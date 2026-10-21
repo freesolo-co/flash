@@ -713,7 +713,7 @@ def test_attach_boundary_schedules_reconciliation_for_staged_transient(
     worker = _spec(package=package)
     monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
     remote = {
-        "provider": "runpod",
+        "provider": "modal",
         "endpoint_id": "ep",
         "job_id": "job",
         "key_fingerprint": "rpk-0123456789ab",
@@ -729,7 +729,7 @@ def test_attach_boundary_schedules_reconciliation_for_staged_transient(
     context = SimpleNamespace(
         worker_spec=worker,
         persisted_remote=remote,
-        handle=SimpleNamespace(provider="runpod", data={}),
+        handle=SimpleNamespace(provider="modal", data={}),
         seed=worker.seed,
         recovered_attempt=0,
         next_attempt=1,
@@ -777,7 +777,7 @@ def test_confirmed_teardown_staging_transient_defers_without_clearing_or_allocat
     worker = _spec(package=package)
     monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
     remote = {
-        "provider": "runpod",
+        "provider": "modal",
         "endpoint_id": "ep",
         "job_id": "job",
         "key_fingerprint": "rpk-0123456789ab",
@@ -798,7 +798,7 @@ def test_confirmed_teardown_staging_transient_defers_without_clearing_or_allocat
     context = SimpleNamespace(
         worker_spec=worker,
         persisted_remote=remote,
-        handle=SimpleNamespace(provider="runpod", data={}),
+        handle=SimpleNamespace(provider="modal", data={}),
         seed=worker.seed,
         recovered_attempt=0,
         next_attempt=1,
@@ -844,7 +844,7 @@ def test_confirmed_teardown_staging_transient_defers_without_clearing_or_allocat
             )
         ),
     )
-    monkeypatch.setattr(attempt_recovery, "_runpod_completed_metrics", lambda *_a, **_k: None)
+    monkeypatch.setattr(attempt_recovery, "_completed_worker_metrics", lambda *_a, **_k: None)
     monkeypatch.setattr(attempt_recovery, "_strict_teardown_handle", lambda *_a, **_k: True)
     monkeypatch.setattr(runner_artifacts, "stage_environment_package", transient_stage)
     monkeypatch.setattr(runner_reconciliation, "_compare_and_clear_remote", record_clear)
@@ -900,7 +900,7 @@ def test_worker_cleans_materialized_package_after_training_handler(
     monkeypatch.setattr(worker_perf, "_restrict_fla_gdn_autotune_on_blackwell", lambda: None)
     monkeypatch.setattr(worker_perf, "gpu_diagnostics", lambda **_kwargs: {})
     monkeypatch.setattr(worker_heartbeat, "heartbeat", lambda *_args, **_kwargs: None)
-    monkeypatch.setattr(worker_kernel_warmup, "load_mega_cache", lambda: None)
+    monkeypatch.setattr(worker_kernel_warmup, "configure_kernel_cache", lambda: None)
     monkeypatch.setattr(
         worker_entry.os,
         "_exit",

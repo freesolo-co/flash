@@ -29,6 +29,12 @@ def _install_exact_dataloaders() -> None:
 
         def exact_loader_init(self, *args, **kwargs):
             kwargs["drop_last"] = False
+            # Rows are pretokenized with frozen masks; keep the same bounded worker pool
+            # feeding packed batches between epochs instead of re-importing torch each epoch.
+            # PyTorch rejects persistent workers when num_workers is zero.
+            if int(kwargs.get("num_workers", 0)) > 0:
+                kwargs["persistent_workers"] = True
+                kwargs["prefetch_factor"] = 2
             return loader_init(self, *args, **kwargs)
 
         exact_loader_init._flash_exact_loader = True
@@ -59,6 +65,27 @@ def _install_seeded_dataloader(seed: int) -> None:
 
     seeded_build_dataloader._flash_seeded_dataloader = True
     sft_trainer.SFTTrainer._build_dataloader = seeded_build_dataloader
+
+
+def _install_epoch_boundary_resume() -> None:
+    from verl.trainer import sft_trainer
+
+    original = sft_trainer.SFTTrainer.fit
+    if getattr(original, "_flash_epoch_boundary_resume", False):
+        return
+
+    def fit(self):
+        step = self.resume_global_step
+        if 0 < step < self.total_training_steps and step % self.steps_per_epoch == 0:
+            # The saved loader is exhausted, but verl starts at the NEXT epoch. Rebuild
+            # only at that boundary so its empty restored iterator cannot skip an epoch.
+            # Mid-epoch resumes keep their exact saved cursor and sampler state.
+            self._build_dataloader()
+            self.ckpt_handler.train_dataloader = self.train_dataloader
+        return original(self)
+
+    fit._flash_epoch_boundary_resume = True
+    sft_trainer.SFTTrainer.fit = fit
 
 
 def _install_linear_scheduler() -> None:
@@ -102,10 +129,14 @@ def _install_core(config: dict) -> None:
     seed = int(config["seed"])
     _install_exact_dataloaders()
     _install_seeded_dataloader(seed)
+    _install_epoch_boundary_resume()
     _install_linear_scheduler()
     save_at_steps = tuple(config.get("save_at_steps", ()))
     if save_at_steps:
         runtime.install_checkpoint_handler_filter(save_at_steps, int(config["total_steps"]))
+        runtime.install_checkpoint_publication_backpressure(
+            config["checkpoint_published_dir"], save_at_steps, int(config["total_steps"])
+        )
     if config.get("reentrant_gradient_checkpointing"):
         _install_reentrant_checkpointing(multimodal=bool(config.get("multimodal")))
 
@@ -113,6 +144,7 @@ def _install_core(config: dict) -> None:
 def install() -> None:
     config = runtime.load_plugin_config("FLASH_SFT_PLUGIN_CONFIG")
     marker_file = str(config["marker_file"])
+    runtime.install_compact_checkpoints(marker_file)
     runtime.install_required("sft-core", marker_file, _install_core, config)
     language_prefix = str(config.get("lora_language_prefix") or "")
     if language_prefix:

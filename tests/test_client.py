@@ -660,6 +660,26 @@ def test_raw_read_timeout_maps_to_client_error(monkeypatch):
         client.health()
 
 
+def test_disconnected_submission_is_actionable_and_never_replayed(monkeypatch):
+    import http.client
+
+    calls = []
+
+    def disconnect(request, **kwargs):
+        calls.append(request.get_method())
+        raise http.client.RemoteDisconnected("Remote end closed connection")
+
+    monkeypatch.setattr("flash.client.http._urlopen_no_redirect", disconnect)
+    client = ApiClient("https://flash.example", "fslo-user-test")
+    with pytest.raises(ClientError, match="may have been accepted"):
+        client.publish_env(
+            name="qualification",
+            package_b64="QQ==",
+            project_id="11111111-1111-4111-8111-111111111111",
+        )
+    assert calls == ["POST"]
+
+
 def test_cancel_timeout_returns_authoritative_cancelled_status(monkeypatch):
     client = ApiClient("http://flash.example", "fslo-user-test")
     calls: list[tuple[str, str, float | None]] = []
@@ -684,7 +704,7 @@ def test_cancel_timeout_returns_authoritative_cancelled_status(monkeypatch):
 
 
 @pytest.mark.parametrize("run_state", ["cancelled", "done", "failed", "dry_run"])
-def test_cancel_timeout_raises_when_backend_revocation_is_unconfirmed(monkeypatch, run_state):
+def test_cancel_timeout_raises_when_backend_cleanup_is_unconfirmed(monkeypatch, run_state):
     client = ApiClient("http://flash.example", "fslo-user-test")
 
     def request(method, path, body=None, timeout=None, progress=None, require=()):
@@ -694,10 +714,12 @@ def test_cancel_timeout_raises_when_backend_revocation_is_unconfirmed(monkeypatc
             return {
                 "run_id": "r1",
                 "state": run_state,
-                "deployment": {
-                    "state": "revocation_failed",
-                    "retryable": True,
-                    "error": "backend unavailable",
+                "deployments": {
+                    "r1/final": {
+                        "state": "cleanup_pending",
+                        "retryable": True,
+                        "error": "backend unavailable",
+                    }
                 },
             }
         raise AssertionError((method, path))
@@ -706,21 +728,25 @@ def test_cancel_timeout_raises_when_backend_revocation_is_unconfirmed(monkeypatc
 
     with pytest.raises(
         ClientError,
-        match="backend revocation is unconfirmed: backend unavailable; retry cancellation",
+        match="backend cleanup is unconfirmed: backend unavailable; retry cancellation",
     ):
         client.cancel_run("r1")
 
 
-def test_cancel_timeout_keeps_polling_nonterminal_revocation_failure(monkeypatch):
+def test_cancel_timeout_keeps_polling_nonterminal_cleanup_pending(monkeypatch):
     client = ApiClient("http://flash.example", "fslo-user-test")
     polls = iter(
         [
             {
                 "run_id": "r1",
                 "state": "running",
-                "deployment": {"state": "revocation_failed", "retryable": True},
+                "deployments": {"r1/final": {"state": "cleanup_pending", "retryable": True}},
             },
-            {"run_id": "r1", "state": "cancelled", "deployment": {"state": "undeployed"}},
+            {
+                "run_id": "r1",
+                "state": "cancelled",
+                "deployments": {"r1/final": {"state": "undeployed"}},
+            },
         ]
     )
 
@@ -842,7 +868,7 @@ def test_deployment_for_reads_the_run_scoped_route_not_the_listing(monkeypatch):
         "checkpoint_id": "flash-1/final",
         "run_id": "flash-1",
     }
-    assert calls == [("GET", "/v1/runs/flash-1/deploy", None, None)]
+    assert calls == [("GET", "/v1/runs/flash-1/deploy?checkpoint_id=flash-1%2Ffinal", None, None)]
 
 
 def test_deployment_for_keeps_a_run_id_already_on_the_record(monkeypatch):
@@ -881,7 +907,7 @@ def test_deployment_for_asks_about_the_base_run_not_the_checkpoint_ref(monkeypat
         "checkpoint_step": 40,
         "run_id": "flash-1",
     }
-    assert calls == [("GET", "/v1/runs/flash-1/deploy", None, None)]
+    assert calls == [("GET", "/v1/runs/flash-1/deploy?checkpoint_id=flash-1%2Fstep-40", None, None)]
 
 
 def test_deployment_for_requires_the_requested_checkpoint_id(monkeypatch):
@@ -933,8 +959,8 @@ def test_deployment_for_matches_the_final_checkpoint_id(monkeypatch):
     assert client.deployment_for("flash-1/step-40") is None
 
 
-def test_deployed_checkpoint_reports_whatever_step_is_serving(monkeypatch):
-    """`deployed_checkpoint` answers what this run serves, not whether one target is live."""
+def test_deployment_for_rejects_a_different_checkpoint(monkeypatch):
+    """Exact polling cannot substitute a ready sibling for the requested checkpoint."""
     client = ApiClient("http://127.0.0.1:1", "fslo-user-test", timeout=2)
     calls = _deployment_reader(
         monkeypatch,
@@ -946,14 +972,9 @@ def test_deployed_checkpoint_reports_whatever_step_is_serving(monkeypatch):
         },
     )
 
-    assert client.deployed_checkpoint("flash-1/step-50") == {
-        "state": "ready",
-        "checkpoint_id": "flash-1/step-100",
-        "checkpoint_step": 100,
-        "run_id": "flash-1",
-    }
+    assert client.deployment_for("flash-1/step-50") is None
     # the same run-scoped route costs one read and never walks the account's history.
-    assert calls == [("GET", "/v1/runs/flash-1/deploy", None, None)]
+    assert calls == [("GET", "/v1/runs/flash-1/deploy?checkpoint_id=flash-1%2Fstep-50", None, None)]
     assert client.deployment_for("flash-1/step-50") is None
 
 
@@ -963,7 +984,7 @@ def test_deployed_checkpoint_still_hides_a_never_deployed_run(monkeypatch, state
     client = ApiClient("http://127.0.0.1:1", "fslo-user-test", timeout=2)
     _deployment_reader(monkeypatch, client, {"state": state})
 
-    assert client.deployed_checkpoint("flash-1/step-50") is None
+    assert client.deployment_for("flash-1/step-50") is None
 
 
 def test_deployed_checkpoint_reports_an_unknown_run_as_absent(monkeypatch):
@@ -971,7 +992,7 @@ def test_deployed_checkpoint_reports_an_unknown_run_as_absent(monkeypatch):
     client = ApiClient("http://127.0.0.1:1", "fslo-user-test", timeout=2)
     _deployment_reader(monkeypatch, client, None, status=404)
 
-    assert client.deployed_checkpoint("flash-1/final") is None
+    assert client.deployment_for("flash-1/final") is None
 
 
 @pytest.mark.parametrize("state", ["undeployed", "dry_run"])
@@ -1018,7 +1039,7 @@ def test_deployment_for_bounds_the_read(monkeypatch):
     calls = _deployment_reader(monkeypatch, client, {"state": "undeployed"})
 
     assert client.deployment_for("flash-1/final", timeout=3.0) is None
-    assert calls == [("GET", "/v1/runs/flash-1/deploy", 3.0, None)]
+    assert calls == [("GET", "/v1/runs/flash-1/deploy?checkpoint_id=flash-1%2Ffinal", 3.0, None)]
 
 
 def test_deployed_checkpoint_takes_a_wall_clock_deadline(monkeypatch):
@@ -1031,21 +1052,30 @@ def test_deployed_checkpoint_takes_a_wall_clock_deadline(monkeypatch):
     client = ApiClient("http://127.0.0.1:1", "fslo-user-test", timeout=2)
     calls = _deployment_reader(monkeypatch, client, {"state": "undeployed"})
 
-    assert client.deployed_checkpoint("flash-1/final", timeout=5.0, body_deadline=5.0) is None
-    assert calls == [("GET", "/v1/runs/flash-1/deploy", 5.0, 5.0)]
+    assert client.deployment_for("flash-1/final", timeout=5.0, body_deadline=5.0) is None
+    assert calls == [("GET", "/v1/runs/flash-1/deploy?checkpoint_id=flash-1%2Ffinal", 5.0, 5.0)]
 
 
 @contextlib.contextmanager
-def _trickling_server(body: bytes, gap: float):
+def _trickling_server(body: bytes, gap: float, *, status: int = 200, phase: str = "body"):
     """A server that dribbles one byte at a time, like a slow proxy relaying a response."""
 
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self):
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            for byte in body:
+            status_line = f"HTTP/1.1 {status} Test response\r\n".encode()
+            headers = (
+                b"Content-Type: application/json\r\n"
+                + f"Content-Length: {len(body)}\r\n\r\n".encode()
+            )
+            if phase == "status":
+                prefix, slow = b"", status_line + headers + body
+            elif phase == "headers":
+                prefix, slow = status_line, headers + body
+            else:
+                prefix, slow = status_line + headers, body
+            self.wfile.write(prefix)
+            self.wfile.flush()
+            for byte in slow:
                 try:
                     self.wfile.write(bytes([byte]))
                     self.wfile.flush()
@@ -1087,7 +1117,7 @@ def test_a_wall_clock_deadline_bounds_a_body_that_arrives_a_byte_at_a_time():
         client = ApiClient(url, "fslo-user-test", timeout=60)
         start = time.monotonic()
         with pytest.raises(ClientError):
-            client.deployed_checkpoint("flash-1/final", timeout=2.0, body_deadline=0.5)
+            client.deployment_for("flash-1/final", timeout=2.0, body_deadline=0.5)
         elapsed = time.monotonic() - start
 
     # generous against CI scheduling noise, and still far under the ~12s of the unbounded read.
@@ -1161,7 +1191,7 @@ def test_a_stalled_body_read_cannot_outlast_the_remaining_deadline():
         client = ApiClient(url, "fslo-user-test", timeout=60)
         start = time.monotonic()
         with pytest.raises(ClientError):
-            client.deployed_checkpoint("flash-1/final", timeout=5.0, body_deadline=budget)
+            client.deployment_for("flash-1/final", timeout=5.0, body_deadline=budget)
         elapsed = time.monotonic() - start
 
     # without the re-cap this measured 3.51s. generous against CI noise, still well under that.
@@ -1224,11 +1254,16 @@ def test_a_complete_body_still_reads_whole_under_a_deadline():
     The deadline path reads what has already arrived rather than a fixed count, so a body
     delivered across several chunks has to be reassembled rather than cut at the first one.
     """
-    payload = {"state": "ready", "checkpoint_step": 100, "pad": "x" * 200_000}
+    payload = {
+        "state": "ready",
+        "checkpoint_id": "flash-1/step-100",
+        "checkpoint_step": 100,
+        "pad": "x" * 200_000,
+    }
     body = json.dumps(payload).encode()
     with _fixed_2xx_server("application/json", body) as url:
         client = ApiClient(url, "fslo-user-test", timeout=30)
-        got = client.deployed_checkpoint("flash-1/final", timeout=30.0, body_deadline=30.0)
+        got = client.deployment_for("flash-1/step-100", timeout=30.0, body_deadline=30.0)
 
     assert got["pad"] == payload["pad"]
     assert got["checkpoint_step"] == 100
@@ -1390,3 +1425,68 @@ def test_spec_payload_sends_an_omitted_gpu_count_as_omitted() -> None:
         reparsed = spec_from_dict(spec_payload(pinned))
         assert reparsed.gpu_count_auto is False, f"{authored} must stay a hard pin"
         assert reparsed.gpu.count == expected_count
+
+
+@pytest.mark.wallclock
+@pytest.mark.parametrize("wait_seconds", [0.0, 0.5])
+def test_cli_deploy_wait_bounds_the_entire_trickling_poll(wait_seconds):
+    from flash.cli.commands.ops.deploy import _await_deployment
+
+    body = b'{"run_id":"flash-1","checkpoint_id":"flash-1/final","state":"ready"}'
+    queued = {"checkpoint_id": "flash-1/final", "state": "queued"}
+    with _trickling_server(body, gap=0.1) as url:
+        client = ApiClient(url, "fslo-user-test", timeout=60)
+        start = time.monotonic()
+        result = _await_deployment(client, "flash-1/final", queued, wait_seconds)
+        elapsed = time.monotonic() - start
+    assert result == queued
+    assert elapsed < 3.0, f"CLI poll exceeded its complete-body budget: {elapsed:.2f}s"
+
+
+@pytest.mark.wallclock
+@pytest.mark.parametrize("wait_seconds", [0.0, 0.5])
+@pytest.mark.parametrize("phase", ["status", "headers"])
+def test_cli_deploy_wait_bounds_trickling_status_and_headers(wait_seconds, phase):
+    from flash.cli.commands.ops.deploy import _await_deployment
+
+    body = b'{"checkpoint_id":"flash-1/final","state":"ready"}'
+    queued = {"checkpoint_id": "flash-1/final", "state": "queued"}
+    with _trickling_server(body, gap=0.1, phase=phase) as url:
+        start = time.monotonic()
+        result = _await_deployment(
+            ApiClient(url, "test-key"), "flash-1/final", queued, wait_seconds
+        )
+        elapsed = time.monotonic() - start
+    assert result == queued
+    assert elapsed < 1.75, f"{phase} exceeded the poll deadline: {elapsed:.2f}s"
+
+
+@pytest.mark.wallclock
+@pytest.mark.parametrize("wait_seconds", [0.0, 0.5])
+@pytest.mark.parametrize("status", [401, 403, 404, 503])
+def test_cli_deploy_wait_bounds_trickling_error_bodies(wait_seconds, status):
+    from flash.cli.commands.ops.deploy import _await_deployment
+
+    body = b'{"detail":"proxy error response arriving slowly"}'
+    queued = {"checkpoint_id": "flash-1/final", "state": "queued"}
+    with _trickling_server(body, gap=0.1, status=status) as url:
+        start = time.monotonic()
+        result = _await_deployment(
+            ApiClient(url, "test-key"), "flash-1/final", queued, wait_seconds
+        )
+        elapsed = time.monotonic() - start
+    assert result == queued
+    assert elapsed < 1.75, f"HTTP {status} exceeded the poll deadline: {elapsed:.2f}s"
+
+
+@pytest.mark.wallclock
+@pytest.mark.parametrize("status", [401, 503])
+def test_error_body_deadline_preserves_http_status(status):
+    body = b'{"detail":"proxy error response arriving slowly"}'
+    with _trickling_server(body, gap=0.1, status=status) as url:
+        start = time.monotonic()
+        with pytest.raises(ApiError) as exc:
+            ApiClient(url, "test-key").deployment_for("flash-1/final", timeout=5, body_deadline=0.5)
+        elapsed = time.monotonic() - start
+    assert exc.value.status == status
+    assert elapsed < 1.25

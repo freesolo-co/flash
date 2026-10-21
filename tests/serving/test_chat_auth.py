@@ -11,6 +11,7 @@ import pytest
 from fastapi import HTTPException, status
 from fastapi.testclient import TestClient
 
+from flash.serving.src.accounting.usage import AuthorizedTraffic, principal_for_external_org
 from flash.serving.src.http.router import AdapterRouter
 from flash.serving.src.http.router import build_offline_serving_app as build_serving_app
 from flash.serving.src.io.schemas import AdapterRecord
@@ -68,7 +69,7 @@ class FakePool:
         self,
         base_model: str,
         org_id: str,
-        adapter_id: str,
+        model_id: str,
         expected_generation: str | None = None,
     ) -> None:  # pragma: no cover
         pass
@@ -81,11 +82,13 @@ class FakeAuthorizer:
         self.calls: list[tuple[str, str]] = []
         self._raises = raises
 
-    async def __call__(self, token: str, adapter_id: str, scope: dict | None = None) -> str:
-        self.calls.append((token, adapter_id))
+    async def __call__(
+        self, token: str, model_id: str, scope: dict | None = None
+    ) -> AuthorizedTraffic:
+        self.calls.append((token, model_id))
         if self._raises is not None:
             raise self._raises
-        return "org-A"
+        return AuthorizedTraffic(principal_for_external_org("org-A"), "generation-a")
 
 
 def _client(*, authorizer=None) -> TestClient:
@@ -169,10 +172,10 @@ def test_adapter_listing_is_gated_and_never_exposes_org_id() -> None:
 def test_generate_endpoint_is_also_enforced() -> None:
     auth = FakeAuthorizer()
     client = _client(authorizer=auth)
-    assert client.post("/generate", json={"adapter_id": _id(), "prompt": "hi"}).status_code == 401
+    assert client.post("/generate", json={"model_id": _id(), "prompt": "hi"}).status_code == 401
     ok = client.post(
         "/generate",
-        json={"adapter_id": _id(), "prompt": "hi"},
+        json={"model_id": _id(), "prompt": "hi"},
         headers={"Authorization": "Bearer fs-user-key"},
     )
     assert ok.status_code == 200
@@ -220,7 +223,7 @@ def test_per_adapter_blank_path_id_is_rejected_before_authorization(
 
     assert response.status_code == 422
     assert auth.calls == []
-    assert response.json() == {"detail": "adapter_id must not be empty"}
+    assert response.json() == {"detail": "model_id must not be empty"}
 
 
 def test_generate_authorizes_against_the_normalized_adapter_id() -> None:
@@ -230,7 +233,7 @@ def test_generate_authorizes_against_the_normalized_adapter_id() -> None:
     client = _client(authorizer=auth)
     ok = client.post(
         "/generate",
-        json={"adapter_id": f"  {_id()}  ", "prompt": "hi"},
+        json={"model_id": f"  {_id()}  ", "prompt": "hi"},
         headers={"Authorization": "Bearer fs-user-key"},
     )
     assert ok.status_code == 200

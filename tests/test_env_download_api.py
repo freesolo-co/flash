@@ -31,18 +31,14 @@ def _identity_for_token(token: str) -> dict[str, str]:
 
 @pytest.fixture
 def api(tmp_path, monkeypatch):
-    monkeypatch.setenv("RUNPOD_API_KEY", "rp-test,rp-test-2")
-    monkeypatch.setenv("LAMBDA_API_KEY", "lam-test")
     monkeypatch.setenv("FREESOLO_INTERNAL_KEY", "fslo-internal-test")
     monkeypatch.setenv("GITHUB_TOKEN", "ghp-test")
     monkeypatch.setenv("HF_TOKEN", "hf-test")
     monkeypatch.setenv("FLASH_DEPLOY_SYNC", "1")
 
-    import flash.providers.runpod.client.auth as runpod_keys
     import flash.server.platform.auth as auth_mod
     import flash.server.platform.db as db_mod
 
-    runpod_keys.reset()
     monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
     monkeypatch.setattr(runner_state, "RESULTS_DIR", str(tmp_path / "results"))
     monkeypatch.setattr(db_mod, "DB_PATH", str(tmp_path / "server.db"))

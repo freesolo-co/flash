@@ -26,6 +26,7 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
+import flash.engine.worker.io.hf as _publication
 import flash.engine.worker.io.hf as worker_hf
 import flash.engine.worker.train.entry.opd_train_runner as opd_train_runner
 import flash.engine.worker.train.opd.bridging.batching as opd_batching
@@ -45,7 +46,6 @@ from flash.engine.worker.train.entry.sft_train import _seed_resume_lifecycle
 from flash.engine.worker.train.opd.bridging.batching import _TextTeacherBatcher
 from flash.engine.worker.train.opd.bridging.bridge import _TeacherAlignmentBridge
 from flash.engine.worker.train.opd.bridging.prompts import (
-    _processor_expanded_prompt_ids,
     _prompt_pool_fingerprint,
     _trim_response_and_forced,
     _validate_forced_mask,
@@ -1034,51 +1034,8 @@ def test_image_observation_env_text_prompt_omits_empty_processor_images(monkeypa
     prompt_rows, multimodal = _render_prompt_rows(
         SimpleNamespace(env=_DynamicImageEnv(), spec=None)
     )
-    messages = prompt_rows[0][1]
-    processor = _MockMultimodalProcessor()
-
-    prompt_ids = _processor_expanded_prompt_ids(
-        processor,
-        messages,
-        (),
-        None,
-        enable_thinking=False,
-    )
-
     assert multimodal is True
-    assert prompt_ids == (10, 11)
-    assert processor.rendered == messages
-    assert "images" not in processor.call_kwargs
-
-
-def test_processor_expanded_prompt_ids_enforce_visual_token_budget(tmp_path):
-    image_module = pytest.importorskip("PIL.Image")
-    dataset_dir = tmp_path / "dataset"
-    dataset_dir.mkdir()
-    image_path = dataset_dir / "image.png"
-    image_module.new("RGB", (2, 2), "red").save(image_path)
-    processor = _MockMultimodalProcessor()
-    messages = [
-        {
-            "role": "user",
-            "content": [{"type": "image"}, {"type": "text", "text": "describe"}],
-        }
-    ]
-
-    from flash.content.multimodal import normalize_image_source
-
-    prompt_ids = _processor_expanded_prompt_ids(
-        processor,
-        messages,
-        (normalize_image_source("dataset/image.png", tmp_path),),
-        str(tmp_path),
-        enable_thinking=False,
-    )
-
-    assert prompt_ids == (10, 151655, 151655, 11)
-    assert len(prompt_ids) > 3
-    assert processor.rendered[0]["content"][0]["image"].size == (2, 2)
-    assert [image.size for image in processor.images] == [(2, 2)]
+    assert prompt_rows[0][1] == [{"role": "user", "content": "describe"}]
 
 
 _IMAGE_DATA_URI = (
@@ -3961,9 +3918,11 @@ def test_opd_checkpoint_watcher_forwards_processor_to_every_export(monkeypatch, 
     monkeypatch.setattr(
         opd_failures._worker_hf,
         "upload_resume_checkpoint",
-        lambda _step, _path, **kwargs: (kwargs["before_upload"](), kwargs["after_upload"](), True)[
-            2
-        ],
+        lambda _step, _path, **kwargs: (
+            _publication.PublicationResult(
+                resume=_publication.ArtifactCommit("test-commit", "test-revision")
+            ),
+        )[0],
     )
     watcher = _OpdVerlCheckpointWatcher(
         local_dir=str(tmp_path),
@@ -4070,12 +4029,18 @@ def test_the_watcher_claims_every_step_but_publishes_only_required_ones(monkeypa
     monkeypatch.setattr(
         worker,
         "publish_deployable_checkpoint",
-        lambda adapter, step, **kwargs: published.append(step) or "sub",
+        lambda adapter, step, **kwargs: _publication.PublicationResult(
+            deployable=_publication.ArtifactCommit(published.append(step) or "sub", "test-revision")
+        ),
     )
     monkeypatch.setattr(
         worker,
         "upload_resume_checkpoint",
-        lambda step, path, **kwargs: (kwargs["before_upload"](), kwargs["after_upload"](), True)[2],
+        lambda step, path, **kwargs: (
+            _publication.PublicationResult(
+                resume=_publication.ArtifactCommit("test-commit", "test-revision")
+            ),
+        )[0],
     )
 
     watcher = _OpdVerlCheckpointWatcher(
@@ -4127,13 +4092,19 @@ def test_an_opd_backlog_stages_a_retry_contract_for_every_step(monkeypatch, tmp_
         "upload_resume_checkpoint",
         lambda step, path, **kwargs: (
             uploaded.append(step),
-            kwargs["before_upload"](),
-            kwargs["after_upload"](),
-            True,
-        )[3],
+            _publication.PublicationResult(
+                resume=_publication.ArtifactCommit("test-commit", "test-revision")
+            ),
+        )[1],
     )
     monkeypatch.setattr(
-        worker, "publish_deployable_checkpoint", lambda *a, **kw: pytest.fail("no required steps")
+        worker,
+        "publish_deployable_checkpoint",
+        lambda *a, **kw: _publication.PublicationResult(
+            deployable=_publication.ArtifactCommit(
+                pytest.fail("no required steps"), "test-revision"
+            )
+        ),
     )
 
     watcher = _OpdVerlCheckpointWatcher(
@@ -7080,7 +7051,7 @@ def test_the_zero2_gate_reads_the_spec_the_caller_passed(monkeypatch):
 
     # a spec whose card cannot hold the retained copy must stay on zero-3 even though the global
     # would have admitted it. reading JOB_SPEC here returns the B200 answer and fails.
-    tight = SimpleNamespace(gpu=SimpleNamespace(type="RTX 4090"), train=SimpleNamespace())
+    tight = SimpleNamespace(gpu=SimpleNamespace(type="L4"), train=SimpleNamespace())
     assert _build(tight)["reshard_after_forward"] is True
 
     # and with no spec at all the gate falls closed rather than silently reaching for the global.
@@ -7920,15 +7891,35 @@ def test_train_meta_reports_the_teacher_call_shape_only_where_one_is_enforced():
     notes = notes[notes.index("_worker_finalize.write_train_meta(") :]
     # only single-turn text uses the serial batcher; multimodal and multi-turn use bridge threads.
     # report at most the samples one step can produce.
-    assert (
-        '"opd_teacher_batch_size": (\n'
-        "                    min(\n"
-        "                        OPD_TEACHER_SCORING_CONCURRENCY, max(1, prompts_per_step * knobs.group_size)\n"
-        "                    )\n"
-        "                    if not multimodal and not multi_turn\n"
-        "                    else None\n"
-        "                ),"
-    ) in notes
+    import ast
+
+    tree = ast.parse(inspect.getsource(run_opd_train))
+    expr = next(
+        value
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Dict)
+        for key, value in zip(node.keys, node.values, strict=True)
+        if isinstance(key, ast.Constant) and key.value == "opd_teacher_batch_size"
+    )
+    code = compile(ast.Expression(expr), "teacher_batch_size", "eval")
+    for multimodal, multi_turn, expected in [
+        (False, False, 6),
+        (True, False, None),
+        (False, True, None),
+    ]:
+        assert (
+            eval(
+                code,
+                {
+                    "multimodal": multimodal,
+                    "multi_turn": multi_turn,
+                    "OPD_TEACHER_SCORING_CONCURRENCY": 32,
+                    "prompts_per_step": 3,
+                    "knobs": SimpleNamespace(group_size=2),
+                },
+            )
+            == expected
+        )
     assert ('"opd_teacher_workers": 1 if not multimodal and not multi_turn else None,') in notes
     # the engine length handed to vllm, not a hardcoded default: prompt filtering is carved out of
     # this same number, so a fabricated one would disagree with the budget the run actually used.
@@ -8111,7 +8102,7 @@ def test_opd_spec_never_resolves_the_allocator_conf_that_kills_vllm(monkeypatch)
                     "max_examples": 1,
                     "credit_assignment": "per_episode",
                 },
-                "gpu": {"type": "B200", "count": 1, "provider": "runpod"},
+                "gpu": {"type": "B200", "count": 1, "provider": "modal"},
             }
         )
 
@@ -8140,7 +8131,7 @@ def test_opd_spec_never_resolves_the_allocator_conf_that_kills_vllm(monkeypatch)
                 "max_examples": 1,
                 "credit_assignment": "per_episode",
             },
-            "gpu": {"type": "B200", "count": 1, "provider": "runpod"},
+            "gpu": {"type": "B200", "count": 1, "provider": "modal"},
         }
     )
     assert build_worker_env(sft)["PYTORCH_CUDA_ALLOC_CONF"] == "expandable_segments:True"
@@ -8989,25 +8980,34 @@ def test_opd_child_records_the_core_marker_only_when_a_save_schedule_was_authore
         "install_deferred_lora_rollout_guard",
         lambda marker: armed.append("lora-rollout-guard"),
     )
-    monkeypatch.setattr(
-        opd_child.runtime,
-        "install_checkpoint_handler_filter",
-        lambda steps, total: armed.append(("checkpoint", tuple(steps), total)),
-    )
+    saved = []
 
-    opd_child.install(
-        {
-            "marker_file": str(marker_file),
-            "save_at_steps": list(save_at_steps),
-            "total_steps": 10,
-            "wandb": False,
-        }
-    )
+    class SyncPPOTrainer:
+        global_steps = 0
 
+        def _save_checkpoint(self):
+            saved.append(self.global_steps)
+            return self.global_steps
+
+    config = {
+        "marker_file": str(marker_file),
+        "save_at_steps": list(save_at_steps),
+        "total_steps": 10,
+        "wandb": False,
+    }
+    opd_child.install(config)
+    # The marker must attest the actual PPO save path, after the trainer import.
+    assert not marker_file.exists()
+    opd_child.install_checkpoint_schedule(SyncPPOTrainer, config)
+    opd_child.install_checkpoint_schedule(SyncPPOTrainer, config)
+    trainer = SyncPPOTrainer()
+    for step in range(1, 11):
+        trainer.global_steps = step
+        trainer._save_checkpoint()
+
+    assert saved == ([3, 10] if save_at_steps else list(range(1, 11)))
     recorded = marker_file.read_text().splitlines() if marker_file.exists() else []
     assert ("opd-core" in recorded) is expects_core
-    assert (("checkpoint", save_at_steps, 10) in armed) is expects_core
-    # the rollout guard is required regardless of the checkpoint schedule.
     assert "lora-rollout-guard" in armed
 
 
@@ -9809,6 +9809,13 @@ def test_build_opd_overrides_requires_a_sized_rollout_memory_budget():
     config.pop("gpu_mem_util")
     with pytest.raises(KeyError, match="gpu_mem_util"):
         build_opd_overrides(config)
+
+
+@pytest.mark.parametrize("multimodal", [False, True])
+def test_opd_rollout_enables_vision_adapters_only_for_image_training(multimodal):
+    overrides = build_opd_overrides(_config(multimodal=multimodal))
+    flag = "+actor_rollout_ref.rollout.engine_kwargs.vllm.enable_tower_connector_lora=True"
+    assert (flag in overrides) is multimodal
 
 
 def test_build_opd_overrides_halves_agent_loop_workers_for_multimodal_runs():

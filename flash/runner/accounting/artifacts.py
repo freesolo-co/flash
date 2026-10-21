@@ -46,12 +46,6 @@ def managed_hf_repo_for_environment(env_id: str) -> str:
     return f"{artifact_namespace()}/{_environment_artifact_repo_name(env_id)}"
 
 
-def _file_digest(path: str, digest) -> None:
-    with open(path, "rb") as f:
-        for chunk in iter(lambda: f.read(1024 * 1024), b""):
-            digest.update(chunk)
-
-
 def _assign_managed_hf_repo(spec: JobSpec) -> JobSpec:
     """Assign the environment-scoped HF artifact repo (platform-managed, never user-set)."""
     if not spec.run_id or spec.run_id == "local":
@@ -219,11 +213,6 @@ def _pin_env_sha_with_reason(spec: JobSpec) -> tuple[JobSpec, str]:
         error,
     )
     return spec, str(error).strip()
-
-
-def _assign_resolved_env_sha(spec: JobSpec) -> JobSpec:
-    """Best-effort preflight pin for diagnostics before authoritative controller staging."""
-    return _pin_env_sha_with_reason(spec)[0]
 
 
 def preflight_validate_environment_ref(spec: JobSpec) -> tuple[JobSpec, bool]:

@@ -1,4 +1,4 @@
-# Cheap per-arch RE-LAYER: graft the EXISTING baked mega-cache onto a freshly rebuilt :cu128 base,
+# Cheap per-arch RE-LAYER: graft the EXISTING baked kernel cache onto a freshly rebuilt :cu128 base,
 # with NO GPU. Used by auto-rebake.yml when fp_cache is unchanged (the cache is still valid) but the
 # base moved (fp_base changed) -- e.g. an FA2/FA3/causal-conv1d/rp_handler bump. The valid cache
 # already lives inside the currently-published per-arch tag, so OLDCACHE IS the cache store; we just

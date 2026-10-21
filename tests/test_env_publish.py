@@ -16,6 +16,7 @@ import pytest
 import flash.runner.lifecycle.state as runner_state
 import flash.runner.lifecycle.status as runner_status
 from flash.server.domain.registry import envs
+from tests._helpers import deployments as deployment_fixtures
 from tests._helpers.source_snapshot import valid_source_snapshot
 from tests._helpers.wire_headers import sent_headers
 
@@ -1143,7 +1144,7 @@ def test_record_training_run_posts_to_backend(monkeypatch):
                 "phase": "rl",
                 "environment": {"id": "acme/checkout-bot/my-env"},
                 "project": "11111111-1111-4111-8111-111111111111",
-                "gpu": {"type": "RTX 5090"},
+                "gpu": {"type": "L40S"},
             },
             platform_context={
                 "org_id": "org-1",
@@ -1151,12 +1152,15 @@ def test_record_training_run_posts_to_backend(monkeypatch):
                 "api_key_id": "key-1",
             },
             source_snapshot=valid_source_snapshot(),
-            deployment={
-                "state": "ready",
-                "checkpoint_id": "flash-1/final",
-                "endpoint_name": "https://serve.example",
-                "adapter_hf_prefix": "private/path",
-            },
+            deployments=deployment_fixtures.records(
+                "flash-1",
+                {
+                    "state": "ready",
+                    "checkpoint_id": "flash-1/final",
+                    "endpoint_name": "https://serve.example",
+                    "adapter_hf_prefix": "private/path",
+                },
+            ),
             last_heartbeat={
                 "attempt": 0,
                 "stage": "sft_step",
@@ -1181,8 +1185,8 @@ def test_record_training_run_posts_to_backend(monkeypatch):
     # the exact canonical project uuid is persisted with every managed training run.
     assert body["projectId"] == "11111111-1111-4111-8111-111111111111"
     assert body["model"] == "Qwen/Qwen3.5-9B"
-    assert body["checkpointId"] == "flash-1/final"
-    assert body["deployment"] == {
+    assert "checkpointId" not in body
+    assert body["deployments"]["flash-1/final"] == {
         "state": "ready",
         "checkpoint_id": "flash-1/final",
         "endpoint": "https://serve.example",
@@ -1222,7 +1226,7 @@ def test_record_training_run_reports_the_gpu_class_actually_rented(monkeypatch):
         "algorithm": "sft",
         "environment": {"id": "acme/checkout-bot/my-env"},
         "project": "11111111-1111-4111-8111-111111111111",
-        "gpu": {"type": ["A100 PCIe", "A100 SXM"]},
+        "gpu": {"type": ["A100 SXM", "A100 SXM"]},
     }
     context = {"org_id": "org-1", "user_id": "user-1", "api_key_id": "key-1"}
 
@@ -1249,7 +1253,7 @@ def test_record_training_run_reports_the_gpu_class_actually_rented(monkeypatch):
             platform_context=context,
         )
     )
-    assert json.loads(seen["body"])["gpuType"] == "A100 PCIe"
+    assert json.loads(seen["body"])["gpuType"] == "A100 SXM"
 
 
 def test_record_training_checkpoint_posts_to_backend(monkeypatch, tmp_path):

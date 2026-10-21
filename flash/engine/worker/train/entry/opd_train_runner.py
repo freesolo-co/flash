@@ -304,6 +304,7 @@ def _write_child_shims(
     parent_dir = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
     copies = (
         ("train/core/child/runtime.py", "flash_verl_runtime.py"),
+        ("train/core/child/compact_checkpoint.py", "flash_compact_checkpoint.py"),
         (
             "../../content/reasoning_normalization.py",
             "flash_reasoning_normalization.py",
@@ -318,6 +319,7 @@ def _write_child_shims(
         ("train/opd/child/entry.py", "flash_opd_entry.py"),
         ("train/opd/child/replay_guard.py", "flash_opd_replay_guard.py"),
         ("../../_internal/diagnostics.py", "flash_child_diagnostics.py"),
+        ("train/core/child/flashinfer_cache.py", "flash_verl_flashinfer.py"),
     )
     for source, target in copies:
         shutil.copy2(os.path.join(parent_dir, *source.split("/")), os.path.join(shim_dir, target))
@@ -647,6 +649,7 @@ def _build_checkpoint_watcher(
         model_id=request.model_id,
         model_revision=request.model_revision,
         required_steps=request.knobs.save_at_steps,
+        final_step=workload.update_horizon,
         exclude_modules=workload.exclude_modules,
         preprocessor=runtime.bridge.processor,
         seed=int(_worker_state.SEED),
@@ -767,7 +770,7 @@ def _report_training_complete(result: _ChildResult, started_at: float) -> float:
         "opd_trained",
         step=result.final_step,
         train_wall=result.train_wall,
-        gpu=_worker_perf.gpu_diagnostics(include_torch=False),
+        gpu=_worker_perf.gpu_diagnostics(),
     )
     return result.train_started_at - started_at
 

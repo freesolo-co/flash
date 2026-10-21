@@ -255,10 +255,10 @@ def test_ordered_gpu_pin_round_trips_through_the_public_spelling():
     )
     # note the alias canonicalization: "A100" is stored as its canonical name, and BOTH halves must
     # agree on it or the two spellings would hash differently for the same authored pin.
-    assert decoded.to_dict()["gpu"]["type"] == ["H100", "A100 PCIe"]
+    assert decoded.to_dict()["gpu"]["type"] == ["H100", "A100 SXM"]
     internal = decoded.to_internal_dict()["gpu"]
     assert internal["type"] == "H100"
-    assert internal["type_fallbacks"] == ("A100 PCIe",)
+    assert internal["type_fallbacks"] == ("A100 SXM",)
 
 
 def test_registries_match_the_declared_boundary():

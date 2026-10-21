@@ -26,7 +26,7 @@ def checkpoint_record(
     subfolder: str | None = None,
     url: str | None = None,
     updated_at: str | None = "2026-07-14T00:00:01+00:00",
-    deployment_generation: str | None = None,
+    deployment_generation: str | None = "generation-a",
     lora_rank: int = 16,
     **overrides: Any,
 ) -> AdapterRecord:
@@ -34,7 +34,7 @@ def checkpoint_record(
     artifact_revision = hashlib.sha1(run_id.encode()).hexdigest()
     artifact_digest = hashlib.sha256(f"{run_id}:artifact".encode()).hexdigest()
     values: dict[str, Any] = {
-        "adapter_id": checkpoint_id,
+        "model_id": checkpoint_id,
         "repo_id": repo_id or f"org/{run_id}",
         "base_model": base_model,
         "subfolder": subfolder,

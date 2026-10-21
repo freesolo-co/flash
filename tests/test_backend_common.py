@@ -393,7 +393,7 @@ def test_resolve_verl_python_installs_pinned_gpu_dependencies(monkeypatch, tmp_p
     # looking healthy. with the package absent, use_liger=true raises ImportError at verl's lazy
     # import (transformer_impl.py) instead of silently producing a zero-delta adapter.
     assert "liger-kernel" not in install
-    assert "bitsandbytes==0.50.1" in install
+    assert "bitsandbytes" not in install
     assert "qwen-vl-utils==0.0.14" in install
     assert "torchvision==0.25.0" in install
     assert "xgrammar==0.1.25" in install
@@ -2985,12 +2985,6 @@ def test_a_job_that_succeeds_still_drains_the_stragglers_an_earlier_one_left(mon
             os.waitpid(pid, 0)
 
 
-# the worker as the runpod handler really runs it: a short-lived process that records a straggler
-# and then EXITS, with no second job to sweep it. `_train_body.run_mode` in
-# `flash/providers/runpod/serverless/endpoints.py`
-# spawns one of these per phase and waits for it, so anything the phase leaves behind reparents to
-# the persistent handler -- which waits only on the worker -- and stays a zombie for the container's
-# life. driven as a subprocess because the leak is about process EXIT, which pytest cannot perform.
 _SHORT_LIVED_WORKER = r"""
 import os, sys, time
 sys.path.insert(0, {repo!r})
@@ -3017,7 +3011,7 @@ sys.stdout.flush()
 def test_a_worker_that_exits_after_one_phase_still_collects_its_straggler():
     """The deferred reap has to happen before this process exits, because nothing follows it.
 
-    A per-phase RunPod worker loses remembered pids at exit, leaving stragglers as permanent
+    A per-phase provider worker loses remembered pids at exit, leaving stragglers as permanent
     zombies.
     """
     done = subprocess.run(
@@ -3029,7 +3023,7 @@ def test_a_worker_that_exits_after_one_phase_still_collects_its_straggler():
     assert done.returncode == 0, f"worker failed: {done.stderr[-2000:]}"
     straggler = int(done.stdout.strip())
     assert not os.path.exists(f"/proc/{straggler}"), (
-        f"straggler {straggler} outlived the worker that owed its status, so the runpod handler "
+        f"straggler {straggler} outlived the worker that owed its status, so the provider handler "
         "inherits a zombie it never waits on: one leaked pid per phase"
     )
 
@@ -4119,7 +4113,7 @@ def test_the_child_fragment_repoints_the_tilelang_libcudart_stub(tmp_path):
     # the marker naming the resolved runtime is the only evidence in a run log that the repoint
     # happened and WHICH libcudart it picked. without it a silently-skipped swap and a successful one
     # read identically, and the next undefined-symbol crash has nothing to bisect against.
-    assert f"{vc.FLASH_CUDART_STUB_MARKER} -> {real}" in result.stdout, (
+    assert f"{vc.FLASH_CUDART_STUB_MARKER} -> {real}" in result.stderr, (
         f"the fragment did not report the repoint it performed: {result.stdout[-1000:]}"
     )
 
@@ -4229,7 +4223,7 @@ def test_a_failed_repoint_still_lets_the_child_start(tmp_path):
     assert "FRAGMENT_DONE" in result.stdout, (
         f"the exception escaped sitecustomize and killed the run: {result.stderr[-2000:]}"
     )
-    assert "repoint failed" in result.stdout, (
+    assert "repoint failed" in result.stderr, (
         "a swallowed failure must still say so; a silent one is unbisectable from a log"
     )
     assert not stub.is_symlink(), "the stub must be left intact when the swap could not complete"
@@ -4491,7 +4485,7 @@ def test_fused_ce_backend_picks_triton_only_where_it_measured_faster():
         assert vc.fused_ce_backend({"capability": list(capability)}) == "triton", capability
 
     # sm80 (A100) and sm86 (A10/A40) are real fleet classes, not hypotheticals, and sm89 is the
-    # RTX 4090 -- the cheapest class the allocator reaches first.
+    # L4 -- the cheapest class the allocator reaches first.
     for capability in ((8, 0), (8, 6), (8, 9)):
         assert vc.fused_ce_backend({"capability": list(capability)}) == "torch", capability
 
@@ -4598,15 +4592,17 @@ def test_every_trainer_probes_capabilities_for_every_model_not_just_gdn():
 
 def test_verify_applied_shim_markers_raises_only_on_missing_names(tmp_path):
     marker_file = tmp_path / "applied_shims.txt"
-    marker_file.write_text("entropy-quantile\nkl-ref-adapter\n")
+    marker_file.write_text("nonempty-response-mask\nkl-ref-adapter\n")
     # complete (and over-complete: ray actors re-record) sets pass.
-    vc.verify_applied_shim_markers(str(marker_file), ["entropy-quantile"])
-    vc.verify_applied_shim_markers(str(marker_file), ["entropy-quantile", "kl-ref-adapter"])
+    vc.verify_applied_shim_markers(str(marker_file), ["nonempty-response-mask"])
+    vc.verify_applied_shim_markers(str(marker_file), ["nonempty-response-mask", "kl-ref-adapter"])
     with pytest.raises(RuntimeError, match=r"never proved.*\['stop-sequences'\]"):
-        vc.verify_applied_shim_markers(str(marker_file), ["entropy-quantile", "stop-sequences"])
+        vc.verify_applied_shim_markers(
+            str(marker_file), ["nonempty-response-mask", "stop-sequences"]
+        )
     # an absent file is every marker missing, not a pass.
     with pytest.raises(RuntimeError, match="never proved"):
-        vc.verify_applied_shim_markers(str(tmp_path / "missing.txt"), ["entropy-quantile"])
+        vc.verify_applied_shim_markers(str(tmp_path / "missing.txt"), ["nonempty-response-mask"])
 
 
 def _lora_rollout_server_module(loaded, *, lora_as_adapter=True):
@@ -4881,3 +4877,27 @@ def test_rollout_max_num_seqs_rejects_a_nonpositive_batch():
 
     with pytest.raises(ValueError, match="rollout_batch must be positive"):
         rollout_max_num_seqs(0)
+
+
+def test_startup_optimizations_preserve_subprocess_json_stdout(tmp_path):
+    """cpuinfo/vLLM helpers parse stdout as JSON; sitecustomize diagnostics must use stderr."""
+    (tmp_path / "torch.py").write_text(
+        "from types import SimpleNamespace as S\n"
+        "backends=S(cuda=S(matmul=S(allow_tf32=False)),cudnn=S(allow_tf32=False))\n"
+        "def set_float32_matmul_precision(value): pass\n"
+    )
+    (tmp_path / "sitecustomize.py").write_text(vc.render_sitecustomize_bootstrap())
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import json,torch; print(json.dumps({'tf32':torch.backends.cuda.matmul.allow_tf32}))",
+        ],
+        env={**os.environ, "PYTHONPATH": str(tmp_path)},
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    assert json.loads(result.stdout) == {"tf32": True}
+    assert vc.FLASH_TF32_MARKER in result.stderr

@@ -1,9 +1,11 @@
 """Shared serving and promotion deadlines, without deployment dependencies."""
 
-# The slowest measured B200 cold boot was 1821s. Allow image loading and compilation
-# to finish before treating an engine as stuck.
-STARTUP_TIMEOUT_SECONDS = 2700
-REQUEST_TIMEOUT_SECONDS = 600
+from flash.serve.deployment.readiness import (
+    ENGINE_REQUEST_TIMEOUT_SECONDS as REQUEST_TIMEOUT_SECONDS,
+)
+from flash.serve.deployment.readiness import (
+    ENGINE_STARTUP_TIMEOUT_SECONDS as STARTUP_TIMEOUT_SECONDS,
+)
 
 # The router waits for both a cold engine and its request to finish.
 ROUTER_TIMEOUT_SECONDS = STARTUP_TIMEOUT_SECONDS + REQUEST_TIMEOUT_SECONDS

@@ -19,10 +19,10 @@ from flash.serving.src.engine.prequant_config import (
 
 # base_model -> serving config. Mirrors flash/flash/catalog.py (the flash submodule).
 #
-# `gpu` (optional): the Modal GPU class to run this cataloged base model's engine on. Routing/adapters
+# `gpu` (required): the Modal GPU class to run this cataloged base model's engine on. Routing/adapters
 # key off the logical `base_model`; only the engine's GPU class changes. The serving app builds one
-# `LoraEngine` Modal class per distinct GPU value and dispatches each base model to its tier. Catalog
-# entries with no `gpu` fall back to ``DEFAULT_GPU``; uncataloged base models are rejected instead of
+# `LoraEngine` Modal class per distinct GPU value and dispatches each base model to its tier.
+# every entry declares its GPU; uncataloged base models are rejected instead of
 # silently using a small default tier. ``TENSOR_PARALLEL_SIZE`` stays 1 (one card per engine).
 #
 # `engine` (optional): per-model vLLM engine-arg overrides (LoRA buffer shape, scheduler/memory caps,
@@ -43,7 +43,6 @@ from flash.serving.src.engine.prequant_config import (
 #
 # NOTE: every new tier/shape needs a one-time real-GPU cold-boot smoke test with the serving canary.
 # Training GPU validation is separate; this file is only the serving vLLM engine matrix.
-DEFAULT_GPU = "L4"
 
 SERVING_MODELS: list[dict[str, Any]] = [
     {
@@ -93,7 +92,6 @@ SERVING_MODELS: list[dict[str, Any]] = [
             "gpu_memory_utilization": 0.90,
             "max_loras": 6,
             "max_lora_rank": 64,
-            "pin_loras": False,
             # 32k context at 6 hot rank-64 LoRAs. measured on B200 (2026-08-30): 49.38 GiB of KV,
             # 3,678,952 tokens, 112x concurrency at 32k -- the 178 GiB card leaves far more room than
             # the 141 GiB H200 this tier previously ran on (which measured about 20x).
@@ -171,7 +169,7 @@ def image_limit_for(base_model: str) -> int | None:
 
 def gpu_for(base_model: str) -> str:
     """return the Modal GPU class for an active hosted engine."""
-    return _config_for(base_model).get("gpu") or DEFAULT_GPU
+    return _config_for(base_model)["gpu"]
 
 
 def serve_model_for(base_model: str) -> str:

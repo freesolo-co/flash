@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import contextlib
 import time
+from dataclasses import dataclass
 
 from flash.core.spec import JobSpec
 from flash.runner.accounting import costs
@@ -11,56 +12,52 @@ from flash.runner.lifecycle import attempts, reporting, state
 from flash.runner.lifecycle import status as status_ops
 from flash.runner.lifecycle.state import RunStatus
 
-# the provider-allocated identifier that names the billable resource itself, per provider handle
-# above: runpod carries `endpoint_id`, lambda and vast carry `instance_id`. a record holding one of
-# these still has something to delete even when the rest of it fails strict validation.
-_RESOURCE_ID_FIELDS = ("endpoint_id", "instance_id")
+_RESOURCE_ID_FIELDS = ("instance_id",)
+
+
+@dataclass(frozen=True)
+class CleanupOutcome:
+    """resource evidence; launch claims and run intent still gate replacement."""
+
+    worker_stopped: bool
+    resource_deleted: bool
+    obligation_recorded: bool
+
+    @property
+    def replacement_safe(self) -> bool:
+        return self.resource_deleted or (self.worker_stopped and self.obligation_recorded)
+
+
+def reconcile_cleanup(run_id: str, remote: dict) -> CleanupOutcome:
+    """attempt exact teardown and retain every unconfirmed resource for retry."""
+    from flash.runner.supervise.recovery import _strict_teardown_handle, _worker_provably_gone
+
+    recorded = False
+    with contextlib.suppress(Exception):
+        recorded = _record_cleanup_remote(run_id, remote)
+    try:
+        deleted = _strict_teardown_handle(remote, run_id)
+        stopped = True
+    except Exception:
+        deleted = False
+        stopped = _worker_provably_gone(run_id, remote)
+    if deleted:
+        with contextlib.suppress(Exception):
+            if not _compare_and_remove_cleanup_remote(run_id, remote):
+                _compare_and_confirm_remote_teardown(run_id, remote)
+    return CleanupOutcome(stopped, deleted, recorded)
 
 
 def _remote_resource_identity(remote: object) -> tuple | None:
-    """Return the exact strict provider resource identity used for compare-and-clear."""
     if not isinstance(remote, dict):
         return None
-    provider = remote.get("provider")
+    from flash.providers.modal.handles import ModalJobHandle
+
     try:
-        if provider == "runpod":
-            from flash.providers.runpod.execution.jobs import JobHandle as RunpodJobHandle
-
-            handle = RunpodJobHandle.from_dict(remote)
-            return (
-                provider,
-                handle.attempt,
-                handle.endpoint_id,
-                handle.job_id,
-                handle.key_fingerprint,
-            )
-        if provider == "lambda":
-            from flash.providers.lambda_.jobs.builders import LambdaJobHandle
-
-            handle = LambdaJobHandle.from_dict(remote)
-            return (
-                provider,
-                handle.attempt,
-                handle.instance_id,
-                handle.instance_type,
-                handle.region,
-                handle.name,
-            )
-        if provider == "vast":
-            from flash.providers.vast.jobs.builders import VastJobHandle
-
-            handle = VastJobHandle.from_dict(remote)
-            return (
-                provider,
-                handle.attempt,
-                handle.instance_id,
-                handle.offer_id,
-                handle.machine_id,
-                handle.label,
-            )
+        h = ModalJobHandle.from_dict(remote)
+        return (h.provider, h.attempt, h.instance_id, h.name, h.run_id)
     except (TypeError, ValueError):
         return None
-    return None
 
 
 def _expected_remote_matches(current: object, expected: dict | None) -> bool:
@@ -203,29 +200,11 @@ def _compare_and_complete_remote(
 
 
 def _canonical_cleanup_remote(remote: object) -> dict | None:
-    """Return the complete strict teardown handle for one exact resource."""
     if not isinstance(remote, dict) or _remote_resource_identity(remote) is None:
         return None
-    provider = remote.get("provider")
-    try:
-        if provider == "runpod":
-            from flash.providers.runpod.execution.jobs import JobHandle as RunpodJobHandle
+    from flash.providers.modal.handles import ModalJobHandle
 
-            record = RunpodJobHandle.from_dict(remote).to_dict()
-        elif provider == "lambda":
-            from flash.providers.lambda_.jobs.builders import LambdaJobHandle
-
-            record = LambdaJobHandle.from_dict(remote).to_dict()
-        elif provider == "vast":
-            from flash.providers.vast.jobs.builders import VastJobHandle
-
-            record = VastJobHandle.from_dict(remote).to_dict()
-        else:
-            return None
-        return record
-    except (TypeError, ValueError):
-        return None
-    return None
+    return ModalJobHandle.from_dict(remote).to_dict()
 
 
 def _cleanup_remote_key(remote: object) -> tuple | None:
@@ -369,13 +348,7 @@ def _drainable_cleanup_remotes(run_id: str) -> list[dict]:
     Only for the teardown path. Unlike the strict reader this never raises on a bad record, because
     raising would strand every well-formed sibling that is still billing.
 
-    A record that fails canonicalization is still yielded verbatim when it names a resource. It is
-    NOT true that such a record has nothing to delete: `key_fingerprint` is validated at exactly 68
-    chars, while a deployed release writes the 16-char form, so every endpoint created by that
-    release fails `from_dict` here. `_delete_runpod_endpoint` resolves precisely that case through
-    `resolve_prefix_key_fingerprint`, and the teardown loop builds a base `JobHandle`, which
-    validates only `provider`. Dropping these records here is what strands them -- a live RunPod
-    endpoint then bills forever with nothing left to tear it down.
+    Malformed records remain tracked; strict ownership validation still gates deletion.
     """
     with state._status_guard(run_id):
         try:
@@ -418,9 +391,6 @@ def _drain_cleanup_remotes(run_id: str) -> set[tuple]:
 
     for record in records:
         checkpoint()
-        # a record that fails strict canonicalization still names a billable resource; the base
-        # JobHandle validates only `provider`, and the runpod teardown resolves the deployed
-        # 16-char fingerprint itself. skipping it here would leave that resource billing forever.
         identity = _remote_resource_identity(record) or _uncanonical_cleanup_remote_key(record)
         if identity is None:
             continue

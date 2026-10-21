@@ -5,7 +5,7 @@ from __future__ import annotations
 import re
 from urllib.parse import SplitResult, urlsplit
 
-_MODAL_HOST_RE = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.modal\.run")
+_MODAL_HOST_RE = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.us-east)?\.modal\.run")
 
 
 def _split_canonical_origin(value: object, name: str) -> tuple[str, SplitResult]:
@@ -43,3 +43,18 @@ def validate_modal_public_url(value: object) -> str:
     if value != canonical:
         raise ValueError("modal public_url must be a canonical provider-managed https origin")
     return value
+
+
+def modal_public_url_matches(value: object, expected: str) -> bool:
+    """Accept the SDK's regional URL and the legacy alias for the exact endpoint.
+
+    Serving pins routing to us-east independently of the GPU's compute region.
+    Neither a different endpoint label nor a different routing region is equivalent.
+    """
+    try:
+        validate_modal_public_url(value)
+        validate_modal_public_url(expected)
+    except ValueError:
+        return False
+    regional = expected.removesuffix(".modal.run") + ".us-east.modal.run"
+    return value in (expected, regional)

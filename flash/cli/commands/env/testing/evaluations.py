@@ -23,12 +23,7 @@ def _evaluation_example(case) -> dict:
 
 
 def _normalize_prompt_images(env, example: dict, messages: list[dict]) -> None:
-    """Resolve the case's images the way the online command and every training worker do.
-
-    Raises whatever `normalize_prompt_images` raises, so an unreadable, oversized, or malformed
-    image fails this gate with the message the caller would have hit at generation time. Text-only
-    cases -- the vast majority -- return without importing the multimodal machinery at all.
-    """
+    """Resolve the case's images the way the online command and every training worker do."""
     from flash.content.multimodal import record_has_images
 
     if not record_has_images(example, messages):

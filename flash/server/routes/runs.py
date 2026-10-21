@@ -20,7 +20,7 @@ from flash.runner.lifecycle.preparation import WarmStartPreparationError
 from flash.runner.lifecycle.state import new_run_id, runs_file_path
 from flash.runner.lifecycle.submit import SourceSnapshotPublicationError
 from flash.runner.supervise.deploy import (
-    DeploymentRevocationError,
+    DeploymentCleanupError,
     DeploymentStatePersistenceError,
     cancel_run,
 )
@@ -484,13 +484,9 @@ def list_runs(key: Annotated[dict, Depends(require_key)]):
 
 @router.get("/v1/runs/{run_id}")
 def run_status(run_id: str, key: Annotated[dict, Depends(require_key)]):
-    from flash.runner.results.verified_revisions import read_verified_checkpoints
 
     status = owned_run(run_id, key)
-    return {
-        **status.to_dict(),
-        "verified_checkpoints": sorted(read_verified_checkpoints(run_id)),
-    }
+    return status.to_dict()
 
 
 @router.get("/v1/runs/{run_id}/logs")
@@ -550,11 +546,11 @@ def cancel(run_id: str, request: Request, key: Annotated[dict, Depends(require_k
             for kind in ("run", "retry", "attach"):
                 request.app.state.training_jobs.cancel((kind, run_id))
         return status.to_dict()
-    except DeploymentRevocationError as exc:
+    except DeploymentCleanupError as exc:
         raise HTTPException(
             status_code=502,
             detail={
-                "code": "deployment_revocation_failed",
+                "code": "deployment_cleanup_failed",
                 "run_id": run_id,
                 "retryable": True,
                 "message": str(exc),

@@ -31,7 +31,7 @@ def _staged_spec() -> JobSpec:
                 },
             },
             "train": {"hf_repo": "owner/runs", "max_examples": 8},
-            "gpu": {"type": "RTX 4090", "max_retries": 2},
+            "gpu": {"type": "L4", "max_retries": 2},
         }
     )
 
@@ -44,15 +44,15 @@ def test_worker_retry_path_has_no_github_pin_fallback() -> None:
 
 
 def test_submit_context_preserves_controller_staged_identity_without_resolving(monkeypatch) -> None:
-    from flash.runner.supervise import attempt_supervision
+    from flash.runner.supervise import execution
 
     monkeypatch.setattr(
         runner_artifacts,
-        "_assign_resolved_env_sha",
+        "_pin_env_sha_with_reason",
         lambda _spec: (_ for _ in ()).throw(AssertionError("worker retry must not resolve github")),
     )
     spec = _staged_spec()
-    context = attempt_supervision._build_context(
+    context = execution._build_context(
         spec,
         io.StringIO(),
         None,

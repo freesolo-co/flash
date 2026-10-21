@@ -11,11 +11,8 @@ Each stage is skipped when an earlier one failed. Streaming against a router tha
 release would prove nothing about it, and inspecting an accounting backlog for a generation that
 never happened would just burn the deadline before failing anyway.
 
-The exact-head binding comes from stages 1 and 2 together: the router proved its identity, and then
-that same router served a real generation. Stage 3 is deliberately weaker than "the canary's own row
-settled" -- `serving_usage_backlog_snapshot` aggregates every generation in flight and offers no
-per-correlation read, so a zero-backlog assertion would be fail-open under concurrent traffic and
-flaky besides. See `verify_accounting`.
+The accounting RPC scopes durable settlement to the canary's correlation id, organization, model,
+deployment id, and release SHA. Fresh pending usage is not evidence of delivery.
 
 Credentials are read from the environment only, never from argv: `run:` lines are echoed into the
 public build log, so an interpolated key leaks on every run including the green ones.
@@ -27,6 +24,7 @@ import argparse
 import asyncio
 import os
 import sys
+import time
 import uuid
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
@@ -75,13 +73,9 @@ HEALTH_UNREACHABLE = "health_unreachable"
 # deploy-induced expiry clears well inside this window while a genuinely wedged loop never does. A
 # deadline at or below the lease would turn every deploy into a rollback of a healthy release.
 #
-# this is deliberately SHORTER than `_STALL_AGE_SECONDS`, and the two are not in tension: this
-# deadline bounds how long the gate waits for a reclaim, while the threshold decides what counts
-# as wedged in the first place. a row still inside the outbox retry budget already reads healthy
-# on the first poll, so there is nothing for a longer deadline here to wait out.
 _DEFAULT_ACCOUNTING_DEADLINE_SECONDS = 180.0
 _ACCOUNTING_POLL_SECONDS = 5.0
-_BACKLOG_SNAPSHOT_RPC = "serving_usage_backlog_snapshot"
+_BACKLOG_SNAPSHOT_RPC = "serving_promotion_accounting_snapshot"
 _MAX_TOKENS = 32
 _REQUIRED_ENV = (
     "FREESOLO_INTERNAL_KEY",
@@ -104,6 +98,7 @@ async def evaluate_promotion(
     accounting_deadline_seconds: float = _DEFAULT_ACCOUNTING_DEADLINE_SECONDS,
     poll_seconds: float = _ACCOUNTING_POLL_SECONDS,
     sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+    clock: Callable[[], float] = time.monotonic,
 ) -> PromotionVerdict:
     try:
         payload = await health_loader()
@@ -138,6 +133,7 @@ async def evaluate_promotion(
         deadline_seconds=accounting_deadline_seconds,
         poll_seconds=poll_seconds,
         sleep=sleep,
+        clock=clock,
     )
 
 
@@ -147,33 +143,30 @@ async def _await_accounting(
     deadline_seconds: float,
     poll_seconds: float,
     sleep: Callable[[float], Awaitable[None]],
+    clock: Callable[[], float] = time.monotonic,
 ) -> PromotionVerdict:
-    """Poll until delivery looks healthy, bounded.
-
-    Delivery is asynchronous, so a single stalled-looking read right after a generation is not yet
-    evidence of anything: a lease can expire and be recovered, and an undelivered row ages until the
-    worker claims it. Only a stall that persists across the deadline indicates a wedged loop, which
-    is why this retries rather than failing on the first bad read.
-    """
-    waited = 0.0
-    # the standing verdict before any read succeeds: an accounting stage that never got a readable
-    # snapshot has proven nothing, so it must not fall through as a pass.
+    """wait for durable canary delivery within one wall-clock budget, including RPC reads."""
+    deadline = clock() + max(0.0, deadline_seconds)
     verdict = PromotionVerdict(ok=False, reason=ACCOUNTING_MALFORMED)
-    while True:
+    while (remaining := deadline - clock()) > 0:
         try:
-            snapshot = await loader()
-        # an unreadable snapshot must never pass as settled.
+            snapshot = await asyncio.wait_for(loader(), timeout=remaining)
+        except TimeoutError:
+            return verdict
         except Exception:
             verdict = PromotionVerdict(ok=False, reason=ACCOUNTING_MALFORMED)
-            snapshot = None
-        if snapshot is not None:
+        else:
+            # even a successful response arriving at the deadline cannot promote the release.
+            if clock() >= deadline:
+                return verdict
             verdict = verify_accounting(parse_accounting(snapshot))
             if verdict.ok:
                 return verdict
-        if waited >= deadline_seconds:
-            return verdict
-        await sleep(poll_seconds)
-        waited += poll_seconds
+        remaining = deadline - clock()
+        if remaining <= 0:
+            break
+        await sleep(min(max(0.0, poll_seconds), remaining))
+    return verdict
 
 
 class GateConfigError(Exception):
@@ -250,12 +243,22 @@ def _resolve(base_url: str, env: dict[str, str]) -> GatePlan:
         raise GateConfigError from exc
     headers["Authorization"] = f"Bearer {key}"
 
+    run_id, attempt = env["GITHUB_RUN_ID"], env["GITHUB_RUN_ATTEMPT"]
+    correlation_id = correlation_id_for(run_id, attempt)
+    deployment_id = f"{run_id}-{attempt}"
+    accounting_scope = {
+        "p_org_id": org_id,
+        "p_correlation_id": correlation_id,
+        "p_serving_deployment_id": deployment_id,
+        "p_serving_release": env["GITHUB_SHA"],
+        "p_public_model_id": models[0],
+    }
+
     async def read_backlog(client: httpx.AsyncClient) -> Any:
-        response = await client.post(url, headers=headers, json={}, timeout=15)
+        response = await client.post(url, headers=headers, json=accounting_scope, timeout=15)
         response.raise_for_status()
         return response.json()
 
-    run_id, attempt = env["GITHUB_RUN_ID"], env["GITHUB_RUN_ATTEMPT"]
     return GatePlan(
         request=CanaryRequest(
             base_url=base_url,
@@ -271,13 +274,13 @@ def _resolve(base_url: str, env: dict[str, str]) -> GatePlan:
             model=models[0],
             api_key=env["FREESOLO_INTERNAL_KEY"],
             org_id=org_id,
-            correlation_id=correlation_id_for(run_id, attempt),
+            correlation_id=correlation_id,
             timeout_seconds=CANARY_TIMEOUT_SECONDS,
             max_tokens=_MAX_TOKENS,
         ),
         read_backlog=read_backlog,
         expected_sha=env["GITHUB_SHA"],
-        expected_deployment_id=f"{run_id}-{attempt}",
+        expected_deployment_id=deployment_id,
     )
 
 

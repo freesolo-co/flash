@@ -1,4 +1,4 @@
-"""Orchestrator end-to-end path with the Flash submission mocked (no RunPod calls)."""
+"""Orchestrator end-to-end path with the Flash submission mocked (no provider calls)."""
 
 from __future__ import annotations
 
@@ -52,14 +52,14 @@ def test_run_job_persists_flash_metrics(monkeypatch):
             attempt = claim.attempt
             runner_attempts.release_launch_claim(spec.run_id, claim)
             return {
-                "arm": "runpod",
+                "arm": "modal",
                 "phase": spec.phase,
                 "seed": spec.seed,
                 "wall_seconds": 3600.0,
                 "trained_eval_acc": 0.7,
                 "base_eval_acc": 0.3,
                 "cost_usd": 0.0,
-                "allocated_gpu": "RTX 4090",
+                "allocated_gpu": "L4",
                 "notes": {},
                 TERMINAL_ATTESTATION_KEY: source_attestation(
                     SOURCE_SNAPSHOT,
@@ -84,7 +84,7 @@ def test_run_job_persists_flash_metrics(monkeypatch):
         status = runner_submit.submit_job(spec, dry_run=False, background=False)
 
         assert status.state == "done", status.error
-        from flash.providers.runpod.client.pricing import hourly_rate
+        from flash.providers.modal.pricing import hourly_rate
 
         # the full run charges the persisted accepted quote; measured cost lands in metrics.json.
         assert status.cost_usd == status.estimated_cost_usd, status.cost_usd
@@ -95,13 +95,13 @@ def test_run_job_persists_flash_metrics(monkeypatch):
         assert status.source_verified_attempt == 0
 
         # Metrics are namespaced by run id so same-phase runs cannot collide.
-        metrics_path = os.path.join(tmp, "results", "runpod", "rl", status.run_id, "metrics.json")
+        metrics_path = os.path.join(tmp, "results", "modal", "rl", status.run_id, "metrics.json")
         assert os.path.exists(metrics_path)
         with open(metrics_path) as f:
             m = json.load(f)
-        assert abs(m["cost_usd"] - hourly_rate("RTX 4090")) < 1e-6  # measured: 1h on the 4090
+        assert abs(m["cost_usd"] - hourly_rate("L4")) < 1e-6  # measured: 1h on the 4090
         assert m["trained_eval_acc"] == 0.7
-        assert m["notes"]["gpu"] == "RTX 4090"
+        assert m["notes"]["gpu"] == "L4"
 
 
 def test_source_publication_failure_is_generic_at_submission_and_api_boundary(monkeypatch, caplog):

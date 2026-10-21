@@ -20,12 +20,9 @@ from flash.serving.src.http.router import AdapterRouter
 from flash.serving.src.http.router import build_offline_serving_app as build_serving_app
 from flash.serving.src.http.router import build_serving_app as build_durable_serving_app
 from flash.serving.src.io.responses import (
-    _openai_structured_outputs,
-    _response_format_to_spec,
     _usage_block,
 )
 from flash.serving.src.io.schemas import AdapterRecord
-from flash.serving.src.io.structured_outputs import StructuredOutputsError
 
 QWEN = "Qwen/Qwen3.5-9B"
 
@@ -34,12 +31,12 @@ async def _allow(_token: str, _adapter_id: str, _scope: dict | None = None) -> s
     return "org-1"
 
 
-def _rec(adapter_id: str, base_model: str = QWEN, **overrides) -> AdapterRecord:
-    run_id = adapter_id.split("/", 1)[0]
-    checkpoint_id = adapter_id if "/" in adapter_id else f"{run_id}/final"
+def _rec(model_id: str, base_model: str = QWEN, **overrides) -> AdapterRecord:
+    run_id = model_id.split("/", 1)[0]
+    checkpoint_id = model_id if "/" in model_id else f"{run_id}/final"
     checkpoint = checkpoint_id.split("/", 1)[1]
     data = {
-        "adapter_id": checkpoint_id,
+        "model_id": checkpoint_id,
         "repo_id": f"org/{run_id}",
         "org_id": "org-1",
         "base_model": base_model,
@@ -81,52 +78,6 @@ def test_usage_block_clamps_cached_and_survives_a_bad_value():
     assert "prompt_tokens_details" not in _usage_block(3, 3, None)
 
 
-def test_response_format_to_spec_translates_each_form():
-    # Non-dict returned unchanged (the GenerateRequest validator normalizes it downstream).
-    assert _response_format_to_spec("raw") == "raw"
-    assert _response_format_to_spec(["a"]) == ["a"]
-    # {"type": "text"} -> explicit "unconstrained".
-    assert _response_format_to_spec({"type": "text"}) == {}
-    assert _response_format_to_spec({"type": "json_object"}) == {"json_object": True}
-    schema = {"type": "object", "properties": {"name": {"type": "string"}}}
-    # Nested json_schema.schema and the flattened schema both map to {"json": schema}.
-    assert _response_format_to_spec({"type": "json_schema", "json_schema": {"schema": schema}}) == {
-        "json": schema
-    }
-    assert _response_format_to_spec({"type": "json_schema", "schema": schema}) == {"json": schema}
-
-
-def test_response_format_to_spec_rejects_malformed():
-    with pytest.raises(StructuredOutputsError, match="requires a schema"):
-        _response_format_to_spec({"type": "json_schema"})
-    with pytest.raises(StructuredOutputsError, match="unsupported response_format type"):
-        _response_format_to_spec({"type": "image_url"})
-
-
-def test_openai_structured_output_fields_are_mutually_exclusive():
-    with pytest.raises(
-        StructuredOutputsError,
-        match="structured_outputs and response_format cannot both be set",
-    ):
-        _openai_structured_outputs(
-            {
-                "structured_outputs": {"choice": ["a"]},
-                "response_format": {"type": "json_object"},
-            }
-        )
-    # response_format alone translates to the canonical spec.
-    assert _openai_structured_outputs({"response_format": {"type": "json_object"}}) == {
-        "json_object": True
-    }
-    # structured_outputs alone remains unchanged, including an explicit unconstrained marker.
-    assert _openai_structured_outputs({"structured_outputs": {"choice": ["a"]}}) == {
-        "choice": ["a"]
-    }
-    assert _openai_structured_outputs({"structured_outputs": {}}) == {}
-    # neither field is unconstrained by the request.
-    assert _openai_structured_outputs({"messages": []}) is None
-
-
 # --------------------------------------------------------------------------------------------
 # router auth branches
 # --------------------------------------------------------------------------------------------
@@ -137,13 +88,13 @@ def test_inference_requires_a_bearer_api_key():
     router = AdapterRouter([_rec("qa/final")])
     client = TestClient(build_serving_app(FakePool(), router, chat_authorizer=_allow))
 
-    no_header = client.post("/generate", json={"adapter_id": "qa/final", "prompt": "hi"})
+    no_header = client.post("/generate", json={"model_id": "qa/final", "prompt": "hi"})
     assert no_header.status_code == 401
     assert "Missing Freesolo API key" in no_header.json()["detail"]
 
     non_bearer = client.post(
         "/generate",
-        json={"adapter_id": "qa/final", "prompt": "hi"},
+        json={"model_id": "qa/final", "prompt": "hi"},
         headers={"Authorization": "Basic Zm9vOmJhcg=="},
     )
     assert non_bearer.status_code == 401  # scheme != bearer -> token treated as absent
@@ -155,7 +106,7 @@ def test_inference_fails_closed_when_no_authorizer_is_wired():
     client = TestClient(build_serving_app(FakePool(), router, chat_authorizer=None))
     resp = client.post(
         "/generate",
-        json={"adapter_id": "qa/final", "prompt": "hi"},
+        json={"model_id": "qa/final", "prompt": "hi"},
         headers={"Authorization": "Bearer k"},
     )
     assert resp.status_code == 503
@@ -199,7 +150,7 @@ class FakePool:
     async def register(self, base_model, record) -> None:
         pass
 
-    async def unregister(self, base_model, adapter_id, expected_generation=None) -> None:
+    async def unregister(self, base_model, model_id, expected_generation=None) -> None:
         pass
 
 

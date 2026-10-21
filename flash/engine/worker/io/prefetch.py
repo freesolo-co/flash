@@ -284,7 +284,6 @@ def prefetch_model(model_id: str, revision: str = "") -> float:
         "model_prefetched",
         model=model_id,
         download_seconds=secs,
-        hf_transfer=os.environ.get("HF_HUB_ENABLE_HF_TRANSFER", ""),
         gpu=gpu_diagnostics(),
     )
     return secs

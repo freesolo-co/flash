@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from flash.serve.control import ModalProviderHandle
+from flash.serve.control._urls import modal_public_url_matches
 from flash.serve.control.types import validate_modal_provider_id
 from flash.serve.provisioning.modal.execution.sdk import (
     ModalAppObservation,
@@ -51,7 +52,7 @@ def deployed_app_matches(plan: ModalCreatePlan, app: ModalAppObservation) -> boo
         and app.tags == plan.tags
         and _valid_provider_id(app.function_id, "function")
         and app.function_name == plan.function_name
-        and app.public_url == plan.expected_public_url
+        and modal_public_url_matches(app.public_url, plan.expected_public_url)
     )
 
 
@@ -78,12 +79,16 @@ def terminal_app_matches(
     handle: ModalProviderHandle,
     app: ModalAppObservation,
 ) -> bool:
+    """match terminal ownership; callers must separately prove containers have drained."""
     return (
         _valid_provider_id(app.app_id, "app")
         and app.app_id == handle.app_id
         and app.app_name == plan.names.app_or_pod
         and app.state in {"stopped", "failed"}
-        and app.running_containers == 0
+        and (
+            app.running_containers is None
+            or (type(app.running_containers) is int and app.running_containers >= 0)
+        )
         and app.function_id is None
         and app.function_name is None
         and app.public_url is None
@@ -189,7 +194,10 @@ def _reclaim_app_matches(
         )
     return (
         app.state in {"stopped", "failed"}
-        and app.running_containers == 0
+        and (
+            app.running_containers is None
+            or (type(app.running_containers) is int and app.running_containers >= 0)
+        )
         and app.function_id is None
         and app.function_name is None
         and app.public_url is None

@@ -76,6 +76,7 @@ def _urlopen_no_redirect(
     *,
     timeout: float,
     urlopen: _UrlOpen | None = None,
+    deadline: float | None = None,
 ):
     """open one authenticated request through a transport that refuses redirects.
 
@@ -98,4 +99,9 @@ def _urlopen_no_redirect(
     transport = urlopen if urlopen is not None else urllib.request.urlopen
     if transport is not _STDLIB_URLOPEN:
         return transport(request, timeout=timeout)
-    return urllib.request.build_opener(_NoRedirectHandler()).open(request, timeout=timeout)
+    handlers = [_NoRedirectHandler()]
+    if deadline is not None:
+        from flash._internal.http_deadline import deadline_handlers
+
+        handlers.extend(deadline_handlers(deadline))
+    return urllib.request.build_opener(*handlers).open(request, timeout=timeout)

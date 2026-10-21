@@ -77,7 +77,6 @@ def test_large_grpo_plugin_config_uses_a_file_and_launches_the_child(tmp_path):
         "dp_cards": 1,
         "reentrant_checkpointing": False,
         "multimodal": False,
-        "entropy_quantile": None,
         "per_turn_credit": False,
         "stop_sequences": (),
         "image_pad_token_id": None,
@@ -153,7 +152,6 @@ def test_grpo_external_plugin_arms_without_importing_cuda_sensitive_targets(tmp_
                 "dp_cards": 2,
                 "reentrant_checkpointing": True,
                 "multimodal": True,
-                "entropy_quantile": 0.2,
                 "per_turn_credit": True,
                 "stop_sequences": ["</answer>"],
                 "image_pad_token_id": 151655,
@@ -189,7 +187,6 @@ expected_names = {
     "nonempty-response-mask",
     "exact-rollout-identity",
     "reentrant-checkpointing",
-    "entropy-quantile",
     "per-turn-credit",
     "stop-sequences",
     "image-pad-ban",
@@ -202,11 +199,11 @@ expected_names = {
 }
 assert set(flash_grpo_plugin.required_patch_names(config)) == expected_names
 expected_target_counts = {
+    "verl.utils.checkpoint.fsdp_checkpoint_manager": 1,
     "verl.single_controller.base.worker": 1,
     "verl.trainer.ppo.rollout_corr_helper": 1,
     "verl.experimental.agent_loop.agent_loop": 5,
     "verl.workers.engine.fsdp.transformer_impl": 2,
-    "verl.workers.utils.losses": 1,
     "verl.trainer.ppo.ray_trainer": 2,
     "verl.workers.rollout.vllm_rollout.vllm_async_server": 1,
     "transformers.models.qwen3_next.modeling_qwen3_next": 1,
@@ -797,3 +794,52 @@ def test_copied_flat_modules_have_no_importerror_fallback_to_flash():
                         and (child.module or "").startswith("flash.")
                     ]
                     assert not fallback_imports, path
+
+
+def test_required_checkpoint_survives_a_slow_publisher(monkeypatch, tmp_path):
+    import shutil
+    import threading
+
+    published = tmp_path / "published"
+    published.mkdir()
+    checkpoints = tmp_path / "checkpoints"
+    checkpoints.mkdir()
+    waiting = threading.Event()
+    released = threading.Event()
+
+    class Handler:
+        def save_checkpoint(self, step):
+            for old in checkpoints.iterdir():
+                shutil.rmtree(old)
+            (checkpoints / f"step-{step}").mkdir()
+            return step
+
+    module = types.ModuleType("verl.utils.checkpoint.checkpoint_handler")
+    module.CheckpointHandler = Handler
+    monkeypatch.setitem(sys.modules, module.__name__, module)
+    runtime.install_checkpoint_handler_filter((1, 5), 10)
+    runtime.install_checkpoint_publication_backpressure(str(published), (1, 5), 10)
+    handler = Handler()
+    assert handler.save_checkpoint(1) == 1
+    # Calls filtered out by the exact schedule must not wait for upload.
+    assert handler.save_checkpoint(2) is None
+    (published / "step-1").touch()
+    assert handler.save_checkpoint(5) == 5
+
+    def save_final():
+        waiting.set()
+        handler.save_checkpoint(10)
+        released.set()
+
+    thread = threading.Thread(target=save_final, daemon=True)
+    thread.start()
+    assert waiting.wait(1)
+    try:
+        assert not released.wait(0.2)
+        assert (checkpoints / "step-5").is_dir()
+        (published / "step-5").touch()
+        assert released.wait(2)
+        assert (checkpoints / "step-10").is_dir()
+    finally:
+        (published / "step-5").touch()
+        thread.join(2)

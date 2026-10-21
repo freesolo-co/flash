@@ -38,13 +38,11 @@ def _observe(failure: str, chosen=None, candidates=(), *, cache=False) -> Failur
     return FailureObservation(failure, chosen, candidates, cache)
 
 
-@pytest.mark.parametrize(
-    "failure", ["stalled", "job_preempted", "poll_error", "no_capacity", "oom"]
-)
+@pytest.mark.parametrize("failure", ["stalled", "poll_error", "no_capacity", "oom"])
 def test_candidate_bound_failures_select_only_strictly_larger_candidates(failure):
-    small = _candidate("runpod", "A100 PCIe", 80)
-    equal = _candidate("lambda", "H100", 80)
-    larger = _candidate("vast", "RTX Pro 6000", 96)
+    small = _candidate("modal", "A100 SXM", 80)
+    equal = _candidate("modal", "H100", 80)
+    larger = _candidate("modal", "RTX Pro 6000", 96)
     retry_state, plan = transition_failure(
         RetryState(2, 2, 1),
         _observe(failure, small, (small, equal, larger)),
@@ -56,11 +54,16 @@ def test_candidate_bound_failures_select_only_strictly_larger_candidates(failure
     assert plan.retry
     assert survivors == (larger,)
     assert chosen is larger
+    assert retry_state.usable_vram_floor == 80
+    assert retry_state.oom_used == (1 if failure == "oom" else 0)
+    assert retry_state.infra_used == (0 if failure == "oom" else 1)
+    restored = RetryState.from_snapshot(_spec(), retry_state.to_snapshot())
+    assert restored.select_candidate((equal, larger)) == ((larger,), larger)
 
 
 def test_candidate_bound_failure_stops_when_only_equal_vram_remains():
-    failed = _candidate("runpod", "A100 PCIe", 80)
-    equal = _candidate("lambda", "H100", 80)
+    failed = _candidate("modal", "A100 SXM", 80)
+    equal = _candidate("modal", "H100", 80)
     retry_state, plan = transition_failure(
         RetryState(2, 2, 1),
         _observe("stalled", failed, (failed, equal)),
@@ -72,9 +75,9 @@ def test_candidate_bound_failure_stops_when_only_equal_vram_remains():
 
 
 def test_retry_selection_preserves_allocator_order_among_larger_candidates():
-    failed = _candidate("runpod", "RTX 4090", 24)
-    first = _candidate("vast", "H100", 80)
-    second = _candidate("lambda", "RTX Pro 6000", 96)
+    failed = _candidate("modal", "L4", 24)
+    first = _candidate("modal", "H100", 80)
+    second = _candidate("modal", "RTX Pro 6000", 96)
     retry_state, _ = transition_failure(
         RetryState(2, 2, 1),
         _observe("stalled", failed, (failed, first, second)),
@@ -103,7 +106,7 @@ def test_candidate_less_poll_error_retries_but_no_capacity_stops():
 
 
 def test_cache_fallback_is_exact_one_shot_and_consumption_is_derived():
-    chosen = _candidate("lambda", "H100", 80, 2)
+    chosen = _candidate("modal", "H100", 80, 2)
     retry_state, plan = transition_failure(
         RetryState(2, 2, 1),
         _observe("poll_error", chosen, (chosen,), cache=True),
@@ -112,35 +115,27 @@ def test_cache_fallback_is_exact_one_shot_and_consumption_is_derived():
 
     assert plan.retry
     assert retry_state.drop_weight_cache
-    assert retry_state.cache_retry_shape == ("lambda", "H100", 2)
+    assert retry_state.cache_retry_shape == ("modal", "H100", 2)
     assert "cache_used" not in retry_state.to_snapshot()
     assert retry_state.select_candidate((chosen,))[1] is chosen
 
 
 def test_cache_retry_shape_does_not_fall_through_when_exact_shape_disappears():
-    exact = _candidate("runpod", "H100", 80, 2)
-    larger = _candidate("runpod", "B200", 180)
+    exact = _candidate("modal", "H100", 80, 2)
+    larger = _candidate("modal", "B200", 180)
     retry_state = replace(
         RetryState(2, 2, 1),
         drop_weight_cache=True,
-        cache_retry_shape=("runpod", "H100", 2),
+        cache_retry_shape=("modal", "H100", 2),
     )
 
     assert retry_state.select_candidate((larger,)) == ((larger,), None)
     assert retry_state.select_candidate((exact, larger)) == ((exact, larger), exact)
 
 
-def test_queue_grace_stays_ordinary_until_cache_fallback_is_consumed():
-    chosen = _candidate("runpod", "H100", 80)
-    retry_state = RetryState(0, 1, 1)
-
-    assert not retry_state.on_last_gpu(chosen, (chosen,), cache_fallback_available=True)
-    assert retry_state.on_last_gpu(chosen, (chosen,), cache_fallback_available=False)
-
-
 def test_retry_floor_uses_executed_width_scale():
-    failed = _candidate("runpod", "RTX 4090", 24, 2)
-    larger = _candidate("runpod", "A100 SXM 40GB", 40)
+    failed = _candidate("modal", "L4", 24, 2)
+    larger = _candidate("modal", "A100 SXM 40GB", 40)
     retry_state, plan = transition_failure(
         RetryState(0, 1, 0),
         _observe("oom", failed, (failed, larger)),
@@ -176,7 +171,7 @@ def test_snapshot_round_trip_uses_one_nested_decision_and_is_frozen():
         lambda snapshot: snapshot.update(last_decision=[]),
         lambda snapshot: snapshot["last_decision"].update(attempt=True),
         lambda snapshot: snapshot["last_decision"]["plan"].update(retry=1),
-        lambda snapshot: snapshot.update(cache_retry_shape=["runpod", "H100"]),
+        lambda snapshot: snapshot.update(cache_retry_shape=["modal", "H100"]),
         lambda snapshot: snapshot.update(drop_weight_cache="yes"),
     ],
 )
@@ -198,13 +193,13 @@ def test_atomic_retry_cas_has_one_owner_and_reuses_persisted_plan(monkeypatch, t
     state._save_status(state.RunStatus(spec.run_id, "running", spec.to_dict()))
     claim = attempts.reserve_verified_attempt_launch(spec.run_id)
     assert claim is not None
-    chosen = _candidate("runpod", "RTX 4090", 24)
+    chosen = _candidate("modal", "L4", 24)
 
     winner = decide_attempt_failure(
         spec.run_id,
         claim_token=claim.token,
         expected_remote=None,
-        observation=_observe("stalled", chosen, (chosen, _candidate("runpod", "H100", 80))),
+        observation=_observe("stalled", chosen, (chosen, _candidate("modal", "H100", 80))),
         attempt=0,
     )
     stale = decide_attempt_failure(
@@ -224,3 +219,30 @@ def test_atomic_retry_cas_has_one_owner_and_reuses_persisted_plan(monkeypatch, t
     )
     assert persisted.last_decision is not None
     assert persisted.last_decision.failure == "stalled"
+
+
+def test_preemption_resumes_at_the_largest_shape_without_raising_the_oom_floor():
+    chosen = _candidate("modal", "H100", 80, 8)
+    original = replace(RetryState.initial_for_spec(_spec()), usable_vram_floor=40)
+    updated, plan = transition_failure(
+        original, _observe("job_preempted", chosen, (chosen,)), attempt=0
+    )
+    restored = RetryState.from_snapshot(_spec(), updated.to_snapshot())
+    assert plan.retry
+    assert plan.infra_retry_ordinal == 1
+    assert restored.usable_vram_floor == 40
+    assert restored.oom_used == 0
+    assert restored.select_candidate((chosen,)) == ((chosen,), chosen)
+
+
+@pytest.mark.parametrize("budget", [0, 2])
+def test_preemption_retries_are_bounded_even_when_the_same_shape_is_available(budget):
+    chosen = _candidate("modal", "H100", 80, 8)
+    retry_state = RetryState(budget, 2, 1)
+    for attempt in range(budget + 1):
+        retry_state, plan = transition_failure(
+            retry_state, _observe("job_preempted", chosen, (chosen,)), attempt=attempt
+        )
+        assert plan.retry is (attempt < budget)
+    assert retry_state.infra_used == budget
+    assert "budget exhausted" in plan.action

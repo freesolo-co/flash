@@ -144,13 +144,20 @@ def has_freesolo_backend(api_url: str) -> bool:
     return bool(backend) and not is_freesolo_hosted_url(backend)
 
 
-def _detail_from_http_error(exc: urllib.error.HTTPError) -> object:
+def _detail_from_http_error(
+    exc: urllib.error.HTTPError, *, deadline: float | None = None
+) -> object:
     """Extract the server's ``detail`` from an HTTPError body, as parsed.
 
     A structured detail stays a dict so the caller can read its ``code``; anything else is the
     string it always was. ``str()`` it for a message, but branch on the object itself.
     """
-    body = exc.read()
+    try:
+        with contextlib.closing(exc):
+            body = _read_response_body(exc, deadline=deadline)
+    except (OSError, http.client.HTTPException, ClientError):
+        # Preserve the status when the error body is incomplete or exceeds its deadline.
+        return str(exc)
     try:
         detail = json.loads(body).get("detail") or body.decode()
     except (ValueError, AttributeError):
@@ -318,12 +325,14 @@ class ApiClient:
         )
 
     @contextlib.contextmanager
-    def _translate_http_errors(self) -> Iterator[None]:
+    def _translate_http_errors(self, *, deadline: float | None = None) -> Iterator[None]:
         """Map urllib transport errors to ApiError/ClientError; other exceptions propagate."""
         try:
             yield
         except urllib.error.HTTPError as exc:
-            detail = self._auth_error_detail(exc.code, _detail_from_http_error(exc))
+            detail = self._auth_error_detail(
+                exc.code, _detail_from_http_error(exc, deadline=deadline)
+            )
             raise ApiError(exc.code, str(detail), detail=detail) from exc
         except urllib.error.URLError as exc:
             if isinstance(getattr(exc, "reason", None), TimeoutError):
@@ -339,6 +348,12 @@ class ApiClient:
             raise RequestTimeoutError(
                 f"request to the Flash service at {self.api_url} timed out; "
                 "check your network connection and FLASH_API_URL"
+            ) from exc
+        except http.client.RemoteDisconnected as exc:
+            raise ServiceUnreachableError(
+                f"the Flash service at {self.api_url} closed the connection without a response; "
+                "check service health and FLASH_API_URL. The request may have been accepted; "
+                "check its status before submitting it again"
             ) from exc
 
     def _decode_response(
@@ -422,9 +437,9 @@ class ApiClient:
         )
         deadline = time.monotonic() + body_deadline if body_deadline is not None else None
         with (
-            self._translate_http_errors(),
+            self._translate_http_errors(deadline=deadline),
             _urlopen_no_redirect(
-                req, timeout=_capped_timeout(timeout or self.timeout, deadline)
+                req, timeout=_capped_timeout(timeout or self.timeout, deadline), deadline=deadline
             ) as resp,
         ):
             raw = _read_response_body(
@@ -616,15 +631,22 @@ class ApiClient:
                 pass
             else:
                 last_state = str(status.get("state") or "unknown")
-                deployment = status.get("deployment") or {}
-                terminal = last_state in {"cancelled", "done", "failed", "dry_run"}
-                revocation_failed = (
-                    isinstance(deployment, dict) and deployment.get("state") == "revocation_failed"
+                deployment = next(
+                    (
+                        record
+                        for record in (status.get("deployments") or {}).values()
+                        if record.get("state") == "cleanup_pending"
+                    ),
+                    {},
                 )
-                if terminal and revocation_failed:
+                terminal = last_state in {"cancelled", "done", "failed", "dry_run"}
+                cleanup_pending = (
+                    isinstance(deployment, dict) and deployment.get("state") == "cleanup_pending"
+                )
+                if terminal and cleanup_pending:
                     error = deployment.get("error") or "unknown backend teardown error"
                     raise ClientError(
-                        "cancel request reached the control plane, but backend revocation is "
+                        "cancel request reached the control plane, but backend cleanup is "
                         f"unconfirmed: {error}; retry cancellation"
                     ) from cause
                 if terminal:
@@ -689,12 +711,12 @@ class ApiClient:
 
     def _serving_deployment(
         self,
-        base_run_id: str,
+        checkpoint_id: str,
         timeout: float | None,
         *,
         body_deadline: float | None = None,
     ) -> dict | None:
-        """The run's servable deployment record, or None when it has none.
+        """The exact checkpoint deployment record, or None when it has none.
 
         Read from the run-scoped route rather than the listing. `/v1/deployments` walks every run
         the key owns and loads each one's status before a caller picks a single record out, so on
@@ -702,16 +724,18 @@ class ApiClient:
         expire scanning unrelated runs while the requested revision is already ready
         `/v1/runs/{run_id}/deploy` resolves the one run directly.
 
-        ``body_deadline`` additionally bounds the read in WALL-CLOCK time. ``timeout`` alone is a
-        per-socket-operation bound, so a peer that trickles bytes just inside it can hold the read
-        open indefinitely; a caller that must return within a fixed budget has to pass both (see
-        ``env_list``). ``--wait`` polling deliberately does not: it owns a deadline spanning many
-        reads and recomputes each one's share.
+        ``body_deadline`` additionally bounds status, headers and body in WALL-CLOCK time.
+        ``timeout`` alone is a per-socket-operation bound, so a peer that trickles bytes
+        just inside it can hold the read open indefinitely; a caller that must return within a fixed budget has to pass both (see
+        ``env_list``). ``--wait`` polling recomputes the remaining share of its total deadline
+        and passes it as both bounds for every read.
         """
+        base_run_id, _ = _parse_adapter_target(checkpoint_id)
+        quoted = urllib.parse.quote(checkpoint_id, safe="")
         try:
             deployment = self._request(
                 "GET",
-                f"/v1/runs/{base_run_id}/deploy",
+                f"/v1/runs/{base_run_id}/deploy?checkpoint_id={quoted}",
                 timeout=timeout,
                 body_deadline=body_deadline,
             )
@@ -735,7 +759,9 @@ class ApiClient:
             deployment = {**deployment, "run_id": base_run_id}
         return deployment
 
-    def deployment_for(self, run_id: str, timeout: float | None = None) -> dict | None:
+    def deployment_for(
+        self, run_id: str, timeout: float | None = None, *, body_deadline: float | None = None
+    ) -> dict | None:
         """The deployment record for the checkpoint named in ``run_id``, or None.
 
         ``deploy`` returns as soon as the record is persisted, which is normally before the
@@ -746,33 +772,13 @@ class ApiClient:
         that: the default client timeout is 60s, so one stalled read inside a `--wait 5` would
         overshoot the bound the user asked for by an order of magnitude.
         """
-        base_run_id, _ = _parse_adapter_target(run_id)
-        deployment = self._serving_deployment(base_run_id, timeout)
+        deployment = self._serving_deployment(run_id, timeout, body_deadline=body_deadline)
         if deployment is None:
             return None
         # the exact checkpoint identity must match the caller's requested target.
         if deployment.get("checkpoint_id") != run_id:
             return None
         return deployment
-
-    def deployed_checkpoint(
-        self,
-        run_id: str,
-        timeout: float | None = None,
-        *,
-        body_deadline: float | None = None,
-    ) -> dict | None:
-        """Whatever checkpoint the run serves right now, whichever step that is.
-
-        The counterpart to ``deployment_for``, which answers the narrower "is MY revision live?"
-        and hides any other. A caller about to deploy needs the opposite: the record it is about
-        to displace is by definition the one the step filter drops.
-
-        ``body_deadline`` bounds the whole read in wall-clock time; ``timeout`` alone bounds each
-        socket operation, which a peer trickling bytes just inside it can extend without limit.
-        """
-        base_run_id, _ = _parse_adapter_target(run_id)
-        return self._serving_deployment(base_run_id, timeout, body_deadline=body_deadline)
 
     def chat(
         self,

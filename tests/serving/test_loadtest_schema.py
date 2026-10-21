@@ -15,7 +15,7 @@ def scenario_payload() -> dict:
         "endpoint": "https://example.invalid",
         "expected_deployment": {"sha": "94210a3", "deployment_id": "deploy-1"},
         "credential_env": "FAKE_SERVING_TOKEN",
-        "required_capabilities": ["permanent_checkpoint_identity"],
+        "required_capabilities": ["serving_contract_v2"],
         "discovery": {
             "enabled": True,
             "include": ["model-a", "model-b", "model-c"],

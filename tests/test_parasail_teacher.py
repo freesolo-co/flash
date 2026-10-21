@@ -1137,7 +1137,7 @@ def _worker_client_after_http_error(monkeypatch, *, status, reason, body):
         return _StaticResponse(_parasail_success())
 
     sleeps = []
-    monkeypatch.setattr(worker_teacher._ThreadLocalHttpsTransport, "urlopen", urlopen)
+    monkeypatch.setattr(worker_teacher._TeacherHttpTransport, "urlopen", urlopen)
     monkeypatch.setattr(worker_teacher.time, "sleep", sleeps.append)
     client = worker_teacher.TeacherClient(
         "capability-value",

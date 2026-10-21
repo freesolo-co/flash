@@ -8,6 +8,7 @@ import shutil
 import threading
 import time
 from collections.abc import Callable
+from dataclasses import dataclass
 
 import flash.engine.worker.io.heartbeat as _worker_heartbeat
 import flash.engine.worker.runtime.state as _worker_state
@@ -29,6 +30,36 @@ from flash.teacher.retry_contract import (
     canonical_opd_optimizer_start_json,
     opd_optimizer_start_marker_path,
 )
+
+
+@dataclass(frozen=True)
+class ArtifactCommit:
+    path: str
+    revision: str | None
+
+
+@dataclass(frozen=True)
+class PublicationResult:
+    """storage proof survives independent cleanup and notification failures."""
+
+    resume: ArtifactCommit | None = None
+    resume_staged: bool = False
+    deployable: ArtifactCommit | None = None
+    skipped_reason: str | None = None
+    upload_error: str | None = None
+    prune_errors: tuple[str, ...] = ()
+    reporting_error: str | None = None
+
+    def __bool__(self):
+        raise TypeError("inspect publication commit facts explicitly")
+
+
+def _report_publication(stage: str, step: int, **fields) -> str | None:
+    try:
+        _worker_heartbeat.heartbeat(stage, step=step, **fields)
+    except Exception as error:
+        return sanitize_diagnostic(error, limit=300)
+    return None
 
 
 class RequiredSaveError(RuntimeError):
@@ -79,9 +110,9 @@ def _disable_xet_upload_staging() -> None:
 
 
 def hf_api():
-    from huggingface_hub import HfApi
+    from flash.engine.worker.io.transfer import upload_api
 
-    return HfApi(token=os.environ.get("HF_TOKEN"))
+    return upload_api(token=os.environ.get("HF_TOKEN"))
 
 
 def hf_prefix() -> str:
@@ -291,6 +322,12 @@ def hf_resume_checkpoint(
                 detail = f" at revision {revision}" if revision else ""
                 raise RetriableInfraError(f"required resume checkpoint is missing{detail}")
             return None
+        from flash.engine.support.checkpoint_transport import restore_directory
+
+        with liveness_heartbeat("checkpoint_prefetching"):
+            for _step, name in candidates:
+                _require_hf_deadline_allowance()
+                restore_directory(os.path.join(base, name))
         latest = _highest_resume_candidate(base, candidates, prefer)
         path = os.path.join(base, latest)
         print(f"[resume] found streamed checkpoint: {path}")
@@ -343,70 +380,72 @@ def _write_deployable_provenance(ckpt_dir: str) -> None:
         write_base_model_provenance(ckpt_dir, spec.model, getattr(spec, "model_revision", "") or "")
 
 
+# required checkpoint uploads share a bounded retry budget and deadline-aware backoff.
+_CKPT_UPLOAD_RETRIES = 3
+_CKPT_UPLOAD_BACKOFF_S = 5.0
+
+
 def publish_deployable_checkpoint(
     ckpt_dir: str,
     step: int,
     *,
-    retries: int = 1,
-    backoff_s: float = 0.0,
+    retries: int | None = None,
+    backoff_s: float = _CKPT_UPLOAD_BACKOFF_S,
     required: bool = False,
     _provenance_ready: bool = False,
     _emit_heartbeat: bool = True,
-) -> str | None:
-    """Mirror a verl checkpoint's LoRA adapter to a stable per-step path.
-
-    Periodic saves remain best-effort. ``required=True`` fails loudly when an exact required save
-    cannot be published.
-    """
-    if not _worker_state.HF_REPO:
+) -> PublicationResult:
+    """commit an adapter once; reporting can never trigger a second storage commit."""
+    if not _worker_state.HF_REPO or not _has_deployable_adapter(ckpt_dir):
+        reason = "no_repository" if not _worker_state.HF_REPO else "no_adapter"
         if required:
-            raise RequiredSaveError(f"required save step {step} has no artifact repository")
-        return None
-    if not _has_deployable_adapter(ckpt_dir):
-        if required:
-            raise RequiredSaveError(
-                f"required save step {step} has no deployable adapter in {ckpt_dir}"
-            )
-        return None
-    # staged optional checkpoints already carry provenance and must remain immutable during upload.
+            raise RequiredSaveError(f"required save step {step}: {reason}")
+        return PublicationResult(skipped_reason=reason)
     if not _provenance_ready:
         _write_deployable_provenance(ckpt_dir)
     subfolder = f"{hf_prefix()}/checkpoints/step-{step}/adapter"
+    if retries is None:
+        retries = _CKPT_UPLOAD_RETRIES if required else 1
     attempts = max(1, int(retries))
-    last_error: Exception | None = None
-    for attempt in range(attempts):
-        try:
-            _require_hf_deadline_allowance()
-            hf_api().upload_folder(
-                folder_path=ckpt_dir,
-                path_in_repo=subfolder,
-                repo_id=_worker_state.HF_REPO,
-                repo_type="dataset",
-                ignore_patterns=list(_CHECKPOINT_TRAINER_STATE),
-            )
-            if _emit_heartbeat:
-                _worker_heartbeat.heartbeat("checkpoint_deployable", step=step, subfolder=subfolder)
-            return subfolder
-        except Exception as e:
-            last_error = e
-            print(f"[ckpt] deployable publish warn (step {step}):", e)
-            if attempt + 1 < attempts:
-                try:
-                    if not _sleep_with_hf_deadline(backoff_s * (attempt + 1)):
-                        break
-                except Exception:
-                    break
-    if required:
-        raise RetriableInfraError(
-            f"required save step {step} deployable upload failed"
-        ) from last_error
-    return None
-
-
-# Retry/backoff for each synchronous checkpoint upload. the watcher BLOCKS on the upload, so a
-# transient HF error is retried until the step lands rather than costing the step.
-_CKPT_UPLOAD_RETRIES = 3
-_CKPT_UPLOAD_BACKOFF_S = 5.0
+    heartbeat_context = (
+        _worker_heartbeat.liveness_heartbeat(
+            "checkpoint_uploading", progress=lambda: step, progress_step=True, keepalive=True
+        )
+        if _emit_heartbeat
+        else contextlib.nullcontext()
+    )
+    with heartbeat_context:
+        for attempt in range(attempts):
+            try:
+                _require_hf_deadline_allowance()
+                receipt = hf_api().upload_folder(
+                    folder_path=ckpt_dir,
+                    path_in_repo=subfolder,
+                    repo_id=_worker_state.HF_REPO,
+                    repo_type="dataset",
+                    ignore_patterns=list(_CHECKPOINT_TRAINER_STATE),
+                )
+                break
+            except Exception as error:
+                print(f"[ckpt] deployable publish warn (step {step}):", error)
+                if attempt + 1 < attempts:
+                    try:
+                        if _sleep_with_hf_deadline(backoff_s * (attempt + 1)):
+                            continue
+                    except Exception:
+                        pass
+                if required:
+                    raise RetriableInfraError(
+                        f"required save step {step} deployable upload failed"
+                    ) from error
+                return PublicationResult(upload_error=sanitize_diagnostic(error, limit=300))
+    commit = ArtifactCommit(subfolder, getattr(receipt, "oid", None))
+    reporting_error = (
+        _report_publication("checkpoint_deployable", step, subfolder=subfolder)
+        if _emit_heartbeat
+        else None
+    )
+    return PublicationResult(deployable=commit, reporting_error=reporting_error)
 
 
 def _deployable_adapter_on_hf(step: int) -> bool:
@@ -435,7 +474,7 @@ def _deployable_adapter_on_hf(step: int) -> bool:
         raise RetriableInfraError(f"could not verify required save step {step} on hf") from e
 
 
-def _prune_stale_resume_checkpoints(keep_step: int) -> None:
+def _prune_stale_resume_checkpoints(keep_step: int) -> tuple[str, ...]:
     """Delete older ``{prefix}/checkpoint/checkpoint-N`` directories.
 
     The streamed resume checkpoint is meant to be latest-only, but ``upload_folder``'s delete_patterns
@@ -445,15 +484,14 @@ def _prune_stale_resume_checkpoints(keep_step: int) -> None:
     (``{prefix}/checkpoints/...``, plural) has a different prefix and is untouched.
     """
     if not _worker_state.HF_REPO:
-        return
+        return ()
     api = hf_api()
     base = f"{hf_prefix()}/checkpoint/"
     try:
         _require_hf_deadline_allowance()
         files = api.list_repo_files(repo_id=_worker_state.HF_REPO, repo_type="dataset")
     except Exception as e:
-        print("ckpt prune warn (list):", e)
-        return
+        return (sanitize_diagnostic(e, limit=300),)
     stale: set[str] = set()
     for f in files:
         if not f.startswith(base):
@@ -469,35 +507,29 @@ def _prune_stale_resume_checkpoints(keep_step: int) -> None:
                 path_in_repo=folder, repo_id=_worker_state.HF_REPO, repo_type="dataset"
             )
         except Exception as e:
-            print(f"ckpt prune warn ({folder}):", e)
-            break
+            return (sanitize_diagnostic(e, limit=300),)
+    return ()
 
 
 def upload_resume_checkpoint(
     step: int,
     ckpt_dir: str,
     *,
-    before_upload=None,
-    after_upload=None,
-    skip_upload=None,
     emit_heartbeat: bool = True,
     lock_timeout_s: float | None = None,
-) -> bool:
-    """synchronously stream one full-state resume checkpoint and ordered companion artifacts."""
+    final_step: int | None = None,
+) -> PublicationResult:
+    """publish native state; callers explicitly order companion publications."""
     if not _worker_state.HF_REPO:
-        return True
-
+        return PublicationResult(skipped_reason="no_repository")
+    from flash.engine.support.checkpoint_transport import upload_directory
+    from flash.engine.worker.io.cpu_handoff import stage_final_checkpoint
     from flash.engine.worker.io.heartbeat import liveness_heartbeat
 
-    before_completed = before_upload is None
-    resume_completed = False
-    after_completed = after_upload is None
+    path = f"{hf_prefix()}/checkpoint/checkpoint-{step}"
     with _resume_checkpoint_upload_slot(lock_timeout_s) as acquired:
         if not acquired:
-            print(f"[ckpt] step {step} upload skipped; another checkpoint upload is still active")
-            return False
-        if skip_upload is not None and skip_upload():
-            return True
+            return PublicationResult(skipped_reason="upload_busy")
         heartbeat_context = (
             liveness_heartbeat(
                 "checkpoint_uploading", progress=lambda: step, progress_step=True, keepalive=True
@@ -506,68 +538,68 @@ def upload_resume_checkpoint(
             else contextlib.nullcontext()
         )
         with heartbeat_context:
+            commit = None
+            last_error = None
+            prune_errors = ()
             for attempt in range(_CKPT_UPLOAD_RETRIES):
-                failure_stage = "resume"
                 try:
-                    if not before_completed:
-                        failure_stage = "before"
-                        before_upload()
-                        before_completed = True
-                    if not resume_completed:
-                        failure_stage = "resume"
+                    _require_hf_deadline_allowance()
+                    if stage_final_checkpoint(step, ckpt_dir, final_step=final_step):
+                        report_error = (
+                            _report_publication("checkpoint_staged", step)
+                            if emit_heartbeat
+                            else None
+                        )
+                        return PublicationResult(resume_staged=True, reporting_error=report_error)
+                    with upload_directory(ckpt_dir) as folder:
                         _require_hf_deadline_allowance()
-                        hf_api().upload_folder(
-                            folder_path=ckpt_dir,
-                            path_in_repo=f"{hf_prefix()}/checkpoint/checkpoint-{step}",
+                        receipt = hf_api().upload_folder(
+                            folder_path=folder,
+                            path_in_repo=path,
                             repo_id=_worker_state.HF_REPO,
                             repo_type="dataset",
+                            delete_patterns="*",
                         )
-                        # prune only after the atomic folder commit lands, so the prior complete save
-                        # survives every failed replacement upload.
-                        _prune_stale_resume_checkpoints(step)
-                        resume_completed = True
-                    if not after_completed:
-                        failure_stage = "after"
-                        after_upload()
-                        after_completed = True
-                    if emit_heartbeat:
-                        failure_stage = "heartbeat"
-                        _worker_heartbeat.heartbeat("checkpoint_uploaded", step=step)
-                    return True
-                except RequiredSaveError:
-                    raise
-                except Exception as e:
+                        commit = ArtifactCommit(path, getattr(receipt, "oid", None))
+                    break
+                except Exception as error:
+                    last_error = sanitize_diagnostic(error, limit=300)
+                    if commit is not None:
+                        # local transport cleanup failed after the remote commit.
+                        prune_errors = (last_error,)
+                        break
                     if attempt + 1 < _CKPT_UPLOAD_RETRIES:
-                        print(
-                            f"[ckpt] step {step} upload retry "
-                            f"{attempt + 1}/{_CKPT_UPLOAD_RETRIES}: {e}"
-                        )
                         try:
-                            if not _sleep_with_hf_deadline(_CKPT_UPLOAD_BACKOFF_S * (attempt + 1)):
-                                break
+                            if _sleep_with_hf_deadline(_CKPT_UPLOAD_BACKOFF_S * (attempt + 1)):
+                                continue
                         except Exception:
-                            break
-                    else:
-                        print(
-                            f"[ckpt] step {step} upload FAILED after "
-                            f"{_CKPT_UPLOAD_RETRIES} attempts: {e}"
-                        )
-                        if emit_heartbeat:
-                            with contextlib.suppress(Exception):
-                                # worker stdout is not part of control-plane run logs, so the stage
-                                # name alone would otherwise be the entire failure report.
-                                _worker_heartbeat.heartbeat(
-                                    "checkpoint_upload_failed",
-                                    step=step,
-                                    checkpoint_failure={
-                                        "step": step,
-                                        "operation": failure_stage,
-                                        "error": sanitize_diagnostic(e, limit=300),
-                                    },
-                                )
-                        if failure_stage in {"before", "after"}:
-                            raise
-    return False
+                            pass
+                    break
+            if commit is None:
+                report_error = (
+                    _report_publication(
+                        "checkpoint_upload_failed",
+                        step,
+                        checkpoint_failure={
+                            "step": step,
+                            "operation": "resume",
+                            "error": last_error,
+                        },
+                    )
+                    if emit_heartbeat
+                    else None
+                )
+                return PublicationResult(upload_error=last_error, reporting_error=report_error)
+            try:
+                prune_errors += _prune_stale_resume_checkpoints(step)
+            except Exception as error:
+                prune_errors += (sanitize_diagnostic(error, limit=300),)
+            report_error = (
+                _report_publication("checkpoint_uploaded", step) if emit_heartbeat else None
+            )
+            return PublicationResult(
+                resume=commit, prune_errors=prune_errors, reporting_error=report_error
+            )
 
 
 # re-exported so the prefetch surface stays reachable as `hf.<name>`: the tests patch

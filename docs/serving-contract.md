@@ -16,8 +16,8 @@ and tokenizer provenance. The 35B-A3B engine serves BF16 weights on one H200 wit
 32K context, eight sequences, a 4096 batched-token cap, and six rank-64 LoRA slots.
 
 Customer-owned `flash serve` is Modal-only and requires the explicit provider argument. Historical
-customer-serving RunPod deployment identities are unsupported, with no migration, status, undeploy,
-or teardown shim. Managed RunPod training remains supported and unchanged. Retired Qwen3.6 27B is
+legacy provider deployment identities are unsupported, with no migration, status, undeploy,
+or teardown shim. Training also uses Modal; the retired providers are unsupported. Retired Qwen3.6 27B is
 never translated into Qwen3.8 27B.
 
 Run-backed adapters use only:
@@ -33,7 +33,7 @@ The grammar is exact. Bare run ids, omitted checkpoints, padded steps, whitespac
 
 ```json
 {
-  "adapter_id": "run-abc/step-10",
+  "model_id": "run-abc/step-10",
   "checkpoint": "run-abc/step-10",
   "run_id": "run-abc",
   "checkpoint_step": 10,
@@ -171,4 +171,5 @@ Flash expects the coordinated Freesolo migration to provide:
 - lifecycle-only mutable updates protected by immutable-field database enforcement;
 - accounting RPCs accepting `checkpoint_id` and private `artifact_fingerprint` without legacy identity fields.
 
-The old and new binaries are not compatible. Deploy them only through the documented maintenance-window cutover.
+The old and new binaries are not compatible. Deploy them only through the
+[checkpoint field cutover](checkpoint-field-cutover.md).

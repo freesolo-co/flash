@@ -480,16 +480,6 @@ def _resolve_grpo_inputs():
     _t = _worker_state.JOB_SPEC.train if _worker_state.JOB_SPEC else None
     options = _resolve_grpo_options(_t, rl, multi_turn)
 
-    # entropy_quantile keeps the loss to the top-entropy tokens of each completion. verl has no
-    # such knob, so a sitecustomize shim adds it; see render_entropy_quantile_shim. a value >= 1.0
-    # (or unset) masks nothing and needs no shim.
-    configured_quantile = getattr(_t, "entropy_quantile", None) if _t else None
-    entropy_quantile = (
-        float(configured_quantile)
-        if configured_quantile is not None and float(configured_quantile) < 1.0
-        else None
-    )
-
     mask_truncated_completions = _worker_config.grpo_mask_truncated_completions(_t)
     options["mask_truncated_completions"] = mask_truncated_completions
     warmstart_adapter = ""
@@ -574,7 +564,6 @@ def _resolve_grpo_inputs():
         _t, rl, prompts, options["prompts_per_step"], lengths, multi_turn
     )
     pinned = {
-        "entropy_quantile": entropy_quantile,
         # verl always checkpoints (enable_gradient_checkpointing=True) and always asks for
         # non-reentrant recompute, which the MoE router and GDN chunk-scan die on. resolved here so
         # the child shim can put the flag back to what the model needs.

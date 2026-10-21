@@ -30,6 +30,7 @@ import flash.serve.deployment.deploy as serving_deploy
 import flash.server.platform.deployment_state as deployment_state
 from flash.serve.contract.errors import RetryableServingUnavailable
 from flash.server.domain.registry import envs
+from tests._helpers.deployments import only_deployment, records
 
 pytest.importorskip("fastapi")
 
@@ -270,7 +271,6 @@ def test_deployment_state_and_public_deployment():
     pub = deployment_state._public_deployment(
         {
             "state": "ready",
-            "previous_deployment": {"x": 1},
             "endpoint_name": "https://serve.example",
             "openai_base_url": "https://serve.example/v1",
             "b": 2,
@@ -308,24 +308,6 @@ def test_deployment_attempt_is_stale_branches():
         serving._deployment_attempt_is_stale(old, now=1000.0 + serving._DEPLOYMENT_STALE_SECONDS)
         is True
     )
-
-
-def test_chat_messages_from_payload_validation():
-    assert serving_revisions._chat_messages_from_payload({}) == []
-    assert serving_revisions._chat_messages_from_payload({"messages": None}) == []
-
-    valid = [{"role": "user", "content": "hi"}]
-    assert serving_revisions._chat_messages_from_payload({"messages": valid}) is valid
-
-    with pytest.raises(HTTPException) as not_list:
-        serving_revisions._chat_messages_from_payload({"messages": "nope"})
-    assert not_list.value.status_code == 400
-    assert "messages must be a list" in not_list.value.detail
-
-    with pytest.raises(HTTPException) as bad_item:
-        serving_revisions._chat_messages_from_payload({"messages": [{"role": "user"}, "oops"]})
-    assert bad_item.value.status_code == 400
-    assert "messages[1]" in bad_item.value.detail
 
 
 def _png_data_uri(image_format: str = "PNG", color: str = "red") -> str:
@@ -442,7 +424,7 @@ def test_chat_payload_rejects_images_training_would_refuse(messages, expected_de
     the count, role, mime, byte, and decoded-memory limits while serving enforced none of them.
     """
     with pytest.raises(HTTPException) as rejected:
-        serving_revisions._chat_messages_from_payload({"messages": messages})
+        serving_revisions._managed_chat_messages(messages)
     assert rejected.value.status_code == 400
     assert expected_detail in rejected.value.detail
 
@@ -456,7 +438,7 @@ def test_chat_payload_forwards_text_only_requests_byte_for_byte():
     """
     text_only = [{"role": "user", "content": "hi"}, {"role": "assistant", "content": "ok"}]
     before = copy.deepcopy(text_only)
-    forwarded = serving_revisions._chat_messages_from_payload({"messages": text_only})
+    forwarded = serving_revisions._managed_chat_messages(text_only)
     assert forwarded == before
     assert text_only == before
 
@@ -479,7 +461,7 @@ def test_chat_payload_forwards_images_in_the_shape_it_validated():
         }
     ]
     before = copy.deepcopy(aliased)
-    forwarded = serving_revisions._chat_messages_from_payload({"messages": aliased})
+    forwarded = serving_revisions._managed_chat_messages(aliased)
     assert [block["type"] for block in forwarded[0]["content"]] == ["text", "image_url"]
     assert forwarded[0]["content"][1]["image_url"]["url"] == uri
     # the caller's own object is never rewritten in place.
@@ -490,7 +472,7 @@ def test_chat_payload_preserves_image_order_when_canonicalizing():
     """four images arrive upstream in the order the caller sent them, with their exact bytes."""
     uris = [_png_data_uri(color=color) for color in ("red", "green", "blue", "yellow")]
     messages = [{"role": "user", "content": [_image_block(uri) for uri in uris]}]
-    forwarded = serving_revisions._chat_messages_from_payload({"messages": messages})
+    forwarded = serving_revisions._managed_chat_messages(messages)
     assert [block["image_url"]["url"] for block in forwarded[0]["content"]] == uris
 
 
@@ -546,18 +528,18 @@ def test_recover_deployments_fails_busy_and_skips_missing(monkeypatch):
     statuses = {
         # busy with no timestamp
         "r-stale": types.SimpleNamespace(
-            run_id="r-stale", state="done", deployment={"state": "queued"}
+            run_id="r-stale", state="done", deployments=records("r-stale", {"state": "queued"})
         ),
         # busy and freshly updated
         "r-fresh": types.SimpleNamespace(
             run_id="r-fresh",
             state="done",
-            deployment={"state": "queued", "updated_at": time.time()},
+            deployments=records("r-fresh", {"state": "queued", "updated_at": time.time()}),
         ),
         "r-held": types.SimpleNamespace(
             run_id="r-held",
             state="done",
-            deployment={"state": "reconciling", "updated_at": time.time()},
+            deployments=records("r-held", {"state": "reconciling", "updated_at": time.time()}),
         ),
     }
 
@@ -572,7 +554,9 @@ def test_recover_deployments_fails_busy_and_skips_missing(monkeypatch):
 
     def mark_failed(run_id, failed):
         marked.append((run_id, failed))
-        return types.SimpleNamespace(run_id=run_id, state="done", deployment=failed)
+        return types.SimpleNamespace(
+            run_id=run_id, state="done", deployments=records(run_id, failed)
+        )
 
     monkeypatch.setenv("FLASH_DEPLOY_SYNC", "1")
     monkeypatch.setattr(runner_transitions, "mark_deployment_failed", mark_failed)
@@ -593,15 +577,17 @@ def test_recover_deployments_fails_busy_and_skips_missing(monkeypatch):
     assert all(failed["state"] == "failed" for _run_id, failed in marked)
     assert all("control-plane restart" in failed["error"] for _run_id, failed in marked)
     assert sorted(status.run_id for status in reported) == ["r-fresh", "r-stale"]
-    assert all(status.deployment["state"] == "failed" for status in reported)
+    assert all(only_deployment(status)["state"] == "failed" for status in reported)
 
 
 def test_recover_deployments_rechecks_busy_state_under_lock(monkeypatch):
     statuses = [
-        types.SimpleNamespace(run_id="r-settled", deployment={"state": "queued"}),
+        types.SimpleNamespace(
+            run_id="r-settled", deployments=records("r-settled", {"state": "queued"})
+        ),
         types.SimpleNamespace(
             run_id="r-settled",
-            deployment={"state": "ready"},
+            deployments=records("r-settled", {"state": "ready"}),
             spec={"run_id": "r-settled", "model": "Qwen/Qwen3.5-9B", "algorithm": "sft"},
         ),
     ]
@@ -631,7 +617,7 @@ def test_recover_deployments_retires_a_ready_deployment_this_build_cannot_serve(
         "r-retired": types.SimpleNamespace(
             run_id="r-retired",
             state="done",
-            deployment={"state": "ready"},
+            deployments=records("r-retired", {"state": "ready"}),
             spec={
                 "run_id": "r-retired",
                 "model": "Qwen/Qwen3.5-9B",
@@ -644,7 +630,7 @@ def test_recover_deployments_retires_a_ready_deployment_this_build_cannot_serve(
         "r-servable": types.SimpleNamespace(
             run_id="r-servable",
             state="done",
-            deployment={"state": "ready"},
+            deployments=records("r-servable", {"state": "ready"}),
             spec={
                 "run_id": "r-servable",
                 "model": "Qwen/Qwen3.5-9B",
@@ -656,58 +642,52 @@ def test_recover_deployments_retires_a_ready_deployment_this_build_cannot_serve(
     monkeypatch.setattr(run_status, "get_status", lambda run_id: statuses[run_id])
     marked: list[tuple[str, dict]] = []
 
-    def mark_failed(run_id, failed):
+    def mark_failed(run_id, error, checkpoint_id):
+        failed = {"state": "cleanup_pending", "checkpoint_id": checkpoint_id, "error": error}
         marked.append((run_id, failed))
-        return types.SimpleNamespace(run_id=run_id, state="done", deployment=failed)
+        return types.SimpleNamespace(
+            run_id=run_id, state="done", deployments=records(run_id, failed)
+        )
 
     monkeypatch.setenv("FLASH_DEPLOY_SYNC", "1")
-    monkeypatch.setattr(runner_transitions, "mark_deployment_failed", mark_failed)
+    monkeypatch.setattr(runner_transitions, "mark_deployment_cleanup_pending", mark_failed)
     monkeypatch.setattr(runner_reporting, "_report_status", lambda status: None)
 
     assert serving_completion.recover_deployments() == 1
     assert [run_id for run_id, _failed in marked] == ["r-retired"]
     for _run_id, failed in marked:
-        assert failed["state"] == "failed"
+        assert failed["state"] == "cleanup_pending"
         # the reason names the actual cause, not the restart the busy branch reports.
         assert "no longer supported" in failed["error"]
 
 
-def test_recover_deployments_reports_restored_ready_predecessor(monkeypatch):
-    previous = {
-        "state": "ready",
-        "endpoint_name": "https://serve.example",
-        "adapter_revision": "r-stale@final." + "a" * 40,
-    }
-    status = types.SimpleNamespace(
-        run_id="r-stale",
-        state="deployed",
-        deployment={"state": "queued", "previous_deployment": previous},
+def test_recovery_fails_only_unfinished_checkpoint_and_reports_inventory(monkeypatch, tmp_path):
+    from flash.runner.lifecycle import state
+    from tests._helpers.deployments import seed_ready_checkpoint
+
+    monkeypatch.setattr(state, "RUNS_DIR", str(tmp_path))
+    state._save_status(state.RunStatus(run_id="r-stale", state="deployed", spec={}))
+    seed_ready_checkpoint("r-stale", "r-stale/final")
+    runner_transitions.mark_deployment_pending(
+        "r-stale",
+        {
+            "checkpoint_id": "r-stale/step-20",
+            "checkpoint_step": 20,
+            "state": "queued",
+            "generation": 1,
+            "requested_at": 1.0,
+        },
     )
+    before = run_status.get_status("r-stale").deployments["r-stale/final"]
     monkeypatch.setattr(serving.db, "all_runs", lambda: [{"run_id": "r-stale"}])
-    monkeypatch.setattr(run_status, "get_status", lambda _run_id: status)
-
-    def mark_failed(run_id, failed):
-        assert run_id == "r-stale"
-        return types.SimpleNamespace(
-            run_id=run_id,
-            state="deployed",
-            deployment={
-                **previous,
-                "last_deploy_error": failed["error"],
-                "last_deploy_failed_at": time.time(),
-            },
-        )
-
-    reported = []
-
+    monkeypatch.setattr(serving_completion, "_spec_is_unservable", lambda _status: False)
     monkeypatch.setenv("FLASH_DEPLOY_SYNC", "1")
-    monkeypatch.setattr(runner_transitions, "mark_deployment_failed", mark_failed)
+    reported = []
     monkeypatch.setattr(runner_reporting, "_report_status", reported.append)
-
     assert serving_completion.recover_deployments() == 1
     assert len(reported) == 1
-    assert reported[0].deployment["state"] == "ready"
-    assert "control-plane restart" in reported[0].deployment["last_deploy_error"]
+    assert reported[0].deployments["r-stale/final"] == before
+    assert reported[0].deployments["r-stale/step-20"]["state"] == "failed"
 
 
 def _smoke_spec(

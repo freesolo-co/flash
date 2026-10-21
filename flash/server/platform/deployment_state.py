@@ -39,27 +39,11 @@ def _enqueue_deployment_report(status) -> None:
 
 def _report_persisted_transition(previous, current, *, persisted: bool) -> None:
     if not persisted or (
-        previous.state == current.state and previous.deployment == current.deployment
+        previous.state == current.state and previous.deployments == current.deployments
     ):
         return
     _enqueue_deployment_report(current)
 
 
 def _deployment_failure_persisted(status, failed: dict) -> bool:
-    if status.deployment == failed:
-        return True
-    previous = failed.get("previous_deployment")
-    deployment = status.deployment
-    failure_fields = {"last_deploy_error", "last_deploy_failed_at"}
-    expected_error = failed.get("error") or "deployment failed"
-    return bool(
-        isinstance(previous, dict)
-        and isinstance(deployment, dict)
-        and all(
-            deployment.get(key) == value
-            for key, value in previous.items()
-            if key not in failure_fields
-        )
-        and deployment.get("last_deploy_error") == expected_error
-        and deployment.get("last_deploy_failed_at") is not None
-    )
+    return status.deployments.get(failed["checkpoint_id"]) == failed

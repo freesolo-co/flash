@@ -72,7 +72,7 @@ def write_train_meta(
         gpu=gpu_diagnostics(),
     )
     m = RunMetrics(
-        arm=os.environ.get("FLASH_ARM", "runpod"),
+        arm=os.environ.get("FLASH_ARM", "modal"),
         phase=phase,
         # Completed optimizer updates (opd passes step=opt_steps; sft/rl omit it -> None). _finalize
         # reads metrics.step to carry the true step onto the terminal `done` heartbeat.
@@ -106,7 +106,10 @@ def _finalize(metrics: RunMetrics, *, heartbeat_fields=None):
     hf_io.hf_upload_file("/tmp/metrics.json", "metrics.json", required=True)
     with open("/tmp/DONE", "w") as handle:
         handle.write(str(time.time()))
-    hf_io.hf_upload_file("/tmp/DONE", "DONE", required=True)
+    from flash.engine.worker.io.cpu_handoff import defer_completion
+
+    if not defer_completion("/tmp/DONE"):
+        hf_io.hf_upload_file("/tmp/DONE", "DONE", required=True)
     step = metrics.step
     step_field = {"step": int(step)} if isinstance(step, (int, float)) and step > 0 else {}
     heartbeat_io.heartbeat("done", **step_field, **(heartbeat_fields or {}), gpu=gpu_diagnostics())

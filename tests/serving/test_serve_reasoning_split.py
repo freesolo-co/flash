@@ -16,9 +16,10 @@ import orjson
 import pytest
 from fastapi.testclient import TestClient
 
+from flash.serve.app.openai import ReasoningDeltaSplitter, split_reasoning
+from flash.serving.src.accounting.usage import AuthorizedTraffic, principal_for_external_org
 from flash.serving.src.http.router import AdapterRouter
 from flash.serving.src.http.router import build_offline_serving_app as build_serving_app
-from flash.serving.src.io.responses import _ReasoningStreamSplitter, _split_reasoning
 from flash.serving.src.io.schemas import AdapterRecord
 from tests.serving.checkpoint_fixtures import checkpoint_record
 from tests.serving.conftest import attest
@@ -26,8 +27,8 @@ from tests.serving.conftest import attest
 QWEN = "Qwen/Qwen3.5-9B"
 
 
-async def _allow(_token: str, _adapter_id: str, _scope: dict | None = None) -> str:
-    return "org-1"
+async def _allow(_token: str, _adapter_id: str, _scope: dict | None = None) -> AuthorizedTraffic:
+    return AuthorizedTraffic(principal_for_external_org("org-1"), "generation-a")
 
 
 def _rec(run_id: str, *, thinking: bool = True) -> AdapterRecord:
@@ -46,7 +47,7 @@ class _NoReadyPool:
             {
                 "type": "delta",
                 "text": "write </think> verbatim",
-                "checkpoint": record.adapter_id,
+                "checkpoint": record.model_id,
             },
         )
         yield self.first_event
@@ -58,7 +59,7 @@ class _NoReadyPool:
     async def register(self, base_model, record) -> None:
         pass
 
-    async def unregister(self, base_model, org_id, adapter_id, expected_generation=None) -> None:
+    async def unregister(self, base_model, org_id, model_id, expected_generation=None) -> None:
         pass
 
 
@@ -78,14 +79,14 @@ class _Pool:
                 "text": self._text,
                 "finish_reason": "stop",
                 "thinking": self._thinking,
-                "checkpoint": record.adapter_id,
+                "checkpoint": record.model_id,
             },
         )
 
     async def stream_generate(self, base_model, payload, record, *, expected_checkpoint=None):
         yield attest(
             record,
-            {"type": "ready", "checkpoint": record.adapter_id, "thinking": self._thinking},
+            {"type": "ready", "checkpoint": record.model_id, "thinking": self._thinking},
         )
         for delta in self._deltas:
             yield {"type": "delta", "text": delta}
@@ -94,7 +95,7 @@ class _Pool:
     async def register(self, base_model, record) -> None:
         pass
 
-    async def unregister(self, base_model, org_id, adapter_id, expected_generation=None) -> None:
+    async def unregister(self, base_model, org_id, model_id, expected_generation=None) -> None:
         pass
 
 
@@ -139,12 +140,12 @@ def _stream_deltas(client: TestClient) -> list[dict]:
 
 
 # ------------------------------------------------------------------------------------------
-# _split_reasoning: the pure non-streaming split
+# split_reasoning: the pure non-streaming split
 # ------------------------------------------------------------------------------------------
 
 
 def test_split_reasoning_separates_reasoning_from_answer():
-    assert _split_reasoning("weighing it up</think>the answer", True) == (
+    assert split_reasoning("weighing it up</think>the answer", thinking=True) == (
         "weighing it up",
         "the answer",
     )
@@ -152,13 +153,13 @@ def test_split_reasoning_separates_reasoning_from_answer():
 
 def test_split_reasoning_unclosed_block_is_all_reasoning():
     """Hitting max_tokens mid-reasoning leaves no answer; an empty content is the honest report."""
-    assert _split_reasoning("still thinking", True) == ("still thinking", "")
+    assert split_reasoning("still thinking", thinking=True) == ("still thinking", "")
 
 
 def test_split_reasoning_leaves_non_thinking_text_verbatim():
     """A non-thinking completion that merely QUOTES the tag must not be torn in half, and gets no
     reasoning_content at all."""
-    assert _split_reasoning("write </think> to close it", False) == (
+    assert split_reasoning("write </think> to close it", thinking=False) == (
         None,
         "write </think> to close it",
     )
@@ -166,53 +167,36 @@ def test_split_reasoning_leaves_non_thinking_text_verbatim():
 
 def test_split_reasoning_splits_on_the_first_close_only():
     """A quoted tag inside the answer stays in the answer."""
-    assert _split_reasoning("think</think>say </think> to close", True) == (
+    assert split_reasoning("think</think>say </think> to close", thinking=True) == (
         "think",
         "say </think> to close",
     )
 
 
 # ------------------------------------------------------------------------------------------
-# _ReasoningStreamSplitter: the incremental split
+# ReasoningDeltaSplitter: the incremental split
 # ------------------------------------------------------------------------------------------
 
 
-def test_stream_splitter_routes_reasoning_then_content():
-    splitter = _ReasoningStreamSplitter(True)
-    assert splitter.feed("weighing") == ("weighing", "")
-    assert splitter.feed(" it up</think>the ") == (" it up", "the ")
-    assert splitter.feed("answer") == ("", "answer")
-    assert splitter.flush() == ""
-
-
-@pytest.mark.parametrize("cut", [1, 2, 3, 4, 5, 6, 7])
-def test_stream_splitter_handles_a_tag_straddling_chunks(cut):
-    """The closing tag arrives token by token and can land across any chunk boundary. No matter
-    where it is cut, the tag itself must never leak into either side of the split."""
-    splitter = _ReasoningStreamSplitter(True)
-    reasoning = ""
-    content = ""
-    for chunk in ("think", "</think>"[:cut], "</think>"[cut:], "answer"):
-        head, tail = splitter.feed(chunk)
-        reasoning += head
-        content += tail
-    reasoning += splitter.flush()
-    assert (reasoning, content) == ("think", "answer")
-
-
-def test_stream_splitter_flushes_an_unclosed_block_as_reasoning():
-    """The block never closed, so the held-back partial match is reasoning, not a lost fragment."""
-    splitter = _ReasoningStreamSplitter(True)
-    assert splitter.feed("thinking</thin") == ("thinking", "")
-    assert splitter.flush() == "</thin"
-    # flush drains: a second call must not replay the same text.
-    assert splitter.flush() == ""
-
-
-def test_stream_splitter_passes_non_thinking_text_straight_through():
-    splitter = _ReasoningStreamSplitter(False)
-    assert splitter.feed("write </think> to close") == ("", "write </think> to close")
-    assert splitter.flush() == ""
+@pytest.mark.parametrize("thinking", [True, False])
+@pytest.mark.parametrize(
+    "text",
+    [
+        "weighing it up</think>the answer",
+        "<think>weighing it up</think>the answer",
+        "thinking</thin",
+        "think</think>say </think> to close",
+    ],
+)
+def test_shared_stream_splitter_matches_complete_response_at_every_boundary(thinking, text):
+    expected_reasoning, expected_content = split_reasoning(text, thinking=thinking)
+    for cut in range(len(text) + 1):
+        splitter = ReasoningDeltaSplitter(thinking=thinking)
+        events = splitter.feed(text[:cut]) + splitter.feed(text[cut:]) + splitter.finish()
+        reasoning = "".join(value for kind, value in events if kind == "reasoning_content")
+        content = "".join(value for kind, value in events if kind == "content")
+        assert (reasoning, content) == (expected_reasoning or "", expected_content)
+        assert splitter.finish() == []
 
 
 # ------------------------------------------------------------------------------------------

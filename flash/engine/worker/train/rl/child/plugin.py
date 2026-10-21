@@ -34,7 +34,6 @@ def _install_multi_turn() -> None:
 
 def required_patch_specs(config: dict) -> tuple[tuple, ...]:
     """describe every fail-closed GRPO patch without importing its target modules."""
-    entropy_quantile = config.get("entropy_quantile")
     model_type = config.get("gdn_model_type")
     return (
         (
@@ -80,15 +79,6 @@ def required_patch_specs(config: dict) -> tuple[tuple, ...]:
             "verl.workers.engine.fsdp.transformer_impl",
             runtime.install_text_lora_targeting,
             (str(config.get("lora_language_prefix") or ""),),
-            {},
-        ),
-        (
-            "entropy-quantile",
-            entropy_quantile is not None and float(entropy_quantile) < 1.0,
-            "required",
-            "verl.workers.utils.losses",
-            patches.install_entropy_quantile,
-            (float(entropy_quantile) if entropy_quantile is not None else 1.0,),
             {},
         ),
         (
@@ -174,6 +164,7 @@ def required_patch_names(config: dict) -> list[str]:
 def install() -> None:
     config = runtime.load_plugin_config_file("FLASH_GRPO_PLUGIN_CONFIG_PATH")
     marker_file = str(config["marker_file"])
+    runtime.install_compact_checkpoints(marker_file)
     for name, enabled, kind, target, installer, args, kwargs in required_patch_specs(config):
         if not enabled:
             continue

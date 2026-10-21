@@ -827,6 +827,8 @@ def _install_verl_extensions() -> None:
     # `sequence_ids=` instead of prompt_ids/response_ids and kills the first rollout.
     from verl.trainer.main_ppo_sync import PPOTrainer
 
+    flash_opd_runtime.install_checkpoint_schedule(PPOTrainer, _PLUGIN_CONFIG)
+
     class FlashSingleTurnAgentLoop(SingleTurnAgentLoop):
         async def run(self, sampling_params: dict[str, Any], **kwargs):
             params = dict(sampling_params)
@@ -985,7 +987,10 @@ if PLUGIN_LOADED_EXTERNALLY:
     import flash_verl_runtime
 
     _PLUGIN_CONFIG.update(flash_verl_runtime.load_plugin_config("FLASH_OPD_PLUGIN_CONFIG"))
+    flash_verl_runtime.install_compact_checkpoints(str(_PLUGIN_CONFIG["marker_file"]))
     flash_opd_runtime.install(_PLUGIN_CONFIG)
+else:
+    from flash.engine.worker.train.opd.child import runtime as flash_opd_runtime
 
 if os.environ.get("FLASH_OPD_STRUCTURED_OUTPUTS"):
     _require_structured_runtime_versions()

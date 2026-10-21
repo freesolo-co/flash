@@ -27,8 +27,6 @@ _REQUIRED_OVERRIDE_KEYS = (
     "ulysses_sp_size",
     "lr",
     "warmup_ratio",
-    "optimizer_impl",
-    "optimizer_name",
     "local_dir",
     "save_freq",
     "n_gpus_per_node",
@@ -36,6 +34,7 @@ _REQUIRED_OVERRIDE_KEYS = (
     "project_name",
     "experiment_name",
     "loop_epochs",
+    "total_training_steps",
 )
 
 
@@ -71,22 +70,14 @@ _VERL_OPTIMIZER_IMPL = "torch.optim"
 _VERL_OPTIMIZER_NAME = "AdamW"
 
 
-def _optimizer_override_config(cfg: dict) -> dict:
-    override = dict(cfg.get("optimizer_kwargs") or {})
-    override.setdefault("eps", cfg.get("eps", 1e-8))
-    return override
-
-
 def build_sft_overrides(cfg: dict) -> list[str]:
     """build hydra overrides for verl's ``sft_trainer_engine.yaml`` config."""
     missing = [key for key in _REQUIRED_OVERRIDE_KEYS if key not in cfg]
     if missing:
         raise KeyError(f"build_sft_overrides missing required cfg keys: {missing}")
-    steps = cfg.get("total_training_steps")
-    epochs = cfg.get("total_epochs")
-    if bool(steps) == bool(epochs):
-        raise ValueError("set exactly one of cfg['total_training_steps'] or cfg['total_epochs']")
-    optimizer_override = _optimizer_override_config(cfg)
+    steps = cfg["total_training_steps"]
+    if type(steps) is not int or steps <= 0:
+        raise ValueError("total_training_steps must be a positive integer")
 
     overrides = [
         f"data.train_files={_hydra_val(cfg['train_files'])}",
@@ -128,7 +119,8 @@ def build_sft_overrides(cfg: dict) -> list[str]:
         # table; triton wins on sm90+ and loses below it.
         "model.use_fused_kernels=true",
         f"model.fused_kernel_options.impl_backend={cfg['fused_ce_backend']}",
-        f"model.use_liger={_hydra_val(cfg.get('use_liger', False))}",
+        # liger severs lora gradients under fsdp2; fused CE uses use_fused_kernels instead.
+        "model.use_liger=false",
         f"model.enable_gradient_checkpointing={_hydra_val(cfg.get('gradient_checkpointing', True))}",
         "engine.strategy=fsdp2",
         "engine.model_dtype=bfloat16",
@@ -136,11 +128,11 @@ def build_sft_overrides(cfg: dict) -> list[str]:
         f"engine.ulysses_sequence_parallel_size={_hydra_val(cfg['ulysses_sp_size'])}",
         f"optim.lr={_hydra_val(cfg['lr'])}",
         f"optim.lr_warmup_steps_ratio={_hydra_val(cfg['warmup_ratio'])}",
-        f"optim.optimizer_impl={_hydra_val(cfg['optimizer_impl'])}",
-        f"optim.optimizer={_hydra_val(cfg['optimizer_name'])}",
-        f"optim.weight_decay={_hydra_val(cfg.get('weight_decay', 0.0))}",
-        f"optim.betas={_hydra_val(cfg.get('betas', [0.9, 0.999]))}",
-        f"optim.override_optimizer_config={_hydra_val(optimizer_override)}",
+        f"optim.optimizer_impl={_VERL_OPTIMIZER_IMPL}",
+        f"optim.optimizer={_VERL_OPTIMIZER_NAME}",
+        "optim.weight_decay=0.0",
+        "optim.betas=[0.9,0.999]",
+        "optim.override_optimizer_config={eps:0.00000001}",
         f"trainer.default_local_dir={_hydra_val(cfg['local_dir'])}",
         f"trainer.save_freq={_hydra_val(cfg['save_freq'])}",
         f"trainer.n_gpus_per_node={_hydra_val(cfg['n_gpus_per_node'])}",
@@ -162,10 +154,7 @@ def build_sft_overrides(cfg: dict) -> list[str]:
         # publishes required interval checkpoints to HF durably, so on-pod history is redundant.
         "trainer.max_ckpt_to_keep=1",
     ]
-    if steps:
-        overrides.append(f"trainer.total_training_steps={_hydra_val(steps)}")
-    else:
-        overrides.append("trainer.total_training_steps=null")
+    overrides.append(f"trainer.total_training_steps={steps}")
     return overrides
 
 

@@ -21,7 +21,7 @@ import flash.serve.request.transport as serving_transport
 from flash.serve.contract.errors import ServingError
 from flash.serve.contract.provenance import immutable_binding_fingerprint
 
-_IMMUTABLE_SERVING_CAPABILITIES = {"permanent_checkpoint_identity"}
+_IMMUTABLE_SERVING_CAPABILITIES = {"serving_contract_v2"}
 
 
 @pytest.fixture(autouse=True)
@@ -109,7 +109,9 @@ def _stub_adapter_config(
             "_require_serving_capabilities",
             lambda **_kwargs: set(_IMMUTABLE_SERVING_CAPABILITIES),
         )
-    monkeypatch.setattr(deploy, "_wait_checkpoint_ready", lambda *a, **k: {})
+    monkeypatch.setattr(
+        deploy, "_wait_checkpoint_ready", lambda *a, **k: {"deployment_generation": "generation-a"}
+    )
     return seen
 
 
@@ -145,7 +147,7 @@ def _capture_registration_body(
     deploy_kwargs.setdefault("org_id", "org-1")
     stub_serving_registry(
         {
-            "adapter_id": f"{run_id}/final",
+            "checkpoint_id": f"{run_id}/final",
             "subfolder": f"{deploy_kwargs['adapter_prefix']}/adapter",
         }
     )
@@ -561,7 +563,7 @@ def test_deploy_registers_with_freesolo_serving(monkeypatch, tmp_path, stub_serv
     )
     assert seen["url"] == "https://serve.example/adapters"
     expected = {
-        "adapter_id": "flash-7-abcd/final",
+        "model_id": "flash-7-abcd/final",
         "repo_id": "org/repo",
         "base_model": "Qwen/Qwen3.5-9B",
         "subfolder": "sft/flash-7-abcd/seed0/adapter",
@@ -660,7 +662,7 @@ def test_deploy_registers_structured_outputs_for_thinking_after_capability_probe
 @pytest.mark.parametrize(
     ("health_case", "match"),
     [
-        ("missing_checkpoint_identity", "permanent_checkpoint_identity"),
+        ("missing_checkpoint_identity", "serving_contract_v2"),
         ("missing_thinking_structured", "thinking_structured_outputs_deferred_v1"),
         ("malformed", "must return a list field named capabilities"),
         ("invalid_json", "did not return valid JSON"),
@@ -694,7 +696,7 @@ def test_thinking_structured_capability_failure_never_posts_adapter(
                 d.THINKING_STRUCTURED_OUTPUTS_CAPABILITY
             }
             missing = {
-                "missing_checkpoint_identity": "permanent_checkpoint_identity",
+                "missing_checkpoint_identity": "serving_contract_v2",
                 "missing_thinking_structured": d.THINKING_STRUCTURED_OUTPUTS_CAPABILITY,
             }.get(health_case)
             return {"capabilities": sorted(capabilities - ({missing} if missing else set()))}
@@ -732,7 +734,7 @@ def test_wait_checkpoint_ready_retries_transient_read_errors(monkeypatch):
 
     revision = "run-1/final"
     ready = {
-        "adapter_id": revision,
+        "model_id": revision,
         "subfolder": "sft/run-1/seed0/adapter",
         "metadata": {"lifecycle_state": "ready"},
     }
@@ -789,81 +791,52 @@ def test_wait_checkpoint_ready_caps_reads_by_remaining_wall_time(monkeypatch):
     assert clock[0] == 105.0
 
 
-def test_revision_ready_budget_scales_with_base_model_size():
-    """A cold engine loads the BASE model, so the readiness budget must track its size.
+@pytest.mark.parametrize(
+    "model",
+    ["Qwen/Qwen3.5-9B", "Qwen/Qwen3.8-27B", "Qwen/Qwen3.6-35B-A3B", "fork/model"],
+)
+def test_cold_checkpoint_can_finish_after_the_old_readiness_limit(monkeypatch, model):
+    """A healthy cold engine and adapter load must survive the controller's polling budget."""
+    import flash.serve.deployment.deploy as deploy
+    from flash.server.routes.serving import _deployment_attempt_is_stale
+    from flash.serving.app.timeouts import REQUEST_TIMEOUT_SECONDS, STARTUP_TIMEOUT_SECONDS
 
-    The flat 5-minute budget timed out deploys that were still loading a large base and reported it
-    as `remained 'registered'`; re-running the identical deploy against the now-warm engine
-    succeeded. Bigger base, bigger budget.
-    """
-    from flash.core.catalog import MODELS
+    clock = [100.0]
+    started = clock[0]
+    ready_after = STARTUP_TIMEOUT_SECONDS + REQUEST_TIMEOUT_SECONDS / 2
+    revision = "run-1/step-1"
+    subfolder = "rl/run-1/checkpoints/step-1/adapter"
 
-    smallest = serving_readiness.revision_ready_budget_seconds("Qwen/Qwen3.5-9B")
-    largest = serving_readiness.revision_ready_budget_seconds("Qwen/Qwen3.6-35B-A3B")
-    assert smallest >= serving_readiness.REVISION_READY_MIN_BUDGET_SECONDS
-    assert largest > smallest
-
-    # monotonic in params_b across the whole catalog: a bigger checkpoint never gets less time.
-    budgets = [
-        (info.params_b, serving_readiness.revision_ready_budget_seconds(model_id))
-        for model_id, info in MODELS.items()
-    ]
-    for _params_b, budget in budgets:
-        assert (
-            serving_readiness.REVISION_READY_MIN_BUDGET_SECONDS
-            <= budget
-            <= serving_readiness.REVISION_READY_MAX_BUDGET_SECONDS
+    def registered(_org, _revision, *, timeout_s=None):
+        state = "ready" if clock[0] - started >= ready_after else "loading"
+        return (
+            {"subfolder": subfolder, "metadata": {"lifecycle_state": state}},
+            types.SimpleNamespace(headers={}),
         )
-    ordered = [budget for _params, budget in sorted(budgets)]
-    assert ordered == sorted(ordered)
-    # the surviving catalog has only one sub-cap row, so add a synthetic smaller row to prove the
-    # per-b term remains live without restoring a retired executable model id.
-    from dataclasses import replace
 
-    synthetic_id = "test/readiness-budget-smaller"
-    MODELS[synthetic_id] = replace(MODELS["Qwen/Qwen3.5-9B"], id=synthetic_id, params_b=1.0)
-    try:
-        synthetic = serving_readiness.revision_ready_budget_seconds(synthetic_id)
-    finally:
-        del MODELS[synthetic_id]
-    assert serving_readiness.REVISION_READY_MIN_BUDGET_SECONDS < synthetic < smallest
-
-    # an MoE is sized by its TOTAL params: every expert is resident even though a token routes
-    # through few, so active_params_b must not shrink the budget. asserted against the formula
-    # directly rather than against the 35B entry, whose scaled value clamps at the cap.
-    moe = MODELS["Qwen/Qwen3.6-35B-A3B"]
-    assert moe.is_moe
-    assert moe.active_params_b < moe.params_b
-    by_total = min(
-        serving_readiness.REVISION_READY_MIN_BUDGET_SECONDS
-        + serving_readiness.REVISION_READY_SECONDS_PER_PARAM_B * moe.params_b,
-        serving_readiness.REVISION_READY_MAX_BUDGET_SECONDS,
+    monkeypatch.setattr(deploy, "_registered_adapter_response", registered)
+    monkeypatch.setattr(deploy, "READBACK_DELAY_SECONDS", 0.25)
+    monkeypatch.setattr(deploy.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(deploy.time, "sleep", lambda delay: clock.__setitem__(0, clock[0] + delay))
+    result = deploy._wait_checkpoint_ready(
+        "org-1",
+        revision,
+        subfolder,
+        budget_s=serving_readiness.revision_ready_budget_seconds(model),
     )
-    by_active = min(
-        serving_readiness.REVISION_READY_MIN_BUDGET_SECONDS
-        + serving_readiness.REVISION_READY_SECONDS_PER_PARAM_B * moe.active_params_b,
-        serving_readiness.REVISION_READY_MAX_BUDGET_SECONDS,
+    assert result["metadata"]["lifecycle_state"] == "ready"
+    assert clock[0] - started >= ready_after
+    assert not _deployment_attempt_is_stale(
+        {"state": "queued", "requested_at": started}, now=clock[0]
     )
-    assert largest == by_total
-    assert largest > by_active
-
-
-def test_revision_ready_budget_unknown_model_keeps_the_floor():
-    """A fork's own catalog entry or a revision-pinned id must not fail the lookup into an error."""
-
-    for unknown in ("some-org/not-in-catalog", "", "   "):
-        assert (
-            serving_readiness.revision_ready_budget_seconds(unknown)
-            == serving_readiness.REVISION_READY_MIN_BUDGET_SECONDS
-        )
 
 
 def test_revision_ready_budget_leaves_room_for_the_rest_of_the_deploy():
     """Readiness is one leg of the attempt, and the other legs have no wall-clock bound of their own.
 
     The same deploy resolves the hub revision, downloads the adapter config to read its rank, checks
-    capabilities and registers before this wait, then runs immutable smoke, activates, and verifies
-    the alias. all of that has to finish before the control plane declares the attempt abandoned and
+    capabilities and registers before this wait, then runs its immutable checkpoint smoke. All of
+    that must finish before the control plane declares the attempt abandoned and
     before the CLI's default `--wait` gives up, so the cap must reserve time rather than merely clear
     smoke.
     """
@@ -878,7 +851,7 @@ def test_revision_ready_budget_leaves_room_for_the_rest_of_the_deploy():
         _build_parser().parse_args(["models", "deploy", "run-1", "--wait"]).wait
     )
 
-    bounded = serving_readiness.REVISION_READY_MAX_BUDGET_SECONDS + 2 * _SMOKE_BUDGET_SECONDS
+    bounded = serving_readiness.REVISION_READY_MAX_BUDGET_SECONDS + _SMOKE_BUDGET_SECONDS
     assert bounded < _DEPLOYMENT_STALE_SECONDS
     # and the CLI must not call a still-progressing deploy failed before the plane reaps it.
     assert bounded < cli_default_wait
@@ -907,7 +880,7 @@ def test_deploy_funds_the_readiness_wait_from_the_model_budget(monkeypatch, tmp_
         assert org_id == "org-1"
         assert checkpoint_id == "run-1/final"
         budgets.append(kwargs.get("budget_s"))
-        return {}
+        return {"deployment_generation": "generation-a"}
 
     monkeypatch.setattr(d, "_wait_checkpoint_ready", wait_ready)
 
@@ -920,7 +893,7 @@ def test_deploy_funds_the_readiness_wait_from_the_model_budget(monkeypatch, tmp_
     )
 
     assert budgets == [serving_readiness.revision_ready_budget_seconds("Qwen/Qwen3.6-35B-A3B")]
-    assert budgets[0] > serving_readiness.REVISION_READY_MIN_BUDGET_SECONDS
+    assert budgets[0] == serving_readiness.REVISION_READY_MAX_BUDGET_SECONDS
 
 
 def test_checkpoint_ready_timeout_message_is_self_diagnosing(monkeypatch):
@@ -1160,7 +1133,7 @@ def test_deploy_ready_read_returned_at_deadline_never_succeeds(monkeypatch, tmp_
 
     def registered(org_id, adapter_id, *, timeout_s=None):
         assert org_id == "org-1"
-        assert adapter_id == registration_body["adapter_id"]
+        assert adapter_id == registration_body["model_id"]
         # the deploy funds this read from the model's own scaled budget, not the bare floor.
         assert timeout_s == serving_readiness.revision_ready_budget_seconds("Qwen/Qwen3.5-9B")
         clock[0] += timeout_s
@@ -1227,7 +1200,7 @@ def test_deploy_requires_and_forwards_org_id(monkeypatch, tmp_path, stub_serving
     monkeypatch.setattr(httpx, "post", fake_post)
     # deploy reads the registry back before reporting ready
     stub_serving_registry(
-        {"adapter_id": "flash-7-abcd", "subfolder": "sft/flash-7-abcd/seed0/adapter"}
+        {"checkpoint_id": "flash-7-abcd", "subfolder": "sft/flash-7-abcd/seed0/adapter"}
     )
 
     d.deploy_adapter(
@@ -1271,7 +1244,7 @@ def test_deploy_sends_thinking_default(monkeypatch, tmp_path, stub_serving_regis
     monkeypatch.setattr(httpx, "post", fake_post)
     # deploy reads the registry back before reporting ready
     stub_serving_registry(
-        {"adapter_id": "flash-7-abcd", "subfolder": "sft/flash-7-abcd/seed0/adapter"}
+        {"checkpoint_id": "flash-7-abcd", "subfolder": "sft/flash-7-abcd/seed0/adapter"}
     )
 
     d.deploy_adapter(
@@ -1499,8 +1472,8 @@ def test_readiness_receives_complete_facts_after_registry_readiness(
         monkeypatch.setattr(
             d,
             "_wait_checkpoint_ready",
-            lambda org_id, checkpoint_id, subfolder, **kwargs: events.append(
-                ("ready", checkpoint_id)
+            lambda org_id, checkpoint_id, subfolder, **kwargs: (
+                events.append(("ready", checkpoint_id)) or {"deployment_generation": "generation-a"}
             ),
         )
         return replace(real_metadata(*args, **kwargs), targets_images=targets_images)
@@ -1510,6 +1483,11 @@ def test_readiness_receives_complete_facts_after_registry_readiness(
     def before_ready(facts: d.DeploymentReadinessFacts) -> None:
         assert events[-1] == ("ready", "flash-7-abcd/final")
         observed.append(facts)
+        monkeypatch.setattr(
+            d,
+            "_registered_adapter",
+            lambda *a, **k: {"status": "ready", "deployment_generation": "generation-a"},
+        )
 
     _capture_registration_body(
         monkeypatch,

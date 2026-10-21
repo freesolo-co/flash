@@ -46,8 +46,8 @@ def wait_for_terminal_app(
             observation,
             app_id_hint=target_app_id if handle is None else None,
         )
-        if app is not None and app.state in {"stopped", "failed"}:
-            return observation if app.running_containers == 0 else None
+        if app is not None and app.state in {"stopped", "failed"} and app.running_containers == 0:
+            return observation
         if not sleep_until_poll(deadline_at, clock, sleep):
             return None
 

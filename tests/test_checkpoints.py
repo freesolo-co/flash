@@ -25,7 +25,7 @@ SPEC_DICT = {
     "algorithm": "grpo",
     "environment": {"id": "github:freesolo-co/envs@main:gsm8k/environment.py"},
     "train": {"epochs": 1, "max_examples": 1, "hf_repo": "org/test-runs"},
-    "gpu": {"type": "RTX 5090"},
+    "gpu": {"type": "L40S"},
     "run_id": "flash-ckpt-1",
     "project": _PROJECT_ID,
 }
@@ -78,7 +78,7 @@ def test_publish_deployable_checkpoint_uploads_adapter_only(tmp_path, monkeypatc
     (ckpt / "adapter_model.safetensors").write_bytes(b"weights")
     (ckpt / "optimizer.pt").write_bytes(b"opt")
 
-    subfolder = worker.publish_deployable_checkpoint(str(ckpt), 80)
+    subfolder = worker.publish_deployable_checkpoint(str(ckpt), 80).deployable.path
 
     assert subfolder == "rl/flash-ckpt-1/checkpoints/step-80/adapter"
     assert len(rec.uploads) == 1
@@ -179,7 +179,7 @@ def test_publish_deployable_checkpoint_rejects_bin_weights(tmp_path, monkeypatch
     (ckpt / "adapter_config.json").write_text("{}")
     (ckpt / "adapter_model.bin").write_bytes(b"weights")
 
-    assert worker.publish_deployable_checkpoint(str(ckpt), 80) is None
+    assert worker.publish_deployable_checkpoint(str(ckpt), 80).deployable is None
     assert rec.uploads == []
 
 
@@ -193,7 +193,7 @@ def test_publish_deployable_checkpoint_skips_without_adapter(tmp_path, monkeypat
     ckpt.mkdir()
     (ckpt / "optimizer.pt").write_bytes(b"opt")  # no adapter_config.json
 
-    assert worker.publish_deployable_checkpoint(str(ckpt), 10) is None
+    assert worker.publish_deployable_checkpoint(str(ckpt), 10).deployable is None
     assert rec.uploads == []
 
 
@@ -207,7 +207,7 @@ def test_publish_deployable_checkpoint_skips_config_without_weights(tmp_path, mo
     ckpt.mkdir()
     (ckpt / "adapter_config.json").write_text("{}")  # config only, no adapter_model.*
 
-    assert worker.publish_deployable_checkpoint(str(ckpt), 20) is None
+    assert worker.publish_deployable_checkpoint(str(ckpt), 20).deployable is None
     assert rec.uploads == []
 
 
@@ -220,7 +220,7 @@ def test_publish_deployable_checkpoint_no_repo_is_noop(tmp_path, monkeypatch):
     ckpt.mkdir()
     (ckpt / "adapter_config.json").write_text("{}")
 
-    assert worker.publish_deployable_checkpoint(str(ckpt), 5) is None
+    assert worker.publish_deployable_checkpoint(str(ckpt), 5).deployable is None
     assert rec.uploads == []
 
 
@@ -235,7 +235,7 @@ def test_publish_deployable_checkpoint_starts_no_upload_at_deadline(tmp_path, mo
     (ckpt / "adapter_config.json").write_text("{}")
     (ckpt / "adapter_model.safetensors").write_bytes(b"weights")
 
-    assert worker.publish_deployable_checkpoint(str(ckpt), 5) is None
+    assert worker.publish_deployable_checkpoint(str(ckpt), 5).deployable is None
     assert rec.uploads == []
 
 
@@ -688,3 +688,174 @@ def _module_or_none(dotted: str):
         return importlib.import_module(dotted)
     except Exception:
         return None
+
+
+def test_deployable_commit_survives_reporting_failure_without_reupload(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    import flash.engine.worker.io.heartbeat as heartbeat
+    import flash.engine.worker.io.hf as worker
+    import flash.engine.worker.runtime.state as state
+
+    checkpoint = tmp_path / "adapter"
+    checkpoint.mkdir()
+    (checkpoint / "adapter_config.json").write_text("{}")
+    (checkpoint / "adapter_model.safetensors").write_bytes(b"weights")
+    uploads = []
+
+    def upload(**kwargs):
+        uploads.append(kwargs)
+        return SimpleNamespace(oid="adapter-commit")
+
+    def fail_report(*args, **kwargs):
+        raise ConnectionError("report unavailable")
+
+    monkeypatch.setattr(state, "HF_REPO", "org/runs")
+    monkeypatch.setattr(worker, "hf_api", lambda: SimpleNamespace(upload_folder=upload))
+    monkeypatch.setattr(heartbeat, "heartbeat", fail_report)
+    result = worker.publish_deployable_checkpoint(
+        str(checkpoint), 5, required=True, retries=3, _provenance_ready=True
+    )
+    assert result.deployable.revision == "adapter-commit"
+    assert result.reporting_error is not None
+    assert len(uploads) == 1
+
+
+@pytest.mark.parametrize("algorithm", ["sft", "opd"])
+def test_required_watcher_retries_adapter_before_publishing_resume(
+    tmp_path, monkeypatch, algorithm
+):
+    from pathlib import Path
+
+    from flash.engine.worker.train.entry import sft_train
+    from flash.engine.worker.train.opd.orchestration import failures as opd
+    from flash.engine.worker.train.sft.setup.checkpoints import _VerlCheckpointWatcher
+
+    uploads = []
+    delays = []
+
+    class Api(_RecordingHfApi):
+        def upload_folder(self, **kwargs):
+            uploads.append(kwargs["path_in_repo"])
+            if len(uploads) < 3:
+                raise ConnectionError("temporary storage outage")
+            return SimpleNamespace(oid="adapter-commit")
+
+    worker = _prime_worker(monkeypatch, Api())
+    monkeypatch.setattr(
+        worker, "_sleep_with_hf_deadline", lambda delay: delays.append(delay) or True
+    )
+
+    def export(_actor, destination, **kwargs):
+        adapter = Path(destination)
+        adapter.mkdir(parents=True)
+        (adapter / "adapter_config.json").write_text("{}")
+        (adapter / "adapter_model.safetensors").write_bytes(b"weights")
+
+    def resume(*args, **kwargs):
+        assert len(uploads) == 3
+        return worker.PublicationResult(resume=worker.ArtifactCommit("native", "native-commit"))
+
+    monkeypatch.setattr(sft_train, "_export_checkpoint_adapter", export)
+    monkeypatch.setattr(opd, "_export_checkpoint_adapter", export)
+    monkeypatch.setattr(opd, "_stage_retry_contract", lambda *args, **kwargs: None)
+    monkeypatch.setattr(worker, "upload_resume_checkpoint", resume)
+    options = {
+        "local_dir": str(tmp_path),
+        "export_root": str(tmp_path / "exports"),
+        "python_bin": "python",
+        "model_id": "org/model",
+        "model_revision": "commit",
+        "required_steps": (1,),
+    }
+    if algorithm == "opd":
+        watcher = opd._OpdVerlCheckpointWatcher(
+            **options,
+            seed=42,
+            prompt_pool_fingerprint="a" * 64,
+            prompts_per_step=2,
+            group_size=3,
+            accounting_state=lambda step: {},
+        )
+    else:
+        watcher = _VerlCheckpointWatcher(**options)
+    checkpoint = tmp_path / "global_step_1"
+    (checkpoint / "actor").mkdir(parents=True)
+    watcher._publish(1, str(checkpoint))
+
+    assert delays == [5.0, 10.0]
+    assert len(set(uploads)) == 1
+    assert watcher.lifecycle.facts(1).deployable_published
+    assert watcher.lifecycle.facts(1).resume_uploaded
+
+
+def test_deployable_upload_and_backoff_remain_alive(tmp_path, monkeypatch):
+    from threading import Event
+
+    heartbeat = worker_hf._worker_heartbeat
+    tick = Event()
+    reports = []
+
+    def report(stage, **fields):
+        if stage == "checkpoint_uploading":
+            reports.append(fields)
+            tick.set()
+
+    class Api(_RecordingHfApi):
+        def upload_folder(self, **kwargs):
+            assert tick.wait(2), "blocked adapter upload emitted no keepalive"
+            self.uploads.append(kwargs)
+            if len(self.uploads) == 1:
+                raise ConnectionError("temporary storage outage")
+            return SimpleNamespace(oid="adapter-commit")
+
+    api = Api()
+    worker = _prime_worker(monkeypatch, api)
+    monkeypatch.setattr(heartbeat, "heartbeat", report)
+    monkeypatch.setattr(heartbeat, "_LIVENESS_TICK_S", 0.01)
+    monkeypatch.setattr(heartbeat.worker_perf, "gpu_diagnostics", dict)
+
+    def backoff(delay):
+        tick.clear()
+        assert tick.wait(2), "retry backoff emitted no keepalive"
+        return True
+
+    monkeypatch.setattr(worker, "_sleep_with_hf_deadline", backoff)
+    (tmp_path / "adapter_config.json").write_text("{}")
+    (tmp_path / "adapter_model.safetensors").write_bytes(b"weights")
+    result = worker.publish_deployable_checkpoint(
+        str(tmp_path), 5, required=True, retries=2, _provenance_ready=True
+    )
+    assert result.deployable.revision == "adapter-commit"
+    assert len(api.uploads) == 2
+    assert len(reports) >= 2
+    assert all(fields["step"] == 5 and not fields["liveness"] for fields in reports)
+
+
+@pytest.mark.parametrize(("required", "expected_attempts"), [(False, 1), (True, 3)])
+def test_deployable_retry_budget_is_bounded(tmp_path, monkeypatch, required, expected_attempts):
+    uploads = []
+    delays = []
+
+    class Api(_RecordingHfApi):
+        def upload_folder(self, **kwargs):
+            uploads.append(kwargs)
+            raise ConnectionError("storage unavailable")
+
+    worker = _prime_worker(monkeypatch, Api())
+    monkeypatch.setattr(
+        worker, "_sleep_with_hf_deadline", lambda delay: delays.append(delay) or True
+    )
+    (tmp_path / "adapter_config.json").write_text("{}")
+    (tmp_path / "adapter_model.safetensors").write_bytes(b"weights")
+    if required:
+        with pytest.raises(worker.RetriableInfraError, match="deployable upload failed"):
+            worker.publish_deployable_checkpoint(
+                str(tmp_path), 5, required=True, _provenance_ready=True
+            )
+    else:
+        result = worker.publish_deployable_checkpoint(str(tmp_path), 5, _provenance_ready=True)
+        assert result.deployable is None
+        assert "storage unavailable" in result.upload_error
+    assert len(uploads) == expected_attempts
+    assert delays == ([5.0, 10.0] if required else [])

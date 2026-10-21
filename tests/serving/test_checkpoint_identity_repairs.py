@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 from urllib.parse import quote
 
 import httpx
@@ -10,13 +11,13 @@ from fastapi.testclient import TestClient
 
 from flash.cli.commands.env.testing.eval import _resolve_evaluation_target
 from flash.runner.lifecycle.state import RunStatus
-from flash.runner.results import verified_revisions
 from flash.runner.supervise import transitions
 from flash.schema import format_checkpoint_ref
 from flash.serve.contract.provenance import immutable_binding_fingerprint
 from flash.serve.contract.responses import matches_revision_identity
 from flash.server.routes import serving_smoke
 from flash.server.routes.serving_revisions import _authorized_chat_checkpoint
+from flash.serving.src.accounting.usage import AuthorizedTraffic, principal_for_external_org
 from flash.serving.src.engine.support import active_checkpoint_ref
 from flash.serving.src.http.router import build_offline_serving_app
 from flash.serving.src.http.routing import AdapterRouter
@@ -25,13 +26,14 @@ from flash.serving.src.io.schemas import (
     ImmutableCheckpointRegistration,
     internal_adapter_payload,
 )
-from flash.serving.src.store.persistence import get_adapter, list_run_adapters
+from flash.serving.src.store.persistence import get_adapter
 from flash.serving.src.store.settings import Settings
+from tests._helpers import deployments as deployment_fixtures
 
 
 def _record(org_id: str, *, digest: str = "b" * 64) -> AdapterRecord:
     values = {
-        "adapter_id": "shared/final",
+        "model_id": "shared/final",
         "repo_id": f"{org_id}/run",
         "base_model": "Qwen/Qwen3.5-9B",
         "org_id": org_id,
@@ -61,8 +63,8 @@ class _Pool:
             "inference_time_seconds": 0.01,
             "request_id": "fsgen-" + "0" * 32,
             "engine_replica_id": "test",
-            "checkpoint": record.adapter_id,
-            "lora_request_adapter": record.adapter_id,
+            "checkpoint": record.model_id,
+            "lora_request_adapter": record.model_id,
         }
 
     async def stream_generate(self, *_args, **_kwargs):
@@ -77,7 +79,7 @@ class _Pool:
 
 
 def _client(*records: AdapterRecord) -> TestClient:
-    by_key = {(record.org_id, record.adapter_id): record for record in records}
+    by_key = {(record.org_id, record.model_id): record for record in records}
     app = build_offline_serving_app(
         _Pool(),
         AdapterRouter(list(records)),
@@ -97,10 +99,10 @@ def _headers(org_id: str) -> dict[str, str]:
 def test_exact_routes_capture_raw_and_encoded_slashes_and_absence_is_idempotent() -> None:
     record = _record("org-a")
     client = _client(record)
-    for target in (record.adapter_id, quote(record.adapter_id, safe="")):
+    for target in (record.model_id, quote(record.model_id, safe="")):
         response = client.get(f"/adapters/{target}", headers=_headers("org-a"))
         assert response.status_code == 200
-        assert response.json()["adapter"]["adapter_id"] == record.adapter_id
+        assert response.json()["adapter"]["model_id"] == record.model_id
         generated = client.post(
             f"/adapters/{target}/generate",
             json={"prompt": "hi"},
@@ -118,9 +120,9 @@ def test_same_public_checkpoint_isolated_by_organization() -> None:
     first = _record("org-a")
     second = _record("org-b", digest="c" * 64)
     router = AdapterRouter([first, second])
-    assert router.resolve(first.adapter_id, org_id="org-a") == (first, first)
-    assert router.resolve(second.adapter_id, org_id="org-b") == (second, second)
-    assert router.resolve(first.adapter_id, org_id="org-c") is None
+    assert router.resolve(first.model_id, org_id="org-a") == (first, first)
+    assert router.resolve(second.model_id, org_id="org-b") == (second, second)
+    assert router.resolve(first.model_id, org_id="org-c") is None
 
 
 def test_persistence_queries_use_org_and_checkpoint_composite(monkeypatch) -> None:
@@ -149,11 +151,8 @@ def test_persistence_queries_use_org_and_checkpoint_composite(monkeypatch) -> No
         SUPABASE_SERVICE_ROLE_KEY="sb_secret_service_role",
     )
     assert get_adapter("org-a", "shared/final", settings) is None
-    assert list_run_adapters("org-a", "shared", settings) == []
     assert seen[0]["org_id"] == "eq.org-a"
     assert seen[0]["checkpoint_id"] == "eq.shared/final"
-    assert seen[1]["org_id"] == "eq.org-a"
-    assert seen[1]["run_id"] == "eq.shared"
 
 
 def test_artifact_digest_and_binding_fingerprint_are_distinct() -> None:
@@ -162,17 +161,20 @@ def test_artifact_digest_and_binding_fingerprint_are_distinct() -> None:
     changed = record.model_copy(update={"base_model": "Qwen/Qwen3.5-4B"})
     assert immutable_binding_fingerprint(changed) != record.artifact_fingerprint
     payload = internal_adapter_payload(record)
-    registration = {name: payload[name] for name in ImmutableCheckpointRegistration.model_fields}
+    registration = {
+        field.alias or name: payload[field.alias or name]
+        for name, field in ImmutableCheckpointRegistration.model_fields.items()
+    }
     with pytest.raises(ValueError, match="immutable binding"):
         ImmutableCheckpointRegistration.model_validate(
             {**registration, "artifact_fingerprint": "d" * 64}
         )
 
 
-@pytest.mark.parametrize("alias", ["checkpoint_id", "checkpoint"])
+@pytest.mark.parametrize("alias", ["adapter_id", "checkpoint_id", "checkpoint"])
 def test_binding_fingerprint_rejects_identity_aliases(alias: str) -> None:
     payload = internal_adapter_payload(_record("org-a"))
-    payload[alias] = payload.pop("adapter_id")
+    payload[alias] = payload.pop("model_id")
 
     with pytest.raises(ValueError, match="inconsistent permanent identity"):
         immutable_binding_fingerprint(payload)
@@ -206,21 +208,23 @@ def test_ambiguous_registration_matches_every_flat_immutable_field() -> None:
         "artifact_fingerprint": record.artifact_fingerprint,
         "lora_rank": record.lora_rank,
     }
-    assert matches_revision_identity(payload, payload)
-    assert not matches_revision_identity({**payload, "lora_rank": 32}, payload)
+    expected = payload.copy()
+    assert matches_revision_identity(payload, expected)
+    assert not matches_revision_identity({**payload, "lora_rank": 32}, expected)
 
 
-def test_verified_sibling_remains_authorized_while_latest_deployment_failed() -> None:
-    checkpoint = format_checkpoint_ref("run-a", 20)
-    assert (
-        _authorized_chat_checkpoint(
-            "run-a",
-            {"state": "failed", "checkpoint_id": format_checkpoint_ref("run-a", 40)},
-            checkpoint,
-            {checkpoint},
-        )
-        == checkpoint
-    )
+def test_chat_requires_the_selected_checkpoint_record():
+    checkpoint = "run-a/step-20"
+    record = {
+        "state": "ready",
+        "checkpoint_id": checkpoint,
+        "checkpoint_step": 20,
+        "verified_at": 1.0,
+        "deployment_generation": "generation-a",
+    }
+    assert _authorized_chat_checkpoint("run-a", record, checkpoint) == checkpoint
+    with pytest.raises(Exception, match="has not passed"):
+        _authorized_chat_checkpoint("run-a", record, "run-a/step-40")
 
 
 def test_evaluation_accepts_verified_sibling_without_latest_deployment_equality() -> None:
@@ -230,8 +234,16 @@ def test_evaluation_accepts_verified_sibling_without_latest_deployment_equality(
         @staticmethod
         def get_run(_run_id):
             return {
-                "verified_checkpoints": [checkpoint],
-                "deployment": {"state": "failed", "checkpoint_id": "run-a/step-40"},
+                "deployments": {
+                    checkpoint: {
+                        "state": "ready",
+                        "checkpoint_id": checkpoint,
+                        "checkpoint_step": 20,
+                        "verified_at": 1.0,
+                        "deployment_generation": "generation-a",
+                    },
+                    "run-a/step-40": {"state": "failed", "checkpoint_id": "run-a/step-40"},
+                },
             }
 
     target, run, error = _resolve_evaluation_target(
@@ -242,7 +254,7 @@ def test_evaluation_accepts_verified_sibling_without_latest_deployment_equality(
         RuntimeError,
     )
     assert target == checkpoint
-    assert run["verified_checkpoints"] == [checkpoint]
+    assert run["deployments"][checkpoint]["state"] == "ready"
     assert error is None
 
 
@@ -258,7 +270,7 @@ def test_hosted_authorizer_uses_freesolo_model_id_schema(monkeypatch) -> None:
 
         @staticmethod
         def json():
-            return {"orgId": "org-a"}
+            return {"orgId": "org-a", "deploymentGeneration": "generation-a"}
 
     class _Client:
         def __init__(self, *_args, **_kwargs):
@@ -275,7 +287,9 @@ def test_hosted_authorizer_uses_freesolo_model_id_schema(monkeypatch) -> None:
     authorize = modal_app._build_chat_authorizer(
         SimpleNamespace(backend_url="https://backend.example", internal_key="internal")
     )
-    assert asyncio.run(authorize("fs-key", "run-a/final")) == "org-a"
+    assert asyncio.run(authorize("fs-key", "run-a/final")) == AuthorizedTraffic(
+        principal_for_external_org("org-a"), "generation-a"
+    )
     assert seen == {"apiKey": "fs-key", "modelId": "run-a/final"}
 
 
@@ -331,58 +345,55 @@ def _save_ready_status(tmp_path, monkeypatch, run_id: str, summary: str) -> tupl
             run_id=run_id,
             state="deployed",
             spec={"run_id": run_id},
-            deployment={"state": "ready", "checkpoint_id": summary, "verified_at": 1.0},
+            deployments=deployment_fixtures.records(
+                run_id, {"state": "ready", "checkpoint_id": summary, "verified_at": 1.0}
+            ),
         )
     )
     for checkpoint_id in (summary, sibling):
-        assert verified_revisions.add_verified_checkpoint(
-            run_id,
-            checkpoint_id,
-            expected_generation=verified_revisions.verified_checkpoint_generation(run_id),
-        )
+        assert deployment_fixtures.seed_ready_checkpoint(run_id, checkpoint_id)
     return summary, sibling
 
 
-def test_revocation_failure_removes_only_current_chat_authority(tmp_path, monkeypatch) -> None:
+def test_cleanup_pending_removes_only_current_chat_authority(tmp_path, monkeypatch) -> None:
     current, sibling = _save_ready_status(tmp_path, monkeypatch, "run-revoke", "run-revoke/final")
 
-    failed = transitions.mark_deployment_revocation_failed("run-revoke", "backend unavailable")
+    failed = transitions.mark_deployment_cleanup_pending(
+        "run-revoke", "backend unavailable", current
+    )
 
-    assert failed.deployment["state"] == "revocation_failed"
-    assert verified_revisions.read_verified_checkpoints("run-revoke") == frozenset({sibling})
+    assert failed.deployments[current]["state"] == "cleanup_pending"
+    assert deployment_fixtures.ready_checkpoints("run-revoke") == frozenset({sibling})
     with pytest.raises(Exception, match="has not passed"):
         _authorized_chat_checkpoint(
             "run-revoke",
-            failed.deployment,
+            failed.deployments[current],
             current,
-            set(verified_revisions.read_verified_checkpoints("run-revoke")),
         )
     assert (
-        _authorized_chat_checkpoint("run-revoke", failed.deployment, sibling, {sibling}) == sibling
+        _authorized_chat_checkpoint("run-revoke", failed.deployments[sibling], sibling) == sibling
     )
 
 
-def test_sibling_revocation_failure_removes_only_failed_checkpoint(tmp_path, monkeypatch) -> None:
+def test_sibling_cleanup_pending_removes_only_failed_checkpoint(tmp_path, monkeypatch) -> None:
     current, sibling = _save_ready_status(
         tmp_path, monkeypatch, "run-sibling-failure", "run-sibling-failure/final"
     )
 
-    failed = transitions.mark_deployment_revocation_failed(
+    failed = transitions.mark_deployment_cleanup_pending(
         "run-sibling-failure", "backend unavailable", checkpoint_id=sibling
     )
 
-    assert failed.deployment["state"] == "ready"
-    assert failed.deployment["checkpoint_id"] == current
-    assert "error" not in failed.deployment
-    assert verified_revisions.read_verified_checkpoints("run-sibling-failure") == frozenset(
-        {current}
-    )
+    assert failed.deployments[current]["state"] == "ready"
+    assert failed.deployments[current]["checkpoint_id"] == current
+    assert "error" not in failed.deployments[current]
+    assert deployment_fixtures.ready_checkpoints("run-sibling-failure") == frozenset({current})
     assert (
-        _authorized_chat_checkpoint("run-sibling-failure", failed.deployment, current, {current})
+        _authorized_chat_checkpoint("run-sibling-failure", failed.deployments[current], current)
         == current
     )
     retried = transitions.mark_undeployed("run-sibling-failure", sibling)
-    assert retried.deployment == failed.deployment
+    assert retried.deployments[current] == failed.deployments[current]
 
 
 def test_sibling_undeploy_preserves_deployed_summary_and_state(tmp_path, monkeypatch) -> None:
@@ -391,26 +402,47 @@ def test_sibling_undeploy_preserves_deployed_summary_and_state(tmp_path, monkeyp
     updated = transitions.mark_undeployed("run-sibling", sibling)
 
     assert updated.state == "deployed"
-    assert updated.deployment == {
+    assert updated.deployments[current] == {
         "state": "ready",
         "checkpoint_id": current,
+        "checkpoint_step": None,
         "verified_at": 1.0,
+        "deployment_generation": "generation-a",
     }
-    assert verified_revisions.read_verified_checkpoints("run-sibling") == frozenset({current})
+    assert deployment_fixtures.ready_checkpoints("run-sibling") == frozenset({current})
 
 
-def test_current_undeploy_promotes_remaining_verified_sibling(tmp_path, monkeypatch) -> None:
-    current, sibling = _save_ready_status(tmp_path, monkeypatch, "run-promote", "run-promote/final")
+@pytest.mark.parametrize(("removed_step", "retained_step"), [(None, 20), (40, 20), (20, None)])
+def test_undeploy_preserves_sibling_verification_and_identity(
+    tmp_path, monkeypatch, removed_step, retained_step
+):
+    from flash.runner.lifecycle import state, status
 
-    updated = transitions.mark_undeployed("run-promote", current)
-
+    monkeypatch.setattr(state, "RUNS_DIR", str(tmp_path))
+    run_id = "run-preserve"
+    current = format_checkpoint_ref(run_id, removed_step)
+    sibling = format_checkpoint_ref(run_id, retained_step)
+    state._save_status(RunStatus(run_id=run_id, state="deployed", spec={}))
+    for target in (current, sibling):
+        deployment_fixtures.seed_ready_checkpoint(run_id, target)
+    before = status.get_status(run_id).deployments[sibling]
+    updated = transitions.mark_undeployed(run_id, current)
+    assert updated.deployments[sibling] == before
+    assert updated.deployments[current]["state"] == "undeployed"
     assert updated.state == "deployed"
-    assert updated.deployment == {
-        "state": "ready",
-        "checkpoint_id": sibling,
-        "verified_at": 1.0,
-    }
-    assert verified_revisions.read_verified_checkpoints("run-promote") == frozenset({sibling})
+    assert deployment_fixtures.ready_checkpoints(run_id) == frozenset({sibling})
+
+
+def test_chat_recovery_hint_uses_canonical_final_checkpoint() -> None:
+    from fastapi import HTTPException
+
+    from flash.server.routes.serving_chat import _require_active_deployment
+
+    with pytest.raises(HTTPException) as raised:
+        _require_active_deployment("run-a", "done", {}, None)
+
+    assert raised.value.status_code == 409
+    assert "`flash models deploy run-a/final`" in raised.value.detail
 
 
 def test_checkpoint_registration_rejects_bare_managed_selector() -> None:
@@ -418,7 +450,7 @@ def test_checkpoint_registration_rejects_bare_managed_selector() -> None:
     response = client.post(
         "/adapters",
         json={
-            "adapter_id": "run-a",
+            "model_id": "run-a",
             "repo_id": "org/run-a",
             "base_model": "Qwen/Qwen3.5-9B",
             "org_id": "org-a",
@@ -434,3 +466,38 @@ def test_checkpoint_registration_rejects_bare_managed_selector() -> None:
         headers=_headers("org-a"),
     )
     assert response.status_code == 422
+
+
+@pytest.mark.parametrize("generation", ["generation-a", "generation-b", None])
+@pytest.mark.parametrize(
+    "route", ["/generate", "/adapters/shared/final/generate", "/v1/chat/completions"]
+)
+def test_external_request_uses_only_the_authorized_generation(generation, route):
+    record = _record("org-a").model_copy(update={"deployment_generation": "generation-a"})
+    current = record
+
+    async def authorize(*_args):
+        nonlocal current
+        # A redeploy can finish after authorization and before the fresh routing lookup.
+        current = record.model_copy(update={"deployment_generation": generation})
+        return AuthorizedTraffic(principal_for_external_org("org-a"), "generation-a")
+
+    pool = _Pool()
+    pool.generate = AsyncMock(wraps=pool.generate)
+    client = TestClient(
+        build_offline_serving_app(
+            pool,
+            AdapterRouter([record]),
+            chat_authorizer=authorize,
+            lookup_record=lambda *_args: current,
+        )
+    )
+    payload = (
+        {"model": record.model_id, "messages": [{"role": "user", "content": "hi"}]}
+        if route == "/v1/chat/completions"
+        else {"model_id": record.model_id, "prompt": "hi"}
+    )
+    response = client.post(route, json=payload, headers={"Authorization": "Bearer user-key"})
+
+    assert response.status_code == (200 if generation == "generation-a" else 503)
+    assert pool.generate.await_count == (1 if generation == "generation-a" else 0)

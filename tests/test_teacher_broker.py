@@ -982,7 +982,7 @@ def test_worker_retries_committed_success_settlement_exception_without_redispatc
 
     monkeypatch.setattr(teacher_broker, "_provider_post", dispatch)
     monkeypatch.setattr(db, "complete_teacher_request", commit_then_raise)
-    monkeypatch.setattr(worker_teacher._ThreadLocalHttpsTransport, "urlopen", urlopen)
+    monkeypatch.setattr(worker_teacher._TeacherHttpTransport, "urlopen", urlopen)
     monkeypatch.setattr(worker_teacher.time, "sleep", lambda _seconds: None)
     client = worker_teacher.TeacherClient(token, "https://broker.example", "parasail-glm-52")
 
@@ -1117,7 +1117,7 @@ def test_worker_reuses_one_logical_request_id_across_transport_retries(monkeypat
             raise urllib.error.URLError("broker unavailable")
         return Response()
 
-    monkeypatch.setattr(worker_teacher._ThreadLocalHttpsTransport, "urlopen", urlopen)
+    monkeypatch.setattr(worker_teacher._TeacherHttpTransport, "urlopen", urlopen)
     monkeypatch.setattr(worker_teacher.time, "sleep", lambda _seconds: None)
     client = worker_teacher.TeacherClient(
         "capability-value", "https://broker.example", "parasail-glm-52"
@@ -1140,7 +1140,7 @@ def test_worker_keeps_unstructured_502_terminal(monkeypatch, body):
         request_ids.append(dict(request.header_items())["X-flash-teacher-request-id"])
         raise urllib.error.HTTPError(request.full_url, 502, "bad gateway", {}, io.BytesIO(body))
 
-    monkeypatch.setattr(worker_teacher._ThreadLocalHttpsTransport, "urlopen", urlopen)
+    monkeypatch.setattr(worker_teacher._TeacherHttpTransport, "urlopen", urlopen)
     monkeypatch.setattr(worker_teacher.time, "sleep", lambda _seconds: None)
     client = worker_teacher.TeacherClient(
         "capability-value", "https://broker.example", "parasail-glm-52"
@@ -1179,7 +1179,7 @@ def test_worker_retries_unstructured_proven_pre_dispatch_http_status(monkeypatch
             )
         return Response()
 
-    monkeypatch.setattr(worker_teacher._ThreadLocalHttpsTransport, "urlopen", urlopen)
+    monkeypatch.setattr(worker_teacher._TeacherHttpTransport, "urlopen", urlopen)
     monkeypatch.setattr(worker_teacher.time, "sleep", lambda _seconds: None)
     client = worker_teacher.TeacherClient(
         "capability-value", "https://broker.example", "parasail-glm-52"
@@ -1204,7 +1204,7 @@ def test_worker_keeps_unstructured_post_dispatch_ambiguity_terminal(monkeypatch,
             request.full_url, status, "broker failure", {}, io.BytesIO(b"")
         )
 
-    monkeypatch.setattr(worker_teacher._ThreadLocalHttpsTransport, "urlopen", urlopen)
+    monkeypatch.setattr(worker_teacher._TeacherHttpTransport, "urlopen", urlopen)
     monkeypatch.setattr(worker_teacher.time, "sleep", lambda _seconds: None)
     client = worker_teacher.TeacherClient(
         "capability-value", "https://broker.example", "parasail-glm-52"
@@ -1231,7 +1231,7 @@ def test_worker_keeps_unstructured_permanent_4xx_terminal(monkeypatch, status):
             request.full_url, status, "broker rejection", {}, io.BytesIO(b"<html>rejected</html>")
         )
 
-    monkeypatch.setattr(worker_teacher._ThreadLocalHttpsTransport, "urlopen", urlopen)
+    monkeypatch.setattr(worker_teacher._TeacherHttpTransport, "urlopen", urlopen)
     monkeypatch.setattr(worker_teacher.time, "sleep", lambda _seconds: None)
     client = worker_teacher.TeacherClient(
         "capability-value", "https://broker.example", "parasail-glm-52"
@@ -1276,7 +1276,7 @@ def test_worker_retries_body_ingress_timeout_with_same_request_id(monkeypatch):
             raise urllib.error.HTTPError(request.full_url, 408, "timeout", {}, io.BytesIO(body))
         return Response()
 
-    monkeypatch.setattr(worker_teacher._ThreadLocalHttpsTransport, "urlopen", urlopen)
+    monkeypatch.setattr(worker_teacher._TeacherHttpTransport, "urlopen", urlopen)
     monkeypatch.setattr(worker_teacher.time, "sleep", lambda _seconds: None)
     client = worker_teacher.TeacherClient(
         "capability-value", "https://broker.example", "parasail-glm-52"
@@ -1319,7 +1319,7 @@ def test_worker_retries_request_in_progress_with_same_request_id(monkeypatch):
             raise urllib.error.HTTPError(request.full_url, 409, "conflict", {}, io.BytesIO(body))
         return Response()
 
-    monkeypatch.setattr(worker_teacher._ThreadLocalHttpsTransport, "urlopen", urlopen)
+    monkeypatch.setattr(worker_teacher._TeacherHttpTransport, "urlopen", urlopen)
     monkeypatch.setattr(worker_teacher.time, "sleep", sleeps.append)
     client = worker_teacher.TeacherClient(
         "capability-value", "https://broker.example", "parasail-glm-52"
@@ -1348,7 +1348,7 @@ def test_worker_fails_closed_on_nontransient_broker_classification(monkeypatch, 
         body = json.dumps({"error": error_payload}).encode()
         raise urllib.error.HTTPError(request.full_url, 502, "rejected", {}, io.BytesIO(body))
 
-    monkeypatch.setattr(worker_teacher._ThreadLocalHttpsTransport, "urlopen", urlopen)
+    monkeypatch.setattr(worker_teacher._TeacherHttpTransport, "urlopen", urlopen)
     monkeypatch.setattr(worker_teacher.time, "sleep", lambda _seconds: None)
     client = worker_teacher.TeacherClient(
         "capability-value", "https://broker.example", "parasail-glm-52"
@@ -1397,7 +1397,7 @@ def test_worker_renders_provider_status_without_leaking_broker_payload(monkeypat
         ).encode()
         raise urllib.error.HTTPError(request.full_url, 502, "rejected", {}, io.BytesIO(body))
 
-    monkeypatch.setattr(worker_teacher._ThreadLocalHttpsTransport, "urlopen", urlopen)
+    monkeypatch.setattr(worker_teacher._TeacherHttpTransport, "urlopen", urlopen)
     client = worker_teacher.TeacherClient(
         "capability-value", "https://broker.example", "parasail-glm-52"
     )
@@ -1430,7 +1430,7 @@ def test_worker_omits_malformed_provider_status(monkeypatch, provider_status):
     def urlopen(_transport, request, timeout=None):
         raise urllib.error.HTTPError(request.full_url, 502, "rejected", {}, io.BytesIO(body))
 
-    monkeypatch.setattr(worker_teacher._ThreadLocalHttpsTransport, "urlopen", urlopen)
+    monkeypatch.setattr(worker_teacher._TeacherHttpTransport, "urlopen", urlopen)
     client = worker_teacher.TeacherClient(
         "capability-value", "https://broker.example", "parasail-glm-52"
     )
@@ -2037,7 +2037,7 @@ def test_cancellation_fences_teacher_capabilities_before_lifecycle_work(monkeypa
     events = []
     status = SimpleNamespace(
         state="running",
-        deployment=None,
+        deployments={},
         remote=None,
         billing_context=None,
         spec={},
@@ -2067,87 +2067,6 @@ def test_cancellation_fences_teacher_capabilities_before_lifecycle_work(monkeypa
         ("revoke", "run-1"),
         ("revoke", "run-1"),
     ]
-
-
-def test_runpod_lambda_and_vast_payloads_never_expose_provider_credentials(monkeypatch):
-    from flash.providers._lifecycle.net.worker import build_worker_env
-    from flash.providers.core.base import PollResult
-    from flash.providers.lambda_.jobs.builders import build_payload as build_lambda_payload
-    from flash.providers.runpod.execution import job_execution as runpod_job_execution
-    from flash.providers.runpod.execution import polling as runpod_polling
-    from flash.providers.vast.jobs.builders import build_payload as build_vast_payload
-
-    spec = JobSpec(
-        model="Qwen/Qwen3.5-9B",
-        algorithm="opd",
-        environment=EnvironmentSpec(id="org/env"),
-        train=TrainSpec(max_examples=8, hf_repo="owner/runs"),
-        run_id="run-payload",
-    )
-    runtime = {
-        "PARASAIL_API_KEY": "parasail-worker-canary",
-        "FLASH_PUBLIC_URL": "https://broker.example",
-        "FLASH_TEACHER_CAPABILITY": "capability-worker-canary",
-    }
-    monkeypatch.setenv("PARASAIL_API_KEY", "parasail-control-plane-canary")
-    deadline = time.time() + 3600
-
-    lambda_payload = build_lambda_payload(
-        spec,
-        0,
-        runtime_secrets=runtime,
-        source_snapshot=_SOURCE_SNAPSHOT,
-        deadline_at=deadline,
-    )
-    vast_payload = build_vast_payload(
-        spec,
-        0,
-        runtime_secrets=runtime,
-        source_snapshot=_SOURCE_SNAPSHOT,
-        deadline_at=deadline,
-    )
-    captured = {}
-    monkeypatch.setattr(
-        runpod_job_execution,
-        "deploy_train_endpoint",
-        lambda *_args, **_kwargs: ("endpoint-id", "endpoint-name", "key-fingerprint"),
-    )
-
-    def submit_job(_endpoint, payload, **_kwargs):
-        captured["payload"] = payload
-        return "job-id"
-
-    monkeypatch.setattr(runpod_job_execution.runpod_api, "submit_job", submit_job)
-    monkeypatch.setattr(
-        runpod_polling,
-        "poll_job",
-        lambda *_args, **_kwargs: PollResult(True, metrics={}),
-    )
-    runpod_job_execution.submit_attempt(
-        spec,
-        attempt=0,
-        runtime_secrets=runtime,
-        source_snapshot=_SOURCE_SNAPSHOT,
-        deadline_at=deadline,
-    )
-
-    serialized = json.dumps(
-        {"runpod": captured["payload"], "lambda": lambda_payload, "vast": vast_payload}
-    )
-    assert "parasail-worker-canary" not in serialized
-    assert "parasail-control-plane-canary" not in serialized
-    assert "PARASAIL_API_KEY" not in serialized
-    assert serialized.count("capability-worker-canary") == 3
-
-    invalid_spec = JobSpec(
-        model="Qwen/Qwen3.5-9B",
-        algorithm="opd",
-        environment=EnvironmentSpec(id="org/env", secrets=("PARASAIL_API_KEY",)),
-        train=TrainSpec(max_examples=8, hf_repo="owner/runs"),
-        run_id="run-invalid-payload",
-    )
-    with pytest.raises(ValueError, match="managed teacher credential names"):
-        build_worker_env(invalid_spec, runtime_secrets=runtime)
 
 
 def test_capability_policy_is_run_bounded_and_rejects_excessive_shapes(monkeypatch):

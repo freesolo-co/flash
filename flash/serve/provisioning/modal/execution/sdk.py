@@ -307,7 +307,7 @@ def _close_client(
 
 
 class PinnedModalSdk:
-    """request-scoped adapter for the locally pinned modal 1.5 sdk contract."""
+    """request-scoped adapter for the locally pinned modal sdk contract."""
 
     __slots__ = (
         "_bridge",
@@ -739,6 +739,7 @@ class PinnedModalSdk:
             startup_timeout=plan.startup_timeout_seconds,
             name=plan.function_name,
             region=plan.placement.region,
+            routing_region="us-east",
             include_source=False,
         )(web_function)
         deployed = self._mutate(

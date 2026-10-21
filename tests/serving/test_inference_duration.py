@@ -11,13 +11,13 @@ import pytest
 from fastapi.testclient import TestClient
 
 from flash.serving.src.accounting.usage import (
+    AuthorizedTraffic,
     build_usage_session,
     new_generation_id,
     principal_for_external_org,
 )
 from flash.serving.src.accounting.usage_outbox import RequestIdentity, UsageOutboxError
 from flash.serving.src.engine import generation
-from flash.serving.src.engine import support as engine_support
 from flash.serving.src.http import inference_routes
 from flash.serving.src.http.router import AdapterRouter, build_serving_app
 from flash.serving.src.io.schemas import AdapterRecord, internal_adapter_payload
@@ -56,12 +56,12 @@ class _Owner:
         self.engine = _Engine()
 
     async def _lora_request(self, _adapter_id: str, _record_dict: Any) -> tuple[Any, Any]:
-        return SimpleNamespace(lora_name=self.record.adapter_id), self.record
+        return SimpleNamespace(lora_name=self.record.model_id), self.record
 
     @staticmethod
     def _lora_request_attestation(record: AdapterRecord, lora_request: Any) -> str:
-        assert lora_request.lora_name == record.adapter_id
-        return record.adapter_id
+        assert lora_request.lora_name == record.model_id
+        return record.model_id
 
     def _enforce_expected_checkpoint(
         self, record: AdapterRecord, expected_checkpoint: str | None
@@ -153,7 +153,7 @@ def _revision() -> AdapterRecord:
     checkpoint_id = f"{run_id}/final"
     return AdapterRecord.model_validate(
         {
-            "adapter_id": checkpoint_id,
+            "model_id": checkpoint_id,
             "repo_id": "org/duration",
             "org_id": "org-1",
             "base_model": BASE_MODEL,
@@ -165,12 +165,15 @@ def _revision() -> AdapterRecord:
             "artifact_digest": hashlib.sha256(b"duration-artifact").hexdigest(),
             "artifact_fingerprint": hashlib.sha256(b"duration-binding").hexdigest(),
             "lora_rank": 16,
+            "deployment_generation": "generation-a",
         }
     )
 
 
-async def _authorize(_token: str, _adapter_id: str, _scope: dict | None = None) -> str:
-    return "org-1"
+async def _authorize(
+    _token: str, _adapter_id: str, _scope: dict | None = None
+) -> AuthorizedTraffic:
+    return AuthorizedTraffic(principal_for_external_org("org-1"), "generation-a")
 
 
 def _client(record: AdapterRecord, store: RecordingUsageStore) -> TestClient:
@@ -224,7 +227,7 @@ def test_nonstream_completed_generation_uses_monotonic_duration(
         response = client.post(
             "/v1/chat/completions",
             json={
-                "model": record.adapter_id,
+                "model": record.model_id,
                 "messages": [{"role": "user", "content": "hello"}],
             },
         )
@@ -255,7 +258,7 @@ def test_stream_completed_generation_uses_monotonic_duration(
             "POST",
             "/v1/chat/completions",
             json={
-                "model": record.adapter_id,
+                "model": record.model_id,
                 "messages": [{"role": "user", "content": "hello"}],
                 "stream": True,
                 "stream_options": {"include_usage": True},
@@ -269,31 +272,6 @@ def test_stream_completed_generation_uses_monotonic_duration(
     assert b"data: [DONE]" in body
     assert len(store.finalized) == 1
     assert store.finalized[0].facts.generation_duration_seconds == pytest.approx(0.4)
-
-
-def test_support_usage_fields_use_monotonic_duration(monkeypatch: pytest.MonkeyPatch) -> None:
-    request_output = SimpleNamespace(prompt_token_ids=[11, 12], num_cached_tokens=0)
-
-    def wall_clock_forbidden() -> float:
-        raise AssertionError("elapsed inference duration read the wall clock")
-
-    monkeypatch.setattr(
-        engine_support,
-        "time",
-        SimpleNamespace(time=wall_clock_forbidden, monotonic=lambda: 10.25),
-    )
-
-    result = engine_support._stream_usage_fields(
-        request_output,
-        [21],
-        start=10.0,
-        request_id="fsgen-duration",
-        engine_replica_id="replica-1",
-        checkpoint="duration",
-        thinking=False,
-    )
-
-    assert result["inference_time_seconds"] == pytest.approx(0.25)
 
 
 @pytest.mark.parametrize(
@@ -317,7 +295,7 @@ def test_invalid_duration_never_reaches_durable_finalization(invalid_duration: f
         principal=principal_for_external_org("org-1"),
         requested=record,
         target=record,
-        result={"checkpoint": record.checkpoint, "lora_request_adapter": record.adapter_id},
+        result={"checkpoint": record.checkpoint, "lora_request_adapter": record.model_id},
         deployment_id="deployment-1",
         serving_release="release-1",
         captured_at=datetime(2026, 8, 26, tzinfo=UTC),
@@ -329,7 +307,7 @@ def test_invalid_duration_never_reaches_durable_finalization(invalid_duration: f
         "thinking": False,
         "inference_time_seconds": invalid_duration,
         "checkpoint": record.checkpoint,
-        "lora_request_adapter": record.adapter_id,
+        "lora_request_adapter": record.model_id,
     }
 
     with pytest.raises(UsageOutboxError, match="usage_duration_invalid"):

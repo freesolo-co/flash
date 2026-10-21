@@ -328,15 +328,15 @@ def test_cold_engine_resolves_forwarded_adapter_record(modal_app_module, tmp_pat
     from flash.serving.src.store.registry import AdapterRegistry
 
     run_id = "flash-1234567890-abcdef12"
-    adapter_id = f"{run_id}/step-1"
+    model_id = f"{run_id}/step-1"
     record_values = {
-        "adapter_id": adapter_id,
+        "model_id": model_id,
         "repo_id": "org/private-adapter",
         "base_model": "Qwen/Qwen3.5-9B",
         "subfolder": "checkpoints/step-1/adapter",
         "repo_type": "dataset",
         "org_id": "org-1",
-        "checkpoint": adapter_id,
+        "checkpoint": model_id,
         "private": True,
         "thinking": False,
         "status": "ready",
@@ -357,23 +357,30 @@ def test_cold_engine_resolves_forwarded_adapter_record(modal_app_module, tmp_pat
     resolved_request = object()
 
     async def ensure_adapter_local(record):
-        assert record.adapter_id == adapter_id
+        assert record.model_id == model_id
         return resolved_path
 
     def cached_lora_request(record, path):
-        assert record.adapter_id == adapter_id
+        assert record.model_id == model_id
         assert path == resolved_path
         return resolved_request
 
     engine._ensure_adapter_local_locked = ensure_adapter_local
     engine._cached_lora_request_locked = cached_lora_request
+    engine._lora_entries = {("org-1", model_id): types.SimpleNamespace(state="reserved")}
+
+    async def add_lora(record, path):
+        assert record.model_id == model_id
+        assert path == resolved_path
+
+    engine._add_lora_locked = add_lora
     assert engine.registry.list_ready() == []
 
-    lora_request, record = asyncio.run(engine._lora_request(adapter_id, record_dict))
+    lora_request, record = asyncio.run(engine._lora_request(model_id, record_dict))
 
     assert lora_request is resolved_request
-    assert record.adapter_id == adapter_id
-    assert engine.registry.get("org-1", adapter_id) == record
+    assert record.model_id == model_id
+    assert engine.registry.get("org-1", model_id) == record
 
 
 def test_lora_engine_import_does_not_require_pillow() -> None:
@@ -620,8 +627,7 @@ def test_scale_to_zero_pool_dispatches_inference_and_registration(modal_app_modu
             self.deployment_generation = deployment_generation
             self.generation_id = generation_id
 
-        def model_dump(self, *, by_alias: bool) -> dict:
-            assert by_alias is True
+        def model_dump(self) -> dict:
             return self.value
 
     async def _generate(
@@ -666,7 +672,7 @@ def test_scale_to_zero_pool_dispatches_inference_and_registration(modal_app_modu
     )
     checkpoint_id = "flash-1234567890-abcdef12/step-1"
     record_values = {
-        "adapter_id": checkpoint_id,
+        "model_id": checkpoint_id,
         "repo_id": "org/run",
         "base_model": "Qwen/Qwen3.5-9B",
         "subfolder": "checkpoints/step-1/adapter",
@@ -780,13 +786,13 @@ def test_every_catalog_model_forwards_its_reasoning_parser(
     assert args.reasoning_parser == "qwen3"
 
 
-def test_lora_pinning_only_when_hot_pool_covers_cpu_pool(modal_app_module, monkeypatch, tmp_path):
+def test_hosted_hot_pools_remain_unpinned(modal_app_module, monkeypatch, tmp_path):
     """Pinned LoRAs cannot be LRU-evicted, so capped hot pools must stay unpinned if 256 adapters
     are deployable through max_cpu_loras."""
     engine, args = _load_engine_and_args(modal_app_module, monkeypatch, tmp_path, "Qwen/Qwen3.5-9B")
     assert args.max_loras == 16
     assert args.max_cpu_loras == 256
-    assert engine._pin_loras is False
+    assert not hasattr(engine, "_pin_loras")
 
     for model, max_loras in (
         ("Qwen/Qwen3.5-9B", 16),
@@ -795,7 +801,7 @@ def test_lora_pinning_only_when_hot_pool_covers_cpu_pool(modal_app_module, monke
         engine, args = _load_engine_and_args(modal_app_module, monkeypatch, tmp_path, model)
         assert args.max_loras == max_loras
         assert args.max_cpu_loras == 256
-        assert engine._pin_loras is False
+        assert not hasattr(engine, "_pin_loras")
 
 
 def test_load_prequant_checkpoint_for_9b(modal_app_module, monkeypatch, tmp_path):
@@ -844,3 +850,16 @@ def test_load_bf16_base_with_full_experts_for_35b(modal_app_module, monkeypatch,
     # language_model_only is NOT enabled: the full VL model (vision encoder included) is loaded so
     # flash adapters' vision-tower LoRA keys have real modules to bind to.
     assert not args.language_model_only
+
+
+def test_engine_boot_never_reads_the_adapter_database(modal_app_module, monkeypatch, tmp_path):
+    reads = []
+
+    def load_adapters(settings):
+        reads.append(settings)
+        raise AssertionError("GPU engines do not have database credentials")
+
+    monkeypatch.setattr("flash.serving.src.store.persistence.load_adapters", load_adapters)
+    engine, _ = _load_engine_and_args(modal_app_module, monkeypatch, tmp_path, "Qwen/Qwen3.5-9B")
+    assert reads == []
+    assert engine.registry.list_ready() == []

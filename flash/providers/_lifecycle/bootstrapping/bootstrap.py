@@ -1,8 +1,4 @@
-"""Bootstrap shared by instance-based providers (e.g. Lambda). Runs inside the worker container.
-
-Stdlib + huggingface_hub only — never import flash here. Reads payload from ``/root/flash/payload.json``.
-Launch scripts must ship ``bootstrap_console.py``, ``bootstrap_secrets.py`` and ``bootstrap_pip.py``.
-"""
+"""Bootstrap the verified worker source inside a Modal training sandbox."""
 
 from __future__ import annotations
 
@@ -24,7 +20,6 @@ if __package__:
     from flash.providers._lifecycle.bootstrapping import pip as bootstrap_pip
     from flash.providers._lifecycle.bootstrapping import processes as _bootstrap_processes
     from flash.providers._lifecycle.bootstrapping.attempt import AttemptState
-    from flash.providers._lifecycle.bootstrapping.preload import run_preload
     from flash.providers._lifecycle.bootstrapping.secrets import (
         _payload_secrets,
         _read_console_tail,
@@ -39,7 +34,6 @@ else:
     import bootstrap_pip  # type: ignore[no-redef]
     import bootstrap_processes as _bootstrap_processes  # type: ignore[no-redef]
     from bootstrap_attempt import AttemptState  # type: ignore[no-redef]
-    from bootstrap_preload import run_preload  # type: ignore[no-redef]
     from bootstrap_secrets import (  # type: ignore[no-redef]
         _payload_secrets,
         _read_console_tail,
@@ -48,6 +42,7 @@ else:
 
 PAYLOAD_PATH = "/root/flash/payload.json"
 CODE_ROOT = "/runcode"
+CHECKPOINT_HANDOFF_ROOT = "/checkpoint-handoff"
 _CONSOLE_UPLOAD_INTERVAL_S = _bootstrap_console._CONSOLE_UPLOAD_INTERVAL_S
 _CONSOLE_UPLOAD_STOP_TIMEOUT_S = 2.0
 _CONSOLE_UPLOAD_FINAL_TIMEOUT_S = 10.0
@@ -62,6 +57,14 @@ _MAX_ATTEMPT_ID = (1 << 63) - 1
 
 class RetriableBootstrapError(RuntimeError):
     """Infra-shaped failure → marker carries retriable=True → poller retries (job_preempted) instead of job_failed."""
+
+
+class WorkerInterrupted(BaseException):
+    """A host shutdown signal interrupted the worker, rather than user-code failure."""
+
+
+def _interrupt_worker(signum, _frame) -> None:
+    raise WorkerInterrupted(f"worker interrupted by signal {signum}")
 
 
 def _finite_positive_number(value: object, label: str) -> float:
@@ -138,6 +141,9 @@ def arm_deadline_watchdog(
 
 
 def load_payload() -> dict:
+    raw = os.environ.pop("FLASH_BOOTSTRAP_PAYLOAD", "")
+    if raw:
+        return json.loads(raw)
     with open(PAYLOAD_PATH) as f:
         return json.load(f)
 
@@ -517,43 +523,14 @@ def remote_completion_confirmed(payload: dict) -> bool:
         return False
 
 
-def fetch_spec_from_hf(payload: dict) -> str:
-    """Fetch the job spec spilled to HF to avoid blowing the cloud-init user_data size cap."""
-    from huggingface_hub import hf_hub_download
-
-    deadline_at = require_deadline_at(payload)
-    local = _hf_call(
-        lambda: hf_hub_download(
-            repo_id=payload["hf_repo"],
-            repo_type="dataset",
-            filename=f"{payload['hf_prefix']}/job_spec.json",
-            token=(payload.get("env") or {}).get("HF_TOKEN"),
-        ),
-        "download spilled job spec",
-        deadline_at=deadline_at,
-        secrets=_payload_secrets(payload),
-    )
-    with open(local) as f:
-        return f.read()
-
-
 def build_worker_env(payload: dict) -> dict:
     env = dict(os.environ)
     env.update({k: str(v) for k, v in (payload.get("env") or {}).items()})
     env.pop("GITHUB_TOKEN", None)
     env.pop("GIT_ASKPASS", None)
     spec_json = payload.get("job_spec_json")
-    if not spec_json and payload.get("job_spec_in_hf"):
-        # Pre-worker fetch; failure is infra-shaped → raise RetriableBootstrapError so poller retries.
-        try:
-            spec_json = fetch_spec_from_hf(payload)
-        except Exception:
-            raise RetriableBootstrapError("failed to fetch the spilled job spec from HF") from None
     if not spec_json:
-        raise RuntimeError(
-            "bootstrap payload carries no job spec: both job_spec_json and the job_spec_in_hf "
-            "sentinel are absent/empty — the control plane built an invalid worker payload"
-        )
+        raise RuntimeError("bootstrap payload carries no job spec: job_spec_json is absent/empty")
     # Large specs go via a file to avoid execve "Argument list too long".
     if len(spec_json) > 96_000:
         with open("/tmp/job_spec.json", "w") as f:
@@ -569,7 +546,6 @@ def build_worker_env(payload: dict) -> dict:
     if isinstance(attempt, bool) or not isinstance(attempt, int) or attempt < 0:
         raise RuntimeError("bootstrap attempt identity is invalid")
     env["ATTEMPT"] = str(attempt)
-    # Override runpod-stamped FLASH_ARM to the real backend from the payload.
     env["FLASH_ARM"] = _arm(payload)
     code_dir = _code_dir(payload)
     env["PYTHONPATH"] = code_dir + (os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else "")
@@ -804,62 +780,72 @@ def write_attempt_marker(payload: dict, ok: bool, error: str = "", retriable: bo
             run_id=run_id,
             attempt=attempt,
         )
-    if payload.get("mode") == "preload":
-        p = "/tmp/attempt_marker.json"
-        with open(p, "w") as f:
-            json.dump(marker, f)
-    else:
-        state = AttemptState(_code_dir(payload), payload)
-        marker = state.save(marker)
-        p = state.publication_path(marker)
-    hf_upload(
-        payload,
-        p,
-        f"{_arm(payload)}_attempt{attempt}.json",
-        enforce_deadline=False,
-    )
+    state = AttemptState(_code_dir(payload), payload)
+    marker = state.save(marker)
+    p = state.publication_path(marker)
+    _publish_terminal_marker(payload, p, ok)
 
 
-def _arm_preload_wall_cap(payload: dict) -> tuple[threading.Timer, threading.Event]:
-    """Arm the absolute run-deadline watchdog around in-process snapshot downloads."""
-    deadline_at = require_deadline_at(payload)
-    remaining = deadline_at - time.time()
-    # done is set by the caller on clean finish; _fire checks it first to avoid a racing false alarm.
-    done = threading.Event()
+def _publish_terminal_marker(payload, p, ok):
+    attempt = payload["attempt"]
+    marker_name = f"{_arm(payload)}_attempt{attempt}.json"
+    if ok and payload.get("handoff_volume"):
+        import shutil
+        from pathlib import Path
 
-    def _fire() -> None:
-        if done.is_set():
-            return
-        _publish_timeout_marker_then_exit(
-            payload,
-            "preload exceeded the run wall deadline; self-terminating box",
-        )
-
-    timer = threading.Timer(max(0.0, remaining), _fire)
-    timer.daemon = True
-    timer.start()
-    return timer, done
+        handoff = Path(CHECKPOINT_HANDOFF_ROOT)
+        if (handoff / "handoff.json").is_file():
+            shutil.copyfile(p, handoff / "terminal.json")
+            marker_name = f"modal_gpu_attempt{attempt}.json"
+    hf_upload(payload, p, marker_name, enforce_deadline=False)
 
 
 def main() -> int:
-    # SIGTERM → sys.exit so the finally block still uploads the terminal marker.
-    signal.signal(signal.SIGTERM, lambda *a: sys.exit(1))
-    payload = load_payload()
-    if payload.get("mode") == "preload":
-        return _run_attempt(payload)
-    state = AttemptState(_code_dir(payload), payload)
-    with state.locked():
-        marker = state.read()
-        if marker is not None:
-            print("bootstrap: replaying the persisted terminal result", flush=True)
-            hf_upload(
-                payload,
-                state.publication_path(marker),
-                f"{_arm(payload)}_attempt{payload['attempt']}.json",
-                enforce_deadline=False,
+    # Modal can deliver SIGINT during termination. Publish an infrastructure failure so
+    # an owned, active run can resume; persisted cancellation and deadline guards still win.
+    previous = {sig: signal.getsignal(sig) for sig in (signal.SIGINT, signal.SIGTERM)}
+    try:
+        for sig in previous:
+            signal.signal(sig, _interrupt_worker)
+        payload = load_payload()
+        state = AttemptState(_code_dir(payload), payload)
+        with state.locked():
+            marker = state.read()
+            if marker is not None:
+                print("bootstrap: replaying the persisted terminal result", flush=True)
+                _publish_terminal_marker(payload, state.publication_path(marker), marker["ok"])
+                return 0 if marker["ok"] else 1
+            return _run_attempt(payload)
+    finally:
+        for sig, handler in previous.items():
+            signal.signal(sig, handler)
+
+
+def _publish_started(payload: dict) -> None:
+    """Publish actual bootstrap start before source downloads and package installation."""
+    import tempfile
+
+    from huggingface_hub import HfApi
+
+    marker = {"run_id": payload["run_id"], "attempt": payload["attempt"], "ts": time.time()}
+    name = f"modal_started_attempt{payload['attempt']}.json"
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".json") as file:
+        json.dump(marker, file)
+        file.flush()
+        try:
+            _hf_call(
+                lambda: HfApi(token=(payload.get("env") or {}).get("HF_TOKEN")).upload_file(
+                    path_or_fileobj=file.name,
+                    path_in_repo=f"{payload['hf_prefix']}/{name}",
+                    repo_id=payload["hf_repo"],
+                    repo_type="dataset",
+                ),
+                "publish bootstrap start",
+                deadline_at=require_deadline_at(payload),
+                secrets=_payload_secrets(payload),
             )
-            return 0 if marker["ok"] else 1
-        return _run_attempt(payload)
+        except Exception as exc:
+            raise RetriableBootstrapError("could not publish bootstrap start") from exc
 
 
 def _run_attempt(payload: dict) -> int:
@@ -868,51 +854,9 @@ def _run_attempt(payload: dict) -> int:
     retriable = False
     deadline_watchdog = None
     try:
-        try:
-            import importlib.util
-
-            if importlib.util.find_spec("hf_transfer") is not None:
-                os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "1"
-        except Exception as exc:
-            print("hf_transfer setup skipped:", exc, flush=True)
         deadline = require_deadline_at(payload)
-        if payload.get("mode") == "preload":
-            deadline_watchdog = _arm_preload_wall_cap(payload)
-            result = run_preload(payload)
-            with open("/tmp/preload_result.json", "w") as f:
-                json.dump(result, f)
-            # preload_result.json is the completion signal the warm driver polls.
-            confirmed = False
-            for attempt in range(3):
-                remaining = deadline - _finite_positive_number(time.time(), "current clock")
-                if remaining <= 0:
-                    break
-                hf_upload(payload, "/tmp/preload_result.json", "preload_result.json")
-                try:
-                    confirmed = hf_file_exists(payload, "preload_result.json")
-                except Exception as exc:
-                    print(
-                        f"preload_result.json upload confirm warn: "
-                        f"{_safe_detail(exc, secrets=_payload_secrets(payload))}",
-                        flush=True,
-                    )
-                if confirmed:
-                    break
-                if attempt < 2:
-                    remaining = deadline - _finite_positive_number(time.time(), "current clock")
-                    if remaining <= 0:
-                        break
-                    time.sleep(min(2.0 * (attempt + 1), remaining))
-            if not confirmed:
-                print(
-                    "preload_result.json upload FAILED before the run deadline "
-                    "(driver falls back to the attempt marker)",
-                    flush=True,
-                )
-            ok = not result.get("error") and not result.get("failed")
-            error = "model preload failed" if not ok else ""
-            return 0 if ok else 1
         deadline_watchdog = arm_deadline_watchdog(deadline, payload)
+        _publish_started(payload)
         # fetch and verify the pinned archive before pip, downloaded imports, path mutation, or child.
         fetch_code(payload)
         install_extra_pip(payload)
@@ -948,8 +892,8 @@ def _run_attempt(payload: dict) -> int:
                 f"error_{phase}_attempt*.txt and console_{phase}.txt in the HF dataset repo"
             )
         ok = True
-    except BaseException as exc:  # incl. SIGTERM's SystemExit / KeyboardInterrupt
-        retriable = isinstance(exc, RetriableBootstrapError)
+    except BaseException as exc:  # shutdown signals must still publish an attempt marker
+        retriable = isinstance(exc, (RetriableBootstrapError, WorkerInterrupted))
         detail = _safe_detail(exc, 1800, secrets=_payload_secrets(payload))
         error = f"run wall deadline exceeded: {detail}" if isinstance(exc, TimeoutError) else detail
         print(f"bootstrap failed: {error}", flush=True)

@@ -34,21 +34,10 @@ GRPO_UPDATE_FLOPS_PER_TOKEN_PER_PARAM = 8.0  # policy fwd+bwd (6) + frozen-ref f
 # parasail api, so there is no local frozen-reference forward (grpo's extra 2).
 OPD_UPDATE_FLOPS_PER_TOKEN_PER_PARAM = 6.0
 
-# Model-FLOPs utilization (fraction of peak sustained), calibrated against real RunPod
-# wall clock. LoRA + small batches sit well below dense-pretraining MFU.
 MFU_TRAIN = 0.35  # GRPO policy/reference update
 MFU_SFT_TRAIN = 0.25  # SFT fwd/bwd (smaller effective batch, long sequences)
 MFU_DECODE = 0.12  # batched vLLM rollout (decode is memory-bandwidth-bound)
 
-# --- rollout step floor ------------------------------------------------------------------------
-# empirically fitted over 45 RunPod arms as fixed per-step overhead plus rollout-batch work.
-# the intercept and per-completion slope cover old_log_prob, weight sync, checkpointing, and
-# small-model overhead that peak-FLOPs scaling misses. this aggregate will drift with hardware,
-# verl, and engine changes.
-#
-# every calibration arm reported timing_s/reward=0.0000, so this fitted floor contains no
-# measurable reward-function wait. it covers only recurring gpu-side work and small-model
-# inefficiency that the peak-flops terms miss. reward latency therefore has no estimate term.
 STEP_FLOOR_BASE_SECONDS = 62.7
 STEP_FLOOR_SECONDS_PER_COMPLETION = 0.805
 
@@ -132,7 +121,7 @@ WORKER_BOOT_S = 120.0  # container pull + start
 DEPS_INSTALL_S = 90.0  # pip/uv resolve + install
 MODEL_LOAD_BASE_S = 235.0  # fixed checkpoint deserialize + GPU placement + framework/CUDA init
 VLLM_INIT_S = 120.0
-DOWNLOAD_RATE_GBPS = 0.4  # effective hf snapshot download (hf_transfer), on top of the base load
+DOWNLOAD_RATE_GBPS = 0.4  # effective hf snapshot download, on top of the base load
 
 # synchronous required saves serialize the lora state and publish it. sft/grpo make two hf commits
 # per save (deployable adapter plus resume checkpoint); opd publishes a single deployable adapter.
@@ -426,11 +415,7 @@ def _wider_shape_remedy(config: RunConfig, need: float, names: tuple[str, ...]) 
     classes that were considered -- reusing the caller's provider filtering instead of
     reconstructing it here and risking a suggestion for a class it never had.
 
-    A class is dropped when every provider that would serve it here names the card count in the
-    SKU, since this path is offline by contract and cannot confirm such a shape is sold. Quoting an
-    unverifiable width is worse than a bare dead end: `--cost` is consulted precisely to avoid a
-    doomed launch. A pinned provider narrows that question to itself -- H100 is on RunPod, but a
-    lambda-pinned quote may not borrow RunPod's freedom to rent any count.
+    Only counts supported by the selected Modal GPU class are suggested.
     """
     from flash.providers.core.base import (
         GPU_INFO,
@@ -465,22 +450,7 @@ def _wider_shape_remedy(config: RunConfig, need: float, names: tuple[str, ...]) 
 
 
 def _catalog_check_remedy(config: RunConfig, need: float, names: tuple[str, ...]) -> str:
-    """The width to ASK a fixed-count provider for, when no width can be promised offline.
-
-    ``_wider_shape_remedy`` drops classes whose providers name the count in the SKU, which leaves a
-    Lambda- or Vast-pinned exact quote with no remedy at all -- so it fell through to knob advice
-    telling the user to shrink a run that already fits at a wider count. `live_capacity` means the
-    count is confirmed dynamically, not that the SKU is absent: Lambda resolves `gpu_4x_h100_pcie`
-    against its own catalog. This mirrors the allocator's ``_catalog_check_hint`` so the same
-    shortfall reads the same whether it surfaced from `--cost` or from submit.
-
-    Still a check and never a promise: nothing offline proved the wider SKU is purchasable.
-
-    Withheld when the run would not LAUNCH on the width found, mirroring ``_catalog_check_hint``:
-    ``smallest_fitting_gpu_count`` credits rented cards, so for an sft run the batch caps at fewer
-    ranks it names a count that buys idle cards. The mirror has to hold in both directions or
-    `--cost` promises a width submit rejects.
-    """
+    """Suggest a wider supported allocation only when all purchased GPUs can execute."""
     from flash.providers.core.base import smallest_fitting_gpu_count
     from flash.providers.core.sharding import MAX_COMBINATION_CARDS
 
@@ -570,12 +540,6 @@ def _offline_preferred_gpu_shape(config: RunConfig) -> tuple[str, int, int, str,
                 quote[4] * quote[2] * sharded_step_seconds(config, quote[0], quote[2], quote[3])
             ),
         )
-    # every eligible provider has now been tried and none has a structural fit. dropping the
-    # restriction here to reach the unpinned `provider="auto"` diagnostic would rank the registered
-    # runpod pool regardless of credentials, quoting a shape this plane cannot rent -- the same
-    # defect the eligibility filter above exists to prevent, reintroduced at the last step. that
-    # quote would then pass affordability and only fail once live allocation runs, after the run is
-    # recorded. re-raise the eligible set's own failure instead, which names the real constraint.
     return _offline_gpu_shape(replace(config, provider=eligible[0], providers=()))
 
 
@@ -622,26 +586,9 @@ def _offline_gpu_shape(config: RunConfig) -> tuple[str, int, int, str, float]:
             )
         )
     elif provider == "auto":
-        # `auto` ranks the RunPod pool: it is the default substrate, and the allocator only reaches a
-        # lambda-only class after the cheaper runpod classes exhaust, so quoting one here would name
-        # hardware auto would not have picked. `enum_member` IS the runpod membership flag.
-        names = tuple(
-            info.name for info in GPU_INFO.values() if info.enum_member and info.validated
-        )
+        names = tuple(info.name for info in GPU_INFO.values() if info.modal_name and info.validated)
     else:
-        # a pinned provider must rank that provider's whole validated pool. filtering on
-        # `enum_member` silently means "on runpod", so lambda-only classes (A10, A100 SXM 40GB) never
-        # entered a `provider=lambda` quote and the estimate - and the submit-time affordability
-        # precheck - overstated cost against a cheaper shape `allocate()` would really pick. the
-        # `providers_for` filter below narrows this pool to the classes the provider can provision.
         names = tuple(info.name for info in GPU_INFO.values() if info.validated)
-    # narrow to what the pinned provider can actually provision BEFORE sizing. the ranking loop
-    # below filters per candidate, which is too late for three decisions taken up front: the
-    # auto-sized count, the no-fit message, and the `--gpus` remedy would all reason over classes
-    # this provider cannot rent. measured: a vast-pinned 119 GB run sized 1 card against another
-    # provider's H200, ranked empty, and reported "more than any 8-card combination (1177.6 GB
-    # max)" -- a number larger than the requirement it claimed could not be met, while 2x80 GB vast
-    # cards would have fit.
     if provider != "auto":
         names = tuple(name for name in names if provider in providers_for(name))
     auto_cap = geometry_safe_gpu_cap(
@@ -652,7 +599,7 @@ def _offline_gpu_shape(config: RunConfig) -> tuple[str, int, int, str, float]:
     ranked = []
     for gpu in names:
         info = GPU_INFO[gpu]
-        for count in rentable_gpu_counts(safe_gpu_count):
+        for count in rentable_gpu_counts(min(safe_gpu_count, info.max_count)):
             # credit only the cards that JOIN the run, matching the allocator's `_fits`. quoting the
             # billed count here made the two disagree: a 27B at 128k over 10 rows was quoted 4x H200
             # (460 GB credited against a 422 GB need) while the allocator launches 2 ranks -- 234 GB
@@ -660,19 +607,9 @@ def _offline_gpu_shape(config: RunConfig) -> tuple[str, int, int, str, float]:
             launched = executed_gpu_count(config, count)
             if combined_vram_gb(info.vram_gb, launched) < need:
                 continue
-            # customer quoting is structural and must not touch a live market. vast pricing is
-            # offer-backed (therefore capacity-backed), and lambda's catalog can blip too. use the
-            # provider's offline static rate here; allocation may later select a different live rate,
-            # but that operational price never changes the accepted customer quote.
-            if provider == "lambda":
-                from flash.providers.lambda_.client.pricing import static_hourly_rate
+            from flash.providers.modal.pricing import hourly_rate
 
-                hourly = static_hourly_rate(gpu)
-            else:
-                hourly = info.hourly_usd
-            # `provider` is "auto" here only when the pool being ranked IS the runpod pool (see the
-            # name selection above), so an empty provider never reaches the multiplier as a
-            # substrate whose interconnect is unknown.
+            hourly = hourly_rate(gpu)
             step_seconds = sharded_step_seconds(
                 config, gpu, count, "" if provider == "auto" else provider
             )
@@ -869,10 +806,6 @@ def estimate_cost(
         gpu, need, billed_gpu_count, quote_provider, hourly = _offline_gpu_shape(config)
 
     setup = setup_seconds(config)
-    # sft shards by sequence and grpo/opd by data, so the multiplier is method-specific. the quote
-    # provider is passed explicitly: with a live allocation it is the substrate actually selected,
-    # which `config` does not carry -- an auto run reaches here with provider "auto" and would
-    # otherwise be credited nvlink scaling on a vast combination that cannot deliver it.
     speedup = method_card_speedup(config, billed_gpu_count, gpu, quote_provider)
     sps = sharded_step_seconds(config, gpu, billed_gpu_count, quote_provider)
     required_save_s = required_save_overhead_seconds(config)

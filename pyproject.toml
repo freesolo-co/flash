@@ -1,9 +1,9 @@
 [project]
 name = "freesolo-flash"
-version = "1.2.135"
+version = "1.3.5"
 description ="Flash — managed LoRA post-training (SFT/GRPO/OPD) for Freesolo environments, driven by the `flash` CLI"
 readme = "README.md"
-# RunPod Flash supports Python 3.11-3.12 (not 3.13 yet).
+# The training and serving stack is validated on Python 3.11 and 3.12.
 requires-python = ">=3.11,<3.13"
 license = "Apache-2.0"
 license-files = ["LICENSE", "NOTICE"]
@@ -31,9 +31,9 @@ gpu = [
     "transformers>=5.8,<5.13",
     "tokenizers>=0.22",
     "tiktoken>=0.12",
+    "httpx>=0.27",  # client-lived managed teacher connection pool
     "peft>=0.19",
     "vllm==0.19.1",
-    "bitsandbytes>=0.49",
     "accelerate>=1.4",
     # resolve_verl_python shells out to `uv` to provision the isolated verl interpreter whenever
     # FLASH_VERL_PYTHON is unset. sft and opd are verl-only, so that call is unconditional here.
@@ -43,10 +43,9 @@ gpu = [
     "freesolo>=0.4.2",
     "huggingface-hub>=1.2.0",
 ]
-# Control-plane / operator deps. runpod-flash (RunPod provider SDK) + huggingface-hub (provider
-# code upload + repo settings) are imported server-side; httpx is the serving client (flash/serve).
-# Keeping runpod-flash out of the base install also stops its `flash` console script shadowing
-# ours, so `pip install freesolo-flash` gives an unambiguous `flash` command. huggingface-hub>=1.2.0:
+# Operator dependencies stay out of the base CLI install. Modal runs the GPU workloads;
+# huggingface-hub handles source and artifact storage, and httpx connects serving clients.
+# huggingface-hub>=1.2.0:
 # 1.2.0+ adds built-in RateLimit-header-aware 429 retry for downloads (resolvers) and paginated Hub
 # API calls. Our outer _hf_call wrappers stay on top: the library does not retry the complete mutating
 # operations (create_commit / create_repo / update_repo_settings) and the wrappers also bound an
@@ -55,13 +54,14 @@ gpu = [
 # sft cost, dry-run, and submit statically read packaged rows plus the defined training contract.
 # environment.py is not imported; other environment prompt transformations remain estimate gaps.
 server = [
+    "pydantic-settings>=2.7",
+    "orjson>=3.10",
     # 0.136 floor keeps modal's serving+serve-runtime pair solvable under vllm's resolver-only <0.137
     # ceiling (omitted from its registry metadata); server alone still resolves fastapi 0.141.1.
     "fastapi>=0.136,<1",
     "uvicorn>=0.52,<1",
     # customer-owned modal lifecycle mutations execute in the control plane.
-    "modal==1.6.1",
-    "runpod-flash>=1.19,<2",
+    "modal==1.6.2",
     "httpx>=0.27",
     "jsonschema>=4.23",
     "referencing>=0.28.4",
@@ -70,12 +70,14 @@ server = [
     "datasets>=2.19",
     "freesolo>=0.4.2",
     "transformers>=5.8,<5.13",
+    # Tokenizer chat templates are rendered during control-plane workload profiling.
+    "jinja2>=3.1.0",
     # the control plane decodes images: flash/server/routes/runs.py imports
     # preflight_validate_image_opd at module load, and flash/content/multimodal.py opens every image
     # source with PIL to validate it. without Pillow a self-hoster on [server] gets
     # `RuntimeError: Pillow is required for multimodal image training` at preflight on any
     # multimodal opd run. the gpu extra gets Pillow transitively via vllm; server does not.
-    "pillow>=11",
+    "pillow>=11.0.0",
 ]
 # The serving app (flash/serving/) that runs inside the GPU container. Kept out of `server` because
 # the control plane never imports it: only the container image and the offline serving tests need
@@ -83,6 +85,8 @@ server = [
 # (vllm==0.23.0, held exactly by a 25h 35B outage on 0.21.0), and the offline tests substitute a
 # stub whenever the real package is unimportable, so CI exercises the app without it.
 serving = [
+    "pydantic-settings>=2.7",
+    "orjson>=3.10",
     # the hosted app talks to supabase (durable adapter registry) and the platform backend (usage
     # billing) over httpx, at module scope in src/persistence.py and src/supabase_rest.py. it is
     # NOT transitively guaranteed by the other bounds, so the image must state it.
@@ -98,12 +102,12 @@ serving = [
     # this one is what the serving image installs ALONE -- so a range here lets the container
     # resolve a different modal than the control plane was validated against, on a rebuild that
     # changed nothing else. one policy per package.
-    "modal==1.6.1",
+    "modal==1.6.2",
     "orjson>=3.10.0",
     # `src/multimodal.py` decodes and normalizes inbound images at module scope. the `gpu` extra
     # gets Pillow transitively via vllm, but this extra deliberately excludes vllm, so it has to
     # state Pillow itself.
-    "pillow>=11",
+    "pillow>=11.0.0",
     # imported directly by `src/io/schemas.py`, `src/io/requests.py` and
     # `src/store/settings.py`. it does arrive under `pydantic-settings`, but a direct module-scope
     # import should not rely on
@@ -130,6 +134,10 @@ serve-runtime = [
 ]
 # CI compatibility: some workflows use `uv sync --extra dev` rather than `--group dev`.
 dev = [
+    "modal==1.6.2",
+    "orjson>=3.10",
+    "pydantic-settings>=2.7",
+    "cloudpickle>=3.0",
     "mypy>=1.13.0",
     "pytest>=9.0.3",
     # dependency contract tests parse exact pins without relying on a transitive install.
@@ -142,7 +150,6 @@ dev = [
     # mirror server's 0.136 floor so dev remains compatible with the deployed serving extra pair.
     "fastapi>=0.136,<1",
     "uvicorn>=0.52,<1",
-    "runpod-flash>=1.19,<2",
     "httpx>=0.27",
     "jsonschema>=4.23",
     "referencing>=0.28.4",
@@ -153,11 +160,12 @@ dev = [
     "transformers>=5.8,<5.13",
     "tokenizers>=0.22",
     "tiktoken>=0.12",
+    "httpx>=0.27",  # client-lived managed teacher connection pool
     # flash/content/multimodal.py imports PIL directly to validate and decode every image source, so the
     # image tests are not optional coverage: without Pillow they importorskip and CI reports green
     # on a multimodal path it never executed. the control plane decodes images too, so `server`
     # declares Pillow as well; this entry keeps the tests runnable without that extra.
-    "pillow>=11",
+    "pillow>=11.0.0",
 ]
 # NB: there is deliberately no `all` aggregate. `gpu` (the GPU worker) and `server` (the control
 # plane) run on separate machines.
@@ -168,11 +176,7 @@ Repository = "https://github.com/freesolo-co/flash"
 
 [project.scripts]
 flash = "flash.cli.parsing.main:main"
-# Same entry point as `flash`, under a name nothing else claims. The `server` and `dev` extras
-# pull in runpod-flash, which declares its own `flash` console script; whichever distribution is
-# installed last wins, so on a plane host `flash` can silently belong to runpod-flash. `flash-cli`
-# always reaches Flash. Keep both: on a base install `flash` is unambiguous and is what every
-# existing user has.
+# Established explicit alias for the Flash command.
 flash-cli = "flash.cli.parsing.main:main"
 # Operator-only: the control plane is a separate service, run once on the host, not a `flash`
 # subcommand. Requires the `server` extra (`pip install 'freesolo-flash[server]'`).
@@ -196,7 +200,7 @@ artifacts = ["flash/py.typed"]
 # auto-published by .github/workflows/publish-dev.yml: a push to `dev` whose version isn't yet on
 # PyPI publishes it; pushes that don't change it find it already published and no-op. So cutting a
 # dev-channel release = bump this (and [project].version) and merge to `dev`.
-version = "1.2.135"
+version = "1.3.5"
 
 [tool.pytest.ini_options]
 pythonpath = ["."]
@@ -227,6 +231,7 @@ conflicts = [
 
 [dependency-groups]
 dev = [
+    "cloudpickle>=3.0",
     "mypy>=1.13.0",
     "pytest>=9.0.3",
     # dependency contract tests parse exact pins without relying on a transitive install.
@@ -239,11 +244,12 @@ dev = [
     "freesolo>=0.4.2",
     "tokenizers>=0.22",
     "tiktoken>=0.12",
+    "httpx>=0.27",  # client-lived managed teacher connection pool
     # flash/content/multimodal.py imports PIL directly to validate and decode every image source, so the
     # image tests are not optional coverage: without Pillow they importorskip and CI reports green
     # on a multimodal path it never executed. the control plane decodes images too, so `server`
     # declares Pillow as well; this entry keeps the tests runnable without that extra.
-    "pillow>=11",
+    "pillow>=11.0.0",
     "pytest-xdist>=3.6",
     # tests/test_workflow_contracts.py parses .github/workflows/*.yml. PyYAML is already present
     # transitively (datasets/transformers/huggingface-hub), but a test that imports it directly

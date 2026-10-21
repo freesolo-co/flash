@@ -375,7 +375,7 @@ def test_is_moe_property():
 
 
 def test_size_gate_reads_the_catalog_not_a_dense_param_estimate():
-    """The GC/liger size gate must not size a MoE with a dense parameter formula.
+    """The gradient-checkpointing size gate must not size a MoE with a dense parameter formula.
 
     ``_estimate_params`` reconstructs ``embeddings + 12 h^2 per layer``, which has no term for an
     expert stack. For Qwen3.6-35B-A3B (2048 hidden, 40 layers, 248320 vocab, untied) that is
@@ -388,7 +388,7 @@ def test_size_gate_reads_the_catalog_not_a_dense_param_estimate():
     fix. ``test_size_gate_is_offline_and_fail_safe_for_cataloged_models`` owns the behavior.
     """
     from flash.core.catalog import MODELS
-    from flash.engine.worker.perf.liger import _LIGER_MIN_PARAMS, _estimate_params
+    from flash.engine.worker.perf.model_size import _CHECKPOINT_MIN_PARAMS, _estimate_params
 
     class _Cfg:
         hidden_size = 2048
@@ -400,13 +400,13 @@ def test_size_gate_reads_the_catalog_not_a_dense_param_estimate():
     assert estimate < 3.1e9, "dense formula no longer under-counts the MoE; revisit this test"
     assert MODELS["Qwen/Qwen3.6-35B-A3B"].params_b == 35.0
     # the margin the old path depended on: 1% of the threshold, on an 11.5x-larger model.
-    assert 1.0 < estimate / _LIGER_MIN_PARAMS < 1.02
+    assert 1.0 < estimate / _CHECKPOINT_MIN_PARAMS < 1.02
 
 
 def test_size_gate_is_offline_and_fail_safe_for_cataloged_models(monkeypatch):
     """A cataloged model must not need a network probe to decide gradient checkpointing.
 
-    ``_liger_default_for_model`` returns False on ANY exception, and False means "small model" ->
+    ``_checkpointing_default_for_model`` returns False on ANY exception, and False means "small model" ->
     ``_memory_mode`` False -> gradient checkpointing OFF. So a rate-limited or offline HF read used
     to disable checkpointing on a 35B model. The catalog is local and exact, so it answers first.
 
@@ -417,7 +417,7 @@ def test_size_gate_is_offline_and_fail_safe_for_cataloged_models(monkeypatch):
     import sys
     import types
 
-    import flash.engine.worker.perf.liger as liger_mod
+    import flash.engine.worker.perf.model_size as model_size_mod
     from flash.core.catalog import MODELS, ModelInfo
     from flash.engine.worker.perf.memory import _memory_mode
 
@@ -442,9 +442,9 @@ def test_size_gate_is_offline_and_fail_safe_for_cataloged_models(monkeypatch):
     )
 
     # every cataloged model answers from params_b, with the probe guaranteed to fail if consulted.
-    assert liger_mod._liger_default_for_model("Qwen/Qwen3.6-35B-A3B") is True
-    assert liger_mod._liger_default_for_model("Qwen/Qwen3.8-27B") is True
-    assert liger_mod._liger_default_for_model("Qwen/Qwen3.5-9B") is True
-    assert liger_mod._liger_default_for_model(synthetic_id) is False
+    assert model_size_mod._checkpointing_default_for_model("Qwen/Qwen3.6-35B-A3B") is True
+    assert model_size_mod._checkpointing_default_for_model("Qwen/Qwen3.8-27B") is True
+    assert model_size_mod._checkpointing_default_for_model("Qwen/Qwen3.5-9B") is True
+    assert model_size_mod._checkpointing_default_for_model(synthetic_id) is False
     # and the decision that matters: a short-context 35b step keeps gradient checkpointing on.
     assert _memory_mode("Qwen/Qwen3.6-35B-A3B", 711) is True

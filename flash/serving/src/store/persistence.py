@@ -51,22 +51,6 @@ def load_adapters(settings: Settings) -> list[AdapterRecord]:
     )
 
 
-def list_run_adapters(org_id: str, run_id: str, settings: Settings) -> list[AdapterRecord]:
-    """load every exact checkpoint for one tenant run, regardless of lifecycle status."""
-
-    if not settings.has_supabase:
-        return []
-    return _list_adapters(
-        settings,
-        {
-            "org_id": f"eq.{org_id}",
-            "run_id": f"eq.{run_id}",
-            "order": "checkpoint_id.asc",
-        },
-        "load hosted run checkpoints",
-    )
-
-
 def _list_adapters(
     settings: Settings,
     filters: dict[str, str],
@@ -95,7 +79,7 @@ def _list_adapters(
             offset += len(rows)
 
 
-def get_adapter(org_id: str, adapter_id: str, settings: Settings) -> AdapterRecord | None:
+def get_adapter(org_id: str, checkpoint_id: str, settings: Settings) -> AdapterRecord | None:
     if not settings.has_supabase:
         return None
     with httpx.Client(timeout=30.0) as client:
@@ -104,7 +88,7 @@ def get_adapter(org_id: str, adapter_id: str, settings: Settings) -> AdapterReco
             params={
                 "select": PERSISTED_COLUMNS,
                 "org_id": f"eq.{org_id}",
-                "checkpoint_id": f"eq.{adapter_id}",
+                "checkpoint_id": f"eq.{checkpoint_id}",
                 "limit": "1",
             },
             headers=supabase_headers(settings, "flash"),
@@ -137,7 +121,8 @@ def insert_adapter(record: AdapterRecord, settings: Settings) -> AdapterRecord:
     with httpx.Client(timeout=30.0) as client:
         response = client.post(
             url,
-            headers=supabase_headers(settings, "flash"),
+            # The binding RPC lives in public; its implementation writes flash's tables.
+            headers=supabase_headers(settings, "public"),
             json=payload,
         )
     if response.status_code == 409:
@@ -181,7 +166,7 @@ def replace_adapter_cas(
             params={
                 "select": PERSISTED_COLUMNS,
                 "org_id": f"eq.{record.org_id}",
-                "checkpoint_id": f"eq.{record.adapter_id}",
+                "checkpoint_id": f"eq.{record.model_id}",
                 "updated_at": f"eq.{expected_updated_at}",
             },
             headers={**supabase_headers(settings, "flash"), "Prefer": "return=representation"},
@@ -198,46 +183,13 @@ def replace_adapter_cas(
     return records[0] if records else None
 
 
-def _adapter_to_row(record: AdapterRecord, now: str) -> dict[str, Any]:
-    """serialize one exact checkpoint to the explicit hosted binding schema."""
-
-    if record.run_id is None or record.checkpoint is None:
-        raise PersistenceRecordError("checkpoint record is missing its permanent identity")
-    parsed = parse_checkpoint_ref(record.checkpoint)
-    if parsed is None or parsed[0] != record.run_id:
-        raise PersistenceRecordError("checkpoint record has an invalid permanent identity")
-    return {
-        "org_id": record.org_id,
-        "run_id": record.run_id,
-        "checkpoint": "final" if parsed[1] is None else f"step-{parsed[1]}",
-        "checkpoint_id": record.adapter_id,
-        "source_repo_type": record.repo_type,
-        "source_repository": record.repo_id,
-        "source_revision": record.artifact_revision,
-        "source_subfolder": record.subfolder,
-        "artifact_digest": record.artifact_digest,
-        "artifact_fingerprint": record.artifact_fingerprint,
-        "base_model": record.base_model,
-        "lora_config": {"rank": record.lora_rank},
-        "serving_defaults": {
-            "thinking": record.thinking,
-            "structured_outputs": record.structured_outputs,
-        },
-        "url": record.url,
-        "status": record.status,
-        "deployment_generation": record.deployment_generation,
-        "created_at": record.created_at or now,
-        "updated_at": now,
-    }
-
-
 def _bind_payload(record: AdapterRecord) -> dict[str, Any]:
     if record.org_id is None or record.run_id is None:
         raise PersistenceRecordError("checkpoint registration requires org_id and run_id")
     return {
         "p_org_id": record.org_id,
         "p_run_id": record.run_id,
-        "p_checkpoint_id": record.adapter_id,
+        "p_checkpoint_id": record.model_id,
         "p_source_repo_type": record.repo_type,
         "p_source_repository": record.repo_id,
         "p_source_revision": record.artifact_revision,
@@ -301,7 +253,7 @@ def _row_to_adapter(row: Any) -> dict[str, Any]:
     if not isinstance(lora_config, dict) or not isinstance(defaults, dict):
         raise RuntimeError("Supabase checkpoint row config fields must be objects")
     return {
-        "adapter_id": checkpoint_id,
+        "model_id": checkpoint_id,
         "repo_id": _required_row_value(row, "source_repository"),
         "org_id": _required_row_value(row, "org_id"),
         "url": row.get("url"),

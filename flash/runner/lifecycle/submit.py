@@ -21,6 +21,7 @@ from flash.core import catalog
 from flash.core.spec import TRAINER_BACKEND, JobSpec
 from flash.core.spec_persistence import PREPARATION_ENVELOPE_VERSION
 from flash.providers._lifecycle.net import worker as provider_worker
+from flash.providers.modal.auth import scope_fingerprint
 from flash.runner.accounting import artifacts, weight_cache
 from flash.runner.lifecycle import preparation, reporting, state
 from flash.runner.lifecycle import status as status_ops
@@ -70,7 +71,8 @@ def prepare_job(
         or preparation._context_org_id(platform_context),
         owner_key_id=owner_key_id,
     )
-    spec = preparation._resolve_model_revision(spec, required=spec.algorithm == "sft")
+    # Every trainer restores compact checkpoints against this exact immutable base.
+    spec = preparation._resolve_model_revision(spec, required=True)
     if spec.algorithm == "sft":
         spec = preparation._require_pinned_profile_environment(spec)
         spec = preparation._require_sft_workload_profile(spec)
@@ -346,6 +348,7 @@ def _submit_prepared_job(
         # snapshot the instance providers available at submit so a later handle-less recovery can fail
         # closed for any phantom-capable one whose creds were since dropped (see _confirm_run_clear).
         # Creds-only check (available_providers -> is_configured), no network on the create path.
+        submitted_modal_scope=scope_fingerprint(),
         submitted_instance_providers=[n for n in available_providers() if n in INSTANCE_PROVIDERS],
     )
     save_kwargs = {

@@ -6,7 +6,6 @@ state, so they are testable without constructing an engine.
 """
 
 import hashlib
-import time
 from pathlib import Path
 from typing import Any
 
@@ -57,25 +56,6 @@ def _safe_chat_template_kwargs(raw: Any) -> dict[str, Any]:
     return {k: v for k, v in raw.items() if k not in _RESERVED_CHAT_TEMPLATE_KWARGS}
 
 
-def _load_adapters_for_base(settings: Any, base_model: str) -> list[Any]:
-    from flash.serving.src.store.persistence import load_adapters
-
-    try:
-        return [
-            adapter
-            for adapter in load_adapters(settings)
-            if adapter.base_model == base_model
-            and adapter.status == "ready"
-            and adapter.is_checkpoint
-        ]
-    except Exception as exc:  # forwarded records still allow request-time serving
-        print(
-            f"adapter hydration skipped for base_model={base_model!r}: {type(exc).__name__}: {exc}",
-            flush=True,
-        )
-        return []
-
-
 def _adapter_source_ident(record: Any) -> tuple[str, str, str, str, str | None]:
     return (
         record.repo_id,
@@ -119,41 +99,6 @@ def _adapter_cache_ready(path: Path) -> bool:
         )
     except OSError:
         return False
-
-
-def _stream_usage_fields(
-    request_output: Any,
-    completion_token_ids: list[int],
-    *,
-    start: float,
-    request_id: str,
-    engine_replica_id: str,
-    checkpoint: str,
-    thinking: bool,
-) -> dict[str, Any]:
-    prompt_token_ids = list(getattr(request_output, "prompt_token_ids", []) or [])
-    fields = {
-        "prompt_token_ids": prompt_token_ids,
-        "completion_token_ids": list(completion_token_ids),
-        "prompt_tokens": _num_prompt_tokens(request_output),
-        "completion_tokens": len(completion_token_ids),
-        "cached_tokens": _num_cached_tokens(request_output),
-        "cached_tokens_reported": _cached_tokens_reported(request_output),
-        "inference_time_seconds": time.monotonic() - start,
-        "request_id": request_id,
-        "engine_replica_id": engine_replica_id,
-        "checkpoint": checkpoint,
-        "thinking": thinking,
-    }
-    if not thinking:
-        fields["reasoning_tokens"] = 0
-    return fields
-
-
-def _stream_text_delta(text: str, previous_text: str) -> tuple[str, str]:
-    if not text:
-        return "", previous_text
-    return text, previous_text + text
 
 
 def _num_prompt_tokens(request_output: Any) -> int:
@@ -214,7 +159,7 @@ def _engine_is_dead(engine: Any) -> bool:
 def active_checkpoint_ref(record: Any) -> str:
     """return the canonical permanent checkpoint the record explicitly serves."""
 
-    checkpoint_id = str(getattr(record, "adapter_id", "") or "").strip()
+    checkpoint_id = str(getattr(record, "model_id", "") or "").strip()
     return checkpoint_id if parse_checkpoint_ref(checkpoint_id) is not None else ""
 
 
@@ -229,7 +174,7 @@ def enforce_expected_checkpoint(record: Any, expected_checkpoint: str | None) ->
         expected = expected_checkpoint.strip()
         raise ValueError(
             "checkpoint mismatch: "
-            f"adapter {record.adapter_id} is serving checkpoint "
+            f"adapter {record.model_id} is serving checkpoint "
             f"{active_checkpoint or '<none>'}, not the expected "
             f"{expected or '<none>'}; a concurrent deploy likely replaced it. "
             "Re-deploy the intended step or drop the expectation."

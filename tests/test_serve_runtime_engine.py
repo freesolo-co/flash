@@ -219,6 +219,11 @@ def _no_hub_credential(monkeypatch):
 
 @pytest.fixture(autouse=True)
 def _fake_modules(monkeypatch):
+    from flash.serve.runtime import hub
+
+    monkeypatch.setattr(
+        hub, "engine_tokenizer_path", lambda config: config.effective_tokenizer_model
+    )
     _Tokenizer.calls = []
     _Processor.calls = []
     _SamplingParams.created = 0
@@ -1232,4 +1237,15 @@ def test_engine_death_callback_retries_after_callback_failure() -> None:
     assert attempts == 2
     assert len(reports) == 1
     assert reports[0].runtime_id == runtime.runtime_id
+    asyncio.run(runtime.close())
+
+
+def test_engine_receives_the_resolved_local_tokenizer_path(monkeypatch):
+    from flash.serve.runtime import hub
+
+    monkeypatch.setattr(hub, "engine_tokenizer_path", lambda _config: "/cache/tokenizer-snapshot")
+    runtime = VllmLoraRuntime(EngineConfig(model="served/model", tokenizer_model="tokenizer/model"))
+    asyncio.run(runtime.start())
+    assert _Engine.args.tokenizer == "/cache/tokenizer-snapshot"
+    assert runtime.health().served_model == "served/model"
     asyncio.run(runtime.close())

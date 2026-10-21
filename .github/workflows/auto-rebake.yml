@@ -1,7 +1,7 @@
 name: auto-rebake per-arch kernel cache
 
 # Keeps the per-arch ghcr.io/freesolo-co/flash-worker:cu128-sm* images fresh whenever the :cu128 base
-# is rebuilt. Each cu128-smXX is physically `FROM :cu128` + a baked mega-cache, so a new base leaves
+# is rebuilt. Each cu128-smXX is physically `FROM :cu128` + a baked kernel cache, so a new base leaves
 # the per-arch tags pointing at the OLD base until rebaked. "Out of date" has two flavors, keyed off
 # the fp_cache / fp_base labels worker-image.yml stamps on :cu128 (docker/kernel_fingerprint.py):
 #
@@ -92,7 +92,7 @@ jobs:
         env:
           HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
         run: |
-          # canonical digest ref (repo@sha256, no tag) so every tool (crane/docker/runpod) accepts it.
+          # canonical digest ref (repo@sha256, no tag) so every tool (crane/docker/modal) accepts it.
           digest=$(crane digest "$BASE")
           repo=${BASE%:*}
           cfg=$(crane config "$repo@$digest")

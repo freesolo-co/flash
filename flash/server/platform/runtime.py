@@ -155,18 +155,22 @@ _DEFERRED_RECOVERY_RETRY_S = 120.0
 def _confirm_run_clear(spec) -> bool:
     """Force-reap this run's label and confirm no instance remains.
 
-    ``gc`` alone cannot prove Vast teardown. Providers with ``run_instances_remaining`` must return
+    ``gc`` alone cannot prove sandbox teardown. Providers with ``run_instances_remaining`` must return
     ``[]``; a live instance or enumeration failure blocks resubmit. A provider recorded in
     ``submitted_instance_providers`` also blocks when it is now unconfigurable, because a lost
-    non-idempotent create such as Vast ``PUT /asks`` may still be billing without a handle.
+    create with a lost response may still be billing without a persisted handle.
     """
     from flash.providers.core.registry import INSTANCE_PROVIDERS, configured_providers, get_provider
 
     try:
-        recorded_raw = getattr(get_status(spec.run_id), "submitted_instance_providers", None)
+        from flash.providers.modal.auth import require_recorded_scope
+
+        status = get_status(spec.run_id)
+        require_recorded_scope(status)
+        recorded_raw = getattr(status, "submitted_instance_providers", None)
     except Exception:
         # Can't read the durable record of providers available at submit -> can't rule out a recorded
-        # Vast phantom that this restart can no longer enumerate -> fail CLOSED.
+        # unacknowledged sandbox that this restart can no longer enumerate -> fail CLOSED.
         return False
     recorded = {str(name) for name in recorded_raw} if recorded_raw is not None else None
     configured = {getattr(p, "name", None): p for p in configured_providers()}
@@ -357,7 +361,7 @@ def _handleless_completed_metrics(spec, status, deadline_at: float) -> dict | No
     providers = {
         str(name)
         for name in (getattr(status, "submitted_instance_providers", None) or [])
-        if name in {"vast", "lambda"}
+        if name == "modal"
     }
     for provider in sorted(providers):
         metrics = _completed_attempt_metrics(
@@ -372,7 +376,7 @@ def _handleless_completed_metrics(spec, status, deadline_at: float) -> dict | No
     return None
 
 
-def _enqueue_resubmit(spec, prior_state: str) -> bool:
+def _enqueue_resubmit(spec) -> bool:
     """Reserve execution capacity before acquiring any durable launch claim."""
     from flash.runner.lifecycle.status import source_snapshot_from_status
 
@@ -385,15 +389,13 @@ def _enqueue_resubmit(spec, prior_state: str) -> bool:
         _fail_blocked_recovery(spec, str(exc), expected_remote=None)
         return False
     try:
-        current_supervisor().submit(
-            ("run", spec.run_id), "training", partial(_resubmit_task, spec, prior_state)
-        )
+        current_supervisor().submit(("run", spec.run_id), "training", partial(_resubmit_task, spec))
     except TaskAdmissionError:
         return False
     return True
 
 
-def _resubmit_task(spec, prior_state: str) -> Retry | None:
+def _resubmit_task(spec) -> Retry | None:
     from flash.runner.lifecycle.deadlines import _remaining_run_wall_seconds
 
     checkpoint()
@@ -405,13 +407,13 @@ def _resubmit_task(spec, prior_state: str) -> Retry | None:
     ):
         return None
     delay = min(_DEFERRED_RECOVERY_RETRY_S, max(1.0, _remaining_run_wall_seconds(spec.run_id)))
-    if prior_state != "queued" and not _confirm_run_clear(spec):
+    if status.state != "queued" and not _confirm_run_clear(spec):
         if not _recovery_wall_deadline_is_open(spec) and _fail_blocked_recovery(
             spec, "provider teardown remains unconfirmed"
         ):
             return None
         return Retry(delay)
-    if _start_handleless_resubmit(spec, prior_state):
+    if _start_handleless_resubmit(spec, status.state):
         return None
     if get_status(spec.run_id).state in _RECOVERABLE:
         return Retry(delay)
@@ -460,7 +462,7 @@ def _reconcile_handleless_run(spec) -> Retry | None:
         if (
             _confirm_run_clear(spec)
             and _recovery_block_reason(spec) is None
-            and _enqueue_resubmit(spec, status.state)
+            and _enqueue_resubmit(spec)
         ):
             return None
     except Exception:
@@ -629,7 +631,7 @@ def recover_runs(*, sweep: bool = True) -> None:
     a worker."""
     active: set[str] = set()
     # Every run this plane knows about (whatever its state). This is the multi-plane safety scope for
-    # the orphan sweep below — WITHOUT it, a restarting plane sharing a Vast/Lambda account sees the
+    # the orphan sweep below — WITHOUT it, a restarting plane sharing a Modal workspace sees the
     # OTHER plane's `flash-` instances as "not active locally" and the providers' unscoped
     # known_labels=None path would DESTROY them (the same guard app.py's periodic sweep already
     # passes). `active` (handle-backed/resuming only) is the narrower must-keep set; `known` is the
@@ -711,7 +713,7 @@ def _classify_recoverable_runs(
         get_status,
         reallocation_spec_from_status,
     )
-    from flash.runner.supervise.recovery import _gc_run_endpoints
+    from flash.runner.supervise.recovery import _gc_run_sandboxes
 
     for row in db.all_runs():
         checkpoint()
@@ -786,24 +788,21 @@ def _classify_recoverable_runs(
                     _update(status.run_id, "failed", error=detail)
                 with contextlib.suppress(Exception):
                     _append_run_log(status.run_id, detail)
-                # The aborted attempt may STILL have registered its uniquely-named RunPod
-                # endpoint before crashing (the exact leak the good-spec branch's
-                # `_gc_run_endpoints` guards against). The `sweep_orphans` dispatch below is a
-                # no-op for RunPod, and the periodic idle reaper would only reclaim this after its
-                # 15-min idle grace — so tear it down by name HERE for immediate cleanup.
-                # `_gc_run_endpoints` needs a parsed `JobSpec`, which we don't have; but the
-                # endpoint name is derived deterministically from the run id + GPU class
-                # (`endpoint_name(gpu, _run_suffix(run_id))`), both readable from the RAW
-                # persisted status without parsing the spec. Terminate by that reconstructed
-                # name. Best-effort/suppressed so it can never re-abort recovery; then continue.
-                from flash.providers.runpod.execution.provider import terminate_persisted_endpoints
+                from flash.providers.modal.provider import terminate_persisted_resources
 
-                terminate_persisted_endpoints(status.spec, status.run_id)
+                try:
+                    terminate_persisted_resources(status.spec, status.run_id)
+                except Exception:
+                    _log.warning(
+                        "cleanup failed for run %s; orphan sweep will retry",
+                        status.run_id,
+                        exc_info=True,
+                    )
                 continue
             # reap run-scoped resources from the parseable public spec before touching the private
             # warm-start snapshot. source drift or snapshot tampering must not strand an endpoint.
             with contextlib.suppress(Exception):
-                _gc_run_endpoints(spec)
+                _gc_run_sandboxes(spec)
             try:
                 spec = reallocation_spec_from_status(status, verify_source=True)
                 # refresh the warm-start marker so recovery keeps an aged source protected.
@@ -854,22 +853,8 @@ def _resubmit_recovered_runs(resubmit: list[tuple[JobSpec, str]]) -> None:
                     _schedule_resubmit(spec)
             continue
         _log.info("resubmitting run %s after control-plane restart", spec.run_id)
-        # MtzrJ: a handle-less run hit the submit->provisioning window, so a NON-IDEMPOTENT instance
-        # create (Vast's PUT /asks) may have been accepted while the response/handle was lost — a
-        # phantom contract that bills and, worse, writes this run's HF artifacts. The batch
-        # sweep_orphans above reaps it only if it was VISIBLE then; _confirm_run_clear force-reaps this
-        # run's label across the instance providers RIGHT BEFORE relaunching and verifies nothing for the
-        # run remains, so a phantom that surfaced in the sweep->resubmit gap (Vast's instance list is
-        # eventually consistent) can't get a SECOND worker writing the same run-scoped artifacts.
-        # A run still `queued` never reached that window: the runner enqueues as `queued` and
-        # lifecycle's `_update(..., "provisioning")` fires BEFORE any `provider.submit_attempt`, and
-        # nothing regresses `provisioning`->`queued`, so a `queued` run made no create and can't
-        # have left a phantom. Skip
-        # the guard for it — else a purely-queued run whose VAST_API_KEY was dropped after submit would
-        # fail closed in _confirm_run_clear (unenumerable recorded Vast) and defer forever. The guard
-        # still runs for `provisioning`/`running`, the states that could have attempted a create.
         if prior_state == "queued" or _confirm_run_clear(spec):
-            if _enqueue_resubmit(spec, prior_state):
+            if _enqueue_resubmit(spec):
                 continue
             try:
                 current = get_status(spec.run_id)

@@ -1,4 +1,4 @@
-"""Focused hermetic coverage for the shared instance bootstrap (Vast/Lambda worker container).
+"""Focused hermetic coverage for the shared instance bootstrap (provider/Lambda worker container).
 
 These target under-covered helpers in ``flash.providers._lifecycle.bootstrap``: payload loading,
 code-prefix validation, the Hugging Face transient-retry machinery (status/Retry-After parsing +
@@ -36,7 +36,7 @@ def _isolate_bootstrap_state(tmp_path, monkeypatch):
     monkeypatch.setattr(bootstrap, "CODE_ROOT", str(tmp_path / "runcode"))
 
 
-@pytest.mark.parametrize("arm", ["lambda", "vast"])
+@pytest.mark.parametrize("arm", ["modal"])
 def test_arm_accepts_current_provider_identity(arm):
     assert b._arm({"flash_arm": arm}) == arm
 
@@ -451,31 +451,6 @@ def test_hf_file_exists_starts_no_request_at_deadline(monkeypatch):
     with pytest.raises(TimeoutError, match="deadline"):
         b.hf_file_exists(payload, "DONE")
     assert calls == []
-
-
-def test_fetch_spec_from_hf_returns_downloaded_file_contents(tmp_path, monkeypatch):
-    local = tmp_path / "job_spec.json"
-    local.write_text('{"spilled": true}')
-    seen = {}
-
-    def _dl(**kw):
-        seen.update(kw)
-        return str(local)
-
-    _install_fake_hf(monkeypatch, hf_hub_download=_dl)
-    created_at = b.time.time()
-    payload = {
-        "hf_repo": "o/r",
-        "hf_prefix": "sft/run",
-        "env": {"HF_TOKEN": "tok"},
-        "deadline_at": created_at + 60.0,
-        "run_created_at": created_at,
-        "run_max_wall_seconds": 60.0,
-    }
-    assert b.fetch_spec_from_hf(payload) == '{"spilled": true}'
-    assert seen["filename"] == "sft/run/job_spec.json"
-    assert seen["repo_type"] == "dataset"
-    assert seen["token"] == "tok"
 
 
 def test_install_extra_pip_starts_no_process_at_deadline(monkeypatch):
@@ -963,8 +938,13 @@ def test_run_mode_reaps_uploader_before_base_exception_propagates(monkeypatch, w
 
 @pytest.mark.parametrize(
     "wait_error",
-    [SystemExit(17), KeyboardInterrupt("interrupted"), RuntimeError("wait failed")],
-    ids=["system-exit", "keyboard-interrupt", "unexpected-exception"],
+    [
+        SystemExit(17),
+        KeyboardInterrupt("interrupted"),
+        RuntimeError("wait failed"),
+        b.WorkerInterrupted("worker interrupted by signal 2"),
+    ],
+    ids=["system-exit", "keyboard-interrupt", "unexpected-exception", "host-interruption"],
 )
 def test_wait_error_reaps_uploader_before_propagating_to_terminal_marker(monkeypatch, wait_error):
     uploader = _ReapTrackedUploader()
@@ -986,6 +966,7 @@ def test_wait_error_reaps_uploader_before_propagating_to_terminal_marker(monkeyp
             return None
 
     monkeypatch.setattr(b, "load_payload", lambda: payload)
+    monkeypatch.setattr(b, "_publish_started", lambda _payload: None)
     monkeypatch.setattr(
         b,
         "arm_deadline_watchdog",
@@ -1026,7 +1007,7 @@ def test_wait_error_reaps_uploader_before_propagating_to_terminal_marker(monkeyp
     ok, error, retriable, uploader_alive, uploader_closed = marker_states[0]
     assert ok is False
     assert type(wait_error).__name__ in error
-    assert retriable is False
+    assert retriable is isinstance(wait_error, b.WorkerInterrupted)
     assert uploader_alive is False
     assert uploader_closed is True
 
@@ -1483,7 +1464,7 @@ def test_run_mode_reserves_cleanup_before_watchdog_marker_with_real_timing(monke
         "job_spec_json": "{}",
         "phase": "sft",
         "seed": 0,
-        "flash_arm": "lambda",
+        "flash_arm": "modal",
         "env": {},
         "extra_pip": [],
         "hf_prefix": "sft/run",
@@ -1499,6 +1480,7 @@ def test_run_mode_reserves_cleanup_before_watchdog_marker_with_real_timing(monke
         markers.append((kind, time.time(), uploader.is_alive()))
 
     monkeypatch.setattr(b, "load_payload", lambda: payload)
+    monkeypatch.setattr(b, "_publish_started", lambda _payload: None)
     monkeypatch.setattr(b, "install_extra_pip", lambda _payload: None)
     monkeypatch.setattr(b, "fetch_code", lambda _payload: None)
     monkeypatch.setattr(b, "build_worker_env", lambda _payload: {})
@@ -1955,7 +1937,7 @@ def test_main_arms_same_absolute_deadline_before_setup_and_training(monkeypatch)
         "job_spec_json": "{}",
         "phase": "sft",
         "seed": 0,
-        "flash_arm": "lambda",
+        "flash_arm": "modal",
         "env": {},
         "extra_pip": [],
         "hf_prefix": "sft/run",
@@ -1977,6 +1959,7 @@ def test_main_arms_same_absolute_deadline_before_setup_and_training(monkeypatch)
 
     monkeypatch.setattr(b.time, "time", lambda: 100.0)
     monkeypatch.setattr(b, "load_payload", lambda: payload)
+    monkeypatch.setattr(b, "_publish_started", lambda _payload: events.append("started"))
     monkeypatch.setattr(
         b,
         "arm_deadline_watchdog",
@@ -1994,8 +1977,9 @@ def test_main_arms_same_absolute_deadline_before_setup_and_training(monkeypatch)
     monkeypatch.setattr(b, "write_attempt_marker", lambda *_args, **_kwargs: None)
 
     assert b.main() == 0
-    assert events[:4] == [
+    assert events[:5] == [
         ("watchdog", 500.0),
+        "started",
         "code",
         "install",
         ("training", 500.0),
@@ -2023,6 +2007,7 @@ def test_main_source_verification_failure_prevents_pip(monkeypatch):
 
     monkeypatch.setattr(b.time, "time", lambda: 100.0)
     monkeypatch.setattr(b, "load_payload", lambda: payload)
+    monkeypatch.setattr(b, "_publish_started", lambda _payload: None)
     monkeypatch.setattr(b, "arm_deadline_watchdog", lambda *_args: (_Timer(), _Done()))
     monkeypatch.setattr(
         b,
@@ -2048,7 +2033,7 @@ def test_main_accepts_required_completion_artifacts_at_deadline(monkeypatch, bou
         "job_spec_json": "{}",
         "phase": "sft",
         "seed": 0,
-        "flash_arm": "lambda",
+        "flash_arm": "modal",
         "env": {},
         "extra_pip": [],
         "hf_prefix": "sft/run",
@@ -2080,6 +2065,7 @@ def test_main_accepts_required_completion_artifacts_at_deadline(monkeypatch, bou
 
     monkeypatch.setattr(b.time, "time", lambda: clock["now"])
     monkeypatch.setattr(b, "load_payload", lambda: payload)
+    monkeypatch.setattr(b, "_publish_started", lambda _payload: None)
     monkeypatch.setattr(b, "arm_deadline_watchdog", lambda deadline, _payload: (_Timer(), _Done()))
     monkeypatch.setattr(b, "install_extra_pip", lambda _payload: None)
     monkeypatch.setattr(b, "fetch_code", lambda _payload: None)
@@ -2112,7 +2098,7 @@ def test_write_attempt_marker_truncates_error_and_uploads_arm_named(monkeypatch)
     payload = {
         "hf_repo": "o/r",
         "hf_prefix": "p",
-        "flash_arm": "vast",
+        "flash_arm": "modal",
         "attempt": 3,
         "run_id": "run-marker",
         "deadline_at": 200.0,
@@ -2125,7 +2111,7 @@ def test_write_attempt_marker_truncates_error_and_uploads_arm_named(monkeypatch)
 
     path, sub, kwargs = uploads[-1]
     assert path == str(b.AttemptState(b._code_dir(payload), payload).marker_path)
-    assert sub == "vast_attempt3.json"  # <arm>_attempt<N>.json
+    assert sub == "modal_attempt3.json"  # <arm>_attempt<N>.json
     assert kwargs == {"enforce_deadline": False}
     with open(path) as f:
         marker = json.load(f)
@@ -2144,7 +2130,7 @@ def test_write_attempt_marker_preserves_success_after_deadline(monkeypatch):
     payload = {
         "hf_repo": "o/r",
         "hf_prefix": "p",
-        "flash_arm": "vast",
+        "flash_arm": "modal",
         "attempt": 3,
         "run_id": "run-marker",
         "deadline_at": 200.0,
@@ -2173,7 +2159,7 @@ def test_write_attempt_marker_rejects_noncanonical_deadline(monkeypatch):
     payload = {
         "hf_repo": "o/r",
         "hf_prefix": "p",
-        "flash_arm": "vast",
+        "flash_arm": "modal",
         "attempt": 3,
         "run_id": "run-marker",
         "deadline_at": 200.0,
@@ -2203,7 +2189,7 @@ def test_arm_deadline_watchdog_publishes_marker_before_exit(monkeypatch):
         "deadline_at": 160.0,
         "run_created_at": 100.0,
         "run_max_wall_seconds": 60.0,
-        "flash_arm": "vast",
+        "flash_arm": "modal",
         "attempt": 0,
         "run_id": "run",
         "hf_repo": "o/r",
@@ -2242,69 +2228,11 @@ def test_deadline_watchdog_hard_exits_when_terminal_marker_writer_blocks(monkeyp
 # ---------------------------------------------------------------------------
 # _arm_preload_wall_cap: the _fire watchdog path
 # ---------------------------------------------------------------------------
-def test_arm_preload_wall_cap_uses_remaining_absolute_deadline(monkeypatch):
-    marks: list[tuple] = []
-    exits: list[int] = []
-    monkeypatch.setattr(b.time, "time", lambda: 100.0)
-    monkeypatch.setattr(
-        b, "write_attempt_marker", lambda p, ok, error="", **k: marks.append((ok, error))
-    )
-    monkeypatch.setattr(b.os, "_exit", lambda code: exits.append(code))
-
-    payload = {
-        "deadline_at": 160.0,
-        "run_created_at": 100.0,
-        "run_max_wall_seconds": 60.0,
-        "flash_arm": "lambda",
-        "attempt": 0,
-        "hf_repo": "o/r",
-        "env": {},
-    }
-    timer, _done = b._arm_preload_wall_cap(payload)
-    timer.cancel()
-    assert timer.interval == 60.0
-
-    # manually invoke the watchdog closure: not done means marker then hard exit.
-    timer.function()
-    assert exits == [124]
-    assert marks
-    assert marks[-1][0] is False
-    assert "run wall deadline" in marks[-1][1]
-
-    # if the download already finished, the watchdog is a no-op.
-    marks.clear()
-    exits.clear()
-    timer2, done2 = b._arm_preload_wall_cap(payload)
-    timer2.cancel()
-    done2.set()
-    timer2.function()
-    assert exits == []
-    assert marks == []
 
 
 # ---------------------------------------------------------------------------
 # run_preload: per-model download failure is captured, not raised
 # ---------------------------------------------------------------------------
-def test_run_preload_records_download_failure(tmp_path, monkeypatch):
-    (tmp_path / ".flash-cache-mounted").write_text("")  # real-mount sentinel
-
-    def _snap(**k):
-        if k.get("local_files_only"):
-            raise FileNotFoundError("not cached")  # force the real download attempt
-        raise RuntimeError("network exploded")  # the real download fails
-
-    _install_fake_hf(monkeypatch, snapshot_download=_snap)
-    cache_dir = str(tmp_path / "hf-cache" / "hub")
-    r = b.run_preload(
-        {
-            "env": {"FLASH_WEIGHT_CACHE_DIR": cache_dir},
-            "models": ["a/b"],
-            "cache_mount_marker": ".flash-cache-mounted",
-        }
-    )
-    assert r["preloaded"] == []
-    assert r["already_cached"] == []
-    assert r["failed"]["a/b"] == "RuntimeError: network exploded"
 
 
 # ---------------------------------------------------------------------------
@@ -2395,7 +2323,7 @@ def test_attempt_marker_error_redacts_a_payload_env_secret(monkeypatch):
     payload = {
         "hf_repo": "o/r",
         "hf_prefix": "p",
-        "flash_arm": "vast",
+        "flash_arm": "modal",
         "attempt": 1,
         "run_id": "run-marker",
         "deadline_at": 200.0,
@@ -2744,66 +2672,19 @@ def test_hf_call_retry_log_redacts_payload_secrets(monkeypatch, capsys):
 # ---------------------------------------------------------------------------
 # main(): the preload branch
 # ---------------------------------------------------------------------------
-def _preload_payload(**over):
-    created_at = b.time.time()
-    base = {
-        "mode": "preload",
-        "hf_repo": "org/repo",
-        "hf_prefix": "preload/run",
-        "flash_arm": "lambda",
-        "run_id": "preload-run",
-        "seed": 0,
-        "attempt": 0,
-        "env": {},
-        "run_created_at": created_at,
-        "run_max_wall_seconds": 999.0,
-        "deadline_at": created_at + 999.0,
-    }
-    base.update(over)
-    return base
 
 
-def test_main_preload_success_returns_zero_and_writes_ok_marker(monkeypatch):
-    markers: list[tuple] = []
-    monkeypatch.setattr(b, "load_payload", lambda path=b.PAYLOAD_PATH: _preload_payload())
-    monkeypatch.setattr(
-        b, "run_preload", lambda p: {"preloaded": ["a/b"], "already_cached": [], "failed": {}}
-    )
-    monkeypatch.setattr(b, "hf_upload", lambda p, path, sub: None)
-    monkeypatch.setattr(
-        b, "hf_file_exists", lambda p, sub: True
-    )  # completion file confirmed first try
-    monkeypatch.setattr(
-        b,
-        "write_attempt_marker",
-        lambda p, ok, error="", retriable=False: markers.append((ok, error, retriable)),
-    )
-    assert b.main() == 0
-    assert markers == [(True, "", False)]
-    with open("/tmp/preload_result.json") as f:
-        assert json.load(f)["preloaded"] == ["a/b"]
+@pytest.mark.parametrize("signum", [signal.SIGINT, signal.SIGTERM])
+def test_bootstrap_shutdown_handlers_classify_host_interruption_and_restore(monkeypatch, signum):
+    previous = {sig: signal.getsignal(sig) for sig in (signal.SIGINT, signal.SIGTERM)}
+    monkeypatch.setattr(b, "load_payload", lambda: _source_payload())
 
+    def run_attempt(_payload):
+        handler = signal.getsignal(signum)
+        with pytest.raises(b.WorkerInterrupted, match=f"signal {signum}"):
+            handler(signum, None)
+        return 1
 
-def test_main_preload_failure_arms_wall_cap_and_reports_failed_models(monkeypatch):
-    markers: list[tuple] = []
-    monkeypatch.setattr(b.time, "sleep", lambda s: None)  # neutralize the confirm-retry backoff
-    monkeypatch.setattr(b, "load_payload", lambda path=b.PAYLOAD_PATH: _preload_payload())
-    monkeypatch.setattr(
-        b,
-        "run_preload",
-        lambda p: {"preloaded": [], "already_cached": [], "failed": {"a/b": "oom"}},
-    )
-    monkeypatch.setattr(b, "hf_upload", lambda p, path, sub: None)
-    monkeypatch.setattr(
-        b, "hf_file_exists", lambda p, sub: False
-    )  # confirm loop exhausts -> else branch
-    monkeypatch.setattr(
-        b,
-        "write_attempt_marker",
-        lambda p, ok, error="", retriable=False: markers.append((ok, error, retriable)),
-    )
+    monkeypatch.setattr(b, "_run_attempt", run_attempt)
     assert b.main() == 1
-    ok, error, retriable = markers[0]
-    assert ok is False
-    assert error == "model preload failed"
-    assert retriable is False
+    assert {sig: signal.getsignal(sig) for sig in previous} == previous

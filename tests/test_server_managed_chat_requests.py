@@ -40,8 +40,15 @@ def _tool_payload():
     ]
 
 
-def _ready_deployment() -> dict[str, str]:
-    return {"state": "ready", "checkpoint_id": CHECKPOINT_ID, "openai_model": CHECKPOINT_ID}
+def _ready_deployment() -> dict:
+    return {
+        "state": "ready",
+        "checkpoint_id": CHECKPOINT_ID,
+        "checkpoint_step": None,
+        "verified_at": 1.0,
+        "deployment_generation": "generation-a",
+        "openai_model": CHECKPOINT_ID,
+    }
 
 
 def test_managed_chat_authorizes_one_explicit_verified_checkpoint() -> None:
@@ -50,7 +57,6 @@ def test_managed_chat_authorizes_one_explicit_verified_checkpoint() -> None:
             RUN_ID,
             _ready_deployment(),
             CHECKPOINT_ID,
-            {CHECKPOINT_ID},
         )
         == CHECKPOINT_ID
     )
@@ -73,15 +79,13 @@ def test_managed_chat_rejects_missing_bare_composite_and_cross_run_targets(
             RUN_ID,
             _ready_deployment(),
             checkpoint_id,
-            {CHECKPOINT_ID},
         )
 
 
 def test_managed_chat_rejects_mandatory_whitespace_stop_for_active_tool_grammar(api, monkeypatch):
     import flash.runner.lifecycle.state as runner_state
     import flash.runner.lifecycle.status as runner_status
-    import flash.runner.results.verified_revisions as runner_verified_revisions
-    import flash.runner.supervise.transitions as runner_transitions
+    from tests._helpers import deployments as deployment_fixtures
 
     key = _login()
     spec = json.loads(json.dumps(SPEC))
@@ -93,7 +97,7 @@ def test_managed_chat_rejects_mandatory_whitespace_stop_for_active_tool_grammar(
     status.state = "done"
     runner_state._save_status(status)
     checkpoint_id = f"{run_id}/final"
-    runner_transitions.mark_deployed(
+    deployment_fixtures.complete_deployment(
         run_id,
         {
             "state": "ready",
@@ -101,7 +105,6 @@ def test_managed_chat_rejects_mandatory_whitespace_stop_for_active_tool_grammar(
             "checkpoint_id": checkpoint_id,
             "openai_model": checkpoint_id,
         },
-        verification_generation=runner_verified_revisions.verified_checkpoint_generation(run_id),
     )
     monkeypatch.setattr(
         serving_deploy,
@@ -223,9 +226,8 @@ def test_managed_chat_rejects_unverified_checkpoint() -> None:
     with pytest.raises(HTTPException, match="has not passed"):
         _authorized_chat_checkpoint(
             RUN_ID,
-            _ready_deployment(),
+            {**_ready_deployment(), "verified_at": None},
             CHECKPOINT_ID,
-            set(),
         )
 
 
@@ -234,9 +236,8 @@ def test_managed_chat_accepts_any_exact_verified_ready_sibling() -> None:
     assert (
         _authorized_chat_checkpoint(
             RUN_ID,
-            _ready_deployment(),
+            {**_ready_deployment(), "checkpoint_id": sibling, "checkpoint_step": 20},
             sibling,
-            {CHECKPOINT_ID, sibling},
         )
         == sibling
     )
@@ -256,3 +257,30 @@ def test_managed_provenance_contains_only_checkpoint_identity() -> None:
     assert response["freesolo"] == {"checkpoint_id": CHECKPOINT_ID}
     assert "artifact_revision" not in str(response)
     assert "hf_revision" not in str(response)
+
+
+@pytest.mark.parametrize("serving_generation", [None, "", "   ", 7])
+def test_managed_chat_rejects_legacy_readiness_before_internal_forwarding(
+    api, monkeypatch, serving_generation
+):
+    from flash.runner.lifecycle import state, status
+
+    key, run_id = _deployed_chat_run(api)
+    checkpoint_id = f"{run_id}/final"
+    current = status.get_status(run_id)
+    current.deployments[checkpoint_id].pop("deployment_generation")
+    if serving_generation is not None:
+        current.deployments[checkpoint_id]["deployment_generation"] = serving_generation
+    state._save_status(current)
+    monkeypatch.setattr(
+        serving_deploy,
+        "chat",
+        lambda **kwargs: pytest.fail("legacy readiness must not reach trusted internal forwarding"),
+    )
+    response = api.post(
+        f"/v1/runs/{run_id}/chat",
+        json={"checkpoint_id": checkpoint_id, "messages": [{"role": "user", "content": "hi"}]},
+        headers=_bearer(key),
+    )
+    assert response.status_code == 409, response.text
+    assert "has not passed" in response.json()["detail"]

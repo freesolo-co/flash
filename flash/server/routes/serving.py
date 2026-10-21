@@ -22,21 +22,22 @@ import flash.server.routes.serving_completion as serving_completion
 import flash.server.routes.serving_revisions as serving_revisions
 from flash.core.spec import JobSpec, require_project_id
 from flash.runner.lifecycle.status import effective_spec_from_status
-from flash.runner.results.verified_revisions import verified_checkpoint_generation
+from flash.runner.results.deployments import generation, is_ready, require_checkpoint
 from flash.runner.supervise.transitions import (
+    mark_deployment_cleanup_pending,
     mark_deployment_failed,
     mark_deployment_pending,
-    mark_deployment_revocation_failed,
     mark_undeployed,
 )
 from flash.serve.contract.errors import ServingError
+from flash.serve.deployment.readiness import DEPLOYMENT_TIMEOUT_SECONDS
 from flash.server.platform import auth, db
 from flash.server.platform.deps import _require_bool, manageable_run, owned_run, require_key
 from flash.server.platform.internal_client import run_org_id, run_serving_org_id
 
 router = APIRouter()
 
-_DEPLOYMENT_STALE_SECONDS = 40 * 60
+_DEPLOYMENT_STALE_SECONDS = DEPLOYMENT_TIMEOUT_SECONDS
 
 
 def _deployment_attempt_is_stale(deployment: dict, *, now: float | None = None) -> bool:
@@ -76,12 +77,19 @@ def _validate_hf_repo_id(repository: str) -> None:
 def deployment(
     run_id: str,
     key: Annotated[dict, Depends(require_key)],
+    checkpoint_id: str | None = None,
     x_freesolo_org_id: Annotated[str | None, Header()] = None,
     x_freesolo_project_id: Annotated[str | None, Header()] = None,
 ):
     status = manageable_run(run_id, key, x_freesolo_org_id, x_freesolo_project_id)
-    persisted = (
-        status.deployment if isinstance(status.deployment, dict) else {"state": "undeployed"}
+    if checkpoint_id is None:
+        return {"deployments": status.to_dict()["deployments"]}
+    try:
+        require_checkpoint(run_id, checkpoint_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    persisted = status.deployments.get(
+        checkpoint_id, {"state": "undeployed", "checkpoint_id": checkpoint_id}
     )
     return deployment_state._public_deployment({**persisted, "run_id": run_id})
 
@@ -97,7 +105,14 @@ def _reject_contended_deploy(
     Always raises. The lock was NOT acquired on this path, so the caller must not release it.
     """
     status = manageable_run(run_id, key, x_freesolo_org_id, x_freesolo_project_id)
-    current_deployment = status.deployment or {}
+    current_deployment = next(
+        (
+            record
+            for record in status.deployments.values()
+            if record.get("state") in serving_revisions._DEPLOYMENT_BUSY_STATES
+        ),
+        {},
+    )
     current_deployment_state = current_deployment.get("state")
     if current_deployment_state in serving_revisions._DEPLOYMENT_BUSY_STATES:
         detail = (
@@ -119,7 +134,6 @@ def _queued_deployment_record(
     checkpoint_step,
     is_checkpoint: bool,
     current_deployment: dict,
-    previous_deployment,
 ) -> dict:
     """Build the ``queued`` deployment record that gets persisted before the job starts."""
     # Validate the cheap configured-rank part synchronously so obvious spec errors return 400
@@ -152,11 +166,9 @@ def _queued_deployment_record(
         verify=True,
         requested_at=time.time(),
     )
-    dep_dict["verification_generation"] = verified_checkpoint_generation(run_id)
+    dep_dict["generation"] = generation(current_deployment) + 1
     if is_checkpoint:
         dep_dict["checkpoint_step"] = checkpoint_step
-    if previous_deployment:
-        dep_dict["previous_deployment"] = previous_deployment
     return dep_dict
 
 
@@ -182,7 +194,8 @@ def _validate_deploy_request(
                 "mandatory before checkpoint readiness"
             ),
         )
-    current_deployment = status.deployment or {}
+    target = payload.get("checkpoint_id")
+    current_deployment = status.deployments.get(target, {}) if isinstance(target, str) else {}
     current_deployment_state = current_deployment.get("state")
     if (
         not dry_run
@@ -291,6 +304,9 @@ def deploy(
                 raise
             return dep.to_dict()
 
+        if is_ready(run_id, current_deployment):
+            return deployment_state._public_deployment(current_deployment)
+
         dep_dict = _queued_deployment_record(
             run_id,
             effective_spec,
@@ -298,10 +314,9 @@ def deploy(
             checkpoint_step,
             is_checkpoint,
             current_deployment,
-            None,
         )
         marked = mark_deployment_pending(run_id, dep_dict, expect_state=prev_state)
-        if marked.deployment != dep_dict:
+        if marked.deployments.get(dep_dict["checkpoint_id"]) != dep_dict:
             raise HTTPException(
                 status_code=409,
                 detail=f"run {run_id} became {marked.state!r} during deploy; aborted",
@@ -351,7 +366,7 @@ def deploy(
             ) from exc
         if ran_sync:
             return deployment_state._public_deployment(
-                run_status.get_status(run_id).deployment or dep_dict
+                run_status.get_status(run_id).deployments.get(dep_dict["checkpoint_id"], dep_dict)
             )
         return deployment_state._public_deployment(dep_dict)
     finally:
@@ -386,45 +401,22 @@ def undeploy(
                 )
             result = serving_deploy.undeploy_adapter(checkpoint_id, org_id=org_id)
         except ServingError as exc:
-            marked = mark_deployment_revocation_failed(
-                run_id, str(exc), checkpoint_id=checkpoint_id
-            )
-            persisted = isinstance(marked.deployment, dict) and (
-                marked.deployment.get("state") == "revocation_failed"
-                and marked.deployment.get("error") == str(exc)
-            )
+            marked = mark_deployment_cleanup_pending(run_id, str(exc), checkpoint_id=checkpoint_id)
+            record = marked.deployments.get(checkpoint_id, {})
+            persisted = record.get("state") == "cleanup_pending" and record.get("error") == str(exc)
             deployment_state._report_persisted_transition(status, marked, persisted=persisted)
             raise HTTPException(
                 status_code=502,
                 detail={
-                    "code": "deployment_revocation_failed",
+                    "code": "deployment_cleanup_failed",
                     "run_id": run_id,
                     "retryable": True,
                     "message": str(exc),
                 },
             ) from exc
         marked = mark_undeployed(run_id, checkpoint_id)
-        persisted = isinstance(marked.deployment, dict) and (
-            marked.deployment.get("state") == "undeployed"
-        )
-        deployment_state._report_persisted_transition(status, marked, persisted=persisted)
-        deployment = (
-            marked.deployment if isinstance(marked.deployment, dict) else {"state": "undeployed"}
-        )
-        removed_summary = (
-            deployment.get("state") == "undeployed"
-            and deployment.get("checkpoint_id") == checkpoint_id
-        )
-        response_state = (
-            deployment
-            if removed_summary
-            else {
-                "state": "undeployed",
-                "checkpoint_id": checkpoint_id,
-                "checkpoint_step": parsed[1],
-            }
-        )
-        response = deployment_state._public_deployment({**response_state, "run_id": run_id})
+        deployment_state._report_persisted_transition(status, marked, persisted=True)
+        response = deployment_state._public_deployment(marked.deployments[checkpoint_id])
         response.update(
             {
                 field: result[field]
@@ -584,12 +576,12 @@ def deployments(
             continue
         if scope is not None and not _in_deployment_listing_scope(status, *scope):
             continue
-        if status.deployment and status.deployment.get("state") not in (
-            "undeployed",
-            "dry_run",
-        ):
+        for record in status.deployments.values():
+            if record.get("state") in {"undeployed", "dry_run"}:
+                continue
             data = status.to_dict()
-            data["deployment"] = deployment_state._public_deployment(data["deployment"])
+            data.pop("deployments")
+            data["deployment"] = deployment_state._public_deployment(record)
             out.append(data)
     return {"deployments": out}
 

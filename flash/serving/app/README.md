@@ -75,7 +75,21 @@ Required production wiring is `HF_TOKEN`, `FREESOLO_INTERNAL_KEY`,
 `PLATFORM_BACKEND_URL`, `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY`, a nonblank
 `FREESOLO_DEPLOYMENT_ID`, and `SERVING_CUSTOM_DOMAIN=serve.freesolo.co`.
 
+Optional capacity observations (queue wait, streaming time to first token, replica
+concurrency, boot duration, and first-request status) persist under
+`attestation_evidence.capacity` in the usage outbox and settled usage row. They do
+not extend the billing RPC's strict top-level field contract. Missing observations
+are omitted; checkpoint identity and token accounting remain required.
+
 #### Promotion gate
+
+Before deploying this gate, apply
+`frontend/supabase/migrations/20261019010000_serving_promotion_accounting.sql` from
+[freesolo PR #784](https://github.com/freesolo-co/freesolo/pull/784) to the production Supabase
+database. It adds `public.serving_promotion_accounting_snapshot`, callable only by `service_role`;
+the gate uses `SUPABASE_SERVICE_ROLE_KEY` to read it. The migration must precede the Flash deployment:
+an unavailable RPC or malformed response cannot pass accounting, and failure within the polling
+window triggers the rollback described below.
 
 Set the repository Actions variable `SERVING_CANARY_ORG_ID` to an existing Freesolo-owned
 organization UUID with billing configured. The canary sends it as `X-Freesolo-Org-Id`; its
@@ -99,21 +113,25 @@ workflow runs `python -m flash.serving.promotion.gate`, which must prove all thr
 2. an authenticated `stream=true` request carrying `X-Correlation-ID: fspromo-<run>-<attempt>`
    returns SSE with at least one non-empty content delta, a terminal finish reason, terminal usage
    with non-zero completion tokens, and `data: [DONE]`;
-3. this release's durable delivery loop is running rather than wedged: no expired lease, and no
-   undelivered row older than the stall threshold.
+3. the canary's own usage has been durably delivered, with no expired lease anywhere in the backlog
+   and no undelivered row at or beyond the 360-second stall threshold.
 
 Exact-head binding comes from steps 1 and 2 together. The router proves its identity, and then that
 same router serves a real generation; engines receive only `HF_TOKEN` and cannot report a release
 sha, and `engine_replica_id` is stripped from public bodies, so the response itself cannot carry it.
 
-Step 3 is deliberately weaker than "the canary's own usage row settled". The only durable accounting
-surface the router exposes is `serving_usage_backlog_snapshot`, which aggregates every generation in
-flight and has no per-correlation read. Asserting a drained backlog there would be **fail-open** (a
-burst of unrelated traffic can drain the counters to zero while the canary's own row is stuck) and
-flaky besides (live traffic keeps them nonzero on a perfectly healthy release). Expired leases and
-undelivered age are the parts of that snapshot that mean the same thing regardless of whose rows are
-in it. Proving per-request settlement would need a read-by-correlation-id RPC, which does not exist
-today; the canary still sends `X-Correlation-ID` so the row is identifiable by an operator.
+Step 3 calls `serving_promotion_accounting_snapshot` with the canary's organization, correlation ID,
+public model ID, deployment attempt ID, and release SHA. The RPC combines global backlog stall
+signals with `canary_settled`: at least one usage row must match all five fields, and every matching
+row must be delivered with positive completion tokens, terminal and delivery timestamps, and a
+billing usage ID. A fresh pending row or a missing canary row cannot pass. Unrelated pending or
+leased traffic may remain; promotion does not require an empty backlog.
+
+Accounting polls at five-second intervals within one 180-second monotonic deadline, including RPC
+latency and sleeps. A hung read is cancelled at the remaining deadline, sleeps are capped to that
+budget, and even a settled response arriving at or after the deadline cannot pass. The gate retries
+unsettled, stalled, unavailable, or malformed accounting evidence within this window; it promotes
+only after receiving valid settlement evidence with no global stall before the deadline.
 
 If any step after the deploy fails, the workflow redeploys the sha the live app reported _before_
 this deploy and re-reads `/healthz` to confirm the restored release under a distinct `-rollback`
@@ -184,8 +202,7 @@ GPUs, so there's nothing to tune at deploy time:
 - **On, hardcoded:** FP8 weights on the dense tiers + FP8 KV cache everywhere (see Quantization
   below), prefix caching (~4.7×
   throughput / ~10× lower TTFT for shared prompts), CUDA graphs where the per-model boot canary
-  leaves enough KV headroom, `disable_log_stats`, the prompt-token cache (2048), `MAX_INPUTS=64`
-  packing, multi-LoRA defaults (**16 hot** / **rank 32** / 256 CPU) with per-model rank overrides
+  leaves enough KV headroom, `disable_log_stats`, the prompt-token cache (2048), 64 concurrent router inputs and 8 per engine (autoscaling target 6), multi-LoRA defaults (**16 hot** / **rank 32** / 256 CPU) with per-model rank overrides
   (**128** for the 9B, **64** for the 27B; the 35B MoE runs rank 64 at only 6 hot slots,
   every other tier keeps 16), and `VLLM_CACHE_ROOT` on the persistent volume so vLLM's
   torch.compile cache survives scale-to-zero instead of recompiling on every cold start.
@@ -194,16 +211,15 @@ GPUs, so there's nothing to tune at deploy time:
   `max_num_seqs`, partial-prefill, async-scheduling, scheduling-policy, gdn-backend,
   scheduler-delay — neutral globally; only real-GPU-validated per-model caps remain in
   `model_config.py`), `performance_mode`, CUDA-graph-size, `stream_interval`, `specialize_active_lora`.
-- **Quantization: pre-quantized FP8 for the active dense tier, bf16 for the 35B MoE (memory-first).**
+- **Quantization: pre-quantized FP8 for the active dense tiers, bf16 for the 35B MoE (memory-first).**
   The active 9B uses Freesolo's compressed-tensors checkpoint with no online quantization. Qwen3.8-27B
-  is a **pending hosted candidate**, not an active hosted model. Its exact official E4M3 checkpoint
-  remains pinned at revision `017b9c7af6b5689d5dd426a76e0bc077eb5ca20a`, with `[128, 128]` weight
+  is also routed by the hosted catalog. Its official E4M3 checkpoint
+  is pinned at revision `017b9c7af6b5689d5dd426a76e0bc077eb5ca20a`, with `[128, 128]` weight
   blocks and the logical BF16 tokenizer/processor pinned to
-  `1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0`, so the canary metadata remains testable without
-  advertising or routing the model. The 35B-A3B vision-language MoE is the
+  `1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0`. The 35B-A3B vision-language MoE is the
   **exception**: it serves the **official bf16
-  base weights** on an H200 (`quantization=None`), because vLLM's fused-MoE LoRA path cannot run under
-  FP8 at the shape a full all-expert flash adapter needs (see the GPU tiers † footnote below).
+  base weights** on a B200 (`quantization=None`), because vLLM's fused-MoE LoRA path cannot run under
+  FP8 at the shape a full all-expert flash adapter needs.
 
   vLLM auto-detects each checkpoint's declared quantization, so the engine passes no online
   `quantization`. `settings.KV_CACHE_DTYPE="fp8"` still halves the KV cache (E4M3, uncalibrated
@@ -212,13 +228,11 @@ GPUs, so there's nothing to tune at deploy time:
   404-crash-loops, which is why the old GPTQ `serve_model_id` was removed); the owned `Freesolo-Co/*-FP8`
   checkpoints are VL-preserving (each VL-unified base's vision tower + MoE router gates stay in
   original precision) and already published to the operator HF org. Native FP8 tensor cores need
-  compute capability ≥ 8.9; every dense FP8 tier runs on an L4, L40S, or H100 (all native). No serving
-  tier runs on A100 now that the 35B is bf16 on H200. The 27B serves the official native FP8
-  checkpoint on an H100.
+  compute capability ≥ 8.9; all active hosted engines run on B200.
 
 - **The real memory lever — LoRA buffers:** vLLM PRE-ALLOCATES the GPU LoRA buffers at `max_loras ×
 max_lora_rank`, regardless of how many adapters load. Both are linear levers. The qualified 9B runs
-  **16 × 128** on L40S and the 27B runs **16 × 64** on H100. The 35B MoE runs **6 × 64** bf16 on H200. Adapters trained above the effective rank are rejected at load; a base regularly serving
+  **16 × 128** and the 35B MoE runs **6 × 64** bf16, both on B200. The hosted 27B uses **16 × 64**. Adapters trained above the effective rank are rejected at load; a base regularly serving
   more distinct adapters than its hot limit pays a swap latency from the CPU pool unless its hot
   limit equals `MAX_CPU_LORAS`.
 
@@ -226,48 +240,27 @@ max_lora_rank`, regardless of how many adapters load. Both are linear levers. Th
 > `base_model`, and Modal provisions a GPU per distinct value. `HOSTING_BASE_MODEL` is
 > unused in the multi-base-model app.
 
-### GPU tiers
+### Hosted GPU configuration
 
-Quantization (FP8 weights + KV for the dense tiers, bf16 for the 35B MoE) plus per-model LoRA buffer
-sizing determine the GPU tier. Tiers live in `src/model_config.py`; only cataloged bases are accepted,
-and a catalog entry with no explicit GPU uses `DEFAULT_GPU` (L4). Every tier needs a one-time real-GPU
-cold-boot smoke test first.
+All active hosted engines use B200 with a 2100-second idle window. Each catalog entry must
+explicitly declare its GPU; unsupported hardware is rejected before deployment. Training GPU
+selection and customer-owned serving profiles are separate.
 
-| Base model                | Checkpoint                                   | GPU       | Hot LoRA shape | Context |
-| ------------------------- | -------------------------------------------- | --------- | -------------- | ------- |
-| Qwen3.5-9B                | owned FP8 (`Freesolo-Co/*-FP8`)              | **L40S**§ | 16 × 128       | 32768   |
-| Qwen3.8-27B               | official native FP8 (`Qwen/Qwen3.8-27B-FP8`) | **H100**‡ | 16 × 64        | 32768   |
-| Qwen3.6-35B-A3B (MoE, VL) | official **bf16** (`Qwen/Qwen3.6-35B-A3B`)   | **H200**† | 6 × 64         | 32768   |
+| Base model | Checkpoint | GPU | Hot LoRA shape | Context |
+| --- | --- | --- | --- | --- |
+| Qwen3.5-9B | owned FP8 (`Freesolo-Co/*-FP8`) | B200 | 16 × 128 | 32768 |
+| Qwen3.8-27B | official native FP8 (`Qwen/Qwen3.8-27B-FP8`) | B200 | 16 × 64 | 32768 |
+| Qwen3.6-35B-A3B (MoE, VL) | official bf16 | B200 | 6 × 64 | 32768 |
 
-§ 9B (L40S) runs **16 × 128** at 32k context with `max_num_seqs=8`, CUDA graphs
-(`enforce_eager=False`), and `gpu_memory_utilization=0.90`. Its rank-128 × 16 buffer OOMed an L4 and
-2×L4 in the real-GPU sweep, so it runs on the 48 GiB L40S, the cheapest Ada card that fits it at 32k.
+CUDA graphs, prefix caching, FP8 KV, and the persistent compilation cache remain enabled.
+The 35B keeps bf16 weights because the FP8 fused-MoE kernel cannot load full-expert LoRA.
+The vision encoder remains loaded so adapters' vision-tower keys bind.
 
-‡ 27B (H100, 80 GiB) runs **16 × 64** at 32k with `max_num_seqs=8`, CUDA graphs
-(`enforce_eager=False`), and `gpu_memory_utilization=0.90`, qualified by a real-GPU canary on the exact
-immutable official FP8 checkpoint: weights loaded at 44.25 GiB, leaving 23.07 GiB of KV cache
-(350,981 tokens, 10.71x concurrency at 32k) after a 0.35 GiB graph capture. Cold boot is about 20 min
-(load + 137 s torch.compile + 442 s warmup dominated by the FlashInfer GDN JIT), all cached on the
-serving volume. Qwen3.6-27B measurements do not qualify or predict the Qwen3.8 checkpoint.
-
-† 35B-A3B runs **bf16 on an H200** (141 GiB) at **6 × 64**, the one serving path that gives a flash
-adapter its full all-expert LoRA AND CUDA graphs at speed. It gets rank 64 like the 27B
-tier but at only **6 hot slots** (`6 × 64`, not `16 × 64`): its fused-MoE LoRA buffer scales with
-`max_loras × rank × num_experts`, so `16 × 64` (~140 GiB) is unreachable on a single GPU. Why bf16 and
-not the FP8 checkpoint every other tier uses:
-
-- **FP8 on A100** materializes the fused-MoE experts back to bf16 (~76 GiB on the 80 GiB card),
-  leaving no room for CUDA-graph capture, so it is forced eager at ~4-10 tok/s.
-- **FP8 on H200/B200** fails outright: the fused-MoE LoRA kernel dies with `Unsupported lhs dtype
-fp8e4nv` (only A100's Marlin kernel runs this MoE's LoRA), so full-expert LoRA will not even load.
-- **bf16 on H200** sidesteps the fp8 kernel: ~107 GiB weights+LoRA + ~17 GiB KV + graph capture all
-  fit the 141 GiB card, every expert gets its LoRA and graphs (~129 tok/s single-stream, canaried
-  2026-07-06). `gpu_memory_utilization=0.90`, `max_model_len=32768` (32k; the real-GPU canary held a
-  ~679,701-token KV cache at 6 × 64, ~20× concurrency, where 8 × 64 overflowed and fit only ~19k),
-  `max_num_batched_tokens=4096`, `max_num_seqs=8`, `enforce_eager=False`.
-
-The vision encoder is loaded (no `language_model_only`) so flash adapters' vision-tower LoRA keys bind.
-There is no A100 fallback and no expert-exclusion "fast profile" knob: one faithful path.
+The router accepts 64 concurrent inputs; each GPU engine accepts 8 with an autoscaling target
+of 6. The router limit is not the number of requests packed onto one GPU.
+Adapters are registered and loaded on demand, using immutable source identities and the
+persistent disk cache. Hosted engines do not hydrate the database at boot, preload adapters,
+or pin adapters against LRU eviction.
 
 ### Owned checkpoints
 
@@ -281,15 +274,15 @@ The one-off quantization job that produced them is not kept in this repo.
 - `GET /healthz` — `{ok, base_models: [...], unsupported_base_models?: [...], gpus: <count>, gpu_by_model: {base: tier}, gpu_tiers: [...], adapters: <count>}` (`gpu*` fields cover supported catalog base models; unsupported hydrated models are listed separately)
 - `GET /adapters`
 - `POST /adapters` with `X-Freesolo-Internal-Key` and an immutable revision registration (optional `structured_outputs` default — see below)
-- `POST /generate` with `adapter_id`
-- `POST /adapters/{adapter_id}/generate`
+- `POST /generate` with `model_id`
+- `POST /adapters/{model_id}/generate`
 - `POST /v1/chat/completions` where `model` is the adapter id
 
 ### Checkpoint headers (all three inference endpoints)
 
 Concurrent checkpoint deploys mutate the single serving surface for an adapter
 id (a redeploy overwrites the record's checkpoint), so every inference endpoint
-(`/generate`, `/adapters/{adapter_id}/generate`, `/v1/chat/completions`,
+(`/generate`, `/adapters/{model_id}/generate`, `/v1/chat/completions`,
 streaming included) supports a checkpoint contract:
 
 - **`X-Freesolo-Checkpoint` (response header)** — echoes the checkpoint that
@@ -344,11 +337,23 @@ activates. Raw `prompt` callers must provide the mode-specific state themselves:
 prompt must already contain a closing `</think>` marker, while a thinking raw prompt must leave an
 open `<think>` block for generation to close.
 
+Registration, fingerprint inputs, records, raw generation requests/responses, and Modal
+dispatch all use `model_id`. Registration requires an exact checkpoint; inference also permits
+a catalog base model. `adapter_id` is not accepted as an alias. OpenAI requests continue to use `model`.
+Database columns already use `checkpoint_id`.
+
+In hosted serving, `artifact_digest` hashes adapter configuration and repository file metadata;
+it contributes to cache identity, but is not a post-download checksum of the weight bytes.
+`artifact_fingerprint` identifies the immutable binding to an organization, checkpoint, source
+revision, base model and serving configuration, including that digest. Neither hash is an
+authentication credential. The fingerprint now hashes the `model_id` key, so previously
+stored fingerprints require the [offline cutover](../../../docs/checkpoint-field-cutover.md).
+
 `POST /adapters`:
 
 ```json
 {
-  "adapter_id": "people-search/step-20",
+  "model_id": "people-search/step-20",
   "repo_id": "Freesolo-Co/people-search-lora",
   "repo_type": "model",
   "base_model": "Qwen/Qwen3.5-9B",
@@ -369,7 +374,7 @@ open `<think>` block for generation to close.
 
 ```json
 {
-  "adapter_id": "people-search/step-20",
+  "model_id": "people-search/step-20",
   "messages": [
     { "role": "user", "content": "Find senior search engineers in SF" }
   ],
@@ -385,3 +390,5 @@ open `<think>` block for generation to close.
   }
 }
 ```
+
+Hosted checkpoint authorization requires Freesolo's verified deployment-generation gate. The control plane reports the exact loading generation that passed smoke verification; if it changes or cannot be confirmed after verification, the attempt fails without publishing readiness or tearing down a possible replacement. Checkpoint API-key requests recheck authorization instead of using the positive base-model authorization cache. Deploy this control-plane and serving-router change with Freesolo PR #784, after its database prerequisites; reverify existing checkpoints whose reports lack a generation before reopening customer traffic. Such records are unready for managed chat; the normal deploy operation queues fresh verification instead of returning the old ready record. Internal smoke requests remain authorized through the trusted internal path.

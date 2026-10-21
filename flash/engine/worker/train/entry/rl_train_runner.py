@@ -14,7 +14,6 @@ import threading
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import Any
 
 import flash.engine.worker.io.heartbeat as _worker_heartbeat
 import flash.engine.worker.io.hf as _worker_hf
@@ -77,7 +76,6 @@ from flash.engine.worker.train.rl.rollout.single_turn import (
     score_single_turn,
     score_single_turn_batch,
 )
-from flash.engine.worker.verl.process_census import GrpoProcessCensus
 
 
 class _GrpoSubprocessStream:
@@ -190,7 +188,6 @@ class _StepMetricState:
     last_dump_step: list[int] = field(default_factory=lambda: [-1])
     metrics_last: list[dict] = field(default_factory=list)
     step_timing: StepTiming = field(default_factory=StepTiming)
-    host_census: dict[str, Any] = field(default_factory=dict)
     rollout_identity_evidence: dict[str, list] = field(
         default_factory=lambda: {"steps": [], "validation": []}
     )
@@ -386,7 +383,6 @@ def _write_rl_plugin_config(inp, files, *, gdn_reset_arch: str | None, loggers) 
         "dp_cards": int(inp["dp_cards"]),
         "reentrant_checkpointing": bool(inp["reentrant_checkpointing"]),
         "multimodal": bool(inp["multimodal"]),
-        "entropy_quantile": inp["entropy_quantile"],
         "per_turn_credit": bool(inp["per_turn_credit"]),
         "stop_sequences": list(inp["stop_sequences"]),
         "image_pad_token_id": inp["image_pad_token_id"],
@@ -503,7 +499,9 @@ def _start_reward_runtime(inp, env, tok, prompts, files) -> _RewardRuntime:
 def _resolve_training_settings(inp, caps):
     expected_steps = int(inp["steps"])
     # verl logs from its own interpreter; gate wandb on that env (see resolve_verl_loggers).
-    loggers = resolve_verl_loggers(caps)
+    # Actor stdout is asynchronous in Ray and can lose the last optimizer-step records at
+    # shutdown. The child entry streams Verl's unbuffered file logger through its own stdout.
+    loggers = ["file" if logger == "console" else logger for logger in resolve_verl_loggers(caps)]
     spec = _worker_state.JOB_SPEC
     project_name = (spec.wandb.project if spec and spec.wandb else None) or "flash"
     experiment_name = _worker_wandb_log.wandb_run_name()
@@ -539,7 +537,15 @@ def _announce_training(t_start: float, cfg) -> tuple[float, float]:
 
 
 def _start_resume_uploader(
-    *, local_dir, resume_step, inp, workdir, python_bin, preprocessor, metric_evidence
+    *,
+    local_dir,
+    resume_step,
+    inp,
+    workdir,
+    python_bin,
+    preprocessor,
+    metric_evidence,
+    final_step=None,
 ):
     targeting = resolve_lora_targeting(
         inp["model_id"], algorithm="grpo", multimodal=bool(inp.get("multimodal"))
@@ -549,6 +555,7 @@ def _start_resume_uploader(
         resume_step=resume_step,
         metric_evidence=metric_evidence,
         required_steps=inp["save_at_steps"],
+        final_step=final_step,
         export_root=os.path.join(workdir, "exports"),
         python_bin=python_bin,
         model_id=inp["model_id"],
@@ -572,6 +579,7 @@ def _build_rl_child_env(inp, files, loggers, reward_url):
     env_for_verl["VERL_USE_EXTERNAL_MODULES"] = "flash_grpo_plugin"
     env_for_verl["FLASH_GRPO_PLUGIN_CONFIG_PATH"] = files["plugin_config_path"]
     env_for_verl["FLASH_VERL_REWARD_URL"] = reward_url
+    env_for_verl["VERL_FILE_LOGGER_PATH"] = os.path.join(files["shim_dir"], "step_metrics.jsonl")
     # where each rank records the gpu it opened. ray fans this env to every actor, which is what
     # makes the file a rendezvous point: the deferred plugin check compares ranks before a process
     # group exists.
@@ -610,13 +618,6 @@ def _ingest_step_metrics(
         # a run constant rather than a verl metric, so it is stamped here from
         # the resolved run config.
         step_metrics["max_completion_tokens"] = inp["max_completion"]
-        step_metrics.update(
-            {
-                f"host_census/{key}": value
-                for key, value in state.host_census.items()
-                if isinstance(value, int)
-            }
-        )
         append_step_metrics(state.metrics_last, step_metrics, limit=GRPO_METRIC_HISTORY_LIMIT)
         # the worker's error path reads this global, so a run that dies mid-training
         # still reports the steps it did complete (worker/__init__.py:_err_metrics).
@@ -634,7 +635,7 @@ def _ingest_step_metrics(
                 step=step_metrics["step"],
                 metrics_last=list(state.metrics_last),
                 **heartbeat_fields,
-                gpu=gpu_diagnostics(include_torch=False),
+                gpu=gpu_diagnostics(),
             )
             if heartbeat_committed:
                 state.sent_first_metrics = True
@@ -685,28 +686,17 @@ def _execute_rl_child(
     _reward_observability,
     files=None,
 ) -> int:
-    # claimed before the child exists, so a grandchild it orphans reparents here and can be
-    # reaped at teardown. this process is not pid 1 (the runpod handler is), so without it
-    # every wait answers ChildProcessError for a zombie nobody will collect.
     adopt_orphaned_descendants()
     resume_step = int((files or {}).get("resume_step", 0))
     state.resume_step = resume_step
-    census = GrpoProcessCensus(
-        os.getpid(),
-        expected_steps=range(resume_step + 1, int(inp["steps"]) + 1),
-    ).start()
-    try:
-        proc = subprocess.Popen(
-            [python_bin, "-m", "flash_grpo_entry", *overrides],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            env=env_for_verl,
-            start_new_session=True,
-        )
-    except BaseException:
-        state.host_census = census.stop()
-        raise
+    proc = subprocess.Popen(
+        [python_bin, "-m", "flash_grpo_entry", *overrides],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        env=env_for_verl,
+        start_new_session=True,
+    )
     child_tail = ChildOutputTail()
     silence_watchdog = VerlChildSilenceWatchdog(
         child_tail,
@@ -749,8 +739,6 @@ def _execute_rl_child(
                     shims_verified = True
                 # dump one sample completion per new step to the flash log (#607).
                 if progress["step"] != last_dump_step[0]:
-                    census.sample_step(progress["step"])
-                    state.host_census = census.summary()
                     # the generation boundary: verl logs this line once its step is scored, so
                     # everything the reward bridge buffered since the last one is that step's
                     # complete output. seal exact identities before publishing any step output.
@@ -781,15 +769,7 @@ def _execute_rl_child(
         child_stream.terminate()
         raise
     finally:
-        state.host_census = census.stop()
         if state.metrics_last:
-            state.metrics_last[-1].update(
-                {
-                    f"host_census/{key}": value
-                    for key, value in state.host_census.items()
-                    if isinstance(value, int)
-                }
-            )
             # multi-turn totals ride the same final metrics row. published in `finally` so a run
             # that dies mid-stream still reports the turns it did execute.
             bridge = getattr(reward_runtime, "multi_turn_bridge", None)
@@ -917,7 +897,12 @@ def _prepare_final_adapter(local_dir: str, t_train: float):
     return actor_dir, adapter_dir, steps_run, train_wall
 
 
-def _export_final_adapter(actor_dir, adapter_dir, inp, python_bin):
+def _export_final_adapter(
+    actor_dir, adapter_dir, inp, python_bin, *, resume_uploader=None, steps_run=0
+):
+    if resume_uploader is not None and resume_uploader.reuse_final_adapter(steps_run, adapter_dir):
+        print(f"[rl-verl] reused validated adapter export at step {steps_run}", flush=True)
+        return
     export_peft_adapter(
         actor_dir, adapter_dir, base_model_id=inp["model_id"], python_bin=python_bin
     )

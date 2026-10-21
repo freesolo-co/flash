@@ -31,7 +31,18 @@ _EXPLICIT_TARGET = "flash-1/step-3"
 
 
 def _run_record(spec: dict) -> dict:
-    return {"verified_checkpoints": [_EXPLICIT_TARGET], "spec": spec}
+    return {
+        "deployments": {
+            _EXPLICIT_TARGET: {
+                "checkpoint_id": _EXPLICIT_TARGET,
+                "checkpoint_step": 3,
+                "state": "ready",
+                "verified_at": 1.0,
+                "deployment_generation": "generation-a",
+            }
+        },
+        "spec": spec,
+    }
 
 
 class _EvalClient:
@@ -469,7 +480,7 @@ def test_env_eval_refuses_a_pinned_step_whose_run_lost_its_verified_ledger(
 
         def get_run(self, run_id):
             return {
-                "verified_checkpoints": [],
+                "deployments": {},
                 "spec": {"thinking": False, "environment": {"id": _PUBLISHED_SLUG}},
             }
 
@@ -559,7 +570,15 @@ def test_env_eval_no_upload_still_requires_a_published_environment(monkeypatch, 
 
         def get_run(self, run_id):
             return {
-                "verified_checkpoints": [_EXPLICIT_TARGET],
+                "deployments": {
+                    _EXPLICIT_TARGET: {
+                        "checkpoint_id": _EXPLICIT_TARGET,
+                        "checkpoint_step": 3,
+                        "state": "ready",
+                        "verified_at": 1.0,
+                        "deployment_generation": "generation-a",
+                    }
+                },
                 "spec": {"thinking": False, "project": _PROJECT_ID},
             }
 
@@ -699,7 +718,15 @@ def test_env_eval_refuses_to_record_a_run_whose_project_is_unknown(
     class Client(_EvalClient):
         def get_run(self, run_id):
             return {
-                "verified_checkpoints": [_EXPLICIT_TARGET],
+                "deployments": {
+                    _EXPLICIT_TARGET: {
+                        "checkpoint_id": _EXPLICIT_TARGET,
+                        "checkpoint_step": 3,
+                        "state": "ready",
+                        "verified_at": 1.0,
+                        "deployment_generation": "generation-a",
+                    }
+                },
                 "spec": {"thinking": False, "environment": {"id": _PUBLISHED_SLUG}},
             }
 
@@ -1001,7 +1028,15 @@ def test_env_eval_refuses_a_run_that_names_no_published_environment(monkeypatch,
     class Client(_EvalClient):
         def get_run(self, run_id):
             return {
-                "verified_checkpoints": [_EXPLICIT_TARGET],
+                "deployments": {
+                    _EXPLICIT_TARGET: {
+                        "checkpoint_id": _EXPLICIT_TARGET,
+                        "checkpoint_step": 3,
+                        "state": "ready",
+                        "verified_at": 1.0,
+                        "deployment_generation": "generation-a",
+                    }
+                },
                 "spec": {"thinking": False, "project": _PROJECT_ID},
             }
 
@@ -2663,7 +2698,15 @@ def test_env_eval_sends_the_prompt_images_training_builds(monkeypatch, tmp_path)
     class Client(_EvalClient):
         def get_run(self, run_id):
             return {
-                "verified_checkpoints": [_EXPLICIT_TARGET],
+                "deployments": {
+                    _EXPLICIT_TARGET: {
+                        "checkpoint_id": _EXPLICIT_TARGET,
+                        "checkpoint_step": 3,
+                        "state": "ready",
+                        "verified_at": 1.0,
+                        "deployment_generation": "generation-a",
+                    }
+                },
                 "spec": {"environment": {"id": _PUBLISHED_SLUG}},
             }
 

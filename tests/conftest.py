@@ -6,7 +6,6 @@ is not stubbed globally because client tests use a real loopback server.
 
 from __future__ import annotations
 
-import contextlib
 import os
 import shlex
 
@@ -332,34 +331,23 @@ def _rebind_worker_submodule_attributes():
 
 @pytest.fixture(autouse=True)
 def _offline(monkeypatch):
-    # RunPod endpoint listing -> offline: the idle-endpoint sweep (deploy-time quota reclaim
-    # and the startup/post-run orphan sweep) lists account endpoints. Default to "no endpoints"
-    # so a sweep never reaches the real API; sweep tests monkeypatch it after this fixture.
-    import flash.providers.runpod.client.api as runpod_api
+    from flash.providers.modal import api as modal_api
 
-    monkeypatch.setattr(runpod_api, "list_endpoints", list, raising=False)
+    monkeypatch.setattr(modal_api, "list_instances", list)
 
-    # Credential scrubbing. Importing ``runpod_flash`` runs ``load_dotenv(find_dotenv(usecwd=True))``
-    # at module scope, which walks UP out of the repo and loads whatever .env it finds -- so on an
-    # operator box real keys appear in os.environ partway through the suite, as soon as some test
-    # first imports that package. Deleting a key BEFORE that import is worthless: load_dotenv skips
-    # names already set, so a name we just unset is exactly the one it fills back in.
-    #
-    # Force the import first, then delete. One ordering, one deletion pass, no name that can be
-    # scrubbed on the wrong side of the import.
-    with contextlib.suppress(Exception):  # package absent in a client-only checkout
-        import runpod_flash  # noqa: F401
+    def no_live_calls(*args, **kwargs):
+        raise AssertionError("offline tests must stub the Modal API")
+
+    monkeypatch.setattr(modal_api, "call", no_live_calls)
 
     # scrub automatically forwarded secrets from the production key set so operator credentials
-    # never enter fixtures. lambda/vast keys enable live providers, FREESOLO_API_KEY changes org
+    # never enter fixtures. FREESOLO_API_KEY changes org
     # identity, and FLASH_STANDALONE/FLASH_HF_NAMESPACE change global mode. tests opt in after this
     # fixture; see tests/test_server_standalone.py.
     from flash.client.runtime_secrets import DEFAULT_RUNTIME_SECRET_KEYS
 
     for _key in {
         "FREESOLO_API_KEY",
-        "LAMBDA_API_KEY",
-        "VAST_API_KEY",
         "PARASAIL_API_KEY",
         "FLASH_PUBLIC_URL",
         "FLASH_TEACHER_CAPABILITY",
@@ -368,13 +356,9 @@ def _offline(monkeypatch):
     } | set(DEFAULT_RUNTIME_SECRET_KEYS):
         monkeypatch.delenv(_key, raising=False)
 
-    # RunPod is OVERWRITTEN, not deleted: same hygiene (no operator key ever reaches a test) with
-    # the default substrate intact. is_configured() is gated on the key pool, so deleting the var
-    # leaves the harness with NO provider at all -- every allocator test then fails "no allocatable
-    # GPU" for want of a credential rather than for the reason it is testing. Two fake accounts so
-    # the multi-account failover paths have a pool to walk. A test that wants runpod unconfigured
-    # (or a specific pool) sets its own value after this fixture.
-    monkeypatch.setenv("RUNPOD_API_KEY", "rp-test-a,rp-test-b")
+    monkeypatch.setenv("MODAL_ENVIRONMENT", "main")
+    monkeypatch.setenv("MODAL_TOKEN_ID", "test-token-id")
+    monkeypatch.setenv("MODAL_TOKEN_SECRET", "test-token-secret")
 
     # Same hazard, one layer up: the client discovers runtime secrets from the process env at submit
     # time, so an operator shell that exports WANDB_API_KEY makes every dry-run test assert against
@@ -385,13 +369,6 @@ def _offline(monkeypatch):
 
     for _key in DEFAULT_RUNTIME_SECRET_KEYS:
         monkeypatch.delenv(_key, raising=False)
-
-    # The RunPod key pool caches the parsed RUNPOD_API_KEY at module level (so collapsing
-    # it to a single active key never loses the rest of the pool). Reset it around every
-    # test so a key set/collapsed by one test can't leak into the next.
-    import flash.providers.runpod.client.auth as rp_keys
-
-    rp_keys.reset()
 
     # Provider singletons are @cache'd per name, and is_configured() now reads the env, so a test
     # that sets or clears a provider key would otherwise see the PREVIOUS test's answer. Clear
@@ -420,10 +397,45 @@ def _offline(monkeypatch):
     monkeypatch.setattr(_rc, "run_scheduled_cleanup", lambda *a, **k: 0, raising=False)
 
     yield
-    rp_keys.reset()
     _providers._get_provider.cache_clear()
     _probe._CONFIG_PROBE_MEMO.clear()
     _facts._PINNED_SIZE_MEMO.clear()
+
+
+@pytest.fixture(autouse=True)
+def _offline_model_revision(monkeypatch):
+    """All submissions now pin the base; keep unrelated lifecycle tests off the Hub."""
+    from types import SimpleNamespace
+
+    from huggingface_hub import HfApi
+
+    from flash.core.catalog import MODELS
+    from flash.engine.plan import vram
+
+    model_info = HfApi.model_info
+    fetch_geometry = vram.fetch_hf_model_geometry
+
+    def info(self, repo_id, *, revision=None, **kwargs):
+        if revision is None and repo_id in MODELS:
+            return SimpleNamespace(sha=PLACEHOLDER_HF_REVISION)
+        return model_info(self, repo_id, revision=revision, **kwargs)
+
+    def geometry(model_id, revision="", **kwargs):
+        if revision == PLACEHOLDER_HF_REVISION and model_id in MODELS:
+            row = MODELS[model_id]
+            return (
+                row.params_b,
+                row.vocab_size,
+                row.hidden_size,
+                row.num_layers,
+                row.num_attention_heads,
+            )
+        return fetch_geometry(model_id, revision, **kwargs)
+
+    # Only the synthetic pin uses catalog geometry. Tests of real revision handling
+    # still exercise the original probe, and test-local Hub mocks override this fixture.
+    monkeypatch.setattr(HfApi, "model_info", info)
+    monkeypatch.setattr(vram, "fetch_hf_model_geometry", geometry)
 
 
 @pytest.fixture(autouse=True)

@@ -411,7 +411,7 @@ def _authored_gpu_type_entries(raw: Any) -> tuple[str, ...]:
         if not entries:
             raise ConfigError(
                 "[gpu] type must not be an empty list; omit the key for managed allocation, "
-                'or name the classes to allow, e.g. type = ["A100 PCIe", "A100 SXM"]'
+                'or name the classes to allow, e.g. type = ["H100", "A100 SXM"]'
             )
     else:
         raise ConfigError("gpu.type must be a string or a list of strings")
@@ -432,24 +432,7 @@ def _parse_time_wider_shape_remedy(
     thinking: bool,
     provider: str,
 ) -> str:
-    """The ``--gpus N`` clause for a class this run outgrows on ONE card, or ``""``.
-
-    The allocator already ends every fit rejection this way (``wider_shape_remedy``), but this
-    parse-time check ran without it: an authored single-card pin that a second card would satisfy
-    was rejected as a flat dead end, and the user learned only that the largest rentable card is
-    smaller than the requirement. Routing through the same helper means both boundaries suggest
-    the same flag, searched with the same fit model.
-
-    A hard ``gpu.provider`` pin is what narrows the pool, and it is a DIFFERENT field from the soft
-    ``gpu.providers`` preference list (the two are mutually exclusive, see ``GpuSpec``). Passing
-    only the soft list would advertise RunPod's freedom to rent any card count to a Lambda-pinned
-    run, sending the user to a wider SKU their pin may not carry -- exactly the confusion
-    ``widenable_gpu_names`` exists to prevent. A soft preference is not a pin, so it leaves the
-    pool open.
-
-    Sizing must never be what stops a config from parsing, so a failure here degrades to no
-    remedy -- the rejection itself is already correct and stands on its own.
-    """
+    """The ``--gpus N`` clause for a class this run outgrows on ONE card, or ``""``."""
     try:
         from flash.providers.core.allocator import _executed_width, geometry_safe_gpu_cap
         from flash.providers.core.base import wider_shape_remedy
@@ -694,7 +677,6 @@ def spec_from_dict(
             temperature=_train_float(train_raw, "temperature", minimum=0.0),
             max_completion_tokens=_train_int(train_raw, "max_completion_tokens", minimum=1),
             kl_penalty_coef=_train_float(train_raw, "kl_penalty_coef", minimum=0.0),
-            entropy_quantile=_train_float(train_raw, "entropy_quantile", minimum=0.0, maximum=1.0),
             thinking_length_penalty_coef=_train_float(
                 train_raw, "thinking_length_penalty_coef", minimum=0.0, maximum=1.0
             ),
@@ -768,7 +750,6 @@ _INAPPLICABLE_TRAIN_KNOBS: dict[str, dict[str, str]] = {
         "kl_penalty_coef": (
             "only applies to rollout algorithms (grpo, opd); SFT's objective has no KL term"
         ),
-        "entropy_quantile": "only applies to grpo; SFT has no rollout tokens to rank by entropy",
         "thinking_length_penalty_coef": (
             "only applies to grpo; it penalizes generated reasoning length, and SFT never generates"
         ),
@@ -783,10 +764,6 @@ _INAPPLICABLE_TRAIN_KNOBS: dict[str, dict[str, str]] = {
         ),
     },
     "opd": {
-        "entropy_quantile": (
-            "only applies to grpo; opd distils every sampled token against the teacher rather than "
-            "ranking tokens by entropy"
-        ),
         "thinking_length_penalty_coef": (
             "only applies to grpo; it shapes the grpo reward, and opd optimizes a distillation "
             "objective with no reward term"

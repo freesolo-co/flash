@@ -169,13 +169,16 @@ jobs:
           # pin the digest, not these tags; the tags exist for humans reading the registry.
           short_sha="$(git rev-parse --short HEAD)"
           branch="${GITHUB_REF_NAME}"
+          # Feature branches can contain slashes, which are invalid in OCI tags.
+          branch_tag="$(printf '%s' "$branch" | sed 's/[^A-Za-z0-9_.-]/-/g' | cut -c1-100)"
+          case "$branch_tag" in [.-]*) branch_tag="branch-${branch_tag}" ;; esac
           {
             echo "tags<<EOF"
             if [ "$branch" = "main" ]; then
               echo "${IMAGE}:main"
               echo "${IMAGE}:latest"
             else
-              echo "${IMAGE}:${branch}"
+              echo "${IMAGE}:${branch_tag}"
             fi
             echo "${IMAGE}:sha-${short_sha}"
             echo "EOF"

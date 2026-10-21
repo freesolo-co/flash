@@ -367,8 +367,8 @@ def test_bootstrap_validation_and_registration_fail_closed(monkeypatch, tmp_path
 def test_engine_death_handler_reaches_the_runtime(monkeypatch, tmp_path: Path) -> None:
     # when vllm's engine core dies after readiness the http process stays bound and answers 503
     # for every later request. the packaged app built the runtime with no on_engine_death
-    # callback, so `_notify_engine_death` only marked the notification complete and neither the
-    # modal container nor the runpod pod was ever replaced.
+    # callback, so `_notify_engine_death` only marked the notification complete and the
+    # Modal container was ever replaced.
     manifest = _manifest()
     monkeypatch.setattr(
         "flash.serve.app.bootstrap.locked_manifest_cache",

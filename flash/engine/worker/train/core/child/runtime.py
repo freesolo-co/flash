@@ -278,6 +278,47 @@ def install_checkpoint_handler_filter(save_at_steps, total_steps: int) -> None:
     CheckpointHandler.save_checkpoint = save_checkpoint
 
 
+def install_checkpoint_publication_backpressure(
+    published_dir: str, required_steps, total_steps: int
+) -> None:
+    """Keep the preceding required save alive until the parent finishes publishing it.
+
+    Waiting before the next save bounds the backlog without letting verl retention delete
+    an undiscovered save, even if hardlink staging was unavailable.
+    Parent supervision and the run deadline still bound a failed publisher's wait.
+    """
+    import time
+
+    from verl.utils.checkpoint.checkpoint_handler import CheckpointHandler
+
+    required_steps = tuple(sorted(int(step) for step in required_steps))
+    current = CheckpointHandler.save_checkpoint
+    if getattr(current, "_flash_publication_backpressure", False):
+        return
+
+    def save_checkpoint(self, step):
+        if step not in required_steps and step != total_steps:
+            return current(self, step)
+        for previous in required_steps:
+            if previous >= step:
+                break
+            marker = os.path.join(published_dir, f"step-{previous}")
+            next_notice = 0.0
+            while not os.path.isfile(marker):
+                if time.monotonic() >= next_notice:
+                    # Lines also let parent supervision surface a failed publisher promptly.
+                    print(
+                        f"[ckpt] waiting for required step {previous} before saving step {step}",
+                        flush=True,
+                    )
+                    next_notice = time.monotonic() + 5.0
+                time.sleep(0.1)
+        return current(self, step)
+
+    save_checkpoint._flash_publication_backpressure = True
+    CheckpointHandler.save_checkpoint = save_checkpoint
+
+
 def _gdn_seq_idx(position_ids, cu_seq_lens):
     import torch
 
@@ -599,4 +640,24 @@ def install_deferred_lora_rollout_guard(marker_file: str) -> None:
         target=_LORA_ROLLOUT_TARGET,
         patch=_patch_lora_rollout,
         required=True,
+    )
+
+
+def install_compact_checkpoints(marker_file: str) -> None:
+    if __name__ == "flash_verl_runtime":
+        from flash_compact_checkpoint import install
+    else:
+        from flash.engine.worker.train.core.child.compact_checkpoint import install
+
+    def apply():
+        import importlib
+
+        install(
+            importlib.import_module("verl.utils.checkpoint.fsdp_checkpoint_manager"),
+            model_id=os.environ.get("FLASH_CHECKPOINT_MODEL_ID", ""),
+            revision=os.environ.get("FLASH_CHECKPOINT_MODEL_REVISION", ""),
+        )
+
+    install_deferred_required(
+        "compact-checkpoint", marker_file, "verl.utils.checkpoint.fsdp_checkpoint_manager", apply
     )

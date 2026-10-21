@@ -83,7 +83,7 @@ def _fully_managed_internal_spec() -> JobSpec:
             "train": {"epochs": 1, "max_examples": 8, "lora_rank": 16, "hf_repo": "operator/runs"},
             "gpu": {
                 "type": "H100",
-                "providers": ["runpod"],
+                "providers": ["modal"],
                 "disk_gb": 160,
                 "network_volume": "flash-weights",
                 "network_volume_gb": 100,
@@ -97,7 +97,7 @@ def _fully_managed_internal_spec() -> JobSpec:
     assert spec.run_id == "flash-managed-run"
     assert spec.train.hf_repo == "operator/runs"
     assert spec.gpu.type == "H100"
-    assert spec.gpu.providers == ("runpod",)
+    assert spec.gpu.providers == ("modal",)
     assert spec.gpu.disk_gb == 160
     assert spec.gpu.network_volume == "flash-weights"
     assert spec.gpu.network_volume_gb == 100

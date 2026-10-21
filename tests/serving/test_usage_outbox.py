@@ -15,6 +15,7 @@ from fastapi.testclient import TestClient
 from flash.serving.src.accounting.usage import (
     _FREESOLO_USD_PER_MTOK,
     FREESOLO_PRICING_SOURCE,
+    AuthorizedTraffic,
     build_usage_session,
     freesolo_price,
     new_generation_id,
@@ -57,7 +58,7 @@ def _revision() -> AdapterRecord:
     checkpoint_id = f"{run_id}/final"
     return AdapterRecord.model_validate(
         {
-            "adapter_id": checkpoint_id,
+            "model_id": checkpoint_id,
             "repo_id": "org/accounting",
             "org_id": "org-1",
             "base_model": BASE_MODEL,
@@ -69,6 +70,7 @@ def _revision() -> AdapterRecord:
             "artifact_digest": hashlib.sha256(b"accounting-artifact").hexdigest(),
             "artifact_fingerprint": hashlib.sha256(b"accounting-binding").hexdigest(),
             "lora_rank": 16,
+            "deployment_generation": "generation-a",
         }
     )
 
@@ -93,7 +95,7 @@ class _Pool:
             record,
             {
                 "ok": True,
-                "adapter_id": payload.adapter_id,
+                "model_id": payload.model_id,
                 "text": "ok",
                 "finish_reason": "stop",
                 "prompt_token_ids": [11, 12],
@@ -131,7 +133,7 @@ class _Pool:
             "request_id": generation_id,
             "engine_replica_id": "replica-1",
             "checkpoint": record.checkpoint,
-            "lora_request_adapter": record.adapter_id,
+            "lora_request_adapter": record.model_id,
         }
         yield {"type": "ready", "completion_tokens": 0, "completion_token_ids": [], **common}
         yield {
@@ -155,10 +157,10 @@ class _Pool:
     async def unregister(
         self,
         base_model: str,
-        adapter_id: str,
+        model_id: str,
         expected_generation: str | None = None,
     ) -> None:
-        del base_model, adapter_id, expected_generation
+        del base_model, model_id, expected_generation
 
 
 class _Store(OfflineUsageStore):
@@ -285,7 +287,7 @@ def test_empty_or_omitted_token_ids_preserve_resolved_scalar_counts(
     assert facts.cached_tokens <= facts.prompt_tokens
 
 
-def test_capacity_facts_use_top_level_optional_rpc_fields() -> None:
+def test_capacity_facts_use_durable_evidence_without_extending_billing_rpc() -> None:
     event = _usage_event()
     event = replace(
         event,
@@ -301,12 +303,19 @@ def test_capacity_facts_use_top_level_optional_rpc_fields() -> None:
 
     payload = event.rpc_payload()
 
-    assert payload["time_to_first_token_seconds"] == 0.75
-    assert payload["queue_wait_seconds"] == 0.25
-    assert payload["replica_in_flight_requests_at_admission"] == 3
-    assert payload["replica_boot_duration_seconds"] == 91.5
-    assert payload["replica_freshly_booted"] is True
-    assert "capacity" not in payload["attestation_evidence"]
+    capacity = payload["attestation_evidence"]["capacity"]
+    assert capacity == {
+        "time_to_first_token_seconds": 0.75,
+        "queue_wait_seconds": 0.25,
+        "replica_in_flight_requests_at_admission": 3,
+        "replica_boot_duration_seconds": 91.5,
+        "replica_freshly_booted": True,
+    }
+    assert not set(capacity).intersection(payload)
+    assert payload["traffic_source"] == "freesolo"
+    assert payload["checkpoint_id"] == event.target.checkpoint_id
+    assert payload["artifact_fingerprint"] == event.target.artifact_fingerprint
+    assert payload["attestation_evidence"].items() >= event.attestation_evidence.items()
 
 
 def test_invalid_or_missing_capacity_facts_are_omitted_without_raising() -> None:
@@ -327,6 +336,8 @@ def test_invalid_or_missing_capacity_facts_are_omitted_without_raising() -> None
     )
     payload = replace(_usage_event(), facts=facts).rpc_payload()
 
+    assert "capacity" not in payload["attestation_evidence"]
+
     assert "time_to_first_token_seconds" not in payload
     assert "queue_wait_seconds" not in payload
     assert "replica_in_flight_requests_at_admission" not in payload
@@ -339,8 +350,10 @@ def test_nonstream_capture_is_awaited_before_successful_response() -> None:
     pool = _Pool()
     store = _Store()
 
-    async def authorize(_token: str, _adapter_id: str, _scope: dict | None = None) -> str:
-        return "org-1"
+    async def authorize(
+        _token: str, _adapter_id: str, _scope: dict | None = None
+    ) -> AuthorizedTraffic:
+        return AuthorizedTraffic(principal_for_external_org("org-1"), "generation-a")
 
     app = build_serving_app(
         pool,
@@ -351,16 +364,14 @@ def test_nonstream_capture_is_awaited_before_successful_response() -> None:
         deployment_sha="release-1",
     )
     with TestClient(app, headers={"Authorization": "Bearer user-key"}) as client:
-        response = client.post(
-            "/generate", json={"adapter_id": record.adapter_id, "prompt": "hello"}
-        )
+        response = client.post("/generate", json={"model_id": record.model_id, "prompt": "hello"})
 
     assert response.status_code == 200
     assert len(store.finalized) == 1
     event = store.finalized[0]
     assert event.identity.request_id == pool.generation_id
     assert event.principal == FreesoloOrgTrafficPrincipal(orgId="org-1")
-    assert event.target.public_model_id == record.adapter_id
+    assert event.target.public_model_id == record.model_id
     assert event.target.checkpoint_id == record.checkpoint
     assert event.target.artifact_fingerprint == record.artifact_fingerprint
     assert event.target.artifact_fingerprint != record.artifact_digest
@@ -374,8 +385,10 @@ def test_stream_captures_in_progress_before_response_and_finalizes_same_id() -> 
     pool = _Pool()
     store = _Store()
 
-    async def authorize(_token: str, _adapter_id: str, _scope: dict | None = None) -> str:
-        return "org-1"
+    async def authorize(
+        _token: str, _adapter_id: str, _scope: dict | None = None
+    ) -> AuthorizedTraffic:
+        return AuthorizedTraffic(principal_for_external_org("org-1"), "generation-a")
 
     app = build_serving_app(
         pool,
@@ -389,7 +402,7 @@ def test_stream_captures_in_progress_before_response_and_finalizes_same_id() -> 
             "POST",
             "/v1/chat/completions",
             json={
-                "model": record.adapter_id,
+                "model": record.model_id,
                 "messages": [{"role": "user", "content": "hello"}],
                 "stream": True,
                 "stream_options": {"include_usage": True},
@@ -423,7 +436,7 @@ def test_stream_finalization_preserves_first_event_attestation() -> None:
         "thinking": False,
         "request_id": identity.request_id,
         "checkpoint": record.checkpoint,
-        "lora_request_adapter": record.adapter_id,
+        "lora_request_adapter": record.model_id,
     }
     final = {
         "type": "final",
@@ -450,14 +463,16 @@ def test_stream_finalization_preserves_first_event_attestation() -> None:
 
     asyncio.run(session.finalize(final))
 
-    assert store.finalized[0].attestation_evidence == {"checkpoint_id": record.adapter_id}
+    assert store.finalized[0].attestation_evidence == {"checkpoint_id": record.model_id}
 
 
 def test_stream_capture_failure_before_headers_returns_controlled_503() -> None:
     record = _revision()
 
-    async def authorize(_token: str, _adapter_id: str, _scope: dict | None = None) -> str:
-        return "org-1"
+    async def authorize(
+        _token: str, _adapter_id: str, _scope: dict | None = None
+    ) -> AuthorizedTraffic:
+        return AuthorizedTraffic(principal_for_external_org("org-1"), "generation-a")
 
     app = build_serving_app(
         _Pool(),
@@ -469,7 +484,7 @@ def test_stream_capture_failure_before_headers_returns_controlled_503() -> None:
         response = client.post(
             "/v1/chat/completions",
             json={
-                "model": record.adapter_id,
+                "model": record.model_id,
                 "messages": [{"role": "user", "content": "hello"}],
                 "stream": True,
             },
@@ -483,8 +498,10 @@ def test_thinking_request_is_rejected_before_engine_dispatch() -> None:
     record = _revision().model_copy(update={"thinking": True})
     pool = _Pool()
 
-    async def authorize(_token: str, _adapter_id: str, _scope: dict | None = None) -> str:
-        return "org-1"
+    async def authorize(
+        _token: str, _adapter_id: str, _scope: dict | None = None
+    ) -> AuthorizedTraffic:
+        return AuthorizedTraffic(principal_for_external_org("org-1"), "generation-a")
 
     app = build_serving_app(
         pool,
@@ -493,9 +510,7 @@ def test_thinking_request_is_rejected_before_engine_dispatch() -> None:
         chat_authorizer=authorize,
     )
     with TestClient(app, headers={"Authorization": "Bearer user-key"}) as client:
-        response = client.post(
-            "/generate", json={"adapter_id": record.adapter_id, "prompt": "hello"}
-        )
+        response = client.post("/generate", json={"model_id": record.model_id, "prompt": "hello"})
 
     assert response.status_code == 503
     assert response.json() == {"detail": "thinking generation accounting is unavailable"}
@@ -505,8 +520,10 @@ def test_thinking_request_is_rejected_before_engine_dispatch() -> None:
 def test_nonstream_capture_failure_returns_controlled_503() -> None:
     record = _revision()
 
-    async def authorize(_token: str, _adapter_id: str, _scope: dict | None = None) -> str:
-        return "org-1"
+    async def authorize(
+        _token: str, _adapter_id: str, _scope: dict | None = None
+    ) -> AuthorizedTraffic:
+        return AuthorizedTraffic(principal_for_external_org("org-1"), "generation-a")
 
     app = build_serving_app(
         _Pool(),
@@ -515,9 +532,7 @@ def test_nonstream_capture_failure_returns_controlled_503() -> None:
         chat_authorizer=authorize,
     )
     with TestClient(app, headers={"Authorization": "Bearer user-key"}) as client:
-        response = client.post(
-            "/generate", json={"adapter_id": record.adapter_id, "prompt": "hello"}
-        )
+        response = client.post("/generate", json={"model_id": record.model_id, "prompt": "hello"})
 
     assert response.status_code == 503
     assert response.json() == {"detail": "durable serving accounting unavailable"}
@@ -556,12 +571,13 @@ def test_every_settled_event_carries_an_attributed_org() -> None:
 
     assert payload["traffic_principal_kind"] == "freesolo_org"
     assert payload["org_id"] == "org-1"
-    assert payload["checkpoint_id"] == record.adapter_id
-    assert payload["public_model_id"] == record.adapter_id
+    assert payload["checkpoint_id"] == record.model_id
+    assert payload["public_model_id"] == record.model_id
     assert payload["pricing_source"] == FREESOLO_PRICING_SOURCE
-    # no marketplace-specific settlement surface survives on the wire.
+    # The billing RPC still requires the fixed first-party source discriminator.
+    assert payload["traffic_source"] == "freesolo"
+    # No marketplace-specific settlement surface survives on the wire.
     for absent in (
-        "traffic_source",
         "openrouter_request_id",
         "openrouter_generation_id",
         "upstream_id",
@@ -1754,7 +1770,7 @@ def test_stream_finalizes_before_successful_terminal_usage_event() -> None:
                 AdapterRouter([record]),
                 record=record,
                 events=_stream_events(generation_id),
-                adapter_id=record.adapter_id,
+                model_id=record.model_id,
                 completion_id="chatcmpl-stream",
                 created=123,
                 include_usage=True,
@@ -1814,7 +1830,7 @@ def test_final_event_wins_same_tick_disconnect_and_emits_one_terminal_pair() -> 
             disconnected,
             record=record,
             events=events(),
-            adapter_id=record.adapter_id,
+            model_id=record.model_id,
             completion_id="chatcmpl-race",
             created=123,
             include_usage=True,
@@ -1853,7 +1869,7 @@ def test_stream_finalization_failure_emits_terminal_sse_error_and_snapshot() -> 
                 AdapterRouter([record]),
                 record=record,
                 events=_stream_events(generation_id),
-                adapter_id=record.adapter_id,
+                model_id=record.model_id,
                 completion_id="chatcmpl-stream",
                 created=123,
                 include_usage=True,
@@ -1900,7 +1916,7 @@ def test_failed_stream_finalization_relinquishes_heartbeat_for_stale_recovery() 
         event.principal,
         record,
         record,
-        {"checkpoint": record.checkpoint, "lora_request_adapter": record.adapter_id},
+        {"checkpoint": record.checkpoint, "lora_request_adapter": record.model_id},
         deployment_id="deployment-1",
         serving_release="release-1",
         captured_at=event.captured_at,
@@ -1913,7 +1929,7 @@ def test_failed_stream_finalization_relinquishes_heartbeat_for_stale_recovery() 
                 AdapterRouter([record]),
                 record=record,
                 events=_stream_events(event.identity.request_id),
-                adapter_id=record.adapter_id,
+                model_id=record.model_id,
                 completion_id="chatcmpl-stream",
                 created=123,
                 include_usage=True,
@@ -1972,7 +1988,7 @@ def test_stream_output_emits_one_terminal_sequence() -> None:
         asyncio.Event(),
         completion_id="chatcmpl-terminal",
         created=123,
-        adapter_id="adapter-1",
+        model_id="adapter-1",
     )
 
     async def run() -> list[bytes | None]:
@@ -1992,7 +2008,7 @@ def test_finish_makes_sentinel_space_after_blocked_terminal_refills_queue() -> N
         disconnected,
         completion_id="chatcmpl-blocked",
         created=123,
-        adapter_id="adapter-1",
+        model_id="adapter-1",
     )
 
     async def run() -> list[bytes | None]:
@@ -2055,7 +2071,7 @@ def test_full_stream_queue_disconnect_does_not_block_cleanup_sentinel() -> None:
             AdapterRouter([record]),
             record=record,
             events=events(),
-            adapter_id=record.adapter_id,
+            model_id=record.model_id,
             completion_id="chatcmpl-stream",
             created=123,
             include_usage=True,
@@ -2113,7 +2129,7 @@ def test_stream_disconnect_persists_latest_cumulative_snapshot() -> None:
             AdapterRouter([record]),
             record=record,
             events=events(),
-            adapter_id=record.adapter_id,
+            model_id=record.model_id,
             completion_id="chatcmpl-stream",
             created=123,
             include_usage=True,
@@ -2160,7 +2176,7 @@ def test_stream_engine_error_persists_latest_valid_snapshot() -> None:
                 AdapterRouter([record]),
                 record=record,
                 events=events(),
-                adapter_id=record.adapter_id,
+                model_id=record.model_id,
                 completion_id="chatcmpl-stream",
                 created=123,
                 include_usage=True,

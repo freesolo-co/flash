@@ -62,7 +62,6 @@ def test_proven_values_are_hardcoded_constants() -> None:
     assert cfg.MAX_LORAS == 16
     assert cfg.MAX_LORA_RANK == 32
     assert cfg.PROMPT_TOKEN_CACHE_SIZE == 2048
-    assert cfg.PRELOAD_CACHED_LORAS is True
     assert cfg.RELOAD_INTERVAL_SECONDS == 30.0
     # FP8 is baked in everywhere (memory-first): online fp8 weight quant + fp8 KV cache. These are
     # module constants (like DTYPE), NOT Settings env knobs — see test_deleted_knobs_are_gone.

@@ -205,7 +205,7 @@ def test_queued_run_requiring_request_secrets_cannot_recover_without_them(monkey
     assert "requires_runtime_secrets" not in stored.to_dict()
     with pytest.raises(ValueError, match="cannot restore request runtime secrets"):
         status.reallocation_spec_from_status(stored)
-    assert not runtime._enqueue_resubmit(spec, "queued")
+    assert not runtime._enqueue_resubmit(spec)
     assert status.get_status(spec.run_id).state == "failed"
 
 
@@ -255,9 +255,52 @@ def test_recovered_launch_rechecks_provider_after_waiting_for_capacity(monkeypat
         "_start_handleless_resubmit",
         lambda *_args: pytest.fail("must not reserve a replacement over a live worker"),
     )
-    result = runtime._resubmit_task(spec, "provisioning")
+    result = runtime._resubmit_task(spec)
     assert isinstance(result, Retry)
     assert result.delay == 30.0
+
+
+def test_delayed_queued_resubmission_uses_current_state_on_every_retry(monkeypatch):
+    from types import SimpleNamespace
+
+    from flash.runner.lifecycle import deadlines
+    from flash.server.platform import runtime
+
+    spec = SimpleNamespace(run_id="changed-while-queued")
+    status = SimpleNamespace(
+        state="queued", remote=None, cleanup_confirmed_remote=None, requires_runtime_secrets=False
+    )
+    monkeypatch.setattr(runtime, "get_status", lambda _: status)
+    monkeypatch.setattr(
+        "flash.runner.lifecycle.status.source_snapshot_from_status", lambda *a, **kw: {}
+    )
+    monkeypatch.setattr(deadlines, "_remaining_run_wall_seconds", lambda _: 30.0)
+    monkeypatch.setattr(runtime, "_recovery_wall_deadline_is_open", lambda _: True)
+    callbacks = []
+    monkeypatch.setattr(
+        current_supervisor(), "submit", lambda key, lane, target: callbacks.append(target) or True
+    )
+    assert runtime._enqueue_resubmit(spec)
+    status.state = "provisioning"
+    checks = []
+    clear = [False]
+    monkeypatch.setattr(
+        runtime, "_confirm_run_clear", lambda _: checks.append(status.state) or clear[0]
+    )
+    reservations = []
+    monkeypatch.setattr(
+        runtime,
+        "_start_handleless_resubmit",
+        lambda _, expected: reservations.append(expected) or True,
+    )
+    assert isinstance(callbacks[0](), Retry)
+    assert checks == ["provisioning"]
+    assert reservations == []
+    status.state = "running"
+    clear[0] = True
+    assert callbacks[0]() is None
+    assert checks == ["provisioning", "running"]
+    assert reservations == ["running"]
 
 
 def test_cleanup_overflow_is_rediscovered_from_persisted_records(monkeypatch):
@@ -297,4 +340,4 @@ def test_queued_replacement_does_not_reap_a_newly_adopted_worker(monkeypatch):
     monkeypatch.setattr(
         runtime, "_confirm_run_clear", lambda _spec: pytest.fail("must not reap an adopted worker")
     )
-    assert runtime._resubmit_task(spec, "provisioning") is None
+    assert runtime._resubmit_task(spec) is None

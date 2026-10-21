@@ -122,7 +122,6 @@ def _write_terminal_metadata(
             wandb_id=reward_runtime.wandb_link.get("wandb_id"),
             reward_bridge_batching=not inp["multi_turn"],
             gdn_boundary_resets=gdn_hybrid or None,
-            host_census=state.host_census,
             rollout_identity_evidence=state.rollout_identity_evidence,
             advantage_spread_history=state.adv_spread_history,
             advantage_bounds=state.advantage_bounds_evidence,
@@ -293,6 +292,7 @@ def run_rl_train():
             python_bin=python_bin,
             preprocessor=preprocessor,
             metric_evidence=state,
+            final_step=expected_steps,
         )
         env_for_verl = _build_rl_child_env(inp, files, loggers, reward_runtime.reward_url)
         metrics_last = state.metrics_last
@@ -350,7 +350,17 @@ def run_rl_train():
         progress_step=True,
         keepalive=True,
     ):
-        _export_final_adapter(actor_dir, adapter_dir, inp, python_bin)
+        _worker_hf.hf_upload_file(
+            env_for_verl["VERL_FILE_LOGGER_PATH"], "step_metrics.jsonl", required=True
+        )
+        _export_final_adapter(
+            actor_dir,
+            adapter_dir,
+            inp,
+            python_bin,
+            resume_uploader=resume_uploader,
+            steps_run=steps_run,
+        )
         preprocessor.save_pretrained(adapter_dir)
         _worker_hf.hf_upload_folder(adapter_dir, "adapter", required=True)
         # preserve the final checkpoint only when exact save steps are not configured: with

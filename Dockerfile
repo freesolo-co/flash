@@ -2,7 +2,7 @@
 #
 #   docker build -t flash-control-plane .
 #   docker run -p 8080:8080 \
-#     -e RUNPOD_API_KEY=... -e HF_TOKEN=... \
+#     -e MODAL_TOKEN_ID=... -e MODAL_TOKEN_SECRET=... -e HF_TOKEN=... \
 #     -v flash-state:/root/.flash flash-control-plane
 #
 # All persistent state (key DB, run records, results) lives under ~/.flash (= /root/.flash for

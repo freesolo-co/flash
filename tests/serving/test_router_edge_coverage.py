@@ -10,6 +10,7 @@ from typing import Any
 
 from fastapi.testclient import TestClient
 
+from flash.serving.src.accounting.usage import AuthorizedTraffic, principal_for_external_org
 from flash.serving.src.http.router import AdapterRouter
 from flash.serving.src.http.router import build_offline_serving_app as build_serving_app
 from flash.serving.src.io.schemas import AdapterRecord
@@ -19,8 +20,8 @@ from tests.serving.conftest import attest
 QWEN = "Qwen/Qwen3.5-9B"
 
 
-async def _allow(_token: str, _adapter_id: str, _scope: dict | None = None) -> str:
-    return "org-1"
+async def _allow(_token: str, _adapter_id: str, _scope: dict | None = None) -> AuthorizedTraffic:
+    return AuthorizedTraffic(principal_for_external_org("org-1"), "generation-a")
 
 
 def _revision(
@@ -33,15 +34,15 @@ def _revision(
 
 
 def _base_record(
-    adapter_id: str,
+    model_id: str,
     *,
     checkpoint: str | None = None,
     subfolder: str | None = None,
 ) -> AdapterRecord:
     return AdapterRecord.model_validate(
         {
-            "adapter_id": adapter_id,
-            "repo_id": f"org/{adapter_id}",
+            "model_id": model_id,
+            "repo_id": f"org/{model_id}",
             "base_model": QWEN,
             "checkpoint": checkpoint,
             "subfolder": subfolder,
@@ -72,7 +73,7 @@ class _Pool:
             {
                 "text": "ok",
                 "finish_reason": "stop",
-                "checkpoint": _record.adapter_id,
+                "checkpoint": _record.model_id,
             },
         )
 
@@ -100,7 +101,7 @@ def test_unsupported_base_model_is_reported_and_rejected() -> None:
     assert health["base_models"] == [unsupported]
     assert health["gpus"] == 0
 
-    response = client.post("/generate", json={"adapter_id": revision.adapter_id, "prompt": "hi"})
+    response = client.post("/generate", json={"model_id": revision.model_id, "prompt": "hi"})
     assert response.status_code == 400
     assert f"Unsupported base model: {unsupported}" in response.json()["detail"]
     assert "Qwen/Qwen3.5-9B" in response.json()["detail"]
@@ -127,7 +128,7 @@ def test_base_model_stream_replay_skips_empty_delta_without_checkpoint_header() 
         "POST",
         "/v1/chat/completions",
         json={
-            "model": record.adapter_id,
+            "model": record.model_id,
             "messages": [{"role": "user", "content": "hi"}],
             "stream": True,
         },
@@ -165,7 +166,7 @@ def test_checkpoint_mismatch_value_error_is_conflict() -> None:
     response = _client(
         _ValueErrorPool("checkpoint mismatch: expected checkpoint differs"),
         AdapterRouter([revision]),
-    ).post("/generate", json={"adapter_id": "qa/final", "prompt": "hi"})
+    ).post("/generate", json={"model_id": "qa/final", "prompt": "hi"})
 
     assert response.status_code == 409
     assert response.json()["detail"] == "expected checkpoint differs"
@@ -175,7 +176,7 @@ def test_engine_error_after_adapter_is_disabled_is_not_found() -> None:
     revision = _revision()
     router = AdapterRouter([revision])
     response = _client(_ValueErrorPool("Unknown adapter id on engine", router), router).post(
-        "/generate", json={"adapter_id": "qa/final", "prompt": "hi"}
+        "/generate", json={"model_id": "qa/final", "prompt": "hi"}
     )
 
     assert response.status_code == 404
@@ -225,12 +226,12 @@ def test_teardown_drops_a_row_that_vanished_from_persistence() -> None:
 
     revision = _revision()
     router = AdapterRouter([revision])
-    assert router.get(revision.adapter_id, org_id="org-1") is not None
+    assert router.get(revision.model_id, org_id="org-1") is not None
 
     cleanup = apply_teardown(router, [(revision, None, revision.deployment_generation)])
 
-    assert router.get(revision.adapter_id, org_id="org-1") is None
-    assert [record.adapter_id for record, _ in cleanup] == [revision.adapter_id]
+    assert router.get(revision.model_id, org_id="org-1") is None
+    assert [record.model_id for record, _ in cleanup] == [revision.model_id]
 
 
 def test_teardown_keeps_the_authoritative_row_when_one_came_back() -> None:
@@ -243,6 +244,6 @@ def test_teardown_keeps_the_authoritative_row_when_one_came_back() -> None:
 
     cleanup = apply_teardown(router, [(revision, disabled, revision.deployment_generation)])
 
-    assert router.get(revision.adapter_id, org_id="org-1") is not None
-    assert router.get(revision.adapter_id, org_id="org-1").status == "disabled"
-    assert [record.adapter_id for record, _ in cleanup] == [revision.adapter_id]
+    assert router.get(revision.model_id, org_id="org-1") is not None
+    assert router.get(revision.model_id, org_id="org-1").status == "disabled"
+    assert [record.model_id for record, _ in cleanup] == [revision.model_id]

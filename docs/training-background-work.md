@@ -39,7 +39,8 @@ return; Python threads are not forcibly interrupted. The application bounds its 
 wait at five seconds and logs when a blocking call remains.
 
 Stopping local monitoring preserves a durably recorded remote worker for restart recovery.
-Lambda and Vast still tear down unrecorded resources and preserve their normal failure cleanup.
+Modal still tears down unrecorded resources and preserves its normal failure cleanup. Both new
+launches and reattached monitors preserve recorded sandboxes and checkpoint uploads on shutdown.
 OPD teacher capabilities retain their existing expiration when a monitor detaches. User
 cancellation performs its existing durable cancellation, capability revocation, and resource
 teardown before cancelling local follow-up tasks; cleanup tasks remain eligible.

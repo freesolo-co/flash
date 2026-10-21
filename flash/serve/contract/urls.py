@@ -131,8 +131,5 @@ def serving_base_url() -> str:
 
 
 def public_deployment(deployment: dict) -> dict:
-    """Return a public copy without private rollback state."""
-    out = dict(deployment)
-    out.pop("previous_deployment", None)
-    out.pop("verification_generation", None)
-    return out
+    """Return an independent copy of a checkpoint deployment record."""
+    return dict(deployment)

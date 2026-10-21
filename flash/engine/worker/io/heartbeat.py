@@ -267,7 +267,7 @@ def heartbeat(
         payload["progress_age_s"] = round(max(0.0, ts - latest_progress_ts), 1)
     else:
         payload.pop("progress_age_s", None)
-    dc = os.environ.get("RUNPOD_DC_ID") or ""
+    dc = os.environ.get("MODAL_REGION") or ""
     if dc:
         payload.setdefault("dc", dc)
     snapshot = json.dumps(payload)
@@ -684,7 +684,7 @@ def liveness_heartbeat(
                             last_val = float(v)
                         elif float(v) > last_val:
                             last_val, made_progress = float(v), True
-            gpu = worker_perf.gpu_diagnostics(include_torch=False)
+            gpu = worker_perf.gpu_diagnostics()
             if done.is_set():  # the wrapped call may have finished during nvidia-smi
                 return
             extra = field_sampler.latest() if field_sampler is not None else {}

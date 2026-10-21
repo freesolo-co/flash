@@ -27,11 +27,6 @@ from flash.engine.worker.runtime.kernel_warmup import KERNEL_CACHE_ENV_SUBDIRS
 from flash.engine.worker.verl.checkpoints import restore_verl_resume
 from flash.engine.worker.verl.parallelism import ULYSSES_SEQUENCE_PARALLEL_SIZE
 
-# todo: run the two-gpu sft smoke on the exact runpod image and command assembled below.
-# consecutive zero-grad-norm steps tolerated before the run is failed as untrainable (GRAD-001).
-# any nonzero grad norm is proof the backward graph is intact and resets the count. 2 is enough to
-# separate a one-off fully-masked batch from a severed graph, and keeps the wasted spend to a couple
-# of steps rather than the whole run.
 _MAX_ZERO_GRAD_STEPS = 2
 
 
@@ -144,11 +139,17 @@ def _seed_resume_lifecycle(watcher, required_steps: tuple[int, ...], resume_step
     the resume-state half of this is the shared rule and lives on the ledger. what stays here is the
     part only sft and opd can answer: the prior attempt's deployable publish was best-effort for a
     periodic save, so a required step is credited only when ``_durable_required_save_steps`` finds
-    its adapter on hf. a required step whose adapter is missing stays undiscovered, so this watcher
-    stages and publishes it without re-uploading the full state hf already has.
+    its adapter on hf. The restored step can still be exported by this watcher; an earlier
+    missing save cannot be recreated and must fail before launching the training child.
     """
     watcher.lifecycle.seed_resumed_step(resume_step, frozenset(required_steps))
-    for step in _durable_required_save_steps(required_steps, resume_step):
+    durable = _durable_required_save_steps(required_steps, resume_step)
+    missing = sorted(step for step in required_steps if step < resume_step and step not in durable)
+    if missing:
+        raise RuntimeError(
+            f"cannot resume: earlier required saves were not durably published: {missing}"
+        )
+    for step in durable:
         watcher.lifecycle.mark_deployable_published(step)
         watcher.lifecycle.mark_discovered(step)
 
@@ -176,7 +177,6 @@ _CHILD_ENV_EXACT = frozenset(
         "HUGGINGFACE_HUB_CACHE",
         "TRANSFORMERS_CACHE",
         "HF_HUB_OFFLINE",
-        "HF_HUB_ENABLE_HF_TRANSFER",
         "HF_HUB_DISABLE_XET",
         "TRANSFORMERS_OFFLINE",
         "TOKENIZERS_PARALLELISM",
@@ -233,6 +233,9 @@ def _build_verl_child_env(*, shim_dir: str, wandb_enabled: bool) -> dict[str, st
         os.environ.get("PYTHONPATH", "") if "PYTHONPATH" not in applied_secret_names else ""
     )
     child["PYTHONPATH"] = os.pathsep.join(item for item in (shim_dir, parent_pythonpath) if item)
+    if _worker_state.JOB_SPEC is not None:
+        child["FLASH_CHECKPOINT_MODEL_ID"] = _worker_state.JOB_SPEC.model
+        child["FLASH_CHECKPOINT_MODEL_REVISION"] = _worker_state.JOB_SPEC.model_revision
     child["PYTHONUNBUFFERED"] = "1"
     child["HYDRA_FULL_ERROR"] = "1"
     child["HF_HUB_OFFLINE"] = "1"
@@ -350,10 +353,6 @@ def _sft_profile_max_length(profile) -> int:
     return max_length  # noqa: RET504
 
 
-def _sft_liger_config() -> dict[str, bool]:
-    return {"use_liger": False}
-
-
 # re-exported so the child-render helpers stay reachable as `sft_train.<name>`: the other
 # trainers import `_hydra_val` from here, and the sft tests import the renderers.
 # the runner resolves patched seams through this parent module at call time, so these imports must
@@ -394,10 +393,7 @@ from flash.engine.worker.train.sft.setup.checkpoints import (  # noqa: E402,F401
 )
 from flash.engine.worker.train.sft.setup.config import (  # noqa: E402,F401
     _REQUIRED_OVERRIDE_KEYS,
-    _VERL_OPTIMIZER_IMPL,
-    _VERL_OPTIMIZER_NAME,
     _hydra_val,
-    _optimizer_override_config,
     _render_sft_dataset_module,
     _sft_parquet_features,
     _write_sft_parquet,
@@ -430,7 +426,7 @@ def _write_sft_result(options, data, model, child, progress, verified, outputs) 
         "sft_trained",
         train_wall=train_wall,
         step=verified.final_step,
-        gpu=_worker_perf.gpu_diagnostics(include_torch=False),
+        gpu=_worker_perf.gpu_diagnostics(),
     )
     _worker_finalize.write_train_meta(
         phase="sft",
@@ -446,7 +442,6 @@ def _write_sft_result(options, data, model, child, progress, verified, outputs) 
             "resumed": bool(child.resume_step),
             "warm_started": bool(model.warmstart_adapter),
             "download_seconds": model.download_seconds,
-            "hf_transfer": os.environ.get("HF_HUB_ENABLE_HF_TRANSFER", ""),
             "thinking": _worker_state.THINKING,
             "multimodal": data.multimodal,
             "gradient_checkpointing": model.gradient_checkpointing,

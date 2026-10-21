@@ -8,15 +8,19 @@ import asyncio
 import os
 import uuid
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import modal
 
+from flash.schema import parse_checkpoint_ref
 from flash.serving.app.timeouts import (
     REQUEST_TIMEOUT_SECONDS,
     ROUTER_TIMEOUT_SECONDS,
     STARTUP_TIMEOUT_SECONDS,
 )
+
+if TYPE_CHECKING:
+    from flash.serving.src.accounting.usage import AuthorizedTraffic
 
 try:
     from dotenv import load_dotenv
@@ -98,37 +102,9 @@ HOSTING_CACHE_MOUNT = "/vol/hosting-cache"
 # doesn't; there is nothing to tune at deploy time. Every value is the proven default. (The wiring
 # below — HF/internal key, backend + Supabase URLs — stays env-configured because it is per-deploy
 # credentials, not tuning.)
-# Maximum idle window before a gpu model container scales down, PER GPU TIER.
-#
-# Sizing rule: an idle container bills at the full GPU rate, so holding one is only worth it while
-# waiting costs less than re-paying the cold boot. Boot is a fixed cost (weights + torch.compile +
-# graph capture + warmup); idle is a rate. The break-even idle window is therefore ~the tier's own
-# cold-boot time — hold roughly as long as a restart would cost, then release the card.
-#
-# A single flat 1800s applied that same 30-minute hold to every tier, so a cheap L4 that boots in
-# ~60s still burned 30 GPU-minutes after its last request. Per Modal's rates the idle tax per cold
-# wake was $0.40 (L4) / $0.97 (L40S) / $1.98 (H100) / $2.27 (H200) regardless of how much work the
-# request did.
-#
-# The H200 keeps a LONGER hold than break-even alone would suggest: the 35B's boot is ~1010s of
-# engine init (67 GiB of weights + ~377s torch.compile + graph capture), so a miss is a ~17-minute
-# user-visible stall. Cost and latency point the same way there, and the window stays at 1800s.
-SCALEDOWN_WINDOW_SECONDS_BY_GPU: dict[str, int] = {
-    # ~60s cold boot (small FP8 checkpoints, cached compile artifacts on the shared volume).
-    "L4": 300,
-    # ~120s cold boot (9B FP8 at 32k).
-    "L40S": 420,
-    # ~400s cold boot (27B FP8 at 32k, graph capture).
-    "H100": 900,
-    # ~1010s cold boot (35B bf16, 67 GiB + ~377s torch.compile). Break-even AND a ~17-min
-    # user-visible stall on a miss both argue for keeping the full window here.
-    "H200": 1800,
-    # B200 now carries all three tiers. Measured cold boots (2026-08-30/31, this card): 9B 723s,
-    # 35B 488s, 27B 1821s. The 27B dominates because a cold torch.compile cache costs ~354s of
-    # Dynamo alone; warm-cache boots of the same tiers run 153-473s. Sized to the slowest MEASURED
-    # cold boot rather than the warm case, so a scale-out replacement is not cycled mid-boot.
-    "B200": 2100,
-}
+# all hosted engines use b200. the slowest measured cold boot is 1821s (27b); retain
+# its 2100s idle window so warm replicas survive normal gaps between requests.
+SCALEDOWN_WINDOW_SECONDS_BY_GPU: dict[str, int] = {"B200": 2100}
 # The tiers this app is allowed to run an engine on. `gpu` in the serving catalog is a plain string,
 # so a typo ("b200", "B2OO") or an unvalidated new card used to fall through `dict.get` to a default
 # window and deploy anyway, at that card's real hourly rate. Membership here is the one gate.
@@ -280,6 +256,9 @@ image = (
             # Production and development share HF_CACHE_VOLUME_NAME but Modal environment isolation
             # namespaces the volume, so the two deployments cannot read each other's entries.
             "VLLM_CACHE_ROOT": f"{HOSTING_CACHE_MOUNT}/vllm",
+            # FlashInfer derives its JIT workspace from this separate root, not VLLM_CACHE_ROOT.
+            # Persist compiled kernels across scale-to-zero restarts, as customer-owned serving does.
+            "FLASHINFER_WORKSPACE_BASE": f"{HOSTING_CACHE_MOUNT}/flashinfer",
             # Disable the HF Xet/CAS checkpoint-download path. It intermittently fails engine init
             # with "CAS Client Error: Format error: I/O error: error decoding response body"
             # (huggingface_hub xet_get inside vLLM download_weights_from_hf) and crash-looped 27B FP8
@@ -423,10 +402,10 @@ def _build_engine(
         async def unregister(
             self,
             org_id: str,
-            adapter_id: str,
+            model_id: str,
             expected_generation: str | None = None,
         ) -> dict[str, Any]:
-            return await self._unregister(org_id, adapter_id, expected_generation)
+            return await self._unregister(org_id, model_id, expected_generation)
 
         @modal.method()
         def health(self) -> dict[str, Any]:
@@ -508,7 +487,7 @@ class _ModalEnginePool:
             raise RuntimeError("generation id is required before modal dispatch")
         engine = _engine_cls_for(base_model)(base_model=base_model)
         return await engine.generate.remote.aio(
-            payload.model_dump(by_alias=True),
+            payload.model_dump(),
             self._record_payload(record),
             expected_checkpoint,
             generation_id,
@@ -527,7 +506,7 @@ class _ModalEnginePool:
             raise RuntimeError("generation id is required before modal dispatch")
         engine = _engine_cls_for(base_model)(base_model=base_model)
         remote_stream = engine.stream_generate.remote_gen.aio(
-            payload.model_dump(by_alias=True),
+            payload.model_dump(),
             self._record_payload(record),
             expected_checkpoint,
             generation_id,
@@ -551,11 +530,11 @@ class _ModalEnginePool:
         self,
         base_model: str,
         org_id: str,
-        adapter_id: str,
+        model_id: str,
         expected_generation: str | None = None,
     ) -> None:
         engine = _engine_cls_for(base_model)(base_model=base_model)
-        await engine.unregister.remote.aio(org_id, adapter_id, expected_generation)
+        await engine.unregister.remote.aio(org_id, model_id, expected_generation)
 
 
 def _build_usage_outbox(settings: Any) -> Any:
@@ -570,7 +549,7 @@ def _build_usage_outbox(settings: Any) -> Any:
 
 # Short-TTL positive-authorization cache + single-flight for the serving->backend authorize call.
 # That call runs on EVERY external chat request; an eval fires many requests with the SAME
-# (api_key, adapter_id), so without this a thundering herd of identical auth lookups stampedes the
+# (api_key, model_id), so without this a thundering herd of identical auth lookups stampedes the
 # backend's Supabase auth path — it 5xx's under the load, which the caller sees as a serving error
 # (the intermittent HTTP 502 burst observed under concurrent evals). Coalescing concurrent identical
 # lookups into ONE backend call and reusing a SUCCESSFUL result for a short window removes that
@@ -581,32 +560,30 @@ _AUTH_CACHE_TTL_SECONDS = 60.0
 _AUTH_CACHE_MAX_ENTRIES = 4096
 
 
-def _authorize_response_org(resp: Any) -> "str | None":
-    """Translate the backend's authorize response into a billing org, or raise.
-
-    Extracted from _build_chat_authorizer only to keep that closure under the repo's
-    function-size limit; it reads nothing but the response, so hoisting it changes no
-    behaviour and makes each status mapping testable on its own.
-    """
+def _authorize_response(resp: Any, model_id: str) -> "AuthorizedTraffic":
+    """Return the approved billing org and checkpoint generation, or fail closed."""
     from fastapi import HTTPException, status
 
+    from flash.serving.src.accounting.usage import AuthorizedTraffic, principal_for_external_org
+
     if resp.status_code == 200:
-        # Return the authorized billing org so the router can meter a base-model serve to the
-        # caller (a base model has no adapter owner). A malformed response cannot authorize an
-        # external request because that would let base-model usage escape billing.
+        # Bind billing and checkpoint dispatch to the same backend authorization.
         try:
-            org_id = resp.json().get("orgId")
+            body = resp.json()
+            org_id = body.get("orgId")
+            if not isinstance(org_id, str) or not org_id.strip():
+                raise ValueError("missing billing organization")
+            generation = body.get("deploymentGeneration")
+            if parse_checkpoint_ref(model_id) is not None and (
+                not isinstance(generation, str) or not generation.strip()
+            ):
+                raise ValueError("missing verified checkpoint generation")
         except Exception as exc:
             raise HTTPException(
                 status.HTTP_503_SERVICE_UNAVAILABLE,
                 "serving auth backend returned malformed response",
             ) from exc
-        if not isinstance(org_id, str) or not org_id:
-            raise HTTPException(
-                status.HTTP_503_SERVICE_UNAVAILABLE,
-                "serving auth backend returned malformed response",
-            )
-        return org_id
+        return AuthorizedTraffic(principal_for_external_org(org_id), generation)
     if resp.status_code == 401:
         # The backend returns 401 for BOTH an invalid *user* key (our authorize route, body
         # code "invalid_api_key") AND a rejected serving *machine* bearer (require_internal_token,
@@ -644,7 +621,7 @@ def _authorize_response_org(resp: Any) -> "str | None":
 def _build_chat_authorizer(settings: Any) -> Any:
     """Build the serving->backend chat authorizer, or None when not configured.
 
-    Returns an async ``authorize(api_key, adapter_id)`` that POSTs to the backend's
+    Returns an async ``authorize(api_key, model_id)`` that POSTs to the backend's
     ``/api/serving/authorize`` (authenticated with the shared internal key) and raises an
     ``HTTPException`` (401/402/403/503) when the Freesolo API key's org does not own the adapter or
     the backend can't be reached. Shares one persistent ``httpx.AsyncClient`` to keep the backend
@@ -652,7 +629,7 @@ def _build_chat_authorizer(settings: Any) -> Any:
     real deployment (backend URL + internal key) — when it returns None, non-internal chat fails
     closed (503).
 
-    Successful authorizations are cached per API-key digest and adapter ID for
+    Successful base-model authorizations are cached per API-key digest and model ID for
     ``_AUTH_CACHE_TTL_SECONDS`` and concurrent identical lookups are coalesced into a single backend
     call, so an eval's many same-key requests don't stampede the backend auth path into transient
     5xx failures. Any backend 5xx maps to a retryable 503 (never a 502) so it isn't read as a
@@ -672,19 +649,19 @@ def _build_chat_authorizer(settings: Any) -> Any:
 
     _client = httpx.AsyncClient(timeout=10.0, headers={"Authorization": f"Bearer {key}"})
 
-    # (api_key_sha256, adapter_id) -> (expires_at_monotonic, org_id); populated only on a successful
-    # authorization. Per-router-container in-memory (each container reduces its own backend load).
-    _cache: dict[tuple[str, str, str], tuple[float, str | None]] = {}
+    # (api_key_sha256, model_id, scope_digest) -> (expires_at_monotonic, authorization).
+    # Only successful authorizations are cached, per router container.
+    _cache: dict[tuple[str, str, str], tuple[float, AuthorizedTraffic]] = {}
     # In-flight single-flight tasks so concurrent identical misses share ONE backend call.
-    _inflight: dict[tuple[str, str, str], asyncio.Task[str | None]] = {}
+    _inflight: dict[tuple[str, str, str], asyncio.Task[AuthorizedTraffic]] = {}
 
     async def _authorize_backend(
-        api_key: str, adapter_id: str, scope: "dict[str, str]"
-    ) -> "str | None":
+        api_key: str, model_id: str, scope: "dict[str, str]"
+    ) -> "AuthorizedTraffic":
         try:
             resp = await _client.post(
                 url,
-                json={"apiKey": api_key, "modelId": adapter_id},
+                json={"apiKey": api_key, "modelId": model_id},
                 # A training container authenticates with the platform internal key rather
                 # than a customer key, so the backend cannot resolve it via
                 # authenticate_api_key. It identifies the calling job from these headers and
@@ -697,7 +674,7 @@ def _build_chat_authorizer(settings: Any) -> Any:
             raise HTTPException(
                 status.HTTP_503_SERVICE_UNAVAILABLE, "serving auth backend unreachable"
             ) from exc
-        return _authorize_response_org(resp)
+        return _authorize_response(resp, model_id)
 
     def _prune(now: float) -> None:
         for expired in [k for k, (exp, _) in _cache.items() if exp <= now]:
@@ -708,25 +685,30 @@ def _build_chat_authorizer(settings: Any) -> Any:
                 _cache.pop(k, None)
 
     async def _authorize_and_cache(
-        ck: tuple[str, str, str], api_key: str, adapter_id: str, scope: "dict[str, str]"
-    ) -> "str | None":
+        ck: tuple[str, str, str], api_key: str, model_id: str, scope: "dict[str, str]"
+    ) -> "AuthorizedTraffic":
         try:
-            org = await _authorize_backend(api_key, adapter_id, scope)
+            authorization = await _authorize_backend(api_key, model_id, scope)
         finally:
             # Drop the single-flight slot regardless of outcome so a failed lookup re-checks next
             # time (failures are never cached) and a success can be re-driven once the cache expires.
             _inflight.pop(ck, None)
         now = time.monotonic()
         # Cache the ALLOW only — reached iff _authorize_backend did not raise above.
-        _cache[ck] = (now + _AUTH_CACHE_TTL_SECONDS, org)
+        _cache[ck] = (now + _AUTH_CACHE_TTL_SECONDS, authorization)
         _prune(now)
-        return org
+        return authorization
 
     async def authorize(
-        api_key: str, adapter_id: str, scope: "dict[str, str] | None" = None
-    ) -> "str | None":
+        api_key: str, model_id: str, scope: "dict[str, str] | None" = None
+    ) -> "AuthorizedTraffic":
         # do not retain raw user credentials as live dict keys beyond the request that supplied them.
         scope = scope or {}
+
+        # A checkpoint can be disabled and reloaded within the positive-auth TTL.
+        # Always recheck its verified generation; base-model authorization remains cached.
+        if parse_checkpoint_ref(model_id) is not None:
+            return await _authorize_backend(api_key, model_id, scope)
         # The scope is part of the key, not just the payload. Every training container presents
         # the SAME platform internal key, so keying on (key, model) alone would let one job's
         # cached authorization answer another job's request -- and the cached value is the
@@ -734,7 +716,7 @@ def _build_chat_authorizer(settings: Any) -> Any:
         scope_digest = hashlib.sha256(
             "\x00".join(f"{k}={scope[k]}" for k in sorted(scope)).encode("utf-8")
         ).hexdigest()
-        ck = (hashlib.sha256(api_key.encode("utf-8")).hexdigest(), adapter_id, scope_digest)
+        ck = (hashlib.sha256(api_key.encode("utf-8")).hexdigest(), model_id, scope_digest)
         cached = _cache.get(ck)
         now = time.monotonic()
         if cached is not None:
@@ -743,7 +725,7 @@ def _build_chat_authorizer(settings: Any) -> Any:
             _cache.pop(ck, None)
         task = _inflight.get(ck)
         if task is None:
-            task = asyncio.ensure_future(_authorize_and_cache(ck, api_key, adapter_id, scope))
+            task = asyncio.ensure_future(_authorize_and_cache(ck, api_key, model_id, scope))
             # Retrieve the task's outcome even if every awaiter is cancelled (all identical clients
             # disconnect), so an orphaned single-flight failure doesn't warn "exception never retrieved".
             task.add_done_callback(lambda t: t.cancelled() or t.exception())
@@ -767,7 +749,7 @@ def _base_model_records() -> list:
 
     return [
         AdapterRecord(
-            adapter_id=m,
+            model_id=m,
             repo_id=m,
             base_model=m,
             serve_base_model=True,
@@ -811,7 +793,7 @@ def router():
         deployment_id=settings.deployment_id,
         # Reload on a routing miss so a stale router still resolves a just-registered adapter.
         reload_records=lambda: load_adapters(settings) + _base_model_records(),
-        lookup_record=lambda org_id, adapter_id: get_adapter(org_id, adapter_id, settings),
+        lookup_record=lambda org_id, model_id: get_adapter(org_id, model_id, settings),
         reload_interval_seconds=cfg.RELOAD_INTERVAL_SECONDS,
         # durable capture is required in configured serving deployments.
         usage_store=_build_usage_outbox(settings),

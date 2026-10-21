@@ -15,6 +15,7 @@ carry a credential, a response body, or any part of a request payload.
 
 from __future__ import annotations
 
+import math
 import re
 from dataclasses import dataclass
 from typing import Any
@@ -50,7 +51,8 @@ def _number(value: Any) -> float | None:
     """
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return None
-    return float(value)
+    value = float(value)
+    return value if math.isfinite(value) and value >= 0 else None
 
 
 HEALTH_MALFORMED = "health_malformed"
@@ -67,6 +69,7 @@ STREAM_NO_DONE = "stream_no_done_sentinel"
 
 ACCOUNTING_MALFORMED = "accounting_malformed"
 ACCOUNTING_STALLED = "accounting_stalled"
+ACCOUNTING_UNSETTLED = "accounting_canary_unsettled"
 
 
 @dataclass(frozen=True)
@@ -178,24 +181,9 @@ def verify_stream(evidence: StreamEvidence) -> PromotionVerdict:
 
 @dataclass(frozen=True)
 class AccountingEvidence:
-    """The backlog counters this release's outbox reports.
+    """global stall signals plus durable settlement of this release's exact canary scope."""
 
-    This is a WHOLE-DEPLOYMENT view, not a per-request one. `serving_usage_backlog_snapshot` is the
-    only durable accounting surface the router exposes, and it aggregates across every generation in
-    flight. There is no RPC that reads back one row by correlation id, so the canary's own row is not
-    individually observable from here.
-    """
-
-    # Only the two STALL signals are held. `pending` and `leased` were carried by the first
-    # revision, which asserted a drained backlog; review narrowed the claim to what a
-    # deployment-wide snapshot can actually support, and those two counters became unread. Keeping
-    # them would be worse than useless: a field that is parsed and required but never consulted
-    # cannot be verified by any test, so it silently exempts itself from the suite.
-    #
-    # `float` rather than `int` because postgres numerics arrive as JSON floats and `float` already
-    # admits `int`. `oldest_undelivered_age_seconds` in particular is derived with
-    # `EXTRACT(EPOCH FROM ...)`, so a fractional value is the NORMAL shape, not a malformed one.
-    # Neither reading needs integrality: both are threshold comparisons.
+    canary_settled: bool
     expired_leases: float
     oldest_undelivered_age_seconds: float | None
 
@@ -215,7 +203,7 @@ class AccountingEvidence:
 
 
 def parse_accounting(payload: Any) -> AccountingEvidence | None:
-    """Read a `serving_usage_backlog_snapshot` body, or None when it is not one.
+    """Read a `serving_promotion_accounting_snapshot` body, or None when it is not one.
 
     Parsing the RPC body directly -- rather than an `OutboxSnapshot` built from it -- is deliberate.
     `DurableUsageOutbox.snapshot` coerces every absent counter with `int(... or 0)`, which is right
@@ -242,20 +230,22 @@ def parse_accounting(payload: Any) -> AccountingEvidence | None:
     age = None if raw_age is None else _number(raw_age)
     if raw_age is not None and age is None:
         return None
-    return AccountingEvidence(expired_leases=expired_leases, oldest_undelivered_age_seconds=age)
+    settled = payload.get("canary_settled")
+    if not isinstance(settled, bool):
+        return None
+    return AccountingEvidence(
+        canary_settled=settled,
+        expired_leases=expired_leases,
+        oldest_undelivered_age_seconds=age,
+    )
 
 
 def verify_accounting(evidence: AccountingEvidence | None) -> PromotionVerdict:
-    """This release's durable delivery loop is running, not wedged.
-
-    Deliberately NOT "the canary's own row settled": the snapshot cannot express that. Asserting a
-    zero backlog would be both fail-open and flaky on a live deployment -- unrelated traffic can
-    drain the counters to zero while the canary's own row is stuck, and can equally hold them
-    nonzero while everything is healthy. Stall signals are the part of this snapshot that means the
-    same thing no matter whose rows are in it.
-    """
+    """require positive canary delivery evidence as well as absence of backlog stalls."""
     if evidence is None:
         return _fail(ACCOUNTING_MALFORMED)
     if evidence.stalled:
         return _fail(ACCOUNTING_STALLED)
+    if not evidence.canary_settled:
+        return _fail(ACCOUNTING_UNSETTLED)
     return PASS

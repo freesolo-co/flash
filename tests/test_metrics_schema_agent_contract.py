@@ -44,7 +44,6 @@ _SFT_NOTES = {
     "epochs": 2,
     "resumed": False,
     "download_seconds": 12.0,
-    "hf_transfer": "1",
     "thinking": False,
     "loss_curve": [2.1, 1.6, 1.2],
     **_WANDB_NOTES,
@@ -54,7 +53,6 @@ _RL_NOTES = {
     "steps": 150,
     "resumed": False,
     "download_seconds": 12.0,
-    "hf_transfer": "1",
     "reward_history": [0.1, 0.3, 0.55],
     "loss_curve": [1.0, 0.8],
     **_WANDB_NOTES,
@@ -74,7 +72,7 @@ def _run_metrics_with_notes(phase: str, notes: dict) -> dict:
     serialized to a dict, with the phase notes folded into `notes`. This mirrors the
     final metrics.json the control plane persists and the consumers read."""
     m = RunMetrics(
-        arm="runpod",
+        arm="modal",
         phase=phase,
         seed=0,
         model_id="Qwen/Qwen3.5-9B",

@@ -346,27 +346,16 @@ class _OpdVerlCheckpointWatcher(_VerlCheckpointWatcher):
         # `_stage_retry_contract` above has already copied from it and the resume state references it.
         self.lifecycle.mark_staged(step)
 
-        def publish_required_adapter() -> None:
-            if step in self.required_steps:
-                # opd publishes only required steps, and a required publish raises rather than
-                # returning None, so reaching the next line IS the durable fact. sft needs a
-                # returned-subfolder check because its `required` varies per step.
-                _worker_hf.publish_deployable_checkpoint(
-                    adapter_dir,
-                    step,
-                    required=True,
-                    _provenance_ready=True,
-                )
-                self.lifecycle.mark_deployable_published(step)
-
+        if step in self.required_steps:
+            published = _worker_hf.publish_deployable_checkpoint(
+                adapter_dir, step, required=True, _provenance_ready=True
+            )
+            self.lifecycle.record_publication(step, published)
         uploaded = _worker_hf.upload_resume_checkpoint(
-            step,
-            checkpoint_dir,
-            before_upload=publish_required_adapter,
-            # the callback, not the return value: see mark_resume_uploaded's contract.
-            after_upload=lambda: self.lifecycle.mark_resume_uploaded(step),
+            step, checkpoint_dir, final_step=self.final_step
         )
-        if step in self.required_steps and not uploaded:
+        self.lifecycle.record_publication(step, uploaded)
+        if step in self.required_steps and uploaded.resume is None and not uploaded.resume_staged:
             self.lifecycle.mark_failed(step)
             resume_upload_unavailable(step, checkpoint_dir, job_label="opd")
 

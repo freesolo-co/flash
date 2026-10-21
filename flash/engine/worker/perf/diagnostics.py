@@ -122,33 +122,9 @@ def _query_nvidia_processes() -> list[dict]:
     return sorted(rows, key=lambda r: float(r.get("used_memory_gb") or 0.0), reverse=True)[:8]
 
 
-def gpu_diagnostics(include_torch: bool = True) -> dict:
-    """Collect live CUDA/GPU telemetry for run logs and status."""
+def gpu_diagnostics() -> dict:
+    """Collect device telemetry without importing torch or creating a CUDA context."""
     diag = {}
-    if include_torch:
-        try:
-            import torch
-
-            diag["torch"] = torch.__version__
-            diag["torch_cuda"] = torch.version.cuda
-            diag["cuda_available"] = torch.cuda.is_available()
-            try:
-                diag["device_count"] = torch.cuda.device_count()
-                if torch.cuda.is_available():
-                    diag["device_name"] = torch.cuda.get_device_name(0)
-                    free, total = torch.cuda.mem_get_info()
-                    diag["torch_memory_free_gb"] = round(free / (1024**3), 3)
-                    diag["torch_memory_total_gb"] = round(total / (1024**3), 3)
-                    diag["torch_memory_allocated_gb"] = round(
-                        torch.cuda.memory_allocated() / (1024**3), 3
-                    )
-                    diag["torch_memory_reserved_gb"] = round(
-                        torch.cuda.memory_reserved() / (1024**3), 3
-                    )
-            except Exception as e:
-                diag["device_query_err"] = str(e)[:160]
-        except Exception as e:
-            diag["torch_import_err"] = str(e)[:160]
     try:
         diag.update(_query_nvidia_gpu())
         processes = _query_nvidia_processes()
