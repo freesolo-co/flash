@@ -46,6 +46,35 @@ def test_queue_wait_uses_capacity_budget_not_worker_liveness(polling):
     assert 1800 < clock[0] - 100 < 1900
 
 
+def test_shutdown_of_reattached_poll_preserves_worker(monkeypatch, polling):
+    import threading
+
+    from flash._internal.background import Supervisor
+    from flash.providers.modal.provider import PROVIDER
+
+    _, _, _, handle, spec = polling
+    observed = threading.Event()
+    monkeypatch.setattr(
+        api, "get_instance", lambda *a, **kw: observed.set() or {"status": "pending"}
+    )
+    monkeypatch.setattr(api, "terminate", lambda *_: pytest.fail("shutdown destroyed worker"))
+    monkeypatch.setattr(
+        "flash.providers.modal.checkpoint_upload.cleanup",
+        lambda *_: pytest.fail("shutdown destroyed checkpoint uploads"),
+    )
+    owner = Supervisor()
+    try:
+        owner.submit(
+            ("run", spec.run_id),
+            "training",
+            lambda: PROVIDER.poll_attempt(handle, spec, _deadline_at=10000),
+        )
+        assert observed.wait(1)
+        assert owner.close(1), "shutdown must interrupt the reattached poll's wait"
+    finally:
+        owner.close(1)
+
+
 @pytest.mark.parametrize("reattach", [False, True])
 def test_long_queue_then_bootstrap_can_finish_with_queue_excluded_from_cost(
     monkeypatch, polling, reattach

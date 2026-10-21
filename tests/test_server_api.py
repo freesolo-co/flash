@@ -5924,7 +5924,7 @@ def test_recover_runs_defers_resubmit_when_instance_not_confirmed_reaped(monkeyp
     monkeypatch.setattr(providers_mod, "configured_providers", lambda: [_FakeVast()])
     # Disable the background retry budget so the defer is a clean no-op for this assertion (no lingering
     # daemon thread polling a torn-down tmp db); the reschedule behavior has its own test below.
-    monkeypatch.setattr(rt, "_deferred_resubmit_loop", lambda _spec: None)
+    monkeypatch.setattr(rt, "_reconcile_handleless_run", lambda _spec: None)
 
     server_runtime.recover_runs()
 
@@ -5978,7 +5978,7 @@ def test_recover_runs_defers_when_recorded_provider_unconfigurable(monkeypatch, 
     # still exposes run_instances_remaining, so the recorded-but-unconfigurable provider can't be
     # enumerated -> the guard must fail closed rather than declare clear.
     monkeypatch.setattr(providers_mod, "configured_providers", list)
-    monkeypatch.setattr(rt, "_deferred_resubmit_loop", lambda _spec: None)
+    monkeypatch.setattr(rt, "_reconcile_handleless_run", lambda _spec: None)
 
     server_runtime.recover_runs()
 
@@ -6039,7 +6039,7 @@ def test_recover_runs_resubmits_queued_run_despite_unconfigurable_vast(monkeypat
     # queued run must resubmit anyway, because it provably never created the phantom the guard protects
     # against. _confirm_run_clear must not even be consulted (Vast enumeration would raise/defer).
     monkeypatch.setattr(providers_mod, "configured_providers", list)
-    monkeypatch.setattr(rt, "_deferred_resubmit_loop", lambda _spec: None)
+    monkeypatch.setattr(rt, "_reconcile_handleless_run", lambda _spec: None)
 
     server_runtime.recover_runs()
 

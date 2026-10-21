@@ -469,6 +469,17 @@ def stub_serving_registry(monkeypatch):
     return _stub
 
 
+@pytest.fixture(autouse=True)
+def background_supervisor(monkeypatch):
+    """Each test owns and drains its background work before its patched dependencies disappear."""
+    from flash._internal.background import Supervisor
+
+    owner = Supervisor()
+    with owner.bind():
+        yield owner
+    owner.close(1.0)
+
+
 @pytest.fixture
 def worker_context():
     from flash.engine.worker.runtime.state import WorkerContext

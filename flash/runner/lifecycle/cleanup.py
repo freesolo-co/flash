@@ -383,10 +383,12 @@ def _drain_cleanup_remotes(run_id: str) -> set[tuple]:
     attempted = set()
     if not records:
         return attempted
+    from flash._internal.background import checkpoint
     from flash.providers.core.base import JobHandle
     from flash.runner.supervise.recovery import _strict_teardown_handle
 
     for record in records:
+        checkpoint()
         identity = _remote_resource_identity(record) or _uncanonical_cleanup_remote_key(record)
         if identity is None:
             continue
