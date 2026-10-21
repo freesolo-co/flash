@@ -85,9 +85,9 @@ def test_ray_num_cpus_prefers_the_cgroup_quota_over_the_host_core_count():
 def test_ray_num_cpus_falls_back_to_affinity_when_no_quota_is_set():
     with (
         mock.patch.object(vc, "_cgroup_cpu_quota", return_value=None),
-        mock.patch.object(os, "sched_getaffinity", return_value=set(range(6)), create=True),
+        mock.patch.object(os, "sched_getaffinity", return_value=set(range(8)), create=True),
     ):
-        assert vc.ray_num_cpus() == 6
+        assert vc.ray_num_cpus() == 8
 
 
 def test_ray_num_cpus_caps_an_unconstrained_host():
@@ -160,8 +160,8 @@ def test_an_uncapped_v2_controller_does_not_fall_through_to_v1(tmp_path):
 
 def test_ray_cpu_floor_clears_what_verl_actually_reserves():
     # prevent the opposite hang: verl waits forever for a placement group with too few CPUs.
-    # a 1-GPU OPD pod needs five CPUs: three worker bundles, TaskRunner, and one storage unit.
-    verl_peak_cpu_demand = 3 + 1 + 1
+    # Both RL paths reserve the GPU bundle, TaskRunner, storage unit, and queue controller.
+    verl_peak_cpu_demand = 3 + 1 + 1 + 1 + 1
     assert vc.verl_cpu_demand(1) == verl_peak_cpu_demand
     with (
         mock.patch.object(vc, "_cgroup_cpu_quota", return_value=None),
@@ -182,9 +182,9 @@ def test_a_small_cgroup_quota_still_clears_verls_placement_group():
 
 def test_the_cpu_pool_scales_with_gpu_count():
     # verl requests one bundle PER GPU under STRICT_PACK, so demand grows with the job. flash allows
-    # up to 8 gpus (spec.py _MAX_GPU_COUNT), which needs 26 cpus -- above the 16 cap. capping there
+    # up to 8 gpus (spec.py _MAX_GPU_COUNT), which needs 28 cpus -- above the 16 cap. capping there
     # would hang every large job on a rented, billing gpu.
-    assert vc.verl_cpu_demand(8) == 8 * 3 + 2
+    assert vc.verl_cpu_demand(8) == 8 * 3 + 4
     with (
         mock.patch.object(vc, "_cgroup_cpu_quota", return_value=None),
         mock.patch.object(os, "sched_getaffinity", return_value=set(range(48)), create=True),
@@ -538,7 +538,7 @@ def test_provisioned_venv_can_import_the_entrypoints_flash_launches(monkeypatch,
             f"verl must install its exact direct dependency {requirement}"
         )
     # opd's entrypoint calls tq.init()/tq.close() and verl's setup.py omits TransferQueue.
-    assert "TransferQueue==0.1.7" in install
+    assert "TransferQueue==0.1.11" in install
 
 
 def test_provisioned_venv_gets_flash_attn_for_the_remove_padding_path(monkeypatch, tmp_path):

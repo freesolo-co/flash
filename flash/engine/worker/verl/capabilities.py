@@ -458,7 +458,7 @@ def resolve_verl_python(workdir: str, *, install_wandb: bool = False) -> str:
                 "uvicorn==0.52.4",
                 "fastapi==0.141.1",
                 # opd's entrypoint calls tq.init()/tq.close(); absent from verl's setup.py.
-                "TransferQueue==0.1.7",
+                "TransferQueue==0.1.11",
                 # older raises AttributeError on PyArrow PyExtensionType.
                 "datasets==5.0.1",
                 "qwen-vl-utils==0.0.14",

@@ -433,15 +433,23 @@ def _cgroup_cpu_quota() -> int | None:
 # ResourcePoolManager defaults max_colocate_count to 3 (base.py:189).
 _VERL_CPU_PER_GPU_BUNDLE = 3
 # plus the singletons outside the bundles: TaskRunner is ray.remote(num_cpus=1) (main_ppo.py:83),
-# and opd adds one storage unit.
-_VERL_CPU_OVERHEAD = 2
+# and both RL paths add a storage unit plus the TransferQueue controller. One additional CPU
+# remains available to schedule upstream's default Ray actors (one CPU during creation, zero
+# while running), since their startup cannot borrow CPUs reserved inside GPU bundles.
+_VERL_CPU_OVERHEAD = 4
+
+
+def transfer_queue_overrides() -> list[str]:
+    """Both single-node RL trainers share one storage unit and one controller."""
+    return ["transfer_queue.backend.SimpleStorage.num_data_storage_units=1"]
 
 
 def verl_cpu_demand(gpu_count: int) -> int:
     """cpus verl's placement group needs for ``gpu_count`` gpus, read off the verl source.
 
-    the bundles are requested STRICT_PACK, so this is a single-node demand: 8 gpus want 26 cpus on
-    one box, not spread over several.
+    the bundles are requested STRICT_PACK, so this is a single-node demand: 8 gpus want 28 cpus on
+    one box, not spread over several. The task runner, storage unit, and queue controller
+    each reserve one additional CPU outside the GPU bundles; actor creation needs one free CPU.
     """
     return max(1, gpu_count) * _VERL_CPU_PER_GPU_BUNDLE + _VERL_CPU_OVERHEAD
 

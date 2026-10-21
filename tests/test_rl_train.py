@@ -704,6 +704,13 @@ def _overrides_cfg(**over):
     return cfg
 
 
+def test_grpo_bounds_transfer_queue_storage_to_the_single_node_cpu_budget():
+    overrides = dict(
+        value.split("=", 1) for value in rl_verl.build_verl_overrides(_overrides_cfg())
+    )
+    assert overrides["transfer_queue.backend.SimpleStorage.num_data_storage_units"] == "1"
+
+
 def test_build_verl_overrides_enables_layered_summon_for_fused_expert_targets():
     # end-to-end through the real builder: a fused-expert model must reach verl with the layered
     # weight-sync gather, and must keep load_format=safetensors, which verl requires as

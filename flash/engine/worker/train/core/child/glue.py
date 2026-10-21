@@ -1,8 +1,7 @@
 """child-side multi-turn rollout primitives shared by the OPD and GRPO verl agent loops.
 
-stdlib only at import time. no verl import and no flash import, so the parent can copy this file
-into a verl child's workdir the same way it copies the loop modules themselves. image decoding loads
-Pillow only when a validated dynamic image reply arrives.
+The parent and packaged trainer import these primitives directly. Image decoding loads Pillow
+only when a validated dynamic image reply arrives.
 
 everything here is algorithm-neutral: turning an environment reply into the exact tokens the chat
 template would have produced, deciding whether an assistant turn terminated or was truncated, and
@@ -32,9 +31,7 @@ _ALLOWED_MESSAGE_KEYS = frozenset({"role", "content", "reasoning_content"})
 _PROBE_PREFIX = "flash-env-glue-probe"
 # the media block types verl's own dataset parser substitutes for a placeholder, and the exact set
 # it then extracts (rl_dataset.py `_build_messages`: `<image>`/`<video>`/`<audio>` become blocks of
-# the matching type, and `_process_multi_modal_info` returns images, videos, audios). duplicated
-# here as literals rather than imported from flash.content.multimodal because this module is copied
-# into the verl child, where flash is not importable -- see the module docstring.
+# the matching type, and `_process_multi_modal_info` returns images, videos, audios).
 _MEDIA_BLOCK_TYPES = frozenset({"image", "video", "audio"})
 
 
@@ -75,8 +72,7 @@ _WORST_BYTES_PER_PIXEL = max(_MODE_BYTES_PER_PIXEL.values()) + 2 * _RGB_BYTES_PE
 
 # derived from the memory budget rather than chosen independently, matching the parent's
 # `flash.content.multimodal`: a pixel count the decoded-memory guard would always reject is not a
-# limit. this file cannot import flash, so the derivation is repeated rather than shared -- the
-# inputs above are the same, so the two land on the same numbers. there is no cumulative pixel cap
+# limit. there is no cumulative pixel cap
 # for the same reason as the parent: decoded memory depends on mode and order, so no mode-blind
 # total can track it, and the aggregate decoded-byte guard below already bounds it exactly.
 _MAX_IMAGE_PIXELS = _MAX_TOTAL_DECODED_BYTES // _WORST_BYTES_PER_PIXEL

@@ -249,9 +249,9 @@ print('worker stack OK | torch', torch.__version__, '| cudnn', cudnn, '| triton'
 # ---------------------------------------------------------------------------------------------
 # verl venv (GRPO/OPD/SFT verl backends): ISOLATED from the main interpreter on purpose.
 #
-# verl's dependency set CONFLICTS with the worker stack above. verl and TransferQueue declare
-# numpy<2.0.0 while this image's stack resolves numpy>=2, and verl's structured-OPD gate pins
-# xgrammar to exactly 0.1.25 against vLLM's declared >=0.1.32 floor. Resolving verl into the main
+# Flash's structured-OPD gate pins xgrammar to exactly 0.1.25 against vLLM's declared
+# >=0.1.32 floor. The trainer stack is isolated from the worker interpreter so changing its
+# dependency resolution cannot move the main worker's pins. Resolving verl into the main
 # interpreter would move shared pins under every other worker path (peft/transformers/vllm all
 # live there), so verl gets its own venv and flash launches it out-of-process via FLASH_VERL_PYTHON.
 # The venv deliberately re-resolves its own numpy independent of the base interpreter's.
@@ -265,14 +265,13 @@ print('worker stack OK | torch', torch.__version__, '| cudnn', cudnn, '| triton'
 #
 # vLLM is pinned to 0.19.1, matching the base stack above so the image carries ONE vLLM version.
 # Flash pins the tested vLLM and Transformers versions alongside the exact upstream source.
-# The overrides still resolve incompatible metadata in the remaining dependency graph:
-#   verl + transferqueue declare numpy<2.0.0 -> vLLM 0.19.1 needs numpy>=2
-#   vllm declares xgrammar>=0.1.32           -> structured OPD requires exactly 0.1.25
+# The remaining dependency-metadata override is xgrammar: vLLM declares >=0.1.32,
+# while structured OPD requires exactly 0.1.25. Upstream Verl and TransferQueue now support numpy>=2.
 # xgrammar 0.1.25 was exercised against vLLM 0.19.1's own XgrammarBackend (schema compile, grammar
 # build, token-mask fill+apply) so the floor is not required to drive the API.
 #
-# numpy and xgrammar still need uv's --override to resolve conflicting dependency
-# metadata. Repeating exact vllm and transformers pins keeps the baked and fallback
+# xgrammar needs uv's --override to resolve conflicting dependency metadata.
+# Repeating exact numpy, vllm, and transformers pins keeps the baked and fallback
 # training environments aligned. GPU qualification remains required for this runtime.
 #
 # `uv venv` rather than `python -m venv` because the pytorch base image ships no ensurepip, so
@@ -281,7 +280,7 @@ print('worker stack OK | torch', torch.__version__, '| cudnn', cudnn, '| triton'
 # image at /usr/local/bin/uv.
 #
 # Four pins are non-obvious and load-bearing: datasets>=4.7 (older raises AttributeError on PyArrow
-# PyExtensionType), TransferQueue (absent from verl's setup.py, but OPD calls tq.init()/tq.close()),
+# PyExtensionType), TransferQueue 0.1.11 (required by upstream's V1 API, absent from setup.py),
 # transformers<5.13 (see below), and wandb (also absent from verl's setup.py). verl calls wandb.init from THIS interpreter, not
 # flash's, so a job that sets WANDB_API_KEY loses its curves and run link unless wandb is importable
 # in here; resolve_verl_loggers() degrades to console when it is not, which is the right behaviour
@@ -321,7 +320,7 @@ RUN printf '%s\n' "numpy==2.2.6" "xgrammar==0.1.25" "vllm==0.19.1" "transformers
         "numpy==2.2.6" \
         "transformers==5.12.1" \
         "datasets==5.0.1" \
-        "TransferQueue==0.1.7" \
+        "TransferQueue==0.1.11" \
         "qwen-vl-utils==0.0.14" \
         "wandb==0.28.2" \
         "cachetools==7.1.7" "uvicorn==0.52.4" "fastapi==0.141.1" \

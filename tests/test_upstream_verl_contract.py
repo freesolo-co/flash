@@ -47,6 +47,7 @@ def test_production_overrides_validate_with_upstream(algorithm):
         engine = actor.engine
         assert config.trainer.use_v1
         assert config.transfer_queue.enable
+        assert config.transfer_queue.backend.SimpleStorage.num_data_storage_units == 1
         assert config.actor_rollout_ref.rollout.name == "flash_vllm"
     assert isinstance(engine, FlashEngineConfig)
     assert engine.strategy == "flash_fsdp2"

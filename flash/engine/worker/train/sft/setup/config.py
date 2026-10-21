@@ -1,9 +1,8 @@
-"""Render every file and hydra override the verl sft child is launched with.
+"""Render Hydra overrides and parquet data for the packaged SFT trainer.
 
-`build_sft_overrides` turns a resolved config dict into the hydra argv verl's sft trainer takes, and
-the `_render_*`/`render_*` helpers emit the child-side python that goes with it: the dataset module
-that reads flash's parquet. Child runtime patches are installed by the external SFT plugin.
-It is all string and dict construction -- no torch, no subprocess.
+`build_sft_overrides` turns resolved execution settings into upstream trainer configuration.
+The packaged dataset and Flash engine own dataset loading and model policy.
+This module constructs configuration and data without launching a trainer.
 
 Split out of `flash.engine.worker.train.entry.sft_train` to keep that module under the file-size limit.
 """

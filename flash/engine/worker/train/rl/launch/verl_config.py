@@ -26,6 +26,7 @@ from flash.engine.worker.train.entry.backend_common import (
     rollout_resident_overrides,
     rollout_sleep_unsupported,
     trainer_dtype_overrides,
+    transfer_queue_overrides,
 )
 from flash.engine.worker.train.entry.prompt_rows import (
     canonical_prompt_messages,
@@ -432,6 +433,7 @@ def build_verl_overrides(cfg: dict) -> list[str]:
         + _rollout_overrides(cfg)
         + _reward_overrides(cfg)
         + _ray_overrides(cfg)
+        + transfer_queue_overrides()
         + _trainer_overrides(cfg)
     )
     if kl_on:

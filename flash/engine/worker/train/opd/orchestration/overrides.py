@@ -23,6 +23,7 @@ from flash.engine.worker.train.entry.backend_common import (
     rollout_mm_processor_cache_overrides,
     rollout_resident_overrides,
     trainer_dtype_overrides,
+    transfer_queue_overrides,
 )
 from flash.engine.worker.train.entry.sft_train import _build_verl_child_env, _hydra_val
 from flash.engine.worker.verl.capabilities import rollout_max_num_seqs
@@ -234,14 +235,6 @@ def _actor_rollout_overrides(config: dict, *, max_tokens: int) -> list[str]:
     ]
 
 
-def _transfer_queue_overrides() -> list[str]:
-    return [
-        # verl force-enables TransferQueue and waits forever for every cpu bundle.
-        # one storage unit fits flash's single-node trainer regardless of ray cluster sizing.
-        "transfer_queue.backend.SimpleStorage.num_data_storage_units=1",
-    ]
-
-
 def _ray_overrides(config: dict) -> list[str]:
     return [
         # ray autodetects the HOST's cpu count inside a rented pod and eagerly forks one idle worker
@@ -332,7 +325,7 @@ def build_opd_overrides(config: dict) -> list[str]:
         ),
         *_data_runtime_overrides(config),
         *_actor_rollout_overrides(config, max_tokens=max_tokens),
-        *_transfer_queue_overrides(),
+        *transfer_queue_overrides(),
         *_ray_overrides(config),
         *_critic_overrides(),
         *_reward_overrides(config),

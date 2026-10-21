@@ -10,7 +10,7 @@ Each receives `--flash-config <launch.json>` and Hydra overrides. The JSON conta
 
 ## Exact upstream dependency
 
-Both worker installation paths pin unmodified [`verl-project/verl` at `ddf700725c34bb8966685c8ecf5ca36a2cc54a35`](https://github.com/verl-project/verl/commit/ddf700725c34bb8966685c8ecf5ca36a2cc54a35). Its distribution version is `0.10.0.dev0`; the immutable commit, rather than that development version string, identifies the source. This revision supports Flash's Transformers 5.12.1 dependency. Flash also pins vLLM 0.19.1 and TransferQueue 0.1.7 in its worker environments.
+Both worker installation paths pin unmodified [`verl-project/verl` at `ddf700725c34bb8966685c8ecf5ca36a2cc54a35`](https://github.com/verl-project/verl/commit/ddf700725c34bb8966685c8ecf5ca36a2cc54a35). Its distribution version is `0.10.0.dev0`; the immutable commit, rather than that development version string, identifies the source. This revision supports Flash's Transformers 5.12.1 dependency. Flash also pins vLLM 0.19.1 and TransferQueue 0.1.11 in its worker environments.
 
 Before constructing a trainer, `core.child.upstream` checks installed VCS metadata for the official repository and exact commit. An installation from a fork, another revision, or a wheel without VCS provenance fails with a rebuild instruction. `scripts/check_verl_pin_exists.py` checks the installation pins and fetches the commit from upstream.
 

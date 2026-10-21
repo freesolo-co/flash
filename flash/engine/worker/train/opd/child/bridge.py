@@ -1,7 +1,6 @@
 """Teacher-bridge transport and failure reporting for the OPD verl child.
 
-Copied into the isolated verl child workdir as `flash_opd_bridge.py`. Everything here is about
-talking to the parent's localhost bridge and about what to do when that conversation fails: post a
+The packaged child talks to the parent's localhost bridge and handles failed conversations: post a
 json request, classify the error, and drop a fallback file on disk so the parent can attribute the
 child's exit even when the bridge itself is what broke.
 
