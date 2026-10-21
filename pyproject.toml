@@ -75,7 +75,7 @@ server = [
     # source with PIL to validate it. without Pillow a self-hoster on [server] gets
     # `RuntimeError: Pillow is required for multimodal image training` at preflight on any
     # multimodal opd run. the gpu extra gets Pillow transitively via vllm; server does not.
-    "pillow>=11",
+    "pillow>=11.0.0",
 ]
 # The serving app (flash/serving/) that runs inside the GPU container. Kept out of `server` because
 # the control plane never imports it: only the container image and the offline serving tests need
@@ -103,7 +103,7 @@ serving = [
     # `src/multimodal.py` decodes and normalizes inbound images at module scope. the `gpu` extra
     # gets Pillow transitively via vllm, but this extra deliberately excludes vllm, so it has to
     # state Pillow itself.
-    "pillow>=11",
+    "pillow>=11.0.0",
     # imported directly by `src/schemas.py`, `src/serving_io.py` and `src/settings.py`. it does
     # arrive under `pydantic-settings`, but a direct module-scope import should not rely on
     # another package's dependency to keep supplying it.
@@ -156,7 +156,7 @@ dev = [
     # image tests are not optional coverage: without Pillow they importorskip and CI reports green
     # on a multimodal path it never executed. the control plane decodes images too, so `server`
     # declares Pillow as well; this entry keeps the tests runnable without that extra.
-    "pillow>=11",
+    "pillow>=11.0.0",
 ]
 # NB: there is deliberately no `all` aggregate. `gpu` (the GPU worker) and `server` (the control
 # plane) run on separate machines.
@@ -242,7 +242,7 @@ dev = [
     # image tests are not optional coverage: without Pillow they importorskip and CI reports green
     # on a multimodal path it never executed. the control plane decodes images too, so `server`
     # declares Pillow as well; this entry keeps the tests runnable without that extra.
-    "pillow>=11",
+    "pillow>=11.0.0",
     "pytest-xdist>=3.6",
     # tests/test_workflow_contracts.py parses .github/workflows/*.yml. PyYAML is already present
     # transitively (datasets/transformers/huggingface-hub), but a test that imports it directly
