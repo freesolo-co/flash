@@ -593,24 +593,27 @@ def run_sft_train(spec=None) -> None:
     gpu_sampler = _NvidiaSmiPeakSampler().start()
     train_started_at = time.time()
     return_code = 0
-    if child.resume_step < model.update_horizon:
-        child.watcher.start()
-        # check save completeness only after normal training completion. callback failures occur before
-        # return_code assignment; checking anyway would replace the real zero-grad or runtime-patch diagnosis
-        # with a missing-save error. opd_train uses the same guard.
-        training_completed = False
-        try:
-            with liveness_heartbeat(
-                "sft_step",
-                progress=lambda: int(progress["step"] or 0),
-                progress_step=True,
-            ):
-                return_code = _invoke_sft_child(child, callbacks, on_line)
-                training_completed = return_code == 0
-        finally:
-            child.watcher.stop(require_complete=training_completed)
+    try:
+        if child.resume_step < model.update_horizon:
+            child.watcher.start()
+            # check save completeness only after normal training completion. callback failures occur before
+            # return_code assignment; checking anyway would replace the real zero-grad or runtime-patch diagnosis
+            # with a missing-save error. opd_train uses the same guard.
+            training_completed = False
+            try:
+                with liveness_heartbeat(
+                    "sft_step",
+                    progress=lambda: int(progress["step"] or 0),
+                    progress_step=True,
+                ):
+                    return_code = _invoke_sft_child(child, callbacks, on_line)
+                    training_completed = return_code == 0
+            finally:
+                child.watcher.stop(require_complete=training_completed)
+    finally:
+        device_peak_gpu_gb = gpu_sampler.stop_gb()
     train_wall, device_peak_gpu_gb = _finish_sft_child(
-        gpu_sampler, train_started_at, return_code, child_progress
+        device_peak_gpu_gb, train_started_at, return_code, child_progress
     )
     verified = _verify_sft_run(options, data, model, child_progress, child.resume_step)
     actor_dir = verified.actor_dir

@@ -865,13 +865,12 @@ def _record_sft_step_metrics(
 
 
 def _finish_sft_child(
-    gpu_sampler,
+    device_peak_gpu_gb: float,
     train_started_at: float,
     return_code: int,
     progress: _SftProgress,
 ) -> tuple[float, float]:
     train_wall = time.time() - train_started_at
-    device_peak_gpu_gb = gpu_sampler.stop_gb()
     if return_code == SHIM_FRAGMENT_FAILED_EXIT_CODE:
         # permanent, not retriable infra: the same interpreter fails the same fragment on retry.
         raise RuntimeError(
