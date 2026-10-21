@@ -38,7 +38,7 @@ def recover_deployments() -> int:
                 continue
             for checkpoint_id, deployment in status.deployments.items():
                 state = deployment.get("state")
-                if state == "cleanup_pending":
+                if state == "undeploying":
                     recovered += 1  # Already fenced; preserve the original failure.
                     continue
                 if state in _DEPLOYMENT_BUSY_STATES:
@@ -47,11 +47,15 @@ def recover_deployments() -> int:
                     error = "deployment spec is no longer supported"
                 else:
                     continue
-                if state == "queued" and "registration_identity" not in deployment:
+                if (
+                    state == "deploying"
+                    and "registration_identity" not in deployment
+                    and not deployment.get("verification_started_at")
+                ):
                     failed = deployment_state._deployment_state(deployment, "failed", error=error)
                     marked = runner_transitions.mark_deployment_failed(status.run_id, failed)
                 else:
-                    marked = runner_transitions.mark_deployment_cleanup_pending(
+                    marked = runner_transitions.mark_deployment_undeploying(
                         status.run_id, error, checkpoint_id
                     )
                 deployment_state._report_persisted_transition(status, marked, persisted=True)
@@ -80,7 +84,7 @@ def cleanup_recovered_deployments(stop: Event) -> bool:
             for checkpoint_id, deployment in status.deployments.items():
                 if stop.is_set():
                     return pending
-                if deployment.get("state") != "cleanup_pending":
+                if deployment.get("state") != "undeploying":
                     continue
                 org_id = deployment.get("serving_org_id") or run_serving_org_id(status)
                 # Normalize composite errors from records written before causes were separated.
@@ -204,8 +208,9 @@ def _finish_deployment_unlocked(
         nonlocal current
         current = deployment_state._deployment_state(
             {**current, "checkpoint_id": facts.checkpoint_id, "openai_model": facts.checkpoint_id},
-            "smoke_testing",
+            "deploying",
             detail="running bounded fixed-prompt smoke",
+            verification_started_at=time.time(),
         )
         _assert_deployment_fence(run_id, deployment, is_checkpoint, prev_state)
         previous = run_status.get_status(run_id)
@@ -238,7 +243,7 @@ def _finish_deployment_unlocked(
         return
     except Exception as exc:
         if (
-            ("registration_identity" in current or current.get("state") == "smoke_testing")
+            ("registration_identity" in current or current.get("verification_started_at"))
             and not isinstance(exc, RegistrationRejected)
             and not _cleanup_failed_deployment(
                 run_id, deployment["checkpoint_id"], str(deploy_kwargs["org_id"]), exc
@@ -299,7 +304,7 @@ def _cleanup_failed_deployment(
         serving_deploy.undeploy_adapter(checkpoint_id, org_id=org_id, **kwargs)
     except Exception as exc:
         previous = run_status.get_status(run_id)
-        marked = runner_transitions.mark_deployment_cleanup_pending(
+        marked = runner_transitions.mark_deployment_undeploying(
             run_id, str(deployment_error), checkpoint_id=checkpoint_id, cleanup_error=str(exc)
         )
         deployment_state._report_persisted_transition(previous, marked, persisted=True)

@@ -265,3 +265,10 @@ open a public issue.
 ## License
 
 Apache-2.0. See [LICENSE](LICENSE) and [NOTICE](NOTICE).
+
+Checkpoint deployment states are `deploying`, `ready`, `undeploying`, `undeployed`,
+and `failed`. Queueing, loading, and smoke verification happen within `deploying`.
+Removal stays `undeploying` until confirmed, including retries after cleanup errors;
+it never becomes `undeployed` merely because a removal request was sent. Existing
+persisted states are translated when loaded, preserving registration and generation
+fences. Deploy alongside the matching Freesolo deployment-state migration and backend.
