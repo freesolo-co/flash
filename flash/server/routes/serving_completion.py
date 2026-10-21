@@ -104,12 +104,13 @@ def cleanup_recovered_deployments(stop: Event) -> bool:
 
 
 def retry_deployment_cleanup(stop: Event) -> None:
-    """Retry full passes with interruptible backoff; each checkpoint has a five-second budget."""
+    """Retry failures with backoff and poll for new cleanup work until shutdown."""
     delay = 1.0
-    while not stop.is_set() and cleanup_recovered_deployments(stop):
-        if stop.wait(delay):
+    while not stop.is_set():
+        pending = cleanup_recovered_deployments(stop)
+        if stop.wait(delay if pending else 30.0):
             break
-        delay = min(30.0, delay * 2)
+        delay = min(30.0, delay * 2) if pending else 1.0
 
 
 def replay_status_reports(stop: Event | None = None) -> int:
@@ -262,7 +263,6 @@ def _finish_deployment_unlocked(
         detail="permanent checkpoint verified and ready",
         **smoke_result,
     )
-    current = deployment_state._public_deployment(current)
     if not _commit_ready_deployment(run_id, current, is_checkpoint, prev_state):
         print(
             f"deploy[{run_id}]: checkpoint ready but deployment record changed concurrently",

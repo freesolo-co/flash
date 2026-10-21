@@ -1,5 +1,6 @@
 """Incomplete hosted registrations are revoked without disturbing verified siblings."""
 
+from queue import Queue
 from threading import Event
 from types import SimpleNamespace
 
@@ -23,7 +24,10 @@ def _deploy(api, key, run_id, checkpoint_id):
         f"/v1/runs/{run_id}/deploy", json={"checkpoint_id": checkpoint_id}, headers=_bearer(key)
     )
     assert response.status_code == 200, response.text
-    return response.json()
+    result = response.json()
+    assert "registration_identity" not in result
+    assert "serving_org_id" not in result
+    return result
 
 
 @pytest.mark.parametrize("cleanup_fails", [False, True])
@@ -231,6 +235,66 @@ def test_startup_serves_requests_while_remote_cleanup_is_blocked(blocked_recover
     assert api.get("/v1/me", headers=_bearer(_login())).status_code == 200
 
 
+@pytest.fixture
+def controlled_cleanup(monkeypatch):
+    retry = serving_completion.retry_deployment_cleanup
+    waits, wake, finished = Queue(), Event(), Event()
+
+    def worker(stop):
+        stop_wait = stop.wait
+
+        def wait(delay):
+            waits.put(delay)
+            while not stop_wait(0.01):
+                if wake.is_set():
+                    wake.clear()
+                    return False
+            return True
+
+        monkeypatch.setattr(stop, "wait", wait)
+        try:
+            retry(stop)
+        finally:
+            finished.set()
+
+    monkeypatch.setattr(serving_completion, "retry_deployment_cleanup", worker)
+    yield waits, wake
+    assert finished.wait(2), "cleanup worker did not stop with the API"
+
+
+def test_cleanup_worker_handles_live_failures_after_idle(controlled_cleanup, api, monkeypatch):
+    waits, wake = controlled_cleanup
+    assert waits.get(timeout=2) == 30.0  # Clean startup still owns an idle worker.
+    key = _login()
+    run_id = _make_run(api, key, "done")
+    target = f"{run_id}/final"
+    offline = True
+    deleted = []
+
+    def register(**kwargs):
+        kwargs["before_register"]({})
+        raise ServingError("registration response lost")
+
+    def undeploy(checkpoint_id, **kwargs):
+        deleted.append(checkpoint_id)
+        if offline:
+            raise ServingError("backend offline")
+
+    monkeypatch.setattr(deploy, "deploy_adapter", register)
+    monkeypatch.setattr(deploy, "undeploy_adapter", undeploy)
+    for _ in range(2):  # A drained queue must not end the worker's lifetime.
+        offline = True
+        assert _deploy(api, key, run_id, target)["state"] == "cleanup_pending"
+        wake.set()
+        assert waits.get(timeout=2) == 1.0
+        assert status.get_status(run_id).deployments[target]["state"] == "cleanup_pending"
+        offline = False
+        wake.set()
+        assert waits.get(timeout=2) == 30.0
+        assert status.get_status(run_id).deployments[target]["state"] == "undeployed"
+    assert deleted == [target] * 6
+
+
 @pytest.mark.parametrize("status_code", [None, 408, 503])
 def test_ambiguous_registration_preserves_mismatched_binding(
     api, monkeypatch, tmp_path, status_code
@@ -289,7 +353,9 @@ def test_cleanup_worker_retries_without_another_restart(api, monkeypatch, interr
 
     def wait(delay):
         waits.append(delay)
-        assert len(waits) == 1, "cleanup did not finish on the next pass"
+        if len(waits) == 2:
+            assert delay == 30.0, "cleanup did not finish on the next pass"
+            return True
         if interruption == "locked":
             lock.release()
         return False
@@ -301,7 +367,7 @@ def test_cleanup_worker_retries_without_another_restart(api, monkeypatch, interr
     finally:
         if interruption == "locked" and not waits:
             lock.release()
-    assert waits == [1.0]
+    assert waits == [1.0, 30.0]
     assert len(deleted) == (3 if interruption == "failure" else 2)
     assert all(status.get_status(run_id).deployments[t]["state"] == "undeployed" for t in targets)
 
@@ -319,6 +385,8 @@ def test_cleanup_retry_rechecks_state_after_backoff(api, monkeypatch):
         raise ServingError("offline")
 
     def wait(delay):
+        if delay == 30.0:
+            return True
         seed_ready_checkpoint(run_id, target)
         return False
 
