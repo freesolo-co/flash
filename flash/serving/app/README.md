@@ -262,15 +262,15 @@ The one-off quantization job that produced them is not kept in this repo.
 - `GET /healthz` — `{ok, base_models: [...], unsupported_base_models?: [...], gpus: <count>, gpu_by_model: {base: tier}, gpu_tiers: [...], adapters: <count>}` (`gpu*` fields cover supported catalog base models; unsupported hydrated models are listed separately)
 - `GET /adapters`
 - `POST /adapters` with `X-Freesolo-Internal-Key` and an immutable revision registration (optional `structured_outputs` default — see below)
-- `POST /generate` with `adapter_id`
-- `POST /adapters/{adapter_id}/generate`
+- `POST /generate` with `model_id`
+- `POST /adapters/{model_id}/generate`
 - `POST /v1/chat/completions` where `model` is the adapter id
 
 ### Checkpoint headers (all three inference endpoints)
 
 Concurrent checkpoint deploys mutate the single serving surface for an adapter
 id (a redeploy overwrites the record's checkpoint), so every inference endpoint
-(`/generate`, `/adapters/{adapter_id}/generate`, `/v1/chat/completions`,
+(`/generate`, `/adapters/{model_id}/generate`, `/v1/chat/completions`,
 streaming included) supports a checkpoint contract:
 
 - **`X-Freesolo-Checkpoint` (response header)** — echoes the checkpoint that
@@ -325,22 +325,23 @@ activates. Raw `prompt` callers must provide the mode-specific state themselves:
 prompt must already contain a closing `</think>` marker, while a thinking raw prompt must leave an
 open `<think>` block for generation to close.
 
-Internal Python code uses `checkpoint_id` for permanent checkpoint bindings and `model_id`
-where a selector can also name a catalog base model. The existing HTTP/Modal JSON spelling
-`adapter_id` remains a serialization alias; this naming cleanup does not change API payloads
-or database columns.
+Checkpoint registration and fingerprint inputs use `checkpoint_id`. Records, raw generation
+requests/responses, and Modal dispatch use `model_id`, because these may also select a catalog
+base model. `adapter_id` is not accepted as an alias. OpenAI requests continue to use `model`.
+Database columns already use `checkpoint_id`.
 
-`artifact_digest` verifies the artifact files. `artifact_fingerprint` identifies their immutable
-binding to an organization, checkpoint, source revision, base model and serving configuration,
-including the content digest. The same files can have the same digest but different binding
-fingerprints. Fingerprint serialization retains its original keys so stored fingerprints remain
-valid; neither hash is an authentication credential.
+In hosted serving, `artifact_digest` hashes adapter configuration and repository file metadata;
+it contributes to cache identity, but is not a post-download checksum of the weight bytes.
+`artifact_fingerprint` identifies the immutable binding to an organization, checkpoint, source
+revision, base model and serving configuration, including that digest. Neither hash is an
+authentication credential. The fingerprint now hashes the `checkpoint_id` key, so previously
+stored fingerprints require the [offline cutover](../../../docs/checkpoint-field-cutover.md).
 
 `POST /adapters`:
 
 ```json
 {
-  "adapter_id": "people-search/step-20",
+  "checkpoint_id": "people-search/step-20",
   "repo_id": "Freesolo-Co/people-search-lora",
   "repo_type": "model",
   "base_model": "Qwen/Qwen3.5-9B",
@@ -361,7 +362,7 @@ valid; neither hash is an authentication credential.
 
 ```json
 {
-  "adapter_id": "people-search/step-20",
+  "model_id": "people-search/step-20",
   "messages": [
     { "role": "user", "content": "Find senior search engineers in SF" }
   ],

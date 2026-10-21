@@ -619,7 +619,7 @@ class _LoraEngineImpl:
         )
         if record.serve_base_model:
             self.registry.upsert(record, revive=True)
-            return {"ok": True, "adapter_id": record.model_id, "base_model": self.base_model}
+            return {"ok": True, "model_id": record.model_id, "base_model": self.base_model}
         if not record.is_checkpoint:
             raise ValueError("only immutable checkpoints can be registered")
         lock = await self._adapter_lock(record_key(record))
@@ -627,7 +627,7 @@ class _LoraEngineImpl:
             path = await self._ensure_adapter_local_locked(record)
             await self._add_lora_locked(record, path)
             self.registry.upsert(record, revive=True)
-        return {"ok": True, "adapter_id": record.model_id, "base_model": self.base_model}
+        return {"ok": True, "model_id": record.model_id, "base_model": self.base_model}
 
     @staticmethod
     def _lora_request_attestation(record: Any, lora_request: Any) -> str | None:

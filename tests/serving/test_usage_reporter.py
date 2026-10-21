@@ -648,7 +648,7 @@ def _checkpoint_record(
 ) -> dict[str, Any]:
     checkpoint_id = f"{run_id}/final"
     return {
-        "adapter_id": checkpoint_id,
+        "model_id": checkpoint_id,
         "repo_id": repo_id,
         "org_id": "org-1",
         "base_model": "Qwen/Qwen3.5-9B",

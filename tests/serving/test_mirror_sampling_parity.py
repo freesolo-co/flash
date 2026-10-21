@@ -243,7 +243,7 @@ def test_hosted_base_model_engine_honors_boolean_thinking_override() -> None:
     result = asyncio.run(
         engine._generate(
             {
-                "adapter_id": "adapter",
+                "model_id": "adapter",
                 "messages": [{"role": "user", "content": "hi"}],
                 "logprobs": True,
                 "top_logprobs": 1,
@@ -260,7 +260,7 @@ def test_hosted_buffered_generation_parses_qualified_tool_calls() -> None:
     result = asyncio.run(
         engine._generate(
             {
-                "adapter_id": "adapter",
+                "model_id": "adapter",
                 "messages": [{"role": "user", "content": "weather"}],
                 "tools": _tool_payload(),
                 "tool_choice": "auto",
@@ -287,7 +287,7 @@ def test_hosted_stream_reports_hidden_tool_usage_before_structured_delta() -> No
             event
             async for event in engine._stream_generate(
                 {
-                    "adapter_id": "adapter",
+                    "model_id": "adapter",
                     "messages": [{"role": "user", "content": "weather"}],
                     "tools": _tool_payload(),
                     "tool_choice": "auto",
@@ -324,7 +324,7 @@ def test_hosted_tools_reject_effective_persisted_structured_default_after_resolu
 
     engine._lora_request = resolve
     payload = {
-        "adapter_id": "adapter",
+        "model_id": "adapter",
         "messages": [{"role": "user", "content": "weather"}],
         "tools": _tool_payload(),
         "tool_choice": "auto",
@@ -352,7 +352,7 @@ def test_hosted_tool_choice_none_allows_effective_structured_default(streaming: 
     vllm_engine = _BufferedChoiceEngine()
     engine = _engine(vllm_engine, structured_outputs={"choice": ["sunny", "rainy"]})
     payload = {
-        "adapter_id": "adapter",
+        "model_id": "adapter",
         "messages": [{"role": "user", "content": "weather"}],
         "tools": _tool_payload(),
         "tool_choice": "none",
@@ -381,7 +381,7 @@ def _buffered_result(
     result = asyncio.run(
         engine._generate(
             {
-                "adapter_id": "adapter",
+                "model_id": "adapter",
                 "prompt": "hi",
                 "temperature": 0.7,
                 "n": choice_count,
@@ -429,7 +429,7 @@ def test_hosted_tool_stream_keeps_interleaved_choice_parsers_isolated() -> None:
             event
             async for event in engine._stream_generate(
                 {
-                    "adapter_id": "adapter",
+                    "model_id": "adapter",
                     "messages": [{"role": "user", "content": "weather"}],
                     "n": 2,
                     "temperature": 0.5,
@@ -474,7 +474,7 @@ def test_hosted_engine_streams_interleaved_indexes_and_aggregate_usage() -> None
             event
             async for event in engine._stream_generate(
                 {
-                    "adapter_id": "adapter",
+                    "model_id": "adapter",
                     "prompt": "hi",
                     "temperature": 0.5,
                     "n": 2,
@@ -526,7 +526,7 @@ class _UsageSession:
 def test_hosted_tool_history_accepts_valid_non_bmp_pair_and_serializes() -> None:
     messages = _historical_tool_messages('{"text":"\\ud83d\\ude00"}')
 
-    request = OpenAIGenerateRequest.model_validate({"adapter_id": "adapter", "messages": messages})
+    request = OpenAIGenerateRequest.model_validate({"model_id": "adapter", "messages": messages})
 
     request.model_dump_json()
 
@@ -540,7 +540,7 @@ def test_hosted_tool_history_rejects_surrogate_call_ids_before_cache(field: str)
         messages[1]["tool_call_id"] = "call_\ud800"
 
     with pytest.raises(ValidationError, match="cannot contain an unpaired surrogate"):
-        OpenAIGenerateRequest.model_validate({"adapter_id": "adapter", "messages": messages})
+        OpenAIGenerateRequest.model_validate({"model_id": "adapter", "messages": messages})
 
 
 @pytest.mark.parametrize(
@@ -553,13 +553,13 @@ def test_hosted_tool_result_surrogates_are_rejected_before_cache(content) -> Non
     messages[1]["content"] = content
 
     with pytest.raises(ValidationError, match="tool result content cannot contain"):
-        OpenAIGenerateRequest.model_validate({"adapter_id": "adapter", "messages": messages})
+        OpenAIGenerateRequest.model_validate({"model_id": "adapter", "messages": messages})
 
 
 def test_hosted_tool_result_non_bmp_text_reaches_prompt_cache() -> None:
     messages = _historical_tool_messages("{}")
     messages[1]["content"] = [{"type": "text", "text": "sunny ☀"}]
-    request = OpenAIGenerateRequest.model_validate({"adapter_id": "adapter", "messages": messages})
+    request = OpenAIGenerateRequest.model_validate({"model_id": "adapter", "messages": messages})
     engine = _engine(_BufferedChoiceEngine())
     engine._prompt_cache_size = 1
 
@@ -569,7 +569,7 @@ def test_hosted_tool_result_non_bmp_text_reaches_prompt_cache() -> None:
 def test_hosted_tool_history_accepts_non_bmp_call_ids_and_serializes() -> None:
     messages = _historical_tool_messages("{}", call_id="call_🌦")
 
-    request = OpenAIGenerateRequest.model_validate({"adapter_id": "adapter", "messages": messages})
+    request = OpenAIGenerateRequest.model_validate({"model_id": "adapter", "messages": messages})
 
     assert request.messages == messages
     request.model_dump_json().encode("utf-8")
@@ -581,7 +581,7 @@ def test_hosted_tool_history_accepts_non_bmp_call_ids_and_serializes() -> None:
 def test_hosted_raw_json_rejects_numeric_enum_1_0() -> None:
     number = "1.0"
     raw = (
-        '{"adapter_id":"adapter","messages":[{"role":"user","content":"weather"}],'
+        '{"model_id":"adapter","messages":[{"role":"user","content":"weather"}],'
         '"tool_choice":"auto","parallel_tool_calls":true,"tools":[{"type":"function",'
         '"function":{"name":"weather","parameters":{"type":"object","properties":'
         '{"value":{"type":"number","enum":['
@@ -598,7 +598,7 @@ def test_hosted_private_tool_envelope_rejects_active_stop_grammar_collision(stop
     with pytest.raises(ValueError, match=r"grammar markers.*tool_choice='auto'"):
         OpenAIGenerateRequest.model_validate(
             {
-                "adapter_id": "adapter",
+                "model_id": "adapter",
                 "messages": [{"role": "user", "content": "weather"}],
                 "tools": _tool_payload(),
                 "tool_choice": "auto",
@@ -608,7 +608,7 @@ def test_hosted_private_tool_envelope_rejects_active_stop_grammar_collision(stop
         )
     request = OpenAIGenerateRequest.model_validate(
         {
-            "adapter_id": "adapter",
+            "model_id": "adapter",
             "messages": [{"role": "user", "content": "weather"}],
             "tools": _tool_payload(),
             "tool_choice": "none",
@@ -626,7 +626,7 @@ def test_hosted_generation_rejects_active_stop_marker_collision_before_dispatch(
     vllm_engine = _BufferedChoiceEngine()
     engine = _engine(vllm_engine)
     payload = {
-        "adapter_id": "adapter",
+        "model_id": "adapter",
         "messages": [{"role": "user", "content": "weather"}],
         "tools": _tool_payload(),
         "tool_choice": "auto",
@@ -650,7 +650,7 @@ def test_hosted_generation_rejects_active_stop_marker_collision_before_dispatch(
 
 def test_hosted_private_tool_envelope_requires_text_chat_messages() -> None:
     controls = {
-        "adapter_id": "adapter",
+        "model_id": "adapter",
         "tools": _tool_payload(),
         "tool_choice": "auto",
         "parallel_tool_calls": True,
@@ -672,7 +672,7 @@ def test_hosted_private_tool_envelope_requires_text_chat_messages() -> None:
 
 
 def test_raw_generate_schema_forbids_openai_sampling_fields() -> None:
-    base = {"adapter_id": "adapter", "prompt": "hi"}
+    base = {"model_id": "adapter", "prompt": "hi"}
     for field, value in (
         ("n", 2),
         ("seed", 7),

@@ -47,7 +47,7 @@ def test_persisted_checkpoint_read_failure_does_not_serve_cached_ready_record():
 
     pool = FakePool()
     with _serve(pool, AdapterRouter([ready]), lookup_record=unavailable) as client:
-        response = client.post("/generate", json={"adapter_id": ready.model_id, "prompt": "hi"})
+        response = client.post("/generate", json={"model_id": ready.model_id, "prompt": "hi"})
     assert response.status_code == 503
     assert response.json() == {"detail": "adapter storage is unavailable"}
     assert pool.generated == []
@@ -74,6 +74,6 @@ def test_new_checkpoint_resolves_directly_from_persistence_without_bulk_reload()
     ready = checkpoint_record("run-1", QWEN)
     pool = FakePool()
     with _serve(pool, AdapterRouter(), lookup_record=lambda org_id, model_id: ready) as client:
-        response = client.post("/generate", json={"adapter_id": ready.model_id, "prompt": "hi"})
+        response = client.post("/generate", json={"model_id": ready.model_id, "prompt": "hi"})
     assert response.status_code == 200
     assert pool.generated == [(QWEN, ready.model_id)]

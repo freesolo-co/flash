@@ -125,6 +125,6 @@ async def generate_once(
     require_attested_checkpoint(result, target)
     if require_generation_id and result.get("request_id") != generation_id:
         raise RuntimeError("serving engine returned a mismatched generation id")
-    if "adapter_id" in result:
-        result = {**result, "adapter_id": requested.model_id}
+    if "model_id" in result:
+        result = {**result, "model_id": requested.model_id}
     return result

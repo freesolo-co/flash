@@ -41,6 +41,8 @@ def matches_revision_identity(record: dict, expected: dict) -> bool:
     try:
         return record.get("artifact_fingerprint") == expected.get(
             "artifact_fingerprint"
-        ) and immutable_binding_fingerprint(record) == immutable_binding_fingerprint(expected)
-    except (TypeError, ValueError):
+        ) and immutable_binding_fingerprint(
+            {**record, "checkpoint_id": record["model_id"]}
+        ) == immutable_binding_fingerprint(expected)
+    except (KeyError, TypeError, ValueError):
         return False

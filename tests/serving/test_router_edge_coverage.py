@@ -40,7 +40,7 @@ def _base_record(
 ) -> AdapterRecord:
     return AdapterRecord.model_validate(
         {
-            "adapter_id": model_id,
+            "model_id": model_id,
             "repo_id": f"org/{model_id}",
             "base_model": QWEN,
             "checkpoint": checkpoint,
@@ -100,7 +100,7 @@ def test_unsupported_base_model_is_reported_and_rejected() -> None:
     assert health["base_models"] == [unsupported]
     assert health["gpus"] == 0
 
-    response = client.post("/generate", json={"adapter_id": revision.model_id, "prompt": "hi"})
+    response = client.post("/generate", json={"model_id": revision.model_id, "prompt": "hi"})
     assert response.status_code == 400
     assert f"Unsupported base model: {unsupported}" in response.json()["detail"]
     assert "Qwen/Qwen3.5-9B" in response.json()["detail"]
@@ -165,7 +165,7 @@ def test_checkpoint_mismatch_value_error_is_conflict() -> None:
     response = _client(
         _ValueErrorPool("checkpoint mismatch: expected checkpoint differs"),
         AdapterRouter([revision]),
-    ).post("/generate", json={"adapter_id": "qa/final", "prompt": "hi"})
+    ).post("/generate", json={"model_id": "qa/final", "prompt": "hi"})
 
     assert response.status_code == 409
     assert response.json()["detail"] == "expected checkpoint differs"
@@ -175,7 +175,7 @@ def test_engine_error_after_adapter_is_disabled_is_not_found() -> None:
     revision = _revision()
     router = AdapterRouter([revision])
     response = _client(_ValueErrorPool("Unknown adapter id on engine", router), router).post(
-        "/generate", json={"adapter_id": "qa/final", "prompt": "hi"}
+        "/generate", json={"model_id": "qa/final", "prompt": "hi"}
     )
 
     assert response.status_code == 404

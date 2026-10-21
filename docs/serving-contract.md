@@ -33,7 +33,7 @@ The grammar is exact. Bare run ids, omitted checkpoints, padded steps, whitespac
 
 ```json
 {
-  "adapter_id": "run-abc/step-10",
+  "checkpoint_id": "run-abc/step-10",
   "checkpoint": "run-abc/step-10",
   "run_id": "run-abc",
   "checkpoint_step": 10,
@@ -171,4 +171,5 @@ Flash expects the coordinated Freesolo migration to provide:
 - lifecycle-only mutable updates protected by immutable-field database enforcement;
 - accounting RPCs accepting `checkpoint_id` and private `artifact_fingerprint` without legacy identity fields.
 
-The old and new binaries are not compatible. Deploy them only through the documented maintenance-window cutover.
+The old and new binaries are not compatible. Deploy them only through the
+[checkpoint field cutover](checkpoint-field-cutover.md).

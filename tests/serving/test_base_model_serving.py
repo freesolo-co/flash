@@ -24,7 +24,7 @@ INTERNAL_KEY = "fs-internal"
 
 def _lora_rec(run_id: str = "qa") -> AdapterRecord:
     values = {
-        "adapter_id": f"{run_id}/final",
+        "model_id": f"{run_id}/final",
         "repo_id": f"org/{run_id}",
         "base_model": QWEN,
         "org_id": "org-A",
@@ -37,7 +37,9 @@ def _lora_rec(run_id: str = "qa") -> AdapterRecord:
         "artifact_digest": "b" * 64,
         "lora_rank": 16,
     }
-    values["artifact_fingerprint"] = immutable_binding_fingerprint(values)
+    values["artifact_fingerprint"] = immutable_binding_fingerprint(
+        {**values, "checkpoint_id": values["model_id"]}
+    )
     return AdapterRecord.model_validate(values)
 
 
@@ -134,7 +136,7 @@ def test_base_model_serve_records_the_authorized_org_principal() -> None:
 @pytest.mark.parametrize(
     ("path", "payload"),
     [
-        ("/generate", {"adapter_id": QWEN, "prompt": "hi"}),
+        ("/generate", {"model_id": QWEN, "prompt": "hi"}),
         (
             "/v1/chat/completions",
             {"model": QWEN, "messages": [{"role": "user", "content": "hi"}]},
@@ -157,7 +159,7 @@ def test_explicit_base_model_thinking_remains_rejected_before_settlement() -> No
     response = client.post(
         "/generate",
         json={
-            "adapter_id": QWEN,
+            "model_id": QWEN,
             "prompt": "hi",
             "chat_template_kwargs": {"enable_thinking": True},
         },

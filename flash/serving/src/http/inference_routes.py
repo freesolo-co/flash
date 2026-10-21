@@ -88,7 +88,7 @@ async def generate_for_adapter(
     context = ServingContext.of(request)
     normalized_model_id = _path_model_id(model_id)
     authorization = await context.authorize_inference(request, normalized_model_id)
-    req = _parse_generate({**payload, "adapter_id": normalized_model_id})
+    req = _parse_generate({**payload, "model_id": normalized_model_id})
     requested, target = await context.lookup.resolve(
         req.model_id, org_id=_authorization_org_id(authorization)
     )
@@ -129,11 +129,11 @@ def _path_model_id(model_id: str) -> str:
     """return the stripped path adapter id, rejecting a blank one before the authorizer runs."""
     stripped = model_id.strip()
     if not stripped:
-        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "adapter_id must not be empty")
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "model_id must not be empty")
     return stripped
 
 
-def _openai_adapter_id(payload: dict[str, Any]) -> str:
+def _openai_model_id(payload: dict[str, Any]) -> str:
     """return the stripped adapter id required to authorize an openai-shaped request."""
     model_id = payload.get("model")
     if not isinstance(model_id, str) or not model_id.strip():
@@ -144,7 +144,7 @@ def _openai_adapter_id(payload: dict[str, Any]) -> str:
 @inference_router.post("/v1/chat/completions", tags=["openai"])
 async def chat_completions(payload: dict[str, Any], request: Request) -> Any:
     context = ServingContext.of(request)
-    model_id = _openai_adapter_id(payload)
+    model_id = _openai_model_id(payload)
     authorization = await context.authorize_inference(request, model_id)
     try:
         normalized = parse_chat_request(

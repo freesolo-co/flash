@@ -21,7 +21,7 @@ RUN_ID = "flash-1234567890-abcdef12"
 
 def _revision(sha: str, *, status: str = "ready") -> AdapterRecord:
     values = {
-        "adapter_id": f"{RUN_ID}/step-20",
+        "model_id": f"{RUN_ID}/step-20",
         "repo_id": "org/run",
         "org_id": "org-1",
         "base_model": BASE_MODEL,
@@ -37,7 +37,9 @@ def _revision(sha: str, *, status: str = "ready") -> AdapterRecord:
         "artifact_digest": "b" * 64,
         "lora_rank": 16,
     }
-    values["artifact_fingerprint"] = immutable_binding_fingerprint(values)
+    values["artifact_fingerprint"] = immutable_binding_fingerprint(
+        {**values, "checkpoint_id": values["model_id"]}
+    )
     return AdapterRecord.model_validate(values)
 
 

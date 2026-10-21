@@ -261,11 +261,11 @@ def _forwarded_record(eng: Any, model_id: str) -> dict[str, Any]:
 
 def _generate(eng: Any, **payload_extra: Any) -> Any:
     """Run _generate and return the SamplingParams the (fake) vLLM engine received."""
-    payload = {"adapter_id": "r1"}
+    payload = {"model_id": "r1"}
     if "messages" not in payload_extra:
         payload["prompt"] = "hi"
     payload.update(payload_extra)
-    record = eng.registry.get(None, payload["adapter_id"])
+    record = eng.registry.get(None, payload["model_id"])
     assert record is not None
     result = asyncio.run(eng._generate(payload, internal_adapter_payload(record)))
     assert result["ok"] is True
@@ -291,7 +291,7 @@ def test_nonstream_generation_requires_a_real_finish_reason(modal_app_module) ->
     with pytest.raises(RuntimeError, match="ended without a finish reason"):
         asyncio.run(
             eng._generate(
-                {"adapter_id": "r1", "prompt": "hi"},
+                {"model_id": "r1", "prompt": "hi"},
                 _forwarded_record(eng, "r1"),
             )
         )
@@ -435,13 +435,13 @@ def test_concurrent_requests_do_not_leak_reasoning_or_grammar_state(modal_app_mo
         await asyncio.gather(
             eng._generate(
                 {
-                    "adapter_id": "r1",
+                    "model_id": "r1",
                     "messages": [{"role": "user", "content": "hi"}],
                 },
                 _forwarded_record(eng, "r1"),
             ),
             eng._generate(
-                {"adapter_id": "non-thinking", "prompt": "hi"},
+                {"model_id": "non-thinking", "prompt": "hi"},
                 _forwarded_record(eng, "non-thinking"),
             ),
         )
@@ -470,19 +470,19 @@ def test_thinking_constraint_rejects_empty_messages_before_vllm(
     modal_app_module, streaming, prompt
 ):
     eng = _engine(modal_app_module, thinking=True, default={"json": SCHEMA})
-    payload = {"adapter_id": "r1", "messages": [], "prompt": prompt}
+    payload = {"model_id": "r1", "messages": [], "prompt": prompt}
 
     async def run_request():
         if streaming:
             return await anext(
                 eng._stream_generate(
                     payload,
-                    _forwarded_record(eng, payload["adapter_id"]),
+                    _forwarded_record(eng, payload["model_id"]),
                 )
             )
         return await eng._generate(
             payload,
-            _forwarded_record(eng, payload["adapter_id"]),
+            _forwarded_record(eng, payload["model_id"]),
         )
 
     with pytest.raises(ValueError, match="exactly one nonempty prompt or messages"):
@@ -513,7 +513,7 @@ def test_stream_generate_attests_the_resolved_checkpoint_before_deltas(modal_app
 
     async def first_event():
         stream = eng._stream_generate(
-            {"adapter_id": checkpoint_id, "prompt": "hi"},
+            {"model_id": checkpoint_id, "prompt": "hi"},
             internal_adapter_payload(revision),
             expected_checkpoint=checkpoint_id,
         )
@@ -554,7 +554,7 @@ def test_generation_reports_capacity_at_admission_and_releases_counter(modal_app
     eng._replica_boot_duration_seconds = 12.5
 
     async def run_both():
-        payload = {"adapter_id": "r1", "prompt": "hi"}
+        payload = {"model_id": "r1", "prompt": "hi"}
         record = _forwarded_record(eng, "r1")
         return await asyncio.gather(eng._generate(payload, record), eng._generate(payload, record))
 
@@ -583,7 +583,7 @@ def test_stream_generate_carries_structured_outputs(modal_app_module):
     events = asyncio.run(
         _drain(
             eng._stream_generate(
-                {"adapter_id": "r1", "prompt": "hi", "structured_outputs": SCHEMA},
+                {"model_id": "r1", "prompt": "hi", "structured_outputs": SCHEMA},
                 _forwarded_record(eng, "r1"),
             )
         )
@@ -652,7 +652,7 @@ def _repeated_delta_events(modal_app_module):
         return [
             event
             async for event in eng._stream_generate(
-                {"adapter_id": "r1", "prompt": "hi"},
+                {"model_id": "r1", "prompt": "hi"},
                 _forwarded_record(eng, "r1"),
             )
         ]
@@ -748,7 +748,7 @@ def test_stream_close_after_ready_closes_inner_generator(modal_app_module):
 
     async def prime_and_close():
         stream = eng._stream_generate(
-            {"adapter_id": "r1", "prompt": "hi"},
+            {"model_id": "r1", "prompt": "hi"},
             _forwarded_record(eng, "r1"),
         )
         ready = (await anext(stream)).copy()
@@ -785,7 +785,7 @@ def test_streaming_and_non_streaming_reasoning_state_match(modal_app_module):
     events = asyncio.run(
         _drain(
             eng._stream_generate(
-                {"adapter_id": "r1", "messages": messages},
+                {"model_id": "r1", "messages": messages},
                 _forwarded_record(eng, "r1"),
             )
         )
@@ -818,19 +818,19 @@ def test_semantically_invalid_schema_raises_on_first_engine_advance(modal_app_mo
     eng = _engine(modal_app_module)
     eng.engine = _FirstAdvanceErrorEngine()
     eng._self_heal_if_dead = MagicMock()
-    payload = {"adapter_id": "r1", "prompt": "hi", "structured_outputs": {"json": SCHEMA}}
+    payload = {"model_id": "r1", "prompt": "hi", "structured_outputs": {"json": SCHEMA}}
 
     async def run_request():
         if streaming:
             return await anext(
                 eng._stream_generate(
                     payload,
-                    _forwarded_record(eng, payload["adapter_id"]),
+                    _forwarded_record(eng, payload["model_id"]),
                 )
             )
         return await eng._generate(
             payload,
-            _forwarded_record(eng, payload["adapter_id"]),
+            _forwarded_record(eng, payload["model_id"]),
         )
 
     with pytest.raises(ValueError, match="semantic validation failed"):
@@ -859,7 +859,7 @@ def test_invalid_stored_spec_raises_value_error_before_ready(modal_app_module):
     with pytest.raises(ValueError, match="structured outputs spec must set exactly one constraint"):
         asyncio.run(
             eng._generate(
-                {"adapter_id": "r1", "prompt": "hi"},
+                {"model_id": "r1", "prompt": "hi"},
                 _forwarded_record(eng, "r1"),
             )
         )
@@ -871,7 +871,7 @@ def test_invalid_stored_spec_raises_value_error_before_ready(modal_app_module):
         asyncio.run(
             _first(
                 eng._stream_generate(
-                    {"adapter_id": "r1", "prompt": "hi"},
+                    {"model_id": "r1", "prompt": "hi"},
                     _forwarded_record(eng, "r1"),
                 )
             )
@@ -920,7 +920,7 @@ def test_stop_reaches_sampling_params_when_streaming(modal_app_module):
     events = asyncio.run(
         _drain(
             eng._stream_generate(
-                {"adapter_id": "r1", "prompt": "hi", "stop": ["</s>"]},
+                {"model_id": "r1", "prompt": "hi", "stop": ["</s>"]},
                 _forwarded_record(eng, "r1"),
             )
         )

@@ -34,7 +34,7 @@ def checkpoint_record(
     artifact_revision = hashlib.sha1(run_id.encode()).hexdigest()
     artifact_digest = hashlib.sha256(f"{run_id}:artifact".encode()).hexdigest()
     values: dict[str, Any] = {
-        "adapter_id": checkpoint_id,
+        "model_id": checkpoint_id,
         "repo_id": repo_id or f"org/{run_id}",
         "base_model": base_model,
         "subfolder": subfolder,
@@ -56,7 +56,9 @@ def checkpoint_record(
         "lora_rank": lora_rank,
     }
     values.update(overrides)
-    values["artifact_fingerprint"] = immutable_binding_fingerprint(values)
+    values["artifact_fingerprint"] = immutable_binding_fingerprint(
+        {**values, "checkpoint_id": values["model_id"]}
+    )
     return AdapterRecord.model_validate(values)
 
 
@@ -66,11 +68,6 @@ def checkpoint_payload(*args: Any, **kwargs: Any) -> dict[str, Any]:
 
 def checkpoint_registration_payload(*args: Any, **kwargs: Any) -> dict[str, Any]:
     record = checkpoint_record(*args, **kwargs)
-    forwarded = internal_adapter_payload(record)
-    registration = {
-        field.alias or name: forwarded[field.alias or name]
-        for name, field in ImmutableCheckpointRegistration.model_fields.items()
-    }
-    return ImmutableCheckpointRegistration.model_validate(registration).model_dump(
-        mode="json", by_alias=True
-    )
+    forwarded = {**internal_adapter_payload(record), "checkpoint_id": record.checkpoint_id}
+    registration = {name: forwarded[name] for name in ImmutableCheckpointRegistration.model_fields}
+    return ImmutableCheckpointRegistration.model_validate(registration).model_dump(mode="json")

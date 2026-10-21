@@ -36,7 +36,7 @@ def _settings() -> Settings:
 
 def _record_values(**overrides: object) -> dict[str, object]:
     values: dict[str, object] = {
-        "adapter_id": CHECKPOINT_ID,
+        "model_id": CHECKPOINT_ID,
         "repo_id": "org/run",
         "org_id": ORG_ID,
         "url": "https://huggingface.co/org/run",
@@ -56,7 +56,9 @@ def _record_values(**overrides: object) -> dict[str, object]:
         "updated_at": "2026-07-14T00:00:01+00:00",
     }
     values.update(overrides)
-    values["artifact_fingerprint"] = immutable_binding_fingerprint(values)
+    values["artifact_fingerprint"] = immutable_binding_fingerprint(
+        {**values, "checkpoint_id": values["model_id"]}
+    )
     return values
 
 
@@ -257,7 +259,7 @@ def test_cas_miss_returns_none() -> None:
 
 
 def test_hydration_skips_legacy_rows_and_targeted_reads_reject_them() -> None:
-    legacy = {"adapter_id": "legacy-alias", "metadata": {"run_id": RUN_ID}}
+    legacy = {"model_id": "legacy-alias", "metadata": {"run_id": RUN_ID}}
     FakeClient.get_rows = [legacy]
     assert load_adapters(_settings()) == []
 

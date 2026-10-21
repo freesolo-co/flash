@@ -21,7 +21,7 @@ import flash.serve.request.transport as serving_transport
 from flash.serve.contract.errors import ServingError
 from flash.serve.contract.provenance import immutable_binding_fingerprint
 
-_IMMUTABLE_SERVING_CAPABILITIES = {"permanent_checkpoint_identity"}
+_IMMUTABLE_SERVING_CAPABILITIES = {"permanent_checkpoint_identity", "canonical_checkpoint_fields"}
 
 
 @pytest.fixture(autouse=True)
@@ -145,7 +145,7 @@ def _capture_registration_body(
     deploy_kwargs.setdefault("org_id", "org-1")
     stub_serving_registry(
         {
-            "adapter_id": f"{run_id}/final",
+            "checkpoint_id": f"{run_id}/final",
             "subfolder": f"{deploy_kwargs['adapter_prefix']}/adapter",
         }
     )
@@ -561,7 +561,7 @@ def test_deploy_registers_with_freesolo_serving(monkeypatch, tmp_path, stub_serv
     )
     assert seen["url"] == "https://serve.example/adapters"
     expected = {
-        "adapter_id": "flash-7-abcd/final",
+        "checkpoint_id": "flash-7-abcd/final",
         "repo_id": "org/repo",
         "base_model": "Qwen/Qwen3.5-9B",
         "subfolder": "sft/flash-7-abcd/seed0/adapter",
@@ -732,7 +732,7 @@ def test_wait_checkpoint_ready_retries_transient_read_errors(monkeypatch):
 
     revision = "run-1/final"
     ready = {
-        "adapter_id": revision,
+        "model_id": revision,
         "subfolder": "sft/run-1/seed0/adapter",
         "metadata": {"lifecycle_state": "ready"},
     }
@@ -1131,7 +1131,7 @@ def test_deploy_ready_read_returned_at_deadline_never_succeeds(monkeypatch, tmp_
 
     def registered(org_id, adapter_id, *, timeout_s=None):
         assert org_id == "org-1"
-        assert adapter_id == registration_body["adapter_id"]
+        assert adapter_id == registration_body["checkpoint_id"]
         # the deploy funds this read from the model's own scaled budget, not the bare floor.
         assert timeout_s == serving_readiness.revision_ready_budget_seconds("Qwen/Qwen3.5-9B")
         clock[0] += timeout_s
@@ -1198,7 +1198,7 @@ def test_deploy_requires_and_forwards_org_id(monkeypatch, tmp_path, stub_serving
     monkeypatch.setattr(httpx, "post", fake_post)
     # deploy reads the registry back before reporting ready
     stub_serving_registry(
-        {"adapter_id": "flash-7-abcd", "subfolder": "sft/flash-7-abcd/seed0/adapter"}
+        {"checkpoint_id": "flash-7-abcd", "subfolder": "sft/flash-7-abcd/seed0/adapter"}
     )
 
     d.deploy_adapter(
@@ -1242,7 +1242,7 @@ def test_deploy_sends_thinking_default(monkeypatch, tmp_path, stub_serving_regis
     monkeypatch.setattr(httpx, "post", fake_post)
     # deploy reads the registry back before reporting ready
     stub_serving_registry(
-        {"adapter_id": "flash-7-abcd", "subfolder": "sft/flash-7-abcd/seed0/adapter"}
+        {"checkpoint_id": "flash-7-abcd", "subfolder": "sft/flash-7-abcd/seed0/adapter"}
     )
 
     d.deploy_adapter(

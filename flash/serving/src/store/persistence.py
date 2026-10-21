@@ -103,7 +103,7 @@ def insert_adapter(record: AdapterRecord, settings: Settings) -> AdapterRecord:
     if not settings.has_supabase:
         return PersistedAdapterRecord.model_validate(
             {
-                **record.model_dump(mode="json", by_alias=True),
+                **record.model_dump(mode="json"),
                 "org_id": record.org_id,
                 "created_at": record.created_at or now,
                 "updated_at": record.updated_at or now,
@@ -148,7 +148,7 @@ def replace_adapter_cas(
     if not settings.has_supabase:
         return PersistedAdapterRecord.model_validate(
             {
-                **record.model_dump(mode="json", by_alias=True),
+                **record.model_dump(mode="json"),
                 "org_id": record.org_id,
                 "updated_at": now,
                 "deployment_generation": record.deployment_generation,
@@ -253,7 +253,7 @@ def _row_to_adapter(row: Any) -> dict[str, Any]:
     if not isinstance(lora_config, dict) or not isinstance(defaults, dict):
         raise RuntimeError("Supabase checkpoint row config fields must be objects")
     return {
-        "adapter_id": checkpoint_id,
+        "model_id": checkpoint_id,
         "repo_id": _required_row_value(row, "source_repository"),
         "org_id": _required_row_value(row, "org_id"),
         "url": row.get("url"),

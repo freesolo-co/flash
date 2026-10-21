@@ -31,7 +31,7 @@ from tests._helpers import deployments as deployment_fixtures
 
 def _record(org_id: str, *, digest: str = "b" * 64) -> AdapterRecord:
     values = {
-        "adapter_id": "shared/final",
+        "model_id": "shared/final",
         "repo_id": f"{org_id}/run",
         "base_model": "Qwen/Qwen3.5-9B",
         "org_id": org_id,
@@ -43,7 +43,9 @@ def _record(org_id: str, *, digest: str = "b" * 64) -> AdapterRecord:
         "artifact_digest": digest,
         "lora_rank": 16,
     }
-    values["artifact_fingerprint"] = immutable_binding_fingerprint(values)
+    values["artifact_fingerprint"] = immutable_binding_fingerprint(
+        {**values, "checkpoint_id": values["model_id"]}
+    )
     return AdapterRecord.model_validate(values)
 
 
@@ -100,7 +102,7 @@ def test_exact_routes_capture_raw_and_encoded_slashes_and_absence_is_idempotent(
     for target in (record.model_id, quote(record.model_id, safe="")):
         response = client.get(f"/adapters/{target}", headers=_headers("org-a"))
         assert response.status_code == 200
-        assert response.json()["adapter"]["adapter_id"] == record.model_id
+        assert response.json()["adapter"]["model_id"] == record.model_id
         generated = client.post(
             f"/adapters/{target}/generate",
             json={"prompt": "hi"},
@@ -158,7 +160,7 @@ def test_artifact_digest_and_binding_fingerprint_are_distinct() -> None:
     assert record.artifact_digest != record.artifact_fingerprint
     changed = record.model_copy(update={"base_model": "Qwen/Qwen3.5-4B"})
     assert immutable_binding_fingerprint(changed) != record.artifact_fingerprint
-    payload = internal_adapter_payload(record)
+    payload = {**internal_adapter_payload(record), "checkpoint_id": record.checkpoint_id}
     registration = {
         field.alias or name: payload[field.alias or name]
         for name, field in ImmutableCheckpointRegistration.model_fields.items()
@@ -169,10 +171,10 @@ def test_artifact_digest_and_binding_fingerprint_are_distinct() -> None:
         )
 
 
-@pytest.mark.parametrize("alias", ["checkpoint_id", "checkpoint"])
+@pytest.mark.parametrize("alias", ["adapter_id", "model_id", "checkpoint"])
 def test_binding_fingerprint_rejects_identity_aliases(alias: str) -> None:
     payload = internal_adapter_payload(_record("org-a"))
-    payload[alias] = payload.pop("adapter_id")
+    payload[alias] = payload.pop("model_id")
 
     with pytest.raises(ValueError, match="inconsistent permanent identity"):
         immutable_binding_fingerprint(payload)
@@ -197,7 +199,7 @@ def test_active_checkpoint_uses_only_shared_permanent_identity_grammar() -> None
 def test_ambiguous_registration_matches_every_flat_immutable_field() -> None:
     record = _record("org-a")
     payload = {
-        **record.model_dump(mode="json", by_alias=True),
+        **record.model_dump(mode="json"),
         "org_id": record.org_id,
         "run_id": record.run_id,
         "checkpoint_step": record.checkpoint_step,
@@ -206,8 +208,9 @@ def test_ambiguous_registration_matches_every_flat_immutable_field() -> None:
         "artifact_fingerprint": record.artifact_fingerprint,
         "lora_rank": record.lora_rank,
     }
-    assert matches_revision_identity(payload, payload)
-    assert not matches_revision_identity({**payload, "lora_rank": 32}, payload)
+    expected = {**payload, "checkpoint_id": record.checkpoint_id}
+    assert matches_revision_identity(payload, expected)
+    assert not matches_revision_identity({**payload, "lora_rank": 32}, expected)
 
 
 def test_chat_requires_the_selected_checkpoint_record():
@@ -442,7 +445,7 @@ def test_checkpoint_registration_rejects_bare_managed_selector() -> None:
     response = client.post(
         "/adapters",
         json={
-            "adapter_id": "run-a",
+            "model_id": "run-a",
             "repo_id": "org/run-a",
             "base_model": "Qwen/Qwen3.5-9B",
             "org_id": "org-a",

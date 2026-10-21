@@ -38,14 +38,12 @@ def engine_adapter_name(org_id: str, checkpoint_id: str) -> str:
     return f"fsckpt-{digest}"
 
 
-# These keys are the persisted fingerprint format. Keep the legacy wire spelling
-# even though checkpoint-only Python objects now expose checkpoint_id. Renaming
-# a hash input key would invalidate every existing fingerprint.
+# Canonical checkpoint binding fields shared by registration and fingerprinting.
 _BINDING_FIELDS = (
     "org_id",
     "run_id",
     "checkpoint_step",
-    "adapter_id",
+    "checkpoint_id",
     "repo_id",
     "repo_type",
     "artifact_revision",
@@ -64,12 +62,12 @@ def immutable_binding_projection(value: Mapping[str, Any] | Any) -> dict[str, An
     def get(name: str) -> Any:
         if isinstance(value, Mapping):
             return value.get(name)
-        return getattr(value, "checkpoint_id" if name == "adapter_id" else name, None)
+        return getattr(value, name, None)
 
     org_id = get("org_id")
     run_id = get("run_id")
     step = get("checkpoint_step")
-    checkpoint_id = get("adapter_id")
+    checkpoint_id = get("checkpoint_id")
     if not isinstance(org_id, str) or not org_id.strip():
         raise ValueError("checkpoint binding requires org_id")
     if not isinstance(run_id, str):

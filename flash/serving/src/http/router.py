@@ -18,7 +18,10 @@ from typing import Any
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 
-from flash.serve.contract.protocol import MAX_CHAT_REQUEST_BYTES
+from flash.serve.contract.protocol import (
+    MAX_CHAT_REQUEST_BYTES,
+    REQUIRED_SERVING_CAPABILITIES,
+)
 from flash.serving.src.accounting.usage_outbox import OfflineUsageStore, UsageStore
 from flash.serving.src.http.adapter_routes import adapter_router
 from flash.serving.src.http.body_limit import RequestBodyLimitMiddleware
@@ -32,7 +35,7 @@ THINKING_STRUCTURED_OUTPUTS_DEFERRED_CAPABILITY = "thinking_structured_outputs_d
 _CLEANUP_TIMEOUT_SECONDS = 10.0
 
 _CAPABILITIES = (
-    "permanent_checkpoint_identity",
+    *sorted(REQUIRED_SERVING_CAPABILITIES),
     THINKING_STRUCTURED_OUTPUTS_DEFERRED_CAPABILITY,
 )
 

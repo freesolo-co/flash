@@ -320,7 +320,7 @@ def test_deploy_registers_one_exact_checkpoint_without_activation(monkeypatch) -
     assert method == "POST"
     assert url.endswith("/adapters")
     expected = {
-        "adapter_id": "flash-1/step-20",
+        "checkpoint_id": "flash-1/step-20",
         "repo_id": "org/repo",
         "base_model": "Qwen/Qwen3.5-9B",
         "subfolder": "sft/flash-1/checkpoints/step_20/adapter",
@@ -437,7 +437,7 @@ def test_capability_preflight_reads_healthz(monkeypatch) -> None:
 
     class _Response:
         def json(self):
-            return {"capabilities": [PERMANENT_CHECKPOINT_IDENTITY_CAPABILITY]}
+            return {"capabilities": sorted(REQUIRED_SERVING_CAPABILITIES)}
 
     def request(method, url, **kwargs):
         seen["method"] = method
@@ -487,3 +487,15 @@ def test_the_serving_extra_declares_every_module_scope_import_of_the_serving_app
             missing.setdefault(top, set()).add(str(path.relative_to(root)))
 
     assert not missing
+
+
+def test_capability_preflight_rejects_legacy_checkpoint_fields(monkeypatch) -> None:
+    import flash.serve.deployment.deploy as deploy_mod
+
+    class Response:
+        def json(self):
+            return {"capabilities": [PERMANENT_CHECKPOINT_IDENTITY_CAPABILITY]}
+
+    monkeypatch.setattr(serving_transport, "serving_request", lambda *a, **k: Response())
+    with pytest.raises(serving_errors.ServingError, match="canonical_checkpoint_fields"):
+        deploy_mod._require_serving_capabilities()

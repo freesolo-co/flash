@@ -549,7 +549,7 @@ def test_engine_processor_render_and_vllm_multimodal_input_shape() -> None:
     result = asyncio.run(
         engine._generate(
             {
-                "adapter_id": QWEN,
+                "model_id": QWEN,
                 "messages": _messages(),
                 "chat_template_kwargs": {"enable_thinking": True, "custom": "value"},
             },
@@ -655,7 +655,7 @@ def test_stream_validation_and_first_engine_error_happen_before_ready() -> None:
     async def first_event() -> Any:
         return await anext(
             engine._stream_generate(
-                {"adapter_id": QWEN, "messages": _messages()},
+                {"model_id": QWEN, "messages": _messages()},
                 internal_adapter_payload(_base_record()),
             )
         )
@@ -666,7 +666,7 @@ def test_stream_validation_and_first_engine_error_happen_before_ready() -> None:
 
 def _revision(base_model: str) -> AdapterRecord:
     values = {
-        "adapter_id": REVISION_ID,
+        "model_id": REVISION_ID,
         "repo_id": "org/run",
         "org_id": "org-1",
         "base_model": base_model,
@@ -680,7 +680,9 @@ def _revision(base_model: str) -> AdapterRecord:
         "artifact_digest": "b" * 64,
         "lora_rank": 16,
     }
-    values["artifact_fingerprint"] = immutable_binding_fingerprint(values)
+    values["artifact_fingerprint"] = immutable_binding_fingerprint(
+        {**values, "checkpoint_id": values["model_id"]}
+    )
     return AdapterRecord.model_validate(values)
 
 
@@ -701,7 +703,7 @@ class _Pool:
         self.calls.append((base_model, payload.model_id, record.model_id))
         self.payloads.append(payload)
         return {
-            "adapter_id": payload.model_id,
+            "model_id": payload.model_id,
             # a real engine attests the adapter it actually resolved, which for a revision is the
             # resolved record rather than whatever id the caller asked with.
             **({"lora_request_adapter": record.model_id} if record.is_checkpoint else {}),
@@ -799,7 +801,7 @@ def test_chat_permanent_checkpoint_echoes_public_checkpoint_identity() -> None:
 @pytest.mark.parametrize(
     ("path", "body"),
     [
-        ("/generate", {"adapter_id": REVISION_ID, "messages": _messages()}),
+        ("/generate", {"model_id": REVISION_ID, "messages": _messages()}),
         (f"/adapters/{REVISION_ID}/generate", {"messages": _messages()}),
         ("/v1/chat/completions", {"model": REVISION_ID, "messages": _messages()}),
     ],
@@ -919,7 +921,7 @@ def _unattesting_pool(monkeypatch) -> None:
 @pytest.mark.parametrize(
     ("path", "body"),
     [
-        ("/generate", {"adapter_id": REVISION_ID, "prompt": "hi"}),
+        ("/generate", {"model_id": REVISION_ID, "prompt": "hi"}),
         (f"/adapters/{REVISION_ID}/generate", {"prompt": "hi"}),
     ],
 )
@@ -953,7 +955,7 @@ def test_a_refused_attestation_is_never_metered(monkeypatch) -> None:
     )
     client = TestClient(app, headers={"Authorization": "Bearer test"})
 
-    response = client.post("/generate", json={"adapter_id": REVISION_ID, "prompt": "hi"})
+    response = client.post("/generate", json={"model_id": REVISION_ID, "prompt": "hi"})
 
     assert response.status_code == 502
     assert store.captured == []

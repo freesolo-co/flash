@@ -57,7 +57,7 @@ def _revision() -> AdapterRecord:
     checkpoint_id = f"{run_id}/final"
     return AdapterRecord.model_validate(
         {
-            "adapter_id": checkpoint_id,
+            "model_id": checkpoint_id,
             "repo_id": "org/accounting",
             "org_id": "org-1",
             "base_model": BASE_MODEL,
@@ -93,7 +93,7 @@ class _Pool:
             record,
             {
                 "ok": True,
-                "adapter_id": payload.model_id,
+                "model_id": payload.model_id,
                 "text": "ok",
                 "finish_reason": "stop",
                 "prompt_token_ids": [11, 12],
@@ -360,7 +360,7 @@ def test_nonstream_capture_is_awaited_before_successful_response() -> None:
         deployment_sha="release-1",
     )
     with TestClient(app, headers={"Authorization": "Bearer user-key"}) as client:
-        response = client.post("/generate", json={"adapter_id": record.model_id, "prompt": "hello"})
+        response = client.post("/generate", json={"model_id": record.model_id, "prompt": "hello"})
 
     assert response.status_code == 200
     assert len(store.finalized) == 1
@@ -500,7 +500,7 @@ def test_thinking_request_is_rejected_before_engine_dispatch() -> None:
         chat_authorizer=authorize,
     )
     with TestClient(app, headers={"Authorization": "Bearer user-key"}) as client:
-        response = client.post("/generate", json={"adapter_id": record.model_id, "prompt": "hello"})
+        response = client.post("/generate", json={"model_id": record.model_id, "prompt": "hello"})
 
     assert response.status_code == 503
     assert response.json() == {"detail": "thinking generation accounting is unavailable"}
@@ -520,7 +520,7 @@ def test_nonstream_capture_failure_returns_controlled_503() -> None:
         chat_authorizer=authorize,
     )
     with TestClient(app, headers={"Authorization": "Bearer user-key"}) as client:
-        response = client.post("/generate", json={"adapter_id": record.model_id, "prompt": "hello"})
+        response = client.post("/generate", json={"model_id": record.model_id, "prompt": "hello"})
 
     assert response.status_code == 503
     assert response.json() == {"detail": "durable serving accounting unavailable"}

@@ -19,7 +19,7 @@ def _record(step: int | None = 20, **overrides):
     selector = "final" if step is None else f"step-{step}"
     checkpoint_id = f"{RUN_ID}/{selector}"
     payload = {
-        "adapter_id": checkpoint_id,
+        "checkpoint_id": checkpoint_id,
         "repo_id": "org/run",
         "base_model": "Qwen/Qwen3.5-9B",
         "subfolder": f"checkpoints/{selector}",

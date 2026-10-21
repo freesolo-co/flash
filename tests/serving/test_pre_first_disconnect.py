@@ -33,7 +33,7 @@ def _record() -> AdapterRecord:
     checkpoint_id = f"{run_id}/final"
     return AdapterRecord.model_validate(
         {
-            "adapter_id": checkpoint_id,
+            "model_id": checkpoint_id,
             "repo_id": "org/run-a",
             "org_id": "org-1",
             "base_model": QWEN,

@@ -330,7 +330,7 @@ def test_cold_engine_resolves_forwarded_adapter_record(modal_app_module, tmp_pat
     run_id = "flash-1234567890-abcdef12"
     model_id = f"{run_id}/step-1"
     record_values = {
-        "adapter_id": model_id,
+        "model_id": model_id,
         "repo_id": "org/private-adapter",
         "base_model": "Qwen/Qwen3.5-9B",
         "subfolder": "checkpoints/step-1/adapter",
@@ -346,7 +346,9 @@ def test_cold_engine_resolves_forwarded_adapter_record(modal_app_module, tmp_pat
         "artifact_digest": "b" * 64,
         "lora_rank": 32,
     }
-    record_values["artifact_fingerprint"] = immutable_binding_fingerprint(record_values)
+    record_values["artifact_fingerprint"] = immutable_binding_fingerprint(
+        {**record_values, "checkpoint_id": record_values["model_id"]}
+    )
     record_dict = internal_adapter_payload(AdapterRecord.model_validate(record_values))
     engine = object.__new__(modal_app_module._LoraEngineImpl)
     engine.base_model = record_dict["base_model"]
@@ -627,8 +629,7 @@ def test_scale_to_zero_pool_dispatches_inference_and_registration(modal_app_modu
             self.deployment_generation = deployment_generation
             self.generation_id = generation_id
 
-        def model_dump(self, *, by_alias: bool) -> dict:
-            assert by_alias is True
+        def model_dump(self) -> dict:
             return self.value
 
     async def _generate(
@@ -673,7 +674,7 @@ def test_scale_to_zero_pool_dispatches_inference_and_registration(modal_app_modu
     )
     checkpoint_id = "flash-1234567890-abcdef12/step-1"
     record_values = {
-        "adapter_id": checkpoint_id,
+        "model_id": checkpoint_id,
         "repo_id": "org/run",
         "base_model": "Qwen/Qwen3.5-9B",
         "subfolder": "checkpoints/step-1/adapter",
@@ -688,7 +689,9 @@ def test_scale_to_zero_pool_dispatches_inference_and_registration(modal_app_modu
         "artifact_digest": "b" * 64,
         "lora_rank": 32,
     }
-    record_values["artifact_fingerprint"] = immutable_binding_fingerprint(record_values)
+    record_values["artifact_fingerprint"] = immutable_binding_fingerprint(
+        {**record_values, "checkpoint_id": record_values["model_id"]}
+    )
     record = AdapterRecord.model_validate(record_values)
 
     result = asyncio.run(

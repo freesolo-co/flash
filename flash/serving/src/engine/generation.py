@@ -258,7 +258,7 @@ async def generate(
     first = choices[0]
     return {
         "ok": True,
-        "adapter_id": payload.model_id,
+        "model_id": payload.model_id,
         **({"lora_request_adapter": attestation} if attestation is not None else {}),
         "text": first["text"],
         "finish_reason": first["finish_reason"],
@@ -496,7 +496,7 @@ async def stream_generate(
         yield {
             "type": "final",
             "ok": True,
-            "adapter_id": payload.model_id,
+            "model_id": payload.model_id,
             "choices": [{"index": index, **state} for index, state in sorted(choice_state.items())],
             **_usage_fields(last_output, completion_ids, **usage_kwargs),
         }

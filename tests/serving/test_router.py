@@ -123,7 +123,7 @@ class FakePool:
             {
                 # Snake_case, matching the real engine RPC contract (modal_app.py::_generate).
                 "ok": True,
-                "adapter_id": payload.model_id,
+                "model_id": payload.model_id,
                 "text": f"[{base_model}] reply",
                 "finish_reason": "stop",
                 "prompt_token_ids": [4, 5],
@@ -209,6 +209,7 @@ def test_healthz_reports_one_gpu_per_base_model(app_setup):
     body = client.get("/healthz").json()
     assert body["ok"] is True
     assert body["capabilities"] == [
+        "canonical_checkpoint_fields",
         "permanent_checkpoint_identity",
         "thinking_structured_outputs_deferred_v1",
     ]
@@ -300,7 +301,7 @@ def test_generate_fails_closed_when_accounting_cannot_settle() -> None:
     pool = FakePool()
     client = _metered_client(pool, router, _UnhealthyUsageStore())
 
-    response = client.post("/generate", json={"adapter_id": "qa/final", "prompt": "hi"})
+    response = client.post("/generate", json={"model_id": "qa/final", "prompt": "hi"})
 
     assert response.status_code == 503
     assert response.json() == {"detail": "durable serving accounting unavailable"}
@@ -320,7 +321,7 @@ def test_healthz_reports_unsupported_hydrated_base_models_without_routing_them()
     assert body["gpus"] == 0
     assert body["gpu_by_model"] == {}
 
-    resp = client.post("/generate", json={"adapter_id": "legacy", "prompt": "hi"})
+    resp = client.post("/generate", json={"model_id": "legacy", "prompt": "hi"})
     assert resp.status_code == 404
     assert pool.generated == []
 
@@ -373,15 +374,11 @@ def test_chat_rejects_unknown_list_content_without_image_before_dispatch(app_set
 def test_generate_routes_to_the_adapters_base_model(app_setup):
     client, pool, _ = app_setup
     assert (
-        client.post(
-            "/generate", json={"adapter_id": _revision_id("qa"), "prompt": "hi"}
-        ).status_code
+        client.post("/generate", json={"model_id": _revision_id("qa"), "prompt": "hi"}).status_code
         == 200
     )
     assert (
-        client.post(
-            "/generate", json={"adapter_id": _revision_id("mc"), "prompt": "hi"}
-        ).status_code
+        client.post("/generate", json={"model_id": _revision_id("mc"), "prompt": "hi"}).status_code
         == 200
     )
     # each adapter dispatches to its own active base-model engine.
@@ -395,7 +392,7 @@ def test_chat_template_kwargs_forwarded_on_generate(app_setup):
     resp = client.post(
         "/generate",
         json={
-            "adapter_id": _revision_id("qa"),
+            "model_id": _revision_id("qa"),
             "messages": [{"role": "user", "content": "hi"}],
             "chat_template_kwargs": {"enable_thinking": False},
         },
@@ -423,7 +420,7 @@ def test_chat_template_kwargs_forwarded_on_openai_chat(app_setup):
 def test_generate_without_chat_template_kwargs_is_none(app_setup):
     """Absent chat_template_kwargs stays None (template runs at its default) — no accidental key."""
     client, pool, _ = app_setup
-    client.post("/generate", json={"adapter_id": _revision_id("qa"), "prompt": "hi"})
+    client.post("/generate", json={"model_id": _revision_id("qa"), "prompt": "hi"})
     assert pool.template_kwargs[-1] is None
 
 
@@ -721,7 +718,7 @@ def test_generate_passes_structured_outputs_through(app_setup):
     resp = client.post(
         "/generate",
         json={
-            "adapter_id": _revision_id("qa"),
+            "model_id": _revision_id("qa"),
             "prompt": "hi",
             "structured_outputs": {"json": _PERSON_SCHEMA},
         },
@@ -745,9 +742,7 @@ def test_absent_structured_outputs_stays_none(app_setup):
     """No spec anywhere -> None reaches the engine (which may then apply an adapter default)."""
     client, pool, _ = app_setup
     assert (
-        client.post(
-            "/generate", json={"adapter_id": _revision_id("qa"), "prompt": "hi"}
-        ).status_code
+        client.post("/generate", json={"model_id": _revision_id("qa"), "prompt": "hi"}).status_code
         == 200
     )
     assert pool.structured[-1] is None
@@ -772,8 +767,8 @@ def test_streamed_chat_forwards_structured_outputs(app_setup):
 
 def test_many_adapters_share_one_base_model_engine(app_setup):
     client, pool, _ = app_setup
-    client.post("/generate", json={"adapter_id": _revision_id("qa"), "prompt": "x"})
-    client.post("/generate", json={"adapter_id": _revision_id("qb"), "prompt": "y"})
+    client.post("/generate", json={"model_id": _revision_id("qa"), "prompt": "x"})
+    client.post("/generate", json={"model_id": _revision_id("qb"), "prompt": "y"})
     # Both Qwen adapters dispatched to the SAME base-model engine (one GPU, multi-LoRA).
     assert {bm for bm, _ in pool.generated} == {QWEN}
     assert {aid for _, aid in pool.generated} == {
@@ -785,14 +780,14 @@ def test_many_adapters_share_one_base_model_engine(app_setup):
 @pytest.mark.parametrize(
     ("path", "payload"),
     [
-        ("/generate", {"adapter_id": _revision_id("qa"), "prompt": "hi"}),
+        ("/generate", {"model_id": _revision_id("qa"), "prompt": "hi"}),
         (f"/adapters/{_revision_id('qa')}/generate", {"prompt": "hi"}),
     ],
 )
 def test_raw_generate_responses_exclude_internal_fields(app_setup, path, payload):
     client, _, _ = app_setup
     body = client.post(path, json=payload).json()
-    assert body["adapter_id"] == _revision_id("qa")
+    assert body["model_id"] == _revision_id("qa")
     assert body["finish_reason"] == "stop"
     assert body["token_ids"] == [1, 2, 3]
     assert body["text"] == f"[{QWEN}] reply"
@@ -820,7 +815,7 @@ def test_raw_generate_responses_exclude_internal_fields(app_setup, path, payload
 @pytest.mark.parametrize(
     ("path", "payload"),
     [
-        ("/generate", {"adapter_id": _revision_id("qa"), "prompt": "hi"}),
+        ("/generate", {"model_id": _revision_id("qa"), "prompt": "hi"}),
         (f"/adapters/{_revision_id('qa')}/generate", {"prompt": "hi"}),
     ],
 )
@@ -892,7 +887,7 @@ def test_external_generate_forwards_system_prompts(app_setup):
     ]
     resp = client.post(
         "/generate",
-        json={"adapter_id": _revision_id("qa"), "messages": messages},
+        json={"model_id": _revision_id("qa"), "messages": messages},
     )
 
     assert resp.status_code == 200, resp.text
@@ -1087,7 +1082,7 @@ def test_per_adapter_generate_bad_payload_is_422_not_500(app_setup):
 @pytest.mark.parametrize(
     ("path", "payload"),
     [
-        ("/generate", {"adapter_id": _revision_id("qb"), "prompt": "hi", "max_tokens": 0}),
+        ("/generate", {"model_id": _revision_id("qb"), "prompt": "hi", "max_tokens": 0}),
         (f"/adapters/{_revision_id('qb')}/generate", {"prompt": "hi", "temperature": -0.1}),
         (
             "/v1/chat/completions",
@@ -1121,7 +1116,7 @@ def test_per_adapter_generate_endpoint_routes(app_setup):
 
 def test_unknown_adapter_is_404_not_misrouted(app_setup):
     client, pool, _ = app_setup
-    assert client.post("/generate", json={"adapter_id": "nope", "prompt": "hi"}).status_code == 404
+    assert client.post("/generate", json={"model_id": "nope", "prompt": "hi"}).status_code == 404
     assert (
         client.post("/v1/chat/completions", json={"model": "nope", "messages": []}).status_code
         == 422
@@ -1139,9 +1134,7 @@ def test_engine_valueerror_is_400_when_adapter_still_ready(app_setup):
     pool.generate = boom
     client = _serve(pool, router, internal_key="sekret")
     assert (
-        client.post(
-            "/generate", json={"adapter_id": _revision_id("qa"), "prompt": "hi"}
-        ).status_code
+        client.post("/generate", json={"model_id": _revision_id("qa"), "prompt": "hi"}).status_code
         == 400
     )
 
@@ -1158,9 +1151,7 @@ def test_raced_undeploy_engine_valueerror_is_404(app_setup):
     pool.generate = vanish
     client = _serve(pool, router, internal_key="sekret")
     assert (
-        client.post(
-            "/generate", json={"adapter_id": _revision_id("qa"), "prompt": "hi"}
-        ).status_code
+        client.post("/generate", json={"model_id": _revision_id("qa"), "prompt": "hi"}).status_code
         == 404
     )
 
@@ -1172,7 +1163,7 @@ def test_list_adapters_requires_internal_key(app_setup):
     assert client.get("/adapters").status_code == 401
     ok = client.get("/adapters", headers={"X-Freesolo-Internal-Key": "sekret"})
     assert ok.status_code == 200
-    assert {a["adapter_id"] for a in ok.json()["adapters"]} == {
+    assert {a["model_id"] for a in ok.json()["adapters"]} == {
         _revision_id("qa"),
         _revision_id("qb"),
         _revision_id("mc"),
@@ -1206,7 +1197,7 @@ def test_list_adapters_refreshes_authoritative_persisted_state():
 
     assert response.status_code == 200
     assert reloads == 1
-    records = {record["adapter_id"]: record for record in response.json()["adapters"]}
+    records = {record["model_id"]: record for record in response.json()["adapters"]}
     assert set(records) == {_revision_id("fresh")}
     assert not router.has("stale/final", org_id="org-1")
 
@@ -1301,7 +1292,7 @@ class _MeteringPool(FakePool):
             record,
             {
                 "ok": True,
-                "adapter_id": payload.model_id,
+                "model_id": payload.model_id,
                 "text": f"[{base_model}] reply",
                 "prompt_tokens": 7,
                 "completion_tokens": 3,
@@ -1338,7 +1329,7 @@ def test_generate_response_strips_internal_cache_attribution():
     router = _router_for("qa", QWEN)
     client = _serve(_MeteringPool(), router)
 
-    body = client.post("/generate", json={"adapter_id": _revision_id("qa"), "prompt": "hi"}).json()
+    body = client.post("/generate", json={"model_id": _revision_id("qa"), "prompt": "hi"}).json()
 
     assert "cached_tokens_reported" not in body
     assert "engine_replica_id" not in body
@@ -1366,7 +1357,7 @@ class _CachedMeteringPool(FakePool):
             record,
             {
                 "ok": True,
-                "adapter_id": payload.model_id,
+                "model_id": payload.model_id,
                 "text": f"[{base_model}] reply",
                 "prompt_tokens": 10,
                 "completion_tokens": 3,
@@ -1461,7 +1452,7 @@ def test_generate_forwards_record_for_lazy_engine_load(app_setup):
         captured.append((base_model, record.model_id, record.repo_id))
         return {
             "ok": True,
-            "adapter_id": payload.model_id,
+            "model_id": payload.model_id,
             "text": "x",
             "finish_reason": "stop",
             "token_ids": [],
@@ -1473,9 +1464,7 @@ def test_generate_forwards_record_for_lazy_engine_load(app_setup):
 
     pool.generate = _capture
     assert (
-        client.post(
-            "/generate", json={"adapter_id": _revision_id("qa"), "prompt": "hi"}
-        ).status_code
+        client.post("/generate", json={"model_id": _revision_id("qa"), "prompt": "hi"}).status_code
         == 200
     )
     assert captured == [(QWEN, _revision_id("qa"), "org/qa")]
@@ -1497,20 +1486,20 @@ def test_generate_miss_reloads_from_shared_storage():
     # Unknown locally -> reload finds it -> 200, and it's now cached.
     assert (
         client.post(
-            "/generate", json={"adapter_id": _revision_id("late"), "prompt": "hi"}
+            "/generate", json={"model_id": _revision_id("late"), "prompt": "hi"}
         ).status_code
         == 200
     )
     assert reloaded["count"] == 1
     assert (
         client.post(
-            "/generate", json={"adapter_id": _revision_id("late"), "prompt": "hi"}
+            "/generate", json={"model_id": _revision_id("late"), "prompt": "hi"}
         ).status_code
         == 200
     )
     assert reloaded["count"] == 1  # permanent checkpoint hits use the hydrated record
     # Still-unknown after reload -> 404.
-    assert client.post("/generate", json={"adapter_id": "ghost", "prompt": "hi"}).status_code == 404
+    assert client.post("/generate", json={"model_id": "ghost", "prompt": "hi"}).status_code == 404
 
 
 def test_hit_refresh_failure_serves_cached_adapter():
@@ -1530,13 +1519,13 @@ def test_hit_refresh_failure_serves_cached_adapter():
     # Warm the cache through the mutable alias, then exercise the immutable revision. Immutable
     # records keep the background-refresh fallback because their target cannot drift.
     assert (
-        client.post("/generate", json={"adapter_id": _revision_id("qa"), "prompt": "x"}).status_code
+        client.post("/generate", json={"model_id": _revision_id("qa"), "prompt": "x"}).status_code
         == 200
     )
     state["fail"] = True
     revision_id = _revision_id("qa")
     assert (
-        client.post("/generate", json={"adapter_id": revision_id, "prompt": "x"}).status_code == 200
+        client.post("/generate", json={"model_id": revision_id, "prompt": "x"}).status_code == 200
     )
     assert pool.generated[-1] == (QWEN, revision_id)
 
@@ -1551,7 +1540,7 @@ def test_miss_refresh_failure_propagates():
     app = build_serving_app(pool, AdapterRouter([]), reload_records=_reload, chat_authorizer=_allow)
     # raise_server_exceptions=False so we observe the 500 response rather than re-raising.
     client = TestClient(app, raise_server_exceptions=False, headers={"Authorization": "Bearer t"})
-    resp = client.post("/generate", json={"adapter_id": "ghost", "prompt": "x"})
+    resp = client.post("/generate", json={"model_id": "ghost", "prompt": "x"})
     assert resp.status_code == 500
 
 

@@ -52,10 +52,9 @@ def normalize_adapter_subfolder(value: str | None) -> str | None:
 class AdapterRecord(BaseModel):
     """one base model or one exact run-backed checkpoint used by hosted serving."""
 
-    model_config = ConfigDict(populate_by_name=True)
+    model_config = ConfigDict(extra="forbid")
 
-    # Keep the existing HTTP/Modal payload spelling during the internal rename.
-    model_id: str = Field(alias="adapter_id")
+    model_id: str
     repo_id: str
     base_model: str
     subfolder: str | None = None
@@ -158,9 +157,9 @@ class AdapterRecord(BaseModel):
 class ImmutableCheckpointRegistration(BaseModel):
     """strict internal registration input for one permanent checkpoint binding."""
 
-    model_config = ConfigDict(extra="forbid", populate_by_name=True)
+    model_config = ConfigDict(extra="forbid")
 
-    checkpoint_id: str = Field(alias="adapter_id")
+    checkpoint_id: str
     repo_id: str
     base_model: str
     subfolder: str | None = None
@@ -198,7 +197,7 @@ class ImmutableCheckpointRegistration(BaseModel):
         expected = format_checkpoint_ref(self.run_id, self.checkpoint_step)
         if self.checkpoint_id != expected or self.checkpoint != expected:
             raise ValueError(
-                "adapter_id and checkpoint must equal the canonical checkpoint identity"
+                "checkpoint_id and checkpoint must equal the canonical checkpoint identity"
             )
         if re.fullmatch(r"[0-9a-f]{40}", self.artifact_revision) is None:
             raise ValueError("artifact_revision must be a canonical 40-character commit sha")
@@ -217,17 +216,23 @@ class ImmutableCheckpointRegistration(BaseModel):
 
     def to_record(self) -> AdapterRecord:
         return AdapterRecord.model_validate(
-            {**self.model_dump(mode="json", by_alias=True), "status": "disabled"}
+            {
+                **self.model_dump(mode="json", exclude={"checkpoint_id"}),
+                "model_id": self.checkpoint_id,
+                "status": "disabled",
+            }
         )
 
 
 class PersistedAdapterRecord(AdapterRecord):
-    model_config = ConfigDict(extra="forbid", populate_by_name=True)
+    model_config = ConfigDict(extra="forbid")
 
     @model_validator(mode="after")
     def validate_persisted_identity(self) -> PersistedAdapterRecord:
         if self.serve_base_model:
             raise ValueError("base-model records must not be persisted")
+        if self.artifact_fingerprint != self.immutable_fingerprint():
+            raise ValueError("stored artifact_fingerprint requires the checkpoint-field cutover")
         if not self.updated_at:
             raise ValueError("persisted checkpoint records require updated_at")
         return self
@@ -235,7 +240,7 @@ class PersistedAdapterRecord(AdapterRecord):
 
 def internal_adapter_payload(record: AdapterRecord) -> dict[str, Any]:
     return {
-        **record.model_dump(mode="json", by_alias=True),
+        **record.model_dump(mode="json"),
         "org_id": record.org_id,
         "deployment_generation": record.deployment_generation,
         "run_id": record.run_id,
@@ -248,9 +253,9 @@ def internal_adapter_payload(record: AdapterRecord) -> dict[str, Any]:
 
 
 class GenerateRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid", populate_by_name=True)
+    model_config = ConfigDict(extra="forbid")
 
-    model_id: str = Field(alias="adapter_id")
+    model_id: str
     # the cpu front door overwrites this before every production dispatch. direct offline engine
     # tests may omit it, in which case the engine supplies a test-only id before calling vllm.
     generation_id: str | None = None

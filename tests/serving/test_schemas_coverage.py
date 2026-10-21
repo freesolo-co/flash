@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 from pydantic import ValidationError
 
+from flash.serve.contract.provenance import immutable_binding_fingerprint
 from flash.serving.src.io.schemas import (
     AdapterRecord,
     GenerateRequest,
@@ -23,7 +24,7 @@ CHECKPOINT_ID = f"{RUN_ID}/step-20"
 
 def _registration(**overrides: object) -> dict[str, object]:
     payload: dict[str, object] = {
-        "adapter_id": CHECKPOINT_ID,
+        "model_id": CHECKPOINT_ID,
         "repo_id": "org/run",
         "base_model": "Qwen/Qwen3.5-9B",
         "org_id": "org-1",
@@ -36,6 +37,9 @@ def _registration(**overrides: object) -> dict[str, object]:
         "lora_rank": 16,
         "thinking": False,
     }
+    payload["artifact_fingerprint"] = immutable_binding_fingerprint(
+        {**payload, "checkpoint_id": CHECKPOINT_ID}
+    )
     payload.update(overrides)
     return payload
 
@@ -55,7 +59,7 @@ def test_required_record_field_rejects_whitespace_only() -> None:
         AdapterRecord.model_validate(
             {
                 **_registration(),
-                "adapter_id": "   ",
+                "model_id": "   ",
             }
         )
 
@@ -67,10 +71,10 @@ def test_adapter_record_before_validator_rejects_non_dict_input() -> None:
 
 @pytest.mark.parametrize("checkpoint_step", [-1, True])
 def test_checkpoint_step_rejects_negative_and_boolean_values(checkpoint_step: object) -> None:
+    payload = _registration(checkpoint_step=checkpoint_step)
+    payload["checkpoint_id"] = payload.pop("model_id")
     with pytest.raises(ValidationError, match=r"checkpoint step|canonical checkpoint identity"):
-        ImmutableCheckpointRegistration.model_validate(
-            _registration(checkpoint_step=checkpoint_step)
-        )
+        ImmutableCheckpointRegistration.model_validate(payload)
 
 
 @pytest.mark.parametrize(
@@ -79,7 +83,7 @@ def test_checkpoint_step_rejects_negative_and_boolean_values(checkpoint_step: ob
         ({"serve_base_model": True}, "base-model records must not be persisted"),
         ({"org_id": "   "}, "checkpoint records require run_id and org_id"),
         ({"updated_at": None}, "persisted checkpoint records require updated_at"),
-        ({"adapter_id": f"{RUN_ID}/step-21"}, "checkpoint identity does not match"),
+        ({"model_id": f"{RUN_ID}/step-21"}, "checkpoint identity does not match"),
         ({"checkpoint": f"{RUN_ID}/step-21"}, "checkpoint identity does not match"),
     ],
 )
@@ -90,7 +94,7 @@ def test_persisted_checkpoint_identity_failures(overrides: dict[str, object], me
 
 def test_generate_request_rejects_whitespace_adapter_id() -> None:
     with pytest.raises(ValidationError, match="value must not be empty"):
-        GenerateRequest.model_validate({"adapter_id": "   ", "prompt": "hi"})
+        GenerateRequest.model_validate({"model_id": "   ", "prompt": "hi"})
 
 
 @pytest.mark.parametrize(
@@ -111,14 +115,14 @@ def test_generate_request_requires_exactly_one_nonempty_prompt_source(
         ValidationError,
         match="exactly one nonempty prompt or messages source is required",
     ):
-        GenerateRequest.model_validate({"adapter_id": CHECKPOINT_ID, **sources})
+        GenerateRequest.model_validate({"model_id": CHECKPOINT_ID, **sources})
 
 
 def test_serving_readme_uses_generate_request_field_names() -> None:
     readme = Path(__file__).parents[2] / "flash" / "serving" / "app" / "README.md"
     text = readme.read_text()
 
-    assert "`POST /generate` with `adapter_id`" in text
+    assert "`POST /generate` with `model_id`" in text
     assert '"max_tokens": 512' in text
     assert '"structured_outputs": {' in text
     assert "adapterId" not in text
@@ -151,4 +155,4 @@ def test_generate_request_rejects_sampling_outside_runtime_contract(
     field: str, value: object
 ) -> None:
     with pytest.raises(ValidationError):
-        GenerateRequest.model_validate({"adapter_id": CHECKPOINT_ID, "prompt": "hi", field: value})
+        GenerateRequest.model_validate({"model_id": CHECKPOINT_ID, "prompt": "hi", field: value})

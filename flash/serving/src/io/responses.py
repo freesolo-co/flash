@@ -116,7 +116,7 @@ def openai_generate_fields(request: NormalizedChatRequest, model_id: str) -> dic
     """bind one canonical OpenAI request to the hosted internal envelope."""
 
     return {
-        "adapter_id": model_id,
+        "model_id": model_id,
         "messages": request.messages,
         "max_tokens": request.max_tokens,
         "temperature": request.temperature,

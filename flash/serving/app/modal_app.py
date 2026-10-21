@@ -483,7 +483,7 @@ class _ModalEnginePool:
             raise RuntimeError("generation id is required before modal dispatch")
         engine = _engine_cls_for(base_model)(base_model=base_model)
         return await engine.generate.remote.aio(
-            payload.model_dump(by_alias=True),
+            payload.model_dump(),
             self._record_payload(record),
             expected_checkpoint,
             generation_id,
@@ -502,7 +502,7 @@ class _ModalEnginePool:
             raise RuntimeError("generation id is required before modal dispatch")
         engine = _engine_cls_for(base_model)(base_model=base_model)
         remote_stream = engine.stream_generate.remote_gen.aio(
-            payload.model_dump(by_alias=True),
+            payload.model_dump(),
             self._record_payload(record),
             expected_checkpoint,
             generation_id,

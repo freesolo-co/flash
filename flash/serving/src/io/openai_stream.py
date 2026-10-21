@@ -102,7 +102,7 @@ class _StreamOutput:
         self._disconnected = disconnected
         self._completion_id = completion_id
         self._created = created
-        self._adapter_id = model_id
+        self._model_id = model_id
         self._terminal_sent = False
 
     async def emit(
@@ -134,7 +134,7 @@ class _StreamOutput:
                 "id": self._completion_id,
                 "object": "chat.completion.chunk",
                 "created": self._created,
-                "model": self._adapter_id,
+                "model": self._model_id,
                 "choices": [choice],
             }
         )
@@ -145,7 +145,7 @@ class _StreamOutput:
                 "id": self._completion_id,
                 "object": "chat.completion.chunk",
                 "created": self._created,
-                "model": self._adapter_id,
+                "model": self._model_id,
                 "choices": [{"index": 0, "delta": {}, "finish_reason": "error"}],
                 "error": {"message": message, "type": error_type, "code": code},
             }

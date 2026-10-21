@@ -21,7 +21,7 @@ def _rec(model_id: str, *, serve_base_model: bool = False) -> AdapterRecord:
     checkpoint_step = None if checkpoint == "final" else int(checkpoint.removeprefix("step-"))
     return AdapterRecord.model_validate(
         {
-            "adapter_id": model_id,
+            "model_id": model_id,
             "repo_id": QWEN if serve_base_model else f"org/{run_id}",
             "base_model": QWEN,
             "org_id": None if serve_base_model else "org-a",
