@@ -47,8 +47,8 @@ READBACK_MAX_DELAY_SECONDS = 2.0
 SMOKE_RETRY_FALLBACK_DELAY_SECONDS = 2.0
 
 
-class DeploymentGenerationChanged(serving_errors.ServingError):
-    """Verification was superseded; cleanup must not remove the replacement generation."""
+class DeploymentGenerationUnconfirmed(serving_errors.ServingError):
+    """Loading generation ownership is unconfirmed; unfenced cleanup is unsafe."""
 
 
 @dataclass
@@ -263,17 +263,28 @@ def deploy_adapter(
                 adapter_targets_images=artifact_metadata.targets_images,
             )
         )
-        verified_record = _registered_adapter(normalized_org_id, checkpoint_id)
-        if (
-            verified_record is None
-            or verified_record.get("status") != "ready"
-            or verified_record.get("deployment_generation") != serving_generation
-        ):
-            raise DeploymentGenerationChanged("checkpoint deployment changed during verification")
+        _confirm_deployment_generation(normalized_org_id, checkpoint_id, serving_generation)
     dep.state = "ready"
     dep.openai_model = checkpoint_id
     logger.info("deployed checkpoint %s", checkpoint_id)
     return dep
+
+
+def _confirm_deployment_generation(org_id: str, checkpoint_id: str, generation: str) -> None:
+    try:
+        record = _registered_adapter(org_id, checkpoint_id)
+    except serving_errors.ServingError as exc:
+        # A failed read cannot prove this attempt still owns the loaded adapter.
+        # Preserve any replacement rather than deleting by checkpoint ID alone.
+        raise DeploymentGenerationUnconfirmed(
+            f"could not confirm checkpoint deployment after verification: {exc}"
+        ) from exc
+    if (
+        record is None
+        or record.get("status") != "ready"
+        or record.get("deployment_generation") != generation
+    ):
+        raise DeploymentGenerationUnconfirmed("checkpoint deployment changed during verification")
 
 
 def _adapter_url(adapter_id: str) -> str:

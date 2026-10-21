@@ -29,7 +29,13 @@ def queued(run, step, generation=1):
 def ready(run, step):
     record = queued(run, step)
     transitions.mark_deployment_pending(run, record)
-    record = {**record, "state": "ready", "verified_at": 123.0, "verify_sample": str(step)}
+    record = {
+        **record,
+        "state": "ready",
+        "verified_at": 123.0,
+        "deployment_generation": "generation-a",
+        "verify_sample": str(step),
+    }
     return transitions.mark_checkpoint_deployed(run, record).deployments[record["checkpoint_id"]]
 
 
@@ -62,7 +68,12 @@ def test_late_completion_cannot_restore_revoked_checkpoint(run, action):
         fenced = transitions.mark_deployment_cleanup_pending(
             run, "pending", attempt["checkpoint_id"]
         )
-    late = {**attempt, "state": "ready", "verified_at": 10.0}
+    late = {
+        **attempt,
+        "state": "ready",
+        "verified_at": 10.0,
+        "deployment_generation": "generation-a",
+    }
     assert transitions.mark_checkpoint_deployed(run, late).deployments == fenced.deployments
     assert transitions.mark_deployment_failed(run, attempt).deployments == fenced.deployments
     assert (
@@ -76,7 +87,7 @@ def test_new_attempt_generation_survives_old_completion(run):
     transitions.mark_deployment_pending(run, old)
     new = queued(run, 20, 2)
     transitions.mark_deployment_pending(run, new)
-    late = {**old, "state": "ready", "verified_at": 10.0}
+    late = {**old, "state": "ready", "verified_at": 10.0, "deployment_generation": "generation-a"}
     assert transitions.mark_checkpoint_deployed(run, late).deployments[old["checkpoint_id"]] == new
 
 
@@ -116,3 +127,15 @@ def test_malformed_inventory_fails_closed(records):
         status._runstatus_from_json(
             {"run_id": "run-a", "state": "done", "spec": {}, "deployments": records}
         )
+
+
+@pytest.mark.parametrize("serving_generation", [None, "", "   ", 7])
+def test_ready_without_serving_generation_cannot_be_committed(run, serving_generation):
+    attempt = queued(run, 20)
+    transitions.mark_deployment_pending(run, attempt)
+    ready_record = {**attempt, "state": "ready", "verified_at": 123.0}
+    if serving_generation is not None:
+        ready_record["deployment_generation"] = serving_generation
+    with pytest.raises(ValueError, match="verification"):
+        transitions.mark_checkpoint_deployed(run, ready_record)
+    assert status.get_status(run).deployments[attempt["checkpoint_id"]]["state"] == "queued"

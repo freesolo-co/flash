@@ -2,10 +2,13 @@
 
 from types import SimpleNamespace
 
+import pytest
+
 from flash.server.routes import serving_completion as completion
 
 
-def test_superseded_verification_does_not_undeploy_the_new_generation(monkeypatch):
+@pytest.mark.parametrize("readback", ["replacement", "timeout", "unavailable"])
+def test_unconfirmed_verification_does_not_undeploy_the_new_generation(monkeypatch, readback):
     deployment = {"checkpoint_id": "run-1/final", "generation": 1, "state": "queued"}
     state = SimpleNamespace(deployments={"run-1/final": deployment})
     monkeypatch.setattr(completion.JobSpec, "from_dict", lambda _: SimpleNamespace())
@@ -23,13 +26,24 @@ def test_superseded_verification_does_not_undeploy_the_new_generation(monkeypatc
         completion.serving_smoke, "_run_deployment_smoke", lambda *a, **k: {"verified_at": 1.0}
     )
 
+    def registered(*args, **kwargs):
+        if readback == "replacement":
+            return {"status": "ready", "deployment_generation": "generation-b"}
+        raise completion.ServingError(
+            readback, status_code=503 if readback == "unavailable" else None
+        )
+
+    monkeypatch.setattr(completion.serving_deploy, "_registered_adapter", registered)
+
     def deploy(**kwargs):
         kwargs["before_ready"](
             completion.serving_deploy.DeploymentReadinessFacts(
                 "run-1/final", "run-1/final", frozenset(), False
             )
         )
-        raise completion.serving_deploy.DeploymentGenerationChanged("superseded")
+        completion.serving_deploy._confirm_deployment_generation(
+            "org-1", "run-1/final", "generation-a"
+        )
 
     monkeypatch.setattr(completion.serving_deploy, "deploy_adapter", deploy)
     failures = []
@@ -51,3 +65,4 @@ def test_superseded_verification_does_not_undeploy_the_new_generation(monkeypatc
         prev_state="succeeded",
     )
     assert len(failures) == 1
+    assert isinstance(failures[0][2], completion.serving_deploy.DeploymentGenerationUnconfirmed)

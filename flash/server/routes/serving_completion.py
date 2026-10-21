@@ -170,8 +170,8 @@ def _finish_deployment_unlocked(
 
     try:
         dep = serving_deploy.deploy_adapter(**deploy_kwargs, before_ready=_before_ready)
-    except serving_deploy.DeploymentGenerationChanged as exc:
-        # This attempt no longer owns the loaded generation. Keep the replacement alive.
+    except serving_deploy.DeploymentGenerationUnconfirmed as exc:
+        # Ownership changed or could not be checked. Do not delete a possible replacement.
         _record_deployment_failure(run_id, spec, exc, current, deployment, is_checkpoint)
         return
     except Exception as exc:

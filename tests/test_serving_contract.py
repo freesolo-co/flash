@@ -493,7 +493,16 @@ def test_the_serving_extra_declares_every_module_scope_import_of_the_serving_app
     assert not missing
 
 
-@pytest.mark.parametrize("observed_generation", ["generation-a", "generation-b", None])
+@pytest.mark.parametrize(
+    "observed_generation",
+    [
+        "generation-a",
+        "generation-b",
+        None,
+        serving_errors.ServingError("readback timeout"),
+        serving_errors.ServingError("readback unavailable", status_code=503),
+    ],
+)
 def test_deploy_verification_is_bound_to_the_loaded_generation(monkeypatch, observed_generation):
     from types import SimpleNamespace
 
@@ -509,8 +518,15 @@ def test_deploy_verification_is_bound_to_the_loaded_generation(monkeypatch, obse
         lambda *a, **k: {"deployment_generation": "generation-a"},
     )
     # The first lookup is before registration, the second is after smoke verification.
-    reads = iter([None, {"status": "ready", "deployment_generation": observed_generation}])
-    monkeypatch.setattr(deploy_mod, "_registered_adapter", lambda *a, **k: next(reads))
+    reads = iter([None, observed_generation])
+
+    def registered(*args, **kwargs):
+        value = next(reads)
+        if isinstance(value, serving_errors.ServingError):
+            raise value
+        return {"status": "ready", "deployment_generation": value} if value else None
+
+    monkeypatch.setattr(deploy_mod, "_registered_adapter", registered)
     verified = []
 
     def deploy():
@@ -527,7 +543,8 @@ def test_deploy_verification_is_bound_to_the_loaded_generation(monkeypatch, obse
         assert deploy().to_dict()["deployment_generation"] == "generation-a"
     else:
         with pytest.raises(
-            deploy_mod.serving_errors.ServingError, match="changed during verification"
+            deploy_mod.DeploymentGenerationUnconfirmed,
+            match=r"changed during verification|could not confirm",
         ):
             deploy()
     assert verified == ["flash-1/final"]
