@@ -644,7 +644,7 @@ def install_deferred_lora_rollout_guard(marker_file: str) -> None:
 
 
 def install_compact_checkpoints(marker_file: str) -> None:
-    enabled = os.environ.get("FLASH_COMPACT_CHECKPOINTS", "0")
+    enabled = os.environ.get("FLASH_COMPACT_CHECKPOINTS", "1")
     if enabled == "0":
         return
     if enabled != "1":

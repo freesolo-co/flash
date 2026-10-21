@@ -1,10 +1,11 @@
-# Compact LoRA recovery (experimental)
+# Compact LoRA recovery
 
-An operator can set `FLASH_COMPACT_CHECKPOINTS=1` on the Modal controller (forwarded into the worker) to
-save FSDP2 recovery shards without immutable frozen base parameters. This is
-opt-in until multi-rank save/load, adapter export, and resumed-update checks pass
-on the supported worker stack. The base model must have a pinned 40-character
-revision. Keep the setting enabled for retries that restore compact checkpoints.
+FSDP2 LoRA training saves compact recovery checkpoints by default, omitting
+immutable frozen base parameters. No configuration is needed. Flash pins the base
+model to a 40-character revision and forwards the checkpoint setting into workers
+and retries. Operators can explicitly set `FLASH_COMPACT_CHECKPOINTS=0` on the
+Modal controller to save full-state checkpoints for troubleshooting or backups.
+Leave the default enabled when restoring compact checkpoints.
 
 Trainable LoRA tensors, persistent buffers, optimizer state, scheduler state, RNG,
 and the existing data-loader checkpoint remain intact. A rank-local manifest
@@ -23,3 +24,12 @@ SFT run exported a 280,919,452-byte recovery checkpoint (87,132,731-byte model
 shard), then resumed from step 4 to step 8. Its four resumed losses and all 496
 final adapter tensors matched the uninterrupted run exactly. These results do
 not substitute for live coverage of every model, trainer or GPU topology.
+
+An independent Qwen3.5-9B SFT check on one Modal H100 used all-linear LoRA targets
+(716 tensors, including vision projections). Full checkpoints were 19.15 GB;
+compact checkpoints were 329 MB. Fresh-process recovery from both mid-epoch and
+an epoch boundary matched uninterrupted losses, final adapter tensors, buffers,
+optimizer and scheduler state exactly. Exported adapters also matched. Native
+save time was 31.25 seconds full versus about 2 seconds compact in that run,
+excluding uploads; this was not a randomized performance benchmark. GRPO/OPD
+recovery and changed GPU topologies remain outside this live validation.

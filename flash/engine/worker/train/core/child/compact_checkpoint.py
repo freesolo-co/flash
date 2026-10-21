@@ -1,4 +1,4 @@
-"""Opt-in FSDP2 recovery checkpoints that omit immutable base parameters only.
+"""FSDP2 LoRA recovery checkpoints that omit immutable base parameters only.
 
 Optimizer, scheduler, RNG, trainable parameters, and persistent buffers keep their native formats.
 The pinned base is already loaded before Verl restores a checkpoint. Load hooks fill only the

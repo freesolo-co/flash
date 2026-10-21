@@ -5172,14 +5172,20 @@ def test_redeploy_after_inactive_deployment_state_is_allowed(api, monkeypatch, d
 
 
 def test_deploy_ignores_stored_training_gpu(api, monkeypatch):
+    from dataclasses import replace
+
+    from flash.core.spec import JobSpec
 
     key = _login()
     run_id = api.post(
         "/v1/runs", json={"spec": SPEC, "dry_run": True}, headers=_bearer(key)
     ).json()["run_id"]
     status = runner_status.get_status(run_id)
+    worker = runner_status.effective_spec_from_status(status)
+    status.effective_preparation = runner_submit._effective_preparation_snapshot(
+        JobSpec.from_dict(status.spec), replace(worker, gpu=replace(worker.gpu, type="H200")), None
+    )
     status.state = "done"
-    status.spec["gpu"]["type"] = "H200"
     # keep the internal worker-spec carrier: hf_repo + run_id (adapter identity) are platform-managed
     # and stripped from the public spec, so deploy resolves them from effective_preparation.
     runner_state._save_status(status)
@@ -5204,12 +5210,13 @@ def test_deploy_ignores_stored_training_gpu(api, monkeypatch):
 def test_deploy_works_the_same_whether_or_not_gpu_count_was_authored(api, monkeypatch):
     """Deploy must not depend on whether the author wrote gpu.count.
 
-    `gpu_count_auto` was briefly added to the digest-verified set in `effective_spec_from_status`.
-    The digest covers the whole public spec including `gpu.type`, which the allocator legitimately
-    rewrites onto the stored status when a run is provisioned -- so gating on the marker made an
-    ordinary provisioned run fail integrity validation at deploy. An omitted count is the DEFAULT,
-    so that was nearly every run. These two specs differ only in that one authors `gpu.count = 1`.
+    Allocation records the rented GPU in the private worker snapshot and preserves the
+    authored public spec. Both forms must deploy with the automatically pinned base revision.
     """
+
+    from dataclasses import replace
+
+    from flash.core.spec import JobSpec
 
     def fake_start(target, *args, **kwargs):
         kwargs["deploy_lock"].release()
@@ -5224,9 +5231,13 @@ def test_deploy_works_the_same_whether_or_not_gpu_count_was_authored(api, monkey
             "/v1/runs", json={"spec": spec, "dry_run": True}, headers=_bearer(key)
         ).json()["run_id"]
         status = runner_status.get_status(run_id)
+        worker = runner_status.effective_spec_from_status(status)
+        status.effective_preparation = runner_submit._effective_preparation_snapshot(
+            JobSpec.from_dict(status.spec),
+            replace(worker, gpu=replace(worker.gpu, type="H200")),
+            None,
+        )
         status.state = "done"
-        # the allocator writes the class it actually rented onto the public status.
-        status.spec["gpu"]["type"] = "H200"
         runner_state._save_status(status)
 
         resp = api.post(

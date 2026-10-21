@@ -70,7 +70,8 @@ def prepare_job(
         or preparation._context_org_id(platform_context),
         owner_key_id=owner_key_id,
     )
-    spec = preparation._resolve_model_revision(spec, required=spec.algorithm == "sft")
+    # Every trainer restores compact checkpoints against this exact immutable base.
+    spec = preparation._resolve_model_revision(spec, required=True)
     if spec.algorithm == "sft":
         spec = preparation._require_pinned_profile_environment(spec)
         spec = preparation._require_sft_workload_profile(spec)
