@@ -253,3 +253,36 @@ def test_opd_parent_passes_model_checkpointing_and_vision_policy(monkeypatch, mu
     options = json.loads(child["launch_config"])
     assert options["reentrant_checkpointing"] is True
     assert options["multimodal"] is multimodal
+
+
+@pytest.mark.parametrize("lengths", [(89, 89), (19, 23), (4, 4), (1, 1, 1, 1)])
+def test_multimodal_batch_decoding_preserves_each_position_axis(lengths):
+    import torch
+
+    from flash.engine.worker.train.core.child.batch import normalize_position_ids
+
+    expected = [torch.arange(4 * n).reshape(4, n) + 1000 * i for i, n in enumerate(lengths)]
+    queued = torch.nested.as_nested_tensor(expected, layout=torch.jagged)
+    data = {
+        "input_ids": torch.nested.as_nested_tensor(
+            [torch.arange(n) for n in lengths], layout=torch.jagged
+        ),
+        "position_ids": queued,
+    }
+    normalize_position_ids(data)
+    normalize_position_ids(data)
+    for actual, reference in zip(data["position_ids"].unbind(), expected, strict=True):
+        torch.testing.assert_close(actual, reference)
+
+
+def test_multimodal_batch_decoding_rejects_mismatched_token_lengths():
+    import torch
+
+    from flash.engine.worker.train.core.child.batch import normalize_position_ids
+
+    data = {
+        "input_ids": torch.nested.as_nested_tensor([torch.arange(9)] * 2, layout=torch.jagged),
+        "position_ids": torch.nested.as_nested_tensor([torch.ones(4, 7)] * 2, layout=torch.jagged),
+    }
+    with pytest.raises(ValueError, match="do not match token lengths"):
+        normalize_position_ids(data)

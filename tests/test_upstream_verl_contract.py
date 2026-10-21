@@ -531,3 +531,66 @@ def test_multiturn_prompt_uses_native_continuous_token_api(multimodal):
                 await prepare_episode_prompt(loop, prompt)
 
     asyncio.run(prepare())
+
+
+@pytest.mark.parametrize("lengths", [(89, 89, 89, 89), (17, 23, 19), (4,), (4, 4), (1, 1, 1, 1)])
+@pytest.mark.parametrize("relabel", [False, True])
+def test_queue_positions_preserve_axes_through_native_microbatch_selection(lengths, relabel):
+    import torch
+    from tensordict import TensorDict
+    from transfer_queue.storage.managers.simple_storage_manager import AsyncSimpleStorageManager
+    from verl.utils.tensordict_utils import index_select_tensor_dict, maybe_fix_3d_position_ids
+
+    from flash.engine.worker.train.core.child.batch import normalize_position_ids
+
+    rows = [torch.arange(4 * n).reshape(4, n) + i * 1000 for i, n in enumerate(lengths)]
+    data = TensorDict(
+        {
+            "input_ids": torch.nested.as_nested_tensor(
+                [torch.arange(n) for n in lengths], layout=torch.jagged
+            ),
+            "position_ids": AsyncSimpleStorageManager._pack_field_values(rows),
+        },
+        batch_size=len(rows),
+    )
+    if relabel:
+        maybe_fix_3d_position_ids(data)
+    normalize_position_ids(data)
+    normalize_position_ids(data)  # repeated infer/ref/train admission preserves the same positions
+    selected = index_select_tensor_dict(data, list(reversed(range(len(rows)))))
+    for actual, expected in zip(selected["position_ids"].unbind(), reversed(rows), strict=True):
+        torch.testing.assert_close(actual, expected)
+
+
+@pytest.mark.parametrize("method", ["infer_batch", "train_mini_batch"])
+def test_flash_worker_decodes_positions_before_upstream_execution(monkeypatch, method):
+    import torch
+    from tensordict import TensorDict
+    from transfer_queue.storage.managers.simple_storage_manager import AsyncSimpleStorageManager
+    from verl.workers.engine_workers import TrainingWorker
+
+    from flash.engine.worker.train.core.child.worker import (
+        FlashActorRolloutWorker,
+        FlashTrainingWorker,
+    )
+
+    expected = [torch.arange(28).reshape(4, 7), torch.arange(28, 56).reshape(4, 7)]
+    data = TensorDict(
+        {
+            "input_ids": torch.nested.as_nested_tensor([torch.arange(7)] * 2, layout=torch.jagged),
+            "position_ids": AsyncSimpleStorageManager._pack_field_values(expected),
+        },
+        batch_size=2,
+    )
+
+    def execute(self, actual):
+        for row, reference in zip(actual["position_ids"].unbind(), expected, strict=True):
+            torch.testing.assert_close(row, reference)
+        return "native result"
+
+    monkeypatch.setattr(TrainingWorker, method, execute)
+    assert FlashActorRolloutWorker.actor_worker_cls is FlashTrainingWorker
+    assert FlashActorRolloutWorker.ref_worker_cls is FlashTrainingWorker
+    assert (
+        getattr(FlashTrainingWorker.__new__(FlashTrainingWorker), method)(data) == "native result"
+    )

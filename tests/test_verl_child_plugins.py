@@ -398,7 +398,15 @@ def test_optimizer_mutation_notice_precedes_real_update_and_is_once_per_optimize
 
 
 def test_physical_device_claims_reject_cross_rank_collisions(monkeypatch, tmp_path):
-    _modules(monkeypatch, {"verl.workers.engine_workers": {"ActorRolloutRefWorker": object}})
+    _modules(
+        monkeypatch,
+        {
+            "verl.workers.engine_workers": {
+                "ActorRolloutRefWorker": object,
+                "TrainingWorker": object,
+            }
+        },
+    )
     recipe = _import_recipe(monkeypatch, "flash.engine.worker.train.core.child.worker")
     path = str(tmp_path / "claims")
     recipe.claim_device(0, path, "gpu-a")

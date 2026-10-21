@@ -2,8 +2,9 @@
 
 import os
 
-from verl.workers.engine_workers import ActorRolloutRefWorker
+from verl.workers.engine_workers import ActorRolloutRefWorker, TrainingWorker
 
+from flash.engine.worker.train.core.child.batch import normalize_position_ids
 from flash.engine.worker.train.core.child.startup import initialize_process
 
 
@@ -25,7 +26,20 @@ def claim_device(rank, path, uuid):
             raise RuntimeError(f"ranks were bound to the SAME physical gpu: {collided}")
 
 
+class FlashTrainingWorker(TrainingWorker):
+    def infer_batch(self, data):
+        normalize_position_ids(data)
+        return super().infer_batch(data)
+
+    def train_mini_batch(self, data):
+        normalize_position_ids(data)
+        return super().train_mini_batch(data)
+
+
 class FlashActorRolloutWorker(ActorRolloutRefWorker):
+    actor_worker_cls = FlashTrainingWorker
+    ref_worker_cls = FlashTrainingWorker
+
     def __init__(self, config, *args, **kwargs):
         initialize_process()
         super().__init__(config, *args, **kwargs)
