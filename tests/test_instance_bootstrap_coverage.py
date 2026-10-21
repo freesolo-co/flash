@@ -914,6 +914,13 @@ def test_run_mode_leaves_a_deadline_already_inside_the_budget_alone(monkeypatch)
     ids=["system-exit", "keyboard-interrupt"],
 )
 def test_run_mode_reaps_uploader_before_base_exception_propagates(monkeypatch, wait_error):
+    # The worker is a fake PID; verify teardown without signalling the host.
+    torn_down = []
+    monkeypatch.setattr(
+        b._bootstrap_processes,
+        "terminate_process_group",
+        lambda proc, **kwargs: torn_down.append((proc, kwargs)),
+    )
     uploader = _ReapTrackedUploader()
     stop_upload = threading.Event()
     monkeypatch.setattr(
@@ -931,6 +938,8 @@ def test_run_mode_reaps_uploader_before_base_exception_propagates(monkeypatch, w
         b.run_mode({"attempt": 0, "run_id": "run-1"}, {}, "sft", deadline_ts=b.time.time() + 100)
 
     assert raised.value is wait_error
+    assert len(torn_down) == 1
+    assert torn_down[0][1]["process_group_id"] == torn_down[0][0].pid
     assert stop_upload.is_set()
     assert uploader.is_alive() is False
     assert uploader.close_called is True
@@ -947,6 +956,13 @@ def test_run_mode_reaps_uploader_before_base_exception_propagates(monkeypatch, w
     ids=["system-exit", "keyboard-interrupt", "unexpected-exception", "host-interruption"],
 )
 def test_wait_error_reaps_uploader_before_propagating_to_terminal_marker(monkeypatch, wait_error):
+    # The worker is a fake PID; verify teardown without signalling the host.
+    torn_down = []
+    monkeypatch.setattr(
+        b._bootstrap_processes,
+        "terminate_process_group",
+        lambda proc, **kwargs: torn_down.append((proc, kwargs)),
+    )
     uploader = _ReapTrackedUploader()
     stop_upload = threading.Event()
     marker_states = []
@@ -1000,6 +1016,8 @@ def test_wait_error_reaps_uploader_before_propagating_to_terminal_marker(monkeyp
 
     assert b.main() == 1
 
+    assert len(torn_down) == 1
+    assert torn_down[0][1]["process_group_id"] == torn_down[0][0].pid
     assert stop_upload.is_set()
     assert uploader.is_alive() is False
     assert uploader.close_called is True
