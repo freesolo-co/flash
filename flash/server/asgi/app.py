@@ -179,7 +179,6 @@ def create_app():
         finally:
             deployment_cleanup_stop.set()
             app.state.training_jobs.close()
-            deployment_cleanup_stop.set()
             startup_report_stop.set()
             startup_report_task.cancel()
             with contextlib.suppress(asyncio.CancelledError, Exception):
