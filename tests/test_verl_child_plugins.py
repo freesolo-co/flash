@@ -150,7 +150,8 @@ def test_packaged_runtime_has_no_import_interception_or_dependency_method_rebind
 
 
 @pytest.mark.parametrize("enabled", [True, False])
-def test_model_options_are_owned_by_each_engine(monkeypatch, enabled):
+@pytest.mark.parametrize("reentrant", [True, False])
+def test_model_options_are_owned_by_each_engine(monkeypatch, enabled, reentrant):
     calls = []
 
     class BaseEngine:
@@ -174,9 +175,7 @@ def test_model_options_are_owned_by_each_engine(monkeypatch, enabled):
         enable_input_require_grads=lambda: calls.append("input"),
         gradient_checkpointing_enable=lambda **kw: calls.append(kw),
     )
-    runtime = RuntimeOptions(
-        "sft", 7, "ready", reentrant_gradient_checkpointing=True, multimodal=True
-    )
+    runtime = RuntimeOptions("sft", 7, "ready", reentrant_checkpointing=reentrant, multimodal=True)
     engine = recipe.FlashFSDPEngine(
         model_config=SimpleNamespace(
             runtime_options=runtime.encode(), module=module, enable_gradient_checkpointing=enabled
@@ -186,7 +185,7 @@ def test_model_options_are_owned_by_each_engine(monkeypatch, enabled):
     assert engine._build_module() is module
     expected = (
         ["input", {"gradient_checkpointing_kwargs": {"use_reentrant": True}}, "vision"]
-        if enabled
+        if reentrant
         else []
     )
     assert calls == expected

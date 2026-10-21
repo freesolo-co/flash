@@ -28,9 +28,7 @@ class FlashFSDPEngine(FSDPEngineWithLMHead):
     def _build_module(self):
         module = super()._build_module()
         options = self.runtime
-        if self.model_config.enable_gradient_checkpointing and (
-            options.reentrant_gradient_checkpointing or options.reentrant_checkpointing
-        ):
+        if options.reentrant_checkpointing:
             module.enable_input_require_grads()
             module.gradient_checkpointing_enable(
                 gradient_checkpointing_kwargs={"use_reentrant": True}

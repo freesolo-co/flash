@@ -11,7 +11,6 @@ class RuntimeOptions:
     seed: int = 42
     save_at_steps: tuple[int, ...] = ()
     checkpoint_published_dir: str = ""
-    reentrant_gradient_checkpointing: bool = False
     reentrant_checkpointing: bool = False
     lora_language_prefix: str = ""
     multimodal: bool = False

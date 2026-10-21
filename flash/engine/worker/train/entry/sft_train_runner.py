@@ -568,7 +568,7 @@ def _write_sft_launch(
             "save_at_steps": list(options.save_at_steps),
             "checkpoint_published_dir": os.path.join(options.paths.export_root, "_published"),
             "total_steps": int(model.update_horizon),
-            "reentrant_gradient_checkpointing": bool(model.reentrant_gradient_checkpointing),
+            "reentrant_checkpointing": bool(model.reentrant_gradient_checkpointing),
             "lora_language_prefix": (
                 get_model(options.model_id).lora_language_prefix if text_only else ""
             ),
