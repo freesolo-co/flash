@@ -19,9 +19,9 @@ from types import SimpleNamespace
 import pytest
 
 import flash.core.spec as runner_spec
-import flash.runner.accounting.reconciliation as runner_reconciliation
 import flash.runner.lifecycle.preparation as runner_preparation
 import flash.runner.lifecycle.reporting as runner_reporting
+import flash.runner.lifecycle.resource_cleanup as runner_cleanup
 import flash.runner.lifecycle.state as runner_state
 import flash.runner.lifecycle.status as runner_status
 import flash.runner.lifecycle.submit as runner_submit
@@ -5805,7 +5805,7 @@ def test_recover_runs_drains_private_cleanup_for_terminal_run(monkeypatch, tmp_p
     monkeypatch.setattr(app_mod.db, "all_runs", lambda: [{"run_id": run_id}])
     drained = []
     monkeypatch.setattr(
-        runner_reconciliation, "_drain_cleanup_remotes", lambda rid: drained.append(rid) or set()
+        runner_cleanup, "_drain_cleanup_remotes", lambda rid: drained.append(rid) or set()
     )
     monkeypatch.setattr(providers_mod, "configured_providers", list)
 

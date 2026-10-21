@@ -1,4 +1,4 @@
-"""Remote resource reconciliation and cleanup tracking."""
+"""Remote resource cleanup tracking and guarded run recovery."""
 
 from __future__ import annotations
 

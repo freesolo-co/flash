@@ -127,8 +127,8 @@ def _clear_remote_if_unchanged(run_id: str, expected_remote: dict) -> bool:
     Compare-and-clear under the status guard: a racing write that installed a DIFFERENT remote must
     keep it, or the run loses the only handle to a live billing resource.
     """
-    from flash.runner.accounting.reconciliation import _remote_resource_identity
     from flash.runner.lifecycle.reporting import _report_status
+    from flash.runner.lifecycle.resource_cleanup import _remote_resource_identity
     from flash.runner.lifecycle.state import _save_status_unlocked, _status_guard
     from flash.runner.lifecycle.status import get_status
 
@@ -155,7 +155,7 @@ def _drain_confirmed_cleanup(run_id: str) -> set[tuple]:
     A record still present after the drain was NOT confirmed, so it is left for a later attempt;
     only records that disappeared are reported, and each has its status entry cleared.
     """
-    from flash.runner.accounting.reconciliation import (
+    from flash.runner.lifecycle.resource_cleanup import (
         _cleanup_remote_key,
         _drain_cleanup_remotes,
         _remote_resource_identity,
@@ -186,7 +186,7 @@ def _drain_confirmed_cleanup(run_id: str) -> set[tuple]:
 
 def _teardown_or_preserve_remote(run_id: str, remote: dict) -> bool:
     """cancellation clears a resource only after confirmed deletion."""
-    from flash.runner.accounting.reconciliation import reconcile_cleanup
+    from flash.runner.lifecycle.resource_cleanup import reconcile_cleanup
 
     cleanup = reconcile_cleanup(run_id, remote)
     if not cleanup.resource_deleted and not cleanup.obligation_recorded:
@@ -205,7 +205,7 @@ def _teardown_persisted_remotes(
     Stops on the first remote that could not be confirmed torn down, unless the status has since
     moved to a different one -- an already-confirmed identity is cleared without a second teardown.
     """
-    from flash.runner.accounting.reconciliation import _remote_resource_identity
+    from flash.runner.lifecycle.resource_cleanup import _remote_resource_identity
     from flash.runner.lifecycle.status import get_status
 
     processed_remote_identities = set()

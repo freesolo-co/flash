@@ -113,7 +113,7 @@ def _matching_persisted_status(status: Any) -> dict[str, Any] | None:
 
 def _canonical_remote_attempt(remote: object) -> int | None:
     try:
-        from flash.runner.accounting.reconciliation import _canonical_cleanup_remote
+        from flash.runner.lifecycle.resource_cleanup import _canonical_cleanup_remote
 
         canonical = _canonical_cleanup_remote(remote)
     except Exception:

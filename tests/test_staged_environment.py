@@ -26,8 +26,8 @@ import flash.engine.worker.perf as worker_perf
 import flash.engine.worker.runtime.kernel_warmup as worker_kernel_warmup
 import flash.engine.worker.runtime.state as worker_state
 import flash.runner.accounting.artifacts as runner_artifacts
-import flash.runner.accounting.reconciliation as runner_reconciliation
 import flash.runner.lifecycle.preparation as runner_preparation
+import flash.runner.lifecycle.resource_cleanup as runner_cleanup
 import flash.runner.lifecycle.state as runner_state
 import flash.runner.lifecycle.status as runner_status
 import flash.runner.supervise.lifecycle as runner_lifecycle
@@ -847,8 +847,8 @@ def test_confirmed_teardown_staging_transient_defers_without_clearing_or_allocat
     monkeypatch.setattr(attempt_recovery, "_completed_worker_metrics", lambda *_a, **_k: None)
     monkeypatch.setattr(attempt_recovery, "_strict_teardown_handle", lambda *_a, **_k: True)
     monkeypatch.setattr(runner_artifacts, "stage_environment_package", transient_stage)
-    monkeypatch.setattr(runner_reconciliation, "_compare_and_clear_remote", record_clear)
-    monkeypatch.setattr(runner_reconciliation, "_compare_and_fail_remote", record_fail)
+    monkeypatch.setattr(runner_cleanup, "_compare_and_clear_remote", record_clear)
+    monkeypatch.setattr(runner_cleanup, "_compare_and_fail_remote", record_fail)
     monkeypatch.setattr(runner_lifecycle, "_run_training", forbidden_training)
     monkeypatch.setattr("flash.providers.core.allocator.allocate", forbidden_allocation)
     monkeypatch.setattr(
