@@ -438,6 +438,11 @@ def test_every_required_grpo_patch_is_registered_deferred(monkeypatch, tmp_path)
 
     grpo_plugin.install()
 
+    assert registered.pop(0)[:3] == (
+        "compact-checkpoint",
+        config["marker_file"],
+        "verl.utils.checkpoint.fsdp_checkpoint_manager",
+    )
     assert [entry[0] for entry in registered] == [
         "rank-device-assert",
         "nonempty-response-mask",
@@ -502,7 +507,7 @@ def test_parent_and_child_share_required_patch_registry(monkeypatch, tmp_path):
     grpo_plugin.install()
 
     expected = grpo_plugin.required_patch_names(config)
-    assert installed == expected
+    assert installed == ["compact-checkpoint", *expected]
     assert expected == [
         "rank-device-assert",
         "nonempty-response-mask",
@@ -648,6 +653,11 @@ def test_nonempty_response_mask_patch_is_required_and_marker_wired(monkeypatch, 
 
     grpo_plugin.install()
 
+    assert registered.pop(0)[:3] == (
+        "compact-checkpoint",
+        config["marker_file"],
+        "verl.utils.checkpoint.fsdp_checkpoint_manager",
+    )
     assert registered == [
         (
             "nonempty-response-mask",

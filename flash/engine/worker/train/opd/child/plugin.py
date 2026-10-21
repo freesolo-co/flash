@@ -987,6 +987,7 @@ if PLUGIN_LOADED_EXTERNALLY:
     import flash_verl_runtime
 
     _PLUGIN_CONFIG.update(flash_verl_runtime.load_plugin_config("FLASH_OPD_PLUGIN_CONFIG"))
+    flash_verl_runtime.install_compact_checkpoints(str(_PLUGIN_CONFIG["marker_file"]))
     flash_opd_runtime.install(_PLUGIN_CONFIG)
 else:
     from flash.engine.worker.train.opd.child import runtime as flash_opd_runtime

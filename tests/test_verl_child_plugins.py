@@ -199,6 +199,7 @@ expected_names = {
 }
 assert set(flash_grpo_plugin.required_patch_names(config)) == expected_names
 expected_target_counts = {
+    "verl.utils.checkpoint.fsdp_checkpoint_manager": 1,
     "verl.single_controller.base.worker": 1,
     "verl.trainer.ppo.rollout_corr_helper": 1,
     "verl.experimental.agent_loop.agent_loop": 5,

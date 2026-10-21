@@ -403,6 +403,42 @@ def _offline(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _offline_model_revision(monkeypatch):
+    """All submissions now pin the base; keep unrelated lifecycle tests off the Hub."""
+    from types import SimpleNamespace
+
+    from huggingface_hub import HfApi
+
+    from flash.core.catalog import MODELS
+    from flash.engine.plan import vram
+
+    model_info = HfApi.model_info
+    fetch_geometry = vram.fetch_hf_model_geometry
+
+    def info(self, repo_id, *, revision=None, **kwargs):
+        if revision is None and repo_id in MODELS:
+            return SimpleNamespace(sha=PLACEHOLDER_HF_REVISION)
+        return model_info(self, repo_id, revision=revision, **kwargs)
+
+    def geometry(model_id, revision="", **kwargs):
+        if revision == PLACEHOLDER_HF_REVISION and model_id in MODELS:
+            row = MODELS[model_id]
+            return (
+                row.params_b,
+                row.vocab_size,
+                row.hidden_size,
+                row.num_layers,
+                row.num_attention_heads,
+            )
+        return fetch_geometry(model_id, revision, **kwargs)
+
+    # Only the synthetic pin uses catalog geometry. Tests of real revision handling
+    # still exercise the original probe, and test-local Hub mocks override this fixture.
+    monkeypatch.setattr(HfApi, "model_info", info)
+    monkeypatch.setattr(vram, "fetch_hf_model_geometry", geometry)
+
+
+@pytest.fixture(autouse=True)
 def _child_subreaper_does_not_leak_between_tests():
     """Restore PR_SET_CHILD_SUBREAPER after every test, not just the ones that opt in.
 

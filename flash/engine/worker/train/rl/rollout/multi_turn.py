@@ -664,6 +664,10 @@ GRPO_CHILD_MODULES = (
     (os.path.join("train", "core", "child", "runtime.py"), "flash_verl_runtime.py"),
     (os.path.join("train", "core", "child", "flashinfer_cache.py"), "flash_verl_flashinfer.py"),
     (
+        os.path.join("train", "core", "child", "compact_checkpoint.py"),
+        "flash_compact_checkpoint.py",
+    ),
+    (
         os.path.join("..", "..", "content", "reasoning_normalization.py"),
         "flash_reasoning_normalization.py",
     ),
