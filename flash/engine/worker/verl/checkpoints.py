@@ -44,12 +44,8 @@ from flash.engine.worker.model.lora import (
 from flash.engine.worker.runtime.state import WorkerContext
 
 
-class MergeDiskHeadroomError(RuntimeError):
-    """the merged model this export must write does not fit beside the checkpoint it reads."""
-
-
 class MergeDiskExhaustedError(RuntimeError):
-    """the merge started with room and then ran the disk out partway through writing its output."""
+    """adapter serialization exhausted disk space or quota while writing its output."""
 
 
 # a genuine short write leaves almost no free space; keep the fallback absolute so a normal partial
@@ -68,7 +64,6 @@ _DISK_EXHAUSTED_MARKERS = (
     "os error 122",
 )
 _SHORT_WRITE_MARKERS = ("unexpected pos",)
-_FSDP_MODEL_SHARD_RE = re.compile(r"model_world_size_(\d+)_rank_\d+\.pt")
 
 # disk size is platform-managed, so checkpoint frequency is the reachable remedy.
 _FEWER_CHECKPOINTS_ADVICE = (
@@ -76,41 +71,6 @@ _FEWER_CHECKPOINTS_ADVICE = (
     "publishes only the final adapter), or drop entries from train.save_at_steps if the run sets "
     "them -- exact steps override save_every and are always published."
 )
-
-
-def _model_shard_bytes(path: str) -> int:
-    """total size of the top-level fsdp model shards the merger reads."""
-    try:
-        names = os.listdir(path)
-    except OSError:
-        return 0
-    total = 0
-    for name in names:
-        if _FSDP_MODEL_SHARD_RE.fullmatch(name) is None:
-            continue
-        try:
-            total += os.stat(os.path.join(path, name)).st_size
-        except OSError:
-            continue
-    return total
-
-
-def require_merge_headroom(ckpt_actor_dir: str, merge_out: str) -> None:
-    """fail before the merger when its full-bf16 output cannot fit beside its input shards."""
-    need = _model_shard_bytes(ckpt_actor_dir)
-    if need <= 0:
-        return
-    free = _free_bytes(merge_out)
-    if free is None:
-        # an unreadable mount is not evidence of exhaustion; let the merger run and report for real.
-        return
-    if free >= need:
-        return
-    raise MergeDiskHeadroomError(
-        f"cannot export the adapter: merging {ckpt_actor_dir} needs about "
-        f"{need / 1e9:.1f} GB beside it but only {free / 1e9:.1f} GB is free. "
-        + _FEWER_CHECKPOINTS_ADVICE
-    )
 
 
 def _run_merger(cmd: list[str], env: dict[str, str]) -> None:
@@ -492,7 +452,8 @@ def export_peft_adapter(
     os.makedirs(out_adapter_dir, exist_ok=True)
     merge_out = out_adapter_dir.rstrip("/") + "_merge"
     shutil.rmtree(merge_out, ignore_errors=True)
-    require_merge_headroom(ckpt_actor_dir, merge_out)
+    # Input shards may contain the frozen base; their size does not estimate adapter output.
+    # Native serialization and the disk-error classifier below provide actual write evidence.
     merge_env = dict(os.environ)
     # the merger reads only local checkpoint files: strip credentials/tokens from its env (least
     # privilege), and keep it fully offline so it never touches hf's rate-limited api.

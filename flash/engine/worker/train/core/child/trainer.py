@@ -1,5 +1,6 @@
 """Shared synchronous trainer policy using upstream Verl's V1 lifecycle hooks."""
 
+import contextlib
 import importlib
 
 from omegaconf import OmegaConf
@@ -86,7 +87,9 @@ class FlashTaskRunner:
             try:
                 tracking = getattr(trainer, "logger", None)
                 if tracking is not None:
-                    tracking.finish(exit_code=0 if succeeded else 1)
+                    # Optional telemetry must not hide the training outcome or skip draining.
+                    with contextlib.suppress(Exception):
+                        tracking.finish(exit_code=0 if succeeded else 1)
                 if getattr(trainer, "_dump_executor", None) is not None:
                     trainer._shutdown_dump_executor()
             finally:

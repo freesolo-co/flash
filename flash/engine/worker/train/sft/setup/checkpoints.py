@@ -27,7 +27,6 @@ from flash.engine.worker.train.entry.backend_common import (
 )
 from flash.engine.worker.verl.checkpoints import (
     MergeDiskExhaustedError,
-    MergeDiskHeadroomError,
     resume_upload_unavailable,
 )
 
@@ -143,7 +142,7 @@ class _VerlCheckpointWatcher:
             pass
 
     def raise_if_failed(self) -> None:
-        if isinstance(self._error, (MergeDiskHeadroomError, MergeDiskExhaustedError)):
+        if isinstance(self._error, MergeDiskExhaustedError):
             raise self._error
         if self._error is not None:
             raise RuntimeError("verl checkpoint watcher failed") from self._error

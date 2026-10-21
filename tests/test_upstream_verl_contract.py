@@ -171,7 +171,10 @@ def test_native_replay_returns_whole_groups_or_fails_before_consuming(monkeypatc
 
 
 @pytest.mark.parametrize("failure", [None, "queue", "init", "fit"])
-def test_task_runner_closes_resources_without_masking_startup_failure(monkeypatch, failure):
+@pytest.mark.parametrize("tracking_fails", [False, True])
+def test_task_runner_closes_resources_without_masking_startup_failure(
+    monkeypatch, failure, tracking_fails
+):
     import transfer_queue as tq
 
     from flash.engine.worker.train.core.child import trainer as recipe
@@ -195,9 +198,12 @@ def test_task_runner_closes_resources_without_masking_startup_failure(monkeypatc
         get_reward_handles = get_llm_client
 
         def fit(self, manager):
-            self.logger = SimpleNamespace(
-                finish=lambda exit_code: events.append(("finish", exit_code))
-            )
+            def finish(exit_code):
+                events.append(("finish", exit_code))
+                if tracking_fails:
+                    raise OSError("tracking unavailable")
+
+            self.logger = SimpleNamespace(finish=finish)
             if failure == "fit":
                 raise ValueError("fit failed")
             events.append("trained")
