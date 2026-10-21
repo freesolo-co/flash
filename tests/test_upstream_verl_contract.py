@@ -170,7 +170,7 @@ def test_native_replay_returns_whole_groups_or_fails_before_consuming(monkeypatc
         assert clears == [{"partition_id": "train", "keys": ["prompt"]}]
 
 
-@pytest.mark.parametrize("failure", [None, "init", "fit"])
+@pytest.mark.parametrize("failure", [None, "queue", "init", "fit"])
 def test_task_runner_closes_resources_without_masking_startup_failure(monkeypatch, failure):
     import transfer_queue as tq
 
@@ -217,10 +217,21 @@ def test_task_runner_closes_resources_without_masking_startup_failure(monkeypatc
         return original_import(name)
 
     config = _config("opd")
+
+    def init_queue(*args):
+        events.append("queue")
+        if failure == "queue":
+            raise RuntimeError("queue initialization timed out")
+
     monkeypatch.setattr(recipe.importlib, "import_module", import_module)
-    monkeypatch.setattr(recipe, "_init_transfer_queue", lambda *args: events.append("queue"))
+    monkeypatch.setattr(recipe, "_init_transfer_queue", init_queue)
     monkeypatch.setattr(recipe, "publish_ready", lambda options: events.append("ready"))
     monkeypatch.setattr(tq, "close", lambda: events.append("closed"))
+    if failure == "queue":
+        with pytest.raises(RuntimeError, match="queue initialization timed out"):
+            recipe.FlashTaskRunner().run(config)
+        assert events == ["queue"]
+        return
     if failure:
         with pytest.raises(ValueError, match=f"{failure} failed"):
             recipe.FlashTaskRunner().run(config)

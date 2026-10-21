@@ -10,9 +10,9 @@ class OwnedTracking(Tracking):
     def __init__(self, *args, **kwargs):
         self.run = None
         super().__init__(*args, **kwargs)
-        self.run = getattr(self.logger.get("wandb"), "run", None)
-        if self.run is not None:
-            with contextlib.suppress(Exception):
+        with contextlib.suppress(Exception):
+            self.run = getattr(self.logger.get("wandb"), "run", None)
+            if self.run is not None:
                 print(
                     "FLASH_WANDB_LINK "
                     + json.dumps({"wandb_url": self.run.url, "wandb_id": self.run.id}),

@@ -67,8 +67,10 @@ class FlashTaskRunner:
         OmegaConf.resolve(config)
         trainer = None
         succeeded = False
+        # A timed-out init still owns a blocked daemon thread. Only enter queue cleanup
+        # after successful initialization; close must never race that thread.
+        _init_transfer_queue(tq.init, config.transfer_queue)
         try:
-            _init_transfer_queue(tq.init, config.transfer_queue)
             trainer = trainer_type(config=config)
             trainer.init()
             manager = manager_type.create(

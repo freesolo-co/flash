@@ -170,10 +170,8 @@ def test_rollout_versions_are_isolated_across_reused_concurrent_episodes():
 
 
 @pytest.mark.parametrize("failed_property", ["run", "url", "id", None])
-def test_tracking_link_lookup_is_optional(monkeypatch, capsys, failed_property):
-    _modules(monkeypatch, {"verl.utils.tracking": {"Tracking": object}})
-    recipe = _import_recipe(monkeypatch, "flash.engine.worker.train.core.child.tracking")
-
+@pytest.mark.parametrize("owned", [False, True])
+def test_tracking_link_lookup_is_optional(monkeypatch, capsys, failed_property, owned):
     class Run:
         @property
         def url(self):
@@ -194,7 +192,16 @@ def test_tracking_link_lookup_is_optional(monkeypatch, capsys, failed_property):
                 raise RuntimeError("offline")
             return Run()
 
-    recipe.publish_tracking_link(SimpleNamespace(logger={"wandb": Logger()}))
+    class Tracking:
+        def __init__(self):
+            self.logger = {"wandb": Logger()}
+
+    _modules(monkeypatch, {"verl.utils.tracking": {"Tracking": Tracking}})
+    recipe = _import_recipe(monkeypatch, "flash.engine.worker.train.core.child.tracking")
+    if owned:
+        recipe.OwnedTracking()
+    else:
+        recipe.publish_tracking_link(Tracking())
     output = capsys.readouterr().out
     if failed_property:
         assert output == ""
