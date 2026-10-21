@@ -21,7 +21,7 @@ sweep charges it through the SAME path as a completed run.
 It runs once at startup (so a crash between the ``done`` write and the charge is recovered promptly,
 even though those runs are terminal and outside recover_runs) and then on a fixed interval, which is
 the bounded backoff. Gated on the operator internal key (the charge needs it); off entirely without
-FREESOLO_INTERNAL_KEY, exactly like realized-cost reconciliation.
+FREESOLO_INTERNAL_KEY.
 """
 
 from __future__ import annotations

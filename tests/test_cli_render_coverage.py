@@ -310,7 +310,7 @@ def test_deployments_table_surfaces_base_url_and_handles_missing_value(styled_pl
     assert "-" in out
 
 
-def test_run_status_shows_realized_cost_and_artifacts(styled_plain) -> None:
+def test_run_status_shows_cost_and_artifacts(styled_plain) -> None:
     obj = {
         "run_id": "flash-1",
         "state": "done",
@@ -320,13 +320,12 @@ def test_run_status_shows_realized_cost_and_artifacts(styled_plain) -> None:
             "algorithm": "grpo",
         },
         "cost_usd": 0.10,
-        "realized_cost_usd": 0.42,
         "artifacts_dir": "/tmp/run/artifacts",
         "error": "something broke",
     }
     out = render.run_status(obj)
-    assert "realized" in out
-    assert "$0.4200" in out  # money() with default 4 decimals
+    assert "realized" not in out
+    assert "$0.1000" in out
     assert "artifacts" in out
     assert "/tmp/run/artifacts" in out
     assert "something broke" in out
@@ -453,13 +452,7 @@ def test_a_failed_run_that_never_measured_a_charge_is_not_reported_as_settled_ze
 
 
 def test_realized_cogs_is_never_shown_as_the_customers_cost() -> None:
-    """``realized_cost_usd`` is provider COGS, not what the customer is charged.
-
-    ``runner_state.RunStatus`` says so directly: it is pulled from the provider's billing API by
-    reconciliation and is "distinct from ``cost_usd`` (the flash.cost ESTIMATE we charge the
-    customer)". Promoting it into the cost slot would bill the user our internal spend, and
-    ``run_status`` already prints it on its own dedicated ``realized`` row.
-    """
+    """Legacy reconciliation fields do not replace the customer quote."""
     amount, _ = cost.run_cost(
         {
             "state": "failed",

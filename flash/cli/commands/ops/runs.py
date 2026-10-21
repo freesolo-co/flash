@@ -95,8 +95,7 @@ def _log_follow_progress(status: dict | None, fallback_state: str) -> tuple[str,
         parts.append(f"attempt={attempt}")
     # what this run has committed to spend so far. while it is live that is the submit-time quote,
     # since the settled charge is not written until the terminal transition -- following a run for an
-    # hour and never seeing a cost is how a user loses track of what it is costing. it sits next to
-    # realized_cost below so the quote and the settled charge read as one pair.
+    # hour and never seeing a cost is how a user loses track of what it is costing.
     #
     # a settled zero is a real answer and prints: `runs list` and `runs status` both show $0.0000
     # there, and dropping it only here made the same terminal run read as costed in one surface and
@@ -106,12 +105,6 @@ def _log_follow_progress(status: dict | None, fallback_state: str) -> tuple[str,
     settled = str(status.get("state") or "") in cost_ui.SETTLED_COST_STATES
     if amount or is_estimate or settled:
         parts.append(f"cost={'~' if is_estimate else ''}${amount:.4f}")
-    realized = status.get("realized_cost_usd")
-    if realized is not None:
-        if isinstance(realized, (int, float)):
-            parts.append(f"realized_cost=${realized:.4f}")
-        else:
-            parts.append(f"realized_cost={realized}")
     return state, " ".join(parts)
 
 

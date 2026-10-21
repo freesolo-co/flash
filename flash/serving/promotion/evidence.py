@@ -205,12 +205,9 @@ class AccountingEvidence:
 def parse_accounting(payload: Any) -> AccountingEvidence | None:
     """Read a `serving_promotion_accounting_snapshot` body, or None when it is not one.
 
-    Parsing the RPC body directly -- rather than an `OutboxSnapshot` built from it -- is deliberate.
-    `DurableUsageOutbox.snapshot` coerces every absent counter with `int(... or 0)`, which is right
-    for a delivery worker deciding whether to wake up and wrong for a gate: zero is precisely the
-    value that means "healthy", so a body that lost its fields to a rename, a schema drift, or a
-    permission-shaped empty result would read as a perfectly drained backlog and PASS. Absence has
-    to survive parsing to be rejected here.
+    Missing counters must remain distinguishable from zero: zero means healthy, whereas missing
+    fields can indicate schema drift or a permission-shaped empty result. Reject incomplete
+    evidence rather than treating it as a drained backlog.
     """
     if isinstance(payload, list):
         payload = payload[0] if payload else None

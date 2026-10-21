@@ -884,7 +884,7 @@ def test_failed_attached_opd_worker_decodes_present_marker_after_teardown(monkey
     assert status.state == "failed"
     assert status.remote is None
     assert status.cleanup_confirmed_remote == _remote(attempt=0)
-    assert status.realized_cost_remote == _remote(attempt=0)
+    assert status.billing_remote == _remote(attempt=0)
     assert "replacement is blocked" in status.error
     assert [name for name, _kwargs in private_hf.calls] == [
         "repo_info",
