@@ -17,6 +17,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from flash.serve.app.openai import ReasoningDeltaSplitter, split_reasoning
+from flash.serving.src.accounting.usage import AuthorizedTraffic, principal_for_external_org
 from flash.serving.src.http.router import AdapterRouter
 from flash.serving.src.http.router import build_offline_serving_app as build_serving_app
 from flash.serving.src.io.schemas import AdapterRecord
@@ -26,8 +27,8 @@ from tests.serving.conftest import attest
 QWEN = "Qwen/Qwen3.5-9B"
 
 
-async def _allow(_token: str, _adapter_id: str, _scope: dict | None = None) -> str:
-    return "org-1"
+async def _allow(_token: str, _adapter_id: str, _scope: dict | None = None) -> AuthorizedTraffic:
+    return AuthorizedTraffic(principal_for_external_org("org-1"), "generation-a")
 
 
 def _rec(run_id: str, *, thinking: bool = True) -> AdapterRecord:

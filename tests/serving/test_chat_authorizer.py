@@ -342,7 +342,7 @@ def test_cancelled_waiter_does_not_cancel_shared_authorization(modal_app_module,
 
     results = asyncio.run(run())
     assert isinstance(results[0], asyncio.CancelledError)
-    assert results[1:] == ["org-1"] * 9
+    assert [result.principal.orgId for result in results[1:]] == ["org-1"] * 9
     assert calls["n"] == 1
 
 
@@ -358,7 +358,8 @@ def test_successful_authorization_is_cached_within_ttl(modal_app_module, monkeyp
         return first, second
 
     first, second = asyncio.run(run())
-    assert first == second == "org-1"
+    assert first == second
+    assert first.principal.orgId == "org-1"
     assert calls["n"] == 1
 
 
@@ -373,7 +374,7 @@ def test_concurrent_identical_lookups_coalesce_to_one_call(modal_app_module, mon
         return await asyncio.gather(*[authorize("key", "ad") for _ in range(50)])
 
     orgs = asyncio.run(run())
-    assert orgs == ["org-1"] * 50
+    assert [org.principal.orgId for org in orgs] == ["org-1"] * 50
     assert calls["n"] == 1  # single-flight collapsed the stampede into ONE backend call
 
 
@@ -412,7 +413,7 @@ def test_failed_authorization_is_not_cached(modal_app_module, monkeypatch):
         return await authorize("key", "ad")
 
     org = asyncio.run(run())
-    assert org == "org-1"
+    assert org.principal.orgId == "org-1"
     assert calls["n"] == 2
 
 
@@ -545,7 +546,7 @@ def test_checkpoint_authorization_is_rechecked_after_a_prior_success(modal_app_m
     calls = _counting_client(
         monkeypatch,
         lambda n: (
-            _FakeResp(200, {"ok": True, "orgId": "org-1"})
+            _FakeResp(200, {"orgId": "org-1", "deploymentGeneration": "generation-a"})
             if n == 1
             else _FakeResp(404, {"detail": "not verified"})
         ),
@@ -553,10 +554,30 @@ def test_checkpoint_authorization_is_rechecked_after_a_prior_success(modal_app_m
     authorize = _new_authorizer(modal_app_module)
 
     async def scenario():
-        assert await authorize("key", "run-1/final") == "org-1"
+        authorized = await authorize("key", "run-1/final")
+        assert authorized.principal.orgId == "org-1"
+        assert authorized.deployment_generation == "generation-a"
         with pytest.raises(HTTPException) as error:
             await authorize("key", "run-1/final")
         assert error.value.status_code == 403
 
     asyncio.run(scenario())
     assert calls["n"] == 2
+
+
+@pytest.mark.parametrize("generation", [None, "", "   ", 7])
+def test_checkpoint_authorization_requires_verified_generation(
+    modal_app_module, monkeypatch, generation
+):
+    import asyncio
+
+    from fastapi import HTTPException
+
+    authorize = _authorizer(
+        modal_app_module,
+        monkeypatch,
+        _FakeResp(200, {"orgId": "org-1", "deploymentGeneration": generation}),
+    )
+    with pytest.raises(HTTPException) as error:
+        asyncio.run(authorize("key", "run-1/final"))
+    assert error.value.status_code == 503

@@ -139,3 +139,28 @@ def test_ready_without_serving_generation_cannot_be_committed(run, serving_gener
     with pytest.raises(ValueError, match="verification"):
         transitions.mark_checkpoint_deployed(run, ready_record)
     assert status.get_status(run).deployments[attempt["checkpoint_id"]]["state"] == "queued"
+
+
+@pytest.mark.parametrize("initial_state", ["deployed", "training"])
+@pytest.mark.parametrize("with_ready_sibling", [False, True])
+def test_failed_legacy_reverification_reconciles_parent_state(
+    run, initial_state, with_ready_sibling
+):
+    if with_ready_sibling:
+        ready(run, 40)
+    saved = status.get_status(run)
+    saved.state = initial_state
+    legacy = {**queued(run, 20), "state": "ready", "verified_at": 1.0}
+    saved.deployments[legacy["checkpoint_id"]] = legacy
+    state._save_status(saved)
+
+    attempt = queued(run, 20, generation=2)
+    transitions.mark_deployment_pending(run, attempt, expect_state=initial_state)
+    result = transitions.mark_deployment_failed(run, {**attempt, "error": "smoke failed"})
+
+    expected = "done" if initial_state == "deployed" and not with_ready_sibling else initial_state
+    assert result.state == status.get_status(run).state == expected
+    assert result.deployments[attempt["checkpoint_id"]]["state"] == "failed"
+    assert (
+        any(is_ready(run, record) for record in result.deployments.values()) == with_ready_sibling
+    )

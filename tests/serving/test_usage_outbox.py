@@ -15,6 +15,7 @@ from fastapi.testclient import TestClient
 from flash.serving.src.accounting.usage import (
     _FREESOLO_USD_PER_MTOK,
     FREESOLO_PRICING_SOURCE,
+    AuthorizedTraffic,
     build_usage_session,
     freesolo_price,
     new_generation_id,
@@ -69,6 +70,7 @@ def _revision() -> AdapterRecord:
             "artifact_digest": hashlib.sha256(b"accounting-artifact").hexdigest(),
             "artifact_fingerprint": hashlib.sha256(b"accounting-binding").hexdigest(),
             "lora_rank": 16,
+            "deployment_generation": "generation-a",
         }
     )
 
@@ -348,8 +350,10 @@ def test_nonstream_capture_is_awaited_before_successful_response() -> None:
     pool = _Pool()
     store = _Store()
 
-    async def authorize(_token: str, _adapter_id: str, _scope: dict | None = None) -> str:
-        return "org-1"
+    async def authorize(
+        _token: str, _adapter_id: str, _scope: dict | None = None
+    ) -> AuthorizedTraffic:
+        return AuthorizedTraffic(principal_for_external_org("org-1"), "generation-a")
 
     app = build_serving_app(
         pool,
@@ -381,8 +385,10 @@ def test_stream_captures_in_progress_before_response_and_finalizes_same_id() -> 
     pool = _Pool()
     store = _Store()
 
-    async def authorize(_token: str, _adapter_id: str, _scope: dict | None = None) -> str:
-        return "org-1"
+    async def authorize(
+        _token: str, _adapter_id: str, _scope: dict | None = None
+    ) -> AuthorizedTraffic:
+        return AuthorizedTraffic(principal_for_external_org("org-1"), "generation-a")
 
     app = build_serving_app(
         pool,
@@ -463,8 +469,10 @@ def test_stream_finalization_preserves_first_event_attestation() -> None:
 def test_stream_capture_failure_before_headers_returns_controlled_503() -> None:
     record = _revision()
 
-    async def authorize(_token: str, _adapter_id: str, _scope: dict | None = None) -> str:
-        return "org-1"
+    async def authorize(
+        _token: str, _adapter_id: str, _scope: dict | None = None
+    ) -> AuthorizedTraffic:
+        return AuthorizedTraffic(principal_for_external_org("org-1"), "generation-a")
 
     app = build_serving_app(
         _Pool(),
@@ -490,8 +498,10 @@ def test_thinking_request_is_rejected_before_engine_dispatch() -> None:
     record = _revision().model_copy(update={"thinking": True})
     pool = _Pool()
 
-    async def authorize(_token: str, _adapter_id: str, _scope: dict | None = None) -> str:
-        return "org-1"
+    async def authorize(
+        _token: str, _adapter_id: str, _scope: dict | None = None
+    ) -> AuthorizedTraffic:
+        return AuthorizedTraffic(principal_for_external_org("org-1"), "generation-a")
 
     app = build_serving_app(
         pool,
@@ -510,8 +520,10 @@ def test_thinking_request_is_rejected_before_engine_dispatch() -> None:
 def test_nonstream_capture_failure_returns_controlled_503() -> None:
     record = _revision()
 
-    async def authorize(_token: str, _adapter_id: str, _scope: dict | None = None) -> str:
-        return "org-1"
+    async def authorize(
+        _token: str, _adapter_id: str, _scope: dict | None = None
+    ) -> AuthorizedTraffic:
+        return AuthorizedTraffic(principal_for_external_org("org-1"), "generation-a")
 
     app = build_serving_app(
         _Pool(),

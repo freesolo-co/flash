@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 from urllib.parse import quote
 
 import httpx
@@ -16,6 +17,7 @@ from flash.serve.contract.provenance import immutable_binding_fingerprint
 from flash.serve.contract.responses import matches_revision_identity
 from flash.server.routes import serving_smoke
 from flash.server.routes.serving_revisions import _authorized_chat_checkpoint
+from flash.serving.src.accounting.usage import AuthorizedTraffic, principal_for_external_org
 from flash.serving.src.engine.support import active_checkpoint_ref
 from flash.serving.src.http.router import build_offline_serving_app
 from flash.serving.src.http.routing import AdapterRouter
@@ -268,7 +270,7 @@ def test_hosted_authorizer_uses_freesolo_model_id_schema(monkeypatch) -> None:
 
         @staticmethod
         def json():
-            return {"orgId": "org-a"}
+            return {"orgId": "org-a", "deploymentGeneration": "generation-a"}
 
     class _Client:
         def __init__(self, *_args, **_kwargs):
@@ -285,7 +287,9 @@ def test_hosted_authorizer_uses_freesolo_model_id_schema(monkeypatch) -> None:
     authorize = modal_app._build_chat_authorizer(
         SimpleNamespace(backend_url="https://backend.example", internal_key="internal")
     )
-    assert asyncio.run(authorize("fs-key", "run-a/final")) == "org-a"
+    assert asyncio.run(authorize("fs-key", "run-a/final")) == AuthorizedTraffic(
+        principal_for_external_org("org-a"), "generation-a"
+    )
     assert seen == {"apiKey": "fs-key", "modelId": "run-a/final"}
 
 
@@ -462,3 +466,38 @@ def test_checkpoint_registration_rejects_bare_managed_selector() -> None:
         headers=_headers("org-a"),
     )
     assert response.status_code == 422
+
+
+@pytest.mark.parametrize("generation", ["generation-a", "generation-b", None])
+@pytest.mark.parametrize(
+    "route", ["/generate", "/adapters/shared/final/generate", "/v1/chat/completions"]
+)
+def test_external_request_uses_only_the_authorized_generation(generation, route):
+    record = _record("org-a").model_copy(update={"deployment_generation": "generation-a"})
+    current = record
+
+    async def authorize(*_args):
+        nonlocal current
+        # A redeploy can finish after authorization and before the fresh routing lookup.
+        current = record.model_copy(update={"deployment_generation": generation})
+        return AuthorizedTraffic(principal_for_external_org("org-a"), "generation-a")
+
+    pool = _Pool()
+    pool.generate = AsyncMock(wraps=pool.generate)
+    client = TestClient(
+        build_offline_serving_app(
+            pool,
+            AdapterRouter([record]),
+            chat_authorizer=authorize,
+            lookup_record=lambda *_args: current,
+        )
+    )
+    payload = (
+        {"model": record.model_id, "messages": [{"role": "user", "content": "hi"}]}
+        if route == "/v1/chat/completions"
+        else {"model_id": record.model_id, "prompt": "hi"}
+    )
+    response = client.post(route, json=payload, headers={"Authorization": "Bearer user-key"})
+
+    assert response.status_code == (200 if generation == "generation-a" else 503)
+    assert pool.generate.await_count == (1 if generation == "generation-a" else 0)

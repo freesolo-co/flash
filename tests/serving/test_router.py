@@ -16,6 +16,7 @@ import pytest
 from fastapi import BackgroundTasks, HTTPException, Request
 from fastapi.testclient import TestClient
 
+from flash.serving.src.accounting.usage import AuthorizedTraffic, principal_for_external_org
 from flash.serving.src.http.adapter_routes import remove_adapter
 from flash.serving.src.http.context import ServingContext
 from flash.serving.src.http.router import AdapterRouter
@@ -30,9 +31,9 @@ from tests.serving.checkpoint_fixtures import (
 from tests.serving.conftest import attest
 
 
-async def _allow(_token: str, _adapter_id: str, _scope: dict | None = None) -> str:
+async def _allow(_token: str, _adapter_id: str, _scope: dict | None = None) -> AuthorizedTraffic:
     """Permissive attributed authorizer for routing tests."""
-    return "org-1"
+    return AuthorizedTraffic(principal_for_external_org("org-1"), "generation-a")
 
 
 def _serve(*args, **kwargs):
@@ -1027,9 +1028,11 @@ def test_openai_chat_stream_sets_anti_buffering_headers(app_setup):
 def test_openai_chat_rejects_non_boolean_stream_after_authorization(stream):
     authorizations: list[str] = []
 
-    async def _authorize(_token: str, model_id: str, _scope: dict | None = None) -> str:
+    async def _authorize(
+        _token: str, model_id: str, _scope: dict | None = None
+    ) -> AuthorizedTraffic:
         authorizations.append(model_id)
-        return "org-1"
+        return AuthorizedTraffic(principal_for_external_org("org-1"), "generation-a")
 
     pool = FakePool()
     client = _serve(pool, _router_for("qa", QWEN), chat_authorizer=_authorize)
