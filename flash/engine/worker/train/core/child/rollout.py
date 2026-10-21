@@ -6,6 +6,13 @@ from verl.workers.rollout.vllm_rollout.vllm_async_server import vLLMHttpServer, 
 
 
 class FlashVLLMServer(vLLMHttpServer):
+    def _init_model_config(self, model_config):
+        from verl.utils.config import omega_conf_to_dataclass
+
+        from flash.engine.worker.train.core.child.configuration import FlashModelConfig
+
+        return omega_conf_to_dataclass(model_config, dataclass_type=FlashModelConfig)
+
     async def generate(self, *args, **kwargs):
         if self.lora_as_adapter and VLLM_LORA_INT_ID not in await self.engine.list_loras():
             raise RuntimeError(

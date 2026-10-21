@@ -355,3 +355,28 @@ def test_grpo_manager_registers_whole_tensordict_batch_before_native_dispatch(mo
     ]
     ledger.seal(17)
     ledger.finalize({17})
+
+
+@pytest.mark.parametrize("algorithm", ["grpo", "opd"])
+def test_rollout_server_decodes_extended_model_config(monkeypatch, algorithm):
+    from flash.engine.worker.train.core.child.configuration import FlashModelConfig
+    from tests.test_verl_child_plugins import _import_recipe, _modules
+
+    config = _config(algorithm)
+    # Exercise native structured decoding without downloading weights or starting a GPU server.
+    monkeypatch.setattr(FlashModelConfig, "__post_init__", lambda self: None)
+    _modules(
+        monkeypatch,
+        {
+            "verl.workers.rollout.vllm_rollout.utils": {"VLLM_LORA_INT_ID": 123},
+            "verl.workers.rollout.vllm_rollout.vllm_async_server": {
+                "vLLMHttpServer": object,
+                "vLLMReplica": object,
+            },
+        },
+    )
+    recipe = _import_recipe(monkeypatch, "flash.engine.worker.train.core.child.rollout")
+    decoded = recipe.FlashVLLMServer()._init_model_config(config.actor_rollout_ref.model)
+    assert isinstance(decoded, FlashModelConfig)
+    assert decoded.runtime_options["algorithm"] == algorithm
+    assert decoded.path == config.actor_rollout_ref.model.path

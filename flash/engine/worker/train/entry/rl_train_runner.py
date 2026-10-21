@@ -862,7 +862,12 @@ def _prepare_final_adapter(local_dir: str, t_train: float):
     return actor_dir, adapter_dir, steps_run, train_wall
 
 
-def _export_final_adapter(actor_dir, adapter_dir, inp, python_bin):
+def _export_final_adapter(
+    actor_dir, adapter_dir, inp, python_bin, *, resume_uploader=None, steps_run=0
+):
+    if resume_uploader is not None and resume_uploader.reuse_final_adapter(steps_run, adapter_dir):
+        print(f"[rl-verl] reused validated adapter export at step {steps_run}", flush=True)
+        return
     export_peft_adapter(
         actor_dir, adapter_dir, base_model_id=inp["model_id"], python_bin=python_bin
     )

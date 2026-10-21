@@ -103,3 +103,15 @@ class FlashFSDPEngine(FSDPEngineWithLMHead):
                 optimizer, os.environ["FLASH_OPD_BRIDGE_URL"], os.environ["FLASH_OPD_BRIDGE_TOKEN"]
             )
         return optimizer
+
+    def save_checkpoint(self, local_path, *args, **kwargs):
+        from flash.engine.worker.train.core.child.compact_checkpoint import saving
+
+        with saving(self.checkpoint_manager, local_path):
+            return super().save_checkpoint(local_path, *args, **kwargs)
+
+    def load_checkpoint(self, local_path, *args, **kwargs):
+        from flash.engine.worker.train.core.child.compact_checkpoint import loading
+
+        with loading(self.checkpoint_manager, local_path):
+            return super().load_checkpoint(local_path, *args, **kwargs)

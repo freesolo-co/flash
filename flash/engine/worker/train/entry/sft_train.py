@@ -234,6 +234,9 @@ def _build_verl_child_env(*, wandb_enabled: bool) -> dict[str, str]:
     package_root = str(Path(__file__).resolve().parents[5])
     child["PYTHONPATH"] = package_root
     child.pop("VERL_USE_EXTERNAL_MODULES", None)
+    if _worker_state.JOB_SPEC is not None:
+        child["FLASH_CHECKPOINT_MODEL_ID"] = _worker_state.JOB_SPEC.model
+        child["FLASH_CHECKPOINT_MODEL_REVISION"] = _worker_state.JOB_SPEC.model_revision
     child["PYTHONUNBUFFERED"] = "1"
     child["HYDRA_FULL_ERROR"] = "1"
     child["HF_HUB_OFFLINE"] = "1"
