@@ -20,7 +20,7 @@ from pathlib import Path
 
 import flash.engine.worker.io.hf as _worker_hf
 import flash.engine.worker.perf as _worker_perf
-import flash.engine.worker.runtime.state as _worker_state
+from flash.engine.worker.runtime.state import WorkerContext
 from flash.engine.worker.train.entry.sft_train import (
     SHIM_FRAGMENT_FAILED_EXIT_CODE,
     _export_checkpoint_adapter,
@@ -300,9 +300,11 @@ class _OpdVerlCheckpointWatcher(_VerlCheckpointWatcher):
         prompts_per_step: int,
         group_size: int,
         accounting_state,
+        context: WorkerContext,
         **kwargs,
     ) -> None:
-        super().__init__(**kwargs)
+        self.context = context
+        super().__init__(context=context, **kwargs)
         self.seed = seed
         self.prompt_pool_fingerprint = prompt_pool_fingerprint
         self.prompts_per_step = prompts_per_step
@@ -348,11 +350,11 @@ class _OpdVerlCheckpointWatcher(_VerlCheckpointWatcher):
 
         if step in self.required_steps:
             published = _worker_hf.publish_deployable_checkpoint(
-                adapter_dir, step, required=True, _provenance_ready=True
+                adapter_dir, step, required=True, _provenance_ready=True, context=self.context
             )
             self.lifecycle.record_publication(step, published)
         uploaded = _worker_hf.upload_resume_checkpoint(
-            step, checkpoint_dir, final_step=self.final_step
+            step, checkpoint_dir, final_step=self.final_step, context=self.context
         )
         self.lifecycle.record_publication(step, uploaded)
         if step in self.required_steps and uploaded.resume is None and not uploaded.resume_staged:
@@ -366,12 +368,15 @@ def _restore_verl_resume(
     prompt_pool_fingerprint: str,
     update_horizon: int,
     world_size: int,
+    context: WorkerContext,
 ) -> tuple[int, dict | None]:
-    revision = _worker_state.OPD_RESUME_REVISION or None
+    revision = context.config.opd_resume_revision or None
     # no `prefer`: opd pins an exact commit via OPD_RESUME_REVISION with fail_closed, and
     # validate_opd_resume_state_metadata is keyed to that checkpoint's step, so silently picking a
     # different candidate here would violate the retry contract those enforce.
-    resume = _worker_hf.hf_resume_checkpoint(fail_closed=bool(revision), revision=revision)
+    resume = _worker_hf.hf_resume_checkpoint(
+        fail_closed=bool(revision), revision=revision, context=context
+    )
     if not resume:
         return 0, None
     match = re.fullmatch(r"checkpoint-(\d+)", os.path.basename(resume))
@@ -406,7 +411,7 @@ def _restore_verl_resume(
         return 0, None
     with open(os.path.join(resume, "opd_state.json"), encoding="utf-8") as file:
         state = validate_opd_resume_state_metadata(
-            json.load(file), expected_seed=int(_worker_state.SEED), checkpoint_step=step
+            json.load(file), expected_seed=int(context.config.seed), checkpoint_step=step
         )
     if state["prompt_pool_fingerprint"] != prompt_pool_fingerprint:
         raise RuntimeError("OPD resume prompt pool does not match the current run")

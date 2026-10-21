@@ -4,6 +4,7 @@ import math
 import os
 import shutil
 import time
+from functools import partial
 from typing import Any
 
 import flash.engine.worker.io.heartbeat as _worker_heartbeat
@@ -12,7 +13,6 @@ import flash.engine.worker.io.wandb_log as _worker_wandb
 import flash.engine.worker.model.adapter as _worker_adapter
 import flash.engine.worker.perf as _worker_perf
 import flash.engine.worker.runtime.rng as _worker_rng
-import flash.engine.worker.runtime.state as _worker_state
 import flash.engine.worker.train.entry.backend_common as _backend
 import flash.engine.worker.train.entry.sft_train as _sft
 import flash.engine.worker.train.opd.bridging.bridge as _opd_bridge
@@ -29,6 +29,7 @@ from flash.engine.plan.recipe import RECIPE
 from flash.engine.plan.steps import rl_data_parallel_cards
 from flash.engine.profiling.sft_workload import _materialize_verl_images
 from flash.engine.worker.entry import opd as _opd_entry
+from flash.engine.worker.runtime.state import WorkerContext
 from flash.engine.worker.train.core.child.runtime import TEXT_LORA_TARGET_SHIM
 from flash.engine.worker.train.entry.prompt_rows import canonical_prompt_messages
 from flash.engine.worker.train.opd.orchestration.reporting import (
@@ -49,8 +50,8 @@ from flash.engine.worker.verl.parallelism import (
 )
 
 
-def _prepare_request(spec: Any) -> _OpdRequest:
-    env = _worker_state.require_active_env()
+def _prepare_request(spec: Any, *, context: WorkerContext) -> _OpdRequest:
+    env = context.require_active_env()
     if getattr(env, "is_tool_env", False):
         raise RuntimeError("native tool-calling OPD environments are not supported")
     multi_turn = bool(getattr(env, "multi_turn", False))
@@ -71,7 +72,7 @@ def _prepare_request(spec: Any) -> _OpdRequest:
             raise RuntimeError("multi-turn OPD environment requires a positive bounded turn limit")
     else:
         max_turns = 0
-    knobs = _opd_entry._resolve_opd_knobs()
+    knobs = _opd_entry._resolve_opd_knobs(context=context)
     if multi_turn and knobs.structured_outputs:
         raise RuntimeError(
             "multi-turn structured-output OPD is not supported until a per-turn constraint contract exists"
@@ -118,9 +119,7 @@ def _reset_workdir(workdir: str) -> None:
 
 
 def _prepare_workload(
-    request: _OpdRequest,
-    prompt_state: _PromptState,
-    multimodal: bool,
+    request: _OpdRequest, prompt_state: _PromptState, multimodal: bool, *, context: WorkerContext
 ) -> _WorkloadState:
     prompts = prompt_state.prompts
     knobs = request.knobs
@@ -134,7 +133,7 @@ def _prepare_workload(
     _steps.validate_save_steps(knobs.save_at_steps, update_horizon)
     prompt_pool_fingerprint = _opd_prompts._prompt_pool_fingerprint(prompts)
     workdir = os.path.join(
-        "/tmp", "flash-opd-verl", _worker_state.RUN_ID, f"seed-{_worker_state.SEED}"
+        "/tmp", "flash-opd-verl", context.config.run_id, f"seed-{context.config.seed}"
     )
     _reset_workdir(workdir)
     data_dir = os.path.join(workdir, "data")
@@ -180,7 +179,7 @@ def _prepare_workload(
     val_file = os.path.join(data_dir, "val.parquet")
     _opd_overrides._write_opd_parquet(rows, train_file)
     _opd_overrides._write_opd_parquet([rows[0]], val_file)
-    lora_config = _worker_adapter.make_lora(request.model_id)
+    lora_config = _worker_adapter.make_lora(request.model_id, context=context)
     targeting = resolve_lora_targeting(request.model_id, algorithm="opd", multimodal=multimodal)
     target_modules = targeting.target_modules
     if isinstance(target_modules, set | frozenset):
@@ -214,6 +213,7 @@ def _prepare_workload(
             lora_rank,
             int(lora_config.lora_alpha),
             targeting,
+            context=context,
         ),
     )
 
@@ -226,6 +226,8 @@ def _materialize_child_files(
     caps: dict[str, Any],
     gdn_reset_arch: str | None,
     eos_token_ids: tuple[int, ...],
+    *,
+    context: WorkerContext,
 ) -> _RuntimeState:
     knobs = request.knobs
     model_path = _sft._cached_model_path(request.model_id, request.model_revision)
@@ -243,7 +245,7 @@ def _materialize_child_files(
     loggers = _backend.resolve_verl_loggers(caps)
     wandb = request.spec.wandb if request.spec else None
     project_name = wandb.project if wandb and wandb.project else "flash"
-    experiment_name = _worker_wandb.wandb_run_name()
+    experiment_name = _worker_wandb.wandb_run_name(context=context)
     entry_path, reward_path = _write_child_shims(
         request,
         workload,
@@ -257,6 +259,7 @@ def _materialize_child_files(
         # the same count this attempt hands verl as n_gpus_per_node, which is the data-parallel
         # width: ulysses is pinned to 1, so every rank is a dp rank.
         world_size=gpu_count,
+        context=context,
     )
     bridge = _opd_bridge._TeacherAlignmentBridge(
         prompts=prompt_state.prompts,
@@ -270,8 +273,8 @@ def _materialize_child_files(
         active_env=request.env if request.multi_turn else None,
         multi_turn=request.multi_turn,
         max_turns=request.max_turns,
-        thinking=bool(_worker_state.THINKING),
-        mutation_callback=_worker_hf.publish_opd_optimizer_start_marker,
+        thinking=bool(context.config.thinking),
+        mutation_callback=partial(_worker_hf.publish_opd_optimizer_start_marker, context=context),
         initial_state=resume_state,
     )
     bridge.start()
@@ -381,6 +384,8 @@ def _build_base_config(
     workload: _WorkloadState,
     runtime: _RuntimeState,
     eos_token_ids: tuple[int, ...],
+    *,
+    context: WorkerContext,
 ) -> dict[str, Any]:
     knobs = request.knobs
     bridge = runtime.bridge
@@ -416,10 +421,10 @@ def _build_base_config(
             gpu_type=_opd_protocol.spec_gpu_type(getattr(request, "spec", None)),
             n_gpus=int(runtime.gpu_count),
             train=getattr(getattr(request, "spec", None), "train", None),
-            thinking=bool(_worker_state.THINKING),
+            thinking=bool(context.config.thinking),
             model_revision=str(getattr(request, "model_revision", "") or ""),
         ),
-        "seed": _worker_rng.backend_seed(_worker_state.SEED),
+        "seed": _worker_rng.backend_seed(context.config.seed),
         "project_name": runtime.project_name,
         "experiment_name": runtime.experiment_name,
         "total_training_steps": workload.update_horizon,
@@ -437,7 +442,7 @@ def _build_base_config(
         # cannot hold.
         "max_sequence_length": prompt_state.max_model_len,
         "multi_turn": request.multi_turn,
-        "thinking": bool(_worker_state.THINKING),
+        "thinking": bool(context.config.thinking),
         "structured_outputs": request.structured_outputs,
     }
 
@@ -449,6 +454,8 @@ def _build_child_callbacks(
     resume_step: int,
     shim_markers: str,
     expected_shims: tuple[str, ...],
+    *,
+    context: WorkerContext,
 ) -> _ChildCallbacks:
     progress = {
         "step": resume_step,
@@ -504,10 +511,12 @@ def _build_child_callbacks(
         if progress["truncation_step"] == step and progress["truncation_rate"] is not None:
             payload["truncation_rate"] = progress["truncation_rate"]
             payload["discarded_rollouts"] = progress["discarded_rollouts"]
-        _worker_heartbeat.heartbeat("opd_step", **payload)
+        _worker_heartbeat.heartbeat("opd_step", **payload, context=context)
 
     def child_heartbeat() -> None:
-        _worker_heartbeat.heartbeat("opd_step", liveness=True, step=int(progress["step"] or 0))
+        _worker_heartbeat.heartbeat(
+            "opd_step", liveness=True, step=int(progress["step"] or 0), context=context
+        )
 
     child_tail = _backend.ChildOutputTail()
     # one instance for the whole run: it measures silence across ticks, so it cannot live inside
@@ -543,10 +552,12 @@ def _run_child(
     runtime: _RuntimeState,
     config: dict[str, Any],
     eos_token_ids: tuple[int, ...],
+    *,
+    context: WorkerContext,
 ) -> _ChildResult:
     overrides = _opd_overrides.build_opd_overrides(config)
     progress_state = _opd_progress._OpdProgressState(runtime.resume_state)
-    watcher = _build_checkpoint_watcher(request, workload, runtime, progress_state)
+    watcher = _build_checkpoint_watcher(request, workload, runtime, progress_state, context=context)
     shim_markers = _backend.shim_marker_file(workload.shim_dir)
     # the child installs opd-core only for a nonempty schedule, because exact-save
     # filtering is the entire meaning of that marker.
@@ -563,8 +574,11 @@ def _run_child(
         runtime.resume_step,
         shim_markers,
         expected_shims,
+        context=context,
     )
-    child_env = _build_child_env(request, prompt_state, workload, runtime, eos_token_ids)
+    child_env = _build_child_env(
+        request, prompt_state, workload, runtime, eos_token_ids, context=context
+    )
     command = [runtime.python_bin, runtime.entry_path, *overrides]
     gpu_sampler = _sft._NvidiaSmiPeakSampler().start()
     train_started_at = time.time()
@@ -580,6 +594,7 @@ def _run_child(
                 progress_step=True,
                 fields=callbacks.liveness_fields,
                 sample_off_thread=True,
+                context=context,
             ):
                 return_code = _backend.run_verl_training(
                     command,
@@ -641,6 +656,8 @@ def _build_checkpoint_watcher(
     workload: _WorkloadState,
     runtime: _RuntimeState,
     progress_state: Any,
+    *,
+    context: WorkerContext,
 ) -> Any:
     watcher = _opd_failures._OpdVerlCheckpointWatcher(
         local_dir=workload.local_dir,
@@ -652,13 +669,16 @@ def _build_checkpoint_watcher(
         final_step=workload.update_horizon,
         exclude_modules=workload.exclude_modules,
         preprocessor=runtime.bridge.processor,
-        seed=int(_worker_state.SEED),
+        seed=int(context.config.seed),
         prompt_pool_fingerprint=workload.prompt_pool_fingerprint,
         prompts_per_step=workload.prompts_per_step,
         group_size=request.knobs.group_size,
         accounting_state=progress_state.checkpoint_state,
+        context=context,
     )
-    _sft._seed_resume_lifecycle(watcher, request.knobs.save_at_steps, runtime.resume_step)
+    _sft._seed_resume_lifecycle(
+        watcher, request.knobs.save_at_steps, runtime.resume_step, context=context
+    )
     return watcher
 
 
@@ -668,6 +688,8 @@ def _build_child_env(
     workload: _WorkloadState,
     runtime: _RuntimeState,
     eos_token_ids: tuple[int, ...],
+    *,
+    context: WorkerContext,
 ) -> dict[str, str]:
     bridge = runtime.bridge
     return _opd_overrides._build_opd_child_env(
@@ -675,12 +697,12 @@ def _build_child_env(
         wandb_enabled="wandb" in runtime.loggers,
         bridge_url=bridge.url,
         bridge_token=bridge.token,
-        seed=int(_worker_state.SEED),
+        seed=int(context.config.seed),
         stop_sequences=request.knobs.stop_sequences,
         eos_token_ids=eos_token_ids,
         structured_outputs=request.structured_outputs,
         model_vocab_size=request.model_vocab_size,
-        thinking=bool(_worker_state.THINKING),
+        thinking=bool(context.config.thinking),
         multi_turn=request.multi_turn,
         max_turns=request.max_turns,
         max_model_len=prompt_state.max_model_len,
@@ -700,6 +722,7 @@ def _build_child_env(
             gdn_model_type=runtime.gdn_reset_arch,
             loggers=runtime.loggers,
         ),
+        context=context,
     )
 
 
@@ -765,12 +788,15 @@ def _validate_aligned_sequences(final_accounting: dict[str, Any]) -> None:
         )
 
 
-def _report_training_complete(result: _ChildResult, started_at: float) -> float:
+def _report_training_complete(
+    result: _ChildResult, started_at: float, *, context: WorkerContext
+) -> float:
     _worker_heartbeat.heartbeat(
         "opd_trained",
         step=result.final_step,
         train_wall=result.train_wall,
         gpu=_worker_perf.gpu_diagnostics(),
+        context=context,
     )
     return result.train_started_at - started_at
 
@@ -780,6 +806,8 @@ def _export_and_upload_adapter(
     workload: _WorkloadState,
     runtime: _RuntimeState,
     result: _ChildResult,
+    *,
+    context: WorkerContext,
 ) -> str:
     adapter_dir = os.path.join(workload.workdir, "adapter")
     _sft._export_checkpoint_adapter(
@@ -791,5 +819,5 @@ def _export_and_upload_adapter(
         python_bin=runtime.python_bin,
         preprocessor=runtime.bridge.processor,
     )
-    _worker_hf.hf_upload_folder(adapter_dir, "adapter", required=True)
+    _worker_hf.hf_upload_folder(adapter_dir, "adapter", required=True, context=context)
     return adapter_dir

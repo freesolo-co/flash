@@ -20,6 +20,7 @@ import time
 import types
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -1015,7 +1016,9 @@ class _MockMultimodalProcessor:
         return {"input_ids": [input_ids]}
 
 
-def test_image_observation_env_text_prompt_omits_empty_processor_images(monkeypatch):
+def test_image_observation_env_text_prompt_omits_empty_processor_images(
+    worker_context, monkeypatch
+):
     class _DynamicImageEnv:
         image_observations = True
 
@@ -1029,10 +1032,10 @@ def test_image_observation_env_text_prompt_omits_empty_processor_images(monkeypa
     monkeypatch.setattr(
         opd_prompt_preparation,
         "liveness_heartbeat",
-        lambda *_args, **_kwargs: nullcontext(),
+        lambda *_args, context=None, **_kwargs: nullcontext(),
     )
     prompt_rows, multimodal = _render_prompt_rows(
-        SimpleNamespace(env=_DynamicImageEnv(), spec=None)
+        SimpleNamespace(env=_DynamicImageEnv(), spec=None), context=worker_context
     )
     assert multimodal is True
     assert prompt_rows[0][1] == [{"role": "user", "content": "describe"}]
@@ -1329,9 +1332,9 @@ def test_failure_accounting_metadata_uses_trl_skip_reason_names():
 def test_write_train_meta_integrates_canonical_failure_accounting_metadata():
     import inspect
 
-    from flash.engine.worker.train.entry.opd_train import run_opd_train
+    from flash.engine.worker.train.entry.opd_train import _publish_opd_result
 
-    source = inspect.getsource(run_opd_train)
+    source = inspect.getsource(_publish_opd_result)
     write_train_meta_source = source[source.index("_worker_finalize.write_train_meta(") :]
 
     assert "**_failure_accounting_metadata(final_accounting)" in write_train_meta_source
@@ -3841,7 +3844,7 @@ def test_opd_failure_diagnosis_is_not_cumulative_accounting_dict():
         _failure_accounting_metadata(diagnosis)
 
 
-def test_restore_verl_resume_returns_validated_accounting(monkeypatch, tmp_path):
+def test_restore_verl_resume_returns_validated_accounting(worker_context, monkeypatch, tmp_path):
     resume = tmp_path / "checkpoint-2"
     actor = resume / "actor"
     (actor / "huggingface").mkdir(parents=True)
@@ -3853,12 +3856,14 @@ def test_restore_verl_resume_returns_validated_accounting(monkeypatch, tmp_path)
     (actor / "fsdp_config.json").write_text(json.dumps({"FSDP_version": 2, "world_size": 1}))
     for kind in ("model", "optim", "extra_state"):
         (actor / f"{kind}_world_size_1_rank_0.pt").write_bytes(b"shard")
-    monkeypatch.setattr(opd_failures._worker_state, "OPD_RESUME_REVISION", "revision")
-    monkeypatch.setattr(opd_failures._worker_state, "SEED", 42)
+    monkeypatch.setattr(
+        worker_context, "config", replace(worker_context.config, opd_resume_revision="revision")
+    )
+    monkeypatch.setattr(worker_context, "config", replace(worker_context.config, seed=42))
     monkeypatch.setattr(
         opd_failures._worker_hf,
         "hf_resume_checkpoint",
-        lambda **_kwargs: str(resume),
+        lambda context=None, **_kwargs: str(resume),
     )
     local_dir = tmp_path / "local"
     local_dir.mkdir()
@@ -3868,6 +3873,7 @@ def test_restore_verl_resume_returns_validated_accounting(monkeypatch, tmp_path)
         prompt_pool_fingerprint="a" * 64,
         update_horizon=3,
         world_size=1,
+        context=worker_context,
     )
 
     assert step == 2
@@ -3875,16 +3881,18 @@ def test_restore_verl_resume_returns_validated_accounting(monkeypatch, tmp_path)
     assert (local_dir / "global_step_2" / "payload.bin").read_bytes() == b"checkpoint"
 
 
-def test_restore_verl_resume_rejects_fsdp1(monkeypatch, tmp_path):
+def test_restore_verl_resume_rejects_fsdp1(worker_context, monkeypatch, tmp_path):
     resume = tmp_path / "checkpoint-2"
     actor = resume / "actor"
     (actor / "huggingface").mkdir(parents=True)
     (actor / "fsdp_config.json").write_text(json.dumps({"FSDP_version": 1, "world_size": 1}))
     for kind in ("model", "optim", "extra_state"):
         (actor / f"{kind}_world_size_1_rank_0.pt").write_bytes(b"shard")
-    monkeypatch.setattr(opd_failures._worker_state, "OPD_RESUME_REVISION", "revision")
     monkeypatch.setattr(
-        opd_failures._worker_hf, "hf_resume_checkpoint", lambda **_kwargs: str(resume)
+        worker_context, "config", replace(worker_context.config, opd_resume_revision="revision")
+    )
+    monkeypatch.setattr(
+        opd_failures._worker_hf, "hf_resume_checkpoint", lambda context=None, **_kwargs: str(resume)
     )
     local_dir = tmp_path / "local"
     local_dir.mkdir()
@@ -3898,12 +3906,15 @@ def test_restore_verl_resume_rejects_fsdp1(monkeypatch, tmp_path):
             prompt_pool_fingerprint="a" * 64,
             update_horizon=3,
             world_size=1,
+            context=worker_context,
         )
 
     assert not (local_dir / "global_step_2").exists()
 
 
-def test_opd_checkpoint_watcher_forwards_processor_to_every_export(monkeypatch, tmp_path):
+def test_opd_checkpoint_watcher_forwards_processor_to_every_export(
+    worker_context, monkeypatch, tmp_path
+):
 
     checkpoint_dir = tmp_path / "global_step_1"
     (checkpoint_dir / "actor").mkdir(parents=True)
@@ -3937,6 +3948,7 @@ def test_opd_checkpoint_watcher_forwards_processor_to_every_export(monkeypatch, 
         prompts_per_step=2,
         group_size=3,
         accounting_state=lambda _step: _resume_accounting(1),
+        context=worker_context,
     )
 
     watcher._publish(1, str(checkpoint_dir))
@@ -3945,15 +3957,19 @@ def test_opd_checkpoint_watcher_forwards_processor_to_every_export(monkeypatch, 
     assert captured[0]["preprocessor"] is processor
 
 
-def test_resume_leaves_missing_required_companion_for_checkpoint_watcher(monkeypatch, tmp_path):
+def test_resume_leaves_missing_required_companion_for_checkpoint_watcher(
+    worker_context, monkeypatch, tmp_path
+):
     import flash.engine.worker.io.hf as worker
 
     class Api:
         def file_exists(self, **_kwargs):
             return False
 
-    monkeypatch.setattr(worker._worker_state, "HF_REPO", "owner/artifacts")
-    monkeypatch.setattr(worker, "hf_prefix", lambda: "opd/run")
+    monkeypatch.setattr(
+        worker_context, "config", replace(worker_context.config, hf_repo="owner/artifacts")
+    )
+    monkeypatch.setattr(worker, "hf_prefix", lambda context=None, **_context: "opd/run")
     monkeypatch.setattr(worker_hf, "hf_api", Api)
     local_dir = tmp_path / "checkpoints"
     checkpoint_dir = local_dir / "global_step_3"
@@ -3971,9 +3987,10 @@ def test_resume_leaves_missing_required_companion_for_checkpoint_watcher(monkeyp
         prompts_per_step=2,
         group_size=3,
         accounting_state=lambda _step: _resume_accounting(3),
+        context=worker_context,
     )
 
-    _seed_resume_lifecycle(watcher, (3,), 3)
+    _seed_resume_lifecycle(watcher, (3,), 3, context=worker_context)
     published = []
 
     def publish(step, path):
@@ -4001,13 +4018,16 @@ def test_resume_leaves_missing_required_companion_for_checkpoint_watcher(monkeyp
         prompts_per_step=2,
         group_size=3,
         accounting_state=lambda _step: _resume_accounting(3),
+        context=worker_context,
     )
-    _seed_resume_lifecycle(other, (4,), 3)
+    _seed_resume_lifecycle(other, (4,), 3, context=worker_context)
     assert other.lifecycle.discovered_steps == {3}
     assert other.lifecycle.facts(3).resume_uploaded
 
 
-def test_the_watcher_claims_every_step_but_publishes_only_required_ones(monkeypatch, tmp_path):
+def test_the_watcher_claims_every_step_but_publishes_only_required_ones(
+    worker_context, monkeypatch, tmp_path
+):
     """a default opd run claims its steps without ever owing a deployable for them.
 
     asserted by running the watcher rather than by grepping its source: a source check passes on a
@@ -4055,6 +4075,7 @@ def test_the_watcher_claims_every_step_but_publishes_only_required_ones(monkeypa
         prompts_per_step=2,
         group_size=3,
         accounting_state=lambda _step: _resume_accounting(2),
+        context=worker_context,
     )
     watcher._publish(2, str(checkpoint_dir))
 
@@ -4064,7 +4085,9 @@ def test_the_watcher_claims_every_step_but_publishes_only_required_ones(monkeypa
     assert not watcher.lifecycle.facts(2).deployable_published
 
 
-def test_an_opd_backlog_stages_a_retry_contract_for_every_step(monkeypatch, tmp_path):
+def test_an_opd_backlog_stages_a_retry_contract_for_every_step(
+    worker_context, monkeypatch, tmp_path
+):
     """opd must never coalesce: each checkpoint carries its own accounting and retry contract.
 
     the sft watcher it inherits from drops all but the newest of an optional backlog, which for opd
@@ -4090,7 +4113,7 @@ def test_an_opd_backlog_stages_a_retry_contract_for_every_step(monkeypatch, tmp_
     monkeypatch.setattr(
         worker,
         "upload_resume_checkpoint",
-        lambda step, path, **kwargs: (
+        lambda step, path, context=None, **kwargs: (
             uploaded.append(step),
             _publication.PublicationResult(
                 resume=_publication.ArtifactCommit("test-commit", "test-revision")
@@ -4119,6 +4142,7 @@ def test_an_opd_backlog_stages_a_retry_contract_for_every_step(monkeypatch, tmp_
         prompts_per_step=2,
         group_size=3,
         accounting_state=lambda _step: _resume_accounting(1),
+        context=worker_context,
     )
     watcher._stop.set()
     watcher._run()
@@ -4136,7 +4160,7 @@ def test_the_final_deployable_publish_is_not_suppressed_by_the_watcher_lifecycle
     # final_save_due applies only when save_at_steps is empty, while the watcher publishes only
     # requested steps. the paths are disjoint, so the watcher's ledger cannot suppress the final
     # publish -- and above all it must not be consulted for it.
-    source = inspect.getsource(opd_train.run_opd_train)
+    source = inspect.getsource(opd_train._publish_opd_result)
     assert "final_save_due(final_step, knobs.save_at_steps)" in source
     assert "watcher.lifecycle" not in source
 
@@ -6509,7 +6533,7 @@ def test_no_signal_failure_does_not_blame_cap_without_dominant_truncation():
 
 
 def test_opd_child_success_skips_failure_accounting_and_always_stops_gpu_sampler(
-    monkeypatch, tmp_path
+    worker_context, monkeypatch, tmp_path
 ):
     from contextlib import nullcontext
 
@@ -6560,14 +6584,18 @@ def test_opd_child_success_skips_failure_accounting_and_always_stops_gpu_sampler
     reconciled = []
     monkeypatch.setattr(opd_runner._opd_overrides, "build_opd_overrides", lambda _config: [])
     monkeypatch.setattr(opd_runner._opd_progress, "_OpdProgressState", ProgressState)
-    monkeypatch.setattr(opd_runner, "_build_checkpoint_watcher", lambda *_args: Watcher())
-    monkeypatch.setattr(opd_runner, "_build_child_callbacks", lambda *_args: callbacks)
-    monkeypatch.setattr(opd_runner, "_build_child_env", lambda *_args: {})
+    monkeypatch.setattr(
+        opd_runner, "_build_checkpoint_watcher", lambda *_args, context=None, **_context: Watcher()
+    )
+    monkeypatch.setattr(
+        opd_runner, "_build_child_callbacks", lambda *_args, context=None, **_context: callbacks
+    )
+    monkeypatch.setattr(opd_runner, "_build_child_env", lambda *_args, context=None, **_context: {})
     monkeypatch.setattr(opd_runner._sft, "_NvidiaSmiPeakSampler", GpuSampler)
     monkeypatch.setattr(
         opd_runner._worker_heartbeat,
         "liveness_heartbeat",
-        lambda *_args, **_kwargs: nullcontext(),
+        lambda *_args, context=None, **_kwargs: nullcontext(),
     )
     monkeypatch.setattr(
         opd_runner._backend,
@@ -6601,6 +6629,7 @@ def test_opd_child_success_skips_failure_accounting_and_always_stops_gpu_sampler
             ),
             {},
             (),
+            context=worker_context,
         )
 
     result = run_child()
@@ -6667,13 +6696,7 @@ def _config(**overrides):
     return config
 
 
-def _materialized_opd_save_freq(
-    monkeypatch,
-    *,
-    save_at_steps,
-    save_every,
-    horizon,
-):
+def _materialized_opd_save_freq(monkeypatch, *, save_at_steps, save_every, horizon, worker_context):
     from flash.engine.worker.train.entry import opd_train_runner as runner
 
     knobs = SimpleNamespace(
@@ -6710,10 +6733,14 @@ def _materialized_opd_save_freq(
     )
     monkeypatch.setattr(runner._sft, "_cached_model_path", lambda *_args: "/model")
     monkeypatch.setattr(runner._backend, "resolve_verl_loggers", lambda _caps: ["console"])
-    monkeypatch.setattr(runner._worker_wandb, "wandb_run_name", lambda: "opd-test")
+    monkeypatch.setattr(
+        runner._worker_wandb, "wandb_run_name", lambda context=None, **_context: "opd-test"
+    )
     monkeypatch.setattr(runner, "_write_child_shims", lambda *_args: ("entry.py", "reward.py"))
 
-    monkeypatch.setattr(runner._opd_failures, "_restore_verl_resume", lambda *_a, **_kw: (0, None))
+    monkeypatch.setattr(
+        runner._opd_failures, "_restore_verl_resume", lambda *_a, context=None, **_kw: (0, None)
+    )
 
     class Bridge:
         def __init__(self, **_kwargs):
@@ -6724,35 +6751,36 @@ def _materialized_opd_save_freq(
 
     monkeypatch.setattr(runner._opd_bridge, "_TeacherAlignmentBridge", Bridge)
     return runner._materialize_child_files(
-        request,
-        prompt_state,
-        workload,
-        "/python",
-        {},
-        None,
-        (),
+        request, prompt_state, workload, "/python", {}, None, (), context=worker_context
     ).save_freq
 
 
-def test_opd_save_freq_clamps_to_a_short_derived_horizon(monkeypatch):
+def test_opd_save_freq_clamps_to_a_short_derived_horizon(worker_context, monkeypatch):
     from flash.engine.plan.steps import on_policy_steps
 
     horizon = on_policy_steps(epochs=1, prompt_count=800, prompts_per_step=64)
     assert horizon == 13
     save_freq = _materialized_opd_save_freq(
-        monkeypatch, save_at_steps=(), save_every=20, horizon=horizon
+        monkeypatch, save_at_steps=(), save_every=20, horizon=horizon, worker_context=worker_context
     )
     assert save_freq == 13
     assert horizon % save_freq == 0
 
 
-def test_opd_save_freq_preserves_long_run_interval_and_exact_step_gcd(monkeypatch):
+def test_opd_save_freq_preserves_long_run_interval_and_exact_step_gcd(worker_context, monkeypatch):
     assert (
-        _materialized_opd_save_freq(monkeypatch, save_at_steps=(), save_every=15, horizon=100) == 15
+        _materialized_opd_save_freq(
+            monkeypatch, save_at_steps=(), save_every=15, horizon=100, worker_context=worker_context
+        )
+        == 15
     )
     assert (
         _materialized_opd_save_freq(
-            monkeypatch, save_at_steps=(10, 25, 100), save_every=15, horizon=100
+            monkeypatch,
+            save_at_steps=(10, 25, 100),
+            save_every=15,
+            horizon=100,
+            worker_context=worker_context,
         )
         == 5
     )
@@ -6921,7 +6949,7 @@ def test_overrides_match_verl_0_8_sync_distillation_contract():
 
 
 @pytest.mark.parametrize("gpu_count", [1, 2, 4, 8])
-def test_the_runner_pins_ulysses_off_at_every_card_count(gpu_count):
+def test_the_runner_pins_ulysses_off_at_every_card_count(worker_context, gpu_count):
     # drives the REAL producer, not a hand-built config: the contract test above supplies its own
     # dict, so it proves the renderer and would keep passing if the runner regressed to
     # `ulysses_sequence_parallel_size = runtime.gpu_count`. sequence parallelism corrupts
@@ -6970,6 +6998,7 @@ def test_the_runner_pins_ulysses_off_at_every_card_count(gpu_count):
             bridge=SimpleNamespace(url="http://127.0.0.1:1234", token="token"),
         ),
         eos_token_ids=(151645,),
+        context=worker_context,
     )
 
     assert config["ulysses_sequence_parallel_size"] == 1
@@ -6987,7 +7016,7 @@ def test_the_runner_pins_ulysses_off_at_every_card_count(gpu_count):
     assert overrides["actor_rollout_ref.rollout.tensor_model_parallel_size"] == str(gpu_count)
 
 
-def test_the_zero2_gate_reads_the_spec_the_caller_passed(monkeypatch):
+def test_the_zero2_gate_reads_the_spec_the_caller_passed(worker_context, monkeypatch):
     """The gate must size off `request.spec`, never the process-global JOB_SPEC.
 
     the OPD entry resolves its spec as `spec or worker_state.JOB_SPEC`, so a caller that passes one gets a run
@@ -6995,15 +7024,16 @@ def test_the_zero2_gate_reads_the_spec_the_caller_passed(monkeypatch):
     enable ZeRO-2 against a card the run never landed on -- the allocator/worker divergence the gate
     exists to prevent. Pinned with the two disagreeing so reading the wrong one cannot pass.
     """
-    import flash.engine.worker.runtime.state as worker_state
     from flash.engine.worker.train.entry import opd_train_runner as _runner
 
     # the global says a card with room to spare; the passed spec says a card without it.
     monkeypatch.setattr(
-        worker_state,
-        "JOB_SPEC",
-        SimpleNamespace(gpu=SimpleNamespace(type="B200"), train=SimpleNamespace()),
-        raising=False,
+        worker_context,
+        "config",
+        replace(
+            worker_context.config,
+            spec=SimpleNamespace(gpu=SimpleNamespace(type="B200"), train=SimpleNamespace()),
+        ),
     )
 
     def _build(spec):
@@ -7047,6 +7077,7 @@ def test_the_zero2_gate_reads_the_spec_the_caller_passed(monkeypatch):
                 bridge=SimpleNamespace(url="http://127.0.0.1:1234", token="token"),
             ),
             eos_token_ids=(151645,),
+            context=worker_context,
         )
 
     # a spec whose card cannot hold the retained copy must stay on zero-3 even though the global
@@ -7542,7 +7573,7 @@ def test_image_token_suppression_is_gated_on_structured_image_blocks():
     assert _resolve_image_token_id(SimpleNamespace(), fallback) == 42
 
 
-def test_opd_plugin_config_is_serialized_with_the_child_environment(tmp_path):
+def test_opd_plugin_config_is_serialized_with_the_child_environment(worker_context, tmp_path):
     plugin_config = _build_opd_plugin_config(
         shim_dir=str(tmp_path),
         save_at_steps=(3, 7),
@@ -7571,11 +7602,14 @@ def test_opd_plugin_config_is_serialized_with_the_child_environment(tmp_path):
         model_vocab_size=248320,
         thinking=False,
         plugin_config=plugin_config,
+        context=worker_context,
     )
     assert child["FLASH_OPD_PLUGIN_CONFIG"] == plugin_config
 
 
-def test_child_environment_keeps_bridge_but_excludes_teacher_transport(monkeypatch, tmp_path):
+def test_child_environment_keeps_bridge_but_excludes_teacher_transport(
+    worker_context, monkeypatch, tmp_path
+):
     monkeypatch.setenv("PARASAIL_API_KEY", "parasail-secret")
     monkeypatch.setenv("FLASH_PUBLIC_URL", "https://broker.example")
     monkeypatch.setenv("FLASH_TEACHER_CAPABILITY", "capability-secret")
@@ -7598,6 +7632,7 @@ def test_child_environment_keeps_bridge_but_excludes_teacher_transport(monkeypat
         abandonment_failure_path=str(tmp_path / "abandonment-failure"),
         resample_failure_path=str(tmp_path / "resample-failure"),
         cycle_commit_failure_path=str(tmp_path / "cycle-commit-failure"),
+        context=worker_context,
     )
     assert child["FLASH_OPD_BRIDGE_URL"] == "http://127.0.0.1:4444"
     assert child["FLASH_OPD_BRIDGE_TOKEN"] == "bridge-token"
@@ -7620,7 +7655,9 @@ def test_child_environment_keeps_bridge_but_excludes_teacher_transport(monkeypat
     assert "FLASH_OPD_THINKING" not in child
 
 
-def test_opd_child_environment_scrubs_declared_prefixed_secrets(monkeypatch, tmp_path):
+def test_opd_child_environment_scrubs_declared_prefixed_secrets(
+    worker_context, monkeypatch, tmp_path
+):
     from flash._internal.diagnostics import SECRET_ENV_KEYS_ENV
 
     declared = (
@@ -7649,6 +7686,7 @@ def test_opd_child_environment_scrubs_declared_prefixed_secrets(monkeypatch, tmp
         model_vocab_size=248320,
         thinking=False,
         plugin_config='{"wandb":true}',
+        context=worker_context,
     )
 
     for name in declared:
@@ -7667,7 +7705,9 @@ def test_opd_child_environment_scrubs_declared_prefixed_secrets(monkeypatch, tmp
     assert child["FLASH_OPD_PLUGIN_CONFIG"] == '{"wandb":true}'
 
 
-def test_structured_child_environment_carries_only_canonical_replay_inputs(tmp_path):
+def test_structured_child_environment_carries_only_canonical_replay_inputs(
+    worker_context, tmp_path
+):
     child = _build_opd_child_env(
         shim_dir=str(tmp_path),
         wandb_enabled=False,
@@ -7679,6 +7719,7 @@ def test_structured_child_environment_carries_only_canonical_replay_inputs(tmp_p
         structured_outputs={"choice": ["4"]},
         model_vocab_size=248320,
         thinking=True,
+        context=worker_context,
     )
 
     assert child["FLASH_OPD_STRUCTURED_OUTPUTS"] == '{"choice":["4"]}'
@@ -7686,7 +7727,7 @@ def test_structured_child_environment_carries_only_canonical_replay_inputs(tmp_p
     assert child["FLASH_OPD_THINKING"] == "1"
 
 
-def test_multiturn_child_environment_carries_only_rollout_capabilities(tmp_path):
+def test_multiturn_child_environment_carries_only_rollout_capabilities(worker_context, tmp_path):
     child = _build_opd_child_env(
         shim_dir=str(tmp_path),
         wandb_enabled=False,
@@ -7701,6 +7742,7 @@ def test_multiturn_child_environment_carries_only_rollout_capabilities(tmp_path)
         multi_turn=True,
         max_turns=6,
         max_model_len=4096,
+        context=worker_context,
     )
 
     assert child["FLASH_OPD_MAX_TURNS"] == "6"
@@ -7825,9 +7867,9 @@ def test_deterministic_seed_uses_every_rollout_identity_component():
 def test_train_meta_records_the_optimizer_steps_that_actually_produced_a_loss():
     import inspect
 
-    from flash.engine.worker.train.entry.opd_train import run_opd_train
+    from flash.engine.worker.train.entry.opd_train import _publish_opd_result
 
-    notes = inspect.getsource(run_opd_train)
+    notes = inspect.getsource(_publish_opd_result)
     notes = notes[notes.index("_worker_finalize.write_train_meta(") :]
     # `steps` is the REQUESTED horizon. a step whose batch carried no teacher signal never applies
     # an update, so reporting the horizon as the work done would overstate a partly-starved run.
@@ -7865,9 +7907,9 @@ def test_worker_filters_over_budget_prompts_before_downloading_the_weights():
 def test_worker_refuses_to_publish_a_loss_curve_shorter_than_the_final_checkpoint():
     import inspect
 
-    from flash.engine.worker.train.entry.opd_train import run_opd_train
+    from flash.engine.worker.train.entry.opd_train import _publish_opd_result
 
-    source = inspect.getsource(run_opd_train)
+    source = inspect.getsource(_publish_opd_result)
     # record_step only checks that each metric line FOLLOWS the previous one, so it cannot notice a
     # MISSING TRAILING metric: on_line silently skips any step-tagged line whose loss it cannot
     # parse, and no later step ever arrives to trip the sequence check. that leaves a curve of
@@ -7885,15 +7927,15 @@ def test_worker_refuses_to_publish_a_loss_curve_shorter_than_the_final_checkpoin
 def test_train_meta_reports_the_teacher_call_shape_only_where_one_is_enforced():
     import inspect
 
-    from flash.engine.worker.train.entry.opd_train import run_opd_train
+    from flash.engine.worker.train.entry.opd_train import _publish_opd_result
 
-    notes = inspect.getsource(run_opd_train)
+    notes = inspect.getsource(_publish_opd_result)
     notes = notes[notes.index("_worker_finalize.write_train_meta(") :]
     # only single-turn text uses the serial batcher; multimodal and multi-turn use bridge threads.
     # report at most the samples one step can produce.
     import ast
 
-    tree = ast.parse(inspect.getsource(run_opd_train))
+    tree = ast.parse(inspect.getsource(_publish_opd_result))
     expr = next(
         value
         for node in ast.walk(tree)
@@ -8065,7 +8107,7 @@ def test_plugin_identifiers_remain_provider_neutral():
         assert f"_{name}" not in source
 
 
-def test_opd_delegates_to_verl_with_no_selector_left(monkeypatch):
+def test_opd_delegates_to_verl_with_no_selector_left(worker_context, monkeypatch):
     """run_opd has no backend selector: it calls verl unconditionally.
 
     Replaces the FLASH_OPD_BACKEND selector test. The TRL OPD body is gone, so there is nothing
@@ -8077,7 +8119,7 @@ def test_opd_delegates_to_verl_with_no_selector_left(monkeypatch):
     called = []
     monkeypatch.setattr(ov, "run_opd_train", lambda *a, **k: called.append(True))
     monkeypatch.setenv("FLASH_OPD_BACKEND", "bogus")
-    opd_mod.run_opd()
+    opd_mod.run_opd(context=worker_context)
     assert called == [True]
 
 
@@ -8137,7 +8179,7 @@ def test_opd_spec_never_resolves_the_allocator_conf_that_kills_vllm(monkeypatch)
     assert build_worker_env(sft)["PYTORCH_CUDA_ALLOC_CONF"] == "expandable_segments:True"
 
 
-def test_worker_fails_closed_on_tool_env(monkeypatch):
+def test_worker_fails_closed_on_tool_env(worker_context, monkeypatch):
     # multi-turn is now supported; native tool-calling OPD still fails closed at the worker layer.
     import flash.engine.worker.train.entry.opd_train as ov
 
@@ -8145,11 +8187,11 @@ def test_worker_fails_closed_on_tool_env(monkeypatch):
         is_tool_env = True
         multi_turn = False
 
-    monkeypatch.setattr(ov._worker_state, "require_active_env", lambda: FakeEnv())
+    monkeypatch.setattr(worker_context, "require_active_env", lambda: FakeEnv())
     with pytest.raises(
         RuntimeError, match="native tool-calling OPD environments are not supported"
     ):
-        ov.run_opd_train(spec=object())
+        ov.run_opd_train(spec=object(), context=worker_context)
 
 
 def test_on_line_parses_the_numpy2_distillation_loss_the_image_actually_prints():
@@ -8176,14 +8218,14 @@ def test_on_line_parses_the_numpy2_distillation_loss_the_image_actually_prints()
     )
 
 
-def test_opd_step_heartbeat_carries_truncation_rate(monkeypatch, tmp_path):
+def test_opd_step_heartbeat_carries_truncation_rate(worker_context, monkeypatch, tmp_path):
     import flash.engine.worker.train.entry.opd_train_runner as opd_runner
 
     emitted = []
     monkeypatch.setattr(
         opd_runner._worker_heartbeat,
         "heartbeat",
-        lambda stage, **payload: emitted.append((stage, payload)),
+        lambda stage, context=None, **payload: emitted.append((stage, payload)),
     )
     callbacks = opd_runner._build_child_callbacks(
         SimpleNamespace(raise_if_failed=lambda: None),
@@ -8192,6 +8234,7 @@ def test_opd_step_heartbeat_carries_truncation_rate(monkeypatch, tmp_path):
         0,
         _applied_shim_markers(tmp_path),
         ("lora-rollout-guard",),
+        context=worker_context,
     )
 
     callbacks.on_line("step:1 - actor/distillation/loss:0.5")
@@ -8210,14 +8253,14 @@ def test_opd_step_heartbeat_carries_truncation_rate(monkeypatch, tmp_path):
     ]
 
 
-def test_opd_step_heartbeat_omits_stale_truncation_rate(monkeypatch, tmp_path):
+def test_opd_step_heartbeat_omits_stale_truncation_rate(worker_context, monkeypatch, tmp_path):
     import flash.engine.worker.train.entry.opd_train_runner as opd_runner
 
     emitted = []
     monkeypatch.setattr(
         opd_runner._worker_heartbeat,
         "heartbeat",
-        lambda stage, **payload: emitted.append((stage, payload)),
+        lambda stage, context=None, **payload: emitted.append((stage, payload)),
     )
     callbacks = opd_runner._build_child_callbacks(
         SimpleNamespace(raise_if_failed=lambda: None),
@@ -8226,6 +8269,7 @@ def test_opd_step_heartbeat_omits_stale_truncation_rate(monkeypatch, tmp_path):
         0,
         _applied_shim_markers(tmp_path),
         ("lora-rollout-guard",),
+        context=worker_context,
     )
 
     callbacks.on_line("step:1 - actor/distillation/loss:0.5")
@@ -8239,7 +8283,9 @@ def test_opd_step_heartbeat_omits_stale_truncation_rate(monkeypatch, tmp_path):
     assert "discarded_rollouts" not in emitted[1][1]
 
 
-def test_opd_step_heartbeat_carries_the_rate_on_real_child_line_shapes(monkeypatch, tmp_path):
+def test_opd_step_heartbeat_carries_the_rate_on_real_child_line_shapes(
+    worker_context, monkeypatch, tmp_path
+):
     """the step-match guard must not silently disable the rate in production.
 
     on_line gates on verl_step_number, on_step on backend_common's own step_pattern. the two
@@ -8256,7 +8302,7 @@ def test_opd_step_heartbeat_carries_the_rate_on_real_child_line_shapes(monkeypat
     monkeypatch.setattr(
         opd_runner._worker_heartbeat,
         "heartbeat",
-        lambda stage, **payload: emitted.append((stage, payload)),
+        lambda stage, context=None, **payload: emitted.append((stage, payload)),
     )
     callbacks = opd_runner._build_child_callbacks(
         SimpleNamespace(raise_if_failed=lambda: None),
@@ -8265,6 +8311,7 @@ def test_opd_step_heartbeat_carries_the_rate_on_real_child_line_shapes(monkeypat
         0,
         _applied_shim_markers(tmp_path),
         ("lora-rollout-guard",),
+        context=worker_context,
     )
 
     # the step number reaching on_step is the one backend_common parses, not a hand-picked int.
@@ -8440,7 +8487,7 @@ def test_stalled_thread_probe_reports_a_thread_that_is_gone_instead_of_raising()
     assert plugin._describe_stalled_thread(None) == "stack unavailable"
 
 
-def test_opd_missing_managed_teacher_broker_fails_before_the_gpu_probe(monkeypatch):
+def test_opd_missing_managed_teacher_broker_fails_before_the_gpu_probe(worker_context, monkeypatch):
     """A missing managed teacher key must fail before any paid GPU work starts.
 
     The platform-injected key is mandatory, so reject before the GPU probe and model prefetch.
@@ -8463,17 +8510,20 @@ def test_opd_missing_managed_teacher_broker_fails_before_the_gpu_probe(monkeypat
         stop_sequences=(),
         structured_outputs="",
     )
-    monkeypatch.setattr(opd_mod._worker_state, "SEED", 0)
-    monkeypatch.setattr(opd_mod._worker_state, "THINKING", False)
-    monkeypatch.setattr(opd_mod._worker_state, "require_active_env", lambda: env)
+    monkeypatch.setattr(worker_context, "config", replace(worker_context.config, seed=0))
+    monkeypatch.setattr(worker_context, "config", replace(worker_context.config, thinking=False))
+    monkeypatch.setattr(worker_context, "require_active_env", lambda: env)
     monkeypatch.setattr(
-        opd_mod._worker_state,
-        "JOB_SPEC",
-        SimpleNamespace(
-            train=train,
-            model="Qwen/Qwen3.5-9B",
-            model_revision="",
-            gpu=SimpleNamespace(type=None),
+        worker_context,
+        "config",
+        replace(
+            worker_context.config,
+            spec=SimpleNamespace(
+                train=train,
+                model="Qwen/Qwen3.5-9B",
+                model_revision="",
+                gpu=SimpleNamespace(type=None),
+            ),
         ),
     )
     monkeypatch.setattr(
@@ -8489,7 +8539,7 @@ def test_opd_missing_managed_teacher_broker_fails_before_the_gpu_probe(monkeypat
     monkeypatch.delenv("FLASH_TEACHER_CAPABILITY", raising=False)
 
     with pytest.raises(RuntimeError, match="managed teacher control-panel transport is missing"):
-        opd_mod.run_opd_train()
+        opd_mod.run_opd_train(context=worker_context)
 
 
 @pytest.mark.parametrize(
@@ -8502,7 +8552,7 @@ def test_opd_missing_managed_teacher_broker_fails_before_the_gpu_probe(monkeypat
     ],
 )
 def test_opd_preparation_propagates_derived_thinking_semantics(
-    monkeypatch, thinking, rendered_prompt, expected_opened
+    worker_context, monkeypatch, thinking, rendered_prompt, expected_opened
 ):
     from flash.engine.worker.model.decoding import prompt_opens_thinking
     from flash.engine.worker.train.opd.orchestration import prompt_preparation
@@ -8534,14 +8584,18 @@ def test_opd_preparation_propagates_derived_thinking_semantics(
 
     env = SimpleNamespace(thinking=None, prompt_opens_thinking=None, package_root=None)
     tokenizer = _Tokenizer()
-    monkeypatch.setattr(prompt_preparation._worker_state, "THINKING", thinking)
+    monkeypatch.setattr(worker_context, "config", replace(worker_context.config, thinking=thinking))
     monkeypatch.setattr(
         prompt_preparation._worker_hf,
         "load_tokenizer",
         lambda model_id, revision: tokenizer,
     )
     monkeypatch.setattr(prompt_preparation, "prompt_opens_thinking", prompt_opens_thinking)
-    monkeypatch.setattr(prompt_preparation, "_thinking_prefill_text", lambda _tokenizer: "")
+    monkeypatch.setattr(
+        prompt_preparation,
+        "_thinking_prefill_text",
+        lambda _tokenizer, context=None, **_context: "",
+    )
     monkeypatch.setattr(
         prompt_preparation._backend,
         "clamp_engine_len",
@@ -8560,7 +8614,7 @@ def test_opd_preparation_propagates_derived_thinking_semantics(
     monkeypatch.setattr(
         prompt_preparation,
         "liveness_heartbeat",
-        lambda *_args, **_kwargs: contextlib.nullcontext(),
+        lambda *_args, context=None, **_kwargs: contextlib.nullcontext(),
     )
     import flash.engine.worker.teacher.client as teacher_client
 
@@ -8594,6 +8648,7 @@ def test_opd_preparation_propagates_derived_thinking_semantics(
         False,
         "capability",
         "https://control.invalid",
+        context=worker_context,
     )
 
     assert len(state.prompts) == 1
@@ -8606,7 +8661,7 @@ def test_opd_preparation_propagates_derived_thinking_semantics(
     assert env.prompt_opens_thinking is expected_opened
 
 
-def test_opd_thinking_semantics_come_from_the_first_retained_prompt(monkeypatch):
+def test_opd_thinking_semantics_come_from_the_first_retained_prompt(worker_context, monkeypatch):
     """a row dropped for length must not decide the run-level thinking flag.
 
     the flag is run-level and latched once, and it drives `strip_think` during grading. deriving it
@@ -8639,14 +8694,18 @@ def test_opd_thinking_semantics_come_from_the_first_retained_prompt(monkeypatch)
             pass
 
     env = SimpleNamespace(thinking=None, prompt_opens_thinking=None, package_root=None)
-    monkeypatch.setattr(prompt_preparation._worker_state, "THINKING", True)
+    monkeypatch.setattr(worker_context, "config", replace(worker_context.config, thinking=True))
     monkeypatch.setattr(
         prompt_preparation._worker_hf,
         "load_tokenizer",
         lambda model_id, revision: _Tokenizer(),
     )
     monkeypatch.setattr(prompt_preparation, "prompt_opens_thinking", prompt_opens_thinking)
-    monkeypatch.setattr(prompt_preparation, "_thinking_prefill_text", lambda _tokenizer: "")
+    monkeypatch.setattr(
+        prompt_preparation,
+        "_thinking_prefill_text",
+        lambda _tokenizer, context=None, **_context: "",
+    )
     monkeypatch.setattr(
         prompt_preparation._backend,
         "clamp_engine_len",
@@ -8665,7 +8724,7 @@ def test_opd_thinking_semantics_come_from_the_first_retained_prompt(monkeypatch)
     monkeypatch.setattr(
         prompt_preparation,
         "liveness_heartbeat",
-        lambda *_args, **_kwargs: contextlib.nullcontext(),
+        lambda *_args, context=None, **_kwargs: contextlib.nullcontext(),
     )
     import flash.engine.worker.teacher.client as teacher_client
 
@@ -8689,6 +8748,7 @@ def test_opd_thinking_semantics_come_from_the_first_retained_prompt(monkeypatch)
         False,
         "capability",
         "https://control.invalid",
+        context=worker_context,
     )
 
     assert len(state.prompts) == 1, "the over-budget row must be dropped"
@@ -9011,7 +9071,7 @@ def test_opd_child_records_the_core_marker_only_when_a_save_schedule_was_authore
     assert "lora-rollout-guard" in armed
 
 
-def test_opd_stops_an_unguarded_child_at_its_first_step(tmp_path):
+def test_opd_stops_an_unguarded_child_at_its_first_step(worker_context, tmp_path):
     """a child whose sitecustomize was skipped serves every rollout from the base model.
 
     the marker is checked at the first step boundary and the raise tears the child down there, so
@@ -9026,6 +9086,7 @@ def test_opd_stops_an_unguarded_child_at_its_first_step(tmp_path):
         0,
         backend_common.shim_marker_file(str(tmp_path)),  # no marker: the plugin never applied
         ("opd-core", "lora-rollout-guard"),
+        context=worker_context,
     )
 
     # output before the first step is not a verdict: fragments still print while later ones apply.

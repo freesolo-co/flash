@@ -130,13 +130,6 @@ def test_start_marker_rejects_wrong_identity_or_invalid_time(monkeypatch, change
     assert startup.start_time_reader(modal_remote(started_ts=100))() is None
 
 
-def test_missing_bootstrap_time_does_not_bill_queue(monkeypatch):
-    from flash.providers.core.realized import realized_cost_for_remote
-
-    monkeypatch.setattr(startup, "make_hf_text_reader", lambda *a, **k: lambda: None)
-    assert realized_cost_for_remote(modal_remote(), start=1, end=3601) is None
-
-
 def test_bootstrap_publishes_start_identity_before_setup(monkeypatch):
     from pathlib import Path
     from types import SimpleNamespace

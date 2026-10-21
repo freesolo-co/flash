@@ -53,6 +53,9 @@ def _runstatus_from_json(d: dict) -> RunStatus:
     # tolerant load: drop unknown keys before constructing runstatus. source_snapshot is different:
     # malformed persisted identity must fail closed rather than be treated as a legacy absence.
     values = {k: v for k, v in d.items() if k in RunStatus.__dataclass_fields__}
+    # older runs retained the same billing identity under the reconciliation-era field name.
+    if "billing_remote" not in d and d.get("realized_cost_remote") is not None:
+        values["billing_remote"] = d["realized_cost_remote"]
     if d.get("source_snapshot") is not None:
         from flash.snapshot.archive import parse_descriptor
 

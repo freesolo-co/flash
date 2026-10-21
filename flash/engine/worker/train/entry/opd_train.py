@@ -9,10 +9,10 @@ from contextlib import closing
 import flash.engine.worker.io.heartbeat as _worker_heartbeat
 import flash.engine.worker.io.hf as _worker_hf
 import flash.engine.worker.perf as _worker_perf
-import flash.engine.worker.runtime.state as _worker_state
 import flash.engine.worker.train.core.lifecycle.finalize as _worker_finalize
 from flash.engine.plan.steps import final_save_due
 from flash.engine.worker.io.heartbeat import liveness_heartbeat
+from flash.engine.worker.runtime.state import WorkerContext
 from flash.engine.worker.train.entry.backend_common import (
     fused_ce_backend,
     gdn_probe_module,
@@ -65,7 +65,9 @@ def _validate_multimodal_opd(request, spec, model_id: str) -> None:
     )
 
 
-def _load_opd_model(model_id: str, model_revision: str, prompt_state) -> tuple[float, list]:
+def _load_opd_model(
+    model_id: str, model_revision: str, prompt_state, *, context: WorkerContext
+) -> tuple[float, list]:
     """Pull the base weights and read back the generation EOS ids, reporting progress throughout.
 
     Weights come AFTER the prompt-budget filter: a dataset whose every prompt is over budget is a
@@ -78,13 +80,14 @@ def _load_opd_model(model_id: str, model_revision: str, prompt_state) -> tuple[f
     reported as whatever ping came before it. Emit the transition, then hold it open across the
     config read, which is minutes of silence on a cold cache mount.
     """
-    download_seconds = _worker_hf.prefetch_model(model_id, revision=model_revision)
+    download_seconds = _worker_hf.prefetch_model(model_id, revision=model_revision, context=context)
     _worker_heartbeat.heartbeat(
         "opd_model_load",
         download_seconds=download_seconds,
         gpu=_worker_perf.gpu_diagnostics(),
+        context=context,
     )
-    with liveness_heartbeat("opd_model_load"):
+    with liveness_heartbeat("opd_model_load", context=context):
         # reads the snapshot with local_files_only, so it has to follow the prefetch.
         eos_token_ids = generation_eos_from_cached_config(
             model_id, model_revision, prompt_state.tokenizer
@@ -101,11 +104,108 @@ def _cuda_supports_fp8_kv() -> bool:
         return False
 
 
-def run_opd_train(spec=None) -> None:
+def _publish_opd_result(
+    request,
+    prompt_state,
+    workload,
+    runtime,
+    result,
+    download_seconds,
+    started_at,
+    gdn_hybrid,
+    multimodal,
+    *,
+    context: WorkerContext,
+) -> None:
+    knobs, model_id = request.knobs, request.model_id
+    multi_turn, max_model_len = request.multi_turn, prompt_state.max_model_len
+    update_horizon, prompts_per_step = workload.update_horizon, workload.prompts_per_step
+    final_accounting, final_step = result.final_accounting, result.final_step
+    if len(final_accounting["loss_curve"]) != final_step:
+        # record_step only checks that each metric line FOLLOWS the last one, so a missing trailing metric (on_line skips any step-tagged line whose loss it cannot parse) leaves a curve shorter than the checkpoint verl actually wrote.
+        # nothing later arrives to catch it. opt_steps is published from this curve, so a short curve would understate the updates applied. fail loud instead of reporting a number the curve cannot support.
+        raise RuntimeError(
+            f"verl OPD recorded {len(final_accounting['loss_curve'])} distillation-loss metrics "
+            f"for {final_step} optimizer updates; refusing to publish an accounting that does "
+            "not cover every update"
+        )
+    _validate_aligned_sequences(final_accounting)
+    with liveness_heartbeat(
+        "opd_finalizing",
+        progress=lambda: final_step,
+        progress_step=True,
+        keepalive=True,
+        context=context,
+    ):
+        adapter_dir = _export_and_upload_adapter(
+            request, workload, runtime, result, context=context
+        )
+        # preserve the final checkpoint only when save_at_steps is empty, matching grpo. watcher
+        # and final-save paths are disjoint, so the watcher's lifecycle must not suppress it.
+        if final_save_due(final_step, knobs.save_at_steps):
+            _worker_hf.publish_deployable_checkpoint(
+                adapter_dir, final_step, _provenance_ready=True, context=context
+            )
+    setup_seconds = _report_training_complete(result, started_at, context=context)
+    initial_notes, accounting_notes, training_notes, backend_notes = _build_train_note_sections(
+        request,
+        prompt_state,
+        workload,
+        runtime,
+        result,
+        download_seconds,
+        context=context,
+    )
+    _worker_finalize.write_train_meta(
+        phase="opd",
+        step=final_step,
+        adapter_dir=adapter_dir,
+        model_id=model_id,
+        train_wall=result.train_wall,
+        setup_seconds=setup_seconds,
+        train_tokens=0,
+        generated_tokens=int(final_accounting["generated_tokens"]),
+        notes={
+            "steps": update_horizon,
+            # optimizer updates that actually produced a distillation loss. record_step enforces loss_curve length == the metric step, and the guard above rejects a curve shorter than final_step, so this is measured, not assumed.
+            "opt_steps": len(final_accounting["loss_curve"]),
+            **initial_notes,
+            # the real alignment-health signal. mean_coverage reads ~1.0 even when the alignment has collapsed every student token onto one group, so it cannot flag that failure mode on its own; this ratio can.
+            "mean_align_granularity": (
+                float(final_accounting["align_group_sum"]) / int(final_accounting["align_group_n"])
+                if final_accounting["align_group_n"]
+                else 0.0
+            ),
+            **accounting_notes,
+            **_failure_accounting_metadata(final_accounting),
+            **training_notes,
+            # the engine length actually handed to vllm (prompt + completion), already clamped to the model's own limit. the prompt filter is carved out of this same number.
+            "vllm_max_model_len": max_model_len,
+            # only single-turn text uses the fixed serial batcher; multimodal and multi-turn use bridge threads. cap the reported batch by samples the step can produce.
+            "opd_teacher_batch_size": (
+                min(
+                    OPD_TEACHER_SCORING_CONCURRENCY,
+                    max(1, prompts_per_step * knobs.group_size),
+                )
+                if not multimodal and not multi_turn
+                else None
+            ),
+            "opd_teacher_workers": 1 if not multimodal and not multi_turn else None,
+            **backend_notes[0],
+            "gdn_boundary_resets": gdn_hybrid or None,
+            **backend_notes[1],
+            "wandb_url": result.wandb_url,  # the sdk's link_wandb reads notes["wandb_url"]; trl gets it from the child marker emitted by backend_common.render_wandb_link_shim.
+            "wandb_id": result.wandb_id,
+        },
+        context=context,
+    )
+
+
+def run_opd_train(spec=None, *, context: WorkerContext) -> None:
     """Run flash OPD through verl's native rollout and weight-sync path."""
     from flash.engine.worker.train.opd.orchestration import validation
 
-    request = _prepare_request(spec := spec or _worker_state.JOB_SPEC)
+    request = _prepare_request(spec := spec or context.config.spec, context=context)
     knobs, model_id, model_revision = request.knobs, request.model_id, request.model_revision
     structured_validation = validation.validate_opd_structured_outputs(
         knobs.structured_outputs,
@@ -113,26 +213,28 @@ def run_opd_train(spec=None) -> None:
         model_revision=model_revision,
     )
     request = _with_structured_validation(request, structured_validation)
-    prompt_rows, multimodal = render_prompt_rows(request)
+    prompt_rows, multimodal = render_prompt_rows(request, context=context)
     if multimodal:
         _validate_multimodal_opd(request, spec, model_id)
     started_at = time.time()
     capability, control_panel_url = _validate_teacher_transport()
-    _worker_heartbeat.heartbeat("opd_start", gpu=_worker_perf.gpu_diagnostics())
+    _worker_heartbeat.heartbeat("opd_start", gpu=_worker_perf.gpu_diagnostics(), context=context)
     _probe_gpu_in_subprocess(
         spec.gpu.type if spec else None,
         exact_type=spec.gpu.type if spec else "",
     )
-    prompt_state = prepare_prompts(request, prompt_rows, multimodal, capability, control_panel_url)
+    prompt_state = prepare_prompts(
+        request, prompt_rows, multimodal, capability, control_panel_url, context=context
+    )
     with closing(prompt_state.teacher):
-        multi_turn, max_model_len = request.multi_turn, prompt_state.max_model_len
         if not prompt_state.prompts:
             raise RuntimeError("every OPD prompt exceeds the configured prompt budget")
-        download_seconds, eos_token_ids = _load_opd_model(model_id, model_revision, prompt_state)
-        workload = _prepare_workload(request, prompt_state, multimodal)
-        update_horizon, prompts_per_step = workload.update_horizon, workload.prompts_per_step
+        download_seconds, eos_token_ids = _load_opd_model(
+            model_id, model_revision, prompt_state, context=context
+        )
+        workload = _prepare_workload(request, prompt_state, multimodal, context=context)
         # same silent boundary the sft path guards: with no prebuilt worker image this builds a venv and installs the training stack, minutes long with nothing to report and no liveness thread running.
-        with liveness_heartbeat("opd_configuring"):
+        with liveness_heartbeat("opd_configuring", context=context):
             python_bin = resolve_verl_python(
                 workload.workdir, install_wandb=bool(os.environ.get("WANDB_API_KEY"))
             )
@@ -157,10 +259,19 @@ def run_opd_train(spec=None) -> None:
             caps, verl_cc
         )
         runtime = _materialize_child_files(
-            request, prompt_state, workload, python_bin, caps, gdn_reset_arch, eos_token_ids
+            request,
+            prompt_state,
+            workload,
+            python_bin,
+            caps,
+            gdn_reset_arch,
+            eos_token_ids,
+            context=context,
         )
         try:
-            config = _build_base_config(request, prompt_state, workload, runtime, eos_token_ids)
+            config = _build_base_config(
+                request, prompt_state, workload, runtime, eos_token_ids, context=context
+            )
             config.update(
                 {
                     "fp8_kv": fp8_kv,
@@ -179,75 +290,20 @@ def run_opd_train(spec=None) -> None:
                     "fused_ce_backend": fused_ce_backend(caps),
                 }
             )
-            result = _run_child(request, prompt_state, workload, runtime, config, eos_token_ids)
-            final_accounting, final_step = result.final_accounting, result.final_step
-            if len(final_accounting["loss_curve"]) != final_step:
-                # record_step only checks that each metric line FOLLOWS the last one, so a missing trailing metric (on_line skips any step-tagged line whose loss it cannot parse) leaves a curve shorter than the checkpoint verl actually wrote.
-                # nothing later arrives to catch it. opt_steps is published from this curve, so a short curve would understate the updates applied. fail loud instead of reporting a number the curve cannot support.
-                raise RuntimeError(
-                    f"verl OPD recorded {len(final_accounting['loss_curve'])} distillation-loss metrics "
-                    f"for {final_step} optimizer updates; refusing to publish an accounting that does "
-                    "not cover every update"
-                )
-            _validate_aligned_sequences(final_accounting)
-            with liveness_heartbeat(
-                "opd_finalizing", progress=lambda: final_step, progress_step=True, keepalive=True
-            ):
-                adapter_dir = _export_and_upload_adapter(request, workload, runtime, result)
-                # preserve the final checkpoint only when save_at_steps is empty, matching grpo. watcher
-                # and final-save paths are disjoint, so the watcher's lifecycle must not suppress it.
-                if final_save_due(final_step, knobs.save_at_steps):
-                    _worker_hf.publish_deployable_checkpoint(
-                        adapter_dir, final_step, _provenance_ready=True
-                    )
-            setup_seconds = _report_training_complete(result, started_at)
-            initial_notes, accounting_notes, training_notes, backend_notes = (
-                _build_train_note_sections(
-                    request, prompt_state, workload, runtime, result, download_seconds
-                )
+            result = _run_child(
+                request, prompt_state, workload, runtime, config, eos_token_ids, context=context
             )
-            _worker_finalize.write_train_meta(
-                phase="opd",
-                step=final_step,
-                adapter_dir=adapter_dir,
-                model_id=model_id,
-                train_wall=result.train_wall,
-                setup_seconds=setup_seconds,
-                train_tokens=0,
-                generated_tokens=int(final_accounting["generated_tokens"]),
-                notes={
-                    "steps": update_horizon,
-                    # optimizer updates that actually produced a distillation loss. record_step enforces loss_curve length == the metric step, and the guard above rejects a curve shorter than final_step, so this is measured, not assumed.
-                    "opt_steps": len(final_accounting["loss_curve"]),
-                    **initial_notes,
-                    # the real alignment-health signal. mean_coverage reads ~1.0 even when the alignment has collapsed every student token onto one group, so it cannot flag that failure mode on its own; this ratio can.
-                    "mean_align_granularity": (
-                        float(final_accounting["align_group_sum"])
-                        / int(final_accounting["align_group_n"])
-                        if final_accounting["align_group_n"]
-                        else 0.0
-                    ),
-                    **accounting_notes,
-                    **_failure_accounting_metadata(final_accounting),
-                    **training_notes,
-                    # the engine length actually handed to vllm (prompt + completion), already clamped to the model's own limit. the prompt filter is carved out of this same number.
-                    "vllm_max_model_len": max_model_len,
-                    # only single-turn text uses the fixed serial batcher; multimodal and multi-turn use bridge threads. cap the reported batch by samples the step can produce.
-                    "opd_teacher_batch_size": (
-                        min(
-                            OPD_TEACHER_SCORING_CONCURRENCY,
-                            max(1, prompts_per_step * knobs.group_size),
-                        )
-                        if not multimodal and not multi_turn
-                        else None
-                    ),
-                    "opd_teacher_workers": 1 if not multimodal and not multi_turn else None,
-                    **backend_notes[0],
-                    "gdn_boundary_resets": gdn_hybrid or None,
-                    **backend_notes[1],
-                    "wandb_url": result.wandb_url,  # the sdk's link_wandb reads notes["wandb_url"]; trl gets it from the child marker emitted by backend_common.render_wandb_link_shim.
-                    "wandb_id": result.wandb_id,
-                },
+            _publish_opd_result(
+                request,
+                prompt_state,
+                workload,
+                runtime,
+                result,
+                download_seconds,
+                started_at,
+                gdn_hybrid,
+                multimodal,
+                context=context,
             )
         finally:
             runtime.bridge.close()

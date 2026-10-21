@@ -8,7 +8,6 @@ import tempfile
 import pytest
 
 import flash.engine.worker.io.heartbeat as worker_heartbeat
-import flash.engine.worker.runtime.state as worker_state
 import flash.providers._lifecycle.net.worker as provider_worker
 import flash.runner.lifecycle.state as runner_state
 import flash.runner.lifecycle.status as runner_status
@@ -164,7 +163,7 @@ def _patch_prefetch_io(monkeypatch, ephemeral_hub):
     return hf, calls
 
 
-def test_prefetch_model_downloads_to_shared_mount_and_links(tmp_path, monkeypatch):
+def test_prefetch_model_downloads_to_shared_mount_and_links(worker_context, tmp_path, monkeypatch):
     """With the shared cache attached, the base model is downloaded ONTO the mount (explicit cache_dir)
     and symlinked into the per-worker ephemeral hub cache so the trainer/vLLM hit it without re-download."""
     import os as _os
@@ -176,7 +175,7 @@ def test_prefetch_model_downloads_to_shared_mount_and_links(tmp_path, monkeypatc
     monkeypatch.setenv("FLASH_WEIGHT_CACHE_DIR", shared_hub)
     hf, calls = _patch_prefetch_io(monkeypatch, ephemeral_hub)
 
-    hf.prefetch_model("Qwen/Qwen3.5-9B")
+    hf.prefetch_model("Qwen/Qwen3.5-9B", context=worker_context)
 
     # downloaded straight onto the shared mount, NOT the ephemeral default
     assert calls == [
@@ -196,19 +195,23 @@ def test_prefetch_model_downloads_to_shared_mount_and_links(tmp_path, monkeypatc
     assert [p.name for p in ephemeral_hub.iterdir()] == [folder]
 
 
-def test_prefetch_model_uses_ephemeral_default_without_shared_cache(tmp_path, monkeypatch):
+def test_prefetch_model_uses_ephemeral_default_without_shared_cache(
+    worker_context, tmp_path, monkeypatch
+):
     """No shared cache attached -> cache_dir=None (the worker's ephemeral default) and no symlink."""
     monkeypatch.delenv("FLASH_WEIGHT_CACHE_DIR", raising=False)
     ephemeral_hub = tmp_path / "ephemeral" / "hub"
     hf, calls = _patch_prefetch_io(monkeypatch, ephemeral_hub)
 
-    hf.prefetch_model("Qwen/Qwen3.5-9B")
+    hf.prefetch_model("Qwen/Qwen3.5-9B", context=worker_context)
 
     assert calls[0]["cache_dir"] is None  # ephemeral default cache, a correct cold run
     assert not ephemeral_hub.exists()  # nothing linked
 
 
-def test_prefetch_model_falls_back_to_ephemeral_when_mount_absent(tmp_path, monkeypatch):
+def test_prefetch_model_falls_back_to_ephemeral_when_mount_absent(
+    worker_context, tmp_path, monkeypatch
+):
     """FLASH_WEIGHT_CACHE_DIR set but the mount isn't present (failed/absent attach) -> ephemeral cache,
     no write under the missing mount. Defense-in-depth re-check on the worker itself."""
     missing_hub = str(tmp_path / "weight-cache" / "hf-cache" / "hub")  # parent mount NOT created
@@ -216,19 +219,19 @@ def test_prefetch_model_falls_back_to_ephemeral_when_mount_absent(tmp_path, monk
     ephemeral_hub = tmp_path / "ephemeral" / "hub"
     hf, calls = _patch_prefetch_io(monkeypatch, ephemeral_hub)
 
-    hf.prefetch_model("Qwen/Qwen3.5-9B")
+    hf.prefetch_model("Qwen/Qwen3.5-9B", context=worker_context)
 
     assert (
         calls[0]["cache_dir"] is None
     )  # mount absent -> ephemeral, never the missing /weight-cache path
 
 
-def test_prefetch_model_starts_no_download_at_deadline(tmp_path, monkeypatch):
+def test_prefetch_model_starts_no_download_at_deadline(worker_context, tmp_path, monkeypatch):
     monkeypatch.delenv("FLASH_WEIGHT_CACHE_DIR", raising=False)
     hf, calls = _patch_prefetch_io(monkeypatch, tmp_path / "ephemeral" / "hub")
-    monkeypatch.setattr(worker_state, "_remaining_worker_wall_seconds", lambda: 0.0)
+    monkeypatch.setattr(worker_context, "remaining_wall_seconds", lambda: 0.0)
 
-    hf.prefetch_model("Qwen/Qwen3.5-9B")
+    hf.prefetch_model("Qwen/Qwen3.5-9B", context=worker_context)
 
     assert calls == []
 

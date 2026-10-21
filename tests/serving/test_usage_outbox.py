@@ -5,7 +5,7 @@ import hashlib
 import json
 import re
 from dataclasses import replace
-from datetime import UTC, date, datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import httpx
@@ -23,14 +23,9 @@ from flash.serving.src.accounting.usage import (
 )
 from flash.serving.src.accounting.usage_facts import usage_facts
 from flash.serving.src.accounting.usage_outbox import (
-    AuthoritativeProviderDay,
     DurableUsageOutbox,
     FreesoloOrgTrafficPrincipal,
     OfflineUsageStore,
-    OutboxSnapshot,
-    ProviderSettlementRecord,
-    ReconciliationDayResult,
-    ReconciliationResult,
     RequestIdentity,
     UsageEvent,
     UsageOutboxError,
@@ -1533,168 +1528,6 @@ def test_slow_delivery_shutdown_releases_every_single_row_claim() -> None:
     ]
     assert not any(url.endswith("/rpc/quarantine_serving_usage") for url, _ in client.calls)
     assert outbox._active_leases == set()
-
-
-def test_snapshot_is_immutable_and_does_not_mutate_state() -> None:
-    client = _QueuedClient(
-        [
-            (
-                200,
-                {
-                    "captured_at": "2026-08-24T12:00:00Z",
-                    "states": {
-                        "pending": 3,
-                        "leased": 2,
-                        "quarantined": 1,
-                        "disputed": 4,
-                    },
-                    "due_pending": 2,
-                    "expired_leases": 3,
-                    "expired_generation_leases": 5,
-                    "oldest_expired_generation_lease_age_seconds": 45,
-                    "oldest_undelivered_age_seconds": 90,
-                },
-            )
-        ]
-    )
-    outbox = DurableUsageOutbox(
-        _outbox_settings(), client=client, worker_id="worker-1", sleep=_no_sleep
-    )
-
-    snapshot = asyncio.run(outbox.snapshot())
-
-    assert snapshot == OutboxSnapshot(
-        captured_at=datetime(2026, 8, 24, 12, 0, tzinfo=UTC),
-        pending=3,
-        leased=2,
-        quarantined=1,
-        disputed=4,
-        due_pending=2,
-        expired_leases=3,
-        expired_generation_leases=5,
-        oldest_expired_generation_lease_age_seconds=45,
-        oldest_undelivered_age_seconds=90,
-    )
-    with pytest.raises(AttributeError):
-        snapshot.pending = 0  # type: ignore[misc]
-    assert len(client.calls) == 1
-    assert client.calls[0][0].endswith("/rpc/serving_usage_backlog_snapshot")
-
-
-def _provider_record(index: int) -> ProviderSettlementRecord:
-    return ProviderSettlementRecord(
-        provider="freesolo",
-        usage_date=date(2026, 8, 24),
-        source="settlement_export",
-        source_version="v1",
-        provider_record_id=f"provider-{index}",
-        request_id=f"fsgen-{index:032x}",
-        provider_amount_micro_usd=index,
-    )
-
-
-@pytest.mark.parametrize("size", [0, 501])
-def test_reconcile_batch_rejects_outside_contract_cardinality(size: int) -> None:
-    outbox = DurableUsageOutbox(
-        _outbox_settings(), client=_QueuedClient([]), worker_id="worker-1", sleep=_no_sleep
-    )
-
-    with pytest.raises(ValueError, match="1 to 500"):
-        asyncio.run(outbox.reconcile_batch([_provider_record(i) for i in range(size)]))
-
-
-@pytest.mark.parametrize("size", [1, 500])
-def test_reconcile_batch_accepts_contract_boundaries_and_validates_order(size: int) -> None:
-    rows = [
-        {
-            "input_ordinal": index,
-            "outbox_id": f"outbox-{index}",
-            "reconciliation_status": "matched",
-            "dispute_code": None,
-            "replay": False,
-        }
-        for index in range(1, size + 1)
-    ]
-    client = _QueuedClient([(200, rows)])
-    outbox = DurableUsageOutbox(
-        _outbox_settings(), client=client, worker_id="worker-1", sleep=_no_sleep
-    )
-    records = [_provider_record(i) for i in range(1, size + 1)]
-
-    result = asyncio.run(outbox.reconcile_batch(records))
-
-    assert len(result) == size
-    assert result[0] == ReconciliationResult(1, "outbox-1", "matched", None, False)
-    assert result[-1].input_ordinal == size
-    url, payload = client.calls[0]
-    assert url.endswith("/rpc/reconcile_serving_usage_batch")
-    assert payload == {"p_records": [record.rpc_payload() for record in records]}
-
-
-def test_reconcile_batch_rejects_unordered_results() -> None:
-    client = _QueuedClient(
-        [
-            (
-                200,
-                [
-                    {
-                        "input_ordinal": 2,
-                        "outbox_id": "outbox-1",
-                        "reconciliation_status": "matched",
-                        "dispute_code": None,
-                        "replay": False,
-                    }
-                ],
-            )
-        ]
-    )
-    outbox = DurableUsageOutbox(
-        _outbox_settings(), client=client, worker_id="worker-1", sleep=_no_sleep
-    )
-
-    with pytest.raises(UsageOutboxError, match="usage_reconciliation_batch_invalid"):
-        asyncio.run(outbox.reconcile(_provider_record(1)))
-
-
-def test_finalize_authoritative_empty_day_uses_exact_typed_payload() -> None:
-    client = _QueuedClient(
-        [
-            (
-                200,
-                [
-                    {
-                        "reconciliation_day_id": "day-1",
-                        "reconciliation_state": "matched",
-                        "status_reason": None,
-                        "replay": False,
-                    }
-                ],
-            )
-        ]
-    )
-    outbox = DurableUsageOutbox(
-        _outbox_settings(), client=client, worker_id="worker-1", sleep=_no_sleep
-    )
-    day = AuthoritativeProviderDay(
-        provider="freesolo",
-        usage_date=date(2026, 8, 24),
-        source="settlement_export",
-        source_version="v1",
-        attestation_evidence={"digest": "sha256:empty-day"},
-    )
-
-    result = asyncio.run(outbox.finalize_reconciliation_day(day))
-
-    assert result == ReconciliationDayResult("day-1", "matched", None, False)
-    url, payload = client.calls[0]
-    assert url.endswith("/rpc/finalize_serving_usage_reconciliation_day")
-    assert payload == {
-        "p_provider": "freesolo",
-        "p_usage_date": "2026-08-24",
-        "p_source": "settlement_export",
-        "p_source_version": "v1",
-        "p_attestation_evidence": {"digest": "sha256:empty-day"},
-    }
 
 
 class _StreamSession:

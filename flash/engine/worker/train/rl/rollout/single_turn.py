@@ -13,13 +13,14 @@ from __future__ import annotations
 import math
 
 import flash.engine.worker.model.decoding as _worker_decoding
+from flash.engine.worker.runtime.state import WorkerContext
 
 
 def _single_turn_scoring_state(
-    solution_str: str, *, thinking: bool, prompt_opened_thinking: bool
+    solution_str: str, *, thinking: bool, prompt_opened_thinking: bool, context: WorkerContext
 ) -> tuple[str, dict | None]:
     graded = _worker_decoding.graded_text(
-        solution_str, prompt_opened_thinking=prompt_opened_thinking
+        solution_str, prompt_opened_thinking=prompt_opened_thinking, context=context
     )
     state = (
         {
@@ -71,6 +72,7 @@ def score_single_turn(
     think_penalty: float,
     raise_on_error: bool = False,
     breakdowns: list[dict[str, float] | None] | None = None,
+    context: WorkerContext,
 ) -> float:
     """score one single-turn text completion against flash's live env.
 
@@ -95,6 +97,7 @@ def score_single_turn(
             solution_str,
             thinking=thinking,
             prompt_opened_thinking=prompt_opened_thinking,
+            context=context,
         )
         if has_breakdown:
             breakdown = env.scores_breakdown(graded, ex, state)
@@ -133,6 +136,7 @@ def score_single_turn_batch(
     thinking: bool,
     prompt_opened_thinking: bool,
     think_penalty: float,
+    context: WorkerContext,
 ) -> list[tuple[float, list[dict[str, float] | None]]]:
     """score a batch of single-turn completions while preserving scalar failure semantics."""
     if not requests:
@@ -151,6 +155,7 @@ def score_single_turn_batch(
             prompt_opened_thinking=prompt_opened_thinking,
             think_penalty=think_penalty,
             breakdowns=breakdowns,
+            context=context,
         )
         return score, breakdowns
 
@@ -164,6 +169,7 @@ def score_single_turn_batch(
                 solution_str,
                 thinking=thinking,
                 prompt_opened_thinking=prompt_opened_thinking,
+                context=context,
             )
             batch_state = {"response_text": graded}
             if state is not None:

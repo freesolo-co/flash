@@ -19,7 +19,7 @@ from types import SimpleNamespace
 import pytest
 
 import flash.core.spec as runner_spec
-import flash.runner.accounting.reconciliation as runner_reconciliation
+import flash.runner.lifecycle.cleanup as runner_cleanup
 import flash.runner.lifecycle.preparation as runner_preparation
 import flash.runner.lifecycle.reporting as runner_reporting
 import flash.runner.lifecycle.state as runner_state
@@ -3979,7 +3979,6 @@ def test_shutdown_flushes_after_status_replay_failure(monkeypatch):
 
     import flash.server.asgi.app as app_mod
     import flash.server.billing.retry as billing_retry
-    import flash.server.domain.ops.reconcile as reconcile
     import flash.server.domain.ops.repo_cleanup as repo_cleanup
     from flash.providers.core import preflight
 
@@ -4005,7 +4004,6 @@ def test_shutdown_flushes_after_status_replay_failure(monkeypatch):
     monkeypatch.setattr(serving_completion, "recover_deployments", lambda: 0)
     monkeypatch.setattr(serving_completion, "replay_status_reports", fail_replay)
     monkeypatch.setattr(billing_retry, "charge_retry_enabled", lambda: False)
-    monkeypatch.setattr(reconcile, "reconcile_enabled", lambda: False)
     monkeypatch.setattr(repo_cleanup, "repo_cleanup_enabled", lambda: False)
     monkeypatch.setattr(app_mod, "_instance_providers_configured", lambda: False)
     monkeypatch.setattr(deployment_jobs, "_wait_for_deployment_jobs", wait_for_deployments)
@@ -5807,7 +5805,7 @@ def test_recover_runs_drains_private_cleanup_for_terminal_run(monkeypatch, tmp_p
     monkeypatch.setattr(app_mod.db, "all_runs", lambda: [{"run_id": run_id}])
     drained = []
     monkeypatch.setattr(
-        runner_reconciliation, "_drain_cleanup_remotes", lambda rid: drained.append(rid) or set()
+        runner_cleanup, "_drain_cleanup_remotes", lambda rid: drained.append(rid) or set()
     )
     monkeypatch.setattr(providers_mod, "configured_providers", list)
 

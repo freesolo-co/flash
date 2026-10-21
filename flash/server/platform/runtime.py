@@ -25,32 +25,6 @@ _log = logging.getLogger("flash.server")
 _RECOVERABLE = {"queued", "provisioning", "running"}
 
 
-async def _reconcile_cost_loop() -> None:
-    """Background loop: periodically pull realized provider cost (COGS) for finished runs and
-    report it to the freesolo backend for estimator accuracy. The provider billing calls are
-    blocking urllib, so each sweep is offloaded to a thread; failures are swallowed and retried
-    next cycle. Off entirely when FREESOLO_INTERNAL_KEY is unset (see reconcile_enabled)."""
-    from flash.server.domain.ops.reconcile import reconcile_once
-
-    interval = 3600.0  # COGS reconcile sweep interval (fixed; flash is fully managed)
-    while True:
-        await asyncio.sleep(interval)
-        # Handle cancellation EXPLICITLY (re-raise it) and swallow only real Exceptions, exactly
-        # like the sibling reaper loops in app.py (_reap_idle_endpoints_loop /
-        # _sweep_orphan_instances_loop). On the supported Pythons (>=3.11) asyncio.CancelledError
-        # already derives from BaseException, so the old `contextlib.suppress(Exception)` did not
-        # swallow a shutdown cancel arriving during the blocking sweep — but being explicit makes the
-        # cancel path obvious and uniform, and logs a failed sweep instead of silently dropping it.
-        try:
-            reported = await asyncio.to_thread(reconcile_once)
-            if reported:
-                _log.info("reconciled realized cost for %d run(s)", reported)
-        except asyncio.CancelledError:
-            raise  # shutdown: let the lifespan's task.cancel() propagate, don't swallow it
-        except Exception:
-            _log.debug("realized-cost reconcile sweep failed; retrying next cycle", exc_info=True)
-
-
 async def _repo_cleanup_loop() -> None:
     """Sweep aged undeployed HF prefixes on startup, then daily.
 
@@ -69,7 +43,7 @@ async def _repo_cleanup_loop() -> None:
     while True:
         # The blocking sweep runs in a worker thread that task.cancel() can't interrupt; a stop Event
         # lets the lifespan signal it to halt BETWEEN deletes at shutdown, so a large in-flight sweep
-        # can't keep deleting after the server was told to stop (see _reconcile_cost_loop).
+        # can't keep deleting after the server was told to stop.
         stop = threading.Event()
         try:
             deleted = await asyncio.to_thread(run_scheduled_cleanup, should_stop=stop.is_set)
@@ -125,7 +99,7 @@ async def _charge_retry_loop() -> None:
     interval = 300.0  # retry pending/failed customer charges every 5 min
     while True:
         await asyncio.sleep(interval)
-        # Mirror the sibling reaper/reconcile loops: re-raise CancelledError so the lifespan's
+        # Mirror the sibling reaper loops: re-raise CancelledError so the lifespan's
         # task.cancel() stops it at shutdown, and swallow only real Exceptions to keep sweeping.
         stop = threading.Event()
         try:
@@ -238,7 +212,7 @@ def _fail_blocked_recovery(
     *,
     expected_remote: dict | None = None,
 ) -> bool:
-    from flash.runner.accounting.reconciliation import _compare_and_fail_remote
+    from flash.runner.lifecycle.cleanup import _compare_and_fail_remote
     from flash.runner.lifecycle.deadlines import _load_run_deadline_at
     from flash.runner.supervise.recovery import _adopt_completed_attempt, _CompletedAttemptPending
 
@@ -424,7 +398,7 @@ def _reconcile_handleless_run(spec) -> Retry | None:
     """One handle-less reconciliation pass; the owner schedules the next observation."""
     import time
 
-    from flash.runner.accounting.reconciliation import _compare_and_fail_remote
+    from flash.runner.lifecycle.cleanup import _compare_and_fail_remote
     from flash.runner.lifecycle.deadlines import _load_run_deadline_at
     from flash.runner.lifecycle.state import TERMINAL_STATES
     from flash.runner.supervise.recovery import _adopt_completed_attempt
@@ -609,7 +583,7 @@ def _teardown_unrecoverable_remote(status) -> None:
     runs off the persisted handle alone, so it works for exactly the spec the parse rejected.
     Best-effort and fully suppressed: recovery must finish for every other run regardless.
     """
-    from flash.runner.accounting.reconciliation import _record_cleanup_remote
+    from flash.runner.lifecycle.cleanup import _record_cleanup_remote
     from flash.runner.supervise.recovery import _strict_teardown_handle
 
     remote = dict(status.remote or {})
@@ -655,7 +629,7 @@ def _cleanup_pending(run_id: str) -> bool:
 
 
 def _drain_cleanup_remotes_bg(run_id: str) -> Retry | None:
-    from flash.runner.accounting.reconciliation import _drain_cleanup_remotes
+    from flash.runner.lifecycle.cleanup import _drain_cleanup_remotes
 
     checkpoint()
     try:

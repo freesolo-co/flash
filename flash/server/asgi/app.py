@@ -120,7 +120,6 @@ def create_app():
         from flash.providers.core.preflight import check_run_preflight
         from flash.runner.lifecycle.reporting import _open_status_reporter
         from flash.server.billing.retry import charge_retry_enabled
-        from flash.server.domain.ops.reconcile import reconcile_enabled
 
         check_run_preflight()  # operator credentials: fail fast, before serving anyone
         db.recover_teacher_request_ledger()
@@ -143,13 +142,6 @@ def create_app():
         startup_charge_task = (
             asyncio.create_task(server_runtime._charge_retry_startup())
             if charge_retry_enabled()
-            else None
-        )
-        # Periodic realized-cost reconciliation (estimator accuracy), only when the operator
-        # internal key is configured.
-        cost_task = (
-            asyncio.create_task(server_runtime._reconcile_cost_loop())
-            if reconcile_enabled()
             else None
         )
         # Periodic completion-charge retry: re-charge any run left pending/failed by a transient blip
@@ -186,7 +178,6 @@ def create_app():
                 await startup_report_task
             for task in (
                 startup_charge_task,
-                cost_task,
                 charge_task,
                 sweep_task,
                 cleanup_task,

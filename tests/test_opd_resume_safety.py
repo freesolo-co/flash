@@ -3,13 +3,13 @@ from __future__ import annotations
 import contextlib
 import io
 import json
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
 import flash.engine.worker.io.hf as worker_hf
-import flash.engine.worker.runtime.state as worker_state
 import flash.runner.lifecycle.attempts as runner_attempts
 import flash.runner.lifecycle.state as runner_state
 import flash.runner.lifecycle.status as runner_status
@@ -43,12 +43,13 @@ def _patch_worker_marker_context(
     seed: int,
     api=None,
     remaining: float | None = None,
+    worker_context,
 ) -> None:
-    monkeypatch.setattr(worker_state, "HF_REPO", repo)
-    monkeypatch.setattr(worker_state, "RUN_ID", run_id)
-    monkeypatch.setattr(worker_state, "ATTEMPT", attempt)
-    monkeypatch.setattr(worker_state, "SEED", seed)
-    monkeypatch.setattr(worker_state, "_remaining_worker_wall_seconds", lambda: remaining)
+    monkeypatch.setattr(worker_context, "config", replace(worker_context.config, hf_repo=repo))
+    monkeypatch.setattr(worker_context, "config", replace(worker_context.config, run_id=run_id))
+    monkeypatch.setattr(worker_context, "config", replace(worker_context.config, attempt=attempt))
+    monkeypatch.setattr(worker_context, "config", replace(worker_context.config, seed=seed))
+    monkeypatch.setattr(worker_context, "remaining_wall_seconds", lambda: remaining)
     monkeypatch.setattr(worker_hf, "hf_api", lambda: api)
 
 
@@ -237,7 +238,7 @@ def test_marker_decode_rejects_malformed_or_noncanonical_evidence(raw):
         decode_opd_optimizer_start_json(raw, run_id="run-1", attempt=3, seed=42)
 
 
-def test_marker_upload_failure_is_retriable_and_attempted_exactly_once(monkeypatch):
+def test_marker_upload_failure_is_retriable_and_attempted_exactly_once(worker_context, monkeypatch):
     """A failed marker upload is retriable, preserves its cause, and is attempted once.
 
     Retrying in place could double-commit an ambiguous marker. The optimizer wrapper's pre-step
@@ -261,16 +262,17 @@ def test_marker_upload_failure_is_retriable_and_attempted_exactly_once(monkeypat
         attempt=0,
         seed=42,
         api=api,
+        worker_context=worker_context,
     )
 
     with pytest.raises(RetriableInfraError) as caught:
-        hf.publish_opd_optimizer_start_marker()
+        hf.publish_opd_optimizer_start_marker(context=worker_context)
 
     assert caught.value.__cause__ is failure
     assert len(uploads) == 1
 
 
-def test_ambiguous_marker_upload_is_not_retried_and_leaks_no_token(monkeypatch):
+def test_ambiguous_marker_upload_is_not_retried_and_leaks_no_token(worker_context, monkeypatch):
     """A lost commit response must not be retried, and its diagnostic must not carry the HF token.
 
     The dangerous case is a commit that landed while the response was lost: retrying could publish a
@@ -303,9 +305,10 @@ def test_ambiguous_marker_upload_is_not_retried_and_leaks_no_token(monkeypatch):
         attempt=2,
         seed=42,
         api=api,
+        worker_context=worker_context,
     )
     with pytest.raises(RetriableInfraError) as caught:
-        hf.publish_opd_optimizer_start_marker()
+        hf.publish_opd_optimizer_start_marker(context=worker_context)
 
     assert isinstance(caught.value.__cause__, TimeoutError)
     assert "marker-secret" not in str(caught.value)
@@ -319,21 +322,17 @@ def test_ambiguous_marker_upload_is_not_retried_and_leaks_no_token(monkeypatch):
     )
 
 
-def test_worker_marker_rejects_empty_repo(monkeypatch):
+def test_worker_marker_rejects_empty_repo(worker_context, monkeypatch):
     from flash.engine.worker.io import hf
 
     _patch_worker_marker_context(
-        monkeypatch,
-        repo="",
-        run_id="run-1",
-        attempt=0,
-        seed=42,
+        monkeypatch, repo="", run_id="run-1", attempt=0, seed=42, worker_context=worker_context
     )
     with pytest.raises(RuntimeError, match="requires a private HF repository"):
-        hf.publish_opd_optimizer_start_marker()
+        hf.publish_opd_optimizer_start_marker(context=worker_context)
 
 
-def test_worker_marker_starts_no_hf_call_at_deadline(monkeypatch):
+def test_worker_marker_starts_no_hf_call_at_deadline(worker_context, monkeypatch):
     from flash.engine.worker.io import hf
     from flash.engine.worker.perf import RetriableInfraError
 
@@ -346,15 +345,16 @@ def test_worker_marker_starts_no_hf_call_at_deadline(monkeypatch):
         seed=42,
         api=SimpleNamespace(upload_file=lambda **_kwargs: calls.append("hf_api")),
         remaining=0.0,
+        worker_context=worker_context,
     )
 
     with pytest.raises(RetriableInfraError, match="run wall deadline exceeded"):
-        hf.publish_opd_optimizer_start_marker()
+        hf.publish_opd_optimizer_start_marker(context=worker_context)
 
     assert calls == []
 
 
-def test_worker_marker_writes_fsync_and_required_upload(monkeypatch):
+def test_worker_marker_writes_fsync_and_required_upload(worker_context, monkeypatch):
     from flash.engine.worker.io import hf
 
     fsync_calls = []
@@ -378,8 +378,9 @@ def test_worker_marker_writes_fsync_and_required_upload(monkeypatch):
         attempt=4,
         seed=42,
         api=SimpleNamespace(upload_file=upload_file),
+        worker_context=worker_context,
     )
-    hf.publish_opd_optimizer_start_marker()
+    hf.publish_opd_optimizer_start_marker(context=worker_context)
 
     assert len(fsync_calls) == 1
     assert uploads == [
@@ -883,7 +884,7 @@ def test_failed_attached_opd_worker_decodes_present_marker_after_teardown(monkey
     assert status.state == "failed"
     assert status.remote is None
     assert status.cleanup_confirmed_remote == _remote(attempt=0)
-    assert status.realized_cost_remote == _remote(attempt=0)
+    assert status.billing_remote == _remote(attempt=0)
     assert "replacement is blocked" in status.error
     assert [name for name, _kwargs in private_hf.calls] == [
         "repo_info",
@@ -946,7 +947,9 @@ def test_handleless_opd_recovery_blocks_through_recover_runs(monkeypatch, tmp_pa
     ]
 
 
-def test_ambiguous_marker_upload_lands_evidence_and_blocks_replacement(monkeypatch, tmp_path):
+def test_ambiguous_marker_upload_lands_evidence_and_blocks_replacement(
+    worker_context, monkeypatch, tmp_path
+):
     """An ambiguous marker upload still leaves evidence that blocks replacement.
 
     A lost response cannot prove the commit failed, so the published marker must fail closed before
@@ -958,7 +961,9 @@ def test_ambiguous_marker_upload_lands_evidence_and_blocks_replacement(monkeypat
     from flash.runner.supervise import lifecycle
 
     private_hf = _FakePrivateHf(tmp_path, raise_after_upload=True)
-    monkeypatch.setattr(hf, "_sleep_with_hf_deadline", lambda _delay: True)
+    monkeypatch.setattr(
+        hf, "_sleep_with_hf_deadline", lambda _delay, context=None, **_context: True
+    )
     _patch_worker_marker_context(
         monkeypatch,
         repo="private/runs",
@@ -966,9 +971,10 @@ def test_ambiguous_marker_upload_lands_evidence_and_blocks_replacement(monkeypat
         attempt=0,
         seed=42,
         api=private_hf,
+        worker_context=worker_context,
     )
     with pytest.raises(RetriableInfraError, match="required upload"):
-        hf.publish_opd_optimizer_start_marker()
+        hf.publish_opd_optimizer_start_marker(context=worker_context)
 
     marker_path = opd_optimizer_start_marker_path("ambiguous-upload", 0)
     assert private_hf.files[marker_path] == canonical_opd_optimizer_start_json(

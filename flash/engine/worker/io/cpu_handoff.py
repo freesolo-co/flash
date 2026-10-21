@@ -10,6 +10,8 @@ import tempfile
 import time
 from pathlib import Path
 
+from flash.engine.worker.runtime.state import WorkerContext
+
 MOUNT = "/checkpoint-handoff"
 
 
@@ -18,19 +20,25 @@ def handoff_root() -> Path | None:
     return root if root.is_dir() else None
 
 
-def stage_final_checkpoint(step: int, directory: str, *, final_step: int | None) -> bool:
+def stage_final_checkpoint(
+    step: int, directory: str, *, final_step: int | None, context: WorkerContext
+) -> bool:
     """Copy the trainer's resolved final save; intermediate saves upload normally."""
-    from flash.engine.worker.runtime import state
 
     root = handoff_root()
-    if root is None or state.JOB_SPEC is None or final_step is None or step != final_step:
+    if root is None or context.config.spec is None or final_step is None or step != final_step:
         return False
     if type(final_step) is not int or final_step < 1:
         raise ValueError("invalid final checkpoint step")
     source = Path(directory)
     if source.is_symlink() or any(p.is_symlink() for p in source.rglob("*")):
         raise ValueError("checkpoint handoff does not accept symlinks")
-    descriptor = {"version": 1, "run_id": state.RUN_ID, "attempt": state.ATTEMPT, "step": step}
+    descriptor = {
+        "version": 1,
+        "run_id": context.config.run_id,
+        "attempt": context.config.attempt,
+        "step": step,
+    }
     # A complete checkpoint is published by rename; interrupted copies cannot be consumed.
     with tempfile.TemporaryDirectory(prefix="staging-", dir=root) as temporary:
         staged = Path(temporary) / "checkpoint"
@@ -42,7 +50,7 @@ def stage_final_checkpoint(step: int, directory: str, *, final_step: int | None)
         shutil.copytree(
             code, root / "source" / "flash", ignore=shutil.ignore_patterns("__pycache__")
         )
-    (root / "spec.json").write_text(state.JOB_SPEC.to_json())
+    (root / "spec.json").write_text(context.config.spec.to_json())
     target = root / "handoff.json"
     temporary = root / "handoff.json.tmp"
     temporary.write_text(json.dumps(descriptor))
@@ -61,13 +69,13 @@ def defer_completion(done_path: str) -> bool:
 
 
 def main() -> None:
+    context = WorkerContext.from_env()
     spec_path = Path(MOUNT) / "spec.json"
     if spec_path.is_symlink() or hashlib.sha256(
         spec_path.read_bytes()
     ).hexdigest() != os.environ.get("FLASH_EXPECTED_SPEC_SHA256"):
         raise ValueError("CPU checkpoint job specification mismatch")
     from flash.engine.worker.io import hf
-    from flash.engine.worker.runtime import state
 
     root = Path(MOUNT)
     descriptor = root / "handoff.json"
@@ -80,8 +88,8 @@ def main() -> None:
         raise ValueError("missing final training step in checkpoint handoff")
     expected = {
         "version": 1,
-        "run_id": state.RUN_ID,
-        "attempt": state.ATTEMPT,
+        "run_id": context.config.run_id,
+        "attempt": context.config.attempt,
         "step": final_step,
     }
     if json.loads(descriptor.read_text()) != expected:
@@ -92,19 +100,29 @@ def main() -> None:
     if not checkpoint.is_dir() or not any(checkpoint.iterdir()):
         raise ValueError("empty checkpoint handoff")
     started = time.time()
-    result = hf.upload_resume_checkpoint(expected["step"], str(checkpoint), emit_heartbeat=False)
+    result = hf.upload_resume_checkpoint(
+        expected["step"], str(checkpoint), emit_heartbeat=False, context=context
+    )
     if result.resume is None:
         raise RuntimeError("CPU checkpoint publication failed")
     receipt = root / "receipt.json"
     receipt.write_text(json.dumps({**expected, "upload_seconds": time.time() - started}))
-    hf.hf_upload_file(str(receipt), f"cpu_upload_attempt{state.ATTEMPT}.json", required=True)
+    hf.hf_upload_file(
+        str(receipt),
+        f"cpu_upload_attempt{context.config.attempt}.json",
+        required=True,
+        context=context,
+    )
     metrics.setdefault("notes", {})["cpu_upload_seconds"] = time.time() - started
     metrics_path.write_text(json.dumps(metrics))
-    hf.hf_upload_file(str(metrics_path), "metrics.json", required=True)
-    hf.hf_upload_file(str(root / "DONE"), "DONE", required=True)
+    hf.hf_upload_file(str(metrics_path), "metrics.json", required=True, context=context)
+    hf.hf_upload_file(str(root / "DONE"), "DONE", required=True, context=context)
     # The original, source-attested terminal marker becomes public only after every artifact.
     hf.hf_upload_file(
-        str(root / "terminal.json"), f"modal_attempt{state.ATTEMPT}.json", required=True
+        str(root / "terminal.json"),
+        f"modal_attempt{context.config.attempt}.json",
+        required=True,
+        context=context,
     )
 
 

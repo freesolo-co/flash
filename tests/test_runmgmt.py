@@ -12,8 +12,8 @@ import pytest
 import flash.engine.worker.entry.worker as worker_entry
 import flash.runner.accounting.artifacts as runner_artifacts
 import flash.runner.accounting.costs as runner_costs
-import flash.runner.accounting.reconciliation as runner_reconciliation
 import flash.runner.lifecycle.attempts as runner_attempts
+import flash.runner.lifecycle.cleanup as runner_cleanup
 import flash.runner.lifecycle.deadlines as runner_deadlines
 import flash.runner.lifecycle.preparation as runner_preparation
 import flash.runner.lifecycle.reporting as runner_reporting
@@ -522,8 +522,7 @@ def test_record_heartbeat_persists_finalize_liveness_ping_with_step(monkeypatch)
 
 def test_finished_at_frozen_at_terminal_survives_later_updated_at_bumps(monkeypatch):
     """finished_at freezes the training-teardown time on the FIRST terminal transition and is NOT
-    moved by later updated_at bumps (heartbeat/deploy/reconcile) — so reconciliation has an
-    immutable instance run_end even for a run deployed (or heartbeat-touched) after completion."""
+    moved by later heartbeat or deployment updates, so the training end time remains accurate."""
     with tempfile.TemporaryDirectory() as tmp:
         monkeypatch.setattr(runner_state, "RUNS_DIR", tmp)
         from flash.core.spec import JobSpec, TrainSpec
@@ -1617,7 +1616,7 @@ def test_replacement_reservation_clears_the_consumed_teardown_marker(monkeypatch
     and the run is left in `provisioning` with no handleless pass scheduled.
     """
     from flash.core.spec import JobSpec
-    from flash.runner.accounting.reconciliation import _compare_and_confirm_remote_teardown
+    from flash.runner.lifecycle.cleanup import _compare_and_confirm_remote_teardown
 
     monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
     spec = JobSpec(run_id="consumed-teardown-marker", model="Qwen/Qwen3.5-4B", algorithm="sft")
@@ -1669,7 +1668,7 @@ def test_replacement_reservation_clears_the_consumed_teardown_marker(monkeypatch
     # the consumed marker is gone, so startup cannot misread this as confirmed-handle recovery.
     assert settled.cleanup_confirmed_remote is None
     # the accounting copy is carried separately and must survive.
-    assert settled.realized_cost_remote is not None
+    assert settled.billing_remote is not None
 
 
 def test_setup_failure_releases_the_reserved_launch_claim(monkeypatch, tmp_path):
@@ -1831,7 +1830,7 @@ def test_compare_and_clear_remote_uses_exact_provider_resource_identity(
         )
     )
 
-    assert runner_reconciliation._compare_and_clear_remote(spec.run_id, remote) is True
+    assert runner_cleanup._compare_and_clear_remote(spec.run_id, remote) is True
     assert runner_status.get_status(spec.run_id).remote is None
 
 
@@ -1866,7 +1865,7 @@ def test_compare_and_clear_remote_preserves_newer_resource(monkeypatch, tmp_path
         )
     )
 
-    assert runner_reconciliation._compare_and_clear_remote(spec.run_id, original) is False
+    assert runner_cleanup._compare_and_clear_remote(spec.run_id, original) is False
     assert runner_status.get_status(spec.run_id).remote == newer
 
 
@@ -1889,8 +1888,8 @@ def test_cleanup_collection_deduplicates_and_survives_status_writes_and_reload(
         )
     )
 
-    assert runner_reconciliation._preserve_cleanup_remote(spec.run_id, cleanup_remote) is True
-    assert runner_reconciliation._preserve_cleanup_remote(spec.run_id, cleanup_remote) is True
+    assert runner_cleanup._preserve_cleanup_remote(spec.run_id, cleanup_remote) is True
+    assert runner_cleanup._preserve_cleanup_remote(spec.run_id, cleanup_remote) is True
     assert runner_status._update(spec.run_id, "cancelled", error="unchanged terminal state") is True
 
     raw = runner_status._load_status_json(spec.run_id)
@@ -1913,8 +1912,8 @@ def test_record_cleanup_remote_does_not_revive_cleared_remote(monkeypatch, tmp_p
         runner_state.RunStatus(run_id=spec.run_id, state="running", spec=spec.to_dict())
     )
 
-    assert runner_reconciliation._record_cleanup_remote(spec.run_id, remote) is True
-    assert runner_reconciliation._record_cleanup_remote(spec.run_id, remote) is True
+    assert runner_cleanup._record_cleanup_remote(spec.run_id, remote) is True
+    assert runner_cleanup._record_cleanup_remote(spec.run_id, remote) is True
 
     status = runner_status.get_status(spec.run_id)
     assert status.remote is None
@@ -1937,7 +1936,7 @@ def test_recovered_completion_does_not_overwrite_concurrent_cancel(monkeypatch, 
             remote=remote,
         )
     )
-    real_record = runner_reconciliation._record_cleanup_remote
+    real_record = runner_cleanup._record_cleanup_remote
 
     def clear_then_record(run_id, cleanup_remote):
         with runner_state._status_guard(run_id):
@@ -1946,12 +1945,10 @@ def test_recovered_completion_does_not_overwrite_concurrent_cancel(monkeypatch, 
             runner_state._save_status_unlocked(status)
         return real_record(run_id, cleanup_remote)
 
-    monkeypatch.setattr(runner_reconciliation, "_record_cleanup_remote", clear_then_record)
+    monkeypatch.setattr(runner_cleanup, "_record_cleanup_remote", clear_then_record)
     monkeypatch.setattr(runner_status, "_persist_metrics", lambda *_args, **_kwargs: 0.0)
 
-    assert (
-        runner_reconciliation._compare_and_complete_remote(spec.run_id, remote, spec, {}) is False
-    )
+    assert runner_cleanup._compare_and_complete_remote(spec.run_id, remote, spec, {}) is False
     assert runner_status.get_status(spec.run_id).state == "running"
     assert runner_status._update(spec.run_id, "cancelled")
 
@@ -1964,11 +1961,8 @@ def test_recovered_completion_does_not_overwrite_concurrent_cancel(monkeypatch, 
 
 
 @pytest.mark.parametrize("terminal_state", ["done", "failed"])
-def test_recovered_terminal_runs_keep_remote_for_cost_reconciliation(
-    monkeypatch, tmp_path, terminal_state
-):
+def test_recovered_terminal_runs_keep_remote_for_cleanup(monkeypatch, tmp_path, terminal_state):
     from flash.core.spec import JobSpec
-    from flash.server.domain.ops import reconcile
 
     monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
     spec = JobSpec(run_id=f"recovered-{terminal_state}", model="Qwen/Qwen3.5-9B", algorithm="sft")
@@ -1984,20 +1978,16 @@ def test_recovered_terminal_runs_keep_remote_for_cost_reconciliation(
     )
     if terminal_state == "done":
         monkeypatch.setattr(runner_status, "_persist_metrics", lambda *_args, **_kwargs: 0.5)
-        assert (
-            runner_reconciliation._compare_and_complete_remote(spec.run_id, remote, spec, {})
-            is True
-        )
+        assert runner_cleanup._compare_and_complete_remote(spec.run_id, remote, spec, {}) is True
     else:
         assert (
-            runner_reconciliation._compare_and_fail_remote(spec.run_id, remote, "provider failed")
-            is True
+            runner_cleanup._compare_and_fail_remote(spec.run_id, remote, "provider failed") is True
         )
 
     status = runner_status.get_status(spec.run_id)
     assert status.state == terminal_state
     assert status.remote == remote
-    assert reconcile._due(status, status.finished_at + reconcile._SETTLE_SECONDS + 1.0)
+    assert status.finished_at is not None
 
 
 def test_cleanup_collection_removes_only_confirmed_exact_records(monkeypatch, tmp_path):
@@ -2023,7 +2013,7 @@ def test_cleanup_collection_removes_only_confirmed_exact_records(monkeypatch, tm
         started_ts=3.0,
     )
     for remote in (confirmed, endpoint_only, unconfirmed):
-        assert runner_reconciliation._preserve_cleanup_remote(spec.run_id, remote) is True
+        assert runner_cleanup._preserve_cleanup_remote(spec.run_id, remote) is True
 
     events = []
 
@@ -2042,7 +2032,7 @@ def test_cleanup_collection_removes_only_confirmed_exact_records(monkeypatch, tm
 
     monkeypatch.setattr(providers, "get_provider", lambda _name: Provider())
 
-    attempted = runner_reconciliation._drain_cleanup_remotes(spec.run_id)
+    attempted = runner_cleanup._drain_cleanup_remotes(spec.run_id)
 
     assert attempted == {
         ("modal", 1, "sb-endpoint-confirmed", "flash-test-s0-a1", "flash-test"),
@@ -3367,7 +3357,7 @@ def test_recover_runs_defers_when_resubmit_waits_for_metrics(
         runner_state.RunStatus(run_id=spec.run_id, state="provisioning", spec=spec.to_dict())
     )
     monkeypatch.setattr(runtime.db, "all_runs", lambda: [{"run_id": spec.run_id}])
-    monkeypatch.setattr(runner_reconciliation, "_drain_cleanup_remotes", lambda _run_id: None)
+    monkeypatch.setattr(runner_cleanup, "_drain_cleanup_remotes", lambda _run_id: None)
     monkeypatch.setattr(runner_recovery, "_gc_run_sandboxes", lambda _spec: None)
     monkeypatch.setattr(
         runner_preparation, "_mark_warmstart_source", lambda *_args, **_kwargs: None
@@ -3449,7 +3439,7 @@ def test_recover_runs_tears_down_a_handle_backed_run_whose_model_was_removed(
     with pytest.raises(ValueError, match="unsupported model"):
         runner_status.effective_spec_from_status(runner_status.get_status("recover-unparseable"))
     monkeypatch.setattr(runtime.db, "all_runs", lambda: [{"run_id": "recover-unparseable"}])
-    monkeypatch.setattr(runner_reconciliation, "_drain_cleanup_remotes", lambda _run_id: None)
+    monkeypatch.setattr(runner_cleanup, "_drain_cleanup_remotes", lambda _run_id: None)
     monkeypatch.setattr(providers, "configured_providers", list)
     torn: list[tuple[dict, str]] = []
 
@@ -3500,7 +3490,7 @@ def test_recover_runs_rejects_handleless_removed_model_before_resubmit_or_gc(
 
     monkeypatch.setattr(runtime.db, "all_runs", lambda: [{"run_id": spec.run_id}])
     monkeypatch.setattr(providers, "configured_providers", list)
-    monkeypatch.setattr(runner_reconciliation, "_drain_cleanup_remotes", lambda _run_id: None)
+    monkeypatch.setattr(runner_cleanup, "_drain_cleanup_remotes", lambda _run_id: None)
     monkeypatch.setattr(
         runner_recovery,
         "_gc_run_sandboxes",
@@ -3557,7 +3547,7 @@ def test_unparseable_spec_retries_a_teardown_it_could_not_confirm(monkeypatch, t
         attempt=0,
         started_ts=1.0,
     )
-    assert runner_reconciliation._remote_resource_identity(remote) is not None
+    assert runner_cleanup._remote_resource_identity(remote) is not None
     runner_state._save_status(
         runner_state.RunStatus(
             run_id="recover-unconfirmed",
@@ -3670,7 +3660,7 @@ def test_deferred_handleless_loop_waits_through_provider_minimum_window(monkeypa
     monkeypatch.setattr(runtime, "_confirm_run_clear", lambda _spec: True)
     monkeypatch.setattr(runtime, "_handleless_completed_metrics", lambda *a, **k: None)
     failures = []
-    real_fail = runner_reconciliation._compare_and_fail_remote
+    real_fail = runner_cleanup._compare_and_fail_remote
 
     def record_failure(*args, **kwargs):
         failures.append(clock["now"])
@@ -3680,7 +3670,7 @@ def test_deferred_handleless_loop_waits_through_provider_minimum_window(monkeypa
         assert runner_status.get_status(spec.run_id).state == "provisioning"
         clock["now"] += seconds
 
-    monkeypatch.setattr(runner_reconciliation, "_compare_and_fail_remote", record_failure)
+    monkeypatch.setattr(runner_cleanup, "_compare_and_fail_remote", record_failure)
     monkeypatch.setattr(time_mod, "sleep", advance)
 
     _drive_retries(lambda: runtime._reconcile_handleless_run(spec))
@@ -3742,7 +3732,7 @@ def test_deferred_handleless_loop_deadline_cas_fails_with_retry(monkeypatch, tmp
     monkeypatch.setattr(time_mod, "time", lambda: 101.0)
     monkeypatch.setattr(time_mod, "sleep", lambda _seconds: None)
     monkeypatch.setattr(runtime, "_handleless_completed_metrics", lambda *a, **k: None)
-    real_fail = runner_reconciliation._compare_and_fail_remote
+    real_fail = runner_cleanup._compare_and_fail_remote
     attempts = []
 
     def flaky_fail(*args, **kwargs):
@@ -3751,7 +3741,7 @@ def test_deferred_handleless_loop_deadline_cas_fails_with_retry(monkeypatch, tmp
             raise PermissionError("status store unavailable")
         return real_fail(*args, **kwargs)
 
-    monkeypatch.setattr(runner_reconciliation, "_compare_and_fail_remote", flaky_fail)
+    monkeypatch.setattr(runner_cleanup, "_compare_and_fail_remote", flaky_fail)
 
     _drive_retries(lambda: runtime._reconcile_handleless_run(spec))
 
@@ -4235,7 +4225,7 @@ def test_cleanup_policy_requires_stop_evidence_and_retained_obligation(
     remote = _modal_remote()
     events = []
     monkeypatch.setattr(
-        runner_reconciliation,
+        runner_cleanup,
         "_record_cleanup_remote",
         lambda *_: events.append("record") or recorded,
     )
@@ -4249,11 +4239,11 @@ def test_cleanup_policy_requires_stop_evidence_and_retained_obligation(
     monkeypatch.setattr(runner_recovery, "_strict_teardown_handle", destroy)
     monkeypatch.setattr(runner_recovery, "_worker_provably_gone", lambda *_: stopped)
     monkeypatch.setattr(
-        runner_reconciliation,
+        runner_cleanup,
         "_compare_and_remove_cleanup_remote",
         lambda *_: events.append("confirm") or True,
     )
-    outcome = runner_reconciliation.reconcile_cleanup("run", remote)
+    outcome = runner_cleanup.reconcile_cleanup("run", remote)
     assert outcome.replacement_safe is safe
     assert outcome.worker_stopped is stopped
     assert outcome.resource_deleted is deleted
@@ -4265,8 +4255,8 @@ def test_cleanup_persistence_failure_does_not_hide_unknown_teardown(monkeypatch)
     def fail(*_):
         raise OSError("persistence unavailable")
 
-    monkeypatch.setattr(runner_reconciliation, "_record_cleanup_remote", fail)
+    monkeypatch.setattr(runner_cleanup, "_record_cleanup_remote", fail)
     monkeypatch.setattr(runner_recovery, "_strict_teardown_handle", fail)
     monkeypatch.setattr(runner_recovery, "_worker_provably_gone", lambda *_: False)
-    result = runner_reconciliation.reconcile_cleanup("run", _modal_remote())
-    assert result == runner_reconciliation.CleanupOutcome(False, False, False)
+    result = runner_cleanup.reconcile_cleanup("run", _modal_remote())
+    assert result == runner_cleanup.CleanupOutcome(False, False, False)
