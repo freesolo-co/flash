@@ -157,7 +157,10 @@ def test_child_prompt_transport_preserves_reasoning_content_and_rejects_metadata
         def _get_mm_processor_kwargs(self, _audios):
             return {}
 
-        async def apply_chat_template(self, messages, **_kwargs):
+        def _assert_mm_supported(self, has_media):
+            assert not has_media
+
+        async def ct_build_initial_tokens(self, messages, **_kwargs):
             assert messages[1]["reasoning_content"] == "old"
             return [1, 2]
 

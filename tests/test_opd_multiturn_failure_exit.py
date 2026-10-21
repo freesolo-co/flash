@@ -29,7 +29,10 @@ class _Loop:
     def _get_mm_processor_kwargs(self, _audio_data=None):
         return {}
 
-    async def apply_chat_template(self, _prompt, **_kwargs):
+    def _assert_mm_supported(self, has_media):
+        assert not has_media
+
+    async def ct_build_initial_tokens(self, _prompt, **_kwargs):
         return [1, 2]
 
     async def _run_turns(self, *_args, **_kwargs):

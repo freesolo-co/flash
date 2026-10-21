@@ -892,17 +892,17 @@ async def prepare_episode_prompt(loop_self, raw_prompt) -> EpisodePrompt:
         if message.get("reasoning_content") is None:
             message.pop("reasoning_content", None)
     multi_modal_data = await loop_self.process_multi_modal_info(messages)
+    loop_self._assert_mm_supported(bool(multi_modal_data))
     images = multi_modal_data.get("images")
     videos = multi_modal_data.get("videos")
     audios = multi_modal_data.get("audios")
     structured = validate_structured_messages(messages, source="initial prompt")
     mm_processor_kwargs = loop_self._get_mm_processor_kwargs(audios)
-    prompt_ids = await loop_self.apply_chat_template(
+    prompt_ids = await loop_self.ct_build_initial_tokens(
         messages,
         images=images,
         videos=videos,
         audios=audios,
-        mm_processor_kwargs=mm_processor_kwargs,
     )
     return EpisodePrompt(
         getattr(loop_self, "processor", None),

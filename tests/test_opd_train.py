@@ -8965,7 +8965,10 @@ def _drive_opd_multi_turn_episode(
                 return {"images": decode_image_descriptors(descriptors, None)}
             return dict(multi_modal_data or {})
 
-        async def apply_chat_template(self, messages, **kwargs):
+        def _assert_mm_supported(self, has_media):
+            pass
+
+        async def ct_build_initial_tokens(self, messages, **kwargs):
             return [1, 2, 3]
 
         async def generate(

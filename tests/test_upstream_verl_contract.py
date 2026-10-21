@@ -465,3 +465,69 @@ def test_native_adapter_export_accepts_full_and_compact_state(tmp_path, compact)
     assert list((tmp_path / "export").iterdir()) == [output]
     with pytest.raises(RuntimeError, match="no LoRA"):
         merger.save_hf_model_and_tokenizer({})
+
+
+@pytest.mark.parametrize("multimodal", [False, True])
+def test_multiturn_prompt_uses_native_continuous_token_api(multimodal):
+    import asyncio
+
+    import numpy as np
+    from verl.experimental.agent_loop.agent_loop import AgentLoopBase
+
+    from flash.engine.worker.train.core.child.glue import prepare_episode_prompt
+
+    calls = []
+    images = [object()] if multimodal else None
+
+    class Builder:
+        def supports_multimodal(self):
+            return True
+
+        def build_initial_tokens(self, messages, **kwargs):
+            calls.append((messages, kwargs))
+            return [11, 12, 13]
+
+    class Loop(AgentLoopBase):
+        async def run(self, *args, **kwargs):
+            raise NotImplementedError
+
+        async def process_multi_modal_info(self, messages):
+            return {"images": images} if images else {}
+
+    async def prepare():
+        loop = Loop.__new__(Loop)
+        loop.loop = asyncio.get_running_loop()
+        loop.processor = (
+            SimpleNamespace(
+                image_processor=lambda **kwargs: {
+                    "pixel_values": np.zeros((1, 3), dtype=np.float32),
+                    "image_grid_thw": np.ones((1, 3), dtype=np.int64),
+                }
+            )
+            if multimodal
+            else None
+        )
+        loop.continuous_token_builder = Builder()
+        loop.mm_processor_kwargs = {}
+        loop.rollout_config = SimpleNamespace(prompt_length=10)
+        prompt = [{"role": "user", "content": "Name this color."}]
+        result = await prepare_episode_prompt(loop, prompt)
+        assert result.prompt_ids == [11, 12, 13]
+        assert calls == [
+            (
+                prompt,
+                {
+                    "tools": None,
+                    "images": images,
+                    "videos": None,
+                    "audios": None,
+                    "mm_inputs_out": None,
+                },
+            )
+        ]
+        if multimodal:
+            loop.processor = None
+            with pytest.raises(ValueError, match="Multimodal inputs require"):
+                await prepare_episode_prompt(loop, prompt)
+
+    asyncio.run(prepare())
