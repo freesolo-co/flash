@@ -169,7 +169,7 @@ def submit_attempt(
     from flash.providers.modal import checkpoint_upload
 
     name = instance_label(spec.run_id, attempt)
-    payload["handoff_volume"] = checkpoint_upload.volume_name(owner_scope, name)
+    payload["handoff_volume"] = checkpoint_upload.volume_name(owner_scope, spec.run_id, attempt)
     started = time.time()
     capsule, _ = build_capsule("instance-bootstrap")
     sandbox_id = api.create(

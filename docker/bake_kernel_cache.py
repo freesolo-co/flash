@@ -200,6 +200,22 @@ def _verify(out: str, sm: str) -> int:
     if got != sm:
         log(f"FAIL: baked arch {got!r} != requested {sm!r}")
         return 1
+    try:
+        with open(os.path.join(out, "cache_validation.json")) as file:
+            validation = json.load(file)
+        with open(os.path.join(out, "cache_reload.json")) as file:
+            reload = json.load(file)
+        if (
+            validation.get("first_exit_code") != 0
+            or validation.get("reload_exit_code") != 0
+            or reload.get("compilation_forbidden") is not True
+            or reload.get("compile_attempts") != 0
+            or reload.get("passed") is not True
+        ):
+            raise ValueError("fresh-process cache reuse was not proven")
+    except (OSError, ValueError, TypeError, AttributeError) as error:
+        log(f"FAIL: cache reload validation failed ({error})")
+        return 1
     log(f"OK: compiled kernel artifacts for {sm}")
     return 0
 

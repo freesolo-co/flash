@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import time
 from threading import Event
 
 import flash.runner.lifecycle.status as run_status
@@ -281,6 +282,19 @@ def _cleanup_failed_deployment(
     try:
         if not org_id:
             raise ServingError("run has no organization scope for checkpoint cleanup")
+        deadline = time.monotonic() + timeout_s if timeout_s is not None else None
+        previous = run_status.get_status(run_id)
+        identity = previous.deployments.get(checkpoint_id, {}).get("registration_identity")
+        if identity:
+            record = serving_deploy._registered_adapter(org_id, checkpoint_id, timeout_s=timeout_s)
+            if record is not None and not serving_deploy._matches_revision_identity(
+                record, identity
+            ):
+                return True  # This attempt never owned the immutable binding; leave it intact.
+        if identity and deadline is not None:
+            timeout_s = deadline - time.monotonic()
+            if timeout_s <= 0:
+                raise ServingError("checkpoint cleanup deadline expired")
         kwargs = {"timeout_s": timeout_s} if timeout_s is not None else {}
         serving_deploy.undeploy_adapter(checkpoint_id, org_id=org_id, **kwargs)
     except Exception as exc:

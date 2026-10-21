@@ -6316,8 +6316,11 @@ def test_recover_runs_reuses_verified_effective_snapshot_for_no_handle_resubmit(
     import threading
 
     import flash.adapters.lora_rank as rank_mod
+    import flash.providers.modal.checkpoint_upload as checkpoint_upload
     import flash.server.platform.db as db_mod
 
+    # This test models a fully reaped launch, including its persistent handoff storage.
+    monkeypatch.setattr(checkpoint_upload, "run_volumes", lambda _run_id: [])
     monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
     monkeypatch.setattr(runner_state, "RESULTS_DIR", str(tmp_path / "results"))
     monkeypatch.setattr(db_mod, "DB_PATH", str(tmp_path / "s.db"))
