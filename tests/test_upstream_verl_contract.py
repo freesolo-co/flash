@@ -249,7 +249,7 @@ def test_grpo_agent_carries_identity_and_masks_only_truncation(monkeypatch, fini
         prompt_ids=[1],
         response_ids=[2, 3],
         response_mask=[1, 1],
-        extra_fields={"finish_reason": finish_reason},
+        extra_fields={"finish_reason": finish_reason, "global_steps": 1},
         metrics={},
     )
 
@@ -257,7 +257,10 @@ def test_grpo_agent_carries_identity_and_masks_only_truncation(monkeypatch, fini
         async def run(self, params, **kwargs):
             assert kwargs["extra_info"]["flash_rollout_identity"]["rollout_ordinal"] == 2
             events.append("generated")
-            return output
+            return await self.observations.generate()
+
+    async def generate():
+        return output
 
     class Agent(recipe.FlashGrpoPolicy, BaseAgent):
         pass
@@ -265,7 +268,7 @@ def test_grpo_agent_carries_identity_and_masks_only_truncation(monkeypatch, fini
     agent = Agent.__new__(Agent)
     agent.config = _config("grpo")
     agent.config.actor_rollout_ref.model.runtime_options.mask_truncated_completions = True
-    agent.observations = ObservedRolloutClient(None)
+    agent.observations = ObservedRolloutClient(SimpleNamespace(generate=generate))
     agent.tokenizer = SimpleNamespace(decode=lambda *args, **kwargs: "completion")
     monkeypatch.setenv("FLASH_VERL_REWARD_URL", "http://unused")
     monkeypatch.setattr(recipe, "post_json", lambda *args, **kwargs: events.append("registered"))
@@ -279,6 +282,7 @@ def test_grpo_agent_carries_identity_and_masks_only_truncation(monkeypatch, fini
     assert events == ["generated", "scored"]
     assert actual.response_mask == ([0, 0] if finish_reason == "length" else [1, 1])
     assert actual.reward_score == 1.0
+    assert actual.extra_fields["min_global_steps"] == actual.extra_fields["max_global_steps"] == 1
 
 
 def test_opd_teacher_facts_survive_native_agent_serialization(monkeypatch):

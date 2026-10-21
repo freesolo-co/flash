@@ -30,8 +30,11 @@ class OwnedTracking(Tracking):
 
 
 def publish_tracking_link(tracking):
-    run = getattr(tracking.logger.get("wandb"), "run", None)
-    if run is not None:
-        print(
-            "FLASH_WANDB_LINK " + json.dumps({"wandb_url": run.url, "wandb_id": run.id}), flush=True
-        )
+    # Reporting is optional even when an SDK property performs failing I/O internally.
+    with contextlib.suppress(Exception):
+        run = getattr(tracking.logger.get("wandb"), "run", None)
+        if run is not None:
+            print(
+                "FLASH_WANDB_LINK " + json.dumps({"wandb_url": run.url, "wandb_id": run.id}),
+                flush=True,
+            )

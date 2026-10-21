@@ -366,6 +366,7 @@ def _build_opd_launch_config(
     gdn_model_type: str | None,
     loggers,
     reentrant_checkpointing: bool = False,
+    multimodal: bool = False,
     lora_language_prefix: str = "",
     structured_outputs: dict | None = None,
 ) -> str:
@@ -380,6 +381,7 @@ def _build_opd_launch_config(
             **({"lora_language_prefix": lora_language_prefix} if lora_language_prefix else {}),
             "gdn_model_type": gdn_model_type,
             "reentrant_checkpointing": bool(reentrant_checkpointing),
+            "multimodal": bool(multimodal),
             "wandb": "wandb" in loggers,
         },
         sort_keys=True,

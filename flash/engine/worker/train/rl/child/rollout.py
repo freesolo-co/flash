@@ -77,21 +77,22 @@ class FlashGrpoPolicy:
             from vllm.sampling_params import StructuredOutputsParams
 
             params["structured_outputs"] = StructuredOutputsParams(**runtime.structured_outputs)
-        output = await super().run(params, **kwargs)
-        if output.reward_score is None:
-            output.reward_score = await asyncio.to_thread(
-                compute_score,
-                kwargs.get("data_source"),
-                self.tokenizer.decode(output.response_ids, skip_special_tokens=True),
-                (kwargs.get("reward_model") or {}).get("ground_truth"),
-                extra,
-            )
-        if (
-            runtime.mask_truncated_completions
-            and output.extra_fields.get("finish_reason") == "length"
-        ):
-            output.response_mask = [0] * len(output.response_mask)
-        return self.observations.annotate(output)
+        with self.observations.episode():
+            output = await super().run(params, **kwargs)
+            if output.reward_score is None:
+                output.reward_score = await asyncio.to_thread(
+                    compute_score,
+                    kwargs.get("data_source"),
+                    self.tokenizer.decode(output.response_ids, skip_special_tokens=True),
+                    (kwargs.get("reward_model") or {}).get("ground_truth"),
+                    extra,
+                )
+            if (
+                runtime.mask_truncated_completions
+                and output.extra_fields.get("finish_reason") == "length"
+            ):
+                output.response_mask = [0] * len(output.response_mask)
+            return self.observations.annotate(output)
 
 
 @register("flash_grpo_single_turn")

@@ -7451,12 +7451,16 @@ def test_image_token_suppression_is_gated_on_structured_image_blocks():
 
 
 @pytest.mark.parametrize("reentrant", [False, True])
-def test_opd_launch_config_is_serialized_with_the_child_environment(tmp_path, reentrant):
+@pytest.mark.parametrize("multimodal", [False, True])
+def test_opd_launch_config_is_serialized_with_the_child_environment(
+    tmp_path, reentrant, multimodal
+):
     launch_config = _build_opd_launch_config(
         runtime_dir=str(tmp_path),
         save_at_steps=(3, 7),
         total_steps=9,
         reentrant_checkpointing=reentrant,
+        multimodal=multimodal,
         gdn_model_type="qwen3_5",
         loggers=["console", "wandb"],
         structured_outputs={"choice": ["yes"]},
@@ -7468,6 +7472,7 @@ def test_opd_launch_config_is_serialized_with_the_child_environment(tmp_path, re
         "total_steps": 9,
         "gdn_model_type": "qwen3_5",
         "reentrant_checkpointing": reentrant,
+        "multimodal": multimodal,
         "wandb": True,
         "structured_outputs": {"choice": ["yes"]},
     }

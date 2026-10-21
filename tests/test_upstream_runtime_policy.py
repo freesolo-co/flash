@@ -136,3 +136,113 @@ def test_sft_loop_owns_step_horizon_checkpoints_and_tracking(monkeypatch, resume
         assert [step for kind, step in events if kind == "train"] == list(range(resume + 1, 5))
         assert [step for kind, step in events if kind == "save"] == list(range(resume + 2, 5, 2))
         assert events[-1] == ("finish", 0)
+
+
+def test_rollout_versions_are_isolated_across_reused_concurrent_episodes():
+    from flash.engine.worker.train.core.child.observations import ObservedRolloutClient
+
+    class Client:
+        async def generate(self, version):
+            await asyncio.sleep(0)
+            return SimpleNamespace(extra_fields={"global_steps": version})
+
+    observed = ObservedRolloutClient(Client())
+
+    async def run(versions):
+        with observed.episode():
+            for version in versions:
+                await observed.generate(version)
+            return observed.annotate(SimpleNamespace(extra_fields={})).extra_fields
+
+    async def exercise():
+        assert await run([1, 2]) == {"min_global_steps": 1, "max_global_steps": 2}
+        assert await asyncio.gather(run([5, 6]), run([20, 21])) == [
+            {"min_global_steps": 5, "max_global_steps": 6},
+            {"min_global_steps": 20, "max_global_steps": 21},
+        ]
+        with pytest.raises(RuntimeError, match="episode scope"):
+            await observed.generate(99)
+        with pytest.raises(ValueError, match="failed"), observed.episode():
+            raise ValueError("failed")
+        assert await run([30]) == {"min_global_steps": 30, "max_global_steps": 30}
+
+    asyncio.run(exercise())
+
+
+@pytest.mark.parametrize("failed_property", ["run", "url", "id", None])
+def test_tracking_link_lookup_is_optional(monkeypatch, capsys, failed_property):
+    _modules(monkeypatch, {"verl.utils.tracking": {"Tracking": object}})
+    recipe = _import_recipe(monkeypatch, "flash.engine.worker.train.core.child.tracking")
+
+    class Run:
+        @property
+        def url(self):
+            if failed_property == "url":
+                raise RuntimeError("offline")
+            return "https://wandb.example/run"
+
+        @property
+        def id(self):
+            if failed_property == "id":
+                raise RuntimeError("offline")
+            return "run-id"
+
+    class Logger:
+        @property
+        def run(self):
+            if failed_property == "run":
+                raise RuntimeError("offline")
+            return Run()
+
+    recipe.publish_tracking_link(SimpleNamespace(logger={"wandb": Logger()}))
+    output = capsys.readouterr().out
+    if failed_property:
+        assert output == ""
+    else:
+        assert json.loads(output.removeprefix("FLASH_WANDB_LINK ")) == {
+            "wandb_url": "https://wandb.example/run",
+            "wandb_id": "run-id",
+        }
+
+
+@pytest.mark.parametrize("multimodal", [False, True])
+def test_opd_parent_passes_model_checkpointing_and_vision_policy(monkeypatch, multimodal):
+    from flash.engine.worker.train.entry import opd_train_runner as runner
+
+    request = SimpleNamespace(
+        model_id="Qwen/Qwen3.5-9B",
+        knobs=SimpleNamespace(stop_sequences=(), save_at_steps=()),
+        structured_outputs=None,
+        model_vocab_size=248320,
+        multi_turn=False,
+        max_turns=1,
+    )
+    workload = SimpleNamespace(
+        runtime_dir="/runtime",
+        update_horizon=2,
+        exclude_modules=None,
+        multimodal=multimodal,
+        **dict.fromkeys(
+            (
+                "mutation_failure_path",
+                "score_delivery_failure_path",
+                "rollout_failure_path",
+                "abandonment_failure_path",
+                "resample_failure_path",
+                "cycle_commit_failure_path",
+            ),
+            "",
+        ),
+    )
+    runtime = SimpleNamespace(
+        bridge=SimpleNamespace(url="http://teacher", token="test"),
+        loggers=[],
+        gdn_reset_arch="qwen3_5",
+    )
+    monkeypatch.setattr(runner._opd_overrides, "_build_opd_child_env", lambda **kwargs: kwargs)
+    child = runner._build_child_env(
+        request, SimpleNamespace(max_model_len=256), workload, runtime, ()
+    )
+    options = json.loads(child["launch_config"])
+    assert options["reentrant_checkpointing"] is True
+    assert options["multimodal"] is multimodal

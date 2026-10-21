@@ -88,4 +88,6 @@ class FlashTaskRunner:
                 if getattr(trainer, "_dump_executor", None) is not None:
                     trainer._shutdown_dump_executor()
             finally:
+                # The pinned replay buffer polls synchronously and owns no thread or close
+                # operation. The dump executor above must finish before the queue.
                 tq.close()
