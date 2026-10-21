@@ -28,10 +28,11 @@ import numpy as np
 import pytest
 from safetensors.numpy import save
 
-from flash.engine.worker import backend_common as vc
-from flash.engine.worker import rl_train
+import flash.engine.worker.train.entry.rl_train_runner as rl_train_runner
 from flash.engine.worker.perf.lifecycle import RetriableInfraError
 from flash.engine.worker.train.core.child import runtime as child_runtime
+from flash.engine.worker.train.entry import backend_common as vc
+from flash.engine.worker.train.entry import rl_train
 
 # the stamp reads the run's modality off `exclude_modules`: the language-prefix regex for a
 # text-only run, None for a multimodal one. these artifacts are text-only.
@@ -201,11 +202,11 @@ def _trainer_source(module: str) -> str:
     vacuously. These are read by PATH rather than imported because the assertions are on source
     text, so the set of files has to be maintained here when a trainer is split further.
     """
-    parts = [f"flash/engine/worker/{module}.py"]
+    parts = [f"flash/engine/worker/train/entry/{module}.py"]
     if module == "opd_train":
-        parts.append("flash/engine/worker/train/opd/overrides.py")
+        parts.append("flash/engine/worker/train/opd/orchestration/overrides.py")
     if module == "rl_train":
-        parts.append("flash/engine/worker/train/rl/verl_config.py")
+        parts.append("flash/engine/worker/train/rl/launch/verl_config.py")
     return "\n".join(pathlib.Path(_REPO_ROOT, p).read_text() for p in parts)
 
 
@@ -382,7 +383,7 @@ def test_resolve_verl_python_installs_pinned_gpu_dependencies(monkeypatch, tmp_p
     assert "cp312" in vc.FLASH_ATTN_SPEC
     install = calls[1]
     assert vc.VERL_REQUIREMENT == (
-        "verl @ git+https://github.com/freesolo-co/verl@32d6200de81dc484893baf8b9cf30297ebe7fa49"
+        "verl @ git+https://github.com/freesolo-co/verl@f71a02ddb32a9c6a6915f7519bda6dede92e9dd0"
     )
     assert any(vc.VERL_REQUIREMENT_URL in arg for arg in install)
     # liger-kernel is deliberately NOT installed. a matched qwen3.5-9b a/b differing only in
@@ -392,7 +393,7 @@ def test_resolve_verl_python_installs_pinned_gpu_dependencies(monkeypatch, tmp_p
     # looking healthy. with the package absent, use_liger=true raises ImportError at verl's lazy
     # import (transformer_impl.py) instead of silently producing a zero-delta adapter.
     assert "liger-kernel" not in install
-    assert "bitsandbytes==0.50.1" in install
+    assert "bitsandbytes" not in install
     assert "qwen-vl-utils==0.0.14" in install
     assert "torchvision==0.25.0" in install
     assert "xgrammar==0.1.25" in install
@@ -469,7 +470,7 @@ def test_an_exhausted_wheel_install_hands_the_arm_back_instead_of_burning_it(mon
 
     Assert the heartbeat flag, not only the exception type, because the poller routes on that flag.
     """
-    from flash.engine.worker import _worker_failure_flags
+    from flash.engine.worker.entry.worker import _worker_failure_flags
     from flash.engine.worker.perf.lifecycle import RetriableInfraError
 
     calls, sleeps = [], []
@@ -857,7 +858,7 @@ def test_the_verified_arch_round_trips_for_the_dense_module_too(monkeypatch):
     import flash.engine.worker.model.packing as _packing
 
     monkeypatch.setattr(_packing, "gdn_model_type", lambda *a, **k: "qwen3_5")
-    gdn_module = vc.gdn_probe_module("Qwen/Qwen3.5-4B")
+    gdn_module = vc.gdn_probe_module("Qwen/Qwen3.5-9B")
     assert vc.gdn_reset_arch_from_caps({"gdn_boundary_resets": True}, gdn_module) == "qwen3_5"
 
 
@@ -1448,12 +1449,12 @@ def test_verl_pin_matches_the_version_opd_requires_exactly():
     from flash.engine.worker.train.opd.child import plugin as plugin
 
     assert plugin._STRUCTURED_RUNTIME_EXACT_VERSIONS["verl"] == "0.8.0"
-    # bind the pin to its verified base: 32d6200d remains verl 0.8.0 with main_ppo_sync.py plus the
-    # truncation, position-id, fused-label, and qwen3.5 shift-label fixes, and the opd dead-compute
-    # skip on top of them.
+    # bind the pin to its verified base: f71a02dd remains verl 0.8.0 with main_ppo_sync.py plus the
+    # truncation, position-id, fused-label, and qwen3.5 shift-label fixes, the opd dead-compute
+    # skip, and the whole-adapter lora bucket sync plus fused-linear grad preservation on top.
     _, _, ref = vc.VERL_REQUIREMENT.partition("git+")
     _, _, commit = ref.rpartition("@")
-    assert commit == "32d6200de81dc484893baf8b9cf30297ebe7fa49"
+    assert commit == "f71a02ddb32a9c6a6915f7519bda6dede92e9dd0"
 
 
 def test_resolve_verl_python_installs_wandb_best_effort_when_requested(monkeypatch, tmp_path):
@@ -1819,7 +1820,7 @@ def test_run_verl_training_classifies_a_child_cuda_oom_rather_than_returning_it(
 def test_run_verl_training_preserves_oom_over_device_unavailable_after_eviction(
     monkeypatch, oom_first
 ):
-    from flash.engine.worker import _worker_failure_flags
+    from flash.engine.worker.entry.worker import _worker_failure_flags
     from flash.engine.worker.perf import lifecycle
 
     monkeypatch.setattr(lifecycle, "cuda_oom_count", lambda: 0)
@@ -2786,7 +2787,7 @@ def test_the_conftest_fixture_restores_the_flag_the_entry_point_set():
         "    libc.prctl(37, ctypes.byref(cur), 0, 0, 0)\n"
         "    return cur.value\n"
         "import os\n"
-        "from flash.engine.worker import backend_common as vc\n"
+        "from flash.engine.worker.train.entry import backend_common as vc\n"
         "def test_claims_adoption():\n"
         "    vc.run_verl_training(['bash', '-c', \"echo 'step: 1'\"], env=dict(os.environ))\n"
         "    assert flag() == 1\n"
@@ -2984,16 +2985,10 @@ def test_a_job_that_succeeds_still_drains_the_stragglers_an_earlier_one_left(mon
             os.waitpid(pid, 0)
 
 
-# the worker as the runpod handler really runs it: a short-lived process that records a straggler
-# and then EXITS, with no second job to sweep it. `_train_body.run_mode` in
-# `flash/providers/runpod/serverless/endpoints.py`
-# spawns one of these per phase and waits for it, so anything the phase leaves behind reparents to
-# the persistent handler -- which waits only on the worker -- and stays a zombie for the container's
-# life. driven as a subprocess because the leak is about process EXIT, which pytest cannot perform.
 _SHORT_LIVED_WORKER = r"""
 import os, sys, time
 sys.path.insert(0, {repo!r})
-from flash.engine.worker import backend_common as vc
+from flash.engine.worker.train.entry import backend_common as vc
 
 # a straggler as teardown leaves one: exited, owed to this process, recorded because it was still
 # running when the drain deadline passed.
@@ -3016,7 +3011,7 @@ sys.stdout.flush()
 def test_a_worker_that_exits_after_one_phase_still_collects_its_straggler():
     """The deferred reap has to happen before this process exits, because nothing follows it.
 
-    A per-phase RunPod worker loses remembered pids at exit, leaving stragglers as permanent
+    A per-phase provider worker loses remembered pids at exit, leaving stragglers as permanent
     zombies.
     """
     done = subprocess.run(
@@ -3028,7 +3023,7 @@ def test_a_worker_that_exits_after_one_phase_still_collects_its_straggler():
     assert done.returncode == 0, f"worker failed: {done.stderr[-2000:]}"
     straggler = int(done.stdout.strip())
     assert not os.path.exists(f"/proc/{straggler}"), (
-        f"straggler {straggler} outlived the worker that owed its status, so the runpod handler "
+        f"straggler {straggler} outlived the worker that owed its status, so the provider handler "
         "inherits a zombie it never waits on: one leaked pid per phase"
     )
 
@@ -3069,7 +3064,7 @@ def test_grpo_teardown_uses_the_shared_escalating_kill():
     # the grpo path used to hand-roll killpg(pid, 15) and swallow the wait timeout, so a vllm
     # EngineCore that ignored the term kept its cuda context and stranded the gpu for later jobs.
     # pin the call site: a bare killpg here would reintroduce exactly that.
-    source = inspect.getsource(rl_train)
+    source = inspect.getsource(rl_train_runner)
     assert "kill_process_group(self._proc, process_group_id=self._process_group_id)" in source
     assert "os.killpg" not in source, "grpo teardown must not hand-roll a non-escalating killpg"
 
@@ -3114,7 +3109,7 @@ def test_every_test_touching_a_linux_only_api_carries_the_platform_guard():
 _TOPOLOGY_PROBE = r"""
 import ctypes, os, signal, sys, time
 sys.path.insert(0, {repo!r})
-from flash.engine.worker.backend_common import _reap, adopt_orphaned_descendants
+from flash.engine.worker.train.entry.backend_common import _reap, adopt_orphaned_descendants
 
 CLAIM = {claim!r}
 
@@ -3245,7 +3240,7 @@ def test_the_claim_is_made_before_each_verl_process_is_spawned():
     Claiming after the child exists leaves any grandchild it has already orphaned parented
     elsewhere, so the fix would work only for the second job onward on a reused worker.
     """
-    for fn in (vc._run_streaming_verl_subprocess, rl_train._execute_rl_child):
+    for fn in (vc._run_streaming_verl_subprocess, rl_train_runner._execute_rl_child):
         src = " ".join(inspect.getsource(fn).split())
         assert "adopt_orphaned_descendants()" in src, f"{fn.__name__} never claims its orphans"
         assert src.index("adopt_orphaned_descendants()") < src.index("subprocess.Popen("), (
@@ -3866,16 +3861,17 @@ def test_both_verl_bridges_use_the_bounded_server():
     each bridge is defined in its own module, so a fix applied to one leaves the other able to
     exhaust the thread table on exactly the same rollout shape.
     """
-    from flash.engine.worker import opd_train
+    import flash.engine.worker.train.opd.bridging.batching as opd_batching
+    import flash.engine.worker.train.rl.rollout.multi_turn as rl_multi_turn
 
     # the teacher bridge is a module-level class, so check the type itself.
-    assert issubclass(opd_train._TeacherBridgeHTTPServer, vc.BoundedThreadingHTTPServer), (
+    assert issubclass(opd_batching._TeacherBridgeHTTPServer, vc.BoundedThreadingHTTPServer), (
         "the opd teacher bridge does not use BoundedThreadingHTTPServer"
     )
     # the reward bridge is defined inside the function that starts it, so it is only reachable
     # through the source. parse rather than substring-match: a comment mentioning the old name
     # must not pass, and a real subclass must not be missed.
-    for mod in (rl_train, opd_train):
+    for mod in (rl_multi_turn, opd_batching):
         tree = ast.parse(pathlib.Path(inspect.getfile(mod)).read_text())
         for node in ast.walk(tree):
             if not isinstance(node, ast.ClassDef):
@@ -3896,7 +3892,7 @@ def _exit_delay_with_pool(pool_expr: str) -> float:
     program = textwrap.dedent(f"""
         import sys, time
         sys.path.insert(0, {str(pathlib.Path(vc.__file__).parents[3])!r})
-        from flash.engine.worker.backend_common import _DaemonBridgeThreadPool  # noqa: F401
+        from flash.engine.worker.train.entry.backend_common import _DaemonBridgeThreadPool  # noqa: F401
         from concurrent.futures import ThreadPoolExecutor  # noqa: F401
 
         pool = {pool_expr}
@@ -4117,7 +4113,7 @@ def test_the_child_fragment_repoints_the_tilelang_libcudart_stub(tmp_path):
     # the marker naming the resolved runtime is the only evidence in a run log that the repoint
     # happened and WHICH libcudart it picked. without it a silently-skipped swap and a successful one
     # read identically, and the next undefined-symbol crash has nothing to bisect against.
-    assert f"{vc.FLASH_CUDART_STUB_MARKER} -> {real}" in result.stdout, (
+    assert f"{vc.FLASH_CUDART_STUB_MARKER} -> {real}" in result.stderr, (
         f"the fragment did not report the repoint it performed: {result.stdout[-1000:]}"
     )
 
@@ -4227,7 +4223,7 @@ def test_a_failed_repoint_still_lets_the_child_start(tmp_path):
     assert "FRAGMENT_DONE" in result.stdout, (
         f"the exception escaped sitecustomize and killed the run: {result.stderr[-2000:]}"
     )
-    assert "repoint failed" in result.stdout, (
+    assert "repoint failed" in result.stderr, (
         "a swallowed failure must still say so; a silent one is unbisectable from a log"
     )
     assert not stub.is_symlink(), "the stub must be left intact when the swap could not complete"
@@ -4399,7 +4395,7 @@ def test_rendering_the_probe_ignores_a_monkeypatched_parent(monkeypatch):
     ever resolved through ``perf.<attr>`` a test double's body would be rendered into the child and
     the shipped shim would be whatever the last test stubbed. Pin the immunity.
     """
-    from flash.engine.worker import perf
+    import flash.engine.worker.perf as perf
 
     before = vc.render_tilelang_cudart_shim()
     monkeypatch.setattr(perf, "_find_real_libcudart", lambda: "/fake/libcudart.so")
@@ -4489,7 +4485,7 @@ def test_fused_ce_backend_picks_triton_only_where_it_measured_faster():
         assert vc.fused_ce_backend({"capability": list(capability)}) == "triton", capability
 
     # sm80 (A100) and sm86 (A10/A40) are real fleet classes, not hypotheticals, and sm89 is the
-    # RTX 4090 -- the cheapest class the allocator reaches first.
+    # L4 -- the cheapest class the allocator reaches first.
     for capability in ((8, 0), (8, 6), (8, 9)):
         assert vc.fused_ce_backend({"capability": list(capability)}) == "torch", capability
 
@@ -4534,9 +4530,9 @@ def test_every_trainer_asks_for_the_backend_rather_than_hardcoding_one():
     Each trainer resolves the backend once from `caps` and threads the ANSWER through its config
     dict, so the override builders read `cfg[...]` and only the call sites name the helper.
     """
-    import flash.engine.worker.opd_train as opd_train
-    import flash.engine.worker.rl_train as rl_train
-    import flash.engine.worker.sft_train as sft_train
+    import flash.engine.worker.train.entry.opd_train as opd_train
+    import flash.engine.worker.train.entry.rl_train as rl_train
+    import flash.engine.worker.train.entry.sft_train as sft_train
 
     for module in (sft_train, rl_train, opd_train):
         source = pathlib.Path(module.__file__).read_text()
@@ -4561,9 +4557,9 @@ def test_every_trainer_probes_capabilities_for_every_model_not_just_gdn():
     triton measured 2.25x faster. That failure is invisible today -- every catalog model is a gdn
     hybrid -- which is exactly why it needs a test rather than a reader noticing it later.
     """
-    import flash.engine.worker.opd_train as opd_train
-    import flash.engine.worker.rl_train as rl_train
-    import flash.engine.worker.sft_train as sft_train
+    import flash.engine.worker.train.entry.opd_train as opd_train
+    import flash.engine.worker.train.entry.rl_train as rl_train
+    import flash.engine.worker.train.entry.sft_train as sft_train
 
     for module in (sft_train, rl_train, opd_train):
         lines = pathlib.Path(module.__file__).read_text().splitlines()
@@ -4596,15 +4592,17 @@ def test_every_trainer_probes_capabilities_for_every_model_not_just_gdn():
 
 def test_verify_applied_shim_markers_raises_only_on_missing_names(tmp_path):
     marker_file = tmp_path / "applied_shims.txt"
-    marker_file.write_text("entropy-quantile\nkl-ref-adapter\n")
+    marker_file.write_text("nonempty-response-mask\nkl-ref-adapter\n")
     # complete (and over-complete: ray actors re-record) sets pass.
-    vc.verify_applied_shim_markers(str(marker_file), ["entropy-quantile"])
-    vc.verify_applied_shim_markers(str(marker_file), ["entropy-quantile", "kl-ref-adapter"])
+    vc.verify_applied_shim_markers(str(marker_file), ["nonempty-response-mask"])
+    vc.verify_applied_shim_markers(str(marker_file), ["nonempty-response-mask", "kl-ref-adapter"])
     with pytest.raises(RuntimeError, match=r"never proved.*\['stop-sequences'\]"):
-        vc.verify_applied_shim_markers(str(marker_file), ["entropy-quantile", "stop-sequences"])
+        vc.verify_applied_shim_markers(
+            str(marker_file), ["nonempty-response-mask", "stop-sequences"]
+        )
     # an absent file is every marker missing, not a pass.
     with pytest.raises(RuntimeError, match="never proved"):
-        vc.verify_applied_shim_markers(str(tmp_path / "missing.txt"), ["entropy-quantile"])
+        vc.verify_applied_shim_markers(str(tmp_path / "missing.txt"), ["nonempty-response-mask"])
 
 
 def _lora_rollout_server_module(loaded, *, lora_as_adapter=True):
@@ -4858,38 +4856,20 @@ def test_rollout_layered_summon_uses_a_bare_override_not_an_append():
     assert override.startswith("actor_rollout_ref.rollout.layered_summon=")
 
 
-def test_fused_expert_orig_params_is_on_for_fused_expert_targets():
-    # the regression this exists for: PEFT applies `target_parameters` by registering a torch
-    # parametrization onto a NAMED TENSOR at forward time (peft/tuners/lora/layer.py:2463). fsdp1
-    # with verl's default use_orig_params=False (workers/config/engine.py:254) flattens that tensor
-    # into a FlatParameter, so the attribute is gone and register_parametrization raises
-    # "Module 'Qwen3_5MoeExperts(...)' does not have a parameter ... with name 'down_proj'" in the
-    # log-prob forward -- which is how the first GRPO run to survive the weight sync died.
-    from flash.engine.worker.verl.capabilities import fused_expert_orig_params_overrides
+def test_actor_fsdp_strategy_is_always_fsdp2():
+    from flash.engine.worker.verl.capabilities import actor_fsdp_strategy_overrides
 
-    assert fused_expert_orig_params_overrides(
-        ["mlp.experts.gate_up_proj", "mlp.experts.down_proj"]
-    ) == ["actor_rollout_ref.actor.fsdp_config.use_orig_params=true"]
+    assert actor_fsdp_strategy_overrides() == ["actor_rollout_ref.actor.strategy=fsdp2"]
 
 
-@pytest.mark.parametrize("empty", [None, [], (), ""])
-def test_fused_expert_orig_params_stays_off_for_dense_models(empty):
-    # a dense model's lora lives on wrapper MODULES, which fsdp flattening does not remove. it keeps
-    # verl's default, which is the cheaper layout.
-    from flash.engine.worker.verl.capabilities import fused_expert_orig_params_overrides
+def test_actor_fsdp_strategy_uses_a_bare_override_not_an_append():
+    # `strategy` is declared in verl's actor/dp_actor.yaml:26, so hydra already has the key. a '+'
+    # prefix would be an append to an existing key and fail the config merge.
+    from flash.engine.worker.verl.capabilities import actor_fsdp_strategy_overrides
 
-    assert fused_expert_orig_params_overrides(empty) == []
-
-
-def test_fused_expert_orig_params_uses_a_bare_override_not_an_append():
-    # use_orig_params is declared in verl's fsdp.yaml (fsdp.yaml:36) and in the generated trainer
-    # config (_generated_ppo_trainer.yaml:38), so hydra already has the key. a '+' prefix would be
-    # an append to an existing key and fail the config merge.
-    from flash.engine.worker.verl.capabilities import fused_expert_orig_params_overrides
-
-    (override,) = fused_expert_orig_params_overrides(["mlp.experts.gate_up_proj"])
+    (override,) = actor_fsdp_strategy_overrides()
     assert not override.startswith("+")
-    assert override.startswith("actor_rollout_ref.actor.fsdp_config.use_orig_params=")
+    assert override.startswith("actor_rollout_ref.actor.strategy=")
 
 
 def test_rollout_max_num_seqs_rejects_a_nonpositive_batch():
@@ -4897,3 +4877,27 @@ def test_rollout_max_num_seqs_rejects_a_nonpositive_batch():
 
     with pytest.raises(ValueError, match="rollout_batch must be positive"):
         rollout_max_num_seqs(0)
+
+
+def test_startup_optimizations_preserve_subprocess_json_stdout(tmp_path):
+    """cpuinfo/vLLM helpers parse stdout as JSON; sitecustomize diagnostics must use stderr."""
+    (tmp_path / "torch.py").write_text(
+        "from types import SimpleNamespace as S\n"
+        "backends=S(cuda=S(matmul=S(allow_tf32=False)),cudnn=S(allow_tf32=False))\n"
+        "def set_float32_matmul_precision(value): pass\n"
+    )
+    (tmp_path / "sitecustomize.py").write_text(vc.render_sitecustomize_bootstrap())
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import json,torch; print(json.dumps({'tf32':torch.backends.cuda.matmul.allow_tf32}))",
+        ],
+        env={**os.environ, "PYTHONPATH": str(tmp_path)},
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    assert json.loads(result.stdout) == {"tf32": True}
+    assert vc.FLASH_TF32_MARKER in result.stderr

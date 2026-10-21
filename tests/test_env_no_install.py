@@ -10,10 +10,10 @@ import argparse
 
 import pytest
 
-import flash.cli.commands.env.list as env_list_commands
+import flash.cli.commands.env.ops.list as env_list_commands
 from flash._internal.channel import CLI_NAME
-from flash.cli import _build_parser
-from flash.cli.commands.env.list import cmd_env_list
+from flash.cli.commands.env.ops.list import cmd_env_list
+from flash.cli.parsing.main import _build_parser
 
 
 def _no_published(monkeypatch):
@@ -47,7 +47,7 @@ def test_remaining_env_subcommands_still_parse():
 
 
 def test_install_manifest_machinery_is_removed():
-    import flash.envs.base as registry
+    import flash.envs.loading.base as registry
 
     for gone in (
         "record_installed_env",

@@ -48,7 +48,7 @@ def _bounded_pattern(needle: str) -> str:
     non-word character beyond it asks the wrong question: ``/a`` inside ``https://host/a/repo`` is
     preceded by the ``t`` of ``host``, so an unconditional left guard fails and the secret prints
     verbatim. ``ati`` keeps both guards and so still cannot rewrite ``authentication``.
-    Mirrors flash.providers._lifecycle.bootstrap_secrets._bounded_pattern.
+    Mirrors flash.providers._lifecycle.bootstrapping.secrets._bounded_pattern.
     """
     escaped = re.escape(needle)
     left = r"(?<!\w)" if needle[:1].isalnum() or needle[:1] == "_" else ""

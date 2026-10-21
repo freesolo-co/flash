@@ -16,8 +16,8 @@ import tomllib
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
-MODAL_APP = ROOT / "flash" / "serving" / "modal_app.py"
-SERVING_README = ROOT / "flash" / "serving" / "README.md"
+MODAL_APP = ROOT / "flash" / "serving" / "app" / "modal_app.py"
+SERVING_README = ROOT / "flash" / "serving" / "app" / "README.md"
 DEPLOY_WORKFLOWS = ("deploy-modal.yml", "deploy-modal-dev.yml")
 
 
@@ -35,14 +35,17 @@ def _assigned_value(name: str) -> ast.expr:
 
 
 def test_repo_dir_walks_up_to_the_actual_repo_root() -> None:
-    # SERVING_DIR is flash/serving/, so the repo root is two parents up, not one. a single .parent
-    # resolves to flash/, where load_dotenv finds no .env and silently returns -- a production deploy
-    # then runs with none of its secrets and fails at request time rather than at deploy time.
-    assert MODAL_APP.parent.parent.parent == ROOT
+    # SERVING_DIR is flash/serving/app/, so the repo root is three parents up. too few resolves
+    # inside the flash package, where load_dotenv finds no .env and silently returns -- a production
+    # deploy then runs with none of its secrets and fails at request time, not at deploy time.
+    assert MODAL_APP.parent.parent.parent.parent == ROOT
     assert (ROOT / "pyproject.toml").is_file()
 
+    # derived from the file's real depth rather than hardcoded, so a later move of the app updates
+    # the expectation with it instead of leaving this passing against a stale literal.
+    depth = len(MODAL_APP.parent.relative_to(ROOT).parts)
     source = ast.unparse(_assigned_value("REPO_DIR"))
-    assert source == "SERVING_DIR.parent.parent", source
+    assert source == "SERVING_DIR" + ".parent" * depth, source
 
 
 def test_image_installs_from_a_pyproject_that_exists() -> None:
@@ -73,6 +76,34 @@ def test_image_installs_from_a_pyproject_that_exists() -> None:
         assert declared[extra], extra
 
 
+def test_modal_image_applies_and_verifies_the_shared_vllm_repair() -> None:
+    source = MODAL_APP.read_text(encoding="utf-8")
+    copy_call = next(
+        node
+        for node in ast.walk(_module())
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "add_local_file"
+        and "patch_vllm_moe_lora.py" in ast.unparse(node.args[0])
+    )
+    remote_keyword = next(keyword for keyword in copy_call.keywords if keyword.arg == "remote_path")
+    assert ast.literal_eval(remote_keyword.value) == "/root/patch_vllm_moe_lora.py"
+    copy_keyword = next(keyword for keyword in copy_call.keywords if keyword.arg == "copy")
+    assert ast.literal_eval(copy_keyword.value) is True
+
+    install_index = source.index(".pip_install_from_pyproject(")
+    copy_index = source.index(".add_local_file(", install_index)
+    run_index = source.index(".run_commands(", copy_index)
+    env_index = source.index(".env(", run_index)
+    mount_index = source.index('.add_local_python_source("flash")', env_index)
+    assert install_index < copy_index < run_index < env_index < mount_index
+    command = source[run_index:env_index]
+    apply = "python /root/patch_vllm_moe_lora.py &&"
+    verify = "python /root/patch_vllm_moe_lora.py --verify &&"
+    cleanup = "rm /root/patch_vllm_moe_lora.py"
+    assert command.index(apply) < command.index(verify) < command.index(cleanup)
+
+
 def test_hosted_deploy_docs_and_workflows_point_at_paths_that_exist() -> None:
     """The documented deploy commands and the workflows that run them must match the move.
 
@@ -85,8 +116,10 @@ def test_hosted_deploy_docs_and_workflows_point_at_paths_that_exist() -> None:
     readme = SERVING_README.read_text(encoding="utf-8")
     assert "cd serving" not in readme
     # both documented deploys must name the app by its repo-root-relative path.
-    assert readme.count("modal deploy flash/serving/modal_app.py") == 1
-    assert readme.count("modal deploy --env dev flash/serving/modal_app.py") == 1
+    assert readme.count("modal deploy flash/serving/app/modal_app.py") == 1
+    assert readme.count("modal deploy --env dev flash/serving/app/modal_app.py") == 1
+    assert readme.count('export FREESOLO_DEPLOYMENT_ID="manual-production-') == 1
+    assert readme.count('export FREESOLO_DEPLOYMENT_ID="manual-development-') == 1
 
     for workflow in DEPLOY_WORKFLOWS:
         path = ROOT / ".github" / "workflows" / workflow
@@ -191,6 +224,15 @@ def test_image_ships_the_package_under_its_real_import_path() -> None:
             assert (ROOT / f"{relative}.py").is_file() or (
                 ROOT / relative / "__init__.py"
             ).is_file(), node.module
+
+
+def test_serving_workflow_gates_include_the_shared_repair_script() -> None:
+    path = "docker/patch_vllm_moe_lora\\.py$"
+    for workflow in (*DEPLOY_WORKFLOWS, "publish-serving-image.yml"):
+        source = (ROOT / ".github" / "workflows" / workflow).read_text(encoding="utf-8")
+        gate_lines = [line for line in source.splitlines() if "grep -qE" in line]
+        assert len(gate_lines) == 1, workflow
+        assert path in gate_lines[0], workflow
 
 
 def test_self_hosting_docs_name_the_image_the_workflow_actually_publishes() -> None:

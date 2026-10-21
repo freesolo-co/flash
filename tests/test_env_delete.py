@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import argparse
 
-import flash.cli as cli
-from flash.cli.commands.env.push import cmd_env_delete
+import flash.cli.parsing.main as cli
+from flash.cli.commands.env.ops.push import cmd_env_delete
 
 
 def _fake_client(capture: dict, *, deleted: bool = True):

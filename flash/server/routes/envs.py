@@ -25,8 +25,8 @@ def publish_env(
     authorization: Annotated[str | None, Header()] = None,
     x_freesolo_org_id: Annotated[str | None, Header()] = None,
 ):
-    from flash.server.domain import envs
-    from flash.server.domain.projects import require_project_access_slug
+    from flash.server.domain.registry import envs
+    from flash.server.domain.registry.projects import require_project_access_slug
 
     project_raw = payload.get("project_id")
     if not isinstance(project_raw, str):
@@ -41,7 +41,7 @@ def publish_env(
     # Use `if x is None` not `x or ""` so non-string falsy values reach publish_package's type checks.
     _pkg = payload.get("package_b64")
     _name = payload.get("name")
-    from flash.server.domain.environment_registry import record_published_environment
+    from flash.server.domain.registry.environment_registry import record_published_environment
 
     resolved_key = {**key, "org_id": key.get("org_id") or x_freesolo_org_id}
 
@@ -84,7 +84,7 @@ def list_envs(key: Annotated[dict, Depends(require_key)]):
     here would require trusting the mirror this deliberately does not read. A caller that wants one
     project's environments should read the mirror through the web UI.
     """
-    from flash.server.domain import envs
+    from flash.server.domain.registry import envs
 
     try:
         slugs = envs.list_namespace_slugs(key=key)
@@ -96,7 +96,7 @@ def list_envs(key: Annotated[dict, Depends(require_key)]):
 @router.get("/v1/envs/{env_id:path}/package")
 def download_env_package(env_id: str, key: Annotated[dict, Depends(require_key)]):
     """Download a managed Freesolo environment package from the GitHub-backed hub."""
-    from flash.server.domain import envs
+    from flash.server.domain.registry import envs
 
     try:
         env_id = envs.canonical_env_id(env_id)
@@ -130,12 +130,12 @@ def delete_env(
     # Authorization (own-namespace for user keys, any for the internal key) lives in
     # ``delete_package`` so it can't be bypassed.
     from flash.core.spec import require_project_id
-    from flash.server.domain import envs
-    from flash.server.domain.environment_registry import (
+    from flash.server.domain.registry import envs
+    from flash.server.domain.registry.environment_registry import (
         record_deleted_environment,
         require_environment_project,
     )
-    from flash.server.domain.projects import require_project_access
+    from flash.server.domain.registry.projects import require_project_access
 
     try:
         project_id = require_project_id(x_freesolo_project_id)

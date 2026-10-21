@@ -12,6 +12,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
+import flash.runner.lifecycle.state as runner_state
 from flash.server.platform import db
 
 
@@ -397,26 +398,17 @@ def test_me_surfaces_verify_identity_fields_through_api(tmp_path, monkeypatch) -
     pytest.importorskip("fastapi")
     from fastapi.testclient import TestClient
 
-    monkeypatch.setenv("RUNPOD_API_KEY", "rp-test,rp-test-2")
-    monkeypatch.setenv("LAMBDA_API_KEY", "lam-test")
     monkeypatch.setenv("FREESOLO_INTERNAL_KEY", "fslo-internal-test")
     monkeypatch.setenv("HF_TOKEN", "hf-test")
     monkeypatch.setenv("FREESOLO_BASE_URL", "https://freesolo.test")
     monkeypatch.setenv("GITHUB_TOKEN", "ghp-test")
-    # runpod.auth caches the parsed pool on first read; reset so the startup preflight reads THIS
-    # RUNPOD_API_KEY (the autouse _offline fixture also resets, but make the fixture self-contained).
-    import flash.providers.runpod.auth as runpod_keys
 
-    runpod_keys.reset()
-
-    import flash.runner as runner
     import flash.server.platform.auth as auth_mod
     import flash.server.platform.db as db_mod
 
-    importlib.reload(runner)
     importlib.reload(auth_mod)
-    monkeypatch.setattr(runner, "RUNS_DIR", str(tmp_path / "runs"))
-    monkeypatch.setattr(runner, "RESULTS_DIR", str(tmp_path / "results"))
+    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
+    monkeypatch.setattr(runner_state, "RESULTS_DIR", str(tmp_path / "results"))
     monkeypatch.setattr(db_mod, "DB_PATH", str(tmp_path / "server.db"))
 
     token = "fslo_abc123_secret"
@@ -452,14 +444,11 @@ def test_me_surfaces_verify_identity_fields_through_api(tmp_path, monkeypatch) -
 
     monkeypatch.setattr(auth_mod.urllib.request, "urlopen", fake_urlopen)
 
-    import flash.providers as providers_mod
-    import flash.server.app as app_mod
+    import flash.server.asgi.app as app_mod
+    from flash.providers.core import registry as providers_mod
 
     importlib.reload(app_mod)
-    # The Lambda key above (required by the new preflight) makes configured_providers()
-    # treat it as live, so create_app()'s lifespan recover_runs() would dispatch real sweep_orphans()
-    # list calls at startup. This test only checks /v1/me, so stub the provider set to empty to keep it
-    # hermetic. (Pre-PR this fixture set only RUNPOD_API_KEY, whose sweep is a no-op.)
+    # This test checks /v1/me; keep startup recovery from querying provider resources.
     monkeypatch.setattr(providers_mod, "configured_providers", list, raising=False)
     with TestClient(app_mod.create_app()) as client:
         res = client.get("/v1/me", headers={"Authorization": f"Bearer {token}"})

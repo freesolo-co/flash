@@ -16,7 +16,7 @@ from flash.core.spec import (
     CreditAssignment,
     WandbSpec,
 )
-from flash.envs.adapter import is_freesolo_environment_id
+from flash.envs.loading.adapter import is_freesolo_environment_id
 
 
 def _section_int(
@@ -307,7 +307,8 @@ def _validate_env_var_names(names, context: str) -> None:
 
 _RESERVED_ENVIRONMENT_SECRET_KEYS = frozenset(
     {
-        "RUNPOD_API_KEY",
+        "MODAL_TOKEN_ID",
+        "MODAL_TOKEN_SECRET",
         "HF_TOKEN",
         "HUGGING_FACE_HUB_TOKEN",
         "GITHUB_TOKEN",

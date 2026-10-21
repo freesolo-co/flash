@@ -36,7 +36,7 @@ jobs:
           set -euo pipefail
           # This used to `exit 0` when the PAT was absent, on the theory that only a fork could
           # hit that branch. It made the guard fail-OPEN: the secret has never existed on this
-          # repository (flash's secrets are HF_TOKEN, PYPI_API_TOKEN, RUNPOD_API_KEY, and the org
+          # repository (flash's secrets are HF_TOKEN, PYPI_API_TOKEN, MODAL_TOKEN_ID, and the org
           # holds none), so every push took the skip branch and reported success while
           # dispatching nothing. The tests repo recorded 0 `flash-merged` events against 100+
           # `freesolo-merged` ones -- the flash<->backend suites have never gated a flash merge,

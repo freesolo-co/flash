@@ -8,8 +8,10 @@ import sys
 
 import pytest
 
+import flash.engine.worker.io.heartbeat as worker_heartbeat
+import flash.engine.worker.io.hf as worker_hf
 from flash.engine.result.rollout_samples import build_rollout_sample, select_rollout_samples
-from flash.providers._lifecycle.poll import _format_heartbeat
+from flash.providers._lifecycle.instances.poll import _format_heartbeat
 
 
 def test_build_rollout_sample_shows_full_text_and_sanitizes_without_redacting_placeholder(
@@ -170,38 +172,36 @@ def test_select_rollout_samples_rejects_unknown_scalar() -> None:
 
 
 def test_heartbeat_reports_failed_then_successful_forced_delivery(monkeypatch) -> None:
-    import flash.engine.worker as worker
 
     outcomes = iter([False, True])
-    monkeypatch.setattr(worker, "hf_upload_file", lambda *args, **kwargs: next(outcomes))
-    monkeypatch.setattr(worker, "_HB_TERMINAL_ONLY", False)
-    monkeypatch.setattr(worker, "_HB_MIN_INTERVAL_S", 900.0)
-    monkeypatch.setattr(worker, "_HB_FORCE_MIN_INTERVAL_S", 0.0)
-    monkeypatch.setattr(worker, "_HB_LAST_UPLOAD", 0.0)
-    monkeypatch.setattr(worker, "_HB_LAST_FORCED_UPLOAD", 0.0)
-    monkeypatch.setattr(worker, "_HB_LAST_COMMITTED_STEP", 0)
-    monkeypatch.setattr(worker, "_HB_PROGRESS_SEQ", 0)
-    monkeypatch.setattr(worker, "_HB_PROGRESS_UPLOADED_SEQ", 0)
-    monkeypatch.setattr(worker, "_HB_LAST_PROGRESS_TS", 0.0)
+    monkeypatch.setattr(worker_hf, "hf_upload_file", lambda *args, **kwargs: next(outcomes))
+    monkeypatch.setattr(worker_heartbeat, "_HB_TERMINAL_ONLY", False)
+    monkeypatch.setattr(worker_heartbeat, "_HB_MIN_INTERVAL_S", 900.0)
+    monkeypatch.setattr(worker_heartbeat, "_HB_FORCE_MIN_INTERVAL_S", 0.0)
+    monkeypatch.setattr(worker_heartbeat, "_HB_LAST_UPLOAD", 0.0)
+    monkeypatch.setattr(worker_heartbeat, "_HB_LAST_FORCED_UPLOAD", 0.0)
+    monkeypatch.setattr(worker_heartbeat, "_HB_LAST_COMMITTED_STEP", 0)
+    monkeypatch.setattr(worker_heartbeat, "_HB_PROGRESS_SEQ", 0)
+    monkeypatch.setattr(worker_heartbeat, "_HB_PROGRESS_UPLOADED_SEQ", 0)
+    monkeypatch.setattr(worker_heartbeat, "_HB_LAST_PROGRESS_TS", 0.0)
 
-    assert worker.heartbeat("rl_step", step=1, force=True) is False
-    assert worker.heartbeat("rl_step", step=1, force=True) is True
+    assert worker_heartbeat.heartbeat("rl_step", step=1, force=True) is False
+    assert worker_heartbeat.heartbeat("rl_step", step=1, force=True) is True
 
 
 def test_throttled_heartbeat_omits_samples_from_console(monkeypatch, capsys) -> None:
-    import flash.engine.worker as worker
 
-    monkeypatch.setattr(worker, "_HB_TERMINAL_ONLY", False)
-    monkeypatch.setattr(worker, "_HB_MIN_INTERVAL_S", 900.0)
-    monkeypatch.setattr(worker, "_HB_LAST_UPLOAD", 1000.0)
-    monkeypatch.setattr(worker, "_HB_LAST_COMMITTED_STEP", 1)
-    monkeypatch.setattr(worker, "_HB_LAST_PROGRESS_TS", 0.0)
-    monkeypatch.setattr(worker, "_HB_PROGRESS_SEQ", 0)
-    monkeypatch.setattr(worker, "_HB_PROGRESS_UPLOADED_SEQ", 0)
+    monkeypatch.setattr(worker_heartbeat, "_HB_TERMINAL_ONLY", False)
+    monkeypatch.setattr(worker_heartbeat, "_HB_MIN_INTERVAL_S", 900.0)
+    monkeypatch.setattr(worker_heartbeat, "_HB_LAST_UPLOAD", 1000.0)
+    monkeypatch.setattr(worker_heartbeat, "_HB_LAST_COMMITTED_STEP", 1)
+    monkeypatch.setattr(worker_heartbeat, "_HB_LAST_PROGRESS_TS", 0.0)
+    monkeypatch.setattr(worker_heartbeat, "_HB_PROGRESS_SEQ", 0)
+    monkeypatch.setattr(worker_heartbeat, "_HB_PROGRESS_UPLOADED_SEQ", 0)
     heartbeat_module = importlib.import_module("flash.engine.worker.io.heartbeat")
     monkeypatch.setattr(heartbeat_module.time, "time", lambda: 1001.0)
 
-    committed = worker.heartbeat(
+    committed = worker_heartbeat.heartbeat(
         "rl_step",
         step=2,
         sampled_completions=[
@@ -337,7 +337,7 @@ def test_format_heartbeat_defensively_neutralizes_control_characters() -> None:
 
 @pytest.mark.parametrize(
     "module",
-    ["flash.providers._lifecycle.poll", "flash.runner", "flash.cli.commands"],
+    ["flash.providers._lifecycle.instances.poll", "flash.runner", "flash.cli.commands"],
 )
 def test_control_plane_modules_import_without_running_worker_init(module: str) -> None:
     """The control plane must not execute worker startup just by being imported.
