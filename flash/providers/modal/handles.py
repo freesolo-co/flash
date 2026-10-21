@@ -14,6 +14,7 @@ class ModalJobHandle(InstanceJobHandle):
     phase: str
     scope: str
     gpu_count: int = 1
+    cpu_uploads: bool = False
     provider = "modal"
 
     @staticmethod
@@ -30,6 +31,7 @@ class ModalJobHandle(InstanceJobHandle):
             "phase": self.phase,
             "gpu_count": self.gpu_count,
             "scope": self.scope,
+            **({"cpu_uploads": True} if self.cpu_uploads else {}),
         }
 
     @staticmethod
@@ -44,6 +46,10 @@ class ModalJobHandle(InstanceJobHandle):
         if type(count) is not int or count not in (1, 2, 4, 8):
             raise ValueError("invalid Modal gpu_count")
         fields["gpu_count"] = count
+        flag = data.get("cpu_uploads", False)
+        if type(flag) is not bool:
+            raise ValueError("invalid Modal cpu_uploads")
+        fields["cpu_uploads"] = flag
         return fields
 
 

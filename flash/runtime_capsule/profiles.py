@@ -34,7 +34,7 @@ _INSTANCE_BOOTSTRAP_SOURCES = (
 PROFILES: dict[str, Profile] = {
     "instance-bootstrap": Profile(
         name="instance-bootstrap",
-        version=6,
+        version=7,
         entrypoint="bootstrap.py",
         sources=_INSTANCE_BOOTSTRAP_SOURCES,
     ),

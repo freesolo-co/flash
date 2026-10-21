@@ -292,6 +292,7 @@ def run_rl_train():
             python_bin=python_bin,
             preprocessor=preprocessor,
             metric_evidence=state,
+            final_step=expected_steps,
         )
         env_for_verl = _build_rl_child_env(inp, files, loggers, reward_runtime.reward_url)
         metrics_last = state.metrics_last

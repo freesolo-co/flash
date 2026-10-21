@@ -74,6 +74,10 @@ class ModalProvider:
         h = ModalJobHandle.from_dict(handle.to_dict())
         require_scope(h)
         terminate(h.instance_id)
+        if h.cpu_uploads:
+            from flash.providers.modal.checkpoint_upload import cleanup
+
+            cleanup(h)
 
     def cancel(self, handle):
         self.destroy(handle)

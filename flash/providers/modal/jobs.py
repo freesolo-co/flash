@@ -71,13 +71,19 @@ def poll(handle, spec, *, log=None, deadline_at=None):
             else "unknown_start_time",
         )
 
+    terminal_reader = reader(f"modal_attempt{h.attempt}.json")
+    gpu_reader = reader(f"modal_gpu_attempt{h.attempt}.json") if h.cpu_uploads else None
+
+    def marker_reader(**kwargs):
+        return terminal_reader(**kwargs) or (gpu_reader(**kwargs) if gpu_reader else None)
+
     adapter = InstancePollAdapter(
         instance_id=h.instance_id,
         run_id=spec.run_id,
         current_attempt=h.attempt,
         launch_ts=h.started_ts,
         done_reader=reader("DONE"),
-        marker_reader=reader(f"modal_attempt{h.attempt}.json"),
+        marker_reader=marker_reader,
         metrics_reader=reader("metrics.json"),
         fetch_instance=fetch_instance,
         poll_error_exceptions=(api.ModalApiError,),
@@ -100,7 +106,7 @@ def poll(handle, spec, *, log=None, deadline_at=None):
             f"Modal worker produced no liveness for {int(elapsed)}s (limit {int(limit)}s)"
         ),
     )
-    return poll_instance_job(
+    result = poll_instance_job(
         adapter,
         log=log,
         heartbeat_reader=heartbeat_reader_for(spec, deadline_at=deadline_at),
@@ -111,6 +117,18 @@ def poll(handle, spec, *, log=None, deadline_at=None):
         load_timeout_s=1800.0,
         deadline_at=deadline_at,
     )
+    if result.ok and h.cpu_uploads and terminal_reader(force=True) is None:
+        from flash.providers.core.base import PollResult
+        from flash.providers.modal import checkpoint_upload
+
+        try:
+            notes = checkpoint_upload.finish(h, spec, deadline_at=deadline_at)
+        except (api.ModalApiError, TimeoutError):
+            return PollResult(
+                False, failure="job_preempted", detail="Final CPU checkpoint publication failed"
+            )
+        result.metrics.setdefault("notes", {}).update(notes)
+    return result
 
 
 def submit_attempt(
@@ -147,7 +165,10 @@ def submit_attempt(
     if spec.gpu.network_volume and os.environ.get("FLASH_WEIGHT_CACHE_DISABLED", "").strip() != "1":
         payload["cache_volume"] = spec.gpu.network_volume
         payload["env"]["FLASH_WEIGHT_CACHE_DIR"] = f"{api.CACHE_MOUNT}/hf-cache/hub"
+    from flash.providers.modal import checkpoint_upload
+
     name = instance_label(spec.run_id, attempt)
+    payload["handoff_volume"] = checkpoint_upload.volume_name(owner_scope, name)
     started = time.time()
     capsule, _ = build_capsule("instance-bootstrap")
     sandbox_id = api.create(
@@ -159,6 +180,7 @@ def submit_attempt(
         capsule=capsule,
         deadline_at=deadline_at,
     )
+    h = None
     try:
         h = ModalJobHandle(
             instance_id=sandbox_id,
@@ -171,6 +193,7 @@ def submit_attempt(
             hf_repo=spec.train.hf_repo,
             phase=spec.phase,
             gpu_count=count,
+            cpu_uploads=True,
             scope=owner_scope,
         )
         handle = JobHandle.from_dict(h.to_dict())
@@ -180,3 +203,5 @@ def submit_attempt(
     finally:
         # cleanup errors stay visible; a failed delete must not be mistaken for a stopped worker.
         api.terminate(sandbox_id)
+        if h is not None and h.cpu_uploads:
+            checkpoint_upload.cleanup(h)
