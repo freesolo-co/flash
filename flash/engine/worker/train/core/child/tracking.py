@@ -25,20 +25,12 @@ class OwnedTracking(Tracking):
             with contextlib.suppress(Exception):
                 self.run.finish(exit_code=exit_code)
             self.run = None
+        super().finish(exit_code=exit_code)
 
 
-class TrackingOwner:
-    def tracking_class(self, **kwargs):
-        self._owned_tracking = OwnedTracking(**kwargs)
-        return self._owned_tracking
-
-    def fit(self):
-        exit_code = 1
-        try:
-            result = super().fit()
-            exit_code = 0
-            return result
-        finally:
-            tracking = getattr(self, "_owned_tracking", None)
-            if tracking is not None:
-                tracking.finish(exit_code)
+def publish_tracking_link(tracking):
+    run = getattr(tracking.logger.get("wandb"), "run", None)
+    if run is not None:
+        print(
+            "FLASH_WANDB_LINK " + json.dumps({"wandb_url": run.url, "wandb_id": run.id}), flush=True
+        )

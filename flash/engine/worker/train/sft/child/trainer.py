@@ -2,7 +2,6 @@
 
 import os
 import time
-from functools import partial
 
 from torch.utils.data import DistributedSampler
 from torchdata.stateful_dataloader import StatefulDataLoader
@@ -11,8 +10,8 @@ from verl.utils.checkpoint import CheckpointHandler
 from verl.utils.dataset.dataset_utils import SFTTensorCollator
 
 from flash.engine.worker.train.core.child.options import RuntimeOptions
-from flash.engine.worker.train.core.child.tracking import TrackingOwner
 from flash.engine.worker.train.sft.child.dataset import FlashTokenizedSFTDataset
+from flash.engine.worker.train.sft.child.loop import fit_sft
 
 
 class FlashCheckpointHandler(CheckpointHandler):
@@ -42,7 +41,7 @@ class FlashCheckpointHandler(CheckpointHandler):
                 time.sleep(0.1)
 
 
-class FlashSFTTrainer(TrackingOwner, SFTTrainer):
+class FlashSFTTrainer(SFTTrainer):
     def __init__(self, config):
         self.runtime = RuntimeOptions.decode(dict(config.model.runtime_options))
         super().__init__(config)
@@ -54,9 +53,22 @@ class FlashSFTTrainer(TrackingOwner, SFTTrainer):
             self._build_dataloader()
             self.ckpt_handler.train_dataloader = self.train_dataloader
 
-    @property
-    def checkpoint_handler_class(self):
-        return partial(FlashCheckpointHandler, runtime=self.runtime)
+    def _build_ckpt_handler(self):
+        trainer = self.config.trainer
+        self.ckpt_handler = FlashCheckpointHandler(
+            runtime=self.runtime,
+            engine=self.engine,
+            train_dataloader=self.train_dataloader,
+            default_local_dir=trainer.default_local_dir,
+            max_ckpt_to_keep=trainer.get("max_ckpt_to_keep"),
+            default_hdfs_dir=trainer.get("default_hdfs_dir"),
+            resume_mode=trainer.get("resume_mode", "auto"),
+            resume_from_path=trainer.get("resume_from_path"),
+            lora_train_meta=self._get_lora_train_meta(),
+        )
+
+    def fit(self):
+        return fit_sft(self)
 
     def _build_dataset(self):
         if self.config.data.val_files:

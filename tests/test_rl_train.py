@@ -1057,7 +1057,7 @@ def test_one_optimizer_step_consumes_exactly_the_requested_unique_prompts():
 def test_build_verl_overrides_sets_truncation_mask_when_enabled():
     o = rl_verl.build_verl_overrides(_overrides_cfg(mask_truncated_completions=True))
     # `++` (append-or-override), because the key exists in the fork's rollout.yaml but not stock's.
-    assert "++actor_rollout_ref.rollout.mask_truncated_completions=true" in o
+    assert not any("mask_truncated_completions" in override for override in o)
 
 
 def test_build_verl_overrides_omits_truncation_mask_when_disabled():

@@ -24,7 +24,16 @@ ROOT = Path(__file__).resolve().parents[1]
 
 def _modules(monkeypatch, values):
     """supply CPU stand-ins only for dependency boundaries, then import the real recipe."""
+    if "verl.workers.engine.fsdp.transformer_impl" in values:
+        values = {
+            "verl.workers.engine": {
+                "EngineRegistry": SimpleNamespace(register=lambda **kw: lambda cls: cls)
+            },
+            **values,
+        }
     for name, attrs in values.items():
+        if name.startswith("flash."):
+            importlib.import_module(name.rsplit(".", 1)[0])
         for depth in range(1, len(name.split(".")) + 1):
             package = ".".join(name.split(".")[:depth])
             if package not in sys.modules:
@@ -171,7 +180,8 @@ def test_model_options_are_owned_by_each_engine(monkeypatch, enabled):
     engine = recipe.FlashFSDPEngine(
         model_config=SimpleNamespace(
             runtime_options=runtime.encode(), module=module, enable_gradient_checkpointing=enabled
-        )
+        ),
+        engine_config=SimpleNamespace(native_config=lambda: "native"),
     )
     assert engine._build_module() is module
     expected = (
@@ -188,27 +198,25 @@ def test_model_options_are_owned_by_each_engine(monkeypatch, enabled):
 
 
 @pytest.mark.parametrize("algorithm", ["sft", "grpo", "opd"])
-def test_every_engine_uses_explicit_model_construction(monkeypatch, algorithm):
+def test_every_engine_delegates_model_loading_to_upstream(monkeypatch, algorithm):
     calls = []
     model = object()
 
-    def load(config, dtype, sequence_parallel_size):
-        calls.append((config, dtype, sequence_parallel_size))
-        return model
+    class BaseEngine:
+        def _build_module(self):
+            calls.append(self.model_config)
+            return model
 
     _modules(
         monkeypatch,
-        {
-            "verl.workers.engine.fsdp.transformer_impl": {"FSDPEngineWithLMHead": object},
-            "verl.models.transformers.training_model": {"load_training_model": load},
-        },
+        {"verl.workers.engine.fsdp.transformer_impl": {"FSDPEngineWithLMHead": BaseEngine}},
     )
     recipe = _import_recipe(monkeypatch, "flash.engine.worker.train.core.child.engine")
     engine = recipe.FlashFSDPEngine.__new__(recipe.FlashFSDPEngine)
-    engine.model_config = SimpleNamespace(runtime_options={"algorithm": algorithm})
-    engine.ulysses_sequence_parallel_size = 1
-    assert engine._load_model("dtype") is model
-    assert calls == [(engine.model_config, "dtype", 1)]
+    engine.model_config = SimpleNamespace(enable_gradient_checkpointing=False)
+    engine.runtime = RuntimeOptions(algorithm, 1, "ready")
+    assert engine._build_module() is model
+    assert calls == [engine.model_config]
 
 
 def test_sft_uses_linear_scheduler_without_replacing_upstream(monkeypatch):
@@ -251,24 +259,15 @@ def test_tracking_closes_the_owned_run_with_the_actual_outcome(monkeypatch, caps
         def __init__(self, **kwargs):
             self.logger = {"wandb": SimpleNamespace(run=run)}
 
+        def finish(self, exit_code=0):
+            assert "wandb" not in self.logger
+
     _modules(monkeypatch, {"verl.utils.tracking": {"Tracking": Tracking}})
     recipe = _import_recipe(monkeypatch, "flash.engine.worker.train.core.child.tracking")
 
-    class TrainerBase:
-        def fit(self):
-            self.tracking_class(project_name="flash")
-            if fail:
-                raise ValueError("training failed")
-            return 123
-
-    class Trainer(recipe.TrackingOwner, TrainerBase):
-        pass
-
-    if fail:
-        with pytest.raises(ValueError, match="training failed"):
-            Trainer().fit()
-    else:
-        assert Trainer().fit() == 123
+    tracking = recipe.OwnedTracking(project_name="flash")
+    tracking.finish(exit_code=int(fail))
+    tracking.finish(exit_code=int(fail))
     assert finishes == [{"exit_code": int(fail)}]
     assert json.loads(capsys.readouterr().out.removeprefix("FLASH_WANDB_LINK ")) == {
         "wandb_url": run.url,
@@ -303,6 +302,7 @@ def _sft_recipe(monkeypatch, *, resume_step=0):
         monkeypatch,
         {
             "verl.trainer.sft_trainer": {"SFTTrainer": BaseTrainer},
+            "flash.engine.worker.train.sft.child.loop": {"fit_sft": lambda _: None},
             "verl.utils.checkpoint": {"CheckpointHandler": Checkpoint},
             "verl.utils.dataset.dataset_utils": {"SFTTensorCollator": lambda _: list},
             "verl.utils.tracking": {"Tracking": object},
@@ -397,40 +397,6 @@ def test_optimizer_mutation_notice_precedes_real_update_and_is_once_per_optimize
     assert parameter.item() == 1.5
 
 
-@pytest.mark.parametrize("status", ["success", "failure", "running"])
-def test_replay_wait_is_bounded_and_failures_do_not_return_success(monkeypatch, status):
-    import threading
-
-    class Replay:
-        def __init__(self):
-            self.lock = threading.Lock()
-            self._stop_event = threading.Event()
-            self.partitions = {"train": {"one": {"global_steps": 3, "status": status}}}
-
-    _modules(
-        monkeypatch,
-        {"verl.trainer.main_ppo_sync": {"ReplayBuffer": Replay, "KVBatchMeta": SimpleNamespace}},
-    )
-    recipe = _import_recipe(monkeypatch, "flash.engine.worker.train.opd.child.replay")
-    monkeypatch.setattr(recipe, "_actor_probe_state", lambda _: "live")
-    monkeypatch.setattr(recipe, "_REPLAY_STALL_SECONDS", 0)
-    monkeypatch.delenv("FLASH_OPD_ROLLOUT_FAILURE_PATH", raising=False)
-    replay = recipe.BoundedReplayBuffer(SimpleNamespace())
-    if status == "success":
-        result = replay.sample("train", global_steps=3)
-        assert result.keys == ["one"]
-        result.tags[0]["status"] = "changed"
-        assert replay.partitions["train"]["one"]["status"] == "success"
-    else:
-        with pytest.raises(RuntimeError, match=r"failed prompt|opd_replay_stall"):
-            replay.sample("train", global_steps=3)
-    replay._stop_event.set()
-    with pytest.raises(RuntimeError, match="closed"):
-        replay.sample("train", global_steps=3)
-    with pytest.raises(ValueError, match="exactly one"):
-        replay.sample("train", global_steps=3, batch_size=1)
-
-
 def test_physical_device_claims_reject_cross_rank_collisions(monkeypatch, tmp_path):
     _modules(monkeypatch, {"verl.workers.engine_workers": {"ActorRolloutRefWorker": object}})
     recipe = _import_recipe(monkeypatch, "flash.engine.worker.train.core.child.worker")
@@ -443,31 +409,33 @@ def test_physical_device_claims_reject_cross_rank_collisions(monkeypatch, tmp_pa
 
 
 @pytest.mark.parametrize("mask", [[[0, 0]], [[0, 0], [1, 0]]])
-def test_grpo_rejects_empty_response_batches_before_actor_update(monkeypatch, mask):
+def test_grpo_rejects_empty_response_batches_before_advantages(monkeypatch, mask):
     torch = pytest.importorskip("torch")
     calls = []
 
     class BaseTrainer:
-        def _update_actor(self, batch):
+        def _compute_advantage(self, batch, metrics):
             calls.append(batch)
-            return "updated"
+            return batch
 
     _modules(
         monkeypatch,
         {
-            "verl.trainer.main_ppo": {"TaskRunner": object},
-            "verl.trainer.ppo.ray_trainer": {"RayPPOTrainer": BaseTrainer},
-            "verl.utils.tracking": {"Tracking": object},
+            "transfer_queue": {"kv_batch_get": lambda **kw: {"response_mask": torch.tensor(mask)}},
+            "tensordict": {"TensorDict": object},
+            "verl": {"DataProto": object},
+            "verl.workers.utils.padding": {"response_to_nested": object},
+            "flash.engine.worker.train.core.child.trainer": {"FlashSyncTrainer": BaseTrainer},
         },
     )
-    _import_recipe(monkeypatch, "flash.engine.worker.train.core.child.tracking")
     recipe = _import_recipe(monkeypatch, "flash.engine.worker.train.rl.child.trainer")
     trainer = recipe.FlashGrpoTrainer.__new__(recipe.FlashGrpoTrainer)
-    batch = SimpleNamespace(batch={"response_mask": torch.tensor(mask)})
+    trainer.runtime = RuntimeOptions("grpo", 1, "ready")
+    batch = SimpleNamespace(keys=["a"], partition_id="train")
     if len(mask) == 1:
         with pytest.raises(RuntimeError, match="no trainable response tokens"):
-            trainer._update_actor(batch)
+            trainer._compute_advantage(batch, {})
         assert calls == []
     else:
-        assert trainer._update_actor(batch) == "updated"
+        assert trainer._compute_advantage(batch, {}) is batch
         assert calls == [batch]

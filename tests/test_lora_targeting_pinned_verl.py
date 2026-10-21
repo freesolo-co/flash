@@ -25,7 +25,7 @@ from flash.engine.worker.train.core.child.engine import FlashFSDPEngine
 from flash.engine.worker.train.core.child.options import RuntimeOptions
 from flash.engine.worker.train.entry.backend_common import VERL_REQUIREMENT_URL
 
-_PINNED_COMMIT = "7647bb7f423b649df74ac71a244a2a3de9e1466a"
+_PINNED_COMMIT = "ddf700725c34bb8966685c8ecf5ca36a2cc54a35"
 _PINNED_BLOBS = {
     "base_config.py": (BaseConfig, "f425dd1464b0f13c83a0944249cd84d55903f120"),
     "model.py": (HFModelConfig, "2de369fb39d90747a352aeff20c27632655b4545"),
@@ -114,7 +114,7 @@ def _build_model_config(monkeypatch, fused_targets, override_config):
 def test_exact_pinned_verl_frozen_config_is_replaced_without_gpu_or_field_loss(monkeypatch):
     import torch
 
-    assert importlib.metadata.version("verl") == "0.8.0"
+    assert importlib.metadata.version("verl") == "0.10.0.dev0"
     assert VERL_REQUIREMENT_URL.endswith("@" + _PINNED_COMMIT)
     assert torch.cuda.is_available() is False
     for symbol, expected in _PINNED_BLOBS.values():

@@ -1,4 +1,4 @@
-"""standalone child-side multi-turn OPD rollout support for verl 0.8.0."""
+"""standalone child-side multi-turn OPD rollout support for pinned upstream Verl."""
 
 from __future__ import annotations
 

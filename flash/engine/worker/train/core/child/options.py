@@ -19,6 +19,7 @@ class RuntimeOptions:
     wandb: bool = False
     dp_cards: int = 1
     per_turn_credit: bool = False
+    mask_truncated_completions: bool = False
     stop_sequences: tuple[str, ...] = ()
     image_pad_token_id: int | None = None
     structured_outputs: dict | None = None

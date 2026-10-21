@@ -260,12 +260,11 @@ print('worker stack OK | torch', torch.__version__, '| cudnn', cudnn, '| triton'
 # the pod. Keep the two in lockstep: verl's install_requires omits vllm/uvicorn/fastapi/cachetools
 # while importing them at module level on the launch path, so any dependency dropped from ONE of
 # these two lists yields an interpreter where `verl.trainer.main_ppo` dies on ModuleNotFoundError:
-# cachetools and `main_ppo_sync` dies on uvicorn. Baking them here keeps the image from paying the
+# cachetools and the V1 PPO trainer dies on uvicorn. Baking them here keeps the image from paying the
 # fallback's install cost on every run; it is not what makes the backends runnable.
 #
 # vLLM is pinned to 0.19.1, matching the base stack above so the image carries ONE vLLM version.
-# The company fork now declares that exact vLLM version and Transformers >=5.12.1,<5.13.
-# Its explicit model and tensor-adapter implementations use those APIs.
+# Flash pins the tested vLLM and Transformers versions alongside the exact upstream source.
 # The overrides still resolve incompatible metadata in the remaining dependency graph:
 #   verl + transferqueue declare numpy<2.0.0 -> vLLM 0.19.1 needs numpy>=2
 #   vllm declares xgrammar>=0.1.32           -> structured OPD requires exactly 0.1.25
@@ -310,7 +309,7 @@ print('worker stack OK | torch', torch.__version__, '| cudnn', cudnn, '| triton'
 # is_causal_conv1d_available() are byte-identical in 5.12.1 and 5.14.1, and both begin with
 # is_torch_cuda_available() -- they answer False on this cpu builder at every version. An earlier
 # revision of this comment blamed a 5.13 import-path move; no such move exists.
-ARG VERL_SPEC=verl[vllm]@git+https://github.com/freesolo-co/verl@7647bb7f423b649df74ac71a244a2a3de9e1466a
+ARG VERL_SPEC=verl[vllm]@git+https://github.com/verl-project/verl@ddf700725c34bb8966685c8ecf5ca36a2cc54a35
 ENV FLASH_VERL_PYTHON=/opt/verl-venv/bin/python
 RUN printf '%s\n' "numpy==2.2.6" "xgrammar==0.1.25" "vllm==0.19.1" "transformers==5.12.1" > /tmp/verl-overrides.txt \
     && uv venv --seed /opt/verl-venv \
@@ -408,10 +407,9 @@ RUN python /tmp/cudartfix/extract_cudart_fix.py /tmp/cudartfix/capabilities.py /
 
 # Sanity: the verl venv must be able to LAUNCH, not merely install. This is the assert that would
 # have caught the shipped-but-unrunnable venv. Import the three entrypoints flash actually invokes
-# (rl_train -> main_ppo, opd child trainer -> main_ppo_sync, sft_train -> sft_trainer; note it is
+# (rl_train -> main_ppo, opd child trainer -> ppo.v1.trainer_sync, sft_train -> sft_trainer; note it is
 # sft_trainer, NOT fsdp_sft_trainer, which does not exist in this pin), the vLLM rollout modules
-# where a version mismatch would surface, and the fork-only rollout field the GRPO path emits as a
-# hydra override. Also assert the Qwen3.5 archs are registered, since that is the entire reason this
+# where a version mismatch would surface, and verify the installed upstream VCS source. Also assert the Qwen3.5 archs are registered, since that is the entire reason this
 # venv carries 0.19.1 instead of 0.11.2.
 #
 # fla and causal_conv1d are asserted here as INSTALLED AND IMPORTABLE, not via transformers'
@@ -432,23 +430,21 @@ RUN python /tmp/cudartfix/extract_cudart_fix.py /tmp/cudartfix/capabilities.py /
 RUN /opt/verl-venv/bin/python -c "import importlib.metadata as M; \
 import importlib; \
 from packaging import version; \
-[importlib.import_module(m) for m in ('verl.trainer.main_ppo','verl.trainer.main_ppo_sync','verl.trainer.sft_trainer')]; \
+[importlib.import_module(m) for m in ('verl.trainer.main_ppo','verl.trainer.ppo.v1.trainer_sync','verl.trainer.sft_trainer')]; \
 [importlib.import_module(m) for m in ('verl.workers.rollout.vllm_rollout.vllm_rollout','verl.workers.rollout.vllm_rollout.vllm_async_server')]; \
-from verl.workers.config.rollout import RolloutConfig; \
-assert 'mask_truncated_completions' in RolloutConfig.__dataclass_fields__, 'verl is not the freesolo fork (no mask_truncated_completions)'; \
 importlib.import_module('flash_attn.bert_padding'); \
 importlib.import_module('fla'); \
 assert version.parse(M.version('flash-linear-attention')) >= version.parse('0.2.2'), 'flash-linear-attention older than the 0.2.2 transformers requires: packed GDN boundary resets would be silently discarded'; \
 importlib.import_module('causal_conv1d'); \
-assert M.version('verl') == '0.8.0', 'opd structured gate requires verl exactly 0.8.0, got ' + M.version('verl'); \
+import json; source=json.loads(M.distribution('verl').read_text('direct_url.json')); assert source['url'].removesuffix('.git') == 'https://github.com/verl-project/verl' and source['vcs_info']['commit_id'] == '${VERL_SPEC##*@}', 'wrong upstream Verl source'; \
 assert M.version('xgrammar') == '0.1.25', 'opd structured gate requires xgrammar exactly 0.1.25, got ' + M.version('xgrammar'); \
 from vllm import ModelRegistry; \
 archs = set(ModelRegistry.get_supported_archs()); \
 missing = {'Qwen3_5ForConditionalGeneration','Qwen3_5MoeForConditionalGeneration'} - archs; \
 assert not missing, 'vllm cannot serve the default-model archs: ' + repr(sorted(missing)); \
 print('verl venv OK | verl', M.version('verl'), '| vllm', M.version('vllm'), '| torch', M.version('torch'), '| numpy', M.version('numpy'), '| xgrammar', M.version('xgrammar')); \
-print('  entrypoints: main_ppo (grpo), main_ppo_sync (opd), sft_trainer (sft)'); \
-print('  qwen3.5 archs registered; mask_truncated_completions present'); \
+print('  entrypoints: main_ppo (grpo), ppo.v1.trainer_sync (grpo/opd), sft_trainer (sft)'); \
+print('  qwen3.5 archs registered; exact upstream source verified'); \
 print('  gdn boundary resets: fla', M.version('flash-linear-attention'), 'and causal_conv1d installed and importable (capability itself is cuda-gated, asserted on the worker)')"
 
 # Modal injects the versioned bootstrap capsule and request-local secrets at launch.

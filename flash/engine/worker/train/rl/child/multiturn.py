@@ -1,4 +1,4 @@
-"""standalone child-side multi-turn GRPO rollout support for verl 0.8.0.
+"""standalone child-side multi-turn GRPO rollout support for pinned upstream Verl.
 
 stdlib only: the parent copies it into the child interpreter. GRPO must return one output per
 episode

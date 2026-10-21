@@ -334,7 +334,7 @@ def test_resolve_verl_python_prefers_preset(monkeypatch, tmp_path):
 
 @pytest.mark.parametrize("blank", ["", "   "])
 def test_resolve_verl_python_treats_an_empty_preset_as_unset(monkeypatch, tmp_path, blank):
-    # a missing or blank image preset takes the isolated pinned-fork provisioning path.
+    # a missing or blank image preset takes the isolated pinned upstream provisioning path.
     calls = []
     monkeypatch.setenv("FLASH_VERL_PYTHON", blank)
     monkeypatch.setattr(vc.subprocess, "run", _record_run(calls))
@@ -382,7 +382,7 @@ def test_resolve_verl_python_installs_pinned_gpu_dependencies(monkeypatch, tmp_p
     assert "cp312" in vc.FLASH_ATTN_SPEC
     install = calls[1]
     assert vc.VERL_REQUIREMENT == (
-        "verl @ git+https://github.com/freesolo-co/verl@7647bb7f423b649df74ac71a244a2a3de9e1466a"
+        "verl @ git+https://github.com/verl-project/verl@ddf700725c34bb8966685c8ecf5ca36a2cc54a35"
     )
     assert any(vc.VERL_REQUIREMENT_URL in arg for arg in install)
     # liger-kernel is deliberately NOT installed. a matched qwen3.5-9b a/b differing only in
@@ -511,7 +511,7 @@ def test_the_fallback_install_keeps_compatibility_overrides_and_exact_runtime_pi
     override_file = install[install.index("--override") + 1]
     written = pathlib.Path(override_file).read_text()
     # runtime pins stay aligned; numpy and xgrammar override incompatible metadata.
-    assert "vllm==0.19.1" in written  # matches the company fork's declared runtime
+    assert "vllm==0.19.1" in written  # matches the worker image
     assert "numpy==2.2.6" in written  # verl + transferqueue declare numpy<2.0.0
     assert "xgrammar==0.1.25" in written  # vllm declares xgrammar>=0.1.32
 
@@ -1382,7 +1382,7 @@ def test_resolve_verl_python_reuses_a_venv_built_from_the_current_pin(monkeypatc
 
 
 @pytest.mark.parametrize(
-    "stale", ["verl @ git+https://github.com/freesolo-co/verl@" + "0" * 40, None]
+    "stale", ["verl @ git+https://github.com/verl-project/verl@" + "0" * 40, None]
 )
 def test_resolve_verl_python_rebuilds_a_venv_that_is_not_the_current_pin(
     monkeypatch, tmp_path, stale
@@ -1434,28 +1434,23 @@ def test_resolve_verl_python_clears_a_venv_whose_creation_was_interrupted(monkey
     ]
 
 
-def test_verl_pin_is_an_immutable_commit_on_the_freesolo_fork():
+def test_verl_pin_is_an_immutable_commit_on_upstream():
     # a branch or tag would let the runtime move under a pinned flash release.
     _, _, ref = vc.VERL_REQUIREMENT.partition("git+")
     url, _, commit = ref.rpartition("@")
-    assert url == "https://github.com/freesolo-co/verl"
+    assert url == "https://github.com/verl-project/verl"
     assert len(commit) == 40
     assert all(c in "0123456789abcdef" for c in commit)
 
 
 def test_verl_pin_matches_the_version_opd_requires_exactly():
-    # the pin MUST stay on the verl 0.8.0 base. opd_plugin patches 0.8.0 internals and imports
-    # verl.trainer.main_ppo_sync, which verl deleted after 0.8.0, so a pin built on a newer base
-    # installs a verl that fails opd's exact-version gate and cannot import its own entrypoint.
     from flash.engine.worker.train.opd.child import policy as plugin
 
-    assert plugin._STRUCTURED_RUNTIME_EXACT_VERSIONS["verl"] == "0.8.0"
-    # bind the pin to its verified base: f71a02dd remains verl 0.8.0 with main_ppo_sync.py plus the
-    # truncation, position-id, fused-label, and qwen3.5 shift-label fixes, the opd dead-compute
-    # skip, and the whole-adapter lora bucket sync plus fused-linear grad preservation on top.
+    assert plugin._STRUCTURED_RUNTIME_EXACT_VERSIONS["verl"] == "0.10.0.dev0"
+    # bind the structured-output version gate to the verified upstream source.
     _, _, ref = vc.VERL_REQUIREMENT.partition("git+")
     _, _, commit = ref.rpartition("@")
-    assert commit == "7647bb7f423b649df74ac71a244a2a3de9e1466a"
+    assert commit == "ddf700725c34bb8966685c8ecf5ca36a2cc54a35"
 
 
 def test_resolve_verl_python_installs_wandb_best_effort_when_requested(monkeypatch, tmp_path):

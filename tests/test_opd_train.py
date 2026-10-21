@@ -1,4 +1,4 @@
-"""CPU contracts for the OPD migration to verl 0.8.0."""
+"""CPU contracts for the packaged OPD runtime."""
 
 from __future__ import annotations
 
@@ -852,7 +852,7 @@ def test_verl_0_8_rlhf_dataset_builds_one_structured_block_per_image(
     monkeypatch, tmp_path, image_first
 ):
     rl_dataset = _load_verl_rl_dataset(monkeypatch)
-    assert importlib.metadata.version("verl") == "0.8.0"
+    assert importlib.metadata.version("verl") == "0.10.0.dev0"
     image_row = {
         "prompt": [{"role": "user", "content": "before<image>after"}],
         "images": [{"image": "file:///tmp/only.png"}],
@@ -7662,7 +7662,7 @@ def test_unstructured_validator_does_not_resolve_model_metadata(monkeypatch):
 
 
 def test_structured_runtime_rejects_vllm_below_minimum(monkeypatch):
-    versions = {"verl": "0.8.0", "vllm": "0.9.0", "xgrammar": "0.1.25"}
+    versions = {"verl": "0.10.0.dev0", "vllm": "0.9.0", "xgrammar": "0.1.25"}
     monkeypatch.setattr(importlib.metadata, "version", versions.__getitem__)
 
     with pytest.raises(RuntimeError, match=r"vllm 0\.11\.0 or newer; found 0\.9\.0"):
@@ -7670,7 +7670,7 @@ def test_structured_runtime_rejects_vllm_below_minimum(monkeypatch):
 
 
 def test_structured_runtime_accepts_shipped_versions(monkeypatch):
-    versions = {"verl": "0.8.0", "vllm": "0.19.1", "xgrammar": "0.1.25"}
+    versions = {"verl": "0.10.0.dev0", "vllm": "0.19.1", "xgrammar": "0.1.25"}
     monkeypatch.setattr(importlib.metadata, "version", versions.__getitem__)
 
     _require_structured_runtime_versions()
@@ -7680,12 +7680,12 @@ def test_structured_runtime_rejects_wrong_verl_version(monkeypatch):
     versions = {"verl": "0.8.1", "vllm": "0.19.1", "xgrammar": "0.1.25"}
     monkeypatch.setattr(importlib.metadata, "version", versions.__getitem__)
 
-    with pytest.raises(RuntimeError, match=r"verl 0\.8\.0 exactly"):
+    with pytest.raises(RuntimeError, match=r"verl 0\.10\.0\.dev0 exactly"):
         _require_structured_runtime_versions()
 
 
 def test_structured_runtime_rejects_wrong_xgrammar_version(monkeypatch):
-    versions = {"verl": "0.8.0", "vllm": "0.19.1", "xgrammar": "0.1.26"}
+    versions = {"verl": "0.10.0.dev0", "vllm": "0.19.1", "xgrammar": "0.1.26"}
     monkeypatch.setattr(importlib.metadata, "version", versions.__getitem__)
 
     with pytest.raises(RuntimeError, match=r"xgrammar 0\.1\.25 exactly"):
@@ -7695,7 +7695,7 @@ def test_structured_runtime_rejects_wrong_xgrammar_version(monkeypatch):
 def test_explicit_launch_checks_structured_versions_before_loading_verl(monkeypatch, tmp_path):
     from flash.engine.worker.train.core.child import launch
 
-    versions = {"verl": "0.8.0", "vllm": "0.19.1", "xgrammar": "0.1.26"}
+    versions = {"verl": "0.10.0.dev0", "vllm": "0.19.1", "xgrammar": "0.1.26"}
     monkeypatch.setattr(importlib.metadata, "version", versions.__getitem__)
     monkeypatch.setattr(
         launch, "validate_environment", lambda: pytest.fail("version gate must run first")
@@ -7887,20 +7887,6 @@ def test_worker_structured_validator_runs_before_model_download():
     # must still precede.
     assert source.index("validate_opd_structured_outputs(") < source.index("_load_opd_model(")
     assert "resolve_vocab_size" not in source
-
-
-def test_explicit_opd_trainer_does_not_allocate_a_teacher_gpu_pool():
-    from pathlib import Path
-
-    from flash.engine.worker.train.opd.child import policy as plugin
-
-    source = Path(plugin.__file__).with_name("trainer.py").read_text()
-    assert "class FlashTaskRunner" in source
-    assert "resource_pool_spec = {" in source
-    assert '"global_pool"' in source
-    assert "teacher_pool" not in source
-    assert "Role.TeacherModel" not in source
-    assert "_run_with_no_signal_replacements" in source
 
 
 def test_opd_policy_import_has_no_trainer_installation_side_effects():

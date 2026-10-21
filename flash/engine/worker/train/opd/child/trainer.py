@@ -1,23 +1,17 @@
 """OPD trainer with explicit teacher cycles, checkpoint policy, and replay ownership."""
 
+import copy
 import os
 
-import numpy as np
-import ray
 import torch
-from omegaconf import OmegaConf
-from verl.single_controller.ray import ResourcePoolManager
-from verl.trainer.main_ppo_sync import KVBatchMeta, PPOTrainer, tq
-from verl.trainer.ppo.utils import Role, need_critic, need_reference_policy
+import transfer_queue as tq
+from transfer_queue import KVBatchMeta
+from verl.utils import tensordict_utils as tu
 from verl.utils.config import omega_conf_to_dataclass
 from verl.utils.metric import reduce_metrics
 from verl.utils.py_functional import rename_dict
-from verl.workers.engine_workers import TrainingWorker
 
-from flash.engine.worker.train.core.child.options import RuntimeOptions
-from flash.engine.worker.train.core.child.readiness import publish_ready
-from flash.engine.worker.train.core.child.tracking import TrackingOwner
-from flash.engine.worker.train.core.child.worker import FlashActorRolloutWorker
+from flash.engine.worker.train.core.child.trainer import FlashSyncTrainer
 from flash.engine.worker.train.opd.child.bridge import (
     _post_no_signal_abandoned,
     _post_no_signal_resample,
@@ -26,10 +20,8 @@ from flash.engine.worker.train.opd.child.bridge import (
 from flash.engine.worker.train.opd.child.policy import (
     _AllNoSignalBatch,
     _full_sequence_signal_sequences,
-    _init_transfer_queue,
     _run_with_no_signal_replacements,
 )
-from flash.engine.worker.train.opd.child.replay import BoundedReplayBuffer
 
 
 def filter_signal_batch(batch):
@@ -58,57 +50,59 @@ def filter_signal_batch(batch):
     )
 
 
-class FlashPPOTrainer(TrackingOwner, PPOTrainer):
-    def _create_replay_buffer(self):
-        return BoundedReplayBuffer(self)
+class FlashPPOTrainer(FlashSyncTrainer):
+    def _init_resource_pool_mgr(self):
+        original = self.config
+        self.config = copy.deepcopy(original)
+        self.config.distillation.enabled = False
+        try:
+            super()._init_resource_pool_mgr()
+        finally:
+            self.config = original
 
-    def _save_checkpoint(self):
-        options = RuntimeOptions.decode(dict(self.config.actor_rollout_ref.model.runtime_options))
-        if options.should_save(int(self.global_steps)):
-            return super()._save_checkpoint()
+    def _setup(self):
+        self.use_teacher_policy = False
+        super()._setup()
+        self.distillation_config = omega_conf_to_dataclass(self.config.distillation)
+
+    def get_teacher_client(self):
         return None
 
-    def init_workers(self):
-        self.use_teacher_policy = False
-        super().init_workers()
-        self.use_teacher_policy = True
-        self.distillation_config = omega_conf_to_dataclass(self.config.distillation)
-        publish_ready(
-            RuntimeOptions.decode(dict(self.config.actor_rollout_ref.model.runtime_options))
-        )
+    def _next_train_batch(self, num_prompts=None):
+        if self._replacement_prompts is None:
+            self._replacement_prompts = super()._next_train_batch(num_prompts)
+        batch = self._replacement_prompts.clone()
+        tu.assign_non_tensor_data(batch, "flash_no_signal_attempt", self._no_signal_attempt)
+        return batch
 
-    def step(self, batch_dict, metrics, timing_raw):
-        def run_attempt(attempt_ordinal: int):
-            batch_dict["flash_no_signal_attempt"] = np.full(
-                len(batch_dict["raw_prompt"]), attempt_ordinal, dtype=np.int64
+    def step(self, metrics, timing_raw):
+        self._replacement_prompts = None
+
+        def run_attempt(attempt_ordinal):
+            self._no_signal_attempt = attempt_ordinal
+            return super(FlashPPOTrainer, self).step(metrics, timing_raw)
+
+        def cleanup_attempt(batch):
+            tq.kv_clear(keys=batch.keys, partition_id=batch.partition_id)
+
+        def prepare_replacement():
+            self.checkpoint_manager.update_weights(self.global_steps - 1)
+
+        try:
+            return _run_with_no_signal_replacements(
+                run_attempt,
+                cleanup_attempt,
+                prepare_replacement,
+                lambda: _post_no_signal_resample(
+                    os.environ["FLASH_OPD_BRIDGE_URL"], os.environ["FLASH_OPD_BRIDGE_TOKEN"]
+                ),
+                lambda: _post_no_signal_abandoned(
+                    os.environ["FLASH_OPD_BRIDGE_URL"], os.environ["FLASH_OPD_BRIDGE_TOKEN"]
+                ),
+                max_attempts=self.runtime.no_signal_attempts,
             )
-            return super(FlashPPOTrainer, self).step(batch_dict, metrics, timing_raw)
-
-        def cleanup_attempt(batch) -> None:
-            prompt_keys = [str(uid) for uid in batch_dict["uid"]]
-            keys = list(dict.fromkeys([*batch.keys, *prompt_keys]))
-            tq.kv_clear(keys=keys, partition_id=batch.partition_id)
-            self.replay_buffer.remove(batch.partition_id, keys)
-
-        def prepare_replacement() -> None:
-            self.checkpoint_manager.update_weights()
-
-        return _run_with_no_signal_replacements(
-            run_attempt,
-            cleanup_attempt,
-            prepare_replacement,
-            lambda: _post_no_signal_resample(
-                os.environ["FLASH_OPD_BRIDGE_URL"],
-                os.environ["FLASH_OPD_BRIDGE_TOKEN"],
-            ),
-            lambda: _post_no_signal_abandoned(
-                os.environ["FLASH_OPD_BRIDGE_URL"],
-                os.environ["FLASH_OPD_BRIDGE_TOKEN"],
-            ),
-            max_attempts=int(
-                self.config.actor_rollout_ref.model.runtime_options.no_signal_attempts
-            ),
-        )
+        finally:
+            self._replacement_prompts = None
 
     def _compute_reward_colocate(self, batch, metrics):
         data = tq.kv_batch_get(
@@ -128,8 +122,12 @@ class FlashPPOTrainer(TrackingOwner, PPOTrainer):
         return dp_size
 
     def _balance_batch(self, batch, metrics, logging_prefix="global_seqlen", keep_minibatch=False):
+        selected = filter_signal_batch(batch)
+        rejected = sorted(set(batch.keys) - set(selected.keys))
+        if rejected:
+            tq.kv_clear(keys=rejected, partition_id=batch.partition_id)
         return super()._balance_batch(
-            filter_signal_batch(batch),
+            selected,
             metrics,
             logging_prefix=logging_prefix,
             keep_minibatch=keep_minibatch,
@@ -158,61 +156,3 @@ class FlashPPOTrainer(TrackingOwner, PPOTrainer):
         output["perf/mfu/actor"] = output.pop("actor/mfu")
         metrics.update(reduce_metrics(output))
         return batch
-
-
-@ray.remote
-class FlashTaskRunner:
-    def __init__(self):
-        self.role_worker_mapping = {}
-        self.mapping = {}
-
-    def add_actor_rollout_worker(self, config):
-        lora_rank = config.actor_rollout_ref.model.get("lora", {}).get("rank", 0)
-        if lora_rank <= 0:
-            lora_rank = config.actor_rollout_ref.model.get("lora_rank", 0)
-        ref_in_actor = (
-            lora_rank > 0 or config.actor_rollout_ref.model.get("lora_adapter_path") is not None
-        )
-        role = (
-            Role.ActorRolloutRef
-            if need_reference_policy(config) and not ref_in_actor
-            else Role.ActorRollout
-        )
-        self.role_worker_mapping[role] = ray.remote(FlashActorRolloutWorker)
-        self.mapping[role] = "global_pool"
-
-    def add_critic_worker(self, config):
-        if need_critic(config):
-            self.role_worker_mapping[Role.Critic] = ray.remote(TrainingWorker)
-            self.mapping[Role.Critic] = "global_pool"
-
-    def init_resource_pool_mgr(self, config):
-        resource_pool_spec = {
-            "global_pool": [config.trainer.n_gpus_per_node] * config.trainer.nnodes
-        }
-        config.reward.reward_model.nnodes = config.trainer.nnodes
-        config.reward.reward_model.n_gpus_per_node = config.trainer.n_gpus_per_node
-        self.mapping[Role.RewardModel] = "global_pool"
-        self.resource_pool_manager = ResourcePoolManager(
-            resource_pool_spec=resource_pool_spec, mapping=self.mapping
-        )
-
-    def run(self, config):
-        OmegaConf.resolve(config)
-        _init_transfer_queue(tq.init, config.transfer_queue)
-        trainer = None
-        try:
-            self.add_actor_rollout_worker(config)
-            self.add_critic_worker(config)
-            self.init_resource_pool_mgr(config)
-            trainer = FlashPPOTrainer(
-                config=config,
-                role_worker_mapping=self.role_worker_mapping,
-                resource_pool_manager=self.resource_pool_manager,
-            )
-            trainer.init_workers()
-            trainer.fit()
-        finally:
-            if trainer:
-                trainer.replay_buffer.close()
-            tq.close()

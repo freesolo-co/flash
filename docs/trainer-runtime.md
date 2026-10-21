@@ -1,23 +1,41 @@
 # Packaged trainer runtime
 
-SFT, GRPO, and OPD start through ordinary Python modules in the verified Flash package:
+SFT, GRPO, and OPD launch ordinary Python modules from the verified Flash package:
 
-- `flash.engine.worker.train.sft.child.entry` (launched by `torchrun`)
-- `flash.engine.worker.train.rl.child.entry` (owns the Ray driver and metric journal reader)
-- `flash.engine.worker.train.opd.child.entry` (owns the Ray driver and transfer-queue trainer)
+- `flash.engine.worker.train.sft.child.entry` (torchrun)
+- `flash.engine.worker.train.rl.child.entry` (Ray and synchronous V1 PPO)
+- `flash.engine.worker.train.opd.child.entry` (Ray, synchronous V1 PPO, remote teacher bridge)
 
-Each receives `--flash-config <launch.json>` followed by Hydra overrides. The JSON file contains nonsecret runtime options, including checkpoint schedules and model policy. Credentials remain in the existing filtered environment/bridge configuration. Scratch directories contain data and readiness records; they contain no generated Python. Children use the verified package root on `PYTHONPATH` and do not inherit external-module plugin selection.
+Each receives `--flash-config <launch.json>` and Hydra overrides. The JSON contains runtime options, checkpoint schedules, and model policy. Credentials remain in the filtered environment and bridge configuration. Scratch directories contain data and readiness records, with no generated Python or `sitecustomize` startup hook.
 
-`core.child.launch` validates the environment and fork interface version before constructing a trainer. `FlashFSDPEngine` owns model initialization, exact LoRA targets, checkpointing, the SFT scheduler, the frozen KL reference, and the OPD optimizer pre-step acknowledgment. Each trainer owns tracking and checkpoint policy; GRPO owns per-turn credit and rollout identities; OPD owns teacher cycles and bounded replay. A readiness record is published only after trainer/worker initialization succeeds. The parent rejects progress or successful exit without that record.
+## Exact upstream dependency
 
-Model-specific behavior uses PyTorch forward hooks on constructed model instances. Optimizer notification uses `register_step_pre_hook`. Backend selection uses the pinned FLA dispatcher's hardware/shape checks, including FlashQLA selection, rather than replacing a kernel function. The fork's native vLLM server rejects generation if a required LoRA adapter is absent.
+Both worker installation paths pin unmodified [`verl-project/verl` at `ddf700725c34bb8966685c8ecf5ca36a2cc54a35`](https://github.com/verl-project/verl/commit/ddf700725c34bb8966685c8ecf5ca36a2cc54a35). Its distribution version is `0.10.0.dev0`; the immutable commit, rather than that development version string, identifies the source. This revision supports Flash's Transformers 5.12.1 dependency. Flash also pins vLLM 0.19.1 and TransferQueue 0.1.7 in its worker environments.
 
-The small opt-in construction contract lives in [the company Verl fork](https://github.com/freesolo-co/verl/pull/6), with `verl.runtime_interfaces.API_VERSION == 2`. Flash pins the reachable fork commit in both worker installation paths. Flash selects the fork's explicit Qwen dense/MoE model factory, bypassing its legacy model/attention patch dispatcher. This removes Flash's import interception, copied-source plugins, dependency-method replacements, and `sitecustomize` startup path.
+Before constructing a trainer, `core.child.upstream` checks installed VCS metadata for the official repository and exact commit. An installation from a fork, another revision, or a wheel without VCS provenance fails with a rebuild instruction. `scripts/check_verl_pin_exists.py` checks the installation pins and fetches the commit from upstream.
 
-CPU tests cover launch data, package imports, exact LoRA targeting and isolation, SFT data order/partial batches/boundary resume, checkpoint publication backpressure, GDN packed-boundary hooks, tracking ownership, GRPO identity and credit calculations, and OPD failure/replay/mutation ordering. Fork tests also exercise real tiny Transformers 5.12.1 dense/MoE models, compare text and multimodal outputs and gradients against the previous implementation, and round-trip native checkpoints. Rollout tests cover instance-local vocabulary hooks, tensor-adapter ownership, complete bucket assembly, and native cache replacement/validation ordering.
+No change or PR to Verl is required. Flash no longer depends on the company fork's runtime interface, model factory, trainer callbacks, or worker subclasses. Upstream's own compatibility implementations remain upstream-owned and unmodified; this does not claim that upstream itself contains no patches.
 
-The model factory preserves fused torch/triton loss selection, native attention, the vision offload behavior, and exact module names. It explicitly rejects sequence parallelism and unsupported model/kernel choices. The fork declares its supported Transformers 5.12 line and vLLM 0.19.1 rather than carrying older API fallbacks.
+## Flash-owned extensions
 
-The fork's `TensorLoRAWorkerManager` owns tensor decoding and shares the native per-worker adapter cache; it does not replace vLLM class methods. Vocabulary filtering is a PyTorch output hook before logprob normalization. Remaining compatibility code is explicit: legacy recipes for other architectures, optional backend/quantization paths, the conditional FSDP/ABC context, and the MoE Parameter weight-loader repair. The last repair is still needed when vLLM post-load transforms discard loader attributes; it has not been removed solely because its comment names an old version.
+`FlashModelConfig`, `FlashActorConfig`, and `FlashEngineConfig` are selected through Hydra. The engine registers distinct `flash_fsdp` / `flash_fsdp2` names and delegates model construction to upstream. Flash retains exact language LoRA targeting, frozen KL references, its SFT scheduler, instance-local GDN/vision hooks, and optimizer pre-step acknowledgments. These use subclasses, PyTorch hooks, and owned configuration rather than replacing dependency methods.
 
-Before marking the PR ready, qualify all three algorithms on the pinned worker image: a fresh run and checkpoint resume, authored checkpoint publication, warm-start LoRA and KL reference, GRPO single-/multi-turn identities and final metrics, OPD scoring failure/no-signal replacement/first-mutation acknowledgment, and multi-rank initialization. Include text and supported multimodal/GDN workloads. CPU tests and module import smoke checks do not establish CUDA kernel, FSDP, Ray, or vLLM compatibility.
+The SFT trainer owns its dataset order, partial batches, boundary resume, checkpoint publication backpressure, and a small training loop that calls upstream's training client. The loop explicitly closes tracking with the actual success or failure outcome.
+
+GRPO and OPD share the upstream V1 synchronous trainer lifecycle and TransferQueue replay implementation. Flash bounds replay waiting and rejects failed prompt groups before consuming them. The common task runner initializes TransferQueue, trainers, and agent managers, publishes readiness, then runs training and closes tracking and queue resources.
+
+GRPO agents register rollout identities before scoring, apply per-turn credit, and carry model-version observations across turns. Truncation masking is a Flash runtime option, not an extra upstream dataclass field. Trainability is checked before advantages and again before actor updates because rollout correction can reject additional tokens.
+
+OPD agents score through the existing remote teacher bridge. The trainer does not allocate a local teacher GPU pool. Teacher facts travel through upstream's native agent output serialization; no-signal batches retain bounded replacement and teacher-cycle acknowledgment before mutation. Native upstream policy forwards remain enabled; the former fork's dead-compute optimization is not carried over.
+
+`flash_vllm` is a separate rollout registration using upstream's registry and replica/server extension points. Its server preserves the exact engine finish reason and refuses generation when the training LoRA adapter is missing. Adapter transfer, model construction, and vLLM compatibility remain upstream-owned.
+
+The four agent classes are declared in packaged `core/child/agents.yaml`. Upstream's unmodified TransferQueue worker instantiates them. A readiness record is published only after trainer and rollout initialization; the parent rejects progress or successful exit without it.
+
+## Validation
+
+The offline suite covers launch policy, source verification, tracking outcome, SFT data order/resume/checkpointing, exact LoRA targeting, GDN boundaries, GRPO identities and credit, and OPD failure/replay/mutation ordering. `tests/test_upstream_verl_contract.py` additionally runs against the actual pinned package: all three production configurations, trainer and agent imports, OPD pool ownership, native replay, and ragged GRPO credit serialization. It skips when Verl is not installed.
+
+Run that contract suite in an environment with the exact VCS requirement from `backend_common.py`, Transformers 5.12.1, and the worker dependencies installed. The default development environment intentionally does not install the GPU trainer stack.
+
+Before marking the PR ready, qualify the pinned GPU worker image on all three algorithms: fresh training and checkpoint resume, authored checkpoint publication, warm-start LoRA and KL reference, GRPO single-/multi-turn identities and metrics, OPD scoring failures/no-signal replacement/first-mutation acknowledgment, and multi-rank startup. Include text and supported multimodal/GDN workloads. CPU tests do not establish CUDA kernel, FSDP, distributed Ray, vLLM adapter transfer, or end-to-end training compatibility.

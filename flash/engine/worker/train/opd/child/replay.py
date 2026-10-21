@@ -1,8 +1,8 @@
-"""bounded replay ownership without replacing a live buffer's methods."""
+"""Bound upstream replay polling by progress and decisive rollout actor failures."""
 
 import time
 
-from verl.trainer.main_ppo_sync import KVBatchMeta, ReplayBuffer
+from verl.trainer.ppo.v1.replay_buffer import ReplayBuffer
 
 from flash.engine.worker.train.opd.child.replay_guard import (
     _ACTOR_PROBE_SECONDS,
@@ -13,60 +13,48 @@ from flash.engine.worker.train.opd.child.replay_guard import (
     _raise_actor_death,
     _raise_prompt_failure,
     _raise_stall,
-    _status_is_terminal,
-    _target_statuses,
 )
 
 
 class BoundedReplayBuffer(ReplayBuffer):
-    def __init__(self, trainer):
+    def __init__(self, trainer, **kwargs):
         self.trainer = trainer
-        super().__init__()
+        super().__init__(poll_interval=_REPLAY_POLL_SECONDS, **kwargs)
 
-    def sample(self, partition_id, global_steps=None, batch_size=None):
-        if (global_steps is None) == (batch_size is None):
-            raise ValueError("exactly one of global_steps or batch_size is required")
-        if global_steps is None:
-            return super().sample(partition_id, global_steps, batch_size)
-        fingerprint = None
-        unchanged_since = time.monotonic()
-        next_probe = 0.0
-        while not self._stop_event.is_set():
-            statuses = _target_statuses(self, partition_id, global_steps)
-            failure = _failure_key(statuses)
-            if failure is not None:
-                _raise_prompt_failure(failure, global_steps)
-            now = time.monotonic()
-            if statuses != fingerprint:
-                fingerprint, unchanged_since = statuses, now
-            if now >= next_probe:
-                if _actor_probe_state(self.trainer) == "dead":
-                    _raise_actor_death(global_steps)
-                next_probe = now + _ACTOR_PROBE_SECONDS
-            if _status_is_terminal(statuses):
-                with self.lock:
-                    current = self.partitions.get(partition_id, {})
-                    latest = tuple(
-                        sorted(
-                            (str(key), str(tag.get("status", "")))
-                            for key, tag in current.items()
-                            if tag.get("global_steps") == global_steps
-                        )
-                    )
-                    if latest != statuses:
-                        continue
-                    selected = [
-                        (key, dict(tag))
-                        for key, tag in current.items()
-                        if tag.get("global_steps") == global_steps
-                        and tag.get("status") == "success"
-                    ]
-                return KVBatchMeta(
-                    partition_id=partition_id,
-                    keys=[key for key, _ in selected],
-                    tags=[tag for _, tag in selected],
-                )
-            if now - unchanged_since >= _REPLAY_STALL_SECONDS:
-                _raise_stall(global_steps, statuses)
-            time.sleep(_REPLAY_POLL_SECONDS)
-        raise RuntimeError("OPD replay buffer closed while waiting for rollout")
+    def sample(self, global_steps, partition_id, batch_size):
+        self._sampling_step = global_steps
+        self._sampling_partition = partition_id
+        self._fingerprint = None
+        self._unchanged_since = time.monotonic()
+        self._next_probe = 0.0
+        return super().sample(global_steps, partition_id, batch_size)
+
+    def _sync_metadata_from_transfer_queue(self):
+        super()._sync_metadata_from_transfer_queue()
+        statuses = tuple(
+            sorted(
+                (str(key), str(tag.get("status", "")))
+                for key, tag in self.partitions.get(self._sampling_partition, {}).items()
+            )
+        )
+        # upstream stores prompt statuses separately from trajectory rows.
+        failures = self.failure_keys[self._sampling_partition]
+        if failures:
+            _raise_prompt_failure(sorted(failures)[0], self._sampling_step)
+        failure = _failure_key(statuses)
+        if failure is not None:
+            _raise_prompt_failure(failure, self._sampling_step)
+        now = time.monotonic()
+        fingerprint = (
+            statuses,
+            tuple(sorted(self.pending_keys[self._sampling_partition])),
+            tuple(sorted(self.running_keys[self._sampling_partition])),
+        )
+        if fingerprint != self._fingerprint:
+            self._fingerprint, self._unchanged_since = fingerprint, now
+        if now >= self._next_probe:
+            if _actor_probe_state(self.trainer) == "dead":
+                _raise_actor_death(self._sampling_step)
+            self._next_probe = now + _ACTOR_PROBE_SECONDS
+        if now - self._unchanged_since >= _REPLAY_STALL_SECONDS:
+            _raise_stall(self._sampling_step, statuses)

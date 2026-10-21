@@ -21,24 +21,45 @@ def load_launch(algorithm, argv=None):
 def configure(options, overrides):
     from hydra import compose, initialize_config_module
     from omegaconf import open_dict
-    from verl.runtime_interfaces import API_VERSION
     from verl.utils.device import auto_set_device
 
-    if API_VERSION != 2:
-        raise RuntimeError("unsupported Verl trainer interface version")
+    from flash.engine.worker.train.core.child.upstream import validate_upstream
+
+    validate_upstream()
     name = "sft_trainer_engine" if options.algorithm == "sft" else "ppo_trainer"
     with initialize_config_module(config_module="verl.trainer.config", version_base=None):
         config = compose(config_name=name, overrides=overrides)
     with open_dict(config):
         model = config.model if options.algorithm == "sft" else config.actor_rollout_ref.model
-        model.custom_engine_class = "flash.engine.worker.train.core.child.engine.FlashFSDPEngine"
+        model._target_ = "flash.engine.worker.train.core.child.configuration.FlashModelConfig"
         model.runtime_options = options.encode()
-        if options.algorithm != "sft":
+        if options.algorithm == "sft":
+            engines = [config.engine]
+        else:
+            engines = [
+                config.actor_rollout_ref.actor.fsdp_config,
+                config.actor_rollout_ref.ref.fsdp_config,
+            ]
+            for actor in (config.actor_rollout_ref.actor, config.actor_rollout_ref.ref):
+                actor._target_ = (
+                    "flash.engine.worker.train.core.child.configuration.FlashActorConfig"
+                )
+            config.actor_rollout_ref.rollout.name = "flash_vllm"
+            config.trainer.use_v1 = True
+            config.trainer.v1.trainer_mode = "sync"
+            config.transfer_queue.enable = True
             module = "rl" if options.algorithm == "grpo" else "opd"
             name = "FlashGrpoManager" if module == "rl" else "FlashOpdManager"
-            config.actor_rollout_ref.rollout.agent.agent_loop_manager_class = (
+            agent = config.actor_rollout_ref.rollout.agent
+            agent.agent_loop_manager_class = (
                 f"flash.engine.worker.train.{module}.child.rollout.{name}"
             )
+            agent.agent_loop_config_path = str(Path(__file__).with_name("agents.yaml"))
+            if options.algorithm == "grpo" and agent.default_agent_loop == "single_turn_agent":
+                agent.default_agent_loop = "flash_grpo_single_turn"
+        for engine in engines:
+            engine._target_ = "flash.engine.worker.train.core.child.configuration.FlashEngineConfig"
+            engine.strategy = "flash_" + str(engine.strategy)
     auto_set_device(config)
     return config
 
@@ -86,18 +107,9 @@ def run_rl(config, algorithm):
     from verl.trainer.ppo.utils import need_critic, need_reference_policy
     from verl.utils.config import validate_config
 
-    if algorithm == "grpo":
-        from verl.trainer.main_ppo import migrate_legacy_reward_impl
+    from flash.engine.worker.train.core.child.trainer import FlashTaskRunner
 
-        from flash.engine.worker.train.rl.child.trainer import FlashGrpoTaskRunner
-
-        config = migrate_legacy_reward_impl(config)
-        runner = ray.remote(num_cpus=1)(FlashGrpoTaskRunner)
-    else:
-        from flash.engine.worker.train.opd.child.trainer import FlashTaskRunner
-
-        config.transfer_queue.enable = True
-        runner = FlashTaskRunner
+    runner = ray.remote(num_cpus=1)(FlashTaskRunner)
     validate_config(
         config=config,
         use_reference_policy=need_reference_policy(config),

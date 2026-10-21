@@ -1,6 +1,6 @@
 """Hydra overrides, child environment, and parquet writing for the OPD trainer.
 
-`build_opd_overrides` renders the exact verl 0.8.0 synchronous-PPO and distillation config surface
+`build_opd_overrides` renders the exact pinned upstream Verl synchronous-PPO and distillation config surface
 the child is launched with; the rest prepare what that child needs on disk and in its environment
 (the resolved env vars and rollout parquet).
 
@@ -190,7 +190,7 @@ def _actor_rollout_overrides(config: dict, *, max_tokens: int) -> list[str]:
         *rollout_layered_summon_overrides(config.get("target_parameters")),
         *rollout_mm_processor_cache_overrides(),
         # keep the rollout engine RESIDENT for models whose vLLM wake/reload HANGS (catalog
-        # sleep_unsupported), exactly as the grpo path does. opd is NOT exempt: main_ppo_sync calls
+        # sleep_unsupported), exactly as the grpo path does. opd is NOT exempt: the synchronous trainer calls
         # checkpoint_manager.sleep_replicas() during init_workers and again around validation, which
         # lands in the same vllm_async_server sleep(). the flagged model declares algos including
         # opd and the parse-time gate admits it, so without this an opd run on it wedges.
@@ -311,7 +311,7 @@ def _trainer_overrides(config: dict) -> list[str]:
 
 
 def build_opd_overrides(config: dict) -> list[str]:
-    """Render the exact verl 0.8.0 synchronous PPO and distillation config surface."""
+    """Render the exact pinned upstream Verl synchronous PPO and distillation config surface."""
     missing = [key for key in _REQUIRED_OVERRIDE_KEYS if key not in config]
     if missing:
         raise KeyError(f"build_opd_overrides missing required config keys: {missing}")

@@ -5,7 +5,6 @@ import json
 import os
 
 import torch
-from verl.utils.config import omega_conf_to_dataclass
 
 from flash.engine.worker.train.opd.child.bridge import (
     FlashTeacherBridgeError,
@@ -14,17 +13,18 @@ from flash.engine.worker.train.opd.child.bridge import (
 )
 from flash.engine.worker.train.opd.child.policy import (
     _PERMANENT_TEACHER_EXIT,
-    StructuredOutputReplay,
     _bridge_score_payload,
+)
+from flash.engine.worker.train.opd.child.structured import (
+    StructuredOutputReplay,
     canonical_structured_spec,
 )
 
 
 class FlashBridgeTeacherManager:
     def __init__(self, config, teacher_client=None):
-        resolved = omega_conf_to_dataclass(config.distillation)
-        self.bridge_url = resolved.bridge_url
-        self.bridge_token = resolved.bridge_token
+        self.bridge_url = config.distillation.bridge_url
+        self.bridge_token = config.distillation.bridge_token
 
     async def compute_teacher_logprobs_single(
         self,

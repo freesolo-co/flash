@@ -1,15 +1,15 @@
 """explicit OPD rollout worker and transfer-queue manager types."""
 
+import copy
 import json
 import os
 from typing import Any
 
-import ray
+import transfer_queue as tq
 from verl.experimental.agent_loop.agent_loop import AgentLoopBase, AgentLoopOutput, register
 from verl.experimental.agent_loop.single_turn_agent_loop import SingleTurnAgentLoop
-from verl.trainer.main_ppo_sync import AgentLoopManagerTQ, AgentLoopWorkerTQBase, tq
+from verl.trainer.ppo.v1.agent_loop_tq import AgentLoopManagerTQ
 
-from flash.engine.worker.train.core.child.startup import initialize_process
 from flash.engine.worker.train.opd.child.bridge import (
     _defer_score_failure,
     _fatal_rollout_exit_code,
@@ -66,6 +66,13 @@ class FlashSingleTurnAgentLoop(SingleTurnAgentLoop):
             params["structured_outputs"] = StructuredOutputsParams(**json.loads(structured_spec))
         output = await super().run(params, **kwargs)
         output.reward_score = 0.0
+        output.extra_fields.setdefault("reward_extra_info", {})
+        self.distillation_enabled = True
+        self.teacher_key = self.config.distillation.teacher_key
+        self.teacher_server_manager = FlashBridgeTeacherManager(self.config)
+        await compute_flash_teacher_logprobs(
+            self, output, output.prompt_ids, output.response_ids, False, sample_kwargs=kwargs
+        )
         return output
 
 
@@ -75,7 +82,7 @@ def mark_prompt_failure(uid, partition_id, global_steps, status):
     )
 
 
-FlashMultiTurnAgentLoop = build_flash_multi_turn_agent_loop(
+_MultiTurn = build_flash_multi_turn_agent_loop(
     register=register,
     agent_loop_base=AgentLoopBase,
     agent_loop_output=AgentLoopOutput,
@@ -89,17 +96,18 @@ FlashMultiTurnAgentLoop = build_flash_multi_turn_agent_loop(
 )
 
 
-class FlashOpdWorker(AgentLoopWorkerTQBase):
-    def __init__(self, *args, **kwargs):
-        initialize_process()
-        super().__init__(*args, **kwargs)
-
-    def _create_teacher_manager(self, **kwargs):
-        return FlashBridgeTeacherManager(**kwargs)
-
-    async def _compute_teacher_logprobs(self, *args, **kwargs):
-        return await compute_flash_teacher_logprobs(self, *args, **kwargs)
+@register("flash_multi_turn")
+class FlashMultiTurnAgentLoop(_MultiTurn):
+    async def run(self, sampling_params, **kwargs):
+        outputs = await super().run(sampling_params, **kwargs)
+        for output in outputs:
+            output.extra_fields.setdefault("reward_extra_info", {})
+        return outputs
 
 
 class FlashOpdManager(AgentLoopManagerTQ):
-    worker_class = ray.remote(FlashOpdWorker)
+    def __init__(self, config, *args, **kwargs):
+        # the packaged agent scores through the remote bridge; no native teacher pool is needed.
+        config = copy.deepcopy(config)
+        config.distillation.enabled = False
+        super().__init__(config, *args, **kwargs)

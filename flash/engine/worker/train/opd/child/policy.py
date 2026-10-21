@@ -54,7 +54,7 @@ _FAILURE_FALLBACK_MAX_CHARS = 8192
 
 
 _STRUCTURED_RUNTIME_EXACT_VERSIONS = {
-    "verl": "0.8.0",
+    "verl": "0.10.0.dev0",
     "xgrammar": "0.1.25",
 }
 
@@ -183,7 +183,7 @@ def _flash_groupwise_reverse_kl_values(
 
 
 def _set_current_global_batch_info(config, data) -> None:
-    """Mirror verl 0.8.0 ppo_loss metadata population for the current microbatch."""
+    """Populate upstream ppo_loss metadata population for the current microbatch."""
     config.global_batch_info["dp_size"] = data["dp_size"]
     config.global_batch_info["batch_num_tokens"] = data["batch_num_tokens"]
     config.global_batch_info["global_batch_size"] = data["global_batch_size"]
@@ -355,8 +355,7 @@ def _init_transfer_queue(
 ) -> None:
     """run verl's transfer-queue init under a deadline, reporting the resource state on timeout.
 
-    verl force-enables TransferQueue on the opd entry point (main_ppo_sync.main sets
-    transfer_queue.enable = True with no opt-out), so this runs before a single gpu is touched. tq.init
+    Flash enables TransferQueue for both synchronous RL entrypoints, before GPUs are initialized. tq.init
     has three separate unbounded waits, none of which can be observed from outside:
 
       - get_placement_group blocks in ray.get(pg.ready()) until every 1-cpu storage bundle is placed,

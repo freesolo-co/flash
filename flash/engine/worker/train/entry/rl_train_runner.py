@@ -368,6 +368,7 @@ def _write_rl_launch_config(inp, files, *, gdn_reset_arch: str | None, loggers) 
         "reentrant_checkpointing": bool(inp["reentrant_checkpointing"]),
         "multimodal": bool(inp["multimodal"]),
         "per_turn_credit": bool(inp["per_turn_credit"]),
+        "mask_truncated_completions": bool(inp["mask_truncated_completions"]),
         "stop_sequences": list(inp["stop_sequences"]),
         "image_pad_token_id": inp["image_pad_token_id"],
         "structured_outputs": inp["structured_outputs"],

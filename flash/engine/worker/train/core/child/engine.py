@@ -3,6 +3,7 @@
 import copy
 from dataclasses import is_dataclass, replace
 
+from verl.workers.engine import EngineRegistry
 from verl.workers.engine.fsdp.transformer_impl import FSDPEngineWithLMHead
 
 from flash.engine.worker.train.core.child.model import (
@@ -14,20 +15,15 @@ from flash.engine.worker.train.core.child.options import RuntimeOptions
 from flash.engine.worker.train.core.child.startup import initialize_process
 
 
+@EngineRegistry.register(model_type="language_model", backend=["flash_fsdp", "flash_fsdp2"])
 class FlashFSDPEngine(FSDPEngineWithLMHead):
     def __init__(self, *args, **kwargs):
         initialize_process()
         if kwargs["model_config"].runtime_options.get("algorithm") == "opd":
             from flash.engine.worker.train.opd.child import loss  # noqa: F401
+        kwargs["engine_config"] = kwargs["engine_config"].native_config()
         super().__init__(*args, **kwargs)
         self.runtime = RuntimeOptions.decode(self.model_config.runtime_options)
-
-    def _load_model(self, torch_dtype):
-        from verl.models.transformers.training_model import load_training_model
-
-        return load_training_model(
-            self.model_config, torch_dtype, self.ulysses_sequence_parallel_size
-        )
 
     def _build_module(self):
         module = super()._build_module()

@@ -15,24 +15,8 @@ _REPLAY_POLL_SECONDS = 0.1
 _ACTOR_PROBE_SECONDS = 5.0
 
 
-def _target_statuses(buffer, partition_id: str, global_steps: int) -> tuple[tuple[str, str], ...]:
-    with buffer.lock:
-        partition = buffer.partitions.get(partition_id, {})
-        return tuple(
-            sorted(
-                (str(key), str(tag.get("status", "")))
-                for key, tag in partition.items()
-                if tag.get("global_steps") == global_steps
-            )
-        )
-
-
 def _failure_key(statuses: tuple[tuple[str, str], ...]) -> str | None:
     return next((key for key, status in statuses if status == "failure"), None)
-
-
-def _status_is_terminal(statuses: tuple[tuple[str, str], ...]) -> bool:
-    return bool(statuses) and all(status != "running" for _key, status in statuses)
 
 
 def _actor_probe_state(trainer) -> str:
@@ -42,7 +26,7 @@ def _actor_probe_state(trainer) -> str:
         from ray.exceptions import RayActorError
     except Exception:
         return "unknown"
-    workers = getattr(getattr(trainer, "async_rollout_manager", None), "agent_loop_workers", ())
+    workers = getattr(getattr(trainer, "agent_loop_manager", None), "agent_loop_workers", ())
     saw_live = False
     for worker in workers:
         try:

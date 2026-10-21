@@ -25,14 +25,10 @@ from concurrent.futures import thread as _thread_module
 from http.server import ThreadingHTTPServer
 from typing import Self
 
-# verl 0.8.0 exactly, plus the truncation-mask, 3d position-id, and ulysses fused-label fixes, the
-# whole-adapter lora bucket sync, and the fused-linear grad-flag preservation.
-# it must stay on the 0.8.0 base: the OPD trainer extends the 0.8.0 interfaces and imports
-# verl.trainer.main_ppo_sync, which verl deleted after 0.8.0, and opd's exact-version gate reads the
-# version file this branch pins to the release value.
+# unmodified upstream commit; kept identical to Dockerfile.worker.
 VERL_REQUIREMENT_NAME = "verl"
 VERL_REQUIREMENT_URL = (
-    "git+https://github.com/freesolo-co/verl@7647bb7f423b649df74ac71a244a2a3de9e1466a"
+    "git+https://github.com/verl-project/verl@ddf700725c34bb8966685c8ecf5ca36a2cc54a35"
 )
 # the pin, as the venv stamp records it. the provisioning install asks for the [vllm] extra of this
 # same commit; the stamp stays extra-free so it identifies the verl a venv holds, not how it was
