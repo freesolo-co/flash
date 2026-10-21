@@ -42,10 +42,10 @@ class FlashTokenizedSFTDataset:
 
     @staticmethod
     def _multimodal_inputs(payload):
-        if payload is None:
-            return {}
         if hasattr(payload, "as_py"):
             payload = payload.as_py()
+        if payload is None or payload is pd.NA:
+            return {}
         payload = bytes(payload)
         if not payload:
             return {}

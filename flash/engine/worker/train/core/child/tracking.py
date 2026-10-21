@@ -8,6 +8,7 @@ from verl.utils.tracking import Tracking
 
 class OwnedTracking(Tracking):
     def __init__(self, *args, **kwargs):
+        self.run = None
         super().__init__(*args, **kwargs)
         self.run = getattr(self.logger.get("wandb"), "run", None)
         if self.run is not None:
@@ -18,9 +19,9 @@ class OwnedTracking(Tracking):
                     flush=True,
                 )
 
-    def finish(self, exit_code):
+    def finish(self, exit_code=0):
         # the upstream destructor must not finish a later process-global wandb run.
-        self.logger.pop("wandb", None)
+        getattr(self, "logger", {}).pop("wandb", None)
         if self.run is not None:
             with contextlib.suppress(Exception):
                 self.run.finish(exit_code=exit_code)

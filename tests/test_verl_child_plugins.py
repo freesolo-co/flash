@@ -267,6 +267,7 @@ def test_tracking_closes_the_owned_run_with_the_actual_outcome(monkeypatch, caps
     tracking = recipe.OwnedTracking(project_name="flash")
     tracking.finish(exit_code=int(fail))
     tracking.finish(exit_code=int(fail))
+    tracking.finish()  # upstream's destructor calls the no-argument form
     assert finishes == [{"exit_code": int(fail)}]
     assert json.loads(capsys.readouterr().out.removeprefix("FLASH_WANDB_LINK ")) == {
         "wandb_url": run.url,
