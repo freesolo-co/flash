@@ -120,11 +120,11 @@ def test_old_handles_default_off_and_new_handles_round_trip():
 
 
 def test_volume_identity_includes_owner_and_attempt():
-    assert checkpoint_upload.volume_name("owner", "run-a0") != checkpoint_upload.volume_name(
-        "owner", "run-a1"
+    assert checkpoint_upload.volume_name("owner", "run", 0) != checkpoint_upload.volume_name(
+        "owner", "run", 1
     )
-    assert checkpoint_upload.volume_name("owner", "run-a0") != checkpoint_upload.volume_name(
-        "other", "run-a0"
+    assert checkpoint_upload.volume_name("owner", "run", 0) != checkpoint_upload.volume_name(
+        "other", "run", 0
     )
 
 
