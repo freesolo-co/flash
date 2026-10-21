@@ -65,7 +65,7 @@ def test_always_thinking_model_requires_flag(monkeypatch):
         thinking="always",
     )
     monkeypatch.setattr("flash.schema.resolve_model", lambda *a, **k: info)
-    monkeypatch.setattr("flash.schema.provisional_gpu", lambda *a, **k: "RTX 5090")
+    monkeypatch.setattr("flash.schema.provisional_gpu", lambda *a, **k: "L40S")
     # An always-thinker can't run with thinking OFF (the default); the rejection triggers on the
     # default-off as well as an explicit thinking=false.
     with pytest.raises(ConfigError) as ei:
@@ -103,13 +103,13 @@ def test_thinking_roundtrips_through_dict():
     spec2 = JobSpec.from_dict(spec.to_dict())
     assert spec2.thinking is True
     # a dict without the field gets the default (OFF)
-    assert JobSpec.from_dict({"model": "Qwen/Qwen3.5-0.8B"}).thinking is False
+    assert JobSpec.from_dict({"model": "Qwen/Qwen3.5-9B"}).thinking is False
 
 
 def test_thinking_set_override(tmp_path):
     cfg = tmp_path / "cfg.toml"
     cfg.write_text(
-        'model = "Qwen/Qwen3.5-0.8B"\nalgorithm = "sft"\n\n'
+        'model = "Qwen/Qwen3.5-9B"\nalgorithm = "sft"\n\n'
         '[environment]\nid = "github:owner/repo@main:env/environment.py"\n\n'
         "[train]\nepochs = 1\nmax_examples = 8\n"
     )

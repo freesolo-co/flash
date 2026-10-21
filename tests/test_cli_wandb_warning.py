@@ -8,7 +8,7 @@ logging off, which is only discoverable after the GPU spend, when the curve is g
 
 from __future__ import annotations
 
-from flash.cli.commands import _warn_if_wandb_requested_without_key
+from flash.cli.commands.ops.train import _warn_if_wandb_requested_without_key
 from flash.core.spec import JobSpec, WandbSpec
 
 
@@ -97,23 +97,24 @@ def test_every_shipped_worker_actually_reaches_wandb():
     import inspect
     from pathlib import Path
 
+    import flash.engine.worker.entry.worker as worker_entry
     from flash.core.catalog import ALGORITHMS
-    from flash.engine import worker as worker_pkg
 
-    worker_dir = Path(inspect.getfile(worker_pkg)).parent
+    # the trainer entry modules live in worker/train/entry/ since the layout regrouping.
+    worker_dir = Path(inspect.getfile(worker_entry)).parents[1] / "train" / "entry"
     without_wandb = set()
     for algorithm in ALGORITHMS:
         # JobSpec.phase is the algorithm -> worker-module mapping (grpo runs the rl worker); the
-        # entry module delegates to its {phase}_train.py, which owns the verl launch.
+        # entry modules delegate to the trainer runner that owns the verl launch.
         phase = JobSpec(algorithm=algorithm).phase
         source = "".join(
             (worker_dir / name).read_text()
-            for name in (f"{phase}.py", f"{phase}_train.py")
+            for name in (f"{phase}.py", f"{phase}_train.py", f"{phase}_train_runner.py")
             if (worker_dir / name).exists()
         )
         # resolve_verl_loggers() is what adds "wandb" to trainer.logger. metadata readers do not
         # start a run, so accepting one as evidence would let the warning lie again.
-        if "resolve_verl_loggers" not in source:
+        if "resolve_verl_loggers(" not in source:
             without_wandb.add(algorithm)
 
     # an empty catalog would satisfy the assertion below without having checked anything, so the

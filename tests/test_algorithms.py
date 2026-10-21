@@ -21,13 +21,13 @@ def test_algorithm_names_normalize_case_insensitively(algorithm):
 
 def test_unknown_algorithm_rejected():
     with pytest.raises(ConfigError):
-        spec_from_dict({"model": "Qwen/Qwen3.5-0.8B", "algorithm": "ppo"}, run_id="x")
+        spec_from_dict({"model": "Qwen/Qwen3.5-9B", "algorithm": "ppo"}, run_id="x")
 
 
 def test_opd_algorithm_accepted():
     spec = spec_from_dict(
         {
-            "model": "Qwen/Qwen3.5-4B",
+            "model": "Qwen/Qwen3.5-9B",
             "algorithm": "opd",
             "environment": {"id": "github:owner/repo@main:env/environment.py"},
             "train": {"epochs": 1, "max_examples": 10},
@@ -117,7 +117,7 @@ def test_qwen35_9b_now_supports_grpo():
             "algorithm": "grpo",
             "environment": {"id": "github:owner/repo@main:env/environment.py"},
             "train": {"epochs": 1, "max_examples": 1},
-            "gpu": {"type": "A100 PCIe"},
+            "gpu": {"type": "A100 SXM"},
         },
         run_id="x",
     )

@@ -20,84 +20,29 @@ from types import SimpleNamespace
 
 import pytest
 
+import flash.runner.lifecycle.state as runner_state
+import flash.runner.lifecycle.submit as runner_submit
 from tests._helpers.profile import satisfy_sft_profile
 from tests._helpers.source_snapshot import valid_source_snapshot
 from tests._helpers.teacher import configure_managed_teacher
 
-_PROVIDERS = ("runpod", "lambda", "vast")
+_PROVIDERS = ("modal",)
 _SOURCE_SNAPSHOT = valid_source_snapshot()
 # the only managed class all three providers stock. a parity test needs one class every provider can
 # actually provision, or the spec is rejected on catalog grounds before parity is ever exercised.
-_TRI_PROVIDER_GPU = "H100"
-
-
-# a fake Lambda catalog covering the counts the tests ask for. Lambda names the count in the type,
-# so 1x/2x/4x/8x are separate entries and an absent one means "Lambda does not sell that shape".
-def _fake_lambda_types() -> dict:
-    """A Lambda catalog stocking 1/2/4/8-card boxes of the tri-provider class.
-
-    Keys are derived through ``instance_type_for`` rather than spelled out, so the fixture cannot
-    drift from the real naming (the class is ``gpu_1x_h100_pcie``, not the ``_sxm5`` one might
-    guess) and quietly stock a catalog nothing ever looks up.
-    """
-    from flash.providers.lambda_.gpus import instance_type_for
-
-    return {
-        instance_type_for(_TRI_PROVIDER_GPU, n): {
-            # per INSTANCE, so a 4-card box lists at 4x the 1-card price
-            "instance_type": {"price_cents_per_hour": 300 * n},
-            "regions_with_capacity_available": [{"name": "us-west-1"}],
-        }
-        for n in (1, 2, 4, 8)
-    }
-
-
-def _fake_vast_row(cards: int) -> dict:
-    """One verified-datacenter H100 offer carrying ``cards`` GPUs, priced for the WHOLE box."""
-    return {
-        "id": 100 + cards,
-        "gpu_name": "H100 SXM",
-        "gpu_ram": 81920,
-        "num_gpus": cards,
-        "dph_total": 2.0 * cards,
-        "cuda_max_good": 99.0,
-        "hosting_type": 1,
-        "verification": "verified",
-        "reliability2": 0.999,
-        "disk_space": 2000.0,
-        "inet_down": 5000.0,
-        "machine_id": 900 + cards,
-    }
+_MULTI_GPU_CLASS = "H100"
 
 
 @pytest.fixture
 def all_providers_configured(monkeypatch):
-    """Enable lambda/vast AND stub their markets so a parity assertion really covers all three.
-
-    Two separate problems, both of which would otherwise turn a three-way parity test into a
-    runpod-only one. ``is_configured`` is keyed on an operator API key and this box carries only
-    RunPod's, so lambda/vast would fail on credentials. But a key alone sends the real client at the
-    network, which a CPU test must never do (and which fails here as a 404). So the catalog/market
-    calls are stubbed at their single entry points -- ``list_instance_types`` and ``search_offers``
-    -- leaving every line of the count-aware provider code under test and only the transport faked.
-    """
-    from flash.providers.lambda_ import api as lambda_api
-    from flash.providers.vast import api as vast_api
-
-    monkeypatch.setenv("LAMBDA_API_KEY", "test-key-not-used")
-    monkeypatch.setenv("VAST_API_KEY", "test-key-not-used")
-    monkeypatch.setattr(lambda_api, "list_instance_types", lambda *a, **k: _fake_lambda_types())
-    monkeypatch.setattr(
-        vast_api,
-        "search_offers",
-        lambda *a, num_gpus=1, **k: [_fake_vast_row(int(num_gpus))],
-    )
+    monkeypatch.setenv("MODAL_TOKEN_ID", "test-token-id")
+    monkeypatch.setenv("MODAL_TOKEN_SECRET", "test-token-secret")
 
 
-def _spec(count: int, algorithm: str = "grpo", provider: str = "runpod"):
+def _spec(count: int, algorithm: str = "grpo", provider: str = "modal"):
     from flash.core.spec import JobSpec
 
-    gpu: dict = {"type": "RTX 5090", "count": count}
+    gpu: dict = {"type": "L40S", "count": count}
     if provider:
         gpu["provider"] = provider
     body: dict = {"model": "test/gate", "algorithm": algorithm, "gpu": gpu}
@@ -105,7 +50,7 @@ def _spec(count: int, algorithm: str = "grpo", provider: str = "runpod"):
 
 
 def test_no_multi_gpu_gate_survives_anywhere():
-    """The runpod-only gate is gone from every layer it used to fire in.
+    """The provider-only gate is gone from every layer it used to fire in.
 
     Asserted by NAME across the source tree rather than by calling it: the gate had five call sites
     (the two submit_job specs, the server route's two, and the recovery path), and a test that only
@@ -134,14 +79,13 @@ def test_submit_accepts_multi_gpu_on_every_provider(
 
     dry_run stops before provisioning, so this asserts only that nothing rejects the shape up front.
     """
-    from flash import runner
 
     with tempfile.TemporaryDirectory() as tmp:
-        monkeypatch.setattr(runner, "RUNS_DIR", os.path.join(tmp, "runs"))
+        monkeypatch.setattr(runner_state, "RUNS_DIR", os.path.join(tmp, "runs"))
         spec = _submittable(algorithm, count=4, provider=provider)
-        satisfy_sft_profile(runner, monkeypatch, spec)
+        satisfy_sft_profile(monkeypatch, spec)
         configure_managed_teacher(monkeypatch, spec)
-        status = runner.submit_job(spec, dry_run=True)
+        status = runner_submit.submit_job(spec, dry_run=True)
         assert status is not None
 
 
@@ -149,14 +93,14 @@ def test_submit_accepts_multi_gpu_on_every_provider(
 def test_provider_only_offers_counts_it_can_rent(all_providers_configured, provider):
     """``live_candidates`` never advertises a shape the provider cannot actually rent.
 
-    Each provider reaches a count differently (runpod passes it at launch, lambda names it in the
+    Each provider reaches a count differently (provider passes it at launch, lambda names it in the
     instance type, vast has it baked into the offer), so the allocator cannot synthesise n-card
     combinations on its own -- it must take what the provider reports. Counts are powers of two
     because vllm asserts ``num_attention_heads % tp_size == 0`` for the rollout engine, and every
     managed model's head count is a power of two: a 3-card box would abort at engine init.
     """
-    from flash.providers import get_provider
-    from flash.providers.base import AllocationConstraints, rentable_gpu_counts
+    from flash.providers.core.base import AllocationConstraints, rentable_gpu_counts
+    from flash.providers.core.registry import get_provider
 
     # spelled out rather than taken from rentable_gpu_counts: the providers call that same helper, so
     # comparing candidates against it would compare the code to itself and could never disagree.
@@ -182,8 +126,8 @@ def test_single_card_constraint_yields_only_single_card_offers(all_providers_con
     The pairing that makes the count-aware path failable: with the cap at 1 a provider that ignored
     the constraint entirely would still look correct in the max_gpu_count=8 test above.
     """
-    from flash.providers import available_providers, get_provider
-    from flash.providers.base import AllocationConstraints
+    from flash.providers.core.base import AllocationConstraints
+    from flash.providers.core.registry import available_providers, get_provider
 
     checked = []
     for name in available_providers():
@@ -197,540 +141,12 @@ def test_single_card_constraint_yields_only_single_card_offers(all_providers_con
     assert checked == list(_PROVIDERS), f"expected all three providers enabled, checked {checked}"
 
 
-def test_lambda_names_the_card_count_in_the_instance_type():
-    """Lambda reaches an n-card box only by rewriting the count segment of the type name."""
-    from flash.providers.lambda_.gpus import instance_type_for
-
-    one = instance_type_for("H100")
-    assert one.startswith("gpu_1x_")
-    assert instance_type_for("H100", 4) == one.replace("gpu_1x_", "gpu_4x_", 1)
-    # count 1 must be byte-identical to the no-count call, or single-gpu runs change shape.
-    assert instance_type_for("H100", 1) == one
-
-
-def test_lambda_resolves_a_multi_card_sku_that_renames_its_suffix():
-    """The count rewrite alone can name a type Lambda does not sell; the catalog is authoritative.
-
-    H100 is registered as ``gpu_1x_h100_pcie`` but Lambda's multi-card family is ``_sxm5``, so the
-    derived ``gpu_8x_h100_pcie`` does not exist. ``regions_with_capacity`` answers [] for an unknown
-    type, which reads as "sold out" rather than "wrong name" -- real capacity disappears silently.
-    """
-    from flash.providers.lambda_.gpus import instance_type_for
-
-    derived = instance_type_for("H100", 4)
-    real = derived.replace("_pcie", "_sxm5")
-    assert real != derived, "fixture must model a renamed suffix or it proves nothing"
-
-    # only the renamed spelling is stocked, so a rewrite-only answer cannot pass by accident.
-    assert instance_type_for("H100", 4, {real: {}}) == real
-    # a catalog that DOES stock the derived name must not be second-guessed.
-    assert instance_type_for("H100", 4, {derived: {}, real: {}}) == derived
-    # a count the catalog stocks at neither spelling still yields the derived name: naming is this
-    # function's job, and rentability is ``usable_instances``' check.
-    assert instance_type_for("H100", 2, {real: {}}) == instance_type_for("H100", 2)
-
-
-def test_lambda_catalog_suffix_fallback_preserves_the_managed_memory_class():
-    """Family matching must not turn A100 40 GB into the costlier A100 80 GB SKU.
-
-    Lambda stocks both as 8-card boxes. Matching only the ``a100`` family makes catalog order choose
-    arbitrarily; in the live catalog that selected the 80 GB box at $22.32/hr instead of the fitting
-    40 GB box at $15.92/hr while still labelling the candidate ``A100 SXM 40GB``.
-    """
-    from flash.providers.lambda_.gpus import instance_type_for
-
-    forty = "gpu_8x_a100"
-    eighty = "gpu_8x_a100_80gb_sxm4"
-    catalog = {
-        eighty: {
-            "instance_type": {
-                "gpu_description": "A100 (80 GB SXM4)",
-                "price_cents_per_hour": 2232,
-            }
-        },
-        forty: {
-            "instance_type": {
-                "gpu_description": "A100 (40 GB SXM4)",
-                "price_cents_per_hour": 1592,
-            }
-        },
-    }
-    assert instance_type_for("A100 SXM 40GB", 8, catalog) == forty
-    # dictionary order is not a contract; reversing it must not change the selected memory class.
-    assert instance_type_for("A100 SXM 40GB", 8, dict(reversed(catalog.items()))) == forty
-    # A sole explicit 80 GB entry is still the WRONG class, not a renamed 40 GB spelling.
-    assert instance_type_for("A100 SXM 40GB", 8, {eighty: catalog[eighty]}) == instance_type_for(
-        "A100 SXM 40GB", 8
-    )
-
-
-def test_lambda_missing_required_count_sku_is_terminal(monkeypatch):
-    """An absent 8-card SKU is structural, while an existing sold-out SKU remains retryable.
-
-    Without the catalog check both cases return no live candidates and the allocator retries them as
-    capacity failures. A shape Lambda does not sell can never recover by retrying.
-    """
-    from flash.providers.base import AllocationConstraints, UnsupportedGpuError
-    from flash.providers.lambda_ import LambdaProvider
-    from flash.providers.lambda_ import api as lambda_api
-    from flash.providers.lambda_.gpus import instance_type_for
-
-    gpu = "A100 SXM 40GB"
-
-    def _catalog(counts):
-        return {
-            instance_type_for(gpu, count): {
-                "instance_type": {"gpu_description": "A100 (40 GB SXM4)"},
-                "regions_with_capacity_available": [],
-            }
-            for count in counts
-        }
-
-    provider = LambdaProvider()
-    constraints = AllocationConstraints(gpu_type=gpu, required_vram_gb=129, max_gpu_count=8)
-    monkeypatch.setattr(lambda_api, "list_instance_types", lambda *a, **k: _catalog((1, 2, 4)))
-    with pytest.raises(UnsupportedGpuError, match=r"does not offer a rentable.*8 cards"):
-        provider.live_candidates(19, constraints)
-
-    # The required SKU exists but has no live regions: return no candidates so allocate() classifies
-    # it as sold out/retryable rather than structurally impossible.
-    monkeypatch.setattr(lambda_api, "list_instance_types", lambda *a, **k: _catalog((1, 2, 4, 8)))
-    assert provider.live_candidates(19, constraints) == []
-
-    # Unpinned searches need the same distinction. Otherwise a Lambda-only run retries forever for
-    # a count-specific SKU Lambda does not sell.
-    unpinned = AllocationConstraints(required_vram_gb=129, max_gpu_count=8)
-    monkeypatch.setattr(lambda_api, "list_instance_types", lambda *a, **k: _catalog((1, 2, 4)))
-    with pytest.raises(UnsupportedGpuError, match=r"does not offer a rentable.*8 cards"):
-        provider.live_candidates(19, unpinned)
-
-
-def test_lambda_sku_miss_is_provider_local_during_auto_allocation(monkeypatch):
-    """A missing Lambda count SKU must not discard a valid shape from another provider."""
-    import flash.providers.allocator as allocator
-    from flash.providers.base import Candidate, UnsupportedGpuError, gpu_classes_for
-
-    class _LambdaMiss:
-        live_capacity = True
-
-        def live_candidates(self, _need, _constraints):
-            raise UnsupportedGpuError("lambda does not sell this count-specific SKU")
-
-        def gpu_classes(self):
-            return gpu_classes_for("lambda_name")
-
-    class _RunPodHit:
-        live_capacity = False
-
-        def live_candidates(self, _need, _constraints):
-            return [Candidate("runpod", "H100", 3.29, 80, 2)]
-
-        def gpu_classes(self):
-            return gpu_classes_for("enum_member")
-
-    providers = {"lambda": _LambdaMiss(), "runpod": _RunPodHit()}
-    monkeypatch.setattr(allocator, "available_providers", lambda: ("lambda", "runpod"))
-    monkeypatch.setattr(allocator, "get_provider", providers.__getitem__)
-    monkeypatch.setattr(allocator, "required_vram_gb", lambda *a, **k: 100)
-
-    chosen = allocator.allocate("Qwen/Qwen3.5-4B", "sft", gpu_type="H100", max_gpu_count=2)
-    assert (chosen.provider, chosen.gpu, chosen.gpu_count) == ("runpod", "H100", 2)
-
-
-def test_lambda_instance_type_never_reaches_the_network():
-    """``instance_type_for`` must stay offline: it is called from pricing, which is called from it.
-
-    An in-function catalog fetch turns a pure name lookup into live I/O on every sizing call and
-    deadlocks the offline test path. Callers holding a catalog pass it; nobody else pays.
-    """
-    from flash.providers.lambda_ import api as lambda_api
-    from flash.providers.lambda_.gpus import instance_type_for
-
-    def explode(*_a, **_k):
-        raise AssertionError("instance_type_for fetched the catalog")
-
-    monkey = pytest.MonkeyPatch()
-    try:
-        monkey.setattr(lambda_api, "list_instance_types", explode)
-        monkey.setattr(lambda_api, "request_with_retries", explode)
-        assert instance_type_for("H100", 4)
-    finally:
-        monkey.undo()
-
-
-def test_lambda_price_is_per_card_not_per_instance():
-    """``price_cents_per_hour`` prices the whole instance; ``Candidate.hourly_usd`` is per card.
-
-    Without the division an n-card box prices n^2 (the allocator re-multiplies by gpu_count via
-    total_hourly_usd) and would never be chosen -- a silent, permanent multi-gpu outage.
-    """
-    import flash.providers.lambda_.jobs as lj
-
-    seen: dict = {}
-
-    def fake_rate(name, *, gpu_count=1, **kwargs):
-        seen["count"] = gpu_count
-        return 4.0 * gpu_count  # a real 4-card instance costs 4x a 1-card instance
-
-    def fake_regions(itype, **kwargs):
-        return ["us-west-1"]
-
-    monkey = pytest.MonkeyPatch()
-    try:
-        monkey.setattr("flash.providers.lambda_.pricing.hourly_rate", fake_rate)
-        monkey.setattr(lj.lambda_api, "regions_with_capacity", fake_regions)
-        four = lj.usable_instances("H100", gpu_count=4)
-    finally:
-        monkey.undo()
-    assert seen["count"] == 4, "the n-card instance type must be the one priced"
-    assert four, "no instance came back, so the rate assertion below would never run"
-    assert four[0].gpu_count == 4
-    assert four[0].price_usd_hr == pytest.approx(4.0), "per-card rate, not the instance total"
-
-
-def test_vast_price_is_per_card_not_per_offer():
-    """``dph_total`` prices the WHOLE offer; the per-card rate is what Candidate carries.
-
-    Same failure mode as lambda's: an undivided 4-card offer prices 4x too high and loses every
-    ranking, so multi-gpu on vast would look supported and never actually be selected.
-    """
-    import flash.providers.vast.jobs as vj
-
-    row = {
-        "id": 1,
-        "gpu_name": "H100 SXM",
-        "gpu_ram": 81920,
-        "num_gpus": 4,
-        "dph_total": 8.0,  # whole 4-card box
-        "cuda_max_good": 99.0,
-        "hosting_type": 1,
-        "verification": "verified",
-        "reliability2": 0.999,
-        "disk_space": 500.0,
-        "inet_down": 5000.0,
-        "machine_id": 7,
-    }
-    monkey = pytest.MonkeyPatch()
-    try:
-        monkey.setattr(vj.vast_api, "search_offers", lambda *a, **k: [row])
-        offers = vj.usable_offers(80, 100.0, num_gpus=4)
-    finally:
-        monkey.undo()
-    assert offers, "a fitting verified 4-card offer must survive the filter"
-    assert offers[0].gpu_count == 4
-    assert offers[0].dph_total == pytest.approx(2.0), "per-card rate, not the offer total"
-
-
-def test_vast_rejects_an_offer_whose_card_count_disagrees():
-    """A row that does not carry the requested count is dropped client-side.
-
-    The server-side num_gpus filter is an {"eq": n} query, but the count divides dph_total into the
-    per-card rate -- trusting it would mis-price a mismatched row by exactly the ratio of counts.
-    """
-    import flash.providers.vast.jobs as vj
-
-    row = {
-        "id": 1,
-        "gpu_name": "H100 SXM",
-        "gpu_ram": 81920,
-        "num_gpus": 1,  # server ignored the filter
-        "dph_total": 8.0,
-        "cuda_max_good": 99.0,
-        "hosting_type": 1,
-        "verification": "verified",
-        "reliability2": 0.999,
-        "disk_space": 500.0,
-        "inet_down": 5000.0,
-        "machine_id": 7,
-    }
-    monkey = pytest.MonkeyPatch()
-    try:
-        monkey.setattr(vj.vast_api, "search_offers", lambda *a, **k: [row])
-        assert vj.usable_offers(80, 100.0, num_gpus=4) == []
-        # the SAME row is accepted when the count matches, so the rejection is the count and not
-        # some other filter in the chain quietly failing.
-        assert vj.usable_offers(80, 100.0, num_gpus=1)
-    finally:
-        monkey.undo()
-
-
-def test_lambda_submit_requests_the_allocated_card_count():
-    """``submit_run_lambda`` must ask for gpu.count cards, not one.
-
-    This is the expensive half of the contract: the worker spawns gpu.count ranks regardless, so a
-    single-card rental oversubscribes one card while the run bills for the full wall time.
-    """
-    import flash.providers.lambda_.jobs as lj
-
-    seen: dict = {}
-
-    def fake_usable(gpu_class, force=False, *, gpu_count=1, **kwargs):
-        seen["count"] = gpu_count
-        raise lj.lambda_api.LambdaApiError("stop before launching")
-
-    monkey = pytest.MonkeyPatch()
-    try:
-        monkey.setattr(lj, "usable_instances", fake_usable)
-        with pytest.raises(lj.lambda_api.LambdaApiError):
-            lj.submit_run_lambda(
-                _submittable("grpo", count=4, provider="lambda"),
-                42,
-                deadline_at=9_999_999_999.0,
-            )
-    finally:
-        monkey.undo()
-    assert seen["count"] == 4, "submit rented a shape other than the one allocated"
-
-
-def test_vast_submit_requests_the_allocated_card_count():
-    """``submit_run_vast`` must search for gpu.count cards, not one. Same billing exposure."""
-    import flash.providers.vast.jobs as vj
-
-    seen: dict = {}
-
-    def fake_offers(*args, num_gpus=1, **kwargs):
-        seen["count"] = num_gpus
-        raise vj.vast_api.VastApiError("stop before renting")
-
-    monkey = pytest.MonkeyPatch()
-    try:
-        monkey.setattr(vj, "usable_offers", fake_offers)
-        with pytest.raises(vj.vast_api.VastApiError):
-            vj.submit_run_vast(
-                _submittable("grpo", count=4, provider="vast"),
-                42,
-                deadline_at=9_999_999_999.0,
-            )
-    finally:
-        monkey.undo()
-    assert seen["count"] == 4, "submit rented a shape other than the one allocated"
-
-
-def test_lambda_capacity_refresh_keeps_the_allocated_card_count():
-    """The mid-walk capacity refresh must re-search the SAME shape, not fall back to one card.
-
-    ``usable_instances`` defaults ``gpu_count`` to 1, so a refresh that omits it silently rents a
-    1-card box while the worker still starts n ranks -- the exact billing exposure the submit-path
-    test guards, reached through the other door.
-    """
-    from flash.providers.lambda_ import api as lambda_api
-    from flash.providers.lambda_ import jobs as lj
-    from flash.providers.lambda_.jobs.builders import LambdaInstance
-
-    def _inst(region: str) -> LambdaInstance:
-        return LambdaInstance(
-            gpu=_TRI_PROVIDER_GPU,
-            instance_type="gpu_4x_h100_sxm5",
-            region=region,
-            vram_gb=80,
-            price_usd_hr=3.0,
-            gpu_count=4,
-        )
-
-    refreshed_with: dict = {}
-
-    def fake_launch(*, region_name, **_kw):
-        if region_name != "us-fresh-1":
-            raise lambda_api.LambdaApiError("PUT /asks/1/ -> HTTP 400: insufficient-capacity")
-        return "i-42"
-
-    def fake_usable(gpu_class, force=False, *, gpu_count=1, **_kw):
-        refreshed_with["count"] = gpu_count
-        return [_inst("us-fresh-1")]
-
-    spec = _submittable("grpo", count=4, provider="lambda")
-    monkey = pytest.MonkeyPatch()
-    try:
-        monkey.setattr(lj, "resolve_ssh_key_names", lambda **_k: ["jk"])
-        monkey.setattr(lambda_api, "launch_instance", fake_launch)
-        monkey.setattr(lj, "usable_instances", fake_usable)
-        handle = lj.launch_and_submit(
-            spec,
-            seed=spec.seed,
-            instances=[_inst("us-east-1")],
-            source_snapshot=_SOURCE_SNAPSHOT,
-            deadline_at=9_999_999_999.0,
-        )
-    finally:
-        monkey.undo()
-
-    assert refreshed_with.get("count") == 4, "refresh dropped the count and would rent one card"
-    # the refresh is what produced the launch, so the assertion above cannot pass vacuously.
-    assert handle.instance_id == "i-42"
-
-
-def test_vast_capacity_refresh_keeps_the_allocated_card_count():
-    """Same contract on Vast: ``usable_offers`` defaults ``num_gpus`` to 1 on an omitted refresh."""
-    from flash.providers.vast import api as vast_api
-    from flash.providers.vast import jobs as vj
-    from flash.providers.vast.jobs.builders import VastOffer
-
-    def _offer(offer_id: int) -> VastOffer:
-        return VastOffer(
-            offer_id=offer_id,
-            machine_id=900 + offer_id,
-            gpu=_TRI_PROVIDER_GPU,
-            vram_gb=80,
-            dph_total=2.0,
-            cuda_max_good=99.0,
-            disk_space=2000.0,
-            reliability=0.999,
-            inet_down=5000.0,
-            geolocation="US",
-            gpu_count=4,
-        )
-
-    refreshed_with: dict = {}
-
-    def fake_create(offer_id, **_kw):
-        if offer_id != 7:
-            raise vast_api.VastCreateRejected(f"offer {offer_id} taken")
-        return 4242
-
-    def fake_usable(*_a, num_gpus=1, **_kw):
-        refreshed_with["count"] = num_gpus
-        return [_offer(7)]
-
-    spec = _submittable("grpo", count=4, provider="vast")
-    monkey = pytest.MonkeyPatch()
-    try:
-        monkey.setattr(vast_api, "create_instance", fake_create)
-        monkey.setattr(vj, "usable_offers", fake_usable)
-        handle = vj.deploy_and_submit(
-            spec,
-            seed=spec.seed,
-            offers=[_offer(1)],
-            source_snapshot=_SOURCE_SNAPSHOT,
-            deadline_at=9_999_999_999.0,
-        )
-    finally:
-        monkey.undo()
-
-    assert refreshed_with.get("count") == 4, "refresh dropped the count and would rent one card"
-    assert handle.instance_id == 4242
-
-
-@pytest.mark.parametrize("provider", ["lambda", "vast"])
-def test_handle_rate_prices_the_whole_instance_not_one_card(provider):
-    """The handle's ``hourly_usd`` is billed against wall-clock ONCE, so it must cover every card.
-
-    Both the metrics cost stamp and ``_instance_realized_cost`` compute ``wall_h * hourly_usd`` with
-    no card-count factor anywhere. Storing the per-card rate that ranking needs would under-report
-    an n-card box's COGS by exactly n -- invisible, because the number still looks like a price.
-    """
-    per_card = 3.0
-    cards = 4
-
-    if provider == "lambda":
-        from flash.providers.lambda_ import api as lambda_api
-        from flash.providers.lambda_ import jobs as lj
-        from flash.providers.lambda_.jobs.builders import LambdaInstance
-
-        inst = LambdaInstance(
-            gpu=_TRI_PROVIDER_GPU,
-            instance_type="gpu_4x_h100_sxm5",
-            region="us-east-1",
-            vram_gb=80,
-            price_usd_hr=per_card,
-            gpu_count=cards,
-        )
-        spec = _submittable("grpo", count=cards, provider="lambda")
-        monkey = pytest.MonkeyPatch()
-        try:
-            monkey.setattr(lj, "resolve_ssh_key_names", lambda **_k: ["jk"])
-            monkey.setattr(lambda_api, "launch_instance", lambda **_kw: "i-1")
-            handle = lj.launch_and_submit(
-                spec,
-                seed=spec.seed,
-                instances=[inst],
-                source_snapshot=_SOURCE_SNAPSHOT,
-                deadline_at=9_999_999_999.0,
-            )
-        finally:
-            monkey.undo()
-    else:
-        from flash.providers.vast import api as vast_api
-        from flash.providers.vast import jobs as vj
-        from flash.providers.vast.jobs.builders import VastOffer
-
-        offer = VastOffer(
-            offer_id=1,
-            machine_id=901,
-            gpu=_TRI_PROVIDER_GPU,
-            vram_gb=80,
-            dph_total=per_card,
-            cuda_max_good=99.0,
-            disk_space=2000.0,
-            reliability=0.999,
-            inet_down=5000.0,
-            geolocation="US",
-            gpu_count=cards,
-        )
-        spec = _submittable("grpo", count=cards, provider="vast")
-        monkey = pytest.MonkeyPatch()
-        try:
-            monkey.setattr(vast_api, "create_instance", lambda *_a, **_kw: 4242)
-            handle = vj.deploy_and_submit(
-                spec,
-                seed=spec.seed,
-                offers=[offer],
-                source_snapshot=_SOURCE_SNAPSHOT,
-                deadline_at=9_999_999_999.0,
-            )
-        finally:
-            monkey.undo()
-
-    assert handle.hourly_usd == pytest.approx(per_card * cards)
-    # and the realized-COGS reader must agree, since that is the consumer that would under-bill.
-    from flash.providers.realized import realized_cost_for_remote
-
-    realized = realized_cost_for_remote(
-        {
-            "provider": provider,
-            "hourly_usd": handle.hourly_usd,
-            "instance_id": handle.instance_id,
-            "started_ts": 1.0,
-        },
-        start=1.0,
-        end=3601.0,
-    )
-    assert realized is not None
-    assert realized.realized_usd == pytest.approx(per_card * cards), (
-        "one hour on an n-card box must bill the whole box"
-    )
-
-
-def test_retry_bookkeeping_distinguishes_card_counts_of_one_class():
-    """A class at 2 cards and the same class at 4 are different rentable shapes.
-
-    This PR made multiple counts per class reachable (the fit filter keeps every shape that fits),
-    so a 2-tuple ``(provider, gpu)`` retry key marks EVERY count tried the moment one fails and the
-    walk skips a wider shape that would have fit.
-    """
-    from flash.providers.base import Candidate
-    from flash.runner.supervise.lifecycle import _select_candidate, _shape_key
-
-    two = Candidate(
-        provider="runpod", gpu=_TRI_PROVIDER_GPU, hourly_usd=3.0, vram_gb=80, gpu_count=2
-    )
-    four = Candidate(
-        provider="runpod", gpu=_TRI_PROVIDER_GPU, hourly_usd=3.0, vram_gb=80, gpu_count=4
-    )
-
-    assert _shape_key(two) != _shape_key(four), "count must be part of the retry identity"
-
-    # having burned the 2-card shape, the walk must still reach the 4-card one rather than treat
-    # the whole class as exhausted.
-    chosen = _select_candidate([two, four], set(), {_shape_key(two)})
-    assert chosen is four
-
-
 def _submittable(
     algorithm: str,
     *,
     count: int = 1,
-    provider: str = "runpod",
-    gpu: str = _TRI_PROVIDER_GPU,
+    provider: str = "modal",
+    gpu: str = _MULTI_GPU_CLASS,
 ):
     """a spec that survives a full submit, unlike a bare gate fixture."""
     from flash.core.spec import JobSpec
@@ -739,7 +155,7 @@ def _submittable(
     if algorithm == "opd":
         train["teacher_model"] = "kimi-k3"
     body: dict = {
-        "model": "Qwen/Qwen3.5-0.8B",
+        "model": "Qwen/Qwen3.5-9B",
         "algorithm": algorithm,
         "gpu": {"type": gpu, "count": count, "provider": provider},
         "train": train,
@@ -753,16 +169,15 @@ def _submittable(
 
 @pytest.mark.parametrize("algorithm", ["grpo", "sft", "opd"])
 def test_submit_records_the_resolved_backend(monkeypatch, algorithm):
-    from flash import runner
 
     # the run records which trainer actually ran, so it stays auditable from the run itself.
     expected = "verl"
     with tempfile.TemporaryDirectory() as tmp:
-        monkeypatch.setattr(runner, "RUNS_DIR", os.path.join(tmp, "runs"))
+        monkeypatch.setattr(runner_state, "RUNS_DIR", os.path.join(tmp, "runs"))
         spec = _submittable(algorithm)
-        satisfy_sft_profile(runner, monkeypatch, spec)
+        satisfy_sft_profile(monkeypatch, spec)
         configure_managed_teacher(monkeypatch, spec)
-        status = runner.submit_job(spec, dry_run=True)
+        status = runner_submit.submit_job(spec, dry_run=True)
         assert (status.effective_preparation or {}).get("backend") == expected
 
 
@@ -777,7 +192,11 @@ def test_gpu_count_is_honoured_by_parse_time_sizing():
     Pinned to a need no single validated class holds (180 GB max) but four cards do, so the
     assertion cannot pass by accident on a run that fits one card anyway.
     """
-    from flash.providers.base import UnsupportedGpuError, cheapest_gpu, combined_vram_gb
+    from flash.providers.core.base import (
+        UnsupportedGpuError,
+        cheapest_gpu,
+    )
+    from flash.providers.core.sharding import combined_vram_gb
 
     need = 234
     assert all(info.vram_gb < need for info in _validated_infos()), (
@@ -791,7 +210,7 @@ def test_gpu_count_is_honoured_by_parse_time_sizing():
         chosen = cheapest_gpu(need, gpu_count=count)
         # the shape it names must genuinely hold the run under the SAME fit model the allocator
         # applies at submit time -- naming a class that does not fit would just move the failure.
-        from flash.providers.base import get_gpu_info
+        from flash.providers.core.base import get_gpu_info
 
         assert combined_vram_gb(get_gpu_info(chosen).vram_gb, count) >= need
 
@@ -803,7 +222,11 @@ def test_public_max_gpu_count_is_rentable_not_silently_clamped():
     ``gpu.count = 8``; clamping it to 4 makes that provider capacity unreachable and contradicts the
     authored ceiling without an error.
     """
-    from flash.providers.base import UnsupportedGpuError, cheapest_gpu, combined_vram_gb
+    from flash.providers.core.base import (
+        UnsupportedGpuError,
+        cheapest_gpu,
+    )
+    from flash.providers.core.sharding import combined_vram_gb
 
     # above the widest 4-card shape but below 8x B200, so restoring the old cap to 4 kills this test.
     need = 700
@@ -811,7 +234,7 @@ def test_public_max_gpu_count_is_rentable_not_silently_clamped():
     with pytest.raises(UnsupportedGpuError):
         cheapest_gpu(need, gpu_count=4)
     chosen = cheapest_gpu(need, gpu_count=8)
-    from flash.providers.base import get_gpu_info
+    from flash.providers.core.base import get_gpu_info
 
     assert combined_vram_gb(get_gpu_info(chosen).vram_gb, 8) >= need
 
@@ -826,7 +249,7 @@ def test_eight_cards_require_validated_head_geometry(monkeypatch):
     """
     import flash.engine.plan.model_config_probe as model_config_probe
     import flash.engine.plan.vram as vram
-    from flash.providers.allocator import geometry_safe_gpu_cap
+    from flash.providers.core.allocator import geometry_safe_gpu_cap
 
     monkeypatch.setattr(model_config_probe, "_CONFIG_PROBE_MEMO", {})
 
@@ -845,12 +268,12 @@ def test_geometry_cap_follows_each_models_own_head_count():
     """The cap must divide each row's RECORDED head count, never a derived stand-in.
 
     ``hidden_size // head_dim`` is not the head count: these checkpoints decouple ``head_dim`` from
-    that ratio, and the quotient is wrong for four of six rows (3.5-4B is 16 heads, not 2560/256 =
-    10). Every row is checked against ``num_attention_heads`` so a future model with, say, 20 heads
-    is capped at 4 instead of rented at 8 and failed in Ulysses init.
+    that ratio, and the quotient is wrong for two of the three surviving rows. Every row is checked
+    against ``num_attention_heads`` so a future model with, say, 20 heads is capped at 4 instead of
+    rented at 8 and failed in Ulysses init.
     """
     from flash.core.catalog import MODELS
-    from flash.providers.allocator import geometry_safe_gpu_cap
+    from flash.providers.core.allocator import geometry_safe_gpu_cap
 
     for model_id, info in MODELS.items():
         heads = info.num_attention_heads
@@ -859,18 +282,16 @@ def test_geometry_cap_follows_each_models_own_head_count():
         # refactor cannot quietly reintroduce it.
         assert heads % geometry_safe_gpu_cap(model_id, 8) == 0
 
-    # the derivation this replaced disagrees with the truth on four of six rows.
-    derived_wrong = [
+    # the derivation still disagrees with the recorded geometry for these surviving rows.
+    derived_wrong = {
         m for m, i in MODELS.items() if i.hidden_size // i.head_dim != i.num_attention_heads
-    ]
-    assert len(derived_wrong) == 4, derived_wrong
-    assert MODELS["Qwen/Qwen3.5-4B"].num_attention_heads == 16
-    assert MODELS["Qwen/Qwen3.5-4B"].hidden_size // MODELS["Qwen/Qwen3.5-4B"].head_dim == 10
+    }
+    assert derived_wrong == {"Qwen/Qwen3.8-27B", "Qwen/Qwen3.6-35B-A3B"}
 
     # every CURRENT row divides by 8, so no row is narrowed today. that is a property of this
     # catalog, not an invariant -- the loop above is what enforces it for whatever is added next.
-    assert geometry_safe_gpu_cap("Qwen/Qwen3.5-4B", 8) == 8
-    assert geometry_safe_gpu_cap("Qwen/Qwen3.6-27B", 8) == 8
+    assert geometry_safe_gpu_cap("Qwen/Qwen3.5-9B", 8) == 8
+    assert geometry_safe_gpu_cap("Qwen/Qwen3.8-27B", 8) == 8
     # an authored ceiling below the geometric limit still wins; the cap only ever narrows.
     assert geometry_safe_gpu_cap("Qwen/Qwen3.5-9B", 2) == 2
     # a model outside the catalog has no readable geometry, so it keeps the unvalidated ceiling.
@@ -905,7 +326,7 @@ def test_a_certified_pin_reaches_eight_cards():
     pinned commit's own config is readable, so it is what decides the width.
     """
     from flash.core.catalog import MODELS
-    from flash.providers.allocator import geometry_safe_gpu_cap
+    from flash.providers.core.allocator import geometry_safe_gpu_cap
 
     monkey = pytest.MonkeyPatch()
     try:
@@ -931,7 +352,7 @@ def test_a_pin_that_contradicts_the_catalog_certifies_nothing():
     when sizing runs, so the conservative ceiling here is belt-and-braces rather than the only gate.
     """
     from flash.core.catalog import MODELS
-    from flash.providers.allocator import geometry_safe_gpu_cap
+    from flash.providers.core.allocator import geometry_safe_gpu_cap
 
     info = MODELS["Qwen/Qwen3.5-9B"]
     assert info.num_attention_heads == 16
@@ -962,7 +383,7 @@ def test_a_pin_without_parameter_metadata_certifies_nothing():
     import flash.engine.plan.model_config_probe as model_config_probe
     import flash.engine.plan.vram as vram
     from flash.core.catalog import MODELS
-    from flash.providers.allocator import geometry_safe_gpu_cap
+    from flash.providers.core.allocator import geometry_safe_gpu_cap
 
     info = MODELS["Qwen/Qwen3.5-9B"]
 
@@ -1022,7 +443,7 @@ def test_a_pinned_head_lookup_is_not_repeated_or_cached_on_failure():
     import flash.engine.plan.model_config_probe as model_config_probe
     import flash.engine.plan.vram as vram
     from flash.core.catalog import MODELS
-    from flash.providers.allocator import geometry_safe_gpu_cap
+    from flash.providers.core.allocator import geometry_safe_gpu_cap
 
     info = MODELS["Qwen/Qwen3.5-9B"]
     rev = "a" * 40
@@ -1132,7 +553,7 @@ def test_only_the_submission_path_certifies_a_pin():
     import inspect
 
     import flash.cost.analytical as analytical
-    import flash.providers.allocator as allocator
+    import flash.providers.core.allocator as allocator
     import flash.schema as schema
 
     def _certifying_calls(module) -> list[bool]:
@@ -1178,7 +599,7 @@ def test_a_low_ceiling_pin_does_not_reach_the_hub():
     """
     import flash.engine.plan.model_config_probe as model_config_probe
     import flash.engine.plan.vram as vram
-    from flash.providers.allocator import geometry_safe_gpu_cap
+    from flash.providers.core.allocator import geometry_safe_gpu_cap
 
     monkey = pytest.MonkeyPatch()
     try:
@@ -1217,7 +638,7 @@ def test_a_blip_after_sizing_cannot_narrow_an_already_validated_pin():
     import flash.engine.plan.model_config_probe as model_config_probe
     import flash.engine.plan.vram as vram
     from flash.core.catalog import MODELS
-    from flash.providers.allocator import geometry_safe_gpu_cap
+    from flash.providers.core.allocator import geometry_safe_gpu_cap
 
     model = "Qwen/Qwen3.5-9B"
     info = MODELS[model]
@@ -1255,7 +676,7 @@ def test_geometry_cap_narrows_a_row_whose_heads_do_not_divide_eight():
     from dataclasses import replace
 
     from flash.core.catalog import MODELS
-    from flash.providers.allocator import geometry_safe_gpu_cap
+    from flash.providers.core.allocator import geometry_safe_gpu_cap
 
     awkward = replace(MODELS["Qwen/Qwen3.5-9B"], id="Qwen/Fake-20-Head", num_attention_heads=20)
     patched = dict(MODELS)
@@ -1290,7 +711,7 @@ def test_an_uncertified_pin_still_narrows_below_the_four_card_ceiling():
     from dataclasses import replace
 
     from flash.core.catalog import MODELS
-    from flash.providers.allocator import geometry_safe_gpu_cap
+    from flash.providers.core.allocator import geometry_safe_gpu_cap
 
     six = replace(MODELS["Qwen/Qwen3.5-9B"], id="Qwen/Fake-6-Head", num_attention_heads=6)
     patched = dict(MODELS)
@@ -1329,25 +750,25 @@ def test_unpinned_sold_out_live_market_stays_retryable():
     as terminal, killing a run a retry would have placed. A genuinely oversized run must still fail
     terminally, so the distinction is gated on whether any offered shape could hold the run at all.
     """
-    import flash.providers.allocator as alloc
-    from flash.providers.base import CapacityLookupError, UnsupportedGpuError
+    import flash.providers.core.allocator as alloc
+    from flash.providers.core.base import CapacityLookupError, UnsupportedGpuError
 
     class _SoldOutLiveMarket:
-        name = "lambda"
+        name = "modal"
         live_capacity = True
 
         def live_candidates(self, need, constraints):
             return []  # structurally offered, nothing free right now
 
         def gpu_classes(self):
-            from flash.providers import base
+            from flash.providers.core import base
 
-            return base.gpu_classes_for("lambda_name")
+            return list(base.GPU_INFO.values())
 
     monkey = pytest.MonkeyPatch()
     try:
         monkey.setattr(alloc, "get_provider", lambda _n: _SoldOutLiveMarket())
-        monkey.setattr(alloc, "available_providers", lambda: ("lambda",))
+        monkey.setattr(alloc, "available_providers", lambda: ("modal",))
         # a run that fits an offered shape: sold out now -> retryable.
         with pytest.raises(CapacityLookupError):
             alloc.allocate("Qwen/Qwen3-4B", "sft")
@@ -1360,7 +781,7 @@ def test_unpinned_sold_out_live_market_stays_retryable():
 
 
 def _validated_infos():
-    from flash.providers.base import GPU_INFO
+    from flash.providers.core.base import GPU_INFO
 
     return [info for info in GPU_INFO.values() if info.validated]
 
@@ -1377,7 +798,7 @@ def test_effective_spec_validation_accepts_an_allocator_narrowed_count():
     integrity failure.
     """
     from flash.core.spec import JobSpec, gpu_count_of
-    from flash.runner import _validate_effective_spec
+    from flash.runner.lifecycle.preparation import _validate_effective_spec
     from flash.runner.supervise.lifecycle import _spec_with_gpu
 
     public = JobSpec.from_dict(
@@ -1390,114 +811,31 @@ def test_effective_spec_validation_accepts_an_allocator_narrowed_count():
         }
     )
     # the fixture must actually narrow, or it proves nothing about the comparison.
-    narrowed = _spec_with_gpu(public, _TRI_PROVIDER_GPU, 2)
+    narrowed = _spec_with_gpu(public, _MULTI_GPU_CLASS, 2)
     assert gpu_count_of(narrowed) == 2 < gpu_count_of(public)
     _validate_effective_spec(public, narrowed)  # must not raise
     # the full ceiling is still fine, and so is a single card.
-    _validate_effective_spec(public, _spec_with_gpu(public, _TRI_PROVIDER_GPU, 4))
-    _validate_effective_spec(public, _spec_with_gpu(public, _TRI_PROVIDER_GPU, 1))
+    _validate_effective_spec(public, _spec_with_gpu(public, _MULTI_GPU_CLASS, 4))
+    _validate_effective_spec(public, _spec_with_gpu(public, _MULTI_GPU_CLASS, 1))
     # widening past the authored ceiling is NOT an allocator narrowing -> still rejected.
     with pytest.raises(ValueError, match="does not match the public run"):
-        _validate_effective_spec(public, _spec_with_gpu(public, _TRI_PROVIDER_GPU, 8))
+        _validate_effective_spec(public, _spec_with_gpu(public, _MULTI_GPU_CLASS, 8))
 
 
 def test_unpinned_quote_bills_the_allocator_selected_count():
     """The exact lifecycle quote charges selected count and timing, never the authored ceiling."""
     from flash.cost.analytical import estimate_cost
     from flash.cost.types import RunConfig
-    from flash.providers.base import Candidate
+    from flash.providers.core.base import Candidate
 
-    config = RunConfig(model_id="Qwen/Qwen3.5-4B", method="sft", steps=100, gpu_count=8)
-    one = estimate_cost(config, allocation=Candidate("runpod", "H100", 3.29, 80, 1))
-    two = estimate_cost(config, allocation=Candidate("runpod", "H100", 3.29, 80, 2))
+    config = RunConfig(model_id="Qwen/Qwen3.5-9B", method="sft", steps=100, gpu_count=8)
+    one = estimate_cost(config, allocation=Candidate("modal", "H100", 3.29, 80, 1))
+    two = estimate_cost(config, allocation=Candidate("modal", "H100", 3.29, 80, 2))
 
     assert one.gpu_count == 1
     assert two.gpu_count == 2
     assert two.train_seconds < one.train_seconds
     assert two.total_usd < 2 * one.total_usd
-
-
-def test_vast_keeps_confirmed_shapes_when_another_count_query_fails():
-    """One count's market blip must not discard shapes another count already confirmed rentable.
-
-    Each card count is its own Vast market search. Raising on the first failure threw away
-    candidates from earlier successful queries, so a Vast-only run holding a live 4-card offer still
-    failed allocation when the 2-card query blipped -- unrecoverable at `max_retries=0`. Only a
-    total lookup failure may raise.
-    """
-    from flash.providers.base import AllocationConstraints, CapacityLookupError
-    from flash.providers.vast import VastProvider
-
-    provider = VastProvider()
-    fitting_vram = min(g.vram_gb for g in provider.gpu_classes())
-    tri = {g.name for g in provider.gpu_classes()}
-    name = sorted(tri)[0]
-
-    calls: list[int] = []
-
-    def _flaky(_vram, _disk, _wall, *, num_gpus, **_kw):
-        calls.append(num_gpus)
-        if num_gpus == 4:
-            return {name: 1.5}
-        raise RuntimeError("market blip")
-
-    def _all_dead(_vram, _disk, _wall, *, num_gpus, **_kw):
-        calls.append(num_gpus)
-        raise RuntimeError("market blip")
-
-    monkey = pytest.MonkeyPatch()
-    try:
-        monkey.setattr("flash.providers.vast.pricing.live_candidate_rates", _flaky)
-        got = provider.live_candidates(
-            fitting_vram, AllocationConstraints(max_gpu_count=4, disk_gb=100.0)
-        )
-        # the confirmed 4-card offer survives the 2-card and 1-card failures.
-        assert [c.gpu_count for c in got] == [4]
-        assert calls == [4, 2, 1]  # every count still attempted, none short-circuited
-
-        calls.clear()
-        monkey.setattr("flash.providers.vast.pricing.live_candidate_rates", _all_dead)
-        # nothing confirmed anywhere -> still retryable, not a terminal "no GPU fits".
-        with pytest.raises(CapacityLookupError):
-            provider.live_candidates(
-                fitting_vram, AllocationConstraints(max_gpu_count=4, disk_gb=100.0)
-            )
-    finally:
-        monkey.undo()
-
-
-def test_lambda_single_card_pricing_survives_a_catalog_outage():
-    """A catalog blip must not downgrade a 1x Lambda quote to the static list price.
-
-    ``instance_type_for`` returns the registry name unconditionally at count 1 -- the catalog is
-    only consulted to resolve a MULTI-card suffix (gpu_1x_h100_pcie vs gpu_8x_h100_sxm5). Fetching
-    it on every call put a second network round-trip on the single-card path and, worse, let one
-    ``/instance-types`` failure escape into the shared ``except`` and fall back to the static rate
-    for EVERY Lambda quote -- even though the per-type price lookup underneath would have answered
-    fine. Live pricing that silently reverts to a stale snapshot misprices allocation and billing.
-    """
-    from flash.providers.lambda_ import api as lambda_api
-    from flash.providers.lambda_.pricing import _STATIC_RATES, hourly_rate
-
-    live_rate, calls = 2.49, []
-
-    def _dead_catalog(*_a, **_k):
-        calls.append("catalog")
-        raise RuntimeError("instance-types outage")
-
-    monkey = pytest.MonkeyPatch()
-    try:
-        monkey.setattr(lambda_api, "list_instance_types", _dead_catalog)
-        monkey.setattr(lambda_api, "instance_type_price_usd_hr", lambda *_a, **_k: live_rate)
-        # the static fallback must actually differ, or this asserts nothing.
-        assert _STATIC_RATES["H100"] != live_rate
-        assert hourly_rate("H100") == live_rate
-        assert calls == []  # the 1x path never asked for the catalog at all
-        # multi-card still resolves through the catalog, so its outage still falls back.
-        assert hourly_rate("H100", gpu_count=4) == _STATIC_RATES["H100"] * 4
-        assert calls == ["catalog"]
-    finally:
-        monkey.undo()
 
 
 def test_structured_opd_compiler_vocab_is_card_independent():
@@ -1509,7 +847,7 @@ def test_structured_opd_compiler_vocab_is_card_independent():
     inside resolution, so the shape cannot reach it and cannot reject anything: the resolved
     vocabulary is a function of the model and its revision alone.
     """
-    from flash.engine.worker.train.opd.validation import _resolve_compiler_vocab_size
+    from flash.engine.worker.train.opd.orchestration.validation import _resolve_compiler_vocab_size
 
     seen: list[tuple] = []
 
@@ -1578,8 +916,8 @@ def test_every_catalog_row_shards_on_every_vllm_tensor_parallel_axis():
     divides on query heads is caught here rather than on a paid box.
     """
     from flash.core.catalog import MODELS
-    from flash.providers.allocator import geometry_safe_gpu_cap
-    from flash.providers.base import rentable_gpu_counts
+    from flash.providers.core.allocator import geometry_safe_gpu_cap
+    from flash.providers.core.base import rentable_gpu_counts
 
     for model_id, info in MODELS.items():
         cap = geometry_safe_gpu_cap(model_id, 8)
@@ -1605,7 +943,7 @@ def test_the_tensor_parallel_axis_check_fails_a_row_vllm_would_reject():
     from flash.core.catalog import MODELS
 
     row = replace(
-        MODELS["Qwen/Qwen3.5-4B"],
+        MODELS["Qwen/Qwen3.5-9B"],
         num_attention_heads=16,
         num_key_value_heads=3,
         linear_num_value_heads=12,
@@ -1618,13 +956,13 @@ def test_the_tensor_parallel_axis_check_fails_a_row_vllm_would_reject():
     # kv axis (3 can neither partition across nor replicate into 4 ranks) still objects.
     assert _vllm_tp_axis_failures(row, 4) == ["kv_heads"]
     # a real row stays clean at every width, so the helper is not merely rejecting everything.
-    assert _vllm_tp_axis_failures(MODELS["Qwen/Qwen3.6-27B"], 8) == []
+    assert _vllm_tp_axis_failures(MODELS["Qwen/Qwen3.8-27B"], 8) == []
     # the conv axis is reported, and ISOLATED: conv_dim is `head_k*num_k*2 + head_v*num_v`, which
     # the catalog's 128-wide head dims keep a multiple of 8 for any head count -- so no value-head
     # count alone can break it. Narrow the dims instead: 1*3*2 + 1*16 = 22 fails while the value
     # heads (16) still divide 8, leaving conv_dim as the only objection.
     narrow_conv = replace(
-        MODELS["Qwen/Qwen3.5-4B"],
+        MODELS["Qwen/Qwen3.5-9B"],
         linear_key_head_dim=1,
         linear_num_key_heads=3,
         linear_value_head_dim=1,

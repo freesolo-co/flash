@@ -22,9 +22,9 @@ import types
 
 import pytest
 
-from flash.engine.worker.backend_common import parse_wandb_link
 from flash.engine.worker.train.core.child import runtime as child_runtime
 from flash.engine.worker.train.core.child.runtime import install_wandb_link_reporting
+from flash.engine.worker.train.entry.backend_common import parse_wandb_link
 
 _URL = "https://wandb.ai/acme/flash/runs/abc123"
 _ID = "abc123"
@@ -311,9 +311,9 @@ def test_parser_tolerates_a_missing_id():
 # extra files a trainer's write_train_meta notes builder can live in, after the module was split
 # to stay under the file-size limit. paths are relative to _WORKER.
 _NOTES_BUILDER_MODULES = {
-    "rl_train.py": ("train/rl/verl_config.py",),
-    "opd_train.py": ("train/opd/overrides.py",),
-    "sft_train.py": ("train/sft/config.py",),
+    "rl_train.py": ("train/rl/launch/verl_config.py",),
+    "opd_train.py": ("train/opd/orchestration/overrides.py",),
+    "sft_train.py": ("train/sft/setup/config.py",),
 }
 
 
@@ -333,7 +333,8 @@ def _emitted_notes_keys(module: str) -> set[str]:
     dropping "wandb_url" from the returned dict would keep the suite green while link_wandb got
     nothing, which is the exact defect this module exists to catch.
     """
-    tree = ast.parse((_WORKER / module).read_text())
+    # the trainer entry modules moved under worker/train/entry/ in the layout regrouping.
+    tree = ast.parse((_WORKER / "train" / "entry" / module).read_text())
     # the notes builder need not live in the same file as the write_train_meta call: grpo calls it
     # from rl_train.py but defines it in train/rl/verl_config.py. collect builders from the module
     # AND from wherever it was split to, or the sentinel below reports every key as unresolvable.

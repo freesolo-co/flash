@@ -1,17 +1,4 @@
-"""Versioned, checksummed runtime capsules.
-
-Flash runs code on machines it does not own: RunPod workers, Lambda instances, Vast containers.
-Historically that code travelled as SOURCE TEXT -- read off disk, docstring-stripped, embedded in
-a shell heredoc, and executed on the far end. Nothing checked that what arrived was what was sent,
-and a local refactor could raise NameError only once a paid GPU had already booted.
-
-A capsule replaces that with a declared artifact: a deterministic zipapp whose every member is
-named, sized, and sha256'd in a manifest, carrying a version so the far end can refuse a shape it
-does not understand. The expected archive digest travels OUTSIDE the archive (job payload or image
-label), which is what makes a substituted-but-self-consistent capsule detectable.
-
-Stdlib-only on purpose: a capsule may have to be verified before any dependency is installed.
-"""
+"""Versioned, checksummed runtime capsules."""
 
 from __future__ import annotations
 

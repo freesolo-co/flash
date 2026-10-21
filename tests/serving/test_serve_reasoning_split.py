@@ -10,59 +10,56 @@ and pin that a NON-thinking completion is never torn apart on the strength of a 
 
 from __future__ import annotations
 
-import hashlib
 import json
 
 import orjson
 import pytest
 from fastapi.testclient import TestClient
 
-from flash.serving.src.responses import _ReasoningStreamSplitter, _split_reasoning
-from flash.serving.src.router import AdapterRouter, build_serving_app
-from flash.serving.src.schemas import AdapterRecord
+from flash.serve.app.openai import ReasoningDeltaSplitter, split_reasoning
+from flash.serving.src.http.router import AdapterRouter
+from flash.serving.src.http.router import build_offline_serving_app as build_serving_app
+from flash.serving.src.io.schemas import AdapterRecord
+from tests.serving.checkpoint_fixtures import checkpoint_record
 from tests.serving.conftest import attest
 
-QWEN = "Qwen/Qwen3.5-0.8B"
+QWEN = "Qwen/Qwen3.5-9B"
 
 
-async def _allow(_token: str, _adapter_id: str) -> None:
-    return None
+async def _allow(_token: str, _adapter_id: str, _scope: dict | None = None) -> str:
+    return "org-1"
 
 
 def _rec(run_id: str, *, thinking: bool = True) -> AdapterRecord:
-    sha = hashlib.sha1(run_id.encode()).hexdigest()
-    return AdapterRecord.model_validate(
-        {
-            "adapter_id": f"{run_id}@final.{sha}",
-            "repo_id": f"org/{run_id}",
-            "org_id": "org-1",
-            "base_model": QWEN,
-            "checkpoint": run_id,
-            "status": "ready",
-            "thinking": thinking,
-            "metadata": {
-                "record_type": "revision",
-                "run_id": run_id,
-                "checkpoint_step": None,
-                "hf_revision": sha,
-            },
-        }
-    )
+    return checkpoint_record(run_id, QWEN, thinking=thinking)
 
 
-def _alias(revision: AdapterRecord) -> AdapterRecord:
-    run_id = str(revision.metadata["run_id"])
-    return revision.model_copy(
-        update={
-            "adapter_id": run_id,
-            "checkpoint": None,
-            "metadata": {
-                "record_type": "alias",
-                "run_id": run_id,
-                "alias_of": revision.adapter_id,
+class _NoReadyPool:
+    """engine pool whose first event is an attested content delta."""
+
+    def __init__(self) -> None:
+        self.first_event = None
+
+    async def stream_generate(self, base_model, payload, record, *, expected_checkpoint=None):
+        self.first_event = attest(
+            record,
+            {
+                "type": "delta",
+                "text": "write </think> verbatim",
+                "checkpoint": record.adapter_id,
             },
-        }
-    )
+        )
+        yield self.first_event
+        yield {"type": "final", "finish_reason": "stop"}
+
+    async def generate(self, base_model, payload, record, *, expected_checkpoint=None):
+        raise AssertionError("stream test must not use buffered generation")
+
+    async def register(self, base_model, record) -> None:
+        pass
+
+    async def unregister(self, base_model, org_id, adapter_id, expected_generation=None) -> None:
+        pass
 
 
 class _Pool:
@@ -81,11 +78,15 @@ class _Pool:
                 "text": self._text,
                 "finish_reason": "stop",
                 "thinking": self._thinking,
+                "checkpoint": record.adapter_id,
             },
         )
 
     async def stream_generate(self, base_model, payload, record, *, expected_checkpoint=None):
-        yield {"type": "ready", "checkpoint": "", "thinking": self._thinking}
+        yield attest(
+            record,
+            {"type": "ready", "checkpoint": record.adapter_id, "thinking": self._thinking},
+        )
         for delta in self._deltas:
             yield {"type": "delta", "text": delta}
         yield {"type": "final", "finish_reason": "stop"}
@@ -93,31 +94,23 @@ class _Pool:
     async def register(self, base_model, record) -> None:
         pass
 
-    async def unregister(self, base_model, adapter_id, expected_generation=None) -> None:
+    async def unregister(self, base_model, org_id, adapter_id, expected_generation=None) -> None:
         pass
-
-
-class _NoReadyPool(_Pool):
-    """Streams without a leading ``ready`` event, so the router takes the replay path."""
-
-    async def stream_generate(self, base_model, payload, record, *, expected_checkpoint=None):
-        for delta in self._deltas:
-            yield {"type": "delta", "text": delta}
-        yield {"type": "final", "finish_reason": "stop"}
 
 
 def _client(pool: _Pool, *, thinking: bool = True) -> TestClient:
     revision = _rec("qa", thinking=thinking)
-    app = build_serving_app(
-        pool, AdapterRouter([revision, _alias(revision)]), chat_authorizer=_allow
+    app = build_serving_app(pool, AdapterRouter([revision]), chat_authorizer=_allow)
+    return TestClient(
+        app,
+        headers={"Authorization": "Bearer t", "X-Freesolo-Org-Id": "org-1"},
     )
-    return TestClient(app, headers={"Authorization": "Bearer t"})
 
 
 def _chat(client: TestClient) -> dict:
     resp = client.post(
         "/v1/chat/completions",
-        json={"model": "qa", "messages": [{"role": "user", "content": "hi"}]},
+        json={"model": "qa/final", "messages": [{"role": "user", "content": "hi"}]},
     )
     assert resp.status_code == 200, resp.text
     return resp.json()["choices"][0]["message"]
@@ -128,7 +121,7 @@ def _stream_deltas(client: TestClient) -> list[dict]:
     with client.stream(
         "POST",
         "/v1/chat/completions",
-        json={"model": "qa", "messages": [{"role": "user", "content": "hi"}], "stream": True},
+        json={"model": "qa/final", "messages": [{"role": "user", "content": "hi"}], "stream": True},
     ) as resp:
         assert resp.status_code == 200
         body = resp.read().decode("utf-8")
@@ -146,12 +139,12 @@ def _stream_deltas(client: TestClient) -> list[dict]:
 
 
 # ------------------------------------------------------------------------------------------
-# _split_reasoning: the pure non-streaming split
+# split_reasoning: the pure non-streaming split
 # ------------------------------------------------------------------------------------------
 
 
 def test_split_reasoning_separates_reasoning_from_answer():
-    assert _split_reasoning("weighing it up</think>the answer", True) == (
+    assert split_reasoning("weighing it up</think>the answer", thinking=True) == (
         "weighing it up",
         "the answer",
     )
@@ -159,13 +152,13 @@ def test_split_reasoning_separates_reasoning_from_answer():
 
 def test_split_reasoning_unclosed_block_is_all_reasoning():
     """Hitting max_tokens mid-reasoning leaves no answer; an empty content is the honest report."""
-    assert _split_reasoning("still thinking", True) == ("still thinking", "")
+    assert split_reasoning("still thinking", thinking=True) == ("still thinking", "")
 
 
 def test_split_reasoning_leaves_non_thinking_text_verbatim():
     """A non-thinking completion that merely QUOTES the tag must not be torn in half, and gets no
     reasoning_content at all."""
-    assert _split_reasoning("write </think> to close it", False) == (
+    assert split_reasoning("write </think> to close it", thinking=False) == (
         None,
         "write </think> to close it",
     )
@@ -173,53 +166,36 @@ def test_split_reasoning_leaves_non_thinking_text_verbatim():
 
 def test_split_reasoning_splits_on_the_first_close_only():
     """A quoted tag inside the answer stays in the answer."""
-    assert _split_reasoning("think</think>say </think> to close", True) == (
+    assert split_reasoning("think</think>say </think> to close", thinking=True) == (
         "think",
         "say </think> to close",
     )
 
 
 # ------------------------------------------------------------------------------------------
-# _ReasoningStreamSplitter: the incremental split
+# ReasoningDeltaSplitter: the incremental split
 # ------------------------------------------------------------------------------------------
 
 
-def test_stream_splitter_routes_reasoning_then_content():
-    splitter = _ReasoningStreamSplitter(True)
-    assert splitter.feed("weighing") == ("weighing", "")
-    assert splitter.feed(" it up</think>the ") == (" it up", "the ")
-    assert splitter.feed("answer") == ("", "answer")
-    assert splitter.flush() == ""
-
-
-@pytest.mark.parametrize("cut", [1, 2, 3, 4, 5, 6, 7])
-def test_stream_splitter_handles_a_tag_straddling_chunks(cut):
-    """The closing tag arrives token by token and can land across any chunk boundary. No matter
-    where it is cut, the tag itself must never leak into either side of the split."""
-    splitter = _ReasoningStreamSplitter(True)
-    reasoning = ""
-    content = ""
-    for chunk in ("think", "</think>"[:cut], "</think>"[cut:], "answer"):
-        head, tail = splitter.feed(chunk)
-        reasoning += head
-        content += tail
-    reasoning += splitter.flush()
-    assert (reasoning, content) == ("think", "answer")
-
-
-def test_stream_splitter_flushes_an_unclosed_block_as_reasoning():
-    """The block never closed, so the held-back partial match is reasoning, not a lost fragment."""
-    splitter = _ReasoningStreamSplitter(True)
-    assert splitter.feed("thinking</thin") == ("thinking", "")
-    assert splitter.flush() == "</thin"
-    # flush drains: a second call must not replay the same text.
-    assert splitter.flush() == ""
-
-
-def test_stream_splitter_passes_non_thinking_text_straight_through():
-    splitter = _ReasoningStreamSplitter(False)
-    assert splitter.feed("write </think> to close") == ("", "write </think> to close")
-    assert splitter.flush() == ""
+@pytest.mark.parametrize("thinking", [True, False])
+@pytest.mark.parametrize(
+    "text",
+    [
+        "weighing it up</think>the answer",
+        "<think>weighing it up</think>the answer",
+        "thinking</thin",
+        "think</think>say </think> to close",
+    ],
+)
+def test_shared_stream_splitter_matches_complete_response_at_every_boundary(thinking, text):
+    expected_reasoning, expected_content = split_reasoning(text, thinking=thinking)
+    for cut in range(len(text) + 1):
+        splitter = ReasoningDeltaSplitter(thinking=thinking)
+        events = splitter.feed(text[:cut]) + splitter.feed(text[cut:]) + splitter.finish()
+        reasoning = "".join(value for kind, value in events if kind == "reasoning_content")
+        content = "".join(value for kind, value in events if kind == "content")
+        assert (reasoning, content) == (expected_reasoning or "", expected_content)
+        assert splitter.finish() == []
 
 
 # ------------------------------------------------------------------------------------------
@@ -260,11 +236,27 @@ def test_chat_stream_without_thinking_emits_only_content_deltas():
     assert content == "write </think> to close"
 
 
-def test_chat_stream_without_a_ready_event_does_not_split():
-    """No ready event means the rendered mode is unknown. Reporting non-thinking keeps the answer
-    intact rather than guessing from the record and risking a torn completion."""
-    pool = _NoReadyPool("", thinking=True, deltas=["weighing</think>the answer"])
-    deltas = _stream_deltas(_client(pool))
-    assert all("reasoning_content" not in d for d in deltas)
-    content = "".join(d["content"] for d in deltas if "content" in d)
-    assert content == "weighing</think>the answer"
+def test_chat_stream_accepts_attested_delta_without_ready_event() -> None:
+    pool = _NoReadyPool()
+    client = _client(pool, thinking=False)
+
+    with client.stream(
+        "POST",
+        "/v1/chat/completions",
+        json={"model": "qa/final", "messages": [{"role": "user", "content": "hi"}], "stream": True},
+    ) as response:
+        assert response.status_code == 200
+        assert response.headers["X-Freesolo-Checkpoint"] == "qa/final"
+        assert response.headers["X-Freesolo-LoRA-Request-Adapter"] == "qa/final"
+        body = response.read().decode("utf-8")
+
+    assert pool.first_event["checkpoint"] == "qa/final"
+    assert pool.first_event["lora_request_adapter"] == "qa/final"
+    payloads = [
+        json.loads(line.removeprefix("data: "))
+        for line in body.splitlines()
+        if line.startswith("data: ") and line != "data: [DONE]"
+    ]
+    deltas = [payload["choices"][0]["delta"] for payload in payloads]
+    assert all("reasoning_content" not in delta for delta in deltas)
+    assert "".join(delta.get("content", "") for delta in deltas) == "write </think> verbatim"

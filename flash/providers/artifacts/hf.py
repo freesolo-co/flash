@@ -3,7 +3,7 @@
 The control plane observes a remote worker purely through the artifacts it uploads to a private HF
 dataset repo: rate-limited text/JSON readers for ``heartbeat.json`` / ``error_*.txt`` / console logs,
 plus the provenance predicates that decide whether a heartbeat belongs to THIS attempt or a leftover
-prior one. None of this is provider-specific — RunPod, Lambda, and Vast all poll the same artifact
+prior one. None of this is provider-specific — Modal all poll the same artifact
 shape — so it lives here in the shared kernel and no provider package imports another for it.
 
 The worker-side bootstrap (``_instance_bootstrap``) cannot import flash, so it re-implements the
@@ -17,22 +17,29 @@ import math
 import os
 import time
 from collections.abc import Callable
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
 from logging import Logger
-from typing import TypeVar
+from typing import Protocol, TypeVar
 
 from flash._internal.diagnostics import sanitize_diagnostic
 from flash.adapters.artifacts import attempt_scoped_artifact_name
-from flash.providers._lifecycle.deadline import (
-    deadline_kwargs,
+from flash.engine.support.verl_checkpoint import (
+    VERL_FSDP_CONFIG_FILE,
+    FsdpCheckpointInspection,
+    FsdpManifestFile,
+    expected_native_fsdp_shard_names,
+    inspect_fsdp_checkpoint_manifest,
+    parse_fsdp_stamp,
+)
+from flash.providers._lifecycle.instances.poll import _attempt_int
+from flash.providers._lifecycle.net.deadline import (
     remaining_seconds,
     require_deadline_at,
 )
-from flash.providers._lifecycle.poll import _attempt_int
 from flash.teacher.retry_contract import (
     decode_opd_optimizer_start_json,
-    opd_checkpoint_world_size,
     opd_optimizer_start_marker_path,
     opd_resume_checkpoint_complete,
     require_opd_retry_contract_version,
@@ -40,47 +47,204 @@ from flash.teacher.retry_contract import (
 )
 
 
-def _opd_resume_checkpoint_step(
-    api, *, hf_repo: str, phase: str, run_id: str, revision: str
-) -> tuple[int, int | None] | None:
-    """The newest filename-complete OPD checkpoint step at the pinned revision, and its world size.
+@dataclass(frozen=True)
+class _RemoteResumeCheckpoint:
+    step: int
+    prefix: str
+    inspection: FsdpCheckpointInspection
 
-    The world size rides along because it comes from the same listing: the shards are nested under
-    the step directory, so reading it separately would repeat this call. ``None`` for the width
-    means the shard names did not agree on one -- the caller decides what an unreadable topology
-    costs, rather than this guessing a number a retry would then be pinned to.
-    """
+
+def _download_pinned_hf_bytes(
+    hf_repo: str,
+    path: str,
+    *,
+    revision: str,
+    token: str | None,
+) -> bytes:
+    """download one pinned private dataset artifact and return its bytes."""
+    from huggingface_hub import hf_hub_download
+
+    local_path = hf_hub_download(
+        repo_id=hf_repo,
+        repo_type="dataset",
+        filename=path,
+        revision=revision,
+        token=token,
+        force_download=True,
+    )
+    with open(local_path, "rb") as file:
+        return file.read()
+
+
+def _transported_checkpoint_files(api, *, hf_repo, prefix, paths, revision, token):
+    """Prove all chunk members at the pinned revision before admitting a resume."""
+    from flash.engine.support.checkpoint_transport import MANIFEST, parse_manifest
+
+    manifest_path = f"{prefix}/{MANIFEST}"
+    if manifest_path not in paths:
+        return {}
+    raw = _download_pinned_hf_bytes(hf_repo, manifest_path, revision=revision, token=token)
+    if len(raw) > 4 * 1024 * 1024:
+        raise ValueError("checkpoint transport manifest is too large")
+    files = parse_manifest(raw)
+    expected = {}
+    for name, entry in files.items():
+        if f"{prefix}/{name}" in paths:
+            raise ValueError("checkpoint contains both native and transported file")
+        for part in entry["parts"]:
+            path = f"{prefix}/{part['path']}"
+            if path not in paths or path in expected:
+                raise ValueError("checkpoint transport part is missing or duplicated")
+            expected[path] = part["size"]
+    infos = api.get_paths_info(
+        repo_id=hf_repo, paths=list(expected), repo_type="dataset", revision=revision
+    )
+    actual = {}
+    for info in infos:
+        path = getattr(info, "path", None)
+        size = getattr(info, "size", None)
+        if path not in expected or path in actual or type(size) is not int:
+            raise ValueError("checkpoint transport metadata is ambiguous")
+        actual[path] = size
+    if actual != expected:
+        raise ValueError("checkpoint transport part length mismatch")
+    return {name: entry["size"] for name, entry in files.items()}
+
+
+def _opd_resume_checkpoint(
+    api,
+    *,
+    hf_repo: str,
+    phase: str,
+    run_id: str,
+    revision: str,
+    token: str | None,
+) -> _RemoteResumeCheckpoint | None:
+    """Inspect the newest canonical OPD checkpoint at one pinned revision."""
     base = f"{phase}/{run_id}/checkpoint/"
     try:
-        files = api.list_repo_files(repo_id=hf_repo, repo_type="dataset", revision=revision)
+        paths = api.list_repo_files(repo_id=hf_repo, repo_type="dataset", revision=revision)
     except Exception:
         return None
     by_step: dict[int, set[str]] = {}
-    nested: dict[int, list[str]] = {}
-    for path in files:
+    actor_names: dict[int, list[str]] = {}
+    for path in paths:
         if not isinstance(path, str) or not path.startswith(base):
             continue
-        seg, sep, tail = path[len(base) :].partition("/")
-        if not sep or not tail or not seg.startswith("checkpoint-"):
+        segment, separator, tail = path[len(base) :].partition("/")
+        if not separator or not tail or not segment.startswith("checkpoint-"):
             continue
-        suffix = seg[len("checkpoint-") :]
+        suffix = segment[len("checkpoint-") :]
         if not suffix.isdigit():
             continue
         step = int(suffix)
         if step <= 0 or suffix != str(step):
             continue
-        if "/" in tail:
-            # the fsdp shards sit one level down (`actor/model_world_size_W_rank_R.pt`), so they
-            # are collected separately: only DIRECT children count toward filename completeness.
-            nested.setdefault(step, []).append(tail)
-            continue
-        by_step.setdefault(step, set()).add(tail)
+        if "/" not in tail:
+            by_step.setdefault(step, set()).add(tail)
+        elif tail.startswith("actor/") and "/" not in tail[len("actor/") :]:
+            actor_names.setdefault(step, []).append(tail[len("actor/") :])
     if not by_step:
         return None
     step = max(by_step)
     if not opd_resume_checkpoint_complete(by_step[step]):
         return None
-    return step, opd_checkpoint_world_size(nested.get(step, ()))
+    prefix = f"{base}checkpoint-{step}"
+    try:
+        transported = _transported_checkpoint_files(
+            api, hf_repo=hf_repo, prefix=prefix, paths=paths, revision=revision, token=token
+        )
+    except Exception:
+        return None
+    stamp_path = f"{prefix}/actor/{VERL_FSDP_CONFIG_FILE}"
+    try:
+        stamp_raw = _download_pinned_hf_bytes(
+            hf_repo,
+            stamp_path,
+            revision=revision,
+            token=token,
+        )
+    except Exception:
+        stamp_raw = None
+    stamp = parse_fsdp_stamp(stamp_raw)
+    sizes: dict[str, int | None] = {}
+    names = actor_names.get(step, [])
+    transported_sizes = {
+        name.removeprefix("actor/"): size
+        for name, size in transported.items()
+        if name.startswith("actor/") and "/" not in name.removeprefix("actor/")
+    }
+    names.extend(transported_sizes)
+    if stamp is not None:
+        _generation, width = stamp
+        expected_names = expected_native_fsdp_shard_names(width)
+        expected_paths = [
+            f"{prefix}/actor/{name}" for name in expected_names if name not in transported_sizes
+        ]
+        try:
+            infos = api.get_paths_info(
+                repo_id=hf_repo,
+                paths=expected_paths,
+                repo_type="dataset",
+                revision=revision,
+            )
+            for info in infos:
+                path = str(getattr(info, "path", ""))
+                name = path.rsplit("/", 1)[-1]
+                if path not in expected_paths or name in sizes:
+                    raise ValueError("HF returned ambiguous checkpoint shard evidence")
+                size = getattr(info, "size", None)
+                sizes[name] = (
+                    size if isinstance(size, int) and not isinstance(size, bool) and size > 0 else 0
+                )
+        except Exception:
+            sizes = dict.fromkeys(expected_names, 0)
+        sizes.update(transported_sizes)
+        for name in expected_names:
+            if name not in sizes:
+                sizes[name] = 0
+    inspection = inspect_fsdp_checkpoint_manifest(
+        stamp_raw,
+        [FsdpManifestFile(name, sizes.get(name)) for name in names],
+        expected_world_size=None,
+    )
+    return _RemoteResumeCheckpoint(step, prefix, inspection)
+
+
+def _validate_opd_optimizer_start_markers(
+    *,
+    hf_repo: str,
+    paths: list[str],
+    present: dict[str, object],
+    revision: str,
+    token: str | None,
+    run_id: str,
+    seed: int,
+    version: int,
+) -> None:
+    """download and decode every optimizer-start marker found at the pinned revision."""
+    for attempt, path in enumerate(paths):
+        if path not in present:
+            continue
+        try:
+            raw = _download_pinned_hf_bytes(
+                hf_repo,
+                path,
+                revision=revision,
+                token=token,
+            )
+            decode_opd_optimizer_start_json(
+                raw,
+                run_id=run_id,
+                attempt=attempt,
+                seed=seed,
+                version=version,
+            )
+        except Exception as exc:
+            raise RuntimeError(
+                "opd retry evidence is unverifiable; replacement is blocked"
+            ) from exc
+        # one validated marker proves mutation; keep validating every present marker.
 
 
 def verify_opd_replacement_safe(
@@ -101,11 +265,9 @@ def verify_opd_replacement_safe(
     evidence, or any listing/download/parse uncertainty.
 
     Returns ``None`` when nothing mutated, else ``(revision, world_size)``. The world size is the
-    rank count that wrote the pinned checkpoint, and the retry MUST be allocated at it: the worker
-    fails closed when a pinned resume's fsdp width does not match the attempt's, so a retry that
-    re-ranked onto a different card count would permanently reject the only checkpoint it is
-    authorized to continue from. ``None`` means the shards named no single width, which the caller
-    treats as "do not constrain" rather than inventing one.
+    validated stamped rank count, and the retry MUST be allocated at it: the worker fails closed when
+    a pinned resume's fsdp width does not match the attempt's, so a retry that re-ranked onto a
+    different card count would permanently reject the only checkpoint it is authorized to continue.
     """
     try:
         version = require_opd_retry_contract_version(contract_version)
@@ -157,65 +319,47 @@ def verify_opd_replacement_safe(
         ) from exc
     if not present:
         return None
-    mutated = False
-    for attempt, path in enumerate(paths):
-        if path not in present:
-            continue
-        try:
-            from huggingface_hub import hf_hub_download
-
-            local_path = hf_hub_download(
-                repo_id=hf_repo,
-                repo_type="dataset",
-                filename=path,
-                revision=revision,
-                token=token,
-                force_download=True,
-            )
-            with open(local_path, "rb") as file:
-                raw = file.read()
-            decode_opd_optimizer_start_json(
-                raw,
-                run_id=run_id,
-                attempt=attempt,
-                seed=seed,
-                version=version,
-            )
-        except Exception as exc:
-            raise RuntimeError(
-                "opd retry evidence is unverifiable; replacement is blocked"
-            ) from exc
-        # one validated marker proves mutation; keep validating every present marker.
-        mutated = True
-    if not mutated:
-        return None
-    # a validated optimizer-start marker proves some attempt crossed the first optimizer.step(). allow
-    # replacement only when the newest canonical checkpoint is filename-complete and its lightweight
-    # metadata validates at the same pinned revision. tensor, optimizer, rng, tokenizer, and model checks
-    # remain worker-side.
-    selected = _opd_resume_checkpoint_step(
-        api, hf_repo=hf_repo, phase=phase, run_id=run_id, revision=revision
+    _validate_opd_optimizer_start_markers(
+        hf_repo=hf_repo,
+        paths=paths,
+        present=present,
+        revision=revision,
+        token=token,
+        run_id=run_id,
+        seed=seed,
+        version=version,
+    )
+    # the replacement gate uses the same dependency-light native manifest invariants as worker
+    # preflight. tensor deserialization remains worker-side.
+    selected = _opd_resume_checkpoint(
+        api,
+        hf_repo=hf_repo,
+        phase=phase,
+        run_id=run_id,
+        revision=revision,
+        token=token,
     )
     if selected is None:
         raise RuntimeError(
             "opd optimizer state may have mutated and no complete resume checkpoint is available; "
             "replacement is blocked"
         )
-    checkpoint_step, checkpoint_world_size = selected
-    state_path = f"{phase}/{run_id}/checkpoint/checkpoint-{checkpoint_step}/opd_state.json"
-    try:
-        from huggingface_hub import hf_hub_download
-
-        local_path = hf_hub_download(
-            repo_id=hf_repo,
-            repo_type="dataset",
-            filename=state_path,
-            revision=revision,
-            token=token,
-            force_download=True,
+    if not selected.inspection.loadable:
+        raise RuntimeError(
+            "opd resume checkpoint native manifest is unverifiable: "
+            f"{selected.inspection.diagnostic()}; replacement is blocked"
         )
-        with open(local_path, encoding="utf-8") as file:
-            state = json.load(file)
+    checkpoint_step = selected.step
+    state_path = f"{selected.prefix}/opd_state.json"
+    try:
+        state = json.loads(
+            _download_pinned_hf_bytes(
+                hf_repo,
+                state_path,
+                revision=revision,
+                token=token,
+            )
+        )
         validate_opd_resume_state_metadata(
             state,
             expected_seed=seed,
@@ -225,7 +369,13 @@ def verify_opd_replacement_safe(
         raise RuntimeError(
             "opd resume checkpoint metadata is unverifiable; replacement is blocked"
         ) from exc
-    return revision, checkpoint_world_size
+    return revision, selected.inspection.width
+
+
+class TextArtifactReader(Protocol):
+    """Read one artifact, allowing a bounded caller to override the captured deadline."""
+
+    def __call__(self, force: bool = False, *, deadline_at: float | None = None) -> str | None: ...
 
 
 def make_hf_text_reader(
@@ -234,7 +384,7 @@ def make_hf_text_reader(
     min_interval_s: float = 45.0,
     *,
     deadline_at: float | None = None,
-):
+) -> TextArtifactReader:
     """Rate-limited reader for an HF artifact; returns None until it exists or on any error."""
     deadline = require_deadline_at(deadline_at) if deadline_at is not None else None
     state = {"last": 0.0}
@@ -280,7 +430,7 @@ def make_hf_heartbeat_reader(
         hf_repo,
         f"{prefix}/heartbeat.json",
         min_interval_s,
-        **deadline_kwargs(make_hf_text_reader, deadline_at),
+        deadline_at=deadline_at,
     )
 
     def read(force: bool = False, *, deadline_at: float | None = deadline_at) -> dict | None:
@@ -302,7 +452,7 @@ def heartbeat_reader_for(spec, *, deadline_at: float | None = None):
         make_hf_heartbeat_reader(
             hf_repo,
             f"{spec.phase}/{spec.run_id}",
-            **deadline_kwargs(make_hf_heartbeat_reader, deadline_at),
+            deadline_at=deadline_at,
         )
         if hf_repo
         else None
@@ -335,19 +485,19 @@ def make_hf_failure_detail_reader(
         hf_repo,
         f"{prefix}/{err_name}",
         min_interval_s,
-        **deadline_kwargs(make_hf_text_reader, deadline_at),
+        deadline_at=deadline_at,
     )
     console_reader = make_hf_text_reader(
         hf_repo,
         f"{prefix}/console_{phase}.txt",
         min_interval_s,
-        **deadline_kwargs(make_hf_text_reader, deadline_at),
+        deadline_at=deadline_at,
     )
     live_console_reader = make_hf_text_reader(
         hf_repo,
         f"{prefix}/{live_console_name}",
         min_interval_s,
-        **deadline_kwargs(make_hf_text_reader, deadline_at),
+        deadline_at=deadline_at,
     )
 
     def read(force: bool = False) -> str | None:

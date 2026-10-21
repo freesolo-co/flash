@@ -31,6 +31,7 @@ from flash.client.freesolo_api import (
     verify_freesolo_key,
 )
 from flash.client.http import ApiError, ClientError, RequestTimeoutError
+from tests._helpers.wire_headers import sent_headers
 
 _PROJECT_ID = "11111111-1111-4111-8111-111111111111"
 
@@ -114,7 +115,7 @@ def test_verify_key_sends_a_bearer_get_and_accepts_a_2xx(monkeypatch):
     seen = {}
 
     def urlopen(req, timeout=None):
-        seen.update(method=req.method, url=req.full_url, headers=dict(req.headers))
+        seen.update(method=req.method, url=req.full_url, headers=sent_headers(req))
         return _Response({})
 
     monkeypatch.setattr("urllib.request.urlopen", urlopen)
@@ -230,7 +231,7 @@ def test_request_sends_the_body_as_json_and_omits_it_when_absent(monkeypatch):
     seen = []
 
     def urlopen(req, timeout=None):
-        seen.append((req.method, req.data, dict(req.headers), timeout))
+        seen.append((req.method, req.data, sent_headers(req), timeout))
         return _Response({})
 
     monkeypatch.setattr("urllib.request.urlopen", urlopen)
@@ -240,7 +241,7 @@ def test_request_sends_the_body_as_json_and_omits_it_when_absent(monkeypatch):
 
     assert seen[0][1] is None
     assert json.loads(seen[1][1]) == {"name": "n"}
-    assert seen[1][2]["Content-type"] == "application/json"
+    assert seen[1][2]["Content-Type"] == "application/json"
     assert seen[1][3] == 7.0
 
 

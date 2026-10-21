@@ -9,6 +9,6 @@ from __future__ import annotations
 
 def run_rl():
     """Run GRPO on verl."""
-    from flash.engine.worker.rl_train import run_rl_train
+    from flash.engine.worker.train.entry.rl_train import run_rl_train
 
     run_rl_train()

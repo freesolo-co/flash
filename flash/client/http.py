@@ -15,6 +15,13 @@ from collections.abc import Iterator, Mapping
 from typing import Any
 
 from flash._internal.channel import CLI_NAME
+from flash._internal.http import _urlopen_no_redirect
+from flash._internal.openai_sse import (
+    DeltaEvent,
+    ErrorEvent,
+    OpenAISSEError,
+    iter_openai_sse_events,
+)
 from flash.client.config import load_credentials_with_source
 from flash.client.shapes import RequireSpec, matches_require
 from flash.client.streaming import (
@@ -25,7 +32,8 @@ from flash.client.streaming import (
     _read_response_body,
 )
 from flash.core.spec import require_project_id
-from flash.serve.urls import is_freesolo_hosted_url
+from flash.serve.contract.urls import is_freesolo_hosted_url
+from flash.serve.request.tool_calls import validate_tool_control_presence
 
 
 class ClientError(RuntimeError):
@@ -142,7 +150,11 @@ def _detail_from_http_error(exc: urllib.error.HTTPError) -> object:
     A structured detail stays a dict so the caller can read its ``code``; anything else is the
     string it always was. ``str()`` it for a message, but branch on the object itself.
     """
-    body = exc.read()
+    try:
+        body = exc.read()
+    except (OSError, http.client.HTTPException):
+        # The status is authoritative even when the peer closes its error body early.
+        return str(exc)
     try:
         detail = json.loads(body).get("detail") or body.decode()
     except (ValueError, AttributeError):
@@ -181,8 +193,6 @@ from flash.client.freesolo_api import list_trace_projects as list_trace_projects
 from flash.client.freesolo_api import upload_eval_run as upload_eval_run  # noqa: E402
 from flash.client.freesolo_api import verify_freesolo_key as verify_freesolo_key  # noqa: E402
 
-_CHAT_STEP_SELECTOR_CAPABILITY = "chat_step_selector_v1"
-
 
 def _validate_chat_messages(messages: list[dict]) -> None:
     if not isinstance(messages, list):
@@ -192,20 +202,13 @@ def _validate_chat_messages(messages: list[dict]) -> None:
             raise ClientError(f"chat messages[{index}] must be an object")
 
 
-def _parse_chat_target(target: str) -> tuple[str, str | None, int | None]:
-    from flash.schema import parse_adapter_revision, parse_checkpoint_ref
+def _parse_chat_target(target: str) -> tuple[str, str]:
+    from flash.schema import parse_checkpoint_ref
 
-    revision = parse_adapter_revision(target)
-    if revision is not None:
-        return revision[0], target.strip(), None
     parsed = parse_checkpoint_ref(target)
     if parsed is None:
-        raise ClientError(
-            "invalid run id: expected a bare RUN_ID, RUN_ID/step-N, or a full immutable adapter "
-            "revision"
-        )
-    run_id, step = parsed
-    return run_id, None, step
+        raise ClientError("invalid checkpoint id: expected RUN_ID/final or RUN_ID/step-N")
+    return parsed[0], target
 
 
 def _prepare_chat_request(
@@ -215,21 +218,67 @@ def _prepare_chat_request(
     max_tokens: int,
     *,
     stream: bool = False,
+    tools: list[dict[str, Any]] | None = None,
+    tool_choice: str | None = None,
+    parallel_tool_calls: bool | None = None,
 ) -> tuple[str, dict[str, Any]]:
-    base_run_id, adapter_revision, step = _parse_chat_target(target)
+    base_run_id, checkpoint_id = _parse_chat_target(target)
     _validate_chat_messages(messages)
+    validate_tool_control_presence(
+        tools,
+        tool_choice,
+        parallel_tool_calls,
+        error_type=ClientError,
+    )
     body: dict[str, Any] = {
+        "checkpoint_id": checkpoint_id,
         "messages": messages,
         "temperature": temperature,
         "max_tokens": max_tokens,
     }
     if stream:
         body["stream"] = True
-    if adapter_revision is not None:
-        body["adapter_revision"] = adapter_revision
-    elif step is not None:
-        body["step"] = step
+    if tools is not None:
+        body["tools"] = tools
+        body["tool_choice"] = "auto" if tool_choice is None else tool_choice
+        body["parallel_tool_calls"] = True if parallel_tool_calls is None else parallel_tool_calls
     return base_run_id, body
+
+
+def _openai_sse_text(chunks: Iterator[str]) -> Iterator[str]:
+    """render normalized openai events for cli and environment evaluation."""
+
+    reasoning_open = False
+    reasoning_done = False
+    try:
+        for event in iter_openai_sse_events(chunks):
+            if isinstance(event, ErrorEvent):
+                if reasoning_open:
+                    reasoning_open = False
+                    yield "</think>"
+                raise ClientError(event.message)
+            if not isinstance(event, DeltaEvent):
+                continue
+            reasoning = event.reasoning_content
+            if reasoning is not None:
+                if not reasoning_open and not (reasoning_done and not reasoning):
+                    reasoning_open = True
+                    yield "<think>"
+                if reasoning:
+                    yield reasoning
+            content = event.content
+            if content:
+                if reasoning_open:
+                    reasoning_open = False
+                    reasoning_done = True
+                    yield "</think>"
+                yield content
+    except OpenAISSEError as exc:
+        if reasoning_open:
+            yield "</think>"
+        raise ClientError(str(exc)) from exc
+    if reasoning_open:
+        yield "</think>"
 
 
 def _parse_adapter_target(target: str) -> tuple[str, int | None]:
@@ -237,10 +286,7 @@ def _parse_adapter_target(target: str) -> tuple[str, int | None]:
 
     parsed = parse_checkpoint_ref(target)
     if parsed is None:
-        raise ClientError(
-            "invalid adapter id: expected RUN_ID for the final adapter or RUN_ID/step-N "
-            "for a saved checkpoint"
-        )
+        raise ClientError("invalid checkpoint id: expected RUN_ID/final or RUN_ID/step-N")
     return parsed
 
 
@@ -256,7 +302,6 @@ class ApiClient:
         self.api_key = api_key
         self.timeout = timeout
         self.key_source = key_source
-        self._chat_step_selector_available = False
 
     def _auth_headers(self) -> dict[str, str]:
         if self.api_key:
@@ -298,6 +343,12 @@ class ApiClient:
             raise RequestTimeoutError(
                 f"request to the Flash service at {self.api_url} timed out; "
                 "check your network connection and FLASH_API_URL"
+            ) from exc
+        except http.client.RemoteDisconnected as exc:
+            raise ServiceUnreachableError(
+                f"the Flash service at {self.api_url} closed the connection without a response; "
+                "check service health and FLASH_API_URL. The request may have been accepted; "
+                "check its status before submitting it again"
             ) from exc
 
     def _decode_response(
@@ -382,7 +433,7 @@ class ApiClient:
         deadline = time.monotonic() + body_deadline if body_deadline is not None else None
         with (
             self._translate_http_errors(),
-            urllib.request.urlopen(
+            _urlopen_no_redirect(
                 req, timeout=_capped_timeout(timeout or self.timeout, deadline)
             ) as resp,
         ):
@@ -409,7 +460,7 @@ class ApiClient:
         )
         with (
             self._translate_http_errors(),
-            urllib.request.urlopen(req, timeout=timeout or self.timeout) as resp,
+            _urlopen_no_redirect(req, timeout=timeout or self.timeout) as resp,
         ):
             if max_bytes is not None:
                 return _read_capped_response(resp, max_bytes)
@@ -420,36 +471,6 @@ class ApiClient:
 
     def health(self) -> dict:
         return self._request("GET", "/v1/health", timeout=10.0)
-
-    def _require_chat_step_selector(self) -> None:
-        # cached after it first succeeds: this is a property of the control plane, not of the
-        # request. `env eval` sends one chat per case, so re-checking each time doubled the request
-        # count and let a single transient /v1/health blip fail an arbitrary case while the chat
-        # endpoint was healthy.
-        if self._chat_step_selector_available:
-            return
-        capabilities = self.health().get("capabilities")
-        if not isinstance(capabilities, list) or _CHAT_STEP_SELECTOR_CAPABILITY not in capabilities:
-            raise ClientError(
-                "chat checkpoint selectors require a control plane that advertises "
-                f"{_CHAT_STEP_SELECTOR_CAPABILITY}; use a full immutable adapter revision or "
-                "upgrade the control plane"
-            )
-        # only a successful capability check is cached, so a transient failure remains visible and
-        # retryable. concurrent first calls may make the same benign request twice; a lock would add
-        # coordination to every client solely to optimize that one startup race, so a caller about to
-        # fan out settles it up front instead (see `warm_chat_step_selector`).
-        self._chat_step_selector_available = True
-
-    def warm_chat_step_selector(self, target: str) -> None:
-        """Settle the step-selector capability now, so concurrent callers inherit the cached answer.
-
-        A caller about to run many chats in parallel would otherwise have every worker miss the cold
-        cache at once and fire its own /v1/health. Only a `RUN/step-N` target needs the
-        capability, so anything else is a no-op. Raises exactly what the per-request check raises.
-        """
-        if _parse_chat_target(target)[2] is not None:
-            self._require_chat_step_selector()
 
     def publish_env(
         self,
@@ -483,7 +504,7 @@ class ApiClient:
         # nonblank but unusable one (`my-env`, `acme/env`, unsafe path characters) would be
         # advertised as usable and then fail at submit. Validated with the managed parser itself
         # rather than a second predicate here, so the two cannot drift apart.
-        from flash.envs.loader import _parse_managed_environment_slug
+        from flash.envs.loading.loader import _parse_managed_environment_slug
 
         ids: list[str] = []
         for row in rows:
@@ -528,7 +549,7 @@ class ApiClient:
 
     def download_env_package(self, env_id: str) -> bytes:
         """Download a managed environment package through the Flash control plane."""
-        from flash.envs import loader
+        from flash.envs.loading import loader
 
         quoted = urllib.parse.quote(env_id, safe="/")
         return self._request_bytes(
@@ -605,15 +626,22 @@ class ApiClient:
                 pass
             else:
                 last_state = str(status.get("state") or "unknown")
-                deployment = status.get("deployment") or {}
-                terminal = last_state in {"cancelled", "done", "failed", "dry_run"}
-                revocation_failed = (
-                    isinstance(deployment, dict) and deployment.get("state") == "revocation_failed"
+                deployment = next(
+                    (
+                        record
+                        for record in (status.get("deployments") or {}).values()
+                        if record.get("state") == "cleanup_pending"
+                    ),
+                    {},
                 )
-                if terminal and revocation_failed:
+                terminal = last_state in {"cancelled", "done", "failed", "dry_run"}
+                cleanup_pending = (
+                    isinstance(deployment, dict) and deployment.get("state") == "cleanup_pending"
+                )
+                if terminal and cleanup_pending:
                     error = deployment.get("error") or "unknown backend teardown error"
                     raise ClientError(
-                        "cancel request reached the control plane, but backend revocation is "
+                        "cancel request reached the control plane, but backend cleanup is "
                         f"unconfirmed: {error}; retry cancellation"
                     ) from cause
                 if terminal:
@@ -636,11 +664,12 @@ class ApiClient:
         run_id: str,
         dry_run: bool = False,
     ) -> dict:
-        base_run_id, step = _parse_adapter_target(run_id)
+        base_run_id, _ = _parse_adapter_target(run_id)
         # smoke verification is mandatory server-side; there is no opt-out to forward.
-        body: dict = {"dry_run": dry_run}
-        if step is not None:
-            body["step"] = step
+        body: dict = {
+            "dry_run": dry_run,
+            "checkpoint_id": run_id,
+        }
         return self._request(
             "POST",
             f"/v1/runs/{base_run_id}/deploy",
@@ -656,14 +685,19 @@ class ApiClient:
         private: bool = True,
     ) -> dict:
         """Copy a run's adapter into a user-owned HuggingFace repo."""
-        base_run_id, step = _parse_adapter_target(run_id)
-        body: dict = {"repository": repository, "hf_token": hf_token, "private": private}
-        if step is not None:
-            body["step"] = step
+        base_run_id, _ = _parse_adapter_target(run_id)
+        body: dict = {
+            "repository": repository,
+            "hf_token": hf_token,
+            "private": private,
+            "checkpoint_id": run_id,
+        }
         return self._request("POST", f"/v1/runs/{base_run_id}/export", body=body, timeout=30 * 60)
 
-    def undeploy(self, run_id: str) -> dict:
-        return self._request("DELETE", f"/v1/runs/{run_id}/deploy")
+    def undeploy(self, checkpoint_id: str) -> dict:
+        run_id, checkpoint_id = _parse_chat_target(checkpoint_id)
+        quoted = urllib.parse.quote(checkpoint_id, safe="")
+        return self._request("DELETE", f"/v1/runs/{run_id}/deploy?checkpoint_id={quoted}")
 
     def deployments(self, timeout: float | None = None) -> list[dict]:
         return self._request(
@@ -672,12 +706,12 @@ class ApiClient:
 
     def _serving_deployment(
         self,
-        base_run_id: str,
+        checkpoint_id: str,
         timeout: float | None,
         *,
         body_deadline: float | None = None,
     ) -> dict | None:
-        """The run's servable deployment record, or None when it has none.
+        """The exact checkpoint deployment record, or None when it has none.
 
         Read from the run-scoped route rather than the listing. `/v1/deployments` walks every run
         the key owns and loads each one's status before a caller picks a single record out, so on
@@ -691,10 +725,12 @@ class ApiClient:
         ``env_list``). ``--wait`` polling deliberately does not: it owns a deadline spanning many
         reads and recomputes each one's share.
         """
+        base_run_id, _ = _parse_adapter_target(checkpoint_id)
+        quoted = urllib.parse.quote(checkpoint_id, safe="")
         try:
             deployment = self._request(
                 "GET",
-                f"/v1/runs/{base_run_id}/deploy",
+                f"/v1/runs/{base_run_id}/deploy?checkpoint_id={quoted}",
                 timeout=timeout,
                 body_deadline=body_deadline,
             )
@@ -718,7 +754,9 @@ class ApiClient:
             deployment = {**deployment, "run_id": base_run_id}
         return deployment
 
-    def deployment_for(self, run_id: str, timeout: float | None = None) -> dict | None:
+    def deployment_for(
+        self, run_id: str, timeout: float | None = None, *, body_deadline: float | None = None
+    ) -> dict | None:
         """The deployment record for the checkpoint named in ``run_id``, or None.
 
         ``deploy`` returns as soon as the record is persisted, which is normally before the
@@ -729,39 +767,13 @@ class ApiClient:
         that: the default client timeout is 60s, so one stalled read inside a `--wait 5` would
         overshoot the bound the user asked for by an order of magnitude.
         """
-        base_run_id, step = _parse_adapter_target(run_id)
-        deployment = self._serving_deployment(base_run_id, timeout)
+        deployment = self._serving_deployment(run_id, timeout, body_deadline=body_deadline)
         if deployment is None:
             return None
-        # the requested step is part of the identity, not decoration. matching on the run id
-        # alone lets `deploy RUN/step-40 --wait` settle on whichever revision happens to be
-        # deployed -- an older one still marked ready, or a replacement another shell deployed
-        # mid-wait -- and report that as this caller's own revision.
-        if "checkpoint_step" in deployment:
-            listed = deployment.get("checkpoint_step")
-            # None is the final adapter, an int is RUN/step-N (see the deployments renderer).
-            if (listed if listed is None else int(listed)) != step:
-                return None
+        # the exact checkpoint identity must match the caller's requested target.
+        if deployment.get("checkpoint_id") != run_id:
+            return None
         return deployment
-
-    def deployed_checkpoint(
-        self,
-        run_id: str,
-        timeout: float | None = None,
-        *,
-        body_deadline: float | None = None,
-    ) -> dict | None:
-        """Whatever checkpoint the run serves right now, whichever step that is.
-
-        The counterpart to ``deployment_for``, which answers the narrower "is MY revision live?"
-        and hides any other. A caller about to deploy needs the opposite: the record it is about
-        to displace is by definition the one the step filter drops.
-
-        ``body_deadline`` bounds the whole read in wall-clock time; ``timeout`` alone bounds each
-        socket operation, which a peer trickling bytes just inside it can extend without limit.
-        """
-        base_run_id, _ = _parse_adapter_target(run_id)
-        return self._serving_deployment(base_run_id, timeout, body_deadline=body_deadline)
 
     def chat(
         self,
@@ -770,15 +782,20 @@ class ApiClient:
         temperature: float = 0.0,
         max_tokens: int = 512,
         timeout: float | None = None,
+        *,
+        tools: list[dict[str, Any]] | None = None,
+        tool_choice: str | None = None,
+        parallel_tool_calls: bool | None = None,
     ) -> dict:
         base_run_id, body = _prepare_chat_request(
             run_id,
             messages,
             temperature,
             max_tokens,
+            tools=tools,
+            tool_choice=tool_choice,
+            parallel_tool_calls=parallel_tool_calls,
         )
-        if "step" in body:
-            self._require_chat_step_selector()
         return self._request(
             "POST",
             f"/v1/runs/{base_run_id}/chat",
@@ -792,7 +809,11 @@ class ApiClient:
         messages: list[dict],
         temperature: float = 0.0,
         max_tokens: int = 512,
+        *,
+        tools: list[dict[str, Any]] | None = None,
     ) -> Iterator[str]:
+        if tools is not None:
+            raise ValueError("decoded chat_stream does not support tools")
         base_run_id, body = _prepare_chat_request(
             run_id,
             messages,
@@ -800,8 +821,6 @@ class ApiClient:
             max_tokens,
             stream=True,
         )
-        if "step" in body:
-            self._require_chat_step_selector()
         headers = {"Content-Type": "application/json", **self._auth_headers()}
         req = urllib.request.Request(
             f"{self.api_url}/v1/runs/{base_run_id}/chat",
@@ -812,10 +831,11 @@ class ApiClient:
         decoder = codecs.getincrementaldecoder("utf-8")()
         with (
             self._translate_http_errors(),
-            urllib.request.urlopen(req, timeout=30 * 60) as resp,
+            _urlopen_no_redirect(req, timeout=30 * 60) as resp,
         ):
             content_type = resp.headers.get("Content-Type", "")
-            if "application/json" in content_type:
+            media_type = content_type.partition(";")[0].strip().lower()
+            if media_type == "application/json":
                 payload = self._decode_response(
                     f"/v1/runs/{base_run_id}/chat",
                     resp.read(),
@@ -829,7 +849,8 @@ class ApiClient:
             read1 = getattr(resp, "read1", None)
             read = read1 if read1 is not None else resp.read
             read_size = 4096 if read1 is not None else 1
-            try:
+
+            def decoded_chunks() -> Iterator[str]:
                 while raw := read(read_size):
                     state = decoder.getstate()
                     try:
@@ -844,6 +865,13 @@ class ApiClient:
                         raise exc
                     yield from decoded
                 yield from decoder.decode(b"", final=True)
+
+            try:
+                chunks = decoded_chunks()
+                if media_type == "text/event-stream":
+                    yield from _openai_sse_text(chunks)
+                else:
+                    yield from chunks
             except (http.client.IncompleteRead, ConnectionError) as exc:
                 # the server aborts the chunked response when the serving backend fails
                 # mid-generation; urllib reports the missing terminating chunk (or reset) here.

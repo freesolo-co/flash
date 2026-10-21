@@ -2,7 +2,7 @@
 
 The resolver downloads `adapter_config.json` to digest it, then used to discard it and write the
 caller-supplied `--lora-rank` / `--model` straight into the immutable manifest. Every one of these
-mismatches was therefore caught only by `_validate_adapter_config` *inside the paid GPU container*,
+mismatches was therefore caught only by the GPU container's own revalidation *after provisioning*,
 so `--dry-run` reported success and a real deployment could leave billable resources in a failed or
 outcome-unknown state.
 """
@@ -16,10 +16,15 @@ import numpy as np
 import pytest
 from safetensors.numpy import save_file
 
-from flash.serve import resolve as resolve_module
-from flash.serve.resolve import ADAPTER_CONFIG, ADAPTER_WEIGHTS, ResolveError, resolve_adapter
+from flash.serve.deployment import resolve as resolve_module
+from flash.serve.deployment.resolve import (
+    ADAPTER_CONFIG,
+    ADAPTER_WEIGHTS,
+    ResolveError,
+    resolve_adapter,
+)
 
-BASE = "Qwen/Qwen3.5-4B"
+BASE = "Qwen/Qwen3.5-9B"
 BASE_REVISION = "b" * 40
 ARTIFACT_REVISION = "a" * 40
 
@@ -93,7 +98,7 @@ def test_a_base_model_that_disagrees_with_the_config_is_rejected(monkeypatch, tm
     _install_hub(
         monkeypatch,
         tmp_path,
-        {"peft_type": "LORA", "r": 32, "base_model_name_or_path": "Qwen/Qwen3.5-9B"},
+        {"peft_type": "LORA", "r": 32, "base_model_name_or_path": "Qwen/Qwen3.8-27B"},
     )
 
     with pytest.raises(ResolveError, match="trained against"):
@@ -232,22 +237,19 @@ def test_checkpoint_provenance_is_derived_from_an_agreeing_step_subfolder(
         artifact_subfolder="rl/run1/checkpoints/step-10/adapter", checkpoint_step=10
     )
 
-    assert resolved.adapter.checkpoint == "step-10"
-    assert resolved.adapter.adapter_revision == f"run1@step-10.{ARTIFACT_REVISION}"
+    assert resolved.adapter.checkpoint_id == "run1/step-10"
+    assert resolved.adapter.artifact_revision == ARTIFACT_REVISION
 
 
-def test_unrecognized_artifact_layout_keeps_the_authored_checkpoint(monkeypatch, tmp_path) -> None:
-    # older or external layouts cannot attest a step from their path. refusing them would add a new
-    # deployment failure unrelated to the mismatch this guard can prove, so they remain pass-through.
-    _install_hub(
-        monkeypatch,
-        tmp_path,
-        {"peft_type": "LORA", "r": 32, "base_model_name_or_path": BASE},
+def test_unrecognized_artifact_layout_is_rejected_before_hub_access(monkeypatch) -> None:
+    monkeypatch.setattr(
+        resolve_module,
+        "_hub_api",
+        lambda: pytest.fail("an unattested checkpoint path must fail before hub access"),
     )
 
-    resolved = _resolve(artifact_subfolder="sft/run-1-step-2", checkpoint_step=2)
-
-    assert resolved.adapter.checkpoint == "step-2"
+    with pytest.raises(ResolveError, match="does not identify a canonical Flash"):
+        _resolve(artifact_subfolder="sft/run-1-step-2", checkpoint_step=2)
 
 
 @pytest.mark.parametrize(
@@ -265,7 +267,7 @@ def test_a_config_the_container_will_refuse_is_rejected_before_provisioning(
 ) -> None:
     """Each of these is decided by the config alone, so paying a gpu to learn it is waste.
 
-    ``_validate_adapter_config`` rejects every one of these inside the serving container, and the
+    the serving container rejects every one of these when it revalidates its cache entry, and the
     verdict never depends on anything the gpu observes at runtime. Resolving them anyway meant a
     deployment that could not possibly serve still allocated provider resources and started billing
     before failing for a reason that was readable here, for free, from bytes already on disk.
@@ -315,7 +317,7 @@ def test_padded_provenance_is_rejected_before_provider_resources_exist(
 ) -> None:
     """A value that matches only after stripping must not resolve.
 
-    `_validate_adapter_config` compares these raw bytes for equality inside the container, so a
+    the container compares these raw bytes for equality when it revalidates, so a
     padded value it will refuse used to pass resolution, provision, and start billing before
     failing -- the exact outcome this guard exists to prevent. Normalizing the padding away
     instead would be worse for `revision`, which the resolver *adopts* into the immutable
@@ -378,7 +380,7 @@ def test_a_duplicate_key_is_rejected_before_provider_resources_exist(monkeypatch
 
     `json.load` keeps the last value, so a config declaring `r` twice resolves cleanly here against
     one rank while the materializer's `_reject_duplicate_keys` refuses the identical bytes. that
-    split means the artifact is only rejected after the modal app or runpod pod exists -- billing
+    split means the artifact is only rejected after the Modal app exists -- billing
     the user for a deployment that could never have started. this function exists specifically to
     catch provenance problems before provisioning, so the rule has to match on both sides.
     """
@@ -467,7 +469,7 @@ def test_a_config_the_container_cannot_decode_is_rejected_here(
 ) -> None:
     """The control plane must decode these bytes exactly as the gpu container will.
 
-    `_load_strict_config` decodes strict utf-8 and refuses a BOM. Passing the raw handle to
+    The shared reader decodes strict utf-8 and refuses a BOM. Passing the raw handle to
     `json.load` instead lets it auto-detect utf-16 and skip a BOM (RFC 4627), so a config the
     container rejects outright resolved cleanly, provisioned, and started billing before failing
     -- the same split this function already closes for duplicate keys.
