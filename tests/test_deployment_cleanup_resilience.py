@@ -14,7 +14,10 @@ from tests.test_server_api import api as api
 
 
 @pytest.mark.parametrize("failure", [OSError("storage unavailable"), ValueError("corrupt status")])
-def test_unreadable_run_does_not_starve_later_cleanup(api, monkeypatch, caplog, failure):
+@pytest.mark.parametrize("failure_point", ["status", "lock"])
+def test_unreadable_run_does_not_starve_later_cleanup(
+    api, monkeypatch, caplog, failure, failure_point
+):
     run_id = _make_run(api, _new_user_token(), "done")
     target = f"{run_id}/final"
     seed_ready_checkpoint(run_id, target)
@@ -22,11 +25,23 @@ def test_unreadable_run_does_not_starve_later_cleanup(api, monkeypatch, caplog, 
     original_get = status.get_status
 
     def read_status(name):
-        if name == "unreadable-run":
+        if name == "unreadable-run" and failure_point == "status":
             raise failure
         return original_get(name)
 
     monkeypatch.setattr(status, "get_status", read_status)
+    original_lock = serving_completion.deployment_locks._deploy_lock
+
+    class UnavailableLock:
+        def acquire(self, blocking):
+            raise failure
+
+    def lock_for_run(name):
+        if name == "unreadable-run" and failure_point == "lock":
+            return UnavailableLock()
+        return original_lock(name)
+
+    monkeypatch.setattr(serving_completion.deployment_locks, "_deploy_lock", lock_for_run)
     monkeypatch.setattr(
         serving_completion.db,
         "all_runs",
@@ -38,7 +53,7 @@ def test_unreadable_run_does_not_starve_later_cleanup(api, monkeypatch, caplog, 
     assert deleted == [target]
     assert status.get_status(run_id).deployments[target]["state"] == "undeployed"
     assert "unreadable-run" in caplog.text
-    lock = serving_completion.deployment_locks._deploy_lock("unreadable-run")
+    lock = original_lock("unreadable-run")
     assert lock.acquire(blocking=False)
     lock.release()
 

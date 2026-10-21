@@ -67,49 +67,55 @@ def recover_deployments() -> int:
     return recovered
 
 
+def _cleanup_pending_run(run_id: str, stop: Event) -> bool:
+    lock = deployment_locks._deploy_lock(run_id)
+    if not lock.acquire(blocking=False):
+        return True
+    pending = False
+    try:
+        try:
+            status = run_status.get_status(run_id)
+        except FileNotFoundError:
+            return False
+        for checkpoint_id, deployment in status.deployments.items():
+            if stop.is_set():
+                return pending
+            if deployment.get("state") != "cleanup_pending":
+                continue
+            org_id = deployment.get("serving_org_id") or run_serving_org_id(status)
+            # Normalize composite errors from records written before causes were separated.
+            cause = (
+                deployment.get("deployment_error")
+                or str(deployment.get("error") or "interrupted deployment").split(
+                    "; checkpoint cleanup failed:", 1
+                )[0]
+            )
+            if _cleanup_failed_deployment(
+                run_id, checkpoint_id, org_id, ServingError(cause), timeout_s=5.0
+            ):
+                marked = runner_transitions.mark_undeployed(run_id, checkpoint_id)
+                deployment_state._report_persisted_transition(status, marked, persisted=True)
+                status = marked
+            else:
+                pending = True
+    finally:
+        lock.release()
+    return pending
+
+
 def cleanup_pending_deployments(stop: Event) -> bool:
-    """Try every pending checkpoint once; return whether another pass is needed."""
+    """Try every pending run once; return whether another pass is needed."""
     pending = False
     for row in db.all_runs():
         if stop.is_set():
             break
         run_id = row["run_id"]
-        lock = deployment_locks._deploy_lock(run_id)
-        if not lock.acquire(blocking=False):
-            pending = True
-            continue
         try:
-            try:
-                status = run_status.get_status(run_id)
-            except FileNotFoundError:
-                continue
-            for checkpoint_id, deployment in status.deployments.items():
-                if stop.is_set():
-                    return pending
-                if deployment.get("state") != "cleanup_pending":
-                    continue
-                org_id = deployment.get("serving_org_id") or run_serving_org_id(status)
-                # Normalize composite errors from records written before causes were separated.
-                cause = (
-                    deployment.get("deployment_error")
-                    or str(deployment.get("error") or "interrupted deployment").split(
-                        "; checkpoint cleanup failed:", 1
-                    )[0]
-                )
-                if _cleanup_failed_deployment(
-                    run_id, checkpoint_id, org_id, ServingError(cause), timeout_s=5.0
-                ):
-                    marked = runner_transitions.mark_undeployed(run_id, checkpoint_id)
-                    deployment_state._report_persisted_transition(status, marked, persisted=True)
-                    status = marked
-                else:
-                    pending = True
+            pending = _cleanup_pending_run(run_id, stop) or pending
         except Exception:
-            # A broken status record or failed write must not starve other runs.
+            # Lock failures and broken status records must not starve other runs.
             _log.exception("deployment cleanup failed for run %s; retrying", run_id)
             pending = True
-        finally:
-            lock.release()
     return pending
 
 

@@ -26,6 +26,7 @@ from pathlib import Path
 from typing import BinaryIO
 
 from flash.envs.meta import cache_security
+from flash.envs.meta.cache_storage import STAGING_PREFIX, publish_cache_entry
 
 # the underscored names are re-exports: tests and content.multimodal reach them via loader.
 from flash.envs.meta.dataset_selection import (
@@ -762,7 +763,9 @@ def _evict_env_cache(keep: Path) -> None:
     # used within the last _CACHE_MIN_AGE_SECONDS (a concurrent run may be
     # loading it); overshooting the caps briefly is safer than deleting live env.
     try:
-        entries = [p for p in _CACHE_ROOT.iterdir() if p.is_dir()]
+        entries = [
+            p for p in _CACHE_ROOT.iterdir() if p.is_dir() and not p.name.startswith(STAGING_PREFIX)
+        ]
     except OSError:
         return
     now = time.time()
@@ -822,6 +825,8 @@ def _resolve_github_environment_file(env_ref: str, pinned_sha: str | None = None
             return env_file
         # a foreign file inside our own directory condemns the whole entry, same as above.
         cache_security.discard_untrusted_entry(cache_dir)
+    if cache_dir.exists():
+        shutil.rmtree(cache_dir)
     tmp_parent = Path(tempfile.mkdtemp(prefix="flash-env-github-"))
     resolved = GitHubEnvironmentRef(
         parsed.owner,
@@ -846,8 +851,7 @@ def _resolve_github_environment_file(env_ref: str, pinned_sha: str | None = None
             raise FileNotFoundError(
                 f"environment archive did not contain required entrypoint {required_entrypoint!r}"
             )
-        shutil.rmtree(cache_dir, ignore_errors=True)
-        shutil.copytree(extracted, cache_dir)
+        publish_cache_entry(extracted, cache_dir, required_entrypoint)
         _evict_env_cache(keep=cache_dir)
         return cache_dir / candidate.relative_to(extracted)
     finally:
