@@ -237,8 +237,13 @@ def deploy_adapter(
             record = _registered_adapter(normalized_org_id, checkpoint_id)
         except serving_errors.ServingError as read_exc:
             raise exc from read_exc
-        if record is None or not _matches_revision_identity(record, body):
+        if record is None:
             raise exc
+        if not _matches_revision_identity(record, body):
+            raise serving_errors.RegistrationRejected(
+                f"checkpoint {checkpoint_id} is already registered with a different immutable identity",
+                status_code=409,
+            ) from exc
         logger.warning(
             "adapter registration response was ambiguous; checkpoint %s exists with matching identity",
             checkpoint_id,

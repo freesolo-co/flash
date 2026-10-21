@@ -130,7 +130,7 @@ def create_app():
         startup_cleanup_stop = threading.Event()
         if recovered_deployments:
             deployment_jobs.start_deployment_job(
-                serving_completion.cleanup_recovered_deployments,
+                serving_completion.retry_deployment_cleanup,
                 startup_cleanup_stop,
                 background=True,
             )

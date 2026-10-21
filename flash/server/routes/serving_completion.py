@@ -67,7 +67,7 @@ def _recover_interrupted_deployment(status, checkpoint_id: str) -> None:
 
 
 def cleanup_recovered_deployments(stop: Event, *, budget_seconds: float = 30.0) -> int:
-    """retry fenced cleanup in one owned worker, leaving unfinished records retryable."""
+    """Run one bounded cleanup pass, leaving unfinished records retryable."""
     deadline = time.monotonic() + budget_seconds
     cleaned = 0
     for row in db.all_runs():
@@ -100,6 +100,32 @@ def cleanup_recovered_deployments(stop: Event, *, budget_seconds: float = 30.0) 
         finally:
             lock.release()
     return cleaned
+
+
+def retry_deployment_cleanup(stop: Event) -> int:
+    """Retry bounded passes in the owned worker until cleanup finishes or shutdown begins."""
+    cleaned = 0
+    delay = 1.0
+    while not stop.is_set():
+        cleaned += cleanup_recovered_deployments(stop)
+        if not _has_pending_cleanup(stop) or stop.wait(delay):
+            break
+        delay = min(30.0, delay * 2)
+    return cleaned
+
+
+def _has_pending_cleanup(stop: Event) -> bool:
+    # This scan only schedules another pass; that pass rechecks state under each run lock.
+    for row in db.all_runs():
+        if stop.is_set():
+            break
+        try:
+            status = run_status.get_status(row["run_id"])
+        except FileNotFoundError:
+            continue
+        if any(record.get("state") == "cleanup_pending" for record in status.deployments.values()):
+            return True
+    return False
 
 
 def replay_status_reports(stop: Event | None = None) -> int:

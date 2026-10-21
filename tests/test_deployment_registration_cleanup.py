@@ -1,6 +1,7 @@
 """Incomplete hosted registrations are revoked without disturbing verified siblings."""
 
 from threading import Event
+from types import SimpleNamespace
 
 import pytest
 
@@ -12,6 +13,7 @@ from flash.server.platform import deployment_state
 from flash.server.platform.internal_client import run_serving_org_id
 from flash.server.routes import serving_completion
 from tests._helpers.deployments import seed_ready_checkpoint
+from tests.test_serve import _stub_adapter_config
 from tests.test_server_api import _bearer, _identity_for_token, _login, _make_run
 from tests.test_server_api import api as api
 
@@ -215,7 +217,7 @@ def blocked_recovery(monkeypatch):
             pass
 
     monkeypatch.setattr(serving_completion, "recover_deployments", lambda: 1)
-    monkeypatch.setattr(serving_completion, "cleanup_recovered_deployments", cleanup)
+    monkeypatch.setattr(serving_completion, "retry_deployment_cleanup", cleanup)
     try:
         yield started
     finally:
@@ -225,3 +227,133 @@ def blocked_recovery(monkeypatch):
 def test_startup_serves_requests_while_remote_cleanup_is_blocked(blocked_recovery, api):
     assert blocked_recovery.wait(2)
     assert api.get("/v1/me", headers=_bearer(_login())).status_code == 200
+
+
+@pytest.mark.parametrize("status_code", [None, 408, 503])
+def test_ambiguous_registration_preserves_mismatched_binding(
+    api, monkeypatch, tmp_path, status_code
+):
+    key = _login()
+    run_id = _make_run(api, key, "done")
+    checkpoint_id, sibling = f"{run_id}/final", f"{run_id}/step-20"
+    seed_ready_checkpoint(run_id, sibling)
+    before = status.get_status(run_id).deployments[sibling]
+    _stub_adapter_config(monkeypatch, tmp_path)
+    monkeypatch.setattr(deploy, "resolve_artifact_revision", lambda _: "a" * 40)
+    existing = {}
+    reads, deletes = [], []
+
+    def registered(*args, **kwargs):
+        reads.append(checkpoint_id)
+        return existing or None
+
+    def ambiguous(method, url, **kwargs):
+        assert method == "POST"
+        existing.update({**kwargs["json"], "artifact_digest": "another-artifact"})
+        raise ServingError("registration response lost", status_code=status_code)
+
+    monkeypatch.setattr(deploy, "_registered_adapter", registered)
+    monkeypatch.setattr(deploy.transport, "serving_request", ambiguous)
+    monkeypatch.setattr(deploy, "undeploy_adapter", lambda target, **_: deletes.append(target))
+    response = api.post(
+        f"/v1/runs/{run_id}/deploy", json={"checkpoint_id": checkpoint_id}, headers=_bearer(key)
+    )
+    assert response.status_code == 200
+    assert response.json()["state"] == "failed"
+    assert reads == [checkpoint_id, checkpoint_id]
+    assert deletes == []
+    assert "different immutable identity" in response.json()["error"]
+    assert status.get_status(run_id).deployments[sibling] == before
+
+
+@pytest.mark.parametrize("interruption", ["failure", "budget", "locked"])
+def test_cleanup_worker_retries_without_another_restart(api, monkeypatch, interruption):
+    key = _login()
+    run_id = _make_run(api, key, "done")
+    targets = [f"{run_id}/final", f"{run_id}/step-20"]
+    for target in targets:
+        seed_ready_checkpoint(run_id, target)
+        transitions.mark_deployment_cleanup_pending(run_id, "interrupted", target)
+    clock = SimpleNamespace(now=0.0)
+    monkeypatch.setattr(serving_completion, "time", SimpleNamespace(monotonic=lambda: clock.now))
+    deleted, waits = [], []
+    stop = Event()
+    lock = serving_completion.deployment_locks._deploy_lock(run_id)
+    if interruption == "locked":
+        lock.acquire()
+
+    def undeploy(target, **kwargs):
+        assert 0 < kwargs["timeout_s"] <= 5
+        deleted.append(target)
+        if len(deleted) == 1:
+            if interruption == "failure":
+                raise ServingError("temporarily unavailable")
+            if interruption == "budget":
+                clock.now += 30
+
+    def wait(delay):
+        waits.append(delay)
+        assert len(waits) == 1, "cleanup did not finish on the next pass"
+        if interruption == "locked":
+            lock.release()
+        return False
+
+    monkeypatch.setattr(deploy, "undeploy_adapter", undeploy)
+    monkeypatch.setattr(stop, "wait", wait)
+    try:
+        assert serving_completion.retry_deployment_cleanup(stop) == 2
+    finally:
+        if interruption == "locked" and not waits:
+            lock.release()
+    assert waits == [1.0]
+    assert len(deleted) == (3 if interruption == "failure" else 2)
+    assert all(status.get_status(run_id).deployments[t]["state"] == "undeployed" for t in targets)
+
+
+def test_cleanup_retry_backoff_is_bounded_and_stoppable(api, monkeypatch):
+    key = _login()
+    run_id = _make_run(api, key, "done")
+    target = f"{run_id}/final"
+    seed_ready_checkpoint(run_id, target)
+    transitions.mark_deployment_cleanup_pending(run_id, "interrupted", target)
+    stop, waits, attempts = Event(), [], []
+
+    def unavailable(*args, **kwargs):
+        attempts.append(args)
+        raise ServingError("offline")
+
+    def wait(delay):
+        waits.append(delay)
+        if len(waits) == 7:
+            stop.set()
+        return stop.is_set()
+
+    monkeypatch.setattr(deploy, "undeploy_adapter", unavailable)
+    monkeypatch.setattr(stop, "wait", wait)
+    assert serving_completion.retry_deployment_cleanup(stop) == 0
+    assert waits == [1, 2, 4, 8, 16, 30, 30]
+    assert len(attempts) == len(waits)
+    assert status.get_status(run_id).deployments[target]["state"] == "cleanup_pending"
+
+
+def test_cleanup_retry_rechecks_state_after_backoff(api, monkeypatch):
+    key = _login()
+    run_id = _make_run(api, key, "done")
+    target = f"{run_id}/final"
+    seed_ready_checkpoint(run_id, target)
+    transitions.mark_deployment_cleanup_pending(run_id, "interrupted", target)
+    stop, deleted = Event(), []
+
+    def unavailable(checkpoint_id, **kwargs):
+        deleted.append(checkpoint_id)
+        raise ServingError("offline")
+
+    def wait(delay):
+        seed_ready_checkpoint(run_id, target)
+        return False
+
+    monkeypatch.setattr(deploy, "undeploy_adapter", unavailable)
+    monkeypatch.setattr(stop, "wait", wait)
+    assert serving_completion.retry_deployment_cleanup(stop) == 0
+    assert deleted == [target]
+    assert status.get_status(run_id).deployments[target]["state"] == "ready"

@@ -24,7 +24,7 @@ class ServingError(RuntimeError):
 
 
 class RegistrationRejected(ServingError):
-    """the registration POST definitively rejected this attempt without creating a binding."""
+    """Registration rejection or reconciliation proves this attempt created no binding."""
 
 
 class RetryableServingUnavailable(ServingError):
