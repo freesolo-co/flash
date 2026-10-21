@@ -97,13 +97,15 @@ class FlashSFTTrainer(SFTTrainer):
             seed=self.runtime.seed,
         )
         self.collate_fn = SFTTensorCollator(self.config.data.pad_mode)
+        num_workers = self.config.data.num_workers
         self.train_dataloader = StatefulDataLoader(
             dataset=self.train_dataset,
             batch_size=self.train_batch_size_per_dp,
             sampler=self.train_sampler,
             collate_fn=self.collate_fn,
-            num_workers=self.config.data.num_workers,
+            num_workers=num_workers,
             pin_memory=False,
             drop_last=False,
+            **({"persistent_workers": True, "prefetch_factor": 2} if num_workers > 0 else {}),
         )
         self.val_dataloader = None
