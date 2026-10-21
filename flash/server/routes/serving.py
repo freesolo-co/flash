@@ -315,6 +315,7 @@ def deploy(
             is_checkpoint,
             current_deployment,
         )
+        dep_dict["serving_org_id"] = deploy_org_id
         marked = mark_deployment_pending(run_id, dep_dict, expect_state=prev_state)
         if marked.deployments.get(dep_dict["checkpoint_id"]) != dep_dict:
             raise HTTPException(
@@ -394,7 +395,9 @@ def undeploy(
                     status_code=400,
                     detail="checkpoint_id must be a canonical checkpoint belonging to the route run",
                 )
-            org_id = run_serving_org_id(status)
+            org_id = status.deployments.get(checkpoint_id, {}).get(
+                "serving_org_id"
+            ) or run_serving_org_id(status)
             if not org_id:
                 raise HTTPException(
                     status_code=409, detail=f"run {run_id} has no organization scope"

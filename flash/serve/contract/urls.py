@@ -131,5 +131,9 @@ def serving_base_url() -> str:
 
 
 def public_deployment(deployment: dict) -> dict:
-    """Return an independent copy of a checkpoint deployment record."""
-    return dict(deployment)
+    """Project a deployment for clients without exposing internal recovery metadata."""
+    return {
+        key: value
+        for key, value in deployment.items()
+        if key not in {"registration_identity", "serving_org_id"}
+    }

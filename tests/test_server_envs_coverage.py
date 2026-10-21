@@ -30,7 +30,7 @@ import flash.serve.deployment.deploy as serving_deploy
 import flash.server.platform.deployment_state as deployment_state
 from flash.serve.contract.errors import RetryableServingUnavailable
 from flash.server.domain.registry import envs
-from tests._helpers.deployments import only_deployment, records
+from tests._helpers.deployments import records
 
 pytest.importorskip("fastapi")
 
@@ -514,7 +514,7 @@ def test_resolve_deploy_step_branches(monkeypatch):
         assert exc.value.status_code == 400, bad
 
 
-def test_recover_deployments_fails_busy_and_skips_missing(monkeypatch):
+def test_recover_deployments_selects_busy_and_skips_missing(monkeypatch):
     import time
 
     rows = [
@@ -549,18 +549,14 @@ def test_recover_deployments_fails_busy_and_skips_missing(monkeypatch):
         return statuses[run_id]
 
     monkeypatch.setattr(run_status, "get_status", fake_get_status)
-    marked: list[tuple[str, dict]] = []
-    reported = []
-
-    def mark_failed(run_id, failed):
-        marked.append((run_id, failed))
-        return types.SimpleNamespace(
-            run_id=run_id, state="done", deployments=records(run_id, failed)
-        )
-
-    monkeypatch.setenv("FLASH_DEPLOY_SYNC", "1")
-    monkeypatch.setattr(runner_transitions, "mark_deployment_failed", mark_failed)
-    monkeypatch.setattr(runner_reporting, "_report_status", reported.append)
+    recovered = []
+    monkeypatch.setattr(
+        runner_transitions,
+        "mark_deployment_failed",
+        lambda run_id, record: (
+            recovered.append((run_id, record["checkpoint_id"])) or statuses[run_id]
+        ),
+    )
 
     from flash.server.platform.locks import _RunLock
 
@@ -573,34 +569,26 @@ def test_recover_deployments_fails_busy_and_skips_missing(monkeypatch):
         assert serving_completion.recover_deployments() == 2
     finally:
         held_lock.release()
-    assert sorted(run_id for run_id, _failed in marked) == ["r-fresh", "r-stale"]
-    assert all(failed["state"] == "failed" for _run_id, failed in marked)
-    assert all("control-plane restart" in failed["error"] for _run_id, failed in marked)
-    assert sorted(status.run_id for status in reported) == ["r-fresh", "r-stale"]
-    assert all(only_deployment(status)["state"] == "failed" for status in reported)
+    assert sorted(recovered) == [
+        ("r-fresh", "r-fresh/final"),
+        ("r-stale", "r-stale/final"),
+    ]
 
 
 def test_recover_deployments_rechecks_busy_state_under_lock(monkeypatch):
-    statuses = [
-        types.SimpleNamespace(
-            run_id="r-settled", deployments=records("r-settled", {"state": "queued"})
-        ),
-        types.SimpleNamespace(
-            run_id="r-settled",
-            deployments=records("r-settled", {"state": "ready"}),
-            spec={"run_id": "r-settled", "model": "Qwen/Qwen3.5-9B", "algorithm": "sft"},
-        ),
-    ]
-    monkeypatch.setattr(serving.db, "all_runs", lambda: [{"run_id": "r-settled"}])
-    monkeypatch.setattr(run_status, "get_status", lambda _run_id: statuses.pop(0))
-    monkeypatch.setattr(
-        runner_transitions,
-        "mark_deployment_failed",
-        lambda *_args: pytest.fail("a deployment that settled under the lock must not be failed"),
-    )
+    lock = serving_completion.deployment_locks._deploy_lock("r-settled")
 
+    def get_status(run_id):
+        assert not lock.acquire(blocking=False), "status must only be read under the lock"
+        return types.SimpleNamespace(
+            run_id=run_id,
+            deployments=records(run_id, {"state": "ready"}),
+            spec={"run_id": run_id, "model": "Qwen/Qwen3.5-9B", "algorithm": "sft"},
+        )
+
+    monkeypatch.setattr(serving.db, "all_runs", lambda: [{"run_id": "r-settled"}])
+    monkeypatch.setattr(run_status, "get_status", get_status)
     assert serving_completion.recover_deployments() == 0
-    assert statuses == []
 
 
 def test_recover_deployments_retires_a_ready_deployment_this_build_cannot_serve(monkeypatch):
@@ -661,7 +649,7 @@ def test_recover_deployments_retires_a_ready_deployment_this_build_cannot_serve(
         assert "no longer supported" in failed["error"]
 
 
-def test_recovery_fails_only_unfinished_checkpoint_and_reports_inventory(monkeypatch, tmp_path):
+def test_recovery_removes_only_unfinished_checkpoint_and_reports_inventory(monkeypatch, tmp_path):
     from flash.runner.lifecycle import state
     from tests._helpers.deployments import seed_ready_checkpoint
 
@@ -674,6 +662,7 @@ def test_recovery_fails_only_unfinished_checkpoint_and_reports_inventory(monkeyp
             "checkpoint_id": "r-stale/step-20",
             "checkpoint_step": 20,
             "state": "queued",
+            "registration_identity": {},
             "generation": 1,
             "requested_at": 1.0,
         },
@@ -682,12 +671,17 @@ def test_recovery_fails_only_unfinished_checkpoint_and_reports_inventory(monkeyp
     monkeypatch.setattr(serving.db, "all_runs", lambda: [{"run_id": "r-stale"}])
     monkeypatch.setattr(serving_completion, "_spec_is_unservable", lambda _status: False)
     monkeypatch.setenv("FLASH_DEPLOY_SYNC", "1")
+    monkeypatch.setattr(serving_completion, "run_serving_org_id", lambda _status: "org-1")
+    monkeypatch.setattr(serving_deploy, "undeploy_adapter", lambda *_args, **_kwargs: {})
     reported = []
     monkeypatch.setattr(runner_reporting, "_report_status", reported.append)
     assert serving_completion.recover_deployments() == 1
-    assert len(reported) == 1
-    assert reported[0].deployments["r-stale/final"] == before
-    assert reported[0].deployments["r-stale/step-20"]["state"] == "failed"
+    from threading import Event
+
+    serving_completion.cleanup_recovered_deployments(Event())
+    assert len(reported) == 2
+    assert reported[-1].deployments["r-stale/final"] == before
+    assert reported[-1].deployments["r-stale/step-20"]["state"] == "undeployed"
 
 
 def _smoke_spec(

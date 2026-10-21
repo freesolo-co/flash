@@ -282,6 +282,14 @@ provider resources using the pre-migration release before starting this Modal-on
 Historical provider handles are not converted into Modal identities. Existing Hugging Face
 checkpoints and adapters remain usable; the provider migration does not rewrite those artifacts.
 
+This requires a clean control-plane cutover. Export needed artifacts and back up run state
+using the old release; retain it with the old records for historical access. Draining jobs does
+not make legacy specs compatible: removed training fields, bare warm-start references, retired
+provider/GPU names, and model IDs are not translated for deploy, export, warm-start, or recovery.
+Hugging Face artifacts retain their original base model identity; preservation does not imply
+current catalog support. Follow the checkpoint schema cutover, then rebind and verify supported
+checkpoints. Old verification and launch ownership records are not current readiness or ownership.
+
 ## What `FLASH_STANDALONE=1` does
 
 Flash's managed deployment keeps organizations, projects, and billing in a Freesolo SaaS

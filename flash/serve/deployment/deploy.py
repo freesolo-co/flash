@@ -142,6 +142,8 @@ def deploy_adapter(
     structured_outputs: str = "",
     org_id: str | None = None,
     checkpoint_step: int | None = None,
+    # mark possible remote side effects before sending the registration request.
+    before_register: Callable[[dict], None] | None = None,
     # Pass the immutable target and facts already fetched for this deployment to smoke testing.
     before_ready: Callable[[DeploymentReadinessFacts], None] | None = None,
 ) -> Deployment:
@@ -218,6 +220,8 @@ def deploy_adapter(
     body["org_id"] = normalized_org_id
     body["artifact_fingerprint"] = immutable_binding_fingerprint(body)
 
+    if before_register is not None:
+        before_register(dict(body))
     try:
         registration = transport.serving_request(
             "POST",
@@ -230,14 +234,21 @@ def deploy_adapter(
                 f"serving returned unexpected adapter registration status {registration.status_code}"
             )
     except serving_errors.ServingError as exc:
-        if exc.status_code is not None and exc.status_code < 500:
-            raise
+        if exc.status_code is not None and 400 <= exc.status_code < 500 and exc.status_code != 408:
+            raise serving_errors.RegistrationRejected(
+                str(exc), status_code=exc.status_code, retry_after=exc.retry_after
+            ) from exc
         try:
             record = _registered_adapter(normalized_org_id, checkpoint_id)
         except serving_errors.ServingError as read_exc:
             raise exc from read_exc
-        if record is None or not _matches_revision_identity(record, body):
+        if record is None:
             raise exc
+        if not _matches_revision_identity(record, body):
+            raise serving_errors.RegistrationRejected(
+                f"checkpoint {checkpoint_id} is already registered with a different immutable identity",
+                status_code=409,
+            ) from exc
         logger.warning(
             "adapter registration response was ambiguous; checkpoint %s exists with matching identity",
             checkpoint_id,
@@ -535,13 +546,14 @@ def _wait_checkpoint_ready(
     )
 
 
-def undeploy_adapter(checkpoint_id: str, *, org_id: str) -> dict:
+def undeploy_adapter(checkpoint_id: str, *, org_id: str, timeout_s: float | None = None) -> dict:
     """disable one exact permanent checkpoint."""
     response = transport.serving_request(
         "DELETE",
         _adapter_url(checkpoint_id),
         ok_statuses=(404,),
         org_id=org_id,
+        timeout_s=timeout_s,
     )
     if response.status_code == 404:
         return {

@@ -109,7 +109,7 @@ def _mark_checkpoint_inactive(run_id: str, checkpoint_id: str, **fields) -> RunS
     with _status_guard(run_id):
         status = get_status(run_id)
         current = dict(status.deployments.get(checkpoint_id, {}))
-        for field in ("error", "retryable"):
+        for field in ("error", "retryable", "deployment_error", "cleanup_error"):
             current.pop(field, None)
         record = {
             **current,
@@ -123,10 +123,18 @@ def _mark_checkpoint_inactive(run_id: str, checkpoint_id: str, **fields) -> RunS
         return _save_record(status, record)
 
 
-def mark_deployment_cleanup_pending(run_id: str, error: str, checkpoint_id: str) -> RunStatus:
+def mark_deployment_cleanup_pending(
+    run_id: str, error: str, checkpoint_id: str, *, cleanup_error: str | None = None
+) -> RunStatus:
     """Disable checkpoint serving while backend removal is pending or needs a retry."""
     return _mark_checkpoint_inactive(
-        run_id, checkpoint_id, state="cleanup_pending", error=error, retryable=True
+        run_id,
+        checkpoint_id,
+        state="cleanup_pending",
+        deployment_error=error,
+        cleanup_error=cleanup_error,
+        error=f"{error}; checkpoint cleanup failed: {cleanup_error}" if cleanup_error else error,
+        retryable=True,
     )
 
 

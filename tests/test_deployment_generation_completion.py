@@ -54,7 +54,7 @@ def test_unconfirmed_verification_does_not_undeploy_the_new_generation(monkeypat
             "superseded attempt must not publish readiness or delete its replacement"
         )
 
-    monkeypatch.setattr(completion, "_cleanup_failed_smoke", forbidden)
+    monkeypatch.setattr(completion, "_cleanup_failed_deployment", forbidden)
     monkeypatch.setattr(completion, "_commit_ready_deployment", forbidden)
     completion._finish_deployment_unlocked(
         run_id="run-1",

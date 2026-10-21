@@ -23,6 +23,10 @@ class ServingError(RuntimeError):
         self.retry_after = retry_after
 
 
+class RegistrationRejected(ServingError):
+    """Registration rejection or reconciliation proves this attempt created no binding."""
+
+
 class RetryableServingUnavailable(ServingError):
     """a recognized serving cold-start envelope that may be retried within a caller deadline."""
 
