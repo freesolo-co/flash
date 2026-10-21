@@ -31,3 +31,8 @@ class FlashVLLMReplica(vLLMReplica):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.server_class = ray.remote(FlashVLLMServer)
+
+    def _get_server_name_prefix(self):
+        # The native adapter derives its lookup name from rollout.name; the replica defaults
+        # to vllm_ even for registered subclasses. Both sides must share the same namespace.
+        return f"{self.config.name}_"

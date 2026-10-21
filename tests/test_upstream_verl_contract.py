@@ -380,3 +380,73 @@ def test_rollout_server_decodes_extended_model_config(monkeypatch, algorithm):
     assert isinstance(decoded, FlashModelConfig)
     assert decoded.runtime_options["algorithm"] == algorithm
     assert decoded.path == config.actor_rollout_ref.model.path
+
+
+def test_custom_rollout_replica_and_native_weight_sender_share_actor_name(monkeypatch):
+    from tests.test_verl_child_plugins import _import_recipe, _modules
+
+    # Skip CUDA package discovery; the sender's actual actor lookup needs no GPU operations.
+    version = importlib.metadata.version
+    monkeypatch.setattr(
+        importlib.metadata, "version", lambda name: "0.19.1" if name == "vllm" else version(name)
+    )
+    _modules(monkeypatch, {"verl.third_party.vllm": {"VLLM_SLEEP_LEVEL": 1}})
+    from verl.workers.rollout.vllm_rollout.vllm_rollout import ServerAdapter
+
+    _modules(
+        monkeypatch,
+        {
+            "verl.workers.rollout.vllm_rollout.utils": {"VLLM_LORA_INT_ID": 123},
+            "verl.workers.rollout.vllm_rollout.vllm_async_server": {
+                "vLLMHttpServer": object,
+                "vLLMReplica": object,
+            },
+        },
+    )
+    recipe = _import_recipe(monkeypatch, "flash.engine.worker.train.core.child.rollout")
+    replica = recipe.FlashVLLMReplica.__new__(recipe.FlashVLLMReplica)
+    sender = ServerAdapter.__new__(ServerAdapter)
+    replica.config = sender.config = _config("grpo").actor_rollout_ref.rollout
+    sender._has_server = True
+    sender.server_handle = None
+    sender._pd_role = None
+    sender.replica_rank, sender.node_rank = 2, 1
+    expected_name = f"{replica._get_server_name_prefix()}server_2_1"
+    handle = object()
+    actors = {expected_name: handle}
+    monkeypatch.setattr("ray.get_actor", actors.__getitem__)
+    assert sender._ensure_server_handle()
+    assert sender.server_handle is handle
+
+
+@pytest.mark.parametrize("compact", [False, True])
+def test_native_adapter_export_accepts_full_and_compact_state(tmp_path, compact):
+    import json
+
+    import torch
+    from safetensors.torch import load_file
+
+    from flash.engine.worker.verl.adapter_merger import AdapterMerger
+
+    (tmp_path / "lora_train_meta.json").write_text(
+        json.dumps({"r": 2, "lora_alpha": 8, "task_type": "CAUSAL_LM"})
+    )
+    merger = AdapterMerger.__new__(AdapterMerger)
+    merger.config = SimpleNamespace(local_dir=str(tmp_path), target_dir=str(tmp_path / "export"))
+    prefix = "base_model.model.layers.0.q_proj"
+    state = {
+        f"{prefix}.lora_A.default.weight": torch.ones(2, 4),
+        f"{prefix}.lora_B.default.weight": torch.full((4, 2), 3.0),
+    }
+    if not compact:
+        state[f"{prefix}.base_layer.weight"] = torch.ones(4, 4)
+    merger.save_hf_model_and_tokenizer(state)
+    output = tmp_path / "export" / "lora_adapter"
+    tensors = load_file(str(output / "adapter_model.safetensors"))
+    assert set(tensors) == {f"{prefix}.lora_A.weight", f"{prefix}.lora_B.weight"}
+    assert torch.equal(tensors[f"{prefix}.lora_B.weight"], torch.full((4, 2), 3.0))
+    config = json.loads((output / "adapter_config.json").read_text())
+    assert (config["r"], config["lora_alpha"], config["target_modules"]) == (2, 8, ["q_proj"])
+    assert list((tmp_path / "export").iterdir()) == [output]
+    with pytest.raises(RuntimeError, match="no LoRA"):
+        merger.save_hf_model_and_tokenizer({})

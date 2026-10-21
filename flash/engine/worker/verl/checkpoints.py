@@ -512,7 +512,7 @@ def export_peft_adapter(
             [
                 python_bin,
                 "-m",
-                "verl.model_merger",
+                "flash.engine.worker.verl.adapter_merger",
                 "merge",
                 "--backend",
                 "fsdp",
