@@ -154,7 +154,7 @@ def _run_attempts_supervised(
     Retries resume from the latest HF checkpoint on a fresh host. Genuine worker errors fail fast.
     ``attempt_start`` offsets persisted identities without expanding this invocation's retry budget.
     """
-    from flash.runner.supervise.attempt_supervision import run_attempts_supervised
+    from flash.runner.supervise.execution import run_attempts_supervised
 
     return run_attempts_supervised(
         spec,

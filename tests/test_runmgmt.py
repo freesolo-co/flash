@@ -3246,7 +3246,7 @@ def test_successful_supervision_settles_the_terminal_remote(monkeypatch, tmp_pat
     reaches `done` must not leave a remote handle that can relaunch already completed work.
     """
     from flash.core.spec import JobSpec
-    from flash.runner.supervise import attempt_supervision
+    from flash.runner.supervise import execution
 
     monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
     spec = JobSpec(run_id="settle-on-success", model="Qwen/Qwen3.5-9B", algorithm="sft")
@@ -3271,7 +3271,7 @@ def test_successful_supervision_settles_the_terminal_remote(monkeypatch, tmp_pat
     )
     # enter through the success return, not the helper: the regression this guards was the success
     # path losing its settlement call while the helper itself still worked.
-    metrics = attempt_supervision._return_success_metrics(
+    metrics = execution._return_success_metrics(
         ctx, (types.SimpleNamespace(ok=True, metrics={}), None, (), False)
     )
 
@@ -3958,7 +3958,7 @@ def test_handle_persistence_failure_still_tears_down_the_created_resource(monkey
     from flash.core.spec import GpuSpec, JobSpec, TrainSpec
     from flash.providers.core import registry as providers
     from flash.providers.core.base import Allocation, Candidate
-    from flash.runner.supervise import attempt_supervision, lifecycle
+    from flash.runner.supervise import execution, lifecycle
     from tests._helpers.profile import attach_sft_profile, stub_revision_geometry
 
     monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
@@ -3993,9 +3993,7 @@ def test_handle_persistence_failure_still_tears_down_the_created_resource(monkey
     def _raise_on_persist(*_args, **_kwargs):
         raise OSError("status write failed before becoming durable")
 
-    monkeypatch.setattr(
-        attempt_supervision, "persist_claimed_remote", _raise_on_persist, raising=False
-    )
+    monkeypatch.setattr(execution, "persist_claimed_remote", _raise_on_persist, raising=False)
     monkeypatch.setattr("flash.runner.lifecycle.attempts.persist_claimed_remote", _raise_on_persist)
 
     class Provider:
