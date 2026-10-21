@@ -26,10 +26,15 @@ Use a maintenance window; this is not a rolling, mixed-version upgrade.
    engines and background workers. A database lock cannot stop an old binary from writing later.
 3. From the new Flash checkout, run the migration's dry run against the intended database using
    an environment-provided `FLASH_CHECKPOINT_DATABASE_URL` and an administrative connection.
-   Install psycopg in the operator environment if needed; it is not a serving dependency.
+   The requirements file declares all operator dependencies, including the serving schema/settings
+   and HTTP imports used to validate rows. Use the isolated environment below so the command does
+   not depend on packages already installed in your development environment. These dependencies
+   do not change the base Flash CLI installation.
 
    ```sh
-   python -m scripts.migrate_checkpoint_fingerprints
+   uv run --isolated --no-project --python 3.12 \
+     --with-requirements scripts/checkpoint-migration-requirements.txt \
+     python -m scripts.migrate_checkpoint_fingerprints
    ```
 
    This verifies every binding against its stored fingerprint. It rejects unknown or corrupted
@@ -37,7 +42,9 @@ Use a maintenance window; this is not a rolling, mixed-version upgrade.
 4. With the same stopped services and database backup, apply:
 
    ```sh
-   python -m scripts.migrate_checkpoint_fingerprints --apply
+   uv run --isolated --no-project --python 3.12 \
+     --with-requirements scripts/checkpoint-migration-requirements.txt \
+     python -m scripts.migrate_checkpoint_fingerprints --apply
    ```
 
    The transaction locks bindings and the usage outbox, requires disabled bindings and no

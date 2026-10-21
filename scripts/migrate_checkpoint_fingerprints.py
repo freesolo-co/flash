@@ -1,8 +1,8 @@
 """One-time, offline migration from adapter_id to model_id fingerprint inputs.
 
-Run from this checkout with ``python -m scripts.migrate_checkpoint_fingerprints``.
-Requires psycopg and FLASH_CHECKPOINT_DATABASE_URL. Defaults to a read-only dry run.
-See docs/checkpoint-field-cutover.md before using --apply.
+Run from this checkout after installing scripts/checkpoint-migration-requirements.txt.
+Requires FLASH_CHECKPOINT_DATABASE_URL and defaults to a read-only dry run.
+See docs/checkpoint-field-cutover.md for the isolated setup command before using --apply.
 """
 
 from __future__ import annotations
