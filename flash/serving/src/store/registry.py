@@ -30,11 +30,11 @@ def _parse_iso(value: str | None) -> datetime | None:
 
 
 def _record_key(record: AdapterRecord) -> RegistryKey:
-    return (None, record.adapter_id) if record.serve_base_model else record_key(record)
+    return (None, record.model_id) if record.serve_base_model else record_key(record)
 
 
-def _lookup_key(org_id: str | None, adapter_id: str) -> RegistryKey:
-    return (None, adapter_id) if org_id is None else checkpoint_key(org_id, adapter_id)
+def _lookup_key(org_id: str | None, model_id: str) -> RegistryKey:
+    return (None, model_id) if org_id is None else checkpoint_key(org_id, model_id)
 
 
 class AdapterRegistry:
@@ -89,13 +89,13 @@ class AdapterRegistry:
             self._records[key] = record
             return record
 
-    def get(self, org_id: str | None, adapter_id: str) -> AdapterRecord | None:
+    def get(self, org_id: str | None, model_id: str) -> AdapterRecord | None:
         with self._lock:
-            return self._records.get(_lookup_key(org_id, adapter_id))
+            return self._records.get(_lookup_key(org_id, model_id))
 
-    def has(self, org_id: str | None, adapter_id: str) -> bool:
+    def has(self, org_id: str | None, model_id: str) -> bool:
         with self._lock:
-            return _lookup_key(org_id, adapter_id) in self._records
+            return _lookup_key(org_id, model_id) in self._records
 
     def list_ready(self, *, org_id: str | None = None) -> list[AdapterRecord]:
         with self._lock:
@@ -105,11 +105,11 @@ class AdapterRegistry:
                     for record in self._records.values()
                     if record.status == "ready" and (org_id is None or record.org_id == org_id)
                 ),
-                key=lambda record: (record.org_id or "", record.adapter_id),
+                key=lambda record: (record.org_id or "", record.model_id),
             )
 
-    def remove(self, org_id: str | None, adapter_id: str) -> AdapterRecord | None:
-        key = _lookup_key(org_id, adapter_id)
+    def remove(self, org_id: str | None, model_id: str) -> AdapterRecord | None:
+        key = _lookup_key(org_id, model_id)
         with self._lock:
             removed = self._records.pop(key, None)
             if removed is not None:
@@ -117,7 +117,7 @@ class AdapterRegistry:
             else:
                 self._tombstones[key] = self._tombstones.get(key) or _utc_now_iso()
             if org_id is not None:
-                checkpoint = checkpoint_key(org_id, adapter_id)
+                checkpoint = checkpoint_key(org_id, model_id)
                 self._local_paths.pop(checkpoint, None)
                 self._local_idents.pop(checkpoint, None)
             return removed

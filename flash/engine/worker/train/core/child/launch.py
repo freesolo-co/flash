@@ -45,6 +45,9 @@ def configure(options, overrides):
                     "flash.engine.worker.train.core.child.configuration.FlashActorConfig"
                 )
             config.actor_rollout_ref.rollout.name = "flash_vllm"
+            config.actor_rollout_ref.rollout.engine_kwargs.vllm.worker_cls = (
+                "flash.engine.worker.train.core.child.vllm_worker.FlashGPUWorker"
+            )
             config.trainer.use_v1 = True
             config.trainer.v1.trainer_mode = "sync"
             config.transfer_queue.enable = True

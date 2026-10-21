@@ -69,7 +69,7 @@ This fake example covers every phase kind:
     "deployment_id": "fake-deployment-1"
   },
   "credential_env": "FAKE_SERVING_TOKEN",
-  "required_capabilities": ["permanent_checkpoint_identity"],
+  "required_capabilities": ["serving_contract_v2"],
   "discovery": {
     "enabled": true,
     "include": ["model-a", "model-b", "model-c"],

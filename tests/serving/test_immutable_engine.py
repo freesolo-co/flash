@@ -21,7 +21,7 @@ RUN_ID = "flash-1234567890-abcdef12"
 
 def _revision(sha: str, *, status: str = "ready") -> AdapterRecord:
     values = {
-        "adapter_id": f"{RUN_ID}/step-20",
+        "model_id": f"{RUN_ID}/step-20",
         "repo_id": "org/run",
         "org_id": "org-1",
         "base_model": BASE_MODEL,
@@ -64,17 +64,17 @@ def test_unregister_skips_cleanup_for_a_newer_deployment_generation() -> None:
     engine._evict_loaded_lora = _evict
 
     async def _exercise() -> tuple[dict, dict, dict]:
-        legacy = await engine._unregister(record.org_id, record.adapter_id)
-        stale = await engine._unregister(record.org_id, record.adapter_id, "generation-old")
-        removed = await engine._unregister(record.org_id, record.adapter_id, "generation-new")
+        legacy = await engine._unregister(record.org_id, record.model_id)
+        stale = await engine._unregister(record.org_id, record.model_id, "generation-old")
+        removed = await engine._unregister(record.org_id, record.model_id, "generation-new")
         return legacy, stale, removed
 
     legacy, stale, removed = asyncio.run(_exercise())
 
     assert legacy["skipped_stale_generation"] is True
     assert stale["skipped_stale_generation"] is True
-    assert removed["removed"] == record.adapter_id
-    assert engine.registry.get(record.org_id, record.adapter_id) is None
+    assert removed["removed"] == record.model_id
+    assert engine.registry.get(record.org_id, record.model_id) is None
     assert evicted == [record.storage_key]
 
 
@@ -232,20 +232,20 @@ def test_cold_unregister_uses_durable_disable_time(monkeypatch) -> None:
         }
     )
 
-    async def authoritative(org_id, adapter_id):
-        assert (org_id, adapter_id) == stale_record.storage_key
+    async def authoritative(org_id, model_id):
+        assert (org_id, model_id) == stale_record.storage_key
         return disabled
 
     monkeypatch.setattr("flash.serving.src.store.undeploy.get_authoritative", authoritative)
 
     result = asyncio.run(
-        engine._unregister(stale_record.org_id, stale_record.adapter_id, "generation-old")
+        engine._unregister(stale_record.org_id, stale_record.model_id, "generation-old")
     )
 
-    assert result["removed"] == stale_record.adapter_id
+    assert result["removed"] == stale_record.model_id
     assert evicted == [stale_record.storage_key]
     engine.registry.upsert(stale_record)
-    assert engine.registry.get(stale_record.org_id, stale_record.adapter_id) is None
+    assert engine.registry.get(stale_record.org_id, stale_record.model_id) is None
     # even if the redeploy completed before this cleanup returned, its durable timestamp wins.
     newer = stale_record.model_copy(
         update={
@@ -254,7 +254,7 @@ def test_cold_unregister_uses_durable_disable_time(monkeypatch) -> None:
         }
     )
     engine.registry.upsert(newer)
-    assert engine.registry.get(newer.org_id, newer.adapter_id) == newer
+    assert engine.registry.get(newer.org_id, newer.model_id) == newer
 
 
 def test_snapshot_download_receives_exact_hub_sha(monkeypatch, tmp_path: Path) -> None:
@@ -326,16 +326,16 @@ def test_cold_unregister_does_not_tombstone_new_deployment(monkeypatch, status):
     engine._adapter_locks = {}
     engine._adapter_locks_guard = asyncio.Lock()
 
-    async def authoritative(org_id, adapter_id):
-        assert (org_id, adapter_id) == record.storage_key
+    async def authoritative(org_id, model_id):
+        assert (org_id, model_id) == record.storage_key
         return record
 
     monkeypatch.setattr("flash.serving.src.store.undeploy.get_authoritative", authoritative)
-    result = asyncio.run(engine._unregister(record.org_id, record.adapter_id, "generation-old"))
+    result = asyncio.run(engine._unregister(record.org_id, record.model_id, "generation-old"))
     assert result["skipped_stale_generation"] is True
     ready = record.model_copy(update={"status": "ready"})
     engine.registry.upsert(ready)
-    assert engine.registry.get(ready.org_id, ready.adapter_id) == ready
+    assert engine.registry.get(ready.org_id, ready.model_id) == ready
 
 
 @pytest.mark.parametrize("unavailable", [False, True])
@@ -349,20 +349,20 @@ def test_cold_unregister_without_authoritative_record_leaves_registry_untouched(
     engine._adapter_locks = {}
     engine._adapter_locks_guard = asyncio.Lock()
 
-    async def authoritative(org_id, adapter_id):
+    async def authoritative(org_id, model_id):
         if unavailable:
             raise RuntimeError("storage unavailable")
         return
 
     monkeypatch.setattr("flash.serving.src.store.undeploy.get_authoritative", authoritative)
-    call = engine._unregister(record.org_id, record.adapter_id, "generation-old")
+    call = engine._unregister(record.org_id, record.model_id, "generation-old")
     if unavailable:
         with pytest.raises(RuntimeError, match="storage unavailable"):
             asyncio.run(call)
     else:
         assert asyncio.run(call)["removed"] is None
     engine.registry.upsert(record)
-    assert engine.registry.get(record.org_id, record.adapter_id) == record
+    assert engine.registry.get(record.org_id, record.model_id) == record
 
 
 def test_request_loaded_adapter_is_registered_once_and_evicted_on_undeploy(tmp_path):
@@ -396,11 +396,11 @@ def test_request_loaded_adapter_is_registered_once_and_evicted_on_undeploy(tmp_p
 
     async def exercise():
         payload = internal_adapter_payload(record)
-        first, _ = await engine._lora_request(record.adapter_id, payload)
+        first, _ = await engine._lora_request(record.model_id, payload)
         assert first.lora_int_id in resident
-        second, _ = await engine._lora_request(record.adapter_id, payload)
+        second, _ = await engine._lora_request(record.model_id, payload)
         assert second is first
-        await engine._unregister(record.org_id, record.adapter_id, "generation-one")
+        await engine._unregister(record.org_id, record.model_id, "generation-one")
         assert not resident
         # the same immutable checkpoint can subsequently be deployed again.
         await engine._register(payload, "generation-two")

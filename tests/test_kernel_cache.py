@@ -3,6 +3,8 @@ import os
 import sys
 import types
 
+import pytest
+
 from flash.engine.worker.runtime import kernel_warmup
 
 
@@ -122,3 +124,67 @@ def test_worker_rejects_unreadable_bake_metadata(monkeypatch, tmp_path):
 
     assert kernel_warmup.configure_kernel_cache() is False
     assert os.environ["TRITON_CACHE_DIR"] != str(tmp_path / "triton")
+
+
+@pytest.mark.parametrize(
+    ("field", "value"), [("torch", "old"), ("cuda", "11.8"), ("python", "3.9")]
+)
+def test_baked_runtime_mismatch_redirects_every_backend(monkeypatch, tmp_path, field, value):
+    kernel_warmup._point_backends_at(str(tmp_path))
+    (tmp_path / "tilelang" / "kernel.so").write_bytes(b"compiled")
+    kernel_warmup.save_cache_metadata(_FakeTorch, str(tmp_path), requested_arch="8.9", warmed=2)
+    path = tmp_path / kernel_warmup.CACHE_META_FILENAME
+    metadata = json.loads(path.read_text())
+    metadata[field] = value
+    path.write_text(json.dumps(metadata))
+    monkeypatch.setattr(kernel_warmup, "DEFAULT_CACHE_DIR", str(tmp_path))
+    monkeypatch.setitem(sys.modules, "torch", _FakeTorch)
+    assert not kernel_warmup.configure_kernel_cache()
+    for name in kernel_warmup.KERNEL_CACHE_ENV_SUBDIRS:
+        assert not os.environ[name].startswith(str(tmp_path))
+
+
+def test_tilelang_artifacts_are_part_of_bake(tmp_path):
+    cache = tmp_path / "tilelang"
+    cache.mkdir()
+    (cache / "kernel.so").write_bytes(b"compiled")
+    assert kernel_warmup.has_raw_kernel_cache(str(tmp_path))
+
+
+def test_bake_uses_the_native_training_backend(monkeypatch):
+    implementation = object()
+    monkeypatch.setitem(
+        sys.modules,
+        "fla.ops.gated_delta_rule",
+        types.SimpleNamespace(chunk_gated_delta_rule=implementation),
+    )
+    assert kernel_warmup._training_gdn_kernel() is implementation
+
+
+def test_flashinfer_prefill_bake_loads_the_pinned_rollout_library(monkeypatch):
+    from flash.engine.worker.train.core.child import flashinfer_cache
+
+    calls = []
+    module = types.SimpleNamespace(get_gdn_prefill_module=lambda: calls.append("load"))
+    monkeypatch.setitem(sys.modules, "flashinfer.gdn_prefill", module)
+    monkeypatch.setitem(sys.modules, "flashinfer.jit", types.SimpleNamespace(env=object()))
+    monkeypatch.setattr(flashinfer_cache, "activate", lambda _: calls.append("activate"))
+    monkeypatch.setattr(flashinfer_cache, "publish", lambda *_: calls.append("publish"))
+    torch = types.SimpleNamespace(
+        cuda=types.SimpleNamespace(synchronize=lambda: calls.append("sync"))
+    )
+    assert kernel_warmup.warm_flashinfer_gdn(torch)
+    assert calls == ["activate", "load", "sync", "publish"]
+
+
+def test_hopper_bake_requires_rollout_prefill_coverage(monkeypatch, tmp_path):
+    torch = types.SimpleNamespace(
+        cuda=types.SimpleNamespace(get_device_capability=lambda _: (9, 0)),
+    )
+    monkeypatch.setattr(kernel_warmup, "_require_gpu", lambda: torch)
+    monkeypatch.setattr(kernel_warmup, "warm_flash_attn", lambda _: True)
+    monkeypatch.setattr(kernel_warmup, "warm_fla_gdn", lambda _: True)
+    monkeypatch.setattr(kernel_warmup, "warm_flashinfer_gdn", lambda _: False)
+    monkeypatch.setattr(kernel_warmup, "has_raw_kernel_cache", lambda _: True)
+    monkeypatch.setattr(kernel_warmup, "save_cache_metadata", lambda *a, **k: True)
+    assert kernel_warmup.warmup(str(tmp_path)) == 1

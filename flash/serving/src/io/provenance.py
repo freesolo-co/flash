@@ -9,7 +9,7 @@ from flash.serving.src.io.schemas import AdapterRecord
 
 
 def _active_checkpoint_ref(record: AdapterRecord) -> str:
-    return record.adapter_id if record.is_checkpoint else ""
+    return record.model_id if record.is_checkpoint else ""
 
 
 def require_attested_checkpoint(result: dict[str, Any], target: AdapterRecord) -> None:
@@ -22,12 +22,12 @@ def require_attested_checkpoint(result: dict[str, Any], target: AdapterRecord) -
 
     if not target.is_checkpoint:
         return
-    if result.get("lora_request_adapter") != target.adapter_id:
+    if result.get("lora_request_adapter") != target.model_id:
         raise HTTPException(
             status.HTTP_502_BAD_GATEWAY,
             "The serving engine did not attest the resolved immutable adapter.",
         )
-    if result.get("checkpoint") != target.adapter_id:
+    if result.get("checkpoint") != target.model_id:
         raise HTTPException(
             status.HTTP_502_BAD_GATEWAY,
             "The serving engine did not attest the resolved immutable checkpoint.",
@@ -38,7 +38,7 @@ def _checkpoint_provenance(target: AdapterRecord, active_checkpoint: Any) -> dic
     if not target.is_checkpoint:
         return None
     checkpoint = str(active_checkpoint or "").strip()
-    if checkpoint != target.adapter_id:
+    if checkpoint != target.model_id:
         return None
     return {"checkpoint_id": checkpoint}
 

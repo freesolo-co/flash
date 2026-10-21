@@ -239,12 +239,12 @@ def test_readiness_backoff_honors_retry_after_and_cap(monkeypatch):
     revision = "run-1/final"
     subfolder = "sft/run-1/seed0/adapter"
     loading = {
-        "adapter_id": revision,
+        "model_id": revision,
         "subfolder": subfolder,
         "metadata": {"lifecycle_state": "loading"},
     }
     ready = {
-        "adapter_id": revision,
+        "model_id": revision,
         "subfolder": subfolder,
         "metadata": {"lifecycle_state": "ready"},
     }

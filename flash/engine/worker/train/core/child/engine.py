@@ -26,6 +26,9 @@ class FlashFSDPEngine(FSDPEngineWithLMHead):
         self.runtime = RuntimeOptions.decode(self.model_config.runtime_options)
 
     def _build_module(self):
+        from flash.engine.worker.train.core.child.flashinfer_cache import activate_current
+
+        activate_current()
         module = super()._build_module()
         options = self.runtime
         if options.reentrant_checkpointing:

@@ -32,6 +32,8 @@ OPD agents score through the existing remote teacher bridge. The trainer does no
 
 `flash_vllm` is a separate rollout registration using upstream's registry and replica/server extension points. Its server preserves the exact engine finish reason and refuses generation when the training LoRA adapter is missing. Adapter transfer, model construction, and vLLM compatibility remain upstream-owned.
 
+Image-baked FlashInfer libraries are selected explicitly after GPU device initialization by the configured `FlashGPUWorker` subclass and the Flash training engine. Cache identity checks cover the package, Torch/CUDA/Python versions, and GPU architecture; a missing or incompatible bake retains native JIT behavior. No interpreter startup or import-finder hook is installed. Kernel baking calls the same native FLA dispatcher as training.
+
 The four agent classes are declared in packaged `core/child/agents.yaml`. Upstream's unmodified TransferQueue worker instantiates them. A readiness record is published only after trainer and rollout initialization; the parent rejects progress or successful exit without it.
 
 ## Validation

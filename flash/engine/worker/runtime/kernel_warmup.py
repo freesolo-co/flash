@@ -8,6 +8,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import sys
 import tempfile
 import time
 
@@ -24,6 +25,8 @@ CACHE_META_FILENAME = "mega_cache.json"
 KERNEL_CACHE_ENV_SUBDIRS = {
     "TRITON_CACHE_DIR": "triton",
     "TORCHINDUCTOR_CACHE_DIR": "inductor",
+    "TILELANG_CACHE_DIR": "tilelang",
+    "TORCH_EXTENSIONS_DIR": "torch_extensions",
     # flashinfer downloads b200 attention cubins and builds a host wrapper on first use. redirect
     # both to distinct persistent-cache subdirs so cold workers do not depend on nvidia artifactory
     # or pay the first-step build repeatedly. it reads FLASHINFER_CUBIN_DIR for cubins and
@@ -78,7 +81,7 @@ def _require_gpu():
         return None
 
 
-def warm_flash_attn(torch) -> bool:
+def warm_flash_attn(torch, *, head_dim: int = 256) -> bool:
     """Compile FlashAttention fwd + bwd with one tiny attention.
 
     FA2 only. The FA3 (``flash_attn_interface``) warm was removed with the wheel: it was installed
@@ -91,7 +94,9 @@ def warm_flash_attn(torch) -> bool:
         from flash_attn import flash_attn_func
 
         q, k, v = (
-            torch.randn(1, 64, 4, 64, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+            torch.randn(
+                1, 256, 4, head_dim, device="cuda", dtype=torch.bfloat16, requires_grad=True
+            )
             for _ in range(3)
         )
         out = flash_attn_func(q, k, v, causal=True)
@@ -104,7 +109,14 @@ def warm_flash_attn(torch) -> bool:
     return warmed
 
 
-def warm_fla_gdn(torch) -> bool:
+def _training_gdn_kernel():
+    """Warm the native FLA dispatch used by the unmodified upstream trainer."""
+    from fla.ops.gated_delta_rule import chunk_gated_delta_rule
+
+    return chunk_gated_delta_rule
+
+
+def warm_fla_gdn(torch, *, heads: int = 32, head_dim: int = 128) -> bool:
     """Compile flash-linear-attention's Gated-DeltaNet chunk kernels (Qwen3.5/3.6 hybrid path)."""
     try:
         # sm100: tilelang's GDN bwd miscomputes grads — warm the Triton path the worker will run.
@@ -129,9 +141,9 @@ def warm_fla_gdn(torch) -> bool:
             _restrict_fla_gdn_autotune_on_blackwell()
         except Exception as e:
             _log(f"blackwell fla autotune restriction skipped: {e}")
-        from fla.ops.gated_delta_rule import chunk_gated_delta_rule
+        chunk_gated_delta_rule = _training_gdn_kernel()
 
-        b, h, t, d = 1, 4, 256, 64
+        b, h, t, d = 1, heads, 256, head_dim
         q = torch.randn(b, t, h, d, device="cuda", dtype=torch.bfloat16, requires_grad=True)
         k = torch.randn(b, t, h, d, device="cuda", dtype=torch.bfloat16, requires_grad=True)
         v = torch.randn(b, t, h, d, device="cuda", dtype=torch.bfloat16, requires_grad=True)
@@ -162,9 +174,29 @@ def warm_fla_gdn(torch) -> bool:
             _log("flash-linear-attention GDN varlen (cu_seqlens) fwd/bwd compiled")
         except Exception as e:
             _log(f"fla GDN varlen warm skipped: {e}")
+            return False
         return True
     except Exception as e:
         _log(f"fla GDN warm skipped: {e}")
+        return False
+
+
+def warm_flashinfer_gdn(torch) -> bool:
+    """Compile vLLM's Hopper GDN prefill library in the pinned training interpreter."""
+    try:
+        from flashinfer.gdn_prefill import get_gdn_prefill_module
+        from flashinfer.jit import env
+
+        from flash.engine.worker.train.core.child import flashinfer_cache
+
+        flashinfer_cache.activate(env)
+        get_gdn_prefill_module()
+        torch.cuda.synchronize()
+        flashinfer_cache.publish(env, torch)
+        _log("flashinfer GDN prefill library compiled and loaded")
+        return True
+    except Exception as error:
+        _log(f"flashinfer GDN prefill warm failed: {error}")
         return False
 
 
@@ -172,7 +204,7 @@ def has_raw_kernel_cache(out_dir: str) -> bool:
     """Require compiled artifacts, not just empty directories or lock files."""
     return any(
         name.endswith((".cubin", ".ptx", ".so")) and os.path.getsize(os.path.join(root, name)) > 0
-        for subdir in ("triton", "inductor")
+        for subdir in set(KERNEL_CACHE_ENV_SUBDIRS.values())
         for root, _, files in os.walk(os.path.join(out_dir, subdir))
         for name in files
     )
@@ -182,6 +214,8 @@ def save_cache_metadata(torch, out_dir: str, *, requested_arch: str | None, warm
     try:
         meta = {
             "sm": _torch_sm(torch),
+            "python": f"{sys.version_info.major}.{sys.version_info.minor}",
+            "interpreter": sys.executable,
             "requested_arch": requested_arch,
             "torch": getattr(torch, "__version__", "unknown"),
             "cuda": getattr(getattr(torch, "version", None), "cuda", None),
@@ -208,10 +242,7 @@ def configure_kernel_cache() -> bool:
         # Repoint triton/inductor off baked trees so JIT compiles fresh; wrong-arch entries would collide.
         print(f"[kernel-cache] {reason} -> first-run JIT fallback")
         scratch = os.path.join(tempfile.gettempdir(), "flash-kernelcache-jit")
-        for sub, var in (("triton", "TRITON_CACHE_DIR"), ("inductor", "TORCHINDUCTOR_CACHE_DIR")):
-            d = os.path.join(scratch, sub)
-            os.makedirs(d, exist_ok=True)
-            os.environ[var] = d
+        _point_backends_at(scratch)
         return False
 
     # An unbaked image may accumulate runtime JIT files; leave those alone without probing CUDA.
@@ -237,6 +268,13 @@ def configure_kernel_cache() -> bool:
             return _reject(
                 f"baked cache arch {cached_sm or 'unknown'} does not match worker arch {current_sm}"
             )
+        for key, current in (
+            ("torch", getattr(torch, "__version__", "unknown")),
+            ("cuda", getattr(getattr(torch, "version", None), "cuda", None)),
+            ("python", f"{sys.version_info.major}.{sys.version_info.minor}"),
+        ):
+            if meta.get(key) != current:
+                return _reject(f"baked cache {key} does not match worker runtime")
         _point_backends_at(DEFAULT_CACHE_DIR)
         print(f"[kernel-cache] using baked raw kernel caches for {cached_sm}")
         return True
@@ -266,17 +304,15 @@ def warmup(out_dir: str = DEFAULT_CACHE_DIR, arch: str | None = None) -> int:
                 "re-run on a matching GPU."
             )
             return 1
-    warmed = sum(
-        [
-            warm_flash_attn(torch),
-            warm_fla_gdn(torch),
-        ]
-    )
-    _log(f"{warmed}/2 kernel groups warmed in {time.time() - t0:.1f}s")
+    groups = [warm_flash_attn, warm_fla_gdn]
+    if torch.cuda.get_device_capability(0)[0] == 9:
+        groups.append(warm_flashinfer_gdn)
+    warmed = sum(group(torch) for group in groups)
+    _log(f"{warmed}/{len(groups)} kernel groups warmed in {time.time() - t0:.1f}s")
     has_kernels = has_raw_kernel_cache(out_dir)
     meta_saved = save_cache_metadata(torch, out_dir, requested_arch=arch, warmed=warmed)
     _log(f"done in {time.time() - t0:.1f}s (raw_kernels={has_kernels}, metadata={meta_saved})")
-    return 0 if warmed and meta_saved and has_kernels else 1
+    return 0 if warmed == len(groups) and meta_saved and has_kernels else 1
 
 
 def main() -> int:

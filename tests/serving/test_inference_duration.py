@@ -55,12 +55,12 @@ class _Owner:
         self.engine = _Engine()
 
     async def _lora_request(self, _adapter_id: str, _record_dict: Any) -> tuple[Any, Any]:
-        return SimpleNamespace(lora_name=self.record.adapter_id), self.record
+        return SimpleNamespace(lora_name=self.record.model_id), self.record
 
     @staticmethod
     def _lora_request_attestation(record: AdapterRecord, lora_request: Any) -> str:
-        assert lora_request.lora_name == record.adapter_id
-        return record.adapter_id
+        assert lora_request.lora_name == record.model_id
+        return record.model_id
 
     def _enforce_expected_checkpoint(
         self, record: AdapterRecord, expected_checkpoint: str | None
@@ -152,7 +152,7 @@ def _revision() -> AdapterRecord:
     checkpoint_id = f"{run_id}/final"
     return AdapterRecord.model_validate(
         {
-            "adapter_id": checkpoint_id,
+            "model_id": checkpoint_id,
             "repo_id": "org/duration",
             "org_id": "org-1",
             "base_model": BASE_MODEL,
@@ -223,7 +223,7 @@ def test_nonstream_completed_generation_uses_monotonic_duration(
         response = client.post(
             "/v1/chat/completions",
             json={
-                "model": record.adapter_id,
+                "model": record.model_id,
                 "messages": [{"role": "user", "content": "hello"}],
             },
         )
@@ -254,7 +254,7 @@ def test_stream_completed_generation_uses_monotonic_duration(
             "POST",
             "/v1/chat/completions",
             json={
-                "model": record.adapter_id,
+                "model": record.model_id,
                 "messages": [{"role": "user", "content": "hello"}],
                 "stream": True,
                 "stream_options": {"include_usage": True},
@@ -291,7 +291,7 @@ def test_invalid_duration_never_reaches_durable_finalization(invalid_duration: f
         principal=principal_for_external_org("org-1"),
         requested=record,
         target=record,
-        result={"checkpoint": record.checkpoint, "lora_request_adapter": record.adapter_id},
+        result={"checkpoint": record.checkpoint, "lora_request_adapter": record.model_id},
         deployment_id="deployment-1",
         serving_release="release-1",
         captured_at=datetime(2026, 8, 26, tzinfo=UTC),
@@ -303,7 +303,7 @@ def test_invalid_duration_never_reaches_durable_finalization(invalid_duration: f
         "thinking": False,
         "inference_time_seconds": invalid_duration,
         "checkpoint": record.checkpoint,
-        "lora_request_adapter": record.adapter_id,
+        "lora_request_adapter": record.model_id,
     }
 
     with pytest.raises(UsageOutboxError, match="usage_duration_invalid"):

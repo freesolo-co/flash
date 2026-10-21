@@ -93,7 +93,16 @@ def test_cleanup_covers_input_upload_and_never_overrides_result(
     monkeypatch.setattr(bake, "_verify", lambda *a: 0)
 
     def download(**kwargs):
-        (Path(kwargs["local_dir"]) / "out").mkdir()
+        import io
+        import tarfile
+
+        out = Path(kwargs["local_dir"]) / "out"
+        out.mkdir()
+        (out / "bake-warmup.log").write_bytes(b"current bake")
+        with tarfile.open(out / "kernel_cache.tar.gz", "w:gz") as archive:
+            entry = tarfile.TarInfo("bake-warmup.log")
+            entry.size = len(b"old image log")
+            archive.addfile(entry, io.BytesIO(b"old image log"))
 
     monkeypatch.setattr(huggingface_hub, "snapshot_download", download)
     monkeypatch.setattr(
@@ -116,4 +125,33 @@ def test_cleanup_covers_input_upload_and_never_overrides_result(
             bake.main()
     else:
         assert bake.main() == 0
+        assert (tmp_path / "out/bake-warmup.log").read_bytes() == b"current bake"
+        assert (tmp_path / "out/warmup.log").read_bytes() == b"current bake"
     assert len(deleted) == 1
+
+
+@pytest.mark.parametrize("name", ["../escape", "/absolute"])
+def test_cache_archive_rejects_escaping_paths(tmp_path, name):
+    import io
+    import tarfile
+
+    path = tmp_path / "cache.tar.gz"
+    with tarfile.open(path, "w:gz") as archive:
+        entry = tarfile.TarInfo(name)
+        entry.size = 1
+        archive.addfile(entry, io.BytesIO(b"x"))
+    with pytest.raises(ValueError, match="invalid kernel cache"):
+        bake_module()._extract_cache_archive(path, tmp_path / "out")
+
+
+def test_cache_archive_preserves_hidden_backend_directories(tmp_path):
+    import io
+    import tarfile
+
+    path = tmp_path / "cache.tar.gz"
+    with tarfile.open(path, "w:gz") as archive:
+        entry = tarfile.TarInfo("flashinfer/.cache/kernel.so")
+        entry.size = 8
+        archive.addfile(entry, io.BytesIO(b"compiled"))
+    bake_module()._extract_cache_archive(path, tmp_path / "out")
+    assert (tmp_path / "out/flashinfer/.cache/kernel.so").read_bytes() == b"compiled"

@@ -68,7 +68,7 @@ class _FailingPool:
                 "type": "ready",
                 "checkpoint": "run-a/final",
                 "thinking": False,
-                "lora_request_adapter": record.adapter_id,
+                "lora_request_adapter": record.model_id,
             }
             yield {"type": "delta", "text": "Hello"}
         raise self._exc
@@ -76,7 +76,7 @@ class _FailingPool:
     async def register(self, base_model, record):
         return None
 
-    async def unregister(self, base_model, adapter_id, expected_generation=None):
+    async def unregister(self, base_model, model_id, expected_generation=None):
         return None
 
 
@@ -86,7 +86,7 @@ class _CleanlyTruncatedPool(_FailingPool):
             "type": "ready",
             "checkpoint": "run-a/final",
             "thinking": False,
-            "lora_request_adapter": record.adapter_id,
+            "lora_request_adapter": record.model_id,
         }
         yield {"type": "delta", "text": "partial"}
 
