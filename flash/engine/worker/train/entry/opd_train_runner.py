@@ -318,6 +318,7 @@ def _write_child_shims(
         ("train/opd/child/entry.py", "flash_opd_entry.py"),
         ("train/opd/child/replay_guard.py", "flash_opd_replay_guard.py"),
         ("../../_internal/diagnostics.py", "flash_child_diagnostics.py"),
+        ("train/core/child/flashinfer_cache.py", "flash_verl_flashinfer.py"),
     )
     for source, target in copies:
         shutil.copy2(os.path.join(parent_dir, *source.split("/")), os.path.join(shim_dir, target))

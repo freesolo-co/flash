@@ -16,19 +16,19 @@ CHECKPOINT_MODEL = "flash-1783788692-948932a3/step-32"
 BASE_RUN_ID = "flash-1783788692-948932a3"
 
 
-def _rec(adapter_id: str, *, serve_base_model: bool = False) -> AdapterRecord:
-    run_id, checkpoint = adapter_id.split("/", 1)
+def _rec(model_id: str, *, serve_base_model: bool = False) -> AdapterRecord:
+    run_id, checkpoint = model_id.split("/", 1)
     checkpoint_step = None if checkpoint == "final" else int(checkpoint.removeprefix("step-"))
     return AdapterRecord.model_validate(
         {
-            "adapter_id": adapter_id,
+            "model_id": model_id,
             "repo_id": QWEN if serve_base_model else f"org/{run_id}",
             "base_model": QWEN,
             "org_id": None if serve_base_model else "org-a",
             "status": "ready",
             "thinking": True,
             "serve_base_model": serve_base_model,
-            "checkpoint": None if serve_base_model else adapter_id,
+            "checkpoint": None if serve_base_model else model_id,
             "run_id": None if serve_base_model else run_id,
             "checkpoint_step": None if serve_base_model else checkpoint_step,
             "artifact_revision": None if serve_base_model else "a" * 40,
@@ -44,7 +44,7 @@ class FakePool:
         self.generated: list[str] = []
 
     async def generate(self, base_model, payload, record, *, expected_checkpoint=None):
-        self.generated.append(payload.adapter_id)
+        self.generated.append(payload.model_id)
         return {
             "text": "hi",
             "finish_reason": "stop",
@@ -54,7 +54,7 @@ class FakePool:
         }
 
     async def stream_generate(self, base_model, payload, record, *, expected_checkpoint=None):
-        self.generated.append(payload.adapter_id)
+        self.generated.append(payload.model_id)
         yield {"type": "ready", "checkpoint": ""}
         yield {"type": "final", "finish_reason": "stop", "prompt_tokens": 1, "completion_tokens": 1}
 
@@ -62,7 +62,7 @@ class FakePool:
         pass
 
     async def unregister(
-        self, base_model, adapter_id, expected_generation=None
+        self, base_model, model_id, expected_generation=None
     ) -> None:  # pragma: no cover
         pass
 
@@ -72,8 +72,8 @@ class FakeAuthorizer:
         self.calls: list[tuple[str, str]] = []
         self.error = error
 
-    async def __call__(self, token: str, adapter_id: str, scope: dict | None = None) -> str:
-        self.calls.append((token, adapter_id))
+    async def __call__(self, token: str, model_id: str, scope: dict | None = None) -> str:
+        self.calls.append((token, model_id))
         if self.error is not None:
             raise self.error
         return "caller-org"

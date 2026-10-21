@@ -257,7 +257,7 @@ class _CountingPool:
 
 def _base_model_client(authorize, pool, *, usage_store=None) -> TestClient:
     record = AdapterRecord(
-        adapter_id=_QWEN,
+        model_id=_QWEN,
         repo_id=_QWEN,
         base_model=_QWEN,
         serve_base_model=True,
