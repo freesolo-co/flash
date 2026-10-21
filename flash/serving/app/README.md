@@ -83,6 +83,14 @@ are omitted; checkpoint identity and token accounting remain required.
 
 #### Promotion gate
 
+Before deploying this gate, apply
+`frontend/supabase/migrations/20261019010000_serving_promotion_accounting.sql` from
+[freesolo PR #784](https://github.com/freesolo-co/freesolo/pull/784) to the production Supabase
+database. It adds `public.serving_promotion_accounting_snapshot`, callable only by `service_role`;
+the gate uses `SUPABASE_SERVICE_ROLE_KEY` to read it. The migration must precede the Flash deployment:
+an unavailable RPC or malformed response cannot pass accounting, and failure within the polling
+window triggers the rollback described below.
+
 Set the repository Actions variable `SERVING_CANARY_ORG_ID` to an existing Freesolo-owned
 organization UUID with billing configured. The canary sends it as `X-Freesolo-Org-Id`; its
 usage is attributed and charged to that organization, never to an invented tenant or an
@@ -105,21 +113,25 @@ workflow runs `python -m flash.serving.promotion.gate`, which must prove all thr
 2. an authenticated `stream=true` request carrying `X-Correlation-ID: fspromo-<run>-<attempt>`
    returns SSE with at least one non-empty content delta, a terminal finish reason, terminal usage
    with non-zero completion tokens, and `data: [DONE]`;
-3. this release's durable delivery loop is running rather than wedged: no expired lease, and no
-   undelivered row older than the stall threshold.
+3. the canary's own usage has been durably delivered, with no expired lease anywhere in the backlog
+   and no undelivered row at or beyond the 360-second stall threshold.
 
 Exact-head binding comes from steps 1 and 2 together. The router proves its identity, and then that
 same router serves a real generation; engines receive only `HF_TOKEN` and cannot report a release
 sha, and `engine_replica_id` is stripped from public bodies, so the response itself cannot carry it.
 
-Step 3 is deliberately weaker than "the canary's own usage row settled". The only durable accounting
-surface the router exposes is `serving_usage_backlog_snapshot`, which aggregates every generation in
-flight and has no per-correlation read. Asserting a drained backlog there would be **fail-open** (a
-burst of unrelated traffic can drain the counters to zero while the canary's own row is stuck) and
-flaky besides (live traffic keeps them nonzero on a perfectly healthy release). Expired leases and
-undelivered age are the parts of that snapshot that mean the same thing regardless of whose rows are
-in it. Proving per-request settlement would need a read-by-correlation-id RPC, which does not exist
-today; the canary still sends `X-Correlation-ID` so the row is identifiable by an operator.
+Step 3 calls `serving_promotion_accounting_snapshot` with the canary's organization, correlation ID,
+public model ID, deployment attempt ID, and release SHA. The RPC combines global backlog stall
+signals with `canary_settled`: at least one usage row must match all five fields, and every matching
+row must be delivered with positive completion tokens, terminal and delivery timestamps, and a
+billing usage ID. A fresh pending row or a missing canary row cannot pass. Unrelated pending or
+leased traffic may remain; promotion does not require an empty backlog.
+
+Accounting polls at five-second intervals within one 180-second monotonic deadline, including RPC
+latency and sleeps. A hung read is cancelled at the remaining deadline, sleeps are capped to that
+budget, and even a settled response arriving at or after the deadline cannot pass. The gate retries
+unsettled, stalled, unavailable, or malformed accounting evidence within this window; it promotes
+only after receiving valid settlement evidence with no global stall before the deadline.
 
 If any step after the deploy fails, the workflow redeploys the sha the live app reported _before_
 this deploy and re-reads `/healthz` to confirm the restored release under a distinct `-rollback`
