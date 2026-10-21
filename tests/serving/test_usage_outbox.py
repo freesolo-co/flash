@@ -26,7 +26,6 @@ from flash.serving.src.accounting.usage_outbox import (
     DurableUsageOutbox,
     FreesoloOrgTrafficPrincipal,
     OfflineUsageStore,
-    OutboxSnapshot,
     RequestIdentity,
     UsageEvent,
     UsageOutboxError,
@@ -1529,52 +1528,6 @@ def test_slow_delivery_shutdown_releases_every_single_row_claim() -> None:
     ]
     assert not any(url.endswith("/rpc/quarantine_serving_usage") for url, _ in client.calls)
     assert outbox._active_leases == set()
-
-
-def test_snapshot_is_immutable_and_does_not_mutate_state() -> None:
-    client = _QueuedClient(
-        [
-            (
-                200,
-                {
-                    "captured_at": "2026-08-24T12:00:00Z",
-                    "states": {
-                        "pending": 3,
-                        "leased": 2,
-                        "quarantined": 1,
-                        "disputed": 4,
-                    },
-                    "due_pending": 2,
-                    "expired_leases": 3,
-                    "expired_generation_leases": 5,
-                    "oldest_expired_generation_lease_age_seconds": 45,
-                    "oldest_undelivered_age_seconds": 90,
-                },
-            )
-        ]
-    )
-    outbox = DurableUsageOutbox(
-        _outbox_settings(), client=client, worker_id="worker-1", sleep=_no_sleep
-    )
-
-    snapshot = asyncio.run(outbox.snapshot())
-
-    assert snapshot == OutboxSnapshot(
-        captured_at=datetime(2026, 8, 24, 12, 0, tzinfo=UTC),
-        pending=3,
-        leased=2,
-        quarantined=1,
-        disputed=4,
-        due_pending=2,
-        expired_leases=3,
-        expired_generation_leases=5,
-        oldest_expired_generation_lease_age_seconds=45,
-        oldest_undelivered_age_seconds=90,
-    )
-    with pytest.raises(AttributeError):
-        snapshot.pending = 0  # type: ignore[misc]
-    assert len(client.calls) == 1
-    assert client.calls[0][0].endswith("/rpc/serving_usage_backlog_snapshot")
 
 
 class _StreamSession:

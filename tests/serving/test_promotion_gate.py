@@ -37,7 +37,7 @@ DEPLOYMENT_ID = "12345-1"
 def _Snapshot(
     pending=0, leased=0, expired_leases=0, oldest_undelivered_age_seconds=None, canary_settled=True
 ):
-    """A backlog RPC body, shaped exactly as `serving_usage_backlog_snapshot` returns it.
+    """A backlog RPC body, shaped exactly as `serving_promotion_accounting_snapshot` returns it.
 
     `pending`/`leased` are still sent by the RPC and still shaped here, because the point of the
     test below is that a deployment-wide backlog does NOT fail a promotion. The gate no longer

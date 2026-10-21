@@ -178,20 +178,6 @@ class UsageEvent:
         }
 
 
-@dataclass(frozen=True)
-class OutboxSnapshot:
-    captured_at: datetime
-    pending: int
-    leased: int
-    quarantined: int
-    disputed: int
-    due_pending: int
-    expired_leases: int
-    expired_generation_leases: int
-    oldest_expired_generation_lease_age_seconds: int | None
-    oldest_undelivered_age_seconds: int | None
-
-
 class UsageOutboxError(RuntimeError):
     """Sanitized durable accounting failure safe to expose by class only."""
 
@@ -209,7 +195,6 @@ class UsageStore(Protocol):
     async def finalize(self, event: UsageEvent) -> None: ...
     async def fail(self, event: UsageEvent, code: str) -> None: ...
     def relinquish(self, request_id: str) -> None: ...
-    async def snapshot(self) -> OutboxSnapshot: ...
     async def recover_stale_in_progress(self) -> None: ...
     async def aclose(self) -> None: ...
 
@@ -236,9 +221,6 @@ class OfflineUsageStore:
 
     def relinquish(self, request_id: str) -> None:
         del request_id
-
-    async def snapshot(self) -> OutboxSnapshot:
-        raise UsageOutboxError("usage_outbox_disabled")
 
     async def recover_stale_in_progress(self) -> None:
         return None
@@ -375,33 +357,6 @@ class DurableUsageOutbox:
         self._terminal_generations.discard(request_id)
         self._generation_lease_deadlines.pop(request_id, None)
         self._heartbeat_wake.set()
-
-    async def snapshot(self) -> OutboxSnapshot:
-        data = await self._rpc("serving_usage_backlog_snapshot", {})
-        if isinstance(data, list):
-            data = data[0] if data else None
-        if not isinstance(data, dict):
-            raise UsageOutboxError("usage_snapshot_invalid")
-        states = data.get("states")
-        if not isinstance(states, dict):
-            states = {}
-        captured_at = _parse_datetime(data.get("captured_at"))
-        oldest = data.get("oldest_undelivered_age_seconds")
-        expired_age = data.get("oldest_expired_generation_lease_age_seconds")
-        return OutboxSnapshot(
-            captured_at=captured_at,
-            pending=int(states.get("pending") or 0),
-            leased=int(states.get("leased") or 0),
-            quarantined=int(states.get("quarantined") or 0),
-            disputed=int(states.get("disputed") or 0),
-            due_pending=int(data.get("due_pending") or 0),
-            expired_leases=int(data.get("expired_leases") or 0),
-            expired_generation_leases=int(data.get("expired_generation_leases") or 0),
-            oldest_expired_generation_lease_age_seconds=(
-                None if expired_age is None else int(expired_age)
-            ),
-            oldest_undelivered_age_seconds=None if oldest is None else int(oldest),
-        )
 
     async def recover_stale_in_progress(self) -> None:
         await self._rpc(
