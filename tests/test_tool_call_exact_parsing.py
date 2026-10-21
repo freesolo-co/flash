@@ -1598,7 +1598,7 @@ def test_merged_self_derived_declarations_stay_under_the_property_ceiling(
     # the hosted envelope is a second entry into the same replay validation, so pin the ceiling
     # there too rather than assuming one caller speaks for both.
     hosted = OpenAIGenerateRequest(
-        adapter_id="adapter", generation_id="generation", messages=payload["messages"]
+        model_id="adapter", generation_id="generation", messages=payload["messages"]
     )
 
     assert [item["function"]["name"] for item in hosted.messages[0]["tool_calls"]] == ["f", "f"]
@@ -1621,7 +1621,7 @@ def test_hosted_envelope_enforces_the_replay_declaration_ceiling() -> None:
 
     with pytest.raises(ValidationError, match="cannot be replayed exactly"):
         OpenAIGenerateRequest(
-            adapter_id="adapter",
+            model_id="adapter",
             generation_id="generation",
             messages=[
                 {"role": "assistant", "content": None, "tool_calls": calls},
@@ -1772,7 +1772,7 @@ def _hosted_tool_request(tool_choice: str) -> OpenAIGenerateRequest:
         )
     )
     return OpenAIGenerateRequest(
-        adapter_id="adapter",
+        model_id="adapter",
         generation_id="generation",
         messages=messages,
         tools=declarations,
@@ -1813,7 +1813,7 @@ def test_hosted_request_accepts_unambiguous_history_under_active_declarations() 
     )
 
     request = OpenAIGenerateRequest(
-        adapter_id="adapter",
+        model_id="adapter",
         generation_id="generation",
         messages=[
             {

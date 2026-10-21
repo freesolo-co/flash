@@ -16,9 +16,43 @@ SOURCE_REVISION = "a" * 40
 ARTIFACT_DIGEST = "b" * 64
 
 
+def test_canonical_identity_names_and_fingerprint() -> None:
+    payload = _payload()
+    model_id = payload.pop("model_id")
+    registration = ImmutableCheckpointRegistration(model_id=model_id, **payload)
+    record = registration.to_record()
+
+    assert registration.model_id == record.model_id == CHECKPOINT_ID
+    assert registration.model_dump()["model_id"] == CHECKPOINT_ID
+    assert record.model_dump()["model_id"] == CHECKPOINT_ID
+    assert "adapter_id" not in registration.model_dump()
+    assert "adapter_id" not in record.model_dump()
+    # Fixed canonical encoding: the model_id key is part of the fingerprint.
+    expected = "a930d9bd4c6d38e4ff5cbb96705b11b31d763386c0bb9bf9cc414ada8ab6d71c"
+    assert immutable_binding_fingerprint(registration) == expected
+    assert immutable_binding_fingerprint(record) == expected
+    assert registration.artifact_fingerprint == expected
+
+
+def test_base_model_identity_is_not_a_checkpoint() -> None:
+    record = AdapterRecord(
+        model_id="Qwen/Qwen3.5-9B",
+        repo_id="Qwen/Qwen3.5-9B",
+        base_model="Qwen/Qwen3.5-9B",
+        serve_base_model=True,
+        thinking=False,
+    )
+    assert record.model_id == "Qwen/Qwen3.5-9B"
+    assert not record.is_checkpoint
+    with pytest.raises(ValueError, match="base-model records"):
+        _ = record.storage_key
+    with pytest.raises(ValidationError, match="canonical checkpoint identity"):
+        ImmutableCheckpointRegistration.model_validate(_payload(model_id=record.model_id))
+
+
 def _payload(**overrides: object) -> dict[str, object]:
     payload: dict[str, object] = {
-        "adapter_id": CHECKPOINT_ID,
+        "model_id": CHECKPOINT_ID,
         "repo_id": "org/run",
         "base_model": "Qwen/Qwen3.5-9B",
         "subfolder": "checkpoints/step-20",
@@ -63,13 +97,13 @@ def test_registration_requires_canonical_private_artifact_digests(field: str) ->
 @pytest.mark.parametrize(
     ("field", "value"),
     [
-        ("adapter_id", f"{RUN_ID}/step-21"),
+        ("model_id", f"{RUN_ID}/step-21"),
         ("checkpoint", f"{RUN_ID}/step-21"),
         ("run_id", "other-run"),
         ("checkpoint_step", 21),
     ],
 )
-def test_registration_requires_one_canonical_checkpoint_identity(field: str, value: object) -> None:
+def test_registration_requires_one_canonical_model_identity(field: str, value: object) -> None:
     with pytest.raises(ValidationError, match="canonical checkpoint identity"):
         ImmutableCheckpointRegistration.model_validate(_payload(**{field: value}))
 
@@ -133,7 +167,7 @@ def test_persisted_rows_require_exact_checkpoint_and_timestamp() -> None:
         "updated_at": "2026-08-26T00:00:00+00:00",
     }
     persisted = PersistedAdapterRecord.model_validate(row)
-    assert persisted.adapter_id == CHECKPOINT_ID
+    assert persisted.model_id == CHECKPOINT_ID
 
     with pytest.raises(ValidationError, match="updated_at"):
         PersistedAdapterRecord.model_validate({**row, "updated_at": None})
@@ -142,7 +176,7 @@ def test_persisted_rows_require_exact_checkpoint_and_timestamp() -> None:
 def test_base_model_record_remains_a_separate_identity_kind() -> None:
     base = AdapterRecord.model_validate(
         {
-            "adapter_id": "Qwen/Qwen3.5-9B",
+            "model_id": "Qwen/Qwen3.5-9B",
             "repo_id": "Qwen/Qwen3.5-9B",
             "base_model": "Qwen/Qwen3.5-9B",
             "serve_base_model": True,
@@ -150,3 +184,60 @@ def test_base_model_record_remains_a_separate_identity_kind() -> None:
         }
     )
     assert not base.is_checkpoint
+
+
+@pytest.mark.parametrize("retain_canonical", [False, True])
+def test_registration_rejects_legacy_adapter_id(retain_canonical: bool) -> None:
+    payload = _payload()
+    payload["adapter_id"] = payload["model_id"]
+    if not retain_canonical:
+        del payload["model_id"]
+    with pytest.raises(ValidationError, match="adapter_id"):
+        ImmutableCheckpointRegistration.model_validate(payload)
+
+
+def test_registration_rejects_pre_rename_fingerprint() -> None:
+    with pytest.raises(ValidationError, match="immutable binding"):
+        ImmutableCheckpointRegistration.model_validate(
+            _payload(
+                artifact_fingerprint="b0901013f208f06c0a221fac29a5b2b30237393b18f8ecd8e35cc107753604ed"
+            )
+        )
+
+
+@pytest.mark.parametrize("retain_canonical", [False, True])
+def test_generation_rejects_legacy_adapter_id(retain_canonical: bool) -> None:
+    from flash.serving.src.io.schemas import GenerateRequest
+
+    payload = {"model_id": CHECKPOINT_ID, "adapter_id": CHECKPOINT_ID, "prompt": "hello"}
+    if not retain_canonical:
+        del payload["model_id"]
+    with pytest.raises(ValidationError, match="adapter_id"):
+        GenerateRequest.model_validate(payload)
+
+
+@pytest.mark.parametrize("retain_canonical", [False, True])
+def test_record_rejects_legacy_adapter_id(retain_canonical: bool) -> None:
+    from flash.serving.src.io.schemas import internal_adapter_payload
+
+    record = ImmutableCheckpointRegistration.model_validate(_payload()).to_record()
+    payload = internal_adapter_payload(record)
+    payload["adapter_id"] = payload["model_id"]
+    if not retain_canonical:
+        del payload["model_id"]
+    with pytest.raises(ValidationError, match="adapter_id"):
+        AdapterRecord.model_validate(payload)
+
+
+@pytest.mark.parametrize("schema", [ImmutableCheckpointRegistration, AdapterRecord])
+def test_serving_models_have_one_identity_field(schema) -> None:
+    assert "model_id" in schema.model_fields
+    assert "checkpoint_id" not in schema.model_fields
+    assert not hasattr(schema, "checkpoint_id")
+
+
+def test_registration_rejects_checkpoint_id_alias() -> None:
+    payload = _payload()
+    payload["checkpoint_id"] = payload.pop("model_id")
+    with pytest.raises(ValidationError, match="checkpoint_id"):
+        ImmutableCheckpointRegistration.model_validate(payload)

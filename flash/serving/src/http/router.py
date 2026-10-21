@@ -18,7 +18,10 @@ from typing import Any
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 
-from flash.serve.contract.protocol import MAX_CHAT_REQUEST_BYTES
+from flash.serve.contract.protocol import (
+    MAX_CHAT_REQUEST_BYTES,
+    REQUIRED_SERVING_CAPABILITIES,
+)
 from flash.serving.src.accounting.usage_outbox import OfflineUsageStore, UsageStore
 from flash.serving.src.http.adapter_routes import adapter_router
 from flash.serving.src.http.body_limit import RequestBodyLimitMiddleware
@@ -32,7 +35,7 @@ THINKING_STRUCTURED_OUTPUTS_DEFERRED_CAPABILITY = "thinking_structured_outputs_d
 _CLEANUP_TIMEOUT_SECONDS = 10.0
 
 _CAPABILITIES = (
-    "permanent_checkpoint_identity",
+    *sorted(REQUIRED_SERVING_CAPABILITIES),
     THINKING_STRUCTURED_OUTPUTS_DEFERRED_CAPABILITY,
 )
 
@@ -71,7 +74,7 @@ def build_serving_app(
     partially wired hosted deployment to unmetered serving.
 
     External chat/inference auth is ALWAYS enforced. ``chat_authorizer`` authorizes a user request:
-    it is called with ``(freesolo_api_key, adapter_id)`` and must raise an ``HTTPException`` (401/403)
+    it is called with ``(freesolo_api_key, model_id)`` and must raise an ``HTTPException`` (401/403)
     when the key's org does not own the adapter (a base-model serve is authorized for any valid key).
     It returns the caller's org id, which bills a base-model serve to the caller (no adapter owner).
     Trusted server-to-server callers presenting the shared internal key bypass it. If no
