@@ -510,9 +510,9 @@ def test_the_fallback_install_keeps_compatibility_overrides_and_exact_runtime_pi
     assert "--override" in install
     override_file = install[install.index("--override") + 1]
     written = pathlib.Path(override_file).read_text()
-    # runtime pins stay aligned; numpy and xgrammar override incompatible metadata.
+    # runtime pins stay aligned; xgrammar overrides incompatible metadata.
     assert "vllm==0.19.1" in written  # matches the worker image
-    assert "numpy==2.2.6" in written  # verl + transferqueue declare numpy<2.0.0
+    assert "numpy==2.2.6" in written  # matches the worker image
     assert "xgrammar==0.1.25" in written  # vllm declares xgrammar>=0.1.32
 
 
@@ -529,8 +529,8 @@ def test_provisioned_venv_can_import_the_entrypoints_flash_launches(monkeypatch,
     vc.resolve_verl_python(str(tmp_path))
 
     install = calls[1]
-    # the [vllm] extra, as Dockerfile.worker's VERL_SPEC asks for it, on the same commit.
-    assert f"verl[vllm] @ {vc.VERL_REQUIREMENT_URL}" in install
+    # the bare package, as Dockerfile.worker's VERL_SPEC asks for it, on the same commit.
+    assert f"verl @ {vc.VERL_REQUIREMENT_URL}" in install
     # the explicit model/adapter runtime uses this exact vllm version.
     assert "vllm==0.19.1" in install
     for requirement in ("cachetools==7.1.7", "uvicorn==0.52.4", "fastapi==0.141.1"):
@@ -1327,7 +1327,7 @@ def test_verl_spec_stays_in_lockstep_with_the_worker_image():
     # the default image exports FLASH_VERL_PYTHON, so its baked interpreter bypasses the fallback
     # resolver entirely. both paths must pin the same commit or live workers miss dependency fixes.
     dockerfile = pathlib.Path(__file__).resolve().parents[1] / "Dockerfile.worker"
-    expected = f"ARG VERL_SPEC=verl[vllm]@{vc.VERL_REQUIREMENT_URL}"
+    expected = f"ARG VERL_SPEC=verl@{vc.VERL_REQUIREMENT_URL}"
     assert expected in dockerfile.read_text(), (
         "Dockerfile.worker's VERL_SPEC drifted from backend_common.VERL_REQUIREMENT_URL"
     )

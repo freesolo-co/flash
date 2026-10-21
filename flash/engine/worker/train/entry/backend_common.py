@@ -30,9 +30,8 @@ VERL_REQUIREMENT_NAME = "verl"
 VERL_REQUIREMENT_URL = (
     "git+https://github.com/verl-project/verl@ddf700725c34bb8966685c8ecf5ca36a2cc54a35"
 )
-# the pin, as the venv stamp records it. the provisioning install asks for the [vllm] extra of this
-# same commit; the stamp stays extra-free so it identifies the verl a venv holds, not how it was
-# installed.
+# the pin, as the venv stamp records it. the provisioning install uses the bare upstream package
+# at this commit; GPU dependencies are selected explicitly alongside it.
 VERL_REQUIREMENT = f"{VERL_REQUIREMENT_NAME} @ {VERL_REQUIREMENT_URL}"
 
 # the FA2 wheel the verl interpreter needs, kept byte-identical to Dockerfile.worker's

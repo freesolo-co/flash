@@ -12,6 +12,8 @@ Each receives `--flash-config <launch.json>` and Hydra overrides. The JSON conta
 
 Both worker installation paths pin unmodified [`verl-project/verl` at `ddf700725c34bb8966685c8ecf5ca36a2cc54a35`](https://github.com/verl-project/verl/commit/ddf700725c34bb8966685c8ecf5ca36a2cc54a35). Its distribution version is `0.10.0.dev0`; the immutable commit, rather than that development version string, identifies the source. This revision supports Flash's Transformers 5.12.1 dependency. Flash also pins vLLM 0.19.1 and TransferQueue 0.1.11 in its worker environments.
 
+The installer uses the bare upstream package plus Flash's explicit CUDA 12.8 / Torch 2.10 stack. Upstream's `[vllm]` extra selects its complete CUDA 13 / Torch 2.13 environment and is deliberately not combined with Flash's worker image.
+
 Before constructing a trainer, `core.child.upstream` checks installed VCS metadata for the official repository and exact commit. An installation from a fork, another revision, or a wheel without VCS provenance fails with a rebuild instruction. `scripts/check_verl_pin_exists.py` checks the installation pins and fetches the commit from upstream.
 
 No change or PR to Verl is required. Flash no longer depends on the company fork's runtime interface, model factory, trainer callbacks, or worker subclasses. Upstream's own compatibility implementations remain upstream-owned and unmodified; this does not claim that upstream itself contains no patches.

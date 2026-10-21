@@ -442,10 +442,9 @@ def resolve_verl_python(workdir: str, *, install_wandb: bool = False) -> str:
                 py,
                 "--override",
                 overrides,
-                # the [vllm] extra, matching Dockerfile.worker's VERL_SPEC. verl's bare
-                # install_requires omits vllm, and every entrypoint flash launches needs it:
-                # the packaged RL agents use the upstream vllm server adapter.
-                f"{VERL_REQUIREMENT_NAME}[vllm] @ {VERL_REQUIREMENT_URL}",
+                # Upstream's [vllm] extra selects a full CUDA 13 / Torch 2.13 stack.
+                # Install the bare package with Flash's explicit CUDA 12.8 runtime instead.
+                f"{VERL_REQUIREMENT_NAME} @ {VERL_REQUIREMENT_URL}",
                 "vllm==0.19.1",
                 "numpy==2.2.6",
                 TRANSFORMERS_INSTALL_REQUIREMENT,

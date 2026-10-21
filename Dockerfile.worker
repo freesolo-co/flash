@@ -264,7 +264,9 @@ print('worker stack OK | torch', torch.__version__, '| cudnn', cudnn, '| triton'
 # fallback's install cost on every run; it is not what makes the backends runnable.
 #
 # vLLM is pinned to 0.19.1, matching the base stack above so the image carries ONE vLLM version.
-# Flash pins the tested vLLM and Transformers versions alongside the exact upstream source.
+# Install the bare upstream package and Flash's explicit GPU stack. Upstream's [vllm] extra
+# selects its complete CUDA 13 / Torch 2.13 environment; this image uses CUDA 12.8 / Torch 2.10.
+# Flash pins vLLM and Transformers alongside the exact upstream source.
 # The remaining dependency-metadata override is xgrammar: vLLM declares >=0.1.32,
 # while structured OPD requires exactly 0.1.25. Upstream Verl and TransferQueue now support numpy>=2.
 # xgrammar 0.1.25 was exercised against vLLM 0.19.1's own XgrammarBackend (schema compile, grammar
@@ -308,7 +310,7 @@ print('worker stack OK | torch', torch.__version__, '| cudnn', cudnn, '| triton'
 # is_causal_conv1d_available() are byte-identical in 5.12.1 and 5.14.1, and both begin with
 # is_torch_cuda_available() -- they answer False on this cpu builder at every version. An earlier
 # revision of this comment blamed a 5.13 import-path move; no such move exists.
-ARG VERL_SPEC=verl[vllm]@git+https://github.com/verl-project/verl@ddf700725c34bb8966685c8ecf5ca36a2cc54a35
+ARG VERL_SPEC=verl@git+https://github.com/verl-project/verl@ddf700725c34bb8966685c8ecf5ca36a2cc54a35
 ENV FLASH_VERL_PYTHON=/opt/verl-venv/bin/python
 RUN printf '%s\n' "numpy==2.2.6" "xgrammar==0.1.25" "vllm==0.19.1" "transformers==5.12.1" > /tmp/verl-overrides.txt \
     && uv venv --seed /opt/verl-venv \
