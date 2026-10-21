@@ -259,7 +259,7 @@ def test_opd_parent_passes_model_checkpointing_and_vision_policy(
 
 @pytest.mark.parametrize("lengths", [(89, 89), (19, 23), (4, 4), (1, 1, 1, 1)])
 def test_multimodal_batch_decoding_preserves_each_position_axis(lengths):
-    import torch
+    torch = pytest.importorskip("torch")
 
     from flash.engine.worker.train.core.child.batch import normalize_position_ids
 
@@ -278,7 +278,7 @@ def test_multimodal_batch_decoding_preserves_each_position_axis(lengths):
 
 
 def test_multimodal_batch_decoding_rejects_mismatched_token_lengths():
-    import torch
+    torch = pytest.importorskip("torch")
 
     from flash.engine.worker.train.core.child.batch import normalize_position_ids
 
