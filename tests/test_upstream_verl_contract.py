@@ -594,3 +594,42 @@ def test_flash_worker_decodes_positions_before_upstream_execution(monkeypatch, m
     assert (
         getattr(FlashTrainingWorker.__new__(FlashTrainingWorker), method)(data) == "native result"
     )
+
+
+def test_opd_multiturn_bridge_scores_skip_native_reward_recomputation(monkeypatch):
+    import asyncio
+
+    from verl.experimental.agent_loop.agent_loop import AgentLoopOutput, AgentLoopWorker
+
+    from flash.engine.worker.train.opd.child import rollout
+
+    outputs = [
+        AgentLoopOutput(
+            prompt_ids=[1] * size,
+            response_ids=[2],
+            response_mask=[1],
+            metrics={},
+            extra_fields={"teacher_ids": [size], "teacher_logprobs": [-0.3]},
+        )
+        for size in (89, 111)
+    ]
+
+    async def run(self, sampling_params, **kwargs):
+        return outputs
+
+    monkeypatch.setattr(rollout._MultiTurn, "run", run)
+    agent = rollout.FlashMultiTurnAgentLoop.__new__(rollout.FlashMultiTurnAgentLoop)
+
+    async def verify():
+        result = await agent.run({})
+        # A configured reward service must not be invoked or reconstruct multimodal positions.
+        worker = AgentLoopWorker.__new__(AgentLoopWorker)
+        worker.reward_loop_worker_handles = [object()]
+        await worker._compute_score(result, {})
+        assert result is outputs
+        for output in result:
+            assert output.reward_score == 0.0
+            assert output.extra_fields["teacher_logprobs"] == [-0.3]
+            assert output.extra_fields["reward_extra_info"] == {}
+
+    asyncio.run(verify())

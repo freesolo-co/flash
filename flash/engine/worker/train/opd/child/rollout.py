@@ -101,6 +101,8 @@ class FlashMultiTurnAgentLoop(_MultiTurn):
     async def run(self, sampling_params, **kwargs):
         outputs = await super().run(sampling_params, **kwargs)
         for output in outputs:
+            # The bridge already supplies the distillation target for every turn.
+            output.reward_score = 0.0
             output.extra_fields.setdefault("reward_extra_info", {})
         return outputs
 
