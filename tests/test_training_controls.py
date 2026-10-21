@@ -570,3 +570,57 @@ def test_resume_without_repository_is_not_a_commit(monkeypatch, tmp_path):
     result = worker_hf.upload_resume_checkpoint(4, str(tmp_path))
     assert result.resume is None
     assert result.skipped_reason == "no_repository"
+
+
+def test_resume_transport_cleanup_failure_still_clears_previous_failure(monkeypatch, tmp_path):
+    import json
+    from contextlib import contextmanager
+    from pathlib import Path
+
+    from flash.engine.support import checkpoint_transport
+
+    uploads = []
+    reports = []
+
+    @contextmanager
+    def broken_cleanup(directory):
+        yield directory
+        raise OSError("transport cleanup failed")
+
+    class Api:
+        def upload_folder(self, **kwargs):
+            uploads.append(kwargs)
+            return SimpleNamespace(oid="resume-commit")
+
+        def list_repo_files(self, **kwargs):
+            raise OSError("pruning unavailable")
+
+    def upload_report(path, *args, **kwargs):
+        reports.append(json.loads(Path(path).read_text()))
+        return True
+
+    # restore heartbeat bookkeeping after exercising the real status publisher.
+    for name, value in vars(worker_heartbeat).copy().items():
+        if name.startswith("_HB_") and isinstance(value, (int, float, dict, type(None))):
+            monkeypatch.setattr(worker_heartbeat, name, value)
+    monkeypatch.setattr(worker_state, "HF_REPO", "org/runs")
+    monkeypatch.setattr(worker_hf, "hf_api", Api)
+    monkeypatch.setattr(worker_hf, "hf_upload_file", upload_report)
+    monkeypatch.setattr(checkpoint_transport, "upload_directory", broken_cleanup)
+    worker_heartbeat.heartbeat(
+        "checkpoint_upload_failed", step=3, checkpoint_failure={"step": 3, "error": "old failure"}
+    )
+
+    result = worker_hf.upload_resume_checkpoint(4, str(tmp_path))
+    worker_heartbeat.heartbeat("done", step=4)
+
+    assert result.resume.revision == "resume-commit"
+    assert len(uploads) == 1
+    assert result.upload_error is None
+    assert result.prune_errors == (
+        "OSError: transport cleanup failed",
+        "OSError: pruning unavailable",
+    )
+    assert worker_heartbeat._HB_PENDING_CHECKPOINT_FAILURE is None
+    assert reports[-1]["stage"] == "done"
+    assert "checkpoint_failure" not in reports[-1]

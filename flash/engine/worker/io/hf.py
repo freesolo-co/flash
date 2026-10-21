@@ -380,12 +380,17 @@ def _write_deployable_provenance(ckpt_dir: str) -> None:
         write_base_model_provenance(ckpt_dir, spec.model, getattr(spec, "model_revision", "") or "")
 
 
+# required checkpoint uploads share a bounded retry budget and deadline-aware backoff.
+_CKPT_UPLOAD_RETRIES = 3
+_CKPT_UPLOAD_BACKOFF_S = 5.0
+
+
 def publish_deployable_checkpoint(
     ckpt_dir: str,
     step: int,
     *,
-    retries: int = 1,
-    backoff_s: float = 0.0,
+    retries: int | None = None,
+    backoff_s: float = _CKPT_UPLOAD_BACKOFF_S,
     required: bool = False,
     _provenance_ready: bool = False,
     _emit_heartbeat: bool = True,
@@ -399,33 +404,41 @@ def publish_deployable_checkpoint(
     if not _provenance_ready:
         _write_deployable_provenance(ckpt_dir)
     subfolder = f"{hf_prefix()}/checkpoints/step-{step}/adapter"
+    if retries is None:
+        retries = _CKPT_UPLOAD_RETRIES if required else 1
     attempts = max(1, int(retries))
-    last_error = None
-    for attempt in range(attempts):
-        try:
-            _require_hf_deadline_allowance()
-            receipt = hf_api().upload_folder(
-                folder_path=ckpt_dir,
-                path_in_repo=subfolder,
-                repo_id=_worker_state.HF_REPO,
-                repo_type="dataset",
-                ignore_patterns=list(_CHECKPOINT_TRAINER_STATE),
-            )
-            break
-        except Exception as error:
-            last_error = error
-            print(f"[ckpt] deployable publish warn (step {step}):", error)
-            if attempt + 1 < attempts:
-                try:
-                    if _sleep_with_hf_deadline(backoff_s * (attempt + 1)):
-                        continue
-                except Exception:
-                    pass
-            if required:
-                raise RetriableInfraError(
-                    f"required save step {step} deployable upload failed"
-                ) from last_error
-            return PublicationResult(upload_error=sanitize_diagnostic(last_error, limit=300))
+    heartbeat_context = (
+        _worker_heartbeat.liveness_heartbeat(
+            "checkpoint_uploading", progress=lambda: step, progress_step=True, keepalive=True
+        )
+        if _emit_heartbeat
+        else contextlib.nullcontext()
+    )
+    with heartbeat_context:
+        for attempt in range(attempts):
+            try:
+                _require_hf_deadline_allowance()
+                receipt = hf_api().upload_folder(
+                    folder_path=ckpt_dir,
+                    path_in_repo=subfolder,
+                    repo_id=_worker_state.HF_REPO,
+                    repo_type="dataset",
+                    ignore_patterns=list(_CHECKPOINT_TRAINER_STATE),
+                )
+                break
+            except Exception as error:
+                print(f"[ckpt] deployable publish warn (step {step}):", error)
+                if attempt + 1 < attempts:
+                    try:
+                        if _sleep_with_hf_deadline(backoff_s * (attempt + 1)):
+                            continue
+                    except Exception:
+                        pass
+                if required:
+                    raise RetriableInfraError(
+                        f"required save step {step} deployable upload failed"
+                    ) from error
+                return PublicationResult(upload_error=sanitize_diagnostic(error, limit=300))
     commit = ArtifactCommit(subfolder, getattr(receipt, "oid", None))
     reporting_error = (
         _report_publication("checkpoint_deployable", step, subfolder=subfolder)
@@ -433,12 +446,6 @@ def publish_deployable_checkpoint(
         else None
     )
     return PublicationResult(deployable=commit, reporting_error=reporting_error)
-
-
-# Retry/backoff for each synchronous checkpoint upload. the watcher BLOCKS on the upload, so a
-# transient HF error is retried until the step lands rather than costing the step.
-_CKPT_UPLOAD_RETRIES = 3
-_CKPT_UPLOAD_BACKOFF_S = 5.0
 
 
 def _deployable_adapter_on_hf(step: int) -> bool:
@@ -533,6 +540,7 @@ def upload_resume_checkpoint(
         with heartbeat_context:
             commit = None
             last_error = None
+            prune_errors = ()
             for attempt in range(_CKPT_UPLOAD_RETRIES):
                 try:
                     _require_hf_deadline_allowance()
@@ -558,7 +566,8 @@ def upload_resume_checkpoint(
                     last_error = sanitize_diagnostic(error, limit=300)
                     if commit is not None:
                         # local transport cleanup failed after the remote commit.
-                        return PublicationResult(resume=commit, prune_errors=(last_error,))
+                        prune_errors = (last_error,)
+                        break
                     if attempt + 1 < _CKPT_UPLOAD_RETRIES:
                         try:
                             if _sleep_with_hf_deadline(_CKPT_UPLOAD_BACKOFF_S * (attempt + 1)):
@@ -582,9 +591,9 @@ def upload_resume_checkpoint(
                 )
                 return PublicationResult(upload_error=last_error, reporting_error=report_error)
             try:
-                prune_errors = _prune_stale_resume_checkpoints(step)
+                prune_errors += _prune_stale_resume_checkpoints(step)
             except Exception as error:
-                prune_errors = (sanitize_diagnostic(error, limit=300),)
+                prune_errors += (sanitize_diagnostic(error, limit=300),)
             report_error = (
                 _report_publication("checkpoint_uploaded", step) if emit_heartbeat else None
             )
