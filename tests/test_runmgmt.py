@@ -4251,3 +4251,56 @@ def _offline_modal_instance_probe(monkeypatch):
     from flash.providers.modal import api
 
     monkeypatch.setattr(api, "get_instance", lambda *args, **kwargs: None)
+
+
+@pytest.mark.parametrize(
+    ("deleted", "stopped", "recorded", "safe"),
+    [
+        (True, True, False, True),
+        (False, True, True, True),
+        (False, True, False, False),
+        (False, False, True, False),
+        (False, False, False, False),
+    ],
+)
+def test_cleanup_policy_requires_stop_evidence_and_retained_obligation(
+    monkeypatch, deleted, stopped, recorded, safe
+):
+    remote = _modal_remote()
+    events = []
+    monkeypatch.setattr(
+        runner_reconciliation,
+        "_record_cleanup_remote",
+        lambda *_: events.append("record") or recorded,
+    )
+
+    def destroy(*_):
+        events.append("destroy")
+        if not deleted:
+            raise TimeoutError("lost teardown response")
+        return True
+
+    monkeypatch.setattr(runner_recovery, "_strict_teardown_handle", destroy)
+    monkeypatch.setattr(runner_recovery, "_worker_provably_gone", lambda *_: stopped)
+    monkeypatch.setattr(
+        runner_reconciliation,
+        "_compare_and_remove_cleanup_remote",
+        lambda *_: events.append("confirm") or True,
+    )
+    outcome = runner_reconciliation.reconcile_cleanup("run", remote)
+    assert outcome.replacement_safe is safe
+    assert outcome.worker_stopped is stopped
+    assert outcome.resource_deleted is deleted
+    assert events[:2] == ["record", "destroy"]
+    assert ("confirm" in events) is deleted
+
+
+def test_cleanup_persistence_failure_does_not_hide_unknown_teardown(monkeypatch):
+    def fail(*_):
+        raise OSError("persistence unavailable")
+
+    monkeypatch.setattr(runner_reconciliation, "_record_cleanup_remote", fail)
+    monkeypatch.setattr(runner_recovery, "_strict_teardown_handle", fail)
+    monkeypatch.setattr(runner_recovery, "_worker_provably_gone", lambda *_: False)
+    result = runner_reconciliation.reconcile_cleanup("run", _modal_remote())
+    assert result == runner_reconciliation.CleanupOutcome(False, False, False)

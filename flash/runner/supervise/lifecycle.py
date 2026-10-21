@@ -233,14 +233,11 @@ def _run_training(
     reserved_claim: AttemptLaunchClaim | None = None,
 ) -> None:
     """Train one adapter while preserving run-global attempt authorization and cost."""
-    from flash.runner.accounting.costs import _status_estimated_charge
-    from flash.runner.lifecycle.state import TERMINAL_STATES, artifacts_dir
+    from flash.runner.lifecycle.state import TERMINAL_STATES
     from flash.runner.lifecycle.status import (
-        _persist_metrics,
         _update,
         get_status,
         source_snapshot_from_status,
-        validate_terminal_source_metrics,
     )
     from flash.runner.supervise.errors import _RunCancelled
     from flash.runner.supervise.lifecycle import _run_attempts_supervised
@@ -276,32 +273,10 @@ def _run_training(
         source_snapshot=source_snapshot,
         reserved_claim=reserved_claim,
     )
-    metrics, verified_attempt = validate_terminal_source_metrics(get_status(spec.run_id), metrics)
-    # measured wall x $/hr is recorded in metrics.json for analytics, but is not what we charge.
-    measured_cost = prior_cost + _persist_metrics(spec, metrics)
-    # full planned work is charged at the submit-time quote, never measured wall. a worker that
-    # finishes fewer optimizer steps pays the matching estimated-work fraction; legacy records
-    # without a completed-step metric preserve the quote exactly.
-    charge_usd = _status_estimated_charge(get_status(spec.run_id), spec, fallback=measured_cost)
-    # A cancel can land while this thread writes metrics — after the supervised late-cancel check.
-    # Re-read before the terminal "done" so a late worker success doesn't resurrect a cancelled run.
-    with contextlib.suppress(FileNotFoundError):
-        if get_status(spec.run_id).state == "cancelled":
-            raise _RunCancelled(f"run {spec.run_id} was cancelled")
-    # Gate side effects on the CAS succeeding — a concurrent cancel rejects the `done` write.
-    applied = _update(
-        spec.run_id,
-        "done",
-        cost_usd=charge_usd,
-        artifacts_dir=artifacts_dir(spec),
-        source_verified_attempt=verified_attempt,
-    )
-    print(
-        f"done: train_wall={metrics.get('wall_seconds')} measured={measured_cost:.4f} "
-        f"charge_usd={charge_usd:.4f}",
-        file=log,
-        flush=True,
-    )
-    if applied:
-        attempt_recovery._charge_completed_run_by_id(spec.run_id, log)
-        attempt_recovery._register_checkpoints_best_effort(spec, log)
+    current = get_status(spec.run_id)
+    expected_remote = current.remote or current.cleanup_confirmed_remote
+    if not attempt_recovery._adopt_completed_attempt(
+        spec.run_id, spec, expected_remote, metrics, log=log
+    ):
+        raise _RunCancelled(f"run {spec.run_id} lost completion ownership")
+    print(f"done: train_wall={metrics.get('wall_seconds')}", file=log, flush=True)
