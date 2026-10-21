@@ -45,7 +45,20 @@ def _has_unsupported_xgrammar_schema_feature(schema: dict[str, Any]) -> bool:
         for key in ("minProperties", "maxProperties", "propertyNames", "patternProperties")
     ):
         return True
-    for value in schema.values():
+    for key, value in schema.items():
+        # These dictionaries map user-chosen names to schemas. A field named "type" or
+        # "format" is not a schema keyword at the map level.
+        if key in (
+            "properties",
+            "patternProperties",
+            "$defs",
+            "definitions",
+            "dependentSchemas",
+            "dependencies",
+        ) and isinstance(value, dict):
+            if any(_has_unsupported_xgrammar_schema_feature(child) for child in value.values()):
+                return True
+            continue
         if isinstance(value, dict) and _has_unsupported_xgrammar_schema_feature(value):
             return True
         if isinstance(value, list) and any(

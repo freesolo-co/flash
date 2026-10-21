@@ -14,12 +14,11 @@ from __future__ import annotations
 
 import copy
 import hashlib
-import http.client
 import json
 import os
 import threading
 import time
-from http.server import BaseHTTPRequestHandler
+from contextlib import ExitStack, suppress
 
 import flash.engine.worker.perf as _worker_perf
 from flash.content.multimodal import normalize_environment_reply
@@ -36,6 +35,7 @@ from flash.engine.worker.train.opd.bridging.failures import (
     TeacherFailureRecording,
     _RecordedMutationCallbackFailure,
 )
+from flash.engine.worker.train.opd.bridging.http import make_teacher_bridge_handler
 from flash.engine.worker.train.opd.bridging.prompts import (
     _trim_response_and_forced,
     _validate_forced_mask,
@@ -891,81 +891,29 @@ class _TeacherAlignmentBridge(TeacherFailureRecording):
             self._record_teacher_failure(classification, str(error), terminal=True)
 
     def start(self) -> None:
-        bridge = self
-
-        class Handler(BaseHTTPRequestHandler):
-            def log_message(self, *_args):
-                return
-
-            def _send_json(self, status: int, payload: dict) -> None:
-                encoded = json.dumps(payload, separators=(",", ":")).encode("utf-8")
-                self.send_response(status)
-                self.send_header("Content-Type", "application/json")
-                self.send_header("Content-Length", str(len(encoded)))
-                self.end_headers()
-                self.wfile.write(encoded)
-
-            def do_POST(self):
-                recovered_failures: list[tuple[str, str]] = []
-                request_succeeded = False
-                try:
-                    if self.headers.get("Authorization") != f"Bearer {bridge.token}":
-                        raise PermissionError("flash OPD bridge authorization failed")
-                    length = int(self.headers.get("Content-Length", "0"))
-                    payload = json.loads(self.rfile.read(length).decode("utf-8") or "{}")
-                    route = bridge._routes(recovered_failures).get(self.path)
-                    if route is None:
-                        raise ValueError("flash OPD bridge path is unknown")
-                    result = route(payload)
-                    request_succeeded = True
-                    self._send_json(200, result)
-                except Exception as error:
-                    # only a route that already answered can be failing on DELIVERY; before that, an
-                    # OSError is the teacher call itself.
-                    delivery = (
-                        request_succeeded
-                        and self.path in {"/score", "/multiturn/score"}
-                        and isinstance(error, (OSError, http.client.HTTPException))
-                    )
-                    classification = bridge._classify_failure(error, delivery=delivery)
-                    bridge._record_route_failure(
-                        self.path,
-                        error,
-                        classification,
-                        delivery=delivery,
-                        recovered=recovered_failures[0] if recovered_failures else None,
-                    )
-                    self._send_json(
-                        503 if classification == "transient" else 422,
-                        {
-                            "error": {
-                                "classification": classification,
-                                "message": str(error),
-                            }
-                        },
-                    )
-
         self._text_teacher_batcher = _TextTeacherBatcher(
             self.teacher,
             max_batch_size=OPD_TEACHER_SCORING_CONCURRENCY,
             flush_wait_s=protocol.TEXT_TEACHER_FLUSH_WAIT_S,
             on_scored=self.parent_work.complete,
         )
-        self._text_teacher_batcher.start()
         try:
-            self._server = _TeacherBridgeHTTPServer(("127.0.0.1", 0), Handler)
-        except Exception:
-            self._text_teacher_batcher.close()
-            raise
-        self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
-        self._thread.start()
-        if self.multi_turn:
-            self._session_reaper_stop.clear()
-            self._session_reaper_thread = threading.Thread(
-                target=self._session_reaper_loop,
-                daemon=True,
+            self._text_teacher_batcher.start()
+            self._server = _TeacherBridgeHTTPServer(
+                ("127.0.0.1", 0), make_teacher_bridge_handler(self)
             )
-            self._session_reaper_thread.start()
+            thread = threading.Thread(target=self._server.serve_forever, daemon=True)
+            thread.start()
+            self._thread = thread
+            if self.multi_turn:
+                self._session_reaper_stop.clear()
+                reaper = threading.Thread(target=self._session_reaper_loop, daemon=True)
+                reaper.start()
+                self._session_reaper_thread = reaper
+        except BaseException:
+            with suppress(Exception):
+                self.close()
+            raise
 
     @property
     def url(self) -> str:
@@ -974,17 +922,19 @@ class _TeacherAlignmentBridge(TeacherFailureRecording):
         return f"http://127.0.0.1:{self._server.server_port}"
 
     def close(self) -> None:
-        self._session_reaper_stop.set()
-        if self._session_reaper_thread is not None:
-            self._session_reaper_thread.join(timeout=self.session_reap_interval_s + 1.0)
-        with self._sessions_lock:
-            self._sessions.clear()
-            self._session_tombstones.clear()
-        if self._server is not None:
-            self._server.shutdown()
-        if self._text_teacher_batcher is not None:
-            self._text_teacher_batcher.close()
-        if self._server is not None:
-            self._server.server_close()
-        if self._thread is not None:
-            self._thread.join(timeout=5)
+        # Every owned resource is released even if an earlier cleanup reports a failure.
+        with ExitStack() as cleanup:
+            if self._thread is not None:
+                cleanup.callback(self._thread.join, timeout=5)
+            if self._server is not None:
+                cleanup.callback(self._server.server_close)
+            if self._text_teacher_batcher is not None:
+                cleanup.callback(self._text_teacher_batcher.close)
+            self._session_reaper_stop.set()
+            if self._session_reaper_thread is not None:
+                self._session_reaper_thread.join(timeout=self.session_reap_interval_s + 1.0)
+            with self._sessions_lock:
+                self._sessions.clear()
+                self._session_tombstones.clear()
+            if self._server is not None and self._thread is not None:
+                self._server.shutdown()
