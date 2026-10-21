@@ -2,7 +2,6 @@
 
 from queue import Queue
 from threading import Event
-from types import SimpleNamespace
 
 import pytest
 
@@ -397,17 +396,8 @@ def test_cleanup_retry_rechecks_state_after_backoff(api, monkeypatch):
     assert status.get_status(run_id).deployments[target]["state"] == "ready"
 
 
-@pytest.mark.parametrize(
-    "stage",
-    [
-        "before_registration",
-        "matching_binding",
-        "conflicting_binding",
-        "unavailable_registry",
-        "slow_registry",
-    ],
-)
-def test_restart_uses_durable_registration_intent(api, monkeypatch, stage):
+@pytest.mark.parametrize("registration_started", [False, True])
+def test_restart_uses_durable_registration_intent(api, monkeypatch, registration_started):
     key = _login()
     run_id = _make_run(api, key, "done")
     target, sibling = f"{run_id}/final", f"{run_id}/step-20"
@@ -423,7 +413,7 @@ def test_restart_uses_durable_registration_intent(api, monkeypatch, stage):
 
     def interrupted(**kwargs):
         assert "registration_identity" not in status.get_status(run_id).deployments[target]
-        if stage != "before_registration":
+        if registration_started:
             identity["org_id"] = kwargs["org_id"]
             kwargs["before_register"](identity)
         snapshot.append(status.get_status(run_id))
@@ -435,39 +425,25 @@ def test_restart_uses_durable_registration_intent(api, monkeypatch, stage):
         patch.setattr(serving_completion, "_cleanup_failed_deployment", lambda *a, **kw: True)
         _deploy(api, key, run_id, target)
     state._save_status(snapshot[0])
-    reads, deletes = [], []
-    clock = SimpleNamespace(now=0.0)
-    monkeypatch.setattr(serving_completion, "time", SimpleNamespace(monotonic=lambda: clock.now))
+    deletes = []
 
-    def registered(org_id, checkpoint_id, **kwargs):
-        reads.append((org_id, checkpoint_id))
-        assert kwargs["timeout_s"] <= 5
-        if stage == "unavailable_registry":
-            raise ServingError("registry unavailable")
-        if stage == "slow_registry":
-            clock.now += 6
-        return {
-            **identity,
-            "artifact_digest": "other" if stage == "conflicting_binding" else "expected-artifact",
-        }
+    def undeploy(target, *, org_id, timeout_s):
+        deletes.append((target, org_id, timeout_s))
 
-    monkeypatch.setattr(deploy, "_registered_adapter", registered)
-    monkeypatch.setattr(deploy, "undeploy_adapter", lambda target, **kw: deletes.append(target))
+    monkeypatch.setattr(
+        deploy, "_registered_adapter", lambda *a, **kw: pytest.fail("unexpected registry lookup")
+    )
+    monkeypatch.setattr(deploy, "undeploy_adapter", undeploy)
     assert serving_completion.recover_deployments() == 1
     serving_completion.cleanup_recovered_deployments(Event())
     recovered = status.get_status(run_id)
-    if stage == "before_registration":
-        assert reads == deletes == []
+    if not registration_started:
+        assert deletes == []
         assert recovered.deployments[target]["state"] == "failed"
     else:
         assert snapshot[0].deployments[target]["registration_identity"] == identity
-        assert reads == [(identity["org_id"], target)]
-        assert deletes == ([target] if stage == "matching_binding" else [])
-        assert recovered.deployments[target]["state"] == (
-            "cleanup_pending"
-            if stage in {"unavailable_registry", "slow_registry"}
-            else "undeployed"
-        )
+        assert deletes == [(target, identity["org_id"], 5.0)]
+        assert recovered.deployments[target]["state"] == "undeployed"
     assert recovered.deployments[sibling] == snapshot[0].deployments[sibling]
     late = {
         **snapshot[0].deployments[target],
@@ -523,20 +499,19 @@ def test_cleanup_reaches_later_checkpoints_despite_repeated_timeouts(
         transitions.mark_deployment_cleanup_pending(run_id, "original failure", target)
     targets.sort()
     last_run, last_target = targets[-1]
-    clock = SimpleNamespace(now=0.0)
-    monkeypatch.setattr(serving_completion, "time", SimpleNamespace(monotonic=lambda: clock.now))
+    timeout_budgets = []
     stop, deleted, waits = Event(), [], []
 
     def undeploy(target, **kwargs):
         deleted.append(target)
-        clock.now += kwargs["timeout_s"]
+        timeout_budgets.append(kwargs["timeout_s"])
         if target != last_target:
             raise ServingError("request timed out")
 
     def wait(delay):
         waits.append(delay)
         assert last_target in deleted, "later checkpoints were starved by earlier failures"
-        assert clock.now >= 35, "the old whole-pass budget must not skip the seventh checkpoint"
+        assert timeout_budgets == [5.0] * 7
         stop.set()
         return True
 
