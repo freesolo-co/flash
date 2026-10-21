@@ -101,7 +101,7 @@ def test_health_identity_capabilities_and_two_of_three_discovery() -> None:
                     "accounting_ok": True,
                     "deployment_sha": "94210a3",
                     "deployment_id": "deploy-1",
-                    "capabilities": ["permanent_checkpoint_identity", "other"],
+                    "capabilities": ["serving_contract_v2", "other"],
                     "base_models": ["model-a", "model-b", "model-c"],
                     "gpus": 3,
                 },
@@ -112,7 +112,7 @@ def test_health_identity_capabilities_and_two_of_three_discovery() -> None:
                 client,
                 "https://example.invalid",
                 DeploymentExpectation(sha="94210a3", deployment_id="deploy-1"),
-                ["permanent_checkpoint_identity"],
+                ["serving_contract_v2"],
             )
 
     health = asyncio.run(run())
@@ -131,7 +131,7 @@ def _health_body(**overrides) -> dict:
         "ok": True,
         "deployment_sha": "94210a3",
         "deployment_id": "deploy-1",
-        "capabilities": ["permanent_checkpoint_identity"],
+        "capabilities": ["serving_contract_v2"],
         "base_models": ["model-a"],
     }
     body.update(overrides)
@@ -147,7 +147,7 @@ def _get_health(body: dict):
                 client,
                 "https://example.invalid",
                 DeploymentExpectation(sha="94210a3", deployment_id="deploy-1"),
-                ["permanent_checkpoint_identity"],
+                ["serving_contract_v2"],
             )
 
     return asyncio.run(run())

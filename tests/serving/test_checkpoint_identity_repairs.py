@@ -31,7 +31,7 @@ from tests._helpers import deployments as deployment_fixtures
 
 def _record(org_id: str, *, digest: str = "b" * 64) -> AdapterRecord:
     values = {
-        "adapter_id": "shared/final",
+        "model_id": "shared/final",
         "repo_id": f"{org_id}/run",
         "base_model": "Qwen/Qwen3.5-9B",
         "org_id": org_id,
@@ -61,8 +61,8 @@ class _Pool:
             "inference_time_seconds": 0.01,
             "request_id": "fsgen-" + "0" * 32,
             "engine_replica_id": "test",
-            "checkpoint": record.adapter_id,
-            "lora_request_adapter": record.adapter_id,
+            "checkpoint": record.model_id,
+            "lora_request_adapter": record.model_id,
         }
 
     async def stream_generate(self, *_args, **_kwargs):
@@ -77,7 +77,7 @@ class _Pool:
 
 
 def _client(*records: AdapterRecord) -> TestClient:
-    by_key = {(record.org_id, record.adapter_id): record for record in records}
+    by_key = {(record.org_id, record.model_id): record for record in records}
     app = build_offline_serving_app(
         _Pool(),
         AdapterRouter(list(records)),
@@ -97,10 +97,10 @@ def _headers(org_id: str) -> dict[str, str]:
 def test_exact_routes_capture_raw_and_encoded_slashes_and_absence_is_idempotent() -> None:
     record = _record("org-a")
     client = _client(record)
-    for target in (record.adapter_id, quote(record.adapter_id, safe="")):
+    for target in (record.model_id, quote(record.model_id, safe="")):
         response = client.get(f"/adapters/{target}", headers=_headers("org-a"))
         assert response.status_code == 200
-        assert response.json()["adapter"]["adapter_id"] == record.adapter_id
+        assert response.json()["adapter"]["model_id"] == record.model_id
         generated = client.post(
             f"/adapters/{target}/generate",
             json={"prompt": "hi"},
@@ -118,9 +118,9 @@ def test_same_public_checkpoint_isolated_by_organization() -> None:
     first = _record("org-a")
     second = _record("org-b", digest="c" * 64)
     router = AdapterRouter([first, second])
-    assert router.resolve(first.adapter_id, org_id="org-a") == (first, first)
-    assert router.resolve(second.adapter_id, org_id="org-b") == (second, second)
-    assert router.resolve(first.adapter_id, org_id="org-c") is None
+    assert router.resolve(first.model_id, org_id="org-a") == (first, first)
+    assert router.resolve(second.model_id, org_id="org-b") == (second, second)
+    assert router.resolve(first.model_id, org_id="org-c") is None
 
 
 def test_persistence_queries_use_org_and_checkpoint_composite(monkeypatch) -> None:
@@ -159,17 +159,20 @@ def test_artifact_digest_and_binding_fingerprint_are_distinct() -> None:
     changed = record.model_copy(update={"base_model": "Qwen/Qwen3.5-4B"})
     assert immutable_binding_fingerprint(changed) != record.artifact_fingerprint
     payload = internal_adapter_payload(record)
-    registration = {name: payload[name] for name in ImmutableCheckpointRegistration.model_fields}
+    registration = {
+        field.alias or name: payload[field.alias or name]
+        for name, field in ImmutableCheckpointRegistration.model_fields.items()
+    }
     with pytest.raises(ValueError, match="immutable binding"):
         ImmutableCheckpointRegistration.model_validate(
             {**registration, "artifact_fingerprint": "d" * 64}
         )
 
 
-@pytest.mark.parametrize("alias", ["checkpoint_id", "checkpoint"])
+@pytest.mark.parametrize("alias", ["adapter_id", "checkpoint_id", "checkpoint"])
 def test_binding_fingerprint_rejects_identity_aliases(alias: str) -> None:
     payload = internal_adapter_payload(_record("org-a"))
-    payload[alias] = payload.pop("adapter_id")
+    payload[alias] = payload.pop("model_id")
 
     with pytest.raises(ValueError, match="inconsistent permanent identity"):
         immutable_binding_fingerprint(payload)
@@ -203,8 +206,9 @@ def test_ambiguous_registration_matches_every_flat_immutable_field() -> None:
         "artifact_fingerprint": record.artifact_fingerprint,
         "lora_rank": record.lora_rank,
     }
-    assert matches_revision_identity(payload, payload)
-    assert not matches_revision_identity({**payload, "lora_rank": 32}, payload)
+    expected = payload.copy()
+    assert matches_revision_identity(payload, expected)
+    assert not matches_revision_identity({**payload, "lora_rank": 32}, expected)
 
 
 def test_chat_requires_the_selected_checkpoint_record():
@@ -439,7 +443,7 @@ def test_checkpoint_registration_rejects_bare_managed_selector() -> None:
     response = client.post(
         "/adapters",
         json={
-            "adapter_id": "run-a",
+            "model_id": "run-a",
             "repo_id": "org/run-a",
             "base_model": "Qwen/Qwen3.5-9B",
             "org_id": "org-a",

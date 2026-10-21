@@ -273,7 +273,7 @@ def test_normalization_is_idempotent(value):
 
 def test_generate_request_normalizes_structured_outputs():
     req = GenerateRequest.model_validate(
-        {"adapter_id": "a", "prompt": "hi", "structured_outputs": "json_object"}
+        {"model_id": "a", "prompt": "hi", "structured_outputs": "json_object"}
     )
     assert req.structured_outputs == {"json_object": True}
 
@@ -283,7 +283,7 @@ def test_generate_request_accepts_a_raw_json_schema():
     # (see the test below). This was parametrized over two spellings until the alias was removed,
     # after which both cases named the same key and the second proved nothing.
     req = GenerateRequest.model_validate(
-        {"adapter_id": "a", "prompt": "hi", "structured_outputs": SCHEMA}
+        {"model_id": "a", "prompt": "hi", "structured_outputs": SCHEMA}
     )
     assert req.structured_outputs == {"json": SCHEMA}
 
@@ -293,26 +293,26 @@ def test_generate_request_rejects_a_response_format_key():
     # it rather than silently dispatching an unconstrained request.
     with pytest.raises(ValueError, match="extra_forbidden"):
         GenerateRequest.model_validate(
-            {"adapter_id": "a", "prompt": "hi", "response_format": {"type": "json_object"}}
+            {"model_id": "a", "prompt": "hi", "response_format": {"type": "json_object"}}
         )
 
 
 def test_generate_request_keeps_explicit_off_distinct_from_absent():
-    absent = GenerateRequest.model_validate({"adapter_id": "a", "prompt": "hi"})
+    absent = GenerateRequest.model_validate({"model_id": "a", "prompt": "hi"})
     off = GenerateRequest.model_validate(
-        {"adapter_id": "a", "prompt": "hi", "structured_outputs": False}
+        {"model_id": "a", "prompt": "hi", "structured_outputs": False}
     )
     assert absent.structured_outputs is None  # inherit the adapter default
     assert off.structured_outputs == {}  # explicitly unconstrained, overrides the default
 
 
 def test_generate_request_serializes_camel_case_for_the_rpc():
-    # The router forwards model_dump(by_alias=True) over Modal RPC; the engine re-validates that
+    # The router forwards model_dump() over Modal RPC; the engine re-validates that
     # dict, so the canonical spec must ride the "structured_outputs" alias and survive re-parsing.
     req = GenerateRequest.model_validate(
-        {"adapter_id": "a", "prompt": "hi", "structured_outputs": SCHEMA}
+        {"model_id": "a", "prompt": "hi", "structured_outputs": SCHEMA}
     )
-    dumped = req.model_dump(by_alias=True)
+    dumped = req.model_dump()
     assert dumped["structured_outputs"] == {"json": SCHEMA}
     assert GenerateRequest.model_validate(dumped).structured_outputs == {"json": SCHEMA}
 
@@ -321,7 +321,7 @@ def test_generate_request_invalid_spec_is_a_validation_error():
     with pytest.raises(ValidationError, match="exactly one constraint"):
         GenerateRequest.model_validate(
             {
-                "adapter_id": "a",
+                "model_id": "a",
                 "prompt": "hi",
                 "structured_outputs": {"json": SCHEMA, "regex": "x"},
             }
@@ -341,7 +341,7 @@ def test_adapter_record_normalizes_structured_outputs_default():
     # A bare JSON schema is normalized to the canonical {"json": schema} on the way in.
     rec = _record(structured_outputs=SCHEMA)
     assert rec.structured_outputs == {"json": SCHEMA}
-    assert rec.model_dump(by_alias=True)["structured_outputs"] == {"json": SCHEMA}
+    assert rec.model_dump()["structured_outputs"] == {"json": SCHEMA}
 
 
 def test_adapter_record_defaults_to_no_structured_outputs():

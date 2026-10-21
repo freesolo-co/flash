@@ -159,7 +159,7 @@ def _engine_is_dead(engine: Any) -> bool:
 def active_checkpoint_ref(record: Any) -> str:
     """return the canonical permanent checkpoint the record explicitly serves."""
 
-    checkpoint_id = str(getattr(record, "adapter_id", "") or "").strip()
+    checkpoint_id = str(getattr(record, "model_id", "") or "").strip()
     return checkpoint_id if parse_checkpoint_ref(checkpoint_id) is not None else ""
 
 
@@ -174,7 +174,7 @@ def enforce_expected_checkpoint(record: Any, expected_checkpoint: str | None) ->
         expected = expected_checkpoint.strip()
         raise ValueError(
             "checkpoint mismatch: "
-            f"adapter {record.adapter_id} is serving checkpoint "
+            f"adapter {record.model_id} is serving checkpoint "
             f"{active_checkpoint or '<none>'}, not the expected "
             f"{expected or '<none>'}; a concurrent deploy likely replaced it. "
             "Re-deploy the intended step or drop the expectation."

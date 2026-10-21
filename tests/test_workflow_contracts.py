@@ -560,6 +560,19 @@ def test_dev_cache_pushes_only_detect_and_off_peak_runs_build():
     assert "github.event_name == 'workflow_dispatch'" in bake["if"]
     assert bake["uses"] == "./.github/workflows/bake-kernel-cache.yml"
     assert "cu128-dev-" in bake["with"]["target_tag_prefix"]
+    assert triggers["workflow_dispatch"]["inputs"]["deadline_minutes"]["default"] == 90
+    assert "fromJSON(format(" in bake["with"]["deadline_minutes"]
+    assert "inputs.deadline_minutes" in bake["with"]["deadline_minutes"]
+    assert "||" not in bake["with"]["deadline_minutes"]  # zero must fail validation, not become 90
+    bake_workflow = _load(WORKFLOW_DIR / "bake-kernel-cache.yml")
+    assert "deadline_minutes" in _triggers(bake_workflow)["workflow_call"]["inputs"]
+    warm = next(
+        step
+        for step in _steps(_jobs(bake_workflow)["bake"])
+        if str(step.get("name", "")).startswith("Warm kernels")
+    )
+    assert warm["env"]["BAKE_DEADLINE_MINUTES"] == "${{ inputs.deadline_minutes }}"
+    assert '--deadline-min "$BAKE_DEADLINE_MINUTES"' in warm["run"]
 
     publish = jobs["publish-ready"]
     script = next(step for step in _steps(publish) if step.get("name") == "Publish ready aliases")[

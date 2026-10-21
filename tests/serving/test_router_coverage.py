@@ -31,12 +31,12 @@ async def _allow(_token: str, _adapter_id: str, _scope: dict | None = None) -> s
     return "org-1"
 
 
-def _rec(adapter_id: str, base_model: str = QWEN, **overrides) -> AdapterRecord:
-    run_id = adapter_id.split("/", 1)[0]
-    checkpoint_id = adapter_id if "/" in adapter_id else f"{run_id}/final"
+def _rec(model_id: str, base_model: str = QWEN, **overrides) -> AdapterRecord:
+    run_id = model_id.split("/", 1)[0]
+    checkpoint_id = model_id if "/" in model_id else f"{run_id}/final"
     checkpoint = checkpoint_id.split("/", 1)[1]
     data = {
-        "adapter_id": checkpoint_id,
+        "model_id": checkpoint_id,
         "repo_id": f"org/{run_id}",
         "org_id": "org-1",
         "base_model": base_model,
@@ -88,13 +88,13 @@ def test_inference_requires_a_bearer_api_key():
     router = AdapterRouter([_rec("qa/final")])
     client = TestClient(build_serving_app(FakePool(), router, chat_authorizer=_allow))
 
-    no_header = client.post("/generate", json={"adapter_id": "qa/final", "prompt": "hi"})
+    no_header = client.post("/generate", json={"model_id": "qa/final", "prompt": "hi"})
     assert no_header.status_code == 401
     assert "Missing Freesolo API key" in no_header.json()["detail"]
 
     non_bearer = client.post(
         "/generate",
-        json={"adapter_id": "qa/final", "prompt": "hi"},
+        json={"model_id": "qa/final", "prompt": "hi"},
         headers={"Authorization": "Basic Zm9vOmJhcg=="},
     )
     assert non_bearer.status_code == 401  # scheme != bearer -> token treated as absent
@@ -106,7 +106,7 @@ def test_inference_fails_closed_when_no_authorizer_is_wired():
     client = TestClient(build_serving_app(FakePool(), router, chat_authorizer=None))
     resp = client.post(
         "/generate",
-        json={"adapter_id": "qa/final", "prompt": "hi"},
+        json={"model_id": "qa/final", "prompt": "hi"},
         headers={"Authorization": "Bearer k"},
     )
     assert resp.status_code == 503
@@ -150,7 +150,7 @@ class FakePool:
     async def register(self, base_model, record) -> None:
         pass
 
-    async def unregister(self, base_model, adapter_id, expected_generation=None) -> None:
+    async def unregister(self, base_model, model_id, expected_generation=None) -> None:
         pass
 
 

@@ -24,7 +24,7 @@ INTERNAL_KEY = "fs-internal"
 
 def _lora_rec(run_id: str = "qa") -> AdapterRecord:
     values = {
-        "adapter_id": f"{run_id}/final",
+        "model_id": f"{run_id}/final",
         "repo_id": f"org/{run_id}",
         "base_model": QWEN,
         "org_id": "org-A",
@@ -43,7 +43,7 @@ def _lora_rec(run_id: str = "qa") -> AdapterRecord:
 
 def _base_rec(base_model: str = QWEN) -> AdapterRecord:
     return AdapterRecord(
-        adapter_id=base_model,
+        model_id=base_model,
         repo_id=base_model,
         base_model=base_model,
         serve_base_model=True,
@@ -65,7 +65,7 @@ class FakePool:
                 "cached_tokens_reported": False,
                 "reasoning_tokens": 0,
                 "request_id": payload.generation_id,
-                "checkpoint": record.adapter_id if record.is_checkpoint else "",
+                "checkpoint": record.model_id if record.is_checkpoint else "",
             },
         )
 
@@ -76,7 +76,7 @@ class FakePool:
         pass
 
     async def unregister(
-        self, base_model, adapter_id, expected_generation=None
+        self, base_model, model_id, expected_generation=None
     ) -> None:  # pragma: no cover
         pass
 
@@ -86,8 +86,8 @@ class FakeAuthorizer:
         self.calls = []
         self._org = org
 
-    async def __call__(self, token, adapter_id, scope=None):
-        self.calls.append((token, adapter_id))
+    async def __call__(self, token, model_id, scope=None):
+        self.calls.append((token, model_id))
         return self._org
 
 
@@ -134,7 +134,7 @@ def test_base_model_serve_records_the_authorized_org_principal() -> None:
 @pytest.mark.parametrize(
     ("path", "payload"),
     [
-        ("/generate", {"adapter_id": QWEN, "prompt": "hi"}),
+        ("/generate", {"model_id": QWEN, "prompt": "hi"}),
         (
             "/v1/chat/completions",
             {"model": QWEN, "messages": [{"role": "user", "content": "hi"}]},
@@ -157,7 +157,7 @@ def test_explicit_base_model_thinking_remains_rejected_before_settlement() -> No
     response = client.post(
         "/generate",
         json={
-            "adapter_id": QWEN,
+            "model_id": QWEN,
             "prompt": "hi",
             "chat_template_kwargs": {"enable_thinking": True},
         },
@@ -283,9 +283,9 @@ def test_base_model_records_seed_one_open_record_per_model(modal_app_module):
     from flash.serving.src.engine.model_config import base_models
 
     recs = modal_app_module._base_model_records()
-    assert {r.adapter_id for r in recs} == set(base_models())
+    assert {r.model_id for r in recs} == set(base_models())
     assert all(
-        r.serve_base_model and not r.thinking and r.org_id is None and r.adapter_id == r.base_model
+        r.serve_base_model and not r.thinking and r.org_id is None and r.model_id == r.base_model
         for r in recs
     )
 

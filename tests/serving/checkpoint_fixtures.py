@@ -34,7 +34,7 @@ def checkpoint_record(
     artifact_revision = hashlib.sha1(run_id.encode()).hexdigest()
     artifact_digest = hashlib.sha256(f"{run_id}:artifact".encode()).hexdigest()
     values: dict[str, Any] = {
-        "adapter_id": checkpoint_id,
+        "model_id": checkpoint_id,
         "repo_id": repo_id or f"org/{run_id}",
         "base_model": base_model,
         "subfolder": subfolder,

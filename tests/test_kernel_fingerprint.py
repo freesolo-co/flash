@@ -321,7 +321,11 @@ def test_baked_arch_workflows_match_canonical_source():
     (fallback,) = [
         match.group(1)
         for line in bake_lines
-        if (match := re.fullmatch(r'\s*req="\$\{\{ inputs\.sms \|\| \'([^\']+)\' \}\}"\s*', line))
+        if (
+            match := re.fullmatch(
+                r"\s*REQUESTED_SMS:\s*\$\{\{ inputs\.sms \|\| '([^']+)' \}\}\s*", line
+            )
+        )
     ]
     fallback_arches = {arch.strip() for arch in fallback.split(",") if arch.strip()}
 
@@ -364,3 +368,11 @@ def test_parsing_fails_loud_on_a_broken_stack():
         kf._pip_stack_specs("FROM scratch\n# no pip install block here\n")
     with pytest.raises(ValueError, match="could not parse"):
         kf._search(r"NOPE=(\S+)", "nothing here", "a missing thing")
+
+
+def test_training_interpreter_pins_and_bake_entry_invalidate_cache():
+    cache, base = kf.collect_inputs(ROOT)
+    assert "vllm==0.19.1" in cache["verl_stack"]
+    before = kf.compute_fingerprints(cache, base)[0]
+    for key in ("verl_stack", "bake_entry_sha256", "flashinfer_aot_sha256"):
+        assert kf.compute_fingerprints({**cache, key: cache[key] + "changed"}, base)[0] != before
