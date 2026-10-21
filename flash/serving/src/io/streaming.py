@@ -39,7 +39,7 @@ async def prepare_stream(
     expected_checkpoint: str | None,
 ) -> tuple[AsyncIterator[dict[str, Any]], dict[str, str], bool, dict[str, Any]]:
     engine_payload = payload.model_copy(
-        update={"adapter_id": target.adapter_id, "generation_id": generation_id}
+        update={"model_id": target.model_id, "generation_id": generation_id}
     )
     events: AsyncIterator[dict[str, Any]] | None = None
     try:
@@ -64,7 +64,7 @@ async def prepare_stream(
             with contextlib.suppress(Exception):
                 await _close_async_iterator(events)
         if isinstance(exc, Exception):
-            raise_if_engine_error(router, requested.adapter_id, exc)
+            raise_if_engine_error(router, requested.model_id, exc)
         raise
     try:
         if require_generation_id and first.get("request_id") != generation_id:
@@ -111,7 +111,7 @@ async def generate_once(
 ) -> dict[str, Any]:
     """dispatch one non-streaming generation and echo the authorized checkpoint id."""
     engine_payload = payload.model_copy(
-        update={"adapter_id": target.adapter_id, "generation_id": generation_id}
+        update={"model_id": target.model_id, "generation_id": generation_id}
     )
     try:
         result = await pool.generate(
@@ -121,10 +121,10 @@ async def generate_once(
             expected_checkpoint=expected_checkpoint,
         )
     except Exception as exc:
-        raise_if_engine_error(router, requested.adapter_id, exc)
+        raise_if_engine_error(router, requested.model_id, exc)
     require_attested_checkpoint(result, target)
     if require_generation_id and result.get("request_id") != generation_id:
         raise RuntimeError("serving engine returned a mismatched generation id")
-    if "adapter_id" in result:
-        result = {**result, "adapter_id": requested.adapter_id}
+    if "model_id" in result:
+        result = {**result, "model_id": requested.model_id}
     return result

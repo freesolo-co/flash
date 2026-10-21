@@ -381,6 +381,29 @@ class _VerlResumeUploader:
         _worker_hf.write_base_model_provenance(adapter_dir, self.model_id, self.model_revision)
         return adapter_dir
 
+    def reuse_final_adapter(self, step: int, destination: str) -> bool:
+        """Copy this run's validated, published export after the uploader has drained."""
+        if self._thread.is_alive():
+            raise RuntimeError("cannot reuse an adapter while checkpoint publication is running")
+        source = self.staged_adapters.get(step)
+        if source is None or step not in self.lifecycle.deployable_published_steps:
+            return False
+        if not self._deployable_allowed():
+            return False
+        # optional resume upload failures must not block the normal export fallback.
+        self.raise_if_incomplete()
+        _validate_internal_adapter_dir(source, label=f"final step-{step}")
+        source_path, destination_path = os.path.realpath(source), os.path.realpath(destination)
+        if os.path.islink(destination) or os.path.commonpath([source_path, destination_path]) in {
+            source_path,
+            destination_path,
+        }:
+            raise RuntimeError("final adapter destination overlaps or redirects the staged export")
+        if os.path.exists(destination):
+            shutil.rmtree(destination)
+        shutil.copytree(source, destination)
+        return True
+
     def _make_required_adapter_durable(self, step: int, adapter_dir: str) -> None:
         """upload one withheld adapter once under the non-serving singular namespace."""
         if step in self._internal_adapter_attempts:

@@ -12,20 +12,18 @@ from fastapi import HTTPException, status
 from flash.serving.src.http.routing import AdapterRouter
 
 
-def value_error_http(router: AdapterRouter, adapter_id: str, exc: ValueError) -> HTTPException:
+def value_error_http(router: AdapterRouter, model_id: str, exc: ValueError) -> HTTPException:
     message = str(exc)
     if message.startswith("checkpoint mismatch: "):
         return HTTPException(
             status.HTTP_409_CONFLICT, message.removeprefix("checkpoint mismatch: ")
         )
     if message.startswith("Unknown adapter id"):
-        return HTTPException(status.HTTP_404_NOT_FOUND, f"Unknown adapter id: {adapter_id}")
+        return HTTPException(status.HTTP_404_NOT_FOUND, f"Unknown adapter id: {model_id}")
     return HTTPException(status.HTTP_400_BAD_REQUEST, message)
 
 
-def engine_error_http(
-    router: AdapterRouter, adapter_id: str, exc: Exception
-) -> HTTPException | None:
+def engine_error_http(router: AdapterRouter, model_id: str, exc: Exception) -> HTTPException | None:
     """Map an engine dispatch failure to a client-meaningful status.
 
     Returns ``None`` when ``exc`` is not a failure this layer can identify, so the caller
@@ -47,7 +45,7 @@ def engine_error_http(
     router.py's docstring, which is what lets the routing layer be unit-tested against a fake pool.
     """
     if isinstance(exc, ValueError):
-        return value_error_http(router, adapter_id, exc)
+        return value_error_http(router, model_id, exc)
     from modal.exception import Error as ModalError
     from modal.exception import FunctionTimeoutError
 
@@ -67,16 +65,16 @@ def engine_error_http(
     return None
 
 
-def raise_if_engine_error(router: AdapterRouter, adapter_id: str, exc: Exception) -> None:
+def raise_if_engine_error(router: AdapterRouter, model_id: str, exc: Exception) -> None:
     """Re-raise ``exc`` as its mapped ``HTTPException``, or unchanged if it is not mapped."""
-    failure = engine_error_http(router, adapter_id, exc)
+    failure = engine_error_http(router, model_id, exc)
     if failure is None:
         raise exc
     raise failure from exc
 
 
 async def terminating_on_engine_error(
-    router: AdapterRouter, events: AsyncIterator[dict[str, Any]], adapter_id: str
+    router: AdapterRouter, events: AsyncIterator[dict[str, Any]], model_id: str
 ) -> AsyncIterator[dict[str, Any]]:
     """Convert a mid-stream engine failure into a terminal ``error`` event.
 
@@ -96,7 +94,7 @@ async def terminating_on_engine_error(
         async for event in events:
             yield event
     except Exception as exc:
-        failure = engine_error_http(router, adapter_id, exc)
+        failure = engine_error_http(router, model_id, exc)
         if failure is None:
             raise
         yield {"type": "error", "message": str(failure.detail), "code": failure.status_code}

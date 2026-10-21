@@ -135,9 +135,9 @@ def build_usage_session(
     captured_at: datetime,
 ) -> UsageSession:
     immutable_target = ImmutableTarget(
-        public_model_id=requested.adapter_id,
+        public_model_id=requested.model_id,
         base_model=target.base_model,
-        checkpoint_id=target.adapter_id if target.is_checkpoint else None,
+        checkpoint_id=target.model_id if target.is_checkpoint else None,
         artifact_fingerprint=target.artifact_fingerprint,
     )
     price = freesolo_price(target.base_model)

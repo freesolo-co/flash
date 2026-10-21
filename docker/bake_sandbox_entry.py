@@ -14,13 +14,15 @@ It is invoked by the CI helper via the sandbox command. Env:
 """
 
 import io
+import json
 import os
 import subprocess
-import sys
+import tarfile
 import time
 
 
 def main() -> int:
+    os.environ["HF_HUB_DISABLE_XET"] = "1"
     from huggingface_hub import HfApi, snapshot_download
 
     repo = os.environ["BAKE_HF_REPO"]
@@ -65,25 +67,58 @@ def main() -> int:
     )
 
     env = {**os.environ, "PYTHONPATH": "/runcode/code"}
-    cmd = [sys.executable, "-m", "flash.engine.worker.runtime.kernel_warmup", "--out", "/out"]
+    python_bin = os.environ.get("FLASH_VERL_PYTHON", "/opt/verl-venv/bin/python")
+    if not os.path.isfile(python_bin):
+        raise RuntimeError(f"training interpreter missing: {python_bin}")
+    cmd = [
+        python_bin,
+        "-m",
+        "flash.engine.worker.runtime.kernel_warmup",
+        "--out",
+        "/opt/flash/kernelcache",
+    ]
     if arch:
         cmd += ["--arch", arch]
     print(f"[bake] running: {' '.join(cmd)}", flush=True)
     # capture the warmup output into /out so it ships back with the cache -- lets the CI helper show
     # which warm steps ran and why a bake failed to produce compiled kernel files.
     os.makedirs("/out", exist_ok=True)
+    started = time.monotonic()
     with open("/out/warmup.log", "wb") as lf:
         rc = subprocess.call(cmd, env=env, stdout=lf, stderr=subprocess.STDOUT)
+    first_seconds = time.monotonic() - started
+    validation = {"first_process_seconds": first_seconds, "first_exit_code": rc}
+    if rc == 0:
+        # Import and execute from a fresh process: an in-memory JIT hit cannot prove that
+        # another training process can load the baked on-disk artifacts.
+        started = time.monotonic()
+        with open("/out/warmup.log", "ab") as lf:
+            lf.write(b"\n[bake] fresh-process cache reload validation\n")
+            rc = subprocess.call(cmd, env=env, stdout=lf, stderr=subprocess.STDOUT)
+        validation.update(reload_process_seconds=time.monotonic() - started, reload_exit_code=rc)
+    with open("/opt/flash/kernelcache/cache_validation.json", "w") as output:
+        json.dump(validation, output)
     print(f"[bake] kernel_warmup rc={rc}", flush=True)
-
-    # ship the whole cache tree back (metadata + raw triton/inductor dirs).
-    if os.path.isdir("/out"):
-        try:
-            api.upload_folder(
-                folder_path="/out", path_in_repo="out", repo_id=repo, repo_type="dataset"
-            )
-        except Exception as e:
-            print(f"[bake] artifact upload failed: {e}", flush=True)
+    # Hub repositories reject nested .cache paths (FlashInfer uses one). Transport the exact
+    # directory layout as an archive, compiled at its final image path, without a second tree copy.
+    try:
+        with tarfile.open("/tmp/kernel_cache.tar.gz", "w:gz", compresslevel=1) as archive:
+            archive.add("/opt/flash/kernelcache", arcname=".")
+        api.upload_file(
+            path_or_fileobj="/tmp/kernel_cache.tar.gz",
+            path_in_repo="out/kernel_cache.tar.gz",
+            repo_id=repo,
+            repo_type="dataset",
+        )
+        api.upload_file(
+            path_or_fileobj="/out/warmup.log",
+            path_in_repo="out/bake-warmup.log",
+            repo_id=repo,
+            repo_type="dataset",
+        )
+    except Exception as e:
+        rc = 1
+        print(f"[bake] artifact upload failed: {e}", flush=True)
     # STATUS marker LAST: its presence is the helper's completion signal.
     api.upload_file(
         path_or_fileobj=io.BytesIO(f"rc={rc}\narch={arch}\n".encode()),

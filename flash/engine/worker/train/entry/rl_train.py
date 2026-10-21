@@ -349,7 +349,17 @@ def run_rl_train():
         progress_step=True,
         keepalive=True,
     ):
-        _export_final_adapter(actor_dir, adapter_dir, inp, python_bin)
+        _worker_hf.hf_upload_file(
+            env_for_verl["VERL_FILE_LOGGER_PATH"], "step_metrics.jsonl", required=True
+        )
+        _export_final_adapter(
+            actor_dir,
+            adapter_dir,
+            inp,
+            python_bin,
+            resume_uploader=resume_uploader,
+            steps_run=steps_run,
+        )
         preprocessor.save_pretrained(adapter_dir)
         _worker_hf.hf_upload_folder(adapter_dir, "adapter", required=True)
         # preserve the final checkpoint only when exact save steps are not configured: with

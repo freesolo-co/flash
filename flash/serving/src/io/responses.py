@@ -56,7 +56,7 @@ def openai_chat_completion(
     *,
     completion_id: str,
     created: int,
-    adapter_id: str,
+    model_id: str,
     generation: dict[str, Any],
     provenance: dict[str, str] | None,
 ) -> dict[str, Any]:
@@ -98,7 +98,7 @@ def openai_chat_completion(
         "id": completion_id,
         "object": "chat.completion",
         "created": created,
-        "model": adapter_id,
+        "model": model_id,
         "choices": choices,
     }
     if provenance is not None:
@@ -112,11 +112,11 @@ def openai_chat_completion(
     return response
 
 
-def openai_generate_fields(request: NormalizedChatRequest, adapter_id: str) -> dict[str, Any]:
+def openai_generate_fields(request: NormalizedChatRequest, model_id: str) -> dict[str, Any]:
     """bind one canonical OpenAI request to the hosted internal envelope."""
 
     return {
-        "adapter_id": adapter_id,
+        "model_id": model_id,
         "messages": request.messages,
         "max_tokens": request.max_tokens,
         "temperature": request.temperature,
