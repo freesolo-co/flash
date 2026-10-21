@@ -789,7 +789,7 @@ def write_attempt_marker(payload: dict, ok: bool, error: str = "", retriable: bo
 def _publish_terminal_marker(payload, p, ok):
     attempt = payload["attempt"]
     marker_name = f"{_arm(payload)}_attempt{attempt}.json"
-    if ok and (payload.get("env") or {}).get("FLASH_MODAL_CPU_UPLOADS") == "1":
+    if ok and payload.get("handoff_volume"):
         import shutil
         from pathlib import Path
 

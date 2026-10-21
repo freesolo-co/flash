@@ -488,6 +488,7 @@ def upload_resume_checkpoint(
     skip_upload=None,
     emit_heartbeat: bool = True,
     lock_timeout_s: float | None = None,
+    final_step: int | None = None,
 ) -> bool:
     """synchronously stream one full-state resume checkpoint and ordered companion artifacts."""
     if not _worker_state.HF_REPO:
@@ -526,7 +527,7 @@ def upload_resume_checkpoint(
                         from flash.engine.support.checkpoint_transport import upload_directory
                         from flash.engine.worker.io.cpu_handoff import stage_final_checkpoint
 
-                        deferred = stage_final_checkpoint(step, ckpt_dir)
+                        deferred = stage_final_checkpoint(step, ckpt_dir, final_step=final_step)
                         if not deferred:
                             with upload_directory(ckpt_dir) as folder:
                                 _require_hf_deadline_allowance()

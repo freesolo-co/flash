@@ -18,9 +18,9 @@ from tests.test_modal_training_lifecycle import spec
 def staged(tmp_path, monkeypatch):
     root = tmp_path / "volume"
     root.mkdir()
+    (root / "metrics.json").write_text('{"step":2,"notes":{}}')
     job = spec()
     job = replace(job, train=replace(job.train, max_steps=2))
-    monkeypatch.setenv("FLASH_MODAL_CPU_UPLOADS", "1")
     monkeypatch.setattr(cpu_handoff, "MOUNT", str(root))
     monkeypatch.setattr(state, "JOB_SPEC", job)
     monkeypatch.setenv(
@@ -36,9 +36,9 @@ def staged(tmp_path, monkeypatch):
 
 def test_only_final_step_is_staged_and_copy_survives_source_removal(staged):
     root, source = staged
-    assert not cpu_handoff.stage_final_checkpoint(1, str(source))
+    assert not cpu_handoff.stage_final_checkpoint(1, str(source), final_step=2)
     assert not (root / "handoff.json").exists()
-    assert cpu_handoff.stage_final_checkpoint(2, str(source))
+    assert cpu_handoff.stage_final_checkpoint(2, str(source), final_step=2)
     (source / "model.pt").unlink()
     assert (root / "checkpoint/model.pt").read_bytes() == b"native model data"
     assert (root / "source/flash/engine/worker/io/cpu_handoff.py").is_file()
@@ -48,13 +48,13 @@ def test_handoff_rejects_links_before_copy(staged):
     root, source = staged
     (source / "escape").symlink_to("/etc/passwd")
     with pytest.raises(ValueError, match="symlinks"):
-        cpu_handoff.stage_final_checkpoint(2, str(source))
+        cpu_handoff.stage_final_checkpoint(2, str(source), final_step=2)
     assert not (root / "handoff.json").exists()
 
 
 def test_cpu_failure_cannot_publish_done_or_success(staged, monkeypatch):
     _root, source = staged
-    cpu_handoff.stage_final_checkpoint(2, str(source))
+    cpu_handoff.stage_final_checkpoint(2, str(source), final_step=2)
     monkeypatch.setattr(hf, "upload_resume_checkpoint", lambda *a, **k: False)
     monkeypatch.setattr(hf, "hf_upload_file", lambda *a, **k: pytest.fail("premature completion"))
     with pytest.raises(RuntimeError, match="publication failed"):
@@ -63,8 +63,8 @@ def test_cpu_failure_cannot_publish_done_or_success(staged, monkeypatch):
 
 def test_cpu_commit_precedes_metrics_done_and_attested_success(staged, monkeypatch):
     root, source = staged
-    cpu_handoff.stage_final_checkpoint(2, str(source))
-    (root / "metrics.json").write_text('{"notes":{}}')
+    cpu_handoff.stage_final_checkpoint(2, str(source), final_step=2)
+    (root / "metrics.json").write_text('{"step":2,"notes":{}}')
     (root / "DONE").write_text("123")
     (root / "terminal.json").write_text('{"ok":true}')
     events = []
@@ -84,7 +84,7 @@ def test_cpu_commit_precedes_metrics_done_and_attested_success(staged, monkeypat
 
 def test_wrong_attempt_never_uploads(staged, monkeypatch):
     root, source = staged
-    cpu_handoff.stage_final_checkpoint(2, str(source))
+    cpu_handoff.stage_final_checkpoint(2, str(source), final_step=2)
     manifest = json.loads((root / "handoff.json").read_text())
     manifest["attempt"] = 4
     (root / "handoff.json").write_text(json.dumps(manifest))
@@ -115,12 +115,28 @@ def test_volume_identity_includes_owner_and_attempt():
     )
 
 
-def test_cpu_mode_requires_explicit_last_step(monkeypatch):
-    monkeypatch.setenv("FLASH_MODAL_CPU_UPLOADS", "1")
-    job = spec()
-    job = replace(job, train=replace(job.train, max_steps=None))
-    with pytest.raises(ValueError, match="explicit"):
-        checkpoint_upload.enabled(job)
+def test_epoch_based_training_uses_resolved_final_step(staged, monkeypatch):
+    root, source = staged
+    job = replace(state.JOB_SPEC, train=replace(state.JOB_SPEC.train, max_steps=None))
+    monkeypatch.setattr(state, "JOB_SPEC", job)
+    assert cpu_handoff.stage_final_checkpoint(2, str(source), final_step=2)
+    assert json.loads((root / "handoff.json").read_text())["step"] == 2
+
+
+def test_cpu_upload_does_not_restage_the_mounted_checkpoint(staged):
+    _root, source = staged
+    assert not cpu_handoff.stage_final_checkpoint(2, str(source), final_step=None)
+
+
+def test_cpu_rejects_a_checkpoint_from_before_the_completed_final_step(staged, monkeypatch):
+    root, source = staged
+    cpu_handoff.stage_final_checkpoint(2, str(source), final_step=2)
+    (root / "metrics.json").write_text('{"step":3,"notes":{}}')
+    monkeypatch.setattr(
+        hf, "upload_resume_checkpoint", lambda *a, **k: pytest.fail("wrong final step")
+    )
+    with pytest.raises(ValueError, match="different attempt"):
+        cpu_handoff.main()
 
 
 def test_bootstrap_withholds_attested_marker_for_handoff(tmp_path, monkeypatch):
@@ -136,7 +152,7 @@ def test_bootstrap_withholds_attested_marker_for_handoff(tmp_path, monkeypatch):
     monkeypatch.setattr(
         bootstrap, "hf_upload", lambda payload, path, name, **kw: published.append(name)
     )
-    payload = {"attempt": 2, "flash_arm": "modal", "env": {"FLASH_MODAL_CPU_UPLOADS": "1"}}
+    payload = {"attempt": 2, "flash_arm": "modal", "handoff_volume": "owned-volume"}
     # Initial publication and replay both go through this gate.
     bootstrap._publish_terminal_marker(payload, str(marker), True)
     bootstrap._publish_terminal_marker(payload, str(marker), True)

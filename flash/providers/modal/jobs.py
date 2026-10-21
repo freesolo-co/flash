@@ -167,11 +167,8 @@ def submit_attempt(
         payload["env"]["FLASH_WEIGHT_CACHE_DIR"] = f"{api.CACHE_MOUNT}/hf-cache/hub"
     from flash.providers.modal import checkpoint_upload
 
-    cpu_uploads = checkpoint_upload.enabled(spec)
     name = instance_label(spec.run_id, attempt)
-    if cpu_uploads:
-        payload["handoff_volume"] = checkpoint_upload.volume_name(owner_scope, name)
-        payload["env"]["FLASH_MODAL_CPU_UPLOADS"] = "1"
+    payload["handoff_volume"] = checkpoint_upload.volume_name(owner_scope, name)
     started = time.time()
     capsule, _ = build_capsule("instance-bootstrap")
     sandbox_id = api.create(
@@ -196,7 +193,7 @@ def submit_attempt(
             hf_repo=spec.train.hf_repo,
             phase=spec.phase,
             gpu_count=count,
-            cpu_uploads=cpu_uploads,
+            cpu_uploads=True,
             scope=owner_scope,
         )
         handle = JobHandle.from_dict(h.to_dict())

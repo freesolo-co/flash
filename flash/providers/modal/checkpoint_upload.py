@@ -17,15 +17,6 @@ def volume_name(scope: str, name: str) -> str:
     return "flash-handoff-" + hashlib.sha256(f"{scope}:{name}".encode()).hexdigest()[:40]
 
 
-def enabled(spec) -> bool:
-    value = os.environ.get("FLASH_MODAL_CPU_UPLOADS", "0")
-    if value not in ("0", "1"):
-        raise ValueError("FLASH_MODAL_CPU_UPLOADS must be 0 or 1")
-    if value == "1" and (spec.train.max_steps is None or spec.train.max_steps < 1):
-        raise ValueError("CPU checkpoint uploads require explicit train.max_steps")
-    return value == "1"
-
-
 def _identity(handle):
     return {
         "flash_owner": "flash-training",

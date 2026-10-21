@@ -21,6 +21,10 @@ def launch_state(monkeypatch):
         events.append(("create", kwargs))
         return "sb-job"
 
+    monkeypatch.setattr(
+        "flash.providers.modal.checkpoint_upload.cleanup",
+        lambda handle: events.append(("cleanup", handle.instance_id)),
+    )
     monkeypatch.setattr(api, "create", create)
     monkeypatch.setattr(api, "terminate", lambda identity: events.append(("terminate", identity)))
     return events
@@ -46,7 +50,14 @@ def submit(job, **kwargs):
     )
 
 
-def test_launch_persists_identity_before_poll_and_stops_after_success(monkeypatch, launch_state):
+@pytest.mark.parametrize("old_switch", [None, "0", "1"])
+def test_launch_persists_identity_before_poll_and_stops_after_success(
+    monkeypatch, launch_state, old_switch
+):
+    if old_switch is None:
+        monkeypatch.delenv("FLASH_MODAL_CPU_UPLOADS", raising=False)
+    else:
+        monkeypatch.setenv("FLASH_MODAL_CPU_UPLOADS", old_switch)
     persisted = []
 
     def poll(handle, job, **kwargs):
@@ -59,12 +70,14 @@ def test_launch_persists_identity_before_poll_and_stops_after_success(monkeypatc
     result = submit(spec(), on_handle=lambda handle: persisted.append(handle.to_dict()), attempt=3)
     assert result.ok
     payload = launch_state[0][1]["payload"]
+    assert persisted[0]["cpu_uploads"] is True
+    assert payload["handoff_volume"].startswith("flash-handoff-")
     assert payload["attempt"] == 3
     assert payload["flash_arm"] == "modal"
     assert payload["source_snapshot"] == valid_source_snapshot()
     assert payload["env"]["FLASH_WEIGHT_CACHE_DIR"] == "/weight-cache/hf-cache/hub"
     assert launch_state[0][1]["gpu_count"] == 2
-    assert launch_state[-1] == ("terminate", "sb-job")
+    assert launch_state[-2:] == [("terminate", "sb-job"), ("cleanup", "sb-job")]
 
 
 @pytest.mark.parametrize("failure_stage", ["persist", "poll"])
@@ -76,7 +89,7 @@ def test_failure_after_launch_always_stops_exact_sandbox(monkeypatch, launch_sta
     callback = fail if failure_stage == "persist" else None
     with pytest.raises(RuntimeError, match="write failed"):
         submit(spec(), on_handle=callback)
-    assert launch_state[-1] == ("terminate", "sb-job")
+    assert launch_state[-2:] == [("terminate", "sb-job"), ("cleanup", "sb-job")]
 
 
 def test_operator_cache_bypass_survives_assigned_volume(monkeypatch, launch_state):
@@ -164,7 +177,7 @@ def test_launch_keeps_original_owner_if_environment_changes_after_create(monkeyp
     monkeypatch.setattr(jobs, "poll", lambda *a, **kw: PollResult(False, failure="poll_error"))
     submit(spec(), on_handle=lambda h: handles.append(h.to_dict()))
     assert handles[0]["scope"] == original_scope
-    assert launch_state[-1] == ("terminate", "sb-job")
+    assert launch_state[-2:] == [("terminate", "sb-job"), ("cleanup", "sb-job")]
 
 
 def test_disabled_cache_cannot_authorize_cacheless_retry(monkeypatch):
