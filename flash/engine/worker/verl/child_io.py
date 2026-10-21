@@ -194,7 +194,15 @@ except Exception as _flash_cudart_exc:
 
 def render_sitecustomize_bootstrap() -> str:
     """render the minimal process-start bootstrap shared by all verl children."""
-    return render_tf32_shim() + render_tilelang_cudart_shim()
+    return (
+        render_tf32_shim()
+        + render_tilelang_cudart_shim()
+        + """
+import flash_verl_runtime as _flash_cache_runtime
+import flash_verl_flashinfer as _flash_cache_loader
+_flash_cache_loader.install(_flash_cache_runtime)
+"""
+    )
 
 
 from flash.engine.worker.train.core.child.runtime import (  # noqa: E402,F401

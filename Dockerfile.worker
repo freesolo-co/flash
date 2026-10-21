@@ -36,6 +36,8 @@ ENV DEBIAN_FRONTEND=noninteractive \
 # the default home workspace and re-JITs instead of using the baked cache.
 ENV TRITON_CACHE_DIR=/opt/flash/kernelcache/triton \
     TORCHINDUCTOR_CACHE_DIR=/opt/flash/kernelcache/inductor \
+    TILELANG_CACHE_DIR=/opt/flash/kernelcache/tilelang \
+    TORCH_EXTENSIONS_DIR=/opt/flash/kernelcache/torch_extensions \
     FLASHINFER_CUBIN_DIR=/opt/flash/kernelcache/flashinfer_cubin \
     FLASHINFER_CACHE_DIR=/opt/flash/kernelcache/flashinfer \
     FLASHINFER_WORKSPACE_BASE=/opt/flash/kernelcache/flashinfer
@@ -214,8 +216,7 @@ COPY build/kernel_cache/ /opt/flash/kernelcache/
 RUN if [ "${BUILD_KERNEL_CACHE}" = "true" ] && [ -f /opt/flash/kernelcache/mega_cache.json ]; then \
       echo "kernel-cache: baked from build/kernel_cache/ -> /opt/flash/kernelcache"; \
     else \
-      rm -rf /opt/flash/kernelcache/mega_cache.bin /opt/flash/kernelcache/mega_cache.json \
-        /opt/flash/kernelcache/triton /opt/flash/kernelcache/inductor; \
+      rm -rf /opt/flash/kernelcache; \
       mkdir -p /opt/flash/kernelcache/triton /opt/flash/kernelcache/inductor; \
       echo "kernel-cache: not baked (BUILD_KERNEL_CACHE=${BUILD_KERNEL_CACHE}) -> first-run JIT fallback"; \
     fi
