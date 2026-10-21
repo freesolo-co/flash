@@ -2,13 +2,12 @@
 
 from __future__ import annotations
 
-import flash.engine.worker.runtime.state as _worker_state
-
 # the pure parsers live in flash.content.thinking so the multi-turn grading path (flash.envs.adapter, which
 # must stay importable without torch) reaches the same implementation. re-exported here because this
 # module is the worker's public decoding surface.
 from flash.content.thinking import strip_think as strip_think
 from flash.content.thinking import thinking_text as thinking_text
+from flash.engine.worker.runtime.state import WorkerContext
 
 
 def prompt_opens_thinking(prompt: str | None) -> bool:
@@ -19,11 +18,13 @@ def prompt_opens_thinking(prompt: str | None) -> bool:
     return prompt.rstrip().endswith("<think>")
 
 
-def graded_text(completion: str | None, *, prompt_opened_thinking: bool = False) -> str | None:
+def graded_text(
+    completion: str | None, *, prompt_opened_thinking: bool = False, context: WorkerContext
+) -> str | None:
     """Answer text extracted for grading; reward state may still carry the raw completion."""
     return (
         strip_think(completion, prompt_opened_thinking=prompt_opened_thinking)
-        if _worker_state.THINKING
+        if context.config.thinking
         else completion
     )
 

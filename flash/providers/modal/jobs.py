@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import time
 
+from flash._internal.background import TaskStopped
 from flash.providers._lifecycle.instances.instance import build_payload, instance_label
 from flash.providers._lifecycle.instances.poll import (
     FIRST_LIVENESS_S,
@@ -181,6 +182,7 @@ def submit_attempt(
         deadline_at=deadline_at,
     )
     h = None
+    persisted = detached = False
     try:
         h = ModalJobHandle(
             instance_id=sandbox_id,
@@ -199,9 +201,14 @@ def submit_attempt(
         handle = JobHandle.from_dict(h.to_dict())
         if on_handle is not None:
             on_handle(handle)
+            persisted = True
         return poll(handle, spec, log=log, deadline_at=deadline_at)
+    except TaskStopped:
+        detached = persisted
+        raise
     finally:
-        # cleanup errors stay visible; a failed delete must not be mistaken for a stopped worker.
-        api.terminate(sandbox_id)
-        if h is not None and h.cpu_uploads:
-            checkpoint_upload.cleanup(h)
+        if not detached:
+            # cleanup errors stay visible; a failed delete must not be mistaken for a stopped worker.
+            api.terminate(sandbox_id)
+            if h is not None and h.cpu_uploads:
+                checkpoint_upload.cleanup(h)

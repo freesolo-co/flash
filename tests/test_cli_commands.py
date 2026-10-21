@@ -1933,7 +1933,7 @@ def test_follow_logs_uses_status_progress_when_log_tail_lags(monkeypatch, capsys
     err = stderr.getvalue()
     assert "stage=rl_step" in err
     assert "step=42" in err
-    assert "realized_cost=$1.2346" in err
+    assert "realized_cost=" not in err
 
 
 def test_follow_logs_prints_heartbeat_metrics_once_per_step(monkeypatch, capsys) -> None:

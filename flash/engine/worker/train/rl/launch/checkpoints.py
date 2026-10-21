@@ -11,12 +11,12 @@ import threading
 import time
 
 import flash.engine.worker.io.hf as _worker_hf
-import flash.engine.worker.runtime.state as _worker_state
 import flash.engine.worker.verl.checkpoints as verl_checkpoints
 from flash._internal.fileio import reject_duplicate_keys
 from flash.adapters.artifacts import MAX_ATTEMPT_ID, has_loadable_adapter_weights
 from flash.engine.support.verl_checkpoint import FsdpCheckpointInspection
 from flash.engine.worker.io.heartbeat import join_while_draining
+from flash.engine.worker.runtime.state import WorkerContext
 from flash.engine.worker.train.core.lifecycle.ledger import CheckpointLedger
 from flash.engine.worker.train.entry.backend_common import (
     completed_checkpoint_step,
@@ -257,7 +257,9 @@ class _VerlResumeUploader:
         model_revision: str = "",
         exclude_modules: str | None = None,
         preprocessor=None,
+        context: WorkerContext,
     ) -> None:
+        self.context = context
         self.local_dir = local_dir
         self.resume_step = int(resume_step)
         self.metric_evidence = metric_evidence
@@ -268,7 +270,7 @@ class _VerlResumeUploader:
         self._resume_attempted: set[int] = {resume_step} if resume_step else set()
         self.staged_adapters: dict[int, str] = {}
         self._internal_adapter_attempts: dict[int, int] = {}
-        self._attempt = _strict_attempt(_worker_state.ATTEMPT, field="attempt")
+        self._attempt = _strict_attempt(self.context.config.attempt, field="attempt")
         self._reported_required_debt = False
         self._blocked_evidence_step: int | None = None
         self.export_root = export_root
@@ -285,7 +287,9 @@ class _VerlResumeUploader:
     def credit_durable_required_steps(self, resume_step: int) -> None:
         """credit required deployables that are verifiably servable before this attempt."""
         for step in sorted(self.required_steps):
-            if step <= int(resume_step) and _worker_hf._deployable_adapter_on_hf(step):
+            if step <= int(resume_step) and _worker_hf._deployable_adapter_on_hf(
+                step, context=self.context
+            ):
                 self.lifecycle.mark_deployable_published(step)
 
     def restore_staged_adapters(self, resume_step: int) -> None:
@@ -338,7 +342,7 @@ class _VerlResumeUploader:
 
     def stop(self) -> None:
         self._stop.set()
-        join_while_draining(self._thread, "verl resume uploader")
+        join_while_draining(self._thread, "verl resume uploader", context=self.context)
 
     def raise_if_incomplete(self) -> None:
         """fail clean completion when required durability or uploader work failed."""
@@ -415,16 +419,17 @@ class _VerlResumeUploader:
             adapter_dir,
             f"checkpoint/{_HF_REQUIRED_ADAPTER_ROOT}/attempt-{self._attempt}/step-{step}/adapter",
             required=True,
+            context=self.context,
         )
         if not uploaded:
             raise RuntimeError(f"required internal adapter upload returned false at step {step}")
         self._internal_adapter_attempts[step] = self._attempt
 
     def _publish_staged(self, step: int, adapter_dir: str) -> None:
-        _worker_hf.publish_deployable_checkpoint(
-            adapter_dir, step, required=True, _provenance_ready=True
+        result = _worker_hf.publish_deployable_checkpoint(
+            adapter_dir, step, required=True, _provenance_ready=True, context=self.context
         )
-        self.lifecycle.mark_deployable_published(step)
+        self.lifecycle.record_publication(step, result)
 
     def _publish_ready(self) -> None:
         if not self._deployable_allowed():
@@ -513,14 +518,10 @@ class _VerlResumeUploader:
                             first_positive_grad_step=positive_step,
                         )
                         try:
-                            _worker_hf.upload_resume_checkpoint(
-                                step,
-                                path,
-                                final_step=self.final_step,
-                                after_upload=lambda step=step: self.lifecycle.mark_resume_uploaded(
-                                    step
-                                ),
+                            result = _worker_hf.upload_resume_checkpoint(
+                                step, path, final_step=self.final_step, context=self.context
                             )
+                            self.lifecycle.record_publication(step, result)
                         except Exception as error:
                             print(
                                 f"[rl-verl] resume checkpoint upload failed at step {step}: {error}",
@@ -538,10 +539,7 @@ class _VerlResumeUploader:
 
 
 def _restore_verl_resume(
-    local_dir: str,
-    *,
-    world_size: int,
-    required_steps: tuple[int, ...] = (),
+    local_dir: str, *, world_size: int, required_steps: tuple[int, ...] = (), context: WorkerContext
 ) -> int:
     """stage this run's current-contract native checkpoint and its internal adapter store."""
     accepted: dict[str, tuple[tuple[int, int], ...]] = {}
@@ -574,8 +572,7 @@ def _restore_verl_resume(
         return True
 
     resume, inspection = verl_checkpoints.select_verl_resume_checkpoint(
-        world_size=world_size,
-        accept=accept,
+        world_size=world_size, accept=accept, context=context
     )
     if not resume:
         return 0

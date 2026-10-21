@@ -5,6 +5,7 @@ Covers worker publication, HF listing, and backend mirroring. All network bounda
 
 from __future__ import annotations
 
+from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
@@ -54,31 +55,35 @@ class _RecordingHfApi:
         self.deleted.append(path_in_repo)
 
 
-def _prime_worker(monkeypatch, recorder, *, repo="org/test-runs", phase="rl", run="flash-ckpt-1"):
+def _prime_worker(
+    monkeypatch, recorder, *, repo="org/test-runs", phase="rl", run="flash-ckpt-1", worker_context
+):
     import flash.engine.worker.io.hf as worker
 
-    monkeypatch.setattr(worker._worker_state, "HF_REPO", repo)
-    monkeypatch.setattr(worker._worker_state, "PHASE", phase)
-    monkeypatch.setattr(worker._worker_state, "RUN_ID", run)
-    monkeypatch.setattr(worker._worker_state, "SEED", 0)
+    monkeypatch.setattr(worker_context, "config", replace(worker_context.config, hf_repo=repo))
+    monkeypatch.setattr(worker_context, "config", replace(worker_context.config, phase=phase))
+    monkeypatch.setattr(worker_context, "config", replace(worker_context.config, run_id=run))
+    monkeypatch.setattr(worker_context, "config", replace(worker_context.config, seed=0))
     monkeypatch.setattr(worker_hf, "hf_api", lambda: recorder)
     # heartbeat would otherwise commit to hf; silence it for the unit test.
-    monkeypatch.setattr(worker._worker_heartbeat, "heartbeat", lambda *a, **k: None)
+    monkeypatch.setattr(worker._worker_heartbeat, "heartbeat", lambda *a, context=None, **k: None)
     return worker
 
 
-def test_publish_deployable_checkpoint_uploads_adapter_only(tmp_path, monkeypatch):
+def test_publish_deployable_checkpoint_uploads_adapter_only(worker_context, tmp_path, monkeypatch):
     import flash.engine.worker.io.hf as worker
 
     rec = _RecordingHfApi()
-    _prime_worker(monkeypatch, rec)
+    _prime_worker(monkeypatch, rec, worker_context=worker_context)
     ckpt = tmp_path / "checkpoint-80"
     ckpt.mkdir()
     (ckpt / "adapter_config.json").write_text("{}")
     (ckpt / "adapter_model.safetensors").write_bytes(b"weights")
     (ckpt / "optimizer.pt").write_bytes(b"opt")
 
-    subfolder = worker.publish_deployable_checkpoint(str(ckpt), 80)
+    subfolder = worker.publish_deployable_checkpoint(
+        str(ckpt), 80, context=worker_context
+    ).deployable.path
 
     assert subfolder == "rl/flash-ckpt-1/checkpoints/step-80/adapter"
     assert len(rec.uploads) == 1
@@ -91,7 +96,9 @@ def test_publish_deployable_checkpoint_uploads_adapter_only(tmp_path, monkeypatc
     assert "delete_patterns" not in up
 
 
-def test_publish_deployable_checkpoint_writes_base_model_provenance(tmp_path, monkeypatch):
+def test_publish_deployable_checkpoint_writes_base_model_provenance(
+    worker_context, tmp_path, monkeypatch
+):
     # regression (#538 finding 6): a per-step / opd-reconcile deployable is published straight from a
     # trainer dir that never passed through the final _save_adapter path, so publish itself stamps the
     # base-model provenance sidecar, sourced from the job spec's pinned base model, before uploading.
@@ -101,10 +108,14 @@ def test_publish_deployable_checkpoint_writes_base_model_provenance(tmp_path, mo
     import flash.engine.worker.io.hf as worker
 
     rec = _RecordingHfApi()
-    _prime_worker(monkeypatch, rec)
+    _prime_worker(monkeypatch, rec, worker_context=worker_context)
     commit = "e" * 40
     monkeypatch.setattr(
-        worker._worker_state, "JOB_SPEC", SimpleNamespace(model="org/base", model_revision="main")
+        worker_context,
+        "config",
+        replace(
+            worker_context.config, spec=SimpleNamespace(model="org/base", model_revision="main")
+        ),
     )
     monkeypatch.setattr(hf, "resolve_cached_model_commit", lambda model_id, revision: commit)
     ckpt = tmp_path / "checkpoint-80"
@@ -112,7 +123,7 @@ def test_publish_deployable_checkpoint_writes_base_model_provenance(tmp_path, mo
     (ckpt / "adapter_config.json").write_text("{}")
     (ckpt / "adapter_model.safetensors").write_bytes(b"weights")
 
-    worker.publish_deployable_checkpoint(str(ckpt), 80)
+    worker.publish_deployable_checkpoint(str(ckpt), 80, context=worker_context)
 
     payload = json.loads((ckpt / "base_model_provenance.json").read_text())
     assert payload == {
@@ -125,121 +136,143 @@ def test_publish_deployable_checkpoint_writes_base_model_provenance(tmp_path, mo
     assert "base_model_provenance.json" not in rec.uploads[0]["ignore_patterns"]
 
 
-def test_publish_deployable_checkpoint_without_job_spec_writes_no_provenance(tmp_path, monkeypatch):
+def test_publish_deployable_checkpoint_without_job_spec_writes_no_provenance(
+    worker_context, tmp_path, monkeypatch
+):
     # back-compat: with no JOB_SPEC (e.g. local recipe runs) publish writes no base_model_provenance.json
     # rather than a misleading empty record, and still publishes the deployable (provenance is additive).
     import flash.engine.worker.io.hf as worker
 
     rec = _RecordingHfApi()
-    _prime_worker(monkeypatch, rec)
-    monkeypatch.setattr(worker._worker_state, "JOB_SPEC", None, raising=False)
+    _prime_worker(monkeypatch, rec, worker_context=worker_context)
+    monkeypatch.setattr(worker_context, "config", replace(worker_context.config, spec=None))
     ckpt = tmp_path / "checkpoint-80"
     ckpt.mkdir()
     (ckpt / "adapter_config.json").write_text("{}")
     (ckpt / "adapter_model.safetensors").write_bytes(b"weights")
 
-    worker.publish_deployable_checkpoint(str(ckpt), 80)
+    worker.publish_deployable_checkpoint(str(ckpt), 80, context=worker_context)
 
     assert not (ckpt / "base_model_provenance.json").exists()
     assert len(rec.uploads) == 1
 
 
-def test_publish_deployable_checkpoint_with_empty_model_writes_no_provenance(tmp_path, monkeypatch):
+def test_publish_deployable_checkpoint_with_empty_model_writes_no_provenance(
+    worker_context, tmp_path, monkeypatch
+):
     # #542 finding: the guard mirrors the final-save path (write only for a non-empty base model), so a
     # JOB_SPEC with no model stamps no sidecar rather than a misleading empty-model_id record, and still
     # publishes the deployable.
     import flash.engine.worker.io.hf as worker
 
     rec = _RecordingHfApi()
-    _prime_worker(monkeypatch, rec)
+    _prime_worker(monkeypatch, rec, worker_context=worker_context)
     monkeypatch.setattr(
-        worker._worker_state,
-        "JOB_SPEC",
-        SimpleNamespace(model="", model_revision=""),
-        raising=False,
+        worker_context,
+        "config",
+        replace(worker_context.config, spec=SimpleNamespace(model="", model_revision="")),
     )
     ckpt = tmp_path / "checkpoint-80"
     ckpt.mkdir()
     (ckpt / "adapter_config.json").write_text("{}")
     (ckpt / "adapter_model.safetensors").write_bytes(b"weights")
 
-    worker.publish_deployable_checkpoint(str(ckpt), 80)
+    worker.publish_deployable_checkpoint(str(ckpt), 80, context=worker_context)
 
     assert not (ckpt / "base_model_provenance.json").exists()
     assert len(rec.uploads) == 1
 
 
-def test_publish_deployable_checkpoint_rejects_bin_weights(tmp_path, monkeypatch):
+def test_publish_deployable_checkpoint_rejects_bin_weights(worker_context, tmp_path, monkeypatch):
     import flash.engine.worker.io.hf as worker
 
     rec = _RecordingHfApi()
-    _prime_worker(monkeypatch, rec)
+    _prime_worker(monkeypatch, rec, worker_context=worker_context)
     ckpt = tmp_path / "checkpoint-80"
     ckpt.mkdir()
     (ckpt / "adapter_config.json").write_text("{}")
     (ckpt / "adapter_model.bin").write_bytes(b"weights")
 
-    assert worker.publish_deployable_checkpoint(str(ckpt), 80) is None
+    assert (
+        worker.publish_deployable_checkpoint(str(ckpt), 80, context=worker_context).deployable
+        is None
+    )
     assert rec.uploads == []
 
 
-def test_publish_deployable_checkpoint_skips_without_adapter(tmp_path, monkeypatch):
+def test_publish_deployable_checkpoint_skips_without_adapter(worker_context, tmp_path, monkeypatch):
     """A checkpoint that carries no PEFT adapter is never advertised as deployable."""
     import flash.engine.worker.io.hf as worker
 
     rec = _RecordingHfApi()
-    _prime_worker(monkeypatch, rec)
+    _prime_worker(monkeypatch, rec, worker_context=worker_context)
     ckpt = tmp_path / "checkpoint-10"
     ckpt.mkdir()
     (ckpt / "optimizer.pt").write_bytes(b"opt")  # no adapter_config.json
 
-    assert worker.publish_deployable_checkpoint(str(ckpt), 10) is None
+    assert (
+        worker.publish_deployable_checkpoint(str(ckpt), 10, context=worker_context).deployable
+        is None
+    )
     assert rec.uploads == []
 
 
-def test_publish_deployable_checkpoint_skips_config_without_weights(tmp_path, monkeypatch):
+def test_publish_deployable_checkpoint_skips_config_without_weights(
+    worker_context, tmp_path, monkeypatch
+):
     """A checkpoint with adapter_config.json but no weights file isn't loadable -> not published."""
     import flash.engine.worker.io.hf as worker
 
     rec = _RecordingHfApi()
-    _prime_worker(monkeypatch, rec)
+    _prime_worker(monkeypatch, rec, worker_context=worker_context)
     ckpt = tmp_path / "checkpoint-20"
     ckpt.mkdir()
     (ckpt / "adapter_config.json").write_text("{}")  # config only, no adapter_model.*
 
-    assert worker.publish_deployable_checkpoint(str(ckpt), 20) is None
+    assert (
+        worker.publish_deployable_checkpoint(str(ckpt), 20, context=worker_context).deployable
+        is None
+    )
     assert rec.uploads == []
 
 
-def test_publish_deployable_checkpoint_no_repo_is_noop(tmp_path, monkeypatch):
+def test_publish_deployable_checkpoint_no_repo_is_noop(worker_context, tmp_path, monkeypatch):
     import flash.engine.worker.io.hf as worker
 
     rec = _RecordingHfApi()
-    _prime_worker(monkeypatch, rec, repo="")  # local run, no HF repo
+    _prime_worker(monkeypatch, rec, repo="", worker_context=worker_context)  # local run, no HF repo
     ckpt = tmp_path / "checkpoint-5"
     ckpt.mkdir()
     (ckpt / "adapter_config.json").write_text("{}")
 
-    assert worker.publish_deployable_checkpoint(str(ckpt), 5) is None
+    assert (
+        worker.publish_deployable_checkpoint(str(ckpt), 5, context=worker_context).deployable
+        is None
+    )
     assert rec.uploads == []
 
 
-def test_publish_deployable_checkpoint_starts_no_upload_at_deadline(tmp_path, monkeypatch):
+def test_publish_deployable_checkpoint_starts_no_upload_at_deadline(
+    worker_context, tmp_path, monkeypatch
+):
     import flash.engine.worker.io.hf as worker
 
     rec = _RecordingHfApi()
-    _prime_worker(monkeypatch, rec)
-    monkeypatch.setattr(worker._worker_state, "_remaining_worker_wall_seconds", lambda: 0.0)
+    _prime_worker(monkeypatch, rec, worker_context=worker_context)
+    monkeypatch.setattr(worker_context, "remaining_wall_seconds", lambda: 0.0)
     ckpt = tmp_path / "checkpoint-5"
     ckpt.mkdir()
     (ckpt / "adapter_config.json").write_text("{}")
     (ckpt / "adapter_model.safetensors").write_bytes(b"weights")
 
-    assert worker.publish_deployable_checkpoint(str(ckpt), 5) is None
+    assert (
+        worker.publish_deployable_checkpoint(str(ckpt), 5, context=worker_context).deployable
+        is None
+    )
     assert rec.uploads == []
 
 
-def test_prune_stale_resume_checkpoints_deletes_only_older_steps(monkeypatch):
+def test_prune_stale_resume_checkpoints_deletes_only_older_steps(worker_context, monkeypatch):
     """Pruning removes older steps without deleting a newer concurrently published checkpoint."""
     import flash.engine.worker.io.hf as worker_hf
 
@@ -254,9 +287,9 @@ def test_prune_stale_resume_checkpoints_deletes_only_older_steps(monkeypatch):
         f"{prefix}/metrics.json",
     ]
     rec = _RecordingHfApi(files)
-    _prime_worker(monkeypatch, rec)
+    _prime_worker(monkeypatch, rec, worker_context=worker_context)
 
-    worker_hf._prune_stale_resume_checkpoints(60)
+    worker_hf._prune_stale_resume_checkpoints(60, context=worker_context)
 
     assert sorted(rec.deleted) == [
         f"{prefix}/checkpoint/checkpoint-20",
@@ -267,12 +300,12 @@ def test_prune_stale_resume_checkpoints_deletes_only_older_steps(monkeypatch):
     assert all("checkpoints/" not in d for d in rec.deleted)  # deployable tree untouched
 
 
-def test_prune_stale_resume_checkpoints_no_repo_is_noop(monkeypatch):
+def test_prune_stale_resume_checkpoints_no_repo_is_noop(worker_context, monkeypatch):
     import flash.engine.worker.io.hf as worker_hf
 
     rec = _RecordingHfApi(["rl/r/checkpoint/checkpoint-1/optimizer.pt"])
-    _prime_worker(monkeypatch, rec, repo="")  # local run, no HF repo
-    worker_hf._prune_stale_resume_checkpoints(5)
+    _prime_worker(monkeypatch, rec, repo="", worker_context=worker_context)  # local run, no HF repo
+    worker_hf._prune_stale_resume_checkpoints(5, context=worker_context)
     assert rec.deleted == []
 
 
@@ -622,23 +655,31 @@ def _finalize_src(module_name: str, fn_name: str) -> str:
 
 
 def test_run_rl_publishes_final_step_as_deployable_checkpoint():
-    src = _finalize_src("flash.engine.worker.train.entry.rl_train", "run_rl_train")
+    src = _finalize_src("flash.engine.worker.train.entry.rl_train", "_publish_rl_result")
     # Warm-start CONTINUES the one adapter in place, so the saved adapter already carries SFT+GRPO on
     # the original catalog base and deploys as-is: the final adapter is uploaded as the default and
     # published as the deployable checkpoint directly — no recombine step.
     assert "save_pretrained(adapter_dir)" in src
-    assert '_worker_hf.hf_upload_folder(adapter_dir, "adapter", required=True)' in src
-    assert "_worker_hf.publish_deployable_checkpoint(adapter_dir, steps_run)" in src
+    assert (
+        '_worker_hf.hf_upload_folder(adapter_dir, "adapter", required=True, context=context)' in src
+    )
+    assert (
+        "_worker_hf.publish_deployable_checkpoint(adapter_dir, steps_run, context=context)" in src
+    )
 
 
 def test_run_sft_publishes_final_step_as_deployable_checkpoint():
     # The invariant lives in the verl worker, which owns the whole SFT path; `run_sft` is a one-line
     # delegation to it. Asserting on the delegator's source would pass on any body at all, so this
     # follows the wiring to where the adapter is actually exported and published.
-    src = _finalize_src("flash.engine.worker.train.entry.sft_train", "run_sft_train")
+    src = _finalize_src("flash.engine.worker.train.entry.sft_train", "_publish_sft_result")
     assert "_export_checkpoint_adapter(" in src
-    assert '_worker_hf.hf_upload_folder(adapter_dir, "adapter", required=True)' in src
-    assert "_worker_hf.publish_deployable_checkpoint(adapter_dir, final_step)" in src
+    assert (
+        '_worker_hf.hf_upload_folder(adapter_dir, "adapter", required=True, context=context)' in src
+    )
+    assert (
+        "_worker_hf.publish_deployable_checkpoint(adapter_dir, final_step, context=context)" in src
+    )
 
 
 def test_worker_io_modules_only_reference_attributes_their_siblings_define():
@@ -688,3 +729,182 @@ def _module_or_none(dotted: str):
         return importlib.import_module(dotted)
     except Exception:
         return None
+
+
+def test_deployable_commit_survives_reporting_failure_without_reupload(
+    worker_context, tmp_path, monkeypatch
+):
+    from types import SimpleNamespace
+
+    import flash.engine.worker.io.heartbeat as heartbeat
+    import flash.engine.worker.io.hf as worker
+
+    checkpoint = tmp_path / "adapter"
+    checkpoint.mkdir()
+    (checkpoint / "adapter_config.json").write_text("{}")
+    (checkpoint / "adapter_model.safetensors").write_bytes(b"weights")
+    uploads = []
+
+    def upload(**kwargs):
+        uploads.append(kwargs)
+        return SimpleNamespace(oid="adapter-commit")
+
+    def fail_report(*args, **kwargs):
+        raise ConnectionError("report unavailable")
+
+    monkeypatch.setattr(
+        worker_context, "config", replace(worker_context.config, hf_repo="org/runs")
+    )
+    monkeypatch.setattr(worker, "hf_api", lambda: SimpleNamespace(upload_folder=upload))
+    monkeypatch.setattr(heartbeat, "heartbeat", fail_report)
+    result = worker.publish_deployable_checkpoint(
+        str(checkpoint), 5, required=True, retries=3, _provenance_ready=True, context=worker_context
+    )
+    assert result.deployable.revision == "adapter-commit"
+    assert result.reporting_error is not None
+    assert len(uploads) == 1
+
+
+@pytest.mark.parametrize("algorithm", ["sft", "opd"])
+def test_required_watcher_retries_adapter_before_publishing_resume(
+    worker_context, tmp_path, monkeypatch, algorithm
+):
+    from pathlib import Path
+
+    from flash.engine.worker.train.entry import sft_train
+    from flash.engine.worker.train.opd.orchestration import failures as opd
+    from flash.engine.worker.train.sft.setup.checkpoints import _VerlCheckpointWatcher
+
+    uploads = []
+    delays = []
+
+    class Api(_RecordingHfApi):
+        def upload_folder(self, **kwargs):
+            uploads.append(kwargs["path_in_repo"])
+            if len(uploads) < 3:
+                raise ConnectionError("temporary storage outage")
+            return SimpleNamespace(oid="adapter-commit")
+
+    worker = _prime_worker(monkeypatch, Api(), worker_context=worker_context)
+    monkeypatch.setattr(
+        worker, "_sleep_with_hf_deadline", lambda delay, **kwargs: delays.append(delay) or True
+    )
+
+    def export(_actor, destination, **kwargs):
+        adapter = Path(destination)
+        adapter.mkdir(parents=True)
+        (adapter / "adapter_config.json").write_text("{}")
+        (adapter / "adapter_model.safetensors").write_bytes(b"weights")
+
+    def resume(*args, **kwargs):
+        assert len(uploads) == 3
+        return worker.PublicationResult(resume=worker.ArtifactCommit("native", "native-commit"))
+
+    monkeypatch.setattr(sft_train, "_export_checkpoint_adapter", export)
+    monkeypatch.setattr(opd, "_export_checkpoint_adapter", export)
+    monkeypatch.setattr(opd, "_stage_retry_contract", lambda *args, **kwargs: None)
+    monkeypatch.setattr(worker, "upload_resume_checkpoint", resume)
+    options = {
+        "local_dir": str(tmp_path),
+        "export_root": str(tmp_path / "exports"),
+        "python_bin": "python",
+        "model_id": "org/model",
+        "model_revision": "commit",
+        "required_steps": (1,),
+    }
+    if algorithm == "opd":
+        watcher = opd._OpdVerlCheckpointWatcher(
+            **options,
+            seed=42,
+            prompt_pool_fingerprint="a" * 64,
+            prompts_per_step=2,
+            group_size=3,
+            accounting_state=lambda step: {},
+            context=worker_context,
+        )
+    else:
+        watcher = _VerlCheckpointWatcher(**options, context=worker_context)
+    checkpoint = tmp_path / "global_step_1"
+    (checkpoint / "actor").mkdir(parents=True)
+    watcher._publish(1, str(checkpoint))
+
+    assert delays == [5.0, 10.0]
+    assert len(set(uploads)) == 1
+    assert watcher.lifecycle.facts(1).deployable_published
+    assert watcher.lifecycle.facts(1).resume_uploaded
+
+
+def test_deployable_upload_and_backoff_remain_alive(worker_context, tmp_path, monkeypatch):
+    from threading import Event
+
+    heartbeat = worker_hf._worker_heartbeat
+    tick = Event()
+    reports = []
+
+    def report(stage, **fields):
+        if stage == "checkpoint_uploading":
+            reports.append(fields)
+            tick.set()
+
+    class Api(_RecordingHfApi):
+        def upload_folder(self, **kwargs):
+            assert tick.wait(2), "blocked adapter upload emitted no keepalive"
+            self.uploads.append(kwargs)
+            if len(self.uploads) == 1:
+                raise ConnectionError("temporary storage outage")
+            return SimpleNamespace(oid="adapter-commit")
+
+    api = Api()
+    worker = _prime_worker(monkeypatch, api, worker_context=worker_context)
+    monkeypatch.setattr(heartbeat, "heartbeat", report)
+    monkeypatch.setattr(heartbeat, "_LIVENESS_TICK_S", 0.01)
+    monkeypatch.setattr(heartbeat.worker_perf, "gpu_diagnostics", dict)
+
+    def backoff(delay, **kwargs):
+        tick.clear()
+        assert tick.wait(2), "retry backoff emitted no keepalive"
+        return True
+
+    monkeypatch.setattr(worker, "_sleep_with_hf_deadline", backoff)
+    (tmp_path / "adapter_config.json").write_text("{}")
+    (tmp_path / "adapter_model.safetensors").write_bytes(b"weights")
+    result = worker.publish_deployable_checkpoint(
+        str(tmp_path), 5, required=True, retries=2, _provenance_ready=True, context=worker_context
+    )
+    assert result.deployable.revision == "adapter-commit"
+    assert len(api.uploads) == 2
+    assert len(reports) >= 2
+    assert all(fields["step"] == 5 and not fields["liveness"] for fields in reports)
+
+
+@pytest.mark.parametrize(("required", "expected_attempts"), [(False, 1), (True, 3)])
+def test_deployable_retry_budget_is_bounded(
+    worker_context, tmp_path, monkeypatch, required, expected_attempts
+):
+    uploads = []
+    delays = []
+
+    class Api(_RecordingHfApi):
+        def upload_folder(self, **kwargs):
+            uploads.append(kwargs)
+            raise ConnectionError("storage unavailable")
+
+    worker = _prime_worker(monkeypatch, Api(), worker_context=worker_context)
+    monkeypatch.setattr(
+        worker, "_sleep_with_hf_deadline", lambda delay, **kwargs: delays.append(delay) or True
+    )
+    (tmp_path / "adapter_config.json").write_text("{}")
+    (tmp_path / "adapter_model.safetensors").write_bytes(b"weights")
+    if required:
+        with pytest.raises(worker.RetriableInfraError, match="deployable upload failed"):
+            worker.publish_deployable_checkpoint(
+                str(tmp_path), 5, required=True, _provenance_ready=True, context=worker_context
+            )
+    else:
+        result = worker.publish_deployable_checkpoint(
+            str(tmp_path), 5, _provenance_ready=True, context=worker_context
+        )
+        assert result.deployable is None
+        assert "storage unavailable" in result.upload_error
+    assert len(uploads) == expected_attempts
+    assert delays == ([5.0, 10.0] if required else [])

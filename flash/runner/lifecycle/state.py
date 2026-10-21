@@ -145,9 +145,9 @@ class RunStatus:
     lifecycle_progressed_attempt: int | None = None
     # exact provider handle whose teardown was confirmed independently of retained billing identity.
     cleanup_confirmed_remote: dict | None = None
-    # exact torn-down provider handle retained until both delayed realized-cost reconciliation and any
-    # pending customer charge complete. it is private and is not an active resource.
-    realized_cost_remote: dict | None = None
+    # exact torn-down provider handle retained for pending customer charges and cancellation pricing.
+    # it is private and is not an active resource.
+    billing_remote: dict | None = None
     # Sandbox providers configured WHEN THIS RUN WAS SUBMITTED — the set that could have
     # owned a pre-handle non-idempotent create. Recovery's phantom guard (_confirm_run_clear) fails
     # closed for any of these that is no longer configurable (so it can't ENUMERATE to prove clear),
@@ -155,14 +155,7 @@ class RunStatus:
     # for runs created outside submit() / pre-feature records.
     submitted_instance_providers: list[str] | None = None
     submitted_modal_scope: str | None = None
-    # Realized provider cost (COGS), pulled from the provider's billing API after the run
-    # finishes by the reconciliation job (flash/server/domain/ops/reconcile.py) and reported to the
-    # freesolo backend for estimator accuracy. Distinct from ``cost_usd`` (the flash.cost ESTIMATE
-    # we charge the customer); ``reconciled_at`` marks that the realized pull has happened so it
-    # isn't re-pulled. Both stay None for un-reconciled / pre-instrumentation runs.
-    realized_cost_usd: float | None = None
-    reconciled_at: float | None = None
-    # Stamped ONCE on first terminal transition; survives later updated_at bumps from deploy/reconcile.
+    # Stamped ONCE on first terminal transition; survives later updated_at bumps from deployment updates.
     finished_at: float | None = None
     billing_context: dict | None = None
     billing_state: str | None = None
@@ -181,6 +174,8 @@ class RunStatus:
     # full managed source descriptor, kept private because it carries the repository path.
     source_snapshot: dict | None = None
     source_verified_attempt: int | None = None
+    # Only the requirement is persisted, never request secret names or values.
+    requires_runtime_secrets: bool = False
 
     def to_dict(self) -> dict:
         """Return the public run status representation."""
@@ -188,11 +183,12 @@ class RunStatus:
 
         data = _status_storage_dict(self)
         data["spec"] = _public_status_spec(data.get("spec"))
+        data.pop("requires_runtime_secrets", None)
         data.pop("report_sequence", None)
         data.pop("lifecycle_started_attempt", None)
         data.pop("lifecycle_progressed_attempt", None)
         data.pop("cleanup_confirmed_remote", None)
-        data.pop("realized_cost_remote", None)
+        data.pop("billing_remote", None)
         # internal warm-start preparation (storage locators, digests) never leaves the server
         data.pop("effective_preparation", None)
         heartbeat = data.get("last_heartbeat")

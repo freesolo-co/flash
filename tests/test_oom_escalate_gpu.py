@@ -3,12 +3,12 @@
 from __future__ import annotations
 
 import types
+from dataclasses import replace
 
 import pytest
 
 import flash.engine.worker.entry.worker as worker_entry
 import flash.engine.worker.perf as worker_perf
-import flash.engine.worker.runtime.state as worker_state
 
 
 @pytest.fixture(autouse=True)
@@ -536,7 +536,7 @@ def test_invalid_gpu0_does_not_hide_dirty_gpu1(monkeypatch):
     assert queried == [0, 1]
 
 
-def test_resolved_count_bounds_gpu_enumeration(monkeypatch):
+def test_resolved_count_bounds_gpu_enumeration(worker_context, monkeypatch):
     from flash.engine.worker.perf import lifecycle as lc
 
     queried = _install_nvml_memory_stub(
@@ -549,10 +549,14 @@ def test_resolved_count_bounds_gpu_enumeration(monkeypatch):
         },
     )
     monkeypatch.setattr(
-        worker_state, "JOB_SPEC", types.SimpleNamespace(gpu=types.SimpleNamespace(count=2))
+        worker_context,
+        "config",
+        replace(
+            worker_context.config, spec=types.SimpleNamespace(gpu=types.SimpleNamespace(count=2))
+        ),
     )
     with pytest.raises(lc.DirtyGpuError, match="GPU device 0"):
-        worker_entry._preflight_gpu_occupancy_for_spec()
+        worker_entry._preflight_gpu_occupancy_for_spec(context=worker_context)
 
     assert queried == [0, 1]
 
@@ -642,7 +646,7 @@ def test_boot_reads_the_card_before_anything_initializes_cuda():
     # `_preflight_gpu_occupancy_for_spec` precedes everything, so the ordering assertion would hold no
     # matter how the calls were arranged and the test would pass while the check was disabled.
     body = inspect.getsource(worker_entry._run_worker_mode)
-    preflight = body.index("_preflight_gpu_occupancy_for_spec()")
+    preflight = body.index("_preflight_gpu_occupancy_for_spec(context=context)")
     forcer = body.index("_force_fla_triton_gdn_on_sm100()")
     assert preflight < forcer, "the occupancy read must precede the first CUDA context"
 
@@ -694,7 +698,7 @@ def test_cuda_is_initialized_is_false_before_any_cuda_call(monkeypatch):
     assert lc.cuda_is_initialized() is True
 
 
-def test_preflight_never_re_derives_what_the_run_needs(monkeypatch):
+def test_preflight_never_re_derives_what_the_run_needs(worker_context, monkeypatch):
     """The worker-side gate must not reach for the allocator's sizing model.
 
     Two sizing models that disagree is the failure this guards. ``allocate()`` sizes SFT from
@@ -711,7 +715,7 @@ def test_preflight_never_re_derives_what_the_run_needs(monkeypatch):
 
     monkeypatch.setattr(allocator, "required_vram_gb", _fail)
     monkeypatch.setattr(lc, "_nvml_memory_gb", lambda _device_index: (22.1, 22.5))
-    _preflight_gpu_occupancy_for_spec()
+    _preflight_gpu_occupancy_for_spec(context=worker_context)
 
 
 def test_free_vram_reads_nvml_and_never_starts_cuda(monkeypatch):

@@ -16,6 +16,7 @@ import flash.runner.lifecycle.status as run_status
 import flash.server.platform.deployment_jobs as deployment_jobs
 import flash.server.platform.runtime as server_runtime
 from flash import __version__
+from flash._internal.background import Supervisor
 from flash.server.platform import db
 
 _SERVER_EXTRAS_HINT = "the control plane needs the server extras: pip install 'flash[server]'"
@@ -115,17 +116,19 @@ def create_app():
     from contextlib import asynccontextmanager
 
     @asynccontextmanager
-    async def lifespan(app):
+    async def managed_lifespan(app):
         from flash.providers.core.preflight import check_run_preflight
         from flash.runner.lifecycle.reporting import _open_status_reporter
         from flash.server.billing.retry import charge_retry_enabled
-        from flash.server.domain.ops.reconcile import reconcile_enabled
 
         check_run_preflight()  # operator credentials: fail fast, before serving anyone
         db.recover_teacher_request_ledger()
         deployment_jobs._open_deployment_jobs()
         _open_status_reporter()
-        server_runtime.recover_runs()
+        # Reserve the durable-backlog scanner before recovery can fill its bounded lane.
+        with app.state.training_jobs.reserve(("scan", "runs"), "recovery", delay=30.0) as dispatch:
+            server_runtime.recover_runs()
+            dispatch(server_runtime.recover_pending_runs)
         serving_completion.recover_deployments()
         deployment_cleanup_stop = threading.Event()
         deployment_jobs.start_deployment_job(
@@ -145,13 +148,6 @@ def create_app():
         startup_charge_task = (
             asyncio.create_task(server_runtime._charge_retry_startup())
             if charge_retry_enabled()
-            else None
-        )
-        # Periodic realized-cost reconciliation (estimator accuracy), only when the operator
-        # internal key is configured.
-        cost_task = (
-            asyncio.create_task(server_runtime._reconcile_cost_loop())
-            if reconcile_enabled()
             else None
         )
         # Periodic completion-charge retry: re-charge any run left pending/failed by a transient blip
@@ -182,13 +178,13 @@ def create_app():
             yield
         finally:
             deployment_cleanup_stop.set()
+            app.state.training_jobs.close()
             startup_report_stop.set()
             startup_report_task.cancel()
             with contextlib.suppress(asyncio.CancelledError, Exception):
                 await startup_report_task
             for task in (
                 startup_charge_task,
-                cost_task,
                 charge_task,
                 sweep_task,
                 cleanup_task,
@@ -206,6 +202,18 @@ def create_app():
 
                 remaining = max(0.0, shutdown_deadline - time.monotonic())
                 await asyncio.to_thread(_shutdown_status_reporter, remaining, close=True)
+
+    @asynccontextmanager
+    async def lifespan(app):
+        owner = Supervisor()
+        app.state.training_jobs = owner
+        try:
+            with owner.bind():
+                async with managed_lifespan(app):
+                    yield
+        finally:
+            if not await asyncio.to_thread(owner.close, 5.0):
+                _log.warning("training tasks still in blocking calls at shutdown deadline")
 
     app = FastAPI(title="Flash Control Plane", version=__version__, lifespan=lifespan)
     app.include_router(meta.router)

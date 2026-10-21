@@ -10,6 +10,7 @@ import time
 from dataclasses import dataclass, field, replace
 
 import flash.runner.supervise.recovery as attempt_recovery
+from flash._internal.background import checkpoint, pause
 from flash.core.spec import JobSpec
 from flash.runner.lifecycle.attempts import AttemptLaunchClaim
 from flash.runner.supervise.retry_decision import (
@@ -37,7 +38,7 @@ class _SubmitContext:
     def gc_seen_sandboxes(self) -> None:
         if not self.seen_sandboxes:
             return
-        from flash.runner.accounting.reconciliation import reconcile_cleanup
+        from flash.runner.lifecycle.cleanup import reconcile_cleanup
 
         for remote in self.seen_sandboxes.values():
             outcome = reconcile_cleanup(self.spec.run_id, remote)
@@ -116,7 +117,7 @@ def _require_opd_configuration(ctx: _SubmitContext) -> None:
 def _cleanup_previous_attempt(ctx: _SubmitContext, attempt: int) -> dict | None:
     if not ctx.last_handle:
         return None
-    from flash.runner.accounting.reconciliation import _compare_and_clear_remote, reconcile_cleanup
+    from flash.runner.lifecycle.cleanup import _compare_and_clear_remote, reconcile_cleanup
     from flash.runner.lifecycle.deadlines import _load_run_deadline_at
 
     metrics = attempt_recovery._await_completed_worker_metrics(
@@ -327,12 +328,12 @@ def _handle_callback(ctx: _SubmitContext, prepared, candidate_plan):
     """Bind provider handle persistence to one immutable reservation and candidate."""
     claim = prepared[0]
     _, chosen, _, _ = candidate_plan
-    from flash.runner.accounting.reconciliation import (
+    from flash.runner.lifecycle.attempts import persist_claimed_remote
+    from flash.runner.lifecycle.cleanup import (
         _expected_remote_matches,
         _preserve_cleanup_remote,
         _record_cleanup_remote,
     )
-    from flash.runner.lifecycle.attempts import persist_claimed_remote
     from flash.runner.lifecycle.status import get_status
     from flash.runner.supervise.errors import _TerminalHandleRace
 
@@ -506,7 +507,7 @@ def _run_attempt(ctx: _SubmitContext, prepared):
 
 def _settle_terminal_remote(ctx: _SubmitContext) -> None:
     """settle through the same resource policy used by restart and cancellation."""
-    from flash.runner.accounting.reconciliation import reconcile_cleanup
+    from flash.runner.lifecycle.cleanup import reconcile_cleanup
 
     if ctx.last_handle and reconcile_cleanup(ctx.spec.run_id, ctx.last_handle).resource_deleted:
         ctx.seen_sandboxes.pop(ctx.last_handle.get("instance_id"), None)
@@ -601,6 +602,7 @@ def run_attempts_supervised(
         )
         _require_opd_configuration(ctx)
         while True:
+            checkpoint()
             prepared, completed_metrics = _prepare_attempt(ctx)
             if completed_metrics is not None:
                 return ctx.return_completed_worker_metrics(completed_metrics)
@@ -619,7 +621,7 @@ def run_attempts_supervised(
             if not retry:
                 break
             if retry_delay:
-                time.sleep(retry_delay)
+                pause(retry_delay)
         _settle_terminal_remote(ctx)
         ctx.gc_seen_sandboxes()
         raise RuntimeError(f"run {spec.run_id} failed after retries: {ctx.last_detail}")

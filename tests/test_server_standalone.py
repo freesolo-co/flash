@@ -109,17 +109,14 @@ def test_standalone_disables_backend_reporting_at_the_shared_gate(monkeypatch) -
 
 
 def test_standalone_disables_the_backend_polling_loops(monkeypatch) -> None:
-    """Cost reconciliation and charge retry poll on a timer against a backend that isn't there."""
+    """Charge retries poll on a timer against a backend that isn't there."""
     from flash.server.billing.retry import charge_retry_enabled
-    from flash.server.domain.ops.reconcile import reconcile_enabled
 
     monkeypatch.setenv(auth.INTERNAL_KEY_ENV, "operator-key")
     monkeypatch.delenv(auth.STANDALONE_ENV, raising=False)
-    assert reconcile_enabled() is True
     assert charge_retry_enabled() is True
 
     monkeypatch.setenv(auth.STANDALONE_ENV, "1")
-    assert reconcile_enabled() is False
     assert charge_retry_enabled() is False
 
 

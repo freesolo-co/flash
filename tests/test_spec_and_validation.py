@@ -1468,7 +1468,7 @@ def test_attributed_gpu_type_prefers_effective_worker_spec_and_is_total() -> Non
     status["remote"] = {"allocated_gpu": "H200"}
     assert attributed_gpu_type(status) == "H200"
     status["remote"] = None
-    status["realized_cost_remote"] = {"allocated_gpu": "A100 SXM"}
+    status["billing_remote"] = {"allocated_gpu": "A100 SXM"}
     assert attributed_gpu_type(status) == "A100 SXM"
     for malformed in ("status", ["status"], {"remote": []}, {"effective_preparation": "bad"}):
         assert attributed_gpu_type(malformed) == ""

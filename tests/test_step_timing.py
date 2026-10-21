@@ -41,17 +41,17 @@ def test_median_resists_outlier_while_projection_uses_mean() -> None:
     assert fields["projected_remaining_s"] == pytest.approx(((92 + 92 + 900) / 3) * 10)
 
 
-def test_overflowing_diagnostic_is_omitted_through_step_ingestion(monkeypatch) -> None:
+def test_overflowing_diagnostic_is_omitted_through_step_ingestion(
+    worker_context, monkeypatch
+) -> None:
     calls = []
 
-    def heartbeat(stage, **fields):
+    def heartbeat(stage, context=None, **fields):
         calls.append((stage, fields))
         return True
 
     monkeypatch.setattr(rl_train_runner._worker_heartbeat, "heartbeat", heartbeat)
-    monkeypatch.setattr(
-        rl_train_runner._worker_state, "_remaining_worker_wall_seconds", lambda: 20000.0
-    )
+    monkeypatch.setattr(worker_context, "remaining_wall_seconds", lambda: 20000.0)
     monkeypatch.setattr(rl_train_runner, "gpu_diagnostics", lambda **_kwargs: {})
     state = _StepMetricState()
     inp = {"max_completion": 512, "steps": 190}
@@ -62,7 +62,8 @@ def test_overflowing_diagnostic_is_omitted_through_step_ingestion(monkeypatch) -
             _line(step, duration),
             inp,
             state,
-            lambda: rl_train_runner._step_timing_fields(inp, state),
+            lambda: rl_train_runner._step_timing_fields(inp, state, context=worker_context),
+            context=worker_context,
         )
 
     assert len(calls) == 1
@@ -106,7 +107,9 @@ def test_overrun_flag_uses_actual_remaining_wall_allowance() -> None:
     assert "wall_deadline_at_risk" not in unknown
 
 
-def test_non_step_and_validation_lines_do_not_consume_warmup() -> None:
+def test_non_step_and_validation_lines_do_not_consume_warmup(
+    worker_context,
+) -> None:
     state = _StepMetricState(sent_first_metrics=True)
     inp = {"max_completion": 512, "steps": 3}
     for line in (
@@ -114,17 +117,17 @@ def test_non_step_and_validation_lines_do_not_consume_warmup() -> None:
         "validation metrics: val-core/reward/mean:0.4 - timing_s/step:800.0",
         "step:1 - val-core/reward/mean:0.4 - timing_s/step:700.0",
     ):
-        _ingest_step_metrics(line, inp, state, dict)
+        _ingest_step_metrics(line, inp, state, dict, context=worker_context)
 
     state.progress["step"] = 1
-    _ingest_step_metrics(_line(1, 500.0), inp, state, dict)
+    _ingest_step_metrics(_line(1, 500.0), inp, state, dict, context=worker_context)
     assert (
         state.step_timing.heartbeat_fields(current_step=1, total_steps=3, remaining_wall_s=1000)
         == {}
     )
 
     state.progress["step"] = 2
-    _ingest_step_metrics(_line(2, 92.0), inp, state, dict)
+    _ingest_step_metrics(_line(2, 92.0), inp, state, dict, context=worker_context)
     assert (
         state.step_timing.heartbeat_fields(current_step=2, total_steps=3, remaining_wall_s=1000)[
             "step_duration_s"
@@ -133,17 +136,17 @@ def test_non_step_and_validation_lines_do_not_consume_warmup() -> None:
     )
 
 
-def test_first_usable_pace_is_forced_after_first_metrics_commit(monkeypatch) -> None:
+def test_first_usable_pace_is_forced_after_first_metrics_commit(
+    worker_context, monkeypatch
+) -> None:
     calls = []
 
-    def heartbeat(stage, **fields):
+    def heartbeat(stage, context=None, **fields):
         calls.append((stage, fields))
         return True
 
     monkeypatch.setattr(rl_train_runner._worker_heartbeat, "heartbeat", heartbeat)
-    monkeypatch.setattr(
-        rl_train_runner._worker_state, "_remaining_worker_wall_seconds", lambda: 20000.0
-    )
+    monkeypatch.setattr(worker_context, "remaining_wall_seconds", lambda: 20000.0)
     monkeypatch.setattr(rl_train_runner, "gpu_diagnostics", lambda **_kwargs: {})
     state = _StepMetricState()
     inp = {"max_completion": 512, "steps": 190}
@@ -151,15 +154,15 @@ def test_first_usable_pace_is_forced_after_first_metrics_commit(monkeypatch) -> 
     def observability():
         return {
             "reward_metrics": {"quality": 0.5},
-            **rl_train_runner._step_timing_fields(inp, state),
+            **rl_train_runner._step_timing_fields(inp, state, context=worker_context),
         }
 
     state.progress["step"] = 1
-    _ingest_step_metrics(_line(1, 515.0), inp, state, observability)
+    _ingest_step_metrics(_line(1, 515.0), inp, state, observability, context=worker_context)
     state.progress["step"] = 2
-    _ingest_step_metrics(_line(2, 92.0), inp, state, observability)
+    _ingest_step_metrics(_line(2, 92.0), inp, state, observability, context=worker_context)
     state.progress["step"] = 3
-    _ingest_step_metrics(_line(3, 93.0), inp, state, observability)
+    _ingest_step_metrics(_line(3, 93.0), inp, state, observability, context=worker_context)
 
     assert len(calls) == 2
     assert calls[0][1]["force"] is True
@@ -171,7 +174,9 @@ def test_first_usable_pace_is_forced_after_first_metrics_commit(monkeypatch) -> 
     assert state.sent_first_timing is True
 
 
-def test_first_timing_bypasses_force_floor_and_retries_with_real_wrapper(monkeypatch) -> None:
+def test_first_timing_bypasses_force_floor_and_retries_with_real_wrapper(
+    worker_context, monkeypatch
+) -> None:
     import importlib
 
     heartbeat_module = importlib.import_module("flash.engine.worker.io.heartbeat")
@@ -180,7 +185,7 @@ def test_first_timing_bypasses_force_floor_and_retries_with_real_wrapper(monkeyp
     outcomes = iter((True, False, True))
     uploads = []
 
-    def upload(local, *_args, **_kwargs):
+    def upload(local, *_args, context=None, **_kwargs):
         with open(local) as f:
             uploads.append(json.load(f))
         return next(outcomes)
@@ -189,43 +194,43 @@ def test_first_timing_bypasses_force_floor_and_retries_with_real_wrapper(monkeyp
     monkeypatch.setattr(worker_hf, "hf_upload_file", upload)
     monkeypatch.setattr(worker_heartbeat, "_HB_MIN_INTERVAL_S", 900.0)
     monkeypatch.setattr(worker_heartbeat, "_HB_FORCE_MIN_INTERVAL_S", 60.0)
-    monkeypatch.setattr(worker_heartbeat, "_HB_LAST_UPLOAD", 999.0)
-    monkeypatch.setattr(worker_heartbeat, "_HB_LAST_FORCED_UPLOAD", 0.0)
-    monkeypatch.setattr(worker_heartbeat, "_HB_LAST_COMMITTED_STEP", 0)
-    monkeypatch.setattr(worker_heartbeat, "_HB_PROGRESS_SEQ", 0)
-    monkeypatch.setattr(worker_heartbeat, "_HB_PROGRESS_UPLOADED_SEQ", 0)
+    monkeypatch.setattr(worker_context.heartbeat_state, "last_upload", 999.0)
+    monkeypatch.setattr(worker_context.heartbeat_state, "last_forced_upload", 0.0)
+    monkeypatch.setattr(worker_context.heartbeat_state, "last_committed_step", 0)
+    monkeypatch.setattr(worker_context.heartbeat_state, "progress_seq", 0)
+    monkeypatch.setattr(worker_context.heartbeat_state, "progress_uploaded_seq", 0)
     monkeypatch.setattr(rl_train_runner._worker_heartbeat, "heartbeat", worker_heartbeat.heartbeat)
-    monkeypatch.setattr(
-        rl_train_runner._worker_state, "_remaining_worker_wall_seconds", lambda: 20000.0
-    )
+    monkeypatch.setattr(worker_context, "remaining_wall_seconds", lambda: 20000.0)
     monkeypatch.setattr(rl_train_runner, "gpu_diagnostics", lambda **_kwargs: {})
     state = _StepMetricState()
     inp = {"max_completion": 512, "steps": 190}
 
     def observability():
-        return rl_train_runner._step_timing_fields(inp, state)
+        return rl_train_runner._step_timing_fields(inp, state, context=worker_context)
 
     state.progress["step"] = 1
-    _ingest_step_metrics(_line(1, 515.0), inp, state, observability)
+    _ingest_step_metrics(_line(1, 515.0), inp, state, observability, context=worker_context)
     assert state.sent_first_metrics is True
-    assert worker_heartbeat._HB_LAST_FORCED_UPLOAD == 1000.0
+    assert worker_context.heartbeat_state.last_forced_upload == 1000.0
 
     now["value"] = 1001.0
     state.progress["step"] = 2
-    _ingest_step_metrics(_line(2, 92.0), inp, state, observability)
+    _ingest_step_metrics(_line(2, 92.0), inp, state, observability, context=worker_context)
     assert state.sent_first_timing is False
-    assert worker_heartbeat._HB_LAST_COMMITTED_STEP == 1
-    assert worker_heartbeat._HB_LAST_FORCED_UPLOAD == 1000.0
+    assert worker_context.heartbeat_state.last_committed_step == 1
+    assert worker_context.heartbeat_state.last_forced_upload == 1000.0
 
     now["value"] = 1002.0
     state.progress["step"] = 3
-    _ingest_step_metrics(_line(3, 93.0), inp, state, observability)
+    _ingest_step_metrics(_line(3, 93.0), inp, state, observability, context=worker_context)
     assert state.sent_first_timing is True
 
     now["value"] = 1003.0
     state.progress["step"] = 4
-    _ingest_step_metrics(_line(4, 94.0), inp, state, observability)
-    assert worker_heartbeat.heartbeat("rl_step", step=4, force=True) is False
+    _ingest_step_metrics(_line(4, 94.0), inp, state, observability, context=worker_context)
+    assert (
+        worker_heartbeat.heartbeat("rl_step", step=4, force=True, context=worker_context) is False
+    )
 
     assert [payload["step"] for payload in uploads] == [1, 2, 3]
     assert "step_duration_s" not in uploads[0]
@@ -233,18 +238,16 @@ def test_first_timing_bypasses_force_floor_and_retries_with_real_wrapper(monkeyp
     assert uploads[2]["step_duration_s"] == 92.5
 
 
-def test_failed_first_timing_commit_retries_on_next_step(monkeypatch) -> None:
+def test_failed_first_timing_commit_retries_on_next_step(worker_context, monkeypatch) -> None:
     calls = []
     outcomes = iter([True, False, True])
 
-    def heartbeat(stage, **fields):
+    def heartbeat(stage, context=None, **fields):
         calls.append((stage, fields))
         return next(outcomes)
 
     monkeypatch.setattr(rl_train_runner._worker_heartbeat, "heartbeat", heartbeat)
-    monkeypatch.setattr(
-        rl_train_runner._worker_state, "_remaining_worker_wall_seconds", lambda: 20000.0
-    )
+    monkeypatch.setattr(worker_context, "remaining_wall_seconds", lambda: 20000.0)
     monkeypatch.setattr(rl_train_runner, "gpu_diagnostics", lambda **_kwargs: {})
     state = _StepMetricState()
     inp = {"max_completion": 512, "steps": 190}
@@ -252,25 +255,25 @@ def test_failed_first_timing_commit_retries_on_next_step(monkeypatch) -> None:
     def observability():
         return {
             "reward_metrics": {"quality": 0.5},
-            **rl_train_runner._step_timing_fields(inp, state),
+            **rl_train_runner._step_timing_fields(inp, state, context=worker_context),
         }
 
     state.progress["step"] = 1
-    _ingest_step_metrics(_line(1, 515.0), inp, state, observability)
+    _ingest_step_metrics(_line(1, 515.0), inp, state, observability, context=worker_context)
     assert state.sent_first_metrics is True
     assert state.sent_first_timing is False
 
     state.progress["step"] = 2
-    _ingest_step_metrics(_line(2, 92.0), inp, state, observability)
+    _ingest_step_metrics(_line(2, 92.0), inp, state, observability, context=worker_context)
     assert state.sent_first_metrics is True
     assert state.sent_first_timing is False
 
     state.progress["step"] = 3
-    _ingest_step_metrics(_line(3, 93.0), inp, state, observability)
+    _ingest_step_metrics(_line(3, 93.0), inp, state, observability, context=worker_context)
     assert state.sent_first_timing is True
 
     state.progress["step"] = 4
-    _ingest_step_metrics(_line(4, 94.0), inp, state, observability)
+    _ingest_step_metrics(_line(4, 94.0), inp, state, observability, context=worker_context)
 
     assert len(calls) == 3
     assert [fields["step"] for _, fields in calls] == [1, 2, 3]
@@ -279,17 +282,17 @@ def test_failed_first_timing_commit_retries_on_next_step(monkeypatch) -> None:
     assert calls[2][1]["step_duration_s"] == 92.5
 
 
-def test_forced_first_metrics_retry_carries_pace_once_available(monkeypatch) -> None:
+def test_forced_first_metrics_retry_carries_pace_once_available(
+    worker_context, monkeypatch
+) -> None:
     calls = []
 
-    def heartbeat(stage, **fields):
+    def heartbeat(stage, context=None, **fields):
         calls.append((stage, fields))
         return len(calls) > 1
 
     monkeypatch.setattr(rl_train_runner._worker_heartbeat, "heartbeat", heartbeat)
-    monkeypatch.setattr(
-        rl_train_runner._worker_state, "_remaining_worker_wall_seconds", lambda: 20000.0
-    )
+    monkeypatch.setattr(worker_context, "remaining_wall_seconds", lambda: 20000.0)
     monkeypatch.setattr(rl_train_runner, "gpu_diagnostics", lambda **_kwargs: {})
     state = _StepMetricState()
     inp = {"max_completion": 512, "steps": 190}
@@ -297,18 +300,18 @@ def test_forced_first_metrics_retry_carries_pace_once_available(monkeypatch) -> 
     def observability():
         return {
             "reward_metrics": {"quality": 0.5},
-            **rl_train_runner._step_timing_fields(inp, state),
+            **rl_train_runner._step_timing_fields(inp, state, context=worker_context),
         }
 
     state.progress["step"] = 1
-    _ingest_step_metrics(_line(1, 515.0), inp, state, observability)
+    _ingest_step_metrics(_line(1, 515.0), inp, state, observability, context=worker_context)
     assert state.sent_first_metrics is False
     assert state.sent_first_timing is False
 
     state.progress["step"] = 2
-    _ingest_step_metrics(_line(2, 92.0), inp, state, observability)
+    _ingest_step_metrics(_line(2, 92.0), inp, state, observability, context=worker_context)
     state.progress["step"] = 3
-    _ingest_step_metrics(_line(3, 93.0), inp, state, observability)
+    _ingest_step_metrics(_line(3, 93.0), inp, state, observability, context=worker_context)
 
     assert len(calls) == 2
     assert calls[0][1]["force"] is True

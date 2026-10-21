@@ -55,7 +55,7 @@ def test_each_runner_configures_exactly_one_algorithm_plugin():
     assert opd_source.count("VERL_USE_EXTERNAL_MODULES") == 1
 
 
-def test_large_grpo_plugin_config_uses_a_file_and_launches_the_child(tmp_path):
+def test_large_grpo_plugin_config_uses_a_file_and_launches_the_child(worker_context, tmp_path):
     description = "x" * 140_000
     structured_outputs = {
         "json": {
@@ -92,7 +92,9 @@ def test_large_grpo_plugin_config_uses_a_file_and_launches_the_child(tmp_path):
 
     config_path = Path(files["plugin_config_path"])
     assert config_path.stat().st_size > 128 * 1024
-    env = rl_train_runner._build_rl_child_env(inp, files, [], "http://127.0.0.1:9/")
+    env = rl_train_runner._build_rl_child_env(
+        inp, files, [], "http://127.0.0.1:9/", context=worker_context
+    )
     assert "FLASH_GRPO_PLUGIN_CONFIG" not in env
     assert env["FLASH_GRPO_PLUGIN_CONFIG_PATH"] == str(config_path)
     assert len(env["FLASH_GRPO_PLUGIN_CONFIG_PATH"]) < 4096

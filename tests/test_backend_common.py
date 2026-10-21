@@ -582,12 +582,16 @@ def test_flash_attn_spec_stays_in_lockstep_with_the_worker_image():
     # requirement it cannot parse and fails this REQUIRED layer. pin both halves: the install takes
     # a shell-resolved spec, and the fragment is added only inside the http* case.
     install_line = (
-        'uv pip install --python /opt/verl-venv/bin/python --no-build-isolation "${spec}"'
+        "uv pip install --python /opt/verl-venv/bin/python --no-build-isolation "
+        '--reinstall-package flash-attn "${spec}"'
     )
     assert install_line in text, (
         "the verl-venv flash-attn install must install a shell-resolved spec, not the raw ARG"
     )
     block = text[text.rindex("\nRUN ", 0, text.index(install_line)) : text.index(install_line)]
+    assert "uv cache clean flash-attn;" in block, (
+        "source overrides must discard cached wheels built with a different Torch/CUDA toolchain"
+    )
     assert "http*)" in block, (
         "the verl-venv install must append the sha256 fragment only for an http(s) wheel url"
     )

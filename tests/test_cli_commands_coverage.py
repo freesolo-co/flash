@@ -104,14 +104,14 @@ def test_print_worker_output_skips_empty_sections_and_styles_nonempty_output(
     assert capsys.readouterr().out == "section:console.txt\nworker line\n"
 
 
-def test_log_follow_progress_preserves_nonnumeric_realized_cost() -> None:
-    """Malformed realized cost values must remain visible instead of crashing log following."""
+def test_log_follow_progress_ignores_legacy_realized_cost() -> None:
+    """Legacy reconciliation fields must not appear in log progress."""
     state, progress = commands._log_follow_progress(
         {"state": "running", "realized_cost_usd": "pending"}, "unknown"
     )
 
     assert state == "running"
-    assert progress == "running realized_cost=pending"
+    assert progress == "running"
 
 
 def test_checkpoints_empty_and_styled_paths(monkeypatch, capsys) -> None:
