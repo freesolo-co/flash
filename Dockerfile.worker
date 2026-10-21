@@ -368,8 +368,12 @@ RUN --mount=type=cache,id=flash-worker-uv-cu128,target=/root/.cache/uv,sharing=l
 # `#sha256=` fragment is url syntax, so gluing it onto the documented non-url override
 # (FLASH_ATTN_SPEC=flash-attn==2.8.3) yields a requirement uv cannot parse and fails this required
 # layer outright. A package pin passes through unchanged and resolves from the index as before.
+# uv's built-wheel cache does not track Torch/CUDA or TORCH_CUDA_ARCH_LIST. Clear this
+# extension before installing so a source override cannot reuse another toolchain's wheel.
+# Other dependency downloads remain cached; unchanged installs still use Docker's layer cache.
 RUN --mount=type=cache,id=flash-worker-uv-cu128,target=/root/.cache/uv,sharing=locked \
     set -eu; \
+    uv cache clean flash-attn; \
     spec="${FLASH_ATTN_SPEC}"; \
     case "${spec}" in \
         http*) \
@@ -377,7 +381,7 @@ RUN --mount=type=cache,id=flash-worker-uv-cu128,target=/root/.cache/uv,sharing=l
             spec="${spec}#sha256=${FLASH_ATTN_SHA256}" ;; \
     esac; \
     TORCH_CUDA_ARCH_LIST="8.0 8.6 8.9 9.0 10.0 12.0" MAX_JOBS=4 \
-    uv pip install --python /opt/verl-venv/bin/python --no-build-isolation "${spec}"
+    uv pip install --python /opt/verl-venv/bin/python --no-build-isolation --reinstall-package flash-attn "${spec}"
 
 # causal_conv1d in the VERL VENV, which is where the model actually trains. The main interpreter's
 # copy above does not reach here: /opt/verl-venv is built without --system-site-packages, so the two
@@ -396,9 +400,12 @@ RUN --mount=type=cache,id=flash-worker-uv-cu128,target=/root/.cache/uv,sharing=l
 # gpu. Failing the BUILD is strictly cheaper than failing the run. No `|| uninstall` branch: the
 # import check below is part of the same && chain, so an ABI-broken build (which passes
 # transformers' find_spec probe) fails the image rather than shipping as present-but-broken.
+# Clear only this extension's cache, for the same toolchain reason as flash-attn above.
+# FORCE_BUILD reaches setup.py only when uv actually builds instead of using a cached wheel.
 RUN --mount=type=cache,id=flash-worker-uv-cu128,target=/root/.cache/uv,sharing=locked \
-    TORCH_CUDA_ARCH_LIST="8.0 8.6 8.9 9.0 10.0 12.0" CAUSAL_CONV1D_FORCE_BUILD=TRUE MAX_JOBS=4 \
-    uv pip install --python /opt/verl-venv/bin/python "causal-conv1d==1.6.2.post1" --no-build-isolation \
+    uv cache clean causal-conv1d \
+    && TORCH_CUDA_ARCH_LIST="8.0 8.6 8.9 9.0 10.0 12.0" CAUSAL_CONV1D_FORCE_BUILD=TRUE MAX_JOBS=4 \
+    uv pip install --python /opt/verl-venv/bin/python "causal-conv1d==1.6.2.post1" --no-build-isolation --reinstall-package causal-conv1d \
     && /opt/verl-venv/bin/python -c "import causal_conv1d" \
     && echo "causal_conv1d (verl venv): installed (GDN boundary resets enabled)"
 
