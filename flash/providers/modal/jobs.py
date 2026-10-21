@@ -144,11 +144,6 @@ def submit_attempt(
     )
     import os
 
-    compact = os.environ.get("FLASH_COMPACT_CHECKPOINTS", "1")
-    if compact not in ("0", "1"):
-        raise ValueError("FLASH_COMPACT_CHECKPOINTS must be 0 or 1")
-    payload["env"]["FLASH_COMPACT_CHECKPOINTS"] = compact
-
     if spec.gpu.network_volume and os.environ.get("FLASH_WEIGHT_CACHE_DISABLED", "").strip() != "1":
         payload["cache_volume"] = spec.gpu.network_volume
         payload["env"]["FLASH_WEIGHT_CACHE_DIR"] = f"{api.CACHE_MOUNT}/hf-cache/hub"

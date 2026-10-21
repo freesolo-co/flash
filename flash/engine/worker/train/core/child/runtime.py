@@ -644,11 +644,6 @@ def install_deferred_lora_rollout_guard(marker_file: str) -> None:
 
 
 def install_compact_checkpoints(marker_file: str) -> None:
-    enabled = os.environ.get("FLASH_COMPACT_CHECKPOINTS", "1")
-    if enabled == "0":
-        return
-    if enabled != "1":
-        raise RuntimeError("FLASH_COMPACT_CHECKPOINTS must be 0 or 1")
     if __name__ == "flash_verl_runtime":
         from flash_compact_checkpoint import install
     else:

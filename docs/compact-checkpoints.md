@@ -1,11 +1,9 @@
 # Compact LoRA recovery
 
-FSDP2 LoRA training saves compact recovery checkpoints by default, omitting
-immutable frozen base parameters. No configuration is needed. Flash pins the base
-model to a 40-character revision and forwards the checkpoint setting into workers
-and retries. Operators can explicitly set `FLASH_COMPACT_CHECKPOINTS=0` on the
-Modal controller to save full-state checkpoints for troubleshooting or backups.
-Leave the default enabled when restoring compact checkpoints.
+FSDP2 LoRA training always saves compact recovery checkpoints, omitting immutable
+frozen base parameters. Flash automatically pins the base model to a 40-character
+revision and passes that identity into workers and retries. There is no checkpoint
+format toggle.
 
 Trainable LoRA tensors, persistent buffers, optimizer state, scheduler state, RNG,
 and the existing data-loader checkpoint remain intact. A rank-local manifest
