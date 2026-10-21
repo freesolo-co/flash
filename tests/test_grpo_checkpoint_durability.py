@@ -1743,9 +1743,55 @@ def test_final_adapter_reuse_rejects_uploader_failure(tmp_path):
         resume_step=0,
         metric_evidence=_always_ready_metric_evidence(),
     )
+    source = tmp_path / "export"
+    _write_internal_adapter(source)
+    uploader.staged_adapters[4] = str(source)
+    uploader.lifecycle.mark_deployable_published(4)
+    uploader.allow_deployable_publication()
     uploader._error = RuntimeError("upload failed")
     with pytest.raises(RuntimeError, match="resume uploader failed"):
         uploader.reuse_final_adapter(4, str(tmp_path / "final"))
+
+
+@pytest.mark.parametrize("export_state", ["absent", "wrong_step", "unpublished", "closed_gate"])
+def test_final_export_falls_back_after_optional_upload_failure(tmp_path, monkeypatch, export_state):
+    uploader = rl_checkpoints._VerlResumeUploader(
+        str(tmp_path),
+        resume_step=0,
+        metric_evidence=_always_ready_metric_evidence(),
+    )
+    if export_state != "absent":
+        source = tmp_path / "export"
+        _write_internal_adapter(source)
+        step = 3 if export_state == "wrong_step" else 4
+        uploader.staged_adapters[step] = str(source)
+        if export_state != "unpublished":
+            uploader.lifecycle.mark_deployable_published(step)
+    if export_state != "closed_gate":
+        uploader.allow_deployable_publication()
+    uploader._error = FileNotFoundError("older optional checkpoint was pruned")
+    destination = str(tmp_path / "final")
+    exports = []
+    monkeypatch.setattr(
+        rl_runner,
+        "export_peft_adapter",
+        lambda *args, **kwargs: exports.append((args, kwargs)),
+    )
+    monkeypatch.setattr(rl_runner, "stamp_adapter_dir_provenance", lambda *a, **kw: None)
+    monkeypatch.setattr(rl_runner._worker_hf, "write_base_model_provenance", lambda *a, **kw: None)
+
+    rl_runner._export_final_adapter(
+        "/actor",
+        destination,
+        {"model_id": "Qwen/Qwen3.5-9B", "model_revision": "rev"},
+        "python",
+        resume_uploader=uploader,
+        steps_run=4,
+    )
+
+    assert exports == [
+        (("/actor", destination), {"base_model_id": "Qwen/Qwen3.5-9B", "python_bin": "python"})
+    ]
 
 
 def test_final_adapter_reuse_rejects_malformed_export(tmp_path):

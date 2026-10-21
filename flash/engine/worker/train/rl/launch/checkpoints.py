@@ -385,12 +385,13 @@ class _VerlResumeUploader:
         """Copy this run's validated, published export after the uploader has drained."""
         if self._thread.is_alive():
             raise RuntimeError("cannot reuse an adapter while checkpoint publication is running")
-        self.raise_if_incomplete()
         source = self.staged_adapters.get(step)
         if source is None or step not in self.lifecycle.deployable_published_steps:
             return False
         if not self._deployable_allowed():
             return False
+        # optional resume upload failures must not block the normal export fallback.
+        self.raise_if_incomplete()
         _validate_internal_adapter_dir(source, label=f"final step-{step}")
         source_path, destination_path = os.path.realpath(source), os.path.realpath(destination)
         if os.path.islink(destination) or os.path.commonpath([source_path, destination_path]) in {
