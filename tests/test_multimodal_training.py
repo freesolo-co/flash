@@ -652,7 +652,7 @@ def test_a_row_whose_completion_truncated_away_is_dropped_not_trained_on():
     verl pre-tokenizes to `input_ids`/`loss_mask` instead, so the check moved to `has_real_target`
     -- same invariant, different representation, and nothing covered it after the move.
     """
-    from flash.engine.worker.entry.sft import has_real_target
+    from flash.engine.profiling.sft_rows import has_real_target
 
     eos = 2
     special = {eos}
@@ -700,7 +700,7 @@ def test_grpo_rows_retain_arrow_safe_images_and_reward_examples(tmp_path):
 
 
 def test_sft_rejects_image_completion_when_prompt_is_text_only():
-    from flash.engine.worker.entry.sft import _reject_image_completion
+    from flash.engine.profiling.sft_rows import _reject_image_completion
 
     completion = [
         {
@@ -719,7 +719,7 @@ def test_sft_rejects_image_completion_when_prompt_is_text_only():
 @pytest.mark.parametrize(("block_type", "source_key"), _SDK_IMAGE_TARGET_FORMS)
 @pytest.mark.parametrize("image_bearing", [False, True], ids=["text-prompt", "image-prompt"])
 def test_sft_rejects_every_sdk_image_target_spelling(block_type, source_key, image_bearing):
-    from flash.engine.worker.entry.sft import _reject_image_completion
+    from flash.engine.profiling.sft_rows import _reject_image_completion
 
     completion = [
         {
@@ -736,7 +736,7 @@ def test_sft_rejects_every_sdk_image_target_spelling(block_type, source_key, ima
 
 
 def test_user_image_prompt_with_text_assistant_target_is_accepted():
-    from flash.engine.worker.entry.sft import _reject_image_completion
+    from flash.engine.profiling.sft_rows import _reject_image_completion
 
     normalized = mm.normalize_prompt_images(
         {},

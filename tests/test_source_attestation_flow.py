@@ -5,7 +5,7 @@ import copy
 import pytest
 
 import flash.runner.accounting.costs as runner_costs
-import flash.runner.accounting.reconciliation as runner_reconciliation
+import flash.runner.lifecycle.cleanup as runner_cleanup
 import flash.runner.lifecycle.reporting as runner_reporting
 import flash.runner.lifecycle.state as runner_state
 import flash.runner.lifecycle.status as runner_status
@@ -136,14 +136,10 @@ def test_recovery_completion_requires_attestation_before_done(monkeypatch, tmp_p
     monkeypatch.setattr(runner_reporting, "_report_status", lambda _status: None)
 
     with pytest.raises(RuntimeError):
-        runner_reconciliation._compare_and_complete_remote(
-            "run-1", None, spec, {"wall_seconds": 1.0}
-        )
+        runner_cleanup._compare_and_complete_remote("run-1", None, spec, {"wall_seconds": 1.0})
     assert runner_status.get_status("run-1").state == "running"
 
-    assert (
-        runner_reconciliation._compare_and_complete_remote("run-1", None, spec, _metrics()) is True
-    )
+    assert runner_cleanup._compare_and_complete_remote("run-1", None, spec, _metrics()) is True
     completed = runner_status.get_status("run-1")
     assert completed.state == "done"
     assert completed.source_verified_attempt == 2

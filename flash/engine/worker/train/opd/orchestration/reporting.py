@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any
 
-import flash.engine.worker.runtime.state as _worker_state
+from flash.engine.worker.runtime.state import WorkerContext
 from flash.engine.worker.verl.parallelism import ULYSSES_SEQUENCE_PARALLEL_SIZE
 
 if TYPE_CHECKING:
@@ -24,6 +24,8 @@ def _build_train_note_sections(
     runtime: _RuntimeState,
     result: _ChildResult,
     download_seconds: float,
+    *,
+    context: WorkerContext,
 ) -> tuple[
     dict[str, Any],
     dict[str, Any],
@@ -40,7 +42,7 @@ def _build_train_note_sections(
         "init_from_adapter": request.spec.train.init_from_adapter or None,
         "teacher_model": knobs.teacher_model,
         "download_seconds": download_seconds,
-        "thinking": _worker_state.THINKING,
+        "thinking": context.config.thinking,
         "loss_curve": final_accounting["loss_curve"],
         "mean_coverage": (
             float(final_accounting["coverage_sum"]) / int(final_accounting["aligned_sequences"])

@@ -119,10 +119,10 @@ def test_readiness_is_required_and_atomically_published(tmp_path):
     assert [item.name for item in tmp_path.iterdir()] == ["ready"]
 
 
-def test_child_uses_only_its_verified_package_path(monkeypatch, tmp_path):
+def test_child_uses_only_its_verified_package_path(worker_context, monkeypatch, tmp_path):
     monkeypatch.setenv("PYTHONPATH", str(tmp_path / "obsolete-shims"))
     monkeypatch.setenv("VERL_USE_EXTERNAL_MODULES", "old_plugin")
-    env = _build_verl_child_env(wandb_enabled=False)
+    env = _build_verl_child_env(wandb_enabled=False, context=worker_context)
     assert env["PYTHONPATH"] == str(ROOT)
     assert "VERL_USE_EXTERNAL_MODULES" not in env
 

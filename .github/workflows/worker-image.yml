@@ -8,8 +8,9 @@ name: flash worker image
 #
 # Triggered automatically on flash/** changes (worker training code is baked in; skipping a
 # rebuild leaves GPU workers running stale code) and manually for Dockerfile/dep changes.
-# The build is heavy (vllm + full training stack + flash-attn wheel) but Docker layer caching
-# means only the flash COPY+install layer reruns on pure Python changes (~minutes, not hours).
+# The build is heavy (vllm + full training stack + flash-attn wheel). Export completed layers
+# to GHCR so fresh runners can skip unchanged dependency installs, including CUDA compilation.
+# Package cache mounts are builder-local; registry layer exports do not persist their contents.
 
 on:
   workflow_call:
@@ -111,6 +112,11 @@ jobs:
         run: |
           echo "revision=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
           echo "tag=$IMAGE_TAG" >> "$GITHUB_OUTPUT"
+          # Stable across commits and image tags on this branch. Hash refs containing slashes
+          # into valid registry tags; test branches never overwrite the main branch's cache.
+          cache_scope=$(printf '%s' "$GITHUB_REF" | sha256sum | cut -c1-16)
+          if [ "$GITHUB_REF" = refs/heads/main ]; then cache_scope=main; fi
+          echo "cache_ref=ghcr.io/freesolo-co/flash-worker:buildcache-$cache_scope" >> "$GITHUB_OUTPUT"
 
       # Compute the kernel-cache fingerprints (stdlib-only, no uv sync) and stamp them as labels on
       # :cu128 below, so auto-rebake.yml can read what this base was built from. Fails the build if a
@@ -149,6 +155,13 @@ jobs:
           # declared in flash/providers/_lifecycle/net/worker.py, so a fork run must not push to its own owner
           # namespace and leave the real image stale.
           tags: ghcr.io/freesolo-co/flash-worker:${{ steps.source.outputs.tag }}
+          # Keep this large cache in GHCR, not the repository's Actions cache quota. Import
+          # this branch first plus main as a fallback; export only to this branch's cache.
+          # BuildKit validates layer inputs, so toolchain changes still rebuild native code.
+          cache-from: |
+            type=registry,ref=${{ steps.source.outputs.cache_ref }}
+            type=registry,ref=ghcr.io/freesolo-co/flash-worker:buildcache-main
+          cache-to: type=registry,ref=${{ steps.source.outputs.cache_ref }},mode=max
           provenance: false
           # Stamp the kernel-cache fingerprints + the source commit so auto-rebake.yml can read what
           # this base was built from (docker/kernel_fingerprint.py is the source of truth).

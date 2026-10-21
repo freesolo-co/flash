@@ -41,6 +41,7 @@ from flash.engine.worker.model.lora import (
     _open_safetensors_numpy,
     _read_adapter_tensor_metadata,
 )
+from flash.engine.worker.runtime.state import WorkerContext
 
 
 class MergeDiskHeadroomError(RuntimeError):
@@ -319,6 +320,7 @@ def select_verl_resume_checkpoint(
     *,
     world_size: int,
     accept: Callable[[str, FsdpCheckpointInspection], bool] | None = None,
+    context: WorkerContext,
 ) -> tuple[str | None, FsdpCheckpointInspection | None]:
     """select the newest caller-accepted loadable checkpoint and return its cached inspection."""
     import flash.engine.worker.io.hf as worker_hf
@@ -335,7 +337,7 @@ def select_verl_resume_checkpoint(
             inspections[path] = inspection
         return inspection.loadable and (accept is None or accept(path, inspection))
 
-    resume = worker_hf.hf_resume_checkpoint(prefer=prefer)
+    resume = worker_hf.hf_resume_checkpoint(prefer=prefer, context=context)
     if not resume:
         return None, None
     inspection = inspections.get(resume)
@@ -346,15 +348,10 @@ def select_verl_resume_checkpoint(
 
 
 def restore_verl_resume(
-    local_dir: str,
-    *,
-    world_size: int,
-    job_label: str,
+    local_dir: str, *, world_size: int, job_label: str, context: WorkerContext
 ) -> int:
     """select, inspect once, and stage the newest loadable streamed checkpoint."""
-    resume, inspection = select_verl_resume_checkpoint(
-        world_size=world_size,
-    )
+    resume, inspection = select_verl_resume_checkpoint(world_size=world_size, context=context)
     if not resume:
         return 0
     if inspection is None:

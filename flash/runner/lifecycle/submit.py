@@ -12,9 +12,10 @@ from __future__ import annotations
 
 import logging
 import os
-import threading
 from dataclasses import dataclass
+from functools import partial
 
+from flash._internal.background import Supervisor, current_supervisor
 from flash._internal.diagnostics import sanitize_diagnostic
 from flash.core import catalog
 from flash.core.spec import TRAINER_BACKEND, JobSpec
@@ -270,6 +271,7 @@ def submit_job(
     platform_context: dict | None = None,
     owner_key_id: int | None = None,
     prepared_job: PreparedJob | None = None,
+    supervisor: Supervisor | None = None,
 ) -> state.RunStatus:
     """Submit a prepared job, allocating resources only outside dry-run mode."""
     if prepared_job is not None:
@@ -281,6 +283,28 @@ def submit_job(
             platform_context=platform_context,
             owner_key_id=owner_key_id,
         )
+    kwargs = {
+        "dry_run": dry_run,
+        "runtime_secrets": runtime_secrets,
+        "billing_context": billing_context,
+        "platform_context": platform_context,
+    }
+    if background and not dry_run:
+        owner = supervisor or current_supervisor()
+        with owner.reserve(("run", prepared.public_spec.run_id), "training") as dispatch:
+            return _submit_prepared_job(prepared, dispatch=dispatch, **kwargs)
+    return _submit_prepared_job(prepared, **kwargs)
+
+
+def _submit_prepared_job(
+    prepared: PreparedJob,
+    *,
+    dry_run: bool,
+    runtime_secrets: dict | None,
+    billing_context: dict | None,
+    platform_context: dict | None,
+    dispatch=None,
+) -> state.RunStatus:
     public_spec = prepared.public_spec
     worker_spec = prepared.worker_spec
     estimated_cost_usd = prepared.estimated_cost_usd
@@ -320,6 +344,7 @@ def submit_job(
             public_spec, worker_spec, prepared.adapter_identity
         ),
         source_snapshot=source_snapshot,
+        requires_runtime_secrets=bool(runtime_secrets),
         # snapshot the instance providers available at submit so a later handle-less recovery can fail
         # closed for any phantom-capable one whose creds were since dropped (see _confirm_run_clear).
         # Creds-only check (available_providers -> is_configured), no network on the create path.
@@ -345,12 +370,8 @@ def submit_job(
         state._save_status(status)
         reporting._report_status(status)
         return status
-    if background:
-        threading.Thread(
-            target=supervision._run_job_background,
-            args=(worker_spec, runtime_secrets or {}),
-            daemon=True,
-        ).start()
+    if dispatch is not None:
+        dispatch(partial(supervision._run_job_background, worker_spec, runtime_secrets or {}))
         return status_ops.get_status(public_spec.run_id)
     if runtime_secrets:
         supervision._run_job(worker_spec, runtime_secrets=runtime_secrets)

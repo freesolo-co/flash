@@ -6,9 +6,12 @@ poll in `deploy-modal.yml` passes all of them, which is why these rules exist.
 
 from __future__ import annotations
 
+import pytest
+
 from flash.serving.promotion.evidence import (
     ACCOUNTING_MALFORMED,
     ACCOUNTING_STALLED,
+    ACCOUNTING_UNSETTLED,
     HEALTH_DEPLOYMENT_ID_MISMATCH,
     HEALTH_MALFORMED,
     HEALTH_NO_ENGINES,
@@ -136,20 +139,13 @@ def test_a_real_stream_passes():
 
 
 def _evidence(**overrides) -> AccountingEvidence:
-    counters = {"expired_leases": 0, "oldest_undelivered_age_seconds": None}
+    counters = {"canary_settled": True, "expired_leases": 0, "oldest_undelivered_age_seconds": None}
     counters.update(overrides)
     return AccountingEvidence(**counters)
 
 
 def test_traffic_in_flight_is_not_a_failed_promotion():
-    """This is the fail-open/flaky trap that a zero-backlog assertion walks into.
-
-    `serving_usage_backlog_snapshot` aggregates EVERY generation in flight, not the canary's own
-    row, and there is no per-correlation read. On live production some unrelated request is almost
-    always mid-delivery, so requiring zero would fail healthy releases at random -- and, worse, a
-    burst of unrelated traffic draining to zero would pass a release whose own row never settled.
-    Only stall signals mean the same thing regardless of whose rows are in the counters.
-    """
+    """unrelated traffic may remain in flight after this canary settles."""
     assert verify_accounting(_evidence(oldest_undelivered_age_seconds=3)).ok
 
 
@@ -178,10 +174,11 @@ def test_a_row_still_inside_the_outbox_retry_budget_does_not_block_promotion():
 
 
 def _body(**overrides):
-    """A `serving_usage_backlog_snapshot` body, shaped exactly as the RPC returns it."""
+    """A `serving_promotion_accounting_snapshot` body, shaped exactly as the RPC returns it."""
     body = {
         # still sent by the RPC and still required by the parser, though no field is read out of
         # it: an absent `states` is what a schema rename or an empty result looks like.
+        "canary_settled": True,
         "states": {"pending": 0, "leased": 0},
         "expired_leases": 0,
         "oldest_undelivered_age_seconds": None,
@@ -267,10 +264,28 @@ def test_a_fractional_age_is_the_normal_wire_shape_not_a_malformed_body():
 
 
 def test_postgrest_returns_the_row_wrapped_in_a_list():
-    """`serving_usage_backlog_snapshot` comes back as a single-element list, not a bare object."""
+    """`serving_promotion_accounting_snapshot` comes back as a single-element list, not a bare object."""
     assert verify_accounting(parse_accounting([_body()])).ok
 
 
 def test_a_healthy_body_passes():
     # quarantined rows are a pre-existing backlog condition, not something this release caused.
     assert verify_accounting(parse_accounting(_body(quarantined=4))).ok
+
+
+def test_fresh_or_absent_canary_usage_does_not_prove_delivery():
+    assert (
+        verify_accounting(parse_accounting(_body(canary_settled=False))).reason
+        == ACCOUNTING_UNSETTLED
+    )
+
+
+@pytest.mark.parametrize("value", [None, 0, 1, "true", {}, []])
+def test_canary_settlement_requires_a_boolean(value):
+    assert parse_accounting(_body(canary_settled=value)) is None
+
+
+def test_old_snapshot_without_canary_settlement_fails_closed():
+    body = _body()
+    del body["canary_settled"]
+    assert parse_accounting(body) is None

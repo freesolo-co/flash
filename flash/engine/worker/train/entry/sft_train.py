@@ -19,11 +19,11 @@ import flash.engine.worker.io.heartbeat as _worker_heartbeat
 import flash.engine.worker.io.hf as _worker_hf
 import flash.engine.worker.model.adapter as _worker_adapter
 import flash.engine.worker.perf as _worker_perf
-import flash.engine.worker.runtime.state as _worker_state
 import flash.engine.worker.train.core.lifecycle.finalize as _worker_finalize
 from flash._internal.diagnostics import SECRET_ENV_KEYS_ENV
 from flash.adapters.lora_rank import alpha_from_adapter_config, rank_from_adapter_config
 from flash.engine.worker.runtime.kernel_warmup import KERNEL_CACHE_ENV_SUBDIRS
+from flash.engine.worker.runtime.state import WorkerContext
 from flash.engine.worker.verl.checkpoints import restore_verl_resume
 from flash.engine.worker.verl.parallelism import ULYSSES_SEQUENCE_PARALLEL_SIZE
 
@@ -60,6 +60,8 @@ def _warmstart_adapter_path(
     expected_rank: int,
     expected_alpha: int,
     targeting=None,
+    *,
+    context: WorkerContext,
 ) -> str | None:
     """Stage and verify this run's warm-start source adapter; None when it is not a warm start.
 
@@ -67,11 +69,11 @@ def _warmstart_adapter_path(
     run of any algorithm, so nothing here may describe either end as SFT: warm start continues one
     LoRA in place across every algorithm pair.
     """
-    spec = _worker_state.JOB_SPEC
+    spec = context.config.spec
     source = spec.train.init_from_adapter if spec else ""
     if not source:
         return None
-    adapter_dir = _worker_adapter._download_adapter(source)
+    adapter_dir = _worker_adapter._download_adapter(source, context=context)
     if not adapter_dir:
         raise RuntimeError("the prepared warm-start adapter could not be downloaded")
     config_path = os.path.join(adapter_dir, "adapter_config.json")
@@ -109,18 +111,20 @@ def _warmstart_adapter_path(
 _restore_verl_resume = partial(restore_verl_resume, job_label="SFT")
 
 
-def _durable_required_save_steps(required_steps: tuple[int, ...], resume_step: int) -> set[int]:
+def _durable_required_save_steps(
+    required_steps: tuple[int, ...], resume_step: int, *, context: WorkerContext
+) -> set[int]:
     candidates = [step for step in required_steps if step <= resume_step]
     if not candidates:
         return set()
-    if not _worker_state.HF_REPO:
+    if not context.config.hf_repo:
         raise RuntimeError("required SFT saves have no artifact repository")
     durable: set[int] = set()
     for step in candidates:
-        marker = f"{_worker_hf.hf_prefix()}/checkpoints/step-{step}/adapter/adapter_config.json"
+        marker = f"{_worker_hf.hf_prefix(context=context)}/checkpoints/step-{step}/adapter/adapter_config.json"
         try:
             exists = _worker_hf.hf_api().file_exists(
-                repo_id=_worker_state.HF_REPO,
+                repo_id=context.config.hf_repo,
                 filename=marker,
                 repo_type="dataset",
             )
@@ -133,7 +137,9 @@ def _durable_required_save_steps(required_steps: tuple[int, ...], resume_step: i
     return durable
 
 
-def _seed_resume_lifecycle(watcher, required_steps: tuple[int, ...], resume_step: int) -> None:
+def _seed_resume_lifecycle(
+    watcher, required_steps: tuple[int, ...], resume_step: int, *, context: WorkerContext
+) -> None:
     """record what a previous attempt already made durable, before the watcher's first sweep.
 
     the resume-state half of this is the shared rule and lives on the ledger. what stays here is the
@@ -143,7 +149,7 @@ def _seed_resume_lifecycle(watcher, required_steps: tuple[int, ...], resume_step
     missing save cannot be recreated and must fail before launching the training child.
     """
     watcher.lifecycle.seed_resumed_step(resume_step, frozenset(required_steps))
-    durable = _durable_required_save_steps(required_steps, resume_step)
+    durable = _durable_required_save_steps(required_steps, resume_step, context=context)
     missing = sorted(step for step in required_steps if step < resume_step and step not in durable)
     if missing:
         raise RuntimeError(
@@ -212,7 +218,7 @@ _CHILD_ENV_PREFIXES = (
 )
 
 
-def _build_verl_child_env(*, wandb_enabled: bool) -> dict[str, str]:
+def _build_verl_child_env(*, wandb_enabled: bool, context: WorkerContext) -> dict[str, str]:
     applied_secret_names = frozenset(
         name.strip() for name in os.environ.get(SECRET_ENV_KEYS_ENV, "").split(",") if name.strip()
     )
@@ -234,9 +240,9 @@ def _build_verl_child_env(*, wandb_enabled: bool) -> dict[str, str]:
     package_root = str(Path(__file__).resolve().parents[5])
     child["PYTHONPATH"] = package_root
     child.pop("VERL_USE_EXTERNAL_MODULES", None)
-    if _worker_state.JOB_SPEC is not None:
-        child["FLASH_CHECKPOINT_MODEL_ID"] = _worker_state.JOB_SPEC.model
-        child["FLASH_CHECKPOINT_MODEL_REVISION"] = _worker_state.JOB_SPEC.model_revision
+    if context.config.spec is not None:
+        child["FLASH_CHECKPOINT_MODEL_ID"] = context.config.spec.model
+        child["FLASH_CHECKPOINT_MODEL_REVISION"] = context.config.spec.model_revision
     child["PYTHONUNBUFFERED"] = "1"
     child["HYDRA_FULL_ERROR"] = "1"
     child["HF_HUB_OFFLINE"] = "1"
@@ -360,11 +366,11 @@ def _sft_profile_max_length(profile) -> int:
 # remain attributes of `sft_train` rather than direct imports in the split module.
 from flash.engine.plan.recipe import RECIPE  # noqa: E402,F401
 from flash.engine.plan.steps import final_save_due, validate_save_steps  # noqa: E402,F401
+from flash.engine.profiling.sft_rows import _model_arch_dims, sft_under_ran  # noqa: E402,F401
 from flash.engine.profiling.sft_workload import (  # noqa: E402,F401
     prepare_sft_workload,
     sft_tokens_for_updates,
 )
-from flash.engine.worker.entry.sft import _model_arch_dims, sft_under_ran  # noqa: E402,F401
 from flash.engine.worker.io.heartbeat import liveness_heartbeat  # noqa: E402
 from flash.engine.worker.model.packing import model_is_gdn_hybrid  # noqa: E402
 from flash.engine.worker.runtime.rng import seed_training_rngs  # noqa: E402,F401
@@ -416,7 +422,9 @@ from flash.engine.worker.train.entry.sft_train_runner import (  # noqa: E402
 )
 
 
-def _write_sft_result(options, data, model, child, progress, verified, outputs) -> None:
+def _write_sft_result(
+    options, data, model, child, progress, verified, outputs, *, context: WorkerContext
+) -> None:
     adapter_dir = outputs.adapter_dir
     train_wall = outputs.train_wall
     device_peak_gpu_gb = outputs.device_peak_gpu_gb
@@ -425,6 +433,7 @@ def _write_sft_result(options, data, model, child, progress, verified, outputs) 
         train_wall=train_wall,
         step=verified.final_step,
         gpu=_worker_perf.gpu_diagnostics(),
+        context=context,
     )
     _worker_finalize.write_train_meta(
         phase="sft",
@@ -440,7 +449,7 @@ def _write_sft_result(options, data, model, child, progress, verified, outputs) 
             "resumed": bool(child.resume_step),
             "warm_started": bool(model.warmstart_adapter),
             "download_seconds": model.download_seconds,
-            "thinking": _worker_state.THINKING,
+            "thinking": context.config.thinking,
             "multimodal": data.multimodal,
             "gradient_checkpointing": model.gradient_checkpointing,
             "gradient_checkpointing_reentrant": model.reentrant_gradient_checkpointing,
@@ -489,21 +498,69 @@ def _write_sft_result(options, data, model, child, progress, verified, outputs) 
             "wandb_url": progress.wandb_link.get("wandb_url"),
             "wandb_id": progress.wandb_link.get("wandb_id"),
         },
+        context=context,
     )
 
 
-def run_sft_train(spec=None) -> None:
+def _publish_sft_result(
+    options,
+    data,
+    model,
+    child,
+    child_progress,
+    verified,
+    train_wall,
+    device_peak_gpu_gb,
+    *,
+    context: WorkerContext,
+) -> None:
+    actor_dir = verified.actor_dir
+    final_step = verified.final_step
+    with liveness_heartbeat(
+        "sft_finalizing",
+        progress=lambda: final_step,
+        progress_step=True,
+        keepalive=True,
+        context=context,
+    ):
+        adapter_dir = os.path.join(options.paths.workdir, "adapter")
+        _export_checkpoint_adapter(
+            actor_dir,
+            adapter_dir,
+            model_id=options.model_id,
+            model_revision=options.model_revision,
+            exclude_modules=model.exclude_modules,
+            python_bin=child.python_bin,
+            preprocessor=data.processor,
+        )
+        _worker_hf.hf_upload_folder(adapter_dir, "adapter", required=True, context=context)
+        # only a durably published adapter may suppress the final publish. the seeded resume step no
+        # longer needs excluding by hand: it is credited as deployable_published only when its
+        # adapter was actually found on hf, so a resume that carried resumable state without a
+        # servable adapter falls through to this publish instead of being skipped.
+        if (
+            final_save_due(final_step, options.save_at_steps)
+            and final_step not in child.watcher.lifecycle.deployable_published_steps
+        ):
+            _worker_hf.publish_deployable_checkpoint(adapter_dir, final_step, context=context)
+        outputs = _SftOutputs(adapter_dir, train_wall, device_peak_gpu_gb)
+    _write_sft_result(
+        options, data, model, child, child_progress, verified, outputs, context=context
+    )
+
+
+def run_sft_train(spec=None, *, context: WorkerContext) -> None:
     """run flash sft through verl's out-of-process fsdp trainer."""
-    options = _resolve_sft_options(spec)
-    with liveness_heartbeat("sft_data_loading"):
-        data = _prepare_sft_data(options)
-    model = _prepare_sft_model(options, data)
+    options = _resolve_sft_options(spec, context=context)
+    with liveness_heartbeat("sft_data_loading", context=context):
+        data = _prepare_sft_data(options, context=context)
+    model = _prepare_sft_model(options, data, context=context)
 
     # provisioning the verl interpreter builds a venv and installs the whole training stack when the
     # run has no prebuilt worker image, which is minutes of silence with no training step to report
     # and no liveness thread otherwise running here -- long enough for the stall watchdog to fail a
     # healthy run. no progress= : there is no monotonic counter to read, only the keepalive.
-    with liveness_heartbeat("sft_configuring"):
+    with liveness_heartbeat("sft_configuring", context=context):
         python_bin = resolve_verl_python(
             options.paths.workdir, install_wandb=bool(os.environ.get("WANDB_API_KEY"))
         )
@@ -571,7 +628,7 @@ def run_sft_train(spec=None) -> None:
     # boundary. batch size 1 is the isolation lever, not the tensor-layout flag.
     use_remove_padding = True
     child = _prepare_sft_child(
-        options, data, model, capabilities, use_remove_padding, gdn_reset_arch
+        options, data, model, capabilities, use_remove_padding, gdn_reset_arch, context=context
     )
     child_progress = _prepare_sft_progress(data, model, child)
     progress = child_progress.values
@@ -587,7 +644,7 @@ def run_sft_train(spec=None) -> None:
         learning_rate_value = parse_verl_metric(line, "train/lr")
         _record_sft_step_metrics(child_progress, loss, grad_norm, learning_rate_value)
 
-    callbacks = _SftProgressCallbacks(child_progress)
+    callbacks = _SftProgressCallbacks(child_progress, context=context)
     gpu_sampler = _NvidiaSmiPeakSampler().start()
     train_started_at = time.time()
     return_code = 0
@@ -602,8 +659,9 @@ def run_sft_train(spec=None) -> None:
                 "sft_step",
                 progress=lambda: int(progress["step"] or 0),
                 progress_step=True,
+                context=context,
             ):
-                return_code = _invoke_sft_child(child, callbacks, on_line)
+                return_code = _invoke_sft_child(child, callbacks, on_line, context=context)
                 training_completed = return_code == 0
         finally:
             child.watcher.stop(require_complete=training_completed)
@@ -611,33 +669,14 @@ def run_sft_train(spec=None) -> None:
         gpu_sampler, train_started_at, return_code, child_progress
     )
     verified = _verify_sft_run(options, data, model, child_progress, child.resume_step)
-    actor_dir = verified.actor_dir
-    final_step = verified.final_step
-    with liveness_heartbeat(
-        "sft_finalizing",
-        progress=lambda: final_step,
-        progress_step=True,
-        keepalive=True,
-    ):
-        adapter_dir = os.path.join(options.paths.workdir, "adapter")
-        _export_checkpoint_adapter(
-            actor_dir,
-            adapter_dir,
-            model_id=options.model_id,
-            model_revision=options.model_revision,
-            exclude_modules=model.exclude_modules,
-            python_bin=child.python_bin,
-            preprocessor=data.processor,
-        )
-        _worker_hf.hf_upload_folder(adapter_dir, "adapter", required=True)
-        # only a durably published adapter may suppress the final publish. the seeded resume step no
-        # longer needs excluding by hand: it is credited as deployable_published only when its
-        # adapter was actually found on hf, so a resume that carried resumable state without a
-        # servable adapter falls through to this publish instead of being skipped.
-        if (
-            final_save_due(final_step, options.save_at_steps)
-            and final_step not in child.watcher.lifecycle.deployable_published_steps
-        ):
-            _worker_hf.publish_deployable_checkpoint(adapter_dir, final_step)
-        outputs = _SftOutputs(adapter_dir, train_wall, device_peak_gpu_gb)
-    _write_sft_result(options, data, model, child, child_progress, verified, outputs)
+    _publish_sft_result(
+        options,
+        data,
+        model,
+        child,
+        child_progress,
+        verified,
+        train_wall,
+        device_peak_gpu_gb,
+        context=context,
+    )

@@ -18,7 +18,6 @@ from dataclasses import dataclass, field
 import flash.engine.worker.io.heartbeat as _worker_heartbeat
 import flash.engine.worker.io.hf as _worker_hf
 import flash.engine.worker.io.wandb_log as _worker_wandb_log
-import flash.engine.worker.runtime.state as _worker_state
 import flash.engine.worker.train.rl.launch.checkpoints as rl_checkpoints
 import flash.engine.worker.train.rl.launch.config as _worker_config
 import flash.engine.worker.train.rl.launch.inputs as rl_inputs
@@ -30,10 +29,10 @@ from flash.engine.profiling.sft_workload import _materialize_verl_images
 from flash.engine.result.rollout_samples import sample_completion_text, sanitize_rollout_text
 from flash.engine.worker.io.heartbeat import (
     GRPO_METRIC_HISTORY_LIMIT,
-    LATEST_GRPO_METRICS_LAST,
     RewardObservabilityBuffer,
 )
 from flash.engine.worker.perf import gpu_diagnostics, wait_for_gpu
+from flash.engine.worker.runtime.state import WorkerContext
 from flash.engine.worker.train.core.lifecycle.step_timing import StepTiming
 from flash.engine.worker.train.entry.backend_common import (
     _ORPHANED_PIPE_GRACE_S,
@@ -244,18 +243,18 @@ class _RewardRuntime:
     reward_url: str
 
 
-def _prepare_rl_inputs():
+def _prepare_rl_inputs(*, context: WorkerContext):
     t_start = time.time()
-    _worker_heartbeat.heartbeat("rl_start", gpu=gpu_diagnostics())
+    _worker_heartbeat.heartbeat("rl_start", gpu=gpu_diagnostics(), context=context)
     wait_for_gpu(
-        _worker_state.JOB_SPEC.gpu.type if _worker_state.JOB_SPEC else None,
-        gpu_type=_worker_state.JOB_SPEC.gpu.type if _worker_state.JOB_SPEC else "",
+        context.config.spec.gpu.type if context.config.spec else None,
+        gpu_type=context.config.spec.gpu.type if context.config.spec else "",
     )
     # no setup_perf_backends() here: torch's tf32 flags are per-process state that a subprocess does
     # not inherit, and this process trains nothing -- verl does, out of process. the child opts in
     # through its explicit process initializer.
 
-    inp = rl_inputs._resolve_grpo_inputs()
+    inp = rl_inputs._resolve_grpo_inputs(context=context)
     env, tok = inp["env"], inp["tok"]
     # what gets saved next to a published adapter. a multimodal adapter is unservable without its
     # image preprocessor, so save the whole processor there; a text run saves the tokenizer alone.
@@ -267,14 +266,14 @@ def _prepare_rl_inputs():
     # subprocess simply reuses that cache.
     if inp["model_revision"]:
         download_seconds = _worker_hf.prefetch_model(
-            inp["model_id"], revision=inp["model_revision"]
+            inp["model_id"], revision=inp["model_revision"], context=context
         )
     else:
-        download_seconds = _worker_hf.prefetch_model(inp["model_id"])
+        download_seconds = _worker_hf.prefetch_model(inp["model_id"], context=context)
     return t_start, inp, env, tok, preprocessor, prompts, download_seconds
 
 
-def _prepare_rl_files(inp, prompts):
+def _prepare_rl_files(inp, prompts, *, context: WorkerContext):
     # stable int index -> rollout example, exactly as the retired trl path (reward maps back via this).
     ds_rows, rollout_examples = _worker_config.build_grpo_prompt_dataset(prompts)
     message_prompts = [p["prompt"] for p in prompts]
@@ -285,7 +284,7 @@ def _prepare_rl_files(inp, prompts):
         str(ex.get("answer", "") or "") if isinstance(ex, dict) else "" for ex in rollout_examples
     ]
 
-    workdir = f"/tmp/rl_train_seed{_worker_state.SEED}"
+    workdir = f"/tmp/rl_train_seed{context.config.seed}"
     os.makedirs(workdir, exist_ok=True)
     local_dir = os.path.join(workdir, "ckpt")
     # a retry reuses the pod workdir; stale global_step_N dirs from a prior attempt would satisfy
@@ -302,6 +301,7 @@ def _prepare_rl_files(inp, prompts):
         local_dir,
         world_size=int(inp["dp_cards"]),
         required_steps=tuple(inp["save_at_steps"]),
+        context=context,
     )
     train_pq = os.path.join(workdir, "train.parquet")
     val_pq = os.path.join(workdir, "val.parquet")
@@ -388,12 +388,14 @@ def _write_rl_launch_config(inp, files, *, gdn_reset_arch: str | None, loggers) 
     files["expected_components"] = expected
 
 
-def _prepare_rl_runtime(inp, env, tok, prompts):
-    files = _prepare_rl_files(inp, prompts)
-    return files, _start_reward_runtime(inp, env, tok, prompts, files)
+def _prepare_rl_runtime(inp, env, tok, prompts, *, context: WorkerContext):
+    files = _prepare_rl_files(inp, prompts, context=context)
+    return files, _start_reward_runtime(inp, env, tok, prompts, files, context=context)
 
 
-def _start_reward_runtime(inp, env, tok, prompts, files) -> _RewardRuntime:
+def _start_reward_runtime(
+    inp, env, tok, prompts, files, *, context: WorkerContext
+) -> _RewardRuntime:
     rollout_examples = files["rollout_examples"]
     message_prompts = files["message_prompts"]
     # the localhost bridge carries rollouts and #607 reward components. generation_size closes each
@@ -416,9 +418,10 @@ def _start_reward_runtime(inp, env, tok, prompts, files) -> _RewardRuntime:
                 env,
                 [(solution_str, rollout_examples[int(index)]) for index, solution_str in requests],
                 tok=tok,
-                thinking=bool(_worker_state.THINKING),
+                thinking=bool(context.config.thinking),
                 prompt_opened_thinking=inp["prompt_opened_thinking"],
                 think_penalty=inp["think_penalty"],
+                context=context,
             )
         results = []
         for (index, solution_str), (score, breakdowns) in zip(requests, scored, strict=True):
@@ -434,10 +437,11 @@ def _start_reward_runtime(inp, env, tok, prompts, files) -> _RewardRuntime:
                 solution_str,
                 rollout_examples[int(index)],
                 tok=tok,
-                thinking=bool(_worker_state.THINKING),
+                thinking=bool(context.config.thinking),
                 prompt_opened_thinking=inp["prompt_opened_thinking"],
                 think_penalty=inp["think_penalty"],
                 raise_on_error=True,
+                context=context,
             )
 
     multi_turn_bridge = (
@@ -452,7 +456,7 @@ def _start_reward_runtime(inp, env, tok, prompts, files) -> _RewardRuntime:
             package_root=inp["package_root"],
             processor=inp["processor"],
             tokenizer=tok,
-            thinking=bool(_worker_state.THINKING),
+            thinking=bool(context.config.thinking),
             per_turn_credit=bool(inp["per_turn_credit"]),
             on_episode_scored=observability.record,
             parent_work=observability.parent_work,
@@ -480,15 +484,15 @@ def _start_reward_runtime(inp, env, tok, prompts, files) -> _RewardRuntime:
     )
 
 
-def _resolve_training_settings(inp, caps):
+def _resolve_training_settings(inp, caps, *, context: WorkerContext):
     expected_steps = int(inp["steps"])
     # verl logs from its own interpreter; gate wandb on that env (see resolve_verl_loggers).
     # Actor stdout is asynchronous in Ray and can lose the last optimizer-step records at
     # shutdown. The child entry streams Verl's unbuffered file logger through its own stdout.
     loggers = ["file" if logger == "console" else logger for logger in resolve_verl_loggers(caps)]
-    spec = _worker_state.JOB_SPEC
+    spec = context.config.spec
     project_name = (spec.wandb.project if spec and spec.wandb else None) or "flash"
-    experiment_name = _worker_wandb_log.wandb_run_name()
+    experiment_name = _worker_wandb_log.wandb_run_name(context=context)
     # fp8 kv cache on ada/hopper+ (cc>=8.9), matching the sizing math in engine/vram.py. NOT for
     # hybrid linear-attention (GDN) models: vllm's fp8-kv wake path (init_fp8_kv_scales) assumes a
     # plain kv tensor and crashes on the hybrid cache ('list' has no zero_) under verl sleep/wake.
@@ -508,14 +512,14 @@ def _initialize_teardown_state():
     return None, _NvidiaSmiPeakSampler().start(), None
 
 
-def _announce_training(t_start: float, cfg) -> tuple[float, float]:
+def _announce_training(t_start: float, cfg, *, context: WorkerContext) -> tuple[float, float]:
     # the executor budget is sized per run now, so print what this one actually asked for --
     # a vllm init failure reports the demand against the free memory, and the demand is
     # otherwise invisible in the log.
     print(f"[rl-verl] rollout gpu_memory_utilization={cfg['gpu_mem_util']:.4f}", flush=True)
     setup_seconds = time.time() - t_start
     _worker_heartbeat.heartbeat(
-        "rl_train_start", setup_seconds=setup_seconds, gpu=gpu_diagnostics()
+        "rl_train_start", setup_seconds=setup_seconds, gpu=gpu_diagnostics(), context=context
     )
     return setup_seconds, time.time()
 
@@ -530,6 +534,7 @@ def _start_resume_uploader(
     preprocessor,
     metric_evidence,
     final_step=None,
+    context: WorkerContext,
 ):
     targeting = resolve_lora_targeting(
         inp["model_id"], algorithm="grpo", multimodal=bool(inp.get("multimodal"))
@@ -546,6 +551,7 @@ def _start_resume_uploader(
         model_revision=inp["model_revision"],
         exclude_modules=targeting.exclude_modules,
         preprocessor=preprocessor,
+        context=context,
     )
     resume_uploader.credit_durable_required_steps(resume_step)
     resume_uploader.restore_staged_adapters(resume_step)
@@ -553,11 +559,11 @@ def _start_resume_uploader(
     return resume_uploader
 
 
-def _build_rl_child_env(inp, files, loggers, reward_url):
+def _build_rl_child_env(inp, files, loggers, reward_url, *, context: WorkerContext):
     # allowlist the child env because ray fans it to every actor; scoring stays in the parent, so
     # the child needs no platform hf token, github token, or user secrets. FLA_ kernel settings
     # still cross through _CHILD_ENV_PREFIXES.
-    env_for_verl = _build_verl_child_env(wandb_enabled="wandb" in loggers)
+    env_for_verl = _build_verl_child_env(wandb_enabled="wandb" in loggers, context=context)
     env_for_verl["FLASH_VERL_REWARD_URL"] = reward_url
     env_for_verl["VERL_FILE_LOGGER_PATH"] = os.path.join(files["runtime_dir"], "step_metrics.jsonl")
     # where each rank records the gpu it opened. ray fans this env to every actor, which is what
@@ -570,17 +576,17 @@ def _build_rl_child_env(inp, files, loggers, reward_url):
     env_for_verl["HF_HUB_DISABLE_XET"] = "1"
     if inp["multi_turn"]:
         env_for_verl.update(
-            multi_turn_child_env(inp, reward_url=reward_url, thinking=bool(_worker_state.THINKING))
+            multi_turn_child_env(inp, reward_url=reward_url, thinking=bool(context.config.thinking))
         )
     env_for_verl.update(GRPO_NATIVE_THREAD_ENV)
     return env_for_verl
 
 
-def _step_timing_fields(inp, state: _StepMetricState) -> dict:
+def _step_timing_fields(inp, state: _StepMetricState, *, context: WorkerContext) -> dict:
     return state.step_timing.heartbeat_fields(
         current_step=state.progress["step"],
         total_steps=int(inp["steps"]),
-        remaining_wall_s=_worker_state._remaining_worker_wall_seconds(),
+        remaining_wall_s=context.remaining_wall_seconds(),
     )
 
 
@@ -589,6 +595,8 @@ def _ingest_step_metrics(
     inp,
     state: _StepMetricState,
     _reward_observability: Callable[[], dict],
+    *,
+    context: WorkerContext,
 ) -> None:
     step_metrics = parse_verl_step_metrics(line)
     step_number = verl_step_number(line)
@@ -601,7 +609,7 @@ def _ingest_step_metrics(
         append_step_metrics(state.metrics_last, step_metrics, limit=GRPO_METRIC_HISTORY_LIMIT)
         # the worker's error path reads this global, so a run that dies mid-training
         # still reports the steps it did complete (worker/__init__.py:_err_metrics).
-        LATEST_GRPO_METRICS_LAST[:] = state.metrics_last
+        context.heartbeat_state.metrics_last[:] = state.metrics_last
         heartbeat_fields = _reward_observability()
         has_step_timing = "step_duration_s" in heartbeat_fields
         # rl_train_start arms a 900s throttle, so force until both the first backlog and the first
@@ -616,6 +624,7 @@ def _ingest_step_metrics(
                 metrics_last=list(state.metrics_last),
                 **heartbeat_fields,
                 gpu=gpu_diagnostics(),
+                context=context,
             )
             if heartbeat_committed:
                 state.sent_first_metrics = True
@@ -665,6 +674,7 @@ def _execute_rl_child(
     reward_runtime,
     _reward_observability,
     files=None,
+    context: WorkerContext,
 ) -> int:
     adopt_orphaned_descendants()
     resume_step = int((files or {}).get("resume_step", 0))
@@ -742,7 +752,7 @@ def _execute_rl_child(
                             f"(reward={reward:.3f}): {preview}",
                             flush=True,
                         )
-            _ingest_step_metrics(line, inp, state, _reward_observability)
+            _ingest_step_metrics(line, inp, state, _reward_observability, context=context)
         return child_stream.wait_and_classify()
     except BaseException:
         # the stream loop died (upload error, cancel, oom in the parent): a still-running
@@ -765,7 +775,7 @@ def _execute_rl_child(
                     if value is not None
                 }
             )
-            LATEST_GRPO_METRICS_LAST[:] = state.metrics_last
+            context.heartbeat_state.metrics_last[:] = state.metrics_last
 
 
 def _finalize_advantage_evidence(state, resume_step: int, expected_steps: int) -> None:
@@ -857,9 +867,9 @@ def _validate_rl_child(
         state.rollout_identity_evidence = rollout_identity_evidence
 
 
-def _prepare_final_adapter(local_dir: str, t_train: float):
+def _prepare_final_adapter(local_dir: str, t_train: float, *, context: WorkerContext):
     # collect verl's lora checkpoint -> flash-servable peft adapter, then reuse flash finalize.
-    out_dir = f"/tmp/rl_seed{_worker_state.SEED}"
+    out_dir = f"/tmp/rl_seed{context.config.seed}"
     adapter_dir = f"{out_dir}/adapter"
     shutil.rmtree(adapter_dir, ignore_errors=True)
     os.makedirs(adapter_dir, exist_ok=True)

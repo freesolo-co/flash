@@ -113,7 +113,7 @@ def _matching_persisted_status(status: Any) -> dict[str, Any] | None:
 
 def _canonical_remote_attempt(remote: object) -> int | None:
     try:
-        from flash.runner.accounting.reconciliation import _canonical_cleanup_remote
+        from flash.runner.lifecycle.cleanup import _canonical_cleanup_remote
 
         canonical = _canonical_cleanup_remote(remote)
     except Exception:
@@ -160,7 +160,9 @@ def _lifecycle_projection(status: Any, public_status: dict[str, Any]) -> dict[st
     if raw is None:
         return lifecycle
 
-    remote_attempt = _canonical_remote_attempt(raw.get("remote") or raw.get("realized_cost_remote"))
+    remote_attempt = _canonical_remote_attempt(
+        raw.get("remote") or getattr(status, "billing_remote", None)
+    )
     started_attempt = _valid_attempt(raw.get("lifecycle_started_attempt"))
     if started_attempt is None:
         started_attempt = remote_attempt
@@ -218,7 +220,6 @@ def record_training_run(*, status: Any, key: dict[str, Any] | None = None) -> bo
         "phase": spec.get("phase") if isinstance(spec.get("phase"), str) else None,
         "gpuType": attributed_gpu_type(status) or None,
         "costUsd": status.cost_usd,
-        "realizedCostUsd": status.realized_cost_usd,
         "artifactsDir": status.artifacts_dir,
         "error": status.error,
         "spec": spec,

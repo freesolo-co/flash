@@ -1,6 +1,7 @@
 """Compact recovery omits only frozen base tensors and reconstructs them strictly."""
 
 import sys
+from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
@@ -65,15 +66,17 @@ def test_corrupt_compact_state_is_rejected(mutation):
         restore_state(Model(), state, manifest, model_id="test/model", revision=REVISION)
 
 
-def test_training_child_inherits_pinned_base(monkeypatch):
+def test_training_child_inherits_pinned_base(worker_context, monkeypatch):
     from flash.engine.worker.train.entry import sft_train
 
     monkeypatch.setattr(
-        sft_train._worker_state,
-        "JOB_SPEC",
-        SimpleNamespace(model="test/model", model_revision=REVISION),
+        worker_context,
+        "config",
+        replace(
+            worker_context.config, spec=SimpleNamespace(model="test/model", model_revision=REVISION)
+        ),
     )
-    child = sft_train._build_verl_child_env(wandb_enabled=False)
+    child = sft_train._build_verl_child_env(wandb_enabled=False, context=worker_context)
     assert child["FLASH_CHECKPOINT_MODEL_ID"] == "test/model"
     assert child["FLASH_CHECKPOINT_MODEL_REVISION"] == REVISION
 

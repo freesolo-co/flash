@@ -213,7 +213,9 @@ def test_tracking_link_lookup_is_optional(monkeypatch, capsys, failed_property, 
 
 
 @pytest.mark.parametrize("multimodal", [False, True])
-def test_opd_parent_passes_model_checkpointing_and_vision_policy(monkeypatch, multimodal):
+def test_opd_parent_passes_model_checkpointing_and_vision_policy(
+    worker_context, monkeypatch, multimodal
+):
     from flash.engine.worker.train.entry import opd_train_runner as runner
 
     request = SimpleNamespace(
@@ -248,7 +250,7 @@ def test_opd_parent_passes_model_checkpointing_and_vision_policy(monkeypatch, mu
     )
     monkeypatch.setattr(runner._opd_overrides, "_build_opd_child_env", lambda **kwargs: kwargs)
     child = runner._build_child_env(
-        request, SimpleNamespace(max_model_len=256), workload, runtime, ()
+        request, SimpleNamespace(max_model_len=256), workload, runtime, (), context=worker_context
     )
     options = json.loads(child["launch_config"])
     assert options["reentrant_checkpointing"] is True

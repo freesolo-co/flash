@@ -14,6 +14,7 @@ import json
 import os
 
 from flash.content.structured_outputs import reasoning_parser_for
+from flash.engine.worker.runtime.state import WorkerContext
 from flash.engine.worker.train.entry.backend_common import (
     actor_fsdp_strategy_overrides,
     agent_loop_workers,
@@ -411,8 +412,9 @@ def _build_opd_child_env(
     resample_failure_path: str = "",
     cycle_commit_failure_path: str = "",
     launch_config: str = "",
+    context: WorkerContext,
 ) -> dict[str, str]:
-    child = _build_verl_child_env(wandb_enabled=wandb_enabled)
+    child = _build_verl_child_env(wandb_enabled=wandb_enabled, context=context)
     child.update(
         {
             "FLASH_OPD_BRIDGE_URL": bridge_url,

@@ -92,6 +92,26 @@ def test_failure_after_launch_always_stops_exact_sandbox(monkeypatch, launch_sta
     assert launch_state[-2:] == [("terminate", "sb-job"), ("cleanup", "sb-job")]
 
 
+@pytest.mark.parametrize("persistence", ["recorded", "missing", "interrupted"])
+def test_shutdown_preserves_only_durably_recorded_sandbox(monkeypatch, launch_state, persistence):
+    from flash._internal.background import TaskStopped
+
+    def stop(*args, **kwargs):
+        raise TaskStopped
+
+    monkeypatch.setattr(jobs, "poll", stop)
+    persisted = []
+    callback = {"recorded": persisted.append, "missing": None, "interrupted": stop}[persistence]
+    with pytest.raises(TaskStopped):
+        submit(spec(), on_handle=callback)
+    cleanup = [event for event in launch_state if event[0] in {"terminate", "cleanup"}]
+    if persistence == "recorded":
+        assert len(persisted) == 1
+        assert cleanup == []
+    else:
+        assert cleanup == [("terminate", "sb-job"), ("cleanup", "sb-job")]
+
+
 def test_operator_cache_bypass_survives_assigned_volume(monkeypatch, launch_state):
     monkeypatch.setenv("FLASH_WEIGHT_CACHE_DISABLED", "1")
     monkeypatch.setattr(jobs, "poll", lambda *a, **k: PollResult(True, metrics={}))

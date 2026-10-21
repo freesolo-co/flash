@@ -121,13 +121,13 @@ def test_training_report_projects_only_conservative_lifecycle_booleans(monkeypat
     status.lifecycle_progressed_attempt = 0
     status.remote["allocated_gpu"] = "A100 SXM"
     status.cleanup_confirmed_remote = status.remote
-    status.realized_cost_remote = status.remote
+    status.billing_remote = status.remote
     status.remote = None
     runner_state._save_status(status, _cleanup_remotes=None)
     assert "lifecycle_started_attempt" not in status.to_dict()
     assert "lifecycle_progressed_attempt" not in status.to_dict()
     assert "cleanup_confirmed_remote" not in status.to_dict()
-    assert "realized_cost_remote" not in status.to_dict()
+    assert "billing_remote" not in status.to_dict()
     report = _report(monkeypatch, status)
     assert report["gpuType"] == "A100 SXM"
     assert report["lifecycle"] == {
@@ -141,14 +141,10 @@ def test_training_report_projects_only_conservative_lifecycle_booleans(monkeypat
     runner_state._save_status(status)
     assert _report(monkeypatch, status)["lifecycle"]["cleanupComplete"] is True
 
-    runner_costs.record_realized_cost(
-        status.run_id,
-        realized_cost_usd=1.0,
-        reconciled_at=10.0,
-    )
-    reconciled = runner_status.get_status(status.run_id)
-    assert reconciled.realized_cost_remote is None
-    assert _report(monkeypatch, reconciled)["lifecycle"] == {
+    runner_costs.record_billing_state(status.run_id, billing_state="charged")
+    charged = runner_status.get_status(status.run_id)
+    assert charged.billing_remote is None
+    assert _report(monkeypatch, charged)["lifecycle"] == {
         "started": True,
         "progressed": True,
         "artifactsComplete": True,
@@ -394,3 +390,51 @@ def test_status_report_rejects_invalid_sequence_before_http_post(monkeypatch, se
         runs, "_post", lambda *_args: pytest.fail("invalid sequence must not reach the backend")
     )
     assert runs.record_training_run(status=status) is False
+
+
+def test_legacy_reconciliation_record_preserves_pending_customer_charge(monkeypatch, tmp_path):
+    from flash.server.billing import charges
+
+    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
+    monkeypatch.setattr(runner_reporting, "_report_status", lambda _status: None)
+    status = _status(_spec())
+    status.state = "done"
+    status.cost_usd = 2.5
+    status.billing_context = {"org_id": "org-1"}
+    status.billing_state = "pending"
+    runner_state._save_status(status)
+    path = runner_state.runs_file_path(status.run_id, ".json")
+    with open(path) as file:
+        raw = json.load(file)
+    remote = {**_remote(), "allocated_gpu": "A100 SXM"}
+    raw.pop("billing_remote")
+    raw.update(realized_cost_remote=remote, realized_cost_usd=1.0, reconciled_at=10.0)
+    with open(path, "w") as file:
+        json.dump(raw, file)
+
+    loaded = runner_status.get_status(status.run_id)
+    assert loaded.billing_remote == remote
+    assert not {"realized_cost_usd", "reconciled_at", "billing_remote"} & loaded.to_dict().keys()
+    report = _report(monkeypatch, loaded)
+    assert "realizedCostUsd" not in report
+    assert report["gpuType"] == "A100 SXM"
+    assert report["lifecycle"]["started"] is True
+
+    requests = []
+    monkeypatch.setattr(charges, "_post_billing", lambda **kwargs: requests.append(kwargs) or {})
+    charges.charge_completed_run(internal_key="internal-test", status=loaded)
+    assert requests[0]["body"]["costCents"] == 250
+    assert requests[0]["body"]["gpu"] == "A100 SXM"
+    assert requests[0]["body"]["provider"] == "modal"
+
+    runner_costs.record_billing_state(status.run_id, billing_state="charged")
+    saved = runner_status._load_status_json(status.run_id)
+    assert saved["billing_remote"] is None
+    assert not {"realized_cost_usd", "reconciled_at", "realized_cost_remote"} & saved.keys()
+    assert runner_status.get_status(status.run_id).billing_state == "charged"
+
+
+def test_cleared_billing_handle_is_not_restored_from_legacy_field():
+    raw = runner_state._status_storage_dict(_status(_spec()))
+    raw["realized_cost_remote"] = _remote()
+    assert runner_status._runstatus_from_json(raw).billing_remote is None

@@ -496,7 +496,7 @@ def test_record_billing_state_never_downgrades_charged(monkeypatch, tmp_path):
 
 
 # --------------------------------------------------------------------------- background loop
-# Same contract as the sibling reconcile loop: re-raise CancelledError (so shutdown's task.cancel()
+# Same contract as the sibling reaper loops: re-raise CancelledError (so shutdown's task.cancel()
 # stops it), swallow a real Exception and continue to the next cycle.
 
 

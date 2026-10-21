@@ -1,37 +1,29 @@
-"""Reattaching to a run the control plane restarted away from, and reconciling what it finds.
+"""Reattach to persisted attempts and schedule recovery observations.
 
-`attach_run` is called for every non-terminal run at startup: the supervisor thread that owned the
-run is gone, but the remote worker may still be alive, already finished, or already torn down.
-Deciding which -- without double-billing, double-tearing-down, or resuming a run whose teardown was
-never confirmed -- is what the reconciliation loop here does, on its own background thread.
-
-Split out of `flash.runner.supervise.deploy` to keep that module under the file-size limit.
+Durable identity and launch claims govern replacement; the application supervisor owns execution.
 """
 
 from __future__ import annotations
 
 import contextlib
-import threading
 import time
 from dataclasses import dataclass, replace
+from functools import partial
 from typing import TYPE_CHECKING
 
+from flash._internal.background import Retry, TaskAdmissionError, checkpoint, current_supervisor
 from flash.core.spec import JobSpec
 from flash.envs.loading.staged import StagedEnvironmentTransientError
 from flash.providers._lifecycle.instances.poll import _attempt_int
-from flash.runner.supervise.attach_reconcile import (
+from flash.runner.lifecycle.cleanup import reconcile_cleanup
+from flash.runner.supervise.recovery import (
     carry_allocation_stamp as _carry_allocation_stamp,
 )
-from flash.runner.supervise.attach_reconcile import (
+from flash.runner.supervise.recovery import (
     completed_metrics_for_remote as _completed_metrics_for_remote,
-)
-from flash.runner.supervise.attach_reconcile import (
-    teardown_reconciled_remote as _teardown_reconciled_remote,
 )
 
 _ATTACH_RECONCILE_INTERVAL_S = 120.0
-_ATTACH_RECONCILING: set[str] = set()
-_ATTACH_RECONCILING_LOCK = threading.Lock()
 
 
 if TYPE_CHECKING:
@@ -51,12 +43,12 @@ def _resume_after_confirmed_teardown(
 ) -> RunStatus:
     """CAS-clear one captured remote, then resume its next attempt exactly once."""
     from flash.runner.accounting.artifacts import stage_environment_package
-    from flash.runner.accounting.reconciliation import (
+    from flash.runner.lifecycle import state as lifecycle_state
+    from flash.runner.lifecycle.attempts import reserve_verified_attempt_launch
+    from flash.runner.lifecycle.cleanup import (
         _compare_and_fail_remote,
         _record_cleanup_remote,
     )
-    from flash.runner.lifecycle import state as lifecycle_state
-    from flash.runner.lifecycle.attempts import reserve_verified_attempt_launch
     from flash.runner.lifecycle.deadlines import _load_run_deadline_at, _spec_with_remaining_wall
     from flash.runner.lifecycle.status import (
         _load_status_json,
@@ -143,9 +135,9 @@ def _reconcile_completed_remote(
     completed_metrics: dict,
     deadline_at: float,
     log,
-) -> bool:
+) -> bool | Retry:
     """Retry completed-attempt adoption and decide whether reconciliation is finished."""
-    from flash.runner.accounting.reconciliation import (
+    from flash.runner.lifecycle.cleanup import (
         _compare_and_fail_remote,
         _record_cleanup_remote,
     )
@@ -162,16 +154,9 @@ def _reconcile_completed_remote(
             return True
     except Exception:
         pass
-    # the job completed with metrics; keep retrying adoption (e.g. across a
-    # transient cleanup failure) until it sticks -- but never past the wall
-    # deadline plus the recovery grace, or a persistently failing adoption
-    # would leave the run non-terminal forever. past the grace, preserve the
-    # remote for cost reconciliation and fail the run.
+    # Retry adoption through the recovery grace. Afterward, preserve cleanup evidence and
+    # fail the captured attempt even if preserving the cleanup record itself fails.
     if time.time() >= deadline_at + _RECOVERY_MARKER_GRACE_S:
-        # best-effort: preserve the remote for cost reconciliation, but do NOT
-        # gate termination on it -- a persistently failing cleanup-persist must
-        # not leave the run non-terminal forever (the whole point of the grace
-        # cutoff). attempt the cleanup record, then fail the run regardless.
         with contextlib.suppress(Exception):
             _record_cleanup_remote(run_id, expected_remote)
         try:
@@ -183,11 +168,9 @@ def _reconcile_completed_remote(
                 return True
         except Exception:
             pass
-        time.sleep(_ATTACH_RECONCILE_INTERVAL_S)
-        return False
+        return Retry(_ATTACH_RECONCILE_INTERVAL_S)
     remaining_grace = deadline_at + _RECOVERY_MARKER_GRACE_S - time.time()
-    time.sleep(min(_ATTACH_RECONCILE_INTERVAL_S, max(0.0, remaining_grace)))
-    return False
+    return Retry(min(_ATTACH_RECONCILE_INTERVAL_S, max(0.0, remaining_grace)))
 
 
 def _reconcile_expired_remote(
@@ -199,9 +182,9 @@ def _reconcile_expired_remote(
     deadline_at: float,
     log,
     failure: str,
-) -> bool:
+) -> bool | Retry:
     """Adopt late metrics or fail an attempt whose wall deadline has elapsed."""
-    from flash.runner.accounting.reconciliation import (
+    from flash.runner.lifecycle.cleanup import (
         _compare_and_fail_remote,
         _record_cleanup_remote,
     )
@@ -217,8 +200,7 @@ def _reconcile_expired_remote(
             log=log,
         )
     except Exception:
-        time.sleep(_ATTACH_RECONCILE_INTERVAL_S)
-        return False
+        return Retry(_ATTACH_RECONCILE_INTERVAL_S)
     if metrics is not None:
         _carry_allocation_stamp(metrics, expected_remote)
         try:
@@ -231,49 +213,34 @@ def _reconcile_expired_remote(
                 log=log,
             )
         except Exception:
-            time.sleep(_ATTACH_RECONCILE_INTERVAL_S)
-            return False
+            return Retry(_ATTACH_RECONCILE_INTERVAL_S)
         if adopted:
             return True
-        time.sleep(_ATTACH_RECONCILE_INTERVAL_S)
-        return False
+        return Retry(_ATTACH_RECONCILE_INTERVAL_S)
     try:
         cleanup_preserved = _record_cleanup_remote(run_id, expected_remote)
     except Exception:
         cleanup_preserved = False
     if not cleanup_preserved:
-        time.sleep(_ATTACH_RECONCILE_INTERVAL_S)
-        return False
+        return Retry(_ATTACH_RECONCILE_INTERVAL_S)
     try:
         if _compare_and_fail_remote(run_id, expected_remote, failure):
             return True
     except Exception:
-        time.sleep(_ATTACH_RECONCILE_INTERVAL_S)
-        return False
+        return Retry(_ATTACH_RECONCILE_INTERVAL_S)
     return True
 
 
 def _wait_for_replacement_window(worker_spec: JobSpec, deadline_at: float) -> bool:
-    """Wait within the wall deadline and decide whether teardown should be deferred."""
+    """Keep observing completion when a replacement cannot fit the remaining wall budget."""
     from flash.runner.lifecycle.deadlines import _spec_with_remaining_wall
 
-    delay = min(_ATTACH_RECONCILE_INTERVAL_S, max(0.0, deadline_at - time.time()))
-    if delay > 0:
-        time.sleep(delay)
-        if time.time() >= deadline_at:
-            return True
-    if time.time() < deadline_at:
-        # if a replacement cannot meet the 60-second provider minimum yet the run
-        # wall deadline is still open, keep reconciling (probe for completion) rather
-        # than tearing down and failing early - mirror handle-less recovery, which
-        # waits until the wall deadline.
-        try:
-            _spec_with_remaining_wall(worker_spec, require_provider_minimum=True)
-        except RuntimeError:
-            # cap the reconcile wait at the wall deadline so a near-deadline wake does
-            # not overshoot the run's wall deadline by a full interval.
-            time.sleep(min(_ATTACH_RECONCILE_INTERVAL_S, max(0.0, deadline_at - time.time())))
-            return True
+    if time.time() >= deadline_at:
+        return True
+    try:
+        _spec_with_remaining_wall(worker_spec, require_provider_minimum=True)
+    except RuntimeError:
+        return True
     return False
 
 
@@ -285,9 +252,11 @@ def _reconcile_attached_remote(
     source_snapshot: dict | None,
     log,
     failure: str,
-) -> None:
+    *,
+    resume_inline: bool = False,
+) -> Retry | None:
     from flash.providers.core.base import JobHandle
-    from flash.runner.accounting.reconciliation import (
+    from flash.runner.lifecycle.cleanup import (
         _compare_and_fail_remote,
         _remote_resource_identity,
     )
@@ -298,132 +267,161 @@ def _reconcile_attached_remote(
 
     expected_identity = _remote_resource_identity(expected_remote)
     handle = JobHandle.from_dict(expected_remote)
-    while True:
+    checkpoint()
+    try:
+        status = get_status(run_id)
+    except Exception:
+        return Retry(_ATTACH_RECONCILE_INTERVAL_S)
+    if status.state in TERMINAL_STATES:
+        return None
+    active_remote_matches = _remote_resource_identity(status.remote) == expected_identity
+    confirmed_teardown = (
+        status.remote is None
+        and _remote_resource_identity(status.cleanup_confirmed_remote) == expected_identity
+    )
+    if not active_remote_matches and not confirmed_teardown:
+        return None
+    try:
+        deadline_at = _load_run_deadline_at(run_id)
+    except Exception as exc:
         try:
-            status = get_status(run_id)
+            if _compare_and_fail_remote(run_id, expected_remote, str(exc)):
+                return None
         except Exception:
-            time.sleep(_ATTACH_RECONCILE_INTERVAL_S)
-            continue
-        if status.state in TERMINAL_STATES:
-            return
-        active_remote_matches = _remote_resource_identity(status.remote) == expected_identity
-        confirmed_teardown = (
-            status.remote is None
-            and _remote_resource_identity(status.cleanup_confirmed_remote) == expected_identity
+            return Retry(_ATTACH_RECONCILE_INTERVAL_S)
+        return None
+    try:
+        completed_metrics = _completed_metrics_for_remote(
+            worker_spec,
+            expected_remote,
+            provider=handle.provider,
+            attempt=next_attempt - 1,
+            deadline_at=deadline_at,
+            log=log,
         )
-        if not active_remote_matches and not confirmed_teardown:
-            return
-        try:
-            deadline_at = _load_run_deadline_at(run_id)
-        except Exception as exc:
-            try:
-                if _compare_and_fail_remote(run_id, expected_remote, str(exc)):
-                    return
-            except Exception:
-                time.sleep(_ATTACH_RECONCILE_INTERVAL_S)
-                continue
-            return
-        try:
-            completed_metrics = _completed_metrics_for_remote(
-                worker_spec,
-                expected_remote,
-                provider=handle.provider,
-                attempt=next_attempt - 1,
-                deadline_at=deadline_at,
-                log=log,
+    except _CompletedAttemptPending:
+        # the queue job already completed but its metrics are still landing; keep
+        # reconciling (do not tear it down) until they are readable -- but do not sleep
+        # past the grace cutoff, or a run that fails at the cutoff keeps reconciling a
+        # full interval beyond it before terminating.
+        pending_interval = _ATTACH_RECONCILE_INTERVAL_S
+        if deadline_at is not None:
+            pending_interval = min(
+                pending_interval,
+                max(0.0, deadline_at + _RECOVERY_MARKER_GRACE_S - time.time()),
             )
-        except _CompletedAttemptPending:
-            # the queue job already completed but its metrics are still landing; keep
-            # reconciling (do not tear it down) until they are readable -- but do not sleep
-            # past the grace cutoff, or a run that fails at the cutoff keeps reconciling a
-            # full interval beyond it before terminating.
-            pending_interval = _ATTACH_RECONCILE_INTERVAL_S
-            if deadline_at is not None:
-                pending_interval = min(
-                    pending_interval,
-                    max(0.0, deadline_at + _RECOVERY_MARKER_GRACE_S - time.time()),
-                )
-            time.sleep(pending_interval)
-            continue
-        if completed_metrics is not None:
-            if _reconcile_completed_remote(
-                run_id,
-                worker_spec,
-                expected_remote,
-                completed_metrics,
-                deadline_at,
-                log,
-            ):
-                return
-            continue
-        if time.time() >= deadline_at:
-            if _reconcile_expired_remote(
-                run_id,
-                worker_spec,
-                expected_remote,
-                handle,
-                next_attempt,
-                deadline_at,
-                log,
-                failure,
-            ):
-                return
-            continue
-        if _wait_for_replacement_window(worker_spec, deadline_at):
-            continue
-        may_continue, resource_deleted = _teardown_reconciled_remote(
+        return Retry(pending_interval)
+    if completed_metrics is not None:
+        result = _reconcile_completed_remote(
             run_id,
+            worker_spec,
+            expected_remote,
+            completed_metrics,
+            deadline_at,
+            log,
+        )
+        return result if isinstance(result, Retry) else None
+    if time.time() >= deadline_at:
+        result = _reconcile_expired_remote(
+            run_id,
+            worker_spec,
             expected_remote,
             handle,
-            confirmed_teardown=confirmed_teardown,
+            next_attempt,
+            deadline_at,
+            log,
+            failure,
         )
-        if not may_continue:
-            continue
-        if resource_deleted and not confirmed_teardown:
-            from flash.runner.accounting.reconciliation import (
-                _compare_and_confirm_remote_teardown,
-            )
-
-            try:
-                confirmed_teardown = _compare_and_confirm_remote_teardown(run_id, expected_remote)
-            except Exception:
-                confirmed_teardown = False
-            if not confirmed_teardown:
-                continue
+        return result if isinstance(result, Retry) else None
+    if _wait_for_replacement_window(worker_spec, deadline_at):
+        return Retry(min(_ATTACH_RECONCILE_INTERVAL_S, max(1.0, deadline_at - time.time())))
+    if not resume_inline:
         try:
-            _resume_after_confirmed_teardown(
-                run_id,
-                worker_spec,
-                expected_remote,
-                next_attempt,
-                source_snapshot,
-                log,
-                failure=failure,
+            admitted = current_supervisor().submit(
+                ("run", run_id),
+                "training",
+                partial(
+                    _run_attach_reconciliation,
+                    run_id,
+                    expected_remote,
+                    worker_spec,
+                    next_attempt,
+                    source_snapshot,
+                    log,
+                    failure,
+                    resume_inline=True,
+                ),
             )
-        except StagedEnvironmentTransientError:
-            time.sleep(_ATTACH_RECONCILE_INTERVAL_S)
-            continue
-        except Exception as exc:
+        except TaskAdmissionError:
+            admitted = False
+        return None if admitted else Retry(_ATTACH_RECONCILE_INTERVAL_S)
+    if not confirmed_teardown:
+        cleanup = reconcile_cleanup(run_id, expected_remote)
+        if not cleanup.replacement_safe:
+            return Retry(min(_ATTACH_RECONCILE_INTERVAL_S, max(1.0, deadline_at - time.time())))
+    return _resume_reconciled_remote(
+        run_id, expected_remote, worker_spec, next_attempt, source_snapshot, log, failure
+    )
+
+
+def _resume_reconciled_remote(
+    run_id: str,
+    expected_remote: dict,
+    worker_spec: JobSpec,
+    next_attempt: int,
+    source_snapshot: dict | None,
+    log,
+    failure: str,
+) -> Retry | None:
+    from flash.runner.lifecycle.cleanup import (
+        _compare_and_fail_remote,
+        _remote_resource_identity,
+    )
+    from flash.runner.lifecycle.state import TERMINAL_STATES
+    from flash.runner.lifecycle.status import get_status
+
+    expected_identity = _remote_resource_identity(expected_remote)
+    try:
+        _resume_after_confirmed_teardown(
+            run_id,
+            worker_spec,
+            expected_remote,
+            next_attempt,
+            source_snapshot,
+            log,
+            failure=failure,
+        )
+    except StagedEnvironmentTransientError:
+        return Retry(_ATTACH_RECONCILE_INTERVAL_S)
+    except Exception as exc:
+        try:
+            current = get_status(run_id)
+        except Exception:
+            return Retry(_ATTACH_RECONCILE_INTERVAL_S)
+        if current.state in TERMINAL_STATES:
+            return None
+        if current.remote is None:
             try:
-                current = get_status(run_id)
+                if _compare_and_fail_remote(run_id, None, str(exc)):
+                    return None
             except Exception:
-                time.sleep(_ATTACH_RECONCILE_INTERVAL_S)
-                continue
-            if current.state in TERMINAL_STATES:
-                return
-            if current.remote is None:
-                try:
-                    if _compare_and_fail_remote(run_id, None, str(exc)):
-                        return
-                except Exception:
-                    time.sleep(_ATTACH_RECONCILE_INTERVAL_S)
-                    continue
-                return
-            if _remote_resource_identity(current.remote) != expected_identity:
-                return
-            time.sleep(_ATTACH_RECONCILE_INTERVAL_S)
-            continue
-        return
+                return Retry(_ATTACH_RECONCILE_INTERVAL_S)
+            return None
+        if _remote_resource_identity(current.remote) != expected_identity:
+            return None
+        return Retry(_ATTACH_RECONCILE_INTERVAL_S)
+    return None
+
+
+def _retry_delay(run_id: str, interval_s: float) -> float:
+    """Keep the observation interval within the run wall deadline."""
+    from flash.runner.lifecycle.deadlines import _load_run_deadline_at
+
+    try:
+        return min(interval_s, max(0.0, _load_run_deadline_at(run_id) - time.time()))
+    except Exception:
+        # the observation itself owns failing an unreadable deadline.
+        return 0.0
 
 
 def _schedule_attach_reconciliation(
@@ -435,15 +433,14 @@ def _schedule_attach_reconciliation(
     log,
     failure: str,
 ) -> bool:
-    """Schedule one in-process reconciler for a captured remote identity."""
-    with _ATTACH_RECONCILING_LOCK:
-        if run_id in _ATTACH_RECONCILING:
-            return False
-        _ATTACH_RECONCILING.add(run_id)
+    """Schedule observations under the application owner; retain persisted intent on overflow."""
 
-    def run() -> None:
-        try:
-            _reconcile_attached_remote(
+    try:
+        return current_supervisor().submit(
+            ("attach", run_id),
+            "recovery",
+            partial(
+                _run_attach_reconciliation,
                 run_id,
                 expected_remote,
                 worker_spec,
@@ -451,27 +448,41 @@ def _schedule_attach_reconciliation(
                 source_snapshot,
                 log,
                 failure,
-            )
-        finally:
-            try:
-                from flash.runner.lifecycle.state import TERMINAL_STATES
-                from flash.runner.lifecycle.status import get_status
-                from flash.runner.supervise.recovery import _gc_run_sandboxes
+            ),
+            delay=_retry_delay(run_id, _ATTACH_RECONCILE_INTERVAL_S),
+        )
+    except TaskAdmissionError:
+        return False
 
-                if get_status(run_id).state in TERMINAL_STATES:
-                    _gc_run_sandboxes(worker_spec)
-            except Exception:
-                pass
-            with _ATTACH_RECONCILING_LOCK:
-                _ATTACH_RECONCILING.discard(run_id)
 
-    try:
-        threading.Thread(target=run, daemon=True).start()
-    except Exception:
-        with _ATTACH_RECONCILING_LOCK:
-            _ATTACH_RECONCILING.discard(run_id)
-        raise
-    return True
+def _run_attach_reconciliation(
+    run_id: str,
+    expected_remote: dict,
+    worker_spec: JobSpec,
+    next_attempt: int,
+    source_snapshot: dict | None,
+    log,
+    failure: str,
+    *,
+    resume_inline: bool = False,
+) -> Retry | None:
+    from flash.runner.lifecycle.state import TERMINAL_STATES
+    from flash.runner.lifecycle.status import get_status
+    from flash.runner.supervise.recovery import _gc_run_sandboxes
+
+    result = _reconcile_attached_remote(
+        run_id,
+        expected_remote,
+        worker_spec,
+        next_attempt,
+        source_snapshot,
+        log,
+        failure,
+        resume_inline=resume_inline,
+    )
+    if result is None and get_status(run_id).state in TERMINAL_STATES:
+        _gc_run_sandboxes(worker_spec)
+    return result
 
 
 @dataclass(frozen=True)
@@ -525,7 +536,7 @@ def _build_attach_context(
 def _fail_unparseable_attach(run_id: str, status: RunStatus, exc: Exception, log) -> RunStatus:
     """Tear down and fail a run whose persisted public spec cannot be parsed."""
     from flash.providers.core.base import JobHandle
-    from flash.runner.accounting.reconciliation import (
+    from flash.runner.lifecycle.cleanup import (
         _compare_and_confirm_remote_teardown,
         _compare_and_fail_remote,
         _record_cleanup_remote,
@@ -568,35 +579,24 @@ def _handle_attach_wall_deadline(
     exc: RuntimeError,
 ) -> RunStatus:
     """Adopt finished work or fail and tear down an attempt whose wall time is exhausted."""
-    from flash.runner.accounting.reconciliation import (
-        _compare_and_confirm_remote_teardown,
+    from flash.runner.lifecycle.cleanup import (
         _compare_and_fail_remote,
-        _record_cleanup_remote,
     )
     from flash.runner.lifecycle.deadlines import _load_run_deadline_at
     from flash.runner.lifecycle.status import get_status
     from flash.runner.supervise.recovery import (
         _adopt_completed_attempt,
-        _completed_attempt_metrics,
-        _completed_worker_metrics,
-        _strict_teardown_handle,
     )
 
     deadline_at = _load_run_deadline_at(run_id)
-    metrics = _completed_worker_metrics(
+    metrics = _completed_metrics_for_remote(
+        context.worker_spec,
         context.persisted_remote,
+        provider=context.handle.provider,
+        attempt=context.recovered_attempt,
         deadline_at=deadline_at,
+        log=log,
     )
-    started_ts = context.persisted_remote.get("started_ts")
-    if metrics is None and started_ts is not None:
-        metrics = _completed_attempt_metrics(
-            context.worker_spec,
-            provider=context.handle.provider,
-            attempt=context.recovered_attempt,
-            launch_floor=float(started_ts),
-            deadline_at=deadline_at,
-            log=log,
-        )
     if metrics is not None:
         _carry_allocation_stamp(metrics, context.persisted_remote)
         try:
@@ -633,14 +633,9 @@ def _handle_attach_wall_deadline(
             file=log,
         )
         return get_status(run_id)
-    try:
-        resource_deleted = _strict_teardown_handle(context.handle, run_id)
-    except Exception:
-        resource_deleted = False
-    if resource_deleted:
-        _compare_and_confirm_remote_teardown(run_id, context.persisted_remote)
-    else:
-        _record_cleanup_remote(run_id, context.persisted_remote)
+    cleanup = reconcile_cleanup(run_id, context.persisted_remote)
+    if not cleanup.resource_deleted and not cleanup.obligation_recorded:
+        raise RuntimeError("unconfirmed cleanup obligation could not be persisted")
     _compare_and_fail_remote(run_id, context.persisted_remote, str(exc))
     print(f"attach: {run_id} {exc}", file=log)
     return get_status(run_id)
@@ -653,18 +648,12 @@ def _handle_failed_attach_poll(
     log,
 ) -> RunStatus:
     """Adopt completed work or safely recover from an unsuccessful provider poll."""
-    from flash.runner.accounting.reconciliation import (
-        _compare_and_confirm_remote_teardown,
-        _record_cleanup_remote,
-    )
     from flash.runner.lifecycle.attempts import decide_attempt_failure
     from flash.runner.lifecycle.deadlines import _load_run_deadline_at
     from flash.runner.lifecycle.status import get_status
     from flash.runner.supervise.recovery import (
         _adopt_completed_attempt,
         _completed_worker_metrics,
-        _strict_teardown_handle,
-        _worker_provably_gone,
     )
     from flash.runner.supervise.retry_decision import (
         FailureObservation,
@@ -727,24 +716,10 @@ def _handle_failed_attach_poll(
     if plan is None:
         return get_status(run_id)
     print(f"attach: {run_id} {plan.action}", file=log)
-    try:
-        resource_deleted = _strict_teardown_handle(context.handle, run_id)
-        worker_gone = True
-    except Exception:
-        resource_deleted = False
-        worker_gone = _worker_provably_gone(run_id, context.handle)
-    if (
-        worker_gone
-        and context.handle.provider == "modal"
-        and not resource_deleted
-        and not _record_cleanup_remote(run_id, context.persisted_remote)
-    ):
-        raise RuntimeError("leaked endpoint cleanup target could not be persisted")
-    if resource_deleted:
-        _compare_and_confirm_remote_teardown(run_id, context.persisted_remote)
-    if worker_gone:
+    cleanup = reconcile_cleanup(run_id, context.persisted_remote)
+    if cleanup.replacement_safe:
         if not plan.retry:
-            from flash.runner.accounting.reconciliation import _compare_and_fail_remote
+            from flash.runner.lifecycle.cleanup import _compare_and_fail_remote
 
             _compare_and_fail_remote(run_id, context.persisted_remote, failure)
             return get_status(run_id)
@@ -846,7 +821,7 @@ def attach_run(run_id: str, log_stream=None) -> RunStatus:
     """Re-attach to a run's remote job from any process (after a client crash/restart)."""
     import sys
 
-    from flash.runner.accounting.reconciliation import (
+    from flash.runner.lifecycle.cleanup import (
         _compare_and_fail_remote,
         _record_cleanup_remote,
     )
