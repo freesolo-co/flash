@@ -1,4 +1,4 @@
-"""Focused hermetic coverage for the shared instance bootstrap (Vast/Lambda worker container).
+"""Focused hermetic coverage for the shared instance bootstrap (provider/Lambda worker container).
 
 These target under-covered helpers in ``flash.providers._lifecycle.bootstrap``: payload loading,
 code-prefix validation, the Hugging Face transient-retry machinery (status/Retry-After parsing +
@@ -23,14 +23,20 @@ import types
 
 import pytest
 
-from flash.providers._lifecycle import bootstrap as b
-from flash.providers._lifecycle.deadline import deadline_kwargs
+from flash.providers._lifecycle.bootstrapping import bootstrap as b
 from tests._helpers.source_snapshot import valid_source_snapshot
 
 SOURCE_SNAPSHOT = valid_source_snapshot()
 
 
-@pytest.mark.parametrize("arm", ["lambda", "vast"])
+@pytest.fixture(autouse=True)
+def _isolate_bootstrap_state(tmp_path, monkeypatch):
+    from flash.providers._lifecycle.bootstrapping import bootstrap
+
+    monkeypatch.setattr(bootstrap, "CODE_ROOT", str(tmp_path / "runcode"))
+
+
+@pytest.mark.parametrize("arm", ["modal"])
 def test_arm_accepts_current_provider_identity(arm):
     assert b._arm({"flash_arm": arm}) == arm
 
@@ -166,43 +172,6 @@ def test_require_deadline_at_rejects_unsafe_current_clock(monkeypatch):
         b.require_deadline_at(
             {"deadline_at": 150.0, "run_created_at": 50.0, "run_max_wall_seconds": 100.0}
         )
-
-
-def test_deadline_kwargs_forwards_supported_values_including_none():
-    def accepts_deadline(*, deadline_at):
-        return deadline_at
-
-    assert deadline_kwargs(accepts_deadline, 123.0) == {"deadline_at": 123.0}
-    assert deadline_kwargs(accepts_deadline, None) == {"deadline_at": None}
-
-
-def test_deadline_kwargs_omits_keyword_for_legacy_callable():
-    def legacy(value=None):
-        return value
-
-    assert deadline_kwargs(legacy, 123.0) == {}
-    assert deadline_kwargs(legacy, None) == {}
-
-
-def test_deadline_kwargs_forwards_to_variadic_callable():
-    def variadic(**kwargs):
-        return kwargs
-
-    assert deadline_kwargs(variadic, 123.0) == {"deadline_at": 123.0}
-    assert deadline_kwargs(variadic, None) == {"deadline_at": None}
-
-
-def test_deadline_kwargs_fails_closed_for_uninspectable_callable():
-    class _Uninspectable:
-        @property
-        def __signature__(self):
-            raise ValueError("signature unavailable")
-
-        def __call__(self, **kwargs):
-            return kwargs
-
-    assert deadline_kwargs(_Uninspectable(), 123.0) == {"deadline_at": 123.0}
-    assert deadline_kwargs(_Uninspectable(), None) == {"deadline_at": None}
 
 
 # ---------------------------------------------------------------------------
@@ -484,31 +453,6 @@ def test_hf_file_exists_starts_no_request_at_deadline(monkeypatch):
     assert calls == []
 
 
-def test_fetch_spec_from_hf_returns_downloaded_file_contents(tmp_path, monkeypatch):
-    local = tmp_path / "job_spec.json"
-    local.write_text('{"spilled": true}')
-    seen = {}
-
-    def _dl(**kw):
-        seen.update(kw)
-        return str(local)
-
-    _install_fake_hf(monkeypatch, hf_hub_download=_dl)
-    created_at = b.time.time()
-    payload = {
-        "hf_repo": "o/r",
-        "hf_prefix": "sft/run",
-        "env": {"HF_TOKEN": "tok"},
-        "deadline_at": created_at + 60.0,
-        "run_created_at": created_at,
-        "run_max_wall_seconds": 60.0,
-    }
-    assert b.fetch_spec_from_hf(payload) == '{"spilled": true}'
-    assert seen["filename"] == "sft/run/job_spec.json"
-    assert seen["repo_type"] == "dataset"
-    assert seen["token"] == "tok"
-
-
 def test_install_extra_pip_starts_no_process_at_deadline(monkeypatch):
     monkeypatch.setattr(b.time, "time", lambda: 200.0)
     monkeypatch.setattr(
@@ -569,7 +513,12 @@ def test_fetch_code_uses_exact_revision_and_verified_file_materialization(monkey
     assert seen["revision"] == SOURCE_SNAPSHOT["revision"]
     assert events == [
         "download",
-        ("materialize", "/tmp/archive.zip", SOURCE_SNAPSHOT["sha256"], "/runcode/run-1-attempt-0"),
+        (
+            "materialize",
+            "/tmp/archive.zip",
+            SOURCE_SNAPSHOT["sha256"],
+            b._code_dir(_source_payload()),
+        ),
     ]
 
 
@@ -633,12 +582,19 @@ class _StoppedUploader:
 
 
 class _FakeProc:
-    def __init__(self, lines, rc=0, timeout_once=False):
+    # the worker is launched as its own process-group leader, so a fake needs a pid to be
+    # addressable as a group. a real one is never signalled: the group teardown is stubbed out in
+    # the tests that reach it.
+    def __init__(self, lines, rc=0, timeout_once=False, pid=4242):
         self.stdout = iter(lines)
         self.returncode = rc
+        self.pid = pid
         self._timeout_once = timeout_once
         self._waits = 0
         self.killed = False
+
+    def poll(self):
+        return self.returncode
 
     def wait(self, timeout=None):
         self._waits += 1
@@ -651,11 +607,15 @@ class _FakeProc:
 
 
 class _RaisingWaitProc:
-    def __init__(self, error):
+    def __init__(self, error, pid=4243):
         self.args = ["worker"]
         self.stdout = iter(())
         self.returncode = None
+        self.pid = pid
         self.error = error
+
+    def poll(self):
+        return self.returncode
 
     def wait(self, timeout=None):
         raise self.error
@@ -778,7 +738,7 @@ def test_run_mode_success_returns_rc_and_uploads_console(monkeypatch):
     deadline = b.time.time() + 100
     rc = b.run_mode(payload, {"E": "1"}, "sft", deadline_ts=deadline)
     assert rc == 0
-    assert popen_calls[0][0][0] == [sys.executable, "-m", "flash.engine.worker_entrypoint"]
+    assert popen_calls[0][0][0] == [sys.executable, "-m", "flash.engine.support.worker_entrypoint"]
     upload_deadline, _reaping_deadline = b._upload_cleanup_deadlines(deadline)
     expected_worker_deadline = b._worker_execution_deadline(upload_deadline)
     assert float(popen_calls[0][1]["env"]["FLASH_RUN_DEADLINE_AT"]) == pytest.approx(
@@ -978,8 +938,13 @@ def test_run_mode_reaps_uploader_before_base_exception_propagates(monkeypatch, w
 
 @pytest.mark.parametrize(
     "wait_error",
-    [SystemExit(17), KeyboardInterrupt("interrupted"), RuntimeError("wait failed")],
-    ids=["system-exit", "keyboard-interrupt", "unexpected-exception"],
+    [
+        SystemExit(17),
+        KeyboardInterrupt("interrupted"),
+        RuntimeError("wait failed"),
+        b.WorkerInterrupted("worker interrupted by signal 2"),
+    ],
+    ids=["system-exit", "keyboard-interrupt", "unexpected-exception", "host-interruption"],
 )
 def test_wait_error_reaps_uploader_before_propagating_to_terminal_marker(monkeypatch, wait_error):
     uploader = _ReapTrackedUploader()
@@ -1001,6 +966,7 @@ def test_wait_error_reaps_uploader_before_propagating_to_terminal_marker(monkeyp
             return None
 
     monkeypatch.setattr(b, "load_payload", lambda: payload)
+    monkeypatch.setattr(b, "_publish_started", lambda _payload: None)
     monkeypatch.setattr(
         b,
         "arm_deadline_watchdog",
@@ -1041,7 +1007,7 @@ def test_wait_error_reaps_uploader_before_propagating_to_terminal_marker(monkeyp
     ok, error, retriable, uploader_alive, uploader_closed = marker_states[0]
     assert ok is False
     assert type(wait_error).__name__ in error
-    assert retriable is False
+    assert retriable is isinstance(wait_error, b.WorkerInterrupted)
     assert uploader_alive is False
     assert uploader_closed is True
 
@@ -1439,8 +1405,12 @@ def test_run_mode_reserves_cleanup_before_watchdog_marker_with_real_timing(monke
             self.args = ["worker"]
             self.stdout = iter(())
             self.returncode = None
+            self.pid = 4244
             self.wait_timeouts = []
             self.killed_at = None
+
+        def poll(self):
+            return self.returncode
 
         def wait(self, timeout=None):
             self.wait_timeouts.append(timeout)
@@ -1494,7 +1464,7 @@ def test_run_mode_reserves_cleanup_before_watchdog_marker_with_real_timing(monke
         "job_spec_json": "{}",
         "phase": "sft",
         "seed": 0,
-        "flash_arm": "lambda",
+        "flash_arm": "modal",
         "env": {},
         "extra_pip": [],
         "hf_prefix": "sft/run",
@@ -1510,10 +1480,18 @@ def test_run_mode_reserves_cleanup_before_watchdog_marker_with_real_timing(monke
         markers.append((kind, time.time(), uploader.is_alive()))
 
     monkeypatch.setattr(b, "load_payload", lambda: payload)
+    monkeypatch.setattr(b, "_publish_started", lambda _payload: None)
     monkeypatch.setattr(b, "install_extra_pip", lambda _payload: None)
     monkeypatch.setattr(b, "fetch_code", lambda _payload: None)
     monkeypatch.setattr(b, "build_worker_env", lambda _payload: {})
     monkeypatch.setattr(b.subprocess, "Popen", lambda *_args, **_kwargs: worker)
+    # route the group teardown at the fake rather than a real killpg on its invented pid: the
+    # timing of the kill is what this measures, not the signalling mechanics.
+    monkeypatch.setattr(
+        b._bootstrap_processes,
+        "terminate_process_group",
+        lambda process, **_kwargs: process.kill(),
+    )
     monkeypatch.setattr(
         b,
         "_start_console_uploader",
@@ -1734,12 +1712,20 @@ def test_unreapable_uploader_with_interrupt_exits_before_marker(
     assert all(event[0] != "marker" for event in events)
 
 
-def test_run_mode_timeout_kills_child_and_raises(monkeypatch):
+def test_run_mode_timeout_tears_down_the_whole_worker_group_and_raises(monkeypatch):
     _disable_periodic_console_upload(monkeypatch)
     monkeypatch.setattr(b, "_upload_console_tail_bounded", lambda *_args: True)
     monkeypatch.setattr(b, "hf_upload", lambda p, path, sub: None)
     proc = _FakeProc(["partial\n"], rc=0, timeout_once=True)
     monkeypatch.setattr(b.subprocess, "Popen", lambda *a, **k: proc)
+    # never let a fake pid reach a real killpg; record the call instead.
+    torn_down = {}
+
+    def _terminate(process, *, process_group_id, **_kwargs):
+        torn_down["process"] = process
+        torn_down["group"] = process_group_id
+
+    monkeypatch.setattr(b._bootstrap_processes, "terminate_process_group", _terminate)
 
     payload = {
         "hf_repo": "o/r",
@@ -1751,7 +1737,177 @@ def test_run_mode_timeout_kills_child_and_raises(monkeypatch):
     }
     with pytest.raises(TimeoutError, match="wall-clock cap"):
         b.run_mode(payload, {}, "grpo", deadline_ts=b.time.time() + 100)
-    assert proc.killed is True  # the child was killed on the deadline
+    # the whole group is torn down on the deadline, not just the leader pid: the worker's
+    # torchrun/vllm children hold the gpu and outlive a bare proc.kill().
+    assert torn_down["process"] is proc
+    assert torn_down["group"] == proc.pid
+
+
+def test_run_mode_timeout_reports_a_worker_group_that_survived_teardown(monkeypatch):
+    """A stranded gpu must not be filed as an ordinary capped run."""
+    _disable_periodic_console_upload(monkeypatch)
+    uploaded = {}
+
+    def _upload(_payload, _console, _mode, extra, *_args):
+        uploaded["extra"] = extra
+        return True
+
+    monkeypatch.setattr(b, "_upload_console_tail_bounded", _upload)
+    monkeypatch.setattr(b, "hf_upload", lambda p, path, sub: None)
+    proc = _FakeProc(["partial\n"], rc=0, timeout_once=True)
+    monkeypatch.setattr(b.subprocess, "Popen", lambda *a, **k: proc)
+
+    def _terminate(_process, *, process_group_id, **_kwargs):
+        raise RuntimeError(f"process group {process_group_id} survived term and kill supervision")
+
+    monkeypatch.setattr(b._bootstrap_processes, "terminate_process_group", _terminate)
+
+    payload = {
+        "hf_repo": "o/r",
+        "hf_prefix": "sft/run",
+        "env": {},
+        "source_snapshot": SOURCE_SNAPSHOT,
+        "attempt": 0,
+        "run_id": "run-1",
+    }
+    with pytest.raises(TimeoutError, match="survived term and kill supervision"):
+        b.run_mode(payload, {}, "grpo", deadline_ts=b.time.time() + 100)
+    # the console tail still uploads and carries the survivor, rather than being skipped by the
+    # raise: without it there is no record of why the box is still occupied.
+    assert "survived term and kill supervision" in uploaded["extra"]
+
+
+def test_group_teardown_is_bounded_by_the_deadline_it_is_given():
+    """A SIGTERM-ignoring group must not spend time the caller reserved for what follows teardown.
+
+    ``terminate_process_group`` runs at the worker's cutoff, and its term-then-kill grace is 15s by
+    default while the bootstrap holds only 12s before ``upload_deadline_at``. Unbounded, teardown
+    overruns that window and the final console tail is skipped -- discarding the survivor line that
+    is the only record the gpu is still held. Bounding it against a deadline (rather than reserving
+    the worst case up front) keeps short wall budgets startable and preserves the escalation.
+    """
+    import flash.providers._lifecycle.bootstrapping.processes as processes
+
+    # a group that ignores every signal, so the waits run to their full allowance.
+    monkey_now = [1_000.0]
+    real_time = processes.time.time
+    try:
+        processes.time.time = lambda: monkey_now[0]
+        # only 0.4s left: the kill wait is funded first, then whatever remains goes to the term.
+        term_wait, kill_wait = processes._bounded_graces(10.0, 5.0, monkey_now[0] + 0.4)
+        assert kill_wait == pytest.approx(0.4), "the escalation that frees the gpu is funded first"
+        assert term_wait == pytest.approx(0.0)
+        assert term_wait + kill_wait <= 0.4, "the supervision must fit the window it was given"
+
+        # a comfortable budget still gets the full default graces, unchanged.
+        term_wait, kill_wait = processes._bounded_graces(10.0, 5.0, monkey_now[0] + 60.0)
+        assert (term_wait, kill_wait) == (10.0, 5.0)
+
+        # already past the deadline: no waiting at all, but the caller still sends the signals.
+        assert processes._bounded_graces(10.0, 5.0, monkey_now[0] - 1.0) == (0.0, 0.0)
+    finally:
+        processes.time.time = real_time
+
+    # and with no deadline the behaviour is the documented default.
+    assert processes._bounded_graces(10.0, 5.0, None) == (10.0, 5.0)
+
+
+def test_group_teardown_deadline_is_later_than_the_cutoff_that_triggers_teardown():
+    """Teardown cannot be bounded by the instant it starts, or the kill gets no time to land.
+
+    ``terminate_process_group`` runs when the worker deadline fires. Handing it that same instant
+    leaves zero remaining, so ``_bounded_graces`` yields (0, 0): SIGKILL is sent but never waited
+    on, ``_group_exists`` still sees the not-yet-reaped group, and an ordinary wall-clock timeout
+    is reported as a survivor holding the gpu. The teardown cap must therefore sit strictly after
+    the worker cutoff, while still leaving the final console tail -- which carries the survivor
+    line -- its own slice.
+    """
+    import flash.providers._lifecycle.bootstrapping.processes as processes
+
+    upload_deadline = 1_000.0
+    worker_cutoff = b._worker_execution_deadline(upload_deadline)
+    teardown_cap = b._group_teardown_deadline(upload_deadline)
+
+    assert teardown_cap > worker_cutoff, (
+        "teardown is bounded by the moment it begins, so the kill is never waited on and every "
+        "capped run reports a surviving process group"
+    )
+    # the slack is real time to reap a killed group, not a rounding artefact.
+    assert teardown_cap - worker_cutoff == pytest.approx(b._CONSOLE_UPLOAD_STOP_TIMEOUT_S)
+    # and it stops short of the tail that reports the survivor.
+    assert teardown_cap <= upload_deadline - b._CONSOLE_UPLOAD_FINAL_TIMEOUT_S
+
+    # standing at the cutoff -- where teardown actually begins -- that slack is what the
+    # supervision gets to spend. bounded by the cutoff instead, both waits would be zero.
+    real_time = processes.time.time
+    try:
+        processes.time.time = lambda: worker_cutoff
+        term_wait, kill_wait = processes._bounded_graces(10.0, 5.0, teardown_cap)
+        assert kill_wait > 0, "the escalation that frees the gpu must be given time to be reaped"
+        # the whole window is handed to the supervision -- none of it is lost to the split.
+        assert term_wait + kill_wait == pytest.approx(teardown_cap - worker_cutoff)
+        assert term_wait + kill_wait <= b._CONSOLE_UPLOAD_STOP_TIMEOUT_S
+        # bounded by the cutoff instead, both waits collapse and the kill is never awaited.
+        assert processes._bounded_graces(10.0, 5.0, worker_cutoff) == (0.0, 0.0)
+    finally:
+        processes.time.time = real_time
+
+
+def test_run_mode_hands_teardown_a_deadline_it_can_actually_use(monkeypatch):
+    """The cap ``run_mode`` passes to teardown must outlast the cutoff that triggered it."""
+    _disable_periodic_console_upload(monkeypatch)
+    monkeypatch.setattr(b, "_upload_console_tail_bounded", lambda *a, **k: True)
+    monkeypatch.setattr(b, "hf_upload", lambda *a, **k: None)
+
+    handed = {}
+
+    def terminate(process, *, process_group_id, deadline_at=None):
+        handed["deadline_at"] = deadline_at
+        handed["at"] = b.time.time()
+
+    monkeypatch.setattr(b._bootstrap_processes, "terminate_process_group", terminate)
+
+    class _NeverExits:
+        def __init__(self):
+            self.args = ["worker"]
+            self.stdout = iter(())
+            self.returncode = None
+            self.pid = 909
+
+        def poll(self):
+            return None
+
+        def wait(self, timeout=None):
+            raise subprocess.TimeoutExpired(self.args, timeout)
+
+    monkeypatch.setattr(
+        b._bootstrap_processes,
+        "start_process_group",
+        lambda *a, **k: (_NeverExits(), 909),
+    )
+
+    deadline = b.time.time() + 100
+    payload = {
+        "hf_repo": "o/r",
+        "hf_prefix": "sft/run",
+        "env": {},
+        "source_snapshot": SOURCE_SNAPSHOT,
+        "attempt": 0,
+        "run_id": "run-1",
+    }
+    # the worker never exits, so the cap fires and the run ends as an ordinary timeout. that is
+    # the path under test: teardown runs, and what it was handed is what decides whether the kill
+    # is waited on or the run is misreported as a stranded gpu.
+    with pytest.raises(TimeoutError):
+        b.run_mode(payload, {}, "sft", deadline_ts=deadline)
+
+    upload_deadline, _reaping = b._upload_cleanup_deadlines(deadline)
+    assert handed["deadline_at"] == pytest.approx(b._group_teardown_deadline(upload_deadline))
+    # the cap must outlast the worker cutoff that triggered teardown. handing over the cutoff
+    # itself leaves zero remaining, so SIGKILL is sent but never waited on and an ordinary timeout
+    # is reported as a stranded gpu.
+    assert handed["deadline_at"] > b._worker_execution_deadline(upload_deadline)
+    assert handed["deadline_at"] > handed["at"], "teardown was handed an already-expired deadline"
 
 
 def test_run_mode_starts_no_subprocess_at_deadline(monkeypatch):
@@ -1781,7 +1937,7 @@ def test_main_arms_same_absolute_deadline_before_setup_and_training(monkeypatch)
         "job_spec_json": "{}",
         "phase": "sft",
         "seed": 0,
-        "flash_arm": "lambda",
+        "flash_arm": "modal",
         "env": {},
         "extra_pip": [],
         "hf_prefix": "sft/run",
@@ -1803,6 +1959,7 @@ def test_main_arms_same_absolute_deadline_before_setup_and_training(monkeypatch)
 
     monkeypatch.setattr(b.time, "time", lambda: 100.0)
     monkeypatch.setattr(b, "load_payload", lambda: payload)
+    monkeypatch.setattr(b, "_publish_started", lambda _payload: events.append("started"))
     monkeypatch.setattr(
         b,
         "arm_deadline_watchdog",
@@ -1820,8 +1977,9 @@ def test_main_arms_same_absolute_deadline_before_setup_and_training(monkeypatch)
     monkeypatch.setattr(b, "write_attempt_marker", lambda *_args, **_kwargs: None)
 
     assert b.main() == 0
-    assert events[:4] == [
+    assert events[:5] == [
         ("watchdog", 500.0),
+        "started",
         "code",
         "install",
         ("training", 500.0),
@@ -1849,6 +2007,7 @@ def test_main_source_verification_failure_prevents_pip(monkeypatch):
 
     monkeypatch.setattr(b.time, "time", lambda: 100.0)
     monkeypatch.setattr(b, "load_payload", lambda: payload)
+    monkeypatch.setattr(b, "_publish_started", lambda _payload: None)
     monkeypatch.setattr(b, "arm_deadline_watchdog", lambda *_args: (_Timer(), _Done()))
     monkeypatch.setattr(
         b,
@@ -1874,7 +2033,7 @@ def test_main_accepts_required_completion_artifacts_at_deadline(monkeypatch, bou
         "job_spec_json": "{}",
         "phase": "sft",
         "seed": 0,
-        "flash_arm": "lambda",
+        "flash_arm": "modal",
         "env": {},
         "extra_pip": [],
         "hf_prefix": "sft/run",
@@ -1906,6 +2065,7 @@ def test_main_accepts_required_completion_artifacts_at_deadline(monkeypatch, bou
 
     monkeypatch.setattr(b.time, "time", lambda: clock["now"])
     monkeypatch.setattr(b, "load_payload", lambda: payload)
+    monkeypatch.setattr(b, "_publish_started", lambda _payload: None)
     monkeypatch.setattr(b, "arm_deadline_watchdog", lambda deadline, _payload: (_Timer(), _Done()))
     monkeypatch.setattr(b, "install_extra_pip", lambda _payload: None)
     monkeypatch.setattr(b, "fetch_code", lambda _payload: None)
@@ -1938,7 +2098,7 @@ def test_write_attempt_marker_truncates_error_and_uploads_arm_named(monkeypatch)
     payload = {
         "hf_repo": "o/r",
         "hf_prefix": "p",
-        "flash_arm": "vast",
+        "flash_arm": "modal",
         "attempt": 3,
         "run_id": "run-marker",
         "deadline_at": 200.0,
@@ -1950,8 +2110,8 @@ def test_write_attempt_marker_truncates_error_and_uploads_arm_named(monkeypatch)
     b.write_attempt_marker(payload, ok=False, error=long_error, retriable=True)
 
     path, sub, kwargs = uploads[-1]
-    assert path == "/tmp/attempt_marker.json"
-    assert sub == "vast_attempt3.json"  # <arm>_attempt<N>.json
+    assert path == str(b.AttemptState(b._code_dir(payload), payload).marker_path)
+    assert sub == "modal_attempt3.json"  # <arm>_attempt<N>.json
     assert kwargs == {"enforce_deadline": False}
     with open(path) as f:
         marker = json.load(f)
@@ -1970,7 +2130,7 @@ def test_write_attempt_marker_preserves_success_after_deadline(monkeypatch):
     payload = {
         "hf_repo": "o/r",
         "hf_prefix": "p",
-        "flash_arm": "vast",
+        "flash_arm": "modal",
         "attempt": 3,
         "run_id": "run-marker",
         "deadline_at": 200.0,
@@ -1982,7 +2142,7 @@ def test_write_attempt_marker_preserves_success_after_deadline(monkeypatch):
 
     b.write_attempt_marker(payload, ok=True)
 
-    with open("/tmp/attempt_marker.json") as f:
+    with b.AttemptState(b._code_dir(payload), payload).marker_path.open() as f:
         marker = json.load(f)
     assert marker["ok"] is True
     assert marker["retriable"] is False
@@ -1999,7 +2159,7 @@ def test_write_attempt_marker_rejects_noncanonical_deadline(monkeypatch):
     payload = {
         "hf_repo": "o/r",
         "hf_prefix": "p",
-        "flash_arm": "vast",
+        "flash_arm": "modal",
         "attempt": 3,
         "run_id": "run-marker",
         "deadline_at": 200.0,
@@ -2029,7 +2189,7 @@ def test_arm_deadline_watchdog_publishes_marker_before_exit(monkeypatch):
         "deadline_at": 160.0,
         "run_created_at": 100.0,
         "run_max_wall_seconds": 60.0,
-        "flash_arm": "vast",
+        "flash_arm": "modal",
         "attempt": 0,
         "run_id": "run",
         "hf_repo": "o/r",
@@ -2068,69 +2228,11 @@ def test_deadline_watchdog_hard_exits_when_terminal_marker_writer_blocks(monkeyp
 # ---------------------------------------------------------------------------
 # _arm_preload_wall_cap: the _fire watchdog path
 # ---------------------------------------------------------------------------
-def test_arm_preload_wall_cap_uses_remaining_absolute_deadline(monkeypatch):
-    marks: list[tuple] = []
-    exits: list[int] = []
-    monkeypatch.setattr(b.time, "time", lambda: 100.0)
-    monkeypatch.setattr(
-        b, "write_attempt_marker", lambda p, ok, error="", **k: marks.append((ok, error))
-    )
-    monkeypatch.setattr(b.os, "_exit", lambda code: exits.append(code))
-
-    payload = {
-        "deadline_at": 160.0,
-        "run_created_at": 100.0,
-        "run_max_wall_seconds": 60.0,
-        "flash_arm": "lambda",
-        "attempt": 0,
-        "hf_repo": "o/r",
-        "env": {},
-    }
-    timer, _done = b._arm_preload_wall_cap(payload)
-    timer.cancel()
-    assert timer.interval == 60.0
-
-    # manually invoke the watchdog closure: not done means marker then hard exit.
-    timer.function()
-    assert exits == [124]
-    assert marks
-    assert marks[-1][0] is False
-    assert "run wall deadline" in marks[-1][1]
-
-    # if the download already finished, the watchdog is a no-op.
-    marks.clear()
-    exits.clear()
-    timer2, done2 = b._arm_preload_wall_cap(payload)
-    timer2.cancel()
-    done2.set()
-    timer2.function()
-    assert exits == []
-    assert marks == []
 
 
 # ---------------------------------------------------------------------------
 # run_preload: per-model download failure is captured, not raised
 # ---------------------------------------------------------------------------
-def test_run_preload_records_download_failure(tmp_path, monkeypatch):
-    (tmp_path / ".flash-cache-mounted").write_text("")  # real-mount sentinel
-
-    def _snap(**k):
-        if k.get("local_files_only"):
-            raise FileNotFoundError("not cached")  # force the real download attempt
-        raise RuntimeError("network exploded")  # the real download fails
-
-    _install_fake_hf(monkeypatch, snapshot_download=_snap)
-    cache_dir = str(tmp_path / "hf-cache" / "hub")
-    r = b.run_preload(
-        {
-            "env": {"FLASH_WEIGHT_CACHE_DIR": cache_dir},
-            "models": ["a/b"],
-            "cache_mount_marker": ".flash-cache-mounted",
-        }
-    )
-    assert r["preloaded"] == []
-    assert r["already_cached"] == []
-    assert r["failed"]["a/b"] == "RuntimeError: network exploded"
 
 
 # ---------------------------------------------------------------------------
@@ -2221,7 +2323,7 @@ def test_attempt_marker_error_redacts_a_payload_env_secret(monkeypatch):
     payload = {
         "hf_repo": "o/r",
         "hf_prefix": "p",
-        "flash_arm": "vast",
+        "flash_arm": "modal",
         "attempt": 1,
         "run_id": "run-marker",
         "deadline_at": 200.0,
@@ -2232,7 +2334,7 @@ def test_attempt_marker_error_redacts_a_payload_env_secret(monkeypatch):
 
     b.write_attempt_marker(payload, ok=False, error=f"worker died holding {_PAYLOAD_SECRET}")
 
-    with open("/tmp/attempt_marker.json") as f:
+    with b.AttemptState(b._code_dir(payload), payload).marker_path.open() as f:
         marker = json.load(f)
     assert marker["error"] == "worker died holding <redacted>"
 
@@ -2444,7 +2546,7 @@ def test_read_console_tail_drops_a_single_unterminated_line(tmp_path, monkeypatc
     configured secret then removes a prefix sized for THAT secret and leaves a long fragment of the
     runtime one, which full-value redaction can never match. The empty tail never leaked.
     """
-    from flash.providers._lifecycle import bootstrap_secrets
+    from flash.providers._lifecycle.bootstrapping import secrets as bootstrap_secrets
 
     for name in [key for key in b.os.environ if bootstrap_secrets._secret_env_name(key)]:
         monkeypatch.delenv(name, raising=False)
@@ -2570,66 +2672,19 @@ def test_hf_call_retry_log_redacts_payload_secrets(monkeypatch, capsys):
 # ---------------------------------------------------------------------------
 # main(): the preload branch
 # ---------------------------------------------------------------------------
-def _preload_payload(**over):
-    created_at = b.time.time()
-    base = {
-        "mode": "preload",
-        "hf_repo": "org/repo",
-        "hf_prefix": "preload/run",
-        "flash_arm": "lambda",
-        "run_id": "preload-run",
-        "seed": 0,
-        "attempt": 0,
-        "env": {},
-        "run_created_at": created_at,
-        "run_max_wall_seconds": 999.0,
-        "deadline_at": created_at + 999.0,
-    }
-    base.update(over)
-    return base
 
 
-def test_main_preload_success_returns_zero_and_writes_ok_marker(monkeypatch):
-    markers: list[tuple] = []
-    monkeypatch.setattr(b, "load_payload", lambda path=b.PAYLOAD_PATH: _preload_payload())
-    monkeypatch.setattr(
-        b, "run_preload", lambda p: {"preloaded": ["a/b"], "already_cached": [], "failed": {}}
-    )
-    monkeypatch.setattr(b, "hf_upload", lambda p, path, sub: None)
-    monkeypatch.setattr(
-        b, "hf_file_exists", lambda p, sub: True
-    )  # completion file confirmed first try
-    monkeypatch.setattr(
-        b,
-        "write_attempt_marker",
-        lambda p, ok, error="", retriable=False: markers.append((ok, error, retriable)),
-    )
-    assert b.main() == 0
-    assert markers == [(True, "", False)]
-    with open("/tmp/preload_result.json") as f:
-        assert json.load(f)["preloaded"] == ["a/b"]
+@pytest.mark.parametrize("signum", [signal.SIGINT, signal.SIGTERM])
+def test_bootstrap_shutdown_handlers_classify_host_interruption_and_restore(monkeypatch, signum):
+    previous = {sig: signal.getsignal(sig) for sig in (signal.SIGINT, signal.SIGTERM)}
+    monkeypatch.setattr(b, "load_payload", lambda: _source_payload())
 
+    def run_attempt(_payload):
+        handler = signal.getsignal(signum)
+        with pytest.raises(b.WorkerInterrupted, match=f"signal {signum}"):
+            handler(signum, None)
+        return 1
 
-def test_main_preload_failure_arms_wall_cap_and_reports_failed_models(monkeypatch):
-    markers: list[tuple] = []
-    monkeypatch.setattr(b.time, "sleep", lambda s: None)  # neutralize the confirm-retry backoff
-    monkeypatch.setattr(b, "load_payload", lambda path=b.PAYLOAD_PATH: _preload_payload())
-    monkeypatch.setattr(
-        b,
-        "run_preload",
-        lambda p: {"preloaded": [], "already_cached": [], "failed": {"a/b": "oom"}},
-    )
-    monkeypatch.setattr(b, "hf_upload", lambda p, path, sub: None)
-    monkeypatch.setattr(
-        b, "hf_file_exists", lambda p, sub: False
-    )  # confirm loop exhausts -> else branch
-    monkeypatch.setattr(
-        b,
-        "write_attempt_marker",
-        lambda p, ok, error="", retriable=False: markers.append((ok, error, retriable)),
-    )
+    monkeypatch.setattr(b, "_run_attempt", run_attempt)
     assert b.main() == 1
-    ok, error, retriable = markers[0]
-    assert ok is False
-    assert error == "model preload failed"
-    assert retriable is False
+    assert {sig: signal.getsignal(sig) for sig in previous} == previous

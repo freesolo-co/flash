@@ -1,7 +1,7 @@
 """The per-step floor: work the FLOPs terms do not account for.
 
 A GRPO step has three phases with no term in the cost model. Measured by verl's own `timing_s/*`
-on real hardware (Qwen3.5-0.8B, RTX 4090, 8 steps, 100.0% of the step accounted):
+on real hardware (Qwen3.5-0.8B, L4, 8 steps, 100.0% of the step accounted):
 
     update_actor      62.1%   -> update_s
     old_log_prob      17.9%   -> NOTHING
@@ -40,7 +40,7 @@ from flash.cost.analytical import (
 )
 from flash.cost.types import RunConfig
 
-CARDS = ["A100 PCIe", "B200", "H100", "H200", "RTX 4090", "RTX 5090"]
+CARDS = ["A100 SXM", "B200", "H100", "H200", "L4", "L40S"]
 # Cards the campaign measured but that did NOT earn an offset: 2 arms each, under the min-arm gate.
 # RTX Pro 6000's own replicate spread on one identical config is 2.37x, so its residual is noise.
 UNDER_SAMPLED = ["A100 SXM", "RTX Pro 6000"]
@@ -48,7 +48,7 @@ UNDER_SAMPLED = ["A100 SXM", "RTX Pro 6000"]
 
 def _config(method="grpo", **overrides):
     base = {
-        "model_id": "Qwen/Qwen3.5-2B",
+        "model_id": "Qwen/Qwen3.5-9B",
         "method": method,
         "steps": 20,
         "seq_len": 2048,
@@ -56,7 +56,7 @@ def _config(method="grpo", **overrides):
         "batch_size": 8,
         "group_size": 4,
         "gpu_type": "H100",
-        "provider": "runpod",
+        "provider": "modal",
     }
     base.update(overrides)
     return RunConfig(**base)
@@ -215,9 +215,9 @@ def test_the_card_reaches_the_floor_through_the_real_quote_path(monkeypatch):
     import flash.cost.analytical as analytical
 
     monkeypatch.setattr(analytical, "step_floor_seconds", spy)
-    fast = seconds_per_step(_config(gpu_type="RTX 5090"), "RTX 5090")
+    fast = seconds_per_step(_config(gpu_type="L40S"), "L40S")
     slow = seconds_per_step(_config(gpu_type="H200"), "H200")
-    assert "RTX 5090" in seen
+    assert "L40S" in seen
     assert "H200" in seen
     assert fast != slow
 
@@ -317,3 +317,18 @@ def test_multi_card_still_beats_single_card(method):
     seconds = [sharded_step_seconds(config, "H100", n) for n in (1, 2, 4, 8)]
     for narrow, wide in pairwise(seconds):
         assert wide < narrow, f"{method}: adding cards must still shorten the step ({seconds})"
+
+
+def test_grpo_estimate_has_no_reward_latency_allowance():
+    """reward execution is customer code, so neither its identity nor latency can move the quote."""
+    from dataclasses import fields, replace
+
+    config = _config(method="grpo", environment="github:org/fast-reward")
+    names = {field.name for field in fields(RunConfig)}
+    assert not any("reward" in name and "model" not in name for name in names)
+    fast = seconds_per_step(config, "H100")
+    slow_identity = seconds_per_step(
+        replace(config, environment="github:org/arbitrarily-slow-reward"),
+        "H100",
+    )
+    assert slow_identity == fast

@@ -8,7 +8,12 @@ checked-in source is the prod channel, and the build-time rewrites produce a coh
 from __future__ import annotations
 
 import importlib.util
+import os
+import subprocess
+import sys
 from pathlib import Path
+
+import flash.serve.contract.urls as serving_urls
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
@@ -23,6 +28,46 @@ def _load_build_module():
     return module
 
 
+def test_ui_leaf_modules_import_cold() -> None:
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import flash.cli.ui.env_panels; import flash.cli.ui.tables",
+        ],
+        cwd=REPO_ROOT,
+        check=False,
+        capture_output=True,
+        text=True,
+        env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"},
+    )
+
+    assert result.returncode == 0, result.stderr
+
+
+def test_heartbeat_interpretation_does_not_import_rendering() -> None:
+    script = (
+        "import sys; from flash.cli.ui import heartbeat; "
+        "heartbeat._heartbeat_pairs({'state': 'running', "
+        "'last_heartbeat': {'stage': 'sft_initializing', 'ts': 1}}); "
+        "assert 'flash.cli.ui.render' not in sys.modules"
+    )
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            script,
+        ],
+        cwd=REPO_ROOT,
+        check=False,
+        capture_output=True,
+        text=True,
+        env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"},
+    )
+
+    assert result.returncode == 0, result.stderr
+
+
 def test_checked_in_source_is_prod_channel():
     from flash._internal import channel as _channel
     from flash.client import config
@@ -33,9 +78,7 @@ def test_checked_in_source_is_prod_channel():
     # The functional defaults everything reads from.
     assert config.DEFAULT_API_URL == "https://flash.freesolo.co"
 
-    from flash.serve import deploy
-
-    assert deploy.DEFAULT_FREESOLO_SERVING_URL == "https://serve.freesolo.co"
+    assert serving_urls.default_serving_url() == "https://serve.freesolo.co"
 
 
 def test_default_api_url_follows_channel():
@@ -53,7 +96,7 @@ def test_default_serving_url_follows_channel():
     posts a dev `org_id` into the prod database and takes a 23503 foreign-key violation -- which
     reads as a serving outage but is a routing defect, and which no retry can clear.
     """
-    from flash.serve.deploy import (
+    from flash.serve.contract.urls import (
         DEV_FREESOLO_SERVING_URL,
         PROD_FREESOLO_SERVING_URL,
         default_serving_url,
@@ -70,7 +113,7 @@ def test_every_hosted_default_flips_with_the_channel():
     """Build the dev channel for real and assert NO hosted default is left pointing at prod.
 
     This is the regression that was missing. `serve.freesolo.co` sat hardcoded in
-    `flash/serve/deploy.py` while `client/config.py` derived its URL from CHANNEL, so the dev
+    `flash/serve/deployment/deploy.py` while `client/config.py` derived its URL from CHANNEL, so the dev
     package shipped a prod serving endpoint and every dev deploy failed the prod org_id FK.
     Each half was internally consistent, so nothing was red -- the same shape as the earlier
     catalog drift between the flash and serving rank limits.
@@ -91,12 +134,14 @@ def test_every_hosted_default_flips_with_the_channel():
     assert dev_channel == "dev"
 
     from flash.client.config import default_api_url
-    from flash.serve.deploy import default_serving_url
+    from flash.serve.contract.urls import default_serving_url
 
     # Every channel-derived default, evaluated as the built dev package would.
     dev_defaults = {
         "control plane (flash.client.config.default_api_url)": default_api_url(dev_channel),
-        "serving plane (flash.serve.deploy.default_serving_url)": default_serving_url(dev_channel),
+        "serving plane (flash.serve.deployment.serving_urls.default_serving_url)": default_serving_url(
+            dev_channel
+        ),
     }
     assert dev_defaults, "no hosted defaults collected -- the scan would pass vacuously"
 
@@ -108,7 +153,7 @@ def test_every_hosted_default_flips_with_the_channel():
         + "; ".join(f"{name} -> {url}" for name, url in sorted(leaked.items()))
         + ". Each hosted plane is backed by its own Supabase project, so a dev client hitting a "
         "prod endpoint fails the org_id foreign key. Give the constant a prod/dev pair that "
-        "derives from CHANNEL, as flash.client.config and flash.serve.deploy both do."
+        "derives from CHANNEL, as flash.client.config and flash.serve.deployment.deploy both do."
     )
 
 
@@ -145,23 +190,23 @@ def _real_console_scripts() -> dict[str, str]:
 def test_flash_cli_alias_reaches_the_same_entry_point():
     """`flash-cli` must exist and be the same entry point as `flash`.
 
-    The `server` and `dev` extras install runpod-flash, which declares its own `flash` console
+    The `server` and `dev` extras install another CLI package, which declares its own `flash` console
     script. Whichever distribution is installed last wins, so on a control-plane host `flash` can
-    silently belong to runpod-flash -- it exits 0 without doing anything. `flash-cli` is the name
+    silently belong to another CLI package -- it exits 0 without doing anything. `flash-cli` is the name
     nothing else claims, so it is what SELF_HOSTING.md points operators at.
     """
     scripts = _real_console_scripts()
-    assert scripts.get("flash") == "flash.cli:main"
+    assert scripts.get("flash") == "flash.cli.parsing.main:main"
     assert scripts.get("flash-cli") == scripts["flash"], (
         "flash-cli must stay an alias of flash. SELF_HOSTING.md tells self-hosters to use it "
-        "when runpod-flash's console script shadows `flash`."
+        "when another CLI package's console script shadows `flash`."
     )
 
 
 def test_printed_commands_name_the_executable_the_operator_invoked():
     """Generated commands must name the script actually run, not the channel default.
 
-    On the documented `[server]` install, `flash` can be runpod-flash's console script. Printing
+    On the documented `[server]` install, `flash` can be another CLI package's console script. Printing
     `flash runs cancel <id>` there hands the operator a command that exits 0 without cancelling,
     leaving a billed run alive -- so an operator who reached us via `flash-cli` must be told
     `flash-cli`. Anything that is not one of our scripts (a test runner, a renamed copy) falls
@@ -195,6 +240,7 @@ def test_operator_hints_follow_flash_cli_invocation():
     from unittest import mock
 
     from flash._internal import channel
+    from flash.cli.ui import env_panels, render
     from flash.cli.ui import env_panels as env_panels_module
     from flash.cli.ui import render as render_module
     from flash.cli.ui import tables as tables_module
@@ -203,8 +249,7 @@ def test_operator_hints_follow_flash_cli_invocation():
     outputs: dict[str, str] = {}
     try:
         with mock.patch.object(sys, "argv", ["/usr/local/bin/flash-cli"]):
-            # env_panels before render: it binds CLI_NAME with a from-import, so reloading it
-            # after channel is what re-reads the name, and render re-exports its `env_list`.
+            # reload each canonical owner after channel so its imported CLI_NAME follows argv.
             importlib.reload(channel)
             importlib.reload(tables_module)
             importlib.reload(env_panels_module)
@@ -218,11 +263,13 @@ def test_operator_hints_follow_flash_cli_invocation():
                 "flash/cli/ui/render.py:env_setup": render.env_setup(
                     ["environment.py"], "11111111-1111-4111-8111-111111111111"
                 ),
-                "flash/cli/ui/render.py:env_list(local)": render.env_list(["."]),
-                "flash/cli/ui/render.py:env_list(empty)": render.env_list([]),
-                "flash/cli/ui/tables.py:models_table": render.models_table([{"id": "acme/model"}]),
-                "flash/cli/ui/tables.py:projects_table": render.projects_table([]),
-                "flash/cli/ui/tables.py:checkpoints_table": render.checkpoints_table(
+                "flash/cli/ui/render.py:env_list(local)": env_panels.env_list(["."]),
+                "flash/cli/ui/render.py:env_list(empty)": env_panels.env_list([]),
+                "flash/cli/ui/tables.py:models_table": tables_module.models_table(
+                    [{"id": "acme/model"}]
+                ),
+                "flash/cli/ui/tables.py:projects_table": tables_module.projects_table([]),
+                "flash/cli/ui/tables.py:checkpoints_table": tables_module.checkpoints_table(
                     "run-1", [{"step": 1}]
                 ),
             }
@@ -246,7 +293,7 @@ def test_scaffolded_files_follow_flash_cli_invocation(tmp_path, monkeypatch):
     """The GENERATED environment.py / evaluations.py must name the invoked CLI too.
 
     The terminal output above already did, but the scaffold guidance was a literal `flash env push`.
-    Those files outlive the terminal session -- an operator on a host where `flash` is RunPod's CLI
+    Those files outlive the terminal session -- an operator on a host where `flash` is provider's CLI
     reads the docstring later, runs the shadowed binary, and it exits 0 having published nothing.
     That is the failure mode the alias exists to prevent, so the two renderings have to agree.
     """
@@ -256,8 +303,8 @@ def test_scaffolded_files_follow_flash_cli_invocation(tmp_path, monkeypatch):
     from unittest import mock
 
     from flash._internal import channel
-    from flash.cli.commands.env import retained as retained_module
-    from flash.cli.commands.env import setup as setup_module
+    from flash.cli.commands.env.ops import retained as retained_module
+    from flash.cli.commands.env.ops import setup as setup_module
 
     project = "11111111-1111-4111-8111-111111111111"
     original_argv = list(sys.argv)
@@ -516,7 +563,7 @@ def test_the_attached_dash_m_form_is_recognised_as_a_module_launch():
     A short option may carry its value attached, and CPython accepts it; the only difference is
     that `sys.orig_argv` holds one token, `-mflash.cli`, instead of two. Matching the separated
     spelling alone sends this form to the `flash` fallback -- on the host where `flash` may be
-    RunPod's console script, so the printed cancel exits 0 without cancelling. That is the exact
+    provider's console script, so the printed cancel exits 0 without cancelling. That is the exact
     failure this module exists to prevent, reached through a spelling rather than a bug.
     """
     import sys
@@ -550,7 +597,7 @@ def test_the_attached_dash_m_form_is_recognised_as_a_module_launch():
 def test_windows_console_script_names_match_case_insensitively():
     """Windows filenames are case-insensitive, so `FLASH-CLI.EXE` IS the script we installed.
 
-    Rejecting it falls back to `flash` -- which on the `[server]` install may be RunPod's, so the
+    Rejecting it falls back to `flash` -- which on the `[server]` install may be provider's, so the
     operator is pointed at the shadowed name the alias exists to escape. `.EXE` also survives a
     lowercase-only suffix strip, so the name then fails the membership test for a second reason.
 
@@ -638,7 +685,7 @@ def test_rewrite_pyproject_retargets_only_the_project_table():
         'flash = "flash.cli.main:main"\n'
         "# Operator-only console script.\n"
         'flash-cli = "flash.cli.main:main"\n'
-        'flash-server = "flash.server.__main__:main"\n'
+        'flash-server = "flash.server.asgi.cli:main"\n'
         "\n"
         "[tool.flash-dev]\n"
         'version = "9.9.9"\n'
@@ -649,7 +696,7 @@ def test_rewrite_pyproject_retargets_only_the_project_table():
     assert 'name = "freesolo-flash-dev"' in out
     assert 'flash-dev = "flash.cli.main:main"' in out
     assert 'flash-dev-cli = "flash.cli.main:main"' in out
-    assert 'flash-dev-server = "flash.server.__main__:main"' in out
+    assert 'flash-dev-server = "flash.server.asgi.cli:main"' in out
     # No un-renamed script key survives: each would collide with the prod package.
     assert "\nflash = " not in out
     assert "\nflash-cli = " not in out

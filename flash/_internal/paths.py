@@ -1,7 +1,7 @@
 """The one place Flash decides where its local state lives.
 
 Everything Flash persists on the machine it runs on -- the CLI's saved login, the control
-plane's SQLite database, run records and results, and the RunPod SDK's resource registry --
+plane's SQLite database, run records and results, and the Modal SDK's resource registry --
 hangs off a single root. ``FLASH_DATA_DIR`` moves that root; unset, it is ``~/.flash``, which
 is where every one of those things already lived.
 

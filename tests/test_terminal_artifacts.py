@@ -10,7 +10,7 @@ import json
 
 import pytest
 
-from flash.providers._lifecycle.terminal_artifacts import (
+from flash.providers._lifecycle.instances.terminal_artifacts import (
     AttemptIdentity,
     ProbeBudget,
     TerminalKind,
@@ -90,7 +90,7 @@ def test_success_marker_with_metrics_is_success():
 
 
 def test_success_marker_carries_trusted_source_attestation_into_metrics():
-    from flash.source_snapshot import TERMINAL_ATTESTATION_KEY, source_attestation
+    from flash.snapshot.archive import TERMINAL_ATTESTATION_KEY, source_attestation
 
     attestation = source_attestation(SOURCE_SNAPSHOT, run_id="run-1", attempt=0)
     resolution = _resolve(
@@ -139,7 +139,7 @@ def test_one_budget_is_shared_across_both_reads(monkeypatch):
     real ceiling their sum. With a shared absolute cutoff, a marker read that exhausts the window
     leaves metrics no retries at all.
     """
-    import flash.providers._lifecycle.terminal_artifacts as ta
+    import flash.providers._lifecycle.instances.terminal_artifacts as ta
 
     clock = {"now": 1000.0}
     monkeypatch.setattr(ta.time, "time", lambda: clock["now"])
@@ -177,7 +177,7 @@ def test_one_budget_is_shared_across_both_reads(monkeypatch):
 
 
 def test_read_within_stops_at_the_cutoff_rather_than_the_try_count(monkeypatch):
-    import flash.providers._lifecycle.terminal_artifacts as ta
+    import flash.providers._lifecycle.instances.terminal_artifacts as ta
 
     clock = {"now": 1000.0}
     monkeypatch.setattr(ta.time, "time", lambda: clock["now"])

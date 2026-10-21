@@ -8,7 +8,7 @@ import tempfile
 import pytest
 
 BASE = (
-    'model = "Qwen/Qwen3.5-4B"\n'
+    'model = "Qwen/Qwen3.5-9B"\n'
     'algorithm = "grpo"\n'
     '[environment]\nid = "github:freesolo-co/envs@main:gsm8k/environment.py"\n'
     "[train]\nepochs = 1\nmax_examples = 100\n"
@@ -69,7 +69,7 @@ def test_authored_train_keys_follow_composed_config() -> None:
         base = _write(tmp, "base.toml", BASE)
         # BASE is grpo, so the composed key has to be one grpo accepts: teacher_model is opd-only
         # and is now rejected by the parser, which would fail before key tracking is exercised.
-        extra = _write(tmp, "extra.toml", "[train]\nentropy_quantile = 0.8\n")
+        extra = _write(tmp, "extra.toml", "[train]\nthinking_length_penalty_coef = 0.8\n")
         spec, keys = spec_and_train_keys_from_file(
             base,
             run_id="x",
@@ -81,14 +81,14 @@ def test_authored_train_keys_follow_composed_config() -> None:
         {
             "epochs",
             "max_examples",
-            "entropy_quantile",
+            "thinking_length_penalty_coef",
             "temperature",
             "stop_sequences",
         }
     )
     assert spec.train.temperature == 0.0
     assert spec.train.stop_sequences == ()
-    assert spec.train.entropy_quantile == 0.8
+    assert spec.train.thinking_length_penalty_coef == 0.8
 
 
 def test_set_requires_key_value():

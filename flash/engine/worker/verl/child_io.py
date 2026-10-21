@@ -36,12 +36,13 @@ def render_tf32_shim() -> str:
     return f"""
 # --- flash: enable tf32 in the trainer process (see backend_common.render_tf32_shim) ---
 try:
+    import sys as _flash_tf32_sys
     import torch as _flash_tf32_torch
 
     _flash_tf32_torch.set_float32_matmul_precision("high")
     _flash_tf32_torch.backends.cuda.matmul.allow_tf32 = True
     _flash_tf32_torch.backends.cudnn.allow_tf32 = True
-    print({FLASH_TF32_MARKER!r}, flush=True)
+    print({FLASH_TF32_MARKER!r}, file=_flash_tf32_sys.stderr, flush=True)
 except Exception:
     pass
 """
@@ -101,6 +102,7 @@ def render_tilelang_cudart_shim() -> str:
 # --- flash: repoint tilelang's libcudart stub (see child_io.render_tilelang_cudart_shim) ---
 # the probe below is perf._find_real_libcudart's own source, shipped verbatim. edit it THERE.
 try:
+    import sys as _flash_cudart_sys
     import importlib.util as _flash_cudart_importlib_util
     import os
     import os as _flash_cudart_os
@@ -130,7 +132,7 @@ try:
             if _flash_cudart_real is None:
                 print(
                     "[flash-verl] tilelang libcudart stub: no real libcudart found; left as-is",
-                    flush=True,
+                    file=_flash_cudart_sys.stderr, flush=True,
                 )
             else:
                 # ray starts several child interpreters against ONE venv, so every step below has
@@ -183,10 +185,10 @@ try:
                             pass
                 print(
                     {FLASH_CUDART_STUB_MARKER!r} + " -> " + _flash_cudart_real,
-                    flush=True,
+                    file=_flash_cudart_sys.stderr, flush=True,
                 )
 except Exception as _flash_cudart_exc:
-    print("[flash-verl] tilelang libcudart stub repoint failed: " + repr(_flash_cudart_exc), flush=True)
+    print("[flash-verl] tilelang libcudart stub repoint failed: " + repr(_flash_cudart_exc), file=_flash_cudart_sys.stderr, flush=True)
 """
 
 

@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import os
 
+import flash.engine.worker.io.heartbeat as worker_heartbeat
+
 # Disable HF I/O in node_entry helpers (they early-return when HF_REPO is empty).
 os.environ["HF_REPO"] = ""
 os.environ["PHASE"] = "rl"
@@ -40,9 +42,11 @@ def test_heartbeat_concurrent_calls_stay_safe(monkeypatch):
     import json
     import threading as _threading
 
-    import flash.engine.worker as ne
+    import flash.engine.worker.io.heartbeat as ne
 
-    monkeypatch.setattr(ne, "_HB_MIN_INTERVAL_S", 0.0)  # force every call through the upload path
+    monkeypatch.setattr(
+        worker_heartbeat, "_HB_MIN_INTERVAL_S", 0.0
+    )  # force every call through the upload path
 
     # Remove any stale upload temp files a prior failed run (or another process) left behind, so the
     # end-of-test "no temp files" assertion measures only THIS test's cleanup, not pre-existing cruft.
@@ -61,7 +65,7 @@ def test_heartbeat_concurrent_calls_stay_safe(monkeypatch):
         except Exception as e:  # truncated/garbled/missing -> a concurrency bug
             bad.append(e)
 
-    monkeypatch.setattr(ne, "hf_upload_file", fake_upload)
+    monkeypatch.setattr(ne.hf_io, "hf_upload_file", fake_upload)
 
     errors: list[Exception] = []
     barrier = _threading.Barrier(8)
@@ -72,7 +76,7 @@ def test_heartbeat_concurrent_calls_stay_safe(monkeypatch):
             for j in range(40):
                 # vary stage so both the throttled and unthrottled branches run
                 stage = "rl_step" if (i + j) % 2 else "checkpoint_uploaded"
-                ne.heartbeat(stage, step=i * 1000 + j, payload="x" * 200)
+                worker_heartbeat.heartbeat(stage, step=i * 1000 + j, payload="x" * 200)
         except Exception as e:
             errors.append(e)
 
@@ -101,7 +105,7 @@ def test_heartbeat_uploads_are_serialized_and_use_claimed_snapshot(monkeypatch):
     import threading as _threading
     import time
 
-    import flash.engine.worker as ne
+    import flash.engine.worker.io.heartbeat as ne
 
     monkeypatch.setenv(
         "HF_REPO", ""
@@ -120,7 +124,7 @@ def test_heartbeat_uploads_are_serialized_and_use_claimed_snapshot(monkeypatch):
     guard = _threading.Lock()
 
     # Force every call through the upload path: no throttling.
-    monkeypatch.setattr(ne, "_HB_MIN_INTERVAL_S", 0.0)
+    monkeypatch.setattr(worker_heartbeat, "_HB_MIN_INTERVAL_S", 0.0)
 
     def fake_upload(local_path, repo_subpath, required=False):
         nonlocal inflight, max_inflight
@@ -140,7 +144,7 @@ def test_heartbeat_uploads_are_serialized_and_use_claimed_snapshot(monkeypatch):
                 mismatches.append((expected_stage, obj))
             inflight -= 1
 
-    monkeypatch.setattr(ne, "hf_upload_file", fake_upload)
+    monkeypatch.setattr(ne.hf_io, "hf_upload_file", fake_upload)
 
     barrier = _threading.Barrier(6)
     errors: list[Exception] = []
@@ -150,7 +154,7 @@ def test_heartbeat_uploads_are_serialized_and_use_claimed_snapshot(monkeypatch):
             barrier.wait()
             for j in range(20):
                 step = i * 1000 + j
-                ne.heartbeat("rl_step" if (i + j) % 2 else "ckpt", step=step)
+                worker_heartbeat.heartbeat("rl_step" if (i + j) % 2 else "ckpt", step=step)
         except Exception as e:
             errors.append(e)
 

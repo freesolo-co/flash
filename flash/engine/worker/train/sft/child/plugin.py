@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-from importlib import import_module
-
 if __name__ == "flash_sft_plugin":
     import flash_verl_runtime as runtime
 else:
@@ -63,6 +61,27 @@ def _install_seeded_dataloader(seed: int) -> None:
     sft_trainer.SFTTrainer._build_dataloader = seeded_build_dataloader
 
 
+def _install_epoch_boundary_resume() -> None:
+    from verl.trainer import sft_trainer
+
+    original = sft_trainer.SFTTrainer.fit
+    if getattr(original, "_flash_epoch_boundary_resume", False):
+        return
+
+    def fit(self):
+        step = self.resume_global_step
+        if 0 < step < self.total_training_steps and step % self.steps_per_epoch == 0:
+            # The saved loader is exhausted, but verl starts at the NEXT epoch. Rebuild
+            # only at that boundary so its empty restored iterator cannot skip an epoch.
+            # Mid-epoch resumes keep their exact saved cursor and sampler state.
+            self._build_dataloader()
+            self.ckpt_handler.train_dataloader = self.train_dataloader
+        return original(self)
+
+    fit._flash_epoch_boundary_resume = True
+    sft_trainer.SFTTrainer.fit = fit
+
+
 def _install_linear_scheduler() -> None:
     from transformers import get_linear_schedule_with_warmup
     from verl.workers.engine.fsdp.transformer_impl import FSDPEngine
@@ -100,60 +119,20 @@ def _install_reentrant_checkpointing(*, multimodal: bool) -> None:
     FSDPEngine._build_module = build_reentrant_module
 
 
-def _install_loraplus(ratio: float, ready_marker: str) -> None:
-    if ratio <= 1:
-        return
-    from peft.optimizers import create_loraplus_optimizer
-    from verl.workers.engine.fsdp.transformer_impl import FSDPEngine
-
-    def build_loraplus_optimizer(self, module):
-        config = self.optimizer_config
-        optimizer_cls = getattr(import_module(config.optimizer_impl), config.optimizer)
-        optimizer_kwargs = {"lr": config.lr, "weight_decay": config.weight_decay}
-        if "adam" in config.optimizer.lower() or "ademamix" in config.optimizer.lower():
-            optimizer_kwargs["betas"] = config.betas
-        if config.override_optimizer_config:
-            optimizer_kwargs.update(config.override_optimizer_config)
-        try:
-            optimizer = create_loraplus_optimizer(
-                model=module,
-                optimizer_cls=optimizer_cls,
-                optimizer_kwargs=optimizer_kwargs,
-                loraplus_lr_ratio=ratio,
-                loraplus_weight_decay=config.weight_decay,
-            )
-        except TypeError:
-            optimizer = create_loraplus_optimizer(
-                model=module,
-                optimizer_cls=optimizer_cls,
-                lr=config.lr,
-                loraplus_lr_ratio=ratio,
-                loraplus_weight_decay=config.weight_decay,
-                **{key: value for key, value in optimizer_kwargs.items() if key != "lr"},
-            )
-        print(
-            f"{ready_marker} ratio={ratio:g} optimizer={optimizer_cls.__name__}",
-            flush=True,
-        )
-        return optimizer
-
-    FSDPEngine._build_optimizer = build_loraplus_optimizer
-
-
 def _install_core(config: dict) -> None:
     seed = int(config["seed"])
     _install_exact_dataloaders()
     _install_seeded_dataloader(seed)
+    _install_epoch_boundary_resume()
     _install_linear_scheduler()
     save_at_steps = tuple(config.get("save_at_steps", ()))
     if save_at_steps:
         runtime.install_checkpoint_handler_filter(save_at_steps, int(config["total_steps"]))
+        runtime.install_checkpoint_publication_backpressure(
+            config["checkpoint_published_dir"], save_at_steps, int(config["total_steps"])
+        )
     if config.get("reentrant_gradient_checkpointing"):
         _install_reentrant_checkpointing(multimodal=bool(config.get("multimodal")))
-    _install_loraplus(
-        float(config.get("loraplus_ratio", 1.0)),
-        str(config["loraplus_ready_marker"]),
-    )
 
 
 def install() -> None:

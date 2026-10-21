@@ -6,9 +6,10 @@ from dataclasses import dataclass, replace
 
 from flash.core.catalog import normalize_algorithm, optimizer_batch_key, samples_on_policy
 from flash.core.spec import parse_positive_int_tuple
+from flash.cost.currency import format_usd
 from flash.engine.plan.recipe import RECIPE
-from flash.providers import PROVIDER_NAMES, validated_provider_preferences
-from flash.providers.base import GPU_INFO, canonical_gpu, providers_for
+from flash.providers.core.base import GPU_INFO, canonical_gpu, providers_for
+from flash.providers.core.registry import PROVIDER_NAMES, validated_provider_preferences
 
 
 def vram_clause(per_card_gb: int, offered_gb: int, gpu_count: int) -> str:
@@ -317,7 +318,7 @@ class CostEstimate:
         side. An sft job whose one-row batch launches a single rank on two rented cards is
         offered one card's memory, and the quote has to say so.
         """
-        from flash.providers.sharding import combined_vram_gb
+        from flash.providers.core.sharding import combined_vram_gb
 
         return int(combined_vram_gb(self.gpu_vram_gb, self.joined_gpu_count))
 
@@ -345,7 +346,7 @@ class CostEstimate:
                 f"Teacher API: ${self.teacher_api_usd:.2f} (Parasail teacher token spend on the "
                 "platform-managed teacher key — tracked separately, NOT included in TOTAL)"
             )
-        lines.append(f"TOTAL      : ${self.total_usd:.2f}")
+        lines.append(f"TOTAL      : {format_usd(self.total_usd)}")
         if self.notes:
             lines.append("Notes      :")
             lines.extend(f"  - {n}" for n in self.notes)

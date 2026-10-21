@@ -16,11 +16,11 @@ from pathlib import Path
 
 import pytest
 
-MODAL_APP = Path(__file__).resolve().parents[2] / "flash" / "serving" / "modal_app.py"
+MODAL_APP = Path(__file__).resolve().parents[2] / "flash" / "serving" / "app" / "modal_app.py"
 
 # Every catalog model currently ships a pre-quantized serve_model_id, so the online-quantization
 # default is exercised by clearing it rather than by picking a different model.
-MODEL = "Qwen/Qwen3.5-4B"
+MODEL = "Qwen/Qwen3.5-9B"
 
 
 @pytest.fixture
@@ -30,9 +30,9 @@ def engine_args():
     The conftest installs the vLLM stub at import, so this resolves against the same
     ``AsyncEngineArgs`` field set the engine would see on a build missing newer args.
     """
-    from flash.serving.src import settings as cfg
-    from flash.serving.src.engine_boot import engine_args_for
-    from flash.serving.src.model_config import engine_overrides_for
+    from flash.serving.src.engine.boot import engine_args_for
+    from flash.serving.src.engine.model_config import engine_overrides_for
+    from flash.serving.src.store import settings as cfg
 
     def _for(model: str, **overrides):
         resolved = {**engine_overrides_for(model), **overrides}
@@ -42,7 +42,7 @@ def engine_args():
 
 
 def test_engine_args_wires_fp8_weights_and_kv(engine_args) -> None:
-    from flash.serving.src import settings as cfg
+    from flash.serving.src.store import settings as cfg
 
     # FP8 weights: with no pre-quantized checkpoint the base is online-quantized to cfg.QUANTIZATION
     # and serves itself.
@@ -57,7 +57,7 @@ def test_prequantized_base_passes_no_quantization(engine_args) -> None:
     # A pre-quantized serve_model_id checkpoint is served directly and vLLM auto-detects its FP8, so
     # passing quantization on top would re-quantize an already-quantized checkpoint.
     kwargs = engine_args(MODEL)
-    assert kwargs["model"] == "Freesolo-Co/Qwen3.5-4B-FP8"
+    assert kwargs["model"] == "Freesolo-Co/Qwen3.5-9B-FP8"
     assert kwargs["quantization"] is None
 
 
@@ -66,7 +66,7 @@ def test_a_model_can_opt_out_to_bf16_explicitly(engine_args) -> None:
     # reach vLLM as None (the documented 35B H200 bf16 fallback), not fall back to the global FP8
     # default. serve_model_id is cleared first, or the default would already be None and this could
     # not tell the two apart.
-    from flash.serving.src import settings as cfg
+    from flash.serving.src.store import settings as cfg
 
     assert engine_args(MODEL, serve_model_id=None)["quantization"] == cfg.QUANTIZATION
     opted_out = engine_args(MODEL, serve_model_id=None, quantization=None)
@@ -87,7 +87,7 @@ def test_moe_backend_override_is_guarded(engine_args, monkeypatch, capsys) -> No
     # on an unknown kwarg.
     assert engine_args(MODEL, moe_backend="triton")["moe_backend"] == "triton"
 
-    monkeypatch.setattr("flash.serving.src.engine_boot._async_engine_arg_names", lambda _t: set())
+    monkeypatch.setattr("flash.serving.src.engine.boot._async_engine_arg_names", lambda _t: set())
     assert "moe_backend" not in engine_args(MODEL, moe_backend="triton")
     assert "no moe_backend arg" in capsys.readouterr().out
 
@@ -97,7 +97,7 @@ def test_max_num_batched_tokens_override_is_guarded(engine_args, monkeypatch, ca
     # exceeds vLLM's 2048 default. Forward it only when this AsyncEngineArgs build exposes the field.
     assert engine_args(MODEL, max_num_batched_tokens=4096)["max_num_batched_tokens"] == 4096
 
-    monkeypatch.setattr("flash.serving.src.engine_boot._async_engine_arg_names", lambda _t: set())
+    monkeypatch.setattr("flash.serving.src.engine.boot._async_engine_arg_names", lambda _t: set())
     assert "max_num_batched_tokens" not in engine_args(MODEL, max_num_batched_tokens=4096)
     assert "no max_num_batched_tokens arg" in capsys.readouterr().out
 
@@ -113,7 +113,7 @@ def test_reasoning_parser_forwarding_fails_closed_on_incompatible_vllm(
         raise RuntimeError("vllm build cannot forward reasoning_parser")
 
     monkeypatch.setattr(
-        "flash.serving.src.engine_boot._require_reasoning_api_compatibility", _incompatible
+        "flash.serving.src.engine.boot._require_reasoning_api_compatibility", _incompatible
     )
     with pytest.raises(RuntimeError):
         engine_args(MODEL, reasoning_parser="qwen3")
@@ -125,7 +125,8 @@ def test_image_keeps_deepgemm_out_of_moe_backend_race() -> None:
     assert '"VLLM_MOE_USE_DEEP_GEMM": "0"' in MODAL_APP.read_text()
 
 
-def test_image_persists_vllm_compile_cache_on_the_volume() -> None:
+@pytest.mark.parametrize("cache_variable", ["VLLM_CACHE_ROOT", "FLASHINFER_WORKSPACE_BASE"])
+def test_image_persists_compile_caches_on_the_volume(cache_variable: str) -> None:
     # VLLM_CACHE_ROOT defaults to ~/.cache/vllm (vllm/envs.py) -- ephemeral container storage -- so
     # leaving it unset made every scale-from-zero recompile the model: vLLM writes torch.compile
     # artifacts under VLLM_CACHE_ROOT/torch_compile_cache/ (vllm/compilation/backends.py). It must
@@ -138,13 +139,13 @@ def test_image_persists_vllm_compile_cache_on_the_volume() -> None:
         for node in ast.walk(tree)
         if isinstance(node, ast.Dict)
         for key, value in zip(node.keys, node.values, strict=False)
-        if isinstance(key, ast.Constant) and key.value == "VLLM_CACHE_ROOT"
+        if isinstance(key, ast.Constant) and key.value == cache_variable
         for node in [value]
     ]
-    assert roots, "VLLM_CACHE_ROOT must be set in the image env"
+    assert roots, f"{cache_variable} must be set in the image env"
     (root,) = roots
     # An f-string interpolating HOSTING_CACHE_MOUNT is the only accepted form, matching HF_HUB_CACHE.
-    assert isinstance(root, ast.JoinedStr), "VLLM_CACHE_ROOT must interpolate HOSTING_CACHE_MOUNT"
+    assert isinstance(root, ast.JoinedStr), f"{cache_variable} must interpolate HOSTING_CACHE_MOUNT"
     names = {
         node.id
         for part in root.values
@@ -153,7 +154,7 @@ def test_image_persists_vllm_compile_cache_on_the_volume() -> None:
         if isinstance(node, ast.Name)
     }
     assert "HOSTING_CACHE_MOUNT" in names, (
-        "VLLM_CACHE_ROOT must live under the persistent volume mount, or the compile cache is "
+        f"{cache_variable} must live under the persistent volume mount, or the compile cache is "
         "discarded on every cold start"
     )
 

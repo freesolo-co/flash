@@ -14,8 +14,11 @@ from pathlib import Path
 
 import pytest
 
-from flash.engine.worker import opd_train, rl_train, sft_train
+import flash.engine.worker.train.entry.rl_train_runner as rl_train_runner
+import flash.engine.worker.train.opd.orchestration.overrides as opd_overrides
+import flash.engine.worker.train.rl.rollout.multi_turn as rl_multi_turn
 from flash.engine.worker.train.core.child import runtime
+from flash.engine.worker.train.entry import sft_train
 from flash.engine.worker.train.opd.child import entry as opd_entry
 from flash.engine.worker.train.rl.child import entry as grpo_entry
 from flash.engine.worker.train.sft.child import entry as sft_entry
@@ -41,8 +44,8 @@ def test_strict_entries_reject_a_missing_external_module(monkeypatch, entry, plu
 
 def test_each_runner_configures_exactly_one_algorithm_plugin():
     sft_source = inspect.getsource(sft_train._prepare_sft_child)
-    grpo_source = inspect.getsource(rl_train._build_rl_child_env)
-    opd_source = inspect.getsource(opd_train._build_opd_child_env)
+    grpo_source = inspect.getsource(rl_train_runner._build_rl_child_env)
+    opd_source = inspect.getsource(opd_overrides._build_opd_child_env)
 
     assert 'child_env["VERL_USE_EXTERNAL_MODULES"] = "flash_sft_plugin"' in sft_source
     assert 'env_for_verl["VERL_USE_EXTERNAL_MODULES"] = "flash_grpo_plugin"' in grpo_source
@@ -70,11 +73,10 @@ def test_large_grpo_plugin_config_uses_a_file_and_launches_the_child(tmp_path):
         "plugin_config_path": str(tmp_path / "flash_grpo_plugin_config.json"),
     }
     inp = {
-        "model_id": "Qwen/Qwen3.5-0.8B",
+        "model_id": "Qwen/Qwen3.5-9B",
         "dp_cards": 1,
         "reentrant_checkpointing": False,
         "multimodal": False,
-        "entropy_quantile": None,
         "per_turn_credit": False,
         "stop_sequences": (),
         "image_pad_token_id": None,
@@ -85,12 +87,12 @@ def test_large_grpo_plugin_config_uses_a_file_and_launches_the_child(tmp_path):
         "kl_coef": 0.0,
         "multi_turn": False,
     }
-    rl_train._write_rl_shim(inp, files)
-    rl_train._write_rl_plugin_config(inp, files, gdn_reset_arch=None, loggers=[])
+    rl_train_runner._write_rl_shim(inp, files)
+    rl_train_runner._write_rl_plugin_config(inp, files, gdn_reset_arch=None, loggers=[])
 
     config_path = Path(files["plugin_config_path"])
     assert config_path.stat().st_size > 128 * 1024
-    env = rl_train._build_rl_child_env(inp, files, [], "http://127.0.0.1:9/")
+    env = rl_train_runner._build_rl_child_env(inp, files, [], "http://127.0.0.1:9/")
     assert "FLASH_GRPO_PLUGIN_CONFIG" not in env
     assert env["FLASH_GRPO_PLUGIN_CONFIG_PATH"] == str(config_path)
     assert len(env["FLASH_GRPO_PLUGIN_CONFIG_PATH"]) < 4096
@@ -115,8 +117,33 @@ print("config-loaded")
     assert "config-loaded" in result.stdout.splitlines()
 
 
+def test_staged_child_glue_imports_the_copied_reasoning_normalizer(tmp_path):
+    rl_multi_turn.copy_grpo_child_modules(str(tmp_path))
+    normalizer = tmp_path / "flash_reasoning_normalization.py"
+    normalizer.write_text(
+        normalizer.read_text()
+        + "\n\ndef messages_for_chat_template(messages):\n    return [{'role': 'assistant', 'content': 'staged'}]\n",
+        encoding="utf-8",
+    )
+    script = """
+import flash_multiturn_glue as glue
+assert glue._messages_for_chat_template([]) == [{'role': 'assistant', 'content': 'staged'}]
+print('staged-normalizer-used')
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    assert "staged-normalizer-used" in result.stdout
+
+
 def test_grpo_external_plugin_arms_without_importing_cuda_sensitive_targets(tmp_path):
-    rl_train.copy_grpo_child_modules(str(tmp_path))
+    rl_multi_turn.copy_grpo_child_modules(str(tmp_path))
     config_path = tmp_path / "flash_grpo_plugin_config.json"
     config_path.write_text(
         json.dumps(
@@ -125,7 +152,6 @@ def test_grpo_external_plugin_arms_without_importing_cuda_sensitive_targets(tmp_
                 "dp_cards": 2,
                 "reentrant_checkpointing": True,
                 "multimodal": True,
-                "entropy_quantile": 0.2,
                 "per_turn_credit": True,
                 "stop_sequences": ["</answer>"],
                 "image_pad_token_id": 151655,
@@ -161,7 +187,6 @@ expected_names = {
     "nonempty-response-mask",
     "exact-rollout-identity",
     "reentrant-checkpointing",
-    "entropy-quantile",
     "per-turn-credit",
     "stop-sequences",
     "image-pad-ban",
@@ -178,7 +203,6 @@ expected_target_counts = {
     "verl.trainer.ppo.rollout_corr_helper": 1,
     "verl.experimental.agent_loop.agent_loop": 5,
     "verl.workers.engine.fsdp.transformer_impl": 2,
-    "verl.workers.utils.losses": 1,
     "verl.trainer.ppo.ray_trainer": 2,
     "verl.workers.rollout.vllm_rollout.vllm_async_server": 1,
     "transformers.models.qwen3_next.modeling_qwen3_next": 1,
@@ -769,3 +793,52 @@ def test_copied_flat_modules_have_no_importerror_fallback_to_flash():
                         and (child.module or "").startswith("flash.")
                     ]
                     assert not fallback_imports, path
+
+
+def test_required_checkpoint_survives_a_slow_publisher(monkeypatch, tmp_path):
+    import shutil
+    import threading
+
+    published = tmp_path / "published"
+    published.mkdir()
+    checkpoints = tmp_path / "checkpoints"
+    checkpoints.mkdir()
+    waiting = threading.Event()
+    released = threading.Event()
+
+    class Handler:
+        def save_checkpoint(self, step):
+            for old in checkpoints.iterdir():
+                shutil.rmtree(old)
+            (checkpoints / f"step-{step}").mkdir()
+            return step
+
+    module = types.ModuleType("verl.utils.checkpoint.checkpoint_handler")
+    module.CheckpointHandler = Handler
+    monkeypatch.setitem(sys.modules, module.__name__, module)
+    runtime.install_checkpoint_handler_filter((1, 5), 10)
+    runtime.install_checkpoint_publication_backpressure(str(published), (1, 5), 10)
+    handler = Handler()
+    assert handler.save_checkpoint(1) == 1
+    # Calls filtered out by the exact schedule must not wait for upload.
+    assert handler.save_checkpoint(2) is None
+    (published / "step-1").touch()
+    assert handler.save_checkpoint(5) == 5
+
+    def save_final():
+        waiting.set()
+        handler.save_checkpoint(10)
+        released.set()
+
+    thread = threading.Thread(target=save_final, daemon=True)
+    thread.start()
+    assert waiting.wait(1)
+    try:
+        assert not released.wait(0.2)
+        assert (checkpoints / "step-5").is_dir()
+        (published / "step-5").touch()
+        assert released.wait(2)
+        assert (checkpoints / "step-10").is_dir()
+    finally:
+        (published / "step-5").touch()
+        thread.join(2)
