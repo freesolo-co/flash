@@ -37,9 +37,7 @@ def _registration(**overrides: object) -> dict[str, object]:
         "lora_rank": 16,
         "thinking": False,
     }
-    payload["artifact_fingerprint"] = immutable_binding_fingerprint(
-        {**payload, "checkpoint_id": CHECKPOINT_ID}
-    )
+    payload["artifact_fingerprint"] = immutable_binding_fingerprint(payload)
     payload.update(overrides)
     return payload
 
@@ -72,7 +70,6 @@ def test_adapter_record_before_validator_rejects_non_dict_input() -> None:
 @pytest.mark.parametrize("checkpoint_step", [-1, True])
 def test_checkpoint_step_rejects_negative_and_boolean_values(checkpoint_step: object) -> None:
     payload = _registration(checkpoint_step=checkpoint_step)
-    payload["checkpoint_id"] = payload.pop("model_id")
     with pytest.raises(ValidationError, match=r"checkpoint step|canonical checkpoint identity"):
         ImmutableCheckpointRegistration.model_validate(payload)
 

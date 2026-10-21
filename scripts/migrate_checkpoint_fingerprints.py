@@ -1,4 +1,4 @@
-"""One-time, offline migration from adapter_id to checkpoint_id fingerprint inputs.
+"""One-time, offline migration from adapter_id to model_id fingerprint inputs.
 
 Run from this checkout with ``python -m scripts.migrate_checkpoint_fingerprints``.
 Requires psycopg and FLASH_CHECKPOINT_DATABASE_URL. Defaults to a read-only dry run.
@@ -29,7 +29,7 @@ def fingerprint_change(row: dict[str, Any]) -> tuple[str, str] | None:
         return None
     # Legacy encoding exists only in this offline migration, never in serving acceptance.
     legacy = immutable_binding_projection(record)
-    legacy["adapter_id"] = legacy.pop("checkpoint_id")
+    legacy["adapter_id"] = legacy.pop("model_id")
     previous = hashlib.sha256(
         json.dumps(legacy, sort_keys=True, separators=(",", ":")).encode("utf-8")
     ).hexdigest()

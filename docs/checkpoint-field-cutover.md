@@ -1,12 +1,13 @@
 # Checkpoint field cutover
 
-The hosted contract uses `checkpoint_id` in registration and fingerprint inputs, and `model_id`
-in catalog records, raw generation requests/responses, and Modal dispatch. OpenAI `model` and
+The hosted contract uses `model_id` consistently in registration, fingerprint inputs, catalog
+records, raw generation requests/responses, and Modal dispatch. Registration still validates that
+the value identifies an exact checkpoint; inference also permits catalog base models. OpenAI `model` and
 public checkpoint provenance are unchanged. The legacy `adapter_id` payload field is rejected.
 Low-level vLLM adapter handles are a separate runtime concept and retain their existing name.
 
 Deploy the CLI and hosted serving from the same release. The new CLI requires the
-`canonical_checkpoint_fields` health capability before registering checkpoints. Old clients cannot
+`serving_contract_v2` health capability before registering checkpoints. Old clients cannot
 register against the new closed registration schema; old raw `/generate` callers must send `model_id`.
 
 The Freesolo backend already uses `checkpoint_id` and treats fingerprints as opaque values, so

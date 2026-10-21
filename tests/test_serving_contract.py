@@ -14,9 +14,9 @@ import flash.serve.request.transport as serving_transport
 from flash.adapters.config import DeclaredAdapterConfig
 from flash.schema import format_checkpoint_ref, parse_checkpoint_ref
 from flash.serve.contract.protocol import (
-    PERMANENT_CHECKPOINT_IDENTITY_CAPABILITY,
     PREFERRED_SERVING_CAPABILITIES,
     REQUIRED_SERVING_CAPABILITIES,
+    SERVING_CONTRACT_CAPABILITY,
     ServingHealthError,
     parse_serving_health,
 )
@@ -158,7 +158,7 @@ def _stub_deploy_preconditions(monkeypatch, deploy_mod) -> None:
     monkeypatch.setattr(
         deploy_mod,
         "_require_serving_capabilities",
-        lambda **_kwargs: {PERMANENT_CHECKPOINT_IDENTITY_CAPABILITY},
+        lambda **_kwargs: {SERVING_CONTRACT_CAPABILITY},
     )
 
 
@@ -320,7 +320,7 @@ def test_deploy_registers_one_exact_checkpoint_without_activation(monkeypatch) -
     assert method == "POST"
     assert url.endswith("/adapters")
     expected = {
-        "checkpoint_id": "flash-1/step-20",
+        "model_id": "flash-1/step-20",
         "repo_id": "org/repo",
         "base_model": "Qwen/Qwen3.5-9B",
         "subfolder": "sft/flash-1/checkpoints/step_20/adapter",
@@ -426,7 +426,7 @@ def test_serving_capability_preflight_requires_permanent_identity(monkeypatch) -
             return {"capabilities": []}
 
     monkeypatch.setattr(serving_transport, "serving_request", lambda *a, **k: _Response())
-    with pytest.raises(serving_errors.ServingError, match=PERMANENT_CHECKPOINT_IDENTITY_CAPABILITY):
+    with pytest.raises(serving_errors.ServingError, match=SERVING_CONTRACT_CAPABILITY):
         deploy_mod._require_serving_capabilities()
 
 
@@ -494,8 +494,10 @@ def test_capability_preflight_rejects_legacy_checkpoint_fields(monkeypatch) -> N
 
     class Response:
         def json(self):
-            return {"capabilities": [PERMANENT_CHECKPOINT_IDENTITY_CAPABILITY]}
+            return {
+                "capabilities": ["permanent_checkpoint_identity", "canonical_checkpoint_fields"]
+            }
 
     monkeypatch.setattr(serving_transport, "serving_request", lambda *a, **k: Response())
-    with pytest.raises(serving_errors.ServingError, match="canonical_checkpoint_fields"):
+    with pytest.raises(serving_errors.ServingError, match="serving_contract_v2"):
         deploy_mod._require_serving_capabilities()

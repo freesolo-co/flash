@@ -33,7 +33,7 @@ The grammar is exact. Bare run ids, omitted checkpoints, padded steps, whitespac
 
 ```json
 {
-  "checkpoint_id": "run-abc/step-10",
+  "model_id": "run-abc/step-10",
   "checkpoint": "run-abc/step-10",
   "run_id": "run-abc",
   "checkpoint_step": 10,

@@ -166,7 +166,7 @@ def replace_adapter_cas(
             params={
                 "select": PERSISTED_COLUMNS,
                 "org_id": f"eq.{record.org_id}",
-                "checkpoint_id": f"eq.{record.checkpoint_id}",
+                "checkpoint_id": f"eq.{record.model_id}",
                 "updated_at": f"eq.{expected_updated_at}",
             },
             headers={**supabase_headers(settings, "flash"), "Prefer": "return=representation"},
@@ -189,7 +189,7 @@ def _bind_payload(record: AdapterRecord) -> dict[str, Any]:
     return {
         "p_org_id": record.org_id,
         "p_run_id": record.run_id,
-        "p_checkpoint_id": record.checkpoint_id,
+        "p_checkpoint_id": record.model_id,
         "p_source_repo_type": record.repo_type,
         "p_source_repository": record.repo_id,
         "p_source_revision": record.artifact_revision,

@@ -15,7 +15,7 @@ from tests.serving.test_persistence import _record, _row
 
 def _legacy_row(**overrides):
     binding = immutable_binding_projection(_record())
-    binding["adapter_id"] = binding.pop("checkpoint_id")
+    binding["adapter_id"] = binding.pop("model_id")
     old = hashlib.sha256(
         json.dumps(binding, sort_keys=True, separators=(",", ":")).encode()
     ).hexdigest()
@@ -33,7 +33,7 @@ def test_migration_changes_only_the_fingerprint_encoding() -> None:
     migrated = {**row, "artifact_fingerprint": new}
     assert fingerprint_change(migrated) is None
     assert (
-        PersistedAdapterRecord.model_validate(_row_to_adapter(migrated)).checkpoint_id
+        PersistedAdapterRecord.model_validate(_row_to_adapter(migrated)).model_id
         == row["checkpoint_id"]
     )
 

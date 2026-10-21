@@ -137,7 +137,7 @@ def build_usage_session(
     immutable_target = ImmutableTarget(
         public_model_id=requested.model_id,
         base_model=target.base_model,
-        checkpoint_id=target.checkpoint_id if target.is_checkpoint else None,
+        checkpoint_id=target.model_id if target.is_checkpoint else None,
         artifact_fingerprint=target.artifact_fingerprint,
     )
     price = freesolo_price(target.base_model)

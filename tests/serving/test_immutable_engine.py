@@ -37,9 +37,7 @@ def _revision(sha: str, *, status: str = "ready") -> AdapterRecord:
         "artifact_digest": "b" * 64,
         "lora_rank": 16,
     }
-    values["artifact_fingerprint"] = immutable_binding_fingerprint(
-        {**values, "checkpoint_id": values["model_id"]}
-    )
+    values["artifact_fingerprint"] = immutable_binding_fingerprint(values)
     return AdapterRecord.model_validate(values)
 
 

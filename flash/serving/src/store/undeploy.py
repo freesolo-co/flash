@@ -59,7 +59,7 @@ async def _cas_row_to_disabled(
     expected_generation = candidate.deployment_generation
     for _ in range(_CAS_ATTEMPTS):
         if current.updated_at is None:
-            current = await get_authoritative(candidate.checkpoint_id)
+            current = await get_authoritative(candidate.model_id)
             if current is None or current.updated_at is None:
                 return current, expected_generation
         expected_generation = current.deployment_generation or expected_generation
@@ -69,7 +69,7 @@ async def _cas_row_to_disabled(
         )
         if committed is not None:
             return committed, expected_generation
-        current = await get_authoritative(candidate.checkpoint_id)
+        current = await get_authoritative(candidate.model_id)
         if current is None or (
             current.status == "disabled" and current.deployment_generation is None
         ):
@@ -101,10 +101,10 @@ async def disable_matched(
         if current is not None and (
             current.status == "ready" or current.deployment_generation is not None
         ):
-            stuck_ready.append(candidate.checkpoint_id)
+            stuck_ready.append(candidate.model_id)
             continue
         pending_teardown.append((candidate, current, expected_generation))
-        disabled_checkpoints.append(candidate.checkpoint_id)
+        disabled_checkpoints.append(candidate.model_id)
     return DisableResult(
         disabled_checkpoints=disabled_checkpoints,
         stuck_ready=stuck_ready,
@@ -120,7 +120,7 @@ def apply_teardown(
     cleanup_records: list[tuple[AdapterRecord, str | None]] = []
     for candidate, current, expected_generation in pending_teardown:
         if current is None:
-            router.remove(candidate.checkpoint_id, org_id=candidate.org_id)
+            router.remove(candidate.model_id, org_id=candidate.org_id)
         else:
             router.upsert(current)
         cleanup_records.append((current or candidate, expected_generation))

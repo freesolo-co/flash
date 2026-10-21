@@ -61,7 +61,7 @@ async def _claim_loading_generation(
         return claimed, True
     if stored.org_id is None:
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "checkpoint requires org_id")
-    return (await get_authoritative(stored.org_id, stored.checkpoint_id) or stored), False
+    return (await get_authoritative(stored.org_id, stored.model_id) or stored), False
 
 
 @adapter_router.post("/adapters")
@@ -121,7 +121,7 @@ async def _reconcile_failed_promotion(context: ServingContext, registration: Ada
     """Keep a failed promotion from orphaning its loaded gpu adapter."""
 
     try:
-        current = await get_authoritative(registration.org_id or "", registration.checkpoint_id)
+        current = await get_authoritative(registration.org_id or "", registration.model_id)
         if _is_same_generation_winner(current, registration):
             # another attempt from this shared lifecycle generation won the promotion. adopt its
             # durable row instead of unloading the gpu registration that now legitimately backs it.
@@ -140,16 +140,14 @@ async def _reconcile_failed_promotion(context: ServingContext, registration: Ada
                 expected_updated_at=expected_updated_at,
             )
             if fenced is None:
-                current = await get_authoritative(
-                    registration.org_id or "", registration.checkpoint_id
-                )
+                current = await get_authoritative(registration.org_id or "", registration.model_id)
                 if _is_same_generation_winner(current, registration):
                     context.router.upsert(current, revive=True)
                     return
                 if _is_unfenced_original(current, registration):
                     print(
                         f"adapter registration reconciliation skipped for "
-                        f"{registration.checkpoint_id}: lifecycle generation could not be fenced",
+                        f"{registration.model_id}: lifecycle generation could not be fenced",
                         flush=True,
                     )
                     return
@@ -157,7 +155,7 @@ async def _reconcile_failed_promotion(context: ServingContext, registration: Ada
                 context.router.upsert(fenced, revive=True)
     except HTTPException as exc:
         print(
-            f"adapter registration reconciliation skipped for {registration.checkpoint_id}: {exc!r}",
+            f"adapter registration reconciliation skipped for {registration.model_id}: {exc!r}",
             flush=True,
         )
         return
@@ -165,7 +163,7 @@ async def _reconcile_failed_promotion(context: ServingContext, registration: Ada
     await context.unregister_safe(
         registration.base_model,
         registration.org_id or "",
-        registration.checkpoint_id,
+        registration.model_id,
         registration.deployment_generation,
     )
 
@@ -270,7 +268,7 @@ async def remove_adapter(
                 context.unregister_safe,
                 cleanup_record.base_model,
                 org_id,
-                cleanup_record.checkpoint_id,
+                cleanup_record.model_id,
                 expected_generation,
             )
 

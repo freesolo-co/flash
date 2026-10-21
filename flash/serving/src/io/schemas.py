@@ -140,13 +140,6 @@ class AdapterRecord(BaseModel):
         return not self.serve_base_model and parse_checkpoint_ref(self.model_id) is not None
 
     @property
-    def checkpoint_id(self) -> str:
-        """The canonical identity; catalog base models have no checkpoint."""
-        if not self.is_checkpoint:
-            raise ValueError("base-model records do not have a checkpoint_id")
-        return self.model_id
-
-    @property
     def storage_key(self) -> CheckpointKey:
         return record_key(self)
 
@@ -159,7 +152,7 @@ class ImmutableCheckpointRegistration(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    checkpoint_id: str
+    model_id: str
     repo_id: str
     base_model: str
     subfolder: str | None = None
@@ -177,7 +170,7 @@ class ImmutableCheckpointRegistration(BaseModel):
     artifact_fingerprint: str
     lora_rank: int
 
-    @field_validator("checkpoint_id", "repo_id", "base_model", "org_id", "checkpoint")
+    @field_validator("model_id", "repo_id", "base_model", "org_id", "checkpoint")
     @classmethod
     def require_non_empty(cls, value: str) -> str:
         return _require_non_empty(value)
@@ -195,10 +188,8 @@ class ImmutableCheckpointRegistration(BaseModel):
     @model_validator(mode="after")
     def validate_identity(self) -> ImmutableCheckpointRegistration:
         expected = format_checkpoint_ref(self.run_id, self.checkpoint_step)
-        if self.checkpoint_id != expected or self.checkpoint != expected:
-            raise ValueError(
-                "checkpoint_id and checkpoint must equal the canonical checkpoint identity"
-            )
+        if self.model_id != expected or self.checkpoint != expected:
+            raise ValueError("model_id and checkpoint must equal the canonical checkpoint identity")
         if re.fullmatch(r"[0-9a-f]{40}", self.artifact_revision) is None:
             raise ValueError("artifact_revision must be a canonical 40-character commit sha")
         for name in ("artifact_digest", "artifact_fingerprint"):
@@ -215,13 +206,7 @@ class ImmutableCheckpointRegistration(BaseModel):
         return self
 
     def to_record(self) -> AdapterRecord:
-        return AdapterRecord.model_validate(
-            {
-                **self.model_dump(mode="json", exclude={"checkpoint_id"}),
-                "model_id": self.checkpoint_id,
-                "status": "disabled",
-            }
-        )
+        return AdapterRecord.model_validate({**self.model_dump(mode="json"), "status": "disabled"})
 
 
 class PersistedAdapterRecord(AdapterRecord):

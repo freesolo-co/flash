@@ -325,23 +325,23 @@ activates. Raw `prompt` callers must provide the mode-specific state themselves:
 prompt must already contain a closing `</think>` marker, while a thinking raw prompt must leave an
 open `<think>` block for generation to close.
 
-Checkpoint registration and fingerprint inputs use `checkpoint_id`. Records, raw generation
-requests/responses, and Modal dispatch use `model_id`, because these may also select a catalog
-base model. `adapter_id` is not accepted as an alias. OpenAI requests continue to use `model`.
+Registration, fingerprint inputs, records, raw generation requests/responses, and Modal
+dispatch all use `model_id`. Registration requires an exact checkpoint; inference also permits
+a catalog base model. `adapter_id` is not accepted as an alias. OpenAI requests continue to use `model`.
 Database columns already use `checkpoint_id`.
 
 In hosted serving, `artifact_digest` hashes adapter configuration and repository file metadata;
 it contributes to cache identity, but is not a post-download checksum of the weight bytes.
 `artifact_fingerprint` identifies the immutable binding to an organization, checkpoint, source
 revision, base model and serving configuration, including that digest. Neither hash is an
-authentication credential. The fingerprint now hashes the `checkpoint_id` key, so previously
+authentication credential. The fingerprint now hashes the `model_id` key, so previously
 stored fingerprints require the [offline cutover](../../../docs/checkpoint-field-cutover.md).
 
 `POST /adapters`:
 
 ```json
 {
-  "checkpoint_id": "people-search/step-20",
+  "model_id": "people-search/step-20",
   "repo_id": "Freesolo-Co/people-search-lora",
   "repo_type": "model",
   "base_model": "Qwen/Qwen3.5-9B",

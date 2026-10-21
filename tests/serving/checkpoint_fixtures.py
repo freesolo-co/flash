@@ -56,9 +56,7 @@ def checkpoint_record(
         "lora_rank": lora_rank,
     }
     values.update(overrides)
-    values["artifact_fingerprint"] = immutable_binding_fingerprint(
-        {**values, "checkpoint_id": values["model_id"]}
-    )
+    values["artifact_fingerprint"] = immutable_binding_fingerprint(values)
     return AdapterRecord.model_validate(values)
 
 
@@ -68,6 +66,6 @@ def checkpoint_payload(*args: Any, **kwargs: Any) -> dict[str, Any]:
 
 def checkpoint_registration_payload(*args: Any, **kwargs: Any) -> dict[str, Any]:
     record = checkpoint_record(*args, **kwargs)
-    forwarded = {**internal_adapter_payload(record), "checkpoint_id": record.checkpoint_id}
+    forwarded = internal_adapter_payload(record)
     registration = {name: forwarded[name] for name in ImmutableCheckpointRegistration.model_fields}
     return ImmutableCheckpointRegistration.model_validate(registration).model_dump(mode="json")

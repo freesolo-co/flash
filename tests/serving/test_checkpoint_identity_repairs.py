@@ -43,9 +43,7 @@ def _record(org_id: str, *, digest: str = "b" * 64) -> AdapterRecord:
         "artifact_digest": digest,
         "lora_rank": 16,
     }
-    values["artifact_fingerprint"] = immutable_binding_fingerprint(
-        {**values, "checkpoint_id": values["model_id"]}
-    )
+    values["artifact_fingerprint"] = immutable_binding_fingerprint(values)
     return AdapterRecord.model_validate(values)
 
 
@@ -160,7 +158,7 @@ def test_artifact_digest_and_binding_fingerprint_are_distinct() -> None:
     assert record.artifact_digest != record.artifact_fingerprint
     changed = record.model_copy(update={"base_model": "Qwen/Qwen3.5-4B"})
     assert immutable_binding_fingerprint(changed) != record.artifact_fingerprint
-    payload = {**internal_adapter_payload(record), "checkpoint_id": record.checkpoint_id}
+    payload = internal_adapter_payload(record)
     registration = {
         field.alias or name: payload[field.alias or name]
         for name, field in ImmutableCheckpointRegistration.model_fields.items()
@@ -171,7 +169,7 @@ def test_artifact_digest_and_binding_fingerprint_are_distinct() -> None:
         )
 
 
-@pytest.mark.parametrize("alias", ["adapter_id", "model_id", "checkpoint"])
+@pytest.mark.parametrize("alias", ["adapter_id", "checkpoint_id", "checkpoint"])
 def test_binding_fingerprint_rejects_identity_aliases(alias: str) -> None:
     payload = internal_adapter_payload(_record("org-a"))
     payload[alias] = payload.pop("model_id")
@@ -208,7 +206,7 @@ def test_ambiguous_registration_matches_every_flat_immutable_field() -> None:
         "artifact_fingerprint": record.artifact_fingerprint,
         "lora_rank": record.lora_rank,
     }
-    expected = {**payload, "checkpoint_id": record.checkpoint_id}
+    expected = payload.copy()
     assert matches_revision_identity(payload, expected)
     assert not matches_revision_identity({**payload, "lora_rank": 32}, expected)
 

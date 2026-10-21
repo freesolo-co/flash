@@ -193,7 +193,7 @@ def deploy_adapter(
     )
 
     body = {
-        "checkpoint_id": checkpoint_id,
+        "model_id": checkpoint_id,
         "repo_id": hf_repo,
         "base_model": model,
         "subfolder": subfolder,

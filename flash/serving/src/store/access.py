@@ -57,7 +57,7 @@ async def _insert_or_read(record: AdapterRecord) -> tuple[AdapterRecord, bool]:
                 status.HTTP_422_UNPROCESSABLE_ENTITY,
                 "checkpoint registration requires org_id",
             ) from exc
-        winner = await _get_stored(record.org_id, record.checkpoint_id)
+        winner = await _get_stored(record.org_id, record.model_id)
         if winner is None:
             raise HTTPException(
                 status.HTTP_503_SERVICE_UNAVAILABLE,

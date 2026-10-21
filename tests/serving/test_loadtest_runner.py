@@ -19,7 +19,7 @@ def _health() -> dict:
         "accounting_ok": True,
         "deployment_sha": "94210a3",
         "deployment_id": "deploy-1",
-        "capabilities": ["permanent_checkpoint_identity"],
+        "capabilities": ["serving_contract_v2"],
         "base_models": ["model-a", "model-b", "model-c"],
     }
 

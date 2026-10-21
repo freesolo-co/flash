@@ -17,16 +17,16 @@ ARTIFACT_DIGEST = "b" * 64
 
 def _record(step: int | None = 20, **overrides):
     selector = "final" if step is None else f"step-{step}"
-    checkpoint_id = f"{RUN_ID}/{selector}"
+    model_id = f"{RUN_ID}/{selector}"
     payload = {
-        "checkpoint_id": checkpoint_id,
+        "model_id": model_id,
         "repo_id": "org/run",
         "base_model": "Qwen/Qwen3.5-9B",
         "subfolder": f"checkpoints/{selector}",
         "repo_type": "model",
         "org_id": "org-1",
         "url": "https://huggingface.co/org/run",
-        "checkpoint": checkpoint_id,
+        "checkpoint": model_id,
         "private": True,
         "thinking": False,
         "structured_outputs": None,
@@ -45,7 +45,7 @@ def test_first_registration_inserts_one_exact_checkpoint(monkeypatch) -> None:
     checkpoint = _record()
     inserted = []
 
-    async def get_stored(_org_id: str, _checkpoint_id: str):
+    async def get_stored(_org_id: str, _model_id: str):
         return None
 
     async def insert_or_read(record):
@@ -63,9 +63,7 @@ def test_first_registration_inserts_one_exact_checkpoint(monkeypatch) -> None:
 
 def test_identical_registration_retry_is_idempotent(monkeypatch) -> None:
     checkpoint = _record()
-    monkeypatch.setattr(
-        registration, "_get_stored", lambda _org_id, _checkpoint_id: _async(checkpoint)
-    )
+    monkeypatch.setattr(registration, "_get_stored", lambda _org_id, _model_id: _async(checkpoint))
 
     stored = asyncio.run(registration.persist_checkpoint(_record()))
 
@@ -81,9 +79,7 @@ def test_identical_registration_retry_is_idempotent(monkeypatch) -> None:
 )
 def test_changed_immutable_registration_conflicts(monkeypatch, changed) -> None:
     existing = _record()
-    monkeypatch.setattr(
-        registration, "_get_stored", lambda _org_id, _checkpoint_id: _async(existing)
-    )
+    monkeypatch.setattr(registration, "_get_stored", lambda _org_id, _model_id: _async(existing))
 
     with pytest.raises(HTTPException) as raised:
         asyncio.run(registration.persist_checkpoint(changed))
@@ -93,9 +89,7 @@ def test_changed_immutable_registration_conflicts(monkeypatch, changed) -> None:
 
 def test_equal_checkpoint_string_cannot_cross_org_authorization(monkeypatch) -> None:
     existing = _record(org_id="org-a")
-    monkeypatch.setattr(
-        registration, "_get_stored", lambda _org_id, _checkpoint_id: _async(existing)
-    )
+    monkeypatch.setattr(registration, "_get_stored", lambda _org_id, _model_id: _async(existing))
 
     with pytest.raises(HTTPException) as raised:
         asyncio.run(registration.persist_checkpoint(_record(org_id="org-b")))
@@ -147,8 +141,8 @@ def test_exact_undeploy_preserves_ready_sibling(monkeypatch) -> None:
         rows[record.model_id] = stored
         return stored
 
-    async def authoritative(checkpoint_id: str):
-        return rows.get(checkpoint_id)
+    async def authoritative(model_id: str):
+        return rows.get(model_id)
 
     monkeypatch.setattr(undeploy, "_replace_stored_cas", replace)
     result = asyncio.run(undeploy.disable_matched([target], get_authoritative=authoritative))
@@ -168,7 +162,7 @@ def test_already_disabled_checkpoint_is_an_idempotent_noop(monkeypatch) -> None:
         }
     )
 
-    async def unexpected_authoritative(_checkpoint_id: str):
+    async def unexpected_authoritative(_model_id: str):
         raise AssertionError("settled disabled checkpoint must not be written again")
 
     result = asyncio.run(

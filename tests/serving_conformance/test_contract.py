@@ -43,7 +43,7 @@ def _readback_delay(attempt: int, retry_after: str | None = None) -> float:
 
 
 def _registration(run_id: str, source: dict, *, step: int | None = 10) -> dict:
-    checkpoint_id = format_checkpoint_ref(run_id, step)
+    model_id = format_checkpoint_ref(run_id, step)
     metadata = adapter_artifact_metadata(
         source["repo_id"],
         source["subfolder"],
@@ -51,12 +51,12 @@ def _registration(run_id: str, source: dict, *, step: int | None = 10) -> dict:
         expected_base_model=source["base_model"],
     )
     body = {
-        "checkpoint_id": checkpoint_id,
+        "model_id": model_id,
         "repo_id": source["repo_id"],
         "base_model": source["base_model"],
         "subfolder": source["subfolder"],
         "repo_type": source["repo_type"],
-        "checkpoint": checkpoint_id,
+        "checkpoint": model_id,
         "org_id": CONFORMANCE_ORG_ID,
         "run_id": run_id,
         "checkpoint_step": step,
@@ -75,17 +75,17 @@ def _register(http, body: dict):
     return response
 
 
-def _wait_ready(http, checkpoint_id: str, timeout: float, expected: dict | None = None) -> dict:
+def _wait_ready(http, model_id: str, timeout: float, expected: dict | None = None) -> dict:
     deadline = time.monotonic() + timeout
     attempt = 0
     last = "registered"
     while time.monotonic() < deadline:
         remaining = deadline - time.monotonic()
-        response = http.get(f"/adapters/{checkpoint_id}", timeout=min(60.0, remaining))
+        response = http.get(f"/adapters/{model_id}", timeout=min(60.0, remaining))
         if response.status_code == 200:
             record = _record(response.json())
             if expected is not None:
-                assert record["model_id"] == expected["checkpoint_id"]
+                assert record["model_id"] == expected["model_id"]
                 for field in (
                     "repo_id",
                     "repo_type",
@@ -97,7 +97,7 @@ def _wait_ready(http, checkpoint_id: str, timeout: float, expected: dict | None 
                     assert record.get(field) == expected.get(field)
             last = _lifecycle_state(record)
             if last == "failed" or record.get("status") == "disabled":
-                pytest.fail(f"checkpoint {checkpoint_id} reported {last}")
+                pytest.fail(f"checkpoint {model_id} reported {last}")
             if last == "ready":
                 return record
         elif response.status_code < 500 and response.status_code != 404:
@@ -107,7 +107,7 @@ def _wait_ready(http, checkpoint_id: str, timeout: float, expected: dict | None 
         delay = _readback_delay(attempt, response.headers.get("Retry-After"))
         attempt += 1
         time.sleep(min(delay, max(0.0, deadline - time.monotonic())))
-    pytest.fail(f"checkpoint {checkpoint_id} never reached ready within {timeout}s, last={last!r}")
+    pytest.fail(f"checkpoint {model_id} never reached ready within {timeout}s, last={last!r}")
 
 
 @pytest.fixture
@@ -115,14 +115,14 @@ def deployed(http, adapter_source, run_id, ready_timeout):
     body = _registration(run_id, adapter_source)
     try:
         _register(http, body)
-        _wait_ready(http, body["checkpoint_id"], ready_timeout, expected=body)
+        _wait_ready(http, body["model_id"], ready_timeout, expected=body)
         yield body
     finally:
         with contextlib.suppress(Exception):
-            http.delete(f"/adapters/{body['checkpoint_id']}")
+            http.delete(f"/adapters/{body['model_id']}")
 
 
-def test_healthz_advertises_permanent_checkpoint_identity(http) -> None:
+def test_healthz_advertises_permanent_model_identity(http) -> None:
     response = http.get("/healthz")
     assert response.status_code == 200
     capabilities = response.json().get("capabilities")
@@ -130,9 +130,9 @@ def test_healthz_advertises_permanent_checkpoint_identity(http) -> None:
     assert set(capabilities) >= REQUIRED_SERVING_CAPABILITIES
 
 
-def test_readback_echoes_the_exact_checkpoint_identity(http, deployed) -> None:
-    record = _record(http.get(f"/adapters/{deployed['checkpoint_id']}").json())
-    assert record["model_id"] == deployed["checkpoint_id"]
+def test_readback_echoes_the_exact_model_identity(http, deployed) -> None:
+    record = _record(http.get(f"/adapters/{deployed['model_id']}").json())
+    assert record["model_id"] == deployed["model_id"]
     assert record["checkpoint"] == deployed["checkpoint"]
     assert record["model_id"] == record["checkpoint"]
     serialized = json.dumps(record)
@@ -142,8 +142,8 @@ def test_readback_echoes_the_exact_checkpoint_identity(http, deployed) -> None:
 
 def test_identical_reregistration_is_idempotent(http, deployed) -> None:
     _register(http, deployed)
-    record = _record(http.get(f"/adapters/{deployed['checkpoint_id']}").json())
-    assert record["model_id"] == deployed["checkpoint_id"]
+    record = _record(http.get(f"/adapters/{deployed['model_id']}").json())
+    assert record["model_id"] == deployed["model_id"]
 
 
 def test_changed_immutable_binding_conflicts(http, deployed) -> None:
@@ -171,11 +171,11 @@ def test_bare_and_composite_model_identities_are_rejected(http, deployed) -> Non
 def test_exact_checkpoint_chat_returns_checkpoint_only_provenance(
     http, deployed, chat_timeout
 ) -> None:
-    checkpoint_id = deployed["checkpoint_id"]
+    model_id = deployed["model_id"]
     response = http.post(
         "/v1/chat/completions",
         json={
-            "model": checkpoint_id,
+            "model": model_id,
             "messages": [{"role": "user", "content": "Say hello."}],
             "max_tokens": 16,
             "temperature": 0.0,
@@ -185,8 +185,8 @@ def test_exact_checkpoint_chat_returns_checkpoint_only_provenance(
     )
     assert response.status_code == 200, response.text[:400]
     payload = response.json()
-    assert payload.get("freesolo") == {"checkpoint_id": checkpoint_id}
-    assert response.headers.get("X-Freesolo-Checkpoint") == checkpoint_id
+    assert payload.get("freesolo") == {"model_id": model_id}
+    assert response.headers.get("X-Freesolo-Checkpoint") == model_id
     serialized = json.dumps(payload)
     assert "adapter_revision" not in serialized
     assert "hf_revision" not in serialized
@@ -200,24 +200,24 @@ def test_sibling_undeploy_preserves_the_other_checkpoint(
     try:
         for body in (first, second):
             _register(http, body)
-            _wait_ready(http, body["checkpoint_id"], ready_timeout, expected=body)
-        response = http.delete(f"/adapters/{first['checkpoint_id']}")
+            _wait_ready(http, body["model_id"], ready_timeout, expected=body)
+        response = http.delete(f"/adapters/{first['model_id']}")
         assert response.status_code == 200
         payload = response.json()
-        assert payload.get("checkpoint_id") == first["checkpoint_id"]
-        assert payload.get("disabled_checkpoints") == [first["checkpoint_id"]]
-        sibling = _record(http.get(f"/adapters/{second['checkpoint_id']}").json())
+        assert payload.get("checkpoint_id") == first["model_id"]
+        assert payload.get("disabled_checkpoints") == [first["model_id"]]
+        sibling = _record(http.get(f"/adapters/{second['model_id']}").json())
         assert sibling.get("status") == "ready"
         assert _lifecycle_state(sibling) == "ready"
     finally:
         for body in (first, second):
             with contextlib.suppress(Exception):
-                http.delete(f"/adapters/{body['checkpoint_id']}")
+                http.delete(f"/adapters/{body['model_id']}")
 
 
 def test_streaming_uses_the_exact_checkpoint(http, deployed, chat_timeout) -> None:
     body = {
-        "model": deployed["checkpoint_id"],
+        "model": deployed["model_id"],
         "messages": [{"role": "user", "content": "Say hello."}],
         "max_tokens": 16,
         "temperature": 0.0,
@@ -228,7 +228,7 @@ def test_streaming_uses_the_exact_checkpoint(http, deployed, chat_timeout) -> No
     saw_done = False
     with http.stream("POST", "/v1/chat/completions", json=body, timeout=chat_timeout) as response:
         assert response.status_code == 200
-        assert response.headers.get("X-Freesolo-Checkpoint") == deployed["checkpoint_id"]
+        assert response.headers.get("X-Freesolo-Checkpoint") == deployed["model_id"]
         for line in response.iter_lines():
             if not line.startswith("data:"):
                 continue
@@ -251,13 +251,13 @@ def test_a_wrong_serving_key_is_rejected(
     body = _registration(_UNAUTHORIZED_RUN_ID, adapter_source, step=None)
     probes = (
         ("POST", "/adapters", body),
-        ("GET", f"/adapters/{body['checkpoint_id']}", None),
+        ("GET", f"/adapters/{body['model_id']}", None),
         (
             "POST",
             "/v1/chat/completions",
-            {"model": body["checkpoint_id"], "messages": [{"role": "user", "content": "hi"}]},
+            {"model": body["model_id"], "messages": [{"role": "user", "content": "hi"}]},
         ),
-        ("DELETE", f"/adapters/{body['checkpoint_id']}", None),
+        ("DELETE", f"/adapters/{body['model_id']}", None),
     )
     unprotected: list[str] = []
     with serving_client_factory() as client:

@@ -27,7 +27,9 @@ def checkpoint_key(org_id: str, checkpoint_id: str) -> CheckpointKey:
 def record_key(record: Any) -> CheckpointKey:
     """return the internal key for one checkpoint record."""
 
-    return checkpoint_key(record.org_id, record.checkpoint_id)
+    if not record.is_checkpoint:
+        raise ValueError("base-model records do not have a checkpoint binding")
+    return checkpoint_key(record.org_id, record.model_id)
 
 
 def engine_adapter_name(org_id: str, checkpoint_id: str) -> str:
@@ -43,7 +45,7 @@ _BINDING_FIELDS = (
     "org_id",
     "run_id",
     "checkpoint_step",
-    "checkpoint_id",
+    "model_id",
     "repo_id",
     "repo_type",
     "artifact_revision",
@@ -67,14 +69,14 @@ def immutable_binding_projection(value: Mapping[str, Any] | Any) -> dict[str, An
     org_id = get("org_id")
     run_id = get("run_id")
     step = get("checkpoint_step")
-    checkpoint_id = get("checkpoint_id")
+    model_id = get("model_id")
     if not isinstance(org_id, str) or not org_id.strip():
         raise ValueError("checkpoint binding requires org_id")
     if not isinstance(run_id, str):
         raise ValueError("checkpoint binding requires run_id")
     if isinstance(step, bool) or (step is not None and not isinstance(step, int)):
         raise ValueError("checkpoint binding has invalid checkpoint_step")
-    if checkpoint_id != format_checkpoint_ref(run_id, step):
+    if model_id != format_checkpoint_ref(run_id, step):
         raise ValueError("checkpoint binding has inconsistent permanent identity")
     projection = {field: get(field) for field in _BINDING_FIELDS}
     projection["repo_type"] = projection["repo_type"] or "model"

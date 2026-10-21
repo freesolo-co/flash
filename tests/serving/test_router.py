@@ -209,8 +209,7 @@ def test_healthz_reports_one_gpu_per_base_model(app_setup):
     body = client.get("/healthz").json()
     assert body["ok"] is True
     assert body["capabilities"] == [
-        "canonical_checkpoint_fields",
-        "permanent_checkpoint_identity",
+        "serving_contract_v2",
         "thinking_structured_outputs_deferred_v1",
     ]
     assert body["base_models"] == [QWEN, QWEN_35B]  # sorted by model id

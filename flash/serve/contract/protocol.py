@@ -5,8 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Literal
 
-PERMANENT_CHECKPOINT_IDENTITY_CAPABILITY = "permanent_checkpoint_identity"
-CANONICAL_CHECKPOINT_FIELDS_CAPABILITY = "canonical_checkpoint_fields"
+SERVING_CONTRACT_CAPABILITY = "serving_contract_v2"
 THINKING_STRUCTURED_OUTPUTS_CAPABILITY = "thinking_structured_outputs_deferred_v1"
 # the serving backend echoes back WHICH LoRA answered a request. like revision provenance
 # this is produced by the serving image, not by the run, so a client cannot make it appear
@@ -20,9 +19,7 @@ MAX_CHAT_REQUEST_BYTES = 24 * 1024 * 1024
 TEXT_TYPES = frozenset({"text", "input_text"})
 IMAGE_TYPES = frozenset({"image_url", "input_image", "image"})
 
-REQUIRED_SERVING_CAPABILITIES = frozenset(
-    {PERMANENT_CHECKPOINT_IDENTITY_CAPABILITY, CANONICAL_CHECKPOINT_FIELDS_CAPABILITY}
-)
+REQUIRED_SERVING_CAPABILITIES = frozenset({SERVING_CONTRACT_CAPABILITY})
 PREFERRED_SERVING_CAPABILITIES: frozenset[str] = frozenset()
 
 

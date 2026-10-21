@@ -56,9 +56,7 @@ def _record_values(**overrides: object) -> dict[str, object]:
         "updated_at": "2026-07-14T00:00:01+00:00",
     }
     values.update(overrides)
-    values["artifact_fingerprint"] = immutable_binding_fingerprint(
-        {**values, "checkpoint_id": values["model_id"]}
-    )
+    values["artifact_fingerprint"] = immutable_binding_fingerprint(values)
     return values
 
 

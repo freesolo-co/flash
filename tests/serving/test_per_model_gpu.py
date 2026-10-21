@@ -346,9 +346,7 @@ def test_cold_engine_resolves_forwarded_adapter_record(modal_app_module, tmp_pat
         "artifact_digest": "b" * 64,
         "lora_rank": 32,
     }
-    record_values["artifact_fingerprint"] = immutable_binding_fingerprint(
-        {**record_values, "checkpoint_id": record_values["model_id"]}
-    )
+    record_values["artifact_fingerprint"] = immutable_binding_fingerprint(record_values)
     record_dict = internal_adapter_payload(AdapterRecord.model_validate(record_values))
     engine = object.__new__(modal_app_module._LoraEngineImpl)
     engine.base_model = record_dict["base_model"]
@@ -689,9 +687,7 @@ def test_scale_to_zero_pool_dispatches_inference_and_registration(modal_app_modu
         "artifact_digest": "b" * 64,
         "lora_rank": 32,
     }
-    record_values["artifact_fingerprint"] = immutable_binding_fingerprint(
-        {**record_values, "checkpoint_id": record_values["model_id"]}
-    )
+    record_values["artifact_fingerprint"] = immutable_binding_fingerprint(record_values)
     record = AdapterRecord.model_validate(record_values)
 
     result = asyncio.run(
