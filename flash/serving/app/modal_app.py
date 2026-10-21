@@ -8,15 +8,19 @@ import asyncio
 import os
 import uuid
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import modal
 
+from flash.schema import parse_checkpoint_ref
 from flash.serving.app.timeouts import (
     REQUEST_TIMEOUT_SECONDS,
     ROUTER_TIMEOUT_SECONDS,
     STARTUP_TIMEOUT_SECONDS,
 )
+
+if TYPE_CHECKING:
+    from flash.serving.src.accounting.usage import AuthorizedTraffic
 
 try:
     from dotenv import load_dotenv
@@ -556,32 +560,30 @@ _AUTH_CACHE_TTL_SECONDS = 60.0
 _AUTH_CACHE_MAX_ENTRIES = 4096
 
 
-def _authorize_response_org(resp: Any) -> "str | None":
-    """Translate the backend's authorize response into a billing org, or raise.
-
-    Extracted from _build_chat_authorizer only to keep that closure under the repo's
-    function-size limit; it reads nothing but the response, so hoisting it changes no
-    behaviour and makes each status mapping testable on its own.
-    """
+def _authorize_response(resp: Any, model_id: str) -> "AuthorizedTraffic":
+    """Return the approved billing org and checkpoint generation, or fail closed."""
     from fastapi import HTTPException, status
 
+    from flash.serving.src.accounting.usage import AuthorizedTraffic, principal_for_external_org
+
     if resp.status_code == 200:
-        # Return the authorized billing org so the router can meter a base-model serve to the
-        # caller (a base model has no adapter owner). A malformed response cannot authorize an
-        # external request because that would let base-model usage escape billing.
+        # Bind billing and checkpoint dispatch to the same backend authorization.
         try:
-            org_id = resp.json().get("orgId")
+            body = resp.json()
+            org_id = body.get("orgId")
+            if not isinstance(org_id, str) or not org_id.strip():
+                raise ValueError("missing billing organization")
+            generation = body.get("deploymentGeneration")
+            if parse_checkpoint_ref(model_id) is not None and (
+                not isinstance(generation, str) or not generation.strip()
+            ):
+                raise ValueError("missing verified checkpoint generation")
         except Exception as exc:
             raise HTTPException(
                 status.HTTP_503_SERVICE_UNAVAILABLE,
                 "serving auth backend returned malformed response",
             ) from exc
-        if not isinstance(org_id, str) or not org_id:
-            raise HTTPException(
-                status.HTTP_503_SERVICE_UNAVAILABLE,
-                "serving auth backend returned malformed response",
-            )
-        return org_id
+        return AuthorizedTraffic(principal_for_external_org(org_id), generation)
     if resp.status_code == 401:
         # The backend returns 401 for BOTH an invalid *user* key (our authorize route, body
         # code "invalid_api_key") AND a rejected serving *machine* bearer (require_internal_token,
@@ -627,7 +629,7 @@ def _build_chat_authorizer(settings: Any) -> Any:
     real deployment (backend URL + internal key) — when it returns None, non-internal chat fails
     closed (503).
 
-    Successful authorizations are cached per API-key digest and adapter ID for
+    Successful base-model authorizations are cached per API-key digest and model ID for
     ``_AUTH_CACHE_TTL_SECONDS`` and concurrent identical lookups are coalesced into a single backend
     call, so an eval's many same-key requests don't stampede the backend auth path into transient
     5xx failures. Any backend 5xx maps to a retryable 503 (never a 502) so it isn't read as a
@@ -647,15 +649,15 @@ def _build_chat_authorizer(settings: Any) -> Any:
 
     _client = httpx.AsyncClient(timeout=10.0, headers={"Authorization": f"Bearer {key}"})
 
-    # (api_key_sha256, model_id) -> (expires_at_monotonic, org_id); populated only on a successful
-    # authorization. Per-router-container in-memory (each container reduces its own backend load).
-    _cache: dict[tuple[str, str, str], tuple[float, str | None]] = {}
+    # (api_key_sha256, model_id, scope_digest) -> (expires_at_monotonic, authorization).
+    # Only successful authorizations are cached, per router container.
+    _cache: dict[tuple[str, str, str], tuple[float, AuthorizedTraffic]] = {}
     # In-flight single-flight tasks so concurrent identical misses share ONE backend call.
-    _inflight: dict[tuple[str, str, str], asyncio.Task[str | None]] = {}
+    _inflight: dict[tuple[str, str, str], asyncio.Task[AuthorizedTraffic]] = {}
 
     async def _authorize_backend(
         api_key: str, model_id: str, scope: "dict[str, str]"
-    ) -> "str | None":
+    ) -> "AuthorizedTraffic":
         try:
             resp = await _client.post(
                 url,
@@ -672,7 +674,7 @@ def _build_chat_authorizer(settings: Any) -> Any:
             raise HTTPException(
                 status.HTTP_503_SERVICE_UNAVAILABLE, "serving auth backend unreachable"
             ) from exc
-        return _authorize_response_org(resp)
+        return _authorize_response(resp, model_id)
 
     def _prune(now: float) -> None:
         for expired in [k for k, (exp, _) in _cache.items() if exp <= now]:
@@ -684,24 +686,29 @@ def _build_chat_authorizer(settings: Any) -> Any:
 
     async def _authorize_and_cache(
         ck: tuple[str, str, str], api_key: str, model_id: str, scope: "dict[str, str]"
-    ) -> "str | None":
+    ) -> "AuthorizedTraffic":
         try:
-            org = await _authorize_backend(api_key, model_id, scope)
+            authorization = await _authorize_backend(api_key, model_id, scope)
         finally:
             # Drop the single-flight slot regardless of outcome so a failed lookup re-checks next
             # time (failures are never cached) and a success can be re-driven once the cache expires.
             _inflight.pop(ck, None)
         now = time.monotonic()
         # Cache the ALLOW only — reached iff _authorize_backend did not raise above.
-        _cache[ck] = (now + _AUTH_CACHE_TTL_SECONDS, org)
+        _cache[ck] = (now + _AUTH_CACHE_TTL_SECONDS, authorization)
         _prune(now)
-        return org
+        return authorization
 
     async def authorize(
         api_key: str, model_id: str, scope: "dict[str, str] | None" = None
-    ) -> "str | None":
+    ) -> "AuthorizedTraffic":
         # do not retain raw user credentials as live dict keys beyond the request that supplied them.
         scope = scope or {}
+
+        # A checkpoint can be disabled and reloaded within the positive-auth TTL.
+        # Always recheck its verified generation; base-model authorization remains cached.
+        if parse_checkpoint_ref(model_id) is not None:
+            return await _authorize_backend(api_key, model_id, scope)
         # The scope is part of the key, not just the payload. Every training container presents
         # the SAME platform internal key, so keying on (key, model) alone would let one job's
         # cached authorization answer another job's request -- and the cached value is the

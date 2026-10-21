@@ -1080,7 +1080,12 @@ def test_standalone_serving_scope_is_stable_across_deploy_chat_and_undeploy(monk
         platform_context=None,
         deployments=records(
             "run-standalone",
-            {"state": "ready", "checkpoint_id": "run-standalone/final", "verified_at": 1.0},
+            {
+                "state": "ready",
+                "checkpoint_id": "run-standalone/final",
+                "verified_at": 1.0,
+                "deployment_generation": "generation-a",
+            },
         ),
     )
     assert auth.serving_org_id(None) == auth.STANDALONE_SERVING_ORG_ID
@@ -1099,7 +1104,11 @@ def test_standalone_serving_scope_is_stable_across_deploy_chat_and_undeploy(monk
         ),
     )
     monkeypatch.setattr(serving_deploy, "_require_serving_capabilities", lambda **_kwargs: set())
-    monkeypatch.setattr(serving_deploy, "_wait_checkpoint_ready", lambda *_args, **_kwargs: {})
+    monkeypatch.setattr(
+        serving_deploy,
+        "_wait_checkpoint_ready",
+        lambda *_args, **_kwargs: {"deployment_generation": "generation-a"},
+    )
     monkeypatch.setattr(
         serving_deploy.transport,
         "serving_request",

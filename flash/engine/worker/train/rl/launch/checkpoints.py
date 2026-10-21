@@ -249,6 +249,7 @@ class _VerlResumeUploader:
         *,
         resume_step: int,
         required_steps: tuple[int, ...] = (),
+        final_step: int | None = None,
         metric_evidence,
         export_root: str = "",
         python_bin: str = "",
@@ -261,6 +262,7 @@ class _VerlResumeUploader:
         self.resume_step = int(resume_step)
         self.metric_evidence = metric_evidence
         self.required_steps = frozenset(required_steps)
+        self.final_step = final_step
         self.lifecycle = CheckpointLedger()
         self.lifecycle.seed_resumed_step(resume_step, self.required_steps)
         self._resume_attempted: set[int] = {resume_step} if resume_step else set()
@@ -514,6 +516,7 @@ class _VerlResumeUploader:
                             _worker_hf.upload_resume_checkpoint(
                                 step,
                                 path,
+                                final_step=self.final_step,
                                 after_upload=lambda step=step: self.lifecycle.mark_resume_uploaded(
                                     step
                                 ),

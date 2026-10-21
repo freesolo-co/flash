@@ -41,6 +41,7 @@ def is_ready(run_id: str, record: dict) -> bool:
     checkpoint_id = record.get("checkpoint_id")
     parsed = parse_checkpoint_ref(checkpoint_id) if isinstance(checkpoint_id, str) else None
     verified_at = record.get("verified_at")
+    serving_generation = record.get("deployment_generation")
     return bool(
         parsed is not None
         and parsed[0] == run_id
@@ -51,6 +52,8 @@ def is_ready(run_id: str, record: dict) -> bool:
         and not isinstance(verified_at, bool)
         and math.isfinite(verified_at)
         and verified_at > 0
+        and isinstance(serving_generation, str)
+        and bool(serving_generation.strip())
     )
 
 

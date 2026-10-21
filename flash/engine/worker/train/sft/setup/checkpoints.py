@@ -106,6 +106,7 @@ class _VerlCheckpointWatcher:
         model_id: str,
         model_revision: str,
         required_steps: tuple[int, ...],
+        final_step: int | None = None,
         exclude_modules: str | None = None,
         preprocessor=None,
     ) -> None:
@@ -121,6 +122,7 @@ class _VerlCheckpointWatcher:
         self.exclude_modules = exclude_modules
         self.preprocessor = preprocessor
         self.required_steps = frozenset(required_steps)
+        self.final_step = final_step
         self.lifecycle = CheckpointLedger()
         self._error: BaseException | None = None
         self._stop = threading.Event()
@@ -294,6 +296,7 @@ class _VerlCheckpointWatcher:
             uploaded = _worker_hf.upload_resume_checkpoint(
                 step,
                 checkpoint_dir,
+                final_step=self.final_step,
                 before_upload=publish_adapter,
                 # the callback, not the return value: see mark_resume_uploaded's contract.
                 after_upload=lambda: self.lifecycle.mark_resume_uploaded(step),

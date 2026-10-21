@@ -38,6 +38,7 @@ def _run_record(spec: dict) -> dict:
                 "checkpoint_step": 3,
                 "state": "ready",
                 "verified_at": 1.0,
+                "deployment_generation": "generation-a",
             }
         },
         "spec": spec,
@@ -575,6 +576,7 @@ def test_env_eval_no_upload_still_requires_a_published_environment(monkeypatch, 
                         "checkpoint_step": 3,
                         "state": "ready",
                         "verified_at": 1.0,
+                        "deployment_generation": "generation-a",
                     }
                 },
                 "spec": {"thinking": False, "project": _PROJECT_ID},
@@ -722,6 +724,7 @@ def test_env_eval_refuses_to_record_a_run_whose_project_is_unknown(
                         "checkpoint_step": 3,
                         "state": "ready",
                         "verified_at": 1.0,
+                        "deployment_generation": "generation-a",
                     }
                 },
                 "spec": {"thinking": False, "environment": {"id": _PUBLISHED_SLUG}},
@@ -1031,6 +1034,7 @@ def test_env_eval_refuses_a_run_that_names_no_published_environment(monkeypatch,
                         "checkpoint_step": 3,
                         "state": "ready",
                         "verified_at": 1.0,
+                        "deployment_generation": "generation-a",
                     }
                 },
                 "spec": {"thinking": False, "project": _PROJECT_ID},
@@ -2700,6 +2704,7 @@ def test_env_eval_sends_the_prompt_images_training_builds(monkeypatch, tmp_path)
                         "checkpoint_step": 3,
                         "state": "ready",
                         "verified_at": 1.0,
+                        "deployment_generation": "generation-a",
                     }
                 },
                 "spec": {"environment": {"id": _PUBLISHED_SLUG}},

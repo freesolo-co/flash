@@ -46,6 +46,7 @@ def _record() -> AdapterRecord:
             "artifact_digest": hashlib.sha256(b"run-a-artifact").hexdigest(),
             "artifact_fingerprint": hashlib.sha256(b"run-a-binding").hexdigest(),
             "lora_rank": 16,
+            "deployment_generation": "generation-a",
         }
     )
 
@@ -109,7 +110,7 @@ def test_non_streaming_disconnect_cancels_generation(monkeypatch, route: str) ->
             lookup = Lookup()
 
             async def authorize_inference(self, *_args):
-                return AuthorizedTraffic(principal=principal_for_external_org("org-1"))
+                return AuthorizedTraffic(principal_for_external_org("org-1"), "generation-a")
 
             def reject_unsettleable_thinking(self, *_args) -> None:
                 return None
@@ -183,7 +184,7 @@ def test_non_streaming_disconnect_after_engine_completion_finishes_finalization_
 
         class Context(ServingContext):
             async def authorize_inference(self, *_args):
-                return AuthorizedTraffic(principal=principal_for_external_org("org-1"))
+                return AuthorizedTraffic(principal_for_external_org("org-1"), "generation-a")
 
         context = Context(
             object(),  # type: ignore[arg-type]
@@ -296,7 +297,7 @@ def _identity() -> RequestIdentity:
 
 
 def _traffic() -> AuthorizedTraffic:
-    return AuthorizedTraffic(principal=principal_for_external_org("org-1"))
+    return AuthorizedTraffic(principal_for_external_org("org-1"), "generation-a")
 
 
 def test_disconnect_before_first_event_closes_engine_without_starting_response_body() -> None:

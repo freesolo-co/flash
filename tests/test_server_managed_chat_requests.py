@@ -46,6 +46,7 @@ def _ready_deployment() -> dict:
         "checkpoint_id": CHECKPOINT_ID,
         "checkpoint_step": None,
         "verified_at": 1.0,
+        "deployment_generation": "generation-a",
         "openai_model": CHECKPOINT_ID,
     }
 
@@ -256,3 +257,30 @@ def test_managed_provenance_contains_only_checkpoint_identity() -> None:
     assert response["freesolo"] == {"checkpoint_id": CHECKPOINT_ID}
     assert "artifact_revision" not in str(response)
     assert "hf_revision" not in str(response)
+
+
+@pytest.mark.parametrize("serving_generation", [None, "", "   ", 7])
+def test_managed_chat_rejects_legacy_readiness_before_internal_forwarding(
+    api, monkeypatch, serving_generation
+):
+    from flash.runner.lifecycle import state, status
+
+    key, run_id = _deployed_chat_run(api)
+    checkpoint_id = f"{run_id}/final"
+    current = status.get_status(run_id)
+    current.deployments[checkpoint_id].pop("deployment_generation")
+    if serving_generation is not None:
+        current.deployments[checkpoint_id]["deployment_generation"] = serving_generation
+    state._save_status(current)
+    monkeypatch.setattr(
+        serving_deploy,
+        "chat",
+        lambda **kwargs: pytest.fail("legacy readiness must not reach trusted internal forwarding"),
+    )
+    response = api.post(
+        f"/v1/runs/{run_id}/chat",
+        json={"checkpoint_id": checkpoint_id, "messages": [{"role": "user", "content": "hi"}]},
+        headers=_bearer(key),
+    )
+    assert response.status_code == 409, response.text
+    assert "has not passed" in response.json()["detail"]

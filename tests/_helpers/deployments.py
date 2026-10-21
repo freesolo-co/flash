@@ -36,7 +36,12 @@ def seed_ready_checkpoint(run_id, checkpoint_id):
         checkpoint_id,
         {"checkpoint_id": checkpoint_id, "checkpoint_step": parse_checkpoint_ref(checkpoint_id)[1]},
     )
-    current.deployments[checkpoint_id] = {**record, "state": "ready", "verified_at": 1.0}
+    current.deployments[checkpoint_id] = {
+        **record,
+        "state": "ready",
+        "verified_at": 1.0,
+        "deployment_generation": "generation-a",
+    }
     state._save_status(current)
     return True
 
@@ -50,6 +55,7 @@ def complete_deployment(run_id, record, expect_state=None):
     record = {
         **record,
         "generation": generation(current) + 1,
+        "deployment_generation": record.get("deployment_generation", "generation-a"),
         "requested_at": record.get("requested_at", 1.0),
     }
     transitions.mark_deployment_pending(run_id, {**record, "state": "queued"}, expect_state)

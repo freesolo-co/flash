@@ -146,7 +146,9 @@ class _FakeClient:
             }
         ]
 
-    def deployment_for(self, run_id: str, timeout: float | None = None) -> dict | None:
+    def deployment_for(
+        self, run_id: str, timeout: float | None = None, *, body_deadline=None
+    ) -> dict | None:
         self.calls.append(("deployment_for", run_id))
         for entry in self.deployments():
             deployment = entry.get("deployment") or {}
@@ -3814,7 +3816,10 @@ def test_deploy_wait_polls_until_the_revision_is_servable(fake_client, monkeypat
     _queued_deploy(monkeypatch, fake_client)
     states = iter([{"state": "smoke_testing"}, {"state": "reconciling"}, {"state": "ready"}])
     monkeypatch.setattr(
-        fake_client, "deployment_for", lambda run_id, timeout=None: next(states), raising=False
+        fake_client,
+        "deployment_for",
+        lambda run_id, timeout=None, body_deadline=None: next(states),
+        raising=False,
     )
 
     assert _run(["models", "deploy", "flash-1/final", "--wait"]) == 0
@@ -3829,7 +3834,10 @@ def test_deploy_wait_stops_on_a_failed_revision(fake_client, monkeypatch, capsys
     monkeypatch.setattr(
         fake_client,
         "deployment_for",
-        lambda run_id, timeout=None: {"state": "failed", "error": "smoke generation failed"},
+        lambda run_id, timeout=None, body_deadline=None: {
+            "state": "failed",
+            "error": "smoke generation failed",
+        },
         raising=False,
     )
 
@@ -3844,7 +3852,7 @@ def test_deploy_wait_gives_up_at_the_timeout_without_claiming_success(
     monkeypatch.setattr(
         fake_client,
         "deployment_for",
-        lambda run_id, timeout=None: {"state": "smoke_testing"},
+        lambda run_id, timeout=None, body_deadline=None: {"state": "smoke_testing"},
         raising=False,
     )
 
@@ -3863,7 +3871,10 @@ def test_deploy_wait_ends_when_the_deployment_stops_being_listed(
     """A run drops out of the listing once its deployment is gone, so that is terminal."""
     _queued_deploy(monkeypatch, fake_client)
     monkeypatch.setattr(
-        fake_client, "deployment_for", lambda run_id, timeout=None: None, raising=False
+        fake_client,
+        "deployment_for",
+        lambda run_id, timeout=None, body_deadline=None: None,
+        raising=False,
     )
 
     # the last record seen was still queued, so the requested revision never became servable.
@@ -3899,7 +3910,7 @@ def test_missing_checkpoint_does_not_spend_more_time_listing_siblings(
     clock = {"t": 0.0}
     monkeypatch.setattr(run_commands.time, "monotonic", lambda: clock["t"])
 
-    def poll(_target, timeout=None):
+    def poll(_target, timeout=None, *, body_deadline=None):
         assert timeout <= 5.0
         clock["t"] = elapsed
         return
@@ -3937,7 +3948,10 @@ def test_deploy_wait_still_reports_a_vanished_deployment_as_vanished(
     """
     _queued_deploy(monkeypatch, fake_client)
     monkeypatch.setattr(
-        fake_client, "deployment_for", lambda run_id, timeout=None: None, raising=False
+        fake_client,
+        "deployment_for",
+        lambda run_id, timeout=None, body_deadline=None: None,
+        raising=False,
     )
     monkeypatch.setattr(fake_client, "deployments", lambda timeout=None: rows, raising=False)
 
@@ -3952,7 +3966,7 @@ def test_deploy_wait_survives_a_transient_control_plane_error(
     _queued_deploy(monkeypatch, fake_client)
     results = iter([deploy_commands.ClientError("503"), {"state": "ready"}])
 
-    def _next(run_id, timeout=None):
+    def _next(run_id, timeout=None, *, body_deadline=None):
         value = next(results)
         if isinstance(value, Exception):
             raise value
@@ -3977,7 +3991,7 @@ def test_deploy_wait_zero_polls_once_instead_of_being_treated_as_no_wait(
     monkeypatch.setattr(
         fake_client,
         "deployment_for",
-        lambda run_id, timeout=None: {"state": "smoke_testing"},
+        lambda run_id, timeout=None, body_deadline=None: {"state": "smoke_testing"},
         raising=False,
     )
 
@@ -4022,7 +4036,7 @@ def test_deploy_wait_accepts_a_ready_revision_carrying_a_stale_error(
     monkeypatch.setattr(
         fake_client,
         "deployment_for",
-        lambda run_id, timeout=None: {
+        lambda run_id, timeout=None, body_deadline=None: {
             "state": "ready",
             "requested_at": "2026-07-29T02:00:00Z",
             "last_deploy_error": "a previous attempt failed",
@@ -4044,7 +4058,8 @@ def test_deploy_wait_bounds_each_poll_by_the_remaining_time(
     _queued_deploy(monkeypatch, fake_client)
     seen: list[float | None] = []
 
-    def _poll(run_id, timeout=None):
+    def _poll(run_id, timeout=None, *, body_deadline=None):
+        assert body_deadline == timeout
         seen.append(timeout)
         return {"state": "ready"}
 
@@ -4064,7 +4079,7 @@ def test_deploy_wait_zero_actually_reads_the_current_state(fake_client, monkeypa
     _queued_deploy(monkeypatch, fake_client)
     polls: list[str] = []
 
-    def _poll(run_id, timeout=None):
+    def _poll(run_id, timeout=None, *, body_deadline=None):
         polls.append(run_id)
         return {"state": "ready"}
 
@@ -4098,7 +4113,7 @@ def test_deploy_wait_does_not_start_a_read_after_the_deadline_expires(
     )
     reads: list[tuple[float, float | None]] = []
 
-    def _poll(run_id, timeout=None):
+    def _poll(run_id, timeout=None, *, body_deadline=None):
         reads.append((clock["t"], timeout))
         return {"state": "queued"}
 
@@ -4128,7 +4143,7 @@ def test_deploy_wait_fails_closed_on_a_terminal_state_that_is_not_ready(
     monkeypatch.setattr(
         fake_client,
         "deployment_for",
-        lambda run_id, timeout=None: {"state": state},
+        lambda run_id, timeout=None, body_deadline=None: {"state": state},
         raising=False,
     )
 
@@ -4165,7 +4180,7 @@ def test_deploy_wait_observes_readiness_inside_a_short_window(fake_client, monke
         run_commands.time, "sleep", lambda s: clock.__setitem__("t", clock["t"] + s)
     )
 
-    def _poll(run_id, timeout=None):
+    def _poll(run_id, timeout=None, *, body_deadline=None):
         # ready one second into the five-second window.
         return {"state": "ready" if clock["t"] >= 1.0 else "queued"}
 
@@ -4189,7 +4204,7 @@ def test_deploy_wait_observes_readiness_inside_the_final_window(fake_client, mon
         run_commands.time, "sleep", lambda s: clock.__setitem__("t", clock["t"] + s)
     )
 
-    def _poll(run_id, timeout=None):
+    def _poll(run_id, timeout=None, *, body_deadline=None):
         # ready half a second into the one-second window.
         return {"state": "ready" if clock["t"] >= 0.5 else "queued"}
 
@@ -4213,7 +4228,7 @@ def test_deploy_wait_watches_the_final_window_to_its_deadline(fake_client, monke
         run_commands.time, "sleep", lambda s: clock.__setitem__("t", clock["t"] + s)
     )
 
-    def _poll(run_id, timeout=None):
+    def _poll(run_id, timeout=None, *, body_deadline=None):
         # ready in the second half of the window -- past a midpoint read, inside the deadline.
         return {"state": "ready" if clock["t"] >= 0.75 else "queued"}
 
@@ -4238,7 +4253,7 @@ def test_deploy_wait_final_window_does_not_poll_unboundedly(fake_client, monkeyp
     )
     reads = []
 
-    def _poll(run_id, timeout=None):
+    def _poll(run_id, timeout=None, *, body_deadline=None):
         reads.append(clock["t"])
         # never settles: the wait has to end on its own budget, not on the plane's answer.
         return {"state": "queued"}
@@ -4260,7 +4275,8 @@ def test_deploy_wait_zero_does_not_block_past_its_own_bound(fake_client, monkeyp
     _queued_deploy(monkeypatch, fake_client)
     seen: list[float | None] = []
 
-    def _poll(run_id, timeout=None):
+    def _poll(run_id, timeout=None, *, body_deadline=None):
+        assert body_deadline == timeout
         seen.append(timeout)
         return {"state": "ready"}
 
@@ -4290,7 +4306,10 @@ def test_deploy_wait_accepts_a_synchronous_success(fake_client, monkeypatch) -> 
     settled = {"run_id": "flash-1", "state": "ready", "requested_at": "2026-07-29T02:00:00Z"}
     monkeypatch.setattr(fake_client, "deploy", lambda run_id, **_: dict(settled), raising=False)
     monkeypatch.setattr(
-        fake_client, "deployment_for", lambda run_id, timeout=None: dict(settled), raising=False
+        fake_client,
+        "deployment_for",
+        lambda run_id, timeout=None, body_deadline=None: dict(settled),
+        raising=False,
     )
 
     assert _run(["models", "deploy", "flash-1/final", "--wait"]) == 0
@@ -4316,7 +4335,7 @@ def test_deploy_wait_stops_retrying_a_rejected_key(fake_client, monkeypatch, cap
     _queued_deploy(monkeypatch, fake_client)
     calls: list[int] = []
 
-    def _denied(run_id, timeout=None):
+    def _denied(run_id, timeout=None, *, body_deadline=None):
         calls.append(1)
         raise deploy_commands.ApiError(403, "forbidden")
 

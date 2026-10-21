@@ -521,7 +521,15 @@ def _announce_training(t_start: float, cfg) -> tuple[float, float]:
 
 
 def _start_resume_uploader(
-    *, local_dir, resume_step, inp, workdir, python_bin, preprocessor, metric_evidence
+    *,
+    local_dir,
+    resume_step,
+    inp,
+    workdir,
+    python_bin,
+    preprocessor,
+    metric_evidence,
+    final_step=None,
 ):
     targeting = resolve_lora_targeting(
         inp["model_id"], algorithm="grpo", multimodal=bool(inp.get("multimodal"))
@@ -531,6 +539,7 @@ def _start_resume_uploader(
         resume_step=resume_step,
         metric_evidence=metric_evidence,
         required_steps=inp["save_at_steps"],
+        final_step=final_step,
         export_root=os.path.join(workdir, "exports"),
         python_bin=python_bin,
         model_id=inp["model_id"],

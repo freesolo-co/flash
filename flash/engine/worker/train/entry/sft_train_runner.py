@@ -672,6 +672,7 @@ def _prepare_sft_child(
         model_revision=options.model_revision,
         exclude_modules=model.exclude_modules,
         required_steps=options.save_at_steps,
+        final_step=model.update_horizon,
         preprocessor=data.processor,
     )
     # the staged resume checkpoint is already a pending global_step_N on disk, so an unseeded

@@ -35,7 +35,7 @@ APP_STATE_ATTR = "serving_context"
 def require_attributed_traffic(
     authorization: InferenceAuthorization, target: AdapterRecord
 ) -> AuthorizedTraffic:
-    """resolve a trusted-internal caller to the organization its usage is billed to.
+    """Validate the routed generation and attribute trusted internal traffic.
 
     a trusted internal caller is authenticated but not yet billable. it may state its tenant
     explicitly, otherwise the resolved target's owner supplies it. a request with neither fails
@@ -43,6 +43,14 @@ def require_attributed_traffic(
     """
 
     if isinstance(authorization, AuthorizedTraffic):
+        if target.is_checkpoint and (
+            not authorization.deployment_generation
+            or authorization.deployment_generation != target.deployment_generation
+        ):
+            raise HTTPException(
+                status.HTTP_503_SERVICE_UNAVAILABLE,
+                "checkpoint deployment changed after authorization; retry the request",
+            )
         return authorization
     org_id = authorization.org_id or target.org_id
     if org_id is None:

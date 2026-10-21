@@ -79,9 +79,9 @@ def _disable_xet_upload_staging() -> None:
 
 
 def hf_api():
-    from huggingface_hub import HfApi
+    from flash.engine.worker.io.transfer import upload_api
 
-    return HfApi(token=os.environ.get("HF_TOKEN"))
+    return upload_api(token=os.environ.get("HF_TOKEN"))
 
 
 def hf_prefix() -> str:
@@ -488,6 +488,7 @@ def upload_resume_checkpoint(
     skip_upload=None,
     emit_heartbeat: bool = True,
     lock_timeout_s: float | None = None,
+    final_step: int | None = None,
 ) -> bool:
     """synchronously stream one full-state resume checkpoint and ordered companion artifacts."""
     if not _worker_state.HF_REPO:
@@ -497,6 +498,7 @@ def upload_resume_checkpoint(
 
     before_completed = before_upload is None
     resume_completed = False
+    deferred = False
     after_completed = after_upload is None
     with _resume_checkpoint_upload_slot(lock_timeout_s) as acquired:
         if not acquired:
@@ -523,21 +525,24 @@ def upload_resume_checkpoint(
                         failure_stage = "resume"
                         _require_hf_deadline_allowance()
                         from flash.engine.support.checkpoint_transport import upload_directory
+                        from flash.engine.worker.io.cpu_handoff import stage_final_checkpoint
 
-                        with upload_directory(ckpt_dir) as folder:
-                            _require_hf_deadline_allowance()
-                            hf_api().upload_folder(
-                                folder_path=folder,
-                                path_in_repo=f"{hf_prefix()}/checkpoint/checkpoint-{step}",
-                                repo_id=_worker_state.HF_REPO,
-                                repo_type="dataset",
-                                # Replace this step atomically, including stale transport files
-                                # from an earlier publication of the same native checkpoint.
-                                delete_patterns="*",
-                            )
-                        # prune only after the atomic folder commit lands, so the prior complete save
-                        # survives every failed replacement upload.
-                        _prune_stale_resume_checkpoints(step)
+                        deferred = stage_final_checkpoint(step, ckpt_dir, final_step=final_step)
+                        if not deferred:
+                            with upload_directory(ckpt_dir) as folder:
+                                _require_hf_deadline_allowance()
+                                hf_api().upload_folder(
+                                    folder_path=folder,
+                                    path_in_repo=f"{hf_prefix()}/checkpoint/checkpoint-{step}",
+                                    repo_id=_worker_state.HF_REPO,
+                                    repo_type="dataset",
+                                    # Replace this step atomically, including stale transport files
+                                    # from an earlier publication of the same native checkpoint.
+                                    delete_patterns="*",
+                                )
+                            # prune only after the atomic folder commit lands, so the prior complete save
+                            # survives every failed replacement upload.
+                            _prune_stale_resume_checkpoints(step)
                         resume_completed = True
                     if not after_completed:
                         failure_stage = "after"
@@ -545,7 +550,9 @@ def upload_resume_checkpoint(
                         after_completed = True
                     if emit_heartbeat:
                         failure_stage = "heartbeat"
-                        _worker_heartbeat.heartbeat("checkpoint_uploaded", step=step)
+                        _worker_heartbeat.heartbeat(
+                            "checkpoint_staged" if deferred else "checkpoint_uploaded", step=step
+                        )
                     return True
                 except RequiredSaveError:
                     raise

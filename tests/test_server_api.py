@@ -3551,6 +3551,37 @@ def test_deploy_returns_deploying_before_background_job_finishes(api, monkeypatc
     assert deployments[0]["deployment"]["state"] == "queued"
 
 
+@pytest.mark.parametrize("serving_generation", [None, "", "   ", 7, "generation-a"])
+def test_redeploy_reverifies_legacy_ready_records(api, monkeypatch, serving_generation):
+    key = _login()
+    run_id = _make_run(api, key, "deployed")
+    checkpoint_id = f"{run_id}/final"
+    status = runner_status.get_status(run_id)
+    record = {"checkpoint_id": checkpoint_id, "state": "ready", "verified_at": 123.0}
+    if serving_generation is not None:
+        record["deployment_generation"] = serving_generation
+    status.deployments = records(run_id, record)
+    runner_state._save_status(status)
+    starts = []
+
+    def start(_target, **kwargs):
+        starts.append(kwargs)
+        kwargs["deploy_lock"].release()
+        return False
+
+    monkeypatch.setattr(deployment_jobs, "start_deployment_job", start)
+    response = api.post(
+        f"/v1/runs/{run_id}/deploy", json={"checkpoint_id": checkpoint_id}, headers=_bearer(key)
+    )
+    assert response.status_code == 200, response.text
+    already_verified = serving_generation == "generation-a"
+    assert response.json()["state"] == ("ready" if already_verified else "queued")
+    assert len(starts) == (0 if already_verified else 1)
+    if starts:
+        assert starts[0]["deployment"]["checkpoint_id"] == checkpoint_id
+        assert starts[0]["deployment"]["verified_at"] is None
+
+
 def test_concurrent_deploy_returns_409_without_queueing_duplicate(api, monkeypatch):
     import threading
 
@@ -7316,6 +7347,7 @@ class _FakeDeployment:
     def to_dict(self):
         return {
             "state": "ready",
+            "deployment_generation": "generation-a",
             "run_id": "X",
             "adapter_hf_prefix": f"{self.adapter_prefix}/adapter",
         }

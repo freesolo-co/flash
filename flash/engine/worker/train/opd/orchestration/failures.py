@@ -352,6 +352,7 @@ class _OpdVerlCheckpointWatcher(_VerlCheckpointWatcher):
         uploaded = _worker_hf.upload_resume_checkpoint(
             step,
             checkpoint_dir,
+            final_step=self.final_step,
             before_upload=publish_required_adapter,
             # the callback, not the return value: see mark_resume_uploaded's contract.
             after_upload=lambda: self.lifecycle.mark_resume_uploaded(step),
