@@ -124,7 +124,7 @@ def test_roundtrip_is_the_only_authority_store(run, tmp_path):
 )
 def test_malformed_inventory_fails_closed(records):
     with pytest.raises(ValueError, match="deployment"):
-        status._runstatus_from_json(
+        status._run_status_from_json(
             {"run_id": "run-a", "state": "done", "spec": {}, "deployments": records}
         )
 

@@ -29,7 +29,7 @@ INFERENCE_KEY_ENV = "FLASH_SERVING_KEY"
 ARTIFACT_TOKEN_ENV = "HF_TOKEN"
 
 
-def _err(message: str) -> int:
+def _report_command_error(message: str) -> int:
     print(f"error: {message}", file=sys.stderr)
     return 1
 
@@ -52,7 +52,7 @@ def _require_modal_provider(provider: object) -> None:
         raise ValueError("provider must be modal")
 
 
-def _credentials() -> ModalCredentials:
+def _read_modal_credentials() -> ModalCredentials:
     """build request-scoped modal credentials from the environment."""
 
     return ModalCredentials(
@@ -61,7 +61,7 @@ def _credentials() -> ModalCredentials:
     )
 
 
-def _image(reference: str):
+def _parse_serving_image(reference: str):
     from flash.serve.provisioning import ServingImage
 
     if "@" not in reference:
@@ -83,7 +83,7 @@ def _report_handle(handle, *, endpoint: bool = True) -> None:
     print(f"secret id   {handle.inference_secret_id}")
 
 
-def _report(result, bundle) -> int:
+def _print_deployment_result(result, bundle) -> int:
     print(f"deployment  {result.deployment_id} generation {result.generation}")
     print(f"provider    {result.provider}")
     print(f"engine      {result.engine_id}")
@@ -164,7 +164,7 @@ def _deployment_bundle(args):
 
     _require_modal_provider(args.provider)
     profile = get_profile(args.model)
-    image = _image(args.image)
+    image = _parse_serving_image(args.image)
     placement = placement_for(
         profile,
         args.provider,
@@ -227,11 +227,11 @@ def cmd_serve_deploy(args) -> int:
         if not getattr(args, "dry_run", False):
             from flash.serve.deployment.profiles import get_profile, require_live_qualification
 
-            image = _image(args.image)
+            image = _parse_serving_image(args.image)
             require_live_qualification(get_profile(args.model), args.provider, image.digest)
         bundle = _deployment_bundle(args)
     except (ValueError, TypeError) as exc:
-        return _err(str(exc))
+        return _report_command_error(str(exc))
 
     from flash.server.domain.ops.serving_resources import dry_run_deployment
 
@@ -239,7 +239,7 @@ def cmd_serve_deploy(args) -> int:
         # validate the provider-specific hostname contract on both dry-run and allocation paths.
         _build_provider_plan(bundle)
     except (ValueError, TypeError) as exc:
-        return _err(str(exc))
+        return _report_command_error(str(exc))
 
     if getattr(args, "dry_run", False):
         for key, value in dry_run_deployment(bundle).items():
@@ -248,10 +248,10 @@ def cmd_serve_deploy(args) -> int:
         return 0
 
     try:
-        credentials = _credentials()
+        credentials = _read_modal_credentials()
         runtime_secrets = _runtime_secrets()
     except ValueError as exc:
-        return _err(
+        return _report_command_error(
             f"{exc}. provider credentials are read from the environment for this one request "
             "and are never stored"
         )
@@ -264,13 +264,13 @@ def cmd_serve_deploy(args) -> int:
             bundle, credentials, runtime_secrets, deadline_at=deadline_at
         )
     except FreshDeploymentArtifactTokenRequired as exc:
-        return _err(f"{ARTIFACT_TOKEN_ENV} is not set. {exc}")
+        return _report_command_error(f"{ARTIFACT_TOKEN_ENV} is not set. {exc}")
     except InterruptedProvisioning:
         # the interrupt still propagates, but first report the exact identity and billing ambiguity.
         _report_identity(bundle)
         _warn_unconfirmed_cleanup(args.deployment_id)
         raise
-    return _report(result, bundle)
+    return _print_deployment_result(result, bundle)
 
 
 def _warn_unconfirmed_cleanup(deployment_id: str) -> None:

@@ -62,13 +62,13 @@ def can_prompt() -> bool:
     return styled()
 
 
-def _color() -> bool:
+def _color_enabled() -> bool:
     """Themed layout minus NO_COLOR / dumb-terminal opt-outs."""
     return styled() and "NO_COLOR" not in os.environ and os.environ.get("TERM") != "dumb"
 
 
 def _style(code: str, text: str) -> str:
-    return f"\x1b[{code}m{text}\x1b[0m" if _color() else text
+    return f"\x1b[{code}m{text}\x1b[0m" if _color_enabled() else text
 
 
 def _glyph(unicode_glyph: str, ascii_fallback: str) -> str:
@@ -91,7 +91,7 @@ _ASCII_PUNCT = {
 }
 
 
-def _safe(text: str) -> str:
+def _stdout_encodable_text(text: str) -> str:
     """Ensure text is printable under the current stdout encoding without UnicodeEncodeError."""
     enc = sys.stdout.encoding or "ascii"
     try:
@@ -129,18 +129,20 @@ def format_identity(me: dict, key_source: str | None = None) -> str:
 def login_ok(me: dict | None) -> str:
     head = f"{_paint(_glyph('✓', 'ok:'), _GREEN, '1')} {_bold('logged in to flash')}"
     if not me:
-        return _safe(
+        return _stdout_encodable_text(
             f"{head}\n{_dim(f'  account details unavailable right now — run `{CLI_NAME} whoami` later')}"
         )
-    return _safe(f"{head}\n\n{format_identity(me)}")
+    return _stdout_encodable_text(f"{head}\n\n{format_identity(me)}")
 
 
 def whoami(me: dict, key_source: str | None = None) -> str:
-    return _safe(f"{_bold('logged in to flash')}\n\n{format_identity(me, key_source)}")
+    return _stdout_encodable_text(
+        f"{_bold('logged in to flash')}\n\n{format_identity(me, key_source)}"
+    )
 
 
 def login_failed(reason: str) -> str:
-    return _safe(
+    return _stdout_encodable_text(
         f"{_paint(_glyph('✗', 'x:'), _RED, '1')} {_bold('login failed')}\n"
         f"  {reason}\n"
         f"  {_dim(f'then run `{CLI_NAME} login --api-key <key>` to try again')}\n"
@@ -153,20 +155,20 @@ def error(msg: str) -> str:
     by main()'s catch-all so every command's failure is styled on a TTY, not just ``flash login``.
     The machine path keeps the plain ``error: {msg}`` prefix that scripts and tests match on."""
     mark = _paint(_glyph("✗", "x:"), _RED, "1")
-    return _safe(f"{mark} {_paint('error:', _RED, '1')} {msg}")
+    return _stdout_encodable_text(f"{mark} {_paint('error:', _RED, '1')} {msg}")
 
 
 def warn(msg: str) -> str:
     """A themed warning (amber ⚠) — distinct from the red error idiom: the command still
     proceeds or succeeded. Machine path keeps the plain ``warning: {msg}`` text."""
     mark = _paint(_glyph("⚠", "!"), _AMBER, "1")
-    return _safe(f"{mark} {_paint('warning:', _AMBER, '1')} {msg}")
+    return _stdout_encodable_text(f"{mark} {_paint('warning:', _AMBER, '1')} {msg}")
 
 
 def note(msg: str) -> str:
     """A quiet, dimmed line for transient progress / info (e.g. ``exporting ...``). The
     machine path prints the same text undimmed."""
-    return _safe(_dim(msg))
+    return _stdout_encodable_text(_dim(msg))
 
 
 # These renderers are only ever called when `styled()` is true (an interactive stdout, or
@@ -208,7 +210,7 @@ _ACCENT, _ACCENT2, _GREEN, _TEAL, _RED, _VIOLET, _GRAY, _FAINT, _AMBER = (
 )
 
 
-def _truecolor() -> bool:
+def _supports_truecolor() -> bool:
     """Whether the terminal supports 24-bit color."""
     return os.environ.get("COLORTERM", "").lower() in {"truecolor", "24bit"}
 
@@ -231,14 +233,14 @@ def _sgr(part: str) -> str:
     if color is None:
         return part
     hex6, fallback = color[_theme()]
-    if _truecolor():
+    if _supports_truecolor():
         return f"38;2;{int(hex6[0:2], 16)};{int(hex6[2:4], 16)};{int(hex6[4:6], 16)}"
     return f"38;5;{fallback}"
 
 
 def _paint(text: str, *codes: str) -> str:
     """Apply style tokens (SGR codes and/or brand color names)."""
-    if not codes or not _color():
+    if not codes or not _color_enabled():
         return text
     return f"\x1b[{';'.join(_sgr(c) for c in codes)}m{text}\x1b[0m"
 
@@ -279,7 +281,7 @@ def header(cmd: str, desc: str | None = None) -> str:
     line = f"{mark} {sep} {_bold(cmd)}"
     if desc:
         line += "  " + _paint(desc, _GRAY)
-    return _safe(f"{line}\n{_rule()}")
+    return _stdout_encodable_text(f"{line}\n{_rule()}")
 
 
 def badge(state: str) -> str:
@@ -289,12 +291,12 @@ def badge(state: str) -> str:
 
 
 def ok(msg: str) -> str:
-    return _safe(f"{_paint(_glyph('✓', 'ok:'), _GREEN, '1')} {msg}")
+    return _stdout_encodable_text(f"{_paint(_glyph('✓', 'ok:'), _GREEN, '1')} {msg}")
 
 
 def arrow(msg: str) -> str:
     """A de-emphasized pointer / next-step line."""
-    return _safe(f"{_paint(_glyph('→', '->'), _ACCENT2)} {_dim(msg)}")
+    return _stdout_encodable_text(f"{_paint(_glyph('→', '->'), _ACCENT2)} {_dim(msg)}")
 
 
 def select(title: str, options: list[tuple[str, str, str]], default: int = 0) -> str:
@@ -305,13 +307,13 @@ def select(title: str, options: list[tuple[str, str, str]], default: int = 0) ->
     decides *when* to prompt (interactive stdin), so this always prompts when called. On EOF the
     default is returned so a closed stdin never hangs the scaffold."""
     prompt_mark = _paint(_glyph("?", "?"), _ACCENT, "1")
-    print(f"{prompt_mark} {_bold(_safe(title))}")
+    print(f"{prompt_mark} {_bold(_stdout_encodable_text(title))}")
     for i, (_value, label, hint) in enumerate(options):
         num = _paint(f"{i + 1})", _ACCENT2)
         lab = _bold(label) if i == default else label
-        tail = f"  {_dim(_safe(hint))}" if hint else ""
+        tail = f"  {_dim(_stdout_encodable_text(hint))}" if hint else ""
         mark = _paint(" (default)", _GREEN) if i == default else ""
-        print(f"  {num} {_safe(lab)}{tail}{mark}")
+        print(f"  {num} {_stdout_encodable_text(lab)}{tail}{mark}")
     pointer = _paint(_glyph("›", ">"), _ACCENT2)  # noqa: RUF001 (the glyph is the point)
     for _ in range(5):
         try:
@@ -334,11 +336,11 @@ def select_required(title: str, options: list[tuple[str, str, str]]) -> str:
     if not options:
         raise ValueError("selection requires at least one option")
     prompt_mark = _paint(_glyph("?", "?"), _ACCENT, "1")
-    print(f"{prompt_mark} {_bold(_safe(title))}")
+    print(f"{prompt_mark} {_bold(_stdout_encodable_text(title))}")
     for i, (_value, label, hint) in enumerate(options):
         num = _paint(f"{i + 1})", _ACCENT2)
-        tail = f"  {_dim(_safe(hint))}" if hint else ""
-        print(f"  {num} {_safe(label)}{tail}")
+        tail = f"  {_dim(_stdout_encodable_text(hint))}" if hint else ""
+        print(f"  {num} {_stdout_encodable_text(label)}{tail}")
     pointer = _paint(_glyph("›", ">"), _ACCENT2)  # noqa: RUF001 (the glyph is the point)
     while True:
         try:
@@ -357,7 +359,7 @@ def money(value: float, decimals: int = 4) -> str:
     return _paint(f"${value:.{decimals}f}", _TEAL)
 
 
-def _kv(pairs: list[tuple[str, str | None]], indent: int = 2) -> str:
+def _format_key_value_pairs(pairs: list[tuple[str, str | None]], indent: int = 2) -> str:
     """Aligned ``key · value`` panel; keys dimmed and padded to a common width."""
     rows = [(k, v) for k, v in pairs if v is not None]
     if not rows:
@@ -368,7 +370,7 @@ def _kv(pairs: list[tuple[str, str | None]], indent: int = 2) -> str:
     return "\n".join(f"{pad}{_paint(k.ljust(keyw), _GRAY)} {sep} {v}" for k, v in rows)
 
 
-def _table(headers: list[str], rows: list[list], aligns: list[str] | None = None) -> str:
+def _format_table(headers: list[str], rows: list[list], aligns: list[str] | None = None) -> str:
     """Aligned table; cells are plain strings or ``(text, *sgr_codes)`` tuples."""
     aligns = aligns or ["l"] * len(headers)
     cols = len(headers)
@@ -397,16 +399,16 @@ def _table(headers: list[str], rows: list[list], aligns: list[str] | None = None
     body = [
         "  ".join(fmt(row[i], widths[i], aligns[i]) for i in range(cols)).rstrip() for row in rows
     ]
-    return _safe("\n".join([head.rstrip(), underline, *body]))
+    return _stdout_encodable_text("\n".join([head.rstrip(), underline, *body]))
 
 
-def _json(obj) -> str:
+def _format_json(obj) -> str:
     """Pretty JSON: plain when color is off, syntax-highlighted when on."""
     import json
 
-    if not _color():
+    if not _color_enabled():
         return json.dumps(obj, indent=2)
-    return _safe(_color_json(obj, 0))
+    return _stdout_encodable_text(_color_json(obj, 0))
 
 
 def _color_json(obj, depth: int) -> str:
@@ -457,7 +459,7 @@ def _hide_provider_metadata(obj):
 def version(value: str) -> str:
     """The wordmark + version."""
     mark = _paint(BRAND_NAME, _ACCENT, "1")
-    return _safe(f"{mark} {_dim('v' + value)}")
+    return _stdout_encodable_text(f"{mark} {_dim('v' + value)}")
 
 
 def submitted(run_id: str) -> str:
@@ -471,12 +473,12 @@ def submitted(run_id: str) -> str:
         f"resume with `{CLI_NAME} runs log {run_id} --follow`, "
         f"stop with `{CLI_NAME} runs cancel {run_id}`"
     )
-    return _safe(f"{head}\n{hint}")
+    return _stdout_encodable_text(f"{head}\n{hint}")
 
 
 def empty(cmd: str, desc: str, message: str) -> str:
     """A styled empty state (e.g. no runs yet)."""
-    return _safe(f"{header(cmd, desc)}\n{_dim('  ' + message)}")
+    return _stdout_encodable_text(f"{header(cmd, desc)}\n{_dim('  ' + message)}")
 
 
 def _humanize_ts(value) -> str | None:
@@ -525,9 +527,9 @@ def run_status(obj: dict) -> str:
         pairs.append(("artifacts", obj["artifacts_dir"]))
     if obj.get("error"):
         pairs.append(("error", _paint(str(obj["error"]), _RED)))
-    head = f"{header('status')}\n  {badge(obj.get('state', 'unknown'))}\n\n{_kv(pairs)}"
-    raw = f"{_dim('details')}\n{_json(_hide_provider_metadata(obj))}"
-    return _safe(f"{head}\n\n{raw}")
+    head = f"{header('status')}\n  {badge(obj.get('state', 'unknown'))}\n\n{_format_key_value_pairs(pairs)}"
+    raw = f"{_dim('details')}\n{_format_json(_hide_provider_metadata(obj))}"
+    return _stdout_encodable_text(f"{head}\n\n{raw}")
 
 
 def object_panel(cmd: str, obj: dict, desc: str | None = None) -> str:
@@ -543,8 +545,8 @@ def object_panel(cmd: str, obj: dict, desc: str | None = None) -> str:
         if rid:
             line += "   " + _paint(rid, _ACCENT2)
         parts.append(line + "\n")
-    parts.append(_json(_hide_provider_metadata(obj)))
-    return _safe("\n".join(parts))
+    parts.append(_format_json(_hide_provider_metadata(obj)))
+    return _stdout_encodable_text("\n".join(parts))
 
 
 # Run-lifecycle mutation confirmations — the curated `✓ ... + detail card` idiom (same as
@@ -561,7 +563,7 @@ def cancelled(payload: dict) -> str:
         head = ok(f"cancel requested for {rid}")
     else:
         head = note(f"{payload.get('run_id', '')} already {state} — nothing to cancel")
-    return _safe(f"{head}\n  {badge(state)}")
+    return _stdout_encodable_text(f"{head}\n  {badge(state)}")
 
 
 def deployed(dep: dict) -> str:
@@ -585,7 +587,7 @@ def deployed(dep: dict) -> str:
         head = ok("deployed")
     else:
         head = f"{ok('deploy')}  {badge(state)}"
-    return _safe(f"{head}\n{_kv(pairs)}")
+    return _stdout_encodable_text(f"{head}\n{_format_key_value_pairs(pairs)}")
 
 
 def undeployed(result: dict) -> str:
@@ -598,7 +600,7 @@ def undeployed(result: dict) -> str:
         line += "\n" + _dim(f"  disabled {', '.join(str(item) for item in disabled)}")
     else:
         line += "\n" + _dim("  serving record was already disabled or absent")
-    return _safe(line)
+    return _stdout_encodable_text(line)
 
 
 def exported(result: dict) -> str:
@@ -609,19 +611,23 @@ def exported(result: dict) -> str:
         ("url", _paint(result["url"], _ACCENT2) if result.get("url") else None),
         ("visibility", "private" if result.get("private") else "public"),
     ]
-    return _safe(f"{ok('exported to HuggingFace')}\n{_kv(pairs)}")
+    return _stdout_encodable_text(
+        f"{ok('exported to HuggingFace')}\n{_format_key_value_pairs(pairs)}"
+    )
 
 
 def server_cost_panel(
     rows: list[tuple[str, str | None]], total_usd: float, description: str
 ) -> str:
     """Server-prepared quote with no invented local hardware or timing details."""
-    panel = _kv([(key, _paint(value, _ACCENT2) if key == "run" else value) for key, value in rows])
+    panel = _format_key_value_pairs(
+        [(key, _paint(value, _ACCENT2) if key == "run" else value) for key, value in rows]
+    )
     total = (
         f"  {_paint('TOTAL'.ljust(8), _GRAY, '1')} {_paint(_glyph('·', '-'), _FAINT)} "
         f"{_paint(format_usd(total_usd), _TEAL, '1')}"
     )
-    return _safe(f"{header('train', description)}\n{panel}\n{_rule()}\n{total}")
+    return _stdout_encodable_text(f"{header('train', description)}\n{panel}\n{_rule()}\n{total}")
 
 
 def sft_cost_panel(rows: list[tuple[str, str | None]], total_usd: float) -> str:
@@ -634,7 +640,7 @@ def sft_cost_panel(rows: list[tuple[str, str | None]], total_usd: float) -> str:
 
 def project_created(project_id: str, name: str) -> str:
     """Styled project creation confirmation with the copyable id."""
-    return _safe(
+    return _stdout_encodable_text(
         f"{header('projects create', name)}\n{ok('project created')}\n\n"
         f"{_dim('project id')}  {_paint(project_id, _ACCENT2, '1')}"
     )
@@ -666,7 +672,7 @@ def env_setup(paths: list[str], project_id: str, *, can_publish: bool = True) ->
             "github:OWNER/REPO@REF:environment.py (REF is the repo's actual default branch) "
             "(needs FLASH_STANDALONE=1 on the plane)"
         )
-    return _safe(f"{head}\n{tree}\n\n{next_step}")
+    return _stdout_encodable_text(f"{head}\n{tree}\n\n{next_step}")
 
 
 def chat_label() -> str:
@@ -679,13 +685,13 @@ def log_section(name: str) -> str:
     idiom as chat_label sitting above a raw chat reply (the log body stays raw). The machine path
     keeps the plain ``----- name -----`` divider that scripts and tests match on."""
     rule = _paint(_glyph("─", "-") * 3, _FAINT)
-    return _safe(f"{rule} {_paint(name, _ACCENT2, '1')} {rule}")
+    return _stdout_encodable_text(f"{rule} {_paint(name, _ACCENT2, '1')} {rule}")
 
 
 def env_published(slug: str) -> str:
     snippet = f'[environment]\nid = "{slug}"'
     body = "\n".join(f"  {_paint(line, _ACCENT2)}" for line in snippet.splitlines())
-    return _safe(
+    return _stdout_encodable_text(
         f"{ok(f'published {_bold(slug)}')}\n\n{_dim('reference it in your config:')}\n{body}"
     )
 
@@ -694,7 +700,7 @@ def env_pulled(dest: str, detail: str = "") -> str:
     line = ok(f"pulled {_bold(dest)}")
     if detail:
         line += f"\n{_dim(f'  {detail}')}"
-    return _safe(line)
+    return _stdout_encodable_text(line)
 
 
 def help_page(
@@ -717,7 +723,7 @@ def help_page(
     banner = f"{mark}  {_paint(tagline, _GRAY)}"
     usage_line = f"{_dim('usage:')} {_paint(usage, _GRAY)}"
     # one name-column width across every group AND the options block, so every summary lines up
-    # down the whole page (same single-shared-width discipline as _table).
+    # down the whole page (same single-shared-width discipline as _format_table).
     names = [name for _, rows in groups for name, _ in rows] + [flag for flag, _ in options]
     width = max((len(n) for n in names), default=0)
 
@@ -735,4 +741,4 @@ def help_page(
     foot = "\n".join(arrow(line) for line in footers)
     # trailing newline so the styled page matches argparse's newline-terminated help (argparse
     # writes format_help() verbatim via print_help, with no print() to add one).
-    return _safe(f"{banner}\n{_rule()}\n{usage_line}\n\n{body}\n\n{foot}\n")
+    return _stdout_encodable_text(f"{banner}\n{_rule()}\n{usage_line}\n\n{body}\n\n{foot}\n")

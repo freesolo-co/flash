@@ -211,7 +211,7 @@ def test_color_json_covers_all_leaf_types(monkeypatch) -> None:
         "empty_list": [],
         "empty_dict": {},
     }
-    out = render._json(obj)
+    out = render._format_json(obj)
     # leaf tokens survive the syntax highlighting (as substrings inside SGR wrappers)
     assert "null" in out
     assert "true" in out
@@ -225,8 +225,8 @@ def test_color_json_covers_all_leaf_types(monkeypatch) -> None:
 
 
 def test_kv_returns_empty_when_no_rows(styled_plain) -> None:
-    assert render._kv([]) == ""
-    assert render._kv([("only", None)]) == ""  # all-None rows filtered out
+    assert render._format_key_value_pairs([]) == ""
+    assert render._format_key_value_pairs([("only", None)]) == ""  # all-None rows filtered out
 
 
 # --------------------------------------------------------------------------- provider redaction

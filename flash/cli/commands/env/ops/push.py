@@ -71,7 +71,7 @@ def _atomic_write_bytes(out: Path, data: bytes | bytearray) -> None:
         raise
 
 
-def _err(msg: str) -> int:
+def _report_command_error(msg: str) -> int:
     """Print a command error (themed red ✗ on a TTY, plain on the machine path) and return 1.
 
     These `env` failures `return 1` directly rather than raising, so they never reach main()'s
@@ -115,7 +115,7 @@ def cmd_env_pull(args) -> int:
     env_id = str(args.env_id or "").strip()
     managed_env_id, managed_error = _normalize_managed_hub_id(env_id)
     if managed_error == "not-canonical":
-        return _err(
+        return _report_command_error(
             f'env id must be lowercase "namespace/project/name" with no spaces (got {args.env_id!r})'
         )
     if managed_env_id is None:
@@ -247,7 +247,7 @@ def cmd_env_delete(args) -> int:
         project_id = require_project_id(getattr(args, "project", None))
     except (TypeError, ValueError) as exc:
         detail = str(exc).replace("project", "project id", 1)
-        return _err(f"{detail}: pass `--project <project-uuid>`")
+        return _report_command_error(f"{detail}: pass `--project <project-uuid>`")
 
     # Delete only targets MANAGED hub ids ("namespace/project/name") — not github: refs or local paths, which
     # don't live on the hub. And enforce the hub's canonical form (lowercase, no surrounding
@@ -255,12 +255,12 @@ def cmd_env_delete(args) -> int:
     # mixed-case / padded id would otherwise make a pointless request and return a confusing 400.
     env_id, validation_error = _normalize_managed_hub_id(args.env_id)
     if validation_error == "not-managed":
-        return _err(
+        return _report_command_error(
             f'env id must be a managed Freesolo hub id "namespace/project/name" (got {args.env_id!r}); '
             "github refs and local paths can't be deleted from the hub"
         )
     if validation_error == "not-canonical" or env_id is None:
-        return _err(
+        return _report_command_error(
             f'env id must be lowercase "namespace/project/name" with no spaces (got {args.env_id!r})'
         )
     if not getattr(args, "yes", False):
@@ -275,7 +275,7 @@ def cmd_env_delete(args) -> int:
     try:
         result = client_from_config().delete_env(env_id, project_id=project_id)
     except ClientError as exc:
-        return _err(str(exc))
+        return _report_command_error(str(exc))
     deleted = bool(result["deleted"])
     msg = f"deleted {env_id}" if deleted else f"{env_id} was not found on the hub (already deleted)"
     print(render.ok(msg) if render.styled() else msg)
@@ -642,14 +642,14 @@ def _upload_and_report(
         )
     except ClientError as exc:
         bar.clear()
-        return _err(str(exc))
+        return _report_command_error(str(exc))
     bar.clear()
     slug = result.get("id")
     if not slug:
         # a publish that can't report an id has not done its job (no `id = "..."` snippet to show),
-        # so this is a hard failure — route it through _err's red ✗ idiom, not the amber ⚠ warning
-        # idiom (which means "succeeded / still proceeding") it used to borrow.
-        return _err("the env was uploaded but the server returned no id")
+        # so this is a hard failure — use _report_command_error's red ✗ idiom. The amber ⚠
+        # warning it used to borrow means "succeeded / still proceeding".
+        return _report_command_error("the env was uploaded but the server returned no id")
     if render.styled():
         print(render.env_published(slug))
     else:
@@ -698,7 +698,7 @@ def cmd_env_push(args) -> int:
     raw_env_name = str(getattr(args, "name", "") or "")
     env_name = _normalize_env_name(raw_env_name)
     if not env_name:
-        return _err(_env_name_error(raw_env_name))
+        return _report_command_error(_env_name_error(raw_env_name))
 
     from flash.core.spec import require_project_id
 
@@ -706,12 +706,12 @@ def cmd_env_push(args) -> int:
         project_id = require_project_id(getattr(args, "project", None))
     except (TypeError, ValueError) as exc:
         detail = str(exc).replace("project", "project id", 1)
-        return _err(f"{detail}: pass `--project <project-uuid>`")
+        return _report_command_error(f"{detail}: pass `--project <project-uuid>`")
 
     try:
         src, env_root, entrypoint, include_full_tree = _resolve_local_env_entrypoint(args.path)
     except ValueError as exc:
-        return _err(str(exc))
+        return _report_command_error(str(exc))
 
     try:
         published_source = _prepare_env_entrypoint_source(entrypoint.read_bytes())
@@ -719,11 +719,13 @@ def cmd_env_push(args) -> int:
         location = (
             f"line {exc.lineno}" if getattr(exc, "lineno", None) is not None else "unknown line"
         )
-        return _err(
+        return _report_command_error(
             f"cannot publish {src}: environment entrypoint has invalid Python syntax ({location})"
         )
     except OSError:
-        return _err(f"cannot publish {src}: environment entrypoint could not be read")
+        return _report_command_error(
+            f"cannot publish {src}: environment entrypoint could not be read"
+        )
 
     try:
         _check_env_push_limits(
@@ -733,7 +735,7 @@ def cmd_env_push(args) -> int:
             env_name=env_name,
         )
     except (OSError, ValueError) as exc:
-        return _err(f"cannot publish {src}: {exc}")
+        return _report_command_error(f"cannot publish {src}: {exc}")
 
     with tempfile.TemporaryDirectory(prefix="flash-env-push-") as tmp:
         pkg = Path(tmp)
@@ -758,9 +760,9 @@ def cmd_env_push(args) -> int:
         try:
             contains_direct_token = package_contains_direct_token(pkg)
         except DirectTokenScanError:
-            return _err("environment package could not be scanned safely")
+            return _report_command_error("environment package could not be scanned safely")
         if contains_direct_token:
-            return _err(
+            return _report_command_error(
                 "environment package contains a direct access token; remove it before publishing"
             )
         # one progress widget spans both phases the user otherwise waits through silently:

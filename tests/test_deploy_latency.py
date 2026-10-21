@@ -267,7 +267,7 @@ def test_readiness_backoff_honors_retry_after_and_cap(monkeypatch):
     monkeypatch.setattr(deploy, "READBACK_MAX_DELAY_SECONDS", 2.0)
     monkeypatch.setattr(
         deploy,
-        "_registered_adapter_response",
+        "_fetch_registered_checkpoint_response",
         registered_adapter_response,
     )
     monkeypatch.setattr(deploy.time, "sleep", sleeps.append)

@@ -77,7 +77,7 @@ def test_trainer_and_quote_read_the_one_measured_window():
     workload module produced. So the guard is that no other derivation exists -- the trainer takes
     ``profile.max_length`` and the quote takes the same field off the same artifact.
     """
-    from flash.cost.spec import runconfig_from_spec
+    from flash.cost.spec import run_config_from_spec
 
     trainer_src = "".join(pathlib.Path(sft_train_mod.__file__).read_text().split())
     assert "max_length=profile.max_length" in trainer_src
@@ -92,4 +92,4 @@ def test_trainer_and_quote_read_the_one_measured_window():
             train=TrainSpec(max_context_tokens=3072, max_examples=8),
         )
     )
-    assert runconfig_from_spec(spec).seq_len == spec.workload_profile["max_length"] == 3072
+    assert run_config_from_spec(spec).seq_len == spec.workload_profile["max_length"] == 3072

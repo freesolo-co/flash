@@ -178,7 +178,7 @@ def test_redeploy_reuses_bound_artifact_revision(
     bound_revision = "b" * 40
     monkeypatch.setattr(
         d,
-        "_registered_adapter",
+        "fetch_registered_checkpoint",
         lambda _org_id, _checkpoint_id: {"artifact_revision": bound_revision},
     )
     monkeypatch.setattr(
@@ -553,7 +553,7 @@ def test_deploy_registers_with_freesolo_serving(monkeypatch, tmp_path, stub_serv
         return _Resp()
 
     monkeypatch.setattr(httpx, "post", fake_post)
-    monkeypatch.setattr(d, "_registered_adapter", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(d, "fetch_registered_checkpoint", lambda *_args, **_kwargs: None)
     dep = d.deploy_adapter(
         run_id="flash-7-abcd",
         model="Qwen/Qwen3.5-9B",
@@ -755,7 +755,7 @@ def test_wait_checkpoint_ready_retries_transient_read_errors(monkeypatch):
         return outcome, types.SimpleNamespace(headers={})
 
     sleeps = []
-    monkeypatch.setattr(d, "_registered_adapter_response", fake_registered_adapter)
+    monkeypatch.setattr(d, "_fetch_registered_checkpoint_response", fake_registered_adapter)
     monkeypatch.setattr(d.time, "sleep", sleeps.append)
 
     assert d._wait_checkpoint_ready("org-1", revision, ready["subfolder"]) == ready
@@ -782,7 +782,7 @@ def test_wait_checkpoint_ready_caps_reads_by_remaining_wall_time(monkeypatch):
     monkeypatch.setattr(d, "READBACK_DELAY_SECONDS", 1.0)
     monkeypatch.setattr(d.time, "monotonic", lambda: clock[0])
     monkeypatch.setattr(d.time, "sleep", fake_sleep)
-    monkeypatch.setattr(d, "_registered_adapter_response", fake_registered_adapter)
+    monkeypatch.setattr(d, "_fetch_registered_checkpoint_response", fake_registered_adapter)
 
     with pytest.raises(serving_errors.ServingError, match="readiness could not be confirmed"):
         d._wait_checkpoint_ready("org-1", revision, "sft/run-1/seed0/adapter", budget_s=5.0)
@@ -814,7 +814,7 @@ def test_cold_checkpoint_can_finish_after_the_old_readiness_limit(monkeypatch, m
             types.SimpleNamespace(headers={}),
         )
 
-    monkeypatch.setattr(deploy, "_registered_adapter_response", registered)
+    monkeypatch.setattr(deploy, "_fetch_registered_checkpoint_response", registered)
     monkeypatch.setattr(deploy, "READBACK_DELAY_SECONDS", 0.25)
     monkeypatch.setattr(deploy.time, "monotonic", lambda: clock[0])
     monkeypatch.setattr(deploy.time, "sleep", lambda delay: clock.__setitem__(0, clock[0] + delay))
@@ -822,7 +822,7 @@ def test_cold_checkpoint_can_finish_after_the_old_readiness_limit(monkeypatch, m
         "org-1",
         revision,
         subfolder,
-        budget_s=serving_readiness.revision_ready_budget_seconds(model),
+        budget_s=serving_readiness.checkpoint_readiness_timeout_seconds(model),
     )
     assert result["metadata"]["lifecycle_state"] == "ready"
     assert clock[0] - started >= ready_after
@@ -866,7 +866,7 @@ def test_deploy_funds_the_readiness_wait_from_the_model_budget(monkeypatch, tmp_
 
     _stub_adapter_config(monkeypatch, tmp_path, rank=32, base_model="Qwen/Qwen3.6-35B-A3B")
     monkeypatch.setattr(d, "resolve_artifact_revision", lambda _repo: "a" * 40)
-    monkeypatch.setattr(d, "_registered_adapter", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(d, "fetch_registered_checkpoint", lambda *_args, **_kwargs: None)
 
     class Response:
         status_code = 200
@@ -892,7 +892,9 @@ def test_deploy_funds_the_readiness_wait_from_the_model_budget(monkeypatch, tmp_
         org_id="org-1",
     )
 
-    assert budgets == [serving_readiness.revision_ready_budget_seconds("Qwen/Qwen3.6-35B-A3B")]
+    assert budgets == [
+        serving_readiness.checkpoint_readiness_timeout_seconds("Qwen/Qwen3.6-35B-A3B")
+    ]
     assert budgets[0] == serving_readiness.REVISION_READY_MAX_BUDGET_SECONDS
 
 
@@ -916,7 +918,7 @@ def test_checkpoint_ready_timeout_message_is_self_diagnosing(monkeypatch):
             types.SimpleNamespace(headers={}),
         )
 
-    monkeypatch.setattr(d, "_registered_adapter_response", registered)
+    monkeypatch.setattr(d, "_fetch_registered_checkpoint_response", registered)
     monkeypatch.setattr(d.time, "monotonic", lambda: clock[0])
     monkeypatch.setattr(d.time, "sleep", lambda delay: clock.__setitem__(0, clock[0] + delay))
 
@@ -955,7 +957,7 @@ def test_checkpoint_ready_timeout_reports_the_loader_failure(monkeypatch):
             types.SimpleNamespace(headers={}),
         )
 
-    monkeypatch.setattr(d, "_registered_adapter_response", registered)
+    monkeypatch.setattr(d, "_fetch_registered_checkpoint_response", registered)
     monkeypatch.setattr(d.time, "monotonic", lambda: clock[0])
     monkeypatch.setattr(d.time, "sleep", lambda delay: clock.__setitem__(0, clock[0] + delay))
 
@@ -984,7 +986,7 @@ def test_checkpoint_ready_timeout_distinguishes_a_never_visible_record(monkeypat
         clock[0] += 1.0
         return None, types.SimpleNamespace(headers={})
 
-    monkeypatch.setattr(d, "_registered_adapter_response", registered)
+    monkeypatch.setattr(d, "_fetch_registered_checkpoint_response", registered)
     monkeypatch.setattr(d.time, "monotonic", lambda: clock[0])
     monkeypatch.setattr(d.time, "sleep", lambda delay: clock.__setitem__(0, clock[0] + delay))
 
@@ -1024,7 +1026,7 @@ def test_a_cleared_loader_failure_is_not_reported_after_the_timeout(monkeypatch)
             types.SimpleNamespace(headers={}),
         )
 
-    monkeypatch.setattr(d, "_registered_adapter_response", registered)
+    monkeypatch.setattr(d, "_fetch_registered_checkpoint_response", registered)
     monkeypatch.setattr(d.time, "monotonic", lambda: clock[0])
     monkeypatch.setattr(d.time, "sleep", lambda delay: clock.__setitem__(0, clock[0] + delay))
 
@@ -1069,7 +1071,7 @@ def test_a_loader_failure_survives_later_transient_read_errors(monkeypatch):
             )
         raise serving_errors.ServingError("serving backend error (HTTP 503)", status_code=503)
 
-    monkeypatch.setattr(d, "_registered_adapter_response", registered)
+    monkeypatch.setattr(d, "_fetch_registered_checkpoint_response", registered)
     monkeypatch.setattr(d.time, "monotonic", lambda: clock[0])
     monkeypatch.setattr(d.time, "sleep", lambda delay: clock.__setitem__(0, clock[0] + delay))
 
@@ -1091,7 +1093,7 @@ def test_rejected_adapter_still_fails_distinctly_from_a_timeout(monkeypatch):
     revision = "run-1/final"
     monkeypatch.setattr(
         d,
-        "_registered_adapter_response",
+        "_fetch_registered_checkpoint_response",
         lambda org_id, adapter_id, **_kwargs: (
             {
                 "subfolder": "sft/run-1/seed0/adapter",
@@ -1117,7 +1119,7 @@ def test_deploy_ready_read_returned_at_deadline_never_succeeds(monkeypatch, tmp_
     _stub_adapter_config(monkeypatch, tmp_path, rank=32)
     monkeypatch.setattr(d, "_wait_checkpoint_ready", real_wait_checkpoint_ready)
     monkeypatch.setattr(d, "resolve_artifact_revision", lambda _repo: "a" * 40)
-    monkeypatch.setattr(d, "_registered_adapter", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(d, "fetch_registered_checkpoint", lambda *_args, **_kwargs: None)
     registration_body = {}
 
     class Response:
@@ -1135,7 +1137,9 @@ def test_deploy_ready_read_returned_at_deadline_never_succeeds(monkeypatch, tmp_
         assert org_id == "org-1"
         assert adapter_id == registration_body["model_id"]
         # the deploy funds this read from the model's own scaled budget, not the bare floor.
-        assert timeout_s == serving_readiness.revision_ready_budget_seconds("Qwen/Qwen3.5-9B")
+        assert timeout_s == serving_readiness.checkpoint_readiness_timeout_seconds(
+            "Qwen/Qwen3.5-9B"
+        )
         clock[0] += timeout_s
         return (
             {
@@ -1146,7 +1150,7 @@ def test_deploy_ready_read_returned_at_deadline_never_succeeds(monkeypatch, tmp_
         )
 
     monkeypatch.setattr(serving_transport, "serving_request", request)
-    monkeypatch.setattr(d, "_registered_adapter_response", registered)
+    monkeypatch.setattr(d, "_fetch_registered_checkpoint_response", registered)
     monkeypatch.setattr(d.time, "monotonic", lambda: clock[0])
 
     with pytest.raises(serving_errors.ServingError, match="checkpoint_ready_timeout"):
@@ -1175,7 +1179,7 @@ def test_registered_adapter_caps_request_timeout(monkeypatch):
     monkeypatch.setenv("FREESOLO_SERVING_URL", "https://serve.example")
     monkeypatch.setattr(httpx, "get", fake_get)
 
-    assert d._registered_adapter("org-1", "run-1/final", timeout_s=0.75) is None
+    assert d.fetch_registered_checkpoint("org-1", "run-1/final", timeout_s=0.75) is None
     assert seen["timeout"] == 0.75
 
 
@@ -1485,7 +1489,7 @@ def test_readiness_receives_complete_facts_after_registry_readiness(
         observed.append(facts)
         monkeypatch.setattr(
             d,
-            "_registered_adapter",
+            "fetch_registered_checkpoint",
             lambda *a, **k: {"status": "ready", "deployment_generation": "generation-a"},
         )
 
@@ -1525,7 +1529,7 @@ def test_registration_post_rejection_is_distinct_from_readiness_failure(
 
     _stub_adapter_config(monkeypatch, tmp_path, rank=32)
     monkeypatch.setattr(d, "resolve_artifact_revision", lambda _repo: "a" * 40)
-    monkeypatch.setattr(d, "_registered_adapter", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(d, "fetch_registered_checkpoint", lambda *_args, **_kwargs: None)
 
     def reject(method, *args, **kwargs):
         assert method == "POST"

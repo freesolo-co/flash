@@ -509,7 +509,7 @@ def test_finalize_preserves_failed_checkpoint_identity(monkeypatch):
     failure = {"step": 50, "operation": "resume", "error": "quota denied"}
 
     worker_heartbeat.heartbeat("checkpoint_upload_failed", step=50, checkpoint_failure=failure)
-    worker_finalize._finalize(RunMetrics(phase="sft", step=100))
+    worker_finalize._publish_training_completion(RunMetrics(phase="sft", step=100))
 
     assert committed[-1]["stage"] == "done"
     assert committed[-1]["step"] == 100
@@ -528,7 +528,7 @@ def test_successful_checkpoint_clears_failure_before_any_terminal(monkeypatch, t
     worker_heartbeat.heartbeat("checkpoint_uploaded", step=75)
     if terminal_stage == "done":
         monkeypatch.setattr(worker_perf, "gpu_diagnostics", dict)
-        worker_finalize._finalize(RunMetrics(phase="sft", step=100))
+        worker_finalize._publish_training_completion(RunMetrics(phase="sft", step=100))
     else:
         worker_heartbeat.heartbeat(terminal_stage, step=100, error="later fatal")
 

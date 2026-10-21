@@ -13,7 +13,7 @@ def test_unconfirmed_verification_does_not_undeploy_the_new_generation(monkeypat
     state = SimpleNamespace(deployments={"run-1/final": deployment})
     monkeypatch.setattr(completion.JobSpec, "from_dict", lambda _: SimpleNamespace())
     monkeypatch.setattr(completion.run_status, "get_status", lambda _: state)
-    monkeypatch.setattr(completion, "_assert_deployment_fence", lambda *a: None)
+    monkeypatch.setattr(completion, "_require_current_deployment_attempt", lambda *a: None)
     monkeypatch.setattr(
         completion.runner_transitions,
         "mark_deployment_pending",
@@ -33,7 +33,7 @@ def test_unconfirmed_verification_does_not_undeploy_the_new_generation(monkeypat
             readback, status_code=503 if readback == "unavailable" else None
         )
 
-    monkeypatch.setattr(completion.serving_deploy, "_registered_adapter", registered)
+    monkeypatch.setattr(completion.serving_deploy, "fetch_registered_checkpoint", registered)
 
     def deploy(**kwargs):
         kwargs["before_ready"](

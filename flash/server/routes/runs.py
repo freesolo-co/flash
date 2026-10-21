@@ -31,9 +31,9 @@ from flash.server.platform.deps import (
     _parse_spec,
     _require_bool,
     _runtime_secrets,
-    owned_run,
-    readable_run,
     require_key,
+    require_owned_run,
+    require_readable_run,
 )
 
 _LOG = logging.getLogger("flash.server.runs")
@@ -482,7 +482,7 @@ def list_runs(key: Annotated[dict, Depends(require_key)]):
 @router.get("/v1/runs/{run_id}")
 def run_status(run_id: str, key: Annotated[dict, Depends(require_key)]):
 
-    status = owned_run(run_id, key)
+    status = require_owned_run(run_id, key)
     return status.to_dict()
 
 
@@ -493,7 +493,7 @@ def run_logs(
     offset: int = 0,
     x_freesolo_org_id: Annotated[str | None, Header()] = None,
 ):
-    status = readable_run(run_id, key, x_freesolo_org_id)
+    status = require_readable_run(run_id, key, x_freesolo_org_id)
     log_path = runs_file_path(run_id, ".log")
     chunk, end = "", max(0, offset)
     if os.path.exists(log_path):
@@ -523,7 +523,7 @@ def run_worker_output(
     key: Annotated[dict, Depends(require_key)],
     x_freesolo_org_id: Annotated[str | None, Header()] = None,
 ):
-    status = readable_run(run_id, key, x_freesolo_org_id)
+    status = require_readable_run(run_id, key, x_freesolo_org_id)
     # hf_repo + run_id (adapter prefix) are platform-managed and stripped from the public spec;
     # the worker artifact repo lives under the internal carrier (see _internal_spec_from_status).
     from flash.runner.lifecycle.state import _internal_spec_from_status
@@ -536,7 +536,7 @@ def run_worker_output(
 
 @router.post("/v1/runs/{run_id}/cancel")
 def cancel(run_id: str, key: Annotated[dict, Depends(require_key)]):
-    owned_run(run_id, key)
+    require_owned_run(run_id, key)
     try:
         return cancel_run(run_id).to_dict()
     except DeploymentCleanupError as exc:
@@ -565,7 +565,7 @@ def cancel(run_id: str, key: Annotated[dict, Depends(require_key)]):
 @router.get("/v1/runs/{run_id}/checkpoints")
 def run_checkpoints(run_id: str, key: Annotated[dict, Depends(require_key)]):
     """List a run's deployable per-step RL checkpoints."""
-    status = owned_run(run_id, key)
+    status = require_owned_run(run_id, key)
     # checkpoint listing keys off hf_repo + run_id, both platform-managed and stripped from the
     # public spec; resolve them from the internal carrier (see _internal_spec_from_status).
     from flash.runner.lifecycle.state import _internal_spec_from_status

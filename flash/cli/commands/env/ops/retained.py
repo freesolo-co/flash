@@ -14,7 +14,7 @@ from pathlib import Path
 from flash._internal.channel import CLI_NAME
 
 
-def _text(path: Path) -> str:
+def _read_text_or_empty(path: Path) -> str:
     """The file's text, or "" if it cannot be decoded as UTF-8.
 
     This whole path only decides whether to PRINT an advisory, and setup leaves the retained files
@@ -63,7 +63,7 @@ def _warn_if_retained_starter_files_describe_another_plane(
         path
         for path in starter_files
         if path.exists()
-        if any(marker in _text(path) for marker in wanted)
+        if any(marker in _read_text_or_empty(path) for marker in wanted)
     ]
     if not mismatched:
         return

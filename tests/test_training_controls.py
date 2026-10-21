@@ -464,14 +464,14 @@ def test_every_attempt_of_a_run_shares_the_one_authoritative_seed():
 
 
 def test_sft_under_ran_only_fails_a_genuine_under_run():
-    from flash.engine.worker.entry.sft import sft_under_ran
+    from flash.engine.worker.entry.sft import sft_finished_before_expected_steps
 
     # a real under-run (fewer updates than the quoted horizon) fails loudly.
-    assert sft_under_ran(9, 10)
+    assert sft_finished_before_expected_steps(9, 10)
     # a fresh run landed exactly on the horizon passes.
-    assert not sft_under_ran(10, 10)
+    assert not sft_finished_before_expected_steps(10, 10)
     # a resume from a checkpoint past a lowered horizon did zero new steps yet is fully trained.
-    assert not sft_under_ran(12, 10)
+    assert not sft_finished_before_expected_steps(12, 10)
 
 
 def test_grpo_under_ran_only_fails_a_genuine_under_run():

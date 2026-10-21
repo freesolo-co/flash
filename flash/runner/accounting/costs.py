@@ -113,10 +113,10 @@ def charge_usd_for_spec(
     """
     try:
         from flash.cost.analytical import estimate_cost
-        from flash.cost.spec import UnknownPromptPoolSize, runconfig_from_spec
+        from flash.cost.spec import UnknownPromptPoolSize, run_config_from_spec
 
         try:
-            cfg = runconfig_from_spec(spec)
+            cfg = run_config_from_spec(spec)
         except UnknownPromptPoolSize:
             # a cancel prices work that already happened, so it must not need a PREDICTED horizon.
             # grpo/opd derive theirs from a stated prompt-pool size and refuse to guess without one,
@@ -126,7 +126,7 @@ def charge_usd_for_spec(
             # prorating callers may do this: with no steps to state, there is still no horizon.
             if steps is None:
                 raise
-            cfg = runconfig_from_spec(_spec_pinned_to_horizon(spec, int(steps)))
+            cfg = run_config_from_spec(_spec_pinned_to_horizon(spec, int(steps)))
         if provider:
             # suppressed ValueError: the registry no longer maps this provider to the spec's
             # class. the combination was rentable when the run launched, so degrade to the spec's

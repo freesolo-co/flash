@@ -41,7 +41,7 @@ shim_marker_file = _sft_train.shim_marker_file
 verify_applied_shim_markers = _sft_train.verify_applied_shim_markers
 SHIM_FRAGMENT_FAILED_EXIT_CODE = _sft_train.SHIM_FRAGMENT_FAILED_EXIT_CODE
 sft_tokens_for_updates = _sft_train.sft_tokens_for_updates
-sft_under_ran = _sft_train.sft_under_ran
+sft_finished_before_expected_steps = _sft_train.sft_finished_before_expected_steps
 validate_save_steps = _sft_train.validate_save_steps
 _render_sft_dataset_module = _sft_train._render_sft_dataset_module
 
@@ -899,7 +899,7 @@ def _verify_sft_run(
     resume_step: int,
 ) -> _SftVerified:
     actor_dir, final_step = _sft_train.latest_global_step_dir(options.paths.local_dir)
-    if sft_under_ran(final_step, model.update_horizon):
+    if sft_finished_before_expected_steps(final_step, model.update_horizon):
         raise RuntimeError(
             f"sft completed {final_step}/{model.update_horizon} requested optimizer updates"
         )

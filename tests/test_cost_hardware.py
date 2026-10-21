@@ -273,7 +273,7 @@ def test_ranking_caps_the_rollout_batch_at_the_retained_prompt_count():
 def test_the_persisted_quote_prices_the_same_batch_ranking_selects_hardware_for():
     """The quote a run is BILLED from must price the batch the ranker sized the card for.
 
-    `runconfig_from_spec` fed `RunConfig.batch_size` the raw authored `prompts_per_step`, so a run
+    `run_config_from_spec` fed `RunConfig.batch_size` the raw authored `prompts_per_step`, so a run
     with `prompts_per_step = 128, max_examples = 2` was quoted for a batch of 128 while training on
     2. The persisted quote is what a completed or cancelled run is charged against
     (`flash/runner/accounting/costs.py`), and it also gates the pre-submit affordability check, so the gap both
@@ -283,7 +283,7 @@ def test_the_persisted_quote_prices_the_same_batch_ranking_selects_hardware_for(
     quote mixed a capped step count with an uncapped per-step price.
     """
     from flash.core.spec import JobSpec
-    from flash.cost.spec import runconfig_from_spec
+    from flash.cost.spec import run_config_from_spec
     from flash.providers.core.base import run_config_for_ranking
 
     base = {
@@ -321,7 +321,7 @@ def test_the_persisted_quote_prices_the_same_batch_ranking_selects_hardware_for(
             spec = JobSpec.from_dict(
                 {**base, "algorithm": algorithm, "run_id": "q", "train": train}
             )
-            quoted = runconfig_from_spec(spec).normalized().batch_size
+            quoted = run_config_from_spec(spec).normalized().batch_size
             ranked = (
                 run_config_for_ranking("Qwen/Qwen3.5-9B", algorithm, train=train)
                 .normalized()
@@ -340,7 +340,7 @@ def test_the_persisted_quote_prices_the_same_batch_ranking_selects_hardware_for(
             "train": {"epochs": 1, "group_size": 4, "prompts_per_step": 128, "max_examples": 2},
         }
     )
-    assert runconfig_from_spec(capped).normalized().batch_size == 2
+    assert run_config_from_spec(capped).normalized().batch_size == 2
 
     # a stated horizon needs no pool size, so capping must not turn `max_steps` into a refusal.
     # `spec_steps` returns before asking for a row count; asking anyway here would reject a fully
@@ -353,7 +353,7 @@ def test_the_persisted_quote_prices_the_same_batch_ranking_selects_hardware_for(
             "train": {"epochs": 1, "group_size": 4, "prompts_per_step": 32, "max_steps": 10},
         }
     )
-    assert runconfig_from_spec(stated).normalized().batch_size == 32
+    assert run_config_from_spec(stated).normalized().batch_size == 32
 
     # and a pool that genuinely cannot be known is still dev's explicit refusal, not a cheap quote.
     from flash.cost.spec import UnknownPromptPoolSize
@@ -367,7 +367,7 @@ def test_the_persisted_quote_prices_the_same_batch_ranking_selects_hardware_for(
         }
     )
     with pytest.raises(UnknownPromptPoolSize):
-        runconfig_from_spec(unbounded)
+        run_config_from_spec(unbounded)
 
     # [environment.params] max_examples is not horizon evidence at all, so a spec stating only that
     # is refused rather than priced from it. it is an opaque kwarg forwarded to the user's
@@ -389,7 +389,7 @@ def test_the_persisted_quote_prices_the_same_batch_ranking_selects_hardware_for(
         }
     )
     with pytest.raises(UnknownPromptPoolSize):
-        runconfig_from_spec(env_only)
+        run_config_from_spec(env_only)
 
     # and when both are stated, the enforced [train] cap is the one that binds.
     both = JobSpec.from_dict(
@@ -404,7 +404,7 @@ def test_the_persisted_quote_prices_the_same_batch_ranking_selects_hardware_for(
             "train": {"epochs": 1, "group_size": 4, "prompts_per_step": 128, "max_examples": 4},
         }
     )
-    assert runconfig_from_spec(both).normalized().batch_size == 4
+    assert run_config_from_spec(both).normalized().batch_size == 4
 
 
 def test_sft_fit_credits_only_the_ranks_that_will_launch():

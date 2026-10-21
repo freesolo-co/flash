@@ -62,7 +62,7 @@ from flash.serve.provisioning.modal.readiness_checks.teardown import (
     confirmed_abort_handle,
     delete_confirmed_abort_resources,
     delete_teardown_resources,
-    suppressed,
+    run_teardown_step_best_effort,
     wait_for_terminal_app,
 )
 
@@ -404,7 +404,9 @@ def _abort_created_resources(
             return False
         # stop acknowledgement is not terminal proof. modal may retain the mount until lifecycle
         # observation reaches a zero-container terminal state, so use the same wait as teardown.
-        suppressed(lambda: mutation(lambda: sdk.stop_app(plan, proof.handle.app_id)))
+        run_teardown_step_best_effort(
+            lambda: mutation(lambda: sdk.stop_app(plan, proof.handle.app_id))
+        )
         try:
             terminal = wait_for_terminal_app(
                 plan,

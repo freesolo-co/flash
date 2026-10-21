@@ -13,7 +13,7 @@ from typing import Any
 RequireSpec = type | tuple[type, ...] | list[Any]
 
 
-def matches_require(value: object, expected: RequireSpec) -> bool:
+def matches_required_shape(value: object, expected: RequireSpec) -> bool:
     """True when a required response value has a shape the caller can actually read.
 
     ``[dict]`` exists because a bare ``list`` accepts ``{"runs": [null]}``, which then crashes on
@@ -23,6 +23,8 @@ def matches_require(value: object, expected: RequireSpec) -> bool:
     """
     if isinstance(expected, list):
         (element,) = expected
-        return isinstance(value, list) and all(matches_require(item, element) for item in value)
+        return isinstance(value, list) and all(
+            matches_required_shape(item, element) for item in value
+        )
     wants_bool = expected is bool or (isinstance(expected, tuple) and bool in expected)
     return isinstance(value, expected) and (wants_bool or not isinstance(value, bool))

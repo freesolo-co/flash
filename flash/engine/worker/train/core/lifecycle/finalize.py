@@ -74,8 +74,9 @@ def write_train_meta(
     m = RunMetrics(
         arm=os.environ.get("FLASH_ARM", "modal"),
         phase=phase,
-        # Completed optimizer updates (opd passes step=opt_steps; sft/rl omit it -> None). _finalize
-        # reads metrics.step to carry the true step onto the terminal `done` heartbeat.
+        # Completed optimizer updates (opd passes step=opt_steps; sft/rl omit it -> None).
+        # _publish_training_completion reads metrics.step to carry the true step onto the
+        # terminal `done` heartbeat.
         step=step,
         seed=worker_state.SEED,
         model_id=model_id,
@@ -96,10 +97,10 @@ def write_train_meta(
             "job_spec": _train_meta_job_spec(),
         },
     )
-    _finalize(m, heartbeat_fields=_heartbeat_fields)
+    _publish_training_completion(m, heartbeat_fields=_heartbeat_fields)
 
 
-def _finalize(metrics: RunMetrics, *, heartbeat_fields=None):
+def _publish_training_completion(metrics: RunMetrics, *, heartbeat_fields=None):
     import time
 
     metrics.save("/tmp/metrics.json")

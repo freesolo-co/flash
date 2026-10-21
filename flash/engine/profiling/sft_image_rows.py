@@ -44,7 +44,7 @@ def _serialize_multimodal_inputs(values: dict) -> bytes:
     return payload.getvalue()
 
 
-def _ids(value) -> list[int]:
+def _normalize_token_ids(value) -> list[int]:
     if hasattr(value, "tolist"):
         value = value.tolist()
     if value and isinstance(value[0], list):
@@ -133,7 +133,7 @@ def estimate_sft_image_row(
                 preserve_thinking=False,
             )
         )["input_ids"]
-        return expand_image_pad_runs(_ids(rendered), pad_token_id, pad_counts)
+        return expand_image_pad_runs(_normalize_token_ids(rendered), pad_token_id, pad_counts)
 
     untruncated_ids = token_ids(full_messages, add_generation_prompt=False)
     untruncated_length = len(untruncated_ids)
@@ -202,10 +202,10 @@ def process_sft_image_row(
                 **common,
             )
         )
-        untruncated_ids = _ids(full.pop("input_ids"))
+        untruncated_ids = _normalize_token_ids(full.pop("input_ids"))
         untruncated_length = len(untruncated_ids)
         input_ids = untruncated_ids[:max_length]
-        prompt_ids = _ids(prompt["input_ids"])[:max_length]
+        prompt_ids = _normalize_token_ids(prompt["input_ids"])[:max_length]
         # the span reader needs the text tokenizer's vocabulary; a processor exposes it as
         # .tokenizer. the IMAGE-PREPARED messages are what the processor actually rendered, so
         # probing the unprepared list would validate a different transcript than the one masked.

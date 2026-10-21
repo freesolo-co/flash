@@ -94,7 +94,7 @@ def test_former_openai_json_object_is_now_a_raw_schema():
     assert _canonical({"type": "json_object"}) == {"json": {"type": "json_object"}}
 
 
-def test_string_forms():
+def test_structured_output_strings_normalize_to_canonical_constraints():
     # inline JSON text (how a TOML single-quoted string arrives), shorthands, and JSON-of-canonical
     assert _canonical(json.dumps(_SCHEMA)) == {"json": _SCHEMA}
     assert _canonical(json.dumps({"regex": "a+"})) == {"regex": "a+"}

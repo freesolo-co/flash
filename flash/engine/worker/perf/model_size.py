@@ -28,8 +28,8 @@ def _checkpointing_default_for_model(model_id: str, revision: str = "") -> bool:
     probe reconstructs a parameter count as ``embeddings + 12 h^2 per layer``, which describes a
     DENSE transformer: it cannot see an expert stack, so it reads Qwen3.6-35B-A3B (35B total) as
     3.03B -- 1% over this threshold, on a model that clears it 11x over. Nothing about that margin
-    is load-bearing, and it decides gradient checkpointing (``_memory_mode``), so a catalog whose
-    vocab or depth shifted slightly would silently turn GC off on a 35B model.
+    is load-bearing, and it decides gradient checkpointing (``_prefer_gradient_checkpointing``),
+    so a catalog whose vocab or depth shifted slightly would silently turn GC off on a 35B model.
 
     The probe is also fail-open for this caller: it returns False on ANY exception, and False here
     means "small model, no checkpointing needed". A network blip or a rate-limited HF read would

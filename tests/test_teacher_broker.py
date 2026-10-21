@@ -2107,7 +2107,7 @@ def test_multiturn_capability_quota_covers_turns_and_no_signal_attempts(max_turn
 
 
 def test_unknown_external_environment_uses_identical_ceiling_for_quota_and_cost():
-    from flash.cost.spec import runconfig_from_spec
+    from flash.cost.spec import run_config_from_spec
     from flash.teacher.limits import opd_teacher_request_multiplier
 
     spec = JobSpec(
@@ -2119,7 +2119,7 @@ def test_unknown_external_environment_uses_identical_ceiling_for_quota_and_cost(
     )
 
     limits = teacher_broker.capability_limits_for_spec(spec)
-    config = runconfig_from_spec(spec)
+    config = run_config_from_spec(spec)
     cost_multiplier = opd_teacher_request_multiplier(
         multi_turn=config.opd_multi_turn,
         max_turns=config.opd_max_turns,

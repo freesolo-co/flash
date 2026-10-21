@@ -599,13 +599,13 @@ def _teardown_unrecoverable_remote(status) -> None:
     Best-effort and fully suppressed: recovery must finish for every other run regardless.
     """
     from flash.runner.accounting.reconciliation import _record_cleanup_remote
-    from flash.runner.supervise.recovery import _strict_teardown_handle
+    from flash.runner.supervise.recovery import _destroy_and_confirm_worker
 
     remote = dict(status.remote or {})
     if not remote:
         return
     try:
-        deleted = _strict_teardown_handle(remote, status.run_id)
+        deleted = _destroy_and_confirm_worker(remote, status.run_id)
     except Exception:
         # unconfirmed deletion: leave it recorded for the cleanup drain rather than dropping it.
         deleted = False
@@ -686,7 +686,7 @@ def _classify_recoverable_runs(
             # upgrade path -- a run accepted under an algorithm this build has since dropped -- so
             # decide it HERE, where the handle is still in hand, rather than dispatching a thread
             # that can only crash. Same disposition as the handle-less branch below: fail it
-            # visibly, then tear the worker down. `_strict_teardown_handle` needs only the persisted
+            # visibly, then tear the worker down. `_destroy_and_confirm_worker` needs only the persisted
             # handle and the run id, never a parsed spec, so removal does not depend on the parse
             # that just failed.
             try:
@@ -708,7 +708,7 @@ def _classify_recoverable_runs(
                 # snapshot, of a list that did not yet contain this record.
                 # `_drain_cleanup_remotes` returns early on an empty snapshot, so nothing would
                 # retry it before the next restart. Dispatch a second drain now that the record
-                # exists. A double teardown of one handle is safe: `_strict_teardown_handle` is
+                # exists. A double teardown of one handle is safe: `_destroy_and_confirm_worker` is
                 # idempotent and the record is removed by compare-and-remove only on a confirmed
                 # delete.
                 threading.Thread(

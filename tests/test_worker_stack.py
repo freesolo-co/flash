@@ -571,7 +571,7 @@ def test_checkpointing_default_model_size_gate(monkeypatch):
 
     Named for liger because that is where the threshold was measured (PR #174, fused-CE's memory win
     only paying off above ~3B), but liger itself is gone from the verl paths: this predicate now
-    feeds ``_memory_mode`` -> ``grad_checkpointing_on``, so the threshold is load-bearing for
+    feeds ``_prefer_gradient_checkpointing`` -> ``grad_checkpointing_on``, so the threshold is load-bearing for
     gradient checkpointing rather than for a fused-CE choice.
     """
     monkeypatch.setenv("RUN_MODE", "sft")
@@ -605,8 +605,8 @@ def test_checkpointing_default_model_size_gate(monkeypatch):
     # context-aware: a SMALL model at LONG context is memory-bound -> memory mode ON (PR #174:
     # 1B GRPO OOMs at 4096 in speed mode, fits in memory mode).
     fake_cfg(small)
-    assert w._memory_mode("meta-llama/Llama-3.2-1B", 512) is False
-    assert w._memory_mode("meta-llama/Llama-3.2-1B", 4096) is True
+    assert w._prefer_gradient_checkpointing("meta-llama/Llama-3.2-1B", 512) is False
+    assert w._prefer_gradient_checkpointing("meta-llama/Llama-3.2-1B", 4096) is True
     assert w.grad_checkpointing_on("meta-llama/Llama-3.2-1B", 4096) is True
 
 
@@ -687,7 +687,9 @@ def test_train_metadata_keeps_model_revision_in_nested_job_spec(monkeypatch):
     monkeypatch.setattr(finalize.hf_io, "hf_upload_file", lambda *args, **kwargs: None)
     monkeypatch.setattr(finalize.heartbeat_io, "heartbeat", lambda *args, **kwargs: None)
     monkeypatch.setattr(
-        finalize, "_finalize", lambda metrics, **kwargs: captured.append((metrics, kwargs))
+        finalize,
+        "_publish_training_completion",
+        lambda metrics, **kwargs: captured.append((metrics, kwargs)),
     )
     monkeypatch.setattr(finalize, "gpu_diagnostics", dict)
 
@@ -726,7 +728,7 @@ def test_train_metadata_preserves_terminal_heartbeat_fields(monkeypatch):
     )
     monkeypatch.setattr(
         finalize,
-        "_finalize",
+        "_publish_training_completion",
         lambda metrics, **kwargs: finalized.append((metrics, kwargs)),
     )
     monkeypatch.setattr(finalize, "gpu_diagnostics", dict)
@@ -766,7 +768,9 @@ def test_finalize_preserves_terminal_heartbeat_fields(monkeypatch):
     monkeypatch.setattr(finalize, "gpu_diagnostics", dict)
     monkeypatch.setattr("builtins.open", mock_open())
 
-    finalize._finalize(RunMetrics(phase="rl"), heartbeat_fields={"metrics_last": metrics_last})
+    finalize._publish_training_completion(
+        RunMetrics(phase="rl"), heartbeat_fields={"metrics_last": metrics_last}
+    )
 
     assert emitted[-1][0] == "done"
     assert emitted[-1][1]["metrics_last"] == metrics_last
@@ -789,7 +793,7 @@ def test_finalize_uploads_metrics_before_done(monkeypatch):
     monkeypatch.setattr(finalize, "gpu_diagnostics", dict)
     monkeypatch.setattr("builtins.open", mock_open())
 
-    finalize._finalize(RunMetrics(phase="rl"))
+    finalize._publish_training_completion(RunMetrics(phase="rl"))
 
     assert uploads == [
         ("metrics.json", {"required": True}),

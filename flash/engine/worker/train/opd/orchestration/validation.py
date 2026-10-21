@@ -18,7 +18,7 @@ class OpdVerlStructuredValidation:
     model_vocab_size: int = 0
 
 
-def _xgrammar_unsupported_json_feature(schema: dict[str, Any]) -> bool:
+def _has_unsupported_xgrammar_schema_feature(schema: dict[str, Any]) -> bool:
     """mirror vllm 0.11.0's xgrammar-to-guidance fallback predicate."""
     if not isinstance(schema, dict):
         return False
@@ -27,7 +27,8 @@ def _xgrammar_unsupported_json_feature(schema: dict[str, Any]) -> bool:
         # array-valued type: the keyword applies if ANY member type would trigger the fallback;
         # normalize by re-running the predicate per member.
         return any(
-            _xgrammar_unsupported_json_feature({**schema, "type": member}) for member in schema_type
+            _has_unsupported_xgrammar_schema_feature({**schema, "type": member})
+            for member in schema_type
         )
     # keywords trigger the guidance fallback whether or not "type" is spelled out (json-schema
     # keywords apply implicitly); an untyped schema with these keywords must also be rejected.
@@ -45,10 +46,11 @@ def _xgrammar_unsupported_json_feature(schema: dict[str, Any]) -> bool:
     ):
         return True
     for value in schema.values():
-        if isinstance(value, dict) and _xgrammar_unsupported_json_feature(value):
+        if isinstance(value, dict) and _has_unsupported_xgrammar_schema_feature(value):
             return True
         if isinstance(value, list) and any(
-            isinstance(item, dict) and _xgrammar_unsupported_json_feature(item) for item in value
+            isinstance(item, dict) and _has_unsupported_xgrammar_schema_feature(item)
+            for item in value
         ):
             return True
     return False
@@ -65,7 +67,7 @@ def _require_exact_replay_constraint(constraint: dict[str, Any]) -> None:
             "verl OPD pins xgrammar"
         )
     schema = constraint.get("json")
-    if isinstance(schema, dict) and _xgrammar_unsupported_json_feature(schema):
+    if isinstance(schema, dict) and _has_unsupported_xgrammar_schema_feature(schema):
         raise ValueError(
             "train.structured_outputs JSON schema requires vLLM's guidance fallback, but verl OPD "
             "pins xgrammar for exact forced-token replay"

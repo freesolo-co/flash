@@ -986,7 +986,7 @@ def test_standalone_owner_manages_its_own_deployments_without_org_headers(
     """`flash models deploy` must work on the plane the operator owns outright.
 
     Standalone resolves its one operator credential to ``auth_kind == "internal"`` against the
-    key-independent standalone-owner row, so `manageable_run` sent the plane's own run owner down
+    key-independent standalone-owner row, so `require_manageable_run` sent the plane's own run owner down
     the internal branch, which demands ``X-Freesolo-Org-Id``. The CLI's deploy, poll, and undeploy
     calls send no such header and a standalone plane has no organization directory to take one
     from, so deploying a run the caller demonstrably owned answered 404 with no way to succeed.
@@ -1007,7 +1007,7 @@ def test_standalone_owner_manages_its_own_deployments_without_org_headers(
     monkeypatch.setattr(_deps, "_load_status", lambda _run_id: sentinel)
 
     # no org/project headers, exactly as the CLI sends them
-    assert _deps.manageable_run("run-standalone", key) is sentinel
+    assert _deps.require_manageable_run("run-standalone", key) is sentinel
 
 
 def test_standalone_deployment_management_still_refuses_a_run_it_does_not_own(
@@ -1039,7 +1039,7 @@ def test_standalone_deployment_management_still_refuses_a_run_it_does_not_own(
     )
 
     with pytest.raises(HTTPException) as ei:
-        _deps.manageable_run("run-someone-else", key)
+        _deps.require_manageable_run("run-someone-else", key)
     assert ei.value.status_code == 404
 
 
@@ -1092,7 +1092,9 @@ def test_standalone_serving_scope_is_stable_across_deploy_chat_and_undeploy(monk
     assert run_serving_org_id(status) == auth.STANDALONE_SERVING_ORG_ID
 
     registrations: list[dict] = []
-    monkeypatch.setattr(serving_deploy, "_registered_adapter", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        serving_deploy, "fetch_registered_checkpoint", lambda *_args, **_kwargs: None
+    )
     monkeypatch.setattr(serving_deploy, "resolve_artifact_revision", lambda _repo: "a" * 40)
     monkeypatch.setattr(
         serving_deploy.adapter_check,
@@ -1128,7 +1130,7 @@ def test_standalone_serving_scope_is_stable_across_deploy_chat_and_undeploy(monk
     assert registrations[0]["org_id"] == auth.STANDALONE_SERVING_ORG_ID
     assert registrations[0]["json"]["org_id"] == auth.STANDALONE_SERVING_ORG_ID
 
-    monkeypatch.setattr(serving, "manageable_run", lambda *_args, **_kwargs: status)
+    monkeypatch.setattr(serving, "require_manageable_run", lambda *_args, **_kwargs: status)
     monkeypatch.setattr(
         serving_deploy,
         "undeploy_adapter",
@@ -1150,7 +1152,7 @@ def test_standalone_serving_scope_is_stable_across_deploy_chat_and_undeploy(monk
     )
     assert undeployed["disabled_checkpoints"] == ["run-standalone/final"]
 
-    monkeypatch.setattr(serving_chat, "manageable_run", lambda *_args, **_kwargs: status)
+    monkeypatch.setattr(serving_chat, "require_manageable_run", lambda *_args, **_kwargs: status)
     monkeypatch.setattr(
         serving_chat,
         "effective_spec_from_status",

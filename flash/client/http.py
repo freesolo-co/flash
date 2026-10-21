@@ -23,7 +23,7 @@ from flash._internal.openai_sse import (
     iter_openai_sse_events,
 )
 from flash.client.config import load_credentials_with_source
-from flash.client.shapes import RequireSpec, matches_require
+from flash.client.shapes import RequireSpec, matches_required_shape
 from flash.client.streaming import (
     ProgressCallback,
     _capped_timeout,
@@ -395,7 +395,7 @@ class ApiClient:
         bad = [
             key
             for key, expected in (require or {}).items()
-            if key not in payload or not matches_require(payload[key], expected)
+            if key not in payload or not matches_required_shape(payload[key], expected)
         ]
         if bad:
             raise _unexpected_response(

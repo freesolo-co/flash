@@ -78,7 +78,7 @@ def _headroom(params_b: float, algo: str, quant: str, gpu: str) -> str:
         (36.0, "grpo", "bf16", "L40S", "too_big"),  # 2 bf16 copies + KV >> 32 GB
     ],
 )
-def test_estimator_anchors(params_b, algo, quant, gpu, expected):
+def test_vram_headroom_matches_reference_estimates(params_b, algo, quant, gpu, expected):
     # params_b is supplied directly, so this calibrates the SIZING EQUATIONS against known anchors
     # and never resolves the id through the catalog.
     assert _headroom(params_b, algo, quant, gpu) == expected

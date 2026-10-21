@@ -140,7 +140,7 @@ def select_sft_examples(train, max_examples, seed):
     return selected
 
 
-def sft_under_ran(final_step: int, update_horizon: int) -> bool:
+def sft_finished_before_expected_steps(final_step: int, update_horizon: int) -> bool:
     """True when the run completed fewer updates than the horizon it was quoted and billed for.
 
     the horizon caps every run (trainer.total_training_steps in _prepare_sft_child), so a fresh run

@@ -106,7 +106,7 @@ def _adapter_ref_for_status(status: RunStatus) -> str | None:
         # a status json written by an older plane can carry since-removed spec keys (e.g.
         # ``gpu.exact_type`` pre-#670), and stored run records are never rewritten. jobspec.from_dict
         # is strict, so parsing raises -- and one such record would 500 the whole runs list. same
-        # operational tolerance as _runstatus_from_json: the record stays readable, it just shows no
+        # operational tolerance as _run_status_from_json: the record stays readable, it just shows no
         # adapter ref (its spec cannot name one we could resolve).
         return None
     if not spec.train.hf_repo:

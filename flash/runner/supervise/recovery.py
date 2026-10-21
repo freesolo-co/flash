@@ -87,7 +87,7 @@ def _worker_provably_gone(run_id: str, handle) -> bool:
         return False
 
 
-def _strict_teardown_handle(handle, run_id: str) -> bool:
+def _destroy_and_confirm_worker(handle, run_id: str) -> bool:
     from flash.providers.core.registry import get_provider
 
     canonical = _canonical_provider_handle(handle)
@@ -323,7 +323,7 @@ def _gc_run_sandboxes(spec: JobSpec) -> None:
         and _remote_resource_identity(status.remote) not in attempted_cleanup
     ):
         try:
-            resource_deleted = _strict_teardown_handle(status.remote, spec.run_id)
+            resource_deleted = _destroy_and_confirm_worker(status.remote, spec.run_id)
             if resource_deleted:
                 _compare_and_confirm_remote_teardown(spec.run_id, status.remote)
             elif status.remote.get("provider") == "modal":

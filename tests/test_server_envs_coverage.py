@@ -260,7 +260,7 @@ def test_github_download_wrapper_uses_default_repo(monkeypatch):
 
 def test_deployment_state_and_public_deployment():
     original = {"a": 1, "state": "queued"}
-    out = deployment_state._deployment_state(original, "ready", detail="done")
+    out = deployment_state.with_deployment_state(original, "ready", detail="done")
     assert out["state"] == "ready"
     assert out["detail"] == "done"
     assert out["a"] == 1
@@ -678,7 +678,7 @@ def test_recovery_removes_only_unfinished_checkpoint_and_reports_inventory(monke
     assert serving_completion.recover_deployments() == 1
     from threading import Event
 
-    serving_completion.cleanup_recovered_deployments(Event())
+    serving_completion.cleanup_pending_deployments(Event())
     assert len(reported) == 2
     assert reported[-1].deployments["r-stale/final"] == before
     assert reported[-1].deployments["r-stale/step-20"]["state"] == "undeployed"

@@ -30,13 +30,13 @@ class CleanupOutcome:
 
 def reconcile_cleanup(run_id: str, remote: dict) -> CleanupOutcome:
     """attempt exact teardown and retain every unconfirmed resource for retry."""
-    from flash.runner.supervise.recovery import _strict_teardown_handle, _worker_provably_gone
+    from flash.runner.supervise.recovery import _destroy_and_confirm_worker, _worker_provably_gone
 
     recorded = False
     with contextlib.suppress(Exception):
         recorded = _record_cleanup_remote(run_id, remote)
     try:
-        deleted = _strict_teardown_handle(remote, run_id)
+        deleted = _destroy_and_confirm_worker(remote, run_id)
         stopped = True
     except Exception:
         deleted = False
@@ -271,7 +271,7 @@ def _compare_and_remove_cleanup_remote(run_id: str, expected_remote: dict) -> bo
     report_status: RunStatus | None = None
     with state._status_guard(run_id):
         raw = status_ops._load_status_json(run_id)
-        status = status_ops._runstatus_from_json(raw)
+        status = status_ops._run_status_from_json(raw)
         try:
             records = _cleanup_remotes_from_raw(raw)
         except Exception:
@@ -386,7 +386,7 @@ def _drain_cleanup_remotes(run_id: str) -> set[tuple]:
     if not records:
         return attempted
     from flash.providers.core.base import JobHandle
-    from flash.runner.supervise.recovery import _strict_teardown_handle
+    from flash.runner.supervise.recovery import _destroy_and_confirm_worker
 
     for record in records:
         identity = _remote_resource_identity(record) or _uncanonical_cleanup_remote_key(record)
@@ -394,7 +394,7 @@ def _drain_cleanup_remotes(run_id: str) -> set[tuple]:
             continue
         attempted.add(identity)
         try:
-            resource_deleted = _strict_teardown_handle(JobHandle.from_dict(record), run_id)
+            resource_deleted = _destroy_and_confirm_worker(JobHandle.from_dict(record), run_id)
         except Exception:
             continue
         if resource_deleted:
@@ -425,7 +425,7 @@ def _record_cleanup_remote(run_id: str, remote: dict) -> bool:
     report_status: RunStatus | None = None
     with state._status_guard(run_id):
         raw = status_ops._load_status_json(run_id)
-        status = status_ops._runstatus_from_json(raw)
+        status = status_ops._run_status_from_json(raw)
         records = _cleanup_records_with(raw, record)
         if records is None:
             return False
@@ -446,7 +446,7 @@ def _preserve_cleanup_remote(run_id: str, remote: dict) -> bool:
     report_status: RunStatus | None = None
     with state._status_guard(run_id):
         raw = status_ops._load_status_json(run_id)
-        status = status_ops._runstatus_from_json(raw)
+        status = status_ops._run_status_from_json(raw)
         records = _cleanup_remotes_from_raw(raw)
         if all(_cleanup_remote_key(existing) != key for existing in records):
             records.append(record)

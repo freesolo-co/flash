@@ -41,7 +41,7 @@ def reconcile_enabled() -> bool:
     return internal_key() is not None
 
 
-def _report(body: dict) -> bool:
+def _report_realized_cost(body: dict) -> bool:
     """POST realized cost to the backend with the internal key (Bearer). Best-effort: returns
     True on a 2xx, False on any failure (never raises). Mirrors ``billing._post_billing`` but
     swallows errors -- a metering report must never affect anything."""
@@ -75,7 +75,7 @@ def _realized_cost_remote(status: RunStatus) -> dict:
     return remote if isinstance(remote, dict) else {}
 
 
-def _due(status: RunStatus, now: float) -> bool:
+def _is_reconciliation_due(status: RunStatus, now: float) -> bool:
     """Whether a run should be reconciled this pass: a billable run whose training is finished
     (a terminal billable state, or `deployed` -- see _RECONCILABLE_STATES), not yet reconciled,
     past the settle delay, still within the window, and carrying a provider handle."""
@@ -119,7 +119,7 @@ def reconcile_run(status: RunStatus, *, now: float | None = None) -> bool:
         "costBasis": "realized",
         "source": realized.source,
     }
-    if not _report(body):
+    if not _report_realized_cost(body):
         return False
 
     # persist realized-cost fields only. `status` is stale, and writing its state could revert a run
@@ -140,7 +140,7 @@ def reconcile_once(*, now: float | None = None) -> int:
     now = time.time() if now is None else now
     reported = 0
     for status in runner_status.list_runs():
-        if not _due(status, now):
+        if not _is_reconciliation_due(status, now):
             continue
         with contextlib.suppress(Exception):
             if reconcile_run(status, now=now):

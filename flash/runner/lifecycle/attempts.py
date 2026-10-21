@@ -98,7 +98,7 @@ def _verified_opd_retry_state(run_id: str) -> tuple[int, str | None, int | None]
     """Verify one opd retry snapshot and its optional resumable checkpoint."""
     with state._status_guard(run_id):
         raw = status_ops._load_status_json(run_id)
-        status = status_ops._runstatus_from_json(raw)
+        status = status_ops._run_status_from_json(raw)
         spec = state._internal_spec_from_status(status)
         if spec.algorithm != "opd":
             raise RuntimeError("opd retry verification requires an opd run")
@@ -195,7 +195,7 @@ def _clear_exact_persisted_claim_unlocked(run_id: str, claim: AttemptLaunchClaim
     if not _claim_matches_raw(raw, claim):
         return
     state._save_status_unlocked(
-        status_ops._runstatus_from_json(raw),
+        status_ops._run_status_from_json(raw),
         _active_launch_claim=None,
     )
 
@@ -278,7 +278,7 @@ def _reserve_attempt_launch(
     try:
         with state._status_guard(run_id):
             raw = status_ops._load_status_json(run_id)
-            status = status_ops._runstatus_from_json(raw)
+            status = status_ops._run_status_from_json(raw)
             if status.state in state.TERMINAL_STATES:
                 return LaunchReservationResult(None)
             if expected_state is not None and status.state != expected_state:
@@ -462,7 +462,7 @@ def require_attempt_launch_current(run_id: str, spec: JobSpec, claim: AttemptLau
         return retry_state
 
 
-def attempt_is_this_callers_to_fail(run_id: str, claim: AttemptLaunchClaim) -> bool:
+def caller_must_record_attempt_failure(run_id: str, claim: AttemptLaunchClaim) -> bool:
     """Return whether this claim's caller still owes the run a terminal outcome.
 
     Exact ownership is the common case, but it is not the only one. A caller that already settled
@@ -504,7 +504,7 @@ def attempt_is_this_callers_to_fail(run_id: str, claim: AttemptLaunchClaim) -> b
         try:
             if status_ops.decode_next_attempt(raw) - 1 != claim.attempt:
                 return False
-            spec = state._internal_spec_from_status(status_ops._runstatus_from_json(raw))
+            spec = state._internal_spec_from_status(status_ops._run_status_from_json(raw))
             retry_state = RetryState.from_snapshot(spec, raw[state._RETRY_STATE_KEY])
         except (KeyError, ValueError, RuntimeError):
             return False
@@ -551,7 +551,7 @@ def decide_attempt_failure(
             released = True
             plan = None
         else:
-            status = status_ops._runstatus_from_json(raw)
+            status = status_ops._run_status_from_json(raw)
             spec = state._internal_spec_from_status(status)
             retry_state = require_retry_authorization_from_raw(spec, raw, attempt)
             plan = retry_state.persisted_plan(attempt)
@@ -576,7 +576,7 @@ def consume_active_launch_claim(run_id: str, claim: AttemptLaunchClaim) -> bool:
             if not _claim_matches_raw(raw, claim):
                 return False
             state._save_status_unlocked(
-                status_ops._runstatus_from_json(raw),
+                status_ops._run_status_from_json(raw),
                 _active_launch_claim=None,
             )
         return True
@@ -594,7 +594,7 @@ def persist_claimed_remote(
     try:
         with state._status_guard(run_id):
             raw = status_ops._load_status_json(run_id)
-            status = status_ops._runstatus_from_json(raw)
+            status = status_ops._run_status_from_json(raw)
             if status.state in state.TERMINAL_STATES or status.remote is not None:
                 return False
             if not _claim_matches_raw(raw, claim):

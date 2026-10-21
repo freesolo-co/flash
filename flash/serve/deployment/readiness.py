@@ -16,7 +16,7 @@ DEPLOYMENT_TIMEOUT_SECONDS = (
 )
 
 
-def revision_ready_budget_seconds(model: str) -> float:
+def checkpoint_readiness_timeout_seconds(model: str) -> float:
     """Allow the engine's full startup and adapter-load deadlines for every model.
 
     All hosted catalog entries use the same bounded engine lifecycle. Unknown or

@@ -1588,7 +1588,7 @@ def _settled_attempt(run_id, tmp_path, monkeypatch, failure):
     )
     claim = runner_attempts.reserve_verified_attempt_launch(run_id)
     assert claim is not None
-    assert runner_attempts.attempt_is_this_callers_to_fail(run_id, claim)
+    assert runner_attempts.caller_must_record_attempt_failure(run_id, claim)
     plan = None
     if failure is not None:
         plan = runner_attempts.decide_attempt_failure(
@@ -1748,7 +1748,7 @@ def test_settled_terminal_attempt_still_owes_the_run_a_terminal_outcome(monkeypa
     """
     claim, plan = _settled_attempt("settled-terminal", tmp_path, monkeypatch, "no_capacity")
     assert plan.retry is False
-    assert runner_attempts.attempt_is_this_callers_to_fail("settled-terminal", claim)
+    assert runner_attempts.caller_must_record_attempt_failure("settled-terminal", claim)
 
 
 def test_settled_retryable_attempt_is_not_this_callers_to_fail(monkeypatch, tmp_path):
@@ -1760,14 +1760,14 @@ def test_settled_retryable_attempt_is_not_this_callers_to_fail(monkeypatch, tmp_
     """
     claim, plan = _settled_attempt("settled-retryable", tmp_path, monkeypatch, "poll_error")
     assert plan.retry is True
-    assert not runner_attempts.attempt_is_this_callers_to_fail("settled-retryable", claim)
+    assert not runner_attempts.caller_must_record_attempt_failure("settled-retryable", claim)
 
     # a newer reserved attempt is the further boundary: its owner, not the stale caller, holds it.
     replacement = runner_attempts.reserve_verified_attempt_launch("settled-retryable")
     assert replacement is not None
     assert replacement.attempt == claim.attempt + 1
-    assert not runner_attempts.attempt_is_this_callers_to_fail("settled-retryable", claim)
-    assert runner_attempts.attempt_is_this_callers_to_fail("settled-retryable", replacement)
+    assert not runner_attempts.caller_must_record_attempt_failure("settled-retryable", claim)
+    assert runner_attempts.caller_must_record_attempt_failure("settled-retryable", replacement)
 
 
 def test_settled_attempt_without_a_decision_is_not_this_callers_to_fail(monkeypatch, tmp_path):
@@ -1778,7 +1778,7 @@ def test_settled_attempt_without_a_decision_is_not_this_callers_to_fail(monkeypa
     """
     claim, plan = _settled_attempt("settled-undecided", tmp_path, monkeypatch, None)
     assert plan is None
-    assert not runner_attempts.attempt_is_this_callers_to_fail("settled-undecided", claim)
+    assert not runner_attempts.caller_must_record_attempt_failure("settled-undecided", claim)
 
 
 def test_replacement_reservation_requires_exact_previous_authorization(monkeypatch, tmp_path):
@@ -1997,7 +1997,9 @@ def test_recovered_terminal_runs_keep_remote_for_cost_reconciliation(
     status = runner_status.get_status(spec.run_id)
     assert status.state == terminal_state
     assert status.remote == remote
-    assert reconcile._due(status, status.finished_at + reconcile._SETTLE_SECONDS + 1.0)
+    assert reconcile._is_reconciliation_due(
+        status, status.finished_at + reconcile._SETTLE_SECONDS + 1.0
+    )
 
 
 def test_cleanup_collection_removes_only_confirmed_exact_records(monkeypatch, tmp_path):
@@ -2667,7 +2669,7 @@ def test_attach_expired_run_adopts_completed_attempt_at_deadline(monkeypatch, tm
     monkeypatch.setattr(runner_recovery, "_gc_run_sandboxes", lambda _spec: None)
     monkeypatch.setattr(
         runner_recovery,
-        "_strict_teardown_handle",
+        "_destroy_and_confirm_worker",
         lambda *_args, **_kwargs: pytest.fail(
             "completed attempt must not be torn down before adoption"
         ),
@@ -3259,7 +3261,7 @@ def test_successful_supervision_settles_the_terminal_remote(monkeypatch, tmp_pat
     torn_down = []
     monkeypatch.setattr(
         runner_recovery,
-        "_strict_teardown_handle",
+        "_destroy_and_confirm_worker",
         lambda handle, run_id: torn_down.append(run_id) or True,
     )
 
@@ -3307,7 +3309,7 @@ def test_lost_ownership_failure_releases_the_launch_lease(monkeypatch, tmp_path)
 
     # a competing owner takes the attempt over, so this caller's report loses the ownership check.
     runner_state._save_status(
-        runner_status._runstatus_from_json(runner_status._load_status_json(spec.run_id)),
+        runner_status._run_status_from_json(runner_status._load_status_json(spec.run_id)),
         _active_launch_claim=None,
     )
 
@@ -3490,7 +3492,9 @@ def test_recover_runs_tears_down_a_handle_backed_run_whose_model_was_removed(
         torn.append((dict(handle), run_id))
         return True
 
-    monkeypatch.setattr("flash.runner.supervise.recovery._strict_teardown_handle", fake_teardown)
+    monkeypatch.setattr(
+        "flash.runner.supervise.recovery._destroy_and_confirm_worker", fake_teardown
+    )
     attached: list[str] = []
     # recover_runs imports attach_run from flash.runner inside the function, so patch it there.
     monkeypatch.setattr(runner_attach, "attach_run", lambda rid: attached.append(rid))
@@ -3579,7 +3583,7 @@ def test_recover_runs_rejects_handleless_removed_model_before_resubmit_or_gc(
 
 
 def test_unparseable_spec_retries_a_teardown_it_could_not_confirm(monkeypatch, tmp_path):
-    # when `_strict_teardown_handle` cannot confirm the delete, the handle is recorded for the
+    # when `_destroy_and_confirm_worker` cannot confirm the delete, the handle is recorded for the
     # cleanup drain -- but this run's drain was already dispatched at the top of the loop and had
     # snapshotted an empty list, and it returns early on empty. so the record sat there with nothing
     # scheduled to retry it, and the worker kept billing until the next restart.
@@ -3626,7 +3630,9 @@ def test_unparseable_spec_retries_a_teardown_it_could_not_confirm(monkeypatch, t
         torn.append("drain" if hasattr(handle, "provider") else "direct")
         return False  # unconfirmed, both times: this is the case that records for the drain
 
-    monkeypatch.setattr("flash.runner.supervise.recovery._strict_teardown_handle", fake_teardown)
+    monkeypatch.setattr(
+        "flash.runner.supervise.recovery._destroy_and_confirm_worker", fake_teardown
+    )
     monkeypatch.setattr(runner_attach, "attach_run", lambda rid: None)
     # persisting a cleanup record reports the new status, which blocks on its reporter thread. that
     # thread is real in production; here the fake below would stand in for it and never run.
@@ -4278,7 +4284,7 @@ def test_cleanup_policy_requires_stop_evidence_and_retained_obligation(
             raise TimeoutError("lost teardown response")
         return True
 
-    monkeypatch.setattr(runner_recovery, "_strict_teardown_handle", destroy)
+    monkeypatch.setattr(runner_recovery, "_destroy_and_confirm_worker", destroy)
     monkeypatch.setattr(runner_recovery, "_worker_provably_gone", lambda *_: stopped)
     monkeypatch.setattr(
         runner_reconciliation,
@@ -4298,7 +4304,7 @@ def test_cleanup_persistence_failure_does_not_hide_unknown_teardown(monkeypatch)
         raise OSError("persistence unavailable")
 
     monkeypatch.setattr(runner_reconciliation, "_record_cleanup_remote", fail)
-    monkeypatch.setattr(runner_recovery, "_strict_teardown_handle", fail)
+    monkeypatch.setattr(runner_recovery, "_destroy_and_confirm_worker", fail)
     monkeypatch.setattr(runner_recovery, "_worker_provably_gone", lambda *_: False)
     result = runner_reconciliation.reconcile_cleanup("run", _modal_remote())
     assert result == runner_reconciliation.CleanupOutcome(False, False, False)

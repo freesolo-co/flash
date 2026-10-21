@@ -49,7 +49,7 @@ _TRANSITION_FIELDS = frozenset(
 # uniformity and to stay independent of the order the parent imports its submodules in.
 
 
-def _runstatus_from_json(d: dict) -> RunStatus:
+def _run_status_from_json(d: dict) -> RunStatus:
     # tolerant load: drop unknown keys before constructing runstatus. source_snapshot is different:
     # malformed persisted identity must fail closed rather than be treated as a legacy absence.
     values = {k: v for k, v in d.items() if k in RunStatus.__dataclass_fields__}
@@ -85,7 +85,7 @@ def decode_next_attempt(raw: dict) -> int:
 
 
 def get_status(run_id: str) -> RunStatus:
-    return _runstatus_from_json(_load_status_json(run_id))
+    return _run_status_from_json(_load_status_json(run_id))
 
 
 def source_snapshot_from_status(status: RunStatus, *, required: bool = False) -> dict | None:
@@ -255,7 +255,7 @@ def list_runs() -> list[RunStatus]:
     for name in sorted(os.listdir(state.RUNS_DIR)):
         if name.endswith(".json"):
             with open(os.path.join(state.RUNS_DIR, name)) as f:
-                runs.append(_runstatus_from_json(json.load(f)))
+                runs.append(_run_status_from_json(json.load(f)))
     return runs
 
 

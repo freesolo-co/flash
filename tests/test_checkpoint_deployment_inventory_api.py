@@ -2,14 +2,14 @@
 
 import flash.runner.lifecycle.status as run_status
 from tests._helpers import deployments as fixtures
-from tests.test_server_api import _bearer, _login, _make_run
+from tests.test_server_api import _bearer, _make_run, _new_user_token
 from tests.test_server_api import api as api
 
 
 def test_deployment_listing_and_exact_lookup_preserve_siblings(api, monkeypatch):
     import flash.serve.deployment.deploy as serving
 
-    key = _login()
+    key = _new_user_token()
     run_id = _make_run(api, key, "done")
     targets = [f"{run_id}/final", f"{run_id}/step-20", f"{run_id}/step-40"]
     for target in targets:

@@ -119,7 +119,7 @@ class TestLogLevel:
         flash_logging.configure_logging()
         assert logging.getLogger("flash").level == logging.DEBUG
 
-    def test_case_insensitive(self, monkeypatch):
+    def test_log_level_environment_value_is_case_insensitive(self, monkeypatch):
         monkeypatch.setenv("FLASH_LOG_LEVEL", "debug")
         flash_logging.configure_logging()
         assert logging.getLogger("flash").level == logging.DEBUG
