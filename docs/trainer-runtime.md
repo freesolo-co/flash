@@ -26,6 +26,8 @@ The SFT trainer owns its dataset order, partial batches, boundary resume, checkp
 
 GRPO and OPD share the upstream V1 synchronous trainer lifecycle and TransferQueue replay implementation. Flash bounds replay waiting and rejects failed prompt groups before consuming them. The common task runner initializes TransferQueue, trainers, and agent managers, publishes readiness, then runs training and closes tracking and queue resources.
 
+At actor and reference worker entry, Flash decodes queued multimodal position IDs into a sequence-ragged tensor using PyTorch’s public constructor. TransferQueue can encode equal-length rows along the position-axis dimension; rebuilding the sequence offsets before native microbatch selection preserves each image/text position without changing dependency functions. Shared multi-turn prompt preparation calls upstream’s Continuous Token builder and validates its multimodal capability.
+
 The GRPO manager registers the complete expected identity set before dispatch. Agents carry those identities into scoring and collect model-version observations across turns; the trainer applies per-turn credit. Truncation masking is a Flash runtime option, not an extra upstream dataclass field. Trainability is checked before advantages and again before actor updates because rollout correction can reject additional tokens.
 
 OPD agents score through the existing remote teacher bridge. The trainer does not allocate a local teacher GPU pool. Teacher facts travel through upstream's native agent output serialization; no-signal batches retain bounded replacement and teacher-cycle acknowledgment before mutation. Native upstream policy forwards remain enabled; the former fork's dead-compute optimization is not carried over.
