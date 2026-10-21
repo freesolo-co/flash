@@ -522,8 +522,7 @@ def test_record_heartbeat_persists_finalize_liveness_ping_with_step(monkeypatch)
 
 def test_finished_at_frozen_at_terminal_survives_later_updated_at_bumps(monkeypatch):
     """finished_at freezes the training-teardown time on the FIRST terminal transition and is NOT
-    moved by later updated_at bumps (heartbeat/deploy/reconcile) — so reconciliation has an
-    immutable instance run_end even for a run deployed (or heartbeat-touched) after completion."""
+    moved by later heartbeat or deployment updates, so the training end time remains accurate."""
     with tempfile.TemporaryDirectory() as tmp:
         monkeypatch.setattr(runner_state, "RUNS_DIR", tmp)
         from flash.core.spec import JobSpec, TrainSpec
@@ -1669,7 +1668,7 @@ def test_replacement_reservation_clears_the_consumed_teardown_marker(monkeypatch
     # the consumed marker is gone, so startup cannot misread this as confirmed-handle recovery.
     assert settled.cleanup_confirmed_remote is None
     # the accounting copy is carried separately and must survive.
-    assert settled.realized_cost_remote is not None
+    assert settled.billing_remote is not None
 
 
 def test_setup_failure_releases_the_reserved_launch_claim(monkeypatch, tmp_path):
@@ -1964,11 +1963,8 @@ def test_recovered_completion_does_not_overwrite_concurrent_cancel(monkeypatch, 
 
 
 @pytest.mark.parametrize("terminal_state", ["done", "failed"])
-def test_recovered_terminal_runs_keep_remote_for_cost_reconciliation(
-    monkeypatch, tmp_path, terminal_state
-):
+def test_recovered_terminal_runs_keep_remote_for_cleanup(monkeypatch, tmp_path, terminal_state):
     from flash.core.spec import JobSpec
-    from flash.server.domain.ops import reconcile
 
     monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
     spec = JobSpec(run_id=f"recovered-{terminal_state}", model="Qwen/Qwen3.5-9B", algorithm="sft")
@@ -1997,7 +1993,7 @@ def test_recovered_terminal_runs_keep_remote_for_cost_reconciliation(
     status = runner_status.get_status(spec.run_id)
     assert status.state == terminal_state
     assert status.remote == remote
-    assert reconcile._due(status, status.finished_at + reconcile._SETTLE_SECONDS + 1.0)
+    assert status.finished_at is not None
 
 
 def test_cleanup_collection_removes_only_confirmed_exact_records(monkeypatch, tmp_path):

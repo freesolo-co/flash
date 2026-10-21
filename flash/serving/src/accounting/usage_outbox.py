@@ -1,4 +1,4 @@
-"""Durable hosted-serving usage capture, delivery, and reconciliation boundaries."""
+"""Durable hosted-serving usage capture and delivery boundaries."""
 
 from __future__ import annotations
 
@@ -8,9 +8,9 @@ import hashlib
 import re
 import time
 import uuid
-from collections.abc import Callable, Coroutine, Mapping, Sequence
+from collections.abc import Callable, Coroutine, Mapping
 from dataclasses import dataclass
-from datetime import UTC, date, datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from typing import Annotated, Any, Literal, Protocol
 
 import httpx
@@ -35,8 +35,6 @@ _RESPONSE_LOSS_SAFE_RPCS = frozenset(
         "heartbeat_serving_generation",
         "recover_stale_serving_generations",
         "acknowledge_serving_usage_delivered",
-        "reconcile_serving_usage_batch",
-        "finalize_serving_usage_reconciliation_day",
     }
 )
 
@@ -202,10 +200,6 @@ class ReasoningSettlementUnavailable(UsageOutboxError):
     """Exact reasoning-token facts are unavailable for this generation."""
 
 
-class ReconciliationUnavailable(UsageOutboxError):
-    """Authoritative provider settlement is not launch-ready."""
-
-
 class UsageStore(Protocol):
     enabled: bool
 
@@ -251,91 +245,6 @@ class OfflineUsageStore:
 
     async def aclose(self) -> None:
         return None
-
-
-@dataclass(frozen=True)
-class AuthoritativeProviderDay:
-    provider: str
-    usage_date: date
-    source: str
-    source_version: str
-    attestation_evidence: Mapping[str, Any]
-
-    def rpc_payload(self) -> dict[str, Any]:
-        return {
-            "p_provider": self.provider,
-            "p_usage_date": self.usage_date.isoformat(),
-            "p_source": self.source,
-            "p_source_version": self.source_version,
-            "p_attestation_evidence": dict(self.attestation_evidence),
-        }
-
-
-@dataclass(frozen=True)
-class ReconciliationDayResult:
-    reconciliation_day_id: str
-    reconciliation_state: str
-    status_reason: str | None
-    replay: bool
-
-
-@dataclass(frozen=True)
-class ReconciliationResult:
-    input_ordinal: int
-    outbox_id: str | None
-    reconciliation_status: str
-    dispute_code: str | None
-    replay: bool
-
-
-@dataclass(frozen=True)
-class ProviderSettlementRecord:
-    provider: str
-    usage_date: date
-    source: str
-    source_version: str
-    provider_record_id: str
-    request_id: str | None
-    provider_amount_micro_usd: int | None
-    prompt_tokens: int | None = None
-    completion_tokens: int | None = None
-    reasoning_tokens: int | None = None
-    cached_tokens: int | None = None
-    evidence: Mapping[str, Any] | None = None
-    attestation_evidence: Mapping[str, Any] | None = None
-
-    def rpc_payload(self) -> dict[str, Any]:
-        return {
-            "provider": self.provider,
-            "usage_date": self.usage_date.isoformat(),
-            "source": self.source,
-            "source_version": self.source_version,
-            "provider_record_id": self.provider_record_id,
-            "request_id": self.request_id,
-            "provider_amount_micro_usd": self.provider_amount_micro_usd,
-            "prompt_tokens": self.prompt_tokens,
-            "completion_tokens": self.completion_tokens,
-            "reasoning_tokens": self.reasoning_tokens,
-            "cached_tokens": self.cached_tokens,
-            "evidence": dict(self.evidence or {}),
-            "attestation_evidence": dict(self.attestation_evidence or {}),
-        }
-
-
-@dataclass(frozen=True)
-class ProviderSettlementPage:
-    records: tuple[ProviderSettlementRecord, ...]
-    next_cursor: str | None
-
-
-class ProviderSettlementAdapter(Protocol):
-    provider: str
-    authoritative: bool
-    exact_reasoning_tokens: bool
-
-    async def fetch_day(
-        self, usage_date: date, *, cursor: str | None, limit: int
-    ) -> ProviderSettlementPage: ...
 
 
 Jitter = Callable[[str, int, float], float]
@@ -499,69 +408,6 @@ class DurableUsageOutbox:
             "recover_stale_serving_generations",
             {"p_limit": _RECOVERY_BATCH_SIZE},
         )
-
-    async def reconcile_batch(
-        self, records: Sequence[ProviderSettlementRecord]
-    ) -> tuple[ReconciliationResult, ...]:
-        if not 1 <= len(records) <= 500:
-            raise ValueError("serving usage reconciliation batch must contain 1 to 500 records")
-        data = await self._rpc(
-            "reconcile_serving_usage_batch",
-            {"p_records": [record.rpc_payload() for record in records]},
-        )
-        if not isinstance(data, list) or len(data) != len(records):
-            raise UsageOutboxError("usage_reconciliation_batch_invalid")
-        results: list[ReconciliationResult] = []
-        for expected_ordinal, row in enumerate(data, 1):
-            if not isinstance(row, dict) or row.get("input_ordinal") != expected_ordinal:
-                raise UsageOutboxError("usage_reconciliation_batch_invalid")
-            status = row.get("reconciliation_status")
-            replay = row.get("replay")
-            if not isinstance(status, str) or type(replay) is not bool:
-                raise UsageOutboxError("usage_reconciliation_batch_invalid")
-            outbox_id = row.get("outbox_id")
-            dispute_code = row.get("dispute_code")
-            if outbox_id is not None and not isinstance(outbox_id, str):
-                raise UsageOutboxError("usage_reconciliation_batch_invalid")
-            if dispute_code is not None and not isinstance(dispute_code, str):
-                raise UsageOutboxError("usage_reconciliation_batch_invalid")
-            results.append(
-                ReconciliationResult(
-                    input_ordinal=expected_ordinal,
-                    outbox_id=outbox_id,
-                    reconciliation_status=status,
-                    dispute_code=dispute_code,
-                    replay=replay,
-                )
-            )
-        return tuple(results)
-
-    async def reconcile(self, record: ProviderSettlementRecord) -> ReconciliationResult:
-        return (await self.reconcile_batch([record]))[0]
-
-    async def finalize_reconciliation_day(
-        self, day: AuthoritativeProviderDay
-    ) -> ReconciliationDayResult:
-        data = await self._rpc(
-            "finalize_serving_usage_reconciliation_day",
-            day.rpc_payload(),
-        )
-        if isinstance(data, list):
-            data = data[0] if len(data) == 1 else None
-        if not isinstance(data, dict):
-            raise UsageOutboxError("usage_reconciliation_day_invalid")
-        day_id = data.get("reconciliation_day_id")
-        state = data.get("reconciliation_state")
-        reason = data.get("status_reason")
-        replay = data.get("replay")
-        if (
-            not isinstance(day_id, str)
-            or not isinstance(state, str)
-            or (reason is not None and not isinstance(reason, str))
-            or type(replay) is not bool
-        ):
-            raise UsageOutboxError("usage_reconciliation_day_invalid")
-        return ReconciliationDayResult(day_id, state, reason, replay)
 
     async def _generation_rpc(
         self,

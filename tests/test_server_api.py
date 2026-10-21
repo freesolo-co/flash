@@ -3979,7 +3979,6 @@ def test_shutdown_flushes_after_status_replay_failure(monkeypatch):
 
     import flash.server.asgi.app as app_mod
     import flash.server.billing.retry as billing_retry
-    import flash.server.domain.ops.reconcile as reconcile
     import flash.server.domain.ops.repo_cleanup as repo_cleanup
     from flash.providers.core import preflight
 
@@ -4005,7 +4004,6 @@ def test_shutdown_flushes_after_status_replay_failure(monkeypatch):
     monkeypatch.setattr(serving_completion, "recover_deployments", lambda: 0)
     monkeypatch.setattr(serving_completion, "replay_status_reports", fail_replay)
     monkeypatch.setattr(billing_retry, "charge_retry_enabled", lambda: False)
-    monkeypatch.setattr(reconcile, "reconcile_enabled", lambda: False)
     monkeypatch.setattr(repo_cleanup, "repo_cleanup_enabled", lambda: False)
     monkeypatch.setattr(app_mod, "_instance_providers_configured", lambda: False)
     monkeypatch.setattr(deployment_jobs, "_wait_for_deployment_jobs", wait_for_deployments)

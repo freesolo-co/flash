@@ -246,7 +246,7 @@ def _charge_run(
     if not org_id:
         raise BillingError(400, "missing billing org id for training run")
     spec = status.spec if isinstance(status.spec, dict) else {}
-    remote = status.remote or status.realized_cost_remote
+    remote = status.remote or status.billing_remote
     remote = remote if isinstance(remote, dict) else {}
     allocated_gpu = remote.get("allocated_gpu")
     gpu = (

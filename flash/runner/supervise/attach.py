@@ -164,9 +164,9 @@ def _reconcile_completed_remote(
     # transient cleanup failure) until it sticks -- but never past the wall
     # deadline plus the recovery grace, or a persistently failing adoption
     # would leave the run non-terminal forever. past the grace, preserve the
-    # remote for cost reconciliation and fail the run.
+    # remote for resource cleanup and fail the run.
     if time.time() >= deadline_at + _RECOVERY_MARKER_GRACE_S:
-        # best-effort: preserve the remote for cost reconciliation, but do NOT
+        # best-effort: preserve the remote for resource cleanup, but do NOT
         # gate termination on it -- a persistently failing cleanup-persist must
         # not leave the run non-terminal forever (the whole point of the grace
         # cutoff). attempt the cleanup record, then fail the run regardless.

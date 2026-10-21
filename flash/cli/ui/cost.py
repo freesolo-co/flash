@@ -49,13 +49,7 @@ def run_cost(obj: dict) -> tuple[float, bool]:
 
 
 def _spent_without_measuring(obj: dict) -> bool:
-    """A failed run that rented hardware but never produced a measured charge.
-
-    ``realized_cost_usd`` is deliberately NOT used as the number to show: it is provider COGS
-    pulled by reconciliation (see ``runner.RunStatus``), distinct from the ``cost_usd`` estimate
-    the customer is charged. Presenting our internal spend as their bill would be wrong, and
-    ``run_status`` already prints it on its own ``realized`` row.
-    """
+    """A failed run that rented hardware but never produced a measured charge."""
     return str(obj.get("state") or "") == "failed"
 
 
