@@ -12,6 +12,7 @@ from pathlib import Path
 
 import pytest
 
+import flash.engine.worker.io.hf as _publication
 import flash.engine.worker.train.entry.rl_train_runner as rl_runner
 import flash.engine.worker.train.rl.launch.checkpoints as rl_checkpoints
 from flash.engine.worker.train.entry import backend_common, rl_train
@@ -24,10 +25,18 @@ def test_resume_uploader_publishes_required_steps_and_reports_missing(tmp_path, 
     monkeypatch.setattr(
         rl_checkpoints._worker_hf,
         "publish_deployable_checkpoint",
-        lambda d, s, **kw: published.append((d, s, kw.get("required", False))),
+        lambda d, s, **kw: _publication.PublicationResult(
+            deployable=_publication.ArtifactCommit(
+                published.append((d, s, kw.get("required", False))), "test-revision"
+            )
+        ),
     )
     monkeypatch.setattr(
-        rl_checkpoints._worker_hf, "upload_resume_checkpoint", lambda *a, **kw: True
+        rl_checkpoints._worker_hf,
+        "upload_resume_checkpoint",
+        lambda *a, **kw: _publication.PublicationResult(
+            resume=_publication.ArtifactCommit("test-commit", "test-revision")
+        ),
     )
     monkeypatch.setattr(
         rl_checkpoints._worker_hf, "hf_upload_folder", lambda *a, **kw: True, raising=False
@@ -523,10 +532,9 @@ def test_internal_required_adapters_upload_once_and_restore_from_latest_manifest
             if old != destination:
                 shutil.rmtree(old)
         native_uploads.append(step)
-        callback = kwargs.get("after_upload")
-        if callback:
-            callback()
-        return True
+        return _publication.PublicationResult(
+            resume=_publication.ArtifactCommit("test-commit", "test-revision")
+        )
 
     monkeypatch.setattr(rl_checkpoints._VerlResumeUploader, "_stage_deployable", stage)
     monkeypatch.setattr(
@@ -794,7 +802,9 @@ def test_checkpoint_waits_for_its_own_metric_and_preemption_keeps_previous_remot
     monkeypatch.setattr(
         rl_checkpoints._worker_hf,
         "upload_resume_checkpoint",
-        lambda step, path, **kwargs: uploaded.append(step),
+        lambda step, path, **kwargs: _publication.PublicationResult(
+            resume=_publication.ArtifactCommit(uploaded.append(step), "test-revision")
+        ),
         raising=False,
     )
     checkpoint = _write_step(local, 1)
@@ -820,6 +830,9 @@ def test_checkpoint_manifest_is_written_only_after_metric_ingestion(tmp_path, mo
     def upload(step, path, **kwargs):
         uploaded.append(
             (step, json.loads((Path(path) / "_flash_resume_manifest.json").read_text()))
+        )
+        return _publication.PublicationResult(
+            resume=_publication.ArtifactCommit("test-commit", "test-revision")
         )
 
     monkeypatch.setattr(
@@ -860,7 +873,9 @@ def test_required_adapter_upload_failure_blocks_later_native_replacement(tmp_pat
     monkeypatch.setattr(
         rl_checkpoints._worker_hf,
         "upload_resume_checkpoint",
-        lambda step, path, **kwargs: native.append(step),
+        lambda step, path, **kwargs: _publication.PublicationResult(
+            resume=_publication.ArtifactCommit(native.append(step), "test-revision")
+        ),
         raising=False,
     )
     _write_step(local, 2)
@@ -900,6 +915,9 @@ def test_required_save_debt_prevents_a_later_checkpoint_from_replacing_recoverab
         callback = kwargs.get("after_upload")
         if callback is not None:
             callback()
+        return _publication.PublicationResult(
+            resume=_publication.ArtifactCommit("test-commit", "test-revision")
+        )
 
     monkeypatch.setattr(
         rl_checkpoints._worker_hf,
@@ -1107,7 +1125,9 @@ def test_withheld_required_step_still_uploads_resume_state_exactly_once(tmp_path
     monkeypatch.setattr(
         rl_checkpoints._worker_hf,
         "upload_resume_checkpoint",
-        lambda step, path, **k: uploaded.append(int(step)),
+        lambda step, path, **k: _publication.PublicationResult(
+            resume=_publication.ArtifactCommit(uploaded.append(int(step)), "test-revision")
+        ),
         raising=False,
     )
     _patch_stage_and_publish(monkeypatch, staged, published)
@@ -1150,7 +1170,9 @@ def test_positive_early_gradient_never_publishes_before_terminal_validation(tmp_
     monkeypatch.setattr(
         rl_checkpoints._worker_hf,
         "upload_resume_checkpoint",
-        lambda step, path, **k: True,
+        lambda step, path, **k: _publication.PublicationResult(
+            resume=_publication.ArtifactCommit("test-commit", "test-revision")
+        ),
         raising=False,
     )
     _patch_stage_and_publish(monkeypatch, staged, published)
@@ -1181,7 +1203,9 @@ def test_invalid_later_step_never_releases_an_early_positive_required_save(tmp_p
     monkeypatch.setattr(
         rl_checkpoints._worker_hf,
         "upload_resume_checkpoint",
-        lambda step, path, **k: True,
+        lambda step, path, **k: _publication.PublicationResult(
+            resume=_publication.ArtifactCommit("test-commit", "test-revision")
+        ),
         raising=False,
     )
     _patch_stage_and_publish(monkeypatch, staged, published)
@@ -1218,7 +1242,9 @@ def test_clean_terminal_validation_releases_staged_required_save(tmp_path, monke
     monkeypatch.setattr(
         rl_checkpoints._worker_hf,
         "upload_resume_checkpoint",
-        lambda step, path, **k: True,
+        lambda step, path, **k: _publication.PublicationResult(
+            resume=_publication.ArtifactCommit("test-commit", "test-revision")
+        ),
         raising=False,
     )
     _patch_stage_and_publish(monkeypatch, staged, published)
@@ -1254,7 +1280,9 @@ def test_resumed_new_required_step_waits_for_terminal_validation(tmp_path, monke
     monkeypatch.setattr(
         rl_checkpoints._worker_hf,
         "upload_resume_checkpoint",
-        lambda step, path, **k: True,
+        lambda step, path, **k: _publication.PublicationResult(
+            resume=_publication.ArtifactCommit("test-commit", "test-revision")
+        ),
         raising=False,
     )
     _patch_stage_and_publish(monkeypatch, staged, published)
@@ -1301,7 +1329,11 @@ def test_a_gate_already_open_publishes_the_deployable_before_the_resume_upload(
     monkeypatch.setattr(
         rl_checkpoints._worker_hf,
         "upload_resume_checkpoint",
-        lambda step, path, **k: (order.append("resume"), k["after_upload"]())[0],
+        lambda step, path, **k: (
+            _publication.PublicationResult(
+                resume=_publication.ArtifactCommit(order.append("resume"), "test-revision")
+            ),
+        )[0],
         raising=False,
     )
     _patch_stage_and_publish(monkeypatch, staged, published)
@@ -1381,7 +1413,9 @@ def test_a_permanently_withheld_step_fails_the_run_and_does_not_hang_stop(tmp_pa
     monkeypatch.setattr(
         rl_checkpoints._worker_hf,
         "upload_resume_checkpoint",
-        lambda step, path, **k: True,
+        lambda step, path, **k: _publication.PublicationResult(
+            resume=_publication.ArtifactCommit("test-commit", "test-revision")
+        ),
         raising=False,
     )
     _patch_stage_and_publish(monkeypatch, [], [])
@@ -1412,7 +1446,9 @@ def test_gate_opening_just_before_stop_still_publishes_rather_than_failing_on_ti
     monkeypatch.setattr(
         rl_checkpoints._worker_hf,
         "upload_resume_checkpoint",
-        lambda step, path, **k: True,
+        lambda step, path, **k: _publication.PublicationResult(
+            resume=_publication.ArtifactCommit("test-commit", "test-revision")
+        ),
         raising=False,
     )
     _patch_stage_and_publish(monkeypatch, [], published)
@@ -1444,7 +1480,9 @@ def test_resumed_required_step_can_still_publish_its_withheld_deployable(tmp_pat
     monkeypatch.setattr(
         rl_checkpoints._worker_hf,
         "upload_resume_checkpoint",
-        lambda step, path, **k: True,
+        lambda step, path, **k: _publication.PublicationResult(
+            resume=_publication.ArtifactCommit("test-commit", "test-revision")
+        ),
         raising=False,
     )
     _patch_stage_and_publish(monkeypatch, [], published)
@@ -1481,7 +1519,9 @@ def test_checkpoint_appearing_at_stop_is_uploaded_before_the_exit(tmp_path, monk
     monkeypatch.setattr(
         rl_checkpoints._worker_hf,
         "upload_resume_checkpoint",
-        lambda step, path, **k: uploaded.append(int(step)),
+        lambda step, path, **k: _publication.PublicationResult(
+            resume=_publication.ArtifactCommit(uploaded.append(int(step)), "test-revision")
+        ),
         raising=False,
     )
 
@@ -1549,7 +1589,9 @@ def test_required_step_publishes_after_verl_prunes_its_checkpoint(tmp_path, monk
     monkeypatch.setattr(
         rl_checkpoints._worker_hf,
         "upload_resume_checkpoint",
-        lambda step, path, **k: True,
+        lambda step, path, **k: _publication.PublicationResult(
+            resume=_publication.ArtifactCommit("test-commit", "test-revision")
+        ),
         raising=False,
     )
     monkeypatch.setattr(
@@ -1623,7 +1665,9 @@ def test_staging_failure_does_not_strand_an_earlier_publishable_step(tmp_path, m
     monkeypatch.setattr(
         rl_checkpoints._worker_hf,
         "upload_resume_checkpoint",
-        lambda step, path, **k: True,
+        lambda step, path, **k: _publication.PublicationResult(
+            resume=_publication.ArtifactCommit("test-commit", "test-revision")
+        ),
         raising=False,
     )
     monkeypatch.setattr(
@@ -1682,7 +1726,9 @@ def test_zero_gradient_is_reported_before_a_withheld_required_save(tmp_path, mon
     monkeypatch.setattr(
         rl_checkpoints._worker_hf,
         "upload_resume_checkpoint",
-        lambda step, path, **k: True,
+        lambda step, path, **k: _publication.PublicationResult(
+            resume=_publication.ArtifactCommit("test-commit", "test-revision")
+        ),
         raising=False,
     )
     _patch_stage_and_publish(monkeypatch, [], [])

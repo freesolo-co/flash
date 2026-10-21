@@ -78,7 +78,7 @@ def test_publish_deployable_checkpoint_uploads_adapter_only(tmp_path, monkeypatc
     (ckpt / "adapter_model.safetensors").write_bytes(b"weights")
     (ckpt / "optimizer.pt").write_bytes(b"opt")
 
-    subfolder = worker.publish_deployable_checkpoint(str(ckpt), 80)
+    subfolder = worker.publish_deployable_checkpoint(str(ckpt), 80).deployable.path
 
     assert subfolder == "rl/flash-ckpt-1/checkpoints/step-80/adapter"
     assert len(rec.uploads) == 1
@@ -179,7 +179,7 @@ def test_publish_deployable_checkpoint_rejects_bin_weights(tmp_path, monkeypatch
     (ckpt / "adapter_config.json").write_text("{}")
     (ckpt / "adapter_model.bin").write_bytes(b"weights")
 
-    assert worker.publish_deployable_checkpoint(str(ckpt), 80) is None
+    assert worker.publish_deployable_checkpoint(str(ckpt), 80).deployable is None
     assert rec.uploads == []
 
 
@@ -193,7 +193,7 @@ def test_publish_deployable_checkpoint_skips_without_adapter(tmp_path, monkeypat
     ckpt.mkdir()
     (ckpt / "optimizer.pt").write_bytes(b"opt")  # no adapter_config.json
 
-    assert worker.publish_deployable_checkpoint(str(ckpt), 10) is None
+    assert worker.publish_deployable_checkpoint(str(ckpt), 10).deployable is None
     assert rec.uploads == []
 
 
@@ -207,7 +207,7 @@ def test_publish_deployable_checkpoint_skips_config_without_weights(tmp_path, mo
     ckpt.mkdir()
     (ckpt / "adapter_config.json").write_text("{}")  # config only, no adapter_model.*
 
-    assert worker.publish_deployable_checkpoint(str(ckpt), 20) is None
+    assert worker.publish_deployable_checkpoint(str(ckpt), 20).deployable is None
     assert rec.uploads == []
 
 
@@ -220,7 +220,7 @@ def test_publish_deployable_checkpoint_no_repo_is_noop(tmp_path, monkeypatch):
     ckpt.mkdir()
     (ckpt / "adapter_config.json").write_text("{}")
 
-    assert worker.publish_deployable_checkpoint(str(ckpt), 5) is None
+    assert worker.publish_deployable_checkpoint(str(ckpt), 5).deployable is None
     assert rec.uploads == []
 
 
@@ -235,7 +235,7 @@ def test_publish_deployable_checkpoint_starts_no_upload_at_deadline(tmp_path, mo
     (ckpt / "adapter_config.json").write_text("{}")
     (ckpt / "adapter_model.safetensors").write_bytes(b"weights")
 
-    assert worker.publish_deployable_checkpoint(str(ckpt), 5) is None
+    assert worker.publish_deployable_checkpoint(str(ckpt), 5).deployable is None
     assert rec.uploads == []
 
 
@@ -688,3 +688,34 @@ def _module_or_none(dotted: str):
         return importlib.import_module(dotted)
     except Exception:
         return None
+
+
+def test_deployable_commit_survives_reporting_failure_without_reupload(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    import flash.engine.worker.io.heartbeat as heartbeat
+    import flash.engine.worker.io.hf as worker
+    import flash.engine.worker.runtime.state as state
+
+    checkpoint = tmp_path / "adapter"
+    checkpoint.mkdir()
+    (checkpoint / "adapter_config.json").write_text("{}")
+    (checkpoint / "adapter_model.safetensors").write_bytes(b"weights")
+    uploads = []
+
+    def upload(**kwargs):
+        uploads.append(kwargs)
+        return SimpleNamespace(oid="adapter-commit")
+
+    def fail_report(*args, **kwargs):
+        raise ConnectionError("report unavailable")
+
+    monkeypatch.setattr(state, "HF_REPO", "org/runs")
+    monkeypatch.setattr(worker, "hf_api", lambda: SimpleNamespace(upload_folder=upload))
+    monkeypatch.setattr(heartbeat, "heartbeat", fail_report)
+    result = worker.publish_deployable_checkpoint(
+        str(checkpoint), 5, required=True, retries=3, _provenance_ready=True
+    )
+    assert result.deployable.revision == "adapter-commit"
+    assert result.reporting_error is not None
+    assert len(uploads) == 1

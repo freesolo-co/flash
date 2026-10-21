@@ -92,7 +92,8 @@ def main() -> None:
     if not checkpoint.is_dir() or not any(checkpoint.iterdir()):
         raise ValueError("empty checkpoint handoff")
     started = time.time()
-    if not hf.upload_resume_checkpoint(expected["step"], str(checkpoint), emit_heartbeat=False):
+    result = hf.upload_resume_checkpoint(expected["step"], str(checkpoint), emit_heartbeat=False)
+    if result.resume is None:
         raise RuntimeError("CPU checkpoint publication failed")
     receipt = root / "receipt.json"
     receipt.write_text(json.dumps({**expected, "upload_seconds": time.time() - started}))

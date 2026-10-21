@@ -185,34 +185,6 @@ def test_positive_save_every_is_preserved():
     assert TrainSpec(save_every=20).save_every == 20
 
 
-def test_resume_first_companion_retries_without_reuploading_full_state(monkeypatch, tmp_path):
-
-    calls = {"resume": 0, "deployable": 0}
-
-    class Api:
-        def upload_folder(self, **kwargs):
-            assert kwargs["path_in_repo"].endswith("/checkpoint/checkpoint-4")
-            calls["resume"] += 1
-
-        def list_repo_files(self, **_kwargs):
-            return []
-
-    def publish_once_then_succeed():
-        calls["deployable"] += 1
-        if calls["deployable"] == 1:
-            raise ConnectionError("hf deployable upload unavailable")
-
-    monkeypatch.setattr(worker_state, "HF_REPO", "org/runs")
-    monkeypatch.setattr(worker_hf, "hf_api", lambda: Api())
-    monkeypatch.setattr(worker_heartbeat, "heartbeat", lambda *args, **kwargs: None)
-    monkeypatch.setattr(worker_hf, "_CKPT_UPLOAD_BACKOFF_S", 0.0)
-
-    assert worker_hf.upload_resume_checkpoint(
-        4, str(tmp_path), after_upload=publish_once_then_succeed
-    )
-    assert calls == {"resume": 1, "deployable": 2}
-
-
 def test_resume_checkpoint_failure_heartbeat_surfaces_sanitized_error(monkeypatch, tmp_path):
 
     secret = "hf_checkpoint_upload_secret"
@@ -233,7 +205,7 @@ def test_resume_checkpoint_failure_heartbeat_surfaces_sanitized_error(monkeypatc
     )
     monkeypatch.setattr(worker_hf, "_CKPT_UPLOAD_BACKOFF_S", 0.0)
 
-    assert not worker_hf.upload_resume_checkpoint(50, str(tmp_path))
+    assert worker_hf.upload_resume_checkpoint(50, str(tmp_path)).resume is None
 
     failed = [fields for stage, fields in heartbeats if stage == "checkpoint_upload_failed"]
     assert calls == worker_hf._CKPT_UPLOAD_RETRIES
@@ -246,44 +218,6 @@ def test_resume_checkpoint_failure_heartbeat_surfaces_sanitized_error(monkeypatc
     assert "<redacted>" in failure["error"]
     assert secret not in failure["error"]
     assert len(failure["error"]) <= 300
-
-
-@pytest.mark.parametrize("failure_stage", ["before", "after"])
-def test_resume_checkpoint_companion_failure_still_raises(monkeypatch, tmp_path, failure_stage):
-
-    calls = {"resume": 0, "companion": 0}
-    heartbeats: list[tuple[str, dict]] = []
-
-    class Api:
-        def upload_folder(self, **_kwargs):
-            calls["resume"] += 1
-
-        def list_repo_files(self, **_kwargs):
-            return []
-
-    def fail_companion():
-        calls["companion"] += 1
-        raise RuntimeError(f"{failure_stage} companion failed")
-
-    callbacks = {f"{failure_stage}_upload": fail_companion}
-    monkeypatch.setattr(worker_state, "HF_REPO", "org/runs")
-    monkeypatch.setattr(worker_hf, "hf_api", lambda: Api())
-    monkeypatch.setattr(
-        worker_heartbeat, "heartbeat", lambda stage, **kwargs: heartbeats.append((stage, kwargs))
-    )
-    monkeypatch.setattr(worker_hf, "_CKPT_UPLOAD_BACKOFF_S", 0.0)
-
-    with pytest.raises(RuntimeError, match=f"{failure_stage} companion failed"):
-        worker_hf.upload_resume_checkpoint(50, str(tmp_path), **callbacks)
-
-    failed = [fields for stage, fields in heartbeats if stage == "checkpoint_upload_failed"]
-    assert calls["companion"] == worker_hf._CKPT_UPLOAD_RETRIES
-    assert calls["resume"] == (0 if failure_stage == "before" else 1)
-    assert len(failed) == 1
-    failure = failed[0]["checkpoint_failure"]
-    assert failure["step"] == 50
-    assert failure["operation"] == failure_stage
-    assert f"{failure_stage} companion failed" in failure["error"]
 
 
 def test_upload_failure_cause_reaches_the_rendered_run_log():
@@ -597,3 +531,42 @@ def test_all_algorithms_reject_unconditional_control_plane_secrets(algorithm):
         match=r"\[environment\] secrets must not include platform-managed key\(s\): SEED",
     ):
         spec_from_dict(_spec_with_declared_secret(algorithm, "SEED"))
+
+
+@pytest.mark.parametrize("failure", ["report", "prune", "none"])
+def test_resume_commit_survives_post_commit_failures(monkeypatch, tmp_path, failure):
+    from types import SimpleNamespace
+
+    calls = []
+
+    class Api:
+        def upload_folder(self, **kwargs):
+            calls.append(kwargs["path_in_repo"])
+            return SimpleNamespace(oid="immutable-revision")
+
+        def list_repo_files(self, **kwargs):
+            if failure == "prune":
+                raise OSError("pruning unavailable")
+            return []
+
+    def report(*args, **kwargs):
+        if failure == "report":
+            raise OSError("reporting unavailable")
+
+    monkeypatch.setattr(worker_state, "HF_REPO", "org/runs")
+    monkeypatch.setattr(worker_hf, "hf_api", lambda: Api())
+    monkeypatch.setattr(worker_heartbeat, "heartbeat", report)
+    result = worker_hf.upload_resume_checkpoint(4, str(tmp_path))
+    assert result.resume.revision == "immutable-revision"
+    assert len(calls) == 1
+    assert bool(result.reporting_error) == (failure == "report")
+    assert bool(result.prune_errors) == (failure == "prune")
+    with pytest.raises(TypeError, match="commit facts"):
+        bool(result)
+
+
+def test_resume_without_repository_is_not_a_commit(monkeypatch, tmp_path):
+    monkeypatch.setattr(worker_state, "HF_REPO", "")
+    result = worker_hf.upload_resume_checkpoint(4, str(tmp_path))
+    assert result.resume is None
+    assert result.skipped_reason == "no_repository"

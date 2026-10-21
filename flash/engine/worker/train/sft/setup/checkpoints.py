@@ -255,19 +255,6 @@ class _VerlCheckpointWatcher:
         actor_dir = resolve_checkpoint_actor_dir(checkpoint_dir)
         adapter_dir = os.path.join(self.export_root, f"step-{step}")
 
-        def publish_adapter() -> None:
-            published = _worker_hf.publish_deployable_checkpoint(
-                adapter_dir,
-                step,
-                required=step in self.required_steps,
-                _provenance_ready=True,
-            )
-            # gate on the returned subfolder, not on reaching this line: an optional publish returns
-            # None for a failed upload and for a directory with no adapter in it, raising only when
-            # the save is required. crediting those would report an artifact that was never written.
-            if published:
-                self.lifecycle.mark_deployable_published(step)
-
         # claimed before the work, not after it: `_pending` filters on the discovered set, so a step
         # left unclaimed while its export raises is handed straight back on the next sweep. the
         # watcher thread dies on that exception anyway, and the retry would race its own teardown.
@@ -293,17 +280,17 @@ class _VerlCheckpointWatcher:
                 preprocessor=self.preprocessor,
             )
             self.lifecycle.mark_staged(step)
-            uploaded = _worker_hf.upload_resume_checkpoint(
-                step,
-                checkpoint_dir,
-                final_step=self.final_step,
-                before_upload=publish_adapter,
-                # the callback, not the return value: see mark_resume_uploaded's contract.
-                after_upload=lambda: self.lifecycle.mark_resume_uploaded(step),
+            published = _worker_hf.publish_deployable_checkpoint(
+                adapter_dir, step, required=step in self.required_steps, _provenance_ready=True
             )
+            self.lifecycle.record_publication(step, published)
+            uploaded = _worker_hf.upload_resume_checkpoint(
+                step, checkpoint_dir, final_step=self.final_step
+            )
+            self.lifecycle.record_publication(step, uploaded)
         finally:
             shutil.rmtree(adapter_dir, ignore_errors=True)
-        if step in self.required_steps and not uploaded:
+        if step in self.required_steps and uploaded.resume is None and not uploaded.resume_staged:
             self.lifecycle.mark_failed(step)
             resume_upload_unavailable(step, checkpoint_dir, job_label="sft")
 
