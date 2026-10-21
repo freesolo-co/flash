@@ -28,8 +28,8 @@ from flash.engine.worker.train.entry.backend_common import VERL_REQUIREMENT_URL
 _PINNED_COMMIT = "ddf700725c34bb8966685c8ecf5ca36a2cc54a35"
 _PINNED_BLOBS = {
     "base_config.py": (BaseConfig, "f425dd1464b0f13c83a0944249cd84d55903f120"),
-    "model.py": (HFModelConfig, "2de369fb39d90747a352aeff20c27632655b4545"),
-    "transformer_impl.py": (FSDPEngine, "2c66c6a3fad912d674bcf5f0a6454743725f33cd"),
+    "model.py": (HFModelConfig, "545ec4682189d3811311cd0ac8fcae3e153bef3b"),
+    "transformer_impl.py": (FSDPEngine, "fa5d3e89171f8e511b30e364a5dbef45354b7f55"),
 }
 
 
