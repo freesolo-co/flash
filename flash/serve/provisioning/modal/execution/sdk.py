@@ -288,10 +288,12 @@ def _post_mutation_read(operation: Callable[[], object]) -> object:
         raise ModalSdkFailure("resource_ambiguous", outcome_unknown=True) from None
 
 
+_CLIENT_CLOSE_TIMEOUT_SECONDS = 5.0
+
+
 def _close_client(
     client: object,
     *,
-    deadline_at: float,
     clock: Clock = time.monotonic,
     bridge: _AsyncBridge | None = None,
 ) -> None:
@@ -300,7 +302,7 @@ def _close_client(
         with contextlib.suppress(BaseException):
             _run_async(
                 close,
-                deadline_at=deadline_at,
+                deadline_at=clock() + _CLIENT_CLOSE_TIMEOUT_SECONDS,
                 clock=clock,
                 bridge=bridge,
             )
@@ -363,22 +365,22 @@ class PinnedModalSdk:
                 raise ModalSdkFailure("authentication_failed")
         except TimeoutError:
             if client is not None:
-                _close_client(client, deadline_at=deadline_at, clock=clock, bridge=bridge)
+                _close_client(client, clock=clock, bridge=bridge)
             bridge.close()
             raise ModalSdkFailure("transport_failed") from None
         except ModalSdkFailure:
             if client is not None:
-                _close_client(client, deadline_at=deadline_at, clock=clock, bridge=bridge)
+                _close_client(client, clock=clock, bridge=bridge)
             bridge.close()
             raise
         except Exception:
             if client is not None:
-                _close_client(client, deadline_at=deadline_at, clock=clock, bridge=bridge)
+                _close_client(client, clock=clock, bridge=bridge)
             bridge.close()
             raise ModalSdkFailure("authentication_failed") from None
         except BaseException:
             if client is not None:
-                _close_client(client, deadline_at=deadline_at, clock=clock, bridge=bridge)
+                _close_client(client, clock=clock, bridge=bridge)
             bridge.close()
             raise
         self._modal = modal
@@ -833,7 +835,6 @@ class PinnedModalSdk:
         try:
             _close_client(
                 client,
-                deadline_at=self._deadline_at,
                 clock=self._clock,
                 bridge=self._bridge,
             )

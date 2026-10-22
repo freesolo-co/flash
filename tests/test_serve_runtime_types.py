@@ -1527,3 +1527,8 @@ def test_a_multimodal_template_rejection_is_a_client_error_not_an_unavailable_en
 
     assert isinstance(raised.value, ValueError)
     assert "chat template rejected" in str(raised.value)
+
+
+@pytest.mark.parametrize("prompt", ["  indented code\n", "\ttext\t", "\nhello  "])
+def test_raw_completion_prompt_preserves_authored_whitespace(prompt) -> None:
+    assert GenerationRequest(prompt=prompt).prompt == prompt

@@ -432,8 +432,10 @@ class VllmLoraRuntime:
                 await self._notify_if_dead()
                 raise
             finally:
-                await self._close_output_stream(output_stream)
-                prompt.close()
+                try:
+                    await self._close_output_stream(output_stream)
+                finally:
+                    prompt.close()
 
     def health(self) -> RuntimeHealth:
         """return process-local identity, state counts, and engine liveness."""

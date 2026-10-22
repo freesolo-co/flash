@@ -437,7 +437,8 @@ class GenerationRequest:
         if has_prompt == has_messages:
             raise RuntimeConfigurationError("exactly one of prompt or messages is required")
         if self.prompt is not None:
-            object.__setattr__(self, "prompt", _nonempty(self.prompt, "prompt"))
+            # Validate without trimming: whitespace is part of the model's input.
+            _nonempty(self.prompt, "prompt")
         if self.messages is not None:
             if isinstance(self.messages, str) or not isinstance(self.messages, Sequence):
                 raise RuntimeConfigurationError("messages must be a sequence of mappings")

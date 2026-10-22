@@ -87,6 +87,31 @@ def test_concurrent_registration_is_idempotent(adapter_dir: Path) -> None:
     assert manager.registered_count == manager.loaded_count == 1
 
 
+@pytest.mark.parametrize("replace_existing", [False, True])
+def test_request_construction_failure_preserves_adapter_state(
+    adapter_dir: Path, monkeypatch, replace_existing: bool
+) -> None:
+    engine = _Engine()
+    manager = AdapterManager(engine, EngineConfig(model="model"))
+
+    async def exercise() -> None:
+        if replace_existing:
+            await manager.register(_spec(adapter_dir, "one"))
+        prior_ids = dict(manager._ids)
+
+        def fail_request(*_args):
+            raise RuntimeError("request construction failed")
+
+        monkeypatch.setattr(manager, "_new_lora_request", fail_request)
+        with pytest.raises(RuntimeError, match="request construction failed"):
+            await manager.register(_spec(adapter_dir, "two"))
+        assert manager._ids == prior_ids
+        assert manager.loaded_count == int(replace_existing)
+        assert engine.removed == []
+
+    asyncio.run(exercise())
+
+
 def test_replacement_waits_for_inflight_incarnation(adapter_dir: Path) -> None:
     engine = _Engine()
     manager = AdapterManager(engine, EngineConfig(model="model"))
