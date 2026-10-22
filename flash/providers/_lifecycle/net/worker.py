@@ -36,15 +36,42 @@ WORKER_IMAGE = (
 BAKED_PER_SM_ARCHES = frozenset({"sm80", "sm86", "sm89", "sm90", "sm120", "sm100"})
 
 
+# Requalified on real GPUs against the pinned upstream trainer. See
+# docs/kernel-cache-requalification-2026-10-22.md before rotating these digests.
+QUALIFIED_WORKER_IMAGES = {
+    "sm80": (
+        "ghcr.io/freesolo-co/flash-worker@"
+        "sha256:10ddd08a8c3fa4794f5370a143b433d38597e3fa15860313c1b2eb0340d62e2e"
+    ),
+    "sm86": (
+        "ghcr.io/freesolo-co/flash-worker@"
+        "sha256:14252986499b9f8ca36273d28400171cf77bebc27b633084a5efa8d386be70ef"
+    ),
+    "sm89": (
+        "ghcr.io/freesolo-co/flash-worker@"
+        "sha256:5a435995295d942fffcafc0805fa199451ad24a77c8e4059477230005acd1a84"
+    ),
+    "sm90": (
+        "ghcr.io/freesolo-co/flash-worker@"
+        "sha256:c794abb352bb99c8a90e58f4f1f8f4b56012a1c00fcfe607dd8a037d0f119fb8"
+    ),
+    "sm100": (
+        "ghcr.io/freesolo-co/flash-worker@"
+        "sha256:341e0724f1f1730ff8f8ea0492ee56b16df3e374bf3464528a59c55cc67025d3"
+    ),
+    "sm120": (
+        "ghcr.io/freesolo-co/flash-worker@"
+        "sha256:c5bacd1780becbf383f3e72b5abf9e27b133e4b49cab6817be8d13e6b399ac85"
+    ),
+}
+
+
 def worker_image_for_gpu(friendly_gpu: str | None) -> str:
-    """Return the immutable image qualified with the current upstream trainer."""
-    if friendly_gpu:
-        get_gpu_info(friendly_gpu)
-    # the mutable sm90 tag still contains the retired verl fork. a cache fingerprint is not
-    # trainer compatibility: that tag fails before the first optimizer update.
-    # use the qualified upstream image until compatible per-architecture digests are qualified.
-    # native jit remains available when this image has no matching kernel cache.
-    return WORKER_IMAGE
+    """Select an immutable, qualified cache image with a compatible base fallback."""
+    if not friendly_gpu:
+        return WORKER_IMAGE
+    sm = get_gpu_info(friendly_gpu).sm
+    return QUALIFIED_WORKER_IMAGES.get(sm, WORKER_IMAGE)
 
 
 DEFAULT_EXECUTION_TIMEOUT_MS = 6 * 3600 * 1000  # 6h cap
