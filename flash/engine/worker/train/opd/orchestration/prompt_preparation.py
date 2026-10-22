@@ -7,7 +7,6 @@ from pathlib import Path
 from typing import Any
 
 import flash.engine.worker.io.hf as _worker_hf
-import flash.engine.worker.runtime.state as _worker_state
 import flash.engine.worker.train.entry.backend_common as _backend
 import flash.engine.worker.train.opd.bridging.prompts as _opd_prompts
 from flash.content.thinking import messages_for_chat_template
@@ -16,6 +15,7 @@ from flash.engine.worker.entry.opd import _thinking_prefill_text
 from flash.engine.worker.io.heartbeat import liveness_heartbeat
 from flash.engine.worker.model.decoding import prompt_opens_thinking
 from flash.engine.worker.runtime.rng import seed_training_rngs
+from flash.engine.worker.runtime.state import WorkerContext
 from flash.engine.worker.train.core.child.glue import (
     parent_image_digests,
     validate_glue_template,
@@ -28,10 +28,12 @@ from flash.engine.worker.train.opd.orchestration.state import (
 )
 
 
-def render_prompt_rows(request: _OpdRequest) -> tuple[list[tuple[Any, Any]], bool]:
+def render_prompt_rows(
+    request: _OpdRequest, *, context: WorkerContext
+) -> tuple[list[tuple[Any, Any]], bool]:
     from flash.content.multimodal import record_has_images
 
-    seed_training_rngs(_worker_state.SEED)
+    seed_training_rngs(context.config.seed)
     train = list(request.env.dataset())
     if not train:
         raise RuntimeError("opd environment dataset is empty")
@@ -39,7 +41,7 @@ def render_prompt_rows(request: _OpdRequest) -> tuple[list[tuple[Any, Any]], boo
     if max_examples > 0:
         train = train[:max_examples]
     scanned = [0]
-    with liveness_heartbeat("opd_prompt_scan", progress=lambda: scanned[0]):
+    with liveness_heartbeat("opd_prompt_scan", progress=lambda: scanned[0], context=context):
         prompt_rows = []
         for example in train:
             prompt_rows.append((example, request.env.prompt_messages(example)))
@@ -47,7 +49,7 @@ def render_prompt_rows(request: _OpdRequest) -> tuple[list[tuple[Any, Any]], boo
     multimodal = bool(getattr(request.env, "image_observations", False)) or any(
         record_has_images(example, messages) for example, messages in prompt_rows
     )
-    random.Random(_worker_state.SEED).shuffle(prompt_rows)
+    random.Random(context.config.seed).shuffle(prompt_rows)
     return prompt_rows, multimodal
 
 
@@ -80,6 +82,8 @@ def prepare_prompts(
     multimodal: bool,
     capability: str,
     control_panel_url: str,
+    *,
+    context: WorkerContext,
 ) -> _PromptState:
     from flash.content.multimodal import image_teacher_prompt_messages
     from flash.engine.worker.teacher.client import TeacherClient
@@ -99,13 +103,13 @@ def prepare_prompts(
         tokenizer = _worker_hf.load_tokenizer(request.model_id, revision=request.model_revision)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
-    thinking_prefill = _thinking_prefill_text(tokenizer)
+    thinking_prefill = _thinking_prefill_text(tokenizer, context=context)
     from flash.engine.plan.vram import opd_rollout_seq_len
 
     requested_len = opd_rollout_seq_len(
         request.knobs.max_length,
         request.knobs.max_completion,
-        bool(_worker_state.THINKING),
+        bool(context.config.thinking),
     )
     max_model_len = _backend.clamp_engine_len(
         requested_len,
@@ -121,14 +125,14 @@ def prepare_prompts(
     if prompt_budget < 1:
         raise RuntimeError("opd max_context_tokens leaves no room for a prompt")
     if request.multi_turn:
-        validate_glue_template(tokenizer, thinking=bool(_worker_state.THINKING))
+        validate_glue_template(tokenizer, thinking=bool(context.config.thinking))
     prompts: list[_BridgePrompt] = []
     dropped_long = 0
     package_root_value = getattr(request.env, "package_root", None)
     package_root = str(Path(package_root_value).resolve()) if package_root_value else None
     prepped = [0]
     thinking_semantics_set = False
-    with liveness_heartbeat("opd_image_prep", progress=lambda: prepped[0]):
+    with liveness_heartbeat("opd_image_prep", progress=lambda: prepped[0], context=context):
         for example, messages in prompt_rows:
             prepped[0] += 1
             student_messages, image_descriptors = _prepare_prompt_messages(
@@ -148,7 +152,7 @@ def prepare_prompts(
                     student_messages,
                     image_descriptors,
                     package_root,
-                    enable_thinking=bool(_worker_state.THINKING),
+                    enable_thinking=bool(context.config.thinking),
                 )
             else:
                 teacher_messages = student_messages
@@ -158,14 +162,14 @@ def prepare_prompts(
                         student_messages,
                         (),
                         package_root,
-                        enable_thinking=bool(_worker_state.THINKING),
+                        enable_thinking=bool(context.config.thinking),
                     )
                 else:
                     rendered_prompt = tokenizer.apply_chat_template(
                         student_messages,
                         tokenize=False,
                         add_generation_prompt=True,
-                        enable_thinking=_worker_state.THINKING,
+                        enable_thinking=context.config.thinking,
                         preserve_thinking=False,
                     )
                     prompt_ids = _opd_prompts._normalize_prompt_ids(
@@ -173,7 +177,7 @@ def prepare_prompts(
                             student_messages,
                             tokenize=True,
                             add_generation_prompt=True,
-                            enable_thinking=_worker_state.THINKING,
+                            enable_thinking=context.config.thinking,
                             preserve_thinking=False,
                         )
                     )
@@ -181,7 +185,7 @@ def prepare_prompts(
                 dropped_long += 1
                 continue
             if not thinking_semantics_set:
-                thinking = bool(_worker_state.THINKING)
+                thinking = bool(context.config.thinking)
                 if hasattr(request.env, "thinking"):
                     request.env.thinking = thinking
                 if hasattr(request.env, "prompt_opens_thinking"):

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
@@ -43,7 +44,7 @@ def test_freesolo_adapter_carries_only_an_explicit_class_capability():
     assert instance.image_observations is False
 
 
-def test_worker_environment_load_applies_the_capability_guard(monkeypatch):
+def test_worker_environment_load_applies_the_capability_guard(worker_context, monkeypatch):
 
     spec = SimpleNamespace(
         environment=SimpleNamespace(id="local", params={}, resolved_sha=""),
@@ -52,7 +53,7 @@ def test_worker_environment_load_applies_the_capability_guard(monkeypatch):
         train=SimpleNamespace(teacher_model=None, hf_repo=""),
         thinking=False,
     )
-    monkeypatch.setattr(worker_state, "JOB_SPEC", spec)
+    monkeypatch.setattr(worker_context, "config", replace(worker_context.config, spec=spec))
     monkeypatch.setattr(
         worker_state,
         "load_staged_freesolo_environment",
@@ -60,7 +61,7 @@ def test_worker_environment_load_applies_the_capability_guard(monkeypatch):
     )
 
     with pytest.raises(ValueError, match="does not support image-bearing"):
-        worker_state._load_active_env()
+        worker_context.require_active_env()
 
 
 def test_dynamic_image_capability_requires_an_image_capable_model_and_opd_teacher():

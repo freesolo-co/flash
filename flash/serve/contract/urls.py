@@ -135,5 +135,5 @@ def public_deployment(deployment: dict) -> dict:
     return {
         key: value
         for key, value in deployment.items()
-        if key not in {"registration_identity", "serving_org_id"}
+        if key not in {"registration_identity", "serving_org_id", "verification_started_at"}
     }

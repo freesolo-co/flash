@@ -16,6 +16,7 @@ import time
 
 import flash.engine.worker.io.hf as _worker_hf
 from flash.engine.worker.io.heartbeat import join_while_draining
+from flash.engine.worker.runtime.state import WorkerContext
 from flash.engine.worker.train.core.lifecycle.ledger import CheckpointLedger
 from flash.engine.worker.train.entry.backend_common import (
     completed_checkpoint_step,
@@ -109,7 +110,9 @@ class _VerlCheckpointWatcher:
         final_step: int | None = None,
         exclude_modules: str | None = None,
         preprocessor=None,
+        context: WorkerContext,
     ) -> None:
+        self.context = context
         self.local_dir = local_dir
         self.export_root = export_root
         # sibling of export_root so it shares its filesystem: _staged_source hardlinks into it, and
@@ -151,7 +154,7 @@ class _VerlCheckpointWatcher:
         # is never killed (VERL-131). a watcher that died mid-publish is already not alive, so the
         # join returns at once and raise_if_failed surfaces its real exception rather than a
         # generic "did not stop".
-        join_while_draining(self._thread, "verl checkpoint watcher")
+        join_while_draining(self._thread, "verl checkpoint watcher", context=self.context)
         self.raise_if_failed()
         if require_complete:
             # the published adapters, not the steps this watcher handled: a required save is owed a
@@ -255,19 +258,6 @@ class _VerlCheckpointWatcher:
         actor_dir = resolve_checkpoint_actor_dir(checkpoint_dir)
         adapter_dir = os.path.join(self.export_root, f"step-{step}")
 
-        def publish_adapter() -> None:
-            published = _worker_hf.publish_deployable_checkpoint(
-                adapter_dir,
-                step,
-                required=step in self.required_steps,
-                _provenance_ready=True,
-            )
-            # gate on the returned subfolder, not on reaching this line: an optional publish returns
-            # None for a failed upload and for a directory with no adapter in it, raising only when
-            # the save is required. crediting those would report an artifact that was never written.
-            if published:
-                self.lifecycle.mark_deployable_published(step)
-
         # claimed before the work, not after it: `_pending` filters on the discovered set, so a step
         # left unclaimed while its export raises is handed straight back on the next sweep. the
         # watcher thread dies on that exception anyway, and the retry would race its own teardown.
@@ -293,17 +283,21 @@ class _VerlCheckpointWatcher:
                 preprocessor=self.preprocessor,
             )
             self.lifecycle.mark_staged(step)
-            uploaded = _worker_hf.upload_resume_checkpoint(
+            published = _worker_hf.publish_deployable_checkpoint(
+                adapter_dir,
                 step,
-                checkpoint_dir,
-                final_step=self.final_step,
-                before_upload=publish_adapter,
-                # the callback, not the return value: see mark_resume_uploaded's contract.
-                after_upload=lambda: self.lifecycle.mark_resume_uploaded(step),
+                required=step in self.required_steps,
+                _provenance_ready=True,
+                context=self.context,
             )
+            self.lifecycle.record_publication(step, published)
+            uploaded = _worker_hf.upload_resume_checkpoint(
+                step, checkpoint_dir, final_step=self.final_step, context=self.context
+            )
+            self.lifecycle.record_publication(step, uploaded)
         finally:
             shutil.rmtree(adapter_dir, ignore_errors=True)
-        if step in self.required_steps and not uploaded:
+        if step in self.required_steps and uploaded.resume is None and not uploaded.resume_staged:
             self.lifecycle.mark_failed(step)
             resume_upload_unavailable(step, checkpoint_dir, job_label="sft")
 

@@ -9,7 +9,7 @@ mean durability.
 The five facts below are recorded where each one actually becomes true, and are deliberately
 INDEPENDENT rather than a linear enum, because both publication orders occur legitimately:
 
-- sft and opd publish the deployable from ``before_upload``, so a required step reaches
+- sft and opd explicitly publish the deployable first, so a required step reaches
   ``deployable_published`` BEFORE ``resume_uploaded``.
 - grpo stages a required adapter while its terminal publication latch is shut, uploads resume state meanwhile,
   and publishes the deployable on a later sweep -- the opposite order.
@@ -26,6 +26,10 @@ with the algorithm that owns them.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from flash.engine.worker.io.hf import PublicationResult
 
 
 @dataclass(frozen=True)
@@ -88,13 +92,16 @@ class CheckpointLedger:
     def mark_resume_uploaded(self, step: int) -> None:
         """``step``'s full trainer state is committed under the singular ``checkpoint/`` tree.
 
-        Mark this from ``upload_resume_checkpoint``'s ``after_upload`` callback, which runs only
-        once the folder commit and its prune have both succeeded. The function's boolean return
-        cannot carry this fact: it is also True when there is no artifact repository at all and
-        when a caller's ``skip_upload`` short-circuits, and it is False when the commit landed but
-        the closing heartbeat failed.
+        Recorded from the publication result's commit fact, independently of reporting or pruning.
         """
         self._mark(step, resume_uploaded=True)
+
+    def record_publication(self, step: int, result: PublicationResult) -> None:
+        """record only proved commits, including partial publication success."""
+        if result.resume is not None:
+            self.mark_resume_uploaded(step)
+        if result.deployable is not None:
+            self.mark_deployable_published(step)
 
     def mark_deployable_published(self, step: int) -> None:
         """``step``'s adapter is servable under the plural ``checkpoints/step-N/`` tree.

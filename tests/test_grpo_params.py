@@ -12,11 +12,11 @@ exercised by the live smokes).
 from __future__ import annotations
 
 import re
+from dataclasses import replace
 
 import pytest
 
 import flash.engine.worker.model.decoding as worker_decoding
-import flash.engine.worker.runtime.state as worker_state
 import flash.engine.worker.train.rl.launch.config as worker_grpo_config
 from flash.core.grpo import SUPPORTED_GRPO_GROUP_SIZES
 from flash.core.spec import JobSpec
@@ -123,40 +123,51 @@ def test_prompt_opens_thinking_detects_preopened_tag() -> None:
     )
 
 
-def test_graded_text_hides_tagless_prompt_opened_reasoning(monkeypatch) -> None:
+def test_graded_text_hides_tagless_prompt_opened_reasoning(worker_context, monkeypatch) -> None:
 
-    monkeypatch.setattr(worker_state, "THINKING", True)
+    monkeypatch.setattr(worker_context, "config", replace(worker_context.config, thinking=True))
     # Tagless completion under a prompt-opened <think>: the generation never closed reasoning, so the
     # env must grade NOTHING (scores 0) — not the raw ramble (which a raw-text fallback could reward).
     assert (
-        worker_decoding.graded_text("rambling forever no answer", prompt_opened_thinking=True) == ""
+        worker_decoding.graded_text(
+            "rambling forever no answer", prompt_opened_thinking=True, context=worker_context
+        )
+        == ""
     )
     # Without the prompt-opened signal (e.g. an uncurated template that didn't pre-open), the same
     # tagless text is a normal answer and is graded as-is.
     assert (
-        worker_decoding.graded_text("the answer is 42", prompt_opened_thinking=False)
+        worker_decoding.graded_text(
+            "the answer is 42", prompt_opened_thinking=False, context=worker_context
+        )
         == "the answer is 42"
     )
     # A normally-tagged thinking completion is unaffected: strip to the post-</think> answer.
     assert (
-        worker_decoding.graded_text("reasoning...</think>\\boxed{5}", prompt_opened_thinking=True)
+        worker_decoding.graded_text(
+            "reasoning...</think>\\boxed{5}", prompt_opened_thinking=True, context=worker_context
+        )
         == "\\boxed{5}"
     )
     # Echoed <think> while still unterminated (no </think>): the WHOLE thing is reasoning -> hidden,
     # NOT just the text before the echoed opener (which a raw-text fallback could otherwise reward).
     assert (
-        worker_decoding.graded_text("reason 42 <think> still going", prompt_opened_thinking=True)
+        worker_decoding.graded_text(
+            "reason 42 <think> still going", prompt_opened_thinking=True, context=worker_context
+        )
         == ""
     )
     # THINKING off: no stripping at all, even with the flag set.
-    monkeypatch.setattr(worker_state, "THINKING", False)
+    monkeypatch.setattr(worker_context, "config", replace(worker_context.config, thinking=False))
     assert (
-        worker_decoding.graded_text("rambling forever", prompt_opened_thinking=True)
+        worker_decoding.graded_text(
+            "rambling forever", prompt_opened_thinking=True, context=worker_context
+        )
         == "rambling forever"
     )
 
 
-def test_grpo_overrides_reads_train_knobs(monkeypatch) -> None:
+def test_grpo_overrides_reads_train_knobs(worker_context, monkeypatch) -> None:
 
     train_knobs = {
         "group_size": 4,
@@ -179,8 +190,8 @@ def test_grpo_overrides_reads_train_knobs(monkeypatch) -> None:
             "train": {**train_knobs},
         }
     )
-    monkeypatch.setattr(worker_state, "JOB_SPEC", spec)
-    assert worker_grpo_config.grpo_overrides() == grpo_knobs
+    monkeypatch.setattr(worker_context, "config", replace(worker_context.config, spec=spec))
+    assert worker_grpo_config.grpo_overrides(context=worker_context) == grpo_knobs
     # A leftover grpo_config in environment.params must NOT be read by the worker.
     poisoned = JobSpec.from_dict(
         {
@@ -193,31 +204,37 @@ def test_grpo_overrides_reads_train_knobs(monkeypatch) -> None:
             "train": {},
         }
     )
-    monkeypatch.setattr(worker_state, "JOB_SPEC", poisoned)
-    assert worker_grpo_config.grpo_overrides() == {}
+    monkeypatch.setattr(worker_context, "config", replace(worker_context.config, spec=poisoned))
+    assert worker_grpo_config.grpo_overrides(context=worker_context) == {}
     # only the knobs actually set are returned (a partial set omits the rest)
     monkeypatch.setattr(
-        worker_state,
-        "JOB_SPEC",
-        JobSpec.from_dict(
-            {
-                "model": "Qwen/Qwen3.5-9B",
-                "algorithm": "grpo",
-                "environment": {"id": "github:owner/repo@main:env/environment.py"},
-                "train": {"group_size": 2},
-            }
+        worker_context,
+        "config",
+        replace(
+            worker_context.config,
+            spec=JobSpec.from_dict(
+                {
+                    "model": "Qwen/Qwen3.5-9B",
+                    "algorithm": "grpo",
+                    "environment": {"id": "github:owner/repo@main:env/environment.py"},
+                    "train": {"group_size": 2},
+                }
+            ),
         ),
     )
-    assert worker_grpo_config.grpo_overrides() == {"group_size": 2}
+    assert worker_grpo_config.grpo_overrides(context=worker_context) == {"group_size": 2}
     # no [train] knobs -> empty (recipe defaults apply downstream)
     monkeypatch.setattr(
-        worker_state,
-        "JOB_SPEC",
-        JobSpec.from_dict({"model": "Qwen/Qwen3.5-9B", "algorithm": "grpo"}),
+        worker_context,
+        "config",
+        replace(
+            worker_context.config,
+            spec=JobSpec.from_dict({"model": "Qwen/Qwen3.5-9B", "algorithm": "grpo"}),
+        ),
     )
-    assert worker_grpo_config.grpo_overrides() == {}
-    monkeypatch.setattr(worker_state, "JOB_SPEC", None)
-    assert worker_grpo_config.grpo_overrides() == {}
+    assert worker_grpo_config.grpo_overrides(context=worker_context) == {}
+    monkeypatch.setattr(worker_context, "config", replace(worker_context.config, spec=None))
+    assert worker_grpo_config.grpo_overrides(context=worker_context) == {}
 
 
 def test_train_grpo_knobs_parse_and_roundtrip() -> None:

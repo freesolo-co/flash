@@ -16,9 +16,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from flash.engine.profiling.sft_rows import select_sft_examples
 from flash.engine.profiling.sft_workload import prepare_sft_workload
 from flash.engine.profiling.tokenizer import load_control_plane_tokenizer
-from flash.engine.worker.entry.sft import select_sft_examples
 from flash.engine.worker.model.packing import worker_image_packing_support
 from flash.envs.loading.base import with_system_prompt
 from flash.envs.loading.loader import (

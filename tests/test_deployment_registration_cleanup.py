@@ -30,6 +30,45 @@ def _deploy(api, key, run_id, checkpoint_id):
     return result
 
 
+def test_retired_ready_deployments_are_revoked_and_failed_cleanup_is_retried(api, monkeypatch):
+    key = _new_user_token()
+    retired, supported = [_make_run(api, key, "done") for _ in range(2)]
+    for run_id in (retired, supported):
+        seed_ready_checkpoint(run_id, f"{run_id}/final")
+    current = status.get_status(retired)
+    current.spec = {**current.spec, "algorithm": "opsd"}
+    state._save_status(current)
+    sibling = status.get_status(supported).deployments
+    monkeypatch.setattr(
+        serving_completion.db, "all_runs", lambda: [{"run_id": r} for r in (retired, supported)]
+    )
+    monkeypatch.setattr(deployment_state, "_enqueue_deployment_report", lambda _: None)
+    calls = []
+
+    def undeploy(target, *, org_id, timeout_s):
+        assert target == f"{retired}/final"
+        assert org_id == run_serving_org_id(current)
+        assert timeout_s == 5.0
+        assert status.get_status(retired).deployments[target]["state"] == "cleanup_pending"
+        calls.append(target)
+        if len(calls) == 1:
+            raise ServingError("temporary serving outage")
+        return {"disabled_checkpoints": [target]}
+
+    monkeypatch.setattr(deploy, "undeploy_adapter", undeploy)
+    assert serving_completion.recover_deployments() == 1
+    assert not calls
+    assert serving_completion.cleanup_pending_deployments(Event())
+    pending = status.get_status(retired).deployments[f"{retired}/final"]
+    assert pending["state"] == "cleanup_pending"
+    assert "temporary serving outage" in pending["error"]
+    assert serving_completion.recover_deployments() == 1
+    assert not serving_completion.cleanup_pending_deployments(Event())
+    assert status.get_status(retired).deployments[f"{retired}/final"]["state"] == "undeployed"
+    assert status.get_status(supported).deployments == sibling
+    assert len(calls) == 2
+
+
 @pytest.mark.parametrize("cleanup_fails", [False, True])
 @pytest.mark.parametrize("registration_started", [False, True])
 def test_failure_before_smoke_cleans_only_attempted_registration(
@@ -59,7 +98,7 @@ def test_failure_before_smoke_cleans_only_attempted_registration(
     monkeypatch.setattr(deploy, "undeploy_adapter", undeploy)
     result = _deploy(api, key, run_id, checkpoint_id)
     pending = registration_started and cleanup_fails
-    assert result["state"] == ("cleanup_pending" if pending else "failed")
+    assert result["state"] == ("undeploying" if pending else "failed")
     assert undeploys == (
         [(checkpoint_id, run_serving_org_id(before))] if registration_started else []
     )
@@ -69,7 +108,7 @@ def test_failure_before_smoke_cleans_only_attempted_registration(
     assert status.get_status(run_id).deployments[sibling] == before.deployments[sibling]
 
 
-@pytest.mark.parametrize("initial_state", ["queued", "smoke_testing", "cleanup_pending"])
+@pytest.mark.parametrize("initial_state", ["deploying", "undeploying"])
 @pytest.mark.parametrize("cleanup_fails", [False, True])
 def test_recovery_fences_and_removes_unfinished_registration(
     api, monkeypatch, initial_state, cleanup_fails
@@ -96,8 +135,8 @@ def test_recovery_fences_and_removes_unfinished_registration(
     def undeploy(target, *, org_id, timeout_s=None):
         undeploys.append((target, org_id))
         fenced = status.get_status(run_id).deployments[target]
-        assert fenced["state"] == "cleanup_pending"
-        assert fenced["generation"] >= attempt["generation"] + (initial_state != "cleanup_pending")
+        assert fenced["state"] == "undeploying"
+        assert fenced["generation"] >= attempt["generation"] + (initial_state != "undeploying")
         late = {
             **attempt,
             "state": "ready",
@@ -116,7 +155,7 @@ def test_recovery_fences_and_removes_unfinished_registration(
     saved = status.get_status(run_id)
     assert saved.deployments[sibling] == current.deployments[sibling]
     assert saved.deployments[checkpoint_id]["state"] == (
-        "cleanup_pending" if cleanup_fails else "undeployed"
+        "undeploying" if cleanup_fails else "undeployed"
     )
     assert undeploys == [(checkpoint_id, run_serving_org_id(current))]
     assert reports[-1].deployments == saved.deployments
@@ -139,7 +178,7 @@ def test_recovery_without_org_retains_cleanup_pending(api, monkeypatch):
             "checkpoint_id": checkpoint_id,
             "checkpoint_step": None,
             "generation": 1,
-            "state": "queued",
+            "state": "deploying",
             "registration_identity": {},
         },
     )
@@ -151,7 +190,7 @@ def test_recovery_without_org_retains_cleanup_pending(api, monkeypatch):
     assert serving_completion.recover_deployments() == 1
     serving_completion.cleanup_pending_deployments(Event())
     record = status.get_status(run_id).deployments[checkpoint_id]
-    assert record["state"] == "cleanup_pending"
+    assert record["state"] == "undeploying"
     assert "no organization scope" in record["error"]
 
 
@@ -284,10 +323,10 @@ def test_cleanup_worker_handles_live_failures_after_idle(controlled_cleanup, api
     monkeypatch.setattr(deploy, "undeploy_adapter", undeploy)
     for _ in range(2):  # A drained queue must not end the worker's lifetime.
         offline = True
-        assert _deploy(api, key, run_id, target)["state"] == "cleanup_pending"
+        assert _deploy(api, key, run_id, target)["state"] == "undeploying"
         wake.set()
         assert waits.get(timeout=2) == 1.0
-        assert status.get_status(run_id).deployments[target]["state"] == "cleanup_pending"
+        assert status.get_status(run_id).deployments[target]["state"] == "undeploying"
         offline = False
         wake.set()
         assert waits.get(timeout=2) == 30.0
@@ -338,7 +377,7 @@ def test_cleanup_worker_retries_without_another_restart(api, monkeypatch, interr
     targets = [f"{run_id}/final", f"{run_id}/step-20"]
     for target in targets:
         seed_ready_checkpoint(run_id, target)
-        transitions.mark_deployment_cleanup_pending(run_id, "interrupted", target)
+        transitions.mark_deployment_undeploying(run_id, "interrupted", target)
     deleted, waits = [], []
     stop = Event()
     lock = serving_completion.deployment_locks._deploy_lock(run_id)
@@ -377,7 +416,7 @@ def test_cleanup_retry_rechecks_state_after_backoff(api, monkeypatch):
     run_id = _make_run(api, key, "done")
     target = f"{run_id}/final"
     seed_ready_checkpoint(run_id, target)
-    transitions.mark_deployment_cleanup_pending(run_id, "interrupted", target)
+    transitions.mark_deployment_undeploying(run_id, "interrupted", target)
     stop, deleted = Event(), []
 
     def unavailable(checkpoint_id, **kwargs):
@@ -520,7 +559,7 @@ def test_cleanup_reaches_later_checkpoints_despite_repeated_timeouts(
         target = f"{run_id}/step-{i + 1}"
         targets.append((run_id, target))
         seed_ready_checkpoint(run_id, target)
-        transitions.mark_deployment_cleanup_pending(run_id, "original failure", target)
+        transitions.mark_deployment_undeploying(run_id, "original failure", target)
     targets.sort()
     last_run, last_target = targets[-1]
     clock = SimpleNamespace(now=0.0)
@@ -555,7 +594,7 @@ def test_cleanup_retry_keeps_original_cause_and_only_latest_failure(
     run_id = _make_run(api, key, "done")
     target = f"{run_id}/final"
     seed_ready_checkpoint(run_id, target)
-    transitions.mark_deployment_cleanup_pending(run_id, "readiness timed out", target)
+    transitions.mark_deployment_undeploying(run_id, "readiness timed out", target)
     if legacy_composite:
         current = status.get_status(run_id)
         current.deployments[target].pop("deployment_error")

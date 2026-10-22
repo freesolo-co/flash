@@ -24,9 +24,9 @@ from flash.core.spec import JobSpec, require_project_id
 from flash.runner.lifecycle.status import effective_spec_from_status
 from flash.runner.results.deployments import generation, is_ready, require_checkpoint
 from flash.runner.supervise.transitions import (
-    mark_deployment_cleanup_pending,
     mark_deployment_failed,
     mark_deployment_pending,
+    mark_deployment_undeploying,
     mark_undeployed,
 )
 from flash.serve.contract.errors import ServingError
@@ -132,7 +132,7 @@ def _reject_contended_deploy(
     raise HTTPException(status_code=409, detail=detail)
 
 
-def _queued_deployment_record(
+def _deploying_record(
     run_id: str,
     effective_spec: JobSpec,
     deploy_prefix: str,
@@ -140,7 +140,7 @@ def _queued_deployment_record(
     is_checkpoint: bool,
     current_deployment: dict,
 ) -> dict:
-    """Build the ``queued`` deployment record that gets persisted before the job starts."""
+    """Build the ``deploying`` deployment record that gets persisted before the job starts."""
     # Validate the cheap configured-rank part synchronously so obvious spec errors return 400
     # instead of becoming background deployment failures.
     try:
@@ -159,14 +159,14 @@ def _queued_deployment_record(
             run_id=run_id,
             model=effective_spec.model,
             adapter_prefix=deploy_prefix,
-            state="queued",
+            state="deploying",
             checkpoint_step=checkpoint_step,
         ).to_dict()
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     dep_dict = deployment_state.with_deployment_state(
         dep_dict,
-        "queued",
+        "deploying",
         detail="deployment queued",
         verify=True,
         requested_at=time.time(),
@@ -312,7 +312,7 @@ def deploy(
         if is_ready(run_id, current_deployment):
             return deployment_state._public_deployment(current_deployment)
 
-        dep_dict = _queued_deployment_record(
+        dep_dict = _deploying_record(
             run_id,
             effective_spec,
             deploy_prefix,
@@ -407,11 +407,14 @@ def undeploy(
                 raise HTTPException(
                     status_code=409, detail=f"run {run_id} has no organization scope"
                 )
+            marked = mark_deployment_undeploying(run_id, "", checkpoint_id=checkpoint_id)
+            deployment_state._report_persisted_transition(status, marked, persisted=True)
+            status = marked
             result = serving_deploy.undeploy_adapter(checkpoint_id, org_id=org_id)
         except ServingError as exc:
-            marked = mark_deployment_cleanup_pending(run_id, str(exc), checkpoint_id=checkpoint_id)
+            marked = mark_deployment_undeploying(run_id, str(exc), checkpoint_id=checkpoint_id)
             record = marked.deployments.get(checkpoint_id, {})
-            persisted = record.get("state") == "cleanup_pending" and record.get("error") == str(exc)
+            persisted = record.get("state") == "undeploying" and record.get("error") == str(exc)
             deployment_state._report_persisted_transition(status, marked, persisted=persisted)
             raise HTTPException(
                 status_code=502,

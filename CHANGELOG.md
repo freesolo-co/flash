@@ -18,6 +18,12 @@ This file starts at 1.1.35. Earlier releases are not reconstructed here; use
 
 ## Unreleased
 
+### Removed
+
+- Removed training provider-cost reconciliation, realized-cost reporting and displays, and serving
+  settlement reconciliation writes to Supabase. Customer charges, price estimates, and serving
+  usage capture and delivery remain supported.
+
 ### Added
 
 - OpenAI chat serving now implements and offline-validates strict function tool calling for the exact

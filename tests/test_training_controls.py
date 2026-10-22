@@ -2,13 +2,13 @@ from __future__ import annotations
 
 import builtins
 import sys
+from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
 
 import flash.engine.worker.io.heartbeat as worker_heartbeat
 import flash.engine.worker.io.hf as worker_hf
-import flash.engine.worker.runtime.state as worker_state
 from flash.core.grpo import GRPO_NATIVE_THREAD_ENV
 from flash.core.spec import FIXED_SEED, EnvironmentSpec, JobSpec, TrainSpec
 from flash.engine.plan.steps import (
@@ -185,35 +185,9 @@ def test_positive_save_every_is_preserved():
     assert TrainSpec(save_every=20).save_every == 20
 
 
-def test_resume_first_companion_retries_without_reuploading_full_state(monkeypatch, tmp_path):
-
-    calls = {"resume": 0, "deployable": 0}
-
-    class Api:
-        def upload_folder(self, **kwargs):
-            assert kwargs["path_in_repo"].endswith("/checkpoint/checkpoint-4")
-            calls["resume"] += 1
-
-        def list_repo_files(self, **_kwargs):
-            return []
-
-    def publish_once_then_succeed():
-        calls["deployable"] += 1
-        if calls["deployable"] == 1:
-            raise ConnectionError("hf deployable upload unavailable")
-
-    monkeypatch.setattr(worker_state, "HF_REPO", "org/runs")
-    monkeypatch.setattr(worker_hf, "hf_api", lambda: Api())
-    monkeypatch.setattr(worker_heartbeat, "heartbeat", lambda *args, **kwargs: None)
-    monkeypatch.setattr(worker_hf, "_CKPT_UPLOAD_BACKOFF_S", 0.0)
-
-    assert worker_hf.upload_resume_checkpoint(
-        4, str(tmp_path), after_upload=publish_once_then_succeed
-    )
-    assert calls == {"resume": 1, "deployable": 2}
-
-
-def test_resume_checkpoint_failure_heartbeat_surfaces_sanitized_error(monkeypatch, tmp_path):
+def test_resume_checkpoint_failure_heartbeat_surfaces_sanitized_error(
+    worker_context, monkeypatch, tmp_path
+):
 
     secret = "hf_checkpoint_upload_secret"
     calls = 0
@@ -226,14 +200,20 @@ def test_resume_checkpoint_failure_heartbeat_surfaces_sanitized_error(monkeypatc
             raise PermissionError(f"hf quota refused credential {secret} " + "x" * 400)
 
     monkeypatch.setenv("HF_TOKEN", secret)
-    monkeypatch.setattr(worker_state, "HF_REPO", "org/runs")
+    monkeypatch.setattr(
+        worker_context, "config", replace(worker_context.config, hf_repo="org/runs")
+    )
     monkeypatch.setattr(worker_hf, "hf_api", lambda: Api())
     monkeypatch.setattr(
-        worker_heartbeat, "heartbeat", lambda stage, **kwargs: heartbeats.append((stage, kwargs))
+        worker_heartbeat,
+        "heartbeat",
+        lambda stage, context=None, **kwargs: heartbeats.append((stage, kwargs)),
     )
     monkeypatch.setattr(worker_hf, "_CKPT_UPLOAD_BACKOFF_S", 0.0)
 
-    assert not worker_hf.upload_resume_checkpoint(50, str(tmp_path))
+    assert (
+        worker_hf.upload_resume_checkpoint(50, str(tmp_path), context=worker_context).resume is None
+    )
 
     failed = [fields for stage, fields in heartbeats if stage == "checkpoint_upload_failed"]
     assert calls == worker_hf._CKPT_UPLOAD_RETRIES
@@ -246,44 +226,6 @@ def test_resume_checkpoint_failure_heartbeat_surfaces_sanitized_error(monkeypatc
     assert "<redacted>" in failure["error"]
     assert secret not in failure["error"]
     assert len(failure["error"]) <= 300
-
-
-@pytest.mark.parametrize("failure_stage", ["before", "after"])
-def test_resume_checkpoint_companion_failure_still_raises(monkeypatch, tmp_path, failure_stage):
-
-    calls = {"resume": 0, "companion": 0}
-    heartbeats: list[tuple[str, dict]] = []
-
-    class Api:
-        def upload_folder(self, **_kwargs):
-            calls["resume"] += 1
-
-        def list_repo_files(self, **_kwargs):
-            return []
-
-    def fail_companion():
-        calls["companion"] += 1
-        raise RuntimeError(f"{failure_stage} companion failed")
-
-    callbacks = {f"{failure_stage}_upload": fail_companion}
-    monkeypatch.setattr(worker_state, "HF_REPO", "org/runs")
-    monkeypatch.setattr(worker_hf, "hf_api", lambda: Api())
-    monkeypatch.setattr(
-        worker_heartbeat, "heartbeat", lambda stage, **kwargs: heartbeats.append((stage, kwargs))
-    )
-    monkeypatch.setattr(worker_hf, "_CKPT_UPLOAD_BACKOFF_S", 0.0)
-
-    with pytest.raises(RuntimeError, match=f"{failure_stage} companion failed"):
-        worker_hf.upload_resume_checkpoint(50, str(tmp_path), **callbacks)
-
-    failed = [fields for stage, fields in heartbeats if stage == "checkpoint_upload_failed"]
-    assert calls["companion"] == worker_hf._CKPT_UPLOAD_RETRIES
-    assert calls["resume"] == (0 if failure_stage == "before" else 1)
-    assert len(failed) == 1
-    failure = failed[0]["checkpoint_failure"]
-    assert failure["step"] == 50
-    assert failure["operation"] == failure_stage
-    assert f"{failure_stage} companion failed" in failure["error"]
 
 
 def test_upload_failure_cause_reaches_the_rendered_run_log():
@@ -464,7 +406,7 @@ def test_every_attempt_of_a_run_shares_the_one_authoritative_seed():
 
 
 def test_sft_under_ran_only_fails_a_genuine_under_run():
-    from flash.engine.worker.entry.sft import sft_finished_before_expected_steps
+    from flash.engine.profiling.sft_rows import sft_finished_before_expected_steps
 
     # a real under-run (fewer updates than the quoted horizon) fails loudly.
     assert sft_finished_before_expected_steps(9, 10)
@@ -485,7 +427,7 @@ def test_grpo_under_ran_only_fails_a_genuine_under_run():
 
     from flash.engine.worker.train.entry import rl_train
 
-    tree = ast.parse(textwrap.dedent(inspect.getsource(rl_train.run_rl_train)))
+    tree = ast.parse(textwrap.dedent(inspect.getsource(rl_train._publish_rl_result)))
     compares = [
         node
         for node in ast.walk(tree)
@@ -597,3 +539,110 @@ def test_all_algorithms_reject_unconditional_control_plane_secrets(algorithm):
         match=r"\[environment\] secrets must not include platform-managed key\(s\): SEED",
     ):
         spec_from_dict(_spec_with_declared_secret(algorithm, "SEED"))
+
+
+@pytest.mark.parametrize("failure", ["report", "prune", "none"])
+def test_resume_commit_survives_post_commit_failures(
+    worker_context, monkeypatch, tmp_path, failure
+):
+    from types import SimpleNamespace
+
+    calls = []
+
+    class Api:
+        def upload_folder(self, **kwargs):
+            calls.append(kwargs["path_in_repo"])
+            return SimpleNamespace(oid="immutable-revision")
+
+        def list_repo_files(self, **kwargs):
+            if failure == "prune":
+                raise OSError("pruning unavailable")
+            return []
+
+    def report(*args, **kwargs):
+        if failure == "report":
+            raise OSError("reporting unavailable")
+
+    monkeypatch.setattr(
+        worker_context, "config", replace(worker_context.config, hf_repo="org/runs")
+    )
+    monkeypatch.setattr(worker_hf, "hf_api", lambda: Api())
+    monkeypatch.setattr(worker_heartbeat, "heartbeat", report)
+    result = worker_hf.upload_resume_checkpoint(4, str(tmp_path), context=worker_context)
+    assert result.resume.revision == "immutable-revision"
+    assert len(calls) == 1
+    assert bool(result.reporting_error) == (failure == "report")
+    assert bool(result.prune_errors) == (failure == "prune")
+    with pytest.raises(TypeError, match="commit facts"):
+        bool(result)
+
+
+def test_resume_without_repository_is_not_a_commit(worker_context, monkeypatch, tmp_path):
+    monkeypatch.setattr(worker_context, "config", replace(worker_context.config, hf_repo=""))
+    result = worker_hf.upload_resume_checkpoint(4, str(tmp_path), context=worker_context)
+    assert result.resume is None
+    assert result.skipped_reason == "no_repository"
+
+
+def test_resume_transport_cleanup_failure_still_clears_previous_failure(
+    worker_context, monkeypatch, tmp_path
+):
+    import json
+    from contextlib import contextmanager
+    from pathlib import Path
+
+    from flash.engine.support import checkpoint_transport
+    from flash.engine.worker.runtime.state import WorkerContext
+
+    uploads = []
+    reports = []
+
+    @contextmanager
+    def broken_cleanup(directory):
+        yield directory
+        raise OSError("transport cleanup failed")
+
+    class Api:
+        def upload_folder(self, **kwargs):
+            uploads.append(kwargs)
+            return SimpleNamespace(oid="resume-commit")
+
+        def list_repo_files(self, **kwargs):
+            raise OSError("pruning unavailable")
+
+    def upload_report(path, *args, **kwargs):
+        reports.append(json.loads(Path(path).read_text()))
+        return True
+
+    monkeypatch.setattr(
+        worker_context, "config", replace(worker_context.config, hf_repo="org/runs")
+    )
+    monkeypatch.setattr(worker_hf, "hf_api", Api)
+    monkeypatch.setattr(worker_hf, "hf_upload_file", upload_report)
+    monkeypatch.setattr(checkpoint_transport, "upload_directory", broken_cleanup)
+    worker_heartbeat.heartbeat(
+        "checkpoint_upload_failed",
+        step=3,
+        checkpoint_failure={"step": 3, "error": "old failure"},
+        context=worker_context,
+    )
+    other_attempt = WorkerContext(replace(worker_context.config, run_id="other-run"))
+    other_failure = {"step": 2, "error": "other failure"}
+    worker_heartbeat.heartbeat(
+        "checkpoint_upload_failed", step=2, checkpoint_failure=other_failure, context=other_attempt
+    )
+
+    result = worker_hf.upload_resume_checkpoint(4, str(tmp_path), context=worker_context)
+    worker_heartbeat.heartbeat("done", step=4, context=worker_context)
+
+    assert result.resume.revision == "resume-commit"
+    assert len(uploads) == 1
+    assert result.upload_error is None
+    assert result.prune_errors == (
+        "OSError: transport cleanup failed",
+        "OSError: pruning unavailable",
+    )
+    assert worker_context.heartbeat_state.pending_checkpoint_failure is None
+    assert other_attempt.heartbeat_state.pending_checkpoint_failure == other_failure
+    assert reports[-1]["stage"] == "done"
+    assert "checkpoint_failure" not in reports[-1]

@@ -635,13 +635,13 @@ class ApiClient:
                     (
                         record
                         for record in (status.get("deployments") or {}).values()
-                        if record.get("state") == "cleanup_pending"
+                        if record.get("state") == "undeploying"
                     ),
                     {},
                 )
                 terminal = last_state in {"cancelled", "done", "failed", "dry_run"}
                 cleanup_pending = (
-                    isinstance(deployment, dict) and deployment.get("state") == "cleanup_pending"
+                    isinstance(deployment, dict) and deployment.get("state") == "undeploying"
                 )
                 if terminal and cleanup_pending:
                     error = deployment.get("error") or "unknown backend teardown error"

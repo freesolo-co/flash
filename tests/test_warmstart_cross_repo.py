@@ -3,13 +3,13 @@
 import json
 import os
 import shutil
+from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
 
 import flash.core.catalog as catalog
 import flash.engine.worker.model.adapter as worker_adapter
-import flash.engine.worker.runtime.state as worker_state
 import flash.runner.lifecycle.preparation as runner_preparation
 import flash.runner.lifecycle.state as runner_state
 import flash.runner.lifecycle.status as runner_status
@@ -20,7 +20,7 @@ from tests._helpers.runner import provisioned_status
 _REVISION = "a" * 40
 
 
-def _capture(monkeypatch, prefix, hf_repo="Freesolo-Co/flashrun-self"):
+def _capture(monkeypatch, prefix, hf_repo="Freesolo-Co/flashrun-self", *, worker_context):
     """Call _download_adapter with snapshot_download stubbed; return its kwargs + the result.
 
     _download_adapter targets an absolute local_dir (/tmp/evdl), so no chdir is needed; the
@@ -40,7 +40,7 @@ def _capture(monkeypatch, prefix, hf_repo="Freesolo-Co/flashrun-self"):
         with open(os.path.join(adapter_dir, "adapter_model.safetensors"), "wb") as fh:
             fh.write(b"fixture")
 
-    monkeypatch.setattr(worker_state, "HF_REPO", hf_repo)
+    monkeypatch.setattr(worker_context, "config", replace(worker_context.config, hf_repo=hf_repo))
     monkeypatch.setattr(
         "flash.engine.worker.model.adapter._warmstart_adapter_is_loadable",
         lambda adapter_dir: (
@@ -52,53 +52,66 @@ def _capture(monkeypatch, prefix, hf_repo="Freesolo-Co/flashrun-self"):
 
     monkeypatch.setattr(huggingface_hub, "snapshot_download", fake_snapshot_download)
     try:
-        return calls, worker_adapter._download_adapter(prefix)
+        return calls, worker_adapter._download_adapter(prefix, context=worker_context)
     finally:
         shutil.rmtree("/tmp/evdl", ignore_errors=True)
 
 
-def test_storage_ref_downloads_from_other_repo(monkeypatch):
-    calls, out = _capture(monkeypatch, "Freesolo-Co/flashrun-sftX:sft/flash-sftX")
+def test_storage_ref_downloads_from_other_repo(worker_context, monkeypatch):
+    calls, out = _capture(
+        monkeypatch, "Freesolo-Co/flashrun-sftX:sft/flash-sftX", worker_context=worker_context
+    )
     assert calls["repo_id"] == "Freesolo-Co/flashrun-sftX"
     assert calls["allow_patterns"] == ["sft/flash-sftX/adapter/*"]
     assert out is not None
     assert out.endswith("sft/flash-sftX/adapter")
 
 
-def test_checkpoint_step_adapter_ref_downloads_that_step(monkeypatch):
+def test_checkpoint_step_adapter_ref_downloads_that_step(worker_context, monkeypatch):
     """The resolved storage ref can target a deployable per-step adapter snapshot."""
-    calls, out = _capture(monkeypatch, "Freesolo-Co/flashrun-rlX:rl/flash-rlX/checkpoints/step-40")
+    calls, out = _capture(
+        monkeypatch,
+        "Freesolo-Co/flashrun-rlX:rl/flash-rlX/checkpoints/step-40",
+        worker_context=worker_context,
+    )
     assert calls["repo_id"] == "Freesolo-Co/flashrun-rlX"
     assert calls["allow_patterns"] == ["rl/flash-rlX/checkpoints/step-40/adapter/*"]
     assert out is not None
     assert out.endswith("rl/flash-rlX/checkpoints/step-40/adapter")
 
 
-def test_worker_download_uses_pinned_source_revision(monkeypatch):
+def test_worker_download_uses_pinned_source_revision(worker_context, monkeypatch):
     monkeypatch.setattr(
-        worker_state,
-        "JOB_SPEC",
-        SimpleNamespace(train=SimpleNamespace(init_from_adapter_revision=_REVISION)),
+        worker_context,
+        "config",
+        replace(
+            worker_context.config,
+            spec=SimpleNamespace(train=SimpleNamespace(init_from_adapter_revision=_REVISION)),
+        ),
     )
-    calls, _out = _capture(monkeypatch, "Freesolo-Co/flashrun-sftX:sft/flash-sftX")
+    calls, _out = _capture(
+        monkeypatch, "Freesolo-Co/flashrun-sftX:sft/flash-sftX", worker_context=worker_context
+    )
     assert calls["revision"] == _REVISION
 
 
-def test_checkpoint_ref_with_trailing_path_is_rejected(monkeypatch):
+def test_checkpoint_ref_with_trailing_path_is_rejected(worker_context, monkeypatch):
     calls, out = _capture(
-        monkeypatch, "Freesolo-Co/flashrun-rlX:rl/flash-rlX/checkpoints/step-40/adapter"
+        monkeypatch,
+        "Freesolo-Co/flashrun-rlX:rl/flash-rlX/checkpoints/step-40/adapter",
+        worker_context=worker_context,
     )
     assert calls == {}
     assert out is None
 
 
-def test_bare_prefix_is_not_an_internal_storage_ref(monkeypatch):
-    calls, out = _capture(monkeypatch, "sft/flash-self")
+def test_bare_prefix_is_not_an_internal_storage_ref(worker_context, monkeypatch):
+    calls, out = _capture(monkeypatch, "sft/flash-self", worker_context=worker_context)
     assert calls == {}
     assert out is None
 
 
-def test_worker_download_failure_redacts_internal_storage_ref(monkeypatch, capsys):
+def test_worker_download_failure_redacts_internal_storage_ref(worker_context, monkeypatch, capsys):
     import huggingface_hub
 
     internal_ref = "private-owner/private-repo:sft/source-run/checkpoints/step-20"
@@ -108,7 +121,7 @@ def test_worker_download_failure_redacts_internal_storage_ref(monkeypatch, capsy
 
     monkeypatch.setattr(huggingface_hub, "snapshot_download", fail_download)
     with pytest.raises(RuntimeError) as exc_info:
-        worker_adapter._download_adapter(internal_ref)
+        worker_adapter._download_adapter(internal_ref, context=worker_context)
 
     captured = capsys.readouterr()
     exposed = f"{exc_info.value}\n{captured.out}\n{captured.err}"
@@ -118,8 +131,10 @@ def test_worker_download_failure_redacts_internal_storage_ref(monkeypatch, capsy
     assert "prepared warm-start source adapter could not be downloaded" in str(exc_info.value)
 
 
-def test_managed_repo_without_prefix_is_not_an_internal_storage_ref(monkeypatch):
-    calls, out = _capture(monkeypatch, "Freesolo-Co/flashrun-flash-1782194170-ce1cfcff")
+def test_managed_repo_without_prefix_is_not_an_internal_storage_ref(worker_context, monkeypatch):
+    calls, out = _capture(
+        monkeypatch, "Freesolo-Co/flashrun-flash-1782194170-ce1cfcff", worker_context=worker_context
+    )
     assert calls == {}
     assert out is None
 

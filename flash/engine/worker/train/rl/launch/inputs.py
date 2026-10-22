@@ -20,7 +20,6 @@ import flash.engine.worker.io.hf as _worker_hf
 import flash.engine.worker.model.adapter as _worker_adapter
 import flash.engine.worker.model.decoding as _worker_decoding
 import flash.engine.worker.perf as _worker_perf
-import flash.engine.worker.runtime.state as _worker_state
 import flash.engine.worker.train.rl.launch.config as _worker_config
 from flash.adapters.targets import LoraTargeting, resolve_lora_targeting
 from flash.content.structured_outputs import (
@@ -38,6 +37,7 @@ from flash.engine.plan.steps import (
 )
 from flash.engine.worker.io.heartbeat import liveness_heartbeat
 from flash.engine.worker.runtime.rng import backend_seed, seed_training_rngs
+from flash.engine.worker.runtime.state import WorkerContext
 from flash.engine.worker.train.core.child.glue import validate_glue_template
 from flash.engine.worker.train.entry.backend_common import (
     clamp_engine_len,
@@ -76,7 +76,7 @@ def _validate_grpo_environment(env):
     return True
 
 
-def _resolve_grpo_options(train_spec, rl, multi_turn):
+def _resolve_grpo_options(train_spec, rl, multi_turn, *, context: WorkerContext):
     # fail loudly on unsupported verl features. structured-output constraints travel in per-sample
     # params via render_structured_outputs_shim; the reasoning parser is a hydra override. malformed
     # payloads raise instead of training unconstrained.
@@ -123,7 +123,7 @@ def _resolve_grpo_options(train_spec, rl, multi_turn):
             f"RECIPE.lora.dropout={RECIPE.lora.dropout} is not wired on the verl backend; "
             "add actor_rollout_ref.model.lora_dropout support before setting it non-zero."
         )
-    gcfg = _worker_config.grpo_overrides()
+    gcfg = _worker_config.grpo_overrides(context=context)
     prompts_per_step = int(
         train_spec.prompts_per_step
         if train_spec and train_spec.prompts_per_step is not None
@@ -194,12 +194,12 @@ def _resolve_warmstart_config(
     return lora_rank, lora_alpha
 
 
-def _load_training_records(env, train_spec):
+def _load_training_records(env, train_spec, *, context: WorkerContext):
     train = env.dataset()
     max_examples = getattr(train_spec, "max_examples", None) if train_spec else None
     if max_examples:
         train = train[: int(max_examples)]
-    rng = random.Random(_worker_state.SEED)
+    rng = random.Random(context.config.seed)
     rng.shuffle(train)
     return train, [env.prompt_messages(ex) for ex in train]
 
@@ -212,10 +212,12 @@ def _grpo_is_multimodal(env, train, message_prompts):
     )
 
 
-def _resolve_sequence_lengths(model_id, model_revision, train_spec, rl, gcfg, tok, multi_turn):
+def _resolve_sequence_lengths(
+    model_id, model_revision, train_spec, rl, gcfg, tok, multi_turn, *, context: WorkerContext
+):
     from flash.engine.plan.vram import grpo_completion_len, grpo_rollout_seq_len
 
-    thinking = bool(_worker_state.THINKING)
+    thinking = bool(context.config.thinking)
     max_tokens = gcfg.get("max_tokens")
     max_completion = grpo_completion_len(max_tokens, thinking)
     train_ctx = (
@@ -243,7 +245,7 @@ def _resolve_sequence_lengths(model_id, model_revision, train_spec, rl, gcfg, to
         # the child derives inter-turn glue by probing this template. a template that cannot
         # round-trip assistant content would fail on the first environment reply, after the rollout
         # has already burned gpu time -- fail here instead, before anything is launched.
-        validate_glue_template(tok, thinking=bool(_worker_state.THINKING))
+        validate_glue_template(tok, thinking=bool(context.config.thinking))
     return {
         "max_completion": max_completion,
         "vllm_max_len": vllm_max_len,
@@ -252,7 +254,15 @@ def _resolve_sequence_lengths(model_id, model_revision, train_spec, rl, gcfg, to
 
 
 def _build_grpo_prompts(
-    train, message_prompts, multimodal, processor, tok, package_root, prompt_budget
+    train,
+    message_prompts,
+    multimodal,
+    processor,
+    tok,
+    package_root,
+    prompt_budget,
+    *,
+    context: WorkerContext,
 ):
     from flash.content.multimodal import normalize_prompt_images
 
@@ -269,7 +279,7 @@ def _build_grpo_prompts(
                 template_messages,
                 tuple(normalized.descriptors),
                 package_root,
-                enable_thinking=bool(_worker_state.THINKING),
+                enable_thinking=bool(context.config.thinking),
             )
             if 0 < len(expanded) <= prompt_budget:
                 prompts.append(
@@ -292,7 +302,7 @@ def _build_grpo_prompts(
                 template_messages,
                 tokenize=False,
                 add_generation_prompt=True,
-                enable_thinking=_worker_state.THINKING,
+                enable_thinking=context.config.thinking,
                 preserve_thinking=False,
             )
             prompt_ids = list(tok(rendered, add_special_tokens=False).input_ids)
@@ -398,6 +408,7 @@ def _assemble_grpo_inputs(
     prompt_opened_thinking,
     warmstart_adapter,
     pinned,
+    context: WorkerContext,
 ):
     return {
         "env": env,
@@ -429,7 +440,7 @@ def _assemble_grpo_inputs(
         # a checkpoint written at the executed width read as the wrong topology and every retry
         # restarted from step 0. opd binds one value for both phases; this is grpo's.
         "dp_cards": rl_data_parallel_cards(
-            gpu_count_of(_worker_state.JOB_SPEC),
+            gpu_count_of(context.config.spec),
             int(schedule["prompts_per_step"]) * int(options["group_size"]),
         ),
         "mask_truncated_completions": options["mask_truncated_completions"],
@@ -463,22 +474,22 @@ def _assemble_grpo_inputs(
         # verl's default preserves the update horizon and on-policy baseline; with no generation reuse, each
         # update gets a fresh rollout batch.
         "ppo_epochs": 1,
-        "seed": int(backend_seed(_worker_state.SEED)),
+        "seed": int(backend_seed(context.config.seed)),
     }
 
 
-def _resolve_grpo_inputs():
+def _resolve_grpo_inputs(*, context: WorkerContext):
     """reproduce run_rl's front-half config + dataset prep for text, multimodal, and multi-turn."""
-    env = _worker_state.require_active_env()
+    env = context.require_active_env()
     multi_turn = _validate_grpo_environment(env)
-    seed_training_rngs(_worker_state.SEED)
-    model_id = _worker_state.JOB_SPEC.model if _worker_state.JOB_SPEC else RECIPE.hf_model_id
+    seed_training_rngs(context.config.seed)
+    model_id = context.config.spec.model if context.config.spec else RECIPE.hf_model_id
     model_revision = (
-        getattr(_worker_state.JOB_SPEC, "model_revision", "") if _worker_state.JOB_SPEC else ""
+        getattr(context.config.spec, "model_revision", "") if context.config.spec else ""
     )
     rl = RECIPE.rl
-    _t = _worker_state.JOB_SPEC.train if _worker_state.JOB_SPEC else None
-    options = _resolve_grpo_options(_t, rl, multi_turn)
+    _t = context.config.spec.train if context.config.spec else None
+    options = _resolve_grpo_options(_t, rl, multi_turn, context=context)
 
     mask_truncated_completions = _worker_config.grpo_mask_truncated_completions(_t)
     options["mask_truncated_completions"] = mask_truncated_completions
@@ -490,14 +501,14 @@ def _resolve_grpo_inputs():
         # adapter's rank/alpha (flash forbids a child lora_rank on warm-start).
         # a multi-GB adapter pull emits nothing of its own, so it must run under a liveness wrap or
         # the provider judges the silence as a stall.
-        with liveness_heartbeat("rl_adapter_loading"):
-            warmstart_adapter = _download_adapter(_t.init_from_adapter)
+        with liveness_heartbeat("rl_adapter_loading", context=context):
+            warmstart_adapter = _download_adapter(_t.init_from_adapter, context=context)
         if not warmstart_adapter:
             raise RuntimeError(
                 "warm-start source adapter could not be downloaded; refusing to start from the base."
             )
 
-    train, message_prompts = _load_training_records(env, _t)
+    train, message_prompts = _load_training_records(env, _t, context=context)
     multimodal = _grpo_is_multimodal(env, train, message_prompts)
     targeting = resolve_lora_targeting(model_id, algorithm="grpo", multimodal=multimodal)
     if warmstart_adapter:
@@ -538,7 +549,7 @@ def _resolve_grpo_inputs():
         tok.pad_token = tok.eos_token
 
     lengths = _resolve_sequence_lengths(
-        model_id, model_revision, _t, rl, options["gcfg"], tok, multi_turn
+        model_id, model_revision, _t, rl, options["gcfg"], tok, multi_turn, context=context
     )
     prompts = _build_grpo_prompts(
         train,
@@ -548,9 +559,10 @@ def _resolve_grpo_inputs():
         tok,
         package_root,
         lengths["prompt_budget"],
+        context=context,
     )
     prompt_opened_thinking = bool(
-        _worker_state.THINKING
+        context.config.thinking
     ) and _worker_decoding.prompt_opens_thinking(prompts[0]["rendered"])
     # hand the same derived flag to the multi-turn grading path. the env cannot derive it itself --
     # it has no tokenizer and never sees a rendered prompt -- and the template opens the block in
@@ -587,4 +599,5 @@ def _resolve_grpo_inputs():
         prompt_opened_thinking=prompt_opened_thinking,
         warmstart_adapter=warmstart_adapter,
         pinned=pinned,
+        context=context,
     )

@@ -94,7 +94,9 @@ def main() -> int:
         started = time.monotonic()
         with open("/out/warmup.log", "ab") as lf:
             lf.write(b"\n[bake] fresh-process cache reload validation\n")
-            rc = subprocess.call(cmd, env=env, stdout=lf, stderr=subprocess.STDOUT)
+            rc = subprocess.call(
+                [*cmd, "--verify-cache"], env=env, stdout=lf, stderr=subprocess.STDOUT
+            )
         validation.update(reload_process_seconds=time.monotonic() - started, reload_exit_code=rc)
     with open("/opt/flash/kernelcache/cache_validation.json", "w") as output:
         json.dump(validation, output)

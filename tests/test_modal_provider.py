@@ -136,6 +136,79 @@ class AsyncMethod:
         return self.fn(*args, **kwargs)
 
 
+@pytest.mark.parametrize("failure", [None, "listing", "deletion", "termination"])
+def test_handleless_cleanup_discovers_volumes_and_requires_confirmed_removal(monkeypatch, failure):
+    from flash.providers.modal import checkpoint_upload
+    from flash.providers.modal.provider import terminate_persisted_resources
+
+    run_id = "lost-launch"
+    own = [checkpoint_upload.volume_name(scope_fingerprint(), run_id, i) for i in (0, 3)]
+    foreign = [
+        checkpoint_upload.volume_name("other-owner", run_id, 0),
+        checkpoint_upload.volume_name(scope_fingerprint(), "other-run", 0),
+        own[0] + "-foreign",
+        "flash-weights",
+    ]
+    volumes = set(own + foreign)
+    instances = [
+        {"id": "sb-gpu", "tags": {"flash_run": run_id}},
+        {"id": "sb-upload", "tags": {"flash_run": run_id}},
+        {"id": "sb-foreign", "tags": {"flash_run": "other-run"}},
+    ]
+    deleted = []
+
+    def listing(**kwargs):
+        assert kwargs["environment_name"] == api.environment()
+        if failure == "listing":
+            raise api.ModalApiError("listing failed")
+        return [SimpleNamespace(name=name) for name in volumes]
+
+    def remove(name, **kwargs):
+        assert all(item["tags"]["flash_run"] != run_id for item in instances)
+        if failure == "deletion":
+            raise api.ModalApiError("deletion failed")
+        deleted.append(name)
+        volumes.remove(name)
+
+    def terminate(instance_id):
+        if failure == "termination":
+            raise api.ModalApiError("termination failed")
+        instances[:] = [item for item in instances if item["id"] != instance_id]
+
+    modal = SimpleNamespace(
+        Volume=SimpleNamespace(
+            objects=SimpleNamespace(list=AsyncMethod(listing), delete=AsyncMethod(remove))
+        ),
+        exception=SimpleNamespace(NotFoundError=FileNotFoundError),
+    )
+    monkeypatch.setattr(
+        api, "call", lambda operation, **kw: asyncio.run(operation(modal, object()))
+    )
+    monkeypatch.setattr(api, "list_instances", lambda: list(instances))
+    monkeypatch.setattr(api, "terminate", terminate)
+    provider = get_provider("modal")
+    if failure:
+        with pytest.raises(api.ModalApiError, match=failure):
+            terminate_persisted_resources({}, run_id)
+        assert not deleted
+        if failure == "listing":
+            with pytest.raises(api.ModalApiError, match="listing"):
+                provider.run_instances_remaining(run_id)
+        else:
+            assert set(own) <= set(provider.run_instances_remaining(run_id))
+        return
+
+    assert set(provider.run_instances_remaining(run_id)) == {"sb-gpu", "sb-upload", *own}
+    # Recover even when creation failed before the GPU handle was persisted.
+    instances[:] = [item for item in instances if item["id"] != "sb-gpu"]
+    terminate_persisted_resources({}, run_id)
+    assert set(deleted) == set(own)
+    assert volumes == set(foreign)
+    assert provider.run_instances_remaining(run_id) == []
+    terminate_persisted_resources({}, run_id)
+    assert len(deleted) == len(own)
+
+
 @pytest.fixture
 def sdk(monkeypatch):
     class Missing(Exception):

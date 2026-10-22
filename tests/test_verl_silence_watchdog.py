@@ -157,7 +157,9 @@ def test_parent_work_gauge_releases_depth_in_finally():
     assert gauge.snapshot().completed == 1
 
 
-def test_off_thread_field_sampling_continues_while_heartbeat_upload_blocks(monkeypatch):
+def test_off_thread_field_sampling_continues_while_heartbeat_upload_blocks(
+    worker_context, monkeypatch
+):
     monkeypatch.setattr(heartbeat, "_LIVENESS_TICK_S", 0.01)
     monkeypatch.setattr(heartbeat, "_HB_UPLOAD_LOCK_TIMEOUT_S", 0.2)
     diagnostics_entered = threading.Event()
@@ -176,11 +178,9 @@ def test_off_thread_field_sampling_continues_while_heartbeat_upload_blocks(monke
         return {"count": len(calls)}
 
     monkeypatch.setattr(heartbeat.worker_perf, "gpu_diagnostics", blocked_diagnostics)
-    monkeypatch.setattr(heartbeat, "heartbeat", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(heartbeat, "heartbeat", lambda *_args, context=None, **_kwargs: None)
     with heartbeat.liveness_heartbeat(
-        "rl_step",
-        fields=fields,
-        sample_off_thread=True,
+        "rl_step", fields=fields, sample_off_thread=True, context=worker_context
     ):
         assert diagnostics_entered.wait(1)
         time.sleep(0.08)

@@ -5,6 +5,7 @@ from __future__ import annotations
 import contextlib
 import hashlib
 import os
+import re
 import time
 
 from flash.engine.worker.io.cpu_handoff import MOUNT
@@ -13,8 +14,50 @@ from flash.providers.modal import api
 from flash.providers.modal.pricing import CPU_HOURLY, MEMORY_GIB_HOURLY
 
 
-def volume_name(scope: str, name: str) -> str:
-    return "flash-handoff-" + hashlib.sha256(f"{scope}:{name}".encode()).hexdigest()[:40]
+def _volume_prefix(scope: str, run_id: str) -> str:
+    return "flash-handoff-" + hashlib.sha256(f"{scope}:{run_id}".encode()).hexdigest()[:32] + "-a"
+
+
+def volume_name(scope: str, run_id: str, attempt: int) -> str:
+    from flash.providers._lifecycle.instances.instance import instance_label
+
+    instance_label(run_id, attempt)  # enforce the same attempt bound as the sandbox name.
+    return f"{_volume_prefix(scope, run_id)}{attempt}"
+
+
+def run_volumes(run_id: str) -> list[str]:
+    """Find exact run-owned handoffs even after their sandboxes have disappeared."""
+    from flash.providers.modal.auth import scope_fingerprint
+
+    prefix = _volume_prefix(scope_fingerprint(), run_id)
+
+    async def listing(modal, client):
+        volumes = await modal.Volume.objects.list.aio(
+            environment_name=api.environment(), client=client
+        )
+        return [
+            volume.name
+            for volume in volumes
+            if volume.name
+            and re.fullmatch(re.escape(prefix) + r"(?:0|[1-9][0-9]{0,9})", volume.name)
+        ]
+
+    return api.call(listing)
+
+
+def cleanup_run(run_id: str) -> None:
+    """Delete handoffs only after the caller confirms every run sandbox has stopped."""
+    names = run_volumes(run_id)
+
+    async def remove(modal, client):
+        for name in names:
+            with contextlib.suppress(modal.exception.NotFoundError):
+                await modal.Volume.objects.delete.aio(
+                    name, environment_name=api.environment(), client=client
+                )
+
+    if names:
+        api.call(remove, timeout=api.TERMINATION_TIMEOUT_SECONDS)
 
 
 def _uploader_tags(handle):
@@ -79,7 +122,7 @@ def finish(handle, spec, *, deadline_at):
                 client=client,
             )
             volume = modal.Volume.from_name(
-                volume_name(handle.scope, handle.name),
+                volume_name(handle.scope, handle.run_id, handle.attempt),
                 environment_name=api.environment(),
                 create_if_missing=False,
                 client=client,
@@ -132,7 +175,7 @@ def cleanup(handle):
                 raise api.ModalApiError("CPU uploader termination was not confirmed")
         with contextlib.suppress(modal.exception.NotFoundError):
             await modal.Volume.objects.delete.aio(
-                volume_name(handle.scope, handle.name),
+                volume_name(handle.scope, handle.run_id, handle.attempt),
                 environment_name=api.environment(),
                 client=client,
             )
