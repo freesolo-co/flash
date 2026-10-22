@@ -18,8 +18,9 @@ from pydantic import (
     model_validator,
 )
 
+from flash.schema import parse_checkpoint_ref
+
 _SHA_RE = re.compile(r"^[0-9a-f]{7,64}$")
-_HF_REVISION_RE = re.compile(r"^[0-9a-f]{40}$")
 _ENV_RE = re.compile(r"^[A-Z_][A-Z0-9_]*$")
 
 
@@ -134,26 +135,16 @@ class BaseTarget(StrictModel):
 
 
 class AdapterTarget(StrictModel):
-    """an immutable adapter target and the provenance headers it requires.
-
-    ``checkpoint`` is always verified because ``X-Freesolo-Checkpoint`` is part of the hosted
-    contract on every deployment this harness targets. ``adapter_revision`` and ``hf_revision``
-    are optional because they are not emitted by every hosted deployment: a scenario that omits
-    them verifies checkpoint identity alone rather than silently passing a header check that the
-    deployment never answered. Supplying one asserts the deployment does emit it, and a response
-    that omits it is then a provenance mismatch rather than a skipped assertion.
-    """
+    """An exact checkpoint target verified by X-Freesolo-Checkpoint."""
 
     name: str
     kind: Literal["adapter"]
     model: str
     base_model: str
     checkpoint: str
-    adapter_revision: str | None = None
-    hf_revision: str | None = None
     weight: PositiveFloat = 1.0
 
-    @field_validator("name", "model", "base_model", "checkpoint")
+    @field_validator("name", "base_model")
     @classmethod
     def validate_text(cls, value: str) -> str:
         value = value.strip()
@@ -161,25 +152,13 @@ class AdapterTarget(StrictModel):
             raise ValueError("target fields must not be empty")
         return value
 
-    @field_validator("adapter_revision")
-    @classmethod
-    def validate_adapter_revision(cls, value: str | None) -> str | None:
-        if value is None:
-            return None
-        value = value.strip()
-        if not value:
-            raise ValueError("adapter_revision must not be empty when it is supplied")
-        return value
-
-    @field_validator("hf_revision")
-    @classmethod
-    def validate_hf_revision(cls, value: str | None) -> str | None:
-        if value is None:
-            return None
-        value = value.strip()
-        if not _HF_REVISION_RE.fullmatch(value):
-            raise ValueError("hf_revision must be a canonical 40-character hub commit sha")
-        return value
+    @model_validator(mode="after")
+    def validate_checkpoint_identity(self) -> AdapterTarget:
+        if parse_checkpoint_ref(self.checkpoint) is None:
+            raise ValueError("checkpoint must be a canonical checkpoint ID")
+        if self.model != self.checkpoint:
+            raise ValueError("model must equal the exact checkpoint ID")
+        return self
 
 
 Target = Annotated[BaseTarget | AdapterTarget, Field(discriminator="kind")]

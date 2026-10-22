@@ -46,11 +46,10 @@ Dynamic base-model discovery reads `base_models` from `/healthz`, then applies `
 Explicit adapter targets must name the immutable model id, base model, and checkpoint. The request
 carries `X-Freesolo-Expected-Checkpoint` and the response must match `X-Freesolo-Checkpoint`.
 
-`adapter_revision` and `hf_revision` are optional, because the hosted app does not emit them on every
-deployment. Omitting one verifies checkpoint identity alone rather than passing a header check the
-deployment never answered. Supplying one asserts that the deployment does emit it, so a response that
-omits or changes it is a provenance mismatch, never a skipped assertion. A supplied `hf_revision` must
-still be a canonical 40-character hub commit SHA.
+The model and checkpoint must be the same canonical checkpoint ID (for example,
+`run-a/final` or `run-a/step-20`). Legacy composite IDs and separate revision fields
+are rejected. Artifact provenance remains private to the binding; the public response
+attests the permanent checkpoint identity.
 
 `/healthz` is read for `ok`, deployment identity, capabilities, and `base_models`. `accounting_ok` is
 optional: a deployment that does not report it is not treated as an accounting failure, while an

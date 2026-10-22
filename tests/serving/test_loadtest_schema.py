@@ -26,11 +26,9 @@ def scenario_payload() -> dict:
             {
                 "name": "adapter-a",
                 "kind": "adapter",
-                "model": "adapter-a@final." + "a" * 40,
+                "model": "adapter-a/final",
                 "base_model": "model-a",
-                "checkpoint": "adapter-a",
-                "adapter_revision": "adapter-a@final." + "a" * 40,
-                "hf_revision": "a" * 40,
+                "checkpoint": "adapter-a/final",
             }
         ],
         "profiles": [
@@ -118,23 +116,30 @@ def test_sustained_and_mixed_are_duration_open_loop_only() -> None:
         Scenario.model_validate(payload)
 
 
-def test_adapter_target_provenance_headers_are_optional_but_validated() -> None:
-    """omitting a provenance header is allowed; supplying a malformed one is not.
-
-    not every hosted deployment emits adapter-revision and hf-revision, so a scenario may verify
-    checkpoint identity alone. that is different from accepting a bad value: a supplied
-    hf_revision must still be a canonical hub commit sha.
-    """
+@pytest.mark.parametrize("field", ["adapter_revision", "hf_revision"])
+def test_adapter_target_rejects_retired_revision_fields(field: str) -> None:
     payload = scenario_payload()
-    payload["targets"][0].pop("hf_revision")
-    scenario = Scenario.model_validate(payload)
-    assert scenario.targets[0].hf_revision is None
-    assert scenario.targets[0].checkpoint
+    payload["targets"][0][field] = "a" * 40
+    with pytest.raises(ValidationError, match="extra_forbidden"):
+        Scenario.model_validate(payload)
 
-    malformed = scenario_payload()
-    malformed["targets"][0]["hf_revision"] = "not-a-sha"
-    with pytest.raises(ValidationError, match="hf_revision"):
-        Scenario.model_validate(malformed)
+
+@pytest.mark.parametrize(
+    "checkpoint",
+    ["run", "run@final." + "a" * 40, "custom:run/final", "run/step-01", " run/final", "run/final "],
+)
+def test_adapter_target_rejects_noncanonical_checkpoint(checkpoint: str) -> None:
+    payload = scenario_payload()
+    payload["targets"][0].update(model=checkpoint, checkpoint=checkpoint)
+    with pytest.raises(ValidationError, match="canonical checkpoint"):
+        Scenario.model_validate(payload)
+
+
+def test_adapter_target_rejects_different_model_and_checkpoint() -> None:
+    payload = scenario_payload()
+    payload["targets"][0]["model"] = "adapter-a/step-20"
+    with pytest.raises(ValidationError, match="model must equal"):
+        Scenario.model_validate(payload)
 
 
 def test_adapter_checkpoint_is_always_required() -> None:

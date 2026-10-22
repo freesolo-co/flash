@@ -290,23 +290,11 @@ async def _classify_http_error(response: httpx.Response, observation: RequestObs
 
 
 def _validate_provenance(headers: httpx.Headers, target: Target) -> None:
-    """assert every provenance header the target declared, and only those.
-
-    a declared header that the response omits is a mismatch, not a skipped check, so a
-    deployment that stops emitting provenance cannot quietly pass.
-    """
+    """A missing or different checkpoint header fails provenance verification."""
     if not isinstance(target, AdapterTarget):
         return
-    expected = {
-        "X-Freesolo-Checkpoint": target.checkpoint,
-        "X-Freesolo-Adapter-Revision": target.adapter_revision,
-        "X-Freesolo-HF-Revision": target.hf_revision,
-    }
-    for name, value in expected.items():
-        if value is None:
-            continue
-        if headers.get(name) != value:
-            raise ProtocolError(f"response {name.lower()} did not match the immutable target")
+    if headers.get("X-Freesolo-Checkpoint") != target.checkpoint:
+        raise ProtocolError("response x-freesolo-checkpoint did not match the immutable target")
 
 
 def _allowed_headers(headers: httpx.Headers) -> dict[str, str]:

@@ -35,11 +35,9 @@ def _adapter() -> AdapterTarget:
     return AdapterTarget(
         name="adapter",
         kind="adapter",
-        model="run@final." + "a" * 40,
+        model="run/final",
         base_model="model-a",
-        checkpoint="run",
-        adapter_revision="run@final." + "a" * 40,
-        hf_revision="a" * 40,
+        checkpoint="run/final",
     )
 
 
@@ -55,8 +53,6 @@ def _success_headers() -> dict[str, str]:
     return {
         "content-type": "text/event-stream",
         "X-Freesolo-Checkpoint": target.checkpoint,
-        "X-Freesolo-Adapter-Revision": target.adapter_revision,
-        "X-Freesolo-HF-Revision": target.hf_revision,
     }
 
 
@@ -169,19 +165,19 @@ def test_explicitly_unhealthy_accounting_still_stops_the_run() -> None:
         _get_health(_health_body(accounting_ok=False))
 
 
-def test_undeclared_provenance_headers_are_not_asserted() -> None:
-    """a target that declares no adapter revision verifies checkpoint identity alone."""
+def test_exact_checkpoint_header_is_sufficient() -> None:
+    """The hosted contract exposes the permanent checkpoint identity."""
     target = AdapterTarget(
         name="adapter",
         kind="adapter",
-        model="adapter-a@run",
+        model="run/final",
         base_model="model-a",
-        checkpoint="run",
+        checkpoint="run/final",
     )
     observation = _run_chat(
         lambda _request: httpx.Response(
             200,
-            headers={"X-Freesolo-Checkpoint": "run"},
+            headers={"X-Freesolo-Checkpoint": "run/final"},
             content=_success_body(),
         ),
         target=target,
@@ -189,26 +185,25 @@ def test_undeclared_provenance_headers_are_not_asserted() -> None:
     assert observation.outcome == "success"
 
 
-def test_declared_provenance_header_missing_from_response_is_a_mismatch() -> None:
-    """declaring a header asserts the deployment emits it, so an omission must fail."""
+def test_missing_checkpoint_header_is_a_mismatch() -> None:
+    """A successful response must attest the requested checkpoint."""
     target = AdapterTarget(
         name="adapter",
         kind="adapter",
-        model="adapter-a@run",
+        model="run/final",
         base_model="model-a",
-        checkpoint="run",
-        hf_revision="a" * 40,
+        checkpoint="run/final",
     )
     observation = _run_chat(
         lambda _request: httpx.Response(
             200,
-            headers={"X-Freesolo-Checkpoint": "run"},
+            headers={},
             content=_success_body(),
         ),
         target=target,
     )
     assert observation.outcome == "protocol_error"
-    assert "hf-revision" in observation.error_detail
+    assert "x-freesolo-checkpoint" in observation.error_detail
 
 
 def test_server_error_prose_is_never_persisted_in_the_observation() -> None:
@@ -230,7 +225,7 @@ def test_strict_sse_tracks_reasoning_and_visible_content_separately() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         requests.append(request)
         assert request.url.path == "/v1/chat/completions"
-        assert request.headers["X-Freesolo-Expected-Checkpoint"] == "run"
+        assert request.headers["X-Freesolo-Expected-Checkpoint"] == "run/final"
         payload = json.loads(request.content)
         assert payload["stream_options"] == {"include_usage": True}
         return httpx.Response(200, headers=_success_headers(), content=_success_body())
@@ -326,12 +321,12 @@ def test_strict_sse_rejects_malformed_terminal_contract(content: bytes, match: s
 
 def test_identity_and_immutable_provenance_mismatch_fail_closed() -> None:
     headers = _success_headers()
-    headers["X-Freesolo-HF-Revision"] = "b" * 40
+    headers["X-Freesolo-Checkpoint"] = "other/final"
     observation = _run_chat(
         lambda _request: httpx.Response(200, headers=headers, content=_success_body())
     )
     assert observation.error_class == "protocol_error"
-    assert "hf-revision" in observation.error_detail
+    assert "x-freesolo-checkpoint" in observation.error_detail
 
 
 def test_exact_capacity_other_503_and_429_are_separate_and_never_retried() -> None:

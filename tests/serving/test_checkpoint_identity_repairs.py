@@ -431,7 +431,7 @@ def test_undeploy_preserves_sibling_verification_and_identity(
     assert deployment_fixtures.ready_checkpoints(run_id) == frozenset({sibling})
 
 
-def test_chat_recovery_hint_uses_canonical_final_checkpoint() -> None:
+def test_chat_recovery_hint_requires_an_explicit_checkpoint() -> None:
     from fastapi import HTTPException
 
     from flash.server.routes.serving_chat import _require_active_deployment
@@ -440,7 +440,8 @@ def test_chat_recovery_hint_uses_canonical_final_checkpoint() -> None:
         _require_active_deployment("run-a", "done", {}, None)
 
     assert raised.value.status_code == 409
-    assert "`flash models deploy run-a/final`" in raised.value.detail
+    assert "`flash models deploy <checkpoint-id>`" in raised.value.detail
+    assert "run-a/final" not in raised.value.detail
 
 
 def test_checkpoint_registration_rejects_bare_managed_selector() -> None:
