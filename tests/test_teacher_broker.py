@@ -66,9 +66,9 @@ def _issue(*, now=None, expires_at=None, limits=None):
     return db.issue_teacher_capability(
         run_id="run-1",
         attempt=2,
-        teacher_alias="glm-5.2",
+        teacher_alias="glm-5.3",
         provider=teacher_broker.PARASAIL_PROVIDER,
-        model="parasail-glm-52",
+        model="parasail-glm-53",
         scoring_mode=teacher_broker.PARASAIL_SCORING_MODE,
         expires_at=expires_at if expires_at is not None else current + 600,
         limits=limits or _limits(),
@@ -76,7 +76,7 @@ def _issue(*, now=None, expires_at=None, limits=None):
     )
 
 
-def _body(*, prompt="questionanswer", model="parasail-glm-52", **extra):
+def _body(*, prompt="questionanswer", model="parasail-glm-53", **extra):
     value = {
         "model": model,
         "prompt": prompt,
@@ -109,7 +109,7 @@ def _response(*, token="questionanswer"):
     ).encode()
 
 
-def _chat_body(*, model="parasail-glm-52", messages=None, **extra):
+def _chat_body(*, model="parasail-glm-53", messages=None, **extra):
     value = {
         "model": model,
         "messages": messages
@@ -174,9 +174,9 @@ def test_capability_is_bound_to_attempt_and_new_attempt_revokes_old(broker_db):
     second = db.issue_teacher_capability(
         run_id="run-1",
         attempt=3,
-        teacher_alias="glm-5.2",
+        teacher_alias="glm-5.3",
         provider=teacher_broker.PARASAIL_PROVIDER,
-        model="parasail-glm-52",
+        model="parasail-glm-53",
         scoring_mode=teacher_broker.PARASAIL_SCORING_MODE,
         expires_at=time.time() + 600,
         limits=_limits(),
@@ -984,7 +984,7 @@ def test_worker_retries_committed_success_settlement_exception_without_redispatc
     monkeypatch.setattr(db, "complete_teacher_request", commit_then_raise)
     monkeypatch.setattr(worker_teacher._TeacherHttpTransport, "urlopen", urlopen)
     monkeypatch.setattr(worker_teacher.time, "sleep", lambda _seconds: None)
-    client = worker_teacher.TeacherClient(token, "https://broker.example", "parasail-glm-52")
+    client = worker_teacher.TeacherClient(token, "https://broker.example", "parasail-glm-53")
 
     assert client.score("question", "answer")
     assert raised_after_commit is True
@@ -1085,7 +1085,7 @@ def test_worker_default_timeout_exceeds_broker_provider_ceiling():
     from flash.engine.worker.teacher import client as worker_teacher
 
     client = worker_teacher.TeacherClient(
-        "capability-value", "https://broker.example", "parasail-glm-52"
+        "capability-value", "https://broker.example", "parasail-glm-53"
     )
 
     assert worker_teacher._BROKER_PROVIDER_TIMEOUT_CEILING_S == 90.0
@@ -1120,7 +1120,7 @@ def test_worker_reuses_one_logical_request_id_across_transport_retries(monkeypat
     monkeypatch.setattr(worker_teacher._TeacherHttpTransport, "urlopen", urlopen)
     monkeypatch.setattr(worker_teacher.time, "sleep", lambda _seconds: None)
     client = worker_teacher.TeacherClient(
-        "capability-value", "https://broker.example", "parasail-glm-52"
+        "capability-value", "https://broker.example", "parasail-glm-53"
     )
 
     assert client.score("question", "answer")
@@ -1143,7 +1143,7 @@ def test_worker_keeps_unstructured_502_terminal(monkeypatch, body):
     monkeypatch.setattr(worker_teacher._TeacherHttpTransport, "urlopen", urlopen)
     monkeypatch.setattr(worker_teacher.time, "sleep", lambda _seconds: None)
     client = worker_teacher.TeacherClient(
-        "capability-value", "https://broker.example", "parasail-glm-52"
+        "capability-value", "https://broker.example", "parasail-glm-53"
     )
 
     with pytest.raises(worker_teacher.TeacherError) as error:
@@ -1182,7 +1182,7 @@ def test_worker_retries_unstructured_proven_pre_dispatch_http_status(monkeypatch
     monkeypatch.setattr(worker_teacher._TeacherHttpTransport, "urlopen", urlopen)
     monkeypatch.setattr(worker_teacher.time, "sleep", lambda _seconds: None)
     client = worker_teacher.TeacherClient(
-        "capability-value", "https://broker.example", "parasail-glm-52"
+        "capability-value", "https://broker.example", "parasail-glm-53"
     )
 
     assert client.score("question", "answer")
@@ -1207,7 +1207,7 @@ def test_worker_keeps_unstructured_post_dispatch_ambiguity_terminal(monkeypatch,
     monkeypatch.setattr(worker_teacher._TeacherHttpTransport, "urlopen", urlopen)
     monkeypatch.setattr(worker_teacher.time, "sleep", lambda _seconds: None)
     client = worker_teacher.TeacherClient(
-        "capability-value", "https://broker.example", "parasail-glm-52"
+        "capability-value", "https://broker.example", "parasail-glm-53"
     )
 
     with pytest.raises(worker_teacher.TeacherError) as error:
@@ -1234,7 +1234,7 @@ def test_worker_keeps_unstructured_permanent_4xx_terminal(monkeypatch, status):
     monkeypatch.setattr(worker_teacher._TeacherHttpTransport, "urlopen", urlopen)
     monkeypatch.setattr(worker_teacher.time, "sleep", lambda _seconds: None)
     client = worker_teacher.TeacherClient(
-        "capability-value", "https://broker.example", "parasail-glm-52"
+        "capability-value", "https://broker.example", "parasail-glm-53"
     )
 
     with pytest.raises(worker_teacher.TeacherError) as error:
@@ -1279,7 +1279,7 @@ def test_worker_retries_body_ingress_timeout_with_same_request_id(monkeypatch):
     monkeypatch.setattr(worker_teacher._TeacherHttpTransport, "urlopen", urlopen)
     monkeypatch.setattr(worker_teacher.time, "sleep", lambda _seconds: None)
     client = worker_teacher.TeacherClient(
-        "capability-value", "https://broker.example", "parasail-glm-52"
+        "capability-value", "https://broker.example", "parasail-glm-53"
     )
 
     assert client.score("question", "answer")
@@ -1322,7 +1322,7 @@ def test_worker_retries_request_in_progress_with_same_request_id(monkeypatch):
     monkeypatch.setattr(worker_teacher._TeacherHttpTransport, "urlopen", urlopen)
     monkeypatch.setattr(worker_teacher.time, "sleep", sleeps.append)
     client = worker_teacher.TeacherClient(
-        "capability-value", "https://broker.example", "parasail-glm-52"
+        "capability-value", "https://broker.example", "parasail-glm-53"
     )
 
     assert client.score("question", "answer")
@@ -1351,7 +1351,7 @@ def test_worker_fails_closed_on_nontransient_broker_classification(monkeypatch, 
     monkeypatch.setattr(worker_teacher._TeacherHttpTransport, "urlopen", urlopen)
     monkeypatch.setattr(worker_teacher.time, "sleep", lambda _seconds: None)
     client = worker_teacher.TeacherClient(
-        "capability-value", "https://broker.example", "parasail-glm-52"
+        "capability-value", "https://broker.example", "parasail-glm-53"
     )
 
     with pytest.raises(worker_teacher.TeacherError) as error:
@@ -1399,7 +1399,7 @@ def test_worker_renders_provider_status_without_leaking_broker_payload(monkeypat
 
     monkeypatch.setattr(worker_teacher._TeacherHttpTransport, "urlopen", urlopen)
     client = worker_teacher.TeacherClient(
-        "capability-value", "https://broker.example", "parasail-glm-52"
+        "capability-value", "https://broker.example", "parasail-glm-53"
     )
 
     with pytest.raises(worker_teacher.TeacherError) as error:
@@ -1432,7 +1432,7 @@ def test_worker_omits_malformed_provider_status(monkeypatch, provider_status):
 
     monkeypatch.setattr(worker_teacher._TeacherHttpTransport, "urlopen", urlopen)
     client = worker_teacher.TeacherClient(
-        "capability-value", "https://broker.example", "parasail-glm-52"
+        "capability-value", "https://broker.example", "parasail-glm-53"
     )
 
     with pytest.raises(worker_teacher.TeacherError) as error:
@@ -1649,9 +1649,9 @@ def test_bounded_body_accepts_exact_limit_without_copy_and_rejects_next_chunk(mo
 
 
 def test_strict_json_accepts_bytearray_without_converting_input():
-    raw = bytearray(b'{"model":"parasail-glm-52"}')
+    raw = bytearray(b'{"model":"parasail-glm-53"}')
 
-    assert teacher_broker.parse_strict_json(raw) == {"model": "parasail-glm-52"}
+    assert teacher_broker.parse_strict_json(raw) == {"model": "parasail-glm-53"}
     assert type(raw) is bytearray
 
 
@@ -1819,15 +1819,15 @@ def test_current_nonterminal_attempt_is_checked_on_every_admission(monkeypatch):
     capability = {
         "run_id": "run-1",
         "attempt": 2,
-        "teacher_alias": "glm-5.2",
+        "teacher_alias": "glm-5.3",
         "provider": teacher_broker.PARASAIL_PROVIDER,
-        "model": "parasail-glm-52",
+        "model": "parasail-glm-53",
         "scoring_mode": teacher_broker.PARASAIL_SCORING_MODE,
     }
     spec = JobSpec(
         model="Qwen/Qwen3.5-9B",
         algorithm="opd",
-        train=TrainSpec(teacher_model="glm-5.2"),
+        train=TrainSpec(teacher_model="glm-5.3"),
         run_id="run-1",
     )
 
@@ -2019,9 +2019,9 @@ def test_old_attempt_context_exit_does_not_revoke_new_attempt_token(broker_db, m
         new_token = db.issue_teacher_capability(
             run_id="run-1",
             attempt=3,
-            teacher_alias="glm-5.2",
+            teacher_alias="glm-5.3",
             provider=teacher_broker.PARASAIL_PROVIDER,
-            model="parasail-glm-52",
+            model="parasail-glm-53",
             scoring_mode=teacher_broker.PARASAIL_SCORING_MODE,
             expires_at=time.time() + 600,
             limits=_limits(),
