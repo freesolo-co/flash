@@ -639,3 +639,74 @@ def test_restat_spares_source_referenced_after_enumeration(monkeypatch):
     api = ReferencedDuringScan({repo: [_adapter("sft/flash-1-old/w", OLD)]})
     assert rc.run_scheduled_cleanup(api=api) == 0
     assert api.deleted == []
+
+
+def test_deletion_rechecks_only_target_and_references(monkeypatch):
+    _wire(monkeypatch)
+    monkeypatch.setattr(rc, "_throttle_tree_list", lambda: None)
+    repo = _managed("many-runs")
+    listings = []
+    entries_read = []
+
+    class CountingApi(FakeApi):
+        def list_repo_tree(self, **kwargs):
+            listings.append(kwargs.get("path_in_repo"))
+            entries = super().list_repo_tree(**kwargs)
+            entries_read.extend(entries)
+            return entries
+
+    prefixes = [f"sft/flash-{i}-old" for i in range(20)]
+    api = CountingApi({repo: [_adapter(f"{prefix}/w", OLD) for prefix in prefixes]})
+    assert rc.run_scheduled_cleanup(api=api) == len(prefixes)
+    assert listings.count(None) == 1  # One discovery scan, regardless of the number of runs.
+    assert listings[1:] == [path for prefix in prefixes for path in (prefix, rc.REF_MARKER)]
+    assert len(entries_read) == 2 * len(prefixes)
+
+
+@pytest.mark.parametrize(
+    "failure", ["missing_references", "missing_target", "unreadable_references"]
+)
+def test_scoped_recheck_handles_missing_paths_and_read_failures(monkeypatch, failure):
+    import httpx
+    from huggingface_hub.errors import RemoteEntryNotFoundError
+
+    _wire(monkeypatch)
+    repo = _managed("e")
+    prefix = "sft/flash-1-old"
+
+    class FailingListingApi(FakeApi):
+        def list_repo_tree(self, **kwargs):
+            # Real HF listings are lazy: failures can arrive during iteration.
+            path = kwargs.get("path_in_repo")
+            if path == (prefix if failure == "missing_target" else rc.REF_MARKER):
+                if failure == "unreadable_references":
+                    raise RuntimeError("HF 429")
+                raise RemoteEntryNotFoundError(
+                    "missing directory",
+                    response=httpx.Response(
+                        404, request=httpx.Request("GET", "https://hf.test/tree")
+                    ),
+                )
+            yield from super().list_repo_tree(**kwargs)
+
+    api = FailingListingApi({repo: [_adapter(f"{prefix}/w", OLD)]})
+    expected = 1 if failure == "missing_references" else 0
+    assert rc.run_scheduled_cleanup(api=api) == expected
+    assert api.deleted == ([(repo, prefix)] if expected else [])
+
+
+def test_scoped_recheck_spares_new_run_writes(monkeypatch):
+    _wire(monkeypatch)
+    repo = _managed("e")
+    prefix = "sft/flash-1-old"
+
+    class WrittenDuringScan(FakeApi):
+        def list_repo_tree(self, **kwargs):
+            entries = super().list_repo_tree(**kwargs)
+            if not kwargs.get("path_in_repo"):
+                self._repos[repo].append(_adapter(f"{prefix}/new-checkpoint/w", 0))
+            return entries
+
+    api = WrittenDuringScan({repo: [_adapter(f"{prefix}/w", OLD)]})
+    assert rc.run_scheduled_cleanup(api=api) == 0
+    assert api.deleted == []

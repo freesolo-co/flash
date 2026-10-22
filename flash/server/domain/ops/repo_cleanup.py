@@ -213,13 +213,30 @@ def _hold_run_lock(run_id: str):
 def _run_artifacts_recently_used(
     api, repo_id: str, prefix: str, now: float, max_age_s: float
 ) -> bool:
-    """Recheck both run writes and warm-start references immediately before deletion."""
-    prefixes, referenced_at, _unknown = _scan_repo(api, repo_id)
-    written_at = prefixes.get(prefix, (0, None))[1]
-    return any(
-        timestamp is not None and now - timestamp <= max_age_s
-        for timestamp in (written_at, referenced_at)
-    )
+    """Recheck run writes and warm-start references without rescanning unrelated runs."""
+    from huggingface_hub.errors import RemoteEntryNotFoundError
+
+    for path in (prefix, REF_MARKER):
+        _throttle_tree_list()
+        try:
+            entries = api.list_repo_tree(
+                repo_id=repo_id,
+                repo_type="dataset",
+                path_in_repo=path,
+                recursive=True,
+                expand=True,
+            )
+            for entry in entries:
+                commit = getattr(entry, "last_commit", None)
+                date = getattr(commit, "date", None)
+                if date is not None and now - date.timestamp() <= max_age_s:
+                    return True
+        except RemoteEntryNotFoundError:
+            # Repos without warm-start children have no marker directory. Missing targets and
+            # all other listing failures propagate so the caller skips deletion.
+            if path != REF_MARKER:
+                raise
+    return False
 
 
 def _collect_targets(api, live, whole, now: float, max_age_s: float) -> list[_RunTarget]:
