@@ -126,3 +126,5 @@ uv run python scripts/smoke_modal_sft.py --run-paid-test \
 Additional matrix drivers, JUnit XML, raw worker logs, runtime JSON results, and cleanup receipts are retained in `flash-e2e-artifacts-20261021/` alongside the worktrees; its manifest records file hashes. The launch drivers are audit-specific and require new disposable resource names/repositories before reuse. Credentials and serving bearer-token files must not be published with those artifacts. Private model artifacts remain in the audit's private dataset repositories for inspection.
 
 Proposed follow-ups and measurements are in [optimization opportunities](optimization-opportunities-2026-10-21.md).
+
+The subsequent [October 22 kernel-cache requalification](kernel-cache-requalification-2026-10-22.md) records live verification and immutable image selection for architecture-specific caches.
