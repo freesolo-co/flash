@@ -6,6 +6,7 @@ import copy
 import json
 import sys
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 
@@ -16,7 +17,20 @@ from flash.content.structured_options import (
 )
 
 
-def test_compact_json_is_lowered_to_cached_explicit_grammar(monkeypatch):
+@pytest.fixture
+def backend_feature_check(monkeypatch):
+    check = Mock(return_value=False)
+    monkeypatch.setitem(
+        sys.modules,
+        "vllm.v1.structured_output.backend_xgrammar",
+        SimpleNamespace(has_xgrammar_unsupported_json_features=check),
+    )
+    _compact_json_grammar.cache_clear()
+    yield check
+    _compact_json_grammar.cache_clear()
+
+
+def test_compact_json_is_lowered_to_cached_explicit_grammar(monkeypatch, backend_feature_check):
     calls = []
 
     def compile_schema(schema, **options):
@@ -44,6 +58,7 @@ def test_compact_json_is_lowered_to_cached_explicit_grammar(monkeypatch):
         )
     ]
     assert spec == original
+    backend_feature_check.assert_called_once_with(spec["json"])
     _compact_json_grammar.cache_clear()
 
 
@@ -102,7 +117,7 @@ def test_custom_whitespace_is_rejected_at_both_public_validation_boundaries():
         spec_from_dict(_raw(spec))
 
 
-def test_compiler_errors_remain_request_errors(monkeypatch):
+def test_compiler_errors_remain_request_errors(monkeypatch, backend_feature_check):
     def fail(*_args, **_kwargs):
         raise RuntimeError("invalid schema")
 

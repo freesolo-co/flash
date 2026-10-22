@@ -24,6 +24,17 @@ _SCHEMA_VALUES = (
     "else",
 )
 _SCHEMA_LISTS = ("allOf", "anyOf", "oneOf", "prefixItems")
+_COMPOSED_OBJECT_KEYS = (
+    "allOf",
+    "anyOf",
+    "oneOf",
+    "not",
+    "if",
+    "then",
+    "else",
+    "dependentSchemas",
+    "dependencies",
+)
 
 
 def validate_structured_options(spec: dict[str, Any]) -> None:
@@ -36,6 +47,18 @@ def validate_structured_options(spec: dict[str, Any]) -> None:
         spec.get(key) for key in _JSON_OPTIONS
     ):
         raise ValueError("structured output whitespace/property options require a JSON constraint")
+    if spec.get("disable_additional_properties"):
+        schema = spec.get("json", {})
+        if isinstance(schema, str):
+            schema = json.loads(schema)
+        for node in _schema_nodes(schema):
+            unsupported = next((key for key in _COMPOSED_OBJECT_KEYS if key in node), None)
+            if unsupported is not None:
+                raise ValueError(
+                    "disable_additional_properties cannot safely rewrite schemas containing "
+                    f"{unsupported}; set additionalProperties explicitly in the schema "
+                    "and omit disable_additional_properties"
+                )
 
 
 def vllm_structured_kwargs(spec: dict[str, Any]) -> dict[str, Any]:
@@ -66,6 +89,18 @@ def vllm_structured_kwargs(spec: dict[str, Any]) -> dict[str, Any]:
 
 @lru_cache(maxsize=32)
 def _compact_json_grammar(schema: str) -> str:
+    from vllm.v1.structured_output.backend_xgrammar import (
+        has_xgrammar_unsupported_json_features,
+    )
+
+    # Lowering JSON to EBNF bypasses vLLM's backend selection. Use the installed
+    # version's feature check before doing so, including in OPD mask replay.
+    # Falling back to JSON here would silently discard the compact option again.
+    if has_xgrammar_unsupported_json_features(json.loads(schema)):
+        raise ValueError(
+            "disable_any_whitespace requires an xgrammar-compatible JSON schema; "
+            "omit disable_any_whitespace to allow backend selection"
+        )
     import xgrammar
 
     try:
@@ -79,33 +114,40 @@ def _compact_json_grammar(schema: str) -> str:
 
 
 def _close_objects(schema: Any) -> None:
+    for node in _schema_nodes(schema):
+        kind = node.get("type")
+        if (
+            kind == "object"
+            or (isinstance(kind, list) and "object" in kind)
+            or any(
+                key in node for key in ("properties", "patternProperties", "additionalProperties")
+            )
+        ):
+            node["additionalProperties"] = False
+
+
+def _schema_nodes(schema: Any):
     if not isinstance(schema, dict):
         return
-    kind = schema.get("type")
-    if (
-        kind == "object"
-        or (isinstance(kind, list) and "object" in kind)
-        or any(key in schema for key in ("properties", "patternProperties", "additionalProperties"))
-    ):
-        schema["additionalProperties"] = False
+    yield schema
     # descend through schema vocabulary, never example/default/enum data or property names.
     for key in _SCHEMA_MAPS:
         children = schema.get(key)
         if isinstance(children, dict):
             for child in children.values():
-                _close_objects(child)
+                yield from _schema_nodes(child)
     for key in _SCHEMA_VALUES:
         child = schema.get(key)
         if isinstance(child, list):
             for item in child:
-                _close_objects(item)
+                yield from _schema_nodes(item)
         else:
-            _close_objects(child)
+            yield from _schema_nodes(child)
     for key in _SCHEMA_LISTS:
         children = schema.get(key)
         if isinstance(children, list):
             for child in children:
-                _close_objects(child)
+                yield from _schema_nodes(child)
 
 
 def _plain_json_containers(value: Any) -> Any:
