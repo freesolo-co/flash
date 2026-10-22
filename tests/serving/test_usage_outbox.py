@@ -489,9 +489,20 @@ def test_stream_capture_failure_before_headers_returns_controlled_503() -> None:
     assert response.json() == {"detail": "durable serving accounting unavailable"}
 
 
-def test_thinking_request_is_rejected_before_engine_dispatch() -> None:
+@pytest.mark.parametrize(
+    "path", ["/generate", "/adapters/accounting/final/generate", "/v1/chat/completions"]
+)
+def test_thinking_request_is_settled(path: str) -> None:
     record = _revision().model_copy(update={"thinking": True})
-    pool = _Pool()
+
+    class ThinkingPool(_Pool):
+        async def generate(self, *args, **kwargs):
+            result = await super().generate(*args, **kwargs)
+            result.update(thinking=True, reasoning_tokens=1, text="reason")
+            return result
+
+    pool = ThinkingPool()
+    store = _Store()
 
     async def authorize(
         _token: str, _adapter_id: str, _scope: dict | None = None
@@ -501,15 +512,25 @@ def test_thinking_request_is_rejected_before_engine_dispatch() -> None:
     app = build_serving_app(
         pool,
         AdapterRouter([record]),
-        usage_store=_Store(),
+        usage_store=store,
         chat_authorizer=authorize,
     )
     with TestClient(app, headers={"Authorization": "Bearer user-key"}) as client:
-        response = client.post("/generate", json={"model_id": record.model_id, "prompt": "hello"})
+        response = client.post(
+            path,
+            json=(
+                {"model": record.model_id, "messages": [{"role": "user", "content": "hello"}]}
+                if path == "/v1/chat/completions"
+                else {"model_id": record.model_id, "prompt": "hello"}
+            ),
+        )
 
-    assert response.status_code == 503
-    assert response.json() == {"detail": "thinking generation accounting is unavailable"}
-    assert pool.generation_id is None
+    assert response.status_code == 200
+    assert pool.generation_id is not None
+    assert store.finalized[0].facts.reasoning_tokens == 1
+    assert store.finalized[0].facts.completion_tokens == 1
+    if path == "/v1/chat/completions":
+        assert response.json()["usage"]["completion_tokens_details"] == {"reasoning_tokens": 1}
 
 
 def test_nonstream_capture_failure_returns_controlled_503() -> None:
@@ -1924,7 +1945,8 @@ def test_full_stream_queue_disconnect_does_not_block_cleanup_sentinel() -> None:
     assert session.failed[0][1] == "client_disconnected"
 
 
-def test_stream_disconnect_persists_latest_cumulative_snapshot() -> None:
+@pytest.mark.parametrize("thinking", [True, False])
+def test_stream_disconnect_persists_latest_cumulative_snapshot(thinking) -> None:
     session = _StreamSession()
     generation_id = new_generation_id()
     record = _revision()
@@ -1939,18 +1961,18 @@ def test_stream_disconnect_persists_latest_cumulative_snapshot() -> None:
                 "prompt_token_ids": [1, 2],
                 "completion_token_ids": [],
                 "reasoning_tokens": 0,
-                "thinking": False,
+                "thinking": thinking,
                 "request_id": generation_id,
             }
             yield {
                 "type": "delta",
-                "text": "partial",
+                "text": "partial thinking content",
                 "prompt_tokens": 2,
                 "completion_tokens": 1,
                 "prompt_token_ids": [1, 2],
                 "completion_token_ids": [3],
-                "reasoning_tokens": 0,
-                "thinking": False,
+                "reasoning_tokens": int(thinking),
+                "thinking": thinking,
                 "request_id": generation_id,
             }
             await asyncio.Event().wait()
@@ -1966,6 +1988,7 @@ def test_stream_disconnect_persists_latest_cumulative_snapshot() -> None:
             completion_id="chatcmpl-stream",
             created=123,
             include_usage=True,
+            thinking=thinking,
             usage_session=session,  # type: ignore[arg-type]
         )
         await anext(stream)
@@ -1975,7 +1998,8 @@ def test_stream_disconnect_persists_latest_cumulative_snapshot() -> None:
 
     partial = asyncio.run(run())
 
-    assert b'"content":"partial"' in partial
+    assert (b'"reasoning_content":' if thinking else b'"content":') in partial
+    assert session.failed[-1][0]["reasoning_tokens"] == int(thinking)
     assert released.is_set()
     assert session.finalized == []
     assert session.failed[-1][0]["type"] == "delta"
@@ -2029,3 +2053,97 @@ def test_stream_engine_error_persists_latest_valid_snapshot() -> None:
     assert "usage" not in error
     assert chunks.count(_sse("[DONE]")) == 1
     assert chunks[-1] == _sse("[DONE]")
+
+
+def test_metered_thinking_stream_returns_reasoning_and_settles_output_once() -> None:
+    record = _revision().model_copy(update={"thinking": True})
+    store = _Store()
+
+    class ThinkingPool(_Pool):
+        async def stream_generate(self, *args, **kwargs):
+            async for event in super().stream_generate(*args, **kwargs):
+                event["thinking"] = True
+                if event["completion_tokens"]:
+                    event.update(
+                        reasoning_tokens=1,
+                        completion_tokens=3,
+                        completion_token_ids=[21, 22, 23],
+                    )
+                if event["type"] == "delta":
+                    event["text"] = "reasoning</think>answer"
+                yield event
+
+    async def authorize(*_args):
+        return AuthorizedTraffic(principal_for_external_org("org-1"), "generation-a")
+
+    app = build_serving_app(
+        ThinkingPool(), AdapterRouter([record]), usage_store=store, chat_authorizer=authorize
+    )
+    with TestClient(app, headers={"Authorization": "Bearer user-key"}) as client:
+        response = client.post(
+            "/v1/chat/completions",
+            json={
+                "model": record.model_id,
+                "messages": [{"role": "user", "content": "hello"}],
+                "stream": True,
+                "stream_options": {"include_usage": True},
+            },
+        )
+    assert response.status_code == 200
+    chunks = [
+        json.loads(line.removeprefix("data: "))
+        for line in response.text.splitlines()
+        if line.startswith("data: ") and line != "data: [DONE]"
+    ]
+    deltas = [choice["delta"] for chunk in chunks for choice in chunk["choices"]]
+    assert "".join(delta.get("reasoning_content", "") for delta in deltas) == "reasoning"
+    assert "".join(delta.get("content", "") for delta in deltas) == "answer"
+    assert chunks[-1]["usage"] == {
+        "prompt_tokens": 2,
+        "completion_tokens": 3,
+        "total_tokens": 5,
+        "completion_tokens_details": {"reasoning_tokens": 1},
+    }
+    assert len(store.finalized) == 1
+    event = store.finalized[0]
+    assert event.facts.reasoning_tokens == 1
+    assert event.facts.completion_tokens == 3
+    assert event.rpc_payload()["reasoning_tokens"] == 1
+    assert event.rpc_payload()["completion_tokens"] == 3
+
+
+@pytest.mark.parametrize("stream", [False, True])
+def test_missing_thinking_usage_remains_fail_closed(stream: bool) -> None:
+    record = _revision().model_copy(update={"thinking": True})
+    store = _Store()
+
+    class MissingUsagePool(_Pool):
+        async def generate(self, *args, **kwargs):
+            result = await super().generate(*args, **kwargs)
+            result["thinking"] = True
+            result.pop("reasoning_tokens")
+            return result
+
+        async def stream_generate(self, *args, **kwargs):
+            async for event in super().stream_generate(*args, **kwargs):
+                event["thinking"] = True
+                event.pop("reasoning_tokens")
+                yield event
+
+    async def authorize(*_args):
+        return AuthorizedTraffic(principal_for_external_org("org-1"), "generation-a")
+
+    app = build_serving_app(
+        MissingUsagePool(), AdapterRouter([record]), usage_store=store, chat_authorizer=authorize
+    )
+    with TestClient(app, headers={"Authorization": "Bearer user-key"}) as client:
+        response = client.post(
+            "/v1/chat/completions",
+            json={
+                "model": record.model_id,
+                "messages": [{"role": "user", "content": "hello"}],
+                "stream": stream,
+            },
+        )
+    assert response.status_code == 503
+    assert store.finalized == []

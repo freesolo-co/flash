@@ -508,7 +508,9 @@ def _engine_impl(*, processor: Any = None) -> _LoraEngineImpl:
     engine = object.__new__(_LoraEngineImpl)
     engine.base_model = QWEN
     engine.processor = processor
-    engine.tokenizer = types.SimpleNamespace()
+    engine.tokenizer = types.SimpleNamespace(
+        get_vocab=lambda: {"<think>": 151667, "</think>": 151668}
+    )
     engine.reasoning_parser = "qwen3"
     engine.registry = AdapterRegistry()
     engine.registry.hydrate([_base_record()])

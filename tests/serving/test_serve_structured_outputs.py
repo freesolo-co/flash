@@ -66,6 +66,9 @@ def modal_app_module(load_modal_app_under_stub):
 class _Tok:
     """Prompt-path tokenizer stand-in (one int per codepoint)."""
 
+    def get_vocab(self) -> dict[str, int]:
+        return {"<think>": 151667, "</think>": 151668}
+
     def encode(self, text: str, add_special_tokens: bool = False) -> list[int]:
         return [ord(c) for c in text]
 
@@ -739,6 +742,7 @@ def test_openai_sse_keeps_repeated_delta_text(modal_app_module):
         "prompt_tokens": 2,
         "completion_tokens": 3,
         "total_tokens": 5,
+        "completion_tokens_details": {"reasoning_tokens": 0},
     }
 
 

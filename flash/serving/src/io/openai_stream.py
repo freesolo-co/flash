@@ -430,6 +430,7 @@ def _terminal_chunks(
                     int(final["prompt_tokens"]),
                     int(final["completion_tokens"]),
                     final.get("cached_tokens"),
+                    final.get("reasoning_tokens"),
                 ),
             }
         )

@@ -139,21 +139,6 @@ class ServingContext:
                 "durable serving accounting unavailable",
             ) from exc
 
-    def reject_unsettleable_thinking(self, payload: Any, target: AdapterRecord) -> None:
-        if not self.usage.enabled:
-            return
-        thinking = target.thinking
-        if target.serve_base_model:
-            kwargs = getattr(payload, "chat_template_kwargs", None)
-            override = kwargs.get("enable_thinking") if isinstance(kwargs, dict) else None
-            if isinstance(override, bool):
-                thinking = override
-        if thinking:
-            raise HTTPException(
-                status.HTTP_503_SERVICE_UNAVAILABLE,
-                "thinking generation accounting is unavailable",
-            )
-
     async def reload_if_configured(self) -> None:
         if self.reload_records is not None:
             await self.lookup.reload()
