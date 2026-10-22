@@ -354,6 +354,7 @@ def test_exact_capacity_other_503_and_429_are_separate_and_never_retried() -> No
             return httpx.Response(response_status, headers=response_headers, json=response_body)
 
         observation = _run_chat(handler, BaseTarget(name="base", model="model-a"))
+        assert observation.outcome == "http_error"
         assert observation.error_class == expected
         assert observation.retry_count == 0
         assert calls == 1

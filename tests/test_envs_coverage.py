@@ -115,3 +115,6 @@ def test_scaffolded_env_scores_through_real_task_example(tmp_path, monkeypatch) 
     assert messages == [{"role": "user", "content": "What is 2 + 2?"}]
     assert mod.exact_match_reward(example, "the answer is 4").score == 1.0
     assert mod.exact_match_reward(example, "nope").score == 0.0
+    for expected in (0, False):
+        example = load_task_examples([{"input": "question", "output": expected}])[0]
+        assert mod.exact_match_reward(example, str(expected)).score == 1.0

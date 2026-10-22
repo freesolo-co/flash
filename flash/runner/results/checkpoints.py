@@ -17,6 +17,7 @@ import re
 from flash.adapters.artifacts import has_loadable_adapter_weights
 from flash.core.spec import JobSpec
 from flash.runner.lifecycle.state import adapter_prefix
+from flash.schema import parse_checkpoint_ref
 
 
 class CheckpointListingError(RuntimeError):
@@ -75,13 +76,15 @@ def _repo_files(spec: JobSpec, *, strict: bool, revision: str | None = None) -> 
 def _checkpoints_from_files(spec: JobSpec, files: list[str]) -> list[dict]:
     repo = spec.train.hf_repo
     base = adapter_prefix(spec)
-    pattern = re.compile(re.escape(base) + r"/checkpoints/step-(\d+)/adapter/([^/]+)$")
+    pattern = re.compile(re.escape(base) + r"/checkpoints/step-([^/]+)/adapter/([^/]+)")
     # Collect each step's adapter-folder filenames, then keep only steps with config + weights.
     by_step: dict[int, set[str]] = {}
     for path in files:
-        match = pattern.search(path)
+        match = pattern.fullmatch(path)
         if match:
-            by_step.setdefault(int(match.group(1)), set()).add(match.group(2))
+            checkpoint = parse_checkpoint_ref(f"{spec.run_id}/step-{match.group(1)}")
+            if checkpoint is not None:
+                by_step.setdefault(checkpoint[1], set()).add(match.group(2))
     out: list[dict] = []
     for step in sorted(by_step):
         names = by_step[step]

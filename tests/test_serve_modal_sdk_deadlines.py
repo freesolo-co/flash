@@ -133,3 +133,23 @@ def test_fast_modal_awaitable_is_unaffected_by_the_deadline() -> None:
     result = _sync_value(_fast_value, deadline_at=10.0, clock=lambda: 0.0)
 
     assert result == "fast-modal-result", "a fast modal call was rejected before its deadline"
+
+
+def test_client_closes_after_its_operation_deadline_has_expired() -> None:
+    from types import SimpleNamespace
+
+    from flash.serve.provisioning.modal.execution.sdk import PinnedModalSdk, _AsyncBridge
+
+    closed = []
+
+    async def close() -> None:
+        closed.append(asyncio.get_running_loop())
+
+    sdk = object.__new__(PinnedModalSdk)
+    sdk._clock = lambda: 20.0
+    sdk._deadline_at = 10.0
+    sdk._bridge = _AsyncBridge(sdk._clock)
+    sdk._client = SimpleNamespace(_close=SimpleNamespace(aio=close))
+    sdk.close()
+    assert closed == [sdk._bridge._loop]
+    assert sdk._bridge._loop.is_closed()

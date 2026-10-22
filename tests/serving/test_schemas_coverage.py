@@ -70,8 +70,28 @@ def test_adapter_record_before_validator_rejects_non_dict_input() -> None:
 @pytest.mark.parametrize("checkpoint_step", [-1, True])
 def test_checkpoint_step_rejects_negative_and_boolean_values(checkpoint_step: object) -> None:
     payload = _registration(checkpoint_step=checkpoint_step)
-    with pytest.raises(ValidationError, match=r"checkpoint step|canonical checkpoint identity"):
+    with pytest.raises(
+        ValidationError, match=r"checkpoint step|canonical checkpoint identity|valid integer"
+    ):
         ImmutableCheckpointRegistration.model_validate(payload)
+
+
+@pytest.mark.parametrize(
+    "model", [AdapterRecord, ImmutableCheckpointRegistration, PersistedAdapterRecord]
+)
+@pytest.mark.parametrize("field", ["checkpoint_step", "lora_rank"])
+@pytest.mark.parametrize("value", [True, 1.0, "1"])
+def test_checkpoint_numbers_are_validated_before_coercion(model, field, value):
+    payload = _persisted(
+        checkpoint_step=1, lora_rank=1, model_id=f"{RUN_ID}/step-1", checkpoint=f"{RUN_ID}/step-1"
+    )
+    payload["artifact_fingerprint"] = immutable_binding_fingerprint(payload)
+    payload[field] = value
+    if model is ImmutableCheckpointRegistration:
+        payload.pop("status")
+        payload.pop("updated_at")
+    with pytest.raises(ValidationError):
+        model.model_validate(payload)
 
 
 @pytest.mark.parametrize(

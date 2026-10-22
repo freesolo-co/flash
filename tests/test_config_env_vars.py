@@ -379,7 +379,7 @@ class TestSqliteBusyTimeout:
         monkeypatch.setenv(db.BUSY_TIMEOUT_ENV, "120")
         assert db.busy_timeout_s() == 120.0
 
-    @pytest.mark.parametrize("value", ["abc", "0", "-5"])
+    @pytest.mark.parametrize("value", ["abc", "0", "-5", "nan", "inf", "-inf", "1e999"])
     def test_unusable_value_keeps_the_default(self, monkeypatch, value):
         """A zero or negative timeout would turn ordinary contention into failed API calls."""
         from flash.server.platform import db

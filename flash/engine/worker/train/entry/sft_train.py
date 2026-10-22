@@ -12,7 +12,6 @@ import os
 import subprocess
 import sys
 import threading
-import time
 from functools import partial
 
 import flash.engine.worker.io.heartbeat as _worker_heartbeat
@@ -407,17 +406,15 @@ from flash.engine.worker.train.sft.setup.config import (  # noqa: E402,F401
 # isort: split
 from flash.engine.worker.train.entry.sft_train_runner import (  # noqa: E402
     _consume_sft_marker_line,
-    _finish_sft_child,
-    _invoke_sft_child,
     _prepare_sft_child,
     _prepare_sft_data,
     _prepare_sft_model,
     _prepare_sft_progress,
     _record_sft_step_metrics,
     _resolve_sft_options,
+    _run_sft_child,
     _SftCapabilities,
     _SftOutputs,
-    _SftProgressCallbacks,
     _verify_sft_run,
 )
 
@@ -631,7 +628,6 @@ def run_sft_train(spec=None, *, context: WorkerContext) -> None:
         options, data, model, capabilities, use_remove_padding, gdn_reset_arch, context=context
     )
     child_progress = _prepare_sft_progress(data, model, child)
-    progress = child_progress.values
 
     def on_line(line: str) -> None:
         child.watcher.raise_if_failed()
@@ -644,29 +640,8 @@ def run_sft_train(spec=None, *, context: WorkerContext) -> None:
         learning_rate_value = parse_verl_metric(line, "train/lr")
         _record_sft_step_metrics(child_progress, loss, grad_norm, learning_rate_value)
 
-    callbacks = _SftProgressCallbacks(child_progress, context=context)
-    gpu_sampler = _NvidiaSmiPeakSampler().start()
-    train_started_at = time.time()
-    return_code = 0
-    if child.resume_step < model.update_horizon:
-        child.watcher.start()
-        # check save completeness only after normal training completion. callback failures occur before
-        # return_code assignment; checking anyway would replace the real zero-grad or runtime-patch diagnosis
-        # with a missing-save error. opd_train uses the same guard.
-        training_completed = False
-        try:
-            with liveness_heartbeat(
-                "sft_step",
-                progress=lambda: int(progress["step"] or 0),
-                progress_step=True,
-                context=context,
-            ):
-                return_code = _invoke_sft_child(child, callbacks, on_line, context=context)
-                training_completed = return_code == 0
-        finally:
-            child.watcher.stop(require_complete=training_completed)
-    train_wall, device_peak_gpu_gb = _finish_sft_child(
-        gpu_sampler, train_started_at, return_code, child_progress
+    train_wall, device_peak_gpu_gb = _run_sft_child(
+        child, model.update_horizon, child_progress, on_line, context=context
     )
     verified = _verify_sft_run(options, data, model, child_progress, child.resume_step)
     _publish_sft_result(

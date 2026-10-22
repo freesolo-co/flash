@@ -26,7 +26,9 @@ def _read_env_file(path: Path, keys: set[str]) -> dict[str, str]:
         key = key.strip()
         if key not in keys:
             continue
-        value = value.strip().strip('"').strip("'")
+        value = value.strip()
+        if len(value) >= 2 and value[0] in {"'", '"'} and value[-1] == value[0]:
+            value = value[1:-1]
         if value:
             out[key] = value
     return out

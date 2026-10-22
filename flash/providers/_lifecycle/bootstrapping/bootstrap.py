@@ -598,6 +598,49 @@ def fetch_code(payload: dict) -> None:
     )
 
 
+def _start_console_pump(proc, cf, payload):
+    """Start a console tee and return its completion event and write-disable callback."""
+    pump_done = threading.Event()
+    pump_write_lock = threading.Lock()
+    pump_writes_enabled = True
+    # resolved once: the payload does not change, and this runs per child line.
+    pump_secrets = _payload_secrets(payload)
+
+    def pump():
+        """tee sanitized output to the provider log and raw output to the console file.
+
+        only this process knows payload secret values. keep the end of oversized lines because
+        native stacks and json diagnostics place the root cause there.
+        """
+        try:
+            for line in proc.stdout:
+                with pump_write_lock:
+                    if not pump_writes_enabled:
+                        return
+                    print(
+                        _safe_detail(line, 100_000, secrets=pump_secrets, keep="end"),
+                        end="",
+                        flush=True,
+                    )
+                    cf.write(line)
+        except BaseException as exc:
+            print(
+                f"console pump warn: {_safe_detail(exc, secrets=pump_secrets)}",
+                flush=True,
+            )
+        finally:
+            pump_done.set()
+
+    def stop_writes():
+        nonlocal pump_writes_enabled
+        with pump_write_lock:
+            pump_writes_enabled = False
+
+    thread = threading.Thread(target=pump, daemon=True)
+    thread.start()
+    return thread, pump_done, stop_writes
+
+
 def run_mode(payload: dict, env: dict, mode: str, deadline_ts: float) -> int:
     """Run one worker subprocess; tee console to a file and upload periodically for live logs."""
     console = f"/tmp/console_{mode}.txt"
@@ -638,83 +681,70 @@ def run_mode(payload: dict, env: dict, mode: str, deadline_ts: float) -> int:
             # decoding would raise mid-stream and fail a paid run whose training actually ran.
             errors="replace",
         )
-        pump_done = threading.Event()
-        pump_write_lock = threading.Lock()
-        pump_writes_enabled = True
-        # resolved once: the payload does not change, and this runs per child line.
-        pump_secrets = _payload_secrets(payload)
-
-        def pump():
-            """tee sanitized output to the provider log and raw output to the console file.
-
-            only this process knows payload secret values. keep the end of oversized lines because
-            native stacks and json diagnostics place the root cause there.
-            """
-            try:
-                for line in proc.stdout:
-                    with pump_write_lock:
-                        if not pump_writes_enabled:
-                            return
-                        print(
-                            _safe_detail(line, 100_000, secrets=pump_secrets, keep="end"),
-                            end="",
-                            flush=True,
-                        )
-                        cf.write(line)
-            except BaseException as exc:
-                print(
-                    f"console pump warn: {_safe_detail(exc, secrets=pump_secrets)}",
-                    flush=True,
-                )
-            finally:
-                pump_done.set()
-
-        t = threading.Thread(target=pump, daemon=True)
-        t.start()
-        uploader, stop_upload = _start_console_uploader(payload, console, mode)
+        stop_pump = None
         try:
+            t, pump_done, stop_pump = _start_console_pump(proc, cf, payload)
+            uploader, stop_upload = _start_console_uploader(payload, console, mode)
             try:
-                remaining = worker_deadline_at - _finite_positive_number(
-                    time.time(), "current clock"
-                )
-                if remaining <= 0:
-                    raise subprocess.TimeoutExpired(proc.args, timeout=0.0)
-                proc.wait(timeout=remaining)
-            except subprocess.TimeoutExpired:
-                timed_out = True
-                # the whole group, not just the leader: a surviving child keeps the gpu busy for
-                # every later run on this box. a survivor is recorded rather than raised here, so
-                # the console tail below still uploads and explains why the run was killed.
                 try:
-                    _bootstrap_processes.terminate_process_group(
-                        proc,
-                        process_group_id=worker_process_group_id,
-                        deadline_at=teardown_deadline_at,
+                    remaining = worker_deadline_at - _finite_positive_number(
+                        time.time(), "current clock"
                     )
-                except RuntimeError as exc:
-                    survived_teardown = str(exc)
-                    print(survived_teardown, flush=True)
+                    if remaining <= 0:
+                        raise subprocess.TimeoutExpired(proc.args, timeout=0.0)
+                    proc.wait(timeout=remaining)
+                except subprocess.TimeoutExpired:
+                    timed_out = True
+                    # the whole group, not just the leader: a surviving child keeps the gpu busy for
+                    # every later run on this box. a survivor is recorded rather than raised here, so
+                    # the console tail below still uploads and explains why the run was killed.
+                    try:
+                        _bootstrap_processes.terminate_process_group(
+                            proc,
+                            process_group_id=worker_process_group_id,
+                            deadline_at=teardown_deadline_at,
+                        )
+                    except RuntimeError as exc:
+                        survived_teardown = str(exc)
+                        print(survived_teardown, flush=True)
 
-            drain_timeout = max(
-                0.0,
-                worker_deadline_at - _finite_positive_number(time.time(), "current clock"),
+                drain_timeout = max(
+                    0.0,
+                    worker_deadline_at - _finite_positive_number(time.time(), "current clock"),
+                )
+                pump_finished = pump_done.wait(drain_timeout)
+                if pump_finished:
+                    t.join()
+                else:
+                    if not timed_out:
+                        # The leader exited, but a descendant can still hold stdout and CUDA.
+                        _bootstrap_processes.terminate_process_group(
+                            proc,
+                            process_group_id=worker_process_group_id,
+                            deadline_at=teardown_deadline_at,
+                        )
+                    timed_out = True
+                    stop_pump()
+            finally:
+                uploader_clean = _stop_upload_process(
+                    uploader,
+                    stop_upload,
+                    upload_deadline_at,
+                    reaping_deadline_at,
+                )
+                if not uploader_clean:
+                    print(
+                        "console uploader exceeded its shutdown allowance; terminated", flush=True
+                    )
+        except BaseException:
+            if stop_pump is not None:
+                stop_pump()
+            _bootstrap_processes.terminate_process_group(
+                proc,
+                process_group_id=worker_process_group_id,
+                deadline_at=teardown_deadline_at,
             )
-            pump_finished = pump_done.wait(drain_timeout)
-            if pump_finished:
-                t.join()
-            else:
-                timed_out = True
-                with pump_write_lock:
-                    pump_writes_enabled = False
-        finally:
-            uploader_clean = _stop_upload_process(
-                uploader,
-                stop_upload,
-                upload_deadline_at,
-                reaping_deadline_at,
-            )
-            if not uploader_clean:
-                print("console uploader exceeded its shutdown allowance; terminated", flush=True)
+            raise
     try:
         extra = ""
         if timed_out:

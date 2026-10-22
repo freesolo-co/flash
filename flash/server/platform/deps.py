@@ -240,8 +240,7 @@ def _runtime_secrets(payload: dict, spec: JobSpec) -> dict[str, str]:
             continue
         if not isinstance(value, str):
             raise HTTPException(status_code=400, detail=f"runtime_secrets.{key} must be a string")
-        value = value.strip()
-        if value:
+        if value.strip():
             out[key] = value
     missing = sorted(set(spec.environment.secrets) - set(out))
     if missing:

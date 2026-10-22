@@ -221,6 +221,8 @@ def test_engine_config_rejects_inexact_public_scalar_types(kwargs) -> None:
         ("temperature", float("nan")),
         ("temperature", float("inf")),
         ("temperature", "0"),
+        pytest.param("temperature", 10**400, id="temperature-overflow"),
+        pytest.param("top_p", 10**400, id="top-p-overflow"),
         ("top_p", float("nan")),
         ("top_p", True),
         ("thinking", "false"),
@@ -1525,3 +1527,8 @@ def test_a_multimodal_template_rejection_is_a_client_error_not_an_unavailable_en
 
     assert isinstance(raised.value, ValueError)
     assert "chat template rejected" in str(raised.value)
+
+
+@pytest.mark.parametrize("prompt", ["  indented code\n", "\ttext\t", "\nhello  "])
+def test_raw_completion_prompt_preserves_authored_whitespace(prompt) -> None:
+    assert GenerationRequest(prompt=prompt).prompt == prompt

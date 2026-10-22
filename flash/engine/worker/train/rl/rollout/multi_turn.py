@@ -788,9 +788,14 @@ def start_reward_server(
         request_queue_size = max(_REWARD_BRIDGE_MIN_REQUEST_BACKLOG, int(rollout_batch))
 
         def shutdown(self):
-            if score_batcher is not None:
-                score_batcher.close(_SINGLE_TURN_SCORE_SHUTDOWN_WAIT_S)
-            super().shutdown()
+            try:
+                if score_batcher is not None:
+                    score_batcher.close(_SINGLE_TURN_SCORE_SHUTDOWN_WAIT_S)
+            finally:
+                try:
+                    super().shutdown()
+                finally:
+                    self.server_close()
 
     server = _RewardBridgeHTTPServer(("127.0.0.1", 0), _Handler)
     threading.Thread(target=server.serve_forever, daemon=True).start()

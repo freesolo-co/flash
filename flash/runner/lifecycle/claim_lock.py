@@ -27,6 +27,9 @@ def try_acquire(run_id: str) -> int | None:
     except BlockingIOError:
         os.close(fd)
         return None
+    except BaseException:
+        os.close(fd)
+        raise
     return fd
 
 

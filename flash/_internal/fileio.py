@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import contextlib
+import errno
 import json
 import os
+import tempfile
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -43,13 +45,21 @@ def read_json_or_empty(path: Path) -> dict:
 
 
 def secure_json_write(path: Path, data: dict) -> None:
-    """Write ``data`` as JSON 0600. Opens with O_CREAT|0o600 — never write_text+chmod (TOCTOU). O_NOFOLLOW blocks symlink redirect."""
+    """Atomically replace a JSON file with a private, fully written 0600 file."""
     path.parent.mkdir(parents=True, exist_ok=True)
     with contextlib.suppress(OSError):
         os.chmod(path.parent, 0o700)
-    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0)
-    fd = os.open(path, flags, 0o600)
-    with os.fdopen(fd, "w") as f:
-        json.dump(data, f, indent=2, sort_keys=True)
-    with contextlib.suppress(OSError):
-        os.chmod(path, 0o600)
+    if path.is_symlink():
+        raise OSError(errno.ELOOP, "refusing to replace a credential symlink", str(path))
+    # mkstemp creates a fresh 0600 inode. Never truncate the previous login or write a
+    # new secret into an existing file whose permissions may still be public.
+    fd, temporary = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as writer:
+            json.dump(data, writer, indent=2, sort_keys=True)
+            writer.flush()
+            os.fsync(writer.fileno())
+        os.replace(temporary, path)
+    finally:
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(temporary)

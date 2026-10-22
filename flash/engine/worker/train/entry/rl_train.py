@@ -224,19 +224,20 @@ def _shutdown_rl_runtime(resume_uploader, gpu_sampler, reward_runtime) -> float 
         with contextlib.suppress(Exception):
             resume_uploader.stop()
     device_peak_gpu_gb = None
-    with contextlib.suppress(Exception):
-        device_peak_gpu_gb = gpu_sampler.stop_gb()
+    if gpu_sampler is not None:
+        with contextlib.suppress(Exception):
+            device_peak_gpu_gb = gpu_sampler.stop_gb()
     # bridge first: the scoring thread is what the server's routes block on, so stopping the server
     # before it would strand a scoring episode on an event nothing will ever set.
     if reward_runtime.multi_turn_bridge is not None:
         with contextlib.suppress(Exception):
             reward_runtime.multi_turn_bridge.shutdown()
-    reward_runtime.server.shutdown()
-    # every job boundary, not just the failing ones. `kill_process_group` runs on exceptions alone
-    # here, so a straggler an earlier teardown sigkilled but could not drain in time would otherwise
-    # be collected only by the next failing job.
-    with contextlib.suppress(Exception):
-        reap_stragglers()
+    try:
+        reward_runtime.server.shutdown()
+    finally:
+        # Reap at every job boundary, even if reward-server cleanup fails.
+        with contextlib.suppress(Exception):
+            reap_stragglers()
     return device_peak_gpu_gb
 
 
@@ -306,8 +307,9 @@ def run_rl_train(*, context: WorkerContext):
     model_path_for_verl = _cached_model_path(inp["model_id"], inp["model_revision"])
     files, reward_runtime = _prepare_rl_runtime(inp, env, tok, prompts, context=context)
 
-    resume_uploader, gpu_sampler, device_peak_gpu_gb = _initialize_teardown_state()
+    resume_uploader = gpu_sampler = device_peak_gpu_gb = None
     try:
+        resume_uploader, gpu_sampler, device_peak_gpu_gb = _initialize_teardown_state()
         # provisioning and the cold verl capability probe can take minutes without step output. keep
         # liveness running so the stall watchdog does not fail healthy setup (#442). there is no
         # monotonic progress counter here, only the keepalive.

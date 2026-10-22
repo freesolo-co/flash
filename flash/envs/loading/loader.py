@@ -26,6 +26,13 @@ from pathlib import Path
 from typing import BinaryIO
 
 from flash.envs.meta import cache_security
+from flash.envs.meta.cache_storage import (
+    STAGING_PREFIX,
+    cache_lock,
+    find_cached_entry,
+    publish_cache_entry,
+    reap_abandoned_stages,
+)
 
 # the underscored names are re-exports: tests and content.multimodal reach them via loader.
 from flash.envs.meta.dataset_selection import (
@@ -761,23 +768,32 @@ def _evict_env_cache(keep: Path) -> None:
     # size are under their caps. never remove `keep` (just written) or anything
     # used within the last _CACHE_MIN_AGE_SECONDS (a concurrent run may be
     # loading it); overshooting the caps briefly is safer than deleting live env.
-    try:
-        entries = [p for p in _CACHE_ROOT.iterdir() if p.is_dir()]
-    except OSError:
+    with contextlib.suppress(OSError):
+        reap_abandoned_stages(_CACHE_ROOT)
+    if not _CACHE_ROOT.is_dir():
         return
-    now = time.time()
-    entries.sort(key=_safe_mtime)  # oldest first
-    sizes = {p: _dir_size_bytes(p) for p in entries}
-    total = sum(sizes.values())
-    count = len(entries)
-    for p in entries:
-        if count <= _CACHE_MAX_ENTRIES and total <= _CACHE_MAX_BYTES:
-            break
-        if p == keep or now - _safe_mtime(p) < _CACHE_MIN_AGE_SECONDS:
-            continue
-        shutil.rmtree(p, ignore_errors=True)
-        total -= sizes.get(p, 0)
-        count -= 1
+    with cache_lock(_CACHE_ROOT):
+        try:
+            entries = [
+                p
+                for p in _CACHE_ROOT.iterdir()
+                if p.is_dir() and not p.name.startswith(STAGING_PREFIX)
+            ]
+        except OSError:
+            return
+        now = time.time()
+        entries.sort(key=_safe_mtime)  # oldest first
+        sizes = {p: _dir_size_bytes(p) for p in entries}
+        total = sum(sizes.values())
+        count = len(entries)
+        for p in entries:
+            if count <= _CACHE_MAX_ENTRIES and total <= _CACHE_MAX_BYTES:
+                break
+            if p == keep or now - _safe_mtime(p) < _CACHE_MIN_AGE_SECONDS:
+                continue
+            shutil.rmtree(p, ignore_errors=True)
+            total -= sizes.get(p, 0)
+            count -= 1
 
 
 def _resolve_github_environment_file(env_ref: str, pinned_sha: str | None = None) -> Path:
@@ -795,33 +811,9 @@ def _resolve_github_environment_file(env_ref: str, pinned_sha: str | None = None
         f"{cache_scope}:github:{parsed.repo_full_name}@{resolved_ref}:{parsed.path}".encode()
     ).hexdigest()[:24]
     cache_dir = _ensure_cache_root() / cache_key
-    # vet ANY existing entry at this key before looking inside it, not just one that already
-    # holds the expected entrypoint. a foreign-owned directory missing the entrypoint used to
-    # skip these checks entirely and fall straight to the download, which then writes the
-    # environment into a directory another account owns. untrusted here means planted before
-    # the root's permissions were last repaired, or swapped in since: never import it -- clear
-    # it and fall through to a fresh download. raises if the entry cannot be removed, which has
-    # to happen HERE: continuing would download the environment only for copytree to fail on
-    # the entry still sitting there, and the alternative -- using it -- is what is refused.
-    # a cache entry is a DIRECTORY, whoever owns it: a regular file at the key (manual cache
-    # corruption, an interrupted write) passes the ownership check when we own it, and the
-    # download path's rmtree(ignore_errors=True) then swallows NotADirectoryError and leaves
-    # copytree to fail with FileExistsError on this key forever.
-    if os.path.lexists(cache_dir) and not (
-        cache_security.trust_cache_entry(cache_dir) and cache_dir.is_dir()
-    ):
-        cache_security.discard_untrusted_entry(cache_dir)
-    env_file = cache_dir / parsed.path
-    if env_file.is_dir():
-        env_file = env_file / _DEFAULT_ENVIRONMENT_PATH
-    if env_file.is_file():
-        if cache_security.trust_cache_entry(env_file):
-            # mark as recently used so LRU eviction keeps hot envs.
-            with contextlib.suppress(OSError):
-                os.utime(cache_dir)
-            return env_file
-        # a foreign file inside our own directory condemns the whole entry, same as above.
-        cache_security.discard_untrusted_entry(cache_dir)
+    env_file = find_cached_entry(cache_dir, parsed.path, _DEFAULT_ENVIRONMENT_PATH)
+    if env_file is not None:
+        return env_file
     tmp_parent = Path(tempfile.mkdtemp(prefix="flash-env-github-"))
     resolved = GitHubEnvironmentRef(
         parsed.owner,
@@ -846,8 +838,7 @@ def _resolve_github_environment_file(env_ref: str, pinned_sha: str | None = None
             raise FileNotFoundError(
                 f"environment archive did not contain required entrypoint {required_entrypoint!r}"
             )
-        shutil.rmtree(cache_dir, ignore_errors=True)
-        shutil.copytree(extracted, cache_dir)
+        publish_cache_entry(extracted, cache_dir, required_entrypoint)
         _evict_env_cache(keep=cache_dir)
         return cache_dir / candidate.relative_to(extracted)
     finally:

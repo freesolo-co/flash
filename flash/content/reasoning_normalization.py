@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
-_TEXT_BLOCK_TYPES = frozenset({"text", "input_text"})
+_TEXT_BLOCK_TYPES = ("text", "input_text")
 
 
 def _canonical_leading_thinking(content: str) -> tuple[str, str] | None:

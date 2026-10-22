@@ -482,7 +482,7 @@ def _validated_provider_response(
         )
     except TeacherBrokerError as exc:
         raise TeacherBrokerError("provider_contract_error", status_code=502) from exc
-    except (TypeError, ValueError) as exc:
+    except (TypeError, ValueError, RecursionError) as exc:
         raise TeacherBrokerError("provider_contract_error", status_code=502) from exc
     if not isinstance(value, dict) or score_items != 1:
         raise TeacherBrokerError("provider_contract_error", status_code=502)
@@ -551,7 +551,7 @@ def _validated_chat_provider_response(
         )
     except TeacherBrokerError as exc:
         raise TeacherBrokerError("provider_contract_error", status_code=502) from exc
-    except (UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError) as exc:
+    except (UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError, RecursionError) as exc:
         raise TeacherBrokerError("provider_contract_error", status_code=502) from exc
     if not isinstance(value, dict) or score_items != 1:
         raise TeacherBrokerError("provider_contract_error", status_code=502)

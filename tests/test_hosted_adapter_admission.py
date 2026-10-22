@@ -102,9 +102,10 @@ def test_non_lora_peft_type_is_rejected(monkeypatch, tmp_path):
         _admit(monkeypatch, tmp_path, {**_valid_config(), "peft_type": "IA3"})
 
 
-def test_wrong_task_type_is_rejected(monkeypatch, tmp_path):
+@pytest.mark.parametrize("task_type", ["SEQ_CLS", [], {}, ["CAUSAL_LM"]])
+def test_wrong_task_type_is_rejected(monkeypatch, tmp_path, task_type):
     with pytest.raises(ValueError, match="task_type must be absent or CAUSAL_LM"):
-        _admit(monkeypatch, tmp_path, {**_valid_config(), "task_type": "SEQ_CLS"})
+        _admit(monkeypatch, tmp_path, {**_valid_config(), "task_type": task_type})
 
 
 def test_modules_to_save_is_rejected(monkeypatch, tmp_path):

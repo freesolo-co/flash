@@ -560,6 +560,7 @@ def test_health_reports_effective_max_model_len_override(modal_app_module):
         registry = type("R", (), {"list_ready": lambda self: []})()
 
     assert impl._health(_Big())["max_model_len"] == 32768  # the override, not cfg.MAX_MODEL_LEN
+    assert impl._health(_Big())["quantization"] is None  # validated bf16 weights
 
     class _Dense:
         base_model = "Qwen/Qwen3.5-9B"  # per-model 32k override
@@ -567,6 +568,7 @@ def test_health_reports_effective_max_model_len_override(modal_app_module):
 
     assert impl._health(_Dense())["max_model_len"] == 32768
     assert impl._health(_Dense())["max_model_len"] != cfg.MAX_MODEL_LEN
+    assert impl._health(_Dense())["quantization"] == "fp8"
 
 
 def test_start_all_raises_after_any_engine_fails(modal_app_module, monkeypatch):

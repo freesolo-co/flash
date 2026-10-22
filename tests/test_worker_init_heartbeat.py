@@ -1370,7 +1370,7 @@ def test_provider_surface_heartbeat_records_liveness_without_progress(monkeypatc
     ("modname", "outer", "stage"),
     [
         ("flash.engine.worker.train.entry.rl_train", "run_rl_train", "rl_step"),
-        ("flash.engine.worker.train.entry.sft_train", "run_sft_train", "sft_step"),
+        ("flash.engine.worker.train.entry.sft_train_runner", "_run_sft_child", "sft_step"),
     ],
 )
 def test_train_phase_wraps_train_in_liveness_heartbeat(modname, outer, stage):
@@ -1390,7 +1390,9 @@ def test_train_phase_wraps_train_in_liveness_heartbeat(modname, outer, stage):
     )
     # the step has to come from the trainer's own counter, not a local tick. trl exposed it in-process
     # as global_step; verl trains in a subprocess and parses it back out into progress["step"].
-    assert "global_step" in src or 'progress["step"]' in src
+    assert any(
+        value in src for value in ("global_step", 'progress["step"]', 'progress.values["step"]')
+    )
 
 
 def test_prefetch_wraps_download_in_liveness_heartbeat_gated_on_bytes():

@@ -41,7 +41,7 @@ def assert_internal(request: Request, internal_key: str | None) -> None:
     presented = request.headers.get("X-Freesolo-Internal-Key") or ""
     # Constant-time compare on a secret header (consistent with is_trusted_internal) so a
     # rejected key can't be recovered via response timing.
-    if not hmac.compare_digest(presented, internal_key):
+    if not hmac.compare_digest(presented.encode(), internal_key.encode()):
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Invalid serving internal key")
 
 
@@ -53,7 +53,7 @@ def is_trusted_internal(request: Request, trusted_keys: tuple[str, ...]) -> bool
     # compare always runs -- a short-circuiting any() would leak which key matched via timing.
     # C419 (prefer a generator) is exactly the rewrite the comment above forbids: a
     # generator short-circuits, which is the timing leak. The list is load-bearing.
-    return any([hmac.compare_digest(presented, k) for k in trusted_keys])  # noqa: C419
+    return any([hmac.compare_digest(presented.encode(), k.encode()) for k in trusted_keys])  # noqa: C419
 
 
 # The job-scope headers a training container sends with a catalog-base sample. The backend

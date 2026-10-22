@@ -134,12 +134,12 @@ class AdapterManager:
                     await self._load_entry(current)
                 return False
             int_id = await self._reserve_id(normalized.adapter_id, current)
-            if current is not None and current.loaded:
-                await self._remove_lora(current.lora_request.lora_int_id)
-                current.loaded = False
-            request = self._new_lora_request(normalized, int_id)
-            entry = _AdapterEntry(spec=normalized, lora_request=request, loaded=False)
             try:
+                request = self._new_lora_request(normalized, int_id)
+                entry = _AdapterEntry(spec=normalized, lora_request=request, loaded=False)
+                if current is not None and current.loaded:
+                    await self._remove_lora(current.lora_request.lora_int_id)
+                    current.loaded = False
                 await self._load_entry(entry)
             except BaseException:
                 if current is None:

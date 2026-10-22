@@ -46,7 +46,7 @@ def usage_facts(result: Mapping[str, Any]) -> UsageFacts:
         prompt_tokens = len(prompt_ids)
     if isinstance(completion_ids, list) and completion_ids and completion_tokens is None:
         completion_tokens = len(completion_ids)
-    if not isinstance(prompt_tokens, int) or not isinstance(completion_tokens, int):
+    if type(prompt_tokens) is not int or type(completion_tokens) is not int:
         raise UsageOutboxError("native_token_ids_unavailable")
     cached = result.get("cached_tokens")
     cached_tokens = int(cached) if isinstance(cached, int) and not isinstance(cached, bool) else 0
@@ -56,8 +56,8 @@ def usage_facts(result: Mapping[str, Any]) -> UsageFacts:
         raise UsageOutboxError("usage_counters_invalid")
     duration = result.get("inference_time_seconds")
     if duration is not None:
-        duration = float(duration)
-        if not math.isfinite(duration) or duration < 0:
+        duration = _optional_nonnegative_float(duration)
+        if duration is None:
             raise UsageOutboxError("usage_duration_invalid")
     replica = result.get("engine_replica_id")
     return UsageFacts(

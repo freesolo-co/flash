@@ -59,7 +59,7 @@ MIN_LORA_RANK = 1
 _OWNER_REPO_RE = r"[A-Za-z0-9][A-Za-z0-9._-]*"
 _RUN_ID_RE = r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}"
 _CHECKPOINT_REF_RE = re.compile(
-    rf"^(?P<run_id>{_RUN_ID_RE})/(?:(?P<final>final)|step-(?P<step>0|[1-9]\d{{0,17}}))$"
+    rf"^(?P<run_id>{_RUN_ID_RE})/(?:(?P<final>final)|step-(?P<step>0|[1-9][0-9]{{0,17}}))$"
 )
 # INTERNAL artifact-store locator (`<owner>/<repo>:<phase>/<run_id>[/checkpoints/step-N]`); built by
 # the control plane from run metadata and consumed by the worker — not accepted from users anywhere.
@@ -116,7 +116,7 @@ def normalize_env_name_segment(value: str) -> str | None:
     lowercase, collapse invalid runs to ``-``, strip edge dashes, and return none when no usable
     alphanumeric content remains. cli and server share this grammar.
     """
-    segment = re.sub(r"[^a-z0-9._-]+", "-", str(value or "").lower()).strip("-")
+    segment = re.sub(r"[^a-z0-9._-]+", "-", str(value or "").lower()).lstrip("._-").rstrip("-")
     if segment in {"", ".", ".."} or not re.search(r"[a-z0-9]", segment):
         return None
     return segment
@@ -190,8 +190,13 @@ def _apply_override(raw: dict, item: str) -> None:
     if parts[0] == "wandb":
         node[leaf] = val
     elif val.startswith("[") and val.endswith("]"):
-        inner = val[1:-1].strip()
-        node[leaf] = [_coerce_scalar(x.strip()) for x in inner.split(",") if x.strip()]
+        try:
+            node[leaf] = tomllib.loads(f"value = {val}")["value"]
+        except tomllib.TOMLDecodeError:
+            # Preserve the existing shorthand [STOP1,STOP2]. Quoted TOML values
+            # above must be parsed before splitting, since they may contain commas.
+            inner = val[1:-1].strip()
+            node[leaf] = [_coerce_scalar(x.strip()) for x in inner.split(",") if x.strip()]
     else:
         node[leaf] = _coerce_scalar(val)
 
@@ -516,15 +521,15 @@ def _validate_gpu_section(
     preflight_train = (
         {**train_raw, "lora_rank": MIN_LORA_RANK} if unresolved_warmstart_rank else train_raw
     )
-    preflight_gpu_count = provisional_gpu_count(
-        model,
-        algorithm,
-        train=preflight_train,
-        thinking=thinking,
-        geometry_model_revision=model_revision,
-        gpu_count=requested_gpu_count,
-    )
     try:
+        preflight_gpu_count = provisional_gpu_count(
+            model,
+            algorithm,
+            train=preflight_train,
+            thinking=thinking,
+            geometry_model_revision=model_revision,
+            gpu_count=requested_gpu_count,
+        )
         if gpu_types and preflight_gpu_count <= 1 and not model_revision:
             from flash.providers.core.allocator import required_vram_gb
 
@@ -571,6 +576,8 @@ def _validate_gpu_section(
             gpu_count=preflight_gpu_count,
             authored_gpu_ceiling=requested_gpu_count,
         )
+    except OverflowError as exc:
+        raise ConfigError("training dimensions exceed the supported numeric range") from exc
     except (UnsupportedGpuError, ValueError) as exc:
         raise ConfigError(str(exc)) from exc
     return gpu_spec, requested_gpu_count is None

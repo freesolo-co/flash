@@ -117,10 +117,12 @@ class BaseEnvironment:
         raise NotImplementedError
 
     def prompt_messages(self, example: dict) -> list[dict]:
-        return [{"role": "user", "content": str(example.get("input") or "")}]
+        value = example.get("input")
+        return [{"role": "user", "content": "" if value is None else str(value)}]
 
     def sft_completion(self, example: dict) -> list[dict]:
-        return [{"role": "assistant", "content": str(example.get("output") or "")}]
+        value = example.get("output")
+        return [{"role": "assistant", "content": "" if value is None else str(value)}]
 
     def reward(self, completion: str, example: dict, state: dict | None = None) -> float:
         return 1.0 if self.grade(completion, example, state) else 0.0
@@ -134,7 +136,7 @@ class BaseEnvironment:
 
             def score_one(item: tuple[dict, dict]) -> float:
                 example, state = item
-                return float(self.reward("", example, state))
+                return float(self.reward(str(state.get("response_text") or ""), example, state))
 
             episode_rewards = map_bounded(
                 items,
@@ -149,7 +151,8 @@ class BaseEnvironment:
         ]
 
     def grade(self, completion: str, example: dict, state: dict | None = None) -> bool:
-        gold = str(example.get("output") or "").strip()
+        value = example.get("output")
+        gold = "" if value is None else str(value).strip()
         # `"" in x` is always True — guard so missing output doesn't grade everything correct.
         return bool(gold) and gold in (completion or "")
 

@@ -6529,11 +6529,14 @@ def test_opd_child_success_skips_failure_accounting_and_always_stops_gpu_sampler
 
     import flash.engine.worker.train.entry.opd_train_runner as opd_runner
 
-    watcher_failure = {"enabled": False}
+    watcher_failure = {"enabled": False, "start": False}
     sampler_stops = []
 
     class ProgressState:
         def __init__(self, _resume_state):
+            pass
+
+        def fail(self, _reason):
             pass
 
         def start_training(self):
@@ -6547,7 +6550,8 @@ def test_opd_child_success_skips_failure_accounting_and_always_stops_gpu_sampler
 
     class Watcher:
         def start(self):
-            pass
+            if watcher_failure["start"]:
+                raise RuntimeError("watcher startup failed")
 
         def stop(self, *, require_complete):
             assert require_complete is True
@@ -6632,6 +6636,11 @@ def test_opd_child_success_skips_failure_accounting_and_always_stops_gpu_sampler
     with pytest.raises(RuntimeError, match="watcher cleanup failed"):
         run_child()
     assert sampler_stops == [True, True]
+
+    watcher_failure["start"] = True
+    with pytest.raises(RuntimeError, match="watcher startup failed"):
+        run_child()
+    assert sampler_stops == [True, True, True]
 
 
 def test_parent_maps_teacher_failures_to_fatal_or_retriable_run_errors():
