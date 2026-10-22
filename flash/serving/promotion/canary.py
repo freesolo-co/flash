@@ -17,6 +17,7 @@ import asyncio
 import json
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
+from urllib.parse import urljoin, urlsplit
 
 from flash.serving.promotion.evidence import StreamEvidence
 
@@ -28,6 +29,8 @@ _DONE = "[DONE]"
 
 CANARY_TIMEOUT = "canary_timeout"
 CANARY_TRANSPORT_FAILURE = "canary_transport_failure"
+CANARY_RESULT_REDIRECT_REJECTED = "canary_result_redirect_rejected"
+_MAX_RESULT_REDIRECTS = 24
 
 
 class CanaryError(Exception):
@@ -176,21 +179,48 @@ async def run_stream_canary(request: CanaryRequest, *, client: httpx.AsyncClient
 
 async def _read_stream(request: CanaryRequest, *, client: httpx.AsyncClient) -> StreamEvidence:
     url = f"{request.base_url.rstrip('/')}/v1/chat/completions"
+    original = urlsplit(url)
+    method = "POST"
+    payload: dict[str, Any] | None = _payload(request)
     reader = _StreamReader()
-    async with client.stream(
-        "POST",
-        url,
-        headers=_headers(request),
-        json=_payload(request),
-        timeout=request.timeout_seconds,
-    ) as response:
-        content_type = str(response.headers.get("content-type", ""))
-        content_type_ok = content_type.startswith("text/event-stream")
-        if response.status_code != 200 or not content_type_ok:
-            # a non-200 or non-SSE response has no frames worth parsing; report what it was, not
-            # what it said, so an error body cannot reach the log.
-            return reader.evidence(content_type_ok=False)
-        async for line in response.aiter_lines():
-            if not reader.feed(line):
-                break
-    return reader.evidence(content_type_ok=content_type_ok)
+    for redirects in range(_MAX_RESULT_REDIRECTS + 1):
+        async with client.stream(
+            method,
+            url,
+            headers=_headers(request),
+            json=payload,
+            timeout=request.timeout_seconds,
+            follow_redirects=False,
+        ) as response:
+            if response.status_code == 303:
+                # Modal returns a result URL after 150s while the original request
+                # continues. Poll it with GET; repeating POST would generate twice.
+                # Never forward the internal key to another origin or endpoint.
+                location = response.headers.get("location", "")
+                target_url = urljoin(url, location)
+                target = urlsplit(target_url)
+                if (
+                    redirects == _MAX_RESULT_REDIRECTS
+                    or not location
+                    or target.scheme != original.scheme
+                    or target.netloc != original.netloc
+                    or target.path != original.path
+                    or not target.query
+                    or target.fragment
+                ):
+                    raise CanaryError(CANARY_RESULT_REDIRECT_REJECTED)
+                url, method, payload = target_url, "GET", None
+                continue
+            if response.status_code != 200:
+                # Status is safe to log; bodies and result URLs may contain secrets.
+                raise CanaryError(f"canary_http_{response.status_code}")
+            content_type = str(response.headers.get("content-type", ""))
+            content_type_ok = content_type.startswith("text/event-stream")
+            if not content_type_ok:
+                # Never expose the response body (or a signed result URL) in logs.
+                return reader.evidence(content_type_ok=False)
+            async for line in response.aiter_lines():
+                if not reader.feed(line):
+                    break
+            return reader.evidence(content_type_ok=content_type_ok)
+    raise CanaryError(CANARY_RESULT_REDIRECT_REJECTED)

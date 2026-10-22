@@ -190,6 +190,23 @@ def test_matching_health_without_a_full_stability_window_never_streams():
     assert calls == ["health", "health"]
 
 
+def test_rollout_taking_more_than_one_minute_can_stabilize_before_streaming():
+    snapshots = iter(
+        [
+            *[_health(deployment_id="previous-attempt") for _ in range(14)],
+            *[_health() for _ in range(7)],
+        ]
+    )
+    verdict, calls = _evaluate(
+        health=lambda: next(snapshots),
+        stream=_good_stream(),
+        accounting=_Snapshot(),
+        health_stable_seconds=gate_module._HEALTH_STABLE_SECONDS,
+    )
+    assert verdict.ok
+    assert calls == ["health"] * 21 + ["stream", "accounting"]
+
+
 def test_health_read_latency_consumes_the_rollout_deadline():
     now, reads = [0.0], []
 

@@ -746,6 +746,44 @@ PREVIOUS = "1111111111111111111111111111111111111111"
 CURRENT = "2222222222222222222222222222222222222222"
 
 
+@pytest.mark.parametrize(
+    ("event", "attempt", "expected"),
+    [
+        ("push", "1", "false"),
+        ("push", "2", "true"),
+        ("workflow_dispatch", "1", "true"),
+    ],
+)
+def test_explicit_reruns_reverify_even_when_the_current_sha_is_already_live(
+    event, attempt, expected
+):
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        bin_dir = root / "bin"
+        bin_dir.mkdir()
+        (bin_dir / "python3").write_text('#!/bin/sh\nprintf "%s\\n" "$CURRENT_SHA"\n')
+        (bin_dir / "git").write_text("#!/bin/sh\nexit 0\n")
+        for stub in bin_dir.iterdir():
+            stub.chmod(0o755)
+        output = root / "outputs"
+        gate = _deploy_steps()[_step_index("Decide whether to deploy serving")]
+        completed = subprocess.run(
+            ["bash", "-e", "-c", gate["run"]],
+            capture_output=True,
+            text=True,
+            cwd=tmp,
+            env={
+                "PATH": f"{bin_dir}:{os.environ.get('PATH', '')}",
+                "EVENT": event,
+                "GITHUB_RUN_ATTEMPT": attempt,
+                "CURRENT_SHA": CURRENT,
+                "GITHUB_OUTPUT": str(output),
+            },
+        )
+        assert completed.returncode == 0, completed.stderr
+        assert f"deploy={expected}" in output.read_text().splitlines()
+
+
 def _run_rollback(
     *,
     previous_sha: str,
