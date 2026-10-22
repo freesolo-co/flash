@@ -310,13 +310,17 @@ Every inference endpoint supports structured outputs (vLLM guided decoding via
   dict/string directly), `regex`, `choice` (list of strings), or `json_object: true`, plus
   optional `disable_any_whitespace` and `disable_additional_properties` for JSON constraints.
   Compact JSON preserves whitespace inside string values. Property restriction closes objects
-  in the schema, including nested objects. Compact JSON rejects schemas that the installed
-  vLLM would route away from xgrammar; omit `disable_any_whitespace` to allow backend selection.
+  in the schema, including nested objects and schemas with implicit object constraints such as
+  `required` or `minProperties`. Compact JSON checks actual schema nodes for unsupported xgrammar
+  features, without interpreting default, example, enum, or const data as schemas; omit
+  `disable_any_whitespace` to allow backend selection.
   `disable_additional_properties` rejects composed or conditional schemas (`allOf`, `anyOf`,
   `oneOf`, `not`, `if`/`then`/`else`, `dependentSchemas`, or `dependencies`) because automatically
-  closing their subschemas can change their meaning. For these schemas, omit that option and
-  declare `additionalProperties` explicitly where appropriate. Custom `whitespace_pattern` is rejected with a
-  validation error because the managed decoder cannot honor it per request.
+  closing their subschemas can change their meaning. It also rejects `$ref` or `$dynamicRef`
+  combined with local object constraints; simple references to definitions remain supported.
+  For these schemas, omit that option and declare `additionalProperties` explicitly where
+  appropriate. Custom `whitespace_pattern` is rejected with a validation error because the
+  managed decoder cannot honor it per request.
   Convenience aliases: `json_schema` / `schema` → `json`, `choices` → `choice`; a bare
   JSON-schema dict (e.g. `{"type": "object", ...}`) is accepted directly.
 - **OpenAI `response_format`** (on `/v1/chat/completions` only) — the standard OpenAI shapes are
