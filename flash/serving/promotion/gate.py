@@ -78,9 +78,10 @@ HEALTH_NOT_STABLE = "health_release_not_stable"
 #
 _DEFAULT_ACCOUNTING_DEADLINE_SECONDS = 180.0
 _ACCOUNTING_POLL_SECONDS = 5.0
-# Modal can briefly route health requests to both releases during a rollout, even
-# after the workflow's first successful readiness probe.
-_HEALTH_ROLLOUT_DEADLINE_SECONDS = 60.0
+# Modal can route health requests to both attempts for more than a minute even
+# after the first readiness probe succeeds. Use the workflow's five-minute
+# readiness budget here too, while still requiring a full stable window.
+_HEALTH_ROLLOUT_DEADLINE_SECONDS = 300.0
 _HEALTH_STABLE_SECONDS = 30.0
 _BACKLOG_SNAPSHOT_RPC = "serving_promotion_accounting_snapshot"
 _MAX_TOKENS = 32
