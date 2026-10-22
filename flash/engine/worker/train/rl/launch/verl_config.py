@@ -1,6 +1,6 @@
 """verl config rendering for the GRPO trainer.
 
-Everything that turns a resolved flash job into the exact verl 0.8.0 surface: the parquet rows the
+Everything that turns a resolved flash job into the pinned upstream Verl surface: the parquet rows the
 child reads, the hydra override list, the GPU memory-utilization split between the training and
 rollout engines, and the human-readable notes attached to the run.
 
@@ -26,6 +26,7 @@ from flash.engine.worker.train.entry.backend_common import (
     rollout_resident_overrides,
     rollout_sleep_unsupported,
     trainer_dtype_overrides,
+    transfer_queue_overrides,
 )
 from flash.engine.worker.train.entry.prompt_rows import (
     canonical_prompt_messages,
@@ -339,19 +340,6 @@ def _rollout_overrides(cfg: dict) -> list[str]:
             if cfg["multi_turn"]
             else []
         ),
-        # fork-only rollout field, so `++` (append-or-override): it exists in the fork's rollout.yaml
-        # but not in stock verl 0.8.0's, where a bare key or `+` would break. omitted entirely when
-        # false, since not masking is already stock behavior and stock verl rejects the unknown key.
-        *(
-            [
-                (
-                    "++actor_rollout_ref.rollout.mask_truncated_completions="
-                    f"{str(bool(cfg['mask_truncated_completions'])).lower()}"
-                )
-            ]
-            if cfg["mask_truncated_completions"]
-            else []
-        ),
         # safetensors load format is required for lora rollout on vllm.
         "actor_rollout_ref.rollout.load_format=safetensors",
         # fused-expert lora models gather the weight sync one submodule at a time; the whole-model
@@ -445,6 +433,7 @@ def build_verl_overrides(cfg: dict) -> list[str]:
         + _rollout_overrides(cfg)
         + _reward_overrides(cfg)
         + _ray_overrides(cfg)
+        + transfer_queue_overrides()
         + _trainer_overrides(cfg)
     )
     if kl_on:

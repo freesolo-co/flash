@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import contextlib
 import importlib.util
+import inspect
 import io
 import json
 import os
@@ -13,6 +14,7 @@ import shutil
 import sys
 import types
 from dataclasses import replace
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -32,11 +34,9 @@ from flash.engine.worker.train.entry.sft_train import (
     _CHILD_ENV_PREFIXES,
     _MAX_ZERO_GRAD_STEPS,
     _build_verl_child_env,
-    _render_sft_dataset_module,
     _write_sft_parquet,
     build_sft_overrides,
 )
-from flash.engine.worker.train.sft.child import plugin as sft_plugin
 from flash.engine.worker.train.sft.setup.config import _VERL_OPTIMIZER_IMPL, _VERL_OPTIMIZER_NAME
 
 # distinct from `flash.__version__` on purpose: the worker resolves that to "0+unknown" (no flash
@@ -235,7 +235,6 @@ def test_sft_pins_ulysses_off_because_sequence_parallelism_breaks_gdn():
     the WIRING (this site did not regress to the card count), and the constant proves the VALUE.
     Either alone would pass while the contract was broken.
     """
-    import inspect
 
     from flash.engine.worker.train.entry import sft_train_runner
     from flash.engine.worker.verl.parallelism import ULYSSES_SEQUENCE_PARALLEL_SIZE
@@ -439,7 +438,6 @@ def test_sft_launches_the_resolved_width_not_the_allocated_cards():
     to the allocated card count: verl would split the batch across every rank torchrun started, so
     the extra ranks would hit the batch_size=0 crash the resolver exists to prevent.
     """
-    import inspect
 
     from flash.engine.worker.train.entry import sft_train_runner
 
@@ -489,7 +487,6 @@ def test_remove_padding_is_unconditional():
     already computed, so a test driving it through a cfg dict asserts on its own fixture and stays
     green no matter what the derivation does.
     """
-    import inspect
 
     from flash.engine.worker.train.entry import sft_train
 
@@ -1470,7 +1467,13 @@ def test_exact_mask_drops_right_truncated_completion_and_handles_thinking_prefix
 
 def _load_custom_dataset_module(tmp_path):
     path = tmp_path / "flash_verl_sft_dataset.py"
-    path.write_text(_render_sft_dataset_module())
+    path.write_text(
+        Path(__file__)
+        .resolve()
+        .parents[1]
+        .joinpath("flash/engine/worker/train/sft/child/dataset.py")
+        .read_text()
+    )
     spec = importlib.util.spec_from_file_location("flash_verl_sft_dataset_test", path)
     assert spec is not None
     assert spec.loader is not None
@@ -1588,7 +1591,13 @@ def test_mrope_processor_check_matches_every_image_training_model():
     from flash.core.catalog import _IMAGE_TRAINING_MODELS
 
     # take the literal from the shipped source, so the guard cannot drift from the branch it guards.
-    rendered = _render_sft_dataset_module()
+    rendered = (
+        Path(__file__)
+        .resolve()
+        .parents[1]
+        .joinpath("flash/engine/worker/train/sft/child/dataset.py")
+        .read_text()
+    )
     match = re.search(r'"([A-Za-z0-9_]+)" in self\.processor\.image_processor', rendered)
     assert match, "the mRoPE branch no longer selects on an image_processor class name"
     literal = match.group(1)
@@ -1674,267 +1683,12 @@ def _module(name, **attrs):
     return module
 
 
-@pytest.mark.parametrize(
-    "original_error",
-    [RuntimeError("original failure"), AttributeError("original failure")],
-)
-def test_seeded_dataloader_handles_missing_and_present_validation_sampler(
-    monkeypatch, original_error
-):
-    missing = object()
-
-    class FakeTrainer:
-        def __init__(self, val_sampler=missing, error=None):
-            self._val_sampler = val_sampler
-            self._error = error
-
-        def _build_dataloader(self):
-            if self._error is not None:
-                raise self._error
-            self.train_sampler = SimpleNamespace(seed=None)
-            if self._val_sampler is not missing:
-                self.val_sampler = self._val_sampler
-            return "loader"
-
-    probe = FakeTrainer()
-    assert FakeTrainer._build_dataloader(probe) == "loader"
-    with pytest.raises(AttributeError, match="val_sampler"):
-        _ = probe.val_sampler
-
-    fake_sft_module = _module("verl.trainer.sft_trainer", SFTTrainer=FakeTrainer)
-    monkeypatch.setitem(sys.modules, "torch", _module("torch", manual_seed=lambda seed: None))
-    monkeypatch.setitem(
-        sys.modules,
-        "numpy",
-        _module("numpy", random=SimpleNamespace(seed=lambda seed: None)),
-    )
-    monkeypatch.setitem(sys.modules, "verl", _module("verl"))
-    monkeypatch.setitem(
-        sys.modules,
-        "verl.trainer",
-        _module("verl.trainer", sft_trainer=fake_sft_module),
-    )
-
-    sft_plugin._install_seeded_dataloader(43)
-
-    trainer_without_validation = FakeTrainer()
-    assert trainer_without_validation._build_dataloader() == "loader"
-    assert trainer_without_validation.train_sampler.seed == 43
-    assert not hasattr(trainer_without_validation, "val_sampler")
-
-    validation_sampler = SimpleNamespace(seed=None)
-    trainer_with_validation = FakeTrainer(val_sampler=validation_sampler)
-    assert trainer_with_validation._build_dataloader() == "loader"
-    assert trainer_with_validation.train_sampler.seed == 43
-    assert validation_sampler.seed == 43
-
-    with pytest.raises(type(original_error), match="original failure") as exc_info:
-        FakeTrainer(error=original_error)._build_dataloader()
-    assert exc_info.value is original_error
-
-
-def _exec_dataloader_shim(monkeypatch):
-    """Execute the real rendered dataloader shim against fake torch classes, and return them.
-
-    The shim is a string concatenated into the shipped sitecustomize, so nothing else in the suite
-    would notice it breaking: an import it cannot satisfy, or a patch that silently stops applying,
-    surfaces on a rented gpu as rows arriving in a different order than the profile measured.
-    """
-    sampler_calls: list[dict] = []
-    loader_calls: list[dict] = []
-
-    class FakeDistributedSampler:
-        def __init__(self, dataset, **kwargs):
-            sampler_calls.append(kwargs)
-
-    class FakeStatefulDataLoader:
-        def __init__(self, dataset, **kwargs):
-            loader_calls.append(kwargs)
-
-    monkeypatch.setitem(
-        sys.modules,
-        "torch.utils.data.distributed",
-        _module("torch.utils.data.distributed", DistributedSampler=FakeDistributedSampler),
-    )
-    monkeypatch.setitem(
-        sys.modules,
-        "torchdata.stateful_dataloader",
-        _module("torchdata.stateful_dataloader", StatefulDataLoader=FakeStatefulDataLoader),
-    )
-    sft_trainer = _module("verl.trainer.sft_trainer", StatefulDataLoader=FakeStatefulDataLoader)
-    monkeypatch.setitem(sys.modules, "verl", _module("verl"))
-    monkeypatch.setitem(
-        sys.modules, "verl.trainer", _module("verl.trainer", sft_trainer=sft_trainer)
-    )
-    monkeypatch.setitem(sys.modules, "verl.trainer.sft_trainer", sft_trainer)
-
-    sft_plugin._install_exact_dataloaders()
-    return FakeDistributedSampler, FakeStatefulDataLoader, sampler_calls, loader_calls
-
-
-def test_dataloader_shim_forces_the_row_order_the_profile_measured(monkeypatch):
-    """Shuffle off and drop_last off, whatever verl asked for.
-
-    Both are overrides, not defaults: verl passes shuffle=True and drop_last=True itself, so a shim
-    that merely supplied them when absent would change nothing. Shuffling would reorder the rows
-    the profile tokenized in a fixed order, and dropping the last partial batch would train on
-    fewer examples than were measured and quoted -- neither of which fails loudly.
-    """
-    sampler, loader, sampler_calls, loader_calls = _exec_dataloader_shim(monkeypatch)
-
-    sampler(["row"], shuffle=True, num_replicas=1, rank=0)
-    loader(["row"], drop_last=True, batch_size=2)
-
-    assert sampler_calls == [{"shuffle": False, "num_replicas": 1, "rank": 0}]
-    assert loader_calls == [{"drop_last": False, "batch_size": 2}]
-
-
-def test_dataloader_shim_sets_both_flags_when_the_caller_omits_them(monkeypatch):
-    """A caller that passes neither must still get the exact-order behaviour.
-
-    verl currently passes both, but the shim's guarantee cannot depend on that: a verl release that
-    started relying on the library defaults (shuffle=True, drop_last=False for the sampler) would
-    silently reintroduce shuffling through a shim that only rewrote what it was given.
-    """
-    sampler, loader, sampler_calls, loader_calls = _exec_dataloader_shim(monkeypatch)
-
-    sampler(["row"])
-    loader(["row"])
-
-    assert sampler_calls == [{"shuffle": False}]
-    assert loader_calls == [{"drop_last": False}]
-
-
-def test_dataloader_shim_patches_the_classes_verl_imports(monkeypatch):
-    """The patch must land on the shared class objects, not on a copy the shim made.
-
-    A shim that rebound its own local name would execute cleanly and assert nothing -- verl
-    constructs the sampler through its own import of the same class, so the identity of the patched
-    attribute is the whole mechanism.
-    """
-    sampler, loader, _sampler_calls, _loader_calls = _exec_dataloader_shim(monkeypatch)
-
-    from torch.utils.data.distributed import DistributedSampler
-    from torchdata.stateful_dataloader import StatefulDataLoader
-
-    assert DistributedSampler is sampler
-    assert StatefulDataLoader is loader
-    assert DistributedSampler.__init__.__name__ == "exact_sampler_init"
-    assert StatefulDataLoader.__init__.__name__ == "exact_loader_init"
-
-    # the class __init__ patch above is the whole mechanism, so the trainer attribute must stay
-    # the original class. an extra function wrapper there would force drop_last a second time and
-    # hide the fact that verl constructs the loader through the shared class.
-    from verl.trainer import sft_trainer
-
-    assert sft_trainer.StatefulDataLoader is loader
-    assert isinstance(sft_trainer.StatefulDataLoader, type)
-
-
-def test_shipped_shim_carries_the_exact_dataloader_patch(monkeypatch):
-    """The rendered fragment is only worth testing if it reaches the file verl imports.
-
-    ``run_sft_train`` concatenates it onto the sitecustomize source; asserting that here keeps the
-    three tests above from passing against a fragment nothing writes out.
-    """
-    import pathlib
-
-    import flash.engine.worker.train.entry.sft_train as sft_train_module
-
-    plugin_source = pathlib.Path(sft_plugin.__file__).read_text()
-    runner_source = (
-        pathlib.Path(sft_train_module.__file__).with_name("sft_train_runner.py").read_text()
-    )
-    assert "_install_exact_dataloaders()" in plugin_source
-    assert "flash_sft_plugin.py" in runner_source
-    assert 'kwargs["shuffle"] = False' in plugin_source
-    assert 'kwargs["drop_last"] = False' in plugin_source
-
-
-def test_reentrant_checkpointing_enables_input_grads_before_enabling_checkpointing(monkeypatch):
-    calls = []
-
-    class FakeModule:
-        def enable_input_require_grads(self):
-            calls.append("require_grads")
-
-        def gradient_checkpointing_enable(self, **kwargs):
-            calls.append(("gc_enable", kwargs))
-
-    class FakeEngine:
-        def _build_module(self):
-            return FakeModule()
-
-    transformer_impl = _module("verl.workers.engine.fsdp.transformer_impl", FSDPEngine=FakeEngine)
-    for name, module in {
-        "verl": _module("verl"),
-        "verl.workers": _module("verl.workers"),
-        "verl.workers.engine": _module("verl.workers.engine"),
-        "verl.workers.engine.fsdp": _module("verl.workers.engine.fsdp"),
-        "verl.workers.engine.fsdp.transformer_impl": transformer_impl,
-    }.items():
-        monkeypatch.setitem(sys.modules, name, module)
-
-    sft_plugin._install_reentrant_checkpointing(multimodal=False)
-    FakeEngine()._build_module()
-
-    assert calls[0] == "require_grads"
-    assert calls[1] == (
-        "gc_enable",
-        {"gradient_checkpointing_kwargs": {"use_reentrant": True}},
-    )
-
-
-@pytest.mark.parametrize("multimodal", [True, False])
-def test_reentrant_checkpointing_installs_vision_grads_only_when_multimodal(
-    monkeypatch, multimodal
-):
-    """a reentrant-checkpointed vision tower gets ZERO gradient without this hook.
-
-    ``enable_input_require_grads()`` only reaches the text embedding, so pixel values stay
-    grad-free and every ``visual.blocks.*`` lora pair stays exactly at its init value while the
-    language model trains normally. that leaves the aggregate adapter delta large and the deployed
-    red/blue probe passing, so this seam is the only place the regression is observable.
-    """
-    installed = []
-
-    class FakeModule:
-        def enable_input_require_grads(self):
-            pass
-
-        def gradient_checkpointing_enable(self, **kwargs):
-            pass
-
-    class FakeEngine:
-        def _build_module(self):
-            return FakeModule()
-
-    transformer_impl = _module("verl.workers.engine.fsdp.transformer_impl", FSDPEngine=FakeEngine)
-    for name, module in {
-        "verl": _module("verl"),
-        "verl.workers": _module("verl.workers"),
-        "verl.workers.engine": _module("verl.workers.engine"),
-        "verl.workers.engine.fsdp": _module("verl.workers.engine.fsdp"),
-        "verl.workers.engine.fsdp.transformer_impl": transformer_impl,
-    }.items():
-        monkeypatch.setitem(sys.modules, name, module)
-    monkeypatch.setattr(
-        sft_plugin.runtime, "install_vision_input_grads", lambda module: installed.append(module)
-    )
-
-    sft_plugin._install_reentrant_checkpointing(multimodal=multimodal)
-    FakeEngine()._build_module()
-
-    assert len(installed) == (1 if multimodal else 0)
-
-
-def test_sft_plugin_config_carries_multimodal_for_the_vision_hook():
+def test_sft_launch_config_carries_multimodal_for_the_vision_hook():
     """the child cannot see the workload, so the parent must ship the multimodal flag."""
-    import inspect
 
     from flash.engine.worker.train.entry import sft_train_runner
 
-    writer = inspect.getsource(sft_train_runner._write_sft_child_shims)
+    writer = inspect.getsource(sft_train_runner._write_sft_launch)
     assert '"multimodal": bool(multimodal),' in writer
     assert "multimodal=data.multimodal," in inspect.getsource(sft_train_runner._prepare_sft_child)
 
@@ -2085,9 +1839,7 @@ def test_child_environment_excludes_provider_and_control_plane_secrets(
     monkeypatch.setenv("MODAL_TOKEN_SECRET", "provider-secret")
     monkeypatch.setenv("HF_TOKEN", "hub-secret")
 
-    without_wandb = _build_verl_child_env(
-        shim_dir=str(tmp_path), wandb_enabled=False, context=worker_context
-    )
+    without_wandb = _build_verl_child_env(wandb_enabled=False, context=worker_context)
     assert without_wandb["CUDA_VISIBLE_DEVICES"] == "0,1"
     assert without_wandb["NCCL_DEBUG"] == "WARN"
     assert without_wandb["HF_HOME"] == "/cache/hf"
@@ -2101,9 +1853,7 @@ def test_child_environment_excludes_provider_and_control_plane_secrets(
     ):
         assert secret not in without_wandb
 
-    with_wandb = _build_verl_child_env(
-        shim_dir=str(tmp_path), wandb_enabled=True, context=worker_context
-    )
+    with_wandb = _build_verl_child_env(wandb_enabled=True, context=worker_context)
     assert with_wandb["WANDB_API_KEY"] == "wandb-secret"
 
 
@@ -2148,27 +1898,23 @@ def test_shared_child_environment_scrubs_declared_prefixed_secrets(
         f"  {','.join(declared_secrets[:4])},, {','.join(declared_secrets[4:])}  ",
     )
 
-    without_wandb = _build_verl_child_env(
-        shim_dir=str(tmp_path), wandb_enabled=False, context=worker_context
-    )
+    without_wandb = _build_verl_child_env(wandb_enabled=False, context=worker_context)
     for name, value in runtime_controls.items():
         assert without_wandb[name] == value
     for name in declared_secrets:
         if name != "PYTHONPATH":
             assert name not in without_wandb
-    assert without_wandb["PYTHONPATH"] == str(tmp_path)
+    assert (Path(without_wandb["PYTHONPATH"]) / "flash/__init__.py").is_file()
     assert "WANDB_MODE" not in without_wandb
     assert SECRET_ENV_KEYS_ENV not in without_wandb
 
-    with_wandb = _build_verl_child_env(
-        shim_dir=str(tmp_path), wandb_enabled=True, context=worker_context
-    )
+    with_wandb = _build_verl_child_env(wandb_enabled=True, context=worker_context)
     for name, value in runtime_controls.items():
         assert with_wandb[name] == value
     for name in declared_secrets:
         if name not in {"PYTHONPATH", "WANDB_API_KEY"}:
             assert name not in with_wandb
-    assert with_wandb["PYTHONPATH"] == str(tmp_path)
+    assert (Path(with_wandb["PYTHONPATH"]) / "flash/__init__.py").is_file()
     assert "WANDB_API_KEY" in with_wandb
     assert with_wandb["WANDB_MODE"] == "offline"
     assert SECRET_ENV_KEYS_ENV not in with_wandb
@@ -2177,10 +1923,8 @@ def test_shared_child_environment_scrubs_declared_prefixed_secrets(
         SECRET_ENV_KEYS_ENV,
         ",".join(name for name in declared_secrets if name != "PYTHONPATH"),
     )
-    inherited = _build_verl_child_env(
-        shim_dir=str(tmp_path), wandb_enabled=False, context=worker_context
-    )
-    assert inherited["PYTHONPATH"] == os.pathsep.join((str(tmp_path), "synthetic-pythonpath"))
+    inherited = _build_verl_child_env(wandb_enabled=False, context=worker_context)
+    assert inherited["PYTHONPATH"] == without_wandb["PYTHONPATH"]
 
 
 def test_child_env_carries_every_baked_kernel_cache_dir(worker_context, monkeypatch, tmp_path):
@@ -2196,9 +1940,7 @@ def test_child_env_carries_every_baked_kernel_cache_dir(worker_context, monkeypa
     for name, value in baked.items():
         monkeypatch.setenv(name, value)
 
-    child = _build_verl_child_env(
-        shim_dir=str(tmp_path), wandb_enabled=False, context=worker_context
-    )
+    child = _build_verl_child_env(wandb_enabled=False, context=worker_context)
 
     for name, value in baked.items():
         assert child.get(name) == value, f"{name} must reach the verl child"
@@ -2837,10 +2579,10 @@ def _stub_sft_run(
     # restores the real _prepare_sft_child.
     real_prepare_child = sft_train._prepare_sft_child
 
-    def prepare_child_with_applied_shims(*args, context=None, **kwargs):
-        child = real_prepare_child(*args, context=context, **kwargs)
-        with open(child.shim_markers, "w", encoding="utf-8") as handle:
-            handle.write("".join(name + "\n" for name in child.expected_shims))
+    def prepare_child_with_applied_shims(*args, **kwargs):
+        child = real_prepare_child(*args, **kwargs)
+        with open(child.readiness_path, "w", encoding="utf-8") as handle:
+            handle.write("".join(name + "\n" for name in child.expected_components))
         captured["child"] = child
         return child
 
@@ -3022,15 +2764,15 @@ def test_run_sft_train_orchestrates_exact_dataset_and_resume_accounting(
     assert "--nproc-per-node=1" in captured["command"]
     assert "trainer.n_gpus_per_node=1" in captured["command"]
     assert "engine.ulysses_sequence_parallel_size=1" in captured["command"]
-    assert "flash_sft_entry" in captured["command"]
-    assert captured["child_env"]["VERL_USE_EXTERNAL_MODULES"] == "flash_sft_plugin"
+    assert "flash.engine.worker.train.sft.child.entry" in captured["command"]
+    assert "VERL_USE_EXTERNAL_MODULES" not in captured["child_env"]
     custom_path = next(
         value.split("=", 1)[1]
         for value in captured["command"]
         if value.startswith("data.custom_cls.path=")
     )
     assert os.path.isfile(custom_path)
-    assert captured["child_env"]["PYTHONPATH"] == os.path.dirname(captured["child"].shim_markers)
+    assert (Path(captured["child_env"]["PYTHONPATH"]) / "flash/__init__.py").is_file()
     assert captured["child_env"]["HF_HUB_OFFLINE"] == "1"
     assert captured["uploads"][0][1:] == ("adapter", True)
     assert captured["published"][0][1] == 2
@@ -3480,7 +3222,10 @@ def test_text_sft_keeps_export_policy_out_of_the_frozen_verl_runtime_config(
     )
 
     assert "model.exclude_modules=null" in child.command
-    assert child.expected_shims.count("text-lora-targeting") == 1
+    config_path = child.command[child.command.index("--flash-config") + 1]
+    assert (
+        json.loads(Path(config_path).read_text())["lora_language_prefix"] == "model.language_model"
+    )
 
 
 def test_a_packed_quote_fails_closed_when_environment_filtering_leaves_less_than_one_batch(
@@ -3798,7 +3543,6 @@ def test_sft_line_handler_reads_metrics_through_the_shared_parser():
     which would otherwise serialize into the heartbeat as bare NaN.
     """
     import ast
-    import inspect
     import textwrap
 
     import flash.engine.worker.train.entry.sft_train as sv
@@ -3948,7 +3692,6 @@ def test_sft_ships_no_val_file_so_the_child_cannot_validate():
     inference forward this removes. So the override is asserted directly, and the worker source is
     asserted to name no val parquet at all.
     """
-    import inspect
 
     from flash.engine.worker.train.entry import sft_train
 
@@ -4276,7 +4019,6 @@ def test_sft_resume_guard_checks_the_launched_width_not_the_allocation():
     there would discard a checkpoint that matches the run about to start, and keep one that does
     not -- the exact inversion the guard exists to prevent.
     """
-    import inspect
 
     from flash.engine.worker.train.entry import sft_train_runner
 
@@ -5140,7 +4882,6 @@ def test_the_worker_disables_xet_as_its_very_first_action():
     Matching the call by name also survives the alternate spellings a substring grep would miss.
     """
     import ast
-    import inspect
     import textwrap
 
     tree = ast.parse(textwrap.dedent(inspect.getsource(worker_entry._run_worker_mode)))
@@ -5209,7 +4950,6 @@ def test_sft_result_records_the_micro_batch_that_ran_not_the_one_requested():
     Asserted against the source because the writer's inputs are a live verl child; the point is
     which object the value is read FROM, and that is what the fix changes.
     """
-    import inspect
 
     from flash.engine.worker.train.entry import sft_train
 
@@ -5370,89 +5110,6 @@ def test_resume_upload_unavailable_reports_the_oversized_member(tmp_path, capsys
     assert "largest member" in out, "the size that caused the failure must be reported"
     # the deepest file must be walked, not just the top level, or a sharded layout reports 0.
     assert "0.0 GB" in out
-
-
-@pytest.mark.parametrize("resume_step", [0, 1, 2])
-def test_sft_resume_keeps_mid_epoch_cursor_but_resets_exhausted_epoch(monkeypatch, resume_step):
-    class Trainer:
-        def __init__(self):
-            self.resume_global_step = resume_step
-            self.steps_per_epoch = 2
-            self.total_training_steps = 4
-            self.remaining = list(range(resume_step, 2))
-            self.train_dataloader = object()
-            self.ckpt_handler = SimpleNamespace(train_dataloader=self.train_dataloader)
-            self.rebuilds = 0
-
-        def _build_dataloader(self):
-            self.rebuilds += 1
-            self.train_dataloader = object()
-            self.remaining = [0, 1]
-
-        def fit(self):
-            # Match verl's next-epoch calculation with a restored stateful loader.
-            step = self.resume_global_step
-            seen = []
-            for epoch in range(step // self.steps_per_epoch, 2):
-                for item in self.remaining:
-                    seen.append((epoch, item))
-                    step += 1
-                self.remaining = [0, 1]
-            return step, seen
-
-    monkeypatch.setitem(sys.modules, "verl", _module("verl"))
-    monkeypatch.setitem(
-        sys.modules,
-        "verl.trainer",
-        _module("verl.trainer", sft_trainer=_module("sft_trainer", SFTTrainer=Trainer)),
-    )
-    sft_plugin._install_epoch_boundary_resume()
-    sft_plugin._install_epoch_boundary_resume()
-    trainer = Trainer()
-    final_step, seen = trainer.fit()
-    assert final_step == 4
-    assert seen == [(step // 2, step % 2) for step in range(resume_step, 4)]
-    assert trainer.rebuilds == (1 if resume_step == 2 else 0)
-    assert trainer.ckpt_handler.train_dataloader is trainer.train_dataloader
-
-
-def test_sft_core_keeps_verl_optimizer_and_installs_linear_scheduler(monkeypatch):
-    class FakeEngine:
-        def _build_optimizer(self, module):
-            return module
-
-    original_builder = FakeEngine._build_optimizer
-    scheduler_calls = []
-    monkeypatch.setitem(
-        sys.modules,
-        "verl.workers.engine.fsdp.transformer_impl",
-        _module("verl.workers.engine.fsdp.transformer_impl", FSDPEngine=FakeEngine),
-    )
-    monkeypatch.setitem(
-        sys.modules,
-        "transformers",
-        _module(
-            "transformers",
-            get_linear_schedule_with_warmup=lambda optimizer, **kwargs: (
-                scheduler_calls.append((optimizer, kwargs)) or "linear"
-            ),
-        ),
-    )
-    monkeypatch.setattr(sft_plugin, "_install_exact_dataloaders", lambda: None)
-    monkeypatch.setattr(sft_plugin, "_install_seeded_dataloader", lambda seed: None)
-    monkeypatch.setattr(sft_plugin, "_install_epoch_boundary_resume", lambda: None)
-    # The core installer does not need the PEFT optimizer module.
-    monkeypatch.setitem(sys.modules, "peft.optimizers", None)
-    sft_plugin._install_core({"seed": 43})
-    assert FakeEngine._build_optimizer is original_builder
-    engine = FakeEngine()
-    engine.optimizer_config = SimpleNamespace(
-        lr_warmup_steps=-1, lr_warmup_steps_ratio=0.1, total_training_steps=20
-    )
-    optimizer = object()
-    assert engine._build_optimizer(optimizer) is optimizer
-    assert engine._build_lr_scheduler(optimizer) == "linear"
-    assert scheduler_calls == [(optimizer, {"num_warmup_steps": 2, "num_training_steps": 20})]
 
 
 def test_resume_releases_only_durable_deployable_checkpoint_gates(

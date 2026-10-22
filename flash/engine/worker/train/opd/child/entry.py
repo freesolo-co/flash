@@ -1,21 +1,10 @@
-"""strict OPD child entrypoint for the verl external-module contract."""
+"""packaged OPD entrypoint with explicit runtime construction."""
 
-from __future__ import annotations
-
-import os
-import sys
+from flash.engine.worker.train.core.child.launch import run
 
 
-def main() -> None:
-    import verl  # noqa: F401
-
-    configured = os.environ.get("VERL_USE_EXTERNAL_MODULES")
-    plugin = sys.modules.get("flash_opd_plugin")
-    if configured != "flash_opd_plugin" or not getattr(plugin, "PLUGIN_LOADED_EXTERNALLY", False):
-        raise RuntimeError(
-            "flash_opd_plugin was not loaded by verl through VERL_USE_EXTERNAL_MODULES"
-        )
-    plugin.main()
+def main():
+    run("opd")
 
 
 if __name__ == "__main__":

@@ -1,4 +1,4 @@
-"""Flash OPD orchestration through verl 0.8.0 in an isolated child interpreter."""
+"""Flash OPD orchestration through pinned upstream Verl in an isolated child interpreter."""
 
 from __future__ import annotations
 
