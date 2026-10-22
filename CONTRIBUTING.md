@@ -19,6 +19,11 @@ uv run ruff format --check .
 uv run pytest -q
 ```
 
+The test harness rejects unstubbed HTTPX requests to remote hosts, including requests from
+cached clients and deployment cleanup. Use `httpx.MockTransport` or stub the serving operation;
+loopback test servers still work. The opt-in serving conformance suite allows only its selected
+backend origin, and `tests/live` retains its `FLASH_LIVE=1` opt-in.
+
 CI (`.github/workflows/ci.yml`) additionally enforces two size gates and runs the
 timing-sensitive tests in their own serial pass:
 

@@ -4871,6 +4871,7 @@ def test_deploy_rejects_verify_false_before_anything_registers(api, monkeypatch)
 
 
 def test_deploy_rechecks_run_state_before_alias_activation(api, monkeypatch):
+    from flash.server.platform.internal_client import run_serving_org_id
 
     key = _new_user_token()
     run_id = api.post(
@@ -4892,6 +4893,12 @@ def test_deploy_rechecks_run_state_before_alias_activation(api, monkeypatch):
         pytest.fail("state recheck must block alias activation")
 
     monkeypatch.setattr(serving_deploy, "deploy_adapter", fake_deploy)
+    cleaned = []
+    monkeypatch.setattr(
+        serving_deploy,
+        "undeploy_adapter",
+        lambda checkpoint_id, **kwargs: cleaned.append((checkpoint_id, kwargs["org_id"])) or {},
+    )
 
     resp = api.post(
         f"/v1/runs/{run_id}/deploy", json={"checkpoint_id": f"{run_id}/final"}, headers=_bearer(key)
@@ -4900,6 +4907,7 @@ def test_deploy_rechecks_run_state_before_alias_activation(api, monkeypatch):
     assert resp.status_code == 200, resp.text
     assert resp.json()["state"] == "failed"
     assert "run state changed from 'done' to 'cancelled'" in resp.json()["error"]
+    assert cleaned == [(f"{run_id}/final", run_serving_org_id(status))]
 
 
 def test_create_rejects_retired_gpu_class(api):
@@ -5361,6 +5369,11 @@ def test_deploy_attributes_adapter_to_run_owning_org(api, monkeypatch):
 
     def capture(**kwargs):
         seen.update(kwargs)
+        kwargs["before_ready"](
+            serving_deploy.DeploymentReadinessFacts(
+                f"{run_id}/final", f"{run_id}/final", frozenset(), False
+            )
+        )
         return Deployment(
             run_id=run_id,
             model=kwargs["model"],
@@ -5369,15 +5382,22 @@ def test_deploy_attributes_adapter_to_run_owning_org(api, monkeypatch):
             endpoint_name="https://serve.example",
             openai_base_url="https://serve.example/v1",
             checkpoint_id=f"{run_id}/final",
+            deployment_generation="generation-a",
             state="ready",
         )
 
     monkeypatch.setattr(serving_deploy, "deploy_adapter", capture)
+    monkeypatch.setattr(
+        serving_deploy,
+        "chat",
+        lambda **kwargs: _smoke_chat_result(f"{run_id}/final", f"{run_id}/final"),
+    )
 
     resp = api.post(
         f"/v1/runs/{run_id}/deploy", json={"checkpoint_id": f"{run_id}/final"}, headers=_bearer(key)
     )
     assert resp.status_code == 200, resp.text
+    assert resp.json()["state"] == "ready"
     # The run's owning org (billing_context) is what's attributed, not the bare caller key.
     assert seen["org_id"] == "run-owner-org"
 
@@ -5401,6 +5421,11 @@ def test_deploy_falls_back_to_platform_context_org(api, monkeypatch):
 
     def capture(**kwargs):
         seen.update(kwargs)
+        kwargs["before_ready"](
+            serving_deploy.DeploymentReadinessFacts(
+                f"{run_id}/final", f"{run_id}/final", frozenset(), False
+            )
+        )
         return Deployment(
             run_id=run_id,
             model=kwargs["model"],
@@ -5409,15 +5434,22 @@ def test_deploy_falls_back_to_platform_context_org(api, monkeypatch):
             endpoint_name="https://serve.example",
             openai_base_url="https://serve.example/v1",
             checkpoint_id=f"{run_id}/final",
+            deployment_generation="generation-a",
             state="ready",
         )
 
     monkeypatch.setattr(serving_deploy, "deploy_adapter", capture)
+    monkeypatch.setattr(
+        serving_deploy,
+        "chat",
+        lambda **kwargs: _smoke_chat_result(f"{run_id}/final", f"{run_id}/final"),
+    )
 
     resp = api.post(
         f"/v1/runs/{run_id}/deploy", json={"checkpoint_id": f"{run_id}/final"}, headers=_bearer(key)
     )
     assert resp.status_code == 200, resp.text
+    assert resp.json()["state"] == "ready"
     assert seen["org_id"] == "platform-org"
 
 
