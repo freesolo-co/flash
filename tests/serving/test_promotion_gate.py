@@ -422,6 +422,7 @@ def _gate_step_env() -> dict[str, str]:
     gate_step = next(s for s in steps if s.get("run", "").strip().endswith("promotion.gate"))
     supplied = set(gate_step.get("env", {}))
     values = {
+        "PLATFORM_BACKEND_URL": "https://backend.example",
         "SUPABASE_SERVICE_ROLE_KEY": "sb_secret_x",
         "SUPABASE_URL": "https://db.example",
         "SERVING_CANARY_ORG_ID": "11111111-2222-4333-8444-555555555555",

@@ -316,6 +316,10 @@ jobs:
             sleep "$sleep_seconds"
           done
 
+      - name: Verify backend serving contract before deployment
+        if: steps.gate.outputs.deploy == 'true'
+        run: python -m flash.serving.promotion.backend
+
       - name: Deploy serving
         id: deploy_serving
         if: steps.gate.outputs.deploy == 'true'
@@ -427,6 +431,7 @@ jobs:
           # durably. this step is the only thing standing between "the process booted" and "the
           # release can actually serve", so a failure here must not be promoted.
           SERVING_BASE_URL: https://serve.freesolo.co
+          PLATFORM_BACKEND_URL: ${{ secrets.PLATFORM_BACKEND_URL }}
           SERVING_CANARY_ORG_ID: ${{ vars.SERVING_CANARY_ORG_ID }}
           FREESOLO_INTERNAL_KEY: ${{ secrets.FREESOLO_INTERNAL_KEY }}
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}

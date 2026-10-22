@@ -70,7 +70,7 @@ Real vLLM base-runtime inference covered Qwen3.5-9B (FP8 serving base on L40S), 
 - Text generation and streaming, explicit thinking mode and thinking streaming.
 - JSON schema and streamed JSON, regex and choice constraints.
 - Multiple choices, streamed multiple choices, token log probabilities.
-- PNG, JPEG, WEBP, and GIF data-URL images; two images in one request; image streaming and image JSON output.
+- PNG, JPEG and WEBP data-URL images; two images in one request; image streaming and image JSON output. GIF is outside the supported image contract and must be rejected; its fixture is negative coverage, not evidence of GIF support.
 - Concurrent requests, runtime health, and explicit engine shutdown.
 - Real 9B generated tool calls, streamed tool calls, tool-result replay, and `tool_choice="none"`.
 - Invalid/corrupt images and image-count limits; unsupported feature combinations.

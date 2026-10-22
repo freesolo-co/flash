@@ -1,6 +1,7 @@
 """Deploy-time promotion gate for the hosted serving release.
 
-Imported by `.github/workflows/deploy-modal.yml` AFTER `modal deploy`, never by the request path.
+Used by `.github/workflows/deploy-modal.yml` for backend preflight before `modal deploy` and
+generation/settlement verification afterward, never by the request path.
 Nothing here may be imported from `flash/serving/src/http/` or `flash/serving/src/engine/`: this
 code runs on a CI runner against a live deployment, not inside the serving container.
 

@@ -1,8 +1,9 @@
-"""Sequence the three proofs a promotion needs, and fail the deploy without them.
+"""Check backend compatibility, then sequence the three proofs a promotion needs.
 
 Run as `python -m flash.serving.promotion.gate` from `.github/workflows/deploy-modal.yml`, after the
 readiness poll. Order is load-bearing and short-circuits:
 
+  backend -> does the configured backend expose authorization and durable settlement?
   health  -> is the live router THIS release, with engines to route to?
   stream  -> did a real authenticated request generate real tokens over a real stream?
   usage   -> is this release's durable delivery loop running rather than wedged?
@@ -34,6 +35,7 @@ if TYPE_CHECKING:
     import httpx
 
 from flash.serving.app.timeouts import CANARY_TIMEOUT_SECONDS
+from flash.serving.promotion.backend import check_backend, schema_url
 from flash.serving.promotion.canary import (
     CANARY_TRANSPORT_FAILURE,
     CanaryError,
@@ -86,6 +88,7 @@ _HEALTH_STABLE_SECONDS = 30.0
 _BACKLOG_SNAPSHOT_RPC = "serving_promotion_accounting_snapshot"
 _MAX_TOKENS = 32
 _REQUIRED_ENV = (
+    "PLATFORM_BACKEND_URL",
     "FREESOLO_INTERNAL_KEY",
     "SERVING_CANARY_ORG_ID",
     "SUPABASE_URL",
@@ -244,6 +247,7 @@ class GatePlan:
     """
 
     request: CanaryRequest
+    backend_url: str
     read_backlog: BacklogReader
     expected_sha: str
     expected_deployment_id: str
@@ -255,9 +259,9 @@ def _resolve(base_url: str, env: dict[str, str]) -> GatePlan:
     Every rejection lives HERE, above `asyncio.run`, because a gate that raises is strictly worse
     than one that fails: the rollback step keys off `failure()`, which fires on a crashed step
     exactly as it does on a failed one, so a misconfigured secret would roll production back to its
-    predecessor instead of simply declining to promote it. All three rejections -- an incomplete
-    environment, `supabase_headers` refusing a key that is not `sb_secret_`-shaped, and an empty
-    base-model catalog -- are knowable before the first request, so each is answered with a reason
+    predecessor instead of simply declining to promote it. An incomplete environment, invalid
+    backend URL, `supabase_headers` refusing a key that is not `sb_secret_`-shaped, and an empty
+    base-model catalog are knowable before the first request, so each is answered with a reason
     code rather than a traceback.
 
     Taking credentials as an argument rather than through `get_settings()` also keeps this
@@ -270,6 +274,7 @@ def _resolve(base_url: str, env: dict[str, str]) -> GatePlan:
         raise GateConfigError
 
     try:
+        schema_url(env["PLATFORM_BACKEND_URL"])
         org_id = str(uuid.UUID(env["SERVING_CANARY_ORG_ID"].strip()))
     except ValueError as exc:
         raise GateConfigError from exc
@@ -318,6 +323,7 @@ def _resolve(base_url: str, env: dict[str, str]) -> GatePlan:
         return response.json()
 
     return GatePlan(
+        backend_url=env["PLATFORM_BACKEND_URL"],
         request=CanaryRequest(
             base_url=base_url,
             # ONE model, not all of `base_models()`. This is a deliberate limit and it is narrower
@@ -345,6 +351,9 @@ def _resolve(base_url: str, env: dict[str, str]) -> GatePlan:
 async def _run(plan: GatePlan) -> PromotionVerdict:
     import httpx
 
+    reason = await asyncio.to_thread(check_backend, plan.backend_url)
+    if reason:
+        return PromotionVerdict(ok=False, reason=reason)
     base_url = plan.request.base_url.rstrip("/")
     async with httpx.AsyncClient() as client:
 
