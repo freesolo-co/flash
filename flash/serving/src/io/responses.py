@@ -30,7 +30,12 @@ def _inference_json_response(result: dict[str, Any], target: AdapterRecord) -> J
     return JSONResponse(body, headers=_provenance_headers(provenance, active_checkpoint))
 
 
-def _usage_block(prompt_tokens: int, completion_tokens: int, cached_tokens: Any) -> dict[str, Any]:
+def _usage_block(
+    prompt_tokens: int,
+    completion_tokens: int,
+    cached_tokens: Any,
+    reasoning_tokens: int | None = None,
+) -> dict[str, Any]:
     """OpenAI-style ``usage`` object for a completion response.
 
     Mirrors the OpenAI schema, including ``prompt_tokens_details.cached_tokens`` (the
@@ -49,6 +54,8 @@ def _usage_block(prompt_tokens: int, completion_tokens: int, cached_tokens: Any)
         cached = 0
     if cached > 0:
         usage["prompt_tokens_details"] = {"cached_tokens": cached}
+    if reasoning_tokens is not None:
+        usage["completion_tokens_details"] = {"reasoning_tokens": reasoning_tokens}
     return usage
 
 
@@ -107,7 +114,10 @@ def openai_chat_completion(
     completion_tokens = generation.get("completion_tokens")
     if prompt_tokens is not None and completion_tokens is not None:
         response["usage"] = _usage_block(
-            int(prompt_tokens), int(completion_tokens), generation.get("cached_tokens")
+            int(prompt_tokens),
+            int(completion_tokens),
+            generation.get("cached_tokens"),
+            generation.get("reasoning_tokens"),
         )
     return response
 

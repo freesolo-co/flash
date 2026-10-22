@@ -1,7 +1,7 @@
 """Offline-by-default test harness.
 
-Autouse fixtures stub production network boundaries; later test patches still win. Freesolo auth
-is not stubbed globally because client tests use a real loopback server.
+Autouse fixtures stub production network boundaries and reject unstubbed remote HTTPX requests.
+Later test patches still win; loopback servers and in-process transports remain usable.
 """
 
 from __future__ import annotations
@@ -288,6 +288,46 @@ def _reset_status_reporter_before_test():
     reporting._open_status_reporter()
 
 
+@pytest.fixture
+def allowed_http_origins():
+    """Only the opt-in conformance suite may allow a remote HTTP origin."""
+    return set()
+
+
+@pytest.fixture(autouse=True)
+def _offline_http(monkeypatch, allowed_http_origins):
+    """Reject unstubbed HTTP before it reaches a live service, including cached clients."""
+    import httpx
+
+    sync_send = httpx.HTTPTransport.handle_request
+    async_send = httpx.AsyncHTTPTransport.handle_async_request
+
+    def check(request):
+        origin = (request.url.scheme, request.url.host, request.url.port)
+        if (
+            request.url.host not in {"127.0.0.1", "localhost", "::1"}
+            and origin not in allowed_http_origins
+        ):
+            # pytest's failure escapes application-level Exception handlers: a cleanup path
+            # must not swallow the guard and let an accidentally online test pass.
+            pytest.fail(
+                f"offline test attempted live HTTP: {request.method} "
+                f"{request.url.scheme}://{request.url.host}{request.url.path}; "
+                "stub the HTTP transport or the serving operation"
+            )
+
+    def send(self, request):
+        check(request)
+        return sync_send(self, request)
+
+    async def send_async(self, request):
+        check(request)
+        return await async_send(self, request)
+
+    monkeypatch.setattr(httpx.HTTPTransport, "handle_request", send)
+    monkeypatch.setattr(httpx.AsyncHTTPTransport, "handle_async_request", send_async)
+
+
 @pytest.fixture(autouse=True)
 def _offline(monkeypatch):
     from flash.providers.modal import api as modal_api
@@ -470,7 +510,7 @@ def stub_serving_registry(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
-def background_supervisor(monkeypatch):
+def background_supervisor(monkeypatch, _offline_http):
     """Each test owns and drains its background work before its patched dependencies disappear."""
     from flash._internal.background import Supervisor
 

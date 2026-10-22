@@ -58,15 +58,17 @@ def _base_rec(base_model: str = QWEN) -> AdapterRecord:
 
 class FakePool:
     async def generate(self, base_model, payload, record, *, expected_checkpoint=None):
+        thinking = (payload.chat_template_kwargs or {}).get("enable_thinking", record.thinking)
         return attest(
             record,
             {
-                "text": "hi",
+                "text": "reason</think>hi" if thinking else "hi",
+                "thinking": thinking,
                 "finish_reason": "stop",
                 "prompt_tokens": 3,
                 "completion_tokens": 2,
                 "cached_tokens_reported": False,
-                "reasoning_tokens": 0,
+                "reasoning_tokens": 1 if thinking else 0,
                 "request_id": payload.generation_id,
                 "checkpoint": record.model_id if record.is_checkpoint else "",
             },
@@ -156,7 +158,7 @@ def test_default_base_model_request_shapes_are_settleable(path, payload) -> None
     assert store.finalized[0].facts.reasoning_tokens == 0
 
 
-def test_explicit_base_model_thinking_remains_rejected_before_settlement() -> None:
+def test_explicit_base_model_thinking_is_settled() -> None:
     client, store = _build([_base_rec()], authorizer=FakeAuthorizer())
 
     response = client.post(
@@ -169,9 +171,9 @@ def test_explicit_base_model_thinking_remains_rejected_before_settlement() -> No
         headers={"Authorization": "Bearer k"},
     )
 
-    assert response.status_code == 503
-    assert response.json() == {"detail": "thinking generation accounting is unavailable"}
-    assert store.finalized == []
+    assert response.status_code == 200
+    assert len(store.finalized) == 1
+    assert store.finalized[0].facts.reasoning_tokens == 1
 
 
 def test_unattributable_internal_base_model_request_fails_closed() -> None:

@@ -1280,22 +1280,28 @@ def test_deploy_propagates_serving_error(monkeypatch, tmp_path):
     import flash.serve.deployment.deploy as d
 
     _stub_adapter_config(monkeypatch, tmp_path, rank=32)
+    calls = []
 
-    class _Resp:
-        status_code = 500
+    def respond(request):
+        calls.append((request.method, request.url.path))
+        return httpx.Response(404 if request.method == "GET" else 500, json={})
 
-        def raise_for_status(self):
-            raise httpx.HTTPStatusError("boom", request=None, response=None)
-
-    monkeypatch.setattr(httpx, "post", lambda *a, **k: _Resp())
-    with pytest.raises(ServingError):
-        d.deploy_adapter(
-            run_id="r1",
-            model="Qwen/Qwen3.5-9B",
-            hf_repo="org/repo",
-            adapter_prefix="sft/r1/seed0",
-            org_id="org-1",
-        )
+    with httpx.Client(transport=httpx.MockTransport(respond)) as client:
+        monkeypatch.setattr(serving_transport, "_http_client", lambda: client)
+        with pytest.raises(ServingError) as exc_info:
+            d.deploy_adapter(
+                run_id="r1",
+                model="Qwen/Qwen3.5-9B",
+                hf_repo="org/repo",
+                adapter_prefix="sft/r1/seed0",
+                org_id="org-1",
+            )
+    assert exc_info.value.status_code == 500
+    assert calls == [
+        ("GET", "/adapters/r1/final"),
+        ("POST", "/adapters"),
+        ("GET", "/adapters/r1/final"),
+    ]
 
 
 def test_undeploy_deletes_on_freesolo_serving(monkeypatch):
