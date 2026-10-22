@@ -653,13 +653,23 @@ def test_xgrammar_replay_masks_only_positions_after_thinking_boundary():
         ),
     ],
 )
+@pytest.mark.live
 def test_xgrammar_replay_uses_real_qwen_padded_model_vocab(spec, text):
+    if not os.environ.get("FLASH_LIVE"):
+        pytest.skip("set FLASH_LIVE=1 to download the tokenizer and model config")
     pytest.importorskip("xgrammar")
+    from huggingface_hub import snapshot_download
     from transformers import AutoConfig, AutoTokenizer
 
     model_id = "Qwen/Qwen3.5-9B"
-    tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
-    config = AutoConfig.from_pretrained(model_id, trust_remote_code=True)
+    revision = "c202236235762e1c871ad0ccb60c8ee5ba337b9a"
+    # mirror worker prefetch: local loading also prevents transformers' tokenizer metadata
+    # heuristic from querying an unpinned model_info through the offline test fixture.
+    snapshot = snapshot_download(
+        model_id, revision=revision, allow_patterns=["*.json", "*.jinja", "*.txt", "*.model"]
+    )
+    tokenizer = AutoTokenizer.from_pretrained(snapshot, local_files_only=True)
+    config = AutoConfig.from_pretrained(snapshot, local_files_only=True)
     assert len(tokenizer.get_vocab()) == 248077
     assert config.text_config.vocab_size == 248320
 
