@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import pathlib
+import time
 from unittest import mock
 
 import pytest
@@ -19,6 +20,7 @@ from flash.serving.promotion.evidence import (
     ACCOUNTING_MALFORMED,
     ACCOUNTING_STALLED,
     ACCOUNTING_UNSETTLED,
+    HEALTH_DEPLOYMENT_ID_MISMATCH,
     HEALTH_SHA_MISMATCH,
     STREAM_NO_CONTENT,
     StreamEvidence,
@@ -69,11 +71,14 @@ def _good_stream() -> StreamEvidence:
 
 def _evaluate(*, health, stream, accounting, **kwargs):
     calls: list[str] = []
+    kwargs.setdefault("health_stable_seconds", 0)
 
     async def health_loader():
         calls.append("health")
         if isinstance(health, BaseException):
             raise health
+        if callable(health):
+            return health()
         return health
 
     async def stream_runner():
@@ -117,10 +122,123 @@ def test_a_wrong_release_is_never_streamed_against():
     accounting evidence would be actively misleading rather than merely useless.
     """
     verdict, calls = _evaluate(
-        health=_health(deployment_sha="0" * 40), stream=_good_stream(), accounting=_Snapshot()
+        health=_health(deployment_sha="0" * 40),
+        stream=_good_stream(),
+        accounting=_Snapshot(),
+        health_deadline_seconds=10,
     )
     assert verdict.reason == HEALTH_SHA_MISMATCH
-    assert calls == ["health"]
+    assert calls == ["health", "health"]
+
+
+@pytest.mark.parametrize(
+    "stale",
+    [
+        {"deployment_sha": "0" * 40},
+        {"deployment_id": "12345-previous"},
+    ],
+)
+def test_rollout_identity_drift_clears_before_streaming(stale):
+    snapshots = iter([_health(**stale), _health(**stale), _health()])
+    verdict, calls = _evaluate(
+        health=lambda: next(snapshots),
+        stream=_good_stream(),
+        accounting=_Snapshot(),
+    )
+    assert verdict.ok
+    assert calls == ["health", "health", "health", "stream", "accounting"]
+
+
+def test_a_previous_attempt_never_reaches_streaming():
+    verdict, calls = _evaluate(
+        health=_health(deployment_id="12345-previous"),
+        stream=_good_stream(),
+        accounting=_Snapshot(),
+        health_deadline_seconds=10,
+    )
+    assert verdict.reason == HEALTH_DEPLOYMENT_ID_MISMATCH
+    assert calls == ["health", "health"]
+
+
+def test_an_interleaved_old_container_restarts_the_health_stability_window():
+    snapshots = iter(
+        [
+            _health(),
+            _health(deployment_sha="0" * 40),
+            *[_health() for _ in range(7)],
+        ]
+    )
+    verdict, calls = _evaluate(
+        health=lambda: next(snapshots),
+        stream=_good_stream(),
+        accounting=_Snapshot(),
+        health_stable_seconds=gate_module._HEALTH_STABLE_SECONDS,
+    )
+    assert verdict.ok
+    assert calls == ["health"] * 9 + ["stream", "accounting"]
+
+
+def test_matching_health_without_a_full_stability_window_never_streams():
+    verdict, calls = _evaluate(
+        health=_health(),
+        stream=_good_stream(),
+        accounting=_Snapshot(),
+        health_stable_seconds=30,
+        health_deadline_seconds=10,
+    )
+    assert verdict.reason == gate_module.HEALTH_NOT_STABLE
+    assert calls == ["health", "health"]
+
+
+def test_health_read_latency_consumes_the_rollout_deadline():
+    now, reads = [0.0], []
+
+    async def load():
+        reads.append(now[0])
+        now[0] += 7
+        return _health(deployment_sha="0" * 40)
+
+    async def sleep(seconds):
+        now[0] += seconds
+
+    verdict = asyncio.run(
+        gate_module._await_health(
+            load,
+            expected_sha=SHA,
+            expected_deployment_id=DEPLOYMENT_ID,
+            deadline_seconds=10,
+            poll_seconds=5,
+            sleep=sleep,
+            clock=lambda: now[0],
+        )
+    )
+    assert verdict.reason == HEALTH_SHA_MISMATCH
+    assert reads == [0]
+    assert now[0] == 10
+
+
+def test_hung_health_read_is_cancelled_at_deadline():
+    cancelled = []
+
+    async def load():
+        try:
+            await asyncio.Event().wait()
+        finally:
+            cancelled.append(True)
+
+    verdict = asyncio.run(
+        gate_module._await_health(
+            load,
+            expected_sha=SHA,
+            expected_deployment_id=DEPLOYMENT_ID,
+            deadline_seconds=0.01,
+            poll_seconds=5,
+            sleep=asyncio.sleep,
+            clock=time.monotonic,
+        )
+    )
+    assert not verdict.ok
+    assert cancelled == [True]
 
 
 def test_an_unreachable_router_fails_the_gate_instead_of_crashing_it():
