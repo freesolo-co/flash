@@ -440,7 +440,8 @@ def test_chat_recovery_hint_requires_an_explicit_checkpoint() -> None:
         _require_active_deployment("run-a", "done", {}, None)
 
     assert raised.value.status_code == 409
-    assert "`flash models deploy run-a/final`" in raised.value.detail
+    assert "`flash models deploy <checkpoint-id>`" in raised.value.detail
+    assert "run-a/final" not in raised.value.detail
 
 
 def test_checkpoint_registration_rejects_bare_managed_selector() -> None:
