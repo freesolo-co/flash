@@ -120,7 +120,6 @@ def test_options_pass_through_with_the_constraint():
         "json": SCHEMA,
         "disable_any_whitespace": True,
         "disable_additional_properties": True,
-        "whitespace_pattern": r"[\n\t ]*",
     }
     assert normalize_structured_outputs(spec) == spec
 

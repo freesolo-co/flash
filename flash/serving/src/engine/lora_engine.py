@@ -18,6 +18,8 @@ from functools import cached_property
 from pathlib import Path
 from typing import Any
 
+from flash.content.structured_options import vllm_structured_kwargs
+
 # Adapter-cache paths and token accounting live in engine_support.py, alongside
 # _RESERVED_CHAT_TEMPLATE_KWARGS (the apply_chat_template args a caller must never re-supply) and
 # the vllm build probes engine_boot uses.
@@ -428,7 +430,7 @@ class _LoraEngineImpl:
         from vllm.sampling_params import StructuredOutputsParams
 
         try:
-            params = StructuredOutputsParams(**spec)
+            params = StructuredOutputsParams(**vllm_structured_kwargs(spec))
         except (TypeError, ValueError) as exc:
             raise ValueError(f"invalid structured outputs spec {spec!r}: {exc}") from exc
 

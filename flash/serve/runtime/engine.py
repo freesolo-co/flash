@@ -11,6 +11,7 @@ from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass
 from typing import Any
 
+from flash.content.structured_options import vllm_structured_kwargs
 from flash.serve.request.runtime_support import reasoning_compatibility_guard
 from flash.serve.request.tool_calls import tools_active
 
@@ -614,7 +615,7 @@ class VllmLoraRuntime:
         from vllm.sampling_params import StructuredOutputsParams
 
         try:
-            params = StructuredOutputsParams(**spec)
+            params = StructuredOutputsParams(**vllm_structured_kwargs(spec))
         except (TypeError, ValueError) as exc:
             raise PromptError(f"invalid structured outputs spec {spec!r}: {exc}") from exc
         parser_kwargs = None

@@ -11,6 +11,7 @@ import warnings
 from collections.abc import Mapping
 from typing import Any
 
+from flash.content.structured_options import validate_structured_options
 from flash.serve.contract.protocol import (
     IMAGE_TYPES,
     TEXT_TYPES,
@@ -631,7 +632,12 @@ def _normalize_structured_canonical(
             f"{', '.join(CONSTRAINT_KEYS)}; got {found}"
         )
     # canonical ordering keeps serialized payloads stable across both validation passes.
-    return {**constraints, **{key: options[key] for key in OPTION_KEYS if key in options}}
+    normalized = {**constraints, **{key: options[key] for key in OPTION_KEYS if key in options}}
+    try:
+        validate_structured_options(normalized)
+    except ValueError as exc:
+        raise error_type(str(exc)) from exc
+    return normalized
 
 
 def _validate_structured_constraint(
