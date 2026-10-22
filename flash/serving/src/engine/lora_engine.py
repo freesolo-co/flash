@@ -790,14 +790,13 @@ class _LoraEngineImpl:
             "ok": not engine_dead,
             "engine_dead": engine_dead,
             "base_model": self.base_model,
-            # The checkpoint this engine actually loaded: the pre-quantized serve_model_id (owned FP8,
-            # or the official 35B FP8). Surfaced so ops can confirm which weights came up.
+            # The checkpoint this engine actually loaded, including any serving-specific repo.
             "served_model": _served_model,
             "immutable_identity": _immutable_identity,
-            # effective weight quantization of the served checkpoint. every base now serves a
-            # pre-quantized FP8 checkpoint (vLLM auto-detects, so the engine arg is None).
-            "quantization": (
-                "fp8" if _ov.get("serve_model_id") else _ov.get("quantization", cfg.QUANTIZATION)
+            # Explicit overrides include None for BF16. Other serving repos hold FP8 weights,
+            # which vLLM auto-detects even though the engine argument is None.
+            "quantization": _ov.get(
+                "quantization", "fp8" if _ov.get("serve_model_id") else cfg.QUANTIZATION
             ),
             # KV-cache dtype this engine was built with (FP8 for every base; a model may override).
             "kv_cache_dtype": _ov.get("kv_cache_dtype", cfg.KV_CACHE_DTYPE),

@@ -6183,6 +6183,42 @@ def test_the_run_shuts_the_bridge_down_before_the_server_it_is_mounted_on():
     assert src.index("multi_turn_bridge.shutdown()") < src.index("server.shutdown()")
 
 
+def test_sampler_start_failure_closes_the_running_reward_server(monkeypatch):
+    events = []
+    reward = SimpleNamespace(
+        multi_turn_bridge=SimpleNamespace(shutdown=lambda: events.append("bridge")),
+        server=SimpleNamespace(shutdown=lambda: events.append("server")),
+    )
+    inp = {"model_id": "model", "model_revision": "revision"}
+    monkeypatch.setattr(rl_train, "liveness_heartbeat", lambda *_: contextlib.nullcontext())
+    monkeypatch.setattr(rl_train, "_prepare_rl_inputs", lambda: (0, inp, None, None, None, [], 0))
+    monkeypatch.setattr(rl_train, "_cached_model_path", lambda *_: "/model")
+    monkeypatch.setattr(rl_train, "_prepare_rl_runtime", lambda *_: ({}, reward))
+    monkeypatch.setattr(rl_train, "reap_stragglers", lambda: events.append("reap"))
+
+    def fail_start():
+        raise RuntimeError("sampler start failed")
+
+    monkeypatch.setattr(rl_train, "_initialize_teardown_state", fail_start)
+    with pytest.raises(RuntimeError, match="sampler start failed"):
+        rl_train.run_rl_train()
+    assert events == ["bridge", "server", "reap"]
+
+
+def test_reward_server_shutdown_failure_still_reaps_children(monkeypatch):
+    events = []
+
+    def fail_shutdown():
+        raise RuntimeError("server shutdown failed")
+
+    reward = SimpleNamespace(multi_turn_bridge=None, server=SimpleNamespace(shutdown=fail_shutdown))
+    sampler = SimpleNamespace(stop_gb=lambda: 2.0)
+    monkeypatch.setattr(rl_train, "reap_stragglers", lambda: events.append("reap"))
+    with pytest.raises(RuntimeError, match="server shutdown failed"):
+        rl_train._shutdown_rl_runtime(None, sampler, reward)
+    assert events == ["reap"]
+
+
 def test_bridge_close_releases_the_session():
     # every in-flight episode holds env state. a leak here grows for the whole run, and the child
     # closes in a finally precisely so a failed episode still frees it -- so close must tolerate a
