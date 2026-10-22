@@ -25,6 +25,7 @@ from flash.serve.runtime.tool_calls import (
     ToolCallStreamParser,
     parse_qwen3_coder_output,
 )
+from flash.serving.src.engine.reasoning_usage import ReasoningTokenCounter
 from flash.serving.src.engine.support import (
     _cached_tokens_reported,
     _num_cached_tokens,
@@ -171,6 +172,7 @@ def _usage_fields(
     engine_replica_id: str,
     checkpoint: str,
     thinking: bool,
+    reasoning_counter: ReasoningTokenCounter,
 ) -> dict[str, Any]:
     prompt_token_ids = [
         int(value) for value in (getattr(request_output, "prompt_token_ids", []) or [])
@@ -195,8 +197,7 @@ def _usage_fields(
         "checkpoint": checkpoint,
         "thinking": thinking,
     }
-    if not thinking:
-        fields["reasoning_tokens"] = 0
+    fields["reasoning_tokens"] = reasoning_counter.total
     return fields
 
 
@@ -222,6 +223,9 @@ async def generate(
         payload, record, thinking
     )
     _reject_tools_with_structured_outputs(payload, structured)
+    reasoning_counter = ReasoningTokenCounter(
+        owner._reasoning_usage_token_ids if thinking else None
+    )
     sampling = _sampling_params(payload, structured, RequestOutputKind.FINAL_ONLY)
     request_id = generation_id or payload.generation_id or f"fsgen-{uuid.uuid4().hex}"
     start = time.monotonic()
@@ -255,6 +259,8 @@ async def generate(
         for index, output in sorted(complete_indexed_outputs(final_output, n=payload.n).items())
     ]
     completion_ids = [token for choice in choices for token in choice["token_ids"]]
+    for choice in choices:
+        reasoning_counter.consume(choice["index"], choice["token_ids"])
     first = choices[0]
     return {
         "ok": True,
@@ -279,8 +285,27 @@ async def generate(
             engine_replica_id=owner._replica_identifier(),
             checkpoint=active_checkpoint,
             thinking=thinking,
+            reasoning_counter=reasoning_counter,
         ),
     }
+
+
+def _record_stream_usage(
+    current: Any,
+    payload: OpenAIGenerateRequest,
+    choice_state: dict[int, _ChoiceState],
+    completion_ids: list[int],
+    reasoning_counter: ReasoningTokenCounter,
+) -> None:
+    # Record the whole native batch before any event, including ready. Rendering
+    # its choices must never regress counters or count this batch a second time.
+    for index, output in sorted(indexed_outputs(current, n=payload.n).items()):
+        if choice_state[index]["finish_reason"] is not None:
+            raise RuntimeError("vLLM emitted data after a choice terminal")
+        token_ids = [int(value) for value in (getattr(output, "token_ids", None) or [])]
+        choice_state[index]["token_ids"].extend(token_ids)
+        completion_ids.extend(token_ids)
+        reasoning_counter.consume(index, token_ids)
 
 
 def _consume_stream_output(
@@ -303,8 +328,6 @@ def _consume_stream_output(
             top_logprobs=payload.top_logprobs,
         )
         text = str(getattr(output, "text", "") or "")
-        state["token_ids"].extend(token_ids)
-        completion_ids.extend(token_ids)
         visible = tool_parsers[index].feed(text) if index in tool_parsers else text
         state["text"] += visible
         if visible or logprobs is not None:
@@ -413,6 +436,9 @@ async def stream_generate(
         payload, record, thinking
     )
     _reject_tools_with_structured_outputs(payload, structured)
+    reasoning_counter = ReasoningTokenCounter(
+        owner._reasoning_usage_token_ids if thinking else None
+    )
     sampling = _sampling_params(payload, structured, RequestOutputKind.DELTA)
     request_id = generation_id or payload.generation_id or f"fsgen-{uuid.uuid4().hex}"
     start = time.monotonic()
@@ -439,6 +465,7 @@ async def stream_generate(
         "engine_replica_id": owner._replica_identifier(),
         "checkpoint": active_checkpoint,
         "thinking": thinking,
+        "reasoning_counter": reasoning_counter,
     }
     try:
         try:
@@ -459,16 +486,12 @@ async def stream_generate(
             raise
         usage_kwargs["time_to_first_token_seconds"] = time_to_first_token_seconds
         usage_kwargs["queue_wait_seconds"] = _queue_wait_seconds(first_output)
-        first_ids = [
-            int(token)
-            for output in indexed_outputs(first_output, n=payload.n).values()
-            for token in (getattr(output, "token_ids", None) or [])
-        ]
+        _record_stream_usage(first_output, payload, choice_state, completion_ids, reasoning_counter)
         yield {
             "type": "ready",
             "thinking": thinking,
             **({"lora_request_adapter": attestation} if attestation is not None else {}),
-            **_usage_fields(first_output, first_ids, **usage_kwargs),
+            **_usage_fields(first_output, completion_ids, **usage_kwargs),
         }
         current = first_output
         last_output = first_output
@@ -476,18 +499,16 @@ async def stream_generate(
             while True:
                 last_output = current
                 for event in _consume_stream_output(
-                    current,
-                    payload,
-                    choice_state,
-                    completion_ids,
-                    tool_parsers,
-                    usage_kwargs,
+                    current, payload, choice_state, completion_ids, tool_parsers, usage_kwargs
                 ):
                     yield event
                 try:
                     current = await anext(output_stream)
                 except StopAsyncIteration:
                     break
+                _record_stream_usage(
+                    current, payload, choice_state, completion_ids, reasoning_counter
+                )
         except Exception:
             owner._self_heal_if_dead("stream_generate")
             raise

@@ -44,6 +44,15 @@ def serving_key() -> str:
     return (os.environ.get("FLASH_SERVING_KEY") or "").strip()
 
 
+@pytest.fixture
+def allowed_http_origins(serving_url):
+    """Allow only the explicitly selected backend, including during redirect handling."""
+    import httpx
+
+    url = httpx.URL(serving_url)
+    return {(url.scheme, url.host, url.port)}
+
+
 @pytest.fixture(scope="session")
 def adapter_source(request) -> dict:
     repo_id = _option(request, "--conformance-repo", "FLASH_CONFORMANCE_REPO")

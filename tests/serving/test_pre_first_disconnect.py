@@ -112,9 +112,6 @@ def test_non_streaming_disconnect_cancels_generation(monkeypatch, route: str) ->
             async def authorize_inference(self, *_args):
                 return AuthorizedTraffic(principal_for_external_org("org-1"), "generation-a")
 
-            def reject_unsettleable_thinking(self, *_args) -> None:
-                return None
-
             async def generate(self, *_args, **_kwargs):
                 entered.set()
                 try:

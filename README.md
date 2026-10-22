@@ -230,10 +230,13 @@ base model requires another deployment. Legacy provider deployment identities ar
 It implements the same contract `flash/serve/` speaks; [docs/serving-contract.md](docs/serving-contract.md)
 documents it if you would rather write your own.
 
-The GPU worker image is public and published under an explicit CUDA tag, not `latest`:
+Training selects the public worker image by its qualified digest. The historical `cu128` and
+`cu128-sm*` tags can contain an incompatible trainer; they are build outputs, not the launch
+contract. The selected image runs the pinned upstream Verl stack, with native kernel JIT when
+no compatible baked cache is available:
 
 ```bash
-docker pull ghcr.io/freesolo-co/flash-worker:cu128
+docker pull ghcr.io/freesolo-co/flash-worker@sha256:34c84092f87b9ae43457620a8e5c0dc2e3dc30fdd5de5b4300c1eeb384e9a066
 ```
 
 ## Release channels

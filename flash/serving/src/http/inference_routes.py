@@ -57,7 +57,6 @@ async def generate(payload: GenerateRequest, request: Request) -> JSONResponse:
         payload.model_id, org_id=_authorization_org_id(authorization)
     )
     traffic = require_attributed_traffic(authorization, target)
-    context.reject_unsettleable_thinking(payload, target)
     await _prepare_generate_request(payload, target)
     identity = new_request_identity(request)
     admitted_at = captured_now()
@@ -93,7 +92,6 @@ async def generate_for_adapter(
         req.model_id, org_id=_authorization_org_id(authorization)
     )
     traffic = require_attributed_traffic(authorization, target)
-    context.reject_unsettleable_thinking(req, target)
     await _prepare_generate_request(req, target)
     identity = new_request_identity(request)
     admitted_at = captured_now()
@@ -184,7 +182,6 @@ async def chat_completions(payload: dict[str, Any], request: Request) -> Any:
         "enable_thinking": effective_thinking,
     }
     req = _parse_openai_generate(generate_fields)
-    context.reject_unsettleable_thinking(req, target)
     stream = normalized.stream
     include_usage = normalized.include_usage
     await _prepare_generate_request(req, target)
