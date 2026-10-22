@@ -26,7 +26,7 @@ MAX_TOTAL_DECODED_BYTES = 64 * 1024 * 1024
 MAX_SOURCE_CHARS = len("data:image/webp;base64,") + 4 * ((MAX_COMPRESSED_BYTES + 2) // 3)
 MAX_MESSAGE_NODES = 4096
 MAX_MESSAGE_DEPTH = 256
-ALLOWED_ROLES = frozenset({"system", "user", "assistant", "tool"})
+ALLOWED_ROLES = ("system", "user", "assistant", "tool")
 MIME_TO_FORMAT = {"image/jpeg": "JPEG", "image/png": "PNG", "image/webp": "WEBP"}
 DATA_URI_RE = re.compile(r"\Adata:(image/[^;,]+);base64,(.*)\Z", re.DOTALL)
 

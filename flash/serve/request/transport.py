@@ -32,7 +32,7 @@ from flash.serve.request.tool_calls import (
 _INTERNAL_KEY_HEADER_NAME = "X-Freesolo-Internal-Key"
 _ORG_ID_HEADER_NAME = "X-Freesolo-Org-Id"
 _MAX_REDIRECTS = 100
-_RETRYABLE_SMOKE_503_CODES = frozenset({"adapter_loading", "engine_unavailable"})
+_RETRYABLE_SMOKE_503_CODES = ("adapter_loading", "engine_unavailable")
 _SMOKE_RETRY_FALLBACK_DELAY_SECONDS = 2.0
 _HTTP_CLIENT: httpx.Client | None = None
 _CHAT_HTTP_CLIENT: httpx.Client | None = None

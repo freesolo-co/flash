@@ -602,13 +602,18 @@ class DurableUsageOutbox:
             result = response.json()
             if not isinstance(result, Mapping):
                 raise TypeError
+            for field in ("exactCostMicroUsd", "billedCents"):
+                if type(result[field]) is not int or result[field] < 0:
+                    raise ValueError("invalid settlement amount")
+            if type(result.get("replay", False)) is not bool:
+                raise ValueError("invalid settlement replay flag")
             ack = {
                 "usage_id": result.get("usageId"),
                 "ledger_id": result.get("ledgerId"),
                 "price_version": result["priceVersion"],
-                "exact_cost_micro_usd": int(result["exactCostMicroUsd"]),
-                "billed_cents": int(result["billedCents"]),
-                "replay": bool(result.get("replay", False)),
+                "exact_cost_micro_usd": result["exactCostMicroUsd"],
+                "billed_cents": result["billedCents"],
+                "replay": result.get("replay", False),
             }
         except (KeyError, TypeError, ValueError):
             await self._quarantine(outbox_id, "invalid_settlement_response")

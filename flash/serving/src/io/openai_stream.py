@@ -30,15 +30,18 @@ async def _next_event_or_disconnect(
 ) -> dict[str, Any] | None:
     next_event: asyncio.Future[dict[str, Any] | bool] = asyncio.ensure_future(anext(events))
     waiters: set[asyncio.Future[Any]] = {next_event, disconnect_wait}
-    await asyncio.sleep(0)
-    if next_event.done():
-        return cast("dict[str, Any]", next_event.result())
-    done, _ = await asyncio.wait(waiters, return_when=asyncio.FIRST_COMPLETED)
-    if next_event in done:
-        return cast("dict[str, Any]", next_event.result())
-    next_event.cancel()
-    await asyncio.gather(next_event, return_exceptions=True)
-    return None
+    try:
+        await asyncio.sleep(0)
+        if next_event.done():
+            return cast("dict[str, Any]", next_event.result())
+        done, _ = await asyncio.wait(waiters, return_when=asyncio.FIRST_COMPLETED)
+        if next_event in done:
+            return cast("dict[str, Any]", next_event.result())
+        return None
+    finally:
+        if not next_event.done():
+            next_event.cancel()
+        await asyncio.gather(next_event, return_exceptions=True)
 
 
 async def _close_async_iterator(events: AsyncIterator[dict[str, Any]]) -> None:

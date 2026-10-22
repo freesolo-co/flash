@@ -161,3 +161,33 @@ def test_artifact_scenario_redacts_prompt_content() -> None:
     public = public_scenario_dict(scenario)
     assert public["profiles"][0]["messages"][0]["content"] == "[redacted]"
     assert "secret prompt" not in str(public)
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        ("client", "read_timeout_seconds"),
+        ("client", "max_scheduling_lag_ms"),
+        ("profiles", 0, "weight"),
+        ("targets", 0, "weight"),
+        ("phases", 0, "burst_window_seconds"),
+        ("phases", 2, "duration_seconds"),
+        ("phases", 2, "rate_rps"),
+        ("phases", 4, "stages", 0, "rate_rps"),
+    ],
+)
+def test_infinite_scheduling_and_client_parameters_are_rejected(path) -> None:
+    payload = scenario_payload()
+    parent = payload
+    for key in path[:-1]:
+        parent = parent[key]
+    parent[path[-1]] = float("inf")
+    with pytest.raises(ValidationError, match="finite"):
+        Scenario.model_validate(payload)
+
+
+def test_endpoint_cannot_embed_credentials_in_public_artifacts() -> None:
+    payload = scenario_payload()
+    payload["endpoint"] = "https://user:password@example.invalid"
+    with pytest.raises(ValidationError, match="credentials"):
+        Scenario.model_validate(payload)

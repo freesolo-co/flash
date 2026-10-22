@@ -684,7 +684,9 @@ def test_cancel_timeout_returns_authoritative_cancelled_status(monkeypatch):
     client = ApiClient("http://flash.example", "fslo-user-test")
     calls: list[tuple[str, str, float | None]] = []
 
-    def request(method, path, body=None, timeout=None, progress=None, require=()):
+    def request(
+        method, path, body=None, timeout=None, progress=None, require=(), body_deadline=None
+    ):
         calls.append((method, path, timeout))
         if method == "POST":
             raise RequestTimeoutError("cancel timed out")
@@ -699,7 +701,7 @@ def test_cancel_timeout_returns_authoritative_cancelled_status(monkeypatch):
     assert out["state"] == "cancelled"
     assert calls == [
         ("POST", "/v1/runs/r1/cancel", 60.0),
-        ("GET", "/v1/runs/r1", None),
+        ("GET", "/v1/runs/r1", 60.0),
     ]
 
 
@@ -707,7 +709,9 @@ def test_cancel_timeout_returns_authoritative_cancelled_status(monkeypatch):
 def test_cancel_timeout_raises_when_backend_cleanup_is_unconfirmed(monkeypatch, run_state):
     client = ApiClient("http://flash.example", "fslo-user-test")
 
-    def request(method, path, body=None, timeout=None, progress=None, require=()):
+    def request(
+        method, path, body=None, timeout=None, progress=None, require=(), body_deadline=None
+    ):
         if method == "POST":
             raise RequestTimeoutError("cancel timed out")
         if method == "GET" and path == "/v1/runs/r1":
@@ -750,7 +754,9 @@ def test_cancel_timeout_keeps_polling_nonterminal_cleanup_pending(monkeypatch):
         ]
     )
 
-    def request(method, path, body=None, timeout=None, progress=None, require=()):
+    def request(
+        method, path, body=None, timeout=None, progress=None, require=(), body_deadline=None
+    ):
         if method == "POST":
             raise RequestTimeoutError("cancel timed out")
         if method == "GET" and path == "/v1/runs/r1":

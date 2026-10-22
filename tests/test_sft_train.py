@@ -5144,3 +5144,44 @@ def test_resume_rejects_missing_required_save_before_restored_step(worker_contex
     watcher = types.SimpleNamespace(lifecycle=CheckpointLedger())
     with pytest.raises(RuntimeError, match=r"cannot resume.*\[5\]"):
         sft_train._seed_resume_lifecycle(watcher, (3, 5, 9), 7, context=worker_context)
+
+
+@pytest.mark.parametrize("failure_stage", ["child", "watcher_start", "watcher_stop"])
+def test_sft_failure_stops_gpu_sampler(monkeypatch, failure_stage, worker_context):
+    from flash.engine.worker.train.entry import sft_train
+
+    def fail(stage):
+        if failure_stage == stage:
+            raise RuntimeError(f"{stage} failed")
+
+    class Watcher:
+        def __init__(self, **kwargs):
+            self.required_steps = frozenset(kwargs["required_steps"])
+            self.lifecycle = CheckpointLedger()
+
+        def start(self):
+            fail("watcher_start")
+
+        def stop(self, *, require_complete):
+            fail("watcher_stop")
+
+    spec, _ = _stub_sft_run(monkeypatch, watcher_cls=Watcher, worker_context=worker_context)
+    stopped = []
+
+    class Sampler:
+        def start(self):
+            return self
+
+        def stop_gb(self):
+            stopped.append(True)
+            return 12.5
+
+    def train(*args, **kwargs):
+        fail("child")
+        return 0
+
+    monkeypatch.setattr(sft_train, "_NvidiaSmiPeakSampler", Sampler)
+    monkeypatch.setattr(sft_train, "run_verl_training", train)
+    with pytest.raises(RuntimeError, match=f"{failure_stage} failed"):
+        sft_train.run_sft_train(spec, context=worker_context)
+    assert stopped == [True]

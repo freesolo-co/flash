@@ -285,23 +285,32 @@ class SftWorkloadProfile:
     created_at: float = field(default=0.0, compare=False)
 
     def __post_init__(self) -> None:
-        if self.schema_version != WORKLOAD_PROFILE_SCHEMA_VERSION:
+        if (
+            type(self.schema_version) is not int
+            or self.schema_version != WORKLOAD_PROFILE_SCHEMA_VERSION
+        ):
             raise ValueError("unsupported workload profile schema version")
         if self.kind != SFT_PROFILE_KIND:
             raise ValueError("sft workload profile kind must be 'sft'")
-        if len(self.input_digest) != 64 or any(
-            c not in "0123456789abcdef" for c in self.input_digest
+        if (
+            not isinstance(self.input_digest, str)
+            or len(self.input_digest) != 64
+            or any(c not in "0123456789abcdef" for c in self.input_digest)
         ):
             raise ValueError("input_digest must be a lowercase sha256 hex digest")
-        if not self.producer_version:
-            raise ValueError("producer_version is required")
-        if not self.tokenizer_revision:
-            raise ValueError("tokenizer_revision is required")
-        if not self.environment_id:
-            raise ValueError("environment_id is required")
-        if not self.environment_revision:
-            raise ValueError("environment_revision is required")
+        for name in (
+            "producer_version",
+            "tokenizer_revision",
+            "environment_id",
+            "environment_revision",
+            "architecture_mode",
+        ):
+            value = getattr(self, name)
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError(f"{name} must be a non-empty string")
         counts = {
+            "epochs": self.epochs,
+            "max_length": self.max_length,
             "source_examples": self.source_examples,
             "selected_examples": self.selected_examples,
             "retained_examples": self.retained_examples,
@@ -371,16 +380,18 @@ class SftWorkloadProfile:
             raise ValueError("examples per update must be positive")
         if self.derived_steps < 1 or self.authoritative_steps < 1:
             raise ValueError("step counts must be positive")
-        if self.packing_mode not in {"packed", "exact-unpacked"}:
+        if self.packing_mode not in ("packed", "exact-unpacked"):
             raise ValueError("packing_mode must be 'packed' or 'exact-unpacked'")
-        if not self.architecture_mode:
-            raise ValueError("architecture_mode is required")
-        if not math.isfinite(self.packing_efficiency) or not 0 < self.packing_efficiency <= 1:
+        if (
+            isinstance(self.packing_efficiency, bool)
+            or not isinstance(self.packing_efficiency, (int, float))
+            or not 0 < self.packing_efficiency <= 1
+        ):
             raise ValueError("packing_efficiency must be finite and in (0, 1]")
         expected_efficiency = self.real_tokens_per_epoch / self.padded_compute_tokens_per_epoch
         if not math.isclose(self.packing_efficiency, expected_efficiency, rel_tol=1e-12):
             raise ValueError("packing_efficiency does not match token aggregates")
-        if self.sample_policy not in {SFT_SAMPLE_POLICY_FULL, SFT_SAMPLE_POLICY_PREFIX}:
+        if self.sample_policy not in (SFT_SAMPLE_POLICY_FULL, SFT_SAMPLE_POLICY_PREFIX):
             raise ValueError("sample_policy must be 'exact-full' or 'exact-prefix'")
         if self.sample_policy == SFT_SAMPLE_POLICY_FULL and (
             self.selected_examples != self.source_examples
@@ -388,7 +399,11 @@ class SftWorkloadProfile:
             raise ValueError("an exact-full profile must select every source example")
         if isinstance(self.created_at, bool) or not isinstance(self.created_at, (int, float)):
             raise ValueError("created_at must be a number")
-        if not math.isfinite(self.created_at) or self.created_at < 0:
+        try:
+            finite_timestamp = math.isfinite(self.created_at)
+        except OverflowError:
+            finite_timestamp = False
+        if not finite_timestamp or self.created_at < 0:
             raise ValueError("created_at must be a non-negative unix timestamp")
 
     def _content(self) -> dict[str, object]:

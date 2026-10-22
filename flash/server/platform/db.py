@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import math
 import os
 import secrets
 import sqlite3
@@ -114,7 +115,7 @@ def busy_timeout_s() -> float:
         seconds = float(raw)
     except ValueError:
         return _DEFAULT_BUSY_TIMEOUT_S
-    return seconds if seconds > 0 else _DEFAULT_BUSY_TIMEOUT_S
+    return seconds if math.isfinite(seconds) and seconds > 0 else _DEFAULT_BUSY_TIMEOUT_S
 
 
 def _database_file_identity(path: str) -> tuple[int, int] | None:

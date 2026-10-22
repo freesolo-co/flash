@@ -9,6 +9,7 @@ from pydantic import (
     ConfigDict,
     Field,
     StrictBool,
+    StrictInt,
     field_validator,
     model_validator,
 )
@@ -71,11 +72,11 @@ class AdapterRecord(BaseModel):
     updated_at: str | None = None
     deployment_generation: str | None = Field(default=None, exclude=True)
     run_id: str | None = Field(default=None, exclude=True)
-    checkpoint_step: int | None = Field(default=None, exclude=True)
+    checkpoint_step: StrictInt | None = Field(default=None, exclude=True)
     artifact_revision: str | None = Field(default=None, exclude=True)
     artifact_digest: str | None = Field(default=None, exclude=True)
     artifact_fingerprint: str | None = Field(default=None, exclude=True)
-    lora_rank: int | None = Field(default=None, exclude=True)
+    lora_rank: StrictInt | None = Field(default=None, exclude=True)
 
     @field_validator("structured_outputs", mode="before")
     @classmethod
@@ -164,11 +165,11 @@ class ImmutableCheckpointRegistration(BaseModel):
     thinking: StrictBool
     structured_outputs: dict[str, Any] | None = Field(default=None)
     run_id: str
-    checkpoint_step: int | None
+    checkpoint_step: StrictInt | None
     artifact_revision: str
     artifact_digest: str
     artifact_fingerprint: str
-    lora_rank: int
+    lora_rank: StrictInt
 
     @field_validator("model_id", "repo_id", "base_model", "org_id", "checkpoint")
     @classmethod

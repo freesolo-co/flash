@@ -495,13 +495,13 @@ def _run_streaming_verl_subprocess(
         start_new_session=True,
     )
     process_group_id = proc.pid
-    if silence_watchdog is not None:
-        silence_watchdog.bind(
-            child_alive=lambda: proc.poll() is None,
-            teardown=lambda: kill_process_group(proc, process_group_id=process_group_id),
-        )
-        silence_watchdog.start()
     try:
+        if silence_watchdog is not None:
+            silence_watchdog.bind(
+                child_alive=lambda: proc.poll() is None,
+                teardown=lambda: kill_process_group(proc, process_group_id=process_group_id),
+            )
+            silence_watchdog.start()
         with _ChildExitWatchdog(
             proc, process_group_id=process_group_id, grace_s=_ORPHANED_PIPE_GRACE_S
         ) as watchdog:

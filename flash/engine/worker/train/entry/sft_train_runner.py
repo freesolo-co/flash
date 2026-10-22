@@ -862,14 +862,37 @@ def _record_sft_step_metrics(
         values["lr"] = learning_rate_value
 
 
-def _finish_sft_child(
-    gpu_sampler,
-    train_started_at: float,
-    return_code: int,
+def _run_sft_child(
+    child: _SftChild,
+    update_horizon: int,
     progress: _SftProgress,
+    on_line,
+    *,
+    context: WorkerContext,
 ) -> tuple[float, float]:
+    callbacks = _SftProgressCallbacks(progress, context=context)
+    gpu_sampler = _sft_train._NvidiaSmiPeakSampler().start()
+    train_started_at = time.time()
+    return_code = 0
+    try:
+        if child.resume_step < update_horizon:
+            child.watcher.start()
+            training_completed = False
+            try:
+                with liveness_heartbeat(
+                    "sft_step",
+                    progress=lambda: int(progress.values["step"] or 0),
+                    progress_step=True,
+                    context=context,
+                ):
+                    return_code = _invoke_sft_child(child, callbacks, on_line, context=context)
+                    training_completed = return_code == 0
+            finally:
+                # A failed child cannot prove save completeness; preserve its failure.
+                child.watcher.stop(require_complete=training_completed)
+    finally:
+        device_peak_gpu_gb = gpu_sampler.stop_gb()
     train_wall = time.time() - train_started_at
-    device_peak_gpu_gb = gpu_sampler.stop_gb()
     if return_code != 0:
         raise RuntimeError(f"verl SFT subprocess exited with status {return_code}")
     # belt and braces behind the first-step check in _consume_sft_marker_line, for a child whose

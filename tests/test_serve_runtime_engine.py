@@ -1249,3 +1249,39 @@ def test_engine_receives_the_resolved_local_tokenizer_path(monkeypatch):
     assert _Engine.args.tokenizer == "/cache/tokenizer-snapshot"
     assert runtime.health().served_model == "served/model"
     asyncio.run(runtime.close())
+
+
+def test_stream_cleanup_failure_still_releases_prompt_images(monkeypatch) -> None:
+    from flash.serve.runtime.prompt import PreparedPrompt
+
+    closed = []
+    prompt = PreparedPrompt(
+        {"prompt_token_ids": [20, 21]},
+        images=(SimpleNamespace(close=lambda: closed.append(True)),),
+    )
+
+    async def prepare(*_args):
+        return prompt
+
+    async def fail_close(output_stream):
+        await output_stream.aclose()
+        raise RuntimeError("stream cleanup failed")
+
+    runtime = VllmLoraRuntime(EngineConfig(model="model"))
+    monkeypatch.setattr(runtime, "_prepare_prompt", prepare)
+    monkeypatch.setattr(runtime, "_close_output_stream", fail_close)
+
+    async def run():
+        await runtime.start()
+        engine = _Engine.latest
+        assert engine is not None
+        engine.responses.append([_output("ok", [1])])
+        try:
+            with pytest.raises(RuntimeError, match="stream cleanup failed"):
+                async for _event in runtime.stream(GenerationRequest(prompt="hello")):
+                    pass
+            assert closed == [True]
+        finally:
+            await runtime.close()
+
+    asyncio.run(run())

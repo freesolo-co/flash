@@ -336,12 +336,13 @@ class VerlChildSilenceWatchdog:
             return
         if self._child_alive is None or self._teardown is None:
             raise RuntimeError("verl child silence watchdog is not bound")
-        self._thread = threading.Thread(
+        thread = threading.Thread(
             target=self._watch,
             name="verl-child-silence-watchdog",
             daemon=True,
         )
-        self._thread.start()
+        thread.start()
+        self._thread = thread
 
     def stop(self) -> None:
         self._stop.set()

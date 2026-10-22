@@ -128,7 +128,7 @@ class MyEnv(EnvironmentSingleTurn):
         return [{"role": "user", "content": example.input}]
 
     def score_response(self, example: TaskExample, response_text: str) -> RewardResult:
-        expected = str(example.output or "").strip()
+        expected = str(example.output if example.output is not None else "").strip()
         score = 1.0 if expected and expected in response_text else 0.0
         return RewardResult(score=score, threshold=1.0)
 

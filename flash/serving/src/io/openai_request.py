@@ -72,7 +72,7 @@ class OpenAIGenerateRequest(GenerateRequest):
         normalized = normalize_tools(value["tools"])
         updated = dict(value)
         updated["tools"] = tools_wire(normalized)
-        if updated.get("tool_choice") not in {"auto", "none"}:
+        if updated.get("tool_choice") not in ("auto", "none"):
             raise ValueError("tool_choice must be auto or none")
         if updated.get("parallel_tool_calls") is not True:
             raise ValueError("parallel_tool_calls must be true")

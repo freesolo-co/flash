@@ -1031,9 +1031,10 @@ def test_packaged_route_treats_tool_choice_none_as_inactive() -> None:
         _raw_chat_body('"chat_template_kwargs": {"nested": NaN}'),
         _raw_chat_body('"structured_outputs": {"json": {"maximum": Infinity}}'),
         _raw_chat_body('"temperature": -Infinity'),
+        pytest.param("[" * 10000 + "0" + "]" * 10000, id="excessive-nesting"),
     ],
 )
-def test_non_finite_json_constants_are_rejected_as_invalid_json(body: str) -> None:
+def test_invalid_json_constants_and_nesting_are_rejected(body: str) -> None:
     """`NaN` and `Infinity` are python spellings, not json, and must not reach the runtime.
 
     `json.loads` accepts them by default. `temperature` and `top_p` are guarded by `math.isfinite`,

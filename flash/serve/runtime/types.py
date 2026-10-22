@@ -204,7 +204,10 @@ def _normalize_stop(value: Any, name: str) -> tuple[str, ...]:
 def _require_finite_number(value: Any, name: str) -> float:
     if isinstance(value, bool) or not isinstance(value, int | float):
         raise RuntimeConfigurationError(f"{name} must be a finite number")
-    normalized = float(value)
+    try:
+        normalized = float(value)
+    except OverflowError as exc:
+        raise RuntimeConfigurationError(f"{name} must be a finite number") from exc
     if not math.isfinite(normalized):
         raise RuntimeConfigurationError(f"{name} must be a finite number")
     return normalized
@@ -434,7 +437,8 @@ class GenerationRequest:
         if has_prompt == has_messages:
             raise RuntimeConfigurationError("exactly one of prompt or messages is required")
         if self.prompt is not None:
-            object.__setattr__(self, "prompt", _nonempty(self.prompt, "prompt"))
+            # Validate without trimming: whitespace is part of the model's input.
+            _nonempty(self.prompt, "prompt")
         if self.messages is not None:
             if isinstance(self.messages, str) or not isinstance(self.messages, Sequence):
                 raise RuntimeConfigurationError("messages must be a sequence of mappings")

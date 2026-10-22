@@ -151,7 +151,9 @@ def package_image_path(
     root = package_root.resolve()
     dataset_root = (root / "dataset").resolve()
     resolved = (root / candidate).resolve()
-    if resolved != dataset_root and dataset_root not in resolved.parents:
+    if root not in dataset_root.parents or (
+        resolved != dataset_root and dataset_root not in resolved.parents
+    ):
         raise ValueError("image paths must stay inside the environment package dataset/ directory")
     if not resolved.is_file():
         raise ValueError(f"image path does not exist: {value!r}")

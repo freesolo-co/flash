@@ -5,7 +5,6 @@ from __future__ import annotations
 from fastapi import HTTPException
 
 import flash.runner.results.checkpoints as run_checkpoints
-import flash.server.routes.serving_revisions as serving_revisions
 from flash.content.multimodal import messages_with_image_data_uris, normalize_prompt_images
 from flash.core.spec import JobSpec
 from flash.runner.lifecycle.state import adapter_prefix
@@ -106,11 +105,7 @@ def _resolve_deployable_target(
             status_code=409,
             detail=f"run {run_id} is 'dry_run'; dry-run runs cannot be {action}ed",
         )
-    if (
-        enforce_state
-        and not is_checkpoint
-        and status.state not in serving_revisions._DEPLOYABLE_STATES
-    ):
+    if enforce_state and not is_checkpoint and status.state not in _DEPLOYABLE_STATES:
         detail = (
             f"run {run_id} is {status.state!r}; only finished runs with trained adapter "
             f"artifacts can be {'deployed' if action == 'deploy' else 'exported'}"
