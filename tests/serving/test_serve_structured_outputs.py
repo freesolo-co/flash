@@ -66,8 +66,8 @@ def modal_app_module(load_modal_app_under_stub):
 class _Tok:
     """Prompt-path tokenizer stand-in (one int per codepoint)."""
 
-    def get_vocab(self) -> dict[str, int]:
-        return {"<think>": 151667, "</think>": 151668}
+    def convert_tokens_to_ids(self, token: str) -> int | None:
+        return {"<think>": 151667, "</think>": 151668}.get(token)
 
     def encode(self, text: str, add_special_tokens: bool = False) -> list[int]:
         return [ord(c) for c in text]

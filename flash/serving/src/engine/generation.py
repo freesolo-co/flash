@@ -224,9 +224,7 @@ async def generate(
     )
     _reject_tools_with_structured_outputs(payload, structured)
     reasoning_counter = ReasoningTokenCounter(
-        thinking=thinking,
-        parser=getattr(owner, "reasoning_parser", None),
-        tokenizer=getattr(owner, "tokenizer", None),
+        owner._reasoning_usage_token_ids if thinking else None
     )
     sampling = _sampling_params(payload, structured, RequestOutputKind.FINAL_ONLY)
     request_id = generation_id or payload.generation_id or f"fsgen-{uuid.uuid4().hex}"
@@ -439,9 +437,7 @@ async def stream_generate(
     )
     _reject_tools_with_structured_outputs(payload, structured)
     reasoning_counter = ReasoningTokenCounter(
-        thinking=thinking,
-        parser=getattr(owner, "reasoning_parser", None),
-        tokenizer=getattr(owner, "tokenizer", None),
+        owner._reasoning_usage_token_ids if thinking else None
     )
     sampling = _sampling_params(payload, structured, RequestOutputKind.DELTA)
     request_id = generation_id or payload.generation_id or f"fsgen-{uuid.uuid4().hex}"

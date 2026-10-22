@@ -7,7 +7,7 @@ import pytest
 
 from flash.serving.src.accounting.usage_facts import usage_facts
 from flash.serving.src.accounting.usage_outbox import UsageOutboxError
-from flash.serving.src.engine.reasoning_usage import ReasoningTokenCounter
+from flash.serving.src.engine.reasoning_usage import ReasoningTokenCounter, reasoning_token_ids
 from tests.serving import test_serve_structured_outputs as structured_helpers
 
 modal_app_module = structured_helpers.modal_app_module
@@ -30,9 +30,8 @@ END = 151668
     ],
 )
 def test_reasoning_count_is_independent_of_chunk_boundaries(tokens, expected):
-    tokenizer = SimpleNamespace(get_vocab=lambda: {"<think>": START, "</think>": END})
     for boundary in range(len(tokens) + 1):
-        counter = ReasoningTokenCounter(thinking=True, parser="qwen3", tokenizer=tokenizer)
+        counter = ReasoningTokenCounter((START, END))
         counter.consume(0, tokens[:boundary])
         counter.consume(0, tokens[boundary:])
         assert counter.total == expected
@@ -41,18 +40,16 @@ def test_reasoning_count_is_independent_of_chunk_boundaries(tokens, expected):
 @pytest.mark.parametrize("vocab", [{}, {"<think>": START}, {"<think>": 1, "</think>": 1}])
 def test_missing_native_boundaries_fail_closed(vocab):
     with pytest.raises(ValueError, match="native think token IDs"):
-        ReasoningTokenCounter(
-            thinking=True, parser="qwen3", tokenizer=SimpleNamespace(get_vocab=lambda: vocab)
-        )
+        reasoning_token_ids("qwen3", SimpleNamespace(convert_tokens_to_ids=vocab.get))
 
 
 def test_unqualified_parser_fails_closed():
     with pytest.raises(ValueError, match="qwen3"):
-        ReasoningTokenCounter(thinking=True, parser="unknown", tokenizer=None)
+        reasoning_token_ids("unknown", None)
 
 
 def test_non_thinking_does_not_require_parser_or_tokenizer():
-    counter = ReasoningTokenCounter(thinking=False, parser=None, tokenizer=None)
+    counter = ReasoningTokenCounter(None)
     counter.consume(0, [START, 1, END])
     assert counter.total == 0
 
@@ -141,3 +138,43 @@ def test_invalid_thinking_counts_cannot_settle(reasoning):
                 "reasoning_tokens": reasoning,
             }
         )
+
+
+def test_boundary_lookup_is_cached_per_engine_without_loading_vocab(modal_app_module):
+    calls = []
+
+    class Tokenizer(structured_helpers._Tok):
+        def get_vocab(self):
+            raise AssertionError("must not copy the vocabulary on the serving loop")
+
+        def convert_tokens_to_ids(self, token):
+            calls.append(token)
+            return super().convert_tokens_to_ids(token)
+
+    eng = structured_helpers._engine(modal_app_module, thinking=True)
+    eng.tokenizer = Tokenizer()
+    eng.engine = _NativeEngine([_batch(_output(0, [10, END], "stop"))])
+    payload = {"model_id": "r1", "prompt": "hi"}
+    record = structured_helpers._forwarded_record(eng, "r1")
+    first = asyncio.run(eng._generate(payload, record))
+    second = asyncio.run(eng._generate(payload, record))
+
+    async def stream():
+        return [event async for event in eng._stream_generate(payload, record)]
+
+    events = asyncio.run(stream())
+    assert (
+        first["reasoning_tokens"]
+        == second["reasoning_tokens"]
+        == events[-1]["reasoning_tokens"]
+        == 1
+    )
+    assert calls == ["<think>", "</think>"]
+
+
+def test_missing_boundary_must_not_resolve_to_unknown_token():
+    tokenizer = SimpleNamespace(
+        unk_token_id=0, convert_tokens_to_ids=lambda token: START if token == "<think>" else 0
+    )
+    with pytest.raises(ValueError, match="native think token IDs"):
+        reasoning_token_ids("qwen3", tokenizer)

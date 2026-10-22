@@ -4,6 +4,24 @@ from collections.abc import Iterable
 from typing import Any
 
 
+def reasoning_token_ids(parser: str | None, tokenizer: Any) -> tuple[int, int]:
+    """Resolve only the boundary IDs; never materialize the tokenizer vocabulary."""
+    if parser != "qwen3":
+        raise ValueError("thinking usage requires the qwen3 reasoning parser")
+    start = tokenizer.convert_tokens_to_ids("<think>")
+    end = tokenizer.convert_tokens_to_ids("</think>")
+    unknown = getattr(tokenizer, "unk_token_id", None)
+    if (
+        type(start) is not int
+        or type(end) is not int
+        or start == end
+        or min(start, end) < 0
+        or unknown in (start, end)
+    ):
+        raise ValueError("thinking usage requires distinct native think token IDs")
+    return start, end
+
+
 class ReasoningTokenCounter:
     """Match Flash's first-close reasoning split without re-tokenizing rendered text.
 
@@ -14,27 +32,12 @@ class ReasoningTokenCounter:
     the first closing token arrives, subsequent tokens never reopen reasoning.
     """
 
-    def __init__(self, *, thinking: bool, parser: str | None, tokenizer: Any) -> None:
+    def __init__(self, token_ids: tuple[int, int] | None) -> None:
         self.total = 0
-        self._thinking = thinking
+        self._thinking = token_ids is not None
         self._seen: set[int] = set()
         self._ended: set[int] = set()
-        self._start: int | None = None
-        self._end: int | None = None
-        if not thinking:
-            return
-        if parser != "qwen3":
-            raise ValueError("thinking usage requires the qwen3 reasoning parser")
-        vocab = tokenizer.get_vocab()
-        self._start = vocab.get("<think>")
-        self._end = vocab.get("</think>")
-        if (
-            type(self._start) is not int
-            or type(self._end) is not int
-            or self._start == self._end
-            or min(self._start, self._end) < 0
-        ):
-            raise ValueError("thinking usage requires distinct native think token IDs")
+        self._start, self._end = token_ids if token_ids is not None else (None, None)
 
     def consume(self, index: int, token_ids: Iterable[int]) -> None:
         if not self._thinking or index in self._ended:

@@ -509,7 +509,7 @@ def _engine_impl(*, processor: Any = None) -> _LoraEngineImpl:
     engine.base_model = QWEN
     engine.processor = processor
     engine.tokenizer = types.SimpleNamespace(
-        get_vocab=lambda: {"<think>": 151667, "</think>": 151668}
+        convert_tokens_to_ids=lambda token: {"<think>": 151667, "</think>": 151668}.get(token)
     )
     engine.reasoning_parser = "qwen3"
     engine.registry = AdapterRegistry()
