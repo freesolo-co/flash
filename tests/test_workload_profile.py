@@ -15,7 +15,7 @@ from flash.engine.profiling.workload_profile import (
 
 def _spec() -> JobSpec:
     return JobSpec(
-        model="Qwen/Qwen3.5-0.8B",
+        model="Qwen/Qwen3.5-9B",
         model_revision="a" * 40,
         model_revision_auto=True,
         algorithm="sft",
@@ -72,6 +72,33 @@ def _profile(**overrides) -> SftWorkloadProfile:
     }
     values.update(overrides)
     return SftWorkloadProfile(**values)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("input_digest", None),
+        ("input_digest", ["a"] * 64),
+        ("schema_version", 7.0),
+        ("producer_version", 3),
+        ("tokenizer_revision", ["revision"]),
+        ("environment_id", {"id": "env"}),
+        ("environment_revision", True),
+        ("architecture_mode", 1),
+        ("epochs", True),
+        ("epochs", 1.5),
+        ("max_length", 100.5),
+        ("max_length", "100"),
+        ("packing_mode", []),
+        ("sample_policy", {}),
+        ("packing_efficiency", "0.75"),
+        ("packing_efficiency", 10**400),
+        ("created_at", 10**400),
+    ],
+)
+def test_malformed_profile_scalars_raise_validation_errors(field, value) -> None:
+    with pytest.raises(ValueError, match=field.replace("_", "[_ ]")):
+        _profile(**{field: value})
 
 
 def test_sft_profile_round_trips_with_a_verified_content_digest() -> None:

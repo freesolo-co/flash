@@ -24,7 +24,7 @@ import pathlib
 from dataclasses import fields
 
 import flash.engine.profiling.sft_workload as sft_workload_mod
-import flash.engine.worker.sft_train as sft_train_mod
+import flash.engine.worker.train.entry.sft_train as sft_train_mod
 from flash.core.spec import EnvironmentSpec, JobSpec, TrainSpec
 from flash.engine.plan.recipe import RECIPE
 from flash.engine.profiling.sft_workload import sft_max_length as _measured_max_length
@@ -59,7 +59,7 @@ def test_sft_context_length_resolves_the_authored_window_or_the_mode_cap():
         recipe_cap = RECIPE.sft.max_seq_len_thinking if thinking else RECIPE.sft.max_seq_len
         for mct in (None, 2048, 3072):
             spec = JobSpec(
-                model="Qwen/Qwen3.5-4B",
+                model="Qwen/Qwen3.5-9B",
                 algorithm="sft",
                 thinking=thinking,
                 environment=EnvironmentSpec(id="team/example", resolved_sha="b" * 40),
@@ -77,7 +77,7 @@ def test_trainer_and_quote_read_the_one_measured_window():
     workload module produced. So the guard is that no other derivation exists -- the trainer takes
     ``profile.max_length`` and the quote takes the same field off the same artifact.
     """
-    from flash.cost.spec import runconfig_from_spec
+    from flash.cost.spec import run_config_from_spec
 
     trainer_src = "".join(pathlib.Path(sft_train_mod.__file__).read_text().split())
     assert "max_length=profile.max_length" in trainer_src
@@ -87,9 +87,9 @@ def test_trainer_and_quote_read_the_one_measured_window():
 
     spec = attach_sft_profile(
         JobSpec(
-            model="Qwen/Qwen3.5-4B",
+            model="Qwen/Qwen3.5-9B",
             algorithm="sft",
             train=TrainSpec(max_context_tokens=3072, max_examples=8),
         )
     )
-    assert runconfig_from_spec(spec).seq_len == spec.workload_profile["max_length"] == 3072
+    assert run_config_from_spec(spec).seq_len == spec.workload_profile["max_length"] == 3072

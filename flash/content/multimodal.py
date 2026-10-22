@@ -34,11 +34,13 @@ MAX_IMAGE_PIXELS = MAX_TOTAL_DECODED_BYTES // _image_descriptors.WORST_BYTES_PER
 MAX_DATA_URI_HEADER_BYTES = 1024
 MAX_IMAGE_DESCRIPTOR_BYTES = 64 * 1024 * 1024
 MAX_TOTAL_IMAGE_DESCRIPTOR_BYTES = 64 * 1024 * 1024
-_IMAGE_BLOCK_TYPES = frozenset({"image", "image_url", "input_image"})
-_IMAGE_TARGET_BLOCK_TYPES = frozenset({*_IMAGE_BLOCK_TYPES, "output_image"})
-_TEXT_BLOCK_TYPES = frozenset({"text", "input_text"})
-_IMAGE_DETAIL_VALUES = frozenset({"auto", "low", "high"})
-_ALLOWED_MESSAGE_ROLES = frozenset({"system", "user", "assistant", "tool"})
+# These predicates see unvalidated JSON values, including arrays and objects.
+# Tuple membership rejects those values without requiring them to be hashable.
+_IMAGE_BLOCK_TYPES = ("image", "image_url", "input_image")
+_IMAGE_TARGET_BLOCK_TYPES = (*_IMAGE_BLOCK_TYPES, "output_image")
+_TEXT_BLOCK_TYPES = ("text", "input_text")
+_IMAGE_DETAIL_VALUES = ("auto", "low", "high")
+_ALLOWED_MESSAGE_ROLES = ("system", "user", "assistant", "tool")
 IMAGE_TEACHER_PLACEHOLDER = "<|media_pad|>"
 # the model's real image-expansion token, as opposed to the placeholder above. one definition so
 # the renderer's rejection and the teacher client's drop guard cannot drift apart.
@@ -325,6 +327,9 @@ def _reject_literal_image_placeholder(
 
 def image_teacher_prompt_messages(messages: list[dict], descriptor_count: int) -> list[dict]:
     """Render normalized image blocks as Kimi media placeholders without changing text order."""
+    from flash.content.thinking import _messages_for_content_only_serialization
+
+    messages = _messages_for_content_only_serialization(messages)
     rendered: list[dict] = []
     image_count = 0
     for message_index, message in enumerate(messages):
@@ -683,7 +688,12 @@ def messages_with_decoded_images(messages: list[dict], images: list[object]) -> 
             for block in content:
                 copied_block = dict(block)
                 if copied_block.get("type") == "image":
-                    copied_block["image"] = next(image_iter)
+                    try:
+                        copied_block["image"] = next(image_iter)
+                    except StopIteration as exc:
+                        raise ValueError(
+                            "normalized messages contain more image blocks than decoded images"
+                        ) from exc
                 blocks.append(copied_block)
             copied["content"] = blocks
         prepared.append(copied)
@@ -852,7 +862,7 @@ def preflight_validate_image_opd(spec, *, scan_packaged_environment: bool = True
     else:
         if not scan_packaged_environment:
             return
-        from flash.envs.loader import (
+        from flash.envs.loading.loader import (
             _packaged_dataset_file,
             _resolve_environment_reference,
             _resolve_path_arg,

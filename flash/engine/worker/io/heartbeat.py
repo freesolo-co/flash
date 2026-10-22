@@ -1,8 +1,4 @@
-"""Worker heartbeat: stream stage/progress to the HF artifact repo.
-
-Monkeypatch contract: all patchable knobs live on the worker package (_w); locks/frozensets live
-here. Tests that monkeypatch worker.<name> then call worker.heartbeat(...) take effect.
-"""
+"""stream worker stage and progress heartbeats to the artifact repository."""
 
 from __future__ import annotations
 
@@ -15,14 +11,21 @@ import re
 import sys
 import threading
 import time
+from _thread import LockType
+from dataclasses import dataclass, field
 from typing import Any
 
+import flash.engine.worker.perf as worker_perf
 from flash.engine.result.rollout_samples import (
     select_rollout_samples,
 )
-from flash.engine.worker.perf import gpu_diagnostics
-from flash.engine.worker.runtime.pkg_proxy import W as _w
+from flash.engine.worker.io import hf as hf_io
+from flash.engine.worker.runtime.state import WorkerContext
 from flash.engine.worker.verl.parent_work import ParentWorkGauge
+
+_HB_MIN_INTERVAL_S = 900.0
+_HB_FORCE_MIN_INTERVAL_S = 60.0
+_HB_SETUP_LIVENESS_INTERVAL_S = 240.0
 
 # Setup-phase liveness stages: emitted from a 30s liveness thread WITH a progress callback during the
 # cold download / model-load / split-scan phase, kept on the tighter setup-liveness upload cadence
@@ -66,7 +69,6 @@ _HB_TIGHT_LIVENESS_STAGES = _HB_SETUP_LIVENESS_STAGES | _HB_UPLOAD_LIVENESS_STAG
 
 # latest per-step GRPO backlog, exposed so a top-level error heartbeat can preserve it
 # for `flash runs log -f` when a short run raises before the throttled rl_step ping committed
-LATEST_GRPO_METRICS_LAST: list = []
 # throttle these stages to protect the hf repository commit budget; terminal transitions are never throttled.
 # opd_filtering_prompts emits a real heartbeat on each scan tick, while opd_prompt_scan and
 # opd_image_prep emit one when progress advances. opd_finalizing emits one on every keepalive tick.
@@ -81,6 +83,22 @@ _HB_MODEL_LOAD_STAGES = frozenset({"sft_model_load", "opd_model_load"})
 _HB_SUCCESS_TERMINAL_STAGES = frozenset({"done", "already_done"})
 # 600s -> ~6 commits/hr; keeps stall detector alive without hitting the HF commit cap.
 _HB_TERMINAL_ONLY_INTERVAL_S = 600.0
+
+
+@dataclass
+class HeartbeatState:
+    last_upload: float = 0.0
+    last_progress_ts: float = 0.0
+    progress_seq: int = 0
+    progress_uploaded_seq: int = 0
+    pending_checkpoint_failure: dict | None = None
+    last_committed_step: int = 0
+    last_forced_upload: float = 0.0
+    terminal_only: bool = False
+    metrics_last: list = field(default_factory=list)
+    lock: LockType = field(default_factory=threading.Lock)
+    upload_lock: LockType = field(default_factory=threading.Lock)
+    upload_in_flight: bool = False
 
 
 def _is_terminal_stage(stage: str) -> bool:
@@ -103,9 +121,7 @@ def _is_critical_stage(stage: str) -> bool:
 
 # Guards throttle bookkeeping; slow HF commit runs outside this lock so heartbeat and liveness
 # threads don't block on the network.
-_HB_LOCK = threading.Lock()
 # Serializes HF commits to prevent reorder; each thread uploads its own per-call temp file.
-_HB_UPLOAD_LOCK = threading.Lock()
 # Terminal/error commits wait longer — no later heartbeat can repair them.
 _HB_UPLOAD_LOCK_TIMEOUT_S = 30.0
 _HB_CRITICAL_UPLOAD_LOCK_TIMEOUT_S = 120.0
@@ -121,7 +137,6 @@ _HB_CRITICAL_UPLOAD_LOCK_TIMEOUT_S = 120.0
 # back when the commit fails, and the rollback has to decide whether a NEWER heartbeat already
 # moved the clock (the reason the old code carried a claim sequence). This says only "a commit is
 # in flight right now", is cleared in a finally, and so cannot strand the throttle on a failure.
-_HB_UPLOAD_IN_FLIGHT = False
 # retain at least one metric row per second across the 900s training heartbeat throttle window.
 GRPO_METRIC_HISTORY_LIMIT = 1024
 
@@ -152,10 +167,10 @@ def _console_heartbeat_snapshot(
     return json.dumps(console_payload)
 
 
-def _set_upload_in_flight(value: bool) -> None:
+def _set_upload_in_flight(value: bool, *, context: WorkerContext) -> None:
     """Mark whether an HF heartbeat commit is running. Call with _HB_LOCK held."""
-    global _HB_UPLOAD_IN_FLIGHT
-    _HB_UPLOAD_IN_FLIGHT = value
+
+    context.heartbeat_state.upload_in_flight = value
 
 
 def _heartbeat_upload_due(
@@ -167,6 +182,7 @@ def _heartbeat_upload_due(
     first_timing: bool,
     fields: dict,
     now: float,
+    context: WorkerContext,
 ) -> bool:
     """return eligibility from committed throttle state while _HB_LOCK is held."""
     if initial or _is_critical_stage(stage):
@@ -185,28 +201,31 @@ def _heartbeat_upload_due(
     #     dropping one to avoid a wait could under-report a step the run really finished.
     # the daemon's own pings are never forced (liveness and keepalive both leave it False), so this
     # exemption does not reopen the stall it fixes.
-    if _HB_UPLOAD_IN_FLIGHT and not force:
+    if context.heartbeat_state.upload_in_flight and not force:
         return False
-    if _w._HB_TERMINAL_ONLY:
+    if context.heartbeat_state.terminal_only:
         return (
-            _w._HB_LAST_UPLOAD == 0.0 or (now - _w._HB_LAST_UPLOAD) >= _HB_TERMINAL_ONLY_INTERVAL_S
+            context.heartbeat_state.last_upload == 0.0
+            or (now - context.heartbeat_state.last_upload) >= _HB_TERMINAL_ONLY_INTERVAL_S
         )
     throttled = stage in _HB_THROTTLED_STAGES
     if stage in _HB_MODEL_LOAD_STAGES and not liveness:
         throttled = False
-    interval_s = _w._HB_MIN_INTERVAL_S
+    interval_s = _HB_MIN_INTERVAL_S
     if stage in _HB_TIGHT_LIVENESS_STAGES:
-        interval_s = min(interval_s, _w._HB_SETUP_LIVENESS_INTERVAL_S)
-    upload_due = not throttled or (now - _w._HB_LAST_UPLOAD) >= interval_s
+        interval_s = min(interval_s, _HB_SETUP_LIVENESS_INTERVAL_S)
+    upload_due = not throttled or (now - context.heartbeat_state.last_upload) >= interval_s
     if force and not upload_due:
         step = fields.get("step")
         has_samples = bool(fields.get("sampled_completions"))
         force_step_due = isinstance(step, (int, float)) and (
-            step > _w._HB_LAST_COMMITTED_STEP
-            or (has_samples and step == _w._HB_LAST_COMMITTED_STEP)
+            step > context.heartbeat_state.last_committed_step
+            or (has_samples and step == context.heartbeat_state.last_committed_step)
         )
         first_timing_due = first_timing and "step_duration_s" in fields
-        force_floor_due = (now - _w._HB_LAST_FORCED_UPLOAD) >= _w._HB_FORCE_MIN_INTERVAL_S
+        force_floor_due = (
+            now - context.heartbeat_state.last_forced_upload
+        ) >= _HB_FORCE_MIN_INTERVAL_S
         upload_due = force_step_due and (first_timing_due or force_floor_due)
     return upload_due
 
@@ -218,37 +237,41 @@ def heartbeat(
     force: bool = False,
     initial: bool = False,
     first_timing: bool = False,
+    context: WorkerContext,
     **kw,
 ):
+
     genuine_progress = not liveness
-    with _HB_LOCK:
+    with context.heartbeat_state.lock:
         if stage == "checkpoint_upload_failed":
             failure = kw.get("checkpoint_failure")
             if isinstance(failure, dict):
-                _w._HB_PENDING_CHECKPOINT_FAILURE = dict(failure)
+                context.heartbeat_state.pending_checkpoint_failure = dict(failure)
         elif stage == "checkpoint_uploaded":
             # a later full resume checkpoint landed, so the earlier failure no longer describes the
             # run's outcome. deployable or final adapter publication cannot clear this because neither
             # restores the missing full resume state.
-            _w._HB_PENDING_CHECKPOINT_FAILURE = None
-        elif _is_terminal_stage(stage) and _w._HB_PENDING_CHECKPOINT_FAILURE:
-            kw.setdefault("checkpoint_failure", dict(_w._HB_PENDING_CHECKPOINT_FAILURE))
+            context.heartbeat_state.pending_checkpoint_failure = None
+        elif _is_terminal_stage(stage) and context.heartbeat_state.pending_checkpoint_failure:
+            kw.setdefault(
+                "checkpoint_failure", dict(context.heartbeat_state.pending_checkpoint_failure)
+            )
         ts = time.time()
         if genuine_progress:
-            _w._HB_LAST_PROGRESS_TS = ts
-            _w._HB_PROGRESS_SEQ += 1
-        elif _w._HB_PROGRESS_SEQ > _w._HB_PROGRESS_UPLOADED_SEQ:
+            context.heartbeat_state.last_progress_ts = ts
+            context.heartbeat_state.progress_seq += 1
+        elif context.heartbeat_state.progress_seq > context.heartbeat_state.progress_uploaded_seq:
             # carry real progress that has not reached hf yet.
             liveness = False
-        latest_progress_ts = float(_w._HB_LAST_PROGRESS_TS or 0.0)
-        my_progress_seq = _w._HB_PROGRESS_SEQ
+        latest_progress_ts = float(context.heartbeat_state.last_progress_ts or 0.0)
+        my_progress_seq = context.heartbeat_state.progress_seq
     payload = {
         "stage": stage,
         "ts": ts,
-        "run_id": _w.RUN_ID,
-        "mode": _w.RUN_MODE,
-        "seed": _w.SEED,
-        "attempt": _w.ATTEMPT,
+        "run_id": context.config.run_id,
+        "mode": context.config.run_mode,
+        "seed": context.config.seed,
+        "attempt": context.config.attempt,
         **({"liveness": True} if liveness else {}),
         **kw,
     }
@@ -258,11 +281,11 @@ def heartbeat(
         payload["progress_age_s"] = round(max(0.0, ts - latest_progress_ts), 1)
     else:
         payload.pop("progress_age_s", None)
-    dc = os.environ.get("RUNPOD_DC_ID") or ""
+    dc = os.environ.get("MODAL_REGION") or ""
     if dc:
         payload.setdefault("dc", dc)
     snapshot = json.dumps(payload)
-    with _HB_LOCK:
+    with context.heartbeat_state.lock:
         upload_due = _heartbeat_upload_due(
             stage,
             liveness=liveness,
@@ -271,14 +294,15 @@ def heartbeat(
             first_timing=first_timing,
             fields=kw,
             now=time.time(),
+            context=context,
         )
     payload_committed = False
     if upload_due:
         critical = _is_critical_stage(stage)
         lock_timeout = _HB_CRITICAL_UPLOAD_LOCK_TIMEOUT_S if critical else _HB_UPLOAD_LOCK_TIMEOUT_S
-        if _HB_UPLOAD_LOCK.acquire(timeout=lock_timeout):
+        if context.heartbeat_state.upload_lock.acquire(timeout=lock_timeout):
             try:
-                with _HB_LOCK:
+                with context.heartbeat_state.lock:
                     upload_due = _heartbeat_upload_due(
                         stage,
                         liveness=liveness,
@@ -287,47 +311,53 @@ def heartbeat(
                         first_timing=first_timing,
                         fields=kw,
                         now=time.time(),
+                        context=context,
                     )
                 if upload_due:
                     up = f"/tmp/.hb-upload-{os.getpid()}-{threading.get_ident()}.json"
                     with open(up, "w") as f:
                         f.write(snapshot)
-                    with _HB_LOCK:
-                        _set_upload_in_flight(True)
+                    with context.heartbeat_state.lock:
+                        _set_upload_in_flight(True, context=context)
                     try:
                         if initial:
-                            committed = _w.hf_upload_file(up, "heartbeat.json", required=True)
+                            committed = hf_io.hf_upload_file(
+                                up, "heartbeat.json", required=True, context=context
+                            )
                         else:
-                            committed = _w.hf_upload_file(up, "heartbeat.json")
+                            committed = hf_io.hf_upload_file(up, "heartbeat.json", context=context)
                     finally:
                         # cleared before the throttle clock is advanced below, and in a finally so a
                         # raising upload cannot leave every later heartbeat permanently skipped.
-                        with _HB_LOCK:
-                            _set_upload_in_flight(False)
+                        with context.heartbeat_state.lock:
+                            _set_upload_in_flight(False, context=context)
                         with contextlib.suppress(OSError):
                             os.remove(up)
                     if committed is False:
                         print(f"HEARTBEAT upload failed for {stage}")
                     else:
                         payload_committed = True
-                        with _HB_LOCK:
+                        with context.heartbeat_state.lock:
                             committed_at = time.time()
-                            _w._HB_LAST_UPLOAD = committed_at
+                            context.heartbeat_state.last_upload = committed_at
                             if force:
-                                _w._HB_LAST_FORCED_UPLOAD = committed_at
+                                context.heartbeat_state.last_forced_upload = committed_at
                             committed_step = kw.get("step")
                             if (
                                 isinstance(committed_step, (int, float))
-                                and committed_step > _w._HB_LAST_COMMITTED_STEP
+                                and committed_step > context.heartbeat_state.last_committed_step
                             ):
-                                _w._HB_LAST_COMMITTED_STEP = int(committed_step)
-                            if not liveness and my_progress_seq > _w._HB_PROGRESS_UPLOADED_SEQ:
-                                _w._HB_PROGRESS_UPLOADED_SEQ = my_progress_seq
+                                context.heartbeat_state.last_committed_step = int(committed_step)
+                            if (
+                                not liveness
+                                and my_progress_seq > context.heartbeat_state.progress_uploaded_seq
+                            ):
+                                context.heartbeat_state.progress_uploaded_seq = my_progress_seq
             finally:
-                _HB_UPLOAD_LOCK.release()
+                context.heartbeat_state.upload_lock.release()
         else:
             if initial:
-                raise _w.RetriableInfraError(
+                raise worker_perf.RetriableInfraError(
                     f"initial heartbeat upload lock remained busy >{lock_timeout}s for {stage}"
                 )
             print(f"HEARTBEAT upload-lock busy >{lock_timeout}s; skipping commit for {stage}")
@@ -637,6 +667,8 @@ def liveness_heartbeat(
     progress_step=False,
     keepalive=False,
     sample_off_thread=False,
+    *,
+    context: WorkerContext,
 ):
     """Emit liveness heartbeats while a main-thread block runs.
     ``keepalive`` marks blocking uploads as progress (dev #445); use a throttled stage. ``fields``
@@ -650,8 +682,6 @@ def liveness_heartbeat(
         if sample_off_thread and fields is not None
         else None
     )
-    if field_sampler is not None:
-        field_sampler.start()
 
     def _loop() -> None:
         if threading.current_thread() is spawner:
@@ -675,7 +705,7 @@ def liveness_heartbeat(
                             last_val = float(v)
                         elif float(v) > last_val:
                             last_val, made_progress = float(v), True
-            gpu = gpu_diagnostics(include_torch=False)
+            gpu = worker_perf.gpu_diagnostics()
             if done.is_set():  # the wrapped call may have finished during nvidia-smi
                 return
             extra = field_sampler.latest() if field_sampler is not None else {}
@@ -686,21 +716,36 @@ def liveness_heartbeat(
                 extra["step"] = int(last_val)
             # keepalive: a legitimate blocking upload IS progress the daemon can't sample per-step, so
             # force a REAL heartbeat every tick to keep the provider's stall clock fed (see docstring).
-            _w.heartbeat(stage, liveness=(not made_progress) and not keepalive, gpu=gpu, **extra)
-            last_progress = float(getattr(_w, "_HB_LAST_PROGRESS_TS", 0.0) or 0.0)
+            heartbeat(
+                stage,
+                liveness=(not made_progress) and not keepalive,
+                gpu=gpu,
+                **extra,
+                context=context,
+            )
+            last_progress = float(context.heartbeat_state.last_progress_ts or 0.0)
             if not dumped and last_progress and (time.time() - last_progress) > _STALL_DUMP_S:
                 _dump_thread_stacks(f"{stage}: no progress for >{_STALL_DUMP_S:.0f}s")
                 dumped = True
 
-    t = threading.Thread(target=_loop, daemon=True)
-    t.start()
+    t = None
+    sampler_started = False
     try:
+        if field_sampler is not None:
+            field_sampler.start()
+            sampler_started = True
+        thread = threading.Thread(target=_loop, daemon=True)
+        thread.start()
+        t = thread
         yield
     finally:
         done.set()
-        t.join(timeout=_HB_UPLOAD_LOCK_TIMEOUT_S)
-        if field_sampler is not None:
-            field_sampler.join()
+        try:
+            if t is not None:
+                t.join(timeout=_HB_UPLOAD_LOCK_TIMEOUT_S)
+        finally:
+            if sampler_started:
+                field_sampler.join()
 
 
 # checkpoint drain time scales with model size and network throughput; a fixed timeout killed a
@@ -712,7 +757,7 @@ _DRAIN_POLL_S = 5.0
 _DRAIN_NO_DEADLINE_MAX_S = 14400.0
 
 
-def join_while_draining(thread: threading.Thread, what: str) -> None:
+def join_while_draining(thread: threading.Thread, what: str, *, context: WorkerContext) -> None:
     """Wait for publishing until the run's wall deadline.
 
     Killing an in-budget drain discards completed work (VERL-131); only the run deadline stops it.
@@ -722,7 +767,7 @@ def join_while_draining(thread: threading.Thread, what: str) -> None:
         thread.join(timeout=_DRAIN_POLL_S)
         if not thread.is_alive():
             return
-        remaining = _w._remaining_worker_wall_seconds()
+        remaining = context.remaining_wall_seconds()
         if remaining is None:
             # no deadline configured: fall back to an absolute ceiling so a hang in a local run
             # cannot wedge the process forever.

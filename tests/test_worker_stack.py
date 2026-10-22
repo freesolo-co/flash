@@ -5,9 +5,13 @@ from __future__ import annotations
 import inspect
 import sys
 import types
+from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
+
+import flash.engine.worker.io.heartbeat as worker_heartbeat
+import flash.engine.worker.model.adapter as worker_adapter
 
 
 def _worker_image_specs() -> list[str]:
@@ -117,14 +121,13 @@ def test_worker_stack_pins_qwen35_capable_versions():
     assert exact_versions["vllm"] == [Version("0.19.1")]
     assert len(exact_versions["transformers"]) == 1
     assert exact_versions["transformers"][0].major == 5  # qwen3_5 model types need transformers 5.x
-    assert exact_versions["bitsandbytes"] == [Version("0.50.1")]  # 8-bit paged AdamW state
+    assert "bitsandbytes" not in exact_versions
 
 
 def _import_worker(monkeypatch):
     monkeypatch.setenv("RUN_MODE", "sft")
     monkeypatch.delenv("FLASH_JOB_SPEC_JSON", raising=False)
-    sys.modules.pop("flash.engine.worker", None)
-    import flash.engine.worker as worker
+    import flash.engine.worker.model.adapter as worker
 
     return worker
 
@@ -158,14 +161,16 @@ def test_model_revision_threads_through_config_probes(monkeypatch, revision):
     fake_transformers.AutoConfig = _AutoConfig
     monkeypatch.setitem(sys.modules, "transformers", fake_transformers)
 
-    from flash.engine.worker.entry import sft
+    from flash.engine.profiling import sft_rows as sft
     from flash.engine.worker.model import packing
-    from flash.engine.worker.perf import liger
+    from flash.engine.worker.perf import model_size
 
     assert packing.model_is_gdn_hybrid("org/model", revision=revision)
     assert packing.gdn_model_type("org/model", revision=revision)
     assert sft._model_arch_dims("uncataloged/model", revision=revision) == (4096, 32)
-    assert isinstance(liger._liger_default_for_model("org/model", revision=revision), bool)
+    assert isinstance(
+        model_size._checkpointing_default_for_model("org/model", revision=revision), bool
+    )
 
     expected = {"trust_remote_code": True}
     if revision:
@@ -194,7 +199,7 @@ def test_arch_dims_revision_zero_probe_falls_back_to_catalog(monkeypatch):
     # revision pin must treat that as "unparseable" and fall back to the curated catalog geometry
     # (exactly like an unpinned run), NOT as a mismatch -- otherwise revision-pinned SFT on that model
     # raises after the GPU is already rented.
-    from flash.engine.worker.entry import sft
+    from flash.engine.profiling import sft_rows as sft
 
     _fake_arch_probe(monkeypatch, hidden=0, layers=0)
     # Qwen/Qwen3.6-35B-A3B is the sole catalog entry carrying (hidden, layers) == (2048, 40).
@@ -204,7 +209,7 @@ def test_arch_dims_revision_zero_probe_falls_back_to_catalog(monkeypatch):
 def test_arch_dims_revision_nonzero_mismatch_still_fails_closed(monkeypatch):
     # a NONZERO probe dim that genuinely disagrees with the catalog is a real revision mismatch and must
     # still fail closed, so a revision pin can never silently size VRAM with the wrong geometry.
-    from flash.engine.worker.entry import sft
+    from flash.engine.profiling import sft_rows as sft
 
     _fake_arch_probe(monkeypatch, hidden=9999, layers=99)
     with pytest.raises(RuntimeError, match="revision-specific model architecture"):
@@ -237,7 +242,7 @@ def test_control_plane_tokenizer_disables_remote_repository_code_without_changin
     ]
 
 
-def test_model_revision_threads_through_tokenizer_and_prefetch(monkeypatch):
+def test_model_revision_threads_through_tokenizer_and_prefetch(worker_context, monkeypatch):
     calls = []
 
     class _AutoTokenizer:
@@ -252,7 +257,6 @@ def test_model_revision_threads_through_tokenizer_and_prefetch(monkeypatch):
 
     import huggingface_hub
 
-    import flash.engine.worker as worker
     from flash.engine.worker.io import hf
 
     monkeypatch.setattr(
@@ -263,12 +267,12 @@ def test_model_revision_threads_through_tokenizer_and_prefetch(monkeypatch):
     monkeypatch.setattr(hf, "_shared_weight_cache_dir", lambda: None)
     monkeypatch.setattr(hf, "_hf_cache_bytes", lambda *args, **kwargs: 0)
     monkeypatch.setattr(hf, "gpu_diagnostics", dict)
-    monkeypatch.setattr(worker, "heartbeat", lambda *args, **kwargs: None)
+    monkeypatch.setattr(worker_heartbeat, "heartbeat", lambda *args, context=None, **kwargs: None)
 
     assert hf.load_tokenizer("org/model", revision="refs/pr/123") is not None
-    hf.prefetch_model("org/model", revision="refs/pr/123")
+    hf.prefetch_model("org/model", revision="refs/pr/123", context=worker_context)
     assert hf.load_tokenizer("org/model", revision="") is not None
-    hf.prefetch_model("org/model", revision="")
+    hf.prefetch_model("org/model", revision="", context=worker_context)
 
     revision_calls = [kwargs for _kind, _model, kwargs in calls[:2]]
     empty_calls = [kwargs for _kind, _model, kwargs in calls[2:]]
@@ -277,7 +281,7 @@ def test_model_revision_threads_through_tokenizer_and_prefetch(monkeypatch):
 
 
 def test_gpu_diagnostics_parses_nvidia_smi(monkeypatch):
-    from flash.engine.worker import perf
+    import flash.engine.worker.perf as perf
 
     class _Completed:
         def __init__(self, stdout: str = "", stderr: str = "", returncode: int = 0):
@@ -289,7 +293,7 @@ def test_gpu_diagnostics_parses_nvidia_smi(monkeypatch):
         joined = " ".join(cmd)
         if "--query-gpu=" in joined:
             return _Completed(
-                "0, GPU-abc, 575.57, NVIDIA GeForce RTX 5090, 98, 77, "
+                "0, GPU-abc, 575.57, NVIDIA GeForce L40S, 98, 77, "
                 "32607, 24000, 8607, 69, 412.5, 575.0, P0, 2700, 14001, 5, 16\n"
             )
         if "--query-compute-apps=" in joined:
@@ -302,7 +306,7 @@ def test_gpu_diagnostics_parses_nvidia_smi(monkeypatch):
 
     diag = perf.gpu_diagnostics()
 
-    assert diag["device_name"] == "NVIDIA GeForce RTX 5090"
+    assert diag["device_name"] == "NVIDIA GeForce L40S"
     assert diag["driver_version"] == "575.57"
     assert diag["gpu_util_pct"] == 98
     assert diag["mem_util_pct"] == 77
@@ -314,38 +318,37 @@ def test_gpu_diagnostics_parses_nvidia_smi(monkeypatch):
     assert diag["processes"][0]["used_memory_gb"] == pytest.approx(23.34, rel=1e-3)
 
 
-def test_heartbeat_commit_is_throttled(monkeypatch):
+def test_heartbeat_commit_is_throttled(worker_context, monkeypatch):
     """heartbeat() must rate-limit HF commits (per-step commits blow HF's 128/hour repo cap),
     while always committing milestone stages."""
     monkeypatch.setenv("RUN_MODE", "rl")
     monkeypatch.delenv("FLASH_JOB_SPEC_JSON", raising=False)
-    sys.modules.pop("flash.engine.worker", None)
-    import flash.engine.worker as w
+    import flash.engine.worker.io.heartbeat as w
 
     calls = []
-    monkeypatch.setattr(w, "hf_upload_file", lambda *a, **k: calls.append(a[1]))
+    monkeypatch.setattr(w.hf_io, "hf_upload_file", lambda *a, context=None, **k: calls.append(a[1]))
 
     # Large interval -> only milestone + the first commit; per-step heartbeats throttled.
-    monkeypatch.setattr(w, "_HB_MIN_INTERVAL_S", 9999.0)
-    monkeypatch.setattr(w, "_HB_LAST_UPLOAD", 0.0)
-    w.heartbeat("rl_start")  # milestone -> commits
-    w.heartbeat("rl_step", step=1)  # throttled
-    w.heartbeat("rl_step", step=2)  # throttled
+    monkeypatch.setattr(worker_heartbeat, "_HB_MIN_INTERVAL_S", 9999.0)
+    monkeypatch.setattr(worker_context.heartbeat_state, "last_upload", 0.0)
+    worker_heartbeat.heartbeat("rl_start", context=worker_context)  # milestone -> commits
+    worker_heartbeat.heartbeat("rl_step", step=1, context=worker_context)  # throttled
+    worker_heartbeat.heartbeat("rl_step", step=2, context=worker_context)  # throttled
     assert calls.count("heartbeat.json") == 1
 
     # Zero interval -> every call commits.
     calls.clear()
-    monkeypatch.setattr(w, "_HB_MIN_INTERVAL_S", 0.0)
-    monkeypatch.setattr(w, "_HB_LAST_UPLOAD", 0.0)
-    w.heartbeat("rl_step", step=1)
-    w.heartbeat("rl_step", step=2)
+    monkeypatch.setattr(worker_heartbeat, "_HB_MIN_INTERVAL_S", 0.0)
+    monkeypatch.setattr(worker_context.heartbeat_state, "last_upload", 0.0)
+    worker_heartbeat.heartbeat("rl_step", step=1, context=worker_context)
+    worker_heartbeat.heartbeat("rl_step", step=2, context=worker_context)
     assert len(calls) == 2
 
 
 @pytest.mark.parametrize(
     "stage", ["model_prefetching", "sft_pretokenizing", "sft_initializing", "rl_initializing"]
 )
-def test_setup_progress_heartbeats_are_throttled(monkeypatch, stage):
+def test_setup_progress_heartbeats_are_throttled(worker_context, monkeypatch, stage):
     """The periodic setup pings run on a side thread every 30s through a long phase (a cold
     snapshot_download can pull tens of GB for ~40 min, and disaggregated workers share one HF_REPO),
     so their HF UPLOAD must be throttled like rl_step or they blow HF's 128/hour repo commit cap. The
@@ -353,46 +356,44 @@ def test_setup_progress_heartbeats_are_throttled(monkeypatch, stage):
     durable channel); this pins only that the repeated stage does NOT commit to HF on every call."""
     monkeypatch.setenv("RUN_MODE", "rl")
     monkeypatch.delenv("FLASH_JOB_SPEC_JSON", raising=False)
-    sys.modules.pop("flash.engine.worker", None)
-    import flash.engine.worker as w
+    import flash.engine.worker.io.heartbeat as w
 
     calls = []
-    monkeypatch.setattr(w, "hf_upload_file", lambda *a, **k: calls.append(a[1]))
+    monkeypatch.setattr(w.hf_io, "hf_upload_file", lambda *a, context=None, **k: calls.append(a[1]))
     # Large interval -> only the FIRST emit of the stage commits; the rest are upload-throttled.
-    monkeypatch.setattr(w, "_HB_MIN_INTERVAL_S", 9999.0)
-    monkeypatch.setattr(w, "_HB_LAST_UPLOAD", 0.0)
-    w.heartbeat(stage, elapsed_seconds=1)
-    w.heartbeat(stage, elapsed_seconds=31)
-    w.heartbeat(stage, elapsed_seconds=61)
+    monkeypatch.setattr(worker_heartbeat, "_HB_MIN_INTERVAL_S", 9999.0)
+    monkeypatch.setattr(worker_context.heartbeat_state, "last_upload", 0.0)
+    worker_heartbeat.heartbeat(stage, elapsed_seconds=1, context=worker_context)
+    worker_heartbeat.heartbeat(stage, elapsed_seconds=31, context=worker_context)
+    worker_heartbeat.heartbeat(stage, elapsed_seconds=61, context=worker_context)
     assert calls.count("heartbeat.json") == 1, f"{stage} must be upload-throttled, got {calls}"
 
 
-def test_heartbeat_hf_upload_runs_outside_lock(monkeypatch):
+def test_heartbeat_hf_upload_runs_outside_lock(worker_context, monkeypatch):
     """Perf regression guard: the synchronous hf_upload_file network call must run OUTSIDE
     _HB_LOCK. Holding the lock across the upload serializes the trainer's per-step reward
     callback behind the checkpoint daemon's HF commit during GRPO."""
     monkeypatch.setenv("RUN_MODE", "rl")
     monkeypatch.delenv("FLASH_JOB_SPEC_JSON", raising=False)
-    sys.modules.pop("flash.engine.worker", None)
-    import flash.engine.worker as w
+    import flash.engine.worker.io.heartbeat as w
 
     # When hf_upload_file is invoked, the lock must be acquirable (i.e. not held).
     lock_free_during_upload = []
 
-    def fake_upload(*a, **k):
-        acquired = w._HB_LOCK.acquire(blocking=False)
+    def fake_upload(*a, context=None, **k):
+        acquired = worker_context.heartbeat_state.lock.acquire(blocking=False)
         lock_free_during_upload.append(acquired)
         if acquired:
-            w._HB_LOCK.release()
+            worker_context.heartbeat_state.lock.release()
 
-    monkeypatch.setattr(w, "hf_upload_file", fake_upload)
-    monkeypatch.setattr(w, "_HB_MIN_INTERVAL_S", 0.0)
-    monkeypatch.setattr(w, "_HB_LAST_UPLOAD", 0.0)
-    w.heartbeat("rl_start")
+    monkeypatch.setattr(w.hf_io, "hf_upload_file", fake_upload)
+    monkeypatch.setattr(worker_heartbeat, "_HB_MIN_INTERVAL_S", 0.0)
+    monkeypatch.setattr(worker_context.heartbeat_state, "last_upload", 0.0)
+    worker_heartbeat.heartbeat("rl_start", context=worker_context)
     assert lock_free_during_upload == [True], "hf_upload_file must run with _HB_LOCK released"
 
 
-def test_heartbeat_upload_skips_when_lock_is_stuck(monkeypatch):
+def test_heartbeat_upload_skips_when_lock_is_stuck(worker_context, monkeypatch):
     """A wedged upload holding _HB_UPLOAD_LOCK must not block the NEXT heartbeat. A milestone like
     model_prefetched (unthrottled, on the worker's critical path right before trainer construction)
     must skip its best-effort commit after a bounded wait rather than wedge the worker."""
@@ -404,34 +405,37 @@ def test_heartbeat_upload_skips_when_lock_is_stuck(monkeypatch):
 
     monkeypatch.setenv("RUN_MODE", "rl")
     monkeypatch.delenv("FLASH_JOB_SPEC_JSON", raising=False)
-    sys.modules.pop("flash.engine.worker", None)
-    import flash.engine.worker as w
+    import flash.engine.worker.io.heartbeat as w
 
     monkeypatch.setattr(hbmod, "_HB_UPLOAD_LOCK_TIMEOUT_S", 0.05)
     uploads = []
-    monkeypatch.setattr(w, "hf_upload_file", lambda *a, **k: uploads.append(a))
-    monkeypatch.setattr(w, "_HB_MIN_INTERVAL_S", 0.0)
+    monkeypatch.setattr(w.hf_io, "hf_upload_file", lambda *a, context=None, **k: uploads.append(a))
+    monkeypatch.setattr(worker_heartbeat, "_HB_MIN_INTERVAL_S", 0.0)
     sentinel_last_upload = 123.0  # a prior successful-commit timestamp the skip must NOT clobber
-    monkeypatch.setattr(w, "_HB_LAST_UPLOAD", sentinel_last_upload)
+    monkeypatch.setattr(worker_context.heartbeat_state, "last_upload", sentinel_last_upload)
 
-    assert hbmod._HB_UPLOAD_LOCK.acquire(blocking=False), "lock should be free at test start"
+    assert worker_context.heartbeat_state.upload_lock.acquire(blocking=False), (
+        "lock should be free at test start"
+    )
     try:
         t0 = _time.monotonic()
-        w.heartbeat("model_prefetched")  # must NOT block on the held lock
+        worker_heartbeat.heartbeat(
+            "model_prefetched", context=worker_context
+        )  # must NOT block on the held lock
         elapsed = _time.monotonic() - t0
     finally:
-        hbmod._HB_UPLOAD_LOCK.release()
+        worker_context.heartbeat_state.upload_lock.release()
 
     assert elapsed < 5.0, f"heartbeat wedged on the held upload lock ({elapsed:.2f}s)"
     assert uploads == [], "the best-effort commit must be skipped while the lock is stuck"
     # The skipped upload must ROLL BACK its optimistic slot claim — otherwise the throttle defers the
     # next real commit and the throttle treats a stale channel as fresh.
-    assert sentinel_last_upload == w._HB_LAST_UPLOAD, (
-        f"a skipped commit must not advance _HB_LAST_UPLOAD (got {w._HB_LAST_UPLOAD})"
+    assert sentinel_last_upload == worker_context.heartbeat_state.last_upload, (
+        f"a skipped commit must not advance _HB_LAST_UPLOAD (got {worker_context.heartbeat_state.last_upload})"
     )
 
 
-def test_heartbeat_rolls_back_slot_when_upload_reports_failure(monkeypatch):
+def test_heartbeat_rolls_back_slot_when_upload_reports_failure(worker_context, monkeypatch):
     """The optimistic _HB_LAST_UPLOAD slot is claimed BEFORE the best-effort HF commit. If that commit
     fails, hf_upload_file swallows the error and returns False (it never raises on best-effort) — HF is
     still stale, so the slot must roll back exactly as the lock-timeout skip does. Otherwise the
@@ -443,28 +447,29 @@ def test_heartbeat_rolls_back_slot_when_upload_reports_failure(monkeypatch):
 
     monkeypatch.setenv("RUN_MODE", "rl")
     monkeypatch.delenv("FLASH_JOB_SPEC_JSON", raising=False)
-    sys.modules.pop("flash.engine.worker", None)
-    import flash.engine.worker as w
+    import flash.engine.worker.io.heartbeat as w
 
-    monkeypatch.setattr(w, "_HB_MIN_INTERVAL_S", 0.0)
+    monkeypatch.setattr(worker_heartbeat, "_HB_MIN_INTERVAL_S", 0.0)
     sentinel_last_upload = (
         123.0  # a prior successful-commit timestamp the failed retry must restore
     )
-    monkeypatch.setattr(w, "_HB_LAST_UPLOAD", sentinel_last_upload)
+    monkeypatch.setattr(worker_context.heartbeat_state, "last_upload", sentinel_last_upload)
 
     calls = []
     # Mirror the real hf_upload_file contract: best-effort failure returns False (does not raise).
-    monkeypatch.setattr(w, "hf_upload_file", lambda *a, **k: (calls.append(a[1]), False)[1])
+    monkeypatch.setattr(
+        w.hf_io, "hf_upload_file", lambda *a, context=None, **k: (calls.append(a[1]), False)[1]
+    )
 
-    w.heartbeat("model_prefetched")
+    worker_heartbeat.heartbeat("model_prefetched", context=worker_context)
 
     assert calls == ["heartbeat.json"], "the upload must actually be attempted"
-    assert sentinel_last_upload == w._HB_LAST_UPLOAD, (
-        f"a failed upload must roll _HB_LAST_UPLOAD back to its prior value (got {w._HB_LAST_UPLOAD})"
+    assert sentinel_last_upload == worker_context.heartbeat_state.last_upload, (
+        f"a failed upload must roll _HB_LAST_UPLOAD back to its prior value (got {worker_context.heartbeat_state.last_upload})"
     )
 
 
-def test_heartbeat_keeps_slot_when_upload_reports_success(monkeypatch):
+def test_heartbeat_keeps_slot_when_upload_reports_success(worker_context, monkeypatch):
     """The dual of the rollback test: a SUCCESSFUL commit (or a mock that doesn't report False) must
     KEEP the advanced slot so the throttle works. ``is False`` — not falsy — gates the rollback, so a
     None-returning mock counts as success."""
@@ -474,19 +479,20 @@ def test_heartbeat_keeps_slot_when_upload_reports_success(monkeypatch):
 
     monkeypatch.setenv("RUN_MODE", "rl")
     monkeypatch.delenv("FLASH_JOB_SPEC_JSON", raising=False)
-    sys.modules.pop("flash.engine.worker", None)
-    import flash.engine.worker as w
+    import flash.engine.worker.io.heartbeat as w
 
-    monkeypatch.setattr(w, "_HB_MIN_INTERVAL_S", 0.0)
-    monkeypatch.setattr(w, "_HB_LAST_UPLOAD", 0.0)
-    monkeypatch.setattr(w, "hf_upload_file", lambda *a, **k: True)
+    monkeypatch.setattr(worker_heartbeat, "_HB_MIN_INTERVAL_S", 0.0)
+    monkeypatch.setattr(worker_context.heartbeat_state, "last_upload", 0.0)
+    monkeypatch.setattr(w.hf_io, "hf_upload_file", lambda *a, context=None, **k: True)
 
-    w.heartbeat("model_prefetched")
+    worker_heartbeat.heartbeat("model_prefetched", context=worker_context)
 
-    assert w._HB_LAST_UPLOAD > 0.0, "a successful commit must keep the advanced throttle slot"
+    assert worker_context.heartbeat_state.last_upload > 0.0, (
+        "a successful commit must keep the advanced throttle slot"
+    )
 
 
-def test_critical_stages_wait_longer_for_upload_lock(monkeypatch):
+def test_critical_stages_wait_longer_for_upload_lock(worker_context, monkeypatch):
     """done/already_done/error_* are CRITICAL — no later heartbeat repairs a skipped terminal commit,
     and error_* carries the `retriable` flag worker_flagged_retriable() reads. So they wait the LONGER
     _HB_CRITICAL_UPLOAD_LOCK_TIMEOUT_S for the upload lock before skipping, vs the short progress
@@ -499,26 +505,31 @@ def test_critical_stages_wait_longer_for_upload_lock(monkeypatch):
 
     monkeypatch.setenv("RUN_MODE", "rl")
     monkeypatch.delenv("FLASH_JOB_SPEC_JSON", raising=False)
-    sys.modules.pop("flash.engine.worker", None)
-    import flash.engine.worker as w
+    import flash.engine.worker.io.heartbeat as w
 
     monkeypatch.setattr(hbmod, "_HB_UPLOAD_LOCK_TIMEOUT_S", 0.05)
     monkeypatch.setattr(hbmod, "_HB_CRITICAL_UPLOAD_LOCK_TIMEOUT_S", 0.4)
-    monkeypatch.setattr(w, "hf_upload_file", lambda *a, **k: None)
-    monkeypatch.setattr(w, "_HB_MIN_INTERVAL_S", 0.0)
-    monkeypatch.setattr(w, "_HB_LAST_UPLOAD", 0.0)
+    monkeypatch.setattr(w.hf_io, "hf_upload_file", lambda *a, context=None, **k: None)
+    monkeypatch.setattr(worker_heartbeat, "_HB_MIN_INTERVAL_S", 0.0)
+    monkeypatch.setattr(worker_context.heartbeat_state, "last_upload", 0.0)
 
-    assert hbmod._HB_UPLOAD_LOCK.acquire(blocking=False), "lock should be free at test start"
+    assert worker_context.heartbeat_state.upload_lock.acquire(blocking=False), (
+        "lock should be free at test start"
+    )
     try:
         t = _time.monotonic()
-        w.heartbeat("rl_step", step=1)  # progress -> short timeout, skips fast
+        worker_heartbeat.heartbeat(
+            "rl_step", step=1, context=worker_context
+        )  # progress -> short timeout, skips fast
         progress_wait = _time.monotonic() - t
 
         t = _time.monotonic()
-        w.heartbeat("done")  # critical -> waits the long timeout before skipping
+        worker_heartbeat.heartbeat(
+            "done", context=worker_context
+        )  # critical -> waits the long timeout before skipping
         critical_wait = _time.monotonic() - t
     finally:
-        hbmod._HB_UPLOAD_LOCK.release()
+        worker_context.heartbeat_state.upload_lock.release()
 
     assert progress_wait < 0.3, (
         f"progress stage should skip after the short timeout, waited {progress_wait:.2f}s"
@@ -529,50 +540,54 @@ def test_critical_stages_wait_longer_for_upload_lock(monkeypatch):
     assert critical_wait > progress_wait + 0.15
 
 
-def test_heartbeat_terminal_only_mode(monkeypatch):
+def test_heartbeat_terminal_only_mode(worker_context, monkeypatch):
     """TERMINAL_ONLY mode throttles every non-terminal stage (not just rl_step) so a fan-out of
     runs sharing one HF_REPO stays under the 128-commits/hour cap; terminal done/error_* still
     always commit so the control plane never misses a transition."""
     monkeypatch.setenv("RUN_MODE", "sft")
     monkeypatch.delenv("FLASH_JOB_SPEC_JSON", raising=False)
-    sys.modules.pop("flash.engine.worker", None)
-    import flash.engine.worker as w
+    import flash.engine.worker.io.heartbeat as w
 
     calls = []
 
-    def _fake_upload(*a, **k):
+    def _fake_upload(*a, context=None, **k):
         calls.append(a[1])
         return True  # simulate a successful commit so the throttle clock advances
 
-    monkeypatch.setattr(w, "hf_upload_file", _fake_upload)
-    monkeypatch.setattr(w, "_HB_TERMINAL_ONLY", True)
-    monkeypatch.setattr(w, "_HB_MIN_INTERVAL_S", 9999.0)
-    monkeypatch.setattr(w, "_HB_LAST_UPLOAD", 0.0)
+    monkeypatch.setattr(w.hf_io, "hf_upload_file", _fake_upload)
+    monkeypatch.setattr(worker_context.heartbeat_state, "terminal_only", True)
+    monkeypatch.setattr(worker_heartbeat, "_HB_MIN_INTERVAL_S", 9999.0)
+    monkeypatch.setattr(worker_context.heartbeat_state, "last_upload", 0.0)
 
     # Short interval: terminal-only must STILL suppress non-terminal after the first, NOT
     # leak a commit once the window elapses (the bot-caught 128/hr re-breach).
-    monkeypatch.setattr(w, "_HB_MIN_INTERVAL_S", 0.0)
-    w.heartbeat("sft_start")  # first non-terminal -> commits (last_upload==0)
-    w.heartbeat("sft_model_load")  # suppressed despite 0s interval
-    w.heartbeat("sft_trained")  # suppressed
+    monkeypatch.setattr(worker_heartbeat, "_HB_MIN_INTERVAL_S", 0.0)
+    worker_heartbeat.heartbeat(
+        "sft_start", context=worker_context
+    )  # first non-terminal -> commits (last_upload==0)
+    worker_heartbeat.heartbeat(
+        "sft_model_load", context=worker_context
+    )  # suppressed despite 0s interval
+    worker_heartbeat.heartbeat("sft_trained", context=worker_context)  # suppressed
     assert len(calls) == 1
-    w.heartbeat("error_sft", error="boom")  # terminal -> always commits
-    w.heartbeat("done")  # terminal -> always commits
+    worker_heartbeat.heartbeat(
+        "error_sft", error="boom", context=worker_context
+    )  # terminal -> always commits
+    worker_heartbeat.heartbeat("done", context=worker_context)  # terminal -> always commits
     assert calls.count("heartbeat.json") == 3
 
 
-def test_liger_default_model_size_gate(monkeypatch):
+def test_checkpointing_default_model_size_gate(monkeypatch):
     """The model-size gate is OFF for small models (1B-class) and ON at ≥ ~3B.
 
     Named for liger because that is where the threshold was measured (PR #174, fused-CE's memory win
     only paying off above ~3B), but liger itself is gone from the verl paths: this predicate now
-    feeds ``_memory_mode`` -> ``grad_checkpointing_on``, so the threshold is load-bearing for
+    feeds ``_prefer_gradient_checkpointing`` -> ``grad_checkpointing_on``, so the threshold is load-bearing for
     gradient checkpointing rather than for a fused-CE choice.
     """
     monkeypatch.setenv("RUN_MODE", "sft")
     monkeypatch.delenv("FLASH_JOB_SPEC_JSON", raising=False)
-    sys.modules.pop("flash.engine.worker", None)
-    import flash.engine.worker as w
+    import flash.engine.worker.perf as w
 
     # _estimate_params: ~1B vs ~4B configs
     small = types.SimpleNamespace(
@@ -591,21 +606,21 @@ def test_liger_default_model_size_gate(monkeypatch):
         monkeypatch.setitem(sys.modules, "transformers", fake)
 
     fake_cfg(small)
-    assert w._liger_default_for_model("meta-llama/Llama-3.2-1B") is False
+    assert w._checkpointing_default_for_model("meta-llama/Llama-3.2-1B") is False
     # grad checkpointing follows the same small=speed(off) / large=memory(on) principle
     assert w.grad_checkpointing_on("meta-llama/Llama-3.2-1B") is False
     fake_cfg(big)
-    assert w._liger_default_for_model("Qwen/Qwen3-4B") is True
+    assert w._checkpointing_default_for_model("Qwen/Qwen3-4B") is True
     assert w.grad_checkpointing_on("Qwen/Qwen3-4B") is True
     # context-aware: a SMALL model at LONG context is memory-bound -> memory mode ON (PR #174:
     # 1B GRPO OOMs at 4096 in speed mode, fits in memory mode).
     fake_cfg(small)
-    assert w._memory_mode("meta-llama/Llama-3.2-1B", 512) is False
-    assert w._memory_mode("meta-llama/Llama-3.2-1B", 4096) is True
+    assert w._prefer_gradient_checkpointing("meta-llama/Llama-3.2-1B", 512) is False
+    assert w._prefer_gradient_checkpointing("meta-llama/Llama-3.2-1B", 4096) is True
     assert w.grad_checkpointing_on("meta-llama/Llama-3.2-1B", 4096) is True
 
 
-def test_make_lora_uses_standard_init_and_scaling(monkeypatch):
+def test_make_lora_uses_standard_init_and_scaling(worker_context, monkeypatch):
     """make_lora uses serve-safe, convergence-stable LoRA defaults for every model:
     standard zero-B init (PiSSA removed — its residual corrupts serve + GRPO warm-start) and
     standard alpha/r scaling (rsLoRA removed — alpha/sqrt(r) is ~5.6x larger and diverges the
@@ -616,14 +631,22 @@ def test_make_lora_uses_standard_init_and_scaling(monkeypatch):
     monkeypatch.setitem(sys.modules, "peft", fake_peft)
 
     worker = _import_worker(monkeypatch)
-    worker.JOB_SPEC = types.SimpleNamespace(
-        train=types.SimpleNamespace(lora_rank=32, lora_alpha=64),
-        model_revision="a" * 40,
+
+    monkeypatch.setattr(
+        worker_context,
+        "config",
+        replace(
+            worker_context.config,
+            spec=types.SimpleNamespace(
+                train=types.SimpleNamespace(lora_rank=32, lora_alpha=64),
+                model_revision="a" * 40,
+            ),
+        ),
     )
 
-    for model_id in ("Qwen/Qwen3.5-9B", "Qwen/Qwen3.5-0.8B"):
+    for model_id in ("Qwen/Qwen3.5-9B", "Qwen/Qwen3.8-27B"):
         captured.clear()
-        worker.make_lora(model_id)
+        worker.make_lora(model_id, context=worker_context)
         assert captured.get("init_lora_weights") is True
         assert "pissa" not in str(captured.get("init_lora_weights")).lower()
         assert captured.get("use_rslora") is False
@@ -632,12 +655,12 @@ def test_make_lora_uses_standard_init_and_scaling(monkeypatch):
         assert captured["exclude_modules"] == r"^(?!model\.language_model(?:\.|$)).*$"
 
     captured.clear()
-    worker.make_lora("Qwen/Qwen3.5-0.8B", algorithm="sft", multimodal=True)
+    worker.make_lora("Qwen/Qwen3.5-9B", algorithm="sft", multimodal=True, context=worker_context)
     assert captured["target_modules"] == "all-linear"
     assert captured["exclude_modules"] is None
 
     captured.clear()
-    worker.make_lora("Qwen/Qwen3.6-35B-A3B")
+    worker.make_lora("Qwen/Qwen3.6-35B-A3B", context=worker_context)
     assert captured["r"] == 32
     assert captured["target_modules"] == "all-linear"
     assert captured["exclude_modules"] == r"^(?!model\.language_model(?:\.|$)).*$"
@@ -650,7 +673,7 @@ def test_make_lora_uses_standard_init_and_scaling(monkeypatch):
 def test_worker_exports_only_the_current_warmstart_adapter_surface(monkeypatch):
     worker = _import_worker(monkeypatch)
 
-    assert callable(worker.validate_warmstart_adapter)
+    assert callable(worker_adapter.validate_warmstart_adapter)
     assert callable(worker.lora_target_parameters)
     for deleted in (
         "adapter_has_fused_expert_tensors",
@@ -662,20 +685,29 @@ def test_worker_exports_only_the_current_warmstart_adapter_surface(monkeypatch):
         assert not hasattr(worker, deleted)
 
 
-def test_train_metadata_keeps_model_revision_in_nested_job_spec(monkeypatch):
-    import flash.engine.worker as worker
+def test_train_metadata_keeps_model_revision_in_nested_job_spec(worker_context, monkeypatch):
     from flash.core.spec import JobSpec
-    from flash.engine.worker.train import finalize
+    from flash.engine.worker.train.core.lifecycle import finalize
 
     captured = []
-    monkeypatch.setattr(worker, "JOB_SPEC", JobSpec(model_revision="refs/pr/123"))
-    monkeypatch.setattr(worker, "SEED", 42)
-    monkeypatch.setattr(worker, "THINKING", False)
-    monkeypatch.setattr(worker, "require_active_env", lambda: SimpleNamespace(id="org/env"))
-    monkeypatch.setattr(worker, "hf_upload_file", lambda *args, **kwargs: None)
-    monkeypatch.setattr(worker, "heartbeat", lambda *args, **kwargs: None)
     monkeypatch.setattr(
-        worker, "_finalize", lambda metrics, **kwargs: captured.append((metrics, kwargs))
+        worker_context,
+        "config",
+        replace(worker_context.config, spec=JobSpec(model_revision="refs/pr/123")),
+    )
+    monkeypatch.setattr(worker_context, "config", replace(worker_context.config, seed=42))
+    monkeypatch.setattr(worker_context, "config", replace(worker_context.config, thinking=False))
+    monkeypatch.setattr(worker_context, "require_active_env", lambda: SimpleNamespace(id="org/env"))
+    monkeypatch.setattr(
+        finalize.hf_io, "hf_upload_file", lambda *args, context=None, **kwargs: None
+    )
+    monkeypatch.setattr(
+        finalize.heartbeat_io, "heartbeat", lambda *args, context=None, **kwargs: None
+    )
+    monkeypatch.setattr(
+        finalize,
+        "_publish_training_completion",
+        lambda metrics, context=None, **kwargs: captured.append((metrics, kwargs)),
     )
     monkeypatch.setattr(finalize, "gpu_diagnostics", dict)
 
@@ -688,31 +720,35 @@ def test_train_metadata_keeps_model_revision_in_nested_job_spec(monkeypatch):
         train_tokens=3,
         generated_tokens=0,
         notes={},
+        context=worker_context,
     )
 
     assert captured[0][0].notes["job_spec"]["model_revision"] == "refs/pr/123"
     assert captured[0][1] == {"heartbeat_fields": {}}
 
 
-def test_train_metadata_preserves_terminal_heartbeat_fields(monkeypatch):
-    import flash.engine.worker as worker
-    from flash.engine.worker.train import finalize
+def test_train_metadata_preserves_terminal_heartbeat_fields(worker_context, monkeypatch):
+    from flash.engine.worker.train.core.lifecycle import finalize
 
     emitted = []
     finalized = []
     metrics_last = [{"step": 4, "reward": 0.75}]
-    monkeypatch.setattr(worker, "JOB_SPEC", None)
-    monkeypatch.setattr(worker, "SEED", 42)
-    monkeypatch.setattr(worker, "THINKING", False)
-    monkeypatch.setattr(worker, "require_active_env", lambda: SimpleNamespace(id="org/env"))
-    monkeypatch.setattr(worker, "hf_upload_file", lambda *args, **kwargs: None)
+    monkeypatch.setattr(worker_context, "config", replace(worker_context.config, spec=None))
+    monkeypatch.setattr(worker_context, "config", replace(worker_context.config, seed=42))
+    monkeypatch.setattr(worker_context, "config", replace(worker_context.config, thinking=False))
+    monkeypatch.setattr(worker_context, "require_active_env", lambda: SimpleNamespace(id="org/env"))
     monkeypatch.setattr(
-        worker, "heartbeat", lambda stage, **kwargs: emitted.append((stage, kwargs))
+        finalize.hf_io, "hf_upload_file", lambda *args, context=None, **kwargs: None
     )
     monkeypatch.setattr(
-        worker,
-        "_finalize",
-        lambda metrics, **kwargs: finalized.append((metrics, kwargs)),
+        finalize.heartbeat_io,
+        "heartbeat",
+        lambda stage, context=None, **kwargs: emitted.append((stage, kwargs)),
+    )
+    monkeypatch.setattr(
+        finalize,
+        "_publish_training_completion",
+        lambda metrics, context=None, **kwargs: finalized.append((metrics, kwargs)),
     )
     monkeypatch.setattr(finalize, "gpu_diagnostics", dict)
 
@@ -726,6 +762,7 @@ def test_train_metadata_preserves_terminal_heartbeat_fields(monkeypatch):
         generated_tokens=3,
         notes={},
         heartbeat_fields={"metrics_last": metrics_last},
+        context=worker_context,
     )
 
     assert emitted[-1][0] == "rl_train_done"
@@ -733,26 +770,63 @@ def test_train_metadata_preserves_terminal_heartbeat_fields(monkeypatch):
     assert finalized[0][1] == {"heartbeat_fields": {"metrics_last": metrics_last}}
 
 
-def test_finalize_preserves_terminal_heartbeat_fields(monkeypatch):
+def test_finalize_preserves_terminal_heartbeat_fields(worker_context, monkeypatch):
     from unittest.mock import mock_open
 
-    import flash.engine.worker as worker
     from flash.engine.result.accounting import RunMetrics
+    from flash.engine.worker.train.core.lifecycle import finalize
 
     emitted = []
     metrics_last = [{"step": 4, "reward": 0.75}]
     monkeypatch.setattr(RunMetrics, "save", lambda self, path: None)
-    monkeypatch.setattr(worker, "hf_upload_file", lambda *args, **kwargs: None)
     monkeypatch.setattr(
-        worker, "heartbeat", lambda stage, **kwargs: emitted.append((stage, kwargs))
+        finalize.hf_io, "hf_upload_file", lambda *args, context=None, **kwargs: None
     )
-    monkeypatch.setattr(worker, "gpu_diagnostics", dict)
+    monkeypatch.setattr(
+        finalize.heartbeat_io,
+        "heartbeat",
+        lambda stage, context=None, **kwargs: emitted.append((stage, kwargs)),
+    )
+    monkeypatch.setattr(finalize, "gpu_diagnostics", dict)
     monkeypatch.setattr("builtins.open", mock_open())
 
-    worker._finalize(RunMetrics(phase="rl"), heartbeat_fields={"metrics_last": metrics_last})
+    finalize._publish_training_completion(
+        RunMetrics(phase="rl"),
+        heartbeat_fields={"metrics_last": metrics_last},
+        context=worker_context,
+    )
 
     assert emitted[-1][0] == "done"
     assert emitted[-1][1]["metrics_last"] == metrics_last
+
+
+def test_finalize_uploads_metrics_before_done(worker_context, monkeypatch):
+    from unittest.mock import mock_open
+
+    from flash.engine.result.accounting import RunMetrics
+    from flash.engine.worker.train.core.lifecycle import finalize
+
+    uploads = []
+    monkeypatch.setattr(RunMetrics, "save", lambda self, path: None)
+    monkeypatch.setattr(
+        finalize.hf_io,
+        "hf_upload_file",
+        lambda local_path, remote_name, context=None, **kwargs: uploads.append(
+            (remote_name, kwargs)
+        ),
+    )
+    monkeypatch.setattr(
+        finalize.heartbeat_io, "heartbeat", lambda *args, context=None, **kwargs: None
+    )
+    monkeypatch.setattr(finalize, "gpu_diagnostics", dict)
+    monkeypatch.setattr("builtins.open", mock_open())
+
+    finalize._publish_training_completion(RunMetrics(phase="rl"), context=worker_context)
+
+    assert uploads == [
+        ("metrics.json", {"required": True}),
+        ("DONE", {"required": True}),
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -806,7 +880,7 @@ def _patch_hopper_stack(
     import importlib.util
     import subprocess
 
-    from flash.engine.worker import perf
+    import flash.engine.worker.perf as perf
 
     monkeypatch.setitem(sys.modules, "torch", _hopper_torch())
 
@@ -1002,7 +1076,7 @@ def test_non_hopper_fla_fastpath_is_noop(monkeypatch):
     import importlib.util
     import subprocess
 
-    from flash.engine.worker import perf
+    import flash.engine.worker.perf as perf
 
     t = types.ModuleType("torch")
     t.cuda = types.SimpleNamespace(
@@ -1055,7 +1129,7 @@ def test_verl_venv_pins_transformers_to_the_main_interpreters_version():
     )
 
     venv_block = dockerfile[dockerfile.index("uv venv --seed /opt/verl-venv") :]
-    venv_block = venv_block[: venv_block.index("uv cache clean")]
+    venv_block = venv_block[: venv_block.index("rm -f /tmp/verl-overrides.txt")]
     assert f'"{main_pin.group(1)}"' in venv_block, (
         "the verl venv install list must also name the same exact transformers pin directly"
     )
@@ -1116,7 +1190,7 @@ def test_venv_sanity_block_uses_no_cuda_gated_probe():
     root = pathlib.Path(__file__).resolve().parent.parent
     dockerfile = (root / "Dockerfile.worker").read_text()
     venv_sanity = dockerfile[dockerfile.index("# Sanity: the verl venv must be able to LAUNCH") :]
-    venv_sanity = venv_sanity[: venv_sanity.index("# RunPod Serverless worker entrypoint")]
+    venv_sanity = venv_sanity[: venv_sanity.index("CMD [")]
 
     for probe in ("is_flash_linear_attention_available", "is_causal_conv1d_available"):
         assert f"assert {probe}()" not in venv_sanity, (
@@ -1234,44 +1308,58 @@ def test_wait_for_gpu_raises_retriable_infra_error(monkeypatch):
         wait_for_gpu()
 
 
-def test_required_upload_exhaustion_raises_retriable_infra_error(monkeypatch):
+def test_required_upload_exhaustion_raises_retriable_infra_error(worker_context, monkeypatch):
     # A required upload that fails after its retries is bad host/network -> RetriableInfraError.
-    from flash.engine import worker
+    import flash.engine.worker.io.hf as worker
     from flash.engine.worker.perf import RetriableInfraError
 
-    monkeypatch.setattr(worker, "HF_REPO", "owner/repo")
+    monkeypatch.setattr(
+        worker_context, "config", replace(worker_context.config, hf_repo="owner/repo")
+    )
     monkeypatch.setattr(worker.time, "sleep", lambda *_a: None)
 
     def boom():
         raise OSError("connection reset by peer")
 
     with pytest.raises(RetriableInfraError):
-        worker._hf_upload(boom, "DONE", required=True, label="DONE")
+        worker._hf_upload(boom, "DONE", required=True, label="DONE", context=worker_context)
 
 
-def test_required_upload_starts_no_hf_call_at_deadline(monkeypatch):
-    from flash.engine import worker
+def test_required_upload_starts_no_hf_call_at_deadline(worker_context, monkeypatch):
+    import flash.engine.worker.io.hf as worker
     from flash.engine.worker.perf import RetriableInfraError
 
     calls = []
-    monkeypatch.setattr(worker, "HF_REPO", "owner/repo")
-    monkeypatch.setattr(worker, "_remaining_worker_wall_seconds", lambda: 0.0)
+    monkeypatch.setattr(
+        worker_context, "config", replace(worker_context.config, hf_repo="owner/repo")
+    )
+    monkeypatch.setattr(worker_context, "remaining_wall_seconds", lambda: 0.0)
 
     with pytest.raises(RetriableInfraError):
-        worker._hf_upload(lambda: calls.append("upload"), "DONE", required=True, label="DONE")
+        worker._hf_upload(
+            lambda: calls.append("upload"),
+            "DONE",
+            required=True,
+            label="DONE",
+            context=worker_context,
+        )
 
     assert calls == []
 
 
-def test_required_upload_caps_retry_sleep_and_starts_no_late_retry(monkeypatch, capsys):
-    from flash.engine import worker
+def test_required_upload_caps_retry_sleep_and_starts_no_late_retry(
+    worker_context, monkeypatch, capsys
+):
+    import flash.engine.worker.io.hf as worker
     from flash.engine.worker.perf import RetriableInfraError
 
     calls = []
     sleeps = []
     remaining = iter((2.0, 2.0, 0.0))
-    monkeypatch.setattr(worker, "HF_REPO", "owner/repo")
-    monkeypatch.setattr(worker, "_remaining_worker_wall_seconds", lambda: next(remaining))
+    monkeypatch.setattr(
+        worker_context, "config", replace(worker_context.config, hf_repo="owner/repo")
+    )
+    monkeypatch.setattr(worker_context, "remaining_wall_seconds", lambda: next(remaining))
     monkeypatch.setattr(worker.time, "sleep", sleeps.append)
     monkeypatch.setenv("HF_TOKEN", "bearer-secret")
 
@@ -1280,7 +1368,7 @@ def test_required_upload_caps_retry_sleep_and_starts_no_late_retry(monkeypatch, 
         raise OSError("Authorization: Bearer bearer-secret provider-body-private")
 
     with pytest.raises(RetriableInfraError):
-        worker._hf_upload(boom, "DONE", required=True, label="DONE")
+        worker._hf_upload(boom, "DONE", required=True, label="DONE", context=worker_context)
 
     assert calls == ["upload"]
     assert sleeps == [2.0]
@@ -1289,18 +1377,22 @@ def test_required_upload_caps_retry_sleep_and_starts_no_late_retry(monkeypatch, 
     assert "provider-body-private" in output
 
 
-def test_optional_upload_without_deadline_preserves_single_attempt(monkeypatch):
-    from flash.engine import worker
+def test_optional_upload_without_deadline_preserves_single_attempt(worker_context, monkeypatch):
+    import flash.engine.worker.io.hf as worker
 
     calls = []
-    monkeypatch.setattr(worker, "HF_REPO", "owner/repo")
-    monkeypatch.setattr(worker, "_remaining_worker_wall_seconds", lambda: None)
+    monkeypatch.setattr(
+        worker_context, "config", replace(worker_context.config, hf_repo="owner/repo")
+    )
+    monkeypatch.setattr(worker_context, "remaining_wall_seconds", lambda: None)
 
     def boom():
         calls.append("upload")
         raise OSError("offline")
 
-    assert not worker._hf_upload(boom, "debug.json", required=False, label="debug")
+    assert not worker._hf_upload(
+        boom, "debug.json", required=False, label="debug", context=worker_context
+    )
     assert calls == ["upload"]
 
 
@@ -1325,7 +1417,7 @@ def test_find_real_libcudart_safe_when_nothing_matches(monkeypatch):
     import ctypes.util
     import glob
 
-    from flash.engine.worker import perf
+    import flash.engine.worker.perf as perf
 
     monkeypatch.setattr(glob, "glob", lambda *_a, **_k: [])
     monkeypatch.setattr(ctypes.util, "find_library", lambda _n: None)
@@ -1361,7 +1453,7 @@ def test_find_real_libcudart_handles_bare_soname_without_crashing(monkeypatch):
     import ctypes.util
     import glob
 
-    from flash.engine.worker import perf
+    import flash.engine.worker.perf as perf
 
     monkeypatch.setattr(glob, "glob", lambda *_a, **_k: [])  # no absolute-path candidates
     monkeypatch.setattr(ctypes.util, "find_library", lambda _n: "libcudart.so.12")  # bare soname
@@ -1396,7 +1488,7 @@ def test_find_real_libcudart_finds_cu13_wheel_layout(tmp_path, monkeypatch):
 
         pytest.skip("no C toolchain to build a real libcudart.so")
 
-    from flash.engine.worker import perf
+    import flash.engine.worker.perf as perf
 
     # Fake the `nvidia` namespace package so its __path__ is our tmp tree (the cu13 wheel layout).
     fake_nvidia = types.ModuleType("nvidia")
@@ -1459,7 +1551,7 @@ def _patch_blackwell_stack(monkeypatch, *, cc=(10, 0), fla_present: bool = True,
     """
     import importlib.util
 
-    from flash.engine.worker import perf
+    import flash.engine.worker.perf as perf
 
     monkeypatch.setitem(sys.modules, "torch", _blackwell_torch(cc))
     monkeypatch.setattr(
@@ -1574,7 +1666,7 @@ def test_non_blackwell_gdn_autotune_untouched(monkeypatch):
 # tilelang to Hopper since fla #975) so fla dispatches to its Triton path, correct on sm100.
 # ---------------------------------------------------------------------------
 def _patch_arch(monkeypatch, cc):
-    from flash.engine.worker import perf
+    import flash.engine.worker.perf as perf
 
     monkeypatch.setitem(sys.modules, "torch", _blackwell_torch(cc))
     return perf
@@ -1685,7 +1777,7 @@ def test_no_except_handler_supplies_a_fallback_gdn_hybrid():
     import ast
     import inspect as _inspect
 
-    from flash.engine.worker import opd_train, rl_train, sft_train
+    from flash.engine.worker.train.entry import opd_train, rl_train, sft_train
 
     for module in (sft_train, opd_train, rl_train):
         tree = ast.parse(_inspect.getsource(module))
@@ -1715,7 +1807,7 @@ def test_each_path_resolves_the_gdn_arch_question_exactly_once():
     import ast
     import inspect as _inspect
 
-    from flash.engine.worker import opd_train, rl_train, sft_train
+    from flash.engine.worker.train.entry import opd_train, rl_train, sft_train
 
     for module in (sft_train, opd_train, rl_train):
         tree = ast.parse(_inspect.getsource(module))
@@ -1744,12 +1836,12 @@ def test_every_algorithm_records_whether_gdn_boundary_resets_engaged():
     """
     import inspect as _inspect
 
-    from flash.engine.worker import opd_train, rl_train, sft_train
+    from flash.engine.worker.train.entry import opd_train, rl_train, sft_train
 
     # grpo renders its run metadata in train.rl.verl_config and opd in train.opd.overrides, so
     # each trainer's source is its module plus wherever its notes are built.
-    from flash.engine.worker.train.opd import overrides as opd_overrides
-    from flash.engine.worker.train.rl import verl_config as rl_verl_config
+    from flash.engine.worker.train.opd.orchestration import overrides as opd_overrides
+    from flash.engine.worker.train.rl.launch import verl_config as rl_verl_config
 
     extra = {"rl_train": rl_verl_config, "opd_train": opd_overrides}
     for module in (sft_train, opd_train, rl_train):
@@ -1775,7 +1867,7 @@ def test_sft_remove_padding_is_ungated_tensor_layout():
     import ast
     import inspect as _inspect
 
-    from flash.engine.worker import sft_train
+    from flash.engine.worker.train.entry import sft_train
 
     tree = ast.parse(_inspect.getsource(sft_train))
     assigns = [
@@ -1814,7 +1906,7 @@ def test_grpo_and_opd_do_not_launch_into_the_unrunnable_padded_fallback():
     import inspect as _inspect
     import textwrap as _textwrap
 
-    from flash.engine.worker import backend_common, opd_train, rl_train, sft_train
+    from flash.engine.worker.train.entry import backend_common, opd_train, rl_train, sft_train
 
     # the gate lives in one shared helper, so the assertions split: the helper must raise, and each
     # affected algorithm must route through it rather than re-deriving a decision of its own.
@@ -2220,3 +2312,91 @@ def test_worker_image_rebuilds_when_the_cudart_extractor_changes():
             f"worker-image.yml does not rebuild on {script}; a change to a build-time generator "
             "would ship an image built from the old one."
         )
+
+
+def test_attempt_contexts_keep_identity_uploads_and_heartbeat_progress_independent(monkeypatch):
+    import json
+    from pathlib import Path
+
+    from flash.engine.worker.io import hf
+    from flash.engine.worker.runtime.state import WorkerContext
+
+    first_env = {"RUN_ID": "first", "HF_REPO": "owner/first", "PHASE": "sft", "SEED": "7"}
+    first = WorkerContext.from_env(first_env)
+    second = WorkerContext.from_env(
+        {"RUN_ID": "second", "HF_REPO": "owner/second", "PHASE": "opd", "ATTEMPT": "2"}
+    )
+    first_env["RUN_ID"] = "mutated-after-construction"
+    monkeypatch.setenv("RUN_ID", "unrelated-process-value")
+    uploads = []
+
+    def upload_file(*, path_or_fileobj, path_in_repo, repo_id, **kwargs):
+        uploads.append((repo_id, path_in_repo, json.loads(Path(path_or_fileobj).read_text())))
+
+    monkeypatch.setattr(hf, "hf_api", lambda: SimpleNamespace(upload_file=upload_file))
+    worker_heartbeat.heartbeat("boot", context=first)
+    worker_heartbeat.heartbeat("boot", context=second)
+    worker_heartbeat.heartbeat("sft_step", step=1, context=first)
+    assert [(repo, path) for repo, path, _ in uploads[:2]] == [
+        ("owner/first", "sft/first/heartbeat.json"),
+        ("owner/second", "opd/second/heartbeat.json"),
+    ]
+    assert uploads[0][2]["seed"] == 7
+    assert uploads[1][2]["attempt"] == 2
+    assert first.heartbeat_state.progress_seq == 2
+    assert second.heartbeat_state.progress_seq == 1
+    first.heartbeat_state.metrics_last.append({"step": 1})
+    assert second.heartbeat_state.metrics_last == []
+    with first.resume_upload_lock:
+        assert second.resume_upload_lock.acquire(blocking=False)
+        second.resume_upload_lock.release()
+
+
+def test_profiling_import_does_not_initialize_a_worker(tmp_path):
+    import os
+    import subprocess
+
+    env = dict(os.environ, FLASH_JOB_SPEC_JSON="not-valid-json", ATTEMPT="invalid")
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import sys; import flash.engine.profiling.sft_workload; "
+                "assert 'flash.engine.worker.runtime.state' not in sys.modules"
+            ),
+        ],
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+
+
+def test_invalid_environment_releases_owned_package_once(monkeypatch):
+    from flash.content import multimodal
+    from flash.engine.worker.runtime import state
+
+    cleaned = []
+    package = SimpleNamespace(cleanup=lambda: cleaned.append(True))
+    spec = SimpleNamespace(
+        environment=SimpleNamespace(id="org/env", params={}),
+        train=SimpleNamespace(hf_repo="owner/data"),
+        thinking=False,
+    )
+    context = state.WorkerContext(state.WorkerConfig(spec=spec))
+    monkeypatch.setattr(
+        state, "load_staged_freesolo_environment", lambda *a, **k: (object(), package)
+    )
+
+    def reject(*args):
+        raise ValueError("invalid environment")
+
+    monkeypatch.setattr(multimodal, "validate_image_observation_environment", reject)
+    with pytest.raises(ValueError, match="invalid environment"):
+        context.require_active_env()
+    context.close()
+    assert cleaned == [True]
+    assert context.active_env is None
+    assert context.active_env_package is None

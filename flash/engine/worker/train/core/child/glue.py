@@ -1,8 +1,7 @@
 """child-side multi-turn rollout primitives shared by the OPD and GRPO verl agent loops.
 
-stdlib only at import time. no verl import and no flash import, so the parent can copy this file
-into a verl child's workdir the same way it copies the loop modules themselves. image decoding loads
-Pillow only when a validated dynamic image reply arrives.
+The parent and packaged trainer import these primitives directly. Image decoding loads Pillow
+only when a validated dynamic image reply arrives.
 
 everything here is algorithm-neutral: turning an environment reply into the exact tokens the chat
 template would have produced, deciding whether an assistant turn terminated or was truncated, and
@@ -24,14 +23,18 @@ import warnings
 from typing import Any
 from uuid import uuid4
 
-_ALLOWED_MESSAGE_KEYS = frozenset({"role", "content"})
+from flash.content.reasoning_normalization import (
+    messages_for_chat_template as _messages_for_chat_template,
+)
+
+_ALLOWED_MESSAGE_KEYS = frozenset({"role", "content", "reasoning_content"})
 _PROBE_PREFIX = "flash-env-glue-probe"
 # the media block types verl's own dataset parser substitutes for a placeholder, and the exact set
 # it then extracts (rl_dataset.py `_build_messages`: `<image>`/`<video>`/`<audio>` become blocks of
-# the matching type, and `_process_multi_modal_info` returns images, videos, audios). duplicated
-# here as literals rather than imported from flash.content.multimodal because this module is copied
-# into the verl child, where flash is not importable -- see the module docstring.
+# the matching type, and `_process_multi_modal_info` returns images, videos, audios).
 _MEDIA_BLOCK_TYPES = frozenset({"image", "video", "audio"})
+
+
 _IMAGE_DATA_URI_HEADERS = {
     "data:image/jpeg;base64": "JPEG",
     "data:image/png;base64": "PNG",
@@ -69,8 +72,7 @@ _WORST_BYTES_PER_PIXEL = max(_MODE_BYTES_PER_PIXEL.values()) + 2 * _RGB_BYTES_PE
 
 # derived from the memory budget rather than chosen independently, matching the parent's
 # `flash.content.multimodal`: a pixel count the decoded-memory guard would always reject is not a
-# limit. this file cannot import flash, so the derivation is repeated rather than shared -- the
-# inputs above are the same, so the two land on the same numbers. there is no cumulative pixel cap
+# limit. there is no cumulative pixel cap
 # for the same reason as the parent: decoded memory depends on mode and order, so no mode-blind
 # total can track it, and the aggregate decoded-byte guard below already bounds it exactly.
 _MAX_IMAGE_PIXELS = _MAX_TOTAL_DECODED_BYTES // _WORST_BYTES_PER_PIXEL
@@ -137,11 +139,7 @@ def validate_structured_messages(messages: list[dict], *, source: str) -> list[d
     for position, message in enumerate(messages):
         if not isinstance(message, dict):
             raise ValueError(f"{source} message {position} must be an object")
-        extras = sorted(
-            key
-            for key, value in message.items()
-            if key not in _ALLOWED_MESSAGE_KEYS and value is not None
-        )
+        extras = sorted(key for key in message if key not in _ALLOWED_MESSAGE_KEYS)
         if extras:
             raise ValueError(
                 f"{source} message {position} carries unsupported transcript metadata {extras}; "
@@ -150,10 +148,14 @@ def validate_structured_messages(messages: list[dict], *, source: str) -> list[d
             )
         role = message.get("role")
         content = message.get("content")
+        reasoning = message.get("reasoning_content")
         if not isinstance(role, str) or not role.strip():
             raise ValueError(f"{source} message {position} has an invalid role")
+        if "reasoning_content" in message and not isinstance(reasoning, str):
+            raise ValueError(f"{source} message {position} reasoning_content must be text")
+        metadata = {"reasoning_content": reasoning} if reasoning is not None else {}
         if isinstance(content, str):
-            normalized.append({"role": role, "content": content})
+            normalized.append({"role": role, "content": content, **metadata})
             continue
         if not isinstance(content, list):
             raise ValueError(
@@ -192,7 +194,7 @@ def validate_structured_messages(messages: list[dict], *, source: str) -> list[d
                     f"{source} message {position} has an unsupported content block at index "
                     f"{block_index}"
                 )
-        normalized.append({"role": role, "content": blocks})
+        normalized.append({"role": role, "content": blocks, **metadata})
     return normalized
 
 
@@ -213,11 +215,7 @@ def validate_transcript_messages(
     for position, message in enumerate(messages):
         if not isinstance(message, dict):
             raise ValueError(f"{source} message {position} must be an object")
-        extras = sorted(
-            key
-            for key, value in message.items()
-            if key not in _ALLOWED_MESSAGE_KEYS and value is not None
-        )
+        extras = sorted(key for key in message if key not in _ALLOWED_MESSAGE_KEYS)
         if extras:
             raise ValueError(
                 f"{source} message {position} carries unsupported transcript metadata {extras}; "
@@ -226,15 +224,21 @@ def validate_transcript_messages(
             )
         role = message.get("role")
         content = message.get("content")
+        reasoning = message.get("reasoning_content")
         if not isinstance(role, str) or not role.strip():
             raise ValueError(f"{source} message {position} has an invalid role")
+        if "reasoning_content" in message and not isinstance(reasoning, str):
+            raise ValueError(f"{source} message {position} reasoning_content must be text")
         if allow_content_blocks and isinstance(content, list):
             # a multimodal prompt arrives as content BLOCKS, not a string; flatten to the text this
             # transcript can represent. the media rides separately as decoded pixels.
             content = content_block_text(content, source=source, position=position)
         elif not isinstance(content, str):
             raise ValueError(f"{source} message {position} content must be text for multi-turn")
-        normalized.append({"role": role, "content": content})
+        normalized_message = {"role": role, "content": content}
+        if reasoning is not None:
+            normalized_message["reasoning_content"] = reasoning
+        normalized.append(normalized_message)
     return normalized
 
 
@@ -274,10 +278,11 @@ class EnvGlueTokenizer:
             return list(cached)
         probe = _unique_glue_probe(messages)
         text = self.tokenizer.apply_chat_template(
-            [{"role": "assistant", "content": probe}, *messages],
+            _messages_for_chat_template([{"role": "assistant", "content": probe}, *messages]),
             add_generation_prompt=True,
             tokenize=False,
             enable_thinking=self.thinking,
+            preserve_thinking=False,
         )
         first = text.find(probe)
         if first == -1 or text.find(probe, first + len(probe)) != -1:
@@ -592,7 +597,10 @@ def parent_environment_glue(
             tokenizer,
             structured,
             images,
-            apply_chat_template_kwargs={"enable_thinking": bool(thinking)},
+            apply_chat_template_kwargs={
+                "enable_thinking": bool(thinking),
+                "preserve_thinking": False,
+            },
             mm_processor_kwargs={},
         )
         return token_ids, processor_image_digests(processor, images)
@@ -620,6 +628,7 @@ class EnvGlueProcessor:
             getattr(loop_self, "apply_chat_template_kwargs", {}) or {}
         )
         self.apply_chat_template_kwargs["enable_thinking"] = bool(thinking)
+        self.apply_chat_template_kwargs["preserve_thinking"] = False
 
     async def __call__(
         self,
@@ -877,19 +886,24 @@ async def prepare_episode_prompt(loop_self, raw_prompt) -> EpisodePrompt:
     bridge authentication and rejects unsupported blocks and message metadata before rollout.
     """
     messages = [dict(message) for message in raw_prompt]
+    for message in messages:
+        # arrow materializes an omitted nullable struct field as null; restore omission before the
+        # canonical validator so authored non-string reasoning metadata still fails in the parent.
+        if message.get("reasoning_content") is None:
+            message.pop("reasoning_content", None)
     multi_modal_data = await loop_self.process_multi_modal_info(messages)
+    loop_self._assert_mm_supported(bool(multi_modal_data))
     images = multi_modal_data.get("images")
     videos = multi_modal_data.get("videos")
     audios = multi_modal_data.get("audios")
+    structured = validate_structured_messages(messages, source="initial prompt")
     mm_processor_kwargs = loop_self._get_mm_processor_kwargs(audios)
-    prompt_ids = await loop_self.apply_chat_template(
+    prompt_ids = await loop_self.ct_build_initial_tokens(
         messages,
         images=images,
         videos=videos,
         audios=audios,
-        mm_processor_kwargs=mm_processor_kwargs,
     )
-    structured = validate_structured_messages(messages, source="initial prompt")
     return EpisodePrompt(
         getattr(loop_self, "processor", None),
         multi_modal_data,

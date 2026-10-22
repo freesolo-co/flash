@@ -5,7 +5,7 @@ at the same time; everything below either runs that probe or reads its result to
 child gets launched -- which interpreter, which attention backend, whether the rollout can sleep,
 whether GDN boundary resets are available.
 
-Split out of `flash.engine.worker.backend_common` to keep that module under the file-size limit.
+Split out of `flash.engine.worker.train.entry.backend_common` to keep that module under the file-size limit.
 """
 
 from __future__ import annotations
@@ -17,7 +17,7 @@ import shutil
 import subprocess
 from collections.abc import Sequence
 
-from flash.engine.worker.backend_common import (
+from flash.engine.worker.train.entry.backend_common import (
     CAUSAL_CONV1D_REQUIREMENT,
     FLA_REQUIREMENT,
     FLASH_QLA_REQUIREMENT,
@@ -424,18 +424,9 @@ def resolve_verl_python(workdir: str, *, install_wandb: bool = False) -> str:
         # dev-only fallback (production uses FLASH_VERL_PYTHON on a prebuilt verl image): verl brings
         # its own torch/vllm, so use a full install rather than --no-deps to include runtime deps.
         subprocess.run(["uv", "venv", "--python", VERL_VENV_PYTHON, venv], check=True)
-        # the SAME four overrides Dockerfile.worker writes, for the same reason: this pin
-        # set deliberately violates declared ceilings, and a bare pin cannot break
-        # any of them -- a pin is a constraint the resolver must satisfy alongside the
-        # declaration, so the pair is simply unsatisfiable and the install fails outright.
-        # only --override makes uv IGNORE the declaration. all four lines are required;
-        # dropping any one leaves the set unsatisfiable or silently wrong: verl +
-        # transferqueue declare numpy<2.0.0 -> vllm 0.19.1 needs numpy>=2 verl[vllm]
-        # declares vllm>=0.8.5,<=0.12.0 -> flash needs 0.19.1 for the Qwen3.5 archs vllm
-        # declares xgrammar>=0.1.32 -> structured opd gates on EXACTLY 0.1.25 verl and
-        # vllm both depend on transformers with no upper bound -> an unpinned resolve
-        # drifts the interpreter that TRAINS onto a transformers line nothing validated,
-        # and transformers owns the gdn modelling code the boundary-reset shim patches.
+        # keep these overrides aligned with Dockerfile.worker. numpy and xgrammar
+        # override conflicting dependency metadata; vllm and transformers name the
+        # exact APIs used by the explicit model and tensor-adapter runtime.
         overrides = os.path.join(workdir, "verl-overrides.txt")
         with open(overrides, "w") as f:
             f.write(
@@ -451,10 +442,9 @@ def resolve_verl_python(workdir: str, *, install_wandb: bool = False) -> str:
                 py,
                 "--override",
                 overrides,
-                # the [vllm] extra, matching Dockerfile.worker's VERL_SPEC. verl's bare
-                # install_requires omits vllm, and every entrypoint flash launches needs it:
-                # main_ppo/main_ppo_sync set rollout.name=vllm.
-                f"{VERL_REQUIREMENT_NAME}[vllm] @ {VERL_REQUIREMENT_URL}",
+                # Upstream's [vllm] extra selects a full CUDA 13 / Torch 2.13 stack.
+                # Install the bare package with Flash's explicit CUDA 12.8 runtime instead.
+                f"{VERL_REQUIREMENT_NAME} @ {VERL_REQUIREMENT_URL}",
                 "vllm==0.19.1",
                 "numpy==2.2.6",
                 TRANSFORMERS_INSTALL_REQUIREMENT,
@@ -467,10 +457,9 @@ def resolve_verl_python(workdir: str, *, install_wandb: bool = False) -> str:
                 "uvicorn==0.52.4",
                 "fastapi==0.141.1",
                 # opd's entrypoint calls tq.init()/tq.close(); absent from verl's setup.py.
-                "TransferQueue==0.1.7",
+                "TransferQueue==0.1.11",
                 # older raises AttributeError on PyArrow PyExtensionType.
                 "datasets==5.0.1",
-                "bitsandbytes==0.50.1",
                 "qwen-vl-utils==0.0.14",
                 "torchvision==0.25.0",
                 "xgrammar==0.1.25",
@@ -864,39 +853,9 @@ def rollout_layered_summon_overrides(target_parameters: Sequence[str] | None) ->
     return ["actor_rollout_ref.rollout.layered_summon=true"]
 
 
-def fused_expert_orig_params_overrides(target_parameters: Sequence[str] | None) -> list[str]:
-    """keep fsdp1 parameters addressable so peft can parametrize a fused-expert tensor.
-
-    PEFT implements ``target_parameters`` by registering a torch parametrization onto a NAMED
-    TENSOR of the module at forward time (``peft/tuners/lora/layer.py:2463``), unlike
-    ``target_modules``, which swaps in a wrapper layer once at injection. verl injects the adapter
-    BEFORE wrapping in fsdp (``transformer_impl.py:543-565``), so by the time that forward runs the
-    tensor has to still be reachable by name.
-
-    fsdp1 only keeps it reachable under ``use_orig_params=True``. verl passes the config value
-    straight through (``transformer_impl.py:392-404``) and it defaults to False
-    (``workers/config/engine.py:254``), which flattens every parameter into a FlatParameter. The
-    attribute is then gone and ``register_parametrization`` raises ``Module 'Qwen3_5MoeExperts(...)'
-    does not have a parameter, a buffer, or a parametrized element with name 'down_proj'`` -- which
-    is exactly how the first GRPO run to survive the weight sync died, in the log-prob forward.
-
-    the natural control is flash's own sft driver: it pins ``engine.strategy=fsdp2``
-    (``train/sft/config.py:138``), and fsdp2's ``fully_shard`` never flattens, so the same model
-    with the same ``target_parameters`` trains fine there. grpo and opd stay on fsdp1, so they need
-    the flag instead of the strategy switch.
-
-    verl's own fused-expert lora test pins ``use_orig_params=True``
-    (``tests/utils/test_fsdp_lora_merge.py:92``) over these very targets, as does every other
-    lora-bearing fsdp1 test; only the checkpoint and activation-offload tests use False. upstream
-    has no forward-pass regression for this combination, which is why the default was never fixed.
-
-    gated on ``target_parameters`` because that is precisely the set of models whose lora lives on a
-    raw tensor rather than a wrapper module. dense models keep verl's flattened default, which is
-    the cheaper layout.
-    """
-    if not target_parameters:
-        return []
-    return ["actor_rollout_ref.actor.fsdp_config.use_orig_params=true"]
+def actor_fsdp_strategy_overrides() -> list[str]:
+    """use fsdp2 for every actor, independent of model and lora targets."""
+    return ["actor_rollout_ref.actor.strategy=fsdp2"]
 
 
 def rollout_mm_processor_cache_overrides() -> list[str]:

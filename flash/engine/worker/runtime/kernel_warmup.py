@@ -1,20 +1,21 @@
-"""Pre-compile hot worker kernels on a GPU builder and persist a portable mega-cache.
+"""Pre-compile hot worker kernels on a GPU builder and persist their caches.
 
-Measured: cold compile ~124s -> warm load ~0.2s. Import-safe without torch (every heavy import is
-inside a function). CLI: ``python -m flash.engine.worker.runtime.kernel_warmup --arch <sm> --out <dir>``.
+Import-safe without torch (every heavy import is inside a function). CLI: ``python -m flash.engine.worker.runtime.kernel_warmup --arch <sm> --out <dir>``.
 """
 
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import os
+import sys
 import tempfile
 import time
 
 DEFAULT_CACHE_DIR = "/opt/flash/kernelcache"
-MEGA_CACHE_FILENAME = "mega_cache.bin"
-MEGA_CACHE_META_FILENAME = "mega_cache.json"
+# Keep the metadata filename used by already-published worker images.
+CACHE_META_FILENAME = "mega_cache.json"
 
 # every env var that addresses the baked kernel cache, mapped to its subdirectory of the cache root.
 # Dockerfile.worker sets these image-wide to the same layout; this module re-forces them so a stale
@@ -25,6 +26,8 @@ MEGA_CACHE_META_FILENAME = "mega_cache.json"
 KERNEL_CACHE_ENV_SUBDIRS = {
     "TRITON_CACHE_DIR": "triton",
     "TORCHINDUCTOR_CACHE_DIR": "inductor",
+    "TILELANG_CACHE_DIR": "tilelang",
+    "TORCH_EXTENSIONS_DIR": "torch_extensions",
     # flashinfer downloads b200 attention cubins and builds a host wrapper on first use. redirect
     # both to distinct persistent-cache subdirs so cold workers do not depend on nvidia artifactory
     # or pay the first-step build repeatedly. it reads FLASHINFER_CUBIN_DIR for cubins and
@@ -79,20 +82,22 @@ def _require_gpu():
         return None
 
 
-def warm_flash_attn(torch) -> bool:
+def warm_flash_attn(torch, *, head_dim: int = 256) -> bool:
     """Compile FlashAttention fwd + bwd with one tiny attention.
 
     FA2 only. The FA3 (``flash_attn_interface``) warm was removed with the wheel: it was installed
     into this interpreter while training runs in /opt/verl-venv, and nothing ever set
     ``attn_implementation``, so verl's "flash_attention_2" default meant FA3 never ran in a training
-    forward on any arch. Warming a kernel the trainer cannot reach only bloated the mega-cache.
+    forward on any arch. Warming a kernel the trainer cannot reach only added unused warmup work.
     """
     warmed = False
     try:
         from flash_attn import flash_attn_func
 
         q, k, v = (
-            torch.randn(1, 64, 4, 64, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+            torch.randn(
+                1, 256, 4, head_dim, device="cuda", dtype=torch.bfloat16, requires_grad=True
+            )
             for _ in range(3)
         )
         out = flash_attn_func(q, k, v, causal=True)
@@ -105,7 +110,14 @@ def warm_flash_attn(torch) -> bool:
     return warmed
 
 
-def warm_fla_gdn(torch) -> bool:
+def _training_gdn_kernel():
+    """Warm the native FLA dispatch used by the unmodified upstream trainer."""
+    from fla.ops.gated_delta_rule import chunk_gated_delta_rule
+
+    return chunk_gated_delta_rule
+
+
+def warm_fla_gdn(torch, *, heads: int = 32, head_dim: int = 128) -> bool:
     """Compile flash-linear-attention's Gated-DeltaNet chunk kernels (Qwen3.5/3.6 hybrid path)."""
     try:
         # sm100: tilelang's GDN bwd miscomputes grads — warm the Triton path the worker will run.
@@ -130,9 +142,9 @@ def warm_fla_gdn(torch) -> bool:
             _restrict_fla_gdn_autotune_on_blackwell()
         except Exception as e:
             _log(f"blackwell fla autotune restriction skipped: {e}")
-        from fla.ops.gated_delta_rule import chunk_gated_delta_rule
+        chunk_gated_delta_rule = _training_gdn_kernel()
 
-        b, h, t, d = 1, 4, 256, 64
+        b, h, t, d = 1, heads, 256, head_dim
         q = torch.randn(b, t, h, d, device="cuda", dtype=torch.bfloat16, requires_grad=True)
         k = torch.randn(b, t, h, d, device="cuda", dtype=torch.bfloat16, requires_grad=True)
         v = torch.randn(b, t, h, d, device="cuda", dtype=torch.bfloat16, requires_grad=True)
@@ -163,54 +175,48 @@ def warm_fla_gdn(torch) -> bool:
             _log("flash-linear-attention GDN varlen (cu_seqlens) fwd/bwd compiled")
         except Exception as e:
             _log(f"fla GDN varlen warm skipped: {e}")
+            return False
         return True
     except Exception as e:
         _log(f"fla GDN warm skipped: {e}")
         return False
 
 
-def warm_torch_compile(torch) -> bool:
-    """Trigger a representative ``torch.compile`` so TorchInductor populates its cache."""
+def warm_flashinfer_gdn(torch) -> bool:
+    """Compile vLLM's Hopper GDN prefill library in the pinned training interpreter."""
     try:
+        from flashinfer.gdn_prefill import get_gdn_prefill_module
+        from flashinfer.jit import env
 
-        @torch.compile
-        def _fused(a, b):
-            return torch.nn.functional.gelu(a @ b)
+        from flash.engine.worker.train.core.child import flashinfer_cache
 
-        a = torch.randn(256, 256, device="cuda", dtype=torch.bfloat16)
-        b = torch.randn(256, 256, device="cuda", dtype=torch.bfloat16)
-        _fused(a, b)
+        flashinfer_cache.activate(env)
+        get_gdn_prefill_module()
         torch.cuda.synchronize()
-        _log("torch.compile (TorchInductor) warmed")
+        flashinfer_cache.publish(env, torch)
+        _log("flashinfer GDN prefill library compiled and loaded")
         return True
-    except Exception as e:
-        _log(f"torch.compile warm skipped: {e}")
+    except Exception as error:
+        _log(f"flashinfer GDN prefill warm failed: {error}")
         return False
 
 
-def save_mega_cache(torch, out_dir: str) -> bool:
-    """Persist compiled kernels into a portable blob via ``torch.compiler.save_cache_artifacts()``."""
-    try:
-        artifacts = torch.compiler.save_cache_artifacts()
-        if not artifacts:
-            _log("save_cache_artifacts returned nothing — no compiled kernels to persist")
-            return False
-        blob = artifacts[0] if isinstance(artifacts, tuple) else artifacts
-        os.makedirs(out_dir, exist_ok=True)
-        path = os.path.join(out_dir, MEGA_CACHE_FILENAME)
-        with open(path, "wb") as f:
-            f.write(blob)
-        _log(f"mega-cache saved: {path} ({len(blob)} bytes)")
-        return True
-    except Exception as e:
-        _log(f"save_cache_artifacts failed: {e}")
-        return False
+def has_raw_kernel_cache(out_dir: str) -> bool:
+    """Require compiled artifacts, not just empty directories or lock files."""
+    return any(
+        name.endswith((".cubin", ".ptx", ".so")) and os.path.getsize(os.path.join(root, name)) > 0
+        for subdir in set(KERNEL_CACHE_ENV_SUBDIRS.values())
+        for root, _, files in os.walk(os.path.join(out_dir, subdir))
+        for name in files
+    )
 
 
 def save_cache_metadata(torch, out_dir: str, *, requested_arch: str | None, warmed: int) -> bool:
     try:
         meta = {
             "sm": _torch_sm(torch),
+            "python": f"{sys.version_info.major}.{sys.version_info.minor}",
+            "interpreter": sys.executable,
             "requested_arch": requested_arch,
             "torch": getattr(torch, "__version__", "unknown"),
             "cuda": getattr(getattr(torch, "version", None), "cuda", None),
@@ -219,7 +225,7 @@ def save_cache_metadata(torch, out_dir: str, *, requested_arch: str | None, warm
             "created_at": int(time.time()),
         }
         os.makedirs(out_dir, exist_ok=True)
-        path = os.path.join(out_dir, MEGA_CACHE_META_FILENAME)
+        path = os.path.join(out_dir, CACHE_META_FILENAME)
         with open(path, "w") as f:
             json.dump(meta, f, sort_keys=True)
         _log(f"cache metadata saved: {path} ({meta['sm']})")
@@ -229,23 +235,23 @@ def save_cache_metadata(torch, out_dir: str, *, requested_arch: str | None, warm
         return False
 
 
-def load_mega_cache() -> bool:
-    """Load a baked mega-cache at worker boot; no-op (returns False) if absent or wrong arch."""
-    cache_file = os.path.join(DEFAULT_CACHE_DIR, MEGA_CACHE_FILENAME)
-    meta_file = os.path.join(DEFAULT_CACHE_DIR, MEGA_CACHE_META_FILENAME)
+def configure_kernel_cache() -> bool:
+    """Validate baked raw kernels and point backends at their cache directories."""
+    meta_file = os.path.join(DEFAULT_CACHE_DIR, CACHE_META_FILENAME)
 
     def _reject(reason: str) -> bool:
         # Repoint triton/inductor off baked trees so JIT compiles fresh; wrong-arch entries would collide.
         print(f"[kernel-cache] {reason} -> first-run JIT fallback")
         scratch = os.path.join(tempfile.gettempdir(), "flash-kernelcache-jit")
-        for sub, var in (("triton", "TRITON_CACHE_DIR"), ("inductor", "TORCHINDUCTOR_CACHE_DIR")):
-            d = os.path.join(scratch, sub)
-            os.makedirs(d, exist_ok=True)
-            os.environ[var] = d
+        _point_backends_at(scratch)
         return False
 
-    if not os.path.isfile(cache_file):
-        print(f"[kernel-cache] no baked cache at {cache_file} -> first-run JIT (expected default)")
+    # An unbaked image may accumulate runtime JIT files; leave those alone without probing CUDA.
+    if not os.path.isfile(meta_file):
+        print("[kernel-cache] no baked metadata -> using runtime JIT caches")
+        return False
+    if not has_raw_kernel_cache(DEFAULT_CACHE_DIR):
+        print("[kernel-cache] no baked raw kernels -> first-run JIT")
         return False
     try:
         import torch
@@ -254,8 +260,6 @@ def load_mega_cache() -> bool:
         try:
             with open(meta_file) as f:
                 meta = json.load(f)
-        except FileNotFoundError:
-            return _reject("baked cache has no metadata")
         except Exception as e:
             return _reject(f"metadata unreadable ({e})")
         cached_sm = str(meta.get("sm") or "")
@@ -265,20 +269,56 @@ def load_mega_cache() -> bool:
             return _reject(
                 f"baked cache arch {cached_sm or 'unknown'} does not match worker arch {current_sm}"
             )
-        with open(cache_file, "rb") as f:
-            blob = f.read()
-        torch.compiler.load_cache_artifacts(blob)
-        print(
-            f"[kernel-cache] loaded baked mega-cache for {cached_sm or 'unknown'} "
-            f"({len(blob)} bytes) -> skipping first-run JIT"
-        )
+        for key, current in (
+            ("torch", getattr(torch, "__version__", "unknown")),
+            ("cuda", getattr(getattr(torch, "version", None), "cuda", None)),
+            ("python", f"{sys.version_info.major}.{sys.version_info.minor}"),
+        ):
+            if meta.get(key) != current:
+                return _reject(f"baked cache {key} does not match worker runtime")
+        _point_backends_at(DEFAULT_CACHE_DIR)
+        print(f"[kernel-cache] using baked raw kernel caches for {cached_sm}")
         return True
     except Exception as e:
-        return _reject(f"load skipped ({e})")
+        return _reject(f"cache setup failed ({e})")
 
 
-def warmup(out_dir: str = DEFAULT_CACHE_DIR, arch: str | None = None) -> int:
-    """Run every warm step then persist the mega-cache. Returns a process exit code."""
+@contextlib.contextmanager
+def _cached_kernels_only(torch):
+    """Reject cache misses at the pinned backends' compilation entrypoints."""
+    from torch.utils import cpp_extension
+    from triton.compiler.compiler import ASTSource, IRSource
+
+    targets = [
+        (ASTSource, "make_ir"),
+        (IRSource, "make_ir"),
+        (cpp_extension, "_run_ninja_build"),
+    ]
+    if torch.cuda.get_device_capability(0)[0] == 9:
+        from flashinfer.jit.core import JitSpec
+        from tilelang.jit import JITKernel
+
+        targets.extend([(JITKernel, "_compile_and_create_adapter"), (JitSpec, "build")])
+    originals = [(owner, name, getattr(owner, name)) for owner, name in targets]
+    attempts = []
+
+    def reject(*args, **kwargs):
+        attempts.append(True)
+        raise RuntimeError("kernel cache miss: compilation is forbidden during reload validation")
+
+    try:
+        for owner, name, _original in originals:
+            setattr(owner, name, reject)
+        yield attempts
+    finally:
+        for owner, name, original in originals:
+            setattr(owner, name, original)
+
+
+def warmup(
+    out_dir: str = DEFAULT_CACHE_DIR, arch: str | None = None, *, verify_cache: bool = False
+) -> int:
+    """Warm real training kernels and persist raw caches plus architecture metadata."""
     t0 = time.time()
     _point_backends_at(out_dir)
     if arch:
@@ -299,22 +339,36 @@ def warmup(out_dir: str = DEFAULT_CACHE_DIR, arch: str | None = None) -> int:
                 "re-run on a matching GPU."
             )
             return 1
-    warmed = sum(
-        [
-            warm_flash_attn(torch),
-            warm_fla_gdn(torch),
-            warm_torch_compile(torch),
-        ]
+    groups = [warm_flash_attn, warm_fla_gdn]
+    if torch.cuda.get_device_capability(0)[0] == 9:
+        groups.append(warm_flashinfer_gdn)
+    guard = _cached_kernels_only(torch) if verify_cache else contextlib.nullcontext([])
+    with guard as compile_attempts:
+        warmed = sum(group(torch) for group in groups)
+    _log(f"{warmed}/{len(groups)} kernel groups warmed in {time.time() - t0:.1f}s")
+    has_kernels = has_raw_kernel_cache(out_dir)
+    meta_saved = (
+        os.path.isfile(os.path.join(out_dir, CACHE_META_FILENAME))
+        if verify_cache
+        else (save_cache_metadata(torch, out_dir, requested_arch=arch, warmed=warmed))
     )
-    _log(f"{warmed}/3 kernel groups compiled in {time.time() - t0:.1f}s; saving mega-cache")
-    saved = save_mega_cache(torch, out_dir)
-    meta_saved = save_cache_metadata(torch, out_dir, requested_arch=arch, warmed=warmed)
-    _log(f"done in {time.time() - t0:.1f}s (saved={saved})")
-    return 0 if saved and meta_saved else 1
+    passed = warmed == len(groups) and meta_saved and has_kernels and not compile_attempts
+    if verify_cache:
+        with open(os.path.join(out_dir, "cache_reload.json"), "w") as output:
+            json.dump(
+                {
+                    "compilation_forbidden": True,
+                    "compile_attempts": len(compile_attempts),
+                    "passed": passed,
+                },
+                output,
+            )
+    _log(f"done in {time.time() - t0:.1f}s (raw_kernels={has_kernels}, metadata={meta_saved})")
+    return 0 if passed else 1
 
 
 def main() -> int:
-    ap = argparse.ArgumentParser(description="pre-compile hot worker kernels and bake a mega-cache")
+    ap = argparse.ArgumentParser(description="pre-compile hot worker kernels and bake their caches")
     ap.add_argument(
         "--arch",
         default=None,
@@ -323,10 +377,13 @@ def main() -> int:
     ap.add_argument(
         "--out",
         default=DEFAULT_CACHE_DIR,
-        help=f"cache output dir (default: {DEFAULT_CACHE_DIR}); the bake produces <out>/{MEGA_CACHE_FILENAME}",
+        help=f"cache output dir (default: {DEFAULT_CACHE_DIR}); the bake produces raw kernel caches and architecture metadata",
+    )
+    ap.add_argument(
+        "--verify-cache", action="store_true", help="reject compilation on cache reload"
     )
     args = ap.parse_args()
-    return warmup(out_dir=args.out, arch=args.arch)
+    return warmup(out_dir=args.out, arch=args.arch, verify_cache=args.verify_cache)
 
 
 if __name__ == "__main__":

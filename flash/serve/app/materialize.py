@@ -7,7 +7,6 @@ import ctypes
 import errno
 import fcntl
 import hashlib
-import json
 import os
 import shutil
 import stat
@@ -16,6 +15,11 @@ from collections.abc import Callable, Iterator, Mapping
 from pathlib import Path
 from typing import Any
 
+from flash.adapters.config import (
+    AdapterConfigError,
+    DeclaredAdapterConfig,
+    parse_declared_adapter_config,
+)
 from flash.adapters.fused_experts import (
     has_complete_fused_expert_tensors,
     lora_target_parameters,
@@ -23,11 +27,10 @@ from flash.adapters.fused_experts import (
 )
 from flash.adapters.lora_rank import (
     lora_tensor_rank_disagrees,
-    rank_from_adapter_config,
     strict_declared_lora_ranks,
 )
 from flash.engine.worker.model.lora import _read_safetensors_tensor_metadata
-from flash.serve.contract import reject_non_finite_json_constant
+from flash.serve.runtime.hub import TOKENIZER_WEIGHT_PATTERNS
 
 from .manifest import ArtifactFile, ManifestAdapter, ServingManifest
 from .progress import emit_boot_progress
@@ -144,6 +147,12 @@ def base_weights_are_cached(
                 revision=revision,
                 cache_dir=cache_dir,
                 local_files_only=True,
+                **(
+                    {"ignore_patterns": list(TOKENIZER_WEIGHT_PATTERNS)}
+                    if (repo_id, revision)
+                    != (manifest.engine.served_model, manifest.engine.model_revision)
+                    else {}
+                ),
             )
         except Exception:
             return False
@@ -199,6 +208,14 @@ def hydrate_base_weights(
                     revision=revision,
                     token=token,
                     cache_dir=str(cache_dir),
+                    # A separate tokenizer revision needs configs and vocabulary, not
+                    # another full copy of the unquantized model's tensor shards.
+                    **(
+                        {"ignore_patterns": list(TOKENIZER_WEIGHT_PATTERNS)}
+                        if (repo_id, revision)
+                        != (manifest.engine.served_model, manifest.engine.model_revision)
+                        else {}
+                    ),
                 )
             except Exception:
                 # the repo id is manifest data and safe to name, but the exception can carry the
@@ -274,7 +291,7 @@ def _materialize_all(
     root = _prepare_cache_root(cache_root)
     hydrated: dict[str, Path] = {}
     for adapter in manifest.adapters:
-        hydrated[adapter.adapter_revision] = _materialize_adapter(
+        hydrated[adapter.checkpoint_id] = _materialize_adapter(
             adapter,
             manifest,
             root,
@@ -359,24 +376,24 @@ def locked_manifest_cache(
     if type(manifest) is not ServingManifest:
         raise MaterializationError("cache validation requires an exact ServingManifest")
     root = _prepare_cache_root(cache_root)
-    adapters = tuple(sorted(manifest.adapters, key=lambda adapter: adapter.aggregate_sha256))
+    digests = sorted({adapter.aggregate_sha256 for adapter in manifest.adapters})
     with contextlib.ExitStack() as locks:
-        for adapter in adapters:
-            lock_path = root / ".locks" / f"{adapter.aggregate_sha256}.lock"
+        for digest in digests:
+            lock_path = root / ".locks" / f"{digest}.lock"
             locks.enter_context(_digest_lock(lock_path))
         paths = {
-            adapter.adapter_revision: adapter_cache_path(root, adapter)
+            adapter.checkpoint_id: adapter_cache_path(root, adapter)
             for adapter in manifest.adapters
         }
         for adapter in manifest.adapters:
-            validate_materialized_adapter(adapter, manifest, paths[adapter.adapter_revision])
+            validate_materialized_adapter(adapter, manifest, paths[adapter.checkpoint_id])
         try:
             yield paths
         except BaseException:
             raise
         else:
             for adapter in manifest.adapters:
-                validate_materialized_adapter(adapter, manifest, paths[adapter.adapter_revision])
+                validate_materialized_adapter(adapter, manifest, paths[adapter.checkpoint_id])
 
 
 def validate_manifest_cache(
@@ -398,13 +415,20 @@ def validate_materialized_adapter(
 
     directory = Path(path)
     before, contents = _read_exact_regular_files(directory, adapter.files)
-    config = _load_strict_config(contents[_CONFIG_NAME])
-    _validate_adapter_config(config, adapter, manifest)
-    validate_adapter_weight_structure(directory / _WEIGHTS_NAME, config, adapter.base_model)
+    # the config-only rules are the shared reader's, so admission and this container reach the same
+    # verdict on the same bytes by construction. only the rules that need the manifest live here.
+    try:
+        declared = parse_declared_adapter_config(contents[_CONFIG_NAME], source=_CONFIG_NAME)
+    except AdapterConfigError as exc:
+        raise MaterializationError(str(exc)) from exc
+    _validate_against_manifest(declared, adapter, manifest)
+    validate_adapter_weight_structure(
+        directory / _WEIGHTS_NAME, declared.config, adapter.base_model
+    )
     after, _ = _read_exact_regular_files(directory, adapter.files)
     if after != before:
         raise MaterializationError("adapter cache entry changed during validation")
-    return config
+    return declared.config
 
 
 def validate_adapter_weight_structure(
@@ -566,8 +590,8 @@ def _validate_cache_ancestor_stat(
         raise MaterializationError(f"{name} is not a directory")
     owner = details.st_uid
     writable = bool(details.st_mode & 0o022)
-    # root-owned shared directories include sticky /tmp and runpod's non-sticky 0777 moosefs mount.
-    # only root can replace their entries, while every inner cache object must still be owned by us.
+    # root-owned shared directories may be sticky or expose fixed world-writable modes. only root can
+    # replace their entries, while every inner cache object must still be owned by us.
     # filesystems that cannot store modes rely on the manifest digest and before/after identity
     # checks instead; _permission_bits_are_enforceable distinguishes those mounts below.
     root_shared = owner == 0
@@ -585,7 +609,7 @@ def _validate_cache_ancestor_stat(
 def _permission_bits_are_enforceable(directory_fd: int) -> bool:
     """report whether this filesystem preserves a private mode on a probe directory.
 
-    runpod's moosefs mount reports fixed 0777/0666 modes, so a capability probe avoids an
+    some mounted filesystems report fixed 0777/0666 modes, so a capability probe avoids an
     unsatisfiable assertion without coupling the policy to a provider or filesystem name.
     """
 
@@ -689,8 +713,9 @@ def _copy_regular_file(source: Path, destination: Path) -> None:
     write_flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0)
     write_flags |= getattr(os, "O_NOFOLLOW", 0)
     source_fd = os.open(source, read_flags)
-    destination_fd = os.open(destination, write_flags, 0o600)
+    destination_fd = None
     try:
+        destination_fd = os.open(destination, write_flags, 0o600)
         source_before = os.fstat(source_fd)
         if not stat.S_ISREG(source_before.st_mode):
             raise MaterializationError("downloaded artifact entry is not a regular file")
@@ -704,7 +729,8 @@ def _copy_regular_file(source: Path, destination: Path) -> None:
         if _stable_file_identity(os.fstat(source_fd)) != _stable_file_identity(source_before):
             raise MaterializationError("downloaded artifact changed while it was copied")
     finally:
-        os.close(destination_fd)
+        if destination_fd is not None:
+            os.close(destination_fd)
         os.close(source_fd)
 
 
@@ -848,29 +874,6 @@ def _stable_file_identity(details: os.stat_result) -> tuple[int, ...]:
     return (*_stable_directory_identity(details), details.st_size)
 
 
-def _load_strict_config(raw: bytes) -> dict[str, Any]:
-    try:
-        config = json.loads(
-            raw.decode("utf-8"),
-            object_pairs_hook=_reject_duplicate_keys,
-            parse_constant=reject_non_finite_json_constant,
-        )
-    except (UnicodeDecodeError, ValueError) as exc:
-        raise MaterializationError("adapter_config.json is not strict utf-8 json") from exc
-    if type(config) is not dict:
-        raise MaterializationError("adapter_config.json must contain a json object")
-    return config
-
-
-def _reject_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
-    result: dict[str, Any] = {}
-    for key, value in pairs:
-        if key in result:
-            raise MaterializationError("adapter_config.json contains a duplicate key")
-        result[key] = value
-    return result
-
-
 def _validate_lora_pairs(tensors: Mapping[str, tuple[int, ...]]) -> None:
     pairs: dict[tuple[str, str], dict[str, tuple[int, ...]]] = {}
     for key, shape in tensors.items():
@@ -927,30 +930,21 @@ def _validate_lora_pairs(tensors: Mapping[str, tuple[int, ...]]) -> None:
             )
 
 
-def _validate_adapter_config(
-    config: Mapping[str, Any],
+def _validate_against_manifest(
+    declared: DeclaredAdapterConfig,
     adapter: ManifestAdapter,
     manifest: ServingManifest,
 ) -> None:
-    if config.get("peft_type") != "LORA":
-        raise MaterializationError("adapter_config.json peft_type must be LORA")
-    if config.get("task_type") not in {None, "CAUSAL_LM"}:
-        raise MaterializationError("adapter_config.json task_type must be absent or CAUSAL_LM")
-    if config.get("base_model_name_or_path") != adapter.base_model:
+    """check only what the config alone cannot decide: agreement with this exact manifest."""
+
+    if declared.base_model != adapter.base_model:
         raise MaterializationError("adapter logical base model does not match the manifest")
-    revision = config.get("revision")
-    if revision is not None and revision != "" and revision != adapter.base_model_revision:
+    # an absent revision means the adapter never pinned one, which every manifest satisfies.
+    if declared.base_revision is not None and declared.base_revision != adapter.base_model_revision:
         raise MaterializationError("adapter logical base revision does not match the manifest")
-    modules_to_save = config.get("modules_to_save")
-    if modules_to_save is not None and modules_to_save != []:
-        raise MaterializationError("modules_to_save adapters are not supported")
-    try:
-        declared_rank = rank_from_adapter_config(config, source="adapter_config.json")
-    except ValueError as exc:
-        raise MaterializationError("adapter_config.json has invalid LoRA rank metadata") from exc
-    if declared_rank != adapter.lora_rank:
+    if declared.lora_rank != adapter.lora_rank:
         raise MaterializationError("adapter declared rank does not match the manifest")
-    if declared_rank > manifest.engine.max_lora_rank:
+    if declared.lora_rank > manifest.engine.max_lora_rank:
         raise MaterializationError("adapter declared rank exceeds the engine rank ceiling")
 
 

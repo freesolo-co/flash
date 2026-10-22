@@ -16,7 +16,7 @@ dist/
 build/*
 # ...but keep the opt-in kernel-cache staging dir in the build context: Dockerfile.worker
 # copies build/kernel_cache/ (the .keep placeholder makes the source always exist; the
-# gpu-produced mega_cache.bin + mega_cache.json ride along on a kernel-cache bake).
+# GPU-produced kernel caches and architecture metadata ride along on a kernel-cache bake).
 !build/kernel_cache/
 !build/kernel_cache/**
 *.egg-info/

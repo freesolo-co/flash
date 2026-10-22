@@ -7,8 +7,8 @@ from pathlib import Path
 
 import pytest
 
-import flash.source_snapshot as source_snapshot
-from flash.source_snapshot import (
+import flash.snapshot.archive as source_snapshot
+from flash.snapshot.archive import (
     SourceSnapshotDescriptor,
     SourceSnapshotError,
     attempt_materialization_path,
@@ -55,6 +55,15 @@ def _archive(
 def _payload(archive: bytes) -> dict[str, bytes]:
     with zipfile.ZipFile(io.BytesIO(archive)) as source:
         return {info.filename: source.read(info) for info in source.infolist()}
+
+
+def test_default_archive_root_is_the_flash_package() -> None:
+    payload = _payload(build_source_archive())
+    assert "flash/__init__.py" in payload
+    assert "flash/cli/__init__.py" in payload
+    assert "flash/providers/__init__.py" in payload
+    assert "flash/snapshot/archive.py" in payload
+    assert len(payload) > 100
 
 
 def test_archive_is_deterministic_and_contains_only_canonical_package_files(tmp_path: Path) -> None:

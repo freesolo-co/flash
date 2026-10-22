@@ -2,10 +2,13 @@ from __future__ import annotations
 
 import builtins
 import sys
+from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
 
+import flash.engine.worker.io.heartbeat as worker_heartbeat
+import flash.engine.worker.io.hf as worker_hf
 from flash.core.grpo import GRPO_NATIVE_THREAD_ENV
 from flash.core.spec import FIXED_SEED, EnvironmentSpec, JobSpec, TrainSpec
 from flash.engine.plan.steps import (
@@ -17,7 +20,7 @@ from flash.engine.plan.steps import (
 from flash.schema import ConfigError, spec_and_train_keys_from_file, spec_from_dict
 
 _BASE_TOML = """
-model = "Qwen/Qwen3.5-0.8B"
+model = "Qwen/Qwen3.5-9B"
 algorithm = "grpo"
 
 [environment]
@@ -182,39 +185,9 @@ def test_positive_save_every_is_preserved():
     assert TrainSpec(save_every=20).save_every == 20
 
 
-def test_resume_first_companion_retries_without_reuploading_full_state(monkeypatch, tmp_path):
-    import flash.engine.worker as worker
-    from flash.engine.worker.io import hf as worker_hf
-
-    calls = {"resume": 0, "deployable": 0}
-
-    class Api:
-        def upload_folder(self, **kwargs):
-            assert kwargs["path_in_repo"].endswith("/checkpoint/checkpoint-4")
-            calls["resume"] += 1
-
-        def list_repo_files(self, **_kwargs):
-            return []
-
-    def publish_once_then_succeed():
-        calls["deployable"] += 1
-        if calls["deployable"] == 1:
-            raise ConnectionError("hf deployable upload unavailable")
-
-    monkeypatch.setattr(worker, "HF_REPO", "org/runs")
-    monkeypatch.setattr(worker, "hf_api", lambda: Api())
-    monkeypatch.setattr(worker, "heartbeat", lambda *args, **kwargs: None)
-    monkeypatch.setattr(worker_hf, "_CKPT_UPLOAD_BACKOFF_S", 0.0)
-
-    assert worker_hf.upload_resume_checkpoint(
-        4, str(tmp_path), after_upload=publish_once_then_succeed
-    )
-    assert calls == {"resume": 1, "deployable": 2}
-
-
-def test_resume_checkpoint_failure_heartbeat_surfaces_sanitized_error(monkeypatch, tmp_path):
-    import flash.engine.worker as worker
-    from flash.engine.worker.io import hf as worker_hf
+def test_resume_checkpoint_failure_heartbeat_surfaces_sanitized_error(
+    worker_context, monkeypatch, tmp_path
+):
 
     secret = "hf_checkpoint_upload_secret"
     calls = 0
@@ -227,14 +200,20 @@ def test_resume_checkpoint_failure_heartbeat_surfaces_sanitized_error(monkeypatc
             raise PermissionError(f"hf quota refused credential {secret} " + "x" * 400)
 
     monkeypatch.setenv("HF_TOKEN", secret)
-    monkeypatch.setattr(worker, "HF_REPO", "org/runs")
-    monkeypatch.setattr(worker, "hf_api", lambda: Api())
     monkeypatch.setattr(
-        worker, "heartbeat", lambda stage, **kwargs: heartbeats.append((stage, kwargs))
+        worker_context, "config", replace(worker_context.config, hf_repo="org/runs")
+    )
+    monkeypatch.setattr(worker_hf, "hf_api", lambda: Api())
+    monkeypatch.setattr(
+        worker_heartbeat,
+        "heartbeat",
+        lambda stage, context=None, **kwargs: heartbeats.append((stage, kwargs)),
     )
     monkeypatch.setattr(worker_hf, "_CKPT_UPLOAD_BACKOFF_S", 0.0)
 
-    assert not worker_hf.upload_resume_checkpoint(50, str(tmp_path))
+    assert (
+        worker_hf.upload_resume_checkpoint(50, str(tmp_path), context=worker_context).resume is None
+    )
 
     failed = [fields for stage, fields in heartbeats if stage == "checkpoint_upload_failed"]
     assert calls == worker_hf._CKPT_UPLOAD_RETRIES
@@ -249,53 +228,13 @@ def test_resume_checkpoint_failure_heartbeat_surfaces_sanitized_error(monkeypatc
     assert len(failure["error"]) <= 300
 
 
-@pytest.mark.parametrize("failure_stage", ["before", "after"])
-def test_resume_checkpoint_companion_failure_still_raises(monkeypatch, tmp_path, failure_stage):
-    import flash.engine.worker as worker
-    from flash.engine.worker.io import hf as worker_hf
-
-    calls = {"resume": 0, "companion": 0}
-    heartbeats: list[tuple[str, dict]] = []
-
-    class Api:
-        def upload_folder(self, **_kwargs):
-            calls["resume"] += 1
-
-        def list_repo_files(self, **_kwargs):
-            return []
-
-    def fail_companion():
-        calls["companion"] += 1
-        raise RuntimeError(f"{failure_stage} companion failed")
-
-    callbacks = {f"{failure_stage}_upload": fail_companion}
-    monkeypatch.setattr(worker, "HF_REPO", "org/runs")
-    monkeypatch.setattr(worker, "hf_api", lambda: Api())
-    monkeypatch.setattr(
-        worker, "heartbeat", lambda stage, **kwargs: heartbeats.append((stage, kwargs))
-    )
-    monkeypatch.setattr(worker_hf, "_CKPT_UPLOAD_BACKOFF_S", 0.0)
-
-    with pytest.raises(RuntimeError, match=f"{failure_stage} companion failed"):
-        worker_hf.upload_resume_checkpoint(50, str(tmp_path), **callbacks)
-
-    failed = [fields for stage, fields in heartbeats if stage == "checkpoint_upload_failed"]
-    assert calls["companion"] == worker_hf._CKPT_UPLOAD_RETRIES
-    assert calls["resume"] == (0 if failure_stage == "before" else 1)
-    assert len(failed) == 1
-    failure = failed[0]["checkpoint_failure"]
-    assert failure["step"] == 50
-    assert failure["operation"] == failure_stage
-    assert f"{failure_stage} companion failed" in failure["error"]
-
-
 def test_upload_failure_cause_reaches_the_rendered_run_log():
     """The payload is not the deliverable: `get_logs()` shows only what the formatter renders.
 
     The formatter emits a fixed list of numeric metric keys, so a stage whose entire content is an
     explanation rather than a measurement committed the cause and printed `stage=... step=50` alone.
     """
-    from flash.providers._lifecycle.poll import _format_heartbeat
+    from flash.providers._lifecycle.instances.poll import _format_heartbeat
 
     line = _format_heartbeat(
         {
@@ -323,7 +262,7 @@ def test_a_failure_cause_cannot_rewrite_the_log_it_is_printed_in():
     raw would let a `\\x1b[2J` clear the screen or a `\\r` overwrite the line the user is reading
     the failure in -- and the failure report is exactly when the log has to stay legible.
     """
-    from flash.providers._lifecycle.poll import _format_heartbeat
+    from flash.providers._lifecycle.instances.poll import _format_heartbeat
 
     line = _format_heartbeat(
         {
@@ -344,7 +283,7 @@ def test_a_failure_cause_cannot_rewrite_the_log_it_is_printed_in():
 
 def test_a_heartbeat_without_a_failure_cause_is_unchanged():
     """The failure fields are additive: an ordinary step line must not grow an empty `error=`."""
-    from flash.providers._lifecycle.poll import _format_heartbeat
+    from flash.providers._lifecycle.instances.poll import _format_heartbeat
 
     line = _format_heartbeat(
         {"stage": "sft_step", "step": 12, "error": "   ", "checkpoint_failure": {}}
@@ -437,7 +376,7 @@ def test_seed_host_rngs_reaches_the_dataset_generators_without_importing_torch(m
 
 
 def test_worker_seed_prefers_jobspec_when_present():
-    from flash.engine.worker import _resolve_worker_seed
+    from flash.engine.worker.runtime.state import _resolve_worker_seed
 
     assert _resolve_worker_seed(SimpleNamespace(seed=123), "999") == 123
     assert _resolve_worker_seed(None, "999") == 999
@@ -447,31 +386,34 @@ def test_worker_seed_prefers_jobspec_when_present():
 
 
 def test_provider_worker_env_emits_authoritative_spec_seed():
-    from flash.providers._lifecycle.worker import build_worker_env
+    """The spec is the only seed channel, so no caller can supply a second one to disagree with."""
+    import inspect
+
+    from flash.providers._lifecycle.net.worker import build_worker_env
 
     spec = JobSpec(model="model", seed=987)
-    assert build_worker_env(spec, 987)["SEED"] == "987"
-    with pytest.raises(ValueError, match=r"does not match JobSpec\.seed"):
-        build_worker_env(spec, 42)
+    assert build_worker_env(spec)["SEED"] == "987"
+    assert "seed" not in inspect.signature(build_worker_env).parameters
 
 
-def test_lifecycle_rejects_seed_mismatch_before_provider_work():
-    from flash.runner.supervise.lifecycle import _submit_seed_supervised
+def test_every_attempt_of_a_run_shares_the_one_authoritative_seed():
+    """A run owns one seed; an attempt is a fresh host for that same run, never a new identity."""
+    from flash.providers._lifecycle.net.worker import build_worker_env
 
     spec = JobSpec(model="model", seed=987)
-    with pytest.raises(ValueError, match=r"does not match JobSpec\.seed"):
-        _submit_seed_supervised(spec, 42, SimpleNamespace())
+    seeds = {build_worker_env(spec)["SEED"] for _ in range(3)}
+    assert seeds == {"987"}
 
 
 def test_sft_under_ran_only_fails_a_genuine_under_run():
-    from flash.engine.worker.entry.sft import sft_under_ran
+    from flash.engine.profiling.sft_rows import sft_finished_before_expected_steps
 
     # a real under-run (fewer updates than the quoted horizon) fails loudly.
-    assert sft_under_ran(9, 10)
+    assert sft_finished_before_expected_steps(9, 10)
     # a fresh run landed exactly on the horizon passes.
-    assert not sft_under_ran(10, 10)
+    assert not sft_finished_before_expected_steps(10, 10)
     # a resume from a checkpoint past a lowered horizon did zero new steps yet is fully trained.
-    assert not sft_under_ran(12, 10)
+    assert not sft_finished_before_expected_steps(12, 10)
 
 
 def test_grpo_under_ran_only_fails_a_genuine_under_run():
@@ -483,9 +425,9 @@ def test_grpo_under_ran_only_fails_a_genuine_under_run():
     import inspect
     import textwrap
 
-    from flash.engine.worker import rl_train
+    from flash.engine.worker.train.entry import rl_train
 
-    tree = ast.parse(textwrap.dedent(inspect.getsource(rl_train.run_rl_train)))
+    tree = ast.parse(textwrap.dedent(inspect.getsource(rl_train._publish_rl_result)))
     compares = [
         node
         for node in ast.walk(tree)
@@ -522,23 +464,22 @@ def test_from_dict_rejects_misspelled_train_key():
 
 
 def test_runtime_secret_cannot_override_control_plane_seed():
-    from flash.providers._lifecycle.worker import build_worker_env
+    from flash.providers._lifecycle.net.worker import build_worker_env
 
     # a directly-constructed spec can declare a seed env secret (the toml schema rejects it, but
     # json/direct construction does not). the built worker env must still hold the canonical seed.
     spec = JobSpec(model="m", seed=987, environment=EnvironmentSpec(id="e", secrets=("SEED",)))
-    env = build_worker_env(spec, 987, runtime_secrets={"SEED": "7"})
+    env = build_worker_env(spec, runtime_secrets={"SEED": "7"})
     assert env["SEED"] == "987"
 
 
 def test_provider_worker_env_carries_control_plane_resume_revision():
-    from flash.providers._lifecycle.worker import build_worker_env
+    from flash.providers._lifecycle.net.worker import build_worker_env
     from flash.teacher.retry_contract import OPD_RESUME_REVISION_ENV
 
     spec = JobSpec(model="m", algorithm="opd", seed=987)
     env = build_worker_env(
         spec,
-        987,
         runtime_secrets={
             OPD_RESUME_REVISION_ENV: "a" * 40,
             "FLASH_PUBLIC_URL": "https://broker.example",
@@ -551,7 +492,7 @@ def test_provider_worker_env_carries_control_plane_resume_revision():
 def test_toml_environment_secrets_reject_control_plane_seed(tmp_path):
     path = tmp_path / "seed-secret.toml"
     path.write_text(
-        'model = "Qwen/Qwen3.5-0.8B"\n'
+        'model = "Qwen/Qwen3.5-9B"\n'
         'algorithm = "grpo"\n'
         "[environment]\n"
         'id = "freesolo/example-project/gsm8k"\n'
@@ -567,7 +508,7 @@ def test_toml_environment_secrets_reject_control_plane_seed(tmp_path):
 
 def _spec_with_declared_secret(algorithm: str, secret: str) -> dict:
     return {
-        "model": "Qwen/Qwen3.5-4B",
+        "model": "Qwen/Qwen3.5-9B",
         "algorithm": algorithm,
         "environment": {"id": "owner/project/env", "secrets": [secret]},
         "train": {"epochs": 1},
@@ -598,3 +539,110 @@ def test_all_algorithms_reject_unconditional_control_plane_secrets(algorithm):
         match=r"\[environment\] secrets must not include platform-managed key\(s\): SEED",
     ):
         spec_from_dict(_spec_with_declared_secret(algorithm, "SEED"))
+
+
+@pytest.mark.parametrize("failure", ["report", "prune", "none"])
+def test_resume_commit_survives_post_commit_failures(
+    worker_context, monkeypatch, tmp_path, failure
+):
+    from types import SimpleNamespace
+
+    calls = []
+
+    class Api:
+        def upload_folder(self, **kwargs):
+            calls.append(kwargs["path_in_repo"])
+            return SimpleNamespace(oid="immutable-revision")
+
+        def list_repo_files(self, **kwargs):
+            if failure == "prune":
+                raise OSError("pruning unavailable")
+            return []
+
+    def report(*args, **kwargs):
+        if failure == "report":
+            raise OSError("reporting unavailable")
+
+    monkeypatch.setattr(
+        worker_context, "config", replace(worker_context.config, hf_repo="org/runs")
+    )
+    monkeypatch.setattr(worker_hf, "hf_api", lambda: Api())
+    monkeypatch.setattr(worker_heartbeat, "heartbeat", report)
+    result = worker_hf.upload_resume_checkpoint(4, str(tmp_path), context=worker_context)
+    assert result.resume.revision == "immutable-revision"
+    assert len(calls) == 1
+    assert bool(result.reporting_error) == (failure == "report")
+    assert bool(result.prune_errors) == (failure == "prune")
+    with pytest.raises(TypeError, match="commit facts"):
+        bool(result)
+
+
+def test_resume_without_repository_is_not_a_commit(worker_context, monkeypatch, tmp_path):
+    monkeypatch.setattr(worker_context, "config", replace(worker_context.config, hf_repo=""))
+    result = worker_hf.upload_resume_checkpoint(4, str(tmp_path), context=worker_context)
+    assert result.resume is None
+    assert result.skipped_reason == "no_repository"
+
+
+def test_resume_transport_cleanup_failure_still_clears_previous_failure(
+    worker_context, monkeypatch, tmp_path
+):
+    import json
+    from contextlib import contextmanager
+    from pathlib import Path
+
+    from flash.engine.support import checkpoint_transport
+    from flash.engine.worker.runtime.state import WorkerContext
+
+    uploads = []
+    reports = []
+
+    @contextmanager
+    def broken_cleanup(directory):
+        yield directory
+        raise OSError("transport cleanup failed")
+
+    class Api:
+        def upload_folder(self, **kwargs):
+            uploads.append(kwargs)
+            return SimpleNamespace(oid="resume-commit")
+
+        def list_repo_files(self, **kwargs):
+            raise OSError("pruning unavailable")
+
+    def upload_report(path, *args, **kwargs):
+        reports.append(json.loads(Path(path).read_text()))
+        return True
+
+    monkeypatch.setattr(
+        worker_context, "config", replace(worker_context.config, hf_repo="org/runs")
+    )
+    monkeypatch.setattr(worker_hf, "hf_api", Api)
+    monkeypatch.setattr(worker_hf, "hf_upload_file", upload_report)
+    monkeypatch.setattr(checkpoint_transport, "upload_directory", broken_cleanup)
+    worker_heartbeat.heartbeat(
+        "checkpoint_upload_failed",
+        step=3,
+        checkpoint_failure={"step": 3, "error": "old failure"},
+        context=worker_context,
+    )
+    other_attempt = WorkerContext(replace(worker_context.config, run_id="other-run"))
+    other_failure = {"step": 2, "error": "other failure"}
+    worker_heartbeat.heartbeat(
+        "checkpoint_upload_failed", step=2, checkpoint_failure=other_failure, context=other_attempt
+    )
+
+    result = worker_hf.upload_resume_checkpoint(4, str(tmp_path), context=worker_context)
+    worker_heartbeat.heartbeat("done", step=4, context=worker_context)
+
+    assert result.resume.revision == "resume-commit"
+    assert len(uploads) == 1
+    assert result.upload_error is None
+    assert result.prune_errors == (
+        "OSError: transport cleanup failed",
+        "OSError: pruning unavailable",
+    )
+    assert worker_context.heartbeat_state.pending_checkpoint_failure is None
+    assert other_attempt.heartbeat_state.pending_checkpoint_failure == other_failure
+    assert reports[-1]["stage"] == "done"
+    assert "checkpoint_failure" not in reports[-1]

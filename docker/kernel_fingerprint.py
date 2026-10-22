@@ -8,8 +8,8 @@ read by three places:
 
 Two fingerprints, because "out of date" has two flavors with very different costs:
 
-  * fp_cache = hash of the inputs whose kernels live in the baked mega-cache
-    (torch.compiler.save_cache_artifacts: Triton/Inductor/torch.compile). Changing one of these
+  * fp_cache = hash of the inputs whose kernels live in the baked kernel cache
+    (raw compiled kernels and their backend cache files). Changing one of these
     INVALIDATES the cache, so the per-arch image needs a real GPU re-warm. These are: the base
     FROM image (torch+triton), the fla git pin, tilelang, apache-tvm-ffi, and the warmup script
     itself (it decides which kernels get compiled).
@@ -20,9 +20,9 @@ Two fingerprints, because "out of date" has two flavors with very different cost
     per-arch tag is sitting on an old base, so it just needs a cheap re-layer (no GPU). fp_base folds
     fp_cache in, so it always moves when fp_cache does.
 
-A stale baked cache is a SILENT cold-JIT (the worker only validates by SM, then torch.compiler
-ignores a mismatched blob), never a crash. So a missing or wrong input here is invisible at run
-time, which is why every parse below FAILS LOUD rather than hashing a None.
+A stale baked cache can cause cold-JIT when backend cache keys no longer match. The worker
+validates the GPU architecture; these fingerprints track changes to the image and warmup inputs.
+Every parse below FAILS LOUD rather than silently hashing a None.
 
 Known limitations (deliberately scoped -- each only ever costs a recoverable cold-JIT, never
 correctness, and the alternatives over-fire the paid GPU bake):
@@ -31,11 +31,11 @@ correctness, and the alternatives over-fire the paid GPU bake):
     text change; a future cache-affecting RANGE would reintroduce that gap. (fp_base DOES hash the
     whole Dockerfile.worker, so arbitrary base edits -- apt/ENV/CMD/cache-dir -- still trigger a
     free re-layer; only a cache-affecting change that isn't a parsed pin slips through.)
-  * fp_cache hashes runtime/kernel_warmup.py but not its transitive cache-production deps (perf's Hopper
-    fla/tilelang setup, docker/bake_pod_entry.py's pod-side install/invoke). The kernel-DETERMINING
+  * fp_cache hashes the warmup, bake entry and AOT helper, but not all transitive inputs such as
+    perf's Hopper fla/tilelang setup. The kernel-DETERMINING
     versions (tilelang/tvm-ffi/fla) ARE captured here; that code is otherwise stable or fetched fresh
     at runtime, so a change there only risks a stale (mostly sm90) cache that cold-JITs. Hashing all
-    of perf / bake_pod_entry would re-warm 5 GPUs on every unrelated edit.
+    of perf would re-warm 5 GPUs on every unrelated edit.
 
 stdlib only, no flash/torch import, so it runs under a bare python3 in CI (no uv sync needed).
 """
@@ -55,7 +55,7 @@ LABEL_FP_CACHE = "co.freesolo.flash.kernelcache.fp_cache"
 LABEL_FP_BASE = "co.freesolo.flash.kernelcache.fp_base"
 LABEL_REVISION = "org.opencontainers.image.revision"
 
-# pip specs in Dockerfile.worker's main stack whose kernels land in the mega-cache. everything else
+# pip specs in Dockerfile.worker's main stack whose kernels land in the kernel cache. everything else
 # in that block is a base-layer dep (fp_base). fla is matched separately (it carries the git sha).
 _CACHE_PKGS = {"tilelang", "apache-tvm-ffi"}
 _BAKED_ARCHES_NAME = "BAKED_PER_SM_ARCHES"
@@ -194,8 +194,20 @@ def collect_inputs(
         "fla": fla,
         "tilelang": _need("tilelang"),
         "tvm_ffi": _need("apache-tvm-ffi"),
+        # Training kernels are baked in the isolated interpreter; changes to its dependency
+        # block must invalidate the bake even if the parent stack is unchanged.
+        "verl_stack": _search(
+            r"(ARG VERL_SPEC=.*?&& rm -f /tmp/verl-overrides.txt)",
+            dockerfile,
+            "Verl stack",
+            flags=re.S,
+        ),
+        "bake_entry_sha256": _sha256_file(root / "docker" / "bake_sandbox_entry.py"),
         "kernel_warmup_sha256": _sha256_file(
             root / "flash" / "engine" / "worker" / "runtime" / "kernel_warmup.py"
+        ),
+        "flashinfer_aot_sha256": _sha256_file(
+            root / "flash/engine/worker/train/core/child/flashinfer_cache.py"
         ),
     }
 
@@ -223,7 +235,7 @@ def collect_inputs(
 
     base_inputs_partial = {
         "fa2": fa2_spec,
-        # NOT cache_inputs: a wheel digest change leaves the Triton/Inductor mega-cache valid (the
+        # NOT cache_inputs: a wheel digest change leaves the Triton/Inductor kernel cache valid (the
         # wheel plays no part in what it caches), so it only needs the free re-layer, never a paid
         # GPU re-warm.
         "fa2_sha256": fa2_sha256,
@@ -232,11 +244,10 @@ def collect_inputs(
         # whole-Dockerfile hash catches ANY base change the parsed fields miss (apt/ENV/CMD/cache-dir);
         # it lives in fp_base, so such a change triggers only the FREE re-layer, never a paid re-warm.
         "dockerfile_sha256": _sha256_file(root / "Dockerfile.worker"),
-        "endpoints_sha256": _sha256_file(
-            root / "flash" / "providers" / "runpod" / "serverless" / "endpoints.py"
+        "bootstrap_sha256": _sha256_file(
+            root / "flash/providers/_lifecycle/bootstrapping/bootstrap.py"
         ),
-        "make_rp_handler_sha256": _sha256_file(root / "docker" / "make_rp_handler.py"),
-        "source_snapshot_sha256": _sha256_file(root / "flash" / "source_snapshot.py"),
+        "archive_sha256": _sha256_file(root / "flash" / "snapshot" / "archive.py"),
     }
     return cache_inputs, base_inputs_partial
 
@@ -301,7 +312,7 @@ def main(argv: list[str] | None = None) -> int:
 
     root = Path(args.root)
     if args.print_baked_arches:
-        worker_source = root / "flash" / "providers" / "_lifecycle" / "worker.py"
+        worker_source = root / "flash" / "providers" / "_lifecycle" / "net" / "worker.py"
         try:
             arches = parse_baked_per_sm_arches(
                 worker_source.read_text(encoding="utf-8"), source=str(worker_source)

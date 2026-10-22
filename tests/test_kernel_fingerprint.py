@@ -99,8 +99,8 @@ def test_collect_inputs_populates_every_key_and_matches_repo():
         "causal_conv1d",
         "pip_base",
         "dockerfile_sha256",
-        "endpoints_sha256",
-        "make_rp_handler_sha256",
+        "bootstrap_sha256",
+        "archive_sha256",
     ):
         assert base_partial[key], f"base input {key} not populated"
 
@@ -127,7 +127,7 @@ def test_fa_sha256_digest_only_change_moves_fp_base_not_fp_cache():
     """The exact remediation this fp_base input exists for: a maintainer dispatches worker-image.yml
     with the SAME wheel url but an UPDATED sha256 (a replaced release asset). A digest rotation must
     move fp_base (so auto-rebake re-layers every stale per-arch tag) while leaving fp_cache untouched
-    (a wheel digest plays no part in what the Triton/Inductor mega-cache holds, so no GPU re-warm)."""
+    (a wheel digest plays no part in what the Triton/Inductor kernel cache holds, so no GPU re-warm)."""
     fp_cache0, fp_base0, _, _ = kf.fingerprints(ROOT)
     fp_cache1, fp_base1, _, _ = kf.fingerprints(ROOT, fa2_sha256="0" * 64)
     assert fp_cache1 == fp_cache0, "a wheel digest rotation must not invalidate the kernel cache"
@@ -240,7 +240,7 @@ def test_freesolo_floor_is_in_lockstep():
     The image governs the deployed version, while FREESOLO_WORKER_SPEC remains a range for published
     package compatibility. A worker pin outside that range would make the two paths disagree.
     """
-    from flash.envs.base import FREESOLO_WORKER_SPEC
+    from flash.envs.loading.base import FREESOLO_WORKER_SPEC
 
     dockerfile = (ROOT / "Dockerfile.worker").read_text()
     docker_fs = [s for s in kf._pip_stack_specs(dockerfile) if kf._pkg_name(s) == "freesolo"]
@@ -282,7 +282,7 @@ def test_parse_baked_per_sm_arches_contract():
 
 
 def test_print_baked_arches_cli_exits_before_fingerprint_work(tmp_path):
-    worker_dir = tmp_path / "flash" / "providers" / "_lifecycle"
+    worker_dir = tmp_path / "flash" / "providers" / "_lifecycle" / "net"
     worker_dir.mkdir(parents=True)
     (worker_dir / "worker.py").write_text('BAKED_PER_SM_ARCHES = frozenset({"sm90", "sm80"})\n')
     result = subprocess.run(
@@ -302,9 +302,9 @@ def test_print_baked_arches_cli_exits_before_fingerprint_work(tmp_path):
 
 
 def test_baked_arch_workflows_match_canonical_source():
-    from flash.providers._lifecycle.worker import BAKED_PER_SM_ARCHES
+    from flash.providers._lifecycle.net.worker import BAKED_PER_SM_ARCHES
 
-    worker_source = (ROOT / "flash" / "providers" / "_lifecycle" / "worker.py").read_text()
+    worker_source = (ROOT / "flash" / "providers" / "_lifecycle" / "net" / "worker.py").read_text()
     source_arches = kf.parse_baked_per_sm_arches(worker_source)
     canonical_arches = set(BAKED_PER_SM_ARCHES)
 
@@ -321,7 +321,11 @@ def test_baked_arch_workflows_match_canonical_source():
     (fallback,) = [
         match.group(1)
         for line in bake_lines
-        if (match := re.fullmatch(r'\s*req="\$\{\{ inputs\.sms \|\| \'([^\']+)\' \}\}"\s*', line))
+        if (
+            match := re.fullmatch(
+                r"\s*REQUESTED_SMS:\s*\$\{\{ inputs\.sms \|\| '([^']+)' \}\}\s*", line
+            )
+        )
     ]
     fallback_arches = {arch.strip() for arch in fallback.split(",") if arch.strip()}
 
@@ -364,3 +368,11 @@ def test_parsing_fails_loud_on_a_broken_stack():
         kf._pip_stack_specs("FROM scratch\n# no pip install block here\n")
     with pytest.raises(ValueError, match="could not parse"):
         kf._search(r"NOPE=(\S+)", "nothing here", "a missing thing")
+
+
+def test_training_interpreter_pins_and_bake_entry_invalidate_cache():
+    cache, base = kf.collect_inputs(ROOT)
+    assert "vllm==0.19.1" in cache["verl_stack"]
+    before = kf.compute_fingerprints(cache, base)[0]
+    for key in ("verl_stack", "bake_entry_sha256", "flashinfer_aot_sha256"):
+        assert kf.compute_fingerprints({**cache, key: cache[key] + "changed"}, base)[0] != before

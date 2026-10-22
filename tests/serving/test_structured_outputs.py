@@ -15,11 +15,12 @@ import json
 import pytest
 from pydantic import ValidationError
 
-from flash.serving.src.schemas import AdapterRecord, GenerateRequest
-from flash.serving.src.structured_outputs import (
+from flash.serving.src.io.schemas import AdapterRecord, GenerateRequest
+from flash.serving.src.io.structured_outputs import (
     StructuredOutputsError,
     normalize_structured_outputs,
 )
+from tests.serving.checkpoint_fixtures import checkpoint_record
 
 SCHEMA = {"type": "object", "properties": {"name": {"type": "string"}}, "required": ["name"]}
 
@@ -272,7 +273,7 @@ def test_normalization_is_idempotent(value):
 
 def test_generate_request_normalizes_structured_outputs():
     req = GenerateRequest.model_validate(
-        {"adapter_id": "a", "prompt": "hi", "structured_outputs": "json_object"}
+        {"model_id": "a", "prompt": "hi", "structured_outputs": "json_object"}
     )
     assert req.structured_outputs == {"json_object": True}
 
@@ -282,36 +283,36 @@ def test_generate_request_accepts_a_raw_json_schema():
     # (see the test below). This was parametrized over two spellings until the alias was removed,
     # after which both cases named the same key and the second proved nothing.
     req = GenerateRequest.model_validate(
-        {"adapter_id": "a", "prompt": "hi", "structured_outputs": SCHEMA}
+        {"model_id": "a", "prompt": "hi", "structured_outputs": SCHEMA}
     )
     assert req.structured_outputs == {"json": SCHEMA}
 
 
-def test_generate_request_ignores_a_response_format_key():
-    # response_format is no longer an accepted alias: a top-level response_format key is not the
-    # structured-outputs spec, so the field stays unset (None = inherit the adapter default).
-    req = GenerateRequest.model_validate(
-        {"adapter_id": "a", "prompt": "hi", "response_format": {"type": "json_object"}}
-    )
-    assert req.structured_outputs is None
+def test_generate_request_rejects_a_response_format_key():
+    # response_format belongs only to the strict openai chat boundary. raw generation must reject
+    # it rather than silently dispatching an unconstrained request.
+    with pytest.raises(ValueError, match="extra_forbidden"):
+        GenerateRequest.model_validate(
+            {"model_id": "a", "prompt": "hi", "response_format": {"type": "json_object"}}
+        )
 
 
 def test_generate_request_keeps_explicit_off_distinct_from_absent():
-    absent = GenerateRequest.model_validate({"adapter_id": "a", "prompt": "hi"})
+    absent = GenerateRequest.model_validate({"model_id": "a", "prompt": "hi"})
     off = GenerateRequest.model_validate(
-        {"adapter_id": "a", "prompt": "hi", "structured_outputs": False}
+        {"model_id": "a", "prompt": "hi", "structured_outputs": False}
     )
     assert absent.structured_outputs is None  # inherit the adapter default
     assert off.structured_outputs == {}  # explicitly unconstrained, overrides the default
 
 
 def test_generate_request_serializes_camel_case_for_the_rpc():
-    # The router forwards model_dump(by_alias=True) over Modal RPC; the engine re-validates that
+    # The router forwards model_dump() over Modal RPC; the engine re-validates that
     # dict, so the canonical spec must ride the "structured_outputs" alias and survive re-parsing.
     req = GenerateRequest.model_validate(
-        {"adapter_id": "a", "prompt": "hi", "structured_outputs": SCHEMA}
+        {"model_id": "a", "prompt": "hi", "structured_outputs": SCHEMA}
     )
-    dumped = req.model_dump(by_alias=True)
+    dumped = req.model_dump()
     assert dumped["structured_outputs"] == {"json": SCHEMA}
     assert GenerateRequest.model_validate(dumped).structured_outputs == {"json": SCHEMA}
 
@@ -320,7 +321,7 @@ def test_generate_request_invalid_spec_is_a_validation_error():
     with pytest.raises(ValidationError, match="exactly one constraint"):
         GenerateRequest.model_validate(
             {
-                "adapter_id": "a",
+                "model_id": "a",
                 "prompt": "hi",
                 "structured_outputs": {"json": SCHEMA, "regex": "x"},
             }
@@ -331,22 +332,16 @@ def test_generate_request_invalid_spec_is_a_validation_error():
 
 
 def _record(**extra) -> AdapterRecord:
-    return AdapterRecord.model_validate(
-        {
-            "adapter_id": "a",
-            "repo_id": "org/a",
-            "base_model": "Qwen/Qwen3.5-0.8B",
-            "thinking": True,
-            **extra,
-        }
-    )
+    base_model = extra.pop("base_model", "Qwen/Qwen3.5-9B")
+    thinking = extra.pop("thinking", True)
+    return checkpoint_record("a", base_model, thinking=thinking, **extra)
 
 
 def test_adapter_record_normalizes_structured_outputs_default():
     # A bare JSON schema is normalized to the canonical {"json": schema} on the way in.
     rec = _record(structured_outputs=SCHEMA)
     assert rec.structured_outputs == {"json": SCHEMA}
-    assert rec.model_dump(by_alias=True)["structured_outputs"] == {"json": SCHEMA}
+    assert rec.model_dump()["structured_outputs"] == {"json": SCHEMA}
 
 
 def test_adapter_record_defaults_to_no_structured_outputs():
@@ -377,21 +372,3 @@ def test_parserless_non_thinking_structured_default_is_allowed():
         structured_outputs=SCHEMA,
     )
     assert record.structured_outputs == {"json": SCHEMA}
-
-
-def test_metadata_structured_outputs_is_storage_only():
-    # metadata.structured_outputs is the DB representation; a stray metadata copy must be stripped
-    # (like metadata.thinking) so it can't be persisted verbatim and resurrected as the field on
-    # the next hydration. The first-class field is the only way to set a default.
-    rec = _record(metadata={"structured_outputs": {"json": SCHEMA}, "note": "keep"})
-    assert rec.structured_outputs is None
-    assert rec.metadata == {"note": "keep"}
-
-
-def test_top_level_structured_outputs_wins_over_metadata():
-    rec = _record(
-        structured_outputs={"json_object": True},
-        metadata={"structured_outputs": {"json": SCHEMA}},
-    )
-    assert rec.structured_outputs == {"json_object": True}
-    assert "structured_outputs" not in rec.metadata

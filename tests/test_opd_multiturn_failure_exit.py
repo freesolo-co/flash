@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import asyncio
 import json
 import os
@@ -11,8 +12,8 @@ from types import SimpleNamespace
 
 import pytest
 
-from flash.engine.worker.train.opd import failures
 from flash.engine.worker.train.opd.child import bridge, multiturn
+from flash.engine.worker.train.opd.orchestration import failures
 
 
 class _Loop:
@@ -28,7 +29,10 @@ class _Loop:
     def _get_mm_processor_kwargs(self, _audio_data=None):
         return {}
 
-    async def apply_chat_template(self, _prompt, **_kwargs):
+    def _assert_mm_supported(self, has_media):
+        assert not has_media
+
+    async def ct_build_initial_tokens(self, _prompt, **_kwargs):
         return [1, 2]
 
     async def _run_turns(self, *_args, **_kwargs):
@@ -375,7 +379,7 @@ def test_parent_reconciliation_reports_rollout_record_before_subprocess_status(
     monkeypatch,
     tmp_path,
 ):
-    import flash.engine.worker.opd_train_runner as opd_runner
+    import flash.engine.worker.train.entry.opd_train_runner as opd_runner
 
     rollout_path = tmp_path / "rollout-failure"
     monkeypatch.setenv("FLASH_OPD_ROLLOUT_FAILURE_PATH", str(rollout_path))
@@ -411,39 +415,38 @@ def test_parent_reconciliation_reports_rollout_record_before_subprocess_status(
     assert "subprocess exited with status" not in detail
 
 
-def test_copied_child_shims_import_flat_without_flash_package(tmp_path):
-    import flash.engine.worker.opd_train_runner as runner
+def test_packaged_child_modules_share_the_same_bridge_from_an_unrelated_cwd(tmp_path):
+    from pathlib import Path
 
-    shim_dir = tmp_path / "shim"
-    shim_dir.mkdir()
-    runner._write_child_shims(
-        SimpleNamespace(),
-        SimpleNamespace(shim_dir=str(shim_dir)),
-        None,
-        [],
-    )
-    script = """
-import importlib
-import importlib.util
-import os
-import sys
-
-sys.path.insert(0, os.getcwd())
-assert importlib.util.find_spec("flash") is None
-bridge = importlib.import_module("flash_opd_bridge")
-multiturn = importlib.import_module("flash_opd_multiturn")
-replay_guard = importlib.import_module("flash_opd_replay_guard")
+    root = str(Path(__file__).resolve().parents[1])
+    script = (
+        f"import sys; sys.path.insert(0, {root!r})\n"
+        """
+from flash.engine.worker.train.opd.child import bridge, multiturn, replay_guard
 assert multiturn._write_rollout_failure_fallback is bridge._write_rollout_failure_fallback
 assert replay_guard._read_rollout_failure_fallback is bridge._read_rollout_failure_fallback
 assert replay_guard._render_rollout_failure is bridge._render_rollout_failure
 """
-
+    )
     result = subprocess.run(
-        [sys.executable, "-I", "-S", "-c", script],
-        cwd=shim_dir,
+        [sys.executable, "-I", "-c", script],
+        cwd=tmp_path,
         capture_output=True,
         text=True,
-        check=False,
+        timeout=30,
     )
-
     assert result.returncode == 0, result.stderr
+
+
+def test_child_modules_use_resolvable_package_imports():
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[1]
+    for path in (root / "flash/engine/worker/train").glob("*/child/*.py"):
+        for node in ast.walk(ast.parse(path.read_text())):
+            if isinstance(node, ast.ImportFrom):
+                name = node.module or ""
+                assert not name.startswith("flash_"), (path, name)
+                if name.startswith("flash."):
+                    target = root.joinpath(*name.split("."))
+                    assert target.is_dir() or target.with_suffix(".py").is_file(), (path, name)

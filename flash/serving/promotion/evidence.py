@@ -1,0 +1,248 @@
+"""What a promotion must prove, as pure data and total predicates.
+
+Every function here is pure: no network, no environment, no clock. The gate does the I/O and hands
+the results in, so each rule is directly testable against a hand-built payload, including the
+malformed ones a live deployment actually produces.
+
+The rules fail CLOSED. Absent, malformed, ambiguous, or unparseable evidence is a failure, never a
+pass, because the failure mode being defended against is a broken release that LOOKS healthy: a
+router that booted while its engines did not, a stream that opened and closed without generating,
+or usage captured in memory that never settled durably.
+
+Reasons are stable snake_case codes. They are printed into a public build log, so they must never
+carry a credential, a response body, or any part of a request payload.
+"""
+
+from __future__ import annotations
+
+import math
+import re
+from dataclasses import dataclass
+from typing import Any
+
+_SHA_PATTERN = re.compile(r"^[0-9a-f]{40}$")
+
+# an undelivered row older than this is not "in flight", it is wedged.
+#
+# the threshold has to clear the outbox's OWN retry budget, or a transient billing 5xx reads as a
+# stall and rolls back a healthy release. `DurableUsageOutbox._retry_or_quarantine` retries 8 times
+# with `min(2 ** (attempt - 1), 300)` seconds of backoff plus up to 20% jitter, each attempt runs
+# against a 10s client timeout, and the worker wakes on a 2s poll. that is ~154s of backoff, ~80s of
+# attempts and ~16s of polling: a row still retrying legitimately can be ~250s old. past the budget
+# the row is quarantined, so it leaves `oldest_undelivered_age_seconds` on its own.
+#
+# 360 sits above that worst case with margin and still well under the settlement horizon, so a row
+# older than this is not retrying -- no healthy path leaves one undelivered that long.
+_STALL_AGE_SECONDS = 360
+
+_MISSING = object()
+
+
+def _number(value: Any) -> float | None:
+    """A JSON number from the snapshot, or None when the field is absent or not a number.
+
+    Accepts floats as well as ints because these fields come from postgres numerics: the canonical
+    reader (`usage_outbox.DurableUsageOutbox.snapshot`) coerces every one of them with `int(...)`
+    for exactly that reason. Rejecting floats here would make the ORDINARY live shape unparseable,
+    and an unparseable snapshot fails the gate -- which rolls a healthy release back.
+
+    `bool` is excluded ahead of `int` because it is a subclass of it, so `True` would otherwise read
+    as the number 1 and let a wrong-typed field pass as a plausible counter.
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    value = float(value)
+    return value if math.isfinite(value) and value >= 0 else None
+
+
+HEALTH_MALFORMED = "health_malformed"
+HEALTH_NOT_OK = "health_not_ok"
+HEALTH_SHA_MISMATCH = "health_sha_mismatch"
+HEALTH_DEPLOYMENT_ID_MISMATCH = "health_deployment_id_mismatch"
+HEALTH_NO_ENGINES = "health_no_engines"
+
+STREAM_CONTENT_TYPE = "stream_content_type_not_sse"
+STREAM_NO_CONTENT = "stream_no_content_delta"
+STREAM_NO_FINISH_REASON = "stream_no_terminal_finish_reason"
+STREAM_NO_USAGE = "stream_no_terminal_usage"
+STREAM_NO_DONE = "stream_no_done_sentinel"
+
+ACCOUNTING_MALFORMED = "accounting_malformed"
+ACCOUNTING_STALLED = "accounting_stalled"
+ACCOUNTING_UNSETTLED = "accounting_canary_unsettled"
+
+
+@dataclass(frozen=True)
+class PromotionVerdict:
+    ok: bool
+    reason: str = ""
+
+
+PASS = PromotionVerdict(ok=True)
+
+
+def _fail(reason: str) -> PromotionVerdict:
+    return PromotionVerdict(ok=False, reason=reason)
+
+
+@dataclass(frozen=True)
+class HealthEvidence:
+    ok: bool
+    deployment_sha: str
+    deployment_id: str
+    gpus: int
+
+
+def parse_health(payload: Any) -> HealthEvidence | None:
+    """Read a `/healthz` body, or None when it is not one.
+
+    Returning None rather than raising keeps the caller's failure path uniform: a transport error, a
+    JSON parse error, and a 200 carrying an HTML error page all have to reach the same verdict.
+    """
+    if not isinstance(payload, dict):
+        return None
+    sha = payload.get("deployment_sha")
+    deployment_id = payload.get("deployment_id")
+    gpus = payload.get("gpus")
+    if not isinstance(sha, str) or not isinstance(deployment_id, str):
+        return None
+    # bool is a subclass of int, so `isinstance(True, int)` is True: a body reporting `gpus: true`
+    # would otherwise be read as one engine.
+    if isinstance(gpus, bool) or not isinstance(gpus, int):
+        return None
+    return HealthEvidence(
+        ok=payload.get("ok") is True,
+        deployment_sha=sha,
+        deployment_id=deployment_id,
+        gpus=gpus,
+    )
+
+
+def verify_health(
+    evidence: HealthEvidence | None,
+    *,
+    expected_sha: str,
+    expected_deployment_id: str,
+) -> PromotionVerdict:
+    """The live router must be THIS release, and must have engines to route to.
+
+    The sha comparison is full-length equality on a validated 40-hex string. A prefix or substring
+    check would accept an unrelated release whose sha happens to share a prefix, which is exactly
+    what an abbreviated sha copied from a log looks like.
+    """
+    if evidence is None:
+        return _fail(HEALTH_MALFORMED)
+    if not evidence.ok:
+        return _fail(HEALTH_NOT_OK)
+    reported = evidence.deployment_sha.lower()
+    expected = expected_sha.lower()
+    if _SHA_PATTERN.match(reported) is None or _SHA_PATTERN.match(expected) is None:
+        return _fail(HEALTH_SHA_MISMATCH)
+    if reported != expected:
+        return _fail(HEALTH_SHA_MISMATCH)
+    if evidence.deployment_id != expected_deployment_id:
+        # a matching sha with a stale attempt id is a PREVIOUS deploy of the same commit, so the
+        # readiness check would pass against a router this run never replaced.
+        return _fail(HEALTH_DEPLOYMENT_ID_MISMATCH)
+    if evidence.gpus < 1:
+        return _fail(HEALTH_NO_ENGINES)
+    return PASS
+
+
+@dataclass(frozen=True)
+class StreamEvidence:
+    content_type_ok: bool
+    content_delta_count: int
+    finish_reason: str | None
+    completion_tokens: int | None
+    saw_done_sentinel: bool
+
+
+def verify_stream(evidence: StreamEvidence) -> PromotionVerdict:
+    """A real generation reached a real client over a real stream.
+
+    Each clause rules out a distinct way a stream can look successful while proving nothing:
+    a 200 that is not SSE at all, frames that carry no generated text, a stream cut off before its
+    terminal chunk, a terminal chunk whose usage says zero tokens were produced, and a body that
+    never reaches `[DONE]` because a proxy buffered it to EOF.
+    """
+    if not evidence.content_type_ok:
+        return _fail(STREAM_CONTENT_TYPE)
+    if evidence.content_delta_count < 1:
+        return _fail(STREAM_NO_CONTENT)
+    if not evidence.finish_reason:
+        return _fail(STREAM_NO_FINISH_REASON)
+    if evidence.completion_tokens is None or evidence.completion_tokens < 1:
+        return _fail(STREAM_NO_USAGE)
+    if not evidence.saw_done_sentinel:
+        return _fail(STREAM_NO_DONE)
+    return PASS
+
+
+@dataclass(frozen=True)
+class AccountingEvidence:
+    """global stall signals plus durable settlement of this release's exact canary scope."""
+
+    canary_settled: bool
+    expired_leases: float
+    oldest_undelivered_age_seconds: float | None
+
+    @property
+    def stalled(self) -> bool:
+        """Delivery is not making progress, as opposed to merely having work in flight.
+
+        A nonzero backlog is normal on a live deployment: concurrent traffic is always producing
+        rows. What is never normal is an expired lease (a worker took a row and died holding it) or
+        an undelivered row older than the stall threshold. Those are properties of the DELIVERY
+        LOOP, so they hold regardless of how much unrelated traffic shares the counters.
+        """
+        if self.expired_leases > 0:
+            return True
+        age = self.oldest_undelivered_age_seconds
+        return age is not None and age >= _STALL_AGE_SECONDS
+
+
+def parse_accounting(payload: Any) -> AccountingEvidence | None:
+    """Read a `serving_promotion_accounting_snapshot` body, or None when it is not one.
+
+    Missing counters must remain distinguishable from zero: zero means healthy, whereas missing
+    fields can indicate schema drift or a permission-shaped empty result. Reject incomplete
+    evidence rather than treating it as a drained backlog.
+    """
+    if isinstance(payload, list):
+        payload = payload[0] if payload else None
+    if not isinstance(payload, dict):
+        return None
+    # `states` is still required even though no field is read out of it. Its absence is the exact
+    # shape a renamed schema or a permission-shaped empty result takes, and this parser's whole job
+    # is to make that unreadable rather than healthy.
+    if not isinstance(payload.get("states"), dict):
+        return None
+    expired_leases = _number(payload.get("expired_leases", _MISSING))
+    if expired_leases is None:
+        return None
+    # None is a real reading here ("nothing undelivered"); an ABSENT field is not, because it would
+    # silently read as healthy while carrying no stall signal at all.
+    raw_age = payload.get("oldest_undelivered_age_seconds", _MISSING)
+    age = None if raw_age is None else _number(raw_age)
+    if raw_age is not None and age is None:
+        return None
+    settled = payload.get("canary_settled")
+    if not isinstance(settled, bool):
+        return None
+    return AccountingEvidence(
+        canary_settled=settled,
+        expired_leases=expired_leases,
+        oldest_undelivered_age_seconds=age,
+    )
+
+
+def verify_accounting(evidence: AccountingEvidence | None) -> PromotionVerdict:
+    """require positive canary delivery evidence as well as absence of backlog stalls."""
+    if evidence is None:
+        return _fail(ACCOUNTING_MALFORMED)
+    if evidence.stalled:
+        return _fail(ACCOUNTING_STALLED)
+    if not evidence.canary_settled:
+        return _fail(ACCOUNTING_UNSETTLED)
+    return PASS

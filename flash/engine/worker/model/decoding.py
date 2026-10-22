@@ -7,7 +7,7 @@ from __future__ import annotations
 # module is the worker's public decoding surface.
 from flash.content.thinking import strip_think as strip_think
 from flash.content.thinking import thinking_text as thinking_text
-from flash.engine.worker.runtime.pkg_proxy import W as _w
+from flash.engine.worker.runtime.state import WorkerContext
 
 
 def prompt_opens_thinking(prompt: str | None) -> bool:
@@ -18,11 +18,13 @@ def prompt_opens_thinking(prompt: str | None) -> bool:
     return prompt.rstrip().endswith("<think>")
 
 
-def graded_text(completion: str | None, *, prompt_opened_thinking: bool = False) -> str | None:
+def graded_text(
+    completion: str | None, *, prompt_opened_thinking: bool = False, context: WorkerContext
+) -> str | None:
     """Answer text extracted for grading; reward state may still carry the raw completion."""
     return (
         strip_think(completion, prompt_opened_thinking=prompt_opened_thinking)
-        if _w.THINKING
+        if context.config.thinking
         else completion
     )
 

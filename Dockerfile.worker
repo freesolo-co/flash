@@ -1,8 +1,9 @@
-# Flash prebuilt WORKER image — the full training stack baked in for RunPod workers.
+# syntax=docker/dockerfile:1
+# Flash prebuilt WORKER image — the full training stack baked in for Modal workers.
 # the worker fetches one pinned source archive at runtime; the trusted verifier is baked here.
 #
-# this image name is defined in flash/providers/_lifecycle/worker.py. it must be
-# published to GHCR and the package set PUBLIC (no registry login is configured) so RunPod can
+# this image name is defined in flash/providers/_lifecycle/net/worker.py. it must be
+# published to GHCR and the package set PUBLIC (no registry login is configured) so Modal can
 # pull it. Normally built by
 # .github/workflows/worker-image.yml (manual dispatch); to build/push by hand:
 #
@@ -17,14 +18,13 @@
 FROM pytorch/pytorch:2.10.0-cuda12.8-cudnn9-devel@sha256:b574d4ccf6d8856a5d87dcadc667aa4f95dc18d337ef3a28d02b7b01897d7081
 
 ENV DEBIAN_FRONTEND=noninteractive \
-    HF_HUB_ENABLE_HF_TRANSFER=1 \
     PIP_BREAK_SYSTEM_PACKAGES=1 \
     PYTHONUNBUFFERED=1
 
 # Compiled-kernel cache dirs (Triton JIT + TorchInductor). Point both backends at a stable on-image
-# location so a BAKED mega-cache (below, opt-in) lands where the runtime looks, and so a first-run
+# location so a BAKED kernel cache (below, opt-in) lands where the runtime looks, and so a first-run
 # JIT on a cold worker writes here too. These ENVs are always set (cheap); whether the dir is
-# pre-populated is what the opt-in bake controls. engine.worker._load_kernel_cache_if_present reads
+# pre-populated is what the opt-in bake controls. kernel_warmup.configure_kernel_cache checks
 # /opt/flash/kernelcache at boot.
 # FLASHINFER_CUBIN_DIR / FLASHINFER_CACHE_DIR / FLASHINFER_WORKSPACE_BASE: FlashInfer's attention-backend
 # cubins (the Blackwell sm120 / B200 rollout attention backend) are NOT bundled in the wheel — flashinfer
@@ -37,6 +37,8 @@ ENV DEBIAN_FRONTEND=noninteractive \
 # the default home workspace and re-JITs instead of using the baked cache.
 ENV TRITON_CACHE_DIR=/opt/flash/kernelcache/triton \
     TORCHINDUCTOR_CACHE_DIR=/opt/flash/kernelcache/inductor \
+    TILELANG_CACHE_DIR=/opt/flash/kernelcache/tilelang \
+    TORCH_EXTENSIONS_DIR=/opt/flash/kernelcache/torch_extensions \
     FLASHINFER_CUBIN_DIR=/opt/flash/kernelcache/flashinfer_cubin \
     FLASHINFER_CACHE_DIR=/opt/flash/kernelcache/flashinfer \
     FLASHINFER_WORKSPACE_BASE=/opt/flash/kernelcache/flashinfer
@@ -54,18 +56,16 @@ RUN pip install --no-cache-dir \
     "peft==0.20.0" \
     "vllm==0.19.1" \
     "flashinfer-python==0.6.6" \
-    "bitsandbytes==0.50.1" \
     "datasets==5.0.1" \
     "huggingface_hub==1.28.0" \
+    "httpx==0.28.1" \
     "accelerate==1.14.0" \
     "wandb==0.28.2" \
     "flash-linear-attention @ git+https://github.com/fla-org/flash-linear-attention.git@9c8e42e762fce087c27b673af4922795d9edb85e" \
     "flash-qla==0.1.2" \
     "tilelang==0.1.9" \
     "apache-tvm-ffi==0.1.9" \
-    "hf_transfer==0.1.9" \
-    "freesolo==0.4.1" \
-    "runpod==1.12.0"
+    "freesolo==0.4.2"
 # Gated-DeltaNet (Qwen3.5/3.6) runs on flash-linear-attention's Triton kernels. On consumer cards
 # (Ampere/Ada/Blackwell) the Triton path is correct. On Hopper (sm90) fla's GDN chunk_bwd is
 # miscomputed with Triton>=3.4 (fla #640) — the fix is fla's TILELANG backend (correct there), so
@@ -80,7 +80,7 @@ RUN pip install --no-cache-dir \
 # pure-PyTorch fallback (H100 SXM, Qwen3.5 hidden-2560 LoRA): seq4096 4.2x faster / 1.6x less mem,
 # seq16384 12.6x / 1.9x, loss matches to 1.8e-4. fla is from git: the PyPI wheel is a broken stub
 # (no fla.modules). The git URL is PINNED to a commit (not the moving default branch) for
-# reproducible image builds; keep this sha in lockstep with the worker dependencies in flash/providers/_lifecycle/worker.py.
+# reproducible image builds; keep this sha in lockstep with the worker dependencies in flash/providers/_lifecycle/net/worker.py.
 # tilelang is 0.1.9, not the newest release: flash-qla (added for the sm90 GDN backend) hard-requires
 # tilelang==0.1.9 AND apache-tvm-ffi==0.1.9, so 0.1.11 made this layer unsatisfiable and every image
 # build failed from 2026-08-12 until the downgrade. 0.1.11 was only ever "latest stable at the time"
@@ -161,7 +161,7 @@ RUN set -eu; \
 # example boundaries. Together with fla's ``cu_seqlens`` (which resets the DeltaNet recurrence) it
 # lets the GatedDeltaNet hybrids (Qwen3.5/3.6) PACK boundary-correctly — a 4D block-diagonal mask
 # alone only fixes the full-attention layers (the verl child's capability probe gates the
-# SFT packing path on this import). GPU-validated (RTX 5090, Qwen3.5-0.8B): a packed example's output
+# sft packing path on this import). gpu-validated on the qwen3.5 hybrid architecture: a packed example's output
 # is byte-identical regardless of its neighbors' content (zero cross-example leakage).
 # Arch-bounded to the catalog GPUs to cap build time. PINNED (compiled CUDA extension) for
 # reproducible image builds — an unpinned upstream release could silently change behavior or break
@@ -181,7 +181,7 @@ RUN TORCH_CUDA_ARCH_LIST="8.0 8.6 8.9 9.0 10.0 12.0" CAUSAL_CONV1D_FORCE_BUILD=T
     && echo "causal_conv1d: installed (GDN packing enabled)"
 
 # weight cache (runtime, not baked): when the shared weight-cache network volume is attached,
-# flash/providers/_lifecycle/worker.py:weight_cache_env redirects only base-model prefetching through
+# flash/providers/_lifecycle/net/worker.py:weight_cache_env redirects only base-model prefetching through
 # FLASH_WEIGHT_CACHE_DIR to the persistent volume for reuse across runs. HF_HOME remains ephemeral,
 # so environment and reward downloads are not shared. executable kernel-jit caches are deliberately
 # not shared because the volume is multi-tenant; a poisoned compiled artifact could affect another
@@ -196,10 +196,9 @@ RUN TORCH_CUDA_ARCH_LIST="8.0 8.6 8.9 9.0 10.0 12.0" CAUSAL_CONV1D_FORCE_BUILD=T
 # first-use JIT as a per-run RUNTIME cost on a cold worker.
 #
 # OPT-IN PATH: build on a real GPU runner with --build-arg BUILD_KERNEL_CACHE=true after running
-# flash/engine/worker/runtime/kernel_warmup.py there to produce a portable mega-cache under build/kernel_cache/
-# (torch.compiler.save_cache_artifacts). The conditional COPY below then bakes it into
-# /opt/flash/kernelcache, and engine.worker._load_kernel_cache_if_present loads it at boot
-# (torch.compiler.load_cache_artifacts) — measured cold compile ~124s -> warm load ~0.2s (537x).
+# flash/engine/worker/runtime/kernel_warmup.py there to produce raw kernel caches and architecture
+# metadata under build/kernel_cache/. The COPY below bakes them into /opt/flash/kernelcache;
+# kernel_warmup.configure_kernel_cache validates the architecture and configures cache paths at boot.
 #
 # FALLBACK (the DEFAULT, BUILD_KERNEL_CACHE=false): NOTHING is baked and the build needs no GPU. The
 # first-run JIT happens on the worker exactly as before; flash #163's init heartbeat keeps the stall
@@ -208,18 +207,17 @@ RUN TORCH_CUDA_ARCH_LIST="8.0 8.6 8.9 9.0 10.0 12.0" CAUSAL_CONV1D_FORCE_BUILD=T
 # The COPY is made safe-when-absent with the standard "COPY a path that always exists + a guard"
 # trick. `build/kernel_cache/` is checked into the repo with just a `.keep` placeholder, so the COPY
 # source ALWAYS exists (a bare glob that matches nothing is a hard BuildKit error — this avoids it).
-# kernel_warmup.py drops `mega_cache.bin` + `mega_cache.json` (+ triton/inductor cache trees) next
+# kernel_warmup.py drops arch metadata + triton/inductor trees next
 # to that placeholder on a GPU builder. COPY STRAIGHT to the final /opt/flash/kernelcache so a
 # multi-GB baked cache lives in exactly ONE layer -- staging in /tmp then cp/mv would leave the
 # bytes in BOTH the COPY layer and the RUN layer (doubling image size). with the default the dir
 # holds only `.keep`, so the copy is harmless; the guard just removes any stale cache + logs.
 ARG BUILD_KERNEL_CACHE=false
 COPY build/kernel_cache/ /opt/flash/kernelcache/
-RUN if [ "${BUILD_KERNEL_CACHE}" = "true" ] && [ -f /opt/flash/kernelcache/mega_cache.bin ]; then \
+RUN if [ "${BUILD_KERNEL_CACHE}" = "true" ] && [ -f /opt/flash/kernelcache/mega_cache.json ]; then \
       echo "kernel-cache: baked from build/kernel_cache/ -> /opt/flash/kernelcache"; \
     else \
-      rm -rf /opt/flash/kernelcache/mega_cache.bin /opt/flash/kernelcache/mega_cache.json \
-        /opt/flash/kernelcache/triton /opt/flash/kernelcache/inductor; \
+      rm -rf /opt/flash/kernelcache; \
       mkdir -p /opt/flash/kernelcache/triton /opt/flash/kernelcache/inductor; \
       echo "kernel-cache: not baked (BUILD_KERNEL_CACHE=${BUILD_KERNEL_CACHE}) -> first-run JIT fallback"; \
     fi
@@ -227,7 +225,7 @@ RUN if [ "${BUILD_KERNEL_CACHE}" = "true" ] && [ -f /opt/flash/kernelcache/mega_
 # Sanity: the worker imports must succeed (catches a broken stack at build time, not run time).
 # Import EVERY package the worker runtime uses (derived from a full AST scan of the engine/envs/
 # bootstrap code + the WORKER_DEPS list above): the core stack, the optimizer/accelerator libs
-# (flash-linear-attention=fla, flash_attn, bitsandbytes, triton), and the HF/env libs. A
+# (flash-linear-attention=fla, flash_attn, triton), and the HF/env libs. A
 # missing or ABI-broken package fails the build HERE instead of silently shipping (the FA wheel in
 # particular can install yet fail to import against this torch). cuDNN comes from the base image.
 # flash_attn is BEST-EFFORT (the install above tolerates a build failure -> SDPA fallback), so it
@@ -235,7 +233,7 @@ RUN if [ "${BUILD_KERNEL_CACHE}" = "true" ] && [ -f /opt/flash/kernelcache/mega_
 # could never be produced. The rest of the stack is mandatory.
 RUN python -c "import importlib.metadata as M; \
 import torch, transformers, peft, vllm, datasets, huggingface_hub, accelerate, wandb, \
-fla, bitsandbytes, hf_transfer, triton, freesolo, runpod; \
+fla, triton, freesolo, httpx; \
 import importlib; \
 fa_ok = False; \
 exec('try:\n import flash_attn\n fa_ok = True\nexcept Exception:\n fa_ok = False'); \
@@ -247,15 +245,15 @@ cudnn = torch.backends.cudnn.version(); assert cudnn, 'cuDNN not compiled into t
 ver = lambda n: M.version(n); \
 print('worker stack OK | torch', torch.__version__, '| cudnn', cudnn, '| triton', triton.__version__, '| flash_attn', 'present' if fa_ok else 'ABSENT (SDPA fallback)', '| flash_attn_3', 'present (Hopper FA3)' if fa3_ok else 'ABSENT (SDPA on Hopper)', '| flashinfer', 'present (B200 MoE/attn)' if fi_ok else 'ABSENT (Triton fused-MoE fallback)'); \
 [print('  ', d, ver(d)) for d in ['transformers','peft','vllm','flashinfer-python','datasets','huggingface-hub', \
-'accelerate','wandb','flash-linear-attention','bitsandbytes', \
-'hf-transfer','freesolo','runpod']]"
+'accelerate','wandb','flash-linear-attention', \
+'freesolo','httpx']]"
 
 # ---------------------------------------------------------------------------------------------
 # verl venv (GRPO/OPD/SFT verl backends): ISOLATED from the main interpreter on purpose.
 #
-# verl's dependency set CONFLICTS with the worker stack above. verl and TransferQueue declare
-# numpy<2.0.0 while this image's stack resolves numpy>=2, and verl's structured-OPD gate pins
-# xgrammar to exactly 0.1.25 against vLLM's declared >=0.1.32 floor. Resolving verl into the main
+# Flash's structured-OPD gate pins xgrammar to exactly 0.1.25 against vLLM's declared
+# >=0.1.32 floor. The trainer stack is isolated from the worker interpreter so changing its
+# dependency resolution cannot move the main worker's pins. Resolving verl into the main
 # interpreter would move shared pins under every other worker path (peft/transformers/vllm all
 # live there), so verl gets its own venv and flash launches it out-of-process via FLASH_VERL_PYTHON.
 # The venv deliberately re-resolves its own numpy independent of the base interpreter's.
@@ -264,32 +262,21 @@ print('worker stack OK | torch', torch.__version__, '| cudnn', cudnn, '| triton'
 # the pod. Keep the two in lockstep: verl's install_requires omits vllm/uvicorn/fastapi/cachetools
 # while importing them at module level on the launch path, so any dependency dropped from ONE of
 # these two lists yields an interpreter where `verl.trainer.main_ppo` dies on ModuleNotFoundError:
-# cachetools and `main_ppo_sync` dies on uvicorn. Baking them here keeps the image from paying the
+# cachetools and the V1 PPO trainer dies on uvicorn. Baking them here keeps the image from paying the
 # fallback's install cost on every run; it is not what makes the backends runnable.
 #
 # vLLM is pinned to 0.19.1, matching the base stack above so the image carries ONE vLLM version.
-# That deliberately exceeds verl's declared vllm<=0.12.0 ceiling. The metadata-clean alternative
-# (0.11.2, which satisfies the ceiling and makes `uv pip check` green) was rejected on a model-
-# contract fact: Qwen/Qwen3.5-4B is flash's DEFAULT_MODEL and enables GRPO+OPD, both of which set
-# rollout.name=vllm, and 0.11.2 registers neither Qwen3_5ForConditionalGeneration nor
-# Qwen3_5MoeForConditionalGeneration, so it cannot run rollouts for the default model at all.
-# The ceiling is stale for the async rollout path regardless: verl 0.8.0's own stable Dockerfile
-# defaults to vllm 0.20.2, its Qwen3.5 GRPO examples require 0.18.0, and vllm_async_server.py
-# branches explicitly on 0.13+/0.17+/0.20+ behavior.
-#
-# Three metadata violations are DELIBERATE, and `uv pip check` stays red in here by design:
-#   verl + transferqueue declare numpy<2.0.0   -> vLLM 0.19.1 needs numpy>=2 (declarations are stale)
-#   verl declares vllm>=0.8.5,<=0.12.0         -> we ship 0.19.1 (see the ceiling discussion above)
-#   vllm declares xgrammar>=0.1.32             -> structured OPD gates on EXACTLY 0.1.25
+# Install the bare upstream package and Flash's explicit GPU stack. Upstream's [vllm] extra
+# selects its complete CUDA 13 / Torch 2.13 environment; this image uses CUDA 12.8 / Torch 2.10.
+# Flash pins vLLM and Transformers alongside the exact upstream source.
+# The remaining dependency-metadata override is xgrammar: vLLM declares >=0.1.32,
+# while structured OPD requires exactly 0.1.25. Upstream Verl and TransferQueue now support numpy>=2.
 # xgrammar 0.1.25 was exercised against vLLM 0.19.1's own XgrammarBackend (schema compile, grammar
 # build, token-mask fill+apply) so the floor is not required to drive the API.
 #
-# Those three violations are why this uses `uv pip install --override` and NOT plain pip. pip has no
-# escape hatch for a deliberate metadata violation: it either resolves or it refuses, and here it
-# refuses with `ResolutionImpossible: Cannot install numpy==2.2.6 and verl` (verl 0.8.0 pins
-# numpy<2.0.0). uv's --override is the mechanism this pin set was validated with. All three violated
-# pins must appear in the override file: dropping the vllm line alone is still unsatisfiable
-# (verl[vllm] depends on vllm<=0.12.0 while we require 0.19.1).
+# xgrammar needs uv's --override to resolve conflicting dependency metadata.
+# Repeating exact numpy, vllm, and transformers pins keeps the baked and fallback
+# training environments aligned. GPU qualification remains required for this runtime.
 #
 # `uv venv` rather than `python -m venv` because the pytorch base image ships no ensurepip, so
 # `python -m venv` fails outright ("The virtual environment was not created successfully because
@@ -297,7 +284,7 @@ print('worker stack OK | torch', torch.__version__, '| cudnn', cudnn, '| triton'
 # image at /usr/local/bin/uv.
 #
 # Four pins are non-obvious and load-bearing: datasets>=4.7 (older raises AttributeError on PyArrow
-# PyExtensionType), TransferQueue (absent from verl's setup.py, but OPD calls tq.init()/tq.close()),
+# PyExtensionType), TransferQueue 0.1.11 (required by upstream's V1 API, absent from setup.py),
 # transformers<5.13 (see below), and wandb (also absent from verl's setup.py). verl calls wandb.init from THIS interpreter, not
 # flash's, so a job that sets WANDB_API_KEY loses its curves and run link unless wandb is importable
 # in here; resolve_verl_loggers() degrades to console when it is not, which is the right behaviour
@@ -316,18 +303,22 @@ print('worker stack OK | torch', torch.__version__, '| cudnn', cudnn, '| triton'
 # already resolved. verl and vllm both depend on transformers, so without the exact override a
 # transitive requirement can re-widen even an exact direct pin. the
 # venv is the interpreter that trains, and transformers owns the gdn modelling code the boundary-
-# reset shim patches (chunk_gated_delta_rule, the causal conv, and the kwargs they read). the main
+# reset hook supplies (chunk_gated_delta_rule, the causal conv, and the kwargs they read). the main
 # interpreter carrying an exact pin protects nothing in here (/opt/verl-venv is built without
-# --system-site-packages). changing this exact pin means re-validating the gdn shim against the new
+# --system-site-packages). changing this exact pin means re-validating the gdn hook against the new
 # version, not just bumping the number.
 #
 # This pin is NOT what makes the sanity block below pass. is_flash_linear_attention_available() and
 # is_causal_conv1d_available() are byte-identical in 5.12.1 and 5.14.1, and both begin with
 # is_torch_cuda_available() -- they answer False on this cpu builder at every version. An earlier
 # revision of this comment blamed a 5.13 import-path move; no such move exists.
-ARG VERL_SPEC=verl[vllm]@git+https://github.com/freesolo-co/verl@32d6200de81dc484893baf8b9cf30297ebe7fa49
-ENV FLASH_VERL_PYTHON=/opt/verl-venv/bin/python
-RUN printf '%s\n' "numpy==2.2.6" "xgrammar==0.1.25" "vllm==0.19.1" "transformers==5.12.1" > /tmp/verl-overrides.txt \
+ARG VERL_SPEC=verl@git+https://github.com/verl-project/verl@ddf700725c34bb8966685c8ecf5ca36a2cc54a35
+# BuildKit retains downloaded wheels between dependency-layer rebuilds, outside the image.
+# Keep the cache private to this trusted builder/toolchain; runtime tenant code never mounts it.
+ENV FLASH_VERL_PYTHON=/opt/verl-venv/bin/python \
+    UV_LINK_MODE=copy
+RUN --mount=type=cache,id=flash-worker-uv-cu128,target=/root/.cache/uv,sharing=locked \
+    printf '%s\n' "numpy==2.2.6" "xgrammar==0.1.25" "vllm==0.19.1" "transformers==5.12.1" > /tmp/verl-overrides.txt \
     && uv venv --seed /opt/verl-venv \
     && VIRTUAL_ENV=/opt/verl-venv uv pip install --python /opt/verl-venv/bin/python \
         --override /tmp/verl-overrides.txt \
@@ -337,8 +328,8 @@ RUN printf '%s\n' "numpy==2.2.6" "xgrammar==0.1.25" "vllm==0.19.1" "transformers
         "numpy==2.2.6" \
         "transformers==5.12.1" \
         "datasets==5.0.1" \
-        "TransferQueue==0.1.7" \
-        "bitsandbytes==0.50.1" "qwen-vl-utils==0.0.14" \
+        "TransferQueue==0.1.11" \
+        "qwen-vl-utils==0.0.14" \
         "wandb==0.28.2" \
         "cachetools==7.1.7" "uvicorn==0.52.4" "fastapi==0.141.1" \
         "torchvision==0.25.0" "tqdm==4.70.0" "pyarrow==25.0.1" \
@@ -346,8 +337,7 @@ RUN printf '%s\n' "numpy==2.2.6" "xgrammar==0.1.25" "vllm==0.19.1" "transformers
         "flash-qla==0.1.2" \
         "tilelang==0.1.9" \
         "apache-tvm-ffi==0.1.9" \
-    && rm -f /tmp/verl-overrides.txt \
-    && uv cache clean
+    && rm -f /tmp/verl-overrides.txt
 
 # flash-attn is REQUIRED in here, not best-effort like it is in the main interpreter above. All three
 # backends default remove-padding ON (train/rl/verl_config.py, train/sft/config.py,
@@ -360,7 +350,7 @@ RUN printf '%s\n' "numpy==2.2.6" "xgrammar==0.1.25" "vllm==0.19.1" "transformers
 # This is /opt/verl-venv/bin/python -- FLASH_VERL_PYTHON, the interpreter that actually trains -- and
 # a separate network fetch from the verified main-interpreter download above (that wheel is gone by
 # now, --no-cache-dir). uv honours a `#sha256=` url fragment and refuses to install a mismatching
-# artifact, the same mechanism flash/engine/worker/backend_common.py's FLASH_ATTN_INSTALL_SPEC
+# artifact, the same mechanism flash/engine/worker/train/entry/backend_common.py's FLASH_ATTN_INSTALL_SPEC
 # already relies on, so appending it here closes the gap: a replaced release asset is rejected before
 # it lands in the venv that trains, not just in the main interpreter. Unlike that block this install
 # has no `|| echo` fallback, so a mismatch already fails the build outright.
@@ -368,7 +358,12 @@ RUN printf '%s\n' "numpy==2.2.6" "xgrammar==0.1.25" "vllm==0.19.1" "transformers
 # `#sha256=` fragment is url syntax, so gluing it onto the documented non-url override
 # (FLASH_ATTN_SPEC=flash-attn==2.8.3) yields a requirement uv cannot parse and fails this required
 # layer outright. A package pin passes through unchanged and resolves from the index as before.
-RUN set -eu; \
+# uv's built-wheel cache does not track Torch/CUDA or TORCH_CUDA_ARCH_LIST. Clear this
+# extension before installing so a source override cannot reuse another toolchain's wheel.
+# Other dependency downloads remain cached; unchanged installs still use Docker's layer cache.
+RUN --mount=type=cache,id=flash-worker-uv-cu128,target=/root/.cache/uv,sharing=locked \
+    set -eu; \
+    uv cache clean flash-attn; \
     spec="${FLASH_ATTN_SPEC}"; \
     case "${spec}" in \
         http*) \
@@ -376,13 +371,12 @@ RUN set -eu; \
             spec="${spec}#sha256=${FLASH_ATTN_SHA256}" ;; \
     esac; \
     TORCH_CUDA_ARCH_LIST="8.0 8.6 8.9 9.0 10.0 12.0" MAX_JOBS=4 \
-    uv pip install --python /opt/verl-venv/bin/python --no-build-isolation "${spec}" \
-    && uv cache clean
+    uv pip install --python /opt/verl-venv/bin/python --no-build-isolation --reinstall-package flash-attn "${spec}"
 
 # causal_conv1d in the VERL VENV, which is where the model actually trains. The main interpreter's
 # copy above does not reach here: /opt/verl-venv is built without --system-site-packages, so the two
 # have disjoint paths. Together with fla's cu_seqlens (installed above) this is what makes the packed
-# GDN boundary resets real rather than decorative: engine.worker.backend_common's boundary shim hands
+# GDN boundary resets real rather than decorative: engine.worker.backend_common's boundary hook hands
 # the GDN layer cu_seq_lens_q + seq_idx, but transformers' pure-torch fallbacks take **kwargs and
 # silently DISCARD both, so a child missing these kernels trains across example boundaries while
 # looking patched. verl_child_can_reset_gdn_boundaries probes this venv for exactly that reason.
@@ -396,8 +390,12 @@ RUN set -eu; \
 # gpu. Failing the BUILD is strictly cheaper than failing the run. No `|| uninstall` branch: the
 # import check below is part of the same && chain, so an ABI-broken build (which passes
 # transformers' find_spec probe) fails the image rather than shipping as present-but-broken.
-RUN TORCH_CUDA_ARCH_LIST="8.0 8.6 8.9 9.0 10.0 12.0" CAUSAL_CONV1D_FORCE_BUILD=TRUE MAX_JOBS=4 \
-    uv pip install --python /opt/verl-venv/bin/python "causal-conv1d==1.6.2.post1" --no-build-isolation \
+# Clear only this extension's cache, for the same toolchain reason as flash-attn above.
+# FORCE_BUILD reaches setup.py only when uv actually builds instead of using a cached wheel.
+RUN --mount=type=cache,id=flash-worker-uv-cu128,target=/root/.cache/uv,sharing=locked \
+    uv cache clean causal-conv1d \
+    && TORCH_CUDA_ARCH_LIST="8.0 8.6 8.9 9.0 10.0 12.0" CAUSAL_CONV1D_FORCE_BUILD=TRUE MAX_JOBS=4 \
+    uv pip install --python /opt/verl-venv/bin/python "causal-conv1d==1.6.2.post1" --no-build-isolation --reinstall-package causal-conv1d \
     && /opt/verl-venv/bin/python -c "import causal_conv1d" \
     && echo "causal_conv1d (verl venv): installed (GDN boundary resets enabled)"
 
@@ -423,10 +421,9 @@ RUN python /tmp/cudartfix/extract_cudart_fix.py /tmp/cudartfix/capabilities.py /
 
 # Sanity: the verl venv must be able to LAUNCH, not merely install. This is the assert that would
 # have caught the shipped-but-unrunnable venv. Import the three entrypoints flash actually invokes
-# (rl_train -> main_ppo, opd_plugin -> main_ppo_sync, sft_train -> sft_trainer; note it is
+# (rl_train -> main_ppo, opd child trainer -> ppo.v1.trainer_sync, sft_train -> sft_trainer; note it is
 # sft_trainer, NOT fsdp_sft_trainer, which does not exist in this pin), the vLLM rollout modules
-# where a version mismatch would surface, and the fork-only rollout field the GRPO path emits as a
-# hydra override. Also assert the Qwen3.5 archs are registered, since that is the entire reason this
+# where a version mismatch would surface, and verify the installed upstream VCS source. Also assert the Qwen3.5 archs are registered, since that is the entire reason this
 # venv carries 0.19.1 instead of 0.11.2.
 #
 # fla and causal_conv1d are asserted here as INSTALLED AND IMPORTABLE, not via transformers'
@@ -447,31 +444,24 @@ RUN python /tmp/cudartfix/extract_cudart_fix.py /tmp/cudartfix/capabilities.py /
 RUN /opt/verl-venv/bin/python -c "import importlib.metadata as M; \
 import importlib; \
 from packaging import version; \
-[importlib.import_module(m) for m in ('verl.trainer.main_ppo','verl.trainer.main_ppo_sync','verl.trainer.sft_trainer')]; \
+[importlib.import_module(m) for m in ('verl.trainer.main_ppo','verl.trainer.ppo.v1.trainer_sync','verl.trainer.sft_trainer')]; \
 [importlib.import_module(m) for m in ('verl.workers.rollout.vllm_rollout.vllm_rollout','verl.workers.rollout.vllm_rollout.vllm_async_server')]; \
-from verl.workers.config.rollout import RolloutConfig; \
-assert 'mask_truncated_completions' in RolloutConfig.__dataclass_fields__, 'verl is not the freesolo fork (no mask_truncated_completions)'; \
 importlib.import_module('flash_attn.bert_padding'); \
 importlib.import_module('fla'); \
 assert version.parse(M.version('flash-linear-attention')) >= version.parse('0.2.2'), 'flash-linear-attention older than the 0.2.2 transformers requires: packed GDN boundary resets would be silently discarded'; \
 importlib.import_module('causal_conv1d'); \
-assert M.version('verl') == '0.8.0', 'opd structured gate requires verl exactly 0.8.0, got ' + M.version('verl'); \
+import json; source=json.loads(M.distribution('verl').read_text('direct_url.json')); assert source['url'].removesuffix('.git') == 'https://github.com/verl-project/verl' and source['vcs_info']['commit_id'] == '${VERL_SPEC##*@}', 'wrong upstream Verl source'; \
 assert M.version('xgrammar') == '0.1.25', 'opd structured gate requires xgrammar exactly 0.1.25, got ' + M.version('xgrammar'); \
 from vllm import ModelRegistry; \
 archs = set(ModelRegistry.get_supported_archs()); \
 missing = {'Qwen3_5ForConditionalGeneration','Qwen3_5MoeForConditionalGeneration'} - archs; \
 assert not missing, 'vllm cannot serve the default-model archs: ' + repr(sorted(missing)); \
 print('verl venv OK | verl', M.version('verl'), '| vllm', M.version('vllm'), '| torch', M.version('torch'), '| numpy', M.version('numpy'), '| xgrammar', M.version('xgrammar')); \
-print('  entrypoints: main_ppo (grpo), main_ppo_sync (opd), sft_trainer (sft)'); \
-print('  qwen3.5 archs registered; mask_truncated_completions present'); \
+print('  entrypoints: main_ppo (grpo), ppo.v1.trainer_sync (grpo/opd), sft_trainer (sft)'); \
+print('  qwen3.5 archs registered; exact upstream source verified'); \
 print('  gdn boundary resets: fla', M.version('flash-linear-attention'), 'and causal_conv1d installed and importable (capability itself is cuda-gated, asserted on the worker)')"
 
-# RunPod Serverless worker entrypoint (Pattern D — Flash custom image). Generate /rp_handler.py
-# from the real _train_body source in providers/runpod/serverless/endpoints.py (single source of truth;
-# _train_body is self-contained — every name is imported inside its body) and run it as the CMD so the
-# image is a self-contained RunPod Serverless worker. Build context is the repo root.
-COPY flash/providers/runpod/serverless/endpoints.py flash/source_snapshot.py docker/make_rp_handler.py /tmp/rpgen/
-RUN cp /tmp/rpgen/source_snapshot.py /source_snapshot.py \
-    && python /tmp/rpgen/make_rp_handler.py /tmp/rpgen/endpoints.py /tmp/rpgen/source_snapshot.py /rp_handler.py \
-    && python -c "import ast; ast.parse(open('/rp_handler.py').read()); print('rp_handler OK')"
-CMD ["python", "-u", "/rp_handler.py"]
+# Modal injects the versioned bootstrap capsule and request-local secrets at launch.
+RUN mkdir -p /root/flash
+WORKDIR /root/flash
+CMD ["python", "-u", "/opt/flash/capsule.pyz", "bootstrap"]

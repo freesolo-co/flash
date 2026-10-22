@@ -25,9 +25,7 @@ from flash.core.spec import (
     parse_seed,
     require_project_id,
 )
-from flash.engine.plan.recipe import RECIPE
-from flash.providers import PROVIDER_NAMES, validated_provider_preferences
-from flash.providers.base import (
+from flash.providers.core.base import (
     UnsupportedGpuError,
     authored_gpu_ceiling,
     get_gpu_info,
@@ -35,6 +33,7 @@ from flash.providers.base import (
     provisional_gpu,
     provisional_gpu_count,
 )
+from flash.providers.core.registry import PROVIDER_NAMES, validated_provider_preferences
 from flash.schema.fields import (
     ConfigError,
     _coerce_scalar,
@@ -50,7 +49,6 @@ from flash.schema.fields import (
     _train_teacher,
     _wandb_spec,
 )
-from flash.serve.contract import ADAPTER_REVISION_PATTERN
 
 # the smallest rank the parser accepts, and so the smallest a source adapter can turn out to have.
 # unresolved warm starts use it instead of the serialization default for permissive client-side
@@ -60,10 +58,9 @@ MIN_LORA_RANK = 1
 
 _OWNER_REPO_RE = r"[A-Za-z0-9][A-Za-z0-9._-]*"
 _RUN_ID_RE = r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}"
-# canonical short checkpoint references name a run alias or a saved checkpoint. immutable adapter
-# revisions additionally lock that checkpoint identity to the exact hugging face commit.
-_CHECKPOINT_REF_RE = re.compile(rf"^(?P<run_id>{_RUN_ID_RE})(?:/step-(?P<step>\d{{1,18}}))?$")
-_ADAPTER_REVISION_RE = re.compile(ADAPTER_REVISION_PATTERN)
+_CHECKPOINT_REF_RE = re.compile(
+    rf"^(?P<run_id>{_RUN_ID_RE})/(?:(?P<final>final)|step-(?P<step>0|[1-9][0-9]{{0,17}}))$"
+)
 # INTERNAL artifact-store locator (`<owner>/<repo>:<phase>/<run_id>[/checkpoints/step-N]`); built by
 # the control plane from run metadata and consumed by the worker — not accepted from users anywhere.
 _ADAPTER_STORAGE_REF_RE = re.compile(
@@ -73,39 +70,29 @@ _ADAPTER_STORAGE_REF_RE = re.compile(
 
 
 def parse_checkpoint_ref(text: str) -> tuple[str, int | None] | None:
-    """Parse the canonical short reference: `<run_id>` or `<run_id>/step-N` -> (run_id, step|None)."""
-    match = _CHECKPOINT_REF_RE.fullmatch(str(text or "").strip())
+    """parse `<run_id>/final` or `<run_id>/step-N` into its canonical components."""
+    if not isinstance(text, str):
+        return None
+    match = _CHECKPOINT_REF_RE.fullmatch(text)
     if match is None:
         return None
     step = match.group("step")
     return match.group("run_id"), int(step) if step is not None else None
 
 
-def parse_adapter_revision(text: str) -> tuple[str, int | None, str] | None:
-    """Parse a locked immutable adapter revision into ``(run_id, step|None, hf_revision)``."""
-    match = _ADAPTER_REVISION_RE.fullmatch(str(text or "").strip())
-    if match is None:
-        return None
-    step = match.group("step")
-    return (
-        match.group("run_id"),
-        int(step) if step is not None else None,
-        match.group("hf_revision"),
-    )
-
-
 def format_checkpoint_ref(run_id: str, step: int | None = None) -> str:
-    """Format the canonical short reference: `<run_id>` or `<run_id>/step-N`."""
-    return f"{run_id}/step-{int(step)}" if step is not None else str(run_id)
-
-
-def format_adapter_revision(run_id: str, step: int | None, hf_revision: str) -> str:
-    """Format and validate a canonical immutable adapter revision."""
-    suffix = f"step-{int(step)}" if step is not None else "final"
-    revision = f"{run_id}@{suffix}.{hf_revision}"
-    if parse_adapter_revision(revision) is None:
-        raise ValueError("invalid immutable adapter revision components")
-    return revision
+    """format and validate one canonical permanent checkpoint identity."""
+    if not isinstance(run_id, str) or re.fullmatch(_RUN_ID_RE, run_id) is None:
+        raise ValueError("invalid run_id for checkpoint identity")
+    if step is None:
+        checkpoint_id = f"{run_id}/final"
+    else:
+        if isinstance(step, bool) or not isinstance(step, int) or step < 0:
+            raise ValueError("checkpoint step must be a non-negative integer")
+        checkpoint_id = f"{run_id}/step-{step}"
+    if parse_checkpoint_ref(checkpoint_id) is None:
+        raise ValueError("invalid checkpoint identity components")
+    return checkpoint_id
 
 
 def checkpoint_storage_ref(hf_repo: str, phase: str, run_id: str, step: int | None = None) -> str:
@@ -129,7 +116,7 @@ def normalize_env_name_segment(value: str) -> str | None:
     lowercase, collapse invalid runs to ``-``, strip edge dashes, and return none when no usable
     alphanumeric content remains. cli and server share this grammar.
     """
-    segment = re.sub(r"[^a-z0-9._-]+", "-", str(value or "").lower()).strip("-")
+    segment = re.sub(r"[^a-z0-9._-]+", "-", str(value or "").lower()).lstrip("._-").rstrip("-")
     if segment in {"", ".", ".."} or not re.search(r"[a-z0-9]", segment):
         return None
     return segment
@@ -203,8 +190,13 @@ def _apply_override(raw: dict, item: str) -> None:
     if parts[0] == "wandb":
         node[leaf] = val
     elif val.startswith("[") and val.endswith("]"):
-        inner = val[1:-1].strip()
-        node[leaf] = [_coerce_scalar(x.strip()) for x in inner.split(",") if x.strip()]
+        try:
+            node[leaf] = tomllib.loads(f"value = {val}")["value"]
+        except tomllib.TOMLDecodeError:
+            # Preserve the existing shorthand [STOP1,STOP2]. Quoted TOML values
+            # above must be parsed before splitting, since they may contain commas.
+            inner = val[1:-1].strip()
+            node[leaf] = [_coerce_scalar(x.strip()) for x in inner.split(",") if x.strip()]
     else:
         node[leaf] = _coerce_scalar(val)
 
@@ -228,8 +220,8 @@ def _init_from_adapter_ref(train_raw: dict[str, Any]) -> str:
     if parse_checkpoint_ref(ref) is not None:
         return ref
     raise ConfigError(
-        "train.init_from_adapter must be `<run_id>` (continue that run's trained adapter) or "
-        f"`<run_id>/step-N` (warm-start from a checkpoint listed by `{CLI_NAME} runs checkpoint`)"
+        "train.init_from_adapter must be `<run_id>/final` or `<run_id>/step-N` "
+        f"from `{CLI_NAME} runs checkpoint`"
     )
 
 
@@ -310,8 +302,6 @@ def validate_train_keys_for_algorithm(train_raw: Mapping[str, Any], algorithm: s
     every spec fail to reparse its own output and break resubmit, warm-start and server reparse.
     A null is the absence of an authored value, which is exactly what the user is being asked for.
     """
-    if train_raw.get("loraplus_ratio") is not None and algorithm != "sft":
-        raise ConfigError("train.loraplus_ratio only applies to sft")
     for key, allowed in _ALGORITHM_ONLY_TRAIN_KEYS.items():
         if train_raw.get(key) is None or algorithm in allowed:
             continue
@@ -352,7 +342,7 @@ def _validate_top_level(
     # an unhashable model (toml array / `[model]` table) would typeerror on models.get() downstream,
     # escaping the callers' configerror/valueerror guards -> 500; type-check like the other scalars.
     if not isinstance(model, str) or not model.strip():
-        raise ConfigError('config `model` must be a model id string (e.g. "Qwen/Qwen3.5-4B")')
+        raise ConfigError('config `model` must be a model id string (e.g. "Qwen/Qwen3.5-9B")')
     model_revision = ""
     project_raw = raw.get("project", "")
     try:
@@ -426,7 +416,7 @@ def _authored_gpu_type_entries(raw: Any) -> tuple[str, ...]:
         if not entries:
             raise ConfigError(
                 "[gpu] type must not be an empty list; omit the key for managed allocation, "
-                'or name the classes to allow, e.g. type = ["A100 PCIe", "A100 SXM"]'
+                'or name the classes to allow, e.g. type = ["H100", "A100 SXM"]'
             )
     else:
         raise ConfigError("gpu.type must be a string or a list of strings")
@@ -447,28 +437,12 @@ def _parse_time_wider_shape_remedy(
     thinking: bool,
     provider: str,
 ) -> str:
-    """The ``--gpus N`` clause for a class this run outgrows on ONE card, or ``""``.
-
-    The allocator already ends every fit rejection this way (``wider_shape_remedy``), but this
-    parse-time check ran without it: an authored single-card pin that a second card would satisfy
-    was rejected as a flat dead end, and the user learned only that the largest rentable card is
-    smaller than the requirement. Routing through the same helper means both boundaries suggest
-    the same flag, searched with the same fit model.
-
-    A hard ``gpu.provider`` pin is what narrows the pool, and it is a DIFFERENT field from the soft
-    ``gpu.providers`` preference list (the two are mutually exclusive, see ``GpuSpec``). Passing
-    only the soft list would advertise RunPod's freedom to rent any card count to a Lambda-pinned
-    run, sending the user to a wider SKU their pin may not carry -- exactly the confusion
-    ``widenable_gpu_names`` exists to prevent. A soft preference is not a pin, so it leaves the
-    pool open.
-
-    Sizing must never be what stops a config from parsing, so a failure here degrades to no
-    remedy -- the rejection itself is already correct and stands on its own.
-    """
+    """The ``--gpus N`` clause for a class this run outgrows on ONE card, or ``""``."""
     try:
-        from flash.providers.allocator import _executed_width, geometry_safe_gpu_cap
-        from flash.providers.base import MAX_COMBINATION_CARDS, wider_shape_remedy
-        from flash.providers.fit_errors import widenable_gpu_names
+        from flash.providers.core.allocator import _executed_width, geometry_safe_gpu_cap
+        from flash.providers.core.base import wider_shape_remedy
+        from flash.providers.core.fit_errors import widenable_gpu_names
+        from flash.providers.core.sharding import MAX_COMBINATION_CARDS
 
         if not widenable_gpu_names((candidate,), (provider,) if provider else None):
             return ""
@@ -547,17 +521,17 @@ def _validate_gpu_section(
     preflight_train = (
         {**train_raw, "lora_rank": MIN_LORA_RANK} if unresolved_warmstart_rank else train_raw
     )
-    preflight_gpu_count = provisional_gpu_count(
-        model,
-        algorithm,
-        train=preflight_train,
-        thinking=thinking,
-        geometry_model_revision=model_revision,
-        gpu_count=requested_gpu_count,
-    )
     try:
+        preflight_gpu_count = provisional_gpu_count(
+            model,
+            algorithm,
+            train=preflight_train,
+            thinking=thinking,
+            geometry_model_revision=model_revision,
+            gpu_count=requested_gpu_count,
+        )
         if gpu_types and preflight_gpu_count <= 1 and not model_revision:
-            from flash.providers.allocator import required_vram_gb
+            from flash.providers.core.allocator import required_vram_gb
 
             # sized from `preflight_train`, so an unresolved warm start is measured at rank 1 rather
             # than at the placeholder. that is a true vram lower bound: no source adapter can need
@@ -602,6 +576,8 @@ def _validate_gpu_section(
             gpu_count=preflight_gpu_count,
             authored_gpu_ceiling=requested_gpu_count,
         )
+    except OverflowError as exc:
+        raise ConfigError("training dimensions exceed the supported numeric range") from exc
     except (UnsupportedGpuError, ValueError) as exc:
         raise ConfigError(str(exc)) from exc
     return gpu_spec, requested_gpu_count is None
@@ -692,10 +668,6 @@ def spec_from_dict(
     )
     wandb_spec = _validate_wandb_section(raw)
 
-    loraplus_ratio = _train_float(train_raw, "loraplus_ratio", minimum=1.0)
-    if algorithm == "sft" and loraplus_ratio is None:
-        # freeze the new default; an absent persisted value identifies the legacy 16x optimizer.
-        loraplus_ratio = RECIPE.sft.loraplus_ratio
     try:
         train_spec = TrainSpec(
             epochs=_train_int(train_raw, "epochs", minimum=1),
@@ -704,7 +676,6 @@ def spec_from_dict(
             init_from_adapter=init_from_adapter,
             hf_repo="",  # assigned server-side; see submit_job._assign_managed_hf_repo
             learning_rate=_train_float(train_raw, "learning_rate", minimum=0.0, exclusive=True),
-            loraplus_ratio=loraplus_ratio,
             batch_size=_train_int(train_raw, "batch_size", minimum=1),
             prompts_per_step=_train_int(train_raw, "prompts_per_step", minimum=1),
             max_context_tokens=_train_int(train_raw, "max_context_tokens", minimum=1),
@@ -713,7 +684,6 @@ def spec_from_dict(
             temperature=_train_float(train_raw, "temperature", minimum=0.0),
             max_completion_tokens=_train_int(train_raw, "max_completion_tokens", minimum=1),
             kl_penalty_coef=_train_float(train_raw, "kl_penalty_coef", minimum=0.0),
-            entropy_quantile=_train_float(train_raw, "entropy_quantile", minimum=0.0, maximum=1.0),
             thinking_length_penalty_coef=_train_float(
                 train_raw, "thinking_length_penalty_coef", minimum=0.0, maximum=1.0
             ),
@@ -787,7 +757,6 @@ _INAPPLICABLE_TRAIN_KNOBS: dict[str, dict[str, str]] = {
         "kl_penalty_coef": (
             "only applies to rollout algorithms (grpo, opd); SFT's objective has no KL term"
         ),
-        "entropy_quantile": "only applies to grpo; SFT has no rollout tokens to rank by entropy",
         "thinking_length_penalty_coef": (
             "only applies to grpo; it penalizes generated reasoning length, and SFT never generates"
         ),
@@ -802,10 +771,6 @@ _INAPPLICABLE_TRAIN_KNOBS: dict[str, dict[str, str]] = {
         ),
     },
     "opd": {
-        "entropy_quantile": (
-            "only applies to grpo; opd distils every sampled token against the teacher rather than "
-            "ranking tokens by entropy"
-        ),
         "thinking_length_penalty_coef": (
             "only applies to grpo; it shapes the grpo reward, and opd optimizes a distillation "
             "objective with no reward term"

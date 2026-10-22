@@ -9,6 +9,7 @@ import urllib.request
 from typing import Any
 
 from flash._internal.channel import CLI_NAME
+from flash._internal.http import _urlopen_no_redirect
 from flash.client.http import (
     FREESOLO_AUTH_VERIFY_PATH,
     FREESOLO_EVAL_RUNS_PATH,
@@ -21,7 +22,7 @@ from flash.client.http import (
     freesolo_base_url,
 )
 from flash.core.spec import require_project_id
-from flash.serve.urls import displayable_url
+from flash.serve.contract.urls import displayable_url
 
 
 def verify_freesolo_key(api_key: str, base_url: str | None = None) -> None:
@@ -34,7 +35,7 @@ def verify_freesolo_key(api_key: str, base_url: str | None = None) -> None:
         headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
     )
     try:
-        with urllib.request.urlopen(req, timeout=30) as resp:
+        with _urlopen_no_redirect(req, timeout=30) as resp:
             resp.read()
     except urllib.error.HTTPError as exc:
         if exc.code in (401, 403):
@@ -52,7 +53,15 @@ def verify_freesolo_key(api_key: str, base_url: str | None = None) -> None:
                 "(or FREESOLO_API_KEY)"
             ) from exc
         raise _api_error(exc) from exc
+    except TimeoutError as exc:
+        raise RequestTimeoutError(
+            f"key verification at {displayable_url(base)} timed out after 30s"
+        ) from exc
     except urllib.error.URLError as exc:
+        if isinstance(exc.reason, TimeoutError):
+            raise RequestTimeoutError(
+                f"key verification at {displayable_url(base)} timed out after 30s"
+            ) from exc
         raise ClientError(
             f"cannot reach the freesolo backend at {displayable_url(base)} ({exc.reason}); "
             "check your network connection and FREESOLO_BASE_URL"
@@ -77,7 +86,7 @@ def _freesolo_request(
         headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
     )
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
+        with _urlopen_no_redirect(req, timeout=timeout) as resp:
             raw = resp.read()
     except urllib.error.HTTPError as exc:
         if exc.code == 401:

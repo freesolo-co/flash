@@ -1,31 +1,21 @@
-"""Shared ``fresh_runner`` helper.
-
-Reloads ``flash.runner`` and redirects RUNS_DIR/RESULTS_DIR under a tmp dir — the
-reload+monkeypatch dance the audit found duplicated across the orchestrator/jobs tests.
-"""
+"""Shared runner state helpers for isolated tests."""
 
 from __future__ import annotations
 
-import importlib
 import os
 
-
-def fresh_runner(tmp, monkeypatch):
-    """Reload ``flash.runner`` for the network-shaped submit/poll path with mocks.
-
-    Redirects the fixed RUNS_DIR/RESULTS_DIR module constants under ``tmp`` via
-    monkeypatch so they're restored after the test (the module object is shared, so a
-    bare assignment leaks).
-    """
-    import flash.runner as runner
-
-    importlib.reload(runner)
-    monkeypatch.setattr(runner, "RUNS_DIR", os.path.join(str(tmp), "runs"))
-    monkeypatch.setattr(runner, "RESULTS_DIR", os.path.join(str(tmp), "results"))
-    return runner
+import flash.core.spec as runner_spec
+import flash.runner.lifecycle.preparation as runner_preparation
+import flash.runner.lifecycle.state as runner_state
 
 
-def provisioned_status(runner, spec, *, state="running", **kwargs):
+def fresh_runner(tmp, monkeypatch) -> None:
+    """Redirect the canonical runner state roots under ``tmp`` for a test."""
+    monkeypatch.setattr(runner_state, "RUNS_DIR", os.path.join(str(tmp), "runs"))
+    monkeypatch.setattr(runner_state, "RESULTS_DIR", os.path.join(str(tmp), "results"))
+
+
+def provisioned_status(spec, *, state="running", **kwargs):
     """A ``RunStatus`` as the control plane persists it for a *provisioned* run.
 
     Mirrors the submit path: ``spec`` is the public (managed-field-stripped) view for display,
@@ -35,12 +25,11 @@ def provisioned_status(runner, spec, *, state="running", **kwargs):
     ``_internal_spec_from_status`` / ``effective_spec_from_status``: run_id, train.hf_repo,
     gpu.max_wall_seconds, gpu.max_retries, ...). A run only acquires a durable provider handle
     *after* this snapshot is persisted (``_persist_effective_worker_spec`` runs before
-    ``submit_run``), so a fixture with ``remote=`` must carry it too -- otherwise recovery falls
+    ``submit_attempt``), so a fixture with ``remote=`` must carry it too -- otherwise recovery falls
     back to the lossy public spec and reconstructs a ``run_id="local"`` placeholder.
 
-    Pass the per-test runner module (imported as ``runner`` / ``orch`` / ``R``) as the first
-    argument. ``run_id`` / ``spec`` / ``effective_preparation`` default to the provisioned shape
-    but stay overridable through ``kwargs`` for the rare fixture that needs to.
+    ``run_id`` / ``spec`` / ``effective_preparation`` default to the provisioned shape but stay
+    overridable through ``kwargs`` for the rare fixture that needs to.
     """
     kwargs.setdefault("run_id", spec.run_id)
     public = spec.to_dict()
@@ -56,9 +45,25 @@ def provisioned_status(runner, spec, *, state="running", **kwargs):
         {
             "worker_spec": spec.to_internal_dict(),
             "version": 1,
-            "preparation_digest": runner._preparation_digest(
-                runner.JobSpec.from_dict(public), spec, None
+            "preparation_digest": runner_preparation._preparation_digest(
+                runner_spec.JobSpec.from_dict(public), spec, None
             ),
         },
     )
-    return runner.RunStatus(state=state, **kwargs)
+    return runner_state.RunStatus(state=state, **kwargs)
+
+
+def save_provisioned_status(status, **save_kwargs) -> None:
+    """Persist a provisioned fixture with the attempt bookkeeping its remote implies.
+
+    A run only holds a provider handle after that attempt was durably reserved, so the persisted
+    next-attempt counter is always ``remote["attempt"] + 1``. Saving a fixture with a remote but a
+    default counter of 0 produces a shape production cannot write, and every ownership check --
+    which requires ``next_attempt - 1 == attempt`` -- then rejects the run for a reason no real
+    record can hit.
+    """
+    remote = status.remote if isinstance(status.remote, dict) else None
+    attempt = remote.get("attempt") if remote else None
+    if isinstance(attempt, int) and not isinstance(attempt, bool) and attempt >= 0:
+        save_kwargs.setdefault("_next_attempt", attempt + 1)
+    runner_state._save_status(status, **save_kwargs)

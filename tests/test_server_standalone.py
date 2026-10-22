@@ -8,11 +8,20 @@ the direction it fails in: standalone must accept FEWER credentials than managed
 
 from __future__ import annotations
 
+from types import SimpleNamespace
 from typing import ClassVar
 
 import pytest
 
+import flash.runner.accounting.artifacts as runner_artifacts
+import flash.runner.supervise.recovery as attempt_recovery
+import flash.serve.contract.errors as serving_errors
+import flash.serve.contract.urls as serving_urls
+import flash.serve.deployment.deploy as serving_deploy
+import flash.serve.request.transport as serving_transport
+import flash.server.platform.deployment_state as deployment_state
 from flash.server.platform import auth
+from tests._helpers.deployments import records
 
 
 @pytest.fixture(autouse=True)
@@ -100,17 +109,14 @@ def test_standalone_disables_backend_reporting_at_the_shared_gate(monkeypatch) -
 
 
 def test_standalone_disables_the_backend_polling_loops(monkeypatch) -> None:
-    """Cost reconciliation and charge retry poll on a timer against a backend that isn't there."""
+    """Charge retries poll on a timer against a backend that isn't there."""
     from flash.server.billing.retry import charge_retry_enabled
-    from flash.server.domain.reconcile import reconcile_enabled
 
     monkeypatch.setenv(auth.INTERNAL_KEY_ENV, "operator-key")
     monkeypatch.delenv(auth.STANDALONE_ENV, raising=False)
-    assert reconcile_enabled() is True
     assert charge_retry_enabled() is True
 
     monkeypatch.setenv(auth.STANDALONE_ENV, "1")
-    assert reconcile_enabled() is False
     assert charge_retry_enabled() is False
 
 
@@ -120,7 +126,7 @@ def test_standalone_disables_the_artifact_gc_sweep(monkeypatch) -> None:
     it confirms the live set against the hosted serving registry before deleting. It can only ever
     delete inside the hardcoded Freesolo-Co/flashrun-* allowlist, which a self-hoster's token does
     not own, so standalone loses nothing by skipping it."""
-    from flash.server.domain.repo_cleanup import repo_cleanup_enabled
+    from flash.server.domain.ops.repo_cleanup import repo_cleanup_enabled
 
     monkeypatch.setenv("HF_TOKEN", "hf-operator-token")
     monkeypatch.delenv(auth.STANDALONE_ENV, raising=False)
@@ -135,24 +141,22 @@ def test_standalone_refuses_to_default_the_serving_url(monkeypatch) -> None:
     credential controlling that plane. Falling back to the hosted default would ship it to a
     service the operator does not run, on an ordinary `flash deploy`/`chat`. Raising covers every
     caller (serving_openai_base_url included) rather than stripping the header at one call site."""
-    from flash.serve import deploy
-
     monkeypatch.delenv("FREESOLO_SERVING_URL", raising=False)
     monkeypatch.delenv(auth.STANDALONE_ENV, raising=False)
     # managed: the hosted default is correct and stays
-    assert deploy.DEFAULT_FREESOLO_SERVING_URL in deploy.serving_base_url()
+    assert serving_urls.default_serving_url() in serving_urls.serving_base_url()
 
     monkeypatch.setenv(auth.STANDALONE_ENV, "1")
-    with pytest.raises(deploy.ServingError) as excinfo:
-        deploy.serving_base_url()
+    with pytest.raises(serving_errors.ServingError) as excinfo:
+        serving_urls.serving_base_url()
     assert "FREESOLO_SERVING_URL" in str(excinfo.value)
     # the OpenAI base url derives from the same resolver, so it is covered too
-    with pytest.raises(deploy.ServingError):
-        deploy.serving_openai_base_url()
+    with pytest.raises(serving_errors.ServingError):
+        serving_transport.serving_openai_base_url()
 
     # an explicitly configured backend is honoured in standalone
     monkeypatch.setenv("FREESOLO_SERVING_URL", "https://serving.example.internal")
-    assert "serving.example.internal" in deploy.serving_base_url()
+    assert "serving.example.internal" in serving_urls.serving_base_url()
 
 
 # Every spelling below resolves to Freesolo-operated infrastructure. An operator carrying any of
@@ -193,21 +197,19 @@ def test_standalone_refuses_an_explicitly_configured_hosted_serving_url(monkeypa
     spelling: scheme, case, port, trailing dot, credentials, and /v1 suffix all vary in real
     config files and every one of them reaches the same third party.
     """
-    from flash.serve import deploy
-
     monkeypatch.setenv(auth.STANDALONE_ENV, "1")
     monkeypatch.setenv("FREESOLO_SERVING_URL", configured)
 
-    with pytest.raises(deploy.ServingError) as excinfo:
-        deploy.serving_base_url()
+    with pytest.raises(serving_errors.ServingError) as excinfo:
+        serving_urls.serving_base_url()
     assert "FREESOLO_SERVING_URL" in str(excinfo.value)
     # same resolver underneath, so the OpenAI base url cannot be used to route around it
-    with pytest.raises(deploy.ServingError):
-        deploy.serving_openai_base_url()
+    with pytest.raises(serving_errors.ServingError):
+        serving_transport.serving_openai_base_url()
 
     # managed mode is unaffected: the hosted backend is exactly what it should be talking to.
     monkeypatch.delenv(auth.STANDALONE_ENV)
-    assert deploy.serving_base_url()
+    assert serving_urls.serving_base_url()
 
 
 @pytest.mark.parametrize(
@@ -226,12 +228,10 @@ def test_standalone_still_allows_a_serving_backend_the_operator_runs(monkeypatch
     """The counterpart: over-blocking would make self-hosted serving impossible, which is the
     feature. Suffix matching is on a dotted boundary, so `freesolo.co.evil.example.com` and
     `notfreesolo.co` are other people's hosts and stay allowed."""
-    from flash.serve import deploy
-
     monkeypatch.setenv(auth.STANDALONE_ENV, "1")
     monkeypatch.setenv("FREESOLO_SERVING_URL", configured)
-    assert deploy.serving_base_url()
-    assert deploy.serving_openai_base_url().endswith("/v1")
+    assert serving_urls.serving_base_url()
+    assert serving_transport.serving_openai_base_url().endswith("/v1")
 
 
 def test_standalone_operator_key_survives_surrounding_whitespace(monkeypatch, tmp_path) -> None:
@@ -262,38 +262,37 @@ def test_artifact_namespace_is_operator_configurable(monkeypatch) -> None:
     one the operator's HF_TOKEN can write to. Hardcoding Freesolo's made self-hosting impossible:
     the assignment runs on every submit, and a self-hoster cannot create Freesolo-Co/flashrun-*, so
     the run died at upload before training started."""
-    from flash import runner
-    from flash.server.domain import repo_cleanup
+    from flash.server.domain.ops import repo_cleanup
 
     monkeypatch.delenv("FLASH_HF_NAMESPACE", raising=False)
-    assert runner.artifact_namespace() == runner._DEFAULT_ARTIFACT_NAMESPACE
-    assert runner.managed_hf_repo_for_environment("env-1").startswith(
-        f"{runner._DEFAULT_ARTIFACT_NAMESPACE}/"
+    assert runner_artifacts.artifact_namespace() == runner_artifacts._DEFAULT_ARTIFACT_NAMESPACE
+    assert runner_artifacts.managed_hf_repo_for_environment("env-1").startswith(
+        f"{runner_artifacts._DEFAULT_ARTIFACT_NAMESPACE}/"
     )
 
     monkeypatch.setenv("FLASH_HF_NAMESPACE", "self-hoster")
-    assert runner.artifact_namespace() == "self-hoster"
-    assert runner.managed_hf_repo_for_environment("env-1").startswith("self-hoster/")
+    assert runner_artifacts.artifact_namespace() == "self-hoster"
+    assert runner_artifacts.managed_hf_repo_for_environment("env-1").startswith("self-hoster/")
     # the GC allowlist must follow the same namespace, or it silently stops matching
     assert repo_cleanup._is_managed_env_repo("self-hoster/flashrun-env-1-abc") is True
     assert repo_cleanup._is_managed_env_repo("someone-else/flashrun-env-1-abc") is False
     # a blank override falls back rather than producing a "/flashrun-*" repo id
     monkeypatch.setenv("FLASH_HF_NAMESPACE", "   ")
-    assert runner.artifact_namespace() == runner._DEFAULT_ARTIFACT_NAMESPACE
+    assert runner_artifacts.artifact_namespace() == runner_artifacts._DEFAULT_ARTIFACT_NAMESPACE
 
 
 def test_a_whitespace_only_provider_key_reads_as_unconfigured(monkeypatch) -> None:
     """`is_configured()` decides whether a provider is advertised to the allocator and whether the
     startup preflight passes. A whitespace-only key (a stray newline in an env file) must not make
     a plane advertise a substrate every allocation then fails on."""
-    from flash.providers._lifecycle.auth import load_provider_key
+    from flash.providers._lifecycle.net.auth import load_provider_key
 
-    monkeypatch.setenv("LAMBDA_API_KEY", "   \n ")
-    assert load_provider_key("LAMBDA_API_KEY") is None
-    monkeypatch.setenv("LAMBDA_API_KEY", "  real-key  ")
-    assert load_provider_key("LAMBDA_API_KEY") == "real-key"
-    monkeypatch.delenv("LAMBDA_API_KEY", raising=False)
-    assert load_provider_key("LAMBDA_API_KEY") is None
+    monkeypatch.setenv("MODAL_TOKEN_SECRET", "   \n ")
+    assert load_provider_key("MODAL_TOKEN_SECRET") is None
+    monkeypatch.setenv("MODAL_TOKEN_SECRET", "  real-key  ")
+    assert load_provider_key("MODAL_TOKEN_SECRET") == "real-key"
+    monkeypatch.delenv("MODAL_TOKEN_SECRET", raising=False)
+    assert load_provider_key("MODAL_TOKEN_SECRET") is None
 
 
 def test_standalone_does_not_charge_a_recovered_managed_run(monkeypatch, tmp_path) -> None:
@@ -301,7 +300,6 @@ def test_standalone_does_not_charge_a_recovered_managed_run(monkeypatch, tmp_pat
     carries a managed-mode billing_context. Charging it would send the operator's key to
     FREESOLO_BASE_URL and bill an organization this plane has no relationship with, so the inline
     charge has to read the SHARED gate rather than the env var directly."""
-    from flash.runner.supervise import lifecycle
 
     charged: list[str] = []
 
@@ -312,9 +310,11 @@ def test_standalone_does_not_charge_a_recovered_managed_run(monkeypatch, tmp_pat
         cost_usd = 12.0
 
     recorded: list[dict] = []
-    monkeypatch.setattr("flash.runner.get_status", lambda _run_id: _Status(), raising=False)
     monkeypatch.setattr(
-        "flash.runner.record_billing_state",
+        "flash.runner.lifecycle.status.get_status", lambda _run_id: _Status(), raising=False
+    )
+    monkeypatch.setattr(
+        "flash.runner.accounting.costs.record_billing_state",
         lambda run_id, **kw: recorded.append(kw),
         raising=False,
     )
@@ -327,7 +327,7 @@ def test_standalone_does_not_charge_a_recovered_managed_run(monkeypatch, tmp_pat
     log = (tmp_path / "run.log").open("w")
 
     monkeypatch.setenv(auth.STANDALONE_ENV, "1")
-    lifecycle._apply_charge_with_state("run-1", log, charge_call=_charge, noun="terminal")
+    attempt_recovery._apply_charge_with_state("run-1", log, charge_call=_charge, noun="terminal")
     assert charged == [], "standalone must not reach the Freesolo billing backend"
     assert recorded
     assert recorded[-1]["billing_state"] == "failed"
@@ -335,7 +335,7 @@ def test_standalone_does_not_charge_a_recovered_managed_run(monkeypatch, tmp_pat
 
     # managed mode with the same key still charges -- the gate narrows standalone only
     monkeypatch.delenv(auth.STANDALONE_ENV, raising=False)
-    lifecycle._apply_charge_with_state("run-1", log, charge_call=_charge, noun="terminal")
+    attempt_recovery._apply_charge_with_state("run-1", log, charge_call=_charge, noun="terminal")
     assert charged == ["called"]
     log.close()
 
@@ -498,13 +498,10 @@ def test_standalone_startup_requires_a_writable_artifact_namespace(monkeypatch) 
     """Without FLASH_HF_NAMESPACE a self-hoster's artifacts default to a namespace their HF_TOKEN
     cannot write to, so every run dies at artifact upload -- AFTER preflight called the plane
     healthy. Fail at startup, where the operator can act on it."""
-    from flash.providers.preflight import PreflightError, check_run_preflight
+    from flash.providers.core.preflight import PreflightError, check_run_preflight
 
     monkeypatch.setenv("HF_TOKEN", "hf-operator-token")
     monkeypatch.setenv(auth.INTERNAL_KEY_ENV, "operator-key")
-    monkeypatch.setenv("VAST_API_KEY", "vast-key")
-    monkeypatch.delenv("RUNPOD_API_KEY", raising=False)
-    monkeypatch.delenv("LAMBDA_API_KEY", raising=False)
     monkeypatch.delenv("FLASH_HF_NAMESPACE", raising=False)
 
     monkeypatch.setenv(auth.STANDALONE_ENV, "1")
@@ -529,13 +526,10 @@ def test_startup_rejects_an_artifact_namespace_that_cannot_form_a_repo_id(monkey
     HuggingFace rejects while creating the artifact repo, long after preflight called the plane
     healthy.
     """
-    from flash.providers.preflight import PreflightError, check_run_preflight
+    from flash.providers.core.preflight import PreflightError, check_run_preflight
 
     monkeypatch.setenv("HF_TOKEN", "hf-operator-token")
     monkeypatch.setenv(auth.INTERNAL_KEY_ENV, "operator-key")
-    monkeypatch.setenv("VAST_API_KEY", "vast-key")
-    monkeypatch.delenv("RUNPOD_API_KEY", raising=False)
-    monkeypatch.delenv("LAMBDA_API_KEY", raising=False)
     monkeypatch.setenv(auth.STANDALONE_ENV, "1")
 
     monkeypatch.setenv("FLASH_HF_NAMESPACE", "owner/repo")
@@ -554,7 +548,7 @@ def test_startup_rejects_an_artifact_namespace_that_cannot_form_a_repo_id(monkey
     # and the value it accepts must actually build a valid id, which is the property that failed.
     from huggingface_hub.utils import validate_repo_id
 
-    from flash.runner import managed_hf_repo_for_environment
+    from flash.runner.accounting.artifacts import managed_hf_repo_for_environment
 
     validate_repo_id(managed_hf_repo_for_environment("github:owner/project/envs@main:gsm8k"))
 
@@ -586,13 +580,11 @@ def test_the_serving_header_carries_the_same_key_the_plane_authenticates(monkeyp
     but is an ILLEGAL header value, so httpx rejects the request before it leaves; a stray space
     authenticates and then presents a different credential to the serving backend. Either way
     deploy/undeploy/chat break for a configuration the plane itself accepts."""
-    from flash.serve import deploy
-
     monkeypatch.setenv(auth.INTERNAL_KEY_ENV, "operator-key\n")
-    assert deploy._internal_key_header() == {"X-Freesolo-Internal-Key": "operator-key"}
+    assert serving_transport._internal_key_header() == {"X-Freesolo-Internal-Key": "operator-key"}
 
     monkeypatch.setenv(auth.INTERNAL_KEY_ENV, "  operator-key  ")
-    header = deploy._internal_key_header()
+    header = serving_transport._internal_key_header()
     assert header == {"X-Freesolo-Internal-Key": "operator-key"}
     # the exact value the plane would accept, byte for byte.
     monkeypatch.setenv(auth.STANDALONE_ENV, "1")
@@ -602,15 +594,15 @@ def test_the_serving_header_carries_the_same_key_the_plane_authenticates(monkeyp
 
     # blank collapses to NO header, matching what an unset key already does.
     monkeypatch.setenv(auth.INTERNAL_KEY_ENV, "   ")
-    assert deploy._internal_key_header() == {}
+    assert serving_transport._internal_key_header() == {}
 
 
 def test_a_blank_github_token_is_not_forwarded_as_a_credential(monkeypatch) -> None:
     """GitHub REJECTS a malformed bearer token rather than falling back to anonymous, so a
     whitespace-only GITHUB_TOKEN makes PUBLIC environment repos fail -- repos that load fine with
     no token at all. Every consumer must read blank as absent."""
-    from flash.envs import loader
-    from flash.server.domain import envs as server_envs
+    from flash.envs.loading import loader
+    from flash.server.domain.registry import envs as server_envs
 
     monkeypatch.setenv("GITHUB_TOKEN", "   \n  ")
     assert loader._github_token() is None
@@ -629,10 +621,10 @@ def test_a_blank_github_token_is_not_shipped_to_the_worker(monkeypatch) -> None:
     """The worker's git askpass branches on presence, so forwarding a blank token turns an
     anonymous public clone into an authenticated one with an invalid credential."""
     from flash.core.spec import JobSpec, TrainSpec
-    from flash.providers._lifecycle.worker import build_worker_env
+    from flash.providers._lifecycle.net.worker import build_worker_env
 
     spec = JobSpec(
-        model="Qwen/Qwen3.5-4B",
+        model="Qwen/Qwen3.5-9B",
         algorithm="grpo",
         train=TrainSpec(epochs=1, max_examples=10, hf_repo="owner/runs"),
         seed=0,
@@ -640,24 +632,19 @@ def test_a_blank_github_token_is_not_shipped_to_the_worker(monkeypatch) -> None:
 
     monkeypatch.setenv("GITHUB_TOKEN", "  \t ")
     monkeypatch.setenv("HF_TOKEN", " hf_real ")
-    env = build_worker_env(spec, 0)
+    env = build_worker_env(spec)
     assert "GITHUB_TOKEN" not in env
     # the real token still travels, stripped: this is a blank-only rejection, not a blanket one.
     assert env["HF_TOKEN"] == "hf_real"
 
 
 def test_self_hosting_docs_do_not_promise_an_endpoint_concurrency_cap() -> None:
-    """Flash caps nothing here, so the docs must not imply it does.
-
-    The slot store that was meant to hold the account to 58 endpoints never enforced anything and
-    has been removed; RunPod's own account limit is the only ceiling. Promising a cap invites a
-    self-hoster to run bursts that RunPod, not Flash, ends up rejecting.
-    """
+    """Document Modal workspace quotas without promising a Flash concurrency cap."""
     import pathlib
 
     doc = (pathlib.Path(__file__).resolve().parent.parent / "SELF_HOSTING.md").read_text()
     assert "in-process semaphore, which is the correct" not in doc
-    assert "RunPod endpoint concurrency is not capped by Flash" in doc
+    assert "Modal workspace GPU quotas bound concurrent reservations" in doc
 
 
 def test_the_serving_repos_are_not_on_the_training_path() -> None:
@@ -996,7 +983,7 @@ def test_standalone_owner_manages_its_own_deployments_without_org_headers(
     """`flash models deploy` must work on the plane the operator owns outright.
 
     Standalone resolves its one operator credential to ``auth_kind == "internal"`` against the
-    key-independent standalone-owner row, so `manageable_run` sent the plane's own run owner down
+    key-independent standalone-owner row, so `require_manageable_run` sent the plane's own run owner down
     the internal branch, which demands ``X-Freesolo-Org-Id``. The CLI's deploy, poll, and undeploy
     calls send no such header and a standalone plane has no organization directory to take one
     from, so deploying a run the caller demonstrably owned answered 404 with no way to succeed.
@@ -1017,7 +1004,7 @@ def test_standalone_owner_manages_its_own_deployments_without_org_headers(
     monkeypatch.setattr(_deps, "_load_status", lambda _run_id: sentinel)
 
     # no org/project headers, exactly as the CLI sends them
-    assert _deps.manageable_run("run-standalone", key) is sentinel
+    assert _deps.require_manageable_run("run-standalone", key) is sentinel
 
 
 def test_standalone_deployment_management_still_refuses_a_run_it_does_not_own(
@@ -1049,7 +1036,7 @@ def test_standalone_deployment_management_still_refuses_a_run_it_does_not_own(
     )
 
     with pytest.raises(HTTPException) as ei:
-        _deps.manageable_run("run-someone-else", key)
+        _deps.require_manageable_run("run-someone-else", key)
     assert ei.value.status_code == 404
 
 
@@ -1074,6 +1061,122 @@ def test_standalone_deploy_needs_no_org_while_managed_fails_closed(monkeypatch) 
     assert ei.value.status_code == 409
     assert "owning organization" in str(ei.value.detail)
     serving._require_deploy_org("run-1", "org-1")  # managed with an org still deploys
+
+
+def test_standalone_serving_scope_is_stable_across_deploy_chat_and_undeploy(monkeypatch) -> None:
+    from flash.server.platform.internal_client import run_serving_org_id
+    from flash.server.routes import serving, serving_chat
+
+    monkeypatch.setenv(auth.STANDALONE_ENV, "1")
+    monkeypatch.setenv("FREESOLO_SERVING_URL", "http://serving.test")
+    status = SimpleNamespace(
+        run_id="run-standalone",
+        state="done",
+        spec={},
+        billing_context=None,
+        platform_context=None,
+        deployments=records(
+            "run-standalone",
+            {
+                "state": "ready",
+                "checkpoint_id": "run-standalone/final",
+                "verified_at": 1.0,
+                "deployment_generation": "generation-a",
+            },
+        ),
+    )
+    assert auth.serving_org_id(None) == auth.STANDALONE_SERVING_ORG_ID
+    assert run_serving_org_id(status) == auth.STANDALONE_SERVING_ORG_ID
+
+    registrations: list[dict] = []
+    monkeypatch.setattr(
+        serving_deploy, "fetch_registered_checkpoint", lambda *_args, **_kwargs: None
+    )
+    monkeypatch.setattr(serving_deploy, "resolve_artifact_revision", lambda _repo: "a" * 40)
+    monkeypatch.setattr(
+        serving_deploy.adapter_check,
+        "adapter_artifact_metadata",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            lora_rank=16,
+            artifact_digest="b" * 64,
+            targets_images=False,
+        ),
+    )
+    monkeypatch.setattr(serving_deploy, "_require_serving_capabilities", lambda **_kwargs: set())
+    monkeypatch.setattr(
+        serving_deploy,
+        "_wait_checkpoint_ready",
+        lambda *_args, **_kwargs: {"deployment_generation": "generation-a"},
+    )
+    monkeypatch.setattr(
+        serving_deploy.transport,
+        "serving_request",
+        lambda _method, _url, **kwargs: (
+            registrations.append(kwargs) or SimpleNamespace(status_code=200)
+        ),
+    )
+    deployment = serving_deploy.deploy_adapter(
+        "run-standalone",
+        "Qwen/Qwen3.5-9B",
+        "org/repo",
+        "sft/run-standalone",
+        org_id=None,
+        lora_rank=16,
+    )
+    assert deployment.checkpoint_id == "run-standalone/final"
+    assert registrations[0]["org_id"] == auth.STANDALONE_SERVING_ORG_ID
+    assert registrations[0]["json"]["org_id"] == auth.STANDALONE_SERVING_ORG_ID
+
+    monkeypatch.setattr(serving, "require_manageable_run", lambda *_args, **_kwargs: status)
+    monkeypatch.setattr(
+        serving_deploy,
+        "undeploy_adapter",
+        lambda checkpoint_id, *, org_id: {
+            "checkpoint_id": checkpoint_id,
+            "disabled_checkpoints": [checkpoint_id],
+            "serving_deregistered": True,
+            "org_id": org_id,
+        },
+    )
+    monkeypatch.setattr(serving, "mark_deployment_undeploying", lambda *_args, **_kwargs: status)
+    monkeypatch.setattr(serving, "mark_undeployed", lambda *_args: status)
+    monkeypatch.setattr(
+        deployment_state, "_report_persisted_transition", lambda *_args, **_kwargs: None
+    )
+    undeployed = serving.undeploy(
+        "run-standalone",
+        "run-standalone/final",
+        {"id": 1, "auth_kind": "internal"},
+    )
+    assert undeployed["disabled_checkpoints"] == ["run-standalone/final"]
+
+    monkeypatch.setattr(serving_chat, "require_manageable_run", lambda *_args, **_kwargs: status)
+    monkeypatch.setattr(
+        serving_chat,
+        "effective_spec_from_status",
+        lambda _status: SimpleNamespace(
+            model="Qwen/Qwen3.5-9B",
+            train=SimpleNamespace(hf_repo="org/repo", stop_sequences=()),
+            thinking=False,
+        ),
+    )
+    _request, _messages, _spec, _checkpoint, org_id = serving_chat._resolve_chat_request(
+        "run-standalone",
+        {
+            "checkpoint_id": "run-standalone/final",
+            "messages": [{"role": "user", "content": "hi"}],
+        },
+        {"id": 1, "auth_kind": "internal"},
+        None,
+        None,
+    )
+    assert org_id == auth.STANDALONE_SERVING_ORG_ID
+
+
+def test_managed_serving_scope_never_synthesizes_an_org(monkeypatch) -> None:
+    monkeypatch.delenv(auth.STANDALONE_ENV, raising=False)
+    assert auth.serving_org_id(None) == ""
+    assert auth.serving_org_id("org-1") == "org-1"
 
 
 def test_standalone_deployment_listing_stays_exact_key_scoped(monkeypatch) -> None:

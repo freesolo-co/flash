@@ -24,7 +24,6 @@ in the offline test env, so we stub it just enough to import and reach _build_ch
 from __future__ import annotations
 
 import hashlib
-import sys
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import MagicMock
@@ -32,9 +31,13 @@ from unittest.mock import MagicMock
 import pytest
 from fastapi.testclient import TestClient
 
-from flash.serving.src.router import AdapterRouter, build_serving_app
-from flash.serving.src.schemas import AdapterRecord
-from tests.serving.conftest import attest
+from flash.serving.src.http.router import (
+    AdapterRouter,
+    build_offline_serving_app,
+    build_serving_app,
+)
+from flash.serving.src.io.schemas import AdapterRecord
+from tests.serving.conftest import RecordingUsageStore, attest
 
 
 def _passthrough_decorator(*_a: Any, **_k: Any):
@@ -45,7 +48,7 @@ def _passthrough_decorator(*_a: Any, **_k: Any):
 
 
 @pytest.fixture(scope="module")
-def modal_app_module():
+def modal_app_module(load_modal_app_under_stub):
     modal_stub = MagicMock(name="modal")
     modal_stub.concurrent.side_effect = _passthrough_decorator
     modal_stub.method.side_effect = _passthrough_decorator
@@ -58,21 +61,7 @@ def modal_app_module():
     app_mock.local_entrypoint.side_effect = _passthrough_decorator
     modal_stub.App.return_value = app_mock
     modal_stub.Period.return_value = MagicMock()
-    _MISSING = object()
-    prev_modal = sys.modules.get("modal", _MISSING)
-    prev_modal_app = sys.modules.get("flash.serving.modal_app", _MISSING)
-    sys.modules["modal"] = modal_stub
-
-    import flash.serving.modal_app as modal_app
-
-    try:
-        yield modal_app
-    finally:
-        for name, prev in (("modal", prev_modal), ("modal_app", prev_modal_app)):
-            if prev is _MISSING:
-                sys.modules.pop(name, None)
-            else:
-                sys.modules[name] = prev
+    return load_modal_app_under_stub(modal_stub)
 
 
 class _FakeResp:
@@ -93,7 +82,7 @@ def _authorizer(modal_app_module, monkeypatch, response: Any):
         def __init__(self, *_a: Any, **_k: Any) -> None:
             pass
 
-        async def post(self, _url: str, json: Any) -> _FakeResp:
+        async def post(self, _url: str, json: Any, headers: Any = None) -> _FakeResp:
             if isinstance(response, Exception):
                 raise response
             return response
@@ -205,7 +194,7 @@ def _counting_client(monkeypatch, responder, *, delay: float = 0.0):
         def __init__(self, *_a: Any, **_k: Any) -> None:
             pass
 
-        async def post(self, _url: str, json: Any) -> _FakeResp:
+        async def post(self, _url: str, json: Any, headers: Any = None) -> _FakeResp:
             calls["n"] += 1
             n = calls["n"]
             if delay:
@@ -228,7 +217,7 @@ def _new_authorizer(modal_app_module):
     )
 
 
-_QWEN = "Qwen/Qwen3.5-0.8B"
+_QWEN = "Qwen/Qwen3.5-9B"
 _INTERNAL_KEY = "fs-internal"
 
 
@@ -236,15 +225,20 @@ class _CountingPool:
     def __init__(self) -> None:
         self.generate_calls = 0
 
-    async def generate(self, _base_model, _payload, record, *, expected_checkpoint=None):
+    async def generate(self, _base_model, payload, record, *, expected_checkpoint=None):
         self.generate_calls += 1
         return attest(
             record,
             {
                 "text": "hi",
                 "finish_reason": "stop",
+                "prompt_token_ids": [1],
+                "completion_token_ids": [2],
                 "prompt_tokens": 1,
                 "completion_tokens": 1,
+                "cached_tokens_reported": False,
+                "reasoning_tokens": 0,
+                "request_id": payload.generation_id,
                 "checkpoint": "",
             },
         )
@@ -261,23 +255,25 @@ class _CountingPool:
         return None
 
 
-def _base_model_client(authorize, pool, *, usage_reporter=None) -> TestClient:
+def _base_model_client(authorize, pool, *, usage_store=None) -> TestClient:
     record = AdapterRecord(
-        adapter_id=_QWEN,
+        model_id=_QWEN,
         repo_id=_QWEN,
         base_model=_QWEN,
         serve_base_model=True,
-        thinking=True,
+        thinking=False,
         org_id=None,
         status="ready",
     )
+    builder = build_serving_app if usage_store is not None else build_offline_serving_app
+    kwargs = {"usage_store": usage_store} if usage_store is not None else {}
     return TestClient(
-        build_serving_app(
+        builder(
             pool,
             AdapterRouter([record]),
             internal_key=_INTERNAL_KEY,
             chat_authorizer=authorize,
-            usage_reporter=usage_reporter,
+            **kwargs,
         )
     )
 
@@ -309,25 +305,27 @@ def test_malformed_200_fails_closed_without_dispatch_or_cache(
     )
     authorize = _new_authorizer(modal_app_module)
     pool = _CountingPool()
-    reports: list[dict[str, Any]] = []
+    store = RecordingUsageStore()
 
-    async def capture(usage: dict[str, Any]) -> None:
-        reports.append(usage)
-
-    with _base_model_client(authorize, pool, usage_reporter=capture) as client:
+    with _base_model_client(authorize, pool, usage_store=store) as client:
         denied = _chat(client, Authorization="Bearer fs-user-key")
         assert denied.status_code == 503
         assert pool.generate_calls == 0
 
         allowed = _chat(client, Authorization="Bearer fs-user-key")
-        internal = _chat(client, **{"X-Freesolo-Internal-Key": _INTERNAL_KEY})
+        internal = _chat(
+            client,
+            **{"X-Freesolo-Internal-Key": _INTERNAL_KEY, "X-Freesolo-Org-Id": "org-2"},
+        )
 
     assert allowed.status_code == 200
     assert internal.status_code == 200
     assert pool.generate_calls == 2
     assert calls["n"] == 2
-    assert len(reports) == 1
-    assert reports[0]["orgId"] == "org-1"
+    assert len(store.finalized) == 2
+    assert store.finalized[0].principal.orgId == "org-1"
+    assert store.finalized[1].principal.kind == "trusted_internal"
+    assert store.finalized[1].principal.orgId == "org-2"
 
 
 def test_cancelled_waiter_does_not_cancel_shared_authorization(modal_app_module, monkeypatch):
@@ -344,7 +342,7 @@ def test_cancelled_waiter_does_not_cancel_shared_authorization(modal_app_module,
 
     results = asyncio.run(run())
     assert isinstance(results[0], asyncio.CancelledError)
-    assert results[1:] == ["org-1"] * 9
+    assert [result.principal.orgId for result in results[1:]] == ["org-1"] * 9
     assert calls["n"] == 1
 
 
@@ -360,7 +358,8 @@ def test_successful_authorization_is_cached_within_ttl(modal_app_module, monkeyp
         return first, second
 
     first, second = asyncio.run(run())
-    assert first == second == "org-1"
+    assert first == second
+    assert first.principal.orgId == "org-1"
     assert calls["n"] == 1
 
 
@@ -375,7 +374,7 @@ def test_concurrent_identical_lookups_coalesce_to_one_call(modal_app_module, mon
         return await asyncio.gather(*[authorize("key", "ad") for _ in range(50)])
 
     orgs = asyncio.run(run())
-    assert orgs == ["org-1"] * 50
+    assert [org.principal.orgId for org in orgs] == ["org-1"] * 50
     assert calls["n"] == 1  # single-flight collapsed the stampede into ONE backend call
 
 
@@ -414,8 +413,11 @@ def test_failed_authorization_is_not_cached(modal_app_module, monkeypatch):
         return await authorize("key", "ad")
 
     org = asyncio.run(run())
-    assert org == "org-1"
+    assert org.principal.orgId == "org-1"
     assert calls["n"] == 2
+
+
+_EMPTY_SCOPE_DIGEST = hashlib.sha256(b"").hexdigest()
 
 
 def test_expired_key_is_evicted_before_reauthorization(modal_app_module, monkeypatch):
@@ -431,7 +433,11 @@ def test_expired_key_is_evicted_before_reauthorization(modal_app_module, monkeyp
     authorize = _new_authorizer(modal_app_module)
     cache = inspect.getclosurevars(authorize).nonlocals["_cache"]
     request_key = ("synthetic-expired-key", "adapter-1")
-    cache_key = (hashlib.sha256(request_key[0].encode("utf-8")).hexdigest(), request_key[1])
+    cache_key = (
+        hashlib.sha256(request_key[0].encode("utf-8")).hexdigest(),
+        request_key[1],
+        _EMPTY_SCOPE_DIGEST,
+    )
 
     async def run() -> None:
         await authorize(*request_key)
@@ -460,10 +466,12 @@ def test_prune_removes_expired_keys_below_capacity(modal_app_module, monkeypatch
     expired_key = (
         hashlib.sha256(expired_request[0].encode("utf-8")).hexdigest(),
         expired_request[1],
+        _EMPTY_SCOPE_DIGEST,
     )
     current_key = (
         hashlib.sha256(current_request[0].encode("utf-8")).hexdigest(),
         current_request[1],
+        _EMPTY_SCOPE_DIGEST,
     )
 
     async def run() -> None:
@@ -528,3 +536,48 @@ def test_engine_secret_contains_only_engine_credentials(modal_app_module, monkey
         modal_app_module.app.function.call_args.kwargs["secrets"]
         is modal_app_module.runtime_secrets
     )
+
+
+def test_checkpoint_authorization_is_rechecked_after_a_prior_success(modal_app_module, monkeypatch):
+    import asyncio
+
+    from fastapi import HTTPException
+
+    calls = _counting_client(
+        monkeypatch,
+        lambda n: (
+            _FakeResp(200, {"orgId": "org-1", "deploymentGeneration": "generation-a"})
+            if n == 1
+            else _FakeResp(404, {"detail": "not verified"})
+        ),
+    )
+    authorize = _new_authorizer(modal_app_module)
+
+    async def scenario():
+        authorized = await authorize("key", "run-1/final")
+        assert authorized.principal.orgId == "org-1"
+        assert authorized.deployment_generation == "generation-a"
+        with pytest.raises(HTTPException) as error:
+            await authorize("key", "run-1/final")
+        assert error.value.status_code == 403
+
+    asyncio.run(scenario())
+    assert calls["n"] == 2
+
+
+@pytest.mark.parametrize("generation", [None, "", "   ", 7])
+def test_checkpoint_authorization_requires_verified_generation(
+    modal_app_module, monkeypatch, generation
+):
+    import asyncio
+
+    from fastapi import HTTPException
+
+    authorize = _authorizer(
+        modal_app_module,
+        monkeypatch,
+        _FakeResp(200, {"orgId": "org-1", "deploymentGeneration": generation}),
+    )
+    with pytest.raises(HTTPException) as error:
+        asyncio.run(authorize("key", "run-1/final"))
+    assert error.value.status_code == 503

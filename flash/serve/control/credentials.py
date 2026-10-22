@@ -15,10 +15,7 @@ class _CredentialBoundary:
     __slots__ = ()
 
     def __init_subclass__(cls, **_kwargs: object) -> None:
-        if cls.__module__ == __name__ and cls.__name__ in {
-            "ModalCredentials",
-            "RunPodCredentials",
-        }:
+        if cls.__module__ == __name__ and cls.__name__ == "ModalCredentials":
             return
         raise TypeError("provider credential wrappers cannot be subclassed")
 
@@ -58,24 +55,3 @@ class ModalCredentials(_CredentialBoundary):
         if type(self) is not ModalCredentials:
             raise TypeError("modal credentials must use the exact credential type")
         return self.__token_id, self.__token_secret
-
-
-class RunPodCredentials(_CredentialBoundary):
-    """one request's runpod api key, never a serializable control record."""
-
-    __slots__ = ("__api_key",)
-
-    provider: Literal["runpod"] = "runpod"
-
-    def __init__(self, api_key: str) -> None:
-        self.__api_key = _credential_part(api_key, "api_key")
-
-    def __repr__(self) -> str:
-        return "RunPodCredentials(<redacted>)"
-
-    def reveal(self) -> str:
-        """return the request-local value to the runpod control implementation."""
-
-        if type(self) is not RunPodCredentials:
-            raise TypeError("runpod credentials must use the exact credential type")
-        return self.__api_key

@@ -6,29 +6,35 @@ import pytest
 from fastapi import HTTPException, status
 from fastapi.testclient import TestClient
 
-from flash.serving.src.router import AdapterRouter, build_serving_app
-from flash.serving.src.schemas import AdapterRecord
+from flash.serving.src.http.router import AdapterRouter
+from flash.serving.src.http.router import build_offline_serving_app as build_serving_app
+from flash.serving.src.io.schemas import AdapterRecord
 
-QWEN = "Qwen/Qwen3.5-0.8B"
+QWEN = "Qwen/Qwen3.5-9B"
 INTERNAL_KEY = "fs-internal"
 CHECKPOINT_MODEL = "flash-1783788692-948932a3/step-32"
 BASE_RUN_ID = "flash-1783788692-948932a3"
-DETAIL = (
-    "This is a checkpoint identifier, not a serving model identifier. "
-    f"Deploy it first or use model {BASE_RUN_ID}."
-)
 
 
-def _rec(adapter_id: str, *, serve_base_model: bool = False) -> AdapterRecord:
+def _rec(model_id: str, *, serve_base_model: bool = False) -> AdapterRecord:
+    run_id, checkpoint = model_id.split("/", 1)
+    checkpoint_step = None if checkpoint == "final" else int(checkpoint.removeprefix("step-"))
     return AdapterRecord.model_validate(
         {
-            "adapter_id": adapter_id,
-            "repo_id": adapter_id if serve_base_model else f"org/{adapter_id}",
+            "model_id": model_id,
+            "repo_id": QWEN if serve_base_model else f"org/{run_id}",
             "base_model": QWEN,
             "org_id": None if serve_base_model else "org-a",
             "status": "ready",
             "thinking": True,
             "serve_base_model": serve_base_model,
+            "checkpoint": None if serve_base_model else model_id,
+            "run_id": None if serve_base_model else run_id,
+            "checkpoint_step": None if serve_base_model else checkpoint_step,
+            "artifact_revision": None if serve_base_model else "a" * 40,
+            "artifact_digest": None if serve_base_model else "b" * 64,
+            "artifact_fingerprint": None if serve_base_model else "c" * 64,
+            "lora_rank": None if serve_base_model else 16,
         }
     )
 
@@ -38,7 +44,7 @@ class FakePool:
         self.generated: list[str] = []
 
     async def generate(self, base_model, payload, record, *, expected_checkpoint=None):
-        self.generated.append(payload.adapter_id)
+        self.generated.append(payload.model_id)
         return {
             "text": "hi",
             "finish_reason": "stop",
@@ -48,7 +54,7 @@ class FakePool:
         }
 
     async def stream_generate(self, base_model, payload, record, *, expected_checkpoint=None):
-        self.generated.append(payload.adapter_id)
+        self.generated.append(payload.model_id)
         yield {"type": "ready", "checkpoint": ""}
         yield {"type": "final", "finish_reason": "stop", "prompt_tokens": 1, "completion_tokens": 1}
 
@@ -56,7 +62,7 @@ class FakePool:
         pass
 
     async def unregister(
-        self, base_model, adapter_id, expected_generation=None
+        self, base_model, model_id, expected_generation=None
     ) -> None:  # pragma: no cover
         pass
 
@@ -66,8 +72,8 @@ class FakeAuthorizer:
         self.calls: list[tuple[str, str]] = []
         self.error = error
 
-    async def __call__(self, token: str, adapter_id: str) -> str:
-        self.calls.append((token, adapter_id))
+    async def __call__(self, token: str, model_id: str, scope: dict | None = None) -> str:
+        self.calls.append((token, model_id))
         if self.error is not None:
             raise self.error
         return "caller-org"
@@ -109,35 +115,38 @@ def test_generated_checkpoint_reference_requires_authorization_first(registered:
     assert pool.generated == []
 
 
-def test_generated_checkpoint_reference_is_normalized_before_validation() -> None:
+def test_checkpoint_reference_whitespace_is_rejected_after_authorization() -> None:
     auth = FakeAuthorizer()
     client, pool = _client([], auth)
 
     response = _chat(client, f"  {CHECKPOINT_MODEL}\n")
 
-    assert response.status_code == 400
-    assert response.json() == {"detail": DETAIL}
+    assert response.status_code == 422
+    assert response.json() == {"detail": "model must be required"}
     assert auth.calls == [("user-key", CHECKPOINT_MODEL)]
     assert pool.generated == []
 
 
-def test_generated_checkpoint_reference_is_400_for_internal_caller() -> None:
+def test_unknown_checkpoint_reference_is_404_for_internal_caller() -> None:
     auth = FakeAuthorizer()
     client, pool = _client([], auth)
 
     response = _chat(
         client,
         CHECKPOINT_MODEL,
-        headers={"X-Freesolo-Internal-Key": INTERNAL_KEY},
+        headers={
+            "X-Freesolo-Internal-Key": INTERNAL_KEY,
+            "X-Freesolo-Org-Id": "org-a",
+        },
     )
 
-    assert response.status_code == 400
-    assert response.json() == {"detail": DETAIL}
+    assert response.status_code == 404
+    assert response.json() == {"detail": f"Unknown adapter id: {CHECKPOINT_MODEL}"}
     assert auth.calls == []
     assert pool.generated == []
 
 
-def test_generated_checkpoint_reference_streaming_request_is_plain_400() -> None:
+def test_streaming_checkpoint_request_validates_messages_before_lookup() -> None:
     auth = FakeAuthorizer()
     client, pool = _client([], auth)
 
@@ -147,10 +156,10 @@ def test_generated_checkpoint_reference_streaming_request_is_plain_400() -> None
         json={"model": CHECKPOINT_MODEL, "messages": [], "stream": True},
         headers={"Authorization": "Bearer user-key"},
     ) as response:
-        assert response.status_code == 400
+        assert response.status_code == 422
         assert response.headers["content-type"].startswith("application/json")
         response.read()
-        assert response.json() == {"detail": DETAIL}
+        assert response.json() == {"detail": "messages must be a nonempty array of objects"}
 
     assert auth.calls == [("user-key", CHECKPOINT_MODEL)]
     assert pool.generated == []

@@ -1,0 +1,289 @@
+{
+  "base": {
+    "architecture": "Qwen3_5ForConditionalGeneration",
+    "geometry": {
+      "attention_heads": 24,
+      "full_attention_layers": 16,
+      "hidden_size": 5120,
+      "key_value_heads": 4,
+      "layers": 64,
+      "linear_attention_layers": 48,
+      "vision_layers": 27,
+      "vocab_size": 248320
+    },
+    "model": "Qwen/Qwen3.8-27B",
+    "model_type": "qwen3_5",
+    "parameter_count": 27781427952,
+    "revision": "1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0",
+    "target_count": 606,
+    "target_shapes": [
+      [
+        1152,
+        1152,
+        27
+      ],
+      [
+        1152,
+        3456,
+        27
+      ],
+      [
+        1152,
+        4304,
+        27
+      ],
+      [
+        4304,
+        1152,
+        27
+      ],
+      [
+        4608,
+        4608,
+        1
+      ],
+      [
+        4608,
+        5120,
+        1
+      ],
+      [
+        5120,
+        48,
+        96
+      ],
+      [
+        5120,
+        1024,
+        32
+      ],
+      [
+        5120,
+        6144,
+        48
+      ],
+      [
+        5120,
+        10240,
+        48
+      ],
+      [
+        5120,
+        12288,
+        16
+      ],
+      [
+        5120,
+        17408,
+        128
+      ],
+      [
+        6144,
+        5120,
+        64
+      ],
+      [
+        17408,
+        5120,
+        64
+      ]
+    ],
+    "weight_bytes": 55562855904
+  },
+  "fp8": {
+    "activation_scheme": "dynamic",
+    "format": "e4m3",
+    "model": "Qwen/Qwen3.8-27B-FP8",
+    "quant_method": "fp8",
+    "revision": "017b9c7af6b5689d5dd426a76e0bc077eb5ca20a",
+    "weight_block_size": [
+      128,
+      128
+    ]
+  },
+  "processor": {
+    "class": "Qwen3VLProcessor",
+    "image_processor_class": "Qwen2VLImageProcessorFast"
+  },
+  "source_sha256": {
+    "config.json": "191e0af232104ed8b65258cf3fb2b842e288008baca7633c11b82a1ac7203aab",
+    "fp8/config.json": "74227dd615bf1ea975aa676bdf355a0379858c12f394b5365cd9dfa5fc2c70bc",
+    "model.safetensors.index.json": "77042094076611b69791a610065f28b7013b8c621795fa86ddccc8bac7d1b9df",
+    "preprocessor_config.json": "27225450ac9c6529872ee1924fcb0962ff5634834f817040f444118116f4e516",
+    "tokenizer_config.json": "b11349aafa7cdc6a320767cf7ceb29ed82f7eda5d65e8e0819e76f0ce947bf27"
+  },
+  "tokenizer": {
+    "added_tokens": [
+      {
+        "content": "<|endoftext|>",
+        "id": 248044,
+        "special": true
+      },
+      {
+        "content": "<|im_start|>",
+        "id": 248045,
+        "special": true
+      },
+      {
+        "content": "<|im_end|>",
+        "id": 248046,
+        "special": true
+      },
+      {
+        "content": "<|object_ref_start|>",
+        "id": 248047,
+        "special": true
+      },
+      {
+        "content": "<|object_ref_end|>",
+        "id": 248048,
+        "special": true
+      },
+      {
+        "content": "<|box_start|>",
+        "id": 248049,
+        "special": true
+      },
+      {
+        "content": "<|box_end|>",
+        "id": 248050,
+        "special": true
+      },
+      {
+        "content": "<|quad_start|>",
+        "id": 248051,
+        "special": true
+      },
+      {
+        "content": "<|quad_end|>",
+        "id": 248052,
+        "special": true
+      },
+      {
+        "content": "<|vision_start|>",
+        "id": 248053,
+        "special": true
+      },
+      {
+        "content": "<|vision_end|>",
+        "id": 248054,
+        "special": true
+      },
+      {
+        "content": "<|vision_pad|>",
+        "id": 248055,
+        "special": true
+      },
+      {
+        "content": "<|image_pad|>",
+        "id": 248056,
+        "special": true
+      },
+      {
+        "content": "<|video_pad|>",
+        "id": 248057,
+        "special": true
+      },
+      {
+        "content": "<tool_call>",
+        "id": 248058,
+        "special": false
+      },
+      {
+        "content": "</tool_call>",
+        "id": 248059,
+        "special": false
+      },
+      {
+        "content": "<|fim_prefix|>",
+        "id": 248060,
+        "special": false
+      },
+      {
+        "content": "<|fim_middle|>",
+        "id": 248061,
+        "special": false
+      },
+      {
+        "content": "<|fim_suffix|>",
+        "id": 248062,
+        "special": false
+      },
+      {
+        "content": "<|fim_pad|>",
+        "id": 248063,
+        "special": false
+      },
+      {
+        "content": "<|repo_name|>",
+        "id": 248064,
+        "special": false
+      },
+      {
+        "content": "<|file_sep|>",
+        "id": 248065,
+        "special": false
+      },
+      {
+        "content": "<tool_response>",
+        "id": 248066,
+        "special": false
+      },
+      {
+        "content": "</tool_response>",
+        "id": 248067,
+        "special": false
+      },
+      {
+        "content": "<think>",
+        "id": 248068,
+        "special": false
+      },
+      {
+        "content": "</think>",
+        "id": 248069,
+        "special": false
+      },
+      {
+        "content": "<|audio_start|>",
+        "id": 248070,
+        "special": true
+      },
+      {
+        "content": "<|audio_end|>",
+        "id": 248071,
+        "special": true
+      },
+      {
+        "content": "<tts_pad>",
+        "id": 248072,
+        "special": true
+      },
+      {
+        "content": "<tts_text_bos>",
+        "id": 248073,
+        "special": true
+      },
+      {
+        "content": "<tts_text_eod>",
+        "id": 248074,
+        "special": true
+      },
+      {
+        "content": "<tts_text_bos_single>",
+        "id": 248075,
+        "special": true
+      },
+      {
+        "content": "<|audio_pad|>",
+        "id": 248076,
+        "special": true
+      }
+    ],
+    "chat_template_sha256": "c3cf9e34abf4f9e36c2d72165aa9c132d3e2a725b6c2586aaa3a8af9d7a81041",
+    "class": "Qwen2Tokenizer",
+    "length": 248077,
+    "preserve_thinking_default": true,
+    "vocab_size": 248044
+  }
+}

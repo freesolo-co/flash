@@ -1,3 +1,5 @@
+import flash.engine.worker.train.entry.rl_train_runner as rl_train_runner
+
 """verl GRPO per-step metrics reconstructed from the trainer's stdout.
 
 an in-process trainer would feed `flash runs log -f` from a TrainerCallback. verl's trainer runs
@@ -12,14 +14,13 @@ import ast
 import inspect
 import textwrap
 
-from flash.engine.worker import rl_train_runner
-from flash.engine.worker.backend_common import (
+from flash.engine.worker.train.entry.backend_common import (
     append_step_metrics,
     parse_verl_metric,
     parse_verl_step_metrics,
     verl_step_number,
 )
-from flash.engine.worker.rl_train_runner import _ingest_step_metrics, _StepMetricState
+from flash.engine.worker.train.entry.rl_train_runner import _ingest_step_metrics, _StepMetricState
 
 # a realistic verl step line: ray tags worker stdout with a pid prefix, and reduce_metrics returns
 # numpy scalars that pprint renders as np.float64(...) under numpy>=2.
@@ -195,24 +196,28 @@ def test_backlog_is_mutated_in_place_for_the_heartbeat_reader():
     assert alias == [{"step": 3}, {"step": 4}, {"step": 5}]
 
 
-def test_exact_advantage_bounds_are_retained_in_the_forced_step_heartbeat(monkeypatch):
+def test_exact_advantage_bounds_are_retained_in_the_forced_step_heartbeat(
+    worker_context, monkeypatch
+):
     calls = []
     outcomes = iter((False, True))
 
-    def heartbeat(stage, **fields):
+    def heartbeat(stage, context=None, **fields):
         calls.append((stage, fields))
         return next(outcomes)
 
-    monkeypatch.setattr(rl_train_runner._w, "heartbeat", heartbeat)
+    monkeypatch.setattr(rl_train_runner._worker_heartbeat, "heartbeat", heartbeat)
     monkeypatch.setattr(rl_train_runner, "gpu_diagnostics", lambda **_kwargs: {})
     state = _StepMetricState()
     for step, minimum, maximum in ((1, -0.25, 0.75), (2, -0.5, 1.5)):
         _ingest_step_metrics(
             f"step:{step} - critic/rewards/mean:0.5 - "
-            f"critic/advantages/min:{minimum} - critic/advantages/max:{maximum}",
+            f"critic/advantages/min:{minimum} - critic/advantages/max:{maximum} - "
+            "actor/grad_norm:1.0",
             {"max_completion": 512},
             state,
             dict,
+            context=worker_context,
         )
 
     assert len(calls) == 2
@@ -222,6 +227,7 @@ def test_exact_advantage_bounds_are_retained_in_the_forced_step_heartbeat(monkey
             "reward": 0.5,
             "advantage_min": -0.25,
             "advantage_max": 0.75,
+            "grad_norm": 1.0,
             "max_completion_tokens": 512,
         },
         {
@@ -229,6 +235,7 @@ def test_exact_advantage_bounds_are_retained_in_the_forced_step_heartbeat(monkey
             "reward": 0.5,
             "advantage_min": -0.5,
             "advantage_max": 1.5,
+            "grad_norm": 1.0,
             "max_completion_tokens": 512,
         },
     ]
@@ -238,16 +245,182 @@ def test_exact_advantage_bounds_are_retained_in_the_forced_step_heartbeat(monkey
         {"step": 1, "min": -0.25, "max": 0.75, "spread": 1.0},
         {"step": 2, "min": -0.5, "max": 1.5, "spread": 2.0},
     ]
+    assert state.grad_norm_evidence == [
+        {"step": 1, "grad_norm": 1.0},
+        {"step": 2, "grad_norm": 1.0},
+    ]
+
+
+def test_masked_truncation_sequence_uses_grad_norm_as_publication_evidence(
+    worker_context, monkeypatch
+):
+    rewards = [1.0] * 14 + [0.0] * 2
+    response_mask = [1] * 14 + [0] * 2
+    assert sum(rewards) / len(rewards) == 0.875
+    assert 1.0 - sum(response_mask) / len(response_mask) == 0.125
+
+    monkeypatch.setattr(
+        rl_train_runner._worker_heartbeat, "heartbeat", lambda *_args, context=None, **_kwargs: True
+    )
+    monkeypatch.setattr(rl_train_runner, "gpu_diagnostics", lambda **_kwargs: {})
+    state = _StepMetricState()
+    lines = (
+        (
+            "step:1 - critic/rewards/mean:0.875 - critic/advantages/min:0.125 - "
+            "critic/advantages/max:0.125 - actor/grad_norm:0.0076509942300617695 - "
+            "response_length/clip_ratio:0.125"
+        ),
+        (
+            "step:2 - critic/rewards/mean:1.0 - critic/advantages/min:0.0 - "
+            "critic/advantages/max:0.0 - actor/grad_norm:0.0 - response_length/clip_ratio:0.0"
+        ),
+    )
+    for line in lines:
+        _ingest_step_metrics(line, {"max_completion": 512}, state, dict, context=worker_context)
+
+    rl_train_runner._validate_rl_child(0, state, 0, 2, None)
+
+    assert state.reward_history == [0.875, 1.0]
+    assert state.advantage_bounds_evidence == [
+        {"step": 1, "min": 0.125, "max": 0.125, "spread": 0.0},
+        {"step": 2, "min": 0.0, "max": 0.0, "spread": 0.0},
+    ]
+    assert state.grad_norm_evidence == [
+        {"step": 1, "grad_norm": 0.0076509942300617695},
+        {"step": 2, "grad_norm": 0.0},
+    ]
+
+
+def test_replayed_step_replaces_gradient_evidence(worker_context, monkeypatch):
+    monkeypatch.setattr(
+        rl_train_runner._worker_heartbeat, "heartbeat", lambda *_args, context=None, **_kwargs: True
+    )
+    monkeypatch.setattr(rl_train_runner, "gpu_diagnostics", lambda **_kwargs: {})
+    state = _StepMetricState()
+    common = (
+        "step:1 - critic/rewards/mean:0.5 - critic/advantages/min:0.0 - critic/advantages/max:0.0"
+    )
+    _ingest_step_metrics(
+        common + " - actor/grad_norm:0.0",
+        {"max_completion": 32},
+        state,
+        dict,
+        context=worker_context,
+    )
+    _ingest_step_metrics(
+        common + " - actor/grad_norm:0.25",
+        {"max_completion": 32},
+        state,
+        dict,
+        context=worker_context,
+    )
+
+    assert state.grad_norms == {1: 0.25}
+    rl_train_runner._validate_rl_child(0, state, 0, 1, None)
+
+
+def test_replayed_step_without_grad_norm_removes_stale_evidence(worker_context, monkeypatch):
+    monkeypatch.setattr(
+        rl_train_runner._worker_heartbeat, "heartbeat", lambda *_args, context=None, **_kwargs: True
+    )
+    monkeypatch.setattr(rl_train_runner, "gpu_diagnostics", lambda **_kwargs: {})
+    state = _StepMetricState()
+    common = (
+        "step:1 - critic/rewards/mean:0.5 - critic/advantages/min:0.0 - critic/advantages/max:0.0"
+    )
+    _ingest_step_metrics(
+        common + " - actor/grad_norm:0.25",
+        {"max_completion": 32},
+        state,
+        dict,
+        context=worker_context,
+    )
+    _ingest_step_metrics(common, {"max_completion": 32}, state, dict, context=worker_context)
+
+    assert state.grad_norms == {}
+    assert state.advantage_bounds == {1: (0.0, 0.0)}
+
+
+def test_replayed_step_without_bounds_clears_stale_bounds_atomically(worker_context, monkeypatch):
+    monkeypatch.setattr(
+        rl_train_runner._worker_heartbeat, "heartbeat", lambda *_args, context=None, **_kwargs: True
+    )
+    monkeypatch.setattr(rl_train_runner, "gpu_diagnostics", lambda **_kwargs: {})
+    state = _StepMetricState()
+    full = (
+        "step:1 - critic/rewards/mean:0.5 - critic/advantages/min:-0.5 - "
+        "critic/advantages/max:0.5 - actor/grad_norm:0.25"
+    )
+    _ingest_step_metrics(full, {"max_completion": 32}, state, dict, context=worker_context)
+    _ingest_step_metrics(
+        "step:1 - critic/rewards/mean:0.5 - actor/grad_norm:0.5",
+        {"max_completion": 32},
+        state,
+        dict,
+        context=worker_context,
+    )
+
+    assert state.grad_norms == {1: 0.5}
+    assert state.advantage_bounds == {}
+    assert state.adv_spread_history == []
+
+
+def test_pg_loss_only_training_replay_clears_all_stale_terminal_evidence(
+    worker_context, monkeypatch
+):
+    monkeypatch.setattr(
+        rl_train_runner._worker_heartbeat, "heartbeat", lambda *_args, context=None, **_kwargs: True
+    )
+    monkeypatch.setattr(rl_train_runner, "gpu_diagnostics", lambda **_kwargs: {})
+    state = _StepMetricState()
+    full = (
+        "step:1 - critic/rewards/mean:0.5 - critic/advantages/min:-0.5 - "
+        "critic/advantages/max:0.5 - actor/grad_norm:0.25"
+    )
+    _ingest_step_metrics(full, {"max_completion": 32}, state, dict, context=worker_context)
+    _ingest_step_metrics(
+        "step:1 - actor/pg_loss:0.125", {"max_completion": 32}, state, dict, context=worker_context
+    )
+
+    assert state.grad_norms == {}
+    assert state.advantage_bounds == {}
+    assert state.adv_spread_history == []
+    assert state.loss_curve == [0.125]
+
+
+def test_validation_only_replay_does_not_clear_training_evidence(worker_context, monkeypatch):
+    monkeypatch.setattr(
+        rl_train_runner._worker_heartbeat, "heartbeat", lambda *_args, context=None, **_kwargs: True
+    )
+    monkeypatch.setattr(rl_train_runner, "gpu_diagnostics", lambda **_kwargs: {})
+    state = _StepMetricState()
+    full = (
+        "step:1 - critic/rewards/mean:0.5 - critic/advantages/min:-0.5 - "
+        "critic/advantages/max:0.5 - actor/grad_norm:0.25"
+    )
+    _ingest_step_metrics(full, {"max_completion": 32}, state, dict, context=worker_context)
+    _ingest_step_metrics(
+        "step:1 - val-core/reward/mean:0.8",
+        {"max_completion": 32},
+        state,
+        dict,
+        context=worker_context,
+    )
+
+    assert state.grad_norms == {1: 0.25}
+    assert state.advantage_bounds == {1: (-0.5, 0.5)}
+    assert state.adv_spread_history == [1.0]
 
 
 def _verl_rl_tree() -> ast.Module:
-    from flash.engine.worker import rl_train
+    from flash.engine.worker.train.entry import rl_train
 
     source = "\n".join(
         inspect.getsource(fn)
         for fn in (
             rl_train.run_rl_train,
-            rl_train._ingest_step_metrics,
+            rl_train._publish_rl_result,
+            rl_train_runner._ingest_step_metrics,
             rl_train._write_terminal_metadata,
         )
     )
@@ -303,9 +476,8 @@ def test_verl_rl_lifecycle_heartbeats_carry_latest_metrics():
     assert "metrics_last" in ast.unparse(write_keywords["heartbeat_fields"])
 
 
-def test_verl_rl_publishes_backlog_to_the_error_path_global():
-    # worker/__init__.py:_err_metrics reads LATEST_GRPO_METRICS_LAST so a run that dies mid-training
-    # still reports the steps it completed. trl's callback writes it; verl must too.
+def test_verl_rl_publishes_backlog_to_the_attempt_error_path():
+    # Error reporting reads the same attempt-owned backlog that the trainer updates.
     tree = _verl_rl_tree()
 
     assigns = [
@@ -314,33 +486,23 @@ def test_verl_rl_publishes_backlog_to_the_error_path_global():
         if isinstance(node, ast.Assign)
         and any(
             isinstance(target, ast.Subscript)
-            and isinstance(target.value, ast.Name)
-            and target.value.id == "LATEST_GRPO_METRICS_LAST"
+            and ast.unparse(target.value) == "context.heartbeat_state.metrics_last"
             for target in node.targets
         )
     ]
-    assert assigns, "verl rl must publish its backlog to LATEST_GRPO_METRICS_LAST"
+    assert assigns, "verl rl must publish its backlog to its attempt context"
 
 
 def test_train_meta_series_are_collected_only_from_step_lines():
-    # verl's sole console metric sink is LocalLogger, which always prints "step:N - ...", so a line
-    # without a step carries no metric. collecting the train_meta series outside the step branch
-    # would re-scan every rollout/log line for keys that cannot be there.
-    tree = _verl_rl_tree()
-
-    guards = [
-        node
-        for node in ast.walk(tree)
-        if isinstance(node, ast.If)
-        and isinstance(node.test, ast.Compare)
-        and isinstance(node.test.left, ast.Name)
-        and node.test.left.id == "step_metrics"
-    ]
-    assert len(guards) == 1, "expected exactly one step_metrics guard"
-    collected = ast.unparse(guards[0])
-
-    for verl_key in ("critic/rewards/mean", "actor/pg_loss", "response_length/mean"):
-        assert verl_key in collected, f"{verl_key} must be collected inside the step branch"
+    # actor/pg_loss must also detect a training replay whose other metrics are unrenderable, but it
+    # still parses only after verl_step_number proves this is a step-tagged LocalLogger record.
+    source = inspect.getsource(_ingest_step_metrics)
+    assert 'parse_verl_metric(line, "actor/pg_loss") if step_number is not None else None' in source
+    structured = source[source.index("if step_metrics is not None:") :]
+    for verl_key in ("critic/rewards/mean", "response_length/mean"):
+        assert verl_key in structured, (
+            f"{verl_key} must be collected inside the structured step branch"
+        )
 
 
 def test_first_backlog_is_forced_past_the_rl_step_throttle():
@@ -376,8 +538,8 @@ def test_first_backlog_is_forced_past_the_rl_step_throttle():
 def test_verl_rl_renders_the_same_metric_fields_the_cli_shows():
     # the payload schema belongs to the cli, not verl: a key the renderer does not know is dead
     # weight, so keep the mapping's flash-side names inside the rendered set.
-    from flash.cli.commands import _FOLLOW_METRIC_FIELDS
-    from flash.engine.worker.backend_common import _VERL_METRIC_FIELDS
+    from flash.cli.commands.ops.log_follow import _FOLLOW_METRIC_FIELDS
+    from flash.engine.worker.train.entry.backend_common import _VERL_METRIC_FIELDS
 
     rendered = {name for name, *_ in _FOLLOW_METRIC_FIELDS}
     emitted = {flash_key for _, flash_key in _VERL_METRIC_FIELDS}

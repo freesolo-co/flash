@@ -22,7 +22,11 @@ from flash._internal.paths import DATA_DIR_ENV, data_dir
 
 # Modules that read the data dir at import time. Resolution is centralized, but these bind the
 # result to a module constant, so the subprocess probes below re-import rather than reload.
-_STATE_MODULES = ("flash.client.config", "flash.runner", "flash.server.platform.db")
+_STATE_MODULES = (
+    "flash.client.config",
+    "flash.runner.lifecycle.state",
+    "flash.server.platform.db",
+)
 
 
 def _resolve_paths_in(env_overrides: dict[str, str]) -> dict[str, str]:
@@ -34,7 +38,8 @@ def _resolve_paths_in(env_overrides: dict[str, str]) -> dict[str, str]:
     """
     code = (
         "import json\n"
-        "import flash.client.config as c, flash.runner as r, flash.server.platform.db as d\n"
+        "import flash.client.config as c, flash.runner.lifecycle.state as r, "
+        "flash.server.platform.db as d\n"
         "from flash._internal.paths import data_dir\n"
         "print(json.dumps({\n"
         "  'config': str(c.CONFIG_PATH),\n"
@@ -114,7 +119,7 @@ class TestLogLevel:
         flash_logging.configure_logging()
         assert logging.getLogger("flash").level == logging.DEBUG
 
-    def test_case_insensitive(self, monkeypatch):
+    def test_log_level_environment_value_is_case_insensitive(self, monkeypatch):
         monkeypatch.setenv("FLASH_LOG_LEVEL", "debug")
         flash_logging.configure_logging()
         assert logging.getLogger("flash").level == logging.DEBUG
@@ -213,7 +218,7 @@ class TestLogFormat:
 class TestServerBind:
     @staticmethod
     def _main():
-        return importlib.import_module("flash.server.__main__")
+        return importlib.import_module("flash.server.asgi.cli")
 
     def _parsed(self, monkeypatch, argv, env):
         main = self._main()
@@ -312,7 +317,7 @@ class TestServerPreflightFailure:
 
     @staticmethod
     def _main():
-        return importlib.import_module("flash.server.__main__")
+        return importlib.import_module("flash.server.asgi.cli")
 
     def _run(self, monkeypatch, capsys, exc):
         main = self._main()
@@ -326,7 +331,7 @@ class TestServerPreflightFailure:
         return code, capsys.readouterr()
 
     def test_missing_operator_config_exits_3_with_the_message_on_stderr(self, monkeypatch, capsys):
-        from flash.providers.preflight import PreflightError
+        from flash.providers.core.preflight import PreflightError
 
         message = (
             "the Flash control plane is missing required operator configuration:\n"
@@ -342,7 +347,7 @@ class TestServerPreflightFailure:
         assert captured.err.startswith("error: ")
 
     def test_the_failure_is_not_reported_as_a_traceback(self, monkeypatch, capsys):
-        from flash.providers.preflight import PreflightError
+        from flash.providers.core.preflight import PreflightError
 
         _, captured = self._run(
             monkeypatch, capsys, PreflightError("missing FREESOLO_INTERNAL_KEY")
@@ -374,7 +379,7 @@ class TestSqliteBusyTimeout:
         monkeypatch.setenv(db.BUSY_TIMEOUT_ENV, "120")
         assert db.busy_timeout_s() == 120.0
 
-    @pytest.mark.parametrize("value", ["abc", "0", "-5"])
+    @pytest.mark.parametrize("value", ["abc", "0", "-5", "nan", "inf", "-inf", "1e999"])
     def test_unusable_value_keeps_the_default(self, monkeypatch, value):
         """A zero or negative timeout would turn ordinary contention into failed API calls."""
         from flash.server.platform import db

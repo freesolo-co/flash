@@ -1,13 +1,4 @@
-"""Which modules each capsule profile carries.
-
-Profiles are deliberately separate and minimal rather than one capsule with everything. The
-Lambda host runs its payload through a hard-capped cloud-init budget, so it must not carry
-members only the RunPod handler needs; and a smaller profile is a smaller thing to audit.
-
-Each profile names its members by repository path. The build resolves them against the repo root,
-so a rename that misses this table fails the build rather than shipping a capsule with a module
-missing.
-"""
+"""Which modules each capsule profile carries."""
 
 from __future__ import annotations
 
@@ -31,28 +22,21 @@ class Profile:
 # bare top-level modules when it runs outside a package (its `if __package__:` branch), which is
 # exactly how it is imported from inside the capsule.
 _INSTANCE_BOOTSTRAP_SOURCES = (
-    (f"{_LIFECYCLE}/bootstrap.py", "bootstrap.py"),
-    (f"{_LIFECYCLE}/bootstrap_secrets.py", "bootstrap_secrets.py"),
-    (f"{_LIFECYCLE}/bootstrap_console.py", "bootstrap_console.py"),
-    (f"{_LIFECYCLE}/bootstrap_pip.py", "bootstrap_pip.py"),
-    ("flash/source_snapshot.py", "source_snapshot.py"),
-)
-
-# the host-side helpers the launch script invokes as standalone programs, alongside the bootstrap.
-_HOST_HELPER_SOURCES = (
-    (f"{_LIFECYCLE}/host/deadline_sleep.py", "deadline_sleep.py"),
-    (f"{_LIFECYCLE}/host/hostlog.py", "hostlog.py"),
-    (f"{_LIFECYCLE}/host/failmark.py", "failmark.py"),
+    (f"{_LIFECYCLE}/bootstrapping/bootstrap.py", "bootstrap.py"),
+    (f"{_LIFECYCLE}/bootstrapping/attempt.py", "bootstrap_attempt.py"),
+    (f"{_LIFECYCLE}/bootstrapping/secrets.py", "bootstrap_secrets.py"),
+    (f"{_LIFECYCLE}/bootstrapping/console.py", "bootstrap_console.py"),
+    (f"{_LIFECYCLE}/bootstrapping/pip.py", "bootstrap_pip.py"),
+    (f"{_LIFECYCLE}/bootstrapping/processes.py", "bootstrap_processes.py"),
+    ("flash/snapshot/archive.py", "archive.py"),
 )
 
 PROFILES: dict[str, Profile] = {
-    # rented-box providers (Lambda, Vast): the shared bootstrap plus the host helpers the launch
-    # script runs directly. one profile, because both providers execute the same programs.
     "instance-bootstrap": Profile(
         name="instance-bootstrap",
-        version=2,
+        version=7,
         entrypoint="bootstrap.py",
-        sources=_INSTANCE_BOOTSTRAP_SOURCES + _HOST_HELPER_SOURCES,
+        sources=_INSTANCE_BOOTSTRAP_SOURCES,
     ),
 }
 

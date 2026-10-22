@@ -1,0 +1,40 @@
+"""tracking belongs to the trainer that creates and closes the run."""
+
+import contextlib
+import json
+
+from verl.utils.tracking import Tracking
+
+
+class OwnedTracking(Tracking):
+    def __init__(self, *args, **kwargs):
+        self.run = None
+        super().__init__(*args, **kwargs)
+        with contextlib.suppress(Exception):
+            self.run = getattr(self.logger.get("wandb"), "run", None)
+            if self.run is not None:
+                print(
+                    "FLASH_WANDB_LINK "
+                    + json.dumps({"wandb_url": self.run.url, "wandb_id": self.run.id}),
+                    flush=True,
+                )
+
+    def finish(self, exit_code=0):
+        # the upstream destructor must not finish a later process-global wandb run.
+        getattr(self, "logger", {}).pop("wandb", None)
+        if self.run is not None:
+            with contextlib.suppress(Exception):
+                self.run.finish(exit_code=exit_code)
+            self.run = None
+        super().finish(exit_code=exit_code)
+
+
+def publish_tracking_link(tracking):
+    # Reporting is optional even when an SDK property performs failing I/O internally.
+    with contextlib.suppress(Exception):
+        run = getattr(tracking.logger.get("wandb"), "run", None)
+        if run is not None:
+            print(
+                "FLASH_WANDB_LINK " + json.dumps({"wandb_url": run.url, "wandb_id": run.id}),
+                flush=True,
+            )

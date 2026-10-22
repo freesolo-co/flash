@@ -6,10 +6,11 @@ import time
 
 import pytest
 
-from flash.engine.worker import backend_common, rl_train
+import flash.engine.worker.train.entry.rl_train_runner as rl_train_runner
 from flash.engine.worker.io import heartbeat
 from flash.engine.worker.io.heartbeat import RewardObservabilityBuffer
 from flash.engine.worker.teacher.client import TeacherClient
+from flash.engine.worker.train.entry import backend_common
 from flash.engine.worker.verl import diagnostics
 from flash.engine.worker.verl.parent_work import ParentWorkGauge
 
@@ -156,7 +157,9 @@ def test_parent_work_gauge_releases_depth_in_finally():
     assert gauge.snapshot().completed == 1
 
 
-def test_off_thread_field_sampling_continues_while_heartbeat_upload_blocks(monkeypatch):
+def test_off_thread_field_sampling_continues_while_heartbeat_upload_blocks(
+    worker_context, monkeypatch
+):
     monkeypatch.setattr(heartbeat, "_LIVENESS_TICK_S", 0.01)
     monkeypatch.setattr(heartbeat, "_HB_UPLOAD_LOCK_TIMEOUT_S", 0.2)
     diagnostics_entered = threading.Event()
@@ -164,7 +167,7 @@ def test_off_thread_field_sampling_continues_while_heartbeat_upload_blocks(monke
     calls = []
     caller_threads = set()
 
-    def blocked_diagnostics(*, include_torch):
+    def blocked_diagnostics():
         diagnostics_entered.set()
         diagnostics_release.wait(timeout=1)
         return {}
@@ -174,12 +177,10 @@ def test_off_thread_field_sampling_continues_while_heartbeat_upload_blocks(monke
         caller_threads.add(threading.get_ident())
         return {"count": len(calls)}
 
-    monkeypatch.setattr(heartbeat, "gpu_diagnostics", blocked_diagnostics)
-    monkeypatch.setattr(heartbeat._w, "heartbeat", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(heartbeat.worker_perf, "gpu_diagnostics", blocked_diagnostics)
+    monkeypatch.setattr(heartbeat, "heartbeat", lambda *_args, context=None, **_kwargs: None)
     with heartbeat.liveness_heartbeat(
-        "rl_step",
-        fields=fields,
-        sample_off_thread=True,
+        "rl_step", fields=fields, sample_off_thread=True, context=worker_context
     ):
         assert diagnostics_entered.wait(1)
         time.sleep(0.08)
@@ -217,7 +218,7 @@ def test_authoritative_tail_classification_precedes_generic_silence():
     assert backend_source.index("raise_for_classified_verl_exit") < backend_source.index(
         "silence_watchdog.raise_if_failed"
     )
-    grpo_source = inspect.getsource(rl_train._GrpoSubprocessStream.wait_and_classify)
+    grpo_source = inspect.getsource(rl_train_runner._GrpoSubprocessStream.wait_and_classify)
     assert grpo_source.index("raise_for_classified_verl_exit") < grpo_source.index(
         "self._silence_watchdog.raise_if_failed"
     )

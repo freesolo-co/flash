@@ -12,10 +12,13 @@ present" check passes while the guard is commented out.
 
 from __future__ import annotations
 
+import json
 import os
 import re
+import shlex
 import subprocess
 import tempfile
+import tomllib
 from pathlib import Path
 from typing import Any
 
@@ -557,6 +560,19 @@ def test_dev_cache_pushes_only_detect_and_off_peak_runs_build():
     assert "github.event_name == 'workflow_dispatch'" in bake["if"]
     assert bake["uses"] == "./.github/workflows/bake-kernel-cache.yml"
     assert "cu128-dev-" in bake["with"]["target_tag_prefix"]
+    assert triggers["workflow_dispatch"]["inputs"]["deadline_minutes"]["default"] == 90
+    assert "fromJSON(format(" in bake["with"]["deadline_minutes"]
+    assert "inputs.deadline_minutes" in bake["with"]["deadline_minutes"]
+    assert "||" not in bake["with"]["deadline_minutes"]  # zero must fail validation, not become 90
+    bake_workflow = _load(WORKFLOW_DIR / "bake-kernel-cache.yml")
+    assert "deadline_minutes" in _triggers(bake_workflow)["workflow_call"]["inputs"]
+    warm = next(
+        step
+        for step in _steps(_jobs(bake_workflow)["bake"])
+        if str(step.get("name", "")).startswith("Warm kernels")
+    )
+    assert warm["env"]["BAKE_DEADLINE_MINUTES"] == "${{ inputs.deadline_minutes }}"
+    assert '--deadline-min "$BAKE_DEADLINE_MINUTES"' in warm["run"]
 
     publish = jobs["publish-ready"]
     script = next(step for step in _steps(publish) if step.get("name") == "Publish ready aliases")[
@@ -631,3 +647,412 @@ def test_bake_workflow_can_publish_versioned_candidate_tags():
         if "docker/build-push-action@" in step.get("uses", "")
     )
     assert "inputs.target_tag_prefix" in image["with"]["tags"]
+
+
+def _deploy_steps() -> list[dict[str, Any]]:
+    return _steps(_jobs(_load(WORKFLOW_DIR / "deploy-modal.yml"))["deploy"])
+
+
+def _step_index(name_fragment: str) -> int:
+    steps = _deploy_steps()
+    for index, step in enumerate(steps):
+        if name_fragment in (step.get("name") or ""):
+            return index
+    raise AssertionError(f"no deploy step named like {name_fragment!r}")
+
+
+def test_promotion_is_gated_on_a_real_stream_after_readiness():
+    """A healthy `/healthz` proves a ROUTER booted, not that the release can serve.
+
+    The readiness poll only reads back the identity the deploy step just injected, so a release
+    whose GPU engines never start, whose streaming path is broken, or whose accounting never
+    settles passes it unchanged. The canary has to run AFTER readiness (it needs the new router
+    live) and BEFORE the job can finish, or a broken release is promoted with a green check.
+    """
+    canary = _deploy_steps()[_step_index("real streaming canary")]
+    assert "flash.serving.promotion.gate" in canary["run"]
+    assert _step_index("real streaming canary") > _step_index("serving readiness")
+
+
+def test_the_job_cap_leaves_room_for_a_rollback_after_every_wait_is_exhausted():
+    """The job cap has to be derived from the waits, not chosen and left to rot.
+
+    `timeout-minutes` kills the job wherever it is, and the worst case ends INSIDE the rollback:
+    both readiness polls burn their full deadlines, the gate burns its canary and accounting
+    budgets, and only then does the restore start its own deploy and 300s verification. A cap that
+    fits the forward path but not the restore converts a recoverable failed promotion into a broken
+    release left live, which is the one outcome this whole step exists to prevent.
+
+    Summing the declared budgets rather than restating a number keeps the cap honest: lengthening
+    any poll, or the gate's own deadlines, moves this bound automatically.
+    """
+    job = _load(WORKFLOW_DIR / "deploy-modal.yml")["jobs"]["deploy"]
+    polls = sum(
+        int(seconds)
+        for step in _steps(job)
+        for seconds in re.findall(r"SECONDS \+ (\d+)", step.get("run") or "")
+    )
+    assert polls > 0, "no bounded polls found -- this test is measuring nothing"
+
+    from flash.serving.promotion import gate as gate_module
+
+    gate_budget = (
+        gate_module.CANARY_TIMEOUT_SECONDS + gate_module._DEFAULT_ACCOUNTING_DEADLINE_SECONDS
+    )
+    # two `modal deploy` invocations (forward and restore), image build included, plus checkout and
+    # dependency installation. deliberately generous: the assertion should fail while there is still
+    # headroom to fix, not at the moment a real run gets killed.
+    deploy_allowance = 15 * 60
+
+    required_minutes = (polls + gate_budget + deploy_allowance) / 60
+    assert job["timeout-minutes"] >= required_minutes, (
+        f"the deploy job caps at {job['timeout-minutes']}m, but its own declared waits "
+        f"({polls}s of polls + {gate_budget:.0f}s of gate budget) plus a "
+        f"{deploy_allowance // 60}m deploy allowance need {required_minutes:.1f}m. A cap below that "
+        "can kill the job mid-rollback and leave a broken release serving."
+    )
+
+
+def test_the_promotion_canary_receives_its_credentials_only_through_the_environment():
+    """A credential passed as an argument is readable in the process table and the step echo.
+
+    `run:` lines are echoed into the public build log, so a key interpolated into argv leaks on
+    every run, including successful ones. The gate reads them from `env:` instead.
+    """
+    canary = _deploy_steps()[_step_index("real streaming canary")]
+    env = canary.get("env") or {}
+    assert "FREESOLO_INTERNAL_KEY" in env
+    assert "SUPABASE_SERVICE_ROLE_KEY" in env
+    for secret in ("FREESOLO_INTERNAL_KEY", "SUPABASE_SERVICE_ROLE_KEY", "secrets."):
+        assert secret not in canary["run"]
+
+
+def test_the_previous_release_is_captured_before_the_deploy_overwrites_it():
+    """`modal deploy` replaces the app in place, so the predecessor is unrecoverable afterwards.
+
+    The gate step reads the live app's sha for its own diff bound; publishing it as an output is
+    what makes rollback possible at all. Reading it only on the non-dispatch path would leave a
+    manually dispatched deploy one-way.
+    """
+    gate = _deploy_steps()[_step_index("Decide whether to deploy")]
+    assert 'previous_sha=$last_deployed_sha" >> "$GITHUB_OUTPUT' in gate["run"]
+    assert _step_index("Decide whether to deploy") < _step_index("Deploy serving")
+
+
+PREVIOUS = "1111111111111111111111111111111111111111"
+CURRENT = "2222222222222222222222222222222222222222"
+
+
+def _run_rollback(
+    *,
+    previous_sha: str,
+    is_ancestor: bool,
+    health: str,
+    entrypoint: str | None = "flash/serving/app/modal_app.py",
+) -> tuple[int, str, str]:
+    """Execute the rollback script with `modal`, `curl`, `git`, and `sleep` stubbed on PATH.
+
+    RUN it rather than grep it, for the same reason the dispatch and fork guards above are run:
+    a substring is present in a step that never reaches the branch containing it. Every assertion
+    below reads an OBSERVABLE effect -- did `modal deploy` get invoked, with which identity, and
+    did the step exit nonzero -- so a rewritten step that echoed the right strings without
+    redeploying would be red here and green under a grep.
+
+    `modal`'s recorded invocation is returned separately from the step's stdout/stderr; blending
+    them would reintroduce the same weakness one layer out, since the script also echoes the sha
+    it intends to restore.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        bin_dir = root / "bin"
+        bin_dir.mkdir()
+        # the working tree starts at the new layout; checkout installs the predecessor's layout.
+        app = root / "flash/serving/app/modal_app.py"
+        app.parent.mkdir(parents=True, exist_ok=True)
+        app.touch()
+        calls = root / "modal-calls.txt"
+        (bin_dir / "modal").write_text(
+            '#!/bin/sh\n[ -f "$2" ] || exit 2\nprintf "%s sha=%s id=%s\\n" "$*" "$FREESOLO_DEPLOYMENT_SHA" '
+            '"$FREESOLO_DEPLOYMENT_ID" >> "$MODAL_CALLS"\nexit 0\n'
+        )
+        # the health body is served from a file; `--output` is where the script wants it.
+        (bin_dir / "curl").write_text(
+            '#!/bin/sh\nfor arg in "$@"; do\n'
+            '  if [ "$prev" = "--output" ]; then out="$arg"; fi\n  prev="$arg"\ndone\n'
+            'printf "%s" "$HEALTH_BODY" > "$out"\nexit 0\n'
+        )
+        # ancestry comes from the fixture, while checkout changes the files visible to rollback.
+        (bin_dir / "git").write_text(
+            '#!/bin/sh\nif [ "$1" = "merge-base" ]; then exit "$ANCESTOR_EXIT"; fi\n'
+            'if [ "$1" = "checkout" ]; then\n'
+            "  rm -f flash/serving/app/modal_app.py flash/serving/modal_app.py\n"
+            '  if [ -n "$RESTORED_ENTRYPOINT" ]; then\n'
+            '    mkdir -p "$(dirname "$RESTORED_ENTRYPOINT")"\n'
+            '    touch "$RESTORED_ENTRYPOINT"\n'
+            "  fi\nfi\nexit 0\n"
+        )
+        for stub in bin_dir.iterdir():
+            stub.chmod(0o755)
+
+        # `sleep` is shadowed by a shell FUNCTION, not a PATH stub. The verification loop is bounded
+        # by `$SECONDS`, which is wall-clock, so a stub that merely returns fast spins for the full
+        # real 300s -- the deadline advances whether anything sleeps or not. A function runs in the
+        # script's own shell, where `SECONDS` is assignable, so the loop's structure is preserved
+        # (same number of naps, same deadline arithmetic) while virtual time moves in place of real
+        # time.
+        script = (
+            "sleep() { SECONDS=$((SECONDS + 60)); }\n"
+            + (_deploy_steps()[_step_index("Restore the previous release")]["run"])
+        )
+        completed = subprocess.run(
+            ["bash", "-c", script],
+            capture_output=True,
+            text=True,
+            cwd=tmp,
+            env={
+                "PATH": f"{bin_dir}:{os.environ.get('PATH', '')}",
+                "MODAL_CALLS": str(calls),
+                "RESTORED_ENTRYPOINT": entrypoint or "",
+                "ANCESTOR_EXIT": "0" if is_ancestor else "1",
+                "HEALTH_BODY": health,
+                "PREVIOUS_SHA": previous_sha,
+                "CURRENT_SHA": CURRENT,
+                "ROLLBACK_DEPLOYMENT_ID": "9-1-rollback",
+            },
+        )
+        recorded = calls.read_text() if calls.exists() else ""
+        return completed.returncode, recorded, completed.stdout + completed.stderr
+
+
+def _health(sha: str, deployment_id: str, ok: bool = True) -> str:
+    return json.dumps({"ok": ok, "deployment_sha": sha, "deployment_id": deployment_id})
+
+
+def test_the_rollback_step_fires_on_failure_with_a_distinct_attempt_id():
+    """Wiring the script cannot prove: `if:` and `env:` are read by Actions, not by the shell.
+
+    The attempt id must differ from the forward deploy's, or the readiness identity already
+    published by the failed release would satisfy the restore check without anything being
+    restored.
+    """
+    rollback = _deploy_steps()[_step_index("Restore the previous release")]
+    assert rollback["if"].startswith("failure()")
+    env = rollback.get("env") or {}
+    assert env.get("PREVIOUS_SHA") == "${{ steps.gate.outputs.previous_sha }}"
+    assert env.get("ROLLBACK_DEPLOYMENT_ID", "").endswith("-rollback")
+    assert env["ROLLBACK_DEPLOYMENT_ID"] != "${{ github.run_id }}-${{ github.run_attempt }}"
+
+
+def test_a_failed_promotion_restores_the_previous_release_and_still_fails_the_job():
+    """The redeploy must carry the PREVIOUS sha, and a restore must never turn the run green.
+
+    A green run would mark an unpromotable commit as deployed: the next push diffs against a sha
+    that never passed its gate and skips the deploy entirely, so the failure compounds silently.
+    """
+    code, deployed, logged = _run_rollback(
+        previous_sha=PREVIOUS,
+        is_ancestor=True,
+        health=_health(PREVIOUS, "9-1-rollback"),
+    )
+
+    assert f"sha={PREVIOUS}" in deployed, f"the redeploy did not carry the restored sha: {deployed}"
+    assert "id=9-1-rollback" in deployed
+    assert "flash/serving/app/modal_app.py" in deployed
+    assert code != 0, "a completed rollback exited 0 -- this commit would be recorded as deployed"
+    assert "is NOT deployed" in logged
+
+
+@pytest.mark.parametrize(
+    ("health", "why"),
+    [
+        (_health(CURRENT, "9-1"), "the broken release is still live"),
+        (_health(CURRENT, "9-1-rollback"), "stale sha under the rollback's own attempt id"),
+        (_health(PREVIOUS, "9-1"), "restored sha under the FORWARD deploy's attempt id"),
+        (_health(PREVIOUS, "9-1-rollback", ok=False), "right identity, but not serving"),
+    ],
+)
+def test_a_rollback_that_never_reports_the_restored_release_is_not_a_rollback(health, why):
+    """`modal deploy` exiting zero says the app was REPLACED, not that it came up serving.
+
+    This is the case a substring test cannot see: the identity comparison is present in the script
+    either way, so what matters is that a live app failing it is rejected rather than read as a
+    completed restore.
+
+    Each field is failed ALONE. A single fixture with everything wrong lets any one surviving check
+    mask the others -- disabling the sha comparison outright left such a test green, because the
+    attempt id was stale in the same body and failed first. Three of these four cases exist only to
+    make each comparison independently load-bearing.
+    """
+    code, deployed, logged = _run_rollback(previous_sha=PREVIOUS, is_ancestor=True, health=health)
+
+    assert f"sha={PREVIOUS}" in deployed, "the restore was never attempted"
+    assert code != 0, f"a rollback was accepted with {why}"
+    assert "never reported the restored release" in logged
+    assert "intervene manually" in logged
+
+
+@pytest.mark.parametrize(
+    ("previous_sha", "is_ancestor", "expected"),
+    [
+        ("", True, "NO previous release was recorded"),
+        (PREVIOUS, False, "is not an ancestor"),
+    ],
+)
+def test_rollback_refuses_a_previous_release_it_cannot_verify(previous_sha, is_ancestor, expected):
+    """An empty or non-ancestor sha must stop WITHOUT deploying, not redeploy an unknown tree.
+
+    Asserting the guard's text alone would pass on a script that printed the refusal and redeployed
+    anyway. The load-bearing assertion is that `modal` was never invoked.
+    """
+    code, deployed, logged = _run_rollback(
+        previous_sha=previous_sha, is_ancestor=is_ancestor, health=_health(PREVIOUS, "9-1-rollback")
+    )
+
+    assert deployed == "", f"an unverifiable predecessor was redeployed anyway: {deployed}"
+    assert code != 0
+    assert expected in logged
+    assert "Restore production manually" in logged
+
+
+def _rollback_fires(*, deploy_outcome: str, job_failed: bool = True) -> bool:
+    """Evaluate the rollback step's `if:` the way Actions would, for one step-outcome scenario.
+
+    Asserting the condition's text (`startswith("failure()")`) passes whether or not the guard that
+    keeps a pre-deploy failure from restoring is present at all. The expression is the thing under
+    test, so it has to be evaluated, not matched.
+    """
+    expression = _deploy_steps()[_step_index("Restore the previous release")]["if"]
+    python = (
+        expression.replace("&&", "and")
+        .replace("||", "or")
+        .replace("failure()", repr(job_failed))
+        .replace("steps.gate.outputs.deploy", repr("true"))
+        .replace("steps.deploy_serving.outcome", repr(deploy_outcome))
+    )
+    assert "steps." not in python, f"unresolved step reference in {expression!r}"
+    # the expression comes from our own workflow file, with every step reference substituted out.
+    return bool(eval(python))
+
+
+def test_a_failure_before_the_deploy_never_restores_over_an_untouched_production():
+    """The steps that verify secrets and auth run BEFORE any deploy, under the same gate output.
+
+    If those satisfy the rollback condition, a run that never replaced production would `modal
+    deploy` the previous sha over a live healthy app -- using the very secret set whose verification
+    just failed. Restoring is only meaningful when this run actually deployed something.
+    """
+    steps = _deploy_steps()
+    deploy_index = _step_index("Deploy serving")
+    assert steps[deploy_index].get("id") == "deploy_serving", (
+        "the rollback guard keys off the deploy step's id; without it the guard silently "
+        "evaluates an empty outcome"
+    )
+    for step in steps[:deploy_index]:
+        assert step.get("name") != "Restore the previous release"
+
+    # skipped and empty are the two outcomes a step that never ran reports.
+    assert not _rollback_fires(deploy_outcome="skipped")
+    assert not _rollback_fires(deploy_outcome="")
+
+    # a deploy that ran -- whether it succeeded and failed readiness later, or failed partway --
+    # leaves the new release live, so both must still restore.
+    assert _rollback_fires(deploy_outcome="success")
+    assert _rollback_fires(deploy_outcome="failure")
+
+    # and a green run never restores, whatever the deploy did.
+    assert not _rollback_fires(deploy_outcome="success", job_failed=False)
+
+
+def test_rollback_can_restore_a_release_before_the_serving_source_move():
+    code, deployed, logged = _run_rollback(
+        previous_sha=PREVIOUS,
+        is_ancestor=True,
+        health=_health(PREVIOUS, "9-1-rollback"),
+        entrypoint="flash/serving/modal_app.py",
+    )
+    assert "deploy flash/serving/modal_app.py" in deployed
+    assert f"sha={PREVIOUS}" in deployed
+    assert code != 0
+    assert "is NOT deployed" in logged
+
+
+def test_rollback_refuses_a_release_without_a_serving_entrypoint():
+    code, deployed, logged = _run_rollback(
+        previous_sha=PREVIOUS,
+        is_ancestor=True,
+        health=_health(PREVIOUS, "9-1-rollback"),
+        entrypoint=None,
+    )
+    assert code != 0
+    assert deployed == ""
+    assert "no supported serving entrypoint" in logged
+
+
+@pytest.mark.parametrize("org_id", ["", "   ", "invalid", "11111111-2222-4333-8444-555555555555"])
+def test_canary_attribution_is_validated_before_production_deployment(org_id):
+    step = _deploy_steps()[_step_index("Verify required serving runtime secrets")]
+    env = dict.fromkeys(
+        (
+            "HF_TOKEN",
+            "SUPABASE_URL",
+            "SUPABASE_SERVICE_ROLE_KEY",
+            "FREESOLO_INTERNAL_KEY",
+            "PLATFORM_BACKEND_URL",
+        ),
+        "configured",
+    )
+    result = subprocess.run(
+        ["bash", "-e", "-c", step["run"]],
+        capture_output=True,
+        text=True,
+        env={**env, "PATH": os.environ["PATH"], "SERVING_CANARY_ORG_ID": org_id},
+    )
+    assert (result.returncode == 0) == org_id.startswith("11111111-")
+    assert _step_index("Verify required serving runtime secrets") < _step_index("Deploy serving")
+
+
+@pytest.mark.parametrize("workflow", ["deploy-modal.yml", "deploy-modal-dev.yml"])
+def test_modal_deploy_client_matches_the_runtime_dependency_pin(workflow):
+    project = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text())
+    expected = next(
+        requirement
+        for requirement in project["project"]["optional-dependencies"]["serving"]
+        if requirement.startswith("modal==")
+    )
+    installs = [
+        step
+        for job in _jobs(_load(WORKFLOW_DIR / workflow)).values()
+        for step in _steps(job)
+        if step.get("name") == "Install Modal client"
+    ]
+    assert len(installs) == 1
+    requirements = [
+        argument
+        for line in installs[0]["run"].splitlines()
+        for argument in shlex.split(line, comments=True)
+        if argument.startswith("modal==")
+    ]
+    assert requirements == [expected]
+
+
+@pytest.mark.parametrize("branch", ["dev", "main", "codex/modal-migration", ".feature"])
+def test_serving_publish_tags_support_feature_branches(branch, tmp_path):
+    workflow = _load(WORKFLOW_DIR / "publish-serving-image.yml")
+    job = _jobs(workflow)["publish-serving-image"]
+    script = next(step["run"] for step in _steps(job) if step.get("name") == "Compute tags")
+    output = tmp_path / "outputs"
+    env = {
+        **os.environ,
+        "GITHUB_REF_NAME": branch,
+        "IMAGE": "ghcr.io/example/serve",
+        "GITHUB_OUTPUT": str(output),
+    }
+    subprocess.run(["bash", "-eu", "-c", script], cwd=REPO_ROOT, env=env, check=True)
+    refs = [line for line in output.read_text().splitlines() if line.startswith(env["IMAGE"])]
+    assert refs
+    assert all(
+        re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}", ref.rsplit(":", 1)[1]) for ref in refs
+    )
+    assert (env["IMAGE"] + ":latest" in refs) is (branch == "main")
+    if branch == "dev":
+        assert env["IMAGE"] + ":dev" in refs

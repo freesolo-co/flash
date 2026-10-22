@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""fail if the pinned verl commit does not exist on the fork.
+"""fail if the pinned verl commit does not exist upstream.
 
 every offline pin test compares the pin against a hardcoded copy of the same sha, so all of them
 pass when the sha is mis-transcribed into a commit that was never pushed. that shipped: dev carried
 `32d6200de81dcc9e97e3aa2ae4a2b3ba30d33e93`, a 40-hex string sharing the real commit's first 13
 characters, and every worker install would have died on `upload-pack: not our ref`. the offline
-suite cannot see this -- only the fork can answer it -- so this runs as its own CI step.
+suite cannot see this -- only the source repository can answer it -- so this runs as its own CI step.
 
 `git ls-remote <url> <sha>` is the wrong probe: it matches ref NAMES, not object ids, and answers
 empty for a perfectly good commit. fetching the object is what actually proves reachability.
@@ -22,7 +22,7 @@ import tempfile
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, REPO_ROOT)
 
-from flash.engine.worker.backend_common import VERL_REQUIREMENT  # noqa: E402
+from flash.engine.worker.train.entry.backend_common import VERL_REQUIREMENT  # noqa: E402
 
 DOCKERFILE = os.path.join(REPO_ROOT, "Dockerfile.worker")
 

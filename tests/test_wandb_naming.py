@@ -8,15 +8,18 @@ the job-spec JSON the worker reads), NOT environment variables; the WANDB_API_KE
 
 from __future__ import annotations
 
+from dataclasses import replace
+
 import pytest
 
+import flash.engine.worker.io.wandb_log as worker_wandb
 from flash.core.spec import JobSpec, WandbSpec
 from flash.schema import ConfigError, spec_and_train_keys_from_file, spec_from_dict
 
 
 def _base(**extra: object) -> dict:
     cfg = {
-        "model": "Qwen/Qwen3.5-0.8B",
+        "model": "Qwen/Qwen3.5-9B",
         "algorithm": "sft",
         "environment": {"id": "github:owner/repo@main:some-env/environment.py"},
         "train": {"max_examples": 8},
@@ -91,7 +94,7 @@ def test_wandb_section_must_be_a_table():
 def _toml(tmp_path) -> str:
     cfg = tmp_path / "run.toml"
     cfg.write_text(
-        'model = "Qwen/Qwen3.5-0.8B"\n'
+        'model = "Qwen/Qwen3.5-9B"\n'
         'algorithm = "sft"\n'
         "[environment]\n"
         'id = "github:owner/repo@main:some-env/environment.py"\n'
@@ -118,38 +121,40 @@ def test_set_override_preserves_numeric_looking_wandb_label(tmp_path, label):
     assert spec.wandb.run_name == label
 
 
-def test_worker_run_name_uses_spec_wandb(monkeypatch):
+def test_worker_run_name_uses_spec_wandb(worker_context, monkeypatch):
     # Primary path: the worker reads the run name from the typed spec (no env var).
-    from flash.engine import worker
 
     monkeypatch.delenv("WANDB_NAME", raising=False)
-    monkeypatch.setattr(worker, "JOB_SPEC", JobSpec(wandb=WandbSpec(run_name="from-spec")))
-    assert worker.wandb_run_name() == "from-spec"
+    monkeypatch.setattr(
+        worker_context,
+        "config",
+        replace(worker_context.config, spec=JobSpec(wandb=WandbSpec(run_name="from-spec"))),
+    )
+    assert worker_wandb.wandb_run_name(context=worker_context) == "from-spec"
 
 
-def test_worker_run_name_is_toml_only_ignores_env(monkeypatch):
+def test_worker_run_name_is_toml_only_ignores_env(worker_context, monkeypatch):
     # WANDB_NAME is fully gone: even if the env var is set, the run name comes only from the
     # [wandb] config (here unset -> the stable default). No env-var override path.
-    from flash.engine import worker
 
-    monkeypatch.setattr(worker, "JOB_SPEC", None)
+    monkeypatch.setattr(worker_context, "config", replace(worker_context.config, spec=None))
     monkeypatch.setenv("WANDB_NAME", "should-be-ignored")
-    assert worker.wandb_run_name().startswith("flash-")
+    assert worker_wandb.wandb_run_name(context=worker_context).startswith("flash-")
 
 
 def test_runtime_secret_reads_wandb_and_declared_environment_secrets(tmp_path, monkeypatch):
     from flash.client.runtime_secrets import runtime_secrets_from_local_env
 
     cfg = tmp_path / "run.toml"
-    cfg.write_text('model = "Qwen/Qwen3.5-0.8B"\n')
+    cfg.write_text('model = "Qwen/Qwen3.5-9B"\n')
     (tmp_path / ".env").write_text(
         "WANDB_API_KEY=wb-from-user-file\n"
         "SERPAPI_API_KEY=serp-from-user-file\n"
-        "RUNPOD_API_KEY=must-not-be-client-supplied\n"
+        "MODAL_TOKEN_SECRET=must-not-be-client-supplied\n"
     )
-    monkeypatch.delenv("WANDB_API_KEY", raising=False)
+    monkeypatch.setenv("WANDB_API_KEY", "wb-from-user-file")
     monkeypatch.delenv("SERPAPI_API_KEY", raising=False)
-    monkeypatch.delenv("RUNPOD_API_KEY", raising=False)
+    monkeypatch.delenv("MODAL_TOKEN_SECRET", raising=False)
 
     assert runtime_secrets_from_local_env(cfg) == {"WANDB_API_KEY": "wb-from-user-file"}
     assert runtime_secrets_from_local_env(cfg, keys=("SERPAPI_API_KEY",)) == {

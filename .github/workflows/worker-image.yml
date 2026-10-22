@@ -1,15 +1,16 @@
 name: flash worker image
 
 # builds the prebuilt flash worker image (full training stack + flash-attn baked in) and
-# pushes it to ghcr, so runpod/vast/lambda training cold-start skips the per-host dependency
+# pushes it to ghcr, so Modal training cold-start skips the per-host dependency
 # install (the dominant cold-start cost). training providers select the pinned image through
-# flash/providers/_lifecycle/worker.py; there is no override, so a new build means bumping the
+# flash/providers/_lifecycle/net/worker.py; there is no override, so a new build means bumping the
 # WORKER_IMAGE constant. serving has no consumer for this training-worker image.
 #
 # Triggered automatically on flash/** changes (worker training code is baked in; skipping a
 # rebuild leaves GPU workers running stale code) and manually for Dockerfile/dep changes.
-# The build is heavy (vllm + full training stack + flash-attn wheel) but Docker layer caching
-# means only the flash COPY+install layer reruns on pure Python changes (~minutes, not hours).
+# The build is heavy (vllm + full training stack + flash-attn wheel). Export completed layers
+# to GHCR so fresh runners can skip unchanged dependency installs, including CUDA compilation.
+# Package cache mounts are builder-local; registry layer exports do not persist their contents.
 
 on:
   workflow_call:
@@ -111,6 +112,11 @@ jobs:
         run: |
           echo "revision=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
           echo "tag=$IMAGE_TAG" >> "$GITHUB_OUTPUT"
+          # Stable across commits and image tags on this branch. Hash refs containing slashes
+          # into valid registry tags; test branches never overwrite the main branch's cache.
+          cache_scope=$(printf '%s' "$GITHUB_REF" | sha256sum | cut -c1-16)
+          if [ "$GITHUB_REF" = refs/heads/main ]; then cache_scope=main; fi
+          echo "cache_ref=ghcr.io/freesolo-co/flash-worker:buildcache-$cache_scope" >> "$GITHUB_OUTPUT"
 
       # Compute the kernel-cache fingerprints (stdlib-only, no uv sync) and stamp them as labels on
       # :cu128 below, so auto-rebake.yml can read what this base was built from. Fails the build if a
@@ -129,7 +135,7 @@ jobs:
           sudo docker image prune -af || true
           df -h /
 
-      - uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
 
       - name: Log in to GHCR
         uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
@@ -140,15 +146,22 @@ jobs:
 
       - name: Build + push worker image
         id: image
-        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
           file: Dockerfile.worker
           push: true
-          # pin the freesolo-co namespace: runpod, vast, and lambda training paths pull the image
-          # declared in flash/providers/_lifecycle/worker.py, so a fork run must not push to its own owner
+          # pin the freesolo-co namespace: Modal training paths pull the image
+          # declared in flash/providers/_lifecycle/net/worker.py, so a fork run must not push to its own owner
           # namespace and leave the real image stale.
           tags: ghcr.io/freesolo-co/flash-worker:${{ steps.source.outputs.tag }}
+          # Keep this large cache in GHCR, not the repository's Actions cache quota. Import
+          # this branch first plus main as a fallback; export only to this branch's cache.
+          # BuildKit validates layer inputs, so toolchain changes still rebuild native code.
+          cache-from: |
+            type=registry,ref=${{ steps.source.outputs.cache_ref }}
+            type=registry,ref=ghcr.io/freesolo-co/flash-worker:buildcache-main
+          cache-to: type=registry,ref=${{ steps.source.outputs.cache_ref }},mode=max
           provenance: false
           # Stamp the kernel-cache fingerprints + the source commit so auto-rebake.yml can read what
           # this base was built from (docker/kernel_fingerprint.py is the source of truth).

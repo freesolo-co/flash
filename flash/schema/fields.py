@@ -16,7 +16,7 @@ from flash.core.spec import (
     CreditAssignment,
     WandbSpec,
 )
-from flash.envs.adapter import is_freesolo_environment_id
+from flash.envs.loading.adapter import is_freesolo_environment_id
 
 
 def _section_int(
@@ -33,8 +33,9 @@ def _section_int(
         return None
     if isinstance(v, bool) or not isinstance(v, (int, float)):
         raise ConfigError(f"{section}.{key} must be an integer")
-    # int(inf) raises overflowerror, so check finiteness before conversion.
-    if not math.isfinite(v) or float(v) != int(v):
+    # Integers are already exact and finite; converting them to float can overflow
+    # or round away valid bits. Only floating-point inputs need this check.
+    if isinstance(v, float) and (not math.isfinite(v) or not v.is_integer()):
         raise ConfigError(f"{section}.{key} must be a finite integer")
     v = int(v)
     if minimum is not None and maximum is not None and (v < minimum or v > maximum):
@@ -307,7 +308,8 @@ def _validate_env_var_names(names, context: str) -> None:
 
 _RESERVED_ENVIRONMENT_SECRET_KEYS = frozenset(
     {
-        "RUNPOD_API_KEY",
+        "MODAL_TOKEN_ID",
+        "MODAL_TOKEN_SECRET",
         "HF_TOKEN",
         "HUGGING_FACE_HUB_TOKEN",
         "GITHUB_TOKEN",

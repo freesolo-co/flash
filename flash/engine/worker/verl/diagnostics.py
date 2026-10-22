@@ -5,7 +5,7 @@ A wedged or crashed child is diagnosed from two places: the tail of its own stdo
 per-session log directory, which holds the raylet and worker output the child never printed. Both
 end up on a heartbeat payload, so both are size-capped and sanitized.
 
-Split out of `flash.engine.worker.backend_common` to keep that module under the file-size limit.
+Split out of `flash.engine.worker.train.entry.backend_common` to keep that module under the file-size limit.
 """
 
 from __future__ import annotations
@@ -44,7 +44,7 @@ def _backend_common():
     handling. Reading it back through the parent is what keeps that patch reaching this collector,
     and falling through to the builtin is what keeps a test that patches `builtins.open` working.
     """
-    from flash.engine.worker import backend_common
+    from flash.engine.worker.train.entry import backend_common
 
     return backend_common
 
@@ -336,12 +336,13 @@ class VerlChildSilenceWatchdog:
             return
         if self._child_alive is None or self._teardown is None:
             raise RuntimeError("verl child silence watchdog is not bound")
-        self._thread = threading.Thread(
+        thread = threading.Thread(
             target=self._watch,
             name="verl-child-silence-watchdog",
             daemon=True,
         )
-        self._thread.start()
+        thread.start()
+        self._thread = thread
 
     def stop(self) -> None:
         self._stop.set()

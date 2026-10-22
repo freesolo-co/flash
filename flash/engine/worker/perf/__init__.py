@@ -32,14 +32,14 @@ from flash.engine.worker.perf.lifecycle import (
     total_vram_gb,
     wait_for_gpu,
 )
-from flash.engine.worker.perf.liger import (
-    _estimate_params,
-    _liger_default_for_model,
-)
 from flash.engine.worker.perf.memory import (
-    _memory_mode,
+    _prefer_gradient_checkpointing,
     grad_checkpointing_on,
     grpo_use_reentrant,
+)
+from flash.engine.worker.perf.model_size import (
+    _checkpointing_default_for_model,
+    _estimate_params,
 )
 
 
@@ -385,6 +385,7 @@ def _ensure_fla_fastpath_on_hopper() -> None:
 __all__ = [
     "DirtyGpuError",
     "RetriableInfraError",
+    "_checkpointing_default_for_model",
     "_clean_diag",
     "_ensure_fla_fastpath_on_hopper",
     "_estimate_params",
@@ -392,8 +393,7 @@ __all__ = [
     "_float_or_none",
     "_force_fla_triton_gdn_on_sm100",
     "_int_or_none",
-    "_liger_default_for_model",
-    "_memory_mode",
+    "_prefer_gradient_checkpointing",
     "_query_nvidia_gpu",
     "_query_nvidia_processes",
     "_remove_fla_from_disk",

@@ -14,11 +14,13 @@ from datetime import UTC, datetime
 
 import pytest
 
-from flash.runner import _DEFAULT_ARTIFACT_NAMESPACE
-from flash.server.domain import repo_cleanup as rc
+from flash.runner.accounting.artifacts import _DEFAULT_ARTIFACT_NAMESPACE
+from flash.serve.contract import urls as serving_urls
+from flash.serve.request import transport as serving_transport
+from flash.server.domain.ops import repo_cleanup as rc
 
 # Real implementations captured before the offline conftest stub swaps in a no-op sweep.
-_REAL_DEPLOYED = rc.deployed_prefixes
+_REAL_DEPLOYED = rc.bound_artifact_prefixes
 _REAL_HOLD_RUN_LOCK = rc._hold_run_lock
 _REAL_RUN_SCHEDULED_CLEANUP = rc.run_scheduled_cleanup
 
@@ -114,7 +116,9 @@ def _wire(monkeypatch, *, deployed=None, hold=None):
     """Patch the sweep's non-HF seams: the global serving set and the per-run lock. The HF side is
     driven entirely by the FakeApi passed to ``run_scheduled_cleanup``."""
     monkeypatch.setattr(
-        rc, "deployed_prefixes", deployed if deployed is not None else (lambda: _LIVE_SENTINEL)
+        rc,
+        "bound_artifact_prefixes",
+        deployed if deployed is not None else (lambda: _LIVE_SENTINEL),
     )
     monkeypatch.setattr(rc, "_hold_run_lock", hold or (lambda run_id: _DummyHeld()))
 
@@ -140,7 +144,7 @@ def test_scan_workers_ignores_environment(value):
         [
             sys.executable,
             "-c",
-            "from flash.server.domain.repo_cleanup import _SCAN_WORKERS; print(_SCAN_WORKERS)",
+            "from flash.server.domain.ops.repo_cleanup import _SCAN_WORKERS; print(_SCAN_WORKERS)",
         ],
         env=env,
         check=True,
@@ -219,19 +223,17 @@ def test_private_opd_retry_markers_are_never_cleanup_targets(monkeypatch):
     assert all(marker_path != deleted_path for _repo, deleted_path in api.deleted)
 
 
-# ---- the global serving set (deployed_prefixes) -----------------------------------------------
+# ---- the global serving set (bound_artifact_prefixes) -----------------------------------------------
 
 
 def _serving(monkeypatch, records):
-    """Point deployed_prefixes' serving call at a canned ``GET /adapters`` payload."""
-    from flash.serve import deploy as sd
-
-    monkeypatch.setattr(sd, "serving_base_url", lambda: "https://serving.test")
-    resp = types.SimpleNamespace(json=lambda: {"adapters": records})
-    monkeypatch.setattr(sd, "_serving_request", lambda method, url: resp)
+    """Point bound_artifact_prefixes' serving call at a canned durable artifact-protection payload."""
+    monkeypatch.setattr(serving_urls, "serving_base_url", lambda: "https://serving.test")
+    resp = types.SimpleNamespace(json=lambda: {"ok": True, "bindings": records})
+    monkeypatch.setattr(serving_transport, "serving_request", lambda method, url: resp)
 
 
-def test_deployed_prefixes_from_serving_registry(monkeypatch):
+def test_bound_artifact_prefixes_from_serving_registry(monkeypatch):
     _serving(
         monkeypatch,
         [
@@ -245,14 +247,14 @@ def test_deployed_prefixes_from_serving_registry(monkeypatch):
     assert complete is True
 
 
-def test_deployed_prefixes_incomplete_when_record_has_no_repo(monkeypatch):
+def test_bound_artifact_prefixes_incomplete_when_record_has_no_repo(monkeypatch):
     _serving(monkeypatch, [{"subfolder": "rl/flash-1-a"}])  # live adapter, no repo id
     prefixes, _whole, complete = _REAL_DEPLOYED()
     assert complete is False
     assert prefixes == set()
 
 
-def test_deployed_prefixes_protects_whole_repo_when_subfolder_unmappable(monkeypatch):
+def test_bound_artifact_prefixes_protects_whole_repo_when_subfolder_unmappable(monkeypatch):
     _serving(monkeypatch, [{"repo_id": _managed("e1"), "subfolder": "toplevel-only"}])
     prefixes, whole, complete = _REAL_DEPLOYED()
     assert whole == {_managed("e1")}
@@ -527,7 +529,7 @@ def test_one_delete_failure_does_not_abort_sweep(monkeypatch):
 def test_restat_spares_prefix_written_since_enumeration(monkeypatch):
     _wire(monkeypatch)
     monkeypatch.setattr(
-        rc, "_prefix_written_within", lambda *a, **k: True
+        rc, "_run_artifacts_recently_used", lambda *a, **k: True
     )  # a fresh write appeared
     api = FakeApi({_managed("e"): [_adapter("sft/flash-1-old/w", OLD)]})
     assert rc.run_scheduled_cleanup(dry_run=False, api=api) == 0
@@ -540,13 +542,13 @@ def test_restat_skips_target_when_it_errors(monkeypatch):
     def _boom(*a, **k):
         raise RuntimeError("HF blip")
 
-    monkeypatch.setattr(rc, "_prefix_written_within", _boom)
+    monkeypatch.setattr(rc, "_run_artifacts_recently_used", _boom)
     api = FakeApi({_managed("e"): [_adapter("sft/flash-1-old/w", OLD)]})
     assert rc.run_scheduled_cleanup(dry_run=False, api=api) == 0  # skipped to stay safe
     assert api.deleted == []
 
 
-def test_prefix_written_within_reads_newest_commit():
+def test_run_artifacts_recently_used_reads_newest_commit():
     api = FakeApi(
         {
             _managed("e"): [
@@ -556,20 +558,24 @@ def test_prefix_written_within_reads_newest_commit():
         }
     )
     assert (
-        rc._prefix_written_within(api, _managed("e"), "sft/flash-1-a", NOW, rc.DELETE_AGE_SECONDS)
+        rc._run_artifacts_recently_used(
+            api, _managed("e"), "sft/flash-1-a", NOW, rc.DELETE_AGE_SECONDS
+        )
         is True
     )
 
 
-def test_prefix_written_within_false_when_all_old_or_undated():
+def test_run_artifacts_recently_used_false_when_all_old_or_undated():
     api = FakeApi({_managed("e"): [_adapter("sft/flash-1-a/w", 30)]})
     assert (
-        rc._prefix_written_within(api, _managed("e"), "sft/flash-1-a", NOW, rc.DELETE_AGE_SECONDS)
+        rc._run_artifacts_recently_used(
+            api, _managed("e"), "sft/flash-1-a", NOW, rc.DELETE_AGE_SECONDS
+        )
         is False
     )
     undated = FakeApi({_managed("e"): [_adapter("sft/flash-1-a/w", None)]})
     assert (
-        rc._prefix_written_within(
+        rc._run_artifacts_recently_used(
             undated, _managed("e"), "sft/flash-1-a", NOW, rc.DELETE_AGE_SECONDS
         )
         is False
@@ -619,3 +625,126 @@ def test_hold_run_lock_is_nonblocking_and_mutually_exclusive():
     reacquired = _deploy_lock("flash-lock-a").acquire(blocking=False)  # released -> free again
     assert reacquired is True
     _deploy_lock("flash-lock-a").release()
+
+
+@pytest.mark.parametrize(
+    "payload", [{"adapters": []}, {"ok": True}, {"ok": True, "bindings": {}}, None]
+)
+def test_cleanup_rejects_missing_or_old_protection_contract(monkeypatch, payload):
+    monkeypatch.setattr(serving_urls, "serving_base_url", lambda: "https://serving.test")
+    monkeypatch.setattr(
+        serving_transport,
+        "serving_request",
+        lambda *args: types.SimpleNamespace(json=lambda: payload),
+    )
+    _wire(monkeypatch, deployed=_REAL_DEPLOYED)
+    api = FakeApi({_managed("e"): [_adapter("sft/flash-1-a/w", OLD)]})
+    with pytest.raises(rc.CleanupAborted):
+        rc.run_scheduled_cleanup(api=api)
+    assert api.deleted == []
+
+
+def test_cleanup_rechecks_durable_binding_created_on_another_plane(monkeypatch):
+    repo = _managed("e")
+    records = [{"repo_id": _managed("live"), "subfolder": "rl/flash-live-0"}]
+    _serving(monkeypatch, records)
+    _wire(monkeypatch, deployed=_REAL_DEPLOYED)
+
+    class RegisteringApi(FakeApi):
+        def list_repo_tree(self, **kwargs):
+            if kwargs.get("path_in_repo"):
+                # Another plane binds a checkpoint during the slow pre-delete HF stat.
+                # It is still disabled/loading and never enters this plane's ready router.
+                records.append({"repo_id": repo, "subfolder": "sft/flash-1-a/checkpoints/step-4"})
+            return super().list_repo_tree(**kwargs)
+
+    api = RegisteringApi({repo: [_adapter("sft/flash-1-a/w", OLD)]})
+    assert rc.run_scheduled_cleanup(api=api) == 0
+    assert api.deleted == []
+
+
+def test_restat_spares_source_referenced_after_enumeration(monkeypatch):
+    _wire(monkeypatch)
+    repo = _managed("source")
+
+    class ReferencedDuringScan(FakeApi):
+        def list_repo_tree(self, **kwargs):
+            entries = super().list_repo_tree(**kwargs)
+            if not kwargs.get("path_in_repo"):
+                self._repos[repo].append(_adapter("referenced_by/flash-new-child", 0))
+            return entries
+
+    api = ReferencedDuringScan({repo: [_adapter("sft/flash-1-old/w", OLD)]})
+    assert rc.run_scheduled_cleanup(api=api) == 0
+    assert api.deleted == []
+
+
+def test_deletion_rechecks_only_target_and_references(monkeypatch):
+    _wire(monkeypatch)
+    monkeypatch.setattr(rc, "_throttle_tree_list", lambda: None)
+    repo = _managed("many-runs")
+    listings = []
+    entries_read = []
+
+    class CountingApi(FakeApi):
+        def list_repo_tree(self, **kwargs):
+            listings.append(kwargs.get("path_in_repo"))
+            entries = super().list_repo_tree(**kwargs)
+            entries_read.extend(entries)
+            return entries
+
+    prefixes = [f"sft/flash-{i}-old" for i in range(20)]
+    api = CountingApi({repo: [_adapter(f"{prefix}/w", OLD) for prefix in prefixes]})
+    assert rc.run_scheduled_cleanup(api=api) == len(prefixes)
+    assert listings.count(None) == 1  # One discovery scan, regardless of the number of runs.
+    assert listings[1:] == [path for prefix in prefixes for path in (prefix, rc.REF_MARKER)]
+    assert len(entries_read) == 2 * len(prefixes)
+
+
+@pytest.mark.parametrize(
+    "failure", ["missing_references", "missing_target", "unreadable_references"]
+)
+def test_scoped_recheck_handles_missing_paths_and_read_failures(monkeypatch, failure):
+    import httpx
+    from huggingface_hub.errors import RemoteEntryNotFoundError
+
+    _wire(monkeypatch)
+    repo = _managed("e")
+    prefix = "sft/flash-1-old"
+
+    class FailingListingApi(FakeApi):
+        def list_repo_tree(self, **kwargs):
+            # Real HF listings are lazy: failures can arrive during iteration.
+            path = kwargs.get("path_in_repo")
+            if path == (prefix if failure == "missing_target" else rc.REF_MARKER):
+                if failure == "unreadable_references":
+                    raise RuntimeError("HF 429")
+                raise RemoteEntryNotFoundError(
+                    "missing directory",
+                    response=httpx.Response(
+                        404, request=httpx.Request("GET", "https://hf.test/tree")
+                    ),
+                )
+            yield from super().list_repo_tree(**kwargs)
+
+    api = FailingListingApi({repo: [_adapter(f"{prefix}/w", OLD)]})
+    expected = 1 if failure == "missing_references" else 0
+    assert rc.run_scheduled_cleanup(api=api) == expected
+    assert api.deleted == ([(repo, prefix)] if expected else [])
+
+
+def test_scoped_recheck_spares_new_run_writes(monkeypatch):
+    _wire(monkeypatch)
+    repo = _managed("e")
+    prefix = "sft/flash-1-old"
+
+    class WrittenDuringScan(FakeApi):
+        def list_repo_tree(self, **kwargs):
+            entries = super().list_repo_tree(**kwargs)
+            if not kwargs.get("path_in_repo"):
+                self._repos[repo].append(_adapter(f"{prefix}/new-checkpoint/w", 0))
+            return entries
+
+    api = WrittenDuringScan({repo: [_adapter(f"{prefix}/w", OLD)]})
+    assert rc.run_scheduled_cleanup(api=api) == 0
+    assert api.deleted == []

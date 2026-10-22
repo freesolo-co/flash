@@ -7,8 +7,8 @@ import pytest
 
 from flash.content import multimodal as mm
 from flash.core.spec import EnvironmentSpec, JobSpec, TrainSpec
+from flash.engine.profiling.sft_rows import _reject_image_completion
 from flash.engine.profiling.sft_workload import prepare_sft_workload
-from flash.engine.worker.entry.sft import _reject_image_completion
 
 _VALID_PNG_DATA_URI = (
     "data:image/png;base64,"
