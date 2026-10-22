@@ -159,7 +159,9 @@ def _confirm_live_set() -> tuple[set[tuple[str, str]], set[str]]:
     if not prefixes and not whole:
         # Zero checkpoint bindings almost always means a broken/empty query rather than a genuinely empty
         # fleet; refuse rather than risk deleting every artifact against an empty do-not-touch set.
-        raise CleanupAborted("serving registry returned zero checkpoint bindings; refusing to sweep")
+        raise CleanupAborted(
+            "serving registry returned zero checkpoint bindings; refusing to sweep"
+        )
     return prefixes, whole
 
 
