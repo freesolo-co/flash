@@ -503,9 +503,7 @@ def test_restart_uses_durable_registration_intent(api, monkeypatch, stage):
         assert reads == [(identity["org_id"], target)]
         assert deletes == ([target] if stage == "matching_binding" else [])
         assert recovered.deployments[target]["state"] == (
-            "undeploying"
-            if stage in {"unavailable_registry", "slow_registry"}
-            else "undeployed"
+            "undeploying" if stage in {"unavailable_registry", "slow_registry"} else "undeployed"
         )
     assert recovered.deployments[sibling] == snapshot[0].deployments[sibling]
     late = {
