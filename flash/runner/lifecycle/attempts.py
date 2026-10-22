@@ -221,7 +221,7 @@ def _persist_reservation_unlocked(
         # to go with it. leaving it makes a crash before the replacement handle look like
         # confirmed-handle recovery: attach reattaches the old attempt, its reservation loses to
         # the advanced counter, and the run sits in `provisioning` with no handleless pass
-        # scheduled. accounting keeps its own `realized_cost_remote`.
+        # scheduled. accounting keeps its own `billing_remote`.
         if clear_teardown_marker:
             status.cleanup_confirmed_remote = None
     if transition_state is not None:
@@ -606,9 +606,9 @@ def persist_claimed_remote(
             status.state = "running"
             status.remote = remote
             status.updated_at = time.time()
-            # a fresh live handle supersedes the torn-down handle retained only for delayed
-            # reconciliation; leaving it would price this attempt against the previous resource.
-            status.realized_cost_remote = None
+            # a fresh live handle supersedes the torn-down billing handle; leaving it would price
+            # this attempt against the previous resource.
+            status.billing_remote = None
             # first-start evidence is stamped once, so a later attempt never rewrites it.
             if status.lifecycle_started_attempt is None:
                 status.lifecycle_started_attempt = claim.attempt

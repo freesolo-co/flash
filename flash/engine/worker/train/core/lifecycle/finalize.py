@@ -9,10 +9,10 @@ from flash.engine.result.accounting import RunMetrics, sanitize_worker_metrics
 from flash.engine.worker.io import heartbeat as heartbeat_io
 from flash.engine.worker.io import hf as hf_io
 from flash.engine.worker.perf import gpu_diagnostics
-from flash.engine.worker.runtime import state as worker_state
+from flash.engine.worker.runtime.state import WorkerContext
 
 
-def _train_meta_job_spec():
+def _train_meta_job_spec(*, context: WorkerContext):
     """the run's spec for the uploaded metrics artifact, with the base revision it trained on.
 
     to_dict() is the PUBLIC spec and no longer emits model_revision, but this artifact records what
@@ -21,7 +21,7 @@ def _train_meta_job_spec():
     train.init_from_adapter_revision, internal storage locators, into an artifact users download.
     so add back the one field, and only when it is set.
     """
-    spec = worker_state.JOB_SPEC
+    spec = context.config.spec
     if not spec:
         return None
     data = spec.to_dict()
@@ -42,8 +42,9 @@ def write_train_meta(
     *,
     step=None,
     heartbeat_fields=None,
+    context: WorkerContext,
 ):
-    env = worker_state.require_active_env()
+    env = context.require_active_env()
     meta = sanitize_worker_metrics(
         {
             "phase": phase,
@@ -58,7 +59,7 @@ def write_train_meta(
     )
     with open("/tmp/train_meta.json", "w") as f:
         json.dump(meta, f)
-    hf_io.hf_upload_file("/tmp/train_meta.json", "train_meta.json")
+    hf_io.hf_upload_file("/tmp/train_meta.json", "train_meta.json", context=context)
     # Carry the completed optimizer ``step`` (when the caller supplies it) so this final pre-DONE
     # heartbeat doesn't clobber the last stepped training ping with a stepless one -- a cancel
     # between here and DONE would otherwise re-price a fully-trained run to 0 steps.
@@ -70,6 +71,7 @@ def write_train_meta(
         **{k: meta[k] for k in ("train_wall", "train_tokens", "generated_tokens")},
         **_heartbeat_fields,
         gpu=gpu_diagnostics(),
+        context=context,
     )
     m = RunMetrics(
         arm=os.environ.get("FLASH_ARM", "modal"),
@@ -78,7 +80,7 @@ def write_train_meta(
         # _publish_training_completion reads metrics.step to carry the true step onto the
         # terminal `done` heartbeat.
         step=step,
-        seed=worker_state.SEED,
+        seed=context.config.seed,
         model_id=model_id,
         wall_seconds=train_wall,
         setup_seconds=setup_seconds,
@@ -90,28 +92,32 @@ def write_train_meta(
         notes={
             **(notes or {}),
             "renderer": "flash_env",
-            "thinking": worker_state.THINKING,
+            "thinking": context.config.thinking,
             "train_wall": train_wall,
             "model_id": model_id,
             "environment": env.id,
-            "job_spec": _train_meta_job_spec(),
+            "job_spec": _train_meta_job_spec(context=context),
         },
     )
-    _publish_training_completion(m, heartbeat_fields=_heartbeat_fields)
+    _publish_training_completion(m, heartbeat_fields=_heartbeat_fields, context=context)
 
 
-def _publish_training_completion(metrics: RunMetrics, *, heartbeat_fields=None):
+def _publish_training_completion(
+    metrics: RunMetrics, *, heartbeat_fields=None, context: WorkerContext
+):
     import time
 
     metrics.save("/tmp/metrics.json")
-    hf_io.hf_upload_file("/tmp/metrics.json", "metrics.json", required=True)
+    hf_io.hf_upload_file("/tmp/metrics.json", "metrics.json", required=True, context=context)
     with open("/tmp/DONE", "w") as handle:
         handle.write(str(time.time()))
     from flash.engine.worker.io.cpu_handoff import defer_completion
 
     if not defer_completion("/tmp/DONE"):
-        hf_io.hf_upload_file("/tmp/DONE", "DONE", required=True)
+        hf_io.hf_upload_file("/tmp/DONE", "DONE", required=True, context=context)
     step = metrics.step
     step_field = {"step": int(step)} if isinstance(step, (int, float)) and step > 0 else {}
-    heartbeat_io.heartbeat("done", **step_field, **(heartbeat_fields or {}), gpu=gpu_diagnostics())
+    heartbeat_io.heartbeat(
+        "done", **step_field, **(heartbeat_fields or {}), gpu=gpu_diagnostics(), context=context
+    )
     print("NODE DONE:", metrics.to_json())

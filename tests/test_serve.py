@@ -827,7 +827,7 @@ def test_cold_checkpoint_can_finish_after_the_old_readiness_limit(monkeypatch, m
     assert result["metadata"]["lifecycle_state"] == "ready"
     assert clock[0] - started >= ready_after
     assert not _deployment_attempt_is_stale(
-        {"state": "queued", "requested_at": started}, now=clock[0]
+        {"state": "deploying", "requested_at": started}, now=clock[0]
     )
 
 

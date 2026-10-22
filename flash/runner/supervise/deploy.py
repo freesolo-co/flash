@@ -14,7 +14,7 @@ from flash.runner.results.deployments import is_ready
 if TYPE_CHECKING:
     from flash.runner.lifecycle.state import RunStatus
 
-_CLEANUP_PENDING_STATE = "cleanup_pending"
+_UNDEPLOYING_STATE = "undeploying"
 _INACTIVE_DEPLOYMENT_STATES = frozenset({"undeployed", "dry_run"})
 
 
@@ -127,7 +127,7 @@ def _clear_remote_if_unchanged(run_id: str, expected_remote: dict) -> bool:
     Compare-and-clear under the status guard: a racing write that installed a DIFFERENT remote must
     keep it, or the run loses the only handle to a live billing resource.
     """
-    from flash.runner.accounting.reconciliation import _remote_resource_identity
+    from flash.runner.lifecycle.cleanup import _remote_resource_identity
     from flash.runner.lifecycle.reporting import _report_status
     from flash.runner.lifecycle.state import _save_status_unlocked, _status_guard
     from flash.runner.lifecycle.status import get_status
@@ -155,7 +155,7 @@ def _drain_confirmed_cleanup(run_id: str) -> set[tuple]:
     A record still present after the drain was NOT confirmed, so it is left for a later attempt;
     only records that disappeared are reported, and each has its status entry cleared.
     """
-    from flash.runner.accounting.reconciliation import (
+    from flash.runner.lifecycle.cleanup import (
         _cleanup_remote_key,
         _drain_cleanup_remotes,
         _remote_resource_identity,
@@ -186,7 +186,7 @@ def _drain_confirmed_cleanup(run_id: str) -> set[tuple]:
 
 def _teardown_or_preserve_remote(run_id: str, remote: dict) -> bool:
     """cancellation clears a resource only after confirmed deletion."""
-    from flash.runner.accounting.reconciliation import reconcile_cleanup
+    from flash.runner.lifecycle.cleanup import reconcile_cleanup
 
     cleanup = reconcile_cleanup(run_id, remote)
     if not cleanup.resource_deleted and not cleanup.obligation_recorded:
@@ -205,7 +205,7 @@ def _teardown_persisted_remotes(
     Stops on the first remote that could not be confirmed torn down, unless the status has since
     moved to a different one -- an already-confirmed identity is cleared without a second teardown.
     """
-    from flash.runner.accounting.reconciliation import _remote_resource_identity
+    from flash.runner.lifecycle.cleanup import _remote_resource_identity
     from flash.runner.lifecycle.status import get_status
 
     processed_remote_identities = set()
@@ -243,7 +243,7 @@ def _fence_contended_deployment(run_id: str) -> None:
                 continue
             status.deployments[checkpoint_id] = {
                 **record,
-                "state": "cleanup_pending",
+                "state": "undeploying",
                 "retryable": True,
                 "generation": generation(record) + 1,
                 "error": "backend cleanup pending: cancellation fenced an in-progress deployment",
@@ -273,15 +273,15 @@ def _cleanup_serving(
     backend call, so a crash between the two leaves the run visibly un-serveable, not silently live.
     """
     from flash.runner.supervise.transitions import (
-        mark_deployment_cleanup_pending,
+        mark_deployment_undeploying,
         mark_undeployed,
     )
 
     checkpoint_id = deployment["checkpoint_id"]
-    already_fenced = deployment.get("state") == _CLEANUP_PENDING_STATE
+    already_fenced = deployment.get("state") == _UNDEPLOYING_STATE
     if not already_fenced:
         try:
-            mark_deployment_cleanup_pending(
+            mark_deployment_undeploying(
                 run_id,
                 "backend cleanup pending: checkpoint serving was disabled locally before "
                 "backend cleanup",
@@ -301,7 +301,7 @@ def _cleanup_serving(
         undeploy_adapter(checkpoint_id, org_id=org_id)
     except Exception as exc:
         with contextlib.suppress(Exception):
-            mark_deployment_cleanup_pending(run_id, str(exc), checkpoint_id)
+            mark_deployment_undeploying(run_id, str(exc), checkpoint_id)
         return exc, None
     try:
         mark_undeployed(run_id, checkpoint_id)
@@ -442,7 +442,7 @@ def cancel_run(run_id: str) -> RunStatus:
         # have moved that exact rented basis into the retained private accounting identity.
         rented_basis = (
             status.remote
-            or getattr(status, "realized_cost_remote", None)
+            or getattr(status, "billing_remote", None)
             or getattr(status, "cleanup_confirmed_remote", None)
         )
         rented_remote = dict(rented_basis) if isinstance(rented_basis, dict) else None

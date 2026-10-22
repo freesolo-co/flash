@@ -32,7 +32,7 @@ def test_on_policy_epochs_resolve_to_prompt_pool_passes():
     )
 
 
-def test_heartbeat_concurrent_calls_stay_safe(monkeypatch):
+def test_heartbeat_concurrent_calls_stay_safe(worker_context, monkeypatch):
     """Regression: heartbeat() is called concurrently from the trainer reward callback and the
     checkpoint-upload daemon during GRPO. There is no worker-local heartbeat file (the control plane
     reads the HF copy), so each call must hand its HF upload a COMPLETE, valid JSON snapshot (never a
@@ -56,7 +56,7 @@ def test_heartbeat_concurrent_calls_stay_safe(monkeypatch):
 
     bad: list[Exception] = []
 
-    def fake_upload(local_path, repo_subpath, required=False):
+    def fake_upload(local_path, repo_subpath, required=False, context=None, **_context):
         # The bytes handed to the upload must be the caller's own complete snapshot.
         try:
             with open(local_path) as f:
@@ -76,7 +76,9 @@ def test_heartbeat_concurrent_calls_stay_safe(monkeypatch):
             for j in range(40):
                 # vary stage so both the throttled and unthrottled branches run
                 stage = "rl_step" if (i + j) % 2 else "checkpoint_uploaded"
-                worker_heartbeat.heartbeat(stage, step=i * 1000 + j, payload="x" * 200)
+                worker_heartbeat.heartbeat(
+                    stage, step=i * 1000 + j, payload="x" * 200, context=worker_context
+                )
         except Exception as e:
             errors.append(e)
 
@@ -91,7 +93,7 @@ def test_heartbeat_concurrent_calls_stay_safe(monkeypatch):
     assert not glob.glob("/tmp/.hb-upload-*"), "upload temp files must be cleaned up"
 
 
-def test_heartbeat_uploads_are_serialized_and_use_claimed_snapshot(monkeypatch):
+def test_heartbeat_uploads_are_serialized_and_use_claimed_snapshot(worker_context, monkeypatch):
     """Concurrent heartbeat uploads stay serialized and carry one claimed snapshot each.
 
     Unforced calls now deliberately skip while an upload is in flight: queueing their already-stale
@@ -126,7 +128,7 @@ def test_heartbeat_uploads_are_serialized_and_use_claimed_snapshot(monkeypatch):
     # Force every call through the upload path: no throttling.
     monkeypatch.setattr(worker_heartbeat, "_HB_MIN_INTERVAL_S", 0.0)
 
-    def fake_upload(local_path, repo_subpath, required=False):
+    def fake_upload(local_path, repo_subpath, required=False, context=None, **_context):
         nonlocal inflight, max_inflight
         with guard:
             inflight += 1
@@ -154,7 +156,9 @@ def test_heartbeat_uploads_are_serialized_and_use_claimed_snapshot(monkeypatch):
             barrier.wait()
             for j in range(20):
                 step = i * 1000 + j
-                worker_heartbeat.heartbeat("rl_step" if (i + j) % 2 else "ckpt", step=step)
+                worker_heartbeat.heartbeat(
+                    "rl_step" if (i + j) % 2 else "ckpt", step=step, context=worker_context
+                )
         except Exception as e:
             errors.append(e)
 

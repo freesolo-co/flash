@@ -515,9 +515,6 @@ def run_status(obj: dict) -> str:
         ("gpu", where),
         ("cost", cost),
     ]
-    realized = obj.get("realized_cost_usd")
-    if realized is not None:
-        pairs.append(("realized", money(realized)))
     pairs += heartbeat._heartbeat_pairs(obj, format_hint=_dim)
     pairs += [
         ("created", _humanize_ts(obj.get("created_at"))),

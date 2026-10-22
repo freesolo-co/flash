@@ -2395,6 +2395,7 @@ def test_cancelled_channel_setup_closes_late_ephemeral_queue(
     assert asyncio.run(scenario()) == (True, True)
 
 
+@pytest.mark.wallclock
 def test_dispatch_deadline_bounds_initial_lease_before_spawn() -> None:
     async def scenario() -> tuple[ChannelErrorCode, int]:
         queue = _FakeQueue()
@@ -2425,6 +2426,7 @@ def test_dispatch_deadline_bounds_initial_lease_before_spawn() -> None:
     assert asyncio.run(scenario()) == (ChannelErrorCode.DISPATCH_DEADLINE, 0)
 
 
+@pytest.mark.wallclock
 def test_dispatch_deadline_bounds_bound_lease_and_cancels_spawned_call() -> None:
     async def scenario() -> tuple[ChannelErrorCode, int]:
         queue = _FakeQueue()

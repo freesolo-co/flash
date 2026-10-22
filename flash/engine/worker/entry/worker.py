@@ -6,19 +6,20 @@ import os
 import sys
 import time
 import traceback
+from functools import partial
 
 import flash.engine.worker.entry.opd as opd_entry
 import flash.engine.worker.entry.rl as rl_entry
-import flash.engine.worker.entry.sft as sft_entry
 import flash.engine.worker.io.heartbeat as heartbeat_io
 import flash.engine.worker.io.hf as hf_io
 import flash.engine.worker.perf as worker_perf
 import flash.engine.worker.runtime.kernel_warmup as kernel_warmup
 import flash.engine.worker.train.entry.backend_common as backend_common
+import flash.engine.worker.train.entry.sft_train as sft_entry
 from flash._internal.diagnostics import sanitize_diagnostic
 from flash.core.spec import gpu_count_of
 from flash.engine.support.huggingface import hub_error_transience
-from flash.engine.worker.runtime import state
+from flash.engine.worker.runtime.state import WorkerContext
 from flash.envs.loading.staged import (
     StagedEnvironmentTransientError,
 )
@@ -36,7 +37,7 @@ def _worker_failure_flags(exc: BaseException) -> dict[str, bool]:
     return {"retriable": retriable, "oom": (not retriable and worker_perf.is_cuda_oom(exc))}
 
 
-def _preflight_gpu_occupancy_for_spec() -> None:
+def _preflight_gpu_occupancy_for_spec(*, context: WorkerContext) -> None:
     """Screen every GPU in the allocator-resolved worker allocation for substantial occupancy.
 
     The allocator stamps the chosen count onto ``JOB_SPEC`` before provider launch, so this passes
@@ -45,36 +46,36 @@ def _preflight_gpu_occupancy_for_spec() -> None:
     This must stay the first CUDA-adjacent call in boot. The reading is trustworthy only while this
     process has no context of its own, and ``_force_fla_triton_gdn_on_sm100`` below creates one.
     """
-    worker_perf.preflight_gpu_occupancy(gpu_count_of(state.JOB_SPEC))
+    worker_perf.preflight_gpu_occupancy(gpu_count_of(context.config.spec))
 
 
-def _run_worker_mode() -> None:
+def _run_worker_mode(*, context: WorkerContext) -> None:
     # first statement in the worker, ahead of every import below it: `huggingface_hub.constants`
     # captures HF_HUB_DISABLE_XET when it is imported, so setting it afterwards has no effect on
     # which upload path is used. anything imported before this line could freeze the default.
     hf_io._disable_xet_upload_staging()
 
     modes = {
-        "sft": sft_entry.run_sft,
-        "rl": rl_entry.run_rl,
-        "opd": opd_entry.run_opd,
+        "sft": partial(sft_entry.run_sft_train, context=context),
+        "rl": partial(rl_entry.run_rl, context=context),
+        "opd": partial(opd_entry.run_opd, context=context),
     }
-    handler = modes.get(state.RUN_MODE)
+    handler = modes.get(context.config.run_mode)
     if handler is None:
         raise RuntimeError("worker run mode is invalid")
-    remaining = state._remaining_worker_wall_seconds()
+    remaining = context.remaining_wall_seconds()
     if remaining is not None and remaining <= 0:
         raise RuntimeError("worker run wall deadline exceeded")
     # Idempotency: check DONE before any env-mutating pip install (fla fast path).
-    if state.HF_REPO:
+    if context.config.hf_repo:
         from huggingface_hub import hf_hub_download
         from huggingface_hub.errors import RemoteEntryNotFoundError
 
         try:
             hf_hub_download(
-                repo_id=state.HF_REPO,
+                repo_id=context.config.hf_repo,
                 repo_type="dataset",
-                filename=f"{hf_io.hf_prefix()}/DONE",
+                filename=f"{hf_io.hf_prefix(context=context)}/DONE",
                 token=os.environ.get("HF_TOKEN"),
             )
             done = True
@@ -87,26 +88,28 @@ def _run_worker_mode() -> None:
                 ) from exc
             else:
                 raise
-        remaining = state._remaining_worker_wall_seconds()
+        remaining = context.remaining_wall_seconds()
         if remaining is not None and remaining <= 0:
             raise RuntimeError("worker run wall deadline exceeded")
         if done:
             print("Run already complete (DONE present); returning persisted metrics.")
-            heartbeat_io.heartbeat("already_done", gpu=worker_perf.gpu_diagnostics())
+            heartbeat_io.heartbeat(
+                "already_done", gpu=worker_perf.gpu_diagnostics(), context=context
+            )
             # DONE is written only AFTER metrics.json uploads (required=True), so a failed read here
             # is a transient HF blip, never a missing file. Retry, then signal RETRIABLE (reschedule)
             # rather than SystemExit — a BaseException that bypasses the retriable-stamping handler
             # below and would report a genuinely-succeeded run as a fatal failure.
             last_err: Exception | None = None
             for attempt in range(3):
-                remaining = state._remaining_worker_wall_seconds()
+                remaining = context.remaining_wall_seconds()
                 if remaining is not None and remaining <= 0:
                     break
                 try:
                     got = hf_hub_download(
-                        repo_id=state.HF_REPO,
+                        repo_id=context.config.hf_repo,
                         repo_type="dataset",
-                        filename=f"{hf_io.hf_prefix()}/metrics.json",
+                        filename=f"{hf_io.hf_prefix(context=context)}/metrics.json",
                         token=os.environ.get("HF_TOKEN"),
                     )
                     import shutil
@@ -119,7 +122,7 @@ def _run_worker_mode() -> None:
                     if attempt >= 2:
                         break
                     delay = 5 * (attempt + 1)
-                    remaining = state._remaining_worker_wall_seconds()
+                    remaining = context.remaining_wall_seconds()
                     if remaining is not None:
                         if remaining <= 0:
                             break
@@ -146,50 +149,50 @@ def _run_worker_mode() -> None:
     # dependency repair, the model download and FSDP init have spent paid GPU on the same
     # conclusion. NVML answers without a context, so nothing here dirties the reading for the code
     # below.
-    _preflight_gpu_occupancy_for_spec()
+    _preflight_gpu_occupancy_for_spec(context=context)
     # run before model imports: sm100 tilelang GDN computes wrong gradients, so use Triton.
     worker_perf._force_fla_triton_gdn_on_sm100()
     worker_perf._ensure_fla_fastpath_on_hopper()
     # AFTER the fla fast path (which may (re)install fla), BEFORE any model import / GDN
     # launch: restrict fla's Blackwell GDN bwd autotune to grad-correct configs (fla #913).
     worker_perf._restrict_fla_gdn_autotune_on_blackwell()
-    heartbeat_io.heartbeat("boot", gpu=worker_perf.gpu_diagnostics())
+    heartbeat_io.heartbeat("boot", gpu=worker_perf.gpu_diagnostics(), context=context)
     kernel_warmup.configure_kernel_cache()
     try:
         handler()
     finally:
-        state._cleanup_active_env_package()
+        context.close()
     # hard-exit: colocated vllm can deadlock on nccl/cuda teardown; all artifacts are already on hf.
     sys.stdout.flush()
     sys.stderr.flush()
     os._exit(0)
 
 
-def main():
+def main(*, context: WorkerContext):
     try:
-        _run_worker_mode()
+        _run_worker_mode(context=context)
     except Exception as e:
         tb = sanitize_diagnostic(traceback.format_exc(), limit=16_000)
         try:
-            err_name = hf_io.error_artifact_name(state.RUN_MODE, state.ATTEMPT)
+            err_name = hf_io.error_artifact_name(context.config.run_mode, context.config.attempt)
             err_path = f"/tmp/{err_name}"
             with open(err_path, "w") as f:
                 f.write(tb)
-            hf_io.hf_upload_file(err_path, err_name)
+            hf_io.hf_upload_file(err_path, err_name, context=context)
         except Exception as up_err:
             print("error-upload warn:", sanitize_diagnostic(up_err, limit=500))
         try:
             # preserve ray session logs because raylet tracebacks show only the downstream EOF and
             # pod-local logs vanish after failure (VERL-115). all training modes start ray.
-            ray_logs = backend_common.collect_ray_failure_logs(
-                started_after=state.WORKER_START_TIME
-            )
+            ray_logs = backend_common.collect_ray_failure_logs(started_after=context.started_at)
             if ray_logs:
-                ray_name = hf_io.ray_log_artifact_name(state.RUN_MODE, state.ATTEMPT)
+                ray_name = hf_io.ray_log_artifact_name(
+                    context.config.run_mode, context.config.attempt
+                )
                 ray_path = f"/tmp/{ray_name}"
                 with open(ray_path, "w") as f:
                     f.write(ray_logs)
-                hf_io.hf_upload_file(ray_path, ray_name)
+                hf_io.hf_upload_file(ray_path, ray_name, context=context)
         except Exception as ray_err:
             # this is the failure path already. a collector that could raise here would replace the
             # run's real error with its own.
@@ -204,13 +207,13 @@ def main():
         # or the upload itself), the fallback still carries metrics_last, which is the backlog
         # this path exists to surface for short failing RL runs.
         _err_metrics = (
-            {"metrics_last": list(heartbeat_io.LATEST_GRPO_METRICS_LAST)}
-            if heartbeat_io.LATEST_GRPO_METRICS_LAST
+            {"metrics_last": list(context.heartbeat_state.metrics_last)}
+            if context.heartbeat_state.metrics_last
             else {}
         )
         try:
             heartbeat_io.heartbeat(
-                f"error_{state.RUN_MODE}",
+                f"error_{context.config.run_mode}",
                 error=detail,
                 **hb_flags,
                 **_err_metrics,
@@ -220,13 +223,22 @@ def main():
                 # whose diagnostics land under an unread key CLEARS the snapshot a healthy
                 # heartbeat already stored, losing the evidence exactly when an oom needs it.
                 gpu=worker_perf.gpu_diagnostics(),
+                context=context,
             )
         except Exception:
             heartbeat_io.heartbeat(
-                f"error_{state.RUN_MODE}", error=detail, **hb_flags, **_err_metrics
+                f"error_{context.config.run_mode}",
+                error=detail,
+                **hb_flags,
+                **_err_metrics,
+                context=context,
             )
-        remaining = state._remaining_worker_wall_seconds()
+        remaining = context.remaining_wall_seconds()
         delay = 10.0 if remaining is None else min(10.0, remaining)
         if delay > 0:
             time.sleep(delay)
         raise
+
+
+def main_from_env() -> None:
+    main(context=WorkerContext.from_env())

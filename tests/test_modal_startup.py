@@ -46,6 +46,35 @@ def test_queue_wait_uses_capacity_budget_not_worker_liveness(polling):
     assert 1800 < clock[0] - 100 < 1900
 
 
+def test_shutdown_of_reattached_poll_preserves_worker(monkeypatch, polling):
+    import threading
+
+    from flash._internal.background import Supervisor
+    from flash.providers.modal.provider import PROVIDER
+
+    _, _, _, handle, spec = polling
+    observed = threading.Event()
+    monkeypatch.setattr(
+        api, "get_instance", lambda *a, **kw: observed.set() or {"status": "pending"}
+    )
+    monkeypatch.setattr(api, "terminate", lambda *_: pytest.fail("shutdown destroyed worker"))
+    monkeypatch.setattr(
+        "flash.providers.modal.checkpoint_upload.cleanup",
+        lambda *_: pytest.fail("shutdown destroyed checkpoint uploads"),
+    )
+    owner = Supervisor()
+    try:
+        owner.submit(
+            ("run", spec.run_id),
+            "training",
+            lambda: PROVIDER.poll_attempt(handle, spec, _deadline_at=10000),
+        )
+        assert observed.wait(1)
+        assert owner.close(1), "shutdown must interrupt the reattached poll's wait"
+    finally:
+        owner.close(1)
+
+
 @pytest.mark.parametrize("reattach", [False, True])
 def test_long_queue_then_bootstrap_can_finish_with_queue_excluded_from_cost(
     monkeypatch, polling, reattach
@@ -99,13 +128,6 @@ def test_start_marker_rejects_wrong_identity_or_invalid_time(monkeypatch, change
     monkeypatch.setattr(startup.time, "time", lambda: 200)
     monkeypatch.setattr(startup, "make_hf_text_reader", lambda *a, **k: lambda: json.dumps(marker))
     assert startup.start_time_reader(modal_remote(started_ts=100))() is None
-
-
-def test_missing_bootstrap_time_does_not_bill_queue(monkeypatch):
-    from flash.providers.core.realized import realized_cost_for_remote
-
-    monkeypatch.setattr(startup, "make_hf_text_reader", lambda *a, **k: lambda: None)
-    assert realized_cost_for_remote(modal_remote(), start=1, end=3601) is None
 
 
 def test_bootstrap_publishes_start_identity_before_setup(monkeypatch):

@@ -174,7 +174,7 @@ def test_a_row_still_inside_the_outbox_retry_budget_does_not_block_promotion():
 
 
 def _body(**overrides):
-    """A `serving_usage_backlog_snapshot` body, shaped exactly as the RPC returns it."""
+    """A `serving_promotion_accounting_snapshot` body, shaped exactly as the RPC returns it."""
     body = {
         # still sent by the RPC and still required by the parser, though no field is read out of
         # it: an absent `states` is what a schema rename or an empty result looks like.
@@ -264,7 +264,7 @@ def test_a_fractional_age_is_the_normal_wire_shape_not_a_malformed_body():
 
 
 def test_postgrest_returns_the_row_wrapped_in_a_list():
-    """`serving_usage_backlog_snapshot` comes back as a single-element list, not a bare object."""
+    """`serving_promotion_accounting_snapshot` comes back as a single-element list, not a bare object."""
     assert verify_accounting(parse_accounting([_body()])).ok
 
 

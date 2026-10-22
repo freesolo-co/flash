@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from contextlib import nullcontext
+from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
@@ -74,10 +75,12 @@ def _train_args(config, *, dry_run: bool = False):
     )
 
 
-def test_reporter_matches_grpo_worker_for_authored_and_default_lengths(monkeypatch) -> None:
+def test_reporter_matches_grpo_worker_for_authored_and_default_lengths(
+    worker_context, monkeypatch
+) -> None:
     from flash.engine.worker.train.rl.launch import inputs
 
-    monkeypatch.setattr(inputs._worker_state, "THINKING", False)
+    monkeypatch.setattr(worker_context, "config", replace(worker_context.config, thinking=False))
     monkeypatch.setattr(inputs, "model_max_position_embeddings", lambda *_args: 32768)
 
     for context in (0, 8192):
@@ -93,6 +96,7 @@ def test_reporter_matches_grpo_worker_for_authored_and_default_lengths(monkeypat
             {"max_tokens": 512},
             object(),
             False,
+            context=worker_context,
         )
         reported = rl_prompt_budget(spec)
         assert reported is not None
@@ -101,10 +105,12 @@ def test_reporter_matches_grpo_worker_for_authored_and_default_lengths(monkeypat
         assert reported["prompt_budget"] == lengths["prompt_budget"]
 
 
-def test_grpo_worker_keeps_clamp_and_value_error_contract(monkeypatch, capsys) -> None:
+def test_grpo_worker_keeps_clamp_and_value_error_contract(
+    worker_context, monkeypatch, capsys
+) -> None:
     from flash.engine.worker.train.rl.launch import inputs
 
-    monkeypatch.setattr(inputs._worker_state, "THINKING", False)
+    monkeypatch.setattr(worker_context, "config", replace(worker_context.config, thinking=False))
     monkeypatch.setattr(inputs, "model_max_position_embeddings", lambda *_args: 1024)
     spec = _budget_spec("grpo", {"max_context_tokens": 2048, "max_completion_tokens": 512})
     lengths = inputs._resolve_sequence_lengths(
@@ -115,6 +121,7 @@ def test_grpo_worker_keeps_clamp_and_value_error_contract(monkeypatch, capsys) -
         {"max_tokens": 512},
         object(),
         False,
+        context=worker_context,
     )
     assert lengths == {"max_completion": 512, "vllm_max_len": 1024, "prompt_budget": 512}
     assert "training at 1024" in capsys.readouterr().out
@@ -128,10 +135,13 @@ def test_grpo_worker_keeps_clamp_and_value_error_contract(monkeypatch, capsys) -
             {"max_tokens": 512},
             object(),
             False,
+            context=worker_context,
         )
 
 
-def _opd_prompt_state(monkeypatch, *, max_length: int, architecture_limit: int = 32768):
+def _opd_prompt_state(
+    monkeypatch, *, max_length: int, architecture_limit: int = 32768, worker_context
+):
     import flash.engine.worker.teacher.client as teacher_client
     from flash.engine.worker.entry.opd import OpdKnobs
     from flash.engine.worker.train.opd.orchestration import prompt_preparation
@@ -144,13 +154,17 @@ def _opd_prompt_state(monkeypatch, *, max_length: int, architecture_limit: int =
         def apply_chat_template(self, *_args, **_kwargs):
             return list(range(100))
 
-    monkeypatch.setattr(prompt_preparation._worker_state, "THINKING", False)
+    monkeypatch.setattr(worker_context, "config", replace(worker_context.config, thinking=False))
     monkeypatch.setattr(
         prompt_preparation._worker_hf,
         "load_tokenizer",
         lambda *_args, **_kwargs: Tokenizer(),
     )
-    monkeypatch.setattr(prompt_preparation, "_thinking_prefill_text", lambda _tokenizer: "")
+    monkeypatch.setattr(
+        prompt_preparation,
+        "_thinking_prefill_text",
+        lambda _tokenizer, context=None, **_context: "",
+    )
     monkeypatch.setattr(
         prompt_preparation._backend,
         "model_max_position_embeddings",
@@ -159,7 +173,7 @@ def _opd_prompt_state(monkeypatch, *, max_length: int, architecture_limit: int =
     monkeypatch.setattr(
         prompt_preparation,
         "liveness_heartbeat",
-        lambda *_args, **_kwargs: nullcontext(),
+        lambda *_args, context=None, **_kwargs: nullcontext(),
     )
     monkeypatch.setattr(teacher_client, "TeacherClient", lambda *_args, **_kwargs: object())
     request = _OpdRequest(
@@ -177,15 +191,18 @@ def _opd_prompt_state(monkeypatch, *, max_length: int, architecture_limit: int =
         False,
         "capability",
         "http://control-plane",
+        context=worker_context,
     )
     return request, state
 
 
 @pytest.mark.parametrize("max_length", [0, 2048])
 def test_reporter_matches_opd_worker_for_authored_and_default_lengths(
-    monkeypatch, max_length
+    worker_context, monkeypatch, max_length
 ) -> None:
-    request, state = _opd_prompt_state(monkeypatch, max_length=max_length)
+    request, state = _opd_prompt_state(
+        monkeypatch, max_length=max_length, worker_context=worker_context
+    )
     train = {"max_completion_tokens": request.knobs.max_completion}
     if max_length:
         train["max_context_tokens"] = max_length
@@ -196,14 +213,20 @@ def test_reporter_matches_opd_worker_for_authored_and_default_lengths(
     assert reported["prompt_budget"] == state.prompt_budget
 
 
-def test_opd_worker_keeps_clamp_log_and_runtime_error_contract(monkeypatch, capsys) -> None:
-    _request, state = _opd_prompt_state(monkeypatch, max_length=2048, architecture_limit=1024)
+def test_opd_worker_keeps_clamp_log_and_runtime_error_contract(
+    worker_context, monkeypatch, capsys
+) -> None:
+    _request, state = _opd_prompt_state(
+        monkeypatch, max_length=2048, architecture_limit=1024, worker_context=worker_context
+    )
     assert state.max_model_len == 1024
     assert state.prompt_budget == 512
     assert "training at 1024" in capsys.readouterr().out
 
     with pytest.raises(RuntimeError, match="opd max_context_tokens leaves no room for a prompt"):
-        _opd_prompt_state(monkeypatch, max_length=512, architecture_limit=512)
+        _opd_prompt_state(
+            monkeypatch, max_length=512, architecture_limit=512, worker_context=worker_context
+        )
 
 
 def test_rollout_helpers_preserve_omitted_zero_and_thinking_behavior() -> None:

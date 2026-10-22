@@ -86,18 +86,19 @@ class ModalProvider:
         self.terminate_run(spec.run_id)
 
     def terminate_run(self, run_id):
-        from flash.providers.modal import api
+        from flash.providers.modal import api, checkpoint_upload
 
         for instance in api.list_instances():
             if instance["tags"].get("flash_run") == run_id:
                 api.terminate(instance["id"])
+        checkpoint_upload.cleanup_run(run_id)
 
     def run_instances_remaining(self, run_id):
-        from flash.providers.modal import api
+        from flash.providers.modal import api, checkpoint_upload
 
         return [
             item["id"] for item in api.list_instances() if item["tags"].get("flash_run") == run_id
-        ]
+        ] + checkpoint_upload.run_volumes(run_id)
 
     def sweep_orphans(self, active_labels=None, known_labels=None):
         from flash.providers.modal import api

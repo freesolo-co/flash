@@ -23,6 +23,7 @@ import time
 import types
 import urllib.error
 import urllib.request
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -50,19 +51,21 @@ from flash.engine.worker.train.rl.child import plugin as grpo_plugin
 
 # ------------------------------- dispatch -------------------------------
 @pytest.mark.parametrize("stale", [None, "verl", "trl", "megatron"])
-def test_run_rl_always_delegates_to_verl(monkeypatch, stale):
+def test_run_rl_always_delegates_to_verl(worker_context, monkeypatch, stale):
     """run_rl delegates to run_rl_train unconditionally -- no env key selects a backend.
 
     verl is the only trainer, so a stale FLASH_RL_BACKEND left in a config must be inert rather than
     routing anywhere else or raising.
     """
     called = []
-    monkeypatch.setattr(rl_train, "run_rl_train", lambda: called.append(True))
+    monkeypatch.setattr(
+        rl_train, "run_rl_train", lambda context=None, **_context: called.append(True)
+    )
     if stale is None:
         monkeypatch.delenv("FLASH_RL_BACKEND", raising=False)
     else:
         monkeypatch.setenv("FLASH_RL_BACKEND", stale)
-    rl.run_rl()
+    rl.run_rl(context=worker_context)
     assert called == [True]
 
 
@@ -2202,13 +2205,18 @@ def test_verl_epoch_capacity_invariant_across_valid_inputs():
                     assert (prompt_count // prompts_per_step) * resolved_epochs >= steps
 
 
-def test_resolver_clamps_prompt_budget_with_the_engine(monkeypatch):
+def test_resolver_clamps_prompt_budget_with_the_engine(worker_context, monkeypatch):
     # regression: clamping only the engine let the prompt filter admit prompts sized against the
     # UNCLAMPED context. those prompts plus the completion allowance overflow the engine vllm was
     # actually given, so they die at rollout instead of training on the shorter context. every
     # length must descend from one clamped value.
     # asks for twice the architecture's context (model_max_position_embeddings is pinned to 32768).
-    inp = _capability_resolve(monkeypatch, _capability_env(), train={"max_context_tokens": 65536})
+    inp = _capability_resolve(
+        monkeypatch,
+        _capability_env(),
+        train={"max_context_tokens": 65536},
+        worker_context=worker_context,
+    )
     assert inp["engine_len"] == 32768
     # the prompt filter's budget is carved out of the clamped engine, not the requested 65536.
     assert inp["max_prompt_len"] + inp["max_completion"] == 32768
@@ -2235,50 +2243,59 @@ def test_resolver_clamps_prompt_budget_with_the_engine(monkeypatch):
     assert cfg["max_prompt_len"] + cfg["max_completion"] == cfg["max_model_len"]
 
 
-def _save_steps_inputs(monkeypatch, *, save_at_steps=None, save_every=None, max_steps=100):
+def _save_steps_inputs(
+    monkeypatch, *, save_at_steps=None, save_every=None, max_steps=100, worker_context
+):
     """resolve grpo verl inputs for a job with (or without) exact save steps."""
     train: dict = {"max_steps": max_steps}
     if save_at_steps is not None:
         train["save_at_steps"] = list(save_at_steps)
     if save_every is not None:
         train["save_every"] = save_every
-    return _capability_resolve(monkeypatch, _capability_env(), train=train)
+    return _capability_resolve(
+        monkeypatch, _capability_env(), train=train, worker_context=worker_context
+    )
 
 
-def test_save_freq_is_the_gcd_so_verl_lands_on_every_required_step(monkeypatch):
+def test_save_freq_is_the_gcd_so_verl_lands_on_every_required_step(worker_context, monkeypatch):
     # periodic saves land only when global_step % save_freq == 0, so they cannot hit an arbitrary set
     # directly. the gcd is the largest interval every required step divides, so verl writes a superset
     # of the checkpoints and the uploader publishes deployables at exactly the requested ones.
-    inp = _save_steps_inputs(monkeypatch, save_at_steps=(10, 25, 100))
+    inp = _save_steps_inputs(
+        monkeypatch, save_at_steps=(10, 25, 100), worker_context=worker_context
+    )
     assert inp["save_freq"] == 5
     assert inp["save_at_steps"] == (10, 25, 100)
     for step in inp["save_at_steps"]:
         assert step % inp["save_freq"] == 0
 
 
-def test_save_freq_falls_back_to_save_every_without_exact_steps(monkeypatch):
+def test_save_freq_falls_back_to_save_every_without_exact_steps(worker_context, monkeypatch):
     # a long run preserves the customer's interval, so the clamp never increases normal frequency.
-    inp = _save_steps_inputs(monkeypatch, save_every=15)
+    inp = _save_steps_inputs(monkeypatch, save_every=15, worker_context=worker_context)
     assert inp["steps"] == 100
     assert inp["save_freq"] == 15
     assert inp["save_at_steps"] == ()
 
 
-def test_short_derived_horizon_clamps_save_freq_to_the_final_step(monkeypatch):
+def test_short_derived_horizon_clamps_save_freq_to_the_final_step(worker_context, monkeypatch):
     inp = _capability_resolve(
         monkeypatch,
         _capability_env(example_count=800),
         train={"max_examples": 800, "epochs": 1, "prompts_per_step": 64},
+        worker_context=worker_context,
     )
     assert inp["steps"] == 13
     assert inp["save_freq"] == 13
     assert inp["steps"] % inp["save_freq"] == 0
 
 
-def test_save_steps_reach_the_horizon_they_were_validated_against(monkeypatch):
+def test_save_steps_reach_the_horizon_they_were_validated_against(worker_context, monkeypatch):
     # save_at_steps requires max_steps, and the horizon resolves to exactly that, so every required
     # step is reachable by the run. this is the invariant the uploader's completeness check assumes.
-    inp = _save_steps_inputs(monkeypatch, save_at_steps=(10, 25, 100), max_steps=100)
+    inp = _save_steps_inputs(
+        monkeypatch, save_at_steps=(10, 25, 100), max_steps=100, worker_context=worker_context
+    )
     assert inp["steps"] == 100
     assert inp["save_at_steps"][-1] <= inp["steps"]
 
@@ -2293,20 +2310,24 @@ def test_final_publish_is_suppressed_when_exact_save_steps_are_set():
     assert final_save_due(100, ())
 
 
-def test_checkpoint_retention_outlives_the_export_when_exact_saves_are_set(monkeypatch):
+def test_checkpoint_retention_outlives_the_export_when_exact_saves_are_set(
+    worker_context, monkeypatch
+):
     # verl prunes a checkpoint once the NEXT save completes, so keeping 1 gives the uploader a
     # single save interval to export before its source is deleted. with a gcd of 1 that interval is
     # one update, which races the export and can lose a required deployable.
-    exact = _save_steps_inputs(monkeypatch, save_at_steps=(10, 11))
+    exact = _save_steps_inputs(monkeypatch, save_at_steps=(10, 11), worker_context=worker_context)
     assert exact["save_freq"] == 1
     assert exact["ckpt_to_keep"] > 1
 
     # nothing is exported mid-run without exact saves, so retention stays at its cheapest.
-    periodic = _save_steps_inputs(monkeypatch, save_every=15)
+    periodic = _save_steps_inputs(monkeypatch, save_every=15, worker_context=worker_context)
     assert periodic["ckpt_to_keep"] == 1
 
 
-def test_verl_resolver_builds_capacity_overrides_and_configured_metadata(monkeypatch):
+def test_verl_resolver_builds_capacity_overrides_and_configured_metadata(
+    worker_context, monkeypatch
+):
     from flash.core.spec import JobSpec
     from flash.engine.worker.train.rl.launch import inputs as rl_inputs
 
@@ -2337,10 +2358,10 @@ def test_verl_resolver_builds_capacity_overrides_and_configured_metadata(monkeyp
             "train": {"prompts_per_step": 16, "epochs": 2},
         }
     )
-    monkeypatch.setattr(rl_inputs._worker_state, "JOB_SPEC", spec)
-    monkeypatch.setattr(rl_inputs._worker_state, "SEED", 42)
-    monkeypatch.setattr(rl_inputs._worker_state, "THINKING", False)
-    monkeypatch.setattr(rl_inputs._worker_state, "require_active_env", lambda: _Env())
+    monkeypatch.setattr(worker_context, "config", replace(worker_context.config, spec=spec))
+    monkeypatch.setattr(worker_context, "config", replace(worker_context.config, seed=42))
+    monkeypatch.setattr(worker_context, "config", replace(worker_context.config, thinking=False))
+    monkeypatch.setattr(worker_context, "require_active_env", lambda: _Env())
     monkeypatch.setattr(rl_inputs._worker_config, "grpo_overrides", dict)
     monkeypatch.setattr(
         rl_inputs._worker_config, "grpo_mask_truncated_completions", lambda _train: False
@@ -2352,7 +2373,7 @@ def test_verl_resolver_builds_capacity_overrides_and_configured_metadata(monkeyp
     # the context-limit probe reads the model config off the hub; keep this unit test offline.
     monkeypatch.setattr(rl_inputs, "model_max_position_embeddings", lambda *a, **k: 40960)
 
-    inp = rl_inputs._resolve_grpo_inputs()
+    inp = rl_inputs._resolve_grpo_inputs(context=worker_context)
     cfg = rl_verl._build_verl_training_cfg(
         inp,
         ce_backend="torch",
@@ -2377,6 +2398,7 @@ def test_verl_resolver_builds_capacity_overrides_and_configured_metadata(monkeyp
         retained_prompts=len(inp["prompts"]),
         reward_history=[],
         loss_curve=[],
+        context=worker_context,
     )
 
     assert "trainer.total_training_steps=5" in overrides
@@ -2468,7 +2490,9 @@ def test_verl_uses_canonical_heartbeat_stage_contracts():
     # asserting the absence of a string nothing can emit any more, which no regression can fail.
     assert "rl_train_training" not in src
     assert "rl_train_finalizing" not in src
-    initial_heartbeat = '_worker_heartbeat.heartbeat("rl_step", step=0, initial=True)'
+    initial_heartbeat = (
+        '_worker_heartbeat.heartbeat("rl_step", step=0, initial=True, context=context)'
+    )
     assert initial_heartbeat in src
     # ordering is read off the ast, not off substring offsets: the liveness call spans several lines
     # once it carries keywords, and a text search for the one-line spelling would report "missing"
@@ -2492,7 +2516,7 @@ def test_verl_uses_canonical_heartbeat_stage_contracts():
     assert "initial" in stage_linenos
     assert "liveness" in stage_linenos
     assert stage_linenos["initial"] < stage_linenos["liveness"]
-    assert '"rl_finalizing"' in src
+    assert '"rl_finalizing"' in inspect.getsource(rl_train._publish_rl_result)
     assert "rl_step" in _HB_THROTTLED_STAGES
     assert "rl_step" in STEP_GATED_STAGES
     assert "rl_step" in _TRAINING_STAGES
@@ -2735,7 +2759,9 @@ class _RaisingEnv:
 def _identity_graded(monkeypatch):
     import flash.engine.worker.model.decoding as decoding
 
-    monkeypatch.setattr(decoding, "graded_text", lambda text, prompt_opened_thinking=False: text)
+    monkeypatch.setattr(
+        decoding, "graded_text", lambda text, prompt_opened_thinking=False, **_context: text
+    )
     monkeypatch.setattr(decoding, "thinking_text", lambda text, prompt_opened_thinking=False: "")
     monkeypatch.setattr(
         decoding, "think_token_count", lambda text, tok, prompt_opened_thinking=False: 3
@@ -2743,7 +2769,9 @@ def _identity_graded(monkeypatch):
 
 
 @pytest.mark.usefixtures("_identity_graded")
-def test_score_single_turn_breakdown_and_reward_env():
+def test_score_single_turn_breakdown_and_reward_env(
+    worker_context,
+):
     s = rl_single.score_single_turn(
         _BreakdownEnv(),
         "7",
@@ -2752,6 +2780,7 @@ def test_score_single_turn_breakdown_and_reward_env():
         thinking=False,
         prompt_opened_thinking=False,
         think_penalty=0.0,
+        context=worker_context,
     )
     assert s == 1.0
     s2 = rl_single.score_single_turn(
@@ -2762,12 +2791,15 @@ def test_score_single_turn_breakdown_and_reward_env():
         thinking=False,
         prompt_opened_thinking=False,
         think_penalty=0.0,
+        context=worker_context,
     )
     assert s2 == 2.5
 
 
 @pytest.mark.usefixtures("_identity_graded")
-def test_score_single_turn_applies_thinking_penalty():
+def test_score_single_turn_applies_thinking_penalty(
+    worker_context,
+):
     # base reward 1.0 minus think_penalty(0.1) * think_token_count(3) = 0.7
     s = rl_single.score_single_turn(
         _BreakdownEnv(),
@@ -2777,12 +2809,15 @@ def test_score_single_turn_applies_thinking_penalty():
         thinking=True,
         prompt_opened_thinking=True,
         think_penalty=0.1,
+        context=worker_context,
     )
     assert abs(s - 0.7) < 1e-9
 
 
 @pytest.mark.usefixtures("_identity_graded")
-def test_score_single_turn_env_error_is_zero():
+def test_score_single_turn_env_error_is_zero(
+    worker_context,
+):
     s = rl_single.score_single_turn(
         _RaisingEnv(),
         "x",
@@ -2791,6 +2826,7 @@ def test_score_single_turn_env_error_is_zero():
         thinking=False,
         prompt_opened_thinking=False,
         think_penalty=0.0,
+        context=worker_context,
     )
     assert s == 0.0
 
@@ -2809,7 +2845,7 @@ class _UnscorableBreakdownEnv:
 @pytest.mark.parametrize(
     "env", [_UnscorableRewardEnv(), _UnscorableBreakdownEnv()], ids=["reward", "scores_breakdown"]
 )
-def test_an_unscorable_reward_is_masked_before_it_reaches_verl(env):
+def test_an_unscorable_reward_is_masked_before_it_reaches_verl(worker_context, env):
     """A non-finite reward must not be forwarded, from EITHER env hook.
 
     verl's grpo baseline is a plain torch.mean/torch.std over the group (core_algos.py:320-326)
@@ -2828,13 +2864,16 @@ def test_an_unscorable_reward_is_masked_before_it_reaches_verl(env):
         prompt_opened_thinking=False,
         think_penalty=0.0,
         breakdowns=breakdowns,
+        context=worker_context,
     )
     assert s == 0.0
     assert math.isfinite(s)
 
 
 @pytest.mark.usefixtures("_identity_graded")
-def test_an_infinite_reward_is_masked_too_even_with_a_penalty_applied():
+def test_an_infinite_reward_is_masked_too_even_with_a_penalty_applied(
+    worker_context,
+):
     # inf, not just nan: nan is score_rollouts' canonical unscorable marker, but an env returning
     # inf poisons verl's baseline exactly as thoroughly and is not covered by testing nan alone.
     # the penalty is live here because that arithmetic runs between the env's return and the mask;
@@ -2851,12 +2890,15 @@ def test_an_infinite_reward_is_masked_too_even_with_a_penalty_applied():
         thinking=True,
         prompt_opened_thinking=True,
         think_penalty=0.1,
+        context=worker_context,
     )
     assert s == 0.0
 
 
 @pytest.mark.usefixtures("_identity_graded")
-def test_an_unscorable_reward_still_re_raises_for_the_latency_profiler():
+def test_an_unscorable_reward_still_re_raises_for_the_latency_profiler(
+    worker_context,
+):
     # same contract as a raising env: the profiler must tell a real 0.0 apart from a grader that
     # is not returning a usable number, or it reports a broken grader as fast and confident.
     with pytest.raises(ValueError, match="non-finite"):
@@ -2869,6 +2911,7 @@ def test_an_unscorable_reward_still_re_raises_for_the_latency_profiler():
             prompt_opened_thinking=False,
             think_penalty=0.0,
             raise_on_error=True,
+            context=worker_context,
         )
 
 
@@ -2887,7 +2930,9 @@ class _RaisingProbeEnv:
 
 
 @pytest.mark.usefixtures("_identity_graded")
-def test_a_capability_probe_that_raises_scores_zero_and_counts_as_a_failed_grading():
+def test_a_capability_probe_that_raises_scores_zero_and_counts_as_a_failed_grading(
+    worker_context,
+):
     """The probe is env code too, so it has to sit inside the guard that turns env faults into 0.0.
 
     Preserve ``None`` so failed scoring remains in named-metric denominators as zero.
@@ -2902,6 +2947,7 @@ def test_a_capability_probe_that_raises_scores_zero_and_counts_as_a_failed_gradi
         prompt_opened_thinking=False,
         think_penalty=0.0,
         breakdowns=breakdowns,
+        context=worker_context,
     )
 
     assert s == 0.0
@@ -2909,7 +2955,9 @@ def test_a_capability_probe_that_raises_scores_zero_and_counts_as_a_failed_gradi
 
 
 @pytest.mark.usefixtures("_identity_graded")
-def test_a_raising_probe_still_re_raises_for_the_latency_profiler():
+def test_a_raising_probe_still_re_raises_for_the_latency_profiler(
+    worker_context,
+):
     # raise_on_error is the profiler's way of telling a real 0.0 apart from a broken grader. the
     # guard must not swallow the probe's fault for that caller either.
     with pytest.raises(RuntimeError, match="scoring sidecar is gone"):
@@ -2922,6 +2970,7 @@ def test_a_raising_probe_still_re_raises_for_the_latency_profiler():
             prompt_opened_thinking=False,
             think_penalty=0.0,
             raise_on_error=True,
+            context=worker_context,
         )
 
 
@@ -2973,7 +3022,9 @@ class _RaisingRewardOnlyEnv:
 
 
 @pytest.mark.usefixtures("_identity_graded")
-def test_score_single_turn_collects_the_named_breakdown_for_reward_metrics():
+def test_score_single_turn_collects_the_named_breakdown_for_reward_metrics(
+    worker_context,
+):
     breakdowns: list[dict | None] = []
     score = rl_single.score_single_turn(
         _NamedBreakdownEnv(),
@@ -2984,13 +3035,16 @@ def test_score_single_turn_collects_the_named_breakdown_for_reward_metrics():
         prompt_opened_thinking=False,
         think_penalty=0.0,
         breakdowns=breakdowns,
+        context=worker_context,
     )
     assert score == 1.0
     assert breakdowns == [{"success": 1.0, "quality": 0.5, "total": 1.0}]
 
 
 @pytest.mark.usefixtures("_identity_graded")
-def test_a_scalar_reward_env_contributes_no_breakdown_at_all():
+def test_a_scalar_reward_env_contributes_no_breakdown_at_all(
+    worker_context,
+):
     # appending {} for a scores_breakdown-less env would add a denominator under no numerators:
     # RewardObservabilityBuffer divides by every scored completion, so an env mixing the two
     # shapes -- or a run with none at all -- would publish every name shrunk toward 0.
@@ -3004,13 +3058,16 @@ def test_a_scalar_reward_env_contributes_no_breakdown_at_all():
         prompt_opened_thinking=False,
         think_penalty=0.0,
         breakdowns=breakdowns,
+        context=worker_context,
     )
     assert score == 2.5
     assert breakdowns == []
 
 
 @pytest.mark.usefixtures("_identity_graded")
-def test_a_scalar_reward_env_contributes_nothing_when_its_grading_fails_either():
+def test_a_scalar_reward_env_contributes_nothing_when_its_grading_fails_either(
+    worker_context,
+):
     # the failure path is where the scores_breakdown gate actually bites: without it, a run whose
     # env has no named components at all would still append None per failed completion, and the
     # buffer's outage branch would then republish the LAST run's names as a flat 0 for an env that
@@ -3025,13 +3082,16 @@ def test_a_scalar_reward_env_contributes_nothing_when_its_grading_fails_either()
         prompt_opened_thinking=False,
         think_penalty=0.0,
         breakdowns=breakdowns,
+        context=worker_context,
     )
     assert score == 0.0
     assert breakdowns == []
 
 
 @pytest.mark.usefixtures("_identity_graded")
-def test_a_failed_grading_records_none_so_it_counts_as_a_zero():
+def test_a_failed_grading_records_none_so_it_counts_as_a_zero(
+    worker_context,
+):
     # trl's contract: a completion that failed to grade still scored 0.0, and must pull the mean of
     # every name the OTHER completions reported down with it. dropping it silently would report the
     # surviving completions' average as if the whole generation had earned it.
@@ -3045,13 +3105,16 @@ def test_a_failed_grading_records_none_so_it_counts_as_a_zero():
         prompt_opened_thinking=False,
         think_penalty=0.0,
         breakdowns=breakdowns,
+        context=worker_context,
     )
     assert score == 0.0
     assert breakdowns == [None]
 
 
 @pytest.mark.usefixtures("_identity_graded")
-def test_an_unusable_total_records_no_named_components():
+def test_an_unusable_total_records_no_named_components(
+    worker_context,
+):
     # float(total) raising IS a failed grading -- the completion scores 0.0. crediting its named
     # components would report metrics for a completion that earned nothing.
     breakdowns: list[dict | None] = []
@@ -3064,6 +3127,7 @@ def test_an_unusable_total_records_no_named_components():
         prompt_opened_thinking=False,
         think_penalty=0.0,
         breakdowns=breakdowns,
+        context=worker_context,
     )
     assert score == 0.0
     assert breakdowns == [None]
@@ -4011,7 +4075,8 @@ def test_run_rl_train_wires_direct_gradient_evidence_into_the_publish_path():
     assert "_check_grpo_had_a_gradient(" in verdict_source
     assert "state.grad_norms," in verdict_source
     assert "expected_steps=range(" in verdict_source
-    assert entry_source.index("_validate_rl_child(") < entry_source.index("_export_final_adapter(")
+    assert entry_source.index("_validate_rl_child(") < entry_source.index("_publish_rl_result(")
+    assert "_export_final_adapter(" in inspect.getsource(rl_train._publish_rl_result)
     assert "export_peft_adapter(" in export_source
     assert 'step_metrics.get("grad_norm")' in metrics_source
     assert 'step_metrics.get("advantage_max")' in metrics_source
@@ -4019,13 +4084,15 @@ def test_run_rl_train_wires_direct_gradient_evidence_into_the_publish_path():
     assert "_finalize_advantage_evidence(state, resume_step, expected_steps)" in verdict_source
 
 
-def test_train_notes_report_whether_the_run_resumed():
+def test_train_notes_report_whether_the_run_resumed(
+    worker_context,
+):
     # without this a resumed run is indistinguishable from a fresh one in train_meta (trl reports it).
     inp = _notes_inp()
     common = _notes_common()
-    fresh = rl_verl._build_verl_train_notes(inp, **common)
+    fresh = rl_verl._build_verl_train_notes(inp, **common, context=worker_context)
     assert fresh["resumed"] is False
-    resumed = rl_verl._build_verl_train_notes(inp, **common, resumed=True)
+    resumed = rl_verl._build_verl_train_notes(inp, **common, resumed=True, context=worker_context)
     assert resumed["resumed"] is True
 
 
@@ -4072,7 +4139,9 @@ def _identity_summary(identities):
     return {"count": len(identities), "sha256": digest.hexdigest()}
 
 
-def test_successful_child_validation_publishes_exact_rollout_identity_evidence_in_notes():
+def test_successful_child_validation_publishes_exact_rollout_identity_evidence_in_notes(
+    worker_context,
+):
     from flash.engine.worker.train.rl.rollout.identity import RolloutIdentityLedger
 
     ledger = RolloutIdentityLedger(1, 2)
@@ -4110,6 +4179,7 @@ def test_successful_child_validation_publishes_exact_rollout_identity_evidence_i
         advantage_spread_history=state.adv_spread_history,
         advantage_bounds=state.advantage_bounds_evidence,
         grad_norm_evidence=state.grad_norm_evidence,
+        context=worker_context,
     )
     assert notes["rollout_identity_evidence"] == {
         "steps": [
@@ -4126,7 +4196,9 @@ def test_successful_child_validation_publishes_exact_rollout_identity_evidence_i
     assert notes["grad_norm_evidence"] == [{"step": 1, "grad_norm": 0.25}]
 
 
-def test_already_complete_resume_finalizes_empty_rollout_identity_evidence():
+def test_already_complete_resume_finalizes_empty_rollout_identity_evidence(
+    worker_context,
+):
     from flash.engine.worker.train.rl.rollout.identity import RolloutIdentityLedger
 
     state = rl_runner._StepMetricState(resume_step=5)
@@ -4143,13 +4215,16 @@ def test_already_complete_resume_finalizes_empty_rollout_identity_evidence():
         advantage_spread_history=state.adv_spread_history,
         advantage_bounds=state.advantage_bounds_evidence,
         grad_norm_evidence=state.grad_norm_evidence,
+        context=worker_context,
     )
     assert notes["advantage_spread_history"] == []
     assert notes["advantage_bounds"] == []
     assert notes["grad_norm_evidence"] == []
 
 
-def test_train_notes_carry_the_trl_observability_fields():
+def test_train_notes_carry_the_trl_observability_fields(
+    worker_context,
+):
     # the console is uploaded only on FAILURE, so a successful run's train_meta is the sole record
     # of how it ran. the retired trl path reported these; without them a verl run cannot be compared to a
     # trl one, and the fp8-kv decision (resolved per-card at runtime) leaves no trace at all.
@@ -4161,6 +4236,7 @@ def test_train_notes_carry_the_trl_observability_fields():
         fp8_kv=True,
         wandb_project="acme",
         wandb_run_name="flash-rl-run123",
+        context=worker_context,
     )
     assert notes["download_seconds"] == 12.5
     assert notes["vllm_kv_cache_dtype"] == "fp8"
@@ -4175,18 +4251,24 @@ def test_train_notes_carry_the_trl_observability_fields():
     assert notes["gen_tokens_is_upper_bound"] is False
 
 
-def test_train_notes_report_bf16_kv_when_fp8_did_not_engage():
+def test_train_notes_report_bf16_kv_when_fp8_did_not_engage(
+    worker_context,
+):
     # fp8 is gated on cc>=8.9 AND a non-gdn model, so "requested" and "engaged" are not the same
     # thing. reporting fp8 unconditionally would claim a memory saving the run never got.
-    notes = rl_verl._build_verl_train_notes(_notes_inp(), **_notes_common(), fp8_kv=False)
+    notes = rl_verl._build_verl_train_notes(
+        _notes_inp(), **_notes_common(), fp8_kv=False, context=worker_context
+    )
     assert notes["vllm_kv_cache_dtype"] is None
 
 
-def test_train_notes_omit_wandb_identity_when_wandb_is_off():
+def test_train_notes_omit_wandb_identity_when_wandb_is_off(
+    worker_context,
+):
     # verl logs from its own interpreter, so flash's in-process wandb.run is empty on this path and
     # the names come from the config. recording them when the logger is off would point a reader at
     # a dashboard run that was never created.
-    notes = rl_verl._build_verl_train_notes(_notes_inp(), **_notes_common())
+    notes = rl_verl._build_verl_train_notes(_notes_inp(), **_notes_common(), context=worker_context)
     assert notes["wandb_project"] is None
     assert notes["wandb_run_name"] is None
     # a sampler that never saw a card must not report a fabricated zero-gb peak.
@@ -4214,10 +4296,12 @@ def test_verl_grpo_wandb_names_survive_hydra_special_characters():
     assert 'trainer.experiment_name="run=a,b"' in o
 
 
-def test_train_notes_record_the_batch_shape_one_step_consumed():
+def test_train_notes_record_the_batch_shape_one_step_consumed(
+    worker_context,
+):
     # the retired trl path reported the batch shape, so without it a verl run's reward curve cannot be read
     # against a trl one: the same step count at a different batch size is a different experiment.
-    notes = rl_verl._build_verl_train_notes(_notes_inp(), **_notes_common())
+    notes = rl_verl._build_verl_train_notes(_notes_inp(), **_notes_common(), context=worker_context)
     assert notes["max_completion_len"] == 512
     assert notes["prompts_per_step"] == 8
     # one optimizer step still sees the whole batch under data parallelism: use_dynamic_bsz
@@ -4225,11 +4309,13 @@ def test_train_notes_record_the_batch_shape_one_step_consumed():
     assert notes["generations_per_step"] == 8 * 4
 
 
-def test_train_notes_report_token_bounded_batching_as_unset_not_fabricated():
+def test_train_notes_report_token_bounded_batching_as_unset_not_fabricated(
+    worker_context,
+):
     # trl fixes a per-device SEQUENCE count; verl bounds the backward pass by tokens, so a
     # micro-batch holds however many sequences fit and varies step to step. reporting a number here
     # would read as directly comparable to trl's when nothing enforces it.
-    notes = rl_verl._build_verl_train_notes(_notes_inp(), **_notes_common())
+    notes = rl_verl._build_verl_train_notes(_notes_inp(), **_notes_common(), context=worker_context)
     assert notes["per_device_train_batch_size"] is None
     assert notes["gradient_accumulation_steps"] is None
     # the bound that IS enforced gets recorded in their place.
@@ -4353,6 +4439,8 @@ def _capability_resolve(
     processor=None,
     model="Qwen/Qwen3.5-9B",
     gpu_count=1,
+    *,
+    worker_context,
 ):
     """run the resolver against one env, with everything else on the supported path."""
     from flash.core.spec import JobSpec
@@ -4380,11 +4468,15 @@ def _capability_resolve(
             "gpu": {"count": gpu_count},
         }
     )
-    monkeypatch.setattr(rl_inputs._worker_state, "JOB_SPEC", spec)
-    monkeypatch.setattr(rl_inputs._worker_state, "SEED", 42)
-    monkeypatch.setattr(rl_inputs._worker_state, "THINKING", False)
-    monkeypatch.setattr(rl_inputs._worker_state, "require_active_env", lambda: env)
-    monkeypatch.setattr(rl_inputs._worker_config, "grpo_overrides", lambda: dict(overrides or {}))
+    monkeypatch.setattr(worker_context, "config", replace(worker_context.config, spec=spec))
+    monkeypatch.setattr(worker_context, "config", replace(worker_context.config, seed=42))
+    monkeypatch.setattr(worker_context, "config", replace(worker_context.config, thinking=False))
+    monkeypatch.setattr(worker_context, "require_active_env", lambda: env)
+    monkeypatch.setattr(
+        rl_inputs._worker_config,
+        "grpo_overrides",
+        lambda context=None, **_context: dict(overrides or {}),
+    )
     monkeypatch.setattr(
         rl_inputs._worker_config, "grpo_mask_truncated_completions", lambda _train: False
     )
@@ -4398,22 +4490,26 @@ def _capability_resolve(
     monkeypatch.setattr(
         rl_inputs, "generation_eos_from_cached_config", lambda *a, **k: frozenset({151645})
     )
-    return rl_inputs._resolve_grpo_inputs()
+    return rl_inputs._resolve_grpo_inputs(context=worker_context)
 
 
-def test_capability_guard_rejects_tool_env(monkeypatch):
+def test_capability_guard_rejects_tool_env(worker_context, monkeypatch):
     # trl grpo hands tool schemas AND callables to the trainer; verl gets neither, so a tool env
     # would train against completions that never call a tool.
     with pytest.raises(RuntimeError, match="function-calling tool environments"):
-        _capability_resolve(monkeypatch, _capability_env(is_tool_env=True))
+        _capability_resolve(
+            monkeypatch, _capability_env(is_tool_env=True), worker_context=worker_context
+        )
 
 
-def test_multi_turn_env_resolves_and_selects_the_flash_agent_loop(monkeypatch):
+def test_multi_turn_env_resolves_and_selects_the_flash_agent_loop(worker_context, monkeypatch):
     # the inverse of the guard this replaces: a multi-turn env used to be refused outright and fall
     # back to trl. it must now resolve, and the resolution must reach the ONE override that decides
     # which agent loop verl runs -- on the stock single_turn_agent the episode would end after the
     # first assistant turn and every environment reply would be dropped.
-    inp = _capability_resolve(monkeypatch, _capability_env(multi_turn=True))
+    inp = _capability_resolve(
+        monkeypatch, _capability_env(multi_turn=True), worker_context=worker_context
+    )
     assert inp["multi_turn"] is True
     assert inp["max_turns"] == 3
     cfg = rl_verl._build_verl_training_cfg(
@@ -4437,35 +4533,35 @@ def test_multi_turn_env_resolves_and_selects_the_flash_agent_loop(monkeypatch):
     assert "actor_rollout_ref.rollout.agent.default_agent_loop=flash_grpo_multi_turn" in o
 
 
-def test_single_turn_env_leaves_the_agent_loop_on_verl_default(monkeypatch):
+def test_single_turn_env_leaves_the_agent_loop_on_verl_default(worker_context, monkeypatch):
     # the override must be GATED: emitting it on a single-turn job would route text rollouts
     # through the multi-turn bridge, which has no episode state for them.
-    inp = _capability_resolve(monkeypatch, _capability_env())
+    inp = _capability_resolve(monkeypatch, _capability_env(), worker_context=worker_context)
     assert inp["multi_turn"] is False
     assert not [
         o for o in rl_verl.build_verl_overrides(_overrides_cfg()) if "default_agent_loop" in o
     ]
 
 
-def test_multi_turn_env_missing_a_rollout_method_is_refused(monkeypatch):
+def test_multi_turn_env_missing_a_rollout_method_is_refused(worker_context, monkeypatch):
     # the bridge calls exactly four env methods; a missing one would otherwise surface mid-rollout
     # on the first episode, after the gpu time is already spent.
     env = _capability_env(multi_turn=True)
     del type(env).env_reply
     with pytest.raises(RuntimeError, match="missing required rollout methods"):
-        _capability_resolve(monkeypatch, env)
+        _capability_resolve(monkeypatch, env, worker_context=worker_context)
 
 
-def test_multi_turn_env_without_a_turn_limit_is_refused(monkeypatch):
+def test_multi_turn_env_without_a_turn_limit_is_refused(worker_context, monkeypatch):
     # an unbounded episode cannot be budgeted: the response tensor is sized from the turn limit and
     # a runaway env would loop until the engine context is exhausted every single rollout.
     env = _capability_env(multi_turn=True)
     env.max_turns = 0
     with pytest.raises(RuntimeError, match="bounded turn limit"):
-        _capability_resolve(monkeypatch, env)
+        _capability_resolve(monkeypatch, env, worker_context=worker_context)
 
 
-def test_resolver_admits_image_prompts_and_carries_the_processor(monkeypatch):
+def test_resolver_admits_image_prompts_and_carries_the_processor(worker_context, monkeypatch):
     # the inverse of the guard this replaces: an image env used to be refused outright and fall
     # back to trl. it must now resolve, and it must resolve through a PROCESSOR -- a bare tokenizer
     # would under-count the prompt by the whole placeholder expansion. asserting the processor is
@@ -4476,6 +4572,7 @@ def test_resolver_admits_image_prompts_and_carries_the_processor(monkeypatch):
         monkeypatch,
         _capability_env(image_uri=_capability_image_uri()),
         processor=processor,
+        worker_context=worker_context,
     )
     assert inp["multimodal"] is True
     assert inp["processor"] is processor
@@ -4486,11 +4583,15 @@ def test_resolver_admits_image_prompts_and_carries_the_processor(monkeypatch):
     assert all(len(call["images"] or []) == 1 for call in processor.calls)
 
 
-def test_multimodal_prompts_carry_descriptors_and_rendered_text(monkeypatch):
+def test_multimodal_prompts_carry_descriptors_and_rendered_text(worker_context, monkeypatch):
     # the parquet writer needs each prompt's image DESCRIPTORS and the thinking probe needs the
     # RENDERED text. both are produced only on the multimodal branch, so a branch that returned
     # bare messages would break the writer downstream rather than here.
-    inp = _capability_resolve(monkeypatch, _capability_env(image_uri=_capability_image_uri()))
+    inp = _capability_resolve(
+        monkeypatch,
+        _capability_env(image_uri=_capability_image_uri()),
+        worker_context=worker_context,
+    )
     first = inp["prompts"][0]
     assert len(first["images"]) == 1
     assert first["rendered"] == "prompt"
@@ -4500,7 +4601,9 @@ def test_multimodal_prompts_carry_descriptors_and_rendered_text(monkeypatch):
     assert {"type": "image"} in blocks
 
 
-def test_top_level_record_image_reaches_actor_and_environment_prompts():
+def test_top_level_record_image_reaches_actor_and_environment_prompts(
+    worker_context,
+):
     from flash.engine.worker.train.rl.launch import inputs as rl_inputs
 
     prompts = rl_inputs._build_grpo_prompts(
@@ -4511,13 +4614,16 @@ def test_top_level_record_image_reaches_actor_and_environment_prompts():
         _CapabilityTokenizer(),
         None,
         32,
+        context=worker_context,
     )
 
     assert any(block == {"type": "image"} for block in prompts[0]["prompt"][0]["content"])
     assert any(block == {"type": "image"} for block in prompts[0]["env_prompt"][0]["content"])
 
 
-def test_text_prompts_freeze_qwen38_reasoning_fields_for_child_parity():
+def test_text_prompts_freeze_qwen38_reasoning_fields_for_child_parity(
+    worker_context,
+):
     from flash.engine.worker.train.rl.launch import inputs as rl_inputs
 
     prompts = rl_inputs._build_grpo_prompts(
@@ -4534,6 +4640,7 @@ def test_text_prompts_freeze_qwen38_reasoning_fields_for_child_parity():
         _CapabilityTokenizer(),
         None,
         32,
+        context=worker_context,
     )
 
     expected = {
@@ -4546,6 +4653,7 @@ def test_text_prompts_freeze_qwen38_reasoning_fields_for_child_parity():
 
 
 def test_multimodal_prompts_preserve_reasoning_content_through_processor_and_child_transport(
+    worker_context,
     tmp_path,
 ):
     from flash.engine.worker.train.rl.launch import inputs as rl_inputs
@@ -4578,7 +4686,7 @@ def test_multimodal_prompts_preserve_reasoning_content_through_processor_and_chi
     ]
 
     prompts = rl_inputs._build_grpo_prompts(
-        [{}], [messages], True, processor, processor.tokenizer, None, 32
+        [{}], [messages], True, processor, processor.tokenizer, None, 32, context=worker_context
     )
     row = build_verl_dataset_rows([prompts[0]["prompt"]], [0], [""], [prompts[0]["images"]])[0]
 
@@ -4595,7 +4703,7 @@ def test_multimodal_prompts_preserve_reasoning_content_through_processor_and_chi
     assert restored[1] == expected
 
 
-def test_multimodal_budget_filter_measures_the_expanded_prompt(monkeypatch):
+def test_multimodal_budget_filter_measures_the_expanded_prompt(worker_context, monkeypatch):
     # verl RAISES on an over-budget multimodal prompt instead of truncating, so this filter is the
     # only thing between a long image prompt and a dead run. the tokenizer says 1 token; the
     # processor says the prompt is huge. the filter must believe the processor -- if it measured
@@ -4606,20 +4714,21 @@ def test_multimodal_budget_filter_measures_the_expanded_prompt(monkeypatch):
             monkeypatch,
             _capability_env(image_uri=_capability_image_uri()),
             processor=processor,
+            worker_context=worker_context,
         )
 
 
-def test_text_env_resolves_without_building_a_processor(monkeypatch):
+def test_text_env_resolves_without_building_a_processor(worker_context, monkeypatch):
     # the control for the three tests above: a text-only job must NOT pay for a processor, and must
     # not carry an image-pad ban into its rollouts. without this a resolver hardcoded to the
     # multimodal branch would pass every multimodal test above.
-    inp = _capability_resolve(monkeypatch, _capability_env())
+    inp = _capability_resolve(monkeypatch, _capability_env(), worker_context=worker_context)
     assert inp["multimodal"] is False
     assert inp["processor"] is None
     assert inp["image_pad_token_id"] is None
 
 
-def test_kl_anchored_warm_start_is_accepted(monkeypatch, tmp_path):
+def test_kl_anchored_warm_start_is_accepted(worker_context, monkeypatch, tmp_path):
     # verl's kl reference is the bare base whenever lora is active, so warm-start + kl used to be
     # refused: the penalty would drag the policy away from the sft adapter the run was told to
     # continue. the deferred kl-reference plugin patch anchors the reference to that adapter instead,
@@ -4638,19 +4747,24 @@ def test_kl_anchored_warm_start_is_accepted(monkeypatch, tmp_path):
             }
         )
     )
-    monkeypatch.setattr(_adapter_mod, "_download_adapter", lambda ref: str(adapter_dir))
+    monkeypatch.setattr(
+        _adapter_mod, "_download_adapter", lambda ref, context=None, **_context: str(adapter_dir)
+    )
 
     inp = _capability_resolve(
         monkeypatch,
         _capability_env(),
         train={"init_from_adapter": "org/some-sft-adapter"},
         overrides={"kl_penalty_coef": 0.1},
+        worker_context=worker_context,
     )
     assert inp["warmstart_adapter"]
     assert inp["kl_coef"] == pytest.approx(0.1)
 
 
-def test_grpo_checks_warmstart_modality_after_resolving_image_prompts(monkeypatch, tmp_path):
+def test_grpo_checks_warmstart_modality_after_resolving_image_prompts(
+    worker_context, monkeypatch, tmp_path
+):
     import flash.engine.worker.model.adapter as adapter_mod
 
     adapter_dir = tmp_path / "warmstart"
@@ -4664,17 +4778,20 @@ def test_grpo_checks_warmstart_modality_after_resolving_image_prompts(monkeypatc
             }
         )
     )
-    monkeypatch.setattr(adapter_mod, "_download_adapter", lambda ref: str(adapter_dir))
+    monkeypatch.setattr(
+        adapter_mod, "_download_adapter", lambda ref, context=None, **_context: str(adapter_dir)
+    )
 
     with pytest.raises(ValueError, match="multimodal run cannot continue a text-only adapter"):
         _capability_resolve(
             monkeypatch,
             _capability_env(image_uri=_capability_image_uri()),
             train={"init_from_adapter": "org/text-only-adapter"},
+            worker_context=worker_context,
         )
 
 
-def test_35b_grpo_warm_start_requires_fused_expert_targets(monkeypatch, tmp_path):
+def test_35b_grpo_warm_start_requires_fused_expert_targets(worker_context, monkeypatch, tmp_path):
     import flash.engine.worker.model.adapter as adapter_mod
 
     adapter_dir = tmp_path / "warmstart"
@@ -4689,7 +4806,9 @@ def test_35b_grpo_warm_start_requires_fused_expert_targets(monkeypatch, tmp_path
         ),
         encoding="utf-8",
     )
-    monkeypatch.setattr(adapter_mod, "_download_adapter", lambda ref: str(adapter_dir))
+    monkeypatch.setattr(
+        adapter_mod, "_download_adapter", lambda ref, context=None, **_context: str(adapter_dir)
+    )
 
     with pytest.raises(ValueError, match="omits required expert targets"):
         _capability_resolve(
@@ -4698,10 +4817,13 @@ def test_35b_grpo_warm_start_requires_fused_expert_targets(monkeypatch, tmp_path
             train={"init_from_adapter": "org/pre-expert-adapter"},
             model="Qwen/Qwen3.6-35B-A3B",
             gpu_count=2,
+            worker_context=worker_context,
         )
 
 
-def test_per_turn_credit_assignment_is_accepted_on_single_turn_envs(monkeypatch, capsys):
+def test_per_turn_credit_assignment_is_accepted_on_single_turn_envs(
+    worker_context, monkeypatch, capsys
+):
     # per_turn only diverges from per_episode when there is more than one assistant turn to credit.
     # the multi-turn/tool guard above already rejects every env that could get there, so anything
     # reaching here is single-turn and the two modes are the same objective. rejecting a key that
@@ -4710,26 +4832,30 @@ def test_per_turn_credit_assignment_is_accepted_on_single_turn_envs(monkeypatch,
         monkeypatch,
         _capability_env(),
         train={"credit_assignment": "per_turn"},
+        worker_context=worker_context,
     )
     assert inp["max_prompt_len"] > 0
     assert "equivalent to per_episode" in capsys.readouterr().out
 
 
-def test_default_credit_assignment_does_not_log_an_equivalence_note(monkeypatch, capsys):
+def test_default_credit_assignment_does_not_log_an_equivalence_note(
+    worker_context, monkeypatch, capsys
+):
     # the control: the note above must be tied to an explicitly non-default value, not printed on
     # every run. without this a hardcoded print would still satisfy the test above.
     _capability_resolve(
         monkeypatch,
         _capability_env(),
         train={"credit_assignment": "per_episode"},
+        worker_context=worker_context,
     )
     assert "equivalent to per_episode" not in capsys.readouterr().out
 
 
-def test_capability_guards_admit_the_supported_single_turn_text_env(monkeypatch):
+def test_capability_guards_admit_the_supported_single_turn_text_env(worker_context, monkeypatch):
     # the control: with none of the four shapes present the resolver must run to completion, so a
     # guard that fires on every env would fail here instead of passing the four tests above.
-    inp = _capability_resolve(monkeypatch, _capability_env())
+    inp = _capability_resolve(monkeypatch, _capability_env(), worker_context=worker_context)
     assert inp["max_prompt_len"] > 0
 
 
@@ -4828,11 +4954,13 @@ def test_grpo_child_modules_do_not_fall_back_to_flash_in_the_isolated_child(tmp_
         ast.parse(source)
 
 
-def test_the_shared_builder_is_the_sole_owner_of_the_grpo_child_path(monkeypatch, tmp_path):
+def test_the_shared_builder_is_the_sole_owner_of_the_grpo_child_path(
+    worker_context, monkeypatch, tmp_path
+):
     sentinel_path = "shared-builder-pythonpath"
     calls = []
 
-    def build_child_env(*, shim_dir, wandb_enabled):
+    def build_child_env(*, shim_dir, wandb_enabled, context=None, **_context):
         calls.append((shim_dir, wandb_enabled))
         return {"PYTHONPATH": sentinel_path}
 
@@ -4842,7 +4970,9 @@ def test_the_shared_builder_is_the_sole_owner_of_the_grpo_child_path(monkeypatch
         "rank_device_claims": str(tmp_path / "rank_device_claims.txt"),
         "plugin_config_path": str(tmp_path / "flash_grpo_plugin_config.json"),
     }
-    child = rl_runner._build_rl_child_env({"multi_turn": False}, files, [], "http://127.0.0.1:9/")
+    child = rl_runner._build_rl_child_env(
+        {"multi_turn": False}, files, [], "http://127.0.0.1:9/", context=worker_context
+    )
 
     assert calls == [(str(tmp_path), False)]
     assert child["PYTHONPATH"] == sentinel_path
@@ -5367,7 +5497,9 @@ def test_bridge_authentication_rejects_image_placement_and_media_digest_sabotage
         image.close()
 
 
-def test_image_observation_prompt_without_initial_images_authenticates_through_verl_row():
+def test_image_observation_prompt_without_initial_images_authenticates_through_verl_row(
+    worker_context,
+):
     from flash.engine.worker.train.rl.launch import inputs as rl_inputs
 
     class _ImageObservationEnv(_BridgeEnv):
@@ -5378,7 +5510,14 @@ def test_image_observation_prompt_without_initial_images_authenticates_through_v
     source_prompt = [{"role": "user", "content": "question"}]
     processor = _CapabilityProcessor()
     prompts = rl_inputs._build_grpo_prompts(
-        [example], [source_prompt], True, processor, processor.tokenizer, None, 32
+        [example],
+        [source_prompt],
+        True,
+        processor,
+        processor.tokenizer,
+        None,
+        32,
+        context=worker_context,
     )
     prepared = prompts[0]
     rows = rl_verl.build_verl_dataset_rows(
@@ -6183,17 +6322,21 @@ def test_the_run_shuts_the_bridge_down_before_the_server_it_is_mounted_on():
     assert src.index("multi_turn_bridge.shutdown()") < src.index("server.shutdown()")
 
 
-def test_sampler_start_failure_closes_the_running_reward_server(monkeypatch):
+def test_sampler_start_failure_closes_the_running_reward_server(monkeypatch, worker_context):
     events = []
     reward = SimpleNamespace(
         multi_turn_bridge=SimpleNamespace(shutdown=lambda: events.append("bridge")),
         server=SimpleNamespace(shutdown=lambda: events.append("server")),
     )
     inp = {"model_id": "model", "model_revision": "revision"}
-    monkeypatch.setattr(rl_train, "liveness_heartbeat", lambda *_: contextlib.nullcontext())
-    monkeypatch.setattr(rl_train, "_prepare_rl_inputs", lambda: (0, inp, None, None, None, [], 0))
+    monkeypatch.setattr(
+        rl_train, "liveness_heartbeat", lambda *_, **kwargs: contextlib.nullcontext()
+    )
+    monkeypatch.setattr(
+        rl_train, "_prepare_rl_inputs", lambda **kwargs: (0, inp, None, None, None, [], 0)
+    )
     monkeypatch.setattr(rl_train, "_cached_model_path", lambda *_: "/model")
-    monkeypatch.setattr(rl_train, "_prepare_rl_runtime", lambda *_: ({}, reward))
+    monkeypatch.setattr(rl_train, "_prepare_rl_runtime", lambda *_, **kwargs: ({}, reward))
     monkeypatch.setattr(rl_train, "reap_stragglers", lambda: events.append("reap"))
 
     def fail_start():
@@ -6201,7 +6344,7 @@ def test_sampler_start_failure_closes_the_running_reward_server(monkeypatch):
 
     monkeypatch.setattr(rl_train, "_initialize_teardown_state", fail_start)
     with pytest.raises(RuntimeError, match="sampler start failed"):
-        rl_train.run_rl_train()
+        rl_train.run_rl_train(context=worker_context)
     assert events == ["bridge", "server", "reap"]
 
 
@@ -6364,10 +6507,12 @@ def test_the_bridge_is_built_only_for_multi_turn_jobs():
 
 
 # ---------------------- multi-turn response tensor width ----------------------
-def test_multi_turn_widens_the_response_tensor_to_hold_a_whole_episode(monkeypatch):
+def test_multi_turn_widens_the_response_tensor_to_hold_a_whole_episode(worker_context, monkeypatch):
     # verl drops response_ids beyond data.max_response_length.
     # size for the longest transcript: engine length minus the shortest admitted prompt.
-    inp = _capability_resolve(monkeypatch, _capability_env(multi_turn=True))
+    inp = _capability_resolve(
+        monkeypatch, _capability_env(multi_turn=True), worker_context=worker_context
+    )
     assert inp["max_response_len"] > inp["max_completion"], "the episode tensor was not widened"
     assert inp["max_response_len"] == inp["engine_len"] - min(
         int(p["prompt_len"]) for p in inp["prompts"]
@@ -6376,17 +6521,23 @@ def test_multi_turn_widens_the_response_tensor_to_hold_a_whole_episode(monkeypat
     assert inp["max_completion"] < inp["engine_len"]
 
 
-def test_single_turn_leaves_the_response_tensor_at_the_completion_width(monkeypatch):
+def test_single_turn_leaves_the_response_tensor_at_the_completion_width(
+    worker_context, monkeypatch
+):
     # the control: one completion IS the response, so widening it would inflate every rollout's
     # padded tensor and the token budget derived from it for no reason.
-    inp = _capability_resolve(monkeypatch, _capability_env())
+    inp = _capability_resolve(monkeypatch, _capability_env(), worker_context=worker_context)
     assert inp["max_response_len"] == inp["max_completion"]
 
 
-def test_the_response_width_reaches_verls_config_rather_than_max_completion(monkeypatch):
+def test_the_response_width_reaches_verls_config_rather_than_max_completion(
+    worker_context, monkeypatch
+):
     # the derivation is worthless if the override still emits max_completion. this is the one line
     # that decides how wide the tensor verl allocates actually is.
-    inp = _capability_resolve(monkeypatch, _capability_env(multi_turn=True))
+    inp = _capability_resolve(
+        monkeypatch, _capability_env(multi_turn=True), worker_context=worker_context
+    )
     cfg = rl_verl._build_verl_training_cfg(
         inp,
         ce_backend="torch",
@@ -6410,7 +6561,7 @@ def test_the_response_width_reaches_verls_config_rather_than_max_completion(monk
 
 
 # ---------------- reward observability: the buffer and the heartbeat drain ----------------
-def _score_buffer(env, *, prompts=None, examples=None, generation_size=0):
+def _score_buffer(env, *, prompts=None, examples=None, generation_size=0, worker_context):
     """`_score`'s grade-then-record pair, against a real buffer and fake env.
 
     The real local function requires a model, dataset, and verl child, so source tests separately
@@ -6432,6 +6583,7 @@ def _score_buffer(env, *, prompts=None, examples=None, generation_size=0):
             prompt_opened_thinking=False,
             think_penalty=0.0,
             breakdowns=breakdowns,
+            context=worker_context,
         )
         buffer.record(message_prompts[int(index)], solution_str, value, breakdowns)
         return value
@@ -6468,8 +6620,10 @@ def test_the_recorded_prompt_is_the_one_the_batched_completion_was_graded_agains
 
 
 @pytest.mark.usefixtures("_identity_graded")
-def test_the_buffer_keeps_the_rollout_sample_and_its_named_breakdown():
-    score, buffer = _score_buffer(_NamedBreakdownEnv())
+def test_the_buffer_keeps_the_rollout_sample_and_its_named_breakdown(
+    worker_context,
+):
+    score, buffer = _score_buffer(_NamedBreakdownEnv(), worker_context=worker_context)
 
     assert score(0, "7") == 1.0
     assert buffer.latest() == ("prompt-0", "7", 1.0)
@@ -6478,10 +6632,12 @@ def test_the_buffer_keeps_the_rollout_sample_and_its_named_breakdown():
 
 
 @pytest.mark.usefixtures("_identity_graded")
-def test_the_buffers_are_bounded_when_the_generation_never_closes():
+def test_the_buffers_are_bounded_when_the_generation_never_closes(
+    worker_context,
+):
     # nothing bounds how many completions arrive before a boundary. the sample buffer evicts; the
     # metric accumulator must not GROW instead -- this process is already memory-tight.
-    score, buffer = _score_buffer(_NamedBreakdownEnv())
+    score, buffer = _score_buffer(_NamedBreakdownEnv(), worker_context=worker_context)
     for _ in range(5000):
         score(0, "7")
 
@@ -6492,7 +6648,9 @@ def test_the_buffers_are_bounded_when_the_generation_never_closes():
 
 
 @pytest.mark.usefixtures("_identity_graded")
-def test_every_completion_counts_toward_the_mean_however_large_the_generation():
+def test_every_completion_counts_toward_the_mean_however_large_the_generation(
+    worker_context,
+):
     """A generation is ``batch_size * group_size`` completions, both unbounded, so no retention cap
     can hold one. Dropping the overflow biases the published mean toward whichever completions were
     graded last -- here, a run that succeeded early and failed late would report a flat 0
@@ -6501,6 +6659,7 @@ def test_every_completion_counts_toward_the_mean_however_large_the_generation():
         _CountingBreakdownEnv(),
         prompts=["prompt-0"],
         examples=[{"gt": "7"}],
+        worker_context=worker_context,
     )
     total = 5000
     for _ in range(total):
@@ -6512,7 +6671,9 @@ def test_every_completion_counts_toward_the_mean_however_large_the_generation():
 
 
 @pytest.mark.usefixtures("_identity_graded")
-def test_eviction_drops_the_oldest_rollouts_and_keeps_the_newest():
+def test_eviction_drops_the_oldest_rollouts_and_keeps_the_newest(
+    worker_context,
+):
     """Over the limit, what SURVIVES has to be the recent end: samples answer "what is the model
     doing now", so evicting the newest would pin a stalled run's diagnostics to its oldest
     gradings. A length-only assertion passes either way -- this reads the retained values."""
@@ -6520,6 +6681,7 @@ def test_eviction_drops_the_oldest_rollouts_and_keeps_the_newest():
         _CountingBreakdownEnv(),
         prompts=["prompt-0"],
         examples=[{"gt": "7"}],
+        worker_context=worker_context,
     )
     total = RewardObservabilityBuffer._SAMPLE_BUFFER_LIMIT + 50
     for _ in range(total):
@@ -6578,10 +6740,12 @@ def test_a_reward_that_is_not_a_float_is_coerced_at_the_boundary():
 
 
 @pytest.mark.usefixtures("_identity_graded")
-def test_a_scalar_reward_run_publishes_no_named_metrics_at_all():
+def test_a_scalar_reward_run_publishes_no_named_metrics_at_all(
+    worker_context,
+):
     # end to end for the empty case: a scores_breakdown-less env must reach the wire with the key
     # ABSENT, not with every name flattened to 0 by an empty-dict denominator.
-    score, buffer = _score_buffer(_RewardOnlyEnv())
+    score, buffer = _score_buffer(_RewardOnlyEnv(), worker_context=worker_context)
     score(0, "the answer is 7")
     buffer.close_generation(1)
 
@@ -6591,11 +6755,14 @@ def test_a_scalar_reward_run_publishes_no_named_metrics_at_all():
 
 
 @pytest.mark.usefixtures("_identity_graded")
-def test_the_heartbeat_publishes_averaged_metrics_and_bounded_samples():
+def test_the_heartbeat_publishes_averaged_metrics_and_bounded_samples(
+    worker_context,
+):
     score, buffer = _score_buffer(
         _NamedBreakdownEnv(),
         prompts=["p0", "p1", "p2", "p3"],
         examples=[{"gt": "7"}, {"gt": "7"}, {"gt": "9"}, {"gt": "9"}],
+        worker_context=worker_context,
     )
     for index, completion in enumerate(["7", "7", "7", "7"]):
         score(index, completion)
@@ -6611,7 +6778,9 @@ def test_the_heartbeat_publishes_averaged_metrics_and_bounded_samples():
 
 
 @pytest.mark.usefixtures("_identity_graded")
-def test_a_heartbeat_landing_mid_generation_republishes_the_last_complete_one():
+def test_a_heartbeat_landing_mid_generation_republishes_the_last_complete_one(
+    worker_context,
+):
     """A 30s liveness tick is not a generation boundary, and publishing on it is latency-biased.
 
     The completions that finish first are the fast ones -- short outputs, cache hits, envs that
@@ -6623,6 +6792,7 @@ def test_a_heartbeat_landing_mid_generation_republishes_the_last_complete_one():
         _NamedBreakdownEnv(),
         prompts=["p0", "p1"],
         examples=[{"gt": "7"}, {"gt": "7"}],
+        worker_context=worker_context,
     )
     score(0, "7")  # the fast completion: success 1.0
     buffer.close_generation(1)
@@ -6642,14 +6812,18 @@ def test_a_heartbeat_landing_mid_generation_republishes_the_last_complete_one():
 
 
 @pytest.mark.usefixtures("_identity_graded")
-def test_the_next_generation_cannot_be_sealed_into_the_step_line_that_is_still_in_flight():
+def test_the_next_generation_cannot_be_sealed_into_the_step_line_that_is_still_in_flight(
+    worker_context,
+):
     """The child's stdout is delivered asynchronously, so `step:N` can reach the parent AFTER
     generation N+1 has started scoring. A boundary taken at that moment seals both generations
     under step N and leaves N+1 with nothing of its own to publish.
 
     Counting closes the generation on the scoring thread that finishes it, so the in-flight line
     only names what was already sealed."""
-    score, buffer = _score_buffer(_NamedBreakdownEnv(), generation_size=2)
+    score, buffer = _score_buffer(
+        _NamedBreakdownEnv(), generation_size=2, worker_context=worker_context
+    )
     score(0, "7")
     score(0, "7")  # generation 1 is complete here, whatever stdout is doing
     score(0, "wrong")  # generation 2 begins while `step:1` is still in the pipe
@@ -6668,13 +6842,17 @@ def test_the_next_generation_cannot_be_sealed_into_the_step_line_that_is_still_i
 
 
 @pytest.mark.usefixtures("_identity_graded")
-def test_a_generation_that_completes_before_the_previous_step_line_is_not_lost():
+def test_a_generation_that_completes_before_the_previous_step_line_is_not_lost(
+    worker_context,
+):
     """Stdout can fall a WHOLE generation behind, not just part of one.
 
     A single "already sealed" flag only remembers one unacknowledged generation, so the second seal
     overwrites the first: generation 1 is dropped and generation 2 publishes under step 1, leaving
     every later step misaligned. Small generations make that window ordinary."""
-    score, buffer = _score_buffer(_NamedBreakdownEnv(), generation_size=2)
+    score, buffer = _score_buffer(
+        _NamedBreakdownEnv(), generation_size=2, worker_context=worker_context
+    )
     score(0, "7")
     score(0, "7")  # generation 1 complete: success 1.0
     score(0, "wrong")
@@ -6696,10 +6874,14 @@ def test_a_generation_that_completes_before_the_previous_step_line_is_not_lost()
 
 
 @pytest.mark.usefixtures("_identity_graded")
-def test_the_queue_of_unnamed_generations_is_bounded():
+def test_the_queue_of_unnamed_generations_is_bounded(
+    worker_context,
+):
     # the queue holds whole generations, each retaining up to _SAMPLE_BUFFER_LIMIT completions. a
     # child that stops printing step lines never drains it, and this process is already memory-tight.
-    score, buffer = _score_buffer(_NamedBreakdownEnv(), generation_size=2)
+    score, buffer = _score_buffer(
+        _NamedBreakdownEnv(), generation_size=2, worker_context=worker_context
+    )
     for _ in range(4 * RewardObservabilityBuffer._SEALED_QUEUE_LIMIT):
         score(0, "7")
 
@@ -6765,11 +6947,13 @@ def test_a_preview_before_the_first_boundary_still_shows_a_rollout():
 
 
 @pytest.mark.usefixtures("_identity_graded")
-def test_a_component_too_large_to_be_a_float_does_not_fail_the_reward_request():
+def test_a_component_too_large_to_be_a_float_does_not_fail_the_reward_request(
+    worker_context,
+):
     """`record` runs OUTSIDE `score_single_turn`'s error guard, so anything it raises 400s the
     reward request and aborts the run. An int larger than a float can hold raises OverflowError,
     which is neither TypeError nor ValueError."""
-    score, buffer = _score_buffer(_OverflowingBreakdownEnv())
+    score, buffer = _score_buffer(_OverflowingBreakdownEnv(), worker_context=worker_context)
 
     assert score(0, "7") == 1.0  # the total graded fine; only the diagnostic component is unusable
     buffer.close_generation(1)
@@ -6787,12 +6971,16 @@ def test_the_published_metric_bound_survives_a_value_too_large_to_be_a_float():
 
 
 @pytest.mark.usefixtures("_identity_graded")
-def test_the_step_line_names_the_generation_the_count_already_sealed():
+def test_the_step_line_names_the_generation_the_count_already_sealed(
+    worker_context,
+):
     """A counted seal publishes under the buffer's OWN ordinal, which is only a guess at what verl
     logged -- it counts from 1 and assumes no skipped or resumed steps. The arriving line carries
     the real number, so dropping the relabel would stamp every sample with a step the run never
     logged, and a reader correlating samples against the loss curve would line them up wrong."""
-    score, buffer = _score_buffer(_NamedBreakdownEnv(), generation_size=2)
+    score, buffer = _score_buffer(
+        _NamedBreakdownEnv(), generation_size=2, worker_context=worker_context
+    )
     score(0, "7")
     score(0, "7")
 
@@ -6805,12 +6993,16 @@ def test_the_step_line_names_the_generation_the_count_already_sealed():
 
 
 @pytest.mark.usefixtures("_identity_graded")
-def test_a_counted_seal_does_not_disarm_the_boundary_for_later_generations():
+def test_a_counted_seal_does_not_disarm_the_boundary_for_later_generations(
+    worker_context,
+):
     """`_sealed_by_count` holds the generations the count sealed, waiting to be named. A step line
     that names one without taking it off the queue turns every later `close_generation` into a
     relabel of the same entry, so from the second generation on the buffer publishes nothing new --
     metrics frozen at generation 1 while the run continues."""
-    score, buffer = _score_buffer(_NamedBreakdownEnv(), generation_size=2)
+    score, buffer = _score_buffer(
+        _NamedBreakdownEnv(), generation_size=2, worker_context=worker_context
+    )
     for _ in range(2):
         score(0, "7")
     buffer.close_generation(1)
@@ -6824,13 +7016,17 @@ def test_a_counted_seal_does_not_disarm_the_boundary_for_later_generations():
 
 
 @pytest.mark.usefixtures("_identity_graded")
-def test_a_generation_short_of_its_count_is_still_sealed_by_the_step_line():
+def test_a_generation_short_of_its_count_is_still_sealed_by_the_step_line(
+    worker_context,
+):
     """The count seals a FULL generation; the step line is what seals a short one. If a named
     generation stays on `_sealed_by_count`, the next `close_generation` relabels it instead of
     sealing what is open -- so a generation that lost a completion (a `_score` that raised before
     reaching the bridge) republishes the PREVIOUS generation's numbers under the new step, and
     carries its samples forward. The run reads as healthy at exactly the step where grading broke."""
-    score, buffer = _score_buffer(_NamedBreakdownEnv(), generation_size=2)
+    score, buffer = _score_buffer(
+        _NamedBreakdownEnv(), generation_size=2, worker_context=worker_context
+    )
     for _ in range(2):
         score(0, "7")
     buffer.close_generation(1)
@@ -6860,12 +7056,14 @@ def test_a_completion_that_failed_scoring_still_counts_toward_the_denominator():
 
 
 @pytest.mark.usefixtures("_identity_graded")
-def test_a_component_whose_values_are_all_unusable_is_reported_as_zero_not_dropped():
+def test_a_component_whose_values_are_all_unusable_is_reported_as_zero_not_dropped(
+    worker_context,
+):
     """Registering a name only once one of its values coerces would delete the component from the
     payload entirely -- and an env whose component is broken for the WHOLE generation is exactly
     when someone needs to see it. A flat 0 reads as "this scored nothing"; absence is
     indistinguishable from "this env has no such component"."""
-    score, buffer = _score_buffer(_UnusableComponentEnv())
+    score, buffer = _score_buffer(_UnusableComponentEnv(), worker_context=worker_context)
     score(0, "7")
     buffer.close_generation(1)
 
@@ -6955,14 +7153,16 @@ def test_the_generation_size_is_the_configured_rollout_count():
 
 
 @pytest.mark.usefixtures("_identity_graded")
-def test_samples_carry_the_step_they_were_generated_at_not_the_current_one():
+def test_samples_carry_the_step_they_were_generated_at_not_the_current_one(
+    worker_context,
+):
     """`generated_at_step` names the generation that PRODUCED the completion.
 
     The buffer is rolling, so a drain that stamps everything in it with the current step
     re-publishes older rollouts as if the model had just produced them -- a reader watching for
     behaviour change sees old text under a new step number.
     """
-    score, buffer = _score_buffer(_NamedBreakdownEnv())
+    score, buffer = _score_buffer(_NamedBreakdownEnv(), worker_context=worker_context)
     score(0, "7")
     buffer.close_generation(4)
 
@@ -6975,11 +7175,13 @@ def test_samples_carry_the_step_they_were_generated_at_not_the_current_one():
 
 
 @pytest.mark.usefixtures("_identity_graded")
-def test_the_drain_clears_pending_breakdowns_and_then_repeats_the_last_reading():
+def test_the_drain_clears_pending_breakdowns_and_then_repeats_the_last_reading(
+    worker_context,
+):
     # the drain CLEARS the pending list. between generations there is nothing new to average, and
     # reporting {} there would blank the metric on every heartbeat that lands mid-generation rather
     # than holding the last real reading.
-    score, buffer = _score_buffer(_NamedBreakdownEnv())
+    score, buffer = _score_buffer(_NamedBreakdownEnv(), worker_context=worker_context)
     score(0, "7")
     buffer.close_generation(1)
 
@@ -7015,7 +7217,9 @@ class _ReleaseHookedLock:
 
 
 @pytest.mark.usefixtures("_identity_graded")
-def test_metrics_and_samples_in_one_payload_describe_the_same_gradings():
+def test_metrics_and_samples_in_one_payload_describe_the_same_gradings(
+    worker_context,
+):
     """The boundary's drain and sample seal must be ONE acquisition, or a payload tears.
 
     A grading landing between them is not lost -- it just belongs to the NEXT generation. What
@@ -7028,6 +7232,7 @@ def test_metrics_and_samples_in_one_payload_describe_the_same_gradings():
         _NamedBreakdownEnv(),
         prompts=["prompt-0", "prompt-1"],  # distinct: both survive the per-prompt dedup
         examples=[{"gt": "7"}, {"gt": "7"}],
+        worker_context=worker_context,
     )
     score(0, "7")  # success 1.0
 
@@ -7917,7 +8122,9 @@ def test_grpo_builds_its_verl_child_env_from_the_allowlist():
     )
 
 
-def test_the_verl_child_allowlist_keeps_the_kernel_choice_but_drops_credentials(tmp_path):
+def test_the_verl_child_allowlist_keeps_the_kernel_choice_but_drops_credentials(
+    worker_context, tmp_path
+):
     """The grpo child still needs the FLA_ kernel backend the parent picked (on sm100 FLA_TILELANG=0
     is a correctness floor, not a preference), so the allowlist must carry it while excluding the
     credentials. This pins both halves of that split for the path grpo now shares with sft/opd."""
@@ -7933,7 +8140,9 @@ def test_the_verl_child_allowlist_keeps_the_kernel_choice_but_drops_credentials(
     try:
         os.environ.update(keep)
         os.environ.update(drop)
-        child = _build_verl_child_env(shim_dir=str(tmp_path), wandb_enabled=False)
+        child = _build_verl_child_env(
+            shim_dir=str(tmp_path), wandb_enabled=False, context=worker_context
+        )
     finally:
         for key, value in saved.items():
             if value is None:
@@ -7946,7 +8155,9 @@ def test_the_verl_child_allowlist_keeps_the_kernel_choice_but_drops_credentials(
         assert key not in child
 
 
-def test_grpo_final_driver_env_scrubs_declared_prefixed_secrets_before_ray(monkeypatch, tmp_path):
+def test_grpo_final_driver_env_scrubs_declared_prefixed_secrets_before_ray(
+    worker_context, monkeypatch, tmp_path
+):
     from flash._internal.diagnostics import SECRET_ENV_KEYS_ENV
 
     declared = (
@@ -7968,7 +8179,7 @@ def test_grpo_final_driver_env_scrubs_declared_prefixed_secrets_before_ray(monke
         "plugin_config_path": str(tmp_path / "plugin-config.json"),
     }
     child = rl_runner._build_rl_child_env(
-        {"multi_turn": False}, files, ["wandb"], "http://127.0.0.1:9/"
+        {"multi_turn": False}, files, ["wandb"], "http://127.0.0.1:9/", context=worker_context
     )
 
     for name in declared:
@@ -8028,6 +8239,7 @@ def test_grpo_final_driver_env_scrubs_declared_prefixed_secrets_before_ray(monke
             state=rl_runner._StepMetricState(),
             reward_runtime=reward_runtime,
             _reward_observability=dict,
+            context=worker_context,
         )
         == 0
     )
@@ -8227,7 +8439,9 @@ def test_validate_rl_child_classifies_the_shim_exit_code_as_permanent():
     assert "FLASH_VERL_PYTHON" in str(err.value)
 
 
-def test_the_fp8_kv_probe_reads_the_child_capability_probe_not_parent_cuda(monkeypatch):
+def test_the_fp8_kv_probe_reads_the_child_capability_probe_not_parent_cuda(
+    worker_context, monkeypatch
+):
     """backend_common.fused_ce_backend's rule applies here too: opening cuda in this long-lived
     parent retains a context on the devices the verl child is about to own. a stub torch whose
     cuda attribute explodes stands in for 'somebody reintroduced the live probe'."""
@@ -8249,7 +8463,7 @@ def test_the_fp8_kv_probe_reads_the_child_capability_probe_not_parent_cuda(monke
         ({"capability": None}, False),
         ({}, False),
     ):
-        settings = rl_runner._resolve_training_settings(inp, caps)
+        settings = rl_runner._resolve_training_settings(inp, caps, context=worker_context)
         assert settings[0] == 4
         assert settings[-1] is cc_ok, caps
 
@@ -8552,7 +8766,9 @@ def test_a_failed_score_does_not_inflate_the_turn_accounting():
     assert accounting["mean_turns_per_episode"] is None
 
 
-def test_turn_accounting_reaches_the_durable_notes_not_only_the_heartbeat():
+def test_turn_accounting_reaches_the_durable_notes_not_only_the_heartbeat(
+    worker_context,
+):
     """The counters have to land in `metrics.json` notes, which is what a terminal proof reads.
 
     The heartbeat's `metrics_last` row is a live view that a completed run's artifact bundle does
@@ -8570,20 +8786,22 @@ def test_turn_accounting_reaches_the_durable_notes_not_only_the_heartbeat():
         "mean_turns_per_episode": 4.5703125,
     }
     notes = rl_verl._build_verl_train_notes(
-        _notes_inp(), **_notes_common(), multi_turn_accounting=accounting
+        _notes_inp(), **_notes_common(), multi_turn_accounting=accounting, context=worker_context
     )
     assert notes["multi_turn_accounting"] == accounting
     # a copy, so a later bridge update cannot retroactively rewrite a published record.
     assert notes["multi_turn_accounting"] is not accounting
 
 
-def test_single_turn_run_records_multi_turn_accounting_as_an_explicit_none():
+def test_single_turn_run_records_multi_turn_accounting_as_an_explicit_none(
+    worker_context,
+):
     """Single-turn runs must record the key, so absence stays distinguishable from omission.
 
     A terminal gate cannot tell "this run had no episode loop" from "the counters were never
     wired" if the key is simply missing, and the second case is the one that hides a collapse.
     """
-    notes = rl_verl._build_verl_train_notes(_notes_inp(), **_notes_common())
+    notes = rl_verl._build_verl_train_notes(_notes_inp(), **_notes_common(), context=worker_context)
     assert "multi_turn_accounting" in notes
     assert notes["multi_turn_accounting"] is None
 
@@ -8598,7 +8816,9 @@ def _verl_step_line(step: int, *, adv_min: float, adv_max: float, grad_norm: flo
     )
 
 
-def test_resumed_grpo_ignores_the_replayed_resume_step_bounds():
+def test_resumed_grpo_ignores_the_replayed_resume_step_bounds(
+    worker_context,
+):
     """A resumed child replays its resume step; those bounds belong to the previous attempt.
 
     `child_io.append_step_metrics` documents the replay, and `_finalize_advantage_evidence`
@@ -8617,6 +8837,7 @@ def test_resumed_grpo_ignores_the_replayed_resume_step_bounds():
         _notes_inp(),
         state,
         observability,
+        context=worker_context,
     )
     assert 2 not in state.advantage_bounds
     assert 2 not in state.grad_norms
@@ -8627,6 +8848,7 @@ def test_resumed_grpo_ignores_the_replayed_resume_step_bounds():
         _notes_inp(),
         state,
         observability,
+        context=worker_context,
     )
     assert sorted(state.advantage_bounds) == [3]
     assert state.grad_norms == {3: 1.0}

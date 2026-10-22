@@ -259,14 +259,14 @@ def test_github_download_wrapper_uses_default_repo(monkeypatch):
 
 
 def test_deployment_state_and_public_deployment():
-    original = {"a": 1, "state": "queued"}
+    original = {"a": 1, "state": "deploying"}
     out = deployment_state.with_deployment_state(original, "ready", detail="done")
     assert out["state"] == "ready"
     assert out["detail"] == "done"
     assert out["a"] == 1
     assert isinstance(out["updated_at"], float)
     # The input is not mutated in place.
-    assert original == {"a": 1, "state": "queued"}
+    assert original == {"a": 1, "state": "deploying"}
 
     pub = deployment_state._public_deployment(
         {
@@ -293,17 +293,16 @@ def test_deployment_attempt_is_stale_branches():
     # Not in a busy state -> never stale.
     assert serving._deployment_attempt_is_stale({"state": "ready"}) is False
     # Busy with no timestamp -> treated as stale.
-    assert serving._deployment_attempt_is_stale({"state": "queued"}) is True
+    assert serving._deployment_attempt_is_stale({"state": "deploying"}) is True
     # Busy with an unparseable timestamp -> stale.
     assert (
-        serving._deployment_attempt_is_stale({"state": "smoke_testing", "updated_at": "nope"})
-        is True
+        serving._deployment_attempt_is_stale({"state": "deploying", "updated_at": "nope"}) is True
     )
     # Busy but recently updated (via injected `now`) -> not stale.
-    fresh = {"state": "reconciling", "updated_at": 1000.0}
+    fresh = {"state": "deploying", "updated_at": 1000.0}
     assert serving._deployment_attempt_is_stale(fresh, now=1000.0 + 10) is False
     # Busy and older than the stale window -> stale.
-    old = {"state": "queued", "requested_at": 1000.0}
+    old = {"state": "deploying", "requested_at": 1000.0}
     assert (
         serving._deployment_attempt_is_stale(old, now=1000.0 + serving._DEPLOYMENT_STALE_SECONDS)
         is True
@@ -528,18 +527,18 @@ def test_recover_deployments_selects_busy_and_skips_missing(monkeypatch):
     statuses = {
         # busy with no timestamp
         "r-stale": types.SimpleNamespace(
-            run_id="r-stale", state="done", deployments=records("r-stale", {"state": "queued"})
+            run_id="r-stale", state="done", deployments=records("r-stale", {"state": "deploying"})
         ),
         # busy and freshly updated
         "r-fresh": types.SimpleNamespace(
             run_id="r-fresh",
             state="done",
-            deployments=records("r-fresh", {"state": "queued", "updated_at": time.time()}),
+            deployments=records("r-fresh", {"state": "deploying", "updated_at": time.time()}),
         ),
         "r-held": types.SimpleNamespace(
             run_id="r-held",
             state="done",
-            deployments=records("r-held", {"state": "reconciling", "updated_at": time.time()}),
+            deployments=records("r-held", {"state": "deploying", "updated_at": time.time()}),
         ),
     }
 
@@ -631,20 +630,20 @@ def test_recover_deployments_retires_a_ready_deployment_this_build_cannot_serve(
     marked: list[tuple[str, dict]] = []
 
     def mark_failed(run_id, error, checkpoint_id):
-        failed = {"state": "cleanup_pending", "checkpoint_id": checkpoint_id, "error": error}
+        failed = {"state": "undeploying", "checkpoint_id": checkpoint_id, "error": error}
         marked.append((run_id, failed))
         return types.SimpleNamespace(
             run_id=run_id, state="done", deployments=records(run_id, failed)
         )
 
     monkeypatch.setenv("FLASH_DEPLOY_SYNC", "1")
-    monkeypatch.setattr(runner_transitions, "mark_deployment_cleanup_pending", mark_failed)
+    monkeypatch.setattr(runner_transitions, "mark_deployment_undeploying", mark_failed)
     monkeypatch.setattr(runner_reporting, "_report_status", lambda status: None)
 
     assert serving_completion.recover_deployments() == 1
     assert [run_id for run_id, _failed in marked] == ["r-retired"]
     for _run_id, failed in marked:
-        assert failed["state"] == "cleanup_pending"
+        assert failed["state"] == "undeploying"
         # the reason names the actual cause, not the restart the busy branch reports.
         assert "no longer supported" in failed["error"]
 
@@ -661,7 +660,7 @@ def test_recovery_removes_only_unfinished_checkpoint_and_reports_inventory(monke
         {
             "checkpoint_id": "r-stale/step-20",
             "checkpoint_step": 20,
-            "state": "queued",
+            "state": "deploying",
             "registration_identity": {},
             "generation": 1,
             "requested_at": 1.0,

@@ -53,12 +53,37 @@ def _run_status_from_json(d: dict) -> RunStatus:
     # tolerant load: drop unknown keys before constructing runstatus. source_snapshot is different:
     # malformed persisted identity must fail closed rather than be treated as a legacy absence.
     values = {k: v for k, v in d.items() if k in RunStatus.__dataclass_fields__}
+    # older runs retained the same billing identity under the reconciliation-era field name.
+    if "billing_remote" not in d and d.get("realized_cost_remote") is not None:
+        values["billing_remote"] = d["realized_cost_remote"]
     if d.get("source_snapshot") is not None:
         from flash.snapshot.archive import parse_descriptor
 
         values["source_snapshot"] = parse_descriptor(d["source_snapshot"]).to_dict()
     from flash.runner.results.deployments import validate_deployments
 
+    # Upgrade persisted pre-cutover records without losing cleanup obligations.
+    previous_states = {
+        "queued": "deploying",
+        "smoke_testing": "deploying",
+        "reconciling": "deploying",
+        "cleanup_pending": "undeploying",
+        "revocation_failed": "undeploying",
+    }
+    records = values.get("deployments", {})
+    if isinstance(records, dict):
+        records = {
+            key: dict(record) if isinstance(record, dict) else record
+            for key, record in records.items()
+        }
+        values["deployments"] = records
+        for record in records.values():
+            if not isinstance(record, dict):
+                continue
+            if record.get("state") == "smoke_testing":
+                record.setdefault("verification_started_at", record.get("updated_at") or 1)
+            if record.get("state") in previous_states:
+                record["state"] = previous_states[record["state"]]
     values["deployments"] = validate_deployments(values["run_id"], values.get("deployments", {}))
     return RunStatus(**values)
 
@@ -224,6 +249,8 @@ def reallocation_spec_from_status(status: RunStatus, *, verify_source: bool = Fa
     failed, so a run authored for up to 4 cards can never again be offered a 4-card shape. gpu.count
     is a CEILING, so restoring it re-widens the search rather than forcing a size.
     """
+    if status.requires_runtime_secrets:
+        raise ValueError("recovery cannot restore request runtime secrets; resubmit the run")
     worker_spec = effective_spec_from_status(status, verify_source=verify_source)
     public_gpu = JobSpec.from_dict(status.spec).gpu
     # `gpu_count_auto` needs no restoring here: it is provenance, so the worker half carries it

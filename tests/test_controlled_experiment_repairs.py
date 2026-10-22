@@ -289,26 +289,28 @@ def test_prefetch_error_classification():
     assert not _prefetch_error_is_retriable(ValueError("bug"))
 
 
-def test_prefetch_pinned_revision_does_not_swallow_download_failure(monkeypatch):
+def test_prefetch_pinned_revision_does_not_swallow_download_failure(worker_context, monkeypatch):
     import flash.engine.worker.io.heartbeat as worker_heartbeat
     import flash.engine.worker.io.hf as worker_hf
     import flash.engine.worker.io.prefetch as worker_prefetch
     import flash.engine.worker.perf as worker_perf
 
     monkeypatch.setattr(worker_prefetch, "_shared_weight_cache_dir", lambda: None)
-    monkeypatch.setattr(worker_hf, "_require_hf_deadline_allowance", lambda: None)
+    monkeypatch.setattr(
+        worker_hf, "_require_hf_deadline_allowance", lambda context=None, **_context: None
+    )
     monkeypatch.setattr(worker_perf, "gpu_diagnostics", dict)
-    monkeypatch.setattr(worker_heartbeat, "heartbeat", lambda *args, **kwargs: None)
+    monkeypatch.setattr(worker_heartbeat, "heartbeat", lambda *args, context=None, **kwargs: None)
     monkeypatch.setattr(
         "huggingface_hub.snapshot_download",
         lambda **kwargs: (_ for _ in ()).throw(ValueError("revision not found")),
     )
 
     with pytest.raises(ValueError, match="revision not found"):
-        worker_prefetch.prefetch_model("owner/model", revision="f" * 40)
+        worker_prefetch.prefetch_model("owner/model", revision="f" * 40, context=worker_context)
 
 
-def test_prefetch_pinned_revision_wraps_transient_download_failure(monkeypatch):
+def test_prefetch_pinned_revision_wraps_transient_download_failure(worker_context, monkeypatch):
     from requests.exceptions import Timeout
 
     import flash.engine.worker.io.heartbeat as worker_heartbeat
@@ -319,16 +321,18 @@ def test_prefetch_pinned_revision_wraps_transient_download_failure(monkeypatch):
 
     transient = Timeout("timed out")
     monkeypatch.setattr(worker_prefetch, "_shared_weight_cache_dir", lambda: None)
-    monkeypatch.setattr(worker_hf, "_require_hf_deadline_allowance", lambda: None)
+    monkeypatch.setattr(
+        worker_hf, "_require_hf_deadline_allowance", lambda context=None, **_context: None
+    )
     monkeypatch.setattr(worker_perf, "gpu_diagnostics", dict)
-    monkeypatch.setattr(worker_heartbeat, "heartbeat", lambda *args, **kwargs: None)
+    monkeypatch.setattr(worker_heartbeat, "heartbeat", lambda *args, context=None, **kwargs: None)
     monkeypatch.setattr(
         "huggingface_hub.snapshot_download",
         lambda **kwargs: (_ for _ in ()).throw(transient),
     )
 
     with pytest.raises(RetriableInfraError, match="pinned model prefetch failed") as exc_info:
-        worker_prefetch.prefetch_model("owner/model", revision="f" * 40)
+        worker_prefetch.prefetch_model("owner/model", revision="f" * 40, context=worker_context)
 
     assert exc_info.value.__cause__ is transient
 

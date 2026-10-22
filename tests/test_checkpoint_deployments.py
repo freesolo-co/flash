@@ -20,7 +20,7 @@ def queued(run, step, generation=1):
     return {
         "checkpoint_id": f"{run}/step-{step}",
         "checkpoint_step": step,
-        "state": "queued",
+        "state": "deploying",
         "generation": generation,
         "requested_at": float(generation),
     }
@@ -65,9 +65,7 @@ def test_late_completion_cannot_restore_revoked_checkpoint(run, action):
     if action == "undeploy":
         fenced = transitions.mark_undeployed(run, attempt["checkpoint_id"])
     else:
-        fenced = transitions.mark_deployment_cleanup_pending(
-            run, "pending", attempt["checkpoint_id"]
-        )
+        fenced = transitions.mark_deployment_undeploying(run, "pending", attempt["checkpoint_id"])
     late = {
         **attempt,
         "state": "ready",
@@ -138,7 +136,7 @@ def test_ready_without_serving_generation_cannot_be_committed(run, serving_gener
         ready_record["deployment_generation"] = serving_generation
     with pytest.raises(ValueError, match="verification"):
         transitions.mark_checkpoint_deployed(run, ready_record)
-    assert status.get_status(run).deployments[attempt["checkpoint_id"]]["state"] == "queued"
+    assert status.get_status(run).deployments[attempt["checkpoint_id"]]["state"] == "deploying"
 
 
 @pytest.mark.parametrize("initial_state", ["deployed", "training"])
@@ -164,3 +162,38 @@ def test_failed_legacy_reverification_reconciles_parent_state(
     assert (
         any(is_ready(run, record) for record in result.deployments.values()) == with_ready_sibling
     )
+
+
+@pytest.mark.parametrize(
+    ("previous", "expected"),
+    [
+        ("queued", "deploying"),
+        ("smoke_testing", "deploying"),
+        ("reconciling", "deploying"),
+        ("cleanup_pending", "undeploying"),
+        ("revocation_failed", "undeploying"),
+    ],
+)
+def test_persisted_state_upgrade_retains_errors_and_fences(run, previous, expected):
+    record = {**queued(run, 20, generation=7), "state": previous, "error": "original failure"}
+    state._save_status(
+        state.RunStatus(
+            run_id=run, state="done", spec={}, deployments={record["checkpoint_id"]: record}
+        )
+    )
+    loaded = status.get_status(run).deployments[record["checkpoint_id"]]
+    assert loaded["state"] == expected
+    assert loaded["generation"] == 7
+    assert loaded["error"] == "original failure"
+    assert not is_ready(run, loaded)
+    if previous == "smoke_testing":
+        assert loaded["verification_started_at"]
+
+
+@pytest.mark.parametrize(
+    "invalid",
+    ["queued", "smoke_testing", "reconciling", "cleanup_pending", "revocation_failed", "unknown"],
+)
+def test_new_transitions_reject_removed_states(run, invalid):
+    with pytest.raises(ValueError, match="invalid checkpoint deployment state"):
+        transitions.mark_deployment_pending(run, {**queued(run, 20), "state": invalid})

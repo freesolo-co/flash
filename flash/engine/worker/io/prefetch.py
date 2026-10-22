@@ -18,6 +18,7 @@ import time
 from flash._internal.diagnostics import sanitize_diagnostic
 from flash.engine.support.huggingface import hub_error_transience, model_revision_kwargs
 from flash.engine.worker.perf import RetriableInfraError
+from flash.engine.worker.runtime.state import WorkerContext
 from flash.envs.loading.loader import is_commit_sha
 
 
@@ -194,7 +195,7 @@ def _snapshot_has_weights(snapshot_dir: str) -> bool:
     return False
 
 
-def prefetch_model(model_id: str, revision: str = "") -> float:
+def prefetch_model(model_id: str, revision: str = "", *, context: WorkerContext) -> float:
     """Pull base-model weights into the HF cache up front; return seconds spent.
 
     When the shared weight-cache volume is attached, downloads onto the mount and symlinks into
@@ -208,11 +209,11 @@ def prefetch_model(model_id: str, revision: str = "") -> float:
     from flash.engine.worker.io.heartbeat import liveness_heartbeat
 
     with liveness_heartbeat(
-        "model_prefetching", progress=lambda: _hf_cache_bytes(model_id, shared_hub)
+        "model_prefetching", progress=lambda: _hf_cache_bytes(model_id, shared_hub), context=context
     ):
 
         def _download() -> None:
-            _hf()._require_hf_deadline_allowance()
+            _hf()._require_hf_deadline_allowance(context=context)
             local_path = snapshot_download(
                 repo_id=model_id,
                 cache_dir=shared_hub,
@@ -285,5 +286,6 @@ def prefetch_model(model_id: str, revision: str = "") -> float:
         model=model_id,
         download_seconds=secs,
         gpu=gpu_diagnostics(),
+        context=context,
     )
     return secs

@@ -313,8 +313,8 @@ With it set:
   to Freesolo's private hub, which this plane cannot read, so it is rejected with a `400`
   naming the repo instead of failing later on a rented GPU. Use the `github:` form
   ([environments](#environments)).
-- **Backend reporting is off** - billing precheck and charge, realized-cost
-  reconciliation, checkpoint registration, and the hosted artifact GC sweep. Otherwise these would send your operator key to `api.freesolo.co`
+- **Backend reporting is off** - billing precheck and charge, checkpoint registration, and the
+  hosted artifact GC sweep. Otherwise these would send your operator key to `api.freesolo.co`
   (and, for the GC, `serve.freesolo.co`) and log a warning per run or per startup.
 - **Hosted-only CLI commands say so.** `flash projects create` mints a uuid locally instead
   of calling the org directory; `flash projects list` and `flash traces export` have no local

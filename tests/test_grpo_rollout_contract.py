@@ -373,11 +373,13 @@ def test_grpo_worker_env_reasserts_managed_native_thread_policy(monkeypatch):
     assert not (secret_names & set(GRPO_NATIVE_THREAD_ENV))
 
 
-def test_grpo_child_env_reasserts_native_thread_policy_last(monkeypatch):
+def test_grpo_child_env_reasserts_native_thread_policy_last(worker_context, monkeypatch):
     from flash.core.grpo import GRPO_NATIVE_THREAD_ENV
 
     hostile = dict.fromkeys(GRPO_NATIVE_THREAD_ENV, "999")
-    monkeypatch.setattr(rl_train_runner, "_build_verl_child_env", lambda **_kwargs: dict(hostile))
+    monkeypatch.setattr(
+        rl_train_runner, "_build_verl_child_env", lambda context=None, **_kwargs: dict(hostile)
+    )
     env = rl_train_runner._build_rl_child_env(
         {"multi_turn": False},
         {
@@ -387,6 +389,7 @@ def test_grpo_child_env_reasserts_native_thread_policy_last(monkeypatch):
         },
         [],
         "http://127.0.0.1:1",
+        context=worker_context,
     )
     assert {key: env[key] for key in GRPO_NATIVE_THREAD_ENV} == dict(GRPO_NATIVE_THREAD_ENV)
 
@@ -421,7 +424,7 @@ def test_training_guide_describes_authored_admission_and_retained_execution_clam
     ],
 )
 def test_persisted_legacy_shapes_reach_worker_option_resolution(
-    monkeypatch, prompts_per_step, group_size
+    worker_context, monkeypatch, prompts_per_step, group_size
 ):
     from flash.engine.worker.train.rl.launch import inputs
 
@@ -431,10 +434,10 @@ def test_persisted_legacy_shapes_reach_worker_option_resolution(
     monkeypatch.setattr(
         inputs._worker_config,
         "grpo_overrides",
-        lambda: {"group_size": spec.train.group_size},
+        lambda context=None, **_context: {"group_size": spec.train.group_size},
     )
 
-    options = inputs._resolve_grpo_options(spec.train, RECIPE.rl, False)
+    options = inputs._resolve_grpo_options(spec.train, RECIPE.rl, False, context=worker_context)
 
     assert (options["prompts_per_step"], options["group_size"]) == (
         prompts_per_step,
@@ -443,16 +446,18 @@ def test_persisted_legacy_shapes_reach_worker_option_resolution(
 
 
 @pytest.mark.parametrize("group_size", SUPPORTED_GRPO_GROUP_SIZES)
-def test_supported_shapes_reach_worker_option_resolution_exactly(monkeypatch, group_size):
+def test_supported_shapes_reach_worker_option_resolution_exactly(
+    worker_context, monkeypatch, group_size
+):
     from flash.engine.worker.train.rl.launch import inputs
 
     spec = spec_from_dict(_public_grpo_train(prompts_per_step=4, group_size=group_size))
     monkeypatch.setattr(
         inputs._worker_config,
         "grpo_overrides",
-        lambda: {"group_size": spec.train.group_size},
+        lambda context=None, **_context: {"group_size": spec.train.group_size},
     )
 
-    options = inputs._resolve_grpo_options(spec.train, RECIPE.rl, False)
+    options = inputs._resolve_grpo_options(spec.train, RECIPE.rl, False, context=worker_context)
 
     assert (options["prompts_per_step"], options["group_size"]) == (4, group_size)

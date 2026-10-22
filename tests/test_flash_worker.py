@@ -237,7 +237,9 @@ def test_build_worker_env_forwards_declared_environment_runtime_secrets():
     assert "UNDECLARED_API_KEY" not in env
 
 
-def test_build_worker_env_lists_declared_secret_names_for_the_redactors(monkeypatch, tmp_path):
+def test_build_worker_env_lists_declared_secret_names_for_the_redactors(
+    worker_context, monkeypatch, tmp_path
+):
     """the producer's exact applied-name metadata is also the verl child scrub contract."""
     from flash._internal.diagnostics import SECRET_ENV_KEYS_ENV
     from flash.core.spec import EnvironmentSpec, JobSpec, TrainSpec
@@ -274,7 +276,9 @@ def test_build_worker_env_lists_declared_secret_names_for_the_redactors(monkeypa
     monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "0,1")
     monkeypatch.setenv("FLA_TILELANG", "0")
     monkeypatch.setenv("WANDB_MODE", "offline")
-    child = _build_verl_child_env(shim_dir=str(tmp_path), wandb_enabled=True)
+    child = _build_verl_child_env(
+        shim_dir=str(tmp_path), wandb_enabled=True, context=worker_context
+    )
 
     for name in declared:
         if name != "PYTHONPATH":
@@ -628,11 +632,13 @@ def test_sft_train_keeps_the_optimizations_that_survived_the_trl_deletion():
     import inspect
 
     from flash.engine.profiling import sft_image_rows, sft_workload
-    from flash.engine.worker.entry import sft
+    from flash.engine.worker.entry import worker
     from flash.engine.worker.train.entry import sft_train
 
-    # run_sft is now a pure delegation: no backend selector, no trainer of its own.
-    assert "run_sft_train()" in inspect.getsource(sft.run_sft)
+    # Dispatch goes straight to the trainer; preparation has no worker entrypoint dependency.
+    assert "partial(sft_entry.run_sft_train, context=context)" in inspect.getsource(
+        worker._run_worker_mode
+    )
 
     workload_src = inspect.getsource(sft_workload)
     image_rows_src = inspect.getsource(sft_image_rows)

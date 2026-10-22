@@ -48,7 +48,7 @@ def test_checkpoint_completion_rejects_newer_attempt(tmp_path, monkeypatch):
     run_id = "flash-checkpoint-stale"
     previous = _ready_checkpoint(run_id, 40)
     runner_transitions.mark_undeployed(run_id, previous["checkpoint_id"])
-    newer = {**previous, "state": "queued", "generation": 3, "requested_at": 200.0}
+    newer = {**previous, "state": "deploying", "generation": 3, "requested_at": 200.0}
     runner_transitions.mark_deployment_pending(run_id, newer)
     out = runner_transitions.mark_checkpoint_deployed(run_id, previous)
     assert out.deployments[previous["checkpoint_id"]] == newer
@@ -134,7 +134,7 @@ def test_cancel_backend_success_local_commit_failure_is_not_backend_uncertainty(
     assert backend_calls == [f"{run_id}/final"]
     failed = runner_status.get_status(run_id)
     assert failed.state == "cancelled"
-    assert only_deployment(failed)["state"] == "cleanup_pending"
+    assert only_deployment(failed)["state"] == "undeploying"
     assert deployment_fixtures.ready_checkpoints(run_id) == frozenset()
 
 
@@ -230,7 +230,7 @@ def test_cancel_double_undeploy_failure_revokes_authority_and_is_retryable(tmp_p
     assert attempts == [revision]
     failed = runner_status.get_status(run_id)
     assert failed.state == "cancelled"
-    assert only_deployment(failed)["state"] == "cleanup_pending"
+    assert only_deployment(failed)["state"] == "undeploying"
     assert only_deployment(failed)["retryable"] is True
     assert deployment_fixtures.ready_checkpoints(run_id) == frozenset()
 
@@ -262,7 +262,7 @@ def test_cancel_preserves_ready_siblings_and_retries_each_unfinished_checkpoint(
             {
                 "checkpoint_id": f"{run_id}/step-{step}",
                 "checkpoint_step": step,
-                "state": "queued",
+                "state": "deploying",
                 "generation": 1,
                 "requested_at": 1.0,
             },
@@ -280,6 +280,6 @@ def test_cancel_preserves_ready_siblings_and_retries_each_unfinished_checkpoint(
         runner_deploy.cancel_run(run_id)
     saved = runner_status.get_status(run_id)
     assert saved.deployments[ready["checkpoint_id"]] == ready
-    assert saved.deployments[f"{run_id}/step-40"]["state"] == "cleanup_pending"
+    assert saved.deployments[f"{run_id}/step-40"]["state"] == "undeploying"
     assert saved.deployments[f"{run_id}/step-60"]["state"] == "undeployed"
     assert set(attempts) == {f"{run_id}/step-40", f"{run_id}/step-60"}

@@ -21,7 +21,7 @@ def test_unreadable_run_does_not_starve_later_cleanup(
     run_id = _make_run(api, _new_user_token(), "done")
     target = f"{run_id}/final"
     seed_ready_checkpoint(run_id, target)
-    transitions.mark_deployment_cleanup_pending(run_id, "interrupted", target)
+    transitions.mark_deployment_undeploying(run_id, "interrupted", target)
     original_get = status.get_status
 
     def read_status(name):

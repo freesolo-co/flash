@@ -14,7 +14,7 @@ import time
 import tracemalloc
 import types
 from copy import deepcopy
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import ClassVar
 
 import pytest
@@ -2256,7 +2256,7 @@ def test_non_thinking_run_scores_the_completion_unchanged(monkeypatch):
     assert sdk_env.scored == [_THINK_COMPLETION]
 
 
-def test_worker_marks_the_env_thinking_from_the_job_spec(monkeypatch):
+def test_worker_marks_the_env_thinking_from_the_job_spec(worker_context, monkeypatch):
     """The worker is what knows whether the run samples <think>; it must tell the env."""
     from flash.core.spec import JobSpec
 
@@ -2271,12 +2271,12 @@ def test_worker_marks_the_env_thinking_from_the_job_spec(monkeypatch):
             "environment": {"id": "org/env"},
         }
     )
-    monkeypatch.setattr(worker_state, "JOB_SPEC", spec)
+    monkeypatch.setattr(worker_context, "config", replace(worker_context.config, spec=spec))
     monkeypatch.setattr(
         worker_state, "load_staged_freesolo_environment", lambda *a, **k: (_Env(), None)
     )
 
-    assert worker_state._load_active_env().thinking is True
+    assert worker_context.require_active_env().thinking is True
 
 
 def _thinking_env(monkeypatch, sdk_env, *, prompt_opens_thinking: bool):
@@ -2290,7 +2290,9 @@ def _thinking_env(monkeypatch, sdk_env, *, prompt_opens_thinking: bool):
     return env
 
 
-def test_opd_prepared_thinking_completion_steps_raw_and_grades_answer_only(monkeypatch):
+def test_opd_prepared_thinking_completion_steps_raw_and_grades_answer_only(
+    worker_context, monkeypatch
+):
     from flash.engine.worker.train.opd.orchestration import prompt_preparation
     from flash.engine.worker.train.opd.orchestration.state import _OpdRequest
 
@@ -2325,7 +2327,7 @@ def test_opd_prepared_thinking_completion_steps_raw_and_grades_answer_only(monke
 
     env = FreesoloEnvironment(sdk_env, "owner/env", source=None, contract_text="")
     tokenizer = _Tokenizer()
-    monkeypatch.setattr(prompt_preparation._worker_state, "THINKING", True)
+    monkeypatch.setattr(worker_context, "config", replace(worker_context.config, thinking=True))
     monkeypatch.setattr(
         prompt_preparation._worker_hf,
         "load_tokenizer",
@@ -2334,7 +2336,7 @@ def test_opd_prepared_thinking_completion_steps_raw_and_grades_answer_only(monke
     monkeypatch.setattr(
         prompt_preparation,
         "_thinking_prefill_text",
-        lambda _tokenizer: "<think>\n",
+        lambda _tokenizer, context=None, **_context: "<think>\n",
     )
     monkeypatch.setattr(
         prompt_preparation._backend,
@@ -2354,7 +2356,7 @@ def test_opd_prepared_thinking_completion_steps_raw_and_grades_answer_only(monke
     monkeypatch.setattr(
         prompt_preparation,
         "liveness_heartbeat",
-        lambda *_args, **_kwargs: contextlib.nullcontext(),
+        lambda *_args, context=None, **_kwargs: contextlib.nullcontext(),
     )
     import flash.engine.worker.teacher.client as teacher_client
 
@@ -2383,6 +2385,7 @@ def test_opd_prepared_thinking_completion_steps_raw_and_grades_answer_only(monke
         False,
         "capability",
         "https://control.invalid",
+        context=worker_context,
     )
 
     example = {"id": "a", "input": "2+2?", "output": "4"}
