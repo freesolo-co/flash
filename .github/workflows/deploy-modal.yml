@@ -90,6 +90,7 @@ jobs:
         working-directory: .
         env:
           EVENT: ${{ github.event_name }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
           CURRENT_SHA: ${{ github.sha }}
           DEPLOYED_HEALTH_URL: https://serve.freesolo.co/healthz
         run: |
@@ -127,7 +128,10 @@ jobs:
           # says so out loud rather than reporting a restore it never performed.
           echo "previous_sha=$last_deployed_sha" >> "$GITHUB_OUTPUT"
 
-          if [ "$EVENT" = "workflow_dispatch" ]; then
+          # a failed promotion can leave this sha live when rollback is incompatible with the
+          # database. retrying must run the deployment and canary again: an empty source diff
+          # proves only that the router booted, not that generation and accounting passed.
+          if [ "$EVENT" = "workflow_dispatch" ] || [ "${RUN_ATTEMPT:-1}" -gt 1 ]; then
             deploy=true
           elif [ "$read_ok" != "true" ]; then
             # a missing deployment or any health, network, or parsing failure must deploy safely.
