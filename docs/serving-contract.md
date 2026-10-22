@@ -78,9 +78,10 @@ The packaged, hosted, and managed OpenAI entry points retain the shared strict s
 - `logprobs` is a strict boolean and `top_logprobs` is an integer from 0 through 20.
 - thinking-enabled adapters reject logprobs.
 
-Function tools are implemented and offline-validated only for the exact qualified Qwen3.5 packaged
-and hosted profile. This path is not live-qualified pending exact model testing. The parser identity
-is `qwen3_coder`; Qwen3.6 and unqualified engines reject tools after authorization and checkpoint
+Function tools are implemented only for the exact qualified Qwen3.5 packaged and hosted profile.
+The [October 21 E2E audit](e2e-qualification-2026-10-21.md) live-tested the packaged 9B FP8
+profile, including generated calls, streaming, and tool-result replay with a trained adapter over
+HTTPS. Hosted ingress remains offline-validated. The parser identity is `qwen3_coder`; Qwen3.6 and unqualified engines reject tools after authorization and checkpoint
 resolution, before generation. Declarations must be closed function objects with unique nonempty
 names. Parameters use a bounded root-object JSON Schema profile with `properties`, `required`,
 `additionalProperties: false`, recursive scalar, object, and array types, descriptions, enums, and
