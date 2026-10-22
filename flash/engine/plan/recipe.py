@@ -25,7 +25,7 @@ class TeacherModel:
     supports_images: bool = False
 
 
-DEFAULT_TEACHER_ALIAS = "glm-5.2"
+DEFAULT_TEACHER_ALIAS = "glm-5.3"
 
 TEACHER_MODELS: dict[str, TeacherModel] = {
     "kimi-k3": TeacherModel(
@@ -47,13 +47,13 @@ TEACHER_MODELS: dict[str, TeacherModel] = {
             ),
         ),
     ),
-    "glm-5.2": TeacherModel(
-        alias="glm-5.2",
-        model_id="parasail-glm-52",
-        display_name="GLM 5.2",
+    "glm-5.3": TeacherModel(
+        alias="glm-5.3",
+        model_id="parasail-glm-53",
+        display_name="GLM 5.3",
         usd_per_1m=(1.40, 4.40),
-        tokenizer_repo="nvidia/GLM-5.2-NVFP4",
-        tokenizer_revision="aec724e8c7b8ee9db3b48c01c320f63f9cdaf8aa",
+        tokenizer_repo="zai-org/GLM-5.3",
+        tokenizer_revision="ba32f8c19c8738e2c57c71798c601d477a7bf844",
         tokenizer_kind="tokenizer_json",
         tokenizer_files=(
             (
@@ -62,20 +62,37 @@ TEACHER_MODELS: dict[str, TeacherModel] = {
             ),
         ),
     ),
-    "deepseek-v4-pro": TeacherModel(
-        alias="deepseek-v4-pro",
-        model_id="parasail-deepseek-v4-pro",
-        display_name="DeepSeek V4 Pro",
-        usd_per_1m=(1.74, 3.48),
-        tokenizer_repo="deepseek-ai/DeepSeek-V4-Pro",
-        tokenizer_revision="b5968e9190ef611bbf34a7229255be88a0e937c1",
+    # native vision uses different markers; only text scoring is qualified for this route.
+    "deepseek-v4.1-flash-1017": TeacherModel(
+        alias="deepseek-v4.1-flash-1017",
+        model_id="parasail-deepseek-v41-flash-1017",
+        display_name="DeepSeek V4.1 Flash 1017",
+        usd_per_1m=(0.30, 1.20),
+        tokenizer_repo="deepseek-ai/DeepSeek-V4.1-Flash-1017",
+        tokenizer_revision="1bae0e1088993b9b82de08f59de5be5a34e42170",
         tokenizer_kind="tokenizer_json",
         tokenizer_files=(
             (
                 "tokenizer.json",
-                "8f9f37ca37fdc4f5fd36d5cf4d3b0e8392edb4e894fd10cc0d70b4957c8633cf",
+                "c90dfa01249db1be4245780a052ede752e1361c612ac6d08e2bdada7d599476b",
             ),
         ),
+    ),
+    "qwen3.8-27b": TeacherModel(
+        alias="qwen3.8-27b",
+        model_id="parasail-qwen38-27b",
+        display_name="Qwen3.8 27B",
+        usd_per_1m=(0.24, 2.20),
+        tokenizer_repo="Qwen/Qwen3.8-27B",
+        tokenizer_revision="1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0",
+        tokenizer_kind="tokenizer_json",
+        tokenizer_files=(
+            (
+                "tokenizer.json",
+                "0997f410c57a1f4e53b09e4be8f4a172d90edd9564368fb0847030937229b9f3",
+            ),
+        ),
+        supports_images=True,
     ),
     "qwen3.5-397b-a17b": TeacherModel(
         alias="qwen3.5-397b-a17b",
@@ -122,7 +139,7 @@ def normalize_teacher_alias(value: str) -> str:
 
 
 def resolve_teacher(value: str | None) -> TeacherModel:
-    """Resolve only a friendly managed alias, defaulting an omitted value to GLM 5.2."""
+    """Resolve only a friendly managed alias, defaulting an omitted value to GLM 5.3."""
     if value is None or not str(value).strip():
         return TEACHER_MODELS[DEFAULT_TEACHER_ALIAS]
     key = normalize_teacher_alias(str(value))

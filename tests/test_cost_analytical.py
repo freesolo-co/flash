@@ -310,7 +310,7 @@ def test_opd_teacher_cost_uses_authoritative_request_multiplier(multi_turn, max_
         seq_len=1024,
         batch_size=2,
         group_size=1,
-        teacher_model="glm-5.2",
+        teacher_model="glm-5.3",
         opd_multi_turn=multi_turn,
         opd_max_turns=max_turns,
     )
@@ -320,7 +320,7 @@ def test_opd_teacher_cost_uses_authoritative_request_multiplier(multi_turn, max_
     input_tokens = 2 * 1024 * multiplier
     output_tokens = 2 * multiplier
     assert estimate.teacher_api_usd == pytest.approx(
-        teacher_token_cost_usd(input_tokens, output_tokens, "glm-5.2")
+        teacher_token_cost_usd(input_tokens, output_tokens, "glm-5.3")
     )
 
 

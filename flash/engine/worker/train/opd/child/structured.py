@@ -80,17 +80,17 @@ class StructuredOutputReplay:
         if cached is not None:
             return cached
         spec = json.loads(canonical_spec)
-        disable_any_whitespace = bool(spec.get("disable_any_whitespace", False))
-        if spec.get("json") is not None:
+        from flash.content.structured_options import vllm_structured_kwargs
+
+        spec = vllm_structured_kwargs(spec)
+        if spec.get("grammar") is not None:
+            compiled = self._compiler.compile_grammar(spec["grammar"])
+        elif spec.get("json") is not None:
             compiled = self._compiler.compile_json_schema(
-                json.dumps(spec["json"]),
-                any_whitespace=not disable_any_whitespace,
+                json.dumps(spec["json"]), any_whitespace=True
             )
         elif spec.get("json_object") is not None:
-            compiled = self._compiler.compile_json_schema(
-                '{"type": "object"}',
-                any_whitespace=not disable_any_whitespace,
-            )
+            compiled = self._compiler.compile_json_schema('{"type": "object"}', any_whitespace=True)
         elif spec.get("regex") is not None:
             compiled = self._compiler.compile_regex(str(spec["regex"]))
         elif spec.get("choice") is not None:

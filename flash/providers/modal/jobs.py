@@ -45,16 +45,27 @@ def poll(handle, spec, *, log=None, deadline_at=None):
     console = reader(f"console_{spec.phase}_attempt{h.attempt}.txt")
     read_start = start_time_reader(h.to_dict(), deadline_at=deadline_at)
     worker_started = None
+    returncode = None
 
     def fetch_instance():
-        nonlocal worker_started
+        nonlocal worker_started, returncode
         worker_started = worker_started or read_start()
         instance = api.get_instance(h.instance_id, deadline_at=deadline_at)
+        if instance is not None:
+            returncode = instance.get("returncode")
         if instance is not None and instance["status"] == "pending" and worker_started is not None:
             return {**instance, "status": "running", "started_ts": worker_started}
         return instance
 
     error = reader(error_artifact_name(spec.phase, h.attempt))
+
+    def process_failure():
+        # the provider exit status survives an artifact-store outage. ordinary process errors
+        # must not become paid preemption retries merely because their failure upload hit 429.
+        # signals/unknown status remain host-loss candidates; explicit retriable markers still win.
+        if type(returncode) is int and 0 < returncode < 128:
+            return f"Modal worker stopped with exit code {returncode} without a terminal record"
+        return None
 
     def stamp(metrics, *, end_ts, launch_ts):
         started = worker_started or read_start()
@@ -93,10 +104,11 @@ def poll(handle, spec, *, log=None, deadline_at=None):
         dead_states=frozenset({"terminated"}),
         missing_dead_threshold=3,
         early_liveness_alive=lambda: console(force=True) is not None,
-        read_current_error=lambda: error(force=True),
+        read_current_error=lambda: error(force=True) or process_failure(),
         stamp_cost_and_notes=stamp,
         failure_detail=lambda marker: (
             (marker or {}).get("error")
+            or process_failure()
             or "Modal worker stopped without a successful terminal marker"
         ),
         load_timeout_failure="no_capacity",

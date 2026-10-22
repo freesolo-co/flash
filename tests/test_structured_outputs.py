@@ -105,13 +105,10 @@ def test_structured_output_strings_normalize_to_canonical_constraints():
 
 
 def test_backend_options_pass_through():
-    got = _canonical(
-        {"json": _SCHEMA, "disable_any_whitespace": True, "whitespace_pattern": r"[\n ]?"}
-    )
+    got = _canonical({"json": _SCHEMA, "disable_any_whitespace": True})
     assert got == {
         "json": _SCHEMA,
         "disable_any_whitespace": True,
-        "whitespace_pattern": r"[\n ]?",
     }
 
 

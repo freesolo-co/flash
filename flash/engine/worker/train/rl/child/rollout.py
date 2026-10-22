@@ -8,6 +8,7 @@ from verl.experimental.agent_loop.single_turn_agent_loop import SingleTurnAgentL
 from verl.trainer.ppo.v1.agent_loop_tq import AgentLoopManagerTQ
 from verl.utils import tensordict_utils as tu
 
+from flash.content.structured_options import vllm_structured_kwargs
 from flash.engine.worker.train.core.child.observations import ObservedRolloutClient
 from flash.engine.worker.train.core.child.options import RuntimeOptions
 from flash.engine.worker.train.rl.child.identity import _identity_from_trajectory
@@ -76,7 +77,9 @@ class FlashGrpoPolicy:
         if runtime.structured_outputs:
             from vllm.sampling_params import StructuredOutputsParams
 
-            params["structured_outputs"] = StructuredOutputsParams(**runtime.structured_outputs)
+            params["structured_outputs"] = StructuredOutputsParams(
+                **vllm_structured_kwargs(runtime.structured_outputs)
+            )
         with self.observations.episode():
             output = await super().run(params, **kwargs)
             if output.reward_score is None:

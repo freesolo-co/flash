@@ -780,7 +780,7 @@ def test_valid_thinking_structured_run_passes_dry_run(api) -> None:
         ),
         (
             {"json_object": True, "whitespace_pattern": "["},
-            "whitespace_pattern is invalid",
+            "whitespace_pattern is not supported",
         ),
     ],
 )
@@ -861,7 +861,7 @@ def test_warmstart_dry_run_preserves_context_preflight_error(api) -> None:
 @pytest.mark.parametrize(
     "structured_outputs",
     [
-        {"regex": r"^[0-9]+$", "whitespace_pattern": r"\s*"},
+        {"regex": r"^[0-9]+$"},
         {
             "json": {
                 "$defs": {"answer": {"type": "string"}},
@@ -8346,7 +8346,7 @@ def test_managed_teacher_rejection_reports_which_side_is_at_fault(
         "_resolve_environment_reference",
         lambda *_a, **_k: str(offline_env / "environment.py"),
     )
-    train = {**SPEC["train"], "teacher_model": "glm-5.2"}
+    train = {**SPEC["train"], "teacher_model": "glm-5.3"}
     if plane_misconfigured:
         monkeypatch.delenv("PARASAIL_API_KEY", raising=False)
     else:

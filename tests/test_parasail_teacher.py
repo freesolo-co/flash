@@ -127,7 +127,7 @@ def _client(response, capture=None):
     client = TeacherClient(
         "capability",
         "https://broker.example",
-        "parasail-glm-52",
+        "parasail-glm-53",
         tokenizer=_FixedTokenizer(_tokens()),
     )
 
@@ -160,9 +160,12 @@ def _multimodal_client(response, capture=None):
 def test_training_guide_lists_only_the_managed_teacher_aliases():
     guide = (Path(__file__).parents[1] / "flash" / "cli" / "scaffold" / "TRAINING.md").read_text()
 
-    assert "glm-5.2 (default) | kimi-k3 |" in guide
-    assert "qwen3.5-397b-a17b | deepseek-v4-pro |" in guide
-    assert "#                                                       # qwen3-vl-235b" in guide
+    assert "glm-5.3 (default) | kimi-k3 |" in guide
+    assert "qwen3.5-397b-a17b | deepseek-v4.1-flash-1017 |" in guide
+    assert (
+        "#                                                       # qwen3.8-27b | qwen3-vl-235b"
+        in guide
+    )
     assert "kimi-k2.6" not in guide
     assert "The control-plane broker owns `PARASAIL_API_KEY`" in guide
     assert "`FLASH_PUBLIC_URL` and an attempt-scoped `FLASH_TEACHER_CAPABILITY`" in guide
@@ -172,17 +175,19 @@ def test_training_guide_lists_only_the_managed_teacher_aliases():
 def test_catalog_contains_exactly_five_parasail_aliases():
     assert set(TEACHER_MODELS) == {
         "kimi-k3",
-        "glm-5.2",
+        "glm-5.3",
+        "qwen3.8-27b",
         "qwen3.5-397b-a17b",
-        "deepseek-v4-pro",
+        "deepseek-v4.1-flash-1017",
         "qwen3-vl-235b",
     }
-    assert resolve_teacher("").alias == "glm-5.2"
+    assert resolve_teacher("").alias == "glm-5.3"
     assert {model.model_id for model in TEACHER_MODELS.values()} == {
         "parasail-kimi-k3-fast",
-        "parasail-glm-52",
+        "parasail-glm-53",
+        "parasail-qwen38-27b",
         "parasail-qwen35-397b-a17b",
-        "parasail-deepseek-v4-pro",
+        "parasail-deepseek-v41-flash-1017",
         "parasail-qwen3-vl-235b-a22b-instruct",
     }
     # qwen3.5 is a vision model despite the alias carrying no "-vl": the checkpoint is a
@@ -192,21 +197,24 @@ def test_catalog_contains_exactly_five_parasail_aliases():
     # drops the image.
     assert {alias for alias, model in TEACHER_MODELS.items() if model.supports_images} == {
         "qwen3-vl-235b",
+        "qwen3.8-27b",
         "qwen3.5-397b-a17b",
     }
     assert {alias for alias, model in TEACHER_MODELS.items() if not model.supports_images} == {
         "kimi-k3",
-        "glm-5.2",
-        "deepseek-v4-pro",
+        "glm-5.3",
+        "deepseek-v4.1-flash-1017",
     }
     for rejected in (
         "kimi-k2.6",
+        "glm-5.2",
+        "deepseek-v4-pro",
         "deepseek-ai/DeepSeek-V4-Pro",
         "moonshotai/Kimi-K3",
         "Qwen/Qwen3.5-397B-A17B-FP8",
-        "parasail-glm-52",
-        "parasail-deepseek-v4-pro",
-        "accounts/fireworks/models/deepseek-v4-pro",
+        "parasail-glm-53",
+        "parasail-deepseek-v41-flash-1017",
+        "accounts/fireworks/models/deepseek-v4.1-flash-1017",
         "accounts/fireworks/models/glm-5p2",
     ):
         with pytest.raises(ValueError, match="not a supported teacher"):
@@ -223,7 +231,7 @@ def test_image_capable_aliases_come_from_the_catalog_in_order():
     from flash.engine.plan.recipe import image_capable_teacher_aliases
 
     aliases = image_capable_teacher_aliases()
-    assert aliases == ("qwen3.5-397b-a17b", "qwen3-vl-235b"), aliases
+    assert aliases == ("qwen3.8-27b", "qwen3.5-397b-a17b", "qwen3-vl-235b"), aliases
     # catalog order, so the message is stable rather than set-iteration order.
     assert list(aliases) == [a for a in TEACHER_MODELS if TEACHER_MODELS[a].supports_images]
 
@@ -243,22 +251,36 @@ def test_image_capable_teachers_declare_the_image_pad_token():
             f"{alias} is flagged image-capable but pins a {teacher.tokenizer_kind} tokenizer; the "
             "multimodal scoring path needs the image-pad marker as a single token."
         )
-        assert "vl" in teacher.tokenizer_repo.lower() or "qwen3.5" in teacher.tokenizer_repo.lower()
+        assert "vl" in teacher.tokenizer_repo.lower() or "qwen3." in teacher.tokenizer_repo.lower()
 
 
 def test_pinned_tokenizer_hashes_are_complete():
+    assert (
+        TEACHER_MODELS["deepseek-v4.1-flash-1017"].tokenizer_repo
+        == "deepseek-ai/DeepSeek-V4.1-Flash-1017"
+    )
+    assert TEACHER_MODELS["deepseek-v4.1-flash-1017"].tokenizer_revision == (
+        "1bae0e1088993b9b82de08f59de5be5a34e42170"
+    )
+    assert TEACHER_MODELS["qwen3.8-27b"].tokenizer_repo == "Qwen/Qwen3.8-27B"
+    assert TEACHER_MODELS["qwen3.8-27b"].tokenizer_revision == (
+        "1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0"
+    )
+    assert dict(TEACHER_MODELS["qwen3.8-27b"].tokenizer_files)["tokenizer.json"] == (
+        "0997f410c57a1f4e53b09e4be8f4a172d90edd9564368fb0847030937229b9f3"
+    )
     assert dict(TEACHER_MODELS["kimi-k3"].tokenizer_files) == {
         "tokenizer_config.json": "5d0803c94db9cd78763499e0956c95fd5a225c14a727e5a6cf5db3f96f010a6e",
         "tiktoken.model": "b6c497a7469b33ced9c38afb1ad6e47f03f5e5dc05f15930799210ec050c5103",
     }
-    assert dict(TEACHER_MODELS["glm-5.2"].tokenizer_files)["tokenizer.json"] == (
+    assert dict(TEACHER_MODELS["glm-5.3"].tokenizer_files)["tokenizer.json"] == (
         "19e773648cb4e65de8660ea6365e10acca112d42a854923df93db4a6f333a82d"
     )
     assert dict(TEACHER_MODELS["qwen3.5-397b-a17b"].tokenizer_files)["tokenizer.json"] == (
         "5f9e4d4901a92b997e463c1f46055088b6cca5ca61a6522d1b9f64c4bb81cb42"
     )
-    assert dict(TEACHER_MODELS["deepseek-v4-pro"].tokenizer_files)["tokenizer.json"] == (
-        "8f9f37ca37fdc4f5fd36d5cf4d3b0e8392edb4e894fd10cc0d70b4957c8633cf"
+    assert dict(TEACHER_MODELS["deepseek-v4.1-flash-1017"].tokenizer_files)["tokenizer.json"] == (
+        "c90dfa01249db1be4245780a052ede752e1361c612ac6d08e2bdada7d599476b"
     )
     assert TEACHER_MODELS["qwen3-vl-235b"].tokenizer_revision == (
         "710c13861be6c466e66de3f484069440b8f31389"
@@ -287,7 +309,7 @@ def test_token_keyed_response_scores_boundary_crossing_token_and_bills_one_outpu
     assert capture == {
         "path": "/v1/teacher/completions",
         "body": {
-            "model": "parasail-glm-52",
+            "model": "parasail-glm-53",
             "prompt": "P: hi!",
             "max_tokens": 1,
             "echo": True,
@@ -974,9 +996,9 @@ def broker_ledger(monkeypatch, tmp_path):
     return db.issue_teacher_capability(
         run_id="run-1",
         attempt=2,
-        teacher_alias="glm-5.2",
+        teacher_alias="glm-5.3",
         provider=teacher_broker.PARASAIL_PROVIDER,
-        model="parasail-glm-52",
+        model="parasail-glm-53",
         scoring_mode=teacher_broker.PARASAIL_SCORING_MODE,
         expires_at=time.time() + 600,
         limits={
@@ -998,7 +1020,7 @@ def _ledger_client(
     client = TeacherClient(
         token,
         "https://plane.example",
-        "parasail-glm-52",
+        "parasail-glm-53",
         tokenizer=_WholeTextTokenizer(),
     )
     transport = _LedgerBrokerTransport(
@@ -1142,7 +1164,7 @@ def _worker_client_after_http_error(monkeypatch, *, status, reason, body):
     client = worker_teacher.TeacherClient(
         "capability-value",
         "https://broker.example",
-        "parasail-glm-52",
+        "parasail-glm-53",
         tokenizer=_WholeTextTokenizer(),
     )
     return client, request_ids, sleeps

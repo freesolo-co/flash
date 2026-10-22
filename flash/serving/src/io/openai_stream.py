@@ -8,6 +8,7 @@ from collections.abc import AsyncIterator
 from typing import Any, cast
 
 import orjson
+from anyio import CancelScope
 
 from flash.serve.app.openai import ReasoningDeltaSplitter
 from flash.serving.src.accounting.usage import UsageSession
@@ -482,4 +483,10 @@ async def openai_chat_stream(
         disconnected.set()
         with contextlib.suppress(asyncio.QueueEmpty):
             output.get_nowait()
-        await _await_producer_shutdown(producer)
+        try:
+            # anyio repeatedly cancels awaits in a disconnected response scope. the
+            # producer must retain ownership until its bounded settlement completes.
+            with CancelScope(shield=True):
+                await _await_producer_shutdown(producer)
+        finally:
+            usage_session.relinquish()

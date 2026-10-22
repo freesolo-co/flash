@@ -662,7 +662,7 @@ def test_sft_train_keeps_the_optimizations_that_survived_the_trl_deletion():
     # gradient checkpointing, with the MoE/GDN reentrant rule shared with grpo.
     assert "grad_checkpointing_on(" in train_src
     assert "grpo_use_reentrant(" in train_src
-    assert "get_linear_schedule_with_warmup" in engine_src
+    assert "linear_warmup_scheduler" in engine_src
     assert "optimizer = super()._build_optimizer(module)" in engine_src
 
 
