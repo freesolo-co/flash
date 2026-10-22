@@ -700,6 +700,9 @@ def test_openai_sse_keeps_repeated_delta_text(modal_app_module):
             yield event
 
     class UsageSession:
+        def relinquish(self):
+            return None
+
         async def finalize(self, _result):
             return None
 

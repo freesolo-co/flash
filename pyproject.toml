@@ -1,6 +1,6 @@
 [project]
 name = "freesolo-flash"
-version = "1.3.11"
+version = "1.3.12"
 description ="Flash — managed LoRA post-training (SFT/GRPO/OPD) for Freesolo environments, driven by the `flash` CLI"
 readme = "README.md"
 # The training and serving stack is validated on Python 3.11 and 3.12.
@@ -85,6 +85,9 @@ server = [
 # (vllm==0.23.0, held exactly by a 25h 35B outage on 0.21.0), and the offline tests substitute a
 # stub whenever the real package is unimportable, so CI exercises the app without it.
 serving = [
+    # response lifetime ownership uses cancellation shielding and ASGI response types.
+    "anyio>=4.0,<5",
+    "starlette>=0.46,<2",
     "pydantic-settings>=2.7",
     "orjson>=3.10",
     # the hosted app talks to supabase (durable adapter registry) and the platform backend (usage
@@ -200,7 +203,7 @@ artifacts = ["flash/py.typed"]
 # auto-published by .github/workflows/publish-dev.yml: a push to `dev` whose version isn't yet on
 # PyPI publishes it; pushes that don't change it find it already published and no-op. So cutting a
 # dev-channel release = bump this (and [project].version) and merge to `dev`.
-version = "1.3.11"
+version = "1.3.12"
 
 [tool.pytest.ini_options]
 pythonpath = ["."]

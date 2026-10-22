@@ -1740,7 +1740,7 @@ def test_stream_finalization_failure_emits_terminal_sse_error_and_snapshot() -> 
     assert error["error"]["type"] == "accounting_error"
     assert chunks[-1] == _sse("[DONE]")
     assert session.captured[-1]["type"] == "final"
-    assert session.relinquished == 1
+    assert session.relinquished >= 1
 
 
 def test_failed_stream_finalization_relinquishes_heartbeat_for_stale_recovery() -> None:

@@ -31,6 +31,7 @@ from flash.serving.src.accounting.usage import (
 from flash.serving.src.accounting.usage_outbox import UsageOutboxError
 from flash.serving.src.engine.model_config import tool_parser_for
 from flash.serving.src.http.context import ServingContext, require_attributed_traffic
+from flash.serving.src.http.stream_response import ClosingStreamingResponse
 from flash.serving.src.io.multimodal import _prepare_generate_request
 from flash.serving.src.io.provenance import _checkpoint_provenance, _provenance_headers
 from flash.serving.src.io.requests import (
@@ -324,7 +325,7 @@ async def _stream_chat_completion(
                 status.HTTP_503_SERVICE_UNAVAILABLE,
                 "durable serving accounting unavailable",
             ) from exc
-        response = StreamingResponse(
+        response = ClosingStreamingResponse(
             context.chat_stream(
                 record=requested,
                 events=events,
@@ -336,6 +337,7 @@ async def _stream_chat_completion(
                 thinking=thinking,
                 choice_count=getattr(req, "n", 1),
             ),
+            on_unstarted=lambda: _discard_prepared_stream(usage_session, events),
             media_type="text/event-stream",
             # Disable proxy and CDN buffering so each SSE chunk reaches the client immediately.
             # Without X-Accel-Buffering, Nginx accumulates tokens until its output buffer fills,
