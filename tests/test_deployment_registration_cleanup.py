@@ -168,7 +168,7 @@ def test_recovery_fences_and_removes_unfinished_registration(
     assert serving_completion.recover_deployments() == 0
 
 
-def test_recovery_without_org_retains_cleanup_pending(api, monkeypatch):
+def test_recovery_without_org_retains_undeploying(api, monkeypatch):
     key = _new_user_token()
     run_id = _make_run(api, key, "done")
     checkpoint_id = f"{run_id}/final"
