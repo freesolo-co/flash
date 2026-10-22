@@ -188,7 +188,7 @@ def test_spec_payload_filters_normalized_train_values_by_authored_keys() -> None
                 "max_examples": 1,
                 "temperature": 0,
                 "stop_sequences": [],
-                "teacher_model": "GLM 5.2",
+                "teacher_model": "GLM 5.3",
                 "structured_outputs": False,
             },
         }
@@ -211,7 +211,7 @@ def test_spec_payload_filters_normalized_train_values_by_authored_keys() -> None
         "max_examples": 1,
         "temperature": 0.0,
         "stop_sequences": (),
-        "teacher_model": "glm-5.2",
+        "teacher_model": "glm-5.3",
         "structured_outputs": "",
     }
     assert "lora_rank" not in sparse["train"]

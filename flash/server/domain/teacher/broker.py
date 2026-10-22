@@ -181,9 +181,10 @@ def require_teacher_broker_configuration(
     teacher = resolve_teacher(spec.train.teacher_model)
     if teacher.alias not in {
         "kimi-k3",
-        "glm-5.2",
+        "glm-5.3",
+        "qwen3.8-27b",
         "qwen3.5-397b-a17b",
-        "deepseek-v4-pro",
+        "deepseek-v4.1-flash-1017",
         "qwen3-vl-235b",
     }:
         raise TeacherBrokerConfigurationError(

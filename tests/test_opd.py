@@ -495,21 +495,22 @@ def test_opd_selects_only_managed_parasail_aliases():
         )
 
     assert _spec("kimi-k3").train.teacher_model == "kimi-k3"
-    assert _spec("GLM 5.2").train.teacher_model == "glm-5.2"
+    assert _spec("Qwen3.8 27B").train.teacher_model == "qwen3.8-27b"
+    assert _spec("GLM 5.3").train.teacher_model == "glm-5.3"
     assert _spec("qwen3.5-397b-a17b").train.teacher_model == "qwen3.5-397b-a17b"
-    assert _spec("deepseek-v4-pro").train.teacher_model == "deepseek-v4-pro"
+    assert _spec("deepseek-v4.1-flash-1017").train.teacher_model == "deepseek-v4.1-flash-1017"
     assert _spec("qwen3-vl-235b").train.teacher_model == "qwen3-vl-235b"
-    assert _spec("DeepSeek V4 Pro").train.teacher_model == "deepseek-v4-pro"
+    assert _spec("DeepSeek V4.1 Flash 1017").train.teacher_model == "deepseek-v4.1-flash-1017"
     assert _spec("").train.teacher_model == ""
 
     rejected = (
         "kimi-k2.6",
         "deepseek-ai/DeepSeek-V4-Pro",
-        "parasail-deepseek-v4-pro",
+        "parasail-deepseek-v41-flash-1017",
         "moonshotai/Kimi-K3",
-        "nvidia/GLM-5.2-NVFP4",
+        "zai-org/GLM-5.3",
         "Qwen/Qwen3.5-397B-A17B-FP8",
-        "parasail-glm-52",
+        "parasail-glm-53",
         "accounts/fireworks/models/glm-5p2",
     )
     for teacher in rejected:
@@ -1068,7 +1069,7 @@ def test_opd_all_over_budget_prompts_fail_before_loading_student(worker_context,
         opd_entry,
         "_resolve_opd_knobs",
         lambda context=None, **_context: opd_entry.OpdKnobs(
-            teacher_model="glm-5.2",
+            teacher_model="glm-5.3",
             epochs=1,
             learning_rate=1e-4,
             temperature=0.0,
@@ -1620,10 +1621,11 @@ def test_opd_teacher_price_table_covers_exact_parasail_catalog():
         assert teacher_price_per_1m(alias) == info.usd_per_1m
     assert teacher_price_per_1m("kimi-k3") == (3.00, 15.00)
     assert teacher_price_per_1m("qwen3.5-397b-a17b") == (0.50, 3.60)
-    assert teacher_price_per_1m("deepseek-v4-pro") == (1.74, 3.48)
+    assert teacher_price_per_1m("deepseek-v4.1-flash-1017") == (0.30, 1.20)
     assert teacher_price_per_1m("qwen3-vl-235b") == (0.21, 1.90)
+    assert teacher_price_per_1m("qwen3.8-27b") == (0.24, 2.20)
     with pytest.raises(ValueError, match="not a supported teacher"):
-        teacher_price_per_1m("parasail-deepseek-v4-pro")
+        teacher_price_per_1m("parasail-deepseek-v41-flash-1017")
 
 
 # --------------------------------------------------------------------------------------------------
@@ -1724,15 +1726,15 @@ def test_resolve_opd_knobs_maps_alias_to_parasail_model(worker_context, monkeypa
 
     assert _knobs("kimi-k3").teacher_model == "parasail-kimi-k3-fast"
     assert _knobs("qwen3.5-397b-a17b").teacher_model == "parasail-qwen35-397b-a17b"
-    assert _knobs("deepseek-v4-pro").teacher_model == "parasail-deepseek-v4-pro"
+    assert _knobs("deepseek-v4.1-flash-1017").teacher_model == "parasail-deepseek-v41-flash-1017"
     assert _knobs("qwen3-vl-235b").teacher_model == ("parasail-qwen3-vl-235b-a22b-instruct")
-    assert _knobs("").teacher_model == "parasail-glm-52"
-    assert _knobs(None).teacher_model == "parasail-glm-52"
+    assert _knobs("").teacher_model == "parasail-glm-53"
+    assert _knobs(None).teacher_model == "parasail-glm-53"
     for teacher in (
         "kimi-k2.6",
         "deepseek-ai/DeepSeek-V4-Pro",
         "Qwen/Qwen3.5-397B-A17B-FP8",
-        "accounts/fireworks/models/deepseek-v4-pro",
+        "accounts/fireworks/models/deepseek-v4.1-flash-1017",
     ):
         with pytest.raises(RuntimeError, match="teacher_model"):
             _knobs(teacher)
@@ -1870,7 +1872,7 @@ class _TinyLM:
 
 def test_opd_worker_rejects_text_teacher_for_images_before_gpu_use(worker_context, monkeypatch):
     """Image-bearing OPD with a text teacher must fail before paid GPU work."""
-    teacher_model = "glm-5.2"
+    teacher_model = "glm-5.3"
     fake_torch = types.ModuleType("torch")
     fake_torch.manual_seed = lambda _seed: None
     fake_torch.cuda = SimpleNamespace(is_available=lambda: False)
@@ -1930,5 +1932,5 @@ def test_opd_worker_rejects_text_teacher_for_images_before_gpu_use(worker_contex
     # ValueError, not RuntimeError: TRL re-wrapped this as `RuntimeError(f"opd: {exc}")`, verl lets it
     # propagate. The type carries no behavioral difference -- `_worker_failure_flags` branches only on
     # RetriableInfraError/GitHubRateLimitError and CUDA OOM, so both are fatal and non-retriable.
-    with pytest.raises(ValueError, match=r"selected teacher 'glm-5\.2' cannot see images"):
+    with pytest.raises(ValueError, match=r"selected teacher 'glm-5\.3' cannot see images"):
         opd_mod.run_opd_train(context=worker_context)

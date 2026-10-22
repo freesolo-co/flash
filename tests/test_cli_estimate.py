@@ -232,7 +232,7 @@ def test_opd_runconfig_carries_selected_teacher_and_prices_it():
             raw["train"]["teacher_model"] = teacher
         return spec_from_dict(raw)
 
-    assert _runconfig_from_spec(_opd()).teacher_model == "glm-5.2"
+    assert _runconfig_from_spec(_opd()).teacher_model == "glm-5.3"
     qwen_cfg = _runconfig_from_spec(_opd("qwen3.5-397b-a17b"))
     assert qwen_cfg.teacher_model == "qwen3.5-397b-a17b"
 

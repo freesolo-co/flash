@@ -8346,7 +8346,7 @@ def test_managed_teacher_rejection_reports_which_side_is_at_fault(
         "_resolve_environment_reference",
         lambda *_a, **_k: str(offline_env / "environment.py"),
     )
-    train = {**SPEC["train"], "teacher_model": "glm-5.2"}
+    train = {**SPEC["train"], "teacher_model": "glm-5.3"}
     if plane_misconfigured:
         monkeypatch.delenv("PARASAIL_API_KEY", raising=False)
     else:

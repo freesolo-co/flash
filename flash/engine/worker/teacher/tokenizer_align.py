@@ -1,4 +1,4 @@
-"""Cross-tokenizer alignment for on-policy distillation (teacher GLM-5.2 -> student Qwen3.5/3.6).
+"""Cross-tokenizer alignment for on-policy distillation (teacher GLM-5.3 -> student Qwen3.5/3.6).
 
 This is the collinear-ai *spider* / Tinker-cookbook realignment (``_build_alignment_groups`` +
 ``_compute_groupwise_reverse_kl``), and it uses only the REALIZED-token logprobs on each side -- no
