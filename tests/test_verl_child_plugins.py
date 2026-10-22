@@ -228,8 +228,8 @@ def test_sft_uses_linear_scheduler_without_replacing_upstream(monkeypatch):
         monkeypatch,
         {
             "verl.workers.engine.fsdp.transformer_impl": {"FSDPEngineWithLMHead": BaseEngine},
-            "transformers": {
-                "get_linear_schedule_with_warmup": lambda opt, **kw: calls.append((opt, kw))
+            "flash.engine.worker.train.sft.child.schedule": {
+                "linear_warmup_scheduler": lambda opt, **kw: calls.append((opt, kw))
             },
         },
     )
