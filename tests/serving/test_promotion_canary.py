@@ -197,11 +197,24 @@ def test_a_timeout_is_reported_as_a_timeout_not_a_hang():
 
 def test_a_non_sse_response_is_reported_without_echoing_its_body():
     client = _FakeClient(
-        _FakeResponse(['data: {"error": "boom"}'], content_type="application/json", status_code=500)
+        _FakeResponse(['data: {"error": "boom"}'], content_type="application/json")
     )
     evidence = _run(client)
     assert evidence.content_type_ok is False
     assert evidence.content_delta_count == 0
+
+
+@pytest.mark.parametrize("status_code", [301, 302, 307, 308, 401, 500, 503])
+def test_http_failures_report_only_the_status_without_echoing_credentials(status_code):
+    client = _FakeClient(
+        _FakeResponse(
+            [API_KEY],
+            content_type="application/json",
+            status_code=status_code,
+        )
+    )
+    with pytest.raises(CanaryError, match=f"^canary_http_{status_code}$"):
+        _run(client)
 
 
 def test_modal_result_redirects_poll_the_original_generation_with_get():

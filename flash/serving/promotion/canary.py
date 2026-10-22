@@ -211,9 +211,12 @@ async def _read_stream(request: CanaryRequest, *, client: httpx.AsyncClient) -> 
                     raise CanaryError(CANARY_RESULT_REDIRECT_REJECTED)
                 url, method, payload = target_url, "GET", None
                 continue
+            if response.status_code != 200:
+                # Status is safe to log; bodies and result URLs may contain secrets.
+                raise CanaryError(f"canary_http_{response.status_code}")
             content_type = str(response.headers.get("content-type", ""))
             content_type_ok = content_type.startswith("text/event-stream")
-            if response.status_code != 200 or not content_type_ok:
+            if not content_type_ok:
                 # Never expose the response body (or a signed result URL) in logs.
                 return reader.evidence(content_type_ok=False)
             async for line in response.aiter_lines():
