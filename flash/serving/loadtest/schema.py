@@ -24,7 +24,7 @@ _ENV_RE = re.compile(r"^[A-Z_][A-Z0-9_]*$")
 
 
 class StrictModel(BaseModel):
-    model_config = ConfigDict(extra="forbid", strict=True)
+    model_config = ConfigDict(extra="forbid", strict=True, allow_inf_nan=False)
 
 
 class DeploymentExpectation(StrictModel):
@@ -325,6 +325,8 @@ class Scenario(StrictModel):
     @classmethod
     def validate_endpoint(cls, value: HttpUrl) -> HttpUrl:
         parts = urlsplit(str(value))
+        if parts.username is not None or parts.password is not None:
+            raise ValueError("endpoint must not contain credentials; use credential_env")
         if parts.query or parts.fragment or parts.path not in ("", "/"):
             raise ValueError("endpoint must be an origin without path, query, or fragment")
         normalized = urlunsplit((parts.scheme, parts.netloc, "", "", ""))

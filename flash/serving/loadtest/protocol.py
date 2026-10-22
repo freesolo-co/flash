@@ -141,9 +141,9 @@ async def stream_chat(
             observation.response_headers = _allowed_headers(response.headers)
             if response.status_code != 200:
                 await _classify_http_error(response, observation)
-                return observation
-            _validate_provenance(response.headers, target)
-            await _consume_sse(response, observation, clock)
+            else:
+                _validate_provenance(response.headers, target)
+                await _consume_sse(response, observation, clock)
     except ProtocolError as exc:
         observation.error_class = "protocol_error"
         observation.error_detail = _sanitize(str(exc))
