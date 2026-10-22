@@ -276,7 +276,10 @@ async def _discard_prepared_stream(usage_session: Any, events: Any) -> None:
     except StopAsyncIteration:
         pass
     finally:
-        await _close_async_iterator(events)
+        try:
+            await _close_async_iterator(events)
+        finally:
+            usage_session.relinquish()
 
 
 async def _stream_chat_completion(

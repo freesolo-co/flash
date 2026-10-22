@@ -5,7 +5,7 @@ from typing import Any
 
 from anyio import CancelScope
 from starlette.responses import StreamingResponse
-from starlette.types import Send
+from starlette.types import Receive, Scope, Send
 
 
 class ClosingStreamingResponse(StreamingResponse):
@@ -26,12 +26,12 @@ class ClosingStreamingResponse(StreamingResponse):
         async for chunk in self._content:
             yield chunk
 
-    async def stream_response(self, send: Send) -> None:
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         try:
-            await super().stream_response(send)
+            await super().__call__(scope, receive, send)
         finally:
-            # cancellation at send() never enters the generator's finally block.
-            # protect cleanup from the surrounding anyio disconnect scope.
+            # own cleanup outside starlette's cancellable streaming child: a task
+            # cancelled before its first step never enters its own finally block.
             with CancelScope(shield=True):
                 try:
                     close = getattr(self._content, "aclose", None)
