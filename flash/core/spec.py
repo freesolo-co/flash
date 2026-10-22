@@ -387,7 +387,7 @@ class TrainSpec:
         default=None, metadata={"introduced_in": "0.2.0"}
     )
     # opd only: the managed teacher's canonical friendly alias. provider and repository ids are not
-    # accepted as user input. an empty value selects the recipe default, glm-5.2.
+    # accepted as user input. an empty value selects the recipe default, glm-5.3.
     teacher_model: str = field(default="", metadata={"introduced_in": "0.2.56"})
     stop_sequences: tuple[str, ...] = field(default=(), metadata={"introduced_in": "0.2.0"})
     # canonical json of vllm structured-output kwargs ("" = unconstrained). normalized once

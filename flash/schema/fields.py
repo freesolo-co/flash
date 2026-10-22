@@ -86,7 +86,7 @@ def _train_float(
 def _train_teacher(train_raw: dict) -> str:
     """Validate [train] teacher_model against the managed OPD teacher allow-list -> ConfigError (400).
 
-    Missing/None/blank -> "" (the worker then uses the default GLM 5.2 teacher). A supported value is
+    Missing/None/blank -> "" (the worker then uses the default GLM 5.3 teacher). A supported value is
     stored as its canonical friendly alias. Provider and repository identifiers are never accepted as
     user input. An unsupported teacher is rejected before a paid GPU is provisioned."""
     v = train_raw.get("teacher_model")

@@ -962,14 +962,14 @@ def test_multimodal_algorithm_validation_requires_a_vision_teacher_after_model_v
     mm.validate_multimodal_training("Qwen/Qwen3.5-9B", "opd", "qwen3-vl-235b")
     with pytest.raises(
         ValueError,
-        match=r"requires.*qwen3-vl-235b.*selected teacher \'glm-5\.2\' cannot see images",
+        match=r"requires.*qwen3-vl-235b.*selected teacher \'glm-5\.3\' cannot see images",
     ):
-        mm.validate_multimodal_training("Qwen/Qwen3.5-9B", "opd", "glm-5.2")
+        mm.validate_multimodal_training("Qwen/Qwen3.5-9B", "opd", "glm-5.3")
     with pytest.raises(ValueError, match="does not support"):
         mm.validate_multimodal_training(
             "meta-llama/Llama-3.2-1B",
             "opd",
-            "glm-5.2",
+            "glm-5.3",
         )
 
 

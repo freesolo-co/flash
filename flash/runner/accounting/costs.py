@@ -148,7 +148,19 @@ def charge_usd_for_spec(
         reached_saves = tuple(s for s in cfg.save_at_steps if s <= n)
         if not cfg.is_grpo and cfg.train_tokens and planned > 0:
             scaled_tokens = max(1, int(cfg.train_tokens * n / planned))
-            cfg = replace(cfg, steps=n, train_tokens=scaled_tokens, save_at_steps=reached_saves)
+            # both token totals describe the same completed horizon. leaving supervised tokens
+            # at the full-run value can violate supervised <= compute and make cancellation fail.
+            supervised = cfg.supervised_train_tokens
+            scaled_supervised = (
+                max(1, supervised * n // planned) if supervised is not None else None
+            )
+            cfg = replace(
+                cfg,
+                steps=n,
+                train_tokens=scaled_tokens,
+                supervised_train_tokens=scaled_supervised,
+                save_at_steps=reached_saves,
+            )
         else:
             cfg = replace(cfg, steps=n, save_at_steps=reached_saves)
         return float(estimate_cost(cfg, allocation=allocation).total_usd)
