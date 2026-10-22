@@ -26,21 +26,24 @@ from flash.teacher.retry_contract import OPD_RESUME_REVISION_ENV
 logger = get_logger(__name__)
 
 
-WORKER_IMAGE = "ghcr.io/freesolo-co/flash-worker:cu128"
+WORKER_IMAGE = (
+    "ghcr.io/freesolo-co/flash-worker@"
+    "sha256:34c84092f87b9ae43457620a8e5c0dc2e3dc30fdd5de5b4300c1eeb384e9a066"
+)
 
-# MUST mirror the bake matrix in .github/workflows/bake-kernel-cache.yml. Unlisted arches fall
-# back to WORKER_IMAGE (no -smXX tag built) rather than failing at docker pull.
+# must mirror the bake matrix in .github/workflows/bake-kernel-cache.yml. this is the build
+# inventory, not proof that a mutable per-sm tag contains the current trainer dependencies.
 BAKED_PER_SM_ARCHES = frozenset({"sm80", "sm86", "sm89", "sm90", "sm120", "sm100"})
 
 
 def worker_image_for_gpu(friendly_gpu: str | None) -> str:
-    """Return the worker Docker image for a GPU class (per-SM kernel-cache tag or base)."""
+    """Return the immutable image qualified with the current upstream trainer."""
     if friendly_gpu:
-        info = get_gpu_info(friendly_gpu)
-        # Per-SM baked kernel-cache image is always used for baked arches (skips ~10-15 min
-        # cold-start JIT). Unbaked arches fall through to the base image to avoid a 404 docker pull.
-        if info.sm in BAKED_PER_SM_ARCHES:
-            return f"{WORKER_IMAGE}-{info.sm}"
+        get_gpu_info(friendly_gpu)
+    # the mutable sm90 tag still contains the retired verl fork. a cache fingerprint is not
+    # trainer compatibility: that tag fails before the first optimizer update.
+    # use the qualified upstream image until compatible per-architecture digests are qualified.
+    # native jit remains available when this image has no matching kernel cache.
     return WORKER_IMAGE
 
 
