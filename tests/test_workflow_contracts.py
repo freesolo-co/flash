@@ -697,7 +697,10 @@ def test_the_job_cap_leaves_room_for_a_rollback_after_every_wait_is_exhausted():
     from flash.serving.promotion import gate as gate_module
 
     gate_budget = (
-        gate_module.CANARY_TIMEOUT_SECONDS + gate_module._DEFAULT_ACCOUNTING_DEADLINE_SECONDS
+        gate_module.CANARY_TIMEOUT_SECONDS
+        + gate_module._DEFAULT_ACCOUNTING_DEADLINE_SECONDS
+        + gate_module._HEALTH_ROLLOUT_DEADLINE_SECONDS
+        + 15  # rollback schema probe
     )
     # two `modal deploy` invocations (forward and restore), image build included, plus checkout and
     # dependency installation. deliberately generous: the assertion should fail while there is still
@@ -749,6 +752,8 @@ def _run_rollback(
     is_ancestor: bool,
     health: str,
     entrypoint: str | None = "flash/serving/app/modal_app.py",
+    schema_status: str = "200",
+    has_schema_contract: bool = True,
 ) -> tuple[int, str, str]:
     """Execute the rollback script with `modal`, `curl`, `git`, and `sleep` stubbed on PATH.
 
@@ -770,6 +775,14 @@ def _run_rollback(
         app = root / "flash/serving/app/modal_app.py"
         app.parent.mkdir(parents=True, exist_ok=True)
         app.touch()
+        columns_path = root / (
+            "flash/serving/src/persisted_columns.py"
+            if entrypoint == "flash/serving/modal_app.py"
+            else "flash/serving/src/store/persisted_columns.py"
+        )
+        if has_schema_contract:
+            columns_path.parent.mkdir(parents=True, exist_ok=True)
+            columns_path.write_text('PERSISTED_COLUMNS = "adapter_id,base_model"\n')
         calls = root / "modal-calls.txt"
         (bin_dir / "modal").write_text(
             '#!/bin/sh\n[ -f "$2" ] || exit 2\nprintf "%s sha=%s id=%s\\n" "$*" "$FREESOLO_DEPLOYMENT_SHA" '
@@ -777,7 +790,9 @@ def _run_rollback(
         )
         # the health body is served from a file; `--output` is where the script wants it.
         (bin_dir / "curl").write_text(
-            '#!/bin/sh\nfor arg in "$@"; do\n'
+            '#!/bin/sh\ncase "$*" in\n'
+            '  *hosted_lora_adapters*) printf "%s" "$SCHEMA_STATUS"; exit 0;;\n'
+            'esac\nfor arg in "$@"; do\n'
             '  if [ "$prev" = "--output" ]; then out="$arg"; fi\n  prev="$arg"\ndone\n'
             'printf "%s" "$HEALTH_BODY" > "$out"\nexit 0\n'
         )
@@ -815,6 +830,9 @@ def _run_rollback(
                 "RESTORED_ENTRYPOINT": entrypoint or "",
                 "ANCESTOR_EXIT": "0" if is_ancestor else "1",
                 "HEALTH_BODY": health,
+                "SCHEMA_STATUS": schema_status,
+                "SUPABASE_URL": "https://supabase.example",
+                "SUPABASE_SERVICE_ROLE_KEY": "sb_secret_test",
                 "PREVIOUS_SHA": previous_sha,
                 "CURRENT_SHA": CURRENT,
                 "ROLLBACK_DEPLOYMENT_ID": "9-1-rollback",
@@ -986,6 +1004,31 @@ def test_rollback_refuses_a_release_without_a_serving_entrypoint():
     assert code != 0
     assert deployed == ""
     assert "no supported serving entrypoint" in logged
+
+
+@pytest.mark.parametrize("schema_status", ["400", "401", "500", "000"])
+def test_rollback_does_not_deploy_an_unverified_database_contract(schema_status):
+    code, deployed, logged = _run_rollback(
+        previous_sha=PREVIOUS,
+        is_ancestor=True,
+        health=_health(PREVIOUS, "9-1-rollback"),
+        schema_status=schema_status,
+    )
+    assert code != 0
+    assert deployed == ""
+    assert "refusing rollback" in logged
+
+
+def test_rollback_does_not_deploy_without_a_schema_contract():
+    code, deployed, logged = _run_rollback(
+        previous_sha=PREVIOUS,
+        is_ancestor=True,
+        health=_health(PREVIOUS, "9-1-rollback"),
+        has_schema_contract=False,
+    )
+    assert code != 0
+    assert deployed == ""
+    assert "Cannot verify" in logged
 
 
 @pytest.mark.parametrize("org_id", ["", "   ", "invalid", "11111111-2222-4333-8444-555555555555"])

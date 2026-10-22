@@ -43,6 +43,8 @@ from flash.serving.promotion.canary import (
 )
 from flash.serving.promotion.evidence import (
     ACCOUNTING_MALFORMED,
+    HEALTH_DEPLOYMENT_ID_MISMATCH,
+    HEALTH_SHA_MISMATCH,
     PromotionVerdict,
     StreamEvidence,
     parse_accounting,
@@ -75,6 +77,9 @@ HEALTH_UNREACHABLE = "health_unreachable"
 #
 _DEFAULT_ACCOUNTING_DEADLINE_SECONDS = 180.0
 _ACCOUNTING_POLL_SECONDS = 5.0
+# Modal can briefly route health requests to both releases during a rollout, even
+# after the workflow's first successful readiness probe.
+_HEALTH_ROLLOUT_DEADLINE_SECONDS = 60.0
 _BACKLOG_SNAPSHOT_RPC = "serving_promotion_accounting_snapshot"
 _MAX_TOKENS = 32
 _REQUIRED_ENV = (
@@ -95,20 +100,20 @@ async def evaluate_promotion(
     accounting_loader: AccountingLoader,
     expected_sha: str,
     expected_deployment_id: str,
+    health_deadline_seconds: float = _HEALTH_ROLLOUT_DEADLINE_SECONDS,
     accounting_deadline_seconds: float = _DEFAULT_ACCOUNTING_DEADLINE_SECONDS,
     poll_seconds: float = _ACCOUNTING_POLL_SECONDS,
     sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
     clock: Callable[[], float] = time.monotonic,
 ) -> PromotionVerdict:
-    try:
-        payload = await health_loader()
-    # an unreachable router is a failed promotion, not a crashed step: a crash skips the rollback.
-    except Exception:
-        return PromotionVerdict(ok=False, reason=HEALTH_UNREACHABLE)
-    verdict = verify_health(
-        parse_health(payload),
+    verdict = await _await_health(
+        health_loader,
         expected_sha=expected_sha,
         expected_deployment_id=expected_deployment_id,
+        deadline_seconds=health_deadline_seconds,
+        poll_seconds=poll_seconds,
+        sleep=sleep,
+        clock=clock,
     )
     if not verdict.ok:
         return verdict
@@ -135,6 +140,42 @@ async def evaluate_promotion(
         sleep=sleep,
         clock=clock,
     )
+
+
+async def _await_health(
+    loader: HealthLoader,
+    *,
+    expected_sha: str,
+    expected_deployment_id: str,
+    deadline_seconds: float,
+    poll_seconds: float,
+    sleep: Callable[[float], Awaitable[None]],
+    clock: Callable[[], float],
+) -> PromotionVerdict:
+    """Wait out rollout identity drift without sending a canary to a stale release."""
+    deadline = clock() + max(0.0, deadline_seconds)
+    verdict = PromotionVerdict(ok=False, reason=HEALTH_UNREACHABLE)
+    while (remaining := deadline - clock()) > 0:
+        try:
+            payload = await asyncio.wait_for(loader(), timeout=remaining)
+        except TimeoutError:
+            return verdict
+        except Exception:
+            return PromotionVerdict(ok=False, reason=HEALTH_UNREACHABLE)
+        if clock() >= deadline:
+            return verdict
+        verdict = verify_health(
+            parse_health(payload),
+            expected_sha=expected_sha,
+            expected_deployment_id=expected_deployment_id,
+        )
+        if verdict.reason not in (HEALTH_SHA_MISMATCH, HEALTH_DEPLOYMENT_ID_MISMATCH):
+            return verdict
+        remaining = deadline - clock()
+        if remaining <= 0:
+            break
+        await sleep(min(max(0.0, poll_seconds), remaining))
+    return verdict
 
 
 async def _await_accounting(

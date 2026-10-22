@@ -42,12 +42,13 @@ jobs:
     runs-on: ubuntu-latest
     # the job's own bounded waits now sum well past the old 30: two 300s readiness polls, the remote
     # image build, a 3360s canary that pays a GPU cold start, a 180s accounting deadline, and on the
-    # failure path a SECOND `modal deploy` plus a 300s restore poll. 90 minutes clears that worst
+    # failure path a SECOND `modal deploy` plus a 300s restore poll. The 60s identity wait and 15s
+    # rollback schema probe also count toward this bound. 95 minutes clears that worst
     # case with room while keeping a wedged deploy from holding the runner for GitHub's 6-hour
     # default. the headroom is specifically for the rollback: a job killed partway through the
     # restore leaves the broken release live with no second attempt, which is the one outcome this
     # workflow exists to prevent.
-    timeout-minutes: 90
+    timeout-minutes: 95
     # serialize serving deploys across runs because each deploy mutates the live app. github can still
     # replace a pending run, so the gate compares against the sha reported by the deployed app rather
     # than assuming every push predecessor was deployed.
@@ -477,6 +478,24 @@ jobs:
             rollback_app=flash/serving/modal_app.py
           else
             echo "::error::Previous release has no supported serving entrypoint. Restore production manually."
+            exit 1
+          fi
+
+          # A source ancestor can be incompatible after an irreversible schema cutover.
+          # Probe its own column contract before replacing the schema-compatible app.
+          columns_file=flash/serving/src/store/persisted_columns.py
+          if [ ! -f "$columns_file" ]; then
+            columns_file=flash/serving/src/persisted_columns.py
+          fi
+          if ! columns="$(python -c 'import runpy, sys; print(runpy.run_path(sys.argv[1])["PERSISTED_COLUMNS"])' "$columns_file")" || [ -z "$columns" ]; then
+            echo "::error::Cannot verify the previous release's schema contract; refusing rollback. Restore production manually."
+            exit 1
+          fi
+          if ! schema_status="$(curl --silent --show-error --output /dev/null --write-out '%{http_code}' \
+            --connect-timeout 5 --max-time 15 \
+            --header "apikey: $SUPABASE_SERVICE_ROLE_KEY" --header "Accept-Profile: flash" \
+            "${SUPABASE_URL%/}/rest/v1/hosted_lora_adapters?select=${columns}&limit=1")" || [ "$schema_status" != "200" ]; then
+            echo "::error::Previous release is not compatible with the current database schema or its schema could not be verified; refusing rollback. Restore production manually."
             exit 1
           fi
 
