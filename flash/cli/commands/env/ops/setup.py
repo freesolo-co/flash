@@ -226,7 +226,7 @@ All three algorithms train off this file:
   `output = {"messages": [...]}` (a full assistant/tool trajectory) or a scalar
   `output` for a single gold assistant turn.
 - OPD (configs/opd.toml) rolls out each episode and distils EVERY assistant turn against
-  the managed Parasail teacher (GLM 5.2 by default; pick another with [train] teacher_model),
+  the managed Parasail teacher (GLM 5.3 by default; pick another with [train] teacher_model),
   conditioned on the transcript so far — the multi-turn on-policy-distillation objective. The
   teacher key is platform-managed (nothing to set).
 """
@@ -788,9 +788,9 @@ def _write_opd_config(
             "epochs = 1\n"
             f"{max_examples_line}"
             "lora_rank = 32\n"
-            '# teacher_model = "glm-5.2"   # teacher: glm-5.2 (default) | kimi-k3 |\n'
-            "#                             # qwen3.5-397b-a17b | deepseek-v4-pro |\n"
-            "#                             # qwen3-vl-235b\n"
+            '# teacher_model = "glm-5.3"   # teacher: glm-5.3 (default) | kimi-k3 |\n'
+            "#                             # qwen3.5-397b-a17b | deepseek-v4.1-flash-1017 |\n"
+            "#                             # qwen3.8-27b | qwen3-vl-235b\n"
             "#                             # (key stays managed)\n"
             "# GPU and HF artifacts are managed automatically by the platform: the GPU is\n"
             "# the cheapest fitting managed class, and artifacts live in a private environment-scoped repo.\n"

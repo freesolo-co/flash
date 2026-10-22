@@ -792,13 +792,13 @@ _INAPPLICABLE_CASES = [
     ("sft", "max_completion_tokens", 512),
     ("sft", "kl_penalty_coef", 0.5),
     ("sft", "thinking_length_penalty_coef", 0.1),
-    ("sft", "teacher_model", "glm-5.2"),
+    ("sft", "teacher_model", "glm-5.3"),
     ("sft", "credit_assignment", "per_turn"),
     ("sft", "stop_sequences", ["END"]),
     ("sft", "structured_outputs", '{"type": "object"}'),
     ("opd", "thinking_length_penalty_coef", 0.1),
     ("opd", "credit_assignment", "per_turn"),
-    ("grpo", "teacher_model", "glm-5.2"),
+    ("grpo", "teacher_model", "glm-5.3"),
 ]
 
 # the same knobs on an algorithm whose worker DOES read them. without this direction a validator
@@ -818,7 +818,7 @@ _APPLICABLE_CASES = [
     ("opd", "structured_outputs", '{"type": "object"}'),
     ("grpo", "thinking_length_penalty_coef", 0.1),
     ("grpo", "credit_assignment", "per_turn"),
-    ("opd", "teacher_model", "glm-5.2"),
+    ("opd", "teacher_model", "glm-5.3"),
 ]
 
 
