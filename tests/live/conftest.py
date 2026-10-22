@@ -19,6 +19,13 @@ _KEY_SNAPSHOT = {k: os.environ.get(k) for k in ("MODAL_TOKEN_ID", "MODAL_TOKEN_S
 
 
 @pytest.fixture(autouse=True)
+def _offline_http():
+    """Real provider smoke tests keep their existing explicit opt-in."""
+    if os.environ.get("FLASH_LIVE") != "1":
+        pytest.skip("live smoke disabled; set FLASH_LIVE=1 (and provider creds) to run")
+
+
+@pytest.fixture(autouse=True)
 def _require_live_optin(monkeypatch):
     if os.environ.get("FLASH_LIVE") != "1":
         pytest.skip("live smoke disabled; set FLASH_LIVE=1 (and provider creds) to run")
