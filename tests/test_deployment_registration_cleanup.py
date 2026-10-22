@@ -49,7 +49,7 @@ def test_retired_ready_deployments_are_revoked_and_failed_cleanup_is_retried(api
         assert target == f"{retired}/final"
         assert org_id == run_serving_org_id(current)
         assert timeout_s == 5.0
-        assert status.get_status(retired).deployments[target]["state"] == "cleanup_pending"
+        assert status.get_status(retired).deployments[target]["state"] == "undeploying"
         calls.append(target)
         if len(calls) == 1:
             raise ServingError("temporary serving outage")
@@ -60,7 +60,7 @@ def test_retired_ready_deployments_are_revoked_and_failed_cleanup_is_retried(api
     assert not calls
     assert serving_completion.cleanup_pending_deployments(Event())
     pending = status.get_status(retired).deployments[f"{retired}/final"]
-    assert pending["state"] == "cleanup_pending"
+    assert pending["state"] == "undeploying"
     assert "temporary serving outage" in pending["error"]
     assert serving_completion.recover_deployments() == 1
     assert not serving_completion.cleanup_pending_deployments(Event())
@@ -503,9 +503,7 @@ def test_restart_uses_durable_registration_intent(api, monkeypatch, stage):
         assert reads == [(identity["org_id"], target)]
         assert deletes == ([target] if stage == "matching_binding" else [])
         assert recovered.deployments[target]["state"] == (
-            "cleanup_pending"
-            if stage in {"unavailable_registry", "slow_registry"}
-            else "undeployed"
+            "undeploying" if stage in {"unavailable_registry", "slow_registry"} else "undeployed"
         )
     assert recovered.deployments[sibling] == snapshot[0].deployments[sibling]
     late = {
