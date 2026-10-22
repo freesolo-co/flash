@@ -165,3 +165,45 @@ def test_bootstrap_publishes_start_identity_before_setup(monkeypatch):
             {"run_id": "queued-run", "attempt": 3, "ts": 150},
         )
     ]
+
+
+@pytest.mark.parametrize("returncode", [1, 2, 42, 127])
+def test_nonzero_process_exit_is_not_preemption_when_failure_upload_is_missing(
+    monkeypatch, polling, returncode
+):
+    _, _, _, handle, spec = polling
+    monkeypatch.setattr(
+        api, "get_instance", lambda *_a, **_k: {"status": "terminated", "returncode": returncode}
+    )
+    result = jobs.poll(handle, spec, deadline_at=10000)
+    assert result.failure == "job_failed"
+    assert f"exit code {returncode}" in result.detail
+
+
+@pytest.mark.parametrize("returncode", [None, 0, -1, 137, 143, True, "1"])
+def test_unknown_or_signal_exit_keeps_host_loss_recovery(monkeypatch, polling, returncode):
+    _, _, _, handle, spec = polling
+    monkeypatch.setattr(
+        api, "get_instance", lambda *_a, **_k: {"status": "terminated", "returncode": returncode}
+    )
+    assert jobs.poll(handle, spec, deadline_at=10000).failure == "job_preempted"
+
+
+def test_explicit_retriable_worker_evidence_overrides_process_exit(monkeypatch, polling):
+    _, _, _, handle, spec = polling
+    monkeypatch.setattr(
+        api, "get_instance", lambda *_a, **_k: {"status": "terminated", "returncode": 1}
+    )
+    monkeypatch.setattr(
+        jobs,
+        "heartbeat_reader_for",
+        lambda *_a, **_k: (
+            lambda **_kw: {
+                "stage": "error_sft",
+                "ts": 100,
+                "attempt": 0,
+                "retriable": True,
+            }
+        ),
+    )
+    assert jobs.poll(handle, spec, deadline_at=10000).failure == "job_preempted"

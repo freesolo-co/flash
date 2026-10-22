@@ -46,11 +46,25 @@ def managed_hf_repo_for_environment(env_id: str) -> str:
     return f"{artifact_namespace()}/{_environment_artifact_repo_name(env_id)}"
 
 
+def managed_hf_repo_for_run(env_id: str, run_id: str) -> str:
+    """isolate each new run's commits while keeping retries in one stable private repo."""
+    if not run_id or run_id == "local":
+        raise ValueError("run_id must be finalized before assigning the artifact repo")
+    # environment-only repositories share an upstream commit quota across every concurrent run.
+    # hash a framed identity so different environment/run pairs cannot alias by concatenation.
+    identity = f"{len(env_id)}:{env_id}{run_id}"
+    digest = hashlib.sha256(identity.encode("utf-8")).hexdigest()[:24]
+    label = re.sub(r"[^A-Za-z0-9]+", "-", run_id).strip("-") or "run"
+    budget = _ARTIFACT_REPO_NAME_MAX - len(_ARTIFACT_REPO_PREFIX) - len(digest) - 1
+    name = f"{_ARTIFACT_REPO_PREFIX}{label[:budget].rstrip('-')}-{digest}"
+    return f"{artifact_namespace()}/{name}"
+
+
 def _assign_managed_hf_repo(spec: JobSpec) -> JobSpec:
-    """Assign the environment-scoped HF artifact repo (platform-managed, never user-set)."""
+    """Assign a private run-scoped repo at submit; persisted older assignments stay intact."""
     if not spec.run_id or spec.run_id == "local":
         raise ValueError("run_id must be finalized before assigning the artifact repo")
-    repo = managed_hf_repo_for_environment(spec.environment.id)
+    repo = managed_hf_repo_for_run(spec.environment.id, spec.run_id)
     d = spec.to_internal_dict()
     d["train"] = {**d["train"], "hf_repo": repo}
     return JobSpec.from_dict(d)
