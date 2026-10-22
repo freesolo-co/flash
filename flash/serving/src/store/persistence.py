@@ -51,6 +51,21 @@ def load_adapters(settings: Settings) -> list[AdapterRecord]:
     )
 
 
+def load_checkpoint_bindings(settings: Settings) -> list[AdapterRecord]:
+    """Read every durable binding for artifact protection, regardless of deployment state.
+
+    Unlike routing reloads, cleanup must reject unavailable or malformed storage instead of
+    silently omitting a checkpoint whose source files are still needed.
+    """
+    if not settings.has_supabase:
+        raise PersistenceRecordError("checkpoint binding storage is not configured")
+    return _list_adapters(
+        settings,
+        {"order": "org_id.asc,checkpoint_id.asc"},
+        "load checkpoint artifact protections",
+    )
+
+
 def _list_adapters(
     settings: Settings,
     filters: dict[str, str],

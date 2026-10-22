@@ -8,6 +8,7 @@ Every route here is gated on the shared internal key: these are control-plane op
 caller-facing inference.
 """
 
+import asyncio
 from typing import Any, TypeGuard
 
 from fastapi import APIRouter, BackgroundTasks, HTTPException, Request, status
@@ -22,7 +23,9 @@ from flash.serving.src.io.schemas import (
     internal_adapter_payload,
 )
 from flash.serving.src.store.access import _replace_stored_cas
+from flash.serving.src.store.persistence import load_checkpoint_bindings
 from flash.serving.src.store.registration import persist_checkpoint
+from flash.serving.src.store.settings import get_settings
 from flash.serving.src.store.undeploy import (
     apply_teardown,
     disable_matched,
@@ -44,6 +47,22 @@ async def list_adapters(request: Request) -> dict[str, Any]:
     context.assert_internal(request)
     await context.reload_if_configured()
     return {"ok": True, "adapters": context.router.ready_adapters()}
+
+
+@adapter_router.get("/artifact-protections")
+async def list_artifact_protections(request: Request) -> dict[str, Any]:
+    """Protect permanent sources, including bindings not yet loaded by any router."""
+    ServingContext.of(request).assert_internal(request)
+    try:
+        bindings = await asyncio.to_thread(load_checkpoint_bindings, get_settings())
+    except Exception as exc:
+        raise HTTPException(
+            status.HTTP_503_SERVICE_UNAVAILABLE, "checkpoint artifact protections unavailable"
+        ) from exc
+    return {
+        "ok": True,
+        "bindings": [{"repo_id": row.repo_id, "subfolder": row.subfolder} for row in bindings],
+    }
 
 
 async def _claim_loading_generation(

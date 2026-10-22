@@ -280,3 +280,39 @@ def test_row_hydration_preserves_exact_source_identity() -> None:
     assert hydrated.deployment_generation == "generation-1"
     assert row["checkpoint_id"] == CHECKPOINT_ID
     assert row["checkpoint"] == "step-20"
+
+
+def test_artifact_protections_read_all_pages_and_deployment_states(monkeypatch):
+    from flash.serving.src.store import persistence
+
+    monkeypatch.setattr(persistence, "_ADAPTER_PAGE", 1)
+    rows = [_row(status="ready"), _row(status="disabled", deployment_generation="loading")]
+
+    def get(self, url, **kwargs):
+        self.requests.append({"method": "GET", "url": url, **kwargs})
+        params = kwargs["params"]
+        assert "status" not in params
+        offset = int(params["offset"])
+        return httpx.Response(
+            200, json=rows[offset : offset + 1], request=httpx.Request("GET", url)
+        )
+
+    monkeypatch.setattr(FakeClient, "get", get)
+    records = persistence.load_checkpoint_bindings(_settings())
+    assert [record.status for record in records] == ["ready", "disabled"]
+    assert len(FakeClient.requests) == 3
+
+
+def test_artifact_protections_reject_invalid_rows_instead_of_skipping():
+    from flash.serving.src.store.persistence import load_checkpoint_bindings
+
+    FakeClient.get_rows = [_row(), {"checkpoint_id": "invalid"}]
+    with pytest.raises(PersistenceRecordError):
+        load_checkpoint_bindings(_settings())
+
+
+def test_artifact_protections_require_durable_storage():
+    from flash.serving.src.store.persistence import load_checkpoint_bindings
+
+    with pytest.raises(PersistenceRecordError, match="not configured"):
+        load_checkpoint_bindings(Settings(SUPABASE_URL="", SUPABASE_SERVICE_ROLE_KEY=""))

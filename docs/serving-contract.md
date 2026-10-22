@@ -65,6 +65,9 @@ Customer-owned deployments use `Authorization: Bearer <FLASH_SERVING_KEY>`. Free
 
 Registration returns `200` or `202`. `GET /adapters/{checkpoint_id}` reports lifecycle for that exact binding. A checkpoint becomes routable only after its exact adapter load succeeds and the generation-fenced durable row is promoted to `ready`.
 
+Artifact cleanup uses the internal-key-protected `GET /artifact-protections` endpoint. It reads all durable checkpoint bindings, including disabled/loading checkpoints, and returns only their source repositories and subfolders. Bound sources stay protected after undeploy so the same checkpoint can be loaded again. Cleanup fails closed if this endpoint or binding storage is unavailable or malformed; `/adapters` remains the ready-only routing inventory.
+
+
 Routing is direct. `POST /v1/chat/completions` requires the exact checkpoint id as `model`. There is no alias lookup, activation operation, current checkpoint, implicit final, first checkpoint, or sole-checkpoint fallback. Tenant authorization is checked against the checkpoint binding's owning organization before dispatch.
 
 The packaged, hosted, and managed OpenAI entry points retain the shared strict sampling grammar:
