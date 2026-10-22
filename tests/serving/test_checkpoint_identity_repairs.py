@@ -431,7 +431,7 @@ def test_undeploy_preserves_sibling_verification_and_identity(
     assert deployment_fixtures.ready_checkpoints(run_id) == frozenset({sibling})
 
 
-def test_chat_recovery_hint_uses_canonical_final_checkpoint() -> None:
+def test_chat_recovery_hint_requires_an_explicit_checkpoint() -> None:
     from fastapi import HTTPException
 
     from flash.server.routes.serving_chat import _require_active_deployment
