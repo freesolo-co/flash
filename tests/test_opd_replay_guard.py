@@ -1,242 +1,133 @@
+"""Replay failure precedence and bounded polling through the upstream sampler API."""
+
 from __future__ import annotations
 
+import importlib
+import sys
 import threading
-import time
+import types
 from collections import defaultdict
 from types import SimpleNamespace
 
 import pytest
 
-from flash.engine.worker.train.opd.child import bridge, replay_guard
+from flash.engine.worker.train.opd.child import bridge
 
 
-class _Buffer:
-    def __init__(self, sample):
-        self.lock = threading.Lock()
-        self.partitions = defaultdict(dict)
-        self.poll_interval = 0.001
-        self.sample = sample
+@pytest.fixture
+def recipe(monkeypatch):
+    clock = SimpleNamespace(now=0.0, advance=lambda: None)
+
+    class ReplayBuffer:
+        def __init__(self, **kwargs):
+            self.partitions = defaultdict(dict)
+            self.pending_keys = defaultdict(set)
+            self.running_keys = defaultdict(set)
+            self.failure_keys = defaultdict(set)
+            self.poll_interval = kwargs["poll_interval"]
+            self.snapshots = []
+
+        def _sync_metadata_from_transfer_queue(self):
+            pass
+
+        def sample(self, global_steps, partition_id, batch_size):
+            while True:
+                self._sync_metadata_from_transfer_queue()
+                self.snapshots.append((global_steps, partition_id, batch_size))
+                rows = self.partitions[partition_id]
+                if (
+                    rows
+                    and not self.pending_keys[partition_id]
+                    and not self.running_keys[partition_id]
+                ):
+                    return list(rows), {}
+                clock.now += self.poll_interval
+                clock.advance()
+
+    dependency = types.ModuleType("verl.trainer.ppo.v1.replay_buffer")
+    dependency.ReplayBuffer = ReplayBuffer
+    monkeypatch.setitem(sys.modules, dependency.__name__, dependency)
+    name = "flash.engine.worker.train.opd.child.replay"
+    monkeypatch.setitem(sys.modules, name, types.ModuleType(name))
+    sys.modules.pop(name)
+    module = importlib.import_module(name)
+    monkeypatch.setattr(module, "time", SimpleNamespace(monotonic=lambda: clock.now))
+    monkeypatch.setattr(module, "_REPLAY_POLL_SECONDS", 0.1)
+    monkeypatch.setattr(module, "_REPLAY_STALL_SECONDS", 0.3)
+    monkeypatch.setattr(module, "_actor_probe_state", lambda _: "unknown")
+    monkeypatch.delenv("FLASH_OPD_ROLLOUT_FAILURE_PATH", raising=False)
+    return module, module.BoundedReplayBuffer(SimpleNamespace()), clock
 
 
-class _Upstream:
-    def __init__(self):
-        self.calls = 0
-        self.release = threading.Event()
-        self.value = object()
-        self.error: BaseException | None = None
-
-    def __call__(self, *, partition_id, global_steps=None, batch_size=None):
-        self.calls += 1
-        self.release.wait(timeout=2)
-        if self.error is not None:
-            raise self.error
-        return self.value
-
-
-def _trainer(buffer):
-    return SimpleNamespace(
-        replay_buffer=buffer,
-        async_rollout_manager=SimpleNamespace(agent_loop_workers=[]),
-    )
-
-
-def _run_sample(buffer, state):
-    try:
-        state["value"] = buffer.sample(partition_id="train", global_steps=7)
-    except BaseException as error:
-        state["error"] = error
-    finally:
-        state["done"].set()
-
-
-@pytest.fixture(autouse=True)
-def _fast_guard(monkeypatch):
-    monkeypatch.setattr(replay_guard, "_REPLAY_POLL_SECONDS", 0.002)
-    monkeypatch.setattr(replay_guard, "_REPLAY_STALL_SECONDS", 0.08)
-    monkeypatch.setattr(replay_guard, "_actor_probe_state", lambda _trainer: "unknown")
-
-
-def test_failed_prompt_beats_still_running_siblings_and_upstream_result():
-    upstream = _Upstream()
-    buffer = _Buffer(upstream)
-    buffer.partitions["train"] = {
-        "failed": {"global_steps": 7, "status": "failure"},
-        "sibling": {"global_steps": 7, "status": "running"},
-    }
-    replay_guard.install_bounded_replay_buffer_sample(_trainer(buffer))
-    upstream.release.set()
-
+def test_failed_prompt_beats_running_siblings_and_successful_rollouts(recipe):
+    _, buffer, _ = recipe
+    buffer.failure_keys["train"].add("failed")
+    buffer.running_keys["train"].add("sibling")
+    buffer.partitions["train"]["success"] = {"status": "success"}
     with pytest.raises(RuntimeError, match=r"failed prompt.*failed"):
-        buffer.sample(partition_id="train", global_steps=7)
-    assert upstream.calls == 1
+        buffer.sample(7, "train", 2)
+    assert not buffer.snapshots
 
 
-def test_recorded_rollout_cause_beats_generic_failed_prompt(monkeypatch, tmp_path):
-    rollout_path = tmp_path / "rollout-failure"
-    monkeypatch.setenv("FLASH_OPD_ROLLOUT_FAILURE_PATH", str(rollout_path))
+def test_recorded_rollout_cause_beats_generic_failed_prompt(recipe, monkeypatch, tmp_path):
+    _, buffer, _ = recipe
+    monkeypatch.setenv("FLASH_OPD_ROLLOUT_FAILURE_PATH", str(tmp_path / "failure"))
     try:
         raise LookupError("replay-original-sentinel")
     except LookupError as error:
         bridge._write_rollout_failure_fallback(error, "permanent")
-
-    upstream = _Upstream()
-    buffer = _Buffer(upstream)
-    buffer.partitions["train"]["failed"] = {"global_steps": 7, "status": "failure"}
-    replay_guard.install_bounded_replay_buffer_sample(_trainer(buffer))
-    upstream.release.set()
-
-    with pytest.raises(RuntimeError) as excinfo:
-        buffer.sample(partition_id="train", global_steps=7)
-    detail = str(excinfo.value)
-    assert "multi-turn OPD rollout failed" in detail
-    assert "LookupError" in detail
-    assert "replay-original-sentinel" in detail
-    assert "opd replay observed failed prompt" not in detail
+    buffer.failure_keys["train"].add("failed")
+    with pytest.raises(RuntimeError, match=r"LookupError.*replay-original-sentinel"):
+        buffer.sample(7, "train", 1)
 
 
-def test_initially_empty_step_stays_guarded_until_target_step_is_observed():
-    upstream = _Upstream()
-    buffer = _Buffer(upstream)
-    trainer = _trainer(buffer)
-    original_identity = trainer.replay_buffer
-    replay_guard.install_bounded_replay_buffer_sample(trainer)
-    upstream.release.set()
-    state = {"done": threading.Event()}
-    thread = threading.Thread(target=_run_sample, args=(buffer, state), daemon=True)
-    thread.start()
-
-    assert not state["done"].wait(0.03)
-    with buffer.lock:
-        buffer.partitions["train"]["prompt"] = {"global_steps": 7, "status": "finished"}
-    assert state["done"].wait(1)
-    assert state["value"] is upstream.value
-    assert trainer.replay_buffer is original_identity
+def test_empty_queue_waits_then_delegates_selection_to_upstream(recipe):
+    _, buffer, clock = recipe
+    clock.advance = lambda: buffer.partitions["train"].update(new={"status": "success"})
+    assert buffer.sample(7, "train", 3) == (["new"], {})
+    assert buffer.snapshots == [(7, "train", 3)] * 2
 
 
-def test_failure_before_during_and_after_upstream_sample_is_rejected():
-    for timing in ("before", "during", "after"):
-        upstream = _Upstream()
-        buffer = _Buffer(upstream)
-        if timing == "before":
-            buffer.partitions["train"]["prompt"] = {"global_steps": 7, "status": "failure"}
-        else:
-            buffer.partitions["train"]["prompt"] = {"global_steps": 7, "status": "running"}
-        replay_guard.install_bounded_replay_buffer_sample(_trainer(buffer))
-        state = {"done": threading.Event()}
-        thread = threading.Thread(target=_run_sample, args=(buffer, state), daemon=True)
-        thread.start()
-        if timing == "during":
-            with buffer.lock:
-                buffer.partitions["train"]["prompt"]["status"] = "failure"
-            upstream.release.set()
-        elif timing == "after":
-            upstream.release.set()
-            time.sleep(0.01)
-            with buffer.lock:
-                buffer.partitions["train"]["prompt"]["status"] = "failure"
-        else:
-            upstream.release.set()
-        assert state["done"].wait(1), timing
-        assert isinstance(state.get("error"), RuntimeError), timing
-        assert "failed prompt" in str(state["error"]), timing
+def test_running_sibling_failure_prevents_survivor_only_training(recipe):
+    _, buffer, clock = recipe
+    buffer.running_keys["train"].add("sibling")
+    buffer.partitions["train"]["success"] = {"status": "success"}
+    clock.advance = lambda: buffer.failure_keys["train"].add("sibling")
+    with pytest.raises(RuntimeError, match=r"failed prompt.*sibling"):
+        buffer.sample(7, "train", 2)
 
 
-def test_survivor_only_result_is_rechecked_before_return():
-    upstream = _Upstream()
-    buffer = _Buffer(upstream)
-    buffer.partitions["train"] = {
-        "prompt-a": {"global_steps": 7, "status": "finished"},
-        "prompt-b": {"global_steps": 7, "status": "running"},
-        "prompt-a_0_0": {"global_steps": 7, "status": "success"},
-    }
-    replay_guard.install_bounded_replay_buffer_sample(_trainer(buffer))
-    upstream.release.set()
-    state = {"done": threading.Event()}
-    threading.Thread(target=_run_sample, args=(buffer, state), daemon=True).start()
-    time.sleep(0.01)
-    with buffer.lock:
-        buffer.partitions["train"]["prompt-b"]["status"] = "failure"
-
-    assert state["done"].wait(1)
-    assert isinstance(state.get("error"), RuntimeError)
-
-
-def test_a_prompt_that_fails_while_upstream_returns_cannot_reach_training(monkeypatch):
-    """the recheck after upstream returns, isolated from the top-of-loop check.
-
-    a prompt can flip to failure in the window between the loop's status read and the return of a
-    survivor-only batch. without the second read that batch trains on fewer rollouts than were
-    collected, so drive the two reads apart deterministically rather than by sleeping.
-    """
-    upstream = _Upstream()
-    buffer = _Buffer(upstream)
-    replay_guard.install_bounded_replay_buffer_sample(_trainer(buffer))
-    upstream.release.set()
-
-    terminal = (("prompt-a", "finished"), ("prompt-b", "finished"))
-    failed = (("prompt-a", "finished"), ("prompt-b", "failure"))
-    reads = {"count": 0}
-
-    def _staged(_buffer, _partition_id, _global_steps):
-        # every read the loop takes is terminal-and-clean; only the post-upstream read sees the
-        # failure, so a passing assertion can come from no other branch.
-        reads["count"] += 1
-        return failed if reads["count"] > 1 else terminal
-
-    monkeypatch.setattr(replay_guard, "_target_statuses", _staged)
-
-    with pytest.raises(RuntimeError, match=r"failed prompt.*prompt-b"):
-        buffer.sample(partition_id="train", global_steps=7)
-
-
-def test_actor_death_beats_upstream_but_probe_error_is_unknown(monkeypatch):
-    upstream = _Upstream()
-    buffer = _Buffer(upstream)
-    buffer.partitions["train"]["prompt"] = {"global_steps": 7, "status": "running"}
-    replay_guard.install_bounded_replay_buffer_sample(_trainer(buffer))
-    upstream.release.set()
-    monkeypatch.setattr(replay_guard, "_actor_probe_state", lambda _trainer: "dead")
+def test_actor_death_is_fatal_but_unknown_probe_allows_selection(recipe, monkeypatch):
+    module, buffer, _ = recipe
+    buffer.partitions["train"]["sample"] = {"status": "success"}
+    monkeypatch.setattr(module, "_actor_probe_state", lambda _: "dead")
     with pytest.raises(RuntimeError, match="actor died"):
-        buffer.sample(partition_id="train", global_steps=7)
-
-    upstream = _Upstream()
-    upstream.error = ValueError("upstream")
-    buffer = _Buffer(upstream)
-    buffer.partitions["train"]["prompt"] = {"global_steps": 7, "status": "finished"}
-    replay_guard.install_bounded_replay_buffer_sample(_trainer(buffer))
-    upstream.release.set()
-    monkeypatch.setattr(replay_guard, "_actor_probe_state", lambda _trainer: "unknown")
-    with pytest.raises(ValueError, match="upstream"):
-        buffer.sample(partition_id="train", global_steps=7)
+        buffer.sample(7, "train", 1)
+    monkeypatch.setattr(module, "_actor_probe_state", lambda _: "unknown")
+    assert buffer.sample(7, "train", 1) == (["sample"], {})
 
 
-def test_status_change_resets_stall_and_success_object_is_preserved():
-    upstream = _Upstream()
-    buffer = _Buffer(upstream)
-    buffer.partitions["train"]["prompt"] = {"global_steps": 7, "status": "running"}
-    replay_guard.install_bounded_replay_buffer_sample(_trainer(buffer))
-    state = {"done": threading.Event()}
-    threading.Thread(target=_run_sample, args=(buffer, state), daemon=True).start()
-    time.sleep(0.05)
-    with buffer.lock:
-        buffer.partitions["train"]["prompt"]["status"] = "finished"
-    upstream.release.set()
+def test_status_changes_reset_stall_budget(recipe):
+    _, buffer, clock = recipe
+    buffer.pending_keys["train"].add("prompt")
 
-    assert state["done"].wait(1)
-    assert state["value"] is upstream.value
+    def progress():
+        if clock.now >= 0.5:
+            buffer.running_keys["train"].clear()
+            buffer.partitions["train"]["sample"] = {"status": "success"}
+        elif clock.now >= 0.2:
+            buffer.pending_keys["train"].clear()
+            buffer.running_keys["train"].add("prompt")
+
+    clock.advance = progress
+    assert buffer.sample(7, "train", 1) == (["sample"], {})
+    assert clock.now >= 0.5
 
 
-def test_installer_is_idempotent_and_stall_is_named():
-    upstream = _Upstream()
-    buffer = _Buffer(upstream)
-    buffer.partitions["train"]["prompt"] = {"global_steps": 7, "status": "running"}
-    trainer = _trainer(buffer)
-    replay_guard.install_bounded_replay_buffer_sample(trainer)
-    wrapped = buffer.sample
-    replay_guard.install_bounded_replay_buffer_sample(trainer)
-    assert buffer.sample is wrapped
-
-    upstream.release.set()
+def test_stalled_replay_is_named_without_a_sampling_thread(recipe):
+    _, buffer, _ = recipe
+    buffer.running_keys["train"].add("prompt")
+    before = set(threading.enumerate())
     with pytest.raises(RuntimeError, match="opd_replay_stall"):
-        buffer.sample(partition_id="train", global_steps=7)
-    assert upstream.calls == 1
+        buffer.sample(7, "train", 1)
+    assert set(threading.enumerate()) == before

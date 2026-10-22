@@ -24,7 +24,7 @@ from flash.engine.worker.train.entry.backend_common import (
     stamp_adapter_dir_provenance,
     undiscovered_checkpoint_dirs,
 )
-from flash.engine.worker.verl.checkpoints import MergeDiskExhaustedError, MergeDiskHeadroomError
+from flash.engine.worker.verl.checkpoints import MergeDiskExhaustedError
 
 _RESUME_MANIFEST = "_flash_resume_manifest.json"
 _RESUME_MANIFEST_VERSION = 2
@@ -346,7 +346,7 @@ class _VerlResumeUploader:
 
     def raise_if_incomplete(self) -> None:
         """fail clean completion when required durability or uploader work failed."""
-        if isinstance(self._error, (MergeDiskHeadroomError, MergeDiskExhaustedError)):
+        if isinstance(self._error, MergeDiskExhaustedError):
             raise self._error
         if self._error is not None:
             raise RuntimeError("verl resume uploader failed") from self._error

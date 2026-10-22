@@ -424,18 +424,9 @@ def resolve_verl_python(workdir: str, *, install_wandb: bool = False) -> str:
         # dev-only fallback (production uses FLASH_VERL_PYTHON on a prebuilt verl image): verl brings
         # its own torch/vllm, so use a full install rather than --no-deps to include runtime deps.
         subprocess.run(["uv", "venv", "--python", VERL_VENV_PYTHON, venv], check=True)
-        # the SAME four overrides Dockerfile.worker writes, for the same reason: this pin
-        # set deliberately violates declared ceilings, and a bare pin cannot break
-        # any of them -- a pin is a constraint the resolver must satisfy alongside the
-        # declaration, so the pair is simply unsatisfiable and the install fails outright.
-        # only --override makes uv IGNORE the declaration. all four lines are required;
-        # dropping any one leaves the set unsatisfiable or silently wrong: verl +
-        # transferqueue declare numpy<2.0.0 -> vllm 0.19.1 needs numpy>=2 verl[vllm]
-        # declares vllm>=0.8.5,<=0.12.0 -> flash needs 0.19.1 for the Qwen3.5 archs vllm
-        # declares xgrammar>=0.1.32 -> structured opd gates on EXACTLY 0.1.25 verl and
-        # vllm both depend on transformers with no upper bound -> an unpinned resolve
-        # drifts the interpreter that TRAINS onto a transformers line nothing validated,
-        # and transformers owns the gdn modelling code the boundary-reset shim patches.
+        # keep these overrides aligned with Dockerfile.worker. numpy and xgrammar
+        # override conflicting dependency metadata; vllm and transformers name the
+        # exact APIs used by the explicit model and tensor-adapter runtime.
         overrides = os.path.join(workdir, "verl-overrides.txt")
         with open(overrides, "w") as f:
             f.write(
@@ -451,10 +442,9 @@ def resolve_verl_python(workdir: str, *, install_wandb: bool = False) -> str:
                 py,
                 "--override",
                 overrides,
-                # the [vllm] extra, matching Dockerfile.worker's VERL_SPEC. verl's bare
-                # install_requires omits vllm, and every entrypoint flash launches needs it:
-                # main_ppo/main_ppo_sync set rollout.name=vllm.
-                f"{VERL_REQUIREMENT_NAME}[vllm] @ {VERL_REQUIREMENT_URL}",
+                # Upstream's [vllm] extra selects a full CUDA 13 / Torch 2.13 stack.
+                # Install the bare package with Flash's explicit CUDA 12.8 runtime instead.
+                f"{VERL_REQUIREMENT_NAME} @ {VERL_REQUIREMENT_URL}",
                 "vllm==0.19.1",
                 "numpy==2.2.6",
                 TRANSFORMERS_INSTALL_REQUIREMENT,
@@ -467,7 +457,7 @@ def resolve_verl_python(workdir: str, *, install_wandb: bool = False) -> str:
                 "uvicorn==0.52.4",
                 "fastapi==0.141.1",
                 # opd's entrypoint calls tq.init()/tq.close(); absent from verl's setup.py.
-                "TransferQueue==0.1.7",
+                "TransferQueue==0.1.11",
                 # older raises AttributeError on PyArrow PyExtensionType.
                 "datasets==5.0.1",
                 "qwen-vl-utils==0.0.14",

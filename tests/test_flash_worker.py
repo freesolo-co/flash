@@ -9,6 +9,7 @@ Covers:
 from __future__ import annotations
 
 import time
+from pathlib import Path
 
 import pytest
 
@@ -276,14 +277,12 @@ def test_build_worker_env_lists_declared_secret_names_for_the_redactors(
     monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "0,1")
     monkeypatch.setenv("FLA_TILELANG", "0")
     monkeypatch.setenv("WANDB_MODE", "offline")
-    child = _build_verl_child_env(
-        shim_dir=str(tmp_path), wandb_enabled=True, context=worker_context
-    )
+    child = _build_verl_child_env(wandb_enabled=True, context=worker_context)
 
     for name in declared:
         if name != "PYTHONPATH":
             assert name not in child
-    assert child["PYTHONPATH"] == str(tmp_path)
+    assert child["PYTHONPATH"] == str(Path(__file__).resolve().parents[1])
     assert SECRET_ENV_KEYS_ENV not in child
     assert "WANDB_API_KEY" in child
     assert child["CUDA_VISIBLE_DEVICES"] == "0,1"
@@ -649,11 +648,11 @@ def test_sft_train_keeps_the_optimizations_that_survived_the_trl_deletion():
 
     # sft renders its hydra overrides and child shims in train.sft.config, so the trainer's half of
     # this guard spans both modules. keep these in step when sft_train is split further.
-    from flash.engine.worker.train.sft.child import plugin as sft_plugin
+    from flash.engine.worker.train.core.child import options as runtime_options
     from flash.engine.worker.train.sft.setup import config as sft_config
 
     train_src = inspect.getsource(sft_train) + inspect.getsource(sft_config)
-    plugin_src = inspect.getsource(sft_plugin)
+    engine_src = Path(runtime_options.__file__).with_name("engine.py").read_text()
     # revision-aware vocab resolution: the worker must size the realized batch through the SAME
     # resolver the cost quote priced with, else a revision-pinned run drifts from its quote.
     assert "resolve_vocab_size(" in train_src
@@ -663,9 +662,8 @@ def test_sft_train_keeps_the_optimizations_that_survived_the_trl_deletion():
     # gradient checkpointing, with the MoE/GDN reentrant rule shared with grpo.
     assert "grad_checkpointing_on(" in train_src
     assert "grpo_use_reentrant(" in train_src
-    assert "_install_linear_scheduler" in plugin_src
-    # optimizer construction is owned by the upstream FSDP2 engine.
-    assert "_build_optimizer" not in plugin_src
+    assert "get_linear_schedule_with_warmup" in engine_src
+    assert "optimizer = super()._build_optimizer(module)" in engine_src
 
 
 @pytest.fixture

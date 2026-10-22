@@ -25,7 +25,6 @@ from flash.adapters.targets import resolve_lora_targeting
 from flash.core.catalog import get_model
 from flash.engine.plan.steps import sft_data_parallel_cards, widest_usable_dp_width
 from flash.engine.worker.runtime.state import WorkerContext
-from flash.engine.worker.train.core.child.runtime import TEXT_LORA_TARGET_SHIM
 from flash.engine.worker.train.entry import sft_train as _sft_train
 from flash.engine.worker.verl.parallelism import ULYSSES_SEQUENCE_PARALLEL_SIZE
 from flash.providers.core.base import rentable_gpu_counts
@@ -36,14 +35,11 @@ build_sft_overrides = _sft_train.build_sft_overrides
 # taken from the parent like every other name here, so the runner and `sft_train`'s own
 # `sft_data_loading`/`sft_configuring` wraps use one object rather than two imports of it.
 liveness_heartbeat = _sft_train.liveness_heartbeat
-render_sitecustomize_bootstrap = _sft_train.render_sitecustomize_bootstrap
-shim_marker_file = _sft_train.shim_marker_file
-verify_applied_shim_markers = _sft_train.verify_applied_shim_markers
-SHIM_FRAGMENT_FAILED_EXIT_CODE = _sft_train.SHIM_FRAGMENT_FAILED_EXIT_CODE
+readiness_file = _sft_train.readiness_file
+verify_runtime_ready = _sft_train.verify_runtime_ready
 sft_tokens_for_updates = _sft_train.sft_tokens_for_updates
 sft_finished_before_expected_steps = _sft_train.sft_finished_before_expected_steps
 validate_save_steps = _sft_train.validate_save_steps
-_render_sft_dataset_module = _sft_train._render_sft_dataset_module
 
 
 @dataclass(frozen=True)
@@ -130,8 +126,8 @@ class _SftChild:
     # carried because the result file reports it: recording the uncapped request would tell a reader
     # reconstructing the token budget that each rank held twice the rows it did.
     micro_batch: int
-    shim_markers: str
-    expected_shims: tuple[str, ...]
+    readiness_path: str
+    expected_components: tuple[str, ...]
 
 
 @dataclass
@@ -142,11 +138,11 @@ class _SftProgress:
     loss_curve: list[float]
     train_tokens: int
     wandb_link: dict[str, str | None]
-    # what the child plugin must prove applied; verified at the first optimizer step and again at
+    # what the child trainer must prove initialized; verified at the first optimizer step and again at
     # child exit.
-    shim_markers: str = ""
-    expected_shims: tuple[str, ...] = ()
-    shims_verified: bool = False
+    readiness_path: str = ""
+    expected_components: tuple[str, ...] = ()
+    runtime_verified: bool = False
 
 
 @dataclass(frozen=True)
@@ -168,7 +164,7 @@ class _SftOutputs:
 def _resolve_sft_options(spec, *, context: WorkerContext) -> _SftOptions:
     spec = spec or context.config.spec
     env = context.require_active_env()
-    # the child trainer is seeded through its shim, but the environment's dataset/completion calls
+    # the child trainer is seeded by its explicit initializer, but the environment's dataset/completion calls
     # run HERE in the parent. without this the documented top-level seed no longer reproduces sft
     # targets for any env whose row construction uses python/numpy randomness.
     _sft_train.seed_training_rngs(context.config.seed)
@@ -556,44 +552,29 @@ def _resolve_sft_run_identity(
     return loggers, project_name, _worker_wandb.wandb_run_name(context=context)
 
 
-def _write_sft_child_shims(
+def _write_sft_launch(
     options: _SftOptions,
     model: _SftModelSetup,
     *,
-    shim_dir: str,
-    custom_dataset_path: str,
+    runtime_dir: str,
     seed: int,
     loggers: list[str],
     gdn_reset_arch: str | None,
     multimodal: bool = False,
 ) -> tuple[str, tuple[str, ...], str]:
-    """write the SFT plugin bundle, startup bootstrap, and non-secret plugin config."""
-    # the bundle paths below are relative to flash/engine/worker/; this module now lives in
-    # worker/train/entry/, so climb back out of train/entry rather than anchoring here.
-    parent_dir = os.path.dirname(os.path.dirname(os.path.dirname(_sft_train.__file__)))
-    copies = (
-        ("train/core/child/runtime.py", "flash_verl_runtime.py"),
-        ("train/core/child/compact_checkpoint.py", "flash_compact_checkpoint.py"),
-        ("train/sft/child/plugin.py", "flash_sft_plugin.py"),
-        ("train/sft/child/entry.py", "flash_sft_entry.py"),
-        ("train/core/child/flashinfer_cache.py", "flash_verl_flashinfer.py"),
-    )
-    for source, target in copies:
-        shutil.copy2(os.path.join(parent_dir, *source.split("/")), os.path.join(shim_dir, target))
-    shim_markers = shim_marker_file(shim_dir)
-    with open(os.path.join(shim_dir, "sitecustomize.py"), "w", encoding="utf-8") as file:
-        file.write(render_sitecustomize_bootstrap())
-    with open(custom_dataset_path, "w", encoding="utf-8") as file:
-        file.write(_render_sft_dataset_module())
+    """write non-secret options for the packaged SFT entrypoint."""
+    readiness_path = readiness_file(runtime_dir)
+    if os.path.exists(readiness_path):
+        os.remove(readiness_path)
     text_only = bool(getattr(model, "exclude_modules", None))
-    plugin_config = json.dumps(
+    launch_config = json.dumps(
         {
-            "marker_file": shim_markers,
+            "readiness_path": readiness_path,
             "seed": int(seed),
             "save_at_steps": list(options.save_at_steps),
             "checkpoint_published_dir": os.path.join(options.paths.export_root, "_published"),
             "total_steps": int(model.update_horizon),
-            "reentrant_gradient_checkpointing": bool(model.reentrant_gradient_checkpointing),
+            "reentrant_checkpointing": bool(model.reentrant_gradient_checkpointing),
             "lora_language_prefix": (
                 get_model(options.model_id).lora_language_prefix if text_only else ""
             ),
@@ -604,12 +585,10 @@ def _write_sft_child_shims(
         sort_keys=True,
         separators=(",", ":"),
     )
-    expected = ("sft-core",)
-    if text_only:
-        expected += (TEXT_LORA_TARGET_SHIM,)
-    if gdn_reset_arch:
-        expected += ("gdn-varlen",)
-    return shim_markers, expected, plugin_config
+    config_path = os.path.join(runtime_dir, "launch.json")
+    with open(config_path, "w", encoding="utf-8") as handle:
+        handle.write(launch_config)
+    return readiness_path, ("runtime-ready",), config_path
 
 
 def _prepare_sft_child(
@@ -626,13 +605,13 @@ def _prepare_sft_child(
     loggers, project_name, experiment_name = _resolve_sft_run_identity(
         options, capabilities, context=context
     )
-    shim_dir = os.path.join(options.paths.workdir, "shim")
-    os.makedirs(shim_dir, exist_ok=True)
-    custom_dataset_path = os.path.join(shim_dir, "flash_verl_sft_dataset.py")
+    runtime_dir = os.path.join(options.paths.workdir, "runtime")
+    os.makedirs(runtime_dir, exist_ok=True)
+    custom_dataset_path = os.path.join(os.path.dirname(__file__), "../sft/child/dataset.py")
 
-    # the gdn boundary shim resets conv and recurrent state at packed example boundaries, but only
+    # the gdn boundary hook resets conv and recurrent state at packed example boundaries, but only
     # when the verl child has the kernels that read seq_idx and cu_seqlens; the no-fla fallbacks
-    # accept both and discard them. so the shim is installed only when the child proves it can reset.
+    # accept both and discard them. so the hook is installed only when the child proves it can reset.
     # `gdn_reset_arch` is resolved by the caller, inside the configuring liveness wrap, because the
     # probe is part of the setup silence that wrap exists to cover, and because a packed run must
     # take the RAISING gate there rather than the soft form.
@@ -676,11 +655,10 @@ def _prepare_sft_child(
         "fused_ce_backend": _sft_train._resolve_sft_fused_ce_backend(capabilities.caps),
     }
     overrides = build_sft_overrides(config)
-    shim_markers, expected_shims, plugin_config = _write_sft_child_shims(
+    readiness_path, expected_components, launch_config = _write_sft_launch(
         options,
         model,
-        shim_dir=shim_dir,
-        custom_dataset_path=custom_dataset_path,
+        runtime_dir=runtime_dir,
         seed=config["seed"],
         loggers=loggers,
         gdn_reset_arch=gdn_reset_arch,
@@ -718,10 +696,9 @@ def _prepare_sft_child(
         if missing:
             raise RuntimeError(f"required saves were not durably published: {missing}")
     child_env = _sft_train._build_verl_child_env(
-        shim_dir=shim_dir, wandb_enabled="wandb" in loggers, context=context
+        wandb_enabled="wandb" in loggers,
+        context=context,
     )
-    child_env["VERL_USE_EXTERNAL_MODULES"] = "flash_sft_plugin"
-    child_env["FLASH_SFT_PLUGIN_CONFIG"] = plugin_config
     command = [
         capabilities.python_bin,
         "-m",
@@ -732,7 +709,9 @@ def _prepare_sft_child(
         # every rank torchrun starts, so a rank the batch cannot feed is the `batch_size=0` crash.
         f"--nproc-per-node={world_size}",
         "-m",
-        "flash_sft_entry",
+        "flash.engine.worker.train.sft.child.entry",
+        "--flash-config",
+        launch_config,
         *overrides,
     ]
     return _SftChild(
@@ -748,8 +727,8 @@ def _prepare_sft_child(
         command=command,
         world_size=world_size,
         micro_batch=micro_batch,
-        shim_markers=shim_markers,
-        expected_shims=expected_shims,
+        readiness_path=readiness_path,
+        expected_components=expected_components,
     )
 
 
@@ -781,11 +760,11 @@ def _prepare_sft_progress(data: _SftData, model: _SftModelSetup, child: _SftChil
         loss_curve=[],
         train_tokens=train_tokens,
         wandb_link={},
-        shim_markers=child.shim_markers,
-        expected_shims=child.expected_shims,
+        readiness_path=child.readiness_path,
+        expected_components=child.expected_components,
         # a resume already at the horizon never launches the child,
-        # so there is no marker file to verify and nothing left for the shims to patch.
-        shims_verified=resume_step >= model.update_horizon,
+        # so there is no marker file to verify and no trainer to initialize.
+        runtime_verified=resume_step >= model.update_horizon,
     )
 
 
@@ -833,16 +812,16 @@ def _consume_sft_marker_line(progress: _SftProgress, line: str) -> bool:
     """Fold a child log line's non-metric markers in; answer whether it is an optimizer step.
 
     False means the caller has nothing further to do with the line. Before the first optimizer
-    step, verify that the required child runtime patches applied.
+    step, verify that the child runtime finished initialization.
     """
     link = _sft_train.parse_wandb_link(line)
     if link is not None:
         progress.wandb_link.update(link)
     if _sft_train.verl_step_number(line) is None:
         return False
-    if progress.expected_shims and not progress.shims_verified:
-        verify_applied_shim_markers(progress.shim_markers, progress.expected_shims)
-        progress.shims_verified = True
+    if progress.expected_components and not progress.runtime_verified:
+        verify_runtime_ready(progress.readiness_path, progress.expected_components)
+        progress.runtime_verified = True
     return True
 
 
@@ -914,22 +893,14 @@ def _run_sft_child(
     finally:
         device_peak_gpu_gb = gpu_sampler.stop_gb()
     train_wall = time.time() - train_started_at
-    if return_code == SHIM_FRAGMENT_FAILED_EXIT_CODE:
-        # permanent, not retriable infra: the same interpreter fails the same fragment on retry.
-        raise RuntimeError(
-            f"verl SFT subprocess exited {return_code}: a required flash runtime patch failed to "
-            "apply in the child interpreter (its traceback names the fragment in the flash log). "
-            "the verl/transformers stack at the child python is incompatible with this flash "
-            "version; rebuild the worker image or fix FLASH_VERL_PYTHON rather than retrying."
-        )
     if return_code != 0:
         raise RuntimeError(f"verl SFT subprocess exited with status {return_code}")
     # belt and braces behind the first-step check in _consume_sft_marker_line, for a child whose
-    # step lines the parent never parsed. shims_verified starts True when the child is not
+    # step lines the parent never parsed. runtime_verified starts True when the child is not
     # launched at all (resume already at the horizon).
-    if progress.expected_shims and not progress.shims_verified:
-        verify_applied_shim_markers(progress.shim_markers, progress.expected_shims)
-        progress.shims_verified = True
+    if progress.expected_components and not progress.runtime_verified:
+        verify_runtime_ready(progress.readiness_path, progress.expected_components)
+        progress.runtime_verified = True
     return train_wall, device_peak_gpu_gb
 
 

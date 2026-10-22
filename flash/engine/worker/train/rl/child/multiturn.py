@@ -1,4 +1,4 @@
-"""standalone child-side multi-turn GRPO rollout support for verl 0.8.0.
+"""standalone child-side multi-turn GRPO rollout support for pinned upstream Verl.
 
 stdlib only: the parent copies it into the child interpreter. GRPO must return one output per
 episode
@@ -17,26 +17,15 @@ import urllib.request
 from typing import Any
 from uuid import uuid4
 
-if __name__ == "flash_grpo_multiturn":
-    from flash_multiturn_glue import (
-        EnvGlueProcessor,
-        dedup_seam_terminator,
-        prepare_assistant_turn,
-        prepare_episode_prompt,
-        run_executor_call,
-        sum_preemptions,
-        turn_is_unusable,
-    )
-else:
-    from flash.engine.worker.train.core.child.glue import (
-        EnvGlueProcessor,
-        dedup_seam_terminator,
-        prepare_assistant_turn,
-        prepare_episode_prompt,
-        run_executor_call,
-        sum_preemptions,
-        turn_is_unusable,
-    )
+from flash.engine.worker.train.core.child.glue import (
+    EnvGlueProcessor,
+    dedup_seam_terminator,
+    prepare_assistant_turn,
+    prepare_episode_prompt,
+    run_executor_call,
+    sum_preemptions,
+    turn_is_unusable,
+)
 
 # reserve enough room after gluing an environment reply that the next model turn can actually
 # generate. gluing right up to the limit leaves zero completion tokens, so the engine would
@@ -250,7 +239,7 @@ def _agent_loop_output_fields(prompt, episode, *, reward_score, turn_rewards) ->
         "reward_score": reward_score,
         # per-turn credit assignment. the bridge returns one reward per emitted turn when
         # the environment scores turns and the run asked for per-turn credit; it returns
-        # None otherwise, and the advantage shim then falls back to episode credit for the
+        # None otherwise, and the advantage policy then falls back to episode credit for the
         # whole group. carried through extra_fields because that is the only channel the
         # agent loop transports into non_tensor_batch (agent_loop._postprocess).
         "extra_fields": {

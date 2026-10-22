@@ -152,15 +152,14 @@ def test_tilelang_artifacts_are_part_of_bake(tmp_path):
     assert kernel_warmup.has_raw_kernel_cache(str(tmp_path))
 
 
-def test_hopper_bakes_the_explicit_training_backend(monkeypatch):
-    from flash.engine.worker.train.core.child import runtime
-
+def test_bake_uses_the_native_training_backend(monkeypatch):
     implementation = object()
-    monkeypatch.setattr(runtime, "_flash_qla_impl", lambda: implementation)
-    torch = types.SimpleNamespace(
-        cuda=types.SimpleNamespace(get_device_capability=lambda _: (9, 0))
+    monkeypatch.setitem(
+        sys.modules,
+        "fla.ops.gated_delta_rule",
+        types.SimpleNamespace(chunk_gated_delta_rule=implementation),
     )
-    assert kernel_warmup._training_gdn_kernel(torch) is implementation
+    assert kernel_warmup._training_gdn_kernel() is implementation
 
 
 def test_flashinfer_prefill_bake_loads_the_pinned_rollout_library(monkeypatch):

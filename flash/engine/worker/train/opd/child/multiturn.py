@@ -1,4 +1,4 @@
-"""standalone child-side multi-turn OPD rollout support for verl 0.8.0."""
+"""standalone child-side multi-turn OPD rollout support for pinned upstream Verl."""
 
 from __future__ import annotations
 
@@ -9,30 +9,17 @@ import time
 from typing import Any
 from uuid import uuid4
 
-if __name__ == "flash_opd_multiturn":
-    from flash_multiturn_glue import (
-        EnvGlueProcessor,
-        dedup_seam_terminator,
-        normalize_token_ids,
-        prepare_assistant_turn,
-        prepare_episode_prompt,
-        run_executor_call,
-        sum_preemptions,
-        validate_glue_template,
-    )
-    from flash_opd_bridge import _write_rollout_failure_fallback
-else:
-    from flash.engine.worker.train.core.child.glue import (
-        EnvGlueProcessor,
-        dedup_seam_terminator,
-        normalize_token_ids,
-        prepare_assistant_turn,
-        prepare_episode_prompt,
-        run_executor_call,
-        sum_preemptions,
-        validate_glue_template,
-    )
-    from flash.engine.worker.train.opd.child.bridge import _write_rollout_failure_fallback
+from flash.engine.worker.train.core.child.glue import (
+    EnvGlueProcessor,
+    dedup_seam_terminator,
+    normalize_token_ids,
+    prepare_assistant_turn,
+    prepare_episode_prompt,
+    run_executor_call,
+    sum_preemptions,
+    validate_glue_template,
+)
+from flash.engine.worker.train.opd.child.bridge import _write_rollout_failure_fallback
 
 __all__ = [
     "EnvGlueProcessor",

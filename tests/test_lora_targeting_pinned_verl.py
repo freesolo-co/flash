@@ -20,14 +20,16 @@ from verl.workers.config import model as verl_model_config
 from verl.workers.config.model import HFModelConfig
 from verl.workers.engine.fsdp.transformer_impl import FSDPEngine
 
-from flash.engine.worker.train.core.child import runtime as child_runtime
+from flash.engine.worker.train.core.child import model as child_runtime
+from flash.engine.worker.train.core.child.engine import FlashFSDPEngine
+from flash.engine.worker.train.core.child.options import RuntimeOptions
 from flash.engine.worker.train.entry.backend_common import VERL_REQUIREMENT_URL
 
-_PINNED_COMMIT = "f71a02ddb32a9c6a6915f7519bda6dede92e9dd0"
+_PINNED_COMMIT = "ddf700725c34bb8966685c8ecf5ca36a2cc54a35"
 _PINNED_BLOBS = {
     "base_config.py": (BaseConfig, "f425dd1464b0f13c83a0944249cd84d55903f120"),
-    "model.py": (HFModelConfig, "95814663dcaa91f7e2984b1d4c39ca042712c485"),
-    "transformer_impl.py": (FSDPEngine, "2c66c6a3fad912d674bcf5f0a6454743725f33cd"),
+    "model.py": (HFModelConfig, "545ec4682189d3811311cd0ac8fcae3e153bef3b"),
+    "transformer_impl.py": (FSDPEngine, "fa5d3e89171f8e511b30e364a5dbef45354b7f55"),
 }
 
 
@@ -112,7 +114,7 @@ def _build_model_config(monkeypatch, fused_targets, override_config):
 def test_exact_pinned_verl_frozen_config_is_replaced_without_gpu_or_field_loss(monkeypatch):
     import torch
 
-    assert importlib.metadata.version("verl") == "0.8.0"
+    assert importlib.metadata.version("verl") == "0.10.0.dev0"
     assert VERL_REQUIREMENT_URL.endswith("@" + _PINNED_COMMIT)
     assert torch.cuda.is_available() is False
     for symbol, expected in _PINNED_BLOBS.values():
@@ -130,7 +132,6 @@ def test_exact_pinned_verl_frozen_config_is_replaced_without_gpu_or_field_loss(m
 
     monkeypatch.setattr(FSDPEngine, "_build_lora_module", original_builder)
     monkeypatch.setattr(child_runtime, "_text_lora_module_types", lambda: (_FakeLinear,))
-    child_runtime.install_text_lora_targeting("model.language_model")
 
     fused_targets = ["mlp.experts.gate_up_proj", "mlp.experts.down_proj"]
     override_config = {"sentinel": object()}
@@ -139,7 +140,8 @@ def test_exact_pinned_verl_frozen_config_is_replaced_without_gpu_or_field_loss(m
     with pytest.raises(FrozenInstanceError, match="target_modules"):
         original.target_modules = ["would-reproduce-the-live-failure"]
 
-    engine = FSDPEngine.__new__(FSDPEngine)
+    engine = FlashFSDPEngine.__new__(FlashFSDPEngine)
+    engine.runtime = RuntimeOptions("sft", 1, "ready", lora_language_prefix="model.language_model")
     engine.model_config = original
     result = engine._build_lora_module(_FakeModule())
 
@@ -181,9 +183,9 @@ def test_exact_pinned_verl_builder_isolates_same_engine_concurrent_calls(monkeyp
 
     monkeypatch.setattr(FSDPEngine, "_build_lora_module", original_builder)
     monkeypatch.setattr(child_runtime, "_text_lora_module_types", lambda: (_FakeLinear,))
-    child_runtime.install_text_lora_targeting("model.language_model")
     original = _build_model_config(monkeypatch, [], {"concurrent": True})
-    engine = FSDPEngine.__new__(FSDPEngine)
+    engine = FlashFSDPEngine.__new__(FlashFSDPEngine)
+    engine.runtime = RuntimeOptions("sft", 1, "ready", lora_language_prefix="model.language_model")
     engine.model_config = original
     live_engine.append(engine)
     modules = [_FakeModule("module."), _FakeModule("_orig_mod.")]
@@ -220,9 +222,9 @@ def test_exact_pinned_verl_builder_isolates_same_engine_reentry_and_exceptions(m
 
     monkeypatch.setattr(FSDPEngine, "_build_lora_module", original_builder)
     monkeypatch.setattr(child_runtime, "_text_lora_module_types", lambda: (_FakeLinear,))
-    child_runtime.install_text_lora_targeting("model.language_model")
     original = _build_model_config(monkeypatch, [], {"reentrant": True})
-    engine = FSDPEngine.__new__(FSDPEngine)
+    engine = FlashFSDPEngine.__new__(FlashFSDPEngine)
+    engine.runtime = RuntimeOptions("sft", 1, "ready", lora_language_prefix="model.language_model")
     engine.model_config = original
     live_engine.append(engine)
     outer_module = _FakeModule("_orig_mod.")

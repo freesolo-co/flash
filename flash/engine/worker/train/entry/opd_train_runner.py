@@ -30,7 +30,6 @@ from flash.engine.plan.steps import rl_data_parallel_cards
 from flash.engine.profiling.sft_workload import _materialize_verl_images
 from flash.engine.worker.entry import opd as _opd_entry
 from flash.engine.worker.runtime.state import WorkerContext
-from flash.engine.worker.train.core.child.runtime import TEXT_LORA_TARGET_SHIM
 from flash.engine.worker.train.entry.prompt_rows import canonical_prompt_messages
 from flash.engine.worker.train.opd.orchestration.reporting import (
     _build_train_note_sections as _build_train_note_sections,
@@ -43,7 +42,6 @@ from flash.engine.worker.train.opd.orchestration.state import (
     _RuntimeState,
     _WorkloadState,
 )
-from flash.engine.worker.verl.child_io import LORA_ROLLOUT_GUARD_SHIM
 from flash.engine.worker.verl.parallelism import (
     ULYSSES_SEQUENCE_PARALLEL_SIZE,
     resolve_reshard_after_forward,
@@ -138,7 +136,7 @@ def _prepare_workload(
     _reset_workdir(workdir)
     data_dir = os.path.join(workdir, "data")
     image_dir = os.path.join(workdir, "images")
-    shim_dir = os.path.join(workdir, "shim")
+    runtime_dir = os.path.join(workdir, "runtime")
     local_dir = os.path.join(workdir, "checkpoints")
     export_root = os.path.join(workdir, "checkpoint-adapters")
     mutation_failure_path = os.path.join(workdir, "mutation-failure")
@@ -147,7 +145,7 @@ def _prepare_workload(
     abandonment_failure_path = os.path.join(workdir, "abandonment-failure")
     resample_failure_path = os.path.join(workdir, "resample-failure")
     cycle_commit_failure_path = os.path.join(workdir, "cycle-commit-failure")
-    for path in (data_dir, shim_dir, local_dir, export_root):
+    for path in (data_dir, runtime_dir, local_dir, export_root):
         os.makedirs(path, exist_ok=True)
     materialized_images: dict[int, list[dict[str, str]]] = {}
     if multimodal:
@@ -191,7 +189,7 @@ def _prepare_workload(
         update_horizon,
         prompt_pool_fingerprint,
         workdir,
-        shim_dir,
+        runtime_dir,
         local_dir,
         export_root,
         mutation_failure_path,
@@ -215,6 +213,7 @@ def _prepare_workload(
             targeting,
             context=context,
         ),
+        multimodal=multimodal,
     )
 
 
@@ -246,12 +245,7 @@ def _materialize_child_files(
     wandb = request.spec.wandb if request.spec else None
     project_name = wandb.project if wandb and wandb.project else "flash"
     experiment_name = _worker_wandb.wandb_run_name(context=context)
-    entry_path, reward_path = _write_child_shims(
-        request,
-        workload,
-        gdn_reset_arch,
-        loggers,
-    )
+    entry_path, reward_path = _child_module_paths()
     resume_step, resume_state = _opd_failures._restore_verl_resume(
         workload.local_dir,
         prompt_pool_fingerprint=workload.prompt_pool_fingerprint,
@@ -295,46 +289,9 @@ def _materialize_child_files(
     )
 
 
-def _write_child_shims(
-    request: _OpdRequest,
-    workload: _WorkloadState,
-    gdn_reset_arch: str | None,
-    loggers: list[str],
-) -> tuple[str, str]:
-    shim_dir = workload.shim_dir
-    # the bundle paths below are relative to flash/engine/worker/; this module now lives in
-    # worker/train/entry/, so climb back out of train/entry rather than anchoring here.
-    parent_dir = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
-    copies = (
-        ("train/core/child/runtime.py", "flash_verl_runtime.py"),
-        ("train/core/child/compact_checkpoint.py", "flash_compact_checkpoint.py"),
-        (
-            "../../content/reasoning_normalization.py",
-            "flash_reasoning_normalization.py",
-        ),
-        ("train/core/child/glue.py", "flash_multiturn_glue.py"),
-        ("train/opd/child/runtime.py", "flash_opd_runtime.py"),
-        ("train/opd/child/plugin.py", "flash_opd_plugin.py"),
-        ("train/opd/child/bridge.py", "flash_opd_bridge.py"),
-        ("train/opd/child/structured.py", "flash_opd_structured.py"),
-        ("train/opd/child/tensors.py", "flash_opd_tensors.py"),
-        ("train/opd/child/multiturn.py", "flash_opd_multiturn.py"),
-        ("train/opd/child/entry.py", "flash_opd_entry.py"),
-        ("train/opd/child/replay_guard.py", "flash_opd_replay_guard.py"),
-        ("../../_internal/diagnostics.py", "flash_child_diagnostics.py"),
-        ("train/core/child/flashinfer_cache.py", "flash_verl_flashinfer.py"),
-    )
-    for source, target in copies:
-        shutil.copy2(os.path.join(parent_dir, *source.split("/")), os.path.join(shim_dir, target))
-    entry_path = os.path.join(shim_dir, "flash_opd_entry.py")
-    # use a zero custom reward: verl still runs scoring when use_task_rewards=false, and its default
-    # registry has no flash_opd entry (reward_loop.py:146-155).
-    reward_path = os.path.join(shim_dir, "flash_opd_reward.py")
-    with open(reward_path, "w", encoding="utf-8") as file:
-        file.write(_opd_protocol.OPD_ZERO_REWARD_SOURCE)
-    with open(os.path.join(shim_dir, "sitecustomize.py"), "w", encoding="utf-8") as file:
-        file.write(_backend.render_sitecustomize_bootstrap())
-    return entry_path, reward_path
+def _child_module_paths() -> tuple[str, str]:
+    child_dir = os.path.join(os.path.dirname(__file__), "../opd/child")
+    return "flash.engine.worker.train.opd.child.entry", os.path.join(child_dir, "reward.py")
 
 
 def _resolve_opd_gpu_mem_util(
@@ -452,8 +409,8 @@ def _build_child_callbacks(
     progress_state: Any,
     bridge: Any,
     resume_step: int,
-    shim_markers: str,
-    expected_shims: tuple[str, ...],
+    readiness_path: str,
+    expected_components: tuple[str, ...],
     *,
     context: WorkerContext,
 ) -> _ChildCallbacks:
@@ -465,10 +422,10 @@ def _build_child_callbacks(
         "truncation_step": None,
     }
     wandb_link: dict[str, str | None] = {}
-    shims_verified = False
+    runtime_verified = False
 
     def on_line(line: str) -> None:
-        nonlocal shims_verified
+        nonlocal runtime_verified
         watcher.raise_if_failed()
         link = _backend.parse_wandb_link(line)
         if link is not None:
@@ -476,16 +433,10 @@ def _build_child_callbacks(
         step_number = _backend.verl_step_number(line)
         if step_number is None:
             return
-        # the first step line is the training-start boundary: sitecustomize import is long finished
-        # by then, so a marker still missing means this child never ran ours at all -- a shadowing
-        # sitecustomize or a dropped PYTHONPATH entry -- and every rollout it has already served
-        # could have come from the base model. raising here kills the child (run_verl_training
-        # tears the process group down on a callback failure), which costs one step instead of the
-        # whole gpu and teacher budget. not on the first output line: fragments print while later
-        # ones are still applying.
-        if not shims_verified:
-            _backend.verify_applied_shim_markers(shim_markers, expected_shims)
-            shims_verified = True
+        # require successful trainer initialization before accepting progress.
+        if not runtime_verified:
+            _backend.verify_runtime_ready(readiness_path, expected_components)
+            runtime_verified = True
         # use parse_verl_metric because numpy 2 pprint emits np.float64(...); float() would drop
         # every step and leave a trained run with an empty loss curve.
         loss = _backend.parse_verl_metric(line, "actor/distillation/loss")
@@ -558,28 +509,28 @@ def _run_child(
     overrides = _opd_overrides.build_opd_overrides(config)
     progress_state = _opd_progress._OpdProgressState(runtime.resume_state)
     watcher = _build_checkpoint_watcher(request, workload, runtime, progress_state, context=context)
-    shim_markers = _backend.shim_marker_file(workload.shim_dir)
-    # the child installs opd-core only for a nonempty schedule, because exact-save
-    # filtering is the entire meaning of that marker.
-    expected_shims = (
-        (("opd-core",) if request.knobs.save_at_steps else ())
-        + ((TEXT_LORA_TARGET_SHIM,) if getattr(workload, "exclude_modules", None) else ())
-        + (LORA_ROLLOUT_GUARD_SHIM,)
-        + (("gdn-varlen",) if runtime.gdn_reset_arch else ())
-    )
+    readiness_path = _backend.readiness_file(workload.runtime_dir)
+    expected_components = ("runtime-ready",)
     callbacks = _build_child_callbacks(
         watcher,
         progress_state,
         runtime.bridge,
         runtime.resume_step,
-        shim_markers,
-        expected_shims,
+        readiness_path,
+        expected_components,
         context=context,
     )
     child_env = _build_child_env(
         request, prompt_state, workload, runtime, eos_token_ids, context=context
     )
-    command = [runtime.python_bin, runtime.entry_path, *overrides]
+    command = [
+        runtime.python_bin,
+        "-m",
+        runtime.entry_path,
+        "--flash-config",
+        os.path.join(workload.runtime_dir, "launch.json"),
+        *overrides,
+    ]
     gpu_sampler = _sft._NvidiaSmiPeakSampler().start()
     train_started_at = time.time()
     return_code = 0
@@ -696,7 +647,7 @@ def _build_child_env(
 ) -> dict[str, str]:
     bridge = runtime.bridge
     return _opd_overrides._build_opd_child_env(
-        shim_dir=workload.shim_dir,
+        runtime_dir=workload.runtime_dir,
         wandb_enabled="wandb" in runtime.loggers,
         bridge_url=bridge.url,
         bridge_token=bridge.token,
@@ -715,14 +666,17 @@ def _build_child_env(
         abandonment_failure_path=workload.abandonment_failure_path,
         resample_failure_path=workload.resample_failure_path,
         cycle_commit_failure_path=workload.cycle_commit_failure_path,
-        plugin_config=_opd_overrides._build_opd_plugin_config(
-            shim_dir=workload.shim_dir,
+        launch_config=_opd_overrides._build_opd_launch_config(
+            runtime_dir=workload.runtime_dir,
             save_at_steps=request.knobs.save_at_steps,
             total_steps=workload.update_horizon,
             lora_language_prefix=(
                 get_model(request.model_id).lora_language_prefix if workload.exclude_modules else ""
             ),
+            structured_outputs=request.structured_outputs,
             gdn_model_type=runtime.gdn_reset_arch,
+            reentrant_checkpointing=_worker_perf.grpo_use_reentrant(request.model_id),
+            multimodal=workload.multimodal,
             loggers=runtime.loggers,
         ),
         context=context,

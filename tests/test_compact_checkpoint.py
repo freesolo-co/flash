@@ -76,29 +76,57 @@ def test_training_child_inherits_pinned_base(worker_context, monkeypatch):
             worker_context.config, spec=SimpleNamespace(model="test/model", model_revision=REVISION)
         ),
     )
-    child = sft_train._build_verl_child_env(
-        shim_dir="/shim", wandb_enabled=False, context=worker_context
-    )
+    child = sft_train._build_verl_child_env(wandb_enabled=False, context=worker_context)
     assert child["FLASH_CHECKPOINT_MODEL_ID"] == "test/model"
     assert child["FLASH_CHECKPOINT_MODEL_REVISION"] == REVISION
 
 
-def test_runtime_always_installs_compact_checkpoints(monkeypatch):
-    from flash.engine.worker.train.core.child import compact_checkpoint, runtime
+def test_checkpoint_hooks_are_scoped_to_one_model_and_removed_after_failure(monkeypatch, tmp_path):
+    torch = pytest.importorskip("torch")
+    from flash.engine.worker.train.core.child import compact_checkpoint
 
     monkeypatch.setenv("FLASH_CHECKPOINT_MODEL_ID", "test/model")
     monkeypatch.setenv("FLASH_CHECKPOINT_MODEL_REVISION", REVISION)
-    calls = []
-    target = SimpleNamespace()
-    monkeypatch.setitem(sys.modules, "verl.utils.checkpoint.fsdp_checkpoint_manager", target)
-    monkeypatch.setattr(
-        compact_checkpoint, "install", lambda module, **kwargs: calls.append((module, kwargs))
+    monkeypatch.setitem(
+        sys.modules, "verl.utils.fsdp_utils", SimpleNamespace(fsdp_version=lambda _: 2)
     )
-    monkeypatch.setattr(
-        runtime, "install_deferred_required", lambda name, marker, module, apply: apply()
-    )
-    runtime.install_compact_checkpoints("markers.txt")
-    assert calls == [(target, {"model_id": "test/model", "revision": REVISION})]
+
+    def model():
+        result = torch.nn.Module()
+        result.register_parameter(
+            "base", torch.nn.Parameter(torch.tensor(1.0), requires_grad=False)
+        )
+        result.register_parameter("lora_A", torch.nn.Parameter(torch.tensor(2.0)))
+        result.register_buffer("counter", torch.tensor(3.0))
+        return result
+
+    selected, untouched = model(), model()
+    manager = SimpleNamespace(model=selected, rank=0, should_save_model=True)
+    state = {}
+
+    def failing_save():
+        with compact_checkpoint.saving(manager, tmp_path):
+            state.update(selected.state_dict())
+            assert set(state) == {"lora_A", "counter"}
+            assert set(untouched.state_dict()) == {"base", "lora_A", "counter"}
+            raise RuntimeError("save failed")
+
+    with pytest.raises(RuntimeError, match="save failed"):
+        failing_save()
+    assert set(selected.state_dict()) == {"base", "lora_A", "counter"}
+    state["lora_A"] = torch.tensor(8.0)
+    with compact_checkpoint.loading(manager, tmp_path):
+        selected.load_state_dict(state, strict=True)
+    assert selected.lora_A.item() == 8.0
+    assert selected.base.item() == 1.0
+    with pytest.raises(RuntimeError, match="Missing key"):
+        selected.load_state_dict(state, strict=True)
+    with (
+        pytest.raises(RuntimeError, match="load failed"),
+        compact_checkpoint.loading(manager, tmp_path),
+    ):
+        raise RuntimeError("load failed")
+    assert not selected._load_state_dict_pre_hooks
 
 
 @pytest.mark.parametrize("algorithm", ["sft", "grpo", "opd"])

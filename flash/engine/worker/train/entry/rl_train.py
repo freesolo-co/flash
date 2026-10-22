@@ -20,7 +20,6 @@ from flash.engine.worker.model.packing import model_is_gdn_hybrid
 from flash.engine.worker.perf import gpu_diagnostics
 from flash.engine.worker.runtime.state import WorkerContext
 from flash.engine.worker.train.entry.backend_common import (
-    VERL_REQUIREMENT,
     fused_ce_backend,
     gdn_probe_module,
     probe_verl_capabilities,
@@ -30,7 +29,6 @@ from flash.engine.worker.train.entry.backend_common import (
     resolve_rollout_enforce_eager,
     resolve_verl_python,
     rollout_fp8_kv,
-    verl_declares_rollout_field,
     verl_device_capability,
 )
 from flash.engine.worker.train.entry.rl_train_runner import (
@@ -47,7 +45,7 @@ from flash.engine.worker.train.entry.rl_train_runner import (
     _step_timing_fields,
     _StepMetricState,
     _validate_rl_child,
-    _write_rl_plugin_config,
+    _write_rl_launch_config,
 )
 from flash.engine.worker.train.entry.sft_train import _cached_model_path
 from flash.engine.worker.train.rl.launch.verl_config import (
@@ -151,24 +149,13 @@ def _configure_rl_child(
     caps,
     context: WorkerContext,
 ):
-    # masking truncated completions is a fork-only rollout field. FLASH_VERL_PYTHON can point at a
-    # stock verl, and hydra would compose the unknown key only to abort in dataclass conversion.
-    # fail here with the cause instead, and never silently train on truncated completions.
-    if inp["mask_truncated_completions"] and not verl_declares_rollout_field(
-        caps, "mask_truncated_completions"
-    ):
-        raise RuntimeError(
-            f"grpo requested mask_truncated_completions but the verl at {python_bin} does not "
-            "support it. the worker image's baked interpreter predates the freesolo fork; "
-            f"rebuild the worker image with '{VERL_REQUIREMENT}' installed."
-        )
     # raises when a gdn child cannot honor resets: the padded fallback cannot complete a step on
     # verl's fsdp engine, so the final plugin config must carry the proven model type or stop here.
     gdn_reset_arch = require_gdn_boundary_resets(caps, gdn_module)
     expected_steps, loggers, project_name, experiment_name, cc_ok = _resolve_training_settings(
         inp, caps, context=context
     )
-    _write_rl_plugin_config(
+    _write_rl_launch_config(
         inp,
         files,
         gdn_reset_arch=gdn_reset_arch,

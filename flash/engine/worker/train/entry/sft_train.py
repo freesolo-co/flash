@@ -217,9 +217,7 @@ _CHILD_ENV_PREFIXES = (
 )
 
 
-def _build_verl_child_env(
-    *, shim_dir: str, wandb_enabled: bool, context: WorkerContext
-) -> dict[str, str]:
+def _build_verl_child_env(*, wandb_enabled: bool, context: WorkerContext) -> dict[str, str]:
     applied_secret_names = frozenset(
         name.strip() for name in os.environ.get(SECRET_ENV_KEYS_ENV, "").split(",") if name.strip()
     )
@@ -236,10 +234,11 @@ def _build_verl_child_env(
         child.pop(name, None)
     if wandb_enabled and "WANDB_API_KEY" in os.environ:
         child["WANDB_API_KEY"] = os.environ["WANDB_API_KEY"]
-    parent_pythonpath = (
-        os.environ.get("PYTHONPATH", "") if "PYTHONPATH" not in applied_secret_names else ""
-    )
-    child["PYTHONPATH"] = os.pathsep.join(item for item in (shim_dir, parent_pythonpath) if item)
+    from pathlib import Path
+
+    package_root = str(Path(__file__).resolve().parents[5])
+    child["PYTHONPATH"] = package_root
+    child.pop("VERL_USE_EXTERNAL_MODULES", None)
     if context.config.spec is not None:
         child["FLASH_CHECKPOINT_MODEL_ID"] = context.config.spec.model
         child["FLASH_CHECKPOINT_MODEL_REVISION"] = context.config.spec.model_revision
@@ -375,7 +374,6 @@ from flash.engine.worker.io.heartbeat import liveness_heartbeat  # noqa: E402
 from flash.engine.worker.model.packing import model_is_gdn_hybrid  # noqa: E402
 from flash.engine.worker.runtime.rng import seed_training_rngs  # noqa: E402,F401
 from flash.engine.worker.train.entry.backend_common import (  # noqa: E402,F401
-    SHIM_FRAGMENT_FAILED_EXIT_CODE,
     fused_ce_backend,
     gdn_probe_module,
     gdn_reset_arch_from_caps,
@@ -383,14 +381,13 @@ from flash.engine.worker.train.entry.backend_common import (  # noqa: E402,F401
     parse_verl_metric,
     parse_wandb_link,
     probe_verl_capabilities,
-    render_sitecustomize_bootstrap,
+    readiness_file,
     require_gdn_boundary_resets,
     resolve_verl_loggers,
     resolve_verl_python,
     run_verl_training,
-    shim_marker_file,
     strict_gdn_probe_module,
-    verify_applied_shim_markers,
+    verify_runtime_ready,
     verl_step_number,
 )
 from flash.engine.worker.train.sft.setup.checkpoints import (  # noqa: E402,F401
@@ -401,7 +398,6 @@ from flash.engine.worker.train.sft.setup.checkpoints import (  # noqa: E402,F401
 from flash.engine.worker.train.sft.setup.config import (  # noqa: E402,F401
     _REQUIRED_OVERRIDE_KEYS,
     _hydra_val,
-    _render_sft_dataset_module,
     _sft_parquet_features,
     _write_sft_parquet,
     build_sft_overrides,
@@ -495,7 +491,7 @@ def _write_sft_result(
             "wandb_project": child.project_name if "wandb" in child.loggers else None,
             "wandb_run_name": child.experiment_name if "wandb" in child.loggers else None,
             # the sdk's link_wandb reads notes["wandb_url"]; trl gets it from the parent's live
-            # wandb.run, verl from the child marker (see backend_common.render_wandb_link_shim).
+            # wandb.run, verl from the child marker (see core.child.tracking.OwnedTracking).
             "wandb_url": progress.wandb_link.get("wandb_url"),
             "wandb_id": progress.wandb_link.get("wandb_id"),
         },
@@ -579,7 +575,7 @@ def run_sft_train(spec=None, *, context: WorkerContext) -> None:
         # and the MODULE has to fail closed for the same reason one layer down: `gdn_model_type`
         # swallows a failed config read and defaults to "qwen3_5". on a packed `qwen3_5_moe` model
         # (Qwen/Qwen3.6-35B-A3B is in the catalog) that default names the DENSE module, so the child
-        # would clear it, the shim would patch it, and the real MoE layers would stay unpatched --
+        # would clear it, the hook would configure it, and the real MoE layers would miss boundary metadata --
         # state crossing packed boundaries while the log says resets are active. resolve it strictly
         # for a packed run and let the failure surface instead.
         # keyed on the REALIZED batch, matching the reset gate below: a packed profile whose
@@ -625,7 +621,7 @@ def run_sft_train(spec=None, *, context: WorkerContext) -> None:
     # remove-padding is required by this custom dataset and verl's no_padding loss; disabling it
     # hands sft_loss a strided tensor and fails on the first step. an unsupported gdn stack stays
     # safe because packing pins examples_per_update and train_batch_size to 1, leaving no adjacent
-    # example state to contaminate; a supported one is safe because the shim above resets at every
+    # example state to contaminate; a supported one is safe because the hook above resets at every
     # boundary. batch size 1 is the isolation lever, not the tensor-layout flag.
     use_remove_padding = True
     child = _prepare_sft_child(

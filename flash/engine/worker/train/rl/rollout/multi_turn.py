@@ -14,7 +14,6 @@ import copy
 import json
 import math
 import os
-import shutil
 import threading
 import time
 from collections.abc import Callable
@@ -656,38 +655,6 @@ class MultiTurnBridge:
     def open_sessions(self) -> int:
         with self._lock:
             return len(self._sessions)
-
-
-# every GRPO child receives one complete flat plugin bundle. copying the multi-turn module even for
-# single-turn runs keeps the bundle shape invariant while the plugin decides whether to register it.
-GRPO_CHILD_MODULES = (
-    (os.path.join("train", "core", "child", "runtime.py"), "flash_verl_runtime.py"),
-    (os.path.join("train", "core", "child", "flashinfer_cache.py"), "flash_verl_flashinfer.py"),
-    (
-        os.path.join("train", "core", "child", "compact_checkpoint.py"),
-        "flash_compact_checkpoint.py",
-    ),
-    (
-        os.path.join("..", "..", "content", "reasoning_normalization.py"),
-        "flash_reasoning_normalization.py",
-    ),
-    (os.path.join("train", "core", "child", "glue.py"), "flash_multiturn_glue.py"),
-    (os.path.join("train", "rl", "child", "patches.py"), "flash_grpo_patches.py"),
-    (os.path.join("train", "rl", "child", "multiturn.py"), "flash_grpo_multiturn.py"),
-    (os.path.join("train", "rl", "child", "plugin.py"), "flash_grpo_plugin.py"),
-    (os.path.join("train", "rl", "child", "entry.py"), "flash_grpo_entry.py"),
-    (os.path.join("train", "rl", "child", "metrics.py"), "flash_grpo_metrics.py"),
-)
-
-
-def copy_grpo_child_modules(shim_dir: str) -> tuple[str, ...]:
-    """copy the complete GRPO plugin bundle and return the paths written."""
-    written = []
-    for source_name, child_name in GRPO_CHILD_MODULES:
-        target = os.path.join(shim_dir, child_name)
-        shutil.copy2(os.path.join(_WORKER_DIR, source_name), target)
-        written.append(target)
-    return tuple(written)
 
 
 def multi_turn_child_env(inp: dict, *, reward_url: str, thinking: bool) -> dict[str, str]:

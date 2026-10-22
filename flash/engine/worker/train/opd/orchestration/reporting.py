@@ -77,7 +77,7 @@ def _build_train_note_sections(
     backend = (
         {
             "rollout_backend": "verl_vllm",
-            "verl_version": "0.8.0",
+            "verl_version": "0.10.0.dev0",
             "verl_backend": "fsdp",
             # report the executed width, not the allocation: the card count here would claim a
             # sequence-parallel run that did not happen. token-balanced batching makes every
