@@ -80,13 +80,13 @@ class FlashFSDPEngine(FSDPEngineWithLMHead):
     def _build_lr_scheduler(self, optimizer):
         if self.runtime.algorithm != "sft":
             return super()._build_lr_scheduler(optimizer)
-        from transformers import get_linear_schedule_with_warmup
+        from flash.engine.worker.train.sft.child.schedule import linear_warmup_scheduler
 
         config = self.optimizer_config
         warmup = config.lr_warmup_steps
         if warmup <= 0:
             warmup = int(config.lr_warmup_steps_ratio * config.total_training_steps)
-        return get_linear_schedule_with_warmup(
+        return linear_warmup_scheduler(
             optimizer, num_warmup_steps=warmup, num_training_steps=config.total_training_steps
         )
 

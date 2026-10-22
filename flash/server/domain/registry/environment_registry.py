@@ -166,7 +166,7 @@ def require_environment_project(
             if recorded is not True:
                 raise HTTPException(status_code=502, detail=_REPAIR_FAILURE_DETAIL) from None
             return
-        if exc.code in {404, 409}:
+        if exc.code in {400, 404, 409, 422}:
             raise HTTPException(
                 status_code=exc.code,
                 detail=detail or "environment does not belong to the requested project",
