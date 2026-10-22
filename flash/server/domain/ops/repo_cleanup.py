@@ -1,9 +1,9 @@
 """Always-on GC for aged run artifacts in per-environment ``flashrun-*`` HF repos.
 
-The daily cross-plane sweep deletes non-serving ``<phase>/<run_id>`` prefixes whose newest commit is
+The daily cross-plane sweep deletes unbound ``<phase>/<run_id>`` prefixes whose newest commit is
 older than seven days. It never deletes whole repos, shared code snapshots, or unknown phases.
 
-Serving registry data is the fail-closed do-not-delete set and is rechecked before each delete.
+Durable checkpoint bindings are the fail-closed do-not-delete set and are rechecked before each delete.
 Recent warm-start markers, undatable prefixes, and in-flight writes are protected. The loop requires
 an operator ``HF_TOKEN`` and has no manual CLI or policy knobs.
 """
@@ -38,7 +38,7 @@ _warned_hf_unavailable = False
 # Hard allowlist: only <artifact namespace>/flashrun-* dataset repos are ever touched (never env
 # packages, paper-*/oracle/eval sets, or a user's own datasets).
 RUN_REPO_PREFIX = "flashrun-"
-# Delete an undeployed run's prefix once its newest file was committed this long ago (fixed: 7 days).
+# Delete an unbound run's prefix once its newest file was committed this long ago (fixed: 7 days).
 DELETE_AGE_SECONDS = 7.0 * 86400.0
 _DELETE_SLEEP_S = 0.5  # pause between deletes — HF repo-mutation rate-limit courtesy
 _SCAN_WORKERS = 8  # hf tree-listing concurrency
@@ -108,14 +108,21 @@ def _is_managed_env_repo(repo_id) -> bool:
     )
 
 
-def deployed_prefixes() -> tuple[set[tuple[str, str]], set[str], bool]:
-    """Return the global serving do-not-delete set from ``GET /adapters``.
+def bound_artifact_prefixes() -> tuple[set[tuple[str, str]], set[str], bool]:
+    """Return the durable do-not-delete set from ``GET /artifact-protections``.
 
-    The tuple contains exact prefixes, whole repos with unmappable live records, and a completeness
-    flag; callers fail closed when any live adapter cannot be identified.
+    The tuple contains exact prefixes, whole repos with unmappable bindings, and a completeness
+    flag; callers fail closed when any binding cannot be identified.
     """
-    resp = serving_transport.serving_request("GET", f"{serving_urls.serving_base_url()}/adapters")
-    records = resp.json().get("adapters") or []
+    resp = serving_transport.serving_request(
+        "GET", f"{serving_urls.serving_base_url()}/artifact-protections"
+    )
+    payload = resp.json()
+    if not isinstance(payload, dict) or payload.get("ok") is not True:
+        raise CleanupAborted("checkpoint artifact protections could not be confirmed")
+    records = payload.get("bindings")
+    if not isinstance(records, list):
+        raise CleanupAborted("checkpoint artifact protections must contain a binding list")
     prefixes: set[tuple[str, str]] = set()
     whole: set[str] = set()
     complete = True
@@ -123,9 +130,12 @@ def deployed_prefixes() -> tuple[set[tuple[str, str]], set[str], bool]:
         # snake_case is the wire spelling: freesolo's `AdapterRecord` declares `repo_id`
         # with no serialization alias, and its persistence layer reads and writes the same
         # key. a camelCase reading here would never match and would fail this closed.
+        if not isinstance(rec, dict):
+            complete = False
+            continue
         repo = rec.get("repo_id")
         if not isinstance(repo, str) or not repo.strip():
-            complete = False  # a live adapter we can't even attribute to a repo -> fail closed
+            complete = False  # a binding we can't even attribute to a repo -> fail closed
             continue
         repo = repo.strip()
         sub = rec.get("subfolder")
@@ -141,15 +151,17 @@ def _confirm_live_set() -> tuple[set[tuple[str, str]], set[str]]:
     """Return ``(live_prefixes, protected_whole_repos)`` or raise ``CleanupAborted``. Called before
     listing AND before every delete; every failure mode fails closed so a blind delete is impossible."""
     try:
-        prefixes, whole, complete = deployed_prefixes()
+        prefixes, whole, complete = bound_artifact_prefixes()
     except Exception as exc:  # any failure to read the live set must fail closed
         raise CleanupAborted(f"serving registry unreachable ({exc}); deleting nothing") from exc
     if not complete:
-        raise CleanupAborted("a live adapter could not be mapped to a repo; deleting nothing")
+        raise CleanupAborted("a binding could not be mapped to a repo; deleting nothing")
     if not prefixes and not whole:
-        # Zero live adapters almost always means a broken/empty query rather than a genuinely empty
+        # Zero checkpoint bindings almost always means a broken/empty query rather than a genuinely empty
         # fleet; refuse rather than risk deleting every artifact against an empty do-not-touch set.
-        raise CleanupAborted("serving registry returned zero live adapters; refusing to sweep")
+        raise CleanupAborted(
+            "serving registry returned zero checkpoint bindings; refusing to sweep"
+        )
     return prefixes, whole
 
 
@@ -200,7 +212,8 @@ def _hold_run_lock(run_id: str):
     Returns the held lock — the caller MUST ``release()`` it once the delete is done — or ``None`` when
     a deploy/undeploy/export currently holds it. Held ACROSS the delete so the destructive mutation is
     mutually exclusive with THIS plane's adapter registration/export of the same run. In-process and
-    best-effort (it can't mutex a SIBLING plane — the serving-set re-confirm below covers that); never
+    best-effort (it cannot mutex a sibling plane); durable binding checks additionally protect
+    registrations already persisted by other planes. It never
     blocks the sweep waiting on a slow deploy — it just spares the run this cycle."""
     from flash.server.platform.locks import _deploy_lock
 
@@ -240,7 +253,7 @@ def _run_artifacts_recently_used(
 
 
 def _collect_targets(api, live, whole, now: float, max_age_s: float) -> list[_RunTarget]:
-    """Enumerate every ``flashrun-*`` repo and return the aged, undeployed, non-warm-start-source run
+    """Enumerate every ``flashrun-*`` repo and return the aged, unbound, non-warm-start-source run
     prefixes to delete. Per-repo scan failures (HF rate-limit / transient) are skipped and logged, not
     fatal — the sweep reaps what it could read and tries the rest next cycle."""
     repos = [
@@ -268,7 +281,7 @@ def _collect_targets(api, live, whole, now: float, max_age_s: float) -> list[_Ru
             warm_src = ref_recent_ts is not None and (now - ref_recent_ts) <= max_age_s
             for pfx, (_size, ts) in prefixes.items():
                 if (repo, pfx) in live:
-                    continue  # currently serving on some plane
+                    continue  # permanently bound on some plane
                 if ts is None:
                     continue
                 if (now - ts) <= max_age_s:
@@ -284,7 +297,7 @@ def _collect_targets(api, live, whole, now: float, max_age_s: float) -> list[_Ru
             sorted(unknown_tops),
         )
     logger.info(
-        "repo GC: scanned %d/%d repos (%d unreadable), %d aged undeployed prefix(es) to reap",
+        "repo GC: scanned %d/%d repos (%d unreadable), %d aged unbound prefix(es) to reap",
         scanned - errored,
         len(repos),
         errored,
@@ -319,7 +332,7 @@ def run_scheduled_cleanup(*, dry_run: bool = False, api=None, should_stop=None) 
 
     if dry_run:
         logger.info(
-            "repo GC (dry-run): %d aged undeployed run prefix(es) would be deleted", len(targets)
+            "repo GC (dry-run): %d aged unbound run prefix(es) would be deleted", len(targets)
         )
         return 0
 
@@ -360,14 +373,14 @@ def run_scheduled_cleanup(*, dry_run: bool = False, api=None, should_stop=None) 
                 )
                 continue
             # Re-confirm the GLOBAL live set immediately before the delete — now UNDER the held lock and
-            # right ahead of delete_folder, so a deploy can't register this run in the confirm->delete
-            # gap. If it can't be confirmed now, abort the WHOLE sweep (re-raise) rather than press on
-            # deleting other prefixes while an unidentified live adapter may be backed by one of them.
+            # right ahead of delete_folder. This serializes local deploys; the durable set includes
+            # loading and disabled bindings from sibling planes. If confirmation fails, abort the
+            # whole sweep rather than delete prefixes that may back an unidentified binding.
             fresh, fresh_whole = (
                 _confirm_live_set()
             )  # raises -> finally releases, sweep fails closed
             if (target.repo_id, target.prefix) in fresh or target.repo_id in fresh_whole:
-                logger.warning("repo GC: %s became deployed mid-sweep; skipping", target.prefix)
+                logger.warning("repo GC: %s became bound mid-sweep; skipping", target.prefix)
                 continue
             try:
                 # delete_folder has no missing_ok; a concurrent delete / already-gone prefix raises.

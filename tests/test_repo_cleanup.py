@@ -20,7 +20,7 @@ from flash.serve.request import transport as serving_transport
 from flash.server.domain.ops import repo_cleanup as rc
 
 # Real implementations captured before the offline conftest stub swaps in a no-op sweep.
-_REAL_DEPLOYED = rc.deployed_prefixes
+_REAL_DEPLOYED = rc.bound_artifact_prefixes
 _REAL_HOLD_RUN_LOCK = rc._hold_run_lock
 _REAL_RUN_SCHEDULED_CLEANUP = rc.run_scheduled_cleanup
 
@@ -116,7 +116,9 @@ def _wire(monkeypatch, *, deployed=None, hold=None):
     """Patch the sweep's non-HF seams: the global serving set and the per-run lock. The HF side is
     driven entirely by the FakeApi passed to ``run_scheduled_cleanup``."""
     monkeypatch.setattr(
-        rc, "deployed_prefixes", deployed if deployed is not None else (lambda: _LIVE_SENTINEL)
+        rc,
+        "bound_artifact_prefixes",
+        deployed if deployed is not None else (lambda: _LIVE_SENTINEL),
     )
     monkeypatch.setattr(rc, "_hold_run_lock", hold or (lambda run_id: _DummyHeld()))
 
@@ -221,17 +223,17 @@ def test_private_opd_retry_markers_are_never_cleanup_targets(monkeypatch):
     assert all(marker_path != deleted_path for _repo, deleted_path in api.deleted)
 
 
-# ---- the global serving set (deployed_prefixes) -----------------------------------------------
+# ---- the global serving set (bound_artifact_prefixes) -----------------------------------------------
 
 
 def _serving(monkeypatch, records):
-    """Point deployed_prefixes' serving call at a canned ``GET /adapters`` payload."""
+    """Point bound_artifact_prefixes' serving call at a canned durable artifact-protection payload."""
     monkeypatch.setattr(serving_urls, "serving_base_url", lambda: "https://serving.test")
-    resp = types.SimpleNamespace(json=lambda: {"adapters": records})
+    resp = types.SimpleNamespace(json=lambda: {"ok": True, "bindings": records})
     monkeypatch.setattr(serving_transport, "serving_request", lambda method, url: resp)
 
 
-def test_deployed_prefixes_from_serving_registry(monkeypatch):
+def test_bound_artifact_prefixes_from_serving_registry(monkeypatch):
     _serving(
         monkeypatch,
         [
@@ -245,14 +247,14 @@ def test_deployed_prefixes_from_serving_registry(monkeypatch):
     assert complete is True
 
 
-def test_deployed_prefixes_incomplete_when_record_has_no_repo(monkeypatch):
+def test_bound_artifact_prefixes_incomplete_when_record_has_no_repo(monkeypatch):
     _serving(monkeypatch, [{"subfolder": "rl/flash-1-a"}])  # live adapter, no repo id
     prefixes, _whole, complete = _REAL_DEPLOYED()
     assert complete is False
     assert prefixes == set()
 
 
-def test_deployed_prefixes_protects_whole_repo_when_subfolder_unmappable(monkeypatch):
+def test_bound_artifact_prefixes_protects_whole_repo_when_subfolder_unmappable(monkeypatch):
     _serving(monkeypatch, [{"repo_id": _managed("e1"), "subfolder": "toplevel-only"}])
     prefixes, whole, complete = _REAL_DEPLOYED()
     assert whole == {_managed("e1")}
@@ -623,6 +625,42 @@ def test_hold_run_lock_is_nonblocking_and_mutually_exclusive():
     reacquired = _deploy_lock("flash-lock-a").acquire(blocking=False)  # released -> free again
     assert reacquired is True
     _deploy_lock("flash-lock-a").release()
+
+
+@pytest.mark.parametrize(
+    "payload", [{"adapters": []}, {"ok": True}, {"ok": True, "bindings": {}}, None]
+)
+def test_cleanup_rejects_missing_or_old_protection_contract(monkeypatch, payload):
+    monkeypatch.setattr(serving_urls, "serving_base_url", lambda: "https://serving.test")
+    monkeypatch.setattr(
+        serving_transport,
+        "serving_request",
+        lambda *args: types.SimpleNamespace(json=lambda: payload),
+    )
+    _wire(monkeypatch, deployed=_REAL_DEPLOYED)
+    api = FakeApi({_managed("e"): [_adapter("sft/flash-1-a/w", OLD)]})
+    with pytest.raises(rc.CleanupAborted):
+        rc.run_scheduled_cleanup(api=api)
+    assert api.deleted == []
+
+
+def test_cleanup_rechecks_durable_binding_created_on_another_plane(monkeypatch):
+    repo = _managed("e")
+    records = [{"repo_id": _managed("live"), "subfolder": "rl/flash-live-0"}]
+    _serving(monkeypatch, records)
+    _wire(monkeypatch, deployed=_REAL_DEPLOYED)
+
+    class RegisteringApi(FakeApi):
+        def list_repo_tree(self, **kwargs):
+            if kwargs.get("path_in_repo"):
+                # Another plane binds a checkpoint during the slow pre-delete HF stat.
+                # It is still disabled/loading and never enters this plane's ready router.
+                records.append({"repo_id": repo, "subfolder": "sft/flash-1-a/checkpoints/step-4"})
+            return super().list_repo_tree(**kwargs)
+
+    api = RegisteringApi({repo: [_adapter("sft/flash-1-a/w", OLD)]})
+    assert rc.run_scheduled_cleanup(api=api) == 0
+    assert api.deleted == []
 
 
 def test_restat_spares_source_referenced_after_enumeration(monkeypatch):
