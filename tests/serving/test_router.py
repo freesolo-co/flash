@@ -296,7 +296,6 @@ def test_healthz_reports_accounting_ok_when_settlement_is_live() -> None:
 
 
 def test_generate_fails_closed_when_accounting_cannot_settle() -> None:
-    # a non-thinking adapter, so the thinking-settlement guard cannot mask the accounting gate.
     router = AdapterRouter([checkpoint_record("qa", QWEN)])
     pool = FakePool()
     client = _metered_client(pool, router, _UnhealthyUsageStore())

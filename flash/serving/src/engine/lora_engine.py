@@ -14,6 +14,7 @@ import os
 import shutil
 import uuid
 from collections import OrderedDict
+from functools import cached_property
 from pathlib import Path
 from typing import Any
 
@@ -39,6 +40,7 @@ from flash.serving.src.engine.model_config import (
     tokenizer_model_for,
     tool_parser_for,
 )
+from flash.serving.src.engine.reasoning_usage import reasoning_token_ids
 from flash.serving.src.engine.support import (
     _adapter_cache_path,
     _adapter_cache_ready,
@@ -61,6 +63,11 @@ class _LoraEngineImpl:
     subclass and forward to the ``_``-prefixed methods here."""
 
     base_model: str  # set by the per-GPU Modal subclass via modal.parameter()
+
+    @cached_property
+    def _reasoning_usage_token_ids(self) -> tuple[int, int]:
+        # Two constant-time lookups, once per engine, before its first thinking request.
+        return reasoning_token_ids(self.reasoning_parser, self.tokenizer)
 
     def _replica_identifier(self) -> str:
         replica_id = getattr(self, "_replica_id", None)
@@ -102,6 +109,7 @@ class _LoraEngineImpl:
             cfg,
         )
         self.reasoning_parser = kwargs.get("reasoning_parser")
+        self.__dict__.pop("_reasoning_usage_token_ids", None)
         self.tool_parser = tool_parser_for(self.base_model)
         self.engine = AsyncLLMEngine.from_engine_args(AsyncEngineArgs(**kwargs))
         # No in-engine kernel-patching hook runs here (2026-07-05 35B outage post-mortem): under
