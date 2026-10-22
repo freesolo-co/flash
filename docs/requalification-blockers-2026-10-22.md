@@ -1,8 +1,9 @@
 # Release requalification: production rollout blockers
 
-Status at 2026-10-22 17:49 UTC: **not qualified**. The stale backend and control
-plane have been repaired, and a fresh canary has settled. Historical delivery
-quarantines and release publication still block the full paid rerun. The earlier
+Status at 2026-10-22 18:06 UTC: **full rerun still pending**. The stale backend
+and control plane have been repaired, fresh canaries settle, and the three old
+test quarantines have been removed at the operator's explicit request. They no
+longer block accounting readiness. Release qualification must still be rerun. The earlier
 investigation below records observations at 10:43 UTC; see the recovery update.
 
 ## What reached production
@@ -152,3 +153,18 @@ At 17:50 UTC, the restored production timer picked up the subsequent main
 release automatically: the public Flash control plane now reports `1.3.11`.
 This verifies that the repair restored ongoing reconciliation as well as the
 one-time image replacement. The timer exited successfully on consecutive runs.
+
+## Operator-requested test cleanup at 18:06 UTC
+
+The operator chose to delete the three failed release-test receipts instead of
+retrying their delivery. Each exact request and organization was verified, all
+three retained the expected delivery-quarantine/HTTP-404 state, and none had a
+matching billing usage row or an acknowledged ledger entry. A protected copy
+was retained before a transaction locked and deleted exactly those three rows.
+No billing usage, ledger or unrelated request records were changed.
+
+The post-delete snapshot at 18:06:50 UTC contains 12 delivered receipts, no
+quarantines, no due pending work, no expired leases and no oldest-undelivered
+age. Freesolo PR #792 is therefore not required for this incident's cleanup; it
+remains a proposed general recovery mechanism. This cleanup is not a substitute
+for the still-pending full E2E rerun.
