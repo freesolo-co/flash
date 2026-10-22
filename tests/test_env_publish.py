@@ -1010,7 +1010,15 @@ def test_record_published_environment_keeps_failures_best_effort(monkeypatch):
     )
 
 
-def test_require_environment_project_maps_project_mismatch(monkeypatch):
+@pytest.mark.parametrize(
+    ("status", "detail"),
+    [
+        (400, "slug namespace must match org slug"),
+        (422, "invalid environment slug"),
+        (409, "flash environment belongs to another project"),
+    ],
+)
+def test_require_environment_project_preserves_input_errors(monkeypatch, status, detail):
     import urllib.error
 
     from fastapi import HTTPException
@@ -1019,10 +1027,10 @@ def test_require_environment_project_maps_project_mismatch(monkeypatch):
 
     error = urllib.error.HTTPError(
         "https://backend.test/api/flash/environments/validate/internal",
-        409,
-        "conflict",
+        status,
+        "invalid request",
         {},
-        io.BytesIO(b'{"detail":"flash environment belongs to another project"}'),
+        io.BytesIO(json.dumps({"detail": detail}).encode()),
     )
     monkeypatch.setenv("FREESOLO_INTERNAL_KEY", "internal-secret")
     monkeypatch.setattr(
@@ -1033,7 +1041,7 @@ def test_require_environment_project_maps_project_mismatch(monkeypatch):
     monkeypatch.setattr(
         envs,
         "download_package",
-        lambda **_kwargs: pytest.fail("a project conflict must not download the hub package"),
+        lambda **_kwargs: pytest.fail("an invalid request must not download the hub package"),
     )
 
     with pytest.raises(HTTPException) as excinfo:
@@ -1044,8 +1052,8 @@ def test_require_environment_project_maps_project_mismatch(monkeypatch):
             repair_missing=True,
         )
 
-    assert excinfo.value.status_code == 409
-    assert excinfo.value.detail == "flash environment belongs to another project"
+    assert excinfo.value.status_code == status
+    assert excinfo.value.detail == detail
 
 
 def test_require_environment_project_fails_closed_without_internal_key(monkeypatch):
