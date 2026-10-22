@@ -487,7 +487,7 @@ def test_transient_environment_resolve_is_attempted_once_per_request(api, monkey
     spec = {
         **SPEC,
         "algorithm": "opd",
-        "train": {**SPEC["train"], "teacher_model": "deepseek-v4-pro"},
+        "train": {**SPEC["train"], "teacher_model": "deepseek-v4.1-flash-1017"},
     }
 
     res = api.post(
@@ -521,7 +521,7 @@ def test_tokenless_packaged_opd_defers_without_anonymous_github_lookup(api, monk
     spec = {
         **SPEC,
         "algorithm": "opd",
-        "train": {**SPEC["train"], "teacher_model": "deepseek-v4-pro"},
+        "train": {**SPEC["train"], "teacher_model": "deepseek-v4.1-flash-1017"},
     }
 
     res = api.post(
@@ -753,7 +753,7 @@ def test_unsupported_spec_reports_itself_rather_than_insufficient_balance(api, m
         # that asserted nothing the moment its premise became supported. a teacher that cannot see
         # images is a property of the teacher, not a gap waiting to be closed.
         "algorithm": "opd",
-        "train": {**SPEC["train"], "teacher_model": "deepseek-v4-pro"},
+        "train": {**SPEC["train"], "teacher_model": "deepseek-v4.1-flash-1017"},
         "environment": {
             **SPEC["environment"],
             "params": {

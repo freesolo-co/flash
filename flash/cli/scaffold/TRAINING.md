@@ -690,7 +690,7 @@ spending another GPU run:
 | Thinking reward grades the wrong text                        | Rewards accidentally score hidden reasoning, or ignore reasoning you meant to inspect                                                                                                    | By default, score the answer text. In thinking mode the response object is still string-compatible, but also exposes `.completion`, `.thinking`, and `.raw` when a reward intentionally needs those fields.                                                                                                                                                                                                                     |
 | All-zero or flat GRPO reward                                 | `reward` stays near 0 and outputs do not improve                                                                                                                                         | Make the reward dense: give partial credit for parse/format/execution/correctness tiers, and log a separate clean `success` metric. Do not keep rerunning an all-zero reward.                                                                                                                                                                                                                                                   |
 | Reward rises but behavior is worse                           | Short, templated, malformed, or reward-hacked outputs score well                                                                                                                         | Deploy the adapter and probe real examples. Add hard validity gates before judge calls, penalize degenerate shortcuts, and judge the outcome rather than the surface string.                                                                                                                                                                                                                                                    |
-| OPD makes the student worse, not better                      | The distilled adapter scores _below_ its SFT/base start even though the per-token loss fell                                                                                              | The teacher, not a knob, is the ceiling. Reverse-KL only pulls the student toward the managed GLM-5.2 teacher, so a teacher that is weak or wrong on _your_ task transfers its mistakes. Vet the teacher before you spend — the "On-policy distillation" section gives the two ways to do that with a managed key. If it can't beat your student, use GRPO or SFT instead — OPD cannot exceed a teacher that can't do the task. |
+| OPD makes the student worse, not better                      | The distilled adapter scores _below_ its SFT/base start even though the per-token loss fell                                                                                              | The teacher, not a knob, is the ceiling. Reverse-KL only pulls the student toward the managed GLM-5.3 teacher, so a teacher that is weak or wrong on _your_ task transfers its mistakes. Vet the teacher before you spend — the "On-policy distillation" section gives the two ways to do that with a managed key. If it can't beat your student, use GRPO or SFT instead — OPD cannot exceed a teacher that can't do the task. |
 | Output is truncated                                          | Correct-looking answers cut off mid-response or JSON is incomplete                                                                                                                       | Increase `max_completion_tokens` for GRPO/OPD rollouts or `max_context_tokens` for total prompt+completion context only after seeing truncation. Oversizing them by default just burns memory/cost.                                                                                                                                                                                                                             |
 | Infrastructure, CUDA, OOM, vLLM, or kernel failure           | Run errors before useful metrics, often during setup/model load                                                                                                                          | Read `flash runs log <run-id>`. Flash advances a single executed-width-aware usable-VRAM floor for candidate-bound infrastructure and OOM failures, then retries only a strictly larger fitting candidate while keeping infrastructure and OOM budgets separate. Reduce `max_context_tokens`, `max_completion_tokens`, or `group_size` when no larger candidate remains.                                                        |
 | Run looks stuck after disconnecting                          | Terminal stopped streaming but the job may still be alive                                                                                                                                | Ctrl-C detaches. Use `flash runs log <run-id> --follow` to reattach, `flash runs log <run-id>` for the console/error output, or `flash runs cancel <run-id>` if you intentionally want to stop it.                                                                                                                                                                                                                              |
@@ -914,7 +914,7 @@ run fails if a requested exact save cannot be saved and published.
 ## On-policy distillation (`algorithm = "opd"`)
 
 Pick distillation when a much stronger **teacher** model can grade your student's work
-token-by-token. The student samples on-policy (like GRPO), a managed teacher (GLM 5.2 by default,
+token-by-token. The student samples on-policy (like GRPO), a managed teacher (GLM 5.3 by default,
 or another via `[train] teacher_model`) scores each of the _student's_ completions, and a dense per-token
 loss teaches the student to match the teacher — far more sample-efficient than reward-based RL and
 with no reward to design. It supports `epochs` like SFT/GRPO and produces a LoRA served exactly like SFT.
@@ -965,16 +965,16 @@ with no reward to design. It supports `epochs` like SFT/GRPO and produces a LoRA
     it stops the run from starting.
 
 - **Pick the teacher with `[train] teacher_model`; the key stays managed.** The teacher defaults to
-  the managed **GLM 5.2** and is selectable from a fixed, managed allow-list:
-  `glm-5.2` (default), `kimi-k3`, `qwen3.5-397b-a17b`, `deepseek-v4-pro`, or `qwen3-vl-235b`.
+  the managed **GLM 5.3** and is selectable from a fixed, managed allow-list:
+  `glm-5.3` (default), `kimi-k3`, `qwen3.8-27b`, `qwen3.5-397b-a17b`, `deepseek-v4.1-flash-1017`, or `qwen3-vl-235b`.
   Every option is a Parasail-hosted model reached through the control-plane broker, so there is
   nothing to export or declare. An opd run submits like any other, and a `PARASAIL_API_KEY` in your
   shell is ignored. Arbitrary bring-your-own teacher models or keys are not supported (the allow-list
   is curated to teachers verified to score the student's tokens). Image-bearing opd requires
-  `qwen3-vl-235b` or `qwen3.5-397b-a17b` (Qwen3.5 unifies text and vision in one checkpoint, so it
-  sees images despite the name carrying no `-vl`) and is single-turn only. The other teachers are
-  text-only: they accept an image-bearing request and silently ignore the image rather than failing,
-  which is why the allow-list is enforced. The key is never stored in the spec or needed at serving time;
+  `qwen3.8-27b`, `qwen3-vl-235b`, or `qwen3.5-397b-a17b` and is single-turn only.
+  These routes have verified image expansion and supplied-token scoring. Other teachers are
+  available for text OPD only: native model vision support alone does not establish compatibility
+  with Flash's image scoring contract. The key is never stored in the spec or needed at serving time;
   teacher token cost varies by model and is shown in the pre-flight estimate.
 - **The student (Qwen) and the teacher have different tokenizers.** Flash
   bridges the vocabulary mismatch with **groupwise reverse-KL** (the collinear-ai _spider_ / Tinker
@@ -1004,10 +1004,10 @@ id = "your-org/your-project/my-env"
 epochs = 1
 max_examples = 2
 lora_rank = 32
-# teacher_model = "glm-5.2"                             # managed teacher to distil from; one of
-#                                                       # glm-5.2 (default) | kimi-k3 |
-#                                                       # qwen3.5-397b-a17b | deepseek-v4-pro |
-#                                                       # qwen3-vl-235b
+# teacher_model = "glm-5.3"                             # managed teacher to distil from; one of
+#                                                       # glm-5.3 (default) | kimi-k3 |
+#                                                       # qwen3.5-397b-a17b | deepseek-v4.1-flash-1017 |
+#                                                       # qwen3.8-27b | qwen3-vl-235b
 #                                                       # (key stays managed)
 # kl_penalty_coef = 1.0                                 # reverse-KL scale
 ```
