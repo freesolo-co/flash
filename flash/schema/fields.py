@@ -7,6 +7,7 @@ import math
 import re
 from typing import Any
 
+from flash.content.structured_options import validate_structured_options
 from flash.content.structured_outputs import CONSTRAINT_KEYS as _SO_CONSTRAINT_KEYS
 from flash.core.grpo import GRPO_CONTROL_PLANE_OWNED_ENV_KEYS
 from flash.core.spec import (
@@ -242,14 +243,18 @@ def _so_canonical(value: Any) -> dict | None:
         elif not isinstance(v, bool):
             raise _so_error(f"{opt} must be a boolean")
         canonical[opt] = v
+    try:
+        validate_structured_options(canonical)
+    except ValueError as exc:
+        raise _so_error(str(exc)) from exc
     return canonical
 
 
 def _train_structured_outputs(train_raw: dict) -> str:
     """Validate/normalize [train] structured_outputs to canonical JSON ("" = unconstrained).
 
-    The canonical string is exactly the kwargs of vLLM's StructuredOutputsParams, so the worker
-    applies it with zero re-interpretation (json.loads -> StructuredOutputsParams(**spec))."""
+    The canonical string preserves the public constraint and options. Runtime lowering
+    carries request-local JSON options into the grammar before vLLM compiles it."""
     canonical = _so_canonical(train_raw.get("structured_outputs"))
     if canonical is None:
         return ""

@@ -780,7 +780,7 @@ def test_valid_thinking_structured_run_passes_dry_run(api) -> None:
         ),
         (
             {"json_object": True, "whitespace_pattern": "["},
-            "whitespace_pattern is invalid",
+            "whitespace_pattern is not supported",
         ),
     ],
 )
@@ -861,7 +861,7 @@ def test_warmstart_dry_run_preserves_context_preflight_error(api) -> None:
 @pytest.mark.parametrize(
     "structured_outputs",
     [
-        {"regex": r"^[0-9]+$", "whitespace_pattern": r"\s*"},
+        {"regex": r"^[0-9]+$"},
         {
             "json": {
                 "$defs": {"answer": {"type": "string"}},

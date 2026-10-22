@@ -10,6 +10,7 @@ from verl.experimental.agent_loop.agent_loop import AgentLoopBase, AgentLoopOutp
 from verl.experimental.agent_loop.single_turn_agent_loop import SingleTurnAgentLoop
 from verl.trainer.ppo.v1.agent_loop_tq import AgentLoopManagerTQ
 
+from flash.content.structured_options import vllm_structured_kwargs
 from flash.engine.worker.train.opd.child.bridge import (
     _defer_score_failure,
     _fatal_rollout_exit_code,
@@ -63,7 +64,9 @@ class FlashSingleTurnAgentLoop(SingleTurnAgentLoop):
             _require_structured_runtime_versions()
             from vllm.sampling_params import StructuredOutputsParams
 
-            params["structured_outputs"] = StructuredOutputsParams(**json.loads(structured_spec))
+            params["structured_outputs"] = StructuredOutputsParams(
+                **vllm_structured_kwargs(json.loads(structured_spec))
+            )
         output = await super().run(params, **kwargs)
         output.reward_score = 0.0
         output.extra_fields.setdefault("reward_extra_info", {})

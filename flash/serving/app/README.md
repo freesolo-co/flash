@@ -308,7 +308,10 @@ Every inference endpoint supports structured outputs (vLLM guided decoding via
 - **`structured_outputs`** (all endpoints) — takes a
   canonical constraint dict with **exactly one** of `json` (a JSON schema, or a raw JSON-schema
   dict/string directly), `regex`, `choice` (list of strings), or `json_object: true`, plus
-  optional `disable_any_whitespace`, `disable_additional_properties`, `whitespace_pattern`.
+  optional `disable_any_whitespace` and `disable_additional_properties` for JSON constraints.
+  Compact JSON preserves whitespace inside string values. Property restriction closes objects
+  in the schema, including nested objects. Custom `whitespace_pattern` is rejected with a
+  validation error because the managed decoder cannot honor it per request.
   Convenience aliases: `json_schema` / `schema` → `json`, `choices` → `choice`; a bare
   JSON-schema dict (e.g. `{"type": "object", ...}`) is accepted directly.
 - **OpenAI `response_format`** (on `/v1/chat/completions` only) — the standard OpenAI shapes are
