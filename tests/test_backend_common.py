@@ -20,6 +20,7 @@ import tempfile
 import textwrap
 import threading
 import time
+import venv
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from types import SimpleNamespace
 from unittest import mock
@@ -818,14 +819,17 @@ def test_the_capability_probe_is_valid_python():
     ast.parse(vc._CAPABILITY_PROBE % {"gdn_module": ""})
 
 
-def test_every_capability_question_fails_independently():
+def test_every_capability_question_fails_independently(tmp_path):
     # the batching's core risk: five questions in one process means one raising exception could
     # take the other four with it, silently turning a healthy run's rollout field / capability /
     # flashinfer answers into fail-closed defaults. each question owns its own try/except, so a
     # child with NO verl, NO cuda, NO flashinfer and NO wandb must still answer every key.
-    caps = vc.probe_verl_capabilities(
-        sys.executable, "transformers.models.qwen3_5.modeling_qwen3_5"
-    )
+    # the test runner may itself have the full gpu stack installed. make absence an explicit
+    # fixture instead of assuming that the interpreter running pytest has no capabilities.
+    environment = tmp_path / "minimal-python"
+    venv.EnvBuilder(with_pip=False).create(environment)
+    python = environment / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
+    caps = vc.probe_verl_capabilities(str(python), "transformers.models.qwen3_5.modeling_qwen3_5")
     assert set(caps) == set(vc._CAPABILITIES_UNAVAILABLE)
     # this interpreter has none of them, so every answer is the fail-closed one -- but each was
     # REACHED and answered rather than skipped by an earlier raise.
