@@ -71,6 +71,7 @@ def _good_stream() -> StreamEvidence:
 
 def _evaluate(*, health, stream, accounting, **kwargs):
     calls: list[str] = []
+    kwargs.setdefault("health_stable_seconds", 0)
 
     async def health_loader():
         calls.append("health")
@@ -156,6 +157,36 @@ def test_a_previous_attempt_never_reaches_streaming():
         health_deadline_seconds=10,
     )
     assert verdict.reason == HEALTH_DEPLOYMENT_ID_MISMATCH
+    assert calls == ["health", "health"]
+
+
+def test_an_interleaved_old_container_restarts_the_health_stability_window():
+    snapshots = iter(
+        [
+            _health(),
+            _health(deployment_sha="0" * 40),
+            *[_health() for _ in range(7)],
+        ]
+    )
+    verdict, calls = _evaluate(
+        health=lambda: next(snapshots),
+        stream=_good_stream(),
+        accounting=_Snapshot(),
+        health_stable_seconds=gate_module._HEALTH_STABLE_SECONDS,
+    )
+    assert verdict.ok
+    assert calls == ["health"] * 9 + ["stream", "accounting"]
+
+
+def test_matching_health_without_a_full_stability_window_never_streams():
+    verdict, calls = _evaluate(
+        health=_health(),
+        stream=_good_stream(),
+        accounting=_Snapshot(),
+        health_stable_seconds=30,
+        health_deadline_seconds=10,
+    )
+    assert verdict.reason == gate_module.HEALTH_NOT_STABLE
     assert calls == ["health", "health"]
 
 

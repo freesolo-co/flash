@@ -67,6 +67,7 @@ BacklogReader = Callable[["httpx.AsyncClient"], Awaitable[Any]]
 
 GATE_CONFIG_INCOMPLETE = "gate_config_incomplete"
 HEALTH_UNREACHABLE = "health_unreachable"
+HEALTH_NOT_STABLE = "health_release_not_stable"
 
 # long enough for a lease that expired to be RECLAIMED, not merely observed. `modal deploy` replaces
 # the router containers, and a container holding a claimed row when it goes away leaves that lease to
@@ -80,6 +81,7 @@ _ACCOUNTING_POLL_SECONDS = 5.0
 # Modal can briefly route health requests to both releases during a rollout, even
 # after the workflow's first successful readiness probe.
 _HEALTH_ROLLOUT_DEADLINE_SECONDS = 60.0
+_HEALTH_STABLE_SECONDS = 30.0
 _BACKLOG_SNAPSHOT_RPC = "serving_promotion_accounting_snapshot"
 _MAX_TOKENS = 32
 _REQUIRED_ENV = (
@@ -101,6 +103,7 @@ async def evaluate_promotion(
     expected_sha: str,
     expected_deployment_id: str,
     health_deadline_seconds: float = _HEALTH_ROLLOUT_DEADLINE_SECONDS,
+    health_stable_seconds: float = _HEALTH_STABLE_SECONDS,
     accounting_deadline_seconds: float = _DEFAULT_ACCOUNTING_DEADLINE_SECONDS,
     poll_seconds: float = _ACCOUNTING_POLL_SECONDS,
     sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
@@ -111,6 +114,7 @@ async def evaluate_promotion(
         expected_sha=expected_sha,
         expected_deployment_id=expected_deployment_id,
         deadline_seconds=health_deadline_seconds,
+        stable_seconds=health_stable_seconds,
         poll_seconds=poll_seconds,
         sleep=sleep,
         clock=clock,
@@ -148,6 +152,7 @@ async def _await_health(
     expected_sha: str,
     expected_deployment_id: str,
     deadline_seconds: float,
+    stable_seconds: float = _HEALTH_STABLE_SECONDS,
     poll_seconds: float,
     sleep: Callable[[float], Awaitable[None]],
     clock: Callable[[], float],
@@ -155,6 +160,7 @@ async def _await_health(
     """Wait out rollout identity drift without sending a canary to a stale release."""
     deadline = clock() + max(0.0, deadline_seconds)
     verdict = PromotionVerdict(ok=False, reason=HEALTH_UNREACHABLE)
+    matched_since: float | None = None
     while (remaining := deadline - clock()) > 0:
         try:
             payload = await asyncio.wait_for(loader(), timeout=remaining)
@@ -169,7 +175,17 @@ async def _await_health(
             expected_sha=expected_sha,
             expected_deployment_id=expected_deployment_id,
         )
-        if verdict.reason not in (HEALTH_SHA_MISMATCH, HEALTH_DEPLOYMENT_ID_MISMATCH):
+        if verdict.ok:
+            if matched_since is None:
+                matched_since = clock()
+            if clock() - matched_since >= stable_seconds:
+                return verdict
+            # One matching health response does not mean the old containers have
+            # drained: the next request can still hit the previous release.
+            verdict = PromotionVerdict(ok=False, reason=HEALTH_NOT_STABLE)
+        elif verdict.reason in (HEALTH_SHA_MISMATCH, HEALTH_DEPLOYMENT_ID_MISMATCH):
+            matched_since = None
+        else:
             return verdict
         remaining = deadline - clock()
         if remaining <= 0:
