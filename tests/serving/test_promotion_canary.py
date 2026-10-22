@@ -9,6 +9,7 @@ import pytest
 
 from flash.serve.request.openai import parse_chat_request
 from flash.serving.promotion.canary import (
+    CANARY_RESULT_REDIRECT_REJECTED,
     CANARY_TIMEOUT,
     CANARY_TRANSPORT_FAILURE,
     CanaryError,
@@ -63,7 +64,7 @@ class _FakeClient:
         self._response = response
         self.calls: dict = {}
 
-    def stream(self, method, url, *, headers, json, timeout):
+    def stream(self, method, url, *, headers, json, timeout, follow_redirects=False):
         self.calls = {
             "method": method,
             "url": url,
@@ -201,6 +202,113 @@ def test_a_non_sse_response_is_reported_without_echoing_its_body():
     evidence = _run(client)
     assert evidence.content_type_ok is False
     assert evidence.content_delta_count == 0
+
+
+def test_modal_result_redirects_poll_the_original_generation_with_get():
+    import httpx
+
+    calls, responses = [], []
+
+    def respond(request):
+        calls.append(request)
+        if len(calls) <= 2:
+            response = httpx.Response(303, headers={"location": "?result=pending"})
+        else:
+            response = httpx.Response(
+                200,
+                headers={"content-type": "text/event-stream"},
+                text="\n\n".join(_sse(_delta("ready"), _TERMINAL, _USAGE, "[DONE]")),
+            )
+        responses.append(response)
+        return response
+
+    async def run():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as client:
+            return await run_stream_canary(_request(), client=client)
+
+    evidence = asyncio.run(run())
+    assert evidence.content_type_ok
+    assert evidence.saw_done_sentinel
+    assert evidence.content_delta_count == 1
+    assert evidence.completion_tokens == 7
+    assert [request.method for request in calls] == ["POST", "GET", "GET"]
+    assert all(not request.content for request in calls[1:])
+    assert all(request.headers["X-Correlation-ID"] == "fspromo-12345-1" for request in calls)
+    assert all(response.is_closed for response in responses)
+
+
+@pytest.mark.parametrize(
+    "location",
+    [
+        "https://attacker.example/v1/chat/completions?result=secret",
+        "http://serve.freesolo.co/v1/chat/completions?result=secret",
+        "https://serve.freesolo.co:444/v1/chat/completions?result=secret",
+        "https://user@serve.freesolo.co/v1/chat/completions?result=secret",
+        "/another-endpoint?result=secret",
+        "/v1/chat/completions",
+        "",
+        "?result=secret#fragment",
+    ],
+)
+def test_result_redirects_cannot_forward_credentials_to_another_destination(location):
+    import httpx
+
+    calls = []
+
+    def respond(request):
+        calls.append(request)
+        return httpx.Response(303, headers={"location": location})
+
+    async def run():
+        # Even a caller configured to follow redirects must use the canary's guard.
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(respond),
+            follow_redirects=True,
+        ) as client:
+            return await run_stream_canary(_request(), client=client)
+
+    with pytest.raises(CanaryError, match=f"^{CANARY_RESULT_REDIRECT_REJECTED}$"):
+        asyncio.run(run())
+    assert len(calls) == 1
+
+
+def test_result_redirect_loop_is_bounded_without_resubmitting_post():
+    import httpx
+
+    from flash.serving.promotion.canary import _MAX_RESULT_REDIRECTS
+
+    calls = []
+
+    def respond(request):
+        calls.append(request.method)
+        return httpx.Response(303, headers={"location": "?result=pending"})
+
+    async def run():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as client:
+            return await run_stream_canary(_request(), client=client)
+
+    with pytest.raises(CanaryError, match=f"^{CANARY_RESULT_REDIRECT_REJECTED}$"):
+        asyncio.run(run())
+    assert calls == ["POST"] + ["GET"] * _MAX_RESULT_REDIRECTS
+
+
+def test_result_polling_shares_the_original_wall_clock_deadline():
+    import httpx
+
+    calls = []
+
+    async def respond(request):
+        calls.append(request.method)
+        await asyncio.sleep(0.03)
+        return httpx.Response(303, headers={"location": "?result=pending"})
+
+    async def run():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as client:
+            return await run_stream_canary(_request(timeout_seconds=0.05), client=client)
+
+    with pytest.raises(CanaryError, match=f"^{CANARY_TIMEOUT}$"):
+        asyncio.run(run())
+    assert calls == ["POST", "GET"]
 
 
 def test_an_empty_string_delta_is_not_generated_content():

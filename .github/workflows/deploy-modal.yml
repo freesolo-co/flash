@@ -127,7 +127,9 @@ jobs:
           # says so out loud rather than reporting a restore it never performed.
           echo "previous_sha=$last_deployed_sha" >> "$GITHUB_OUTPUT"
 
-          if [ "$EVENT" = "workflow_dispatch" ]; then
+          # A failed promotion may leave this SHA live after refusing rollback.
+          # An explicit rerun must re-prove it, not pass by skipping the canary.
+          if [ "$EVENT" = "workflow_dispatch" ] || [ "${GITHUB_RUN_ATTEMPT:-1}" -gt 1 ]; then
             deploy=true
           elif [ "$read_ok" != "true" ]; then
             # a missing deployment or any health, network, or parsing failure must deploy safely.
