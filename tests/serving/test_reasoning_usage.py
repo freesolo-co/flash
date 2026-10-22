@@ -105,7 +105,7 @@ def test_buffered_and_streamed_native_counts_agree_for_multiple_choices(modal_ap
     assert events[-1]["completion_tokens"] == buffered["completion_tokens"] == 7
     assert events[-1]["reasoning_tokens"] == buffered["reasoning_tokens"] == (3 if thinking else 0)
     assert events[0]["reasoning_tokens"] == (2 if thinking else 0)
-    for field in ("completion_tokens", "reasoning_tokens"):
+    for field in ("completion_tokens", "reasoning_tokens", "inference_time_seconds"):
         counts = [event[field] for event in events]
         assert counts == sorted(counts)
     for event in events:

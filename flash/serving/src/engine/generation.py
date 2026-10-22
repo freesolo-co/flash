@@ -292,6 +292,24 @@ async def generate(
     }
 
 
+def _record_stream_usage(
+    current: Any,
+    payload: OpenAIGenerateRequest,
+    choice_state: dict[int, _ChoiceState],
+    completion_ids: list[int],
+    reasoning_counter: ReasoningTokenCounter,
+) -> None:
+    # Record the whole native batch before any event, including ready. Rendering
+    # its choices must never regress counters or count this batch a second time.
+    for index, output in sorted(indexed_outputs(current, n=payload.n).items()):
+        if choice_state[index]["finish_reason"] is not None:
+            raise RuntimeError("vLLM emitted data after a choice terminal")
+        token_ids = [int(value) for value in (getattr(output, "token_ids", None) or [])]
+        choice_state[index]["token_ids"].extend(token_ids)
+        completion_ids.extend(token_ids)
+        reasoning_counter.consume(index, token_ids)
+
+
 def _consume_stream_output(
     current: Any,
     payload: OpenAIGenerateRequest,
@@ -301,15 +319,7 @@ def _consume_stream_output(
     usage_kwargs: dict[str, Any],
 ) -> list[dict[str, Any]]:
     events: list[dict[str, Any]] = []
-    outputs = sorted(indexed_outputs(current, n=payload.n).items())
-    # Account for the entire native batch before emitting any choice. The ready
-    # event already exposes this batch, so per-choice events must not regress it.
-    for index, output in outputs:
-        token_ids = [int(value) for value in (getattr(output, "token_ids", None) or [])]
-        choice_state[index]["token_ids"].extend(token_ids)
-        completion_ids.extend(token_ids)
-        usage_kwargs["reasoning_counter"].consume(index, token_ids)
-    for index, output in outputs:
+    for index, output in sorted(indexed_outputs(current, n=payload.n).items()):
         state = choice_state[index]
         if state["finish_reason"] is not None:
             raise RuntimeError("vLLM emitted data after a choice terminal")
@@ -480,9 +490,7 @@ async def stream_generate(
             raise
         usage_kwargs["time_to_first_token_seconds"] = time_to_first_token_seconds
         usage_kwargs["queue_wait_seconds"] = _queue_wait_seconds(first_output)
-        pending_events = _consume_stream_output(
-            first_output, payload, choice_state, completion_ids, tool_parsers, usage_kwargs
-        )
+        _record_stream_usage(first_output, payload, choice_state, completion_ids, reasoning_counter)
         yield {
             "type": "ready",
             "thinking": thinking,
@@ -494,14 +502,16 @@ async def stream_generate(
         try:
             while True:
                 last_output = current
-                for event in pending_events:
+                for event in _consume_stream_output(
+                    current, payload, choice_state, completion_ids, tool_parsers, usage_kwargs
+                ):
                     yield event
                 try:
                     current = await anext(output_stream)
                 except StopAsyncIteration:
                     break
-                pending_events = _consume_stream_output(
-                    current, payload, choice_state, completion_ids, tool_parsers, usage_kwargs
+                _record_stream_usage(
+                    current, payload, choice_state, completion_ids, reasoning_counter
                 )
         except Exception:
             owner._self_heal_if_dead("stream_generate")
