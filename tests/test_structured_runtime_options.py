@@ -112,3 +112,29 @@ def test_compiler_errors_remain_request_errors(monkeypatch):
     )
     with pytest.raises(ValueError, match="invalid compact JSON constraint"):
         vllm_structured_kwargs({"json": {"type": "invalid"}, "disable_any_whitespace": True})
+
+
+def test_nested_runtime_configuration_becomes_plain_json():
+    from collections import UserDict, UserList
+
+    schema = UserDict(
+        {
+            "type": "object",
+            "properties": UserDict(
+                {"answer": UserDict({"type": "string", "enum": UserList(["red", "blue"])})}
+            ),
+            "required": UserList(["answer"]),
+        }
+    )
+    lowered = vllm_structured_kwargs(UserDict({"json": schema}))
+    assert json.loads(json.dumps(lowered)) == {
+        "json": {
+            "type": "object",
+            "properties": {"answer": {"type": "string", "enum": ["red", "blue"]}},
+            "required": ["answer"],
+        }
+    }
+    assert isinstance(schema["properties"], UserDict)
+    assert vllm_structured_kwargs({"choice": UserList(["red", "blue"])}) == {
+        "choice": ["red", "blue"]
+    }

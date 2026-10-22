@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import copy
 import json
+from collections.abc import Mapping, Sequence
 from functools import lru_cache
 from typing import Any
 
@@ -44,6 +45,7 @@ def vllm_structured_kwargs(spec: dict[str, Any]) -> dict[str, Any]:
     in StructuredOutputsParams. an explicit grammar carries compact formatting
     per request and preserves spaces *inside* JSON strings.
     """
+    spec = _plain_json_containers(spec)
     validate_structured_options(spec)
     kwargs = {key: value for key, value in spec.items() if key not in _JSON_OPTIONS}
     kwargs.pop("whitespace_pattern", None)
@@ -104,3 +106,13 @@ def _close_objects(schema: Any) -> None:
         if isinstance(children, list):
             for child in children:
                 _close_objects(child)
+
+
+def _plain_json_containers(value: Any) -> Any:
+    # hydra wraps nested rollout configuration in DictConfig/ListConfig. vllm/xgrammar
+    # require plain JSON containers; a shallow dict() leaves schemas unserializable.
+    if isinstance(value, Mapping):
+        return {key: _plain_json_containers(item) for key, item in value.items()}
+    if isinstance(value, Sequence) and not isinstance(value, str | bytes | bytearray):
+        return [_plain_json_containers(item) for item in value]
+    return value
