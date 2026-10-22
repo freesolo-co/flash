@@ -23,7 +23,7 @@ from flash.serve.request.openai import (
 )
 from flash.serve.request.tool_calls import qualified_tool_parser, validate_tool_stop_sequences
 from flash.serve.request.transport import RawChatStream, is_event_stream_content_type
-from flash.server.platform.deps import manageable_run
+from flash.server.platform.deps import require_manageable_run
 from flash.server.platform.internal_client import run_serving_org_id
 from flash.server.routes.serving_revisions import (
     _DEPLOYMENT_BUSY_STATES,
@@ -82,7 +82,7 @@ def _resolve_chat_request(
     x_freesolo_org_id: str | None,
     x_freesolo_project_id: str | None,
 ) -> tuple[Any, list[dict[str, Any]], Any, str]:
-    status = manageable_run(run_id, key, x_freesolo_org_id, x_freesolo_project_id)
+    status = require_manageable_run(run_id, key, x_freesolo_org_id, x_freesolo_project_id)
     try:
         request = parse_chat_request(
             payload,

@@ -33,7 +33,7 @@ from flash.engine.worker.perf.lifecycle import (
     wait_for_gpu,
 )
 from flash.engine.worker.perf.memory import (
-    _memory_mode,
+    _prefer_gradient_checkpointing,
     grad_checkpointing_on,
     grpo_use_reentrant,
 )
@@ -393,7 +393,7 @@ __all__ = [
     "_float_or_none",
     "_force_fla_triton_gdn_on_sm100",
     "_int_or_none",
-    "_memory_mode",
+    "_prefer_gradient_checkpointing",
     "_query_nvidia_gpu",
     "_query_nvidia_processes",
     "_remove_fla_from_disk",

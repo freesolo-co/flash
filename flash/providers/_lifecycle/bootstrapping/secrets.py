@@ -138,7 +138,7 @@ def _redact_values(text: str, values: set[str]) -> str:
     return text
 
 
-def _secret_env_name(name: str) -> bool:
+def _is_secret_env_name(name: str) -> bool:
     upper = str(name).upper()
     return upper in {"AUTHORIZATION", "HF_TOKEN"} or upper.endswith(
         ("_API_KEY", "_TOKEN", "_SECRET", "_PASSWORD")
@@ -162,7 +162,7 @@ def _payload_secrets(payload: dict) -> dict:
     return {
         key: value
         for key, value in env.items()
-        if value and (str(key).upper() in declared or _secret_env_name(key))
+        if value and (str(key).upper() in declared or _is_secret_env_name(key))
     }
 
 
@@ -191,7 +191,7 @@ def _safe_detail(
     text = f"{type(value).__name__}: {value}" if isinstance(value, BaseException) else str(value)
     values: set[str] = set()
     for key, secret in os.environ.items():
-        if secret and _secret_env_name(key):
+        if secret and _is_secret_env_name(key):
             values.add(str(secret))
     for secret in (secrets or {}).values():
         if secret:

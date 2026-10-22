@@ -1,6 +1,6 @@
 """Table renderers for `flash` list commands.
 
-The primitives these build on (`_table`, `_paint`, `header`, ...) stay in
+The primitives these build on (`_format_table`, `_paint`, `header`, ...) stay in
 `flash.cli.ui.render`; this module owns the per-command table layouts.
 """
 
@@ -18,11 +18,11 @@ from flash.cli.ui.render import (
     _STATE_STYLE,
     _TEAL,
     _dim,
+    _format_table,
     _glyph,
     _humanize_ts,
     _paint,
-    _safe,
-    _table,
+    _stdout_encodable_text,
     arrow,
     gpu_label,
     header,
@@ -34,7 +34,7 @@ def models_table(rows: list[dict]) -> str:
     dot = _glyph("•", "-")
     ids = "\n".join(f"  {_paint(dot, _FAINT)} {_paint(r['id'], _ACCENT2)}" for r in rows)
     foot = arrow(f"train one with: {CLI_NAME} train configs/sft.toml")
-    return _safe(f"{header('models', 'supported base models')}\n{ids}\n\n{foot}")
+    return _stdout_encodable_text(f"{header('models', 'supported base models')}\n{ids}\n\n{foot}")
 
 
 def projects_table(rows: list[dict]) -> str:
@@ -47,12 +47,12 @@ def projects_table(rows: list[dict]) -> str:
         for row in rows
     ]
     if not body:
-        return _safe(
+        return _stdout_encodable_text(
             f"{header('projects list', 'Freesolo projects')}\n"
             f"{_dim(f'  no projects yet; create one with `{CLI_NAME} projects create NAME`')}"
         )
-    return _safe(
-        f"{header('projects list', 'Freesolo projects')}\n{_table(['NAME', 'PROJECT ID'], body)}"
+    return _stdout_encodable_text(
+        f"{header('projects list', 'Freesolo projects')}\n{_format_table(['NAME', 'PROJECT ID'], body)}"
     )
 
 
@@ -62,8 +62,10 @@ def gpus_table(rows: list[tuple[str, int, float | None]], tip: str) -> str:
     for name, vram, rate in rows:
         rate_cell = (f"${rate:.2f}", _TEAL) if rate else ("-", _FAINT)
         body.append([(name, _ACCENT2), (f"{vram} GB", _GRAY), rate_cell])
-    table = _table(["GPU", "VRAM", "$/HR"], body, aligns=["l", "r", "r"])
-    return _safe(f"{header('gpus', 'managed GPU classes')}\n{table}\n\n{_dim(tip)}")
+    table = _format_table(["GPU", "VRAM", "$/HR"], body, aligns=["l", "r", "r"])
+    return _stdout_encodable_text(
+        f"{header('gpus', 'managed GPU classes')}\n{table}\n\n{_dim(tip)}"
+    )
 
 
 def runs_table(runs: list[dict]) -> str:
@@ -88,12 +90,12 @@ def runs_table(runs: list[dict]) -> str:
                 model,
             ]
         )
-    table = _table(
+    table = _format_table(
         ["RUN ID", "STATE", "ALGO", "COST", "GPU", "MODEL"],
         body,
         aligns=["l", "l", "l", "r", "l", "l"],
     )
-    return _safe(f"{header('runs', f'{len(runs)} run(s)')}\n{table}")
+    return _stdout_encodable_text(f"{header('runs', f'{len(runs)} run(s)')}\n{table}")
 
 
 def deployments_table(rows: list[dict]) -> str:
@@ -123,7 +125,7 @@ def deployments_table(rows: list[dict]) -> str:
                 (detail, _GRAY),
             ]
         )
-    table = _table(
+    table = _format_table(
         [
             "RUN ID",
             "STEP",
@@ -136,7 +138,7 @@ def deployments_table(rows: list[dict]) -> str:
         ],
         body,
     )
-    return _safe(f"{header('deployments', f'{len(rows)} active')}\n{table}")
+    return _stdout_encodable_text(f"{header('deployments', f'{len(rows)} active')}\n{table}")
 
 
 def checkpoints_table(run_id: str, rows: list[dict]) -> str:
@@ -150,6 +152,8 @@ def checkpoints_table(run_id: str, rows: list[dict]) -> str:
         ]
         for c in sorted(rows, key=lambda c: c.get("step", 0))
     ]
-    table = _table(["STEP", "CHECKPOINT"], body, aligns=["r", "l"])
+    table = _format_table(["STEP", "CHECKPOINT"], body, aligns=["r", "l"])
     foot = arrow(f"deploy one with: {CLI_NAME} models deploy {run_id}/step-<STEP>")
-    return _safe(f"{header('checkpoints', f'{len(rows)} deployable')}\n{table}\n\n{foot}")
+    return _stdout_encodable_text(
+        f"{header('checkpoints', f'{len(rows)} deployable')}\n{table}\n\n{foot}"
+    )

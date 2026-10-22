@@ -366,7 +366,7 @@ def _sft_profile_max_length(profile) -> int:
 # remain attributes of `sft_train` rather than direct imports in the split module.
 from flash.engine.plan.recipe import RECIPE  # noqa: E402,F401
 from flash.engine.plan.steps import final_save_due, validate_save_steps  # noqa: E402,F401
-from flash.engine.profiling.sft_rows import _model_arch_dims, sft_under_ran  # noqa: E402,F401
+from flash.engine.profiling.sft_rows import _model_arch_dims, sft_finished_before_expected_steps  # noqa: E402,F401
 from flash.engine.profiling.sft_workload import (  # noqa: E402,F401
     prepare_sft_workload,
     sft_tokens_for_updates,

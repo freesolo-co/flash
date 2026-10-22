@@ -15,7 +15,7 @@ from flash.server.platform.internal_client import run_serving_org_id
 from flash.server.routes import serving_completion
 from tests._helpers.deployments import seed_ready_checkpoint
 from tests.test_serve import _stub_adapter_config
-from tests.test_server_api import _bearer, _identity_for_token, _login, _make_run
+from tests.test_server_api import _bearer, _identity_for_token, _make_run, _new_user_token
 from tests.test_server_api import api as api
 
 
@@ -31,7 +31,7 @@ def _deploy(api, key, run_id, checkpoint_id):
 
 
 def test_retired_ready_deployments_are_revoked_and_failed_cleanup_is_retried(api, monkeypatch):
-    key = _login()
+    key = _new_user_token()
     retired, supported = [_make_run(api, key, "done") for _ in range(2)]
     for run_id in (retired, supported):
         seed_ready_checkpoint(run_id, f"{run_id}/final")
@@ -58,12 +58,12 @@ def test_retired_ready_deployments_are_revoked_and_failed_cleanup_is_retried(api
     monkeypatch.setattr(deploy, "undeploy_adapter", undeploy)
     assert serving_completion.recover_deployments() == 1
     assert not calls
-    assert serving_completion.cleanup_recovered_deployments(Event())
+    assert serving_completion.cleanup_pending_deployments(Event())
     pending = status.get_status(retired).deployments[f"{retired}/final"]
     assert pending["state"] == "undeploying"
     assert "temporary serving outage" in pending["error"]
     assert serving_completion.recover_deployments() == 1
-    assert not serving_completion.cleanup_recovered_deployments(Event())
+    assert not serving_completion.cleanup_pending_deployments(Event())
     assert status.get_status(retired).deployments[f"{retired}/final"]["state"] == "undeployed"
     assert status.get_status(supported).deployments == sibling
     assert len(calls) == 2
@@ -74,7 +74,7 @@ def test_retired_ready_deployments_are_revoked_and_failed_cleanup_is_retried(api
 def test_failure_before_smoke_cleans_only_attempted_registration(
     api, monkeypatch, cleanup_fails, registration_started
 ):
-    key = _login()
+    key = _new_user_token()
     run_id = _make_run(api, key, "done")
     checkpoint_id, sibling = f"{run_id}/final", f"{run_id}/step-20"
     seed_ready_checkpoint(run_id, sibling)
@@ -113,7 +113,7 @@ def test_failure_before_smoke_cleans_only_attempted_registration(
 def test_recovery_fences_and_removes_unfinished_registration(
     api, monkeypatch, initial_state, cleanup_fails
 ):
-    key = _login()
+    key = _new_user_token()
     run_id = _make_run(api, key, "done")
     checkpoint_id, sibling = f"{run_id}/step-20", f"{run_id}/final"
     seed_ready_checkpoint(run_id, sibling)
@@ -151,7 +151,7 @@ def test_recovery_fences_and_removes_unfinished_registration(
     monkeypatch.setattr(deploy, "undeploy_adapter", undeploy)
     assert serving_completion.recover_deployments() == 1
     assert undeploys == []
-    serving_completion.cleanup_recovered_deployments(Event())
+    serving_completion.cleanup_pending_deployments(Event())
     saved = status.get_status(run_id)
     assert saved.deployments[sibling] == current.deployments[sibling]
     assert saved.deployments[checkpoint_id]["state"] == (
@@ -163,13 +163,13 @@ def test_recovery_fences_and_removes_unfinished_registration(
         assert saved.deployments[checkpoint_id]["retryable"] is True
         cleanup_fails = False
         assert serving_completion.recover_deployments() == 1
-        serving_completion.cleanup_recovered_deployments(Event())
+        serving_completion.cleanup_pending_deployments(Event())
         assert status.get_status(run_id).deployments[checkpoint_id]["state"] == "undeployed"
     assert serving_completion.recover_deployments() == 0
 
 
 def test_recovery_without_org_retains_undeploying(api, monkeypatch):
-    key = _login()
+    key = _new_user_token()
     run_id = _make_run(api, key, "done")
     checkpoint_id = f"{run_id}/final"
     transitions.mark_deployment_pending(
@@ -188,7 +188,7 @@ def test_recovery_without_org_retains_undeploying(api, monkeypatch):
         deploy, "undeploy_adapter", lambda *_args, **_kwargs: pytest.fail("unscoped cleanup")
     )
     assert serving_completion.recover_deployments() == 1
-    serving_completion.cleanup_recovered_deployments(Event())
+    serving_completion.cleanup_pending_deployments(Event())
     record = status.get_status(run_id).deployments[checkpoint_id]
     assert record["state"] == "undeploying"
     assert "no organization scope" in record["error"]
@@ -197,7 +197,7 @@ def test_recovery_without_org_retains_undeploying(api, monkeypatch):
 @pytest.mark.parametrize("error_type", [RegistrationRejected, ServingError])
 @pytest.mark.parametrize("status_code", [401, 403, 409, 422])
 def test_only_registration_rejection_skips_cleanup(api, monkeypatch, error_type, status_code):
-    key = _login()
+    key = _new_user_token()
     run_id = _make_run(api, key, "done")
     deleted = []
 
@@ -213,7 +213,7 @@ def test_only_registration_rejection_skips_cleanup(api, monkeypatch, error_type,
 
 
 def test_recovery_uses_persisted_registration_org(api, monkeypatch):
-    key = _login()
+    key = _new_user_token()
     run_id = _make_run(api, key, "done")
     original = status.get_status(run_id)
     original.billing_context = {}
@@ -238,7 +238,7 @@ def test_recovery_uses_persisted_registration_org(api, monkeypatch):
         deploy, "undeploy_adapter", lambda target, **kw: deleted.append((target, kw))
     )
     serving_completion.recover_deployments()
-    serving_completion.cleanup_recovered_deployments(Event())
+    serving_completion.cleanup_pending_deployments(Event())
     assert deleted == [(f"{run_id}/final", {"org_id": record["serving_org_id"], "timeout_s": 5.0})]
 
 
@@ -249,7 +249,7 @@ def test_recovery_worker_respects_stop(api, monkeypatch):
     )
     stop = Event()
     stop.set()
-    assert serving_completion.cleanup_recovered_deployments(stop) is False
+    assert serving_completion.cleanup_pending_deployments(stop) is False
 
 
 @pytest.fixture
@@ -262,7 +262,7 @@ def blocked_recovery(monkeypatch):
             pass
 
     monkeypatch.setattr(serving_completion, "recover_deployments", lambda: 1)
-    monkeypatch.setattr(serving_completion, "retry_deployment_cleanup", cleanup)
+    monkeypatch.setattr(serving_completion, "run_deployment_cleanup_worker", cleanup)
     try:
         yield started
     finally:
@@ -271,12 +271,12 @@ def blocked_recovery(monkeypatch):
 
 def test_startup_serves_requests_while_remote_cleanup_is_blocked(blocked_recovery, api):
     assert blocked_recovery.wait(2)
-    assert api.get("/v1/me", headers=_bearer(_login())).status_code == 200
+    assert api.get("/v1/me", headers=_bearer(_new_user_token())).status_code == 200
 
 
 @pytest.fixture
 def controlled_cleanup(monkeypatch):
-    retry = serving_completion.retry_deployment_cleanup
+    retry = serving_completion.run_deployment_cleanup_worker
     waits, wake, finished = Queue(), Event(), Event()
 
     def worker(stop):
@@ -296,7 +296,7 @@ def controlled_cleanup(monkeypatch):
         finally:
             finished.set()
 
-    monkeypatch.setattr(serving_completion, "retry_deployment_cleanup", worker)
+    monkeypatch.setattr(serving_completion, "run_deployment_cleanup_worker", worker)
     yield waits, wake
     assert finished.wait(2), "cleanup worker did not stop with the API"
 
@@ -304,7 +304,7 @@ def controlled_cleanup(monkeypatch):
 def test_cleanup_worker_handles_live_failures_after_idle(controlled_cleanup, api, monkeypatch):
     waits, wake = controlled_cleanup
     assert waits.get(timeout=2) == 30.0  # Clean startup still owns an idle worker.
-    key = _login()
+    key = _new_user_token()
     run_id = _make_run(api, key, "done")
     target = f"{run_id}/final"
     offline = True
@@ -338,7 +338,7 @@ def test_cleanup_worker_handles_live_failures_after_idle(controlled_cleanup, api
 def test_ambiguous_registration_preserves_mismatched_binding(
     api, monkeypatch, tmp_path, status_code
 ):
-    key = _login()
+    key = _new_user_token()
     run_id = _make_run(api, key, "done")
     checkpoint_id, sibling = f"{run_id}/final", f"{run_id}/step-20"
     seed_ready_checkpoint(run_id, sibling)
@@ -359,7 +359,7 @@ def test_ambiguous_registration_preserves_mismatched_binding(
         existing.update({**kwargs["json"], "artifact_digest": "another-artifact"})
         raise ServingError("registration response lost", status_code=status_code)
 
-    monkeypatch.setattr(deploy, "_registered_adapter", registered)
+    monkeypatch.setattr(deploy, "fetch_registered_checkpoint", registered)
     monkeypatch.setattr(deploy.transport, "serving_request", ambiguous)
     monkeypatch.setattr(deploy, "undeploy_adapter", lambda target, **_: deletes.append(target))
     result = _deploy(api, key, run_id, checkpoint_id)
@@ -372,7 +372,7 @@ def test_ambiguous_registration_preserves_mismatched_binding(
 
 @pytest.mark.parametrize("interruption", ["failure", "locked"])
 def test_cleanup_worker_retries_without_another_restart(api, monkeypatch, interruption):
-    key = _login()
+    key = _new_user_token()
     run_id = _make_run(api, key, "done")
     targets = [f"{run_id}/final", f"{run_id}/step-20"]
     for target in targets:
@@ -402,7 +402,7 @@ def test_cleanup_worker_retries_without_another_restart(api, monkeypatch, interr
     monkeypatch.setattr(deploy, "undeploy_adapter", undeploy)
     monkeypatch.setattr(stop, "wait", wait)
     try:
-        serving_completion.retry_deployment_cleanup(stop)
+        serving_completion.run_deployment_cleanup_worker(stop)
     finally:
         if interruption == "locked" and not waits:
             lock.release()
@@ -412,7 +412,7 @@ def test_cleanup_worker_retries_without_another_restart(api, monkeypatch, interr
 
 
 def test_cleanup_retry_rechecks_state_after_backoff(api, monkeypatch):
-    key = _login()
+    key = _new_user_token()
     run_id = _make_run(api, key, "done")
     target = f"{run_id}/final"
     seed_ready_checkpoint(run_id, target)
@@ -431,7 +431,7 @@ def test_cleanup_retry_rechecks_state_after_backoff(api, monkeypatch):
 
     monkeypatch.setattr(deploy, "undeploy_adapter", unavailable)
     monkeypatch.setattr(stop, "wait", wait)
-    serving_completion.retry_deployment_cleanup(stop)
+    serving_completion.run_deployment_cleanup_worker(stop)
     assert deleted == [target]
     assert status.get_status(run_id).deployments[target]["state"] == "ready"
 
@@ -447,7 +447,7 @@ def test_cleanup_retry_rechecks_state_after_backoff(api, monkeypatch):
     ],
 )
 def test_restart_uses_durable_registration_intent(api, monkeypatch, stage):
-    key = _login()
+    key = _new_user_token()
     run_id = _make_run(api, key, "done")
     target, sibling = f"{run_id}/final", f"{run_id}/step-20"
     seed_ready_checkpoint(run_id, sibling)
@@ -490,10 +490,10 @@ def test_restart_uses_durable_registration_intent(api, monkeypatch, stage):
             "artifact_digest": "other" if stage == "conflicting_binding" else "expected-artifact",
         }
 
-    monkeypatch.setattr(deploy, "_registered_adapter", registered)
+    monkeypatch.setattr(deploy, "fetch_registered_checkpoint", registered)
     monkeypatch.setattr(deploy, "undeploy_adapter", lambda target, **kw: deletes.append(target))
     assert serving_completion.recover_deployments() == 1
-    serving_completion.cleanup_recovered_deployments(Event())
+    serving_completion.cleanup_pending_deployments(Event())
     recovered = status.get_status(run_id)
     if stage == "before_registration":
         assert reads == deletes == []
@@ -519,7 +519,7 @@ def test_restart_uses_durable_registration_intent(api, monkeypatch, stage):
 
 
 def test_registration_does_not_start_if_intent_cannot_be_persisted(api, monkeypatch):
-    key = _login()
+    key = _new_user_token()
     run_id = _make_run(api, key, "done")
     target = f"{run_id}/final"
     original = transitions.mark_deployment_pending
@@ -548,7 +548,7 @@ def test_registration_does_not_start_if_intent_cannot_be_persisted(api, monkeypa
 def test_cleanup_reaches_later_checkpoints_despite_repeated_timeouts(
     api, monkeypatch, multiple_runs
 ):
-    key = _login()
+    key = _new_user_token()
     run_id = _make_run(api, key, "done")
     targets = []
     for i in range(7):
@@ -579,7 +579,7 @@ def test_cleanup_reaches_later_checkpoints_despite_repeated_timeouts(
 
     monkeypatch.setattr(deploy, "undeploy_adapter", undeploy)
     monkeypatch.setattr(stop, "wait", wait)
-    serving_completion.retry_deployment_cleanup(stop)
+    serving_completion.run_deployment_cleanup_worker(stop)
     assert status.get_status(last_run).deployments[last_target]["state"] == "undeployed"
     assert waits == [1.0]
 
@@ -588,7 +588,7 @@ def test_cleanup_reaches_later_checkpoints_despite_repeated_timeouts(
 def test_cleanup_retry_keeps_original_cause_and_only_latest_failure(
     api, monkeypatch, legacy_composite
 ):
-    key = _login()
+    key = _new_user_token()
     run_id = _make_run(api, key, "done")
     target = f"{run_id}/final"
     seed_ready_checkpoint(run_id, target)
@@ -622,11 +622,11 @@ def test_cleanup_retry_keeps_original_cause_and_only_latest_failure(
 
     monkeypatch.setattr(deploy, "undeploy_adapter", unavailable)
     monkeypatch.setattr(stop, "wait", wait)
-    serving_completion.retry_deployment_cleanup(stop)
+    serving_completion.run_deployment_cleanup_worker(stop)
     assert waits == [1, 2, 4, 8, 16] + [30] * 45
     assert len(attempts) == 50
     monkeypatch.setattr(deploy, "undeploy_adapter", lambda *a, **kw: None)
-    serving_completion.cleanup_recovered_deployments(Event())
+    serving_completion.cleanup_pending_deployments(Event())
     record = status.get_status(run_id).deployments[target]
     assert record["state"] == "undeployed"
     assert not {"error", "deployment_error", "cleanup_error"}.intersection(record)

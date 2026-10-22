@@ -10,7 +10,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from flash._internal.channel import CLI_NAME
-from flash.cli.commands.env.ops.push import _err
+from flash.cli.commands.env.ops.push import _report_command_error
 from flash.cli.commands.env.testing.eval_args import (
     _MAX_CONCURRENCY,
     bounded_concurrency,
@@ -462,7 +462,7 @@ def _upload_report(
 
     _, api_key = load_credentials()
     if not api_key:
-        return _err(
+        return _report_command_error(
             f"cannot upload results: not logged in — run `{CLI_NAME} login` with your freesolo "
             "API key (or set FREESOLO_API_KEY)"
         )
@@ -492,7 +492,7 @@ def _upload_report(
             api_key=api_key,
         )
     except ClientError as exc:
-        return _err(f"suite {report.name}: upload failed: {exc}")
+        return _report_command_error(f"suite {report.name}: upload failed: {exc}")
     detail = f"suite {report.name}: uploaded {len(payload)} case(s)"
     print(render.ok(detail) if render.styled() else detail)
     return 0
@@ -535,23 +535,31 @@ def _resolve_evaluation_target(
     except (api_error, client_error) as exc:
         if getattr(args, "debug", False):
             raise
-        _err(f"env eval failed: could not resolve verified checkpoints for {run_id}: {exc}")
-        return args.target, None, _err("overall: FAIL")
+        _report_command_error(
+            f"env eval failed: could not resolve verified checkpoints for {run_id}: {exc}"
+        )
+        return args.target, None, _report_command_error("overall: FAIL")
     except Exception as exc:
         if getattr(args, "debug", False):
             raise
-        _err(f"env eval failed: could not resolve verified checkpoints for {run_id}: {exc}")
-        return args.target, None, _err("overall: FAIL")
+        _report_command_error(
+            f"env eval failed: could not resolve verified checkpoints for {run_id}: {exc}"
+        )
+        return args.target, None, _report_command_error("overall: FAIL")
     from flash.runner.results.deployments import is_ready
 
     deployments = run.get("deployments") if isinstance(run, dict) else None
     if not isinstance(deployments, dict):
-        _err(f"env eval failed: control plane returned invalid checkpoint authority for {run_id}")
-        return args.target, None, _err("overall: FAIL")
+        _report_command_error(
+            f"env eval failed: control plane returned invalid checkpoint authority for {run_id}"
+        )
+        return args.target, None, _report_command_error("overall: FAIL")
     record = deployments.get(args.target, {})
     if not isinstance(record, dict) or not is_ready(run_id, record):
-        _err(f"env eval failed: checkpoint {args.target} has not passed deployment verification")
-        return args.target, None, _err("overall: FAIL")
+        _report_command_error(
+            f"env eval failed: checkpoint {args.target} has not passed deployment verification"
+        )
+        return args.target, None, _report_command_error("overall: FAIL")
     return args.target, run, None
 
 
@@ -574,12 +582,12 @@ def _resolve_evaluation_project(args, project_id, spec, client_error) -> tuple[s
     except client_error as exc:
         if getattr(args, "debug", False):
             raise
-        _err(
+        _report_command_error(
             f"env eval failed: cannot record results for {args.target}: its project is unknown "
             f"({exc}). pass `--project PROJECT_ID`, or pass --no-upload to score without "
             "recording"
         )
-        return project_id, _err("overall: FAIL")
+        return project_id, _report_command_error("overall: FAIL")
     return project_id, None
 
 
@@ -589,23 +597,23 @@ def _resolve_evaluation_environment(args, spec, is_managed_environment_slug):
     # a local path is neither stable nor resolvable, so there is no fallback.
     environment_reference = _spec_environment_id(spec)
     if not environment_reference:
-        _err(
+        _report_command_error(
             f"env eval failed: run {args.target} trains on no published environment. "
             f"publish one with `{CLI_NAME} env push` and train a run against it"
         )
-        return environment_reference, _err("overall: FAIL")
+        return environment_reference, _report_command_error("overall: FAIL")
     # nonempty is not enough. a run may legitimately train on a generic `github:` ref, which
     # `_spec_environment_id` returns verbatim because it denotes no hub page -- and recording one
     # would file this report under exactly the unlinkable provenance the command exists to stop. the
     # hub is also what makes the package fetchable below, so this is one gate for both: a slug, or
     # no evaluation.
     if not is_managed_environment_slug(environment_reference):
-        _err(
+        _report_command_error(
             f"env eval failed: run {args.target} trains on {environment_reference}, which is not a "
             f"published environment. publish it with `{CLI_NAME} env push` and train a run against "
             "the resulting namespace/project/name slug"
         )
-        return environment_reference, _err("overall: FAIL")
+        return environment_reference, _report_command_error("overall: FAIL")
     return environment_reference, None
 
 
@@ -635,19 +643,19 @@ def _prepare_evaluation_workdir(
     except (api_error, client_error) as exc:
         if getattr(args, "debug", False):
             raise
-        _err(
+        _report_command_error(
             f"env eval failed: could not download the published environment "
             f"{environment_reference}: {exc}"
         )
-        return None, None, None, _err("overall: FAIL")
+        return None, None, None, _report_command_error("overall: FAIL")
     except Exception as exc:
         if getattr(args, "debug", False):
             raise
-        _err(
+        _report_command_error(
             f"env eval failed: could not unpack the published environment "
             f"{environment_reference}: {exc}"
         )
-        return None, None, None, _err("overall: FAIL")
+        return None, None, None, _report_command_error("overall: FAIL")
 
     try:
         # the same kwargs `env test` builds from --split/--param, so a held-out suite grades the
@@ -665,15 +673,19 @@ def _prepare_evaluation_workdir(
         if getattr(args, "debug", False):
             raise
         reason = str(exc) or exc.__class__.__name__
-        _err(f"env eval failed: {reason.replace('cannot publish', 'cannot evaluate')}")
-        return None, None, None, _err("overall: FAIL")
+        _report_command_error(
+            f"env eval failed: {reason.replace('cannot publish', 'cannot evaluate')}"
+        )
+        return None, None, None, _report_command_error("overall: FAIL")
 
     if args.suite:
         available = ", ".join(sorted(suite.name for suite in suites))
         suites = [suite for suite in suites if suite.name == args.suite]
         if not suites:
-            _err(f"env eval failed: unknown suite {args.suite!r}; available suites: {available}")
-            return None, None, None, _err("overall: FAIL")
+            _report_command_error(
+                f"env eval failed: unknown suite {args.suite!r}; available suites: {available}"
+            )
+            return None, None, None, _report_command_error("overall: FAIL")
     return environment, suites, sidecar, None
 
 
@@ -702,7 +714,7 @@ def _run_evaluation_workdir(
             if getattr(args, "debug", False):
                 raise
             reason = str(exc) or exc.__class__.__name__
-            _err(f"suite {suite.name} failed to load cases: {reason}")
+            _report_command_error(f"suite {suite.name} failed to load cases: {reason}")
             report = EvalSuiteReport(
                 name=suite.name,
                 results=(_generation_error("load", f"case loading failed: {reason}"),),
@@ -724,7 +736,7 @@ def _run_evaluation_workdir(
         if not cases:
             # a suite that graded nothing measured nothing. reporting 0/0 as a pass would
             # turn an empty or over-filtered suite into a green check nobody looks at again.
-            _err(f"suite {suite.name} has no cases to run")
+            _report_command_error(f"suite {suite.name} has no cases to run")
             report = EvalSuiteReport(
                 name=suite.name,
                 results=(_generation_error("load", "suite produced no cases"),),
@@ -774,7 +786,7 @@ def _run_evaluation_workdir(
         for report in reports
     )
     if failed:
-        return _err("overall: FAIL")
+        return _report_command_error("overall: FAIL")
     print(render.ok("overall: PASS") if render.styled() else "overall: PASS")
     return 0
 
@@ -791,11 +803,11 @@ def cmd_env_eval(args) -> int:
     from flash.schema import parse_checkpoint_ref
 
     if args.project and not args.upload:
-        return _err("--project cannot be combined with --no-upload")
+        return _report_command_error("--project cannot be combined with --no-upload")
 
     parsed = parse_checkpoint_ref(args.target)
     if parsed is None:
-        return _err(
+        return _report_command_error(
             f"invalid evaluation target {args.target!r} "
             "(expected <run_id>/final or <run_id>/step-N)"
         )
@@ -811,13 +823,13 @@ def cmd_env_eval(args) -> int:
         except ClientError as exc:
             if getattr(args, "debug", False):
                 raise
-            return _err(f"--project must be a valid PROJECT_ID: {exc}")
+            return _report_command_error(f"--project must be a valid PROJECT_ID: {exc}")
 
     try:
         params = _env_params(args)
     except ValueError as exc:
-        _err(f"env eval failed: {exc}")
-        return _err("overall: FAIL")
+        _report_command_error(f"env eval failed: {exc}")
+        return _report_command_error("overall: FAIL")
 
     client = client_from_config()
     evaluation_target, run, exit_code = _resolve_evaluation_target(

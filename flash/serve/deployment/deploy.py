@@ -27,9 +27,7 @@ from flash.serve.contract.protocol import (
     parse_serving_health,
 )
 from flash.serve.contract.provenance import immutable_binding_fingerprint
-from flash.serve.contract.responses import (
-    matches_revision_identity as _matches_revision_identity,
-)
+from flash.serve.contract.responses import matches_registration_identity
 from flash.serve.deployment import adapter_check, readiness
 from flash.serve.request import streaming as streaming_support
 from flash.serve.request import thinking as thinking_support
@@ -176,7 +174,7 @@ def deploy_adapter(
 
     normalized_org_id = serving_org_id(org_id)
     bound_record = (
-        _registered_adapter(normalized_org_id, checkpoint_id) if normalized_org_id else None
+        fetch_registered_checkpoint(normalized_org_id, checkpoint_id) if normalized_org_id else None
     )
     bound_revision = (
         str(bound_record.get("artifact_revision") or "").strip().lower()
@@ -239,12 +237,12 @@ def deploy_adapter(
                 str(exc), status_code=exc.status_code, retry_after=exc.retry_after
             ) from exc
         try:
-            record = _registered_adapter(normalized_org_id, checkpoint_id)
+            record = fetch_registered_checkpoint(normalized_org_id, checkpoint_id)
         except serving_errors.ServingError as read_exc:
             raise exc from read_exc
         if record is None:
             raise exc
-        if not _matches_revision_identity(record, body):
+        if not matches_registration_identity(record, body):
             raise serving_errors.RegistrationRejected(
                 f"checkpoint {checkpoint_id} is already registered with a different immutable identity",
                 status_code=409,
@@ -259,7 +257,7 @@ def deploy_adapter(
         checkpoint_id,
         subfolder,
         expected_identity=body,
-        budget_s=readiness.revision_ready_budget_seconds(model),
+        budget_s=readiness.checkpoint_readiness_timeout_seconds(model),
     )
     serving_generation = ready_record.get("deployment_generation")
     if not isinstance(serving_generation, str) or not serving_generation.strip():
@@ -283,7 +281,7 @@ def deploy_adapter(
 
 def _confirm_deployment_generation(org_id: str, checkpoint_id: str, generation: str) -> None:
     try:
-        record = _registered_adapter(org_id, checkpoint_id)
+        record = fetch_registered_checkpoint(org_id, checkpoint_id)
     except serving_errors.ServingError as exc:
         # A failed read cannot prove this attempt still owns the loaded adapter.
         # Preserve any replacement rather than deleting by checkpoint ID alone.
@@ -302,7 +300,7 @@ def _adapter_url(checkpoint_id: str) -> str:
     return f"{serving_urls.serving_base_url()}/adapters/{quote(checkpoint_id, safe='')}"
 
 
-def _registered_adapter_response(
+def _fetch_registered_checkpoint_response(
     org_id: str, checkpoint_id: str, *, timeout_s: float | None = None
 ) -> tuple[dict | None, httpx.Response]:
     """Read one authoritative adapter record and retain its polling headers."""
@@ -331,12 +329,12 @@ def _registered_adapter_response(
     return record, resp
 
 
-def _registered_adapter(
+def fetch_registered_checkpoint(
     org_id: str, checkpoint_id: str, *, timeout_s: float | None = None
 ) -> dict | None:
     """read one tenant-scoped authoritative adapter record, including disabled records."""
 
-    record, _ = _registered_adapter_response(org_id, checkpoint_id, timeout_s=timeout_s)
+    record, _ = _fetch_registered_checkpoint_response(org_id, checkpoint_id, timeout_s=timeout_s)
     return record
 
 
@@ -441,7 +439,9 @@ def _wait_checkpoint_ready(
                 break
         first_read = False
         try:
-            record, response = _registered_adapter_response(org_id, revision, timeout_s=remaining)
+            record, response = _fetch_registered_checkpoint_response(
+                org_id, revision, timeout_s=remaining
+            )
         except serving_errors.ServingError as exc:
             if exc.status_code is not None and exc.status_code < 500:
                 raise
@@ -459,7 +459,7 @@ def _wait_checkpoint_ready(
         if record is None:
             continue
         last_read_error = None
-        if expected_identity is not None and not _matches_revision_identity(
+        if expected_identity is not None and not matches_registration_identity(
             record, expected_identity
         ):
             raise serving_errors.ServingError(

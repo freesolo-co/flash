@@ -20,7 +20,7 @@ PART_BYTES = 40_000_000_000
 _BUFFER_BYTES = 8 * 1024 * 1024
 
 
-def _path(value: object) -> str:
+def _validate_transport_path(value: object) -> str:
     if not isinstance(value, str) or not value or "\\" in value:
         raise ValueError("invalid checkpoint transport path")
     path = PurePosixPath(value)
@@ -43,7 +43,7 @@ def parse_manifest(raw: bytes | str) -> dict[str, dict]:
     if not isinstance(files, dict) or not 1 <= len(files) <= 1024:
         raise ValueError("invalid checkpoint transport file list")
     for name, entry in files.items():
-        _path(name)
+        _validate_transport_path(name)
         if name == MANIFEST or name.split("/")[0] == PARTS:
             raise ValueError("reserved checkpoint transport path")
         if not isinstance(entry, dict) or set(entry) != {"size", "parts"}:

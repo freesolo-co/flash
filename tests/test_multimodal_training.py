@@ -1151,7 +1151,7 @@ def test_grpo_prices_the_full_context_budget_for_image_and_mixed_rows():
     that -- an image sft run cannot be quoted from an assumed context.
     """
     from flash.core.spec import JobSpec
-    from flash.cost.spec import runconfig_from_spec
+    from flash.cost.spec import run_config_from_spec
 
     grpo_spec = JobSpec.from_dict(
         {
@@ -1167,7 +1167,7 @@ def test_grpo_prices_the_full_context_budget_for_image_and_mixed_rows():
         }
     )
 
-    assert runconfig_from_spec(grpo_spec).seq_len == 2048
+    assert run_config_from_spec(grpo_spec).seq_len == 2048
 
 
 def test_image_sft_cannot_be_priced_from_an_assumed_context():
@@ -1178,7 +1178,7 @@ def test_image_sft_cannot_be_priced_from_an_assumed_context():
     tokenized these exact rows, and without one the quote fails rather than defaulting.
     """
     from flash.core.spec import JobSpec
-    from flash.cost.spec import runconfig_from_spec
+    from flash.cost.spec import run_config_from_spec
     from flash.engine.profiling.workload_profile import WorkloadProfileMismatch
 
     sft_spec = JobSpec.from_dict(
@@ -1191,10 +1191,10 @@ def test_image_sft_cannot_be_priced_from_an_assumed_context():
     )
 
     with pytest.raises(WorkloadProfileMismatch):
-        runconfig_from_spec(sft_spec)
+        run_config_from_spec(sft_spec)
 
     # with the measurement attached, the priced length is the profile's, never the config ceiling.
-    priced = runconfig_from_spec(attach_sft_profile(sft_spec))
+    priced = run_config_from_spec(attach_sft_profile(sft_spec))
     assert priced.seq_len == attach_sft_profile(sft_spec).workload_profile["max_length"]
 
 

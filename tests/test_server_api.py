@@ -123,7 +123,7 @@ def _bearer(key: str) -> dict:
     return headers
 
 
-def _login() -> str:
+def _new_user_token() -> str:
     """A fresh, distinct freesolo user token (accepted by the fixture's stub verify)."""
     return f"{_USER_PREFIX}{next(_counter)}"
 
@@ -222,8 +222,8 @@ def api(tmp_path, monkeypatch):
         yield client
 
 
-def test_me(api):
-    key = _login()
+def test_me_returns_identity_for_authenticated_user(api):
+    key = _new_user_token()
     me = api.get("/v1/me", headers=_bearer(key))
     assert me.status_code == 200
     # A verified freesolo user key resolves to the Freesolo identity returned by verify.
@@ -261,7 +261,7 @@ def test_project_validation_blocks_before_run_preparation(api, monkeypatch) -> N
     )
     response = api.post(
         "/v1/runs",
-        headers=_bearer(_login()),
+        headers=_bearer(_new_user_token()),
         json={"spec": SPEC},
     )
     assert response.status_code == 403
@@ -288,7 +288,7 @@ def test_environment_project_validation_blocks_before_run_preparation(api, monke
     )
     response = api.post(
         "/v1/runs",
-        headers=_bearer(_login()),
+        headers=_bearer(_new_user_token()),
         json={"spec": {**SPEC, "environment": {"id": "acme/checkout-bot/my-env"}}},
     )
     assert response.status_code == 409
@@ -335,7 +335,7 @@ def test_a_github_environment_is_refused_before_validation_or_preparation(
 
     response = api.post(
         "/v1/runs",
-        headers=_bearer(_login()),
+        headers=_bearer(_new_user_token()),
         json={"spec": {**SPEC, "environment": {"id": environment_id}}},
     )
 
@@ -356,7 +356,7 @@ def test_a_hub_environment_still_reaches_preparation(api, monkeypatch) -> None:
 
     response = api.post(
         "/v1/runs",
-        headers=_bearer(_login()),
+        headers=_bearer(_new_user_token()),
         json={"spec": SPEC, "dry_run": True},
     )
 
@@ -387,7 +387,7 @@ def test_run_rejects_noncanonical_managed_environment_before_registry(
 
     response = api.post(
         "/v1/runs",
-        headers=_bearer(_login()),
+        headers=_bearer(_new_user_token()),
         json={"spec": {**SPEC, "environment": {"id": environment_id}}},
     )
 
@@ -415,7 +415,7 @@ def test_project_validation_blocks_before_environment_publication(api, monkeypat
     )
     response = api.post(
         "/v1/envs",
-        headers=_bearer(_login()),
+        headers=_bearer(_new_user_token()),
         json={
             "name": "env",
             "package_b64": ENV_PACKAGE_B64,
@@ -435,7 +435,7 @@ def test_canonical_slug_resolution_blocks_before_environment_publication(api, mo
     monkeypatch.setenv("FREESOLO_BASE_URL", "https://freesolo.test")
     monkeypatch.setenv("FREESOLO_INTERNAL_KEY", "fslo-internal-test")
     project_id = "11111111-1111-4111-8111-111111111111"
-    key = _login()
+    key = _new_user_token()
     org_id = f"org-{key.removeprefix(_USER_PREFIX)}"
     validation_calls: list[str] = []
     publish_events: list[str] = []
@@ -693,7 +693,7 @@ def test_dry_run_rejects_semantically_invalid_thinking_json_schema(api, monkeypa
 
     response = api.post(
         "/v1/runs",
-        headers=_bearer(_login()),
+        headers=_bearer(_new_user_token()),
         json={"spec": spec, "dry_run": True},
     )
 
@@ -717,7 +717,7 @@ def test_dry_run_rejects_structured_completion_budget_above_serving_capacity(api
 
     response = api.post(
         "/v1/runs",
-        headers=_bearer(_login()),
+        headers=_bearer(_new_user_token()),
         json={"spec": spec, "dry_run": True},
     )
 
@@ -744,7 +744,7 @@ def test_valid_thinking_structured_run_passes_dry_run(api) -> None:
 
     response = api.post(
         "/v1/runs",
-        headers=_bearer(_login()),
+        headers=_bearer(_new_user_token()),
         json={"spec": spec, "dry_run": True},
     )
 
@@ -801,7 +801,7 @@ def test_dry_run_rejects_invalid_structured_serving_constraints(
 
     response = api.post(
         "/v1/runs",
-        headers=_bearer(_login()),
+        headers=_bearer(_new_user_token()),
         json={"spec": spec, "dry_run": True},
     )
 
@@ -822,7 +822,7 @@ def test_warmstart_dry_run_preserves_serving_preflight_error(api) -> None:
 
     response = api.post(
         "/v1/runs",
-        headers=_bearer(_login()),
+        headers=_bearer(_new_user_token()),
         json={"spec": spec, "dry_run": True},
     )
 
@@ -848,7 +848,7 @@ def test_warmstart_dry_run_preserves_context_preflight_error(api) -> None:
 
     response = api.post(
         "/v1/runs",
-        headers=_bearer(_login()),
+        headers=_bearer(_new_user_token()),
         json={"spec": spec, "dry_run": True},
     )
 
@@ -887,7 +887,7 @@ def test_dry_run_accepts_valid_regex_and_local_ref_constraints(api, structured_o
 
     response = api.post(
         "/v1/runs",
-        headers=_bearer(_login()),
+        headers=_bearer(_new_user_token()),
         json={"spec": spec, "dry_run": True},
     )
 
@@ -970,7 +970,7 @@ def test_opd_structured_dry_run_checks_rollout_context_before_allocation(
 
     response = api.post(
         "/v1/runs",
-        headers=_bearer(_login()),
+        headers=_bearer(_new_user_token()),
         json={"spec": spec, "dry_run": True},
     )
 
@@ -1003,7 +1003,7 @@ def test_grpo_rollout_shape_rejects_before_secrets_persistence_or_submission(
     }
     response = api.post(
         "/v1/runs",
-        headers=_bearer(_login()),
+        headers=_bearer(_new_user_token()),
         json={"spec": spec, "dry_run": False},
     )
     assert response.status_code == 400
@@ -1136,7 +1136,7 @@ def test_freesolo_user_key_authenticates(api, monkeypatch):
 def test_revoked_external_key_is_rejected_across_critical_routes(api, monkeypatch):
     import flash.server.platform.auth as auth_mod
 
-    key = _login()
+    key = _new_user_token()
     headers = _bearer(key)
     run_id = api.post(
         "/v1/runs",
@@ -1592,7 +1592,7 @@ def test_create_run_keeps_ownership_when_submit_fails_after_persisting_status(ap
 
     monkeypatch.setattr(runner_submit, "submit_job", submit)
 
-    key = _login()
+    key = _new_user_token()
     resp = api.post("/v1/runs", headers=_bearer(key), json={"spec": SPEC})
 
     assert resp.status_code == 400, resp.text
@@ -1623,7 +1623,7 @@ def test_create_run_deletes_the_row_when_submit_fails_before_persisting_status(a
 
     monkeypatch.setattr(runner_submit, "submit_job", submit)
 
-    key = _login()
+    key = _new_user_token()
     resp = api.post("/v1/runs", headers=_bearer(key), json={"spec": SPEC})
 
     assert resp.status_code == 400, resp.text
@@ -1671,7 +1671,7 @@ def test_create_run_dry_run_failure_leaves_no_recoverable_run(api, monkeypatch):
     submitted: list[str] = []
     _persist_queued_then_raise(app_mod, monkeypatch, submitted)
 
-    key = _login()
+    key = _new_user_token()
     resp = api.post("/v1/runs", headers=_bearer(key), json={"spec": SPEC, "dry_run": True})
 
     assert resp.status_code == 400, resp.text
@@ -1696,7 +1696,7 @@ def test_create_run_retained_secretful_run_fails_instead_of_recovering(api, monk
     submitted: list[str] = []
     _persist_queued_then_raise(app_mod, monkeypatch, submitted)
 
-    key = _login()
+    key = _new_user_token()
     resp = api.post(
         "/v1/runs",
         headers=_bearer(key),
@@ -1733,7 +1733,7 @@ def test_create_run_secretful_run_dropped_when_terminalization_fails(api, monkey
 
     monkeypatch.setattr(runner_status, "_update", boom)
 
-    key = _login()
+    key = _new_user_token()
     resp = api.post(
         "/v1/runs",
         headers=_bearer(key),
@@ -1780,7 +1780,7 @@ def test_create_run_secretful_run_kept_when_status_read_fails(api, monkeypatch):
     monkeypatch.setattr(runner_status, "get_status", flaky)
     monkeypatch.setattr(runner_status, "_update", update_then_break_reads)
 
-    key = _login()
+    key = _new_user_token()
     resp = api.post(
         "/v1/runs",
         headers=_bearer(key),
@@ -1816,7 +1816,7 @@ def test_create_run_retained_run_records_managed_environment_use(api, monkeypatc
     _persist_queued_then_raise(app_mod, monkeypatch, submitted)
     spec = {**SPEC, "environment": {"id": "acme/checkout-bot/my-env"}}
 
-    key = _login()
+    key = _new_user_token()
     resp = api.post("/v1/runs", headers=_bearer(key), json={"spec": spec})
 
     assert resp.status_code == 400, resp.text
@@ -1894,7 +1894,7 @@ def test_freesolo_user_key_unverified_when_backend_unreachable(api, monkeypatch)
 
 
 def test_keys_are_hashed_at_rest(api):
-    key = _login()
+    key = _new_user_token()
     # Authenticate once so the key's row is provisioned.
     assert api.get("/v1/me", headers=_bearer(key)).status_code == 200
     with sqlite3.connect(_db_mod.db_path()) as conn:
@@ -1909,7 +1909,7 @@ def test_keys_are_hashed_at_rest(api):
 
 
 def test_run_lifecycle_and_tenant_isolation(api):
-    key_a, key_b = _login(), _login()
+    key_a, key_b = _new_user_token(), _new_user_token()
     created = api.post("/v1/runs", json={"spec": SPEC, "dry_run": True}, headers=_bearer(key_a))
     assert created.status_code == 200, created.text
     run_id = created.json()["run_id"]
@@ -1927,7 +1927,7 @@ def test_run_lifecycle_and_tenant_isolation(api):
 
 
 def test_runtime_secret_validation_and_non_persistence(api):
-    key = _login()
+    key = _new_user_token()
     bad = api.post(
         "/v1/runs",
         json={
@@ -1992,7 +1992,7 @@ def test_runtime_secret_validation_and_non_persistence(api):
 
 
 def test_logs_offset_paging(api):
-    key = _login()
+    key = _new_user_token()
     run_id = api.post(
         "/v1/runs", json={"spec": SPEC, "dry_run": True}, headers=_bearer(key)
     ).json()["run_id"]
@@ -2012,7 +2012,7 @@ def test_worker_output_route(api, monkeypatch):
     # /worker surfaces the train-subprocess stdout/traceback from the run's HF repo (operator
     # token, server-side). Best-effort: no artifacts -> empty dict; present -> passed through.
 
-    key = _login()
+    key = _new_user_token()
     run_id = api.post(
         "/v1/runs", json={"spec": SPEC, "dry_run": True}, headers=_bearer(key)
     ).json()["run_id"]
@@ -2034,7 +2034,7 @@ def test_worker_output_route(api, monkeypatch):
     assert got["worker"] == {"console_sft.txt": "real worker stdout\n"}
 
     # Another user can't read it (same ownership gate as /logs).
-    other = _login()
+    other = _new_user_token()
     assert api.get(f"/v1/runs/{run_id}/worker", headers=_bearer(other)).status_code == 404
 
 
@@ -2044,7 +2044,7 @@ def test_internal_key_reads_logs_and_worker_with_matching_org(api, monkeypatch):
     # internal key and ONLY when it matches the run's persisted org. All failures are 404 so run
     # existence is never leaked, and a rejected request must not trigger the expensive worker fetch.
 
-    owner = _login()
+    owner = _new_user_token()
     org = f"org-{owner.removeprefix(_USER_PREFIX)}"
     run_id = api.post(
         "/v1/runs", json={"spec": SPEC, "dry_run": True}, headers=_bearer(owner)
@@ -2087,13 +2087,13 @@ def test_internal_key_reads_logs_and_worker_with_matching_org(api, monkeypatch):
 def test_org_header_is_ignored_for_non_internal_keys(api):
     # A non-owner user key can't read another tenant's logs even if it forges the org header: the
     # header is consulted only for the internal service key, so the owner check still governs users.
-    owner = _login()
+    owner = _new_user_token()
     org = f"org-{owner.removeprefix(_USER_PREFIX)}"
     run_id = api.post(
         "/v1/runs", json={"spec": SPEC, "dry_run": True}, headers=_bearer(owner)
     ).json()["run_id"]
 
-    intruder = _login()
+    intruder = _new_user_token()
     forged = {**_bearer(intruder), "X-Freesolo-Org-Id": org}
     assert api.get(f"/v1/runs/{run_id}/logs", headers=forged).status_code == 404
     assert api.get(f"/v1/runs/{run_id}/worker", headers=forged).status_code == 404
@@ -2103,10 +2103,10 @@ def test_org_header_is_ignored_for_non_internal_keys(api):
 
 
 def test_internal_org_header_does_not_widen_owner_only_endpoints(api):
-    # readable_run only governs the read-only /logs and /worker endpoints. /status, /cancel, and
-    # /checkpoints stay owner-only via owned_run, so the internal key plus a matching org header
+    # require_readable_run only governs the read-only /logs and /worker endpoints. /status, /cancel, and
+    # /checkpoints stay owner-only via require_owned_run, so the internal key plus a matching org header
     # must NOT grant access to them.
-    owner = _login()
+    owner = _new_user_token()
     org = f"org-{owner.removeprefix(_USER_PREFIX)}"
     run_id = api.post(
         "/v1/runs", json={"spec": SPEC, "dry_run": True}, headers=_bearer(owner)
@@ -2122,7 +2122,7 @@ def test_internal_key_cannot_read_run_without_persisted_org(api, monkeypatch):
     # A run with no persisted org context cannot be matched by the internal path even with a
     # non-empty header: _status_org_id is empty, so it never equals a real org and fails closed.
 
-    owner = _login()
+    owner = _new_user_token()
     run_id = api.post(
         "/v1/runs", json={"spec": SPEC, "dry_run": True}, headers=_bearer(owner)
     ).json()["run_id"]
@@ -2582,7 +2582,7 @@ def test_worker_artifacts_surface_the_terminal_console_tail_not_only_the_snapsho
 
 def test_local_env_path_rejected(api):
     # Managed runs accept Freesolo environment ids; local [environment] paths are rejected.
-    key = _login()
+    key = _new_user_token()
     bad = {**SPEC, "environment": {"id": "custom", "path": "/home/user/env.py"}}
     r = api.post("/v1/runs", json={"spec": bad, "dry_run": True}, headers=_bearer(key))
     assert r.status_code == 400
@@ -2590,7 +2590,7 @@ def test_local_env_path_rejected(api):
 
 
 def test_bad_spec_is_400(api):
-    key = _login()
+    key = _new_user_token()
     r = api.post("/v1/runs", json={"spec": {"algorithm": "grpo"}}, headers=_bearer(key))
     assert r.status_code == 400
     assert "model" in r.json()["detail"]
@@ -2600,7 +2600,7 @@ def test_non_object_spec_fields_get_targeted_400(api):
     # A falsy NON-object JSON value (""/0/[]/false) for spec / spec.environment / runtime_secrets
     # must 400 with the intended "must be a JSON object" message, not get coerced to {} (which
     # would surface a misleading downstream error like "config must set [environment] id").
-    key = _login()
+    key = _new_user_token()
     for bad_spec in ("", 0, [], False):
         r = api.post("/v1/runs", json={"spec": bad_spec}, headers=_bearer(key))
         assert r.status_code == 400, (bad_spec, r.text)
@@ -2626,7 +2626,7 @@ def test_non_object_spec_fields_get_targeted_400(api):
 
 
 def test_create_run_rejects_top_level_and_gpu_typos_as_400(api):
-    key = _login()
+    key = _new_user_token()
     for spec, expected in (
         ({**SPEC, "model_revison": "main"}, "model_revison"),
         ({**SPEC, "gpu": {"exact_typ": "H100"}}, "exact_typ"),
@@ -2641,7 +2641,7 @@ def test_create_run_rejects_top_level_and_gpu_typos_as_400(api):
 
 
 def test_deploy_dry_run(api):
-    key = _login()
+    key = _new_user_token()
     run_id = api.post(
         "/v1/runs", json={"spec": SPEC, "dry_run": True}, headers=_bearer(key)
     ).json()["run_id"]
@@ -2659,7 +2659,7 @@ def test_deploy_dry_run(api):
 
 def test_user_key_undeploy_returns_public_persisted_deployment(api, monkeypatch):
 
-    key = _login()
+    key = _new_user_token()
     run_id = _make_run(api, key, "deployed")
     revision = f"{run_id}/final"
     status = runner_status.get_status(run_id)
@@ -2710,7 +2710,7 @@ def test_user_key_undeploy_returns_public_persisted_deployment(api, monkeypatch)
 @pytest.mark.parametrize("remove_summary", [False, True])
 def test_sibling_undeploy_returns_exact_removed_checkpoint(api, monkeypatch, remove_summary):
 
-    key = _login()
+    key = _new_user_token()
     run_id = _make_run(api, key, "deployed")
     current = f"{run_id}/final"
     sibling = f"{run_id}/step-20"
@@ -2764,7 +2764,7 @@ def test_hosted_undeploy_preserves_historical_removed_model_cleanup(
     api, monkeypatch, retired_model
 ):
 
-    key = _login()
+    key = _new_user_token()
     run_id = _make_run(api, key, "deployed")
     status = runner_status.get_status(run_id)
     status.spec = {**status.spec, "model": retired_model}
@@ -2793,7 +2793,7 @@ def test_hosted_undeploy_preserves_historical_removed_model_cleanup(
 
 def test_internal_org_undeploy_returns_public_persisted_deployment(api, monkeypatch):
 
-    owner = _login()
+    owner = _new_user_token()
     org = f"org-{owner.removeprefix(_USER_PREFIX)}"
     project = "22222222-2222-4222-8222-222222222222"
     run_id = api.post(
@@ -2855,7 +2855,7 @@ def test_internal_org_undeploy_returns_public_persisted_deployment(api, monkeypa
 
 def test_internal_deployment_management_rejects_malformed_persisted_projects(api):
 
-    owner = _login()
+    owner = _new_user_token()
     org = f"org-{owner.removeprefix(_USER_PREFIX)}"
     project = "22222222-2222-4222-8222-222222222222"
     run_id = api.post(
@@ -2904,7 +2904,7 @@ def test_internal_deployment_management_rejects_malformed_persisted_projects(api
 
 def test_internal_deployment_management_rejects_missing_run_org(api):
 
-    owner = _login()
+    owner = _new_user_token()
     project = "22222222-2222-4222-8222-222222222222"
     run_id = api.post(
         "/v1/runs",
@@ -3039,7 +3039,7 @@ def test_deploy_allows_runner_assigned_revision_pin(api):
     """An SFT run pinned by the runner stays deployable."""
     from flash.core.spec import JobSpec
 
-    key = _login()
+    key = _new_user_token()
     run_id = api.post(
         "/v1/runs", json={"spec": SPEC, "dry_run": True}, headers=_bearer(key)
     ).json()["run_id"]
@@ -3083,7 +3083,7 @@ def test_deploy_allows_runner_assigned_revision_pin(api):
 def test_deploy_rejects_a_forged_auto_pin_marker(api):
     """A worker-only pin written without re-digesting fails integrity validation."""
 
-    key = _login()
+    key = _new_user_token()
     run_id = api.post(
         "/v1/runs", json={"spec": SPEC, "dry_run": True}, headers=_bearer(key)
     ).json()["run_id"]
@@ -3109,7 +3109,7 @@ def test_deploy_rejects_a_forged_auto_pin_marker(api):
 def test_public_run_routes_redact_private_deployment_fields(api, monkeypatch):
     import flash.serve.deployment.deploy as deploy_mod
 
-    key = _login()
+    key = _new_user_token()
     run_id = api.post(
         "/v1/runs", json={"spec": SPEC, "dry_run": True}, headers=_bearer(key)
     ).json()["run_id"]
@@ -3170,7 +3170,7 @@ def test_public_run_routes_redact_private_deployment_fields(api, monkeypatch):
 
 def test_deploy_uses_effective_warmstart_rank(api, monkeypatch):
 
-    key = _login()
+    key = _new_user_token()
     run_id = api.post(
         "/v1/runs", json={"spec": SPEC, "dry_run": True}, headers=_bearer(key)
     ).json()["run_id"]
@@ -3282,7 +3282,7 @@ def test_deploy_serving_error_is_recorded_as_failed_deployment(api, monkeypatch)
     """A serving-backend failure during deploy is recorded on the deployment status."""
     from flash.serve.contract.errors import ServingError
 
-    key = _login()
+    key = _new_user_token()
     run_id = api.post(
         "/v1/runs", json={"spec": SPEC, "dry_run": True}, headers=_bearer(key)
     ).json()["run_id"]
@@ -3322,7 +3322,7 @@ def test_deployment_failure_persisted_checks_exact_record():
 def test_deployment_transitions_report_persisted_states_and_skip_dry_run(api, monkeypatch):
     import flash.server.domain.registry.runs as registry
 
-    key = _login()
+    key = _new_user_token()
     run_id = _make_run(api, key, "done")
     revision = f"{run_id}/final"
     calls = []
@@ -3387,7 +3387,7 @@ def test_deployment_reporting_skips_failed_cas_and_reports_failure(api, monkeypa
     from flash.serve.contract.errors import ServingError
     from flash.server.routes import serving
 
-    key = _login()
+    key = _new_user_token()
     run_id = _make_run(api, key, "done")
     calls = []
     monkeypatch.setattr(
@@ -3504,7 +3504,7 @@ def test_deployment_job_is_started_before_waiters_can_observe_it(monkeypatch):
 
 def test_deploy_returns_deploying_before_background_job_finishes(api, monkeypatch):
 
-    key = _login()
+    key = _new_user_token()
     run_id = api.post(
         "/v1/runs", json={"spec": SPEC, "dry_run": True}, headers=_bearer(key)
     ).json()["run_id"]
@@ -3551,7 +3551,7 @@ def test_deploy_returns_deploying_before_background_job_finishes(api, monkeypatc
 
 @pytest.mark.parametrize("serving_generation", [None, "", "   ", 7, "generation-a"])
 def test_redeploy_reverifies_legacy_ready_records(api, monkeypatch, serving_generation):
-    key = _login()
+    key = _new_user_token()
     run_id = _make_run(api, key, "deployed")
     checkpoint_id = f"{run_id}/final"
     status = runner_status.get_status(run_id)
@@ -3583,7 +3583,7 @@ def test_redeploy_reverifies_legacy_ready_records(api, monkeypatch, serving_gene
 def test_concurrent_deploy_returns_409_without_queueing_duplicate(api, monkeypatch):
     import threading
 
-    key = _login()
+    key = _new_user_token()
     run_id = api.post(
         "/v1/runs", json={"spec": SPEC, "dry_run": True}, headers=_bearer(key)
     ).json()["run_id"]
@@ -3660,7 +3660,7 @@ def test_concurrent_non_deploy_operation_returns_generic_409(api, monkeypatch, d
 
     monkeypatch.setattr(deployment_jobs, "start_deployment_job", fake_start)
 
-    key = _login()
+    key = _new_user_token()
     run_id = api.post(
         "/v1/runs", json={"spec": SPEC, "dry_run": True}, headers=_bearer(key)
     ).json()["run_id"]
@@ -3694,7 +3694,7 @@ def test_deploy_holds_lock_through_background_job_handoff(api, monkeypatch):
     import queue
     import threading
 
-    key = _login()
+    key = _new_user_token()
     run_id = api.post(
         "/v1/runs", json={"spec": SPEC, "dry_run": True}, headers=_bearer(key)
     ).json()["run_id"]
@@ -3762,7 +3762,7 @@ def test_deploy_holds_lock_through_background_job_handoff(api, monkeypatch):
 
 def test_deploy_start_failure_persists_terminal_failure(api, monkeypatch):
 
-    key = _login()
+    key = _new_user_token()
     run_id = api.post(
         "/v1/runs", json={"spec": SPEC, "dry_run": True}, headers=_bearer(key)
     ).json()["run_id"]
@@ -3793,7 +3793,7 @@ def test_deploy_start_failure_persists_terminal_failure(api, monkeypatch):
 
 def test_sync_deploy_execution_error_keeps_specific_persisted_outcome(api, monkeypatch):
 
-    key = _login()
+    key = _new_user_token()
     run_id = api.post(
         "/v1/runs", json={"spec": SPEC, "dry_run": True}, headers=_bearer(key)
     ).json()["run_id"]
@@ -4023,7 +4023,7 @@ def test_shutdown_flushes_after_status_replay_failure(monkeypatch):
 
 def test_status_report_sequence_is_persisted_and_private(api):
 
-    key = _login()
+    key = _new_user_token()
     run_id = api.post(
         "/v1/runs", json={"spec": SPEC, "dry_run": True}, headers=_bearer(key)
     ).json()["run_id"]
@@ -4041,7 +4041,7 @@ def test_status_report_sequence_is_persisted_and_private(api):
 
 def test_save_status_repairs_wrong_typed_report_sequence(api):
 
-    key = _login()
+    key = _new_user_token()
     run_id = api.post(
         "/v1/runs", json={"spec": SPEC, "dry_run": True}, headers=_bearer(key)
     ).json()["run_id"]
@@ -4061,7 +4061,7 @@ def test_save_status_repairs_wrong_typed_report_sequence(api):
 def test_replay_preserves_saved_sequence_before_next_update(api, monkeypatch):
     from flash.server.routes import serving
 
-    key = _login()
+    key = _new_user_token()
     run_id = api.post(
         "/v1/runs", json={"spec": SPEC, "dry_run": True}, headers=_bearer(key)
     ).json()["run_id"]
@@ -4840,7 +4840,7 @@ def test_deploy_rejects_verify_false_before_anything_registers(api, monkeypatch)
     # smoke verification is mandatory: an explicit opt-out is a 400 before queuing, and neither
     # serving registration nor alias activation is ever attempted.
 
-    key = _login()
+    key = _new_user_token()
     run_id = api.post(
         "/v1/runs", json={"spec": SPEC, "dry_run": True}, headers=_bearer(key)
     ).json()["run_id"]
@@ -4872,7 +4872,7 @@ def test_deploy_rejects_verify_false_before_anything_registers(api, monkeypatch)
 
 def test_deploy_rechecks_run_state_before_alias_activation(api, monkeypatch):
 
-    key = _login()
+    key = _new_user_token()
     run_id = api.post(
         "/v1/runs", json={"spec": SPEC, "dry_run": True}, headers=_bearer(key)
     ).json()["run_id"]
@@ -4903,7 +4903,7 @@ def test_deploy_rechecks_run_state_before_alias_activation(api, monkeypatch):
 
 
 def test_create_rejects_retired_gpu_class(api):
-    key = _login()
+    key = _new_user_token()
     retired_spec = {**SPEC, "gpu": {"type": "RTX A6000"}}
 
     response = api.post(
@@ -4918,7 +4918,7 @@ def test_deploy_forwards_structured_outputs_to_serving(api, monkeypatch):
     """The deploy route hands the run's [train].structured_outputs to deploy_adapter so serving can
     register it as the adapter's guided-decoding default (guided-decoding train/serve parity)."""
 
-    key = _login()
+    key = _new_user_token()
     schema = {"type": "object", "properties": {"industries": {"type": "array"}}}
     so_spec = {**SPEC, "train": {**SPEC["train"], "structured_outputs": {"json": schema}}}
     run_id = api.post(
@@ -4947,7 +4947,7 @@ def test_deploy_forwards_structured_outputs_to_serving(api, monkeypatch):
 
 def test_thinking_structured_deploy_rejects_verify_false_before_mutation(api, monkeypatch):
 
-    key = _login()
+    key = _new_user_token()
     schema = {"type": "object", "required": ["answer"]}
     spec = {
         **SPEC,
@@ -4985,7 +4985,7 @@ def test_thinking_structured_deploy_rejects_verify_false_before_mutation(api, mo
 
 def test_deploy_retry_takes_over_stale_busy_record(api, monkeypatch):
 
-    key = _login()
+    key = _new_user_token()
     run_id = api.post(
         "/v1/runs", json={"spec": SPEC, "dry_run": True}, headers=_bearer(key)
     ).json()["run_id"]
@@ -5023,7 +5023,7 @@ def test_chat_forwards_trained_stop_sequences(api, monkeypatch):
     forwards them, so the adapter verifies and activates -- but if user inference does not, the same
     model runs on to max_tokens or emits trailing text past its answer on every real request."""
 
-    key = _login()
+    key = _new_user_token()
     spec = json.loads(json.dumps(SPEC))
     spec["train"] = {**spec["train"], "stop_sequences": ["</answer>"]}
     run_id = api.post(
@@ -5062,7 +5062,7 @@ def test_chat_forwards_trained_stop_sequences(api, monkeypatch):
 def test_chat_sends_no_stop_when_run_configured_none(api, monkeypatch):
     """A run that never configured a delimiter must not receive one."""
 
-    key = _login()
+    key = _new_user_token()
     run_id = api.post(
         "/v1/runs", json={"spec": SPEC, "dry_run": True}, headers=_bearer(key)
     ).json()["run_id"]
@@ -5105,7 +5105,7 @@ def test_failed_smoke_cleans_only_unverified_checkpoint(
     from flash.serve.contract.errors import ServingError
     from flash.server.platform.internal_client import run_serving_org_id
 
-    key = _login()
+    key = _new_user_token()
     run_id = api.post(
         "/v1/runs", json={"spec": SPEC, "dry_run": True}, headers=_bearer(key)
     ).json()["run_id"]
@@ -5185,7 +5185,7 @@ def test_failed_smoke_cleans_only_unverified_checkpoint(
 def test_redeploy_after_inactive_deployment_state_is_allowed(api, monkeypatch, deployment_state):
     from flash.serve.contract.errors import ServingError
 
-    key = _login()
+    key = _new_user_token()
     run_id = _make_run(api, key, "done")
     status = runner_status.get_status(run_id)
     status.deployments = records(status.run_id, {"state": deployment_state, "requested_at": 1.0})
@@ -5211,7 +5211,7 @@ def test_deploy_ignores_stored_training_gpu(api, monkeypatch):
 
     from flash.core.spec import JobSpec
 
-    key = _login()
+    key = _new_user_token()
     run_id = api.post(
         "/v1/runs", json={"spec": SPEC, "dry_run": True}, headers=_bearer(key)
     ).json()["run_id"]
@@ -5260,7 +5260,7 @@ def test_deploy_works_the_same_whether_or_not_gpu_count_was_authored(api, monkey
     monkeypatch.setattr(deployment_jobs, "start_deployment_job", fake_start)
 
     for gpu_section in ({}, {"count": 1}):
-        key = _login()
+        key = _new_user_token()
         spec = {**SPEC, "gpu": gpu_section}
         run_id = api.post(
             "/v1/runs", json={"spec": spec, "dry_run": True}, headers=_bearer(key)
@@ -5289,7 +5289,7 @@ def test_deploy_missing_run_level_adapter_points_at_checkpoint_steps(api, monkey
     error: it returns a 409 telling the caller to `flash models deploy <run>/step-N`."""
     from flash.serve.contract.errors import AdapterConfigMissing
 
-    key = _login()
+    key = _new_user_token()
     run_id = api.post(
         "/v1/runs", json={"spec": SPEC, "dry_run": True}, headers=_bearer(key)
     ).json()["run_id"]
@@ -5321,7 +5321,7 @@ def test_deploy_missing_adapter_without_checkpoints_stays_502(api, monkeypatch):
     """No checkpoints to point at -> keep the 502 with the upstream reason."""
     from flash.serve.contract.errors import AdapterConfigMissing
 
-    key = _login()
+    key = _new_user_token()
     run_id = api.post(
         "/v1/runs", json={"spec": SPEC, "dry_run": True}, headers=_bearer(key)
     ).json()["run_id"]
@@ -5348,7 +5348,7 @@ def test_deploy_attributes_adapter_to_run_owning_org(api, monkeypatch):
     serving can authorize external chat by org — not merely whatever key initiated the deploy."""
     from flash.serve.deployment.deploy import Deployment
 
-    key = _login()
+    key = _new_user_token()
     run_id = api.post(
         "/v1/runs", json={"spec": SPEC, "dry_run": True}, headers=_bearer(key)
     ).json()["run_id"]
@@ -5387,7 +5387,7 @@ def test_deploy_falls_back_to_platform_context_org(api, monkeypatch):
     platform_context; the adapter must still be attributed to that run-owning org."""
     from flash.serve.deployment.deploy import Deployment
 
-    key = _login()
+    key = _new_user_token()
     run_id = api.post(
         "/v1/runs", json={"spec": SPEC, "dry_run": True}, headers=_bearer(key)
     ).json()["run_id"]
@@ -5431,7 +5431,7 @@ def test_deploy_without_any_org_context_is_rejected(api, monkeypatch):
     """
     import flash.server.platform.auth as auth_mod
 
-    key = _login()
+    key = _new_user_token()
     run_id = api.post(
         "/v1/runs", json={"spec": SPEC, "dry_run": True}, headers=_bearer(key)
     ).json()["run_id"]
@@ -5463,7 +5463,7 @@ def test_deployments_listing_requires_internal_scope_and_filters_to_it(api):
     """`/v1/deployments` must not hand the internal key a cross-org listing.
 
     On a managed plane the internal key is the platform proxy and owns the runs it submitted for
-    every org, so the listing follows `deps.manageable_run`: the internal key must name the org
+    every org, so the listing follows `deps.require_manageable_run`: the internal key must name the org
     AND project it lists for, and only that scope's rows come back.
     """
 
@@ -5539,7 +5539,7 @@ def test_deployments_listing_requires_internal_scope_and_filters_to_it(api):
     snoop = api.get(
         "/v1/deployments",
         headers={
-            **_bearer(_login()),
+            **_bearer(_new_user_token()),
             "X-Freesolo-Org-Id": "org-alpha",
             "X-Freesolo-Project-Id": SPEC["project"],
         },
@@ -5553,7 +5553,7 @@ def test_undeploy_serving_error_is_clean_502(api, monkeypatch):
     not an unhandled 500: ServingError from undeploy_adapter is translated to HTTPException(502)."""
     from flash.serve.contract.errors import ServingError
 
-    key = _login()
+    key = _new_user_token()
     run_id = api.post(
         "/v1/runs", json={"spec": SPEC, "dry_run": True}, headers=_bearer(key)
     ).json()["run_id"]
@@ -5587,7 +5587,7 @@ def test_undeploy_serving_error_is_clean_502(api, monkeypatch):
 
 
 def test_undeploy_without_prior_record_persists_exact_tombstone(api, monkeypatch):
-    key = _login()
+    key = _new_user_token()
     run_id = _make_run(api, key, "done")
     revision = f"{run_id}/final"
     monkeypatch.setattr(
@@ -6525,7 +6525,7 @@ def test_publish_env_endpoint_publishes_under_managed_account(api, monkeypatch):
             tar.addfile(info, io.BytesIO(content))
     pkg = base64.b64encode(buf.getvalue()).decode()
 
-    key = _login()
+    key = _new_user_token()
     expected_root = f"org-{key.removeprefix(_USER_PREFIX)}/checkout-bot/myenv"
     resp = api.post(
         "/v1/envs",
@@ -6571,7 +6571,7 @@ def test_publish_env_ignores_legacy_is_new(api, monkeypatch):
 
     resp = api.post(
         "/v1/envs",
-        headers=_bearer(_login()),
+        headers=_bearer(_new_user_token()),
         json={
             "name": "e",
             "package_b64": pkg,
@@ -6619,7 +6619,7 @@ def test_publish_env_forwards_project_id_to_registry(api, monkeypatch):
 
     resp = api.post(
         "/v1/envs",
-        headers=_bearer(_login()),
+        headers=_bearer(_new_user_token()),
         json={
             "name": "e",
             "package_b64": pkg,
@@ -6633,7 +6633,7 @@ def test_publish_env_forwards_project_id_to_registry(api, monkeypatch):
     recorded.clear()
     resp = api.post(
         "/v1/envs",
-        headers=_bearer(_login()),
+        headers=_bearer(_new_user_token()),
         json={"name": "e", "package_b64": pkg},
     )
     assert resp.status_code == 400, resp.text
@@ -6664,7 +6664,7 @@ def test_publish_env_returns_502_when_association_record_returns_false(api, monk
 
     response = api.post(
         "/v1/envs",
-        headers=_bearer(_login()),
+        headers=_bearer(_new_user_token()),
         json={"name": "env", "package_b64": ENV_PACKAGE_B64, "project_id": SPEC["project"]},
     )
 
@@ -6698,7 +6698,7 @@ def test_publish_env_returns_502_when_association_record_raises(api, monkeypatch
 
     response = api.post(
         "/v1/envs",
-        headers=_bearer(_login()),
+        headers=_bearer(_new_user_token()),
         json={"name": "env", "package_b64": ENV_PACKAGE_B64, "project_id": SPEC["project"]},
     )
 
@@ -6730,7 +6730,7 @@ def test_publish_env_retry_repairs_association_after_false_ack(api, monkeypatch)
         lambda **_kwargs: pytest.fail("retry must not roll back the uploaded package"),
     )
     request = {
-        "headers": _bearer(_login()),
+        "headers": _bearer(_new_user_token()),
         "json": {"name": "env", "package_b64": ENV_PACKAGE_B64, "project_id": SPEC["project"]},
     }
 
@@ -6788,7 +6788,7 @@ def test_publish_env_validates_the_archive_before_publication(api, monkeypatch, 
 
     response = api.post(
         "/v1/envs",
-        headers=_bearer(_login()),
+        headers=_bearer(_new_user_token()),
         json={"name": "env", "package_b64": package, "project_id": SPEC["project"]},
     )
 
@@ -6811,7 +6811,7 @@ def test_publish_env_validates_inputs_before_publication(
     """An unpublishable request keeps its own deterministic error."""
     body = {"name": "env", "package_b64": ENV_PACKAGE_B64, "project_id": SPEC["project"]}
     body[field] = value
-    response = api.post("/v1/envs", headers=_bearer(_login()), json=body)
+    response = api.post("/v1/envs", headers=_bearer(_new_user_token()), json=body)
 
     assert response.status_code == status, response.text
     assert message in response.json()["detail"].lower()
@@ -6821,7 +6821,7 @@ def test_publish_env_reports_an_invalid_name_as_a_type_error(api, monkeypatch):
     """A malformed name receives the deterministic type error."""
     response = api.post(
         "/v1/envs",
-        headers=_bearer(_login()),
+        headers=_bearer(_new_user_token()),
         json={"name": 0, "package_b64": ENV_PACKAGE_B64, "project_id": SPEC["project"]},
     )
 
@@ -6836,7 +6836,7 @@ def test_publish_env_falsy_non_string_fields_are_not_coerced(api):
     # name = 0 -> hits the name type check, not "missing env name".
     r = api.post(
         "/v1/envs",
-        headers=_bearer(_login()),
+        headers=_bearer(_new_user_token()),
         json={"name": 0, "package_b64": "x", "project_id": "11111111-1111-4111-8111-111111111111"},
     )
     assert r.status_code == 400, r.text
@@ -6844,7 +6844,7 @@ def test_publish_env_falsy_non_string_fields_are_not_coerced(api):
     # package_b64 = False (valid string name) -> hits the package type check.
     r2 = api.post(
         "/v1/envs",
-        headers=_bearer(_login()),
+        headers=_bearer(_new_user_token()),
         json={
             "name": "e",
             "package_b64": False,
@@ -6879,7 +6879,7 @@ def test_delete_env_endpoint_removes_package(api, monkeypatch):
     resp = api.delete(
         "/v1/envs/acme/checkout-bot/my-env",
         headers={
-            **_bearer(_login()),
+            **_bearer(_new_user_token()),
             "X-Freesolo-Org-Id": "org-acme",
             "X-Freesolo-Project-Id": "11111111-1111-4111-8111-111111111111",
         },
@@ -6902,7 +6902,7 @@ def test_delete_env_missing_mirror_and_package_is_idempotent(api, monkeypatch):
     import flash.server.domain.registry.envs as envs_mod
     from flash.server.domain.registry import environment_registry
 
-    key = _login()
+    key = _new_user_token()
     namespace = _identity_for_token(key)["org_slug"]
     mirror_error = HTTPException(status_code=404, detail="flash environment not found")
     monkeypatch.setattr(
@@ -7025,7 +7025,7 @@ def test_delete_env_user_key_missing_mirror_requires_matching_namespace(api, mon
     import flash.server.domain.registry.envs as envs_mod
     from flash.server.domain.registry import environment_registry
 
-    key = _login()
+    key = _new_user_token()
     monkeypatch.setattr(
         environment_registry,
         "require_environment_project",
@@ -7067,7 +7067,7 @@ def test_delete_env_missing_mirror_surfaces_hub_outage_status(api, monkeypatch):
     import flash.server.domain.registry.envs as envs_mod
     from flash.server.domain.registry import environment_registry
 
-    key = _login()
+    key = _new_user_token()
     namespace = _identity_for_token(key)["org_slug"]
     monkeypatch.setattr(
         environment_registry,
@@ -7115,7 +7115,7 @@ def test_delete_env_missing_mirror_does_not_delete_existing_package(api, monkeyp
     import flash.server.domain.registry.envs as envs_mod
     from flash.server.domain.registry import environment_registry
 
-    key = _login()
+    key = _new_user_token()
     namespace = _identity_for_token(key)["org_slug"]
     monkeypatch.setattr(
         environment_registry,
@@ -7154,7 +7154,7 @@ def test_delete_env_endpoint_requires_project_header_before_storage(api, monkeyp
     monkeypatch.setattr(
         envs_mod, "delete_package", lambda **_k: pytest.fail("storage must not be touched")
     )
-    response = api.delete("/v1/envs/acme/checkout-bot/my-env", headers=_bearer(_login()))
+    response = api.delete("/v1/envs/acme/checkout-bot/my-env", headers=_bearer(_new_user_token()))
     assert response.status_code == 400
     assert "X-Freesolo-Project-Id is required" in response.text
 
@@ -7185,7 +7185,7 @@ def test_delete_env_validates_project_and_environment_before_storage(api, monkey
     response = api.delete(
         "/v1/envs/acme/checkout-bot/my-env",
         headers={
-            **_bearer(_login()),
+            **_bearer(_new_user_token()),
             "X-Freesolo-Project-Id": "11111111-1111-4111-8111-111111111111",
         },
     )
@@ -7220,7 +7220,7 @@ def test_delete_env_project_mismatch_blocks_storage(api, monkeypatch):
     response = api.delete(
         "/v1/envs/acme/checkout-bot/my-env",
         headers={
-            **_bearer(_login()),
+            **_bearer(_new_user_token()),
             "X-Freesolo-Project-Id": "22222222-2222-4222-8222-222222222222",
         },
     )
@@ -7240,7 +7240,7 @@ def test_delete_env_endpoint_maps_publish_error_status(api, monkeypatch):
     resp = api.delete(
         "/v1/envs/someone-else/checkout-bot/env",
         headers={
-            **_bearer(_login()),
+            **_bearer(_new_user_token()),
             "X-Freesolo-Project-Id": "11111111-1111-4111-8111-111111111111",
         },
     )
@@ -7261,7 +7261,7 @@ def test_delete_env_endpoint_mirror_failure_is_non_fatal(api, monkeypatch):
     resp = api.delete(
         "/v1/envs/acme/checkout-bot/my-env",
         headers={
-            **_bearer(_login()),
+            **_bearer(_new_user_token()),
             "X-Freesolo-Project-Id": "11111111-1111-4111-8111-111111111111",
         },
     )
@@ -7286,7 +7286,7 @@ def test_delete_env_endpoint_rejects_non_canonical_id(api, monkeypatch):
         resp = api.delete(
             f"/v1/envs/{bad}",
             headers={
-                **_bearer(_login()),
+                **_bearer(_new_user_token()),
                 "X-Freesolo-Project-Id": "11111111-1111-4111-8111-111111111111",
             },
         )
@@ -7377,7 +7377,7 @@ def _make_run(api, key, state):
 def test_list_checkpoints_endpoint(api, monkeypatch):
 
     monkeypatch.setattr(run_checkpoints, "list_checkpoints", lambda spec: _FAKE_CKPTS)
-    key = _login()
+    key = _new_user_token()
     run_id = _make_run(api, key, "done")
     r = api.get(f"/v1/runs/{run_id}/checkpoints", headers=_bearer(key))
     assert r.status_code == 200, r.text
@@ -7388,7 +7388,7 @@ def test_deploy_specific_checkpoint_of_finished_run(api, monkeypatch):
 
     monkeypatch.setattr(run_checkpoints, "list_checkpoints", lambda spec: _FAKE_CKPTS)
     captured = {}
-    key = _login()
+    key = _new_user_token()
     run_id = _make_run(api, key, "done")
     revision = f"{run_id}/step-40"
 
@@ -7427,7 +7427,7 @@ def test_deploy_checkpoint_of_cancelled_run_keeps_terminal_state(api, monkeypatc
 
     monkeypatch.setattr(run_checkpoints, "list_checkpoints", lambda spec: _FAKE_CKPTS)
 
-    key = _login()
+    key = _new_user_token()
     run_id = _make_run(api, key, "cancelled")
     revision = f"{run_id}/step-80"
 
@@ -7465,7 +7465,7 @@ def test_deploy_checkpoint_ignores_run_state_once_step_exists(api, monkeypatch, 
 
     monkeypatch.setattr(run_checkpoints, "list_checkpoints", lambda spec: _FAKE_CKPTS)
 
-    key = _login()
+    key = _new_user_token()
     run_id = _make_run(api, key, state)
     revision = f"{run_id}/step-40"
 
@@ -7500,7 +7500,7 @@ def test_deploy_checkpoint_ignores_run_state_once_step_exists(api, monkeypatch, 
 def test_deploy_checkpoint_promotes_if_run_finishes_during_registration(api, monkeypatch):
 
     monkeypatch.setattr(run_checkpoints, "list_checkpoints", lambda spec: _FAKE_CKPTS)
-    key = _login()
+    key = _new_user_token()
     run_id = _make_run(api, key, "running")
     revision = f"{run_id}/step-40"
 
@@ -7541,7 +7541,7 @@ def test_deploy_checkpoint_preserves_final_deploy_that_wins_cas(api, monkeypatch
         serving_deploy, "undeploy_adapter", lambda run_id, **_: undeploys.append(run_id)
     )
 
-    key = _login()
+    key = _new_user_token()
     run_id = _make_run(api, key, "done")
 
     final_deployment = {
@@ -7577,7 +7577,7 @@ def test_deploy_checkpoint_of_dry_run_run_is_409(api, monkeypatch):
         lambda **_k: pytest.fail("dry-run run must not touch serving"),
     )
 
-    key = _login()
+    key = _new_user_token()
     run_id = _make_run(api, key, "dry_run")
     r = api.post(
         f"/v1/runs/{run_id}/deploy",
@@ -7596,7 +7596,7 @@ def test_undeploy_checkpoint_of_running_run_keeps_training_state(api, monkeypatc
     )
     monkeypatch.setattr(serving_deploy, "undeploy_adapter", lambda run_id, **_: [run_id])
 
-    key = _login()
+    key = _new_user_token()
     run_id = _make_run(api, key, "running")
     r = api.post(
         f"/v1/runs/{run_id}/deploy",
@@ -7617,7 +7617,7 @@ def test_undeploy_checkpoint_of_running_run_keeps_training_state(api, monkeypatc
 
 def test_deploy_cancelled_run_without_step_is_409(api):
     """Without a step, a cancelled run is still undeployable (no final adapter)."""
-    key = _login()
+    key = _new_user_token()
     run_id = _make_run(api, key, "cancelled")
     r = api.post(
         f"/v1/runs/{run_id}/deploy", json={"checkpoint_id": f"{run_id}/final"}, headers=_bearer(key)
@@ -7628,7 +7628,7 @@ def test_deploy_cancelled_run_without_step_is_409(api):
 def test_deploy_unknown_step_is_404_with_available(api, monkeypatch):
 
     monkeypatch.setattr(run_checkpoints, "list_checkpoints", lambda spec: _FAKE_CKPTS)
-    key = _login()
+    key = _new_user_token()
     run_id = _make_run(api, key, "done")
     r = api.post(
         f"/v1/runs/{run_id}/deploy",
@@ -7644,7 +7644,7 @@ def test_deploy_rejects_non_integer_step(api, monkeypatch):
     over Python's 4300-digit int()-conversion limit must also be a clean 400, not int()->uncaught 500."""
 
     monkeypatch.setattr(run_checkpoints, "list_checkpoints", lambda spec: _FAKE_CKPTS)
-    key = _login()
+    key = _new_user_token()
     run_id = _make_run(api, key, "done")
     for bad in (True, 40.9, "40.9", "1" * 5000):
         r = api.post(
@@ -7665,7 +7665,7 @@ def test_create_run_records_managed_environment_use(api, monkeypatch):
         lambda **kwargs: calls.append(kwargs) or True,
     )
     spec = {**SPEC, "environment": {"id": "acme/checkout-bot/my-env"}}
-    key = _login()
+    key = _new_user_token()
 
     resp = api.post(
         "/v1/runs",
@@ -7711,7 +7711,7 @@ def test_create_run_records_flash_training_run(api, monkeypatch):
         "record_training_run",
         lambda **kwargs: calls.append(kwargs) or True,
     )
-    key = _login()
+    key = _new_user_token()
 
     resp = api.post(
         "/v1/runs",
@@ -7747,7 +7747,7 @@ def _finished_run(api, key) -> str:
 def test_export_copies_final_adapter_to_user_repo(api, monkeypatch):
     """A finished run's final adapter is read privately and exported with a public source ref."""
 
-    key = _login()
+    key = _new_user_token()
     run_id = _finished_run(api, key)
     # The platform auto-assigns each run a per-run HF dataset repo under the OPERATOR's org, so
     # only the control plane (operator token) can read the source. hf_repo is platform-managed and
@@ -7807,7 +7807,7 @@ def test_export_sends_the_runner_assigned_revision_not_the_public_blank(api, mon
     """
     from flash.core.spec import JobSpec
 
-    key = _login()
+    key = _new_user_token()
     run_id = _finished_run(api, key)
     status = runner_status.get_status(run_id)
     # the shape a real auto-pinned submit persists: worker half carries pin + marker, public half
@@ -7848,8 +7848,8 @@ def test_export_sends_the_runner_assigned_revision_not_the_public_blank(api, mon
 def test_unauthorized_deployment_operation_returns_while_lock_is_held(api, monkeypatch, operation):
     from concurrent.futures import ThreadPoolExecutor, TimeoutError
 
-    owner = _login()
-    other = _login()
+    owner = _new_user_token()
+    other = _new_user_token()
     run_id = _finished_run(api, owner)
     calls = []
     monkeypatch.setattr(serving_export, "export_adapter", lambda **kwargs: calls.append(kwargs))
@@ -7888,7 +7888,7 @@ def test_unauthorized_deployment_operation_returns_while_lock_is_held(api, monke
 def test_invalid_export_returns_while_lock_is_held(api, monkeypatch):
     from concurrent.futures import ThreadPoolExecutor, TimeoutError
 
-    owner = _login()
+    owner = _new_user_token()
     run_id = _finished_run(api, owner)
     calls = []
     monkeypatch.setattr(serving_export, "export_adapter", lambda **kwargs: calls.append(kwargs))
@@ -7924,13 +7924,13 @@ def test_deployment_operation_rechecks_authorization_after_waiting(api, monkeypa
 
     from flash.server.routes import serving as serving_routes
 
-    owner = _login()
+    owner = _new_user_token()
     run_id = _finished_run(api, owner)
     authorization_checked = threading.Event()
     authorization_attempts = []
     authorized_statuses = []
     calls = []
-    authorization_name = "owned_run" if operation == "export" else "manageable_run"
+    authorization_name = "require_owned_run" if operation == "export" else "require_manageable_run"
     real_authorize = getattr(serving_routes, authorization_name)
 
     def observed_authorize(*args, **kwargs):
@@ -7978,7 +7978,7 @@ def test_deployment_operation_rechecks_authorization_after_waiting(api, monkeypa
 
 def test_export_public_flag_sets_private_false(api, monkeypatch):
 
-    key = _login()
+    key = _new_user_token()
     run_id = _finished_run(api, key)
     seen: dict = {}
     monkeypatch.setattr(
@@ -8001,7 +8001,7 @@ def test_export_public_flag_sets_private_false(api, monkeypatch):
 
 
 def test_export_validates_repository_and_token(api):
-    key = _login()
+    key = _new_user_token()
     run_id = _finished_run(api, key)
     missing_repo = api.post(
         f"/v1/runs/{run_id}/export",
@@ -8057,7 +8057,7 @@ def test_export_unfinished_run_is_409(api, monkeypatch):
     """A run with no trained final adapter (never finished) can't be exported — and the HF copy
     is never attempted."""
 
-    key = _login()
+    key = _new_user_token()
     run_id = api.post(
         "/v1/runs", json={"spec": SPEC, "dry_run": True}, headers=_bearer(key)
     ).json()["run_id"]
@@ -8076,7 +8076,7 @@ def test_export_unfinished_run_is_409(api, monkeypatch):
 
 def test_export_missing_artifacts_is_404(api, monkeypatch):
 
-    key = _login()
+    key = _new_user_token()
     run_id = _finished_run(api, key)
 
     def boom(**kw):
@@ -8097,7 +8097,7 @@ def test_export_hf_failure_is_clean_502(api, monkeypatch):
     real reason — not an unhandled 500 (mirrors the deploy/undeploy ServingError handling)."""
     from flash.serve.contract.errors import ServingError
 
-    key = _login()
+    key = _new_user_token()
     run_id = _finished_run(api, key)
 
     def boom(**kw):
@@ -8117,7 +8117,7 @@ def test_export_step_targets_the_checkpoint_adapter(api, monkeypatch):
     """Step export targets the exact per-step checkpoint `flash deploy RUN_ID/step-N` would serve; an
     unknown step 404s with the available list (resolved against published checkpoints)."""
 
-    key = _login()
+    key = _new_user_token()
     run_id = _finished_run(api, key)
     monkeypatch.setattr(
         run_checkpoints,
@@ -8166,7 +8166,7 @@ def test_export_reports_product_analytics_event(api, monkeypatch):
     destination repo, url, and step; the report failing must never fail the export itself."""
     import flash.server.domain.registry.runs as runs
 
-    key = _login()
+    key = _new_user_token()
     run_id = _finished_run(api, key)
     monkeypatch.setattr(
         serving_export, "export_adapter", lambda **kw: "https://huggingface.co/me/adapters"
@@ -8199,7 +8199,7 @@ def test_export_reports_product_analytics_event(api, monkeypatch):
 def test_export_succeeds_even_when_analytics_report_raises(api, monkeypatch):
     import flash.server.domain.registry.runs as runs
 
-    key = _login()
+    key = _new_user_token()
     run_id = _finished_run(api, key)
     monkeypatch.setattr(
         serving_export, "export_adapter", lambda **kw: "https://huggingface.co/me/adapters"
@@ -8323,7 +8323,9 @@ def test_managed_teacher_rejection_reports_which_side_is_at_fault(
         train |= {"max_steps": 100, "batch_size": 64, "group_size": 8, "max_examples": 6400}
     spec = {**SPEC, "algorithm": "opd", "train": train}
 
-    response = api.post("/v1/runs", headers=_bearer(_login()), json={"spec": spec, "dry_run": True})
+    response = api.post(
+        "/v1/runs", headers=_bearer(_new_user_token()), json={"spec": spec, "dry_run": True}
+    )
 
     assert response.status_code == status_code, response.text
     detail = str(response.json()["detail"])

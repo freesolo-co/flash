@@ -157,7 +157,7 @@ def spec_steps(spec) -> int:
     return _sft_profile(spec).authoritative_steps
 
 
-def runconfig_from_spec(spec) -> RunConfig:
+def run_config_from_spec(spec) -> RunConfig:
     """Map a parsed ``JobSpec`` to a cost ``RunConfig`` for one adapter-training job.
 
     unconstrained runs retain cheapest-fit pricing; authored provider/exact-type constraints are
@@ -245,7 +245,7 @@ def sft_ranking_overrides(spec) -> dict:
     """Profile-derived knobs hardware ranking must price SFT on, or ``{}`` when unavailable.
 
     Ranking runs after the customer quote is frozen and must never change that accepted amount.
-    This therefore fails open where ``runconfig_from_spec`` fails closed: ranking may degrade to a
+    This therefore fails open where ``run_config_from_spec`` fails closed: ranking may degrade to a
     conservative shape, while the quote path still requires the digest-validated profile. The keys
     here mirror the profile-derived fields so ranking describes the same work without repricing it.
 
@@ -275,4 +275,8 @@ def sft_ranking_overrides(spec) -> dict:
 
 def estimate_for_spec(spec, *, allocation=None) -> CostEstimate:
     """Cost estimate for a parsed spec, optionally pinned to the selected live candidate."""
-    return estimate_cost(runconfig_from_spec(spec), allocation=allocation)
+    return estimate_cost(run_config_from_spec(spec), allocation=allocation)
+
+
+# Backward-compatible public import.
+runconfig_from_spec = run_config_from_spec

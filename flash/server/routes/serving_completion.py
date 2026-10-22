@@ -13,6 +13,7 @@ import flash.server.platform.locks as deployment_locks
 from flash.core.spec import JobSpec
 from flash.runner.results.deployments import owns_attempt
 from flash.serve.contract.errors import AdapterConfigMissing, RegistrationRejected, ServingError
+from flash.serve.contract.responses import matches_registration_identity
 from flash.serve.deployment.deploy import DeploymentReadinessFacts
 from flash.server.platform import db, deployment_state
 from flash.server.platform.internal_client import run_serving_org_id
@@ -52,7 +53,9 @@ def recover_deployments() -> int:
                     and "registration_identity" not in deployment
                     and not deployment.get("verification_started_at")
                 ):
-                    failed = deployment_state._deployment_state(deployment, "failed", error=error)
+                    failed = deployment_state.with_deployment_state(
+                        deployment, "failed", error=error
+                    )
                     marked = runner_transitions.mark_deployment_failed(status.run_id, failed)
                 else:
                     marked = runner_transitions.mark_deployment_undeploying(
@@ -65,7 +68,7 @@ def recover_deployments() -> int:
     return recovered
 
 
-def cleanup_recovered_deployments(stop: Event) -> bool:
+def cleanup_pending_deployments(stop: Event) -> bool:
     """Try every pending checkpoint once; return whether another pass is needed."""
     pending = False
     for row in db.all_runs():
@@ -107,11 +110,11 @@ def cleanup_recovered_deployments(stop: Event) -> bool:
     return pending
 
 
-def retry_deployment_cleanup(stop: Event) -> None:
+def run_deployment_cleanup_worker(stop: Event) -> None:
     """Retry failures with backoff and poll for new cleanup work until shutdown."""
     delay = 1.0
     while not stop.is_set():
-        pending = cleanup_recovered_deployments(stop)
+        pending = cleanup_pending_deployments(stop)
         if stop.wait(delay if pending else 30.0):
             break
         delay = min(30.0, delay * 2) if pending else 1.0
@@ -133,7 +136,7 @@ def replay_status_reports(stop: Event | None = None) -> int:
     return replayed
 
 
-def _assert_deployment_fence(
+def _require_current_deployment_attempt(
     run_id: str, deployment: dict, is_checkpoint: bool, prev_state: str
 ) -> None:
     latest = run_status.get_status(run_id)
@@ -193,9 +196,9 @@ def _finish_deployment_unlocked(
     current = dict(deployment)
     smoke_result: dict = {}
 
-    def _before_register(identity: dict) -> None:
+    def _persist_registration_intent(identity: dict) -> None:
         nonlocal current
-        _assert_deployment_fence(run_id, deployment, is_checkpoint, prev_state)
+        _require_current_deployment_attempt(run_id, deployment, is_checkpoint, prev_state)
         registering = {**current, "registration_identity": identity}
         marked = runner_transitions.mark_deployment_pending(
             run_id, registering, owner_deployment=deployment
@@ -204,15 +207,15 @@ def _finish_deployment_unlocked(
             raise ServingError("deployment attempt changed before registration")
         current = registering
 
-    def _before_ready(facts: DeploymentReadinessFacts) -> None:
+    def _verify_checkpoint_readiness(facts: DeploymentReadinessFacts) -> None:
         nonlocal current
-        current = deployment_state._deployment_state(
+        current = deployment_state.with_deployment_state(
             {**current, "checkpoint_id": facts.checkpoint_id, "openai_model": facts.checkpoint_id},
             "deploying",
             detail="running bounded fixed-prompt smoke",
             verification_started_at=time.time(),
         )
-        _assert_deployment_fence(run_id, deployment, is_checkpoint, prev_state)
+        _require_current_deployment_attempt(run_id, deployment, is_checkpoint, prev_state)
         previous = run_status.get_status(run_id)
         marked = runner_transitions.mark_deployment_pending(
             run_id, current, owner_deployment=deployment
@@ -231,11 +234,13 @@ def _finish_deployment_unlocked(
                 adapter_targets_images=facts.adapter_targets_images,
             )
         )
-        _assert_deployment_fence(run_id, deployment, is_checkpoint, prev_state)
+        _require_current_deployment_attempt(run_id, deployment, is_checkpoint, prev_state)
 
     try:
         dep = serving_deploy.deploy_adapter(
-            **deploy_kwargs, before_register=_before_register, before_ready=_before_ready
+            **deploy_kwargs,
+            before_register=_persist_registration_intent,
+            before_ready=_verify_checkpoint_readiness,
         )
     except serving_deploy.DeploymentGenerationUnconfirmed as exc:
         # Ownership changed or could not be checked. Do not delete a possible replacement.
@@ -262,7 +267,7 @@ def _finish_deployment_unlocked(
         return
 
     current = {**current, **dep.to_dict(), "verify": True}
-    current = deployment_state._deployment_state(
+    current = deployment_state.with_deployment_state(
         current,
         "ready",
         detail="permanent checkpoint verified and ready",
@@ -291,10 +296,10 @@ def _cleanup_failed_deployment(
         previous = run_status.get_status(run_id)
         identity = previous.deployments.get(checkpoint_id, {}).get("registration_identity")
         if identity:
-            record = serving_deploy._registered_adapter(org_id, checkpoint_id, timeout_s=timeout_s)
-            if record is not None and not serving_deploy._matches_revision_identity(
-                record, identity
-            ):
+            record = serving_deploy.fetch_registered_checkpoint(
+                org_id, checkpoint_id, timeout_s=timeout_s
+            )
+            if record is not None and not matches_registration_identity(record, identity):
                 return True  # This attempt never owned the immutable binding; leave it intact.
         if identity and deadline is not None:
             timeout_s = deadline - time.monotonic()
@@ -328,7 +333,7 @@ def _record_deployment_failure(
                 f"run {run_id} has no final adapter at {deployment.get('adapter_hf_prefix')}; "
                 f"deploy an explicit saved checkpoint such as {run_id}/step-{steps[-1]}"
             )
-    failed = deployment_state._deployment_state(
+    failed = deployment_state.with_deployment_state(
         current,
         "failed",
         error=error,

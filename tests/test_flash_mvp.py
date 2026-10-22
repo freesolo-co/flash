@@ -13,7 +13,7 @@ import flash.runner.lifecycle.status as runner_status
 import flash.runner.lifecycle.submit as runner_submit
 
 
-def test_catalog_validation():
+def test_catalog_rejects_unsupported_model_algorithm_pair():
     from flash.core.catalog import get_model, validate_model_for_algorithm
 
     info = get_model("Qwen/Qwen3.5-9B")
@@ -60,7 +60,7 @@ def test_config_to_job_spec():
         assert spec.phase == "rl"
 
 
-def test_environment_registry():
+def test_loading_environment_requires_an_explicit_id():
     from flash.envs.loading.base import load_environment
 
     # Verifiers-only: there are no builtin envs and no default — an empty id is a hard

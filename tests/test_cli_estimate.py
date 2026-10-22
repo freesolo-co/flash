@@ -10,7 +10,7 @@ import pytest
 
 from flash.cli.commands.ops.train import cmd_train
 from flash.cost.spec import UnknownPromptPoolSize
-from flash.cost.spec import runconfig_from_spec as _runconfig_from_spec
+from flash.cost.spec import run_config_from_spec as _runconfig_from_spec
 from flash.cost.spec import spec_steps as _spec_steps
 from flash.cost.types import RunConfig
 from flash.engine.plan.recipe import RECIPE
@@ -1135,7 +1135,7 @@ def test_warm_start_exact_card_cost_uses_the_server_prepared_quote(tmp_path, cap
 
 
 def _warm_start_rank_boundary_config():
-    from flash.cost.spec import runconfig_from_spec
+    from flash.cost.spec import run_config_from_spec
 
     spec = spec_from_dict(
         {
@@ -1146,7 +1146,7 @@ def _warm_start_rank_boundary_config():
             "train": {"prompts_per_step": 8, "max_examples": 40, "group_size": 2},
         }
     )
-    return runconfig_from_spec(spec)
+    return run_config_from_spec(spec)
 
 
 def test_higher_warm_start_rank_crosses_hardware_shape_boundary():

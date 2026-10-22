@@ -3,7 +3,16 @@
 from __future__ import annotations
 
 from flash._internal.channel import CLI_NAME
-from flash.cli.ui.render import _ACCENT2, _FAINT, _GRAY, _dim, _glyph, _paint, _safe, header
+from flash.cli.ui.render import (
+    _ACCENT2,
+    _FAINT,
+    _GRAY,
+    _dim,
+    _glyph,
+    _paint,
+    _stdout_encodable_text,
+    header,
+)
 
 
 def env_list(
@@ -36,4 +45,4 @@ def env_list(
         )
     if not local and not published:
         parts.append(_dim(f"  no environments yet — scaffold one with `{CLI_NAME} env setup`"))
-    return _safe("\n".join(parts))
+    return _stdout_encodable_text("\n".join(parts))

@@ -12,7 +12,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import pytest
 
 from flash._internal.http import (
-    _move_credentials_to_the_unredirected_bag,
+    _keep_credentials_on_original_request,
     _urlopen_no_redirect,
 )
 from flash.client.freesolo_api import _freesolo_request, verify_freesolo_key
@@ -343,7 +343,7 @@ def test_relocation_keeps_the_credential_the_wire_was_already_carrying() -> None
     request.add_unredirected_header("Authorization", "Bearer canonical")
     request.add_header("Authorization", "Bearer other")
 
-    _move_credentials_to_the_unredirected_bag(request)
+    _keep_credentials_on_original_request(request)
 
     assert sent_headers(request)["Authorization"] == "Bearer canonical"
     assert "Authorization" not in request.headers

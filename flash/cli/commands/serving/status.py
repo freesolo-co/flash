@@ -12,9 +12,9 @@ import time
 from flash.cli.commands.serving.deploy import (
     INFERENCE_KEY_ENV,
     _build_provider_plan,
-    _credentials,
-    _err,
     _optional_env,
+    _read_modal_credentials,
+    _report_command_error,
     _report_handle,
     _require_modal_provider,
 )
@@ -62,10 +62,10 @@ def cmd_serve_status(args) -> int:
         # the provider plan applies the exact hostname contract before provider access.
         _build_provider_plan(bundle)
     except (ValueError, TypeError) as exc:
-        return _err(str(exc))
+        return _report_command_error(str(exc))
 
     try:
-        credentials = _credentials()
+        credentials = _read_modal_credentials()
         inference_token = _optional_env(INFERENCE_KEY_ENV)
         from flash.serve.provisioning import ServingRuntimeSecrets
 
@@ -73,7 +73,7 @@ def cmd_serve_status(args) -> int:
             ServingRuntimeSecrets(inference_token) if inference_token is not None else None
         )
     except (ValueError, TypeError) as exc:
-        return _err(
+        return _report_command_error(
             f"{exc}. credentials are read from the environment for this one request and are never "
             "stored"
         )

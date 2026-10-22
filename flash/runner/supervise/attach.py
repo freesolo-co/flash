@@ -116,9 +116,9 @@ def _resume_after_confirmed_teardown(
     except _RunCancelled:
         raise
     except Exception as exc:
-        from flash.runner.lifecycle.attempts import attempt_is_this_callers_to_fail
+        from flash.runner.lifecycle.attempts import caller_must_record_attempt_failure
 
-        if attempt_is_this_callers_to_fail(run_id, claim):
+        if caller_must_record_attempt_failure(run_id, claim):
             current_remote = get_status(run_id).remote
             if current_remote is not None:
                 with contextlib.suppress(Exception):
@@ -542,7 +542,7 @@ def _fail_unparseable_attach(run_id: str, status: RunStatus, exc: Exception, log
         _record_cleanup_remote,
     )
     from flash.runner.lifecycle.status import get_status
-    from flash.runner.supervise.recovery import _strict_teardown_handle
+    from flash.runner.supervise.recovery import _destroy_and_confirm_worker
 
     # a parse failure cannot escape the daemon recovery thread while a worker may still bill.
     # fail closed using the exact persisted handle, without requiring a parsed spec.
@@ -552,7 +552,7 @@ def _fail_unparseable_attach(run_id: str, status: RunStatus, exc: Exception, log
     resource_deleted = confirmed_teardown
     if not confirmed_teardown:
         try:
-            resource_deleted = _strict_teardown_handle(
+            resource_deleted = _destroy_and_confirm_worker(
                 JobHandle.from_dict(persisted_remote), run_id
             )
         except Exception:

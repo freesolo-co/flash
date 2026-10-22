@@ -10,7 +10,7 @@ from __future__ import annotations
 import inspect
 from pathlib import Path
 
-from flash.cli.commands.env.ops.push import _err
+from flash.cli.commands.env.ops.push import _report_command_error
 
 
 def _evaluation_example(case) -> dict:
@@ -123,7 +123,7 @@ def _check_evaluation_suites(entrypoint: Path, env) -> bool:
         suites = load_evaluation_suites(entrypoint, environment=env)
     except (Exception, SystemExit) as exc:
         reason = str(exc) or exc.__class__.__name__
-        _err(f"evaluation checks failed: {reason}")
+        _report_command_error(f"evaluation checks failed: {reason}")
         return False
 
     all_valid = True
@@ -133,7 +133,7 @@ def _check_evaluation_suites(entrypoint: Path, env) -> bool:
             cases = validate_evaluation_cases(suite, source=source)
             if not cases:
                 all_valid = False
-                _err(
+                _report_command_error(
                     f"evaluation suite {suite.name} failed contract checks: suite produced no cases"
                 )
                 continue
@@ -174,7 +174,7 @@ def _check_evaluation_suites(entrypoint: Path, env) -> bool:
             if errored:
                 all_valid = False
                 detail = ", ".join(f"{result.case_id}: {result.error}" for result in errored)
-                _err(
+                _report_command_error(
                     f"evaluation suite {suite.name} failed contract checks: "
                     f"{len(errored)}/{report.total} case(s) reported a scoring error ({detail})"
                 )
@@ -186,5 +186,5 @@ def _check_evaluation_suites(entrypoint: Path, env) -> bool:
         except (Exception, SystemExit) as exc:
             all_valid = False
             reason = str(exc) or exc.__class__.__name__
-            _err(f"evaluation suite {suite.name} failed contract checks: {reason}")
+            _report_command_error(f"evaluation suite {suite.name} failed contract checks: {reason}")
     return all_valid

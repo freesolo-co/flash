@@ -11,7 +11,11 @@ from __future__ import annotations
 import sys
 import time
 
-from flash.cli.commands.serving.deploy import _credentials, _err, _require_modal_provider
+from flash.cli.commands.serving.deploy import (
+    _read_modal_credentials,
+    _report_command_error,
+    _require_modal_provider,
+)
 from flash.cli.commands.serving.identity import existing_deployment_bundle
 
 
@@ -87,9 +91,9 @@ def cmd_serve_undeploy(args) -> int:
         # ambiguous create returned no handle; the immutable identity then authorizes exact reclaim.
         if handle is not None:
             _validate_handle(plan, handle)
-        credentials = _credentials()
+        credentials = _read_modal_credentials()
     except (ValueError, TypeError) as exc:
-        return _err(str(exc))
+        return _report_command_error(str(exc))
 
     deadline_at = time.monotonic() + float(args.timeout)
     from flash.serve.provisioning.modal.execution.operations import teardown_modal_deployment

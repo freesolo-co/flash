@@ -363,7 +363,7 @@ def test_total_compressed_byte_limit(monkeypatch) -> None:
         _validate(messages)
 
 
-def test_dimension_limit(monkeypatch) -> None:
+def test_image_dimensions_above_limit_are_rejected(monkeypatch) -> None:
     monkeypatch.setattr(multimodal, "_MAX_DIMENSION", 1)
     with pytest.raises(MultimodalRequestError, match="dimension"):
         _validate(_messages())

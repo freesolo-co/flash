@@ -8,7 +8,7 @@ import time
 from flash.serve.contract.urls import public_deployment
 
 
-def _deployment_state(deployment: dict, state: str, **fields) -> dict:
+def with_deployment_state(deployment: dict, state: str, **fields) -> dict:
     return {**deployment, **fields, "state": state, "updated_at": time.time()}
 
 

@@ -2120,7 +2120,7 @@ def test_safe_extract_archive_rejects_longname_decompression_bomb(tmp_path):
     assert peak < 600 * 1024 * 1024, f"peak memory {peak} not bounded by the limit"
 
 
-def test_worker_deps():
+def test_github_environment_requires_freesolo_worker_dependency():
     import flash.envs.loading.base as registry
 
     env_id = "github:owner/repo@main:env/environment.py"

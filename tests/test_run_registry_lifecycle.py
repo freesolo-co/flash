@@ -437,4 +437,4 @@ def test_legacy_reconciliation_record_preserves_pending_customer_charge(monkeypa
 def test_cleared_billing_handle_is_not_restored_from_legacy_field():
     raw = runner_state._status_storage_dict(_status(_spec()))
     raw["realized_cost_remote"] = _remote()
-    assert runner_status._runstatus_from_json(raw).billing_remote is None
+    assert runner_status._run_status_from_json(raw).billing_remote is None

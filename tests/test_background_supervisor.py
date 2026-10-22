@@ -216,7 +216,7 @@ def test_user_cancellation_discards_followups_but_keeps_cleanup(monkeypatch):
 
     owner = Supervisor()
     status = SimpleNamespace(state="cancelled", to_dict=lambda: {"state": "cancelled"})
-    monkeypatch.setattr(runs, "owned_run", lambda *_args: status)
+    monkeypatch.setattr(runs, "require_owned_run", lambda *_args: status)
     monkeypatch.setattr(runs, "cancel_run", lambda _run_id: status)
     request = SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace(training_jobs=owner)))
     try:

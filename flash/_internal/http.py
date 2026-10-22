@@ -51,7 +51,7 @@ class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
         return None
 
 
-def _move_credentials_to_the_unredirected_bag(request: urllib.request.Request) -> None:
+def _keep_credentials_on_original_request(request: urllib.request.Request) -> None:
     """move the caller's credential headers into the bag `redirect_request` does not copy.
 
     `do_open` sends `unredirected_hdrs` and `headers` together, so the request is unchanged on the
@@ -95,7 +95,7 @@ def _urlopen_no_redirect(
     redirect policy.
     """
 
-    _move_credentials_to_the_unredirected_bag(request)
+    _keep_credentials_on_original_request(request)
     transport = urlopen if urlopen is not None else urllib.request.urlopen
     if transport is not _STDLIB_URLOPEN:
         return transport(request, timeout=timeout)

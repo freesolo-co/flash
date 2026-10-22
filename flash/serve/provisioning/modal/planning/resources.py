@@ -34,7 +34,7 @@ def _one(values: tuple[object, ...], name: str):
     return values[0]
 
 
-def _valid_provider_id(value: object, role: str) -> bool:
+def _is_valid_provider_id(value: object, role: str) -> bool:
     try:
         validate_modal_provider_id(value, role)
     except ValueError:
@@ -44,13 +44,13 @@ def _valid_provider_id(value: object, role: str) -> bool:
 
 def deployed_app_matches(plan: ModalCreatePlan, app: ModalAppObservation) -> bool:
     return (
-        _valid_provider_id(app.app_id, "app")
+        _is_valid_provider_id(app.app_id, "app")
         and app.app_name == plan.names.app_or_pod
         and app.state == "deployed"
         and type(app.running_containers) is int
         and 0 <= app.running_containers <= plan.max_containers
         and app.tags == plan.tags
-        and _valid_provider_id(app.function_id, "function")
+        and _is_valid_provider_id(app.function_id, "function")
         and app.function_name == plan.function_name
         and modal_public_url_matches(app.public_url, plan.expected_public_url)
     )
@@ -62,14 +62,14 @@ def teardown_deployed_app_matches(
     app: ModalAppObservation,
 ) -> bool:
     return (
-        _valid_provider_id(app.app_id, "app")
+        _is_valid_provider_id(app.app_id, "app")
         and app.app_id == handle.app_id
         and app.app_name == plan.names.app_or_pod
         and app.state == "deployed"
         and type(app.running_containers) is int
         and 0 <= app.running_containers <= plan.max_containers
         and app.tags == plan.tags
-        and _valid_provider_id(app.function_id, "function")
+        and _is_valid_provider_id(app.function_id, "function")
         and app.function_name == plan.function_name
     )
 
@@ -81,7 +81,7 @@ def terminal_app_matches(
 ) -> bool:
     """match terminal ownership; callers must separately prove containers have drained."""
     return (
-        _valid_provider_id(app.app_id, "app")
+        _is_valid_provider_id(app.app_id, "app")
         and app.app_id == handle.app_id
         and app.app_name == plan.names.app_or_pod
         and app.state in {"stopped", "failed"}
@@ -101,7 +101,7 @@ def lifecycle_pending_app_matches(
     app: ModalAppObservation,
 ) -> bool:
     return (
-        _valid_provider_id(app.app_id, "app")
+        _is_valid_provider_id(app.app_id, "app")
         and app.app_id == handle.app_id
         and app.app_name == plan.names.app_or_pod
         and app.state == "lifecycle_pending"
@@ -113,7 +113,7 @@ def lifecycle_pending_app_matches(
 
 
 def _named_matches(value: ModalNamedResource, name: str, role: str) -> bool:
-    return _valid_provider_id(value.id, role) and value.name == name
+    return _is_valid_provider_id(value.id, role) and value.name == name
 
 
 def exact_core_resources(
@@ -180,7 +180,7 @@ def _reclaim_app_matches(
         )
     if (
         app_id_hint is None
-        or not _valid_provider_id(app.app_id, "app")
+        or not _is_valid_provider_id(app.app_id, "app")
         or app.app_id != app_id_hint
         or app.app_name != plan.names.app_or_pod
     ):

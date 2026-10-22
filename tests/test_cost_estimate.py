@@ -15,7 +15,7 @@ def est() -> CostEstimate:
     return estimate_cost(RunConfig("Qwen/Qwen3.5-9B", "grpo", 150))
 
 
-def test_is_frozen(est):
+def test_cost_estimate_fields_cannot_be_mutated(est):
     with pytest.raises(dataclasses.FrozenInstanceError):
         est.total_usd = 0.0  # type: ignore[misc]
 
@@ -185,7 +185,7 @@ def test_estimate_honors_exact_gpu_instead_of_cheaper_fit():
 
 def test_runconfig_from_spec_preserves_gpu_constraints():
     from flash.core.spec import GpuSpec, JobSpec, TrainSpec
-    from flash.cost.spec import runconfig_from_spec
+    from flash.cost.spec import run_config_from_spec
     from tests._helpers.profile import attach_sft_profile
 
     # the subject is hardware passthrough, not sft pricing; the profile is attached because
@@ -199,7 +199,7 @@ def test_runconfig_from_spec_preserves_gpu_constraints():
         )
     )
 
-    config = runconfig_from_spec(spec)
+    config = run_config_from_spec(spec)
     assert config.provider == "modal"
     assert config.gpu_type == "H100"
     # the run's disk floor threads through so an exact-auto quote allocates the same disk as launch
@@ -216,7 +216,7 @@ def test_runconfig_from_spec_preserves_gpu_constraints():
 )
 def test_runconfig_from_spec_preserves_conservative_opd_turn_budget(environment, expected):
     from flash.core.spec import JobSpec
-    from flash.cost.spec import runconfig_from_spec
+    from flash.cost.spec import run_config_from_spec
 
     spec = JobSpec.from_dict(
         {
@@ -227,7 +227,7 @@ def test_runconfig_from_spec_preserves_conservative_opd_turn_budget(environment,
         }
     )
 
-    config = runconfig_from_spec(spec)
+    config = run_config_from_spec(spec)
 
     assert (config.opd_multi_turn, config.opd_max_turns) == expected
 
