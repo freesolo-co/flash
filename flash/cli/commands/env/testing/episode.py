@@ -239,7 +239,7 @@ def _run_episode_cases(
     if not getattr(environment, "multi_turn", False):
         # An episode suite on a single-turn env has no transcript to play out. That is an error,
         # not a 0.0: the pairing is unmeasurable, which is not the same as a failing model.
-        eval_module._err(
+        eval_module._report_command_error(
             f"suite {getattr(suite, 'name', 'evaluation')!r} sets grades_episodes = True, "
             "but this environment is single-turn and has no episode to play"
         )

@@ -35,7 +35,7 @@ def serving_status_error(url: str, exc: httpx.HTTPStatusError) -> ServingError:
     )
 
 
-def matches_revision_identity(record: dict, expected: dict) -> bool:
+def matches_registration_identity(record: dict, expected: dict) -> bool:
     """compare the canonical immutable checkpoint fingerprint after ambiguous registration."""
 
     try:

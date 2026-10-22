@@ -537,7 +537,9 @@ def test_finalize_preserves_failed_checkpoint_identity(worker_context, monkeypat
     worker_heartbeat.heartbeat(
         "checkpoint_upload_failed", step=50, checkpoint_failure=failure, context=worker_context
     )
-    worker_finalize._finalize(RunMetrics(phase="sft", step=100), context=worker_context)
+    worker_finalize._publish_training_completion(
+        RunMetrics(phase="sft", step=100), context=worker_context
+    )
 
     assert committed[-1]["stage"] == "done"
     assert committed[-1]["step"] == 100
@@ -560,7 +562,9 @@ def test_successful_checkpoint_clears_failure_before_any_terminal(
     worker_heartbeat.heartbeat("checkpoint_uploaded", step=75, context=worker_context)
     if terminal_stage == "done":
         monkeypatch.setattr(worker_perf, "gpu_diagnostics", dict)
-        worker_finalize._finalize(RunMetrics(phase="sft", step=100), context=worker_context)
+        worker_finalize._publish_training_completion(
+            RunMetrics(phase="sft", step=100), context=worker_context
+        )
     else:
         worker_heartbeat.heartbeat(
             terminal_stage, step=100, error="later fatal", context=worker_context

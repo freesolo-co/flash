@@ -2548,7 +2548,7 @@ def test_read_console_tail_drops_a_single_unterminated_line(tmp_path, monkeypatc
     """
     from flash.providers._lifecycle.bootstrapping import secrets as bootstrap_secrets
 
-    for name in [key for key in b.os.environ if bootstrap_secrets._secret_env_name(key)]:
+    for name in [key for key in b.os.environ if bootstrap_secrets._is_secret_env_name(key)]:
         monkeypatch.delenv(name, raising=False)
     # the boundary lands 200 characters INTO a runtime credential, so it is genuinely split: the
     # part that survives the cut is what no downstream redactor could match.

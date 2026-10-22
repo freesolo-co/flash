@@ -163,18 +163,18 @@ def test_color_respects_no_color(monkeypatch) -> None:
     monkeypatch.setenv("FLASH_STYLE", "1")
     monkeypatch.setenv("TERM", "xterm-256color")
     monkeypatch.delenv("NO_COLOR", raising=False)
-    assert render._color() is True
+    assert render._color_enabled() is True
     assert "\x1b[" in render.badge("done")
 
     monkeypatch.setenv("NO_COLOR", "1")
-    assert render._color() is False
+    assert render._color_enabled() is False
     assert "\x1b[" not in render.badge("done")  # layout kept, color dropped
 
 
 def test_render_json_plain_matches_json_dumps(monkeypatch) -> None:
     monkeypatch.setenv("FLASH_STYLE", "0")
     obj = {"run_id": "flash-1", "state": "done", "cost_usd": 0.25, "nested": {"a": [1, 2]}}
-    assert render._json(obj) == json.dumps(obj, indent=2)
+    assert render._format_json(obj) == json.dumps(obj, indent=2)
 
 
 def test_train_submitted_note(monkeypatch) -> None:

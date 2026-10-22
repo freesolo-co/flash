@@ -15,7 +15,7 @@ from flash.serve.contract.provenance import (
 from flash.server.routes.serving_revisions import _authorized_chat_checkpoint
 from tests._helpers.chat_provenance import managed_chat_result as _managed_chat_result
 from tests._helpers.managed_chat import _deployed_chat_run
-from tests.test_server_api import SPEC, _bearer, _login
+from tests.test_server_api import SPEC, _bearer, _new_user_token
 
 pytest_plugins = ("tests._helpers.server_api_plugin",)
 
@@ -87,7 +87,7 @@ def test_managed_chat_rejects_mandatory_whitespace_stop_for_active_tool_grammar(
     import flash.runner.lifecycle.status as runner_status
     from tests._helpers import deployments as deployment_fixtures
 
-    key = _login()
+    key = _new_user_token()
     spec = json.loads(json.dumps(SPEC))
     spec["train"] = {**spec["train"], "stop_sequences": [" \t\r\n"]}
     run_id = api.post(

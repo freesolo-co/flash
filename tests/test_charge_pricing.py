@@ -89,7 +89,7 @@ def test_charge_usd_for_spec_prorates_sft_cancel_by_tokens(monkeypatch):
     from flash.cost.types import RunConfig
 
     cfg = RunConfig(model_id="Qwen/Qwen3.5-9B", method="sft", steps=20, train_tokens=4_000_000)
-    monkeypatch.setattr(cost_spec, "runconfig_from_spec", lambda spec: cfg)
+    monkeypatch.setattr(cost_spec, "run_config_from_spec", lambda spec: cfg)
 
     full = float(estimate_cost(cfg).total_usd)  # the 20-step / full-token quote
     naive = float(
@@ -240,7 +240,7 @@ def _patched_cfg_spec(monkeypatch, cfg):
 
     from flash.cost import spec as cost_spec
 
-    monkeypatch.setattr(cost_spec, "runconfig_from_spec", lambda spec: cfg)
+    monkeypatch.setattr(cost_spec, "run_config_from_spec", lambda spec: cfg)
     return SimpleNamespace()
 
 
@@ -399,7 +399,7 @@ def test_actual_steps_run_reads_last_heartbeat_step():
     assert runner_costs.actual_steps_run(st({"stage": "opd_trained", "step": 12})) == 12
     assert runner_costs.actual_steps_run(st({"stage": "opd_train_done", "step": 12})) == 12
     # Terminal `done` heartbeat: a cancel racing the DONE upload (done recorded, run not yet
-    # transitioned) reads a STEPLESS done and floors a fully-trained run to 0. _finalize carries
+    # transitioned) reads a STEPLESS done and floors a fully-trained run to 0. _publish_training_completion carries
     # opt_steps onto `done` so the true count bills.
     assert (
         runner_costs.actual_steps_run(st({"stage": "done"})) == 0

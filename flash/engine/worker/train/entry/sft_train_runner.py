@@ -38,7 +38,7 @@ liveness_heartbeat = _sft_train.liveness_heartbeat
 readiness_file = _sft_train.readiness_file
 verify_runtime_ready = _sft_train.verify_runtime_ready
 sft_tokens_for_updates = _sft_train.sft_tokens_for_updates
-sft_under_ran = _sft_train.sft_under_ran
+sft_finished_before_expected_steps = _sft_train.sft_finished_before_expected_steps
 validate_save_steps = _sft_train.validate_save_steps
 
 
@@ -889,7 +889,7 @@ def _verify_sft_run(
     resume_step: int,
 ) -> _SftVerified:
     actor_dir, final_step = _sft_train.latest_global_step_dir(options.paths.local_dir)
-    if sft_under_ran(final_step, model.update_horizon):
+    if sft_finished_before_expected_steps(final_step, model.update_horizon):
         raise RuntimeError(
             f"sft completed {final_step}/{model.update_horizon} requested optimizer updates"
         )

@@ -32,7 +32,12 @@ from flash.runner.supervise.transitions import (
 from flash.serve.contract.errors import ServingError
 from flash.serve.deployment.readiness import DEPLOYMENT_TIMEOUT_SECONDS
 from flash.server.platform import auth, db
-from flash.server.platform.deps import _require_bool, manageable_run, owned_run, require_key
+from flash.server.platform.deps import (
+    _require_bool,
+    require_key,
+    require_manageable_run,
+    require_owned_run,
+)
 from flash.server.platform.internal_client import run_org_id, run_serving_org_id
 
 router = APIRouter()
@@ -81,7 +86,7 @@ def deployment(
     x_freesolo_org_id: Annotated[str | None, Header()] = None,
     x_freesolo_project_id: Annotated[str | None, Header()] = None,
 ):
-    status = manageable_run(run_id, key, x_freesolo_org_id, x_freesolo_project_id)
+    status = require_manageable_run(run_id, key, x_freesolo_org_id, x_freesolo_project_id)
     if checkpoint_id is None:
         return {"deployments": status.to_dict()["deployments"]}
     try:
@@ -104,7 +109,7 @@ def _reject_contended_deploy(
 
     Always raises. The lock was NOT acquired on this path, so the caller must not release it.
     """
-    status = manageable_run(run_id, key, x_freesolo_org_id, x_freesolo_project_id)
+    status = require_manageable_run(run_id, key, x_freesolo_org_id, x_freesolo_project_id)
     current_deployment = next(
         (
             record
@@ -159,7 +164,7 @@ def _deploying_record(
         ).to_dict()
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    dep_dict = deployment_state._deployment_state(
+    dep_dict = deployment_state.with_deployment_state(
         dep_dict,
         "deploying",
         detail="deployment queued",
@@ -220,7 +225,7 @@ def _require_deploy_org(run_id: str, deploy_org_id: str | None) -> None:
     platform docs), so registering a revision without an org would leave the field's
     enforcement to whatever the serving backend does with an unowned adapter. A standalone
     plane is single-tenant by definition and has no organization directory, so it keeps
-    deploying without one (same escape hatch as ``deps.manageable_run``).
+    deploying without one (same escape hatch as ``deps.require_manageable_run``).
     """
     if deploy_org_id is not None or auth.standalone():
         return
@@ -250,7 +255,7 @@ def deploy(
         _reject_contended_deploy(run_id, key, x_freesolo_org_id, x_freesolo_project_id)
     job_owns_lock = False
     try:
-        status = manageable_run(run_id, key, x_freesolo_org_id, x_freesolo_project_id)
+        status = require_manageable_run(run_id, key, x_freesolo_org_id, x_freesolo_project_id)
         dry_run = _require_bool(payload, "dry_run", False)
         effective_spec, current_deployment = _validate_deploy_request(
             run_id, status, payload, dry_run
@@ -342,7 +347,7 @@ def deploy(
         except deployment_jobs.DeploymentJobStartError as exc:
             job_owns_lock = False
             error = f"deployment job could not start: {exc}"
-            failed = deployment_state._deployment_state(
+            failed = deployment_state.with_deployment_state(
                 dep_dict,
                 "failed",
                 error=error,
@@ -383,9 +388,9 @@ def undeploy(
     x_freesolo_org_id: Annotated[str | None, Header()] = None,
     x_freesolo_project_id: Annotated[str | None, Header()] = None,
 ):
-    manageable_run(run_id, key, x_freesolo_org_id, x_freesolo_project_id)
+    require_manageable_run(run_id, key, x_freesolo_org_id, x_freesolo_project_id)
     with deployment_locks._deploy_lock(run_id):
-        status = manageable_run(run_id, key, x_freesolo_org_id, x_freesolo_project_id)
+        status = require_manageable_run(run_id, key, x_freesolo_org_id, x_freesolo_project_id)
         try:
             from flash.schema import parse_checkpoint_ref
 
@@ -437,7 +442,7 @@ def undeploy(
 def export(run_id: str, key: Annotated[dict, Depends(require_key)], payload: dict | None = None):
     """Copy a run's trained adapter into a user-owned HuggingFace repo."""
     payload = payload or {}
-    owned_run(run_id, key)
+    require_owned_run(run_id, key)
     repository = str(payload.get("repository") or "").strip()
     if not repository:
         raise HTTPException(
@@ -460,7 +465,7 @@ def export(run_id: str, key: Annotated[dict, Depends(require_key)], payload: dic
     private = _require_bool(payload, "private", True)
 
     with deployment_locks._deploy_lock(run_id):
-        status = owned_run(run_id, key)
+        status = require_owned_run(run_id, key)
         try:
             effective_spec = effective_spec_from_status(status)
         except ValueError as exc:
@@ -530,7 +535,7 @@ def _deployment_listing_scope(
 ) -> tuple[str, str] | None:
     """The (org, project) filter for ``/v1/deployments``, or None for an exact-key listing.
 
-    Mirrors ``deps.manageable_run``: on a managed plane the internal key is the platform proxy
+    Mirrors ``deps.require_manageable_run``: on a managed plane the internal key is the platform proxy
     and owns the runs it submitted on every org's behalf, so an unscoped listing would cross
     orgs. It must name the org AND project it lists for, exactly as it must to manage a single
     deployment. The headers are honored only for the internal key; a user key can only ever see
@@ -555,7 +560,7 @@ def _deployment_listing_scope(
 
 
 def _in_deployment_listing_scope(status, org: str, project: str) -> bool:
-    """Whether a run belongs to the requested org AND project (manageable_run's predicate)."""
+    """Whether a run belongs to the requested org AND project (require_manageable_run's predicate)."""
     from flash.runner.lifecycle.preparation import _status_org_id
 
     if _status_org_id(status) != org:

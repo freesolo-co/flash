@@ -52,7 +52,7 @@ def wait_for_terminal_app(
             return None
 
 
-def suppressed(step: Callable[[], object]) -> bool:
+def run_teardown_step_best_effort(step: Callable[[], object]) -> bool:
     """run one teardown step without replacing the exception that initiated abort cleanup."""
 
     try:
@@ -73,7 +73,7 @@ def delete_teardown_resources(
 ) -> None:
     def run(step: Callable[[], object]) -> None:
         if suppress_failures:
-            suppressed(step)
+            run_teardown_step_best_effort(step)
         else:
             step()
 

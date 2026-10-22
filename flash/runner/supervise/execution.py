@@ -380,7 +380,7 @@ def _handle_callback(ctx: _SubmitContext, prepared, candidate_plan):
             # active claim exists, and handleless recovery refuses a set remote.
             deleted = False
             with contextlib.suppress(Exception):
-                deleted = attempt_recovery._strict_teardown_handle(remote, ctx.spec.run_id)
+                deleted = attempt_recovery._destroy_and_confirm_worker(remote, ctx.spec.run_id)
             if not deleted:
                 with contextlib.suppress(Exception):
                     _record_cleanup_remote(ctx.spec.run_id, persisted)
@@ -392,7 +392,7 @@ def _handle_callback(ctx: _SubmitContext, prepared, candidate_plan):
             return
         deleted = False
         with contextlib.suppress(Exception):
-            deleted = attempt_recovery._strict_teardown_handle(remote, ctx.spec.run_id)
+            deleted = attempt_recovery._destroy_and_confirm_worker(remote, ctx.spec.run_id)
         if deleted:
             ctx.last_handle.clear()
         else:

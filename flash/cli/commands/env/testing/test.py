@@ -7,7 +7,7 @@ import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from flash.cli.commands.env.ops.push import _err, _resolve_local_env_entrypoint
+from flash.cli.commands.env.ops.push import _report_command_error, _resolve_local_env_entrypoint
 from flash.cli.commands.env.testing.episode import _effective_turn_cap
 from flash.cli.commands.env.testing.evaluations import (
     _check_evaluation_suites,
@@ -696,7 +696,7 @@ def _check_grader(env, algorithm: str, tally: _Tally) -> bool:
         and not separates_on_turns
         and _scores_gold_no_better_than_junk(junk_reward, 0.0)
     ):
-        _err(
+        _report_command_error(
             f"all {tally.replayed} replayed gold answer(s) scored zero, no better than a "
             "deliberately wrong answer; the reward function cannot recognize its own reference "
             "answers. check the grader and that its runtime dependencies are installed in this "
@@ -732,9 +732,9 @@ def _check_grader(env, algorithm: str, tally: _Tally) -> bool:
 
 
 def _load_failure(reason: str) -> int:
-    _err(f"env test failed: {reason}")
+    _report_command_error(f"env test failed: {reason}")
     print("0/0 episodes passed contract checks")
-    return _err("overall: FAIL")
+    return _report_command_error("overall: FAIL")
 
 
 def cmd_env_test(args) -> int:
@@ -797,7 +797,7 @@ def cmd_env_test(args) -> int:
         print(f"  prompt: {_preview(record['prompt'])}")
         print(f"  response: {_preview(record['responses'])}")
         if failure:
-            _err(f"episode {index} failed contract checks: {failure}")
+            _report_command_error(f"episode {index} failed contract checks: {failure}")
             continue
 
         passed += 1
@@ -820,7 +820,7 @@ def cmd_env_test(args) -> int:
 
     print(f"{passed}/{episode_count} episodes passed contract checks")
     if passed != episode_count:
-        return _err("overall: FAIL")
+        return _report_command_error("overall: FAIL")
     # default to grpo so omitting the algorithm cannot disable the blocking check.
     algorithm = getattr(args, "algorithm", None) or _REWARD_DRIVEN_ALGORITHM
     grader_recognizes_gold = _check_grader(env, algorithm, tally)
@@ -828,6 +828,6 @@ def cmd_env_test(args) -> int:
     # reports every broken surface at once instead of hiding the sidecar's errors behind the
     # reward function's. both gates block; neither short-circuits the other.
     if not _check_evaluation_suites(entrypoint, env) or not grader_recognizes_gold:
-        return _err("overall: FAIL")
+        return _report_command_error("overall: FAIL")
     print(render.ok("overall: PASS") if render.styled() else "overall: PASS")
     return 0

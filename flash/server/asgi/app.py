@@ -132,7 +132,7 @@ def create_app():
         serving_completion.recover_deployments()
         deployment_cleanup_stop = threading.Event()
         deployment_jobs.start_deployment_job(
-            serving_completion.retry_deployment_cleanup,
+            serving_completion.run_deployment_cleanup_worker,
             deployment_cleanup_stop,
             background=True,
         )

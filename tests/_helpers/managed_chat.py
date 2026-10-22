@@ -1,6 +1,6 @@
 """shared managed chat api test helpers."""
 
-from tests.test_server_api import SPEC, _bearer, _login
+from tests.test_server_api import SPEC, _bearer, _new_user_token
 
 
 class _RawManagedChatResponse:
@@ -26,7 +26,7 @@ def _deployed_chat_run(api):
     import flash.runner.lifecycle.status as runner_status
     from tests._helpers import deployments as deployment_fixtures
 
-    key = _login()
+    key = _new_user_token()
     run_id = api.post(
         "/v1/runs", json={"spec": SPEC, "dry_run": True}, headers=_bearer(key)
     ).json()["run_id"]

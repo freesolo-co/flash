@@ -1,7 +1,7 @@
 """Shared FastAPI request dependencies and spec/secret parsing for the route modules.
 
 Only import lazily from ``create_app()`` — never at ``flash.server.asgi.app`` import time.
-``owned_run`` reads persisted run status through the lifecycle service.
+``require_owned_run`` reads persisted run status through the lifecycle service.
 """
 
 from __future__ import annotations
@@ -36,7 +36,7 @@ def _load_status(run_id: str):
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
 
-def owned_run(run_id: str, key: dict):
+def require_owned_run(run_id: str, key: dict):
     """Load a run's status iff `key` owns it; 404 otherwise (don't leak existence)."""
     if db.run_owner(run_id) != key["id"]:
         raise HTTPException(status_code=404, detail=f"unknown run_id: {run_id}")
@@ -54,7 +54,7 @@ def _internal_org_run(run_id: str, key: dict, org_id: str | None = None):
     raise HTTPException(status_code=404, detail=f"unknown run_id: {run_id}")
 
 
-def readable_run(run_id: str, key: dict, org_id: str | None = None):
+def require_readable_run(run_id: str, key: dict, org_id: str | None = None):
     """Load a run's status for READ-only endpoints (`/logs`, `/worker`) via one of two paths.
 
     Mirrors the env-delete posture (a user key carries its own identity; the org-agnostic
@@ -73,7 +73,7 @@ def readable_run(run_id: str, key: dict, org_id: str | None = None):
     return _internal_org_run(run_id, key, org_id)
 
 
-def manageable_run(
+def require_manageable_run(
     run_id: str,
     key: dict,
     org_id: str | None = None,
@@ -109,7 +109,7 @@ def manageable_run(
             if persisted_project == project:
                 return status
         raise HTTPException(status_code=404, detail=f"unknown run_id: {run_id}")
-    return owned_run(run_id, key)
+    return require_owned_run(run_id, key)
 
 
 def _require_bool(payload: dict, field: str, default: bool) -> bool:

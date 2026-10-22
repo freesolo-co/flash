@@ -60,7 +60,7 @@ def cleanup_run(run_id: str) -> None:
         api.call(remove, timeout=api.TERMINATION_TIMEOUT_SECONDS)
 
 
-def _identity(handle):
+def _uploader_tags(handle):
     return {
         "flash_owner": "flash-training",
         "flash_run": handle.run_id,
@@ -71,21 +71,21 @@ def _identity(handle):
     }
 
 
-def _name(handle):
+def _uploader_name(handle):
     return "upload-" + handle.instance_id
 
 
-async def _existing(modal, client, handle):
+async def _find_owned_uploader(modal, client, handle):
     try:
         sandbox = await modal.Sandbox.from_name.aio(
             api.APP_NAME,
-            _name(handle),
+            _uploader_name(handle),
             environment_name=api.environment(),
             client=client,
         )
     except modal.exception.NotFoundError:
         return None
-    if await sandbox.get_tags.aio() != _identity(handle):
+    if await sandbox.get_tags.aio() != _uploader_tags(handle):
         raise UnreconciledCreateError("CPU uploader name belongs to another attempt")
     return sandbox
 
@@ -114,7 +114,7 @@ def finish(handle, spec, *, deadline_at):
         raise ValueError("HF_TOKEN is required for CPU checkpoint publication")
 
     async def upload(modal, client):
-        sandbox = await _existing(modal, client, handle)
+        sandbox = await _find_owned_uploader(modal, client, handle)
         if sandbox is None:
             app = await modal.App.lookup.aio(
                 api.APP_NAME,
@@ -134,8 +134,8 @@ def finish(handle, spec, *, deadline_at):
                     "-m",
                     "flash.engine.worker.io.cpu_handoff",
                     app=app,
-                    name=_name(handle),
-                    tags=_identity(handle),
+                    name=_uploader_name(handle),
+                    tags=_uploader_tags(handle),
                     image=modal.Image.from_registry(worker_image_for_gpu(handle.gpu)),
                     secrets=[modal.Secret.from_dict(environment)],
                     volumes={MOUNT: volume},
@@ -145,7 +145,7 @@ def finish(handle, spec, *, deadline_at):
                     client=client,
                 )
             except Exception:
-                sandbox = await _existing(modal, client, handle)
+                sandbox = await _find_owned_uploader(modal, client, handle)
                 if sandbox is None:
                     raise UnreconciledCreateError(
                         "CPU upload launch could not be reconciled"
@@ -168,7 +168,7 @@ def cleanup(handle):
     """Cancel an owned CPU child before deleting its per-attempt storage."""
 
     async def remove(modal, client):
-        sandbox = await _existing(modal, client, handle)
+        sandbox = await _find_owned_uploader(modal, client, handle)
         if sandbox is not None:
             await sandbox.terminate.aio(wait=True)
             if await sandbox.poll.aio() is None:

@@ -1247,17 +1247,19 @@ def test_cost_quote_prices_the_cheapest_acceptable_gpu_class() -> None:
     organization can afford.
     """
     from flash.cost.analytical import estimate_cost
-    from flash.cost.spec import runconfig_from_spec
+    from flash.cost.spec import run_config_from_spec
 
     listed = spec_from_dict(_raw(**{"gpu.type": ["B200", "H100"]}))
     assert listed.gpu.acceptable_types == ("B200", "H100")
 
-    config = runconfig_from_spec(listed)
+    config = run_config_from_spec(listed)
     assert config.gpu_type == "B200"
     assert config.gpu_type_fallbacks == ("H100",)
 
-    head_only = estimate_cost(runconfig_from_spec(spec_from_dict(_raw(**{"gpu.type": "B200"}))))
-    fallback_only = estimate_cost(runconfig_from_spec(spec_from_dict(_raw(**{"gpu.type": "H100"}))))
+    head_only = estimate_cost(run_config_from_spec(spec_from_dict(_raw(**{"gpu.type": "B200"}))))
+    fallback_only = estimate_cost(
+        run_config_from_spec(spec_from_dict(_raw(**{"gpu.type": "H100"})))
+    )
     quoted = estimate_cost(config)
 
     # the acceptable fallback is genuinely cheaper here, so the head-only quote is an overquote.
@@ -1267,13 +1269,13 @@ def test_cost_quote_prices_the_cheapest_acceptable_gpu_class() -> None:
 
     # authoring order does not change the answer: allocation ranks on cost, not position.
     reversed_order = estimate_cost(
-        runconfig_from_spec(spec_from_dict(_raw(**{"gpu.type": ["H100", "B200"]})))
+        run_config_from_spec(spec_from_dict(_raw(**{"gpu.type": ["H100", "B200"]})))
     )
     assert reversed_order.gpu == "H100"
 
     # a bare pin stays a hard pin -- carrying fallbacks must not widen a single authored class.
     assert (
-        estimate_cost(runconfig_from_spec(spec_from_dict(_raw(**{"gpu.type": "B200"})))).gpu
+        estimate_cost(run_config_from_spec(spec_from_dict(_raw(**{"gpu.type": "B200"})))).gpu
         == "B200"
     )
 

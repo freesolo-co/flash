@@ -8,7 +8,7 @@ from flash.core.catalog import ALGORITHMS, normalize_algorithm
 from flash.schema import ConfigError, spec_from_dict
 
 
-def test_algorithms_registry():
+def test_algorithm_registry_contains_only_supported_algorithms():
     assert set(ALGORITHMS) == {"sft", "grpo", "opd"}
 
 

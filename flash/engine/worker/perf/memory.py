@@ -6,7 +6,9 @@ from flash.engine.plan.vram import _CHECKPOINT_LONG_CTX_TOKENS
 from flash.engine.worker.perf.model_size import _checkpointing_default_for_model
 
 
-def _memory_mode(model_id: str, max_length: int = 0, *, revision: str = "") -> bool:
+def _prefer_gradient_checkpointing(
+    model_id: str, max_length: int = 0, *, revision: str = ""
+) -> bool:
     """True for large models or long contexts; False for small+short (optimize for speed)."""
     if max_length and max_length >= _CHECKPOINT_LONG_CTX_TOKENS:
         return True
@@ -29,7 +31,7 @@ def grad_checkpointing_on(
     revision: str = "",
 ) -> bool:
     """Gradient-checkpointing default, with an SFT-only opt-out when GC-off fits."""
-    base = _memory_mode(model_id, max_length, revision=revision)
+    base = _prefer_gradient_checkpointing(model_id, max_length, revision=revision)
     if not allow_disable:
         return base
     if not base:

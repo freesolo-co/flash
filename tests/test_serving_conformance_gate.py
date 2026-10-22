@@ -78,12 +78,12 @@ _READY_TIMEOUT = gate.ready_timeout._get_wrapped_function()
 
 
 def test_the_readiness_default_tracks_the_clients_own_budget(monkeypatch):
-    from flash.serve.deployment.readiness import revision_ready_budget_seconds
+    from flash.serve.deployment.readiness import checkpoint_readiness_timeout_seconds
 
     for base_model in ("Qwen/Qwen3.5-9B", "Qwen/Qwen3.5-35B-A3B"):
         source = {"base_model": base_model}
         request = _request({"--conformance-ready-timeout": None}, monkeypatch)
-        assert _READY_TIMEOUT(request, source) == revision_ready_budget_seconds(base_model)
+        assert _READY_TIMEOUT(request, source) == checkpoint_readiness_timeout_seconds(base_model)
 
 
 def test_an_explicit_readiness_override_still_wins(monkeypatch):
