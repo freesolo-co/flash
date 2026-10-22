@@ -251,9 +251,9 @@ print('worker stack OK | torch', torch.__version__, '| cudnn', cudnn, '| triton'
 # ---------------------------------------------------------------------------------------------
 # verl venv (GRPO/OPD/SFT verl backends): ISOLATED from the main interpreter on purpose.
 #
-# verl's dependency set CONFLICTS with the worker stack above. verl and TransferQueue declare
-# numpy<2.0.0 while this image's stack resolves numpy>=2, and verl's structured-OPD gate pins
-# xgrammar to exactly 0.1.25 against vLLM's declared >=0.1.32 floor. Resolving verl into the main
+# Flash's structured-OPD gate pins xgrammar to exactly 0.1.25 against vLLM's declared
+# >=0.1.32 floor. The trainer stack is isolated from the worker interpreter so changing its
+# dependency resolution cannot move the main worker's pins. Resolving verl into the main
 # interpreter would move shared pins under every other worker path (peft/transformers/vllm all
 # live there), so verl gets its own venv and flash launches it out-of-process via FLASH_VERL_PYTHON.
 # The venv deliberately re-resolves its own numpy independent of the base interpreter's.
@@ -262,32 +262,21 @@ print('worker stack OK | torch', torch.__version__, '| cudnn', cudnn, '| triton'
 # the pod. Keep the two in lockstep: verl's install_requires omits vllm/uvicorn/fastapi/cachetools
 # while importing them at module level on the launch path, so any dependency dropped from ONE of
 # these two lists yields an interpreter where `verl.trainer.main_ppo` dies on ModuleNotFoundError:
-# cachetools and `main_ppo_sync` dies on uvicorn. Baking them here keeps the image from paying the
+# cachetools and the V1 PPO trainer dies on uvicorn. Baking them here keeps the image from paying the
 # fallback's install cost on every run; it is not what makes the backends runnable.
 #
 # vLLM is pinned to 0.19.1, matching the base stack above so the image carries ONE vLLM version.
-# That deliberately exceeds verl's declared vllm<=0.12.0 ceiling. The metadata-clean alternative
-# (0.11.2, which satisfies the ceiling and makes `uv pip check` green) was rejected on a model-
-# contract fact: Qwen/Qwen3.5-9B is flash's DEFAULT_MODEL and enables GRPO+OPD, both of which set
-# rollout.name=vllm, and 0.11.2 registers neither Qwen3_5ForConditionalGeneration nor
-# Qwen3_5MoeForConditionalGeneration, so it cannot run rollouts for the default model at all.
-# The ceiling is stale for the async rollout path regardless: verl 0.8.0's own stable Dockerfile
-# defaults to vllm 0.20.2, its Qwen3.5 GRPO examples require 0.18.0, and vllm_async_server.py
-# branches explicitly on 0.13+/0.17+/0.20+ behavior.
-#
-# Three metadata violations are DELIBERATE, and `uv pip check` stays red in here by design:
-#   verl + transferqueue declare numpy<2.0.0   -> vLLM 0.19.1 needs numpy>=2 (declarations are stale)
-#   verl declares vllm>=0.8.5,<=0.12.0         -> we ship 0.19.1 (see the ceiling discussion above)
-#   vllm declares xgrammar>=0.1.32             -> structured OPD gates on EXACTLY 0.1.25
+# Install the bare upstream package and Flash's explicit GPU stack. Upstream's [vllm] extra
+# selects its complete CUDA 13 / Torch 2.13 environment; this image uses CUDA 12.8 / Torch 2.10.
+# Flash pins vLLM and Transformers alongside the exact upstream source.
+# The remaining dependency-metadata override is xgrammar: vLLM declares >=0.1.32,
+# while structured OPD requires exactly 0.1.25. Upstream Verl and TransferQueue now support numpy>=2.
 # xgrammar 0.1.25 was exercised against vLLM 0.19.1's own XgrammarBackend (schema compile, grammar
 # build, token-mask fill+apply) so the floor is not required to drive the API.
 #
-# Those three violations are why this uses `uv pip install --override` and NOT plain pip. pip has no
-# escape hatch for a deliberate metadata violation: it either resolves or it refuses, and here it
-# refuses with `ResolutionImpossible: Cannot install numpy==2.2.6 and verl` (verl 0.8.0 pins
-# numpy<2.0.0). uv's --override is the mechanism this pin set was validated with. All three violated
-# pins must appear in the override file: dropping the vllm line alone is still unsatisfiable
-# (verl[vllm] depends on vllm<=0.12.0 while we require 0.19.1).
+# xgrammar needs uv's --override to resolve conflicting dependency metadata.
+# Repeating exact numpy, vllm, and transformers pins keeps the baked and fallback
+# training environments aligned. GPU qualification remains required for this runtime.
 #
 # `uv venv` rather than `python -m venv` because the pytorch base image ships no ensurepip, so
 # `python -m venv` fails outright ("The virtual environment was not created successfully because
@@ -295,7 +284,7 @@ print('worker stack OK | torch', torch.__version__, '| cudnn', cudnn, '| triton'
 # image at /usr/local/bin/uv.
 #
 # Four pins are non-obvious and load-bearing: datasets>=4.7 (older raises AttributeError on PyArrow
-# PyExtensionType), TransferQueue (absent from verl's setup.py, but OPD calls tq.init()/tq.close()),
+# PyExtensionType), TransferQueue 0.1.11 (required by upstream's V1 API, absent from setup.py),
 # transformers<5.13 (see below), and wandb (also absent from verl's setup.py). verl calls wandb.init from THIS interpreter, not
 # flash's, so a job that sets WANDB_API_KEY loses its curves and run link unless wandb is importable
 # in here; resolve_verl_loggers() degrades to console when it is not, which is the right behaviour
@@ -314,16 +303,16 @@ print('worker stack OK | torch', torch.__version__, '| cudnn', cudnn, '| triton'
 # already resolved. verl and vllm both depend on transformers, so without the exact override a
 # transitive requirement can re-widen even an exact direct pin. the
 # venv is the interpreter that trains, and transformers owns the gdn modelling code the boundary-
-# reset shim patches (chunk_gated_delta_rule, the causal conv, and the kwargs they read). the main
+# reset hook supplies (chunk_gated_delta_rule, the causal conv, and the kwargs they read). the main
 # interpreter carrying an exact pin protects nothing in here (/opt/verl-venv is built without
-# --system-site-packages). changing this exact pin means re-validating the gdn shim against the new
+# --system-site-packages). changing this exact pin means re-validating the gdn hook against the new
 # version, not just bumping the number.
 #
 # This pin is NOT what makes the sanity block below pass. is_flash_linear_attention_available() and
 # is_causal_conv1d_available() are byte-identical in 5.12.1 and 5.14.1, and both begin with
 # is_torch_cuda_available() -- they answer False on this cpu builder at every version. An earlier
 # revision of this comment blamed a 5.13 import-path move; no such move exists.
-ARG VERL_SPEC=verl[vllm]@git+https://github.com/freesolo-co/verl@f71a02ddb32a9c6a6915f7519bda6dede92e9dd0
+ARG VERL_SPEC=verl@git+https://github.com/verl-project/verl@ddf700725c34bb8966685c8ecf5ca36a2cc54a35
 # BuildKit retains downloaded wheels between dependency-layer rebuilds, outside the image.
 # Keep the cache private to this trusted builder/toolchain; runtime tenant code never mounts it.
 ENV FLASH_VERL_PYTHON=/opt/verl-venv/bin/python \
@@ -339,7 +328,7 @@ RUN --mount=type=cache,id=flash-worker-uv-cu128,target=/root/.cache/uv,sharing=l
         "numpy==2.2.6" \
         "transformers==5.12.1" \
         "datasets==5.0.1" \
-        "TransferQueue==0.1.7" \
+        "TransferQueue==0.1.11" \
         "qwen-vl-utils==0.0.14" \
         "wandb==0.28.2" \
         "cachetools==7.1.7" "uvicorn==0.52.4" "fastapi==0.141.1" \
@@ -387,7 +376,7 @@ RUN --mount=type=cache,id=flash-worker-uv-cu128,target=/root/.cache/uv,sharing=l
 # causal_conv1d in the VERL VENV, which is where the model actually trains. The main interpreter's
 # copy above does not reach here: /opt/verl-venv is built without --system-site-packages, so the two
 # have disjoint paths. Together with fla's cu_seqlens (installed above) this is what makes the packed
-# GDN boundary resets real rather than decorative: engine.worker.backend_common's boundary shim hands
+# GDN boundary resets real rather than decorative: engine.worker.backend_common's boundary hook hands
 # the GDN layer cu_seq_lens_q + seq_idx, but transformers' pure-torch fallbacks take **kwargs and
 # silently DISCARD both, so a child missing these kernels trains across example boundaries while
 # looking patched. verl_child_can_reset_gdn_boundaries probes this venv for exactly that reason.
@@ -432,10 +421,9 @@ RUN python /tmp/cudartfix/extract_cudart_fix.py /tmp/cudartfix/capabilities.py /
 
 # Sanity: the verl venv must be able to LAUNCH, not merely install. This is the assert that would
 # have caught the shipped-but-unrunnable venv. Import the three entrypoints flash actually invokes
-# (rl_train -> main_ppo, opd_plugin -> main_ppo_sync, sft_train -> sft_trainer; note it is
+# (rl_train -> main_ppo, opd child trainer -> ppo.v1.trainer_sync, sft_train -> sft_trainer; note it is
 # sft_trainer, NOT fsdp_sft_trainer, which does not exist in this pin), the vLLM rollout modules
-# where a version mismatch would surface, and the fork-only rollout field the GRPO path emits as a
-# hydra override. Also assert the Qwen3.5 archs are registered, since that is the entire reason this
+# where a version mismatch would surface, and verify the installed upstream VCS source. Also assert the Qwen3.5 archs are registered, since that is the entire reason this
 # venv carries 0.19.1 instead of 0.11.2.
 #
 # fla and causal_conv1d are asserted here as INSTALLED AND IMPORTABLE, not via transformers'
@@ -456,23 +444,21 @@ RUN python /tmp/cudartfix/extract_cudart_fix.py /tmp/cudartfix/capabilities.py /
 RUN /opt/verl-venv/bin/python -c "import importlib.metadata as M; \
 import importlib; \
 from packaging import version; \
-[importlib.import_module(m) for m in ('verl.trainer.main_ppo','verl.trainer.main_ppo_sync','verl.trainer.sft_trainer')]; \
+[importlib.import_module(m) for m in ('verl.trainer.main_ppo','verl.trainer.ppo.v1.trainer_sync','verl.trainer.sft_trainer')]; \
 [importlib.import_module(m) for m in ('verl.workers.rollout.vllm_rollout.vllm_rollout','verl.workers.rollout.vllm_rollout.vllm_async_server')]; \
-from verl.workers.config.rollout import RolloutConfig; \
-assert 'mask_truncated_completions' in RolloutConfig.__dataclass_fields__, 'verl is not the freesolo fork (no mask_truncated_completions)'; \
 importlib.import_module('flash_attn.bert_padding'); \
 importlib.import_module('fla'); \
 assert version.parse(M.version('flash-linear-attention')) >= version.parse('0.2.2'), 'flash-linear-attention older than the 0.2.2 transformers requires: packed GDN boundary resets would be silently discarded'; \
 importlib.import_module('causal_conv1d'); \
-assert M.version('verl') == '0.8.0', 'opd structured gate requires verl exactly 0.8.0, got ' + M.version('verl'); \
+import json; source=json.loads(M.distribution('verl').read_text('direct_url.json')); assert source['url'].removesuffix('.git') == 'https://github.com/verl-project/verl' and source['vcs_info']['commit_id'] == '${VERL_SPEC##*@}', 'wrong upstream Verl source'; \
 assert M.version('xgrammar') == '0.1.25', 'opd structured gate requires xgrammar exactly 0.1.25, got ' + M.version('xgrammar'); \
 from vllm import ModelRegistry; \
 archs = set(ModelRegistry.get_supported_archs()); \
 missing = {'Qwen3_5ForConditionalGeneration','Qwen3_5MoeForConditionalGeneration'} - archs; \
 assert not missing, 'vllm cannot serve the default-model archs: ' + repr(sorted(missing)); \
 print('verl venv OK | verl', M.version('verl'), '| vllm', M.version('vllm'), '| torch', M.version('torch'), '| numpy', M.version('numpy'), '| xgrammar', M.version('xgrammar')); \
-print('  entrypoints: main_ppo (grpo), main_ppo_sync (opd), sft_trainer (sft)'); \
-print('  qwen3.5 archs registered; mask_truncated_completions present'); \
+print('  entrypoints: main_ppo (grpo), ppo.v1.trainer_sync (grpo/opd), sft_trainer (sft)'); \
+print('  qwen3.5 archs registered; exact upstream source verified'); \
 print('  gdn boundary resets: fla', M.version('flash-linear-attention'), 'and causal_conv1d installed and importable (capability itself is cuda-gated, asserted on the worker)')"
 
 # Modal injects the versioned bootstrap capsule and request-local secrets at launch.

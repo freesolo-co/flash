@@ -67,10 +67,15 @@ def publish(env, torch):
     (root / "manifest.json").write_text(json.dumps(_identity(env, torch), sort_keys=True))
 
 
-def install(runtime):
-    """Defer CUDA/runtime validation until FlashInfer is actually imported in each child."""
-    target = "flashinfer.jit.env"
-    if target in sys.modules:
-        activate(sys.modules[target])
-    else:
-        runtime._DEFERRED_FINDER.register(target, activate)
+def activate_current():
+    """Select a validated cache after device initialization, before model kernels load."""
+    root = _root()
+    if root is None or not (root / "manifest.json").is_file():
+        return False
+    import importlib
+
+    try:
+        env = importlib.import_module("flashinfer.jit.env")
+    except ImportError:
+        return False
+    return activate(env)

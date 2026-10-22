@@ -17,9 +17,8 @@ from safetensors.numpy import save
 
 from flash.adapters.targets import LoraTargeting, resolve_lora_targeting
 from flash.core.catalog import ALGORITHMS, MODELS
-from flash.engine.worker.train.core.child import runtime as child_runtime
-from flash.engine.worker.train.core.child.runtime import (
-    install_text_lora_targeting,
+from flash.engine.worker.train.core.child import model as child_runtime
+from flash.engine.worker.train.core.child.model import (
     resolve_text_lora_target_modules,
 )
 
@@ -74,7 +73,7 @@ def test_actual_qwen35_9b_metadata_resolves_the_language_subtree_without_torch()
     assert config.model_type == "qwen3_5"
     assert config.text_config.model_type == "qwen3_5_text"
     assert config.text_config.mtp_num_hidden_layers == 1
-    assert config.vision_config.model_type == "qwen3_5"
+    assert config.vision_config.model_type in {"qwen3_5", "qwen3_5_vision"}
     assert not _excluded(targeting, metadata["module_names"]["language_linear"])
     for key in ("visual_linear", "patch_linear", "projector_linear", "mtp_linear"):
         assert _excluded(targeting, metadata["module_names"][key]), key
@@ -272,7 +271,7 @@ def _install_fake_verl_engine(
             )
 
     impl = types.ModuleType("verl.workers.engine.fsdp.transformer_impl")
-    impl.FSDPEngine = _Engine
+    impl.FSDPEngineWithLMHead = _Engine
     modules = {
         "verl": types.ModuleType("verl"),
         "verl.workers": types.ModuleType("verl.workers"),
@@ -280,11 +279,23 @@ def _install_fake_verl_engine(
         "verl.workers.engine.fsdp": types.ModuleType("verl.workers.engine.fsdp"),
         "verl.workers.engine.fsdp.transformer_impl": impl,
     }
+    modules["verl.workers.engine"].EngineRegistry = SimpleNamespace(
+        register=lambda **kwargs: lambda cls: cls
+    )
     for name, module in modules.items():
         monkeypatch.setitem(sys.modules, name, module)
     monkeypatch.setattr(child_runtime, "_text_lora_module_types", lambda: (_FakeLinear,))
-    install_text_lora_targeting("model.language_model")
-    return _Engine, calls
+    monkeypatch.delitem(sys.modules, "flash.engine.worker.train.core.child.engine", raising=False)
+    from flash.engine.worker.train.core.child.engine import FlashFSDPEngine
+
+    class TestEngine(FlashFSDPEngine):
+        def __init__(self, config):
+            _Engine.__init__(self, config)
+            self.runtime = SimpleNamespace(
+                lora_language_prefix="model.language_model", kl_ref_adapter=False
+            )
+
+    return TestEngine, calls
 
 
 @pytest.mark.parametrize("wrapper", ["", "module.", "_orig_mod.", "base_model.model."])
@@ -429,7 +440,7 @@ def test_runtime_installer_rejects_stale_or_non_dataclass_configs_and_incomplete
     monkeypatch,
 ):
     engine_cls, _calls = _install_fake_verl_engine(monkeypatch)
-    with pytest.raises(RuntimeError, match="requires exclude_modules=null"):
+    with pytest.raises(RuntimeError, match="all-linear and no exclusion regex"):
         engine_cls(_FrozenModelConfig(exclude_modules="stale"))._build_lora_module(
             _runtime_topology()
         )
@@ -447,81 +458,62 @@ def test_runtime_installer_rejects_stale_or_non_dataclass_configs_and_incomplete
         engine_cls(_FrozenModelConfig())._build_lora_module(_runtime_topology())
 
 
-def test_sft_grpo_and_opd_plugins_install_text_targeting_only_for_text_jobs(tmp_path):
+def test_sft_grpo_and_opd_serialize_text_targeting_only_for_text_jobs(tmp_path):
     importlib.import_module("flash.engine.worker.train.entry.sft_train")
-    from flash.engine.worker.train.entry import sft_train_runner
-    from flash.engine.worker.train.opd.orchestration.overrides import _build_opd_plugin_config
-    from flash.engine.worker.train.rl.child.plugin import required_patch_names
+    from flash.engine.worker.train.entry import rl_train_runner, sft_train_runner
+    from flash.engine.worker.train.opd.orchestration.overrides import _build_opd_launch_config
 
-    shim_dir = tmp_path / "sft-text-shim"
-    shim_dir.mkdir()
-    _marker, expected, raw_sft = sft_train_runner._write_sft_child_shims(
-        SimpleNamespace(
-            model_id="Qwen/Qwen3.5-9B",
+    for text_only in (False, True):
+        prefix = "model.language_model" if text_only else ""
+        _, expected, config_path = sft_train_runner._write_sft_launch(
+            SimpleNamespace(
+                model_id="Qwen/Qwen3.5-9B",
+                save_at_steps=(),
+                paths=SimpleNamespace(export_root=str(tmp_path)),
+            ),
+            SimpleNamespace(
+                update_horizon=1,
+                reentrant_gradient_checkpointing=False,
+                exclude_modules="text-only" if text_only else None,
+            ),
+            runtime_dir=str(tmp_path),
+            seed=42,
+            loggers=[],
+            gdn_reset_arch=None,
+        )
+        assert expected == ("runtime-ready",)
+        assert json.loads(Path(config_path).read_text())["lora_language_prefix"] == prefix
+        files = {"readiness_path": "ready", "launch_config_path": str(tmp_path / "grpo.json")}
+        inp = {
+            "model_id": "Qwen/Qwen3.5-9B",
+            "dp_cards": 1,
+            "reentrant_checkpointing": False,
+            "multimodal": not text_only,
+            "per_turn_credit": False,
+            "mask_truncated_completions": True,
+            "stop_sequences": [],
+            "image_pad_token_id": None,
+            "structured_outputs": None,
+            "save_at_steps": [],
+            "steps": 1,
+            "warmstart_adapter": None,
+            "kl_coef": 0,
+            "multi_turn": False,
+        }
+        rl_train_runner._write_rl_launch_config(inp, files, gdn_reset_arch=None, loggers=[])
+        assert (
+            json.loads(Path(files["launch_config_path"]).read_text())["lora_language_prefix"]
+            == prefix
+        )
+        raw = _build_opd_launch_config(
+            runtime_dir=str(tmp_path),
             save_at_steps=(),
-            paths=SimpleNamespace(export_root=str(tmp_path / "exports")),
-        ),
-        SimpleNamespace(
-            update_horizon=1,
-            reentrant_gradient_checkpointing=False,
-            exclude_modules="text-only",
-        ),
-        shim_dir=str(shim_dir),
-        custom_dataset_path=str(shim_dir / "dataset.py"),
-        seed=42,
-        loggers=[],
-        gdn_reset_arch=None,
-    )
-    assert child_runtime.TEXT_LORA_TARGET_SHIM in expected
-    assert json.loads(raw_sft)["lora_language_prefix"] == "model.language_model"
-
-    multimodal_dir = tmp_path / "sft-multimodal-shim"
-    multimodal_dir.mkdir()
-    _marker, expected, raw_sft = sft_train_runner._write_sft_child_shims(
-        SimpleNamespace(
-            model_id="Qwen/Qwen3.5-9B",
-            save_at_steps=(),
-            paths=SimpleNamespace(export_root=str(tmp_path / "exports")),
-        ),
-        SimpleNamespace(
-            update_horizon=1,
-            reentrant_gradient_checkpointing=False,
-            exclude_modules=None,
-        ),
-        shim_dir=str(multimodal_dir),
-        custom_dataset_path=str(multimodal_dir / "dataset.py"),
-        seed=42,
-        loggers=[],
-        gdn_reset_arch=None,
-    )
-    assert child_runtime.TEXT_LORA_TARGET_SHIM not in expected
-    assert json.loads(raw_sft)["lora_language_prefix"] == ""
-
-    grpo_text = required_patch_names(
-        {"lora_language_prefix": "model.language_model", "total_steps": 1}
-    )
-    grpo_multimodal = required_patch_names({"lora_language_prefix": "", "total_steps": 1})
-    assert child_runtime.TEXT_LORA_TARGET_SHIM in grpo_text
-    assert child_runtime.TEXT_LORA_TARGET_SHIM not in grpo_multimodal
-
-    raw_opd = _build_opd_plugin_config(
-        shim_dir=str(tmp_path),
-        save_at_steps=(),
-        total_steps=1,
-        gdn_model_type=None,
-        loggers=[],
-        lora_language_prefix="model.language_model",
-    )
-    assert json.loads(raw_opd)["lora_language_prefix"] == "model.language_model"
-    raw_opd = _build_opd_plugin_config(
-        shim_dir=str(tmp_path),
-        save_at_steps=(),
-        total_steps=1,
-        gdn_model_type=None,
-        loggers=[],
-        lora_language_prefix="",
-    )
-    assert "lora_language_prefix" not in json.loads(raw_opd)
+            total_steps=1,
+            gdn_model_type=None,
+            loggers=[],
+            lora_language_prefix=prefix,
+        )
+        assert json.loads(raw).get("lora_language_prefix", "") == prefix
 
 
 def test_exact_verl_hf_model_reproduces_old_peft_failure_and_attaches_new_targets():
@@ -571,7 +563,8 @@ def test_exact_verl_hf_model_reproduces_old_peft_failure_and_attaches_new_target
         ),
     )
     assert set(attached.base_model.targeted_module_names) == set(targets)
-    assert len(targets) == 186
+    # both the CPU lock (5.10.2) and worker pin (5.12.1) expose split GDN projections.
+    assert len(targets) == 248
     assert not any(
         set(target.lower().split(".")) & child_runtime._NON_LANGUAGE_LORA_SEGMENTS
         for target in targets

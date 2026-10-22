@@ -2,15 +2,15 @@
 
 Optimizer, scheduler, RNG, trainable parameters, and persistent buffers keep their native formats.
 The pinned base is already loaded before Verl restores a checkpoint. Load hooks fill only the
-explicitly omitted frozen keys from that base, then let the original strict loader validate all keys.
+explicitly omitted frozen keys from that base and validate the complete key set before native loading.
 """
 
 from __future__ import annotations
 
-import functools
 import json
 import os
 import re
+from contextlib import contextmanager
 from pathlib import Path
 
 
@@ -66,72 +66,80 @@ def restore_state(model, state: dict, manifest: dict, *, model_id: str, revision
         state[name] = base[name]
 
 
-def install(module, *, model_id: str, revision: str) -> None:
+def _identity() -> tuple[str, str]:
+    model_id = os.environ.get("FLASH_CHECKPOINT_MODEL_ID", "")
+    revision = os.environ.get("FLASH_CHECKPOINT_MODEL_REVISION", "")
     if not model_id or not re.fullmatch(r"[0-9a-f]{40}", revision):
         raise RuntimeError("compact checkpoints require an immutable base model revision")
-    manager = module.FSDPCheckpointManager
-    if getattr(manager.save_checkpoint, "_flash_compact_checkpoint", False):
-        return
-    original_save, original_load = manager.save_checkpoint, manager.load_checkpoint
+    return model_id, revision
 
-    def manifest_path(instance, local_path):
-        return Path(local_path) / f"flash_compact_model_rank_{instance.rank}.json"
 
-    @functools.wraps(original_save)
-    def save(self, local_path, *args, **kwargs):
-        if module.fsdp_version(self.model) != 2 or not self.should_save_model:
-            raise RuntimeError("compact checkpoints require the FSDP2 model save contract")
-        path = manifest_path(self, local_path)
+def _manifest_path(manager, local_path):
+    return Path(local_path) / f"flash_compact_model_rank_{manager.rank}.json"
 
-        def filter_state(model, state, prefix, metadata):
-            if prefix:
-                raise RuntimeError("compact hook must run on the FSDP2 root")
-            omitted = compact_state(model, state)
-            path.parent.mkdir(parents=True, exist_ok=True)
-            temporary = path.with_suffix(".tmp")
-            temporary.write_text(
-                json.dumps(
-                    {
-                        "version": 1,
-                        "model_id": model_id,
-                        "revision": revision,
-                        "omitted": omitted,
-                        "retained": sorted(state),
-                    },
-                    sort_keys=True,
-                )
+
+@contextmanager
+def saving(manager, local_path):
+    """Filter only this model's state during the native checkpoint operation."""
+    from verl.utils.fsdp_utils import fsdp_version
+
+    model_id, revision = _identity()
+    if fsdp_version(manager.model) != 2 or not manager.should_save_model:
+        raise RuntimeError("compact checkpoints require the FSDP2 model save contract")
+    path = _manifest_path(manager, local_path)
+
+    def filter_state(model, state, prefix, metadata):
+        if prefix:
+            raise RuntimeError("compact hook must run on the FSDP2 root")
+        omitted = compact_state(model, state)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = path.with_suffix(".tmp")
+        temporary.write_text(
+            json.dumps(
+                {
+                    "version": 1,
+                    "model_id": model_id,
+                    "revision": revision,
+                    "omitted": omitted,
+                    "retained": sorted(state),
+                },
+                sort_keys=True,
             )
-            os.replace(temporary, path)
+        )
+        os.replace(temporary, path)
 
-        hook = self.model.register_state_dict_post_hook(filter_state)
-        try:
-            return original_save(self, local_path, *args, **kwargs)
-        finally:
-            hook.remove()
+    hook = manager.model.register_state_dict_post_hook(filter_state)
+    try:
+        yield
+    finally:
+        hook.remove()
 
-    @functools.wraps(original_load)
-    def load(self, local_path, *args, **kwargs):
-        if local_path is None or not manifest_path(self, local_path).exists():
-            return original_load(self, local_path, *args, **kwargs)
-        if module.fsdp_version(self.model) != 2:
-            raise RuntimeError("compact recovery requires FSDP2")
-        path = manifest_path(self, local_path)
-        if path.is_symlink() or path.stat().st_size > 4 * 1024**2:
-            raise RuntimeError("invalid compact checkpoint manifest")
-        manifest = json.loads(path.read_text())
-        if not isinstance(manifest, dict):
-            raise RuntimeError("invalid compact checkpoint manifest")
 
-        def fill_base(model, state, prefix, *unused):
-            if prefix:
-                raise RuntimeError("compact hook must run on the FSDP2 root")
-            restore_state(model, state, manifest, model_id=model_id, revision=revision)
+@contextmanager
+def loading(manager, local_path):
+    """Fill omitted base keys for this load, retaining native strict validation."""
+    if local_path is None or not _manifest_path(manager, local_path).exists():
+        yield
+        return
+    from verl.utils.fsdp_utils import fsdp_version
 
-        hook = self.model.register_load_state_dict_pre_hook(fill_base)
-        try:
-            return original_load(self, local_path, *args, **kwargs)
-        finally:
-            hook.remove()
+    model_id, revision = _identity()
+    if fsdp_version(manager.model) != 2:
+        raise RuntimeError("compact recovery requires FSDP2")
+    path = _manifest_path(manager, local_path)
+    if path.is_symlink() or path.stat().st_size > 4 * 1024**2:
+        raise RuntimeError("invalid compact checkpoint manifest")
+    manifest = json.loads(path.read_text())
+    if not isinstance(manifest, dict):
+        raise RuntimeError("invalid compact checkpoint manifest")
 
-    save._flash_compact_checkpoint = True
-    manager.save_checkpoint, manager.load_checkpoint = save, load
+    def fill_base(model, state, prefix, *unused):
+        if prefix:
+            raise RuntimeError("compact hook must run on the FSDP2 root")
+        restore_state(model, state, manifest, model_id=model_id, revision=revision)
+
+    hook = manager.model.register_load_state_dict_pre_hook(fill_base)
+    try:
+        yield
+    finally:
+        hook.remove()

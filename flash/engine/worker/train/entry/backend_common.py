@@ -25,18 +25,13 @@ from concurrent.futures import thread as _thread_module
 from http.server import ThreadingHTTPServer
 from typing import Self
 
-# verl 0.8.0 exactly, plus the truncation-mask, 3d position-id, and ulysses fused-label fixes, the
-# whole-adapter lora bucket sync, and the fused-linear grad-flag preservation.
-# it must stay on the 0.8.0 base: the opd plugin patches 0.8.0 internals and imports
-# verl.trainer.main_ppo_sync, which verl deleted after 0.8.0, and opd's exact-version gate reads the
-# version file this branch pins to the release value.
+# unmodified upstream commit; kept identical to Dockerfile.worker.
 VERL_REQUIREMENT_NAME = "verl"
 VERL_REQUIREMENT_URL = (
-    "git+https://github.com/freesolo-co/verl@f71a02ddb32a9c6a6915f7519bda6dede92e9dd0"
+    "git+https://github.com/verl-project/verl@ddf700725c34bb8966685c8ecf5ca36a2cc54a35"
 )
-# the pin, as the venv stamp records it. the provisioning install asks for the [vllm] extra of this
-# same commit; the stamp stays extra-free so it identifies the verl a venv holds, not how it was
-# installed.
+# the pin, as the venv stamp records it. the provisioning install uses the bare upstream package
+# at this commit; GPU dependencies are selected explicitly alongside it.
 VERL_REQUIREMENT = f"{VERL_REQUIREMENT_NAME} @ {VERL_REQUIREMENT_URL}"
 
 # the FA2 wheel the verl interpreter needs, kept byte-identical to Dockerfile.worker's
@@ -74,14 +69,14 @@ FLA_REQUIREMENT = (
     "flash-linear-attention @ git+https://github.com/fla-org/flash-linear-attention.git"
     "@9c8e42e762fce087c27b673af4922795d9edb85e"
 )
-# the flashqla GDN backend lives in a separate wheel that fla 0.5.2 dispatches to; the child's
-# shim binds it on sm90 only (child_io.render_flash_qla_shim).
+# the pinned FLA dispatcher selects FlashQLA only when its native hardware and shape
+# verifier accepts the request; Flash does not replace the model's kernel callable.
 FLASH_QLA_REQUIREMENT = "flash-qla==0.1.2"
 CAUSAL_CONV1D_REQUIREMENT = "causal-conv1d==1.6.2.post1"
 
 # the SAME transformers range the main interpreter and Dockerfile.worker's verl-venv layer use.
 # this venv is the interpreter that TRAINS, and transformers owns the gdn modelling code the
-# boundary-reset shim patches (chunk_gated_delta_rule, the causal conv, and the kwargs they read),
+# boundary hook supplies (chunk_gated_delta_rule, the causal conv, and the kwargs they read),
 # so an unbounded resolve here means the training path silently rides a transformers line nothing
 # validated. bounding it to the range flash tests against is the whole reason. verl and vllm both
 # depend on transformers, so this has to be in the OVERRIDE file as well as the direct list -- a
@@ -252,7 +247,7 @@ def model_max_position_embeddings(model_id: str, revision: str = "") -> int | No
 
 
 # verl ships two fused linear-CE backends and dispatches on `fused_kernel_options.impl_backend`
-# (models/transformers/monkey_patch.py). all three flash trainers used to pin `torch`, which is
+# (models/transformers/training_qwen3_5.py). all three flash trainers used to pin `torch`, which is
 # verl's own default (config/model/hf_model.yaml:67) -- a restated default rather than a choice.
 #
 # MEASURED, 4096x2560 hidden into a 248320 vocab, bf16, fwd+bwd, paired and alternating, 10 reps
@@ -302,11 +297,8 @@ def fused_ce_backend(caps: dict) -> str:
 def agent_loop_workers(rollout_batch: int, *, cap: int = 8) -> int:
     """largest divisor of ``rollout_batch`` that is <= ``cap`` (verl's default worker count).
 
-    verl 0.8.0 hardcodes async rollout (ray_trainer.py:914), so every rollout goes through
-    AgentLoopManager, which splits the batch across agent.num_workers with DataProto.chunk and
-    asserts the split is exact (agent_loop.py:1111 -> protocol.py:874). the worker count must
-    therefore divide the batch. returning a divisor keeps the run alive for any batch size while
-    preserving parallelism whenever the batch permits it.
+    the upstream agent manager splits prompt batches across agent workers. keeping a divisor
+    bounds worker count and preserves even assignment whenever the batch permits it.
     """
     if rollout_batch <= 0:
         raise ValueError("rollout_batch must be positive")
@@ -440,15 +432,23 @@ def _cgroup_cpu_quota() -> int | None:
 # ResourcePoolManager defaults max_colocate_count to 3 (base.py:189).
 _VERL_CPU_PER_GPU_BUNDLE = 3
 # plus the singletons outside the bundles: TaskRunner is ray.remote(num_cpus=1) (main_ppo.py:83),
-# and opd adds one storage unit.
-_VERL_CPU_OVERHEAD = 2
+# and both RL paths add a storage unit plus the TransferQueue controller. One additional CPU
+# remains available to schedule upstream's default Ray actors (one CPU during creation, zero
+# while running), since their startup cannot borrow CPUs reserved inside GPU bundles.
+_VERL_CPU_OVERHEAD = 4
+
+
+def transfer_queue_overrides() -> list[str]:
+    """Both single-node RL trainers share one storage unit and one controller."""
+    return ["transfer_queue.backend.SimpleStorage.num_data_storage_units=1"]
 
 
 def verl_cpu_demand(gpu_count: int) -> int:
     """cpus verl's placement group needs for ``gpu_count`` gpus, read off the verl source.
 
-    the bundles are requested STRICT_PACK, so this is a single-node demand: 8 gpus want 26 cpus on
-    one box, not spread over several.
+    the bundles are requested STRICT_PACK, so this is a single-node demand: 8 gpus want 28 cpus on
+    one box, not spread over several. The task runner, storage unit, and queue controller
+    each reserve one additional CPU outside the GPU bundles; actor creation needs one free CPU.
     """
     return max(1, gpu_count) * _VERL_CPU_PER_GPU_BUNDLE + _VERL_CPU_OVERHEAD
 
@@ -961,21 +961,14 @@ from flash.engine.worker.verl.checkpoints import (  # noqa: E402,F401
 )
 from flash.engine.worker.verl.child_io import (  # noqa: E402,F401
     _VERL_METRIC_FIELDS,
-    FLASH_CUDART_STUB_MARKER,
-    FLASH_GDN_VARLEN_MARKER,
-    FLASH_TF32_MARKER,
     FLASH_WANDB_LINK_MARKER,
-    SHIM_FRAGMENT_FAILED_EXIT_CODE,
     append_step_metrics,
     parse_verl_metric,
     parse_verl_step_metrics,
     parse_wandb_link,
-    read_applied_shim_markers,
-    render_sitecustomize_bootstrap,
-    render_tf32_shim,
-    render_tilelang_cudart_shim,
-    shim_marker_file,
-    verify_applied_shim_markers,
+    read_ready_components,
+    readiness_file,
+    verify_runtime_ready,
     verl_step_number,
 )
 

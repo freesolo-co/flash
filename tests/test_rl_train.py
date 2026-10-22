@@ -6,7 +6,6 @@ import ast
 import asyncio
 import contextlib
 import hashlib
-import importlib
 import inspect
 import io
 import json
@@ -32,21 +31,18 @@ import pytest
 
 import flash.engine.plan.steps as plan_steps
 import flash.engine.worker.train.entry.rl_train_runner as rl_runner
+import flash.engine.worker.train.rl.child.reward as rl_reward
 import flash.engine.worker.train.rl.launch.config as worker_config
 import flash.engine.worker.train.rl.launch.inputs as rl_inputs
 import flash.engine.worker.train.rl.launch.verl_config as rl_verl
 import flash.engine.worker.train.rl.rollout.multi_turn as rl_multi
-import flash.engine.worker.train.rl.rollout.reward_module as rl_reward
 import flash.engine.worker.train.rl.rollout.single_turn as rl_single
 from flash.core.grpo import SUPPORTED_GRPO_GROUP_SIZES
 from flash.engine.worker.entry import rl
 from flash.engine.worker.io.heartbeat import RewardObservabilityBuffer
-from flash.engine.worker.train.core.child import runtime as child_runtime
-from flash.engine.worker.train.core.child import runtime as verl_child_runtime
+from flash.engine.worker.train.core.child import model as verl_child_runtime
 from flash.engine.worker.train.entry import backend_common, rl_train, sft_train
 from flash.engine.worker.train.rl.child import multiturn as grpo_multiturn
-from flash.engine.worker.train.rl.child import patches as verl_patches
-from flash.engine.worker.train.rl.child import plugin as grpo_plugin
 
 
 # ------------------------------- dispatch -------------------------------
@@ -352,175 +348,6 @@ def _module_scope_imports(source: str) -> set[str]:
     return names
 
 
-def test_no_grpo_plugin_module_imports_cuda_sensitive_packages_at_module_scope():
-    """the regression barrier for the multi-gpu rank-to-device collapse.
-
-    verl loads its external plugin before ray narrows each actor's CUDA visibility. Importing torch,
-    verl, or vllm from plugin module scope can initialize cuda against the full device list and leave
-    every rank on device zero. Installers may import those packages only after the deferred target has
-    completed its real import under the actor's pinned environment.
-    """
-    sources = {
-        "runtime": inspect.getsource(child_runtime),
-        "patches": inspect.getsource(verl_patches),
-        "plugin": inspect.getsource(grpo_plugin),
-    }
-    offenders = {
-        name: sorted(_module_scope_imports(source) & {"torch", "verl", "vllm"})
-        for name, source in sources.items()
-    }
-    assert {name: imports for name, imports in offenders.items() if imports} == {}
-
-
-def _clear_deferred_target(target: str) -> None:
-    sys.modules.pop(target, None)
-    finder = child_runtime._DEFERRED_FINDER
-    finder.pending.pop(target, None)
-    finder.active_targets.discard(target)
-    # the shared finder stays installed while any other target is still armed.
-    if not finder.pending:
-        finder.uninstall()
-
-
-def test_a_deferred_fragment_records_its_marker_only_once_the_patch_applies(tmp_path, monkeypatch):
-    """the marker must mean patched, not merely queued."""
-    target = "flash_marker_probe"
-    markers = tmp_path / "applied_shims.txt"
-    (tmp_path / f"{target}.py").write_text("PATCHED = False\n")
-    monkeypatch.syspath_prepend(str(tmp_path))
-    _clear_deferred_target(target)
-
-    try:
-        child_runtime._arm_deferred(
-            name="probe-fragment",
-            marker_file=str(markers),
-            target=target,
-            patch=lambda module: setattr(module, "PATCHED", True),
-            required=True,
-        )
-        assert backend_common.read_applied_shim_markers(str(markers)) == set()
-        with pytest.raises(RuntimeError, match="never proved these required runtime patches"):
-            backend_common.verify_applied_shim_markers(str(markers), ["probe-fragment"])
-
-        imported = importlib.import_module(target)
-
-        assert imported.PATCHED is True
-        assert backend_common.read_applied_shim_markers(str(markers)) == {"probe-fragment"}
-        backend_common.verify_applied_shim_markers(str(markers), ["probe-fragment"])
-        assert markers.read_text().count("probe-fragment") == 1
-    finally:
-        _clear_deferred_target(target)
-
-
-def test_every_required_grpo_patch_is_registered_deferred(monkeypatch, tmp_path):
-    """the external plugin may queue required patches but must not execute them while verl imports."""
-    config = {
-        "marker_file": str(tmp_path / "markers"),
-        "dp_cards": 2,
-        "reentrant_checkpointing": True,
-        "multimodal": True,
-        "per_turn_credit": True,
-        "stop_sequences": ["</answer>"],
-        "image_pad_token_id": 151655,
-        "structured_outputs": {"json": {"type": "object"}},
-        "save_at_steps": [3],
-        "total_steps": 10,
-        "kl_ref_adapter": True,
-        "multi_turn": True,
-        "gdn_model_type": None,
-        "wandb": False,
-    }
-    registered = []
-
-    def register(name, marker_file, target, installer, *args, **kwargs):
-        registered.append((name, marker_file, target, installer, args, kwargs))
-
-    monkeypatch.setattr(child_runtime, "load_plugin_config_file", lambda _name: config)
-    monkeypatch.setattr(child_runtime, "install_deferred_required", register)
-    monkeypatch.setattr(child_runtime, "install_deferred_lora_rollout_guard", lambda _path: None)
-
-    grpo_plugin.install()
-
-    assert registered.pop(0)[:3] == (
-        "compact-checkpoint",
-        config["marker_file"],
-        "verl.utils.checkpoint.fsdp_checkpoint_manager",
-    )
-    assert [entry[0] for entry in registered] == [
-        "rank-device-assert",
-        "nonempty-response-mask",
-        "exact-rollout-identity",
-        "reentrant-checkpointing",
-        "per-turn-credit",
-        "stop-sequences",
-        "image-pad-ban",
-        "structured-outputs",
-        "exact-save-steps",
-        "kl-ref-adapter",
-        "multi-turn-loop",
-    ]
-    assert registered[0][2] == "verl.single_controller.base.worker"
-    assert registered[1][2] == "verl.trainer.ppo.rollout_corr_helper"
-    assert registered[1][3] is verl_patches.install_nonempty_response_mask
-    assert [entry[2] for entry in registered[5:8]] == [
-        "verl.experimental.agent_loop.agent_loop",
-        "verl.experimental.agent_loop.agent_loop",
-        "verl.experimental.agent_loop.agent_loop",
-    ]
-    assert not Path(config["marker_file"]).exists()
-
-
-def test_parent_and_child_share_required_patch_registry(monkeypatch, tmp_path):
-    config = {
-        "marker_file": str(tmp_path / "markers"),
-        "dp_cards": 2,
-        "reentrant_checkpointing": False,
-        "multimodal": False,
-        "per_turn_credit": False,
-        "stop_sequences": [],
-        "image_pad_token_id": None,
-        "structured_outputs": None,
-        "save_at_steps": [],
-        "total_steps": 10,
-        "kl_ref_adapter": False,
-        "multi_turn": True,
-        "gdn_model_type": "qwen3_5",
-        "wandb": False,
-    }
-    installed = []
-
-    def deferred(name, _marker_file, _target, _installer, *args, **_kwargs):
-        installed.append(name)
-
-    monkeypatch.setattr(child_runtime, "load_plugin_config_file", lambda _name: config)
-    monkeypatch.setattr(child_runtime, "install_deferred_required", deferred)
-    monkeypatch.setattr(
-        child_runtime,
-        "install_deferred_lora_rollout_guard",
-        lambda _marker_file: installed.append(child_runtime.LORA_ROLLOUT_GUARD_SHIM),
-    )
-    monkeypatch.setattr(
-        child_runtime,
-        "install_deferred_gdn",
-        lambda model_type, _marker_file: installed.append(
-            "gdn-varlen" if model_type == "qwen3_5" else "wrong-gdn"
-        ),
-    )
-
-    grpo_plugin.install()
-
-    expected = grpo_plugin.required_patch_names(config)
-    assert installed == ["compact-checkpoint", *expected]
-    assert expected == [
-        "rank-device-assert",
-        "nonempty-response-mask",
-        "exact-rollout-identity",
-        "multi-turn-loop",
-        "lora-rollout-guard",
-        "gdn-varlen",
-    ]
-
-
 def _truncated_thinking_response_mask(monkeypatch):
     monkeypatch.setenv("FLASH_VERL_MULTITURN_URL", "http://bridge.invalid")
     monkeypatch.setenv("FLASH_VERL_MAX_TURNS", "1")
@@ -580,361 +407,6 @@ def _install_rollout_corr_test_module(monkeypatch, original):
     }.items():
         monkeypatch.setitem(sys.modules, name, module)
     return helper
-
-
-def test_nonempty_response_mask_guard_blocks_the_all_empty_batch_before_verl(monkeypatch):
-    calls = []
-
-    def poison_original(*args, **kwargs):
-        calls.append((args, kwargs))
-        raise AssertionError("poison original was called")
-
-    helper = _install_rollout_corr_test_module(monkeypatch, poison_original)
-    _, _, _, empty = _truncated_thinking_response_mask(monkeypatch)
-    batch = SimpleNamespace(batch={"response_mask": np.stack([empty, empty])})
-    verl_patches.install_nonempty_response_mask()
-
-    with pytest.raises(RuntimeError) as exc_info:
-        helper.compute_rollout_correction_and_add_to_batch(batch, {"rollout_is": "token"})
-
-    assert str(exc_info.value) == (
-        "flash: no trainable response tokens remain in this batch: every rollout was truncated or "
-        "unusable, so no optimizer update will run. increase train.max_completion_tokens or disable "
-        "thinking. child context: FLASH_VERL_THINKING=1, "
-        "FLASH_VERL_MAX_COMPLETION_TOKENS=32."
-    )
-    assert calls == []
-
-
-def test_nonempty_response_mask_guard_delegates_a_mixed_batch_exactly_once(monkeypatch):
-    calls = []
-    sentinel = object()
-
-    def original(batch, rollout_corr_config):
-        calls.append((batch, rollout_corr_config))
-        return sentinel
-
-    helper = _install_rollout_corr_test_module(monkeypatch, original)
-    _, _, _, empty = _truncated_thinking_response_mask(monkeypatch)
-    mixed = np.stack([empty, empty.copy()])
-    mixed[1, 31] = 1
-    batch = SimpleNamespace(batch={"response_mask": mixed})
-    config = {"rollout_is": "token"}
-    verl_patches.install_nonempty_response_mask()
-
-    result = helper.compute_rollout_correction_and_add_to_batch(batch, config)
-
-    assert result is sentinel
-    assert calls == [(batch, config)]
-
-
-def test_nonempty_response_mask_installer_is_idempotent(monkeypatch):
-    helper = _install_rollout_corr_test_module(monkeypatch, lambda batch, config: (batch, config))
-
-    verl_patches.install_nonempty_response_mask()
-    installed = helper.compute_rollout_correction_and_add_to_batch
-    verl_patches.install_nonempty_response_mask()
-
-    assert helper.compute_rollout_correction_and_add_to_batch is installed
-    assert installed._flash_nonempty_response_mask is True
-
-
-def test_nonempty_response_mask_patch_is_required_and_marker_wired(monkeypatch, tmp_path):
-    config = {
-        "marker_file": str(tmp_path / "markers"),
-        "dp_cards": 1,
-        "total_steps": 1,
-    }
-    registered = []
-
-    def register(name, marker_file, target, installer, *args, **kwargs):
-        registered.append((name, marker_file, target, installer, args, kwargs))
-
-    monkeypatch.setattr(child_runtime, "load_plugin_config_file", lambda _name: config)
-    monkeypatch.setattr(child_runtime, "install_deferred_required", register)
-    monkeypatch.setattr(child_runtime, "install_deferred_lora_rollout_guard", lambda _path: None)
-
-    grpo_plugin.install()
-
-    assert registered.pop(0)[:3] == (
-        "compact-checkpoint",
-        config["marker_file"],
-        "verl.utils.checkpoint.fsdp_checkpoint_manager",
-    )
-    assert registered == [
-        (
-            "nonempty-response-mask",
-            config["marker_file"],
-            "verl.trainer.ppo.rollout_corr_helper",
-            verl_patches.install_nonempty_response_mask,
-            (),
-            {},
-        ),
-        (
-            "exact-rollout-identity",
-            config["marker_file"],
-            "verl.experimental.agent_loop.agent_loop",
-            verl_patches.install_exact_rollout_identity,
-            (),
-            {},
-        ),
-    ]
-    assert grpo_plugin.required_patch_names(config) == [
-        "nonempty-response-mask",
-        "exact-rollout-identity",
-        child_runtime.LORA_ROLLOUT_GUARD_SHIM,
-    ]
-    assert not Path(config["marker_file"]).exists()
-
-
-def test_exact_save_installer_keeps_authored_and_final_steps_and_is_idempotent(
-    monkeypatch,
-):
-    calls = []
-
-    class RayPPOTrainer:
-        def __init__(self):
-            self.global_steps = 0
-
-        def _save_checkpoint(self):
-            calls.append(self.global_steps)
-            return self.global_steps
-
-    ray_trainer = types.ModuleType("verl.trainer.ppo.ray_trainer")
-    ray_trainer.RayPPOTrainer = RayPPOTrainer
-    ppo = types.ModuleType("verl.trainer.ppo")
-    ppo.ray_trainer = ray_trainer
-    modules = {
-        "verl": types.ModuleType("verl"),
-        "verl.trainer": types.ModuleType("verl.trainer"),
-        "verl.trainer.ppo": ppo,
-        "verl.trainer.ppo.ray_trainer": ray_trainer,
-    }
-    for name, module in modules.items():
-        monkeypatch.setitem(sys.modules, name, module)
-
-    config = {"save_at_steps": (), "total_steps": 20}
-    assert "exact-save-steps" not in grpo_plugin.required_patch_names(config)
-    verl_patches.install_exact_save_steps((7, 13), 20)
-    installed = RayPPOTrainer._save_checkpoint
-    trainer = RayPPOTrainer()
-    for step in (1, 7, 10, 13, 20):
-        trainer.global_steps = step
-        trainer._save_checkpoint()
-
-    assert calls == [7, 13, 20]
-    verl_patches.install_exact_save_steps((7, 13), 20)
-    assert RayPPOTrainer._save_checkpoint is installed
-
-
-def test_the_deferred_registry_runs_patches_at_the_targets_real_import(tmp_path, monkeypatch):
-    """callbacks sharing one target run in registration order after the module finishes importing."""
-    target = "flash_defer_probe"
-    marker_file = str(tmp_path / "markers")
-    (tmp_path / f"{target}.py").write_text("VALUE = 'imported'\n")
-    monkeypatch.syspath_prepend(str(tmp_path))
-    fired = []
-    _clear_deferred_target(target)
-
-    try:
-        for name in ("first", "second"):
-            child_runtime._arm_deferred(
-                name=name,
-                marker_file=marker_file,
-                target=target,
-                patch=lambda module, patch_name=name: fired.append((patch_name, module.VALUE)),
-                required=True,
-            )
-        assert fired == []
-
-        importlib.import_module(target)
-
-        assert fired == [("first", "imported"), ("second", "imported")]
-        assert Path(marker_file).read_text().splitlines() == ["first", "second"]
-        assert target not in child_runtime._DEFERRED_FINDER.pending
-        assert child_runtime._DEFERRED_FINDER not in sys.meta_path
-    finally:
-        _clear_deferred_target(target)
-
-
-def test_a_deferred_patch_registered_after_its_target_is_imported_applies_immediately(
-    monkeypatch, tmp_path
-):
-    # ordering must not decide whether a patch happens. an imported target cannot be intercepted.
-    target = "flash_defer_present"
-    module = types.ModuleType(target)
-    fired = []
-    monkeypatch.setitem(sys.modules, target, module)
-
-    child_runtime._arm_deferred(
-        name="present",
-        marker_file=str(tmp_path / "markers"),
-        target=target,
-        patch=lambda imported: fired.append(imported),
-        required=True,
-    )
-
-    assert fired == [module]
-
-
-def test_a_deferred_body_that_raises_hard_exits_and_cannot_be_retried_around(tmp_path):
-    """a required deferred installer kills the child before an importer can retry unpatched."""
-    target = "flash_defer_boom"
-    (tmp_path / f"{target}.py").write_text("VALUE = 1\n")
-    rl_multi.copy_grpo_child_modules(str(tmp_path))
-    probe = tmp_path / "probe.py"
-    probe.write_text(
-        "import sys\n"
-        f"sys.path.insert(0, {str(tmp_path)!r})\n"
-        "import flash_verl_runtime as runtime\n"
-        "def boom():\n"
-        "    raise RuntimeError('fragment could not apply')\n"
-        f"runtime.install_deferred_required('boom-fragment', {str(tmp_path / 'markers')!r}, "
-        f"{target!r}, boom)\n"
-        "try:\n"
-        f"    import {target}\n"
-        "except BaseException:\n"
-        "    pass\n"
-        f"import {target} as retried\n"
-        "print('REACHED_RETRY', retried.VALUE)\n"
-    )
-
-    done = subprocess.run([sys.executable, str(probe)], capture_output=True, text=True, timeout=120)
-
-    assert done.returncode == backend_common.SHIM_FRAGMENT_FAILED_EXIT_CODE, done.stdout
-    assert "REACHED_RETRY" not in done.stdout
-    assert "boom-fragment" in done.stderr
-
-
-def test_the_rank_device_assert_is_inert_on_a_single_card_run(monkeypatch):
-    # one rank cannot collide with itself, so the installer must return before importing torch/verl.
-    imported = []
-    original_import = __import__
-
-    def guarded_import(name, *args, **kwargs):
-        if name.split(".")[0] in {"torch", "verl"}:
-            imported.append(name)
-            raise AssertionError(f"single-card rank check imported {name}")
-        return original_import(name, *args, **kwargs)
-
-    monkeypatch.setattr("builtins.__import__", guarded_import)
-    verl_patches.install_rank_device_assert(0)
-    verl_patches.install_rank_device_assert(1)
-    assert imported == []
-
-
-def test_the_rank_device_assert_compares_uuids_after_verls_own_init():
-    """the check runs after verl pins the worker and compares physical uuids, not ordinals."""
-    source = inspect.getsource(verl_patches.install_rank_device_assert)
-    installer = ast.parse(source).body[0]
-    wrapper = next(
-        node
-        for node in ast.walk(installer)
-        if isinstance(node, ast.FunctionDef) and node.name == "init"
-    )
-
-    def statement_calling(name: str) -> int:
-        for index, node in enumerate(wrapper.body):
-            if any(
-                isinstance(inner, ast.Call) and getattr(inner.func, "id", "") == name
-                for inner in ast.walk(node)
-            ):
-                return index
-        raise AssertionError(f"{name} is not called in rank-device init wrapper")
-
-    assert statement_calling("original_init") < statement_calling("check")
-    assert "get_device_properties" in source
-    assert "uuid" in source
-    assert "raise RuntimeError(" in source
-
-
-def _run_rank_device_check(tmp_path, monkeypatch, bindings, *, env_rank=None):
-    """run the installer once per rank against fake torch and verl modules sharing one claims file."""
-    claims = tmp_path / "rank_device_claims.txt"
-    monkeypatch.setenv("FLASH_RANK_DEVICE_CLAIMS", str(claims))
-    results = []
-    for rank, ordinal, uuid in bindings:
-        torch_stub = types.ModuleType("torch")
-        torch_stub.cuda = SimpleNamespace(
-            is_available=lambda: True,
-            current_device=lambda ordinal=ordinal: ordinal,
-            get_device_properties=lambda _o, uuid=uuid: SimpleNamespace(uuid=uuid),
-        )
-
-        class _Worker:
-            def __init__(self, rank=rank):
-                # verl's Worker.__init__ stores the rank on the instance before it returns, so the
-                # wrapper that runs after it can read the same value verl will use downstream.
-                self._rank = rank
-
-        worker_module = types.ModuleType("verl.single_controller.base.worker")
-        worker_module.Worker = _Worker
-        base = types.ModuleType("verl.single_controller.base")
-        base.worker = worker_module
-        for name, module in {
-            "torch": torch_stub,
-            "verl": types.ModuleType("verl"),
-            "verl.single_controller": types.ModuleType("verl.single_controller"),
-            "verl.single_controller.base": base,
-            "verl.single_controller.base.worker": worker_module,
-        }.items():
-            monkeypatch.setitem(sys.modules, name, module)
-        monkeypatch.setenv("RANK", str(rank if env_rank is None else env_rank))
-        monkeypatch.setenv("LOCAL_RANK", str(rank))
-        monkeypatch.setenv("CUDA_VISIBLE_DEVICES", str(ordinal))
-        verl_patches.install_rank_device_assert(len(bindings))
-        try:
-            _Worker()
-            results.append(None)
-        except RuntimeError as exc:
-            results.append(str(exc))
-    return results
-
-
-def test_the_rank_device_assert_passes_when_every_rank_opened_its_own_card(tmp_path, monkeypatch):
-    # the healthy multi-card shape: distinct uuids, so nothing is refused. both ranks report
-    # ordinal 0 because ray gave each actor its own CUDA_VISIBLE_DEVICES -- which is exactly why
-    # ordinals cannot be the thing compared.
-    errors = _run_rank_device_check(tmp_path, monkeypatch, [(0, 0, "GPU-aaaa"), (1, 0, "GPU-bbbb")])
-    assert errors == [None, None]
-
-
-def test_the_rank_device_assert_refuses_when_two_ranks_land_on_one_card(tmp_path, monkeypatch):
-    # the failure that killed 7/7 multi-gpu runs. the second rank finds rank 0's uuid already
-    # claimed and refuses, minutes before nccl would abort with a pci id and no rank mapping.
-    errors = _run_rank_device_check(tmp_path, monkeypatch, [(0, 0, "GPU-same"), (1, 0, "GPU-same")])
-    assert errors[0] is None
-    assert errors[1] is not None
-    # the message has to carry the mapping: naming the colliding ranks is the entire diagnostic
-    # value over the nccl abort it front-runs.
-    assert "GPU-same" in errors[1]
-    assert "[0, 1]" in errors[1]
-
-
-def test_the_rank_device_assert_reads_the_rank_verl_resolved_not_the_environment(
-    tmp_path, monkeypatch
-):
-    # the claims file is keyed by rank, so a rank that every actor agrees on collapses the set to
-    # one entry and the collision stops being visible. pin the source: RANK is held at 0 for both
-    # actors while the workers carry 0 and 1, and the check must still refuse.
-    errors = _run_rank_device_check(
-        tmp_path,
-        monkeypatch,
-        [(0, 0, "GPU-same"), (1, 0, "GPU-same")],
-        env_rank=0,
-    )
-    assert errors[0] is None
-    assert errors[1] is not None
-    assert "[0, 1]" in errors[1]
-
-
-def test_the_rank_device_assert_has_no_rank_zero_default_to_fall_back_on():
-    # a getenv("RANK", "0") would make an unset RANK report every actor as rank 0, which is the one
-    # value that turns this check into a no-op. verl reads os.environ["RANK"] unconditionally in the
-    # same __init__, so an absent RANK is already fatal there -- this keeps it fatal here too.
-    source = inspect.getsource(verl_patches.install_rank_device_assert)
-    assert 'environ.get("RANK"' not in source
-    assert 'environ["RANK"]' in source
 
 
 def test_multimodal_rows_match_verl_placeholder_assertion():
@@ -1233,6 +705,13 @@ def _overrides_cfg(**over):
     }
     cfg.update(over)
     return cfg
+
+
+def test_grpo_bounds_transfer_queue_storage_to_the_single_node_cpu_budget():
+    overrides = dict(
+        value.split("=", 1) for value in rl_verl.build_verl_overrides(_overrides_cfg())
+    )
+    assert overrides["transfer_queue.backend.SimpleStorage.num_data_storage_units"] == "1"
 
 
 def test_build_verl_overrides_enables_layered_summon_for_fused_expert_targets():
@@ -1585,10 +1064,10 @@ def test_one_optimizer_step_consumes_exactly_the_requested_unique_prompts():
         assert f"actor_rollout_ref.rollout.n={group}" in o
 
 
-def test_build_verl_overrides_sets_truncation_mask_when_enabled():
+def test_truncation_policy_is_not_an_upstream_hydra_override():
     o = rl_verl.build_verl_overrides(_overrides_cfg(mask_truncated_completions=True))
-    # `++` (append-or-override), because the key exists in the fork's rollout.yaml but not stock's.
-    assert "++actor_rollout_ref.rollout.mask_truncated_completions=true" in o
+    # the packaged agent consumes this policy from the Flash launch JSON.
+    assert not any("mask_truncated_completions" in override for override in o)
 
 
 def test_build_verl_overrides_omits_truncation_mask_when_disabled():
@@ -2529,7 +2008,14 @@ def _rendered_reward_namespace(url_env="FLASH_VERL_REWARD_URL"):
     sys.modules["flash_grpo_multiturn"] = grpo_multiturn
     try:
         namespace: dict = {}
-        exec(compile(rl_reward.render_reward_module(url_env), "<reward>", "exec"), namespace)
+        exec(
+            compile(
+                inspect.getsource(rl_reward).replace("FLASH_VERL_REWARD_URL", url_env),
+                "<reward>",
+                "exec",
+            ),
+            namespace,
+        )
         return namespace
     finally:
         if previous is None:
@@ -2539,10 +2025,10 @@ def _rendered_reward_namespace(url_env="FLASH_VERL_REWARD_URL"):
 
 
 def test_render_reward_module_is_valid_and_defines_compute_score():
-    src = rl_reward.render_reward_module()
+    src = inspect.getsource(rl_reward)
     ns = _rendered_reward_namespace()
     assert callable(ns["compute_score"])
-    assert "from flash_grpo_multiturn import post_json" in src
+    assert "from flash.engine.worker.train.rl.child.multiturn import post_json" in src
     assert "urllib" not in src
 
 
@@ -2621,7 +2107,7 @@ def test_a_slow_env_call_is_not_cut_off_by_a_client_deadline(monkeypatch):
             return real_urlopen(req)
 
         monkeypatch.setattr(grpo_multiturn.urllib.request, "urlopen", urlopen_recording_deadline)
-        ns["_URL"] = url
+        monkeypatch.setenv("TEST_URL", url)
         assert (
             ns["compute_score"](
                 "env",
@@ -2645,7 +2131,7 @@ def test_a_slow_env_call_is_not_cut_off_by_a_client_deadline(monkeypatch):
         server.shutdown()
 
 
-def test_concurrent_scorers_are_serialized_for_the_env():
+def test_concurrent_scorers_are_serialized_for_the_env(monkeypatch):
     # a flash env is a plain python object with no concurrency contract; the retired trl path only
     # ever called it from one thread. verl's reward workers do not, so the server must impose it.
     import concurrent.futures
@@ -2666,7 +2152,7 @@ def test_concurrent_scorers_are_serialized_for_the_env():
     server, url = rl_multi.start_reward_server(score, example_count=8)
     try:
         ns = _rendered_reward_namespace("TEST_URL")
-        ns["_URL"] = url
+        monkeypatch.setenv("TEST_URL", url)
         with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
             results = list(
                 pool.map(
@@ -3664,165 +3150,6 @@ def _stubbed_modules(stubs: dict[str, types.ModuleType]):
                 sys.modules[name] = value
 
 
-def test_the_reentrant_shim_flips_the_flag_and_leaves_uncheckpointed_models_alone():
-    # execute the rendered source against a stand-in engine: asserting on the string alone would not
-    # catch a patch that never runs, or one that turns checkpointing ON for a model verl left off.
-    class _Cfg:
-        def __init__(self, on):
-            self.enable_gradient_checkpointing = on
-
-    class _Module:
-        def __init__(self):
-            self.kwargs = None
-            self.input_grads = False
-
-        def enable_input_require_grads(self):
-            self.input_grads = True
-
-        def gradient_checkpointing_enable(self, gradient_checkpointing_kwargs=None):
-            self.kwargs = gradient_checkpointing_kwargs
-
-    class _Engine:
-        def __init__(self, on):
-            self.model_config = _Cfg(on)
-            self.module = _Module()
-
-        def _build_module(self):
-            return self.module
-
-    module_stub = types.ModuleType("verl.workers.engine.fsdp.transformer_impl")
-    module_stub.FSDPEngine = _Engine
-    parents = [
-        "verl",
-        "verl.workers",
-        "verl.workers.engine",
-        "verl.workers.engine.fsdp",
-    ]
-    stubs = {name: types.ModuleType(name) for name in parents}
-    stubs[module_stub.__name__] = module_stub
-    with _stubbed_modules(stubs):
-        verl_patches.install_reentrant_checkpointing(multimodal=False)
-        # checkpointing on -> the flag is put back to reentrant, and the lora-frozen embeddings
-        # get input grads so the checkpointed segment actually produces a backward (GRAD-001)
-        engine = _Engine(True)
-        built = engine._build_module()
-        assert built.kwargs == {"use_reentrant": True}
-        assert built.input_grads is True
-        # checkpointing off -> untouched, so the shim cannot silently raise the memory profile
-        off = _Engine(False)
-        off_built = off._build_module()
-        assert off_built.kwargs is None
-        assert off_built.input_grads is False
-
-
-def test_image_pad_ban_and_stop_shims_both_apply_to_the_same_method():
-    # both wrap AgentLoopWorker._run_agent_loop. each guards itself with its own marker attribute,
-    # and a shared marker would make whichever ran second silently no-op -- leaving either stop
-    # strings or the image-pad ban missing with no error. executing both is the only way to catch
-    # that: the sources look correct in isolation either way.
-    import asyncio
-    from types import ModuleType
-
-    seen: dict = {}
-
-    class _AgentLoopWorker:
-        async def _run_agent_loop(self, sampling_params, *args, **kwargs):
-            seen.update(sampling_params)
-            return "ok"
-
-    # both shims import the same verl module; hand them one stub so the two patches stack on the
-    # very same function object, exactly as they do in the child.
-    agent_loop_module = ModuleType("verl.experimental.agent_loop.agent_loop")
-    agent_loop_module.AgentLoopWorker = _AgentLoopWorker
-    package = ModuleType("verl.experimental.agent_loop")
-    package.agent_loop = agent_loop_module
-    stubs = {
-        "verl": ModuleType("verl"),
-        "verl.experimental": ModuleType("verl.experimental"),
-        "verl.experimental.agent_loop": package,
-        "verl.experimental.agent_loop.agent_loop": agent_loop_module,
-    }
-    with _stubbed_modules(stubs):
-        verl_patches.install_stop_sequences(("</answer>",))
-        verl_patches.install_image_pad_ban(151655)
-        asyncio.run(_AgentLoopWorker()._run_agent_loop({"temperature": 1.0}))
-
-    assert seen["stop"] == ["</answer>"]
-    assert seen["logit_bias"] == {151655: -100.0}
-    # the untouched key proves each patch COPIED the dict rather than replacing it wholesale.
-    assert seen["temperature"] == 1.0
-
-
-def test_rollout_shims_survive_verls_real_run_agent_loop_signature():
-    """the shims must tolerate the signature verl ACTUALLY calls, not a convenient stub.
-
-    At freesolo-co/verl@32d6200d, ``trajectory`` is positional and required ``agent_name`` is
-    keyword-only; the wrapper must also preserve ``**kwargs``.
-    """
-    import asyncio
-    from types import ModuleType
-
-    seen: dict = {}
-
-    class _AgentLoopWorker:
-        async def _run_agent_loop(
-            self, sampling_params, trajectory, *, agent_name, trace=True, **kwargs
-        ):
-            seen["params"] = dict(sampling_params)
-            seen["trajectory"] = trajectory
-            seen["agent_name"] = agent_name
-            seen["trace"] = trace
-            return "ok"
-
-    agent_loop_module = ModuleType("verl.experimental.agent_loop.agent_loop")
-    agent_loop_module.AgentLoopWorker = _AgentLoopWorker
-    package = ModuleType("verl.experimental.agent_loop")
-    package.agent_loop = agent_loop_module
-
-    # vllm is a worker-image dep too. stand in a recorder so the assertion below can prove the
-    # constraint was WRAPPED: vllm accepts a raw dict, passes _verify_args(), then constrains
-    # nothing -- silently, which is the whole reason render_structured_outputs_shim wraps it.
-    class _StructuredOutputsParams:
-        def __init__(self, **kwargs):
-            self.kwargs = kwargs
-
-    sampling_params_module = ModuleType("vllm.sampling_params")
-    sampling_params_module.StructuredOutputsParams = _StructuredOutputsParams
-    vllm_module = ModuleType("vllm")
-    vllm_module.sampling_params = sampling_params_module
-
-    stubs = {
-        "verl": ModuleType("verl"),
-        "verl.experimental": ModuleType("verl.experimental"),
-        "verl.experimental.agent_loop": package,
-        "verl.experimental.agent_loop.agent_loop": agent_loop_module,
-        "vllm": vllm_module,
-        "vllm.sampling_params": sampling_params_module,
-    }
-    with _stubbed_modules(stubs):
-        verl_patches.install_stop_sequences(("</answer>",))
-        verl_patches.install_image_pad_ban(151655)
-        verl_patches.install_structured_outputs({"json": {"type": "object"}})
-        # called exactly as verl calls it (agent_loop.py:583): two positionals plus keywords.
-        asyncio.run(
-            _AgentLoopWorker()._run_agent_loop(
-                {"temperature": 1.0}, {"step": 0}, agent_name="tool_agent", trace=False
-            )
-        )
-
-    # the arguments the shims do not own must arrive untouched.
-    assert seen["trajectory"] == {"step": 0}
-    assert seen["agent_name"] == "tool_agent"
-    assert seen["trace"] is False
-    assert seen["params"]["temperature"] == 1.0
-    # and all three shims still applied.
-    assert seen["params"]["stop"] == ["</answer>"]
-    assert seen["params"]["logit_bias"] == {151655: -100.0}
-    constraint = seen["params"]["structured_outputs"]
-    assert isinstance(constraint, _StructuredOutputsParams)
-    assert constraint.kwargs == {"json": {"type": "object"}}
-
-
 def test_stop_sequences_gate_off_truncated_completion_masking():
     # main couples these: stop-string rollouts do not end on EOS, so masking truncated completions
     # would wrongly drop every one of them. the verl resolver must inherit that coupling, not
@@ -3865,8 +3192,16 @@ def _load_kl_ref_engine():
         "verl.workers.engine.fsdp.transformer_impl": impl,
     }
     with _stubbed_modules(stubs):
-        verl_patches.install_kl_ref_adapter()
-    return impl.FSDPEngine
+        from flash.engine.worker.train.core.child.reference import snapshot, use_ref_adapter
+
+        class ReferenceEngine(_FSDPEngine):
+            def _build_lora_module(self, module):
+                return snapshot(super()._build_lora_module(module))
+
+            def disable_adapter(self):
+                return use_ref_adapter(self.module)
+
+    return ReferenceEngine
 
 
 def test_kl_ref_adapter_shim_anchors_the_reference_to_the_warm_start_adapter():
@@ -3961,8 +3296,11 @@ def test_kl_ref_adapter_shim_refuses_to_run_without_a_snapshot():
             super().__init__()
             self.peft_config = {"default": SimpleNamespace(r=4)}
 
-    with pytest.raises(RuntimeError, match="flash kl reference adapter missing"):
-        engine_cls(_NoSnapshot()).disable_adapter()
+    with (
+        pytest.raises(RuntimeError, match="flash kl reference adapter missing"),
+        engine_cls(_NoSnapshot()).disable_adapter(),
+    ):
+        pass
 
 
 def test_reasoning_parser_override_needs_both_thinking_and_a_constraint():
@@ -4899,12 +4237,6 @@ def test_multi_turn_child_env_carries_every_variable_the_loop_reads():
     )
 
 
-def test_grpo_child_environment_registers_exactly_one_plugin():
-    source = inspect.getsource(rl_runner._build_rl_child_env)
-    assert 'env_for_verl["VERL_USE_EXTERNAL_MODULES"] = "flash_grpo_plugin"' in source
-    assert "flash_grpo_plugin.py" in {flat for _, flat in rl_multi.GRPO_CHILD_MODULES}
-
-
 def test_multi_turn_child_env_serializes_values_the_child_can_parse_back():
     # every value crosses as a string. the child json-loads two of them and int()s two others, so a
     # repr() or a str(frozenset) here would raise mid-rollout rather than at launch.
@@ -4928,55 +4260,29 @@ def test_multi_turn_child_env_serializes_values_the_child_can_parse_back():
     )
 
 
-def test_multi_turn_child_modules_are_copied_under_the_names_they_import_each_other_by(tmp_path):
-    # each module falls back to a flat `flash_`-prefixed import of the next one. copying a file
-    # under the wrong name leaves that fallback unresolvable, and the child's ImportError arrives
-    # inside verl's plugin loader where it reads as a verl problem.
-    written = rl_multi.copy_grpo_child_modules(str(tmp_path))
-    names = {os.path.basename(path) for path in written}
-    assert names == {name for _, name in rl_multi.GRPO_CHILD_MODULES}
-    imported = set()
-    for path in written:
-        source = Path(path).read_text()
-        assert source
-        # every copy must parse standalone in the child interpreter.
-        ast.parse(source)
-        imported |= set(re.findall(r"from (flash_[a-z_]+) import", source))
-    imported |= set(re.findall(r"from (flash_[a-z_]+) import", rl_reward.render_reward_module()))
-    # every flat import target, including the generated reward module's transport, must be copied.
-    assert imported <= {name.removesuffix(".py") for name in names}
-
-
-def test_grpo_child_modules_do_not_fall_back_to_flash_in_the_isolated_child(tmp_path):
-    for path in rl_multi.copy_grpo_child_modules(str(tmp_path)):
-        source = Path(path).read_text()
-        assert "except ImportError" not in source or "from flash." not in source
-        ast.parse(source)
-
-
 def test_the_shared_builder_is_the_sole_owner_of_the_grpo_child_path(
     worker_context, monkeypatch, tmp_path
 ):
     sentinel_path = "shared-builder-pythonpath"
     calls = []
 
-    def build_child_env(*, shim_dir, wandb_enabled, context=None, **_context):
-        calls.append((shim_dir, wandb_enabled))
+    def build_child_env(*, wandb_enabled, context):
+        calls.append(wandb_enabled)
         return {"PYTHONPATH": sentinel_path}
 
     monkeypatch.setattr(rl_runner, "_build_verl_child_env", build_child_env)
     files = {
-        "shim_dir": str(tmp_path),
+        "runtime_dir": str(tmp_path),
         "rank_device_claims": str(tmp_path / "rank_device_claims.txt"),
-        "plugin_config_path": str(tmp_path / "flash_grpo_plugin_config.json"),
+        "launch_config_path": str(tmp_path / "flash_grpo_launch_config.json"),
     }
     child = rl_runner._build_rl_child_env(
         {"multi_turn": False}, files, [], "http://127.0.0.1:9/", context=worker_context
     )
 
-    assert calls == [(str(tmp_path), False)]
+    assert calls == [False]
     assert child["PYTHONPATH"] == sentinel_path
-    assert child["FLASH_GRPO_PLUGIN_CONFIG_PATH"] == files["plugin_config_path"]
+    assert "FLASH_GRPO_PLUGIN_CONFIG_PATH" not in child
 
 
 # ---------------------- multi-turn per-turn generation cap ----------------------
@@ -7374,9 +6680,9 @@ def _run_per_turn_shim(rows, uids, episode_advantages, response_mask=None):
         "verl.trainer.ppo.ray_trainer": ray_trainer,
     }
     with _stubbed_modules(stubs):
-        verl_patches.install_per_turn_credit()
-        # call the module global by name, exactly as ray_trainer.fit does at its call site.
-        out = ray_trainer.compute_advantage(data, adv_estimator="grpo")
+        from flash.engine.worker.train.rl.child.credit import apply_per_turn_credit
+
+        out = apply_per_turn_credit(data)
     return out.batch["advantages"]
 
 
@@ -7532,8 +6838,9 @@ def test_per_turn_credit_shim_passes_through_a_batch_without_per_turn_metadata()
         "verl.trainer.ppo.ray_trainer": ray_trainer,
     }
     with _stubbed_modules(stubs):
-        verl_patches.install_per_turn_credit()
-        out = ray_trainer.compute_advantage(data, adv_estimator="grpo")
+        from flash.engine.worker.train.rl.child.credit import apply_per_turn_credit
+
+        out = apply_per_turn_credit(data)
     assert torch.equal(out.batch["advantages"], episode)
 
 
@@ -7543,7 +6850,7 @@ def test_per_turn_credit_is_resolved_only_for_multi_turn_and_reaches_the_bridge(
     source = inspect.getsource(rl_inputs._resolve_grpo_inputs)
     assert "not supported for multi-turn environments" not in source
     assert '"per_turn_credit": per_turn_credit' in source
-    plugin_source = inspect.getsource(rl_runner._write_rl_plugin_config)
+    plugin_source = inspect.getsource(rl_runner._write_rl_launch_config)
     reward_source = inspect.getsource(rl_runner._start_reward_runtime)
     assert '"per_turn_credit": bool(inp["per_turn_credit"])' in plugin_source
     assert 'per_turn_credit=bool(inp["per_turn_credit"])' in reward_source
@@ -7712,7 +7019,10 @@ def _drive_multi_turn_episode(
                 return {"images": decode_image_descriptors(descriptors, None)}
             return dict(multi_modal_data or {})
 
-        async def apply_chat_template(self, messages, **kwargs):
+        def _assert_mm_supported(self, has_media):
+            pass
+
+        async def ct_build_initial_tokens(self, messages, **kwargs):
             return [1, 2, 3]
 
         async def generate(
@@ -8100,9 +7410,7 @@ def test_the_verl_child_allowlist_keeps_the_kernel_choice_but_drops_credentials(
     try:
         os.environ.update(keep)
         os.environ.update(drop)
-        child = _build_verl_child_env(
-            shim_dir=str(tmp_path), wandb_enabled=False, context=worker_context
-        )
+        child = _build_verl_child_env(wandb_enabled=False, context=worker_context)
     finally:
         for key, value in saved.items():
             if value is None:
@@ -8134,9 +7442,9 @@ def test_grpo_final_driver_env_scrubs_declared_prefixed_secrets_before_ray(
     monkeypatch.setenv("FLA_TILELANG", "0")
     monkeypatch.setenv("WANDB_MODE", "offline")
     files = {
-        "shim_dir": str(tmp_path),
+        "runtime_dir": str(tmp_path),
         "rank_device_claims": str(tmp_path / "rank-device-claims"),
-        "plugin_config_path": str(tmp_path / "plugin-config.json"),
+        "launch_config_path": str(tmp_path / "plugin-config.json"),
     }
     child = rl_runner._build_rl_child_env(
         {"multi_turn": False}, files, ["wandb"], "http://127.0.0.1:9/", context=worker_context
@@ -8145,15 +7453,15 @@ def test_grpo_final_driver_env_scrubs_declared_prefixed_secrets_before_ray(
     for name in declared:
         if name not in {"PYTHONPATH", "WANDB_API_KEY"}:
             assert name not in child
-    assert child["PYTHONPATH"] == files["shim_dir"]
+    assert child["PYTHONPATH"] == str(Path(__file__).resolve().parents[1])
     assert SECRET_ENV_KEYS_ENV not in child
     assert "WANDB_API_KEY" in child
     assert child["WANDB_MODE"] == "offline"
     assert child["CUDA_VISIBLE_DEVICES"] == "0,1"
     assert child["FLA_TILELANG"] == "0"
     assert child["FLASH_VERL_REWARD_URL"] == "http://127.0.0.1:9/"
-    assert child["VERL_USE_EXTERNAL_MODULES"] == "flash_grpo_plugin"
-    assert child["FLASH_GRPO_PLUGIN_CONFIG_PATH"] == files["plugin_config_path"]
+    assert "VERL_USE_EXTERNAL_MODULES" not in child
+    assert "FLASH_GRPO_PLUGIN_CONFIG_PATH" not in child
     assert child["FLASH_RANK_DEVICE_CLAIMS"] == files["rank_device_claims"]
 
     captured = {}
@@ -8196,6 +7504,7 @@ def test_grpo_final_driver_env_scrubs_declared_prefixed_secrets_before_ray(
             # this test is about the child env, but the process census still needs the step count
             # it validates against; the production caller always supplies a fully resolved inp.
             inp={"steps": 1},
+            files={"launch_config_path": "/tmp/launch.json"},
             state=rl_runner._StepMetricState(),
             reward_runtime=reward_runtime,
             _reward_observability=dict,
@@ -8204,7 +7513,7 @@ def test_grpo_final_driver_env_scrubs_declared_prefixed_secrets_before_ray(
         == 0
     )
     assert captured["popen_env"] is child
-    assert captured["popen_env"]["PYTHONPATH"] == files["shim_dir"]
+    assert captured["popen_env"]["PYTHONPATH"] == str(Path(__file__).resolve().parents[1])
     assert captured["stream_proc"] is process
 
 
@@ -8243,62 +7552,16 @@ def test_grpo_finalization_carries_the_completed_step():
 
 def _shim_files(tmp_path):
     return {
-        "shim_dir": str(tmp_path),
+        "runtime_dir": str(tmp_path),
         "shim_py": str(tmp_path / "sitecustomize.py"),
-        "shim_markers": str(tmp_path / "applied_shims.txt"),
+        "readiness_path": str(tmp_path / "applied_shims.txt"),
         "rank_device_claims": str(tmp_path / "rank_device_claims.txt"),
-        "plugin_config_path": str(tmp_path / "flash_grpo_plugin_config.json"),
+        "launch_config_path": str(tmp_path / "flash_grpo_launch_config.json"),
         "multi_turn": False,
     }
 
 
-def test_write_rl_shim_copies_plugin_bundle_and_serializes_expected_markers(tmp_path):
-    files = _shim_files(tmp_path)
-    inp = {
-        "model_id": "Qwen/Qwen3.5-9B",
-        # one card: the rank/device assertion renders empty, so it owes no marker here. the
-        # multi-card case is pinned by the test below.
-        "dp_cards": 1,
-        "reentrant_checkpointing": True,
-        "multimodal": False,
-        "per_turn_credit": False,
-        "stop_sequences": ("</answer>",),
-        "image_pad_token_id": None,
-        "structured_outputs": None,
-        "save_at_steps": (7,),
-        "steps": 20,
-        "warmstart_adapter": "adapter",
-        "kl_coef": 0.04,
-        "multi_turn": False,
-    }
-    rl_runner._write_rl_shim(inp, files)
-    rl_runner._write_rl_plugin_config(inp, files, gdn_reset_arch=None, loggers=[])
-
-    assert files["expected_shims"] == [
-        "nonempty-response-mask",
-        "exact-rollout-identity",
-        "reentrant-checkpointing",
-        "text-lora-targeting",
-        "stop-sequences",
-        "exact-save-steps",
-        "kl-ref-adapter",
-        "lora-rollout-guard",
-    ]
-    source = Path(files["shim_py"]).read_text()
-    compile(source, "sitecustomize.py", "exec")
-    assert "tilelang libcudart" in source
-    assert "import verl" not in source
-    assert (tmp_path / "flash_grpo_plugin.py").is_file()
-    assert (tmp_path / "flash_grpo_patches.py").is_file()
-    assert (tmp_path / "flash_verl_runtime.py").is_file()
-    config = json.loads(Path(files["plugin_config_path"]).read_text())
-    assert files["expected_shims"] == grpo_plugin.required_patch_names(config)
-    assert config["gdn_model_type"] is None
-    assert config["lora_language_prefix"] == "model.language_model"
-    assert config["kl_ref_adapter"] is True
-
-
-def test_plugin_config_puts_the_rank_device_assert_first_when_the_run_spans_cards(tmp_path):
+def test_launch_config_puts_the_rank_device_assert_first_when_the_run_spans_cards(tmp_path):
     files = _shim_files(tmp_path)
     inp = {
         "model_id": "Qwen/Qwen3.5-9B",
@@ -8306,6 +7569,7 @@ def test_plugin_config_puts_the_rank_device_assert_first_when_the_run_spans_card
         "reentrant_checkpointing": True,
         "multimodal": False,
         "per_turn_credit": False,
+        "mask_truncated_completions": True,
         "stop_sequences": (),
         "image_pad_token_id": None,
         "structured_outputs": None,
@@ -8315,29 +7579,12 @@ def test_plugin_config_puts_the_rank_device_assert_first_when_the_run_spans_card
         "kl_coef": 0.0,
         "multi_turn": False,
     }
-    rl_runner._write_rl_plugin_config(inp, files, gdn_reset_arch=None, loggers=[])
+    rl_runner._write_rl_launch_config(inp, files, gdn_reset_arch=None, loggers=[])
 
-    assert files["expected_shims"] == [
-        "rank-device-assert",
-        "nonempty-response-mask",
-        "exact-rollout-identity",
-        "reentrant-checkpointing",
-        "text-lora-targeting",
-        "lora-rollout-guard",
-    ]
-    config = json.loads(Path(files["plugin_config_path"]).read_text())
+    assert files["expected_components"] == ("runtime-ready",)
+    config = json.loads(Path(files["launch_config_path"]).read_text())
     assert config["dp_cards"] == 2
-
-
-def test_gdn_model_type_is_serialized_only_after_capability_resolution():
-    configure_source = inspect.getsource(rl_train._configure_rl_child)
-    config_source = inspect.getsource(rl_runner._write_rl_plugin_config)
-    registry_source = inspect.getsource(grpo_plugin.required_patch_specs)
-    assert "require_gdn_boundary_resets(caps, gdn_module)" in configure_source
-    assert "_write_rl_plugin_config(" in configure_source
-    assert '"gdn_model_type": gdn_reset_arch' in config_source
-    assert '"gdn-varlen"' in registry_source
-    assert "bool(model_type)" in registry_source
+    assert config["mask_truncated_completions"] is True
 
 
 def test_the_stdout_loop_verifies_the_marker_set_at_the_first_step_line():
@@ -8346,7 +7593,7 @@ def test_the_stdout_loop_verifies_the_marker_set_at_the_first_step_line():
     line would race the file). a missing marker there means the child trains unpatched."""
     stdout_loop = " ".join(inspect.getsource(rl_runner._execute_rl_child).split())
     step_at = stdout_loop.index("step_number = verl_step_number(line)")
-    verify_at = stdout_loop.index("verify_applied_shim_markers(shim_markers, expected_shims)")
+    verify_at = stdout_loop.index("verify_runtime_ready(readiness_path, expected_components)")
     assert step_at < verify_at < stdout_loop.index("close_generation")
     # and the entry point wires the files dict (marker path + expected set) into both the loop
     # and the final verdict.
@@ -8370,9 +7617,9 @@ def test_validate_rl_child_fails_a_run_whose_markers_are_missing(tmp_path):
         0,
         1,
         None,
-        files={"shim_markers": str(marker), "expected_shims": ["nonempty-response-mask"]},
+        files={"readiness_path": str(marker), "expected_components": ["nonempty-response-mask"]},
     )
-    with pytest.raises(RuntimeError, match="never proved"):
+    with pytest.raises(RuntimeError, match="did not finish initialization"):
         rl_runner._validate_rl_child(
             0,
             state,
@@ -8380,23 +7627,10 @@ def test_validate_rl_child_fails_a_run_whose_markers_are_missing(tmp_path):
             1,
             None,
             files={
-                "shim_markers": str(marker),
-                "expected_shims": ["nonempty-response-mask", "kl-ref-adapter"],
+                "readiness_path": str(marker),
+                "expected_components": ["nonempty-response-mask", "kl-ref-adapter"],
             },
         )
-
-
-def test_validate_rl_child_classifies_the_shim_exit_code_as_permanent():
-    from flash.engine.worker.perf.lifecycle import RetriableInfraError
-
-    with pytest.raises(RuntimeError, match="failed to apply") as err:
-        rl_runner._validate_rl_child(
-            backend_common.SHIM_FRAGMENT_FAILED_EXIT_CODE, rl_runner._StepMetricState(), 0, 1, None
-        )
-    # permanent by design: the same interpreter fails the same fragment on retry, so it must not
-    # be classified as retriable infra.
-    assert not isinstance(err.value, RetriableInfraError)
-    assert "FLASH_VERL_PYTHON" in str(err.value)
 
 
 def test_the_fp8_kv_probe_reads_the_child_capability_probe_not_parent_cuda(

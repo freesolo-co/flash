@@ -1,6 +1,6 @@
 """Hydra overrides, child environment, and parquet writing for the OPD trainer.
 
-`build_opd_overrides` renders the exact verl 0.8.0 synchronous-PPO and distillation config surface
+`build_opd_overrides` renders the exact pinned upstream Verl synchronous-PPO and distillation config surface
 the child is launched with; the rest prepare what that child needs on disk and in its environment
 (the resolved env vars and rollout parquet).
 
@@ -19,11 +19,12 @@ from flash.engine.worker.train.entry.backend_common import (
     actor_fsdp_strategy_overrides,
     agent_loop_workers,
     ray_num_cpus,
+    readiness_file,
     rollout_layered_summon_overrides,
     rollout_mm_processor_cache_overrides,
     rollout_resident_overrides,
-    shim_marker_file,
     trainer_dtype_overrides,
+    transfer_queue_overrides,
 )
 from flash.engine.worker.train.entry.sft_train import _build_verl_child_env, _hydra_val
 from flash.engine.worker.verl.capabilities import rollout_max_num_seqs
@@ -191,7 +192,7 @@ def _actor_rollout_overrides(config: dict, *, max_tokens: int) -> list[str]:
         *rollout_layered_summon_overrides(config.get("target_parameters")),
         *rollout_mm_processor_cache_overrides(),
         # keep the rollout engine RESIDENT for models whose vLLM wake/reload HANGS (catalog
-        # sleep_unsupported), exactly as the grpo path does. opd is NOT exempt: main_ppo_sync calls
+        # sleep_unsupported), exactly as the grpo path does. opd is NOT exempt: the synchronous trainer calls
         # checkpoint_manager.sleep_replicas() during init_workers and again around validation, which
         # lands in the same vllm_async_server sleep(). the flagged model declares algos including
         # opd and the parse-time gate admits it, so without this an opd run on it wedges.
@@ -235,14 +236,6 @@ def _actor_rollout_overrides(config: dict, *, max_tokens: int) -> list[str]:
     ]
 
 
-def _transfer_queue_overrides() -> list[str]:
-    return [
-        # verl force-enables TransferQueue and waits forever for every cpu bundle.
-        # one storage unit fits flash's single-node trainer regardless of ray cluster sizing.
-        "transfer_queue.backend.SimpleStorage.num_data_storage_units=1",
-    ]
-
-
 def _ray_overrides(config: dict) -> list[str]:
     return [
         # ray autodetects the HOST's cpu count inside a rented pod and eagerly forks one idle worker
@@ -276,7 +269,7 @@ def _reward_overrides(config: dict) -> list[str]:
 
 def _distillation_overrides(config: dict) -> list[str]:
     return [
-        "distillation._target_=flash_opd_plugin.FlashRemoteDistillationConfig",
+        "distillation._target_=flash.engine.worker.train.opd.child.config.FlashRemoteDistillationConfig",
         "distillation.enabled=true",
         "distillation.n_gpus_per_node=0",
         "distillation.nnodes=0",
@@ -312,7 +305,7 @@ def _trainer_overrides(config: dict) -> list[str]:
 
 
 def build_opd_overrides(config: dict) -> list[str]:
-    """Render the exact verl 0.8.0 synchronous PPO and distillation config surface."""
+    """Render the exact pinned upstream Verl synchronous PPO and distillation config surface."""
     missing = [key for key in _REQUIRED_OVERRIDE_KEYS if key not in config]
     if missing:
         raise KeyError(f"build_opd_overrides missing required config keys: {missing}")
@@ -333,7 +326,7 @@ def build_opd_overrides(config: dict) -> list[str]:
         ),
         *_data_runtime_overrides(config),
         *_actor_rollout_overrides(config, max_tokens=max_tokens),
-        *_transfer_queue_overrides(),
+        *transfer_queue_overrides(),
         *_ray_overrides(config),
         *_critic_overrides(),
         *_reward_overrides(config),
@@ -366,24 +359,30 @@ def build_opd_overrides(config: dict) -> list[str]:
     return overrides
 
 
-def _build_opd_plugin_config(
+def _build_opd_launch_config(
     *,
-    shim_dir: str,
+    runtime_dir: str,
     save_at_steps,
     total_steps: int,
     gdn_model_type: str | None,
     loggers,
+    reentrant_checkpointing: bool = False,
+    multimodal: bool = False,
     lora_language_prefix: str = "",
+    structured_outputs: dict | None = None,
 ) -> str:
-    """serialize the non-secret OPD runtime patch configuration."""
+    """serialize the non-secret OPD runtime configuration."""
     return json.dumps(
         {
-            "marker_file": shim_marker_file(shim_dir),
+            "readiness_path": readiness_file(runtime_dir),
             "no_signal_attempts": OPD_NO_SIGNAL_ATTEMPTS,
+            "structured_outputs": structured_outputs,
             "save_at_steps": list(save_at_steps),
             "total_steps": int(total_steps),
             **({"lora_language_prefix": lora_language_prefix} if lora_language_prefix else {}),
             "gdn_model_type": gdn_model_type,
+            "reentrant_checkpointing": bool(reentrant_checkpointing),
+            "multimodal": bool(multimodal),
             "wandb": "wandb" in loggers,
         },
         sort_keys=True,
@@ -393,7 +392,7 @@ def _build_opd_plugin_config(
 
 def _build_opd_child_env(
     *,
-    shim_dir: str,
+    runtime_dir: str,
     wandb_enabled: bool,
     bridge_url: str,
     bridge_token: str,
@@ -412,13 +411,12 @@ def _build_opd_child_env(
     abandonment_failure_path: str = "",
     resample_failure_path: str = "",
     cycle_commit_failure_path: str = "",
-    plugin_config: str = "",
+    launch_config: str = "",
     context: WorkerContext,
 ) -> dict[str, str]:
-    child = _build_verl_child_env(shim_dir=shim_dir, wandb_enabled=wandb_enabled, context=context)
+    child = _build_verl_child_env(wandb_enabled=wandb_enabled, context=context)
     child.update(
         {
-            "VERL_USE_EXTERNAL_MODULES": "flash_opd_plugin",
             "FLASH_OPD_BRIDGE_URL": bridge_url,
             "FLASH_OPD_BRIDGE_TOKEN": bridge_token,
             "FLASH_OPD_SEED": str(int(seed)),
@@ -464,8 +462,9 @@ def _build_opd_child_env(
                 "FLASH_OPD_THINKING": "1" if thinking else "0",
             }
         )
-    if plugin_config:
-        child["FLASH_OPD_PLUGIN_CONFIG"] = plugin_config
+    if launch_config:
+        with open(os.path.join(runtime_dir, "launch.json"), "w", encoding="utf-8") as handle:
+            handle.write(launch_config)
     return child
 
 

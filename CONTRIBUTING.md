@@ -35,7 +35,7 @@ If you change the verl pin (`Dockerfile.worker` or
 `flash/engine/worker/train/entry/backend_common.py`), also run the one check that needs the network:
 
 ```bash
-uv run python scripts/check_verl_pin_exists.py   # the pinned commit is reachable on the fork
+uv run python scripts/check_verl_pin_exists.py   # the pinned commit is reachable upstream
 ```
 
 The offline tests only compare the pin against a hardcoded copy of itself, so a

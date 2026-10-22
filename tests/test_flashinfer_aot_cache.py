@@ -68,11 +68,34 @@ def test_existing_broader_aot_cache_is_not_hidden(baked):
     assert not cache.activate(env)
 
 
-def test_bootstrap_registers_without_importing_flashinfer(monkeypatch):
-    monkeypatch.delitem(sys.modules, "flashinfer.jit.env", raising=False)
-    registered = []
-    runtime = SimpleNamespace(
-        _DEFERRED_FINDER=SimpleNamespace(register=lambda *a: registered.append(a))
-    )
-    cache.install(runtime)
-    assert registered == [("flashinfer.jit.env", cache.activate)]
+def test_startup_without_a_bake_does_not_import_flashinfer(monkeypatch, tmp_path):
+    import importlib
+
+    monkeypatch.setenv("FLASHINFER_CACHE_DIR", str(tmp_path))
+    monkeypatch.setattr(importlib, "import_module", lambda _: pytest.fail("unexpected import"))
+    assert cache.activate_current() is False
+
+
+def test_explicit_startup_activates_a_compatible_bake(monkeypatch, baked):
+    import importlib
+
+    env, root = baked
+    monkeypatch.setattr(importlib, "import_module", lambda name: env)
+    assert cache.activate_current()
+    assert root == env.FLASHINFER_AOT_DIR
+
+
+def test_vllm_worker_activates_cache_after_device_initialization(monkeypatch):
+    from tests.test_verl_child_plugins import _import_recipe, _modules
+
+    calls = []
+
+    class Worker:
+        def init_device(self):
+            calls.append("device")
+
+    _modules(monkeypatch, {"vllm.v1.worker.gpu_worker": {"Worker": Worker}})
+    monkeypatch.setattr(cache, "activate_current", lambda: calls.append("cache"))
+    module = _import_recipe(monkeypatch, "flash.engine.worker.train.core.child.vllm_worker")
+    module.FlashGPUWorker().init_device()
+    assert calls == ["device", "cache"]

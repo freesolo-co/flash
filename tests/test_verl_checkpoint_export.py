@@ -142,38 +142,6 @@ def _disk_usage(free: int):
     return SimpleNamespace(total=1 << 40, used=0, free=free)
 
 
-def test_model_shard_accounting_uses_only_top_level_model_shards(actor_dir):
-    from flash.engine.worker.verl import checkpoints
-
-    (actor_dir / "optim_world_size_2_rank_0.pt").write_bytes(b"o" * 65536)
-    (actor_dir / "extra_state_world_size_2_rank_0.pt").write_bytes(b"e" * 2048)
-    nested = actor_dir / "nested"
-    nested.mkdir()
-    (nested / "model_world_size_2_rank_0.pt").write_bytes(b"n" * 16384)
-
-    assert checkpoints._model_shard_bytes(str(actor_dir)) == 8192
-
-
-@pytest.mark.parametrize(("free", "raises"), [(8191, True), (8192, False)])
-def test_merge_headroom_matches_shard_bytes(monkeypatch, actor_dir, tmp_path, free, raises):
-    from flash.engine.worker.verl import checkpoints
-
-    monkeypatch.setattr(checkpoints.shutil, "disk_usage", lambda path: _disk_usage(free))
-
-    def call():
-        checkpoints.require_merge_headroom(str(actor_dir), str(tmp_path / "adapter_merge"))
-
-    if raises:
-        with pytest.raises(checkpoints.MergeDiskHeadroomError) as caught:
-            call()
-        message = str(caught.value)
-        assert "save_every" in message
-        assert "save_at_steps" in message
-        assert "disk_gb" not in message
-    else:
-        call()
-
-
 @pytest.mark.parametrize(
     "error",
     [
@@ -234,12 +202,11 @@ def _watcher_boundary(kind: str):
 
 
 @pytest.mark.parametrize("kind", ["sft", "rl"])
-@pytest.mark.parametrize("error_name", ["MergeDiskHeadroomError", "MergeDiskExhaustedError"])
-def test_watcher_boundaries_preserve_merge_disk_errors(kind, error_name):
+def test_watcher_boundaries_preserve_merge_disk_errors(kind):
     from flash.engine.worker.verl import checkpoints
 
     watcher, method_name, _ = _watcher_boundary(kind)
-    error_type = getattr(checkpoints, error_name)
+    error_type = checkpoints.MergeDiskExhaustedError
     error = error_type("specific disk diagnosis")
     watcher._error = error
 
@@ -421,7 +388,8 @@ def test_disk_classification_happens_before_merge_cleanup(monkeypatch, actor_dir
     assert not merge_out.exists()
 
 
-def test_export_moves_adapter_files_and_cleans_merge_tree(monkeypatch, actor_dir, tmp_path):
+@pytest.mark.parametrize("free", [1024, 1 << 40])
+def test_export_moves_adapter_files_and_cleans_merge_tree(monkeypatch, actor_dir, tmp_path, free):
     from flash.engine.worker.verl import checkpoints
 
     merge_out = tmp_path / "adapter_merge"
@@ -441,7 +409,7 @@ def test_export_moves_adapter_files_and_cleans_merge_tree(monkeypatch, actor_dir
 
     monkeypatch.setattr(checkpoints, "_run_merger", merge)
     monkeypatch.setattr(checkpoints.shutil, "rmtree", rmtree)
-    monkeypatch.setattr(checkpoints.shutil, "disk_usage", lambda path: _disk_usage(1 << 40))
+    monkeypatch.setattr(checkpoints.shutil, "disk_usage", lambda path: _disk_usage(free))
     adapter = tmp_path / "adapter"
     checkpoints.export_peft_adapter(
         str(actor_dir),

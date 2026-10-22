@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import concurrent.futures
+import inspect
 import math
 import sys
 import threading
@@ -9,8 +10,8 @@ import time
 import pytest
 
 import flash.engine.worker.model.decoding as worker_decoding
+import flash.engine.worker.train.rl.child.reward as rl_reward_module
 import flash.engine.worker.train.rl.rollout.multi_turn as rl_multi_turn
-import flash.engine.worker.train.rl.rollout.reward_module as rl_reward_module
 import flash.engine.worker.train.rl.rollout.single_turn as rl_single_turn
 from flash.engine.worker.train.entry import score_batcher
 from flash.engine.worker.train.entry.score_batcher import ScoreBatcher
@@ -202,10 +203,14 @@ def test_concurrent_single_turn_requests_are_batched_and_scattered_in_order(monk
         monkeypatch.setitem(sys.modules, "flash_grpo_multiturn", grpo_multiturn)
         namespace: dict = {}
         exec(
-            compile(rl_reward_module.render_reward_module("TEST_URL"), "<reward>", "exec"),
+            compile(
+                inspect.getsource(rl_reward_module).replace("FLASH_VERL_REWARD_URL", "TEST_URL"),
+                "<reward>",
+                "exec",
+            ),
             namespace,
         )
-        namespace["_URL"] = url
+        monkeypatch.setenv("TEST_URL", url)
         with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
             results = list(
                 pool.map(
