@@ -77,12 +77,42 @@ all request distributions.
 - A separate four-rank synthetic transport probe checked exact FP8 embedding bytes
   and packed scales with values varying by owner, row, and column/block. Invalid
   indices were zeroed, and CUDA-graph replay returned the correct values after
-  changing indices. All four ranks passed. Reproduce inside the native four-GPU
-  image with `python scripts/qualify_deepinfer_engram.py`. This checks the mapped
+  changing indices. All four ranks passed. Copy
+  `scripts/qualify_deepinfer_engram.py` into an existing four-GPU container and run
+  it with `/opt/deepinfer-venv/bin/python`; the script does not allocate GPUs. This checks the mapped
   host-memory path used here; it does not qualify every table shape or the unused
   GPU-storage path.
 - During the throughput run, peak sampled memory was 155,158 MiB / 151.52 GiB per GPU, 84.62% of the
   reported 183,359 MiB. Sampling was every five seconds and may miss brief peaks.
+
+## Request-driven scaling and cleanup
+
+A private Modal web function using the same serving entrypoint was capped at one
+four-B200 replica, with zero minimum/spare containers and `scaledown_window=600`.
+It reused the read-only checkpoint and a filesystem snapshot containing compiled
+kernels (`im-01M5ND1YKKQCRSW1YHHMTXP3AV`). That warmed validation snapshot is not
+the default image pinned by the PR.
+
+The function started at zero, allocated one replica on an authenticated request,
+reported all four native workers ready, and returned `391` for `17 × 23` through
+the private endpoint. Health readiness took 354.47 seconds including scheduling
+and startup; the subsequent buffered chat request took about 0.96 seconds in
+Modal's request log. This is a separate endpoint smoke, not the throughput table.
+
+After requests ceased, **automatic scaling returned the pool to zero**. The last
+HTTP response completed at 22:24:58 UTC; zero runners were observed at 22:37:38 UTC,
+759.99 seconds later, using 30-second polling. The transport probe used container
+exec during the idle period. This experiment therefore establishes eventual
+scale-to-zero, not a strict 600-second resource-release guarantee. The configured
+idle window remained 600 seconds; actual release also involves platform scheduling
+and container teardown. No manual stop preceded the observed zero.
+
+The container inventory independently confirmed the GPU container was gone. All
+seven temporary/development validation apps were then explicitly stopped, with
+zero owned containers or active sandboxes. The temporary proxy token and two
+scratch volumes were removed; the original checkpoint volume was unchanged.
+Unrelated serving and training apps were untouched. Multi-replica scale-out and
+the configured four-replica ceiling were not exercised on real GPUs.
 
 ## Historical comparison
 
@@ -100,6 +130,8 @@ Selected historical values are preserved separately to prevent conflating the ru
 - [Quality responses](validation/deepinfer-2026-10-23-quality.json)
 - [Initial throughput trials](validation/deepinfer-2026-10-23-throughput.json)
 - [Extended trials, longer prompts, and cancellation](validation/deepinfer-2026-10-23-extended.json)
+- [Autoscaling observations](validation/deepinfer-2026-10-23-autoscale.json)
+- [Final resource shutdown](validation/deepinfer-2026-10-23-shutdown.json)
 - [Historical comparison only](validation/deepinfer-2026-10-23-prior-results.json)
 
 Raw responses, telemetry, benchmark clients, and operational logs were retained
