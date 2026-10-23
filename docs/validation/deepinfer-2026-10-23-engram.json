@@ -1,0 +1,38 @@
+{
+  "checks": [
+    {
+      "rank": 0,
+      "exact_embedding_bytes": true,
+      "exact_packed_scales": true,
+      "cuda_graph_changed_indices": true,
+      "invalid_indices_zeroed": true
+    },
+    {
+      "rank": 1,
+      "exact_embedding_bytes": true,
+      "exact_packed_scales": true,
+      "cuda_graph_changed_indices": true,
+      "invalid_indices_zeroed": true
+    },
+    {
+      "rank": 2,
+      "exact_embedding_bytes": true,
+      "exact_packed_scales": true,
+      "cuda_graph_changed_indices": true,
+      "invalid_indices_zeroed": true
+    },
+    {
+      "rank": 3,
+      "exact_embedding_bytes": true,
+      "exact_packed_scales": true,
+      "cuda_graph_changed_indices": true,
+      "invalid_indices_zeroed": true
+    }
+  ],
+  "mode": "mapped shared host memory",
+  "rows_per_rank": 8,
+  "hidden_size": 256,
+  "ranks": 4,
+  "pattern": "FP8 bytes vary by global row and column; scale exponents vary by owner, row, and block",
+  "probe": "scripts/qualify_deepinfer_engram.py"
+}

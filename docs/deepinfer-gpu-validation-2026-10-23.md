@@ -30,7 +30,7 @@ and inherited B200/cross-compilation build settings; see the runtime evidence.
 
 Streaming HTTP was measured **inside the GPU sandbox**, excluding public-network,
 Modal proxy, Flash router, authorization, and billing latency. Prompts had unique
-random prefixes and requested 256 output tokens at temperature zero, seed 42.
+random prefixes (47–56 input tokens, median 51) and requested 256 output tokens at temperature zero, seed 42.
 Cache-hit counts are unavailable; no cache-hit rate is claimed.
 The first trial at each concurrency is treated as warmup. Counts below are small
 samples, not a sustained traffic or tail-latency qualification.
@@ -67,14 +67,21 @@ all request distributions.
 - Correct answers were returned for `17 × 23`, France's capital, and the average-speed
   reasoning problem. Generated Fibonacci code was coherent; its explanation was
   intentionally cut off by the 256-token output limit. This is a smoke check,
-  not a model accuracy benchmark or native transport parity proof.
+  not a model accuracy benchmark or full-model numerical parity proof.
 - Six synthetic retrieval prompts returned the correct marker. Input lengths were
   approximately 1,842, 7,220, and 21,556 tokens. Second-run TTFT was respectively
   3.29 s, 12.14 s, and 33.21 s; these short answers measure prefill behavior.
 - Client disconnects during decoding and a long-prompt request left concurrent
   arithmetic requests correct, with zero active requests afterward. Exact cancellation
   placement within a native kernel was not instrumented.
-- Peak sampled memory was 155,158 MiB / 151.52 GiB per GPU, 84.62% of the
+- A separate four-rank synthetic transport probe checked exact FP8 embedding bytes
+  and packed scales with values varying by owner, row, and column/block. Invalid
+  indices were zeroed, and CUDA-graph replay returned the correct values after
+  changing indices. All four ranks passed. Reproduce inside the native four-GPU
+  image with `python scripts/qualify_deepinfer_engram.py`. This checks the mapped
+  host-memory path used here; it does not qualify every table shape or the unused
+  GPU-storage path.
+- During the throughput run, peak sampled memory was 155,158 MiB / 151.52 GiB per GPU, 84.62% of the
   reported 183,359 MiB. Sampling was every five seconds and may miss brief peaks.
 
 ## Historical comparison
@@ -89,6 +96,7 @@ Selected historical values are preserved separately to prevent conflating the ru
 
 - [Loaded GPU workers](validation/deepinfer-2026-10-23-loaded-ranks.json)
 - [Image identity and exact inherited build changes](validation/deepinfer-2026-10-23-runtime.json)
+- [Transport probe](validation/deepinfer-2026-10-23-engram.json)
 - [Quality responses](validation/deepinfer-2026-10-23-quality.json)
 - [Initial throughput trials](validation/deepinfer-2026-10-23-throughput.json)
 - [Extended trials, longer prompts, and cancellation](validation/deepinfer-2026-10-23-extended.json)
