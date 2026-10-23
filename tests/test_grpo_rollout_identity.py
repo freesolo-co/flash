@@ -472,7 +472,12 @@ def _agent(recipe, config):
 
     agent = recipe.FlashGrpoSingleTurnAgentLoop.__new__(recipe.FlashGrpoSingleTurnAgentLoop)
     agent.config = config
-    agent.observations = ObservedRolloutClient(None)
+
+    class IdentityOnlyClient(ObservedRolloutClient):
+        def episode_contract(self, agent, identity):
+            return self.episode()
+
+    agent.observations = IdentityOnlyClient(None)
     return agent
 
 
