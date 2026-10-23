@@ -28,14 +28,25 @@ before releasing the slot; it does not terminate the other requests in that grou
 
 Prices are captured as exact per-token decimals with version
 `2026-10-23.deepseek-1017.1`. Completion usage includes native reasoning and EOS
-tokens. This DeepInfer release exposes no reliable per-request cache-hit counter;
-the bridge reports zero cached tokens with `cached_tokens_reported=False` and
-never invents discounted cache usage.
+tokens. The bridge currently reports zero cached tokens with
+`cached_tokens_reported=False`; verified prefix reuse and its per-request billing
+counts still need implementation in this serving path.
 
 ## Deployment and qualification
 
 The native bridge passed a **four-B200 smoke and performance run**; see the
 [measured results and limits in PR #1484](https://github.com/freesolo-co/flash/pull/1484).
+Its validated default configuration peaked at approximately 1,597 aggregate
+output tokens/s on short prompts. Separate warm benchmarks exceeded 12,000
+output tokens/s on both long-context and short-chat workloads at approximately
+92% input-token reuse. Those experiments used retained prefix states, 128
+sequences per rank, speculative decoding, and FP8 execution of losslessly
+expanded FP4 expert values. The deployable bridge retains the configuration in
+the capacity table above. Promoting the experimental path requires bounded,
+tenant-aware cache management, verified cache billing counts, and service
+qualification at the larger batch sizes. A 92% hit rate also depends on the
+request traffic and cache warmth.
+
 This is not complete customer rollout qualification. CPU tests cover the HTTP/native
 bridge, router authorization, pricing and settlement, thinking/non-thinking
 responses, native errors, and cancellation. Keep customer traffic disabled until
