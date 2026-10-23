@@ -212,6 +212,8 @@ def build_app(runtime, *, manage_lifecycle=True):
             "runtime_revision": RUNTIME_REVISION,
             "gpu": "B200",
             "gpu_count": 4,
+            "loaded_ranks": getattr(runtime, "provenance", {}),
+            "active_requests": len(getattr(runtime, "pending", {})),
         }
 
     @app.get("/v1/models")

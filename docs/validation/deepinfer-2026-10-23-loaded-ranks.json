@@ -1,0 +1,59 @@
+{
+  "status": "ok",
+  "model": "deepseek-ai/DeepSeek-V4.1-Flash-1017",
+  "model_revision": "1bae0e1088993b9b82de08f59de5be5a34e42170",
+  "runtime_revision": "9bd9cf243fc53ef9afbf8f04d391d989117d6ab9",
+  "gpu": "B200",
+  "gpu_count": 4,
+  "loaded_ranks": {
+    "0": {
+      "rank": 0,
+      "upstream": "https://github.com/deepseek-ai/DeepInfer",
+      "revision": "9bd9cf243fc53ef9afbf8f04d391d989117d6ab9",
+      "engine_class": "deepinfer.engine.llm_engine.LLMEngine",
+      "engine_source": "/opt/DeepInfer/deepinfer/engine/llm_engine.py",
+      "native_binary": "/opt/DeepInfer/build/nvidia-x86_64/lib.linux-x86_64-cpython-312/deepinfer/_C.cpython-312-x86_64-linux-gnu.so",
+      "native_sha256": "dea9f42a984ac3334d29e8842252a0b6f16986ae963716c3622d99be6b16c851",
+      "gpu": "NVIDIA B200",
+      "torch": "2.13.0+cu132",
+      "cuda": "13.2"
+    },
+    "2": {
+      "rank": 2,
+      "upstream": "https://github.com/deepseek-ai/DeepInfer",
+      "revision": "9bd9cf243fc53ef9afbf8f04d391d989117d6ab9",
+      "engine_class": "deepinfer.engine.llm_engine.LLMEngine",
+      "engine_source": "/opt/DeepInfer/deepinfer/engine/llm_engine.py",
+      "native_binary": "/opt/DeepInfer/build/nvidia-x86_64/lib.linux-x86_64-cpython-312/deepinfer/_C.cpython-312-x86_64-linux-gnu.so",
+      "native_sha256": "dea9f42a984ac3334d29e8842252a0b6f16986ae963716c3622d99be6b16c851",
+      "gpu": "NVIDIA B200",
+      "torch": "2.13.0+cu132",
+      "cuda": "13.2"
+    },
+    "3": {
+      "rank": 3,
+      "upstream": "https://github.com/deepseek-ai/DeepInfer",
+      "revision": "9bd9cf243fc53ef9afbf8f04d391d989117d6ab9",
+      "engine_class": "deepinfer.engine.llm_engine.LLMEngine",
+      "engine_source": "/opt/DeepInfer/deepinfer/engine/llm_engine.py",
+      "native_binary": "/opt/DeepInfer/build/nvidia-x86_64/lib.linux-x86_64-cpython-312/deepinfer/_C.cpython-312-x86_64-linux-gnu.so",
+      "native_sha256": "dea9f42a984ac3334d29e8842252a0b6f16986ae963716c3622d99be6b16c851",
+      "gpu": "NVIDIA B200",
+      "torch": "2.13.0+cu132",
+      "cuda": "13.2"
+    },
+    "1": {
+      "rank": 1,
+      "upstream": "https://github.com/deepseek-ai/DeepInfer",
+      "revision": "9bd9cf243fc53ef9afbf8f04d391d989117d6ab9",
+      "engine_class": "deepinfer.engine.llm_engine.LLMEngine",
+      "engine_source": "/opt/DeepInfer/deepinfer/engine/llm_engine.py",
+      "native_binary": "/opt/DeepInfer/build/nvidia-x86_64/lib.linux-x86_64-cpython-312/deepinfer/_C.cpython-312-x86_64-linux-gnu.so",
+      "native_sha256": "dea9f42a984ac3334d29e8842252a0b6f16986ae963716c3622d99be6b16c851",
+      "gpu": "NVIDIA B200",
+      "torch": "2.13.0+cu132",
+      "cuda": "13.2"
+    }
+  },
+  "active_requests": 0
+}

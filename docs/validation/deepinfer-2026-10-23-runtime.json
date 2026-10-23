@@ -1,0 +1,24 @@
+{
+  "origin": "https://github.com/deepseek-ai/DeepInfer.git",
+  "revision": "9bd9cf243fc53ef9afbf8f04d391d989117d6ab9",
+  "modified": [
+    "deepinfer/model_executor/models/v4_modules/index_attn.py",
+    "vendor/DeepSelect",
+    "vendor/FlashMLA"
+  ],
+  "packages": {
+    "torch": "2.13.0+cu132",
+    "triton": "3.7.1",
+    "transformers": "4.50.0",
+    "tokenizers": "0.21.4",
+    "fastapi": "0.141.1",
+    "uvicorn": "0.52.0"
+  },
+  "native_binaries": [
+    {
+      "path": "/opt/DeepInfer/deepinfer/_so/nvidia-x86_64/_C.cpython-312-x86_64-linux-gnu.so",
+      "sha256": "dea9f42a984ac3334d29e8842252a0b6f16986ae963716c3622d99be6b16c851"
+    }
+  ],
+  "submodule_diff": "Submodule vendor/DeepSelect contains modified content\ndiff --git a/vendor/DeepSelect/tests/kernelkit/platform.py b/vendor/DeepSelect/tests/kernelkit/platform.py\nindex d45658c..6f98e9b 100644\n--- a/vendor/DeepSelect/tests/kernelkit/platform.py\n+++ b/vendor/DeepSelect/tests/kernelkit/platform.py\n@@ -17,6 +17,8 @@ def get_current_platform() -> Platform:\n     \"\"\"\n     if os.path.exists(\"/dev/davinci_manager\"):\n         return Platform.ASCEND\n+    if os.getenv(\"DEEPINFER_CROSS_COMPILE\") == \"1\":\n+        return Platform.CUDA\n     output = subprocess.check_output([\"lspci\"], text=True)\n     if \"3D controller: NVIDIA Corporation Device\" in output:\n         return Platform.CUDA\nSubmodule vendor/FlashMLA contains modified content\ndiff --git a/vendor/FlashMLA/setup.py b/vendor/FlashMLA/setup.py\nindex 06e8bae..d407df0 100644\n--- a/vendor/FlashMLA/setup.py\n+++ b/vendor/FlashMLA/setup.py\n@@ -24,7 +24,7 @@ EXT_NAME_ASCEND = \"flash_mla.npu\"\n # `-gencode` targets. We use the architecture-specific ones (sm_100a / sm_103a) instead of the\n # family-specific one (sm_100f) because the kernels use `cvt` with `.scaled::n2::ue8m0`, and\n # sm_103a additionally enables better code generation for `exp`.\n-CUDA_ARCHS = [\"sm_100a\", \"sm_103a\"]\n+CUDA_ARCHS = [\"sm_100a\"]\n \n # Head counts (H_Q) the fused core_attn kernel is instantiated for: 128 (2-CTA cluster) and 64\n HEADS_FOR_FUSED_CORE_ATTN = (64, 128)\ndiff --git a/vendor/FlashMLA/tests/kernelkit/platform.py b/vendor/FlashMLA/tests/kernelkit/platform.py\nindex d45658c..6f98e9b 100644\n--- a/vendor/FlashMLA/tests/kernelkit/platform.py\n+++ b/vendor/FlashMLA/tests/kernelkit/platform.py\n@@ -17,6 +17,8 @@ def get_current_platform() -> Platform:\n     \"\"\"\n     if os.path.exists(\"/dev/davinci_manager\"):\n         return Platform.ASCEND\n+    if os.getenv(\"DEEPINFER_CROSS_COMPILE\") == \"1\":\n+        return Platform.CUDA\n     output = subprocess.check_output([\"lspci\"], text=True)\n     if \"3D controller: NVIDIA Corporation Device\" in output:\n         return Platform.CUDA\n"
+}

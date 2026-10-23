@@ -15,7 +15,7 @@ keep their separate vLLM images and capacity.
 | Admission | 32 requests per replica; scale-out target 24 |
 | Native scheduler | 8 sequences per rank, 512-token prefill chunks |
 | Idle shutdown | 600 seconds, no warm floor or spare buffer |
-| Host allocation | 32 CPUs / 256 GiB RAM per replica |
+| Host allocation | 16 CPUs / 256 GiB RAM per replica |
 | Initial context limit | 32,768 tokens including output and 64 reserved tokens |
 | Startup / generation budgets | 45 minutes / 10 minutes |
 | Input / output / cached input | $0.15 / $0.60 / $0.003 per million tokens |
@@ -34,10 +34,12 @@ never invents discounted cache usage.
 
 ## Deployment and qualification
 
-The implementation is **not GPU-qualified yet**. CPU tests cover the HTTP/native
+The native bridge passed a **four-B200 smoke and performance run**; see the
+[measured results and limits](../../../docs/deepinfer-gpu-validation-2026-10-23.md).
+This is not complete customer rollout qualification. CPU tests cover the HTTP/native
 bridge, router authorization, pricing and settlement, thinking/non-thinking
-responses, native errors, and cancellation. Do not enable customer traffic until
-the checks below have real four-B200 evidence.
+responses, native errors, and cancellation. Keep customer traffic disabled until
+the remaining service and accounting checks below are completed.
 
 Deploy the private backend in the intended Modal environment:
 
@@ -98,6 +100,15 @@ transport substitutes mapped shared host RAM/CUDA IPC for RDMA, preserving nativ
 FP8 embedding values and packed scales. It does not widen weights or substitute
 benchmark prompts. Native model weights are downloaded at the pinned revision
 into the persistent `freesolo-deepseek-1017-weights` volume.
+
+The inherited build also selects `sm_100a` in FlashMLA and permits CUDA
+cross-compilation in the DeepSelect/FlashMLA platform probes. The runtime's
+`PATH` and `VIRTUAL_ENV` match the earlier successful four-B200 campaign.
+Each initialized GPU worker checks its engine source and native extension paths
+against the pinned source tree and reports the native binary SHA-256, commit,
+GPU model, and PyTorch/CUDA versions in the private `/health` response's
+`loaded_ranks` field. All four ranks must initialize before health succeeds.
+These loaded-worker records are distinct from inspecting the image on CPU.
 
 The initial API supports text-only system/user/assistant messages, one completion,
 temperature, top-p, seed, max tokens, and `chat_template_kwargs.enable_thinking`.

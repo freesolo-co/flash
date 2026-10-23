@@ -41,6 +41,7 @@ class Runtime:
         self.pending: dict[str, Pending] = {}
         self.loads = [0] * GPU_COUNT
         self.ready: set[int] = set()
+        self.provenance: dict[int, dict] = {}
         self.failure: str | None = None
         self.pump = None
 
@@ -132,6 +133,7 @@ class Runtime:
             self.last_seen[event["rank"]] = time.monotonic()
             if event["type"] == "ready":
                 self.ready.add(event["rank"])
+                self.provenance[event["rank"]] = event.get("provenance", {})
                 if len(self.ready) == GPU_COUNT:
                     self.last_seen = [time.monotonic()] * GPU_COUNT
             return

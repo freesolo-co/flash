@@ -152,12 +152,13 @@ def test_image_extras_cover_every_directly_imported_third_party_package() -> Non
 
     imported: set[str] = set()
     for path in (ROOT / "flash" / "serving").rglob("*.py"):
-        # These three native-only modules execute in the separately pinned DeepInfer
+        # These native-only modules execute in the separately pinned DeepInfer
         # CUDA image. They must never be installed into the vLLM/LoRA image.
         if path.parent.name == "deepinfer" and path.name in {
             "worker.py",
             "runtime.py",
             "engram_transport.py",
+            "provenance.py",
         }:
             continue
         for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):

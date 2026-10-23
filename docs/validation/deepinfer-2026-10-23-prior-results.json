@@ -1,0 +1,42 @@
+{
+  "source": "deepinfer-b200-benchmark/campaign-ratio54-20261023/results.json",
+  "historical_only": true,
+  "qualifies_current_serving_pr": false,
+  "precision": "FP8 target experts widened from released FP4 weights; native FP4 speculative draft, max3 drafts.",
+  "cases": [
+    {
+      "name": "ratio54-strict-cache90-target",
+      "requests": 1627,
+      "successful": 1627,
+      "errors": 0,
+      "elapsed_s": 205.9715540409088,
+      "aggregate_output_tps": 11800.658645888787,
+      "steady_output_tps": 13537.34485240139,
+      "ttft_p50_s": 2.4134862422943115,
+      "ttft_p95_s": 3.8490873813629136,
+      "request_tps_p50": 38.51918076757498,
+      "mean_input_tokens": 88560.0,
+      "mean_output_tokens": 1493.9151813153042,
+      "actual_input_output_ratio": 59.28047395704764,
+      "peak_sampled_vram_percent": 95.4608173037593,
+      "steady_mean_gpu_utilization_percent": 94.97556390977444
+    },
+    {
+      "name": "ratio54-strict-cache95-target",
+      "requests": 1627,
+      "successful": 1627,
+      "errors": 0,
+      "elapsed_s": 202.9626121520996,
+      "aggregate_output_tps": 11975.604640811951,
+      "steady_output_tps": 13966.062501733326,
+      "ttft_p50_s": 2.19394588470459,
+      "ttft_p95_s": 2.851427340507507,
+      "request_tps_p50": 51.721553748223194,
+      "mean_input_tokens": 88560.0,
+      "mean_output_tokens": 1493.9151813153042,
+      "actual_input_output_ratio": 59.28047395704764,
+      "peak_sampled_vram_percent": 95.4608173037593,
+      "steady_mean_gpu_utilization_percent": 95.29731457800511
+    }
+  ]
+}

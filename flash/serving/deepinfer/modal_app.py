@@ -28,6 +28,8 @@ image = (
     .env(
         {
             "PYTHONPATH": "/root:/opt/DeepInfer",
+            "PATH": "/opt/deepinfer-venv/bin:/usr/local/cuda/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+            "VIRTUAL_ENV": "/opt/deepinfer-venv",
             "DEEPINFER_ACCELERATOR": "nvidia",
             "PYTHONUNBUFFERED": "1",
         }
@@ -51,7 +53,7 @@ def _watch_server(process):
 
 @app.function(
     gpu=GPU,
-    cpu=32,
+    cpu=16,
     memory=262144,
     volumes={"/weights": weights},
     min_containers=MIN_CONTAINERS,

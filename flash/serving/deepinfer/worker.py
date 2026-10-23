@@ -121,7 +121,11 @@ def run_rank(rank, model_path, incoming, outgoing, stopped):
     try:
         llm = initialize(rank, model_path)
         engine = llm.llm_engine
-        outgoing.put({"type": "ready", "rank": rank})
+        from flash.serving.deepinfer.provenance import loaded_runtime
+
+        proof = loaded_runtime(llm, rank)
+        print(f"DEEPINFER_LOADED {proof}", flush=True)
+        outgoing.put({"type": "ready", "rank": rank, "provenance": proof})
         active = set()
         last_heartbeat = time.monotonic()
         while not stopped.is_set():
