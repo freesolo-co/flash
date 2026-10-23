@@ -36,12 +36,28 @@ def grad_checkpointing_on(
         return base
     if not base:
         return False
-    can_consider_gc_off = (
-        fused_ce
-        and active_params_b
-        and card_vram_gb
-        and card_vram_gb >= 120.0
-        and (capability is None or capability >= (9, 0))
+    # qualified short-context dense path; keep the larger-model/MoE gate unchanged.
+    # use realized row length and microbatch, never the configured context ceiling.
+    short_dense = (
+        model_id == "Qwen/Qwen3.5-9B"
+        and revision == "c202236235762e1c871ad0ccb60c8ee5ba337b9a"
+        and capability == (8, 9)
+        and 48 <= card_vram_gb < 50
+        and 0 < max_length <= 512
+        and per_device_bs == 1
+        and 0 < lora_rank <= 8
+        and hidden == 4096
+        and num_layers == 32
+        and not active_params_b
+    )
+    can_consider_gc_off = fused_ce and (
+        short_dense
+        or (
+            active_params_b
+            and card_vram_gb
+            and card_vram_gb >= 120.0
+            and (capability is None or capability >= (9, 0))
+        )
     )
     if not can_consider_gc_off:
         return True
@@ -64,6 +80,7 @@ def grad_checkpointing_on(
         lora_rank=lora_rank,
         quant=(getattr(info, "quant", "bf16") or "bf16") if info else "bf16",
         model_info=info,
+        margin_gb=8.0 if short_dense else 18.0,
     ):
         print(
             f"[sft] gradient checkpointing OFF: GC-off peak fits {card_vram_gb:.0f} GB "
