@@ -148,6 +148,12 @@ def attempt(root, steps):
     launch.write_text(json.dumps(options.encode()))
     journal = root / f"metrics-{steps}.jsonl"
     env = dict(os.environ, VERL_FILE_LOGGER_PATH=str(journal))
+    overrides = build_verl_overrides(cfg)
+    # The tiny Qwen3 fixture uses the standard loss path: upstream's fused
+    # forward directly reads lm_head.weight, bypassing its FSDP2 unshard hook.
+    overrides[overrides.index("actor_rollout_ref.model.use_fused_kernels=True")] = (
+        "actor_rollout_ref.model.use_fused_kernels=False"
+    )
     subprocess.run(
         [
             sys.executable,
@@ -155,7 +161,7 @@ def attempt(root, steps):
             "flash.engine.worker.train.rl.child.entry",
             "--flash-config",
             str(launch),
-            *build_verl_overrides(cfg),
+            *overrides,
         ],
         env=env,
         check=True,

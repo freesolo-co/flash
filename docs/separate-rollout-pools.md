@@ -4,9 +4,9 @@ This opt-in GRPO prototype assigns vLLM to dedicated GPUs and lets its replica
 count and tensor parallelism differ from the trainer. It preserves synchronous
 generate → reward → update → publish execution. The default remains colocated.
 
-Status: CPU contracts pass against the pinned upstream Verl. No GPU training,
-NCCL transfer, performance improvement, or image build has been validated yet.
-Do not enable this as a production default on the basis of CPU tests.
+Status: the full offline CPU suite and pinned upstream Verl contracts pass.
+The optional CuPy image layer builds. Live GPU validation is recorded below;
+no production-scale performance or learning-quality improvement is claimed.
 
 The first stage partitions **one existing, single-node allocation**. It does
 not provision separate Modal sandboxes, resize a running pool, share replicas
@@ -33,6 +33,10 @@ docker build -f deploy/rollout-pilot/Dockerfile \
 
 This adds `cupy-cuda12x==13.6.0` to the **Verl interpreter**, required by the
 remote NCCL backend. [CuPy publishes this wheel for CUDA 12.x and Python 3.12](https://pypi.org/project/cupy-cuda12x/13.6.0/).
+The pilot image also sets `NCCL_CUMEM_HOST_ENABLE=0` consistently for all
+processes. The Modal A10G smoke run failed during NCCL shared-memory attachment
+without it and passed initial publication with it. This selects NCCL's legacy
+host-allocation path; see [NVIDIA's NCCL troubleshooting guidance](https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/troubleshooting.html).
 The normal worker image and dependency resolver are unchanged. A missing NCCL
 backend fails before Ray launches training actors; the worker does not install
 dependencies at runtime.
@@ -86,6 +90,33 @@ checks, rollout log probabilities, identity bookkeeping, reward handling,
 multi-turn policy and GRPO loss remain in place.
 
 ## Evidence to collect on GPUs
+
+For an infrastructure smoke test inside a disposable three-GPU pilot worker:
+
+```sh
+/opt/verl-venv/bin/python scripts/check_rollout_pool_gpu.py \
+  --output /tmp/rollout-pool-check
+```
+
+The script creates a tiny random Qwen3 model and synthetic tokenizer locally,
+runs two updates with one training GPU and two rollout replicas, then resumes
+for one more update. It checks nonzero gradients and completed publication
+versions. It downloads no model and writes no artifacts to shared storage.
+The fixture uses the standard loss path: pinned Verl's fused Qwen3 forward
+directly reads the FSDP2-sharded output weight and fails on this fixture.
+This does not qualify fused-loss kernels, production model sizes,
+tensor-parallel replicas, failure injection, or learning quality.
+Live smoke result (2026-10-22): **passed on three Modal A10G GPUs**, with
+one training rank and two TP=1 rollout replicas. Fresh steps 1 and 2 and resumed
+step 3 had nonzero gradients and matching completed publication versions.
+Resume loaded adapter weights, optimizer, RNG and scheduler state before
+initial publication. The sandbox was terminated after evidence collection.
+
+Local validation also passed the full offline suite (10,764 tests, 193 skips),
+the separate wall-clock suite (25 tests, 2 skips), and 96 pinned-Verl contracts.
+The normal CPU environment skips optional GPU/upstream dependencies; the
+pinned-Verl contracts and live run exercise the new pool integration separately. Required CI
+runs the offline suite on Python 3.11 and 3.12.
 
 Start with two GPUs: one trainer, one replica, several updates and a recovery
 checkpoint. Then repeat with more one-GPU replicas at the same training width.
