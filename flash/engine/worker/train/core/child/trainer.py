@@ -61,6 +61,10 @@ class FlashTaskRunner:
         trainer_type = getattr(
             importlib.import_module(f"flash.engine.worker.train.{module}.child.trainer"), name
         )
+        if options.rollout_pool is not None:
+            from flash.engine.worker.train.rl.child.pool import FlashSeparateGrpoTrainer
+
+            trainer_type = FlashSeparateGrpoTrainer
         manager_type = getattr(
             importlib.import_module(f"flash.engine.worker.train.{module}.child.rollout"),
             "FlashGrpoManager" if module == "rl" else "FlashOpdManager",

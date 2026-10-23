@@ -25,6 +25,7 @@ class RuntimeOptions:
     kl_ref_adapter: bool = False
     multi_turn: bool = False
     no_signal_attempts: int = 1
+    rollout_pool: dict | None = None
 
     @classmethod
     def decode(cls, value):
@@ -38,6 +39,13 @@ class RuntimeOptions:
             raise ValueError("total_steps must be a positive integer")
         if options.no_signal_attempts <= 0 or options.dp_cards <= 0:
             raise ValueError("attempt and device counts must be positive")
+        if options.rollout_pool is not None:
+            from flash.engine.worker.train.rl.launch.pool import RolloutPool
+
+            pool = RolloutPool.decode(options.rollout_pool)
+            pool.trainer_gpus(options.dp_cards + pool.gpus)
+            if options.algorithm != "grpo" or options.multimodal:
+                raise ValueError("separate rollout pilot supports dense text GRPO only")
         if any(
             type(step) is not int or not 0 < step <= options.total_steps
             for step in options.save_at_steps

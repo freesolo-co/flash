@@ -33,6 +33,7 @@ from flash.engine.worker.train.entry.prompt_rows import (
     prompt_message_features,
 )
 from flash.engine.worker.train.entry.sft_train import _hydra_val
+from flash.engine.worker.train.rl.launch.pool import RolloutPool, pool_overrides
 from flash.engine.worker.verl.capabilities import rollout_max_num_seqs
 from flash.engine.worker.verl.parallelism import (
     ULYSSES_SEQUENCE_PARALLEL_SIZE,
@@ -311,6 +312,7 @@ def _actor_overrides(cfg: dict) -> list[str]:
 
 def _rollout_overrides(cfg: dict) -> list[str]:
     """configure generation, batching, and rollout engine behavior."""
+    pool = RolloutPool.decode(cfg["rollout_pool"]) if cfg.get("rollout_pool") else None
     return [
         "actor_rollout_ref.rollout.name=vllm",
         f"actor_rollout_ref.rollout.n={cfg['group_size']}",
@@ -349,9 +351,10 @@ def _rollout_overrides(cfg: dict) -> list[str]:
         *rollout_mm_processor_cache_overrides(),
         # keep the rollout engine RESIDENT for models whose vLLM wake/reload HANGS (catalog
         # sleep_unsupported). shared with the opd driver, which runs the same verl sleep path.
-        *rollout_resident_overrides(bool(cfg.get("sleep_unsupported"))),
-        f"actor_rollout_ref.rollout.gpu_memory_utilization={cfg['gpu_mem_util']}",
-        f"actor_rollout_ref.rollout.tensor_model_parallel_size={cfg['n_gpus']}",
+        *rollout_resident_overrides(bool(pool or cfg.get("sleep_unsupported"))),
+        f"actor_rollout_ref.rollout.gpu_memory_utilization={pool.gpu_memory_utilization if pool else cfg['gpu_mem_util']}",
+        f"actor_rollout_ref.rollout.tensor_model_parallel_size={pool.tensor_parallel if pool else cfg['n_gpus']}",
+        *(pool_overrides(pool) if pool else []),
         f"actor_rollout_ref.rollout.temperature={cfg['temperature']}",
         f"actor_rollout_ref.rollout.top_p={cfg['top_p']}",
         # size vllm's kv cache for the job's context, not the architecture's. left unset, verl
@@ -382,13 +385,15 @@ def _reward_overrides(cfg: dict) -> list[str]:
 
 def _ray_overrides(cfg: dict) -> list[str]:
     """bound ray resources to the rented container."""
+    pool = RolloutPool.decode(cfg["rollout_pool"]) if cfg.get("rollout_pool") else None
+    total_gpus = cfg["n_gpus"] + (pool.gpus if pool else 0)
     return [
         # ray autodetects the HOST's cpu count inside a rented pod and eagerly forks one idle worker
         # per core, which has killed real runs two ways (host-ram oom, and a fatal raylet fork
         # failure that takes every actor with it). size the pool to the container instead.
-        f"ray_kwargs.ray_init.num_cpus={ray_num_cpus(cfg['n_gpus'])}",
+        f"ray_kwargs.ray_init.num_cpus={ray_num_cpus(total_gpus)}",
         # num_gpus is absent from verl's generated ray_init node, so hydra requires add-key syntax.
-        f"+ray_kwargs.ray_init.num_gpus={cfg['n_gpus']}",
+        f"+ray_kwargs.ray_init.num_gpus={total_gpus}",
     ]
 
 
@@ -614,7 +619,11 @@ def _build_verl_training_cfg(
     targeting = resolve_lora_targeting(
         inp["model_id"], algorithm="grpo", multimodal=bool(inp.get("multimodal"))
     )
+    pool = RolloutPool.decode(inp["rollout_pool"]) if inp.get("rollout_pool") else None
+    if pool and (inp.get("multimodal") or targeting.target_parameters):
+        raise ValueError("separate rollout pilot supports dense text GRPO only")
     return {
+        "rollout_pool": pool.encode() if pool else None,
         "fused_ce_backend": ce_backend,
         "train_files": train_files,
         "val_files": val_files,
@@ -653,7 +662,9 @@ def _build_verl_training_cfg(
         "ppo_epochs": inp["ppo_epochs"],
         "steps": int(inp["steps"]),
         "warmstart_adapter": inp["warmstart_adapter"],
-        "gpu_mem_util": resolve_gpu_mem_util(
+        "gpu_mem_util": pool.gpu_memory_utilization
+        if pool
+        else resolve_gpu_mem_util(
             inp,
             gpu_type=gpu_type,
             n_gpus=n_gpus,
@@ -718,6 +729,8 @@ def _build_verl_train_notes(
 ) -> dict:
     return {
         "backend": "verl",
+        "rollout_pool": inp.get("rollout_pool"),
+        "training_gpus": inp.get("dp_cards", 1),
         "steps": steps_run,
         "epochs": inp["epochs"],
         "retained_prompts": retained_prompts,

@@ -210,14 +210,16 @@ def _trainer_source(module: str) -> str:
     return "\n".join(pathlib.Path(_REPO_ROOT, p).read_text() for p in parts)
 
 
-def test_both_trainers_size_the_cpu_pool_from_their_own_gpu_count():
-    # a floor that the call sites never pass a gpu count to is a floor that only ever protects
-    # 1-gpu jobs, which is the shape of the bug this fixes. pin the wiring, not just the helper.
-    for module, expected in (
-        ("rl_train", "ray_num_cpus(cfg['n_gpus'])"),
-        ("opd_train", "ray_num_cpus(config['n_gpus_per_node'])"),
-    ):
-        assert expected in _trainer_source(module), module
+@pytest.mark.parametrize("rollout_gpus", [0, 2])
+def test_both_trainers_size_the_cpu_pool_from_their_own_gpu_count(monkeypatch, rollout_gpus):
+    from flash.engine.worker.train.rl.launch import verl_config
+
+    counts = []
+    monkeypatch.setattr(verl_config, "ray_num_cpus", lambda count: counts.append(count) or 24)
+    cfg = {"n_gpus": 4, "rollout_pool": {"gpus": rollout_gpus} if rollout_gpus else None}
+    assert "ray_kwargs.ray_init.num_cpus=24" in verl_config._ray_overrides(cfg)
+    assert counts == [4 + rollout_gpus]
+    assert "ray_num_cpus(config['n_gpus_per_node'])" in _trainer_source("opd_train")
 
 
 def test_every_ray_backed_trainer_constrains_rays_cpu_pool():
