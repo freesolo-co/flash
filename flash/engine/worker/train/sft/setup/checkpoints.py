@@ -1,8 +1,8 @@
-"""Export a verl checkpoint into a deployable adapter while training continues.
+"""Export and publish adapters alongside bounded native checkpoint persistence.
 
-verl writes a full fsdp checkpoint per save step; flash needs a peft adapter directory. Doing that
-conversion inline would stall the trainer, so `_VerlCheckpointWatcher` runs it on a background
-thread, one checkpoint at a time, and the parent joins it at the end of the run.
+The watcher exports completed verl checkpoints while training continues. A separate
+serial worker persists pinned native snapshots, so a recovery upload does not block
+the next adapter publication while queue capacity remains. Shutdown drains both.
 
 Split out of `flash.engine.worker.train.entry.sft_train` to keep that module under the file-size limit.
 """
@@ -18,6 +18,11 @@ import flash.engine.worker.io.hf as _worker_hf
 from flash.engine.worker.io.heartbeat import join_while_draining
 from flash.engine.worker.runtime.state import WorkerContext
 from flash.engine.worker.train.core.lifecycle.ledger import CheckpointLedger
+from flash.engine.worker.train.core.lifecycle.persistence import (
+    CheckpointPersistence,
+    pin_checkpoint,
+)
+from flash.engine.worker.train.core.lifecycle.timing import checkpoint_phase
 from flash.engine.worker.train.entry.backend_common import (
     completed_checkpoint_step,
     export_peft_adapter,
@@ -114,8 +119,8 @@ class _VerlCheckpointWatcher:
         self.context = context
         self.local_dir = local_dir
         self.export_root = export_root
-        # sibling of export_root so it shares its filesystem: _staged_source hardlinks into it, and
-        # os.link cannot cross a mount. holds one step at a time and is cleaned up after each publish.
+        # At most two pinned native snapshots, including the active recovery upload.
+        # Their lifetime is independent of adapter publication and trainer retention.
         self.staging_root = os.path.join(export_root, "_staging")
         self.published_dir = os.path.join(export_root, "_published")
         self.python_bin = python_bin
@@ -126,6 +131,7 @@ class _VerlCheckpointWatcher:
         self.required_steps = frozenset(required_steps)
         self.final_step = final_step
         self.lifecycle = CheckpointLedger()
+        self.persistence = CheckpointPersistence(context=context)
         self._error: BaseException | None = None
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._run, daemon=True)
@@ -149,10 +155,8 @@ class _VerlCheckpointWatcher:
 
     def stop(self, *, require_complete: bool) -> None:
         self._stop.set()
-        # bounded by lack of progress, not wall clock, so a big-model upload that is still moving
-        # is never killed (VERL-131). a watcher that died mid-publish is already not alive, so the
-        # join returns at once and raise_if_failed surfaces its real exception rather than a
-        # generic "did not stop".
+        # The run deadline bounds both publication and persistence draining. A watcher
+        # that failed surfaces its original error after accepted storage work drains.
         join_while_draining(self._thread, "verl checkpoint watcher", context=self.context)
         self.raise_if_failed()
         if require_complete:
@@ -216,27 +220,12 @@ class _VerlCheckpointWatcher:
         return keep
 
     def _staged_source(self, step: int, checkpoint_dir: str) -> str:
-        """hardlink a completed checkpoint before verl retention can prune it.
-
-        export and upload overlap training, while verl may delete ``global_step_N`` as soon as the
-        next save completes. hardlinks preserve the data in o(1) without moving the path referenced by
-        ``latest_checkpointed_iteration.txt``. copies can lose the same race; renames break resume.
-
-        best-effort: on failure, return the original race-exposed path rather than fail the run.
-        """
-        staged = os.path.join(self.staging_root, f"global_step_{step}")
-        try:
-            shutil.rmtree(staged, ignore_errors=True)
-            shutil.copytree(checkpoint_dir, staged, copy_function=os.link)
-        except OSError as error:
-            print(
-                f"[ckpt] step {step} could not be staged out of verl's retention tree "
-                f"({error}); publishing from verl's copy",
-                flush=True,
+        """Pin completed files until the recovery uploader releases them."""
+        self.persistence.wait_for_capacity()
+        with checkpoint_phase(step, "snapshot_pin"):
+            return pin_checkpoint(
+                checkpoint_dir, os.path.join(self.staging_root, f"global_step_{step}")
             )
-            shutil.rmtree(staged, ignore_errors=True)
-            return checkpoint_dir
-        return staged
 
     def _publish(self, step: int, checkpoint_dir: str) -> None:
         if not self._should_publish(step):
@@ -244,14 +233,42 @@ class _VerlCheckpointWatcher:
             return
         staged_dir = self._staged_source(step, checkpoint_dir)
         try:
-            self._publish_from(step, staged_dir)
+            with checkpoint_phase(step, "adapter_publication"):
+                self._publish_from(step, staged_dir)
             if self.lifecycle.facts(step).deployable_published:
                 self._acknowledge_publication(step)
-        finally:
-            if staged_dir != checkpoint_dir:
-                # the links have served their purpose once the upload returns; the originals and the
-                # exported adapter are untouched by this.
-                shutil.rmtree(staged_dir, ignore_errors=True)
+            self._persist_resume(step, staged_dir, job_label="sft")
+        except BaseException:
+            shutil.rmtree(staged_dir, ignore_errors=True)
+            raise
+
+    def _persist_resume(self, step: int, checkpoint_dir: str, *, job_label: str) -> None:
+        def persist():
+            started = time.monotonic()
+            try:
+                result = _worker_hf.upload_resume_checkpoint(
+                    step, checkpoint_dir, final_step=self.final_step, context=self.context
+                )
+                if (
+                    step in self.required_steps
+                    and result.resume is None
+                    and not result.resume_staged
+                ):
+                    resume_upload_unavailable(step, checkpoint_dir, job_label=job_label)
+                return result
+            finally:
+                shutil.rmtree(checkpoint_dir, ignore_errors=True)
+                print(
+                    f"[ckpt] step={step} persistence_s={time.monotonic() - started:.3f}",
+                    flush=True,
+                )
+
+        def complete(result):
+            self.lifecycle.record_publication(step, result)
+            if step in self.required_steps and result.resume is None and not result.resume_staged:
+                self.lifecycle.mark_failed(step)
+
+        self.persistence.submit(persist, complete)
 
     def _publish_from(self, step: int, checkpoint_dir: str) -> None:
         actor_dir = resolve_checkpoint_actor_dir(checkpoint_dir)
@@ -290,19 +307,14 @@ class _VerlCheckpointWatcher:
                 context=self.context,
             )
             self.lifecycle.record_publication(step, published)
-            uploaded = _worker_hf.upload_resume_checkpoint(
-                step, checkpoint_dir, final_step=self.final_step, context=self.context
-            )
-            self.lifecycle.record_publication(step, uploaded)
         finally:
             shutil.rmtree(adapter_dir, ignore_errors=True)
-        if step in self.required_steps and uploaded.resume is None and not uploaded.resume_staged:
-            self.lifecycle.mark_failed(step)
-            resume_upload_unavailable(step, checkpoint_dir, job_label="sft")
 
     def _run(self) -> None:
+        self.persistence.start()
         try:
             while True:
+                self.persistence.reap()
                 for step, checkpoint_dir in self._publishable(self._pending()):
                     self._publish(step, checkpoint_dir)
                 # re-read rather than reusing the sweep above: verl advances the tracker right up to
@@ -312,3 +324,9 @@ class _VerlCheckpointWatcher:
                 time.sleep(0.5)
         except BaseException as error:
             self._error = error
+        finally:
+            try:
+                self.persistence.close()
+            except BaseException as error:
+                if self._error is None:
+                    self._error = error

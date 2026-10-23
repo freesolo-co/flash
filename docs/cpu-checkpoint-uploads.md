@@ -4,8 +4,10 @@ New Modal training attempts always stage their final native recovery checkpoint
 on a private per-attempt Volume and publish it with a CPU worker after the GPU
 exits. There is no enable/disable setting. The trainer supplies its resolved final
 step, so explicit `train.max_steps` and epoch-derived horizons use the same path.
-Intermediate recovery saves and required adapter publication keep their existing
-ordering on the GPU worker.
+Intermediate recovery saves use a bounded persistence thread alongside adapter
+publication on the GPU worker's CPU. See
+[checkpoint storage overlap](checkpoint-storage-overlap.md) for ordering,
+backpressure and validation limits.
 
 The controller confirms GPU termination (including Volume commit) before starting
 a CPU-only uploader, capped at four cores, 8 GiB and 30 minutes, within the same

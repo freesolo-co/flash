@@ -10,6 +10,7 @@ from verl.trainer.ppo.v1.trainer_sync import PPOTrainerSync
 from flash.engine.worker.train.core.child.options import RuntimeOptions
 from flash.engine.worker.train.core.child.readiness import publish_ready
 from flash.engine.worker.train.core.child.tracking import publish_tracking_link
+from flash.engine.worker.train.core.lifecycle.timing import checkpoint_phase
 from flash.engine.worker.train.opd.child.policy import _init_transfer_queue
 from flash.engine.worker.train.opd.child.replay import BoundedReplayBuffer
 
@@ -43,7 +44,8 @@ class FlashSyncTrainer(PPOTrainerSync):
 
     def _save_checkpoint(self):
         if self.runtime.should_save(int(self.global_steps)):
-            return super()._save_checkpoint()
+            with checkpoint_phase(int(self.global_steps), "capture"):
+                return super()._save_checkpoint()
         return None
 
     def on_train_begin(self):
