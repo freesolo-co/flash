@@ -460,7 +460,7 @@ def estimate_vram_gb(
 
 # gc-off activation factors are empirical and geometry-specific; the estimate scales with
 # layers*batch*seq*hidden. dense 65.0 is a live RTX 5090 fit against successful peaks. remeasure
-# before widening the >=120 GB dense gate.
+# when changing the activation estimate or its safety margin.
 #
 # the MoE factor was 18.0 -- a guess, carried on the assumption that ~3B active params imply small
 # activations. that is wrong: routing is per-token, so every one of the 40 layers still
@@ -493,7 +493,13 @@ def sft_gc_off_peak_gb(
     Includes resident weights, optimizer/base, and all-layer activations; unknown geometry returns
     `inf`. MoE activations use hidden/layer geometry while weights retain full parameter size.
     """
-    if not (hidden and num_layers and seq_len):
+    sizes = (params_b, hidden, num_layers, seq_len, batch, lora_rank)
+    if any(not math.isfinite(value) or value <= 0 for value in sizes):
+        return float("inf")
+    if quant not in _BYTES_PER_PARAM or (
+        active_params_b is not None
+        and (not math.isfinite(active_params_b) or not 0 <= active_params_b <= params_b)
+    ):
         return float("inf")
     bpp = _BYTES_PER_PARAM.get(quant, 2.0)
     eff_b = float(active_params_b) if active_params_b else float(params_b)
@@ -518,15 +524,20 @@ def sft_grad_checkpoint_can_disable(
     batch: int = _SFT_PER_DEVICE_BS_DEFAULT,
     lora_rank: int = 32,
     quant: str = "bf16",
-    margin_gb: float = 18.0,
+    margin_gb: float | None = None,
     model_info=None,
 ) -> bool:
     """True when a dense-logit-free LoRA SFT step fits a card WITHOUT gradient checkpointing.
 
-    Unknown geometry or insufficient `margin_gb` keeps checkpointing on. The MoE factor is padded;
-    the empirical dense factor relies on the explicit margin.
+    Unknown geometry or insufficient headroom keeps checkpointing on. Dense workloads reserve
+    8 GB beyond the estimated peak; MoE retains its 18 GB margin calibrated against live OOMs.
+    These margins depend on the activation model, not a model ID, revision, or GPU family.
     """
-    if not card_vram_gb or card_vram_gb <= 0 or not (hidden and num_layers and seq_len):
+    if margin_gb is None:
+        margin_gb = 18.0 if active_params_b else 8.0
+    if not math.isfinite(card_vram_gb) or card_vram_gb <= 0:
+        return False
+    if not math.isfinite(margin_gb) or margin_gb < 0:
         return False
     peak = sft_gc_off_peak_gb(
         params_b,

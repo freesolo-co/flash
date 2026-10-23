@@ -2787,6 +2787,8 @@ def test_run_sft_train_orchestrates_exact_dataset_and_resume_accounting(
     assert captured["sft_grad_accum"]["fused"] is True
     assert captured["grad_checkpointing"]["max_length"] == realized_max_length
     assert captured["grad_checkpointing"]["fused_ce"] is True
+    assert captured["grad_checkpointing"]["allow_disable"] is True
+    assert captured["grad_checkpointing"]["per_device_bs"] == notes["per_device_train_batch_size"]
     assert "data.max_length=1024" in captured["command"]
     assert (
         f"data.max_token_len_per_gpu={realized_max_length * notes['per_device_train_batch_size']}"
@@ -2949,6 +2951,7 @@ def test_sft_runner_carries_the_prepared_processor_to_every_export(
 
     sft_train.run_sft_train(spec, context=worker_context)
 
+    assert _run_capture["grad_checkpointing"]["allow_disable"] is (not multimodal)
     assert captured["watcher_preprocessor"] is processor
     assert captured["final_preprocessor"] is processor
 

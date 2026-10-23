@@ -27,7 +27,7 @@ predeclared ±5-point equivalence margin. This is a small, single-task study, no
 of identical numerics or universal quality equivalence. Loss trajectories and individual
 predictions differ; the change does not promise bitwise identity.
 
-## What changed
+## What changed in the measured candidate
 
 - Stage the exact pinned public SFT base weights on bounded CPU compute before GPU launch.
   Candidate GPU-side downloads measured 0 seconds; controls measured 98.7–238.3 seconds.
@@ -86,6 +86,21 @@ budget control; production retains unbounded bursts above its minimum reservatio
 
 Machine-readable per-run metrics, source attestations, token hashes, bootstrap interval,
 and provider billing records are in [the result JSON](sft-cost-ab-2026-10-23.json).
-The final PR production-source archive matches the tested candidate archive exactly;
-subsequent commits add documentation/results only. CI passes on Python 3.11 and 3.12,
-including lint, size/layout gates, offline tests, and serial wall-clock tests.
+The measured production-source archive matches candidate `8b3b2de0`. Its validation included
+Python 3.11 and 3.12 CI, lint, size/layout gates, offline tests, and serial wall-clock tests.
+
+## Subsequent memory-policy change
+
+The PR now uses the shared memory estimate for text SFT with fused loss instead of the
+model/revision/GPU allowlist above. Checkpointing is disabled only when estimated weights,
+LoRA/optimizer state and activations fit with headroom: 8 GB for dense models and 18 GB for
+MoE. Actual row length, microbatch, rank and model geometry drive the estimate. Missing or
+invalid sizing inputs keep checkpointing enabled. Multimodal training and GRPO retain their
+existing defaults; the estimate does not model vision activations. Multi-GPU text SFT uses
+the conservative full-model estimate per card without assuming any sharding savings.
+
+The benchmark configuration still disables checkpointing under the new rule. CPU regression
+tests cover other model identities, revisions, geometries, memory capacities and workload
+sizes, as well as the existing measured OOM boundaries. The six GPU runs above tested the
+earlier policy; they have not been rerun on this revision and do not validate every newly
+eligible workload.

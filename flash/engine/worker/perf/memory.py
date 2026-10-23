@@ -20,9 +20,7 @@ def grad_checkpointing_on(
     max_length: int = 0,
     *,
     allow_disable: bool = False,
-    allow_short_dense: bool = False,
     card_vram_gb: float = 0.0,
-    capability: tuple[int, int] | None = None,
     active_params_b: float | None = None,
     hidden: int = 0,
     num_layers: int = 0,
@@ -32,36 +30,11 @@ def grad_checkpointing_on(
     revision: str = "",
 ) -> bool:
     """Gradient-checkpointing default, with an SFT-only opt-out when GC-off fits."""
-    base = _prefer_gradient_checkpointing(model_id, max_length, revision=revision)
     if not allow_disable:
-        return base
-    if not base:
-        return False
-    # qualified short-context dense path; keep the larger-model/MoE gate unchanged.
-    # use realized row length and microbatch, never the configured context ceiling.
-    short_dense = (
-        allow_short_dense
-        and model_id == "Qwen/Qwen3.5-9B"
-        and revision == "c202236235762e1c871ad0ccb60c8ee5ba337b9a"
-        and capability == (8, 9)
-        and 47 <= card_vram_gb < 50
-        and 0 < max_length <= 512
-        and per_device_bs == 1
-        and 0 < lora_rank <= 8
-        and hidden == 4096
-        and num_layers == 32
-        and not active_params_b
-    )
-    can_consider_gc_off = fused_ce and (
-        short_dense
-        or (
-            active_params_b
-            and card_vram_gb
-            and card_vram_gb >= 120.0
-            and (capability is None or capability >= (9, 0))
-        )
-    )
-    if not can_consider_gc_off:
+        return _prefer_gradient_checkpointing(model_id, max_length, revision=revision)
+    # The estimate covers text SFT with chunked loss. Decide from the actual workload,
+    # including small models: even a small model can run out of memory at a large batch.
+    if not fused_ce:
         return True
     from flash.core.catalog import MODELS
 
@@ -78,11 +51,10 @@ def grad_checkpointing_on(
         hidden=hidden,
         num_layers=num_layers,
         card_vram_gb=card_vram_gb,
-        batch=per_device_bs or 4,
+        batch=per_device_bs,
         lora_rank=lora_rank,
         quant=(getattr(info, "quant", "bf16") or "bf16") if info else "bf16",
         model_info=info,
-        margin_gb=8.0 if short_dense else 18.0,
     ):
         print(
             f"[sft] gradient checkpointing OFF: GC-off peak fits {card_vram_gb:.0f} GB "

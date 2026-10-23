@@ -9,7 +9,6 @@ from types import SimpleNamespace
 import pytest
 
 from flash.core.spec import JobSpec
-from flash.engine.worker.perf.memory import grad_checkpointing_on
 from flash.providers.core.base import UnreconciledCreateError, get_gpu_info
 from flash.providers.modal import api, prefetch
 from flash.providers.modal.handles import ModalJobHandle
@@ -23,51 +22,6 @@ from flash.providers.modal.pricing import (
 from tests.test_modal_provider import AsyncMethod, remote
 
 PIN = "c202236235762e1c871ad0ccb60c8ee5ba337b9a"
-
-
-def dense_gate(**overrides):
-    options = {
-        "model_id": "Qwen/Qwen3.5-9B",
-        "max_length": 496,
-        "revision": PIN,
-        "allow_disable": True,
-        "allow_short_dense": True,
-        "card_vram_gb": 47.695921152,
-        "capability": (8, 9),
-        "hidden": 4096,
-        "num_layers": 32,
-        "fused_ce": True,
-        "per_device_bs": 1,
-        "lora_rank": 8,
-    }
-    return grad_checkpointing_on(**(options | overrides))
-
-
-def test_qualified_short_dense_workload_avoids_recompute():
-    assert dense_gate() is False
-
-
-@pytest.mark.parametrize(
-    "override",
-    [
-        {"max_length": 513},
-        {"max_length": 0},
-        {"lora_rank": 16},
-        {"per_device_bs": 2},
-        {"per_device_bs": 0},
-        {"card_vram_gb": 24},
-        {"fused_ce": False},
-        {"revision": "f" * 40},
-        {"hidden": 0},
-        {"num_layers": 24},
-        {"capability": (9, 0)},
-        {"allow_disable": False},
-        {"allow_short_dense": False},
-        {"active_params_b": 3.0},
-    ],
-)
-def test_unqualified_shapes_keep_recompute(override):
-    assert dense_gate(**override) is True
 
 
 def test_rate_matches_actual_minimum_reservations():

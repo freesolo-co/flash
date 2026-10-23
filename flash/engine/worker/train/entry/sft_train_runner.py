@@ -393,17 +393,13 @@ def _prepare_sft_model(
     )
 
     card_vram_gb = float(options.gpu_probe.get("memory_gb") or 0.0)
-    raw_capability = options.gpu_probe.get("capability")
-    capability = tuple(raw_capability) if raw_capability else None
     info = MODELS.get(options.model_id)
     active_params_b = float(getattr(info, "active_params_b", 0.0) or 0.0) or None
     gradient_checkpointing = _sft_train._resolve_sft_gradient_checkpointing(
         options.model_id,
         data.realized_max_length,
-        allow_disable=True,
-        allow_short_dense=not data.multimodal and options.gpu_count == 1,
+        allow_disable=not data.multimodal,
         card_vram_gb=card_vram_gb,
-        capability=capability,
         active_params_b=active_params_b,
         hidden=hidden,
         num_layers=layers,

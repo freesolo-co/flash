@@ -257,6 +257,12 @@ implementation. GPU selection now uses Modal's supported card counts and estimat
 memory rates. Cross-cloud fallback and marketplace offer selection have been removed. Modal
 queues reservations subject to workspace capacity and quotas.
 
+For text SFT with fused loss, gradient checkpointing is disabled when the estimated full-model
+training peak fits on each GPU with headroom (8 GB for dense models, 18 GB for MoE). The decision
+uses actual tokenized row lengths, microbatch size, LoRA rank and model geometry, without a
+model-revision or GPU-family allowlist. Unknown sizing inputs keep checkpointing enabled.
+Multimodal training and GRPO retain their existing checkpointing defaults.
+
 Each training sandbox reserves at least two CPU cores and 8 GiB RAM per GPU, and can burst above these
 requests during compilation and checkpoint export. A sandbox has a 24-hour lifetime
 limit and at most 512 GiB ephemeral disk. Cost records are resource-rate estimates, not Modal
