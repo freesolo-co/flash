@@ -7,7 +7,7 @@ import math
 import sys
 import time
 import uuid
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Awaitable, Callable
 from typing import Any, NotRequired, TypedDict
 
 from flash.serve.request.tool_calls import (
@@ -421,6 +421,8 @@ async def stream_generate(
     expected_checkpoint: str | None = None,
     generation_id: str | None = None,
     capacity: dict[str, Any] | None = None,
+    *,
+    pre_generate_check: Callable[[], Awaitable[None]] | None = None,
 ) -> AsyncIterator[dict[str, Any]]:
     from vllm.sampling_params import RequestOutputKind
 
@@ -469,6 +471,10 @@ async def stream_generate(
     }
     try:
         try:
+            # Hydration and image preparation may outlive the caller. Recheck the
+            # invocation lease immediately before admitting GPU work.
+            if pre_generate_check is not None:
+                await pre_generate_check()
             output_stream = owner.engine.generate(
                 prompt_input,
                 sampling,

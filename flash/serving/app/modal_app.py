@@ -6,6 +6,7 @@ README to deploy.
 
 import asyncio
 import os
+import time
 import uuid
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -385,18 +386,31 @@ def _build_engine(
                 payload_dict, record_dict, expected_checkpoint, generation_id
             )
 
-        @modal.method(is_generator=True)
-        async def stream_generate(
+        @modal.method()
+        async def stream_generate_call(
             self,
             payload_dict: dict[str, Any],
-            record_dict: dict[str, Any] | None = None,
-            expected_checkpoint: str | None = None,
-            generation_id: str | None = None,
-        ):
-            async for event in self._stream_generate(
-                payload_dict, record_dict, expected_checkpoint, generation_id
-            ):
-                yield event
+            record_dict: dict[str, Any] | None,
+            expected_checkpoint: str | None,
+            generation_id: str,
+            dispatch_deadline_unix: float,
+            queue_id: str,
+            invocation_nonce: str,
+        ) -> dict[str, Any]:
+            from flash.serving.src.stream_channel.engine import stream_generate_call
+
+            # A regular async invocation avoids Modal's generator-output drain on
+            # disconnect, which can time out and kill a shared GPU replica.
+            return await stream_generate_call(
+                self,
+                payload_dict,
+                record_dict,
+                expected_checkpoint,
+                generation_id,
+                dispatch_deadline_unix,
+                queue_id,
+                invocation_nonce,
+            )
 
         @modal.method()
         async def unregister(
@@ -505,11 +519,16 @@ class _ModalEnginePool:
         if not generation_id:
             raise RuntimeError("generation id is required before modal dispatch")
         engine = _engine_cls_for(base_model)(base_model=base_model)
-        remote_stream = engine.stream_generate.remote_gen.aio(
-            payload.model_dump(),
-            self._record_payload(record),
-            expected_checkpoint,
-            generation_id,
+        from flash.serving.src.stream_channel.client import CancellableStreamChannel
+
+        remote_stream = CancellableStreamChannel(
+            spawn_method=engine.stream_generate_call,
+            payload_dict=payload.model_dump(),
+            record_dict=self._record_payload(record),
+            expected_checkpoint=expected_checkpoint,
+            generation_id=generation_id,
+            dispatch_deadline_unix=time.time() + ROUTER_TIMEOUT_SECONDS,
+            invocation_nonce=uuid.uuid4().hex,
         )
         try:
             async for event in remote_stream:
