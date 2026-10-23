@@ -3,8 +3,8 @@
 The published worker image ships DEPS only — the flash code (incl. kernel_warmup.py) is fetched from
 HF at runtime, exactly like a real worker. So this entry:
   1. snapshot_downloads the flash package (code/**) the CI helper uploaded to a temp HF dataset,
-  2. runs flash.engine.worker.runtime.kernel_warmup --arch <arch> --out /out on the live GPU,
-  3. uploads the produced /out (architecture metadata + triton/inductor trees) back under out/,
+  2. warms kernels at their final /opt/flash/kernelcache path in the training interpreter,
+  3. replays an exported copy, then uploads the verified archive back under out/,
   4. writes an out/STATUS marker LAST so the helper knows the run finished (and its rc).
 
 It is invoked by the CI helper via the sandbox command. Env:
@@ -16,9 +16,23 @@ It is invoked by the CI helper via the sandbox command. Env:
 import io
 import json
 import os
+import shutil
 import subprocess
 import tarfile
 import time
+
+CACHE_DIR = "/opt/flash/kernelcache"
+OUT_DIR = "/out"
+CACHE_ARCHIVE = "/tmp/kernel_cache.tar.gz"
+
+
+def _roundtrip_cache(cache_dir: str, archive_path: str) -> None:
+    """Replay only exported files, at the absolute paths embedded by Triton."""
+    with tarfile.open(archive_path, "w:gz", compresslevel=1) as archive:
+        archive.add(cache_dir, arcname=".")
+    shutil.rmtree(cache_dir)
+    with tarfile.open(archive_path, "r:gz") as archive:
+        archive.extractall(cache_dir, filter="data")
 
 
 def main() -> int:
@@ -70,50 +84,59 @@ def main() -> int:
     python_bin = os.environ.get("FLASH_VERL_PYTHON", "/opt/verl-venv/bin/python")
     if not os.path.isfile(python_bin):
         raise RuntimeError(f"training interpreter missing: {python_bin}")
+    cache_dir = CACHE_DIR
+    # An already-baked input image must not supply stale artifacts or validation receipts.
+    shutil.rmtree(cache_dir, ignore_errors=True)
+    os.makedirs(cache_dir)
     cmd = [
         python_bin,
         "-m",
         "flash.engine.worker.runtime.kernel_warmup",
         "--out",
-        "/opt/flash/kernelcache",
+        cache_dir,
     ]
     if arch:
         cmd += ["--arch", arch]
     print(f"[bake] running: {' '.join(cmd)}", flush=True)
     # capture the warmup output into /out so it ships back with the cache -- lets the CI helper show
     # which warm steps ran and why a bake failed to produce compiled kernel files.
-    os.makedirs("/out", exist_ok=True)
+    os.makedirs(OUT_DIR, exist_ok=True)
     started = time.monotonic()
-    with open("/out/warmup.log", "wb") as lf:
+    with open(os.path.join(OUT_DIR, "warmup.log"), "wb") as lf:
         rc = subprocess.call(cmd, env=env, stdout=lf, stderr=subprocess.STDOUT)
     first_seconds = time.monotonic() - started
     validation = {"first_process_seconds": first_seconds, "first_exit_code": rc}
     if rc == 0:
-        # Import and execute from a fresh process: an in-memory JIT hit cannot prove that
-        # another training process can load the baked on-disk artifacts.
+        # Remove the compiler outputs and restore only the exported archive. A fresh process
+        # alone could otherwise reuse files that never make it into the shipped artifact.
+        _roundtrip_cache(cache_dir, CACHE_ARCHIVE)
         started = time.monotonic()
-        with open("/out/warmup.log", "ab") as lf:
+        with open(os.path.join(OUT_DIR, "warmup.log"), "ab") as lf:
             lf.write(b"\n[bake] fresh-process cache reload validation\n")
             rc = subprocess.call(
                 [*cmd, "--verify-cache"], env=env, stdout=lf, stderr=subprocess.STDOUT
             )
-        validation.update(reload_process_seconds=time.monotonic() - started, reload_exit_code=rc)
-    with open("/opt/flash/kernelcache/cache_validation.json", "w") as output:
+        validation.update(
+            reload_process_seconds=time.monotonic() - started,
+            reload_exit_code=rc,
+            exported_cache_replayed=True,
+        )
+    with open(os.path.join(cache_dir, "cache_validation.json"), "w") as output:
         json.dump(validation, output)
     print(f"[bake] kernel_warmup rc={rc}", flush=True)
     # Hub repositories reject nested .cache paths (FlashInfer uses one). Transport the exact
     # directory layout as an archive, compiled at its final image path, without a second tree copy.
     try:
-        with tarfile.open("/tmp/kernel_cache.tar.gz", "w:gz", compresslevel=1) as archive:
-            archive.add("/opt/flash/kernelcache", arcname=".")
+        with tarfile.open(CACHE_ARCHIVE, "w:gz", compresslevel=1) as archive:
+            archive.add(cache_dir, arcname=".")
         api.upload_file(
-            path_or_fileobj="/tmp/kernel_cache.tar.gz",
+            path_or_fileobj=CACHE_ARCHIVE,
             path_in_repo="out/kernel_cache.tar.gz",
             repo_id=repo,
             repo_type="dataset",
         )
         api.upload_file(
-            path_or_fileobj="/out/warmup.log",
+            path_or_fileobj=os.path.join(OUT_DIR, "warmup.log"),
             path_in_repo="out/bake-warmup.log",
             repo_id=repo,
             repo_type="dataset",
