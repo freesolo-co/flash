@@ -40,6 +40,13 @@ class PoolActorWorker(FlashActorRolloutWorker):
 
 
 class PoolCheckpointWorker(CheckpointEngineWorker):
+    def __init__(self, *args, **kwargs):
+        # Ray unpickles the already-built model config without __post_init__.
+        # Register the server adapter in this receiving process explicitly.
+        from flash.engine.worker.train.core.child import registration  # noqa: F401
+
+        super().__init__(*args, **kwargs)
+
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def set_adapter_config(self, config):
         if not isinstance(config, dict) or not config.get("r"):

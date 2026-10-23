@@ -2,6 +2,8 @@
 
 import asyncio
 import importlib.util
+import subprocess
+import sys
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
@@ -108,6 +110,26 @@ def test_receiver_requires_metadata_and_preserves_version_and_adapter_mode():
         global_steps=7,
         peft_config={"r": 8, "lora_alpha": 16, "target_modules": ["q_proj"]},
         base_sync_done=True,
+    )
+
+
+def test_receiver_registers_server_adapter_in_a_fresh_process():
+    subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "from verl.checkpoint_engine.base import CheckpointEngineWorker\n"
+                "from verl.workers.rollout.base import _ROLLOUT_REGISTRY\n"
+                "from flash.engine.worker.train.rl.child.pool_weights import PoolCheckpointWorker\n"
+                "def initialize(self):\n"
+                "    assert ('flash_vllm', 'async') in _ROLLOUT_REGISTRY\n"
+                "CheckpointEngineWorker.__init__ = initialize\n"
+                "PoolCheckpointWorker()\n"
+            ),
+        ],
+        check=True,
+        timeout=60,
     )
 
 
