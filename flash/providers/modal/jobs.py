@@ -23,7 +23,7 @@ from flash.providers.artifacts.hf import (
     make_hf_text_reader,
 )
 from flash.providers.core.base import JobHandle, get_gpu_info
-from flash.providers.modal import api
+from flash.providers.modal import api, prefetch
 from flash.providers.modal.auth import scope_fingerprint
 from flash.providers.modal.handles import ModalJobHandle, require_scope
 from flash.providers.modal.pricing import hourly_rate
@@ -89,6 +89,8 @@ def poll(handle, spec, *, log=None, deadline_at=None):
             if started is not None
             else "unknown_start_time",
         )
+        if h.cpu_prefetch:
+            notes["cpu_prefetch"] = h.cpu_prefetch
 
     terminal_reader = reader(f"modal_attempt{h.attempt}.json")
     gpu_reader = reader(f"modal_gpu_attempt{h.attempt}.json") if h.cpu_uploads else None
@@ -189,6 +191,7 @@ def submit_attempt(
 
     name = instance_label(spec.run_id, attempt)
     payload["handoff_volume"] = checkpoint_upload.volume_name(owner_scope, spec.run_id, attempt)
+    cpu_prefetch = prefetch.prepare(spec, attempt=attempt, payload=payload, deadline_at=deadline_at)
     started = time.time()
     capsule, _ = build_capsule("instance-bootstrap")
     sandbox_id = api.create(
@@ -215,6 +218,7 @@ def submit_attempt(
             phase=spec.phase,
             gpu_count=count,
             cpu_uploads=True,
+            cpu_prefetch=cpu_prefetch,
             scope=owner_scope,
         )
         handle = JobHandle.from_dict(h.to_dict())

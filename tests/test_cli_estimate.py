@@ -1181,8 +1181,8 @@ def test_higher_warm_start_rank_can_select_cheaper_hardware(monkeypatch):
     rank_1 = estimate_cost(replace(config, lora_rank=1))
     rank_8 = estimate_cost(replace(config, lora_rank=8))
 
-    assert (rank_1.gpu, rank_1.gpu_count, rank_1.gpu_hourly_usd) == ("B200", 1, 5.50 + 1.336032)
-    assert (rank_8.gpu, rank_8.gpu_count, rank_8.gpu_hourly_usd) == ("H200", 2, 3.00 + 1.336032)
+    assert (rank_1.gpu, rank_1.gpu_count, rank_1.gpu_hourly_usd) == ("B200", 1, 5.50 + 0.47592)
+    assert (rank_8.gpu, rank_8.gpu_count, rank_8.gpu_hourly_usd) == ("H200", 2, 3.00 + 0.47592)
     assert rank_8.total_usd < rank_1.total_usd
 
 

@@ -1,10 +1,6 @@
-"""SFT gradient-checkpointing-OFF gate for the 35B-A3B MoE on a big card (CPU-only, no GPU).
+"""Memory-based SFT checkpointing regressions, including measured dense and MoE OOM boundaries.
 
-GC recomputes the forward in the backward (~+33% compute) to save activation memory. For a big MoE
-with a cheap ~3B active backbone + fused CE (Liger FLCE drops the [B,T,vocab] logit spike), the
-no-recompute activations were assumed to FIT an H200 / B200 with margin — so GC is pure tax and we turn
-it OFF. The gate is conservative: it only fires with the SFT signals (``allow_disable=True``), keeps
-GC on for the 80 GB H100 / long context / unknown dims, and never touches the colocated GRPO trainer.
+The worker opts into the estimate for text SFT with fused loss; GRPO retains its defaults.
 """
 
 from __future__ import annotations
@@ -76,7 +72,6 @@ def test_gc_off_gate_is_lora_rank_aware():
         "num_layers": 40,
         "fused_ce": True,
         "per_device_bs": 1,
-        "capability": (9, 0),
     }
     assert grad_checkpointing_on(card_vram_gb=191.5, lora_rank=8, **kw) is False  # GC off (fits)
     assert grad_checkpointing_on(card_vram_gb=191.5, lora_rank=64, **kw) is True  # GC kept on
@@ -110,12 +105,10 @@ def test_dense_activation_constant_matches_the_live_rtx5090_peak():
     # seq 4096 OOMed a 31.37 GB card, so the estimate must exceed the card and keep GC ON.
     assert sft_gc_off_peak_gb(0.8, seq_len=4096, **dense) > 31.37
     assert sft_grad_checkpoint_can_disable(0.8, seq_len=4096, card_vram_gb=31.37, **dense) is False
-    # the 18 GB margin is what blocks the seq lengths that DO fit bare (15.09 GB at seq 1024 leaves
-    # only 16.28 GB), so a 32 GB card never disables GC for this model at any production context.
-    for seq in (1024, 2048):
-        assert (
-            sft_grad_checkpoint_can_disable(0.8, seq_len=seq, card_vram_gb=31.37, **dense) is False
-        )
+    # The dense safety margin allows the measured 1024-token success, while rejecting
+    # the tighter 2048-token case even though that particular measured run fit bare.
+    assert sft_grad_checkpoint_can_disable(0.8, seq_len=1024, card_vram_gb=31.37, **dense)
+    assert not sft_grad_checkpoint_can_disable(0.8, seq_len=2048, card_vram_gb=31.37, **dense)
 
 
 def test_dense_and_moe_activation_constants_are_separate():
@@ -224,7 +217,6 @@ def test_gate_turns_gc_off_for_35b_on_b200():
         711,
         allow_disable=True,
         card_vram_gb=191.5,
-        capability=(9, 0),
         active_params_b=3.0,
         hidden=2048,
         num_layers=40,
@@ -243,7 +235,6 @@ def test_gate_keeps_gc_on_for_the_step_that_oomed_the_b200():
         1404,
         allow_disable=True,
         card_vram_gb=191.5,
-        capability=(9, 0),
         active_params_b=3.0,
         hidden=2048,
         num_layers=40,
@@ -262,7 +253,6 @@ def test_gate_keeps_gc_on_for_35b_on_h200():
         2368,
         allow_disable=True,
         card_vram_gb=150.1,
-        capability=(9, 0),
         active_params_b=3.0,
         hidden=2048,
         num_layers=40,
@@ -278,7 +268,6 @@ def test_gate_keeps_gc_on_h100_80gb():
         2368,
         allow_disable=True,
         card_vram_gb=80.0,
-        capability=(9, 0),
         active_params_b=3.0,
         hidden=2048,
         num_layers=40,
@@ -295,7 +284,6 @@ def test_gate_keeps_gc_on_when_fused_ce_off():
         2368,
         allow_disable=True,
         card_vram_gb=150.1,
-        capability=(9, 0),
         active_params_b=3.0,
         hidden=2048,
         num_layers=40,
@@ -310,9 +298,7 @@ def test_gate_unchanged_without_disable_signal():
     assert grad_checkpointing_on("Qwen/Qwen3.6-35B-A3B", 2368) is True
     # Even passing GPU signals positionally-free: without allow_disable they're ignored.
     assert (
-        grad_checkpointing_on(
-            "Qwen/Qwen3.6-35B-A3B", 2368, card_vram_gb=150.1, capability=(9, 0), fused_ce=True
-        )
+        grad_checkpointing_on("Qwen/Qwen3.6-35B-A3B", 2368, card_vram_gb=150.1, fused_ce=True)
         is True
     )
 
