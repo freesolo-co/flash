@@ -1,6 +1,6 @@
 """validated, serializable options for an explicitly constructed trainer runtime."""
 
-from dataclasses import asdict, dataclass, fields
+from dataclasses import asdict, dataclass, field, fields
 
 
 @dataclass(frozen=True)
@@ -25,6 +25,8 @@ class RuntimeOptions:
     kl_ref_adapter: bool = False
     multi_turn: bool = False
     no_signal_attempts: int = 1
+    rollout_run_id: str = ""
+    rollout_template_kwargs: dict = field(default_factory=dict)
 
     @classmethod
     def decode(cls, value):

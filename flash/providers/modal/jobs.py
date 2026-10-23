@@ -49,7 +49,12 @@ def poll(handle, spec, *, log=None, deadline_at=None):
 
     def fetch_instance():
         nonlocal worker_started, returncode
-        worker_started = worker_started or read_start()
+        observed_start = worker_started or read_start()
+        if worker_started is None and observed_start is not None and log is not None:
+            log(
+                f"allocation and bootstrap: {max(0, observed_start - h.started_ts):.1f}s to worker start"
+            )
+        worker_started = observed_start
         instance = api.get_instance(h.instance_id, deadline_at=deadline_at)
         if instance is not None:
             returncode = instance.get("returncode")
@@ -74,6 +79,8 @@ def poll(handle, spec, *, log=None, deadline_at=None):
         else:
             metrics["cost_usd"] = round(max(0, end_ts - started) / 3600 * h.hourly_usd, 6)
         notes = metrics.setdefault("notes", {})
+        if started is not None:
+            notes["allocation_to_worker_start_s"] = round(max(0, started - h.started_ts), 3)
         notes.update(
             provider="modal",
             modal_rate_usd_hr=h.hourly_usd,

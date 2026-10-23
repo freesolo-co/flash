@@ -5,6 +5,7 @@ import json
 import os
 from pathlib import Path
 
+from flash.engine.worker.runtime.phases import training_phase
 from flash.engine.worker.train.core.child.options import RuntimeOptions
 from flash.engine.worker.train.core.child.startup import initialize_process, validate_environment
 
@@ -33,6 +34,10 @@ def configure(options, overrides):
         model = config.model if options.algorithm == "sft" else config.actor_rollout_ref.model
         model._target_ = "flash.engine.worker.train.core.child.configuration.FlashModelConfig"
         model.runtime_options = options.encode()
+        if options.algorithm == "grpo":
+            model.runtime_options["rollout_template_kwargs"] = dict(
+                config.data.get("apply_chat_template_kwargs", {})
+            )
         if options.algorithm == "sft":
             engines = [config.engine]
         else:
@@ -95,8 +100,9 @@ def run_sft(config, options):
 
     initialize_global_process_group()
     try:
-        trainer = FlashSFTTrainer(config)
-        distributed.barrier()
+        with training_phase("trainer_initialization"):
+            trainer = FlashSFTTrainer(config)
+            distributed.barrier()
         if distributed.get_rank() == 0:
             publish_ready(options)
         trainer.fit()

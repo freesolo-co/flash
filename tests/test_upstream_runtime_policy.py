@@ -59,17 +59,21 @@ def test_server_requires_training_adapter_and_preserves_exact_finish_reason(monk
     recipe = _import_recipe(monkeypatch, "flash.engine.worker.train.core.child.rollout")
     server = recipe.FlashVLLMServer()
     server.lora_as_adapter = True
+    server.model_config = SimpleNamespace(runtime_options={"algorithm": "opd"})
 
     async def list_loras():
         return [123] if loaded else []
 
     server.engine = SimpleNamespace(list_loras=list_loras)
     if loaded:
-        assert asyncio.run(server.generate()) == "tokens"
+        assert (
+            asyncio.run(server.generate(prompt_ids=[1], sampling_params={}, request_id="req"))
+            == "tokens"
+        )
         assert calls == ["generated"]
     else:
         with pytest.raises(RuntimeError, match="refusing base-model generation"):
-            asyncio.run(server.generate())
+            asyncio.run(server.generate(prompt_ids=[1], sampling_params={}, request_id="req"))
         assert not calls
     output = SimpleNamespace(extra_fields={})
     server._postprocess_output(

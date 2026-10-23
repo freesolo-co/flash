@@ -18,6 +18,7 @@ import time
 from flash._internal.diagnostics import sanitize_diagnostic
 from flash.engine.support.huggingface import hub_error_transience, model_revision_kwargs
 from flash.engine.worker.perf import RetriableInfraError
+from flash.engine.worker.runtime.phases import timed_phase
 from flash.engine.worker.runtime.state import WorkerContext
 from flash.envs.loading.loader import is_commit_sha
 
@@ -195,6 +196,7 @@ def _snapshot_has_weights(snapshot_dir: str) -> bool:
     return False
 
 
+@timed_phase("model_download")
 def prefetch_model(model_id: str, revision: str = "", *, context: WorkerContext) -> float:
     """Pull base-model weights into the HF cache up front; return seconds spent.
 

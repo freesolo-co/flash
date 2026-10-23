@@ -38,7 +38,9 @@ def test_verify_accepts_real_raw_artifacts(tmp_path, artifact):
     path.parent.mkdir(exist_ok=True)
     path.write_bytes(b"compiled")
     (tmp_path / "mega_cache.json").write_text('{"sm": "sm100"}')
-    (tmp_path / "cache_validation.json").write_text('{"first_exit_code": 0, "reload_exit_code": 0}')
+    (tmp_path / "cache_validation.json").write_text(
+        '{"first_exit_code": 0, "reload_exit_code": 0, "exported_cache_replayed": true}'
+    )
     (tmp_path / "cache_reload.json").write_text(
         '{"compilation_forbidden": true, "compile_attempts": 0, "passed": true}'
     )
@@ -46,12 +48,18 @@ def test_verify_accepts_real_raw_artifacts(tmp_path, artifact):
     assert bake_module()._verify(str(tmp_path), "sm90") == 1
 
 
-@pytest.mark.parametrize("failure", ["missing", "recompiled", "unguarded", "failed", "reload_exit"])
+@pytest.mark.parametrize(
+    "failure", ["missing", "recompiled", "unguarded", "failed", "reload_exit", "not_exported"]
+)
 def test_verification_requires_a_successful_compilation_free_reload(tmp_path, failure):
     (tmp_path / "triton").mkdir()
     (tmp_path / "triton/kernel.cubin").write_bytes(b"compiled")
     (tmp_path / "mega_cache.json").write_text('{"sm": "sm100"}')
-    validation = {"first_exit_code": 0, "reload_exit_code": int(failure == "reload_exit")}
+    validation = {
+        "first_exit_code": 0,
+        "reload_exit_code": int(failure == "reload_exit"),
+        "exported_cache_replayed": failure != "not_exported",
+    }
     (tmp_path / "cache_validation.json").write_text(json.dumps(validation))
     if failure != "missing":
         (tmp_path / "cache_reload.json").write_text(

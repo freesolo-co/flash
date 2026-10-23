@@ -208,6 +208,7 @@ def _verify(out: str, sm: str) -> int:
         if (
             validation.get("first_exit_code") != 0
             or validation.get("reload_exit_code") != 0
+            or validation.get("exported_cache_replayed") is not True
             or reload.get("compilation_forbidden") is not True
             or reload.get("compile_attempts") != 0
             or reload.get("passed") is not True

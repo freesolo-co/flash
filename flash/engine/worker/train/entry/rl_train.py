@@ -18,6 +18,7 @@ from flash.engine.plan.steps import final_save_due
 from flash.engine.worker.io.heartbeat import liveness_heartbeat
 from flash.engine.worker.model.packing import model_is_gdn_hybrid
 from flash.engine.worker.perf import gpu_diagnostics
+from flash.engine.worker.runtime.phases import training_phase
 from flash.engine.worker.runtime.state import WorkerContext
 from flash.engine.worker.train.entry.backend_common import (
     fused_ce_backend,
@@ -325,7 +326,8 @@ def run_rl_train(*, context: WorkerContext):
             )
             # one child answers every independent capability question. each used to cost its own
             # interpreter, and the torch/verl import -- not the question -- was the price.
-            caps = probe_verl_capabilities(python_bin, gdn_module)
+            with training_phase("capability_checks", context=context):
+                caps = probe_verl_capabilities(python_bin, gdn_module)
         configured = _configure_rl_child(
             inp=inp,
             files=files,
