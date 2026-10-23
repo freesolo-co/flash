@@ -26,8 +26,8 @@ OUT_DIR = "/out"
 CACHE_ARCHIVE = "/tmp/kernel_cache.tar.gz"
 
 
-def _roundtrip_cache(cache_dir: str, archive_path: str) -> None:
-    """Replay only exported files, at the absolute paths embedded by Triton."""
+def _replace_cache_with_exported_copy(cache_dir: str, archive_path: str) -> None:
+    """Archive the cache, delete the originals, and restore files at the same absolute paths."""
     with tarfile.open(archive_path, "w:gz", compresslevel=1) as archive:
         archive.add(cache_dir, arcname=".")
     shutil.rmtree(cache_dir)
@@ -109,7 +109,7 @@ def main() -> int:
     if rc == 0:
         # Remove the compiler outputs and restore only the exported archive. A fresh process
         # alone could otherwise reuse files that never make it into the shipped artifact.
-        _roundtrip_cache(cache_dir, CACHE_ARCHIVE)
+        _replace_cache_with_exported_copy(cache_dir, CACHE_ARCHIVE)
         started = time.monotonic()
         with open(os.path.join(OUT_DIR, "warmup.log"), "ab") as lf:
             lf.write(b"\n[bake] fresh-process cache reload validation\n")

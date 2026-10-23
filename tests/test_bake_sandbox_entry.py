@@ -17,7 +17,7 @@ def entry_module():
     return module
 
 
-def test_roundtrip_replaces_originals_and_preserves_absolute_references(tmp_path, monkeypatch):
+def test_exported_copy_replaces_originals_and_preserves_absolute_references(tmp_path, monkeypatch):
     entry = entry_module()
     cache = tmp_path / "cache"
     library = cache / "flashinfer/.cache/kernel.so"
@@ -34,7 +34,7 @@ def test_roundtrip_replaces_originals_and_preserves_absolute_references(tmp_path
         assert not library.exists()
 
     monkeypatch.setattr(entry.shutil, "rmtree", remove_originals)
-    entry._roundtrip_cache(str(cache), str(tmp_path / "export.tar.gz"))
+    entry._replace_cache_with_exported_copy(str(cache), str(tmp_path / "export.tar.gz"))
     assert removed == [str(cache)]
     assert library.read_bytes() == b"compiled"
     assert (
@@ -63,13 +63,15 @@ def test_bake_clears_inherited_cache_and_replays_export(monkeypatch, tmp_path, w
     monkeypatch.setenv("HF_TOKEN", "test")
     calls = []
     uploaded = {}
-    actual_roundtrip = entry._roundtrip_cache
+    actual_replace_cache = entry._replace_cache_with_exported_copy
 
-    def roundtrip(cache_dir, archive_path):
-        calls.append("roundtrip")
-        actual_roundtrip(cache_dir, archive_path)
+    def replace_cache_with_exported_copy(cache_dir, archive_path):
+        calls.append("replace_cache_with_exported_copy")
+        actual_replace_cache(cache_dir, archive_path)
 
-    monkeypatch.setattr(entry, "_roundtrip_cache", roundtrip)
+    monkeypatch.setattr(
+        entry, "_replace_cache_with_exported_copy", replace_cache_with_exported_copy
+    )
 
     def run(cmd, **kwargs):
         assert cmd[0] == str(trainer)
@@ -81,7 +83,7 @@ def test_bake_clears_inherited_cache_and_replays_export(monkeypatch, tmp_path, w
             assert not (cache / "cache_reload.json").exists()
             (cache / "kernel.cubin").write_bytes(b"compiled")
             return warm_rc
-        assert calls == ["warm", "roundtrip", "replay"]
+        assert calls == ["warm", "replace_cache_with_exported_copy", "replay"]
         assert (cache / "kernel.cubin").read_bytes() == b"compiled"
         return replay_rc
 
