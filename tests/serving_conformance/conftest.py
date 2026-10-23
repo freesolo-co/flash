@@ -1,5 +1,5 @@
 """Opt-in gate and shared client for the serving conformance suite.
-The suite runs `docs/serving-contract.md` against a REAL backend, so it is skipped entirely unless
+The suite exercises the serving contract against a REAL backend, so it is skipped entirely unless
 `--serving-url` names one. That keeps it free in the offline run while making one command the
 answer to "does my backend work with flash".
 It WRITES: registering, activating, and deleting adapters are real state changes. Point it at a

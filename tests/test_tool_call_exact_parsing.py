@@ -13,7 +13,6 @@ import tracemalloc
 from array import array
 from decimal import Decimal
 from itertools import pairwise
-from pathlib import Path
 from typing import Any
 from unittest import mock
 
@@ -441,14 +440,6 @@ def test_decimal_exponent_magnitude_boundary_remains_structured(raw_value: str) 
     assert json.loads(result.calls[0].arguments, parse_float=Decimal)["scalar"] == Decimal(
         raw_value
     )
-
-
-def test_serving_contract_documents_the_numeric_exponent_safety_bound() -> None:
-    contract = (Path(__file__).resolve().parents[1] / "docs/serving-contract.md").read_text()
-
-    assert "exponent\nmagnitude at most 1,000,000" in contract
-    assert "history outside either bound is rejected" in contract
-    assert "Exponent magnitude is not\npart of this bound" not in contract
 
 
 def test_generated_arguments_with_duplicate_object_keys_fall_back_exactly() -> None:

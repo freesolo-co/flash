@@ -35,7 +35,7 @@ never invents discounted cache usage.
 ## Deployment and qualification
 
 The native bridge passed a **four-B200 smoke and performance run**; see the
-[measured results and limits](../../../docs/deepinfer-gpu-validation-2026-10-23.md).
+[measured results and limits in PR #1484](https://github.com/freesolo-co/flash/pull/1484).
 This is not complete customer rollout qualification. CPU tests cover the HTTP/native
 bridge, router authorization, pricing and settlement, thinking/non-thinking
 responses, native errors, and cancellation. Keep customer traffic disabled until
