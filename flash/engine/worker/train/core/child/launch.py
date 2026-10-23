@@ -5,6 +5,7 @@ import json
 import os
 from pathlib import Path
 
+from flash.engine.worker.runtime.phases import training_phase
 from flash.engine.worker.train.core.child.options import RuntimeOptions
 from flash.engine.worker.train.core.child.startup import initialize_process, validate_environment
 
@@ -95,8 +96,9 @@ def run_sft(config, options):
 
     initialize_global_process_group()
     try:
-        trainer = FlashSFTTrainer(config)
-        distributed.barrier()
+        with training_phase("trainer_initialization"):
+            trainer = FlashSFTTrainer(config)
+            distributed.barrier()
         if distributed.get_rank() == 0:
             publish_ready(options)
         trainer.fit()

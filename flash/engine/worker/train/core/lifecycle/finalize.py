@@ -45,6 +45,11 @@ def write_train_meta(
     context: WorkerContext,
 ):
     env = context.require_active_env()
+    notes = {
+        **(notes or {}),
+        "training_timing": context.phase_timings.snapshot(),
+        "setup_seconds_scope": "parent preparation; excludes trainer initialization and first update",
+    }
     meta = sanitize_worker_metrics(
         {
             "phase": phase,

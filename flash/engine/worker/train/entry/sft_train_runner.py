@@ -339,7 +339,7 @@ def _prepare_sft_model(
     setup_seconds = time.time() - options.started_at
     _worker_heartbeat.heartbeat(
         "sft_model_load",
-        setup_seconds=setup_seconds,
+        parent_preparation_seconds=setup_seconds,
         gpu=_worker_perf.gpu_diagnostics(),
         context=context,
     )
@@ -799,11 +799,15 @@ class _SftProgressCallbacks:
 def _invoke_sft_child(
     child: _SftChild, callbacks: _SftProgressCallbacks, on_line, *, context: WorkerContext
 ) -> int:
+    def observed_line(line):
+        context.phase_timings.observe_line(line)
+        on_line(line)
+
     return _sft_train.run_verl_training(
         child.command,
         env=child.child_env,
         on_step=callbacks.on_step,
-        on_line=on_line,
+        on_line=observed_line,
         heartbeat=callbacks.child_heartbeat,
     )
 

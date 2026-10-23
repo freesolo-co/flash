@@ -12,6 +12,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
 from flash.core.spec import FIXED_SEED, JobSpec
+from flash.engine.worker.runtime.phases import PhaseTimings
 from flash.envs.loading.staged import (
     StagedEnvironmentMaterialization,
     load_staged_freesolo_environment,
@@ -85,6 +86,7 @@ class WorkerContext:
     active_env: Any = None
     active_env_package: StagedEnvironmentMaterialization | None = None
     started_at: float = field(default_factory=time.time)
+    phase_timings: PhaseTimings = field(default_factory=PhaseTimings)
     resume_upload_lock: LockType = field(default_factory=threading.Lock)
     heartbeat_state: HeartbeatState = field(init=False)
 
