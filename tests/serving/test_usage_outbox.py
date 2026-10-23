@@ -203,10 +203,17 @@ def test_freesolo_prices_match_committed_catalog_fixed_point_contract() -> None:
             "completion_token_usd": "0.0000009025",
         },
     }
+    expected["deepseek-ai/DeepSeek-V4.1-Flash-1017"] = {
+        "prompt_token_usd": "0.00000015",
+        "cached_prompt_token_usd": "0.000000003",
+        "completion_token_usd": "0.0000006",
+    }
     decimal_string = re.compile(r"^(0|[1-9][0-9]*)(\.[0-9]+)?$")
 
     assert set(_FREESOLO_USD_PER_MTOK) == set(expected)
-    assert set(_FREESOLO_USD_PER_MTOK) == set(base_models())
+    assert set(_FREESOLO_USD_PER_MTOK) == set(base_models()) | {
+        "deepseek-ai/DeepSeek-V4.1-Flash-1017"
+    }
     for model, snapshot in expected.items():
         actual = freesolo_price(model).snapshot
         assert actual == snapshot

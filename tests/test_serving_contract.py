@@ -478,6 +478,10 @@ def test_the_serving_extra_declares_every_module_scope_import_of_the_serving_app
     stdlib = set(sys.stdlib_module_names)
     missing: dict[str, set[str]] = {}
     for path in sorted((root / "flash" / "serving").rglob("*.py")):
+        # This Triton kernel module is loaded only by native GPU workers in the
+        # separate compiled DeepInfer image, never by the CPU/vLLM serving app.
+        if path.relative_to(root).as_posix() == "flash/serving/deepinfer/engram_transport.py":
+            continue
         for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
             if isinstance(node, ast.ImportFrom) and node.level == 0 and node.col_offset == 0:
                 top = (node.module or "").split(".")[0]

@@ -1,0 +1,235 @@
+"""Single-node Engram transport for the pinned DeepInfer runtime: CUDA IPC or mapped shared host RAM.
+
+Keeps native FP8 embedding values and packed UE8M0 scales unchanged. No RDMA,
+no duplicate GPU embedding tables, and no CPU involvement in the decode loop.
+Adapted from the local four-B200 benchmark. GPU qualification remains required for each runtime revision.
+"""
+
+import torch
+import torch.distributed as dist
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def _fetch(
+    indices,
+    weight_ptrs,
+    sf_ptrs,
+    output,
+    out_sf,
+    ROWS: tl.constexpr,
+    HIDDEN: tl.constexpr,
+    ENTRIES: tl.constexpr,
+    TOKENS: tl.constexpr,
+    SF_STRIDE: tl.constexpr,
+    RANKS: tl.constexpr,
+):
+    entry = tl.program_id(0)
+    global_row = tl.load(indices + entry)
+    valid = (global_row >= 0) & (global_row < ROWS * RANKS)
+    owner = tl.minimum(tl.maximum(global_row // ROWS, 0), RANKS - 1)
+    row = tl.maximum(global_row % ROWS, 0)
+    wptr = tl.load(weight_ptrs + owner).to(tl.pointer_type(tl.uint8))
+    cols = tl.arange(0, HIDDEN)
+    value = tl.load(wptr + row.to(tl.int64) * HIDDEN + cols, mask=valid, other=0)
+    tl.store(output + entry.to(tl.int64) * HIDDEN + cols, value)
+    packs: tl.constexpr = HIDDEN // 128
+    sptr = tl.load(sf_ptrs + owner).to(tl.pointer_type(tl.int32))
+    sf = tl.load(
+        sptr + row.to(tl.int64) * packs + cols, mask=valid & (cols < packs), other=2139062143
+    )
+    token = entry // ENTRIES
+    sfcol = (entry % ENTRIES) * packs + cols
+    tl.store(out_sf + token + sfcol * SF_STRIDE, sf, mask=cols < packs)
+
+
+class LocalEngramBuffer:
+    is_local_transport = True
+
+    def __init__(
+        self, group, num_entries_per_layer, hidden_size, max_num_tokens, num_entries_per_token
+    ):
+        self.group = group
+        self.rank = group.rank()
+        self.world = group.size()
+        self.rows = num_entries_per_layer
+        self.hidden = hidden_size
+        self.max_tokens = max_num_tokens
+        self.entries = num_entries_per_token
+        self.owned = []
+        self.peers = []
+        self.registered = []
+        self.tables = []
+
+    def _exchange(self, tensor):
+        from torch.multiprocessing.reductions import reduce_storage, reduce_tensor
+
+        if not tensor.is_cuda:
+            # Conversion to shared storage happens one layer at a time.
+            tensor.share_memory_()
+
+        def export():
+            if tensor.is_cuda:
+                rebuild, args = reduce_tensor(tensor.detach())
+                return True, rebuild, args, None
+            rebuild, args = reduce_storage(tensor.untyped_storage())
+            return (
+                False,
+                rebuild,
+                args,
+                (tensor.dtype, tensor.shape, tensor.stride(), tensor.storage_offset()),
+            )
+
+        # CUDA IPC reference counters and resource-sharer FDs are single-consumer
+        # handles. Export an independent handle for each receiving process.
+        metadata = [None if r == self.rank else export() for r in range(self.world)]
+        self.owned.append(tensor)
+        gathered = [None] * self.world
+        dist.all_gather_object(gathered, metadata, group=self.group)
+        peers = []
+        pointers = []
+        for rank, payload in enumerate(gathered):
+            cuda = tensor.is_cuda
+            if rank == self.rank:
+                peer = tensor
+            else:
+                cuda, rebuild, args, layout = payload[self.rank]
+            if rank != self.rank and cuda:
+                # Each engine exposes its own device as cuda:0. Import the IPC
+                # allocation into this rank's current CUDA context.
+                args = list(args)
+                args[6] = torch.cuda.current_device()
+                peer = rebuild(*args)
+            elif rank != self.rank:
+                import time
+
+                until = time.monotonic() + 120
+                while True:
+                    try:
+                        storage = rebuild(*args)
+                        break
+                    except BlockingIOError:
+                        if time.monotonic() >= until:
+                            raise
+                        time.sleep(0.1)
+                dtype, shape, stride, offset = layout
+                peer = torch.empty(0, dtype=dtype, device="cpu").set_(
+                    storage, offset, shape, stride
+                )
+            peers.append(peer)
+        if not tensor.is_cuda:
+            # Finish FD exchange before pinning multi-GB tables. CUDA host
+            # registration can hold the GIL and starve the FD-sharing thread.
+            dist.barrier(group=self.group)
+        for peer in peers:
+            if tensor.is_cuda:
+                pointers.append(peer.data_ptr())
+            else:
+                runtime = torch.cuda.cudart()
+                result = runtime.cudaHostRegister(peer.data_ptr(), peer.nbytes, 3)
+                if int(result) != 0:
+                    raise RuntimeError(f"cudaHostRegister failed: {result}")
+                self.registered.append(peer.data_ptr())
+                # Registered host memory on this UVA platform shares the virtual
+                # address used by CUDA. The dedicated probe verifies GPU reads.
+                pointers.append(peer.data_ptr())
+        self.peers.append(peers)
+        return torch.tensor(pointers, dtype=torch.int64, device="cuda")
+
+    def write(self, storages, sfs):
+        assert len(storages) == len(self.rows) == len(sfs)
+        for index, (weight, scale) in enumerate(zip(storages, sfs, strict=True)):
+            assert weight.dtype == torch.float8_e4m3fn
+            assert weight.shape == (
+                self.rows[index],
+                self.hidden,
+            )
+            assert scale.dtype == torch.float32
+            # Pack on the original device, preserving every power-of-two scale.
+            bits = scale.view(torch.int32)
+            assert not bool(torch.any((bits < 0) | ((bits & 0x7FFFFF) != 0)))
+            packed = (bits >> 23).to(torch.uint8).view(torch.int32).contiguous()
+            if not weight.is_cuda:
+                packed = packed.cpu()
+            self.tables.append((self._exchange(weight), self._exchange(packed)))
+        torch.cuda.synchronize()
+        dist.barrier(group=self.group)
+
+    def fetch(self, indices, use_tma_aligned_col_major_sf=True):
+        layers, tokens, entries = indices.shape
+        assert layers == len(self.rows)
+        assert entries == self.entries
+        assert tokens <= self.max_tokens
+        results = []
+        for layer in range(layers):
+            output = torch.empty(
+                (tokens, entries * self.hidden), dtype=torch.float8_e4m3fn, device="cuda"
+            )
+            stride = triton.cdiv(tokens, 4) * 4
+            scales = torch.empty(
+                (entries * self.hidden // 128, stride), dtype=torch.int32, device="cuda"
+            ).T[:tokens]
+            if tokens:
+                wp, sp = self.tables[layer]
+                _fetch[(tokens * entries,)](
+                    indices[layer],
+                    wp,
+                    sp,
+                    output.view(torch.uint8),
+                    scales,
+                    self.rows[layer],
+                    self.hidden,
+                    entries,
+                    tokens,
+                    stride,
+                    self.world,
+                    num_warps=4,
+                )
+            results.append(lambda output=output, scales=scales: (output, scales))
+        return results
+
+    def destroy(self):
+        torch.cuda.synchronize()
+        dist.barrier(group=self.group)
+        for pointer in self.registered:
+            torch.cuda.cudart().cudaHostUnregister(pointer)
+        self.registered.clear()
+        self.peers.clear()
+        self.tables.clear()
+        self.owned.clear()
+
+
+def install():
+    """Patch only Engram transport; retain DeepInfer's engine and model math."""
+    import types
+
+    from deepinfer.model_executor.models.v4_modules.engram import EngramRuntime
+    from deepinfer.model_executor.parallel_utils.userbuffer import userbuffer
+
+    def allocate(
+        manager,
+        engram_group,
+        num_entries_per_layer,
+        hidden_size,
+        max_num_tokens,
+        num_entries_per_token,
+        dtype,
+        num_sf_packs=0,
+    ):
+        assert manager.engram is None
+        manager.engram = LocalEngramBuffer(
+            engram_group, num_entries_per_layer, hidden_size, max_num_tokens, num_entries_per_token
+        )
+        return manager.engram
+
+    def initialize(runtime):
+        embeddings = [layer.ngram_embedding for layer in runtime._layers]
+        if runtime._buffer is None:
+            runtime._buffer = runtime.allocate(embeddings)
+        runtime._buffer.write([x.weight for x in embeddings], [x.sf for x in embeddings])
+        for embedding in embeddings:
+            embedding.release_storage()
+
+    userbuffer.allocate_engram = types.MethodType(allocate, userbuffer)
+    EngramRuntime.initialize = initialize
