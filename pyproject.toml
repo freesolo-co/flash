@@ -24,6 +24,14 @@ classifiers = [
 dependencies = []
 
 [project.optional-dependencies]
+# experimental, operator-owned shared trainer; independent of the vLLM worker extra.
+shared-training = [
+    "torch==2.10.0",
+    "peft==0.19.0",
+    "transformers>=5.8,<5.13",
+    "fastapi>=0.136,<1",
+    "uvicorn>=0.52,<1",
+]
 # heavy deps for running the fine-tuning worker locally (the deployed gpu worker installs its exact
 # stack in Dockerfile.worker, with the fallback verl venv mirrored in capabilities.py).
 gpu = [
@@ -226,6 +234,10 @@ package = true
 # training and serving intentionally validate different exact vllm builds and cannot be installed
 # into one environment. uv records both resolutions while rejecting only the incompatible combination.
 conflicts = [
+    [
+        { extra = "shared-training" },
+        { extra = "serve-runtime" },
+    ],
     [
         { extra = "gpu" },
         { extra = "serve-runtime" },

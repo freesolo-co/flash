@@ -59,7 +59,17 @@ def test_serve_runtime_extra_is_independent_and_pinned() -> None:
         "vllm==0.23.0",
     ]
     assert "vllm==0.19.1" in extras["gpu"]
-    assert project["tool"]["uv"]["conflicts"] == [[{"extra": "gpu"}, {"extra": "serve-runtime"}]]
+    assert project["tool"]["uv"]["conflicts"] == [
+        [{"extra": "shared-training"}, {"extra": "serve-runtime"}],
+        [{"extra": "gpu"}, {"extra": "serve-runtime"}],
+    ]
+    assert extras["shared-training"] == [
+        "torch==2.10.0",
+        "peft==0.19.0",
+        TRANSFORMERS_REQUIREMENT,
+        "fastapi>=0.136,<1",
+        "uvicorn>=0.52,<1",
+    ]
     lock = (ROOT / "uv.lock").read_text()
     server_modal = [
         requirement for requirement in extras["server"] if requirement.startswith("modal==")
@@ -79,7 +89,12 @@ def test_serve_runtime_extra_is_independent_and_pinned() -> None:
     # `uv sync --frozen --extra serve-runtime`, and --frozen refuses to re-resolve. adding the extra
     # to pyproject without re-locking leaves provides-extras stale, and the image build dies at that
     # step even though every assertion above still passes.
-    assert 'provides-extras = ["gpu", "server", "serving", "serve-runtime", "dev"]' in lock
+    locked_project = next(
+        package
+        for package in tomllib.loads(lock)["package"]
+        if package["name"] == project["project"]["name"]
+    )
+    assert set(locked_project["metadata"]["provides-extras"]) == set(extras)
     # both vllm builds are recorded side by side; that is what the gpu/serve-runtime conflict buys.
     assert (
         '{ name = "vllm", marker = "extra == \'serve-runtime\'", specifier = "==0.23.0" }' in lock
