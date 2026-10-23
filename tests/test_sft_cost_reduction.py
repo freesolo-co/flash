@@ -31,7 +31,8 @@ def dense_gate(**overrides):
         "max_length": 496,
         "revision": PIN,
         "allow_disable": True,
-        "card_vram_gb": 48.3,
+        "allow_short_dense": True,
+        "card_vram_gb": 47.695921152,
         "capability": (8, 9),
         "hidden": 4096,
         "num_layers": 32,
@@ -61,6 +62,7 @@ def test_qualified_short_dense_workload_avoids_recompute():
         {"num_layers": 24},
         {"capability": (9, 0)},
         {"allow_disable": False},
+        {"allow_short_dense": False},
         {"active_params_b": 3.0},
     ],
 )

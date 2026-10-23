@@ -401,6 +401,7 @@ def _prepare_sft_model(
         options.model_id,
         data.realized_max_length,
         allow_disable=True,
+        allow_short_dense=not data.multimodal and options.gpu_count == 1,
         card_vram_gb=card_vram_gb,
         capability=capability,
         active_params_b=active_params_b,

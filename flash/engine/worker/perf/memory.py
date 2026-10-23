@@ -20,6 +20,7 @@ def grad_checkpointing_on(
     max_length: int = 0,
     *,
     allow_disable: bool = False,
+    allow_short_dense: bool = False,
     card_vram_gb: float = 0.0,
     capability: tuple[int, int] | None = None,
     active_params_b: float | None = None,
@@ -39,10 +40,11 @@ def grad_checkpointing_on(
     # qualified short-context dense path; keep the larger-model/MoE gate unchanged.
     # use realized row length and microbatch, never the configured context ceiling.
     short_dense = (
-        model_id == "Qwen/Qwen3.5-9B"
+        allow_short_dense
+        and model_id == "Qwen/Qwen3.5-9B"
         and revision == "c202236235762e1c871ad0ccb60c8ee5ba337b9a"
         and capability == (8, 9)
-        and 48 <= card_vram_gb < 50
+        and 47 <= card_vram_gb < 50
         and 0 < max_length <= 512
         and per_device_bs == 1
         and 0 < lora_rank <= 8
