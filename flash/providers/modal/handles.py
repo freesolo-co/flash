@@ -1,7 +1,8 @@
 """Strict, durable identity for a Modal training attempt."""
 
+import math
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from flash.providers._lifecycle.instances.instance import InstanceJobHandle
 
@@ -15,6 +16,7 @@ class ModalJobHandle(InstanceJobHandle):
     scope: str
     gpu_count: int = 1
     cpu_uploads: bool = False
+    cpu_prefetch: dict = field(default_factory=dict)
     provider = "modal"
 
     @staticmethod
@@ -32,6 +34,7 @@ class ModalJobHandle(InstanceJobHandle):
             "gpu_count": self.gpu_count,
             "scope": self.scope,
             **({"cpu_uploads": True} if self.cpu_uploads else {}),
+            **({"cpu_prefetch": self.cpu_prefetch} if self.cpu_prefetch else {}),
         }
 
     @staticmethod
@@ -50,6 +53,18 @@ class ModalJobHandle(InstanceJobHandle):
         if type(flag) is not bool:
             raise ValueError("invalid Modal cpu_uploads")
         fields["cpu_uploads"] = flag
+        prefetch = data.get("cpu_prefetch", {})
+        if not isinstance(prefetch, dict):
+            raise ValueError("invalid Modal cpu_prefetch")
+        if prefetch:
+            if set(prefetch) != {"sandbox_id", "wall_seconds", "cost_upper_estimate_usd"}:
+                raise ValueError("invalid Modal cpu_prefetch fields")
+            ModalJobHandle._coerce_instance_id(prefetch["sandbox_id"])
+            for key in ("wall_seconds", "cost_upper_estimate_usd"):
+                value = prefetch[key]
+                if type(value) not in (int, float) or not math.isfinite(value) or value < 0:
+                    raise ValueError("invalid Modal cpu_prefetch cost")
+        fields["cpu_prefetch"] = dict(prefetch)
         return fields
 
 
