@@ -1,0 +1,305 @@
+{
+  "schema_version": 1,
+  "name": "quality-economics",
+  "seeds": [
+    17,
+    29,
+    43
+  ],
+  "cases": [
+    {
+      "name": "sft",
+      "workload": "short_sft",
+      "command": [
+        "python",
+        "-m",
+        "flash.benchmarks.managed"
+      ],
+      "revisions": {
+        "model": "Qwen/Qwen3.5-9B",
+        "model_revision": "0000000000000000000000000000000000000000",
+        "image": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+        "code": "0000000000000000000000000000000000000000",
+        "environment": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+        "dataset": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+        "evaluator": "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+      },
+      "configuration": {
+        "api_url": "https://flash-dev.freesolo.co",
+        "credential_env": "BENCHMARK_CUSTOMER_A_KEY",
+        "hooks": "flash.benchmarks.command_hooks",
+        "prepare_command": [
+          "python",
+          "operator_benchmarks/prepare.py"
+        ],
+        "cleanup_command": [
+          "python",
+          "operator_benchmarks/cleanup.py"
+        ],
+        "collect_command": [
+          "python",
+          "operator_benchmarks/collect.py"
+        ],
+        "max_tokens": 128,
+        "poll_s": 5.0,
+        "episodes": [
+          {
+            "turns": [
+              {
+                "prompt": "What is 6 times 7? Reply with only the number."
+              }
+            ],
+            "expected": "42"
+          }
+        ],
+        "training_spec": {
+          "project": "REPLACE_WITH_PROJECT_UUID",
+          "model": "Qwen/Qwen3.5-9B",
+          "algorithm": "sft",
+          "environment": {
+            "id": "REPLACE_WITH_PINNED_ENVIRONMENT"
+          },
+          "train": {
+            "max_steps": 8,
+            "save_at_steps": [
+              4,
+              8
+            ],
+            "lora_rank": 16
+          },
+          "gpu": {
+            "max_wall_seconds": 1800
+          }
+        }
+      },
+      "target": {
+        "metric": "exact_match",
+        "value": 0.8,
+        "min_samples": 20
+      },
+      "timeout_s": 3600.0,
+      "required_phases": [
+        "allocation",
+        "startup",
+        "training",
+        "weight_publication",
+        "checkpointing",
+        "evaluation"
+      ]
+    },
+    {
+      "name": "grpo",
+      "workload": "single_turn_grpo",
+      "command": [
+        "python",
+        "-m",
+        "flash.benchmarks.managed"
+      ],
+      "revisions": {
+        "model": "Qwen/Qwen3.5-9B",
+        "model_revision": "0000000000000000000000000000000000000000",
+        "image": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+        "code": "0000000000000000000000000000000000000000",
+        "environment": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+        "dataset": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+        "evaluator": "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+      },
+      "configuration": {
+        "api_url": "https://flash-dev.freesolo.co",
+        "credential_env": "BENCHMARK_CUSTOMER_A_KEY",
+        "hooks": "flash.benchmarks.command_hooks",
+        "prepare_command": [
+          "python",
+          "operator_benchmarks/prepare.py"
+        ],
+        "cleanup_command": [
+          "python",
+          "operator_benchmarks/cleanup.py"
+        ],
+        "collect_command": [
+          "python",
+          "operator_benchmarks/collect.py"
+        ],
+        "max_tokens": 128,
+        "poll_s": 5.0,
+        "episodes": [
+          {
+            "turns": [
+              {
+                "prompt": "What is 6 times 7? Reply with only the number."
+              }
+            ],
+            "expected": "42"
+          }
+        ],
+        "training_spec": {
+          "project": "REPLACE_WITH_PROJECT_UUID",
+          "model": "Qwen/Qwen3.5-9B",
+          "algorithm": "grpo",
+          "environment": {
+            "id": "REPLACE_WITH_PINNED_ENVIRONMENT"
+          },
+          "train": {
+            "max_steps": 16,
+            "save_at_steps": [
+              8,
+              16
+            ],
+            "lora_rank": 16
+          },
+          "gpu": {
+            "max_wall_seconds": 1800
+          }
+        }
+      },
+      "target": {
+        "metric": "exact_match",
+        "value": 0.8,
+        "min_samples": 20
+      },
+      "timeout_s": 3600.0
+    },
+    {
+      "name": "agents",
+      "workload": "long_multi_turn",
+      "command": [
+        "python",
+        "-m",
+        "flash.benchmarks.managed"
+      ],
+      "revisions": {
+        "model": "Qwen/Qwen3.5-9B",
+        "model_revision": "0000000000000000000000000000000000000000",
+        "image": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+        "code": "0000000000000000000000000000000000000000",
+        "environment": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+        "dataset": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+        "evaluator": "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+      },
+      "configuration": {
+        "api_url": "https://flash-dev.freesolo.co",
+        "credential_env": "BENCHMARK_CUSTOMER_A_KEY",
+        "hooks": "flash.benchmarks.command_hooks",
+        "prepare_command": [
+          "python",
+          "operator_benchmarks/prepare.py"
+        ],
+        "cleanup_command": [
+          "python",
+          "operator_benchmarks/cleanup.py"
+        ],
+        "collect_command": [
+          "python",
+          "operator_benchmarks/collect.py"
+        ],
+        "max_tokens": 8192,
+        "poll_s": 5.0,
+        "training_spec": {
+          "project": "REPLACE_WITH_PROJECT_UUID",
+          "model": "Qwen/Qwen3.5-9B",
+          "algorithm": "grpo",
+          "environment": {
+            "id": "REPLACE_WITH_PINNED_ENVIRONMENT"
+          },
+          "train": {
+            "max_steps": 64,
+            "save_at_steps": [
+              32,
+              64
+            ],
+            "lora_rank": 16
+          },
+          "gpu": {
+            "max_wall_seconds": 7200
+          }
+        },
+        "evaluate_command": [
+          "python",
+          "operator_benchmarks/evaluate_agent.py"
+        ]
+      },
+      "target": {
+        "metric": "agent_success",
+        "value": 0.8,
+        "min_samples": 20
+      },
+      "timeout_s": 10800.0
+    },
+    {
+      "name": "adapters",
+      "workload": "concurrent_adapters",
+      "command": [
+        "python",
+        "-m",
+        "flash.benchmarks.managed"
+      ],
+      "revisions": {
+        "model": "Qwen/Qwen3.5-9B",
+        "model_revision": "0000000000000000000000000000000000000000",
+        "image": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+        "code": "0000000000000000000000000000000000000000",
+        "environment": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+        "dataset": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+        "evaluator": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+        "adapters": {
+          "REPLACE_RUN_A/final": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+          "REPLACE_RUN_B/final": "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+        }
+      },
+      "configuration": {
+        "api_url": "https://flash-dev.freesolo.co",
+        "credential_env": "BENCHMARK_CUSTOMER_A_KEY",
+        "hooks": "flash.benchmarks.command_hooks",
+        "prepare_command": [
+          "python",
+          "operator_benchmarks/prepare.py"
+        ],
+        "cleanup_command": [
+          "python",
+          "operator_benchmarks/cleanup.py"
+        ],
+        "collect_command": [
+          "python",
+          "operator_benchmarks/collect.py"
+        ],
+        "max_tokens": 128,
+        "poll_s": 5.0,
+        "episodes": [
+          {
+            "turns": [
+              {
+                "prompt": "What is 6 times 7? Reply with only the number."
+              }
+            ],
+            "expected": "42"
+          }
+        ],
+        "targets": [
+          {
+            "customer": "customer-a",
+            "adapter": "REPLACE_RUN_A/final",
+            "credential_env": "BENCHMARK_CUSTOMER_A_KEY"
+          },
+          {
+            "customer": "customer-b",
+            "adapter": "REPLACE_RUN_B/final",
+            "credential_env": "BENCHMARK_CUSTOMER_B_KEY"
+          }
+        ]
+      },
+      "target": {
+        "metric": "exact_match",
+        "value": 0.8,
+        "min_samples": 20
+      },
+      "timeout_s": 3600.0,
+      "required_phases": [
+        "allocation",
+        "startup",
+        "rollout",
+        "weight_publication",
+        "evaluation"
+      ]
+    }
+  ]
+}

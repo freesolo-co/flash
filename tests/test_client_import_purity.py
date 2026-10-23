@@ -27,6 +27,9 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 # the client path. use exact relocated module prefixes: `flash.serve.deploy` would also match every
 # client-reachable module under `flash.serve.deployment`.
 SERVER_ONLY_PREFIXES = (
+    # Operator benchmark runner/collectors require the server extra and are never imported
+    # by the zero-dependency customer CLI, like the hosted load-test harness below.
+    "flash.benchmarks",
     "flash.server",
     "flash.engine.worker",
     "flash.serve.app",

@@ -145,6 +145,10 @@ submit all fail before GPU allocation rather than billing a profiling run.
 
 ## Working on the code
 
+For repeatable quality, latency, and cost comparisons across SFT, GRPO, multi-turn
+agents, and concurrent adapters, see the operator
+[quality and economics benchmark suite](docs/quality-economics-benchmarks.md).
+
 The test suite is CPU-only and offline by default. No GPU, no network, no credentials:
 
 ```bash
