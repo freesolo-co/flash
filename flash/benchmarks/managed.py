@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import importlib
 import json
+import math
 import os
 import signal
 import sys
@@ -19,7 +20,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from types import ModuleType
 
-from flash.benchmarks.evaluation import evaluate_targets
+from flash.benchmarks.evaluation import evaluate_targets, validate_fallback
 from flash.benchmarks.evidence import Recorder, write_json
 from flash.benchmarks.schema import Case, Complete, Quality
 from flash.client import ApiClient
@@ -40,8 +41,21 @@ class Context:
         return self.case.configuration
 
 
+def _positive_timeout(config: dict, name: str, default: float) -> float:
+    value = config.get(name, default)
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, int | float)
+        or not math.isfinite(value)
+        or value <= 0
+    ):
+        raise ValueError(f"{name} must be a positive finite number of seconds")
+    return float(value)
+
+
 def _client(config: dict) -> ApiClient:
-    return ApiClient(config["api_url"], os.environ[config["credential_env"]], timeout=30.0)
+    timeout = _positive_timeout(config, "request_timeout_s", 300.0)
+    return ApiClient(config["api_url"], os.environ[config["credential_env"]], timeout=timeout)
 
 
 def _evaluate(context: Context, hooks: ModuleType, targets: list[tuple], checkpoint: str) -> None:
@@ -66,10 +80,7 @@ def _evaluate(context: Context, hooks: ModuleType, targets: list[tuple], checkpo
     )
 
 
-def _deploy_and_evaluate(context, hooks, client, checkpoint):
-    # Only this trial's freshly submitted run is deployed by the driver; existing targets belong
-    # to prepare/cleanup hooks and are never implicitly undeployed.
-    context.owned_deployments.append(checkpoint)
+def _record_resources(context):
     write_json(
         context.directory / "resources.json",
         {
@@ -77,6 +88,21 @@ def _deploy_and_evaluate(context, hooks, client, checkpoint):
             "deployments": context.owned_deployments,
         },
     )
+
+
+def _undeploy(context, client, checkpoint):
+    result = client.undeploy(checkpoint)
+    if result.get("state") != "undeployed" or result.get("checkpoint_id") != checkpoint:
+        raise RuntimeError(f"benchmark teardown unconfirmed for {checkpoint}")
+    context.owned_deployments.remove(checkpoint)
+    _record_resources(context)
+
+
+def _deploy_and_evaluate(context, hooks, client, checkpoint):
+    # Only this trial's freshly submitted run is deployed by the driver; existing targets belong
+    # to prepare/cleanup hooks and are never implicitly undeployed.
+    context.owned_deployments.append(checkpoint)
+    _record_resources(context)
     deployment = client.deploy(checkpoint)
     while deployment.get("state") == "deploying":
         time.sleep(context.config.get("poll_s", 5.0))
@@ -88,7 +114,11 @@ def _deploy_and_evaluate(context, hooks, client, checkpoint):
         deployment = current
     if deployment.get("state") != "ready" or deployment.get("checkpoint_id") != checkpoint:
         raise ValueError("benchmark checkpoint did not become ready")
-    _evaluate(context, hooks, [(client, checkpoint, "training-customer")], checkpoint)
+    try:
+        _evaluate(context, hooks, [(client, checkpoint, "training-customer")], checkpoint)
+    finally:
+        # Keep failed/ambiguous teardown owned so final cleanup retries it.
+        _undeploy(context, client, checkpoint)
 
 
 def _train(context: Context, hooks: ModuleType, client: ApiClient) -> None:
@@ -98,6 +128,7 @@ def _train(context: Context, hooks: ModuleType, client: ApiClient) -> None:
         raise ValueError(f"{context.case.workload} requires algorithm={expected}")
     if spec.get("model") != context.case.revisions.model:
         raise ValueError("training model differs from benchmark revision lock")
+    visibility_timeout = _positive_timeout(context.config, "checkpoint_visibility_timeout_s", 60.0)
     context.submission_pending = True
     write_json(context.directory / "submission.json", {"state": "pending", "spec": spec})
     status = client.create_run(spec)
@@ -108,20 +139,30 @@ def _train(context: Context, hooks: ModuleType, client: ApiClient) -> None:
     )
     write_json(context.directory / "resources.json", {"run_id": context.run_id, "deployments": []})
     evaluated = set()
+    required = {
+        f"{context.run_id}/step-{step}" for step in spec.get("train", {}).get("save_at_steps", [])
+    }
+    terminal_deadline = None
     with (context.directory / "status.jsonl").open("a") as stream:
         while True:
             stream.write(json.dumps({"at_s": context.recorder.now(), "status": status}) + "\n")
             stream.flush()
             if status["state"] in {"failed", "cancelled", "dry_run"}:
                 raise ValueError(f"benchmark training ended in {status['state']}")
+            if status["state"] == "done" and terminal_deadline is None:
+                terminal_deadline = time.monotonic() + visibility_timeout
             for item in client.checkpoints(context.run_id):
                 checkpoint = f"{context.run_id}/step-{item['step']}"
                 if checkpoint not in evaluated:
                     _deploy_and_evaluate(context, hooks, client, checkpoint)
                     evaluated.add(checkpoint)
             if status["state"] == "done":
-                _deploy_and_evaluate(context, hooks, client, f"{context.run_id}/final")
-                return
+                missing = required - evaluated
+                if not missing:
+                    _deploy_and_evaluate(context, hooks, client, f"{context.run_id}/final")
+                    return
+                if terminal_deadline is not None and time.monotonic() >= terminal_deadline:
+                    raise TimeoutError(f"benchmark missing required checkpoints: {sorted(missing)}")
             time.sleep(context.config.get("poll_s", 5.0))
             status = client.get_run(context.run_id)
 
@@ -135,9 +176,9 @@ def _cleanup(context, hooks, client) -> None:
                 client.cancel_run(context.run_id)
         except Exception as exc:
             errors.append(type(exc).__name__)
-    for checkpoint in reversed(context.owned_deployments):
+    for checkpoint in reversed(context.owned_deployments.copy()):
         try:
-            client.undeploy(checkpoint)
+            _undeploy(context, client, checkpoint)
         except Exception as exc:
             errors.append(type(exc).__name__)
     try:
@@ -162,8 +203,8 @@ def run(request_path: Path) -> None:
             raise ValueError(f"benchmark hooks must implement {name}(context)")
     if case.workload == "long_multi_turn" and not callable(getattr(hooks, "evaluate", None)):
         raise ValueError("long multi-turn agents require an environment-aware evaluate hook")
-    if not hasattr(hooks, "evaluate") and case.target.metric != "exact_match":
-        raise ValueError("the default evaluator only measures exact_match")
+    if not hasattr(hooks, "evaluate"):
+        validate_fallback(case)
     if hasattr(hooks, "validate"):
         hooks.validate(context)
     client = _client(context.config)

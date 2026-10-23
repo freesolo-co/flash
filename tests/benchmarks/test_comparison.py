@@ -93,6 +93,7 @@ def test_sealed_comparison_requires_matched_inputs_and_explicit_treatment(tmp_pa
     replace_suite(changed)
     with pytest.raises(ValueError, match="unmatched inputs"):
         compare_runs(left, right)
+
     result = compare_runs(left, right, allow_changes=("configuration.gpu",))
     assert result["changed_inputs"]["sft"] == ["configuration.gpu"]
     assert result["pairs"][0]["both_valid"] is True
@@ -123,3 +124,41 @@ def test_sealed_comparison_requires_matched_inputs_and_explicit_treatment(tmp_pa
     (right / "summary.json").write_text("{}")
     with pytest.raises(ValueError, match="differs"):
         compare_runs(left, right)
+
+
+@pytest.fixture
+def sealed_runs(tmp_path, case):
+    source = Path(__file__).resolve().parents[2]
+    paths = (tmp_path / "baseline", tmp_path / "candidate")
+    for path in paths:
+        run_suite(Suite(name="test", seeds=[17], cases=[case]), path, source, smoke=True)
+    return paths
+
+
+def test_zero_time_target_counts_as_reached_without_an_undefined_ratio(sealed_runs):
+    left, right = sealed_runs
+    (left / "checksums.json").unlink()
+    for path in left.glob("*/events.jsonl"):
+        events = [json.loads(line) for line in path.read_text().splitlines()]
+        for event in events:
+            if event["kind"] == "quality":
+                event["at_s"] = 0.0
+        path.write_text("".join(json.dumps(event) + "\n" for event in events))
+    seal(left)
+    result = compare_runs(left, right)
+    assert result["all_trials_valid"]
+    for group in result["groups"]:
+        assert group["both_reached_pairs"] == 1
+        assert group["median_time_to_target_ratio_among_both_reached"] is None
+
+
+@pytest.mark.parametrize("live_index", [0, 1])
+def test_sealed_comparison_rejects_mixed_synthetic_and_live_runs(sealed_runs, live_index):
+    path = sealed_runs[live_index]
+    (path / "checksums.json").unlink()
+    harness = json.loads((path / "harness.json").read_text())
+    harness["synthetic"] = False
+    (path / "harness.json").write_text(json.dumps(harness))
+    seal(path)
+    with pytest.raises(ValueError, match="cannot mix synthetic and live"):
+        compare_runs(*sealed_runs)

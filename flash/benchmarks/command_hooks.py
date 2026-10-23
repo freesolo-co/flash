@@ -9,7 +9,7 @@ from __future__ import annotations
 import json
 import subprocess
 
-from flash.benchmarks.evaluation import evaluate_targets
+from flash.benchmarks.evaluation import evaluate_targets, validate_fallback
 from flash.benchmarks.evidence import write_json
 from flash.benchmarks.schema import EVENT, Complete
 
@@ -26,6 +26,8 @@ def validate(context):
             or any(not isinstance(arg, str) or not arg for arg in command)
         ):
             raise ValueError(f"{name}_command must be a nonempty argv array")
+    if "evaluate" not in names:
+        validate_fallback(context.case)
 
 
 def _invoke(context, name, *, targets=None):

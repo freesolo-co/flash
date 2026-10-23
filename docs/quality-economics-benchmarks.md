@@ -47,7 +47,10 @@ uv run python -m flash.benchmarks compare /tmp/h100-results /tmp/b200-results \
 
 The command verifies both artifact seals and pairs trials by case, seed and cache
 condition. Ratios are candidate / baseline. It reports target attainment for all
-pairs, with time ratios only when both valid trials reached the target. Fixed-horizon
+pairs, with time ratios only when both valid trials reached the target.
+Synthetic smoke runs can only be compared with other smoke runs; mixing synthetic
+and live evidence is rejected. A target reached at time zero still counts as reached,
+but a zero baseline time has no defined ratio. Fixed-horizon
 elapsed time and last-observed quality changes are separate measurements. Asynchronous
 checkpoint evaluations can finish out of training-step order; the last observation
 is not necessarily the final training checkpoint. Incomplete actual
@@ -60,6 +63,8 @@ Copy the example plan and replace its placeholder project/environment identities
 revision locks, held-out dataset, adapter digests, and operator commands. The single
 example prompt illustrates the input shape; supply at least `target.min_samples`
 held-out episodes for a valid measurement. The default three seeds are 17, 29, 43.
+The bundled fallback evaluator rejects insufficient sample counts before preparation
+or training submission (concurrent cases count episodes across all targets).
 Commit the driver, collectors, evaluators, and configuration in a clean checkout.
 Run without `--smoke`, with a **new** result directory outside the checkout:
 
@@ -77,6 +82,20 @@ configured horizon after reaching the target, allowing comparison of both first
 target attainment and final quality. Wall time starts before driver launch and
 includes preparation, evaluation, cleanup, and receipt collection. A checkpoint's
 target time is when held-out evaluation **finishes**, not when training wrote it.
+Each evaluated checkpoint is undeployed immediately. It stays in `resources.json`
+until teardown is confirmed, so final cleanup can retry failed or ambiguous requests.
+After training finishes, the driver waits up to
+`configuration.checkpoint_visibility_timeout_s` (default 60 seconds) for every
+configured `training_spec.train.save_at_steps` checkpoint to be discovered and
+evaluated. Missing checkpoints fail the trial rather than silently shortening its
+quality curve. The case timeout still bounds the entire driver.
+
+`configuration.request_timeout_s` sets the API client's per-request timeout
+(default 300 seconds, positive and finite). Concurrent targets may override it.
+The bundled evaluator passes this value explicitly to `chat()`; custom evaluator
+hooks should likewise pass `timeout=client.timeout`, because `ApiClient.chat()`
+otherwise uses its own default. External evaluator commands control their own
+request timeouts. Case and cleanup timeouts remain the overall execution limits.
 
 Each seed runs cold first and warm second. The warm request references the cold
 trial's retained directory. The operator's preparation hook must define the cache

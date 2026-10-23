@@ -101,6 +101,8 @@ def compare_runs(baseline: Path, candidate: Path, *, allow_changes: tuple[str, .
         } and not path.startswith("configuration."):
             raise ValueError(f"cannot allow a change to comparison invariant: {path}")
     reports = [replay(root) for root in (baseline, candidate)]
+    if reports[0]["synthetic"] != reports[1]["synthetic"]:
+        raise ValueError("comparison cannot mix synthetic and live runs")
     suites = [json.loads((root / "suite.json").read_text()) for root in (baseline, candidate)]
     if suites[0]["seeds"] != suites[1]["seeds"]:
         raise ValueError("comparison requires identical seeds")
@@ -151,7 +153,10 @@ def compare_runs(baseline: Path, candidate: Path, *, allow_changes: tuple[str, .
                     "candidate_targets_reached": sum(
                         row["candidate_target_reached"] for row in rows
                     ),
-                    "both_reached_pairs": len(ratios),
+                    "both_reached_pairs": sum(
+                        row["baseline_target_reached"] and row["candidate_target_reached"]
+                        for row in rows
+                    ),
                     "median_time_to_target_ratio_among_both_reached": statistics.median(ratios)
                     if ratios
                     else None,

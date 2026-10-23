@@ -8,6 +8,23 @@ from threading import Barrier
 from flash.benchmarks.schema import Request
 
 
+def validate_fallback(case) -> None:
+    if case.target.metric != "exact_match":
+        raise ValueError("the default evaluator only measures exact_match")
+    episodes = case.configuration.get("episodes")
+    if (
+        not isinstance(episodes, list)
+        or not episodes
+        or any(not isinstance(episode, dict) or not episode.get("turns") for episode in episodes)
+    ):
+        raise ValueError("evaluation requires nonempty held-out episodes")
+    targets = (
+        len(case.configuration.get("targets", [])) if case.workload == "concurrent_adapters" else 1
+    )
+    if len(episodes) * targets < case.target.min_samples:
+        raise ValueError("fallback evaluation has fewer samples than target.min_samples")
+
+
 def evaluate_episode(
     client, adapter: str, customer: str, episode: dict, recorder, *, max_tokens: int
 ):
@@ -22,7 +39,9 @@ def evaluate_episode(
         start = recorder.now()
         succeeded = False
         try:
-            result = client.chat(adapter, messages, temperature=0.0, max_tokens=max_tokens)
+            result = client.chat(
+                adapter, messages, temperature=0.0, max_tokens=max_tokens, timeout=client.timeout
+            )
             answer = result["choices"][0]["message"]["content"]
             if not isinstance(answer, str):
                 raise ValueError("evaluation requires a text answer")

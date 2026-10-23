@@ -59,3 +59,41 @@ def test_collector_cannot_seal_its_own_completion(tmp_path, case, request_data):
     )
     with pytest.raises(ValueError, match="only the managed driver"):
         command_hooks.collect(context)
+
+
+@pytest.mark.parametrize("workload", ["short_sft", "single_turn_grpo", "concurrent_adapters"])
+@pytest.mark.parametrize("enough_samples", [False, True])
+def test_fallback_sample_count_is_validated(tmp_path, case, request_data, workload, enough_samples):
+    case.workload = workload
+    count = case.target.min_samples if enough_samples else 1
+    case.configuration = {
+        **{
+            f"{name}_command": ["python", "operator.py"]
+            for name in ("prepare", "collect", "cleanup")
+        },
+        "episodes": [{"turns": [{"prompt": "hi"}], "expected": "hi"}] * count,
+    }
+    if workload == "concurrent_adapters":
+        case.configuration["targets"] = [{"adapter": "a"}, {"adapter": "b"}]
+        if enough_samples:
+            case.configuration["episodes"] = case.configuration["episodes"][: count // 2]
+    case.target.metric = "exact_match"
+    context = Context(
+        request_data, tmp_path, Recorder(tmp_path / "events.jsonl", time.monotonic()), case
+    )
+    if enough_samples:
+        command_hooks.validate(context)
+    else:
+        with pytest.raises(ValueError, match=r"target\.min_samples"):
+            command_hooks.validate(context)
+
+
+def test_custom_evaluator_does_not_require_fallback_episodes(tmp_path, case, request_data):
+    case.configuration = {
+        f"{name}_command": ["python", "operator.py"]
+        for name in ("prepare", "collect", "cleanup", "evaluate")
+    }
+    context = Context(
+        request_data, tmp_path, Recorder(tmp_path / "events.jsonl", time.monotonic()), case
+    )
+    command_hooks.validate(context)
