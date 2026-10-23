@@ -1,0 +1,394 @@
+{
+  "schema_version": 1,
+  "scope": "Small GPU pilot, one seed, 64 train and 64 disjoint evaluation examples, custom split of MMLU-Pro other, not an official benchmark score. Cost/time to target is interval-censored between saved checkpoints; evaluation runs after training.",
+  "production_claims_eligible": false,
+  "baseline_accuracy": 0.578125,
+  "target": {
+    "metric": "held_out_accuracy",
+    "value": 0.65,
+    "min_samples": 64
+  },
+  "baseline_meets_target": false,
+  "cases": [
+    {
+      "name": "sft-cold",
+      "ok": true,
+      "steps": 64,
+      "end_to_end_s": 491.12195205688477,
+      "launch_to_bootstrap_s": 6.809989929199219,
+      "launch_to_first_optimizer_completion_s": 242.83679223060608,
+      "worker_reported_setup_s": 104.53996729850769,
+      "worker_reported_training_wall_s": 295.6550135612488,
+      "model_download_s": 95.9,
+      "cpu_final_publication_s": 12.837234020233154,
+      "gpu_peak_gb": 23.233,
+      "train_tokens": 10468,
+      "generated_tokens": 0,
+      "worker_rate_based_cost_estimate_usd": 0.674721,
+      "grpo_timer_totals_s": {},
+      "checkpoint_quality": [
+        {
+          "step": 32,
+          "accuracy": 0.578125,
+          "samples": 64,
+          "evaluation_finished_at": 1792720387.7034686,
+          "target_reached": false,
+          "checkpoint_deployable_s": 309.7247748374939
+        },
+        {
+          "step": 64,
+          "accuracy": 0.578125,
+          "samples": 64,
+          "evaluation_finished_at": 1792720390.582495,
+          "target_reached": false,
+          "checkpoint_deployable_s": 433.1578378677368
+        }
+      ],
+      "final_accuracy": 0.578125,
+      "change_from_baseline_pp": 0.0,
+      "code_attestation_verified": true,
+      "quality_target_time_s": null,
+      "quality_target_cost_usd": null,
+      "quality_target_note": "Checkpoints were evaluated after all training jobs. A checkpoint publication timestamp is not a validated time-to-quality target. Full online target measurement remains unmeasured.",
+      "observed_regions": [
+        "uk"
+      ],
+      "observed_gpu_names": [
+        "NVIDIA H100 80GB HBM3"
+      ]
+    },
+    {
+      "name": "sft-warm",
+      "ok": true,
+      "steps": 64,
+      "end_to_end_s": 269.0322151184082,
+      "launch_to_bootstrap_s": 7.141310930252075,
+      "launch_to_first_optimizer_completion_s": 158.5014886856079,
+      "worker_reported_setup_s": 9.963518619537354,
+      "worker_reported_training_wall_s": 170.78024411201477,
+      "model_download_s": 0.0,
+      "cpu_final_publication_s": 13.019827842712402,
+      "gpu_peak_gb": 23.233,
+      "train_tokens": 10468,
+      "generated_tokens": 0,
+      "worker_rate_based_cost_estimate_usd": 0.343907,
+      "grpo_timer_totals_s": {},
+      "checkpoint_quality": [
+        {
+          "step": 32,
+          "accuracy": 0.5625,
+          "samples": 64,
+          "evaluation_finished_at": 1792720393.429478,
+          "target_reached": false,
+          "checkpoint_deployable_s": 196.6255373954773
+        },
+        {
+          "step": 64,
+          "accuracy": 0.578125,
+          "samples": 64,
+          "evaluation_finished_at": 1792720395.798764,
+          "target_reached": false,
+          "checkpoint_deployable_s": 223.58800101280212
+        }
+      ],
+      "final_accuracy": 0.578125,
+      "change_from_baseline_pp": 0.0,
+      "code_attestation_verified": true,
+      "quality_target_time_s": null,
+      "quality_target_cost_usd": null,
+      "quality_target_note": "Checkpoints were evaluated after all training jobs. A checkpoint publication timestamp is not a validated time-to-quality target. Full online target measurement remains unmeasured.",
+      "observed_regions": [
+        "ap-south"
+      ],
+      "observed_gpu_names": [
+        "NVIDIA H100 80GB HBM3"
+      ]
+    },
+    {
+      "name": "grpo-cold",
+      "ok": true,
+      "steps": 8,
+      "end_to_end_s": 664.0312688350677,
+      "launch_to_bootstrap_s": 7.134037256240845,
+      "launch_to_first_optimizer_completion_s": 522.1343994140625,
+      "worker_reported_setup_s": 149.76442432403564,
+      "worker_reported_training_wall_s": 446.79484152793884,
+      "model_download_s": 120.9,
+      "cpu_final_publication_s": 18.890663146972656,
+      "gpu_peak_gb": 48.276,
+      "train_tokens": 0,
+      "generated_tokens": 512,
+      "worker_rate_based_cost_estimate_usd": 0.915862,
+      "grpo_timer_totals_s": {
+        "timing_s/gen": 29.162852262000058,
+        "timing_s/old_log_prob": 34.625051841000015,
+        "timing_s/adv": 0.26193404700006795,
+        "timing_s/update_actor": 53.631250760000114,
+        "timing_s/update_weights": 12.015945548999753,
+        "timing_s/step": 153.71072781599986,
+        "timing_s/save_checkpoint": 4.775230132999923
+      },
+      "checkpoint_quality": [
+        {
+          "step": 4,
+          "accuracy": 0.578125,
+          "samples": 64,
+          "evaluation_finished_at": 1792720398.214905,
+          "target_reached": false,
+          "checkpoint_deployable_s": 596.4609093666077
+        },
+        {
+          "step": 8,
+          "accuracy": 0.5625,
+          "samples": 64,
+          "evaluation_finished_at": 1792720400.5782292,
+          "target_reached": false,
+          "checkpoint_deployable_s": 616.2296442985535
+        }
+      ],
+      "final_accuracy": 0.5625,
+      "change_from_baseline_pp": -1.5625,
+      "code_attestation_verified": true,
+      "quality_target_time_s": null,
+      "quality_target_cost_usd": null,
+      "quality_target_note": "Checkpoints were evaluated after all training jobs. A checkpoint publication timestamp is not a validated time-to-quality target. Full online target measurement remains unmeasured.",
+      "observed_regions": [
+        "ap-south"
+      ],
+      "observed_gpu_names": [
+        "NVIDIA H100 80GB HBM3"
+      ]
+    },
+    {
+      "name": "grpo-warm",
+      "ok": true,
+      "steps": 8,
+      "end_to_end_s": 502.0276699066162,
+      "launch_to_bootstrap_s": 6.624947547912598,
+      "launch_to_first_optimizer_completion_s": 398.0611970424652,
+      "worker_reported_setup_s": 22.5143620967865,
+      "worker_reported_training_wall_s": 421.18281841278076,
+      "model_download_s": 0.0,
+      "cpu_final_publication_s": 13.007408857345581,
+      "gpu_peak_gb": 48.329,
+      "train_tokens": 0,
+      "generated_tokens": 514,
+      "worker_rate_based_cost_estimate_usd": 0.688538,
+      "grpo_timer_totals_s": {
+        "timing_s/gen": 29.525380595999934,
+        "timing_s/old_log_prob": 35.289553780000006,
+        "timing_s/adv": 0.2572738279999953,
+        "timing_s/update_actor": 56.69318413900004,
+        "timing_s/update_weights": 11.028747088999921,
+        "timing_s/step": 153.97270486900004,
+        "timing_s/save_checkpoint": 4.6986189460000105
+      },
+      "checkpoint_quality": [
+        {
+          "step": 4,
+          "accuracy": 0.5625,
+          "samples": 64,
+          "evaluation_finished_at": 1792720402.8464985,
+          "target_reached": false,
+          "checkpoint_deployable_s": 462.4649407863617
+        },
+        {
+          "step": 8,
+          "accuracy": 0.578125,
+          "samples": 64,
+          "evaluation_finished_at": 1792720405.1938002,
+          "target_reached": false,
+          "checkpoint_deployable_s": 464.39299488067627
+        }
+      ],
+      "final_accuracy": 0.578125,
+      "change_from_baseline_pp": 0.0,
+      "code_attestation_verified": true,
+      "quality_target_time_s": null,
+      "quality_target_cost_usd": null,
+      "quality_target_note": "Checkpoints were evaluated after all training jobs. A checkpoint publication timestamp is not a validated time-to-quality target. Full online target measurement remains unmeasured.",
+      "observed_regions": [
+        "eu-west"
+      ],
+      "observed_gpu_names": [
+        "NVIDIA H100 80GB HBM3"
+      ]
+    }
+  ],
+  "latency": [
+    {
+      "mode": "isolated",
+      "wall_s": 2.3398571014404297,
+      "requests": 64,
+      "requests_per_s": 27.352097681777757,
+      "max_observed_in_flight": 8,
+      "customers": {
+        "sft-warm-step64": {
+          "count": 32,
+          "p50_s": 0.2813713550567627,
+          "p95_s": 0.2925395965576172,
+          "max_s": 0.2947423458099365
+        },
+        "grpo-warm-step8": {
+          "count": 32,
+          "p50_s": 0.2976663112640381,
+          "p95_s": 0.30615949630737305,
+          "max_s": 0.3068532943725586
+        }
+      }
+    },
+    {
+      "mode": "concurrent",
+      "wall_s": 2.3755452632904053,
+      "requests": 64,
+      "requests_per_s": 26.941183141824286,
+      "max_observed_in_flight": 8,
+      "customers": {
+        "sft-warm-step64": {
+          "count": 32,
+          "p50_s": 0.29657816886901855,
+          "p95_s": 0.30744361877441406,
+          "max_s": 0.30840110778808594
+        },
+        "grpo-warm-step8": {
+          "count": 32,
+          "p50_s": 0.2970883846282959,
+          "p95_s": 0.3041343688964844,
+          "max_s": 0.30454373359680176
+        }
+      }
+    }
+  ],
+  "multi_turn": {
+    "episodes": 8,
+    "successful": 0,
+    "valid_protocol": 8,
+    "total_turns": 104,
+    "max_turns": 13,
+    "environment_reward_s": 0.0030700349999506216,
+    "episode_wall_s": [
+      10.447174787521362,
+      10.518983125686646,
+      8.070761680603027,
+      8.108473300933838,
+      7.841543197631836,
+      7.877886056900024,
+      7.8245391845703125,
+      7.8635780811309814
+    ]
+  },
+  "cost": {
+    "app_id": "ap-jf6z67H6UEE9ppkeUjGcfR",
+    "at": 1792720623.761277,
+    "provider_reported_cost_usd": 3.66173422,
+    "rows": [
+      {
+        "object_id": "ap-jf6z67H6UEE9ppkeUjGcfR",
+        "description": "flash-quality-a5937ed87d",
+        "environment_name": "main",
+        "interval": "2026-10-23T01:00:00Z",
+        "cost": "3.66173422",
+        "cost_by_resource": {
+          "CPU": "0.43577645",
+          "Memory": "0.55717921",
+          "H100": "2.60724028",
+          "Network Egress": "0.06153828"
+        }
+      }
+    ],
+    "billing_error": null,
+    "sandbox_usage": {
+      "sb-01M5K6BWPMGB0GARHAVG3VPTKG": {
+        "unavailable": "InvalidError"
+      },
+      "sb-Jhm0kwaKiT8QKzjaQqOWaH": {
+        "cpu_core_nanosecs": "574045592308",
+        "mem_gib_nanosecs": "4592364738464",
+        "gpu_nanosecs": "143511398077",
+        "gpu_type": "H100!"
+      },
+      "sb-01M5K6VGB9D53SQ865510H1VZX": {
+        "unavailable": "InvalidError"
+      },
+      "sb-FAKrUfpwakB94q5QI4bjBl": {
+        "cpu_core_nanosecs": "1251049283981",
+        "mem_gib_nanosecs": "10008394271850",
+        "gpu_nanosecs": "312762320995",
+        "gpu_type": "H100!"
+      },
+      "sb-01M5K6F1QNXNB7K80QHMA3AC1Y": {
+        "unavailable": "InvalidError"
+      },
+      "sb-oOLYfZ7BOsMZmytGtF7iTa": {
+        "cpu_core_nanosecs": "961510711669",
+        "mem_gib_nanosecs": "7692085693359",
+        "gpu_nanosecs": "240377677917",
+        "gpu_type": "H100!"
+      },
+      "sb-mWxCcPCzNXOuq7vwEqhuX7": {
+        "cpu_core_nanosecs": "989401455879",
+        "mem_gib_nanosecs": "7915211647033",
+        "gpu_nanosecs": "247350363969",
+        "gpu_type": "H100!"
+      },
+      "sb-01M5K66RTMN3XA5ANPGRMCZJ8M": {
+        "unavailable": "InvalidError"
+      },
+      "sb-QpBKfn0eK0f6dTKkiRnCk1": {
+        "cpu_core_nanosecs": "887611055374",
+        "mem_gib_nanosecs": "8870294982829",
+        "gpu_nanosecs": "221902763843",
+        "gpu_type": "H100!"
+      }
+    },
+    "reconciled": false,
+    "note": "Current-day provider metering can lag. An empty report is unknown cost, not zero. This is not a finalized invoice.",
+    "customer_charge_usd": null,
+    "customer_charge_note": "Direct operator-run Modal workload; no customer billing receipt exists.",
+    "resource_total_usd": {
+      "CPU": 0.43577645,
+      "Memory": 0.55717921,
+      "H100": 2.60724028,
+      "Network Egress": 0.06153828
+    }
+  },
+  "revisions": {
+    "code": "f8249c06beb63671234e1c4dec1665a7590c13e6",
+    "image": "ghcr.io/freesolo-co/flash-worker@sha256:c794abb352bb99c8a90e58f4f1f8f4b56012a1c00fcfe607dd8a037d0f119fb8",
+    "model": {
+      "model": "Qwen/Qwen3.5-9B",
+      "hf_revision": "c202236235762e1c871ad0ccb60c8ee5ba337b9a",
+      "tinker_revision_not_exposed": true
+    },
+    "source_snapshot": {
+      "kind": "flash-source-snapshot",
+      "format_version": 1,
+      "archive_path": "source/c09a733fd9c4db237503fce58996985894a61ddf9b35e80b985200b517726294/flash-source.zip",
+      "sha256": "c09a733fd9c4db237503fce58996985894a61ddf9b35e80b985200b517726294",
+      "size": 1653728,
+      "revision": "b9ea6a11146b791a71d530922c6768e9ce944f38"
+    },
+    "dataset_sha256": "160690b7a848bdb2301475240c25080522ffda965042576bc43941a9847717e2",
+    "evaluator_sha256": "17cd8e42dca0016bc93973d4fa0ca02ee4af5c024b87680258ac45ac4cf4c68b"
+  },
+  "limitations": [
+    "One seed and 64 held-out examples; no statistical performance or quality claim.",
+    "Custom MMLU-Pro other split from prior artifacts; not an official MMLU-Pro score.",
+    "Cold/warm controls model download cache only; provider image caches, region and kernel compilation may differ.",
+    "GPU engine latency excludes hosted HTTP/authentication/routing; customer labels are synthetic request streams.",
+    "Multi-turn results are a 12-lookup tool-use microbenchmark plus final answer, not long-agent RL training.",
+    "GRPO generation timers include reward work; reward time is not separately instrumented in the training trace.",
+    "Training wall metrics include engine initialization and checkpoint work; do not interpret them as optimizer-only time.",
+    "Post-hoc checkpoint evaluation cannot establish online time or cost to quality target.",
+    "Current-day provider charges can lag and are not finalized; per-case cost estimates are separate from actual charges."
+  ],
+  "evaluation_engine_startup_s": 454.0320601463318,
+  "evaluation_worker_wall_s": 551.8308207988739,
+  "evaluation_runtime_versions": {
+    "torch": "2.10.0+cu128",
+    "vllm": "0.19.1",
+    "transformers": "5.12.1",
+    "peft": "0.20.0",
+    "huggingface_hub": "1.28.0"
+  }
+}

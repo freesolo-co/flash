@@ -18,6 +18,13 @@ requests. It tests the whole matrix and artifact pipeline; its numbers are not
 performance measurements. It always sets `production_claims_eligible=false`.
 The offline tests run this path in normal CI.
 
+## Measured GPU pilot
+
+See the [2026-10-22 live GPU results](benchmarks/2026-10-22-gpu-pilot/README.md)
+for real H100 SFT/GRPO cold/warm runs, checkpoint quality, mixed-adapter latency,
+and a 13-turn tool-use microbenchmark. The report retains negative quality results
+and clearly separates this direct-provider pilot from hosted API qualification.
+
 ## Running a real suite
 
 Copy the example plan and replace its placeholder project/environment identities,
