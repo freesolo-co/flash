@@ -89,7 +89,8 @@ def compare_runs(baseline: Path, candidate: Path, *, allow_changes: tuple[str, .
     """Verify both seals and require explicit acknowledgement of changed experimental inputs.
 
     Model, dataset, environment, evaluator, target, workload, seeds, and case identity must
-    match. Only code/image/adapter revisions and configuration paths can be allowed to differ.
+    match, as must execution commands, timeouts, and required phases. Only code/image/adapter
+    revisions and configuration paths can be allowed to differ.
     The caller remains responsible for identifying confounding operational configuration.
     """
     for path in allow_changes:
@@ -109,8 +110,7 @@ def compare_runs(baseline: Path, candidate: Path, *, allow_changes: tuple[str, .
     changes = {}
     for name, left in cases[0].items():
         right = cases[1][name]
-        keys = ("workload", "target", "revisions", "configuration")
-        changed = _differences({key: left[key] for key in keys}, {key: right[key] for key in keys})
+        changed = _differences(left, right)
         unexpected = [
             path
             for path in changed

@@ -28,7 +28,7 @@ and clearly separates this direct-provider pilot from hosted API qualification.
 ## Running a real suite
 
 Compare two sealed runs with identical case names, seeds, targets, model, held-out
-data, environment and evaluator. Declare the configuration or code/image changes
+data, environment, evaluator, commands, timeouts and required phases. Declare the configuration or code/image changes
 being tested explicitly; undeclared differences are rejected:
 
 ```bash
@@ -39,7 +39,7 @@ uv run python -m flash.benchmarks compare /tmp/h100-results /tmp/b200-results \
 The command verifies both artifact seals and pairs trials by case, seed and cache
 condition. Ratios are candidate / baseline. It reports target attainment for all
 pairs, with time ratios only when both valid trials reached the target. Fixed-horizon
-job time and last-observed quality changes are separate measurements. Asynchronous
+elapsed time and last-observed quality changes are separate measurements. Asynchronous
 checkpoint evaluations can finish out of training-step order; the last observation
 is not necessarily the final training checkpoint. Incomplete actual
 costs never produce a cost ratio, and target costs retain their receipt bounds.

@@ -104,6 +104,16 @@ def test_sealed_comparison_requires_matched_inputs_and_explicit_treatment(tmp_pa
     assert not compare_runs(left, right, allow_changes=("configuration.gpu",))["pairs"][0][
         "both_valid"
     ]
+    for field, value in {
+        "command": ["different-driver"],
+        "timeout_s": 1.0,
+        "required_phases": ["allocation"],
+    }.items():
+        altered = copy.deepcopy(original)
+        altered["cases"][0][field] = value
+        replace_suite(altered)
+        with pytest.raises(ValueError, match=field):
+            compare_runs(left, right, allow_changes=("configuration.gpu",))
     changed["cases"][0]["target"]["value"] = 0.5
     replace_suite(changed)
     with pytest.raises(ValueError, match="cannot allow"):
