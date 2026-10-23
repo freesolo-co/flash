@@ -60,6 +60,49 @@ benchmarks.
 
 ## Reproduction and limits
 
+### Expanded service retest
+
+A fresh run against the PR's unchanged training implementation passed the 29 CUDA
+checks on both L4 and H100, repeated the direct Qwen 9B isolation checks, and then
+exercised the actual server entry point through its standard-library HTTP client.
+The [service result](shared-training-service-result-2026-10-22.json) records the
+observed output. The H100 sandbox finished in 294.80 seconds; the expanded service
+portion took 92.98 seconds. The fresh L4 sandbox finished in 99.25 seconds. Both
+exited successfully and were terminated.
+
+The service qualification passed:
+
+- Three concurrent tenants, each completing three SFT/GRPO/OPD recipe updates.
+  SFT used a 221-token prompt. Every adapter changed with finite loss and nonzero
+  gradient norm; another tenant's adapter, optimizer, and RNG stayed unchanged.
+- A separately loaded, frozen Qwen 9B teacher on CUDA scored 64 completion tokens
+  across four calls. Its extra instruction context produces real aligned teacher
+  log-probabilities; no fabricated teacher scores are used in this service test.
+- Tenant adapter/request limits returned HTTP 429. Authentication and foreign
+  session/restore access were rejected. Duplicate submissions retained their ID,
+  queued cancellation freed work, and waiting peers ran before the busy tenant's
+  next queued training command.
+- SIGKILL while a GPU sampling command was observed running, followed by a fresh
+  server process using the same durable state directory. Old sessions became lost;
+  the interrupted command remained unknown and was never replayed.
+- All three adapters restored from completed checkpoints. Each next update matched
+  its uninterrupted counterpart exactly: adapter tensors, optimizer state, RNG,
+  loss, and gradient norm.
+- Seventy distinct physical execution receipts, with tenant totals plus observed
+  overhead reconciling exactly. One interrupted execution has unknown duration.
+  The $4/hour rate is an arithmetic fixture, not a quoted provider price or bill.
+
+An independent `nvidia-smi` observation during the service run reported an NVIDIA
+H100 80GB HBM3, 39,307 MiB occupied, and 20% GPU utilization. This is a point-in-time
+observation of the **student service plus the separate teacher**, not a memory
+benchmark or a peak-capacity guarantee.
+
+The full offline suite passed again: 10,813 passed / 141 skipped, plus a separate
+serial run with 25 passed / 2 skipped. Lint, formatting, size/layout, and new-package
+type checks also passed. No training-runtime fix was needed for this retest.
+
+### Remaining qualification limits
+
 Use `scripts/qualify_shared_training.py` as documented in the operator guide. It
 requires an explicit paid-test flag, snapshots source before building the image,
 uses bounded sandbox timeouts, and terminates the sandbox in `finally`.
@@ -77,6 +120,6 @@ run passed **25 tests** with 2 skips (`-m wallclock`). Existing opt-in/dependenc
 skips remain; they are not represented as passed live integration tests.
 
 Unqualified: managed run routing, hosted credentials and billing, deployable
-adapter export, multi-turn/multimodal/structured recipes, external teacher transport,
+adapter export, multi-turn/multimodal/structured recipes, hosted teacher transport,
 large contexts, long-running training quality, throughput, automatic recovery,
 retention, and production failure SLOs. Keep the backend opt-in and experimental.

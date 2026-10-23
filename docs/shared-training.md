@@ -195,6 +195,9 @@ python scripts/qualify_shared_training.py --run-paid-test --output fixture.json
 python scripts/qualify_shared_training.py --run-paid-test \
   --model-id Qwen/Qwen3.5-9B \
   --revision c202236235762e1c871ad0ccb60c8ee5ba337b9a --output qwen.json
+python scripts/qualify_shared_training.py --run-paid-test --service-test \
+  --model-id Qwen/Qwen3.5-9B \
+  --revision c202236235762e1c871ad0ccb60c8ee5ba337b9a --output service.json
 ```
 
 The fixture run uses an L4; the model run uses an H100. Actual-model qualification
@@ -202,3 +205,13 @@ checks updates, peer adapter/optimizer isolation, exact checkpoint continuation,
 and unchanged base parameters for all three objectives. These short runs do not
 establish long-context capacity, training quality, throughput, production billing,
 or end-to-end managed `flash train` behavior.
+
+`--service-test` additionally starts the actual server CLI in a separate process,
+loads a real frozen teacher on CUDA, runs three concurrent tenant recipe clients,
+checks quota/fairness behavior, and kills/restarts the trainer during a running
+command. It verifies exact checkpoint continuation for all three objectives and
+reconciles usage across the restart. The teacher uses the same pinned model with
+additional instruction context; GRPO uses a deterministic sequence reward. This
+tests the standalone service, not hosted teacher transport or task quality. The
+GPU sandbox has a 30-minute timeout for this expanded qualification. Reports include
+SHA-256 hashes of the snapshotted implementation, tests, and qualification scripts.

@@ -7,6 +7,7 @@ The sandbox is terminated in finally, including on local test failure.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import shutil
 import time
@@ -15,7 +16,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 
 
-def run(root, output, model_id=None, revision=None):
+def run(root, output, model_id=None, revision=None, *, service_test=False):
     import modal
 
     from flash.providers._lifecycle.net.worker import worker_image_for_gpu
@@ -38,11 +39,20 @@ def run(root, output, model_id=None, revision=None):
     image = image.add_local_file(
         root / "scripts/shared_model_qualification.py", "/app/model_qualification.py", copy=True
     )
+    image = image.add_local_file(
+        root / "scripts/shared_service_qualification.py", "/app/service_qualification.py", copy=True
+    )
     name = "flash-shared-qualification-" + uuid.uuid4().hex[:12]
     app = modal.App.lookup(name, create_if_missing=True)
     started = time.time()
     sandbox = None
     report = {"name": name, "gpu": gpu, "fixture_only": not bool(model_id)}
+    report["source_sha256"] = {
+        str(path.relative_to(root)): hashlib.sha256(path.read_bytes()).hexdigest()
+        for path in sorted(root.rglob("*.py"))
+        if "training/shared" in str(path) or path.parent.name in ("scripts", "tests")
+    }
+    report["service_test"] = service_test
     try:
         code = (
             "import subprocess, sys, importlib.metadata as m; "
@@ -50,9 +60,9 @@ def run(root, output, model_id=None, revision=None):
             "subprocess.run([sys.executable,'-m','pytest','-q','-ra','/app/tests'],check=True)"
         )
         if model_id:
-            code += (
-                "; import runpy; runpy.run_path('/app/model_qualification.py',run_name='__main__')"
-            )
+            code += "; subprocess.run([sys.executable,'/app/model_qualification.py'],check=True)"
+        if service_test:
+            code += "; subprocess.run([sys.executable,'/app/service_qualification.py'],check=True)"
         environment = {
             "PYTHONPATH": "/app",
             "FLASH_SHARED_TEST_DEVICE": "cuda",
@@ -69,16 +79,20 @@ def run(root, output, model_id=None, revision=None):
             gpu=gpu,
             cpu=2,
             memory=65536 if model_id else 16384,
-            timeout=1200 if model_id else 600,
+            timeout=1800 if service_test else 1200 if model_id else 600,
             workdir="/app",
             env=environment,
         )
         report["sandbox_id"] = sandbox.object_id
-        stdout = sandbox.stdout.read()
+        output.write_text(json.dumps(report, indent=2))
+        lines = []
+        for line in sandbox.stdout:
+            lines.append(line)
+            print(line, end="", flush=True)
+        stdout = "".join(lines)
         stderr = sandbox.stderr.read()
         sandbox.wait()
         report.update(exit_code=sandbox.returncode, stdout=stdout, stderr=stderr)
-        print(stdout, flush=True)
         if sandbox.returncode:
             print(stderr, flush=True)
             raise RuntimeError("shared CUDA qualification failed")
@@ -96,11 +110,14 @@ def main():
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--model-id")
     parser.add_argument("--revision")
+    parser.add_argument("--service-test", action="store_true")
     args = parser.parse_args()
     if not args.run_paid_test:
         parser.error("--run-paid-test is required")
     if bool(args.model_id) != bool(args.revision):
         parser.error("--model-id and --revision must be supplied together")
+    if args.service_test and not args.model_id:
+        parser.error("--service-test requires --model-id and --revision")
     root = Path(__file__).resolve().parents[1]
     # snapshot before Modal reads files asynchronously; edits cannot alter a running qualification.
     with TemporaryDirectory(prefix="flash-shared-qualification-") as directory:
@@ -114,9 +131,13 @@ def main():
             root / "scripts/shared_model_qualification.py",
             snapshot / "scripts/shared_model_qualification.py",
         )
+        shutil.copy2(
+            root / "scripts/shared_service_qualification.py",
+            snapshot / "scripts/shared_service_qualification.py",
+        )
         for source in (root / "tests").glob("test_shared_training*.py"):
             shutil.copy2(source, snapshot / "tests" / source.name)
-        run(snapshot, args.output, args.model_id, args.revision)
+        run(snapshot, args.output, args.model_id, args.revision, service_test=args.service_test)
 
 
 if __name__ == "__main__":
