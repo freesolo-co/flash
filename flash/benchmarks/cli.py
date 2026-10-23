@@ -25,9 +25,19 @@ def main(argv=None) -> int:
     )
     summarize = commands.add_parser("summarize")
     summarize.add_argument("output", type=Path)
+    compare = commands.add_parser("compare")
+    compare.add_argument("baseline", type=Path)
+    compare.add_argument("candidate", type=Path)
+    compare.add_argument("--allow-change", action="append", default=[])
     args = parser.parse_args(argv)
     try:
-        if args.command == "summarize":
+        if args.command == "compare":
+            from flash.benchmarks.comparison import compare_runs
+
+            result = compare_runs(
+                args.baseline, args.candidate, allow_changes=tuple(args.allow_change)
+            )
+        elif args.command == "summarize":
             result = replay(args.output)
         else:
             suite = Suite.model_validate_json(args.suite.read_text())

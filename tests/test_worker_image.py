@@ -42,7 +42,8 @@ def test_worker_without_gpu_keeps_qualified_base(gpu):
 
 
 def test_bake_inventory_alone_does_not_enable_an_image(monkeypatch):
-    monkeypatch.delitem(QUALIFIED_WORKER_IMAGES, "sm90")
+    # Orchestrator tests can reload the module after collection; patch its live catalog.
+    monkeypatch.delitem(worker_module.QUALIFIED_WORKER_IMAGES, "sm90")
     assert "sm90" in worker_module.BAKED_PER_SM_ARCHES
     assert worker_image_for_gpu("H100") == WORKER_IMAGE
 

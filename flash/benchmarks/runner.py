@@ -128,6 +128,11 @@ def _read_trial(trial: Path, case, smoke: bool) -> dict:
     request = json.loads((trial / "request.json").read_text())
     execution = json.loads((trial / "execution.json").read_text())
     try:
+        if (
+            request.get("case") != case.model_dump(mode="json")
+            or request.get("configuration", {}).get("parameters") != case.configuration
+        ):
+            raise ValueError("trial request does not match retained suite")
         events = load_events(trial / "events.jsonl")
         if not smoke and any(
             getattr(event, "end_s", getattr(event, "at_s", 0.0)) > execution["elapsed_s"]
