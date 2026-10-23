@@ -64,7 +64,7 @@ class RunMetrics:
     seed: int = 0
     model_id: str = ""
     wall_seconds: float = 0.0  # training-loop wall time used for customer cost
-    setup_seconds: float = 0.0  # cold start / provisioning + model load
+    setup_seconds: float = 0.0  # legacy parent preparation; see notes.training_timing for startup
     train_throughput_toks_per_s: float = 0.0
     train_tokens: int = 0
     generated_tokens: int = 0  # RL: total sampled completion tokens

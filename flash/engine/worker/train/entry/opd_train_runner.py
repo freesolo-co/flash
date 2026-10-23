@@ -426,6 +426,7 @@ def _build_child_callbacks(
 
     def on_line(line: str) -> None:
         nonlocal runtime_verified
+        context.phase_timings.observe_line(line)
         watcher.raise_if_failed()
         link = _backend.parse_wandb_link(line)
         if link is not None:

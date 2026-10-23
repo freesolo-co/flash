@@ -24,6 +24,7 @@ from flash.engine.worker.perf import (  # noqa: F401
     RetriableInfraError,
     gpu_diagnostics,
 )
+from flash.engine.worker.runtime.phases import timed_phase
 from flash.engine.worker.runtime.state import WorkerContext
 from flash.teacher.retry_contract import (
     canonical_opd_optimizer_start_json,
@@ -234,6 +235,7 @@ def _resume_checkpoint_upload_slot(timeout_s: float | None = None, *, context: W
             context.resume_upload_lock.release()
 
 
+@timed_phase("publication")
 def hf_upload_folder(
     local_dir: str, repo_subpath: str, required: bool = False, *, context: WorkerContext
 ) -> bool:

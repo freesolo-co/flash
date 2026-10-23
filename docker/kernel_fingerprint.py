@@ -31,11 +31,9 @@ correctness, and the alternatives over-fire the paid GPU bake):
     text change; a future cache-affecting RANGE would reintroduce that gap. (fp_base DOES hash the
     whole Dockerfile.worker, so arbitrary base edits -- apt/ENV/CMD/cache-dir -- still trigger a
     free re-layer; only a cache-affecting change that isn't a parsed pin slips through.)
-  * fp_cache hashes the warmup, bake entry and AOT helper, but not all transitive inputs such as
-    perf's Hopper fla/tilelang setup. The kernel-DETERMINING
-    versions (tilelang/tvm-ffi/fla) ARE captured here; that code is otherwise stable or fetched fresh
-    at runtime, so a change there only risks a stale (mostly sm90) cache that cold-JITs. Hashing all
-    of perf would re-warm 5 GPUs on every unrelated edit.
+  * fp_cache includes perf's kernel-selection helpers as a whole file. An unrelated edit there
+    can also trigger a re-warm; this keeps changes to their transitive setup code from silently
+    reusing kernels baked for a different backend.
 
 stdlib only, no flash/torch import, so it runs under a bare python3 in CI (no uv sync needed).
 """
@@ -57,7 +55,7 @@ LABEL_REVISION = "org.opencontainers.image.revision"
 
 # pip specs in Dockerfile.worker's main stack whose kernels land in the kernel cache. everything else
 # in that block is a base-layer dep (fp_base). fla is matched separately (it carries the git sha).
-_CACHE_PKGS = {"tilelang", "apache-tvm-ffi"}
+_CACHE_PKGS = {"tilelang", "apache-tvm-ffi", "flashinfer-python", "vllm"}
 _BAKED_ARCHES_NAME = "BAKED_PER_SM_ARCHES"
 _BAKED_ARCH_PATTERN = re.compile(r"sm[0-9]+")
 
@@ -194,6 +192,9 @@ def collect_inputs(
         "fla": fla,
         "tilelang": _need("tilelang"),
         "tvm_ffi": _need("apache-tvm-ffi"),
+        "flashinfer": _need("flashinfer-python"),
+        "vllm": _need("vllm"),
+        "kernel_selection_sha256": _sha256_file(root / "flash/engine/worker/perf/__init__.py"),
         # Training kernels are baked in the isolated interpreter; changes to its dependency
         # block must invalidate the bake even if the parent stack is unchanged.
         "verl_stack": _search(
