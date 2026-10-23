@@ -23,17 +23,25 @@ def make_model(path):
     from transformers import PreTrainedTokenizerFast, Qwen3Config, Qwen3ForCausalLM
 
     torch.manual_seed(42)
-    vocab = {"[UNK]": 0, "[PAD]": 1, "[EOS]": 2}
-    vocab.update({f"word{i}": i + 3 for i in range(125)})
+    vocab = {"[UNK]": 0, "[PAD]": 1, "<|im_end|>": 2, "<|im_start|>": 3, "\n": 4}
+    vocab.update({f"word{i}": i + 5 for i in range(123)})
     backend = Tokenizer(models.WordLevel(vocab=vocab, unk_token="[UNK]"))
     backend.pre_tokenizer = pre_tokenizers.Whitespace()
     tokenizer = PreTrainedTokenizerFast(
         tokenizer_object=backend,
         unk_token="[UNK]",
         pad_token="[PAD]",
-        eos_token="[EOS]",
-        chat_template="{% for m in messages %}{{ m['content'] }} {% endfor %}word0",
+        eos_token="<|im_end|>",
+        additional_special_tokens=["<|im_start|>", "\n"],
+        chat_template=(
+            "{% for m in messages %}<|im_start|>{{ m['role'] }}\n"
+            "{{ m['content'] }}<|im_end|>\n{% endfor %}"
+            "{% if add_generation_prompt %}<|im_start|>assistant\n{% endif %}"
+        ),
     )
+    from verl.utils.tokenizer.continuous_token import QwenContinuousTokenBuilder
+
+    QwenContinuousTokenBuilder(tokenizer)
     tokenizer.save_pretrained(path)
     model = Qwen3ForCausalLM(
         Qwen3Config(
