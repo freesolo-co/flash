@@ -519,7 +519,10 @@ def _announce_training(t_start: float, cfg, *, context: WorkerContext) -> tuple[
     print(f"[rl-verl] rollout gpu_memory_utilization={cfg['gpu_mem_util']:.4f}", flush=True)
     setup_seconds = time.time() - t_start
     _worker_heartbeat.heartbeat(
-        "rl_train_start", setup_seconds=setup_seconds, gpu=gpu_diagnostics(), context=context
+        "rl_train_start",
+        parent_preparation_seconds=setup_seconds,
+        gpu=gpu_diagnostics(),
+        context=context,
     )
     return setup_seconds, time.time()
 
@@ -719,6 +722,7 @@ def _execute_rl_child(
     runtime_verified = readiness_path is None
     try:
         for line in child_stream:
+            context.phase_timings.observe_line(line)
             print(f"[verl] {line}", end="", flush=True)
             link = parse_wandb_link(line)
             if link is not None:

@@ -214,6 +214,7 @@ def _format_heartbeat(hb: dict) -> str:
         ("max_completion_tokens", 0),
         ("learning_rate", 8),
         ("setup_seconds", 1),
+        ("parent_preparation_seconds", 1),
         ("train_wall", 1),
     ):
         value = hb.get(key)

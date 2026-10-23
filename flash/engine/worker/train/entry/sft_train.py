@@ -22,6 +22,7 @@ import flash.engine.worker.train.core.lifecycle.finalize as _worker_finalize
 from flash._internal.diagnostics import SECRET_ENV_KEYS_ENV
 from flash.adapters.lora_rank import alpha_from_adapter_config, rank_from_adapter_config
 from flash.engine.worker.runtime.kernel_warmup import KERNEL_CACHE_ENV_SUBDIRS
+from flash.engine.worker.runtime.phases import training_phase
 from flash.engine.worker.runtime.state import WorkerContext
 from flash.engine.worker.verl.checkpoints import restore_verl_resume
 from flash.engine.worker.verl.parallelism import ULYSSES_SEQUENCE_PARALLEL_SIZE
@@ -593,7 +594,8 @@ def run_sft_train(spec=None, *, context: WorkerContext) -> None:
             )
         # ONE child answers every independent capability question. each used to cost its own
         # interpreter, and the torch/verl import -- not the question -- was the price.
-        caps = probe_verl_capabilities(python_bin, gdn_module)
+        with training_phase("capability_checks", context=context):
+            caps = probe_verl_capabilities(python_bin, gdn_module)
         capabilities = _SftCapabilities(
             python_bin=python_bin,
             caps=caps,

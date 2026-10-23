@@ -274,6 +274,7 @@ def heartbeat(
         "attempt": context.config.attempt,
         **({"liveness": True} if liveness else {}),
         **kw,
+        "training_timing": context.phase_timings.snapshot(),
     }
     if genuine_progress:
         payload["progress_age_s"] = 0.0

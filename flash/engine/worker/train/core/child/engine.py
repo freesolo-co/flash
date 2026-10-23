@@ -6,6 +6,7 @@ from dataclasses import is_dataclass, replace
 from verl.workers.engine import EngineRegistry
 from verl.workers.engine.fsdp.transformer_impl import FSDPEngineWithLMHead
 
+from flash.engine.worker.runtime.phases import training_phase
 from flash.engine.worker.train.core.child.model import (
     configure_gdn,
     install_vision_input_grads,
@@ -25,6 +26,7 @@ class FlashFSDPEngine(FSDPEngineWithLMHead):
         super().__init__(*args, **kwargs)
         self.runtime = RuntimeOptions.decode(self.model_config.runtime_options)
 
+    @training_phase("model_initialization")
     def _build_module(self):
         from flash.engine.worker.train.core.child.flashinfer_cache import activate_current
 
@@ -104,6 +106,7 @@ class FlashFSDPEngine(FSDPEngineWithLMHead):
             )
         return optimizer
 
+    @training_phase("checkpoint_capture")
     def save_checkpoint(self, local_path, *args, **kwargs):
         from flash.engine.worker.train.core.child.compact_checkpoint import saving
 
