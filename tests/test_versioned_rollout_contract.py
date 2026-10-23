@@ -168,6 +168,7 @@ class Backend:
             extra_fields={
                 "global_steps": self.global_steps,
                 "finish_reason": "stop",
+                "_flash_engine_prompt_digest": digest(prompt_ids),
                 "_flash_effective_sampling": {"temperature": 0.8, "max_tokens": 2},
             },
         )

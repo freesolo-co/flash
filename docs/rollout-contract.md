@@ -64,6 +64,14 @@ context-budget clamping, including defaults that vLLM normally omits when
 serializing. The existing training recipe selects the probability mode; the
 contract does not silently substitute one distribution for another.
 
+Before issuing a successful result receipt, the server also checks the final
+`RequestOutput.prompt_token_ids` reported by vLLM against the request digest.
+These are the engine's conditioning tokens after preprocessing, including
+multimodal placeholder expansion. Intermediate image-token deduplication is
+allowed when expansion restores the requested token sequence; missing evidence or
+a different final sequence rejects the result. This checks token conditioning,
+not the content of image/audio/video payloads.
+
 Episode receipts distinguish `assistant_mask` (token provenance) from the existing
 `response_mask` (loss eligibility). Environment tokens can never enter the loss.
 All assistant turn boundaries survive, including unusable turns that receive no

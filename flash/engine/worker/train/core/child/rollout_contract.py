@@ -84,7 +84,10 @@ class RolloutContractServer:
         )
         lease.finish(acknowledgement)
         cancelled = output.stop_reason == "aborted"
+        engine_prompt_digest = output.extra_fields.pop("_flash_engine_prompt_digest", None)
         if not cancelled:
+            if engine_prompt_digest != request.prompt_digest:
+                raise ValueError("rollout engine conditioning tokens do not match its request")
             validate_tokens(output.token_ids, output.log_probs)
         output.extra_fields[RESULT_FIELD] = {
             "request": request.encode(),
@@ -100,6 +103,13 @@ class RolloutContractServer:
         if self._contract() is not None:
             import msgspec
 
+            if output.stop_reason != "aborted":
+                # RequestOutput carries the engine's tokens after multimodal expansion,
+                # not the deduplicated placeholders passed to engine.generate().
+                prompt_ids = getattr(final_res, "prompt_token_ids", None)
+                if prompt_ids is None:
+                    raise ValueError("rollout engine did not report its conditioning tokens")
+                output.extra_fields["_flash_engine_prompt_digest"] = digest(prompt_ids)
             # capture the effective engine parameters after upstream applies defaults/caps.
             output.extra_fields["_flash_effective_sampling"] = {
                 name: msgspec.to_builtins(getattr(sampling_params, name))

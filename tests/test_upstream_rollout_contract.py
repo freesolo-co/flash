@@ -79,7 +79,8 @@ def test_request_identity_survives_upstream_routing_and_tensor_ingestion(monkeyp
     )
 
 
-def test_effective_sampling_receipt_includes_omitted_defaults():
+@pytest.mark.parametrize("cancelled", [False, True])
+def test_effective_sampling_receipt_includes_omitted_defaults(cancelled):
     import msgspec
 
     from flash.engine.worker.train.core.child.rollout_contract import RolloutContractServer
@@ -99,12 +100,79 @@ def test_effective_sampling_receipt_includes_omitted_defaults():
 
     server = Server()
     server.model_config = model_config()
-    output = server._postprocess_output(SimpleNamespace(extra_fields={}), None, Sampling())
+    output = server._postprocess_output(
+        SimpleNamespace(extra_fields={}, stop_reason="aborted" if cancelled else "completed"),
+        SimpleNamespace(prompt_token_ids=None if cancelled else [1]),
+        Sampling(),
+    )
+    assert ("_flash_engine_prompt_digest" in output.extra_fields) is not cancelled
     assert output.extra_fields["_flash_effective_sampling"] == {
         "temperature": 1.0,
         "top_p": 1.0,
         "max_tokens": 8,
     }
+
+
+@pytest.mark.parametrize("engine_prompt", [[1, 8, 8, 2], [1, 8, 2], [1, 8, 8, 8, 2], None])
+def test_multimodal_receipt_checks_final_engine_expansion(engine_prompt):
+    from dataclasses import replace
+
+    import msgspec
+    from verl.utils.tokenizer import normalize_token_ids
+    from verl.workers.rollout.utils import qwen2_5_vl_dedup_image_tokens
+
+    from flash.engine.worker.train.core.child.rollout_contract import (
+        REQUEST_FIELD,
+        RESULT_FIELD,
+        RolloutContractServer,
+    )
+    from flash.engine.worker.train.core.rollout.contract import digest, validate_result
+    from tests.test_versioned_rollout_contract import Backend, Server, load, request
+
+    class Sampling(msgspec.Struct):
+        temperature: float = 0.8
+
+    class Qwen2VLImageProcessor:
+        pass
+
+    class EngineBackend(Backend):
+        async def generate(self, **kwargs):
+            # Run the pinned upstream's real normalization and deduplication.
+            normalized = normalize_token_ids(kwargs["prompt_ids"])
+            submitted = qwen2_5_vl_dedup_image_tokens(normalized, self.model_config.processor)
+            assert submitted == [1, 8, 2]
+            output = await super().generate(**kwargs)
+            output.extra_fields.pop("_flash_engine_prompt_digest")
+            # GPU expansion is represented by RequestOutput's final conditioning tokens.
+            final_res = SimpleNamespace(prompt_token_ids=engine_prompt)
+            return self._postprocess_output(output, final_res, Sampling())
+
+        def _postprocess_output(self, output, final_res, sampling_params):
+            return output
+
+    class EngineServer(RolloutContractServer, EngineBackend):
+        __init__ = Server.__init__
+
+    async def scenario():
+        server = EngineServer()
+        server.model_config.processor = SimpleNamespace(
+            image_processor=Qwen2VLImageProcessor(), image_token_id=8, video_token_id=9
+        )
+        await load(server)
+        prompt = [1, 8, 8, 2]
+        req = replace(request(), prompt_digest=digest(prompt))
+        output = await server.generate(
+            prompt_ids=prompt,
+            sampling_params={"logprobs": True, REQUEST_FIELD: req.encode()},
+            request_id=req.request_id,
+        )
+        validate_result(req, output.extra_fields[RESULT_FIELD], [2, 3], [-0.2, -0.3])
+
+    if engine_prompt == [1, 8, 8, 2]:
+        asyncio.run(scenario())
+    else:
+        with pytest.raises(ValueError, match="conditioning tokens"):
+            asyncio.run(scenario())
 
 
 def test_trainer_validates_before_native_batch_padding(monkeypatch):
