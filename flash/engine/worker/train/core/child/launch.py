@@ -33,6 +33,10 @@ def configure(options, overrides):
         model = config.model if options.algorithm == "sft" else config.actor_rollout_ref.model
         model._target_ = "flash.engine.worker.train.core.child.configuration.FlashModelConfig"
         model.runtime_options = options.encode()
+        if options.algorithm == "grpo":
+            model.runtime_options["rollout_template_kwargs"] = dict(
+                config.data.get("apply_chat_template_kwargs", {})
+            )
         if options.algorithm == "sft":
             engines = [config.engine]
         else:

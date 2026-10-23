@@ -9,8 +9,8 @@ from verl.trainer.ppo.v1.agent_loop_tq import AgentLoopManagerTQ
 from verl.utils import tensordict_utils as tu
 
 from flash.content.structured_options import vllm_structured_kwargs
-from flash.engine.worker.train.core.child.observations import ObservedRolloutClient
 from flash.engine.worker.train.core.child.options import RuntimeOptions
+from flash.engine.worker.train.rl.child.contract import ContractRolloutClient
 from flash.engine.worker.train.rl.child.identity import _identity_from_trajectory
 from flash.engine.worker.train.rl.child.multiturn import (
     build_flash_grpo_multi_turn_agent_loop,
@@ -49,7 +49,7 @@ class FlashGrpoManager(AgentLoopManagerTQ):
 
 class FlashGrpoPolicy:
     def __init__(self, *args, server_manager, **kwargs):
-        self.observations = ObservedRolloutClient(server_manager)
+        self.observations = ContractRolloutClient(server_manager)
         super().__init__(*args, server_manager=self.observations, **kwargs)
 
     async def run(self, sampling_params, **kwargs):
@@ -80,7 +80,7 @@ class FlashGrpoPolicy:
             params["structured_outputs"] = StructuredOutputsParams(
                 **vllm_structured_kwargs(runtime.structured_outputs)
             )
-        with self.observations.episode():
+        with self.observations.episode_contract(self, identity):
             output = await super().run(params, **kwargs)
             if output.reward_score is None:
                 output.reward_score = await asyncio.to_thread(

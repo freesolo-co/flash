@@ -8,6 +8,7 @@ from verl import DataProto
 from verl.workers.utils.padding import response_to_nested
 
 from flash.engine.worker.train.core.child.trainer import FlashSyncTrainer
+from flash.engine.worker.train.rl.child.contract import expected_policy, validate_queue_rollouts
 from flash.engine.worker.train.rl.child.credit import apply_per_turn_credit
 
 
@@ -25,6 +26,25 @@ def require_trainable_responses(batch):
 
 
 class FlashGrpoTrainer(FlashSyncTrainer):
+    def get_llm_client(self):
+        from flash.engine.worker.train.rl.child.transport import RolloutContractTransport
+
+        return self.llm_server_manager.get_client(client_cls=RolloutContractTransport)
+
+    def _balance_batch(self, batch, metrics, **kwargs):
+        if getattr(self, "_rollout_contract_step", None) != self.global_steps:
+            self._rollout_contract_step = self.global_steps
+            self._accepted_rollouts = set()
+        validate_queue_rollouts(
+            batch,
+            expected_policy=expected_policy(self, self.global_steps - 1),
+            logprob_definition=self.config.actor_rollout_ref.rollout.logprobs_mode,
+            run_id=self.runtime.rollout_run_id,
+            optimizer_step=self.global_steps,
+            accepted=self._accepted_rollouts,
+        )
+        return super()._balance_batch(batch, metrics, **kwargs)
+
     def _compute_advantage(self, batch, metrics):
         require_trainable_responses(batch)
         batch = super()._compute_advantage(batch, metrics)

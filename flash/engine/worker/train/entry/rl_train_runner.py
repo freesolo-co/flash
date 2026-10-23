@@ -14,6 +14,7 @@ import threading
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from uuid import uuid4
 
 import flash.engine.worker.io.heartbeat as _worker_heartbeat
 import flash.engine.worker.io.hf as _worker_hf
@@ -364,6 +365,7 @@ def _write_rl_launch_config(inp, files, *, gdn_reset_arch: str | None, loggers) 
     )
     config = {
         "readiness_path": files["readiness_path"],
+        "rollout_run_id": uuid4().hex,
         "dp_cards": int(inp["dp_cards"]),
         "reentrant_checkpointing": bool(inp["reentrant_checkpointing"]),
         "multimodal": bool(inp["multimodal"]),

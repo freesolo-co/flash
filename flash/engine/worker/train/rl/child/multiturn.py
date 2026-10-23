@@ -112,11 +112,13 @@ class _EpisodeTranscript:
         # response_ids on the right (agent_loop._postprocess pads with padding_side="right"),
         # so these offsets index the response-width advantage tensor unchanged.
         self.turn_spans: list[tuple[int, int]] = []
+        self.all_turn_spans: list[tuple[int, int]] = []
         self.prefix_ids = list(prompt_ids)
         self.have_logprobs = True
         self.generated_seconds = 0.0
         self.num_preempted = -1
         self.turn_count = 0
+        self.termination_reason = "turn_limit"
         self.response_capacity = response_capacity
         self.max_model_len = max_model_len
 
@@ -149,6 +151,7 @@ class _EpisodeTranscript:
         # score_rollouts rejects as a count mismatch -- dropping the row, and with it its
         # whole group, to episode credit. the span list and the mask are independent
         # fields on the output, so zeroing above does not change this count.
+        self.all_turn_spans.append((turn_start, len(self.response_ids)))
         if not unusable_turn:
             self.turn_spans.append((turn_start, len(self.response_ids)))
         if self.have_logprobs and log_probs is not None:
@@ -244,6 +247,8 @@ def _agent_loop_output_fields(prompt, episode, *, reward_score, turn_rewards) ->
         # agent loop transports into non_tensor_batch (agent_loop._postprocess).
         "extra_fields": {
             "flash_turn_spans": list(episode.turn_spans),
+            "flash_all_turn_spans": list(episode.all_turn_spans),
+            "flash_episode_termination": episode.termination_reason,
             "flash_turn_rewards": turn_rewards,
         },
         "metrics": {
@@ -334,6 +339,11 @@ async def _grpo_run_turns(
     for turn_ordinal in range(turn_limit):
         max_tokens = episode.turn_budget(max_completion_tokens)
         if max_tokens <= 0:
+            episode.termination_reason = (
+                "context_limit"
+                if len(episode.prefix_ids) >= settings.max_model_len
+                else "response_limit"
+            )
             break
         params = _turn_sampling_params(
             sampling_params,
@@ -389,14 +399,28 @@ async def _grpo_run_turns(
             ),
         )
         if turn["truncated"] or turn["skip_reason"] or step["terminal"]:
+            episode.termination_reason = (
+                "length"
+                if turn["truncated"]
+                else "unusable_turn"
+                if turn["skip_reason"]
+                else "environment_terminal"
+            )
             break
         env_messages = step["messages"]
         if not env_messages:
+            episode.termination_reason = "no_followup"
             break
         reply_glue = await glue_processor(env_messages, step.get("image_data_uris"))
         _validate_grpo_reply_media(prompt, reply_glue, step)
         glue_ids = dedup_seam_terminator(turn_ids, reply_glue.token_ids)
         if not episode.glue_fits(glue_ids):
+            episode.termination_reason = (
+                "context_limit"
+                if len(episode.prefix_ids) + len(glue_ids) + _NEXT_TURN_SLACK
+                > settings.max_model_len
+                else "response_limit"
+            )
             _close_reply_images(reply_glue.images)
             break
         prompt.append_images(reply_glue.images, reply_glue.image_digests)
