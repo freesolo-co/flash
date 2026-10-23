@@ -1028,7 +1028,7 @@ def test_opd_all_over_budget_prompts_fail_before_loading_student(worker_context,
         pad_token_id = 0
 
         def apply_chat_template(self, messages, **kw):
-            return "PROMPT"
+            return [1] * 100000 if kw.get("tokenize", True) else "PROMPT"
 
         def __call__(self, text, add_special_tokens=False):
             return SimpleNamespace(input_ids=[1] * 100000)  # every prompt is over budget
@@ -1098,14 +1098,19 @@ def test_opd_all_over_budget_prompts_fail_before_loading_student(worker_context,
     import transformers
 
     monkeypatch.setattr(transformers.AutoTokenizer, "from_pretrained", lambda *a, **k: _Tok())
+    monkeypatch.setattr(
+        transformers.AutoConfig,
+        "from_pretrained",
+        lambda *a, **k: SimpleNamespace(max_position_embeddings=4096),
+    )
     import flash.engine.worker.teacher.client as tmod
 
-    monkeypatch.setattr(tmod, "TeacherClient", lambda *a, **k: object())
+    monkeypatch.setattr(tmod, "TeacherClient", lambda *a, **k: SimpleNamespace(close=lambda: None))
     monkeypatch.setenv("FLASH_PUBLIC_URL", "https://broker.example")
     monkeypatch.setenv("FLASH_TEACHER_CAPABILITY", "unit-test-teacher-capability")
 
     # the all-over-budget guard must fire before the model-load assertion can run.
-    with pytest.raises(RuntimeError, match="every prompt exceeds"):
+    with pytest.raises(RuntimeError, match="every OPD prompt exceeds"):
         opd_mod.run_opd_train(context=worker_context)
     # ...and the base-weight prefetch must have been deferred: an all-over-budget dataset fails
     # without paying for the tens-of-GB snapshot download.

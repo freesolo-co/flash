@@ -1,6 +1,6 @@
 [project]
 name = "freesolo-flash"
-version = "1.3.23"
+version = "1.3.24"
 description ="Flash — managed LoRA post-training (SFT/GRPO/OPD) for Freesolo environments, driven by the `flash` CLI"
 readme = "README.md"
 # The training and serving stack is validated on Python 3.11 and 3.12.
@@ -24,6 +24,14 @@ classifiers = [
 dependencies = []
 
 [project.optional-dependencies]
+# experimental, operator-owned shared trainer; independent of the vLLM worker extra.
+shared-training = [
+    "torch==2.10.0",
+    "peft==0.19.0",
+    "transformers>=5.8,<5.13",
+    "fastapi>=0.136,<1",
+    "uvicorn>=0.52,<1",
+]
 # heavy deps for running the fine-tuning worker locally (the deployed gpu worker installs its exact
 # stack in Dockerfile.worker, with the fallback verl venv mirrored in capabilities.py).
 gpu = [
@@ -203,7 +211,7 @@ artifacts = ["flash/py.typed"]
 # auto-published by .github/workflows/publish-dev.yml: a push to `dev` whose version isn't yet on
 # PyPI publishes it; pushes that don't change it find it already published and no-op. So cutting a
 # dev-channel release = bump this (and [project].version) and merge to `dev`.
-version = "1.3.23"
+version = "1.3.24"
 
 [tool.pytest.ini_options]
 pythonpath = ["."]
@@ -226,6 +234,10 @@ package = true
 # training and serving intentionally validate different exact vllm builds and cannot be installed
 # into one environment. uv records both resolutions while rejecting only the incompatible combination.
 conflicts = [
+    [
+        { extra = "shared-training" },
+        { extra = "serve-runtime" },
+    ],
     [
         { extra = "gpu" },
         { extra = "serve-runtime" },
