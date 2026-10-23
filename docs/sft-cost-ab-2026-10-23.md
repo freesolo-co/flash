@@ -102,5 +102,36 @@ the conservative full-model estimate per card without assuming any sharding savi
 The benchmark configuration still disables checkpointing under the new rule. CPU regression
 tests cover other model identities, revisions, geometries, memory capacities and workload
 sizes, as well as the existing measured OOM boundaries. The six GPU runs above tested the
-earlier policy; they have not been rerun on this revision and do not validate every newly
-eligible workload.
+earlier policy and do not validate every newly eligible workload. The live checks below
+separately exercise the revised policy.
+
+
+## Automatic GPU selection checks on the revised policy
+
+Two fresh-cache SFT runs tested commit `14e93b92` through the production `allocate()` and
+Modal `submit_attempt()` paths. GPU type, count and provider were all omitted from the
+input; the allocator selected the first candidate without retries or manual overrides.
+Both workers attested source archive
+`0b6d629cda40b64a082afc31dccb3ae58475dee6a8b0f763ad681f1b3fa7d24b`.
+
+| Workload | Selected GPU | Actual max tokens | Checkpointing | Updates | Peak GPU memory | Completion |
+| --- | --- | ---: | --- | ---: | ---: | ---: |
+| Qwen3.5-9B | 1× L40S | 304 | Off | 32/32 | 24.67 GiB | 4.74 min |
+| Qwen3.8-27B | 1× H100 | 1,294 | On | 32/32 | 58.49 GiB | 7.97 min |
+
+Both completed with finite training losses, no out-of-memory errors, and successful final
+checkpoint publication. Live GPU probes matched the automatically selected hardware.
+The short 9B workload fit without checkpointing; the longer 27B workload retained it.
+
+Each run used 32 synthetic text examples, batch 1, LoRA rank 8, seed 17, and a 20-minute
+deadline. CPU/RAM reservations remained production defaults; benchmark burst ceilings were
+8 cores/128 GiB per GPU. Estimated compute including CPU staging and publication was
+$0.135 and $0.379, respectively ($0.515 total), against a $5.786 conservative compute
+ceiling. These estimates exclude storage, network and unobserved bursts and are not invoices.
+
+This validates allocation and training completion for these two single-GPU configurations;
+it is not a model-quality comparison or validation of all architectures, long contexts,
+or multi-GPU jobs. It exercises production allocation/worker code directly, not hosted API
+routing. Checkpoints and raw evidence were preserved locally before all six owned GPU/CPU
+sandboxes, the dedicated app, cache/handoff volumes and temporary private artifact repository
+were cleaned up. [Machine-readable results and allocation evidence](sft-memory-autogpu-2026-10-23.json).
