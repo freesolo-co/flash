@@ -1,0 +1,216 @@
+{
+  "schema_version": 1,
+  "baseline_suite": "matched-h100",
+  "candidate_suite": "matched-b200",
+  "changed_inputs": {
+    "sft": [
+      "configuration.gpu",
+      "configuration.quality_observer_modes.warm",
+      "revisions.image"
+    ],
+    "grpo": [
+      "configuration.gpu",
+      "revisions.image"
+    ]
+  },
+  "all_trials_valid": true,
+  "production_claims_eligible": false,
+  "synthetic": false,
+  "groups": [
+    {
+      "case": "grpo",
+      "cache": "cold",
+      "paired_trials": 1,
+      "baseline_targets_reached": 0,
+      "candidate_targets_reached": 0,
+      "both_reached_pairs": 0,
+      "median_time_to_target_ratio_among_both_reached": null
+    },
+    {
+      "case": "grpo",
+      "cache": "warm",
+      "paired_trials": 1,
+      "baseline_targets_reached": 0,
+      "candidate_targets_reached": 0,
+      "both_reached_pairs": 0,
+      "median_time_to_target_ratio_among_both_reached": null
+    },
+    {
+      "case": "sft",
+      "cache": "cold",
+      "paired_trials": 1,
+      "baseline_targets_reached": 0,
+      "candidate_targets_reached": 0,
+      "both_reached_pairs": 0,
+      "median_time_to_target_ratio_among_both_reached": null
+    },
+    {
+      "case": "sft",
+      "cache": "warm",
+      "paired_trials": 1,
+      "baseline_targets_reached": 0,
+      "candidate_targets_reached": 0,
+      "both_reached_pairs": 0,
+      "median_time_to_target_ratio_among_both_reached": null
+    }
+  ],
+  "pairs": [
+    {
+      "case": "grpo",
+      "seed": 17,
+      "cache": "cold",
+      "both_valid": true,
+      "baseline_target_reached": false,
+      "candidate_target_reached": false,
+      "time_to_target_ratio": null,
+      "horizon_wall_ratio": 0.7033423411070149,
+      "baseline_last_observed_quality": 0.515625,
+      "candidate_last_observed_quality": 0.515625,
+      "last_observed_quality_delta": 0.0,
+      "money": {
+        "infrastructure_actual": {
+          "baseline_known_usd": 3.26266578,
+          "candidate_known_usd": 2.82660182,
+          "both_complete": false,
+          "total_cost_ratio": null,
+          "baseline_to_target": null,
+          "candidate_to_target": null
+        },
+        "infrastructure_estimate": {
+          "baseline_known_usd": 0,
+          "candidate_known_usd": 0,
+          "both_complete": false,
+          "total_cost_ratio": null,
+          "baseline_to_target": null,
+          "candidate_to_target": null
+        },
+        "customer_charge": {
+          "baseline_known_usd": 0,
+          "candidate_known_usd": 0,
+          "both_complete": false,
+          "total_cost_ratio": null,
+          "baseline_to_target": null,
+          "candidate_to_target": null
+        }
+      }
+    },
+    {
+      "case": "grpo",
+      "seed": 17,
+      "cache": "warm",
+      "both_valid": true,
+      "baseline_target_reached": false,
+      "candidate_target_reached": false,
+      "time_to_target_ratio": null,
+      "horizon_wall_ratio": 1.734799563917017,
+      "baseline_last_observed_quality": 0.515625,
+      "candidate_last_observed_quality": 0.5078125,
+      "last_observed_quality_delta": -0.0078125,
+      "money": {
+        "infrastructure_actual": {
+          "baseline_known_usd": 1.78136546,
+          "candidate_known_usd": 2.35048789,
+          "both_complete": false,
+          "total_cost_ratio": null,
+          "baseline_to_target": null,
+          "candidate_to_target": null
+        },
+        "infrastructure_estimate": {
+          "baseline_known_usd": 0,
+          "candidate_known_usd": 0,
+          "both_complete": false,
+          "total_cost_ratio": null,
+          "baseline_to_target": null,
+          "candidate_to_target": null
+        },
+        "customer_charge": {
+          "baseline_known_usd": 0,
+          "candidate_known_usd": 0,
+          "both_complete": false,
+          "total_cost_ratio": null,
+          "baseline_to_target": null,
+          "candidate_to_target": null
+        }
+      }
+    },
+    {
+      "case": "sft",
+      "seed": 17,
+      "cache": "cold",
+      "both_valid": true,
+      "baseline_target_reached": false,
+      "candidate_target_reached": false,
+      "time_to_target_ratio": null,
+      "horizon_wall_ratio": 1.971761135090704,
+      "baseline_last_observed_quality": 0.5625,
+      "candidate_last_observed_quality": 0.5546875,
+      "last_observed_quality_delta": -0.0078125,
+      "money": {
+        "infrastructure_actual": {
+          "baseline_known_usd": 1.01104108,
+          "candidate_known_usd": 1.4755721,
+          "both_complete": false,
+          "total_cost_ratio": null,
+          "baseline_to_target": null,
+          "candidate_to_target": null
+        },
+        "infrastructure_estimate": {
+          "baseline_known_usd": 0,
+          "candidate_known_usd": 0,
+          "both_complete": false,
+          "total_cost_ratio": null,
+          "baseline_to_target": null,
+          "candidate_to_target": null
+        },
+        "customer_charge": {
+          "baseline_known_usd": 0,
+          "candidate_known_usd": 0,
+          "both_complete": false,
+          "total_cost_ratio": null,
+          "baseline_to_target": null,
+          "candidate_to_target": null
+        }
+      }
+    },
+    {
+      "case": "sft",
+      "seed": 17,
+      "cache": "warm",
+      "both_valid": true,
+      "baseline_target_reached": false,
+      "candidate_target_reached": false,
+      "time_to_target_ratio": null,
+      "horizon_wall_ratio": 6.177667740947587,
+      "baseline_last_observed_quality": 0.5546875,
+      "candidate_last_observed_quality": 0.5703125,
+      "last_observed_quality_delta": 0.015625,
+      "money": {
+        "infrastructure_actual": {
+          "baseline_known_usd": 1.05643782,
+          "candidate_known_usd": 0.86332863,
+          "both_complete": false,
+          "total_cost_ratio": null,
+          "baseline_to_target": null,
+          "candidate_to_target": null
+        },
+        "infrastructure_estimate": {
+          "baseline_known_usd": 0,
+          "candidate_known_usd": 0,
+          "both_complete": false,
+          "total_cost_ratio": null,
+          "baseline_to_target": null,
+          "candidate_to_target": null
+        },
+        "customer_charge": {
+          "baseline_known_usd": 0,
+          "candidate_known_usd": 0,
+          "both_complete": false,
+          "total_cost_ratio": null,
+          "baseline_to_target": null,
+          "candidate_to_target": null
+        }
+      }
+    }
+  ],
+  "interpretation": "Ratios are candidate / baseline. Fixed-horizon wall time is not time to equal quality. Unreached targets and incomplete costs stay null; attainment counts retain every pair. Repetitions are descriptive, not a statistical superiority test."
+}

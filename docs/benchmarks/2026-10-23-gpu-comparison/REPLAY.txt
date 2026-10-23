@@ -1,0 +1,94 @@
+Matched H100/B200 comparison (2026-10-23 UTC)
+
+Evidence is a retained direct-provider experiment. It is not a hosted production
+qualification. The private artifact repo contains large adapter weights; the ZIP
+contains their immutable revisions/hashes and raw results, not duplicated weights.
+
+OFFLINE REPLAY (no credentials or GPUs)
+1. Extract this ZIP to a new directory. Verify every evidence-manifest.json entry's
+   byte length and SHA-256. The ZIP's own digest is in the PR report/publication.
+2. Extract analysis-code.tar.gz into a separate clean code directory. Its commit is
+   in analysis-revision.json; dependencies are locked in that archive's uv.lock.
+   Use Python 3.12 with the server dependencies (including Pydantic).
+3. Set PYTHONPATH to that extracted code directory. From this evidence directory:
+     python tools/summarize.py
+     python tools/render_report.py
+     python tools/verify.py
+     python -m flash.benchmarks summarize sealed-suites/h100
+     python -m flash.benchmarks summarize sealed-suites/b200
+     python -m flash.benchmarks compare sealed-suites/h100 sealed-suites/b200 \
+       --allow-change configuration.gpu --allow-change revisions.image \
+       --allow-change configuration.quality_observer_modes
+   Compare regenerated summary.json and RESULTS.md against their original hashes.
+   The sealed journals are an offline evidence import, not live launcher commands.
+   Their imported completion records retain native training success and original
+   evaluator campaign failure separately. The reports include measurement-completion time, which includes required
+   evaluation/recovery, while RESULTS.md separately displays training job time.
+   The explicit quality_observer_modes difference declares the recovered B200
+   SFT warm grade; it is a confound for measurement-completion timing, not hidden
+   behind the GPU/image treatment.
+4. tools/import_suite.py recreates sealed-suites and paired-suite-comparison.json
+   from raw retained data. To rerun it, first move the existing sealed-suites out
+   of this directory; it intentionally refuses to overwrite retained sealed runs.
+
+EXECUTED INPUTS
+- Training code is the earlier clean revision in plan.json/source-snapshot.json,
+  preserved in flash-code.tar.gz and attested by each GPU worker. The analysis
+  archive adds comparison tooling; it did not execute the training jobs.
+- plan.json, all *-spec.json, train-data.json, eval-data.json, fixtures/, environment/
+  (where present), source archives and worker images retain the experiment inputs.
+- eval_worker.py and recovery_worker.py are both retained under tools/. Their
+  hashes are in recovery-plan.json. evaluator-equivalence.json records an AST
+  comparison of the shared scoring/generation/load/request/episode functions;
+  request ID namespace is the only normalized difference in those functions.
+- Checkpoint manifests pin private HF repository revisions and SHA-256 weight
+  digests. Artifact metadata is pinned in artifact-manifest.json.
+- Initial base/checkpoint grades and initial B200 serving are retained alongside
+  recovery results. The failed initial campaign is in campaign-status.json.
+  b200-sft-warm-step64/128 are explicitly post-job recovery grades. All training
+  completed on its first attempt. Recovery serving used matched inputs, but H100
+  stalled after eight completed waves. B200 completed all eighteen waves and
+  sixteen agent episodes. H100 completed no recovery agent episodes.
+
+NEW LIVE REPLICATION (paid; never part of offline replay)
+Use a fresh copy of the scripts and a NEW output directory. common.py resolves
+its parent as output root. Configure FLASH_BENCHMARK_CODE to a clean checkout of
+plan.json's executed code revision and FLASH_BENCHMARK_FIXTURES to fixtures/.
+Provide your own Modal profile and Hugging Face token; common.authenticate uses
+the local freesolo profile and huggingface_hub credential store. Change that
+profile explicitly for another account. Do not reuse original owned app/volume
+identities or artifact repository for a new experiment.
+
+Inspect tools/prepare.py before running: it generates fresh owned identities,
+predeclares settings and publishes the exact source/config. tools/campaign.py
+runs eight bounded jobs with two persistent evaluators. Initial evaluator
+lifetimes proved insufficient for this particular provision/startup schedule;
+the original failure is retained, not edited away. tools/early_serving.py and
+tools/release_observers.py record the in-campaign scheduling amendment.
+
+The bounded recovery sequence was tools/prepare_recovery.py followed by
+ tools/recovery_campaign.py. It launched only two additional bounded evaluators,
+reused model volumes, graded the missing B200 checkpoints, released serving through a shared signal. tools/release_recovery.py
+released the prepared B200 evaluator early while H100 was pending provider
+capacity; recovery-schedule-amendment.json retains this scheduling amendment.
+Starts were not simultaneous; workload and lifetime bounds were unchanged. It retries no training. The recovery plan
+retains the revised bound within the initial $83 compute ceiling plus $2 storage/
+egress allowance. The unchanged initial supervisor and both evaluator sources
+are retained so the failure and recovery can be inspected rather than hidden.
+tools/stop_stalled_recovery.py stopped H100 after over five minutes without a
+completed wave, after diagnostics showed a live process and 100% GPU utilization
+near 120 W. The cause is unresolved. tools/retain_partial_recovery.py assembles
+only the durably published records and marks missing work incomplete; it does
+not fabricate requests or successful completion. No further retry was made.
+Future runs should revise evaluator scheduling/bounds before launch, retain the
+new plan, and report those changes as experimental differences.
+
+After retaining completed and partial results: tools/preserve.py retains artifact metadata;
+tools/cleanup.py stops owned sandboxes and removes owned model/handoff volumes;
+tools/inventory.py checks for remaining owned sandboxes. tools/costs.py makes one
+grouped provider-metering request and retains the raw app receipts. Costs are
+accrued, not a finalized invoice; unknown charges are never converted to zero.
+All cleanup is scoped to owned-resources.json and the retained job/sandbox IDs.
+
+tools/archive.py scans against locally held credential values, seals a complete
+file manifest and uploads the evidence ZIP to an immutable private HF revision.

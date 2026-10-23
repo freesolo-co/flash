@@ -18,6 +18,15 @@ requests. It tests the whole matrix and artifact pipeline; its numbers are not
 performance measurements. It always sets `production_claims_eligible=false`.
 The offline tests run this path in normal CI.
 
+## Measured GPU comparisons
+
+See the [2026-10-23 H100/B200 comparison](benchmarks/2026-10-23-gpu-comparison/README.md)
+for eight real cold/warm SFT/GRPO runs, checkpoint quality curves, provider-reported
+costs, startup and component timings, and per-customer serving observations.
+No checkpoint reached the unchanged 65% target. The report retains an H100 serving
+stall and missing agent measurements, with exact revisions, sealed training
+comparisons, raw evidence, independent regrading and offline replay.
+
 ## Measured GPU pilot
 
 See the [2026-10-22 live GPU results](benchmarks/2026-10-22-gpu-pilot/README.md)

@@ -1,0 +1,4334 @@
+{
+  "schema_version": 1,
+  "production_claims_eligible": false,
+  "plan": {
+    "code_revision": "a6bfe171dd1879177d8f5787b4d37b41441a9927",
+    "worker_images": {
+      "h100": "ghcr.io/freesolo-co/flash-worker@sha256:c794abb352bb99c8a90e58f4f1f8f4b56012a1c00fcfe607dd8a037d0f119fb8",
+      "b200": "ghcr.io/freesolo-co/flash-worker@sha256:341e0724f1f1730ff8f8ea0492ee56b16df3e374bf3464528a59c55cc67025d3"
+    },
+    "model": {
+      "model": "Qwen/Qwen3.5-9B",
+      "hf_revision": "c202236235762e1c871ad0ccb60c8ee5ba337b9a",
+      "tinker_revision_not_exposed": true
+    },
+    "dataset_sha256": "a8cafd7e29d30a1349101bd2a5469613b57d09dfd2ce2b0eff25e1d75a359895",
+    "environment_sha256": "59547d9594768767982ce96997e17754012eaf5a46e733a67ebb726aa49cbd1b",
+    "target": {
+      "metric": "held_out_accuracy",
+      "value": 0.65,
+      "min_samples": 128
+    },
+    "seed": 17,
+    "training_cases": [
+      "h100-sft-cold",
+      "h100-sft-warm",
+      "h100-grpo-cold",
+      "h100-grpo-warm",
+      "b200-sft-cold",
+      "b200-sft-warm",
+      "b200-grpo-cold",
+      "b200-grpo-warm"
+    ],
+    "region": "us-east",
+    "training_order": {
+      "h100": [
+        "sft-cold",
+        "grpo-cold",
+        "sft-warm",
+        "grpo-warm"
+      ],
+      "b200": [
+        "grpo-cold",
+        "sft-cold",
+        "grpo-warm",
+        "sft-warm"
+      ]
+    },
+    "cold_definition": "New workload-specific base-model volume. New process; architecture-specific pinned image/kernel caches are not cleared.",
+    "warm_definition": "New adapter/optimizer/process, same seed, reuse only that workload base-model volume.",
+    "quality_protocol": "Dedicated ready observer per GPU evaluates each published checkpoint during the campaign; checkpoint target time is receipt of successful held-out evaluation, including publication/download/evaluation delays. Observer startup and idle compute are separately charged experiment overhead. No pre-target checkpoint interpolation.",
+    "serving_protocol": "Cross-GPU comparison uses exactly the same two H100 warm final adapter artifacts on both GPUs; local GPU request streams, not hosted tenants. Three counterbalanced repetitions of isolated/mixed waves at global concurrency 1,8,16. Original lookup/sum environment extended to 32 tool turns + final answer, 16 episodes.",
+    "limits": {
+      "max_gpu_allocations": 10,
+      "training_timeout_s": 1200,
+      "evaluation_timeout_s": 3600,
+      "max_cpu": 8,
+      "max_memory_gib": 128,
+      "region_multiplier": 1.75,
+      "compute_exposure_upper_usd": 83,
+      "storage_egress_allowance_usd": 2,
+      "no_training_retry": true
+    },
+    "scope": "Matched hardware plus qualified architecture-specific image comparison, not a code change speedup. One seed with cold/warm repeats, 128 train /128 disjoint held-out custom MMLU-Pro other questions. A quality target may remain unreached. Actual receipt attribution is per owned app; customer charge is separate unknown."
+  },
+  "baseline_accuracy": {
+    "h100": 0.5234375,
+    "b200": 0.5078125
+  },
+  "training": [
+    {
+      "name": "h100-sft-cold",
+      "gpu": "h100",
+      "algorithm": "sft",
+      "cache": "cold",
+      "seed": 17,
+      "steps": 128,
+      "end_to_end_s": 377.6759338378906,
+      "measurement_complete_s": 377.6759338378906,
+      "allocation_api_s": 1.5043249130249023,
+      "launch_to_bootstrap_s": 8.412489652633667,
+      "launch_to_first_optimizer_completion_s": 247.31275343894958,
+      "worker_setup_s": 111.51112604141235,
+      "worker_training_wall_s": 187.07217621803284,
+      "model_download_s": 105.7,
+      "cpu_final_publication_s": 13.443675994873047,
+      "train_tokens": 21491,
+      "generated_tokens": 0,
+      "grpo_timers_s": {},
+      "grpo_first_vs_steady": null,
+      "positive_gradient_verified": true,
+      "reward_execution": {
+        "calls_observed": 0,
+        "measured_s": null,
+        "coverage": "Observed grading-call records only; completeness is not attested and log aggregation may omit calls."
+      },
+      "publication_samples": [
+        {
+          "step": 64,
+          "sampled_upload_lower_bound_s": null,
+          "publication_at_s": 303.00633692741394
+        },
+        {
+          "step": 128,
+          "sampled_upload_lower_bound_s": null,
+          "publication_at_s": 339.29912519454956
+        }
+      ],
+      "quality": [
+        {
+          "evaluation_recovery": false,
+          "step": 64,
+          "accuracy": 0.5625,
+          "samples": 128,
+          "evaluated_at": 1792724032.5376198,
+          "received_at": 1792724034.883817,
+          "observed_at_s": 321.85715985298157,
+          "target_reached": false,
+          "checkpoint": {
+            "name": "h100-sft-cold-step64",
+            "prefix": "sft/flash-compare-ada8a16f6c-h100-sft-cold/checkpoints/step-64/adapter",
+            "revision": "b8e70de07183521e8d4e04eccc476c717149068d",
+            "sha256": "f5f10e79ecc10570ba7cc3552536672243968484a654d7e0fff8e347c1004cc4"
+          },
+          "evaluation_wall_s": 14.407381534576416
+        },
+        {
+          "evaluation_recovery": false,
+          "step": 128,
+          "accuracy": 0.5625,
+          "samples": 128,
+          "evaluated_at": 1792724060.5906603,
+          "received_at": 1792724062.9457128,
+          "observed_at_s": 349.9190557003021,
+          "target_reached": false,
+          "checkpoint": {
+            "name": "h100-sft-cold-step128",
+            "prefix": "sft/flash-compare-ada8a16f6c-h100-sft-cold/checkpoints/step-128/adapter",
+            "revision": "f77b80463e7e72d50ce3dd0ad6af02c3f229a24d",
+            "sha256": "95edce0cde7050027e4c590fd1ac69e8064fc93f64a50fe03366ccd9e492517c"
+          },
+          "evaluation_wall_s": 5.495983362197876
+        }
+      ],
+      "final_accuracy": 0.5625,
+      "baseline_accuracy": 0.5234375,
+      "change_from_same_gpu_baseline_pp": 3.90625,
+      "time_to_target_s": null,
+      "cost_to_target_actual_usd": null,
+      "cost_to_target_note": "Target unreached.",
+      "actual_infrastructure_accrued_usd": 1.01104108,
+      "actual_receipt_complete": false,
+      "customer_charge_usd": null,
+      "provider_usage": {
+        "unavailable": "NotFoundError"
+      },
+      "gpu_peak_gib": 23.235,
+      "observed_regions": [
+        "us-east"
+      ],
+      "gpu_names": [
+        "NVIDIA H100 80GB HBM3"
+      ],
+      "source_attestation_verified": true,
+      "spec": {
+        "model": "Qwen/Qwen3.5-9B",
+        "algorithm": "sft",
+        "environment": {
+          "id": "benchmark/mmlu-pro/other",
+          "params": {},
+          "pip": [],
+          "secrets": [],
+          "resolved_sha": "cea03d7bd0015b2cb21124299663904da490dae0",
+          "package": {
+            "artifact_revision": "d1ef9133aefe78e18f8b06d6d3f26e9b2ea04deb",
+            "archive_sha256": "59547d9594768767982ce96997e17754012eaf5a46e733a67ebb726aa49cbd1b",
+            "manifest_sha256": "1e3f938ebf775f51686b44c27e311750fbc2d24a6c1c0c654a51c50dfebcabfa"
+          }
+        },
+        "train": {
+          "epochs": null,
+          "lora_rank": 8,
+          "lora_alpha": 32,
+          "init_from_adapter": "",
+          "init_from_adapter_revision": "",
+          "hf_repo": "DavidBShan/flash-compare-ada8a16f6c",
+          "learning_rate": 0.0001,
+          "batch_size": 1,
+          "prompts_per_step": null,
+          "max_context_tokens": 2048,
+          "save_every": null,
+          "max_steps": 128,
+          "save_at_steps": [
+            64,
+            128
+          ],
+          "max_examples": 128,
+          "group_size": null,
+          "temperature": null,
+          "max_completion_tokens": null,
+          "kl_penalty_coef": null,
+          "thinking_length_penalty_coef": null,
+          "teacher_model": "",
+          "stop_sequences": [],
+          "structured_outputs": "",
+          "credit_assignment": "per_episode"
+        },
+        "gpu": {
+          "type": "H100",
+          "disk_gb": 60,
+          "max_wall_seconds": 1200,
+          "max_retries": 0,
+          "network_volume": "flash-compare-ada8a16f6c-h100-sft",
+          "network_volume_gb": 100,
+          "provider": "modal",
+          "count": 1
+        },
+        "run_id": "flash-compare-ada8a16f6c-h100-sft-cold",
+        "seed": 17,
+        "thinking": false,
+        "wandb": {
+          "project": null,
+          "run_name": null
+        },
+        "model_revision": "c202236235762e1c871ad0ccb60c8ee5ba337b9a",
+        "model_revision_auto": true,
+        "model_revision_force_pin": false,
+        "gpu_count_auto": false,
+        "workload_profile_input_digest": "fb56f4347cfd9882fc64d4f90ed706384d73339b04238cd31ee5f6d06299dc18",
+        "workload_profile_producer_version": "1.3.24",
+        "workload_profile": {
+          "input_digest": "fb56f4347cfd9882fc64d4f90ed706384d73339b04238cd31ee5f6d06299dc18",
+          "producer_version": "1.3.24",
+          "tokenizer_revision": "c202236235762e1c871ad0ccb60c8ee5ba337b9a",
+          "environment_id": "benchmark/mmlu-pro/other",
+          "environment_revision": "cea03d7bd0015b2cb21124299663904da490dae0",
+          "source_examples": 128,
+          "selected_examples": 128,
+          "retained_examples": 128,
+          "dropped_examples": 0,
+          "epochs": 2,
+          "max_length": 2048,
+          "packing_mode": "exact-unpacked",
+          "architecture_mode": "gdn-hybrid",
+          "packed_blocks": 128,
+          "real_tokens_per_epoch": 21491,
+          "supervised_tokens_per_epoch": 384,
+          "padded_compute_tokens_per_epoch": 21491,
+          "authoritative_real_tokens": 21491,
+          "authoritative_supervised_tokens": 384,
+          "authoritative_compute_tokens": 21491,
+          "realized_max_length": 478,
+          "untruncated_max_length": 478,
+          "truncated_examples": 0,
+          "examples_per_update": 1,
+          "derived_steps": 256,
+          "authoritative_steps": 128,
+          "packing_efficiency": 1.0,
+          "sample_policy": "exact-prefix",
+          "schema_version": 7,
+          "kind": "sft",
+          "created_at": 0.0,
+          "authored_reasoning_turns": 0,
+          "rendered_reasoning_spans": 0,
+          "truncated_reasoning_spans": 0,
+          "reasoning_rows": 128,
+          "content_digest": "b1a4923ea16cd58da034419bd45274949bb477c1f1eb4c2111a3412f80bdf499"
+        },
+        "project": ""
+      }
+    },
+    {
+      "name": "h100-sft-warm",
+      "gpu": "h100",
+      "algorithm": "sft",
+      "cache": "warm",
+      "seed": 17,
+      "steps": 128,
+      "end_to_end_s": 391.41799807548523,
+      "measurement_complete_s": 391.41799807548523,
+      "allocation_api_s": 1.1887919902801514,
+      "launch_to_bootstrap_s": 13.092242002487183,
+      "launch_to_first_optimizer_completion_s": 264.1062014102936,
+      "worker_setup_s": 13.294606685638428,
+      "worker_training_wall_s": 286.4832708835602,
+      "model_download_s": 0.7,
+      "cpu_final_publication_s": 12.43884801864624,
+      "train_tokens": 21491,
+      "generated_tokens": 0,
+      "grpo_timers_s": {},
+      "grpo_first_vs_steady": null,
+      "positive_gradient_verified": true,
+      "reward_execution": {
+        "calls_observed": 0,
+        "measured_s": null,
+        "coverage": "Observed grading-call records only; completeness is not attested and log aggregation may omit calls."
+      },
+      "publication_samples": [
+        {
+          "step": 64,
+          "sampled_upload_lower_bound_s": null,
+          "publication_at_s": 320.3906214237213
+        },
+        {
+          "step": 128,
+          "sampled_upload_lower_bound_s": null,
+          "publication_at_s": 357.7058975696564
+        }
+      ],
+      "quality": [
+        {
+          "evaluation_recovery": false,
+          "step": 64,
+          "accuracy": 0.578125,
+          "samples": 128,
+          "evaluated_at": 1792725562.4785483,
+          "received_at": 1792725564.689667,
+          "observed_at_s": 332.0585341453552,
+          "target_reached": false,
+          "checkpoint": {
+            "name": "h100-sft-warm-step64",
+            "prefix": "sft/flash-compare-ada8a16f6c-h100-sft-warm/checkpoints/step-64/adapter",
+            "revision": "83842edc285cdaa7f4fba48ec2812691254a1e32",
+            "sha256": "75d004ce2a198c8dfa4afe796ba65b800a695599034a36eda70295d857e375b8"
+          },
+          "evaluation_wall_s": 5.500843286514282
+        },
+        {
+          "evaluation_recovery": false,
+          "step": 128,
+          "accuracy": 0.5546875,
+          "samples": 128,
+          "evaluated_at": 1792725599.557735,
+          "received_at": 1792725602.090605,
+          "observed_at_s": 369.45947217941284,
+          "target_reached": false,
+          "checkpoint": {
+            "name": "h100-sft-warm-step128",
+            "prefix": "sft/flash-compare-ada8a16f6c-h100-sft-warm/checkpoints/step-128/adapter",
+            "revision": "7656f7faa9a9653f754711bc00b4883dd4ba6842",
+            "sha256": "4ffce16be2505873515a715fc96eac1d139334809da6d5c8dc1be02c28c8b5f5"
+          },
+          "evaluation_wall_s": 5.451711893081665
+        }
+      ],
+      "final_accuracy": 0.5546875,
+      "baseline_accuracy": 0.5234375,
+      "change_from_same_gpu_baseline_pp": 3.125,
+      "time_to_target_s": null,
+      "cost_to_target_actual_usd": null,
+      "cost_to_target_note": "Target unreached.",
+      "actual_infrastructure_accrued_usd": 1.05643782,
+      "actual_receipt_complete": false,
+      "customer_charge_usd": null,
+      "provider_usage": {
+        "cpu_core_nanosecs": "32004272460",
+        "mem_gib_nanosecs": "128017089843",
+        "gpu_nanosecs": "4000534057",
+        "gpu_type": "H100!"
+      },
+      "gpu_peak_gib": 23.235,
+      "observed_regions": [
+        "us-east"
+      ],
+      "gpu_names": [
+        "NVIDIA H100 80GB HBM3"
+      ],
+      "source_attestation_verified": true,
+      "spec": {
+        "model": "Qwen/Qwen3.5-9B",
+        "algorithm": "sft",
+        "environment": {
+          "id": "benchmark/mmlu-pro/other",
+          "params": {},
+          "pip": [],
+          "secrets": [],
+          "resolved_sha": "cea03d7bd0015b2cb21124299663904da490dae0",
+          "package": {
+            "artifact_revision": "d1ef9133aefe78e18f8b06d6d3f26e9b2ea04deb",
+            "archive_sha256": "59547d9594768767982ce96997e17754012eaf5a46e733a67ebb726aa49cbd1b",
+            "manifest_sha256": "1e3f938ebf775f51686b44c27e311750fbc2d24a6c1c0c654a51c50dfebcabfa"
+          }
+        },
+        "train": {
+          "epochs": null,
+          "lora_rank": 8,
+          "lora_alpha": 32,
+          "init_from_adapter": "",
+          "init_from_adapter_revision": "",
+          "hf_repo": "DavidBShan/flash-compare-ada8a16f6c",
+          "learning_rate": 0.0001,
+          "batch_size": 1,
+          "prompts_per_step": null,
+          "max_context_tokens": 2048,
+          "save_every": null,
+          "max_steps": 128,
+          "save_at_steps": [
+            64,
+            128
+          ],
+          "max_examples": 128,
+          "group_size": null,
+          "temperature": null,
+          "max_completion_tokens": null,
+          "kl_penalty_coef": null,
+          "thinking_length_penalty_coef": null,
+          "teacher_model": "",
+          "stop_sequences": [],
+          "structured_outputs": "",
+          "credit_assignment": "per_episode"
+        },
+        "gpu": {
+          "type": "H100",
+          "disk_gb": 60,
+          "max_wall_seconds": 1200,
+          "max_retries": 0,
+          "network_volume": "flash-compare-ada8a16f6c-h100-sft",
+          "network_volume_gb": 100,
+          "provider": "modal",
+          "count": 1
+        },
+        "run_id": "flash-compare-ada8a16f6c-h100-sft-warm",
+        "seed": 17,
+        "thinking": false,
+        "wandb": {
+          "project": null,
+          "run_name": null
+        },
+        "model_revision": "c202236235762e1c871ad0ccb60c8ee5ba337b9a",
+        "model_revision_auto": true,
+        "model_revision_force_pin": false,
+        "gpu_count_auto": false,
+        "workload_profile_input_digest": "fb56f4347cfd9882fc64d4f90ed706384d73339b04238cd31ee5f6d06299dc18",
+        "workload_profile_producer_version": "1.3.24",
+        "workload_profile": {
+          "input_digest": "fb56f4347cfd9882fc64d4f90ed706384d73339b04238cd31ee5f6d06299dc18",
+          "producer_version": "1.3.24",
+          "tokenizer_revision": "c202236235762e1c871ad0ccb60c8ee5ba337b9a",
+          "environment_id": "benchmark/mmlu-pro/other",
+          "environment_revision": "cea03d7bd0015b2cb21124299663904da490dae0",
+          "source_examples": 128,
+          "selected_examples": 128,
+          "retained_examples": 128,
+          "dropped_examples": 0,
+          "epochs": 2,
+          "max_length": 2048,
+          "packing_mode": "exact-unpacked",
+          "architecture_mode": "gdn-hybrid",
+          "packed_blocks": 128,
+          "real_tokens_per_epoch": 21491,
+          "supervised_tokens_per_epoch": 384,
+          "padded_compute_tokens_per_epoch": 21491,
+          "authoritative_real_tokens": 21491,
+          "authoritative_supervised_tokens": 384,
+          "authoritative_compute_tokens": 21491,
+          "realized_max_length": 478,
+          "untruncated_max_length": 478,
+          "truncated_examples": 0,
+          "examples_per_update": 1,
+          "derived_steps": 256,
+          "authoritative_steps": 128,
+          "packing_efficiency": 1.0,
+          "sample_policy": "exact-prefix",
+          "schema_version": 7,
+          "kind": "sft",
+          "created_at": 0.0,
+          "authored_reasoning_turns": 0,
+          "rendered_reasoning_spans": 0,
+          "truncated_reasoning_spans": 0,
+          "reasoning_rows": 128,
+          "content_digest": "b1a4923ea16cd58da034419bd45274949bb477c1f1eb4c2111a3412f80bdf499"
+        },
+        "project": ""
+      }
+    },
+    {
+      "name": "h100-grpo-cold",
+      "gpu": "h100",
+      "algorithm": "grpo",
+      "cache": "cold",
+      "seed": 17,
+      "steps": 16,
+      "end_to_end_s": 1138.0515351295471,
+      "measurement_complete_s": 1138.0515351295471,
+      "allocation_api_s": 1.142719030380249,
+      "launch_to_bootstrap_s": 6.261839389801025,
+      "launch_to_first_optimizer_completion_s": 785.1344079971313,
+      "worker_setup_s": 213.24187469482422,
+      "worker_training_wall_s": 854.2470133304596,
+      "model_download_s": 183.1,
+      "cpu_final_publication_s": 12.758257865905762,
+      "train_tokens": 0,
+      "generated_tokens": 1025,
+      "grpo_timers_s": {
+        "timing_s/gen": 209.16373249400021,
+        "timing_s/old_log_prob": 55.562885434999885,
+        "timing_s/adv": 0.8663231140003518,
+        "timing_s/update_actor": 98.2218278690001,
+        "timing_s/update_weights": 45.75764529799983,
+        "timing_s/step": 453.16620523000006,
+        "timing_s/save_checkpoint": 7.999194391999822
+      },
+      "grpo_first_vs_steady": {
+        "first_step_s": 160.6079216139999,
+        "subsequent_step_median_s": 18.694085813000015
+      },
+      "positive_gradient_verified": true,
+      "reward_execution": {
+        "calls_observed": 409,
+        "measured_s": 0.005620718002319336,
+        "coverage": "Observed grading-call records only; completeness is not attested and log aggregation may omit calls."
+      },
+      "publication_samples": [
+        {
+          "step": 8,
+          "sampled_upload_lower_bound_s": null,
+          "publication_at_s": 1092.1504464149475
+        },
+        {
+          "step": 16,
+          "sampled_upload_lower_bound_s": null,
+          "publication_at_s": 1093.2486114501953
+        }
+      ],
+      "quality": [
+        {
+          "evaluation_recovery": false,
+          "step": 8,
+          "accuracy": 0.5078125,
+          "samples": 128,
+          "evaluated_at": 1792725193.8176675,
+          "received_at": 1792725195.82742,
+          "observed_at_s": 1102.4866042137146,
+          "target_reached": false,
+          "checkpoint": {
+            "name": "h100-grpo-cold-step8",
+            "prefix": "rl/flash-compare-ada8a16f6c-h100-grpo-cold/checkpoints/step-8/adapter",
+            "revision": "57b102385445a7808c356bfbf693722437df4800",
+            "sha256": "86e24a9b9b31d421a7174576293e27c6923ca0290e83b1764e1ef56570686de4"
+          },
+          "evaluation_wall_s": 5.536998748779297
+        },
+        {
+          "evaluation_recovery": false,
+          "step": 16,
+          "accuracy": 0.515625,
+          "samples": 128,
+          "evaluated_at": 1792725203.8686996,
+          "received_at": 1792725205.313656,
+          "observed_at_s": 1111.972840309143,
+          "target_reached": false,
+          "checkpoint": {
+            "name": "h100-grpo-cold-step16",
+            "prefix": "rl/flash-compare-ada8a16f6c-h100-grpo-cold/checkpoints/step-16/adapter",
+            "revision": "37e7c068048321637ab9fec2e5d855b5d48b5ce5",
+            "sha256": "4aff218d7dacd744399a94ca6d593df79e80cf6211abae6b5029e8bd27fb0003"
+          },
+          "evaluation_wall_s": 5.516484975814819
+        }
+      ],
+      "final_accuracy": 0.515625,
+      "baseline_accuracy": 0.5234375,
+      "change_from_same_gpu_baseline_pp": -0.78125,
+      "time_to_target_s": null,
+      "cost_to_target_actual_usd": null,
+      "cost_to_target_note": "Target unreached.",
+      "actual_infrastructure_accrued_usd": 3.26266578,
+      "actual_receipt_complete": false,
+      "customer_charge_usd": null,
+      "provider_usage": {
+        "unavailable": "NotFoundError"
+      },
+      "gpu_peak_gib": 48.29,
+      "observed_regions": [
+        "us-east"
+      ],
+      "gpu_names": [
+        "NVIDIA H100 80GB HBM3"
+      ],
+      "source_attestation_verified": true,
+      "spec": {
+        "model": "Qwen/Qwen3.5-9B",
+        "algorithm": "grpo",
+        "environment": {
+          "id": "benchmark/mmlu-pro/other",
+          "params": {},
+          "pip": [],
+          "secrets": [],
+          "resolved_sha": "cea03d7bd0015b2cb21124299663904da490dae0",
+          "package": {
+            "artifact_revision": "d1ef9133aefe78e18f8b06d6d3f26e9b2ea04deb",
+            "archive_sha256": "59547d9594768767982ce96997e17754012eaf5a46e733a67ebb726aa49cbd1b",
+            "manifest_sha256": "1e3f938ebf775f51686b44c27e311750fbc2d24a6c1c0c654a51c50dfebcabfa"
+          }
+        },
+        "train": {
+          "epochs": null,
+          "lora_rank": 8,
+          "lora_alpha": 32,
+          "init_from_adapter": "",
+          "init_from_adapter_revision": "",
+          "hf_repo": "DavidBShan/flash-compare-ada8a16f6c",
+          "learning_rate": 1e-05,
+          "batch_size": null,
+          "prompts_per_step": 8,
+          "max_context_tokens": 2048,
+          "save_every": null,
+          "max_steps": 16,
+          "save_at_steps": [
+            8,
+            16
+          ],
+          "max_examples": 128,
+          "group_size": 4,
+          "temperature": 1.0,
+          "max_completion_tokens": 16,
+          "kl_penalty_coef": 0.0,
+          "thinking_length_penalty_coef": null,
+          "teacher_model": "",
+          "stop_sequences": [],
+          "structured_outputs": "",
+          "credit_assignment": "per_episode"
+        },
+        "gpu": {
+          "type": "H100",
+          "disk_gb": 60,
+          "max_wall_seconds": 1200,
+          "max_retries": 0,
+          "network_volume": "flash-compare-ada8a16f6c-h100-grpo",
+          "network_volume_gb": 100,
+          "provider": "modal",
+          "count": 1
+        },
+        "run_id": "flash-compare-ada8a16f6c-h100-grpo-cold",
+        "seed": 17,
+        "thinking": false,
+        "wandb": {
+          "project": null,
+          "run_name": null
+        },
+        "model_revision": "c202236235762e1c871ad0ccb60c8ee5ba337b9a",
+        "model_revision_auto": true,
+        "model_revision_force_pin": false,
+        "gpu_count_auto": false,
+        "workload_profile_input_digest": "",
+        "workload_profile_producer_version": "",
+        "workload_profile": {},
+        "project": ""
+      }
+    },
+    {
+      "name": "h100-grpo-warm",
+      "gpu": "h100",
+      "algorithm": "grpo",
+      "cache": "warm",
+      "seed": 17,
+      "steps": 16,
+      "end_to_end_s": 626.5077791213989,
+      "measurement_complete_s": 626.5077791213989,
+      "allocation_api_s": 1.209218978881836,
+      "launch_to_bootstrap_s": 7.5868589878082275,
+      "launch_to_first_optimizer_completion_s": 438.56290912628174,
+      "worker_setup_s": 21.708765983581543,
+      "worker_training_wall_s": 550.6344654560089,
+      "model_download_s": 0.0,
+      "cpu_final_publication_s": 13.969413757324219,
+      "train_tokens": 0,
+      "generated_tokens": 1024,
+      "grpo_timers_s": {
+        "timing_s/gen": 79.12578947799983,
+        "timing_s/old_log_prob": 43.094580158000156,
+        "timing_s/adv": 0.533633783000198,
+        "timing_s/update_actor": 77.79019064900024,
+        "timing_s/update_weights": 28.019424586000127,
+        "timing_s/step": 255.83397678800014,
+        "timing_s/save_checkpoint": 5.24556510299999
+      },
+      "grpo_first_vs_steady": {
+        "first_step_s": 112.35153585,
+        "subsequent_step_median_s": 9.220251682000026
+      },
+      "positive_gradient_verified": true,
+      "reward_execution": {
+        "calls_observed": 458,
+        "measured_s": 0.006234884262084961,
+        "coverage": "Observed grading-call records only; completeness is not attested and log aggregation may omit calls."
+      },
+      "publication_samples": [
+        {
+          "step": 8,
+          "sampled_upload_lower_bound_s": null,
+          "publication_at_s": 592.1182415485382
+        },
+        {
+          "step": 16,
+          "sampled_upload_lower_bound_s": null,
+          "publication_at_s": 593.1121640205383
+        }
+      ],
+      "quality": [
+        {
+          "evaluation_recovery": false,
+          "step": 8,
+          "accuracy": 0.515625,
+          "samples": 128,
+          "evaluated_at": 1792726236.3736484,
+          "received_at": 1792726238.717736,
+          "observed_at_s": 612.2394099235535,
+          "target_reached": false,
+          "checkpoint": {
+            "name": "h100-grpo-warm-step8",
+            "prefix": "rl/flash-compare-ada8a16f6c-h100-grpo-warm/checkpoints/step-8/adapter",
+            "revision": "419424912b7a5ce14327808494236ee929e40d53",
+            "sha256": "bd12c9fdab273610b152645ebdbb869a62011abcc8d05a5793c9227e762cd10e"
+          },
+          "evaluation_wall_s": 5.550729036331177
+        },
+        {
+          "evaluation_recovery": false,
+          "step": 16,
+          "accuracy": 0.515625,
+          "samples": 128,
+          "evaluated_at": 1792726229.1821527,
+          "received_at": 1792726232.419822,
+          "observed_at_s": 605.9414958953857,
+          "target_reached": false,
+          "checkpoint": {
+            "name": "h100-grpo-warm-step16",
+            "prefix": "rl/flash-compare-ada8a16f6c-h100-grpo-warm/checkpoints/step-16/adapter",
+            "revision": "d35bbd5206e85ab1f93b32f279a2d9143fc2a98a",
+            "sha256": "f261cd9b2f4156494c4c7dc90bcef503b9c1a32a54c51ebfb54ce98379848be2"
+          },
+          "evaluation_wall_s": 5.5683557987213135
+        }
+      ],
+      "final_accuracy": 0.515625,
+      "baseline_accuracy": 0.5234375,
+      "change_from_same_gpu_baseline_pp": -0.78125,
+      "time_to_target_s": null,
+      "cost_to_target_actual_usd": null,
+      "cost_to_target_note": "Target unreached.",
+      "actual_infrastructure_accrued_usd": 1.78136546,
+      "actual_receipt_complete": false,
+      "customer_charge_usd": null,
+      "provider_usage": {
+        "cpu_core_nanosecs": "240001718521",
+        "mem_gib_nanosecs": "960006874084",
+        "gpu_nanosecs": "30000214815",
+        "gpu_type": "H100!"
+      },
+      "gpu_peak_gib": 48.433,
+      "observed_regions": [
+        "us-east"
+      ],
+      "gpu_names": [
+        "NVIDIA H100 80GB HBM3"
+      ],
+      "source_attestation_verified": true,
+      "spec": {
+        "model": "Qwen/Qwen3.5-9B",
+        "algorithm": "grpo",
+        "environment": {
+          "id": "benchmark/mmlu-pro/other",
+          "params": {},
+          "pip": [],
+          "secrets": [],
+          "resolved_sha": "cea03d7bd0015b2cb21124299663904da490dae0",
+          "package": {
+            "artifact_revision": "d1ef9133aefe78e18f8b06d6d3f26e9b2ea04deb",
+            "archive_sha256": "59547d9594768767982ce96997e17754012eaf5a46e733a67ebb726aa49cbd1b",
+            "manifest_sha256": "1e3f938ebf775f51686b44c27e311750fbc2d24a6c1c0c654a51c50dfebcabfa"
+          }
+        },
+        "train": {
+          "epochs": null,
+          "lora_rank": 8,
+          "lora_alpha": 32,
+          "init_from_adapter": "",
+          "init_from_adapter_revision": "",
+          "hf_repo": "DavidBShan/flash-compare-ada8a16f6c",
+          "learning_rate": 1e-05,
+          "batch_size": null,
+          "prompts_per_step": 8,
+          "max_context_tokens": 2048,
+          "save_every": null,
+          "max_steps": 16,
+          "save_at_steps": [
+            8,
+            16
+          ],
+          "max_examples": 128,
+          "group_size": 4,
+          "temperature": 1.0,
+          "max_completion_tokens": 16,
+          "kl_penalty_coef": 0.0,
+          "thinking_length_penalty_coef": null,
+          "teacher_model": "",
+          "stop_sequences": [],
+          "structured_outputs": "",
+          "credit_assignment": "per_episode"
+        },
+        "gpu": {
+          "type": "H100",
+          "disk_gb": 60,
+          "max_wall_seconds": 1200,
+          "max_retries": 0,
+          "network_volume": "flash-compare-ada8a16f6c-h100-grpo",
+          "network_volume_gb": 100,
+          "provider": "modal",
+          "count": 1
+        },
+        "run_id": "flash-compare-ada8a16f6c-h100-grpo-warm",
+        "seed": 17,
+        "thinking": false,
+        "wandb": {
+          "project": null,
+          "run_name": null
+        },
+        "model_revision": "c202236235762e1c871ad0ccb60c8ee5ba337b9a",
+        "model_revision_auto": true,
+        "model_revision_force_pin": false,
+        "gpu_count_auto": false,
+        "workload_profile_input_digest": "",
+        "workload_profile_producer_version": "",
+        "workload_profile": {},
+        "project": ""
+      }
+    },
+    {
+      "name": "b200-sft-cold",
+      "gpu": "b200",
+      "algorithm": "sft",
+      "cache": "cold",
+      "seed": 17,
+      "steps": 128,
+      "end_to_end_s": 744.6867280006409,
+      "measurement_complete_s": 744.6867280006409,
+      "allocation_api_s": 354.926824092865,
+      "launch_to_bootstrap_s": 360.3843867778778,
+      "launch_to_first_optimizer_completion_s": 623.7650454044342,
+      "worker_setup_s": 114.98106408119202,
+      "worker_training_wall_s": 198.71067762374878,
+      "model_download_s": 107.6,
+      "cpu_final_publication_s": 12.507636308670044,
+      "train_tokens": 21491,
+      "generated_tokens": 0,
+      "grpo_timers_s": {},
+      "grpo_first_vs_steady": null,
+      "positive_gradient_verified": true,
+      "reward_execution": {
+        "calls_observed": 0,
+        "measured_s": null,
+        "coverage": "Observed grading-call records only; completeness is not attested and log aggregation may omit calls."
+      },
+      "publication_samples": [
+        {
+          "step": 64,
+          "sampled_upload_lower_bound_s": null,
+          "publication_at_s": 673.3080687522888
+        },
+        {
+          "step": 128,
+          "sampled_upload_lower_bound_s": null,
+          "publication_at_s": 708.7541115283966
+        }
+      ],
+      "quality": [
+        {
+          "evaluation_recovery": false,
+          "step": 64,
+          "accuracy": 0.5546875,
+          "samples": 128,
+          "evaluated_at": 1792724835.0075428,
+          "received_at": 1792724837.3184981,
+          "observed_at_s": 682.7322602272034,
+          "target_reached": false,
+          "checkpoint": {
+            "name": "b200-sft-cold-step64",
+            "prefix": "sft/flash-compare-ada8a16f6c-b200-sft-cold/checkpoints/step-64/adapter",
+            "revision": "22b248061d8e7dad0a64df150edd3d4f5cc98f99",
+            "sha256": "5a75b5f23e48f4820ff44699061cb38650948fc4222fe8a97f39444dd74ae072"
+          },
+          "evaluation_wall_s": 4.669316053390503
+        },
+        {
+          "evaluation_recovery": false,
+          "step": 128,
+          "accuracy": 0.5546875,
+          "samples": 128,
+          "evaluated_at": 1792724871.678895,
+          "received_at": 1792724874.730238,
+          "observed_at_s": 720.1440000534058,
+          "target_reached": false,
+          "checkpoint": {
+            "name": "b200-sft-cold-step128",
+            "prefix": "sft/flash-compare-ada8a16f6c-b200-sft-cold/checkpoints/step-128/adapter",
+            "revision": "2af1a3b27c3fb320abbf0a2bd3357c2205a7cd0c",
+            "sha256": "b5c9be9aa69a48d3fcb87deaa00efa327405367767fc7556401a01447dce58e5"
+          },
+          "evaluation_wall_s": 4.599837303161621
+        }
+      ],
+      "final_accuracy": 0.5546875,
+      "baseline_accuracy": 0.5078125,
+      "change_from_same_gpu_baseline_pp": 4.6875,
+      "time_to_target_s": null,
+      "cost_to_target_actual_usd": null,
+      "cost_to_target_note": "Target unreached.",
+      "actual_infrastructure_accrued_usd": 1.4755721,
+      "actual_receipt_complete": false,
+      "customer_charge_usd": null,
+      "provider_usage": {
+        "unavailable": "NotFoundError"
+      },
+      "gpu_peak_gib": 30.25,
+      "observed_regions": [
+        "us-east"
+      ],
+      "gpu_names": [
+        "NVIDIA B200"
+      ],
+      "source_attestation_verified": true,
+      "spec": {
+        "model": "Qwen/Qwen3.5-9B",
+        "algorithm": "sft",
+        "environment": {
+          "id": "benchmark/mmlu-pro/other",
+          "params": {},
+          "pip": [],
+          "secrets": [],
+          "resolved_sha": "cea03d7bd0015b2cb21124299663904da490dae0",
+          "package": {
+            "artifact_revision": "d1ef9133aefe78e18f8b06d6d3f26e9b2ea04deb",
+            "archive_sha256": "59547d9594768767982ce96997e17754012eaf5a46e733a67ebb726aa49cbd1b",
+            "manifest_sha256": "1e3f938ebf775f51686b44c27e311750fbc2d24a6c1c0c654a51c50dfebcabfa"
+          }
+        },
+        "train": {
+          "epochs": null,
+          "lora_rank": 8,
+          "lora_alpha": 32,
+          "init_from_adapter": "",
+          "init_from_adapter_revision": "",
+          "hf_repo": "DavidBShan/flash-compare-ada8a16f6c",
+          "learning_rate": 0.0001,
+          "batch_size": 1,
+          "prompts_per_step": null,
+          "max_context_tokens": 2048,
+          "save_every": null,
+          "max_steps": 128,
+          "save_at_steps": [
+            64,
+            128
+          ],
+          "max_examples": 128,
+          "group_size": null,
+          "temperature": null,
+          "max_completion_tokens": null,
+          "kl_penalty_coef": null,
+          "thinking_length_penalty_coef": null,
+          "teacher_model": "",
+          "stop_sequences": [],
+          "structured_outputs": "",
+          "credit_assignment": "per_episode"
+        },
+        "gpu": {
+          "type": "B200",
+          "disk_gb": 60,
+          "max_wall_seconds": 1200,
+          "max_retries": 0,
+          "network_volume": "flash-compare-ada8a16f6c-b200-sft",
+          "network_volume_gb": 100,
+          "provider": "modal",
+          "count": 1
+        },
+        "run_id": "flash-compare-ada8a16f6c-b200-sft-cold",
+        "seed": 17,
+        "thinking": false,
+        "wandb": {
+          "project": null,
+          "run_name": null
+        },
+        "model_revision": "c202236235762e1c871ad0ccb60c8ee5ba337b9a",
+        "model_revision_auto": true,
+        "model_revision_force_pin": false,
+        "gpu_count_auto": false,
+        "workload_profile_input_digest": "fb56f4347cfd9882fc64d4f90ed706384d73339b04238cd31ee5f6d06299dc18",
+        "workload_profile_producer_version": "1.3.24",
+        "workload_profile": {
+          "input_digest": "fb56f4347cfd9882fc64d4f90ed706384d73339b04238cd31ee5f6d06299dc18",
+          "producer_version": "1.3.24",
+          "tokenizer_revision": "c202236235762e1c871ad0ccb60c8ee5ba337b9a",
+          "environment_id": "benchmark/mmlu-pro/other",
+          "environment_revision": "cea03d7bd0015b2cb21124299663904da490dae0",
+          "source_examples": 128,
+          "selected_examples": 128,
+          "retained_examples": 128,
+          "dropped_examples": 0,
+          "epochs": 2,
+          "max_length": 2048,
+          "packing_mode": "exact-unpacked",
+          "architecture_mode": "gdn-hybrid",
+          "packed_blocks": 128,
+          "real_tokens_per_epoch": 21491,
+          "supervised_tokens_per_epoch": 384,
+          "padded_compute_tokens_per_epoch": 21491,
+          "authoritative_real_tokens": 21491,
+          "authoritative_supervised_tokens": 384,
+          "authoritative_compute_tokens": 21491,
+          "realized_max_length": 478,
+          "untruncated_max_length": 478,
+          "truncated_examples": 0,
+          "examples_per_update": 1,
+          "derived_steps": 256,
+          "authoritative_steps": 128,
+          "packing_efficiency": 1.0,
+          "sample_policy": "exact-prefix",
+          "schema_version": 7,
+          "kind": "sft",
+          "created_at": 0.0,
+          "authored_reasoning_turns": 0,
+          "rendered_reasoning_spans": 0,
+          "truncated_reasoning_spans": 0,
+          "reasoning_rows": 128,
+          "content_digest": "b1a4923ea16cd58da034419bd45274949bb477c1f1eb4c2111a3412f80bdf499"
+        },
+        "project": ""
+      }
+    },
+    {
+      "name": "b200-sft-warm",
+      "gpu": "b200",
+      "algorithm": "sft",
+      "cache": "warm",
+      "seed": 17,
+      "steps": 128,
+      "end_to_end_s": 588.0438380241394,
+      "measurement_complete_s": 2418.05033993721,
+      "allocation_api_s": 337.88606119155884,
+      "launch_to_bootstrap_s": 342.14205026626587,
+      "launch_to_first_optimizer_completion_s": 473.7695257663727,
+      "worker_setup_s": 6.1229143142700195,
+      "worker_training_wall_s": 167.334068775177,
+      "model_download_s": 0.0,
+      "cpu_final_publication_s": 12.63214373588562,
+      "train_tokens": 21491,
+      "generated_tokens": 0,
+      "grpo_timers_s": {},
+      "grpo_first_vs_steady": null,
+      "positive_gradient_verified": true,
+      "reward_execution": {
+        "calls_observed": 0,
+        "measured_s": null,
+        "coverage": "Observed grading-call records only; completeness is not attested and log aggregation may omit calls."
+      },
+      "publication_samples": [
+        {
+          "step": 64,
+          "sampled_upload_lower_bound_s": null,
+          "publication_at_s": 514.2058289051056
+        },
+        {
+          "step": 128,
+          "sampled_upload_lower_bound_s": null,
+          "publication_at_s": 540.4868168830872
+        }
+      ],
+      "quality": [
+        {
+          "evaluation_recovery": true,
+          "step": 64,
+          "accuracy": 0.5546875,
+          "samples": 128,
+          "evaluated_at": 1792727205.8830981,
+          "received_at": 1792728407.991047,
+          "observed_at_s": 2417.9589688777924,
+          "target_reached": false,
+          "checkpoint": {
+            "name": "b200-sft-warm-step64",
+            "prefix": "sft/flash-compare-ada8a16f6c-b200-sft-warm/checkpoints/step-64/adapter",
+            "revision": "07e6b6345764f49bd7fb9553283d9905fa0225fd",
+            "sha256": "bab21806aaa55b1179d69631d82244b0077eb92195f98164ddc52b67b9348749"
+          },
+          "evaluation_wall_s": 13.36168360710144
+        },
+        {
+          "evaluation_recovery": true,
+          "step": 128,
+          "accuracy": 0.5703125,
+          "samples": 128,
+          "evaluated_at": 1792727211.6131742,
+          "received_at": 1792728408.082418,
+          "observed_at_s": 2418.05033993721,
+          "target_reached": false,
+          "checkpoint": {
+            "name": "b200-sft-warm-step128",
+            "prefix": "sft/flash-compare-ada8a16f6c-b200-sft-warm/checkpoints/step-128/adapter",
+            "revision": "07e6b6345764f49bd7fb9553283d9905fa0225fd",
+            "sha256": "b471e3b47ca3dd7f04860ea4365c93c33511ac22606addac881c17379def823d"
+          },
+          "evaluation_wall_s": 4.513584852218628
+        }
+      ],
+      "final_accuracy": 0.5703125,
+      "baseline_accuracy": 0.515625,
+      "change_from_same_gpu_baseline_pp": 5.46875,
+      "time_to_target_s": null,
+      "cost_to_target_actual_usd": null,
+      "cost_to_target_note": "Target unreached.",
+      "actual_infrastructure_accrued_usd": 0.86332863,
+      "actual_receipt_complete": false,
+      "customer_charge_usd": null,
+      "provider_usage": {
+        "cpu_core_nanosecs": "1712003070831",
+        "mem_gib_nanosecs": "6848012283325",
+        "gpu_nanosecs": "214000383853",
+        "gpu_type": "B200"
+      },
+      "gpu_peak_gib": 30.25,
+      "observed_regions": [
+        "us-east"
+      ],
+      "gpu_names": [
+        "NVIDIA B200"
+      ],
+      "source_attestation_verified": true,
+      "spec": {
+        "model": "Qwen/Qwen3.5-9B",
+        "algorithm": "sft",
+        "environment": {
+          "id": "benchmark/mmlu-pro/other",
+          "params": {},
+          "pip": [],
+          "secrets": [],
+          "resolved_sha": "cea03d7bd0015b2cb21124299663904da490dae0",
+          "package": {
+            "artifact_revision": "d1ef9133aefe78e18f8b06d6d3f26e9b2ea04deb",
+            "archive_sha256": "59547d9594768767982ce96997e17754012eaf5a46e733a67ebb726aa49cbd1b",
+            "manifest_sha256": "1e3f938ebf775f51686b44c27e311750fbc2d24a6c1c0c654a51c50dfebcabfa"
+          }
+        },
+        "train": {
+          "epochs": null,
+          "lora_rank": 8,
+          "lora_alpha": 32,
+          "init_from_adapter": "",
+          "init_from_adapter_revision": "",
+          "hf_repo": "DavidBShan/flash-compare-ada8a16f6c",
+          "learning_rate": 0.0001,
+          "batch_size": 1,
+          "prompts_per_step": null,
+          "max_context_tokens": 2048,
+          "save_every": null,
+          "max_steps": 128,
+          "save_at_steps": [
+            64,
+            128
+          ],
+          "max_examples": 128,
+          "group_size": null,
+          "temperature": null,
+          "max_completion_tokens": null,
+          "kl_penalty_coef": null,
+          "thinking_length_penalty_coef": null,
+          "teacher_model": "",
+          "stop_sequences": [],
+          "structured_outputs": "",
+          "credit_assignment": "per_episode"
+        },
+        "gpu": {
+          "type": "B200",
+          "disk_gb": 60,
+          "max_wall_seconds": 1200,
+          "max_retries": 0,
+          "network_volume": "flash-compare-ada8a16f6c-b200-sft",
+          "network_volume_gb": 100,
+          "provider": "modal",
+          "count": 1
+        },
+        "run_id": "flash-compare-ada8a16f6c-b200-sft-warm",
+        "seed": 17,
+        "thinking": false,
+        "wandb": {
+          "project": null,
+          "run_name": null
+        },
+        "model_revision": "c202236235762e1c871ad0ccb60c8ee5ba337b9a",
+        "model_revision_auto": true,
+        "model_revision_force_pin": false,
+        "gpu_count_auto": false,
+        "workload_profile_input_digest": "fb56f4347cfd9882fc64d4f90ed706384d73339b04238cd31ee5f6d06299dc18",
+        "workload_profile_producer_version": "1.3.24",
+        "workload_profile": {
+          "input_digest": "fb56f4347cfd9882fc64d4f90ed706384d73339b04238cd31ee5f6d06299dc18",
+          "producer_version": "1.3.24",
+          "tokenizer_revision": "c202236235762e1c871ad0ccb60c8ee5ba337b9a",
+          "environment_id": "benchmark/mmlu-pro/other",
+          "environment_revision": "cea03d7bd0015b2cb21124299663904da490dae0",
+          "source_examples": 128,
+          "selected_examples": 128,
+          "retained_examples": 128,
+          "dropped_examples": 0,
+          "epochs": 2,
+          "max_length": 2048,
+          "packing_mode": "exact-unpacked",
+          "architecture_mode": "gdn-hybrid",
+          "packed_blocks": 128,
+          "real_tokens_per_epoch": 21491,
+          "supervised_tokens_per_epoch": 384,
+          "padded_compute_tokens_per_epoch": 21491,
+          "authoritative_real_tokens": 21491,
+          "authoritative_supervised_tokens": 384,
+          "authoritative_compute_tokens": 21491,
+          "realized_max_length": 478,
+          "untruncated_max_length": 478,
+          "truncated_examples": 0,
+          "examples_per_update": 1,
+          "derived_steps": 256,
+          "authoritative_steps": 128,
+          "packing_efficiency": 1.0,
+          "sample_policy": "exact-prefix",
+          "schema_version": 7,
+          "kind": "sft",
+          "created_at": 0.0,
+          "authored_reasoning_turns": 0,
+          "rendered_reasoning_spans": 0,
+          "truncated_reasoning_spans": 0,
+          "reasoning_rows": 128,
+          "content_digest": "b1a4923ea16cd58da034419bd45274949bb477c1f1eb4c2111a3412f80bdf499"
+        },
+        "project": ""
+      }
+    },
+    {
+      "name": "b200-grpo-cold",
+      "gpu": "b200",
+      "algorithm": "grpo",
+      "cache": "cold",
+      "seed": 17,
+      "steps": 16,
+      "end_to_end_s": 799.6700248718262,
+      "measurement_complete_s": 800.4398310184479,
+      "allocation_api_s": 81.48517608642578,
+      "launch_to_bootstrap_s": 86.22255754470825,
+      "launch_to_first_optimizer_completion_s": 669.0741610527039,
+      "worker_setup_s": 111.07435131072998,
+      "worker_training_wall_s": 560.8702266216278,
+      "model_download_s": 92.0,
+      "cpu_final_publication_s": 13.526928901672363,
+      "train_tokens": 0,
+      "generated_tokens": 1023,
+      "grpo_timers_s": {
+        "timing_s/gen": 40.34877660599989,
+        "timing_s/old_log_prob": 41.94029831299997,
+        "timing_s/adv": 0.5277210389996299,
+        "timing_s/update_actor": 95.95844651400012,
+        "timing_s/update_weights": 15.326491323000027,
+        "timing_s/step": 216.17127044500006,
+        "timing_s/save_checkpoint": 4.828546509000034
+      },
+      "grpo_first_vs_steady": {
+        "first_step_s": 127.98972454100004,
+        "subsequent_step_median_s": 5.380349541999976
+      },
+      "positive_gradient_verified": true,
+      "reward_execution": {
+        "calls_observed": 472,
+        "measured_s": 0.003551483154296875,
+        "coverage": "Observed grading-call records only; completeness is not attested and log aggregation may omit calls."
+      },
+      "publication_samples": [
+        {
+          "step": 8,
+          "sampled_upload_lower_bound_s": null,
+          "publication_at_s": 767.3578462600708
+        },
+        {
+          "step": 16,
+          "sampled_upload_lower_bound_s": null,
+          "publication_at_s": 768.4352939128876
+        }
+      ],
+      "quality": [
+        {
+          "evaluation_recovery": false,
+          "step": 8,
+          "accuracy": 0.515625,
+          "samples": 128,
+          "evaluated_at": 1792724147.944556,
+          "received_at": 1792724151.261899,
+          "observed_at_s": 800.4398310184479,
+          "target_reached": false,
+          "checkpoint": {
+            "name": "b200-grpo-cold-step8",
+            "prefix": "rl/flash-compare-ada8a16f6c-b200-grpo-cold/checkpoints/step-8/adapter",
+            "revision": "dcfa2a064380b5a08b845cee3535f6b1407503d7",
+            "sha256": "e5db4dbd1c5e5ec119635061e9d841201365b631a0321e91adca72d65b63d1ca"
+          },
+          "evaluation_wall_s": 4.503484010696411
+        },
+        {
+          "evaluation_recovery": false,
+          "step": 16,
+          "accuracy": 0.515625,
+          "samples": 128,
+          "evaluated_at": 1792724135.6928008,
+          "received_at": 1792724141.8562088,
+          "observed_at_s": 791.0341408252716,
+          "target_reached": false,
+          "checkpoint": {
+            "name": "b200-grpo-cold-step16",
+            "prefix": "rl/flash-compare-ada8a16f6c-b200-grpo-cold/checkpoints/step-16/adapter",
+            "revision": "50f53a80c73be0519701248c81885fac4ee93836",
+            "sha256": "c0736b60878b4ff227af12816c4d1c2430e11878b60f85519f23994919664b5f"
+          },
+          "evaluation_wall_s": 12.592297554016113
+        }
+      ],
+      "final_accuracy": 0.515625,
+      "baseline_accuracy": 0.5078125,
+      "change_from_same_gpu_baseline_pp": 0.78125,
+      "time_to_target_s": null,
+      "cost_to_target_actual_usd": null,
+      "cost_to_target_note": "Target unreached.",
+      "actual_infrastructure_accrued_usd": 2.82660182,
+      "actual_receipt_complete": false,
+      "customer_charge_usd": null,
+      "provider_usage": {
+        "unavailable": "NotFoundError"
+      },
+      "gpu_peak_gib": 63.943,
+      "observed_regions": [
+        "us-east"
+      ],
+      "gpu_names": [
+        "NVIDIA B200"
+      ],
+      "source_attestation_verified": true,
+      "spec": {
+        "model": "Qwen/Qwen3.5-9B",
+        "algorithm": "grpo",
+        "environment": {
+          "id": "benchmark/mmlu-pro/other",
+          "params": {},
+          "pip": [],
+          "secrets": [],
+          "resolved_sha": "cea03d7bd0015b2cb21124299663904da490dae0",
+          "package": {
+            "artifact_revision": "d1ef9133aefe78e18f8b06d6d3f26e9b2ea04deb",
+            "archive_sha256": "59547d9594768767982ce96997e17754012eaf5a46e733a67ebb726aa49cbd1b",
+            "manifest_sha256": "1e3f938ebf775f51686b44c27e311750fbc2d24a6c1c0c654a51c50dfebcabfa"
+          }
+        },
+        "train": {
+          "epochs": null,
+          "lora_rank": 8,
+          "lora_alpha": 32,
+          "init_from_adapter": "",
+          "init_from_adapter_revision": "",
+          "hf_repo": "DavidBShan/flash-compare-ada8a16f6c",
+          "learning_rate": 1e-05,
+          "batch_size": null,
+          "prompts_per_step": 8,
+          "max_context_tokens": 2048,
+          "save_every": null,
+          "max_steps": 16,
+          "save_at_steps": [
+            8,
+            16
+          ],
+          "max_examples": 128,
+          "group_size": 4,
+          "temperature": 1.0,
+          "max_completion_tokens": 16,
+          "kl_penalty_coef": 0.0,
+          "thinking_length_penalty_coef": null,
+          "teacher_model": "",
+          "stop_sequences": [],
+          "structured_outputs": "",
+          "credit_assignment": "per_episode"
+        },
+        "gpu": {
+          "type": "B200",
+          "disk_gb": 60,
+          "max_wall_seconds": 1200,
+          "max_retries": 0,
+          "network_volume": "flash-compare-ada8a16f6c-b200-grpo",
+          "network_volume_gb": 100,
+          "provider": "modal",
+          "count": 1
+        },
+        "run_id": "flash-compare-ada8a16f6c-b200-grpo-cold",
+        "seed": 17,
+        "thinking": false,
+        "wandb": {
+          "project": null,
+          "run_name": null
+        },
+        "model_revision": "c202236235762e1c871ad0ccb60c8ee5ba337b9a",
+        "model_revision_auto": true,
+        "model_revision_force_pin": false,
+        "gpu_count_auto": false,
+        "workload_profile_input_digest": "",
+        "workload_profile_producer_version": "",
+        "workload_profile": {},
+        "project": ""
+      }
+    },
+    {
+      "name": "b200-grpo-warm",
+      "gpu": "b200",
+      "algorithm": "grpo",
+      "cache": "warm",
+      "seed": 17,
+      "steps": 16,
+      "end_to_end_s": 1086.8654220104218,
+      "measurement_complete_s": 1086.8654220104218,
+      "allocation_api_s": 478.7888126373291,
+      "launch_to_bootstrap_s": 482.8400139808655,
+      "launch_to_first_optimizer_completion_s": 955.1556656360626,
+      "worker_setup_s": 19.264323234558105,
+      "worker_training_wall_s": 535.0563278198242,
+      "model_download_s": 0.0,
+      "cpu_final_publication_s": 12.328227758407593,
+      "train_tokens": 0,
+      "generated_tokens": 1024,
+      "grpo_timers_s": {
+        "timing_s/gen": 37.00968228999983,
+        "timing_s/old_log_prob": 35.55061105399989,
+        "timing_s/adv": 0.48053732599998966,
+        "timing_s/update_actor": 82.41034611200013,
+        "timing_s/update_weights": 15.450326098999994,
+        "timing_s/step": 194.743498564,
+        "timing_s/save_checkpoint": 4.010783123999886
+      },
+      "grpo_first_vs_steady": {
+        "first_step_s": 112.32861486499996,
+        "subsequent_step_median_s": 5.156536009999968
+      },
+      "positive_gradient_verified": true,
+      "reward_execution": {
+        "calls_observed": 463,
+        "measured_s": 0.0031425952911376953,
+        "coverage": "Observed grading-call records only; completeness is not attested and log aggregation may omit calls."
+      },
+      "publication_samples": [
+        {
+          "step": 8,
+          "sampled_upload_lower_bound_s": null,
+          "publication_at_s": 1046.5532639026642
+        },
+        {
+          "step": 16,
+          "sampled_upload_lower_bound_s": null,
+          "publication_at_s": 1047.5750885009766
+        }
+      ],
+      "quality": [
+        {
+          "evaluation_recovery": false,
+          "step": 8,
+          "accuracy": 0.5078125,
+          "samples": 128,
+          "evaluated_at": 1792725963.0757105,
+          "received_at": 1792725965.6445508,
+          "observed_at_s": 1063.6064057350159,
+          "target_reached": false,
+          "checkpoint": {
+            "name": "b200-grpo-warm-step8",
+            "prefix": "rl/flash-compare-ada8a16f6c-b200-grpo-warm/checkpoints/step-8/adapter",
+            "revision": "83098af4f4eca03456733d09043674664849f487",
+            "sha256": "a01a0ddc9d460c3c744b00e22fb18bc2b88151f811b6e8ca82a6a28e98ff94fe"
+          },
+          "evaluation_wall_s": 4.716985464096069
+        },
+        {
+          "evaluation_recovery": false,
+          "step": 16,
+          "accuracy": 0.5234375,
+          "samples": 128,
+          "evaluated_at": 1792725956.7504966,
+          "received_at": 1792725959.2989628,
+          "observed_at_s": 1057.2608177661896,
+          "target_reached": false,
+          "checkpoint": {
+            "name": "b200-grpo-warm-step16",
+            "prefix": "rl/flash-compare-ada8a16f6c-b200-grpo-warm/checkpoints/step-16/adapter",
+            "revision": "28c5441e760b2252a6d6ab5c8ae6c50dbfaea843",
+            "sha256": "3a0093820a6ce74f43bbf2843b8d3d7813de95601decf62a9d81d3ad6c0884ab"
+          },
+          "evaluation_wall_s": 4.639828443527222
+        }
+      ],
+      "final_accuracy": 0.5234375,
+      "baseline_accuracy": 0.5078125,
+      "change_from_same_gpu_baseline_pp": 1.5625,
+      "time_to_target_s": null,
+      "cost_to_target_actual_usd": null,
+      "cost_to_target_note": "Target unreached.",
+      "actual_infrastructure_accrued_usd": 2.35048789,
+      "actual_receipt_complete": false,
+      "customer_charge_usd": null,
+      "provider_usage": {
+        "cpu_core_nanosecs": "2886716529846",
+        "mem_gib_nanosecs": "13630741774683",
+        "gpu_nanosecs": "360839566230",
+        "gpu_type": "B200"
+      },
+      "gpu_peak_gib": 56.118,
+      "observed_regions": [
+        "us-east"
+      ],
+      "gpu_names": [
+        "NVIDIA B200"
+      ],
+      "source_attestation_verified": true,
+      "spec": {
+        "model": "Qwen/Qwen3.5-9B",
+        "algorithm": "grpo",
+        "environment": {
+          "id": "benchmark/mmlu-pro/other",
+          "params": {},
+          "pip": [],
+          "secrets": [],
+          "resolved_sha": "cea03d7bd0015b2cb21124299663904da490dae0",
+          "package": {
+            "artifact_revision": "d1ef9133aefe78e18f8b06d6d3f26e9b2ea04deb",
+            "archive_sha256": "59547d9594768767982ce96997e17754012eaf5a46e733a67ebb726aa49cbd1b",
+            "manifest_sha256": "1e3f938ebf775f51686b44c27e311750fbc2d24a6c1c0c654a51c50dfebcabfa"
+          }
+        },
+        "train": {
+          "epochs": null,
+          "lora_rank": 8,
+          "lora_alpha": 32,
+          "init_from_adapter": "",
+          "init_from_adapter_revision": "",
+          "hf_repo": "DavidBShan/flash-compare-ada8a16f6c",
+          "learning_rate": 1e-05,
+          "batch_size": null,
+          "prompts_per_step": 8,
+          "max_context_tokens": 2048,
+          "save_every": null,
+          "max_steps": 16,
+          "save_at_steps": [
+            8,
+            16
+          ],
+          "max_examples": 128,
+          "group_size": 4,
+          "temperature": 1.0,
+          "max_completion_tokens": 16,
+          "kl_penalty_coef": 0.0,
+          "thinking_length_penalty_coef": null,
+          "teacher_model": "",
+          "stop_sequences": [],
+          "structured_outputs": "",
+          "credit_assignment": "per_episode"
+        },
+        "gpu": {
+          "type": "B200",
+          "disk_gb": 60,
+          "max_wall_seconds": 1200,
+          "max_retries": 0,
+          "network_volume": "flash-compare-ada8a16f6c-b200-grpo",
+          "network_volume_gb": 100,
+          "provider": "modal",
+          "count": 1
+        },
+        "run_id": "flash-compare-ada8a16f6c-b200-grpo-warm",
+        "seed": 17,
+        "thinking": false,
+        "wandb": {
+          "project": null,
+          "run_name": null
+        },
+        "model_revision": "c202236235762e1c871ad0ccb60c8ee5ba337b9a",
+        "model_revision_auto": true,
+        "model_revision_force_pin": false,
+        "gpu_count_auto": false,
+        "workload_profile_input_digest": "",
+        "workload_profile_producer_version": "",
+        "workload_profile": {},
+        "project": ""
+      }
+    }
+  ],
+  "paired": [
+    {
+      "workload": "sft",
+      "cache": "cold",
+      "h100_wall_s": 377.6759338378906,
+      "b200_wall_s": 744.6867280006409,
+      "b200_over_h100_wall": 1.971761135090704,
+      "h100_accuracy": 0.5625,
+      "b200_accuracy": 0.5546875,
+      "h100_accrued_infra_usd": 1.01104108,
+      "b200_accrued_infra_usd": 1.4755721,
+      "time_to_quality_ratio": null,
+      "settled_cost_ratio": null
+    },
+    {
+      "workload": "sft",
+      "cache": "warm",
+      "h100_wall_s": 391.41799807548523,
+      "b200_wall_s": 588.0438380241394,
+      "b200_over_h100_wall": 1.5023423575702177,
+      "h100_accuracy": 0.5546875,
+      "b200_accuracy": 0.5703125,
+      "h100_accrued_infra_usd": 1.05643782,
+      "b200_accrued_infra_usd": 0.86332863,
+      "time_to_quality_ratio": null,
+      "settled_cost_ratio": null
+    },
+    {
+      "workload": "grpo",
+      "cache": "cold",
+      "h100_wall_s": 1138.0515351295471,
+      "b200_wall_s": 799.6700248718262,
+      "b200_over_h100_wall": 0.702665916426006,
+      "h100_accuracy": 0.515625,
+      "b200_accuracy": 0.515625,
+      "h100_accrued_infra_usd": 3.26266578,
+      "b200_accrued_infra_usd": 2.82660182,
+      "time_to_quality_ratio": null,
+      "settled_cost_ratio": null
+    },
+    {
+      "workload": "grpo",
+      "cache": "warm",
+      "h100_wall_s": 626.5077791213989,
+      "b200_wall_s": 1086.8654220104218,
+      "b200_over_h100_wall": 1.734799563917017,
+      "h100_accuracy": 0.515625,
+      "b200_accuracy": 0.5234375,
+      "h100_accrued_infra_usd": 1.78136546,
+      "b200_accrued_infra_usd": 2.35048789,
+      "time_to_quality_ratio": null,
+      "settled_cost_ratio": null
+    }
+  ],
+  "serving": {
+    "h100": {
+      "incomplete": true,
+      "planned_waves": 18,
+      "completed_waves": 8,
+      "missing_waves": 10,
+      "adapters": [
+        {
+          "name": "customer-a",
+          "prefix": "sft/flash-compare-ada8a16f6c-h100-sft-warm/checkpoints/step-128/adapter",
+          "revision": "b820ef1ddd379fbfe12b3f52b75eb650f9709a12",
+          "sha256": "4ffce16be2505873515a715fc96eac1d139334809da6d5c8dc1be02c28c8b5f5"
+        },
+        {
+          "name": "customer-b",
+          "prefix": "rl/flash-compare-ada8a16f6c-h100-grpo-warm/checkpoints/step-16/adapter",
+          "revision": "b820ef1ddd379fbfe12b3f52b75eb650f9709a12",
+          "sha256": "f261cd9b2f4156494c4c7dc90bcef503b9c1a32a54c51ebfb54ce98379848be2"
+        }
+      ],
+      "waves": [
+        {
+          "mode": "isolated",
+          "concurrency": 1,
+          "repeat": 0,
+          "wall_s": 46.624709367752075,
+          "requests": 128,
+          "requests_per_s": 2.745325423701859,
+          "customers": {
+            "customer-a": {
+              "requests": 64,
+              "quality_accuracy": 0.625,
+              "latency_s": {
+                "p50": 0.24608278274536133,
+                "p95": 1.3113107681274414,
+                "p99": 9.574825763702393
+              },
+              "ttft_s": {
+                "p50": 0.1724090576171875,
+                "p95": 1.2363324165344238,
+                "p99": 9.499998092651367
+              },
+              "including_admission_queue_s": {
+                "p50": 23.10908341407776,
+                "p95": 30.20864510536194,
+                "p99": 30.96092176437378
+              }
+            },
+            "customer-b": {
+              "requests": 64,
+              "quality_accuracy": 0.5625,
+              "latency_s": {
+                "p50": 0.24075579643249512,
+                "p95": 0.25209856033325195,
+                "p99": 0.4386565685272217
+              },
+              "ttft_s": {
+                "p50": 0.16753721237182617,
+                "p95": 0.17548894882202148,
+                "p99": 0.36589670181274414
+              },
+              "including_admission_queue_s": {
+                "p50": 7.939228773117065,
+                "p95": 14.939922332763672,
+                "p99": 15.659371852874756
+              }
+            }
+          },
+          "max_observed_in_flight": 1,
+          "mixed_customer_overlap": false
+        },
+        {
+          "mode": "concurrent",
+          "concurrency": 1,
+          "repeat": 0,
+          "wall_s": 31.13794493675232,
+          "requests": 128,
+          "requests_per_s": 4.110740135869428,
+          "customers": {
+            "customer-a": {
+              "requests": 64,
+              "quality_accuracy": 0.609375,
+              "latency_s": {
+                "p50": 0.24355578422546387,
+                "p95": 0.2500336170196533,
+                "p99": 0.26119470596313477
+              },
+              "ttft_s": {
+                "p50": 0.16959309577941895,
+                "p95": 0.1772000789642334,
+                "p99": 0.18544960021972656
+              },
+              "including_admission_queue_s": {
+                "p50": 15.390515565872192,
+                "p95": 29.44663119316101,
+                "p99": 30.896177291870117
+              }
+            },
+            "customer-b": {
+              "requests": 64,
+              "quality_accuracy": 0.5625,
+              "latency_s": {
+                "p50": 0.24291181564331055,
+                "p95": 0.2529432773590088,
+                "p99": 0.25986552238464355
+              },
+              "ttft_s": {
+                "p50": 0.16897988319396973,
+                "p95": 0.17654895782470703,
+                "p99": 0.18166613578796387
+              },
+              "including_admission_queue_s": {
+                "p50": 15.634769201278687,
+                "p95": 29.684314250946045,
+                "p99": 31.135486364364624
+              }
+            }
+          },
+          "max_observed_in_flight": 1,
+          "mixed_customer_overlap": false
+        },
+        {
+          "mode": "concurrent",
+          "concurrency": 1,
+          "repeat": 1,
+          "wall_s": 31.14659309387207,
+          "requests": 128,
+          "requests_per_s": 4.109598748544454,
+          "customers": {
+            "customer-a": {
+              "requests": 64,
+              "quality_accuracy": 0.625,
+              "latency_s": {
+                "p50": 0.2438669204711914,
+                "p95": 0.2526702880859375,
+                "p99": 0.25479865074157715
+              },
+              "ttft_s": {
+                "p50": 0.16963887214660645,
+                "p95": 0.1754322052001953,
+                "p99": 0.18126296997070312
+              },
+              "including_admission_queue_s": {
+                "p50": 15.267899513244629,
+                "p95": 29.450950384140015,
+                "p99": 30.900430917739868
+              }
+            },
+            "customer-b": {
+              "requests": 64,
+              "quality_accuracy": 0.5625,
+              "latency_s": {
+                "p50": 0.2423405647277832,
+                "p95": 0.25106215476989746,
+                "p99": 0.25814151763916016
+              },
+              "ttft_s": {
+                "p50": 0.16782832145690918,
+                "p95": 0.17709565162658691,
+                "p99": 0.17905712127685547
+              },
+              "including_admission_queue_s": {
+                "p50": 15.51317811012268,
+                "p95": 29.694325923919678,
+                "p99": 31.14395570755005
+              }
+            }
+          },
+          "max_observed_in_flight": 1,
+          "mixed_customer_overlap": false
+        },
+        {
+          "mode": "isolated",
+          "concurrency": 1,
+          "repeat": 1,
+          "wall_s": 31.51056742668152,
+          "requests": 128,
+          "requests_per_s": 4.062129325275692,
+          "customers": {
+            "customer-a": {
+              "requests": 64,
+              "quality_accuracy": 0.625,
+              "latency_s": {
+                "p50": 0.24269628524780273,
+                "p95": 0.27198028564453125,
+                "p99": 0.2831735610961914
+              },
+              "ttft_s": {
+                "p50": 0.16985511779785156,
+                "p95": 0.19297409057617188,
+                "p99": 0.1988515853881836
+              },
+              "including_admission_queue_s": {
+                "p50": 7.661153793334961,
+                "p95": 15.09205675125122,
+                "p99": 15.83745527267456
+              }
+            },
+            "customer-b": {
+              "requests": 64,
+              "quality_accuracy": 0.5625,
+              "latency_s": {
+                "p50": 0.242293119430542,
+                "p95": 0.26407313346862793,
+                "p99": 0.27318358421325684
+              },
+              "ttft_s": {
+                "p50": 0.16779112815856934,
+                "p95": 0.190291166305542,
+                "p99": 0.1954042911529541
+              },
+              "including_admission_queue_s": {
+                "p50": 7.770997762680054,
+                "p95": 14.952776908874512,
+                "p99": 15.6680748462677
+              }
+            }
+          },
+          "max_observed_in_flight": 1,
+          "mixed_customer_overlap": false
+        },
+        {
+          "mode": "isolated",
+          "concurrency": 1,
+          "repeat": 2,
+          "wall_s": 31.93122935295105,
+          "requests": 128,
+          "requests_per_s": 4.008614844895422,
+          "customers": {
+            "customer-a": {
+              "requests": 64,
+              "quality_accuracy": 0.625,
+              "latency_s": {
+                "p50": 0.2401728630065918,
+                "p95": 0.270263671875,
+                "p99": 0.28291773796081543
+              },
+              "ttft_s": {
+                "p50": 0.1681981086730957,
+                "p95": 0.191389799118042,
+                "p99": 0.20627498626708984
+              },
+              "including_admission_queue_s": {
+                "p50": 7.657738208770752,
+                "p95": 14.799519062042236,
+                "p99": 15.63158392906189
+              }
+            },
+            "customer-b": {
+              "requests": 64,
+              "quality_accuracy": 0.546875,
+              "latency_s": {
+                "p50": 0.25263452529907227,
+                "p95": 0.2733316421508789,
+                "p99": 0.28908586502075195
+              },
+              "ttft_s": {
+                "p50": 0.17654895782470703,
+                "p95": 0.1909945011138916,
+                "p99": 0.19878172874450684
+              },
+              "including_admission_queue_s": {
+                "p50": 8.22115421295166,
+                "p95": 15.564387321472168,
+                "p99": 16.291247606277466
+              }
+            }
+          },
+          "max_observed_in_flight": 1,
+          "mixed_customer_overlap": false
+        },
+        {
+          "mode": "concurrent",
+          "concurrency": 1,
+          "repeat": 2,
+          "wall_s": 31.024285316467285,
+          "requests": 128,
+          "requests_per_s": 4.125800117369965,
+          "customers": {
+            "customer-a": {
+              "requests": 64,
+              "quality_accuracy": 0.625,
+              "latency_s": {
+                "p50": 0.24313783645629883,
+                "p95": 0.25531601905822754,
+                "p99": 0.26482391357421875
+              },
+              "ttft_s": {
+                "p50": 0.16818618774414062,
+                "p95": 0.1786653995513916,
+                "p99": 0.18845653533935547
+              },
+              "including_admission_queue_s": {
+                "p50": 15.246240139007568,
+                "p95": 29.325284957885742,
+                "p99": 30.781030893325806
+              }
+            },
+            "customer-b": {
+              "requests": 64,
+              "quality_accuracy": 0.5625,
+              "latency_s": {
+                "p50": 0.2407245635986328,
+                "p95": 0.25127673149108887,
+                "p99": 0.25650882720947266
+              },
+              "ttft_s": {
+                "p50": 0.1677248477935791,
+                "p95": 0.17561125755310059,
+                "p99": 0.18717479705810547
+              },
+              "including_admission_queue_s": {
+                "p50": 15.48549485206604,
+                "p95": 29.565892934799194,
+                "p99": 31.021490812301636
+              }
+            }
+          },
+          "max_observed_in_flight": 1,
+          "mixed_customer_overlap": false
+        },
+        {
+          "mode": "isolated",
+          "concurrency": 8,
+          "repeat": 0,
+          "wall_s": 5.598167896270752,
+          "requests": 128,
+          "requests_per_s": 22.864623278853042,
+          "customers": {
+            "customer-a": {
+              "requests": 64,
+              "quality_accuracy": 0.625,
+              "latency_s": {
+                "p50": 0.336972713470459,
+                "p95": 0.34761595726013184,
+                "p99": 0.3490622043609619
+              },
+              "ttft_s": {
+                "p50": 0.26023054122924805,
+                "p95": 0.26985597610473633,
+                "p99": 0.2726118564605713
+              },
+              "including_admission_queue_s": {
+                "p50": 1.3626532554626465,
+                "p95": 2.7194414138793945,
+                "p99": 2.719477891921997
+              }
+            },
+            "customer-b": {
+              "requests": 64,
+              "quality_accuracy": 0.5625,
+              "latency_s": {
+                "p50": 0.35610318183898926,
+                "p95": 0.3653552532196045,
+                "p99": 0.3678109645843506
+              },
+              "ttft_s": {
+                "p50": 0.2764322757720947,
+                "p95": 0.28493428230285645,
+                "p99": 0.28675270080566406
+              },
+              "including_admission_queue_s": {
+                "p50": 1.4437875747680664,
+                "p95": 2.861851215362549,
+                "p99": 2.8619000911712646
+              }
+            }
+          },
+          "max_observed_in_flight": 8,
+          "mixed_customer_overlap": false
+        },
+        {
+          "mode": "concurrent",
+          "concurrency": 8,
+          "repeat": 0,
+          "wall_s": 5.656386852264404,
+          "requests": 128,
+          "requests_per_s": 22.629286741368855,
+          "customers": {
+            "customer-a": {
+              "requests": 64,
+              "quality_accuracy": 0.625,
+              "latency_s": {
+                "p50": 0.34999561309814453,
+                "p95": 0.36083340644836426,
+                "p99": 0.36349987983703613
+              },
+              "ttft_s": {
+                "p50": 0.2699761390686035,
+                "p95": 0.27963781356811523,
+                "p99": 0.28214240074157715
+              },
+              "including_admission_queue_s": {
+                "p50": 2.808903455734253,
+                "p95": 5.56394100189209,
+                "p99": 5.643276214599609
+              }
+            },
+            "customer-b": {
+              "requests": 64,
+              "quality_accuracy": 0.546875,
+              "latency_s": {
+                "p50": 0.3497300148010254,
+                "p95": 0.3605794906616211,
+                "p99": 0.3627946376800537
+              },
+              "ttft_s": {
+                "p50": 0.2692837715148926,
+                "p95": 0.28020238876342773,
+                "p99": 0.28225183486938477
+              },
+              "including_admission_queue_s": {
+                "p50": 2.8089182376861572,
+                "p95": 5.643174886703491,
+                "p99": 5.643286228179932
+              }
+            }
+          },
+          "max_observed_in_flight": 8,
+          "mixed_customer_overlap": true
+        }
+      ],
+      "long_agents": {
+        "planned_episodes": 16,
+        "missing_episodes": 16,
+        "episodes": 0,
+        "successful": 0,
+        "valid_protocol": 0,
+        "total_turns": 0,
+        "episode_latency_s": {
+          "p50": null,
+          "p95": null,
+          "p99": null
+        },
+        "environment_reward_s": 0,
+        "target_success_fraction": 0.8,
+        "target_reached": false,
+        "completed_episode_success_fraction": null
+      }
+    },
+    "b200": {
+      "incomplete": false,
+      "planned_waves": 18,
+      "completed_waves": 18,
+      "missing_waves": 0,
+      "adapters": [
+        {
+          "name": "customer-a",
+          "prefix": "sft/flash-compare-ada8a16f6c-h100-sft-warm/checkpoints/step-128/adapter",
+          "revision": "b820ef1ddd379fbfe12b3f52b75eb650f9709a12",
+          "sha256": "4ffce16be2505873515a715fc96eac1d139334809da6d5c8dc1be02c28c8b5f5"
+        },
+        {
+          "name": "customer-b",
+          "prefix": "rl/flash-compare-ada8a16f6c-h100-grpo-warm/checkpoints/step-16/adapter",
+          "revision": "b820ef1ddd379fbfe12b3f52b75eb650f9709a12",
+          "sha256": "f261cd9b2f4156494c4c7dc90bcef503b9c1a32a54c51ebfb54ce98379848be2"
+        }
+      ],
+      "waves": [
+        {
+          "mode": "isolated",
+          "concurrency": 1,
+          "repeat": 0,
+          "wall_s": 30.651230096817017,
+          "requests": 128,
+          "requests_per_s": 4.176015109204123,
+          "customers": {
+            "customer-a": {
+              "requests": 64,
+              "quality_accuracy": 0.625,
+              "latency_s": {
+                "p50": 0.19730186462402344,
+                "p95": 0.2043297290802002,
+                "p99": 6.0930328369140625
+              },
+              "ttft_s": {
+                "p50": 0.1432662010192871,
+                "p95": 0.14996623992919922,
+                "p99": 6.0379698276519775
+              },
+              "including_admission_queue_s": {
+                "p50": 12.235697031021118,
+                "p95": 17.879891395568848,
+                "p99": 18.46774959564209
+              }
+            },
+            "customer-b": {
+              "requests": 64,
+              "quality_accuracy": 0.5625,
+              "latency_s": {
+                "p50": 0.18923258781433105,
+                "p95": 0.19069409370422363,
+                "p99": 0.25949788093566895
+              },
+              "ttft_s": {
+                "p50": 0.13516592979431152,
+                "p95": 0.13659167289733887,
+                "p99": 0.20615053176879883
+              },
+              "including_admission_queue_s": {
+                "p50": 6.120713710784912,
+                "p95": 11.611087322235107,
+                "p99": 12.180019855499268
+              }
+            }
+          },
+          "max_observed_in_flight": 1,
+          "mixed_customer_overlap": false
+        },
+        {
+          "mode": "concurrent",
+          "concurrency": 1,
+          "repeat": 0,
+          "wall_s": 24.20133376121521,
+          "requests": 128,
+          "requests_per_s": 5.288964701818681,
+          "customers": {
+            "customer-a": {
+              "requests": 64,
+              "quality_accuracy": 0.625,
+              "latency_s": {
+                "p50": 0.18898630142211914,
+                "p95": 0.18997526168823242,
+                "p99": 0.19068431854248047
+              },
+              "ttft_s": {
+                "p50": 0.13504338264465332,
+                "p95": 0.13622641563415527,
+                "p99": 0.13666081428527832
+              },
+              "including_admission_queue_s": {
+                "p50": 11.919576168060303,
+                "p95": 22.876198768615723,
+                "p99": 24.00893783569336
+              }
+            },
+            "customer-b": {
+              "requests": 64,
+              "quality_accuracy": 0.5625,
+              "latency_s": {
+                "p50": 0.18902349472045898,
+                "p95": 0.19045138359069824,
+                "p99": 0.19133567810058594
+              },
+              "ttft_s": {
+                "p50": 0.1351473331451416,
+                "p95": 0.13634347915649414,
+                "p99": 0.13672852516174316
+              },
+              "including_admission_queue_s": {
+                "p50": 12.108594417572021,
+                "p95": 23.06476855278015,
+                "p99": 24.199503660202026
+              }
+            }
+          },
+          "max_observed_in_flight": 1,
+          "mixed_customer_overlap": false
+        },
+        {
+          "mode": "concurrent",
+          "concurrency": 1,
+          "repeat": 1,
+          "wall_s": 24.227250337600708,
+          "requests": 128,
+          "requests_per_s": 5.283306946366254,
+          "customers": {
+            "customer-a": {
+              "requests": 64,
+              "quality_accuracy": 0.625,
+              "latency_s": {
+                "p50": 0.189347505569458,
+                "p95": 0.1906287670135498,
+                "p99": 0.19112467765808105
+              },
+              "ttft_s": {
+                "p50": 0.13542914390563965,
+                "p95": 0.13666772842407227,
+                "p99": 0.1373734474182129
+              },
+              "including_admission_queue_s": {
+                "p50": 11.907644033432007,
+                "p95": 22.898634910583496,
+                "p99": 24.03614091873169
+              }
+            },
+            "customer-b": {
+              "requests": 64,
+              "quality_accuracy": 0.5625,
+              "latency_s": {
+                "p50": 0.18911194801330566,
+                "p95": 0.19033503532409668,
+                "p99": 0.19054126739501953
+              },
+              "ttft_s": {
+                "p50": 0.13516592979431152,
+                "p95": 0.13620615005493164,
+                "p99": 0.13695430755615234
+              },
+              "including_admission_queue_s": {
+                "p50": 12.096407175064087,
+                "p95": 23.087929010391235,
+                "p99": 24.225510120391846
+              }
+            }
+          },
+          "max_observed_in_flight": 1,
+          "mixed_customer_overlap": false
+        },
+        {
+          "mode": "isolated",
+          "concurrency": 1,
+          "repeat": 1,
+          "wall_s": 24.23854923248291,
+          "requests": 128,
+          "requests_per_s": 5.280844112091611,
+          "customers": {
+            "customer-a": {
+              "requests": 64,
+              "quality_accuracy": 0.625,
+              "latency_s": {
+                "p50": 0.18907380104064941,
+                "p95": 0.1906270980834961,
+                "p99": 0.19103288650512695
+              },
+              "ttft_s": {
+                "p50": 0.13530945777893066,
+                "p95": 0.1362287998199463,
+                "p99": 0.13644671440124512
+              },
+              "including_admission_queue_s": {
+                "p50": 6.06322717666626,
+                "p95": 11.541799306869507,
+                "p99": 12.108939170837402
+              }
+            },
+            "customer-b": {
+              "requests": 64,
+              "quality_accuracy": 0.5625,
+              "latency_s": {
+                "p50": 0.18934178352355957,
+                "p95": 0.19094252586364746,
+                "p99": 0.19096112251281738
+              },
+              "ttft_s": {
+                "p50": 0.1354522705078125,
+                "p95": 0.13654780387878418,
+                "p99": 0.13726425170898438
+              },
+              "including_admission_queue_s": {
+                "p50": 6.057370901107788,
+                "p95": 11.55703616142273,
+                "p99": 12.126813888549805
+              }
+            }
+          },
+          "max_observed_in_flight": 1,
+          "mixed_customer_overlap": false
+        },
+        {
+          "mode": "isolated",
+          "concurrency": 1,
+          "repeat": 2,
+          "wall_s": 24.35131025314331,
+          "requests": 128,
+          "requests_per_s": 5.256390669306081,
+          "customers": {
+            "customer-a": {
+              "requests": 64,
+              "quality_accuracy": 0.625,
+              "latency_s": {
+                "p50": 0.1899251937866211,
+                "p95": 0.19164633750915527,
+                "p99": 0.19279050827026367
+              },
+              "ttft_s": {
+                "p50": 0.13590574264526367,
+                "p95": 0.13714146614074707,
+                "p99": 0.13794946670532227
+              },
+              "including_admission_queue_s": {
+                "p50": 6.074506759643555,
+                "p95": 11.597962617874146,
+                "p99": 12.16983938217163
+              }
+            },
+            "customer-b": {
+              "requests": 64,
+              "quality_accuracy": 0.5625,
+              "latency_s": {
+                "p50": 0.19018125534057617,
+                "p95": 0.191925048828125,
+                "p99": 0.19260168075561523
+              },
+              "ttft_s": {
+                "p50": 0.13594985008239746,
+                "p95": 0.13724899291992188,
+                "p99": 0.13779616355895996
+              },
+              "including_admission_queue_s": {
+                "p50": 6.088627576828003,
+                "p95": 11.60357928276062,
+                "p99": 12.178703784942627
+              }
+            }
+          },
+          "max_observed_in_flight": 1,
+          "mixed_customer_overlap": false
+        },
+        {
+          "mode": "concurrent",
+          "concurrency": 1,
+          "repeat": 2,
+          "wall_s": 24.335880517959595,
+          "requests": 128,
+          "requests_per_s": 5.259723390963294,
+          "customers": {
+            "customer-a": {
+              "requests": 64,
+              "quality_accuracy": 0.625,
+              "latency_s": {
+                "p50": 0.19011783599853516,
+                "p95": 0.1915585994720459,
+                "p99": 0.19219493865966797
+              },
+              "ttft_s": {
+                "p50": 0.13603734970092773,
+                "p95": 0.1373889446258545,
+                "p99": 0.1382904052734375
+              },
+              "including_admission_queue_s": {
+                "p50": 11.987563371658325,
+                "p95": 23.005181789398193,
+                "p99": 24.14481282234192
+              }
+            },
+            "customer-b": {
+              "requests": 64,
+              "quality_accuracy": 0.5625,
+              "latency_s": {
+                "p50": 0.18998360633850098,
+                "p95": 0.19118881225585938,
+                "p99": 0.19138836860656738
+              },
+              "ttft_s": {
+                "p50": 0.13590621948242188,
+                "p95": 0.13696551322937012,
+                "p99": 0.13714957237243652
+              },
+              "including_admission_queue_s": {
+                "p50": 12.177454471588135,
+                "p95": 23.19560170173645,
+                "p99": 24.334246397018433
+              }
+            }
+          },
+          "max_observed_in_flight": 1,
+          "mixed_customer_overlap": false
+        },
+        {
+          "mode": "isolated",
+          "concurrency": 8,
+          "repeat": 0,
+          "wall_s": 4.437937021255493,
+          "requests": 128,
+          "requests_per_s": 28.842229934076165,
+          "customers": {
+            "customer-a": {
+              "requests": 64,
+              "quality_accuracy": 0.609375,
+              "latency_s": {
+                "p50": 0.2752866744995117,
+                "p95": 0.2778337001800537,
+                "p99": 0.2790687084197998
+              },
+              "ttft_s": {
+                "p50": 0.218170166015625,
+                "p95": 0.2204735279083252,
+                "p99": 0.22186541557312012
+              },
+              "including_admission_queue_s": {
+                "p50": 1.1062054634094238,
+                "p95": 2.2110490798950195,
+                "p99": 2.211076498031616
+              }
+            },
+            "customer-b": {
+              "requests": 64,
+              "quality_accuracy": 0.5625,
+              "latency_s": {
+                "p50": 0.27547502517700195,
+                "p95": 0.2779865264892578,
+                "p99": 0.27930212020874023
+              },
+              "ttft_s": {
+                "p50": 0.2182309627532959,
+                "p95": 0.22060561180114746,
+                "p99": 0.22134757041931152
+              },
+              "including_admission_queue_s": {
+                "p50": 1.1067607402801514,
+                "p95": 2.2137670516967773,
+                "p99": 2.213789463043213
+              }
+            }
+          },
+          "max_observed_in_flight": 8,
+          "mixed_customer_overlap": false
+        },
+        {
+          "mode": "concurrent",
+          "concurrency": 8,
+          "repeat": 0,
+          "wall_s": 4.54703950881958,
+          "requests": 128,
+          "requests_per_s": 28.15018425763119,
+          "customers": {
+            "customer-a": {
+              "requests": 64,
+              "quality_accuracy": 0.609375,
+              "latency_s": {
+                "p50": 0.2827894687652588,
+                "p95": 0.28632235527038574,
+                "p99": 0.2869703769683838
+              },
+              "ttft_s": {
+                "p50": 0.2252793312072754,
+                "p95": 0.22883200645446777,
+                "p99": 0.23000764846801758
+              },
+              "including_admission_queue_s": {
+                "p50": 2.276606321334839,
+                "p95": 4.483914613723755,
+                "p99": 4.540522336959839
+              }
+            },
+            "customer-b": {
+              "requests": 64,
+              "quality_accuracy": 0.5625,
+              "latency_s": {
+                "p50": 0.28223705291748047,
+                "p95": 0.2861349582672119,
+                "p99": 0.2869741916656494
+              },
+              "ttft_s": {
+                "p50": 0.22489070892333984,
+                "p95": 0.2289440631866455,
+                "p99": 0.22951436042785645
+              },
+              "including_admission_queue_s": {
+                "p50": 2.276613473892212,
+                "p95": 4.540467739105225,
+                "p99": 4.540529489517212
+              }
+            }
+          },
+          "max_observed_in_flight": 8,
+          "mixed_customer_overlap": true
+        },
+        {
+          "mode": "concurrent",
+          "concurrency": 8,
+          "repeat": 1,
+          "wall_s": 4.437946557998657,
+          "requests": 128,
+          "requests_per_s": 28.842167954749563,
+          "customers": {
+            "customer-a": {
+              "requests": 64,
+              "quality_accuracy": 0.625,
+              "latency_s": {
+                "p50": 0.27571582794189453,
+                "p95": 0.2781076431274414,
+                "p99": 0.2789459228515625
+              },
+              "ttft_s": {
+                "p50": 0.2185966968536377,
+                "p95": 0.22044634819030762,
+                "p99": 0.22134733200073242
+              },
+              "including_admission_queue_s": {
+                "p50": 2.216005325317383,
+                "p95": 4.375725269317627,
+                "p99": 4.431576251983643
+              }
+            },
+            "customer-b": {
+              "requests": 64,
+              "quality_accuracy": 0.5625,
+              "latency_s": {
+                "p50": 0.275193452835083,
+                "p95": 0.27820563316345215,
+                "p99": 0.27934694290161133
+              },
+              "ttft_s": {
+                "p50": 0.21791577339172363,
+                "p95": 0.22060394287109375,
+                "p99": 0.22132420539855957
+              },
+              "including_admission_queue_s": {
+                "p50": 2.2160146236419678,
+                "p95": 4.431518793106079,
+                "p99": 4.431583642959595
+              }
+            }
+          },
+          "max_observed_in_flight": 8,
+          "mixed_customer_overlap": true
+        },
+        {
+          "mode": "isolated",
+          "concurrency": 8,
+          "repeat": 1,
+          "wall_s": 4.433940410614014,
+          "requests": 128,
+          "requests_per_s": 28.868227388350153,
+          "customers": {
+            "customer-a": {
+              "requests": 64,
+              "quality_accuracy": 0.625,
+              "latency_s": {
+                "p50": 0.2748897075653076,
+                "p95": 0.27736639976501465,
+                "p99": 0.277956485748291
+              },
+              "ttft_s": {
+                "p50": 0.21748876571655273,
+                "p95": 0.21991944313049316,
+                "p99": 0.22066044807434082
+              },
+              "including_admission_queue_s": {
+                "p50": 1.1031558513641357,
+                "p95": 2.2074527740478516,
+                "p99": 2.2074780464172363
+              }
+            },
+            "customer-b": {
+              "requests": 64,
+              "quality_accuracy": 0.5625,
+              "latency_s": {
+                "p50": 0.2755916118621826,
+                "p95": 0.2778315544128418,
+                "p99": 0.2791900634765625
+              },
+              "ttft_s": {
+                "p50": 0.21837759017944336,
+                "p95": 0.22089934349060059,
+                "p99": 0.22194433212280273
+              },
+              "including_admission_queue_s": {
+                "p50": 1.1053783893585205,
+                "p95": 2.2136518955230713,
+                "p99": 2.213674545288086
+              }
+            }
+          },
+          "max_observed_in_flight": 8,
+          "mixed_customer_overlap": false
+        },
+        {
+          "mode": "isolated",
+          "concurrency": 8,
+          "repeat": 2,
+          "wall_s": 4.435606956481934,
+          "requests": 128,
+          "requests_per_s": 28.857381020414437,
+          "customers": {
+            "customer-a": {
+              "requests": 64,
+              "quality_accuracy": 0.609375,
+              "latency_s": {
+                "p50": 0.27518343925476074,
+                "p95": 0.2782309055328369,
+                "p99": 0.2796478271484375
+              },
+              "ttft_s": {
+                "p50": 0.21815872192382812,
+                "p95": 0.22051072120666504,
+                "p99": 0.2218766212463379
+              },
+              "including_admission_queue_s": {
+                "p50": 1.1019272804260254,
+                "p95": 2.21081280708313,
+                "p99": 2.2108356952667236
+              }
+            },
+            "customer-b": {
+              "requests": 64,
+              "quality_accuracy": 0.546875,
+              "latency_s": {
+                "p50": 0.27535486221313477,
+                "p95": 0.27835941314697266,
+                "p99": 0.2796449661254883
+              },
+              "ttft_s": {
+                "p50": 0.21836185455322266,
+                "p95": 0.22104573249816895,
+                "p99": 0.2215261459350586
+              },
+              "including_admission_queue_s": {
+                "p50": 1.10276460647583,
+                "p95": 2.211851119995117,
+                "p99": 2.2118759155273438
+              }
+            }
+          },
+          "max_observed_in_flight": 8,
+          "mixed_customer_overlap": false
+        },
+        {
+          "mode": "concurrent",
+          "concurrency": 8,
+          "repeat": 2,
+          "wall_s": 4.437255620956421,
+          "requests": 128,
+          "requests_per_s": 28.84665904652355,
+          "customers": {
+            "customer-a": {
+              "requests": 64,
+              "quality_accuracy": 0.609375,
+              "latency_s": {
+                "p50": 0.27558159828186035,
+                "p95": 0.2782561779022217,
+                "p99": 0.27955102920532227
+              },
+              "ttft_s": {
+                "p50": 0.21820783615112305,
+                "p95": 0.22043490409851074,
+                "p99": 0.22114944458007812
+              },
+              "including_admission_queue_s": {
+                "p50": 2.2132742404937744,
+                "p95": 4.373982667922974,
+                "p99": 4.430955648422241
+              }
+            },
+            "customer-b": {
+              "requests": 64,
+              "quality_accuracy": 0.5625,
+              "latency_s": {
+                "p50": 0.2751328945159912,
+                "p95": 0.2777371406555176,
+                "p99": 0.27883100509643555
+              },
+              "ttft_s": {
+                "p50": 0.21778512001037598,
+                "p95": 0.22075510025024414,
+                "p99": 0.22124052047729492
+              },
+              "including_admission_queue_s": {
+                "p50": 2.2132809162139893,
+                "p95": 4.430901050567627,
+                "p99": 4.430961608886719
+              }
+            }
+          },
+          "max_observed_in_flight": 8,
+          "mixed_customer_overlap": true
+        },
+        {
+          "mode": "isolated",
+          "concurrency": 16,
+          "repeat": 0,
+          "wall_s": 3.3227603435516357,
+          "requests": 128,
+          "requests_per_s": 38.52218841133249,
+          "customers": {
+            "customer-a": {
+              "requests": 64,
+              "quality_accuracy": 0.609375,
+              "latency_s": {
+                "p50": 0.28569984436035156,
+                "p95": 1.3296122550964355,
+                "p99": 1.331620693206787
+              },
+              "ttft_s": {
+                "p50": 0.22813129425048828,
+                "p95": 1.264946460723877,
+                "p99": 1.2670059204101562
+              },
+              "including_admission_queue_s": {
+                "p50": 1.6101315021514893,
+                "p95": 2.186568260192871,
+                "p99": 2.1865968704223633
+              }
+            },
+            "customer-b": {
+              "requests": 64,
+              "quality_accuracy": 0.5625,
+              "latency_s": {
+                "p50": 0.276233434677124,
+                "p95": 0.28130078315734863,
+                "p99": 0.28220510482788086
+              },
+              "ttft_s": {
+                "p50": 0.21990108489990234,
+                "p95": 0.2247171401977539,
+                "p99": 0.22561192512512207
+              },
+              "including_admission_queue_s": {
+                "p50": 0.5521290302276611,
+                "p95": 1.1125426292419434,
+                "p99": 1.1125633716583252
+              }
+            }
+          },
+          "max_observed_in_flight": 16,
+          "mixed_customer_overlap": false
+        },
+        {
+          "mode": "concurrent",
+          "concurrency": 16,
+          "repeat": 0,
+          "wall_s": 2.298248052597046,
+          "requests": 128,
+          "requests_per_s": 55.694597393592296,
+          "customers": {
+            "customer-a": {
+              "requests": 64,
+              "quality_accuracy": 0.609375,
+              "latency_s": {
+                "p50": 0.2832179069519043,
+                "p95": 0.28977179527282715,
+                "p99": 0.29082727432250977
+              },
+              "ttft_s": {
+                "p50": 0.22571182250976562,
+                "p95": 0.23138642311096191,
+                "p99": 0.23245739936828613
+              },
+              "including_admission_queue_s": {
+                "p50": 1.1407630443572998,
+                "p95": 2.285682439804077,
+                "p99": 2.285736083984375
+              }
+            },
+            "customer-b": {
+              "requests": 64,
+              "quality_accuracy": 0.5625,
+              "latency_s": {
+                "p50": 0.2827279567718506,
+                "p95": 0.2895801067352295,
+                "p99": 0.29165077209472656
+              },
+              "ttft_s": {
+                "p50": 0.22544646263122559,
+                "p95": 0.23160147666931152,
+                "p99": 0.23329925537109375
+              },
+              "including_admission_queue_s": {
+                "p50": 1.1407699584960938,
+                "p95": 2.2856907844543457,
+                "p99": 2.2857441902160645
+              }
+            }
+          },
+          "max_observed_in_flight": 16,
+          "mixed_customer_overlap": true
+        },
+        {
+          "mode": "concurrent",
+          "concurrency": 16,
+          "repeat": 1,
+          "wall_s": 2.2593159675598145,
+          "requests": 128,
+          "requests_per_s": 56.65431565919797,
+          "customers": {
+            "customer-a": {
+              "requests": 64,
+              "quality_accuracy": 0.609375,
+              "latency_s": {
+                "p50": 0.27800774574279785,
+                "p95": 0.2832956314086914,
+                "p99": 0.28479671478271484
+              },
+              "ttft_s": {
+                "p50": 0.2211437225341797,
+                "p95": 0.22520899772644043,
+                "p99": 0.22737789154052734
+              },
+              "including_admission_queue_s": {
+                "p50": 1.1224613189697266,
+                "p95": 2.2469606399536133,
+                "p99": 2.246997356414795
+              }
+            },
+            "customer-b": {
+              "requests": 64,
+              "quality_accuracy": 0.5625,
+              "latency_s": {
+                "p50": 0.2777862548828125,
+                "p95": 0.28293681144714355,
+                "p99": 0.28551721572875977
+              },
+              "ttft_s": {
+                "p50": 0.22064828872680664,
+                "p95": 0.22582483291625977,
+                "p99": 0.22812938690185547
+              },
+              "including_admission_queue_s": {
+                "p50": 1.1224677562713623,
+                "p95": 2.246966600418091,
+                "p99": 2.2470030784606934
+              }
+            }
+          },
+          "max_observed_in_flight": 16,
+          "mixed_customer_overlap": true
+        },
+        {
+          "mode": "isolated",
+          "concurrency": 16,
+          "repeat": 1,
+          "wall_s": 2.2535250186920166,
+          "requests": 128,
+          "requests_per_s": 56.799901904037135,
+          "customers": {
+            "customer-a": {
+              "requests": 64,
+              "quality_accuracy": 0.625,
+              "latency_s": {
+                "p50": 0.27692198753356934,
+                "p95": 0.28143858909606934,
+                "p99": 0.28229808807373047
+              },
+              "ttft_s": {
+                "p50": 0.2193903923034668,
+                "p95": 0.22417998313903809,
+                "p99": 0.22531580924987793
+              },
+              "including_admission_queue_s": {
+                "p50": 0.552823543548584,
+                "p95": 1.1146628856658936,
+                "p99": 1.1146831512451172
+              }
+            },
+            "customer-b": {
+              "requests": 64,
+              "quality_accuracy": 0.5625,
+              "latency_s": {
+                "p50": 0.27726268768310547,
+                "p95": 0.28165698051452637,
+                "p99": 0.2823526859283447
+              },
+              "ttft_s": {
+                "p50": 0.2197556495666504,
+                "p95": 0.22405099868774414,
+                "p99": 0.22487258911132812
+              },
+              "including_admission_queue_s": {
+                "p50": 0.552548885345459,
+                "p95": 1.115926742553711,
+                "p99": 1.1159477233886719
+              }
+            }
+          },
+          "max_observed_in_flight": 16,
+          "mixed_customer_overlap": false
+        },
+        {
+          "mode": "isolated",
+          "concurrency": 16,
+          "repeat": 2,
+          "wall_s": 2.252676248550415,
+          "requests": 128,
+          "requests_per_s": 56.82130314214806,
+          "customers": {
+            "customer-a": {
+              "requests": 64,
+              "quality_accuracy": 0.625,
+              "latency_s": {
+                "p50": 0.27666378021240234,
+                "p95": 0.2812843322753906,
+                "p99": 0.28303980827331543
+              },
+              "ttft_s": {
+                "p50": 0.2196638584136963,
+                "p95": 0.22411370277404785,
+                "p99": 0.22601914405822754
+              },
+              "including_admission_queue_s": {
+                "p50": 0.5540311336517334,
+                "p95": 1.1144590377807617,
+                "p99": 1.1144800186157227
+              }
+            },
+            "customer-b": {
+              "requests": 64,
+              "quality_accuracy": 0.5625,
+              "latency_s": {
+                "p50": 0.2769789695739746,
+                "p95": 0.28115200996398926,
+                "p99": 0.28246593475341797
+              },
+              "ttft_s": {
+                "p50": 0.2196202278137207,
+                "p95": 0.22406530380249023,
+                "p99": 0.22542643547058105
+              },
+              "including_admission_queue_s": {
+                "p50": 0.5534753799438477,
+                "p95": 1.1150848865509033,
+                "p99": 1.1151041984558105
+              }
+            }
+          },
+          "max_observed_in_flight": 16,
+          "mixed_customer_overlap": false
+        },
+        {
+          "mode": "concurrent",
+          "concurrency": 16,
+          "repeat": 2,
+          "wall_s": 2.2531561851501465,
+          "requests": 128,
+          "requests_per_s": 56.80919984313928,
+          "customers": {
+            "customer-a": {
+              "requests": 64,
+              "quality_accuracy": 0.609375,
+              "latency_s": {
+                "p50": 0.27784204483032227,
+                "p95": 0.28217339515686035,
+                "p99": 0.2839243412017822
+              },
+              "ttft_s": {
+                "p50": 0.21999096870422363,
+                "p95": 0.22420835494995117,
+                "p99": 0.2269291877746582
+              },
+              "including_admission_queue_s": {
+                "p50": 1.1177198886871338,
+                "p95": 2.241115093231201,
+                "p99": 2.2411532402038574
+              }
+            },
+            "customer-b": {
+              "requests": 64,
+              "quality_accuracy": 0.5625,
+              "latency_s": {
+                "p50": 0.27707481384277344,
+                "p95": 0.2819490432739258,
+                "p99": 0.2846500873565674
+              },
+              "ttft_s": {
+                "p50": 0.21949982643127441,
+                "p95": 0.2248067855834961,
+                "p99": 0.22768568992614746
+              },
+              "including_admission_queue_s": {
+                "p50": 1.1177268028259277,
+                "p95": 2.241121530532837,
+                "p99": 2.2411587238311768
+              }
+            }
+          },
+          "max_observed_in_flight": 16,
+          "mixed_customer_overlap": true
+        }
+      ],
+      "long_agents": {
+        "planned_episodes": 16,
+        "missing_episodes": 0,
+        "episodes": 16,
+        "successful": 0,
+        "valid_protocol": 16,
+        "total_turns": 528,
+        "episode_latency_s": {
+          "p50": 19.870787620544434,
+          "p95": 20.879358768463135,
+          "p99": 20.879358768463135
+        },
+        "environment_reward_s": 0.01123499870300293,
+        "target_success_fraction": 0.8,
+        "target_reached": false,
+        "completed_episode_success_fraction": 0.0
+      }
+    }
+  },
+  "observer_startup": {
+    "h100": {
+      "engine_startup_s": 503.6196930408478,
+      "model_download_s": 75.54125571250916,
+      "baseline_accuracy": 0.5234375,
+      "versions": {
+        "torch": "2.10.0+cu128",
+        "vllm": "0.19.1",
+        "transformers": "5.12.1",
+        "peft": "0.20.0",
+        "huggingface_hub": "1.28.0"
+      },
+      "engine_configuration": {
+        "model": "/__modal/volumes/vo-SpuEys5xXfEPJ2QtUFsY0s/hf-cache/hub/models--Qwen--Qwen3.5-9B/snapshots/c202236235762e1c871ad0ccb60c8ee5ba337b9a",
+        "enable_return_routed_experts": false,
+        "model_weights": "",
+        "served_model_name": null,
+        "tokenizer": "/__modal/volumes/vo-SpuEys5xXfEPJ2QtUFsY0s/hf-cache/hub/models--Qwen--Qwen3.5-9B/snapshots/c202236235762e1c871ad0ccb60c8ee5ba337b9a",
+        "hf_config_path": null,
+        "runner": "auto",
+        "convert": "auto",
+        "skip_tokenizer_init": false,
+        "enable_prompt_embeds": false,
+        "tokenizer_mode": "auto",
+        "trust_remote_code": true,
+        "allowed_local_media_path": "",
+        "allowed_media_domains": null,
+        "download_dir": null,
+        "safetensors_load_strategy": null,
+        "load_format": "auto",
+        "config_format": "auto",
+        "dtype": "bfloat16",
+        "kv_cache_dtype": "auto",
+        "seed": 17,
+        "max_model_len": 8192,
+        "cudagraph_capture_sizes": null,
+        "max_cudagraph_capture_size": null,
+        "distributed_executor_backend": null,
+        "pipeline_parallel_size": 1,
+        "master_addr": "127.0.0.1",
+        "master_port": 29501,
+        "nnodes": 1,
+        "node_rank": 0,
+        "distributed_timeout_seconds": null,
+        "tensor_parallel_size": 1,
+        "prefill_context_parallel_size": 1,
+        "decode_context_parallel_size": 1,
+        "dcp_comm_backend": "ag_rs",
+        "dcp_kv_cache_interleave_size": 1,
+        "cp_kv_cache_interleave_size": 1,
+        "data_parallel_size": 1,
+        "data_parallel_rank": null,
+        "data_parallel_start_rank": null,
+        "data_parallel_size_local": null,
+        "data_parallel_address": null,
+        "data_parallel_rpc_port": null,
+        "data_parallel_hybrid_lb": false,
+        "data_parallel_external_lb": false,
+        "data_parallel_backend": "mp",
+        "enable_expert_parallel": false,
+        "enable_ep_weight_filter": false,
+        "moe_backend": "auto",
+        "all2all_backend": "allgather_reducescatter",
+        "enable_elastic_ep": false,
+        "enable_dbo": false,
+        "ubatch_size": 0,
+        "dbo_decode_token_threshold": 32,
+        "dbo_prefill_token_threshold": 512,
+        "disable_nccl_for_dp_synchronization": null,
+        "eplb_config": "EPLBConfig(window_size=1000, step_interval=3000, num_redundant_experts=0, log_balancedness=False, log_balancedness_interval=1, use_async=False, policy='default')",
+        "enable_eplb": false,
+        "expert_placement_strategy": "linear",
+        "_api_process_count": 1,
+        "_api_process_rank": 0,
+        "max_parallel_loading_workers": null,
+        "block_size": null,
+        "enable_prefix_caching": false,
+        "prefix_caching_hash_algo": "sha256",
+        "disable_sliding_window": false,
+        "disable_cascade_attn": true,
+        "offload_backend": "auto",
+        "cpu_offload_gb": 0,
+        "cpu_offload_params": "set()",
+        "offload_group_size": 0,
+        "offload_num_in_group": 1,
+        "offload_prefetch_step": 1,
+        "offload_params": "set()",
+        "gpu_memory_utilization": 0.8,
+        "kv_cache_memory_bytes": null,
+        "max_num_batched_tokens": 8192,
+        "max_num_partial_prefills": 1,
+        "max_long_partial_prefills": 1,
+        "long_prefill_token_threshold": 0,
+        "max_num_seqs": 16,
+        "max_logprobs": 20,
+        "logprobs_mode": "raw_logprobs",
+        "disable_log_stats": false,
+        "aggregate_engine_logging": false,
+        "revision": null,
+        "code_revision": null,
+        "hf_token": null,
+        "hf_overrides": {},
+        "tokenizer_revision": null,
+        "quantization": null,
+        "allow_deprecated_quantization": false,
+        "enforce_eager": true,
+        "disable_custom_all_reduce": false,
+        "language_model_only": false,
+        "limit_mm_per_prompt": {
+          "image": 0,
+          "video": 0
+        },
+        "enable_mm_embeds": false,
+        "interleave_mm_strings": false,
+        "media_io_kwargs": {},
+        "mm_processor_kwargs": null,
+        "mm_processor_cache_gb": 4,
+        "mm_processor_cache_type": "lru",
+        "mm_shm_cache_max_object_size_mb": 128,
+        "mm_encoder_only": false,
+        "mm_encoder_tp_mode": "weights",
+        "mm_encoder_attn_backend": null,
+        "io_processor_plugin": null,
+        "renderer_num_workers": 1,
+        "skip_mm_profiling": false,
+        "video_pruning_rate": null,
+        "mm_tensor_ipc": "direct_rpc",
+        "enable_lora": true,
+        "max_loras": 2,
+        "max_lora_rank": 8,
+        "default_mm_loras": null,
+        "fully_sharded_loras": false,
+        "max_cpu_loras": 24,
+        "lora_dtype": "auto",
+        "lora_target_modules": null,
+        "enable_tower_connector_lora": false,
+        "specialize_active_lora": false,
+        "ray_workers_use_nsight": false,
+        "num_gpu_blocks_override": null,
+        "model_loader_extra_config": {},
+        "ignore_patterns": [
+          "original/**/*"
+        ],
+        "enable_chunked_prefill": true,
+        "disable_chunked_mm_input": false,
+        "scheduler_reserve_full_isl": true,
+        "disable_hybrid_kv_cache_manager": null,
+        "structured_outputs_config": "StructuredOutputsConfig(backend='auto', disable_any_whitespace=False, disable_additional_properties=False, reasoning_parser='', reasoning_parser_plugin='', enable_in_reasoning=False)",
+        "reasoning_parser": "",
+        "reasoning_parser_plugin": null,
+        "speculative_config": null,
+        "show_hidden_metrics_for_version": null,
+        "otlp_traces_endpoint": null,
+        "collect_detailed_traces": null,
+        "kv_cache_metrics": false,
+        "kv_cache_metrics_sample": 0.01,
+        "cudagraph_metrics": false,
+        "enable_layerwise_nvtx_tracing": false,
+        "enable_mfu_metrics": false,
+        "enable_logging_iteration_details": false,
+        "enable_mm_processor_stats": false,
+        "scheduling_policy": "fcfs",
+        "scheduler_cls": null,
+        "pooler_config": null,
+        "compilation_config": "{'mode': None, 'debug_dump_path': None, 'cache_dir': '', 'compile_cache_save_format': 'binary', 'backend': 'inductor', 'custom_ops': [], 'splitting_ops': None, 'compile_mm_encoder': False, 'cudagraph_mm_encoder': False, 'encoder_cudagraph_token_budgets': [], 'encoder_cudagraph_max_images_per_batch': 0, 'compile_sizes': None, 'compile_ranges_endpoints': None, 'inductor_compile_config': {'enable_auto_functionalized_v2': False, 'size_asserts': False, 'alignment_asserts': False, 'scalar_asserts': False, 'combo_kernels': True, 'benchmark_combo_kernel': True}, 'inductor_passes': {}, 'cudagraph_mode': None, 'cudagraph_num_of_warmups': 0, 'cudagraph_capture_sizes': None, 'cudagraph_copy_inputs': False, 'cudagraph_specialize_lora': True, 'use_inductor_graph_partition': None, 'pass_config': {}, 'max_cudagraph_capture_size': None, 'dynamic_shapes_config': {'type': <DynamicShapesType.BACKED: 'backed'>, 'evaluate_guards': False, 'assume_32_bit_indexing': False}, 'local_cache_dir': None, 'fast_moe_cold_start': None, 'static_all_moe_layers': []}",
+        "attention_config": "AttentionConfig(backend=None, flash_attn_version=None, use_prefill_decode_attention=False, flash_attn_max_num_splits_for_cuda_graph=32, use_cudnn_prefill=False, use_trtllm_ragged_deepseek_prefill=False, use_trtllm_attention=None, disable_flashinfer_prefill=True, disable_flashinfer_q_quantization=False, use_prefill_query_quantization=False)",
+        "kernel_config": "KernelConfig(enable_flashinfer_autotune=None, moe_backend='auto')",
+        "enable_flashinfer_autotune": null,
+        "worker_cls": "auto",
+        "worker_extension_cls": "",
+        "profiler_config": "ProfilerConfig(profiler=None, torch_profiler_dir='', torch_profiler_with_stack=True, torch_profiler_with_flops=False, torch_profiler_use_gzip=True, torch_profiler_dump_cuda_time_total=True, torch_profiler_record_shapes=False, torch_profiler_with_memory=False, ignore_frontend=False, delay_iterations=0, max_iterations=0, warmup_iterations=0, active_iterations=5, wait_iterations=0)",
+        "kv_transfer_config": null,
+        "kv_events_config": null,
+        "ec_transfer_config": null,
+        "reasoning_config": null,
+        "generation_config": "auto",
+        "enable_sleep_mode": false,
+        "override_generation_config": {},
+        "model_impl": "auto",
+        "override_attention_dtype": null,
+        "attention_backend": null,
+        "calculate_kv_scales": false,
+        "kv_cache_dtype_skip_layers": [],
+        "mamba_cache_dtype": "auto",
+        "mamba_ssm_cache_dtype": "auto",
+        "mamba_block_size": null,
+        "mamba_cache_mode": "none",
+        "additional_config": {},
+        "use_tqdm_on_load": true,
+        "pt_load_map_location": "cpu",
+        "logits_processors": null,
+        "async_scheduling": null,
+        "stream_interval": 1,
+        "kv_sharing_fast_prefill": false,
+        "optimization_level": 2,
+        "performance_mode": "balanced",
+        "kv_offloading_size": null,
+        "kv_offloading_backend": "native",
+        "tokens_only": false,
+        "shutdown_timeout": 0,
+        "weight_transfer_config": null,
+        "fail_on_environ_validation": false,
+        "gdn_prefill_backend": null,
+        "enable_log_requests": false
+      }
+    },
+    "b200": {
+      "engine_startup_s": 122.80433225631714,
+      "model_download_s": 82.57620811462402,
+      "baseline_accuracy": 0.5078125,
+      "versions": {
+        "torch": "2.10.0+cu128",
+        "vllm": "0.19.1",
+        "transformers": "5.12.1",
+        "peft": "0.20.0",
+        "huggingface_hub": "1.28.0"
+      },
+      "engine_configuration": {
+        "model": "/__modal/volumes/vo-T16isCaUNHwUcAZ3Cp1xLP/hf-cache/hub/models--Qwen--Qwen3.5-9B/snapshots/c202236235762e1c871ad0ccb60c8ee5ba337b9a",
+        "enable_return_routed_experts": false,
+        "model_weights": "",
+        "served_model_name": null,
+        "tokenizer": "/__modal/volumes/vo-T16isCaUNHwUcAZ3Cp1xLP/hf-cache/hub/models--Qwen--Qwen3.5-9B/snapshots/c202236235762e1c871ad0ccb60c8ee5ba337b9a",
+        "hf_config_path": null,
+        "runner": "auto",
+        "convert": "auto",
+        "skip_tokenizer_init": false,
+        "enable_prompt_embeds": false,
+        "tokenizer_mode": "auto",
+        "trust_remote_code": true,
+        "allowed_local_media_path": "",
+        "allowed_media_domains": null,
+        "download_dir": null,
+        "safetensors_load_strategy": null,
+        "load_format": "auto",
+        "config_format": "auto",
+        "dtype": "bfloat16",
+        "kv_cache_dtype": "auto",
+        "seed": 17,
+        "max_model_len": 8192,
+        "cudagraph_capture_sizes": null,
+        "max_cudagraph_capture_size": null,
+        "distributed_executor_backend": null,
+        "pipeline_parallel_size": 1,
+        "master_addr": "127.0.0.1",
+        "master_port": 29501,
+        "nnodes": 1,
+        "node_rank": 0,
+        "distributed_timeout_seconds": null,
+        "tensor_parallel_size": 1,
+        "prefill_context_parallel_size": 1,
+        "decode_context_parallel_size": 1,
+        "dcp_comm_backend": "ag_rs",
+        "dcp_kv_cache_interleave_size": 1,
+        "cp_kv_cache_interleave_size": 1,
+        "data_parallel_size": 1,
+        "data_parallel_rank": null,
+        "data_parallel_start_rank": null,
+        "data_parallel_size_local": null,
+        "data_parallel_address": null,
+        "data_parallel_rpc_port": null,
+        "data_parallel_hybrid_lb": false,
+        "data_parallel_external_lb": false,
+        "data_parallel_backend": "mp",
+        "enable_expert_parallel": false,
+        "enable_ep_weight_filter": false,
+        "moe_backend": "auto",
+        "all2all_backend": "allgather_reducescatter",
+        "enable_elastic_ep": false,
+        "enable_dbo": false,
+        "ubatch_size": 0,
+        "dbo_decode_token_threshold": 32,
+        "dbo_prefill_token_threshold": 512,
+        "disable_nccl_for_dp_synchronization": null,
+        "eplb_config": "EPLBConfig(window_size=1000, step_interval=3000, num_redundant_experts=0, log_balancedness=False, log_balancedness_interval=1, use_async=False, policy='default')",
+        "enable_eplb": false,
+        "expert_placement_strategy": "linear",
+        "_api_process_count": 1,
+        "_api_process_rank": 0,
+        "max_parallel_loading_workers": null,
+        "block_size": null,
+        "enable_prefix_caching": false,
+        "prefix_caching_hash_algo": "sha256",
+        "disable_sliding_window": false,
+        "disable_cascade_attn": true,
+        "offload_backend": "auto",
+        "cpu_offload_gb": 0,
+        "cpu_offload_params": "set()",
+        "offload_group_size": 0,
+        "offload_num_in_group": 1,
+        "offload_prefetch_step": 1,
+        "offload_params": "set()",
+        "gpu_memory_utilization": 0.8,
+        "kv_cache_memory_bytes": null,
+        "max_num_batched_tokens": 8192,
+        "max_num_partial_prefills": 1,
+        "max_long_partial_prefills": 1,
+        "long_prefill_token_threshold": 0,
+        "max_num_seqs": 16,
+        "max_logprobs": 20,
+        "logprobs_mode": "raw_logprobs",
+        "disable_log_stats": false,
+        "aggregate_engine_logging": false,
+        "revision": null,
+        "code_revision": null,
+        "hf_token": null,
+        "hf_overrides": {},
+        "tokenizer_revision": null,
+        "quantization": null,
+        "allow_deprecated_quantization": false,
+        "enforce_eager": true,
+        "disable_custom_all_reduce": false,
+        "language_model_only": false,
+        "limit_mm_per_prompt": {
+          "image": 0,
+          "video": 0
+        },
+        "enable_mm_embeds": false,
+        "interleave_mm_strings": false,
+        "media_io_kwargs": {},
+        "mm_processor_kwargs": null,
+        "mm_processor_cache_gb": 4,
+        "mm_processor_cache_type": "lru",
+        "mm_shm_cache_max_object_size_mb": 128,
+        "mm_encoder_only": false,
+        "mm_encoder_tp_mode": "weights",
+        "mm_encoder_attn_backend": null,
+        "io_processor_plugin": null,
+        "renderer_num_workers": 1,
+        "skip_mm_profiling": false,
+        "video_pruning_rate": null,
+        "mm_tensor_ipc": "direct_rpc",
+        "enable_lora": true,
+        "max_loras": 2,
+        "max_lora_rank": 8,
+        "default_mm_loras": null,
+        "fully_sharded_loras": false,
+        "max_cpu_loras": 24,
+        "lora_dtype": "auto",
+        "lora_target_modules": null,
+        "enable_tower_connector_lora": false,
+        "specialize_active_lora": false,
+        "ray_workers_use_nsight": false,
+        "num_gpu_blocks_override": null,
+        "model_loader_extra_config": {},
+        "ignore_patterns": [
+          "original/**/*"
+        ],
+        "enable_chunked_prefill": true,
+        "disable_chunked_mm_input": false,
+        "scheduler_reserve_full_isl": true,
+        "disable_hybrid_kv_cache_manager": null,
+        "structured_outputs_config": "StructuredOutputsConfig(backend='auto', disable_any_whitespace=False, disable_additional_properties=False, reasoning_parser='', reasoning_parser_plugin='', enable_in_reasoning=False)",
+        "reasoning_parser": "",
+        "reasoning_parser_plugin": null,
+        "speculative_config": null,
+        "show_hidden_metrics_for_version": null,
+        "otlp_traces_endpoint": null,
+        "collect_detailed_traces": null,
+        "kv_cache_metrics": false,
+        "kv_cache_metrics_sample": 0.01,
+        "cudagraph_metrics": false,
+        "enable_layerwise_nvtx_tracing": false,
+        "enable_mfu_metrics": false,
+        "enable_logging_iteration_details": false,
+        "enable_mm_processor_stats": false,
+        "scheduling_policy": "fcfs",
+        "scheduler_cls": null,
+        "pooler_config": null,
+        "compilation_config": "{'mode': None, 'debug_dump_path': None, 'cache_dir': '', 'compile_cache_save_format': 'binary', 'backend': 'inductor', 'custom_ops': [], 'splitting_ops': None, 'compile_mm_encoder': False, 'cudagraph_mm_encoder': False, 'encoder_cudagraph_token_budgets': [], 'encoder_cudagraph_max_images_per_batch': 0, 'compile_sizes': None, 'compile_ranges_endpoints': None, 'inductor_compile_config': {'enable_auto_functionalized_v2': False, 'size_asserts': False, 'alignment_asserts': False, 'scalar_asserts': False, 'combo_kernels': True, 'benchmark_combo_kernel': True}, 'inductor_passes': {}, 'cudagraph_mode': None, 'cudagraph_num_of_warmups': 0, 'cudagraph_capture_sizes': None, 'cudagraph_copy_inputs': False, 'cudagraph_specialize_lora': True, 'use_inductor_graph_partition': None, 'pass_config': {}, 'max_cudagraph_capture_size': None, 'dynamic_shapes_config': {'type': <DynamicShapesType.BACKED: 'backed'>, 'evaluate_guards': False, 'assume_32_bit_indexing': False}, 'local_cache_dir': None, 'fast_moe_cold_start': None, 'static_all_moe_layers': []}",
+        "attention_config": "AttentionConfig(backend=None, flash_attn_version=None, use_prefill_decode_attention=False, flash_attn_max_num_splits_for_cuda_graph=32, use_cudnn_prefill=False, use_trtllm_ragged_deepseek_prefill=False, use_trtllm_attention=None, disable_flashinfer_prefill=True, disable_flashinfer_q_quantization=False, use_prefill_query_quantization=False)",
+        "kernel_config": "KernelConfig(enable_flashinfer_autotune=None, moe_backend='auto')",
+        "enable_flashinfer_autotune": null,
+        "worker_cls": "auto",
+        "worker_extension_cls": "",
+        "profiler_config": "ProfilerConfig(profiler=None, torch_profiler_dir='', torch_profiler_with_stack=True, torch_profiler_with_flops=False, torch_profiler_use_gzip=True, torch_profiler_dump_cuda_time_total=True, torch_profiler_record_shapes=False, torch_profiler_with_memory=False, ignore_frontend=False, delay_iterations=0, max_iterations=0, warmup_iterations=0, active_iterations=5, wait_iterations=0)",
+        "kv_transfer_config": null,
+        "kv_events_config": null,
+        "ec_transfer_config": null,
+        "reasoning_config": null,
+        "generation_config": "auto",
+        "enable_sleep_mode": false,
+        "override_generation_config": {},
+        "model_impl": "auto",
+        "override_attention_dtype": null,
+        "attention_backend": null,
+        "calculate_kv_scales": false,
+        "kv_cache_dtype_skip_layers": [],
+        "mamba_cache_dtype": "auto",
+        "mamba_ssm_cache_dtype": "auto",
+        "mamba_block_size": null,
+        "mamba_cache_mode": "none",
+        "additional_config": {},
+        "use_tqdm_on_load": true,
+        "pt_load_map_location": "cpu",
+        "logits_processors": null,
+        "async_scheduling": null,
+        "stream_interval": 1,
+        "kv_sharing_fast_prefill": false,
+        "optimization_level": 2,
+        "performance_mode": "balanced",
+        "kv_offloading_size": null,
+        "kv_offloading_backend": "native",
+        "tokens_only": false,
+        "shutdown_timeout": 0,
+        "weight_transfer_config": null,
+        "fail_on_environ_validation": false,
+        "gdn_prefill_backend": null,
+        "enable_log_requests": false
+      }
+    }
+  },
+  "recovery_observer_startup": {
+    "h100": {
+      "allocation_api_s": 872.3095591068268,
+      "engine_startup_s": 513.0143432617188,
+      "model_download_s": 0.690645694732666,
+      "baseline_accuracy": 0.5234375,
+      "versions": {
+        "torch": "2.10.0+cu128",
+        "vllm": "0.19.1",
+        "transformers": "5.12.1",
+        "peft": "0.20.0",
+        "huggingface_hub": "1.28.0"
+      },
+      "engine_configuration": {
+        "model": "/__modal/volumes/vo-SpuEys5xXfEPJ2QtUFsY0s/hf-cache/hub/models--Qwen--Qwen3.5-9B/snapshots/c202236235762e1c871ad0ccb60c8ee5ba337b9a",
+        "enable_return_routed_experts": false,
+        "model_weights": "",
+        "served_model_name": null,
+        "tokenizer": "/__modal/volumes/vo-SpuEys5xXfEPJ2QtUFsY0s/hf-cache/hub/models--Qwen--Qwen3.5-9B/snapshots/c202236235762e1c871ad0ccb60c8ee5ba337b9a",
+        "hf_config_path": null,
+        "runner": "auto",
+        "convert": "auto",
+        "skip_tokenizer_init": false,
+        "enable_prompt_embeds": false,
+        "tokenizer_mode": "auto",
+        "trust_remote_code": true,
+        "allowed_local_media_path": "",
+        "allowed_media_domains": null,
+        "download_dir": null,
+        "safetensors_load_strategy": null,
+        "load_format": "auto",
+        "config_format": "auto",
+        "dtype": "bfloat16",
+        "kv_cache_dtype": "auto",
+        "seed": 17,
+        "max_model_len": 8192,
+        "cudagraph_capture_sizes": null,
+        "max_cudagraph_capture_size": null,
+        "distributed_executor_backend": null,
+        "pipeline_parallel_size": 1,
+        "master_addr": "127.0.0.1",
+        "master_port": 29501,
+        "nnodes": 1,
+        "node_rank": 0,
+        "distributed_timeout_seconds": null,
+        "tensor_parallel_size": 1,
+        "prefill_context_parallel_size": 1,
+        "decode_context_parallel_size": 1,
+        "dcp_comm_backend": "ag_rs",
+        "dcp_kv_cache_interleave_size": 1,
+        "cp_kv_cache_interleave_size": 1,
+        "data_parallel_size": 1,
+        "data_parallel_rank": null,
+        "data_parallel_start_rank": null,
+        "data_parallel_size_local": null,
+        "data_parallel_address": null,
+        "data_parallel_rpc_port": null,
+        "data_parallel_hybrid_lb": false,
+        "data_parallel_external_lb": false,
+        "data_parallel_backend": "mp",
+        "enable_expert_parallel": false,
+        "enable_ep_weight_filter": false,
+        "moe_backend": "auto",
+        "all2all_backend": "allgather_reducescatter",
+        "enable_elastic_ep": false,
+        "enable_dbo": false,
+        "ubatch_size": 0,
+        "dbo_decode_token_threshold": 32,
+        "dbo_prefill_token_threshold": 512,
+        "disable_nccl_for_dp_synchronization": null,
+        "eplb_config": "EPLBConfig(window_size=1000, step_interval=3000, num_redundant_experts=0, log_balancedness=False, log_balancedness_interval=1, use_async=False, policy='default')",
+        "enable_eplb": false,
+        "expert_placement_strategy": "linear",
+        "_api_process_count": 1,
+        "_api_process_rank": 0,
+        "max_parallel_loading_workers": null,
+        "block_size": null,
+        "enable_prefix_caching": false,
+        "prefix_caching_hash_algo": "sha256",
+        "disable_sliding_window": false,
+        "disable_cascade_attn": true,
+        "offload_backend": "auto",
+        "cpu_offload_gb": 0,
+        "cpu_offload_params": "set()",
+        "offload_group_size": 0,
+        "offload_num_in_group": 1,
+        "offload_prefetch_step": 1,
+        "offload_params": "set()",
+        "gpu_memory_utilization": 0.8,
+        "kv_cache_memory_bytes": null,
+        "max_num_batched_tokens": 8192,
+        "max_num_partial_prefills": 1,
+        "max_long_partial_prefills": 1,
+        "long_prefill_token_threshold": 0,
+        "max_num_seqs": 16,
+        "max_logprobs": 20,
+        "logprobs_mode": "raw_logprobs",
+        "disable_log_stats": false,
+        "aggregate_engine_logging": false,
+        "revision": null,
+        "code_revision": null,
+        "hf_token": null,
+        "hf_overrides": {},
+        "tokenizer_revision": null,
+        "quantization": null,
+        "allow_deprecated_quantization": false,
+        "enforce_eager": true,
+        "disable_custom_all_reduce": false,
+        "language_model_only": false,
+        "limit_mm_per_prompt": {
+          "image": 0,
+          "video": 0
+        },
+        "enable_mm_embeds": false,
+        "interleave_mm_strings": false,
+        "media_io_kwargs": {},
+        "mm_processor_kwargs": null,
+        "mm_processor_cache_gb": 4,
+        "mm_processor_cache_type": "lru",
+        "mm_shm_cache_max_object_size_mb": 128,
+        "mm_encoder_only": false,
+        "mm_encoder_tp_mode": "weights",
+        "mm_encoder_attn_backend": null,
+        "io_processor_plugin": null,
+        "renderer_num_workers": 1,
+        "skip_mm_profiling": false,
+        "video_pruning_rate": null,
+        "mm_tensor_ipc": "direct_rpc",
+        "enable_lora": true,
+        "max_loras": 2,
+        "max_lora_rank": 8,
+        "default_mm_loras": null,
+        "fully_sharded_loras": false,
+        "max_cpu_loras": 24,
+        "lora_dtype": "auto",
+        "lora_target_modules": null,
+        "enable_tower_connector_lora": false,
+        "specialize_active_lora": false,
+        "ray_workers_use_nsight": false,
+        "num_gpu_blocks_override": null,
+        "model_loader_extra_config": {},
+        "ignore_patterns": [
+          "original/**/*"
+        ],
+        "enable_chunked_prefill": true,
+        "disable_chunked_mm_input": false,
+        "scheduler_reserve_full_isl": true,
+        "disable_hybrid_kv_cache_manager": null,
+        "structured_outputs_config": "StructuredOutputsConfig(backend='auto', disable_any_whitespace=False, disable_additional_properties=False, reasoning_parser='', reasoning_parser_plugin='', enable_in_reasoning=False)",
+        "reasoning_parser": "",
+        "reasoning_parser_plugin": null,
+        "speculative_config": null,
+        "show_hidden_metrics_for_version": null,
+        "otlp_traces_endpoint": null,
+        "collect_detailed_traces": null,
+        "kv_cache_metrics": false,
+        "kv_cache_metrics_sample": 0.01,
+        "cudagraph_metrics": false,
+        "enable_layerwise_nvtx_tracing": false,
+        "enable_mfu_metrics": false,
+        "enable_logging_iteration_details": false,
+        "enable_mm_processor_stats": false,
+        "scheduling_policy": "fcfs",
+        "scheduler_cls": null,
+        "pooler_config": null,
+        "compilation_config": "{'mode': None, 'debug_dump_path': None, 'cache_dir': '', 'compile_cache_save_format': 'binary', 'backend': 'inductor', 'custom_ops': [], 'splitting_ops': None, 'compile_mm_encoder': False, 'cudagraph_mm_encoder': False, 'encoder_cudagraph_token_budgets': [], 'encoder_cudagraph_max_images_per_batch': 0, 'compile_sizes': None, 'compile_ranges_endpoints': None, 'inductor_compile_config': {'enable_auto_functionalized_v2': False, 'size_asserts': False, 'alignment_asserts': False, 'scalar_asserts': False, 'combo_kernels': True, 'benchmark_combo_kernel': True}, 'inductor_passes': {}, 'cudagraph_mode': None, 'cudagraph_num_of_warmups': 0, 'cudagraph_capture_sizes': None, 'cudagraph_copy_inputs': False, 'cudagraph_specialize_lora': True, 'use_inductor_graph_partition': None, 'pass_config': {}, 'max_cudagraph_capture_size': None, 'dynamic_shapes_config': {'type': <DynamicShapesType.BACKED: 'backed'>, 'evaluate_guards': False, 'assume_32_bit_indexing': False}, 'local_cache_dir': None, 'fast_moe_cold_start': None, 'static_all_moe_layers': []}",
+        "attention_config": "AttentionConfig(backend=None, flash_attn_version=None, use_prefill_decode_attention=False, flash_attn_max_num_splits_for_cuda_graph=32, use_cudnn_prefill=False, use_trtllm_ragged_deepseek_prefill=False, use_trtllm_attention=None, disable_flashinfer_prefill=True, disable_flashinfer_q_quantization=False, use_prefill_query_quantization=False)",
+        "kernel_config": "KernelConfig(enable_flashinfer_autotune=None, moe_backend='auto')",
+        "enable_flashinfer_autotune": null,
+        "worker_cls": "auto",
+        "worker_extension_cls": "",
+        "profiler_config": "ProfilerConfig(profiler=None, torch_profiler_dir='', torch_profiler_with_stack=True, torch_profiler_with_flops=False, torch_profiler_use_gzip=True, torch_profiler_dump_cuda_time_total=True, torch_profiler_record_shapes=False, torch_profiler_with_memory=False, ignore_frontend=False, delay_iterations=0, max_iterations=0, warmup_iterations=0, active_iterations=5, wait_iterations=0)",
+        "kv_transfer_config": null,
+        "kv_events_config": null,
+        "ec_transfer_config": null,
+        "reasoning_config": null,
+        "generation_config": "auto",
+        "enable_sleep_mode": false,
+        "override_generation_config": {},
+        "model_impl": "auto",
+        "override_attention_dtype": null,
+        "attention_backend": null,
+        "calculate_kv_scales": false,
+        "kv_cache_dtype_skip_layers": [],
+        "mamba_cache_dtype": "auto",
+        "mamba_ssm_cache_dtype": "auto",
+        "mamba_block_size": null,
+        "mamba_cache_mode": "none",
+        "additional_config": {},
+        "use_tqdm_on_load": true,
+        "pt_load_map_location": "cpu",
+        "logits_processors": null,
+        "async_scheduling": null,
+        "stream_interval": 1,
+        "kv_sharing_fast_prefill": false,
+        "optimization_level": 2,
+        "performance_mode": "balanced",
+        "kv_offloading_size": null,
+        "kv_offloading_backend": "native",
+        "tokens_only": false,
+        "shutdown_timeout": 0,
+        "weight_transfer_config": null,
+        "fail_on_environ_validation": false,
+        "gdn_prefill_backend": null,
+        "enable_log_requests": false
+      }
+    },
+    "b200": {
+      "allocation_api_s": 22.850425243377686,
+      "engine_startup_s": 133.42156434059143,
+      "model_download_s": 0.6308553218841553,
+      "baseline_accuracy": 0.515625,
+      "versions": {
+        "torch": "2.10.0+cu128",
+        "vllm": "0.19.1",
+        "transformers": "5.12.1",
+        "peft": "0.20.0",
+        "huggingface_hub": "1.28.0"
+      },
+      "engine_configuration": {
+        "model": "/__modal/volumes/vo-T16isCaUNHwUcAZ3Cp1xLP/hf-cache/hub/models--Qwen--Qwen3.5-9B/snapshots/c202236235762e1c871ad0ccb60c8ee5ba337b9a",
+        "enable_return_routed_experts": false,
+        "model_weights": "",
+        "served_model_name": null,
+        "tokenizer": "/__modal/volumes/vo-T16isCaUNHwUcAZ3Cp1xLP/hf-cache/hub/models--Qwen--Qwen3.5-9B/snapshots/c202236235762e1c871ad0ccb60c8ee5ba337b9a",
+        "hf_config_path": null,
+        "runner": "auto",
+        "convert": "auto",
+        "skip_tokenizer_init": false,
+        "enable_prompt_embeds": false,
+        "tokenizer_mode": "auto",
+        "trust_remote_code": true,
+        "allowed_local_media_path": "",
+        "allowed_media_domains": null,
+        "download_dir": null,
+        "safetensors_load_strategy": null,
+        "load_format": "auto",
+        "config_format": "auto",
+        "dtype": "bfloat16",
+        "kv_cache_dtype": "auto",
+        "seed": 17,
+        "max_model_len": 8192,
+        "cudagraph_capture_sizes": null,
+        "max_cudagraph_capture_size": null,
+        "distributed_executor_backend": null,
+        "pipeline_parallel_size": 1,
+        "master_addr": "127.0.0.1",
+        "master_port": 29501,
+        "nnodes": 1,
+        "node_rank": 0,
+        "distributed_timeout_seconds": null,
+        "tensor_parallel_size": 1,
+        "prefill_context_parallel_size": 1,
+        "decode_context_parallel_size": 1,
+        "dcp_comm_backend": "ag_rs",
+        "dcp_kv_cache_interleave_size": 1,
+        "cp_kv_cache_interleave_size": 1,
+        "data_parallel_size": 1,
+        "data_parallel_rank": null,
+        "data_parallel_start_rank": null,
+        "data_parallel_size_local": null,
+        "data_parallel_address": null,
+        "data_parallel_rpc_port": null,
+        "data_parallel_hybrid_lb": false,
+        "data_parallel_external_lb": false,
+        "data_parallel_backend": "mp",
+        "enable_expert_parallel": false,
+        "enable_ep_weight_filter": false,
+        "moe_backend": "auto",
+        "all2all_backend": "allgather_reducescatter",
+        "enable_elastic_ep": false,
+        "enable_dbo": false,
+        "ubatch_size": 0,
+        "dbo_decode_token_threshold": 32,
+        "dbo_prefill_token_threshold": 512,
+        "disable_nccl_for_dp_synchronization": null,
+        "eplb_config": "EPLBConfig(window_size=1000, step_interval=3000, num_redundant_experts=0, log_balancedness=False, log_balancedness_interval=1, use_async=False, policy='default')",
+        "enable_eplb": false,
+        "expert_placement_strategy": "linear",
+        "_api_process_count": 1,
+        "_api_process_rank": 0,
+        "max_parallel_loading_workers": null,
+        "block_size": null,
+        "enable_prefix_caching": false,
+        "prefix_caching_hash_algo": "sha256",
+        "disable_sliding_window": false,
+        "disable_cascade_attn": true,
+        "offload_backend": "auto",
+        "cpu_offload_gb": 0,
+        "cpu_offload_params": "set()",
+        "offload_group_size": 0,
+        "offload_num_in_group": 1,
+        "offload_prefetch_step": 1,
+        "offload_params": "set()",
+        "gpu_memory_utilization": 0.8,
+        "kv_cache_memory_bytes": null,
+        "max_num_batched_tokens": 8192,
+        "max_num_partial_prefills": 1,
+        "max_long_partial_prefills": 1,
+        "long_prefill_token_threshold": 0,
+        "max_num_seqs": 16,
+        "max_logprobs": 20,
+        "logprobs_mode": "raw_logprobs",
+        "disable_log_stats": false,
+        "aggregate_engine_logging": false,
+        "revision": null,
+        "code_revision": null,
+        "hf_token": null,
+        "hf_overrides": {},
+        "tokenizer_revision": null,
+        "quantization": null,
+        "allow_deprecated_quantization": false,
+        "enforce_eager": true,
+        "disable_custom_all_reduce": false,
+        "language_model_only": false,
+        "limit_mm_per_prompt": {
+          "image": 0,
+          "video": 0
+        },
+        "enable_mm_embeds": false,
+        "interleave_mm_strings": false,
+        "media_io_kwargs": {},
+        "mm_processor_kwargs": null,
+        "mm_processor_cache_gb": 4,
+        "mm_processor_cache_type": "lru",
+        "mm_shm_cache_max_object_size_mb": 128,
+        "mm_encoder_only": false,
+        "mm_encoder_tp_mode": "weights",
+        "mm_encoder_attn_backend": null,
+        "io_processor_plugin": null,
+        "renderer_num_workers": 1,
+        "skip_mm_profiling": false,
+        "video_pruning_rate": null,
+        "mm_tensor_ipc": "direct_rpc",
+        "enable_lora": true,
+        "max_loras": 2,
+        "max_lora_rank": 8,
+        "default_mm_loras": null,
+        "fully_sharded_loras": false,
+        "max_cpu_loras": 24,
+        "lora_dtype": "auto",
+        "lora_target_modules": null,
+        "enable_tower_connector_lora": false,
+        "specialize_active_lora": false,
+        "ray_workers_use_nsight": false,
+        "num_gpu_blocks_override": null,
+        "model_loader_extra_config": {},
+        "ignore_patterns": [
+          "original/**/*"
+        ],
+        "enable_chunked_prefill": true,
+        "disable_chunked_mm_input": false,
+        "scheduler_reserve_full_isl": true,
+        "disable_hybrid_kv_cache_manager": null,
+        "structured_outputs_config": "StructuredOutputsConfig(backend='auto', disable_any_whitespace=False, disable_additional_properties=False, reasoning_parser='', reasoning_parser_plugin='', enable_in_reasoning=False)",
+        "reasoning_parser": "",
+        "reasoning_parser_plugin": null,
+        "speculative_config": null,
+        "show_hidden_metrics_for_version": null,
+        "otlp_traces_endpoint": null,
+        "collect_detailed_traces": null,
+        "kv_cache_metrics": false,
+        "kv_cache_metrics_sample": 0.01,
+        "cudagraph_metrics": false,
+        "enable_layerwise_nvtx_tracing": false,
+        "enable_mfu_metrics": false,
+        "enable_logging_iteration_details": false,
+        "enable_mm_processor_stats": false,
+        "scheduling_policy": "fcfs",
+        "scheduler_cls": null,
+        "pooler_config": null,
+        "compilation_config": "{'mode': None, 'debug_dump_path': None, 'cache_dir': '', 'compile_cache_save_format': 'binary', 'backend': 'inductor', 'custom_ops': [], 'splitting_ops': None, 'compile_mm_encoder': False, 'cudagraph_mm_encoder': False, 'encoder_cudagraph_token_budgets': [], 'encoder_cudagraph_max_images_per_batch': 0, 'compile_sizes': None, 'compile_ranges_endpoints': None, 'inductor_compile_config': {'enable_auto_functionalized_v2': False, 'size_asserts': False, 'alignment_asserts': False, 'scalar_asserts': False, 'combo_kernels': True, 'benchmark_combo_kernel': True}, 'inductor_passes': {}, 'cudagraph_mode': None, 'cudagraph_num_of_warmups': 0, 'cudagraph_capture_sizes': None, 'cudagraph_copy_inputs': False, 'cudagraph_specialize_lora': True, 'use_inductor_graph_partition': None, 'pass_config': {}, 'max_cudagraph_capture_size': None, 'dynamic_shapes_config': {'type': <DynamicShapesType.BACKED: 'backed'>, 'evaluate_guards': False, 'assume_32_bit_indexing': False}, 'local_cache_dir': None, 'fast_moe_cold_start': None, 'static_all_moe_layers': []}",
+        "attention_config": "AttentionConfig(backend=None, flash_attn_version=None, use_prefill_decode_attention=False, flash_attn_max_num_splits_for_cuda_graph=32, use_cudnn_prefill=False, use_trtllm_ragged_deepseek_prefill=False, use_trtllm_attention=None, disable_flashinfer_prefill=True, disable_flashinfer_q_quantization=False, use_prefill_query_quantization=False)",
+        "kernel_config": "KernelConfig(enable_flashinfer_autotune=None, moe_backend='auto')",
+        "enable_flashinfer_autotune": null,
+        "worker_cls": "auto",
+        "worker_extension_cls": "",
+        "profiler_config": "ProfilerConfig(profiler=None, torch_profiler_dir='', torch_profiler_with_stack=True, torch_profiler_with_flops=False, torch_profiler_use_gzip=True, torch_profiler_dump_cuda_time_total=True, torch_profiler_record_shapes=False, torch_profiler_with_memory=False, ignore_frontend=False, delay_iterations=0, max_iterations=0, warmup_iterations=0, active_iterations=5, wait_iterations=0)",
+        "kv_transfer_config": null,
+        "kv_events_config": null,
+        "ec_transfer_config": null,
+        "reasoning_config": null,
+        "generation_config": "auto",
+        "enable_sleep_mode": false,
+        "override_generation_config": {},
+        "model_impl": "auto",
+        "override_attention_dtype": null,
+        "attention_backend": null,
+        "calculate_kv_scales": false,
+        "kv_cache_dtype_skip_layers": [],
+        "mamba_cache_dtype": "auto",
+        "mamba_ssm_cache_dtype": "auto",
+        "mamba_block_size": null,
+        "mamba_cache_mode": "none",
+        "additional_config": {},
+        "use_tqdm_on_load": true,
+        "pt_load_map_location": "cpu",
+        "logits_processors": null,
+        "async_scheduling": null,
+        "stream_interval": 1,
+        "kv_sharing_fast_prefill": false,
+        "optimization_level": 2,
+        "performance_mode": "balanced",
+        "kv_offloading_size": null,
+        "kv_offloading_backend": "native",
+        "tokens_only": false,
+        "shutdown_timeout": 0,
+        "weight_transfer_config": null,
+        "fail_on_environ_validation": false,
+        "gdn_prefill_backend": null,
+        "enable_log_requests": false
+      }
+    }
+  },
+  "recovery_baseline_accuracy": {
+    "h100": 0.5234375,
+    "b200": 0.515625
+  },
+  "initial_campaign_status": {
+    "status": "failed",
+    "error": "b200 evaluator exited before b200-sft-warm-step64",
+    "finished_at": 1792726632.468856
+  },
+  "recovery_plan": {
+    "at": 1792726923.1875389,
+    "reason": "Original persistent evaluators exhausted the bounded lifetime after provisioning delays. All eight training jobs succeeded; two B200 SFT warm checkpoint grades were missing, B200 serving completed but H100 serving was interrupted by supervisor cleanup. Retain original failures and repeat serving on both GPUs at the same barrier for a matched comparison.",
+    "max_additional_gpu_allocations": 2,
+    "gpu_timeout_s": 1500,
+    "host_api_timeout_s": 2400,
+    "cpu": 8,
+    "memory_mib": [
+      32768,
+      131072
+    ],
+    "region": "us-east",
+    "original_compute_exposure_upper_usd": 83,
+    "recomputed_total_compute_upper_usd": 72.56767065382512,
+    "no_training_retry": true,
+    "source_evaluator_sha256": "40fbf0c654fab809145f5874dc55a0223f82f8b2b6c5d06983f4bda8905e00b6",
+    "recovery_evaluator_sha256": "34616c312dffa950a0439b823334fd45ae6dbd1d36211c348104a0b13507a14f",
+    "changes": "Isolated namespace and fixed campaign instead of polling training; durable outputs after each serving wave and episode pair; same model, adapters, grader, generation settings, serving matrix and episodes. B200 missing grades are explicitly post-job recovery measurements.",
+    "upper_bound_method": "Completed training end-to-end wall time at maximum GPU/CPU/RAM reservation rate (also conservatively covers CPU-only publication) + full original 3600-second evaluator allocations + two 1500-second recovery allocations; 1.75x region premium. Separate storage/egress allowance remains $2."
+  },
+  "recovery_status": {
+    "status": "failed",
+    "error": "Recovery h100 exited before serving",
+    "finished_at": 1792728945.427256
+  },
+  "recovery_schedule_amendment": {
+    "at": 1792727583.877443,
+    "reason": "H100 remains pending provider capacity while B200 is prepared. Release the common serving signal now so B200 avoids further idle cost and its fixed lifetime can complete useful work. H100 uses the same signal on readiness. Hardware requests run on independent GPUs; no cross-GPU synchronization is required for matched-input comparison.",
+    "max_additional_gpu_allocations": 0,
+    "settings_unchanged": true,
+    "simultaneous_start_claim": false,
+    "recovery_plan_bounds_unchanged": true,
+    "revision": "302748d85b6f21d9e42b00d394ec45bd3fc51f4e"
+  },
+  "recovery_stop": {
+    "at": 1792728933.962765,
+    "last_completed_wave": {
+      "kind": "wave",
+      "at": 1792728622.9222555,
+      "mode": "concurrent",
+      "concurrency": 8,
+      "repeat": 0,
+      "wall_s": 5.656386852264404
+    },
+    "no_wave_completion_s": 311.04050946235657,
+    "reason": "No completed wave for over five minutes after eight successful waves; diagnostic shows live process, 100% GPU utilization and approximately 120 W. Stop owned evaluator to avoid further idle/stalled spend. Root cause is not established. No further retry.",
+    "action": "terminate_h100_recovery",
+    "training_unaffected": true
+  },
+  "measurement_outcomes": {
+    "training_jobs_succeeded": 8,
+    "checkpoint_grades_retained": 16,
+    "h100_recovery": "partial_aborted_after_stall",
+    "b200_recovery": "complete",
+    "initial_campaign_status": {
+      "status": "failed",
+      "error": "b200 evaluator exited before b200-sft-warm-step64",
+      "finished_at": 1792726632.468856
+    },
+    "recovery_status": {
+      "status": "failed",
+      "error": "Recovery h100 exited before serving",
+      "finished_at": 1792728945.427256
+    }
+  },
+  "cost": {
+    "at": 1792729025.301861,
+    "apps": {
+      "h100-sft-cold": {
+        "app_id": "ap-qE1yxJe6N9JNyvYrwamKZD",
+        "provider_reported_cost_usd": 1.01104108,
+        "rows": [
+          {
+            "object_id": "ap-qE1yxJe6N9JNyvYrwamKZD",
+            "description": "flash-compare-ada8a16f6c-h100-sft-cold",
+            "environment_name": "main",
+            "interval": "2026-10-23T02:00:00Z",
+            "cost": "1.01104108",
+            "cost_by_resource": {
+              "CPU": "0.19380061",
+              "Network Egress": "0.01796468",
+              "Memory": "0.13056507",
+              "H100": "0.66871072"
+            }
+          }
+        ],
+        "billing_error": null,
+        "observed_at": 1792729020.243952
+      },
+      "h100-sft-warm": {
+        "app_id": "ap-ii2nqi0AnkDcRLY0r0opVC",
+        "provider_reported_cost_usd": 1.05643782,
+        "rows": [
+          {
+            "object_id": "ap-ii2nqi0AnkDcRLY0r0opVC",
+            "description": "flash-compare-ada8a16f6c-h100-sft-warm",
+            "environment_name": "main",
+            "interval": "2026-10-23T03:00:00Z",
+            "cost": "1.05643782",
+            "cost_by_resource": {
+              "CPU": "0.20344445",
+              "Network Egress": "0.01308391",
+              "Memory": "0.13713844",
+              "H100": "0.70277102"
+            }
+          }
+        ],
+        "billing_error": null,
+        "observed_at": 1792729020.243958
+      },
+      "h100-grpo-cold": {
+        "app_id": "ap-6HqELOqIYtJPS35GXPNqxj",
+        "provider_reported_cost_usd": 3.26266578,
+        "rows": [
+          {
+            "object_id": "ap-6HqELOqIYtJPS35GXPNqxj",
+            "description": "flash-compare-ada8a16f6c-h100-grpo-cold",
+            "environment_name": "main",
+            "interval": "2026-10-23T02:00:00Z",
+            "cost": "0.86383213",
+            "cost_by_resource": {
+              "CPU": "0.16669531",
+              "Network Egress": "0.00433512",
+              "Memory": "0.11277484",
+              "H100": "0.58002686"
+            }
+          },
+          {
+            "object_id": "ap-6HqELOqIYtJPS35GXPNqxj",
+            "description": "flash-compare-ada8a16f6c-h100-grpo-cold",
+            "environment_name": "main",
+            "interval": "2026-10-23T03:00:00Z",
+            "cost": "2.39883365",
+            "cost_by_resource": {
+              "CPU": "0.44214569",
+              "Network Egress": "0.01313578",
+              "Memory": "0.41041717",
+              "H100": "1.53313501"
+            }
+          }
+        ],
+        "billing_error": null,
+        "observed_at": 1792729020.243961
+      },
+      "h100-grpo-warm": {
+        "app_id": "ap-7o2phtFXLN8wyUKaj6drBq",
+        "provider_reported_cost_usd": 1.78136546,
+        "rows": [
+          {
+            "object_id": "ap-7o2phtFXLN8wyUKaj6drBq",
+            "description": "flash-compare-ada8a16f6c-h100-grpo-warm",
+            "environment_name": "main",
+            "interval": "2026-10-23T03:00:00Z",
+            "cost": "1.78136546",
+            "cost_by_resource": {
+              "CPU": "0.33277967",
+              "Network Egress": "0.01310800",
+              "Memory": "0.28338379",
+              "H100": "1.15209400"
+            }
+          }
+        ],
+        "billing_error": null,
+        "observed_at": 1792729020.2439628
+      },
+      "b200-sft-cold": {
+        "app_id": "ap-OOmKObnlkqenhTKtfGiqMN",
+        "provider_reported_cost_usd": 1.4755721,
+        "rows": [
+          {
+            "object_id": "ap-OOmKObnlkqenhTKtfGiqMN",
+            "description": "flash-compare-ada8a16f6c-b200-sft-cold",
+            "environment_name": "main",
+            "interval": "2026-10-23T03:00:00Z",
+            "cost": "1.47557210",
+            "cost_by_resource": {
+              "CPU": "0.20470475",
+              "Network Egress": "0.01401078",
+              "Memory": "0.13798802",
+              "B200": "1.11886856"
+            }
+          }
+        ],
+        "billing_error": null,
+        "observed_at": 1792729020.243965
+      },
+      "b200-sft-warm": {
+        "app_id": "ap-7XyTCZFtecl8rVfd9hRWQS",
+        "provider_reported_cost_usd": 0.86332863,
+        "rows": [
+          {
+            "object_id": "ap-7XyTCZFtecl8rVfd9hRWQS",
+            "description": "flash-compare-ada8a16f6c-b200-sft-warm",
+            "environment_name": "main",
+            "interval": "2026-10-23T03:00:00Z",
+            "cost": "0.86332863",
+            "cost_by_resource": {
+              "CPU": "0.11961020",
+              "Network Egress": "0.01313681",
+              "Memory": "0.08040685",
+              "B200": "0.65017478"
+            }
+          }
+        ],
+        "billing_error": null,
+        "observed_at": 1792729020.243967
+      },
+      "b200-grpo-cold": {
+        "app_id": "ap-LyMw8NPdK9gUmiFyFGTNZ1",
+        "provider_reported_cost_usd": 2.82660182,
+        "rows": [
+          {
+            "object_id": "ap-LyMw8NPdK9gUmiFyFGTNZ1",
+            "description": "flash-compare-ada8a16f6c-b200-grpo-cold",
+            "environment_name": "main",
+            "interval": "2026-10-23T02:00:00Z",
+            "cost": "2.82660182",
+            "cost_by_resource": {
+              "CPU": "0.38503645",
+              "Network Egress": "0.01690362",
+              "Memory": "0.31390173",
+              "B200": "2.11076003"
+            }
+          }
+        ],
+        "billing_error": null,
+        "observed_at": 1792729020.243969
+      },
+      "b200-grpo-warm": {
+        "app_id": "ap-69cFgKw1fTa1cVzYMKxRTq",
+        "provider_reported_cost_usd": 2.35048789,
+        "rows": [
+          {
+            "object_id": "ap-69cFgKw1fTa1cVzYMKxRTq",
+            "description": "flash-compare-ada8a16f6c-b200-grpo-warm",
+            "environment_name": "main",
+            "interval": "2026-10-23T03:00:00Z",
+            "cost": "2.35048789",
+            "cost_by_resource": {
+              "CPU": "0.31978411",
+              "Network Egress": "0.01309135",
+              "Memory": "0.26505934",
+              "B200": "1.75255308"
+            }
+          }
+        ],
+        "billing_error": null,
+        "observed_at": 1792729020.243971
+      },
+      "h100-evaluation": {
+        "app_id": "ap-BNYOKe8gsLIKfPHFpDBKBH",
+        "provider_reported_cost_usd": 10.08977445,
+        "rows": [
+          {
+            "object_id": "ap-BNYOKe8gsLIKfPHFpDBKBH",
+            "description": "flash-compare-ada8a16f6c-h100-evaluation",
+            "environment_name": "main",
+            "interval": "2026-10-23T02:00:00Z",
+            "cost": "3.73892999",
+            "cost_by_resource": {
+              "CPU": "0.71638848",
+              "Network Egress": "0.02730548",
+              "Memory": "0.50289501",
+              "H100": "2.49234102"
+            }
+          },
+          {
+            "object_id": "ap-BNYOKe8gsLIKfPHFpDBKBH",
+            "description": "flash-compare-ada8a16f6c-h100-evaluation",
+            "environment_name": "main",
+            "interval": "2026-10-23T03:00:00Z",
+            "cost": "6.35084446",
+            "cost_by_resource": {
+              "CPU": "1.23169179",
+              "Network Egress": "0.00012354",
+              "Memory": "0.83327986",
+              "H100": "4.28574927"
+            }
+          }
+        ],
+        "billing_error": null,
+        "observed_at": 1792729020.243973
+      },
+      "b200-evaluation": {
+        "app_id": "ap-PFLYmEoXIyAOezquZFI5YF",
+        "provider_reported_cost_usd": 13.98631503,
+        "rows": [
+          {
+            "object_id": "ap-PFLYmEoXIyAOezquZFI5YF",
+            "description": "flash-compare-ada8a16f6c-b200-evaluation",
+            "environment_name": "main",
+            "interval": "2026-10-23T02:00:00Z",
+            "cost": "5.14346271",
+            "cost_by_resource": {
+              "CPU": "0.71361962",
+              "Network Egress": "0.01836196",
+              "Memory": "0.48276705",
+              "B200": "3.92871407"
+            }
+          },
+          {
+            "object_id": "ap-PFLYmEoXIyAOezquZFI5YF",
+            "description": "flash-compare-ada8a16f6c-b200-evaluation",
+            "environment_name": "main",
+            "interval": "2026-10-23T03:00:00Z",
+            "cost": "8.84285232",
+            "cost_by_resource": {
+              "CPU": "1.23119560",
+              "Network Egress": "0.00019551",
+              "Memory": "0.83294417",
+              "B200": "6.77851703"
+            }
+          }
+        ],
+        "billing_error": null,
+        "observed_at": 1792729020.243975
+      },
+      "h100-recovery": {
+        "app_id": "ap-tnrmz2hj3ddfG9yQ51CJVa",
+        "provider_reported_cost_usd": 3.05226309,
+        "rows": [
+          {
+            "object_id": "ap-tnrmz2hj3ddfG9yQ51CJVa",
+            "description": "flash-compare-ada8a16f6c-h100-recovery",
+            "environment_name": "main",
+            "interval": "2026-10-23T03:00:00Z",
+            "cost": "0.38296691",
+            "cost_by_resource": {
+              "CPU": "0.07404630",
+              "Network Egress": "0.00000070",
+              "Memory": "0.05161979",
+              "H100": "0.25730012"
+            }
+          },
+          {
+            "object_id": "ap-tnrmz2hj3ddfG9yQ51CJVa",
+            "description": "flash-compare-ada8a16f6c-h100-recovery",
+            "environment_name": "main",
+            "interval": "2026-10-23T04:00:00Z",
+            "cost": "2.66929618",
+            "cost_by_resource": {
+              "CPU": "0.51453461",
+              "Network Egress": "0.00006295",
+              "Memory": "0.36512881",
+              "H100": "1.78956980"
+            }
+          }
+        ],
+        "billing_error": null,
+        "observed_at": 1792729020.243977
+      },
+      "b200-recovery": {
+        "app_id": "ap-nGgemvkF93v0tv65C24RNS",
+        "provider_reported_cost_usd": 3.733727,
+        "rows": [
+          {
+            "object_id": "ap-nGgemvkF93v0tv65C24RNS",
+            "description": "flash-compare-ada8a16f6c-b200-recovery",
+            "environment_name": "main",
+            "interval": "2026-10-23T03:00:00Z",
+            "cost": "3.73372700",
+            "cost_by_resource": {
+              "CPU": "0.51986696",
+              "Network Egress": "0.00019083",
+              "Memory": "0.35168704",
+              "B200": "2.86198217"
+            }
+          }
+        ],
+        "billing_error": null,
+        "observed_at": 1792729020.24398
+      }
+    },
+    "known_provider_cost_usd": 45.48958015,
+    "all_apps_reported": true,
+    "sandbox_usage": {
+      "sb-BGDMPhov0FkXitlPa3yLqU": {
+        "cpu_core_nanosecs": "2656006752014",
+        "mem_gib_nanosecs": "10624027008056",
+        "gpu_nanosecs": "332000844001",
+        "gpu_type": "H100!"
+      },
+      "sb-01M5KAX29KT5NYXDR721JVN3QJ": {
+        "unavailable": "InvalidError"
+      },
+      "sb-fg0rF7vBVNeDMcUe3E28yQ": {
+        "cpu_core_nanosecs": "3455996784210",
+        "mem_gib_nanosecs": "13823987136840",
+        "gpu_nanosecs": "431999598026",
+        "gpu_type": "H100!"
+      },
+      "sb-L5aGrsfsvZbyltO7CGbAwW": {
+        "unavailable": "NotFoundError"
+      },
+      "sb-01M5KCBWPKVNSN9NW52GHPSXWX": {
+        "unavailable": "InvalidError"
+      },
+      "sb-SLFXbLRiGd74EJwEKkoILq": {
+        "unavailable": "NotFoundError"
+      },
+      "sb-tEYnQLauXdohWfArobnrad": {
+        "unavailable": "NotFoundError"
+      },
+      "sb-YqSUi1KzI0Axc1WjNWZHih": {
+        "cpu_core_nanosecs": "240001718521",
+        "mem_gib_nanosecs": "960006874084",
+        "gpu_nanosecs": "30000214815",
+        "gpu_type": "H100!"
+      },
+      "sb-01M5KCQ13PQS6G93V8977E6YEB": {
+        "unavailable": "InvalidError"
+      },
+      "sb-01M5KBNRT90H8KKFTNP69954X7": {
+        "unavailable": "InvalidError"
+      },
+      "sb-01M5KBZWVVG3M69PVW2TB9MPTA": {
+        "unavailable": "InvalidError"
+      },
+      "sb-zRrJPkEekzFPz5pYHN8TDX": {
+        "cpu_core_nanosecs": "1712003070831",
+        "mem_gib_nanosecs": "6848012283325",
+        "gpu_nanosecs": "214000383853",
+        "gpu_type": "B200"
+      },
+      "sb-eutmBHAcVF6lF9bAKv7sc2": {
+        "cpu_core_nanosecs": "4464005708694",
+        "mem_gib_nanosecs": "17856022834777",
+        "gpu_nanosecs": "558000713586",
+        "gpu_type": "B200"
+      },
+      "sb-KrImwfmTY5D16pjhsaUe8I": {
+        "cpu_core_nanosecs": "2886716529846",
+        "mem_gib_nanosecs": "13630741774683",
+        "gpu_nanosecs": "360839566230",
+        "gpu_type": "B200"
+      },
+      "sb-01M5KCZ1CY5EABX0RPXFG6SYB9": {
+        "unavailable": "InvalidError"
+      },
+      "sb-80NSKpsHETZRLRmPPk9FyW": {
+        "cpu_core_nanosecs": "3448801139831",
+        "mem_gib_nanosecs": "13795204559326",
+        "gpu_nanosecs": "431100142478",
+        "gpu_type": "B200"
+      },
+      "sb-jczIFuCS9ohy9m5077rCKo": {
+        "unavailable": "NotFoundError"
+      },
+      "sb-FRMkbltS106LR7MAFTtcYo": {
+        "cpu_core_nanosecs": "32004272460",
+        "mem_gib_nanosecs": "128017089843",
+        "gpu_nanosecs": "4000534057",
+        "gpu_type": "H100!"
+      },
+      "sb-01M5KAYWK2E01G174N2AFK316V": {
+        "unavailable": "InvalidError"
+      },
+      "sb-01M5KD90396P43N0VDAB2H0FY7": {
+        "unavailable": "InvalidError"
+      }
+    },
+    "reconciled": false,
+    "note": "Current-day accrued provider metering, not a finalized invoice. Region premium included by provider. Empty/missing receipts are unknown. Each training run and each persistent evaluator owns its app. Evaluator cost is experiment overhead, not silently assigned to training.",
+    "customer_charge_usd": null,
+    "customer_charge_note": "Direct operator workload; customer charge ledger unavailable."
+  },
+  "limitations": [
+    "Original evaluator timeout retained; B200 SFT warm grades were recovered post-job; serving was repeated on both GPUs with durable per-wave output. H100 stalled after 8/18 waves and was stopped; no H100 recovery agent episode completed. B200 completed all work.",
+    "One training seed; cold/warm are separate cache conditions, not independent seed replications.",
+    "Hardware and qualified architecture-specific image change together. BF16 kernels/backend selection can differ.",
+    "The custom MMLU-Pro other split is not an official benchmark score.",
+    "Persistent observers are benchmark infrastructure. Their startup/idle cost is retained separately from the training app receipts.",
+    "Serving timings exclude hosted HTTP, authorization, routing and real customer isolation. Queue-inclusive and local admitted request latency are separate.",
+    "Long agents are 33-turn inference episodes, not long-agent RL training.",
+    "Native timers are overlapping component totals, not a complete exclusive timeline. Liveness samples only bound some publication time; SFT optimizer-only and checkpoint-capture durations remain unmeasured.",
+    "Current provider receipts are accrued and provisional; missing/finalized customer billing remains unknown.",
+    "Direct provider campaign does not qualify hosted preparation/collection hooks."
+  ]
+}

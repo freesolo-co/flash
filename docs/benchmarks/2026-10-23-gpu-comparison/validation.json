@@ -1,0 +1,20 @@
+{
+  "heldout_evaluations_regraded": 20,
+  "heldout_predictions_regraded": 2560,
+  "serving_predictions_regraded": 3328,
+  "agent_episodes_regraded": 16,
+  "h100_serving_waves_missing": 10,
+  "h100_agent_episodes_missing": 16,
+  "shared_adapter_digests_match": true,
+  "training_settings_match_except_gpu_and_owned_identities": true,
+  "source_attestations_verified": 8,
+  "positive_gradients_verified": 8,
+  "train_eval_disjoint": true,
+  "training_regions_verified": "us-east",
+  "request_timestamps_verified": true,
+  "cleanup_recorded": true,
+  "owned_sandboxes_remaining": 0,
+  "recovery_succeeded": false,
+  "partial_failure_retained": true,
+  "shared_evaluator_functions_equivalent": true
+}
