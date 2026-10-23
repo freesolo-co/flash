@@ -230,9 +230,12 @@ def test_resume_uploader_uploads_each_completed_step(worker_context, tmp_path):
     )
 
     original = rl_checkpoints._worker_hf.upload_resume_checkpoint
-    rl_checkpoints._worker_hf.upload_resume_checkpoint = lambda step, path, **k: seen.append(
-        int(step)
-    )
+    rl_checkpoints._worker_hf.upload_resume_checkpoint = lambda step, path, **k: (
+        seen.append(int(step)),
+        _publication.PublicationResult(
+            resume=_publication.ArtifactCommit("test-commit", "test-revision")
+        ),
+    )[1]
     try:
         _write_step(local_dir, 4)
         uploader.start()
