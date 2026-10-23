@@ -365,6 +365,7 @@ def _write_rl_launch_config(inp, files, *, gdn_reset_arch: str | None, loggers) 
     config = {
         "readiness_path": files["readiness_path"],
         "dp_cards": int(inp["dp_cards"]),
+        "rollout_pool": inp.get("rollout_pool"),
         "reentrant_checkpointing": bool(inp["reentrant_checkpointing"]),
         "multimodal": bool(inp["multimodal"]),
         "per_turn_credit": bool(inp["per_turn_credit"]),

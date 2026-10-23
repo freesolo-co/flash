@@ -91,6 +91,13 @@ _VERL_METRIC_FIELDS = (
     ("actor/entropy", "entropy"),
     ("response_length/mean", "mean_completion_tokens"),
     ("response_length/clip_ratio", "truncation_rate"),
+    ("timing_s/gen", "rollout_seconds"),
+    ("timing_s/update_actor", "actor_update_seconds"),
+    ("timing_s/update_weights", "publication_seconds"),
+    ("rollout_pool/gpus", "rollout_gpus"),
+    ("rollout_pool/replicas", "rollout_replicas"),
+    ("rollout_pool/training_gpus", "training_gpus"),
+    ("rollout_pool/published_step", "published_step"),
 )
 _ADVANTAGE_MIN_KEY = "critic/advantages/min"
 _ADVANTAGE_MAX_KEY = "critic/advantages/max"

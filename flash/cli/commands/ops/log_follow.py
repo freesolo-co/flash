@@ -165,6 +165,13 @@ _FOLLOW_METRIC_FIELDS = (
     ("truncation_rate", "trunc"),
     ("discarded_rollouts", "discarded"),
     ("max_completion_tokens", "max_comp_tokens"),
+    ("rollout_seconds", "rollout_s"),
+    ("actor_update_seconds", "update_s"),
+    ("publication_seconds", "publish_s"),
+    ("rollout_gpus", "rollout_gpus"),
+    ("rollout_replicas", "replicas"),
+    ("training_gpus", "training_gpus"),
+    ("published_step", "published_step"),
 )
 
 

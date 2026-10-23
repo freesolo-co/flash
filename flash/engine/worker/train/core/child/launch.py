@@ -64,6 +64,10 @@ def configure(options, overrides):
             engine._target_ = "flash.engine.worker.train.core.child.configuration.FlashEngineConfig"
             engine.strategy = "flash_" + str(engine.strategy)
     auto_set_device(config)
+    if options.algorithm != "sft":
+        from flash.engine.worker.train.rl.launch.pool import validate_pool_config
+
+        validate_pool_config(config, options)
     return config
 
 
@@ -112,6 +116,12 @@ def run_rl(config, algorithm):
 
     from flash.engine.worker.train.core.child.trainer import FlashTaskRunner
 
+    if config.actor_rollout_ref.model.runtime_options.get("rollout_pool") is not None:
+        from verl.checkpoint_engine.base import CheckpointEngineRegistry
+
+        # Resolve the optional CuPy/NCCL backend before Ray creates training actors.
+        # The pilot image must install it; never repair dependencies on a paid GPU.
+        CheckpointEngineRegistry.get("nccl")
     runner = ray.remote(num_cpus=1)(FlashTaskRunner)
     validate_config(
         config=config,

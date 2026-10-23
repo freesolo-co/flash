@@ -22,6 +22,13 @@ _METRIC_KEYS = (
     "response_length/mean",
     "response_length/clip_ratio",
     "timing_s/step",
+    "timing_s/gen",
+    "timing_s/update_actor",
+    "timing_s/update_weights",
+    "rollout_pool/gpus",
+    "rollout_pool/replicas",
+    "rollout_pool/training_gpus",
+    "rollout_pool/published_step",
 )
 
 

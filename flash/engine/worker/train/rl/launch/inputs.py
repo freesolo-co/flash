@@ -410,7 +410,13 @@ def _assemble_grpo_inputs(
     pinned,
     context: WorkerContext,
 ):
+    from flash.engine.worker.train.rl.launch.pool import RolloutPool
+
+    pool = RolloutPool.from_env(os.environ)
+    allocated = gpu_count_of(context.config.spec)
+    trainer_gpus = pool.trainer_gpus(allocated) if pool else allocated
     return {
+        "rollout_pool": pool.encode() if pool else None,
         "env": env,
         "tok": tok,
         "processor": processor,
@@ -440,7 +446,7 @@ def _assemble_grpo_inputs(
         # a checkpoint written at the executed width read as the wrong topology and every retry
         # restarted from step 0. opd binds one value for both phases; this is grpo's.
         "dp_cards": rl_data_parallel_cards(
-            gpu_count_of(context.config.spec),
+            trainer_gpus,
             int(schedule["prompts_per_step"]) * int(options["group_size"]),
         ),
         "mask_truncated_completions": options["mask_truncated_completions"],
