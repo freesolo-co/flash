@@ -1,6 +1,6 @@
 # Follow-ups from the production retest
 
-These are proposals based on observed behavior, not measured speedup claims. Test results belong in REPORT.md.
+These are proposals based on observed behavior, not measured speedup claims. See the [production retest report](production-retest-2026-10-22.md) for test outcomes.
 
 | Priority | Proposal | Evidence and validation |
 | --- | --- | --- |
