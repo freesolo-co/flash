@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import sys
 import time
 from dataclasses import replace
 from types import SimpleNamespace
@@ -11,6 +12,7 @@ import pytest
 from flash.core.spec import JobSpec
 from flash.providers.core.base import UnreconciledCreateError, get_gpu_info
 from flash.providers.modal import api, prefetch
+from flash.providers.modal.api import call as modal_call
 from flash.providers.modal.handles import ModalJobHandle
 from flash.providers.modal.pricing import (
     CPU_HOURLY,
@@ -37,7 +39,9 @@ def warmer(monkeypatch):
     class Missing(Exception):
         pass
 
-    state = SimpleNamespace(existing=None, creates=[], events=[], fail_create=False, exit=0)
+    state = SimpleNamespace(
+        existing=None, creates=[], events=[], fail_create=False, fail_reconcile=False, exit=0
+    )
     sandbox = SimpleNamespace(
         object_id="sb-weights",
         wait=AsyncMethod(lambda: state.events.append("wait")),
@@ -46,13 +50,21 @@ def warmer(monkeypatch):
     )
 
     def find(*args, **kwargs):
+        if state.creates and state.fail_reconcile == "lookup":
+            raise OSError("private transport detail")
         if state.existing is None:
             raise Missing
         return state.existing
 
     def create(*args, **kwargs):
         state.creates.append((args, kwargs))
-        sandbox.get_tags = AsyncMethod(lambda: kwargs["tags"])
+
+        def tags():
+            if state.fail_reconcile == "tags":
+                raise OSError("private transport detail")
+            return kwargs["tags"]
+
+        sandbox.get_tags = AsyncMethod(tags)
         state.existing = sandbox
         if state.fail_create:
             raise OSError("lost response")
@@ -68,6 +80,7 @@ def warmer(monkeypatch):
         Sandbox=SimpleNamespace(create=AsyncMethod(create), from_name=AsyncMethod(find)),
         exception=SimpleNamespace(NotFoundError=Missing),
     )
+    state.modal = modal
     monkeypatch.setattr(
         api, "call", lambda operation, **kw: asyncio.run(operation(modal, object()))
     )
@@ -147,3 +160,56 @@ def test_bad_prefetch_meter_is_rejected():
                 }
             )
         )
+
+
+@pytest.mark.parametrize("failure", ["lookup", "tags"])
+def test_lost_create_and_failed_reconciliation_remain_ambiguous(warmer, failure):
+    warmer.fail_create = True
+    warmer.fail_reconcile = failure
+    with pytest.raises(UnreconciledCreateError, match="could not be reconciled") as error:
+        prepare()
+    assert "private transport detail" not in str(error.value)
+    assert len(warmer.creates) == 1
+    assert not warmer.events
+
+
+@pytest.mark.parametrize("phase", ["lookup", "create", "reconcile"])
+def test_cpu_create_timeout_preserves_launch_uncertainty(warmer, monkeypatch, phase):
+    # Exercise the real api.call deadline conversion; the fake transport never completes
+    # at the selected stage, so this asserts classification rather than elapsed wall time.
+    module = warmer.modal
+    original_find = module.Sandbox.from_name.fn
+    original_create = module.Sandbox.create.fn
+
+    async def find(*args, **kwargs):
+        if phase == "lookup" or (phase == "reconcile" and warmer.creates):
+            await asyncio.Future()
+        return original_find(*args, **kwargs)
+
+    async def create(*args, **kwargs):
+        sandbox = original_create(*args, **kwargs)
+        await asyncio.Future()
+        return sandbox
+
+    async def close(*args):
+        return None
+
+    if phase == "reconcile":
+        warmer.fail_create = True
+    module.Sandbox.from_name = SimpleNamespace(aio=find)
+    if phase == "create":
+        module.Sandbox.create = SimpleNamespace(aio=create)
+    module.Client = SimpleNamespace(
+        from_credentials=AsyncMethod(lambda *args: SimpleNamespace(__aexit__=close))
+    )
+    monkeypatch.setitem(sys.modules, "modal", module)
+    monkeypatch.setattr(api, "credentials", lambda: ("test-id", "test-secret"))
+    monkeypatch.setattr(
+        api,
+        "call",
+        lambda operation, **kwargs: modal_call(operation, timeout=0.01),
+    )
+    expected = api.ModalApiError if phase == "lookup" else UnreconciledCreateError
+    with pytest.raises(expected):
+        prepare()
+    assert len(warmer.creates) == int(phase != "lookup")

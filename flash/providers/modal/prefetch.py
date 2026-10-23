@@ -3,24 +3,33 @@
 from __future__ import annotations
 
 import hashlib
+import inspect
 import json
 import re
 import time
 
+from flash.engine.support.model_snapshot import snapshot_has_weights
 from flash.providers.core.base import UnreconciledCreateError
 from flash.providers.modal import api
 from flash.providers.modal.pricing import CPU_HOURLY, MEMORY_GIB_HOURLY
 
-_SCRIPT = """import json, os
-from huggingface_hub import snapshot_download
-from pathlib import Path
+# Ship the same dependency-free validator used by the GPU worker; the CPU image has no Flash.
+_SCRIPT = (
+    "import json, os\nos.environ['HF_HUB_DISABLE_XET'] = '1'\n"
+    "from huggingface_hub import snapshot_download\n"
+    + inspect.getsource(snapshot_has_weights)
+    + """
 model, revision = json.loads(os.environ['FLASH_BASE_MODEL'])
-root = snapshot_download(model, revision=revision, cache_dir='/weight-cache/hf-cache/hub',
-    token=os.environ.get('HF_TOKEN'),
-    ignore_patterns=['*.pth', '*.gguf', 'original/*', '*.onnx', '*.msgpack', '*.h5'])
-if not any(Path(root).glob('*.safetensors')) and not any(Path(root).glob('pytorch_model*.bin')):
-    raise RuntimeError('Pinned base snapshot has no model weights')
+for force in (False, True):
+    root = snapshot_download(model, revision=revision, cache_dir='/weight-cache/hf-cache/hub',
+        token=os.environ.get('HF_TOKEN'), force_download=force,
+        ignore_patterns=['*.pth', '*.gguf', 'original/*', '*.onnx', '*.msgpack', '*.h5'])
+    if snapshot_has_weights(root):
+        break
+else:
+    raise RuntimeError('Pinned base snapshot has no complete model weights after forced download')
 """
+)
 
 
 def prepare(spec, *, attempt, payload, deadline_at):
@@ -46,8 +55,10 @@ def prepare(spec, *, attempt, payload, deadline_at):
         "flash_name": name,
     }
     started = time.time()
+    create_pending = False
 
     async def warm(modal, client):
+        nonlocal create_pending
         sandbox = await _find(modal, client, name, tags)
         if sandbox is None:
             app = await modal.App.lookup.aio(
@@ -66,6 +77,7 @@ def prepare(spec, *, attempt, payload, deadline_at):
             if remaining <= 0:
                 raise TimeoutError("Run deadline expired before base-model staging")
             try:
+                create_pending = True
                 sandbox = await modal.Sandbox.create.aio(
                     "python",
                     "-c",
@@ -91,11 +103,17 @@ def prepare(spec, *, attempt, payload, deadline_at):
                     client=client,
                 )
             except Exception:
-                sandbox = await _find(modal, client, name, tags)
+                try:
+                    sandbox = await _find(modal, client, name, tags)
+                except Exception:
+                    raise UnreconciledCreateError(
+                        "CPU prefetch launch could not be reconciled"
+                    ) from None
                 if sandbox is None:
                     raise UnreconciledCreateError(
                         "CPU prefetch launch could not be reconciled"
                     ) from None
+            create_pending = False
         try:
             await sandbox.wait.aio()
             if await sandbox.poll.aio() != 0:
@@ -106,7 +124,15 @@ def prepare(spec, *, attempt, payload, deadline_at):
             await sandbox.terminate.aio(wait=True)
         return sandbox.object_id
 
-    sandbox_id = api.call(warm, deadline_at=deadline_at, timeout=1080)
+    try:
+        sandbox_id = api.call(warm, deadline_at=deadline_at, timeout=1080)
+    except api.ModalApiError:
+        # api.call's deadline can cancel create/reconciliation before it returns an identity.
+        if create_pending:
+            raise UnreconciledCreateError(
+                "CPU prefetch launch outcome unknown; reconcile before retrying"
+            ) from None
+        raise
     seconds = max(0.0, time.time() - started)
     return {
         "sandbox_id": sandbox_id,
