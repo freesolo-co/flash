@@ -102,12 +102,14 @@ def test_runtime_failure_fences_all_tenants_and_retains_usage(tmp_path):
     runtime = Runtime(journal, BrokenBackend(), lock_path=tmp_path / "owner.lock")
     runtime.start()
     try:
-        a = journal.create(
-            Principal("a", "a"), "a", {"algorithm": "sft", "seed": 0, "learning_rate": 0.001}
-        )
-        b = journal.create(
-            Principal("b", "b"), "b", {"algorithm": "opd", "seed": 0, "learning_rate": 0.001}
-        )
+        # both tenants must be admitted before the deliberately failing worker can claim.
+        with journal.lock:
+            a = journal.create(
+                Principal("a", "a"), "a", {"algorithm": "sft", "seed": 0, "learning_rate": 0.001}
+            )
+            b = journal.create(
+                Principal("b", "b"), "b", {"algorithm": "opd", "seed": 0, "learning_rate": 0.001}
+            )
         runtime.wake.set()
         deadline = time.monotonic() + 5
         while (
