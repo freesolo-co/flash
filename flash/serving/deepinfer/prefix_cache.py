@@ -71,7 +71,7 @@ class PrefixCache:
             ),
         )
 
-    def _evict(self, key):
+    def _evict(self, key, *, spill=True):
         prefix = self.entries.pop(key)
         self.engine.scheduler.free_seq(prefix.sequence)
 
@@ -79,7 +79,7 @@ class PrefixCache:
         now = time.monotonic()
         for key, value in list(self.entries.items()):
             if now - value.touched >= self.ttl:
-                self._evict(key)
+                self._evict(key, spill=False)
         reserve = math.ceil(prompt_tokens / self.engine.cache_config.block_size)
         while self.entries and self.engine.scheduler.get_num_free_gpu_blocks() < reserve:
             self._evict(self._victim())
@@ -110,14 +110,18 @@ class PrefixCache:
                 enqueue=False,
             )
             seq.data, seq.compressed_data = metadata.data, metadata.compressed_data
+            if len(tokens) != donor.data.get_len():
+                # Text masks are length-dependent even for a token-exact prefix.
+                # A new question must not inherit the donor prompt's shorter mask.
+                processor = self.engine.multi_modal_processor
+                seq.multi_modal_data = (
+                    processor.multi_modal_mapper(metadata.multi_modal_data)
+                    if processor is not None
+                    else None
+                )
         return seq
 
-    def admit(self, command, params):
-        import numpy as np
-
-        request_id, tokens = command["id"], command["tokens"]
-        namespace = command.get("cache_namespace")
-        self.prune(len(tokens) + command.get("sampling", {}).get("max_tokens", 0))
+    def _match(self, namespace, tokens, params):
         matches = [
             (key, value)
             for key, value in self.entries.items()
@@ -126,9 +130,26 @@ class PrefixCache:
             and len(value.tokens) < len(tokens) - 1
             and value.tokens == tuple(tokens[: len(value.tokens)])
         ]
+        return max(matches, key=lambda item: len(item[1].tokens)) if matches else None
+
+    def _make_room(self, storage_tokens, *, spill=True):
+        while self.entries and (
+            len(self.entries) >= self.max_entries
+            or sum(value.storage_tokens for value in self.entries.values()) + storage_tokens
+            > self.max_tokens
+        ):
+            self._evict(self._victim(), spill=spill)
+
+    def admit(self, command, params):
+        import numpy as np
+
+        request_id, tokens = command["id"], command["tokens"]
+        namespace = command.get("cache_namespace")
+        self.prune(len(tokens) + command.get("sampling", {}).get("max_tokens", 0))
+        match = self._match(namespace, tokens, params)
         self.hits[request_id] = 0
-        if matches:
-            key, prefix = max(matches, key=lambda item: len(item[1].tokens))
+        if match is not None:
+            key, prefix = match
             self._touch(key, prefix)
             self._fork(prefix.sequence, request_id, params, tokens)
             self.hits[request_id] = len(prefix.tokens)
@@ -178,12 +199,7 @@ class PrefixCache:
             del self.pending[request_id]
             if seq.num_cached_tokens != len(tokens):
                 raise RuntimeError("Native prefix checkpoint advanced before snapshot")
-            while self.entries and (
-                len(self.entries) >= self.max_entries
-                or sum(value.storage_tokens for value in self.entries.values()) + storage_tokens
-                > self.max_tokens
-            ):
-                self._evict(self._victim())
+            self._make_room(storage_tokens)
             donor = self.engine.scheduler.detach_waiting_for_prefix_cache(request_id)
             donor.request_id = "prefix-" + uuid.uuid4().hex
             self.entries[donor.request_id] = Prefix(
@@ -198,4 +214,4 @@ class PrefixCache:
 
     def close(self):
         for key in list(self.entries):
-            self._evict(key)
+            self._evict(key, spill=False)

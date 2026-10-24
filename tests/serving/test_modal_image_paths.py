@@ -160,6 +160,7 @@ def test_image_extras_cover_every_directly_imported_third_party_package() -> Non
             "engram_transport.py",
             "fp8.py",
             "prefix_cache.py",
+            "snapshots.py",
             "provenance.py",
         }:
             continue

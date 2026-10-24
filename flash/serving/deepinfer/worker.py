@@ -19,7 +19,7 @@ from flash.serving.deepinfer.config import (
     RUNTIME_ROOT,
     SEQUENCES_PER_RANK,
 )
-from flash.serving.deepinfer.prefix_cache import PrefixCache
+from flash.serving.deepinfer.tiered_cache import TieredPrefixCache
 
 
 def initialize(rank: int, model_path: str):
@@ -149,7 +149,7 @@ def run_rank(rank, model_path, incoming, outgoing, stopped):
         print(f"DEEPINFER_LOADED {proof}", flush=True)
         outgoing.put({"type": "ready", "rank": rank, "provenance": proof})
         active = set()
-        cache = PrefixCache(engine)
+        cache = TieredPrefixCache(engine)
         batches = {}
         last_directory = None
         last_heartbeat = time.monotonic()
