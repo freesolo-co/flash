@@ -40,7 +40,7 @@ hot/scan and uniform-scan traces. These are synthetic controlled tests, not a
 customer trace or a production capacity qualification.
 
 The service has four B200 ranks, EP=4, native speculation=3, batch invariance,
-YOCO, FP8 execution of expanded expert weights, CPU Engram, 8 GiB KV per rank,
+YOCO, FP8 execution of expanded expert weights, CPU Engram, 8 GiB KV per rank, a 0.96 PyTorch allocator fraction,
 4096-token prefill chunks and a 24-sequence/rank cap. This is an experimental
 accelerated baseline, not the deployed bridge's default configuration. Both arms
 use the same immutable model revision
@@ -71,18 +71,19 @@ Run from this directory with Python 3.12 and `modal==1.6.2` installed:
 ```sh
 export KV_AB_WORKDIR=/tmp/flash-deepinfer-kv-ab
 python control.py launch primary2 10800
-python control.py launch peer2 10800
-python relay_launch.py
 python stage.py primary2
-python stage.py peer2
 # Wait for /results/ready.json on each replica before issuing commands.
 python control.py exec primary2 python /opt/DeepInfer/driver.py
 python control.py exec primary2 python /opt/DeepInfer/routing.py
-# Other experiment PRs add their respective drivers.
-python sharing.py "$KV_AB_WORKDIR"
-python disaggregation.py "$KV_AB_WORKDIR"
+# Companion PRs add their respective drivers. For the sharing/P-D PR stack:
+# python control.py launch peer2 10800
+# python relay_launch.py
+# python stage.py primary2  # only when starting a fresh service, not a second copy
+# python stage.py peer2
+# python sharing.py "$KV_AB_WORKDIR"
+# python disaggregation.py "$KV_AB_WORKDIR"
 python control.py stop primary2
-python control.py stop peer2
+# python control.py stop peer2
 # Terminate the relay ID recorded in $KV_AB_WORKDIR/relay.json as well.
 ```
 
