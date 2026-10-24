@@ -1,0 +1,38 @@
+[
+  {
+    "engine_class": "deepinfer.engine.llm_engine.LLMEngine",
+    "engine_file": "/opt/DeepInfer/deepinfer/engine/llm_engine.py",
+    "native_file": "/opt/DeepInfer/deepinfer/_C.cpython-312-x86_64-linux-gnu.so",
+    "native_sha256": "25f79f259b6da8c070aa30dd91cecdaa4f046878f18a4590722da4a43eea3e8e",
+    "gpu_name": "NVIDIA B200",
+    "torch": "2.13.0+cu132",
+    "cuda": "13.2"
+  },
+  {
+    "engine_class": "deepinfer.engine.llm_engine.LLMEngine",
+    "engine_file": "/opt/DeepInfer/deepinfer/engine/llm_engine.py",
+    "native_file": "/opt/DeepInfer/deepinfer/_C.cpython-312-x86_64-linux-gnu.so",
+    "native_sha256": "25f79f259b6da8c070aa30dd91cecdaa4f046878f18a4590722da4a43eea3e8e",
+    "gpu_name": "NVIDIA B200",
+    "torch": "2.13.0+cu132",
+    "cuda": "13.2"
+  },
+  {
+    "engine_class": "deepinfer.engine.llm_engine.LLMEngine",
+    "engine_file": "/opt/DeepInfer/deepinfer/engine/llm_engine.py",
+    "native_file": "/opt/DeepInfer/deepinfer/_C.cpython-312-x86_64-linux-gnu.so",
+    "native_sha256": "25f79f259b6da8c070aa30dd91cecdaa4f046878f18a4590722da4a43eea3e8e",
+    "gpu_name": "NVIDIA B200",
+    "torch": "2.13.0+cu132",
+    "cuda": "13.2"
+  },
+  {
+    "engine_class": "deepinfer.engine.llm_engine.LLMEngine",
+    "engine_file": "/opt/DeepInfer/deepinfer/engine/llm_engine.py",
+    "native_file": "/opt/DeepInfer/deepinfer/_C.cpython-312-x86_64-linux-gnu.so",
+    "native_sha256": "25f79f259b6da8c070aa30dd91cecdaa4f046878f18a4590722da4a43eea3e8e",
+    "gpu_name": "NVIDIA B200",
+    "torch": "2.13.0+cu132",
+    "cuda": "13.2"
+  }
+]

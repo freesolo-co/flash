@@ -1,0 +1,83 @@
+import os, sys, math
+def initialize(rank, args):
+    os.environ.update({
+        "RANK": "0", "WORLD_SIZE": "1", "DEEPINFER_ACCELERATOR": "nvidia",
+        "DEEPINFER_USE_NEXTN_DECODE": str(args.spec),
+        "DEEPINFER_ENABLE_MTP_VARLEN": "1" if args.spec else "0",
+        "DEEPINFER_DFLASH_CONFIDENCE_HEAD_TEMPERATURE": str(args.confidence_temperature),
+        "DEEPINFER_ENGRAM_FORCE_GPU_STORAGE": "0" if args.engram_storage == "cpu" else "1",
+        "DEEPINFER_YOCO_PREFILL_TRUNCATION_MODE": "compact" if args.yoco else "off",
+        "DEEPINFER_YOCO_PREFILL_KEEP_TOKENS": "140" if args.yoco else "0",
+        "DEEPINFER_PREFILL_STORE_EXTRA_STATE": "1",
+        "DEEPINFER_PREFILL_STORE_EXTRA_SIZE": str(args.export_history),
+        "DEEPINFER_OVERRIDE_NUM_EXTRA_EXPERTS": str(args.extra_experts),
+        "DEEPINFER_BATCH_INVARIANT": str(args.batch_invariant),
+        "DEEPINFER_LOGGING_INTERVAL_STEP": "0",
+        "DEEPINFER_PREFILL_ATTEMPT_INTERVAL": "1",
+        "DEEPINFER_PREFILL_ANY_ATTEMPT_INTERVAL": "4",
+        "DEEPINFER_FORCE_LOAD_BALANCE": "0",
+        "DEEPINFER_CUDAGRAPH_BATCH_SIZE_INTERVAL": str(args.graph_interval),
+        "DEEPINFER_DFLASH_CUDAGRAPH_BATCH_SIZE_INTERVAL": str(args.graph_interval),
+        "BENCH_DENSE_SHORT_CONTEXT": str(args.dense_short_context),
+        "BENCH_NO_STATE_EXPORT": str(args.offline_state_pool),
+        "BENCH_TEXT_ONLY": str(args.text_only),
+    })
+    if args.text_only:
+        os.environ["DEEPINFER_USE_MULTIMODAL_POOL"] = "0"
+    sys.path[:0] = ["/opt/DeepInfer/examples", "/opt/DeepInfer"]
+    from _config import create_llm, setup_common_env, setup_cuda_visible_devices
+    setup_common_env(model_name="/weights/model", sampler_force_topk=0,
+                     set_override_experts=True, enable_eplb=True)
+    os.environ["DEEPINFER_EXPERT_REARRANGEMENT_STEP_INTERVAL"] = str(args.eplb_interval)
+    os.environ["DEEPINFER_EXPERT_COUNT_WINDOW_SIZE"] = str(args.eplb_window)
+    os.environ["DEEPINFER_REARRANGE_AFTER_PREFILL_IN_NORMAL_ENGINE"] = str(args.eplb_after_prefill)
+    if args.local_transport:
+        os.environ["EP_DISABLE_GIN"] = "1"
+        setup_cuda_visible_devices(rank, 1, args.gpus)
+        from engram_local import install
+        install()
+        import torch
+        # Leave physical VRAM for CUDA/NCCL allocations outside PyTorch. The
+        # independent physical-memory watchdog enforces the user's 85% limit.
+        torch.cuda.set_per_process_memory_fraction(args.loader_allocator_memory_fraction)
+    if args.offline_state_pool:
+        from deepinfer.worker.cache_engine import GPUCacheInterface
+        def forbid_state_export(*a, **kw):
+            raise RuntimeError("State export/import is disabled with the single-pool offline memory budget")
+        GPUCacheInterface.select_state_slice_to_store = staticmethod(forbid_state_export)
+        GPUCacheInterface.load_state_from_store_to_prefill_cache = staticmethod(forbid_state_export)
+    from deepinfer.worker.base import WorkerBase
+    original_profile = WorkerBase.profile_num_available_blocks
+    def profile_with_capacity_check(self):
+        torch.cuda.empty_cache()
+        torch.cuda.set_per_process_memory_fraction(args.allocator_memory_fraction)
+        blocks = original_profile(self)
+        floor = math.ceil((args.max_model_len + 64) / (0.8 * 128))
+        assert blocks >= floor, ("Cannot fit one native-length sequence", blocks, floor)
+        # Explicit cache budget, within the runtime's profiled capacity.
+        self.cache_config.num_gpu_blocks = min(blocks, int(args.kv_gib * 2**30 / 114048) // 2 * 2)
+        assert self.cache_config.num_gpu_blocks >= floor
+        return self.cache_config.num_gpu_blocks
+    WorkerBase.profile_num_available_blocks = profile_with_capacity_check
+    args.engine_max_num_seqs = max(args.batches)
+    llm = create_llm(
+        "/weights/model", rank, ep_size=args.gpus, data_parallel_size=args.gpus,
+        max_num_batched_tokens=args.chunk, max_model_len=args.max_model_len or (args.input_tokens + args.output_tokens + 64),
+        max_num_seqs=max(args.batches), gpu_memory_utilization=args.memory,
+        lookahead_tokens=min(1, args.spec), disable_log_stats=True,
+    )
+    from deepinfer._C.engine import RequestOutput, SequenceData
+    from deepinfer.sampling_params import SamplingParams
+    from deepinfer.model_executor.models.v4_modules.engram import CompressedTokenizer
+    import numpy as np
+    tokenizer = llm.get_tokenizer()
+    engine = llm.llm_engine
+    import hashlib, inspect, json
+    from pathlib import Path
+    import deepinfer._C as native
+    provenance={'engine_class':type(engine).__module__+'.'+type(engine).__name__,
+      'engine_file':inspect.getfile(type(engine)),'native_file':native.__file__,
+      'native_sha256':hashlib.sha256(Path(native.__file__).read_bytes()).hexdigest(),
+      'gpu_name':torch.cuda.get_device_name(),'torch':torch.__version__,'cuda':torch.version.cuda}
+    (Path(args.results)/f'loaded-rank-{rank}.json').write_text(json.dumps(provenance))
+    return llm, tokenizer, engine

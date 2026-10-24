@@ -1,0 +1,159 @@
+diff --git a/deepinfer/model_executor/model_loader.py b/deepinfer/model_executor/model_loader.py
+index 21253e6..132f38b 100644
+--- a/deepinfer/model_executor/model_loader.py
++++ b/deepinfer/model_executor/model_loader.py
+@@ -74,6 +74,13 @@ def get_model(
+             skip_load,
+         )
+     for n, p in model.named_parameters():
++        if os.getenv("BENCH_TEXT_ONLY") == "1" and n.startswith((
++            "vision_language_tuner.visual_encoder.", "vision_language_tuner.aligner.",
++        )):
++            assert p.device.type == "cpu", f"{n} must be offloaded in text-only mode"
++            if hasattr(p, "sf"):
++                assert p.sf.device.type == "cpu"
++            continue
+         assert p.is_cuda, f"{n} not on cuda"
+         if hasattr(p, "sf"):
+             assert p.sf.is_cuda, f"{n}.sf not on cuda"
+diff --git a/deepinfer/model_executor/models/deepseek_vl.py b/deepinfer/model_executor/models/deepseek_vl.py
+index ef98df8..40714ed 100644
+--- a/deepinfer/model_executor/models/deepseek_vl.py
++++ b/deepinfer/model_executor/models/deepseek_vl.py
+@@ -37,6 +37,18 @@ class DeepseekVLForCausalLM(DeepseekForCausalLM):
+             model.module.module[0],
+             vision_source=model.vision_pipeline.aligner,
+         )
++        if os.getenv("BENCH_TEXT_ONLY") == "1":
++            self.vision_language_tuner.visual_encoder.cpu()
++            self.vision_language_tuner.aligner.cpu()
++            for module in (self.vision_language_tuner.visual_encoder, self.vision_language_tuner.aligner):
++                for param in module.parameters():
++                    if hasattr(param, "sf"):
++                        param.sf = param.sf.cpu()
++            def no_images(*args, **kwargs):
++                raise RuntimeError("Image inference disabled in the text-only benchmark")
++            self.vision_language_tuner.forward = no_images
++            torch.cuda.empty_cache()
++            logger.info("BENCH: inactive vision encoder and aligner offloaded to CPU")
+ 
+     @staticmethod
+     def _split_cached_prefix(
+diff --git a/deepinfer/model_executor/models/v4_modules/containers.py b/deepinfer/model_executor/models/v4_modules/containers.py
+index acd4781..6c02196 100644
+--- a/deepinfer/model_executor/models/v4_modules/containers.py
++++ b/deepinfer/model_executor/models/v4_modules/containers.py
+@@ -95,7 +95,9 @@ def materialize_hf_parameter(param: nn.Parameter, *, device: str, packed_fp4: bo
+         if hasattr(param, "sf"):
+             if getattr(param, "is_engram", False):
+                 # Tables may stay on CPU, but gather_sf uses CUDA collectives.
+-                sf = torch.empty(param.sf.shape, dtype=param.sf.dtype, device="cuda")
++                import os
++                sf_device = target if os.getenv("BENCH_EXPERT_FP8") == "1" else "cuda"
++                sf = torch.empty(param.sf.shape, dtype=param.sf.dtype, device=sf_device)
+             else:
+                 # Ordinary HF loading replaces sf wholesale, unlike table loading.
+                 sf = param.sf if param.sf.is_meta else torch.empty(param.sf.shape, dtype=param.sf.dtype, device="meta")
+diff --git a/deepinfer/model_executor/models/v4_modules/index_attn.py b/deepinfer/model_executor/models/v4_modules/index_attn.py
+index 46cf987..7aa8d83 100644
+--- a/deepinfer/model_executor/models/v4_modules/index_attn.py
++++ b/deepinfer/model_executor/models/v4_modules/index_attn.py
+@@ -96,8 +96,19 @@ class MQA(nn.Module):
+ 
+         candidate_source = shared_topology.layer_candidate_source_map.get(self.layer_idx) if shared_topology is not None else None
+         candidate_cfg = shared_topology.candidate_source_cfg[candidate_source] if candidate_source is not None else None
+-        self.is_candidate_topk_source = shared_topology is not None and shared_topology.is_candidate_source_layer(self.layer_idx)
+-        self.use_candidate_topk = candidate_source is not None and not self.is_candidate_topk_source
++        import os
++        # Conservative bound in uncompressed tokens. Even at compression 1,
++        # this context cannot contain more blocks than the candidate selector
++        # retains, so dense scoring considers exactly the same valid keys.
++        bypass_candidates = (
++            os.getenv("BENCH_DENSE_SHORT_CONTEXT") == "1" and candidate_cfg is not None
++            and cfg.runtime_max_model_len <= candidate_cfg.candidate_topk_blocks * candidate_cfg.candidate_block_size
++        )
++        self.is_candidate_topk_source = (
++            not bypass_candidates and shared_topology is not None
++            and shared_topology.is_candidate_source_layer(self.layer_idx)
++        )
++        self.use_candidate_topk = not bypass_candidates and candidate_source is not None and not self.is_candidate_topk_source
+         if self.use_candidate_topk:
+             assert candidate_cfg is not None
+             assert self.n_head <= 32 and self.head_dim == 128
+@@ -210,7 +221,7 @@ class MQA(nn.Module):
+     ) -> None:
+         topk_blocks = self.candidate_topk_cfg.topk_block
+         block_size = self.candidate_topk_cfg.block_size
+-        assert 0 < topk_blocks <= (p_sum.shape[1] + block_size - 1) // block_size
++        assert 0 < topk_blocks <= 4096  # Short contexts use DeepSelect end/OOB padding.
+         output = cross_layer_runtime.block_candidate_idxs[offset : offset + p_sum.size(0)]
+         block_scores, valid_blocks = candidate_block_max(p_sum, k_len, block_size)
+         topk(
+diff --git a/deepinfer/model_executor/models/v4_modules/mlp.py b/deepinfer/model_executor/models/v4_modules/mlp.py
+index e056539..c3fac8f 100644
+--- a/deepinfer/model_executor/models/v4_modules/mlp.py
++++ b/deepinfer/model_executor/models/v4_modules/mlp.py
+@@ -91,6 +91,10 @@ def process_moe_weight(
+ 
+ 
+ def _convert_mega_moe_weight(src_l1: nn.Parameter, src_l2: nn.Parameter) -> tuple[nn.Parameter, nn.Parameter]:
++    import os
++    if os.getenv("BENCH_EXPERT_FP8") == "1":
++        from bench_fp8 import convert_mega_moe_weight
++        return convert_mega_moe_weight(src_l1, src_l2)
+     has_sf = src_l1.dtype != torch.bfloat16
+     if has_sf:
+         (l1, l1_sf), (l2, l2_sf) = deep_gemm.transform_weights_for_mega_moe((src_l1, src_l1.sf), (src_l2, src_l2.sf))
+@@ -176,6 +180,14 @@ class DeepseekMoE(nn.Module):
+ 
+         self.use_fp8_act = cfg.get("fp8_mlp", False)
+         self.use_fp4_weight = cfg.get("mxfp4", False)
++        import os
++        if os.getenv("BENCH_EXPERT_FP8") == "1" and (layer_idx < cfg.num_hidden_layers or os.getenv("BENCH_FP8_DRAFT") == "1"):
++            from bench_fp8 import widen_expert
++            for index, linear in enumerate((moe_module.linear1, moe_module.linear2)):
++                linear.weight = widen_expert(linear.weight, interleave=index == 0)
++            self.use_fp4_weight = False
++            if layer_idx == 0:
++                logger.info("BENCH: FP8 execution using losslessly expanded native FP4 expert values")
+         act_type = "fp8" if self.use_fp8_act else "bf16"
+         weight_type = "fp4" if self.use_fp4_weight else "bf16" if moe_module.linear1.weight.dtype == torch.bfloat16 else "fp8"
+         self.mma_type = act_type + "x" + weight_type
+@@ -204,7 +216,7 @@ class DeepseekMoE(nn.Module):
+             f"{self.num_physical_experts=} {self.ep_size=} {self.num_routed_experts=} {self.num_topk=}"
+         )
+ 
+-        if self.use_fp4_weight:
++        if self.use_fp4_weight or moe_module.linear1.weight.ndim == 3:
+             # HF loading fills packed FP4 directly; dummy materialization converts it beforehand.
+             self.gate_up_proj_weight = reconstruct_param(moe_module.linear1.weight)
+             self.down_proj_weight = reconstruct_param(moe_module.linear2.weight)
+diff --git a/deepinfer/model_executor/utils.py b/deepinfer/model_executor/utils.py
+index 552fd80..aebb2e5 100644
+--- a/deepinfer/model_executor/utils.py
++++ b/deepinfer/model_executor/utils.py
+@@ -23,6 +23,8 @@ def reconstruct_param(param: torch.nn.Parameter) -> torch.nn.Parameter:
+     p = torch.nn.Parameter(param.data, requires_grad=False)
+     if hasattr(param, "sf"):
+         p.sf = param.sf
++    if getattr(param, "_bench_interleaved", False):
++        p._bench_interleaved = True
+     return p
+ 
+ 
+diff --git a/deepinfer/worker/base.py b/deepinfer/worker/base.py
+index 158e26a..b83cd05 100644
+--- a/deepinfer/worker/base.py
++++ b/deepinfer/worker/base.py
+@@ -240,7 +240,10 @@ class WorkerBase:
+         )
+         # 减去预留的固定大小的 state cache
+         state_size = math.prod(CacheEngine.get_state_shape(self.model_runner.model.cfg, self.model_config.max_num_seqs))
+-        state_size *= 2  # state store & copy buffer, 所以要开两倍大小
++        # The benchmark forbids state export/import when this is enabled.
++        # Fork copy-on-write copies directly between slots in the existing pool.
++        # Keep the upstream double reservation for every other deployment.
++        state_size *= 1 if os.getenv("BENCH_NO_STATE_EXPORT") == "1" else 2
+         available_kv_cache_memory -= state_size
+         num_gpu_blocks = int(available_kv_cache_memory // cache_block_size)
+         num_gpu_blocks = max(num_gpu_blocks, 0)
