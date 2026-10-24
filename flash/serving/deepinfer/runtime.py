@@ -8,6 +8,7 @@ import hashlib
 import importlib.util
 import json
 import multiprocessing
+import os
 import queue
 import time
 import uuid
@@ -29,6 +30,7 @@ from flash.serving.deepinfer.config import (
     SEQUENCES_PER_RANK,
     STARTUP_SECONDS,
 )
+from flash.serving.deepinfer.routing import CacheRouter
 from flash.serving.deepinfer.worker import run_rank
 
 
@@ -37,6 +39,8 @@ class Pending:
     rank: int
     events: asyncio.Queue
     cancelled: asyncio.Event
+    work: int = 0
+    prefill: int = 0
 
 
 class Runtime:
@@ -49,6 +53,8 @@ class Runtime:
         self.provenance: dict[int, dict] = {}
         self.failure: str | None = None
         self.pump = None
+        self.cache_router = CacheRouter(GPU_COUNT)
+        self.cache_routing = os.environ.get("FLASH_DEEPINFER_CACHE_ROUTING", "1") == "1"
 
     def _load_assets(self):
         from huggingface_hub import snapshot_download
@@ -134,6 +140,9 @@ class Runtime:
     def _deliver(self, event):
         if event["type"] == "fatal":
             raise RuntimeError("DeepInfer rank failed")
+        if event["type"] == "cache_directory":
+            self.cache_router.update(event["rank"], event["prefixes"])
+            return
         if event["type"] in {"ready", "heartbeat"}:
             self.last_seen[event["rank"]] = time.monotonic()
             if event["type"] == "ready":
@@ -144,6 +153,9 @@ class Runtime:
             return
         pending = self.pending.get(event["id"])
         if pending is not None:
+            if event["type"] == "tokens":
+                pending.work = max(0, pending.work - pending.prefill - 16 * len(event["tokens"]))
+                pending.prefill = 0
             if event["type"] == "cancelled":
                 pending.cancelled.set()
                 return
@@ -207,7 +219,11 @@ class Runtime:
     async def generate(self, request, tokens):
         self.assert_healthy()
         rank = min(range(GPU_COUNT), key=self.loads.__getitem__)
-        if request.cache_namespace:
+        if self.cache_routing:
+            rank = self.cache_router.choose(
+                request.cache_namespace, tokens, self.loads, self.pending
+            )
+        elif request.cache_namespace:
             affinity = (
                 hashlib.sha256(
                     (request.cache_namespace + ":" + str(tokens[:128])).encode()
@@ -219,7 +235,13 @@ class Runtime:
         if self.loads[rank] >= SEQUENCES_PER_RANK:
             raise OverflowError("DeepInfer replica is at capacity")
         request_id = uuid.uuid4().hex
-        pending = Pending(rank, asyncio.Queue(maxsize=256), asyncio.Event())
+        pending = Pending(
+            rank,
+            asyncio.Queue(maxsize=256),
+            asyncio.Event(),
+            len(tokens) + 16 * request.max_tokens,
+            len(tokens),
+        )
         self.pending[request_id] = pending
         self.loads[rank] += 1
         try:

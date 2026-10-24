@@ -151,6 +151,7 @@ def run_rank(rank, model_path, incoming, outgoing, stopped):
         active = set()
         cache = PrefixCache(engine)
         batches = {}
+        last_directory = None
         last_heartbeat = time.monotonic()
         while not stopped.is_set():
             # Bounded command draining leaves time for scheduling and other ranks.
@@ -161,6 +162,10 @@ def run_rank(rank, model_path, incoming, outgoing, stopped):
                     break
                 admit(engine, command, active, outgoing, cache, batches)
             step(engine, active, outgoing, cache, batches)
+            directory = cache.directory()
+            if directory != last_directory or time.monotonic() - last_heartbeat >= 1:
+                outgoing.put({"type": "cache_directory", "rank": rank, "prefixes": directory})
+                last_directory = directory
             if time.monotonic() - last_heartbeat >= 1:
                 outgoing.put({"type": "heartbeat", "rank": rank})
                 last_heartbeat = time.monotonic()

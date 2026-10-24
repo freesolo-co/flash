@@ -33,6 +33,7 @@ image = (
             "VIRTUAL_ENV": "/opt/deepinfer-venv",
             "DEEPINFER_ACCELERATOR": "nvidia",
             "PYTHONUNBUFFERED": "1",
+            "FLASH_DEEPINFER_CACHE_ROUTING": os.environ.get("FLASH_DEEPINFER_CACHE_ROUTING", "1"),
         }
     )
     .add_local_python_source("flash", copy=True)

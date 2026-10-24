@@ -48,6 +48,18 @@ model revision, tenant, messages, and thinking mode. Misses run off the event lo
 Delivery batching always flushes terminal tokens; the time limit is checked at
 engine-step boundaries and does not bound a stalled GPU collective.
 
+## Cache controls
+
+Set these operator environment variables when running `modal deploy`; the image
+records them and workers inherit them. They are not public request parameters.
+
+`FLASH_DEEPINFER_CACHE_ROUTING=1` enables live prefix-aware routing across the four
+DP ranks within a replica. Workers advertise exact namespace/prefix digests; stale
+advertisements expire after two seconds. Routing balances estimated queued prefill
+and decode work against saved prefill. Token equality is still checked by the
+worker. Set `0` to restore the original first-128-token hash affinity. This does
+not route between separate Modal replicas.
+
 ## Deployment and qualification
 
 The native bridge passed a **four-B200 smoke and performance run**; see the

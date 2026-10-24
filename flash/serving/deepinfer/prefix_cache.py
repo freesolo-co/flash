@@ -5,6 +5,9 @@ import time
 import uuid
 from collections import OrderedDict
 from dataclasses import dataclass
+from functools import cached_property
+
+from flash.serving.deepinfer.routing import fingerprint
 
 
 @dataclass
@@ -14,6 +17,10 @@ class Prefix:
     sequence: object
     touched: float
     storage_tokens: int = 0
+
+    @cached_property
+    def digest(self):
+        return fingerprint(self.tokens)
 
 
 class PrefixCache:
@@ -25,6 +32,12 @@ class PrefixCache:
         self.entries = OrderedDict()
         self.pending = {}
         self.hits = {}
+
+    def directory(self):
+        return [
+            {"namespace": prefix.namespace, "length": len(prefix.tokens), "digest": prefix.digest}
+            for prefix in self.entries.values()
+        ]
 
     def _evict(self, key):
         prefix = self.entries.pop(key)
