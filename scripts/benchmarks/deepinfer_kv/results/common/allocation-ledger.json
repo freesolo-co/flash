@@ -1,0 +1,55 @@
+{
+  "budget_usd": 500,
+  "max_concurrent_gpus": 8,
+  "allocation_limit_usd": 420,
+  "allocations": [
+    {
+      "label": "primary",
+      "started": 1792800842.907735,
+      "deadline": 1792811642.907735,
+      "reserved_usd": 100.24819200000002,
+      "state": "stopped",
+      "stopped": 1792801852.202899,
+      "exit_code": 137,
+      "elapsed_cost_upper": 9.36851994187935,
+      "hourly_rate_upper_usd": 33.416064000000006,
+      "host_memory_cap_gib": 256
+    },
+    {
+      "label": "peer",
+      "started": 1792801573.8667011,
+      "deadline": 1792812373.8667011,
+      "reserved_usd": 100.24819200000002,
+      "state": "stopped",
+      "stopped": 1792801823.659101,
+      "exit_code": 137,
+      "elapsed_cost_upper": 2.31945218276413,
+      "hourly_rate_upper_usd": 33.416064000000006,
+      "host_memory_cap_gib": 256
+    },
+    {
+      "label": "primary2",
+      "started": 1792801853.02719,
+      "deadline": 1792812653.02719,
+      "reserved_usd": 118.689408,
+      "state": "stopped",
+      "hourly_rate_upper_usd": 39.563136,
+      "host_memory_cap_gib": 512,
+      "stopped": 1792804131.458612,
+      "exit_code": 137,
+      "elapsed_cost_upper": 25.039414504185565
+    },
+    {
+      "label": "peer2",
+      "started": 1792801915.252598,
+      "deadline": 1792812715.252598,
+      "reserved_usd": 118.689408,
+      "state": "stopped",
+      "hourly_rate_upper_usd": 39.563136,
+      "host_memory_cap_gib": 512,
+      "stopped": 1792804705.561204,
+      "exit_code": 137,
+      "elapsed_cost_upper": 30.664821904878313
+    }
+  ]
+}
