@@ -158,6 +158,8 @@ def test_image_extras_cover_every_directly_imported_third_party_package() -> Non
             "worker.py",
             "runtime.py",
             "engram_transport.py",
+            "fp8.py",
+            "prefix_cache.py",
             "provenance.py",
         }:
             continue

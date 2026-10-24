@@ -76,7 +76,11 @@ class HostedDeepInfer:
                     "POST",
                     url,
                     headers=headers,
-                    json={"chat": body, "request_id": payload.generation_id},
+                    json={
+                        "chat": body,
+                        "request_id": payload.generation_id,
+                        "cache_namespace": getattr(payload, "_cache_namespace", None),
+                    },
                 ) as response,
             ):
                 if response.status_code != 200:

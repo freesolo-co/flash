@@ -29,7 +29,11 @@ from flash.serving.src.accounting.usage import (
 )
 from flash.serving.src.accounting.usage_outbox import UsageOutboxError
 from flash.serving.src.engine.model_config import tool_parser_for
-from flash.serving.src.http.context import ServingContext, require_attributed_traffic
+from flash.serving.src.http.context import (
+    ServingContext,
+    bind_cache_namespace,
+    require_attributed_traffic,
+)
 from flash.serving.src.http.stream_response import (
     ClosingStreamingResponse,
 )
@@ -279,7 +283,7 @@ async def _stream_chat_completion(
 ) -> StreamingResponse:
     preparation = asyncio.create_task(
         context.prepare_stream(
-            req,
+            bind_cache_namespace(req, traffic),
             requested,
             target,
             generation_id=identity.request_id,

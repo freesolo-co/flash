@@ -235,3 +235,36 @@ def test_cold_start_redirect_polls_result_without_resubmission_or_credential_lea
     else:
         assert asyncio.run(pool.generate(MODEL_ID, payload, record()))["type"] == "final"
         assert len(calls) == 2
+
+
+@pytest.mark.parametrize("stream", [False, True])
+def test_native_prefix_usage_is_billed_and_namespace_is_authoritative(connection, stream):
+    runtime = FakeRuntime(
+        [
+            {
+                "tokens": [2, 1],
+                "finish_reason": "stop",
+                "cached_tokens": 1,
+                "cached_tokens_reported": True,
+            }
+        ]
+    )
+    seen = []
+    original = runtime.prepare_tokens
+
+    async def prepare(request):
+        seen.append(request.cache_namespace)
+        return await original(request)
+
+    runtime.prepare_tokens = prepare
+    router, store = app(runtime)
+    with TestClient(router) as client:
+        response = client.post(
+            "/v1/chat/completions",
+            json=body(stream=stream),
+            headers={"Authorization": "Bearer test"},
+        )
+    assert response.status_code == 200
+    assert len(seen[0]) == 64
+    assert store.finalized[-1].facts.cached_tokens == 1
+    assert store.finalized[-1].facts.cached_tokens_reported is True

@@ -4,16 +4,20 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
 import importlib.util
+import json
 import multiprocessing
 import queue
 import time
 import uuid
-from dataclasses import dataclass
+from collections import OrderedDict
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 from anyio import CancelScope
 
+from flash.serve.runtime.prompt_cache import cached_prompt_tokens
 from flash.serving.deepinfer.config import (
     GPU_COUNT,
     MAX_INPUTS,
@@ -38,6 +42,7 @@ class Pending:
 class Runtime:
     def __init__(self):
         self.processes = []
+        self.prompt_cache = OrderedDict()
         self.pending: dict[str, Pending] = {}
         self.loads = [0] * GPU_COUNT
         self.ready: set[int] = set()
@@ -151,20 +156,66 @@ class Runtime:
             else:
                 pending.events.put_nowait(event)
 
+    async def prepare_tokens(self, request):
+        key = hashlib.sha256(
+            json.dumps(
+                [MODEL_REVISION, request.cache_namespace, request.messages, request.thinking],
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode()
+        ).hexdigest()
+        tokens = await cached_prompt_tokens(
+            self.prompt_cache,
+            key,
+            lambda: self.tokenize(request),
+            max_entries=128,
+        )
+        # max_tokens varies independently of the cached prompt.
+        self._validate_length(tokens, request.max_tokens)
+        return tokens
+
+    async def prefix_length(self, request, tokens):
+        if not request.cache_namespace:
+            return 0
+        # Reuse only a token-exact stable conversation prefix. Single-message prompts
+        # fall back to full-prompt reuse; no target hit ratio is manufactured.
+        messages = [*request.messages[:-1], {**request.messages[-1], "content": ""}]
+        empty_tail = await self.prepare_tokens(replace(request, messages=messages, max_tokens=1))
+        common = 0
+        for left, right in zip(tokens, empty_tail, strict=False):
+            if left != right:
+                break
+            common += 1
+        return min(common if common >= 128 else len(tokens) - 2, len(tokens) - 2)
+
+    @staticmethod
+    def _validate_length(tokens, max_tokens):
+        if not tokens or len(tokens) + max_tokens + 64 > MAX_MODEL_LEN:
+            raise ValueError(
+                f"prompt plus output exceeds the {MAX_MODEL_LEN}-token serving context"
+            )
+
     def tokenize(self, request):
         prompt = self.encode_messages(
             request.messages, thinking_mode="thinking" if request.thinking else "chat"
         )
         tokens = self.tokenizer.encode(prompt, add_special_tokens=False).ids
-        if not tokens or len(tokens) + request.max_tokens + 64 > MAX_MODEL_LEN:
-            raise ValueError(
-                f"prompt plus output exceeds the {MAX_MODEL_LEN}-token serving context"
-            )
+        self._validate_length(tokens, request.max_tokens)
         return tokens
 
     async def generate(self, request, tokens):
         self.assert_healthy()
         rank = min(range(GPU_COUNT), key=self.loads.__getitem__)
+        if request.cache_namespace:
+            affinity = (
+                hashlib.sha256(
+                    (request.cache_namespace + ":" + str(tokens[:128])).encode()
+                ).digest()[0]
+                % GPU_COUNT
+            )
+            if self.loads[affinity] < SEQUENCES_PER_RANK:
+                rank = affinity
         if self.loads[rank] >= SEQUENCES_PER_RANK:
             raise OverflowError("DeepInfer replica is at capacity")
         request_id = uuid.uuid4().hex
@@ -177,6 +228,8 @@ class Runtime:
                     "type": "generate",
                     "id": request_id,
                     "tokens": tokens,
+                    "cache_namespace": request.cache_namespace,
+                    "prefix_tokens": request.prefix_tokens,
                     "sampling": {
                         "temperature": request.temperature,
                         "top_p": request.top_p,

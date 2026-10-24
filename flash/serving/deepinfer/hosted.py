@@ -1,8 +1,9 @@
 """Native token events in the hosted router's durable-accounting protocol."""
 
-import asyncio
+import re
 import time
 import uuid
+from dataclasses import replace
 
 from flash.serving.deepinfer.config import MODEL_ID, MODEL_REVISION
 from flash.serving.deepinfer.protocol import parse_request
@@ -51,6 +52,8 @@ async def engine_events(runtime, parsed, tokens, request_id):
     native = runtime.generate(parsed, tokens)
     text = ""
     boundary_sent = not parsed.thinking
+    cached_tokens = 0
+    cached_reported = False
 
     def facts():
         return {
@@ -60,9 +63,8 @@ async def engine_events(runtime, parsed, tokens, request_id):
             "prompt_tokens": len(tokens),
             "completion_tokens": decoder.completion_tokens,
             "reasoning_tokens": decoder.reasoning_tokens,
-            # This bridge has not yet integrated per-request prefix-cache accounting.
-            "cached_tokens": 0,
-            "cached_tokens_reported": False,
+            "cached_tokens": cached_tokens,
+            "cached_tokens_reported": cached_reported,
             "engine_replica_id": REPLICA_ID,
             "tokenizer_identity": MODEL_ID,
             "tokenizer_version": MODEL_REVISION,
@@ -74,6 +76,13 @@ async def engine_events(runtime, parsed, tokens, request_id):
         current = await anext(native)
         first = True
         while True:
+            count = current.get("cached_tokens", 0)
+            reported = current.get("cached_tokens_reported", False)
+            if type(count) is not int or not 0 <= count <= len(tokens):
+                raise RuntimeError("Invalid native cache usage")
+            if not first and (count != cached_tokens or reported != cached_reported):
+                raise RuntimeError("Native cache usage changed during generation")
+            cached_tokens, cached_reported = count, reported
             deltas = decoder.consume(current)
             if first:
                 yield {"type": "ready", **facts()}
@@ -103,5 +112,12 @@ async def prepare(runtime, body):
     if not isinstance(request_id, str) or not request_id or len(request_id) > 512:
         raise ValueError("request_id is required")
     parsed = parse_request(body.get("chat", {}))
-    tokens = await asyncio.to_thread(runtime.tokenize, parsed)
+    namespace = body.get("cache_namespace")
+    if namespace is not None and (
+        not isinstance(namespace, str) or not re.fullmatch(r"[0-9a-f]{64}", namespace)
+    ):
+        raise ValueError("invalid cache namespace")
+    parsed = replace(parsed, cache_namespace=namespace)
+    tokens = await runtime.prepare_tokens(parsed)
+    parsed = replace(parsed, prefix_tokens=await runtime.prefix_length(parsed, tokens))
     return engine_events(runtime, parsed, tokens, request_id)

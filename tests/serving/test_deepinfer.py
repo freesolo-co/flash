@@ -53,6 +53,12 @@ class FakeRuntime:
     def tokenize(self, request):
         return [0, 7]
 
+    async def prepare_tokens(self, request):
+        return self.tokenize(request)
+
+    async def prefix_length(self, request, tokens):
+        return 0
+
     def assert_healthy(self):
         pass
 

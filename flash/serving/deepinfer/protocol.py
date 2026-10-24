@@ -17,6 +17,8 @@ class ChatRequest:
     max_tokens: int
     seed: int | None
     thinking: bool
+    cache_namespace: str | None = None
+    prefix_tokens: int = 0
 
 
 def parse_request(body: dict[str, Any]) -> ChatRequest:
