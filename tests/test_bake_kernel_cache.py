@@ -4,6 +4,8 @@ from pathlib import Path
 
 import pytest
 
+from flash.providers.modal.api import call as call_modal
+
 
 def bake_module():
     spec = importlib.util.spec_from_file_location(
@@ -161,6 +163,62 @@ def test_cleanup_covers_input_upload_and_never_overrides_result(
         assert (tmp_path / "out/bake-warmup.log").read_bytes() == b"current bake"
         assert (tmp_path / "out/warmup.log").read_bytes() == b"current bake"
     assert len(deleted) == 1
+
+
+@pytest.mark.parametrize("returncode", [1, 137])
+def test_failed_sandbox_preserves_exit_diagnostic_and_cleans_up(monkeypatch, returncode):
+    import sys
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock, Mock
+
+    import huggingface_hub
+
+    from flash.providers.modal import api
+
+    bake = bake_module()
+    hf = SimpleNamespace(delete_repo=Mock())
+    monkeypatch.setattr(huggingface_hub, "HfApi", lambda **kw: hf)
+    monkeypatch.setattr(bake, "_upload_flash_code", lambda *args: None)
+    monkeypatch.setenv("HF_TOKEN", "test")
+    monkeypatch.setattr(api, "credentials", lambda: ("test-id", "test-secret"))
+    monkeypatch.setattr(api, "call", call_modal)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["bake", "--arch", "9.0", "--sm", "sm90", "--image", "test/image"],
+    )
+    sandbox = SimpleNamespace(
+        object_id="sb-test-h100",
+        wait=SimpleNamespace(aio=AsyncMock()),
+        poll=SimpleNamespace(aio=AsyncMock(return_value=returncode)),
+        terminate=SimpleNamespace(aio=AsyncMock()),
+    )
+    create = AsyncMock(return_value=sandbox)
+    client = SimpleNamespace(__aexit__=AsyncMock())
+    image = SimpleNamespace(add_local_file=Mock(return_value="bake-image"))
+    monkeypatch.setitem(
+        sys.modules,
+        "modal",
+        SimpleNamespace(
+            Client=SimpleNamespace(
+                from_credentials=SimpleNamespace(aio=AsyncMock(return_value=client))
+            ),
+            App=SimpleNamespace(lookup=SimpleNamespace(aio=AsyncMock(return_value="bake-app"))),
+            Image=SimpleNamespace(from_registry=Mock(return_value=image)),
+            Sandbox=SimpleNamespace(create=SimpleNamespace(aio=create)),
+            Secret=SimpleNamespace(from_dict=Mock(return_value="bake-secret")),
+        ),
+    )
+
+    # Exercise the real provider wrapper: an ordinary RuntimeError here used to
+    # become a generic "operation failed or timed out", hiding the exit code.
+    with pytest.raises(api.ModalApiError, match=rf"code {returncode}; .*sb-test-h100"):
+        bake.main()
+
+    assert create.call_args.kwargs["memory"] == (32768, 131072)
+    sandbox.terminate.aio.assert_awaited_once_with(wait=True)
+    client.__aexit__.assert_awaited_once_with(None, None, None)
+    hf.delete_repo.assert_called_once()
 
 
 @pytest.mark.parametrize("name", ["../escape", "/absolute"])
