@@ -1290,7 +1290,7 @@ def test_missing_inference_token_prevents_runtime_bootstrap(monkeypatch) -> None
 def test_the_packaged_app_exposes_exactly_its_documented_route_surface() -> None:
     # this app is immutable by construction: bootstrap_serving registers every adapter from the
     # manifest at boot and freezes the model map, so there is deliberately no /adapters surface.
-    # docs/serving-contract.md documents the DYNAMIC contract (generated + hosted backends) and now
+    # The DYNAMIC contract (generated + hosted backends) now
     # says so explicitly, because pointing tests/serving_conformance at a `flash serve deploy`
     # endpoint fails 26 registration/activation/alias tests against a perfectly healthy deployment.
     #

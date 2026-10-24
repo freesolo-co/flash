@@ -26,11 +26,12 @@ from flash.serving.src.io.schemas import AdapterRecord
 FREESOLO_PRICING_SOURCE = "freesolo_backend_catalog"
 FREESOLO_PRICING_VERSION = "2026-08-27.1"
 # (prompt, completion, cached prompt) usd per million tokens, one entry per active hosted model.
-# these are the charged customer rates, set 5% below the lowest healthy comparable openrouter fp8
-# listing for each model and token category. they are NOT cost-plus: no markup is applied, and they
+# The Qwen customer rates were set 5% below the lowest healthy comparable openrouter fp8
+# listing; the DeepSeek rates are the explicitly requested launch prices. They are not cost-plus: no markup is applied, and they
 # currently sit below the recorded cost basis, so do not reintroduce a multiplier here until measured
 # b200 economics establish a lower truthful cost basis.
 _FREESOLO_USD_PER_MTOK: dict[str, tuple[str, str, str]] = {
+    "deepseek-ai/DeepSeek-V4.1-Flash-1017": ("0.15", "0.60", "0.003"),
     "Qwen/Qwen3.5-9B": ("0.095", "0.1425", "0.0276"),
     "Qwen/Qwen3.8-27B": ("0.3325", "2.4225", "0.03325"),
     "Qwen/Qwen3.6-35B-A3B": ("0.095", "0.9025", "0.0475"),
@@ -166,7 +167,11 @@ def freesolo_price(base_model: str) -> CapturedPrice:
 
     return CapturedPrice(
         source=FREESOLO_PRICING_SOURCE,
-        version=FREESOLO_PRICING_VERSION,
+        version=(
+            "2026-10-23.deepseek-1017.1"
+            if base_model == "deepseek-ai/DeepSeek-V4.1-Flash-1017"
+            else FREESOLO_PRICING_VERSION
+        ),
         snapshot={
             "prompt_token_usd": per_token(prompt_mtok),
             "cached_prompt_token_usd": per_token(cached_mtok),

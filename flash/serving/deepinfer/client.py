@@ -1,0 +1,119 @@
+"""Hosted EnginePool bridge to the authenticated Modal DeepInfer web server."""
+
+import asyncio
+import json
+import os
+from urllib.parse import urlsplit
+
+import httpx
+
+from flash.serving.deepinfer.config import MODEL_ID, REQUEST_SECONDS, STARTUP_SECONDS
+from flash.serving.deepinfer.errors import DeepInferError
+from flash.serving.deepinfer.hosted import chat_body
+
+CONNECTION_KEYS = ("DEEPINFER_URL", "DEEPINFER_PROXY_KEY", "DEEPINFER_PROXY_SECRET")
+
+
+async def _check_redirect(response):
+    # Modal returns 303 result URLs every 150 seconds during a long cold start.
+    # Never forward custom proxy credentials to a different origin.
+    if response.is_redirect:
+        target = response.url.join(response.headers.get("location", ""))
+        source = response.url
+        if response.status_code != 303 or (target.scheme, target.host, target.port) != (
+            source.scheme,
+            source.host,
+            source.port,
+        ):
+            raise DeepInferError(502, "DeepInfer returned an unsafe result redirect")
+
+
+def configured():
+    values = [os.environ.get(key, "").strip() for key in CONNECTION_KEYS]
+    if any(values) and not all(values):
+        raise ValueError("DeepInfer requires URL and both Modal proxy credentials")
+    if all(values):
+        url = urlsplit(values[0])
+        if url.scheme != "https" or not url.hostname or url.username or url.password:
+            raise ValueError("DEEPINFER_URL must be an HTTPS endpoint without credentials")
+        return True
+    return False
+
+
+class HostedDeepInfer:
+    def __init__(self, *, transport=None):
+        self.transport = transport
+
+    async def stream_generate(self, base_model, payload, record, *, expected_checkpoint=None):
+        if base_model != MODEL_ID or not record.serve_base_model:
+            raise ValueError("DeepInfer does not support LoRA adapters")
+        if expected_checkpoint is not None:
+            raise ValueError("checkpoint mismatch: DeepInfer serves base weights only")
+        body = chat_body(payload.model_dump())
+        if not payload.generation_id:
+            raise ValueError("generation id is required")
+        if not configured():
+            raise DeepInferError(503, "DeepInfer backend is not configured")
+        headers = {
+            "Modal-Key": os.environ["DEEPINFER_PROXY_KEY"],
+            "Modal-Secret": os.environ["DEEPINFER_PROXY_SECRET"],
+        }
+        url = os.environ["DEEPINFER_URL"].rstrip("/") + "/internal/generate"
+        timeout = httpx.Timeout(STARTUP_SECONDS + REQUEST_SECONDS, connect=30)
+        terminal = False
+        try:
+            # Closing this context on disconnect aborts only this HTTP request.
+            async with (
+                asyncio.timeout(STARTUP_SECONDS + REQUEST_SECONDS),
+                httpx.AsyncClient(
+                    timeout=timeout,
+                    transport=self.transport,
+                    follow_redirects=True,
+                    max_redirects=32,
+                    event_hooks={"response": [_check_redirect]},
+                ) as client,
+                client.stream(
+                    "POST",
+                    url,
+                    headers=headers,
+                    json={
+                        "chat": body,
+                        "request_id": payload.generation_id,
+                        "cache_namespace": getattr(payload, "_cache_namespace", None),
+                    },
+                ) as response,
+            ):
+                if response.status_code != 200:
+                    code = response.status_code if response.status_code in {400, 422, 429} else 503
+                    raise DeepInferError(code, "DeepInfer backend rejected the request")
+                async for line in response.aiter_lines():
+                    if not line:
+                        continue
+                    event = json.loads(line)
+                    if event.get("type") == "error":
+                        raise DeepInferError(502, "DeepInfer generation failed")
+                    if event.get("request_id") != payload.generation_id:
+                        raise DeepInferError(502, "DeepInfer returned a mismatched generation id")
+                    if terminal:
+                        raise DeepInferError(502, "DeepInfer returned data after completion")
+                    terminal = event.get("type") == "final"
+                    yield event
+                if not terminal:
+                    raise DeepInferError(502, "DeepInfer stream ended before completion")
+        except (httpx.HTTPError, ValueError, TimeoutError) as exc:
+            raise DeepInferError(502, "DeepInfer backend transport failed") from exc
+
+    async def generate(self, base_model, payload, record, *, expected_checkpoint=None):
+        stream = self.stream_generate(
+            base_model, payload, record, expected_checkpoint=expected_checkpoint
+        )
+        result = None
+        try:
+            async for event in stream:
+                if event["type"] == "final":
+                    result = event
+        finally:
+            await stream.aclose()
+        if result is None:
+            raise DeepInferError(502, "DeepInfer did not return a final result")
+        return result

@@ -13,6 +13,8 @@ from __future__ import annotations
 from typing import Any
 
 from flash.serve.request.tool_calls import qualified_tool_parser
+from flash.serving.deepinfer.config import MODEL_ID as DEEPSEEK_MODEL_ID
+from flash.serving.deepinfer.config import MODEL_REVISION as DEEPSEEK_MODEL_REVISION
 from flash.serving.src.engine.prequant_config import (
     fp8_serve_model_for as _prequant_serve_model_for,
 )
@@ -137,7 +139,16 @@ SERVING_MODELS: list[dict[str, Any]] = [
     },
 ]
 
+# Native base-only backend is registered independently of the vLLM/LoRA matrix.
+# The router advertises it only when the authenticated backend connection is configured.
 _BY_MODEL: dict[str, dict[str, Any]] = {m["base_model"]: m for m in SERVING_MODELS}
+_BY_MODEL[DEEPSEEK_MODEL_ID] = {"gpu": "B200:4", "image_input_limit": None}
+
+
+def hosted_base_models() -> list[str]:
+    from flash.serving.deepinfer.client import configured
+
+    return base_models() + ([DEEPSEEK_MODEL_ID] if configured() else [])
 
 
 def base_models() -> list[str]:
@@ -175,6 +186,8 @@ def gpu_for(base_model: str) -> str:
 def serve_model_for(base_model: str) -> str:
     """return the pre-quantized checkpoint an active hosted engine loads."""
     _config_for(base_model)
+    if base_model == DEEPSEEK_MODEL_ID:
+        return DEEPSEEK_MODEL_ID
     return _prequant_serve_model_for(base_model)
 
 
@@ -186,6 +199,11 @@ def tokenizer_model_for(base_model: str) -> str:
 
 def immutable_serving_revisions(base_model: str) -> dict[str, str]:
     """return model/tokenizer/processor pins required by this hosted engine."""
+    if base_model == DEEPSEEK_MODEL_ID:
+        return {
+            "model_revision": DEEPSEEK_MODEL_REVISION,
+            "tokenizer_revision": DEEPSEEK_MODEL_REVISION,
+        }
     engine = _config_for(base_model).get("engine") or {}
     return {
         key: str(engine[key])
@@ -197,6 +215,8 @@ def immutable_serving_revisions(base_model: str) -> dict[str, str]:
 def engine_overrides_for(base_model: str) -> dict[str, Any]:
     """return vLLM overrides for an active hosted engine."""
     config = _config_for(base_model)
+    if base_model == DEEPSEEK_MODEL_ID:
+        raise ValueError("DeepInfer base model cannot be loaded by the vLLM LoRA engine")
     overrides = dict(config.get("engine") or {})
     if "serve_model_id" not in overrides:
         overrides["serve_model_id"] = serve_model_for(base_model)

@@ -1,6 +1,7 @@
 """The per-app collaborators serving request handlers use."""
 
 import asyncio
+import hashlib
 from collections.abc import AsyncIterator, Awaitable, Callable
 from typing import Any
 
@@ -60,6 +61,15 @@ def require_attributed_traffic(
             "serving request lacks required organization attribution",
         )
     return AuthorizedTraffic(principal=principal_for_trusted_internal(org_id))
+
+
+def bind_cache_namespace(payload: Any, traffic: AuthorizedTraffic) -> Any:
+    """Only authenticated traffic attribution can select a shared inference cache."""
+    bound = payload.model_copy()
+    bound._cache_namespace = hashlib.sha256(
+        (traffic.principal.kind + ":" + traffic.principal.orgId).encode()
+    ).hexdigest()
+    return bound
 
 
 class ServingContext:
@@ -180,7 +190,7 @@ class ServingContext:
         result = await generate_once(
             self.pool,
             self.router,
-            payload,
+            bind_cache_namespace(payload, traffic),
             requested,
             target,
             generation_id=identity.request_id,

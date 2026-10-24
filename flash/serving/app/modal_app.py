@@ -168,6 +168,9 @@ _RUNTIME_SECRET_NAMES = (
     "SUPABASE_PROJECT_REF_DEV",
     "SUPABASE_URL",
     "SUPABASE_SERVICE_ROLE_KEY",
+    "DEEPINFER_URL",
+    "DEEPINFER_PROXY_KEY",
+    "DEEPINFER_PROXY_SECRET",
     # only credentials and wiring are forwarded. autoscaling and engine configuration are constants.
 )
 
@@ -496,6 +499,13 @@ class _ModalEnginePool:
         *,
         expected_checkpoint: str | None = None,
     ) -> dict[str, Any]:
+        from flash.serving.deepinfer.client import HostedDeepInfer
+        from flash.serving.deepinfer.config import MODEL_ID as deepseek_model
+
+        if base_model == deepseek_model:
+            return await HostedDeepInfer().generate(
+                base_model, payload, record, expected_checkpoint=expected_checkpoint
+            )
         generation_id = payload.generation_id
         if not generation_id:
             raise RuntimeError("generation id is required before modal dispatch")
@@ -515,6 +525,19 @@ class _ModalEnginePool:
         *,
         expected_checkpoint: str | None = None,
     ):
+        from flash.serving.deepinfer.client import HostedDeepInfer
+        from flash.serving.deepinfer.config import MODEL_ID as deepseek_model
+
+        if base_model == deepseek_model:
+            stream = HostedDeepInfer().stream_generate(
+                base_model, payload, record, expected_checkpoint=expected_checkpoint
+            )
+            try:
+                async for event in stream:
+                    yield event
+            finally:
+                await stream.aclose()
+            return
         generation_id = payload.generation_id
         if not generation_id:
             raise RuntimeError("generation id is required before modal dispatch")
@@ -763,7 +786,7 @@ def _base_model_records() -> list:
     records are never persisted and never org-owned; ``serve_base_model`` marks them so the engine
     generates against the base weights (lora_request=None) and the router serves them openly.
     """
-    from flash.serving.src.engine.model_config import base_models
+    from flash.serving.src.engine.model_config import hosted_base_models
     from flash.serving.src.io.schemas import AdapterRecord
 
     return [
@@ -776,7 +799,7 @@ def _base_model_records() -> list:
             org_id=None,
             status="ready",
         )
-        for m in base_models()
+        for m in hosted_base_models()
     ]
 
 

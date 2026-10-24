@@ -1,5 +1,10 @@
 # Freesolo LoRA Serving Modal App
 
+For DeepSeek V4.1 Flash 1017, see the [native DeepInfer backend](../deepinfer/README.md).
+It uses a separate autoscaling pool of four-B200 replicas and connects to this
+router for authentication and durable billing after qualification and backend
+catalog configuration.
+
 Multi-LoRA serving on Modal with **demand-driven GPU containers per base model**.
 
 - `LoraEngine` is a Modal class **parametrized by `base_model`**. Modal runs separate GPU
@@ -27,8 +32,7 @@ The routing layer (`src/router.py`) carries no `modal`/`vllm` imports and is exh
 unit-tested in `tests/serving/test_router.py` (multi-base-model dispatch, shared-GPU multi-LoRA,
 register-routing, OpenAI shape, auth, 404s) — run with `uv run pytest tests/serving/`.
 
-Operator load tests use the isolated `flash.serving.loadtest` package, documented in
-[`docs/hosted-inference-load-testing.md`](../../../docs/hosted-inference-load-testing.md). It is
+Operator load tests use the isolated `flash.serving.loadtest` package. It is
 never imported by production serving. It drives only `GET /healthz` and `POST /v1/chat/completions`,
 manages no Modal lifecycle, and cannot by itself prove replica scale-out, cold state, GPU identity,
 the cause of a capacity rejection, or an availability SLA.
@@ -390,7 +394,8 @@ it contributes to cache identity, but is not a post-download checksum of the wei
 `artifact_fingerprint` identifies the immutable binding to an organization, checkpoint, source
 revision, base model and serving configuration, including that digest. Neither hash is an
 authentication credential. The fingerprint now hashes the `model_id` key, so previously
-stored fingerprints require the [offline cutover](../../../docs/checkpoint-field-cutover.md).
+stored fingerprints require the offline migration in
+[`scripts/migrate_checkpoint_fingerprints.py`](../../../scripts/migrate_checkpoint_fingerprints.py).
 
 `POST /adapters`:
 
