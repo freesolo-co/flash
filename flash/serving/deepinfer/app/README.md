@@ -67,10 +67,17 @@ engine-step boundaries and does not bound a stalled GPU collective.
 
 Cache affinity and retained checkpoints can leave unequal prefill queues across
 ranks. The native any-rank prefill interval is eight decode steps instead of the
-upstream default of 100, preventing those queues from waiting behind long decode
-runs. This is a scheduling interval, not a wall-clock latency guarantee. Prompts
-shorter than 130 tokens skip prefix preparation and use least-loaded routing,
-because retention requires 128 prefix tokens plus two uncached tokens.
+upstream default of 100. Prompts shorter than 130 tokens skip prefix preparation.
+
+## Cache policy
+
+Live prefix-aware routing is always enabled across the four DP ranks within a
+replica. Workers advertise exact namespace/prefix digests, expiring after two
+seconds. Placement balances queued prefill/decode work against saved prefill.
+Workers verify token equality. This does not route between Modal replicas.
+Qwen engines have one GPU and one DP rank each, so this rank-placement policy has
+no additional target inside those engines; Modal still places their replicas.
+
 
 ## Deployment and qualification
 
