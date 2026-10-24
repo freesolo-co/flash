@@ -22,10 +22,11 @@ from tests.serving.test_deepinfer import FakeRuntime, body
 
 @pytest.fixture
 def connection(monkeypatch):
-    for key, value in zip(
-        CONNECTION_KEYS, ("https://deepinfer.modal.run", "key", "secret"), strict=True
-    ):
+    for key, value in zip(CONNECTION_KEYS, ("key", "secret"), strict=True):
         monkeypatch.setenv(key, value)
+    monkeypatch.setattr(
+        "flash.serving.deepinfer.client.endpoint_url", lambda: "https://deepinfer.modal.run"
+    )
 
 
 def record():
@@ -182,7 +183,7 @@ def test_catalog_requires_complete_authenticated_connection(monkeypatch):
     for key in CONNECTION_KEYS:
         monkeypatch.delenv(key, raising=False)
     assert hosted_base_models() == base_models()
-    monkeypatch.setenv("DEEPINFER_URL", "https://deepinfer.modal.run")
+    monkeypatch.setenv("DEEPINFER_PROXY_KEY", "key")
     with pytest.raises(ValueError, match="both Modal proxy credentials"):
         configured()
     monkeypatch.setenv("DEEPINFER_PROXY_KEY", "key")
@@ -273,3 +274,46 @@ def test_native_prefix_usage_is_billed_and_namespace_is_authoritative(connection
     assert len(seen[0]) == 64
     assert store.finalized[-1].facts.cached_tokens == 1
     assert store.finalized[-1].facts.cached_tokens_reported is True
+
+
+@pytest.mark.parametrize(
+    "endpoint", ["https://backend.modal.run", None, "http://backend", "https://user:pass@backend"]
+)
+def test_endpoint_is_discovered_from_fixed_same_environment_backend(monkeypatch, endpoint):
+    from types import SimpleNamespace
+
+    import modal
+
+    from flash.serving.deepinfer.client import endpoint_url
+
+    calls = []
+
+    def lookup(*args, **kwargs):
+        calls.append((args, kwargs))
+        return SimpleNamespace(get_web_url=lambda: endpoint)
+
+    endpoint_url.cache_clear()
+    monkeypatch.setattr(modal.Function, "from_name", lookup)
+    try:
+        if endpoint == "https://backend.modal.run":
+            assert endpoint_url() == endpoint
+            assert endpoint_url() == endpoint
+        else:
+            with pytest.raises(DeepInferError, match="valid HTTPS endpoint"):
+                endpoint_url()
+        assert calls == [(("freesolo-deepseek-serving", "serve"), {})]
+    finally:
+        endpoint_url.cache_clear()
+
+
+def test_bridge_maps_endpoint_discovery_failure_to_unavailable(connection, monkeypatch):
+    def fail():
+        raise RuntimeError("Modal lookup failed")
+
+    monkeypatch.setattr("flash.serving.deepinfer.client.endpoint_url", fail)
+    payload = OpenAIGenerateRequest(
+        model_id=MODEL_ID, messages=body()["messages"], generation_id="fsgen-test"
+    )
+    with pytest.raises(DeepInferError) as caught:
+        asyncio.run(HostedDeepInfer().generate(MODEL_ID, payload, record()))
+    assert caught.value.status_code == 503

@@ -168,7 +168,6 @@ _RUNTIME_SECRET_NAMES = (
     "SUPABASE_PROJECT_REF_DEV",
     "SUPABASE_URL",
     "SUPABASE_SERVICE_ROLE_KEY",
-    "DEEPINFER_URL",
     "DEEPINFER_PROXY_KEY",
     "DEEPINFER_PROXY_SECRET",
     # only credentials and wiring are forwarded. autoscaling and engine configuration are constants.

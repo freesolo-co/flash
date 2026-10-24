@@ -3,15 +3,29 @@
 import asyncio
 import json
 import os
+from functools import lru_cache
 from urllib.parse import urlsplit
 
 import httpx
 
-from flash.serving.deepinfer.config import MODEL_ID, REQUEST_SECONDS, STARTUP_SECONDS
+from flash.serving.deepinfer.config import APP_NAME, MODEL_ID, REQUEST_SECONDS, STARTUP_SECONDS
 from flash.serving.deepinfer.errors import DeepInferError
 from flash.serving.deepinfer.hosted import chat_body
 
-CONNECTION_KEYS = ("DEEPINFER_URL", "DEEPINFER_PROXY_KEY", "DEEPINFER_PROXY_SECRET")
+CONNECTION_KEYS = ("DEEPINFER_PROXY_KEY", "DEEPINFER_PROXY_SECRET")
+
+
+@lru_cache(maxsize=1)
+def endpoint_url():
+    import modal
+
+    # Resolve the fixed backend in the router's Modal environment. Credentials
+    # remain secrets; neither the endpoint nor engine policy is a deploy-time knob.
+    endpoint = modal.Function.from_name(APP_NAME, "serve").get_web_url()
+    url = urlsplit(endpoint or "")
+    if url.scheme != "https" or not url.hostname or url.username or url.password:
+        raise DeepInferError(503, "DeepInfer backend has no valid HTTPS endpoint")
+    return endpoint.rstrip("/")
 
 
 async def _check_redirect(response):
@@ -31,13 +45,8 @@ async def _check_redirect(response):
 def configured():
     values = [os.environ.get(key, "").strip() for key in CONNECTION_KEYS]
     if any(values) and not all(values):
-        raise ValueError("DeepInfer requires URL and both Modal proxy credentials")
-    if all(values):
-        url = urlsplit(values[0])
-        if url.scheme != "https" or not url.hostname or url.username or url.password:
-            raise ValueError("DEEPINFER_URL must be an HTTPS endpoint without credentials")
-        return True
-    return False
+        raise ValueError("DeepInfer requires both Modal proxy credentials")
+    return all(values)
 
 
 class HostedDeepInfer:
@@ -58,7 +67,11 @@ class HostedDeepInfer:
             "Modal-Key": os.environ["DEEPINFER_PROXY_KEY"],
             "Modal-Secret": os.environ["DEEPINFER_PROXY_SECRET"],
         }
-        url = os.environ["DEEPINFER_URL"].rstrip("/") + "/internal/generate"
+        try:
+            url = await asyncio.wait_for(asyncio.to_thread(endpoint_url), timeout=30)
+        except Exception as exc:
+            raise DeepInferError(503, "DeepInfer endpoint discovery failed") from exc
+        url += "/internal/generate"
         timeout = httpx.Timeout(STARTUP_SECONDS + REQUEST_SECONDS, connect=30)
         terminal = False
         try:

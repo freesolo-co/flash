@@ -1,6 +1,7 @@
 """Pinned identity and bounded capacity for the DeepSeek serving pool."""
 
 MODEL_ID = "deepseek-ai/DeepSeek-V4.1-Flash-1017"
+APP_NAME = "freesolo-deepseek-serving"
 MODEL_REVISION = "1bae0e1088993b9b82de08f59de5be5a34e42170"
 RUNTIME_REVISION = "9bd9cf243fc53ef9afbf8f04d391d989117d6ab9"
 # Immutable CPU-built CUDA 13.2 / Python 3.12 snapshot in the freesolo Modal workspace.

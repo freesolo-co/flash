@@ -10,6 +10,7 @@ from pathlib import Path
 import modal
 
 from flash.serving.deepinfer.config import (
+    APP_NAME,
     BUFFER_CONTAINERS,
     GPU,
     MAX_CONTAINERS,
@@ -46,7 +47,7 @@ image = (
         f"{RUNTIME_PYTHON} /root/prepare_deepinfer_image.py",
     )
 )
-app = modal.App("freesolo-deepseek-serving", image=image)
+app = modal.App(APP_NAME, image=image)
 weights = modal.Volume.from_name("freesolo-deepseek-1017-weights", create_if_missing=True)
 
 

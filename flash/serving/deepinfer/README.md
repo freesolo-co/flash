@@ -122,12 +122,12 @@ the same authorization, response, and accounting path as customer requests.
 After qualification, supply these connection credentials when deploying the
 existing serving router, following its development wiring instructions:
 
-- `DEEPINFER_URL`: the HTTPS root URL printed by the backend deployment.
 - `DEEPINFER_PROXY_KEY` and `DEEPINFER_PROXY_SECRET`: an environment-scoped Modal
   Proxy Token pair, **not** ordinary Modal API credentials.
 
-The router forwards these through its existing runtime secret. All three must be
-present together; partial configuration fails closed. Without them, the native
+The router resolves the fixed `freesolo-deepseek-serving` / `serve` endpoint through
+Modal in its own environment. Only the two authentication secrets are configured
+externally; partial credentials fail closed. Without them, the native
 model is absent from the router's advertised base models. No vLLM class is
 created for DeepSeek, and LoRA registration is unsupported.
 
