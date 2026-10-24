@@ -7,9 +7,11 @@ from omegaconf import OmegaConf
 from verl.trainer.ppo.utils import Role
 from verl.trainer.ppo.v1.trainer_sync import PPOTrainerSync
 
+from flash.engine.worker.runtime.phases import training_phase
 from flash.engine.worker.train.core.child.options import RuntimeOptions
 from flash.engine.worker.train.core.child.readiness import publish_ready
 from flash.engine.worker.train.core.child.tracking import publish_tracking_link
+from flash.engine.worker.train.core.lifecycle.timing import checkpoint_phase
 from flash.engine.worker.train.opd.child.policy import _init_transfer_queue
 from flash.engine.worker.train.opd.child.replay import BoundedReplayBuffer
 
@@ -18,6 +20,13 @@ class FlashSyncTrainer(PPOTrainerSync):
     def __init__(self, config):
         self.runtime = RuntimeOptions.decode(dict(config.actor_rollout_ref.model.runtime_options))
         super().__init__(config)
+
+    def step(self, metrics, timing_raw):
+        first = not getattr(self, "_flash_update_seen", False)
+        with training_phase("first_update" if first else "steady_update", step=self.global_steps):
+            result = super().step(metrics, timing_raw)
+        self._flash_update_seen = True
+        return result
 
     def _build_replay_buffer(self):
         sampler = self.config.trainer.v1.sampler
@@ -43,7 +52,8 @@ class FlashSyncTrainer(PPOTrainerSync):
 
     def _save_checkpoint(self):
         if self.runtime.should_save(int(self.global_steps)):
-            return super()._save_checkpoint()
+            with checkpoint_phase(int(self.global_steps), "capture"):
+                return super()._save_checkpoint()
         return None
 
     def on_train_begin(self):
@@ -72,8 +82,9 @@ class FlashTaskRunner:
         # after successful initialization; close must never race that thread.
         _init_transfer_queue(tq.init, config.transfer_queue)
         try:
-            trainer = trainer_type(config=config)
-            trainer.init()
+            with training_phase("trainer_initialization"):
+                trainer = trainer_type(config=config)
+                trainer.init()
             manager = manager_type.create(
                 config=config,
                 llm_client=trainer.get_llm_client(),

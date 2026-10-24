@@ -92,7 +92,9 @@ def main() -> int:
             gpu=GPU_BY_SM[args.sm],
             timeout=args.deadline_min * 60,
             cpu=(4, 8),
-            memory=(32768, 65536),
+            # Keep the reservation at 32 GiB, but allow compiler memory to burst. The
+            # H100 warmup was evicted for thrashing at the previous 64 GiB limit.
+            memory=(32768, 131072),
             secrets=[
                 modal.Secret.from_dict(
                     {"BAKE_HF_REPO": repo, "BAKE_ARCH": args.arch, "HF_TOKEN": token}
@@ -102,8 +104,14 @@ def main() -> int:
         )
         try:
             await sandbox.wait.aio()
-            if await sandbox.poll.aio() != 0:
-                raise RuntimeError("Modal kernel warmup failed; inspect the bake sandbox logs")
+            returncode = await sandbox.poll.aio()
+            if returncode != 0:
+                # The provider wrapper sanitizes ordinary exceptions. Preserve this
+                # credential-free diagnostic so CI names the failed sandbox and exit.
+                raise modal_api.ModalApiError(
+                    f"Kernel warmup exited with code {returncode}; "
+                    f"inspect Modal sandbox {sandbox.object_id}"
+                )
         finally:
             await sandbox.terminate.aio(wait=True)
 
@@ -208,6 +216,7 @@ def _verify(out: str, sm: str) -> int:
         if (
             validation.get("first_exit_code") != 0
             or validation.get("reload_exit_code") != 0
+            or validation.get("exported_cache_replayed") is not True
             or reload.get("compilation_forbidden") is not True
             or reload.get("compile_attempts") != 0
             or reload.get("passed") is not True

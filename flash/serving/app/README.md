@@ -278,6 +278,37 @@ The one-off quantization job that produced them is not kept in this repo.
 - `POST /adapters/{model_id}/generate`
 - `POST /v1/chat/completions` where `model` is the adapter id
 
+### Organization rate limits
+
+Hosted inference allows **600 requests per minute per organization**, shared across API keys,
+models, router replicas, and all three inference endpoints (including streaming and trusted
+platform calls). Authorization and organization attribution happen before admission; rejected
+requests never start GPU generation. Health and adapter-management routes do not consume quota.
+Each admitted HTTP request counts once, including requests that later fail or disconnect.
+
+The Supabase RPC `public.check_serving_rate_limit` serializes admission per organization and uses
+the database clock. Windows are fixed UTC minutes, so traffic can burst across a minute boundary.
+An exhausted allowance returns **429** with `Retry-After` (seconds until the next minute),
+`X-RateLimit-Limit`, and `X-RateLimit-Remaining: 0`. A database failure or malformed result returns
+**503** with `Retry-After: 5`; serving does not bypass the limiter during an outage.
+
+To change an organization's allowance, edit `internal.serving_rate_limit_overrides` in the
+Supabase table editor or SQL editor:
+
+```sql
+INSERT INTO internal.serving_rate_limit_overrides (org_id, requests_per_minute)
+VALUES ('<organization-uuid>', 1200)
+ON CONFLICT (org_id) DO UPDATE
+SET requests_per_minute = EXCLUDED.requests_per_minute;
+```
+
+The value must be positive. Changes apply to the next admission without a deploy or cache delay;
+lowering the allowance below the current count blocks further requests until the next minute.
+Delete the override row to restore 600 RPM. Counter storage stays bounded to one row per org and
+is removed when the org is deleted. Both tables and the RPC are inaccessible to customer roles.
+Apply platform migration `20261023000000_serving_org_rate_limits.sql` **before deploying** the Flash
+router. Offline app construction explicitly bypasses admission for hermetic tests.
+
 ### Checkpoint headers (all three inference endpoints)
 
 Concurrent checkpoint deploys mutate the single serving surface for an adapter

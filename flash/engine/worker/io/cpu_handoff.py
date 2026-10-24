@@ -10,6 +10,7 @@ import tempfile
 import time
 from pathlib import Path
 
+from flash.engine.worker.runtime.phases import timed_phase
 from flash.engine.worker.runtime.state import WorkerContext
 
 MOUNT = "/checkpoint-handoff"
@@ -68,6 +69,7 @@ def defer_completion(done_path: str) -> bool:
     return True
 
 
+@timed_phase("cpu_publication")
 def main() -> None:
     context = WorkerContext.from_env()
     spec_path = Path(MOUNT) / "spec.json"

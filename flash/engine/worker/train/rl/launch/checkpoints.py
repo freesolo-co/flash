@@ -18,6 +18,11 @@ from flash.engine.support.verl_checkpoint import FsdpCheckpointInspection
 from flash.engine.worker.io.heartbeat import join_while_draining
 from flash.engine.worker.runtime.state import WorkerContext
 from flash.engine.worker.train.core.lifecycle.ledger import CheckpointLedger
+from flash.engine.worker.train.core.lifecycle.persistence import (
+    CheckpointPersistence,
+    pin_checkpoint,
+)
+from flash.engine.worker.train.core.lifecycle.timing import checkpoint_phase
 from flash.engine.worker.train.entry.backend_common import (
     completed_checkpoint_step,
     export_peft_adapter,
@@ -266,6 +271,7 @@ class _VerlResumeUploader:
         self.required_steps = frozenset(required_steps)
         self.final_step = final_step
         self.lifecycle = CheckpointLedger()
+        self.persistence = CheckpointPersistence(context=context)
         self.lifecycle.seed_resumed_step(resume_step, self.required_steps)
         self._resume_attempted: set[int] = {resume_step} if resume_step else set()
         self.staged_adapters: dict[int, str] = {}
@@ -426,9 +432,10 @@ class _VerlResumeUploader:
         self._internal_adapter_attempts[step] = self._attempt
 
     def _publish_staged(self, step: int, adapter_dir: str) -> None:
-        result = _worker_hf.publish_deployable_checkpoint(
-            adapter_dir, step, required=True, _provenance_ready=True, context=self.context
-        )
+        with checkpoint_phase(step, "adapter_publication"):
+            result = _worker_hf.publish_deployable_checkpoint(
+                adapter_dir, step, required=True, _provenance_ready=True, context=self.context
+            )
         self.lifecycle.record_publication(step, result)
 
     def _publish_ready(self) -> None:
@@ -457,9 +464,44 @@ class _VerlResumeUploader:
             if step <= checkpoint_step and step not in published
         )
 
+    def _queue_resume(self, step: int, path: str) -> None:
+        self.persistence.wait_for_capacity()
+        with checkpoint_phase(step, "snapshot_pin"):
+            staged = pin_checkpoint(
+                path, os.path.join(self.local_dir, ".flash-persistence", f"global_step_{step}")
+            )
+
+        def persist():
+            started = time.monotonic()
+            try:
+                return _worker_hf.upload_resume_checkpoint(
+                    step, staged, final_step=self.final_step, context=self.context
+                )
+            except Exception as error:
+                print(
+                    f"[rl-verl] resume checkpoint upload failed at step {step}: {error}", flush=True
+                )
+                return _worker_hf.PublicationResult(skipped_reason="resume_upload_failed")
+            finally:
+                shutil.rmtree(staged, ignore_errors=True)
+                print(
+                    f"[ckpt] step={step} persistence_s={time.monotonic() - started:.3f}",
+                    flush=True,
+                )
+
+        try:
+            self.persistence.submit(
+                persist, lambda result: self.lifecycle.record_publication(step, result)
+            )
+        except BaseException:
+            shutil.rmtree(staged, ignore_errors=True)
+            raise
+
     def _run(self) -> None:
+        self.persistence.start()
         try:
             while True:
+                self.persistence.reap()
                 stopping = self._stop.is_set()
                 deferred_for_evidence = False
                 if self._blocked_evidence_step is not None:
@@ -518,10 +560,7 @@ class _VerlResumeUploader:
                             first_positive_grad_step=positive_step,
                         )
                         try:
-                            result = _worker_hf.upload_resume_checkpoint(
-                                step, path, final_step=self.final_step, context=self.context
-                            )
-                            self.lifecycle.record_publication(step, result)
+                            self._queue_resume(step, path)
                         except Exception as error:
                             print(
                                 f"[rl-verl] resume checkpoint upload failed at step {step}: {error}",
@@ -536,6 +575,12 @@ class _VerlResumeUploader:
                 time.sleep(0.5)
         except BaseException as error:
             self._error = error
+        finally:
+            try:
+                self.persistence.close()
+            except BaseException as error:
+                if self._error is None:
+                    self._error = error
 
 
 def _restore_verl_resume(

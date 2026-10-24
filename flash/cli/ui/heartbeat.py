@@ -409,6 +409,40 @@ def _step_timing_pairs(
     return pairs
 
 
+def _training_timing_pairs(heartbeat: dict) -> list[tuple[str, str]]:
+    timing = heartbeat.get("training_timing")
+    if not isinstance(timing, dict):
+        return []
+    labels = {
+        "model_download": "model downloads",
+        "capability_checks": "capability checks",
+        "trainer_initialization": "trainer initialization",
+        "model_initialization": "model initialization",
+        "compilation_and_warmup": "compilation / warmup",
+        "first_update": "first update",
+        "steady_update": "later update",
+        "checkpoint_capture": "checkpoint capture",
+        "publication": "publication",
+    }
+    pairs = []
+    active = timing.get("active_phase_elapsed_s")
+    if isinstance(active, dict):
+        for name, label in labels.items():
+            value = _finite_positive(active.get(name))
+            if value is not None:
+                pairs.append((label, f"active for {_humanize_duration(value)} at last heartbeat"))
+    ready = _finite_positive(timing.get("worker_to_first_update_s"))
+    if ready is not None:
+        pairs.append(("worker to first update", _humanize_duration(ready)))
+    longest = timing.get("longest_phase_s")
+    if isinstance(longest, dict):
+        for name in ("first_update", "steady_update"):
+            value = _finite_positive(longest.get(name))
+            if value is not None:
+                pairs.append((f"longest {labels[name]}", _humanize_duration(value)))
+    return pairs
+
+
 def _heartbeat_pairs(
     obj: dict, *, format_hint: Callable[[str], str] = str
 ) -> list[tuple[str, str]]:
@@ -438,6 +472,8 @@ def _heartbeat_pairs(
     # a cleared `remote` is the same relaunch window as a mismatched attempt: the plane nulls it at
     # teardown, so the attached ping is just as superseded even though the identity cannot prove it.
     from_current_attempt = not heartbeat_is_superseded(obj, hb)
+    if running and from_current_attempt:
+        pairs.extend(_training_timing_pairs(hb))
     datacenter = hb.get("dc")
     if datacenter:
         label = "datacenter" if from_current_attempt else "datacenter (previous attempt)"

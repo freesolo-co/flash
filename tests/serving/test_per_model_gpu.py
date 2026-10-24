@@ -499,7 +499,7 @@ def test_tier_classes_inherit_the_shared_impl(modal_app_module):
     assert issubclass(b200, modal_app_module._LoraEngineImpl)
     for impl in ("_load", "_register", "_generate", "_stream_generate", "_unregister", "_health"):
         assert hasattr(b200, impl)
-    for entry in ("load", "register", "generate", "stream_generate", "unregister", "health"):
+    for entry in ("load", "register", "generate", "stream_generate_call", "unregister", "health"):
         assert entry in b200.__dict__
 
 
@@ -650,9 +650,7 @@ def test_scale_to_zero_pool_dispatches_inference_and_registration(modal_app_modu
 
     class _FakeEngine:
         generate = types.SimpleNamespace(remote=types.SimpleNamespace(aio=_generate))
-        stream_generate = types.SimpleNamespace(
-            remote_gen=types.SimpleNamespace(aio=_stream_generate)
-        )
+        stream_generate_call = object()
         register = types.SimpleNamespace(remote=types.SimpleNamespace(aio=_register))
 
         @property
@@ -660,6 +658,34 @@ def test_scale_to_zero_pool_dispatches_inference_and_registration(modal_app_modu
             raise AssertionError("zero-floor engines must not update the autoscaler")
 
     engine = _FakeEngine()
+    closed = []
+
+    def channel(**kwargs):
+        import time
+
+        assert kwargs["spawn_method"] is engine.stream_generate_call
+        assert (
+            time.time()
+            < kwargs["dispatch_deadline_unix"]
+            <= time.time() + mod.ROUTER_TIMEOUT_SECONDS
+        )
+        assert len(kwargs["invocation_nonce"]) == 32
+
+        async def events():
+            try:
+                async for event in _stream_generate(
+                    kwargs["payload_dict"],
+                    kwargs["record_dict"],
+                    kwargs["expected_checkpoint"],
+                    kwargs["generation_id"],
+                ):
+                    yield event
+            finally:
+                closed.append(True)
+
+        return events()
+
+    monkeypatch.setattr("flash.serving.src.stream_channel.client.CancellableStreamChannel", channel)
 
     def _bind(*, base_model: str):
         bound_models.append(base_model)
@@ -732,6 +758,7 @@ def test_scale_to_zero_pool_dispatches_inference_and_registration(modal_app_modu
     )
     assert generate_calls == [expected_inference_call]
     assert stream_calls == [expected_inference_call]
+    assert closed == [True]
     assert register_calls == [(forwarded_record, "generation-1")]
 
 
@@ -865,3 +892,18 @@ def test_engine_boot_never_reads_the_adapter_database(modal_app_module, monkeypa
     engine, _ = _load_engine_and_args(modal_app_module, monkeypatch, tmp_path, "Qwen/Qwen3.5-9B")
     assert reads == []
     assert engine.registry.list_ready() == []
+
+
+def test_modal_stream_entrypoint_uses_regular_call(modal_app_module, monkeypatch):
+    import inspect
+    from unittest.mock import AsyncMock
+
+    from flash.serving.src.stream_channel import engine as channel_engine
+
+    engine = modal_app_module.ENGINE_BY_KEY[("B200", 8)]()
+    run = AsyncMock(return_value={"terminal_kind": "event"})
+    monkeypatch.setattr(channel_engine, "stream_generate_call", run)
+    assert not inspect.isasyncgenfunction(engine.stream_generate_call)
+    args = ({"prompt": "hello"}, None, None, "fsgen-test", 123.0, "qu-test", "nonce")
+    assert asyncio.run(engine.stream_generate_call(*args)) == {"terminal_kind": "event"}
+    run.assert_awaited_once_with(engine, *args)

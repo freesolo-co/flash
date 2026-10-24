@@ -19,6 +19,7 @@ from flash.serving.src.accounting.usage import (
 from flash.serving.src.accounting.usage_outbox import RequestIdentity, UsageOutboxError
 from flash.serving.src.engine import generation
 from flash.serving.src.http import inference_routes
+from flash.serving.src.http.rate_limit import allow_offline_inference
 from flash.serving.src.http.router import AdapterRouter, build_serving_app
 from flash.serving.src.io.schemas import AdapterRecord, internal_adapter_payload
 from tests.serving.conftest import RecordingUsageStore
@@ -182,6 +183,7 @@ def _client(record: AdapterRecord, store: RecordingUsageStore) -> TestClient:
             _GenerationPool(record),
             AdapterRouter([record]),
             usage_store=store,
+            rate_limiter=allow_offline_inference,
             chat_authorizer=_authorize,
             deployment_id="deployment-1",
             deployment_sha="release-1",

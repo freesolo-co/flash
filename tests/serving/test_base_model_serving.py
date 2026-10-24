@@ -16,6 +16,7 @@ from fastapi.testclient import TestClient
 from flash.schema import parse_checkpoint_ref
 from flash.serve.contract.provenance import immutable_binding_fingerprint
 from flash.serving.src.accounting.usage import AuthorizedTraffic, principal_for_external_org
+from flash.serving.src.http.rate_limit import allow_offline_inference
 from flash.serving.src.http.router import AdapterRouter, build_serving_app
 from flash.serving.src.io.schemas import AdapterRecord, internal_adapter_payload
 from tests.serving.conftest import RecordingUsageStore, attest
@@ -106,6 +107,7 @@ def _build(records, *, authorizer=None):
         internal_key=INTERNAL_KEY,
         chat_authorizer=authorizer,
         usage_store=store,
+        rate_limiter=allow_offline_inference,
     )
     return TestClient(app), store
 
