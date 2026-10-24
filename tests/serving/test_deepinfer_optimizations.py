@@ -85,17 +85,19 @@ def test_batching_preserves_every_token_in_order(limit):
     assert emitted == expected
 
 
-def test_prefix_eviction_releases_native_state_and_expired_entries():
+@pytest.mark.parametrize("now", [1.0, 10000.0])
+def test_prefix_eviction_releases_native_state_and_expired_entries(monkeypatch, now):
+    monkeypatch.setattr("flash.serving.deepinfer.prefix_cache.time.monotonic", lambda: now)
     released = []
     engine = SimpleNamespace(
         cache_config=SimpleNamespace(block_size=128),
         scheduler=SimpleNamespace(free_seq=released.append, get_num_free_gpu_blocks=lambda: 0),
     )
     cache = PrefixCache(engine)
-    cache.entries["old"] = Prefix("a", (1,), "old-state", 0)
+    cache.entries["old"] = Prefix("a", (1,), "old-state", now - cache.ttl)
     cache.prune()
     assert released == ["old-state"]
-    cache.entries["pressure"] = Prefix("a", (1,), "pressure-state", float("inf"))
+    cache.entries["pressure"] = Prefix("a", (1,), "pressure-state", now)
     cache.prune(256)
     assert released == ["old-state", "pressure-state"]
     assert not cache.entries

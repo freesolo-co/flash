@@ -12,6 +12,7 @@ from flash.serving.deepinfer.config import MODEL_ID
 from flash.serving.deepinfer.errors import DeepInferError
 from flash.serving.deepinfer.http import build_app
 from flash.serving.src.engine.model_config import base_models, hosted_base_models
+from flash.serving.src.http.rate_limit import allow_offline_inference
 from flash.serving.src.http.router import AdapterRouter, build_serving_app
 from flash.serving.src.io.openai_request import OpenAIGenerateRequest
 from flash.serving.src.io.schemas import AdapterRecord
@@ -46,7 +47,11 @@ def app(runtime):
         return "org-deepseek"
 
     return build_serving_app(
-        pool, AdapterRouter([record()]), usage_store=store, chat_authorizer=authorize
+        pool,
+        AdapterRouter([record()]),
+        usage_store=store,
+        chat_authorizer=authorize,
+        rate_limiter=allow_offline_inference,
     ), store
 
 
