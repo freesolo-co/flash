@@ -1,0 +1,325 @@
+{
+  "reviewed_flash_main": "3c751157",
+  "deepseek_serving_base": "b6a4019ae7a8c1cd4d6967ba5ae8e22cbd0e58ad",
+  "deepinfer": "9bd9cf243fc53ef9afbf8f04d391d989117d6ab9",
+  "model_revision": "1bae0e1088993b9b82de08f59de5be5a34e42170",
+  "experiments": [
+    {
+      "name": "routing",
+      "pr": "https://github.com/freesolo-co/flash/pull/1488",
+      "median_throughput_ratio_range": [
+        0.9871624745323939,
+        2.1790478373800686
+      ],
+      "paired_repeats_per_group": 3,
+      "groups": [
+        {
+          "length": 2048,
+          "distribution": "uniform",
+          "median_throughput_ratio": 1.0922393245351458,
+          "throughput_ratio_range": [
+            1.0784329666612724,
+            1.1117759898105595
+          ],
+          "all_exact_output_match": false
+        },
+        {
+          "length": 2048,
+          "distribution": "skewed",
+          "median_throughput_ratio": 0.9871624745323939,
+          "throughput_ratio_range": [
+            0.8338288564447134,
+            1.041944910274152
+          ],
+          "all_exact_output_match": false
+        },
+        {
+          "length": 8192,
+          "distribution": "uniform",
+          "median_throughput_ratio": 1.5438255127176195,
+          "throughput_ratio_range": [
+            1.3112286710141645,
+            1.5735519676366962
+          ],
+          "all_exact_output_match": false
+        },
+        {
+          "length": 8192,
+          "distribution": "skewed",
+          "median_throughput_ratio": 1.2752299603166282,
+          "throughput_ratio_range": [
+            1.2294651439913622,
+            1.3081912523059454
+          ],
+          "all_exact_output_match": false
+        },
+        {
+          "length": 16384,
+          "distribution": "uniform",
+          "median_throughput_ratio": 2.1790478373800686,
+          "throughput_ratio_range": [
+            2.1327099160711818,
+            3.1945328507909556
+          ],
+          "all_exact_output_match": false
+        },
+        {
+          "length": 16384,
+          "distribution": "skewed",
+          "median_throughput_ratio": 1.7009518611209795,
+          "throughput_ratio_range": [
+            1.5442772388622172,
+            1.8680459671358043
+          ],
+          "all_exact_output_match": false
+        }
+      ]
+    },
+    {
+      "name": "tiering",
+      "pr": "https://github.com/freesolo-co/flash/pull/1489",
+      "median_throughput_ratio_range": [
+        1.13947764344567,
+        2.0863301113236554
+      ],
+      "paired_repeats_per_group": 3,
+      "groups": [
+        {
+          "length": 2048,
+          "median_throughput_ratio": 1.13947764344567,
+          "throughput_ratio_range": [
+            1.1359157825978516,
+            1.5935527970130101
+          ],
+          "all_exact_output_match": false
+        },
+        {
+          "length": 8192,
+          "median_throughput_ratio": 1.5390645242254095,
+          "throughput_ratio_range": [
+            1.5093456090830195,
+            1.5391444224333024
+          ],
+          "all_exact_output_match": false
+        },
+        {
+          "length": 16384,
+          "median_throughput_ratio": 2.0863301113236554,
+          "throughput_ratio_range": [
+            2.083602853520218,
+            2.446079201969568
+          ],
+          "all_exact_output_match": false
+        }
+      ]
+    },
+    {
+      "name": "retention",
+      "pr": "https://github.com/freesolo-co/flash/pull/1490",
+      "median_throughput_ratio_range": [
+        0.9864348031606879,
+        1.2331497435889458
+      ],
+      "paired_repeats_per_group": 3,
+      "groups": [
+        {
+          "distribution": "hot_scan",
+          "median_throughput_ratio": 1.2331497435889458,
+          "throughput_ratio_range": [
+            1.2163315859822985,
+            1.268558050357989
+          ],
+          "all_exact_output_match": true,
+          "hit_fraction": {
+            "A": 0.16666666666666666,
+            "B": 0.4166666666666667
+          }
+        },
+        {
+          "distribution": "uniform_scan",
+          "median_throughput_ratio": 0.9864348031606879,
+          "throughput_ratio_range": [
+            0.8793726390593771,
+            1.003168769838644
+          ],
+          "all_exact_output_match": true,
+          "hit_fraction": {
+            "A": 0.0,
+            "B": 0.0
+          }
+        }
+      ]
+    },
+    {
+      "name": "blending",
+      "pr": "https://github.com/freesolo-co/flash/pull/1491",
+      "median_throughput_ratio_range": [
+        1.1352825237939432,
+        1.7754247494363267
+      ],
+      "paired_repeats_per_group": 3,
+      "groups": [
+        {
+          "length": 2048,
+          "median_throughput_ratio": 1.1352825237939432,
+          "throughput_ratio_range": [
+            0.08498300789544405,
+            1.5122200238183985
+          ],
+          "all_exact_output_match": false
+        },
+        {
+          "length": 8192,
+          "median_throughput_ratio": 1.4713212981725556,
+          "throughput_ratio_range": [
+            0.3057886861917088,
+            1.48210418529072
+          ],
+          "all_exact_output_match": false
+        },
+        {
+          "length": 16384,
+          "median_throughput_ratio": 1.7754247494363267,
+          "throughput_ratio_range": [
+            0.5432389652610509,
+            2.083362198350998
+          ],
+          "all_exact_output_match": false
+        }
+      ]
+    },
+    {
+      "name": "compression",
+      "pr": "https://github.com/freesolo-co/flash/pull/1492",
+      "median_throughput_ratio_range": [
+        0.5874369574963338,
+        0.8391909019308619
+      ],
+      "paired_repeats_per_group": 3,
+      "groups": [
+        {
+          "length": 2048,
+          "median_throughput_ratio": 0.8391909019308619,
+          "throughput_ratio_range": [
+            0.8130825866992516,
+            0.9140513901799376
+          ],
+          "all_exact_output_match": false
+        },
+        {
+          "length": 8192,
+          "median_throughput_ratio": 0.5874369574963338,
+          "throughput_ratio_range": [
+            0.5672259067046399,
+            0.6210302263988866
+          ],
+          "all_exact_output_match": false
+        },
+        {
+          "length": 16384,
+          "median_throughput_ratio": 0.6259139483120547,
+          "throughput_ratio_range": [
+            0.6254361883970414,
+            0.6293280013937276
+          ],
+          "all_exact_output_match": false
+        }
+      ]
+    },
+    {
+      "name": "sharing",
+      "pr": "https://github.com/freesolo-co/flash/pull/1493",
+      "median_throughput_ratio_range": [
+        0.1158926820865054,
+        0.22039732907161497
+      ],
+      "paired_repeats_per_group": 3,
+      "groups": [
+        {
+          "length": 2048,
+          "median_throughput_ratio": 0.16072228901616925,
+          "throughput_ratio_range": [
+            0.1541992859436594,
+            0.16085035790564994
+          ],
+          "all_exact_output_match": false
+        },
+        {
+          "length": 8192,
+          "median_throughput_ratio": 0.1158926820865054,
+          "throughput_ratio_range": [
+            0.044033537189804815,
+            0.18100666659496328
+          ],
+          "all_exact_output_match": false
+        },
+        {
+          "length": 16384,
+          "median_throughput_ratio": 0.22039732907161497,
+          "throughput_ratio_range": [
+            0.19239246917236416,
+            0.22377823532608612
+          ],
+          "all_exact_output_match": false
+        }
+      ]
+    },
+    {
+      "name": "disaggregation",
+      "pr": "https://github.com/freesolo-co/flash/pull/1494",
+      "median_throughput_ratio_range": [
+        0.06259649481143045,
+        0.086220557759199
+      ],
+      "paired_repeats_per_group": 3,
+      "groups": [
+        {
+          "length": 2048,
+          "median_throughput_ratio": 0.086220557759199,
+          "throughput_ratio_range": [
+            0.08598549112088984,
+            0.16606727398119456
+          ],
+          "all_exact_output_match": true
+        },
+        {
+          "length": 8192,
+          "median_throughput_ratio": 0.06259649481143045,
+          "throughput_ratio_range": [
+            0.06168337853261438,
+            0.07769573240523352
+          ],
+          "all_exact_output_match": true
+        },
+        {
+          "length": 16384,
+          "median_throughput_ratio": 0.06722821238683956,
+          "throughput_ratio_range": [
+            0.06383761771937588,
+            0.06821125095049309
+          ],
+          "all_exact_output_match": true
+        }
+      ]
+    }
+  ],
+  "scope": "Native synthetic bursts; no hosted traffic changes. Variable-length MTP enabled. Non-prefix reuse is approximate; three-bit compression is host/storage only.",
+  "priorities": [
+    "cache and queue aware routing",
+    "bounded CPU tiering",
+    "frequency retention for hot-plus-scan traffic"
+  ],
+  "cost": {
+    "gpu_host_upper_usd": 67.39220853370736,
+    "relay_cpu_upper_usd": 0.1982587996128559,
+    "remaining_owned_sandboxes": [],
+    "note": "Conservative elapsed-time calculation starts before provisioning and includes idle/build/retry time. Not an invoice; egress excluded, reserve remains inside $500 authorization."
+  },
+  "restart_probe": {
+    "exact_outputs": 16,
+    "requests": 16,
+    "retrieval_passed": 4,
+    "retrieval_checks": 4,
+    "sender_terminated_before_restore": true
+  }
+}
