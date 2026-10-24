@@ -176,7 +176,7 @@ class Runtime:
         return tokens
 
     async def prefix_length(self, request, tokens):
-        if not request.cache_namespace:
+        if not request.cache_namespace or len(tokens) < 130:
             return 0
         # Reuse only a token-exact stable conversation prefix. Single-message prompts
         # fall back to full-prompt reuse; no target hit ratio is manufactured.
@@ -207,7 +207,7 @@ class Runtime:
     async def generate(self, request, tokens):
         self.assert_healthy()
         rank = min(range(GPU_COUNT), key=self.loads.__getitem__)
-        if request.cache_namespace:
+        if request.cache_namespace and request.prefix_tokens >= 128:
             affinity = (
                 hashlib.sha256(
                     (request.cache_namespace + ":" + str(tokens[:128])).encode()

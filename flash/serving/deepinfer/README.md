@@ -13,7 +13,7 @@ keep their separate vLLM images and capacity.
 | GPU allocation | `B200:4` per replica, EP=4 / DP=4 |
 | Replica pool | 0–4, at most 16 B200s |
 | Admission | 32 requests per replica; scale-out target 24 |
-| Native scheduler | 8 sequences per rank, 4,096-token prefill chunks |
+| Native scheduler | 8 sequences per rank, 4,096-token prefill chunks; any-rank prefill check every 8 decode steps |
 | Expert execution | FP8 E4M3 values with the released UE8M0 scales |
 | Token delivery | First output immediately; then 16 tokens or 50 ms of engine progress |
 | Idle shutdown | 600 seconds, no warm floor or spare buffer |
@@ -48,6 +48,13 @@ model revision, tenant, messages, and thinking mode. Misses run off the event lo
 Delivery batching always flushes terminal tokens; the time limit is checked at
 engine-step boundaries and does not bound a stalled GPU collective.
 
+Cache affinity and retained checkpoints can leave unequal prefill queues across
+ranks. The native any-rank prefill interval is eight decode steps instead of the
+upstream default of 100, preventing those queues from waiting behind long decode
+runs. This is a scheduling interval, not a wall-clock latency guarantee. Prompts
+shorter than 130 tokens skip prefix preparation and use least-loaded routing,
+because retention requires 128 prefix tokens plus two uncached tokens.
+
 ## Deployment and qualification
 
 The native bridge passed a **four-B200 smoke and performance run**; see the
@@ -62,6 +69,26 @@ overhead. Batched delivery reduced 131 internal events to about 20 per response.
 GPU checks also covered cached/uncached output parity, tenant isolation, eviction,
 and cancellation during prefill and decoding while another request completed.
 Peak sampled physical GPU memory was 88.93%. All validation GPUs were released.
+
+A subsequent same-four-B200 FP8 comparison isolated the cold-request scheduling
+fix. With 24 streams, 5,068 input tokens and 256 output tokens per request, cold
+aggregate throughput increased from 624 to 1,300 output tokens/s and p95 TTFT fell
+from 6.735 to 2.158 seconds. Median per-stream decode speed fell from 101.4 to 81.7
+tokens/s as prefills interrupted decoding sooner. Short cold requests improved
+from 1,817 to 2,514 aggregate tokens/s, with p95 TTFT falling from 3.083 to 0.229
+seconds. All 792 measured requests and 48 mixed-traffic requests succeeded, with
+identical complete outputs between versions for each tested workload. Native
+traces showed at most eight consecutive decode steps with waiting prefills,
+versus 100 before. The mixed test reduced new-request p95 TTFT from 10.300 to
+2.605 seconds; established streams slowed approximately 6%.
+
+This fix is not a universal throughput improvement: the cached long-prompt
+24-stream comparison included a 2.24-second native-step stall in its first repeat.
+Keeping all three repeats gives 2,512 to 1,924 aggregate tokens/s and 0.346 to
+2.378 seconds p95 TTFT. Its cause remains unisolated; the following two repeats
+reached 2,372 and 2,459 tokens/s. These localhost measurements exclude model
+startup and public-router/network overhead, and retain all first-use effects.
+Further cached-tail and sustained mixed-traffic qualification remains necessary.
 
 The earlier FP4 configuration peaked at approximately 1,597 aggregate output
 tokens/s on short prompts; that is historical evidence, not a measurement of the

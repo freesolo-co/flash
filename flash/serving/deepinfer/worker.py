@@ -15,6 +15,7 @@ from flash.serving.deepinfer.config import (
     DELIVERY_TOKENS,
     GPU_COUNT,
     MAX_MODEL_LEN,
+    PREFILL_ANY_INTERVAL,
     PREFILL_TOKENS,
     RUNTIME_ROOT,
     SEQUENCES_PER_RANK,
@@ -39,6 +40,9 @@ def initialize(rank: int, model_path: str):
             "DEEPINFER_PREFILL_STORE_EXTRA_SIZE": "0",
             "DEEPINFER_LOGGING_INTERVAL_STEP": "0",
             "DEEPINFER_NUM_STATE_SLOTS_RATIO": "2",
+            # Cache affinity/checkpoints leave unequal prefill queues across ranks.
+            # The upstream 100-step fallback stalls those requests behind decoding.
+            "DEEPINFER_PREFILL_ANY_ATTEMPT_INTERVAL": str(PREFILL_ANY_INTERVAL),
         }
     )
     sys.path[:0] = [f"{RUNTIME_ROOT}/examples", RUNTIME_ROOT]
@@ -145,6 +149,7 @@ def run_rank(rank, model_path, incoming, outgoing, stopped):
             expert_dtype="float8_e4m3fn",
             expert_source="losslessly-expanded-fp4",
             converted_expert_tensors=CONVERTED_EXPERT_TENSORS,
+            prefill_any_attempt_interval=engine.scheduler_config.prefill_any_attempt_interval,
         )
         print(f"DEEPINFER_LOADED {proof}", flush=True)
         outgoing.put({"type": "ready", "rank": rank, "provenance": proof})

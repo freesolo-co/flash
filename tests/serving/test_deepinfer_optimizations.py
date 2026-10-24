@@ -59,6 +59,23 @@ async def test_deepinfer_prompt_cache_separates_thinking_tenant_and_checks_outpu
     assert len(calls) == 3
 
 
+@pytest.mark.anyio
+@pytest.mark.parametrize("length", [26, 129, 130])
+async def test_prefix_preparation_skips_prompts_below_native_cache_minimum(length):
+    runtime = Runtime()
+    calls = []
+
+    async def prepare(request):
+        calls.append(request)
+        return list(range(128))
+
+    runtime.prepare_tokens = prepare
+    request = replace(parse_request(body()), cache_namespace="a" * 64)
+    prefix = await runtime.prefix_length(request, list(range(length)))
+    assert prefix == (128 if length == 130 else 0)
+    assert len(calls) == int(length == 130)
+
+
 def test_token_delivery_first_token_deadline_size_and_terminal_flush():
     batch = TokenBatch(3, 0.05)
     batch.add([1], 10)

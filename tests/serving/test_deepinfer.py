@@ -1,10 +1,12 @@
 """CPU contract tests for the private DeepInfer endpoint and rank bridge."""
 
 import asyncio
+import hashlib
 import importlib
 import json
 import queue
 import sys
+from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
@@ -189,26 +191,40 @@ async def test_disconnect_cancels_generation_task():
 
 
 @pytest.mark.anyio
-async def test_rank_assignment_and_cancel_are_request_scoped():
+@pytest.mark.parametrize(
+    ("namespace", "prefix_tokens"), [(None, 0), ("a" * 64, 0), ("a" * 64, 128)]
+)
+async def test_rank_assignment_and_cancel_are_request_scoped(namespace, prefix_tokens):
     runtime = Runtime()
     runtime.incoming = [queue.Queue() for _ in range(4)]
-    runtime.loads = [1, 0, 1, 1]
-    generator = runtime.generate(parse_request(body()), [0, 7])
+    tokens = list(range(130))
+    affinity = (
+        hashlib.sha256(((namespace or "") + ":" + str(tokens[:128])).encode()).digest()[0] % 4
+    )
+    idle = (affinity + 1) % 4
+    initial_loads = [1] * 4
+    initial_loads[idle] = 0
+    runtime.loads = initial_loads.copy()
+    rank = affinity if prefix_tokens else idle
+    request = replace(parse_request(body()), cache_namespace=namespace, prefix_tokens=prefix_tokens)
+    generator = runtime.generate(request, tokens)
     first = asyncio.create_task(anext(generator))
     await asyncio.sleep(0)
-    command = runtime.incoming[1].get_nowait()
+    command = runtime.incoming[rank].get_nowait()
     request_id = command["id"]
     runtime._deliver({"type": "tokens", "id": request_id, "tokens": [2], "finish_reason": None})
     assert (await first)["tokens"] == [2]
     closing = asyncio.create_task(generator.aclose())
     await asyncio.sleep(0)
-    assert runtime.incoming[1].get_nowait() == {"type": "cancel", "id": request_id}
-    assert runtime.loads[1] == 1  # Hold the slot until the native abort is acknowledged.
+    assert runtime.incoming[rank].get_nowait() == {"type": "cancel", "id": request_id}
+    assert (
+        runtime.loads[rank] == initial_loads[rank] + 1
+    )  # Hold until native abort is acknowledged.
     runtime._deliver({"type": "cancelled", "id": request_id})
     await closing
-    assert runtime.loads == [1, 0, 1, 1]
+    assert runtime.loads == initial_loads
     assert runtime.pending == {}
-    assert all(runtime.incoming[rank].empty() for rank in [0, 2, 3])
+    assert all(channel.empty() for channel in runtime.incoming)
 
 
 @pytest.mark.anyio
