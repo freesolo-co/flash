@@ -10,6 +10,7 @@ import traceback
 from collections import defaultdict
 
 from flash.serve.runtime.token_batch import TokenBatch
+from flash.serving.deepinfer.approximate_cache import ApproximatePrefixCache
 from flash.serving.deepinfer.config import (
     DELIVERY_SECONDS,
     DELIVERY_TOKENS,
@@ -19,7 +20,6 @@ from flash.serving.deepinfer.config import (
     RUNTIME_ROOT,
     SEQUENCES_PER_RANK,
 )
-from flash.serving.deepinfer.tiered_cache import TieredPrefixCache
 
 
 def initialize(rank: int, model_path: str):
@@ -122,7 +122,7 @@ def step(engine, active, outgoing, cache, batches):
                 "tokens": tokens,
                 "finish_reason": finished.get(request_id),
                 "cached_tokens": cache.hits.get(request_id, 0),
-                "cached_tokens_reported": True,
+                "cached_tokens_reported": request_id not in cache.approximate,
             }
         )
         if request_id in finished:
@@ -149,7 +149,7 @@ def run_rank(rank, model_path, incoming, outgoing, stopped):
         print(f"DEEPINFER_LOADED {proof}", flush=True)
         outgoing.put({"type": "ready", "rank": rank, "provenance": proof})
         active = set()
-        cache = TieredPrefixCache(engine)
+        cache = ApproximatePrefixCache(engine)
         batches = {}
         last_directory = None
         last_heartbeat = time.monotonic()

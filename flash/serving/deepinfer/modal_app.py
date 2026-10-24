@@ -33,6 +33,9 @@ image = (
             "VIRTUAL_ENV": "/opt/deepinfer-venv",
             "DEEPINFER_ACCELERATOR": "nvidia",
             "PYTHONUNBUFFERED": "1",
+            "FLASH_DEEPINFER_APPROXIMATE_NAMESPACES": os.environ.get(
+                "FLASH_DEEPINFER_APPROXIMATE_NAMESPACES", ""
+            ),
             "FLASH_DEEPINFER_CPU_CACHE_BYTES": os.environ.get(
                 "FLASH_DEEPINFER_CPU_CACHE_BYTES", "1073741824"
             ),

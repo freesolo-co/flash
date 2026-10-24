@@ -74,6 +74,17 @@ another spill to keep the host transfer within its budget. Expired entries are
 discarded. Allocation refusal falls back to prefill. Restored exact prefixes are
 reported as cached input; tokenization-cache hits are still not discounted.
 
+`FLASH_DEEPINFER_APPROXIMATE_NAMESPACES` is empty by default. A comma-separated
+allowlist of trusted 64-character tenant namespace hashes explicitly enables
+approximate reuse for those namespaces. Only small edits at unchanged token
+positions with a long unchanged tail qualify. The worker recomputes through the
+last edit plus 128 tokens, splices complete blocks, retains later approximate KV
+and recurrent state, then replays the final 128 prefix tokens and the query.
+This can change answers and is not layerwise CacheBlend. It permits one in-flight
+blend per rank with at most a 256 MiB donor snapshot. Larger edits, misses, or
+allocation refusal use ordinary prefill. Mixed state is never installed in the
+exact cache and reports zero cached tokens with `cached_tokens_reported=False`.
+
 ## Deployment and qualification
 
 The native bridge passed a **four-B200 smoke and performance run**; see the

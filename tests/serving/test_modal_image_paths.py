@@ -161,6 +161,7 @@ def test_image_extras_cover_every_directly_imported_third_party_package() -> Non
             "fp8.py",
             "prefix_cache.py",
             "snapshots.py",
+            "approximate_cache.py",
             "provenance.py",
         }:
             continue
