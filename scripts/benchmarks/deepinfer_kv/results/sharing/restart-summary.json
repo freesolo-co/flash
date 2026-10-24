@@ -1,0 +1,9 @@
+{
+  "receiver_restart_seconds": 411.89243654184975,
+  "exact_outputs": 16,
+  "requests": 16,
+  "retrieval_passed": 4,
+  "retrieval_checks": 4,
+  "sender_terminated": true,
+  "probe": "One abrupt receiver process-group kill/reload; relay remained alive. Not a durable disk or repeated performance test."
+}
