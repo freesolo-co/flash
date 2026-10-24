@@ -25,6 +25,7 @@ from flash.serving.src.http.headers import (
     optional_internal_org_id,
     training_scope_headers,
 )
+from flash.serving.src.http.rate_limit import RateLimiter
 from flash.serving.src.http.routing import AdapterRouter, EnginePool
 from flash.serving.src.io.schemas import AdapterRecord
 from flash.serving.src.io.streaming import generate_once, openai_chat_stream, prepare_stream
@@ -79,6 +80,7 @@ class ServingContext:
         lookup: AdapterLookup,
         usage: UsageStore,
         *,
+        rate_limiter: RateLimiter,
         internal_key: str | None,
         deployment_id: str,
         serving_release: str,
@@ -89,6 +91,7 @@ class ServingContext:
         ]
         | None,
     ) -> None:
+        self.rate_limiter = rate_limiter
         self.pool = pool
         self.router = router
         self.lookup = lookup

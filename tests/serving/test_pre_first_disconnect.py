@@ -20,6 +20,7 @@ from flash.serving.src.http.inference_routes import (
     _discard_prepared_stream,
     _stream_chat_completion,
 )
+from flash.serving.src.http.rate_limit import allow_offline_inference
 from flash.serving.src.http.routing import AdapterRouter
 from flash.serving.src.io.schemas import AdapterRecord, GenerateRequest
 from flash.serving.src.io.streaming import openai_chat_stream, prepare_stream
@@ -108,6 +109,7 @@ def test_non_streaming_disconnect_cancels_generation(monkeypatch, route: str) ->
 
         class Context:
             lookup = Lookup()
+            rate_limiter = staticmethod(allow_offline_inference)
 
             async def authorize_inference(self, *_args):
                 return AuthorizedTraffic(principal_for_external_org("org-1"), "generation-a")
@@ -189,6 +191,7 @@ def test_non_streaming_disconnect_after_engine_completion_finishes_finalization_
             Lookup(),  # type: ignore[arg-type]
             store,
             internal_key=None,
+            rate_limiter=allow_offline_inference,
             deployment_id="deployment-1",
             serving_release="release-1",
             reload_records=None,

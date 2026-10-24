@@ -28,6 +28,7 @@ from flash.serving.src.http.adapter_routes import adapter_router
 from flash.serving.src.http.body_limit import RequestBodyLimitMiddleware
 from flash.serving.src.http.context import APP_STATE_ATTR, ServingContext
 from flash.serving.src.http.inference_routes import inference_router
+from flash.serving.src.http.rate_limit import RateLimiter, allow_offline_inference
 from flash.serving.src.http.routing import AdapterRouter, EnginePool, health_body
 from flash.serving.src.io.schemas import AdapterRecord
 from flash.serving.src.store.lookup import AdapterLookup
@@ -47,6 +48,7 @@ def build_offline_serving_app(
     **kwargs: Any,
 ):
     """Build an explicitly unmetered app for hermetic tests and local offline use."""
+    kwargs.setdefault("rate_limiter", allow_offline_inference)
     return build_serving_app(pool, router, usage_store=OfflineUsageStore(), **kwargs)
 
 
@@ -61,6 +63,7 @@ def build_serving_app(
     lookup_record: Callable[[str, str], AdapterRecord | None] | None = None,
     reload_interval_seconds: float = 30.0,
     usage_store: UsageStore,
+    rate_limiter: RateLimiter,
     chat_authorizer: Callable[[str, str, dict[str, str]], Awaitable[str | AuthorizedTraffic | None]]
     | None = None,
 ):
@@ -74,6 +77,9 @@ def build_serving_app(
     ``usage_store`` is explicit: hosted construction passes the durable store, while offline tests
     must deliberately pass ``OfflineUsageStore``. There is no configuration-based fallback from a
     partially wired hosted deployment to unmetered serving.
+
+    ``rate_limiter`` admits each attributed request before GPU dispatch. Hosted construction
+    supplies the shared Supabase limiter; offline construction explicitly bypasses it.
 
     External chat/inference auth is ALWAYS enforced. ``chat_authorizer`` authorizes a user request:
     it is called with ``(freesolo_api_key, model_id)`` and must raise an ``HTTPException`` (401/403)
@@ -99,6 +105,7 @@ def build_serving_app(
         reload_records=reload_records,
         lookup_record=lookup_record,
         chat_authorizer=chat_authorizer,
+        rate_limiter=rate_limiter,
     )
 
     api = FastAPI(
@@ -149,7 +156,7 @@ def _lifespan_for(
                 await context.usage.aclose()
             finally:
                 # close persistent authorization clients even when durable shutdown fails.
-                for client_owner in (chat_authorizer,):
+                for client_owner in (chat_authorizer, context.rate_limiter):
                     aclose = getattr(client_owner, "aclose", None)
                     if aclose is not None:
                         with contextlib.suppress(Exception):

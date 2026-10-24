@@ -69,6 +69,7 @@ async def generate(payload: GenerateRequest, request: Request) -> JSONResponse:
         payload.model_id, org_id=_authorization_org_id(authorization)
     )
     traffic = require_attributed_traffic(authorization, target)
+    await context.rate_limiter(traffic.principal.orgId)
     await _prepare_generate_request(payload, target)
     identity = new_request_identity(request)
     admitted_at = captured_now()
@@ -104,6 +105,7 @@ async def generate_for_adapter(
         req.model_id, org_id=_authorization_org_id(authorization)
     )
     traffic = require_attributed_traffic(authorization, target)
+    await context.rate_limiter(traffic.principal.orgId)
     await _prepare_generate_request(req, target)
     identity = new_request_identity(request)
     admitted_at = captured_now()
@@ -173,6 +175,7 @@ async def chat_completions(payload: dict[str, Any], request: Request) -> Any:
         model_id, org_id=_authorization_org_id(authorization)
     )
     traffic = require_attributed_traffic(authorization, target)
+    await context.rate_limiter(traffic.principal.orgId)
     effective_thinking = target.thinking
     if target.serve_base_model:
         override = normalized.chat_template_kwargs.get("enable_thinking")
