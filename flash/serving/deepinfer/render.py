@@ -1,13 +1,10 @@
 """Incrementally decode native tokens without dropping reasoning or partial UTF-8."""
 
-from flash.serving.deepinfer.protocol import usage
-
 
 class Decoder:
-    def __init__(self, tokenizer, *, thinking, prompt_tokens):
+    def __init__(self, tokenizer, *, thinking):
         self.tokenizer = tokenizer
         self.thinking = thinking
-        self.prompt_tokens = prompt_tokens
         self.completion_tokens = 0
         self.reasoning_tokens = 0
         self.start = tokenizer.token_to_id("<think>")
@@ -16,7 +13,6 @@ class Decoder:
         if thinking and (self.start is None or self.end is None):
             raise RuntimeError("Pinned tokenizer is missing reasoning delimiters")
         self.pending = []
-        self.text = {"content": "", "reasoning_content": ""}
 
     def _flush(self, *, final=False):
         if not self.pending:
@@ -26,7 +22,6 @@ class Decoder:
             return {}
         self.pending.clear()
         field = "reasoning_content" if self.thinking else "content"
-        self.text[field] += text
         return {field: text}
 
     def consume(self, event):
@@ -47,6 +42,3 @@ class Decoder:
         if delta := self._flush(final=bool(event.get("finish_reason"))):
             deltas.append(delta)
         return deltas
-
-    def usage(self):
-        return usage(self.prompt_tokens, self.completion_tokens, self.reasoning_tokens)

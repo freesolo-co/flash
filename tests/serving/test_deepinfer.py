@@ -11,10 +11,11 @@ import pytest
 from fastapi.testclient import TestClient
 
 from flash.serving.deepinfer import config
-from flash.serving.deepinfer.http import _watch_disconnect, build_app
+from flash.serving.deepinfer.http import build_app
 from flash.serving.deepinfer.protocol import parse_request
 from flash.serving.deepinfer.render import Decoder
 from flash.serving.deepinfer.runtime import Pending, Runtime
+from flash.serving.src.http.stream_response import await_until_disconnect
 
 
 def body(**kwargs):
@@ -99,70 +100,67 @@ def test_unsupported_requests_never_admit_gpu_work(change):
             with pytest.raises(ValueError, match="temperature"):
                 parse_request(body(**change))
         else:
-            assert client.post("/v1/chat/completions", json=body(**change)).status_code == 422
+            assert (
+                client.post(
+                    "/internal/generate", json={"request_id": "test", "chat": body(**change)}
+                ).status_code
+                == 422
+            )
     assert runtime.calls == 0
 
 
-def test_buffered_completion_reports_native_token_usage_and_closes():
+def test_native_events_report_usage_and_close():
     runtime = FakeRuntime()
     with TestClient(build_app(runtime, manage_lifecycle=False)) as client:
-        response = client.post("/v1/chat/completions", json=body())
+        response = client.post("/internal/generate", json={"request_id": "test", "chat": body()})
     assert response.status_code == 200
-    result = response.json()
-    assert result["choices"][0]["message"] == {"role": "assistant", "content": "Hi there"}
-    assert result["usage"]["completion_tokens"] == 3
-    assert result["usage"]["prompt_tokens"] == 2
-    assert runtime.closed
-
-
-def test_streaming_matches_buffered_output_and_emits_usage():
-    runtime = FakeRuntime()
-    with TestClient(build_app(runtime, manage_lifecycle=False)) as client:
-        response = client.post(
-            "/v1/chat/completions", json=body(stream=True, stream_options={"include_usage": True})
-        )
-    events = [
-        json.loads(line[6:]) for line in response.text.splitlines() if line.startswith("data: {")
-    ]
-    text = "".join(
-        event["choices"][0]["delta"].get("content", "") for event in events if event["choices"]
-    )
-    assert text == "Hi there"
-    assert events[-1]["usage"]["completion_tokens"] == 3
-    assert response.text.endswith("data: [DONE]\n\n")
+    events = [json.loads(line) for line in response.text.splitlines()]
+    assert events[0]["type"] == "ready"
+    assert events[-1]["type"] == "final"
+    assert events[-1]["text"] == "Hi there"
+    assert events[-1]["completion_tokens"] == 3
+    assert events[-1]["prompt_tokens"] == 2
+    assert all(event["request_id"] == "test" for event in events)
     assert runtime.closed
 
 
 def test_error_after_first_token_is_not_successful_completion():
     runtime = FakeRuntime([{"tokens": [2], "finish_reason": None}, RuntimeError("native failure")])
     with TestClient(build_app(runtime, manage_lifecycle=False)) as client:
-        response = client.post("/v1/chat/completions", json=body(stream=True))
-    assert '"type": "server_error"' in response.text
-    assert "[DONE]" not in response.text
+        response = client.post("/internal/generate", json={"request_id": "test", "chat": body()})
+    events = [json.loads(line) for line in response.text.splitlines()]
+    assert events[-1] == {"type": "error"}
+    assert not any(event["type"] == "final" for event in events)
     assert runtime.closed
 
 
 def test_capacity_error_before_stream_starts_returns_429():
     runtime = FakeRuntime([OverflowError()])
     with TestClient(build_app(runtime, manage_lifecycle=False)) as client:
-        assert client.post("/v1/chat/completions", json=body(stream=True)).status_code == 429
+        assert (
+            client.post(
+                "/internal/generate", json={"request_id": "test", "chat": body()}
+            ).status_code
+            == 429
+        )
+    assert runtime.closed
 
 
 def test_reasoning_is_split_and_counted_without_retokenizing():
-    decoder = Decoder(Tokenizer(), thinking=True, prompt_tokens=2)
+    decoder = Decoder(Tokenizer(), thinking=True)
     first = decoder.consume({"tokens": [10, 4], "finish_reason": None})
     second = decoder.consume({"tokens": [11, 2, 1], "finish_reason": "stop"})
     assert first == [{"reasoning_content": "why"}]
     assert second == [{"content": "Hi"}]
-    assert decoder.usage()["completion_tokens"] == 5
-    assert decoder.usage()["completion_tokens_details"]["reasoning_tokens"] == 1
+    assert decoder.completion_tokens == 5
+    assert decoder.reasoning_tokens == 1
 
 
 def test_decoder_retains_split_utf8_bytes():
-    decoder = Decoder(Tokenizer(), thinking=False, prompt_tokens=2)
+    decoder = Decoder(Tokenizer(), thinking=False)
     assert decoder.consume({"tokens": [5], "finish_reason": None}) == []
     assert decoder.consume({"tokens": [6], "finish_reason": "length"}) == [{"content": "€"}]
-    assert decoder.usage()["completion_tokens"] == 2
+    assert decoder.completion_tokens == 2
 
 
 @pytest.mark.anyio
@@ -177,10 +175,10 @@ async def test_disconnect_cancels_generation_task():
 
     async def disconnected():
         await asyncio.sleep(0)
-        return True
+        return {"type": "http.disconnect"}
 
     with pytest.raises(asyncio.CancelledError):
-        await _watch_disconnect(SimpleNamespace(is_disconnected=disconnected), work())
+        await await_until_disconnect(SimpleNamespace(receive=disconnected), work())
     assert stopped.is_set()
 
 

@@ -59,9 +59,10 @@ modal deploy --env dev -m flash.serving.deepinfer.modal_app
 ```
 
 The GPU endpoint requires [Modal Proxy Tokens](https://modal.com/docs/guide/webhook-proxy-auth),
-so unauthenticated requests are rejected before provisioning GPUs. Its direct
-`/v1/chat/completions` endpoint is for operator qualification and is unmetered.
-Customer requests must go through Flash's hosted router.
+so unauthenticated requests are rejected before provisioning GPUs. The GPU backend exposes only `/health` and `/internal/generate`; OpenAI routes,
+stream formatting, usage responses, and model listing use the existing Flash
+hosted router. Run chat qualification through that router too, so probes exercise
+the same authorization, response, and accounting path as customer requests.
 
 After qualification, supply these connection credentials when deploying the
 existing serving router, following its development wiring instructions:

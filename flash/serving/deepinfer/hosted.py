@@ -46,7 +46,7 @@ def chat_body(payload):
 
 
 async def engine_events(runtime, parsed, tokens, request_id):
-    decoder = Decoder(runtime.tokenizer, thinking=parsed.thinking, prompt_tokens=len(tokens))
+    decoder = Decoder(runtime.tokenizer, thinking=parsed.thinking)
     started = time.monotonic()
     native = runtime.generate(parsed, tokens)
     text = ""
@@ -60,7 +60,7 @@ async def engine_events(runtime, parsed, tokens, request_id):
             "prompt_tokens": len(tokens),
             "completion_tokens": decoder.completion_tokens,
             "reasoning_tokens": decoder.reasoning_tokens,
-            # This native release exposes no per-request prefix-cache hit counter.
+            # This bridge has not yet integrated per-request prefix-cache accounting.
             "cached_tokens": 0,
             "cached_tokens_reported": False,
             "engine_replica_id": REPLICA_ID,

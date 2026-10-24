@@ -17,8 +17,6 @@ class ChatRequest:
     max_tokens: int
     seed: int | None
     thinking: bool
-    stream: bool
-    include_usage: bool
 
 
 def parse_request(body: dict[str, Any]) -> ChatRequest:
@@ -31,8 +29,6 @@ def parse_request(body: dict[str, Any]) -> ChatRequest:
         "top_p",
         "max_tokens",
         "seed",
-        "stream",
-        "stream_options",
         "chat_template_kwargs",
         "n",
     }
@@ -65,16 +61,4 @@ def parse_request(body: dict[str, Any]) -> ChatRequest:
         max_tokens=parsed.max_tokens,
         seed=parsed.seed,
         thinking=thinking,
-        stream=parsed.stream,
-        include_usage=parsed.include_usage,
     )
-
-
-def usage(prompt_tokens: int, completion_tokens: int, reasoning_tokens: int) -> dict[str, Any]:
-    return {
-        "prompt_tokens": prompt_tokens,
-        "completion_tokens": completion_tokens,
-        "total_tokens": prompt_tokens + completion_tokens,
-        "prompt_tokens_details": {"cached_tokens": 0},
-        "completion_tokens_details": {"reasoning_tokens": reasoning_tokens},
-    }

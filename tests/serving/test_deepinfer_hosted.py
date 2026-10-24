@@ -95,6 +95,53 @@ def test_hosted_chat_bills_native_usage_at_requested_prices(connection, stream, 
     assert runtime.closed
 
 
+@pytest.mark.parametrize("stream", [False, True])
+def test_hosted_chat_preserves_split_utf8_across_native_events(connection, stream):
+    runtime = FakeRuntime(
+        [
+            {"tokens": [5], "finish_reason": None},
+            {"tokens": [6, 1], "finish_reason": "stop"},
+        ]
+    )
+    router, store = app(runtime)
+    with TestClient(router) as client:
+        response = client.post(
+            "/v1/chat/completions",
+            json=body(stream=stream),
+            headers={"Authorization": "Bearer test"},
+        )
+    assert response.status_code == 200
+    if stream:
+        chunks = [
+            json.loads(line[6:])
+            for line in response.text.splitlines()
+            if line.startswith("data: {")
+        ]
+        content = "".join(
+            chunk["choices"][0]["delta"].get("content", "") for chunk in chunks if chunk["choices"]
+        )
+    else:
+        content = response.json()["choices"][0]["message"]["content"]
+    assert content == "€"
+    assert store.finalized[-1].facts.completion_tokens == 3
+    assert runtime.closed
+
+
+@pytest.mark.parametrize("stream", [False, True])
+def test_hosted_capacity_error_precedes_response_and_settlement(connection, stream):
+    runtime = FakeRuntime([OverflowError()])
+    router, store = app(runtime)
+    with TestClient(router) as client:
+        response = client.post(
+            "/v1/chat/completions",
+            json=body(stream=stream),
+            headers={"Authorization": "Bearer test"},
+        )
+    assert response.status_code == 429
+    assert not store.finalized
+    assert runtime.closed
+
+
 def test_auth_and_unsupported_controls_fail_before_native_work(connection):
     runtime = FakeRuntime()
     router, store = app(runtime)

@@ -10,7 +10,6 @@ key unless the caller presents the shared internal key.
 import asyncio
 import time
 import uuid
-from collections.abc import Awaitable
 from typing import Any
 
 from fastapi import APIRouter, HTTPException, Request, status
@@ -31,7 +30,15 @@ from flash.serving.src.accounting.usage import (
 from flash.serving.src.accounting.usage_outbox import UsageOutboxError
 from flash.serving.src.engine.model_config import tool_parser_for
 from flash.serving.src.http.context import ServingContext, require_attributed_traffic
-from flash.serving.src.http.stream_response import ClosingStreamingResponse
+from flash.serving.src.http.stream_response import (
+    ClosingStreamingResponse,
+)
+from flash.serving.src.http.stream_response import (
+    await_until_disconnect as _await_until_disconnect,
+)
+from flash.serving.src.http.stream_response import (
+    wait_for_disconnect as _wait_for_disconnect,
+)
 from flash.serving.src.io.multimodal import _prepare_generate_request
 from flash.serving.src.io.provenance import _checkpoint_provenance, _provenance_headers
 from flash.serving.src.io.requests import (
@@ -239,33 +246,6 @@ async def chat_completions(payload: dict[str, Any], request: Request) -> Any:
     if target.is_checkpoint:
         response_headers["X-Freesolo-LoRA-Request-Adapter"] = lora_request_adapter
     return JSONResponse(response, headers=response_headers)
-
-
-async def _await_until_disconnect(request: Request, awaitable: Awaitable[Any]) -> Any:
-    operation = asyncio.ensure_future(awaitable)
-    disconnect = asyncio.create_task(_wait_for_disconnect(request))
-    try:
-        done, _ = await asyncio.wait({operation, disconnect}, return_when=asyncio.FIRST_COMPLETED)
-        # `done` is a SET: if generation finished and the peer left in the same tick, both are in
-        # it. deciding on the disconnect first discards a completed, durably finalized result.
-        # resolve the tie toward the
-        # operation, matching the packaged helper in flash/serve/app/http.py.
-        if operation in done:
-            return operation.result()
-        disconnect.result()
-        raise asyncio.CancelledError
-    finally:
-        disconnect.cancel()
-        if not operation.done():
-            operation.cancel()
-        await asyncio.gather(operation, disconnect, return_exceptions=True)
-
-
-async def _wait_for_disconnect(request: Request) -> None:
-    while True:
-        message = await request.receive()
-        if message["type"] == "http.disconnect":
-            return
 
 
 async def _discard_prepared_stream(usage_session: Any, events: Any) -> None:
