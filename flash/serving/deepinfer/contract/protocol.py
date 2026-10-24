@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from flash.serve.request.openai import parse_chat_request
-from flash.serving.deepinfer.config import MODEL_ID
+from flash.serving.deepinfer.contract.config import MODEL_ID
 
 
 @dataclass(frozen=True)

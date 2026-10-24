@@ -1,6 +1,6 @@
 # Freesolo LoRA Serving Modal App
 
-For DeepSeek V4.1 Flash 1017, see the [native DeepInfer backend](../deepinfer/README.md).
+For DeepSeek V4.1 Flash 1017, see the [native DeepInfer backend](../deepinfer/app/README.md).
 It uses a separate autoscaling pool of four-B200 replicas and connects to this
 router for authentication and durable billing after qualification and backend
 catalog configuration.

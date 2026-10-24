@@ -7,8 +7,8 @@ import os
 import subprocess
 from pathlib import Path
 
-from flash.serving.deepinfer.config import RUNTIME_REVISION, RUNTIME_ROOT
-from flash.serving.deepinfer.patches import apply_runtime_patches
+from flash.serving.deepinfer.contract.config import RUNTIME_REVISION, RUNTIME_ROOT
+from flash.serving.deepinfer.native.patches import apply_runtime_patches
 
 INDEX_PATH = "deepinfer/model_executor/models/v4_modules/index_attn.py"
 INDEX_SHA256 = "e269196c3c8d2db7041f7f1073597b8023dc4ecd58b40303ebf392171c02d462"

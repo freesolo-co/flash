@@ -7,10 +7,10 @@ import httpx
 import pytest
 from fastapi.testclient import TestClient
 
-from flash.serving.deepinfer.client import CONNECTION_KEYS, HostedDeepInfer, configured
-from flash.serving.deepinfer.config import MODEL_ID
-from flash.serving.deepinfer.errors import DeepInferError
-from flash.serving.deepinfer.http import build_app
+from flash.serving.deepinfer.app.client import CONNECTION_KEYS, HostedDeepInfer, configured
+from flash.serving.deepinfer.app.http import build_app
+from flash.serving.deepinfer.contract.config import MODEL_ID
+from flash.serving.deepinfer.contract.errors import DeepInferError
 from flash.serving.src.engine.model_config import base_models, hosted_base_models
 from flash.serving.src.http.rate_limit import allow_offline_inference
 from flash.serving.src.http.router import AdapterRouter, build_serving_app

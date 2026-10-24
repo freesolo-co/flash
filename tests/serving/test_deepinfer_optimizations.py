@@ -8,9 +8,9 @@ import pytest
 
 from flash.serve.runtime.prompt_cache import cached_prompt_tokens
 from flash.serve.runtime.token_batch import TokenBatch
-from flash.serving.deepinfer.prefix_cache import Prefix, PrefixCache
-from flash.serving.deepinfer.protocol import parse_request
-from flash.serving.deepinfer.runtime import Runtime
+from flash.serving.deepinfer.contract.protocol import parse_request
+from flash.serving.deepinfer.runtime.bridge import Runtime
+from flash.serving.deepinfer.runtime.prefix_cache import Prefix, PrefixCache
 from tests.serving.test_deepinfer import body
 
 
@@ -104,7 +104,7 @@ def test_batching_preserves_every_token_in_order(limit):
 
 @pytest.mark.parametrize("now", [1.0, 10000.0])
 def test_prefix_eviction_releases_native_state_and_expired_entries(monkeypatch, now):
-    monkeypatch.setattr("flash.serving.deepinfer.prefix_cache.time.monotonic", lambda: now)
+    monkeypatch.setattr("flash.serving.deepinfer.runtime.prefix_cache.time.monotonic", lambda: now)
     released = []
     engine = SimpleNamespace(
         cache_config=SimpleNamespace(block_size=128),

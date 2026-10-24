@@ -13,7 +13,7 @@ def rank_main(rank):
     import torch
     import torch.distributed as dist
 
-    from flash.serving.deepinfer.engram_transport import LocalEngramBuffer
+    from flash.serving.deepinfer.native.engram_transport import LocalEngramBuffer
 
     torch.cuda.set_device(0)
     torch.set_default_device("cuda")

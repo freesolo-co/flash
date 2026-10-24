@@ -5,7 +5,7 @@ from unittest.mock import AsyncMock
 import pytest
 from fastapi.testclient import TestClient
 
-from flash.serving.deepinfer.config import MODEL_ID as DEEPSEEK_MODEL_ID
+from flash.serving.deepinfer.contract.config import MODEL_ID as DEEPSEEK_MODEL_ID
 from flash.serving.src.http import adapter_routes
 from flash.serving.src.http.router import build_offline_serving_app
 from flash.serving.src.http.routing import AdapterRouter

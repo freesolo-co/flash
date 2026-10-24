@@ -9,11 +9,11 @@ PATCHES = {
         [
             (
                 "def _convert_mega_moe_weight(src_l1: nn.Parameter, src_l2: nn.Parameter) -> tuple[nn.Parameter, nn.Parameter]:\n    has_sf = src_l1.dtype != torch.bfloat16\n    if has_sf:\n        (l1, l1_sf), (l2, l2_sf) = deep_gemm.transform_weights_for_mega_moe((src_l1, src_l1.sf), (src_l2, src_l2.sf))\n    else:\n        l1, l2 = deep_gemm.transform_weights_for_mega_moe(src_l1, src_l2)\n    l1 = nn.Parameter(l1.clone(), requires_grad=False)\n    l2 = nn.Parameter(l2.clone(), requires_grad=False)\n    if has_sf:\n        l1.sf = l1_sf.clone()\n        l2.sf = l2_sf.clone()\n    for x in [src_l1, src_l2] + ([src_l1.sf, src_l2.sf] if has_sf else []):\n        x.untyped_storage().resize_(0)\n    return l1, l2\n",
-                "def _convert_mega_moe_weight(src_l1: nn.Parameter, src_l2: nn.Parameter) -> tuple[nn.Parameter, nn.Parameter]:\n    from flash.serving.deepinfer.fp8 import convert_mega_moe_weight\n    return convert_mega_moe_weight(src_l1, src_l2)\n",
+                "def _convert_mega_moe_weight(src_l1: nn.Parameter, src_l2: nn.Parameter) -> tuple[nn.Parameter, nn.Parameter]:\n    from flash.serving.deepinfer.native.fp8 import convert_mega_moe_weight\n    return convert_mega_moe_weight(src_l1, src_l2)\n",
             ),
             (
                 '        self.use_fp4_weight = cfg.get("mxfp4", False)\n',
-                '        self.use_fp4_weight = cfg.get("mxfp4", False)\n        from flash.serving.deepinfer.fp8 import widen_expert\n        if self.use_fp4_weight:\n            for index, linear in enumerate((moe_module.linear1, moe_module.linear2)):\n                linear.weight = widen_expert(linear.weight, interleave=index == 0)\n            self.use_fp4_weight = False\n        assert moe_module.linear1.weight.dtype == torch.float8_e4m3fn\n        assert moe_module.linear2.weight.dtype == torch.float8_e4m3fn\n',
+                '        self.use_fp4_weight = cfg.get("mxfp4", False)\n        from flash.serving.deepinfer.native.fp8 import widen_expert\n        if self.use_fp4_weight:\n            for index, linear in enumerate((moe_module.linear1, moe_module.linear2)):\n                linear.weight = widen_expert(linear.weight, interleave=index == 0)\n            self.use_fp4_weight = False\n        assert moe_module.linear1.weight.dtype == torch.float8_e4m3fn\n        assert moe_module.linear2.weight.dtype == torch.float8_e4m3fn\n',
             ),
             (
                 "        if self.use_fp4_weight:\n            # HF loading fills packed FP4 directly; dummy materialization converts it beforehand.",

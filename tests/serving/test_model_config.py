@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from flash.serving.deepinfer.config import MODEL_ID as DEEPSEEK_MODEL_ID
+from flash.serving.deepinfer.contract.config import MODEL_ID as DEEPSEEK_MODEL_ID
 from flash.serving.src.engine.model_config import (
     SERVING_MODELS,
     base_models,

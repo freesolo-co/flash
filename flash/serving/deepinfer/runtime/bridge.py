@@ -18,7 +18,7 @@ from pathlib import Path
 from anyio import CancelScope
 
 from flash.serve.runtime.prompt_cache import cached_prompt_tokens
-from flash.serving.deepinfer.config import (
+from flash.serving.deepinfer.contract.config import (
     GPU_COUNT,
     MAX_INPUTS,
     MAX_MODEL_LEN,
@@ -29,7 +29,7 @@ from flash.serving.deepinfer.config import (
     SEQUENCES_PER_RANK,
     STARTUP_SECONDS,
 )
-from flash.serving.deepinfer.worker import run_rank
+from flash.serving.deepinfer.runtime.worker import run_rank
 
 
 @dataclass

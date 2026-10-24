@@ -12,11 +12,11 @@ from types import SimpleNamespace
 import pytest
 from fastapi.testclient import TestClient
 
-from flash.serving.deepinfer import config
-from flash.serving.deepinfer.http import build_app
-from flash.serving.deepinfer.protocol import parse_request
-from flash.serving.deepinfer.render import Decoder
-from flash.serving.deepinfer.runtime import Pending, Runtime
+from flash.serving.deepinfer.app.http import build_app
+from flash.serving.deepinfer.app.render import Decoder
+from flash.serving.deepinfer.contract import config
+from flash.serving.deepinfer.contract.protocol import parse_request
+from flash.serving.deepinfer.runtime.bridge import Pending, Runtime
 from flash.serving.src.http.stream_response import await_until_disconnect
 
 
@@ -312,10 +312,10 @@ def test_modal_private_four_gpu_autoscaling_contract(monkeypatch):
         web_server=decorator("web"),
     )
     monkeypatch.setitem(sys.modules, "modal", stub)
-    name = "flash.serving.deepinfer.modal_app"
+    name = "flash.serving.deepinfer.app.modal_app"
     monkeypatch.delitem(sys.modules, name, raising=False)
     try:
-        importlib.import_module(name)
+        launcher = importlib.import_module(name)
     finally:
         sys.modules.pop(name, None)
     assert captured["function"]["gpu"] == "B200:4"
@@ -330,6 +330,29 @@ def test_modal_private_four_gpu_autoscaling_contract(monkeypatch):
     assert script.name == "prepare_deepinfer_image.py"
     assert options == {"remote_path": "/root/prepare_deepinfer_image.py", "copy": True}
     assert captured["build_commands"][-1].endswith(" /root/prepare_deepinfer_image.py")
+    process = object()
+
+    def launch(command):
+        captured["server_command"] = command
+        return process
+
+    def watch(**kwargs):
+        captured["watcher"] = kwargs
+        return SimpleNamespace(start=lambda: None)
+
+    monkeypatch.setattr(launcher.subprocess, "Popen", launch)
+    monkeypatch.setattr(launcher.threading, "Thread", watch)
+    launcher.serve()
+    assert captured["server_command"] == [
+        config.RUNTIME_PYTHON,
+        "-m",
+        "flash.serving.deepinfer.app.http",
+    ]
+    assert captured["watcher"] == {
+        "target": launcher._watch_server,
+        "args": (process,),
+        "daemon": True,
+    }
 
 
 @pytest.fixture

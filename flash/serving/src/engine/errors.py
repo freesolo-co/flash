@@ -9,7 +9,7 @@ from typing import Any
 
 from fastapi import HTTPException, status
 
-from flash.serving.deepinfer.errors import DeepInferError
+from flash.serving.deepinfer.contract.errors import DeepInferError
 from flash.serving.src.http.routing import AdapterRouter
 
 

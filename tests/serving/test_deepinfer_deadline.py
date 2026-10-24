@@ -6,9 +6,9 @@ from types import SimpleNamespace
 
 import pytest
 
-from flash.serving.deepinfer.config import MODEL_ID, REQUEST_SECONDS
-from flash.serving.deepinfer.protocol import parse_request
-from flash.serving.deepinfer.runtime import Runtime
+from flash.serving.deepinfer.contract.config import MODEL_ID, REQUEST_SECONDS
+from flash.serving.deepinfer.contract.protocol import parse_request
+from flash.serving.deepinfer.runtime.bridge import Runtime
 from flash.serving.src.http.stream_response import await_until_disconnect
 
 

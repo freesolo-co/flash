@@ -5,7 +5,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-from flash.serving.deepinfer.config import RUNTIME_REVISION, RUNTIME_ROOT
+from flash.serving.deepinfer.contract.config import RUNTIME_REVISION, RUNTIME_ROOT
 
 
 def loaded_runtime(llm, rank):

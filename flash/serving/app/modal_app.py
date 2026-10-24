@@ -499,8 +499,8 @@ class _ModalEnginePool:
         *,
         expected_checkpoint: str | None = None,
     ) -> dict[str, Any]:
-        from flash.serving.deepinfer.client import HostedDeepInfer
-        from flash.serving.deepinfer.config import MODEL_ID as deepseek_model
+        from flash.serving.deepinfer.app.client import HostedDeepInfer
+        from flash.serving.deepinfer.contract.config import MODEL_ID as deepseek_model
 
         if base_model == deepseek_model:
             return await HostedDeepInfer().generate(
@@ -525,8 +525,8 @@ class _ModalEnginePool:
         *,
         expected_checkpoint: str | None = None,
     ):
-        from flash.serving.deepinfer.client import HostedDeepInfer
-        from flash.serving.deepinfer.config import MODEL_ID as deepseek_model
+        from flash.serving.deepinfer.app.client import HostedDeepInfer
+        from flash.serving.deepinfer.contract.config import MODEL_ID as deepseek_model
 
         if base_model == deepseek_model:
             stream = HostedDeepInfer().stream_generate(
