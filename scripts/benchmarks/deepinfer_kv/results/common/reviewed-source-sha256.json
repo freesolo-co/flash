@@ -1,0 +1,21 @@
+{
+  "flash/serving/deepinfer/cache_routing.py": "e4ceb8b774ed68bc23ae6edcf6594a6070e7a0c6da65c0ebc61308e289363126",
+  "scripts/benchmarks/deepinfer_kv/__init__.py": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  "scripts/benchmarks/deepinfer_kv/actions.py": "5d67179c13e7f09dd6db0b053e08238371eec4210442ab3255f6ac1e8d96a01e",
+  "scripts/benchmarks/deepinfer_kv/control.py": "16a3a622d30ec37879cf0e1b1d8d460169e2c44cd4a5ac7addce977aed6990c2",
+  "scripts/benchmarks/deepinfer_kv/driver.py": "a3b7993f322ec00b90a6b4f176ce04c24c891006a186e6534cb9fae882d075a6",
+  "scripts/benchmarks/deepinfer_kv/native.py": "acfa64377f7ae6c4caa27a618ed2b428783aaa0976368e3b0b57f534f7251c70",
+  "scripts/benchmarks/deepinfer_kv/routing.py": "af207b5217510f355d97644a9f2b35834c74c3856208c5c448279594c8a5d246",
+  "scripts/benchmarks/deepinfer_kv/runtime/bench_fp8.py.txt": "a02759d6b7e1663a4d4cbe5eedd50e1d3dbf56ee44aa81fce6d44422878631b4",
+  "scripts/benchmarks/deepinfer_kv/runtime/engram_local.py.txt": "7815a52a2ed2a6ed80640549ed31f16d158c0338ccb1f912ed6e823a1f6860ea",
+  "scripts/benchmarks/deepinfer_kv/runtime/patch_detach.py.txt": "f302ba8d378b1aa47ea322080fa41dd2d0f1c769803b931822f219359141fa68",
+  "scripts/benchmarks/deepinfer_kv/runtime/restore_fast.py.txt": "1ed12d0c7844a8b2c4e2b0d1d52e5641f1e171392c8addadd0641ff99f61a985",
+  "scripts/benchmarks/deepinfer_kv/runtime/runtime-patches.diff": "9f7d6fc3a97a84d7fa66f3b6ff610d9306056aa8ae03b2a170d08c0263d3c345",
+  "scripts/benchmarks/deepinfer_kv/runtime/serving_init.py.txt": "8def2f4844c4d403f6702a01245ef0904d71e29cf0cc7bd55cdd9c09d195e174",
+  "scripts/benchmarks/deepinfer_kv/sampler.py": "93e91a873ee96c42a8b85dd7d3fa8f6af8ed95ea91e4811ef408c8fad2972f37",
+  "scripts/benchmarks/deepinfer_kv/service.py": "07ec5e608ca18a47c84682df22a28598f0ab9f59146655009d55663ac3ebfdd8",
+  "scripts/benchmarks/deepinfer_kv/stage.py": "fd64be3381f5e27a1b8b291211c15cf0d4a76e16d2b01b0d79ee571fbf79735e",
+  "scripts/benchmarks/deepinfer_kv/summarize.py": "78fd3aa03d4762817042ee0ba8dc9383c4161e6bf7b72a4db065ffa2ae4da991",
+  "scripts/benchmarks/deepinfer_kv/workloads.py": "0020036dfe87de883464f8a6275e0eac1adfff13f0b3144e69d3ef61c7632cd7",
+  "tests/serving/kv_experiments/test_cache_routing.py": "94624ca01d70a0750a052d90035fb6429bf93ef019043a090f225d07489f6299"
+}

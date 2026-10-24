@@ -1,0 +1,27 @@
+{
+  "sample_interval_seconds": 2,
+  "note": "Device allocation including model and fixed cache pool; not a per-experiment KV saving or exact peak. Startup included.",
+  "samples": 191,
+  "gpus": {
+    "0": {
+      "sampled_max_used_mib": 159886.0,
+      "total_mib": 183359.0,
+      "time": 1792802709.435695
+    },
+    "1": {
+      "sampled_max_used_mib": 159886.0,
+      "total_mib": 183359.0,
+      "time": 1792802709.435695
+    },
+    "2": {
+      "sampled_max_used_mib": 159886.0,
+      "total_mib": 183359.0,
+      "time": 1792802709.435695
+    },
+    "3": {
+      "sampled_max_used_mib": 159886.0,
+      "total_mib": 183359.0,
+      "time": 1792802709.435695
+    }
+  }
+}

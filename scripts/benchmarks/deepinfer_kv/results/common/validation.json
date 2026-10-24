@@ -1,0 +1,17 @@
+{
+  "cpu_tests": {
+    "passed": 50,
+    "command": "pytest -q tests/serving/test_deepinfer.py tests/serving/test_deepinfer_hosted.py tests/serving/test_deepinfer_provenance.py tests/serving/kv_experiments",
+    "scope": "Combined seven-experiment workspace, including the one codec test in the compression PR"
+  },
+  "ruff_check": "repository passed",
+  "ruff_format_check": "repository passed",
+  "file_size_check": "passed",
+  "function_size_check": "passed",
+  "source_layout_check": "passed",
+  "gpu_control": {
+    "retained_vs_restored_exact_outputs": 16,
+    "total_outputs": 16
+  },
+  "note": "Focused CPU validation, not the entire repository test suite. Stacked draft PR bases do not trigger the dev/main-only CI workflow."
+}

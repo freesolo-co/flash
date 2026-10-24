@@ -1,0 +1,21 @@
+from pathlib import Path
+p=Path('/opt/DeepInfer/csrc/engine/pybind_scheduler.cpp')
+s=p.read_text()
+anchor='        .def("add_sequence", &Scheduler::add_sequence, py::arg("seq"))'
+patch='''        .def("detach_waiting_for_prefix_cache", [](Scheduler &self, const std::string &request_id) {
+            for (auto it = self.waiting.begin(); it != self.waiting.end(); ++it) {
+                if ((*it)->request.request_id == request_id) {
+                    // Caller must flush in-flight work before detaching. The retained
+                    // Sequence owns its block/state references until free_seq is called.
+                    auto seq = *it;
+                    self.waiting.erase(it);
+                    return seq;
+                }
+            }
+            throw std::runtime_error("Prefix source is not in the waiting queue");
+        }, py::arg("request_id"))
+'''
+if 'detach_waiting_for_prefix_cache' not in s:
+ assert s.count(anchor)==1
+ p.write_text(s.replace(anchor,patch+anchor))
+print('PREFIX_DETACH_PATCH_READY')

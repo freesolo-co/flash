@@ -1,0 +1,2 @@
+# Unified-diff fixtures require a leading space on blank context lines.
+scripts/benchmarks/deepinfer_kv/runtime/runtime-patches.diff whitespace=-blank-at-eol
