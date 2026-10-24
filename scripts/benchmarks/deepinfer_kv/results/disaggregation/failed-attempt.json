@@ -1,0 +1,9 @@
+{
+  "phase": "first receiver decode at 2K, before corrected trials",
+  "unmeasured_failed_candidate": "Handoff with one prompt token left",
+  "error": "prepare_sample.cpp:210: mtp.draft_tokens.size() == nextn_token_cnt failed (0 vs 3)",
+  "cause": "Native fork_seq routes a source with cached_tokens >= prompt_len - 1 to the decode queue. Prefix snapshots do not contain the speculative CPU draft metadata.",
+  "correction": "Leave four final prompt tokens for receiver prefill, which initializes speculative state normally.",
+  "recovery": "Terminated the failed receiver worker process group and verified 4 MiB used per GPU before reloading. An earlier reload attempt failed with CUDA OOM while old contexts remained.",
+  "after_correction": "All 18 arms completed; 144/144 paired output sequences match exactly."
+}
