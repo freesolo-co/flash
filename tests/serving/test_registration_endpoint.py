@@ -1,13 +1,41 @@
 """A durable checkpoint binding needs its serving endpoint before ready promotion."""
 
+from unittest.mock import AsyncMock
+
+import pytest
 from fastapi.testclient import TestClient
 
+from flash.serving.deepinfer.config import MODEL_ID as DEEPSEEK_MODEL_ID
 from flash.serving.src.http import adapter_routes
 from flash.serving.src.http.router import build_offline_serving_app
 from flash.serving.src.http.routing import AdapterRouter
 from flash.serving.src.io.schemas import ImmutableCheckpointRegistration
 from tests.serving.checkpoint_fixtures import checkpoint_registration_payload
 from tests.serving.test_router import QWEN, FakePool
+
+
+@pytest.mark.parametrize("base_model", [DEEPSEEK_MODEL_ID, "example/unsupported"])
+def test_unsupported_lora_registration_has_no_side_effects(monkeypatch, base_model):
+    payload = checkpoint_registration_payload("run-unsupported", base_model)
+    persist = AsyncMock()
+    monkeypatch.setattr(adapter_routes, "persist_checkpoint", persist)
+    pool = FakePool()
+    router = AdapterRouter()
+    app = build_offline_serving_app(pool, router, internal_key="test-internal-key")
+    with TestClient(app) as client:
+        response = client.post(
+            "/adapters",
+            json=payload,
+            headers={
+                "X-Freesolo-Internal-Key": "test-internal-key",
+                "X-Freesolo-Org-Id": payload["org_id"],
+            },
+        )
+    assert response.status_code == 400
+    assert base_model in response.json()["detail"]
+    persist.assert_not_called()
+    assert router.get(payload["model_id"], org_id=payload["org_id"]) is None
+    assert pool.registered == []
 
 
 def test_registration_persists_router_endpoint_before_ready(monkeypatch):

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import pytest
 
+from flash.serving.deepinfer.config import MODEL_ID as DEEPSEEK_MODEL_ID
 from flash.serving.src.engine.model_config import (
     SERVING_MODELS,
     base_models,
@@ -14,6 +15,7 @@ from flash.serving.src.engine.model_config import (
     reasoning_parser_for,
     serve_model_for,
     supports_image_input,
+    supports_lora,
     tool_parser_for,
 )
 
@@ -47,6 +49,13 @@ def test_uncataloged_base_models_are_not_supported() -> None:
     assert is_supported_base_model("openai/gpt-oss-20b") is False
     with pytest.raises(ValueError, match="Unsupported base model"):
         gpu_for("openai/gpt-oss-20b")
+
+
+def test_base_inference_support_is_separate_from_lora_support() -> None:
+    assert is_supported_base_model(DEEPSEEK_MODEL_ID)
+    assert not supports_lora(DEEPSEEK_MODEL_ID)
+    assert not supports_lora("example/unsupported")
+    assert all(supports_lora(model) for model in base_models())
 
 
 def test_reasoning_parser_is_configured_for_every_model() -> None:

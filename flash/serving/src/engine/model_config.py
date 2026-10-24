@@ -159,6 +159,11 @@ def is_supported_base_model(base_model: str) -> bool:
     return base_model in _BY_MODEL
 
 
+def supports_lora(base_model: str) -> bool:
+    """Only models in the vLLM engine matrix can register LoRA checkpoints."""
+    return base_model in base_models()
+
+
 def _config_for(base_model: str) -> dict[str, Any]:
     cfg = _BY_MODEL.get(base_model)
     if cfg is None:
