@@ -794,6 +794,7 @@ def _base_model_records() -> list:
     custom_domains=[SERVING_CUSTOM_DOMAIN] if SERVING_CUSTOM_DOMAIN else None,
 )
 def router():
+    from flash.serving.src.http.rate_limit import SupabaseRateLimiter
     from flash.serving.src.http.router import AdapterRouter, build_serving_app
     from flash.serving.src.store import settings as cfg
     from flash.serving.src.store.persistence import get_adapter, load_adapters
@@ -816,6 +817,7 @@ def router():
         reload_interval_seconds=cfg.RELOAD_INTERVAL_SECONDS,
         # durable capture is required in configured serving deployments.
         usage_store=_build_usage_outbox(settings),
+        rate_limiter=SupabaseRateLimiter(settings),
         # External chat auth is ALWAYS enforced: a request needs a Freesolo API key whose org owns
         # the adapter (the backend authorizes), or the shared internal key to bypass. The authorizer
         # must be wired (backend URL + internal key) or non-internal chat fails closed.

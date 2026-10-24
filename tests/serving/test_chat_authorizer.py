@@ -31,6 +31,7 @@ from unittest.mock import MagicMock
 import pytest
 from fastapi.testclient import TestClient
 
+from flash.serving.src.http.rate_limit import allow_offline_inference
 from flash.serving.src.http.router import (
     AdapterRouter,
     build_offline_serving_app,
@@ -273,6 +274,7 @@ def _base_model_client(authorize, pool, *, usage_store=None) -> TestClient:
             AdapterRouter([record]),
             internal_key=_INTERNAL_KEY,
             chat_authorizer=authorize,
+            rate_limiter=allow_offline_inference,
             **kwargs,
         )
     )

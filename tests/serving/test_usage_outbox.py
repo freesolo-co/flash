@@ -33,6 +33,7 @@ from flash.serving.src.accounting.usage_outbox import (
 )
 from flash.serving.src.engine.model_config import base_models
 from flash.serving.src.http.inference_routes import _discard_prepared_stream
+from flash.serving.src.http.rate_limit import allow_offline_inference
 from flash.serving.src.http.router import AdapterRouter, build_serving_app
 from flash.serving.src.io.schemas import AdapterRecord
 from flash.serving.src.io.streaming import (
@@ -354,6 +355,7 @@ def test_nonstream_capture_is_awaited_before_successful_response() -> None:
         pool,
         AdapterRouter([record]),
         usage_store=store,
+        rate_limiter=allow_offline_inference,
         chat_authorizer=authorize,
         deployment_id="deployment-1",
         deployment_sha="release-1",
@@ -389,6 +391,7 @@ def test_stream_captures_in_progress_before_response_and_finalizes_same_id() -> 
         pool,
         AdapterRouter([record]),
         usage_store=store,
+        rate_limiter=allow_offline_inference,
         chat_authorizer=authorize,
     )
     with (
@@ -473,6 +476,7 @@ def test_stream_capture_failure_before_headers_returns_controlled_503() -> None:
         _Pool(),
         AdapterRouter([record]),
         usage_store=_Store(fail=True),
+        rate_limiter=allow_offline_inference,
         chat_authorizer=authorize,
     )
     with TestClient(app, headers={"Authorization": "Bearer user-key"}) as client:
@@ -513,6 +517,7 @@ def test_thinking_request_is_settled(path: str) -> None:
         pool,
         AdapterRouter([record]),
         usage_store=store,
+        rate_limiter=allow_offline_inference,
         chat_authorizer=authorize,
     )
     with TestClient(app, headers={"Authorization": "Bearer user-key"}) as client:
@@ -545,6 +550,7 @@ def test_nonstream_capture_failure_returns_controlled_503() -> None:
         _Pool(),
         AdapterRouter([record]),
         usage_store=_Store(fail=True),
+        rate_limiter=allow_offline_inference,
         chat_authorizer=authorize,
     )
     with TestClient(app, headers={"Authorization": "Bearer user-key"}) as client:
@@ -2077,7 +2083,11 @@ def test_metered_thinking_stream_returns_reasoning_and_settles_output_once() -> 
         return AuthorizedTraffic(principal_for_external_org("org-1"), "generation-a")
 
     app = build_serving_app(
-        ThinkingPool(), AdapterRouter([record]), usage_store=store, chat_authorizer=authorize
+        ThinkingPool(),
+        AdapterRouter([record]),
+        usage_store=store,
+        rate_limiter=allow_offline_inference,
+        chat_authorizer=authorize,
     )
     with TestClient(app, headers={"Authorization": "Bearer user-key"}) as client:
         response = client.post(
@@ -2134,7 +2144,11 @@ def test_missing_thinking_usage_remains_fail_closed(stream: bool) -> None:
         return AuthorizedTraffic(principal_for_external_org("org-1"), "generation-a")
 
     app = build_serving_app(
-        MissingUsagePool(), AdapterRouter([record]), usage_store=store, chat_authorizer=authorize
+        MissingUsagePool(),
+        AdapterRouter([record]),
+        usage_store=store,
+        rate_limiter=allow_offline_inference,
+        chat_authorizer=authorize,
     )
     with TestClient(app, headers={"Authorization": "Bearer user-key"}) as client:
         response = client.post(
