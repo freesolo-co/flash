@@ -18,3 +18,5 @@ See the shared [methodology](../../README.md) for model pins, configuration and 
 A restores native packed FP4 bytes. B maps the main-cache E2M1 values to a custom signed four-magnitude, three-bit codebook and restores native FP4 bytes before execution. Indexer data, scales and complete recurrent/sliding-window state are unchanged. Timed B includes encoding, decoding, restore and generation. Total snapshot bytes fall by only 4.3%, 9.8% and 12.6% at 2K/8K/16K, respectively; the 25% reduction applies only to the selected value bytes. Active GPU cache allocation is identical.
 
 Recommendation: do not promote this implementation. It slows the measured request path and changes all free-form outputs versus the exact native-snapshot control. Passing the 36 retrieval checks does not establish acceptable lossy-model quality. This is not SnapKV token eviction and is not a GPU FP3 kernel.
+
+`repeat-stability.json` also compares each arm against itself across repeats. The accelerated baseline enables variable-length MTP; fixed seeds do not guarantee fully deterministic output. Exact-match differences alone do not measure semantic quality.
