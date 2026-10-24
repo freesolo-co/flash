@@ -24,9 +24,9 @@ connectors or that no low-level DeepInfer primitives exist.
 | --- | --- | --- | --- |
 | Routing | Least-active rank | Cache and queue-work score | Four ranks within one EP group; static verified cache directory, decode cost heuristic 32 prefill-token equivalents per output token |
 | Tiering | Recompute after GPU eviction | Restore complete CPU snapshot | RAM tier only; no SSD policy or asynchronous overlap |
-| Sharing | Cold destination | Source snapshot through HTTPS relay | Independent replicas; no process-restart durability or RDMA |
+| Sharing | Cold destination | Source snapshot through HTTPS relay | Independent replicas; RAM relay survival probe, no disk durability or RDMA |
 | Retention | LRU | Frequency, then recency | Equal-sized/equal-cost prefixes; two slots per rank |
-| P/D split | Two colocated groups | One prefill group, one decode group | Equal eight GPUs; sequential burst, no pipelined steady state |
+| P/D split | Two colocated groups | One prefill group, one decode group | Equal eight GPUs; receiver replays four prompt tokens; sequential burst, no pipelined steady state |
 | Non-prefix reuse | Recompute changed context | Recompute boundary, reuse later blocks | Approximate prototype, not full CacheBlend; changed-fact quality probe |
 | Compression | Native FP4 snapshot | FP3 main-KV host encoding | Lossy host/storage codec, not SnapKV eviction; no live GPU-memory savings |
 
@@ -89,7 +89,10 @@ python control.py stop peer2
 Do not run two command drivers concurrently against the same replica. The native
 adapter requires all ranks to participate in matching collectives. State is copied
 only at quiescent barriers and accepted only with matching model, binary and cache
-layout identities. There is no concurrent eviction, tenancy, cancellation or
+layout identities. Snapshots contain raw GPU cache/state slots and prefix metadata;
+they are not complete scheduler checkpoints and omit speculative CPU draft state.
+The P/D prototype therefore replays four prompt tokens on the receiver to initialize
+its speculative state. There is no concurrent eviction, tenancy, cancellation or
 failure-recovery qualification in these prototypes.
 
 `runtime/` holds the exact earlier benchmark build inputs as text fixtures; they
