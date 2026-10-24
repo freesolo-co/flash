@@ -17,6 +17,8 @@ def phase(name, ranks):
     temporary.replace(path)
     response = ROOT / "responses" / path.name
     while not response.exists():
+        if (ROOT / "failure.json").exists():
+            raise RuntimeError((ROOT / "failure.json").read_text())
         assert time.perf_counter() - started < 600, f"Phase timeout {name}"
         time.sleep(0.05)
     result = json.loads(response.read_text())

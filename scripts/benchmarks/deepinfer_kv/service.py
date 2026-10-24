@@ -79,6 +79,7 @@ def collect(outgoing, processes, deadline=600):
 
 def main():
     root = Path("/results")
+    (root / "failure.json").unlink(missing_ok=True)
     commands = root / "commands"
     results = root / "responses"
     commands.mkdir(exist_ok=True)
@@ -116,6 +117,9 @@ def main():
             tmp.write_text(json.dumps(result))
             tmp.replace(results / path.name)
             print("PHASE_DONE", command["name"], result["wall_seconds"], flush=True)
+    except BaseException:
+        (root / "failure.json").write_text(json.dumps({"error": traceback.format_exc()}))
+        raise
     finally:
         for p in processes:
             if p.is_alive():

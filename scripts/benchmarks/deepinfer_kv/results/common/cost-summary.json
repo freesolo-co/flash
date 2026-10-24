@@ -1,0 +1,6 @@
+{
+  "gpu_host_upper_usd": 67.39220853370736,
+  "relay_cpu_upper_usd": 0.1982587996128559,
+  "remaining_owned_sandboxes": [],
+  "note": "Conservative elapsed-time calculation starts before provisioning and includes idle/build/retry time. Not an invoice; egress excluded, reserve remains inside $500 authorization."
+}
