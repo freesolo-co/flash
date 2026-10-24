@@ -13,8 +13,8 @@ from __future__ import annotations
 from typing import Any
 
 from flash.serve.request.tool_calls import qualified_tool_parser
-from flash.serving.deepinfer.config import MODEL_ID as DEEPSEEK_MODEL_ID
-from flash.serving.deepinfer.config import MODEL_REVISION as DEEPSEEK_MODEL_REVISION
+from flash.serving.deepinfer.contract.config import MODEL_ID as DEEPSEEK_MODEL_ID
+from flash.serving.deepinfer.contract.config import MODEL_REVISION as DEEPSEEK_MODEL_REVISION
 from flash.serving.src.engine.prequant_config import (
     fp8_serve_model_for as _prequant_serve_model_for,
 )
@@ -146,7 +146,7 @@ _BY_MODEL[DEEPSEEK_MODEL_ID] = {"gpu": "B200:4", "image_input_limit": None}
 
 
 def hosted_base_models() -> list[str]:
-    from flash.serving.deepinfer.client import configured
+    from flash.serving.deepinfer.app.client import configured
 
     return base_models() + ([DEEPSEEK_MODEL_ID] if configured() else [])
 
@@ -157,6 +157,11 @@ def base_models() -> list[str]:
 
 def is_supported_base_model(base_model: str) -> bool:
     return base_model in _BY_MODEL
+
+
+def supports_lora(base_model: str) -> bool:
+    """Only models in the vLLM engine matrix can register LoRA checkpoints."""
+    return base_model in base_models()
 
 
 def _config_for(base_model: str) -> dict[str, Any]:

@@ -12,7 +12,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException, Request
 
 from flash.serve.contract.protocol import MAX_CHAT_REQUEST_BYTES
-from flash.serving.deepinfer.config import MODEL_ID, MODEL_REVISION, RUNTIME_REVISION
+from flash.serving.deepinfer.contract.config import MODEL_ID, MODEL_REVISION, RUNTIME_REVISION
 from flash.serving.src.http.body_limit import RequestBodyLimitMiddleware
 from flash.serving.src.http.stream_response import ClosingStreamingResponse, await_until_disconnect
 
@@ -40,7 +40,7 @@ async def _native_stream(events, first):
 
 
 async def _native_chat(runtime, body, request):
-    from flash.serving.deepinfer.hosted import prepare
+    from flash.serving.deepinfer.app.events import prepare
 
     events = None
     handed_off = False
@@ -113,8 +113,8 @@ def build_app(runtime, *, manage_lifecycle=True):
 def main():
     import uvicorn
 
-    from flash.serving.deepinfer.config import PORT
-    from flash.serving.deepinfer.runtime import Runtime
+    from flash.serving.deepinfer.contract.config import PORT
+    from flash.serving.deepinfer.runtime.bridge import Runtime
 
     uvicorn.run(build_app(Runtime()), host="0.0.0.0", port=PORT, timeout_graceful_shutdown=10)
 

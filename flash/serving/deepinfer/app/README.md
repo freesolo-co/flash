@@ -6,6 +6,23 @@ CPU router retains Freesolo API-key authorization, organization attribution,
 OpenAI response formatting, and durable usage settlement. Qwen/LoRA engines
 keep their separate vLLM images and capacity.
 
+## Code layout
+
+The parent `deepinfer/` package groups code by responsibility:
+
+| Package | Responsibility |
+| --- | --- |
+| `app/` | Private HTTP endpoint, hosted router client, event rendering, and Modal launcher |
+| `contract/` | Pinned configuration, validated chat requests, and shared errors |
+| `runtime/` | Async request bridge, GPU worker processes, prefix cache, and loaded-runtime checks |
+| `native/` | Upstream source patches, FP8 expert conversion, and Engram GPU transport |
+
+The hosted CPU router imports `app.client` and `contract` modules. The private
+HTTP server starts `runtime.bridge.Runtime`, which launches `runtime.worker`
+processes. Workers load native GPU modules after selecting their CUDA device;
+package initializers do not load GPU dependencies. Image preparation applies
+`native.patches`, including imports of the matching `native.fp8` helpers.
+
 ## Capacity and price
 
 | Setting | Value |
@@ -110,7 +127,7 @@ the remaining service and accounting checks below are completed.
 Deploy the private backend in the intended Modal environment:
 
 ```sh
-modal deploy --env dev -m flash.serving.deepinfer.modal_app
+modal deploy --env dev -m flash.serving.deepinfer.app.modal_app
 ```
 
 The GPU endpoint requires [Modal Proxy Tokens](https://modal.com/docs/guide/webhook-proxy-auth),

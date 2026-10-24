@@ -14,7 +14,7 @@ from typing import Any, TypeGuard
 from fastapi import APIRouter, BackgroundTasks, HTTPException, Request, status
 
 from flash.schema import parse_checkpoint_ref
-from flash.serving.src.engine.model_config import is_supported_base_model
+from flash.serving.src.engine.model_config import is_supported_base_model, supports_lora
 from flash.serving.src.http.context import ServingContext
 from flash.serving.src.io.requests import _assert_supported_base_model
 from flash.serving.src.io.schemas import (
@@ -96,6 +96,11 @@ async def add_adapter(
             status.HTTP_403_FORBIDDEN, "checkpoint org scope does not match request"
         )
     _assert_supported_base_model(registration.base_model)
+    if not supports_lora(registration.base_model):
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            f"LoRA checkpoint registration is not supported for base model: {registration.base_model}",
+        )
     checkpoint = registration.to_record()
 
     stored = await persist_checkpoint(checkpoint)

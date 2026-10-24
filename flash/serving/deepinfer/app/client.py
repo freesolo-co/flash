@@ -8,9 +8,14 @@ from urllib.parse import urlsplit
 
 import httpx
 
-from flash.serving.deepinfer.config import APP_NAME, MODEL_ID, REQUEST_SECONDS, STARTUP_SECONDS
-from flash.serving.deepinfer.errors import DeepInferError
-from flash.serving.deepinfer.hosted import chat_body
+from flash.serving.deepinfer.app.events import chat_body
+from flash.serving.deepinfer.contract.config import (
+    APP_NAME,
+    MODEL_ID,
+    REQUEST_SECONDS,
+    STARTUP_SECONDS,
+)
+from flash.serving.deepinfer.contract.errors import DeepInferError
 
 CONNECTION_KEYS = ("DEEPINFER_PROXY_KEY", "DEEPINFER_PROXY_SECRET")
 

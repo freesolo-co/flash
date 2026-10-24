@@ -9,7 +9,7 @@ from pathlib import Path
 
 import modal
 
-from flash.serving.deepinfer.config import (
+from flash.serving.deepinfer.contract.config import (
     APP_NAME,
     BUFFER_CONTAINERS,
     GPU,
@@ -38,7 +38,7 @@ image = (
     )
     .add_local_python_source("flash", copy=True)
     .add_local_file(
-        Path(__file__).resolve().parents[3] / "scripts" / "prepare_deepinfer_image.py",
+        Path(__file__).resolve().parents[4] / "scripts" / "prepare_deepinfer_image.py",
         remote_path="/root/prepare_deepinfer_image.py",
         copy=True,
     )
@@ -73,5 +73,5 @@ def _watch_server(process):
 @modal.concurrent(max_inputs=MAX_INPUTS, target_inputs=TARGET_INPUTS)
 @modal.web_server(PORT, startup_timeout=STARTUP_SECONDS, requires_proxy_auth=True)
 def serve():
-    process = subprocess.Popen([RUNTIME_PYTHON, "-m", "flash.serving.deepinfer.http"])
+    process = subprocess.Popen([RUNTIME_PYTHON, "-m", "flash.serving.deepinfer.app.http"])
     threading.Thread(target=_watch_server, args=(process,), daemon=True).start()

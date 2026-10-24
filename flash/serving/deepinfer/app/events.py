@@ -5,9 +5,9 @@ import time
 import uuid
 from dataclasses import replace
 
-from flash.serving.deepinfer.config import MODEL_ID, MODEL_REVISION
-from flash.serving.deepinfer.protocol import parse_request
-from flash.serving.deepinfer.render import Decoder
+from flash.serving.deepinfer.app.render import Decoder
+from flash.serving.deepinfer.contract.config import MODEL_ID, MODEL_REVISION
+from flash.serving.deepinfer.contract.protocol import parse_request
 
 REPLICA_ID = "deepinfer-" + uuid.uuid4().hex
 

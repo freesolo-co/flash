@@ -6,7 +6,7 @@ from types import ModuleType, SimpleNamespace
 
 import pytest
 
-from flash.serving.deepinfer import provenance
+from flash.serving.deepinfer.runtime import provenance
 
 
 @pytest.fixture

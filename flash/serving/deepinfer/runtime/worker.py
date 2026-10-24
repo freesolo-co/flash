@@ -10,7 +10,7 @@ import traceback
 from collections import defaultdict
 
 from flash.serve.runtime.token_batch import TokenBatch
-from flash.serving.deepinfer.config import (
+from flash.serving.deepinfer.contract.config import (
     DELIVERY_SECONDS,
     DELIVERY_TOKENS,
     GPU_COUNT,
@@ -20,7 +20,7 @@ from flash.serving.deepinfer.config import (
     RUNTIME_ROOT,
     SEQUENCES_PER_RANK,
 )
-from flash.serving.deepinfer.prefix_cache import PrefixCache
+from flash.serving.deepinfer.runtime.prefix_cache import PrefixCache
 
 
 def initialize(rank: int, model_path: str):
@@ -52,7 +52,7 @@ def initialize(rank: int, model_path: str):
         model_name=model_path, sampler_force_topk=0, set_override_experts=False, enable_eplb=False
     )
     setup_cuda_visible_devices(rank, 1, GPU_COUNT)
-    from flash.serving.deepinfer.engram_transport import install
+    from flash.serving.deepinfer.native.engram_transport import install
 
     install()
     return create_llm(
@@ -139,8 +139,8 @@ def run_rank(rank, model_path, incoming, outgoing, stopped):
     try:
         llm = initialize(rank, model_path)
         engine = llm.llm_engine
-        from flash.serving.deepinfer.fp8 import CONVERTED_EXPERT_TENSORS
-        from flash.serving.deepinfer.provenance import loaded_runtime
+        from flash.serving.deepinfer.native.fp8 import CONVERTED_EXPERT_TENSORS
+        from flash.serving.deepinfer.runtime.provenance import loaded_runtime
 
         if CONVERTED_EXPERT_TENSORS == 0:
             raise RuntimeError("No FP8 expert tensors were loaded")

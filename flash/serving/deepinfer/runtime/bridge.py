@@ -18,7 +18,7 @@ from pathlib import Path
 from anyio import CancelScope
 
 from flash.serve.runtime.prompt_cache import cached_prompt_tokens
-from flash.serving.deepinfer.config import (
+from flash.serving.deepinfer.contract.config import (
     GPU_COUNT,
     MAX_INPUTS,
     MAX_MODEL_LEN,
@@ -29,7 +29,7 @@ from flash.serving.deepinfer.config import (
     SEQUENCES_PER_RANK,
     STARTUP_SECONDS,
 )
-from flash.serving.deepinfer.worker import run_rank
+from flash.serving.deepinfer.runtime.worker import run_rank
 
 
 @dataclass
@@ -238,14 +238,20 @@ class Runtime:
                     },
                 }
             )
-            async with asyncio.timeout(REQUEST_SECONDS):
-                while True:
+            loop = asyncio.get_running_loop()
+            deadline = loop.time() + REQUEST_SECONDS
+            while True:
+                # Each anext() can run in a different task. Never keep a task-bound
+                # timeout open across yield, or reset the budget for the next event.
+                if loop.time() >= deadline:
+                    raise TimeoutError("DeepInfer generation deadline exceeded")
+                async with asyncio.timeout_at(deadline):
                     event = await pending.events.get()
-                    if event["type"] in {"fatal", "error"}:
-                        raise RuntimeError("DeepInfer generation failed")
-                    yield event
-                    if event.get("finish_reason"):
-                        return
+                if event["type"] in {"fatal", "error"}:
+                    raise RuntimeError("DeepInfer generation failed")
+                yield event
+                if event.get("finish_reason"):
+                    return
         finally:
             # Starlette cancels its stream task on disconnect. Shield the bounded abort
             # handshake so its slot cannot be reused while native work remains alive.

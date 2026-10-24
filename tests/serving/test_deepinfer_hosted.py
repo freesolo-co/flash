@@ -7,10 +7,10 @@ import httpx
 import pytest
 from fastapi.testclient import TestClient
 
-from flash.serving.deepinfer.client import CONNECTION_KEYS, HostedDeepInfer, configured
-from flash.serving.deepinfer.config import MODEL_ID
-from flash.serving.deepinfer.errors import DeepInferError
-from flash.serving.deepinfer.http import build_app
+from flash.serving.deepinfer.app.client import CONNECTION_KEYS, HostedDeepInfer, configured
+from flash.serving.deepinfer.app.http import build_app
+from flash.serving.deepinfer.contract.config import MODEL_ID
+from flash.serving.deepinfer.contract.errors import DeepInferError
 from flash.serving.src.engine.model_config import base_models, hosted_base_models
 from flash.serving.src.http.rate_limit import allow_offline_inference
 from flash.serving.src.http.router import AdapterRouter, build_serving_app
@@ -25,7 +25,7 @@ def connection(monkeypatch):
     for key, value in zip(CONNECTION_KEYS, ("key", "secret"), strict=True):
         monkeypatch.setenv(key, value)
     monkeypatch.setattr(
-        "flash.serving.deepinfer.client.endpoint_url", lambda: "https://deepinfer.modal.run"
+        "flash.serving.deepinfer.app.client.endpoint_url", lambda: "https://deepinfer.modal.run"
     )
 
 
@@ -284,7 +284,7 @@ def test_endpoint_is_discovered_from_fixed_same_environment_backend(monkeypatch,
 
     import modal
 
-    from flash.serving.deepinfer.client import endpoint_url
+    from flash.serving.deepinfer.app.client import endpoint_url
 
     calls = []
 
@@ -310,7 +310,7 @@ def test_bridge_maps_endpoint_discovery_failure_to_unavailable(connection, monke
     def fail():
         raise RuntimeError("Modal lookup failed")
 
-    monkeypatch.setattr("flash.serving.deepinfer.client.endpoint_url", fail)
+    monkeypatch.setattr("flash.serving.deepinfer.app.client.endpoint_url", fail)
     payload = OpenAIGenerateRequest(
         model_id=MODEL_ID, messages=body()["messages"], generation_id="fsgen-test"
     )
