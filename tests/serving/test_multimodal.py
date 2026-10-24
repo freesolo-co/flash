@@ -16,6 +16,7 @@ from flash.serve.contract.provenance import immutable_binding_fingerprint
 from flash.serving.src.accounting.usage import AuthorizedTraffic, principal_for_external_org
 from flash.serving.src.engine.lora_engine import _LoraEngineImpl
 from flash.serving.src.engine.support import _num_prompt_tokens
+from flash.serving.src.http.rate_limit import allow_offline_inference
 from flash.serving.src.http.router import AdapterRouter
 from flash.serving.src.http.router import build_offline_serving_app as build_serving_app
 from flash.serving.src.http.router import build_serving_app as build_durable_serving_app
@@ -954,6 +955,7 @@ def test_a_refused_attestation_is_never_metered(monkeypatch) -> None:
         AdapterRouter([revision]),
         chat_authorizer=_allow,
         usage_store=store,
+        rate_limiter=allow_offline_inference,
     )
     client = TestClient(app, headers={"Authorization": "Bearer test"})
 
