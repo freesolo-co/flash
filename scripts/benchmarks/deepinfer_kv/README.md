@@ -17,6 +17,10 @@ block allocation and copy-on-write forks. None of those existing mechanisms is
 claimed as a new optimization here. Upstream README explicitly leaves a KV cache
 system, disaggregated serving, and replica load balancing to the serving layer.
 The reviewed Flash paths do not implement the seven policies/services below.
+Evidence: [Flash prefix-cache defaults](https://github.com/freesolo-co/flash/blob/3c751157/flash/serving/src/store/settings.py),
+[DeepInfer feature/integration list](https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/README.md),
+and the serving branch
+[bridge scope](https://github.com/freesolo-co/flash/blob/b6a4019ae7a8c1cd4d6967ba5ae8e22cbd0e58ad/flash/serving/deepinfer/README.md).
 This is a repository integration finding, not a claim that vLLM lacks optional
 connectors or that no low-level DeepInfer primitives exist.
 
@@ -40,7 +44,7 @@ hot/scan and uniform-scan traces. These are synthetic controlled tests, not a
 customer trace or a production capacity qualification.
 
 The service has four B200 ranks, EP=4, native speculation=3, batch invariance,
-YOCO, FP8 execution of expanded expert weights, CPU Engram, 8 GiB KV per rank, a 0.96 PyTorch allocator fraction,
+variable-length MTP enabled, YOCO, FP8 execution of expanded expert weights, CPU Engram, 8 GiB KV per rank, a 0.96 PyTorch allocator fraction,
 4096-token prefill chunks and a 24-sequence/rank cap. This is an experimental
 accelerated baseline, not the deployed bridge's default configuration. Both arms
 use the same immutable model revision
@@ -53,7 +57,10 @@ Report total request-path time alongside output tokens/s: a shorter or changed
 answer is not automatically a speedup. Raw token outputs, exact-match flags and
 retrieval scores remain in the evidence. Exact token equality is a strong check,
 not a complete quality benchmark; a passed retrieval probe is not broad quality
-parity. Cached versus uncached paths may differ even before these modifications;
+parity. The upstream fully deterministic recipe disables variable-length MTP; this
+accelerated baseline keeps it enabled. Fixed seeds and batch invariance therefore
+do not guarantee exact outputs across all schedules. Cached versus uncached paths
+may differ even before these modifications;
 retained versus restored snapshots provide an additional control.
 
 Three repeats provide an exploratory median and observed range, not a reliable
