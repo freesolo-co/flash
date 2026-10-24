@@ -1,10 +1,11 @@
 """Bounded, tenant-scoped native prefix snapshots with copy-on-write continuations."""
 
 import math
+import os
 import time
 import uuid
 from collections import OrderedDict
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import cached_property
 
 from flash.serving.deepinfer.routing import fingerprint
@@ -17,6 +18,8 @@ class Prefix:
     sequence: object
     touched: float
     storage_tokens: int = 0
+    frequency: float = 1.0
+    frequency_at: float = field(default_factory=time.monotonic)
 
     @cached_property
     def digest(self):
@@ -24,8 +27,11 @@ class Prefix:
 
 
 class PrefixCache:
-    def __init__(self, engine, *, max_entries=4, max_tokens=32768, ttl=600):
+    def __init__(self, engine, *, max_entries=4, max_tokens=32768, ttl=600, retention=None):
         self.engine = engine
+        self.retention = retention or os.environ.get("FLASH_DEEPINFER_CACHE_RETENTION", "frequency")
+        if self.retention not in {"lru", "frequency"}:
+            raise ValueError("Unknown DeepInfer cache retention policy")
         self.max_entries = max_entries
         self.max_tokens = max_tokens
         self.ttl = ttl
@@ -39,6 +45,32 @@ class PrefixCache:
             for prefix in self.entries.values()
         ]
 
+    @staticmethod
+    def _frequency(prefix, now):
+        # One-minute half-life lets a formerly hot prefix become cold again.
+        return prefix.frequency * 2 ** (-max(0, now - prefix.frequency_at) / 60)
+
+    def _touch(self, key, prefix):
+        now = time.monotonic()
+        prefix.frequency = min(1024, self._frequency(prefix, now) + 1)
+        prefix.frequency_at = prefix.touched = now
+        self.entries.move_to_end(key)
+
+    def _victim(self):
+        if self.retention == "lru":
+            return next(iter(self.entries))
+        now = time.monotonic()
+        # Estimate reusable prefill work per allocated token, including unused
+        # blocks from the donor prompt. Stable ties preserve LRU order.
+        return min(
+            self.entries,
+            key=lambda key: (
+                self._frequency(self.entries[key], now)
+                * len(self.entries[key].tokens)
+                / max(1, self.entries[key].storage_tokens)
+            ),
+        )
+
     def _evict(self, key):
         prefix = self.entries.pop(key)
         self.engine.scheduler.free_seq(prefix.sequence)
@@ -50,7 +82,7 @@ class PrefixCache:
                 self._evict(key)
         reserve = math.ceil(prompt_tokens / self.engine.cache_config.block_size)
         while self.entries and self.engine.scheduler.get_num_free_gpu_blocks() < reserve:
-            self._evict(next(iter(self.entries)))
+            self._evict(self._victim())
 
     def _fork(self, donor, request_id, params, tokens=None):
         seq = self.engine.scheduler.fork_seq(
@@ -97,8 +129,7 @@ class PrefixCache:
         self.hits[request_id] = 0
         if matches:
             key, prefix = max(matches, key=lambda item: len(item[1].tokens))
-            prefix.touched = time.monotonic()
-            self.entries.move_to_end(key)
+            self._touch(key, prefix)
             self._fork(prefix.sequence, request_id, params, tokens)
             self.hits[request_id] = len(prefix.tokens)
             return
@@ -152,7 +183,7 @@ class PrefixCache:
                 or sum(value.storage_tokens for value in self.entries.values()) + storage_tokens
                 > self.max_tokens
             ):
-                self._evict(next(iter(self.entries)))
+                self._evict(self._victim())
             donor = self.engine.scheduler.detach_waiting_for_prefix_cache(request_id)
             donor.request_id = "prefix-" + uuid.uuid4().hex
             self.entries[donor.request_id] = Prefix(
