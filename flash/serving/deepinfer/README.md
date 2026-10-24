@@ -66,6 +66,14 @@ size. Frequency has a 60-second half-life; TTL expiry is unchanged. Set `lru` to
 restore least-recently-used eviction. The same policy applies at entry/token
 capacity and under GPU block pressure.
 
+`FLASH_DEEPINFER_CPU_CACHE_BYTES` bounds raw host KV/state tensors per rank
+(default 1 GiB, maximum 8 GiB; `0` disables spilling). GPU capacity evictions
+spill complete native blocks and SWA/recurrent state into a process-local CPU LRU.
+Only exact tenant/prefix matches restore them. Promotion drops GPU victims without
+another spill to keep the host transfer within its budget. Expired entries are
+discarded. Allocation refusal falls back to prefill. Restored exact prefixes are
+reported as cached input; tokenization-cache hits are still not discounted.
+
 ## Deployment and qualification
 
 The native bridge passed a **four-B200 smoke and performance run**; see the
