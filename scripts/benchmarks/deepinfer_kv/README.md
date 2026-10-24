@@ -109,3 +109,16 @@ exposes a sequence's allocated block table for full-state snapshots. Model weigh
 and credentials are never checked in. The HTTPS relay is authenticated, RAM-only
 and scoped to this campaign; source code and generated synthetic prompts are its
 only data.
+
+To inspect or regenerate a result summary, decompress its raw JSON and run:
+
+```sh
+gzip -dc results/routing/raw.json.gz > /tmp/routing-trials.json
+python summarize.py routing /tmp/routing-trials.json
+```
+
+The fixed GPU cache pool remains allocated in both arms. CPU tiering recovers
+logical cache blocks after eviction; these experiments do not demonstrate a
+reduction in total model/device allocation. `results/common/*-sampled-memory.json`
+reports sampled device memory, including model and cache, rather than exact peaks
+or per-policy savings.
