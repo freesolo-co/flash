@@ -144,6 +144,7 @@ def engine_args_for(
     from vllm import AsyncEngineArgs, AsyncLLMEngine
 
     from flash.serve.runtime.cache_admission import qwen_scheduler_args
+    from flash.serve.runtime.kv_cache import qwen_cache_args
 
     # serve_model_id: load a PRE-QUANTIZED FP8 checkpoint instead of online-quantizing the bf16
     # base (avoids the bf16 load transient — see model_config). Adapters still key off base_model;
@@ -202,6 +203,7 @@ def engine_args_for(
         "max_cpu_loras": cfg.MAX_CPU_LORAS,
         **extra,
         **cfg.vllm_engine_kwargs(),
+        **qwen_cache_args(base_model),
     }
     kwargs.update(qwen_scheduler_args(base_model))
     return kwargs

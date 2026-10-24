@@ -92,6 +92,8 @@ def _install_vllm_stub() -> None:
         moe_backend: str | None = None
         reasoning_parser: str | None = None
         scheduler_cls: str | None = None
+        enable_cumem_allocator: bool = False
+        kv_transfer_config: dict | None = None
         enable_prefix_caching: bool = False
         disable_log_stats: bool = False
 

@@ -78,12 +78,26 @@ Workers verify token equality. This does not route between Modal replicas.
 Qwen engines have one GPU and one DP rank each, so this rank-placement policy has
 no additional target inside those engines; Modal still places their replicas.
 
-
 The fixed retention policy scores entries by decaying
 reuse count times reusable prefix length divided by the full allocated prompt
 size. Frequency has a 60-second half-life; TTL expiry is unchanged.
 The same policy applies at entry/token
 capacity and under GPU block pressure.
+
+A fixed 1 GiB per rank bounds raw host KV/state tensors. GPU capacity evictions
+spill complete native blocks and SWA/recurrent state into a process-local CPU LRU.
+Only exact tenant/prefix matches restore them. Promotion drops GPU victims without
+another spill to keep the host transfer within its budget. Expired entries are
+discarded. Allocation refusal falls back to prefill. Restored exact prefixes are
+reported as cached input; tokenization-cache hits are still not discounted.
+
+Qwen hosted and packaged engines enable native vLLM prefix caching with a fixed
+1 GiB CPU tier per engine. vLLM's `OffloadingConnector` owns attention and hybrid
+recurrent-state transfers; ARC balances recent and frequently reused CPU blocks.
+This CPU retention policy differs from DeepInfer's decaying GPU score. The private
+hosted RPC carries the authenticated organization namespace as vLLM's cache salt;
+native block hashes also include LoRA and multimodal identities. Cache contents
+remain local to an engine and disappear when its container stops.
 
 ## Deployment and qualification
 

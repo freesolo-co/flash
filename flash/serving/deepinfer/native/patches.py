@@ -4,6 +4,18 @@ import hashlib
 from pathlib import Path
 
 PATCHES = {
+    "csrc/engine/pybind_sequence.cpp": (
+        "872775774022bb27fd4b1fade37ec9f6fe9ec4c3051844206e3ec36c8103a9ce",
+        [
+            (
+                '    bind_sequence_property(sequence, "state_id",',
+                (
+                    '    bind_sequence_readonly(sequence, "block_table", [](const Sequence &seq) -> const auto & { return seq.cache.block_table; });\n'
+                    '    bind_sequence_property(sequence, "state_id",'
+                ),
+            )
+        ],
+    ),
     "deepinfer/model_executor/models/v4_modules/mlp.py": (
         "2541bcc83b178a9e2f18b387b301d60111d6d603e18e2d31df38196b03d290dd",
         [
