@@ -58,6 +58,32 @@ class HostedDeepInfer:
     def __init__(self, *, transport=None):
         self.transport = transport
 
+    async def token_budget(self, payload):
+        if not configured():
+            raise DeepInferError(503, "DeepInfer backend is not configured")
+        headers = {
+            "Modal-Key": os.environ["DEEPINFER_PROXY_KEY"],
+            "Modal-Secret": os.environ["DEEPINFER_PROXY_SECRET"],
+        }
+        url = await asyncio.wait_for(asyncio.to_thread(endpoint_url), timeout=30)
+        async with httpx.AsyncClient(
+            timeout=httpx.Timeout(STARTUP_SECONDS + REQUEST_SECONDS, connect=30),
+            transport=self.transport,
+            follow_redirects=True,
+            max_redirects=32,
+            event_hooks={"response": [_check_redirect]},
+        ) as client:
+            response = await client.post(
+                url + "/internal/token-budget",
+                headers=headers,
+                json=chat_body(payload.model_dump()),
+            )
+            response.raise_for_status()
+            tokens = response.json().get("tokens")
+            if type(tokens) is not int or tokens <= 0:
+                raise DeepInferError(503, "DeepInfer returned an invalid token budget")
+            return tokens
+
     async def stream_generate(self, base_model, payload, record, *, expected_checkpoint=None):
         if base_model != MODEL_ID or not record.serve_base_model:
             raise ValueError("DeepInfer does not support LoRA adapters")

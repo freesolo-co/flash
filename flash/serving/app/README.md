@@ -302,6 +302,40 @@ The one-off quantization job that produced them is not kept in this repo.
 - `POST /adapters/{model_id}/generate`
 - `POST /v1/chat/completions` where `model` is the adapter id
 
+### Per-key rate limits
+
+An operator can assign one API key an independent RPM and total TPM allowance in
+`internal.serving_api_key_rate_limits`. That key uses its own allowance instead of the shared
+organization RPM counter; other keys and trusted platform traffic retain the organization policy.
+The authorization backend supplies the key ID. Client headers cannot choose a quota identity.
+
+```sql
+INSERT INTO internal.serving_api_key_rate_limits
+    (api_key_id, requests_per_minute, tokens_per_minute)
+VALUES ('<api-key-uuid>', 10000, 30000000)
+ON CONFLICT (api_key_id) DO UPDATE
+SET requests_per_minute = EXCLUDED.requests_per_minute,
+    tokens_per_minute = EXCLUDED.tokens_per_minute;
+```
+
+The database atomically admits RPM and TPM together across all replicas, models, and endpoints.
+TPM reserves the exact text prompt token count plus `max_tokens * n` before generation; thinking,
+tools, and template rendering use the generation tokenizer. Image requests conservatively reserve
+the full served context per choice because vLLM expands image patches during processing. Reserved
+output tokens are not refunded for early stops, failures, or disconnects. Windows reset at the
+start of each UTC minute, and all tokens are charged to the admission window. This is an admission
+budget, not a rolling measurement of tokens emitted during a minute.
+
+Only configured keys invoke a private token-counting RPC. Token counting may cold-start the model,
+but it does not generate tokens. Missing database/token-counting infrastructure fails closed with
+503. Exhausted RPM or TPM returns 429 and `Retry-After`, with request and token allowance headers.
+
+Deploy the Freesolo migration `20261025000000_serving_api_key_rate_limits.sql` and the backend
+`apiKeyId` authorization response before this serving version. Deploy the DeepInfer private
+`/internal/token-budget` route before enabling a key override for DeepSeek. Older serving code
+cannot enforce per-key limits; inserting an override alone does not activate them. No default
+key allowances are inserted by the migration.
+
 ### Organization rate limits
 
 Hosted inference allows **600 requests per minute per organization**, shared across API keys,

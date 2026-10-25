@@ -143,6 +143,18 @@ class ServingContext:
             "serving auth did not return an attributable principal",
         )
 
+    async def admit_inference(
+        self, traffic: AuthorizedTraffic, payload: Any, target: AdapterRecord
+    ) -> None:
+        if traffic.api_key_id is None:
+            await self.rate_limiter(traffic.principal.orgId)
+            return
+        await self.rate_limiter(
+            traffic.principal.orgId,
+            api_key_id=traffic.api_key_id,
+            token_budget=lambda: self.pool.token_budget(target.base_model, payload, target),
+        )
+
     def assert_accounting_healthy(self) -> None:
         try:
             self.usage.assert_healthy()

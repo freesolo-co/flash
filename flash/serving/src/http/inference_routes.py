@@ -69,8 +69,8 @@ async def generate(payload: GenerateRequest, request: Request) -> JSONResponse:
         payload.model_id, org_id=_authorization_org_id(authorization)
     )
     traffic = require_attributed_traffic(authorization, target)
-    await context.rate_limiter(traffic.principal.orgId)
     await _prepare_generate_request(payload, target)
+    await _await_until_disconnect(request, context.admit_inference(traffic, payload, target))
     identity = new_request_identity(request)
     admitted_at = captured_now()
     try:
@@ -105,8 +105,8 @@ async def generate_for_adapter(
         req.model_id, org_id=_authorization_org_id(authorization)
     )
     traffic = require_attributed_traffic(authorization, target)
-    await context.rate_limiter(traffic.principal.orgId)
     await _prepare_generate_request(req, target)
+    await _await_until_disconnect(request, context.admit_inference(traffic, req, target))
     identity = new_request_identity(request)
     admitted_at = captured_now()
     try:
@@ -175,7 +175,6 @@ async def chat_completions(payload: dict[str, Any], request: Request) -> Any:
         model_id, org_id=_authorization_org_id(authorization)
     )
     traffic = require_attributed_traffic(authorization, target)
-    await context.rate_limiter(traffic.principal.orgId)
     effective_thinking = target.thinking
     if target.serve_base_model:
         override = normalized.chat_template_kwargs.get("enable_thinking")
@@ -200,6 +199,7 @@ async def chat_completions(payload: dict[str, Any], request: Request) -> Any:
     stream = normalized.stream
     include_usage = normalized.include_usage
     await _prepare_generate_request(req, target)
+    await _await_until_disconnect(request, context.admit_inference(traffic, req, target))
     completion_id = f"chatcmpl-{uuid.uuid4().hex}"
     identity = new_request_identity(request, openai_completion_id=completion_id)
     admitted_at = captured_now()

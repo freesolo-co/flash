@@ -20,6 +20,8 @@ from flash.serving.src.store.registry import AdapterRegistry
 class EnginePool(Protocol):
     """One vLLM engine per base model (Modal container in prod, fake in tests)."""
 
+    async def token_budget(self, base_model: str, payload: Any, record: AdapterRecord) -> int: ...
+
     async def generate(
         self,
         base_model: str,
