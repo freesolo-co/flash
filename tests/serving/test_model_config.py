@@ -53,6 +53,7 @@ def test_uncataloged_base_models_are_not_supported() -> None:
 
 def test_base_inference_support_is_separate_from_lora_support() -> None:
     assert is_supported_base_model(DEEPSEEK_MODEL_ID)
+    assert gpu_for(DEEPSEEK_MODEL_ID) == "B200:2"
     assert not supports_lora(DEEPSEEK_MODEL_ID)
     assert not supports_lora("example/unsupported")
     assert all(supports_lora(model) for model in base_models())
