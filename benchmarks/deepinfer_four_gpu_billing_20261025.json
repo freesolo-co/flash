@@ -1,10 +1,10 @@
 {
-  "delivered_requests_reconciled": 3148,
-  "client_usage_records_matched": 3144,
+  "delivered_requests_reconciled": 5023,
+  "client_usage_records_matched": 5015,
   "duplicates": 0,
-  "total_exact_cost_micro_usd": 16152682,
-  "ledger_and_balance_debit_cents": 1616,
-  "fractional_carry_delta_micro_usd": -7318,
+  "total_exact_cost_micro_usd": 28485228,
+  "ledger_and_balance_debit_cents": 2849,
+  "fractional_carry_delta_micro_usd": -4772,
   "price_snapshots_and_token_counts_match": true,
   "interrupted_request": {
     "state": "quarantined",
@@ -17,5 +17,11 @@
   "key_limits": {
     "requests_per_minute": 10000,
     "tokens_per_minute": 30000000
+  },
+  "cancelled_load_test": {
+    "known_incomplete_generations": 95,
+    "all_quarantined_without_charges": true,
+    "all_generation_leases_released": true,
+    "termination": "Modal cancelled the benchmark input; cause unproven. The test had already exceeded its allowed number of TTFT violations."
   }
 }
