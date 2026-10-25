@@ -1,0 +1,49 @@
+{
+  "remote_completion_marker": "ok",
+  "arms": {
+    "fp4-first": {
+      "measured_waves": 36,
+      "measured_requests": 396,
+      "request_errors": 0,
+      "mixed_requests": 24,
+      "quality_requests": 24,
+      "final_health": "ok",
+      "active_requests_at_finish": 0,
+      "max_mixed_delivery_gap_seconds": 0.6060720360000005
+    },
+    "fp8-first": {
+      "measured_waves": 36,
+      "measured_requests": 396,
+      "request_errors": 0,
+      "mixed_requests": 24,
+      "quality_requests": 24,
+      "final_health": "ok",
+      "active_requests_at_finish": 0,
+      "max_mixed_delivery_gap_seconds": 0.6310539239998434
+    },
+    "fp8-second": {
+      "measured_waves": 36,
+      "measured_requests": 396,
+      "request_errors": 0,
+      "mixed_requests": 24,
+      "quality_requests": 24,
+      "final_health": "ok",
+      "active_requests_at_finish": 0,
+      "max_mixed_delivery_gap_seconds": 0.5948563629999626
+    },
+    "fp4-second": {
+      "measured_waves": 36,
+      "measured_requests": 396,
+      "request_errors": 0,
+      "mixed_requests": 24,
+      "quality_requests": 24,
+      "final_health": "ok",
+      "active_requests_at_finish": 0,
+      "max_mixed_delivery_gap_seconds": 0.7787199559998044
+    }
+  },
+  "shared_native_binary_sha256": "62d3f2996eab97dca43f2e1070f916cb6cbde9f14c552c850f6ea6eaf98f9992",
+  "sandbox_exit": 137,
+  "active_sandboxes_after_cleanup": [],
+  "raw_archive_sha256": "66602fa6b817f240259d6129e176c48307f4274ee9fd8864e04929ae613a2186"
+}
