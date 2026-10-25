@@ -150,12 +150,7 @@ cold GPU allocation, long prompts, and bursts beyond ready capacity are outside
 these warm latency results. Keep the buffer: eight streams on only two replicas
 reached 1.13-second p95 TTFT despite maintaining 117 GPU tokens/s median per stream.
 
-Reproduce public SSE measurements with `scripts/benchmark_serving_latency.py`.
-It saves warmup requests separately and labels aggregate and per-stream results.
-The [numerical evidence](../../../../benchmarks/serving_latency_20261025.json)
-includes native event counts/timestamps and the unsuccessful two-replica eight-stream
-run. The final eight-stream run used main's minimum/buffer policy, with three
-replicas already ready and an experimental cap of three replicas.
+Detailed qualification results are recorded in the optimization PR description.
 Qwen shares local exact token reservations, immutable tokenizer revisions,
 authorization refresh, US placement, and startup generation warmup.
 
@@ -268,20 +263,6 @@ modal deploy --env main -m flash.serving.deepinfer.app.modal_app
 The `Deploy DeepInfer pools` workflow deploys this private app on relevant pushes
 to `main` and `dev`, explicitly selecting the matching Modal environment. It
 does not configure the hosted router credentials.
-
-To measure the private endpoint with environment-scoped Proxy Tokens in
-`MODAL_KEY` and `MODAL_SECRET`, run:
-
-```sh
-uv run python scripts/benchmark_deepinfer_autoscaling.py --env dev \
-  --concurrency 10 --seconds 600 --output /tmp/deepinfer-load.json
-```
-
-The benchmark records first-token latency, completed output throughput, errors,
-replica IDs, and five-second Modal pool samples. It sends a mixture of short and
-long unique prompts with 256-token responses, without changing deployment
-settings. Run comparisons on a quiet pool; retain cold starts and errors in the
-results, and observe idle scale-down without sending HTTP health probes.
 
 The GPU endpoint requires [Modal Proxy Tokens](https://modal.com/docs/guide/webhook-proxy-auth),
 so unauthenticated requests are rejected before provisioning GPUs. The GPU backend exposes only `/health` and `/internal/generate`; OpenAI routes,
