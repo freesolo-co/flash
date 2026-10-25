@@ -887,7 +887,7 @@ def test_invalid_stored_spec_raises_value_error_before_ready(modal_app_module):
 
 
 # --- stop sequences ---------------------------------------------------------------------------
-# `docs/serving-contract.md` documents `stop` as an accepted field and requires stop handling to be
+# The serving contract accepts `stop` and requires stop handling to be
 # preserved. Pydantic drops keys a model does not declare, so an undeclared `stop` was accepted with
 # a 200 and then ignored: generation ran past the caller's stop string and billed the extra tokens.
 

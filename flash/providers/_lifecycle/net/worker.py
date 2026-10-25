@@ -36,8 +36,8 @@ WORKER_IMAGE = (
 BAKED_PER_SM_ARCHES = frozenset({"sm80", "sm86", "sm89", "sm90", "sm120", "sm100"})
 
 
-# Requalified on real GPUs against the pinned upstream trainer. See
-# docs/kernel-cache-requalification-2026-10-22.md before rotating these digests.
+# Requalified on real GPUs against the pinned upstream trainer.
+# Requalify replacement images before rotating these digests.
 QUALIFIED_WORKER_IMAGES = {
     "sm80": (
         "ghcr.io/freesolo-co/flash-worker@"

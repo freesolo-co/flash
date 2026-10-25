@@ -28,7 +28,7 @@ This file starts at 1.1.35. Earlier releases are not reconstructed here; use
 
 - Versioned rollout request/result contracts for synchronous GRPO, binding generation to
   acknowledged policy snapshots and checking token probabilities, turn provenance, attempts,
-  and training-row identity before optimization. See [the V1 contract](docs/rollout-contract.md).
+  and training-row identity before optimization.
 
 - OpenAI chat serving now implements and offline-validates strict function tool calling for the exact
   Qwen3.5 packaged and hosted paths, including validated tool history, buffered and raw SSE

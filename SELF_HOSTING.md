@@ -490,8 +490,6 @@ and returns `400` for them.
 
 `FREESOLO_SERVING_URL` belongs to the separate multi-LoRA backend behind `flash models deploy` /
 `chat` / `undeploy`; standalone refuses an unset or Freesolo-hosted value there for the same reason.
-See [docs/serving-contract.md](docs/serving-contract.md) for both credential rules, the normative
-endpoints, and the conformance command.
 
 ## The worker image
 

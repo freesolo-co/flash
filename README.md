@@ -193,9 +193,6 @@ Within `flash/engine/worker/`, trainers live under `train/`, split by algorithm 
 **copied** into the verl subprocess rather than imported — flash and verl pin incompatible
 torch/vllm versions, so neither can import the other.
 
-Training task admission, recovery scheduling, and shutdown are described in
-[Training background work](docs/training-background-work.md).
-
 ## Self-hosting
 
 Run your own control plane against your own GPU accounts, with no Freesolo backend involved.
@@ -227,8 +224,7 @@ untrusted networks. See [the security model](SELF_HOSTING.md#the-security-model)
 `flash serve deploy` provisions serving in your own Modal account and requires explicit
 `--provider modal`. Each deployment owns one exact base model and its compatible adapters; another
 base model requires another deployment. Legacy provider deployment identities are unsupported.
-It implements the same contract `flash/serve/` speaks; [docs/serving-contract.md](docs/serving-contract.md)
-documents it if you would rather write your own.
+It implements the same contract `flash/serve/` speaks.
 
 Training selects the public worker image by its qualified digest. The historical `cu128` and
 `cu128-sm*` tags can contain an incompatible trainer; they are build outputs, not the launch

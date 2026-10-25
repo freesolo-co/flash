@@ -8,6 +8,7 @@ from pydantic import (
     BaseModel,
     ConfigDict,
     Field,
+    PrivateAttr,
     StrictBool,
     StrictInt,
     field_validator,
@@ -245,6 +246,7 @@ class GenerateRequest(BaseModel):
     # the cpu front door overwrites this before every production dispatch. direct offline engine
     # tests may omit it, in which case the engine supplies a test-only id before calling vllm.
     generation_id: str | None = None
+    _cache_namespace: str | None = PrivateAttr(default=None)
     prompt: str | None = None
     messages: list[dict[str, Any]] | None = None
     max_tokens: int = 1024
