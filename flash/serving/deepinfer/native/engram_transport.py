@@ -179,16 +179,17 @@ class LocalEngramBuffer:
                 raise ValueError("Engram weights must be contiguous")
             if scale.dtype != torch.float32 or scale.shape != (self.rows[index], self.hidden // 32):
                 raise ValueError("Engram scales must be FP32 with one scale per 32 values")
-            if scale.device != weight.device or not scale.is_contiguous():
-                raise ValueError("Engram scales must be contiguous and on the weight device")
+            if not scale.is_contiguous():
+                raise ValueError("Engram scales must be contiguous")
         for weight, scale in zip(storages, sfs, strict=True):
             # Pack on the original device, preserving every power-of-two scale.
             bits = scale.view(torch.int32)
             if bool(torch.any((bits < 0) | ((bits & 0x7FFFFF) != 0))):
                 raise ValueError("Engram scales must be nonnegative powers of two")
             packed = (bits >> 23).to(torch.uint8).view(torch.int32).contiguous()
-            if not weight.is_cuda:
-                packed = packed.cpu()
+            # Native loading can keep FP32 scales on CUDA while weights live in
+            # host RAM. Exchange the smaller packed scales beside their weights.
+            packed = packed.to(device=weight.device)
             self.tables.append((self._exchange(weight), self._exchange(packed)))
         torch.cuda.synchronize()
         dist.barrier(group=self.group)
