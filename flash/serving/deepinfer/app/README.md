@@ -91,14 +91,6 @@ another spill to keep the host transfer within its budget. Expired entries are
 discarded. Allocation refusal falls back to prefill. Restored exact prefixes are
 reported as cached input; tokenization-cache hits are still not discounted.
 
-Qwen hosted and packaged engines enable native vLLM prefix caching with a fixed
-1 GiB CPU tier per engine. vLLM's `OffloadingConnector` owns attention and hybrid
-recurrent-state transfers; ARC balances recent and frequently reused CPU blocks.
-This CPU retention policy differs from DeepInfer's decaying GPU score. The private
-hosted RPC carries the authenticated organization namespace as vLLM's cache salt;
-native block hashes also include LoRA and multimodal identities. Cache contents
-remain local to an engine and disappear when its container stops.
-
 ## Deployment and qualification
 
 The native bridge passed a **four-B200 smoke and performance run**; see the

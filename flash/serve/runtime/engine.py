@@ -527,7 +527,6 @@ class VllmLoraRuntime:
 
         from .cache_admission import qwen_scheduler_args
         from .hub import engine_tokenizer_path
-        from .kv_cache import qwen_cache_args
 
         _require_reasoning_compatibility(
             AsyncEngineArgs,
@@ -545,7 +544,6 @@ class VllmLoraRuntime:
             **thaw_mapping(self.config.engine_args, "engine_args"),
         }
         kwargs.update(qwen_scheduler_args(self.config.model))
-        kwargs.update(qwen_cache_args(self.config.model))
         if self.config.model_revision is not None:
             kwargs["revision"] = self.config.model_revision
         if self.config.tokenizer_revision is not None:
