@@ -274,7 +274,10 @@ def test_native_image_patch_rejects_unknown_source():
         patch_indexer("unexpected upstream release")
 
 
-def test_modal_private_two_gpu_autoscaling_contract(monkeypatch):
+@pytest.mark.parametrize(
+    ("environment", "warm_replicas"), [("main", 1), ("dev", 0), ("test", 0), (None, 0)]
+)
+def test_modal_private_two_gpu_autoscaling_contract(monkeypatch, environment, warm_replicas):
     captured = {}
 
     class Image:
@@ -309,6 +312,7 @@ def test_modal_private_two_gpu_autoscaling_contract(monkeypatch):
         return factory
 
     stub = SimpleNamespace(
+        config=SimpleNamespace(config={"environment": environment}),
         Image=Image,
         App=App,
         Volume=SimpleNamespace(from_name=lambda *a, **kw: object()),
@@ -324,9 +328,9 @@ def test_modal_private_two_gpu_autoscaling_contract(monkeypatch):
         sys.modules.pop(name, None)
     assert captured["function"]["gpu"] == "B200:2"
     assert captured["function"]["memory"] == 524288
-    assert captured["function"]["min_containers"] == 1
-    assert captured["function"]["max_containers"] == 4
-    assert captured["function"]["buffer_containers"] == 0
+    assert captured["function"]["min_containers"] == warm_replicas
+    assert captured["function"]["max_containers"] == (6 if environment == "main" else 4)
+    assert captured["function"]["buffer_containers"] == (1 if environment == "main" else 0)
     assert captured["function"]["scaledown_window"] == 600
     assert captured["concurrent"] == {"max_inputs": 16, "target_inputs": 12}
     assert captured["web"]["requires_proxy_auth"] is True

@@ -12,9 +12,11 @@ from flash.serving.deepinfer.contract.config import (
     APP_NAME,
     BUFFER_CONTAINERS,
     GPU,
+    MAIN_BUFFER_CONTAINERS,
+    MAIN_MAX_CONTAINERS,
+    MAIN_MIN_CONTAINERS,
     MAX_CONTAINERS,
     MAX_INPUTS,
-    MIN_CONTAINERS,
     PORT,
     REQUEST_SECONDS,
     RUNTIME_IMAGE_ID,
@@ -43,6 +45,7 @@ image = (
 )
 app = modal.App(APP_NAME, image=image)
 weights = modal.Volume.from_name("freesolo-deepseek-1017-weights", create_if_missing=True)
+main_environment = modal.config.config.get("environment") == "main"
 
 
 def _watch_server(process):
@@ -57,9 +60,9 @@ def _watch_server(process):
     cpu=16,
     memory=524288,  # Engram host storage and loading peaked above 300 GiB in qualification.
     volumes={"/weights": weights},
-    min_containers=MIN_CONTAINERS,
-    max_containers=MAX_CONTAINERS,
-    buffer_containers=BUFFER_CONTAINERS,
+    min_containers=MAIN_MIN_CONTAINERS if main_environment else 0,
+    max_containers=MAIN_MAX_CONTAINERS if main_environment else MAX_CONTAINERS,
+    buffer_containers=MAIN_BUFFER_CONTAINERS if main_environment else BUFFER_CONTAINERS,
     scaledown_window=SCALEDOWN_SECONDS,
     startup_timeout=STARTUP_SECONDS,
     timeout=REQUEST_SECONDS,

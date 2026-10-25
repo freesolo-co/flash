@@ -14,6 +14,7 @@ import argparse
 import asyncio
 import contextlib
 import dataclasses
+import itertools
 import json
 import math
 import os
@@ -82,6 +83,8 @@ async def generate(client, url, index, max_tokens):
                 elif event["type"] == "error":
                     raise RuntimeError("native_error")
                 elif event["type"] == "final":
+                    if "ttft" not in row or event["completion_tokens"] <= 0:
+                        raise RuntimeError("invalid_final_event")
                     row.update(
                         ok=True,
                         tokens=event["completion_tokens"],
@@ -116,6 +119,7 @@ async def run(args):
     headers = {"Modal-Key": os.environ["MODAL_KEY"], "Modal-Secret": os.environ["MODAL_SECRET"]}
     settings = dataclasses.asdict(await function.autoscaler.settings.aio())
     requests, samples = [], []
+    request_numbers = itertools.count()
     started = time.monotonic()
     done = asyncio.Event()
 
@@ -138,16 +142,16 @@ async def run(args):
         event_hooks={"request": [same_origin]},
     ) as client:
 
-        async def worker(index):
+        async def worker():
             while time.monotonic() - started < args.seconds:
-                row = await generate(client, url, index, args.max_tokens)
+                row = await generate(client, url, next(request_numbers), args.max_tokens)
                 requests.append(row)
                 if not row["ok"]:
                     await asyncio.sleep(1)
 
         monitor = asyncio.create_task(sample())
         try:
-            await asyncio.gather(*(worker(i) for i in range(args.concurrency)))
+            await asyncio.gather(*(worker() for _ in range(args.concurrency)))
         finally:
             done.set()
             await monitor

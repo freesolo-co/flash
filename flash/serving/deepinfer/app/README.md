@@ -29,12 +29,13 @@ prefix-cache bindings. The native FP4 expert sources are left untouched.
 | Setting | Value |
 | --- | --- |
 | GPU allocation | `B200:2` per replica, EP=2 / DP=2 |
-| Replica pool | 1–4, two B200s always warm; at most 8 B200s |
+| Main replica pool | 1–6; two B200s minimum, one two-B200 buffer replica; at most 12 B200s total |
+| Dev and other environments | 0–4 replicas, no buffer; at most 8 B200s; scale to zero when idle |
 | Admission | 16 requests per replica; scale-out target 12 |
 | Native scheduler | 8 sequences per rank, 4,096-token prefill chunks; any-rank prefill check every 8 decode steps |
 | Expert execution | Native packed FP4 weights with FP8 activations and the released scales |
 | Token delivery | First output immediately; then 16 tokens or 50 ms of engine progress |
-| Idle scale-down | 600 seconds for excess replicas; one warm replica, no spare buffer |
+| Idle scale-down | 600 seconds for excess replicas; main retains one replica, dev retains none |
 | Host allocation | 16 CPUs / 512 GiB RAM per replica |
 | Initial context limit | 32,768 tokens including output and 64 reserved tokens |
 | Startup / generation budgets | 45 minutes / 10 minutes |
@@ -46,9 +47,12 @@ or receives a retryable capacity error. Each GPU group exits if one rank dies or
 stalls. Closing a request aborts its native sequence and waits for acknowledgment
 before releasing the slot; it does not terminate the other requests in that group.
 
-The minimum is one **replica**, not one GPU: its two B200s remain provisioned
-even with no traffic. The 600-second idle window applies to capacity above that
-floor. No spare buffer is requested. Modal's [concurrency target](https://modal.com/docs/guide/concurrent-inputs)
+Only Modal's explicitly selected `main` environment keeps one **replica** warm:
+its two B200s remain provisioned even with no traffic. `dev`, qualification
+environments, and unspecified environments have no warm minimum. The 600-second
+idle window applies to capacity above the environment's floor. Main also requests
+one spare two-B200 replica while the pool is active. The six-replica main cap
+includes both active and buffer capacity; dev has no spare buffer. Modal's [concurrency target](https://modal.com/docs/guide/concurrent-inputs)
 allows each replica to accept up to 16 requests while additional replicas start;
 it is not a guarantee that cold capacity will be ready for a sudden burst.
 
@@ -179,10 +183,13 @@ Deploy the private backend in the intended Modal environment:
 
 ```sh
 modal deploy --env dev -m flash.serving.deepinfer.app.modal_app
+# Production: keep one two-B200 replica warm.
+modal deploy --env main -m flash.serving.deepinfer.app.modal_app
 ```
 
-The `Deploy development DeepInfer pool` workflow also deploys this private app
-on relevant pushes to `dev`. It does not configure the hosted router credentials.
+The `Deploy DeepInfer pools` workflow deploys this private app on relevant pushes
+to `main` and `dev`, explicitly selecting the matching Modal environment. It
+does not configure the hosted router credentials.
 
 To measure the private endpoint with environment-scoped Proxy Tokens in
 `MODAL_KEY` and `MODAL_SECRET`, run:
@@ -231,7 +238,8 @@ Keep the router connection unset until that catalog and settlement path are read
 Qualification must exercise cold boot and coherent output against the official
 encoder, native FP8/FP4/Engram parity, thinking and streaming, cancellation during
 prefill and decoding alongside another request, rank failure, load above the
-12-input target, the four-replica cap, and return to one replica after idle timeout.
+12-input target, the six-replica main / four-replica dev caps, and idle scale-down to one replica in
+`main` and zero in `dev`.
 Verify durable accounting through the real backend at the configured rates.
 
 ## Pinned runtime

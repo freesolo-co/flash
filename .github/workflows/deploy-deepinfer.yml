@@ -1,30 +1,31 @@
-name: Deploy development DeepInfer pool
+name: Deploy DeepInfer pools
 
 on:
   push:
-    branches: [dev]
+    branches: [main, dev]
     paths:
       - flash/serving/deepinfer/**
       - flash/serving/src/**
       - flash/serve/**
       - pyproject.toml
       - uv.lock
-      - .github/workflows/deploy-deepinfer-dev.yml
+      - .github/workflows/deploy-deepinfer.yml
   workflow_dispatch:
 
 permissions:
   contents: read
 
 concurrency:
-  group: deploy-deepinfer-dev
+  group: deploy-deepinfer-${{ github.ref_name }}
   cancel-in-progress: false
 
 jobs:
   deploy:
-    if: github.ref == 'refs/heads/dev'
+    if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/dev'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     env:
+      MODAL_ENVIRONMENT: ${{ github.ref_name == 'main' && 'main' || 'dev' }}
       MODAL_TOKEN_ID: ${{ secrets.MODAL_TOKEN_ID }}
       MODAL_TOKEN_SECRET: ${{ secrets.MODAL_TOKEN_SECRET }}
     steps:
@@ -35,5 +36,5 @@ jobs:
           python-version: "3.12"
       - name: Install deployment dependencies
         run: uv sync --extra serving --locked --no-dev
-      - name: Deploy private DeepInfer pool with its warm floor
-        run: uv run --no-sync modal deploy --env dev -m flash.serving.deepinfer.app.modal_app
+      - name: Deploy private DeepInfer pool
+        run: uv run --no-sync modal deploy --env "$MODAL_ENVIRONMENT" -m flash.serving.deepinfer.app.modal_app
