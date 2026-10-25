@@ -15,14 +15,14 @@ The parent `deepinfer/` package groups code by responsibility:
 | `app/` | Private HTTP endpoint, hosted router client, event rendering, and Modal launcher |
 | `contract/` | Pinned configuration, validated chat requests, and shared errors |
 | `runtime/` | Async request bridge, GPU worker processes, prefix cache, and loaded-runtime checks |
-| `native/` | Prefix-cache scheduler patch and Engram GPU transport |
+| `native/` | Prefix-cache native bindings and Engram GPU transport |
 
 The hosted CPU router imports `app.client` and `contract` modules. The private
 HTTP server starts `runtime.bridge.Runtime`, which launches `runtime.worker`
 processes. Workers load native GPU modules after selecting their CUDA device;
 package initializers do not load GPU dependencies. Image preparation applies
-`native.patches`, which checks the scheduler source and adds the prefix-cache
-binding. The native FP4 expert sources are left untouched.
+`native.patches`, which checks the scheduler and sequence sources and adds the
+prefix-cache bindings. The native FP4 expert sources are left untouched.
 
 ## Capacity and price
 
@@ -53,7 +53,7 @@ tokens. GPU prefix-cache hits report the actual retained token count with
 not count as cached GPU input and receive no cached-input billing discount.
 
 The GPU cache keeps at most four prefixes and 32,768 tokens of retained KV allocation per
-rank. Entries expire after 600 seconds of inactivity and are evicted in LRU order
+rank. Entries expire after 600 seconds of inactivity and are evicted according to the retention policy
 or under KV-memory pressure. The router derives each cache namespace from verified
 organization attribution. Prefix matching checks exact token IDs; continuations
 use native copy-on-write state. A stable conversation prefix is preferred, with
@@ -68,10 +68,35 @@ engine-step boundaries and does not bound a stalled GPU collective.
 
 Cache affinity and retained checkpoints can leave unequal prefill queues across
 ranks. The native any-rank prefill interval is eight decode steps instead of the
-upstream default of 100, preventing those queues from waiting behind long decode
-runs. This is a scheduling interval, not a wall-clock latency guarantee. Prompts
-shorter than 130 tokens skip prefix preparation and use least-loaded routing,
-because retention requires 128 prefix tokens plus two uncached tokens.
+upstream default of 100. Prompts shorter than 130 tokens skip prefix preparation.
+
+## Cache policy
+
+Live prefix-aware routing is always enabled across the two DP ranks within a
+replica. Workers advertise exact namespace/prefix digests, expiring after two
+seconds. Placement balances queued prefill/decode work against saved prefill.
+Workers verify token equality. This does not route between Modal replicas.
+Qwen engines have one GPU and one DP rank each, so this rank-placement policy has
+no additional target inside those engines; Modal still places their replicas.
+
+The fixed retention policy scores entries by decaying
+reuse count times reusable prefix length divided by the full allocated prompt
+size. Frequency has a 60-second half-life; TTL expiry is unchanged.
+The same policy applies at entry/token
+capacity and under GPU block pressure.
+
+A fixed 1 GiB per rank bounds raw host KV/state tensors. GPU capacity evictions
+spill complete native blocks and SWA/recurrent state into a process-local CPU LRU.
+Only exact tenant/prefix matches restore them. Promotion drops GPU victims without
+another spill to keep the host transfer within its budget. Expired entries are
+discarded. Allocation refusal falls back to prefill. Restored exact prefixes are
+reported as cached input; tokenization-cache hits are still not discounted.
+
+The fixed retention policy scores entries by decaying
+reuse count times reusable prefix length divided by the full allocated prompt
+size. Frequency has a 60-second half-life; TTL expiry is unchanged.
+The same policy applies at entry/token
+capacity and under GPU block pressure.
 
 ## Deployment and qualification
 

@@ -143,6 +143,8 @@ def engine_args_for(
     """
     from vllm import AsyncEngineArgs, AsyncLLMEngine
 
+    from flash.serve.runtime.cache_admission import qwen_scheduler_args
+
     # serve_model_id: load a PRE-QUANTIZED FP8 checkpoint instead of online-quantizing the bf16
     # base (avoids the bf16 load transient — see model_config). Adapters still key off base_model;
     # the tokenizer stays the base model's (canonical). vLLM auto-detects the checkpoint's FP8, so
@@ -172,7 +174,7 @@ def engine_args_for(
     extra.update(_required_immutable_args(base_model, overrides, engine_arg_names))
     extra.update(_build_specific_args(base_model, overrides, engine_arg_names))
 
-    return {
+    kwargs = {
         "model": served_model,
         "trust_remote_code": cfg.TRUST_REMOTE_CODE,
         "dtype": cfg.DTYPE,
@@ -201,6 +203,8 @@ def engine_args_for(
         **extra,
         **cfg.vllm_engine_kwargs(),
     }
+    kwargs.update(qwen_scheduler_args(base_model))
+    return kwargs
 
 
 def load_engine_config(

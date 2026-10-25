@@ -505,12 +505,14 @@ class _ModalEnginePool:
             return await HostedDeepInfer().generate(
                 base_model, payload, record, expected_checkpoint=expected_checkpoint
             )
+        from flash.serving.src.io.cache_namespace import internal_generation_payload
+
         generation_id = payload.generation_id
         if not generation_id:
             raise RuntimeError("generation id is required before modal dispatch")
         engine = _engine_cls_for(base_model)(base_model=base_model)
         return await engine.generate.remote.aio(
-            payload.model_dump(),
+            internal_generation_payload(payload),
             self._record_payload(record),
             expected_checkpoint,
             generation_id,
@@ -537,6 +539,8 @@ class _ModalEnginePool:
             finally:
                 await stream.aclose()
             return
+        from flash.serving.src.io.cache_namespace import internal_generation_payload
+
         generation_id = payload.generation_id
         if not generation_id:
             raise RuntimeError("generation id is required before modal dispatch")
@@ -545,7 +549,7 @@ class _ModalEnginePool:
 
         remote_stream = CancellableStreamChannel(
             spawn_method=engine.stream_generate_call,
-            payload_dict=payload.model_dump(),
+            payload_dict=internal_generation_payload(payload),
             record_dict=self._record_payload(record),
             expected_checkpoint=expected_checkpoint,
             generation_id=generation_id,

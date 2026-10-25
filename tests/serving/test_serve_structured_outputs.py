@@ -1006,3 +1006,34 @@ def test_hosted_stream_rechecks_lease_after_prompt_preparation(
     assert checked == [True]
     assert closed_images == prepared
     assert len(eng.engine.sampling_params) == (0 if cancel_before_generate else 1)
+
+
+@pytest.mark.parametrize("stream", [False, True])
+def test_authenticated_cache_salts_reach_vllm_without_cross_request_leakage(
+    modal_app_module, stream
+):
+    eng = _engine(modal_app_module, thinking=False)
+    prompts = []
+    original = eng.engine.generate
+
+    async def capture(prompt, *args, **kwargs):
+        prompts.append(dict(prompt))
+        async for output in original(prompt, *args, **kwargs):
+            yield output
+
+    eng.engine.generate = capture
+
+    async def request(namespace):
+        payload = {"model_id": "r1", "prompt": "same prompt", "_cache_namespace": namespace}
+        if stream:
+            async for _ in eng._stream_generate(payload, _forwarded_record(eng, "r1")):
+                pass
+        else:
+            await eng._generate(payload, _forwarded_record(eng, "r1"))
+
+    async def run():
+        await asyncio.gather(request("a" * 64), request("b" * 64))
+
+    asyncio.run(run())
+    assert {prompt.pop("cache_salt") for prompt in prompts} == {"a" * 64, "b" * 64}
+    assert prompts[0] == prompts[1]
