@@ -1,4 +1,4 @@
-"""One native scheduling loop per GPU; all four EP ranks stay in collectives."""
+"""One native scheduling loop per GPU; both EP ranks stay in collectives."""
 
 from __future__ import annotations
 
@@ -139,16 +139,13 @@ def run_rank(rank, model_path, incoming, outgoing, stopped):
     try:
         llm = initialize(rank, model_path)
         engine = llm.llm_engine
-        from flash.serving.deepinfer.native.fp8 import CONVERTED_EXPERT_TENSORS
         from flash.serving.deepinfer.runtime.provenance import loaded_runtime
 
-        if CONVERTED_EXPERT_TENSORS == 0:
-            raise RuntimeError("No FP8 expert tensors were loaded")
         proof = loaded_runtime(llm, rank)
         proof.update(
-            expert_dtype="float8_e4m3fn",
-            expert_source="losslessly-expanded-fp4",
-            converted_expert_tensors=CONVERTED_EXPERT_TENSORS,
+            expert_dtype="native_fp4",
+            expert_source="native-fp4",
+            converted_expert_tensors=0,
             prefill_any_attempt_interval=engine.scheduler_config.prefill_any_attempt_interval,
         )
         print(f"DEEPINFER_LOADED {proof}", flush=True)

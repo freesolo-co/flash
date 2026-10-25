@@ -6,7 +6,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from flash.serving.deepinfer.contract.config import MODEL_ID, REQUEST_SECONDS
+from flash.serving.deepinfer.contract.config import GPU_COUNT, MODEL_ID, REQUEST_SECONDS
 from flash.serving.deepinfer.contract.protocol import parse_request
 from flash.serving.deepinfer.runtime.bridge import Runtime
 from flash.serving.src.http.stream_response import await_until_disconnect
@@ -31,7 +31,7 @@ async def test_generation_deadline_survives_consumer_handoff(monkeypatch, buffer
             if command["type"] == "cancel":
                 cancelled.set()
 
-    runtime.incoming = [Commands() for _ in range(4)]
+    runtime.incoming = [Commands() for _ in range(GPU_COUNT)]
     request = parse_request({"model": MODEL_ID, "messages": [{"role": "user", "content": "hello"}]})
     generator = runtime.generate(request, [0])
 
@@ -64,7 +64,7 @@ async def test_generation_deadline_survives_consumer_handoff(monkeypatch, buffer
         runtime._deliver({"type": "cancelled", "id": request_id})
         with pytest.raises(TimeoutError):
             await consumer
-        assert runtime.loads == [0] * 4
+        assert runtime.loads == [0] * GPU_COUNT
         assert runtime.pending == {}
         assert runtime.failure is None
     finally:
