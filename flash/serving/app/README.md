@@ -217,6 +217,11 @@ allocated to new work. The native pool retains ownership of hashes, references,
 and all KV/state layouts. No block is pinned; even a fully hot cache can allocate.
 These settings are fixed in code and require no environment variables.
 
+Qwen also uses vLLM's native OffloadingConnector with a fixed 1 GiB CPU cache and
+ARC eviction, plus the native allocator needed for stable transfer addresses.
+The connector owns transfers and recurrent-state layouts. Its usefulness depends
+on actual GPU eviction and reuse; it does not increase model context limits.
+
 ### No autoscaling or vLLM perf knobs
 
 There are **no env knobs for autoscaling or vLLM/engine performance**. An optimization either exists
