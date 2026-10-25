@@ -454,9 +454,14 @@ def create_run(
                 project_id=project_id,
                 reporting_key=reporting_key,
             )
-        if isinstance(exc, HTTPException):
+        error = exc if isinstance(exc, HTTPException) else _submit_failure_http_error(exc)
+        if not submission_started:
+            # Preparation is read-only. After admission a failed response may still
+            # leave a recoverable paid run, so status codes alone cannot authorize retry.
+            error.headers = {**(error.headers or {}), "X-Flash-Submission-Outcome": "not-created"}
+        if error is exc:
             raise
-        raise _submit_failure_http_error(exc) from exc
+        raise error from exc
     _record_environment_use(
         environment_slug, project_id=project_id, run_id=run_id, reporting_key=reporting_key
     )
