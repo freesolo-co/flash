@@ -868,6 +868,7 @@ def _base_model_records() -> list:
     region="us-east",  # keep admission, private HTTP dispatch, and serving ingress nearby
     cpu=8,  # exact long-context token counting and concurrent stream framing
     memory=16384,  # pinned tokenizers plus bounded in-flight prompt state
+    nonpreemptible=True,  # a CPU-host interruption cannot resume an open token stream
     min_containers=1,  # one warm CPU front door (hardcoded; no deploy-time knob)
     buffer_containers=BUFFER_CONTAINERS,  # scales out with the engines; see BUFFER_CONTAINERS
     timeout=ROUTER_TIMEOUT_SECONDS,  # must cover engine cold start (see ROUTER_TIMEOUT_SECONDS)

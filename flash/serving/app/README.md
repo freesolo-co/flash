@@ -32,11 +32,6 @@ The routing layer (`src/router.py`) carries no `modal`/`vllm` imports and is exh
 unit-tested in `tests/serving/test_router.py` (multi-base-model dispatch, shared-GPU multi-LoRA,
 register-routing, OpenAI shape, auth, 404s) — run with `uv run pytest tests/serving/`.
 
-Operator load tests use the isolated `flash.serving.loadtest` package. It is
-never imported by production serving. It drives only `GET /healthz` and `POST /v1/chat/completions`,
-manages no Modal lifecycle, and cannot by itself prove replica scale-out, cold state, GPU identity,
-the cause of a capacity rejection, or an availability SLA.
-
 Persistence is only for hydration and recovery. On startup each base model's engine loads
 _its_ ready adapters from the `hosted_lora_adapters` Supabase table; `POST /adapters`
 registers a new adapter on its base model's engine and tracks it in the router.
@@ -56,7 +51,9 @@ the configured limits total 12 GPU containers per environment. Requests queue wh
 containers are busy; an idle model's capacity cannot be borrowed by another model.
 
 The CPU router remains warm and uncapped, with eight CPUs and 16 GiB RAM per container
-for exact token counting and concurrent stream framing. `BUFFER_CONTAINERS = 1` applies to the router and every
+for exact token counting and concurrent stream framing. It uses non-preemptible CPU hosts because
+an interrupted HTTP stream cannot resume. Modal applies a 3x CPU/RAM price multiplier to this
+setting; GPU allocation and pricing are unchanged. `BUFFER_CONTAINERS = 1` applies to the router and every
 engine, but only while active, so GPU engines still scale to zero when idle. Idle windows are set by
 `SCALEDOWN_WINDOW_SECONDS_BY_GPU`; the active B200 tiers use 2100 seconds. The router uses
 `MAX_INPUTS = 64` with `TARGET_INPUTS = 48`; engine concurrency follows each model's `max_num_seqs`.
