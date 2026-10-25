@@ -31,7 +31,8 @@ prefix-cache bindings. The native FP4 expert sources are left untouched.
 | GPU allocation | `B200:2` per replica, EP=2 / DP=2 |
 | Main replica pool | 1–6; two B200s minimum, one two-B200 buffer replica; at most 12 B200s total |
 | Dev and other environments | 0–4 replicas, no buffer; at most 8 B200s; scale to zero when idle |
-| Admission | 16 requests per replica; scale-out target 12 |
+| Admission | 4 requests per replica; scale-out target 3 |
+| Placement | US GPU replicas; CPU admission router in US East |
 | Native scheduler | 8 sequences per rank, 4,096-token prefill chunks; any-rank prefill check every 8 decode steps |
 | Expert execution | Native packed FP4 weights with FP8 activations and the released scales |
 | Token delivery | First output immediately; then 16 tokens or 50 ms of engine progress |
@@ -53,7 +54,7 @@ environments, and unspecified environments have no warm minimum. The 600-second
 idle window applies to capacity above the environment's floor. Main also requests
 one spare two-B200 replica while the pool is active. The six-replica main cap
 includes both active and buffer capacity; dev has no spare buffer. Modal's [concurrency target](https://modal.com/docs/guide/concurrent-inputs)
-allows each replica to accept up to 16 requests while additional replicas start;
+allows each replica to accept up to 4 requests while additional replicas start;
 it is not a guarantee that cold capacity will be ready for a sudden burst.
 
 Prices are captured as exact per-token decimals with version
@@ -110,24 +111,73 @@ capacity and under GPU block pressure.
 
 ## Deployment and qualification
 
-### Autoscaling qualification (2026-10-25)
+### Public-path latency qualification (2026-10-25)
+
+The latency policy targets per-stream speed, with four admitted requests per
+two-B200 replica and a scale-out target of three. Main retains its one-replica
+minimum, one buffer replica, and six-replica cap; dev retains zero minimum/buffer.
+Token reservations run on the CPU router using the same pinned tokenizer and
+encoding as generation. The atomic database RPC still enforces current key
+ownership, RPM, and input-plus-output TPM on every request. HTTP connections are
+reused, and active base-model authorizations refresh before their existing TTL
+expires; failed refreshes evict cached permissions.
+
+Startup now exercises prefill buckets and every native decode batch size before
+readiness. This moves lazy kernel compilation out of customer requests. Engram
+fetch token counts and strides are runtime arguments instead of compilation
+specializations; GPU tests matched weights and scales byte-for-byte in 32 cases.
+
+These warm measurements include the real API-key, rate-limit, public SSE, and
+durable accounting paths through isolated qualification routers. Prompts are
+unique, approximately 45 or 750 tokens, with 256 requested output tokens and
+thinking disabled. GPU decode speed is the change in native completion count
+divided by the change in native inference time between the first and last event.
+It is measured separately from client buffering and aggregate throughput.
+
+| Concurrent streams | B200s serving requests | Requests | p95 TTFT | Per-stream GPU tokens/s median / p10 | Aggregate output tokens/s |
+| --- | --- | --- | --- | --- | --- |
+| 3 | 2 | 96 | 0.697 s | 117.5 / 108.5 | 275 |
+| 4 | 2 | 128 | 0.741 s | 115.0 / 106.3 | 358 |
+| 6 | 4 | 192 | 0.873 s | 120.0 / 104.1 | 529 |
+| 8 | 6 | 192 | 0.841 s | 120.3 / 105.3 | 718 |
+
+All rows above completed without errors. A matched A/B/B/A CPU-router comparison
+on the same warm two-B200 engine measured baseline p95 TTFT of 3.48–5.88 seconds
+versus 0.678–0.686 seconds after the admission changes, 96 measured requests per
+round. Startup and explicit benchmark warmups are recorded separately. A new or
+expired API-key authorization can still add approximately 0.7–0.9 seconds;
+cold GPU allocation, long prompts, and bursts beyond ready capacity are outside
+these warm latency results. Keep the buffer: eight streams on only two replicas
+reached 1.13-second p95 TTFT despite maintaining 117 GPU tokens/s median per stream.
+
+Reproduce public SSE measurements with `scripts/benchmark_serving_latency.py`.
+It saves warmup requests separately and labels aggregate and per-stream results.
+The [numerical evidence](../../../../benchmarks/serving_latency_20261025.json)
+includes native event counts/timestamps and the unsuccessful two-replica eight-stream
+run. The final eight-stream run used main's minimum/buffer policy, with three
+replicas already ready and an experimental cap of three replicas.
+Qwen shares local exact token reservations, immutable tokenizer revisions,
+authorization refresh, US placement, and startup generation warmup.
+
+### Earlier aggregate-throughput qualification (2026-10-25)
 
 The autoscaling campaign completed 6,808 private HTTP generation requests with
 zero errors, including cold/JIT warmup, concurrency 4–28, and live scale-out to
 two replicas. Each response requested 256 output tokens; every fourth request
 used a longer unique prompt. Representative measurements:
 
-| Target / concurrent requests | Requests | Output tokens/s | p95 first-token latency | Serving replicas |
+| Target / concurrent requests | Requests | Aggregate output tokens/s | p95 first-token latency | Serving replicas |
 | --- | --- | --- | --- | --- |
 | 12 / 10 | 360 | 764 | 0.956 s | 1 |
 | 8 / 10 | 2,304 | 817 | 0.542 s | 2 |
 | 12 / 28 | 3,559 | 1,260 | 8.115 s | 2 |
 
-Keep the target at 12 and the admission limit at 16: target 8 improved tail latency
+The earlier policy selected target 12 and admission limit 16: target 8 improved tail latency
 but added a second active replica for approximately 7% more throughput in this
 workload. Newly scaled replicas first delivered tokens after 329–380 seconds;
 the 600-second idle window avoids immediately discarding that startup investment.
-Main's buffer provides additional headroom while replicas start.
+Main's buffer provides additional headroom while replicas start. The public-path
+latency policy above supersedes that earlier concurrency choice.
 
 These synthetic runs exclude the public router and accounting path. Comparison
 windows differ in length and hardware placement, and retain startup/JIT effects;

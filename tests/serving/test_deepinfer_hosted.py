@@ -317,3 +317,54 @@ def test_bridge_maps_endpoint_discovery_failure_to_unavailable(connection, monke
     with pytest.raises(DeepInferError) as caught:
         asyncio.run(HostedDeepInfer().generate(MODEL_ID, payload, record()))
     assert caught.value.status_code == 503
+
+
+def test_disconnect_closes_only_its_response_and_other_pooled_streams_finish(connection):
+    closed = []
+
+    class ResponseStream(httpx.AsyncByteStream):
+        def __init__(self, request_id):
+            self.request_id = request_id
+
+        async def __aiter__(self):
+            for kind in ("ready", "final"):
+                yield (json.dumps({"type": kind, "request_id": self.request_id}) + "\n").encode()
+
+        async def aclose(self):
+            closed.append(self.request_id)
+
+    def handle(request):
+        request_id = json.loads(request.content)["request_id"]
+        return httpx.Response(200, stream=ResponseStream(request_id))
+
+    async def run():
+        pool = HostedDeepInfer(transport=httpx.MockTransport(handle))
+        streams = [
+            pool.stream_generate(
+                MODEL_ID,
+                OpenAIGenerateRequest(
+                    model_id=MODEL_ID,
+                    messages=body()["messages"],
+                    generation_id=identity,
+                ),
+                record(),
+            )
+            for identity in ("fsgen-one", "fsgen-two")
+        ]
+        try:
+            for stream in streams:
+                assert (await anext(stream))["type"] == "ready"
+            await streams[0].aclose()
+            assert closed == ["fsgen-one"]
+            assert (await anext(streams[1]))["type"] == "final"
+            with pytest.raises(StopAsyncIteration):
+                await anext(streams[1])
+            assert closed == ["fsgen-one", "fsgen-two"]
+            assert not pool._client.is_closed
+        finally:
+            for stream in streams:
+                await stream.aclose()
+            await pool.aclose()
+        assert pool._client.is_closed
+
+    asyncio.run(run())

@@ -57,6 +57,7 @@ def _watch_server(process):
 
 @app.function(
     gpu=GPU,
+    region="us",  # avoid intercontinental hops from the us-east serving router
     cpu=16,
     memory=524288,  # Engram host storage and loading peaked above 300 GiB in qualification.
     volumes={"/weights": weights},

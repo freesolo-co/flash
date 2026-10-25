@@ -1,11 +1,10 @@
-"""Bounded async bridge to the four cooperative DeepInfer processes."""
+"""Bounded async bridge to the cooperative DeepInfer GPU processes."""
 
 from __future__ import annotations
 
 import asyncio
 import contextlib
 import hashlib
-import importlib.util
 import json
 import multiprocessing
 import queue
@@ -13,7 +12,6 @@ import time
 import uuid
 from collections import OrderedDict
 from dataclasses import dataclass, replace
-from pathlib import Path
 
 from anyio import CancelScope
 
@@ -21,7 +19,6 @@ from flash.serve.runtime.prompt_cache import cached_prompt_tokens
 from flash.serving.deepinfer.contract.config import (
     GPU_COUNT,
     MAX_INPUTS,
-    MAX_MODEL_LEN,
     MODEL_CACHE,
     MODEL_ID,
     MODEL_REVISION,
@@ -56,20 +53,13 @@ class Runtime:
 
     def _load_assets(self):
         from huggingface_hub import snapshot_download
-        from tokenizers import Tokenizer
+
+        from flash.serving.deepinfer.contract.tokenizer import load_tokenizer
 
         self.model_path = snapshot_download(
             MODEL_ID, revision=MODEL_REVISION, cache_dir=MODEL_CACHE
         )
-        self.tokenizer = Tokenizer.from_file(str(Path(self.model_path) / "tokenizer.json"))
-        spec = importlib.util.spec_from_file_location(
-            "deepseek_1017_encoding", Path(self.model_path) / "encoding" / "encoding.py"
-        )
-        if spec is None or spec.loader is None:
-            raise RuntimeError("Pinned DeepSeek encoding module is missing")
-        module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)
-        self.encode_messages = module.encode_messages
+        self.tokenizer, self.encode_messages = load_tokenizer(self.model_path)
 
     async def start(self):
         await asyncio.to_thread(self._load_assets)
@@ -97,6 +87,9 @@ class Runtime:
                 while len(self.ready) != GPU_COUNT:
                     self.assert_healthy()
                     await asyncio.sleep(0.1)
+                from flash.serving.deepinfer.runtime.warmup import warmup
+
+                await warmup(self)
         except BaseException:
             await self.close()
             raise
@@ -201,18 +194,14 @@ class Runtime:
 
     @staticmethod
     def _validate_length(tokens, max_tokens):
-        if not tokens or len(tokens) + max_tokens + 64 > MAX_MODEL_LEN:
-            raise ValueError(
-                f"prompt plus output exceeds the {MAX_MODEL_LEN}-token serving context"
-            )
+        from flash.serving.deepinfer.contract.tokenizer import validate_length
+
+        validate_length(tokens, max_tokens)
 
     def tokenize(self, request):
-        prompt = self.encode_messages(
-            request.messages, thinking_mode="thinking" if request.thinking else "chat"
-        )
-        tokens = self.tokenizer.encode(prompt, add_special_tokens=False).ids
-        self._validate_length(tokens, request.max_tokens)
-        return tokens
+        from flash.serving.deepinfer.contract.tokenizer import encode_request
+
+        return encode_request(self.tokenizer, self.encode_messages, request)
 
     async def generate(self, request, tokens):
         self.assert_healthy()

@@ -53,6 +53,9 @@ SERVING_MODELS: list[dict[str, Any]] = [
         "image_input_limit": 4,
         "gpu": "B200",
         "engine": {
+            "tokenizer_model": "Qwen/Qwen3.5-9B",
+            "tokenizer_revision": "c202236235762e1c871ad0ccb60c8ee5ba337b9a",
+            "processor_revision": "c202236235762e1c871ad0ccb60c8ee5ba337b9a",
             # measured on B200 (2026-08-31): 132.87 GiB of KV, 7,109,793 tokens, 217x concurrency at
             # 32k with rank-128 x 16 LoRA. this tier previously ran on the L40S (48 GiB, Ada sm89),
             # the cheapest card that fit the LoRA buffer; L4 and 2xL4 OOMed in the real-GPU sweep.
@@ -85,6 +88,9 @@ SERVING_MODELS: list[dict[str, Any]] = [
         "image_input_limit": 4,
         "gpu": "B200",
         "engine": {
+            "tokenizer_model": "Qwen/Qwen3.6-35B-A3B",
+            "tokenizer_revision": "995ad96eacd98c81ed38be0c5b274b04031597b0",
+            "processor_revision": "995ad96eacd98c81ed38be0c5b274b04031597b0",
             # Load the BASE bf16 weights, NOT the FP8 checkpoint — bf16 is what lets full-expert LoRA
             # + graphs coexist (see the block comment above). serve_model_id overrides the FP8 default
             # injected by engine_overrides_for; quantization=None keeps it bf16 (no online quant).

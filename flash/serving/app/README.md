@@ -280,6 +280,13 @@ CUDA graphs, prefix caching, FP8 KV, and the persistent compilation cache remain
 The 35B keeps bf16 weights because the FP8 fused-MoE kernel cannot load full-expert LoRA.
 The vision encoder remains loaded so adapters' vision-tower keys bind.
 
+GPU replicas are placed in the US near the US East CPU router. Before readiness,
+each Qwen replica completes synthetic prefill/decode generations with isolated
+cache salts; these are not customer requests and are not billed. Text admission
+uses the same pinned processor/tokenizer and shared prompt renderer on the CPU,
+avoiding a GPU RPC just to reserve tokens. Image requests still reserve the full
+served context per output choice. Dev retains the existing scale-to-zero policy.
+
 The router accepts 64 concurrent inputs; each GPU engine accepts 8 with an autoscaling target
 of 6. The router limit is not the number of requests packed onto one GPU.
 Adapters are registered and loaded on demand, using immutable source identities and the

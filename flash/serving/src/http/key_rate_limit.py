@@ -46,6 +46,8 @@ async def admit_key(
     org_id: str,
     api_key_id: str,
     token_budget: Callable[[], Awaitable[int]] | None,
+    *,
+    token_budget_keys: dict[tuple[str, str], None] | None = None,
 ) -> None:
     url = org_url.rsplit("/", 1)[0] + "/check_serving_api_key_rate_limit"
     body: dict[str, str | int] = {"p_org_id": org_id, "p_api_key_id": api_key_id}
@@ -61,21 +63,41 @@ async def admit_key(
                 503, "serving rate limit unavailable", headers={"Retry-After": "5"}
             ) from exc
 
-    row = await check()
-    if row["requires_tokens"]:
+    async def count_tokens():
         try:
             if token_budget is None:
                 raise ValueError("missing token counter")
             tokens = await token_budget()
             if type(tokens) is not int or tokens <= 0:
                 raise ValueError("invalid token budget")
+            return tokens
         except Exception as exc:
             if isinstance(exc, HTTPException) and 400 <= exc.status_code < 500:
                 raise
             raise HTTPException(
                 503, "serving token count unavailable", headers={"Retry-After": "5"}
             ) from exc
-        body["p_tokens"] = tokens
+
+    identity = (org_id, api_key_id)
+    # Remember only that a key needed token counting, never an allowance or limit.
+    # The atomic RPC still reads current ownership, limits, and counters on EVERY request.
+    # A removed override falls back to org admission even when p_tokens is supplied.
+    if token_budget_keys is not None and identity in token_budget_keys:
+        body["p_tokens"] = await count_tokens()
+    row = await check()
+    if token_budget_keys is not None:
+        if row["tpm_limit"] is None:
+            token_budget_keys.pop(identity, None)
+        else:
+            token_budget_keys[identity] = None
+            if len(token_budget_keys) > 4096:
+                token_budget_keys.pop(next(iter(token_budget_keys)))
+    if row["requires_tokens"]:
+        if "p_tokens" in body:
+            raise HTTPException(
+                503, "serving token admission unavailable", headers={"Retry-After": "5"}
+            )
+        body["p_tokens"] = await count_tokens()
         row = await check()
         if row["requires_tokens"]:
             raise HTTPException(

@@ -448,6 +448,7 @@ def _build_engine(
     globals()[class_name] = _Engine
     engine = app.cls(
         gpu=gpu,
+        region="us",
         secrets=engine_secrets,
         volumes={HOSTING_CACHE_MOUNT: hf_cache_volume},
         scaledown_window=scaledown_window_for(gpu),
@@ -492,6 +493,24 @@ def _engine_cls_for(base_model: str) -> Any:
 class _ModalEnginePool:
     """Dispatches router calls to each base model's per-gpu-tier ``LoraEngine`` container."""
 
+    def __init__(self):
+        from flash.serving.deepinfer.app.client import HostedDeepInfer
+        from flash.serving.src.engine.router_token_budget import RouterTokenBudgets
+
+        self._deepinfer = HostedDeepInfer()
+        self._token_budgets = RouterTokenBudgets()
+
+    async def start(self):
+        from flash.serving.deepinfer.app.client import configured
+        from flash.serving.deepinfer.app.token_budget import prepare_tokenizer
+
+        await self._token_budgets.start()
+        if configured():
+            await asyncio.to_thread(prepare_tokenizer)
+
+    async def aclose(self):
+        await self._deepinfer.aclose()
+
     @staticmethod
     def _record_payload(record: Any) -> dict[str, Any]:
         from flash.serving.src.io.schemas import internal_adapter_payload
@@ -499,15 +518,13 @@ class _ModalEnginePool:
         return internal_adapter_payload(record)
 
     async def token_budget(self, base_model: str, payload: Any, record: Any) -> int:
-        from flash.serving.deepinfer.app.client import HostedDeepInfer
         from flash.serving.deepinfer.contract.config import MODEL_ID as deepseek_model
-        from flash.serving.src.io.cache_namespace import internal_generation_payload
 
         if base_model == deepseek_model:
-            return await HostedDeepInfer().token_budget(payload)
-        return await _engine_cls_for(base_model)(base_model=base_model).token_budget.remote.aio(
-            internal_generation_payload(payload), self._record_payload(record)
-        )
+            from flash.serving.deepinfer.app.token_budget import token_budget
+
+            return await token_budget(payload)
+        return await self._token_budgets.count(base_model, payload, record)
 
     async def generate(
         self,
@@ -517,11 +534,10 @@ class _ModalEnginePool:
         *,
         expected_checkpoint: str | None = None,
     ) -> dict[str, Any]:
-        from flash.serving.deepinfer.app.client import HostedDeepInfer
         from flash.serving.deepinfer.contract.config import MODEL_ID as deepseek_model
 
         if base_model == deepseek_model:
-            return await HostedDeepInfer().generate(
+            return await self._deepinfer.generate(
                 base_model, payload, record, expected_checkpoint=expected_checkpoint
             )
         from flash.serving.src.io.cache_namespace import internal_generation_payload
@@ -545,11 +561,10 @@ class _ModalEnginePool:
         *,
         expected_checkpoint: str | None = None,
     ):
-        from flash.serving.deepinfer.app.client import HostedDeepInfer
         from flash.serving.deepinfer.contract.config import MODEL_ID as deepseek_model
 
         if base_model == deepseek_model:
-            stream = HostedDeepInfer().stream_generate(
+            stream = self._deepinfer.stream_generate(
                 base_model, payload, record, expected_checkpoint=expected_checkpoint
             )
             try:
@@ -621,6 +636,7 @@ def _build_usage_outbox(settings: Any) -> Any:
 # failures are never cached, so a revoked key / drained balance is re-checked within at most the TTL.
 # Hardcoded (no deploy-time knobs), consistent with src/settings.py.
 _AUTH_CACHE_TTL_SECONDS = 60.0
+_AUTH_CACHE_REFRESH_SECONDS = 10.0
 _AUTH_CACHE_MAX_ENTRIES = 4096
 
 
@@ -760,6 +776,9 @@ def _build_chat_authorizer(settings: Any) -> Any:
     ) -> "AuthorizedTraffic":
         try:
             authorization = await _authorize_backend(api_key, model_id, scope)
+        except BaseException:
+            _cache.pop(ck, None)
+            raise
         finally:
             # Drop the single-flight slot regardless of outcome so a failed lookup re-checks next
             # time (failures are never cached) and a success can be re-driven once the cache expires.
@@ -769,6 +788,14 @@ def _build_chat_authorizer(settings: Any) -> Any:
         _cache[ck] = (now + _AUTH_CACHE_TTL_SECONDS, authorization)
         _prune(now)
         return authorization
+
+    def refresh(ck, api_key, model_id, scope):
+        task = _inflight.get(ck)
+        if task is None:
+            task = asyncio.ensure_future(_authorize_and_cache(ck, api_key, model_id, scope))
+            task.add_done_callback(lambda t: t.cancelled() or t.exception())
+            _inflight[ck] = task
+        return task
 
     async def authorize(
         api_key: str, model_id: str, scope: "dict[str, str] | None" = None
@@ -792,18 +819,22 @@ def _build_chat_authorizer(settings: Any) -> Any:
         now = time.monotonic()
         if cached is not None:
             if cached[0] > now:
+                # Refresh active keys before expiry, but never serve past the original TTL
+                # unless the backend has approved them again. Failures evict the old ALLOW.
+                if cached[0] - now <= _AUTH_CACHE_REFRESH_SECONDS:
+                    refresh(ck, api_key, model_id, scope)
                 return cached[1]
             _cache.pop(ck, None)
-        task = _inflight.get(ck)
-        if task is None:
-            task = asyncio.ensure_future(_authorize_and_cache(ck, api_key, model_id, scope))
-            # Retrieve the task's outcome even if every awaiter is cancelled (all identical clients
-            # disconnect), so an orphaned single-flight failure doesn't warn "exception never retrieved".
-            task.add_done_callback(lambda t: t.cancelled() or t.exception())
-            _inflight[ck] = task
-        return await asyncio.shield(task)
+        return await asyncio.shield(refresh(ck, api_key, model_id, scope))
 
-    authorize.aclose = _client.aclose
+    async def close():
+        tasks = list(_inflight.values())
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        await _client.aclose()
+
+    authorize.aclose = close
     return authorize
 
 
@@ -834,6 +865,7 @@ def _base_model_records() -> list:
 
 @app.function(
     secrets=runtime_secrets,
+    region="us-east",  # keep admission, private HTTP dispatch, and serving ingress nearby
     min_containers=1,  # one warm CPU front door (hardcoded; no deploy-time knob)
     buffer_containers=BUFFER_CONTAINERS,  # scales out with the engines; see BUFFER_CONTAINERS
     timeout=ROUTER_TIMEOUT_SECONDS,  # must cover engine cold start (see ROUTER_TIMEOUT_SECONDS)

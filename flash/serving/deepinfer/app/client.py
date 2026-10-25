@@ -56,7 +56,16 @@ def configured():
 
 class HostedDeepInfer:
     def __init__(self, *, transport=None):
-        self.transport = transport
+        self._client = httpx.AsyncClient(
+            timeout=httpx.Timeout(STARTUP_SECONDS + REQUEST_SECONDS, connect=30),
+            transport=transport,
+            follow_redirects=True,
+            max_redirects=32,
+            event_hooks={"response": [_check_redirect]},
+        )
+
+    async def aclose(self):
+        await self._client.aclose()
 
     async def token_budget(self, payload):
         if not configured():
@@ -66,36 +75,29 @@ class HostedDeepInfer:
             "Modal-Secret": os.environ["DEEPINFER_PROXY_SECRET"],
         }
         url = await asyncio.wait_for(asyncio.to_thread(endpoint_url), timeout=30)
-        async with httpx.AsyncClient(
-            timeout=httpx.Timeout(STARTUP_SECONDS + REQUEST_SECONDS, connect=30),
-            transport=self.transport,
-            follow_redirects=True,
-            max_redirects=32,
-            event_hooks={"response": [_check_redirect]},
-        ) as client:
-            response = await client.post(
-                url + "/internal/token-budget",
-                headers=headers,
-                json=chat_body(payload.model_dump()),
-            )
-            if response.status_code in {400, 422}:
-                try:
-                    detail = response.json()["detail"]
-                    if not isinstance(detail, str) or not detail:
-                        raise ValueError("missing validation detail")
-                except (ValueError, KeyError, TypeError) as exc:
-                    raise DeepInferError(
-                        503, "DeepInfer returned malformed validation feedback"
-                    ) from exc
-                raise DeepInferError(response.status_code, detail)
-            response.raise_for_status()
+        response = await self._client.post(
+            url + "/internal/token-budget",
+            headers=headers,
+            json=chat_body(payload.model_dump()),
+        )
+        if response.status_code in {400, 422}:
             try:
-                tokens = response.json()["tokens"]
-                if type(tokens) is not int or tokens <= 0:
-                    raise ValueError("invalid token budget")
+                detail = response.json()["detail"]
+                if not isinstance(detail, str) or not detail:
+                    raise ValueError("missing validation detail")
             except (ValueError, KeyError, TypeError) as exc:
-                raise DeepInferError(503, "DeepInfer returned an invalid token budget") from exc
-            return tokens
+                raise DeepInferError(
+                    503, "DeepInfer returned malformed validation feedback"
+                ) from exc
+            raise DeepInferError(response.status_code, detail)
+        response.raise_for_status()
+        try:
+            tokens = response.json()["tokens"]
+            if type(tokens) is not int or tokens <= 0:
+                raise ValueError("invalid token budget")
+        except (ValueError, KeyError, TypeError) as exc:
+            raise DeepInferError(503, "DeepInfer returned an invalid token budget") from exc
+        return tokens
 
     async def stream_generate(self, base_model, payload, record, *, expected_checkpoint=None):
         if base_model != MODEL_ID or not record.serve_base_model:
@@ -116,20 +118,12 @@ class HostedDeepInfer:
         except Exception as exc:
             raise DeepInferError(503, "DeepInfer endpoint discovery failed") from exc
         url += "/internal/generate"
-        timeout = httpx.Timeout(STARTUP_SECONDS + REQUEST_SECONDS, connect=30)
         terminal = False
         try:
-            # Closing this context on disconnect aborts only this HTTP request.
+            # A disconnect closes only this response; other streams keep their pooled connections.
             async with (
                 asyncio.timeout(STARTUP_SECONDS + REQUEST_SECONDS),
-                httpx.AsyncClient(
-                    timeout=timeout,
-                    transport=self.transport,
-                    follow_redirects=True,
-                    max_redirects=32,
-                    event_hooks={"response": [_check_redirect]},
-                ) as client,
-                client.stream(
+                self._client.stream(
                     "POST",
                     url,
                     headers=headers,

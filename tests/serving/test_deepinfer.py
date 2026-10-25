@@ -332,7 +332,8 @@ def test_modal_private_two_gpu_autoscaling_contract(monkeypatch, environment, wa
     assert captured["function"]["max_containers"] == (6 if environment == "main" else 4)
     assert captured["function"]["buffer_containers"] == (1 if environment == "main" else 0)
     assert captured["function"]["scaledown_window"] == 600
-    assert captured["concurrent"] == {"max_inputs": 16, "target_inputs": 12}
+    assert captured["concurrent"] == {"max_inputs": 4, "target_inputs": 3}
+    assert captured["function"]["region"] == "us"
     assert captured["web"]["requires_proxy_auth"] is True
     assert captured["build_commands"][-1] == (
         f"{config.RUNTIME_PYTHON} -m flash.serving.deepinfer.native.image"

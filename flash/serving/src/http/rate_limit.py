@@ -33,6 +33,7 @@ class SupabaseRateLimiter:
     def __init__(self, settings: Settings) -> None:
         if not settings.supabase_url:
             raise RuntimeError("Missing SUPABASE_URL for serving rate limits")
+        self._token_budget_keys: dict[tuple[str, str], None] = {}
         self._url = supabase_table_url(settings, "rpc/check_serving_rate_limit")
         self._client = httpx.AsyncClient(headers=supabase_headers(settings, "public"), timeout=5.0)
 
@@ -46,7 +47,14 @@ class SupabaseRateLimiter:
         if api_key_id is not None:
             from flash.serving.src.http.key_rate_limit import admit_key
 
-            await admit_key(self._client, self._url, org_id, api_key_id, token_budget)
+            await admit_key(
+                self._client,
+                self._url,
+                org_id,
+                api_key_id,
+                token_budget,
+                token_budget_keys=self._token_budget_keys,
+            )
             return
         # Never cache or single-flight admission, even when authorization itself is cached.
         # Do not retry ambiguous RPC failures: the database may already have counted the request.

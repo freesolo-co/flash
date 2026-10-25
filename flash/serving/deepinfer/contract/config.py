@@ -18,8 +18,10 @@ PREFILL_TOKENS = 4096
 PREFILL_ANY_INTERVAL = 8
 DELIVERY_TOKENS = 16
 DELIVERY_SECONDS = 0.05
-MAX_INPUTS = GPU_COUNT * SEQUENCES_PER_RANK
-TARGET_INPUTS = MAX_INPUTS * 3 // 4
+# Keep each stream above 100 decode tokens/s instead of filling all native slots.
+# The native scheduler retains headroom for cache affinity and startup qualification.
+MAX_INPUTS = 4
+TARGET_INPUTS = 3
 # Only the explicitly selected main environment keeps one EP=2 replica warm.
 MAIN_MIN_CONTAINERS = 1
 MAIN_MAX_CONTAINERS = 6

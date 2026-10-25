@@ -797,6 +797,13 @@ def _load_engine_and_args(
 
     monkeypatch.setattr(vllm.AsyncLLMEngine, "from_engine_args", staticmethod(_capture))
 
+    async def warmup(native_engine, tokenizer, max_sequences):
+        assert native_engine.engine_args is captured["args"]
+        assert tokenizer is fake_tok
+        assert max_sequences == 8
+
+    monkeypatch.setattr("flash.serving.src.engine.warmup.warmup", warmup)
+
     engine = object.__new__(engine_type or modal_app_module._LoraEngineImpl)
     engine.base_model = base_model
     asyncio.run(engine._load())

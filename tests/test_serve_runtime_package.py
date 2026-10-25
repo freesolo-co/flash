@@ -55,6 +55,7 @@ def test_serve_runtime_extra_is_independent_and_pinned() -> None:
         "huggingface-hub>=1.2.0",
         "safetensors>=0.8,<1",
         "pillow>=11.0.0",
+        "tokenizers>=0.22",
         TRANSFORMERS_REQUIREMENT,
         "vllm==0.23.0",
     ]
