@@ -206,6 +206,13 @@ async def test_rank_assignment_and_cancel_are_request_scoped(namespace, prefix_t
     initial_loads = [1] * config.GPU_COUNT
     initial_loads[idle] = 0
     runtime.loads = initial_loads.copy()
+    if namespace and prefix_tokens:
+        from flash.serving.deepinfer.runtime.routing import fingerprint
+
+        runtime.cache_router.update(
+            affinity,
+            [{"namespace": namespace, "length": 128, "digest": fingerprint(tokens[:128])}],
+        )
     rank = affinity if prefix_tokens else idle
     request = replace(parse_request(body()), cache_namespace=namespace, prefix_tokens=prefix_tokens)
     generator = runtime.generate(request, tokens)

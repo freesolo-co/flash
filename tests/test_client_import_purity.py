@@ -33,6 +33,9 @@ SERVER_ONLY_PREFIXES = (
     "flash.serve.deployment.deploy",
     "flash.serve.deployment.export",
     "flash.serve.deployment.preflight",
+    # Loaded by vLLM's scheduler_cls hook inside EngineCore, never by the SDK.
+    "flash.serve.runtime.cache_scheduler",
+    "flash.serve.runtime.cache_retention",
     # The serving app runs only inside the GPU container built from Dockerfile.serve, which
     # installs the `serving` extra (modal, orjson, pydantic-settings) plus vLLM. Nothing a client
     # imports reaches it, so its fastapi/pydantic/PIL imports stay at module scope.

@@ -197,6 +197,26 @@ Explicitly warm one development model without changing the zero floor:
 uv run modal run --env dev flash/serving/app/modal_app.py --base-model Qwen/Qwen3.5-9B
 ```
 
+### Qwen prefix-cache scheduling
+
+Hosted and packaged Qwen engines use the qualified vLLM 0.23.0 scheduler extension.
+Within the native FCFS waiting queue, a cached request can pass a more expensive
+prefill among the first sixteen arrivals. A head waiting at least 250 ms is not
+bypassed, and a tracked head gets at most two bypasses. Native admission still
+validates availability; running requests, priority scheduling, and preemptions
+retain their native behavior. The extension follows vLLM's resolved synchronous
+or asynchronous scheduler setting. This changes admission within one engine;
+Modal still selects replicas, without prefix-aware cross-replica placement.
+Authenticated organization namespaces remain part of vLLM's cache identity,
+alongside its native adapter and multimodal identity handling.
+
+Idle GPU blocks that served a prefix hit receive bounded, decaying reuse credits.
+Eviction can rotate them behind colder free blocks, with at most 32 inspections
+per allocation. Credits halve each minute and are discarded when a block is
+allocated to new work. The native pool retains ownership of hashes, references,
+and all KV/state layouts. No block is pinned; even a fully hot cache can allocate.
+These settings are fixed in code and require no environment variables.
+
 ### No autoscaling or vLLM perf knobs
 
 There are **no env knobs for autoscaling or vLLM/engine performance**. An optimization either exists

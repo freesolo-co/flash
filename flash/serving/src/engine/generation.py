@@ -58,11 +58,15 @@ _OPENAI_FIELDS = frozenset(
 
 
 def _payload(payload_dict: dict[str, Any]) -> tuple[OpenAIGenerateRequest, bool]:
-    is_openai = bool(_OPENAI_FIELDS & payload_dict.keys())
-    if is_openai:
-        return OpenAIGenerateRequest.model_validate(payload_dict), True
-    raw = GenerateRequest.model_validate(payload_dict)
-    return OpenAIGenerateRequest.model_validate(raw.model_dump()), False
+    from flash.serving.src.io.cache_namespace import split_cache_namespace
+
+    data, namespace = split_cache_namespace(payload_dict)
+    is_openai = bool(_OPENAI_FIELDS & data.keys())
+    if not is_openai:
+        data = GenerateRequest.model_validate(data).model_dump()
+    payload = OpenAIGenerateRequest.model_validate(data)
+    payload._cache_namespace = namespace
+    return payload, is_openai
 
 
 def _sampling_params(payload: OpenAIGenerateRequest, structured: Any, output_kind: Any) -> Any:
@@ -231,6 +235,8 @@ async def generate(
     start = time.monotonic()
     final_output = None
     prompt_input = await owner._prepare_prompt_input(payload, thinking)
+    if payload._cache_namespace is not None:
+        prompt_input["cache_salt"] = payload._cache_namespace
     try:
         async for output in owner.engine.generate(
             prompt_input,
@@ -445,6 +451,8 @@ async def stream_generate(
     request_id = generation_id or payload.generation_id or f"fsgen-{uuid.uuid4().hex}"
     start = time.monotonic()
     prompt_input = await owner._prepare_prompt_input(payload, thinking)
+    if payload._cache_namespace is not None:
+        prompt_input["cache_salt"] = payload._cache_namespace
     # the new interval starts at engine submission, excluding prompt and image preparation.
     first_output_started = time.perf_counter()
     output_stream = None
