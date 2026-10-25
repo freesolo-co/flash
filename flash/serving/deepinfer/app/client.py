@@ -14,6 +14,7 @@ from flash.serving.deepinfer.contract.config import (
     MODEL_ID,
     REQUEST_SECONDS,
     STARTUP_SECONDS,
+    STREAM_IDLE_SECONDS,
 )
 from flash.serving.deepinfer.contract.errors import DeepInferError
 
@@ -52,6 +53,25 @@ def configured():
     if any(values) and not all(values):
         raise ValueError("DeepInfer requires both Modal proxy credentials")
     return all(values)
+
+
+async def _stream_lines(response, deadline):
+    # The consumer may hand this iterator to another task after its first event.
+    # Keep each timeout inside one anext(), never open across a yield.
+    loop = asyncio.get_running_loop()
+    lines = response.aiter_lines()
+    try:
+        while True:
+            if loop.time() >= deadline:
+                raise TimeoutError("DeepInfer stream deadline exceeded")
+            async with asyncio.timeout_at(min(deadline, loop.time() + STREAM_IDLE_SECONDS)):
+                try:
+                    line = await anext(lines)
+                except StopAsyncIteration:
+                    return
+            yield line
+    finally:
+        await lines.aclose()
 
 
 class HostedDeepInfer:
@@ -121,11 +141,11 @@ class HostedDeepInfer:
             raise DeepInferError(503, "DeepInfer endpoint discovery failed") from exc
         url += "/internal/generate"
         terminal = False
+        deadline = asyncio.get_running_loop().time() + STARTUP_SECONDS + REQUEST_SECONDS
         try:
             # A disconnect closes only this response; other streams keep their pooled connections.
-            async with (
-                asyncio.timeout(STARTUP_SECONDS + REQUEST_SECONDS),
-                self._client.stream(
+            async with asyncio.timeout_at(deadline):
+                request = self._client.build_request(
                     "POST",
                     url,
                     headers=headers,
@@ -134,12 +154,13 @@ class HostedDeepInfer:
                         "request_id": payload.generation_id,
                         "cache_namespace": getattr(payload, "_cache_namespace", None),
                     },
-                ) as response,
-            ):
+                )
+                response = await self._client.send(request, stream=True)
+            try:
                 if response.status_code != 200:
                     code = response.status_code if response.status_code in {400, 422, 429} else 503
                     raise DeepInferError(code, "DeepInfer backend rejected the request")
-                async for line in response.aiter_lines():
+                async for line in _stream_lines(response, deadline):
                     if not line:
                         continue
                     if line.startswith(":"):
@@ -157,6 +178,8 @@ class HostedDeepInfer:
                     yield event
                 if not terminal:
                     raise DeepInferError(502, "DeepInfer stream ended before completion")
+            finally:
+                await response.aclose()
         except (httpx.HTTPError, ValueError, TimeoutError) as exc:
             raise DeepInferError(502, "DeepInfer backend transport failed") from exc
 

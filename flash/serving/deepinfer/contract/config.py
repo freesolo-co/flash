@@ -34,4 +34,5 @@ STARTUP_SECONDS = 2700
 # prefill and rate variation while retaining a finite generation deadline.
 REQUEST_SECONDS = 7200
 WORKER_STALL_SECONDS = 600
+STREAM_IDLE_SECONDS = 60
 PORT = 8000

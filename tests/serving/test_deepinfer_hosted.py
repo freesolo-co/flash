@@ -371,3 +371,49 @@ def test_disconnect_closes_only_its_response_and_other_pooled_streams_finish(con
         assert pool._client.is_closed
 
     asyncio.run(run())
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("expired_total", [False, True])
+async def test_stream_deadlines_close_response_after_task_handoff(
+    connection, monkeypatch, expired_total
+):
+    from flash.serving.deepinfer.app import client as bridge
+
+    closed = asyncio.Event()
+    loop = asyncio.get_running_loop()
+    clock = loop.time
+    elapsed = 0
+    monkeypatch.setattr(loop, "time", lambda: clock() + elapsed)
+    monkeypatch.setattr(bridge, "STREAM_IDLE_SECONDS", 0.01)
+
+    class StalledResponse(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            yield b'data: {"type":"ready","request_id":"fsgen-stalled"}\n\n'
+            await asyncio.Event().wait()
+
+        async def aclose(self):
+            closed.set()
+
+    async def handler(request):
+        return httpx.Response(200, stream=StalledResponse())
+
+    pool = HostedDeepInfer(transport=httpx.MockTransport(handler))
+    payload = OpenAIGenerateRequest(
+        model_id=MODEL_ID,
+        messages=[{"role": "user", "content": "hello"}],
+        generation_id="fsgen-stalled",
+    )
+    events = pool.stream_generate(MODEL_ID, payload, record())
+    try:
+        first = await asyncio.create_task(anext(events))
+        assert first["type"] == "ready"
+        if expired_total:
+            elapsed = bridge.STARTUP_SECONDS + bridge.REQUEST_SECONDS + 1
+        with pytest.raises(DeepInferError, match="transport failed"):
+            await asyncio.wait_for(asyncio.create_task(anext(events)), timeout=1)
+        assert closed.is_set()
+    finally:
+        elapsed = 0
+        await events.aclose()
+        await pool.aclose()

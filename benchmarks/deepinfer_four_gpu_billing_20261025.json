@@ -1,0 +1,21 @@
+{
+  "delivered_requests_reconciled": 2903,
+  "client_usage_records_matched": 2899,
+  "duplicates": 0,
+  "total_exact_cost_micro_usd": 14245553,
+  "ledger_and_balance_debit_cents": 1425,
+  "fractional_carry_delta_micro_usd": -4447,
+  "price_snapshots_and_token_counts_match": true,
+  "interrupted_request": {
+    "state": "quarantined",
+    "reason": "client_disconnected",
+    "usage_charge_created": false,
+    "generation_lease_released": true,
+    "known_partial_completion_tokens": 188,
+    "note": "The direct CPU router test was aborted after a verified stream stall. No successful performance claim includes this run."
+  },
+  "key_limits": {
+    "requests_per_minute": 10000,
+    "tokens_per_minute": 30000000
+  }
+}
