@@ -261,7 +261,7 @@ def test_context_budget_includes_output_and_native_reserve():
 
 
 def test_native_image_patch_rejects_unknown_source():
-    from scripts.prepare_deepinfer_image import patch_indexer
+    from flash.serving.deepinfer.native.image import patch_indexer
 
     with pytest.raises(RuntimeError, match="pinned release"):
         patch_indexer("unexpected upstream release")
@@ -280,10 +280,6 @@ def test_modal_private_two_gpu_autoscaling_contract(monkeypatch):
             return self
 
         def add_local_python_source(self, *a, **kw):
-            return self
-
-        def add_local_file(self, path, **kwargs):
-            captured["build_script"] = (path, kwargs)
             return self
 
         def run_commands(self, *a, **kw):
@@ -327,11 +323,9 @@ def test_modal_private_two_gpu_autoscaling_contract(monkeypatch):
     assert captured["function"]["scaledown_window"] == 600
     assert captured["concurrent"] == {"max_inputs": 16, "target_inputs": 12}
     assert captured["web"]["requires_proxy_auth"] is True
-    script, options = captured["build_script"]
-    assert script.is_file()
-    assert script.name == "prepare_deepinfer_image.py"
-    assert options == {"remote_path": "/root/prepare_deepinfer_image.py", "copy": True}
-    assert captured["build_commands"][-1].endswith(" /root/prepare_deepinfer_image.py")
+    assert captured["build_commands"][-1] == (
+        f"{config.RUNTIME_PYTHON} -m flash.serving.deepinfer.native.image"
+    )
     process = object()
 
     def launch(command):

@@ -5,7 +5,6 @@ from __future__ import annotations
 import os
 import subprocess
 import threading
-from pathlib import Path
 
 import modal
 
@@ -37,14 +36,9 @@ image = (
         }
     )
     .add_local_python_source("flash", copy=True)
-    .add_local_file(
-        Path(__file__).resolve().parents[4] / "scripts" / "prepare_deepinfer_image.py",
-        remote_path="/root/prepare_deepinfer_image.py",
-        copy=True,
-    )
     .run_commands(
         f"{RUNTIME_PYTHON} -m pip install fastapi==0.141.1 uvicorn==0.52.0",
-        f"{RUNTIME_PYTHON} /root/prepare_deepinfer_image.py",
+        f"{RUNTIME_PYTHON} -m flash.serving.deepinfer.native.image",
     )
 )
 app = modal.App(APP_NAME, image=image)

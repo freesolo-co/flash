@@ -78,7 +78,7 @@ because retention requires 128 prefix tokens plus two uncached tokens.
 The two-B200 native FP4 configuration above completed 271 generation requests,
 including 24 quality cases (23 correct), a 30,303-token input, and concurrency up
 to 16, with zero request errors. It used 512 GiB of host RAM for mapped Engram
-storage and loading. See the [two-B200 qualification summary](../../../../scripts/benchmarks/deepinfer_precision/results/two-b200.json).
+storage and loading.
 
 A separate capacity campaign measured 15,261 aggregate output tokens/s over ten
 one-minute load windows and 168.7 requests/s for 32-token responses. Those runs
