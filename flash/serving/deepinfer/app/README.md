@@ -24,8 +24,10 @@ retain their separate vLLM images and capacity.
 | Idle scale-down | 600 seconds; main retains its minimum, dev scales to zero |
 
 Each environment is capped at one four-GPU group. Admission above ready capacity
-may receive a retryable capacity error. A warm minimum does not make a new
-container's startup instantaneous. A failed worker retires its entire group;
+may receive a retryable capacity error. After scale-to-zero, an authenticated
+request triggers startup and receives 503 until the server is ready. The hard
+one-container cap also leaves no spare GPU group for a rolling replacement.
+A warm minimum does not make a new container's startup instantaneous. A failed worker retires its entire group;
 ordinary request cancellation aborts only that sequence and releases its slot
 after acknowledgment.
 

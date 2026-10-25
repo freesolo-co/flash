@@ -113,3 +113,26 @@ def test_thread_friendly_tokenizer_preserves_exact_single_sequence_ids(content):
     request = parse_request(body(messages=[{"role": "user", "content": content}]))
     actual = encode_request(tokenizer, lambda *a, **k: content, request)
     assert actual == tokenizer.encode(content, add_special_tokens=False).ids
+
+
+@pytest.mark.parametrize(
+    ("input_tokens", "output_tokens", "valid"),
+    [
+        (698512, 350000, True),
+        (698513, 350000, False),
+        (1048511, 1, True),
+        (1048512, 1, False),
+    ],
+)
+def test_million_token_capacity_reserves_space_for_requested_output(
+    input_tokens, output_tokens, valid
+):
+    from flash.serving.deepinfer.contract.tokenizer import validate_length
+
+    request = parse_request(body(max_tokens=output_tokens))
+    tokens = range(input_tokens)
+    if valid:
+        validate_length(tokens, request.max_tokens)
+    else:
+        with pytest.raises(ValueError, match="serving context"):
+            validate_length(tokens, request.max_tokens)
