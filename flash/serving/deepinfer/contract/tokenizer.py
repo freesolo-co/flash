@@ -25,12 +25,23 @@ def validate_length(tokens, max_tokens):
         raise ValueError(f"prompt plus output exceeds the {MAX_MODEL_LEN}-token serving context")
 
 
-def encode_request(tokenizer, encode_messages, request):
+def encode_request(tokenizer, encode_messages, request, *, prefix_cache=None):
     prompt = encode_messages(
         request.messages, thinking_mode="thinking" if request.thinking else "chat"
     )
     # The single-sequence Rust binding holds the GIL even in a worker thread.
     # A one-item batch releases it without changing rendering or token boundaries.
-    tokens = tokenizer.encode_batch([prompt], add_special_tokens=False)[0].ids
+    tokens = (
+        prefix_cache.encode(prompt, request.cache_namespace)
+        if prefix_cache is not None
+        else tokenizer.encode_batch([prompt], add_special_tokens=False)[0].ids
+    )
     validate_length(tokens, request.max_tokens)
     return tokens
+
+
+def make_prefix_cache(tokenizer):
+    from flash.serve.runtime.token_prefix_cache import TokenPrefixCache
+
+    marker = "<\uff5cUser\uff5c>"
+    return TokenPrefixCache(tokenizer, marker, marker)

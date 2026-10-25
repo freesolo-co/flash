@@ -158,7 +158,9 @@ class ServingContext:
             if not has_image_blocks(getattr(payload, "messages", None)):
                 await _prepare_generate_request(payload, target)
             try:
-                return await self.pool.token_budget(target.base_model, payload, target)
+                return await self.pool.token_budget(
+                    target.base_model, bind_cache_namespace(payload, traffic), target
+                )
             except Exception as exc:
                 failure = engine_error_http(self.router, target.model_id, exc)
                 if failure is not None and 400 <= failure.status_code < 500:

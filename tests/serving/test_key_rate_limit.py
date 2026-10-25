@@ -1,6 +1,7 @@
 """Key identity, concurrent-safe admission contract, and exact text token reservations."""
 
 import asyncio
+import hashlib
 import json
 from types import SimpleNamespace
 
@@ -58,6 +59,9 @@ def test_key_tpm_rejects_before_generation_on_all_routes(path, payload, limiter_
     class Pool(FakePool):
         async def token_budget(self, base, req, target):
             assert base == BASE
+            assert (
+                req._cache_namespace == hashlib.sha256(("freesolo_org:" + ORG).encode()).hexdigest()
+            )
             return 300
 
     pool = Pool()

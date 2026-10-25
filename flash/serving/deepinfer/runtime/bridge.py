@@ -44,6 +44,7 @@ class Runtime:
     def __init__(self):
         self.processes = []
         self.prompt_cache = OrderedDict()
+        self.token_prefix_cache = None
         self.pending: dict[str, Pending] = {}
         self.loads = [0] * RANK_COUNT
         self.ready: set[int] = set()
@@ -55,12 +56,13 @@ class Runtime:
     def _load_assets(self):
         from huggingface_hub import snapshot_download
 
-        from flash.serving.deepinfer.contract.tokenizer import load_tokenizer
+        from flash.serving.deepinfer.contract.tokenizer import load_tokenizer, make_prefix_cache
 
         self.model_path = snapshot_download(
             MODEL_ID, revision=MODEL_REVISION, cache_dir=MODEL_CACHE
         )
         self.tokenizer, self.encode_messages = load_tokenizer(self.model_path)
+        self.token_prefix_cache = make_prefix_cache(self.tokenizer)
 
     async def start(self):
         await asyncio.to_thread(self._load_assets)
@@ -202,7 +204,9 @@ class Runtime:
     def tokenize(self, request):
         from flash.serving.deepinfer.contract.tokenizer import encode_request
 
-        return encode_request(self.tokenizer, self.encode_messages, request)
+        return encode_request(
+            self.tokenizer, self.encode_messages, request, prefix_cache=self.token_prefix_cache
+        )
 
     async def generate(self, request, tokens):
         self.assert_healthy()

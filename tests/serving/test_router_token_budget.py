@@ -78,3 +78,60 @@ async def test_router_image_reservation_never_fetches_or_tokenizes_pixels():
         model_id=BASE, repo_id=BASE, base_model=BASE, serve_base_model=True, thinking=False
     )
     assert await budgets.count(BASE, payload, record) == 32768 * 2
+
+
+@pytest.mark.anyio
+async def test_cached_qwen_text_reservation_matches_generation_and_keeps_tenant_scope():
+    from tokenizers import AddedToken
+
+    from tests.serving.test_token_prefix_cache import tokenizer
+
+    raw = tokenizer()
+    raw.add_tokens([AddedToken("<|im_start|>", normalized=False, special=True)])
+
+    class ChatTokenizer:
+        backend_tokenizer = raw
+
+        def apply_chat_template(self, messages, *, tokenize, **kwargs):
+            rendered = (
+                "".join(
+                    "<|im_start|>" + msg["role"] + "\n" + msg["content"] + "\n" for msg in messages
+                )
+                + "<|im_start|>assistant\n"
+            )
+            if not tokenize:
+                return rendered
+            ids = raw.encode(rendered, add_special_tokens=False).ids
+            maximum = kwargs.get("tokenizer_kwargs", {}).get("max_length")
+            return ids[:maximum] if maximum is not None else ids
+
+    owner = TextPromptTokenizer()
+    owner.base_model = BASE
+    owner.tokenizer = ChatTokenizer()
+    budgets = RouterTokenBudgets()
+    budgets._owners[BASE] = owner
+    record = AdapterRecord(
+        model_id=BASE, repo_id=BASE, base_model=BASE, serve_base_model=True, thinking=False
+    )
+    payload = OpenAIGenerateRequest(
+        model_id=BASE,
+        messages=[
+            {"role": "system", "content": "hello world " * 200},
+            {"role": "user", "content": "first question"},
+        ],
+        max_tokens=10,
+        n=2,
+        temperature=0.8,
+    )
+    for namespace, question in [("a" * 64, "first"), ("a" * 64, "next"), ("b" * 64, "next")]:
+        payload._cache_namespace = namespace
+        payload.messages[-1]["content"] = question
+        expected = owner.tokenizer.apply_chat_template(payload.messages, tokenize=True)
+        assert await budgets.count(BASE, payload, record) == len(expected) + 20
+        assert (await owner._prompt_input(payload, False))["prompt_token_ids"] == expected
+    assert {key[0] for key in owner._text_prefix_cache.entries} == {"a" * 64, "b" * 64}
+
+    payload.chat_template_kwargs = {"tokenizer_kwargs": {"max_length": 2}}
+    assert await budgets.count(BASE, payload, record) == 22
+    assert len((await owner._prompt_input(payload, False))["prompt_token_ids"]) == 2
+    assert owner._text_prefix_cache.tokenizer is not raw

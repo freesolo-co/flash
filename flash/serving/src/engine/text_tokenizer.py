@@ -115,6 +115,25 @@ class TextPromptTokenizer:
         )
         return {"prompt_token_ids": prompt_token_ids}
 
+    def _token_prefix_cache(self):
+        # Owners keep an immutable, pinned tokenizer for their lifetime. Construct
+        # lazily so non-fast tokenizers keep the full path. The clone isolates
+        # cached encoding from per-call padding/truncation in Transformers.
+        if not hasattr(self, "_text_prefix_cache"):
+            from tokenizers import Tokenizer
+
+            from flash.serve.runtime.token_prefix_cache import TokenPrefixCache
+
+            backend = getattr(self.tokenizer, "backend_tokenizer", None)
+            self._text_prefix_cache = (
+                TokenPrefixCache(
+                    Tokenizer.from_str(backend.to_str()), "<|im_start|>user\n", "<|im_start|>"
+                )
+                if isinstance(backend, Tokenizer)
+                else None
+            )
+        return self._text_prefix_cache
+
     def _tokenize_prompt(self, payload: Any, thinking_default: bool | None = None) -> list[int]:
         if payload.messages:
             # Forward sanitized chat_template_kwargs, but force enable_thinking from the adapter's
@@ -122,6 +141,21 @@ class TextPromptTokenizer:
             # with. Reserved/return-shape kwargs are dropped before rendering to avoid 500s.
             ctk = self._effective_chat_template_kwargs(payload, thinking_default)
             try:
+                cache = self._token_prefix_cache()
+                namespace = getattr(payload, "_cache_namespace", None)
+                if (
+                    cache is not None
+                    and cache.supported
+                    and namespace
+                    and "tokenizer_kwargs" not in ctk
+                ):
+                    prompt = self.tokenizer.apply_chat_template(
+                        messages_for_chat_template(detached_template_messages(payload.messages)),
+                        tokenize=False,
+                        add_generation_prompt=True,
+                        **ctk,
+                    )
+                    return cache.encode(prompt, namespace)
                 prompt_token_ids = self.tokenizer.apply_chat_template(
                     messages_for_chat_template(detached_template_messages(payload.messages)),
                     tokenize=True,

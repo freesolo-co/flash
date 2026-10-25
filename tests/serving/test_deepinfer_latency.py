@@ -35,7 +35,7 @@ async def test_local_admission_uses_native_encoding_and_exact_output_reservation
             assert not add_special_tokens
             return [SimpleNamespace(ids=[3, 4, 5])]
 
-    monkeypatch.setattr(budget, "prepare_tokenizer", lambda: (Tokenizer(), encode))
+    monkeypatch.setattr(budget, "prepare_tokenizer", lambda: (Tokenizer(), encode, None))
     data = body(max_tokens=77, chat_template_kwargs={"enable_thinking": thinking})
     parsed = parse_request(data)
     payload = SimpleNamespace(model_dump=lambda: {**data, "model_id": MODEL_ID})
@@ -49,7 +49,9 @@ async def test_local_admission_rejects_over_context_before_gpu_dispatch(monkeypa
     tokenizer = SimpleNamespace(
         encode_batch=lambda *a, **k: [SimpleNamespace(ids=[1] * (MAX_MODEL_LEN - 68))]
     )
-    monkeypatch.setattr(budget, "prepare_tokenizer", lambda: (tokenizer, lambda *a, **k: "prompt"))
+    monkeypatch.setattr(
+        budget, "prepare_tokenizer", lambda: (tokenizer, lambda *a, **k: "prompt", None)
+    )
     payload = SimpleNamespace(model_dump=lambda: {**body(max_tokens=64), "model_id": MODEL_ID})
     with pytest.raises(DeepInferError, match="context") as exc:
         await budget.token_budget(payload)
@@ -136,3 +138,23 @@ def test_million_token_capacity_reserves_space_for_requested_output(
     else:
         with pytest.raises(ValueError, match="serving context"):
             validate_length(tokens, request.max_tokens)
+
+
+@pytest.mark.anyio
+async def test_deepinfer_admission_binds_token_prefix_cache_to_authenticated_namespace(monkeypatch):
+    seen = []
+
+    class Cache:
+        def encode(self, prompt, namespace):
+            seen.append((prompt, namespace))
+            return [1, 2, 3]
+
+    monkeypatch.setattr(
+        budget, "prepare_tokenizer", lambda: (None, lambda *a, **k: "rendered", Cache())
+    )
+    payload = SimpleNamespace(
+        model_dump=lambda: {**body(max_tokens=77), "model_id": MODEL_ID},
+        _cache_namespace="a" * 64,
+    )
+    assert await budget.token_budget(payload) == 80
+    assert seen == [("rendered", "a" * 64)]

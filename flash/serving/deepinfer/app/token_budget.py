@@ -1,6 +1,7 @@
 """Count exact DeepSeek reservations on the router without a GPU network trip."""
 
 import asyncio
+from dataclasses import replace
 from functools import lru_cache
 from threading import Lock
 
@@ -8,7 +9,11 @@ from flash.serving.deepinfer.app.events import chat_body
 from flash.serving.deepinfer.contract.config import MODEL_ID, MODEL_REVISION
 from flash.serving.deepinfer.contract.errors import DeepInferError
 from flash.serving.deepinfer.contract.protocol import parse_request
-from flash.serving.deepinfer.contract.tokenizer import encode_request, load_tokenizer
+from flash.serving.deepinfer.contract.tokenizer import (
+    encode_request,
+    load_tokenizer,
+    make_prefix_cache,
+)
 
 _load_lock = Lock()
 
@@ -21,7 +26,9 @@ def _load_tokenizer():
     path = snapshot_download(
         MODEL_ID, revision=MODEL_REVISION, allow_patterns=["tokenizer.json", "encoding/*.py"]
     )
-    return load_tokenizer(path)
+    tokenizer, encode_messages = load_tokenizer(path)
+    cache = make_prefix_cache(tokenizer)
+    return tokenizer, encode_messages, cache
 
 
 def prepare_tokenizer():
@@ -31,13 +38,17 @@ def prepare_tokenizer():
 
 
 def _count(request):
-    tokenizer, encode_messages = prepare_tokenizer()
+    tokenizer, encode_messages, cache = prepare_tokenizer()
     try:
-        return len(encode_request(tokenizer, encode_messages, request)) + request.max_tokens
+        return (
+            len(encode_request(tokenizer, encode_messages, request, prefix_cache=cache))
+            + request.max_tokens
+        )
     except ValueError as exc:
         raise DeepInferError(422, str(exc)) from exc
 
 
 async def token_budget(payload):
     request = parse_request(chat_body(payload.model_dump()))
+    request = replace(request, cache_namespace=getattr(payload, "_cache_namespace", None))
     return await asyncio.to_thread(_count, request)

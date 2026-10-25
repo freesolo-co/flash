@@ -47,7 +47,7 @@ Ambiguous admissions are never retried or treated as allowed.
 ## Cache and accounting
 
 GPU prefix checkpoints are tenant scoped and require exact token IDs. Each driver
-retains at most 16 entries and 2,097,152 tokens of allocated prefix state. Entries
+retains at most 64 entries and 2,097,152 tokens of allocated prefix state. Entries
 expire after 600 seconds of inactivity or are evicted under memory pressure.
 One-off prefixes skip checkpoint creation; a bounded hash-only observation table
 admits them on reuse. Retention favors frequently reused prefixes relative to
@@ -61,7 +61,12 @@ on actual traffic; a 92% hit fraction is a workload assumption, not a service
 setting or guaranteed discount.
 
 The CPU prompt-token cache holds at most 128 entries, keyed by tenant, model
-revision, messages and thinking mode. Its hits do not count as GPU-cached input.
+revision, messages and thinking mode. CPU admission and generation also reuse
+tokenized conversation prefixes at verified added-token boundaries, preserving
+the exact full-encoding IDs. That tenant-scoped cache holds at most 128 entries
+and 64 MiB of packed token IDs per tokenizer, with a 600-second idle lifetime.
+The shared Qwen text tokenizer uses the same bounded prefix cache; unsupported
+tokenizer configurations retain full encoding. Neither CPU cache counts as GPU-cached input.
 Only native reused-prefix counts receive cached-input pricing. Terminal usage
 includes actual completion, reasoning and EOS tokens; token delivery flushes the
 first token immediately and then batches up to 16 tokens or 50ms of engine
