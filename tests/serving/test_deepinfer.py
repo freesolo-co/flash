@@ -196,13 +196,14 @@ async def test_disconnect_cancels_generation_task():
 )
 async def test_rank_assignment_and_cancel_are_request_scoped(namespace, prefix_tokens):
     runtime = Runtime()
-    runtime.incoming = [queue.Queue() for _ in range(4)]
+    runtime.incoming = [queue.Queue() for _ in range(config.GPU_COUNT)]
     tokens = list(range(130))
     affinity = (
-        hashlib.sha256(((namespace or "") + ":" + str(tokens[:128])).encode()).digest()[0] % 4
+        hashlib.sha256(((namespace or "") + ":" + str(tokens[:128])).encode()).digest()[0]
+        % config.GPU_COUNT
     )
-    idle = (affinity + 1) % 4
-    initial_loads = [1] * 4
+    idle = (affinity + 1) % config.GPU_COUNT
+    initial_loads = [1] * config.GPU_COUNT
     initial_loads[idle] = 0
     runtime.loads = initial_loads.copy()
     rank = affinity if prefix_tokens else idle
@@ -230,7 +231,7 @@ async def test_rank_assignment_and_cancel_are_request_scoped(namespace, prefix_t
 @pytest.mark.anyio
 async def test_full_replica_does_not_enqueue_another_request():
     runtime = Runtime()
-    runtime.loads = [config.SEQUENCES_PER_RANK] * 4
+    runtime.loads = [config.SEQUENCES_PER_RANK] * config.GPU_COUNT
     with pytest.raises(OverflowError):
         await anext(runtime.generate(parse_request(body()), [0]))
     assert not runtime.pending
@@ -239,13 +240,13 @@ async def test_full_replica_does_not_enqueue_another_request():
 @pytest.mark.anyio
 async def test_slow_reader_cancels_only_its_rank_and_reports_error():
     runtime = Runtime()
-    runtime.incoming = [queue.Queue() for _ in range(4)]
-    pending = Pending(2, asyncio.Queue(maxsize=1), asyncio.Event())
+    runtime.incoming = [queue.Queue() for _ in range(config.GPU_COUNT)]
+    pending = Pending(config.GPU_COUNT - 1, asyncio.Queue(maxsize=1), asyncio.Event())
     runtime.pending["slow"] = pending
     pending.events.put_nowait({"type": "tokens"})
     runtime._deliver({"type": "tokens", "id": "slow", "tokens": [2]})
     assert pending.events.get_nowait() == {"type": "fatal"}
-    assert runtime.incoming[2].get_nowait() == {"type": "cancel", "id": "slow"}
+    assert runtime.incoming[pending.rank].get_nowait() == {"type": "cancel", "id": "slow"}
     assert runtime.failure is None
 
 
@@ -266,7 +267,7 @@ def test_native_image_patch_rejects_unknown_source():
         patch_indexer("unexpected upstream release")
 
 
-def test_modal_private_four_gpu_autoscaling_contract(monkeypatch):
+def test_modal_private_two_gpu_autoscaling_contract(monkeypatch):
     captured = {}
 
     class Image:
@@ -318,12 +319,13 @@ def test_modal_private_four_gpu_autoscaling_contract(monkeypatch):
         launcher = importlib.import_module(name)
     finally:
         sys.modules.pop(name, None)
-    assert captured["function"]["gpu"] == "B200:4"
+    assert captured["function"]["gpu"] == "B200:2"
+    assert captured["function"]["memory"] == 524288
     assert captured["function"]["min_containers"] == 0
     assert captured["function"]["max_containers"] == 4
     assert captured["function"]["buffer_containers"] == 0
     assert captured["function"]["scaledown_window"] == 600
-    assert captured["concurrent"] == {"max_inputs": 32, "target_inputs": 24}
+    assert captured["concurrent"] == {"max_inputs": 16, "target_inputs": 12}
     assert captured["web"]["requires_proxy_auth"] is True
     script, options = captured["build_script"]
     assert script.is_file()

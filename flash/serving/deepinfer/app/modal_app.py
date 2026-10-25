@@ -52,7 +52,7 @@ weights = modal.Volume.from_name("freesolo-deepseek-1017-weights", create_if_mis
 
 
 def _watch_server(process):
-    # Retire only this four-GPU replica on startup/native worker death. Other replicas and
+    # Retire only this two-GPU replica on startup/native worker death. Other replicas and
     # requests remain independent; ordinary client cancellation never exits the server.
     process.wait()
     os._exit(1)
@@ -61,7 +61,7 @@ def _watch_server(process):
 @app.function(
     gpu=GPU,
     cpu=16,
-    memory=262144,
+    memory=524288,  # Engram host storage and loading peaked above 300 GiB in qualification.
     volumes={"/weights": weights},
     min_containers=MIN_CONTAINERS,
     max_containers=MAX_CONTAINERS,

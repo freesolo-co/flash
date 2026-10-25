@@ -12,7 +12,12 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException, Request
 
 from flash.serve.contract.protocol import MAX_CHAT_REQUEST_BYTES
-from flash.serving.deepinfer.contract.config import MODEL_ID, MODEL_REVISION, RUNTIME_REVISION
+from flash.serving.deepinfer.contract.config import (
+    GPU_COUNT,
+    MODEL_ID,
+    MODEL_REVISION,
+    RUNTIME_REVISION,
+)
 from flash.serving.src.http.body_limit import RequestBodyLimitMiddleware
 from flash.serving.src.http.stream_response import ClosingStreamingResponse, await_until_disconnect
 
@@ -98,7 +103,7 @@ def build_app(runtime, *, manage_lifecycle=True):
             "model_revision": MODEL_REVISION,
             "runtime_revision": RUNTIME_REVISION,
             "gpu": "B200",
-            "gpu_count": 4,
+            "gpu_count": GPU_COUNT,
             "loaded_ranks": getattr(runtime, "provenance", {}),
             "active_requests": len(getattr(runtime, "pending", {})),
         }
