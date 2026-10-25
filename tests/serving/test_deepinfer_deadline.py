@@ -2,14 +2,30 @@
 
 import asyncio
 import queue
+import time
 from types import SimpleNamespace
 
 import pytest
 
-from flash.serving.deepinfer.contract.config import GPU_COUNT, MODEL_ID, REQUEST_SECONDS
+from flash.serving.deepinfer.contract.config import (
+    GPU_COUNT,
+    MODEL_ID,
+    REQUEST_SECONDS,
+    WORKER_STALL_SECONDS,
+)
 from flash.serving.deepinfer.contract.protocol import parse_request
 from flash.serving.deepinfer.runtime.bridge import Runtime
 from flash.serving.src.http.stream_response import await_until_disconnect
+
+
+@pytest.mark.anyio
+async def test_long_generation_budget_does_not_delay_stalled_worker_detection(monkeypatch):
+    runtime = Runtime()
+    runtime.ready = set(range(GPU_COUNT))
+    runtime.last_seen = [time.monotonic() - WORKER_STALL_SECONDS - 1] * GPU_COUNT
+    monkeypatch.setattr(runtime, "_read_event", lambda: None)
+    await asyncio.wait_for(runtime._dispatch(), timeout=1)
+    assert runtime.failure == "DeepInfer replica is unavailable"
 
 
 @pytest.mark.anyio

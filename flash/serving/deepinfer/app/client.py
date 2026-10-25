@@ -73,6 +73,7 @@ class HostedDeepInfer:
         headers = {
             "Modal-Key": os.environ["DEEPINFER_PROXY_KEY"],
             "Modal-Secret": os.environ["DEEPINFER_PROXY_SECRET"],
+            "Accept": "text/event-stream",
         }
         url = await asyncio.wait_for(asyncio.to_thread(endpoint_url), timeout=30)
         response = await self._client.post(
@@ -112,6 +113,7 @@ class HostedDeepInfer:
         headers = {
             "Modal-Key": os.environ["DEEPINFER_PROXY_KEY"],
             "Modal-Secret": os.environ["DEEPINFER_PROXY_SECRET"],
+            "Accept": "text/event-stream",
         }
         try:
             url = await asyncio.wait_for(asyncio.to_thread(endpoint_url), timeout=30)
@@ -140,6 +142,10 @@ class HostedDeepInfer:
                 async for line in response.aiter_lines():
                     if not line:
                         continue
+                    if line.startswith(":"):
+                        continue
+                    if line.startswith("data:"):
+                        line = line[5:].lstrip()
                     event = json.loads(line)
                     if event.get("type") == "error":
                         raise DeepInferError(502, "DeepInfer generation failed")

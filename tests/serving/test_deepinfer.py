@@ -117,12 +117,21 @@ def test_unsupported_requests_never_admit_gpu_work(change):
     assert runtime.calls == 0
 
 
-def test_native_events_report_usage_and_close():
+@pytest.mark.parametrize("sse", [False, True])
+def test_native_events_report_usage_and_close(sse):
     runtime = FakeRuntime()
     with TestClient(build_app(runtime, manage_lifecycle=False)) as client:
-        response = client.post("/internal/generate", json={"request_id": "test", "chat": body()})
+        response = client.post(
+            "/internal/generate",
+            json={"request_id": "test", "chat": body()},
+            headers={"Accept": "text/event-stream" if sse else "application/x-ndjson"},
+        )
     assert response.status_code == 200
-    events = [json.loads(line) for line in response.text.splitlines()]
+    expected_type = "text/event-stream" if sse else "application/x-ndjson"
+    assert response.headers["content-type"].startswith(expected_type)
+    events = [
+        json.loads(line.removeprefix("data: ")) for line in response.text.splitlines() if line
+    ]
     assert events[0]["type"] == "ready"
     assert events[-1]["type"] == "final"
     assert events[-1]["text"] == "Hi there"
@@ -132,11 +141,18 @@ def test_native_events_report_usage_and_close():
     assert runtime.closed
 
 
-def test_error_after_first_token_is_not_successful_completion():
+@pytest.mark.parametrize("sse", [False, True])
+def test_error_after_first_token_is_not_successful_completion(sse):
     runtime = FakeRuntime([{"tokens": [2], "finish_reason": None}, RuntimeError("native failure")])
     with TestClient(build_app(runtime, manage_lifecycle=False)) as client:
-        response = client.post("/internal/generate", json={"request_id": "test", "chat": body()})
-    events = [json.loads(line) for line in response.text.splitlines()]
+        response = client.post(
+            "/internal/generate",
+            json={"request_id": "test", "chat": body()},
+            headers={"Accept": "text/event-stream" if sse else "application/x-ndjson"},
+        )
+    events = [
+        json.loads(line.removeprefix("data: ")) for line in response.text.splitlines() if line
+    ]
     assert events[-1] == {"type": "error"}
     assert not any(event["type"] == "final" for event in events)
     assert runtime.closed

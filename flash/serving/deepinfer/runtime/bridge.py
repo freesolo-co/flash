@@ -25,6 +25,7 @@ from flash.serving.deepinfer.contract.config import (
     REQUEST_SECONDS,
     SEQUENCES_PER_RANK,
     STARTUP_SECONDS,
+    WORKER_STALL_SECONDS,
 )
 from flash.serving.deepinfer.runtime.routing import CacheRouter
 from flash.serving.deepinfer.runtime.worker import run_rank
@@ -115,7 +116,7 @@ class Runtime:
                     self._deliver(event)
                 if (
                     len(self.ready) == GPU_COUNT
-                    and time.monotonic() - min(self.last_seen) > REQUEST_SECONDS
+                    and time.monotonic() - min(self.last_seen) > WORKER_STALL_SECONDS
                 ):
                     raise RuntimeError("DeepInfer scheduling stalled")
         except asyncio.CancelledError:

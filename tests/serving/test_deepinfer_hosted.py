@@ -192,16 +192,19 @@ def test_catalog_requires_complete_authenticated_connection(monkeypatch):
 
 
 @pytest.mark.parametrize("fault", ["truncated", "wrong-id", "error"])
-def test_bridge_rejects_incomplete_or_misattributed_results(connection, fault):
+@pytest.mark.parametrize("sse", [False, True])
+def test_bridge_rejects_incomplete_or_misattributed_results(connection, fault, sse):
     async def handler(request):
         assert request.headers["Modal-Key"] == "key"
         assert request.headers["Modal-Secret"] == "secret"
+        assert request.headers["Accept"] == "text/event-stream"
         event = {"type": "ready", "request_id": "fsgen-test"}
         if fault == "wrong-id":
             event = {"type": "final", "request_id": "wrong"}
         if fault == "error":
             event = {"type": "error"}
-        return httpx.Response(200, text=json.dumps(event) + "\n")
+        data = json.dumps(event)
+        return httpx.Response(200, text=f": keepalive\n\ndata: {data}\n\n" if sse else data + "\n")
 
     pool = HostedDeepInfer(transport=httpx.MockTransport(handler))
     payload = OpenAIGenerateRequest(

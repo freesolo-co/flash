@@ -5,6 +5,7 @@ OPENAI_API_KEY=... python scripts/benchmark_serving_latency.py \
     --output /tmp/serving-latency.json
 
 Uses unique prompts: one quarter approximately 750 tokens, the rest approximately 45.
+Use --prompt-file to benchmark longer source context; actual input counts come from usage.
 Warm-up requests are optional and saved separately, never silently discarded. Run
 matched baseline/candidate/candidate/baseline rounds on otherwise quiet deployments.
 MODAL_KEY/MODAL_SECRET optionally protect private qualification routers.
@@ -40,13 +41,16 @@ def summarize(rows, elapsed):
         "ttft_p95_seconds": percentile([r["ttft_seconds"] for r in good], 0.95),
         "per_stream_decode_tokens_per_second_p50": percentile(rates, 0.5),
         "per_stream_decode_tokens_per_second_p10": percentile(rates, 0.1),
+        "prompt_tokens_p50": percentile([r["usage"]["prompt_tokens"] for r in good], 0.5),
+        "prompt_tokens_p95": percentile([r["usage"]["prompt_tokens"] for r in good], 0.95),
     }
 
 
 async def request(client, args, index):
     identity = "latency-" + uuid.uuid4().hex
-    context = "Service requests share bounded memory and must retain accurate usage records. " * (
-        60 if index % 4 == 0 else 1
+    context = args.prompt_context or (
+        "Service requests share bounded memory and must retain accurate usage records. "
+        * (60 if index % 4 == 0 else 1)
     )
     payload = {
         "model": args.model,
@@ -68,7 +72,7 @@ async def request(client, args, index):
         "correlation_id": identity,
         "started_unix": time.time(),
         "ok": False,
-        "long_prompt": index % 4 == 0,
+        "long_prompt": bool(args.prompt_context) or index % 4 == 0,
     }
     try:
         async with client.stream(
@@ -182,8 +186,12 @@ def main():
     parser.add_argument("--requests", type=int, default=96)
     parser.add_argument("--warmup", type=int, default=0)
     parser.add_argument("--max-tokens", type=int, default=256)
+    parser.add_argument(
+        "--prompt-file", type=Path, help="UTF-8 source context; never stored in results"
+    )
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
+    args.prompt_context = args.prompt_file.read_text() if args.prompt_file else None
     args.url = args.url.rstrip("/")
     if min(args.concurrency, args.requests) < 1 or args.max_tokens < 2 or args.warmup < 0:
         parser.error(

@@ -30,5 +30,8 @@ MAX_CONTAINERS = 4
 BUFFER_CONTAINERS = 0
 SCALEDOWN_SECONDS = 600
 STARTUP_SECONDS = 2700
-REQUEST_SECONDS = 600
+# A 350K-token completion takes almost an hour at 100 tokens/s. Leave room for
+# prefill and rate variation while retaining a finite generation deadline.
+REQUEST_SECONDS = 7200
+WORKER_STALL_SECONDS = 600
 PORT = 8000
