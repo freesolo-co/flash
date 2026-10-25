@@ -4,14 +4,6 @@ import hashlib
 from pathlib import Path
 
 PATCHES = {
-    "deepinfer/model_executor/models/v4_modules/mlp.py": (
-        "2541bcc83b178a9e2f18b387b301d60111d6d603e18e2d31df38196b03d290dd",
-        [],  # Keep the released native FP4 expert path unchanged.
-    ),
-    "deepinfer/model_executor/utils.py": (
-        "171451e25c45116994751900758ae103609b1e3818d47d8146f7da0d18867c83",
-        [],  # No FP8 conversion metadata is needed.
-    ),
     "csrc/engine/pybind_scheduler.cpp": (
         "a81d71dbfe5a0d7ad5c0c79c104abd65ada2ab57b8073f339e0c13a5cb74a438",
         [

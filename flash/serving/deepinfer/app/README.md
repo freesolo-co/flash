@@ -15,14 +15,14 @@ The parent `deepinfer/` package groups code by responsibility:
 | `app/` | Private HTTP endpoint, hosted router client, event rendering, and Modal launcher |
 | `contract/` | Pinned configuration, validated chat requests, and shared errors |
 | `runtime/` | Async request bridge, GPU worker processes, prefix cache, and loaded-runtime checks |
-| `native/` | Upstream source checks, prefix-cache binding, and Engram GPU transport |
+| `native/` | Prefix-cache scheduler patch and Engram GPU transport |
 
 The hosted CPU router imports `app.client` and `contract` modules. The private
 HTTP server starts `runtime.bridge.Runtime`, which launches `runtime.worker`
 processes. Workers load native GPU modules after selecting their CUDA device;
 package initializers do not load GPU dependencies. Image preparation applies
-`native.patches`, which verifies the unchanged native FP4 expert sources and adds
-the prefix-cache scheduler binding.
+`native.patches`, which checks the scheduler source and adds the prefix-cache
+binding. The native FP4 expert sources are left untouched.
 
 ## Capacity and price
 
