@@ -52,7 +52,7 @@ tokens. GPU prefix-cache hits report the actual retained token count with
 not count as cached GPU input and receive no cached-input billing discount.
 
 The GPU cache keeps at most four prefixes and 32,768 tokens of retained KV allocation per
-rank. Entries expire after 600 seconds of inactivity and are evicted in LRU order
+rank. Entries expire after 600 seconds of inactivity and are evicted according to the retention policy
 or under KV-memory pressure. The router derives each cache namespace from verified
 organization attribution. Prefix matching checks exact token IDs; continuations
 use native copy-on-write state. A stable conversation prefix is preferred, with
@@ -78,6 +78,12 @@ Workers verify token equality. This does not route between Modal replicas.
 Qwen engines have one GPU and one DP rank each, so this rank-placement policy has
 no additional target inside those engines; Modal still places their replicas.
 
+
+The fixed retention policy scores entries by decaying
+reuse count times reusable prefix length divided by the full allocated prompt
+size. Frequency has a 60-second half-life; TTL expiry is unchanged.
+The same policy applies at entry/token
+capacity and under GPU block pressure.
 
 ## Deployment and qualification
 

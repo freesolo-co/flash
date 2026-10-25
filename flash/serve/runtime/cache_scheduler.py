@@ -12,6 +12,7 @@ from vllm.v1.core.sched.request_queue import SchedulingPolicy
 from vllm.v1.core.sched.scheduler import Scheduler
 
 from .cache_admission import cached_candidate
+from .cache_retention import CacheRetention
 
 
 class CacheAdmission:
@@ -52,11 +53,11 @@ class CacheAdmission:
         return super().schedule()
 
 
-class CacheScheduler(CacheAdmission, Scheduler):
+class CacheScheduler(CacheRetention, CacheAdmission, Scheduler):
     pass
 
 
-class AsyncCacheScheduler(CacheAdmission, AsyncScheduler):
+class AsyncCacheScheduler(CacheRetention, CacheAdmission, AsyncScheduler):
     pass
 
 

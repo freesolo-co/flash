@@ -210,6 +210,13 @@ Modal still selects replicas, without prefix-aware cross-replica placement.
 Authenticated organization namespaces remain part of vLLM's cache identity,
 alongside its native adapter and multimodal identity handling.
 
+Idle GPU blocks that served a prefix hit receive bounded, decaying reuse credits.
+Eviction can rotate them behind colder free blocks, with at most 32 inspections
+per allocation. Credits halve each minute and are discarded when a block is
+allocated to new work. The native pool retains ownership of hashes, references,
+and all KV/state layouts. No block is pinned; even a fully hot cache can allocate.
+These settings are fixed in code and require no environment variables.
+
 ### No autoscaling or vLLM perf knobs
 
 There are **no env knobs for autoscaling or vLLM/engine performance**. An optimization either exists
