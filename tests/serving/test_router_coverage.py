@@ -16,6 +16,7 @@ import hashlib
 import pytest
 from fastapi.testclient import TestClient
 
+from flash.serving.src.http.rate_limit import allow_offline_inference
 from flash.serving.src.http.router import AdapterRouter
 from flash.serving.src.http.router import build_offline_serving_app as build_serving_app
 from flash.serving.src.http.router import build_serving_app as build_durable_serving_app
@@ -184,6 +185,7 @@ def test_exceptional_lifespan_exit_closes_usage_and_authorizer():
         FakePool(),
         AdapterRouter([_rec("qa/final")]),
         usage_store=Store(),
+        rate_limiter=allow_offline_inference,
         chat_authorizer=Authorizer(),
     )
 
@@ -221,6 +223,7 @@ def test_shutdown_propagates_usage_store_close_failure():
         FakePool(),
         AdapterRouter([_rec("qa/final")]),
         usage_store=Store(),
+        rate_limiter=allow_offline_inference,
         chat_authorizer=authorizer,
     )
     with (
@@ -250,6 +253,7 @@ def test_shutdown_swallows_authorizer_aclose_errors():
         FakePool(),
         AdapterRouter([_rec("qa/final")]),
         usage_store=OfflineUsageStore(),
+        rate_limiter=allow_offline_inference,
         chat_authorizer=authorizer,
     )
     with TestClient(app) as client:

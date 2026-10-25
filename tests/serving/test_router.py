@@ -19,6 +19,7 @@ from fastapi.testclient import TestClient
 from flash.serving.src.accounting.usage import AuthorizedTraffic, principal_for_external_org
 from flash.serving.src.http.adapter_routes import remove_adapter
 from flash.serving.src.http.context import ServingContext
+from flash.serving.src.http.rate_limit import allow_offline_inference
 from flash.serving.src.http.router import AdapterRouter
 from flash.serving.src.http.router import build_offline_serving_app as build_serving_app
 from flash.serving.src.http.router import build_serving_app as _metered_app
@@ -269,7 +270,13 @@ class _UnhealthyUsageStore:
 
 def _metered_client(pool, router, store) -> TestClient:
     return TestClient(
-        _metered_app(pool, router, usage_store=store, chat_authorizer=_allow),
+        _metered_app(
+            pool,
+            router,
+            usage_store=store,
+            rate_limiter=allow_offline_inference,
+            chat_authorizer=_allow,
+        ),
         headers={"Authorization": "Bearer t", "X-Freesolo-Org-Id": "org-1"},
     )
 

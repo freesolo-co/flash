@@ -887,7 +887,7 @@ def test_invalid_stored_spec_raises_value_error_before_ready(modal_app_module):
 
 
 # --- stop sequences ---------------------------------------------------------------------------
-# `docs/serving-contract.md` documents `stop` as an accepted field and requires stop handling to be
+# The serving contract accepts `stop` and requires stop handling to be
 # preserved. Pydantic drops keys a model does not declare, so an undeclared `stop` was accepted with
 # a 200 and then ignored: generation ran past the caller's stop string and billed the extra tokens.
 
@@ -962,3 +962,78 @@ def test_malformed_stop_is_rejected_rather_than_ignored(bad):
     """A bad `stop` is a 422, not a silently discarded field."""
     with pytest.raises(ValidationError):
         GenerateRequest(model_id="r1", prompt="hi", stop=bad)
+
+
+@pytest.mark.parametrize("cancel_before_generate", [False, True])
+def test_hosted_stream_rechecks_lease_after_prompt_preparation(
+    modal_app_module, monkeypatch, cancel_before_generate
+):
+    eng = _engine(modal_app_module)
+    prepared = []
+    checked = []
+    closed_images = []
+    prepare = eng._prepare_prompt_input
+
+    async def prepare_prompt(*args):
+        result = await prepare(*args)
+        prepared.append(result)
+        return result
+
+    async def check_lease():
+        assert len(prepared) == 1
+        assert not eng.engine.sampling_params
+        checked.append(True)
+        if cancel_before_generate:
+            raise asyncio.CancelledError
+
+    monkeypatch.setattr(eng, "_prepare_prompt_input", prepare_prompt)
+    monkeypatch.setattr(eng, "_close_prompt_images", closed_images.append)
+
+    async def run():
+        stream = eng._stream_generate(
+            {"model_id": "r1", "prompt": "hi"},
+            _forwarded_record(eng, "r1"),
+            pre_generate_check=check_lease,
+        )
+        if cancel_before_generate:
+            with pytest.raises(asyncio.CancelledError):
+                await anext(stream)
+        else:
+            assert (await anext(stream))["type"] == "ready"
+        await stream.aclose()
+
+    asyncio.run(run())
+    assert checked == [True]
+    assert closed_images == prepared
+    assert len(eng.engine.sampling_params) == (0 if cancel_before_generate else 1)
+
+
+@pytest.mark.parametrize("stream", [False, True])
+def test_authenticated_cache_salts_reach_vllm_without_cross_request_leakage(
+    modal_app_module, stream
+):
+    eng = _engine(modal_app_module, thinking=False)
+    prompts = []
+    original = eng.engine.generate
+
+    async def capture(prompt, *args, **kwargs):
+        prompts.append(dict(prompt))
+        async for output in original(prompt, *args, **kwargs):
+            yield output
+
+    eng.engine.generate = capture
+
+    async def request(namespace):
+        payload = {"model_id": "r1", "prompt": "same prompt", "_cache_namespace": namespace}
+        if stream:
+            async for _ in eng._stream_generate(payload, _forwarded_record(eng, "r1")):
+                pass
+        else:
+            await eng._generate(payload, _forwarded_record(eng, "r1"))
+
+    async def run():
+        await asyncio.gather(request("a" * 64), request("b" * 64))
+
+    asyncio.run(run())
+    assert {prompt.pop("cache_salt") for prompt in prompts} == {"a" * 64, "b" * 64}
+    assert prompts[0] == prompts[1]

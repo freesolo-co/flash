@@ -339,7 +339,7 @@ def _prepare_sft_model(
     setup_seconds = time.time() - options.started_at
     _worker_heartbeat.heartbeat(
         "sft_model_load",
-        setup_seconds=setup_seconds,
+        parent_preparation_seconds=setup_seconds,
         gpu=_worker_perf.gpu_diagnostics(),
         context=context,
     )
@@ -393,16 +393,13 @@ def _prepare_sft_model(
     )
 
     card_vram_gb = float(options.gpu_probe.get("memory_gb") or 0.0)
-    raw_capability = options.gpu_probe.get("capability")
-    capability = tuple(raw_capability) if raw_capability else None
     info = MODELS.get(options.model_id)
     active_params_b = float(getattr(info, "active_params_b", 0.0) or 0.0) or None
     gradient_checkpointing = _sft_train._resolve_sft_gradient_checkpointing(
         options.model_id,
         data.realized_max_length,
-        allow_disable=True,
+        allow_disable=not data.multimodal,
         card_vram_gb=card_vram_gb,
-        capability=capability,
         active_params_b=active_params_b,
         hidden=hidden,
         num_layers=layers,
@@ -799,11 +796,15 @@ class _SftProgressCallbacks:
 def _invoke_sft_child(
     child: _SftChild, callbacks: _SftProgressCallbacks, on_line, *, context: WorkerContext
 ) -> int:
+    def observed_line(line):
+        context.phase_timings.observe_line(line)
+        on_line(line)
+
     return _sft_train.run_verl_training(
         child.command,
         env=child.child_env,
         on_step=callbacks.on_step,
-        on_line=on_line,
+        on_line=observed_line,
         heartbeat=callbacks.child_heartbeat,
     )
 

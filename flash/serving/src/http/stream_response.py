@@ -1,9 +1,11 @@
 """explicit lifetime ownership for hosted streaming response bodies."""
 
+import asyncio
 from collections.abc import AsyncIterator, Awaitable, Callable
 from typing import Any
 
 from anyio import CancelScope
+from fastapi import Request
 from starlette.responses import StreamingResponse
 from starlette.types import Receive, Scope, Send
 
@@ -41,3 +43,30 @@ class ClosingStreamingResponse(StreamingResponse):
                         await self._on_unstarted()
                 finally:
                     await self.body_iterator.aclose()
+
+
+async def await_until_disconnect(request: Request, awaitable: Awaitable[Any]) -> Any:
+    operation = asyncio.ensure_future(awaitable)
+    disconnect = asyncio.create_task(wait_for_disconnect(request))
+    try:
+        done, _ = await asyncio.wait({operation, disconnect}, return_when=asyncio.FIRST_COMPLETED)
+        # `done` is a SET: if generation finished and the peer left in the same tick, both are in
+        # it. deciding on the disconnect first discards a completed, durably finalized result.
+        # resolve the tie toward the
+        # operation, matching the packaged helper in flash/serve/app/http.py.
+        if operation in done:
+            return operation.result()
+        disconnect.result()
+        raise asyncio.CancelledError
+    finally:
+        disconnect.cancel()
+        if not operation.done():
+            operation.cancel()
+        await asyncio.gather(operation, disconnect, return_exceptions=True)
+
+
+async def wait_for_disconnect(request: Request) -> None:
+    while True:
+        message = await request.receive()
+        if message["type"] == "http.disconnect":
+            return

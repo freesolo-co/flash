@@ -236,6 +236,13 @@ The shared `flash-weights` Modal Volume retains trusted public base-model weight
 and compiled runtime caches remain isolated. Set `FLASH_WEIGHT_CACHE_DISABLED=1` to disable this
 cache. The supervisor also retains its bounded retry without the cache when appropriate.
 
+For SFT with a pinned catalog model and an attached cache, Flash stages the exact model revision
+in a CPU-only sandbox before allocating the GPU. This stage uses 2–4 CPU cores, 4–8 GiB RAM, and
+at most 15 minutes within the existing run deadline. Failed staging stops before GPU allocation.
+The run's ownership tags cover cancellation and orphan cleanup; its handle records the staging
+time and a separate CPU cost upper estimate. Private adapters and environment code are not staged
+on the shared cache.
+
 ```bash
 python -m flash.providers.artifacts.weight_cache --dry-run
 python -m flash.providers.artifacts.weight_cache --provision
@@ -250,7 +257,13 @@ implementation. GPU selection now uses Modal's supported card counts and estimat
 memory rates. Cross-cloud fallback and marketplace offer selection have been removed. Modal
 queues reservations subject to workspace capacity and quotas.
 
-Each sandbox reserves at least four CPU cores and 32 GiB RAM per GPU, and can burst above these
+For text SFT with fused loss, gradient checkpointing is disabled when the estimated full-model
+training peak fits on each GPU with headroom (8 GB for dense models, 18 GB for MoE). The decision
+uses actual tokenized row lengths, microbatch size, LoRA rank and model geometry, without a
+model-revision or GPU-family allowlist. Unknown sizing inputs keep checkpointing enabled.
+Multimodal training and GRPO retain their existing checkpointing defaults.
+
+Each training sandbox reserves at least two CPU cores and 8 GiB RAM per GPU, and can burst above these
 requests during compilation and checkpoint export. A sandbox has a 24-hour lifetime
 limit and at most 512 GiB ephemeral disk. Cost records are resource-rate estimates, not Modal
 invoices; CPU/RAM usage above the reservation, storage, and network charges are not attributed
@@ -477,8 +490,6 @@ and returns `400` for them.
 
 `FREESOLO_SERVING_URL` belongs to the separate multi-LoRA backend behind `flash models deploy` /
 `chat` / `undeploy`; standalone refuses an unset or Freesolo-hosted value there for the same reason.
-See [docs/serving-contract.md](docs/serving-contract.md) for both credential rules, the normative
-endpoints, and the conformance command.
 
 ## The worker image
 

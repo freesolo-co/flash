@@ -376,3 +376,37 @@ def test_training_interpreter_pins_and_bake_entry_invalidate_cache():
     before = kf.compute_fingerprints(cache, base)[0]
     for key in ("verl_stack", "bake_entry_sha256", "flashinfer_aot_sha256"):
         assert kf.compute_fingerprints({**cache, key: cache[key] + "changed"}, base)[0] != before
+
+
+@pytest.mark.parametrize("changed", ["flashinfer", "vllm", "kernel_selection"])
+def test_kernel_runtime_changes_invalidate_cache(tmp_path, changed):
+    import shutil
+
+    for relative in (
+        "Dockerfile.worker",
+        ".github/workflows/worker-image.yml",
+        "docker/bake_sandbox_entry.py",
+        "flash/engine/worker/runtime/kernel_warmup.py",
+        "flash/engine/worker/train/core/child/flashinfer_cache.py",
+        "flash/engine/worker/perf/__init__.py",
+        "flash/providers/_lifecycle/bootstrapping/bootstrap.py",
+        "flash/snapshot/archive.py",
+    ):
+        target = tmp_path / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(ROOT / relative, target)
+    before = kf.fingerprints(tmp_path)
+    if changed == "kernel_selection":
+        path = tmp_path / "flash/engine/worker/perf/__init__.py"
+        path.write_text(path.read_text() + "\n# changed backend setup\n")
+    else:
+        path = tmp_path / "Dockerfile.worker"
+        package = "flashinfer-python" if changed == "flashinfer" else "vllm"
+        source, count = re.subn(
+            rf'"{package}==[^"\s]+"', f'"{package}==99.0"', path.read_text(), count=1
+        )
+        assert count == 1
+        path.write_text(source)
+    after = kf.fingerprints(tmp_path)
+    assert before[0] != after[0]
+    assert before[1] != after[1]

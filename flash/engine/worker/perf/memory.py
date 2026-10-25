@@ -21,7 +21,6 @@ def grad_checkpointing_on(
     *,
     allow_disable: bool = False,
     card_vram_gb: float = 0.0,
-    capability: tuple[int, int] | None = None,
     active_params_b: float | None = None,
     hidden: int = 0,
     num_layers: int = 0,
@@ -31,19 +30,11 @@ def grad_checkpointing_on(
     revision: str = "",
 ) -> bool:
     """Gradient-checkpointing default, with an SFT-only opt-out when GC-off fits."""
-    base = _prefer_gradient_checkpointing(model_id, max_length, revision=revision)
     if not allow_disable:
-        return base
-    if not base:
-        return False
-    can_consider_gc_off = (
-        fused_ce
-        and active_params_b
-        and card_vram_gb
-        and card_vram_gb >= 120.0
-        and (capability is None or capability >= (9, 0))
-    )
-    if not can_consider_gc_off:
+        return _prefer_gradient_checkpointing(model_id, max_length, revision=revision)
+    # The estimate covers text SFT with chunked loss. Decide from the actual workload,
+    # including small models: even a small model can run out of memory at a large batch.
+    if not fused_ce:
         return True
     from flash.core.catalog import MODELS
 
@@ -60,7 +51,7 @@ def grad_checkpointing_on(
         hidden=hidden,
         num_layers=num_layers,
         card_vram_gb=card_vram_gb,
-        batch=per_device_bs or 4,
+        batch=per_device_bs,
         lora_rank=lora_rank,
         quant=(getattr(info, "quant", "bf16") or "bf16") if info else "bf16",
         model_info=info,

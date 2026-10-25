@@ -14,6 +14,7 @@ from flash.serve.request.tool_calls import detached_template_messages, tools_act
 
 from .errors import MultimodalRequestError, PromptError, ServingRuntimeError
 from .multimodal import has_image_blocks, normalize_text_messages, prepare_multimodal_request
+from .prompt_cache import cached_prompt_tokens
 from .types import AdapterSpec, EngineConfig, GenerationRequest
 
 _RESERVED_CHAT_TEMPLATE_KWARGS = frozenset(
@@ -114,17 +115,12 @@ class PromptPreparer:
         # share the entry they already share a rendering of, instead of tokenizing twice.
         messages = None if request.messages is None else normalize_text_messages(request.messages)
         key = self._cache_key(request, messages, thinking)
-        if key is not None:
-            cached = self._cache.get(key)
-            if cached is not None:
-                self._cache.move_to_end(key)
-                return {"prompt_token_ids": list(cached)}
-        token_ids = await asyncio.to_thread(self._tokenize, request, messages, thinking)
-        if key is not None:
-            self._cache[key] = tuple(token_ids)
-            self._cache.move_to_end(key)
-            while len(self._cache) > self._config.prompt_cache_size:
-                self._cache.popitem(last=False)
+        token_ids = await cached_prompt_tokens(
+            self._cache,
+            key,
+            lambda: self._tokenize(request, messages, thinking),
+            max_entries=self._config.prompt_cache_size,
+        )
         return {"prompt_token_ids": token_ids}
 
     def _tokenize(

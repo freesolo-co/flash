@@ -9,6 +9,7 @@ from typing import Any
 
 from fastapi import HTTPException, status
 
+from flash.serving.deepinfer.contract.errors import DeepInferError
 from flash.serving.src.http.routing import AdapterRouter
 
 
@@ -44,6 +45,8 @@ def engine_error_http(router: AdapterRouter, model_id: str, exc: Exception) -> H
     ``modal`` is imported lazily so this module keeps the no-modal-at-import-scope contract in
     router.py's docstring, which is what lets the routing layer be unit-tested against a fake pool.
     """
+    if isinstance(exc, DeepInferError):
+        return HTTPException(exc.status_code, str(exc))
     if isinstance(exc, ValueError):
         return value_error_http(router, model_id, exc)
     from modal.exception import Error as ModalError

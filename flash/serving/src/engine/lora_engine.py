@@ -14,6 +14,7 @@ import os
 import shutil
 import uuid
 from collections import OrderedDict
+from collections.abc import Awaitable, Callable
 from functools import cached_property
 from pathlib import Path
 from typing import Any
@@ -32,6 +33,7 @@ from flash.serve.request.tool_calls import (
     tools_active,
     tools_wire,
 )
+from flash.serve.runtime.prompt_cache import cached_prompt_tokens
 from flash.serving.src.engine.lora_entries import _LoraEntry, cached_lora_request, entries_for
 from flash.serving.src.engine.model_config import (
     engine_overrides_for,
@@ -522,19 +524,12 @@ class _LoraEngineImpl:
         # kwargs -> same ids), and the duplicate now costs a worker thread rather than the loop.
         key = self._prompt_cache_key(payload, thinking_default)
         cache = getattr(self, "_prompt_token_cache", None)
-        if key is not None and cache is not None:
-            cached = cache.get(key)
-            if cached is not None:
-                cache.move_to_end(key)
-                return {"prompt_token_ids": list(cached)}
-
-        prompt_token_ids = await asyncio.to_thread(self._tokenize_prompt, payload, thinking_default)
-        if key is not None and cache is not None:
-            cache[key] = tuple(prompt_token_ids)
-            cache.move_to_end(key)
-            max_size = getattr(self, "_prompt_cache_size", 0)
-            while len(cache) > max_size:
-                cache.popitem(last=False)
+        prompt_token_ids = await cached_prompt_tokens(
+            cache,
+            key,
+            lambda: self._tokenize_prompt(payload, thinking_default),
+            max_entries=getattr(self, "_prompt_cache_size", 0),
+        )
         return {"prompt_token_ids": prompt_token_ids}
 
     def _tokenize_prompt(self, payload: Any, thinking_default: bool | None = None) -> list[int]:
@@ -686,6 +681,8 @@ class _LoraEngineImpl:
         record_dict: dict[str, Any] | None = None,
         expected_checkpoint: str | None = None,
         generation_id: str | None = None,
+        *,
+        pre_generate_check: Callable[[], Awaitable[None]] | None = None,
     ):
         from flash.serving.src.engine.generation import stream_generate
 
@@ -697,6 +694,7 @@ class _LoraEngineImpl:
             expected_checkpoint,
             generation_id,
             capacity,
+            pre_generate_check=pre_generate_check,
         )
         try:
             async for event in stream:

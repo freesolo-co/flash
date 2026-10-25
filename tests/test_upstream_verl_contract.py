@@ -285,7 +285,12 @@ def test_grpo_agent_carries_identity_and_masks_only_truncation(monkeypatch, fini
     agent = Agent.__new__(Agent)
     agent.config = _config("grpo")
     agent.config.actor_rollout_ref.model.runtime_options.mask_truncated_completions = True
-    agent.observations = ObservedRolloutClient(SimpleNamespace(generate=generate))
+
+    class IdentityOnlyClient(ObservedRolloutClient):
+        def episode_contract(self, agent, identity):
+            return self.episode()
+
+    agent.observations = IdentityOnlyClient(SimpleNamespace(generate=generate))
     agent.tokenizer = SimpleNamespace(decode=lambda *args, **kwargs: "completion")
     monkeypatch.setenv("FLASH_VERL_REWARD_URL", "http://unused")
     monkeypatch.setattr(recipe, "post_json", lambda *args, **kwargs: events.append("registered"))

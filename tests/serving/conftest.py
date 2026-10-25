@@ -91,6 +91,7 @@ def _install_vllm_stub() -> None:
         enable_tower_connector_lora: bool = False
         moe_backend: str | None = None
         reasoning_parser: str | None = None
+        scheduler_cls: str | None = None
         enable_prefix_caching: bool = False
         disable_log_stats: bool = False
 

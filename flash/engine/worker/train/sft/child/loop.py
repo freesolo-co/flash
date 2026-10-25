@@ -4,6 +4,7 @@ from omegaconf import OmegaConf
 from tensordict import NonTensorData
 from verl.utils import tensordict_utils as tu
 
+from flash.engine.worker.runtime.phases import training_phase
 from flash.engine.worker.train.core.child.tracking import OwnedTracking
 
 
@@ -64,7 +65,9 @@ def fit_sft(trainer):
             trainer.train_sampler.set_epoch(epoch)
             for batch in trainer.train_dataloader:
                 step += 1
-                metrics = _train_batch(trainer, batch, step)
+                first = step == trainer.resume_global_step + 1
+                with training_phase("first_update" if first else "steady_update", step=step):
+                    metrics = _train_batch(trainer, batch, step)
                 if metrics is not None:
                     total_tokens += metrics["train/global_tokens"]
                     metrics["train/total_tokens(B)"] = total_tokens / 1e9

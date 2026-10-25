@@ -1,5 +1,10 @@
 # Freesolo LoRA Serving Modal App
 
+For DeepSeek V4.1 Flash 1017, see the [native DeepInfer backend](../deepinfer/app/README.md).
+It uses a separate autoscaling pool of four-B200 replicas and connects to this
+router for authentication and durable billing after qualification and backend
+catalog configuration.
+
 Multi-LoRA serving on Modal with **demand-driven GPU containers per base model**.
 
 - `LoraEngine` is a Modal class **parametrized by `base_model`**. Modal runs separate GPU
@@ -27,8 +32,7 @@ The routing layer (`src/router.py`) carries no `modal`/`vllm` imports and is exh
 unit-tested in `tests/serving/test_router.py` (multi-base-model dispatch, shared-GPU multi-LoRA,
 register-routing, OpenAI shape, auth, 404s) — run with `uv run pytest tests/serving/`.
 
-Operator load tests use the isolated `flash.serving.loadtest` package, documented in
-[`docs/hosted-inference-load-testing.md`](../../../docs/hosted-inference-load-testing.md). It is
+Operator load tests use the isolated `flash.serving.loadtest` package. It is
 never imported by production serving. It drives only `GET /healthz` and `POST /v1/chat/completions`,
 manages no Modal lifecycle, and cannot by itself prove replica scale-out, cold state, GPU identity,
 the cause of a capacity rejection, or an availability SLA.
@@ -193,6 +197,26 @@ Explicitly warm one development model without changing the zero floor:
 uv run modal run --env dev flash/serving/app/modal_app.py --base-model Qwen/Qwen3.5-9B
 ```
 
+### Qwen prefix-cache scheduling
+
+Hosted and packaged Qwen engines use the qualified vLLM 0.23.0 scheduler extension.
+Within the native FCFS waiting queue, a cached request can pass a more expensive
+prefill among the first sixteen arrivals. A head waiting at least 250 ms is not
+bypassed, and a tracked head gets at most two bypasses. Native admission still
+validates availability; running requests, priority scheduling, and preemptions
+retain their native behavior. The extension follows vLLM's resolved synchronous
+or asynchronous scheduler setting. This changes admission within one engine;
+Modal still selects replicas, without prefix-aware cross-replica placement.
+Authenticated organization namespaces remain part of vLLM's cache identity,
+alongside its native adapter and multimodal identity handling.
+
+Idle GPU blocks that served a prefix hit receive bounded, decaying reuse credits.
+Eviction can rotate them behind colder free blocks, with at most 32 inspections
+per allocation. Credits halve each minute and are discarded when a block is
+allocated to new work. The native pool retains ownership of hashes, references,
+and all KV/state layouts. No block is pinned; even a fully hot cache can allocate.
+These settings are fixed in code and require no environment variables.
+
 ### No autoscaling or vLLM perf knobs
 
 There are **no env knobs for autoscaling or vLLM/engine performance**. An optimization either exists
@@ -278,6 +302,37 @@ The one-off quantization job that produced them is not kept in this repo.
 - `POST /adapters/{model_id}/generate`
 - `POST /v1/chat/completions` where `model` is the adapter id
 
+### Organization rate limits
+
+Hosted inference allows **600 requests per minute per organization**, shared across API keys,
+models, router replicas, and all three inference endpoints (including streaming and trusted
+platform calls). Authorization and organization attribution happen before admission; rejected
+requests never start GPU generation. Health and adapter-management routes do not consume quota.
+Each admitted HTTP request counts once, including requests that later fail or disconnect.
+
+The Supabase RPC `public.check_serving_rate_limit` serializes admission per organization and uses
+the database clock. Windows are fixed UTC minutes, so traffic can burst across a minute boundary.
+An exhausted allowance returns **429** with `Retry-After` (seconds until the next minute),
+`X-RateLimit-Limit`, and `X-RateLimit-Remaining: 0`. A database failure or malformed result returns
+**503** with `Retry-After: 5`; serving does not bypass the limiter during an outage.
+
+To change an organization's allowance, edit `internal.serving_rate_limit_overrides` in the
+Supabase table editor or SQL editor:
+
+```sql
+INSERT INTO internal.serving_rate_limit_overrides (org_id, requests_per_minute)
+VALUES ('<organization-uuid>', 1200)
+ON CONFLICT (org_id) DO UPDATE
+SET requests_per_minute = EXCLUDED.requests_per_minute;
+```
+
+The value must be positive. Changes apply to the next admission without a deploy or cache delay;
+lowering the allowance below the current count blocks further requests until the next minute.
+Delete the override row to restore 600 RPM. Counter storage stays bounded to one row per org and
+is removed when the org is deleted. Both tables and the RPC are inaccessible to customer roles.
+Apply platform migration `20261023000000_serving_org_rate_limits.sql` **before deploying** the Flash
+router. Offline app construction explicitly bypasses admission for hermetic tests.
+
 ### Checkpoint headers (all three inference endpoints)
 
 Concurrent checkpoint deploys mutate the single serving surface for an adapter
@@ -359,7 +414,8 @@ it contributes to cache identity, but is not a post-download checksum of the wei
 `artifact_fingerprint` identifies the immutable binding to an organization, checkpoint, source
 revision, base model and serving configuration, including that digest. Neither hash is an
 authentication credential. The fingerprint now hashes the `model_id` key, so previously
-stored fingerprints require the [offline cutover](../../../docs/checkpoint-field-cutover.md).
+stored fingerprints require the offline migration in
+[`scripts/migrate_checkpoint_fingerprints.py`](../../../scripts/migrate_checkpoint_fingerprints.py).
 
 `POST /adapters`:
 

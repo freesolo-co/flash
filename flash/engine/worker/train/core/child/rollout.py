@@ -4,8 +4,10 @@ import ray
 from verl.workers.rollout.vllm_rollout.utils import VLLM_LORA_INT_ID
 from verl.workers.rollout.vllm_rollout.vllm_async_server import vLLMHttpServer, vLLMReplica
 
+from flash.engine.worker.train.core.child.rollout_contract import RolloutContractServer
 
-class FlashVLLMServer(vLLMHttpServer):
+
+class FlashVLLMServer(RolloutContractServer, vLLMHttpServer):
     def _init_model_config(self, model_config):
         from verl.utils.config import omega_conf_to_dataclass
 

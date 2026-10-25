@@ -12,6 +12,7 @@ import flash.engine.worker.perf as _worker_perf
 import flash.engine.worker.train.core.lifecycle.finalize as _worker_finalize
 from flash.engine.plan.steps import final_save_due
 from flash.engine.worker.io.heartbeat import liveness_heartbeat
+from flash.engine.worker.runtime.phases import training_phase
 from flash.engine.worker.runtime.state import WorkerContext
 from flash.engine.worker.train.entry.backend_common import (
     fused_ce_backend,
@@ -245,7 +246,8 @@ def run_opd_train(spec=None, *, context: WorkerContext) -> None:
             gdn_hybrid = model_is_gdn_hybrid(model_id, revision=model_revision)
             gdn_module = gdn_probe_module(model_id, model_revision) if gdn_hybrid else ""
             # ONE child answers every independent capability question. each used to cost its own interpreter, and the torch/verl import -- not the question -- was the price.
-            caps = probe_verl_capabilities(python_bin, gdn_module)
+            with training_phase("capability_checks", context=context):
+                caps = probe_verl_capabilities(python_bin, gdn_module)
         # enable fp8 kv on cc >= 8.9. a gdn hybrid qualifies only when the catalog pins its rollout engine resident: it is sleep/wake that crashes on the hybrid cache, not gdn itself. see rollout_fp8_kv. keep this aligned with vram.py, and keep the device probe separate from gdn classification.
         fp8_kv = rollout_fp8_kv(_cuda_supports_fp8_kv(), gdn_hybrid, model_id)
         # gdn packing requires child support for seq_idx and cu_seqlens; fallbacks discard both and silently bleed state across examples. record whether the child can reset gdn state because successful runs upload no console and failure here is silent contamination; none means non-gdn. see require_gdn_boundary_resets.

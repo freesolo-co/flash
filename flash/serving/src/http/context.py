@@ -1,6 +1,7 @@
 """The per-app collaborators serving request handlers use."""
 
 import asyncio
+import hashlib
 from collections.abc import AsyncIterator, Awaitable, Callable
 from typing import Any
 
@@ -24,6 +25,7 @@ from flash.serving.src.http.headers import (
     optional_internal_org_id,
     training_scope_headers,
 )
+from flash.serving.src.http.rate_limit import RateLimiter
 from flash.serving.src.http.routing import AdapterRouter, EnginePool
 from flash.serving.src.io.schemas import AdapterRecord
 from flash.serving.src.io.streaming import generate_once, openai_chat_stream, prepare_stream
@@ -61,6 +63,15 @@ def require_attributed_traffic(
     return AuthorizedTraffic(principal=principal_for_trusted_internal(org_id))
 
 
+def bind_cache_namespace(payload: Any, traffic: AuthorizedTraffic) -> Any:
+    """Only authenticated traffic attribution can select a shared inference cache."""
+    bound = payload.model_copy()
+    bound._cache_namespace = hashlib.sha256(
+        (traffic.principal.kind + ":" + traffic.principal.orgId).encode()
+    ).hexdigest()
+    return bound
+
+
 class ServingContext:
     def __init__(
         self,
@@ -69,6 +80,7 @@ class ServingContext:
         lookup: AdapterLookup,
         usage: UsageStore,
         *,
+        rate_limiter: RateLimiter,
         internal_key: str | None,
         deployment_id: str,
         serving_release: str,
@@ -79,6 +91,7 @@ class ServingContext:
         ]
         | None,
     ) -> None:
+        self.rate_limiter = rate_limiter
         self.pool = pool
         self.router = router
         self.lookup = lookup
@@ -177,7 +190,7 @@ class ServingContext:
         result = await generate_once(
             self.pool,
             self.router,
-            payload,
+            bind_cache_namespace(payload, traffic),
             requested,
             target,
             generation_id=identity.request_id,

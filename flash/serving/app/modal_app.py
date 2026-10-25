@@ -6,6 +6,7 @@ README to deploy.
 
 import asyncio
 import os
+import time
 import uuid
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -167,6 +168,8 @@ _RUNTIME_SECRET_NAMES = (
     "SUPABASE_PROJECT_REF_DEV",
     "SUPABASE_URL",
     "SUPABASE_SERVICE_ROLE_KEY",
+    "DEEPINFER_PROXY_KEY",
+    "DEEPINFER_PROXY_SECRET",
     # only credentials and wiring are forwarded. autoscaling and engine configuration are constants.
 )
 
@@ -385,18 +388,31 @@ def _build_engine(
                 payload_dict, record_dict, expected_checkpoint, generation_id
             )
 
-        @modal.method(is_generator=True)
-        async def stream_generate(
+        @modal.method()
+        async def stream_generate_call(
             self,
             payload_dict: dict[str, Any],
-            record_dict: dict[str, Any] | None = None,
-            expected_checkpoint: str | None = None,
-            generation_id: str | None = None,
-        ):
-            async for event in self._stream_generate(
-                payload_dict, record_dict, expected_checkpoint, generation_id
-            ):
-                yield event
+            record_dict: dict[str, Any] | None,
+            expected_checkpoint: str | None,
+            generation_id: str,
+            dispatch_deadline_unix: float,
+            queue_id: str,
+            invocation_nonce: str,
+        ) -> dict[str, Any]:
+            from flash.serving.src.stream_channel.engine import stream_generate_call
+
+            # A regular async invocation avoids Modal's generator-output drain on
+            # disconnect, which can time out and kill a shared GPU replica.
+            return await stream_generate_call(
+                self,
+                payload_dict,
+                record_dict,
+                expected_checkpoint,
+                generation_id,
+                dispatch_deadline_unix,
+                queue_id,
+                invocation_nonce,
+            )
 
         @modal.method()
         async def unregister(
@@ -482,12 +498,21 @@ class _ModalEnginePool:
         *,
         expected_checkpoint: str | None = None,
     ) -> dict[str, Any]:
+        from flash.serving.deepinfer.app.client import HostedDeepInfer
+        from flash.serving.deepinfer.contract.config import MODEL_ID as deepseek_model
+
+        if base_model == deepseek_model:
+            return await HostedDeepInfer().generate(
+                base_model, payload, record, expected_checkpoint=expected_checkpoint
+            )
+        from flash.serving.src.io.cache_namespace import internal_generation_payload
+
         generation_id = payload.generation_id
         if not generation_id:
             raise RuntimeError("generation id is required before modal dispatch")
         engine = _engine_cls_for(base_model)(base_model=base_model)
         return await engine.generate.remote.aio(
-            payload.model_dump(),
+            internal_generation_payload(payload),
             self._record_payload(record),
             expected_checkpoint,
             generation_id,
@@ -501,15 +526,35 @@ class _ModalEnginePool:
         *,
         expected_checkpoint: str | None = None,
     ):
+        from flash.serving.deepinfer.app.client import HostedDeepInfer
+        from flash.serving.deepinfer.contract.config import MODEL_ID as deepseek_model
+
+        if base_model == deepseek_model:
+            stream = HostedDeepInfer().stream_generate(
+                base_model, payload, record, expected_checkpoint=expected_checkpoint
+            )
+            try:
+                async for event in stream:
+                    yield event
+            finally:
+                await stream.aclose()
+            return
+        from flash.serving.src.io.cache_namespace import internal_generation_payload
+
         generation_id = payload.generation_id
         if not generation_id:
             raise RuntimeError("generation id is required before modal dispatch")
         engine = _engine_cls_for(base_model)(base_model=base_model)
-        remote_stream = engine.stream_generate.remote_gen.aio(
-            payload.model_dump(),
-            self._record_payload(record),
-            expected_checkpoint,
-            generation_id,
+        from flash.serving.src.stream_channel.client import CancellableStreamChannel
+
+        remote_stream = CancellableStreamChannel(
+            spawn_method=engine.stream_generate_call,
+            payload_dict=internal_generation_payload(payload),
+            record_dict=self._record_payload(record),
+            expected_checkpoint=expected_checkpoint,
+            generation_id=generation_id,
+            dispatch_deadline_unix=time.time() + ROUTER_TIMEOUT_SECONDS,
+            invocation_nonce=uuid.uuid4().hex,
         )
         try:
             async for event in remote_stream:
@@ -744,7 +789,7 @@ def _base_model_records() -> list:
     records are never persisted and never org-owned; ``serve_base_model`` marks them so the engine
     generates against the base weights (lora_request=None) and the router serves them openly.
     """
-    from flash.serving.src.engine.model_config import base_models
+    from flash.serving.src.engine.model_config import hosted_base_models
     from flash.serving.src.io.schemas import AdapterRecord
 
     return [
@@ -757,7 +802,7 @@ def _base_model_records() -> list:
             org_id=None,
             status="ready",
         )
-        for m in base_models()
+        for m in hosted_base_models()
     ]
 
 
@@ -775,6 +820,7 @@ def _base_model_records() -> list:
     custom_domains=[SERVING_CUSTOM_DOMAIN] if SERVING_CUSTOM_DOMAIN else None,
 )
 def router():
+    from flash.serving.src.http.rate_limit import SupabaseRateLimiter
     from flash.serving.src.http.router import AdapterRouter, build_serving_app
     from flash.serving.src.store import settings as cfg
     from flash.serving.src.store.persistence import get_adapter, load_adapters
@@ -797,6 +843,7 @@ def router():
         reload_interval_seconds=cfg.RELOAD_INTERVAL_SECONDS,
         # durable capture is required in configured serving deployments.
         usage_store=_build_usage_outbox(settings),
+        rate_limiter=SupabaseRateLimiter(settings),
         # External chat auth is ALWAYS enforced: a request needs a Freesolo API key whose org owns
         # the adapter (the backend authorizes), or the shared internal key to bypass. The authorizer
         # must be wired (backend URL + internal key) or non-internal chat fails closed.

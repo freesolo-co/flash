@@ -2,7 +2,6 @@
 
 Run from this checkout after installing scripts/checkpoint-migration-requirements.txt.
 Requires FLASH_CHECKPOINT_DATABASE_URL and defaults to a read-only dry run.
-See docs/checkpoint-field-cutover.md for the isolated setup command before using --apply.
 """
 
 from __future__ import annotations

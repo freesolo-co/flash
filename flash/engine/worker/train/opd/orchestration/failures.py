@@ -21,6 +21,7 @@ from pathlib import Path
 import flash.engine.worker.io.hf as _worker_hf
 import flash.engine.worker.perf as _worker_perf
 from flash.engine.worker.runtime.state import WorkerContext
+from flash.engine.worker.train.core.lifecycle.timing import checkpoint_phase
 from flash.engine.worker.train.entry.sft_train import (
     _export_checkpoint_adapter,
     _VerlCheckpointWatcher,
@@ -34,7 +35,6 @@ from flash.engine.worker.train.opd.orchestration.protocol import (
 from flash.engine.worker.verl.checkpoints import (
     inspect_resume_checkpoint,
     resume_topology_matches,
-    resume_upload_unavailable,
 )
 from flash.teacher.limits import OPD_NO_SIGNAL_ATTEMPTS
 from flash.teacher.retry_contract import (
@@ -309,6 +309,16 @@ class _OpdVerlCheckpointWatcher(_VerlCheckpointWatcher):
         return pending
 
     def _publish(self, step: int, checkpoint_dir: str) -> None:
+        staged_dir = self._staged_source(step, checkpoint_dir)
+        try:
+            with checkpoint_phase(step, "adapter_publication"):
+                self._prepare_checkpoint(step, staged_dir)
+            self._persist_resume(step, staged_dir, job_label="opd")
+        except BaseException:
+            shutil.rmtree(staged_dir, ignore_errors=True)
+            raise
+
+    def _prepare_checkpoint(self, step: int, checkpoint_dir: str) -> None:
         actor_dir = os.path.join(checkpoint_dir, "actor")
         adapter_dir = os.path.join(self.export_root, f"step-{step}")
         # claimed before the work: `_pending` filters on the discovered set, so leaving a step
@@ -343,13 +353,6 @@ class _OpdVerlCheckpointWatcher(_VerlCheckpointWatcher):
                 adapter_dir, step, required=True, _provenance_ready=True, context=self.context
             )
             self.lifecycle.record_publication(step, published)
-        uploaded = _worker_hf.upload_resume_checkpoint(
-            step, checkpoint_dir, final_step=self.final_step, context=self.context
-        )
-        self.lifecycle.record_publication(step, uploaded)
-        if step in self.required_steps and uploaded.resume is None and not uploaded.resume_staged:
-            self.lifecycle.mark_failed(step)
-            resume_upload_unavailable(step, checkpoint_dir, job_label="opd")
 
 
 def _restore_verl_resume(
