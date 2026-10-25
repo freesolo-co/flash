@@ -22,26 +22,44 @@ def _fetch(
     HIDDEN: tl.constexpr,
     ENTRIES: tl.constexpr,
     TOKENS: tl.constexpr,
-    SF_STRIDE: tl.constexpr,
+    SF_TOKEN_STRIDE: tl.constexpr,
+    SF_HIDDEN_STRIDE: tl.constexpr,
     RANKS: tl.constexpr,
+    BLOCK_ENTRIES: tl.constexpr,
+    BLOCK_HIDDEN: tl.constexpr,
 ):
-    entry = tl.program_id(0)
-    global_row = tl.load(indices + entry)
-    valid = (global_row >= 0) & (global_row < ROWS * RANKS)
+    entry = tl.program_id(0) * BLOCK_ENTRIES + tl.arange(0, BLOCK_ENTRIES)
+    active = entry < TOKENS * ENTRIES
+    global_row = tl.load(indices + entry, mask=active, other=-1)
+    valid = active & (global_row >= 0) & (global_row < ROWS * RANKS)
     owner = tl.minimum(tl.maximum(global_row // ROWS, 0), RANKS - 1)
     row = tl.maximum(global_row % ROWS, 0)
     wptr = tl.load(weight_ptrs + owner).to(tl.pointer_type(tl.uint8))
-    cols = tl.arange(0, HIDDEN)
-    value = tl.load(wptr + row.to(tl.int64) * HIDDEN + cols, mask=valid, other=0)
-    tl.store(output + entry.to(tl.int64) * HIDDEN + cols, value)
+    cols = tl.arange(0, BLOCK_HIDDEN)
+    value = tl.load(
+        wptr[:, None] + row[:, None].to(tl.int64) * HIDDEN + cols[None, :],
+        mask=valid[:, None] & (cols[None, :] < HIDDEN),
+        other=0,
+    )
+    tl.store(
+        output + entry[:, None].to(tl.int64) * HIDDEN + cols[None, :],
+        value,
+        mask=active[:, None] & (cols[None, :] < HIDDEN),
+    )
     packs: tl.constexpr = HIDDEN // 128
     sptr = tl.load(sf_ptrs + owner).to(tl.pointer_type(tl.int32))
     sf = tl.load(
-        sptr + row.to(tl.int64) * packs + cols, mask=valid & (cols < packs), other=2139062143
+        sptr[:, None] + row[:, None].to(tl.int64) * packs + cols[None, :],
+        mask=valid[:, None] & (cols[None, :] < packs),
+        other=2139062143,
     )
     token = entry // ENTRIES
-    sfcol = (entry % ENTRIES) * packs + cols
-    tl.store(out_sf + token + sfcol * SF_STRIDE, sf, mask=cols < packs)
+    sfcol = (entry[:, None] % ENTRIES) * packs + cols[None, :]
+    tl.store(
+        out_sf + token[:, None] * SF_TOKEN_STRIDE + sfcol * SF_HIDDEN_STRIDE,
+        sf,
+        mask=active[:, None] & (cols[None, :] < packs),
+    )
 
 
 class LocalEngramBuffer:
@@ -57,6 +75,12 @@ class LocalEngramBuffer:
         self.hidden = hidden_size
         self.max_tokens = max_num_tokens
         self.entries = num_entries_per_token
+        if not self.rows or any(row <= 0 for row in self.rows):
+            raise ValueError("Engram requires nonempty, positive shard sizes")
+        if hidden_size <= 0 or hidden_size % 128:
+            raise ValueError("FP8 Engram width must be a positive multiple of 128")
+        if max_num_tokens <= 0 or num_entries_per_token <= 0:
+            raise ValueError("Engram token capacity and entries per token must be positive")
         self.owned = []
         self.peers = []
         self.registered = []
@@ -98,9 +122,11 @@ class LocalEngramBuffer:
             if rank != self.rank and cuda:
                 # Each engine exposes its own device as cuda:0. Import the IPC
                 # allocation into this rank's current CUDA context.
-                args = list(args)
-                args[6] = torch.cuda.current_device()
-                peer = rebuild(*args)
+                import inspect
+
+                arguments = inspect.signature(rebuild).bind(*args)
+                arguments.arguments["storage_device"] = torch.cuda.current_device()
+                peer = rebuild(*arguments.args, **arguments.kwargs)
             elif rank != self.rank:
                 import time
 
@@ -138,17 +164,28 @@ class LocalEngramBuffer:
         return torch.tensor(pointers, dtype=torch.int64, device="cuda")
 
     def write(self, storages, sfs):
-        assert len(storages) == len(self.rows) == len(sfs)
+        if self.tables:
+            raise RuntimeError("Engram storage is already initialized")
+        if sfs is None or len(storages) != len(self.rows) or len(sfs) != len(self.rows):
+            raise ValueError("One FP8 weight and scale shard is required per Engram layer")
+        # Validate every local shard before starting collective handle exchange.
         for index, (weight, scale) in enumerate(zip(storages, sfs, strict=True)):
-            assert weight.dtype == torch.float8_e4m3fn
-            assert weight.shape == (
+            if weight.dtype != torch.float8_e4m3fn or weight.shape != (
                 self.rows[index],
                 self.hidden,
-            )
-            assert scale.dtype == torch.float32
+            ):
+                raise ValueError("Engram weights must be FP8 with the configured shard shape")
+            if not weight.is_contiguous():
+                raise ValueError("Engram weights must be contiguous")
+            if scale.dtype != torch.float32 or scale.shape != (self.rows[index], self.hidden // 32):
+                raise ValueError("Engram scales must be FP32 with one scale per 32 values")
+            if scale.device != weight.device or not scale.is_contiguous():
+                raise ValueError("Engram scales must be contiguous and on the weight device")
+        for weight, scale in zip(storages, sfs, strict=True):
             # Pack on the original device, preserving every power-of-two scale.
             bits = scale.view(torch.int32)
-            assert not bool(torch.any((bits < 0) | ((bits & 0x7FFFFF) != 0)))
+            if bool(torch.any((bits < 0) | ((bits & 0x7FFFFF) != 0))):
+                raise ValueError("Engram scales must be nonnegative powers of two")
             packed = (bits >> 23).to(torch.uint8).view(torch.int32).contiguous()
             if not weight.is_cuda:
                 packed = packed.cpu()
@@ -157,22 +194,36 @@ class LocalEngramBuffer:
         dist.barrier(group=self.group)
 
     def fetch(self, indices, use_tma_aligned_col_major_sf=True):
+        if len(self.tables) != len(self.rows):
+            raise RuntimeError("Engram storage is not initialized")
+        if indices.ndim != 3 or indices.dtype != torch.int32 or not indices.is_cuda:
+            raise ValueError("Engram indices must be a three-dimensional CUDA int32 tensor")
+        if not indices.is_contiguous():
+            raise ValueError("Engram indices must be contiguous")
         layers, tokens, entries = indices.shape
-        assert layers == len(self.rows)
-        assert entries == self.entries
-        assert tokens <= self.max_tokens
+        if layers != len(self.rows) or entries != self.entries or tokens > self.max_tokens:
+            raise ValueError(
+                "Engram indices do not match the configured layer, entry, or token limits"
+            )
         results = []
         for layer in range(layers):
             output = torch.empty(
                 (tokens, entries * self.hidden), dtype=torch.float8_e4m3fn, device="cuda"
             )
-            stride = triton.cdiv(tokens, 4) * 4
-            scales = torch.empty(
-                (entries * self.hidden // 128, stride), dtype=torch.int32, device="cuda"
-            ).T[:tokens]
+            sf_columns = entries * self.hidden // 128
+            if use_tma_aligned_col_major_sf:
+                stride = triton.cdiv(tokens, 4) * 4
+                scales = torch.empty((sf_columns, stride), dtype=torch.int32, device="cuda").T[
+                    :tokens
+                ]
+            else:
+                scales = torch.empty((tokens, sf_columns), dtype=torch.int32, device="cuda")
             if tokens:
                 wp, sp = self.tables[layer]
-                _fetch[(tokens * entries,)](
+                # Four-B200 ABBA tests favor grouping at larger batches. Keep one
+                # row per program for small batches to retain GPU parallelism.
+                block_entries = 4 if tokens >= 32 else 1
+                _fetch[(triton.cdiv(tokens * entries, block_entries),)](
                     indices[layer],
                     wp,
                     sp,
@@ -182,8 +233,10 @@ class LocalEngramBuffer:
                     self.hidden,
                     entries,
                     tokens,
-                    stride,
+                    *scales.stride(),
                     self.world,
+                    block_entries,
+                    triton.next_power_of_2(self.hidden),
                     num_warps=4,
                 )
             results.append(lambda output=output, scales=scales: (output, scales))
@@ -197,6 +250,8 @@ class LocalEngramBuffer:
         self.registered.clear()
         self.peers.clear()
         self.tables.clear()
+        # CUDA IPC producers must outlive every importing process's tensor views.
+        dist.barrier(group=self.group)
         self.owned.clear()
 
 
@@ -217,6 +272,8 @@ def install():
         dtype,
         num_sf_packs=0,
     ):
+        if dtype != torch.float8_e4m3fn or num_sf_packs != hidden_size // 128:
+            raise ValueError("Local Engram transport requires FP8 weights and packed UE8M0 scales")
         assert manager.engram is None
         manager.engram = LocalEngramBuffer(
             engram_group, num_entries_per_layer, hidden_size, max_num_tokens, num_entries_per_token
