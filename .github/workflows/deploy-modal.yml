@@ -73,6 +73,8 @@ jobs:
       PLATFORM_BACKEND_URL: ${{ secrets.PLATFORM_BACKEND_URL }}
       SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
       SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+      DEEPINFER_PROXY_KEY: ${{ secrets.DEEPINFER_PROXY_KEY }}
+      DEEPINFER_PROXY_SECRET: ${{ secrets.DEEPINFER_PROXY_SECRET }}
       # Branded prod serving domain. modal_app.py attaches a Modal custom_domain only when this is set
       # (empty => default *.modal.run url), so non-prod/fork/local workspaces stay deployable. This
       # domain is verified in the production Modal workspace, so prod keeps serving on serve.freesolo.co.
