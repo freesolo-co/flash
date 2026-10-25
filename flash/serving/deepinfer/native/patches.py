@@ -12,7 +12,15 @@ PATCHES = {
                 # GPU Engram storage shares CUDA allocations between local ranks.
                 # Expandable segments require pidfd_getfd, which Modal disallows.
                 'torch._C._accelerator_setAllocatorSettings("expandable_segments:False")',
-            )
+            ),
+            (
+                "torch.cuda.set_device(self.device)",
+                (
+                    "torch.cuda.set_device(self.device)\n"
+                    "        from flash.serving.deepinfer.native.engram_transport import install\n"
+                    "        install()"
+                ),
+            ),
         ],
     ),
     "csrc/engine/pybind_sequence.cpp": (

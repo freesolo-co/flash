@@ -17,11 +17,11 @@ from anyio import CancelScope
 
 from flash.serve.runtime.prompt_cache import cached_prompt_tokens
 from flash.serving.deepinfer.contract.config import (
-    GPU_COUNT,
     MAX_INPUTS,
     MODEL_CACHE,
     MODEL_ID,
     MODEL_REVISION,
+    RANK_COUNT,
     REQUEST_SECONDS,
     SEQUENCES_PER_RANK,
     STARTUP_SECONDS,
@@ -45,12 +45,12 @@ class Runtime:
         self.processes = []
         self.prompt_cache = OrderedDict()
         self.pending: dict[str, Pending] = {}
-        self.loads = [0] * GPU_COUNT
+        self.loads = [0] * RANK_COUNT
         self.ready: set[int] = set()
         self.provenance: dict[int, dict] = {}
         self.failure: str | None = None
         self.pump = None
-        self.cache_router = CacheRouter(GPU_COUNT)
+        self.cache_router = CacheRouter(RANK_COUNT)
 
     def _load_assets(self):
         from huggingface_hub import snapshot_download
@@ -67,10 +67,10 @@ class Runtime:
         context = multiprocessing.get_context("spawn")
         self.stopped = context.Event()
         self.outgoing = context.Queue(maxsize=4096)
-        self.incoming = [context.Queue(maxsize=MAX_INPUTS * 2) for _ in range(GPU_COUNT)]
-        self.last_seen = [time.monotonic()] * GPU_COUNT
+        self.incoming = [context.Queue(maxsize=MAX_INPUTS * 2) for _ in range(RANK_COUNT)]
+        self.last_seen = [time.monotonic()] * RANK_COUNT
         try:
-            for rank in range(GPU_COUNT):
+            for rank in range(RANK_COUNT):
                 process = context.Process(
                     target=run_rank,
                     args=(
@@ -85,7 +85,7 @@ class Runtime:
                 self.processes.append(process)
             self.pump = asyncio.create_task(self._dispatch())
             async with asyncio.timeout(STARTUP_SECONDS):
-                while len(self.ready) != GPU_COUNT:
+                while len(self.ready) != RANK_COUNT:
                     self.assert_healthy()
                     await asyncio.sleep(0.1)
                 from flash.serving.deepinfer.runtime.warmup import warmup
@@ -115,7 +115,7 @@ class Runtime:
                 if event is not None:
                     self._deliver(event)
                 if (
-                    len(self.ready) == GPU_COUNT
+                    len(self.ready) == RANK_COUNT
                     and time.monotonic() - min(self.last_seen) > WORKER_STALL_SECONDS
                 ):
                     raise RuntimeError("DeepInfer scheduling stalled")
@@ -140,8 +140,8 @@ class Runtime:
             if event["type"] == "ready":
                 self.ready.add(event["rank"])
                 self.provenance[event["rank"]] = event.get("provenance", {})
-                if len(self.ready) == GPU_COUNT:
-                    self.last_seen = [time.monotonic()] * GPU_COUNT
+                if len(self.ready) == RANK_COUNT:
+                    self.last_seen = [time.monotonic()] * RANK_COUNT
             return
         pending = self.pending.get(event["id"])
         if pending is not None:

@@ -5,7 +5,7 @@ from types import SimpleNamespace
 import pytest
 
 from flash.serving.deepinfer.app import token_budget as budget
-from flash.serving.deepinfer.contract.config import MODEL_ID
+from flash.serving.deepinfer.contract.config import MAX_MODEL_LEN, MODEL_ID
 from flash.serving.deepinfer.contract.errors import DeepInferError
 from flash.serving.deepinfer.contract.protocol import parse_request
 from flash.serving.deepinfer.contract.tokenizer import encode_request
@@ -30,10 +30,10 @@ async def test_local_admission_uses_native_encoding_and_exact_output_reservation
         return "encoded prompt"
 
     class Tokenizer:
-        def encode(self, prompt, *, add_special_tokens):
-            assert prompt == "encoded prompt"
+        def encode_batch(self, prompts, *, add_special_tokens):
+            assert prompts == ["encoded prompt"]
             assert not add_special_tokens
-            return SimpleNamespace(ids=[3, 4, 5])
+            return [SimpleNamespace(ids=[3, 4, 5])]
 
     monkeypatch.setattr(budget, "prepare_tokenizer", lambda: (Tokenizer(), encode))
     data = body(max_tokens=77, chat_template_kwargs={"enable_thinking": thinking})
@@ -46,7 +46,9 @@ async def test_local_admission_uses_native_encoding_and_exact_output_reservation
 
 @pytest.mark.anyio
 async def test_local_admission_rejects_over_context_before_gpu_dispatch(monkeypatch):
-    tokenizer = SimpleNamespace(encode=lambda *a, **k: SimpleNamespace(ids=[1] * 32700))
+    tokenizer = SimpleNamespace(
+        encode_batch=lambda *a, **k: [SimpleNamespace(ids=[1] * (MAX_MODEL_LEN - 68))]
+    )
     monkeypatch.setattr(budget, "prepare_tokenizer", lambda: (tokenizer, lambda *a, **k: "prompt"))
     payload = SimpleNamespace(model_dump=lambda: {**body(max_tokens=64), "model_id": MODEL_ID})
     with pytest.raises(DeepInferError, match="context") as exc:
@@ -60,7 +62,7 @@ async def test_startup_warmup_drains_and_closes_native_requests():
 
     class Runtime:
         async def prepare_tokens(self, request):
-            return [2] * 8192
+            return [2] * 16384
 
         async def prefix_length(self, request, tokens):
             return 198
@@ -73,15 +75,18 @@ async def test_startup_warmup_drains_and_closes_native_requests():
                 closed.append(request)
 
     await warmup(Runtime())
-    assert len(calls) == len(closed) == 585
-    assert all(r.prefix_tokens == 198 and r.cache_namespace == "0" * 64 for r in calls)
+    assert len(calls) == len(closed) == 2401
+    assert all(r.prefix_tokens == 198 for r in calls)
+    assert all(r.cache_namespace is None for r in calls[:-6])
+    assert all(r.cache_namespace == "0" * 64 for r in calls[-6:])
+    assert calls[-6:-4] == calls[-4:-2] == calls[-2:]
 
 
 @pytest.mark.anyio
 async def test_startup_warmup_fails_readiness_on_native_error():
     class Runtime:
         async def prepare_tokens(self, request):
-            return [2] * 8192
+            return [2] * 16384
 
         async def prefix_length(self, request, tokens):
             return 0
@@ -91,3 +96,20 @@ async def test_startup_warmup_fails_readiness_on_native_error():
 
     with pytest.raises(ExceptionGroup, match="TaskGroup"):
         await warmup(Runtime())
+
+
+@pytest.mark.parametrize(
+    "content", ["Hello world!", "世界 🙂 café\n\n", "<end> special [UNK]", "a" * 20000]
+)
+def test_thread_friendly_tokenizer_preserves_exact_single_sequence_ids(content):
+    from tokenizers import Tokenizer, models, pre_tokenizers, trainers
+
+    tokenizer = Tokenizer(models.BPE(unk_token="[UNK]"))
+    tokenizer.pre_tokenizer = pre_tokenizers.ByteLevel()
+    tokenizer.train_from_iterator(
+        ["Hello world!", "世界 🙂 café", "special text", "a" * 100],
+        trainer=trainers.BpeTrainer(vocab_size=128, special_tokens=["[UNK]", "<end>"]),
+    )
+    request = parse_request(body(messages=[{"role": "user", "content": content}]))
+    actual = encode_request(tokenizer, lambda *a, **k: content, request)
+    assert actual == tokenizer.encode(content, add_special_tokens=False).ids

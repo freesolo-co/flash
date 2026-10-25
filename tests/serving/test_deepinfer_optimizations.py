@@ -8,6 +8,7 @@ import pytest
 
 from flash.serve.runtime.prompt_cache import cached_prompt_tokens
 from flash.serve.runtime.token_batch import TokenBatch
+from flash.serving.deepinfer.contract.config import MAX_MODEL_LEN
 from flash.serving.deepinfer.contract.protocol import parse_request
 from flash.serving.deepinfer.runtime.bridge import Runtime
 from flash.serving.deepinfer.runtime.prefix_cache import Prefix, PrefixCache
@@ -45,7 +46,7 @@ async def test_deepinfer_prompt_cache_separates_thinking_tenant_and_checks_outpu
 
     def encode(request):
         calls.append(request)
-        return [2] * 32000
+        return [2] * (MAX_MODEL_LEN - 768)
 
     runtime.tokenize = encode
     request = parse_request(body(max_tokens=1))
@@ -164,6 +165,16 @@ def test_prefix_budget_counts_allocated_suffix_blocks_too():
     )
     assert added[-1]["chunk_checkpoints"] is None
     assert not cache.pending
+    cache.admit(
+        {
+            "id": "fits-first",
+            "tokens": list(range(200)),
+            "prefix_tokens": 128,
+            "cache_namespace": "tenant",
+        },
+        object(),
+    )
+    assert added[-1]["chunk_checkpoints"] is None
     cache.admit(
         {
             "id": "fits",

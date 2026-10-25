@@ -1,341 +1,134 @@
 # DeepSeek V4.1 Flash 1017 on Modal
 
-This backend serves `deepseek-ai/DeepSeek-V4.1-Flash-1017` through native
-DeepInfer, with two B200s cooperating inside each replica. The existing Flash
-CPU router retains Freesolo API-key authorization, organization attribution,
-OpenAI response formatting, and durable usage settlement. Qwen/LoRA engines
-keep their separate vLLM images and capacity.
+This backend serves `deepseek-ai/DeepSeek-V4.1-Flash-1017` through the pinned
+DeepInfer runtime. Four B200s form one EP=4 / CP=2 / DP=2 group. The existing
+Flash CPU router handles API keys, organization attribution, exact token
+reservations, OpenAI streaming, and durable usage settlement. Qwen/LoRA engines
+retain their separate vLLM images and capacity.
 
-## Code layout
-
-The parent `deepinfer/` package groups code by responsibility:
-
-| Package | Responsibility |
-| --- | --- |
-| `app/` | Private HTTP endpoint, hosted router client, event rendering, and Modal launcher |
-| `contract/` | Pinned configuration, validated chat requests, and shared errors |
-| `runtime/` | Async request bridge, GPU worker processes, prefix cache, and loaded-runtime checks |
-| `native/` | Prefix-cache native bindings and Engram GPU transport |
-
-The hosted CPU router imports `app.client` and `contract` modules. The private
-HTTP server starts `runtime.bridge.Runtime`, which launches `runtime.worker`
-processes. Workers load native GPU modules after selecting their CUDA device;
-package initializers do not load GPU dependencies. Image preparation applies
-`native.patches`, which checks the scheduler and sequence sources and adds the
-prefix-cache bindings. The native FP4 expert sources are left untouched.
-
-## Capacity and price
+## Capacity
 
 | Setting | Value |
 | --- | --- |
-| GPU allocation | `B200:2` per replica, EP=2 / DP=2 |
-| Main replica pool | 1–6; two B200s minimum, one two-B200 buffer replica; at most 12 B200s total |
-| Dev and other environments | 0–4 replicas, no buffer; at most 8 B200s; scale to zero when idle |
-| Admission | 4 requests per replica; scale-out target 3 |
-| Placement | US GPU replicas; CPU admission router in US East |
-| Native scheduler | 8 sequences per rank, 4,096-token prefill chunks; any-rank prefill check every 8 decode steps |
-| Expert execution | Native packed FP4 weights with FP8 activations and the released scales |
-| Token delivery | First output immediately; then 16 tokens or 50 ms of engine progress |
-| Idle scale-down | 600 seconds for excess replicas; main retains one replica, dev retains none |
-| Host allocation | 16 CPUs / 512 GiB RAM per replica |
-| Initial context limit | 32,768 tokens including output and 64 reserved tokens |
-| Startup / generation budgets | 45 minutes / 10 minutes |
-| Input / output / cached input | $0.15 / $0.60 / $0.003 per million tokens |
+| GPU allocation | Four B200s in one container |
+| Main | One warm container, maximum one, zero buffer containers |
+| Dev and other environments | Zero warm containers, maximum one, zero buffers |
+| Admission | Maximum 128 requests; target concurrency 96 |
+| Native scheduler | Two driver ranks, 64 sequences per rank, 16,384-token prefill chunks |
+| Context | 1,048,576 combined input/output tokens, with 64 reserved for native execution |
+| Output | Up to the remaining context budget; 350,000-token completions fit with shorter input |
+| Placement | US compute, US East routing |
+| Host allocation | 32 CPUs / 512 GiB RAM |
+| Startup / request budget | 45 minutes / two hours |
+| Failure bounds | Ten-minute native-worker watchdog; 60-second HTTP stream idle timeout |
+| Idle scale-down | 600 seconds; main retains its minimum, dev scales to zero |
 
-Modal measures active HTTP inputs and scales whole two-GPU replicas. Saturated
-replicas have a bounded native admission queue; excess traffic queues in Modal
-or receives a retryable capacity error. Each GPU group exits if one rank dies or
-stalls. Closing a request aborts its native sequence and waits for acknowledgment
-before releasing the slot; it does not terminate the other requests in that group.
+Each environment is capped at one four-GPU group. Admission above ready capacity
+may receive a retryable capacity error. A warm minimum does not make a new
+container's startup instantaneous. A failed worker retires its entire group;
+ordinary request cancellation aborts only that sequence and releases its slot
+after acknowledgment.
 
-Only Modal's explicitly selected `main` environment keeps one **replica** warm:
-its two B200s remain provisioned even with no traffic. `dev`, qualification
-environments, and unspecified environments have no warm minimum. The 600-second
-idle window applies to capacity above the environment's floor. Main also requests
-one spare two-B200 replica while the pool is active. The six-replica main cap
-includes both active and buffer capacity; dev has no spare buffer. Modal's [concurrency target](https://modal.com/docs/guide/concurrent-inputs)
-allows each replica to accept up to 4 requests while additional replicas start;
-it is not a guarantee that cold capacity will be ready for a sudden burst.
+Large fresh suffixes coalesce across the two driver ranks for up to 420ms before
+forcing an any-rank prefill attempt. Suffixes below 8,192 uncached tokens skip
+that wait. A collective maximum over pending request ages makes every driver
+choose the same scheduling vote. Startup exercises prefill shapes, representative
+decode batches, and prefix capture/reuse before readiness.
 
-Prices are captured as exact per-token decimals with version
-`2026-10-23.deepseek-1017.1`. Completion usage includes native reasoning and EOS
-tokens. GPU prefix-cache hits report the actual retained token count with
-`cached_tokens_reported=True`; misses report zero. CPU prompt-token-cache hits do
-not count as cached GPU input and receive no cached-input billing discount.
+Tokenization uses the checkpoint's official `encoding/encoding.py` and immutable
+tokenizer revision. CPU admission and native generation share the renderer and
+context validation. The one-item batch tokenizer call releases Python's lock;
+offloading the single-sequence binding to a thread alone does not. Atomic database
+admission still reads current ownership and RPM/TPM limits on every request.
+Ambiguous admissions are never retried or treated as allowed.
 
-The GPU cache keeps at most four prefixes and 32,768 tokens of retained KV allocation per
-rank. Entries expire after 600 seconds of inactivity and are evicted according to the retention policy
-or under KV-memory pressure. The router derives each cache namespace from verified
-organization attribution. Prefix matching checks exact token IDs; continuations
-use native copy-on-write state. A stable conversation prefix is preferred, with
-full-prompt reuse for single-message requests. Traffic and cache warmth determine
-the reuse ratio; 92% is not a guaranteed service setting.
+## Cache and accounting
 
-Prompt tokenization reuses the same bounded cache helper as the existing hosted
-and packaged engines, with 128 entries per DeepInfer replica and keys that include
-model revision, tenant, messages, and thinking mode. Misses run off the event loop.
-Delivery batching always flushes terminal tokens; the time limit is checked at
-engine-step boundaries and does not bound a stalled GPU collective.
+GPU prefix checkpoints are tenant scoped and require exact token IDs. Each driver
+retains at most 16 entries and 2,097,152 tokens of allocated prefix state. Entries
+expire after 600 seconds of inactivity or are evicted under memory pressure.
+One-off prefixes skip checkpoint creation; a bounded hash-only observation table
+admits them on reuse. Retention favors frequently reused prefixes relative to
+their allocated size. CPU spill is disabled because its current snapshots do not
+capture every context-parallel worker's state.
 
-Cache affinity and retained checkpoints can leave unequal prefill queues across
-ranks. The native any-rank prefill interval is eight decode steps instead of the
-upstream default of 100. Prompts shorter than 130 tokens skip prefix preparation.
+Workers advertise prefix digests to the in-container router, which balances
+saved prefill against pending work. Workers recheck namespace and token equality
+before reuse. This routing does not cross Modal containers. Cache warmth depends
+on actual traffic; a 92% hit fraction is a workload assumption, not a service
+setting or guaranteed discount.
 
-## Cache policy
+The CPU prompt-token cache holds at most 128 entries, keyed by tenant, model
+revision, messages and thinking mode. Its hits do not count as GPU-cached input.
+Only native reused-prefix counts receive cached-input pricing. Terminal usage
+includes actual completion, reasoning and EOS tokens; token delivery flushes the
+first token immediately and then batches up to 16 tokens or 50ms of engine
+progress, always flushing terminal tokens.
 
-Live prefix-aware routing is always enabled across the two DP ranks within a
-replica. Workers advertise exact namespace/prefix digests, expiring after two
-seconds. Placement balances queued prefill/decode work against saved prefill.
-Workers verify token equality. This does not route between Modal replicas.
-Qwen engines have one GPU and one DP rank each, so this rank-placement policy has
-no additional target inside those engines; Modal still places their replicas.
+The backend catalog captures exact prices in each usage record: $0.15 input,
+$0.60 output and $0.003 cached input per million tokens, price version
+`2026-10-23.deepseek-1017.1`. Settlement uses actual counts and the captured price,
+with durable outbox delivery and idempotent ledger writes. The backend's legacy
+`gpu_seconds` field stores request generation wall time as an allocation weight;
+it is not physical GPU-seconds and does not determine token charges.
 
-The fixed retention policy scores entries by decaying
-reuse count times reusable prefix length divided by the full allocated prompt
-size. Frequency has a 60-second half-life; TTL expiry is unchanged.
-The same policy applies at entry/token
-capacity and under GPU block pressure.
+Qualification results, failed comparisons and limitations are maintained in
+[PR #1508](https://github.com/freesolo-co/flash/pull/1508). Benchmark scripts and
+result files are intentionally not retained in this codebase. Throughput and
+latency must be assessed together with input lengths, output lengths, arrival
+rate, actual cache reuse and per-stream measurements.
 
-A fixed 1 GiB per rank bounds raw host KV/state tensors. GPU capacity evictions
-spill complete native blocks and SWA/recurrent state into a process-local CPU LRU.
-Only exact tenant/prefix matches restore them. Promotion drops GPU victims without
-another spill to keep the host transfer within its budget. Expired entries are
-discarded. Allocation refusal falls back to prefill. Restored exact prefixes are
-reported as cached input; tokenization-cache hits are still not discounted.
-
-The fixed retention policy scores entries by decaying
-reuse count times reusable prefix length divided by the full allocated prompt
-size. Frequency has a 60-second half-life; TTL expiry is unchanged.
-The same policy applies at entry/token
-capacity and under GPU block pressure.
-
-## Deployment and qualification
-
-### Public-path latency qualification (2026-10-25)
-
-The latency policy targets per-stream speed, with four admitted requests per
-two-B200 replica and a scale-out target of three. Main retains its one-replica
-minimum, one buffer replica, and six-replica cap; dev retains zero minimum/buffer.
-Token reservations run on the CPU router using the same pinned tokenizer and
-encoding as generation. The atomic database RPC still enforces current key
-ownership, RPM, and input-plus-output TPM on every request. HTTP connections are
-reused, and active base-model authorizations refresh before their existing TTL
-expires; failed refreshes evict cached permissions.
-
-Startup now exercises prefill buckets and every native decode batch size before
-readiness. This moves lazy kernel compilation out of customer requests. Engram
-fetch token counts and strides are runtime arguments instead of compilation
-specializations; GPU tests matched weights and scales byte-for-byte in 32 cases.
-
-These warm measurements include the real API-key, rate-limit, public SSE, and
-durable accounting paths through isolated qualification routers. Prompts are
-unique, approximately 45 or 750 tokens, with 256 requested output tokens and
-thinking disabled. GPU decode speed is the change in native completion count
-divided by the change in native inference time between the first and last event.
-It is measured separately from client buffering and aggregate throughput.
-
-| Concurrent streams | B200s serving requests | Requests | p95 TTFT | Per-stream GPU tokens/s median / p10 | Aggregate output tokens/s |
-| --- | --- | --- | --- | --- | --- |
-| 3 | 2 | 96 | 0.697 s | 117.5 / 108.5 | 275 |
-| 4 | 2 | 128 | 0.741 s | 115.0 / 106.3 | 358 |
-| 6 | 4 | 192 | 0.873 s | 120.0 / 104.1 | 529 |
-| 8 | 6 | 192 | 0.841 s | 120.3 / 105.3 | 718 |
-
-All rows above completed without errors. A matched A/B/B/A CPU-router comparison
-on the same warm two-B200 engine measured baseline p95 TTFT of 3.48–5.88 seconds
-versus 0.678–0.686 seconds after the admission changes, 96 measured requests per
-round. Startup and explicit benchmark warmups are recorded separately. A new or
-expired API-key authorization can still add approximately 0.7–0.9 seconds;
-cold GPU allocation, long prompts, and bursts beyond ready capacity are outside
-these warm latency results. Keep the buffer: eight streams on only two replicas
-reached 1.13-second p95 TTFT despite maintaining 117 GPU tokens/s median per stream.
-
-Detailed qualification results are recorded in the optimization PR description.
-Qwen shares local exact token reservations, immutable tokenizer revisions,
-authorization refresh, US placement, and startup generation warmup.
-
-### Earlier aggregate-throughput qualification (2026-10-25)
-
-The autoscaling campaign completed 6,808 private HTTP generation requests with
-zero errors, including cold/JIT warmup, concurrency 4–28, and live scale-out to
-two replicas. Each response requested 256 output tokens; every fourth request
-used a longer unique prompt. Representative measurements:
-
-| Target / concurrent requests | Requests | Aggregate output tokens/s | p95 first-token latency | Serving replicas |
-| --- | --- | --- | --- | --- |
-| 12 / 10 | 360 | 764 | 0.956 s | 1 |
-| 8 / 10 | 2,304 | 817 | 0.542 s | 2 |
-| 12 / 28 | 3,559 | 1,260 | 8.115 s | 2 |
-
-The earlier policy selected target 12 and admission limit 16: target 8 improved tail latency
-but added a second active replica for approximately 7% more throughput in this
-workload. Newly scaled replicas first delivered tokens after 329–380 seconds;
-the 600-second idle window avoids immediately discarding that startup investment.
-Main's buffer provides additional headroom while replicas start. The public-path
-latency policy above supersedes that earlier concurrency choice.
-
-These synthetic runs exclude the public router and accounting path. Comparison
-windows differ in length and hardware placement, and retain startup/JIT effects;
-they establish a practical baseline, not a universal optimum. Tuning scale-out
-was capped at two replicas. The final six-replica main cap is configuration-tested,
-not a six-replica saturation result. See [PR #1496](https://github.com/freesolo-co/flash/pull/1496)
-for the final environment and idle checks.
-
-### Native runtime qualification
-
-The two-B200 native FP4 configuration above completed 271 generation requests,
-including 24 quality cases (23 correct), a 30,303-token input, and concurrency up
-to 16, with zero request errors. It used 512 GiB of host RAM for mapped Engram
-storage and loading.
-
-A separate capacity campaign measured 15,261 aggregate output tokens/s over ten
-one-minute load windows and 168.7 requests/s for 32-token responses. Those runs
-used 256 sequences per rank and 90% GPU memory utilization. The million-token
-and 350K-output endurance tests used two sequences per rank and 92% utilization.
-Neither expanded profile is the default above. The follow-up throughput campaign
-had zero errors in 75,790 measured requests; the initial campaign had three HTTP
-read errors, and an auxiliary long-context quality batch exceeded admission and
-received HTTP 429. These are private localhost engine measurements, excluding
-public router and billing qualification.
-
-### Historical four-GPU comparisons
-
-The native bridge passed a **four-B200 smoke and performance run**; see the
-[measured results and limits in PR #1484](https://github.com/freesolo-co/flash/pull/1484).
-The earlier four-GPU FP8 bridge passed 780 measured requests with identical complete
-outputs across prefill and delivery settings. At 24 concurrent requests and 128
-output tokens each, increasing prefill from 512 to 4,096 improved the 5,068-input-token
-case from 948 to 1,607 output tokens/s and reduced median first-token latency from
-1.199 to 0.577 seconds. The 26-input-token case remained near 2,680 output tokens/s.
-These are short in-container HTTP comparisons, excluding startup and router/network
-overhead. Batched delivery reduced 131 internal events to about 20 per response.
-GPU checks also covered cached/uncached output parity, tenant isolation, eviction,
-and cancellation during prefill and decoding while another request completed.
-Peak sampled physical GPU memory was 88.93%. All validation GPUs were released.
-
-A subsequent same-four-B200 FP8 comparison isolated the cold-request scheduling
-fix. With 24 streams, 5,068 input tokens and 256 output tokens per request, cold
-aggregate throughput increased from 624 to 1,300 output tokens/s and p95 TTFT fell
-from 6.735 to 2.158 seconds. Median per-stream decode speed fell from 101.4 to 81.7
-tokens/s as prefills interrupted decoding sooner. Short cold requests improved
-from 1,817 to 2,514 aggregate tokens/s, with p95 TTFT falling from 3.083 to 0.229
-seconds. All 792 measured requests and 48 mixed-traffic requests succeeded, with
-identical complete outputs between versions for each tested workload. Native
-traces showed at most eight consecutive decode steps with waiting prefills,
-versus 100 before. The mixed test reduced new-request p95 TTFT from 10.300 to
-2.605 seconds; established streams slowed approximately 6%.
-
-This fix is not a universal throughput improvement: the cached long-prompt
-24-stream comparison included a 2.24-second native-step stall in its first repeat.
-Keeping all three repeats gives 2,512 to 1,924 aggregate tokens/s and 0.346 to
-2.378 seconds p95 TTFT. Its cause remains unisolated; the following two repeats
-reached 2,372 and 2,459 tokens/s. These localhost measurements exclude model
-startup and public-router/network overhead, and retain all first-use effects.
-Further cached-tail and sustained mixed-traffic qualification remains necessary.
-
-The earlier FP4 configuration peaked at approximately 1,597 aggregate output
-tokens/s on short prompts; that is historical evidence, not a measurement of the
-new FP8/cache/batching configuration. Separate warm benchmarks exceeded 12,000
-output tokens/s on both long-context and short-chat workloads at approximately
-92% input-token reuse. Those experiments used retained prefix states, 128
-sequences per rank, speculative decoding, and FP8 execution of losslessly
-expanded FP4 expert values. The deployable bridge uses the smaller admission/context configuration in the
-capacity table above and no speculative decoding. Its new bounded prefix cache
-and native hit counters do not by themselves establish the experimental throughput.
-The larger scheduler and speculative path still require service qualification. A 92% hit rate also depends on the
-request traffic and cache warmth.
-
-### Hosted deployment
-
-This is not complete customer rollout qualification. CPU tests cover the HTTP/native
-bridge, router authorization, pricing and settlement, thinking/non-thinking
-responses, native errors, and cancellation. Keep customer traffic disabled until
-the remaining service and accounting checks below are completed.
-
-Deploy the private backend in the intended Modal environment:
+## Deployment
 
 ```sh
 modal deploy --env dev -m flash.serving.deepinfer.app.modal_app
-# Production: keep one two-B200 replica warm.
 modal deploy --env main -m flash.serving.deepinfer.app.modal_app
 ```
 
-The `Deploy DeepInfer pools` workflow deploys this private app on relevant pushes
-to `main` and `dev`, explicitly selecting the matching Modal environment. It
-does not configure the hosted router credentials.
+The `Deploy DeepInfer pools` workflow selects the matching Modal environment on
+relevant pushes to `dev` and `main`. Only explicitly selected `main` gets a warm
+minimum. The private `Engine` Modal Server requires proxy authentication and
+exposes `/health`, `/internal/token-budget` and `/internal/generate`.
 
-The GPU endpoint requires [Modal Proxy Tokens](https://modal.com/docs/guide/webhook-proxy-auth),
-so unauthenticated requests are rejected before provisioning GPUs. The GPU backend exposes only `/health` and `/internal/generate`; OpenAI routes,
-stream formatting, usage responses, and model listing use the existing Flash
-hosted router. Run chat qualification through that router too, so probes exercise
-the same authorization, response, and accounting path as customer requests.
-
-After qualification, supply these connection credentials when deploying the
-existing serving router, following its development wiring instructions:
-
-- `DEEPINFER_PROXY_KEY` and `DEEPINFER_PROXY_SECRET`: an environment-scoped Modal
-  Proxy Token pair, **not** ordinary Modal API credentials.
-
-The router resolves the fixed `freesolo-deepseek-serving` / `serve` endpoint through
-Modal in its own environment. Only the two authentication secrets are configured
-externally; partial credentials fail closed. Without them, the native
-model is absent from the router's advertised base models. No vLLM class is
-created for DeepSeek, and LoRA registration is unsupported.
-
-The bridge follows Modal's same-origin 303 result redirects during long cold
-starts without submitting a second generation. It rejects cross-origin redirects
-before forwarding proxy credentials. Direct qualification clients must also
-follow result redirects (for example, `curl -L`). See
-[Modal request timeouts](https://modal.com/docs/guide/webhook-timeouts).
-
-**Control-plane dependency:** the separately deployed Freesolo backend must also
-recognize this exact model and the same prices in `src/billing/token_pricing.py`.
-Its `/api/serving/authorize` uses that catalog to authorize base-model requests.
-This Flash PR alone does not change that repository or enable customer access.
-Keep the router connection unset until that catalog and settlement path are ready.
-
-Qualification must exercise cold boot and coherent output against the official
-encoder, native FP8/FP4/Engram parity, thinking and streaming, cancellation during
-prefill and decoding alongside another request, rank failure, load above the
-12-input target, the six-replica main / four-replica dev caps, and idle scale-down to one replica in
-`main` and zero in `dev`.
-Verify durable accounting through the real backend at the configured rates.
+The hosted router discovers `Engine` in the same Modal environment. Its
+`DEEPINFER_PROXY_KEY` and `DEEPINFER_PROXY_SECRET` must both be configured as
+runtime secrets. Connection credentials are not included in the image or health
+response. The separately deployed Freesolo backend must recognize the exact model
+and price version in its billing catalog. Qualification through the hosted router
+must cover authorization, exact limits, cached pricing, streaming, cancellation
+and durable settlement as well as native GPU performance.
 
 ## Pinned runtime
 
-- [Model and encoder](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash-1017):
-  `1bae0e1088993b9b82de08f59de5be5a34e42170`.
-- [DeepInfer](https://github.com/deepseek-ai/DeepInfer):
-  `9bd9cf243fc53ef9afbf8f04d391d989117d6ab9`.
-- Compiled CUDA 13.2 / Python 3.12 image: `im-01M5GXCE5NCMK4TBY608BEPZ1Y`,
-  a workspace-local immutable image from the four-B200 benchmark. It contains
-  compiled DeepInfer under `/opt/DeepInfer` and Python under `/opt/deepinfer-venv`.
-  Other workspaces must build the pinned upstream runtime and replace this image
-  identity; the image is not a portable public registry artifact.
+- Model/encoder: `1bae0e1088993b9b82de08f59de5be5a34e42170`.
+- DeepInfer: `9bd9cf243fc53ef9afbf8f04d391d989117d6ab9`.
+- Base compiled CUDA 13.2 / Python 3.12 image: `im-01M5GXCE5NCMK4TBY608BEPZ1Y`.
+- Weights volume: `freesolo-deepseek-1017-weights`.
 
-Image preparation checks the upstream Git revision and exact source hashes before
-applying the short-context indexer repair and a native operation for retaining a
-completed prefix checkpoint. It rebuilds the native extension. Expert loading uses
-the released FP4 path without expanding weights to FP8. The historical precision
-benchmark restores its own pinned serving commit, including the old FP8 helpers. The local Engram
-transport substitutes mapped shared host RAM/CUDA IPC for RDMA, preserving native
-FP8 embedding values and packed scales. Cached prefixes come from real requests;
-no benchmark prompts or response cache are substituted. Native model weights are downloaded at the pinned revision
-into the persistent `freesolo-deepseek-1017-weights` volume.
+The base image is immutable and local to this Modal workspace. Other workspaces
+must build the pinned runtime and replace its identity. Image preparation checks
+the Git revision and exact source hashes, applies the short-context indexer and
+prefix-checkpoint bindings, and rebuilds the native extension. It installs local
+Engram transport in spawned context-parallel workers and disables expandable CUDA
+allocations for IPC. A missing RDMA bandwidth is accepted only after checking all
+participants share one host and every resulting physical domain is NVLink-only.
 
-The inherited build also selects `sm_100a` in FlashMLA and permits CUDA
-cross-compilation in the DeepSelect/FlashMLA platform probes. The runtime's
-`PATH` and `VIRTUAL_ENV` match the earlier successful four-B200 campaign.
-Each initialized GPU worker checks its engine source and native extension paths
-against the pinned source tree and reports the native binary SHA-256, commit,
-GPU model, native FP4 execution mode, zero converted expert tensors, and PyTorch/CUDA versions in the private `/health` response's
-`loaded_ranks` field. Both ranks must initialize before health succeeds.
-These loaded-worker records are distinct from inspecting the image on CPU.
+Native FP4 expert weights, released scales and FP8 Engram values remain intact.
+Fast kernels use native multi-token prediction with variable-length drafts; this
+configuration does not promise byte-identical outputs to batch-invariant kernels.
+Each driver reports source revision, native binary hash, GPU model, execution mode
+and library versions in `/health`. Both driver ranks must initialize successfully.
 
-The initial API supports text-only system/user/assistant messages, one completion,
-temperature, top-p, seed, max tokens, and `chat_template_kwargs.enable_thinking`.
-It uses the checkpoint's `encoding/encoding.py`, because the model does not ship
-a Jinja chat template. Tool calls, images, raw prompts, structured outputs,
-logprobs, penalties, and custom stop sequences are rejected explicitly. The
-model's advertised million-token context is not enabled in this initial capacity
-configuration.
+## API scope and code layout
+
+The API supports text-only system/user/assistant messages, one completion,
+temperature, top-p, seed, maximum tokens, and
+`chat_template_kwargs.enable_thinking`. Tool calls, images, raw prompts,
+structured outputs, logprobs, penalties and custom stop sequences are rejected.
+The combined context limit includes generated output; a million-token prompt
+cannot also request 350K output tokens.
+
+`app/` contains HTTP transport and Modal deployment; `contract/` owns identity,
+validation and encoding; `runtime/` owns driver processes, scheduling and caches;
+`native/` owns source-checked compatibility patches and local Engram transport.
+GPU dependencies are imported only after the worker selects its CUDA device.

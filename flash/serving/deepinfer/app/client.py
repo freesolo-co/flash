@@ -27,7 +27,7 @@ def endpoint_url():
 
     # Resolve the fixed backend in the router's Modal environment. Credentials
     # remain secrets; neither the endpoint nor engine policy is a deploy-time knob.
-    endpoint = modal.Function.from_name(APP_NAME, "serve").get_web_url()
+    endpoint = modal.Server.from_name(APP_NAME, "Engine").get_url()
     url = urlsplit(endpoint or "")
     if url.scheme != "https" or not url.hostname or url.username or url.password:
         raise DeepInferError(503, "DeepInfer backend has no valid HTTPS endpoint")

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import importlib.util
 import os
 import subprocess
 from pathlib import Path
@@ -32,6 +33,12 @@ def main():
     indexer = root / INDEX_PATH
     indexer.write_text(patch_indexer(indexer.read_text()))
     apply_runtime_patches(root)
+    from flash.serving.deepinfer.native.local_collectives import patch_bucket
+
+    package = importlib.util.find_spec("deep_ep")
+    if package is None or package.origin is None:
+        raise RuntimeError("Compiled runtime is missing DeepEP")
+    patch_bucket(Path(package.origin).parent / "buffers/bucket.py")
     subprocess.run(
         ["/opt/deepinfer-venv/bin/python", "setup.py", "build_ext", "--inplace"],
         cwd=root,

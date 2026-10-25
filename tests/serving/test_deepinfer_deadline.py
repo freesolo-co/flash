@@ -8,8 +8,8 @@ from types import SimpleNamespace
 import pytest
 
 from flash.serving.deepinfer.contract.config import (
-    GPU_COUNT,
     MODEL_ID,
+    RANK_COUNT,
     REQUEST_SECONDS,
     WORKER_STALL_SECONDS,
 )
@@ -21,8 +21,8 @@ from flash.serving.src.http.stream_response import await_until_disconnect
 @pytest.mark.anyio
 async def test_long_generation_budget_does_not_delay_stalled_worker_detection(monkeypatch):
     runtime = Runtime()
-    runtime.ready = set(range(GPU_COUNT))
-    runtime.last_seen = [time.monotonic() - WORKER_STALL_SECONDS - 1] * GPU_COUNT
+    runtime.ready = set(range(RANK_COUNT))
+    runtime.last_seen = [time.monotonic() - WORKER_STALL_SECONDS - 1] * RANK_COUNT
     monkeypatch.setattr(runtime, "_read_event", lambda: None)
     await asyncio.wait_for(runtime._dispatch(), timeout=1)
     assert runtime.failure == "DeepInfer replica is unavailable"
@@ -47,7 +47,7 @@ async def test_generation_deadline_survives_consumer_handoff(monkeypatch, buffer
             if command["type"] == "cancel":
                 cancelled.set()
 
-    runtime.incoming = [Commands() for _ in range(GPU_COUNT)]
+    runtime.incoming = [Commands() for _ in range(RANK_COUNT)]
     request = parse_request({"model": MODEL_ID, "messages": [{"role": "user", "content": "hello"}]})
     generator = runtime.generate(request, [0])
 
@@ -80,7 +80,7 @@ async def test_generation_deadline_survives_consumer_handoff(monkeypatch, buffer
         runtime._deliver({"type": "cancelled", "id": request_id})
         with pytest.raises(TimeoutError):
             await consumer
-        assert runtime.loads == [0] * GPU_COUNT
+        assert runtime.loads == [0] * RANK_COUNT
         assert runtime.pending == {}
         assert runtime.failure is None
     finally:

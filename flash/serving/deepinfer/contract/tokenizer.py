@@ -29,6 +29,8 @@ def encode_request(tokenizer, encode_messages, request):
     prompt = encode_messages(
         request.messages, thinking_mode="thinking" if request.thinking else "chat"
     )
-    tokens = tokenizer.encode(prompt, add_special_tokens=False).ids
+    # The single-sequence Rust binding holds the GIL even in a worker thread.
+    # A one-item batch releases it without changing rendering or token boundaries.
+    tokens = tokenizer.encode_batch([prompt], add_special_tokens=False)[0].ids
     validate_length(tokens, request.max_tokens)
     return tokens

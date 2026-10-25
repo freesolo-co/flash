@@ -293,10 +293,10 @@ def test_endpoint_is_discovered_from_fixed_same_environment_backend(monkeypatch,
 
     def lookup(*args, **kwargs):
         calls.append((args, kwargs))
-        return SimpleNamespace(get_web_url=lambda: endpoint)
+        return SimpleNamespace(get_url=lambda: endpoint)
 
     endpoint_url.cache_clear()
-    monkeypatch.setattr(modal.Function, "from_name", lookup)
+    monkeypatch.setattr(modal.Server, "from_name", lookup)
     try:
         if endpoint == "https://backend.modal.run":
             assert endpoint_url() == endpoint
@@ -304,7 +304,7 @@ def test_endpoint_is_discovered_from_fixed_same_environment_backend(monkeypatch,
         else:
             with pytest.raises(DeepInferError, match="valid HTTPS endpoint"):
                 endpoint_url()
-        assert calls == [(("freesolo-deepseek-serving", "serve"), {})]
+        assert calls == [(("freesolo-deepseek-serving", "Engine"), {})]
     finally:
         endpoint_url.cache_clear()
 

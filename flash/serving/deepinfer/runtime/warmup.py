@@ -4,16 +4,15 @@ import asyncio
 from dataclasses import replace
 
 from flash.serving.deepinfer.contract.config import (
-    GPU_COUNT,
     MODEL_ID,
     PREFILL_TOKENS,
-    SEQUENCES_PER_RANK,
+    RANK_COUNT,
 )
 from flash.serving.deepinfer.contract.protocol import parse_request
 
 
 async def warmup(runtime):
-    async def request(index, repetitions, concurrency, prefill_tokens=None):
+    async def request(index, repetitions, concurrency, prefill_tokens=None, cache=False):
         parsed = parse_request(
             {
                 "model": MODEL_ID,
@@ -40,7 +39,7 @@ async def warmup(runtime):
                 raise RuntimeError("Startup prompt is shorter than its prefill bucket")
             tokens = tokens[: prefill_tokens - 2] + tokens[-2:]
         # Warm the checkpoint path in an unreachable customer cache namespace too.
-        parsed = replace(parsed, cache_namespace="0" * 64)
+        parsed = replace(parsed, cache_namespace="0" * 64 if cache else None)
         parsed = replace(parsed, prefix_tokens=await runtime.prefix_length(parsed, tokens))
         stream = runtime.generate(parsed, tokens)
         try:
@@ -59,12 +58,17 @@ async def warmup(runtime):
     # an unseen prompt shape arrives. Cover the full chunked-prefill capacity.
     for length in range(16, PREFILL_TOKENS + 1, 16):
         async with asyncio.TaskGroup() as group:
-            for index in range(GPU_COUNT):
-                group.create_task(request(index, 512, GPU_COUNT, length))
+            for index in range(RANK_COUNT):
+                group.create_task(request(index, 2048, RANK_COUNT, length))
 
-    # Every per-rank batch size has its own native kernels. Warming only the
-    # smallest and largest batches still makes ordinary middle-sized bursts compile.
-    for concurrency in [1, *(GPU_COUNT * n for n in range(1, SEQUENCES_PER_RANK + 1))]:
+    # Exercise representative decode batches up to the full two-rank capacity.
+    for concurrency in [1, 2, 8, 16, 32, 64, 96, 128]:
         async with asyncio.TaskGroup() as group:
             for index in range(concurrency):
                 group.create_task(request(index, 64 if index % 4 == 0 else 4, concurrency))
+
+    # The first observation skips retention; the second captures and the third reuses.
+    for _ in range(3):
+        async with asyncio.TaskGroup() as group:
+            for index in range(RANK_COUNT):
+                group.create_task(request(index, 64, RANK_COUNT, cache=True))
