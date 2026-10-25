@@ -10,6 +10,7 @@ from flash.providers._lifecycle.instances.poll import (
     FIRST_LIVENESS_S,
     SETUP_GRACE_S,
     STALL_AFTER_S,
+    make_say,
 )
 from flash.providers._lifecycle.instances.poll_instance import (
     InstancePollAdapter,
@@ -36,6 +37,7 @@ def poll(handle, spec, *, log=None, deadline_at=None):
     if (h.run_id, h.phase, h.hf_repo) != (spec.run_id, spec.phase, spec.train.hf_repo):
         raise ValueError("Modal attempt does not belong to this run")
     prefix = f"{spec.phase}/{spec.run_id}"
+    say = make_say(log)
 
     def reader(filename, **kwargs):
         return make_hf_text_reader(
@@ -50,8 +52,8 @@ def poll(handle, spec, *, log=None, deadline_at=None):
     def fetch_instance():
         nonlocal worker_started, returncode
         observed_start = worker_started or read_start()
-        if worker_started is None and observed_start is not None and log is not None:
-            log(
+        if worker_started is None and observed_start is not None:
+            say(
                 f"allocation and bootstrap: {max(0, observed_start - h.started_ts):.1f}s to worker start"
             )
         worker_started = observed_start

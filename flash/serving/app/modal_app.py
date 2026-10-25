@@ -377,6 +377,14 @@ def _build_engine(
             return await self._register(record_dict, deployment_generation)
 
         @modal.method()
+        async def token_budget(
+            self, payload_dict: dict[str, Any], record_dict: dict[str, Any]
+        ) -> int:
+            from flash.serving.src.engine.token_budget import token_budget
+
+            return await token_budget(self, payload_dict, record_dict)
+
+        @modal.method()
         async def generate(
             self,
             payload_dict: dict[str, Any],
@@ -489,6 +497,17 @@ class _ModalEnginePool:
         from flash.serving.src.io.schemas import internal_adapter_payload
 
         return internal_adapter_payload(record)
+
+    async def token_budget(self, base_model: str, payload: Any, record: Any) -> int:
+        from flash.serving.deepinfer.app.client import HostedDeepInfer
+        from flash.serving.deepinfer.contract.config import MODEL_ID as deepseek_model
+        from flash.serving.src.io.cache_namespace import internal_generation_payload
+
+        if base_model == deepseek_model:
+            return await HostedDeepInfer().token_budget(payload)
+        return await _engine_cls_for(base_model)(base_model=base_model).token_budget.remote.aio(
+            internal_generation_payload(payload), self._record_payload(record)
+        )
 
     async def generate(
         self,
@@ -605,7 +624,9 @@ _AUTH_CACHE_TTL_SECONDS = 60.0
 _AUTH_CACHE_MAX_ENTRIES = 4096
 
 
-def _authorize_response(resp: Any, model_id: str) -> "AuthorizedTraffic":
+def _authorize_response(
+    resp: Any, model_id: str, *, require_api_key_id: bool = False
+) -> "AuthorizedTraffic":
     """Return the approved billing org and checkpoint generation, or fail closed."""
     from fastapi import HTTPException, status
 
@@ -618,6 +639,11 @@ def _authorize_response(resp: Any, model_id: str) -> "AuthorizedTraffic":
             org_id = body.get("orgId")
             if not isinstance(org_id, str) or not org_id.strip():
                 raise ValueError("missing billing organization")
+            api_key_id = body.get("apiKeyId")
+            if require_api_key_id or api_key_id is not None:
+                from uuid import UUID
+
+                api_key_id = str(UUID(api_key_id))
             generation = body.get("deploymentGeneration")
             if parse_checkpoint_ref(model_id) is not None and (
                 not isinstance(generation, str) or not generation.strip()
@@ -628,7 +654,7 @@ def _authorize_response(resp: Any, model_id: str) -> "AuthorizedTraffic":
                 status.HTTP_503_SERVICE_UNAVAILABLE,
                 "serving auth backend returned malformed response",
             ) from exc
-        return AuthorizedTraffic(principal_for_external_org(org_id), generation)
+        return AuthorizedTraffic(principal_for_external_org(org_id), generation, api_key_id)
     if resp.status_code == 401:
         # The backend returns 401 for BOTH an invalid *user* key (our authorize route, body
         # code "invalid_api_key") AND a rejected serving *machine* bearer (require_internal_token,
@@ -719,7 +745,7 @@ def _build_chat_authorizer(settings: Any) -> Any:
             raise HTTPException(
                 status.HTTP_503_SERVICE_UNAVAILABLE, "serving auth backend unreachable"
             ) from exc
-        return _authorize_response(resp, model_id)
+        return _authorize_response(resp, model_id, require_api_key_id=api_key.startswith("fslo_"))
 
     def _prune(now: float) -> None:
         for expired in [k for k, (exp, _) in _cache.items() if exp <= now]:
