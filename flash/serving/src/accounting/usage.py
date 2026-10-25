@@ -43,6 +43,7 @@ _USD_PER_MTOK_DIVISOR = Decimal("1000000")
 class AuthorizedTraffic:
     principal: ServingTrafficPrincipal
     deployment_generation: str | None = None
+    api_key_id: str | None = None
 
 
 @dataclass(frozen=True)

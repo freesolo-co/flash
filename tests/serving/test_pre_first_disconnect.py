@@ -110,6 +110,7 @@ def test_non_streaming_disconnect_cancels_generation(monkeypatch, route: str) ->
         class Context:
             lookup = Lookup()
             rate_limiter = staticmethod(allow_offline_inference)
+            admit_inference = inference_routes.ServingContext.admit_inference
 
             async def authorize_inference(self, *_args):
                 return AuthorizedTraffic(principal_for_external_org("org-1"), "generation-a")

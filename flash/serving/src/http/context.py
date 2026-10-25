@@ -17,6 +17,7 @@ from flash.serving.src.accounting.usage import (
     principal_for_trusted_internal,
 )
 from flash.serving.src.accounting.usage_outbox import RequestIdentity, UsageStore
+from flash.serving.src.engine.errors import engine_error_http
 from flash.serving.src.http.headers import (
     _bearer_token,
     assert_internal,
@@ -27,6 +28,7 @@ from flash.serving.src.http.headers import (
 )
 from flash.serving.src.http.rate_limit import RateLimiter
 from flash.serving.src.http.routing import AdapterRouter, EnginePool
+from flash.serving.src.io.multimodal import _prepare_generate_request, has_image_blocks
 from flash.serving.src.io.schemas import AdapterRecord
 from flash.serving.src.io.streaming import generate_once, openai_chat_stream, prepare_stream
 from flash.serving.src.store.lookup import AdapterLookup
@@ -141,6 +143,32 @@ class ServingContext:
         raise HTTPException(
             status.HTTP_503_SERVICE_UNAVAILABLE,
             "serving auth did not return an attributable principal",
+        )
+
+    async def admit_inference(
+        self, traffic: AuthorizedTraffic, payload: Any, target: AdapterRecord
+    ) -> None:
+        if traffic.api_key_id is None:
+            await self.rate_limiter(traffic.principal.orgId)
+            return
+
+        async def token_budget() -> int:
+            # Text normalization must match generation, but image decoding waits until
+            # admission. Image budgets reserve the context without decoding any pixels.
+            if not has_image_blocks(getattr(payload, "messages", None)):
+                await _prepare_generate_request(payload, target)
+            try:
+                return await self.pool.token_budget(target.base_model, payload, target)
+            except Exception as exc:
+                failure = engine_error_http(self.router, target.model_id, exc)
+                if failure is not None and 400 <= failure.status_code < 500:
+                    raise failure from exc
+                raise
+
+        await self.rate_limiter(
+            traffic.principal.orgId,
+            api_key_id=traffic.api_key_id,
+            token_budget=token_budget,
         )
 
     def assert_accounting_healthy(self) -> None:
