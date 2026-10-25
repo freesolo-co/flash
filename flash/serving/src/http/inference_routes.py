@@ -69,8 +69,8 @@ async def generate(payload: GenerateRequest, request: Request) -> JSONResponse:
         payload.model_id, org_id=_authorization_org_id(authorization)
     )
     traffic = require_attributed_traffic(authorization, target)
-    await _prepare_generate_request(payload, target)
     await _await_until_disconnect(request, context.admit_inference(traffic, payload, target))
+    await _prepare_generate_request(payload, target)
     identity = new_request_identity(request)
     admitted_at = captured_now()
     try:
@@ -105,8 +105,8 @@ async def generate_for_adapter(
         req.model_id, org_id=_authorization_org_id(authorization)
     )
     traffic = require_attributed_traffic(authorization, target)
-    await _prepare_generate_request(req, target)
     await _await_until_disconnect(request, context.admit_inference(traffic, req, target))
+    await _prepare_generate_request(req, target)
     identity = new_request_identity(request)
     admitted_at = captured_now()
     try:
@@ -198,8 +198,8 @@ async def chat_completions(payload: dict[str, Any], request: Request) -> Any:
     req = _parse_openai_generate(generate_fields)
     stream = normalized.stream
     include_usage = normalized.include_usage
-    await _prepare_generate_request(req, target)
     await _await_until_disconnect(request, context.admit_inference(traffic, req, target))
+    await _prepare_generate_request(req, target)
     completion_id = f"chatcmpl-{uuid.uuid4().hex}"
     identity = new_request_identity(request, openai_completion_id=completion_id)
     admitted_at = captured_now()

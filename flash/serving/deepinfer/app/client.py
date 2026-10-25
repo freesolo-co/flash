@@ -78,10 +78,23 @@ class HostedDeepInfer:
                 headers=headers,
                 json=chat_body(payload.model_dump()),
             )
+            if response.status_code in {400, 422}:
+                try:
+                    detail = response.json()["detail"]
+                    if not isinstance(detail, str) or not detail:
+                        raise ValueError("missing validation detail")
+                except (ValueError, KeyError, TypeError) as exc:
+                    raise DeepInferError(
+                        503, "DeepInfer returned malformed validation feedback"
+                    ) from exc
+                raise DeepInferError(response.status_code, detail)
             response.raise_for_status()
-            tokens = response.json().get("tokens")
-            if type(tokens) is not int or tokens <= 0:
-                raise DeepInferError(503, "DeepInfer returned an invalid token budget")
+            try:
+                tokens = response.json()["tokens"]
+                if type(tokens) is not int or tokens <= 0:
+                    raise ValueError("invalid token budget")
+            except (ValueError, KeyError, TypeError) as exc:
+                raise DeepInferError(503, "DeepInfer returned an invalid token budget") from exc
             return tokens
 
     async def stream_generate(self, base_model, payload, record, *, expected_checkpoint=None):

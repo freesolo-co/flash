@@ -70,6 +70,8 @@ async def admit_key(
             if type(tokens) is not int or tokens <= 0:
                 raise ValueError("invalid token budget")
         except Exception as exc:
+            if isinstance(exc, HTTPException) and 400 <= exc.status_code < 500:
+                raise
             raise HTTPException(
                 503, "serving token count unavailable", headers={"Retry-After": "5"}
             ) from exc
