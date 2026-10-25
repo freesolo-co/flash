@@ -76,8 +76,9 @@ def test_shutdown_of_reattached_poll_preserves_worker(monkeypatch, polling):
 
 
 @pytest.mark.parametrize("reattach", [False, True])
+@pytest.mark.parametrize("log_enabled", [False, True])
 def test_long_queue_then_bootstrap_can_finish_with_queue_excluded_from_cost(
-    monkeypatch, polling, reattach
+    monkeypatch, polling, reattach, log_enabled, tmp_path
 ):
     clock, artifacts, paths, handle, spec = polling
     if reattach:
@@ -104,7 +105,13 @@ def test_long_queue_then_bootstrap_can_finish_with_queue_excluded_from_cost(
         return {"status": "pending"}
 
     monkeypatch.setattr(api, "get_instance", instance)
-    result = jobs.poll(handle, spec, deadline_at=10000)
+    log_path = tmp_path / "poll.log"
+    with log_path.open("w") as log:
+        result = jobs.poll(handle, spec, log=log if log_enabled else None, deadline_at=10000)
+        # The runner supplies a file, and startup must be logged only once across poll ticks.
+        assert log_path.read_text().count(
+            "allocation and bootstrap: 1300.0s to worker start"
+        ) == int(log_enabled)
     assert result.ok
     assert result.metrics["cost_usd"] == pytest.approx(1.2)
     assert result.metrics["notes"]["cost_basis"] == "bootstrap_resource_estimate"
