@@ -525,6 +525,7 @@ class VllmLoraRuntime:
     def _build_engine(self) -> Any:
         from vllm import AsyncEngineArgs, AsyncLLMEngine
 
+        from .cache_admission import qwen_scheduler_args
         from .hub import engine_tokenizer_path
 
         _require_reasoning_compatibility(
@@ -542,6 +543,7 @@ class VllmLoraRuntime:
             "max_cpu_loras": self.config.max_cpu_loras,
             **thaw_mapping(self.config.engine_args, "engine_args"),
         }
+        kwargs.update(qwen_scheduler_args(self.config.model, kwargs))
         if self.config.model_revision is not None:
             kwargs["revision"] = self.config.model_revision
         if self.config.tokenizer_revision is not None:
