@@ -37,8 +37,8 @@ class TieredPrefixCache(PrefixCache):
 
     def prune(self, prompt_tokens=0):
         now = time.monotonic()
-        for key, (prefix, _) in list(self.cpu.items()):
-            if now - prefix.touched >= self.ttl:
+        for key in list(self.cpu):
+            if now - self.cpu[key][0].touched >= self.ttl:
                 self._drop_cpu(key)
         super().prune(prompt_tokens)
 

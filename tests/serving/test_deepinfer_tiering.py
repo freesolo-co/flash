@@ -74,6 +74,31 @@ def test_invalid_budget_rejected():
         TieredPrefixCache(None, cpu_bytes=9 * 1024**3)
 
 
+def test_prune_does_not_keep_an_evicted_cpu_snapshot_alive(monkeypatch):
+    import weakref
+
+    from flash.serving.deepinfer.runtime.prefix_cache import PrefixCache
+
+    class Snapshot:
+        nbytes = 60
+
+    value, _ = cache()
+    monkeypatch.setattr("flash.serving.deepinfer.runtime.tiered_cache.time.monotonic", lambda: 100)
+    insert(value, "hot")
+    snapshot = Snapshot()
+    reference = weakref.ref(snapshot)
+    value.cpu["old"] = (value.entries["hot"], snapshot)
+    value.cpu_bytes = snapshot.nbytes
+    del snapshot
+
+    def prune(self, prompt_tokens):
+        self._drop_cpu("old")
+        assert reference() is None
+
+    monkeypatch.setattr(PrefixCache, "prune", prune)
+    value.prune()
+
+
 def test_restore_copy_failure_releases_native_allocation(monkeypatch):
     import sys
 
