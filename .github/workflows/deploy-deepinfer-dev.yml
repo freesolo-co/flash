@@ -1,0 +1,39 @@
+name: Deploy development DeepInfer pool
+
+on:
+  push:
+    branches: [dev]
+    paths:
+      - flash/serving/deepinfer/**
+      - flash/serving/src/**
+      - flash/serve/**
+      - pyproject.toml
+      - uv.lock
+      - .github/workflows/deploy-deepinfer-dev.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deploy-deepinfer-dev
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    if: github.ref == 'refs/heads/dev'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      MODAL_TOKEN_ID: ${{ secrets.MODAL_TOKEN_ID }}
+      MODAL_TOKEN_SECRET: ${{ secrets.MODAL_TOKEN_SECRET }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        with:
+          version: "0.12.5"
+          python-version: "3.12"
+      - name: Install deployment dependencies
+        run: uv sync --extra serving --locked --no-dev
+      - name: Deploy private DeepInfer pool with its warm floor
+        run: uv run --no-sync modal deploy --env dev -m flash.serving.deepinfer.app.modal_app

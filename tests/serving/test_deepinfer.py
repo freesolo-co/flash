@@ -317,7 +317,7 @@ def test_modal_private_two_gpu_autoscaling_contract(monkeypatch):
         sys.modules.pop(name, None)
     assert captured["function"]["gpu"] == "B200:2"
     assert captured["function"]["memory"] == 524288
-    assert captured["function"]["min_containers"] == 0
+    assert captured["function"]["min_containers"] == 1
     assert captured["function"]["max_containers"] == 4
     assert captured["function"]["buffer_containers"] == 0
     assert captured["function"]["scaledown_window"] == 600
