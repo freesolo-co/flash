@@ -543,7 +543,7 @@ class VllmLoraRuntime:
             "max_cpu_loras": self.config.max_cpu_loras,
             **thaw_mapping(self.config.engine_args, "engine_args"),
         }
-        kwargs.update(qwen_scheduler_args(self.config.model, kwargs))
+        kwargs.update(qwen_scheduler_args(self.config.model))
         if self.config.model_revision is not None:
             kwargs["revision"] = self.config.model_revision
         if self.config.tokenizer_revision is not None:

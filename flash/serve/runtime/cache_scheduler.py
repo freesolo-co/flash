@@ -58,3 +58,14 @@ class CacheScheduler(CacheAdmission, Scheduler):
 
 class AsyncCacheScheduler(CacheAdmission, AsyncScheduler):
     pass
+
+
+class QwenCacheScheduler:
+    """Choose after vLLM resolves automatic async compatibility for the model."""
+
+    def __new__(cls, *args, **kwargs):
+        config = kwargs["vllm_config"] if "vllm_config" in kwargs else args[0]
+        scheduler = (
+            AsyncCacheScheduler if config.scheduler_config.async_scheduling else CacheScheduler
+        )
+        return scheduler(*args, **kwargs)

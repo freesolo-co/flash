@@ -32,12 +32,9 @@ def test_old_and_preempted_head_requests_keep_their_place():
     assert cached_candidate(deque([head, hit]), cached, 100.01) is head
 
 
-def test_candidate_search_and_sync_async_configuration_are_bounded():
+def test_candidate_search_is_bounded_and_only_qwen_uses_custom_admission():
     head, hit = request("head", 5000), request("hit", 5000)
     waiting = deque([head] * 16 + [hit])
     assert cached_candidate(waiting, lambda r: 4800 if r is hit else 0, 100.1) is head
-    assert qwen_scheduler_args("other", {}) == {}
-    assert qwen_scheduler_args("Qwen/model", {})["scheduler_cls"].endswith("AsyncCacheScheduler")
-    assert qwen_scheduler_args("Qwen/model", {"async_scheduling": False})["scheduler_cls"].endswith(
-        ".CacheScheduler"
-    )
+    assert qwen_scheduler_args("other") == {}
+    assert qwen_scheduler_args("Qwen/model")["scheduler_cls"].endswith(".QwenCacheScheduler")

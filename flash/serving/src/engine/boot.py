@@ -203,7 +203,7 @@ def engine_args_for(
         **extra,
         **cfg.vllm_engine_kwargs(),
     }
-    kwargs.update(qwen_scheduler_args(base_model, kwargs))
+    kwargs.update(qwen_scheduler_args(base_model))
     return kwargs
 
 

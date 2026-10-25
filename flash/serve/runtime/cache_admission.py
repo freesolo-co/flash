@@ -20,10 +20,7 @@ def cached_candidate(waiting, cached_tokens, now):
     return best
 
 
-def qwen_scheduler_args(model, engine_args):
+def qwen_scheduler_args(model):
     if not model.startswith(("Qwen/", "Freesolo-Co/Qwen")):
         return {}
-    name = (
-        "CacheScheduler" if engine_args.get("async_scheduling") is False else "AsyncCacheScheduler"
-    )
-    return {"scheduler_cls": f"flash.serve.runtime.cache_scheduler.{name}"}
+    return {"scheduler_cls": "flash.serve.runtime.cache_scheduler.QwenCacheScheduler"}
