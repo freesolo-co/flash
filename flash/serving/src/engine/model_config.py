@@ -13,6 +13,7 @@ from __future__ import annotations
 from typing import Any
 
 from flash.serve.request.tool_calls import qualified_tool_parser
+from flash.serving.deepinfer.contract.config import GPU as DEEPSEEK_GPU
 from flash.serving.deepinfer.contract.config import MODEL_ID as DEEPSEEK_MODEL_ID
 from flash.serving.deepinfer.contract.config import MODEL_REVISION as DEEPSEEK_MODEL_REVISION
 from flash.serving.src.engine.prequant_config import (
@@ -142,7 +143,7 @@ SERVING_MODELS: list[dict[str, Any]] = [
 # Native base-only backend is registered independently of the vLLM/LoRA matrix.
 # The router advertises it only when the authenticated backend connection is configured.
 _BY_MODEL: dict[str, dict[str, Any]] = {m["base_model"]: m for m in SERVING_MODELS}
-_BY_MODEL[DEEPSEEK_MODEL_ID] = {"gpu": "B200:4", "image_input_limit": None}
+_BY_MODEL[DEEPSEEK_MODEL_ID] = {"gpu": DEEPSEEK_GPU, "image_input_limit": None}
 
 
 def hosted_base_models() -> list[str]:
