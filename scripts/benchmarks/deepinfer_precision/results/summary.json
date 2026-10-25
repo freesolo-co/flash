@@ -1,0 +1,610 @@
+{
+  "comparisons": [
+    {
+      "workload": "long/cold/c1",
+      "arms": {
+        "fp4": {
+          "aggregate_output_tps": 103.99048881314187,
+          "ttft_s_p50": 0.3880943109998043,
+          "ttft_s_p95": 0.3880943109998043,
+          "latency_s_p95": 2.465420714499828,
+          "cached_input_fraction": 0.0,
+          "throughput_repeats": [
+            99.23680797034217,
+            99.88157786522986,
+            110.15062026795488,
+            108.09939976105389,
+            96.23631489950714,
+            108.49534922288242
+          ]
+        },
+        "fp8": {
+          "aggregate_output_tps": 107.94974949879929,
+          "ttft_s_p50": 0.3796461519999639,
+          "ttft_s_p95": 0.3796461519999639,
+          "latency_s_p95": 2.3713346360000287,
+          "cached_input_fraction": 0.0,
+          "throughput_repeats": [
+            107.93719493855802,
+            97.94723976966395,
+            108.2391988964838,
+            107.96230405904056,
+            96.83333480045367,
+            108.21467561744281
+          ]
+        }
+      },
+      "fp4_over_fp8_throughput": 0.9633231137261559,
+      "fp4_over_fp8_p95_ttft": 1.022252718631114,
+      "fp4_over_fp8_p95_latency": 1.0396764240151715,
+      "within_performance_thresholds": true,
+      "identical_output_sets": false
+    },
+    {
+      "workload": "long/cold/c24",
+      "arms": {
+        "fp4": {
+          "aggregate_output_tps": 1283.2747378255458,
+          "ttft_s_p50": 1.257810350499966,
+          "ttft_s_p95": 2.2449061200001097,
+          "latency_s_p95": 4.662533188499992,
+          "cached_input_fraction": 0.0,
+          "throughput_repeats": [
+            1340.6609207096215,
+            1351.530267935117,
+            1277.3086794779315,
+            1239.9932168979963,
+            1239.0992362293903,
+            1289.24079617316
+          ]
+        },
+        "fp8": {
+          "aggregate_output_tps": 1231.0198228992954,
+          "ttft_s_p50": 1.243267421249925,
+          "ttft_s_p95": 2.225279171000011,
+          "latency_s_p95": 4.864915319500028,
+          "cached_input_fraction": 0.0,
+          "throughput_repeats": [
+            1201.686331827652,
+            1182.281034977012,
+            1323.8732345645747,
+            1259.949496290223,
+            1202.090149508368,
+            1296.8559612767658
+          ]
+        }
+      },
+      "fp4_over_fp8_throughput": 1.0424484756087677,
+      "fp4_over_fp8_p95_ttft": 1.0088199940285598,
+      "fp4_over_fp8_p95_latency": 0.9583996600744872,
+      "within_performance_thresholds": true,
+      "identical_output_sets": false
+    },
+    {
+      "workload": "long/cold/c8",
+      "arms": {
+        "fp4": {
+          "aggregate_output_tps": 660.1455293156014,
+          "ttft_s_p50": 0.7019890100000339,
+          "ttft_s_p95": 1.051476840499845,
+          "latency_s_p95": 3.092697327999929,
+          "cached_input_fraction": 0.0,
+          "throughput_repeats": [
+            663.7967911545198,
+            671.9988425135002,
+            579.1647125266066,
+            656.4942674766828,
+            665.6188190575632,
+            561.7413208772351
+          ]
+        },
+        "fp8": {
+          "aggregate_output_tps": 626.7576541067741,
+          "ttft_s_p50": 0.7075001829999792,
+          "ttft_s_p95": 1.0611897620000263,
+          "latency_s_p95": 3.260169430000019,
+          "cached_input_fraction": 0.0,
+          "throughput_repeats": [
+            619.9586961660578,
+            634.0562666001663,
+            542.2992581996973,
+            641.5135049701939,
+            633.5566120474904,
+            535.4782094293853
+          ]
+        }
+      },
+      "fp4_over_fp8_throughput": 1.053270789738356,
+      "fp4_over_fp8_p95_ttft": 0.9908471398349382,
+      "fp4_over_fp8_p95_latency": 0.9486308593476722,
+      "within_performance_thresholds": true,
+      "identical_output_sets": false
+    },
+    {
+      "workload": "long/warm/c1",
+      "arms": {
+        "fp4": {
+          "aggregate_output_tps": 125.16683913445823,
+          "ttft_s_p50": 0.10205158500002653,
+          "ttft_s_p95": 0.10205158500002653,
+          "latency_s_p95": 2.045154259000242,
+          "cached_input_fraction": 0.9964483030781374,
+          "throughput_repeats": [
+            125.26994578427617,
+            125.2926479588287,
+            125.18130378636529,
+            125.15237448255118,
+            124.99291379286815,
+            111.85050264545822
+          ]
+        },
+        "fp8": {
+          "aggregate_output_tps": 122.66109778491825,
+          "ttft_s_p50": 0.1023588609999706,
+          "ttft_s_p95": 0.1023588609999706,
+          "latency_s_p95": 2.086934076000034,
+          "cached_input_fraction": 0.9964483030781374,
+          "throughput_repeats": [
+            122.67088204452494,
+            122.74048026764767,
+            110.7935723567746,
+            122.69523454195436,
+            122.60404252682936,
+            122.65131352531156
+          ]
+        }
+      },
+      "fp4_over_fp8_throughput": 1.0204281666705257,
+      "fp4_over_fp8_p95_ttft": 0.9969980517862136,
+      "fp4_over_fp8_p95_latency": 0.9799802890372702,
+      "within_performance_thresholds": true,
+      "identical_output_sets": false
+    },
+    {
+      "workload": "long/warm/c24",
+      "arms": {
+        "fp4": {
+          "aggregate_output_tps": 2478.2849705467124,
+          "ttft_s_p50": 0.24465656399999602,
+          "ttft_s_p95": 0.3479455149999353,
+          "latency_s_p95": 2.4685058759999947,
+          "cached_input_fraction": 0.9964483030781374,
+          "throughput_repeats": [
+            2429.2280352179005,
+            1225.7348431207258,
+            2527.341905875525,
+            2332.5062005914506,
+            2647.8404452517343,
+            2670.5942658386907
+          ]
+        },
+        "fp8": {
+          "aggregate_output_tps": 2435.6585307097275,
+          "ttft_s_p50": 0.19782054950002248,
+          "ttft_s_p95": 0.2598651380000092,
+          "latency_s_p95": 2.506210804000034,
+          "cached_input_fraction": 0.9964483030781374,
+          "throughput_repeats": [
+            2376.6728198005803,
+            2352.597091126676,
+            2575.461016157095,
+            2494.6442416188747,
+            2335.724712592557,
+            2571.2950757285703
+          ]
+        }
+      },
+      "fp4_over_fp8_throughput": 1.0175009917439306,
+      "fp4_over_fp8_p95_ttft": 1.338946492314498,
+      "fp4_over_fp8_p95_latency": 0.9849554044137627,
+      "within_performance_thresholds": false,
+      "identical_output_sets": false
+    },
+    {
+      "workload": "long/warm/c8",
+      "arms": {
+        "fp4": {
+          "aggregate_output_tps": 976.7495666850252,
+          "ttft_s_p50": 0.1162647849998848,
+          "ttft_s_p95": 0.11886376399979781,
+          "latency_s_p95": 2.0908512070000143,
+          "cached_input_fraction": 0.9964483030781374,
+          "throughput_repeats": [
+            920.0074707481825,
+            981.4738387970946,
+            891.9184684280532,
+            974.4008246255082,
+            979.0983087445422,
+            981.040040785095
+          ]
+        },
+        "fp8": {
+          "aggregate_output_tps": 960.604680599597,
+          "ttft_s_p50": 0.1189597434999996,
+          "ttft_s_p95": 0.12235219199999392,
+          "latency_s_p95": 2.126099664499975,
+          "cached_input_fraction": 0.9964483030781374,
+          "throughput_repeats": [
+            959.5500104766321,
+            961.6593507225621,
+            965.0742794347856,
+            958.6079450407134,
+            962.4956745852656,
+            875.6339918784233
+          ]
+        }
+      },
+      "fp4_over_fp8_throughput": 1.0168070033505883,
+      "fp4_over_fp8_p95_ttft": 0.9714886350364995,
+      "fp4_over_fp8_p95_latency": 0.9834210700050834,
+      "within_performance_thresholds": true,
+      "identical_output_sets": false
+    },
+    {
+      "workload": "short/cold/c1",
+      "arms": {
+        "fp4": {
+          "aggregate_output_tps": 124.5375321295254,
+          "ttft_s_p50": 0.10476097449992494,
+          "ttft_s_p95": 0.10476097449992494,
+          "latency_s_p95": 2.0554292930000884,
+          "cached_input_fraction": 0.0,
+          "throughput_repeats": [
+            125.88355738880665,
+            125.79131755423799,
+            112.70236127749052,
+            124.87733369022288,
+            124.19773056882792,
+            107.41374974955313
+          ]
+        },
+        "fp8": {
+          "aggregate_output_tps": 122.78362489240318,
+          "ttft_s_p50": 0.10163843750001433,
+          "ttft_s_p95": 0.10163843750001433,
+          "latency_s_p95": 2.0848528225001246,
+          "cached_input_fraction": 0.0,
+          "throughput_repeats": [
+            123.20638989150721,
+            123.30589661374812,
+            111.7334627157862,
+            123.13404886933337,
+            122.433200915473,
+            111.48966080205727
+          ]
+        }
+      },
+      "fp4_over_fp8_throughput": 1.0142845370354492,
+      "fp4_over_fp8_p95_ttft": 1.030722009081556,
+      "fp4_over_fp8_p95_latency": 0.9858869992248412,
+      "within_performance_thresholds": true,
+      "identical_output_sets": false
+    },
+    {
+      "workload": "short/cold/c24",
+      "arms": {
+        "fp4": {
+          "aggregate_output_tps": 2470.825828600545,
+          "ttft_s_p50": 0.24942261949991007,
+          "ttft_s_p95": 0.2738034515000436,
+          "latency_s_p95": 2.4627151629999275,
+          "cached_input_fraction": 0.0,
+          "throughput_repeats": [
+            850.6121555809599,
+            2430.15629069612,
+            2710.7895887582445,
+            2511.49536650497,
+            2397.8306928751076,
+            2655.8729844516893
+          ]
+        },
+        "fp8": {
+          "aggregate_output_tps": 2557.3468474787132,
+          "ttft_s_p50": 0.22654076625002517,
+          "ttft_s_p95": 0.2410524299999679,
+          "latency_s_p95": 2.389164294999887,
+          "cached_input_fraction": 0.0,
+          "throughput_repeats": [
+            2570.8604252623477,
+            2364.5483096441317,
+            2607.5393415545395,
+            2543.8332696950783,
+            2327.834080052385,
+            2609.682580230203
+          ]
+        }
+      },
+      "fp4_over_fp8_throughput": 0.9661676635832681,
+      "fp4_over_fp8_p95_ttft": 1.135866796696802,
+      "fp4_over_fp8_p95_latency": 1.0307851863322963,
+      "within_performance_thresholds": false,
+      "identical_output_sets": false
+    },
+    {
+      "workload": "short/cold/c8",
+      "arms": {
+        "fp4": {
+          "aggregate_output_tps": 971.4160072482981,
+          "ttft_s_p50": 0.11624734125001623,
+          "ttft_s_p95": 0.12097831099987388,
+          "latency_s_p95": 2.10575652950007,
+          "cached_input_fraction": 0.0,
+          "throughput_repeats": [
+            970.1783619104045,
+            973.9640412808362,
+            979.5633249136068,
+            967.1813936306274,
+            961.8803040583255,
+            972.6536525861917
+          ]
+        },
+        "fp8": {
+          "aggregate_output_tps": 953.2833920316525,
+          "ttft_s_p50": 0.10827439625001034,
+          "ttft_s_p95": 0.11420080900006724,
+          "latency_s_p95": 2.145109929,
+          "cached_input_fraction": 0.0,
+          "throughput_repeats": [
+            954.1524670640631,
+            952.4143169992418,
+            957.8201503984751,
+            951.515594435089,
+            947.759866726754,
+            957.033993444648
+          ]
+        }
+      },
+      "fp4_over_fp8_throughput": 1.0190212221971067,
+      "fp4_over_fp8_p95_ttft": 1.0593472328186628,
+      "fp4_over_fp8_p95_latency": 0.9816543670010068,
+      "within_performance_thresholds": true,
+      "identical_output_sets": false
+    },
+    {
+      "workload": "short/warm/c1",
+      "arms": {
+        "fp4": {
+          "aggregate_output_tps": 124.87265753951223,
+          "ttft_s_p50": 0.10248014649999959,
+          "ttft_s_p95": 0.10248014649999959,
+          "latency_s_p95": 2.0499130630000764,
+          "cached_input_fraction": 0.0,
+          "throughput_repeats": [
+            126.09398985518192,
+            114.04418712773511,
+            125.83333834905518,
+            124.9925549478339,
+            124.75276013119057,
+            123.95528530583978
+          ]
+        },
+        "fp8": {
+          "aggregate_output_tps": 123.01701025339713,
+          "ttft_s_p50": 0.09949793850000788,
+          "ttft_s_p95": 0.09949793850000788,
+          "latency_s_p95": 2.080909613000017,
+          "cached_input_fraction": 0.0,
+          "throughput_repeats": [
+            123.34967702580072,
+            111.91316297464368,
+            123.02096687185217,
+            123.25572755355444,
+            111.78201678143834,
+            123.0130536349421
+          ]
+        }
+      },
+      "fp4_over_fp8_throughput": 1.0150844771978504,
+      "fp4_over_fp8_p95_ttft": 1.0299725606876917,
+      "fp4_over_fp8_p95_latency": 0.9851043265856928,
+      "within_performance_thresholds": true,
+      "identical_output_sets": false
+    },
+    {
+      "workload": "short/warm/c24",
+      "arms": {
+        "fp4": {
+          "aggregate_output_tps": 2517.73327364013,
+          "ttft_s_p50": 0.23400746150008445,
+          "ttft_s_p95": 0.255408647000138,
+          "latency_s_p95": 2.4170165329999236,
+          "cached_input_fraction": 0.0,
+          "throughput_repeats": [
+            2659.775904191603,
+            2681.576816871742,
+            2499.180761712592,
+            2509.8800084578074,
+            2525.5865388224524,
+            2356.663881400866
+          ]
+        },
+        "fp8": {
+          "aggregate_output_tps": 2556.6757046783187,
+          "ttft_s_p50": 0.22702435975003254,
+          "ttft_s_p95": 0.25103144450008585,
+          "latency_s_p95": 2.387155339499941,
+          "cached_input_fraction": 0.0,
+          "throughput_repeats": [
+            2559.0060020998176,
+            2579.338290056278,
+            2332.3940913169267,
+            2554.34540725682,
+            2569.0018219897206,
+            2437.050644690561
+          ]
+        }
+      },
+      "fp4_over_fp8_throughput": 0.9847683337519381,
+      "fp4_over_fp8_p95_ttft": 1.0174368693482567,
+      "fp4_over_fp8_p95_latency": 1.0125091119986511,
+      "within_performance_thresholds": true,
+      "identical_output_sets": false
+    },
+    {
+      "workload": "short/warm/c8",
+      "arms": {
+        "fp4": {
+          "aggregate_output_tps": 923.9666718324588,
+          "ttft_s_p50": 0.11067266324991465,
+          "ttft_s_p95": 0.11747937299992373,
+          "latency_s_p95": 2.2170964734999643,
+          "cached_input_fraction": 0.0,
+          "throughput_repeats": [
+            878.3951748634322,
+            977.114536222315,
+            979.9815958212403,
+            811.9902946510005,
+            859.1822714188927,
+            969.5381688014854
+          ]
+        },
+        "fp8": {
+          "aggregate_output_tps": 953.0284136986634,
+          "ttft_s_p50": 0.10779271324997808,
+          "ttft_s_p95": 0.11368792549990303,
+          "latency_s_p95": 2.145960079500014,
+          "cached_input_fraction": 0.0,
+          "throughput_repeats": [
+            868.6990791892125,
+            954.0404259322986,
+            957.2603904630685,
+            865.3515725016812,
+            952.016401465028,
+            955.8439741212848
+          ]
+        }
+      },
+      "fp4_over_fp8_throughput": 0.9695059019768182,
+      "fp4_over_fp8_p95_ttft": 1.0333496058033351,
+      "fp4_over_fp8_p95_latency": 1.0331489829095628,
+      "within_performance_thresholds": true,
+      "identical_output_sets": false
+    }
+  ],
+  "quality": {
+    "fp4-first": {
+      "correct": 23,
+      "total": 24
+    },
+    "fp8-first": {
+      "correct": 22,
+      "total": 24
+    },
+    "fp8-second": {
+      "correct": 22,
+      "total": 24
+    },
+    "fp4-second": {
+      "correct": 23,
+      "total": 24
+    }
+  },
+  "quality_failures": {
+    "fp4-first": [
+      {
+        "prompt_sha256": "e0249c5fcab4cde617b235445adead0961d47fba5886183b193067aa16bd44d5",
+        "expected": "3",
+        "text": "4"
+      }
+    ],
+    "fp8-first": [
+      {
+        "prompt_sha256": "e0249c5fcab4cde617b235445adead0961d47fba5886183b193067aa16bd44d5",
+        "expected": "3",
+        "text": "4"
+      },
+      {
+        "prompt_sha256": "59d0d1d8338baad30121cf9c441dc270a32f8332221e51dbf943abae18655e69",
+        "expected": "16",
+        "text": "12"
+      }
+    ],
+    "fp8-second": [
+      {
+        "prompt_sha256": "e0249c5fcab4cde617b235445adead0961d47fba5886183b193067aa16bd44d5",
+        "expected": "3",
+        "text": "4"
+      },
+      {
+        "prompt_sha256": "59d0d1d8338baad30121cf9c441dc270a32f8332221e51dbf943abae18655e69",
+        "expected": "16",
+        "text": "12"
+      }
+    ],
+    "fp4-second": [
+      {
+        "prompt_sha256": "e0249c5fcab4cde617b235445adead0961d47fba5886183b193067aa16bd44d5",
+        "expected": "3",
+        "text": "4"
+      }
+    ]
+  },
+  "quality_no_regression": true,
+  "resources": {
+    "fp4-first": {
+      "startup_seconds": 475.58901387500003,
+      "peak_sampled_gpu_mib": 155114.0,
+      "model_allocated_gib_per_rank": [
+        77.52,
+        77.52,
+        77.52,
+        77.52
+      ],
+      "kv_blocks_per_rank": [
+        649478,
+        649478,
+        649478,
+        649478
+      ]
+    },
+    "fp8-first": {
+      "startup_seconds": 432.24158709799997,
+      "peak_sampled_gpu_mib": 163060.0,
+      "model_allocated_gib_per_rank": [
+        140.802,
+        140.802,
+        140.802,
+        140.802
+      ],
+      "kv_blocks_per_rank": [
+        47994,
+        47994,
+        47994,
+        47994
+      ]
+    },
+    "fp8-second": {
+      "startup_seconds": 393.5613871449998,
+      "peak_sampled_gpu_mib": 163060.0,
+      "model_allocated_gib_per_rank": [
+        140.802,
+        140.802,
+        140.802,
+        140.802
+      ],
+      "kv_blocks_per_rank": [
+        47994,
+        47994,
+        47994,
+        47994
+      ]
+    },
+    "fp4-second": {
+      "startup_seconds": 440.0525561270001,
+      "peak_sampled_gpu_mib": 155114.0,
+      "model_allocated_gib_per_rank": [
+        77.52,
+        77.52,
+        77.52,
+        77.52
+      ],
+      "kv_blocks_per_rank": [
+        649476,
+        649476,
+        649476,
+        649476
+      ]
+    }
+  },
+  "fp4_meets_all_thresholds": false
+}

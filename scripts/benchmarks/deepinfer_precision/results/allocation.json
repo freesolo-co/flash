@@ -1,0 +1,22 @@
+{
+  "app_id": "ap-IcO8JUriZiazV2UZB3cwrS",
+  "image": "im-DG4Ugn1qPde6Y5UYusMSGR",
+  "started": 1792884805.6162019,
+  "timeout_seconds": 7200,
+  "gpu": "B200:4",
+  "cpu": 16,
+  "host_memory_mib": 524288,
+  "base_commit": "ee68f7a97881b30836cd3e5bf41cd775a6a503f7",
+  "order": [
+    "fp4-first",
+    "fp8-first",
+    "fp8-second",
+    "fp4-second"
+  ],
+  "similarity": {
+    "throughput_relative": 0.05,
+    "p95_latency_relative": 0.1,
+    "quality": "no task accuracy regression"
+  },
+  "sandbox_id": "sb-U100BayDNa0K0ABJMgah5i"
+}
