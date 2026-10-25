@@ -55,7 +55,8 @@ GPU autoscaling is capped at `MAX_CONTAINERS = 4` per model, including its activ
 the configured limits total 12 GPU containers per environment. Requests queue when a model's four
 containers are busy; an idle model's capacity cannot be borrowed by another model.
 
-The CPU router remains warm and uncapped. `BUFFER_CONTAINERS = 1` applies to the router and every
+The CPU router remains warm and uncapped, with eight CPUs and 16 GiB RAM per container
+for exact token counting and concurrent stream framing. `BUFFER_CONTAINERS = 1` applies to the router and every
 engine, but only while active, so GPU engines still scale to zero when idle. Idle windows are set by
 `SCALEDOWN_WINDOW_SECONDS_BY_GPU`; the active B200 tiers use 2100 seconds. The router uses
 `MAX_INPUTS = 64` with `TARGET_INPUTS = 48`; engine concurrency follows each model's `max_num_seqs`.
