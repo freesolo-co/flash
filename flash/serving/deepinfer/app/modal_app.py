@@ -5,7 +5,6 @@ from __future__ import annotations
 import os
 import subprocess
 import threading
-from pathlib import Path
 
 import modal
 
@@ -37,14 +36,9 @@ image = (
         }
     )
     .add_local_python_source("flash", copy=True)
-    .add_local_file(
-        Path(__file__).resolve().parents[4] / "scripts" / "prepare_deepinfer_image.py",
-        remote_path="/root/prepare_deepinfer_image.py",
-        copy=True,
-    )
     .run_commands(
         f"{RUNTIME_PYTHON} -m pip install fastapi==0.141.1 uvicorn==0.52.0",
-        f"{RUNTIME_PYTHON} /root/prepare_deepinfer_image.py",
+        f"{RUNTIME_PYTHON} -m flash.serving.deepinfer.native.image",
     )
 )
 app = modal.App(APP_NAME, image=image)
@@ -52,7 +46,7 @@ weights = modal.Volume.from_name("freesolo-deepseek-1017-weights", create_if_mis
 
 
 def _watch_server(process):
-    # Retire only this four-GPU replica on startup/native worker death. Other replicas and
+    # Retire only this two-GPU replica on startup/native worker death. Other replicas and
     # requests remain independent; ordinary client cancellation never exits the server.
     process.wait()
     os._exit(1)
@@ -61,7 +55,7 @@ def _watch_server(process):
 @app.function(
     gpu=GPU,
     cpu=16,
-    memory=262144,
+    memory=524288,  # Engram host storage and loading peaked above 300 GiB in qualification.
     volumes={"/weights": weights},
     min_containers=MIN_CONTAINERS,
     max_containers=MAX_CONTAINERS,

@@ -1,7 +1,7 @@
 # DeepSeek V4.1 Flash 1017 on Modal
 
 This backend serves `deepseek-ai/DeepSeek-V4.1-Flash-1017` through native
-DeepInfer, with four B200s cooperating inside each replica. The existing Flash
+DeepInfer, with two B200s cooperating inside each replica. The existing Flash
 CPU router retains Freesolo API-key authorization, organization attribution,
 OpenAI response formatting, and durable usage settlement. Qwen/LoRA engines
 keep their separate vLLM images and capacity.
@@ -15,31 +15,32 @@ The parent `deepinfer/` package groups code by responsibility:
 | `app/` | Private HTTP endpoint, hosted router client, event rendering, and Modal launcher |
 | `contract/` | Pinned configuration, validated chat requests, and shared errors |
 | `runtime/` | Async request bridge, GPU worker processes, prefix cache, and loaded-runtime checks |
-| `native/` | Upstream source patches, FP8 expert conversion, and Engram GPU transport |
+| `native/` | Prefix-cache native bindings and Engram GPU transport |
 
 The hosted CPU router imports `app.client` and `contract` modules. The private
 HTTP server starts `runtime.bridge.Runtime`, which launches `runtime.worker`
 processes. Workers load native GPU modules after selecting their CUDA device;
 package initializers do not load GPU dependencies. Image preparation applies
-`native.patches`, including imports of the matching `native.fp8` helpers.
+`native.patches`, which checks the scheduler and sequence sources and adds the
+prefix-cache bindings. The native FP4 expert sources are left untouched.
 
 ## Capacity and price
 
 | Setting | Value |
 | --- | --- |
-| GPU allocation | `B200:4` per replica, EP=4 / DP=4 |
-| Replica pool | 0–4, at most 16 B200s |
-| Admission | 32 requests per replica; scale-out target 24 |
+| GPU allocation | `B200:2` per replica, EP=2 / DP=2 |
+| Replica pool | 0–4, at most 8 B200s |
+| Admission | 16 requests per replica; scale-out target 12 |
 | Native scheduler | 8 sequences per rank, 4,096-token prefill chunks; any-rank prefill check every 8 decode steps |
-| Expert execution | FP8 E4M3 values with the released UE8M0 scales |
+| Expert execution | Native packed FP4 weights with FP8 activations and the released scales |
 | Token delivery | First output immediately; then 16 tokens or 50 ms of engine progress |
 | Idle shutdown | 600 seconds, no warm floor or spare buffer |
-| Host allocation | 16 CPUs / 256 GiB RAM per replica |
+| Host allocation | 16 CPUs / 512 GiB RAM per replica |
 | Initial context limit | 32,768 tokens including output and 64 reserved tokens |
 | Startup / generation budgets | 45 minutes / 10 minutes |
 | Input / output / cached input | $0.15 / $0.60 / $0.003 per million tokens |
 
-Modal measures active HTTP inputs and scales whole four-GPU replicas. Saturated
+Modal measures active HTTP inputs and scales whole two-GPU replicas. Saturated
 replicas have a bounded native admission queue; excess traffic queues in Modal
 or receives a retryable capacity error. Each GPU group exits if one rank dies or
 stalls. Closing a request aborts its native sequence and waits for acknowledgment
@@ -71,7 +72,7 @@ upstream default of 100. Prompts shorter than 130 tokens skip prefix preparation
 
 ## Cache policy
 
-Live prefix-aware routing is always enabled across the four DP ranks within a
+Live prefix-aware routing is always enabled across the two DP ranks within a
 replica. Workers advertise exact namespace/prefix digests, expiring after two
 seconds. Placement balances queued prefill/decode work against saved prefill.
 Workers verify token equality. This does not route between Modal replicas.
@@ -91,11 +92,34 @@ another spill to keep the host transfer within its budget. Expired entries are
 discarded. Allocation refusal falls back to prefill. Restored exact prefixes are
 reported as cached input; tokenization-cache hits are still not discounted.
 
+The fixed retention policy scores entries by decaying
+reuse count times reusable prefix length divided by the full allocated prompt
+size. Frequency has a 60-second half-life; TTL expiry is unchanged.
+The same policy applies at entry/token
+capacity and under GPU block pressure.
+
 ## Deployment and qualification
+
+The two-B200 native FP4 configuration above completed 271 generation requests,
+including 24 quality cases (23 correct), a 30,303-token input, and concurrency up
+to 16, with zero request errors. It used 512 GiB of host RAM for mapped Engram
+storage and loading.
+
+A separate capacity campaign measured 15,261 aggregate output tokens/s over ten
+one-minute load windows and 168.7 requests/s for 32-token responses. Those runs
+used 256 sequences per rank and 90% GPU memory utilization. The million-token
+and 350K-output endurance tests used two sequences per rank and 92% utilization.
+Neither expanded profile is the default above. The follow-up throughput campaign
+had zero errors in 75,790 measured requests; the initial campaign had three HTTP
+read errors, and an auxiliary long-context quality batch exceeded admission and
+received HTTP 429. These are private localhost engine measurements, excluding
+public router and billing qualification.
+
+### Historical four-GPU comparisons
 
 The native bridge passed a **four-B200 smoke and performance run**; see the
 [measured results and limits in PR #1484](https://github.com/freesolo-co/flash/pull/1484).
-The current FP8 bridge passed 780 measured requests with identical complete
+The earlier four-GPU FP8 bridge passed 780 measured requests with identical complete
 outputs across prefill and delivery settings. At 24 concurrent requests and 128
 output tokens each, increasing prefill from 512 to 4,096 improved the 5,068-input-token
 case from 948 to 1,607 output tokens/s and reduced median first-token latency from
@@ -137,6 +161,8 @@ capacity table above and no speculative decoding. Its new bounded prefix cache
 and native hit counters do not by themselves establish the experimental throughput.
 The larger scheduler and speculative path still require service qualification. A 92% hit rate also depends on the
 request traffic and cache warmth.
+
+### Hosted deployment
 
 This is not complete customer rollout qualification. CPU tests cover the HTTP/native
 bridge, router authorization, pricing and settlement, thinking/non-thinking
@@ -182,7 +208,7 @@ Keep the router connection unset until that catalog and settlement path are read
 Qualification must exercise cold boot and coherent output against the official
 encoder, native FP8/FP4/Engram parity, thinking and streaming, cancellation during
 prefill and decoding alongside another request, rank failure, load above the
-24-input target, the four-replica cap, and return to zero after idle timeout.
+12-input target, the four-replica cap, and return to zero after idle timeout.
 Verify durable accounting through the real backend at the configured rates.
 
 ## Pinned runtime
@@ -198,10 +224,10 @@ Verify durable accounting through the real backend at the configured rates.
   identity; the image is not a portable public registry artifact.
 
 Image preparation checks the upstream Git revision and exact source hashes before
-applying the short-context indexer repair, FP8 expert conversion, and a native
-operation for retaining a completed prefix checkpoint. It rebuilds the native
-extension. FP8 conversion expands the released FP4 values losslessly and retains
-their original scales; it does not recover a pre-quantization FP8 checkpoint. The local Engram
+applying the short-context indexer repair and a native operation for retaining a
+completed prefix checkpoint. It rebuilds the native extension. Expert loading uses
+the released FP4 path without expanding weights to FP8. The historical precision
+benchmark restores its own pinned serving commit, including the old FP8 helpers. The local Engram
 transport substitutes mapped shared host RAM/CUDA IPC for RDMA, preserving native
 FP8 embedding values and packed scales. Cached prefixes come from real requests;
 no benchmark prompts or response cache are substituted. Native model weights are downloaded at the pinned revision
@@ -212,8 +238,8 @@ cross-compilation in the DeepSelect/FlashMLA platform probes. The runtime's
 `PATH` and `VIRTUAL_ENV` match the earlier successful four-B200 campaign.
 Each initialized GPU worker checks its engine source and native extension paths
 against the pinned source tree and reports the native binary SHA-256, commit,
-GPU model, converted FP8 expert tensor count, and PyTorch/CUDA versions in the private `/health` response's
-`loaded_ranks` field. All four ranks must initialize before health succeeds.
+GPU model, native FP4 execution mode, zero converted expert tensors, and PyTorch/CUDA versions in the private `/health` response's
+`loaded_ranks` field. Both ranks must initialize before health succeeds.
 These loaded-worker records are distinct from inspecting the image on CPU.
 
 The initial API supports text-only system/user/assistant messages, one completion,
