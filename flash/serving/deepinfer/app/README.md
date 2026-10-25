@@ -110,6 +110,34 @@ capacity and under GPU block pressure.
 
 ## Deployment and qualification
 
+### Autoscaling qualification (2026-10-25)
+
+The autoscaling campaign completed 6,808 private HTTP generation requests with
+zero errors, including cold/JIT warmup, concurrency 4–28, and live scale-out to
+two replicas. Each response requested 256 output tokens; every fourth request
+used a longer unique prompt. Representative measurements:
+
+| Target / concurrent requests | Requests | Output tokens/s | p95 first-token latency | Serving replicas |
+| --- | --- | --- | --- | --- |
+| 12 / 10 | 360 | 764 | 0.956 s | 1 |
+| 8 / 10 | 2,304 | 817 | 0.542 s | 2 |
+| 12 / 28 | 3,559 | 1,260 | 8.115 s | 2 |
+
+Keep the target at 12 and the admission limit at 16: target 8 improved tail latency
+but added a second active replica for approximately 7% more throughput in this
+workload. Newly scaled replicas first delivered tokens after 329–380 seconds;
+the 600-second idle window avoids immediately discarding that startup investment.
+Main's buffer provides additional headroom while replicas start.
+
+These synthetic runs exclude the public router and accounting path. Comparison
+windows differ in length and hardware placement, and retain startup/JIT effects;
+they establish a practical baseline, not a universal optimum. Tuning scale-out
+was capped at two replicas. The final six-replica main cap is configuration-tested,
+not a six-replica saturation result. See [PR #1496](https://github.com/freesolo-co/flash/pull/1496)
+for the final environment and idle checks.
+
+### Native runtime qualification
+
 The two-B200 native FP4 configuration above completed 271 generation requests,
 including 24 quality cases (23 correct), a 30,303-token input, and concurrency up
 to 16, with zero request errors. It used 512 GiB of host RAM for mapped Engram
