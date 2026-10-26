@@ -583,3 +583,61 @@ def test_checkpoint_authorization_requires_verified_generation(
     with pytest.raises(HTTPException) as error:
         asyncio.run(authorize("key", "run-1/final"))
     assert error.value.status_code == 503
+
+
+def test_refresh_near_expiry_does_not_block_a_still_valid_hit(modal_app_module, monkeypatch):
+    import asyncio
+    import inspect
+    import time
+
+    calls = _counting_client(monkeypatch, lambda _n: _FakeResp(200, {"orgId": "org-1"}), delay=0.01)
+    authorize = _new_authorizer(modal_app_module)
+    cache = inspect.getclosurevars(authorize).nonlocals["_cache"]
+
+    async def run():
+        first = await authorize("key", "ad")
+        key = next(iter(cache))
+        cache[key] = (time.monotonic() + 5, first)
+        # No await in the cached path: concurrent hits schedule one refresh without blocking.
+        for _ in range(8):
+            assert await authorize("key", "ad") == first
+        assert calls["n"] == 1
+        await asyncio.sleep(0.03)
+        assert calls["n"] == 2
+        assert cache[key][0] > time.monotonic() + 50
+        await authorize.aclose()
+
+    asyncio.run(run())
+
+
+def test_failed_background_refresh_evicts_allow_and_cannot_extend_ttl(
+    modal_app_module, monkeypatch
+):
+    import asyncio
+    import inspect
+    import time
+
+    from fastapi import HTTPException
+
+    calls = _counting_client(
+        monkeypatch,
+        lambda n: _FakeResp(200, {"orgId": "org-1"}) if n == 1 else _FakeResp(403, {}),
+        delay=0.01,
+    )
+    authorize = _new_authorizer(modal_app_module)
+    cache = inspect.getclosurevars(authorize).nonlocals["_cache"]
+
+    async def run():
+        first = await authorize("key", "ad")
+        key = next(iter(cache))
+        cache[key] = (time.monotonic() + 5, first)
+        assert await authorize("key", "ad") == first
+        await asyncio.sleep(0.03)
+        assert key not in cache
+        with pytest.raises(HTTPException) as exc:
+            await authorize("key", "ad")
+        assert exc.value.status_code == 403
+        assert calls["n"] == 3
+        await authorize.aclose()
+
+    asyncio.run(run())

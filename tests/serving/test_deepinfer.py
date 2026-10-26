@@ -117,12 +117,21 @@ def test_unsupported_requests_never_admit_gpu_work(change):
     assert runtime.calls == 0
 
 
-def test_native_events_report_usage_and_close():
+@pytest.mark.parametrize("sse", [False, True])
+def test_native_events_report_usage_and_close(sse):
     runtime = FakeRuntime()
     with TestClient(build_app(runtime, manage_lifecycle=False)) as client:
-        response = client.post("/internal/generate", json={"request_id": "test", "chat": body()})
+        response = client.post(
+            "/internal/generate",
+            json={"request_id": "test", "chat": body()},
+            headers={"Accept": "text/event-stream" if sse else "application/x-ndjson"},
+        )
     assert response.status_code == 200
-    events = [json.loads(line) for line in response.text.splitlines()]
+    expected_type = "text/event-stream" if sse else "application/x-ndjson"
+    assert response.headers["content-type"].startswith(expected_type)
+    events = [
+        json.loads(line.removeprefix("data: ")) for line in response.text.splitlines() if line
+    ]
     assert events[0]["type"] == "ready"
     assert events[-1]["type"] == "final"
     assert events[-1]["text"] == "Hi there"
@@ -132,11 +141,18 @@ def test_native_events_report_usage_and_close():
     assert runtime.closed
 
 
-def test_error_after_first_token_is_not_successful_completion():
+@pytest.mark.parametrize("sse", [False, True])
+def test_error_after_first_token_is_not_successful_completion(sse):
     runtime = FakeRuntime([{"tokens": [2], "finish_reason": None}, RuntimeError("native failure")])
     with TestClient(build_app(runtime, manage_lifecycle=False)) as client:
-        response = client.post("/internal/generate", json={"request_id": "test", "chat": body()})
-    events = [json.loads(line) for line in response.text.splitlines()]
+        response = client.post(
+            "/internal/generate",
+            json={"request_id": "test", "chat": body()},
+            headers={"Accept": "text/event-stream" if sse else "application/x-ndjson"},
+        )
+    events = [
+        json.loads(line.removeprefix("data: ")) for line in response.text.splitlines() if line
+    ]
     assert events[-1] == {"type": "error"}
     assert not any(event["type"] == "final" for event in events)
     assert runtime.closed
@@ -196,14 +212,14 @@ async def test_disconnect_cancels_generation_task():
 )
 async def test_rank_assignment_and_cancel_are_request_scoped(namespace, prefix_tokens):
     runtime = Runtime()
-    runtime.incoming = [queue.Queue() for _ in range(config.GPU_COUNT)]
+    runtime.incoming = [queue.Queue() for _ in range(config.RANK_COUNT)]
     tokens = list(range(130))
     affinity = (
         hashlib.sha256(((namespace or "") + ":" + str(tokens[:128])).encode()).digest()[0]
-        % config.GPU_COUNT
+        % config.RANK_COUNT
     )
-    idle = (affinity + 1) % config.GPU_COUNT
-    initial_loads = [1] * config.GPU_COUNT
+    idle = (affinity + 1) % config.RANK_COUNT
+    initial_loads = [1] * config.RANK_COUNT
     initial_loads[idle] = 0
     runtime.loads = initial_loads.copy()
     if namespace and prefix_tokens:
@@ -238,7 +254,7 @@ async def test_rank_assignment_and_cancel_are_request_scoped(namespace, prefix_t
 @pytest.mark.anyio
 async def test_full_replica_does_not_enqueue_another_request():
     runtime = Runtime()
-    runtime.loads = [config.SEQUENCES_PER_RANK] * config.GPU_COUNT
+    runtime.loads = [config.SEQUENCES_PER_RANK] * config.RANK_COUNT
     with pytest.raises(OverflowError):
         await anext(runtime.generate(parse_request(body()), [0]))
     assert not runtime.pending
@@ -247,8 +263,8 @@ async def test_full_replica_does_not_enqueue_another_request():
 @pytest.mark.anyio
 async def test_slow_reader_cancels_only_its_rank_and_reports_error():
     runtime = Runtime()
-    runtime.incoming = [queue.Queue() for _ in range(config.GPU_COUNT)]
-    pending = Pending(config.GPU_COUNT - 1, asyncio.Queue(maxsize=1), asyncio.Event())
+    runtime.incoming = [queue.Queue() for _ in range(config.RANK_COUNT)]
+    pending = Pending(config.RANK_COUNT - 1, asyncio.Queue(maxsize=1), asyncio.Event())
     runtime.pending["slow"] = pending
     pending.events.put_nowait({"type": "tokens"})
     runtime._deliver({"type": "tokens", "id": "slow", "tokens": [2]})
@@ -261,7 +277,7 @@ def test_context_budget_includes_output_and_native_reserve():
     runtime = Runtime()
     runtime.encode_messages = lambda *a, **kw: "prompt"
     runtime.tokenizer = SimpleNamespace(
-        encode=lambda *a, **kw: SimpleNamespace(ids=[0] * config.MAX_MODEL_LEN)
+        encode_batch=lambda *a, **kw: [SimpleNamespace(ids=[0] * config.MAX_MODEL_LEN)]
     )
     with pytest.raises(ValueError, match="serving context"):
         runtime.tokenize(parse_request(body()))
@@ -277,7 +293,7 @@ def test_native_image_patch_rejects_unknown_source():
 @pytest.mark.parametrize(
     ("environment", "warm_replicas"), [("main", 1), ("dev", 0), ("test", 0), (None, 0)]
 )
-def test_modal_private_two_gpu_autoscaling_contract(monkeypatch, environment, warm_replicas):
+def test_modal_private_four_gpu_autoscaling_contract(monkeypatch, environment, warm_replicas):
     captured = {}
 
     class Image:
@@ -300,8 +316,8 @@ def test_modal_private_two_gpu_autoscaling_contract(monkeypatch, environment, wa
         def __init__(self, *a, **kw):
             pass
 
-        def function(self, **kwargs):
-            captured["function"] = kwargs
+        def server(self, **kwargs):
+            captured["server"] = kwargs
             return lambda fn: fn
 
     def decorator(name):
@@ -316,8 +332,7 @@ def test_modal_private_two_gpu_autoscaling_contract(monkeypatch, environment, wa
         Image=Image,
         App=App,
         Volume=SimpleNamespace(from_name=lambda *a, **kw: object()),
-        concurrent=decorator("concurrent"),
-        web_server=decorator("web"),
+        enter=decorator("enter"),
     )
     monkeypatch.setitem(sys.modules, "modal", stub)
     name = "flash.serving.deepinfer.app.modal_app"
@@ -326,17 +341,20 @@ def test_modal_private_two_gpu_autoscaling_contract(monkeypatch, environment, wa
         launcher = importlib.import_module(name)
     finally:
         sys.modules.pop(name, None)
-    assert captured["function"]["gpu"] == "B200:2"
-    assert captured["function"]["memory"] == 524288
-    assert captured["function"]["min_containers"] == warm_replicas
-    assert captured["function"]["max_containers"] == (6 if environment == "main" else 4)
-    assert captured["function"]["buffer_containers"] == (1 if environment == "main" else 0)
-    assert captured["function"]["scaledown_window"] == 600
-    assert captured["concurrent"] == {"max_inputs": 16, "target_inputs": 12}
-    assert captured["web"]["requires_proxy_auth"] is True
-    assert captured["build_commands"][-1] == (
-        f"{config.RUNTIME_PYTHON} -m flash.serving.deepinfer.native.image"
-    )
+    assert captured["server"]["gpu"] == "B200:4"
+    assert captured["server"]["memory"] == 524288
+    assert captured["server"]["min_containers"] == warm_replicas
+    assert captured["server"]["max_containers"] == (3 if environment == "main" else 1)
+    assert captured["server"]["buffer_containers"] == 0
+    assert captured["server"]["scaledown_window"] == 600
+    assert captured["server"]["scaleup_window"] == 1
+    assert captured["server"]["max_concurrency"] == 128
+    assert captured["server"]["target_concurrency"] == 8
+    assert captured["server"]["compute_region"] == "us"
+    assert captured["server"]["routing_region"] == "us-east"
+    assert captured["server"]["unauthenticated"] is False
+    assert captured["image"] == config.RUNTIME_IMAGE_ID
+    assert "build_commands" not in captured
     process = object()
 
     def launch(command):
@@ -349,7 +367,7 @@ def test_modal_private_two_gpu_autoscaling_contract(monkeypatch, environment, wa
 
     monkeypatch.setattr(launcher.subprocess, "Popen", launch)
     monkeypatch.setattr(launcher.threading, "Thread", watch)
-    launcher.serve()
+    launcher.Engine().start()
     assert captured["server_command"] == [
         config.RUNTIME_PYTHON,
         "-m",

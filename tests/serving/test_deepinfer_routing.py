@@ -2,6 +2,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from flash.serving.deepinfer.contract.config import SEQUENCES_PER_RANK
 from flash.serving.deepinfer.runtime.routing import CacheRouter, fingerprint
 
 
@@ -23,14 +24,14 @@ def test_verified_prefix_beats_idle_cold_rank_but_not_large_queue():
 def test_eviction_expiry_and_capacity_remove_affinity():
     router = CacheRouter(2)
     router.update(1, [entry("tenant", [1] * 512)])
-    assert router.choose("tenant", [1] * 600, [0, 8], {}) == 0
+    assert router.choose("tenant", [1] * 600, [0, SEQUENCES_PER_RANK], {}) == 0
     router.update(1, [])
     assert router.choose("tenant", [1] * 600, [0, 0], {}) == 0
     router.update(1, [entry("tenant", [1] * 512)])
     router.max_age = -1
     assert router.choose("tenant", [1] * 600, [0, 0], {}) == 0
     with pytest.raises(OverflowError):
-        router.choose("tenant", [1] * 600, [8, 8], {})
+        router.choose("tenant", [1] * 600, [SEQUENCES_PER_RANK] * 2, {})
 
 
 def test_queued_work_retires_prefill_once_and_tracks_decode():

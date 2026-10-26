@@ -1,6 +1,4 @@
-"""Atomic per-key RPM/TPM admission, with lazy token counting for overridden keys."""
-
-from collections.abc import Awaitable, Callable
+"""Atomic admission against RPM and already-recorded actual token usage."""
 
 import httpx
 from fastapi import HTTPException
@@ -45,7 +43,6 @@ async def admit_key(
     org_url: str,
     org_id: str,
     api_key_id: str,
-    token_budget: Callable[[], Awaitable[int]] | None,
 ) -> None:
     url = org_url.rsplit("/", 1)[0] + "/check_serving_api_key_rate_limit"
     body: dict[str, str | int] = {"p_org_id": org_id, "p_api_key_id": api_key_id}
@@ -63,24 +60,9 @@ async def admit_key(
 
     row = await check()
     if row["requires_tokens"]:
-        try:
-            if token_budget is None:
-                raise ValueError("missing token counter")
-            tokens = await token_budget()
-            if type(tokens) is not int or tokens <= 0:
-                raise ValueError("invalid token budget")
-        except Exception as exc:
-            if isinstance(exc, HTTPException) and 400 <= exc.status_code < 500:
-                raise
-            raise HTTPException(
-                503, "serving token count unavailable", headers={"Retry-After": "5"}
-            ) from exc
-        body["p_tokens"] = tokens
-        row = await check()
-        if row["requires_tokens"]:
-            raise HTTPException(
-                503, "serving token admission unavailable", headers={"Retry-After": "5"}
-            )
+        raise HTTPException(
+            503, "Actual-usage rate limits are not deployed", headers={"Retry-After": "5"}
+        )
     if not row["allowed"]:
         headers = {
             "Retry-After": str(row["retry_after"]),

@@ -14,6 +14,7 @@ from flash.serving.deepinfer.contract.config import (
     MODEL_ID,
     REQUEST_SECONDS,
     STARTUP_SECONDS,
+    STREAM_IDLE_SECONDS,
 )
 from flash.serving.deepinfer.contract.errors import DeepInferError
 
@@ -26,7 +27,7 @@ def endpoint_url():
 
     # Resolve the fixed backend in the router's Modal environment. Credentials
     # remain secrets; neither the endpoint nor engine policy is a deploy-time knob.
-    endpoint = modal.Function.from_name(APP_NAME, "serve").get_web_url()
+    endpoint = modal.Server.from_name(APP_NAME, "Engine").get_url()
     url = urlsplit(endpoint or "")
     if url.scheme != "https" or not url.hostname or url.username or url.password:
         raise DeepInferError(503, "DeepInfer backend has no valid HTTPS endpoint")
@@ -54,48 +55,37 @@ def configured():
     return all(values)
 
 
+async def _stream_lines(response, deadline):
+    # The consumer may hand this iterator to another task after its first event.
+    # Keep each timeout inside one anext(), never open across a yield.
+    loop = asyncio.get_running_loop()
+    lines = response.aiter_lines()
+    try:
+        while True:
+            if loop.time() >= deadline:
+                raise TimeoutError("DeepInfer stream deadline exceeded")
+            async with asyncio.timeout_at(min(deadline, loop.time() + STREAM_IDLE_SECONDS)):
+                try:
+                    line = await anext(lines)
+                except StopAsyncIteration:
+                    return
+            yield line
+    finally:
+        await lines.aclose()
+
+
 class HostedDeepInfer:
     def __init__(self, *, transport=None):
-        self.transport = transport
-
-    async def token_budget(self, payload):
-        if not configured():
-            raise DeepInferError(503, "DeepInfer backend is not configured")
-        headers = {
-            "Modal-Key": os.environ["DEEPINFER_PROXY_KEY"],
-            "Modal-Secret": os.environ["DEEPINFER_PROXY_SECRET"],
-        }
-        url = await asyncio.wait_for(asyncio.to_thread(endpoint_url), timeout=30)
-        async with httpx.AsyncClient(
+        self._client = httpx.AsyncClient(
             timeout=httpx.Timeout(STARTUP_SECONDS + REQUEST_SECONDS, connect=30),
-            transport=self.transport,
+            transport=transport,
             follow_redirects=True,
             max_redirects=32,
             event_hooks={"response": [_check_redirect]},
-        ) as client:
-            response = await client.post(
-                url + "/internal/token-budget",
-                headers=headers,
-                json=chat_body(payload.model_dump()),
-            )
-            if response.status_code in {400, 422}:
-                try:
-                    detail = response.json()["detail"]
-                    if not isinstance(detail, str) or not detail:
-                        raise ValueError("missing validation detail")
-                except (ValueError, KeyError, TypeError) as exc:
-                    raise DeepInferError(
-                        503, "DeepInfer returned malformed validation feedback"
-                    ) from exc
-                raise DeepInferError(response.status_code, detail)
-            response.raise_for_status()
-            try:
-                tokens = response.json()["tokens"]
-                if type(tokens) is not int or tokens <= 0:
-                    raise ValueError("invalid token budget")
-            except (ValueError, KeyError, TypeError) as exc:
-                raise DeepInferError(503, "DeepInfer returned an invalid token budget") from exc
-            return tokens
+        )
+
+    async def aclose(self):
+        await self._client.aclose()
 
     async def stream_generate(self, base_model, payload, record, *, expected_checkpoint=None):
         if base_model != MODEL_ID or not record.serve_base_model:
@@ -110,26 +100,19 @@ class HostedDeepInfer:
         headers = {
             "Modal-Key": os.environ["DEEPINFER_PROXY_KEY"],
             "Modal-Secret": os.environ["DEEPINFER_PROXY_SECRET"],
+            "Accept": "text/event-stream",
         }
         try:
             url = await asyncio.wait_for(asyncio.to_thread(endpoint_url), timeout=30)
         except Exception as exc:
             raise DeepInferError(503, "DeepInfer endpoint discovery failed") from exc
         url += "/internal/generate"
-        timeout = httpx.Timeout(STARTUP_SECONDS + REQUEST_SECONDS, connect=30)
         terminal = False
+        deadline = asyncio.get_running_loop().time() + STARTUP_SECONDS + REQUEST_SECONDS
         try:
-            # Closing this context on disconnect aborts only this HTTP request.
-            async with (
-                asyncio.timeout(STARTUP_SECONDS + REQUEST_SECONDS),
-                httpx.AsyncClient(
-                    timeout=timeout,
-                    transport=self.transport,
-                    follow_redirects=True,
-                    max_redirects=32,
-                    event_hooks={"response": [_check_redirect]},
-                ) as client,
-                client.stream(
+            # A disconnect closes only this response; other streams keep their pooled connections.
+            async with asyncio.timeout_at(deadline):
+                request = self._client.build_request(
                     "POST",
                     url,
                     headers=headers,
@@ -138,14 +121,19 @@ class HostedDeepInfer:
                         "request_id": payload.generation_id,
                         "cache_namespace": getattr(payload, "_cache_namespace", None),
                     },
-                ) as response,
-            ):
+                )
+                response = await self._client.send(request, stream=True)
+            try:
                 if response.status_code != 200:
                     code = response.status_code if response.status_code in {400, 422, 429} else 503
                     raise DeepInferError(code, "DeepInfer backend rejected the request")
-                async for line in response.aiter_lines():
+                async for line in _stream_lines(response, deadline):
                     if not line:
                         continue
+                    if line.startswith(":"):
+                        continue
+                    if line.startswith("data:"):
+                        line = line[5:].lstrip()
                     event = json.loads(line)
                     if event.get("type") == "error":
                         raise DeepInferError(502, "DeepInfer generation failed")
@@ -157,6 +145,8 @@ class HostedDeepInfer:
                     yield event
                 if not terminal:
                     raise DeepInferError(502, "DeepInfer stream ended before completion")
+            finally:
+                await response.aclose()
         except (httpx.HTTPError, ValueError, TimeoutError) as exc:
             raise DeepInferError(502, "DeepInfer backend transport failed") from exc
 

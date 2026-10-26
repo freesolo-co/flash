@@ -58,6 +58,8 @@ def test_prequantized_base_passes_no_quantization(engine_args) -> None:
     # passing quantization on top would re-quantize an already-quantized checkpoint.
     kwargs = engine_args(MODEL)
     assert kwargs["model"] == "Freesolo-Co/Qwen3.5-9B-FP8"
+    assert kwargs["tokenizer"] == MODEL
+    assert kwargs["tokenizer_revision"] == "c202236235762e1c871ad0ccb60c8ee5ba337b9a"
     assert kwargs["quantization"] is None
 
 
@@ -87,7 +89,10 @@ def test_moe_backend_override_is_guarded(engine_args, monkeypatch, capsys) -> No
     # on an unknown kwarg.
     assert engine_args(MODEL, moe_backend="triton")["moe_backend"] == "triton"
 
-    monkeypatch.setattr("flash.serving.src.engine.boot._async_engine_arg_names", lambda _t: set())
+    monkeypatch.setattr(
+        "flash.serving.src.engine.boot._async_engine_arg_names",
+        lambda _t: {"tokenizer", "tokenizer_revision"},
+    )
     assert "moe_backend" not in engine_args(MODEL, moe_backend="triton")
     assert "no moe_backend arg" in capsys.readouterr().out
 
@@ -97,7 +102,10 @@ def test_max_num_batched_tokens_override_is_guarded(engine_args, monkeypatch, ca
     # exceeds vLLM's 2048 default. Forward it only when this AsyncEngineArgs build exposes the field.
     assert engine_args(MODEL, max_num_batched_tokens=4096)["max_num_batched_tokens"] == 4096
 
-    monkeypatch.setattr("flash.serving.src.engine.boot._async_engine_arg_names", lambda _t: set())
+    monkeypatch.setattr(
+        "flash.serving.src.engine.boot._async_engine_arg_names",
+        lambda _t: {"tokenizer", "tokenizer_revision"},
+    )
     assert "max_num_batched_tokens" not in engine_args(MODEL, max_num_batched_tokens=4096)
     assert "no max_num_batched_tokens arg" in capsys.readouterr().out
 

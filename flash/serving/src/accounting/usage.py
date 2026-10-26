@@ -67,6 +67,7 @@ class UsageSession:
     deployment_id: str | None
     serving_release: str | None
     attested_adapter: str | None
+    api_key_id: str | None = None
 
     def event(self, result: dict[str, Any]) -> UsageEvent:
         attested_adapter = result.get("lora_request_adapter") or self.attested_adapter
@@ -75,6 +76,8 @@ class UsageSession:
             if isinstance(attested_adapter, str) and attested_adapter
             else {}
         )
+        if self.api_key_id is not None:
+            evidence["api_key_id"] = self.api_key_id
         return UsageEvent(
             identity=self.identity,
             principal=self.principal,
@@ -136,6 +139,7 @@ def build_usage_session(
     deployment_id: str,
     serving_release: str,
     captured_at: datetime,
+    api_key_id: str | None = None,
 ) -> UsageSession:
     immutable_target = ImmutableTarget(
         public_model_id=requested.model_id,
@@ -154,6 +158,7 @@ def build_usage_session(
         deployment_id=deployment_id or None,
         serving_release=serving_release or None,
         attested_adapter=_optional_text(result.get("lora_request_adapter")),
+        api_key_id=api_key_id,
     )
 
 

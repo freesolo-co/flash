@@ -11,12 +11,18 @@ from collections import defaultdict
 
 from flash.serve.runtime.token_batch import TokenBatch
 from flash.serving.deepinfer.contract.config import (
+    CONTEXT_PARALLEL_SIZE,
     DELIVERY_SECONDS,
     DELIVERY_TOKENS,
     GPU_COUNT,
+    GPU_PREFIX_CACHE_ENTRIES,
+    GPU_PREFIX_CACHE_TOKENS,
     MAX_MODEL_LEN,
     PREFILL_ANY_INTERVAL,
+    PREFILL_COALESCING_MIN_TOKENS,
+    PREFILL_COALESCING_SECONDS,
     PREFILL_TOKENS,
+    RANK_COUNT,
     RUNTIME_ROOT,
     SEQUENCES_PER_RANK,
 )
@@ -27,15 +33,19 @@ def initialize(rank: int, model_path: str):
     # No torch/deepinfer imports before assigning the process's CUDA device.
     os.environ.update(
         {
+            "PYTORCH_ALLOC_CONF": "expandable_segments:False",
+            "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:False",
+            "DEEPINFER_YOCO_PREFILL_TRUNCATION_MODE": "compact",
+            "DEEPINFER_YOCO_PREFILL_KEEP_TOKENS": "140",
             "RANK": "0",
             "WORLD_SIZE": "1",
             "DEEPINFER_ACCELERATOR": "nvidia",
             "EP_DISABLE_GIN": "1",
-            "DEEPINFER_ENGRAM_FORCE_GPU_STORAGE": "0",
-            "DEEPINFER_USE_NEXTN_DECODE": "0",
-            "DEEPINFER_ENABLE_MTP_VARLEN": "0",
+            "DEEPINFER_ENGRAM_FORCE_GPU_STORAGE": "1",
+            "DEEPINFER_USE_NEXTN_DECODE": "5",
+            "DEEPINFER_ENABLE_MTP_VARLEN": "1",
             "DEEPINFER_OVERRIDE_NUM_EXTRA_EXPERTS": "0",
-            "DEEPINFER_BATCH_INVARIANT": "1",
+            "DEEPINFER_BATCH_INVARIANT": "0",
             "DEEPINFER_PREFILL_STORE_EXTRA_STATE": "1",
             "DEEPINFER_PREFILL_STORE_EXTRA_SIZE": "0",
             "DEEPINFER_LOGGING_INTERVAL_STEP": "0",
@@ -51,7 +61,7 @@ def initialize(rank: int, model_path: str):
     setup_common_env(
         model_name=model_path, sampler_force_topk=0, set_override_experts=False, enable_eplb=False
     )
-    setup_cuda_visible_devices(rank, 1, GPU_COUNT)
+    setup_cuda_visible_devices(rank, CONTEXT_PARALLEL_SIZE, GPU_COUNT)
     from flash.serving.deepinfer.native.engram_transport import install
 
     install()
@@ -59,12 +69,13 @@ def initialize(rank: int, model_path: str):
         model_path,
         rank,
         ep_size=GPU_COUNT,
-        data_parallel_size=GPU_COUNT,
+        data_parallel_size=RANK_COUNT,
+        cp_size=CONTEXT_PARALLEL_SIZE,
         max_num_batched_tokens=PREFILL_TOKENS,
         max_model_len=MAX_MODEL_LEN,
         max_num_seqs=SEQUENCES_PER_RANK,
         gpu_memory_utilization=0.85,
-        lookahead_tokens=0,
+        lookahead_tokens=1,
         disable_log_stats=True,
     )
 
@@ -86,7 +97,7 @@ def admit(engine, command, active, outgoing, cache, batches):
     batches[request_id] = TokenBatch(DELIVERY_TOKENS, DELIVERY_SECONDS)
 
 
-def step(engine, active, outgoing, cache, batches):
+def step(engine, active, outgoing, cache, batches, prefill_scheduler=None):
     from deepinfer._C.engine import RequestOutput
 
     raw = engine.step() if engine.has_unfinished_requests() else engine.flush_inflight_reqs()
@@ -95,6 +106,8 @@ def step(engine, active, outgoing, cache, batches):
     outputs = [RequestOutput.clone(pointer) for pointer in raw]
     outputs.extend(cache.capture_ready())
     for output in outputs:
+        if prefill_scheduler is not None:
+            prefill_scheduler.pending.pop(output.request_id, None)
         if output.request_id not in active:
             continue
         if output.token_id < 0 or (
@@ -142,16 +155,39 @@ def run_rank(rank, model_path, incoming, outgoing, stopped):
         from flash.serving.deepinfer.runtime.provenance import loaded_runtime
 
         proof = loaded_runtime(llm, rank)
+        from deepinfer import envs
+
         proof.update(
+            batch_invariant=envs.DEEPINFER_BATCH_INVARIANT,
+            nextn=envs.DEEPINFER_USE_NEXTN_DECODE,
+            zero_overhead_scheduling=envs.DEEPINFER_ZERO_OVERHEAD_SCHEDULING,
+            prefill_tokens=engine.scheduler_config.max_num_batched_tokens,
+            max_num_seqs=engine.scheduler_config.max_num_seqs,
+            max_model_len=engine.model_config.max_model_len,
             expert_dtype="native_fp4",
             expert_source="native-fp4",
             converted_expert_tensors=0,
+            prefill_coalescing_seconds=PREFILL_COALESCING_SECONDS,
+            prefill_coalescing_small_prompt_threshold=PREFILL_COALESCING_MIN_TOKENS,
+            gpu_prefix_cache_token_budget=GPU_PREFIX_CACHE_TOKENS,
+            gpu_prefix_cache_entries=GPU_PREFIX_CACHE_ENTRIES,
+            cpu_prefix_spill_enabled=False,
             prefill_any_attempt_interval=engine.scheduler_config.prefill_any_attempt_interval,
         )
         print(f"DEEPINFER_LOADED {proof}", flush=True)
         outgoing.put({"type": "ready", "rank": rank, "provenance": proof})
         active = set()
-        cache = TieredPrefixCache(engine)
+        from flash.serving.deepinfer.runtime.prefill_scheduler import PrefillScheduler
+
+        prefill_scheduler = PrefillScheduler(engine)
+        # CPU snapshots currently contain only the driver rank's state. They cannot
+        # safely restore CP workers, so retain GPU checkpoints without host spill.
+        cache = TieredPrefixCache(
+            engine,
+            cpu_bytes=0,
+            max_tokens=GPU_PREFIX_CACHE_TOKENS,
+            max_entries=GPU_PREFIX_CACHE_ENTRIES,
+        )
         batches = {}
         last_directory = None
         last_heartbeat = time.monotonic()
@@ -163,7 +199,10 @@ def run_rank(rank, model_path, incoming, outgoing, stopped):
                 except queue.Empty:
                     break
                 admit(engine, command, active, outgoing, cache, batches)
-            step(engine, active, outgoing, cache, batches)
+                prefill_scheduler.command(command, active, cache.hits.get(command["id"], 0))
+            prefill_scheduler.before_step()
+            step(engine, active, outgoing, cache, batches, prefill_scheduler)
+            prefill_scheduler.after_step(active)
             directory = cache.directory()
             if directory != last_directory or time.monotonic() - last_heartbeat >= 1:
                 outgoing.put({"type": "cache_directory", "rank": rank, "prefixes": directory})

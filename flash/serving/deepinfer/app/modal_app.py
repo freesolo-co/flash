@@ -18,14 +18,15 @@ from flash.serving.deepinfer.contract.config import (
     MAX_CONTAINERS,
     MAX_INPUTS,
     PORT,
-    REQUEST_SECONDS,
     RUNTIME_IMAGE_ID,
     RUNTIME_PYTHON,
     SCALEDOWN_SECONDS,
+    SCALEUP_SECONDS,
     STARTUP_SECONDS,
     TARGET_INPUTS,
 )
 
+# The pinned image already contains the patched native extension and dependencies.
 image = (
     modal.Image.from_id(RUNTIME_IMAGE_ID)
     .env(
@@ -38,10 +39,6 @@ image = (
         }
     )
     .add_local_python_source("flash", copy=True)
-    .run_commands(
-        f"{RUNTIME_PYTHON} -m pip install fastapi==0.141.1 uvicorn==0.52.0",
-        f"{RUNTIME_PYTHON} -m flash.serving.deepinfer.native.image",
-    )
 )
 app = modal.App(APP_NAME, image=image)
 weights = modal.Volume.from_name("freesolo-deepseek-1017-weights", create_if_missing=True)
@@ -49,26 +46,33 @@ main_environment = modal.config.config.get("environment") == "main"
 
 
 def _watch_server(process):
-    # Retire only this two-GPU replica on startup/native worker death. Other replicas and
-    # requests remain independent; ordinary client cancellation never exits the server.
+    # Retire this entire four-GPU group on native worker death.
+    # Ordinary client cancellation never exits the server.
     process.wait()
     os._exit(1)
 
 
-@app.function(
+@app.server(
     gpu=GPU,
-    cpu=16,
+    compute_region="us",
+    routing_region="us-east",
+    cpu=32,
     memory=524288,  # Engram host storage and loading peaked above 300 GiB in qualification.
     volumes={"/weights": weights},
     min_containers=MAIN_MIN_CONTAINERS if main_environment else 0,
     max_containers=MAIN_MAX_CONTAINERS if main_environment else MAX_CONTAINERS,
     buffer_containers=MAIN_BUFFER_CONTAINERS if main_environment else BUFFER_CONTAINERS,
     scaledown_window=SCALEDOWN_SECONDS,
+    scaleup_window=SCALEUP_SECONDS,
     startup_timeout=STARTUP_SECONDS,
-    timeout=REQUEST_SECONDS,
+    target_concurrency=TARGET_INPUTS,
+    max_concurrency=MAX_INPUTS,
+    port=PORT,
+    unauthenticated=False,
+    exit_grace_period=3600,
 )
-@modal.concurrent(max_inputs=MAX_INPUTS, target_inputs=TARGET_INPUTS)
-@modal.web_server(PORT, startup_timeout=STARTUP_SECONDS, requires_proxy_auth=True)
-def serve():
-    process = subprocess.Popen([RUNTIME_PYTHON, "-m", "flash.serving.deepinfer.app.http"])
-    threading.Thread(target=_watch_server, args=(process,), daemon=True).start()
+class Engine:
+    @modal.enter()
+    def start(self):
+        process = subprocess.Popen([RUNTIME_PYTHON, "-m", "flash.serving.deepinfer.app.http"])
+        threading.Thread(target=_watch_server, args=(process,), daemon=True).start()
