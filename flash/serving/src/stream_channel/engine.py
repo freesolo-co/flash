@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import inspect
+import logging
 import queue as stdlib_queue
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable
@@ -15,6 +16,7 @@ from flash.serving.src.stream_channel.protocol import (
     CLEANUP_SECONDS,
     CONTROL_PARTITION,
     CONTROL_POLL_SECONDS,
+    CONTROL_STARTUP_SECONDS,
     DATA_PARTITION,
     PARTITION_TTL_SECONDS,
     ChannelErrorCode,
@@ -26,6 +28,7 @@ from flash.serving.src.stream_channel.protocol import (
 )
 
 _T = TypeVar("_T")
+logger = logging.getLogger(__name__)
 
 
 class StreamGenerateOwner(Protocol):
@@ -113,6 +116,11 @@ class _LeaseWatch:
             except stdlib_queue.Empty:
                 return False
             except TimeoutError as exc:
+                logger.warning(
+                    "Stream control read timed out: initial=%s budget_seconds=%s",
+                    self._latest is None,
+                    local_timeout,
+                )
                 raise StreamChannelError(
                     ChannelErrorCode.CHANNEL_FAULT,
                     "control channel read timed out",
@@ -123,8 +131,9 @@ class _LeaseWatch:
             return True
 
     async def admit(self) -> None:
-        consumed = await self._consume(timeout=CONTROL_POLL_SECONDS)
+        consumed = await self._consume(timeout=CONTROL_STARTUP_SECONDS)
         if not consumed:
+            logger.warning("Stream admission failed: initial control lease is missing")
             raise StreamChannelError(ChannelErrorCode.CHANNEL_FAULT, "initial lease is missing")
         while self._latest is not None and self._latest.function_call_id is None:
             if await self._consume(block=False):
@@ -350,6 +359,14 @@ async def stream_generate_call(
         raise exc.cause from None
     except Exception as exc:
         code = exc.code if isinstance(exc, StreamChannelError) else ChannelErrorCode.ENGINE_ERROR
+        if isinstance(exc, StreamChannelError):
+            # Stable codes and phase only: never log prompts, queue contents or credentials.
+            logger.warning(
+                "Stream channel failed: code=%s generation_started=%s events=%s",
+                code.value,
+                generation_may_have_started,
+                sequence,
+            )
         envelope = DataEnvelope(
             kind="error",
             generation_id=generation_id,
