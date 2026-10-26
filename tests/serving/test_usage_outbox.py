@@ -348,7 +348,8 @@ def test_invalid_or_missing_capacity_facts_are_omitted_without_raising() -> None
     assert "replica_freshly_booted" not in payload
 
 
-def test_nonstream_capture_is_awaited_before_successful_response() -> None:
+@pytest.mark.parametrize("api_key_id", [None, "20000000-0000-4000-8000-000000000001"])
+def test_nonstream_capture_is_awaited_before_successful_response(api_key_id) -> None:
     record = _revision()
     pool = _Pool()
     store = _Store()
@@ -356,7 +357,7 @@ def test_nonstream_capture_is_awaited_before_successful_response() -> None:
     async def authorize(
         _token: str, _adapter_id: str, _scope: dict | None = None
     ) -> AuthorizedTraffic:
-        return AuthorizedTraffic(principal_for_external_org("org-1"), "generation-a")
+        return AuthorizedTraffic(principal_for_external_org("org-1"), "generation-a", api_key_id)
 
     app = build_serving_app(
         pool,
@@ -367,7 +368,9 @@ def test_nonstream_capture_is_awaited_before_successful_response() -> None:
         deployment_id="deployment-1",
         deployment_sha="release-1",
     )
-    with TestClient(app, headers={"Authorization": "Bearer user-key"}) as client:
+    with TestClient(
+        app, headers={"Authorization": "Bearer user-key", "X-Freesolo-Api-Key-Id": "spoofed"}
+    ) as client:
         response = client.post("/generate", json={"model_id": record.model_id, "prompt": "hello"})
 
     assert response.status_code == 200
@@ -383,8 +386,12 @@ def test_nonstream_capture_is_awaited_before_successful_response() -> None:
     assert event.facts.completion_tokens == 1
     assert event.facts.cached_tokens == 1
 
+    for event in store.captured + store.finalized:
+        assert event.rpc_payload()["attestation_evidence"].get("api_key_id") == api_key_id
 
-def test_stream_captures_in_progress_before_response_and_finalizes_same_id() -> None:
+
+@pytest.mark.parametrize("api_key_id", [None, "20000000-0000-4000-8000-000000000001"])
+def test_stream_captures_in_progress_before_response_and_finalizes_same_id(api_key_id) -> None:
     record = _revision()
     pool = _Pool()
     store = _Store()
@@ -392,7 +399,7 @@ def test_stream_captures_in_progress_before_response_and_finalizes_same_id() -> 
     async def authorize(
         _token: str, _adapter_id: str, _scope: dict | None = None
     ) -> AuthorizedTraffic:
-        return AuthorizedTraffic(principal_for_external_org("org-1"), "generation-a")
+        return AuthorizedTraffic(principal_for_external_org("org-1"), "generation-a", api_key_id)
 
     app = build_serving_app(
         pool,
@@ -402,7 +409,9 @@ def test_stream_captures_in_progress_before_response_and_finalizes_same_id() -> 
         chat_authorizer=authorize,
     )
     with (
-        TestClient(app, headers={"Authorization": "Bearer user-key"}) as client,
+        TestClient(
+            app, headers={"Authorization": "Bearer user-key", "X-Freesolo-Api-Key-Id": "spoofed"}
+        ) as client,
         client.stream(
             "POST",
             "/v1/chat/completions",
@@ -423,6 +432,9 @@ def test_stream_captures_in_progress_before_response_and_finalizes_same_id() -> 
     assert store.finalized[0].identity.request_id == pool.generation_id
     assert store.captured[0].facts.completion_tokens == 0
     assert store.finalized[0].facts.completion_tokens == 1
+
+    for event in store.captured + store.finalized:
+        assert event.rpc_payload()["attestation_evidence"].get("api_key_id") == api_key_id
 
 
 def test_stream_finalization_preserves_first_event_attestation() -> None:
@@ -1516,7 +1528,7 @@ def test_startup_claim_recovers_expired_lease_and_delivers() -> None:
     assert any(url.endswith("/rpc/acknowledge_serving_usage_delivered") for url, _ in client.calls)
 
 
-def test_slow_delivery_shutdown_releases_every_single_row_claim() -> None:
+def test_slow_delivery_shutdown_releases_claim() -> None:
     row = _claimed_row()
     entered = asyncio.Event()
     unblock = asyncio.Event()
@@ -1548,7 +1560,7 @@ def test_slow_delivery_shutdown_releases_every_single_row_claim() -> None:
     claim_calls = [
         payload for url, payload in client.calls if url.endswith("/rpc/claim_serving_usage_batch")
     ]
-    assert claim_calls == [{"p_worker_id": "worker-1", "p_limit": 1, "p_lease_seconds": 60}]
+    assert claim_calls == [{"p_worker_id": "worker-1", "p_limit": 8, "p_lease_seconds": 60}]
     release_calls = [
         payload for url, payload in client.calls if url.endswith("/rpc/reschedule_serving_usage")
     ]

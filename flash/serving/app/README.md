@@ -32,11 +32,6 @@ The routing layer (`src/router.py`) carries no `modal`/`vllm` imports and is exh
 unit-tested in `tests/serving/test_router.py` (multi-base-model dispatch, shared-GPU multi-LoRA,
 register-routing, OpenAI shape, auth, 404s) — run with `uv run pytest tests/serving/`.
 
-Operator load tests use the isolated `flash.serving.loadtest` package. It is
-never imported by production serving. It drives only `GET /healthz` and `POST /v1/chat/completions`,
-manages no Modal lifecycle, and cannot by itself prove replica scale-out, cold state, GPU identity,
-the cause of a capacity rejection, or an availability SLA.
-
 Persistence is only for hydration and recovery. On startup each base model's engine loads
 _its_ ready adapters from the `hosted_lora_adapters` Supabase table; `POST /adapters`
 registers a new adapter on its base model's engine and tracks it in the router.
@@ -55,7 +50,10 @@ GPU autoscaling is capped at `MAX_CONTAINERS = 4` per model, including its activ
 the configured limits total 12 GPU containers per environment. Requests queue when a model's four
 containers are busy; an idle model's capacity cannot be borrowed by another model.
 
-The CPU router remains warm and uncapped. `BUFFER_CONTAINERS = 1` applies to the router and every
+The CPU router remains warm and uncapped, with eight CPUs and 16 GiB RAM per container
+for concurrent stream framing and request handling. It uses non-preemptible CPU hosts because
+an interrupted HTTP stream cannot resume. Modal applies a 3x CPU/RAM price multiplier to this
+setting; GPU allocation and pricing are unchanged. `BUFFER_CONTAINERS = 1` applies to the router and every
 engine, but only while active, so GPU engines still scale to zero when idle. Idle windows are set by
 `SCALEDOWN_WINDOW_SECONDS_BY_GPU`; the active B200 tiers use 2100 seconds. The router uses
 `MAX_INPUTS = 64` with `TARGET_INPUTS = 48`; engine concurrency follows each model's `max_num_seqs`.
@@ -280,6 +278,12 @@ CUDA graphs, prefix caching, FP8 KV, and the persistent compilation cache remain
 The 35B keeps bf16 weights because the FP8 fused-MoE kernel cannot load full-expert LoRA.
 The vision encoder remains loaded so adapters' vision-tower keys bind.
 
+GPU replicas are placed in the US near the US East CPU router. Before readiness,
+each Qwen replica completes synthetic prefill/decode generations with isolated
+cache salts; these are not customer requests and are not billed. Admission checks
+recorded usage without tokenizing text or decoding images. Generation retains the
+pinned tokenizer and context validation. Dev retains the existing scale-to-zero policy.
+
 The router accepts 64 concurrent inputs; each GPU engine accepts 8 with an autoscaling target
 of 6. The router limit is not the number of requests packed onto one GPU.
 Adapters are registered and loaded on demand, using immutable source identities and the
@@ -318,23 +322,27 @@ SET requests_per_minute = EXCLUDED.requests_per_minute,
     tokens_per_minute = EXCLUDED.tokens_per_minute;
 ```
 
-The database atomically admits RPM and TPM together across all replicas, models, and endpoints.
-TPM reserves the exact text prompt token count plus `max_tokens * n` before generation; thinking,
-tools, and template rendering use the generation tokenizer. Image requests conservatively reserve
-the full served context per choice because vLLM expands image patches during processing. Reserved
-output tokens are not refunded for early stops, failures, or disconnects. Windows reset at the
-start of each UTC minute, and all tokens are charged to the admission window. This is an admission
-budget, not a rolling measurement of tokens emitted during a minute.
+The database atomically checks RPM and already-recorded actual input + output tokens
+across all replicas, models, and endpoints. Requests are admitted while the key is below
+its TPM limit; incoming prompts and maximum output lengths are not reserved or tokenized
+for admission. At or above the limit, subsequent requests receive 429 and `Retry-After`,
+with request and token allowance headers. Missing quota infrastructure fails closed with 503.
 
-Only configured keys invoke a private token-counting RPC. Token counting may cold-start the model,
-but it does not generate tokens. Missing database/token-counting infrastructure fails closed with
-503. Exhausted RPM or TPM returns 429 and `Retry-After`, with request and token allowance headers.
+The router writes the authenticated key ID into immutable usage evidence. The durable outbox
+counts only new native prompt/completion token deltas, so capture retries and billing delivery
+cannot count usage twice. Cached input is included once; reasoning is already part of output.
+Streaming input is counted at initial usage capture and output when final usage is recorded;
+non-streaming usage is recorded at completion. Deltas belong to the database minute when
+recorded, not necessarily when each token was generated. Active requests continue and can
+overshoot the allowance; this is a soft TPM limit, with no token reservation or per-token RPC.
 
-Deploy the Freesolo migration `20261025000000_serving_api_key_rate_limits.sql` and the backend
-`apiKeyId` authorization response before this serving version. Deploy the DeepInfer private
-`/internal/token-budget` route before enabling a key override for DeepSeek. Older serving code
-cannot enforce per-key limits; inserting an override alone does not activate them. No default
-key allowances are inserted by the migration.
+Deploy the Freesolo migrations `20261025000000_serving_api_key_rate_limits.sql` and
+`20261026000000_serving_actual_token_limits.sql` before deploying this router version.
+The original RPC signature remains compatible during rollout, but this version fails closed
+if the database still requests token reservations. Older routers do not attach key attribution
+to usage, so their in-flight requests cannot contribute to observed TPM; finish the router
+rollout before relying on the new policy. The backend must supply authenticated `apiKeyId`.
+No default key allowances are inserted, and billing prices and actual-usage charging are unchanged.
 
 ### Organization rate limits
 

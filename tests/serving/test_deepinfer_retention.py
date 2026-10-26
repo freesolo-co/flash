@@ -43,3 +43,52 @@ def test_ttl_still_frees_popular_entries_and_cost_counts_full_allocation(monkeyp
     value.prune()
     assert set(freed) == {"hot", "cold"}
     assert not value.entries
+
+
+def test_one_off_prompts_skip_checkpoints_but_reused_tenant_prefixes_are_retained():
+    added = []
+    engine = SimpleNamespace(
+        scheduler=SimpleNamespace(get_num_free_gpu_blocks=lambda: 10000),
+        cache_config=SimpleNamespace(block_size=128),
+        add_request=lambda **kwargs: added.append(kwargs) or SimpleNamespace(num_cached_tokens=0),
+    )
+    value = PrefixCache(engine)
+    command = {
+        "id": "first",
+        "tokens": list(range(160)),
+        "prefix_tokens": 128,
+        "cache_namespace": "tenant-a",
+    }
+    value.admit(command, None)
+    assert added[-1]["chunk_checkpoints"] is None
+    assert not value.pending
+    value.admit({**command, "id": "other-tenant", "cache_namespace": "tenant-b"}, None)
+    assert added[-1]["chunk_checkpoints"] is None
+    value.admit({**command, "id": "different", "tokens": [999, *range(1, 160)]}, None)
+    assert added[-1]["chunk_checkpoints"] is None
+    # The continuation may differ; admission depends on the exact reusable prefix.
+    value.admit({**command, "id": "reused", "tokens": [*range(128), *range(500, 550)]}, None)
+    assert added[-1]["chunk_checkpoints"] == [128]
+    assert set(value.pending) == {"reused"}
+    assert all(
+        count == 0 for count in value.hits.values()
+    )  # Observation is not a billed cache hit.
+
+
+def test_admission_history_is_bounded_expires_and_does_not_retain_token_lists(monkeypatch):
+    module = "flash.serving.deepinfer.runtime.prefix_cache"
+    monkeypatch.setattr(module + ".ADMISSION_HISTORY_LIMIT", 2)
+    monkeypatch.setattr(module + ".time.monotonic", lambda: 100)
+    value = PrefixCache(None, ttl=10)
+    assert not value._reused_prefix("a", [1] * 128)
+    assert not value._reused_prefix("a", [2] * 128)
+    assert value._reused_prefix("a", [1] * 128)
+    assert not value._reused_prefix("a", [3] * 128)
+    assert len(value.observed) == 2
+    assert all(len(key[1]) == 64 for key in value.observed)
+    assert not value._reused_prefix("a", [2] * 128)  # Evicted observation is cold again.
+    monkeypatch.setattr(module + ".time.monotonic", lambda: 111)
+    assert not value._reused_prefix("a", [2] * 128)
+    assert len(value.observed) == 1
+    value.close()
+    assert not value.observed

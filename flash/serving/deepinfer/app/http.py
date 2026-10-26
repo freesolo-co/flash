@@ -33,13 +33,17 @@ async def _monitor(runtime):
             return
 
 
-async def _native_stream(events, first):
+async def _native_stream(events, first, *, sse=False):
+    def frame(event):
+        data = json.dumps(event)
+        return f"data: {data}\n\n" if sse else data + "\n"
+
     try:
-        yield json.dumps(first) + "\n"
+        yield frame(first)
         async for event in events:
-            yield json.dumps(event) + "\n"
+            yield frame(event)
     except (RuntimeError, TimeoutError, StopAsyncIteration):
-        yield json.dumps({"type": "error"}) + "\n"
+        yield frame({"type": "error"})
     finally:
         await events.aclose()
 
@@ -52,10 +56,13 @@ async def _native_chat(runtime, body, request):
     try:
         events = await prepare(runtime, body)
         first = await await_until_disconnect(request, anext(events))
+        # Modal flushes SSE immediately; NDJSON can be buffered by its proxy.
+        # Negotiate so an older router can still consume this backend during rollout.
+        sse = "text/event-stream" in request.headers.get("accept", "")
         response = ClosingStreamingResponse(
-            _native_stream(events, first),
+            _native_stream(events, first, sse=sse),
             on_unstarted=events.aclose,
-            media_type="application/x-ndjson",
+            media_type="text/event-stream" if sse else "application/x-ndjson",
             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
         )
         handed_off = True
@@ -106,18 +113,10 @@ def build_app(runtime, *, manage_lifecycle=True):
             "gpu_count": GPU_COUNT,
             "loaded_ranks": getattr(runtime, "provenance", {}),
             "active_requests": len(getattr(runtime, "pending", {})),
+            "compiled_kernel_cache_verified": getattr(
+                runtime, "compiled_kernel_cache_verified", False
+            ),
         }
-
-    @app.post("/internal/token-budget")
-    async def token_budget(body: dict):
-        from flash.serving.deepinfer.contract.protocol import parse_request
-
-        try:
-            parsed = parse_request(body)
-            tokens = await runtime.prepare_tokens(parsed)
-            return {"tokens": len(tokens) + parsed.max_tokens}
-        except ValueError as exc:
-            raise HTTPException(422, str(exc)) from exc
 
     @app.post("/internal/generate")
     async def native_chat(body: dict, request: Request):

@@ -9,6 +9,8 @@ from functools import cached_property
 
 from flash.serving.deepinfer.runtime.routing import fingerprint
 
+ADMISSION_HISTORY_LIMIT = 4096
+
 
 @dataclass
 class Prefix:
@@ -34,6 +36,21 @@ class PrefixCache:
         self.entries = OrderedDict()
         self.pending = {}
         self.hits = {}
+        self.observed = OrderedDict()
+
+    def _reused_prefix(self, namespace, tokens):
+        # Checkpointing splits prefill and retains native state. Pay that cost only
+        # after this tenant has requested the same exact prefix more than once.
+        now = time.monotonic()
+        key = (namespace, fingerprint(tokens))
+        previous = self.observed.pop(key, None)
+        self.observed[key] = now
+        while self.observed and (
+            len(self.observed) > ADMISSION_HISTORY_LIMIT
+            or now - next(iter(self.observed.values())) >= self.ttl
+        ):
+            self.observed.popitem(last=False)
+        return previous is not None and now - previous < self.ttl
 
     def directory(self):
         return [
@@ -157,6 +174,7 @@ class PrefixCache:
             and 128 <= length <= self.max_tokens
             and storage_tokens <= self.max_tokens
             and length < len(tokens) - 1
+            and self._reused_prefix(namespace, tokens[:length])
         )
         seq = self.engine.add_request(
             user_id="flash",
@@ -209,3 +227,4 @@ class PrefixCache:
     def close(self):
         for key in list(self.entries):
             self._evict(key, spill=False)
+        self.observed.clear()

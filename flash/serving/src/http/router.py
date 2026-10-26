@@ -150,13 +150,16 @@ def _lifespan_for(
     async def _lifespan(_app: "FastAPI"):
         try:
             await context.usage.start()
+            start_pool = getattr(context.pool, "start", None)
+            if start_pool is not None:
+                await start_pool()
             yield
         finally:
             try:
                 await context.usage.aclose()
             finally:
                 # close persistent authorization clients even when durable shutdown fails.
-                for client_owner in (chat_authorizer, context.rate_limiter):
+                for client_owner in (chat_authorizer, context.rate_limiter, context.pool):
                     aclose = getattr(client_owner, "aclose", None)
                     if aclose is not None:
                         with contextlib.suppress(Exception):

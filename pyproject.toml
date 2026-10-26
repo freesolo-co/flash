@@ -132,6 +132,7 @@ serve-runtime = [
     "pillow>=11.0.0",
     # same range as every other extra: the serving image resolves from these bounds rather than the
     # lockfile, so an unbounded declaration silently rides a transformers line nothing validated.
+    "tokenizers>=0.22",
     "transformers>=5.8,<5.13",
     "vllm==0.23.0",
 ]

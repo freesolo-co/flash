@@ -11,7 +11,7 @@ import triton
 import triton.language as tl
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["TOKENS", "SF_TOKEN_STRIDE", "SF_HIDDEN_STRIDE"])
 def _fetch(
     indices,
     weight_ptrs,
@@ -21,9 +21,9 @@ def _fetch(
     ROWS: tl.constexpr,
     HIDDEN: tl.constexpr,
     ENTRIES: tl.constexpr,
-    TOKENS: tl.constexpr,
-    SF_TOKEN_STRIDE: tl.constexpr,
-    SF_HIDDEN_STRIDE: tl.constexpr,
+    TOKENS,
+    SF_TOKEN_STRIDE,
+    SF_HIDDEN_STRIDE,
     RANKS: tl.constexpr,
     BLOCK_ENTRIES: tl.constexpr,
     BLOCK_HIDDEN: tl.constexpr,

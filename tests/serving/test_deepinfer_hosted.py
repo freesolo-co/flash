@@ -192,16 +192,19 @@ def test_catalog_requires_complete_authenticated_connection(monkeypatch):
 
 
 @pytest.mark.parametrize("fault", ["truncated", "wrong-id", "error"])
-def test_bridge_rejects_incomplete_or_misattributed_results(connection, fault):
+@pytest.mark.parametrize("sse", [False, True])
+def test_bridge_rejects_incomplete_or_misattributed_results(connection, fault, sse):
     async def handler(request):
         assert request.headers["Modal-Key"] == "key"
         assert request.headers["Modal-Secret"] == "secret"
+        assert request.headers["Accept"] == "text/event-stream"
         event = {"type": "ready", "request_id": "fsgen-test"}
         if fault == "wrong-id":
             event = {"type": "final", "request_id": "wrong"}
         if fault == "error":
             event = {"type": "error"}
-        return httpx.Response(200, text=json.dumps(event) + "\n")
+        data = json.dumps(event)
+        return httpx.Response(200, text=f": keepalive\n\ndata: {data}\n\n" if sse else data + "\n")
 
     pool = HostedDeepInfer(transport=httpx.MockTransport(handler))
     payload = OpenAIGenerateRequest(
@@ -290,10 +293,10 @@ def test_endpoint_is_discovered_from_fixed_same_environment_backend(monkeypatch,
 
     def lookup(*args, **kwargs):
         calls.append((args, kwargs))
-        return SimpleNamespace(get_web_url=lambda: endpoint)
+        return SimpleNamespace(get_url=lambda: endpoint)
 
     endpoint_url.cache_clear()
-    monkeypatch.setattr(modal.Function, "from_name", lookup)
+    monkeypatch.setattr(modal.Server, "from_name", lookup)
     try:
         if endpoint == "https://backend.modal.run":
             assert endpoint_url() == endpoint
@@ -301,7 +304,7 @@ def test_endpoint_is_discovered_from_fixed_same_environment_backend(monkeypatch,
         else:
             with pytest.raises(DeepInferError, match="valid HTTPS endpoint"):
                 endpoint_url()
-        assert calls == [(("freesolo-deepseek-serving", "serve"), {})]
+        assert calls == [(("freesolo-deepseek-serving", "Engine"), {})]
     finally:
         endpoint_url.cache_clear()
 
@@ -317,3 +320,100 @@ def test_bridge_maps_endpoint_discovery_failure_to_unavailable(connection, monke
     with pytest.raises(DeepInferError) as caught:
         asyncio.run(HostedDeepInfer().generate(MODEL_ID, payload, record()))
     assert caught.value.status_code == 503
+
+
+def test_disconnect_closes_only_its_response_and_other_pooled_streams_finish(connection):
+    closed = []
+
+    class ResponseStream(httpx.AsyncByteStream):
+        def __init__(self, request_id):
+            self.request_id = request_id
+
+        async def __aiter__(self):
+            for kind in ("ready", "final"):
+                yield (json.dumps({"type": kind, "request_id": self.request_id}) + "\n").encode()
+
+        async def aclose(self):
+            closed.append(self.request_id)
+
+    def handle(request):
+        request_id = json.loads(request.content)["request_id"]
+        return httpx.Response(200, stream=ResponseStream(request_id))
+
+    async def run():
+        pool = HostedDeepInfer(transport=httpx.MockTransport(handle))
+        streams = [
+            pool.stream_generate(
+                MODEL_ID,
+                OpenAIGenerateRequest(
+                    model_id=MODEL_ID,
+                    messages=body()["messages"],
+                    generation_id=identity,
+                ),
+                record(),
+            )
+            for identity in ("fsgen-one", "fsgen-two")
+        ]
+        try:
+            for stream in streams:
+                assert (await anext(stream))["type"] == "ready"
+            await streams[0].aclose()
+            assert closed == ["fsgen-one"]
+            assert (await anext(streams[1]))["type"] == "final"
+            with pytest.raises(StopAsyncIteration):
+                await anext(streams[1])
+            assert closed == ["fsgen-one", "fsgen-two"]
+            assert not pool._client.is_closed
+        finally:
+            for stream in streams:
+                await stream.aclose()
+            await pool.aclose()
+        assert pool._client.is_closed
+
+    asyncio.run(run())
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("expired_total", [False, True])
+async def test_stream_deadlines_close_response_after_task_handoff(
+    connection, monkeypatch, expired_total
+):
+    from flash.serving.deepinfer.app import client as bridge
+
+    closed = asyncio.Event()
+    loop = asyncio.get_running_loop()
+    clock = loop.time
+    elapsed = 0
+    monkeypatch.setattr(loop, "time", lambda: clock() + elapsed)
+    monkeypatch.setattr(bridge, "STREAM_IDLE_SECONDS", 0.01)
+
+    class StalledResponse(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            yield b'data: {"type":"ready","request_id":"fsgen-stalled"}\n\n'
+            await asyncio.Event().wait()
+
+        async def aclose(self):
+            closed.set()
+
+    async def handler(request):
+        return httpx.Response(200, stream=StalledResponse())
+
+    pool = HostedDeepInfer(transport=httpx.MockTransport(handler))
+    payload = OpenAIGenerateRequest(
+        model_id=MODEL_ID,
+        messages=[{"role": "user", "content": "hello"}],
+        generation_id="fsgen-stalled",
+    )
+    events = pool.stream_generate(MODEL_ID, payload, record())
+    try:
+        first = await asyncio.create_task(anext(events))
+        assert first["type"] == "ready"
+        if expired_total:
+            elapsed = bridge.STARTUP_SECONDS + bridge.REQUEST_SECONDS + 1
+        with pytest.raises(DeepInferError, match="transport failed"):
+            await asyncio.wait_for(asyncio.create_task(anext(events)), timeout=1)
+        assert closed.is_set()
+    finally:
+        elapsed = 0
+        await events.aclose()
+        await pool.aclose()

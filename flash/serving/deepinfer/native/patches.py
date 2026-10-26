@@ -4,6 +4,25 @@ import hashlib
 from pathlib import Path
 
 PATCHES = {
+    "deepinfer/worker/base.py": (
+        "40e6ca29aebd9d475eaad4b86326783f76dba2b73feaa51d86a200b7704a05ed",
+        [
+            (
+                'torch._C._accelerator_setAllocatorSettings("expandable_segments:True")',
+                # GPU Engram storage shares CUDA allocations between local ranks.
+                # Expandable segments require pidfd_getfd, which Modal disallows.
+                'torch._C._accelerator_setAllocatorSettings("expandable_segments:False")',
+            ),
+            (
+                "torch.cuda.set_device(self.device)",
+                (
+                    "torch.cuda.set_device(self.device)\n"
+                    "        from flash.serving.deepinfer.native.engram_transport import install\n"
+                    "        install()"
+                ),
+            ),
+        ],
+    ),
     "csrc/engine/pybind_sequence.cpp": (
         "872775774022bb27fd4b1fade37ec9f6fe9ec4c3051844206e3ec36c8103a9ce",
         [

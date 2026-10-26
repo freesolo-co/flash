@@ -1,6 +1,5 @@
 """Organization-wide admission through an atomic, database-clock Supabase counter."""
 
-from collections.abc import Awaitable, Callable
 from typing import Protocol
 
 import httpx
@@ -16,7 +15,6 @@ class RateLimiter(Protocol):
         org_id: str,
         *,
         api_key_id: str | None = None,
-        token_budget: Callable[[], Awaitable[int]] | None = None,
     ) -> None: ...
 
 
@@ -24,7 +22,6 @@ async def allow_offline_inference(
     _org_id: str,
     *,
     api_key_id: str | None = None,
-    token_budget: Callable[[], Awaitable[int]] | None = None,
 ) -> None:
     """Explicit bypass for hermetic tests and offline app construction only."""
 
@@ -41,12 +38,16 @@ class SupabaseRateLimiter:
         org_id: str,
         *,
         api_key_id: str | None = None,
-        token_budget: Callable[[], Awaitable[int]] | None = None,
     ) -> None:
         if api_key_id is not None:
             from flash.serving.src.http.key_rate_limit import admit_key
 
-            await admit_key(self._client, self._url, org_id, api_key_id, token_budget)
+            await admit_key(
+                self._client,
+                self._url,
+                org_id,
+                api_key_id,
+            )
             return
         # Never cache or single-flight admission, even when authorization itself is cached.
         # Do not retry ambiguous RPC failures: the database may already have counted the request.

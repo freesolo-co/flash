@@ -1,11 +1,10 @@
-"""Bounded async bridge to the four cooperative DeepInfer processes."""
+"""Bounded async bridge to the cooperative DeepInfer GPU processes."""
 
 from __future__ import annotations
 
 import asyncio
 import contextlib
 import hashlib
-import importlib.util
 import json
 import multiprocessing
 import queue
@@ -13,21 +12,20 @@ import time
 import uuid
 from collections import OrderedDict
 from dataclasses import dataclass, replace
-from pathlib import Path
 
 from anyio import CancelScope
 
 from flash.serve.runtime.prompt_cache import cached_prompt_tokens
 from flash.serving.deepinfer.contract.config import (
-    GPU_COUNT,
     MAX_INPUTS,
-    MAX_MODEL_LEN,
     MODEL_CACHE,
     MODEL_ID,
     MODEL_REVISION,
+    RANK_COUNT,
     REQUEST_SECONDS,
     SEQUENCES_PER_RANK,
     STARTUP_SECONDS,
+    WORKER_STALL_SECONDS,
 )
 from flash.serving.deepinfer.runtime.routing import CacheRouter
 from flash.serving.deepinfer.runtime.worker import run_rank
@@ -46,40 +44,35 @@ class Runtime:
     def __init__(self):
         self.processes = []
         self.prompt_cache = OrderedDict()
+        self.token_prefix_cache = None
         self.pending: dict[str, Pending] = {}
-        self.loads = [0] * GPU_COUNT
+        self.loads = [0] * RANK_COUNT
         self.ready: set[int] = set()
         self.provenance: dict[int, dict] = {}
         self.failure: str | None = None
         self.pump = None
-        self.cache_router = CacheRouter(GPU_COUNT)
+        self.cache_router = CacheRouter(RANK_COUNT)
 
     def _load_assets(self):
         from huggingface_hub import snapshot_download
-        from tokenizers import Tokenizer
+
+        from flash.serving.deepinfer.contract.tokenizer import load_tokenizer, make_prefix_cache
 
         self.model_path = snapshot_download(
             MODEL_ID, revision=MODEL_REVISION, cache_dir=MODEL_CACHE
         )
-        self.tokenizer = Tokenizer.from_file(str(Path(self.model_path) / "tokenizer.json"))
-        spec = importlib.util.spec_from_file_location(
-            "deepseek_1017_encoding", Path(self.model_path) / "encoding" / "encoding.py"
-        )
-        if spec is None or spec.loader is None:
-            raise RuntimeError("Pinned DeepSeek encoding module is missing")
-        module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)
-        self.encode_messages = module.encode_messages
+        self.tokenizer, self.encode_messages = load_tokenizer(self.model_path)
+        self.token_prefix_cache = make_prefix_cache(self.tokenizer)
 
     async def start(self):
         await asyncio.to_thread(self._load_assets)
         context = multiprocessing.get_context("spawn")
         self.stopped = context.Event()
         self.outgoing = context.Queue(maxsize=4096)
-        self.incoming = [context.Queue(maxsize=MAX_INPUTS * 2) for _ in range(GPU_COUNT)]
-        self.last_seen = [time.monotonic()] * GPU_COUNT
+        self.incoming = [context.Queue(maxsize=MAX_INPUTS * 2) for _ in range(RANK_COUNT)]
+        self.last_seen = [time.monotonic()] * RANK_COUNT
         try:
-            for rank in range(GPU_COUNT):
+            for rank in range(RANK_COUNT):
                 process = context.Process(
                     target=run_rank,
                     args=(
@@ -94,9 +87,12 @@ class Runtime:
                 self.processes.append(process)
             self.pump = asyncio.create_task(self._dispatch())
             async with asyncio.timeout(STARTUP_SECONDS):
-                while len(self.ready) != GPU_COUNT:
+                while len(self.ready) != RANK_COUNT:
                     self.assert_healthy()
                     await asyncio.sleep(0.1)
+                from flash.serving.deepinfer.runtime.warmup import warmup
+
+                await warmup(self)
         except BaseException:
             await self.close()
             raise
@@ -121,8 +117,8 @@ class Runtime:
                 if event is not None:
                     self._deliver(event)
                 if (
-                    len(self.ready) == GPU_COUNT
-                    and time.monotonic() - min(self.last_seen) > REQUEST_SECONDS
+                    len(self.ready) == RANK_COUNT
+                    and time.monotonic() - min(self.last_seen) > WORKER_STALL_SECONDS
                 ):
                     raise RuntimeError("DeepInfer scheduling stalled")
         except asyncio.CancelledError:
@@ -146,8 +142,8 @@ class Runtime:
             if event["type"] == "ready":
                 self.ready.add(event["rank"])
                 self.provenance[event["rank"]] = event.get("provenance", {})
-                if len(self.ready) == GPU_COUNT:
-                    self.last_seen = [time.monotonic()] * GPU_COUNT
+                if len(self.ready) == RANK_COUNT:
+                    self.last_seen = [time.monotonic()] * RANK_COUNT
             return
         pending = self.pending.get(event["id"])
         if pending is not None:
@@ -201,18 +197,16 @@ class Runtime:
 
     @staticmethod
     def _validate_length(tokens, max_tokens):
-        if not tokens or len(tokens) + max_tokens + 64 > MAX_MODEL_LEN:
-            raise ValueError(
-                f"prompt plus output exceeds the {MAX_MODEL_LEN}-token serving context"
-            )
+        from flash.serving.deepinfer.contract.tokenizer import validate_length
+
+        validate_length(tokens, max_tokens)
 
     def tokenize(self, request):
-        prompt = self.encode_messages(
-            request.messages, thinking_mode="thinking" if request.thinking else "chat"
+        from flash.serving.deepinfer.contract.tokenizer import encode_request
+
+        return encode_request(
+            self.tokenizer, self.encode_messages, request, prefix_cache=self.token_prefix_cache
         )
-        tokens = self.tokenizer.encode(prompt, add_special_tokens=False).ids
-        self._validate_length(tokens, request.max_tokens)
-        return tokens
 
     async def generate(self, request, tokens):
         self.assert_healthy()

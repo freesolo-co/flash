@@ -539,7 +539,17 @@ def test_lora_engine_health_reports_served_model_and_baked_config(modal_app_modu
         "engine_dead": False,
         "base_model": "Qwen/Qwen3.5-9B",
         "served_model": "Freesolo-Co/Qwen3.5-9B-FP8",
-        "immutable_identity": None,
+        "immutable_identity": {
+            "model": {"repo": "Freesolo-Co/Qwen3.5-9B-FP8", "revision": None},
+            "tokenizer": {
+                "repo": "Qwen/Qwen3.5-9B",
+                "revision": "c202236235762e1c871ad0ccb60c8ee5ba337b9a",
+            },
+            "processor": {
+                "repo": "Qwen/Qwen3.5-9B",
+                "revision": "c202236235762e1c871ad0ccb60c8ee5ba337b9a",
+            },
+        },
         # A pre-quant FP8 checkpoint carries fp8 weights (auto-detected) + the global fp8 KV cache.
         "quantization": "fp8",
         "kv_cache_dtype": "fp8",
