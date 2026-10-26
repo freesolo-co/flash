@@ -13,7 +13,7 @@ retain their separate vLLM images and capacity.
 | GPU allocation | Four B200s in one container |
 | Main | One warm container, maximum three (12 B200s total), zero buffer containers |
 | Dev and other environments | Zero warm containers, maximum one, zero buffers |
-| Admission per container | Maximum 128 requests; target concurrency 32 |
+| Admission per container | Maximum 128 requests; target concurrency 8 |
 | Scale-up | One second of sustained demand above the target |
 | Native scheduler | Two driver ranks, 64 sequences per rank, 16,384-token prefill chunks |
 | Context | 1,048,576 combined input/output tokens, with 64 reserved for native execution |
@@ -32,13 +32,12 @@ startup and receives 503 until the server is ready. At the maximum pool size the
 is no spare GPU group for a rolling replacement. With zero buffer containers, a
 sudden burst can arrive before additional groups are ready; the scaling target
 does not guarantee latency during cold scale-out.
-The target is 32 active requests per container, so two containers target roughly
-64 requests across the pool. Sixteen total requests do not require a third group
-under this policy. This is a soft demand target, not a literal trigger on a
-particular request number or a decoding-capacity guarantee. It allocates GPUs
-later than the target-eight policy used in the recorded autoscaling replay;
-startup headroom is smaller and the earlier zero-error result does not qualify
-this revised policy. No additional GPU load replay was run for this change.
+The target is eight active requests per container, matching the recorded
+zero-error autoscaling replay. Two containers therefore target roughly 16
+requests across the pool. This is a soft demand target, not a literal trigger
+on a particular request number or a decoding-capacity guarantee. Early allocation
+provides startup headroom; individual groups can serve above the target while
+additional groups initialize. No additional GPU replay was run for this restoration.
 
 The public router sends requests to the private Modal Server URL. Modal selects
 a container using its default routing; we do not send an affinity header or
