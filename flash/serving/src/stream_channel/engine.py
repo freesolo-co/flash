@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import inspect
+import logging
 import queue as stdlib_queue
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable
@@ -26,6 +27,7 @@ from flash.serving.src.stream_channel.protocol import (
 )
 
 _T = TypeVar("_T")
+logger = logging.getLogger(__name__)
 
 
 class StreamGenerateOwner(Protocol):
@@ -113,6 +115,11 @@ class _LeaseWatch:
             except stdlib_queue.Empty:
                 return False
             except TimeoutError as exc:
+                logger.warning(
+                    "Stream control read timed out: initial=%s budget_seconds=%s",
+                    self._latest is None,
+                    local_timeout,
+                )
                 raise StreamChannelError(
                     ChannelErrorCode.CHANNEL_FAULT,
                     "control channel read timed out",
@@ -125,6 +132,7 @@ class _LeaseWatch:
     async def admit(self) -> None:
         consumed = await self._consume(timeout=CONTROL_POLL_SECONDS)
         if not consumed:
+            logger.warning("Stream admission failed: initial control lease is missing")
             raise StreamChannelError(ChannelErrorCode.CHANNEL_FAULT, "initial lease is missing")
         while self._latest is not None and self._latest.function_call_id is None:
             if await self._consume(block=False):
@@ -250,6 +258,21 @@ async def _put_data(queue: Any, envelope: DataEnvelope) -> None:
     )
 
 
+def _channel_failure_code(
+    exc: Exception, generation_started: bool, event_count: int
+) -> ChannelErrorCode:
+    if not isinstance(exc, StreamChannelError):
+        return ChannelErrorCode.ENGINE_ERROR
+    # Stable codes and phase only: never log prompts, queue contents or credentials.
+    logger.warning(
+        "Stream channel failed: code=%s generation_started=%s events=%s",
+        exc.code.value,
+        generation_started,
+        event_count,
+    )
+    return exc.code
+
+
 async def stream_generate_call(
     owner: StreamGenerateOwner,
     payload_dict: dict[str, Any],
@@ -349,7 +372,7 @@ async def stream_generate_call(
     except _UnsettledGuardedOperation as exc:
         raise exc.cause from None
     except Exception as exc:
-        code = exc.code if isinstance(exc, StreamChannelError) else ChannelErrorCode.ENGINE_ERROR
+        code = _channel_failure_code(exc, generation_may_have_started, sequence)
         envelope = DataEnvelope(
             kind="error",
             generation_id=generation_id,
