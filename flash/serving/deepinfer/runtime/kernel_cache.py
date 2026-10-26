@@ -29,19 +29,21 @@ QUALIFIED_CONFIG = {
     "GPU_PREFIX_CACHE_TOKENS": 2097152,
     "GPU_PREFIX_CACHE_ENTRIES": 64,
 }
-# The eight-turn scheduler was qualified with exhaustive startup, correctness
-# checks and a matched four-B200 replay. Other overrides below change only the
-# two module import paths; their bytes were checked against the qualified source
-# after those exact substitutions. Every current file still requires an exact hash.
+# The eight-turn scheduler was qualified with exhaustive startup and GPU replay.
+# Worker/image imports reflect module renames. The transport patch removes only
+# startup host discovery: Modal's B200:4 contract guarantees a single machine,
+# with the same RDMA placeholder and NVLink check. CPU tests exercise that patch.
+# No CUDA implementation, native binary or compiled-kernel geometry is changed.
+# Every current file still requires an exact hash.
 QUALIFIED_SOURCE_OVERRIDES = {
-    "flash/serving/deepinfer/native/single_host_transport.py": "503c53c54e7d841467cc3a22fe057a4d0e05fa641d536922ca59caa57c6b0c7c",
+    "flash/serving/deepinfer/native/transport.py": "9000b752404f0bf1136988dabb398a9df4598110c61038b178964c36ad6fc868",
     "flash/serving/deepinfer/runtime/prefill_scheduler.py": "059ba9374ccd77b45348cc1887ca7b7dbf4a703e6c7b9d0260cef6d8056aa76c",
-    "flash/serving/deepinfer/native/image.py": "1818bc92ad6c81e208aa016f3c8882e63f990d4dfb7bd638e27136ee8f12eb73",
+    "flash/serving/deepinfer/native/image.py": "6ee502e5c530ff27fbf76bf19b8717c3c3db9f48bc93c689e1de1639f9e09282",
     "flash/serving/deepinfer/runtime/worker.py": "fd654ac63b90e33d7c38a424ac7bf4b2a4489c9455b939543abe86067b4bab29",
 }
 # The immutable compiler seed predates these descriptive module names.
 SOURCE_PATH_RENAMES = {
-    "flash/serving/deepinfer/native/local_collectives.py": "flash/serving/deepinfer/native/single_host_transport.py",
+    "flash/serving/deepinfer/native/local_collectives.py": "flash/serving/deepinfer/native/transport.py",
     "flash/serving/deepinfer/runtime/prefill_coalescing.py": "flash/serving/deepinfer/runtime/prefill_scheduler.py",
 }
 _SOURCE_PREFIX = "flash/serving/deepinfer/"

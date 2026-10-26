@@ -10,7 +10,7 @@ retain their separate vLLM images and capacity.
 
 | Setting | Value |
 | --- | --- |
-| GPU allocation | Four B200s in one container |
+| GPU allocation | Four B200s on one physical machine per container (`B200:4`) |
 | Main | One warm container, maximum three (12 B200s total), zero buffer containers |
 | Dev and other environments | Zero warm containers, maximum one, zero buffers |
 | Admission per container | Maximum 128 requests; target concurrency 8 |
@@ -147,8 +147,15 @@ must build the pinned runtime and replace its identity. Image preparation checks
 the Git revision and exact source hashes, applies the short-context indexer and
 prefix-checkpoint bindings, and rebuilds the native extension. It installs local
 Engram transport in spawned context-parallel workers and disables expandable CUDA
-allocations for IPC. A missing RDMA bandwidth is accepted only after checking all
-participants share one host and every resulting physical domain is NVLink-only.
+allocations for IPC. Modal guarantees that the four GPUs requested with `B200:4`
+are on one physical machine ([GPU placement](https://modal.com/docs/guide/gpu#specifying-gpu-count)).
+All native driver and context-parallel processes stay within that container;
+autoscaling adds independent four-GPU replicas rather than extending a collective
+across machines. `native/transport.py` therefore omits redundant hostname and
+physical-domain discovery. It supplies the same positive placeholder when RDMA
+bandwidth is absent, preserves detected RDMA bandwidth, and still requires positive
+NVLink bandwidth. This patch applies to every image; it does not add a new runtime
+speedup to the already-local benchmark configuration.
 
 The compiler-cache layer extends `im-01M5GXCE5NCMK4TBY608BEPZ1Y` with 1,280 files
 from `/root/.dj/cache`, `/root/.tilelang/cache` and `/root/.triton/cache`.
@@ -164,12 +171,12 @@ every compiler artifact, native binary identity on both drivers, compiler/librar
 versions, native/runtime Python sources, and the model and execution geometry.
 The eight-turn scheduler in `runtime/prefill_scheduler.py` was qualified with
 exhaustive warmup, answer/cache checks and a matched four-GPU replay. The exact
-source hashes in `runtime/kernel_cache.py` also account for import-only renames
-to `runtime/prefill_scheduler.py` and `native/single_host_transport.py`; the renamed source
-was compared byte-for-byte after those substitutions. Image construction removes
-the former module filenames inherited from the seed. All current source files
-still require their exact expected hashes. Native binary,
-compiler artifacts and execution geometry are unchanged.
+source hashes in `runtime/kernel_cache.py` account for the scheduler rename and
+`native/transport.py` startup simplification. The latter relies on Modal's
+single-host placement contract and was checked with CPU patch-execution tests;
+no new GPU benchmark was run. Image construction removes former module filenames
+inherited from the seed. All current source files require exact expected hashes.
+Native binary, compiler artifacts and execution geometry are unchanged.
 A qualified image exercises representative prefill shapes, all existing decode
 batches, and prefix capture/reuse before readiness. Missing, modified or
 incompatible artifacts retain the exhaustive 16-token-step prefill warmup.

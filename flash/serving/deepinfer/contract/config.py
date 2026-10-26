@@ -10,6 +10,7 @@ RUNTIME_IMAGE_ID = "im-afZLHKewsK8Ldc8aZIVd5Q"
 RUNTIME_PYTHON = "/opt/deepinfer-venv/bin/python"
 RUNTIME_ROOT = "/opt/DeepInfer"
 MODEL_CACHE = "/weights/hub"
+# Modal guarantees that a multi-GPU container receives GPUs on one physical host.
 GPU_COUNT = 4
 CONTEXT_PARALLEL_SIZE = 2
 RANK_COUNT = GPU_COUNT // CONTEXT_PARALLEL_SIZE

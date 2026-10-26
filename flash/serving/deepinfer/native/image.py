@@ -33,7 +33,7 @@ def main():
     indexer = root / INDEX_PATH
     indexer.write_text(patch_indexer(indexer.read_text()))
     apply_runtime_patches(root)
-    from flash.serving.deepinfer.native.single_host_transport import patch_bucket
+    from flash.serving.deepinfer.native.transport import patch_bucket
 
     package = importlib.util.find_spec("deep_ep")
     if package is None or package.origin is None:
