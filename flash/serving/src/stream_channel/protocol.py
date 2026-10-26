@@ -14,10 +14,6 @@ CONTROL_PARTITION = "control"
 HEARTBEAT_INTERVAL_SECONDS = 1.0
 LEASE_SECONDS = 4.0
 CONTROL_POLL_SECONDS = 0.25
-# The first engine read also resolves Modal's lazy queue handle after a cold boot.
-# No model work is admitted during this bounded setup window. Running streams
-# retain the short poll deadline and four-second renewable lease.
-CONTROL_STARTUP_SECONDS = 10.0
 DATA_GET_SECONDS = 0.25
 TERMINAL_DRAIN_SECONDS = 1.0
 CLEANUP_SECONDS = 1.0

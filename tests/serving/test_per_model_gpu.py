@@ -778,12 +778,15 @@ def _load_engine_and_args(
     base_model: str,
     *,
     engine_type: type | None = None,
+    tokenizer_backend: Any = None,
 ) -> tuple[Any, Any]:
     """Run _LoraEngineImpl._load() for ``base_model`` with the tokenizer + vLLM engine stubbed, and
     return the engine instance plus the AsyncEngineArgs it was constructed with."""
     import transformers
 
     fake_tok = types.SimpleNamespace(pad_token="<pad>", eos_token="<eos>", eos_token_id=0)
+    if tokenizer_backend is not None:
+        fake_tok.backend_tokenizer = tokenizer_backend
     fake_processor = types.SimpleNamespace(tokenizer=fake_tok)
     monkeypatch.setattr(transformers.AutoTokenizer, "from_pretrained", lambda *a, **k: fake_tok)
     monkeypatch.setattr(
@@ -816,6 +819,60 @@ def _load_engine_and_args(
 
 def _capture_engine_args(modal_app_module, monkeypatch, tmp_path, base_model: str) -> Any:
     return _load_engine_and_args(modal_app_module, monkeypatch, tmp_path, base_model)[1]
+
+
+def test_qwen_prefix_tokenizer_is_built_before_readiness_and_reused_by_requests(
+    modal_app_module, monkeypatch, tmp_path
+):
+    from tokenizers import Tokenizer, models
+
+    from flash.serve.runtime.token_prefix_cache import TokenPrefixCache
+    from flash.serving.src.io.schemas import GenerateRequest
+
+    constructions = []
+    original_init = TokenPrefixCache.__init__
+
+    def counted_init(cache, *args, **kwargs):
+        original_init(cache, *args, **kwargs)
+        constructions.append(cache)
+
+    monkeypatch.setattr(TokenPrefixCache, "__init__", counted_init)
+    backend = Tokenizer(models.BPE(vocab={"hello": 0}, merges=[]))
+    engine, _ = _load_engine_and_args(
+        modal_app_module,
+        monkeypatch,
+        tmp_path,
+        "Qwen/Qwen3.5-9B",
+        tokenizer_backend=backend,
+    )
+    # Returning from _load makes the replica ready: expensive cloning must
+    # already be complete, without retaining any customer prompt entries.
+    assert len(constructions) == 1
+    assert not constructions[0].entries
+    assert constructions[0].tokenizer is not backend
+    engine.tokenizer.apply_chat_template = lambda *args, **kwargs: [0]
+    payload = GenerateRequest(
+        model_id=engine.base_model, messages=[{"role": "user", "content": "hello"}]
+    )
+
+    async def first_requests():
+        return await asyncio.gather(*(engine._prompt_input(payload, False) for _ in range(4)))
+
+    assert asyncio.run(first_requests()) == [{"prompt_token_ids": [0]}] * 4
+    assert len(constructions) == 1
+
+
+def test_prefix_tokenizer_initialization_failure_refuses_readiness(
+    modal_app_module, monkeypatch, tmp_path
+):
+    from flash.serving.src.engine.text_tokenizer import TextPromptTokenizer
+
+    def fail_initialization(self):
+        raise RuntimeError("tokenizer initialization failed")
+
+    monkeypatch.setattr(TextPromptTokenizer, "_token_prefix_cache", fail_initialization)
+    with pytest.raises(RuntimeError, match="tokenizer initialization failed"):
+        _load_engine_and_args(modal_app_module, monkeypatch, tmp_path, "Qwen/Qwen3.5-9B")
 
 
 @pytest.mark.parametrize("base_model", base_models())

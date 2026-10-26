@@ -116,9 +116,9 @@ class TextPromptTokenizer:
         return {"prompt_token_ids": prompt_token_ids}
 
     def _token_prefix_cache(self):
-        # Owners keep an immutable, pinned tokenizer for their lifetime. Construct
-        # lazily so non-fast tokenizers keep the full path. The clone isolates
-        # cached encoding from per-call padding/truncation in Transformers.
+        # Hosted startup constructs this before readiness; the lazy fallback is
+        # for offline callers. The clone isolates cached encoding from per-call
+        # padding/truncation in Transformers. Non-fast tokenizers use the full path.
         if not hasattr(self, "_text_prefix_cache"):
             from tokenizers import Tokenizer
 

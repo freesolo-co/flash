@@ -16,7 +16,6 @@ from flash.serving.src.stream_channel.protocol import (
     CLEANUP_SECONDS,
     CONTROL_PARTITION,
     CONTROL_POLL_SECONDS,
-    CONTROL_STARTUP_SECONDS,
     DATA_PARTITION,
     PARTITION_TTL_SECONDS,
     ChannelErrorCode,
@@ -131,7 +130,7 @@ class _LeaseWatch:
             return True
 
     async def admit(self) -> None:
-        consumed = await self._consume(timeout=CONTROL_STARTUP_SECONDS)
+        consumed = await self._consume(timeout=CONTROL_POLL_SECONDS)
         if not consumed:
             logger.warning("Stream admission failed: initial control lease is missing")
             raise StreamChannelError(ChannelErrorCode.CHANNEL_FAULT, "initial lease is missing")
