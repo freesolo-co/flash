@@ -6,7 +6,7 @@ import httpx
 import pytest
 
 from flash.serving.src.accounting.usage_outbox import DurableUsageOutbox, UsageOutboxError
-from tests.serving.test_usage_outbox import _claimed_row, _outbox_settings
+from tests.serving.test_usage_outbox import _claimed_row, _outbox_settings, _QueuedClient
 
 
 class SettlementClient:
@@ -103,5 +103,39 @@ def test_one_permanent_failure_does_not_orphan_other_settlements():
             await outbox.aclose()
         assert client.rescheduled == ["outbox-0"]
         assert client.active == 0
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("code", ["serving_usage_lease_lost", "serving_usage_identity_mismatch"])
+def test_lease_loss_is_not_a_permanent_billing_conflict(code):
+    async def run():
+        client = _QueuedClient([(409, {"detail": {"code": code}}), (200, None)])
+        outbox = DurableUsageOutbox(_outbox_settings(), client=client, worker_id="worker")
+        row = _claimed_row()
+        await outbox._deliver(row)
+        assert not outbox._active_leases
+        if code == "serving_usage_lease_lost":
+            assert len(client.calls) == 1
+            # Shutdown cannot reschedule work that now belongs to a different owner.
+            await outbox.aclose()
+            assert len(client.calls) == 1
+        else:
+            assert client.calls[1][0].endswith("/quarantine_serving_usage")
+            assert client.calls[1][1]["p_reason"] == "permanent_http_409"
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize(
+    "body", [None, [], {"detail": None}, {"detail": []}, {"code": "serving_usage_lease_lost"}]
+)
+def test_malformed_conflict_response_does_not_bypass_quarantine(body):
+    async def run():
+        client = _QueuedClient([(409, body), (200, None)])
+        outbox = DurableUsageOutbox(_outbox_settings(), client=client, worker_id="worker")
+        await outbox._deliver(_claimed_row())
+        assert client.calls[1][0].endswith("/quarantine_serving_usage")
+        assert not outbox._active_leases
 
     asyncio.run(run())

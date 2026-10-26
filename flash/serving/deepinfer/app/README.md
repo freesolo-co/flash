@@ -41,8 +41,11 @@ after acknowledgment.
 Large fresh suffixes coalesce across the two driver ranks for up to 420ms before
 forcing an any-rank prefill attempt. Suffixes below 8,192 uncached tokens skip
 that wait. A collective maximum over pending request ages makes every driver
-choose the same scheduling vote. Startup exercises prefill shapes, representative
-decode batches, and prefix capture/reuse before readiness.
+choose the same scheduling vote. While any rank has decoding work, long prefills
+leave eight decode turns between chunks. Every rank uses the same collective
+decision so a cold long prompt cannot force uninterrupted prefill steps across
+the whole group. Startup exercises prefill shapes, representative decode batches,
+and prefix capture/reuse before readiness.
 
 Tokenization uses the checkpoint's official `encoding/encoding.py` and immutable
 tokenizer revision. CPU admission and native generation share the renderer and
@@ -86,7 +89,10 @@ with durable outbox delivery and idempotent ledger writes. The shared CPU router
 settles up to eight claimed records concurrently; each starts immediately within
 its lease. Shutdown cancels deliveries before releasing their leases, and a
 permanent delivery error refuses new chargeable work. This applies to DeepSeek
-and Qwen and does not change token prices or ledger idempotency. The backend's legacy
+and Qwen and does not change token prices or ledger idempotency. A backend response
+explicitly reporting a lost settlement lease leaves the database-owned event
+for reclamation instead of permanently quarantining it; identity conflicts still
+fail closed. The backend's legacy
 `gpu_seconds` field stores request generation wall time as an allocation weight;
 it is not physical GPU-seconds and does not determine token charges.
 
@@ -144,6 +150,10 @@ its own writable cache overlay; there is no shared runtime cache volume.
 Before shortening prefill warmup, the runtime verifies the trusted manifest,
 every compiler artifact, native binary identity on both drivers, compiler/library
 versions, native/runtime Python sources, and the model and execution geometry.
+The scheduler-only source override in `runtime/kernel_cache.py` was requalified
+with exhaustive warmup, answer/cache checks and a matched four-GPU replay; its
+exact hash is checked separately from the original seed manifest. Native binary,
+compiler artifacts and execution geometry are unchanged.
 A qualified image exercises representative prefill shapes, all existing decode
 batches, and prefix capture/reuse before readiness. Missing, modified or
 incompatible artifacts retain the exhaustive 16-token-step prefill warmup.

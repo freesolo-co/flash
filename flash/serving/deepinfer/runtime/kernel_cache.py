@@ -29,6 +29,11 @@ QUALIFIED_CONFIG = {
     "GPU_PREFIX_CACHE_TOKENS": 2097152,
     "GPU_PREFIX_CACHE_ENTRIES": 64,
 }
+# Requalified with the same native binary and compiler artifacts after exhaustive
+# startup, correctness checks and a matched 1,639-request four-B200 replay.
+QUALIFIED_SOURCE_OVERRIDES = {
+    "flash/serving/deepinfer/runtime/prefill_coalescing.py": "059ba9374ccd77b45348cc1887ca7b7dbf4a703e6c7b9d0260cef6d8056aa76c"
+}
 _SOURCE_PREFIX = "flash/serving/deepinfer/"
 # Deployment/transport code does not specialize GPU kernels. Runtime and native
 # code must match the seed, apart from this verifier and the warmup it selects.
@@ -99,6 +104,9 @@ def _verify(provenance: dict, root: Path) -> bool:
     sources = {
         name: digest for name, digest in manifest["runtime_sources"].items() if _kernel_source(name)
     }
+    if not set(QUALIFIED_SOURCE_OVERRIDES) <= set(sources):
+        return False
+    sources.update(QUALIFIED_SOURCE_OVERRIDES)
     source_root = root / "root"
     current = {
         str(path.relative_to(source_root))

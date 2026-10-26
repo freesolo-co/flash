@@ -16,8 +16,10 @@ class PrefillCoalescing:
         self.engine = engine
         self.seconds = seconds
         self.pending = {}
+        self.decode_remaining = 0
+        self.decoding = False
         self.group = PG.cpu_data_parallel_group()
-        self.age = torch.zeros(1, dtype=torch.float64, device="cpu")
+        self.age = torch.zeros(2, dtype=torch.float64, device="cpu")
 
     def command(self, command, active, cached_tokens=0):
         request_id = command["id"]
@@ -35,13 +37,26 @@ class PrefillCoalescing:
         self.age[0] = max(
             (now - start - wait for start, wait in self.pending.values()), default=-1.0
         )
+        self.age[1] = float(self.decoding)
         # Every DP driver performs this collective once per scheduling iteration.
         # Only age durations cross hosts. All drivers then choose the same vote.
         if self.group.size() > 1:
             dist.all_reduce(self.age, op=dist.ReduceOp.MAX, group=self.group)
-        self.engine.scheduler.decode_step = (
-            self.engine.scheduler_config.prefill_any_attempt_interval if self.age.item() >= 0 else 0
-        )
+        # Keep a bounded decode opportunity between long prefill chunks. Every
+        # driver sees the same global decode flag and advances the same step budget.
+        if self.age[1].item() and self.decode_remaining:
+            self.engine.scheduler.decode_step = 1
+        else:
+            self.engine.scheduler.decode_step = (
+                self.engine.scheduler_config.prefill_any_attempt_interval
+                if self.age[0].item() >= 0
+                else 0
+            )
 
     def after_step(self, active):
         self.pending = {key: value for key, value in self.pending.items() if key in active}
+        self.decoding = bool(active - self.pending.keys())
+        if self.engine.scheduler.decode_step == 0:
+            self.decode_remaining = 8
+        else:
+            self.decode_remaining = max(0, self.decode_remaining - 1)

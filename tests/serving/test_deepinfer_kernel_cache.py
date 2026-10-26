@@ -14,6 +14,7 @@ def digest(data):
 
 @pytest.fixture
 def qualified_seed(tmp_path, monkeypatch):
+    monkeypatch.setattr(kernel_cache, "QUALIFIED_SOURCE_OVERRIDES", {})
     source = "flash/serving/deepinfer/runtime/worker.py"
     source_path = tmp_path / "root" / source
     source_path.parent.mkdir(parents=True)
@@ -120,4 +121,22 @@ def test_manifest_tampering_or_missing_seed_restores_exhaustive_warmup(qualified
     path.write_text("{}")
     assert not kernel_cache.verified_compiler_cache(proof, filesystem_root=root)
     path.unlink()
+    assert not kernel_cache.verified_compiler_cache(proof, filesystem_root=root)
+
+
+def test_requalified_source_requires_its_exact_hash(qualified_seed, monkeypatch):
+    root, proof, source, _ = qualified_seed
+    source.write_bytes(b"requalified scheduler source")
+    name = str(source.relative_to(root / "root"))
+    monkeypatch.setattr(
+        kernel_cache, "QUALIFIED_SOURCE_OVERRIDES", {name: digest(source.read_bytes())}
+    )
+    assert kernel_cache.verified_compiler_cache(proof, filesystem_root=root)
+    source.write_bytes(b"unqualified scheduler change")
+    assert not kernel_cache.verified_compiler_cache(proof, filesystem_root=root)
+
+
+def test_override_cannot_add_an_unmanifested_module(qualified_seed, monkeypatch):
+    root, proof, _, _ = qualified_seed
+    monkeypatch.setattr(kernel_cache, "QUALIFIED_SOURCE_OVERRIDES", {"unlisted.py": "unknown"})
     assert not kernel_cache.verified_compiler_cache(proof, filesystem_root=root)

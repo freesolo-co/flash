@@ -601,6 +601,12 @@ class DurableUsageOutbox:
             await self._retry_or_quarantine(outbox_id, attempt, "transport")
             return
         status = response.status_code
+        if status == 409 and _settlement_lease_lost(response):
+            # Another worker, expiry or shutdown owns this transition. Do not
+            # quarantine an immutable event because this delivery lost its lease.
+            # The database will reclaim pending/expired work idempotently.
+            self._active_leases.discard(outbox_id)
+            return
         if status in {408, 429} or status >= 500:
             await self._retry_or_quarantine(outbox_id, attempt, f"http_{status}")
             return
@@ -731,6 +737,14 @@ class DurableUsageOutbox:
             errors.append(self._background_error)
         if errors:
             raise UsageOutboxError("usage_outbox_shutdown_failed") from errors[0]
+
+
+def _settlement_lease_lost(response: httpx.Response) -> bool:
+    try:
+        body = response.json()
+        return body.get("detail", {}).get("code") == "serving_usage_lease_lost"
+    except (ValueError, AttributeError):
+        return False
 
 
 def _is_transient_rpc_error(exc: BaseException) -> bool:
