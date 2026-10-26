@@ -51,7 +51,7 @@ the configured limits total 12 GPU containers per environment. Requests queue wh
 containers are busy; an idle model's capacity cannot be borrowed by another model.
 
 The CPU router remains warm and uncapped, with eight CPUs and 16 GiB RAM per container
-for exact token counting and concurrent stream framing. It uses non-preemptible CPU hosts because
+for concurrent stream framing and request handling. It uses non-preemptible CPU hosts because
 an interrupted HTTP stream cannot resume. Modal applies a 3x CPU/RAM price multiplier to this
 setting; GPU allocation and pricing are unchanged. `BUFFER_CONTAINERS = 1` applies to the router and every
 engine, but only while active, so GPU engines still scale to zero when idle. Idle windows are set by
@@ -280,10 +280,9 @@ The vision encoder remains loaded so adapters' vision-tower keys bind.
 
 GPU replicas are placed in the US near the US East CPU router. Before readiness,
 each Qwen replica completes synthetic prefill/decode generations with isolated
-cache salts; these are not customer requests and are not billed. Text admission
-uses the same pinned processor/tokenizer and shared prompt renderer on the CPU,
-avoiding a GPU RPC just to reserve tokens. Image requests still reserve the full
-served context per output choice. Dev retains the existing scale-to-zero policy.
+cache salts; these are not customer requests and are not billed. Admission checks
+recorded usage without tokenizing text or decoding images. Generation retains the
+pinned tokenizer and context validation. Dev retains the existing scale-to-zero policy.
 
 The router accepts 64 concurrent inputs; each GPU engine accepts 8 with an autoscaling target
 of 6. The router limit is not the number of requests packed onto one GPU.
@@ -323,23 +322,27 @@ SET requests_per_minute = EXCLUDED.requests_per_minute,
     tokens_per_minute = EXCLUDED.tokens_per_minute;
 ```
 
-The database atomically admits RPM and TPM together across all replicas, models, and endpoints.
-TPM reserves the exact text prompt token count plus `max_tokens * n` before generation; thinking,
-tools, and template rendering use the generation tokenizer. Image requests conservatively reserve
-the full served context per choice because vLLM expands image patches during processing. Reserved
-output tokens are not refunded for early stops, failures, or disconnects. Windows reset at the
-start of each UTC minute, and all tokens are charged to the admission window. This is an admission
-budget, not a rolling measurement of tokens emitted during a minute.
+The database atomically checks RPM and already-recorded actual input + output tokens
+across all replicas, models, and endpoints. Requests are admitted while the key is below
+its TPM limit; incoming prompts and maximum output lengths are not reserved or tokenized
+for admission. At or above the limit, subsequent requests receive 429 and `Retry-After`,
+with request and token allowance headers. Missing quota infrastructure fails closed with 503.
 
-Only configured keys invoke a private token-counting RPC. Token counting may cold-start the model,
-but it does not generate tokens. Missing database/token-counting infrastructure fails closed with
-503. Exhausted RPM or TPM returns 429 and `Retry-After`, with request and token allowance headers.
+The router writes the authenticated key ID into immutable usage evidence. The durable outbox
+counts only new native prompt/completion token deltas, so capture retries and billing delivery
+cannot count usage twice. Cached input is included once; reasoning is already part of output.
+Streaming input is counted at initial usage capture and output when final usage is recorded;
+non-streaming usage is recorded at completion. Deltas belong to the database minute when
+recorded, not necessarily when each token was generated. Active requests continue and can
+overshoot the allowance; this is a soft TPM limit, with no token reservation or per-token RPC.
 
-Deploy the Freesolo migration `20261025000000_serving_api_key_rate_limits.sql` and the backend
-`apiKeyId` authorization response before this serving version. Deploy the DeepInfer private
-`/internal/token-budget` route before enabling a key override for DeepSeek. Older serving code
-cannot enforce per-key limits; inserting an override alone does not activate them. No default
-key allowances are inserted by the migration.
+Deploy the Freesolo migrations `20261025000000_serving_api_key_rate_limits.sql` and
+`20261026000000_serving_actual_token_limits.sql` before deploying this router version.
+The original RPC signature remains compatible during rollout, but this version fails closed
+if the database still requests token reservations. Older routers do not attach key attribution
+to usage, so their in-flight requests cannot contribute to observed TPM; finish the router
+rollout before relying on the new policy. The backend must supply authenticated `apiKeyId`.
+No default key allowances are inserted, and billing prices and actual-usage charging are unchanged.
 
 ### Organization rate limits
 

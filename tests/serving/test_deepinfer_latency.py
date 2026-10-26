@@ -1,12 +1,7 @@
-"""Local reservation parity and startup readiness must preserve native contracts."""
-
-from types import SimpleNamespace
+"""Generation tokenization and startup readiness preserve native contracts."""
 
 import pytest
 
-from flash.serving.deepinfer.app import token_budget as budget
-from flash.serving.deepinfer.contract.config import MAX_MODEL_LEN, MODEL_ID
-from flash.serving.deepinfer.contract.errors import DeepInferError
 from flash.serving.deepinfer.contract.protocol import parse_request
 from flash.serving.deepinfer.contract.tokenizer import encode_request
 from flash.serving.deepinfer.runtime.warmup import warmup
@@ -16,46 +11,6 @@ from tests.serving.test_deepinfer import body
 @pytest.fixture
 def anyio_backend():
     return "asyncio"
-
-
-@pytest.mark.anyio
-@pytest.mark.parametrize("thinking", [False, True])
-async def test_local_admission_uses_native_encoding_and_exact_output_reservation(
-    monkeypatch, thinking
-):
-    seen = []
-
-    def encode(messages, *, thinking_mode):
-        seen.append((messages, thinking_mode))
-        return "encoded prompt"
-
-    class Tokenizer:
-        def encode_batch(self, prompts, *, add_special_tokens):
-            assert prompts == ["encoded prompt"]
-            assert not add_special_tokens
-            return [SimpleNamespace(ids=[3, 4, 5])]
-
-    monkeypatch.setattr(budget, "prepare_tokenizer", lambda: (Tokenizer(), encode, None))
-    data = body(max_tokens=77, chat_template_kwargs={"enable_thinking": thinking})
-    parsed = parse_request(data)
-    payload = SimpleNamespace(model_dump=lambda: {**data, "model_id": MODEL_ID})
-    assert await budget.token_budget(payload) == 80
-    assert encode_request(Tokenizer(), encode, parsed) == [3, 4, 5]
-    assert all(mode == ("thinking" if thinking else "chat") for _, mode in seen)
-
-
-@pytest.mark.anyio
-async def test_local_admission_rejects_over_context_before_gpu_dispatch(monkeypatch):
-    tokenizer = SimpleNamespace(
-        encode_batch=lambda *a, **k: [SimpleNamespace(ids=[1] * (MAX_MODEL_LEN - 68))]
-    )
-    monkeypatch.setattr(
-        budget, "prepare_tokenizer", lambda: (tokenizer, lambda *a, **k: "prompt", None)
-    )
-    payload = SimpleNamespace(model_dump=lambda: {**body(max_tokens=64), "model_id": MODEL_ID})
-    with pytest.raises(DeepInferError, match="context") as exc:
-        await budget.token_budget(payload)
-    assert exc.value.status_code == 422
 
 
 @pytest.mark.anyio
@@ -144,8 +99,10 @@ def test_million_token_capacity_reserves_space_for_requested_output(
             validate_length(tokens, request.max_tokens)
 
 
-@pytest.mark.anyio
-async def test_deepinfer_admission_binds_token_prefix_cache_to_authenticated_namespace(monkeypatch):
+@pytest.mark.parametrize("thinking", [False, True])
+def test_generation_uses_official_formatter_and_scoped_prefix_cache(thinking):
+    from dataclasses import replace
+
     seen = []
 
     class Cache:
@@ -153,12 +110,13 @@ async def test_deepinfer_admission_binds_token_prefix_cache_to_authenticated_nam
             seen.append((prompt, namespace))
             return [1, 2, 3]
 
-    monkeypatch.setattr(
-        budget, "prepare_tokenizer", lambda: (None, lambda *a, **k: "rendered", Cache())
+    def encode(messages, *, thinking_mode):
+        assert thinking_mode == ("thinking" if thinking else "chat")
+        return "rendered"
+
+    request = replace(
+        parse_request(body(chat_template_kwargs={"enable_thinking": thinking})),
+        cache_namespace="a" * 64,
     )
-    payload = SimpleNamespace(
-        model_dump=lambda: {**body(max_tokens=77), "model_id": MODEL_ID},
-        _cache_namespace="a" * 64,
-    )
-    assert await budget.token_budget(payload) == 80
+    assert encode_request(None, encode, request, prefix_cache=Cache()) == [1, 2, 3]
     assert seen == [("rendered", "a" * 64)]

@@ -87,39 +87,6 @@ class HostedDeepInfer:
     async def aclose(self):
         await self._client.aclose()
 
-    async def token_budget(self, payload):
-        if not configured():
-            raise DeepInferError(503, "DeepInfer backend is not configured")
-        headers = {
-            "Modal-Key": os.environ["DEEPINFER_PROXY_KEY"],
-            "Modal-Secret": os.environ["DEEPINFER_PROXY_SECRET"],
-            "Accept": "text/event-stream",
-        }
-        url = await asyncio.wait_for(asyncio.to_thread(endpoint_url), timeout=30)
-        response = await self._client.post(
-            url + "/internal/token-budget",
-            headers=headers,
-            json=chat_body(payload.model_dump()),
-        )
-        if response.status_code in {400, 422}:
-            try:
-                detail = response.json()["detail"]
-                if not isinstance(detail, str) or not detail:
-                    raise ValueError("missing validation detail")
-            except (ValueError, KeyError, TypeError) as exc:
-                raise DeepInferError(
-                    503, "DeepInfer returned malformed validation feedback"
-                ) from exc
-            raise DeepInferError(response.status_code, detail)
-        response.raise_for_status()
-        try:
-            tokens = response.json()["tokens"]
-            if type(tokens) is not int or tokens <= 0:
-                raise ValueError("invalid token budget")
-        except (ValueError, KeyError, TypeError) as exc:
-            raise DeepInferError(503, "DeepInfer returned an invalid token budget") from exc
-        return tokens
-
     async def stream_generate(self, base_model, payload, record, *, expected_checkpoint=None):
         if base_model != MODEL_ID or not record.serve_base_model:
             raise ValueError("DeepInfer does not support LoRA adapters")

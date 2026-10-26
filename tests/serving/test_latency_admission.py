@@ -1,4 +1,4 @@
-"""Preflight hints save a read without caching permission, limits, or reservations."""
+"""One quota RPC per request, independent of prompt size and cached decisions."""
 
 import json
 
@@ -7,7 +7,7 @@ import pytest
 from fastapi import HTTPException
 
 from flash.serving.src.http.key_rate_limit import admit_key
-from tests.serving.test_key_rate_limit import ALLOWED, KEY, PREFLIGHT
+from tests.serving.test_key_rate_limit import ALLOWED, DENIED, KEY
 from tests.serving.test_rate_limit import ORG
 
 
@@ -17,68 +17,41 @@ def anyio_backend():
 
 
 @pytest.mark.anyio
-async def test_hint_still_checks_changed_limits_and_removed_overrides():
+async def test_checks_observed_usage_and_live_limits_on_every_request():
     calls = []
     responses = iter(
-        [
-            PREFLIGHT,
-            ALLOWED,
-            {**ALLOWED, "allowed": False, "tokens_remaining": 0},
-            {**ALLOWED, "tpm_limit": None, "tokens_remaining": None},
-            PREFLIGHT,
-            ALLOWED,
-        ]
+        [ALLOWED, DENIED, {**ALLOWED, "tpm_limit": None, "tokens_remaining": None}, ALLOWED]
     )
 
     def handle(request):
         calls.append(json.loads(request.content))
         return httpx.Response(200, json=[next(responses)])
 
-    counts = []
-
-    async def count():
-        counts.append(1)
-        return 300
-
-    hints = {}
     async with httpx.AsyncClient(transport=httpx.MockTransport(handle)) as client:
 
         async def admit():
-            await admit_key(
-                client, "https://db/rest/v1/rpc/org", ORG, KEY, count, token_budget_keys=hints
-            )
+            await admit_key(client, "https://db/rest/v1/rpc/org", ORG, KEY)
 
         await admit()
-        assert (ORG, KEY) in hints
         with pytest.raises(HTTPException) as exc:
             await admit()
         assert exc.value.status_code == 429
         await admit()
-        assert (ORG, KEY) not in hints
         await admit()
-    assert [c.get("p_tokens") for c in calls] == [None, 300, 300, 300, None, 300]
-    assert len(counts) == 4
+    assert calls == [{"p_org_id": ORG, "p_api_key_id": KEY}] * 4
 
 
 @pytest.mark.anyio
-async def test_hint_does_not_retry_ambiguous_admission_or_cross_organizations():
+async def test_does_not_retry_ambiguous_admission_or_reuse_another_org():
     calls = []
-    hints = {(ORG, KEY): None}
 
     def handle(request):
         calls.append(json.loads(request.content))
         raise httpx.ReadTimeout("reply lost", request=request)
 
-    async def count():
-        return 99
-
     async with httpx.AsyncClient(transport=httpx.MockTransport(handle)) as client:
         for org in (ORG, "another-org"):
             with pytest.raises(HTTPException) as exc:
-                await admit_key(
-                    client, "https://db/rest/v1/rpc/org", org, KEY, count, token_budget_keys=hints
-                )
+                await admit_key(client, "https://db/rest/v1/rpc/org", org, KEY)
             assert exc.value.status_code == 503
-    assert len(calls) == 2
-    assert calls[0]["p_tokens"] == 99
-    assert "p_tokens" not in calls[1]
+    assert calls == [{"p_org_id": org, "p_api_key_id": KEY} for org in (ORG, "another-org")]

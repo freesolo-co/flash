@@ -377,14 +377,6 @@ def _build_engine(
             return await self._register(record_dict, deployment_generation)
 
         @modal.method()
-        async def token_budget(
-            self, payload_dict: dict[str, Any], record_dict: dict[str, Any]
-        ) -> int:
-            from flash.serving.src.engine.token_budget import token_budget
-
-            return await token_budget(self, payload_dict, record_dict)
-
-        @modal.method()
         async def generate(
             self,
             payload_dict: dict[str, Any],
@@ -495,18 +487,8 @@ class _ModalEnginePool:
 
     def __init__(self):
         from flash.serving.deepinfer.app.client import HostedDeepInfer
-        from flash.serving.src.engine.router_token_budget import RouterTokenBudgets
 
         self._deepinfer = HostedDeepInfer()
-        self._token_budgets = RouterTokenBudgets()
-
-    async def start(self):
-        from flash.serving.deepinfer.app.client import configured
-        from flash.serving.deepinfer.app.token_budget import prepare_tokenizer
-
-        await self._token_budgets.start()
-        if configured():
-            await asyncio.to_thread(prepare_tokenizer)
 
     async def aclose(self):
         await self._deepinfer.aclose()
@@ -516,15 +498,6 @@ class _ModalEnginePool:
         from flash.serving.src.io.schemas import internal_adapter_payload
 
         return internal_adapter_payload(record)
-
-    async def token_budget(self, base_model: str, payload: Any, record: Any) -> int:
-        from flash.serving.deepinfer.contract.config import MODEL_ID as deepseek_model
-
-        if base_model == deepseek_model:
-            from flash.serving.deepinfer.app.token_budget import token_budget
-
-            return await token_budget(payload)
-        return await self._token_budgets.count(base_model, payload, record)
 
     async def generate(
         self,

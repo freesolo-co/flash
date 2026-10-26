@@ -1,4 +1,4 @@
-"""The pinned model's official text encoding, shared by admission and generation."""
+"""The pinned model's official text encoding and context validation for generation."""
 
 import importlib.util
 from pathlib import Path

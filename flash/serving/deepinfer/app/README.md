@@ -71,7 +71,7 @@ on actual traffic; a 92% hit fraction is a workload assumption, not a service
 setting or guaranteed discount.
 
 The CPU prompt-token cache holds at most 128 entries, keyed by tenant, model
-revision, messages and thinking mode. CPU admission and generation also reuse
+revision, messages and thinking mode. Generation also reuses
 tokenized conversation prefixes at verified added-token boundaries, preserving
 the exact full-encoding IDs. That tenant-scoped cache holds at most 128 entries
 and 64 MiB of packed token IDs per tokenizer, with a 600-second idle lifetime.
@@ -112,7 +112,7 @@ modal deploy --env main -m flash.serving.deepinfer.app.modal_app
 The `Deploy DeepInfer pools` workflow selects the matching Modal environment on
 relevant pushes to `dev` and `main`. Only explicitly selected `main` gets a warm
 minimum. The private `Engine` Modal Server requires proxy authentication and
-exposes `/health`, `/internal/token-budget` and `/internal/generate`.
+exposes `/health` and `/internal/generate`.
 
 The hosted router discovers `Engine` in the same Modal environment. Its
 `DEEPINFER_PROXY_KEY` and `DEEPINFER_PROXY_SECRET` must both be configured as

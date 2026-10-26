@@ -118,17 +118,6 @@ def build_app(runtime, *, manage_lifecycle=True):
             ),
         }
 
-    @app.post("/internal/token-budget")
-    async def token_budget(body: dict):
-        from flash.serving.deepinfer.contract.protocol import parse_request
-
-        try:
-            parsed = parse_request(body)
-            tokens = await runtime.prepare_tokens(parsed)
-            return {"tokens": len(tokens) + parsed.max_tokens}
-        except ValueError as exc:
-            raise HTTPException(422, str(exc)) from exc
-
     @app.post("/internal/generate")
     async def native_chat(body: dict, request: Request):
         return await _native_chat(runtime, body, request)

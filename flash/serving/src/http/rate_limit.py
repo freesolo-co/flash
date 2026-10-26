@@ -1,6 +1,5 @@
 """Organization-wide admission through an atomic, database-clock Supabase counter."""
 
-from collections.abc import Awaitable, Callable
 from typing import Protocol
 
 import httpx
@@ -16,7 +15,6 @@ class RateLimiter(Protocol):
         org_id: str,
         *,
         api_key_id: str | None = None,
-        token_budget: Callable[[], Awaitable[int]] | None = None,
     ) -> None: ...
 
 
@@ -24,7 +22,6 @@ async def allow_offline_inference(
     _org_id: str,
     *,
     api_key_id: str | None = None,
-    token_budget: Callable[[], Awaitable[int]] | None = None,
 ) -> None:
     """Explicit bypass for hermetic tests and offline app construction only."""
 
@@ -33,7 +30,6 @@ class SupabaseRateLimiter:
     def __init__(self, settings: Settings) -> None:
         if not settings.supabase_url:
             raise RuntimeError("Missing SUPABASE_URL for serving rate limits")
-        self._token_budget_keys: dict[tuple[str, str], None] = {}
         self._url = supabase_table_url(settings, "rpc/check_serving_rate_limit")
         self._client = httpx.AsyncClient(headers=supabase_headers(settings, "public"), timeout=5.0)
 
@@ -42,7 +38,6 @@ class SupabaseRateLimiter:
         org_id: str,
         *,
         api_key_id: str | None = None,
-        token_budget: Callable[[], Awaitable[int]] | None = None,
     ) -> None:
         if api_key_id is not None:
             from flash.serving.src.http.key_rate_limit import admit_key
@@ -52,8 +47,6 @@ class SupabaseRateLimiter:
                 self._url,
                 org_id,
                 api_key_id,
-                token_budget,
-                token_budget_keys=self._token_budget_keys,
             )
             return
         # Never cache or single-flight admission, even when authorization itself is cached.
