@@ -79,11 +79,20 @@ Large fresh suffixes use a 420ms grouping window before allowing an any-rank
 prefill attempt. This is not a mandatory sleep: prefill can start earlier when
 both driver ranks have eligible work. Suffixes below 8,192 uncached tokens allow
 an any-rank attempt immediately, subject to decode protection and capacity.
-While either rank has decoding work, the scheduler protects eight decode
-iterations between prefill chunks. Those iterations are separate from the
-concurrent-request autoscaling target and need not each emit exactly one token.
-Collective decisions keep both drivers in the same scheduling mode. The window
-starts at request admission, rather than restarting for each chunk, and is not
+While either rank has decoding work, the experimental scheduler protects up to
+eight decode iterations or 80ms between prefill chunks, whichever expires first.
+Both ranks reduce remaining protection durations together before choosing the
+same scheduling mode. Pending work deferred for 500ms since admission or
+the most recent group prefill chunk forces an any-rank attempt at the next
+scheduling boundary; native memory and slot
+admission still apply. This bounds policy deferral, not TTFT or chunk execution
+time. Each actual prefill resets the deferral clock, so an old long prompt cannot
+continually bypass decode protection. Decode iterations need not each emit one
+token. The 80ms and 500ms budgets are provisional and require matched GPU replay;
+no throughput or latency improvement has yet been established. Chunk size remains
+16,384 tokens because the pinned native extension has no mutable chunk budget.
+Collective decisions keep both drivers in the same scheduling mode. The coalescing
+window starts at request admission, rather than restarting for each chunk, and is not
 a TTFT bound. Startup exercises prefill shapes, representative decode batches,
 and prefix capture/reuse before readiness.
 
@@ -206,9 +215,11 @@ its own writable cache overlay; there is no shared runtime cache volume.
 Before shortening prefill warmup, the runtime verifies the trusted manifest,
 every compiler artifact, native binary identity on both drivers, compiler/library
 versions, native/runtime Python sources, and the model and execution geometry.
-The eight-turn scheduler in `runtime/prefill_scheduler.py` was qualified with
-exhaustive warmup, answer/cache checks and a matched four-GPU replay. The finalized
-manifest records current source filenames and exact hashes directly; there are
+The previous eight-turn scheduler in `runtime/prefill_scheduler.py` was qualified with
+exhaustive warmup, answer/cache checks and a matched four-GPU replay. The adaptive
+scheduler changes that source identity, so the existing manifest correctly selects
+exhaustive warmup until a new image is built and qualified. The finalized manifest
+records the previous source filenames and exact hashes directly; there are
 no source-hash overrides or filename aliases. Its canonical SHA-256 is
 `150ee7657553951cdc9d29979c40a68aaf727bfd68210b845006c7d2d5812856`.
 Old source filenames are absent from the rebuilt seed. Native binary, compiler

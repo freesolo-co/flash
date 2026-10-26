@@ -97,9 +97,11 @@ def test_prefill_vote_honors_other_rank_and_skips_wait_for_small_cached_suffix(m
     policy.seconds = 0.42
     policy.pending = {}
     policy.decode_remaining = 0
+    policy.protected_until = 0.0
+    policy.last_prefill = 0.0
     policy.decoding = False
     policy.group = SimpleNamespace(size=lambda: 2)
-    policy.age = Scalar([0, 0])
+    policy.age = Scalar([0, 0, 0, 0])
     policy.command({"id": "large", "type": "generate", "tokens": [1] * 32768}, {"large"})
     policy.before_step()
     assert policy.engine.scheduler.decode_step == 0
@@ -127,6 +129,9 @@ def test_prefill_chunks_leave_bounded_decode_turns_on_every_rank(monkeypatch):
         def __getitem__(self, index):
             return Number(super().__getitem__(index))
 
+    monkeypatch.setattr(
+        "flash.serving.deepinfer.runtime.prefill_scheduler.time.monotonic", lambda: 10.0
+    )
     remote_decoding = [1]
 
     def reduce(values, **kwargs):
@@ -141,9 +146,11 @@ def test_prefill_chunks_leave_bounded_decode_turns_on_every_rank(monkeypatch):
     )
     policy.pending = {}
     policy.decode_remaining = 0
+    policy.protected_until = 0.0
+    policy.last_prefill = 0.0
     policy.decoding = False
     policy.group = SimpleNamespace(size=lambda: 2)
-    policy.age = Vector([0, 0])
+    policy.age = Vector([0, 0, 0, 0])
     policy.before_step()
     assert policy.engine.scheduler.decode_step == 8
     # Native scheduling resets this counter to zero after a prefill step.
