@@ -64,10 +64,19 @@ zero warm containers, and its single-container cap. The controller uses the
 container-list API in the pinned Modal SDK; lookup failures fail the tick rather
 than treating missing telemetry as idle capacity.
 
-The public router sends requests to the private Modal Server URL. Modal selects
-a container using its default routing; we do not send an affinity header or
-provide a cross-container prefix directory. Each stream stays with its selected
-container. Within that container, the two native driver ranks are selected by
+The public router sends requests to the private Modal Server URL. Modal receives
+a best-effort `Modal-Routing-Affinity-Key` derived from the
+authorized tenant namespace, pinned model revision, thinking mode, and messages
+through the first user turn. The opaque SHA-256 hint stays stable as later turns
+are appended. Unrelated opening user turns get different hints even when they
+share a system prompt. Requests without an authoritative namespace or user turn
+omit the hint. Hashing runs off the inference event loop.
+
+Affinity can change during scaling or replacement; it does not guarantee a cache
+hit or reserve a replica. Identical opening turns share a hint, which can create
+hotspots and requires load qualification. There is no cross-container prefix
+directory, explicit replica selection, or automatic generation replay. Each
+stream stays with its selected container. Within that container, the two native driver ranks are selected by
 pending work plus uncached prompt length, with active count as a tie-breaker.
 Prefix-cache advertisements are tenant-scoped hints and workers verify exact
 matches. Prefix caches are not shared between containers.

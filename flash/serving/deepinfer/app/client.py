@@ -8,6 +8,7 @@ from urllib.parse import urlsplit
 
 import httpx
 
+from flash.serving.deepinfer.app.affinity import conversation_affinity
 from flash.serving.deepinfer.app.events import chat_body
 from flash.serving.deepinfer.contract.config import (
     APP_NAME,
@@ -102,6 +103,11 @@ class HostedDeepInfer:
             "Modal-Secret": os.environ["DEEPINFER_PROXY_SECRET"],
             "Accept": "text/event-stream",
         }
+        affinity = await asyncio.to_thread(
+            conversation_affinity, body, getattr(payload, "_cache_namespace", None)
+        )
+        if affinity is not None:
+            headers["Modal-Routing-Affinity-Key"] = affinity
         try:
             url = await asyncio.wait_for(asyncio.to_thread(endpoint_url), timeout=30)
         except Exception as exc:
