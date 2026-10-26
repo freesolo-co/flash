@@ -293,7 +293,7 @@ def test_native_image_patch_rejects_unknown_source():
 @pytest.mark.parametrize(
     ("environment", "warm_replicas"), [("main", 1), ("dev", 0), ("test", 0), (None, 0)]
 )
-def test_modal_private_two_gpu_autoscaling_contract(monkeypatch, environment, warm_replicas):
+def test_modal_private_four_gpu_autoscaling_contract(monkeypatch, environment, warm_replicas):
     captured = {}
 
     class Image:
@@ -344,11 +344,12 @@ def test_modal_private_two_gpu_autoscaling_contract(monkeypatch, environment, wa
     assert captured["server"]["gpu"] == "B200:4"
     assert captured["server"]["memory"] == 524288
     assert captured["server"]["min_containers"] == warm_replicas
-    assert captured["server"]["max_containers"] == 1
+    assert captured["server"]["max_containers"] == (3 if environment == "main" else 1)
     assert captured["server"]["buffer_containers"] == 0
     assert captured["server"]["scaledown_window"] == 600
+    assert captured["server"]["scaleup_window"] == 1
     assert captured["server"]["max_concurrency"] == 128
-    assert captured["server"]["target_concurrency"] == 96
+    assert captured["server"]["target_concurrency"] == 16
     assert captured["server"]["compute_region"] == "us"
     assert captured["server"]["routing_region"] == "us-east"
     assert captured["server"]["unauthenticated"] is False

@@ -113,6 +113,9 @@ def build_app(runtime, *, manage_lifecycle=True):
             "gpu_count": GPU_COUNT,
             "loaded_ranks": getattr(runtime, "provenance", {}),
             "active_requests": len(getattr(runtime, "pending", {})),
+            "compiled_kernel_cache_verified": getattr(
+                runtime, "compiled_kernel_cache_verified", False
+            ),
         }
 
     @app.post("/internal/token-budget")

@@ -21,6 +21,7 @@ from flash.serving.deepinfer.contract.config import (
     RUNTIME_IMAGE_ID,
     RUNTIME_PYTHON,
     SCALEDOWN_SECONDS,
+    SCALEUP_SECONDS,
     STARTUP_SECONDS,
     TARGET_INPUTS,
 )
@@ -65,6 +66,7 @@ def _watch_server(process):
     max_containers=MAIN_MAX_CONTAINERS if main_environment else MAX_CONTAINERS,
     buffer_containers=MAIN_BUFFER_CONTAINERS if main_environment else BUFFER_CONTAINERS,
     scaledown_window=SCALEDOWN_SECONDS,
+    scaleup_window=SCALEUP_SECONDS,
     startup_timeout=STARTUP_SECONDS,
     target_concurrency=TARGET_INPUTS,
     max_concurrency=MAX_INPUTS,

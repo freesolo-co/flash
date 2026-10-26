@@ -1516,7 +1516,7 @@ def test_startup_claim_recovers_expired_lease_and_delivers() -> None:
     assert any(url.endswith("/rpc/acknowledge_serving_usage_delivered") for url, _ in client.calls)
 
 
-def test_slow_delivery_shutdown_releases_every_single_row_claim() -> None:
+def test_slow_delivery_shutdown_releases_claim() -> None:
     row = _claimed_row()
     entered = asyncio.Event()
     unblock = asyncio.Event()
@@ -1548,7 +1548,7 @@ def test_slow_delivery_shutdown_releases_every_single_row_claim() -> None:
     claim_calls = [
         payload for url, payload in client.calls if url.endswith("/rpc/claim_serving_usage_batch")
     ]
-    assert claim_calls == [{"p_worker_id": "worker-1", "p_limit": 1, "p_lease_seconds": 60}]
+    assert claim_calls == [{"p_worker_id": "worker-1", "p_limit": 8, "p_lease_seconds": 60}]
     release_calls = [
         payload for url, payload in client.calls if url.endswith("/rpc/reschedule_serving_usage")
     ]

@@ -1,6 +1,7 @@
 """Exercise prefill/decode before a newly allocated replica accepts customer traffic."""
 
 import asyncio
+import logging
 from dataclasses import replace
 
 from flash.serving.deepinfer.contract.config import (
@@ -9,9 +10,17 @@ from flash.serving.deepinfer.contract.config import (
     RANK_COUNT,
 )
 from flash.serving.deepinfer.contract.protocol import parse_request
+from flash.serving.deepinfer.runtime.kernel_cache import verified_compiler_cache
 
 
 async def warmup(runtime):
+    runtime.compiled_kernel_cache_verified = await asyncio.to_thread(
+        verified_compiler_cache, getattr(runtime, "provenance", {})
+    )
+    logging.getLogger(__name__).info(
+        "Compiled kernel cache verified: %s", runtime.compiled_kernel_cache_verified
+    )
+
     async def request(index, repetitions, concurrency, prefill_tokens=None, cache=False):
         parsed = parse_request(
             {
@@ -55,8 +64,15 @@ async def warmup(runtime):
 
     # DeepGEMM selects different kernel layouts in 16-token M increments. Its
     # lazy CUDA compilation otherwise blocks live streams for seconds whenever
-    # an unseen prompt shape arrives. Cover the full chunked-prefill capacity.
-    for length in range(16, PREFILL_TOKENS + 1, 16):
+    # an unseen prompt shape arrives. The verified seed covers the full capacity;
+    # exercise representative execution shapes, largest first for allocator reuse.
+    # Missing or incompatible artifacts retain exhaustive shape coverage.
+    lengths = (
+        (PREFILL_TOKENS, 4096, 1024, 256, 16)
+        if runtime.compiled_kernel_cache_verified
+        else range(16, PREFILL_TOKENS + 1, 16)
+    )
+    for length in lengths:
         async with asyncio.TaskGroup() as group:
             for index in range(RANK_COUNT):
                 group.create_task(request(index, 2048, RANK_COUNT, length))

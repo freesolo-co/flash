@@ -24,6 +24,7 @@ StableId = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1,
 _GENERATION_ID_RE = re.compile(r"^fsgen-[0-9a-f]{32}$")
 _HEARTBEAT_BATCH_SIZE = 128
 _RECOVERY_BATCH_SIZE = 500
+_DELIVERY_CONCURRENCY = 8
 _CLEANUP_TIMEOUT_SECONDS = 10.0
 _RESPONSE_LOSS_REPLAY_ATTEMPTS = 2
 _RESPONSE_LOSS_REPLAY_DELAY_SECONDS = 0.05
@@ -242,7 +243,7 @@ def _deterministic_jitter(outbox_id: str, attempt: int, base: float) -> float:
 
 
 class DurableUsageOutbox:
-    """Supabase-backed capture plus one leased backend-settlement worker."""
+    """Supabase-backed capture plus bounded, leased backend settlement."""
 
     enabled = True
 
@@ -426,10 +427,18 @@ class DurableUsageOutbox:
             try:
                 await self.recover_stale_in_progress()
                 claimed = await self._claim()
-                for row in claimed:
-                    if self._stopping.is_set():
-                        return
-                    await self._deliver(row)
+                # Every claimed row starts immediately: no lease expires while waiting
+                # behind a slow settlement. Await all outcomes before reclaiming work or
+                # surfacing a failure, including cancellation during shutdown.
+                results = await asyncio.gather(
+                    *(self._deliver(row) for row in claimed), return_exceptions=True
+                )
+                failures = [result for result in results if isinstance(result, BaseException)]
+                for failure in failures:
+                    if not _is_transient_rpc_error(failure):
+                        raise failure
+                if failures:
+                    raise failures[0]
                 if claimed:
                     self._wake.set()
             except asyncio.CancelledError:
@@ -551,11 +560,11 @@ class DurableUsageOutbox:
             "claim_serving_usage_batch",
             {
                 "p_worker_id": self._worker_id,
-                "p_limit": 1,
+                "p_limit": _DELIVERY_CONCURRENCY,
                 "p_lease_seconds": self._lease_seconds,
             },
         )
-        if not isinstance(data, list) or len(data) > 1:
+        if not isinstance(data, list) or len(data) > _DELIVERY_CONCURRENCY:
             raise UsageOutboxError("usage_claim_invalid")
         rows = [dict(row) for row in data if isinstance(row, dict)]
         if len(rows) != len(data):

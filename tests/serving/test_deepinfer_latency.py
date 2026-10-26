@@ -59,7 +59,11 @@ async def test_local_admission_rejects_over_context_before_gpu_dispatch(monkeypa
 
 
 @pytest.mark.anyio
-async def test_startup_warmup_drains_and_closes_native_requests():
+@pytest.mark.parametrize("verified", [False, True])
+async def test_startup_warmup_drains_and_closes_native_requests(monkeypatch, verified):
+    monkeypatch.setattr(
+        "flash.serving.deepinfer.runtime.warmup.verified_compiler_cache", lambda _: verified
+    )
     calls, closed = [], []
 
     class Runtime:
@@ -77,7 +81,7 @@ async def test_startup_warmup_drains_and_closes_native_requests():
                 closed.append(request)
 
     await warmup(Runtime())
-    assert len(calls) == len(closed) == 2401
+    assert len(calls) == len(closed) == (363 if verified else 2401)
     assert all(r.prefix_tokens == 198 for r in calls)
     assert all(r.cache_namespace is None for r in calls[:-6])
     assert all(r.cache_namespace == "0" * 64 for r in calls[-6:])
