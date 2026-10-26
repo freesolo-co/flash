@@ -30,16 +30,17 @@ QUALIFIED_CONFIG = {
     "GPU_PREFIX_CACHE_ENTRIES": 64,
 }
 # The eight-turn scheduler was qualified with exhaustive startup and GPU replay.
-# Worker/image imports reflect module renames. The transport patch removes only
+# Scheduler/worker identifiers and imports reflect naming-only changes.
+# The transport patch removes only
 # startup host discovery: Modal's B200:4 contract guarantees a single machine,
 # with the same RDMA placeholder and NVLink check. CPU tests exercise that patch.
 # No CUDA implementation, native binary or compiled-kernel geometry is changed.
 # Every current file still requires an exact hash.
 QUALIFIED_SOURCE_OVERRIDES = {
     "flash/serving/deepinfer/native/transport.py": "9000b752404f0bf1136988dabb398a9df4598110c61038b178964c36ad6fc868",
-    "flash/serving/deepinfer/runtime/prefill_scheduler.py": "059ba9374ccd77b45348cc1887ca7b7dbf4a703e6c7b9d0260cef6d8056aa76c",
+    "flash/serving/deepinfer/runtime/prefill_scheduler.py": "391ad5a235b5667e87a59cfbec3dc80117a044ab2640e4fd4934e7500fd4eb8d",
     "flash/serving/deepinfer/native/image.py": "6ee502e5c530ff27fbf76bf19b8717c3c3db9f48bc93c689e1de1639f9e09282",
-    "flash/serving/deepinfer/runtime/worker.py": "fd654ac63b90e33d7c38a424ac7bf4b2a4489c9455b939543abe86067b4bab29",
+    "flash/serving/deepinfer/runtime/worker.py": "51ee532c2a39cd468436f6352fc029f3dac78beda3c12da62705e77e349088c3",
 }
 # The immutable compiler seed predates these descriptive module names.
 SOURCE_PATH_RENAMES = {

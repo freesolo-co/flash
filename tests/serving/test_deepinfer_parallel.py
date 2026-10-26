@@ -8,7 +8,7 @@ import pytest
 
 from flash.serving.deepinfer.native import transport
 from flash.serving.deepinfer.native.transport import patch_bucket
-from flash.serving.deepinfer.runtime.prefill_scheduler import PrefillCoalescing
+from flash.serving.deepinfer.runtime.prefill_scheduler import PrefillScheduler
 
 
 def fake_dist(monkeypatch, **methods):
@@ -89,7 +89,7 @@ def test_prefill_vote_honors_other_rank_and_skips_wait_for_small_cached_suffix(m
     monkeypatch.setattr(
         "flash.serving.deepinfer.runtime.prefill_scheduler.time.monotonic", lambda: now[0]
     )
-    policy = PrefillCoalescing.__new__(PrefillCoalescing)
+    policy = PrefillScheduler.__new__(PrefillScheduler)
     policy.engine = SimpleNamespace(
         scheduler=SimpleNamespace(decode_step=0),
         scheduler_config=SimpleNamespace(prefill_any_attempt_interval=8),
@@ -134,7 +134,7 @@ def test_prefill_chunks_leave_bounded_decode_turns_on_every_rank(monkeypatch):
         values[1] = max(values[1], remote_decoding[0])
 
     fake_dist(monkeypatch, all_reduce=reduce, ReduceOp=SimpleNamespace(MAX="max"))
-    policy = PrefillCoalescing.__new__(PrefillCoalescing)
+    policy = PrefillScheduler.__new__(PrefillScheduler)
     policy.engine = SimpleNamespace(
         scheduler=SimpleNamespace(decode_step=0),
         scheduler_config=SimpleNamespace(prefill_any_attempt_interval=8),

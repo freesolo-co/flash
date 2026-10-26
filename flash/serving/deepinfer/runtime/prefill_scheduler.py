@@ -8,7 +8,7 @@ from flash.serving.deepinfer.contract.config import (
 )
 
 
-class PrefillCoalescing:
+class PrefillScheduler:
     def __init__(self, engine, seconds=PREFILL_COALESCING_SECONDS):
         import torch
         from deepinfer.model_executor.parallel_utils.parallel_state import PG

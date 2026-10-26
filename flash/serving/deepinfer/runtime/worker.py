@@ -97,7 +97,7 @@ def admit(engine, command, active, outgoing, cache, batches):
     batches[request_id] = TokenBatch(DELIVERY_TOKENS, DELIVERY_SECONDS)
 
 
-def step(engine, active, outgoing, cache, batches, coalescing=None):
+def step(engine, active, outgoing, cache, batches, prefill_scheduler=None):
     from deepinfer._C.engine import RequestOutput
 
     raw = engine.step() if engine.has_unfinished_requests() else engine.flush_inflight_reqs()
@@ -106,8 +106,8 @@ def step(engine, active, outgoing, cache, batches, coalescing=None):
     outputs = [RequestOutput.clone(pointer) for pointer in raw]
     outputs.extend(cache.capture_ready())
     for output in outputs:
-        if coalescing is not None:
-            coalescing.pending.pop(output.request_id, None)
+        if prefill_scheduler is not None:
+            prefill_scheduler.pending.pop(output.request_id, None)
         if output.request_id not in active:
             continue
         if output.token_id < 0 or (
@@ -177,9 +177,9 @@ def run_rank(rank, model_path, incoming, outgoing, stopped):
         print(f"DEEPINFER_LOADED {proof}", flush=True)
         outgoing.put({"type": "ready", "rank": rank, "provenance": proof})
         active = set()
-        from flash.serving.deepinfer.runtime.prefill_scheduler import PrefillCoalescing
+        from flash.serving.deepinfer.runtime.prefill_scheduler import PrefillScheduler
 
-        coalescing = PrefillCoalescing(engine)
+        prefill_scheduler = PrefillScheduler(engine)
         # CPU snapshots currently contain only the driver rank's state. They cannot
         # safely restore CP workers, so retain GPU checkpoints without host spill.
         cache = TieredPrefixCache(
@@ -199,10 +199,10 @@ def run_rank(rank, model_path, incoming, outgoing, stopped):
                 except queue.Empty:
                     break
                 admit(engine, command, active, outgoing, cache, batches)
-                coalescing.command(command, active, cache.hits.get(command["id"], 0))
-            coalescing.before_step()
-            step(engine, active, outgoing, cache, batches, coalescing)
-            coalescing.after_step(active)
+                prefill_scheduler.command(command, active, cache.hits.get(command["id"], 0))
+            prefill_scheduler.before_step()
+            step(engine, active, outgoing, cache, batches, prefill_scheduler)
+            prefill_scheduler.after_step(active)
             directory = cache.directory()
             if directory != last_directory or time.monotonic() - last_heartbeat >= 1:
                 outgoing.put({"type": "cache_directory", "rank": rank, "prefixes": directory})
