@@ -2,8 +2,8 @@
 
 This backend serves `deepseek-ai/DeepSeek-V4.1-Flash-1017` through the pinned
 DeepInfer runtime. Four B200s form one EP=4 / CP=2 / DP=2 group. The existing
-Flash CPU router handles API keys, organization attribution, exact token
-reservations, OpenAI streaming, and durable usage settlement. Qwen/LoRA engines
+Flash CPU router handles API keys, organization attribution, observed-usage
+RPM/TPM admission, OpenAI streaming, and durable usage settlement. Qwen/LoRA engines
 retain their separate vLLM images and capacity.
 
 ## Capacity
@@ -13,7 +13,7 @@ retain their separate vLLM images and capacity.
 | GPU allocation | Four B200s in one container |
 | Main | One warm container, maximum three (12 B200s total), zero buffer containers |
 | Dev and other environments | Zero warm containers, maximum one, zero buffers |
-| Admission per container | Maximum 128 requests; target concurrency 8 |
+| Admission per container | Maximum 128 requests; target concurrency 32 |
 | Scale-up | One second of sustained demand above the target |
 | Native scheduler | Two driver ranks, 64 sequences per rank, 16,384-token prefill chunks |
 | Context | 1,048,576 combined input/output tokens, with 64 reserved for native execution |
@@ -32,8 +32,21 @@ startup and receives 503 until the server is ready. At the maximum pool size the
 is no spare GPU group for a rolling replacement. With zero buffer containers, a
 sudden burst can arrive before additional groups are ready; the scaling target
 does not guarantee latency during cold scale-out.
-The low target intentionally trades earlier GPU allocation for startup headroom;
-it is not the group's maximum decoding capacity.
+The target is 32 active requests per container, so two containers target roughly
+64 requests across the pool. Sixteen total requests do not require a third group
+under this policy. This is a soft demand target, not a literal trigger on a
+particular request number or a decoding-capacity guarantee. It allocates GPUs
+later than the target-eight policy used in the recorded autoscaling replay;
+startup headroom is smaller and the earlier zero-error result does not qualify
+this revised policy. No additional GPU load replay was run for this change.
+
+The public router sends requests to the private Modal Server URL. Modal selects
+a container using its default routing; we do not send an affinity header or
+provide a cross-container prefix directory. Each stream stays with its selected
+container. Within that container, the two native driver ranks are selected by
+pending work plus uncached prompt length, with active count as a tie-breaker.
+Prefix-cache advertisements are tenant-scoped hints and workers verify exact
+matches. Prefix caches are not shared between containers.
 A failed worker retires its entire group;
 ordinary request cancellation aborts only that sequence and releases its slot
 after acknowledgment.
@@ -48,8 +61,8 @@ the whole group. Startup exercises prefill shapes, representative decode batches
 and prefix capture/reuse before readiness.
 
 Tokenization uses the checkpoint's official `encoding/encoding.py` and immutable
-tokenizer revision. CPU admission and native generation share the renderer and
-context validation. The one-item batch tokenizer call releases Python's lock;
+tokenizer revision. Native generation renders and validates its own input;
+admission does not tokenize requests. The one-item batch tokenizer call releases Python's lock;
 offloading the single-sequence binding to a thread alone does not. Atomic database
 admission still reads current ownership and RPM/TPM limits on every request.
 Ambiguous admissions are never retried or treated as allowed.

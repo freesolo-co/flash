@@ -26,9 +26,9 @@ DELIVERY_TOKENS = 16
 DELIVERY_SECONDS = 0.05
 # Two CP=2 driver ranks share four GPUs; bound HTTP admission to native slots.
 MAX_INPUTS = 128
-# Start additional groups well before decode saturation: even with verified
-# kernels, loading and initializing another four-GPU group takes minutes.
-TARGET_INPUTS = 8
+# Prefer fuller groups before allocating another four B200s. This is a soft
+# autoscaling target, not a per-container capacity or latency guarantee.
+TARGET_INPUTS = 32
 # Main can scale to twelve B200s; other environments remain one group, idle at zero.
 MAIN_MIN_CONTAINERS = 1
 MAIN_MAX_CONTAINERS = 3
