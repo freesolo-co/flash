@@ -298,6 +298,10 @@ def test_modal_private_four_gpu_autoscaling_contract(monkeypatch, environment, w
 
     class Image:
         @classmethod
+        def debian_slim(cls, **kwargs):
+            return cls()
+
+        @classmethod
         def from_id(cls, image_id):
             captured["image"] = image_id
             return cls()
@@ -320,6 +324,10 @@ def test_modal_private_four_gpu_autoscaling_contract(monkeypatch, environment, w
             captured["server"] = kwargs
             return lambda fn: fn
 
+        def function(self, **kwargs):
+            captured["controller"] = kwargs
+            return lambda fn: fn
+
     def decorator(name):
         def factory(*args, **kwargs):
             captured[name] = kwargs
@@ -332,6 +340,8 @@ def test_modal_private_four_gpu_autoscaling_contract(monkeypatch, environment, w
         Image=Image,
         App=App,
         Volume=SimpleNamespace(from_name=lambda *a, **kw: object()),
+        Dict=SimpleNamespace(from_name=lambda *a, **kw: object()),
+        Period=lambda **kw: kw,
         enter=decorator("enter"),
     )
     monkeypatch.setitem(sys.modules, "modal", stub)
@@ -349,7 +359,11 @@ def test_modal_private_four_gpu_autoscaling_contract(monkeypatch, environment, w
     assert captured["server"]["scaledown_window"] == 600
     assert captured["server"]["scaleup_window"] == 1
     assert captured["server"]["max_concurrency"] == 128
-    assert captured["server"]["target_concurrency"] == 8
+    assert captured["server"]["target_concurrency"] == (100 if environment == "main" else 8)
+    assert ("controller" in captured) == (environment == "main")
+    if environment == "main":
+        assert captured["controller"]["schedule"] == {"seconds": 5}
+        assert captured["controller"]["max_containers"] == 1
     assert captured["server"]["compute_region"] == "us"
     assert captured["server"]["routing_region"] == "us-east"
     assert captured["server"]["unauthenticated"] is False
@@ -362,22 +376,24 @@ def test_modal_private_four_gpu_autoscaling_contract(monkeypatch, environment, w
         return process
 
     def watch(**kwargs):
-        captured["watcher"] = kwargs
+        captured.setdefault("watchers", []).append(kwargs)
         return SimpleNamespace(start=lambda: None)
 
     monkeypatch.setattr(launcher.subprocess, "Popen", launch)
     monkeypatch.setattr(launcher.threading, "Thread", watch)
+    monkeypatch.setenv("MODAL_TASK_ID", "ta-test")
     launcher.Engine().start()
     assert captured["server_command"] == [
         config.RUNTIME_PYTHON,
         "-m",
         "flash.serving.deepinfer.app.http",
     ]
-    assert captured["watcher"] == {
+    assert captured["watchers"][0] == {
         "target": launcher._watch_server,
         "args": (process,),
         "daemon": True,
     }
+    assert len(captured["watchers"]) == (2 if environment == "main" else 1)
 
 
 @pytest.fixture
