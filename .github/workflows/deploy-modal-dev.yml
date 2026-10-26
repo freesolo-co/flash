@@ -40,7 +40,7 @@ jobs:
       SERVING_CUSTOM_DOMAIN: serve-dev.freesolo.co
       FREESOLO_DEPLOYMENT_SHA: ${{ github.sha }}
       FREESOLO_DEPLOYMENT_ID: ${{ github.run_id }}-${{ github.run_attempt }}
-      EXPECTED_MODAL_URL: https://freesolo-dev--freesolo-lora-serving.modal.run
+      EXPECTED_MODAL_URL: https://freesolo-dev--freesolo-lora-serving.us-east.modal.run
       EXPECTED_SERVING_URL: https://serve-dev.freesolo.co
 
     steps:
