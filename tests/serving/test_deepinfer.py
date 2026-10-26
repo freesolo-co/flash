@@ -353,9 +353,8 @@ def test_modal_private_four_gpu_autoscaling_contract(monkeypatch, environment, w
     assert captured["server"]["compute_region"] == "us"
     assert captured["server"]["routing_region"] == "us-east"
     assert captured["server"]["unauthenticated"] is False
-    assert captured["build_commands"][-1] == (
-        f"{config.RUNTIME_PYTHON} -m flash.serving.deepinfer.native.image"
-    )
+    assert captured["image"] == config.RUNTIME_IMAGE_ID
+    assert "build_commands" not in captured
     process = object()
 
     def launch(command):

@@ -147,15 +147,17 @@ and durable settlement as well as native GPU performance.
 - Model/encoder: `1bae0e1088993b9b82de08f59de5be5a34e42170`.
 - DeepInfer: `9bd9cf243fc53ef9afbf8f04d391d989117d6ab9`.
 - Base compiled CUDA 13.2 / Python 3.12 image with B200 kernel artifacts:
-  `im-afZLHKewsK8Ldc8aZIVd5Q`.
+  `im-22oaWkg4YF8JC0J9nM5RjE`.
 - Weights volume: `freesolo-deepseek-1017-weights`.
 
 The base image is immutable and local to this Modal workspace. Other workspaces
-must build the pinned runtime and replace its identity. Image preparation checks
-the Git revision and exact source hashes, applies the short-context indexer and
-prefix-checkpoint bindings, and rebuilds the native extension. It installs local
-Engram transport in spawned context-parallel workers and disables expandable CUDA
-allocations for IPC. Modal guarantees that the four GPUs requested with `B200:4`
+must build the pinned runtime and replace its identity. The prepared image already
+contains the verified native extension, short-context indexer repair,
+prefix-checkpoint bindings, transport patch and pinned HTTP dependencies.
+Deployment copies current application source onto that image without reapplying
+patches or recompiling the extension. It installs local Engram transport in spawned
+context-parallel workers and disables expandable CUDA allocations for IPC. Modal
+guarantees that the four GPUs requested with `B200:4`
 are on one physical machine ([GPU placement](https://modal.com/docs/guide/gpu#specifying-gpu-count)).
 All native driver and context-parallel processes stay within that container;
 autoscaling adds independent four-GPU replicas rather than extending a collective
@@ -165,9 +167,11 @@ bandwidth is absent, preserves detected RDMA bandwidth, and still requires posit
 NVLink bandwidth. This patch applies to every image; it does not add a new runtime
 speedup to the already-local benchmark configuration.
 
-The compiler-cache layer extends `im-01M5GXCE5NCMK4TBY608BEPZ1Y` with 1,280 files
-from `/root/.dj/cache`, `/root/.tilelang/cache` and `/root/.triton/cache`.
-The source archive SHA-256 is
+The finalized image was rebuilt from the previous compiler seed
+`im-afZLHKewsK8Ldc8aZIVd5Q`, with current source paths and the native patches baked
+in once. It preserves all 1,280 verified compiler files from `/root/.dj/cache`,
+`/root/.tilelang/cache` and `/root/.triton/cache`, and the identical native binary.
+The original compiler archive SHA-256 remains
 `72608d25a9897cb402294b4874347a43f315c84e133cc6e602a2fe76735f0c9d`;
 `/opt/deepinfer-compiled-kernel-manifest.json` records individual file hashes,
 compiler/library versions and the source runtime identity. These are compiled
@@ -178,18 +182,28 @@ Before shortening prefill warmup, the runtime verifies the trusted manifest,
 every compiler artifact, native binary identity on both drivers, compiler/library
 versions, native/runtime Python sources, and the model and execution geometry.
 The eight-turn scheduler in `runtime/prefill_scheduler.py` was qualified with
-exhaustive warmup, answer/cache checks and a matched four-GPU replay. The exact
-source hashes in `runtime/kernel_cache.py` account for the scheduler rename and
-`native/transport.py` startup simplification. The latter relies on Modal's
-single-host placement contract and was checked with CPU patch-execution tests;
-no new GPU benchmark was run. Image construction removes former module filenames
-inherited from the seed. All current source files require exact expected hashes.
-Native binary, compiler artifacts and execution geometry are unchanged.
+exhaustive warmup, answer/cache checks and a matched four-GPU replay. The finalized
+manifest records current source filenames and exact hashes directly; there are
+no source-hash overrides or filename aliases. Its canonical SHA-256 is
+`150ee7657553951cdc9d29979c40a68aaf727bfd68210b845006c7d2d5812856`.
+Old source filenames are absent from the rebuilt seed. Native binary, compiler
+artifacts and execution geometry are unchanged. Future runtime-source changes
+must rebuild and qualify the saved image to retain shorter warmup; simply editing
+the expected manifest hash is not qualification.
 A qualified image exercises representative prefill shapes, all existing decode
 batches, and prefix capture/reuse before readiness. Missing, modified or
 incompatible artifacts retain the exhaustive 16-token-step prefill warmup.
 `/health` reports `compiled_kernel_cache_verified`. Runtime, compiler or GPU
 changes require a fresh qualification; a compiler cache miss may still compile.
+
+The finalized image passed a fresh four-B200 startup check on 2026-10-26:
+both drivers verified the compiler cache, readiness took 140 seconds from server
+launch, and all eight generation checks passed. Repeated-prefix requests reused
+2,570 of 2,581 prompt tokens; the same prompt under another tenant reused zero.
+This was startup and correctness qualification, not a new throughput benchmark.
+The optional DeepGEMM MLOPart localization helper remained unavailable, as in the
+previous qualification logs; native generation and cache checks completed.
+Temporary build and GPU apps were stopped after validation.
 
 Native FP4 expert weights, released scales and FP8 Engram values remain intact.
 Fast kernels use native multi-token prediction with variable-length drafts; this

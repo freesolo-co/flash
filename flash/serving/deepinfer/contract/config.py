@@ -6,7 +6,7 @@ MODEL_REVISION = "1bae0e1088993b9b82de08f59de5be5a34e42170"
 RUNTIME_REVISION = "9bd9cf243fc53ef9afbf8f04d391d989117d6ab9"
 # Immutable CUDA 13.2 / Python 3.12 snapshot with B200 compiler artifacts from the
 # complete startup warmup. It contains no model weights, prompt KV, or credentials.
-RUNTIME_IMAGE_ID = "im-afZLHKewsK8Ldc8aZIVd5Q"
+RUNTIME_IMAGE_ID = "im-22oaWkg4YF8JC0J9nM5RjE"
 RUNTIME_PYTHON = "/opt/deepinfer-venv/bin/python"
 RUNTIME_ROOT = "/opt/DeepInfer"
 MODEL_CACHE = "/weights/hub"

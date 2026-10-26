@@ -11,7 +11,7 @@ from pathlib import Path
 from flash.serving.deepinfer.contract import config
 
 MANIFEST_PATH = "/opt/deepinfer-compiled-kernel-manifest.json"
-MANIFEST_SHA256 = "7cbfab3b44c3237c7ba2a5693af3249404d3093c2bc207d19c768d6511040ff5"
+MANIFEST_SHA256 = "150ee7657553951cdc9d29979c40a68aaf727bfd68210b845006c7d2d5812856"
 NATIVE_SHA256 = "62d3f2996eab97dca43f2e1070f916cb6cbde9f14c552c850f6ea6eaf98f9992"
 # Expected values stay independent of live config so configuration drift is detected.
 QUALIFIED_CONFIG = {
@@ -29,20 +29,6 @@ QUALIFIED_CONFIG = {
     "PREFILL_COALESCING_MIN_TOKENS": 8192,
     "GPU_PREFIX_CACHE_TOKENS": 2097152,
     "GPU_PREFIX_CACHE_ENTRIES": 64,
-}
-# Reviewed source changes relative to the immutable seed: the qualified scheduler,
-# naming-only edits, and the single-host transport patch. Qualification history
-# lives in app/README.md; every accepted source still requires its exact hash.
-QUALIFIED_SOURCE_OVERRIDES = {
-    "flash/serving/deepinfer/native/transport.py": "9000b752404f0bf1136988dabb398a9df4598110c61038b178964c36ad6fc868",
-    "flash/serving/deepinfer/runtime/prefill_scheduler.py": "391ad5a235b5667e87a59cfbec3dc80117a044ab2640e4fd4934e7500fd4eb8d",
-    "flash/serving/deepinfer/native/image.py": "6ee502e5c530ff27fbf76bf19b8717c3c3db9f48bc93c689e1de1639f9e09282",
-    "flash/serving/deepinfer/runtime/worker.py": "51ee532c2a39cd468436f6352fc029f3dac78beda3c12da62705e77e349088c3",
-}
-# The immutable compiler seed predates these descriptive module names.
-SOURCE_PATH_RENAMES = {
-    "flash/serving/deepinfer/native/local_collectives.py": "flash/serving/deepinfer/native/transport.py",
-    "flash/serving/deepinfer/runtime/prefill_coalescing.py": "flash/serving/deepinfer/runtime/prefill_scheduler.py",
 }
 _SOURCE_PREFIX = "flash/serving/deepinfer/"
 # Deployment/transport code does not specialize GPU kernels. Runtime and native
@@ -116,14 +102,8 @@ def _toolchain_matches(manifest: dict, root: Path) -> bool:
 
 def _sources_match(manifest: dict, root: Path) -> bool:
     expected = {
-        SOURCE_PATH_RENAMES.get(name, name): digest
-        for name, digest in manifest["runtime_sources"].items()
-        if _kernel_source(name)
+        name: digest for name, digest in manifest["runtime_sources"].items() if _kernel_source(name)
     }
-    # Overrides can update known files, but cannot introduce an unmanifested module.
-    if not set(QUALIFIED_SOURCE_OVERRIDES) <= set(expected):
-        return False
-    expected.update(QUALIFIED_SOURCE_OVERRIDES)
     source_root = root / "root"
     current = {
         str(path.relative_to(source_root))
