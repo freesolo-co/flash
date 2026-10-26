@@ -78,6 +78,28 @@ async def _native_chat(runtime, body, request):
             await events.aclose()
 
 
+class _GenerationCount:
+    """Count the complete HTTP lifetime, including tokenization and stream draining."""
+
+    def __init__(self, app, counts):
+        self.app = app
+        self.counts = counts
+
+    async def __call__(self, scope, receive, send):
+        generation = (
+            scope["type"] == "http"
+            and scope.get("path") == "/internal/generate"
+            and scope.get("method") == "POST"
+        )
+        if generation:
+            self.counts["active"] += 1
+        try:
+            await self.app(scope, receive, send)
+        finally:
+            if generation:
+                self.counts["active"] -= 1
+
+
 def build_app(runtime, *, manage_lifecycle=True):
     @asynccontextmanager
     async def lifespan(app):
@@ -96,6 +118,8 @@ def build_app(runtime, *, manage_lifecycle=True):
                 await runtime.close()
 
     app = FastAPI(lifespan=lifespan)
+    counts = {"active": 0}
+    app.add_middleware(_GenerationCount, counts=counts)
     app.add_middleware(RequestBodyLimitMiddleware, max_bytes=MAX_CHAT_REQUEST_BYTES)
 
     @app.get("/health")
@@ -113,6 +137,7 @@ def build_app(runtime, *, manage_lifecycle=True):
             "gpu_count": GPU_COUNT,
             "loaded_ranks": getattr(runtime, "provenance", {}),
             "active_requests": len(getattr(runtime, "pending", {})),
+            "active_http_requests": counts["active"],
             "compiled_kernel_cache_verified": getattr(
                 runtime, "compiled_kernel_cache_verified", False
             ),

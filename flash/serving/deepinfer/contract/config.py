@@ -27,9 +27,15 @@ DELIVERY_TOKENS = 16
 DELIVERY_SECONDS = 0.05
 # Two CP=2 driver ranks share four GPUs; bound HTTP admission to native slots.
 MAX_INPUTS = 128
-# Start additional groups well before decode saturation: even with verified
-# kernels, loading and initializing another four-GPU group takes minutes.
+# Development retains Modal's demand-driven single-container policy.
 TARGET_INPUTS = 8
+# Planning capacity per four-GPU container, not a measured per-request SLO.
+# Main adds capacity when the whole pool has 64 request slots remaining.
+POOL_STREAM_CAPACITY = 100
+POOL_SPARE_STREAMS = 64
+POOL_SAMPLE_SECONDS = 5
+POOL_SAMPLE_MAX_AGE = 20
+POOL_STATE_NAME = "freesolo-deepseek-pool-load"
 # Main can scale to twelve B200s; other environments remain one group, idle at zero.
 MAIN_MIN_CONTAINERS = 1
 MAIN_MAX_CONTAINERS = 3
