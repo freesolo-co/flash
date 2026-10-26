@@ -259,6 +259,21 @@ async def _put_data(queue: Any, envelope: DataEnvelope) -> None:
     )
 
 
+def _channel_failure_code(
+    exc: Exception, generation_started: bool, event_count: int
+) -> ChannelErrorCode:
+    if not isinstance(exc, StreamChannelError):
+        return ChannelErrorCode.ENGINE_ERROR
+    # Stable codes and phase only: never log prompts, queue contents or credentials.
+    logger.warning(
+        "Stream channel failed: code=%s generation_started=%s events=%s",
+        exc.code.value,
+        generation_started,
+        event_count,
+    )
+    return exc.code
+
+
 async def stream_generate_call(
     owner: StreamGenerateOwner,
     payload_dict: dict[str, Any],
@@ -358,15 +373,7 @@ async def stream_generate_call(
     except _UnsettledGuardedOperation as exc:
         raise exc.cause from None
     except Exception as exc:
-        code = exc.code if isinstance(exc, StreamChannelError) else ChannelErrorCode.ENGINE_ERROR
-        if isinstance(exc, StreamChannelError):
-            # Stable codes and phase only: never log prompts, queue contents or credentials.
-            logger.warning(
-                "Stream channel failed: code=%s generation_started=%s events=%s",
-                code.value,
-                generation_may_have_started,
-                sequence,
-            )
+        code = _channel_failure_code(exc, generation_may_have_started, sequence)
         envelope = DataEnvelope(
             kind="error",
             generation_id=generation_id,
