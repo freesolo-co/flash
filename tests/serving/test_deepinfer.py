@@ -349,7 +349,7 @@ def test_modal_private_four_gpu_autoscaling_contract(monkeypatch, environment, w
     assert captured["server"]["scaledown_window"] == 600
     assert captured["server"]["scaleup_window"] == 1
     assert captured["server"]["max_concurrency"] == 128
-    assert captured["server"]["target_concurrency"] == 16
+    assert captured["server"]["target_concurrency"] == 8
     assert captured["server"]["compute_region"] == "us"
     assert captured["server"]["routing_region"] == "us-east"
     assert captured["server"]["unauthenticated"] is False

@@ -13,7 +13,7 @@ retain their separate vLLM images and capacity.
 | GPU allocation | Four B200s in one container |
 | Main | One warm container, maximum three (12 B200s total), zero buffer containers |
 | Dev and other environments | Zero warm containers, maximum one, zero buffers |
-| Admission per container | Maximum 128 requests; target concurrency 16 |
+| Admission per container | Maximum 128 requests; target concurrency 8 |
 | Scale-up | One second of sustained demand above the target |
 | Native scheduler | Two driver ranks, 64 sequences per rank, 16,384-token prefill chunks |
 | Context | 1,048,576 combined input/output tokens, with 64 reserved for native execution |

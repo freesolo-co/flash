@@ -141,7 +141,7 @@ MAX_CONTAINERS = 4
 # does not defeat `MIN_CONTAINERS = 0`: idle engines still scale to zero and bill nothing.
 BUFFER_CONTAINERS = 1
 # Concurrent requests packed onto one base-model GPU before Modal autoscales a new (costly) one.
-# A real-GPU sweep (scripts/gpu_canary.py::sweep_concurrency on A10G/Qwen2.5-1.5B) showed vLLM
+# A prior real-GPU sweep on A10G/Qwen2.5-1.5B showed vLLM
 # throughput scaling near-linearly with no saturation through 128 concurrent, while TTFT stayed
 # <60 ms — so the old default of 32 left ~2x of each GPU idle. 64 packs ~2.3x the throughput per
 # GPU for ~+14% per-request latency (now blunted by the fp8 KV cache, which is on for every base —

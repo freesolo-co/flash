@@ -28,7 +28,7 @@ DELIVERY_SECONDS = 0.05
 MAX_INPUTS = 128
 # Start additional groups well before decode saturation: even with verified
 # kernels, loading and initializing another four-GPU group takes minutes.
-TARGET_INPUTS = 16
+TARGET_INPUTS = 8
 # Main can scale to twelve B200s; other environments remain one group, idle at zero.
 MAIN_MIN_CONTAINERS = 1
 MAIN_MAX_CONTAINERS = 3
