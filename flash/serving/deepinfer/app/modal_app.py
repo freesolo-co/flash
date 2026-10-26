@@ -17,6 +17,9 @@ from flash.serving.deepinfer.contract.config import (
     MAIN_MIN_CONTAINERS,
     MAX_CONTAINERS,
     MAX_INPUTS,
+    POOL_SAMPLE_SECONDS,
+    POOL_STATE_NAME,
+    POOL_STREAM_CAPACITY,
     PORT,
     RUNTIME_IMAGE_ID,
     RUNTIME_PYTHON,
@@ -43,6 +46,28 @@ image = (
 app = modal.App(APP_NAME, image=image)
 weights = modal.Volume.from_name("freesolo-deepseek-1017-weights", create_if_missing=True)
 main_environment = modal.config.config.get("environment") == "main"
+pool_load = (
+    modal.Dict.from_name(POOL_STATE_NAME, create_if_missing=True) if main_environment else None
+)
+
+if main_environment:
+    controller_image = modal.Image.debian_slim(python_version="3.12").add_local_python_source(
+        "flash", copy=True
+    )
+
+    @app.function(
+        image=controller_image,
+        schedule=modal.Period(seconds=POOL_SAMPLE_SECONDS),
+        cpu=0.25,
+        memory=256,
+        min_containers=1,
+        max_containers=1,
+        timeout=15,
+    )
+    def scale_pool():
+        from flash.serving.deepinfer.app.autoscaling import reconcile
+
+        return reconcile(modal.Server.from_name(APP_NAME, "Engine"), pool_load)
 
 
 def _watch_server(process):
@@ -65,7 +90,9 @@ def _watch_server(process):
     scaledown_window=SCALEDOWN_SECONDS,
     scaleup_window=SCALEUP_SECONDS,
     startup_timeout=STARTUP_SECONDS,
-    target_concurrency=TARGET_INPUTS,
+    # Native scaling is a fallback. The controller raises the floor at pool-wide
+    # reserve thresholds; this higher target cannot undo that floor.
+    target_concurrency=POOL_STREAM_CAPACITY if main_environment else TARGET_INPUTS,
     max_concurrency=MAX_INPUTS,
     port=PORT,
     unauthenticated=False,
@@ -76,3 +103,11 @@ class Engine:
     def start(self):
         process = subprocess.Popen([RUNTIME_PYTHON, "-m", "flash.serving.deepinfer.app.http"])
         threading.Thread(target=_watch_server, args=(process,), daemon=True).start()
+        if main_environment:
+            from flash.serving.deepinfer.app.autoscaling import report_load
+
+            threading.Thread(
+                target=report_load,
+                args=(process, pool_load, os.environ["MODAL_TASK_ID"]),
+                daemon=True,
+            ).start()
