@@ -29,10 +29,20 @@ QUALIFIED_CONFIG = {
     "GPU_PREFIX_CACHE_TOKENS": 2097152,
     "GPU_PREFIX_CACHE_ENTRIES": 64,
 }
-# Requalified with the same native binary and compiler artifacts after exhaustive
-# startup, correctness checks and a matched 1,639-request four-B200 replay.
+# The eight-turn scheduler was qualified with exhaustive startup, correctness
+# checks and a matched four-B200 replay. Other overrides below change only the
+# two module import paths; their bytes were checked against the qualified source
+# after those exact substitutions. Every current file still requires an exact hash.
 QUALIFIED_SOURCE_OVERRIDES = {
-    "flash/serving/deepinfer/runtime/prefill_coalescing.py": "059ba9374ccd77b45348cc1887ca7b7dbf4a703e6c7b9d0260cef6d8056aa76c"
+    "flash/serving/deepinfer/native/nvlink_compat.py": "4d8e7c0067c6a5c7f48b8c6f861943128dc79c02eba9caa69af3074e380b3ceb",
+    "flash/serving/deepinfer/runtime/prefill_scheduler.py": "059ba9374ccd77b45348cc1887ca7b7dbf4a703e6c7b9d0260cef6d8056aa76c",
+    "flash/serving/deepinfer/native/image.py": "770732bbde9a6a6f106cc3ba821ca38e16d6a791666f5bd8cab150bbd2186257",
+    "flash/serving/deepinfer/runtime/worker.py": "fd654ac63b90e33d7c38a424ac7bf4b2a4489c9455b939543abe86067b4bab29",
+}
+# The immutable compiler seed predates these descriptive module names.
+SOURCE_PATH_RENAMES = {
+    "flash/serving/deepinfer/native/local_collectives.py": "flash/serving/deepinfer/native/nvlink_compat.py",
+    "flash/serving/deepinfer/runtime/prefill_coalescing.py": "flash/serving/deepinfer/runtime/prefill_scheduler.py",
 }
 _SOURCE_PREFIX = "flash/serving/deepinfer/"
 # Deployment/transport code does not specialize GPU kernels. Runtime and native
@@ -102,7 +112,9 @@ def _verify(provenance: dict, root: Path) -> bool:
     ):
         return False
     sources = {
-        name: digest for name, digest in manifest["runtime_sources"].items() if _kernel_source(name)
+        SOURCE_PATH_RENAMES.get(name, name): digest
+        for name, digest in manifest["runtime_sources"].items()
+        if _kernel_source(name)
     }
     if not set(QUALIFIED_SOURCE_OVERRIDES) <= set(sources):
         return False

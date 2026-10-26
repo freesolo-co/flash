@@ -140,3 +140,28 @@ def test_override_cannot_add_an_unmanifested_module(qualified_seed, monkeypatch)
     root, proof, _, _ = qualified_seed
     monkeypatch.setattr(kernel_cache, "QUALIFIED_SOURCE_OVERRIDES", {"unlisted.py": "unknown"})
     assert not kernel_cache.verified_compiler_cache(proof, filesystem_root=root)
+
+
+@pytest.mark.parametrize("damage", [None, "changed", "missing", "legacy_copy"])
+@pytest.mark.parametrize(("old_name", "new_name"), kernel_cache.SOURCE_PATH_RENAMES.items())
+def test_renamed_seed_sources_still_require_exact_files(
+    qualified_seed, monkeypatch, old_name, new_name, damage
+):
+    root, proof, _, _ = qualified_seed
+    source = root / "root" / new_name
+    source.parent.mkdir(parents=True, exist_ok=True)
+    source.write_bytes(b"unchanged qualified module")
+    manifest_path = root / kernel_cache.MANIFEST_PATH.lstrip("/")
+    manifest = json.loads(manifest_path.read_text())
+    manifest["runtime_sources"][old_name] = digest(source.read_bytes())
+    manifest_path.write_text(json.dumps(manifest))
+    monkeypatch.setattr(
+        kernel_cache, "MANIFEST_SHA256", digest(json.dumps(manifest, sort_keys=True).encode())
+    )
+    if damage == "changed":
+        source.write_bytes(b"changed scheduler or transport behavior")
+    elif damage == "missing":
+        source.unlink()
+    elif damage == "legacy_copy":
+        (root / "root" / old_name).write_bytes(source.read_bytes())
+    assert kernel_cache.verified_compiler_cache(proof, filesystem_root=root) is (damage is None)

@@ -34,7 +34,7 @@ def patch_bucket(path: Path):
         (
             "        assert nvl_gbs > 0 and rdma_gbs > 0, 'Failed to detect the NVLink or RDMA bandwidth'",
             (
-                "        from flash.serving.deepinfer.native.local_collectives import local_bandwidth, validate_local_domains\n"
+                "        from flash.serving.deepinfer.native.nvlink_compat import local_bandwidth, validate_local_domains\n"
                 "        rdma_gbs, local_only_fallback = local_bandwidth(self.groups, rdma_gbs)\n"
                 "        assert nvl_gbs > 0 and rdma_gbs > 0, 'Failed to detect communication bandwidth'"
             ),

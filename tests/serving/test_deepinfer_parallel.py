@@ -5,12 +5,12 @@ from types import ModuleType, SimpleNamespace
 
 import pytest
 
-from flash.serving.deepinfer.native.local_collectives import (
+from flash.serving.deepinfer.native.nvlink_compat import (
     local_bandwidth,
     patch_bucket,
     validate_local_domains,
 )
-from flash.serving.deepinfer.runtime.prefill_coalescing import PrefillCoalescing
+from flash.serving.deepinfer.runtime.prefill_scheduler import PrefillCoalescing
 
 
 def fake_dist(monkeypatch, **methods):
@@ -74,7 +74,7 @@ def test_prefill_vote_honors_other_rank_and_skips_wait_for_small_cached_suffix(m
     fake_dist(monkeypatch, all_reduce=reduce, ReduceOp=SimpleNamespace(MAX="max"))
     now = [10.0]
     monkeypatch.setattr(
-        "flash.serving.deepinfer.runtime.prefill_coalescing.time.monotonic", lambda: now[0]
+        "flash.serving.deepinfer.runtime.prefill_scheduler.time.monotonic", lambda: now[0]
     )
     policy = PrefillCoalescing.__new__(PrefillCoalescing)
     policy.engine = SimpleNamespace(

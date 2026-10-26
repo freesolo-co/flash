@@ -1,4 +1,4 @@
-"""Shared text rendering/tokenization for CPU admission and GPU generation."""
+"""Qwen generation text rendering, tokenization and bounded prefix reuse."""
 
 import hashlib
 import json

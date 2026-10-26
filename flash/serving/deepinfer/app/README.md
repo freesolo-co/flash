@@ -150,9 +150,13 @@ its own writable cache overlay; there is no shared runtime cache volume.
 Before shortening prefill warmup, the runtime verifies the trusted manifest,
 every compiler artifact, native binary identity on both drivers, compiler/library
 versions, native/runtime Python sources, and the model and execution geometry.
-The scheduler-only source override in `runtime/kernel_cache.py` was requalified
-with exhaustive warmup, answer/cache checks and a matched four-GPU replay; its
-exact hash is checked separately from the original seed manifest. Native binary,
+The eight-turn scheduler in `runtime/prefill_scheduler.py` was qualified with
+exhaustive warmup, answer/cache checks and a matched four-GPU replay. The exact
+source hashes in `runtime/kernel_cache.py` also account for import-only renames
+to `runtime/prefill_scheduler.py` and `native/nvlink_compat.py`; the renamed source
+was compared byte-for-byte after those substitutions. Image construction removes
+the former module filenames inherited from the seed. All current source files
+still require their exact expected hashes. Native binary,
 compiler artifacts and execution geometry are unchanged.
 A qualified image exercises representative prefill shapes, all existing decode
 batches, and prefix capture/reuse before readiness. Missing, modified or

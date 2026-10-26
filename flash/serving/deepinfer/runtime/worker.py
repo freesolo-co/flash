@@ -177,7 +177,7 @@ def run_rank(rank, model_path, incoming, outgoing, stopped):
         print(f"DEEPINFER_LOADED {proof}", flush=True)
         outgoing.put({"type": "ready", "rank": rank, "provenance": proof})
         active = set()
-        from flash.serving.deepinfer.runtime.prefill_coalescing import PrefillCoalescing
+        from flash.serving.deepinfer.runtime.prefill_scheduler import PrefillCoalescing
 
         coalescing = PrefillCoalescing(engine)
         # CPU snapshots currently contain only the driver rank's state. They cannot

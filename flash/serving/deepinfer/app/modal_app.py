@@ -39,6 +39,10 @@ image = (
     )
     .add_local_python_source("flash", copy=True)
     .run_commands(
+        # The immutable seed contains the former names. Remove them after copying
+        # current source so runtime discovery cannot see both old and new modules.
+        "rm -f /root/flash/serving/deepinfer/native/local_collectives.py "
+        "/root/flash/serving/deepinfer/runtime/prefill_coalescing.py",
         f"{RUNTIME_PYTHON} -m pip install fastapi==0.141.1 uvicorn==0.52.0",
         f"{RUNTIME_PYTHON} -m flash.serving.deepinfer.native.image",
     )
