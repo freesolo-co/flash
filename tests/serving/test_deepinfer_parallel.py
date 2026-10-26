@@ -5,7 +5,7 @@ from types import ModuleType, SimpleNamespace
 
 import pytest
 
-from flash.serving.deepinfer.native.nvlink_compat import (
+from flash.serving.deepinfer.native.single_host_transport import (
     local_bandwidth,
     patch_bucket,
     validate_local_domains,

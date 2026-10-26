@@ -165,7 +165,7 @@ versions, native/runtime Python sources, and the model and execution geometry.
 The eight-turn scheduler in `runtime/prefill_scheduler.py` was qualified with
 exhaustive warmup, answer/cache checks and a matched four-GPU replay. The exact
 source hashes in `runtime/kernel_cache.py` also account for import-only renames
-to `runtime/prefill_scheduler.py` and `native/nvlink_compat.py`; the renamed source
+to `runtime/prefill_scheduler.py` and `native/single_host_transport.py`; the renamed source
 was compared byte-for-byte after those substitutions. Image construction removes
 the former module filenames inherited from the seed. All current source files
 still require their exact expected hashes. Native binary,

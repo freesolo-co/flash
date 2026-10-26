@@ -34,14 +34,14 @@ QUALIFIED_CONFIG = {
 # two module import paths; their bytes were checked against the qualified source
 # after those exact substitutions. Every current file still requires an exact hash.
 QUALIFIED_SOURCE_OVERRIDES = {
-    "flash/serving/deepinfer/native/nvlink_compat.py": "4d8e7c0067c6a5c7f48b8c6f861943128dc79c02eba9caa69af3074e380b3ceb",
+    "flash/serving/deepinfer/native/single_host_transport.py": "503c53c54e7d841467cc3a22fe057a4d0e05fa641d536922ca59caa57c6b0c7c",
     "flash/serving/deepinfer/runtime/prefill_scheduler.py": "059ba9374ccd77b45348cc1887ca7b7dbf4a703e6c7b9d0260cef6d8056aa76c",
-    "flash/serving/deepinfer/native/image.py": "770732bbde9a6a6f106cc3ba821ca38e16d6a791666f5bd8cab150bbd2186257",
+    "flash/serving/deepinfer/native/image.py": "1818bc92ad6c81e208aa016f3c8882e63f990d4dfb7bd638e27136ee8f12eb73",
     "flash/serving/deepinfer/runtime/worker.py": "fd654ac63b90e33d7c38a424ac7bf4b2a4489c9455b939543abe86067b4bab29",
 }
 # The immutable compiler seed predates these descriptive module names.
 SOURCE_PATH_RENAMES = {
-    "flash/serving/deepinfer/native/local_collectives.py": "flash/serving/deepinfer/native/nvlink_compat.py",
+    "flash/serving/deepinfer/native/local_collectives.py": "flash/serving/deepinfer/native/single_host_transport.py",
     "flash/serving/deepinfer/runtime/prefill_coalescing.py": "flash/serving/deepinfer/runtime/prefill_scheduler.py",
 }
 _SOURCE_PREFIX = "flash/serving/deepinfer/"
