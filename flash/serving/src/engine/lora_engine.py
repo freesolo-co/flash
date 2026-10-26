@@ -106,6 +106,10 @@ class _LoraEngineImpl(TextPromptTokenizer):
             self.settings,
             cfg,
         )
+        # Cloning the Rust tokenizer can hold the GIL for seconds, even in a
+        # worker thread. Finish it before readiness so the first request cannot
+        # starve the stream's control-lease watcher (or other admitted requests).
+        self._token_prefix_cache()
         self.reasoning_parser = kwargs.get("reasoning_parser")
         self.__dict__.pop("_reasoning_usage_token_ids", None)
         self.tool_parser = tool_parser_for(self.base_model)
