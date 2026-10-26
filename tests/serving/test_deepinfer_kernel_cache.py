@@ -165,3 +165,62 @@ def test_renamed_seed_sources_still_require_exact_files(
     elif damage == "legacy_copy":
         (root / "root" / old_name).write_bytes(source.read_bytes())
     assert kernel_cache.verified_compiler_cache(proof, filesystem_root=root) is (damage is None)
+
+
+@pytest.mark.parametrize("damage", ["missing", "unexpected", "malformed"])
+def test_incomplete_or_invalid_driver_proof_uses_full_warmup(qualified_seed, damage):
+    root, proof, _, _ = qualified_seed
+    if damage == "missing":
+        proof.pop(1)
+    elif damage == "unexpected":
+        proof[2] = dict(proof[0])
+    else:
+        proof[1] = None
+    assert not kernel_cache.verified_compiler_cache(proof, filesystem_root=root)
+
+
+@pytest.mark.parametrize("dependency", ["library", "compiler"])
+def test_unavailable_toolchain_uses_full_warmup(qualified_seed, monkeypatch, dependency):
+    root, proof, _, _ = qualified_seed
+
+    def unavailable(*args, **kwargs):
+        if dependency == "library":
+            raise kernel_cache.PackageNotFoundError("torch")
+        raise FileNotFoundError("nvcc")
+
+    if dependency == "library":
+        monkeypatch.setattr(kernel_cache, "version", unavailable)
+    else:
+        monkeypatch.setattr(kernel_cache.subprocess, "check_output", unavailable)
+    assert not kernel_cache.verified_compiler_cache(proof, filesystem_root=root)
+
+
+def test_invalid_manifest_json_uses_full_warmup(qualified_seed):
+    root, proof, _, _ = qualified_seed
+    (root / kernel_cache.MANIFEST_PATH.lstrip("/")).write_text("{truncated")
+    assert not kernel_cache.verified_compiler_cache(proof, filesystem_root=root)
+
+
+@pytest.mark.parametrize(
+    "name", [None, "/root/other/kernel.cubin", "/root/.dj/cache/../kernel.cubin"]
+)
+def test_empty_or_out_of_bounds_artifact_manifest_uses_full_warmup(
+    qualified_seed, monkeypatch, name
+):
+    root, proof, _, _ = qualified_seed
+    path = root / kernel_cache.MANIFEST_PATH.lstrip("/")
+    manifest = json.loads(path.read_text())
+    manifest["files"] = {}
+    if name is not None:
+        artifact = root / name.lstrip("/")
+        artifact.parent.mkdir(parents=True, exist_ok=True)
+        artifact.write_bytes(b"valid bytes at an invalid location")
+        manifest["files"][name] = {
+            "size": artifact.stat().st_size,
+            "sha256": digest(artifact.read_bytes()),
+        }
+    path.write_text(json.dumps(manifest))
+    monkeypatch.setattr(
+        kernel_cache, "MANIFEST_SHA256", digest(json.dumps(manifest, sort_keys=True).encode())
+    )
+    assert not kernel_cache.verified_compiler_cache(proof, filesystem_root=root)

@@ -50,13 +50,16 @@ A failed worker retires its entire group;
 ordinary request cancellation aborts only that sequence and releases its slot
 after acknowledgment.
 
-Large fresh suffixes coalesce across the two driver ranks for up to 420ms before
-forcing an any-rank prefill attempt. Suffixes below 8,192 uncached tokens skip
-that wait. A collective maximum over pending request ages makes every driver
-choose the same scheduling vote. While any rank has decoding work, long prefills
-leave eight decode turns between chunks. Every rank uses the same collective
-decision so a cold long prompt cannot force uninterrupted prefill steps across
-the whole group. Startup exercises prefill shapes, representative decode batches,
+Large fresh suffixes use a 420ms grouping window before allowing an any-rank
+prefill attempt. This is not a mandatory sleep: prefill can start earlier when
+both driver ranks have eligible work. Suffixes below 8,192 uncached tokens allow
+an any-rank attempt immediately, subject to decode protection and capacity.
+While either rank has decoding work, the scheduler protects eight decode
+iterations between prefill chunks. Those iterations are separate from the
+concurrent-request autoscaling target and need not each emit exactly one token.
+Collective decisions keep both drivers in the same scheduling mode. The window
+starts at request admission, rather than restarting for each chunk, and is not
+a TTFT bound. Startup exercises prefill shapes, representative decode batches,
 and prefix capture/reuse before readiness.
 
 Tokenization uses the checkpoint's official `encoding/encoding.py` and immutable
@@ -71,10 +74,15 @@ Ambiguous admissions are never retried or treated as allowed.
 GPU prefix checkpoints are tenant scoped and require exact token IDs. Each driver
 retains at most 64 entries and 2,097,152 tokens of allocated prefix state. Entries
 expire after 600 seconds of inactivity or are evicted under memory pressure.
-One-off prefixes skip checkpoint creation; a bounded hash-only observation table
-admits them on reuse. Retention favors frequently reused prefixes relative to
-their allocated size. CPU spill is disabled because its current snapshots do not
-capture every context-parallel worker's state.
+One-off prefixes skip checkpoint creation. Each driver remembers up to 4,096
+eligible tenant-scoped prefix hashes and their observation timestamps, with a
+600-second lifetime. A repeated observation within that history makes a prefix
+eligible for a checkpoint; subsequent requests can reuse it once ready and while
+resident. Evicting an observation only forgets its reuse history and never rejects
+a request. This table holds no prompt tokens or GPU state and is separate from
+the 64-entry GPU cache and API rate limits. Retention favors frequently reused
+prefixes relative to their allocated size. CPU spill is disabled because its
+current snapshots do not capture every context-parallel worker's state.
 
 Workers advertise prefix digests to the in-container router, which balances
 saved prefill against pending work. Workers recheck namespace and token equality

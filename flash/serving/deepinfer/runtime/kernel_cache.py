@@ -1,4 +1,4 @@
-"""Qualify immutable compiler artifacts before shortening prefill warmup."""
+"""Verify the prebuilt GPU kernel cache before selecting shorter startup warmup."""
 
 from __future__ import annotations
 
@@ -13,6 +13,7 @@ from flash.serving.deepinfer.contract import config
 MANIFEST_PATH = "/opt/deepinfer-compiled-kernel-manifest.json"
 MANIFEST_SHA256 = "7cbfab3b44c3237c7ba2a5693af3249404d3093c2bc207d19c768d6511040ff5"
 NATIVE_SHA256 = "62d3f2996eab97dca43f2e1070f916cb6cbde9f14c552c850f6ea6eaf98f9992"
+# Expected values stay independent of live config so configuration drift is detected.
 QUALIFIED_CONFIG = {
     "MODEL_ID": "deepseek-ai/DeepSeek-V4.1-Flash-1017",
     "MODEL_REVISION": "1bae0e1088993b9b82de08f59de5be5a34e42170",
@@ -29,13 +30,9 @@ QUALIFIED_CONFIG = {
     "GPU_PREFIX_CACHE_TOKENS": 2097152,
     "GPU_PREFIX_CACHE_ENTRIES": 64,
 }
-# The eight-turn scheduler was qualified with exhaustive startup and GPU replay.
-# Scheduler/worker identifiers and imports reflect naming-only changes.
-# The transport patch removes only
-# startup host discovery: Modal's B200:4 contract guarantees a single machine,
-# with the same RDMA placeholder and NVLink check. CPU tests exercise that patch.
-# No CUDA implementation, native binary or compiled-kernel geometry is changed.
-# Every current file still requires an exact hash.
+# Reviewed source changes relative to the immutable seed: the qualified scheduler,
+# naming-only edits, and the single-host transport patch. Qualification history
+# lives in app/README.md; every accepted source still requires its exact hash.
 QUALIFIED_SOURCE_OVERRIDES = {
     "flash/serving/deepinfer/native/transport.py": "9000b752404f0bf1136988dabb398a9df4598110c61038b178964c36ad6fc868",
     "flash/serving/deepinfer/runtime/prefill_scheduler.py": "391ad5a235b5667e87a59cfbec3dc80117a044ab2640e4fd4934e7500fd4eb8d",
@@ -54,23 +51,20 @@ _WARMUP_FILES = {"runtime/kernel_cache.py", "runtime/warmup.py"}
 _CACHE_ROOTS = ("/root/.dj/cache/", "/root/.tilelang/cache/", "/root/.triton/cache/")
 
 
-def _kernel_source(name: str) -> bool:
-    relative = name.removeprefix(_SOURCE_PREFIX)
-    return relative.startswith(("runtime/", "native/")) and relative not in _WARMUP_FILES
-
-
-def _sha256(path: Path) -> str:
-    return hashlib.sha256(path.read_bytes()).hexdigest()
-
-
 def verified_compiler_cache(provenance: dict, *, filesystem_root: Path = Path("/")) -> bool:
-    """Fail closed to exhaustive warmup on any missing, changed or unknown input.
+    """Select shorter warmup only when every part of the qualified seed matches.
 
-    Compiler artifacts are only a startup optimization. A failed qualification
-    never suppresses native initialization or prevents the ordinary full warmup.
+    Missing, modified or unreadable inputs return False; the caller then uses
+    exhaustive warmup. This check never skips native runtime initialization.
     """
     try:
-        return _verify(provenance, filesystem_root)
+        manifest = _load_manifest(filesystem_root)
+        return (
+            _runtime_matches(provenance, manifest)
+            and _toolchain_matches(manifest, filesystem_root)
+            and _sources_match(manifest, filesystem_root)
+            and _artifacts_match(manifest, filesystem_root)
+        )
     except (
         OSError,
         ValueError,
@@ -83,11 +77,15 @@ def verified_compiler_cache(provenance: dict, *, filesystem_root: Path = Path("/
         return False
 
 
-def _verify(provenance: dict, root: Path) -> bool:
+def _load_manifest(root: Path) -> dict:
     manifest = json.loads((root / MANIFEST_PATH.lstrip("/")).read_text())
-    digest = hashlib.sha256(json.dumps(manifest, sort_keys=True).encode()).hexdigest()
-    if digest != MANIFEST_SHA256:
-        return False
+    canonical = json.dumps(manifest, sort_keys=True).encode()
+    if hashlib.sha256(canonical).hexdigest() != MANIFEST_SHA256:
+        raise ValueError("Compiler cache manifest does not match the qualified seed")
+    return manifest
+
+
+def _runtime_matches(provenance: dict, manifest: dict) -> bool:
     if any(getattr(config, key) != value for key, value in QUALIFIED_CONFIG.items()):
         return False
     if set(provenance) != set(range(config.RANK_COUNT)):
@@ -102,37 +100,46 @@ def _verify(provenance: dict, root: Path) -> bool:
         "nextn": 5,
         "zero_overhead_scheduling": True,
     }
-    if any(
-        proof.get(key) != value for proof in provenance.values() for key, value in expected.items()
-    ):
-        return False
+    for proof in provenance.values():
+        if any(proof.get(key) != value for key, value in expected.items()):
+            return False
+    return True
+
+
+def _toolchain_matches(manifest: dict, root: Path) -> bool:
     if any(version(name) != value for name, value in manifest["libraries"].items()):
         return False
     compiler = root / "usr/local/cuda/bin/nvcc"
-    if (
-        subprocess.check_output([str(compiler), "--version"], text=True, timeout=5)
-        != manifest["cuda"]
-    ):
-        return False
-    sources = {
+    compiler_version = subprocess.check_output([str(compiler), "--version"], text=True, timeout=5)
+    return compiler_version == manifest["cuda"]
+
+
+def _sources_match(manifest: dict, root: Path) -> bool:
+    expected = {
         SOURCE_PATH_RENAMES.get(name, name): digest
         for name, digest in manifest["runtime_sources"].items()
         if _kernel_source(name)
     }
-    if not set(QUALIFIED_SOURCE_OVERRIDES) <= set(sources):
+    # Overrides can update known files, but cannot introduce an unmanifested module.
+    if not set(QUALIFIED_SOURCE_OVERRIDES) <= set(expected):
         return False
-    sources.update(QUALIFIED_SOURCE_OVERRIDES)
+    expected.update(QUALIFIED_SOURCE_OVERRIDES)
     source_root = root / "root"
     current = {
         str(path.relative_to(source_root))
         for path in (source_root / _SOURCE_PREFIX).rglob("*.py")
         if _kernel_source(str(path.relative_to(source_root)))
     }
-    if not sources or current != set(sources):
+    if not expected or current != set(expected):
         return False
-    if any(_sha256(source_root / name) != digest for name, digest in sources.items()):
+    return all(_sha256(source_root / name) == digest for name, digest in expected.items())
+
+
+def _artifacts_match(manifest: dict, root: Path) -> bool:
+    artifacts = manifest["files"]
+    if not artifacts:
         return False
-    for name, record in manifest["files"].items():
+    for name, record in artifacts.items():
         if not name.startswith(_CACHE_ROOTS) or ".." in Path(name).parts:
             return False
         path = root / name.lstrip("/")
@@ -142,4 +149,13 @@ def _verify(provenance: dict, root: Path) -> bool:
             or _sha256(path) != record["sha256"]
         ):
             return False
-    return bool(manifest["files"])
+    return True
+
+
+def _kernel_source(name: str) -> bool:
+    relative = name.removeprefix(_SOURCE_PREFIX)
+    return relative.startswith(("runtime/", "native/")) and relative not in _WARMUP_FILES
+
+
+def _sha256(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
