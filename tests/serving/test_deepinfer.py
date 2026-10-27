@@ -357,7 +357,7 @@ def test_modal_private_four_gpu_autoscaling_contract(
         sys.modules.pop(name, None)
     assert captured["server"]["gpu"] == "B200:4"
     assert captured["server"]["memory"] == 524288
-    assert captured["server"]["min_containers"] == warm_replicas
+    assert captured["server"]["min_containers"] == (warm_replicas if rollout_id else 0)
     assert captured["server"]["max_containers"] == (
         (8 if rollout_id else 4) if environment == "main" else 1
     )
