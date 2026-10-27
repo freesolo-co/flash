@@ -7,7 +7,7 @@ from types import ModuleType, SimpleNamespace
 import pytest
 
 from flash.serving.deepinfer.runtime import prefill_scheduler as scheduling
-from flash.serving.deepinfer.runtime.prefill_scheduler import _RankState as State
+from flash.serving.deepinfer.runtime.prefill_scheduler import _DriverQueueState as QueueState
 
 
 class Matrix:
@@ -27,7 +27,7 @@ class Matrix:
 
 @pytest.fixture
 def scheduler(monkeypatch):
-    clock, remote, votes = [100.0], [State()], []
+    clock, remote, votes = [100.0], [QueueState()], []
     group = SimpleNamespace(size=lambda: 2, rank=lambda: 0)
     torch = ModuleType("torch")
     torch.float64 = "float64"
@@ -65,47 +65,86 @@ def admit(policy, request_id, active, tokens=32768, cached=0):
 
 def test_isolated_request_releases_at_50ms_on_either_driver():
     for age, expected in [(0, False), (0.049999, False), (0.05, True), (0.419, True)]:
-        state = State(pending=1, work=16384, oldest=age, quiet=age, active=1)
-        for states in [[state, State()], [State(), state]]:
+        state = QueueState(
+            pending_prefill_count=1,
+            estimated_prefill_tokens=16384,
+            oldest_prefill_age_seconds=age,
+            newest_prefill_age_seconds=age,
+            active_request_count=1,
+        )
+        for states in [[state, QueueState()], [QueueState(), state]]:
             assert scheduling._prefill_ready(states, 0.42) is expected
 
 
 def test_remote_active_decode_prevents_isolated_shortcut():
-    state = State(pending=1, work=16384, oldest=0.1, quiet=0.1, active=1)
-    assert not scheduling._prefill_ready([state, State(active=1, decoding=1)], 0.42)
-    assert scheduling._prefill_ready([state._replace(oldest=0.42), State(active=1)], 0.42)
+    state = QueueState(
+        pending_prefill_count=1,
+        estimated_prefill_tokens=16384,
+        oldest_prefill_age_seconds=0.1,
+        newest_prefill_age_seconds=0.1,
+        active_request_count=1,
+    )
+    assert not scheduling._prefill_ready(
+        [state, QueueState(active_request_count=1, has_decoding_requests=1)], 0.42
+    )
+    assert scheduling._prefill_ready(
+        [state._replace(oldest_prefill_age_seconds=0.42), QueueState(active_request_count=1)], 0.42
+    )
 
 
 def test_balanced_work_requires_quiet_window_and_full_chunk_on_every_driver():
-    left = State(pending=1, work=16384, oldest=0.02, quiet=0.02, active=1)
-    right = left._replace(quiet=0.009)
+    left = QueueState(
+        pending_prefill_count=1,
+        estimated_prefill_tokens=16384,
+        oldest_prefill_age_seconds=0.02,
+        newest_prefill_age_seconds=0.02,
+        active_request_count=1,
+    )
+    right = left._replace(newest_prefill_age_seconds=0.009)
     assert not scheduling._prefill_ready([left, right], 0.42)
-    assert scheduling._prefill_ready([left, right._replace(quiet=0.01)], 0.42)
-    assert not scheduling._prefill_ready([left, right._replace(work=8192, quiet=0.02)], 0.42)
-    assert not scheduling._prefill_ready([left._replace(pending=2, active=2), State()], 0.42)
+    assert scheduling._prefill_ready([left, right._replace(newest_prefill_age_seconds=0.01)], 0.42)
+    assert not scheduling._prefill_ready(
+        [left, right._replace(estimated_prefill_tokens=8192, newest_prefill_age_seconds=0.02)], 0.42
+    )
+    assert not scheduling._prefill_ready(
+        [left._replace(pending_prefill_count=2, active_request_count=2), QueueState()], 0.42
+    )
 
 
 def test_small_suffix_bypasses_wait_but_empty_queue_does_not():
-    assert scheduling._prefill_ready([State(pending=1, small_suffix=1, active=1), State()], 0.42)
-    assert not scheduling._prefill_ready([State(active=2, decoding=1), State()], 0.42)
+    assert scheduling._prefill_ready(
+        [
+            QueueState(
+                pending_prefill_count=1, has_small_uncached_suffix=1, active_request_count=1
+            ),
+            QueueState(),
+        ],
+        0.42,
+    )
+    assert not scheduling._prefill_ready(
+        [QueueState(active_request_count=2, has_decoding_requests=1), QueueState()], 0.42
+    )
 
 
 def test_bounded_wait_and_rank_order_for_random_queue_geometries():
     rng = random.Random(812)
     for _ in range(5000):
         states = [
-            State(
-                pending=rng.randrange(4),
-                work=rng.randrange(65536),
-                oldest=rng.random(),
-                quiet=rng.random() / 100,
-                active=rng.randrange(1, 6),
+            QueueState(
+                pending_prefill_count=rng.randrange(4),
+                estimated_prefill_tokens=rng.randrange(65536),
+                oldest_prefill_age_seconds=rng.random(),
+                newest_prefill_age_seconds=rng.random() / 100,
+                active_request_count=rng.randrange(1, 6),
             )
             for _ in range(2)
         ]
         ready = scheduling._prefill_ready(states, 0.42)
         assert ready == scheduling._prefill_ready(states[::-1], 0.42)
-        if any(state.pending and state.oldest >= 0.42 for state in states):
+        if any(
+            state.pending_prefill_count and state.oldest_prefill_age_seconds >= 0.42
+            for state in states
+        ):
             assert ready
 
 
@@ -114,10 +153,16 @@ def test_admission_cancellation_and_cached_suffix(scheduler):
     admit(policy, "large", {"large"})
     policy.before_step()
     assert policy.engine.scheduler.decode_step == 0
-    remote[0] = State(pending=1, work=16384, oldest=0.43, quiet=0.43, active=1)
+    remote[0] = QueueState(
+        pending_prefill_count=1,
+        estimated_prefill_tokens=16384,
+        oldest_prefill_age_seconds=0.43,
+        newest_prefill_age_seconds=0.43,
+        active_request_count=1,
+    )
     policy.before_step()
     assert policy.engine.scheduler.decode_step == 8
-    remote[0] = State()
+    remote[0] = QueueState()
     policy.command({"id": "large", "type": "cancel"}, set())
     policy.before_step()
     assert policy.engine.scheduler.decode_step == 0
@@ -134,7 +179,13 @@ def test_admission_cancellation_and_cached_suffix(scheduler):
 def test_new_admission_resets_quiet_window_and_work_is_capped(scheduler):
     policy, clock, remote, _ = scheduler
     admit(policy, "one", {"one"}, tokens=131072)
-    remote[0] = State(pending=1, work=16384, oldest=0.02, quiet=0.02, active=1)
+    remote[0] = QueueState(
+        pending_prefill_count=1,
+        estimated_prefill_tokens=16384,
+        oldest_prefill_age_seconds=0.02,
+        newest_prefill_age_seconds=0.02,
+        active_request_count=1,
+    )
     clock[0] += 0.02
     policy.before_step()
     assert policy.engine.scheduler.decode_step == 8
@@ -152,7 +203,14 @@ def test_new_admission_resets_quiet_window_and_work_is_capped(scheduler):
 
 def test_native_prefill_reset_preserves_eight_decode_turns_for_remote_work(scheduler):
     policy, _, remote, _ = scheduler
-    remote[0] = State(pending=1, work=16384, oldest=0.5, quiet=0.5, active=2, decoding=1)
+    remote[0] = QueueState(
+        pending_prefill_count=1,
+        estimated_prefill_tokens=16384,
+        oldest_prefill_age_seconds=0.5,
+        newest_prefill_age_seconds=0.5,
+        active_request_count=2,
+        has_decoding_requests=1,
+    )
     policy.before_step()
     assert policy.engine.scheduler.decode_step == 8
     policy.engine.scheduler.decode_step = 0
@@ -164,7 +222,7 @@ def test_native_prefill_reset_preserves_eight_decode_turns_for_remote_work(sched
         policy.after_step(set())
     policy.before_step()
     assert policy.engine.scheduler.decode_step == 8
-    remote[0] = remote[0]._replace(decoding=0)
+    remote[0] = remote[0]._replace(has_decoding_requests=0)
     policy.decode_remaining = 8
     policy.before_step()
     assert policy.engine.scheduler.decode_step == 8

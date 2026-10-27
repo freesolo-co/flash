@@ -12,28 +12,38 @@ from flash.serving.deepinfer.contract.config import (
 )
 
 
-class _RankState(NamedTuple):
-    pending: float = 0
-    work: float = 0
-    oldest: float = 0
-    small_suffix: float = 0
-    quiet: float = 0
-    active: float = 0
-    decoding: float = 0
+class _DriverQueueState(NamedTuple):
+    """One driver queue, shared with all drivers for container-wide decisions.
+
+    Counts and flags use floats because the collective transports a float64 tensor.
+    """
+
+    pending_prefill_count: float = 0
+    estimated_prefill_tokens: float = 0
+    oldest_prefill_age_seconds: float = 0
+    has_small_uncached_suffix: float = 0
+    newest_prefill_age_seconds: float = 0
+    active_request_count: float = 0
+    has_decoding_requests: float = 0
 
 
 def _prefill_ready(states, seconds):
-    pending = [state for state in states if state.pending]
+    pending = [state for state in states if state.pending_prefill_count]
     if not pending:
         return False
-    if any(state.small_suffix for state in pending):
+    if any(state.has_small_uncached_suffix for state in pending):
         return True
-    oldest = max(state.oldest for state in pending)
+    oldest = max(state.oldest_prefill_age_seconds for state in pending)
     if oldest >= seconds:
         return True
-    if len(pending) == len(states) and all(state.work >= PREFILL_TOKENS for state in states):
-        return min(state.quiet for state in states) >= PREFILL_QUIET_SECONDS
-    return sum(state.active for state in states) <= 1 and oldest >= PREFILL_ISOLATED_SECONDS
+    if len(pending) == len(states) and all(
+        state.estimated_prefill_tokens >= PREFILL_TOKENS for state in states
+    ):
+        return min(state.newest_prefill_age_seconds for state in states) >= PREFILL_QUIET_SECONDS
+    return (
+        sum(state.active_request_count for state in states) <= 1
+        and oldest >= PREFILL_ISOLATED_SECONDS
+    )
 
 
 class PrefillScheduler:
@@ -50,7 +60,7 @@ class PrefillScheduler:
         self.group = PG.cpu_data_parallel_group()
         self.rank = self.group.rank()
         self.state = torch.zeros(
-            (self.group.size(), len(_RankState._fields)), dtype=torch.float64, device="cpu"
+            (self.group.size(), len(_DriverQueueState._fields)), dtype=torch.float64, device="cpu"
         )
 
     def command(self, command, active, cached_tokens=0):
@@ -67,16 +77,18 @@ class PrefillScheduler:
 
         now = time.monotonic()
         pending = list(self.pending.values())
-        local = _RankState(
-            pending=len(pending),
+        local = _DriverQueueState(
+            pending_prefill_count=len(pending),
             # Admission-time estimate, capped at one chunk per pending request.
             # Pending entries persist until first output; this is not exact remaining work.
-            work=sum(min(tokens, PREFILL_TOKENS) for _, tokens in pending),
-            oldest=max((now - start for start, _ in pending), default=0.0),
-            small_suffix=any(tokens < PREFILL_COALESCING_MIN_TOKENS for _, tokens in pending),
-            quiet=min((now - start for start, _ in pending), default=0.0),
-            active=self.active_count,
-            decoding=self.decoding,
+            estimated_prefill_tokens=sum(min(tokens, PREFILL_TOKENS) for _, tokens in pending),
+            oldest_prefill_age_seconds=max((now - start for start, _ in pending), default=0.0),
+            has_small_uncached_suffix=any(
+                tokens < PREFILL_COALESCING_MIN_TOKENS for _, tokens in pending
+            ),
+            newest_prefill_age_seconds=min((now - start for start, _ in pending), default=0.0),
+            active_request_count=self.active_count,
+            has_decoding_requests=self.decoding,
         )
         self.state.zero_()
         row = self.state[self.rank]
@@ -86,8 +98,8 @@ class PrefillScheduler:
         # to every driver; only durations, never host timestamps, cross ranks.
         if self.group.size() > 1:
             dist.all_reduce(self.state, op=dist.ReduceOp.MAX, group=self.group)
-        states = [_RankState(*row) for row in self.state.tolist()]
-        if any(state.decoding for state in states) and self.decode_remaining:
+        states = [_DriverQueueState(*row) for row in self.state.tolist()]
+        if any(state.has_decoding_requests for state in states) and self.decode_remaining:
             self.engine.scheduler.decode_step = 1
         else:
             self.engine.scheduler.decode_step = (
