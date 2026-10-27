@@ -16,7 +16,7 @@ import pytest
 from safetensors.numpy import save
 
 from flash.adapters.targets import LoraTargeting, resolve_lora_targeting
-from flash.core.catalog import ALGORITHMS, MODELS
+from flash.core.catalog import MODELS
 from flash.engine.worker.train.core.child import model as child_runtime
 from flash.engine.worker.train.core.child.model import (
     resolve_text_lora_target_modules,
@@ -130,8 +130,10 @@ def test_runtime_target_resolution_rejects_ambiguous_wrapper_roots():
         )
 
 
-@pytest.mark.parametrize("model_id", _CAMPAIGN_MODELS)
-@pytest.mark.parametrize("algorithm", ALGORITHMS)
+@pytest.mark.parametrize(
+    ("model_id", "algorithm"),
+    [(model, algo) for model in _CAMPAIGN_MODELS for algo in MODELS[model].algos],
+)
 def test_every_campaign_text_trainer_targets_only_the_cataloged_language_subtree(
     model_id, algorithm
 ):
@@ -165,8 +167,10 @@ def test_every_campaign_text_trainer_targets_only_the_cataloged_language_subtree
         assert targeting.target_parameters is None
 
 
-@pytest.mark.parametrize("model_id", _CAMPAIGN_MODELS)
-@pytest.mark.parametrize("algorithm", ALGORITHMS)
+@pytest.mark.parametrize(
+    ("model_id", "algorithm"),
+    [(model, algo) for model in _CAMPAIGN_MODELS for algo in MODELS[model].algos],
+)
 def test_every_campaign_multimodal_trainer_keeps_the_existing_all_linear_surface(
     model_id, algorithm
 ):

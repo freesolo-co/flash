@@ -331,7 +331,7 @@ def _resolve_opd_gpu_mem_util(
         n_gpus=int(runtime.gpu_count),
         fp8_kv=bool(fp8_kv),
         sleep_unsupported=rollout_sleep_unsupported(model_id),
-        preserve_legacy_floor=True,
+        preserve_parameter_floor=True,
     )
 
 

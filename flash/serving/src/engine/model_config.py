@@ -49,6 +49,46 @@ from flash.serving.src.engine.prequant_config import (
 
 SERVING_MODELS: list[dict[str, Any]] = [
     {
+        "base_model": "Qwen/Qwen3.5-0.8B",
+        "image_input_limit": None,
+        "gpu": "L40S",
+        "engine": {
+            "serve_model_id": "Qwen/Qwen3.5-0.8B",
+            "model_revision": "2fc06364715b967f1860aea9cf38778875588b17",
+            "tokenizer_revision": "2fc06364715b967f1860aea9cf38778875588b17",
+            "processor_revision": "2fc06364715b967f1860aea9cf38778875588b17",
+            "quantization": None,
+            "gpu_memory_utilization": 0.90,
+            "max_loras": 4,
+            "max_cpu_loras": 4,
+            "max_lora_rank": 64,
+            "max_model_len": 32768,
+            "max_num_seqs": 8,
+            "enforce_eager": False,
+            "reasoning_parser": "qwen3",
+        },
+    },
+    {
+        "base_model": "Qwen/Qwen3.5-4B",
+        "image_input_limit": None,
+        "gpu": "H100",
+        "engine": {
+            "serve_model_id": "Qwen/Qwen3.5-4B",
+            "model_revision": "851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a",
+            "tokenizer_revision": "851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a",
+            "processor_revision": "851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a",
+            "quantization": None,
+            "gpu_memory_utilization": 0.90,
+            "max_loras": 4,
+            "max_cpu_loras": 4,
+            "max_lora_rank": 64,
+            "max_model_len": 32768,
+            "max_num_seqs": 8,
+            "enforce_eager": False,
+            "reasoning_parser": "qwen3",
+        },
+    },
+    {
         "base_model": "Qwen/Qwen3.5-9B",
         "image_input_limit": 4,
         "gpu": "B200",
@@ -198,6 +238,8 @@ def gpu_for(base_model: str) -> str:
 def serve_model_for(base_model: str) -> str:
     """return the pre-quantized checkpoint an active hosted engine loads."""
     _config_for(base_model)
+    if base_model in {"Qwen/Qwen3.5-0.8B", "Qwen/Qwen3.5-4B"}:
+        return base_model
     if base_model == DEEPSEEK_MODEL_ID:
         return DEEPSEEK_MODEL_ID
     return _prequant_serve_model_for(base_model)

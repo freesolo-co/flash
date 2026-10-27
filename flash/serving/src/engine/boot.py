@@ -199,7 +199,7 @@ def engine_args_for(
         "enable_lora": True,
         "max_loras": max_loras,
         "max_lora_rank": overrides.get("max_lora_rank", cfg.MAX_LORA_RANK),
-        "max_cpu_loras": cfg.MAX_CPU_LORAS,
+        "max_cpu_loras": overrides.get("max_cpu_loras", cfg.MAX_CPU_LORAS),
         **extra,
         **cfg.vllm_engine_kwargs(),
     }

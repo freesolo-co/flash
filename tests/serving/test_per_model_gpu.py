@@ -436,10 +436,8 @@ def test_deployed_timeouts_use_the_shared_serving_budget(modal_app_module):
 
 def test_one_engine_class_per_distinct_engine_key(modal_app_module):
     """a loraengine class is built for each active gpu tier and concurrency key."""
-    # all three active tiers serve on B200 with the same concurrency, so they legitimately share
-    # ONE engine class: the key is (gpu, max_inputs) and each model still gets its own container
-    # and its own engine args.
-    assert set(modal_app_module.ENGINE_BY_KEY) == {("B200", 8)}
+    # Models sharing a GPU and concurrency key share a class, with separate containers.
+    assert set(modal_app_module.ENGINE_BY_KEY) == {("B200", 8), ("L40S", 8), ("H100", 8)}
 
 
 def test_engine_concurrency_rejects_malformed_catalog_values(modal_app_module, monkeypatch):

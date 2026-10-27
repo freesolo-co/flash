@@ -330,7 +330,7 @@ def test_opd_kv_floor_keeps_the_bf16_floor_for_a_gdn_hybrid():
         concurrency,
         active_params_b=info.active_params_b,
         model_info=info,
-        preserve_legacy_floor=True,
+        preserve_parameter_floor=True,
     )
     fp8_floor = grpo_kv_floor_gb(
         info.params_b,
@@ -339,7 +339,7 @@ def test_opd_kv_floor_keeps_the_bf16_floor_for_a_gdn_hybrid():
         active_params_b=info.active_params_b,
         fp8_kv=True,
         model_info=info,
-        preserve_legacy_floor=True,
+        preserve_parameter_floor=True,
     )
     need = model_required_vram_gb(
         info.id,
