@@ -286,7 +286,12 @@ def test_geometry_cap_follows_each_models_own_head_count():
     derived_wrong = {
         m for m, i in MODELS.items() if i.hidden_size // i.head_dim != i.num_attention_heads
     }
-    assert derived_wrong == {"Qwen/Qwen3.8-27B", "Qwen/Qwen3.6-35B-A3B"}
+    assert derived_wrong == {
+        "Qwen/Qwen3.5-0.8B",
+        "Qwen/Qwen3.5-4B",
+        "Qwen/Qwen3.8-27B",
+        "Qwen/Qwen3.6-35B-A3B",
+    }
 
     # every CURRENT row divides by 8, so no row is narrowed today. that is a property of this
     # catalog, not an invariant -- the loop above is what enforces it for whatever is added next.

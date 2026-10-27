@@ -22,6 +22,8 @@ from flash.serving.src.engine.model_config import (
 
 def test_catalog_has_only_canary_qualified_active_models() -> None:
     assert set(base_models()) == {
+        "Qwen/Qwen3.5-0.8B",
+        "Qwen/Qwen3.5-4B",
         "Qwen/Qwen3.5-9B",
         "Qwen/Qwen3.8-27B",
         "Qwen/Qwen3.6-35B-A3B",
@@ -182,3 +184,25 @@ def test_35b_has_b200_bf16_rank64_six_loras_overrides() -> None:
         ov["gpu_memory_utilization"] == 0.90
     )  # headroom above the weights + 6 x 64 LoRA buffer for KV + graphs
     assert ov["enforce_eager"] is False  # CUDA graphs on for the bf16/B200 path
+
+
+@pytest.mark.parametrize(
+    ("model", "gpu"), [("Qwen/Qwen3.5-0.8B", "L40S"), ("Qwen/Qwen3.5-4B", "H100")]
+)
+def test_small_models_use_requested_gpu_and_pinned_bf16(model, gpu):
+    from flash.core.catalog import get_model
+    from flash.serve.deployment.profiles import get_profile
+
+    info = get_model(model)
+    overrides = engine_overrides_for(model)
+    assert gpu_for(model) == info.serving.gpu == gpu
+    assert serve_model_for(model) == model
+    assert overrides["quantization"] is None
+    assert overrides["max_loras"] == overrides["max_cpu_loras"] == 4
+    assert overrides["max_lora_rank"] == 64
+    for key in ("model_revision", "tokenizer_revision", "processor_revision"):
+        assert overrides[key] == info.managed_revision
+    assert set(info.algos) == {"sft", "grpo"}
+    profile = get_profile(model)
+    assert profile.modal_gpu_request == ("H100!" if gpu == "H100" else gpu)
+    assert not profile.modal_live_qualified

@@ -293,7 +293,11 @@ def test_native_image_patch_rejects_unknown_source():
 @pytest.mark.parametrize(
     ("environment", "warm_replicas"), [("main", 1), ("dev", 0), ("test", 0), (None, 0)]
 )
-def test_modal_private_four_gpu_autoscaling_contract(monkeypatch, environment, warm_replicas):
+@pytest.mark.parametrize("rollout_id", ["", "test-rollout"])
+def test_modal_private_four_gpu_autoscaling_contract(
+    monkeypatch, environment, warm_replicas, rollout_id
+):
+    monkeypatch.setenv("DEEPINFER_ROLLOUT_ID", rollout_id)
     captured = {}
 
     class Image:
@@ -354,11 +358,14 @@ def test_modal_private_four_gpu_autoscaling_contract(monkeypatch, environment, w
     assert captured["server"]["gpu"] == "B200:4"
     assert captured["server"]["memory"] == 524288
     assert captured["server"]["min_containers"] == warm_replicas
-    assert captured["server"]["max_containers"] == (3 if environment == "main" else 1)
+    assert captured["server"]["max_containers"] == (
+        (8 if rollout_id else 4) if environment == "main" else 1
+    )
+    assert captured["server"]["exit_grace_period"] == 3600
     assert captured["server"]["buffer_containers"] == 0
     assert captured["server"]["scaledown_window"] == 600
     assert captured["server"]["scaleup_window"] == 1
-    assert captured["server"]["max_concurrency"] == 128
+    assert captured["server"]["max_concurrency"] == 0
     assert captured["server"]["target_concurrency"] == (100 if environment == "main" else 8)
     assert ("controller" in captured) == (environment == "main")
     if environment == "main":

@@ -20,6 +20,8 @@ SEQUENCES_PER_RANK = 64
 PREFILL_TOKENS = 16384
 PREFILL_ANY_INTERVAL = 8
 PREFILL_COALESCING_SECONDS = 0.42
+PREFILL_ISOLATED_SECONDS = 0.05
+PREFILL_QUIET_SECONDS = 0.01
 PREFILL_COALESCING_MIN_TOKENS = 8192
 GPU_PREFIX_CACHE_TOKENS = 2 * MAX_MODEL_LEN
 GPU_PREFIX_CACHE_ENTRIES = SEQUENCES_PER_RANK
@@ -36,18 +38,20 @@ POOL_SPARE_STREAMS = 64
 POOL_SAMPLE_SECONDS = 5
 POOL_SAMPLE_MAX_AGE = 20
 POOL_STATE_NAME = "freesolo-deepseek-pool-load"
-# Main can scale to twelve B200s; other environments remain one group, idle at zero.
+# Main can scale to 16 B200s; rolling deploys allow a full replacement pool.
 MAIN_MIN_CONTAINERS = 1
-MAIN_MAX_CONTAINERS = 3
+MAIN_MAX_CONTAINERS = 4
+MAIN_ROLLOUT_MAX_CONTAINERS = 2 * MAIN_MAX_CONTAINERS
 MAIN_BUFFER_CONTAINERS = 0
 MAX_CONTAINERS = 1
 BUFFER_CONTAINERS = 0
 SCALEDOWN_SECONDS = 600
 SCALEUP_SECONDS = 1
 STARTUP_SECONDS = 2700
-# A 350K-token completion takes almost an hour at 100 tokens/s. Leave room for
-# prefill and rate variation while retaining a finite generation deadline.
-REQUEST_SECONDS = 7200
+# The HTTP deadline includes preparation and streaming. Leave five minutes for
+# cancellation/cleanup inside Modal's one-hour native draining window.
+REQUEST_SECONDS = 55 * 60
+DRAIN_SECONDS = 60 * 60
 WORKER_STALL_SECONDS = 600
 STREAM_IDLE_SECONDS = 60
 PORT = 8000

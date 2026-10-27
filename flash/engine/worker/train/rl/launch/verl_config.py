@@ -501,7 +501,7 @@ def resolve_gpu_mem_util(
     n_gpus: int,
     fp8_kv: bool,
     sleep_unsupported: bool,
-    preserve_legacy_floor: bool = False,
+    preserve_parameter_floor: bool = False,
 ) -> float:
     """size vllm's colocated executor budget from this run's geometry.
 
@@ -538,9 +538,7 @@ def resolve_gpu_mem_util(
         model_id = str(inp["model_id"])
         revision = str(inp.get("model_revision") or "")
         catalog_info = MODELS.get(model_id)
-        # a pinned revision is sized on generic architecture geometry:
-        # the commit's real geometry is not validated, so the curated kv/lora shape may not describe
-        # it. the parameter count still comes from the pinned config.
+        # Pinned revisions cannot use unverified catalog layer geometry. Runtime floors still apply.
         info = None if revision else catalog_info
         # the ONE way the worker, the preflight and the cost estimator agree on a model's size:
         # curated catalog params_b, else the pinned commit's real HF count. the catalog answers
@@ -567,7 +565,8 @@ def resolve_gpu_mem_util(
             active_params_b=float(getattr(info, "active_params_b", 0.0) or 0.0) or None,
             fp8_kv=fp8_kv,
             model_info=info,
-            preserve_legacy_floor=preserve_legacy_floor,
+            rollout_cache_min_gb=getattr(catalog_info, "rollout_cache_min_gb", 0.0),
+            preserve_parameter_floor=preserve_parameter_floor,
             tensor_parallel=n_gpus,
             lora_rank=int(inp["lora_rank"]),
         )

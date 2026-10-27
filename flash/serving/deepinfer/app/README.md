@@ -11,33 +11,35 @@ retain their separate vLLM images and capacity.
 | Setting | Value |
 | --- | --- |
 | GPU allocation | Four B200s on one physical machine per container (`B200:4`) |
-| Main | One warm container, maximum three (12 B200s total), zero buffer containers |
+| Main | One warm container, maximum four (16 B200s total), zero buffer containers |
+| Main rolling deployment | Temporarily allow up to eight containers (32 B200s) for old/new overlap; restore four after warm handoff |
 | Dev and other environments | Zero warm containers, maximum one, zero buffers |
 | Admission per container | Maximum 128 requests; main planning capacity 100 concurrent streams |
-| Main scale-up | Pool-wide reserve of 64 streams: second group at 36 active requests, third at 136 |
+| Main scale-up | Pool-wide reserve of 64 streams: second group at 36 active requests, third at 136, fourth at 236 |
 | Sampling | Replica heartbeats and a single CPU controller every five seconds |
 | Native scheduler | Two driver ranks, 64 sequences per rank, 16,384-token prefill chunks |
 | Context | 1,048,576 combined input/output tokens, with 64 reserved for native execution |
 | Output | Up to the remaining context budget; 350,000-token completions fit with shorter input |
 | Placement | US compute, US East routing |
 | Host allocation | 32 CPUs / 512 GiB RAM |
-| Startup / request budget | 45 minutes / two hours |
+| Startup / request budget | 45 minutes for startup; 55 minutes per request, including preparation and streaming |
+| Deployment draining | 60 minutes; five minutes beyond the request budget for cancellation/cleanup |
 | Failure bounds | Ten-minute native-worker watchdog; 60-second HTTP stream idle timeout |
 | Idle scale-down | 600 seconds; main retains its minimum, dev scales to zero |
 
 Production starts additional four-GPU groups before reaching the existing group's
-hard admission limit, up to three groups. Dev and other environments remain capped
+hard admission limit, up to four groups. Dev and other environments remain capped
 at one group and scale to zero. Admission above ready capacity may receive a
 retryable capacity error. After scale-to-zero, an authenticated request triggers
-startup and receives 503 until the server is ready. At the maximum pool size there
-is no spare GPU group for a rolling replacement. With zero buffer containers, a
+startup and receives 503 until the server is ready. Main rolling deployments reserve
+room for a complete replacement pool even at the normal maximum. With zero buffer containers, a
 sudden burst can arrive before additional groups are ready; the scaling target
 does not guarantee latency during cold scale-out.
-Main requests `min(3, floor((active_requests + 64) / 100) + 1)` containers,
-with a minimum of one. The reserve is shared across the pool, not multiplied by
-the number of containers. At 36 requests it requests the second four-GPU group;
-at 136 it requests the third. At the three-group cap it cannot preserve that
-reserve once demand reaches 236. The 100-stream capacity is an operator planning
+Main requests `min(4, max(1, floor((active_requests + 64) / 100) + 1))` containers.
+The reserve is shared across the pool, not multiplied by the number of containers.
+At 36 requests it requests the second four-GPU group; at 136 the third; at 236 the fourth.
+At the four-group cap it cannot preserve that reserve once demand reaches 336.
+The 100-stream capacity is an operator planning
 assumption, not a benchmark-derived latency guarantee or the hard admission limit.
 Aggregate output tokens/sec divided by a target per-stream rate gives only a
 rough concurrency budget for the same saturated workload; prompt length, cache
@@ -75,9 +77,12 @@ A failed worker retires its entire group;
 ordinary request cancellation aborts only that sequence and releases its slot
 after acknowledgment.
 
-Large fresh suffixes use a 420ms grouping window before allowing an any-rank
-prefill attempt. This is not a mandatory sleep: prefill can start earlier when
-both driver ranks have eligible work. Suffixes below 8,192 uncached tokens allow
+Large fresh suffixes allow an any-rank prefill attempt after 50ms when only one
+request is active across the drivers. With multiple active requests, both drivers
+can release early once each has at least one estimated 16,384-token chunk queued
+and no pending request was admitted in the last 10ms. Unbalanced queues retain
+the 420ms maximum grouping window. Work estimates use uncached tokens at admission,
+capped at one chunk per pending request. Suffixes below 8,192 uncached tokens allow
 an any-rank attempt immediately, subject to decode protection and capacity.
 While either rank has decoding work, the scheduler protects eight decode
 iterations between prefill chunks. Those iterations are separate from the
@@ -150,14 +155,77 @@ rate, actual cache reuse and per-stream measurements.
 ## Deployment
 
 ```sh
-modal deploy --env dev -m flash.serving.deepinfer.app.modal_app
-modal deploy --env main -m flash.serving.deepinfer.app.modal_app
+modal deploy --strategy rolling --env dev -m flash.serving.deepinfer.app.modal_app
+
+export MODAL_ENVIRONMENT=main
+export DEEPINFER_ROLLOUT_ID="$(python -c 'import uuid; print(uuid.uuid4().hex)')"
+python -m flash.serving.deepinfer.app.rollout --begin
+modal deploy --strategy rolling --env main -m flash.serving.deepinfer.app.modal_app
+python -m flash.serving.deepinfer.app.rollout
 ```
 
 The `Deploy DeepInfer pools` workflow selects the matching Modal environment on
 relevant pushes to `dev` and `main`. Only explicitly selected `main` gets a warm
 minimum. The private `Engine` Modal Server requires proxy authentication and
 exposes `/health` and `/internal/generate`.
+
+Main explicitly uses Modal's rolling strategy. Uvicorn does not open the serving
+port until every rank loads and the complete prefill, decode, and cache warmup
+finishes. A failed startup never opens that port. Existing replicas continue
+serving while replacements start. Each rollout has a unique identity in its
+health responses and load reports. The deployment waits for at least one warmed
+replacement and for every registered replica to report the current rollout.
+The scheduled controller then restores the normal maximum of four, even if CI has
+disconnected. During rollout the maximum is eight, allowing a full replacement
+pool while old containers finish their existing requests. Restoring the setting
+does not force-stop streams: Modal owns their native draining. Actual container
+usage can remain above four while draining completes. A pre-deploy marker prevents
+the previous controller from removing surge capacity early. A timeout fails
+verification without stopping the serving pool; overlap remains enabled until the
+warm handoff succeeds. Readiness verification is not a claim that all old streams
+have already finished.
+Serialize manual deployments with CI; do not overlap rollout commands.
+
+The availability objective is 99.99% (259.2 seconds unavailable per 30 days), with
+zero failed requests caused by planned redeployment as the rollout acceptance
+criterion. The one-replica warm minimum does not tolerate losing that sole ready
+replica without waiting for a replacement. Autoscaling adds capacity under demand;
+it does not establish independent provider failure domains or prove this SLO. Measure valid
+public generation requests end to end, including complete streaming responses;
+track deployment windows separately and include backend errors, broken streams,
+and timeouts. Health checks alone are not availability evidence. GPU allocation,
+the shared routing region, and upstream platform failures remain dependencies.
+
+Modal Servers allow 3,600 seconds of native draining. The request deadline is
+3,300 seconds (55 minutes), leaving five minutes for cancellation and cleanup.
+The backend enforces this deadline from HTTP admission through upload, tokenization,
+generation, and stream delivery; it is not restarted when the first token arrives.
+The hosted client also applies a single 55-minute deadline across lookup, retries,
+and response streaming. Model loading/warmup uses a separate 45-minute startup
+budget before the serving port opens. It does not extend an accepted request.
+The 60-second stream idle timeout remains in place. Deadline expiry before response
+headers returns 504; after headers it terminates with a native error event. Neither
+case is marked safe for replay. Native cancellation retains its bounded abort
+handshake before releasing the request slot.
+
+There is one deployed GPU App with Modal-native routing and lifecycle management;
+no fleet registry, per-replica Apps, or fleet migration command is required. Safe
+retries go through the same authenticated pool URL, without affinity. Modal chooses
+a ready replica, so another replica can handle a retry when available, but a different
+physical replica is not guaranteed. Retry at most three times within a ten-second
+retry window on connection failures before sending work or explicit application
+admission rejections. Generic HTTP errors, ambiguous read/write failures, accepted
+result redirects, and partial streams are not replayed. Generation identity,
+tenant cache namespace, and accounting remain unchanged across attempts.
+
+For the first production rollout of this policy, deploy the updated public router
+first and let all requests admitted by older router versions finish before
+redeploying the GPU App. Update any direct private clients as well. The currently
+running backend's older two-hour allowance cannot be shortened retroactively;
+native draining cannot protect a pre-existing request with more than an hour left.
+Subsequent rollouts use the 55-minute request limit and one-hour native drain window.
+See [Modal deployment strategies](https://modal.com/docs/guide/managing-deployments)
+and [Server lifecycle limits](https://modal.com/docs/guide/servers).
 
 The hosted router discovers `Engine` in the same Modal environment. Its
 `DEEPINFER_PROXY_KEY` and `DEEPINFER_PROXY_SECRET` must both be configured as
@@ -218,6 +286,8 @@ the expected manifest hash is not qualification.
 A qualified image exercises representative prefill shapes, all existing decode
 batches, and prefix capture/reuse before readiness. Missing, modified or
 incompatible artifacts retain the exhaustive 16-token-step prefill warmup.
+The adaptive scheduler changes runtime source hashes, so the current saved image
+uses this exhaustive fallback until a new image is separately qualified.
 `/health` reports `compiled_kernel_cache_verified`. Runtime, compiler or GPU
 changes require a fresh qualification; a compiler cache miss may still compile.
 

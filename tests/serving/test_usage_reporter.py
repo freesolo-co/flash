@@ -104,7 +104,7 @@ def test_lora_engine_scales_to_zero_by_default(modal_app_module):
     assert all(kwargs["min_containers"] == modal_app_module.MIN_CONTAINERS for kwargs in cls_calls)
     # Each engine class is pinned to ITS gpu tier's window, not one flat value.
     assert {kwargs["gpu"]: kwargs["scaledown_window"] for kwargs in cls_calls} == {
-        gpu: modal_app_module.scaledown_window_for(gpu)
+        ("H100!" if gpu == "H100" else gpu): modal_app_module.scaledown_window_for(gpu)
         for gpu, _mi in modal_app_module.ENGINE_BY_KEY
     }
 
@@ -923,9 +923,9 @@ def test_evict_uncached_alias_does_not_remove_a_colliding_adapter(modal_app_modu
     assert "tenant-b" in engine._lora_entries
 
 
-def test_only_shipped_b200_has_a_hosted_idle_window(modal_app_module):
-    assert {"B200"} == modal_app_module.SUPPORTED_GPUS
+def test_only_active_gpus_have_a_hosted_idle_window(modal_app_module):
+    assert {"B200", "L40S", "H100"} == modal_app_module.SUPPORTED_GPUS
     assert modal_app_module.scaledown_window_for("B200") == 2100
-    for dormant_gpu in ("L4", "L40S", "H100", "H200", "B300"):
+    for dormant_gpu in ("L4", "H200", "B300"):
         with pytest.raises(ValueError, match="Unsupported serving GPU tier"):
             modal_app_module.scaledown_window_for(dormant_gpu)

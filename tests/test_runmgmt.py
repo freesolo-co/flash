@@ -37,7 +37,7 @@ def _modal_remote(instance_id="sb-worker", job_id=None, *, attempt=0, started_ts
 
 
 _SOURCE_SNAPSHOT = valid_source_snapshot()
-_RETIRED_MODELS = ("Qwen/Qwen3.5-0.8B", "Qwen/Qwen3.5-2B", "Qwen/Qwen3.5-4B", "Qwen/Qwen3.6-27B")
+_RETIRED_MODELS = ("Qwen/Qwen3.5-2B", "Qwen/Qwen3.6-27B")
 
 
 def _hold_launch_claim(runs_dir: str, run_id: str, claim_queue, exit_event) -> None:

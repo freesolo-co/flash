@@ -9,14 +9,12 @@ from flash.serve.deployment.readiness import (
 from flash.serving.deepinfer.contract.config import (
     REQUEST_SECONDS as DEEPINFER_REQUEST_SECONDS,
 )
-from flash.serving.deepinfer.contract.config import (
-    STARTUP_SECONDS as DEEPINFER_STARTUP_SECONDS,
-)
 
-# The router waits for both a cold engine and its request to finish.
+# LoRA Functions can wait for cold startup. DeepInfer Servers reject requests
+# until ready, so their 55-minute request budget does not include model startup.
 ROUTER_TIMEOUT_SECONDS = max(
     STARTUP_TIMEOUT_SECONDS + REQUEST_TIMEOUT_SECONDS,
-    DEEPINFER_STARTUP_SECONDS + DEEPINFER_REQUEST_SECONDS,
+    DEEPINFER_REQUEST_SECONDS,
 )
 
 # Let the client receive the router's final response before declaring a failed promotion.

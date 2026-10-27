@@ -31,6 +31,9 @@ FREESOLO_PRICING_VERSION = "2026-08-27.1"
 # currently sit below the recorded cost basis, so do not reintroduce a multiplier here until measured
 # b200 economics establish a lower truthful cost basis.
 _FREESOLO_USD_PER_MTOK: dict[str, tuple[str, str, str]] = {
+    # Restore the prior final customer rates (the old catalog applied 1.2 markup).
+    "Qwen/Qwen3.5-0.8B": ("0.012", "0.06", "0.0024"),
+    "Qwen/Qwen3.5-4B": ("0.036", "0.18", "0.0072"),
     "deepseek-ai/DeepSeek-V4.1-Flash-1017": ("0.15", "0.60", "0.003"),
     "Qwen/Qwen3.5-9B": ("0.095", "0.1425", "0.0276"),
     "Qwen/Qwen3.8-27B": ("0.3325", "2.4225", "0.03325"),

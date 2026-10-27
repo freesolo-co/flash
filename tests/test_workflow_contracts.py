@@ -31,6 +31,20 @@ WORKFLOW_DIR = REPO_ROOT / ".github" / "workflows"
 UPSTREAM_REPOSITORY = "freesolo-co/flash"
 
 
+def test_deepinfer_rollout_cannot_report_success_before_warm_replacement():
+    workflow = yaml.safe_load((WORKFLOW_DIR / "deploy-deepinfer.yml").read_text())
+    assert workflow["concurrency"]["cancel-in-progress"] is False
+    job = workflow["jobs"]["deploy"]
+    assert job["timeout-minutes"] >= 60
+    assert "github.run_attempt" in job["env"]["DEEPINFER_ROLLOUT_ID"]
+    commands = [step["run"] for step in job["steps"] if "run" in step]
+    begin = next(i for i, cmd in enumerate(commands) if "app.rollout --begin" in cmd)
+    deploy = next(i for i, cmd in enumerate(commands) if "modal deploy" in cmd)
+    verify = next(i for i, cmd in enumerate(commands) if cmd.endswith("app.rollout"))
+    assert begin < deploy < verify
+    assert "--strategy rolling" in commands[deploy]
+
+
 def _workflow_paths() -> list[Path]:
     # Both extensions: Actions runs `.yaml` exactly as it runs `.yml`, so globbing only `.yml`
     # would let a `.yaml` workflow run uncapped and unpinned while these contracts still reported
