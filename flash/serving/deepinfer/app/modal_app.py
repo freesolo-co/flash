@@ -73,9 +73,9 @@ if main_environment:
         timeout=15,
     )
     def scale_pool():
-        from flash.serving.deepinfer.app.autoscaling import reconcile
+        from flash.serving.deepinfer.app.autoscaling import update_pool_capacity
 
-        return reconcile(
+        return update_pool_capacity(
             modal.Server.from_name(APP_NAME, "Engine"), pool_load, deployment_id=deployment_id
         )
 

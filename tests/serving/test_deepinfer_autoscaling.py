@@ -5,7 +5,11 @@ from types import SimpleNamespace
 
 import pytest
 
-from flash.serving.deepinfer.app.autoscaling import pool_load, reconcile, required_containers
+from flash.serving.deepinfer.app.autoscaling import (
+    pool_load,
+    required_containers,
+    update_pool_capacity,
+)
 from flash.serving.deepinfer.app.http import _GenerationCount
 
 
@@ -56,25 +60,29 @@ def test_pool_reserve_boundaries(active, expected):
 def test_pool_counts_both_replicas_not_each_threshold_separately():
     server = Server(floor=2, containers=("a", "b"))
     store = Store(a={"at": 1000, "active": 68}, b={"at": 1000, "active": 68})
-    assert reconcile(server, store, now=1000) == {"active": 136, "complete": True, "floor": 3}
+    assert update_pool_capacity(server, store, now=1000) == {
+        "active": 136,
+        "complete": True,
+        "floor": 3,
+    }
     assert server.updates == [3]
 
 
 def test_no_oscillation_after_third_container_starts_and_delayed_scale_down():
     server = Server()
     store = Store(a={"at": 1000, "active": 136})
-    reconcile(server, store, now=1000)
+    update_pool_capacity(server, store, now=1000)
     server.containers = ("a", "b")
     for now in range(1005, 1705, 5):
         store.update(a={"at": now, "active": 68}, b={"at": now, "active": 68})
-        reconcile(server, store, now=now)
+        update_pool_capacity(server, store, now=now)
     assert server.updates == [3]
     for now in range(1705, 2305, 5):
         store.update(a={"at": now, "active": 0}, b={"at": now, "active": 0})
-        reconcile(server, store, now=now)
+        update_pool_capacity(server, store, now=now)
     assert server.updates == [3]
     store.update(a={"at": 2305, "active": 0}, b={"at": 2305, "active": 0})
-    reconcile(server, store, now=2305)
+    update_pool_capacity(server, store, now=2305)
     assert server.updates == [3, 1]
 
 
@@ -100,11 +108,11 @@ def test_missing_replica_blocks_scale_down_but_known_load_can_scale_up():
     store = Store(
         a={"at": 1000, "active": 0}, controller={"at": 995, "floor": 2, "below_since": 390}
     )
-    reconcile(server, store, now=1000)
+    update_pool_capacity(server, store, now=1000)
     assert server.updates == []
     assert store["controller"]["below_since"] is None
     store["a"] = {"at": 1005, "active": 136}
-    reconcile(server, store, now=1005)
+    update_pool_capacity(server, store, now=1005)
     assert server.updates == [3]
 
 
@@ -115,7 +123,7 @@ def test_controller_outage_resets_quiet_window_and_departed_samples_do_not_count
         dead={"at": 900, "active": 1000},
         controller={"at": 900, "floor": 3, "below_since": 300},
     )
-    reconcile(server, store, now=1000)
+    update_pool_capacity(server, store, now=1000)
     assert server.updates == []
     assert "dead" not in store
     assert store["controller"]["below_since"] == 1000
@@ -124,7 +132,7 @@ def test_controller_outage_resets_quiet_window_and_departed_samples_do_not_count
 def test_disabled_pool_is_not_relaunched():
     server = Server(floor=0)
     server.settings.max_containers = 0
-    assert reconcile(server, Store(), now=1000) is None
+    assert update_pool_capacity(server, Store(), now=1000) is None
     assert not server.updates
 
 
@@ -149,7 +157,7 @@ def test_rollout_slot_requires_fresh_replacements_and_the_current_controller(
     )
     if second is not None:
         store["b"] = second
-    reconcile(server, store, now=1000, deployment_id=deployment_id)
+    update_pool_capacity(server, store, now=1000, deployment_id=deployment_id)
     assert server.settings.max_containers == expected_cap
     assert store["rollout"] == {"deployment_id": "new"}
 
@@ -158,7 +166,7 @@ def test_rollout_slot_is_not_part_of_demand_capacity():
     server = Server()
     server.settings.max_containers = 8
     store = Store(a={"at": 1000, "active": 1000, "deployment_id": "old"})
-    reconcile(server, store, now=1000, deployment_id="new")
+    update_pool_capacity(server, store, now=1000, deployment_id="new")
     assert server.updates == [4]
     assert server.settings.max_containers == 8
 
@@ -181,7 +189,7 @@ def test_failed_update_does_not_record_success():
     server.autoscaler.update = fail
     store = Store(a={"at": 1000, "active": 136})
     with pytest.raises(RuntimeError):
-        reconcile(server, store, now=1000)
+        update_pool_capacity(server, store, now=1000)
     assert "controller" not in store
 
 

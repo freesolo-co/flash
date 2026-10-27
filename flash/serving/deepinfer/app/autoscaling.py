@@ -82,7 +82,7 @@ def rollout_ready(container_ids, samples, deployment_id, now):
     )
 
 
-def reconcile(server, store, *, now=None, deployment_id=""):
+def update_pool_capacity(server, store, *, now=None, deployment_id=""):
     """Adjust demand and restore the normal maximum after a warm handoff."""
     settings = server.autoscaler.settings()
     maximum = min(settings.max_containers or 0, MAIN_MAX_CONTAINERS)
