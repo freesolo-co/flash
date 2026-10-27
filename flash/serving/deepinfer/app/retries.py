@@ -10,11 +10,10 @@ ATTEMPTS = 3
 RETRY_SECONDS = 10
 
 
-async def open_generation(client, targets, headers, body, deadline, *, start=0):
+async def open_generation(client, resolve_endpoint, headers, body, deadline):
     loop = asyncio.get_running_loop()
     retry_deadline = min(deadline, loop.time() + RETRY_SECONDS)
     last = None
-    failed = set()
     for attempt in range(ATTEMPTS):
         if attempt:
             remaining = retry_deadline - loop.time()
@@ -22,19 +21,13 @@ async def open_generation(client, targets, headers, body, deadline, *, start=0):
                 break
             await asyncio.sleep(min(0.25 * 2 ** (attempt - 1), remaining))
         try:
-            endpoints = await asyncio.wait_for(asyncio.to_thread(targets), timeout=5)
+            endpoint = await asyncio.wait_for(asyncio.to_thread(resolve_endpoint), timeout=5)
         except Exception:
             # Discovery has not sent generation work and is also safe to retry.
             last = DeepInferError(503, "DeepInfer endpoint discovery failed")
             continue
-        if not endpoints:
-            last = DeepInferError(503, "DeepInfer has no ready replica")
-            continue
-        # Rotation is stable within an attempt and explicitly prefers a different
-        # ready replica after failure. With one replica this is a bounded retry.
-        candidates = endpoints[start % len(endpoints) :] + endpoints[: start % len(endpoints)]
-        endpoint = next((url for url in candidates if url not in failed), candidates[0])
-        failed.add(endpoint)
+        # Modal routes each attempt across its ready pool. We do not pin a stream
+        # or promise that a retry selects a different physical replica.
         request = client.build_request(
             "POST", endpoint + "/internal/generate", headers=headers, json=body
         )
@@ -62,7 +55,7 @@ async def open_generation(client, targets, headers, body, deadline, *, start=0):
         ):
             code = response.status_code
             await response.aclose()
-            last = DeepInferError(code, "DeepInfer replicas rejected admission")
+            last = DeepInferError(code, "DeepInfer pool rejected admission")
             continue
         return response
     if last is not None:

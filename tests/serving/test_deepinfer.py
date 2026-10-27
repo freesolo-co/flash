@@ -359,13 +359,13 @@ def test_modal_private_four_gpu_autoscaling_contract(
     assert captured["server"]["memory"] == 524288
     assert captured["server"]["min_containers"] == warm_replicas
     assert captured["server"]["max_containers"] == (
-        4 + bool(rollout_id) if environment == "main" else 1
+        (8 if rollout_id else 4) if environment == "main" else 1
     )
     assert captured["server"]["exit_grace_period"] == 3600
     assert captured["server"]["buffer_containers"] == 0
     assert captured["server"]["scaledown_window"] == 600
     assert captured["server"]["scaleup_window"] == 1
-    assert captured["server"]["max_concurrency"] == 128
+    assert captured["server"]["max_concurrency"] == 0
     assert captured["server"]["target_concurrency"] == (100 if environment == "main" else 8)
     assert ("controller" in captured) == (environment == "main")
     if environment == "main":

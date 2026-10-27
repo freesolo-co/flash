@@ -82,7 +82,7 @@ def test_verification_cannot_succeed_on_old_version_or_unrestored_cap(monkeypatc
     from flash.serving.deepinfer.app import rollout
 
     samples = {key: {"at": 1000, "active": 0, "deployment_id": "old"} for key in ("a", "b")}
-    settings = SimpleNamespace(max_containers=5)
+    settings = SimpleNamespace(max_containers=8)
     server = SimpleNamespace(
         _experimental_list_containers=lambda: [
             SimpleNamespace(container_id=key) for key in samples

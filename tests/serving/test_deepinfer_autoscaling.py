@@ -131,18 +131,18 @@ def test_disabled_pool_is_not_relaunched():
 @pytest.mark.parametrize(
     ("deployment_id", "second", "expected_cap"),
     [
-        ("new", {"at": 1000, "active": 0, "deployment_id": "old"}, 5),
-        ("new", {"at": 979, "active": 0, "deployment_id": "new"}, 5),
-        ("new", None, 5),
+        ("new", {"at": 1000, "active": 0, "deployment_id": "old"}, 8),
+        ("new", {"at": 979, "active": 0, "deployment_id": "new"}, 8),
+        ("new", None, 8),
         ("new", {"at": 1000, "active": 0, "deployment_id": "new"}, 4),
-        ("old", {"at": 1000, "active": 0, "deployment_id": "old"}, 5),
+        ("old", {"at": 1000, "active": 0, "deployment_id": "old"}, 8),
     ],
 )
 def test_rollout_slot_requires_fresh_replacements_and_the_current_controller(
     deployment_id, second, expected_cap
 ):
     server = Server(containers=("a", "b"))
-    server.settings.max_containers = 5
+    server.settings.max_containers = 8
     store = Store(
         a={"at": 1000, "active": 0, "deployment_id": deployment_id},
         rollout={"deployment_id": "new"},
@@ -156,11 +156,11 @@ def test_rollout_slot_requires_fresh_replacements_and_the_current_controller(
 
 def test_rollout_slot_is_not_part_of_demand_capacity():
     server = Server()
-    server.settings.max_containers = 5
+    server.settings.max_containers = 8
     store = Store(a={"at": 1000, "active": 1000, "deployment_id": "old"})
     reconcile(server, store, now=1000, deployment_id="new")
     assert server.updates == [4]
-    assert server.settings.max_containers == 5
+    assert server.settings.max_containers == 8
 
 
 def test_empty_pool_cannot_complete_a_rollout():

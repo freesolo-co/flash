@@ -36,18 +36,20 @@ POOL_SPARE_STREAMS = 64
 POOL_SAMPLE_SECONDS = 5
 POOL_SAMPLE_MAX_AGE = 20
 POOL_STATE_NAME = "freesolo-deepseek-pool-load"
-# Main can scale to 16 B200s; rolling deploys temporarily allow one extra group.
+# Main can scale to 16 B200s; rolling deploys allow a full replacement pool.
 MAIN_MIN_CONTAINERS = 1
 MAIN_MAX_CONTAINERS = 4
+MAIN_ROLLOUT_MAX_CONTAINERS = 2 * MAIN_MAX_CONTAINERS
 MAIN_BUFFER_CONTAINERS = 0
 MAX_CONTAINERS = 1
 BUFFER_CONTAINERS = 0
 SCALEDOWN_SECONDS = 600
 SCALEUP_SECONDS = 1
 STARTUP_SECONDS = 2700
-# Bound each generation to one hour. Model startup has its own separate budget;
-# an equal-length platform drain window does not add preparation/cleanup margin.
-REQUEST_SECONDS = 3600
+# The HTTP deadline includes preparation and streaming. Leave five minutes for
+# cancellation/cleanup inside Modal's one-hour native draining window.
+REQUEST_SECONDS = 55 * 60
+DRAIN_SECONDS = 60 * 60
 WORKER_STALL_SECONDS = 600
 STREAM_IDLE_SECONDS = 60
 PORT = 8000

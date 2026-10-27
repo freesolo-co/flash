@@ -1,4 +1,4 @@
-"""Pre-admission failover must never duplicate accepted or streamed work."""
+"""Native pool retries must never duplicate accepted or streamed work."""
 
 import asyncio
 import json
@@ -22,6 +22,9 @@ def anyio_backend():
 def credentials(monkeypatch):
     monkeypatch.setenv("DEEPINFER_PROXY_KEY", "key")
     monkeypatch.setenv("DEEPINFER_PROXY_SECRET", "secret")
+    monkeypatch.setattr(
+        "flash.serving.deepinfer.app.client.endpoint_url", lambda: "https://pool.modal.direct"
+    )
 
 
 def payload():
@@ -38,7 +41,7 @@ def success():
 
 @pytest.mark.anyio
 @pytest.mark.parametrize("failure", ["connect", "capacity", "draining"])
-async def test_failure_before_admission_uses_another_ready_replica(failure):
+async def test_failure_before_admission_retries_through_the_native_pool(failure):
     calls = []
 
     def handler(request):
@@ -54,13 +57,12 @@ async def test_failure_before_admission_uses_another_ready_replica(failure):
 
     pool = HostedDeepInfer(
         transport=httpx.MockTransport(handler),
-        targets=lambda: ["https://one.modal.direct", "https://two.modal.direct"],
     )
     try:
         await pool.generate(MODEL_ID, payload(), record())
     finally:
         await pool.aclose()
-    assert [r.url.host for r in calls] == ["one.modal.direct", "two.modal.direct"]
+    assert [r.url.host for r in calls] == ["pool.modal.direct", "pool.modal.direct"]
     assert calls[0].content == calls[1].content  # Same authorized generation and tenant namespace.
 
 
@@ -72,9 +74,7 @@ async def test_single_replica_retries_are_bounded():
         calls.append(request)
         raise httpx.ConnectError("not connected")
 
-    pool = HostedDeepInfer(
-        transport=httpx.MockTransport(handler), targets=lambda: ["https://one.modal.direct"]
-    )
+    pool = HostedDeepInfer(transport=httpx.MockTransport(handler))
     try:
         with pytest.raises(DeepInferError, match="transport failed"):
             await pool.generate(MODEL_ID, payload(), record())
@@ -95,7 +95,6 @@ async def test_connect_failure_fetching_accepted_result_never_replays_post():
 
     pool = HostedDeepInfer(
         transport=httpx.MockTransport(handler),
-        targets=lambda: ["https://one.modal.direct", "https://two.modal.direct"],
     )
     try:
         with pytest.raises(DeepInferError, match="transport failed"):
@@ -122,7 +121,6 @@ async def test_ambiguous_failure_or_started_stream_is_not_replayed(failure):
 
     pool = HostedDeepInfer(
         transport=httpx.MockTransport(handler),
-        targets=lambda: ["https://one.modal.direct", "https://two.modal.direct"],
     )
     try:
         with pytest.raises(DeepInferError):
@@ -133,20 +131,21 @@ async def test_ambiguous_failure_or_started_stream_is_not_replayed(failure):
 
 
 @pytest.mark.anyio
-async def test_transient_directory_failure_retries_before_sending_work():
+async def test_transient_endpoint_lookup_failure_retries_before_sending_work(monkeypatch):
     lookups, requests = [], []
 
-    def targets():
+    def resolve_endpoint():
         lookups.append(True)
         if len(lookups) == 1:
             raise RuntimeError("control plane temporarily unavailable")
-        return ["https://one.modal.direct"]
+        return "https://pool.modal.direct"
 
     def handler(request):
         requests.append(request)
         return success()
 
-    pool = HostedDeepInfer(transport=httpx.MockTransport(handler), targets=targets)
+    monkeypatch.setattr("flash.serving.deepinfer.app.client.endpoint_url", resolve_endpoint)
+    pool = HostedDeepInfer(transport=httpx.MockTransport(handler))
     try:
         await pool.generate(MODEL_ID, payload(), record())
     finally:
@@ -165,9 +164,7 @@ async def test_cancellation_during_retry_does_not_start_another_generation():
         called.set()
         return httpx.Response(503, headers={"X-DeepInfer-Retryable": "not-started"})
 
-    pool = HostedDeepInfer(
-        transport=httpx.MockTransport(handler), targets=lambda: ["https://one.modal.direct"]
-    )
+    pool = HostedDeepInfer(transport=httpx.MockTransport(handler))
     task = asyncio.create_task(pool.generate(MODEL_ID, payload(), record()))
     await called.wait()
     task.cancel()

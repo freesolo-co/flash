@@ -35,16 +35,14 @@ def test_deepinfer_rollout_cannot_report_success_before_warm_replacement():
     workflow = yaml.safe_load((WORKFLOW_DIR / "deploy-deepinfer.yml").read_text())
     assert workflow["concurrency"]["cancel-in-progress"] is False
     job = workflow["jobs"]["deploy"]
-    assert job["timeout-minutes"] >= 210
+    assert job["timeout-minutes"] >= 60
     assert "github.run_attempt" in job["env"]["DEEPINFER_ROLLOUT_ID"]
-    steps = [step for step in job["steps"] if "run" in step]
-    production = next(step for step in steps if "app.fleet_deploy" in step["run"])
-    assert production["if"] == "github.ref == 'refs/heads/main'"
-    assert "--stage-migration" not in production["run"]
-    # A monolithic redeploy would terminate two-hour streams after one hour.
-    native = [step for step in steps if "modal deploy" in step["run"]]
-    assert native
-    assert all(step["if"] == "github.ref == 'refs/heads/dev'" for step in native)
+    commands = [step["run"] for step in job["steps"] if "run" in step]
+    begin = next(i for i, cmd in enumerate(commands) if "app.rollout --begin" in cmd)
+    deploy = next(i for i, cmd in enumerate(commands) if "modal deploy" in cmd)
+    verify = next(i for i, cmd in enumerate(commands) if cmd.endswith("app.rollout"))
+    assert begin < deploy < verify
+    assert "--strategy rolling" in commands[deploy]
 
 
 def _workflow_paths() -> list[Path]:

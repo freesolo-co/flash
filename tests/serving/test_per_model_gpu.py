@@ -428,7 +428,7 @@ def test_deployed_timeouts_use_the_shared_serving_budget(modal_app_module):
     assert (
         max(
             timeouts.STARTUP_TIMEOUT_SECONDS + timeouts.REQUEST_TIMEOUT_SECONDS,
-            timeouts.DEEPINFER_STARTUP_SECONDS + timeouts.DEEPINFER_REQUEST_SECONDS,
+            timeouts.DEEPINFER_REQUEST_SECONDS,
         )
         == timeouts.ROUTER_TIMEOUT_SECONDS
     )

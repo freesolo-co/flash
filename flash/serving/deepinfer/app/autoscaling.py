@@ -11,6 +11,7 @@ from urllib.request import urlopen
 from flash.serving.deepinfer.contract.config import (
     MAIN_MAX_CONTAINERS,
     MAIN_MIN_CONTAINERS,
+    MAIN_ROLLOUT_MAX_CONTAINERS,
     POOL_SAMPLE_MAX_AGE,
     POOL_SAMPLE_SECONDS,
     POOL_SPARE_STREAMS,
@@ -82,7 +83,7 @@ def rollout_ready(container_ids, samples, deployment_id, now):
 
 
 def reconcile(server, store, *, now=None, deployment_id=""):
-    """Adjust demand and retire the temporary rollout slot after the handoff."""
+    """Adjust demand and restore the normal maximum after a warm handoff."""
     settings = server.autoscaler.settings()
     maximum = min(settings.max_containers or 0, MAIN_MAX_CONTAINERS)
     if maximum == 0:
@@ -92,7 +93,7 @@ def reconcile(server, store, *, now=None, deployment_id=""):
     now = time.time() if now is None else now
     active, complete = pool_load(container_ids, samples, now)
     if (
-        settings.max_containers == MAIN_MAX_CONTAINERS + 1
+        settings.max_containers == MAIN_ROLLOUT_MAX_CONTAINERS
         and samples.get("rollout", {}).get("deployment_id") == deployment_id
         and rollout_ready(container_ids, samples, deployment_id, now)
     ):

@@ -11,12 +11,13 @@ import modal
 from flash.serving.deepinfer.contract.config import (
     APP_NAME,
     BUFFER_CONTAINERS,
+    DRAIN_SECONDS,
     GPU,
     MAIN_BUFFER_CONTAINERS,
     MAIN_MAX_CONTAINERS,
     MAIN_MIN_CONTAINERS,
+    MAIN_ROLLOUT_MAX_CONTAINERS,
     MAX_CONTAINERS,
-    MAX_INPUTS,
     POOL_SAMPLE_SECONDS,
     POOL_STATE_NAME,
     POOL_STREAM_CAPACITY,
@@ -29,7 +30,7 @@ from flash.serving.deepinfer.contract.config import (
     TARGET_INPUTS,
 )
 
-# A unique rollout identity gates both completion and removal of the surge slot.
+# A unique rollout identity gates both completion and removal of surge capacity.
 # Normal deployments retain the steady-state cap; CI explicitly enables overlap.
 deployment_id = os.environ.get("DEEPINFER_ROLLOUT_ID", "")
 
@@ -94,7 +95,7 @@ def _watch_server(process):
     memory=524288,  # Engram host storage and loading peaked above 300 GiB in qualification.
     volumes={"/weights": weights},
     min_containers=MAIN_MIN_CONTAINERS if main_environment else 0,
-    max_containers=(MAIN_MAX_CONTAINERS + bool(deployment_id))
+    max_containers=(MAIN_ROLLOUT_MAX_CONTAINERS if deployment_id else MAIN_MAX_CONTAINERS)
     if main_environment
     else MAX_CONTAINERS,
     buffer_containers=MAIN_BUFFER_CONTAINERS if main_environment else BUFFER_CONTAINERS,
@@ -104,10 +105,12 @@ def _watch_server(process):
     # Native scaling is a fallback. The controller raises the floor at pool-wide
     # reserve thresholds; this higher target cannot undo that floor.
     target_concurrency=POOL_STREAM_CAPACITY if main_environment else TARGET_INPUTS,
-    max_concurrency=MAX_INPUTS,
+    # Application admission caps generations at MAX_INPUTS and marks safe
+    # pre-admission rejections for retries; proxy rejections cannot attest that.
+    max_concurrency=0,
     port=PORT,
     unauthenticated=False,
-    exit_grace_period=3600,
+    exit_grace_period=DRAIN_SECONDS,
 )
 class Engine:
     @modal.enter()

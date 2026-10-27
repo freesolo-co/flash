@@ -8,14 +8,12 @@ from urllib.parse import urlsplit
 
 import httpx
 
-from flash.serving.deepinfer.app.endpoints import replica_endpoints
 from flash.serving.deepinfer.app.events import chat_body
 from flash.serving.deepinfer.app.retries import open_generation
 from flash.serving.deepinfer.contract.config import (
     APP_NAME,
     MODEL_ID,
     REQUEST_SECONDS,
-    STARTUP_SECONDS,
     STREAM_IDLE_SECONDS,
 )
 from flash.serving.deepinfer.contract.errors import DeepInferError
@@ -77,11 +75,9 @@ async def _stream_lines(response, deadline):
 
 
 class HostedDeepInfer:
-    def __init__(self, *, transport=None, targets=None):
-        self._targets = targets or replica_endpoints
-        self._next_replica = 0
+    def __init__(self, *, transport=None):
         self._client = httpx.AsyncClient(
-            timeout=httpx.Timeout(STARTUP_SECONDS + REQUEST_SECONDS, connect=30),
+            timeout=httpx.Timeout(REQUEST_SECONDS, connect=30),
             transport=transport,
             follow_redirects=True,
             max_redirects=32,
@@ -107,15 +103,13 @@ class HostedDeepInfer:
             "Accept": "text/event-stream",
         }
         terminal = False
-        deadline = asyncio.get_running_loop().time() + STARTUP_SECONDS + REQUEST_SECONDS
+        deadline = asyncio.get_running_loop().time() + REQUEST_SECONDS
         try:
             # A disconnect closes only this response; other streams keep their pooled connections.
             async with asyncio.timeout_at(deadline):
-                start = self._next_replica
-                self._next_replica += 1
                 response = await open_generation(
                     self._client,
-                    self._targets,
+                    endpoint_url,
                     headers,
                     {
                         "chat": body,
@@ -123,7 +117,6 @@ class HostedDeepInfer:
                         "cache_namespace": getattr(payload, "_cache_namespace", None),
                     },
                     deadline,
-                    start=start,
                 )
             try:
                 if response.status_code != 200:
