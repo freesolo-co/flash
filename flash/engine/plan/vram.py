@@ -734,7 +734,7 @@ def _catalog_model_required_vram_gb(
     # Pinned revisions use their validated params/vocab, not unverified catalog layer geometry.
     # The model's runtime memory allowance still applies independently of that geometry.
     sizing_info = None if model_revision else info
-    rollout_cache_min_gb = info.rollout_cache_min_gb
+    rollout_cache_min_gb = getattr(info, "rollout_cache_min_gb", 0.0)
     active_b = float(getattr(sizing_info, "active_params_b", 0.0) or 0.0)
     need = _model_vram_need(
         params_b or 4.0,

@@ -565,7 +565,7 @@ def resolve_gpu_mem_util(
             active_params_b=float(getattr(info, "active_params_b", 0.0) or 0.0) or None,
             fp8_kv=fp8_kv,
             model_info=info,
-            rollout_cache_min_gb=catalog_info.rollout_cache_min_gb if catalog_info else 0.0,
+            rollout_cache_min_gb=getattr(catalog_info, "rollout_cache_min_gb", 0.0),
             preserve_parameter_floor=preserve_parameter_floor,
             tensor_parallel=n_gpus,
             lora_rank=int(inp["lora_rank"]),
