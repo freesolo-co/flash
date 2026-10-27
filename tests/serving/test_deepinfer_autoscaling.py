@@ -15,7 +15,7 @@ class Store(dict):
 
 
 class Server:
-    def __init__(self, floor=2, containers=("a",)):
+    def __init__(self, floor=1, containers=("a",)):
         self.settings = SimpleNamespace(min_containers=floor, max_containers=4)
         self.containers = containers
         self.updates = []
@@ -35,8 +35,8 @@ class Server:
 @pytest.mark.parametrize(
     ("active", "expected"),
     [
-        (0, 2),
-        (35, 2),
+        (0, 1),
+        (35, 1),
         (36, 2),
         (72, 2),
         (100, 2),
@@ -75,7 +75,7 @@ def test_no_oscillation_after_third_container_starts_and_delayed_scale_down():
     assert server.updates == [3]
     store.update(a={"at": 2305, "active": 0}, b={"at": 2305, "active": 0})
     reconcile(server, store, now=2305)
-    assert server.updates == [3, 2]
+    assert server.updates == [3, 1]
 
 
 @pytest.mark.parametrize(
@@ -167,7 +167,7 @@ def test_empty_pool_cannot_complete_a_rollout():
     from flash.serving.deepinfer.app.autoscaling import rollout_ready
 
     assert not rollout_ready(set(), {}, "new", 1000)
-    assert not rollout_ready(
+    assert rollout_ready(
         {"a"}, {"a": {"at": 1000, "active": 0, "deployment_id": "new"}}, "new", 1000
     )
 

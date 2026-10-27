@@ -291,7 +291,7 @@ def test_native_image_patch_rejects_unknown_source():
 
 
 @pytest.mark.parametrize(
-    ("environment", "warm_replicas"), [("main", 2), ("dev", 0), ("test", 0), (None, 0)]
+    ("environment", "warm_replicas"), [("main", 1), ("dev", 0), ("test", 0), (None, 0)]
 )
 @pytest.mark.parametrize("rollout_id", ["", "test-rollout"])
 def test_modal_private_four_gpu_autoscaling_contract(

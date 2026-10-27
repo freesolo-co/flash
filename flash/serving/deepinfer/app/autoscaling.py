@@ -23,7 +23,7 @@ logger = logging.getLogger(__name__)
 
 
 def required_containers(active: int, maximum: int = MAIN_MAX_CONTAINERS) -> int:
-    """Keep two warm replicas; add a third at 136 and a fourth at 236."""
+    """Keep one warm replica; add capacity at 36, 136, and 236 active requests."""
     return min(
         maximum, max(MAIN_MIN_CONTAINERS, (active + POOL_SPARE_STREAMS) // POOL_STREAM_CAPACITY + 1)
     )
