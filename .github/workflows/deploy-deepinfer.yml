@@ -11,6 +11,11 @@ on:
       - uv.lock
       - .github/workflows/deploy-deepinfer.yml
   workflow_dispatch:
+    inputs:
+      warm_replacement:
+        description: Start a GPU replacement and verify a warm main-pool handoff
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -28,7 +33,7 @@ jobs:
       MODAL_ENVIRONMENT: ${{ github.ref_name == 'main' && 'main' || 'dev' }}
       MODAL_TOKEN_ID: ${{ secrets.MODAL_TOKEN_ID }}
       MODAL_TOKEN_SECRET: ${{ secrets.MODAL_TOKEN_SECRET }}
-      DEEPINFER_ROLLOUT_ID: ${{ github.ref_name == 'main' && format('{0}-{1}', github.run_id, github.run_attempt) || '' }}
+      DEEPINFER_ROLLOUT_ID: ${{ github.ref_name == 'main' && inputs.warm_replacement == true && format('{0}-{1}', github.run_id, github.run_attempt) || '' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
@@ -38,10 +43,10 @@ jobs:
       - name: Install deployment dependencies
         run: uv sync --extra serving --locked --no-dev
       - name: Mark this rolling deployment before enabling overlap
-        if: github.ref == 'refs/heads/main'
+        if: env.DEEPINFER_ROLLOUT_ID != ''
         run: uv run --no-sync python -m flash.serving.deepinfer.app.rollout --begin
       - name: Deploy private DeepInfer pool
         run: uv run --no-sync modal deploy --strategy rolling --env "$MODAL_ENVIRONMENT" -m flash.serving.deepinfer.app.modal_app
       - name: Verify warm replacement and restore steady capacity
-        if: github.ref == 'refs/heads/main'
+        if: env.DEEPINFER_ROLLOUT_ID != ''
         run: uv run --no-sync python -m flash.serving.deepinfer.app.rollout
