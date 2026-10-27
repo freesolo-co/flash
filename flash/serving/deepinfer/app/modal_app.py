@@ -94,7 +94,11 @@ def _watch_server(process):
     cpu=32,
     memory=524288,  # Engram host storage and loading peaked above 300 GiB in qualification.
     volumes={"/weights": weights},
-    min_containers=MAIN_MIN_CONTAINERS if main_environment else 0,
+    # CI warms one replacement to verify a rolling handoff. The controller releases
+    # this temporary floor after the idle window; ordinary starts remain at zero.
+    min_containers=(max(1, MAIN_MIN_CONTAINERS) if deployment_id else MAIN_MIN_CONTAINERS)
+    if main_environment
+    else 0,
     max_containers=(MAIN_ROLLOUT_MAX_CONTAINERS if deployment_id else MAIN_MAX_CONTAINERS)
     if main_environment
     else MAX_CONTAINERS,

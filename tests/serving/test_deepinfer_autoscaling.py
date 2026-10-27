@@ -39,7 +39,8 @@ class Server:
 @pytest.mark.parametrize(
     ("active", "expected"),
     [
-        (0, 1),
+        (0, 0),
+        (1, 1),
         (35, 1),
         (36, 2),
         (72, 2),
@@ -83,7 +84,21 @@ def test_no_oscillation_after_third_container_starts_and_delayed_scale_down():
     assert server.updates == [3]
     store.update(a={"at": 2305, "active": 0}, b={"at": 2305, "active": 0})
     update_pool_capacity(server, store, now=2305)
-    assert server.updates == [3, 1]
+    assert server.updates == [3, 0]
+
+
+@pytest.mark.parametrize("floor", [0, None])
+def test_empty_idle_pool_stays_at_zero_until_native_request_startup(floor):
+    server = Server(floor=floor, containers=())
+    store = Store(dead={"at": 900, "active": 1000})
+    for now in range(1000, 1705, 5):
+        assert update_pool_capacity(server, store, now=now)["floor"] == 0
+    assert not server.updates
+    assert "dead" not in store
+    server.containers = ("a",)
+    store["a"] = {"at": 1705, "active": 1}
+    assert update_pool_capacity(server, store, now=1705)["floor"] == 1
+    assert server.updates == [1]
 
 
 @pytest.mark.parametrize(

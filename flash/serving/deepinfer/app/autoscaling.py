@@ -24,7 +24,9 @@ logger = logging.getLogger(__name__)
 
 
 def required_containers(active: int, maximum: int = MAIN_MAX_CONTAINERS) -> int:
-    """Keep one warm replica; add capacity at 36, 136, and 236 active requests."""
+    """Idle at zero; add capacity at 1, 36, 136, and 236 active requests."""
+    if active == 0:
+        return MAIN_MIN_CONTAINERS
     return min(
         maximum, max(MAIN_MIN_CONTAINERS, (active + POOL_SPARE_STREAMS) // POOL_STREAM_CAPACITY + 1)
     )
@@ -76,7 +78,7 @@ def rollout_ready(container_ids, samples, deployment_id, now):
     _, complete = pool_load(container_ids, samples, now)
     return (
         bool(deployment_id)
-        and len(container_ids) >= MAIN_MIN_CONTAINERS
+        and bool(container_ids)
         and complete
         and all(samples[key].get("deployment_id") == deployment_id for key in container_ids)
     )
@@ -85,6 +87,7 @@ def rollout_ready(container_ids, samples, deployment_id, now):
 def update_pool_capacity(server, store, *, now=None, deployment_id=""):
     """Adjust demand and restore the normal maximum after a warm handoff."""
     settings = server.autoscaler.settings()
+    current = settings.min_containers or 0
     maximum = min(settings.max_containers or 0, MAIN_MAX_CONTAINERS)
     if maximum == 0:
         return None  # Respect an operator disabling the pool.
@@ -101,17 +104,14 @@ def update_pool_capacity(server, store, *, now=None, deployment_id=""):
         server.autoscaler.update(max_containers=MAIN_MAX_CONTAINERS)
     state = samples.get("controller", {})
     # A controller interruption or floor change breaks the continuous quiet period.
-    if (
-        not 0 <= now - state.get("at", 0) <= POOL_SAMPLE_MAX_AGE
-        or state.get("floor") != settings.min_containers
-    ):
+    if not 0 <= now - state.get("at", 0) <= POOL_SAMPLE_MAX_AGE or state.get("floor") != current:
         state = {}
-    floor, below_since = next_floor(settings.min_containers, active, complete, state, now, maximum)
-    if floor != settings.min_containers:
+    floor, below_since = next_floor(current, active, complete, state, now, maximum)
+    if floor != current:
         server.autoscaler.update(min_containers=floor)
         logger.warning(
             "DeepSeek pool floor %s -> %s (active=%s, complete=%s)",
-            settings.min_containers,
+            current,
             floor,
             active,
             complete,
