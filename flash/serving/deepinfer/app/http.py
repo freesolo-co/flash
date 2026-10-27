@@ -130,6 +130,7 @@ def build_app(runtime, *, manage_lifecycle=True):
             raise HTTPException(503, "DeepInfer replica is unavailable") from exc
         return {
             "status": "ok",
+            "deployment_id": os.environ.get("DEEPINFER_ROLLOUT_ID", ""),
             "model": MODEL_ID,
             "model_revision": MODEL_REVISION,
             "runtime_revision": RUNTIME_REVISION,
@@ -156,6 +157,8 @@ def main():
     from flash.serving.deepinfer.contract.config import PORT
     from flash.serving.deepinfer.runtime.bridge import Runtime
 
+    # Uvicorn binds the port only AFTER lifespan startup (including every warmup)
+    # completes. Modal uses that listening port as its rollout readiness gate.
     uvicorn.run(build_app(Runtime()), host="0.0.0.0", port=PORT, timeout_graceful_shutdown=10)
 
 

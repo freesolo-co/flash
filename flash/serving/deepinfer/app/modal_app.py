@@ -29,6 +29,10 @@ from flash.serving.deepinfer.contract.config import (
     TARGET_INPUTS,
 )
 
+# A unique rollout identity gates both completion and removal of the surge slot.
+# Normal deployments retain the steady-state cap; CI explicitly enables overlap.
+deployment_id = os.environ.get("DEEPINFER_ROLLOUT_ID", "")
+
 # The pinned image already contains the patched native extension and dependencies.
 image = (
     modal.Image.from_id(RUNTIME_IMAGE_ID)
@@ -39,6 +43,7 @@ image = (
             "VIRTUAL_ENV": "/opt/deepinfer-venv",
             "DEEPINFER_ACCELERATOR": "nvidia",
             "PYTHONUNBUFFERED": "1",
+            "DEEPINFER_ROLLOUT_ID": deployment_id,
         }
     )
     .add_local_python_source("flash", copy=True)
@@ -51,8 +56,10 @@ pool_load = (
 )
 
 if main_environment:
-    controller_image = modal.Image.debian_slim(python_version="3.12").add_local_python_source(
-        "flash", copy=True
+    controller_image = (
+        modal.Image.debian_slim(python_version="3.12")
+        .env({"DEEPINFER_ROLLOUT_ID": deployment_id})
+        .add_local_python_source("flash", copy=True)
     )
 
     @app.function(
@@ -67,7 +74,9 @@ if main_environment:
     def scale_pool():
         from flash.serving.deepinfer.app.autoscaling import reconcile
 
-        return reconcile(modal.Server.from_name(APP_NAME, "Engine"), pool_load)
+        return reconcile(
+            modal.Server.from_name(APP_NAME, "Engine"), pool_load, deployment_id=deployment_id
+        )
 
 
 def _watch_server(process):
@@ -85,7 +94,9 @@ def _watch_server(process):
     memory=524288,  # Engram host storage and loading peaked above 300 GiB in qualification.
     volumes={"/weights": weights},
     min_containers=MAIN_MIN_CONTAINERS if main_environment else 0,
-    max_containers=MAIN_MAX_CONTAINERS if main_environment else MAX_CONTAINERS,
+    max_containers=(MAIN_MAX_CONTAINERS + bool(deployment_id))
+    if main_environment
+    else MAX_CONTAINERS,
     buffer_containers=MAIN_BUFFER_CONTAINERS if main_environment else BUFFER_CONTAINERS,
     scaledown_window=SCALEDOWN_SECONDS,
     scaleup_window=SCALEUP_SECONDS,

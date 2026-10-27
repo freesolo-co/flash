@@ -23,7 +23,7 @@ logger = logging.getLogger(__name__)
 
 
 def required_containers(active: int, maximum: int = MAIN_MAX_CONTAINERS) -> int:
-    """Add a replica at the reserve boundary: 36 -> 2, 136 -> 3."""
+    """Keep two warm replicas; add a third at 136 and a fourth at 236."""
     return min(
         maximum, max(MAIN_MIN_CONTAINERS, (active + POOL_SPARE_STREAMS) // POOL_STREAM_CAPACITY + 1)
     )
@@ -70,8 +70,19 @@ def next_floor(current, active, complete, state, now, maximum):
     return current, below_since
 
 
-def reconcile(server, store, *, now=None):
-    """One serialized CPU-controller tick; never change caps, buffers or routing."""
+def rollout_ready(container_ids, samples, deployment_id, now):
+    """Every routable replica must report this rollout after completing warmup."""
+    _, complete = pool_load(container_ids, samples, now)
+    return (
+        bool(deployment_id)
+        and len(container_ids) >= MAIN_MIN_CONTAINERS
+        and complete
+        and all(samples[key].get("deployment_id") == deployment_id for key in container_ids)
+    )
+
+
+def reconcile(server, store, *, now=None, deployment_id=""):
+    """Adjust demand and retire the temporary rollout slot after the handoff."""
     settings = server.autoscaler.settings()
     maximum = min(settings.max_containers or 0, MAIN_MAX_CONTAINERS)
     if maximum == 0:
@@ -80,6 +91,13 @@ def reconcile(server, store, *, now=None):
     samples = dict(store.items())
     now = time.time() if now is None else now
     active, complete = pool_load(container_ids, samples, now)
+    if (
+        settings.max_containers == MAIN_MAX_CONTAINERS + 1
+        and samples.get("rollout", {}).get("deployment_id") == deployment_id
+        and rollout_ready(container_ids, samples, deployment_id, now)
+    ):
+        # The scheduled controller owns cleanup even if the deploying client exits.
+        server.autoscaler.update(max_containers=MAIN_MAX_CONTAINERS)
     state = samples.get("controller", {})
     # A controller interruption or floor change breaks the continuous quiet period.
     if (
@@ -101,7 +119,7 @@ def reconcile(server, store, *, now=None):
     # Finished containers are not demand. Remove their old reports without touching live ones.
     for key, value in samples.items():
         if (
-            key != "controller"
+            key not in {"controller", "rollout"}
             and key not in container_ids
             and now - value.get("at", now) > POOL_SAMPLE_MAX_AGE
         ):
@@ -117,7 +135,12 @@ def report_load(process, store, container_id):
                 health = json.load(response)
             if health["status"] == "ok":
                 store.put(
-                    container_id, {"at": time.time(), "active": health["active_http_requests"]}
+                    container_id,
+                    {
+                        "at": time.time(),
+                        "active": health["active_http_requests"],
+                        "deployment_id": health.get("deployment_id", ""),
+                    },
                 )
         except Exception:
             logger.debug("DeepSeek load heartbeat unavailable", exc_info=True)

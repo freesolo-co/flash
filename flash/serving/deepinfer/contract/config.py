@@ -36,9 +36,9 @@ POOL_SPARE_STREAMS = 64
 POOL_SAMPLE_SECONDS = 5
 POOL_SAMPLE_MAX_AGE = 20
 POOL_STATE_NAME = "freesolo-deepseek-pool-load"
-# Main can scale to twelve B200s; other environments remain one group, idle at zero.
-MAIN_MIN_CONTAINERS = 1
-MAIN_MAX_CONTAINERS = 3
+# Main can scale to 16 B200s; rolling deploys temporarily allow one extra group.
+MAIN_MIN_CONTAINERS = 2
+MAIN_MAX_CONTAINERS = 4
 MAIN_BUFFER_CONTAINERS = 0
 MAX_CONTAINERS = 1
 BUFFER_CONTAINERS = 0
