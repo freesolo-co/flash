@@ -14,8 +14,10 @@ from fastapi import FastAPI, HTTPException, Request
 from flash.serve.contract.protocol import MAX_CHAT_REQUEST_BYTES
 from flash.serving.deepinfer.contract.config import (
     GPU_COUNT,
+    MAX_INPUTS,
     MODEL_ID,
     MODEL_REVISION,
+    REQUEST_SECONDS,
     RUNTIME_REVISION,
 )
 from flash.serving.src.http.body_limit import RequestBodyLimitMiddleware
@@ -92,12 +94,59 @@ class _GenerationCount:
             and scope.get("method") == "POST"
         )
         if generation:
+            if self.counts["active"] >= MAX_INPUTS:
+                from starlette.responses import JSONResponse
+
+                await JSONResponse(
+                    {"detail": "DeepInfer replica is not accepting new requests"},
+                    status_code=429,
+                    headers={"X-DeepInfer-Retryable": "not-started"},
+                )(scope, receive, send)
+                return
             self.counts["active"] += 1
         try:
-            await self.app(scope, receive, send)
+            if generation:
+                await _bounded_request(self.app, scope, receive, send)
+            else:
+                await self.app(scope, receive, send)
         finally:
             if generation:
                 self.counts["active"] -= 1
+
+
+async def _bounded_request(app, scope, receive, send):
+    """One deadline covers upload, preparation, generation, and stream delivery."""
+    started = completed = sse = False
+
+    async def track(message):
+        nonlocal started, completed, sse
+        if message["type"] == "http.response.start":
+            started = True
+            sse = b"text/event-stream" in dict(message.get("headers", [])).get(b"content-type", b"")
+        await send(message)
+        if message["type"] == "http.response.body" and not message.get("more_body", False):
+            completed = True
+
+    deadline = asyncio.timeout(REQUEST_SECONDS)
+    try:
+        async with deadline:
+            await app(scope, receive, track)
+    except TimeoutError:
+        if not deadline.expired():
+            raise
+        # Cancellation unwinds the stream and its bounded native abort handshake
+        # before responding. Never mark a timeout as safe to replay.
+        with contextlib.suppress(TimeoutError, OSError):
+            async with asyncio.timeout(5):
+                if not started:
+                    from starlette.responses import JSONResponse
+
+                    await JSONResponse(
+                        {"detail": "DeepInfer request deadline exceeded"}, status_code=504
+                    )(scope, receive, send)
+                elif not completed:
+                    error = b'data: {"type":"error"}\n\n' if sse else b'{"type":"error"}\n'
+                    await send({"type": "http.response.body", "body": error, "more_body": False})
 
 
 def build_app(runtime, *, manage_lifecycle=True):
@@ -130,6 +179,7 @@ def build_app(runtime, *, manage_lifecycle=True):
             raise HTTPException(503, "DeepInfer replica is unavailable") from exc
         return {
             "status": "ok",
+            "deployment_id": os.environ.get("DEEPINFER_ROLLOUT_ID", ""),
             "model": MODEL_ID,
             "model_revision": MODEL_REVISION,
             "runtime_revision": RUNTIME_REVISION,
@@ -138,6 +188,7 @@ def build_app(runtime, *, manage_lifecycle=True):
             "loaded_ranks": getattr(runtime, "provenance", {}),
             "active_requests": len(getattr(runtime, "pending", {})),
             "active_http_requests": counts["active"],
+            "request_timeout_seconds": REQUEST_SECONDS,
             "compiled_kernel_cache_verified": getattr(
                 runtime, "compiled_kernel_cache_verified", False
             ),
@@ -156,6 +207,8 @@ def main():
     from flash.serving.deepinfer.contract.config import PORT
     from flash.serving.deepinfer.runtime.bridge import Runtime
 
+    # Uvicorn binds the port only AFTER lifespan startup (including every warmup)
+    # completes. Modal uses that listening port as its rollout readiness gate.
     uvicorn.run(build_app(Runtime()), host="0.0.0.0", port=PORT, timeout_graceful_shutdown=10)
 
 
