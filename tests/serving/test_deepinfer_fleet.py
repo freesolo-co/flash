@@ -201,3 +201,81 @@ def test_four_replica_rollout_replaces_one_at_a_time_without_capacity_collapse()
                 ops.gone.add(item["name"])
     assert len(store["fleet"]["replicas"]) == 4
     assert all(item["version"] == "new" for item in store["fleet"]["replicas"])
+
+
+def test_established_route_survives_probe_loss_only_within_bounded_grace():
+    store, ops = setup(entry("one", "new"))
+    ops.loads["one"] = 0
+    reconcile_fleet(store, ops, now=100)
+    # A new controller instance must recover readiness from the shared ledger.
+    ops = Ops(store)
+    for now in (105, 110, 120):
+        reconcile_fleet(store, ops, now=now)
+        assert store["routes"]["endpoints"] == ["https://one.modal.direct"]
+    reconcile_fleet(store, ops, now=121)
+    assert store["routes"]["endpoints"] == []
+    assert ops.stops == []
+    ops.loads["one"] = 0
+    reconcile_fleet(store, ops, now=125)
+    assert store["routes"]["endpoints"] == ["https://one.modal.direct"]
+
+
+@pytest.mark.parametrize("phase", ["warming", "active"])
+def test_a_replica_without_a_successful_probe_never_gets_routing_grace(phase):
+    store, ops = setup(entry("one", "new", phase))
+    for now in (0, 5, 20):
+        reconcile_fleet(store, ops, now=now)
+        assert store["routes"]["endpoints"] == []
+
+
+def test_explicit_drain_revokes_grace_even_if_the_next_probe_is_missing():
+    store, ops = setup(entry("one", "new"))
+    ops.loads["one"] = 0
+    reconcile_fleet(store, ops, now=100)
+    ops.drains.append("one")
+    reconcile_fleet(store, ops, now=105)
+    assert store["routes"]["endpoints"] == []
+    ops.loads.clear()
+    reconcile_fleet(store, ops, now=110)
+    assert store["routes"]["endpoints"] == []
+
+
+def test_draining_phase_overrides_recent_healthy_readiness_when_probe_is_lost():
+    store, ops = setup(entry("one", "new"))
+    ops.loads["one"] = 0
+    reconcile_fleet(store, ops, now=100)
+    store["fleet"]["replicas"][0]["phase"] = "draining"
+    ops.loads.clear()
+    reconcile_fleet(store, ops, now=105)
+    assert store["routes"]["endpoints"] == []
+    assert ops.stops == []
+
+
+def test_routing_grace_is_not_fresh_load_for_scale_down():
+    store, ops = setup(entry("one", "new"), entry("two", "new"))
+    ops.loads = {"one": 0, "two": 0}
+    for now in range(0, 600, 5):
+        reconcile_fleet(store, ops, now=now)
+    del ops.loads["one"]
+    reconcile_fleet(store, ops, now=600)
+    assert len(store["routes"]["endpoints"]) == 2
+    assert store["fleet"]["quiet_since"] is None
+    assert ops.drains == []
+
+
+@pytest.mark.parametrize("probe", ["missing", "draining"])
+def test_retiring_a_predecessor_requires_a_fresh_non_draining_replacement(probe):
+    store, ops = setup(entry("old", "new"), entry("replacement", "new"))
+    ops.loads = {"old": 10, "replacement": 10}
+    reconcile_fleet(store, ops, now=100)
+    store["fleet"]["replicas"][0]["version"] = "old"
+    store["fleet"]["replicas"][1]["replaces"] = "old"
+    if probe == "missing":
+        del ops.loads["replacement"]
+    else:
+        ops.drains.append("replacement")
+    reconcile_fleet(store, ops, now=105)
+    assert "https://old.modal.direct" in store["routes"]["endpoints"]
+    assert store["fleet"]["replicas"][0]["phase"] == "active"
+    assert "old" not in ops.drains
+    assert ops.stops == []

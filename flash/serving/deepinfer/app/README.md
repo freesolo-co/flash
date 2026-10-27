@@ -54,6 +54,14 @@ slot until Modal confirms the container is gone. Normal operation permits four
 slots, with one extra only while replacing a previous version. Existing replicas
 stay up when replacement provisioning or warmup fails.
 
+An established active route survives missing health probes for up to 20 seconds
+after its last successful, non-draining probe. Readiness timestamps persist in the
+ledger across controller restarts; failed probes never extend that grace period.
+Explicit drain acknowledgments and draining/stopping phases exclude the replica
+immediately. A replica that has never passed readiness is never routed. This grace
+only preserves routing: stale telemetry cannot authorize scale-down or retirement
+of a predecessor during rollout.
+
 Scale-down requires 600 seconds of fresh lower demand. Missing health data and
 controller interruptions reset that period. Scale-down fences admissions and
 waits for active requests to reach zero, just like a rollout. Each GPU App has

@@ -15,13 +15,13 @@ from flash.serving.deepinfer.contract.config import (
 )
 
 
-def publish(store, state, health):
+def publish(store, state, *, now):
     endpoints = [
         item["url"]
         for item in state["replicas"]
         if item["phase"] == "active"
-        and item["name"] in health
-        and not health[item["name"]]["draining"]
+        and item.get("last_ready_at") is not None
+        and 0 <= now - item["last_ready_at"] <= POOL_SAMPLE_MAX_AGE
     ]
     if (
         not endpoints
@@ -82,22 +82,33 @@ def reconcile_fleet(store, ops, *, now):
         sample = ops.health(item)
         if sample is not None:
             health[item["name"]] = sample
+            if sample["draining"]:
+                item.pop("last_ready_at", None)
+            else:
+                item["last_ready_at"] = now
             if item["phase"] == "warming" and not sample["draining"]:
                 item["phase"] = "active"
                 save(store, state)
 
+    # Persist readiness across controller restarts. Probe loss retains an already
+    # established route briefly, but never refreshes its age or load telemetry.
+    save(store, state)
     # Publish a warmed replacement before fencing old versions. Every stale-route
     # request then gets an explicit not-started rejection, safe to retry elsewhere.
-    publish(store, state, health)
+    publish(store, state, now=now)
     for replacement in entries:
-        if replacement["phase"] != "active" or replacement["name"] not in health:
+        if (
+            replacement["phase"] != "active"
+            or replacement["name"] not in health
+            or health[replacement["name"]]["draining"]
+        ):
             continue
         for item in entries:
             if item["name"] == replacement.get("replaces") and item["phase"] == "active":
                 item["phase"] = "draining"
     state["at"] = now
     save(store, state)
-    publish(store, state, health)
+    publish(store, state, now=now)
 
     for item in entries:
         if item["phase"] != "draining" or not item.get("url"):
@@ -129,7 +140,7 @@ def reconcile_fleet(store, ops, *, now):
     else:
         state["quiet_since"] = None
     save(store, state)
-    publish(store, state, health)
+    publish(store, state, now=now)
 
     old = transitioning
     limit = MAIN_MAX_CONTAINERS + int(old)
