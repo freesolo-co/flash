@@ -22,7 +22,7 @@ retain their separate vLLM images and capacity.
 | Output | Up to the remaining context budget; 350,000-token completions fit with shorter input |
 | Placement | US compute, US East routing |
 | Host allocation | 32 CPUs / 512 GiB RAM |
-| Startup / request budget | 45 minutes / two hours |
+| Startup / generation budget | 45 minutes / one hour |
 | Failure bounds | Ten-minute native-worker watchdog; 60-second HTTP stream idle timeout |
 | Idle scale-down | 600 seconds; main retains its minimum, dev scales to zero |
 
@@ -189,17 +189,18 @@ and all warmup to finish, then publishes its authenticated URL. It replaces old
 replicas one at a time so a four-container pool retains serving capacity. It
 removes the predecessor from routing, atomically fences new admissions, and keeps
 its App deployed until the drain endpoint confirms zero complete HTTP lifetimes.
-Only then does it stop the old App. Requests already accepted can finish beyond
-one hour; there is no retirement timer that kills them. Stale-directory requests
+Only then does it stop the old App. Generation is capped at one hour, separately
+from startup. Preparation and cleanup also count toward draining; no retirement
+timer kills that work. Stale-directory requests
 get an explicit safe rejection and can retry on a ready replacement. Restarted
 replicas restore their drain gate before opening the serving port. Missing drain
 telemetry never authorizes termination. Application and hardware failures can
 still interrupt streams.
 
-CI waits up to three hours for warmup and retirement and fails if the transition
+CI waits up to two hours for warmup and retirement and fails if the transition
 is incomplete. It never kills old work to meet that deadline; the controller
 continues after CI disconnects. A saturated multi-replica rollout can take longer
-because each predecessor can retain two-hour streams. Serialize manual deployments
+because each predecessor can retain hour-long generations. Serialize manual deployments
 with CI. An atomic controller lock without a lease timer prevents old/new controller code
 from mutating the ledger concurrently. If a hard kill strands the lock, verify
 that no previous controller invocation or provisioning call remains running

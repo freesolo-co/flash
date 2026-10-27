@@ -45,9 +45,9 @@ BUFFER_CONTAINERS = 0
 SCALEDOWN_SECONDS = 600
 SCALEUP_SECONDS = 1
 STARTUP_SECONDS = 2700
-# A 350K-token completion takes almost an hour at 100 tokens/s. Leave room for
-# prefill and rate variation while retaining a finite generation deadline.
-REQUEST_SECONDS = 7200
+# Bound each generation to one hour. Model startup has its own separate budget;
+# an equal-length platform drain window does not add preparation/cleanup margin.
+REQUEST_SECONDS = 3600
 WORKER_STALL_SECONDS = 600
 STREAM_IDLE_SECONDS = 60
 PORT = 8000
