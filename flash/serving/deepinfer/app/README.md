@@ -11,7 +11,7 @@ retain their separate vLLM images and capacity.
 | Setting | Value |
 | --- | --- |
 | GPU allocation | Four B200s on one physical machine per container (`B200:4`) |
-| Main | One warm container, maximum four (16 B200s total), zero buffer containers |
+| Main | Zero idle containers, maximum four (16 B200s total), zero buffer containers |
 | Main rolling deployment | Temporarily allow up to eight containers (32 B200s) for old/new overlap; restore four after warm handoff |
 | Dev and other environments | Zero warm containers, maximum one, zero buffers |
 | Admission per container | Maximum 128 requests; main planning capacity 100 concurrent streams |
@@ -25,7 +25,7 @@ retain their separate vLLM images and capacity.
 | Startup / request budget | 45 minutes for startup; 55 minutes per request, including preparation and streaming |
 | Deployment draining | 60 minutes; five minutes beyond the request budget for cancellation/cleanup |
 | Failure bounds | Ten-minute native-worker watchdog; 60-second HTTP stream idle timeout |
-| Idle scale-down | 600 seconds; main retains its minimum, dev scales to zero |
+| Idle scale-down | 600 seconds; all environments scale to zero |
 
 Production starts additional four-GPU groups before reaching the existing group's
 hard admission limit, up to four groups. Dev and other environments remain capped
@@ -35,7 +35,9 @@ startup and receives 503 until the server is ready. Main rolling deployments res
 room for a complete replacement pool even at the normal maximum. With zero buffer containers, a
 sudden burst can arrive before additional groups are ready; the scaling target
 does not guarantee latency during cold scale-out.
-Main requests `min(4, max(1, floor((active_requests + 64) / 100) + 1))` containers.
+Main requests zero containers when idle, and
+`min(4, floor((active_requests + 64) / 100) + 1)` containers while requests are active.
+Modal starts the first container when a request arrives at an empty pool.
 The reserve is shared across the pool, not multiplied by the number of containers.
 At 36 requests it requests the second four-GPU group; at 136 the third; at 236 the fourth.
 At the four-group cap it cannot preserve that reserve once demand reaches 336.
@@ -165,8 +167,9 @@ python -m flash.serving.deepinfer.app.rollout
 ```
 
 The `Deploy DeepInfer pools` workflow selects the matching Modal environment on
-relevant pushes to `dev` and `main`. Only explicitly selected `main` gets a warm
-minimum. The private `Engine` Modal Server requires proxy authentication and
+relevant pushes to `dev` and `main`. Main rolling deployments temporarily warm
+one replacement for verification; the controller releases that floor after the
+idle window. Ordinary deployments start with a zero minimum. The private `Engine` Modal Server requires proxy authentication and
 exposes `/health` and `/internal/generate`.
 
 Main explicitly uses Modal's rolling strategy. Uvicorn does not open the serving
@@ -188,8 +191,8 @@ Serialize manual deployments with CI; do not overlap rollout commands.
 
 The availability objective is 99.99% (259.2 seconds unavailable per 30 days), with
 zero failed requests caused by planned redeployment as the rollout acceptance
-criterion. The one-replica warm minimum does not tolerate losing that sole ready
-replica without waiting for a replacement. Autoscaling adds capacity under demand;
+criterion. Scaling to zero introduces a cold start on the next request; losing a
+sole ready replica also requires waiting for a replacement. Autoscaling adds capacity under demand;
 it does not establish independent provider failure domains or prove this SLO. Measure valid
 public generation requests end to end, including complete streaming responses;
 track deployment windows separately and include backend errors, broken streams,
