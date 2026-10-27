@@ -14,6 +14,7 @@ from fastapi import FastAPI, HTTPException, Request
 from flash.serve.contract.protocol import MAX_CHAT_REQUEST_BYTES
 from flash.serving.deepinfer.contract.config import (
     GPU_COUNT,
+    MAX_INPUTS,
     MODEL_ID,
     MODEL_REVISION,
     RUNTIME_REVISION,
@@ -92,6 +93,15 @@ class _GenerationCount:
             and scope.get("method") == "POST"
         )
         if generation:
+            if self.counts.get("draining") or self.counts["active"] >= MAX_INPUTS:
+                from starlette.responses import JSONResponse
+
+                await JSONResponse(
+                    {"detail": "DeepInfer replica is not accepting new requests"},
+                    status_code=503 if self.counts.get("draining") else 429,
+                    headers={"X-DeepInfer-Retryable": "not-started"},
+                )(scope, receive, send)
+                return
             self.counts["active"] += 1
         try:
             await self.app(scope, receive, send)
@@ -107,6 +117,16 @@ def build_app(runtime, *, manage_lifecycle=True):
         try:
             if manage_lifecycle:
                 await runtime.start()
+                if replica_name := os.environ.get("DEEPINFER_REPLICA_NAME"):
+                    # A platform restart must not reopen admission on a replica
+                    # already fenced by the controller. Lookup failures fail startup.
+                    import modal
+
+                    from flash.serving.deepinfer.app.endpoints import FLEET_STATE
+
+                    state = await asyncio.to_thread(modal.Dict.from_name(FLEET_STATE).get, "fleet")
+                    entry = next(r for r in state["replicas"] if r["name"] == replica_name)
+                    counts["draining"] = entry["phase"] in {"draining", "stopping"}
                 monitor = asyncio.create_task(_monitor(runtime))
             yield
         finally:
@@ -118,7 +138,7 @@ def build_app(runtime, *, manage_lifecycle=True):
                 await runtime.close()
 
     app = FastAPI(lifespan=lifespan)
-    counts = {"active": 0}
+    counts = {"active": 0, "draining": False}
     app.add_middleware(_GenerationCount, counts=counts)
     app.add_middleware(RequestBodyLimitMiddleware, max_bytes=MAX_CHAT_REQUEST_BYTES)
 
@@ -139,10 +159,18 @@ def build_app(runtime, *, manage_lifecycle=True):
             "loaded_ranks": getattr(runtime, "provenance", {}),
             "active_requests": len(getattr(runtime, "pending", {})),
             "active_http_requests": counts["active"],
+            "draining": counts["draining"],
             "compiled_kernel_cache_verified": getattr(
                 runtime, "compiled_kernel_cache_verified", False
             ),
         }
+
+    @app.post("/internal/drain")
+    async def drain():
+        # This and admission run on the same event loop. After this acknowledgment,
+        # no new generation can enter; already admitted streams retain their slots.
+        counts["draining"] = True
+        return {"draining": True, "active_http_requests": counts["active"]}
 
     @app.post("/internal/generate")
     async def native_chat(body: dict, request: Request):

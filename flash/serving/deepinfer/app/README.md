@@ -12,11 +12,11 @@ retain their separate vLLM images and capacity.
 | --- | --- |
 | GPU allocation | Four B200s on one physical machine per container (`B200:4`) |
 | Main | One warm container, maximum four (16 B200s total), zero buffer containers |
-| Main rolling deployment | Temporarily allow five containers (20 B200s); restore four after warm handoff |
+| Main rolling deployment | Temporarily allow five containers (20 B200s); return to four only after old streams finish |
 | Dev and other environments | Zero warm containers, maximum one, zero buffers |
 | Admission per container | Maximum 128 requests; main planning capacity 100 concurrent streams |
 | Main scale-up | Pool-wide reserve of 64 streams: second group at 36 active requests, third at 136, fourth at 236 |
-| Sampling | Replica heartbeats and a single CPU controller every five seconds |
+| Sampling | Authenticated health checks and one CPU controller every five seconds |
 | Native scheduler | Two driver ranks, 64 sequences per rank, 16,384-token prefill chunks |
 | Context | 1,048,576 combined input/output tokens, with 64 reserved for native execution |
 | Output | Up to the remaining context budget; 350,000-token completions fit with shorter input |
@@ -44,31 +44,38 @@ Aggregate output tokens/sec divided by a target per-stream rate gives only a
 rough concurrency budget for the same saturated workload; prompt length, cache
 reuse, prefill and uneven routing also affect achievable concurrency and latency.
 
-Each main container reports its complete generation HTTP lifetime, including
-tokenization and streaming cleanup, to an environment-scoped Modal Dict from a
-background thread. Health probes are excluded. A lightweight scheduled CPU
-function reads the currently registered Server containers and their reports,
-then changes only the GPU pool's minimum container count. Sampling adds roughly
-five to ten seconds before requesting capacity, plus control-plane latency.
-GPU allocation and model startup still take additional time. A reserve of 64
-requests cannot guarantee enough time for an arbitrary burst or provider shortage.
+Production uses an immutable Modal App per GPU container, each fixed at one
+container. A CPU controller owns the shared capacity ledger and ready endpoint
+directory in `freesolo-deepseek-fleet-state`. It polls complete generation HTTP
+counts, including tokenization and streaming cleanup. Health probes do not count.
+Every warming, active, draining, and stopping replica consumes a reserved slot.
+Provisioning reserves its slot before calling Modal; termination does not free the
+slot until Modal confirms the container is gone. Normal operation permits four
+slots, with one extra only while replacing a previous version. Existing replicas
+stay up when replacement provisioning or warmup fails.
 
-The controller permits scale-down only after 600 seconds of continuously fresh,
-lower demand. Missing/stale reports and controller interruptions reset that
-quiet period; known demand can still increase capacity. Reports older than 20
-seconds are stale. Departed containers do not contribute demand. Modal's native
-target of 100 remains a fallback if the controller is unavailable and respects
-the controller's minimum. Native scale-down also retains its 600-second window.
-An operator's maximum of zero disables the pool and is never undone by the
-controller. Dev has no controller or heartbeat publisher: it keeps target eight,
-zero warm containers, and its single-container cap. The controller uses the
-container-list API in the pinned Modal SDK; lookup failures fail the tick rather
-than treating missing telemetry as idle capacity.
+Scale-down requires 600 seconds of fresh lower demand. Missing health data and
+controller interruptions reset that period. Scale-down fences admissions and
+waits for active requests to reach zero, just like a rollout. Each GPU App has
+native autoscaling disabled and a fixed minimum/maximum of one: Modal cannot
+independently scale down a busy replica after its one-hour grace period. The CPU
+controller is required for scale-out; a controller outage leaves the current
+replicas serving but prevents new capacity. Dev retains native autoscaling with
+zero warm containers, target eight, and a single-container cap.
 
-The public router sends requests to the private Modal Server URL. Modal selects
-a container using its default routing; we do not send an affinity header or
-provide a cross-container prefix directory. Each stream stays with its selected
-container. Within that container, the two native driver ranks are selected by
+The public router rotates its first choice across ready replica URLs. On a
+connection failure before sending the request, or an explicit application
+rejection carrying `X-DeepInfer-Retryable: not-started`, it prefers another ready
+replica. With only one replica it retries that replica. Attempts are bounded to
+three within a ten-second retry window, with backoff and the original overall
+deadline. Authorization, generation identity, tenant cache namespace, and usage
+accounting remain outside this retry loop. Generic 429/503 responses, ambiguous
+read/write failures, and partially delivered streams are never replayed. This
+avoids duplicate model work and billing; it cannot resume a failed generation.
+Fallback is to another ready four-B200 container in this fleet, not another
+provider. Requests are not pinned to a replica across turns; prefix caches are
+not shared. Each accepted stream stays with its selected container.
+Within that container, the two native driver ranks are selected by
 pending work plus uncached prompt length, with active count as a tie-breaker.
 Prefix-cache advertisements are tenant-scoped hints and workers verify exact
 matches. Prefix caches are not shared between containers.
@@ -155,54 +162,102 @@ modal deploy --strategy rolling --env dev -m flash.serving.deepinfer.app.modal_a
 
 export MODAL_ENVIRONMENT=main
 export DEEPINFER_ROLLOUT_ID="$(python -c 'import uuid; print(uuid.uuid4().hex)')"
-python -m flash.serving.deepinfer.app.rollout --begin
-modal deploy --strategy rolling --env main -m flash.serving.deepinfer.app.modal_app
-python -m flash.serving.deepinfer.app.rollout
+python -m flash.serving.deepinfer.app.fleet_deploy
 ```
 
-The `Deploy DeepInfer pools` workflow selects the matching Modal environment on
-relevant pushes to `dev` and `main`. Only explicitly selected `main` gets a warm
-minimum. The private `Engine` Modal Server requires proxy authentication and
-exposes `/health` and `/internal/generate`.
+Production also requires `DEEPINFER_PROXY_KEY` and `DEEPINFER_PROXY_SECRET` for
+the CPU controller's authenticated health and drain calls. These are injected as
+Modal secrets, never baked into GPU images. The public router uses the same
+credentials. Deploy the updated public router before enabling fleet routing.
 
-Main explicitly uses Modal's rolling strategy. Uvicorn does not open the serving
-port until every rank loads and the complete prefill, decode, and cache warmup
-finishes. A failed startup never opens that port. Existing replicas continue
-serving while replacements start. Each rollout has a unique identity in its
-health responses and load reports. The deployment waits for at least one warmed
-replacement and for every registered replica to report the current rollout.
-The scheduled controller then removes the temporary fifth slot, even if CI has
-disconnected. A pre-deploy marker prevents the previous controller from removing
-that slot early. A timeout fails verification without stopping the serving pool;
-the fifth slot stays available until the replacement handoff succeeds.
-Serialize manual deployments with CI; do not overlap rollout commands.
+The `Deploy DeepInfer pools` workflow uses the versioned fleet on `main` and the
+native single-container pool on `dev`. Production builds the application image
+once and stores its immutable image ID with the desired version. Future scale-out
+uses that exact image. Never run `modal deploy` or `modal app rollover` on an
+individual production replica: doing so reintroduces the native drain deadline.
 
-The availability objective is 99.99% (259.2 seconds unavailable per 30 days), with
-zero failed requests caused by planned redeployment as the rollout acceptance
-criterion. The one-replica warm minimum does not tolerate losing that sole ready
-replica without waiting for a replacement. Autoscaling adds capacity under demand;
-it does not establish independent provider failure domains or prove this SLO. Measure valid
-public generation requests end to end, including complete streaming responses;
-track deployment windows separately and include backend errors, broken streams,
-and timeouts. Health checks alone are not availability evidence. GPU allocation,
-the shared routing region, and upstream platform failures remain dependencies.
+The controller creates a separately named replacement, waits for every model rank
+and all warmup to finish, then publishes its authenticated URL. It replaces old
+replicas one at a time so a four-container pool retains serving capacity. It
+removes the predecessor from routing, atomically fences new admissions, and keeps
+its App deployed until the drain endpoint confirms zero complete HTTP lifetimes.
+Only then does it stop the old App. Requests already accepted can finish beyond
+one hour; there is no retirement timer that kills them. Stale-directory requests
+get an explicit safe rejection and can retry on a ready replacement. Restarted
+replicas restore their drain gate before opening the serving port. Missing drain
+telemetry never authorizes termination. Application and hardware failures can
+still interrupt streams.
 
-Modal Servers allow at most 3,600 seconds of in-flight connection draining, which
-this app already uses. The generation deadline is 7,200 seconds. Consequently a
-stream with more than one hour remaining when its replica retires can still be
-interrupted: native rolling deployment cannot guarantee preservation of every
-two-hour stream. That stronger guarantee requires independently deployed versions
-with application-controlled routing and retirement after all old requests finish.
-See [Modal deployment strategies](https://modal.com/docs/guide/managing-deployments)
-and [Server lifecycle limits](https://modal.com/docs/guide/servers).
+CI waits up to three hours for warmup and retirement and fails if the transition
+is incomplete. It never kills old work to meet that deadline; the controller
+continues after CI disconnects. A saturated multi-replica rollout can take longer
+because each predecessor can retain two-hour streams. Serialize manual deployments
+with CI. An atomic non-expiring controller lock prevents old/new controller code
+from mutating the ledger concurrently. If a hard kill strands the lock, verify
+that no previous controller invocation or provisioning call remains running
+before removing `controller_lock` from the fleet Dict; never delete the lock just
+because it is old. This deliberately favors preserving work and capacity over
+automatic recovery from an uncertain mutation.
 
-The hosted router discovers `Engine` in the same Modal environment. Its
-`DEEPINFER_PROXY_KEY` and `DEEPINFER_PROXY_SECRET` must both be configured as
-runtime secrets. Connection credentials are not included in the image or health
-response. The separately deployed Freesolo backend must recognize the exact model
-and price version in its billing catalog. Qualification through the hosted router
-must cover authorization, exact limits, cached pricing, streaming, cancellation
-and durable settlement as well as native GPU performance.
+### One-time legacy migration
+
+The existing monolithic production pool predates admission fencing. A normal
+fleet deploy refuses to overwrite it. Migration is staged so existing streams
+remain on the unchanged legacy deployment throughout warmup and router cutover:
+
+1. Finish any existing legacy rollout and verify its maximum is four. Deploy the
+   updated public router, which still discovers the legacy URL while no fleet
+   directory exists. Record the preceding router container IDs; wait for all of
+   them to finish and exit. Check the deployed router release and complete real
+   streaming requests through it. Disable or update every other direct legacy
+   client, and prevent rollback to a router version that ignores fleet routing.
+2. Run `python -m flash.serving.deepinfer.app.fleet_migration --reserve-legacy`.
+   This reserves all four possible legacy slots, regardless of current load.
+   Run `python -m flash.serving.deepinfer.app.fleet_deploy --stage-migration` with
+   the production environment, credentials, and a unique rollout ID. It warms one
+   replacement in the authorized fifth slot and publishes its route. Until then,
+   the updated router continues using the unchanged legacy deployment.
+3. Verify new public requests reach the replacement. The directory cutover and
+   retirement of all old router containers must leave **no source of new legacy
+   admissions**. Confirm old requests have finished; do not redeploy the legacy
+   pool to add a drain endpoint. When ingress is disabled, run:
+
+   ```sh
+   python -m flash.serving.deepinfer.app.fleet_migration --retire-legacy --confirm-legacy-ingress-disabled
+   ```
+
+   This explicit operator assertion is necessary because the old code cannot
+   enforce an admission fence. The command also requires fresh zero-request
+   telemetry from every registered legacy replica and a ready fleet route. It
+   marks the legacy pool for retirement; the controller stops it and keeps its
+   four slots reserved until all its containers disappear. Missing or busy
+   telemetry refuses retirement. An unconfirmed migration stays at one new
+   replica plus the reserved legacy capacity and requires operator completion.
+4. Verify the fleet ledger has only current active replicas, the legacy App has
+   stopped, and real public streaming requests complete. Normal production
+   deployments now use `fleet_deploy` without migration flags.
+
+Do not claim the old system has retroactive drain protection: it retains its
+original lifecycle behavior until migration finishes. First-fleet migration must
+be completed before the production workflow can report a normal rollout success.
+
+### Availability objective
+
+The objective is 99.99% (259.2 seconds unavailable per 30 days), with zero failed
+requests caused by planned redeployment as the acceptance criterion. A minimum
+of one ready replica cannot mask losing that sole replica. Two or more ready
+replicas permit pre-admission failover, but share Modal and regional dependencies;
+this is not independent-provider failover or proof of the SLO. Measure complete
+public requests and streams, alert on error-budget burn, and exercise rollout,
+failed warmup, lost telemetry, and replica failure under load. Health checks alone
+do not establish request availability. GPU allocation and platform failures remain
+dependencies. See [Modal Server lifecycle](https://modal.com/docs/guide/servers)
+and [deployment strategies](https://modal.com/docs/guide/managing-deployments).
+
+The separately deployed Freesolo backend must recognize the exact model and price
+version in its billing catalog. Qualification through the hosted router must cover
+authorization, exact limits, cached pricing, cancellation, and durable settlement
+as well as native GPU performance.
 
 ## Pinned runtime
 

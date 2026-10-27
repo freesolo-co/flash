@@ -8,7 +8,9 @@ from urllib.parse import urlsplit
 
 import httpx
 
+from flash.serving.deepinfer.app.endpoints import replica_endpoints
 from flash.serving.deepinfer.app.events import chat_body
+from flash.serving.deepinfer.app.retries import open_generation
 from flash.serving.deepinfer.contract.config import (
     APP_NAME,
     MODEL_ID,
@@ -75,7 +77,9 @@ async def _stream_lines(response, deadline):
 
 
 class HostedDeepInfer:
-    def __init__(self, *, transport=None):
+    def __init__(self, *, transport=None, targets=None):
+        self._targets = targets or replica_endpoints
+        self._next_replica = 0
         self._client = httpx.AsyncClient(
             timeout=httpx.Timeout(STARTUP_SECONDS + REQUEST_SECONDS, connect=30),
             transport=transport,
@@ -102,27 +106,25 @@ class HostedDeepInfer:
             "Modal-Secret": os.environ["DEEPINFER_PROXY_SECRET"],
             "Accept": "text/event-stream",
         }
-        try:
-            url = await asyncio.wait_for(asyncio.to_thread(endpoint_url), timeout=30)
-        except Exception as exc:
-            raise DeepInferError(503, "DeepInfer endpoint discovery failed") from exc
-        url += "/internal/generate"
         terminal = False
         deadline = asyncio.get_running_loop().time() + STARTUP_SECONDS + REQUEST_SECONDS
         try:
             # A disconnect closes only this response; other streams keep their pooled connections.
             async with asyncio.timeout_at(deadline):
-                request = self._client.build_request(
-                    "POST",
-                    url,
-                    headers=headers,
-                    json={
+                start = self._next_replica
+                self._next_replica += 1
+                response = await open_generation(
+                    self._client,
+                    self._targets,
+                    headers,
+                    {
                         "chat": body,
                         "request_id": payload.generation_id,
                         "cache_namespace": getattr(payload, "_cache_namespace", None),
                     },
+                    deadline,
+                    start=start,
                 )
-                response = await self._client.send(request, stream=True)
             try:
                 if response.status_code != 200:
                     code = response.status_code if response.status_code in {400, 422, 429} else 503

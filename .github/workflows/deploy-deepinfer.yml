@@ -23,11 +23,13 @@ jobs:
   deploy:
     if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/dev'
     runs-on: ubuntu-latest
-    timeout-minutes: 75
+    timeout-minutes: 210
     env:
       MODAL_ENVIRONMENT: ${{ github.ref_name == 'main' && 'main' || 'dev' }}
       MODAL_TOKEN_ID: ${{ secrets.MODAL_TOKEN_ID }}
       MODAL_TOKEN_SECRET: ${{ secrets.MODAL_TOKEN_SECRET }}
+      DEEPINFER_PROXY_KEY: ${{ secrets.DEEPINFER_PROXY_KEY }}
+      DEEPINFER_PROXY_SECRET: ${{ secrets.DEEPINFER_PROXY_SECRET }}
       DEEPINFER_ROLLOUT_ID: ${{ github.ref_name == 'main' && format('{0}-{1}', github.run_id, github.run_attempt) || '' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -37,11 +39,9 @@ jobs:
           python-version: "3.12"
       - name: Install deployment dependencies
         run: uv sync --extra serving --locked --no-dev
-      - name: Reserve a replacement slot for this rollout
+      - name: Deploy versioned production fleet and drain old streams
         if: github.ref == 'refs/heads/main'
-        run: uv run --no-sync python -m flash.serving.deepinfer.app.rollout --begin
-      - name: Deploy private DeepInfer pool
+        run: uv run --no-sync python -m flash.serving.deepinfer.app.fleet_deploy
+      - name: Deploy development pool
+        if: github.ref == 'refs/heads/dev'
         run: uv run --no-sync modal deploy --strategy rolling --env "$MODAL_ENVIRONMENT" -m flash.serving.deepinfer.app.modal_app
-      - name: Verify warm replacement and restore steady capacity
-        if: github.ref == 'refs/heads/main'
-        run: uv run --no-sync python -m flash.serving.deepinfer.app.rollout

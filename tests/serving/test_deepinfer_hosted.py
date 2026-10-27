@@ -7,6 +7,7 @@ import httpx
 import pytest
 from fastapi.testclient import TestClient
 
+from flash.serving.deepinfer.app import client as deepinfer_client
 from flash.serving.deepinfer.app.client import CONNECTION_KEYS, HostedDeepInfer, configured
 from flash.serving.deepinfer.app.http import build_app
 from flash.serving.deepinfer.contract.config import MODEL_ID
@@ -26,6 +27,10 @@ def connection(monkeypatch):
         monkeypatch.setenv(key, value)
     monkeypatch.setattr(
         "flash.serving.deepinfer.app.client.endpoint_url", lambda: "https://deepinfer.modal.run"
+    )
+    monkeypatch.setattr(
+        "flash.serving.deepinfer.app.client.replica_endpoints",
+        lambda: [deepinfer_client.endpoint_url()],
     )
 
 
