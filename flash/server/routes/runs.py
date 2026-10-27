@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import contextlib
 import logging
+import math
 import os
 from dataclasses import dataclass
 from typing import Annotated
@@ -354,6 +355,11 @@ def create_run(
     x_freesolo_org_id: Annotated[str | None, Header()] = None,
 ):
     dry_run = _require_bool(payload, "dry_run", False)
+    ceiling = payload.get("max_cost_usd")
+    if "max_cost_usd" in payload and (
+        type(ceiling) not in (int, float) or not math.isfinite(ceiling) or ceiling < 0
+    ):
+        raise HTTPException(status_code=400, detail="max_cost_usd must be finite and nonnegative")
     schema = _client_train_schema(payload)
     submitted = payload.get("spec")
     submitted_train = submitted.get("train") if isinstance(submitted, dict) else None
@@ -417,6 +423,12 @@ def create_run(
                 ),
             ) from exc
         run_id = prepared.public_spec.run_id
+        if ceiling is not None and prepared.estimated_cost_usd > ceiling:
+            raise HTTPException(
+                status_code=400,
+                detail="Prepared training quote exceeds max_cost_usd; no run was submitted",
+                headers={"X-Flash-Submission-Outcome": "not-created"},
+            )
         # prepare_job has completed every read-only gate before affordability and retained any
         # resolved environment sha on the worker spec passed to submit_job below.
         # run the affordability check for dry runs too. it is verify-only (moves no money), so a
@@ -466,6 +478,7 @@ def create_run(
         environment_slug, project_id=project_id, run_id=run_id, reporting_key=reporting_key
     )
     response = status.to_dict()
+    response["budget_contract"] = "max-cost-usd-v1"
     if dry_run and schema is not None:
         response["train_schema_compatibility"] = schema["compatibility"]
     if dry_run:

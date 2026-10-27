@@ -987,3 +987,43 @@ def test_route_does_not_blame_the_adapter_for_unrelated_failures(api, monkeypatc
 
     assert "no gpu class satisfies" in res.text
     assert "init_from_adapter" not in res.text
+
+
+@pytest.mark.parametrize("ceiling", [True, -1, "1", None])
+def test_invalid_cost_ceiling_rejected_before_submission(api, monkeypatch, ceiling):
+    events = sabotage_submission_boundaries(monkeypatch)
+    response = api.post(
+        "/v1/runs", json={"spec": SPEC, "max_cost_usd": ceiling}, headers=_bearer("fslo-user-1")
+    )
+    assert response.status_code == 400
+    assert "max_cost_usd" in response.text
+    assert events == []
+
+
+def test_cost_ceiling_checks_fresh_prepared_quote_before_paid_side_effects(api, monkeypatch):
+    preview = api.post(
+        "/v1/runs", json={"spec": SPEC, "dry_run": True}, headers=_bearer("fslo-user-1")
+    )
+    assert preview.status_code == 200, preview.text
+    quote = preview.json()["estimated_cost_usd"]
+    assert preview.json()["budget_contract"] == "max-cost-usd-v1"
+    assert quote > 0
+    events = sabotage_submission_boundaries(monkeypatch)
+    response = api.post(
+        "/v1/runs", json={"spec": SPEC, "max_cost_usd": quote / 2}, headers=_bearer("fslo-user-1")
+    )
+    assert response.status_code == 400
+    assert "exceeds max_cost_usd" in response.text
+    assert events == []
+
+
+def test_exact_quote_ceiling_is_accepted(api):
+    preview = api.post(
+        "/v1/runs", json={"spec": SPEC, "dry_run": True}, headers=_bearer("fslo-user-1")
+    )
+    quote = preview.json()["estimated_cost_usd"]
+    response = api.post(
+        "/v1/runs", json={"spec": SPEC, "max_cost_usd": quote}, headers=_bearer("fslo-user-1")
+    )
+    assert response.status_code == 200, response.text
+    assert response.json()["estimated_cost_usd"] == quote
