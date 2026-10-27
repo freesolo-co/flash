@@ -7,7 +7,7 @@ from types import ModuleType, SimpleNamespace
 import pytest
 
 from flash.serving.deepinfer.runtime import prefill_scheduler as scheduling
-from flash.serving.deepinfer.runtime.prefill_scheduler import _DriverQueueState as QueueState
+from flash.serving.deepinfer.runtime.prefill_scheduler import _QueueState as QueueState
 
 
 class Matrix:

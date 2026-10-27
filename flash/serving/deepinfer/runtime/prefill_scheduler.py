@@ -12,8 +12,10 @@ from flash.serving.deepinfer.contract.config import (
 )
 
 
-class _DriverQueueState(NamedTuple):
-    """One driver queue, shared with all drivers for container-wide decisions.
+class _QueueState(NamedTuple):
+    """One local scheduling queue, shared for container-wide decisions.
+
+    Each driver contributes its own queue snapshot; this is not a container total.
 
     Counts and flags use floats because the collective transports a float64 tensor.
     """
@@ -60,7 +62,7 @@ class PrefillScheduler:
         self.group = PG.cpu_data_parallel_group()
         self.rank = self.group.rank()
         self.state = torch.zeros(
-            (self.group.size(), len(_DriverQueueState._fields)), dtype=torch.float64, device="cpu"
+            (self.group.size(), len(_QueueState._fields)), dtype=torch.float64, device="cpu"
         )
 
     def command(self, command, active, cached_tokens=0):
@@ -77,7 +79,7 @@ class PrefillScheduler:
 
         now = time.monotonic()
         pending = list(self.pending.values())
-        local = _DriverQueueState(
+        local = _QueueState(
             pending_prefill_count=len(pending),
             # Admission-time estimate, capped at one chunk per pending request.
             # Pending entries persist until first output; this is not exact remaining work.
@@ -98,7 +100,7 @@ class PrefillScheduler:
         # to every driver; only durations, never host timestamps, cross ranks.
         if self.group.size() > 1:
             dist.all_reduce(self.state, op=dist.ReduceOp.MAX, group=self.group)
-        states = [_DriverQueueState(*row) for row in self.state.tolist()]
+        states = [_QueueState(*row) for row in self.state.tolist()]
         if any(state.has_decoding_requests for state in states) and self.decode_remaining:
             self.engine.scheduler.decode_step = 1
         else:
