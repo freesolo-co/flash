@@ -211,13 +211,28 @@ class PrefixCache:
             del self.pending[request_id]
             if seq.num_cached_tokens != len(tokens):
                 raise RuntimeError("Native prefix checkpoint advanced before snapshot")
-            self._make_room(storage_tokens)
+            duplicate = next(
+                (
+                    key
+                    for key, prefix in self.entries.items()
+                    if prefix.namespace == namespace and prefix.tokens == tokens
+                ),
+                None,
+            )
+            if duplicate is None:
+                self._make_room(storage_tokens)
             donor = self.engine.scheduler.detach_waiting_for_prefix_cache(request_id)
             donor.request_id = "prefix-" + uuid.uuid4().hex
-            self.entries[donor.request_id] = Prefix(
-                namespace, tokens, donor, time.monotonic(), storage_tokens
-            )
+            if duplicate is None:
+                self.entries[donor.request_id] = Prefix(
+                    namespace, tokens, donor, time.monotonic(), storage_tokens
+                )
+            else:
+                self._touch(duplicate, self.entries[duplicate])
             self._fork(donor, request_id, params)
+            if duplicate is not None:
+                # the continuation owns its native references before its donor is freed.
+                self.engine.scheduler.free_seq(donor)
         return outputs
 
     def forget(self, request_id):
