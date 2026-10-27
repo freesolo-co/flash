@@ -634,3 +634,26 @@ def test_accounting_rpc_is_scoped_to_the_canary_and_release():
             },
         )
     ]
+
+
+def test_health_handoff_budget_covers_a_full_router_request():
+    from flash.serving.app.timeouts import ROUTER_TIMEOUT_SECONDS
+
+    assert gate_module._HEALTH_ROLLOUT_DEADLINE_SECONDS >= ROUTER_TIMEOUT_SECONDS + 300
+
+
+def test_old_release_draining_beyond_five_minutes_can_still_be_promoted():
+    snapshots = iter(
+        [
+            *[_health(deployment_sha="0" * 40) for _ in range(65)],
+            *[_health() for _ in range(7)],
+        ]
+    )
+    verdict, calls = _evaluate(
+        health=lambda: next(snapshots),
+        stream=_good_stream(),
+        accounting=_Snapshot(),
+        health_stable_seconds=gate_module._HEALTH_STABLE_SECONDS,
+    )
+    assert verdict.ok
+    assert calls == ["health"] * 72 + ["stream", "accounting"]
