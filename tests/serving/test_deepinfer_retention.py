@@ -80,15 +80,15 @@ def test_admission_history_is_bounded_expires_and_does_not_retain_token_lists(mo
     monkeypatch.setattr(module + ".ADMISSION_HISTORY_LIMIT", 2)
     monkeypatch.setattr(module + ".time.monotonic", lambda: 100)
     value = PrefixCache(None, ttl=10)
-    assert not value._reused_prefix("a", [1] * 128)
-    assert not value._reused_prefix("a", [2] * 128)
-    assert value._reused_prefix("a", [1] * 128)
-    assert not value._reused_prefix("a", [3] * 128)
+    assert not value._checkpoint_key("a", [1] * 128)
+    assert not value._checkpoint_key("a", [2] * 128)
+    assert value._checkpoint_key("a", [1] * 128)
+    assert not value._checkpoint_key("a", [3] * 128)
     assert len(value.observed) == 2
     assert all(len(key[1]) == 64 for key in value.observed)
-    assert not value._reused_prefix("a", [2] * 128)  # Evicted observation is cold again.
+    assert not value._checkpoint_key("a", [2] * 128)  # Evicted observation is cold again.
     monkeypatch.setattr(module + ".time.monotonic", lambda: 111)
-    assert not value._reused_prefix("a", [2] * 128)
+    assert not value._checkpoint_key("a", [2] * 128)
     assert len(value.observed) == 1
     value.close()
     assert not value.observed

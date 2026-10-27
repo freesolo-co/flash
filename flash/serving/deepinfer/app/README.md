@@ -103,7 +103,10 @@ One-off prefixes skip checkpoint creation. Each driver remembers up to 4,096
 eligible tenant-scoped prefix hashes and their observation timestamps, with a
 600-second lifetime. A repeated observation within that history makes a prefix
 eligible for a checkpoint; subsequent requests can reuse it once ready and while
-resident. Evicting an observation only forgets its reuse history and never rejects
+resident. Concurrent misses for the same tenant and prefix retain at most one
+pending checkpoint per driver. Other requests continue prefilling independently;
+cancelling the checkpoint owner lets a later request become the donor. Evicting
+an observation only forgets its reuse history and never rejects
 a request. This table holds no prompt tokens or GPU state and is separate from
 the 64-entry GPU cache and API rate limits. Retention favors frequently reused
 prefixes relative to their allocated size. CPU spill is disabled because its

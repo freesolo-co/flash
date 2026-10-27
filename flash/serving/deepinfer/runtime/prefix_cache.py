@@ -35,10 +35,11 @@ class PrefixCache:
         self.ttl = ttl
         self.entries = OrderedDict()
         self.pending = {}
+        self.pending_prefixes = {}
         self.hits = {}
         self.observed = OrderedDict()
 
-    def _reused_prefix(self, namespace, tokens):
+    def _checkpoint_key(self, namespace, tokens):
         # Checkpointing splits prefill and retains native state. Pay that cost only
         # after this tenant has requested the same exact prefix more than once.
         now = time.monotonic()
@@ -50,7 +51,11 @@ class PrefixCache:
             or now - next(iter(self.observed.values())) >= self.ttl
         ):
             self.observed.popitem(last=False)
-        return previous is not None and now - previous < self.ttl
+        if previous is None or now - previous >= self.ttl:
+            return None
+        # concurrent misses may prefill independently, but retain only one donor.
+        # digests bound bookkeeping without another copy of a long prefix.
+        return key if key not in self.pending_prefixes.values() else None
 
     def directory(self):
         return [
@@ -168,25 +173,25 @@ class PrefixCache:
         length = command.get("prefix_tokens", 0)
         block_size = self.engine.cache_config.block_size
         storage_tokens = math.ceil(len(tokens) / block_size) * block_size
-        retain = bool(
+        eligible = (
             namespace
             and self.max_entries
             and 128 <= length <= self.max_tokens
             and storage_tokens <= self.max_tokens
             and length < len(tokens) - 1
-            and self._reused_prefix(namespace, tokens[:length])
         )
+        checkpoint = self._checkpoint_key(namespace, tokens[:length]) if eligible else None
         seq = self.engine.add_request(
             user_id="flash",
             request_id=request_id,
             sampling_params=params,
             prompt_token_ids=np.asarray(tokens, dtype=np.int32),
             multi_modal_data={"image_bytes": [], "image_sizes": []},
-            chunk_checkpoints=[length] if retain else None,
+            chunk_checkpoints=[length] if checkpoint is not None else None,
         )
         if seq is None:
             raise RuntimeError("DeepInfer refused request admission")
-        if retain:
+        if checkpoint is not None:
             self.pending[request_id] = (
                 seq,
                 namespace,
@@ -194,6 +199,7 @@ class PrefixCache:
                 params,
                 storage_tokens,
             )
+            self.pending_prefixes[request_id] = checkpoint
 
     def capture_ready(self):
         ready = [
@@ -209,6 +215,7 @@ class PrefixCache:
         outputs = [RequestOutput.clone(pointer) for pointer in self.engine.flush_inflight_reqs()]
         for request_id, (seq, namespace, tokens, params, storage_tokens) in ready:
             del self.pending[request_id]
+            self.pending_prefixes.pop(request_id)
             if seq.num_cached_tokens != len(tokens):
                 raise RuntimeError("Native prefix checkpoint advanced before snapshot")
             self._make_room(storage_tokens)
@@ -222,9 +229,11 @@ class PrefixCache:
 
     def forget(self, request_id):
         self.pending.pop(request_id, None)
+        self.pending_prefixes.pop(request_id, None)
         self.hits.pop(request_id, None)
 
     def close(self):
         for key in list(self.entries):
             self._evict(key, spill=False)
         self.observed.clear()
+        self.pending_prefixes.clear()
