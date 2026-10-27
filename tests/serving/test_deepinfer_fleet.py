@@ -176,6 +176,14 @@ def test_controllers_cannot_overlap_during_their_own_redeployment():
     assert "controller_lock" not in store
 
 
+def test_missing_capacity_ledger_never_means_an_empty_fleet():
+    store = Store(desired={"version": "new", "image_id": "im-new"})
+    ops = Ops(store)
+    with pytest.raises(RuntimeError, match="Missing fleet capacity ledger"):
+        reconcile_fleet(store, ops, now=0)
+    assert "fleet" not in store
+
+
 def test_four_replica_rollout_replaces_one_at_a_time_without_capacity_collapse():
     store, ops = setup(*(entry(f"old{i}") for i in range(4)))
     ops.loads = {f"old{i}": 80 for i in range(4)}

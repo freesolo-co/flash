@@ -16,6 +16,9 @@ def replica_app(name, image, version):
     @app.server(
         name="Engine",
         serialized=True,
+        # The image already contains this release's source. Auto-mounted source
+        # from a newer controller must not overwrite it during later scale-out.
+        include_source=False,
         gpu=GPU,
         cpu=32,
         memory=524288,

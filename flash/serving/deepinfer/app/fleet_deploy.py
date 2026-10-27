@@ -1,27 +1,45 @@
 """Publish immutable replica source and request a drain-safe fleet rollout."""
 
 import argparse
+import json
 import os
 import time
 
 import modal
 
 from flash.serving.deepinfer.app.endpoints import FLEET_NAME, FLEET_STATE
+from flash.serving.deepinfer.app.fleet import controller_lock
+from flash.serving.deepinfer.app.fleet_ops import FleetOps
 from flash.serving.deepinfer.contract.config import APP_NAME, REQUEST_SECONDS, STARTUP_SECONDS
 
 
 def require_fleet_migration(store):
     if store.get("fleet", None) is not None:
         return
-    try:
-        modal.Server.from_name(APP_NAME, "Engine").get_url()
-    except modal.exception.NotFoundError:
-        return
-    raise RuntimeError(
-        "The legacy monolithic DeepSeek pool still exists. Its existing streams cannot be "
-        "protected retroactively by a new deployment. Complete the documented legacy migration "
-        "before enabling fleet deployments; no existing application has been modified."
-    )
+    with controller_lock(store) as acquired:
+        if not acquired:
+            raise RuntimeError("Controller busy; retry initialization after its current tick")
+        if store.get("fleet", None) is not None:
+            return
+        try:
+            modal.Server.from_name(APP_NAME, "Engine").get_url()
+        except modal.exception.NotFoundError:
+            apps = json.loads(FleetOps._cli("app", "list", "--json"))
+            if any(
+                item["description"].startswith("freesolo-deepseek-replica-")
+                and item["state"] != "stopped"
+                for item in apps
+            ):
+                raise RuntimeError(
+                    "Existing replica Apps have no capacity ledger; recover it first"
+                ) from None
+            store.put("fleet", {"replicas": [], "quiet_since": None})
+            return
+        raise RuntimeError(
+            "The legacy monolithic DeepSeek pool still exists. Its existing streams cannot be "
+            "protected retroactively by a new deployment. Complete the documented legacy migration "
+            "before enabling fleet deployments; no existing application has been modified."
+        )
 
 
 def wait_for_fleet(

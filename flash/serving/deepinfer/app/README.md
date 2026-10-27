@@ -192,11 +192,13 @@ CI waits up to three hours for warmup and retirement and fails if the transition
 is incomplete. It never kills old work to meet that deadline; the controller
 continues after CI disconnects. A saturated multi-replica rollout can take longer
 because each predecessor can retain two-hour streams. Serialize manual deployments
-with CI. An atomic non-expiring controller lock prevents old/new controller code
+with CI. An atomic controller lock without a lease timer prevents old/new controller code
 from mutating the ledger concurrently. If a hard kill strands the lock, verify
 that no previous controller invocation or provisioning call remains running
 before removing `controller_lock` from the fleet Dict; never delete the lock just
-because it is old. This deliberately favors preserving work and capacity over
+because it is old. A missing capacity ledger blocks provisioning; recover the
+existing App inventory instead of treating missing state as an empty fleet. This
+deliberately favors preserving work and capacity over
 automatic recovery from an uncertain mutation.
 
 ### One-time legacy migration

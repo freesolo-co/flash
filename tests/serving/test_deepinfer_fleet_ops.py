@@ -3,10 +3,12 @@
 import subprocess
 
 import httpx
+import modal
 import pytest
 
 from flash.serving.deepinfer.app.endpoints import validate_endpoint
 from flash.serving.deepinfer.app.fleet_ops import FleetOps
+from flash.serving.deepinfer.app.replicas import replica_app
 
 
 @pytest.fixture
@@ -63,3 +65,19 @@ def test_repeated_stop_handles_the_modal_cli_already_stopped_exit(ops, monkeypat
 def test_directory_cannot_forward_proxy_credentials_to_untrusted_origins(url):
     with pytest.raises(ValueError, match="Invalid private Modal"):
         validate_endpoint(url)
+
+
+def test_replica_keeps_its_pinned_image_source_and_single_container_budget(monkeypatch):
+    settings = {}
+    original = modal.App.server
+
+    def capture(app, **kwargs):
+        settings.update(kwargs)
+        return original(app, **kwargs)
+
+    monkeypatch.setattr(modal.App, "server", capture)
+    replica_app("fleet-config-test", modal.Image.debian_slim(), "version")
+    assert settings["include_source"] is False
+    assert settings["min_containers"] == settings["max_containers"] == 1
+    assert settings["gpu"] == "B200:4"
+    assert settings["target_concurrency"] is None

@@ -58,7 +58,11 @@ def reconcile_fleet(store, ops, *, now):
     desired = store.get("desired", None)
     if desired is None:
         return {"status": "unconfigured"}
-    state = store.get("fleet", {"replicas": [], "quiet_since": None})
+    state = store.get("fleet", None)
+    if state is None:
+        raise RuntimeError(
+            "Missing fleet capacity ledger; reconcile existing Apps before provisioning"
+        )
     if not 0 <= now - state.get("at", 0) <= POOL_SAMPLE_MAX_AGE:
         state["quiet_since"] = None
     entries = state["replicas"]

@@ -3,6 +3,7 @@
 from types import SimpleNamespace
 from unittest.mock import Mock
 
+import modal
 import pytest
 
 from flash.serving.deepinfer.app.fleet import reconcile_fleet
@@ -80,3 +81,23 @@ def test_rollout_timeout_never_stops_undrained_replicas():
     with pytest.raises(TimeoutError, match="retains all undrained"):
         wait_for_fleet(store, "new", timeout=0)
     assert store["fleet"]["replicas"][0]["phase"] == "draining"
+
+
+@pytest.mark.parametrize("state", ["deployed", "stopped"])
+def test_bootstrap_checks_actual_apps_before_initializing_missing_ledger(monkeypatch, state):
+    server = legacy()
+    server.get_url.side_effect = modal.exception.NotFoundError("legacy gone")
+    monkeypatch.setattr(modal.Server, "from_name", lambda *args: server)
+    monkeypatch.setattr(
+        "flash.serving.deepinfer.app.fleet_deploy.FleetOps._cli",
+        lambda *args: '[{"description":"freesolo-deepseek-replica-one","state":"' + state + '"}]',
+    )
+    store = Store()
+    if state == "deployed":
+        with pytest.raises(RuntimeError, match="recover it first"):
+            require_fleet_migration(store)
+        assert "fleet" not in store
+    else:
+        require_fleet_migration(store)
+        assert store["fleet"]["replicas"] == []
+    assert "controller_lock" not in store
