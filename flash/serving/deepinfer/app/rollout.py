@@ -54,7 +54,7 @@ def main():
     deployment_id = os.environ.get("DEEPINFER_ROLLOUT_ID", "")
     if not deployment_id:
         raise ValueError("DEEPINFER_ROLLOUT_ID is required")
-    store = modal.Dict.from_name(POOL_STATE_NAME)
+    store = modal.Dict.from_name(POOL_STATE_NAME, create_if_missing=args.begin)
     if args.begin:
         # Old controller containers can overlap the new deployment too. Disarm
         # their cleanup before changing the Server's capacity or application.

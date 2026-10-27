@@ -2,6 +2,7 @@
 
 import asyncio
 import socket
+import sys
 from types import SimpleNamespace
 
 import pytest
@@ -107,3 +108,27 @@ def test_verification_cannot_succeed_on_old_version_or_unrestored_cap(monkeypatc
 def test_verification_timeout_does_not_stop_or_change_the_pool():
     with pytest.raises(TimeoutError, match="readiness was not confirmed"):
         wait_for_rollout(object(), {}, "new", timeout=0)
+
+
+def test_begin_bootstraps_rollout_state_before_the_first_app_deployment(monkeypatch):
+    from flash.serving.deepinfer.app import rollout
+
+    dictionaries = {}
+
+    def lookup(name, *, create_if_missing=False):
+        if create_if_missing:
+            dictionaries.setdefault(name, {})
+        return SimpleNamespace(put=lambda key, value: dictionaries[name].__setitem__(key, value))
+
+    monkeypatch.setitem(
+        sys.modules,
+        "modal",
+        SimpleNamespace(
+            config=SimpleNamespace(config={"environment": "main"}),
+            Dict=SimpleNamespace(from_name=lookup),
+        ),
+    )
+    monkeypatch.setattr(sys, "argv", ["rollout", "--begin"])
+    monkeypatch.setenv("DEEPINFER_ROLLOUT_ID", "first-deployment")
+    rollout.main()
+    assert dictionaries[rollout.POOL_STATE_NAME]["rollout"] == {"deployment_id": "first-deployment"}
