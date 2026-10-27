@@ -110,6 +110,8 @@ class ModelInfo:
     grpo_min_vram_gb: int = 0
     # 0 => non-grpo sizing uses the param-based estimate; set when a model must not down-route to the cheapest card.
     sft_min_vram_gb: int = 0
+    # Minimum vLLM cache/profiling allowance beyond weights and adapters.
+    rollout_cache_min_gb: float = 0.0
     # resident-only guard: vllm wake/reload hangs after allocator fragmentation. reject configs that
     # miss the resident peak and pin free_cache_engine=false in the verl launcher.
     sleep_unsupported: bool = False
@@ -182,6 +184,7 @@ class ModelInfo:
             "linear_key_head_dim",
             "linear_value_head_dim",
             "linear_conv_kernel_dim",
+            "rollout_cache_min_gb",
             "lora_language_prefix",
             "managed_revision",
             "lora_target_shapes",
@@ -283,6 +286,7 @@ MODELS: dict[str, ModelInfo] = {
         min_vram_gb=48,
         sft_min_vram_gb=48,
         grpo_min_vram_gb=80,
+        rollout_cache_min_gb=24.0,
         min_disk_gb=96,
         recommended_gpu="H100",
         thinking="hybrid",

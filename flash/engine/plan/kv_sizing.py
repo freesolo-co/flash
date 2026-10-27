@@ -11,6 +11,7 @@ estimators read them too; defining them here keeps this module importable on its
 from __future__ import annotations
 
 import math
+from dataclasses import dataclass
 
 _KV_COEF = 2.0
 _KV_CAP = 8.0
@@ -23,6 +24,19 @@ _KV_FRAGMENTATION_MARGIN = 1.25
 # once the kv pool is carved out, so a budget that prices under it is not a smaller engine but a
 # broken one. the legacy equation and the multi-rank shard path both bottom out here.
 _MIN_ENGINE_UTIL = 0.10
+
+
+@dataclass(frozen=True)
+class _RolloutMemoryFloor:
+    rollout_cache_min_gb: float
+
+
+def revision_sizing_info(info, revision: str):
+    """Retain runtime memory floors without trusting a pinned revision's catalog geometry."""
+    if not revision:
+        return info
+    floor = float(getattr(info, "rollout_cache_min_gb", 0.0) or 0.0)
+    return _RolloutMemoryFloor(floor) if floor else None
 
 
 def _round_up(value: int, multiple: int) -> int:
@@ -94,9 +108,10 @@ def _resident_kv_gb(
         legacy *= 0.5
 
     raw = _architecture_kv_raw_gb(model_info, vllm_max_len, num_generations, fp8_kv)
+    model_floor = float(getattr(model_info, "rollout_cache_min_gb", 0.0) or 0.0)
     if raw is None:
-        return legacy
-    profiled = max(_KV_CAP, _KV_PROFILE_OVERHEAD_GB + raw * _KV_FRAGMENTATION_MARGIN)
+        return max(model_floor, legacy)
+    profiled = max(_KV_CAP, model_floor, _KV_PROFILE_OVERHEAD_GB + raw * _KV_FRAGMENTATION_MARGIN)
     # opd startup tiers and the resident-only 35b boundary are live-calibrated. retain their old
     # conservative pool until the architecture equation is validated on those exact gpu paths.
     # a hybrid model whose linear-attention dims are absent yields a PARTIAL estimate (attention KV

@@ -394,7 +394,8 @@ def estimate_vram_gb(
             arch_kv_known = (
                 _architecture_kv_raw_gb(model_info, seq_len, group_size, fp8_kv) is not None
             )
-            if arch_kv_known and kv > _KV_CAP:
+            runtime_floor = float(getattr(model_info, "rollout_cache_min_gb", 0.0) or 0.0)
+            if (arch_kv_known or runtime_floor) and kv > _KV_CAP:
                 rollout = weights + max(_KV_CAP, 1.5 * kv)
             else:
                 rollout = weights + min(kv, _KV_CAP)
@@ -763,7 +764,9 @@ def _catalog_model_required_vram_gb(
         params_b, model_vocab = _validated_revision_geometry(model_id, model_revision, info)
     quant = getattr(info, "quant", "bf16") or "bf16"
     # pinned commits retain validated coarse geometry but use conservative generic architecture sizing.
-    sizing_info = None if model_revision else info
+    from flash.engine.plan.kv_sizing import revision_sizing_info
+
+    sizing_info = revision_sizing_info(info, model_revision)
     active_b = float(getattr(sizing_info, "active_params_b", 0.0) or 0.0)
     need = _model_vram_need(
         params_b or 4.0,

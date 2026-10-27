@@ -529,6 +529,7 @@ def resolve_gpu_mem_util(
         return _DEFAULT_GPU_MEM_UTIL
     try:
         from flash.core.catalog import MODELS
+        from flash.engine.plan.kv_sizing import revision_sizing_info
         from flash.engine.plan.vram import colocate_kv_util, resolve_params_b
         from flash.providers.core.base import get_gpu_info
 
@@ -541,7 +542,7 @@ def resolve_gpu_mem_util(
         # a pinned revision is sized on generic architecture geometry:
         # the commit's real geometry is not validated, so the curated kv/lora shape may not describe
         # it. the parameter count still comes from the pinned config.
-        info = None if revision else catalog_info
+        info = revision_sizing_info(catalog_info, revision)
         # the ONE way the worker, the preflight and the cost estimator agree on a model's size:
         # curated catalog params_b, else the pinned commit's real HF count. the catalog answers
         # FIRST and locally, so the common path adds no network call to launch; the HF lookup is

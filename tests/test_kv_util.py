@@ -315,3 +315,64 @@ def test_moe_colocate_budget_kv_matches_resident_gate_kv():
     budget_kv = util * card - 35.0 * 2.0
     gate_kv = max(_KV_CAP, _resident_kv_gb(3.0, 4096, 8))  # what the active-aware gate adds for KV
     assert round(budget_kv, 6) == round(gate_kv, 6)
+
+
+@pytest.mark.parametrize("model_id", ["Qwen/Qwen3.5-4B"])
+def test_qwen35_4b_rollout_budget_covers_cold_gdn_profile(model_id):
+    from flash.core.catalog import get_model
+
+    info = get_model(model_id)
+    cache_gb = _resident_kv_gb(info.params_b, 256, 16, model_info=info, fp8_kv=True)
+    assert cache_gb >= 24.0
+    util = colocate_kv_util(
+        info.params_b,
+        256,
+        80,
+        False,
+        num_generations=16,
+        model_info=info,
+        fp8_kv=True,
+        lora_rank=8,
+    )
+    # The old ~17.3 GB whole-engine reservation failed before any base-model rollout.
+    assert util * 80 >= info.params_b * 2 + cache_gb
+    assert util <= 0.45
+
+
+@pytest.mark.parametrize("model_id", ["Qwen/Qwen3.5-4B"])
+def test_pinned_qwen35_4b_keeps_runtime_floor_without_assuming_geometry(monkeypatch, model_id):
+    from flash.core.catalog import get_model
+    from flash.engine.plan.kv_sizing import revision_sizing_info
+    from flash.engine.plan.vram import estimate_vram_gb
+    from flash.engine.worker.train.rl.launch.verl_config import resolve_gpu_mem_util
+
+    info = get_model(model_id)
+    sizing = revision_sizing_info(info, "a" * 40)
+    assert sizing.rollout_cache_min_gb == info.rollout_cache_min_gb
+    assert not hasattr(sizing, "num_attention_layers")
+    monkeypatch.setattr("flash.engine.plan.vram.resolve_params_b", lambda *a, **kw: info.params_b)
+    util = resolve_gpu_mem_util(
+        {
+            "model_id": model_id,
+            "model_revision": "a" * 40,
+            "engine_len": 256,
+            "group_size": 4,
+            "lora_rank": 8,
+        },
+        gpu_type="H100",
+        n_gpus=1,
+        fp8_kv=True,
+        sleep_unsupported=False,
+    )
+    assert util == pytest.approx(0.45)
+    estimate = estimate_vram_gb(
+        info.params_b,
+        "grpo",
+        seq_len=256,
+        group_size=4,
+        lora_rank=8,
+        sleep_offload=True,
+        fp8_kv=True,
+        model_info=sizing,
+    )
+    assert estimate >= 2 * info.params_b * 2 + 1.5 * info.rollout_cache_min_gb
