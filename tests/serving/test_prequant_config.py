@@ -26,7 +26,10 @@ def test_official_fp8_contains_the_active_27b_and_35b_moe_defaults() -> None:
         DENSE_27B: "Qwen/Qwen3.8-27B-FP8",
         MOE_35B: "Qwen/Qwen3.6-35B-A3B-FP8",
     }
-    assert set(FP8_SERVE_MODEL_REPOS) == set(base_models())
+    assert set(FP8_SERVE_MODEL_REPOS) == set(base_models()) - {
+        "Qwen/Qwen3.5-0.8B",
+        "Qwen/Qwen3.5-4B",
+    }
 
 
 def test_fp8_serve_model_for_resolves_every_active_base_without_translation() -> None:

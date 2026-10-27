@@ -235,6 +235,14 @@ no compatible baked cache is available:
 docker pull ghcr.io/freesolo-co/flash-worker@sha256:34c84092f87b9ae43457620a8e5c0dc2e3dc30fdd5de5b4300c1eeb384e9a066
 ```
 
+## Small Qwen3.5 models
+
+Qwen3.5-0.8B and Qwen3.5-4B support text SFT and GRPO with pinned BF16 checkpoints.
+Hosted serving uses L40S for 0.8B and exactly H100 for 4B (no H200 substitution),
+with 32k context, four hot LoRA slots and rank up to 64. Image input and image training
+are not enabled for these two entries. Customer-owned deployment profiles are available
+for offline planning; live customer-owned allocation awaits separate qualification.
+
 ## Release channels
 
 Two channels are published to PyPI from the _same source_, distinguished by one line in

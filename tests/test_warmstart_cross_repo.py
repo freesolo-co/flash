@@ -979,7 +979,7 @@ def test_effective_snapshot_rejects_tampering(field, value):
 
 @pytest.mark.parametrize(
     "retired_model",
-    ["Qwen/Qwen3.5-0.8B", "Qwen/Qwen3.5-2B", "Qwen/Qwen3.5-4B"],
+    ["Qwen/Qwen3.5-2B"],
 )
 def test_effective_spec_rejects_persisted_removed_model_before_activation(retired_model):
     from flash.core.spec import JobSpec

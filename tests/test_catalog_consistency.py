@@ -138,6 +138,8 @@ def test_public_rows_prune_unset_serving_capacity_fields():
 
 def test_serving_repos_cover_public_catalog_and_hosted_activation() -> None:
     assert SERVING_MODEL_REPOS == {
+        "Qwen/Qwen3.5-0.8B": "Qwen/Qwen3.5-0.8B",
+        "Qwen/Qwen3.5-4B": "Qwen/Qwen3.5-4B",
         "Qwen/Qwen3.5-9B": "Freesolo-Co/Qwen3.5-9B-FP8",
         "Qwen/Qwen3.8-27B": "Qwen/Qwen3.8-27B-FP8",
         "Qwen/Qwen3.6-35B-A3B": "Qwen/Qwen3.6-35B-A3B",
@@ -210,7 +212,7 @@ def test_qwen38_27b_geometry_is_dense_hybrid():
 
 @pytest.mark.parametrize(
     "model_id",
-    ["Qwen/Qwen3.5-0.8B", "Qwen/Qwen3.5-2B", "Qwen/Qwen3.5-4B", "Qwen/Qwen3.6-27B"],
+    ["Qwen/Qwen3.5-2B", "Qwen/Qwen3.6-27B"],
 )
 def test_retired_models_are_absent_from_every_active_catalog(model_id):
     assert model_id not in MODELS

@@ -149,9 +149,47 @@ class ServingProfile:
         )
 
 
+def _small_qwen_profile(model_id: str, revision: str, gpu: str) -> ServingProfile:
+    """Text-only BF16 small-model profile; customer-owned qualification is separate."""
+    return ServingProfile(
+        model_id=model_id,
+        modality="text",
+        served_model=model_id,
+        served_model_revision=revision,
+        tokenizer_model=model_id,
+        dtype="bfloat16",
+        quantization=None,
+        kv_cache_dtype="fp8",
+        max_model_len=32768,
+        max_num_seqs=8,
+        max_num_batched_tokens=None,
+        max_loras=4,
+        max_cpu_loras=4,
+        max_lora_rank=64,
+        gpu_memory_utilization=0.90,
+        cpu_offload_gb=0.0,
+        image_limit=None,
+        mm_processor_cache_gb=0.0,
+        enable_tower_connector_lora=False,
+        reasoning_parser="qwen3",
+        engine_args={"enforce_eager": False},
+        tokenizer_kwargs={},
+        processor_kwargs={},
+        modal_gpu=gpu,
+        modal_gpu_request="H100!" if gpu == "H100" else gpu,
+        modal_live_qualified=False,
+    )
+
+
 # every public catalog model has an explicit immutable profile. provider qualification remains a
 # separate fact: provisional placement data may build an offline plan, but cannot allocate a gpu.
 _PROFILES: dict[str, ServingProfile] = {
+    "Qwen/Qwen3.5-0.8B": _small_qwen_profile(
+        "Qwen/Qwen3.5-0.8B", "2fc06364715b967f1860aea9cf38778875588b17", "L40S"
+    ),
+    "Qwen/Qwen3.5-4B": _small_qwen_profile(
+        "Qwen/Qwen3.5-4B", "851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a", "H100"
+    ),
     "Qwen/Qwen3.5-9B": ServingProfile(
         model_id="Qwen/Qwen3.5-9B",
         modality="multimodal",
@@ -377,7 +415,7 @@ def _require_catalog_agreement(profile: ServingProfile) -> None:
     for name in _CATALOG_CHECKED_FIELDS:
         expected = getattr(serving, name)
         actual = getattr(profile, name)
-        if name == "max_num_batched_tokens":
+        if name in {"max_num_batched_tokens", "image_limit"}:
             expected = expected or None
             actual = actual or None
         if expected != actual:
