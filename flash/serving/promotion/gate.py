@@ -33,7 +33,7 @@ from typing import TYPE_CHECKING, Any
 if TYPE_CHECKING:
     import httpx
 
-from flash.serving.app.timeouts import CANARY_TIMEOUT_SECONDS
+from flash.serving.app.timeouts import CANARY_TIMEOUT_SECONDS, ROUTER_TIMEOUT_SECONDS
 from flash.serving.promotion.canary import (
     CANARY_TRANSPORT_FAILURE,
     CanaryError,
@@ -78,10 +78,11 @@ HEALTH_NOT_STABLE = "health_release_not_stable"
 #
 _DEFAULT_ACCOUNTING_DEADLINE_SECONDS = 180.0
 _ACCOUNTING_POLL_SECONDS = 5.0
-# Modal can route health requests to both attempts for more than a minute even
-# after the first readiness probe succeeds. Use the workflow's five-minute
-# readiness budget here too, while still requiring a full stable window.
-_HEALTH_ROLLOUT_DEADLINE_SECONDS = 300.0
+# Rolling deployments can still route to the previous attempt while its inputs
+# drain. One matching readiness response does not finish that handoff. Allow a
+# full router request lifetime plus propagation time before rolling back; keep
+# requiring an uninterrupted stable identity before sending the canary.
+_HEALTH_ROLLOUT_DEADLINE_SECONDS = ROUTER_TIMEOUT_SECONDS + 300.0
 _HEALTH_STABLE_SECONDS = 30.0
 _BACKLOG_SNAPSHOT_RPC = "serving_promotion_accounting_snapshot"
 _MAX_TOKENS = 32

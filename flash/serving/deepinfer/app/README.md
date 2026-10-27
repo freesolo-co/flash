@@ -12,7 +12,7 @@ retain their separate vLLM images and capacity.
 | --- | --- |
 | GPU allocation | Four B200s on one physical machine per container (`B200:4`) |
 | Main | Zero idle containers, maximum four (16 B200s total), zero buffer containers |
-| Main rolling deployment | Temporarily allow up to eight containers (32 B200s) for old/new overlap; restore four after warm handoff |
+| Opt-in warm main deployment | Temporarily allow up to eight containers (32 B200s) for old/new overlap; restore four after warm handoff |
 | Dev and other environments | Zero warm containers, maximum one, zero buffers |
 | Admission per container | Maximum 128 requests; main planning capacity 100 concurrent streams |
 | Main scale-up | Pool-wide reserve of 64 streams: second group at 36 active requests, third at 136, fourth at 236 |
@@ -31,7 +31,7 @@ Production starts additional four-GPU groups before reaching the existing group'
 hard admission limit, up to four groups. Dev and other environments remain capped
 at one group and scale to zero. Admission above ready capacity may receive a
 retryable capacity error. After scale-to-zero, an authenticated request triggers
-startup and receives 503 until the server is ready. Main rolling deployments reserve
+startup and receives 503 until the server is ready. Opt-in warm main deployments reserve
 room for a complete replacement pool even at the normal maximum. With zero buffer containers, a
 sudden burst can arrive before additional groups are ready; the scaling target
 does not guarantee latency during cold scale-out.
@@ -167,16 +167,20 @@ python -m flash.serving.deepinfer.app.rollout
 ```
 
 The `Deploy DeepInfer pools` workflow selects the matching Modal environment on
-relevant pushes to `dev` and `main`. Main rolling deployments temporarily warm
-one replacement for verification; the controller releases that floor after the
-idle window. Ordinary deployments start with a zero minimum. The private `Engine` Modal Server requires proxy authentication and
+relevant pushes to `dev` and `main`. Routine pushes and manual dispatches keep
+zero minimum and buffer containers; deployment alone does not request idle GPUs.
+For an explicit warm main-pool handoff, dispatch with `warm_replacement=true`
+(or use the rollout commands above). That mode temporarily warms one replacement
+for verification; the controller releases its floor after the idle window.
+A routine deployment confirms configuration, not GPU readiness; first traffic
+pays the cold start. The private `Engine` Modal Server requires proxy authentication and
 exposes `/health` and `/internal/generate`.
 
 Main explicitly uses Modal's rolling strategy. Uvicorn does not open the serving
 port until every rank loads and the complete prefill, decode, and cache warmup
 finishes. A failed startup never opens that port. Existing replicas continue
 serving while replacements start. Each rollout has a unique identity in its
-health responses and load reports. The deployment waits for at least one warmed
+health responses and load reports. The opt-in warm deployment waits for at least one warmed
 replacement and for every registered replica to report the current rollout.
 The scheduled controller then restores the normal maximum of four, even if CI has
 disconnected. During rollout the maximum is eight, allowing a full replacement

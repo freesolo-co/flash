@@ -31,12 +31,19 @@ WORKFLOW_DIR = REPO_ROOT / ".github" / "workflows"
 UPSTREAM_REPOSITORY = "freesolo-co/flash"
 
 
-def test_deepinfer_rollout_cannot_report_success_before_warm_replacement():
+def test_deepinfer_warm_rollout_is_opt_in_and_verifies_the_replacement():
     workflow = yaml.safe_load((WORKFLOW_DIR / "deploy-deepinfer.yml").read_text())
     assert workflow["concurrency"]["cancel-in-progress"] is False
     job = workflow["jobs"]["deploy"]
     assert job["timeout-minutes"] >= 60
-    assert "github.run_attempt" in job["env"]["DEEPINFER_ROLLOUT_ID"]
+    rollout_id = job["env"]["DEEPINFER_ROLLOUT_ID"]
+    assert "github.run_attempt" in rollout_id
+    assert "inputs.warm_replacement == true" in rollout_id
+    triggers = workflow.get("on", workflow.get(True))
+    assert triggers["workflow_dispatch"]["inputs"]["warm_replacement"]["default"] is False
+    for step in job["steps"]:
+        if "app.rollout" in step.get("run", ""):
+            assert step["if"] == "env.DEEPINFER_ROLLOUT_ID != ''"
     commands = [step["run"] for step in job["steps"] if "run" in step]
     begin = next(i for i, cmd in enumerate(commands) if "app.rollout --begin" in cmd)
     deploy = next(i for i, cmd in enumerate(commands) if "modal deploy" in cmd)
