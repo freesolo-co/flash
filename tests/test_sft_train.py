@@ -3056,6 +3056,7 @@ def _sft_model_save_freq(monkeypatch, *, save_at_steps, save_every, horizon, wor
         max_length=1024,
         realized_max_length=128,
         train_file="/train.parquet",
+        training_dataset={},
     )
     monkeypatch.setattr(
         sft_train_runner._worker_hf, "prefetch_model", lambda *_args, context=None, **_kwargs: 0.0
@@ -5188,3 +5189,40 @@ def test_sft_failure_stops_gpu_sampler(monkeypatch, failure_stage, worker_contex
     with pytest.raises(RuntimeError, match=f"{failure_stage} failed"):
         sft_train.run_sft_train(spec, context=worker_context)
     assert stopped == [True]
+
+
+def test_sft_reports_worker_dataset_counts_separately_from_quote(worker_context, monkeypatch):
+    from flash.engine.worker.train.entry import sft_train
+
+    spec, captured = _stub_sft_run(monkeypatch, worker_context=worker_context)
+    quote = dict(spec.workload_profile)
+    prepare = sft_train.prepare_sft_workload
+    realized_counts = {}
+
+    def prepare_with_larger_source(*args, **kwargs):
+        prepared = prepare(*args, **kwargs)
+        # A custom loader exposes a larger source than the static quote can see,
+        # while max_examples still limits the rows selected for this test run.
+        profile = replace(prepared.profile, source_examples=17735)
+        realized_counts.update(
+            source_examples=profile.source_examples,
+            selected_examples=profile.selected_examples,
+            retained_examples=profile.retained_examples,
+            dropped_examples=profile.dropped_examples,
+        )
+        return replace(prepared, profile=profile)
+
+    def fake_training(command, *, env, on_step, on_line, heartbeat):
+        on_line("step:2 - train/loss:1.0 - train/global_tokens:8\n")
+        on_step(2)
+        return 0
+
+    monkeypatch.setattr(sft_train, "prepare_sft_workload", prepare_with_larger_source)
+    monkeypatch.setattr(sft_train, "run_verl_training", fake_training)
+    sft_train.run_sft_train(spec, context=worker_context)
+
+    assert spec.workload_profile == quote
+    assert quote["source_examples"] != 17735
+    assert captured["meta"]["notes"]["training_dataset"] == realized_counts
+    ready = [fields for stage, fields in captured["heartbeats"] if stage == "sft_dataset_ready"]
+    assert ready == [{"training_dataset": realized_counts}]

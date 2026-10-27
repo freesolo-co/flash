@@ -444,6 +444,7 @@ def _write_sft_result(
         step=verified.final_step,
         notes={
             "epochs": options.epochs,
+            "training_dataset": data.training_dataset,
             "resumed": bool(child.resume_step),
             "warm_started": bool(model.warmstart_adapter),
             "download_seconds": model.download_seconds,

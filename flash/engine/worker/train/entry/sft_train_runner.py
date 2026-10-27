@@ -78,6 +78,7 @@ class _SftData:
     max_length: int
     realized_max_length: int
     train_file: str
+    training_dataset: dict[str, int]
 
 
 @dataclass(frozen=True)
@@ -316,6 +317,17 @@ def _prepare_sft_data(options: _SftOptions, *, context: WorkerContext) -> _SftDa
     )
     train_file = os.path.join(options.paths.data_dir, "train.parquet")
     _sft_train._write_sft_parquet(rows, train_file)
+    # The quote describes static packaged records. Custom environment loaders can
+    # produce a different dataset; report what the worker actually prepared.
+    training_dataset = {
+        "source_examples": realized_profile.source_examples,
+        "selected_examples": selected_count,
+        "retained_examples": retained_count,
+        "dropped_examples": dropped,
+    }
+    _worker_heartbeat.heartbeat(
+        "sft_dataset_ready", context=context, training_dataset=training_dataset
+    )
     return _SftData(
         rows=rows,
         multimodal=prepared_workload.multimodal,
@@ -324,6 +336,7 @@ def _prepare_sft_data(options: _SftOptions, *, context: WorkerContext) -> _SftDa
         max_length=max_length,
         realized_max_length=realized_max_length,
         train_file=train_file,
+        training_dataset=training_dataset,
     )
 
 
