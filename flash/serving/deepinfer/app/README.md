@@ -75,9 +75,12 @@ A failed worker retires its entire group;
 ordinary request cancellation aborts only that sequence and releases its slot
 after acknowledgment.
 
-Large fresh suffixes use a 420ms grouping window before allowing an any-rank
-prefill attempt. This is not a mandatory sleep: prefill can start earlier when
-both driver ranks have eligible work. Suffixes below 8,192 uncached tokens allow
+Large fresh suffixes allow an any-rank prefill attempt after 50ms when only one
+request is active across the drivers. With multiple active requests, both drivers
+can release early once each has at least one estimated 16,384-token chunk queued
+and no pending request was admitted in the last 10ms. Unbalanced queues retain
+the 420ms maximum grouping window. Work estimates use uncached tokens at admission,
+capped at one chunk per pending request. Suffixes below 8,192 uncached tokens allow
 an any-rank attempt immediately, subject to decode protection and capacity.
 While either rank has decoding work, the scheduler protects eight decode
 iterations between prefill chunks. Those iterations are separate from the
@@ -218,6 +221,8 @@ the expected manifest hash is not qualification.
 A qualified image exercises representative prefill shapes, all existing decode
 batches, and prefix capture/reuse before readiness. Missing, modified or
 incompatible artifacts retain the exhaustive 16-token-step prefill warmup.
+The adaptive scheduler changes runtime source hashes, so the current saved image
+uses this exhaustive fallback until a new image is separately qualified.
 `/health` reports `compiled_kernel_cache_verified`. Runtime, compiler or GPU
 changes require a fresh qualification; a compiler cache miss may still compile.
 
