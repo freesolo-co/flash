@@ -234,39 +234,6 @@ def grpo_seq_escalation_gb(params_b: float | None, seq_len: int) -> int:
     return math.ceil(coef * params_b * (seq_len / seq_thresh - 1))
 
 
-def grpo_kv_floor_gb(
-    params_b: float,
-    vllm_max_len: int,
-    group_size: int = 8,
-    active_params_b: float | None = None,
-    fp8_kv: bool = False,
-    model_info=None,
-    preserve_legacy_floor: bool = False,
-    lora_rank: int = 0,
-    tensor_parallel: int = 1,
-) -> int:
-    """Smallest card whose cap holds rank-local weights, adapter, and half the KV pool."""
-    kv_params_b = float(active_params_b) if active_params_b else float(params_b)
-    tp_size = max(1, int(tensor_parallel))
-    weights_gb = max(0.5, float(params_b)) * 2.0 / tp_size
-    adapter_gb = _lora_weight_memory_gb(lora_rank, model_info, tensor_parallel=tp_size) or 0.0
-    kv_gb = _resident_kv_gb(
-        kv_params_b,
-        vllm_max_len,
-        group_size,
-        fp8_kv=fp8_kv,
-        model_info=model_info,
-        preserve_legacy_floor=preserve_legacy_floor,
-    )
-    need = weights_gb + adapter_gb + 0.5 * kv_gb
-    lower = math.ceil(need / 0.55)
-    upper = math.ceil(need / 0.45)
-    for total_vram_gb in range(lower, upper + 1):
-        if _colocate_util_cap(weights_gb, total_vram_gb) * total_vram_gb >= need:
-            return total_vram_gb
-    return upper
-
-
 def _rollout_stays_resident(model_info, model_id: str = "") -> bool:
     """True when the rollout engine is pinned resident and never sleeps.
 
@@ -312,8 +279,9 @@ def _rollout_kv_floor_gb(
     active_params_b: float | None = None,
     model_info=None,
     model_id: str = "",
-    preserve_legacy_floor: bool = False,
+    preserve_parameter_floor: bool = False,
     lora_rank: int = 0,
+    rollout_cache_min_gb: float = 0.0,
 ) -> int:
     floor = grpo_kv_floor_gb(
         params_b,
@@ -321,7 +289,8 @@ def _rollout_kv_floor_gb(
         concurrency,
         active_params_b=active_params_b,
         model_info=model_info,
-        preserve_legacy_floor=preserve_legacy_floor,
+        rollout_cache_min_gb=rollout_cache_min_gb,
+        preserve_parameter_floor=preserve_parameter_floor,
         lora_rank=lora_rank,
     )
     from flash.providers.core.base import max_non_fp8_kv_vram_gb
@@ -342,7 +311,8 @@ def _rollout_kv_floor_gb(
         active_params_b=active_params_b,
         fp8_kv=True,
         model_info=model_info,
-        preserve_legacy_floor=preserve_legacy_floor,
+        rollout_cache_min_gb=rollout_cache_min_gb,
+        preserve_parameter_floor=preserve_parameter_floor,
         lora_rank=lora_rank,
     )
     return max(fp8_floor, ceiling + 1)
@@ -365,6 +335,7 @@ def estimate_vram_gb(
     fp8_kv: bool = False,
     sft_fused_ce: bool | None = None,
     model_info=None,
+    rollout_cache_min_gb: float = 0.0,
 ) -> float:
     """Estimated peak VRAM (GB) for a LoRA job on one GPU.
 
@@ -380,33 +351,25 @@ def estimate_vram_gb(
     base = weights + _BASE_OVERHEAD_GB + lora_opt
     if algo == "grpo":
         # Sleep mode: peak = max(rollout, train). Resident: both live at once, peak = sum.
+        kv = _resident_kv_gb(
+            eff_b,
+            seq_len,
+            group_size,
+            fp8_kv=fp8_kv,
+            model_info=model_info,
+            rollout_cache_min_gb=rollout_cache_min_gb,
+        )
         if sleep_offload:
-            kv = _resident_kv_gb(
-                eff_b,
-                seq_len,
-                group_size,
-                fp8_kv=fp8_kv,
-                model_info=model_info,
-            )
-            # mirror the sleep worker's 1.5x KV lift only for catalog geometry above `_KV_CAP`.
-            # keep the capped generic estimate, whose legacy formula overestimates long context
-            # and is calibrated to the measured train/OOM boundary.
+            # Mirror the worker's 1.5x allowance for geometry-based sizing or runtime floors.
+            # Cap the parameter-only estimate, calibrated to measured train/OOM boundaries.
             arch_kv_known = (
                 _architecture_kv_raw_gb(model_info, seq_len, group_size, fp8_kv) is not None
             )
-            runtime_floor = float(getattr(model_info, "rollout_cache_min_gb", 0.0) or 0.0)
-            if (arch_kv_known or runtime_floor) and kv > _KV_CAP:
-                rollout = weights + max(_KV_CAP, 1.5 * kv)
+            if (arch_kv_known or rollout_cache_min_gb) and kv > _KV_CAP:
+                kv = 1.5 * kv
             else:
-                rollout = weights + min(kv, _KV_CAP)
-        else:
-            rollout = weights + _resident_kv_gb(
-                eff_b,
-                seq_len,
-                group_size,
-                fp8_kv=fp8_kv,
-                model_info=model_info,
-            )
+                kv = min(kv, _KV_CAP)
+        rollout = weights + kv
         group_factor = max(1.0, (max(1, group_size) / 4.0) ** 0.5)
         think_factor = 1.3 if thinking else 1.0
         activations = _TRAIN_COEF * (seq_len / 1024.0) * width * group_factor * think_factor
@@ -427,7 +390,8 @@ def estimate_vram_gb(
                 rollout_concurrency,
                 fp8_kv=fp8_kv,
                 model_info=model_info,
-                preserve_legacy_floor=True,
+                rollout_cache_min_gb=rollout_cache_min_gb,
+                preserve_parameter_floor=True,
             ),
         )
         # text opd computes exact full-vocabulary ce in chunks of VERL_FUSED_CE_CHUNK_TOKENS rows.
@@ -666,6 +630,7 @@ def _model_vram_need(
     active_params_b: float | None = None,
     fp8_kv: bool = False,
     model_info=None,
+    rollout_cache_min_gb: float = 0.0,
 ) -> int:
     """Estimate the headroom-adjusted VRAM requirement."""
     est = estimate_vram_gb(
@@ -683,6 +648,7 @@ def _model_vram_need(
         fp8_kv=fp8_kv,
         sft_fused_ce=sft_fused_ce,
         model_info=model_info,
+        rollout_cache_min_gb=rollout_cache_min_gb,
     )
     return math.ceil(est * headroom)
 
@@ -704,6 +670,7 @@ def _opd_fp8_adjust(
     vocab: int = _VOCAB_DEFAULT,
     active_params_b: float | None = None,
     model_info=None,
+    rollout_cache_min_gb: float = 0.0,
 ) -> int:
     """Re-size an OPD requirement with fp8 KV on modern cards when sufficient."""
     from flash.providers.core.base import max_non_fp8_kv_vram_gb
@@ -734,6 +701,7 @@ def _opd_fp8_adjust(
         active_params_b=active_params_b,
         fp8_kv=True,
         model_info=model_info,
+        rollout_cache_min_gb=rollout_cache_min_gb,
     )
     return fp8_need if fp8_need > ceiling else need
 
@@ -763,10 +731,10 @@ def _catalog_model_required_vram_gb(
     if model_revision:
         params_b, model_vocab = _validated_revision_geometry(model_id, model_revision, info)
     quant = getattr(info, "quant", "bf16") or "bf16"
-    # pinned commits retain validated coarse geometry but use conservative generic architecture sizing.
-    from flash.engine.plan.kv_sizing import revision_sizing_info
-
-    sizing_info = revision_sizing_info(info, model_revision)
+    # Pinned revisions use their validated params/vocab, not unverified catalog layer geometry.
+    # The model's runtime memory allowance still applies independently of that geometry.
+    sizing_info = None if model_revision else info
+    rollout_cache_min_gb = info.rollout_cache_min_gb
     active_b = float(getattr(sizing_info, "active_params_b", 0.0) or 0.0)
     need = _model_vram_need(
         params_b or 4.0,
@@ -783,6 +751,7 @@ def _catalog_model_required_vram_gb(
         vocab=model_vocab,
         active_params_b=active_b,
         model_info=sizing_info,
+        rollout_cache_min_gb=rollout_cache_min_gb,
     )
     if is_opd:
         need = _opd_fp8_adjust(
@@ -801,6 +770,7 @@ def _catalog_model_required_vram_gb(
             vocab=model_vocab,
             active_params_b=active_b,
             model_info=sizing_info,
+            rollout_cache_min_gb=rollout_cache_min_gb,
         )
     floor = 0
     if is_grpo and getattr(info, "grpo_min_vram_gb", 0):
@@ -828,6 +798,7 @@ def _catalog_model_required_vram_gb(
                     active_params_b=active_b,
                     fp8_kv=True,
                     model_info=sizing_info,
+                    rollout_cache_min_gb=rollout_cache_min_gb,
                 )
                 # 1.15 resident margin (NOT the looser 1.1 headroom) so the parse-time reject
                 # lands at the SAME resident wall the worker gate enforces.
@@ -859,8 +830,9 @@ def _catalog_model_required_vram_gb(
                 vllm_concurrency,
                 active_params_b=active_b,
                 model_info=sizing_info,
+                rollout_cache_min_gb=rollout_cache_min_gb,
                 model_id=model_id,
-                preserve_legacy_floor=is_opd,
+                preserve_parameter_floor=is_opd,
                 lora_rank=lora_rank,
             ),
         )
@@ -978,6 +950,7 @@ from flash.engine.plan.kv_sizing import (  # noqa: E402,F401
     _colocate_util_cap,
     _resident_kv_gb,
     colocate_kv_util,
+    grpo_kv_floor_gb,
 )
 
 # The pinned-commit config probe lives in `flash.engine.plan.model_config_probe`, for the same

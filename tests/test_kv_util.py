@@ -317,12 +317,18 @@ def test_moe_colocate_budget_kv_matches_resident_gate_kv():
     assert round(budget_kv, 6) == round(gate_kv, 6)
 
 
-@pytest.mark.parametrize("model_id", ["Qwen/Qwen3.5-4B"])
-def test_qwen35_4b_rollout_budget_covers_cold_gdn_profile(model_id):
+def test_qwen35_4b_rollout_budget_covers_cold_gdn_profile():
     from flash.core.catalog import get_model
 
-    info = get_model(model_id)
-    cache_gb = _resident_kv_gb(info.params_b, 256, 16, model_info=info, fp8_kv=True)
+    info = get_model("Qwen/Qwen3.5-4B")
+    cache_gb = _resident_kv_gb(
+        info.params_b,
+        256,
+        16,
+        model_info=info,
+        fp8_kv=True,
+        rollout_cache_min_gb=info.rollout_cache_min_gb,
+    )
     assert cache_gb >= 24.0
     util = colocate_kv_util(
         info.params_b,
@@ -333,27 +339,23 @@ def test_qwen35_4b_rollout_budget_covers_cold_gdn_profile(model_id):
         model_info=info,
         fp8_kv=True,
         lora_rank=8,
+        rollout_cache_min_gb=info.rollout_cache_min_gb,
     )
     # The old ~17.3 GB whole-engine reservation failed before any base-model rollout.
     assert util * 80 >= info.params_b * 2 + cache_gb
     assert util <= 0.45
 
 
-@pytest.mark.parametrize("model_id", ["Qwen/Qwen3.5-4B"])
-def test_pinned_qwen35_4b_keeps_runtime_floor_without_assuming_geometry(monkeypatch, model_id):
+def test_pinned_qwen35_4b_keeps_runtime_floor_without_assuming_geometry(monkeypatch):
     from flash.core.catalog import get_model
-    from flash.engine.plan.kv_sizing import revision_sizing_info
     from flash.engine.plan.vram import estimate_vram_gb
     from flash.engine.worker.train.rl.launch.verl_config import resolve_gpu_mem_util
 
-    info = get_model(model_id)
-    sizing = revision_sizing_info(info, "a" * 40)
-    assert sizing.rollout_cache_min_gb == info.rollout_cache_min_gb
-    assert not hasattr(sizing, "num_attention_layers")
+    info = get_model("Qwen/Qwen3.5-4B")
     monkeypatch.setattr("flash.engine.plan.vram.resolve_params_b", lambda *a, **kw: info.params_b)
     util = resolve_gpu_mem_util(
         {
-            "model_id": model_id,
+            "model_id": info.id,
             "model_revision": "a" * 40,
             "engine_len": 256,
             "group_size": 4,
@@ -373,6 +375,38 @@ def test_pinned_qwen35_4b_keeps_runtime_floor_without_assuming_geometry(monkeypa
         lora_rank=8,
         sleep_offload=True,
         fp8_kv=True,
-        model_info=sizing,
+        model_info=None,
+        rollout_cache_min_gb=info.rollout_cache_min_gb,
     )
     assert estimate >= 2 * info.params_b * 2 + 1.5 * info.rollout_cache_min_gb
+
+
+@pytest.mark.parametrize("revision", ["", "a" * 40])
+def test_admission_retains_rollout_floor_with_or_without_revision(monkeypatch, revision):
+    from dataclasses import replace
+
+    from flash.core.catalog import MODELS
+    from flash.engine.plan import vram
+
+    # Remove the independent card-size guard so it cannot hide a dropped cache allowance.
+    info = replace(MODELS["Qwen/Qwen3.5-4B"], grpo_min_vram_gb=0)
+    monkeypatch.setitem(MODELS, info.id, info)
+    monkeypatch.setattr(
+        vram, "_validated_revision_geometry", lambda *args: (info.params_b, info.vocab_size)
+    )
+    train = {"max_context_tokens": 256, "group_size": 4, "lora_rank": 64}
+    with_floor = vram.model_required_vram_gb(info.id, "grpo", train=train, model_revision=revision)
+    monkeypatch.setitem(MODELS, info.id, replace(info, rollout_cache_min_gb=0.0))
+    without_floor = vram.model_required_vram_gb(
+        info.id, "grpo", train=train, model_revision=revision
+    )
+    assert with_floor > without_floor
+
+
+@pytest.mark.parametrize("fp8_kv", [False, True])
+def test_cache_minimum_applies_without_layer_geometry(fp8_kv):
+    assert _resident_kv_gb(4.7, 256, 4, fp8_kv=fp8_kv, rollout_cache_min_gb=24.0) == 24.0
+    # A minimum does not cap a larger parameter-based estimate.
+    estimate = _resident_kv_gb(4.7, 32768, 16, fp8_kv=fp8_kv)
+    assert estimate > 24.0
+    assert _resident_kv_gb(4.7, 32768, 16, fp8_kv=fp8_kv, rollout_cache_min_gb=24.0) == estimate

@@ -9658,7 +9658,7 @@ def test_opd_multigpu_gpu_mem_util_matches_the_shared_tp_aware_resolver():
         n_gpus=2,
         fp8_kv=False,
         sleep_unsupported=True,
-        preserve_legacy_floor=True,
+        preserve_parameter_floor=True,
     )
 
     assert got == want

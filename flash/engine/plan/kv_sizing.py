@@ -11,7 +11,6 @@ estimators read them too; defining them here keeps this module importable on its
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
 
 _KV_COEF = 2.0
 _KV_CAP = 8.0
@@ -22,21 +21,8 @@ _KV_PROFILE_OVERHEAD_GB = 1.5
 _KV_FRAGMENTATION_MARGIN = 1.25
 # the smallest share of a card vllm is given. below this the engine has no room for its own runtime
 # once the kv pool is carved out, so a budget that prices under it is not a smaller engine but a
-# broken one. the legacy equation and the multi-rank shard path both bottom out here.
+# broken one. the parameter-based estimate and multi-rank shard path both bottom out here.
 _MIN_ENGINE_UTIL = 0.10
-
-
-@dataclass(frozen=True)
-class _RolloutMemoryFloor:
-    rollout_cache_min_gb: float
-
-
-def revision_sizing_info(info, revision: str):
-    """Retain runtime memory floors without trusting a pinned revision's catalog geometry."""
-    if not revision:
-        return info
-    floor = float(getattr(info, "rollout_cache_min_gb", 0.0) or 0.0)
-    return _RolloutMemoryFloor(floor) if floor else None
 
 
 def _round_up(value: int, multiple: int) -> int:
@@ -73,8 +59,8 @@ def _architecture_kv_raw_gb(
         if not all((key_heads, value_heads, key_dim, value_dim, conv_kernel)):
             # linear-attention dims are absent from the catalog: we can't size the recurrent/conv
             # state, but the standard attention KV already accumulated in total_bytes is a better
-            # (if partial) estimate than the params-only legacy heuristic. The caller floors this
-            # partial value with legacy so a hybrid model is never under-sized below the heuristic.
+            # (if partial) estimate than the parameter-based heuristic. The caller also retains
+            # that heuristic as a floor when linear-attention geometry is incomplete.
             return total_bytes / 1e9
         # vllm stores qwen gated-deltanet recurrent and convolution state in bf16 pages.
         state_elements = value_heads * key_dim * value_dim
@@ -98,26 +84,28 @@ def _resident_kv_gb(
     num_generations: int = 8,
     fp8_kv: bool = False,
     model_info=None,
-    preserve_legacy_floor: bool = False,
+    preserve_parameter_floor: bool = False,
+    rollout_cache_min_gb: float = 0.0,
 ) -> float:
-    """Profiled vLLM cache budget from architecture, with measured conservative floors."""
+    """Estimate cache memory, keeping the runtime minimum independent of model geometry."""
     width = math.sqrt(max(float(params_b or 1.0), 0.1))
-    legacy = _KV_COEF * (max(1, vllm_max_len) / 1024.0) * width
-    legacy *= max(1, num_generations) / 8.0
+    parameter_estimate_gb = _KV_COEF * (max(1, vllm_max_len) / 1024.0) * width
+    parameter_estimate_gb *= max(1, num_generations) / 8.0
     if fp8_kv:
-        legacy *= 0.5
+        parameter_estimate_gb *= 0.5
 
     raw = _architecture_kv_raw_gb(model_info, vllm_max_len, num_generations, fp8_kv)
-    model_floor = float(getattr(model_info, "rollout_cache_min_gb", 0.0) or 0.0)
     if raw is None:
-        return max(model_floor, legacy)
-    profiled = max(_KV_CAP, model_floor, _KV_PROFILE_OVERHEAD_GB + raw * _KV_FRAGMENTATION_MARGIN)
+        return max(rollout_cache_min_gb, parameter_estimate_gb)
+    profiled = max(
+        _KV_CAP, rollout_cache_min_gb, _KV_PROFILE_OVERHEAD_GB + raw * _KV_FRAGMENTATION_MARGIN
+    )
     # opd startup tiers and the resident-only 35b boundary are live-calibrated. retain their old
     # conservative pool until the architecture equation is validated on those exact gpu paths.
     # a hybrid model whose linear-attention dims are absent yields a PARTIAL estimate (attention KV
-    # only); floor it with legacy so the dropped recurrent/conv state can't under-size it.
-    _declares_linear = int(getattr(model_info, "num_linear_attention_layers", 0) or 0) > 0
-    _linear_dims_known = all(
+    # only); retain the parameter estimate so the missing recurrent/conv state cannot under-size it.
+    declares_linear = int(getattr(model_info, "num_linear_attention_layers", 0) or 0) > 0
+    linear_dims_known = all(
         int(getattr(model_info, _f, 0) or 0)
         for _f in (
             "linear_num_key_heads",
@@ -128,11 +116,11 @@ def _resident_kv_gb(
         )
     )
     if (
-        preserve_legacy_floor
+        preserve_parameter_floor
         or getattr(model_info, "sleep_unsupported", False)
-        or (_declares_linear and not _linear_dims_known)
+        or (declares_linear and not linear_dims_known)
     ):
-        profiled = max(profiled, legacy)
+        profiled = max(profiled, parameter_estimate_gb)
     return profiled
 
 
@@ -167,6 +155,43 @@ def _capped_engine_util(
     return min(util_cap, fitted_engine_gb / card_gb)
 
 
+def grpo_kv_floor_gb(
+    params_b: float,
+    vllm_max_len: int,
+    group_size: int = 8,
+    active_params_b: float | None = None,
+    fp8_kv: bool = False,
+    model_info=None,
+    preserve_parameter_floor: bool = False,
+    lora_rank: int = 0,
+    tensor_parallel: int = 1,
+    rollout_cache_min_gb: float = 0.0,
+) -> int:
+    """Smallest card whose cap holds rank-local weights, adapter, and half the KV pool."""
+    from flash.engine.plan.vram import _lora_weight_memory_gb
+
+    kv_params_b = float(active_params_b) if active_params_b else float(params_b)
+    tp_size = max(1, int(tensor_parallel))
+    weights_gb = max(0.5, float(params_b)) * 2.0 / tp_size
+    adapter_gb = _lora_weight_memory_gb(lora_rank, model_info, tensor_parallel=tp_size) or 0.0
+    kv_gb = _resident_kv_gb(
+        kv_params_b,
+        vllm_max_len,
+        group_size,
+        fp8_kv=fp8_kv,
+        model_info=model_info,
+        rollout_cache_min_gb=rollout_cache_min_gb,
+        preserve_parameter_floor=preserve_parameter_floor,
+    )
+    need = weights_gb + adapter_gb + 0.5 * kv_gb
+    lower = math.ceil(need / 0.55)
+    upper = math.ceil(need / 0.45)
+    for total_vram_gb in range(lower, upper + 1):
+        if _colocate_util_cap(weights_gb, total_vram_gb) * total_vram_gb >= need:
+            return total_vram_gb
+    return upper
+
+
 def colocate_kv_util(
     params_b: float | None,
     vllm_max_len: int,
@@ -176,15 +201,16 @@ def colocate_kv_util(
     active_params_b: float | None = None,
     fp8_kv: bool = False,
     model_info=None,
-    preserve_legacy_floor: bool = False,
+    preserve_parameter_floor: bool = False,
     tensor_parallel: int = 1,
     lora_rank: int = 0,
+    rollout_cache_min_gb: float = 0.0,
 ) -> float:
     """vllm_gpu_memory_utilization for one colocated rollout tensor-parallel rank.
 
     budget the rank's weight shard, rank-local bf16 lora footprint, and conservative full kv cache.
     catalog models use geometry with measured overhead and an 8 gb floor; uncataloged models retain
-    the legacy kv equation and no unverified adapter margin.
+    the parameter-based estimate and no unverified adapter margin.
     """
     from flash.engine.plan.vram import _lora_weight_memory_gb
 
@@ -200,41 +226,20 @@ def colocate_kv_util(
     # 0.45 starves KV for >=60 GB colocated weight copies on cards with residual headroom.
     # lift to 0.55 only when `0.45 * total_vram_gb - weight_copy_gb >= 10`; this admits B200
     # but not H200. `_NvidiaSmiPeakSampler` verifies runtime headroom.
-    _util_cap = _colocate_util_cap(weights_gb, total_vram_gb)
-    if not sleep_mode:
-        # `gpu_memory_utilization` covers weights, adapter, and kv, so budget all three. scale kv with
-        # context and group, floor at `_KV_CAP`, and keep the 0.45 cap aligned with
-        # `estimate_vram_gb(..., sleep_offload=False)`.
-        kv_gb = max(
-            _KV_CAP,
-            _resident_kv_gb(
-                kv_params_b,
-                vllm_max_len,
-                num_generations,
-                fp8_kv=fp8_kv,
-                model_info=model_info,
-                preserve_legacy_floor=preserve_legacy_floor,
-            ),
-        )
-        sized = _capped_engine_util(weights_gb, adapter_gb, kv_gb, total_vram_gb, _util_cap)
-        return max(_MIN_ENGINE_UTIL, sized)
+    util_cap = _colocate_util_cap(weights_gb, total_vram_gb)
+    kv_gb = _resident_kv_gb(
+        kv_params_b,
+        vllm_max_len,
+        num_generations,
+        fp8_kv=fp8_kv,
+        model_info=model_info,
+        preserve_parameter_floor=preserve_parameter_floor,
+        rollout_cache_min_gb=rollout_cache_min_gb,
+    )
     # Sleep mode keeps a larger pool (1.5x margin): the engine is offloaded during the backward, so a
     # bigger rollout-phase KV does not compete with the training peak.
-    kv_pool_gb = max(
-        _KV_CAP,
-        1.5
-        * _resident_kv_gb(
-            kv_params_b,
-            vllm_max_len,
-            num_generations,
-            fp8_kv=fp8_kv,
-            model_info=model_info,
-            preserve_legacy_floor=preserve_legacy_floor,
-        ),
-    )
-    sized = _capped_engine_util(weights_gb, adapter_gb, kv_pool_gb, total_vram_gb, _util_cap)
-    # sharding the weight term can drive a small model's rank budget low enough that vllm has no
-    # room left for its own runtime once the kv pool is carved out -- a 4B model on 2 cards prices
-    # under this floor. single-rank sizing carries the whole weight copy and never gets that small,
-    # so the floor exists only where sharding created the problem.
-    return max(_MIN_ENGINE_UTIL, sized) if tp_size > 1 else sized
+    kv_pool_gb = max(_KV_CAP, kv_gb * (1.5 if sleep_mode else 1.0))
+    sized = _capped_engine_util(weights_gb, adapter_gb, kv_pool_gb, total_vram_gb, util_cap)
+    # Resident engines always retain a minimum allocation. Sleeping engines need it only when
+    # tensor parallelism shrinks each rank's weight budget below the engine's runtime overhead.
+    return max(_MIN_ENGINE_UTIL, sized) if not sleep_mode or tp_size > 1 else sized
