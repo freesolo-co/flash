@@ -730,6 +730,7 @@ def rollout_gdn_prefill_overrides(
     The pinned vLLM 0.19.1 selects FlashInfer on SM90. Its FlashInfer 0.6.6 has
     a confirmed stochastic GDN graph-replay deadlock on H100 (flashinfer-ai/
     flashinfer#3329). Triton avoids that kernel for affected GRPO deployments.
+    scripts/repro_hopper_gdn_prefill.py isolates a failing Decision batch shape.
     This is a scoped mitigation, not a diagnosis of every collective timeout.
     """
     if not gdn_hybrid or cc != (9, 0) or n_gpus <= 1:
