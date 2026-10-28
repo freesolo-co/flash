@@ -162,23 +162,37 @@ def test_bake_uses_the_native_training_backend(monkeypatch):
     assert kernel_warmup._training_gdn_kernel() is implementation
 
 
-def test_flashinfer_prefill_bake_loads_the_pinned_rollout_library(monkeypatch):
-    from flash.engine.worker.train.core.child import flashinfer_cache
-
+@pytest.mark.parametrize("finite", [True, False])
+def test_flashinfer_prefill_bake_executes_native_kernel(monkeypatch, finite):
     calls = []
-    module = types.SimpleNamespace(get_gdn_prefill_module=lambda: calls.append("load"))
+
+    def prefill(**kwargs):
+        assert kwargs["output_final_state"] is True
+        assert kwargs["initial_state"] is not None
+        assert kwargs["cu_seqlens"] is not None
+        calls.append("prefill")
+        return object(), object()
+
+    # The replacement kernel has no get_gdn_prefill_module or C++ AOT library.
+    module = types.SimpleNamespace(chunk_gated_delta_rule=prefill)
     monkeypatch.setitem(sys.modules, "flashinfer.gdn_prefill", module)
-    monkeypatch.setitem(sys.modules, "flashinfer.jit", types.SimpleNamespace(env=object()))
-    monkeypatch.setattr(flashinfer_cache, "activate", lambda _: calls.append("activate"))
-    monkeypatch.setattr(flashinfer_cache, "publish", lambda *_: calls.append("publish"))
     torch = types.SimpleNamespace(
-        cuda=types.SimpleNamespace(synchronize=lambda: calls.append("sync"))
+        cuda=types.SimpleNamespace(synchronize=lambda: calls.append("sync")),
+        zeros=lambda *a, **k: object(),
+        ones=lambda *a, **k: object(),
+        full=lambda *a, **k: object(),
+        tensor=lambda *a, **k: object(),
+        bfloat16="bfloat16",
+        float32="float32",
+        int64="int64",
+        isfinite=lambda _: types.SimpleNamespace(all=lambda: finite),
     )
-    assert kernel_warmup.warm_flashinfer_gdn(torch)
-    assert calls == ["activate", "load", "sync", "publish"]
+    assert kernel_warmup.warm_flashinfer_gdn(torch) is finite
+    assert calls == ["prefill", "sync"]
 
 
-def test_hopper_bake_requires_rollout_prefill_coverage(monkeypatch, tmp_path):
+@pytest.mark.parametrize("verify_cache", [False, True])
+def test_hopper_bake_requires_rollout_prefill_coverage(monkeypatch, tmp_path, verify_cache):
     torch = types.SimpleNamespace(
         cuda=types.SimpleNamespace(get_device_capability=lambda _: (9, 0)),
     )
@@ -188,7 +202,9 @@ def test_hopper_bake_requires_rollout_prefill_coverage(monkeypatch, tmp_path):
     monkeypatch.setattr(kernel_warmup, "warm_flashinfer_gdn", lambda _: False)
     monkeypatch.setattr(kernel_warmup, "has_raw_kernel_cache", lambda _: True)
     monkeypatch.setattr(kernel_warmup, "save_cache_metadata", lambda *a, **k: True)
-    assert kernel_warmup.warmup(str(tmp_path)) == 1
+    monkeypatch.setattr(kernel_warmup, "_cached_kernels_only", lambda _: contextlib.nullcontext([]))
+    (tmp_path / "mega_cache.json").write_text('{"sm": "sm90"}')
+    assert kernel_warmup.warmup(str(tmp_path), verify_cache=verify_cache) == 1
 
 
 @pytest.mark.parametrize("backend", [None, "triton", "tilelang", "flashinfer", "torch"])
@@ -249,7 +265,9 @@ def test_reload_rejects_compilation_even_if_the_backend_swallows_the_error(
     assert kernel_warmup.warmup(str(tmp_path), verify_cache=True) == int(backend is not None)
     proof = json.loads((tmp_path / "cache_reload.json").read_text())
     assert proof == {
-        "compilation_forbidden": True,
+        "cached_groups_compilation_forbidden": True,
+        "cached_groups": ["flash_attn", "fla_gdn"],
+        "startup_jit_groups": ["flashinfer_gdn"],
         "compile_attempts": int(backend is not None),
         "passed": backend is None,
     }

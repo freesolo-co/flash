@@ -22,6 +22,7 @@ from flash.engine.worker.train.entry.backend_common import (
     FLA_REQUIREMENT,
     FLASH_QLA_REQUIREMENT,
     TRANSFORMERS_INSTALL_REQUIREMENT,
+    VERL_FLASHINFER_REQUIREMENTS,
     VERL_REQUIREMENT_NAME,
     VERL_REQUIREMENT_URL,
     VERL_VENV_PYTHON,
@@ -432,6 +433,8 @@ def resolve_verl_python(workdir: str, *, install_wandb: bool = False) -> str:
             f.write(
                 f"numpy==2.2.6\nxgrammar==0.1.25\nvllm==0.19.1\n"
                 f"{TRANSFORMERS_INSTALL_REQUIREMENT}\n"
+                + "\n".join(VERL_FLASHINFER_REQUIREMENTS)
+                + "\n"
             )
         subprocess.run(
             [
@@ -446,6 +449,7 @@ def resolve_verl_python(workdir: str, *, install_wandb: bool = False) -> str:
                 # Install the bare package with Flash's explicit CUDA 12.8 runtime instead.
                 f"{VERL_REQUIREMENT_NAME} @ {VERL_REQUIREMENT_URL}",
                 "vllm==0.19.1",
+                *VERL_FLASHINFER_REQUIREMENTS,
                 "numpy==2.2.6",
                 TRANSFORMERS_INSTALL_REQUIREMENT,
                 # not transitively guaranteed: verl imports these at module level on the launch path

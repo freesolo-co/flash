@@ -44,14 +44,32 @@ def test_verify_accepts_real_raw_artifacts(tmp_path, artifact):
         '{"first_exit_code": 0, "reload_exit_code": 0, "exported_cache_replayed": true}'
     )
     (tmp_path / "cache_reload.json").write_text(
-        '{"compilation_forbidden": true, "compile_attempts": 0, "passed": true}'
+        json.dumps(
+            {
+                "cached_groups_compilation_forbidden": True,
+                "cached_groups": ["flash_attn", "fla_gdn"],
+                "startup_jit_groups": [],
+                "compile_attempts": 0,
+                "passed": True,
+            }
+        )
     )
     assert bake_module()._verify(str(tmp_path), "sm100") == 0
     assert bake_module()._verify(str(tmp_path), "sm90") == 1
 
 
 @pytest.mark.parametrize(
-    "failure", ["missing", "recompiled", "unguarded", "failed", "reload_exit", "not_exported"]
+    "failure",
+    [
+        "missing",
+        "recompiled",
+        "unguarded",
+        "failed",
+        "reload_exit",
+        "not_exported",
+        "scope",
+        "startup",
+    ],
 )
 def test_verification_requires_a_successful_compilation_free_reload(tmp_path, failure):
     (tmp_path / "triton").mkdir()
@@ -67,7 +85,9 @@ def test_verification_requires_a_successful_compilation_free_reload(tmp_path, fa
         (tmp_path / "cache_reload.json").write_text(
             json.dumps(
                 {
-                    "compilation_forbidden": failure != "unguarded",
+                    "cached_groups_compilation_forbidden": failure != "unguarded",
+                    "cached_groups": [] if failure == "scope" else ["flash_attn", "fla_gdn"],
+                    "startup_jit_groups": ["flashinfer_gdn"] if failure == "startup" else [],
                     "compile_attempts": int(failure == "recompiled"),
                     "passed": failure != "failed",
                 }

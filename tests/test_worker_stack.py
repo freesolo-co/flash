@@ -1120,7 +1120,7 @@ def test_verl_venv_pins_transformers_to_the_main_interpreters_version():
     main_pin = re.search(r'"(transformers==[\d.]+)"[^\n]*\\\n\s+"peft', dockerfile)
     assert main_pin, "could not find the main interpreter's exact transformers pin"
 
-    overrides = re.search(r"printf '%s\\n'(.*?)> /tmp/verl-overrides\.txt", dockerfile)
+    overrides = re.search(r"printf '%s\\n'(.*?)> /tmp/verl-overrides\.txt", dockerfile, re.DOTALL)
     assert overrides, "could not find the verl-overrides.txt line"
     assert main_pin.group(1) in overrides.group(1), (
         "the verl venv override file must pin transformers to the same exact version as the main "
