@@ -8,6 +8,7 @@ failed Qwen3.5-9B TP2 rollout's scheduler dump: 35 decodes and eight prefills.
 This isolates the prefill implementation; it does not replay the entire trainer.
 Compilation is warmed separately. Trial timeouts only count as kernel stalls
 after warmup succeeds. Both backends run in fresh processes with identical seeds.
+Use --eager to exercise ordinary kernel launches instead of CUDA graph replay.
 """
 
 from __future__ import annotations
@@ -74,14 +75,15 @@ def trial(args):
     print("WARMED", flush=True)
     if args.warmup:
         return
-    graph = torch.cuda.CUDAGraph()
-    stream = torch.cuda.Stream()
-    stream.wait_stream(torch.cuda.current_stream())
-    with torch.cuda.stream(stream), torch.cuda.graph(graph):
-        output, final_state = invoke()
-    torch.cuda.current_stream().wait_stream(stream)
-    torch.cuda.synchronize()
-    print("CAPTURED", flush=True)
+    if not args.eager:
+        graph = torch.cuda.CUDAGraph()
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream), torch.cuda.graph(graph):
+            output, final_state = invoke()
+        torch.cuda.current_stream().wait_stream(stream)
+        torch.cuda.synchronize()
+        print("CAPTURED", flush=True)
     started = time.monotonic()
     for _ in range(args.replays):
         q.normal_()
@@ -89,7 +91,10 @@ def trial(args):
         v.normal_()
         beta.uniform_().sigmoid_()
         state.normal_().mul_(0.01)
-        graph.replay()
+        if args.eager:
+            output, final_state = invoke()
+        else:
+            graph.replay()
     torch.cuda.synchronize()
     if not torch.isfinite(output).all() or not torch.isfinite(final_state).all():
         raise RuntimeError("Non-finite GDN output")
@@ -112,6 +117,8 @@ def run_child(args, backend, seed, *, warmup=False):
     ]
     if warmup:
         command.append("--warmup")
+    if args.eager:
+        command.append("--eager")
     status = None
     with path.open("w") as log:
         child = subprocess.Popen(
@@ -141,6 +148,7 @@ def run_child(args, backend, seed, *, warmup=False):
         "backend": backend,
         "seed": seed,
         "warmup": warmup,
+        "mode": "eager" if args.eager else "graph",
         "status": status or ("passed" if child.returncode == 0 else "error"),
         "returncode": child.returncode,
         "log": str(path),
@@ -156,6 +164,7 @@ def main():
     parser.add_argument("--replays", type=int, default=1000)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--timeout", type=float, default=30)
+    parser.add_argument("--eager", action="store_true", help="Use ordinary kernel launches")
     parser.add_argument("--output", type=Path, default=Path("results/hopper-gdn-repro"))
     parser.add_argument("--worker", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--warmup", action="store_true", help=argparse.SUPPRESS)
