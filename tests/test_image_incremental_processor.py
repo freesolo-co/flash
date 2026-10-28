@@ -14,7 +14,7 @@ import pytest
 from flash.content import multimodal as mm
 
 MODEL_ID = "Qwen/Qwen3.5-9B"
-MODEL_REVISION = "851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a"
+MODEL_REVISION = "c202236235762e1c871ad0ccb60c8ee5ba337b9a"
 _IMAGE_CASES = [
     ((56, 56), "red", 64),
     ((300, 200), "green", 70),
@@ -327,6 +327,134 @@ def test_processor_digest_detects_a_qwen_intermediate_resize(real_processor):
             raise AssertionError("text-only digest path touched the image processor")
 
     assert processor_image_digests(_TextOnlyProcessor(), []) == []
+
+
+def test_initial_rollout_media_matches_parent_pixels_and_tokens(real_processor, tmp_path):
+    from flash.engine.worker.train.core.child.glue import (
+        parent_image_digests,
+        prepare_episode_prompt,
+    )
+
+    data = _nonuniform_32_png()
+    path = tmp_path / "initial.png"
+    path.write_bytes(data)
+    prompt = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "image", "image": path.as_uri()},
+                {"type": "text", "text": "Describe this image."},
+            ],
+        }
+    ]
+
+    class Loop:
+        processor = real_processor
+
+        async def process_multi_modal_info(self, messages):
+            raise AssertionError("initial image used verl's intermediate resize")
+
+        def _assert_mm_supported(self, enabled):
+            assert enabled
+
+        def _get_mm_processor_kwargs(self, _audio):
+            return {}
+
+        async def ct_build_initial_tokens(self, messages, *, images, **kwargs):
+            rendered = self.processor.apply_chat_template(
+                messages, tokenize=False, add_generation_prompt=True, enable_thinking=False
+            )
+            return _flat_ids(self.processor(text=[rendered], images=images, return_tensors="np"))
+
+    descriptor = mm.normalize_image_source(data, None)
+    result = asyncio.run(prepare_episode_prompt(Loop(), prompt))
+    try:
+        assert result.images[0].size == (32, 32)
+        assert result.image_digests == parent_image_digests(real_processor, [descriptor], None)
+        parent_messages = mm.messages_with_decoded_images(result.structured_messages, result.images)
+        assert result.prompt_ids == _processor_ids(real_processor, parent_messages)
+    finally:
+        for image in result.images:
+            image.close()
+
+
+def test_initial_image_loader_preserves_pixels_for_staged_files_and_inline_images(tmp_path):
+    from flash.engine.worker.train.core.child.prompt_media import initial_prompt_images
+
+    data = _nonuniform_32_png()
+    path = tmp_path / "staged screenshot.png"
+    path.write_bytes(data)
+    uri = "data:image/png;base64," + base64.b64encode(data).decode()
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "image", "image": path.as_uri()},
+                {"type": "image", "image": uri},
+            ],
+        }
+    ]
+    images = initial_prompt_images(messages)
+    try:
+        assert len(images) == 2
+        assert [image.size for image in images] == [(32, 32), (32, 32)]
+        assert images[0].tobytes() == images[1].tobytes()
+    finally:
+        for image in images:
+            image.close()
+    with pytest.raises(ValueError, match="not video or audio"):
+        initial_prompt_images([{"role": "user", "content": [{"type": "video"}]}])
+    assert initial_prompt_images([{"role": "user", "content": "text only"}]) is None
+
+
+def test_staged_png_may_exceed_the_admitted_jpeg_source_budget(tmp_path, monkeypatch):
+    import random
+
+    from PIL import Image
+
+    from flash.engine.worker.train.core.child.prompt_media import initial_prompt_images
+
+    pixels = random.Random(0).randbytes(64 * 64 * 3)
+    with Image.frombytes("RGB", (64, 64), pixels) as image:
+        jpeg = io.BytesIO()
+        image.save(jpeg, format="JPEG", quality=80)
+    source = jpeg.getvalue()
+    monkeypatch.setattr(mm, "MAX_IMAGE_SOURCE_BYTES", len(source))
+    descriptor = mm.normalize_image_source(source, None)
+    admitted = mm.decode_image_descriptors([descriptor], None)
+    path = tmp_path / "staged.png"
+    try:
+        admitted[0].save(path)
+        assert path.stat().st_size > mm.MAX_IMAGE_SOURCE_BYTES
+        messages = [{"role": "user", "content": [{"type": "image", "image": path.as_uri()}]}]
+        decoded = initial_prompt_images(messages)
+        try:
+            assert decoded[0].tobytes() == admitted[0].tobytes()
+        finally:
+            decoded[0].close()
+        # The same PNG supplied as an authored source still obeys admission limits.
+        with pytest.raises(ValueError, match="limit"):
+            mm.normalize_image_source(path.read_bytes(), None)
+    finally:
+        admitted[0].close()
+
+
+@pytest.mark.parametrize(
+    ("image_count", "memory_limit"), [(1, 32 * 32 * 9 - 1), (2, 32 * 32 * 12 - 1)]
+)
+def test_staged_images_preserve_decoded_memory_limits(
+    tmp_path, monkeypatch, image_count, memory_limit
+):
+    from flash.engine.worker.train.core.child.prompt_media import initial_prompt_images
+
+    path = tmp_path / "staged.png"
+    path.write_bytes(_nonuniform_32_png())
+    monkeypatch.setattr(mm, "MAX_TOTAL_DECODED_BYTES", memory_limit)
+    messages = [
+        {"role": "user", "content": [{"type": "image", "image": path.as_uri()}] * image_count}
+    ]
+    with pytest.raises(ValueError, match="decoded images exceed the memory limit"):
+        initial_prompt_images(messages)
 
 
 def test_processor_digest_separates_images_that_differ_only_by_grid(real_processor):

@@ -901,7 +901,20 @@ def prepare_sft_workload(
         raise ValueError("source_examples cannot be smaller than the selected sft sample")
     prompt_rows = []
     for example in selected:
-        prompt_messages = env.prompt_messages(example)
+        # An authored SFT transcript is an explicit data contract, visible to both the
+        # static quote and the worker. Do not stringify its images through `input`, or
+        # let an environment hook silently replace it after a text-only quote was frozen.
+        prompt_messages = example.get("prompt_messages")
+        if "prompt_messages" in example:
+            if (
+                not isinstance(prompt_messages, list)
+                or not prompt_messages
+                or not all(isinstance(message, dict) for message in prompt_messages)
+            ):
+                raise ValueError("sft prompt_messages must be a nonempty list of message objects")
+            prompt_messages = [dict(message) for message in prompt_messages]
+        else:
+            prompt_messages = env.prompt_messages(example)
         completion_messages, coerced_scalar_output = _sft_completion_with_provenance(env, example)
         prompt_rows.append((example, prompt_messages, completion_messages, coerced_scalar_output))
     package_root = getattr(env, "package_root", None)
