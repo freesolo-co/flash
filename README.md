@@ -142,8 +142,8 @@ contract. SFT rows can instead supply `prompt_messages`, a nonempty chat-message
 that is authoritative for both profiling and training. This preserves stored multi-turn
 histories and screenshot blocks; image-bearing transcripts use unpacked execution.
 The row still requires `input` for dataset identity. Environment-added prompts, few-shot
-examples, tool schemas, filters, and transformations are **not** executed, so real training can retain fewer rows, truncate more
-often, and cost more than the estimate. If no readable dataset exists, cost, dry-run, and
+examples, tool schemas, filters, and transformations are **not** executed, so real training
+can retain fewer rows, truncate more often, and cost more than the estimate. If no readable dataset exists, cost, dry-run, and
 submit all fail before GPU allocation rather than billing a profiling run.
 
 ## Working on the code
