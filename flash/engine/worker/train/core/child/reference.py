@@ -12,18 +12,18 @@ _KL_REF_ADAPTER_MARKER = "[flash-verl] kl reference anchored to the warm-start a
 def snapshot(module):
     if adapter_name in getattr(module, "peft_config", {}):
         return module
-    module.add_adapter(adapter_name, module.peft_config[module.active_adapter])
+    source_adapter = module.active_adapter
+    module.add_adapter(adapter_name, module.peft_config[source_adapter])
     demoted = 0
     for container in module.modules():
         if isinstance(container, nn.ModuleDict) and adapter_name in container:
             leaf = container[adapter_name]
-            for attr, _value in list(leaf.named_parameters(recurse=False)):
-                # Nonzero FSDP ranks can still have meta adapter parameters here.
-                # Clone the source's device/dtype as well as its values; copying
-                # a meta source into PEFT's newly allocated CPU adapter fails.
-                # Pinned Verl materializes these nonpersistent buffers and
-                # broadcasts rank zero's frozen values during FSDP initialization.
-                frozen = container["default"].get_parameter(attr).detach().clone()
+            source = container[source_adapter]
+            for attr, _ in list(leaf.named_parameters(recurse=False)):
+                # Non-source FSDP ranks still hold meta weights here. Clone the source
+                # directly so its device/dtype (including meta) survive until FSDP
+                # materializes and broadcasts buffers, including non-persistent ones.
+                frozen = source.get_parameter(attr).detach().clone()
                 delattr(leaf, attr)
                 leaf.register_buffer(attr, frozen, persistent=False)
                 demoted += 1

@@ -42,7 +42,7 @@ def adapter_path(tmp_path):
     return str(tmp_path)
 
 
-def load_adapter(path, *, meta):
+def load_adapter(path, *, meta, source_adapter="default"):
     if meta:
         with accelerate.init_empty_weights():
             base = Tiny()
@@ -52,7 +52,9 @@ def load_adapter(path, *, meta):
     # the later FSDP broadcast supplies their values from rank zero.
     with warnings.catch_warnings():
         warnings.filterwarnings("ignore", message=".*copying from a non-meta parameter.*")
-        return peft.PeftModel.from_pretrained(base, path, is_trainable=True)
+        return peft.PeftModel.from_pretrained(
+            base, path, is_trainable=True, adapter_name=source_adapter
+        )
 
 
 def test_meta_warm_start_preserves_placeholders_until_fsdp(adapter_path):
@@ -72,12 +74,15 @@ def test_meta_warm_start_preserves_placeholders_until_fsdp(adapter_path):
         validate_snapshot(model)
 
 
-def test_reference_keeps_source_dtype_and_independent_storage(adapter_path):
-    model = load_adapter(adapter_path, meta=False).to(dtype=torch.bfloat16)
+@pytest.mark.parametrize("source_adapter", ["default", "sft"])
+def test_reference_keeps_source_dtype_and_independent_storage(adapter_path, source_adapter):
+    model = load_adapter(adapter_path, meta=False, source_adapter=source_adapter).to(
+        dtype=torch.bfloat16
+    )
     snapshot(model)
     validate_snapshot(model)
     for name, frozen in model.named_buffers():
-        source = model.get_parameter(name.replace(f".{adapter_name}.", ".default."))
+        source = model.get_parameter(name.replace(f".{adapter_name}.", f".{source_adapter}."))
         assert frozen.dtype == source.dtype == torch.bfloat16
         assert frozen.device == source.device
         assert torch.equal(frozen, source)
