@@ -407,6 +407,56 @@ def test_initial_image_loader_preserves_pixels_for_staged_files_and_inline_image
     assert initial_prompt_images([{"role": "user", "content": "text only"}]) is None
 
 
+def test_staged_png_may_exceed_the_admitted_jpeg_source_budget(tmp_path, monkeypatch):
+    import random
+
+    from PIL import Image
+
+    from flash.engine.worker.train.core.child.prompt_media import initial_prompt_images
+
+    pixels = random.Random(0).randbytes(64 * 64 * 3)
+    with Image.frombytes("RGB", (64, 64), pixels) as image:
+        jpeg = io.BytesIO()
+        image.save(jpeg, format="JPEG", quality=80)
+    source = jpeg.getvalue()
+    monkeypatch.setattr(mm, "MAX_IMAGE_SOURCE_BYTES", len(source))
+    descriptor = mm.normalize_image_source(source, None)
+    admitted = mm.decode_image_descriptors([descriptor], None)
+    path = tmp_path / "staged.png"
+    try:
+        admitted[0].save(path)
+        assert path.stat().st_size > mm.MAX_IMAGE_SOURCE_BYTES
+        messages = [{"role": "user", "content": [{"type": "image", "image": path.as_uri()}]}]
+        decoded = initial_prompt_images(messages)
+        try:
+            assert decoded[0].tobytes() == admitted[0].tobytes()
+        finally:
+            decoded[0].close()
+        # The same PNG supplied as an authored source still obeys admission limits.
+        with pytest.raises(ValueError, match="limit"):
+            mm.normalize_image_source(path.read_bytes(), None)
+    finally:
+        admitted[0].close()
+
+
+@pytest.mark.parametrize(
+    ("image_count", "memory_limit"), [(1, 32 * 32 * 9 - 1), (2, 32 * 32 * 12 - 1)]
+)
+def test_staged_images_preserve_decoded_memory_limits(
+    tmp_path, monkeypatch, image_count, memory_limit
+):
+    from flash.engine.worker.train.core.child.prompt_media import initial_prompt_images
+
+    path = tmp_path / "staged.png"
+    path.write_bytes(_nonuniform_32_png())
+    monkeypatch.setattr(mm, "MAX_TOTAL_DECODED_BYTES", memory_limit)
+    messages = [
+        {"role": "user", "content": [{"type": "image", "image": path.as_uri()}] * image_count}
+    ]
+    with pytest.raises(ValueError, match="decoded images exceed the memory limit"):
+        initial_prompt_images(messages)
+
+
 def test_processor_digest_separates_images_that_differ_only_by_grid(real_processor):
     """a transposed solid image has identical pixel bytes but a different patch grid.
 
