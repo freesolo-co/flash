@@ -247,6 +247,36 @@ def test_sft_uses_linear_scheduler_without_replacing_upstream(monkeypatch):
     assert BaseEngine()._build_lr_scheduler(optimizer) == "upstream"
 
 
+@pytest.mark.parametrize("enabled", [True, False])
+def test_reference_is_validated_after_fsdp_initialization(monkeypatch, enabled):
+    calls = []
+    original, wrapped = object(), object()
+
+    class BaseEngine:
+        def _build_fsdp_module(self, module):
+            assert module is original
+            calls.append("fsdp")
+            return wrapped
+
+    def validate(module):
+        assert module is wrapped
+        assert calls == ["fsdp"]
+        calls.append("validated")
+
+    _modules(
+        monkeypatch,
+        {
+            "verl.workers.engine.fsdp.transformer_impl": {"FSDPEngineWithLMHead": BaseEngine},
+            "flash.engine.worker.train.core.child.reference": {"validate_snapshot": validate},
+        },
+    )
+    recipe = _import_recipe(monkeypatch, "flash.engine.worker.train.core.child.engine")
+    engine = recipe.FlashFSDPEngine.__new__(recipe.FlashFSDPEngine)
+    engine.runtime = RuntimeOptions("grpo", 1, "ready", kl_ref_adapter=enabled)
+    assert engine._build_fsdp_module(original) is wrapped
+    assert calls == (["fsdp", "validated"] if enabled else ["fsdp"])
+
+
 @pytest.mark.parametrize("fail", [False, True])
 def test_tracking_closes_the_owned_run_with_the_actual_outcome(monkeypatch, capsys, fail):
     finishes = []

@@ -13,23 +13,36 @@ def snapshot(module):
     if adapter_name in getattr(module, "peft_config", {}):
         return module
     module.add_adapter(adapter_name, module.peft_config[module.active_adapter])
-    for name, param in module.named_parameters():
-        if ".default." in name:
-            twin = module.get_parameter(name.replace(".default.", f".{adapter_name}."))
-            twin.data.copy_(param.data)
     demoted = 0
     for container in module.modules():
         if isinstance(container, nn.ModuleDict) and adapter_name in container:
             leaf = container[adapter_name]
-            for attr, value in list(leaf.named_parameters(recurse=False)):
-                frozen = value.detach().clone()
+            for attr, _value in list(leaf.named_parameters(recurse=False)):
+                # Nonzero FSDP ranks can still have meta adapter parameters here.
+                # Clone the source's device/dtype as well as its values; copying
+                # a meta source into PEFT's newly allocated CPU adapter fails.
+                # Pinned Verl materializes these nonpersistent buffers and
+                # broadcasts rank zero's frozen values during FSDP initialization.
+                frozen = container["default"].get_parameter(attr).detach().clone()
                 delattr(leaf, attr)
                 leaf.register_buffer(attr, frozen, persistent=False)
                 demoted += 1
     if not demoted:
         raise RuntimeError("flash kl reference snapshot found no adapter weights to freeze")
-    print(_KL_REF_ADAPTER_MARKER + " " + repr(demoted), flush=True)
     return module
+
+
+def validate_snapshot(module):
+    """Do not start training if FSDP left the frozen reference unmaterialized."""
+    buffers = [
+        (name, value) for name, value in module.named_buffers() if f".{adapter_name}." in name
+    ]
+    if not buffers:
+        raise RuntimeError("flash kl reference snapshot has no frozen buffers")
+    pending = [name for name, value in buffers if value.is_meta]
+    if pending:
+        raise RuntimeError(f"flash kl reference not materialized after FSDP: {pending}")
+    print(_KL_REF_ADAPTER_MARKER + " " + repr(len(buffers)), flush=True)
 
 
 @contextmanager

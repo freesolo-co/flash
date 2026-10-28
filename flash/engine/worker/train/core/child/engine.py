@@ -72,6 +72,14 @@ class FlashFSDPEngine(FSDPEngineWithLMHead):
             result = snapshot(result)
         return result
 
+    def _build_fsdp_module(self, module):
+        module = super()._build_fsdp_module(module)
+        if self.runtime.kl_ref_adapter:
+            from flash.engine.worker.train.core.child.reference import validate_snapshot
+
+            validate_snapshot(module)
+        return module
+
     def disable_adapter(self):
         if not self.runtime.kl_ref_adapter:
             return super().disable_adapter()
