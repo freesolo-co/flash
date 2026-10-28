@@ -145,6 +145,31 @@ def test_exact_sft_workload_packs_retained_prefix_rows_deterministically() -> No
     assert first.profile.authoritative_compute_tokens == first.profile.authoritative_real_tokens
 
 
+def test_stored_sft_transcript_is_authoritative_over_environment_prompt_hooks():
+    class TranscriptEnvironment(FakeEnvironment):
+        def dataset(self):
+            return [
+                {
+                    "input": "opaque identity",
+                    "prompt_messages": [{"role": "user", "content": "stored prompt"}],
+                    "answer": "gold",
+                }
+            ]
+
+        def prompt_messages(self, row):
+            raise AssertionError("environment hook replaced the stored SFT transcript")
+
+    prepared = prepare_sft_workload(
+        _spec(),
+        TranscriptEnvironment(),
+        tokenizer_loader=lambda *_: FakeTokenizer(),
+        producer_version="1.2.3",
+        packing_support=lambda *_: ("pure-attention", True),
+    )
+    assert prepared.profile.retained_examples == 1
+    assert any("stored prompt" in text for text in prepared.sampled_texts)
+
+
 def test_retained_workload_counts_mixed_role_aware_and_fallback_multiturn_rows() -> None:
     from flash.engine.profiling.sft_workload import (
         _filter_retained_rows,

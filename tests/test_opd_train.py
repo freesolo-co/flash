@@ -8948,6 +8948,13 @@ def _drive_opd_multi_turn_episode(
     from flash.engine.worker.train.opd.child import bridge as _child_bridge
     from flash.engine.worker.train.opd.child import multiturn as opd_multiturn
 
+    if multi_modal_data:
+        from flash.engine.worker.train.core.child import prompt_media
+
+        monkeypatch.setattr(
+            prompt_media, "initial_prompt_images", lambda messages: multi_modal_data["images"]
+        )
+
     # teacher attachment builds torch tensors, which the offline env has no torch for. it runs
     # strictly AFTER every generate call and every turn output, so stubbing it leaves the media
     # path these tests measure fully exercised.

@@ -646,6 +646,12 @@ class FreesoloEnvironment(BaseEnvironment):
         if not isinstance(raw, str):
             raw = str(state.get("response_text") or "")
         step = self._env.step_episode(task, list(messages), raw)
+        if any(message.get("role") == "system" for message in step.messages):
+            raise ValueError(
+                "EnvironmentStepResult.messages must contain only new environment replies, "
+                "not the full conversation or a system message; Flash appends these replies "
+                "to the existing history. Return messages=[] for a terminal step with no reply."
+            )
         state["done"] = bool(step.done)
         if step.final_response_text is not None:
             # the env overrode the episode's answer, so it is already the text to grade -- do not

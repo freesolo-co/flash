@@ -2,7 +2,8 @@
 
 raw ``input`` and ``output`` fields are augmented with the statically readable training contract,
 using the same ``contract_text`` then ``contract_path`` then ``TRAINING_CONTRACT.md`` precedence as
-the environment loader. the shared tokenizer computes tokens, retention, truncation, and steps from
+the environment loader. an explicit ``prompt_messages`` transcript replaces the raw input prompt
+in the shared SFT preparation path, identically for profiling and training. the shared tokenizer computes tokens, retention, truncation, and steps from
 that one stream so the estimate stays internally consistent. environment-owned prompt construction,
 few-shot examples, tool schemas, filtering, and other transformations remain unavailable without
 executing user code. an environment that expands prompts heavily may therefore retain fewer rows,

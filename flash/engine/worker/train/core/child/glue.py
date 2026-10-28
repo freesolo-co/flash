@@ -1,7 +1,7 @@
 """child-side multi-turn rollout primitives shared by the OPD and GRPO verl agent loops.
 
 The parent and packaged trainer import these primitives directly. Image decoding loads Pillow
-only when a validated dynamic image reply arrives.
+only for validated image prompts and replies.
 
 everything here is algorithm-neutral: turning an environment reply into the exact tokens the chat
 template would have produced, deciding whether an assistant turn terminated or was truncated, and
@@ -891,7 +891,14 @@ async def prepare_episode_prompt(loop_self, raw_prompt) -> EpisodePrompt:
         # canonical validator so authored non-string reasoning metadata still fails in the parent.
         if message.get("reasoning_content") is None:
             message.pop("reasoning_content", None)
-    multi_modal_data = await loop_self.process_multi_modal_info(messages)
+    from flash.engine.worker.train.core.child.prompt_media import initial_prompt_images
+
+    images = await asyncio.to_thread(initial_prompt_images, messages)
+    multi_modal_data = (
+        {"images": images}
+        if images is not None
+        else await loop_self.process_multi_modal_info(messages)
+    )
     loop_self._assert_mm_supported(bool(multi_modal_data))
     images = multi_modal_data.get("images")
     videos = multi_modal_data.get("videos")

@@ -1079,6 +1079,51 @@ def _image_package(tmp_path: Path, width: int = 640, height: int = 480) -> Path:
     return entrypoint
 
 
+def test_authored_sft_prompt_messages_quote_images_without_executing_environment(
+    tmp_path, published_geometry
+):
+    entrypoint = _image_package(tmp_path)
+    row = {
+        "input": "opaque row identifier",
+        "prompt_messages": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "Describe the screenshot."},
+                    {"type": "image_url", "image_url": {"url": "dataset/red.png"}},
+                ],
+            }
+        ],
+        "output": "red",
+    }
+    (entrypoint.parent / "dataset/train.jsonl").write_text(json.dumps(row) + "\n")
+    entrypoint.write_text("raise AssertionError('profiling executed environment code')\n")
+    profile = _image_profile(entrypoint)
+    assert profile.packing_mode == "exact-unpacked"
+    assert profile.architecture_mode == "multimodal"
+    assert profile.examples_per_update == 1
+    assert profile.real_tokens_per_epoch > 300
+
+
+@pytest.mark.parametrize("messages", [None, "text", [], [{"role": "user"}, "bad"]])
+def test_invalid_authored_sft_prompt_messages_fail_before_allocation(tmp_path, messages):
+    entrypoint = _package(
+        tmp_path,
+        {
+            "dataset/train.jsonl": json.dumps(
+                {
+                    "input": "row",
+                    "prompt_messages": messages,
+                    "output": "answer",
+                }
+            )
+            + "\n"
+        },
+    )
+    with pytest.raises(ValueError, match="sft prompt_messages"):
+        _profile(entrypoint)
+
+
 _QWEN_TEST_GEOMETRY = ImageGeometry(
     patch_size=16, merge_size=2, min_pixels=65536, max_pixels=16777216
 )
