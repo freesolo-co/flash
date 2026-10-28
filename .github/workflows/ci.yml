@@ -119,6 +119,22 @@ jobs:
       - name: verl pin exists upstream
         run: uv run python scripts/check_verl_pin_exists.py
 
+      # The ordinary offline environment omits torch/PEFT, so its adapter tests skip.
+      # Exercise real meta tensors and frozen references with the worker's versions.
+      - name: Install CPU adapter-test dependencies
+        run: |
+          uv pip install torch==2.10.0 --index-url https://download.pytorch.org/whl/cpu
+          uv pip install peft==0.20.0 transformers==5.12.1
+
+      - name: Warm-start KL reference regression (real torch and PEFT)
+        env:
+          HF_HUB_OFFLINE: "1"
+          TRANSFORMERS_OFFLINE: "1"
+          HF_HUB_DISABLE_TELEMETRY: "1"
+        run: |
+          .venv/bin/python -c "import torch, peft"
+          .venv/bin/pytest -q tests/test_rl_train.py -k kl_ref_adapter
+
   # `lint + offline tests` is the required status check, and the matrix above turned that one
   # check into two per-version checks. This aggregate keeps a single stable name for branch
   # protection to require, and fails if either matrix leg failed or was cancelled.

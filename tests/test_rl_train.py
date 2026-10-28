@@ -3264,6 +3264,40 @@ def test_kl_ref_adapter_shim_anchors_the_reference_to_the_warm_start_adapter():
     assert not set(model.state_dict()) - state_before
 
 
+def test_kl_ref_adapter_snapshot_preserves_meta_weights_until_fsdp_sync(tmp_path):
+    torch = pytest.importorskip("torch")
+    peft = pytest.importorskip("peft")
+
+    class Tiny(torch.nn.Module):
+        def __init__(self, device="cpu"):
+            super().__init__()
+            self.q_proj = torch.nn.Linear(8, 8, bias=False, device=device)
+
+    config = peft.LoraConfig(r=4, lora_alpha=8, target_modules=["q_proj"])
+    peft.get_peft_model(Tiny(), config).save_pretrained(tmp_path)
+    # Verl loads the adapter before FSDP broadcasts rank zero's weights. PEFT
+    # leaves the default adapter on meta on these ranks, but add_adapter creates
+    # real reference tensors: copying meta -> real used to fail at this point.
+    with pytest.warns(UserWarning, match="non-meta parameter.*meta parameter"):
+        model = peft.PeftModel.from_pretrained(Tiny("meta"), tmp_path, is_trainable=True)
+    source = {name: value for name, value in model.named_parameters() if ".default." in name}
+    assert source
+    assert all(value.is_meta for value in source.values())
+    before = set(model.state_dict())
+
+    _load_kl_ref_engine()(model)._build_lora_module(model)
+
+    buffers = dict(model.named_buffers())
+    for name, value in source.items():
+        reference = buffers[name.replace(".default.", ".flash_kl_ref.")]
+        assert reference.is_meta
+        assert reference.shape == value.shape
+        assert reference.dtype == value.dtype
+        assert not reference.requires_grad
+    assert set(model.state_dict()) == before
+    assert not any(".flash_kl_ref." in name for name, _ in model.named_parameters())
+
+
 def test_kl_ref_adapter_shim_refuses_to_run_without_a_snapshot():
     # both guards exist because the alternative is silent: an unpatched or half-applied snapshot
     # would leave the reference on the bare base, and the run would look completely healthy while
