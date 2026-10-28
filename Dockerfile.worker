@@ -317,13 +317,22 @@ ARG VERL_SPEC=verl@git+https://github.com/verl-project/verl@ddf700725c34bb896668
 # Keep the cache private to this trusted builder/toolchain; runtime tenant code never mounts it.
 ENV FLASH_VERL_PYTHON=/opt/verl-venv/bin/python \
     UV_LINK_MODE=copy
+# FlashInfer 0.6.14 replaces the deadlocking Hopper GDN kernel with its native CuTe DSL
+# implementation. Override vLLM's old dependency pin in the training interpreter only;
+# the parent interpreter and serving image keep their separately validated dependencies.
+# Keep these requirements and the cubin digest aligned with VERL_FLASHINFER_REQUIREMENTS.
+ARG VERL_FLASHINFER_CUBIN="flashinfer-cubin @ https://github.com/flashinfer-ai/flashinfer/releases/download/v0.6.14/flashinfer_cubin-0.6.14-py3-none-any.whl#sha256=7bbed9f3851b59f3f6f6cb344810775bbce8a1c012ecf9a502bebd91cfb6433e"
 RUN --mount=type=cache,id=flash-worker-uv-cu128,target=/root/.cache/uv,sharing=locked \
-    printf '%s\n' "numpy==2.2.6" "xgrammar==0.1.25" "vllm==0.19.1" "transformers==5.12.1" > /tmp/verl-overrides.txt \
+    printf '%s\n' "numpy==2.2.6" "xgrammar==0.1.25" "vllm==0.19.1" "transformers==5.12.1" \
+        "flashinfer-python==0.6.14" "${VERL_FLASHINFER_CUBIN}" \
+        "nvidia-cutlass-dsl==4.8.1" "cuda-tile==1.4.0" > /tmp/verl-overrides.txt \
     && uv venv --seed /opt/verl-venv \
     && VIRTUAL_ENV=/opt/verl-venv uv pip install --python /opt/verl-venv/bin/python \
         --override /tmp/verl-overrides.txt \
         "${VERL_SPEC}" \
         "vllm==0.19.1" \
+        "flashinfer-python==0.6.14" "${VERL_FLASHINFER_CUBIN}" \
+        "nvidia-cutlass-dsl==4.8.1" "cuda-tile==1.4.0" \
         "xgrammar==0.1.25" \
         "numpy==2.2.6" \
         "transformers==5.12.1" \

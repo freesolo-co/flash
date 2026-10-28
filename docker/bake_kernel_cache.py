@@ -217,7 +217,9 @@ def _verify(out: str, sm: str) -> int:
             validation.get("first_exit_code") != 0
             or validation.get("reload_exit_code") != 0
             or validation.get("exported_cache_replayed") is not True
-            or reload.get("compilation_forbidden") is not True
+            or reload.get("cached_groups_compilation_forbidden") is not True
+            or reload.get("cached_groups") != ["flash_attn", "fla_gdn"]
+            or reload.get("startup_jit_groups") != (["flashinfer_gdn"] if sm == "sm90" else [])
             or reload.get("compile_attempts") != 0
             or reload.get("passed") is not True
         ):
