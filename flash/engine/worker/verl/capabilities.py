@@ -22,6 +22,7 @@ from flash.engine.worker.train.entry.backend_common import (
     FLA_REQUIREMENT,
     FLASH_QLA_REQUIREMENT,
     TRANSFORMERS_INSTALL_REQUIREMENT,
+    VERL_FLASHINFER_REQUIREMENTS,
     VERL_REQUIREMENT_NAME,
     VERL_REQUIREMENT_URL,
     VERL_VENV_PYTHON,
@@ -432,6 +433,8 @@ def resolve_verl_python(workdir: str, *, install_wandb: bool = False) -> str:
             f.write(
                 f"numpy==2.2.6\nxgrammar==0.1.25\nvllm==0.19.1\n"
                 f"{TRANSFORMERS_INSTALL_REQUIREMENT}\n"
+                + "\n".join(VERL_FLASHINFER_REQUIREMENTS)
+                + "\n"
             )
         subprocess.run(
             [
@@ -446,6 +449,7 @@ def resolve_verl_python(workdir: str, *, install_wandb: bool = False) -> str:
                 # Install the bare package with Flash's explicit CUDA 12.8 runtime instead.
                 f"{VERL_REQUIREMENT_NAME} @ {VERL_REQUIREMENT_URL}",
                 "vllm==0.19.1",
+                *VERL_FLASHINFER_REQUIREMENTS,
                 "numpy==2.2.6",
                 TRANSFORMERS_INSTALL_REQUIREMENT,
                 # not transitively guaranteed: verl imports these at module level on the launch path
@@ -720,28 +724,6 @@ def resolve_rollout_enforce_eager(cc: tuple[int, int] | None) -> bool:
         )
         return True
     return False
-
-
-def rollout_gdn_prefill_overrides(
-    gdn_hybrid: bool, cc: tuple[int, int] | None, *, n_gpus: int
-) -> list[str]:
-    """Use the Triton GDN implementation for multi-GPU Hopper GRPO rollouts.
-
-    The pinned vLLM 0.19.1 selects FlashInfer on SM90. Its FlashInfer 0.6.6 has
-    a confirmed stochastic GDN graph-replay deadlock on H100 (flashinfer-ai/
-    flashinfer#3329). Triton avoids that kernel for affected GRPO deployments.
-    scripts/repro_hopper_gdn_prefill.py isolates a failing Decision batch shape.
-    This is a scoped mitigation, not a diagnosis of every collective timeout.
-    """
-    if not gdn_hybrid or cc != (9, 0) or n_gpus <= 1:
-        return []
-    # In the pinned vLLM this lives in additional_config, not a top-level engine arg.
-    return [
-        (
-            "+actor_rollout_ref.rollout.engine_kwargs.vllm.additional_config="
-            "{gdn_prefill_backend:triton}"
-        )
-    ]
 
 
 def rollout_sleep_unsupported(model_id: str) -> bool:

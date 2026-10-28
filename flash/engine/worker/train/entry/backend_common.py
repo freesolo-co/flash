@@ -81,15 +81,22 @@ CAUSAL_CONV1D_REQUIREMENT = "causal-conv1d==1.6.2.post1"
 # validated. bounding it to the range flash tests against is the whole reason. verl and vllm both
 # depend on transformers, so this has to be in the OVERRIDE file as well as the direct list -- a
 # direct pin alone loses to their transitive declarations.
-#
-# NOT the reason: this pin does not affect is_flash_linear_attention_available() or
-# is_causal_conv1d_available(). Those are byte-identical in 5.12.1 and 5.14.1 and both open with
-# is_torch_cuda_available(), so they answer False on any machine without a gpu regardless of the
-# installed version. An earlier revision of this comment claimed a 5.13 import-path move made them
-# answer False; that mechanism does not exist. See Dockerfile.worker's sanity block.
 TRANSFORMERS_REQUIREMENT = "transformers>=5.8,<5.13"
-# exact deployed install and override pin; the range above remains public package metadata.
 TRANSFORMERS_INSTALL_REQUIREMENT = "transformers==5.12.1"
+
+# The training child uses FlashInfer's repaired native Hopper GDN kernel. vLLM 0.19.1's
+# dependency metadata still selects the deadlocking 0.6.6 implementation; the explicit
+# override is GPU-qualified against that vLLM version. Keep Dockerfile.worker in sync.
+VERL_FLASHINFER_REQUIREMENTS = (
+    "flashinfer-python==0.6.14",
+    (
+        "flashinfer-cubin @ https://github.com/flashinfer-ai/flashinfer/releases/download/"
+        "v0.6.14/flashinfer_cubin-0.6.14-py3-none-any.whl"
+        "#sha256=7bbed9f3851b59f3f6f6cb344810775bbce8a1c012ecf9a502bebd91cfb6433e"
+    ),
+    "nvidia-cutlass-dsl==4.8.1",
+    "cuda-tile==1.4.0",
+)
 
 # the stamp must identify every separately installed package the venv holds. omitting flash-attn,
 # fla, causal_conv1d, or the exact transformers pin lets an older partial venv match forever; conv1d
@@ -109,7 +116,9 @@ VERL_VENV_BUILD_REPAIRS = "libcudart-stub-neutralized-v1"
 VERL_VENV_STAMP = (
     f"{VERL_REQUIREMENT}\n{FLASH_ATTN_INSTALL_SPEC}\n{FLA_REQUIREMENT}\n{FLASH_QLA_REQUIREMENT}\n"
     f"{CAUSAL_CONV1D_REQUIREMENT}\n{TRANSFORMERS_INSTALL_REQUIREMENT}\n"
-    f"{VERL_VENV_BUILD_REPAIRS}"
+    + "\n".join(VERL_FLASHINFER_REQUIREMENTS)
+    + "\n"
+    + VERL_VENV_BUILD_REPAIRS
 )
 
 
@@ -941,7 +950,6 @@ from flash.engine.worker.verl.capabilities import (  # noqa: E402,F401
     resolve_verl_loggers,
     resolve_verl_python,
     rollout_fp8_kv,
-    rollout_gdn_prefill_overrides,
     rollout_layered_summon_overrides,
     rollout_mm_processor_cache_overrides,
     rollout_resident_overrides,

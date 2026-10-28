@@ -399,6 +399,11 @@ def test_resolve_verl_python_installs_pinned_gpu_dependencies(monkeypatch, tmp_p
     assert "xgrammar==0.1.25" in install
     assert "tqdm==4.70.0" in install
     assert "pyarrow==25.0.1" in install
+    overrides = (tmp_path / "verl-overrides.txt").read_text()
+    for requirement in vc.VERL_FLASHINFER_REQUIREMENTS:
+        assert requirement in install
+        assert requirement in overrides
+        assert requirement in vc.VERL_VENV_STAMP
     # venv, the resolve above, the prebuilt flash_attn wheel on its own --no-build-isolation line,
     # then causal_conv1d (also its own line: it source-builds against the venv's torch), the import
     # probe that proves the conv extension actually loaded, and last the libcudart stub repair that
@@ -1299,7 +1304,8 @@ def test_transformers_pin_stays_in_lockstep_with_the_worker_image():
         "backend_common.TRANSFORMERS_INSTALL_REQUIREMENT"
     )
     # the exact override prevents transitive declarations from re-widening the deployed version.
-    assert f'"{vc.TRANSFORMERS_INSTALL_REQUIREMENT}" > /tmp/verl-overrides.txt' in text
+    overrides = text.split("> /tmp/verl-overrides.txt", 1)[0].rsplit("printf ", 1)[1]
+    assert install_quoted in overrides
 
     # pyproject declares the same range for the gpu/server/dev extras, and a lower ceiling there
     # puts anyone installing the package (local worker, self-hosted plane) on a transformers line
@@ -1316,6 +1322,21 @@ def test_transformers_pin_stays_in_lockstep_with_the_worker_image():
     assert pyproject.count(f'"{vc.TRANSFORMERS_REQUIREMENT}"') == 4, (
         "expected the transformers range in exactly the gpu, server, dev and serve-runtime extras"
     )
+
+
+def test_native_flashinfer_pins_match_the_training_image():
+    text = (pathlib.Path(__file__).resolve().parents[1] / "Dockerfile.worker").read_text()
+    cubin = re.search(r'^ARG VERL_FLASHINFER_CUBIN="([^"]+)"$', text, re.MULTILINE).group(1)
+    assert cubin in vc.VERL_FLASHINFER_REQUIREMENTS
+    assert "#sha256=" in cubin
+    text = text.replace("${VERL_FLASHINFER_CUBIN}", cubin)
+    overrides = text.split("> /tmp/verl-overrides.txt", 1)[0].rsplit("printf ", 1)[1]
+    install = text.split("VIRTUAL_ENV=/opt/verl-venv uv pip install", 1)[1].split(
+        "&& rm -f /tmp/verl-overrides.txt", 1
+    )[0]
+    for requirement in vc.VERL_FLASHINFER_REQUIREMENTS:
+        assert f'"{requirement}"' in overrides
+        assert f'"{requirement}"' in install
 
 
 def test_the_venv_stamp_covers_the_transformers_pin_so_a_prepin_venv_is_rebuilt():

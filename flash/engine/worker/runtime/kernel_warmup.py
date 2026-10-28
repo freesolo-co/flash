@@ -183,18 +183,25 @@ def warm_fla_gdn(torch, *, heads: int = 32, head_dim: int = 128) -> bool:
 
 
 def warm_flashinfer_gdn(torch) -> bool:
-    """Compile vLLM's Hopper GDN prefill library in the pinned training interpreter."""
+    """Compile FlashInfer's repaired native Hopper GDN prefill implementation."""
     try:
-        from flashinfer.gdn_prefill import get_gdn_prefill_module
-        from flashinfer.jit import env
+        from flashinfer.gdn_prefill import chunk_gated_delta_rule
 
-        from flash.engine.worker.train.core.child import flashinfer_cache
-
-        flashinfer_cache.activate(env)
-        get_gdn_prefill_module()
+        qk = torch.zeros((192, 8, 128), device="cuda", dtype=torch.bfloat16)
+        output, state = chunk_gated_delta_rule(
+            q=qk,
+            k=qk,
+            v=torch.zeros((192, 16, 128), device="cuda", dtype=torch.bfloat16),
+            g=torch.ones((192, 16), device="cuda", dtype=torch.float32),
+            beta=torch.full((192, 16), 0.5, device="cuda", dtype=torch.float32),
+            initial_state=torch.zeros((5, 16, 128, 128), device="cuda", dtype=torch.float32),
+            output_final_state=True,
+            cu_seqlens=torch.tensor([0, 1, 32, 64, 128, 192], device="cuda", dtype=torch.int64),
+        )
         torch.cuda.synchronize()
-        flashinfer_cache.publish(env, torch)
-        _log("flashinfer GDN prefill library compiled and loaded")
+        if not torch.isfinite(output).all() or not torch.isfinite(state).all():
+            raise RuntimeError("FlashInfer GDN warmup returned non-finite values")
+        _log("FlashInfer native GDN prefill compiled and executed")
         return True
     except Exception as error:
         _log(f"flashinfer GDN prefill warm failed: {error}")
@@ -340,8 +347,10 @@ def warmup(
             )
             return 1
     groups = [warm_flash_attn, warm_fla_gdn]
-    if torch.cuda.get_device_capability(0)[0] == 9:
-        groups.append(warm_flashinfer_gdn)
+    # Native FlashInfer 0.6.14 uses cute.compile with an in-process cache only.
+    # Exercise it in both passes, but do not claim its startup JIT is image-baked.
+    startup_groups = [warm_flashinfer_gdn] if torch.cuda.get_device_capability(0)[0] == 9 else []
+    startup_passed = all(group(torch) for group in startup_groups)
     guard = _cached_kernels_only(torch) if verify_cache else contextlib.nullcontext([])
     with guard as compile_attempts:
         warmed = sum(group(torch) for group in groups)
@@ -352,12 +361,20 @@ def warmup(
         if verify_cache
         else (save_cache_metadata(torch, out_dir, requested_arch=arch, warmed=warmed))
     )
-    passed = warmed == len(groups) and meta_saved and has_kernels and not compile_attempts
+    passed = (
+        warmed == len(groups)
+        and startup_passed
+        and meta_saved
+        and has_kernels
+        and not compile_attempts
+    )
     if verify_cache:
         with open(os.path.join(out_dir, "cache_reload.json"), "w") as output:
             json.dump(
                 {
-                    "compilation_forbidden": True,
+                    "cached_groups_compilation_forbidden": True,
+                    "cached_groups": ["flash_attn", "fla_gdn"],
+                    "startup_jit_groups": ["flashinfer_gdn"] if startup_groups else [],
                     "compile_attempts": len(compile_attempts),
                     "passed": passed,
                 },
