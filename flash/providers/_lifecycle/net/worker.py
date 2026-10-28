@@ -53,7 +53,7 @@ QUALIFIED_WORKER_IMAGES = {
     ),
     "sm90": (
         "ghcr.io/freesolo-co/flash-worker@"
-        "sha256:c794abb352bb99c8a90e58f4f1f8f4b56012a1c00fcfe607dd8a037d0f119fb8"
+        "sha256:80d1341d749cf30e59d3200a8cf78a48ed180f2392b88f4edaea2d488ee9981e"
     ),
     "sm100": (
         "ghcr.io/freesolo-co/flash-worker@"
