@@ -722,6 +722,27 @@ def resolve_rollout_enforce_eager(cc: tuple[int, int] | None) -> bool:
     return False
 
 
+def rollout_gdn_prefill_overrides(
+    gdn_hybrid: bool, cc: tuple[int, int] | None, *, n_gpus: int
+) -> list[str]:
+    """Use the Triton GDN implementation for multi-GPU Hopper GRPO rollouts.
+
+    The pinned vLLM 0.19.1 selects FlashInfer on SM90. Its FlashInfer 0.6.6 has
+    a confirmed stochastic GDN graph-replay deadlock on H100 (flashinfer-ai/
+    flashinfer#3329). Triton avoids that kernel for affected GRPO deployments.
+    This is a scoped mitigation, not a diagnosis of every collective timeout.
+    """
+    if not gdn_hybrid or cc != (9, 0) or n_gpus <= 1:
+        return []
+    # In the pinned vLLM this lives in additional_config, not a top-level engine arg.
+    return [
+        (
+            "+actor_rollout_ref.rollout.engine_kwargs.vllm.additional_config="
+            "{gdn_prefill_backend:triton}"
+        )
+    ]
+
+
 def rollout_sleep_unsupported(model_id: str) -> bool:
     """whether vLLM's sleep/wake cycle is non-functional for this model.
 

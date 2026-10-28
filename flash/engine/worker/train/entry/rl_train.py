@@ -30,6 +30,7 @@ from flash.engine.worker.train.entry.backend_common import (
     resolve_rollout_enforce_eager,
     resolve_verl_python,
     rollout_fp8_kv,
+    rollout_gdn_prefill_overrides,
     verl_device_capability,
 )
 from flash.engine.worker.train.entry.rl_train_runner import (
@@ -212,7 +213,8 @@ def _configure_rl_child(
         "project_name": project_name,
         "experiment_name": experiment_name,
         "fp8_kv": fp8_kv,
-        "overrides": build_verl_overrides(cfg),
+        "overrides": build_verl_overrides(cfg)
+        + rollout_gdn_prefill_overrides(gdn_hybrid, verl_cc, n_gpus=cfg["n_gpus"]),
         "setup_seconds": setup_seconds,
         "t_train": t_train,
     }
