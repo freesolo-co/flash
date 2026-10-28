@@ -34,6 +34,10 @@ _RETRIABLE_VERL_CHILD_SIGNATURES = (
     "cudaErrorDevicesUnavailable",
     "CUDA-capable device(s) is/are busy or unavailable",
 )
+_ENGINE_TIMEOUT_SIGNATURES = (
+    "Watchdog caught collective operation timeout: WorkNCCL(",
+    "TimeoutError: RPC call to sample_tokens timed out.",
+)
 
 
 def _backend_common():
@@ -64,8 +68,15 @@ class ChildOutputTail:
         self._cuda_oom_evidence: str | None = None
         self._cuda_oom_allocation_detail: str | None = None
         self._host_ram_kill_evidence: str | None = None
+        self._engine_timeout_evidence: str | None = None
 
     def record(self, line: str) -> None:
+        if self._engine_timeout_evidence is None and any(
+            signature in line for signature in _ENGINE_TIMEOUT_SIGNATURES
+        ):
+            # Hundreds of EngineDeadError traces can evict the initiating timeout from both
+            # this ring and the uploaded console tail. Keep its bounded, redacted evidence.
+            self._engine_timeout_evidence = sanitize_diagnostic(line.rstrip(), limit=1000)
         if self._retriable_infra_signature is None:
             self._retriable_infra_signature = next(
                 (signature for signature in _RETRIABLE_VERL_CHILD_SIGNATURES if signature in line),
@@ -117,6 +128,11 @@ class ChildOutputTail:
     def host_ram_kill_evidence(self) -> str | None:
         """the first authoritative ray host-RAM kill evidence observed in child output."""
         return self._host_ram_kill_evidence
+
+    @property
+    def engine_timeout_evidence(self) -> str | None:
+        """First explicit NCCL collective or vLLM sampling timeout, independent of the tail."""
+        return self._engine_timeout_evidence
 
     @property
     def written(self) -> int:
@@ -183,6 +199,13 @@ def raise_for_classified_verl_exit(return_code: int, tail: ChildOutputTail) -> N
         )
     signature = tail.retriable_infra_signature
     if signature is None:
+        if tail.engine_timeout_evidence is not None:
+            # A timeout identifies the failed operation, not why it hung. Do not turn this
+            # into an automatic paid retry, OOM escalation, or successful checkpoint release.
+            raise RuntimeError(
+                f"verl subprocess exited with status {return_code} after a rollout engine "
+                f"timeout: {tail.engine_timeout_evidence}"
+            )
         return
     from flash.engine.worker.perf.lifecycle import RetriableInfraError
 
