@@ -2552,6 +2552,18 @@ def test_terminal_block_reply_reaches_score_episode_without_flattening(monkeypat
     assert episode.turns[-1].content == expected
 
 
+def test_full_history_step_reply_reports_the_environment_contract_error(monkeypatch):
+    sdk_env = _BlockReplyMultiTurnEnv()
+    sdk_env.step_episode = lambda *args: _EnvironmentStepResult(
+        done=False, messages=({"role": "system", "content": "repeated system"},)
+    )
+    env = _thinking_env(monkeypatch, sdk_env, prompt_opens_thinking=False)
+    state = env.new_rollout_state({"id": "a", "input": "2+2?", "output": "4"})
+    env.record_model_turn(state, "a turn")
+    with pytest.raises(ValueError, match="only new environment replies"):
+        env.env_reply(state["messages"], state)
+
+
 def test_stepping_the_env_leaves_the_scored_text_stripped(monkeypatch):
     """Fixing step_episode must not un-fix grading: the scorer still sees answer-only text."""
     sdk_env = _SteppingMultiTurnEnv()

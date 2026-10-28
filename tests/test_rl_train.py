@@ -6964,6 +6964,16 @@ def _drive_multi_turn_episode(
     """
     from flash.engine.worker.train.rl.child import multiturn as grpo_multiturn
 
+    initial_contents = []
+    if multi_modal_data:
+        from flash.engine.worker.train.core.child import prompt_media
+
+        def initial_images(messages):
+            initial_contents.extend(message.get("content") for message in messages)
+            return list(multi_modal_data.get("images") or ())
+
+        monkeypatch.setattr(prompt_media, "initial_prompt_images", initial_images)
+
     monkeypatch.setenv("FLASH_VERL_MULTITURN_URL", "http://bridge.invalid")
     monkeypatch.setenv("FLASH_VERL_MAX_TURNS", str(max_turns))
     monkeypatch.setenv("FLASH_VERL_MAX_MODEL_LEN", "4096")
@@ -7063,6 +7073,8 @@ def _drive_multi_turn_episode(
             pass
 
         async def ct_build_initial_tokens(self, messages, **kwargs):
+            if initial_contents:
+                self.mm_info_contents = initial_contents
             return [1, 2, 3]
 
         async def generate(
