@@ -12,17 +12,18 @@ _KL_REF_ADAPTER_MARKER = "[flash-verl] kl reference anchored to the warm-start a
 def snapshot(module):
     if adapter_name in getattr(module, "peft_config", {}):
         return module
-    module.add_adapter(adapter_name, module.peft_config[module.active_adapter])
-    for name, param in module.named_parameters():
-        if ".default." in name:
-            twin = module.get_parameter(name.replace(".default.", f".{adapter_name}."))
-            twin.data.copy_(param.data)
+    source_adapter = module.active_adapter
+    module.add_adapter(adapter_name, module.peft_config[source_adapter])
     demoted = 0
     for container in module.modules():
         if isinstance(container, nn.ModuleDict) and adapter_name in container:
             leaf = container[adapter_name]
-            for attr, value in list(leaf.named_parameters(recurse=False)):
-                frozen = value.detach().clone()
+            source = container[source_adapter]
+            for attr, _ in list(leaf.named_parameters(recurse=False)):
+                # Non-source FSDP ranks still hold meta weights here. Clone the source
+                # directly so its device/dtype (including meta) survive until FSDP
+                # materializes and broadcasts buffers, including non-persistent ones.
+                frozen = source.get_parameter(attr).detach().clone()
                 delattr(leaf, attr)
                 leaf.register_buffer(attr, frozen, persistent=False)
                 demoted += 1
