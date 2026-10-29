@@ -11,6 +11,7 @@ import warnings
 from collections.abc import Mapping
 from typing import Any
 
+from flash.content.image_descriptors import MAX_IMAGES_PER_CONVERSATION
 from flash.content.structured_options import validate_structured_options
 from flash.serve.contract.protocol import (
     IMAGE_TYPES,
@@ -19,7 +20,7 @@ from flash.serve.contract.protocol import (
 )
 from flash.serve.request.tool_calls import validate_tool_history
 
-MAX_IMAGES = 4
+MAX_IMAGES = MAX_IMAGES_PER_CONVERSATION
 MAX_COMPRESSED_BYTES = 8 * 1024 * 1024
 MAX_TOTAL_COMPRESSED_BYTES = 16 * 1024 * 1024
 MAX_DIMENSION = 8192

@@ -18,7 +18,14 @@ _RUNTIME_SECRET_KEYS = DEFAULT_RUNTIME_SECRET_KEYS
 
 
 def require_key(authorization: str | None = Header(default=None)) -> dict:
-    key = auth.authenticate(authorization)
+    try:
+        key = auth.authenticate(authorization)
+    except auth.AuthVerificationUnavailable:
+        raise HTTPException(
+            status_code=503,
+            detail="Authentication service unavailable; retry shortly",
+            headers={"Retry-After": "1"},
+        ) from None
     if key is None:
         raise HTTPException(
             status_code=401,

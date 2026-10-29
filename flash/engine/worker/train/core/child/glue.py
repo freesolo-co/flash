@@ -23,6 +23,7 @@ import warnings
 from typing import Any
 from uuid import uuid4
 
+from flash.content.image_descriptors import MAX_IMAGES_PER_CONVERSATION
 from flash.content.reasoning_normalization import (
     messages_for_chat_template as _messages_for_chat_template,
 )
@@ -40,7 +41,7 @@ _IMAGE_DATA_URI_HEADERS = {
     "data:image/png;base64": "PNG",
     "data:image/webp;base64": "WEBP",
 }
-_MAX_IMAGES_PER_REPLY = 4
+_MAX_IMAGES_PER_REPLY = MAX_IMAGES_PER_CONVERSATION
 _MAX_IMAGE_SOURCE_BYTES = 8 * 1024 * 1024
 _MAX_TOTAL_IMAGE_SOURCE_BYTES = 16 * 1024 * 1024
 _MAX_IMAGE_WIDTH = 8192

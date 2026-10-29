@@ -411,6 +411,27 @@ def test_multi_image_decoded_memory_counts_resident_not_summed_peaks(monkeypatch
             image.close()
 
 
+def test_thirty_action_screenshot_history_fits_the_serving_budget() -> None:
+    from flash.serving.src.engine.model_config import image_limit_for
+
+    messages = []
+    for turn in range(31):
+        if turn:
+            messages.append({"role": "assistant", "content": "noop()"})
+        messages.append({"role": "user", "content": [{"type": "image", "image": _data_uri()}]})
+    limit = image_limit_for(QWEN)
+    _validate(messages, image_limit=limit)
+    _, images = prepare_multimodal_request(messages, image_limit=limit)
+    try:
+        assert len(images) == 31
+    finally:
+        for image in images:
+            image.close()
+    messages.extend([messages[-1], messages[-1]])
+    with pytest.raises(MultimodalRequestError, match="at most 32"):
+        _validate(messages, image_limit=limit)
+
+
 def test_more_than_four_images_are_rejected() -> None:
     messages = [
         {

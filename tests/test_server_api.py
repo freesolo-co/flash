@@ -1875,8 +1875,7 @@ def test_freesolo_verify_rejects_oversized_token(monkeypatch):
 
 def test_freesolo_user_key_unverified_when_backend_unreachable(api, monkeypatch):
     # When the backend verify can't be reached (the offline test harness makes urlopen fail),
-    # _freesolo_verify returns None and authenticate yields None — an unverifiable key is
-    # never admitted.
+    # Verification outages fail closed with a retryable 503, never an invalid-key 401.
     import urllib.error
 
     import flash.server.platform.auth as auth_mod
@@ -1890,7 +1889,11 @@ def test_freesolo_user_key_unverified_when_backend_unreachable(api, monkeypatch)
         "urlopen",
         lambda *a, **k: (_ for _ in ()).throw(urllib.error.URLError("offline")),
     )
-    assert auth_mod.authenticate("Bearer unknown-token") is None
+    response = api.get("/v1/me", headers=_bearer("unknown-token"))
+    assert response.status_code == 503
+    assert response.headers["Retry-After"] == "1"
+    assert "unknown-token" not in response.text
+    assert auth_mod._verify_cache == {}
 
 
 def test_keys_are_hashed_at_rest(api):

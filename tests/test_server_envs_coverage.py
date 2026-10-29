@@ -346,9 +346,9 @@ def _oversized_source_data_uri(payload_bytes: int) -> str:
     ("messages", "expected_detail"),
     [
         pytest.param(
-            [{"role": "user", "content": [_image_block(_png_data_uri()) for _ in range(5)]}],
-            "exceeding the 4-image limit",
-            id="fifth_image",
+            [{"role": "user", "content": [_image_block(_png_data_uri()) for _ in range(33)]}],
+            "exceeding the 32-image limit",
+            id="conversation_image_limit",
         ),
         pytest.param(
             [{"role": "assistant", "content": [_image_block(_png_data_uri())]}],

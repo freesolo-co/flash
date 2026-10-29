@@ -329,7 +329,10 @@ def test_processor_digest_detects_a_qwen_intermediate_resize(real_processor):
     assert processor_image_digests(_TextOnlyProcessor(), []) == []
 
 
-def test_initial_rollout_media_matches_parent_pixels_and_tokens(real_processor, tmp_path):
+@pytest.mark.parametrize("image_count", [1, 31])
+def test_initial_rollout_media_matches_parent_pixels_and_tokens(
+    real_processor, tmp_path, image_count
+):
     from flash.engine.worker.train.core.child.glue import (
         parent_image_digests,
         prepare_episode_prompt,
@@ -342,8 +345,8 @@ def test_initial_rollout_media_matches_parent_pixels_and_tokens(real_processor, 
         {
             "role": "user",
             "content": [
-                {"type": "image", "image": path.as_uri()},
-                {"type": "text", "text": "Describe this image."},
+                *[{"type": "image", "image": path.as_uri()} for _ in range(image_count)],
+                {"type": "text", "text": "Describe these images."},
             ],
         }
     ]
@@ -370,7 +373,10 @@ def test_initial_rollout_media_matches_parent_pixels_and_tokens(real_processor, 
     result = asyncio.run(prepare_episode_prompt(Loop(), prompt))
     try:
         assert result.images[0].size == (32, 32)
-        assert result.image_digests == parent_image_digests(real_processor, [descriptor], None)
+        assert len(result.images) == image_count
+        assert result.image_digests == parent_image_digests(
+            real_processor, [descriptor] * image_count, None
+        )
         parent_messages = mm.messages_with_decoded_images(result.structured_messages, result.images)
         assert result.prompt_ids == _processor_ids(real_processor, parent_messages)
     finally:
@@ -651,9 +657,10 @@ def test_real_processor_proves_incremental_four_image_glue(real_processor, monke
         None,
     )
     calls_before_fifth = processor_calls
-    with pytest.raises(ValueError, match="4-image limit"):
+    mm.validate_image_descriptors([*cumulative_descriptors, *fifth.descriptors], None)
+    with pytest.raises(ValueError, match="32-image limit"):
         mm.validate_image_descriptors(
-            [*cumulative_descriptors, *fifth.descriptors],
+            list(fifth.descriptors) * 33,
             None,
         )
     assert processor_calls == calls_before_fifth

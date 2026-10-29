@@ -6,6 +6,8 @@ from dataclasses import asdict, dataclass, replace
 from math import ceil
 from typing import Any
 
+from flash.content.image_descriptors import MAX_IMAGES_PER_CONVERSATION
+
 ALGORITHMS = ("sft", "grpo", "opd")
 
 # algorithms whose training step samples on-policy student completions, unlike fixed-dataset sft.
@@ -381,7 +383,7 @@ MODELS: dict[str, ModelInfo] = {
             max_num_seqs=8,
             tensor_parallel_size=1,
             gpu_memory_utilization=0.90,
-            image_limit=4,
+            image_limit=MAX_IMAGES_PER_CONVERSATION,
         ),
         thinking="hybrid",
         notes="bf16 LoRA. ~19 GB of weights; SFT fits a 48 GB card, while colocated GRPO "
@@ -441,7 +443,7 @@ MODELS: dict[str, ModelInfo] = {
             max_num_seqs=8,
             tensor_parallel_size=1,
             gpu_memory_utilization=0.90,
-            image_limit=4,
+            image_limit=MAX_IMAGES_PER_CONVERSATION,
         ),
         thinking="hybrid",
         notes="Dense 27.781427952B multimodal VL checkpoint with image-capable bf16 LoRA training. "
@@ -519,7 +521,7 @@ MODELS: dict[str, ModelInfo] = {
             max_num_batched_tokens=4096,
             tensor_parallel_size=1,
             gpu_memory_utilization=0.90,
-            image_limit=4,
+            image_limit=MAX_IMAGES_PER_CONVERSATION,
         ),
         thinking="hybrid",
         min_disk_gb=200,

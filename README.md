@@ -98,6 +98,8 @@ and serving under `flash models` (`deploy`, `chat`, `deployments`, `undeploy`, `
 `flash models` lists supported base models — six curated Qwen checkpoints — and `flash gpus`
 lists GPU classes with estimated $/hr.
 
+Image-capable training and serving accept up to 32 images per conversation, including screenshots from successive tool turns. Compressed-byte, pixel, decoded-memory, and model context limits still apply; an image-count allowance does not override those budgets.
+
 Intermediate RL checkpoints are deployable: list them with `flash runs checkpoint RUN_ID`,
 then pass `RUN_ID/step-N` as the checkpoint id. To copy a finished adapter into your own
 HuggingFace repo:

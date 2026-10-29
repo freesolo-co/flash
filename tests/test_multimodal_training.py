@@ -511,7 +511,7 @@ def test_count_source_byte_pixel_and_decoded_byte_limits(monkeypatch, tmp_path):
     data = _png_bytes()
     messages = [{"role": "user", "content": "what color?"}]
 
-    assert mm.MAX_IMAGES_PER_EXAMPLE == 4
+    assert mm.MAX_IMAGES_PER_EXAMPLE == 32
     assert mm.MAX_IMAGE_SOURCE_BYTES == 8 * 1024 * 1024
     assert mm.MAX_TOTAL_IMAGE_SOURCE_BYTES == 16 * 1024 * 1024
     assert mm.MAX_IMAGE_PIXELS == 6_710_886
