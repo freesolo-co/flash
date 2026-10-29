@@ -33,6 +33,9 @@ def _single_turn_scoring_state(
         if thinking
         else None
     )
+    rollout_context = getattr(solution_str, "rollout_context", None)
+    if rollout_context is not None:
+        state = dict(state or {}, raw=str(solution_str), rollout_context=rollout_context)
     return graded, state
 
 
