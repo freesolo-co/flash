@@ -42,6 +42,13 @@ from flash.serve.deployment.preflight import (
 from flash.serve.deployment.readiness import DEPLOYMENT_SMOKE_TIMEOUT_SECONDS
 
 _SMOKE_PROMPT = "Deployment smoke test: answer in one short sentence. What is 2+2?"
+# The registered grammar still constrains and validates the answer. Asking for prose under a
+# JSON constraint can instead trap a healthy model in whitespace until truncation.
+# Keep this fixed and short: no task data or potentially unbounded schema enters the prompt.
+_SMOKE_JSON_PROMPT = (
+    "Deployment smoke test: return a minimal JSON value. Use an empty object if possible. "
+    "Do not add explanations."
+)
 _SMOKE_IMAGE_PROMPT = (
     "Look at the square in the attached image. What color is it? Reply with one color word."
 )
@@ -517,12 +524,16 @@ def _run_deployment_smoke(
     use_image_challenge = adapter_targets_images is True
     attestation_advertised = _lora_attestation_advertised(advertised_capabilities)
     expected_colour, image_messages = _smoke_image_challenge(run_id)
+    text_prompt = _SMOKE_PROMPT
+    if constraint and ("json" in constraint or constraint.get("json_object")):
+        text_prompt = _SMOKE_JSON_PROMPT
+    text_messages = [{"role": "user", "content": text_prompt}]
     result = _bounded_smoke_chat(
         serving_model=serving_model,
         thinking=spec.thinking,
         expected_checkpoint=expected_checkpoint,
         org_id=org_id,
-        messages=image_messages if use_image_challenge else None,
+        messages=image_messages if use_image_challenge else text_messages,
         structured_outputs={} if use_image_challenge and constraint is not None else None,
         max_tokens=max_tokens,
         stop_sequences=stop_sequences,
@@ -552,6 +563,7 @@ def _run_deployment_smoke(
                 thinking=spec.thinking,
                 expected_checkpoint=expected_checkpoint,
                 org_id=org_id,
+                messages=text_messages,
                 max_tokens=max_tokens,
                 stop_sequences=stop_sequences,
                 deadline=deadline,

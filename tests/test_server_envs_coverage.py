@@ -1055,7 +1055,7 @@ def test_image_deployment_smoke_keeps_structured_validation_as_a_separate_call(m
     assert out["verify_kind"] == "fixed_image"
     assert out["verify_turns"] == 2
     assert calls[0]["messages"] == serving_smoke._smoke_image_challenge("run-1")[1]
-    assert calls[1]["messages"] == [{"role": "user", "content": serving_smoke._SMOKE_PROMPT}]
+    assert calls[1]["messages"] == [{"role": "user", "content": serving_smoke._SMOKE_JSON_PROMPT}]
     assert validated == [('{"answer":"4"}', {"json_object": True})]
 
 
@@ -1095,6 +1095,41 @@ def test_image_structured_smoke_requires_attestation_on_second_request(
         )
 
     assert calls == 2
+
+
+@pytest.mark.parametrize(
+    ("constraint", "answer", "prompt"),
+    [
+        (
+            {"json": {"type": "object", "additionalProperties": False}},
+            "{}",
+            serving_smoke._SMOKE_JSON_PROMPT,
+        ),
+        ({"json_object": True}, "{}", serving_smoke._SMOKE_JSON_PROMPT),
+        ({"regex": "[A-Z]{3}"}, "ABC", serving_smoke._SMOKE_PROMPT),
+        ({"choice": ["yes", "no"]}, "yes", serving_smoke._SMOKE_PROMPT),
+    ],
+)
+def test_smoke_matches_prompt_to_constraint_kind(monkeypatch, constraint, answer, prompt):
+    calls = []
+
+    def fake_serve_chat(**kwargs):
+        calls.append(kwargs)
+        # Regression: the prose math probe can exhaust its budget under a healthy grammar.
+        if prompt == serving_smoke._SMOKE_JSON_PROMPT and kwargs["messages"] == [
+            {"role": "user", "content": serving_smoke._SMOKE_PROMPT}
+        ]:
+            return _smoke_response('<think>done</think>{"role":' + " " * 100, "length")
+        return _smoke_response(f"<think>done</think>{answer}")
+
+    monkeypatch.setattr(serving_deploy, "chat", fake_serve_chat)
+    out = _run_smoke(_smoke_spec(thinking=True, constraint=constraint))
+
+    assert len(calls) == 1
+    assert calls[0]["messages"] == [{"role": "user", "content": prompt}]
+    assert "structured_outputs" not in calls[0]  # exercise the actual registered default
+    assert out["verify_sample"] == answer
+    assert out["verify_finish_reason"] == "stop"
 
 
 def test_run_deployment_smoke_uses_thinking_completion_budget(monkeypatch):
