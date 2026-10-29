@@ -13,6 +13,7 @@ import copy
 import math
 
 from flash.adapters.targets import resolve_lora_targeting
+from flash.content.image_descriptors import MAX_IMAGES_PER_CONVERSATION
 from flash.content.multimodal import messages_with_decoded_images
 from flash.content.structured_outputs import reasoning_parser_for
 from flash.content.thinking import messages_for_chat_template
@@ -315,7 +316,7 @@ def _rollout_overrides(cfg: dict) -> list[str]:
         "actor_rollout_ref.rollout.name=vllm",
         f"actor_rollout_ref.rollout.n={cfg['group_size']}",
         # hydra's composed rollout node omits this real rollout config field.
-        "++actor_rollout_ref.rollout.limit_images=4",
+        f"++actor_rollout_ref.rollout.limit_images={MAX_IMAGES_PER_CONVERSATION}",
         # verl 0.8.0 chunks the rollout batch across agent workers with exact divisibility
         # (agent_loop.py:1111 -> protocol.py:874). choose the largest divisor of
         # prompts_per_step * group_size up to the cap, so small or final short batches cannot abort.

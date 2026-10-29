@@ -13,7 +13,7 @@ from typing import Any
 from flash.content import image_descriptors as _image_descriptors
 from flash.content.image_descriptors import ValidatedImageDescriptor
 
-MAX_IMAGES_PER_EXAMPLE = 4
+MAX_IMAGES_PER_EXAMPLE = _image_descriptors.MAX_IMAGES_PER_CONVERSATION
 MAX_IMAGE_SOURCE_BYTES = 8 * 1024 * 1024
 MAX_TOTAL_IMAGE_SOURCE_BYTES = 16 * 1024 * 1024
 MAX_IMAGE_WIDTH = 8192

@@ -13,6 +13,7 @@ import contextlib
 import json
 import os
 
+from flash.content.image_descriptors import MAX_IMAGES_PER_CONVERSATION
 from flash.content.structured_outputs import reasoning_parser_for
 from flash.engine.worker.runtime.state import WorkerContext
 from flash.engine.worker.train.entry.backend_common import (
@@ -206,7 +207,7 @@ def _actor_rollout_overrides(config: dict, *, max_tokens: int) -> list[str]:
         f"actor_rollout_ref.rollout.n={_hydra_val(config['group_size'])}",
         # `++`, not a bare key: limit_images is a real RolloutConfig field but is absent from the
         # composed rollout node, so hydra rejects a bare assignment.
-        "++actor_rollout_ref.rollout.limit_images=4",
+        f"++actor_rollout_ref.rollout.limit_images={MAX_IMAGES_PER_CONVERSATION}",
         f"actor_rollout_ref.rollout.max_model_len={_hydra_val(max_tokens)}",
         f"actor_rollout_ref.rollout.temperature={_hydra_val(config.get('temperature', 1.0))}",
         f"actor_rollout_ref.rollout.top_p={_hydra_val(config.get('top_p', 1.0))}",

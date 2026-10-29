@@ -12,7 +12,9 @@ release would prove nothing about it, and inspecting an accounting backlog for a
 never happened would just burn the deadline before failing anyway.
 
 The accounting RPC scopes durable settlement to the canary's correlation id, organization, model,
-deployment id, and release SHA. Fresh pending usage is not evidence of delivery.
+deployment id, and release SHA. Stall reads cover that deployment across all organizations and
+models, so an older release's quarantines cannot veto a healthy promotion. Fresh pending usage
+is not evidence of delivery.
 
 Credentials are read from the environment only, never from argv: `run:` lines are echoed into the
 public build log, so an interpolated key leaks on every run including the green ones.
@@ -34,6 +36,7 @@ if TYPE_CHECKING:
     import httpx
 
 from flash.serving.app.timeouts import CANARY_TIMEOUT_SECONDS, ROUTER_TIMEOUT_SECONDS
+from flash.serving.promotion.accounting_smoke_test import read_accounting
 from flash.serving.promotion.canary import (
     CANARY_TRANSPORT_FAILURE,
     CanaryError,
@@ -283,7 +286,7 @@ def _resolve(base_url: str, env: dict[str, str]) -> GatePlan:
 
     key = env["SUPABASE_SERVICE_ROLE_KEY"]
     url = f"{env['SUPABASE_URL'].rstrip('/')}/rest/v1/rpc/{_BACKLOG_SNAPSHOT_RPC}"
-    # one RPC read, deliberately NOT through `DurableUsageOutbox`: that is the delivery WORKER, and
+    # Read-only RPC/table calls, NOT through `DurableUsageOutbox`: that is the delivery WORKER, and
     # constructing one demands a `worker_id`, a `backend_url`, and a `deployment_id` that a single
     # read never uses. reuse the canonical header helper so the service-role format check and the
     # postgrest schema routing stay identical to every other supabase caller in the repo.
@@ -314,9 +317,7 @@ def _resolve(base_url: str, env: dict[str, str]) -> GatePlan:
     }
 
     async def read_backlog(client: httpx.AsyncClient) -> Any:
-        response = await client.post(url, headers=headers, json=accounting_scope, timeout=15)
-        response.raise_for_status()
-        return response.json()
+        return await read_accounting(client, url, headers, accounting_scope)
 
     return GatePlan(
         request=CanaryRequest(

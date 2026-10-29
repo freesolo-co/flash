@@ -6909,7 +6909,7 @@ def test_overrides_match_verl_0_8_sync_distillation_contract():
     )
     # `++`-prefixed: these keys are absent from the composed node, so a bare assignment would abort
     # the run at hydra composition. see build_opd_overrides for the per-key reasoning.
-    assert overrides["++actor_rollout_ref.rollout.limit_images"] == "4"
+    assert overrides["++actor_rollout_ref.rollout.limit_images"] == "32"
     assert overrides["++actor_rollout_ref.rollout.engine_kwargs.vllm.seed"] == "42"
     assert "actor_rollout_ref.rollout.seed" not in overrides
     assert overrides["actor_rollout_ref.rollout.load_format"] == "safetensors"
@@ -9475,18 +9475,14 @@ def test_text_only_multiturn_start_keeps_flat_transcript_state():
     assert bridge._sessions["text"]["messages"] == [{"role": "user", "content": "q"}]
 
 
-def test_fifth_opd_image_fails_before_processor_glue_or_teacher_scoring():
+@pytest.mark.parametrize("image_count", [4, 31, 32])
+def test_opd_image_history_accepts_fresh_screenshots_until_conversation_limit(image_count):
     initial = [
         {
             "role": "user",
             "content": [
                 {"type": "image", "image": uri}
-                for uri in (
-                    _IMAGE_DATA_URI,
-                    _OTHER_IMAGE_DATA_URI,
-                    _IMAGE_DATA_URI,
-                    _OTHER_IMAGE_DATA_URI,
-                )
+                for uri in ([_IMAGE_DATA_URI, _OTHER_IMAGE_DATA_URI] * 16)[:image_count]
             ],
         }
     ]
@@ -9511,16 +9507,21 @@ def test_fifth_opd_image_fails_before_processor_glue_or_teacher_scoring():
         session_id="fifth",
         prompt_ids=[10, 11],
         raw_prompt=normalized.messages,
-        image_count=4,
+        image_count=image_count,
         image_digests=list(bridge.prompts[0].image_digests),
     )
-    with pytest.raises(ValueError, match="4-image limit"):
+    from contextlib import nullcontext
+
+    context = (
+        pytest.raises(ValueError, match="32-image limit") if image_count == 32 else nullcontext()
+    )
+    with context:
         bridge.step_multiturn(
             {
                 "session_id": "fifth",
                 "turn_ordinal": 0,
                 "accepted_prefix": [10, 11],
-                "image_count": 4,
+                "image_count": image_count,
                 "image_digests": list(bridge.prompts[0].image_digests),
                 "raw_response_ids": [65],
                 "response_ids": [65],
@@ -9532,8 +9533,12 @@ def test_fifth_opd_image_fails_before_processor_glue_or_teacher_scoring():
                 "skip_reason": "",
             }
         )
-    assert processor.image_counts == []
-    assert bridge._sessions["fifth"]["turns"] == []
+    if image_count == 32:
+        assert processor.image_counts == []
+        assert bridge._sessions["fifth"]["turns"] == []
+    else:
+        assert processor.image_counts == [1]
+        assert len(bridge._sessions["fifth"]["turns"]) == 1
 
 
 def test_opd_media_digest_order_sabotage_fails_before_environment_mutation():

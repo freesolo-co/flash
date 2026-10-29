@@ -203,7 +203,10 @@ class AccountingEvidence:
 
 
 def parse_accounting(payload: Any) -> AccountingEvidence | None:
-    """Read a `serving_promotion_accounting_snapshot` body, or None when it is not one.
+    """Read accounting counters, or None when the evidence is malformed.
+
+    The promotion reader retains the RPC's canary proof and global state diagnostics, replacing
+    stall counters with reads scoped to the candidate deployment and release.
 
     Missing counters must remain distinguishable from zero: zero means healthy, whereas missing
     fields can indicate schema drift or a permission-shaped empty result. Reject incomplete

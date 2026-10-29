@@ -41,6 +41,10 @@ _MODE_BYTES_PER_PIXEL = {
     "I": 4,
     "F": 4,
 }
+# One initial observation plus up to 30 browser actions, with a spare slot.
+# Byte, pixel, decoded-memory, and model context limits remain independently enforced.
+MAX_IMAGES_PER_CONVERSATION = 32
+
 RGB_BYTES_PER_PIXEL = 3
 # decoding one image costs its own buffer plus a transient RGB conversion, so the worst mode
 # sets the bytes-per-pixel a pixel budget has to assume. exported because the per-image pixel cap

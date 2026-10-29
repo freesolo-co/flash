@@ -12,6 +12,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from flash.content.image_descriptors import MAX_IMAGES_PER_CONVERSATION
 from flash.serve.request.tool_calls import qualified_tool_parser
 from flash.serving.deepinfer.contract.config import GPU as DEEPSEEK_GPU
 from flash.serving.deepinfer.contract.config import MODEL_ID as DEEPSEEK_MODEL_ID
@@ -90,7 +91,7 @@ SERVING_MODELS: list[dict[str, Any]] = [
     },
     {
         "base_model": "Qwen/Qwen3.5-9B",
-        "image_input_limit": 4,
+        "image_input_limit": MAX_IMAGES_PER_CONVERSATION,
         "gpu": "B200",
         "engine": {
             "tokenizer_model": "Qwen/Qwen3.5-9B",
@@ -125,7 +126,7 @@ SERVING_MODELS: list[dict[str, Any]] = [
     #     registration starts it.
     {
         "base_model": "Qwen/Qwen3.6-35B-A3B",
-        "image_input_limit": 4,
+        "image_input_limit": MAX_IMAGES_PER_CONVERSATION,
         "gpu": "B200",
         "engine": {
             "tokenizer_model": "Qwen/Qwen3.6-35B-A3B",
@@ -168,7 +169,7 @@ SERVING_MODELS: list[dict[str, Any]] = [
     # pins name one in the base repo, which are separate sha namespaces.
     {
         "base_model": "Qwen/Qwen3.8-27B",
-        "image_input_limit": 4,
+        "image_input_limit": MAX_IMAGES_PER_CONVERSATION,
         "gpu": "B200",
         "engine": {
             "model_revision": "017b9c7af6b5689d5dd426a76e0bc077eb5ca20a",

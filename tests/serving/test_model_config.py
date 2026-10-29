@@ -43,7 +43,7 @@ def test_every_catalog_model_has_an_intentional_image_classification() -> None:
         "Qwen/Qwen3.8-27B",
         "Qwen/Qwen3.6-35B-A3B",
     }
-    assert all(image_limit_for(model) == 4 for model in image_models)
+    assert all(image_limit_for(model) == 32 for model in image_models)
 
 
 def test_uncataloged_base_models_are_not_supported() -> None:
@@ -145,7 +145,7 @@ def test_qwen38_27b_is_active_on_b200_with_pinned_immutable_revisions() -> None:
     assert base_model in base_models()
     assert is_supported_base_model(base_model) is True
     assert gpu_for(base_model) == "B200"
-    assert image_limit_for(base_model) == 4
+    assert image_limit_for(base_model) == 32
     assert serve_model_for(base_model) == "Qwen/Qwen3.8-27B-FP8"
 
     ov = engine_overrides_for(base_model)

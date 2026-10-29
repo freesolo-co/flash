@@ -164,7 +164,8 @@ def test_a_rejected_redirect_is_not_cached_as_a_failed_verification(
     auth._verify_cache.clear()
     auth._verify_inflight.clear()
 
-    assert auth._freesolo_verify("redirected-secret") is None
+    with pytest.raises(auth.AuthVerificationUnavailable):
+        auth._freesolo_verify("redirected-secret")
     assert source_seen == [("GET", "Bearer redirected-secret")]
     assert sink_seen == []
     assert auth._verify_key_digest("redirected-secret") not in auth._verify_cache
