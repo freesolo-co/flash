@@ -316,7 +316,9 @@ def test_image_and_structured_smoke_paths_call_pure_answer_without_org(monkeypat
 
     monkeypatch.setattr(serving_smoke, "_bounded_smoke_chat", bounded)
     monkeypatch.setattr(
-        serving_smoke, "_smoke_request_settings", lambda _spec: ({"json_object": True}, 8, None)
+        serving_smoke,
+        "_smoke_request_settings",
+        lambda _spec: ({"json_object": True}, 8, None, None),
     )
     monkeypatch.setattr(serving_smoke, "_smoke_image_challenge", lambda _run_id: ("RED", []))
     monkeypatch.setattr(serving_smoke, "_validate_structured_smoke", lambda *_args, **_kwargs: None)

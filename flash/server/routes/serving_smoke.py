@@ -40,6 +40,7 @@ from flash.serve.deployment.preflight import (
     validate_structured_output_patterns,
 )
 from flash.serve.deployment.readiness import DEPLOYMENT_SMOKE_TIMEOUT_SECONDS
+from flash.server.routes.serving_smoke_request import json_smoke_messages, json_smoke_sampling
 
 _SMOKE_PROMPT = "Deployment smoke test: answer in one short sentence. What is 2+2?"
 _SMOKE_IMAGE_PROMPT = (
@@ -419,9 +420,12 @@ def _validate_structured_smoke(
         raise ServingError(f"configured structured-output regex is invalid: {exc}") from exc
 
 
-def _smoke_request_settings(spec: JobSpec) -> tuple[dict | None, int, list[str] | None]:
+def _smoke_request_settings(
+    spec: JobSpec,
+) -> tuple[dict | None, int, list[str] | None, list[dict] | None]:
     train = getattr(spec, "train", None)
     constraint = parse_structured_outputs(getattr(train, "structured_outputs", ""))
+    messages = json_smoke_messages(constraint)
     max_tokens = 256
     # thinking spends tokens before content regardless of grammar, so 256 can truncate the think
     # block and reject a healthy deployment. the resolver widens it to what the run reasons within,
@@ -431,13 +435,18 @@ def _smoke_request_settings(spec: JobSpec) -> tuple[dict | None, int, list[str] 
         max_tokens = max(
             256, resolve_smoke_completion_tokens(spec, constrained=constraint is not None)
         )
-        serving_capacity = serving_completion_token_capacity(
-            spec, prompt_allowance=SERVING_PROMPT_TOKEN_ALLOWANCE
-        )
-        if serving_capacity is not None:
-            max_tokens = min(max_tokens, serving_capacity)
+    # Reserve the schema's UTF-8 bytes as a conservative token allowance in addition to the
+    # existing template allowance. A large schema must not overrun the serving context.
+    prompt_allowance = SERVING_PROMPT_TOKEN_ALLOWANCE + sum(
+        len(message["content"].encode("utf-8")) for message in messages or []
+    )
+    serving_capacity = serving_completion_token_capacity(spec, prompt_allowance=prompt_allowance)
+    if serving_capacity is not None:
+        if serving_capacity < 256:
+            raise ServingError("deployment smoke JSON schema leaves insufficient serving context")
+        max_tokens = min(max_tokens, serving_capacity)
     stop_sequences = [str(value) for value in (getattr(train, "stop_sequences", ()) or ())]
-    return constraint, max_tokens, stop_sequences or None
+    return constraint, max_tokens, stop_sequences or None, messages
 
 
 def _bounded_smoke_chat(
@@ -448,6 +457,7 @@ def _bounded_smoke_chat(
     org_id: str,
     messages: list[dict] | None = None,
     structured_outputs: dict | None = None,
+    sampling: dict | None = None,
     max_tokens: int,
     stop_sequences: list[str] | None,
     deadline: float,
@@ -479,6 +489,7 @@ def _bounded_smoke_chat(
                 }
                 if structured_outputs is not None:
                     chat_kwargs["structured_outputs"] = structured_outputs
+                chat_kwargs.update(sampling or {})
                 return serving_deploy.chat(**chat_kwargs)
 
             return _bounded_call(_chat_call, deadline=deadline, budget_s=budget_s)
@@ -510,7 +521,8 @@ def _run_deployment_smoke(
 ) -> dict:
     started = time.monotonic()
     deadline = started + budget_s
-    constraint, max_tokens, stop_sequences = _smoke_request_settings(spec)
+    constraint, max_tokens, stop_sequences, text_messages = _smoke_request_settings(spec)
+    sampling = json_smoke_sampling(spec, text_messages)
     # only an explicit multimodal targeting marker enables the image challenge. unavailable metadata
     # falls back to the weaker text smoke: it gives up vision-path verification, but cannot strand a
     # working text adapter by asking a task it was never trained for.
@@ -522,7 +534,8 @@ def _run_deployment_smoke(
         thinking=spec.thinking,
         expected_checkpoint=expected_checkpoint,
         org_id=org_id,
-        messages=image_messages if use_image_challenge else None,
+        messages=image_messages if use_image_challenge else text_messages,
+        sampling=None if use_image_challenge else sampling,
         structured_outputs={} if use_image_challenge and constraint is not None else None,
         max_tokens=max_tokens,
         stop_sequences=stop_sequences,
@@ -552,6 +565,8 @@ def _run_deployment_smoke(
                 thinking=spec.thinking,
                 expected_checkpoint=expected_checkpoint,
                 org_id=org_id,
+                messages=text_messages,
+                sampling=sampling,
                 max_tokens=max_tokens,
                 stop_sequences=stop_sequences,
                 deadline=deadline,

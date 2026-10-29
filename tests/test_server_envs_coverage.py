@@ -1055,7 +1055,7 @@ def test_image_deployment_smoke_keeps_structured_validation_as_a_separate_call(m
     assert out["verify_kind"] == "fixed_image"
     assert out["verify_turns"] == 2
     assert calls[0]["messages"] == serving_smoke._smoke_image_challenge("run-1")[1]
-    assert calls[1]["messages"] == [{"role": "user", "content": serving_smoke._SMOKE_PROMPT}]
+    assert calls[1]["messages"][0] == {"role": "system", "content": "You output a JSON object."}
     assert validated == [('{"answer":"4"}', {"json_object": True})]
 
 
@@ -1108,6 +1108,111 @@ def test_run_deployment_smoke_uses_thinking_completion_budget(monkeypatch):
     _run_smoke(_smoke_spec(thinking=True, constraint={"json_object": True}))
 
     assert calls[0]["max_tokens"] == 1536
+
+
+def test_json_smoke_explains_the_decoder_contract(monkeypatch):
+    schema = {
+        "type": "object",
+        "properties": {"name": {"type": "string"}},
+        "required": ["name"],
+        "additionalProperties": False,
+    }
+    calls = []
+
+    def chat(**kwargs):
+        calls.append(kwargs)
+        return _smoke_response('<think>example</think>{"name":"Jane"}')
+
+    monkeypatch.setattr(serving_deploy, "chat", chat)
+    out = _run_smoke(
+        _smoke_spec(
+            thinking=True,
+            model="Qwen/Qwen3.5-9B",
+            constraint={"json": schema},
+            max_completion_tokens=4096,
+        )
+    )
+    request = calls[0]
+    assert json.loads(request["messages"][0]["content"].split("\n", 1)[1]) == schema
+    assert "2+2" not in json.dumps(request["messages"])
+    assert "structured_outputs" not in request  # Still use the registered adapter grammar.
+    assert request["temperature"] == 1.0
+    assert request["top_p"] == 0.95
+    assert request["presence_penalty"] == 1.5
+    assert request["seed"] == 42
+    assert request["max_tokens"] == 4096
+    assert request["thinking"] is True
+    assert request["expected_checkpoint"] == _SMOKE_REVISION
+    assert out["verify_sample"] == '{"name":"Jane"}'
+
+
+@pytest.mark.parametrize(
+    ("content", "finish", "error"),
+    [
+        ('<think>done</think>{"name":"Jane"}', "length", "truncated"),
+        ("<think>still reasoning", "stop", "never closed"),
+        ('<think>done</think>{"wrong":true}', "stop", "violates"),
+    ],
+)
+def test_sampled_json_smoke_preserves_failure_checks(monkeypatch, content, finish, error):
+    monkeypatch.setattr(serving_deploy, "chat", lambda **_kwargs: _smoke_response(content, finish))
+    with pytest.raises(ServingError, match=error):
+        _run_smoke(
+            _smoke_spec(
+                thinking=True,
+                model="Qwen/Qwen3.5-9B",
+                constraint={"json": {"type": "object", "required": ["name"]}},
+            )
+        )
+
+
+def test_json_smoke_reserves_schema_context_before_generation(monkeypatch):
+    calls = []
+
+    def chat(**kwargs):
+        calls.append(kwargs)
+        return _smoke_response("<think>done</think>{}")
+
+    monkeypatch.setattr(serving_deploy, "chat", chat)
+    spec = _smoke_spec(
+        thinking=True,
+        model="Qwen/Qwen3.5-9B",
+        constraint={"json": {"type": "object", "description": "x" * 3000}},
+        max_completion_tokens=32768,
+    )
+    _run_smoke(spec)
+    assert (
+        calls[0]["max_tokens"]
+        + sum(len(message["content"].encode("utf-8")) for message in calls[0]["messages"])
+        <= 32768 - 256
+    )
+
+    spec.train.structured_outputs = json.dumps(
+        {"json": {"type": "object", "description": "x" * 32768}}
+    )
+    with pytest.raises(ServingError, match="insufficient serving context"):
+        _run_smoke(spec)
+    assert len(calls) == 1
+
+
+def test_image_challenge_keeps_its_sampling_when_json_smoke_is_sampled(monkeypatch):
+    calls = []
+
+    def chat(**kwargs):
+        calls.append(kwargs)
+        answer = _smoke_expected_colour() if len(calls) == 1 else "{}"
+        return _smoke_response(f"<think>done</think>{answer}")
+
+    monkeypatch.setattr(serving_deploy, "chat", chat)
+    _run_smoke(
+        _smoke_spec(thinking=True, model="Qwen/Qwen3.5-9B", constraint={"json_object": True}),
+        adapter_targets_images=True,
+    )
+    assert calls[0]["temperature"] == 0.0
+    assert "presence_penalty" not in calls[0]
+    assert calls[0]["structured_outputs"] == {}
+    assert calls[1]["temperature"] == 1.0
+    assert "structured_outputs" not in calls[1]
 
 
 def test_run_deployment_smoke_does_not_cap_a_constrained_request(monkeypatch):
