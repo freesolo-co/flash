@@ -35,7 +35,7 @@ from flash.envs.meta.dataset_selection import (
 
 _CANONICAL_INPUT_KEY = "input"
 _CANONICAL_OUTPUT_KEY = "output"
-_MAX_PROFILE_DATASET_BYTES = 32 * 1024 * 1024
+_MAX_PROFILE_INLINE_RECORDS_BYTES = 32 * 1024 * 1024
 # the contract rides in every row, so it is bounded far tighter than the dataset that carries it.
 _MAX_PROFILE_CONTRACT_BYTES = 256 * 1024
 
@@ -143,10 +143,10 @@ def _reject_oversized_records(records: object) -> None:
         encoded = len(json.dumps(records, default=str).encode("utf-8", errors="ignore"))
     except (TypeError, ValueError):
         return
-    if encoded > _MAX_PROFILE_DATASET_BYTES:
+    if encoded > _MAX_PROFILE_INLINE_RECORDS_BYTES:
         raise PackagedDatasetUnavailable(
             "[environment.params] records exceed the "
-            f"{_MAX_PROFILE_DATASET_BYTES // (1024 * 1024)} MiB control-plane profiling limit. "
+            f"{_MAX_PROFILE_INLINE_RECORDS_BYTES // (1024 * 1024)} MiB control-plane profiling limit. "
             "Package the dataset as dataset/train.jsonl instead of inlining it."
         )
 
@@ -225,14 +225,11 @@ def _read_dataset_rows(path: Path, *, max_examples: int) -> tuple[int, list[dict
         "valid dataset/train.jsonl to the environment package."
     )
     try:
-        if path.stat().st_size > _MAX_PROFILE_DATASET_BYTES:
-            raise PackagedDatasetUnavailable(
-                f"environment dataset file {path.name!r} exceeds the 32 MiB control-plane profiling "
-                "limit. Reduce the packaged training dataset."
-            )
         if path.suffix.lower() not in {".jsonl", ".json"}:
             raise PackagedDatasetUnavailable("dataset file must end in .jsonl or .json")
-        # use the worker's decoder; it materializes all rows before profiling selects a prefix.
+        # Package upload/extraction already bounds file sizes. Do not impose a smaller profiling
+        # limit that prevents training on accepted packages. Keep the worker's decoder so every
+        # row is validated before selecting a prefix, including rows beyond max_examples.
         rows = load_records(path)
     except PackagedDatasetUnavailable:
         raise
@@ -281,9 +278,8 @@ def profile_packaged_sft_dataset(
     records = params.pop("records", None)
     max_examples = int(spec.train.max_examples or 0)
     if records is not None:
-        # inline records arrive in the request body rather than the package, so the packaged-file
-        # size guard never sees them. bound them by the same limit before anything is copied or
-        # tokenized in the shared plane process.
+        # Inline records arrive in the request body and bypass package size limits. Bound them
+        # before copying or tokenizing them in the shared plane process.
         _reject_oversized_records(records)
         selection = select_dataset_source(params, base_dir, records, _resolve_path_arg)
         source_examples, rows = _validate_dataset_rows(
