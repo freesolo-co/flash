@@ -76,7 +76,7 @@ def test_serving_capacity_matches_validated_matrix():
             "max_num_seqs": 8,
             "tensor_parallel_size": 1,
             "gpu_memory_utilization": 0.90,
-            "image_limit": 4,
+            "image_limit": 32,
         },
         "Qwen/Qwen3.8-27B": {
             "gpu": "B200",
@@ -88,7 +88,7 @@ def test_serving_capacity_matches_validated_matrix():
             "max_num_seqs": 8,
             "tensor_parallel_size": 1,
             "gpu_memory_utilization": 0.90,
-            "image_limit": 4,
+            "image_limit": 32,
         },
         "Qwen/Qwen3.6-35B-A3B": {
             "gpu": "B200",
@@ -101,7 +101,7 @@ def test_serving_capacity_matches_validated_matrix():
             "max_num_batched_tokens": 4096,
             "tensor_parallel_size": 1,
             "gpu_memory_utilization": 0.90,
-            "image_limit": 4,
+            "image_limit": 32,
         },
     }
     for model_id, values in expected.items():
@@ -132,7 +132,7 @@ def test_public_rows_prune_unset_serving_capacity_fields():
         "max_num_seqs": 8,
         "tensor_parallel_size": 1,
         "gpu_memory_utilization": 0.90,
-        "image_limit": 4,
+        "image_limit": 32,
     }
 
 

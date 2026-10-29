@@ -683,6 +683,7 @@ def spec_from_dict(
             group_size=_train_int(train_raw, "group_size", minimum=1),
             temperature=_train_float(train_raw, "temperature", minimum=0.0),
             max_completion_tokens=_train_int(train_raw, "max_completion_tokens", minimum=1),
+            mask_truncated_completions=train_raw.get("mask_truncated_completions"),
             kl_penalty_coef=_train_float(train_raw, "kl_penalty_coef", minimum=0.0),
             thinking_length_penalty_coef=_train_float(
                 train_raw, "thinking_length_penalty_coef", minimum=0.0, maximum=1.0
@@ -738,6 +739,7 @@ def spec_from_dict(
 # shared-table rollout options from being silently ignored by sft and vice versa.
 _INAPPLICABLE_TRAIN_KNOBS: dict[str, dict[str, str]] = {
     "sft": {
+        "mask_truncated_completions": "only applies to single-turn grpo rollouts",
         "structured_outputs": (
             "only applies to rollout algorithms (grpo, opd); SFT trains on dataset completions "
             "and never generates"
@@ -771,6 +773,7 @@ _INAPPLICABLE_TRAIN_KNOBS: dict[str, dict[str, str]] = {
         ),
     },
     "opd": {
+        "mask_truncated_completions": "only applies to single-turn grpo rollouts",
         "thinking_length_penalty_coef": (
             "only applies to grpo; it shapes the grpo reward, and opd optimizes a distillation "
             "objective with no reward term"

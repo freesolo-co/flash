@@ -614,8 +614,14 @@ def test_accounting_rpc_is_scoped_to_the_canary_and_release():
     def respond(request):
         import json
 
+        if request.method == "GET":
+            assert (
+                request.url.params["serving_deployment_id"] == f"eq.{plan.expected_deployment_id}"
+            )
+            assert request.url.params["serving_release"] == f"eq.{plan.expected_sha}"
+            return httpx.Response(200, json=[])
         seen.append((request.url.path, json.loads(request.content)))
-        return httpx.Response(200, json=_Snapshot())
+        return httpx.Response(200, json={**_Snapshot(), "captured_at": "2026-10-29T00:58:18+00:00"})
 
     async def read():
         async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as client:

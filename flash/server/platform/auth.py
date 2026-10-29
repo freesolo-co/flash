@@ -33,6 +33,10 @@ _verify_inflight: dict[str, Future[dict[str, Any] | None]] = {}
 _VERIFY_CACHE_MAX = 1024
 
 
+class AuthVerificationUnavailable(RuntimeError):
+    """The identity service could not verify a key; it did not reject the key."""
+
+
 def _verify_key_digest(token: str) -> str:
     """Return the collision-resistant state key without retaining bearer material."""
     return db.hash_key(token)
@@ -171,7 +175,7 @@ def serving_org_id(org_id: str | None) -> str:
 
 
 def _freesolo_verify(token: str) -> dict[str, Any] | None:
-    """Verify a token and return its identity; transport failures reject without caching."""
+    """Return identity or a definitive rejection; unavailable verification raises."""
     if not token or len(token) > _MAX_TOKEN_LEN:
         return None
     digest = _verify_key_digest(token)
@@ -202,10 +206,12 @@ def _freesolo_verify(token: str) -> dict[str, Any] | None:
         try:
             response = _urlopen_no_redirect(req, timeout=_VERIFY_TIMEOUT_S)
         except urllib.error.HTTPError as exc:
+            if exc.code not in {401, 403}:
+                raise AuthVerificationUnavailable("Authentication service unavailable") from None
             identity = None
-            cache_negative = exc.code in {401, 403}
+            cache_negative = True
         except (OSError, ValueError):
-            identity = None
+            raise AuthVerificationUnavailable("Authentication service unavailable") from None
         else:
             try:
                 with response as resp:
@@ -216,8 +222,10 @@ def _freesolo_verify(token: str) -> dict[str, Any] | None:
                     )
                     response_status = resp.status
             except (urllib.error.HTTPError, OSError, ValueError):
-                identity = None
+                raise AuthVerificationUnavailable("Authentication service unavailable") from None
             else:
+                if response_status not in {200, 401, 403}:
+                    raise AuthVerificationUnavailable("Authentication service unavailable")
                 cache_negative = response_status in {401, 403}
         if cache_negative:
             with _verify_cache_lock:

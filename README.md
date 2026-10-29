@@ -98,6 +98,8 @@ and serving under `flash models` (`deploy`, `chat`, `deployments`, `undeploy`, `
 `flash models` lists supported base models — six curated Qwen checkpoints — and `flash gpus`
 lists GPU classes with estimated $/hr.
 
+Image-capable training and serving accept up to 32 images per conversation, including screenshots from successive tool turns. Compressed-byte, pixel, decoded-memory, and model context limits still apply; an image-count allowance does not override those budgets.
+
 Intermediate RL checkpoints are deployable: list them with `flash runs checkpoint RUN_ID`,
 then pass `RUN_ID/step-N` as the checkpoint id. To copy a finished adapter into your own
 HuggingFace repo:
@@ -109,6 +111,16 @@ flash models export --adapter-id RUN_ID/final --repository your-org/your-repo
 
 There are no built-in task environments — the environment you push defines the task.
 Single-turn and bounded multi-turn environments are supported.
+
+For single-turn GRPO rewards that intentionally score partial responses, such as draft-token
+prefix agreement, set `train.mask_truncated_completions = false`. This retains generated
+tokens in the loss when sampling reaches `train.max_completion_tokens`, without inventing
+an EOS token. Choose the token limit and reward together; Flash does not prescribe a draft
+length. Generation errors and empty batches still fail. Set the flag to `true` for rewards
+requiring finished responses. By default, length-limited responses are masked, including
+when `stop_sequences` is configured. Responses that actually finish on a stop string remain
+trainable. This option is not supported for multi-turn environments, whose actions must
+be complete and usable.
 
 ### Calling a deployed adapter from your own app
 
@@ -263,6 +275,11 @@ CLIs. For side-by-side prod and staging, use a virtualenv per channel (or `pipx`
 Within a commit, `[project].version` and `[tool.flash-dev].version` must match (CI enforces
 this), so cutting a release bumps both. The **published** channels still differ, because dev
 publishes on merge to `dev` while prod publishes only once `dev` is promoted to `main`.
+
+Serving promotion requires stable release identity, a real streaming canary with durable billing
+settlement, and no stalled accounting rows from the candidate deployment and release. Historical
+quarantines remain in the global backlog for reconciliation; they do not roll back a later release
+whose own accounting is healthy. Unreadable accounting evidence still fails the promotion gate.
 
 Either CLI honours an explicit `FLASH_API_URL` or `login --api-url`; the channel only sets
 the default.

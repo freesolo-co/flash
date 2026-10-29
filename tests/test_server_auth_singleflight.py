@@ -102,7 +102,8 @@ def test_http_error_raised_on_response_exit_is_not_cached(monkeypatch) -> None:
 
     token = "revoked-on-exit"
     digest = auth._verify_key_digest(token)
-    assert auth._freesolo_verify(token) is None
+    with pytest.raises(auth.AuthVerificationUnavailable):
+        auth._freesolo_verify(token)
     assert digest not in auth._verify_cache
     assert auth._freesolo_verify(token) == _IDENTITY
     assert responses == []
@@ -249,7 +250,8 @@ def test_transient_failures_are_not_cached(monkeypatch, failure: BaseException) 
 
     monkeypatch.setattr(auth.urllib.request, "urlopen", fake_urlopen)
 
-    assert auth._freesolo_verify("recovering") is None
+    with pytest.raises(auth.AuthVerificationUnavailable):
+        auth._freesolo_verify("recovering")
     assert auth._verify_key_digest("recovering") not in auth._verify_cache
     assert auth._freesolo_verify("recovering") == _IDENTITY
     assert calls == 2

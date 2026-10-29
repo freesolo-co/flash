@@ -904,7 +904,7 @@ def test_build_verl_overrides_does_not_emit_inert_drop_last_override():
 
 def test_build_verl_overrides_limits_grpo_rollouts_to_four_images():
     overrides = rl_verl.build_verl_overrides(_overrides_cfg())
-    assert "++actor_rollout_ref.rollout.limit_images=4" in overrides
+    assert "++actor_rollout_ref.rollout.limit_images=32" in overrides
 
 
 def test_build_verl_overrides_sizes_agent_loop_workers_to_the_rollout_batch():
@@ -3150,13 +3150,11 @@ def _stubbed_modules(stubs: dict[str, types.ModuleType]):
                 sys.modules[name] = value
 
 
-def test_stop_sequences_gate_off_truncated_completion_masking():
-    # main couples these: stop-string rollouts do not end on EOS, so masking truncated completions
-    # would wrongly drop every one of them. the verl resolver must inherit that coupling, not
-    # re-derive it.
+def test_stop_sequences_do_not_override_truncated_completion_masking():
+    # The resolver uses the explicit policy; stop-string termination is handled by finish reason.
     source = inspect.getsource(rl_inputs._resolve_grpo_inputs)
     assert "_worker_config.grpo_mask_truncated_completions(_t)" in source
-    assert not worker_config.grpo_mask_truncated_completions(
+    assert worker_config.grpo_mask_truncated_completions(
         SimpleNamespace(stop_sequences=("</answer>",))
     )
     assert worker_config.grpo_mask_truncated_completions(SimpleNamespace(stop_sequences=()))
@@ -4951,12 +4949,13 @@ def test_bridge_normalizes_and_authenticates_every_supported_image_reply_shape(s
     image.close()
 
 
-def test_bridge_rejects_a_fifth_image_before_processor_glue_or_another_generation():
+@pytest.mark.parametrize("image_count", [4, 31, 32])
+def test_bridge_accepts_fresh_screenshots_until_conversation_limit(image_count):
     from flash.content.multimodal import image_descriptors_to_data_uris
     from flash.engine.worker.train.core.child.glue import parent_image_digests
 
     source_images_and_descriptors = [
-        _bridge_image(color) for color in ("red", "green", "blue", "yellow", "black")
+        _bridge_image("red" if index % 2 else "blue") for index in range(image_count + 1)
     ]
     source_images = [item[0] for item in source_images_and_descriptors]
     descriptors = [item[1] for item in source_images_and_descriptors]
@@ -4966,11 +4965,11 @@ def test_bridge_rejects_a_fifth_image_before_processor_glue_or_another_generatio
     prompt = [
         {
             "role": "user",
-            "content": [{"type": "image", "image": uri} for uri in data_uris[:4]],
+            "content": [{"type": "image", "image": uri} for uri in data_uris[:-1]],
         }
     ]
     env = _BridgeEnv(
-        replies=[{"role": "user", "content": [{"type": "image", "image": data_uris[4]}]}],
+        replies=[{"role": "user", "content": [{"type": "image", "image": data_uris[-1]}]}],
         done_after=99,
     )
     tokenizer = _BridgeGlueTokenizer()
@@ -4980,23 +4979,28 @@ def test_bridge_rejects_a_fifth_image_before_processor_glue_or_another_generatio
         examples=[{"index": 0}],
         env_prompts=[prompt],
         prompt_ids=[[1]],
-        prompt_descriptors=[descriptors[:4]],
+        prompt_descriptors=[descriptors[:-1]],
         processor=processor,
         tokenizer=tokenizer,
     )
     routes = bridge.routes()
-    digests = parent_image_digests(processor, descriptors[:4], None)
+    digests = parent_image_digests(processor, descriptors[:-1], None)
     routes["/multiturn/start"](
         {
             "index": 0,
             "session_id": "a",
             "raw_prompt": prompt,
             "prompt_ids": [1],
-            "image_count": 4,
+            "image_count": image_count,
             "image_digests": digests,
         }
     )
-    with pytest.raises(ValueError, match="4-image limit"):
+    from contextlib import nullcontext
+
+    context = (
+        pytest.raises(ValueError, match="32-image limit") if image_count == 32 else nullcontext()
+    )
+    with context:
         routes["/multiturn/step"](
             {
                 "session_id": "a",
@@ -5004,11 +5008,11 @@ def test_bridge_rejects_a_fifth_image_before_processor_glue_or_another_generatio
                 "accepted_prefix": [1],
                 "response_ids": [2],
                 "completion_text": "answer",
-                "image_count": 4,
+                "image_count": image_count,
                 "image_digests": digests,
             }
         )
-    assert processor.image_counts == []
+    assert processor.image_counts == ([] if image_count == 32 else [1])
     for image in source_images:
         image.close()
 

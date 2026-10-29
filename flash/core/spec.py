@@ -382,6 +382,11 @@ class TrainSpec:
     group_size: int | None = field(default=None, metadata={"introduced_in": "0.2.0"})
     temperature: float | None = field(default=None, metadata={"introduced_in": "0.2.0"})
     max_completion_tokens: int | None = field(default=None, metadata={"introduced_in": "0.2.49"})
+    # Single-turn GRPO: False keeps length-limited samples when the reward scores prefixes.
+    # None leaves the setting unauthored; length-truncated responses are masked by default.
+    mask_truncated_completions: bool | None = field(
+        default=None, metadata={"introduced_in": "1.3.33"}
+    )
     kl_penalty_coef: float | None = field(default=None, metadata={"introduced_in": "0.2.0"})
     thinking_length_penalty_coef: float | None = field(
         default=None, metadata={"introduced_in": "0.2.0"}
@@ -398,6 +403,10 @@ class TrainSpec:
     )
 
     def __post_init__(self) -> None:
+        if self.mask_truncated_completions is not None and not isinstance(
+            self.mask_truncated_completions, bool
+        ):
+            raise TypeError("train.mask_truncated_completions must be a boolean or null")
         if not self.lora_alpha:
             object.__setattr__(self, "lora_alpha", 2 * self.lora_rank)
         max_steps = parse_max_steps(self.max_steps)
@@ -680,6 +689,9 @@ class JobSpec:
         differently, so removing either pop would break existing digests.
         """
         data = asdict(self)
+        # Preserve public and worker preparation digests for all existing runs.
+        if data["train"]["mask_truncated_completions"] is None:
+            data["train"].pop("mask_truncated_completions")
         # missing and unset are the same internal state. omitting the empty value preserves that state
         # without serializing it into an explicit empty preference, which every parser rejects.
         if not data["gpu"].get("providers"):
@@ -795,6 +807,7 @@ class JobSpec:
                 group_size=opt_int(train.get("group_size")),
                 temperature=opt_float(train.get("temperature")),
                 max_completion_tokens=opt_int(train.get("max_completion_tokens")),
+                mask_truncated_completions=train.get("mask_truncated_completions"),
                 kl_penalty_coef=opt_float(train.get("kl_penalty_coef")),
                 thinking_length_penalty_coef=opt_float(train.get("thinking_length_penalty_coef")),
                 teacher_model=str(train.get("teacher_model") or ""),

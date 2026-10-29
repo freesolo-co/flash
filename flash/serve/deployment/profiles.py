@@ -22,6 +22,7 @@ from dataclasses import dataclass
 from types import MappingProxyType
 from typing import Any
 
+from flash.content.image_descriptors import MAX_IMAGES_PER_CONVERSATION
 from flash.core.catalog import ModelInfo, get_model
 from flash.serve.control import (
     EngineIdentity,
@@ -207,7 +208,7 @@ _PROFILES: dict[str, ServingProfile] = {
         max_lora_rank=128,
         gpu_memory_utilization=0.90,
         cpu_offload_gb=0.0,
-        image_limit=4,
+        image_limit=MAX_IMAGES_PER_CONVERSATION,
         mm_processor_cache_gb=0.0,
         enable_tower_connector_lora=True,
         reasoning_parser="qwen3",
@@ -235,7 +236,7 @@ _PROFILES: dict[str, ServingProfile] = {
         max_lora_rank=64,
         gpu_memory_utilization=0.90,
         cpu_offload_gb=0.0,
-        image_limit=4,
+        image_limit=MAX_IMAGES_PER_CONVERSATION,
         mm_processor_cache_gb=0.0,
         enable_tower_connector_lora=True,
         reasoning_parser="qwen3",
@@ -265,7 +266,7 @@ _PROFILES: dict[str, ServingProfile] = {
         max_lora_rank=64,
         gpu_memory_utilization=0.90,
         cpu_offload_gb=0.0,
-        image_limit=4,
+        image_limit=MAX_IMAGES_PER_CONVERSATION,
         mm_processor_cache_gb=0.0,
         enable_tower_connector_lora=True,
         reasoning_parser="qwen3",
