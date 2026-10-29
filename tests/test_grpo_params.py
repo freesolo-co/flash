@@ -648,10 +648,8 @@ def test_grpo_masks_truncated_completions_by_default() -> None:
     assert worker_grpo_config.grpo_mask_truncated_completions(None) is True
 
 
-def test_grpo_truncation_masking_off_when_stop_sequences_set() -> None:
-    """With stop_sequences, vLLM strips the stop string so a normally-terminated completion does
-    NOT end in EOS -- the "last token != EOS" truncation check would then flag (and mask) every
-    completion, so the run would learn nothing. Gate the flag OFF in that case."""
+def test_stop_sequences_do_not_disable_default_truncation_masking() -> None:
+    """The worker distinguishes length limits from stop-string termination by finish reason."""
 
     spec = JobSpec.from_dict(
         {
@@ -662,7 +660,7 @@ def test_grpo_truncation_masking_off_when_stop_sequences_set() -> None:
         }
     )
     assert spec.train.stop_sequences == ("</answer>",)
-    assert worker_grpo_config.grpo_mask_truncated_completions(spec.train) is False
+    assert worker_grpo_config.grpo_mask_truncated_completions(spec.train) is True
 
 
 def test_build_grpo_prompt_dataset_survives_dataset_from_list() -> None:
@@ -751,7 +749,7 @@ def test_grpo_prompt_budget_guard_matches_the_worker_resolver() -> None:
 
 @pytest.mark.parametrize("mask", [False, True])
 @pytest.mark.parametrize("stops", [(), ("</answer>",)])
-def test_explicit_grpo_truncation_policy_overrides_legacy_stop_default(mask, stops):
+def test_explicit_grpo_truncation_policy_is_independent_of_stop_sequences(mask, stops):
     from flash.core.spec import TrainSpec
 
     train = TrainSpec(mask_truncated_completions=mask, stop_sequences=stops)

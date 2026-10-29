@@ -115,9 +115,10 @@ prefix agreement, set `train.mask_truncated_completions = false`. This retains g
 tokens in the loss when sampling reaches `train.max_completion_tokens`, without inventing
 an EOS token. Choose the token limit and reward together; Flash does not prescribe a draft
 length. Generation errors and empty batches still fail. Set the flag to `true` for rewards
-requiring finished responses. When omitted, existing behavior is preserved: length-limited
-responses are masked unless `stop_sequences` is configured. This option is not supported
-for multi-turn environments, whose actions must be complete and usable.
+requiring finished responses. By default, length-limited responses are masked, including
+when `stop_sequences` is configured. Responses that actually finish on a stop string remain
+trainable. This option is not supported for multi-turn environments, whose actions must
+be complete and usable.
 
 ### Calling a deployed adapter from your own app
 

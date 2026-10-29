@@ -96,10 +96,8 @@ def _resolve_grpo_options(train_spec, rl, multi_turn, *, context: WorkerContext)
             f"[rl-verl] structured outputs: every rollout constrained to "
             f"{describe_structured_outputs(structured_outputs)}"
         )
-    # stop_sequences: on the retired trl backend these ride generation_kwargs["stop"] into vllm's
-    # SamplingParams. verl builds its sampling params without a stop field, so the deferred child
-    # plugin inserts the key. When truncation masking is not authored, stop_sequences
-    # preserves the legacy default of disabling it.
+    # The child agent forwards stop strings into vLLM sampling parameters.
+    # Truncation masking is a separate policy based on the reported finish reason.
     stop_sequences = (
         tuple(str(s) for s in (getattr(train_spec, "stop_sequences", ()) or ()))
         if train_spec
@@ -146,8 +144,8 @@ def _resolve_grpo_options(train_spec, rl, multi_turn, *, context: WorkerContext)
         if train_spec and train_spec.learning_rate is not None
         else rl.learning_rate
     )
-    # warm-start forbids lora_rank, so a set init_from_adapter already raised above; read rank/alpha
-    # from the job spec (falling back to the recipe) exactly like the retired trl path's lora config.
+    # Read rank/alpha from the resolved job spec, falling back to the recipe.
+    # Warm-start adapter topology is resolved after download.
     lora_rank = (
         int(train_spec.lora_rank) if train_spec and train_spec.lora_rank else int(RECIPE.lora.rank)
     )

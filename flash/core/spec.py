@@ -383,7 +383,7 @@ class TrainSpec:
     temperature: float | None = field(default=None, metadata={"introduced_in": "0.2.0"})
     max_completion_tokens: int | None = field(default=None, metadata={"introduced_in": "0.2.49"})
     # Single-turn GRPO: False keeps length-limited samples when the reward scores prefixes.
-    # None preserves the historical default (mask unless stop_sequences is configured).
+    # None leaves the setting unauthored; length-truncated responses are masked by default.
     mask_truncated_completions: bool | None = field(
         default=None, metadata={"introduced_in": "1.3.33"}
     )

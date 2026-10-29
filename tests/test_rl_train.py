@@ -3150,13 +3150,11 @@ def _stubbed_modules(stubs: dict[str, types.ModuleType]):
                 sys.modules[name] = value
 
 
-def test_stop_sequences_gate_off_truncated_completion_masking():
-    # main couples these: stop-string rollouts do not end on EOS, so masking truncated completions
-    # would wrongly drop every one of them. the verl resolver must inherit that coupling, not
-    # re-derive it.
+def test_stop_sequences_do_not_override_truncated_completion_masking():
+    # The resolver uses the explicit policy; stop-string termination is handled by finish reason.
     source = inspect.getsource(rl_inputs._resolve_grpo_inputs)
     assert "_worker_config.grpo_mask_truncated_completions(_t)" in source
-    assert not worker_config.grpo_mask_truncated_completions(
+    assert worker_config.grpo_mask_truncated_completions(
         SimpleNamespace(stop_sequences=("</answer>",))
     )
     assert worker_config.grpo_mask_truncated_completions(SimpleNamespace(stop_sequences=()))

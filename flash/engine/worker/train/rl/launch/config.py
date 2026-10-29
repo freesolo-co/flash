@@ -54,10 +54,8 @@ def grpo_mask_truncated_completions(train) -> bool:
     """Resolve the researcher's single-turn GRPO length-truncation policy.
 
     Prefix rewards can train on length-limited samples without requiring EOS. An explicit
-    setting takes precedence; omission retains the existing stop-sequence-dependent default.
-    Actual generation failures and unusable actions are handled separately.
+    setting takes precedence; otherwise length-limited responses are masked. Stop strings
+    do not change this policy: the worker masks finish_reason="length", not "stop".
     """
     requested = getattr(train, "mask_truncated_completions", None)
-    if requested is not None:
-        return requested
-    return not (train and train.stop_sequences)
+    return True if requested is None else requested
