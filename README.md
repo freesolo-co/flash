@@ -109,6 +109,26 @@ export HF_TOKEN=hf_...
 flash models export --adapter-id RUN_ID/final --repository your-org/your-repo
 ```
 
+To download adapter files directly, use the run owner's existing API key. No user
+Hugging Face token or destination repository is needed:
+
+```bash
+curl --fail --get "https://flash.freesolo.co/v1/runs/$RUN_ID/adapter" \
+  -H "Authorization: Bearer $FREESOLO_API_KEY" \
+  --data-urlencode "checkpoint_id=$RUN_ID/final" \
+  --output adapter.zip
+```
+
+The checkpoint is required: use `RUN_ID/final` for a finished run or an available
+`RUN_ID/step-N` checkpoint. The ZIP contains normalized PEFT configuration and safetensors
+weights, plus `manifest.json` (`flash-adapter-download-v1`) with run/checkpoint identity,
+base-model and artifact-source revisions, and each file's byte count and SHA-256.
+`X-Flash-Run-Id`, `X-Flash-Checkpoint-Id`, and `X-Flash-Adapter-Sha256` response headers
+identify the archive. Verify the requested checkpoint and archive/file hashes before
+loading. Artifact-storage credentials remain on the control plane, and downloads do not
+create Hugging Face repositories. Downloads use private, non-cacheable responses and
+are limited to 8 GiB of adapter files.
+
 There are no built-in task environments — the environment you push defines the task.
 Single-turn and bounded multi-turn environments are supported.
 
