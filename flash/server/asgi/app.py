@@ -110,7 +110,15 @@ def create_app():
     try:
         from fastapi import FastAPI
 
-        from flash.server.routes import envs, meta, runs, serving, serving_completion, teacher
+        from flash.server.routes import (
+            adapter_download,
+            envs,
+            meta,
+            runs,
+            serving,
+            serving_completion,
+            teacher,
+        )
     except ImportError as exc:
         raise RuntimeError(_SERVER_EXTRAS_HINT) from exc
     from contextlib import asynccontextmanager
@@ -220,6 +228,7 @@ def create_app():
     app.include_router(envs.router)
     app.include_router(runs.router)
     app.include_router(serving.router)
+    app.include_router(adapter_download.router)
     app.include_router(teacher.router)
     return app
 
