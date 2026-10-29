@@ -266,6 +266,11 @@ Within a commit, `[project].version` and `[tool.flash-dev].version` must match (
 this), so cutting a release bumps both. The **published** channels still differ, because dev
 publishes on merge to `dev` while prod publishes only once `dev` is promoted to `main`.
 
+Serving promotion requires stable release identity, a real streaming canary with durable billing
+settlement, and no stalled accounting rows from the candidate deployment and release. Historical
+quarantines remain in the global backlog for reconciliation; they do not roll back a later release
+whose own accounting is healthy. Unreadable accounting evidence still fails the promotion gate.
+
 Either CLI honours an explicit `FLASH_API_URL` or `login --api-url`; the channel only sets
 the default.
 
