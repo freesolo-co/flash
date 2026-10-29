@@ -177,6 +177,7 @@ def test_train_key_registry_is_derived_from_trainspec_metadata() -> None:
     # takes it; only the new rl name is gated on the release that introduced the split.
     assert TRAIN_KEY_MIN_VERSIONS["prompts_per_step"] == "1.1.43"
     assert TRAIN_KEY_MIN_VERSIONS["batch_size"] == "0.2.0"
+    assert TRAIN_KEY_MIN_VERSIONS["mask_truncated_completions"] == "1.3.33"
     # opd has no auxiliary eos loss or user-facing eos-loss key.
     assert "opd_eos_loss_coef" not in TRAIN_KEY_MIN_VERSIONS
     assert {
@@ -192,6 +193,7 @@ def test_train_key_registry_is_derived_from_trainspec_metadata() -> None:
             "credit_assignment",
             "lora_alpha",
             "prompts_per_step",
+            "mask_truncated_completions",
         }
     } == {"0.2.0"}
 
@@ -337,6 +339,7 @@ def test_historical_train_schema_shapes_are_immutable_source_snapshots() -> None
         "credit_assignment",
         "save_at_steps",
         "prompts_per_step",
+        "mask_truncated_completions",
     }
     assert "opd_eos_loss_coef" not in TRAIN_SCHEMA_KEYS
     assert "advantage_clip" not in TRAIN_SCHEMA_KEYS
@@ -787,6 +790,8 @@ def test_env_ref_validator_matches_adapter_acceptor() -> None:
 # the flat [train] table is shared by all three algorithms, so a knob a run's algorithm cannot
 # consume used to parse clean and do nothing. (algorithm, knob, value) pairs that must be rejected.
 _INAPPLICABLE_CASES = [
+    ("sft", "mask_truncated_completions", False),
+    ("opd", "mask_truncated_completions", True),
     ("sft", "group_size", 8),
     ("sft", "temperature", 0.7),
     ("sft", "max_completion_tokens", 512),
@@ -804,6 +809,8 @@ _INAPPLICABLE_CASES = [
 # the same knobs on an algorithm whose worker DOES read them. without this direction a validator
 # that rejected everything everywhere would pass the rejection tests above.
 _APPLICABLE_CASES = [
+    ("grpo", "mask_truncated_completions", False),
+    ("grpo", "mask_truncated_completions", True),
     ("grpo", "group_size", 8),
     ("opd", "group_size", 2),
     ("grpo", "temperature", 0.7),
@@ -2258,3 +2265,32 @@ def test_neither_optimizer_batch_key_is_required() -> None:
         spec = spec_from_dict(_raw(algorithm=algorithm))
         assert spec.train.batch_size is None
         assert spec.train.prompts_per_step is None
+
+
+@pytest.mark.parametrize("mask", [None, False, True])
+def test_grpo_truncation_policy_survives_public_and_worker_roundtrips(mask):
+    from flash.engine.worker.train.rl.launch.config import grpo_mask_truncated_completions
+
+    raw = _raw(**{"train.mask_truncated_completions": mask})
+    spec = spec_from_dict(raw)
+    assert spec.train.mask_truncated_completions is mask
+    public = spec.to_dict()
+    worker = spec.to_internal_dict()
+    if mask is None:
+        assert "mask_truncated_completions" not in public["train"]
+        assert "mask_truncated_completions" not in worker["train"]
+    else:
+        assert public["train"]["mask_truncated_completions"] is mask
+        assert worker["train"]["mask_truncated_completions"] is mask
+    for decoded in (spec_from_dict(public), JobSpec.from_json(spec.to_json())):
+        assert decoded.train.mask_truncated_completions is mask
+        assert grpo_mask_truncated_completions(decoded.train) is (True if mask is None else mask)
+
+
+@pytest.mark.parametrize("invalid", ["false", "true", 0, 1, [], {}])
+def test_grpo_truncation_policy_rejects_non_booleans_at_both_boundaries(invalid):
+    raw = _raw(**{"train.mask_truncated_completions": invalid})
+    with pytest.raises(ConfigError, match="mask_truncated_completions must be a boolean"):
+        spec_from_dict(raw)
+    with pytest.raises(TypeError, match="mask_truncated_completions must be a boolean"):
+        JobSpec.from_dict(raw)

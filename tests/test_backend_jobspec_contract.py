@@ -53,7 +53,8 @@ def _representative_config() -> dict:
             "learning_rate": 1e-5,
             "group_size": 8,
             "temperature": 0.9,
-            "max_completion_tokens": 512,
+            "max_completion_tokens": 16,
+            "mask_truncated_completions": False,
         },
         "gpu": {},
     }
@@ -107,11 +108,19 @@ def test_backend_config_through_runcreaterequest_then_jobspec() -> None:
     except Exception as exc:  # pragma: no cover - environment-dependent
         pytest.skip(f"backend schema not importable: {exc}")
 
-    req = RunCreateRequest(name="my run", config=_representative_config())
+    config = _representative_config()
+    req = RunCreateRequest(
+        name="my run",
+        projectId=config["project"],
+        trainingTaskId="22222222-2222-4222-8222-222222222222",
+        config=config,
+    )
     assert req.config is not None
     spec = spec_from_dict(req.config, run_id="flash-test-3")
     assert spec.environment.id == "github:owner/repo@main:my-env/environment.py"
     assert spec.algorithm == "grpo"
+    assert spec.train.max_completion_tokens == 16
+    assert spec.train.mask_truncated_completions is False
 
 
 def test_sft_backend_config_maps_to_jobspec() -> None:
