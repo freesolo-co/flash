@@ -24,7 +24,8 @@ def require_key(authorization: str | None = Header(default=None)) -> dict:
         raise HTTPException(
             status_code=503,
             detail="Authentication service unavailable; retry shortly",
-            headers={"Retry-After": "1"},
+            # Authentication failed before any handler could create a paid run.
+            headers={"Retry-After": "1", "X-Flash-Submission-Outcome": "not-created"},
         ) from None
     if key is None:
         raise HTTPException(

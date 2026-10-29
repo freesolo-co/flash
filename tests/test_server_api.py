@@ -1892,6 +1892,7 @@ def test_freesolo_user_key_unverified_when_backend_unreachable(api, monkeypatch)
     response = api.get("/v1/me", headers=_bearer("unknown-token"))
     assert response.status_code == 503
     assert response.headers["Retry-After"] == "1"
+    assert response.headers["X-Flash-Submission-Outcome"] == "not-created"
     assert "unknown-token" not in response.text
     assert auth_mod._verify_cache == {}
 
