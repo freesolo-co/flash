@@ -51,10 +51,13 @@ def grpo_overrides(*, context: WorkerContext) -> dict:
 
 
 def grpo_mask_truncated_completions(train) -> bool:
-    """Whether GRPO should drop truncated (non-EOS) completions from the loss.
+    """Resolve the researcher's single-turn GRPO length-truncation policy.
 
-    Default True: a truncated completion was cut off mid-thought, so training on it teaches the
-    policy to stop early. GATED OFF when stop_sequences is set:
-    stop-string rollouts don't end on EOS, so masking would wrongly drop every completion.
+    Prefix rewards can train on length-limited samples without requiring EOS. An explicit
+    setting takes precedence; omission retains the existing stop-sequence-dependent default.
+    Actual generation failures and unusable actions are handled separately.
     """
+    requested = getattr(train, "mask_truncated_completions", None)
+    if requested is not None:
+        return requested
     return not (train and train.stop_sequences)

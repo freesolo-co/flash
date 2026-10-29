@@ -110,6 +110,15 @@ flash models export --adapter-id RUN_ID/final --repository your-org/your-repo
 There are no built-in task environments — the environment you push defines the task.
 Single-turn and bounded multi-turn environments are supported.
 
+For single-turn GRPO rewards that intentionally score partial responses, such as draft-token
+prefix agreement, set `train.mask_truncated_completions = false`. This retains generated
+tokens in the loss when sampling reaches `train.max_completion_tokens`, without inventing
+an EOS token. Choose the token limit and reward together; Flash does not prescribe a draft
+length. Generation errors and empty batches still fail. Set the flag to `true` for rewards
+requiring finished responses. When omitted, existing behavior is preserved: length-limited
+responses are masked unless `stop_sequences` is configured. This option is not supported
+for multi-turn environments, whose actions must be complete and usable.
+
 ### Calling a deployed adapter from your own app
 
 Deploy once with `flash models deploy RUN_ID/final`, then POST chat requests with your API key:

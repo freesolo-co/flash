@@ -77,6 +77,11 @@ def _validate_grpo_environment(env):
 
 
 def _resolve_grpo_options(train_spec, rl, multi_turn, *, context: WorkerContext):
+    if multi_turn and getattr(train_spec, "mask_truncated_completions", None) is not None:
+        raise ValueError(
+            "train.mask_truncated_completions is supported only for single-turn GRPO; "
+            "multi-turn environments require complete, usable actions"
+        )
     # fail loudly on unsupported verl features. structured-output constraints travel in per-sample
     # params via render_structured_outputs_shim; the reasoning parser is a hydra override. malformed
     # payloads raise instead of training unconstrained.
@@ -93,8 +98,8 @@ def _resolve_grpo_options(train_spec, rl, multi_turn, *, context: WorkerContext)
         )
     # stop_sequences: on the retired trl backend these ride generation_kwargs["stop"] into vllm's
     # SamplingParams. verl builds its sampling params without a stop field, so the deferred child
-    # plugin inserts the key. note grpo_mask_truncated_completions below gates itself OFF when
-    # stop_sequences is set, on either backend.
+    # plugin inserts the key. When truncation masking is not authored, stop_sequences
+    # preserves the legacy default of disabling it.
     stop_sequences = (
         tuple(str(s) for s in (getattr(train_spec, "stop_sequences", ()) or ()))
         if train_spec

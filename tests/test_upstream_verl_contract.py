@@ -252,8 +252,11 @@ def test_task_runner_closes_resources_without_masking_startup_failure(
         assert events[-2] == "drained"
 
 
+@pytest.mark.parametrize("mask_truncated", [False, True])
 @pytest.mark.parametrize("finish_reason", ["length", "stop"])
-def test_grpo_agent_carries_identity_and_masks_only_truncation(monkeypatch, finish_reason):
+def test_grpo_agent_carries_identity_and_masks_only_truncation(
+    monkeypatch, finish_reason, mask_truncated
+):
     import asyncio
 
     from verl.experimental.agent_loop.agent_loop import AgentLoopOutput
@@ -284,7 +287,12 @@ def test_grpo_agent_carries_identity_and_masks_only_truncation(monkeypatch, fini
 
     agent = Agent.__new__(Agent)
     agent.config = _config("grpo")
-    agent.config.actor_rollout_ref.model.runtime_options.mask_truncated_completions = True
+    from flash.core.spec import TrainSpec
+    from flash.engine.worker.train.rl.launch.config import grpo_mask_truncated_completions
+
+    agent.config.actor_rollout_ref.model.runtime_options.mask_truncated_completions = (
+        grpo_mask_truncated_completions(TrainSpec(mask_truncated_completions=mask_truncated))
+    )
 
     class IdentityOnlyClient(ObservedRolloutClient):
         def episode_contract(self, agent, identity):
@@ -302,7 +310,9 @@ def test_grpo_agent_carries_identity_and_masks_only_truncation(monkeypatch, fini
     monkeypatch.setattr(recipe, "compute_score", score)
     actual = asyncio.run(agent.run({}, global_steps=1, index=3, session_id=2))
     assert events == ["generated", "scored"]
-    assert actual.response_mask == ([0, 0] if finish_reason == "length" else [1, 1])
+    assert actual.response_mask == (
+        [0, 0] if mask_truncated and finish_reason == "length" else [1, 1]
+    )
     assert actual.reward_score == 1.0
     assert actual.extra_fields["min_global_steps"] == actual.extra_fields["max_global_steps"] == 1
 

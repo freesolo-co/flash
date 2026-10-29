@@ -21,7 +21,8 @@ def require_trainable_responses(batch):
     if not bool(values.any()):
         raise RuntimeError(
             "no trainable response tokens remain: every rollout was truncated or unusable; "
-            "increase train.max_completion_tokens or disable thinking"
+            "increase train.max_completion_tokens or disable thinking. For single-turn rewards "
+            "that intentionally score partial responses, set train.mask_truncated_completions=false"
         )
 
 

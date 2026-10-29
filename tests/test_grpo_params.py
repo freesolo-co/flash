@@ -747,3 +747,21 @@ def test_grpo_prompt_budget_guard_matches_the_worker_resolver() -> None:
     # both enforcement sites must read the shared helper, not re-derive the recipe inline.
     assert "grpo_completion_len" in inspect.getsource(inputs._resolve_sequence_lengths)
     assert "grpo_completion_len" in inspect.getsource(schema._validate_on_policy_prompt_budget)
+
+
+@pytest.mark.parametrize("mask", [False, True])
+@pytest.mark.parametrize("stops", [(), ("</answer>",)])
+def test_explicit_grpo_truncation_policy_overrides_legacy_stop_default(mask, stops):
+    from flash.core.spec import TrainSpec
+
+    train = TrainSpec(mask_truncated_completions=mask, stop_sequences=stops)
+    assert worker_grpo_config.grpo_mask_truncated_completions(train) is mask
+
+
+@pytest.mark.parametrize("mask", [False, True])
+def test_explicit_grpo_truncation_policy_rejects_multiturn(mask):
+    from flash.core.spec import TrainSpec
+    from flash.engine.worker.train.rl.launch.inputs import _resolve_grpo_options
+
+    with pytest.raises(ValueError, match="supported only for single-turn GRPO"):
+        _resolve_grpo_options(TrainSpec(mask_truncated_completions=mask), None, True, context=None)
