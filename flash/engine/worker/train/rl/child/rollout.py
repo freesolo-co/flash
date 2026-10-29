@@ -83,6 +83,7 @@ class FlashGrpoPolicy:
         with self.observations.episode_contract(self, identity):
             output = await super().run(params, **kwargs)
             if output.reward_score is None:
+                extra["flash_rollout_context"] = self.observations.reward_context()
                 output.reward_score = await asyncio.to_thread(
                     compute_score,
                     kwargs.get("data_source"),

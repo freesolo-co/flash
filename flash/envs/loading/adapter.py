@@ -33,6 +33,7 @@ from flash.envs.loading.loader import (
     load_freesolo_environment,
     managed_slug_to_github_ref,
 )
+from flash.envs.scoring.response import ScoredResponseText as _ScoredResponseText
 from flash.teacher.limits import (
     OPD_DEFAULT_EPISODE_TURNS,
     OPD_MAX_EPISODE_TURNS,
@@ -71,36 +72,21 @@ def _copied_message_list(value: Any, *, row_id: Any, source: str) -> list[dict]:
     return [dict(message) for message in value]
 
 
-class _ScoredResponseText(str):
-    """String-compatible response passed to SDK scorers.
-
-    The string value is the answer-only completion so existing graders keep their old behavior.
-    Thinking-aware scorers can opt into the structured views.
-    """
-
-    completion: str
-    thinking: str | None
-    raw: str
-
-    def __new__(cls, completion: str, *, raw: str, thinking: str | None):
-        obj = str.__new__(cls, completion)
-        obj.completion = completion
-        obj.thinking = thinking
-        obj.raw = raw
-        return obj
-
-
 def _completion_for_scoring(completion: str, state: dict | None) -> str:
     if state:
         raw = state.get("raw")
+        rollout_context = state.get("rollout_context")
         if not isinstance(raw, str):
-            return completion
+            if rollout_context is None:
+                return completion
+            raw = completion
         answer = state.get("completion")
         thinking = state.get("thinking")
         return _ScoredResponseText(
             answer if isinstance(answer, str) else completion,
             raw=raw,
             thinking=thinking if isinstance(thinking, str) else None,
+            rollout_context=rollout_context,
         )
     return completion
 
@@ -703,13 +689,14 @@ class FreesoloEnvironment(BaseEnvironment):
         # not str(): response_text may be a _ScoredResponseText carrying .raw/.thinking, and str()
         # on a str subclass drops back to a plain str, losing the structured views.
         response_text = state.get("response_text")
+        metadata = {"steps": state["step_metadata"]} if state.get("step_metadata") else {}
+        if state.get("rollout_context") is not None:
+            metadata["rollout_context"] = state["rollout_context"]
         return self._EnvironmentEpisode(
             messages=tuple(state.get("messages") or ()),
             response_text="" if response_text is None else response_text,
             turns=tuple(state.get("turns") or ()),
-            metadata={"steps": state.get("step_metadata", [])}
-            if state.get("step_metadata")
-            else {},
+            metadata=metadata,
         )
 
     def _score_episode(self, example: dict, state: dict):

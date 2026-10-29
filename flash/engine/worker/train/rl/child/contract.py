@@ -2,6 +2,7 @@
 
 from contextlib import contextmanager
 from contextvars import ContextVar
+from copy import deepcopy
 from types import SimpleNamespace
 from uuid import uuid4
 
@@ -17,6 +18,7 @@ from flash.engine.worker.train.core.rollout.contract import (
 )
 from flash.engine.worker.train.core.rollout.episode import EPISODE_FIELD, validate_episode
 from flash.engine.worker.train.core.rollout.identity import model_identity, policy_identity
+from flash.envs.scoring.context import RolloutContext, RolloutTurn
 
 
 class ContractRolloutClient(ObservedRolloutClient):
@@ -80,6 +82,30 @@ class ContractRolloutClient(ObservedRolloutClient):
             (list(prompt_ids), list(output.token_ids), list(output.log_probs), result)
         )
         return output
+
+    def reward_context(self) -> dict:
+        """Snapshot validated engine observations before any text cleanup or loss masking."""
+        scope = self._scope.get()
+        if scope is None:
+            raise RuntimeError("reward context requires a contract scope")
+        identity = scope["identity"]
+        return RolloutContext(
+            policy=scope["policy"],
+            optimizer_step=identity["optimizer_step"],
+            sample_index=identity["sample_index"],
+            rollout_ordinal=identity["rollout_ordinal"],
+            logprob_definition=scope["definition"],
+            turns=tuple(
+                RolloutTurn(
+                    tuple(prompt),
+                    tuple(tokens),
+                    tuple(logs),
+                    deepcopy(result["sampling"]),
+                    result["termination"],
+                )
+                for prompt, tokens, logs, result in scope["turns"]
+            ),
+        ).encode()
 
     def annotate(self, output):
         scope = self._scope.get()

@@ -26,10 +26,13 @@ def compute_score(data_source, solution_str, ground_truth, extra_info=None):
     identity = (extra_info or {}).get("flash_rollout_identity")
     if not isinstance(identity, dict):
         raise RuntimeError("flash reward bridge received no rollout identity")
+    request = {"index": idx, "solution_str": solution_str or "", "identity": dict(identity)}
+    if (extra_info or {}).get("flash_rollout_context") is not None:
+        request["rollout_context"] = extra_info["flash_rollout_context"]
     payload = post_json(
         _URL,
         "/score",
-        {"index": idx, "solution_str": solution_str or "", "identity": dict(identity)},
+        request,
         error_style="reward",
     )
     try:
