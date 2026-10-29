@@ -970,7 +970,7 @@ def test_profile_refuses_an_oversized_packaged_contract(tmp_path) -> None:
 
 
 def test_profile_refuses_oversized_inline_records(tmp_path) -> None:
-    # inline records bypass the packaged-file size guard: they arrive in the request body.
+    # Inline records bypass package size limits: they arrive in the request body.
     entrypoint = _package(tmp_path, {})
     row = {"input": "x" * 4096, "output": "y"}
     records = [dict(row) for _ in range(32 * 1024 * 1024 // 4096 + 8)]
@@ -1393,16 +1393,40 @@ def test_jsonl_profile_never_slurps_the_dataset_into_one_control_plane_string(
     assert profile.source_examples == 2
 
 
-def test_profile_refuses_a_dataset_file_above_the_control_plane_memory_bound(
-    tmp_path, monkeypatch
+@pytest.mark.parametrize("dataset_format", ["jsonl", "json", "wrapped-json"])
+@pytest.mark.parametrize("max_examples", [0, 1])
+def test_profile_accepts_packaged_training_files_over_32_mib(
+    tmp_path, dataset_format, max_examples
 ) -> None:
-    from flash.engine.profiling import dataset_profile
+    entrypoint = _package(tmp_path, {})
+    suffix = "jsonl" if dataset_format == "jsonl" else "json"
+    path = tmp_path / "dataset" / f"train.{suffix}"
+    path.parent.mkdir()
+    # Real record content, not whitespace padding or a mocked stat: metadata can make a valid
+    # training file large without affecting the prompt tokens or requiring a GPU for this test.
+    row = {"input": "prompt", "output": "answer", "metadata": {"source": "x" * (17 * 1024**2)}}
+    encoded = json.dumps(row)
+    with path.open("w", encoding="utf-8") as handle:
+        if dataset_format == "jsonl":
+            handle.write(encoded + "\n" + encoded + "\n")
+        else:
+            if dataset_format == "wrapped-json":
+                handle.write('{"data":')
+            handle.write("[" + encoded + "," + encoded + "]")
+            if dataset_format == "wrapped-json":
+                handle.write("}")
+    assert path.stat().st_size > 32 * 1024**2
+    spec = _spec(environment_id=str(entrypoint))
+    spec = replace(spec, train=replace(spec.train, max_examples=max_examples))
 
-    entrypoint = _package(
-        tmp_path,
-        {"dataset/train.jsonl": '{"input":"prompt","output":"answer"}\n'},
+    profile = profile_packaged_sft_dataset(
+        spec,
+        producer_version="1.2.3",
+        tokenizer_loader=lambda _model, _revision: FakeTokenizer(),
+        packing_support=lambda _model, _revision: ("pure-attention", True),
     )
-    monkeypatch.setattr(dataset_profile, "_MAX_PROFILE_DATASET_BYTES", 1)
 
-    with pytest.raises(PackagedDatasetUnavailable, match="profiling limit"):
-        _profile(entrypoint)
+    assert profile.source_examples == 2
+    assert profile.selected_examples == (max_examples or 2)
+    assert profile.retained_examples == (max_examples or 2)
+    assert profile.real_tokens_per_epoch > 0
