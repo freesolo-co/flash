@@ -36,7 +36,7 @@ if TYPE_CHECKING:
     import httpx
 
 from flash.serving.app.timeouts import CANARY_TIMEOUT_SECONDS, ROUTER_TIMEOUT_SECONDS
-from flash.serving.promotion.accounting import read_accounting
+from flash.serving.promotion.accounting_smoke_test import read_accounting
 from flash.serving.promotion.canary import (
     CANARY_TRANSPORT_FAILURE,
     CanaryError,

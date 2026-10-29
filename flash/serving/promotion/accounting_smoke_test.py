@@ -1,4 +1,4 @@
-"""Read promotion accounting without making historical quarantines a release veto."""
+"""Read-only accounting smoke-test evidence for a candidate serving deployment."""
 
 from __future__ import annotations
 
@@ -54,7 +54,7 @@ async def read_accounting(
     headers: dict[str, str],
     canary_scope: dict[str, str],
 ) -> dict[str, Any]:
-    """Require durable canary settlement and inspect stalls across this whole deployment.
+    """Read billing settlement and backlog evidence for the deployment smoke test.
 
     The existing RPC verifies the exact canary's billing evidence, but its stall counters cover
     all releases. A historical delivery quarantine needs reconciliation, not an endless rollback

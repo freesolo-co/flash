@@ -6,7 +6,7 @@ import json
 import httpx
 import pytest
 
-from flash.serving.promotion.accounting import read_accounting
+from flash.serving.promotion.accounting_smoke_test import read_accounting
 from flash.serving.promotion.evidence import parse_accounting, verify_accounting
 
 RPC = "https://database.invalid/rest/v1/rpc/serving_promotion_accounting_snapshot"
