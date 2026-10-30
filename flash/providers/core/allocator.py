@@ -18,6 +18,7 @@ from flash.providers.core.base import (
     _run_cost_key,
     authored_gpu_ceiling,
     canonical_gpu,
+    custom_gpu_shape,
     largest_rentable_count,
     providers_for,
     rentable_gpu_counts,
@@ -62,6 +63,11 @@ def required_vram_gb(
     model_revision: str = "",
 ) -> int:
     """VRAM required for the full run, sized to actual knobs via model_required_vram_gb."""
+    if algorithm == "custom":
+        from flash.core.catalog import CUSTOM_TRAINING_GPUS
+
+        custom_gpu_shape(model_id, "", (), None)
+        return min(GPU_INFO[gpu].vram_gb for gpu in CUSTOM_TRAINING_GPUS[model_id])
     from flash.engine.plan.vram import model_required_vram_gb
 
     return model_required_vram_gb(
@@ -114,6 +120,8 @@ def _step_cost_ranker(model_id, algorithm, train, thinking, model_revision="", o
     single-card paths (parse-time provisional, cost estimate) have no notion of: a combination
     bills every card but only the gpu-bound half of a step is divided among them.
     """
+    if algorithm == "custom":
+        return None  # arbitrary local work has no recipe-derived step-time prediction.
     cost_key = _run_cost_key(
         model_id,
         algorithm,
@@ -804,6 +812,14 @@ def allocate(
     # the authored request. an exact-unpacked run executes batch 1 at the measured length, so sizing
     # off the authored batch over-reserves (4 GB on a 4B at batch 8 / 4096) and can reject a card the
     # run would have fit on. `_fits` reads it too, so the requirement and the fit cannot disagree.
+    if algorithm == "custom":
+        if provider and providers:
+            raise UnsupportedGpuError("provider and providers cannot both be set")
+        validated_provider_preferences(providers, allow_empty=isinstance(providers, tuple))
+        provider, gpu_type, gpu_type_fallbacks, max_gpu_count = custom_gpu_shape(
+            model_id, provider, (gpu_type, *gpu_type_fallbacks) if gpu_type else (), max_gpu_count
+        )
+        providers = ()  # only Modal has a validated custom worker transport today.
     sized_train = _overridden_train(train, overrides)
     # bound before the pinned-class checks below, which need it too: every question about a card
     # count in this function is asked through this one rule. see `_executed_width`.

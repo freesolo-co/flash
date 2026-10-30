@@ -48,4 +48,6 @@ async def main(client):
                 }
             ),
         )
-    await client.download_checkpoint(f"step-{client.step}", f"step-{client.step}.zip")
+    elif client.step == 3:
+        assert [row["logprobs"] for row in scored["outputs"]] != expected["logprobs"]
+        print("UPDATE_CHANGED_LOGPROBS", flush=True)

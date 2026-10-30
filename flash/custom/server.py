@@ -7,7 +7,7 @@ import time
 
 from flash._internal.diagnostics import sanitize_diagnostic
 from flash.custom.session import SessionConflict
-from flash.custom.types import MAX_BODY_BYTES, checkpoint_name
+from flash.custom.types import MAX_BODY_BYTES
 
 
 def create_app(session, token):
@@ -89,16 +89,6 @@ def create_app(session, token):
                     "session_id": session.id,
                 },
             ) from error
-
-    @app.get("/v1/custom/checkpoints/{name}")
-    def download(name: str):
-        from flash.custom.exports import checkpoint_response
-
-        try:
-            checkpoint_name(name)
-        except ValueError as error:
-            raise HTTPException(400, str(error)) from error
-        return checkpoint_response(session, name)
 
     return app
 

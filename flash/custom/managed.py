@@ -1,4 +1,4 @@
-"""Preparation, allocation and resume authorization for managed custom runs."""
+"""Session credentials and backend-specific resume validation for managed custom runs."""
 
 from __future__ import annotations
 
@@ -18,71 +18,15 @@ def session_token(run_id, attempt):
     return hmac.new(secret.encode(), message, hashlib.sha256).hexdigest()
 
 
-def allocation(spec):
-    from flash.providers.core.base import Allocation, Candidate, get_gpu_info
-    from flash.providers.modal.pricing import hourly_rate
-
-    gpu = get_gpu_info(spec.gpu.type)
-    rate = hourly_rate(gpu.name)
-    candidate = Candidate("modal", gpu.name, rate, gpu.vram_gb)
-    return Allocation("modal", gpu.name, rate, gpu.vram_gb, (candidate,))
-
-
-def estimate(spec):
-    from flash.cost.types import CostEstimate
-
-    rented = allocation(spec)
-    seconds = spec.custom["max_wall_seconds"]
-    return CostEstimate(
-        model_id=spec.model,
-        method="custom",
-        steps=spec.train.max_steps,
-        gpu=rented.gpu,
-        provider=rented.provider,
-        gpu_vram_gb=rented.min_vram_gb,
-        required_vram_gb=rented.min_vram_gb,
-        gpu_hourly_usd=rented.hourly_usd,
-        setup_seconds=0,
-        seconds_per_step=seconds / spec.train.max_steps,
-        train_seconds=seconds,
-        wall_clock_seconds=seconds,
-        wall_capped=True,
-        total_usd=seconds * rented.hourly_usd / 3600,
-        notes=(
-            "Upper bound for a dedicated custom session, including time waiting for the local script.",
-        ),
-    )
-
-
-def prepare(spec, *, billing_context, platform_context, owner_key_id):
-    from flash.providers.core.registry import available_providers
-    from flash.runner.accounting.artifacts import _assign_managed_hf_repo
-    from flash.runner.lifecycle import preparation, state
-    from flash.runner.lifecycle.submit import PreparedJob
-
-    if "modal" not in available_providers():
-        raise ValueError("Modal is not configured on this Flash server")
-    if not os.environ.get("HF_TOKEN"):
-        raise ValueError("managed custom training requires durable artifact storage")
-    if spec.custom.get("resume_from"):
-        spec = resolve_resume(
-            spec,
-            owner_key_id=owner_key_id,
-            owner_org_id=preparation._context_org_id(billing_context)
-            or preparation._context_org_id(platform_context),
-        )
-    spec = preparation._resolve_model_revision(spec, required=True)
-    spec = replace(spec, run_id=spec.run_id if spec.run_id != "local" else state.new_run_id())
-    spec = _assign_managed_hf_repo(spec)
-    from flash.cost.currency import usd_amount
-
-    return PreparedJob(spec, spec, usd_amount(estimate(spec).total_usd))
-
-
 def resolve_resume(spec, *, owner_org_id, owner_key_id):
     from huggingface_hub import HfApi, hf_hub_download
 
+    from flash.engine.support.checkpoint_transport import MANIFEST, parse_manifest
     from flash.runner.lifecycle import preparation, status
+    from flash.runner.results.checkpoints import (
+        _adapter_folder_has_required_files,
+        checkpoint_adapter_prefix,
+    )
     from flash.schema import parse_checkpoint_ref
 
     source_id, step = parse_checkpoint_ref(spec.custom["resume_from"])
@@ -105,12 +49,27 @@ def resolve_resume(spec, *, owner_org_id, owner_key_id):
     repo = source.train.hf_repo
     api = HfApi(token=os.environ.get("HF_TOKEN"))
     revision = api.repo_info(repo, repo_type="dataset").sha
-    path = f"custom/{source_id}/checkpoints/step-{step}"
-    required = {
-        f"{path}/{name}"
-        for name in ("metadata.json", "state.pt", "algorithm.json", "adapter/adapter_config.json")
-    }
-    if not required <= set(api.list_repo_files(repo, repo_type="dataset", revision=revision)):
+    path = checkpoint_adapter_prefix(source, step)
+    required = {f"{path}/{name}" for name in ("metadata.json", "algorithm.json")}
+    files = api.list_repo_files(repo, repo_type="dataset", revision=revision)
+    native_state = f"{path}/state.pt" in files
+    if not native_state and f"{path}/{MANIFEST}" in files:
+        manifest = hf_hub_download(
+            repo,
+            f"{path}/{MANIFEST}",
+            repo_type="dataset",
+            revision=revision,
+            token=os.environ.get("HF_TOKEN"),
+        )
+        entry = parse_manifest(Path(manifest).read_bytes()).get("state.pt")
+        native_state = entry is not None and all(
+            f"{path}/{part['path']}" in files for part in entry["parts"]
+        )
+    if (
+        not required <= set(files)
+        or not native_state
+        or not _adapter_folder_has_required_files(files, path)
+    ):
         raise ValueError("custom checkpoint is incomplete")
     metadata_file = hf_hub_download(
         repo,

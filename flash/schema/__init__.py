@@ -7,6 +7,7 @@ import sys
 import tomllib
 from collections.abc import Collection, Mapping
 from dataclasses import fields as dataclass_fields
+from dataclasses import replace
 from typing import Any
 
 from flash._internal.channel import CLI_NAME
@@ -406,6 +407,12 @@ def _validate_train_section(raw: dict[str, Any], algorithm: str) -> dict[str, An
     if not isinstance(train_raw, dict):
         raise ConfigError("[train] must be a table")
     validate_train_keys(train_raw)
+    if algorithm == "custom":
+        from flash.schema.custom import TRAIN_DEFAULTS, TRAIN_KEYS
+
+        if set(train_raw) - TRAIN_KEYS:
+            raise ConfigError(f"[train] custom mode accepts only: {', '.join(sorted(TRAIN_KEYS))}")
+        return {**TRAIN_DEFAULTS, **train_raw}
     validate_train_keys_for_algorithm(train_raw, algorithm)
     return train_raw
 
@@ -506,6 +513,15 @@ def _validate_gpu_section(
         )
     except (TypeError, ValueError) as exc:
         raise ConfigError(str(exc)) from exc
+
+    if algorithm == "custom":
+        from flash.providers.core.base import custom_gpu_shape
+
+        try:
+            custom_gpu_shape(model, gpu_spec.provider, gpu_spec.acceptable_types, gpu_count)
+        except ValueError as exc:
+            raise ConfigError(str(exc)) from exc
+        return gpu_spec, authored_gpu_ceiling(gpu_spec.type, gpu_count) is None
 
     gpu_types = gpu_spec.acceptable_types
     for candidate in gpu_types:
@@ -642,12 +658,9 @@ def spec_from_dict(
     raw: dict[str, Any], run_id: str | None = None, *, project_required: bool = False
 ) -> JobSpec:
     model, model_revision, project, algorithm, thinking = _validate_top_level(raw, project_required)
-    if algorithm == "custom":
-        from flash.custom.config import parse_spec
+    from flash.schema.custom import parse_custom_section
 
-        return parse_spec(raw, run_id=run_id, project=project)
-    if raw.get("custom"):
-        raise ConfigError("[custom] only applies to algorithm = custom")
+    custom = parse_custom_section(raw.get("custom"), algorithm)
     env_raw, environment_pip, environment_secrets = _validate_environment_section(raw, algorithm)
     train_raw = _validate_train_section(raw, algorithm)
     if algorithm == "grpo":
@@ -668,6 +681,8 @@ def spec_from_dict(
         init_from_adapter=init_from_adapter,
         thinking=thinking,
     )
+    if custom:
+        gpu_spec = replace(gpu_spec, max_retries=0, max_wall_seconds=custom["max_wall_seconds"])
     init_from_adapter, lora_rank, lora_alpha = _validate_algorithm_model_consistency(
         model,
         algorithm,
@@ -726,6 +741,7 @@ def spec_from_dict(
         thinking=thinking,
         wandb=wandb_spec,
         project=project,
+        custom=custom,
     )
     _validate_spec(spec)
     if spec.train.structured_outputs and thinking:
@@ -858,6 +874,11 @@ def _validate_spec(spec: JobSpec) -> None:
     validator = _ALGO_VALIDATORS.get(spec.algorithm)
     if validator is not None:
         validator(spec)
+    if spec.algorithm == "custom":
+        from flash.schema.custom import validate_custom_spec
+
+        validate_custom_spec(spec)
+        return
     if not spec.environment.id:
         raise ConfigError(
             "config must set [environment] id (upload an environment with "

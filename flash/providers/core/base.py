@@ -297,6 +297,23 @@ def _run_cost_key(
         return None
 
 
+def custom_gpu_shape(model_id, provider, gpu_types, count):
+    """Constrain the shared allocator to shapes validated for the custom Torch backend."""
+    from flash.core.catalog import CUSTOM_TRAINING_GPUS
+
+    supported = CUSTOM_TRAINING_GPUS.get(model_id)
+    if not supported:
+        raise ValueError(f"{model_id} has no GPU-validated custom training profile")
+    if provider not in {"", "modal"} or (
+        count is not None and (type(count) is not int or count != 1)
+    ):
+        raise ValueError("custom training currently requires one managed Modal GPU")
+    allowed = tuple(gpu_types) or supported
+    if any(gpu not in supported for gpu in allowed):
+        raise ValueError(f"custom training for {model_id} supports: {', '.join(supported)}")
+    return "modal", allowed[0], allowed[1:], 1
+
+
 def authored_gpu_ceiling(gpu_type: str, gpu_count: int | None) -> int | None:
     """Return the author's card ceiling, or ``None`` when the run may be auto-sized.
 

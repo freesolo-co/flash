@@ -14,7 +14,6 @@ import re
 import shutil
 import subprocess
 import sys
-import zipfile
 from pathlib import Path
 
 from flash.client import client_from_config
@@ -47,7 +46,7 @@ def main():
                 'algorithm = "custom"\n[custom]\nfile = "algorithm.py"\n'
                 f"max_wall_seconds = 1800\nidle_seconds = 300\n{resume}\n"
                 f"[train]\nmax_steps = {steps}\nmax_context_tokens = 256\nsave_every = 2\n"
-                'lora_rank = 16\n[gpu]\ntype = "H100"\n'
+                "lora_rank = 16\n"
             )
             with (output / f"run-{steps}.log").open("w") as log:
                 process = subprocess.Popen(
@@ -72,19 +71,13 @@ def main():
                     if process.poll() is None:
                         process.terminate()
                         process.wait(timeout=15)
-        metadata = []
-        for step in (2, 3):
-            with zipfile.ZipFile(output / f"step-{step}.zip") as archive:
-                assert {"state.pt", "algorithm.json", "metadata.json"} <= set(archive.namelist())
-                metadata.append(json.loads(archive.read("metadata.json")))
-        assert metadata[0]["parameter_sha256"] != metadata[1]["parameter_sha256"]
         assert "RESTORE_EXACT" in (output / "run-3.log").read_text()
+        assert "UPDATE_CHANGED_LOGPROBS" in (output / "run-3.log").read_text()
         evidence = {
             "runs": runs,
-            "checkpoints": metadata,
             "restored_logprobs_exact": True,
             "restored_algorithm_state_exact": True,
-            "continued_update_changed_weights": True,
+            "continued_update_changed_logprobs": True,
             "registered_checkpoints": [api.checkpoints(run) for run in runs],
         }
         (output / "evidence.json").write_text(json.dumps(evidence, indent=2))

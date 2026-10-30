@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import tempfile
 from pathlib import Path
 
 
@@ -21,12 +22,17 @@ class RunCheckpoints:
         step = metadata["step"]
         # adapter and full optimizer state commit together. a listed adapter therefore always
         # has its matching resume state, unlike separate best-effort uploads.
-        hf._write_deployable_provenance(str(directory / "adapter"), context=self.context)
         metadata = {**metadata, "format": "flash-custom-v1"}
         (directory / "metadata.json").write_text(json.dumps(metadata))
-        hf.hf_upload_folder(
-            str(directory), f"checkpoints/step-{step}", required=True, context=self.context
+        receipt = hf.publish_deployable_checkpoint(
+            str(directory / "adapter"),
+            step,
+            checkpoint_dir=str(directory),
+            required=True,
+            context=self.context,
         )
+        if receipt.resume is None or receipt.deployable is None:
+            raise RuntimeError("checkpoint publication did not commit training state and adapter")
         reference = f"{self.context.config.run_id}/step-{step}"
         self.published[step] = directory
         self.by_name[directory.name] = step
@@ -34,47 +40,28 @@ class RunCheckpoints:
         self.cached = directory
         if previous is not None and previous != directory:
             shutil.rmtree(previous)
-        from flash.engine.worker.io.heartbeat import heartbeat
-
-        heartbeat("checkpoint_deployable", step=step, context=self.context)
         return {"reference": reference, "durable": True}
-
-    def export_source(self, name, workspace):
-        """Rehydrate evicted snapshots only inside the temporary export workspace."""
-        from huggingface_hub import snapshot_download
-
-        if name not in self.by_name:
-            raise FileNotFoundError("unknown checkpoint")
-        step = self.by_name[name]
-        directory = self.published[step]
-        if directory.is_dir():
-            return directory
-        config = self.context.config
-        prefix = f"{config.phase}/{config.run_id}/checkpoints/step-{step}"
-        root = snapshot_download(
-            repo_id=config.hf_repo,
-            repo_type="dataset",
-            allow_patterns=[f"{prefix}/**"],
-            local_dir=workspace / "source",
-            token=os.environ.get("HF_TOKEN"),
-        )
-        return Path(root) / prefix
 
     def restore(self, backend, resolved):
         from huggingface_hub import snapshot_download
 
-        root = snapshot_download(
-            repo_id=resolved["repo"],
-            repo_type="dataset",
-            revision=resolved["revision"],
-            allow_patterns=[f"{resolved['path']}/**"],
-            token=os.environ.get("HF_TOKEN"),
-        )
-        source = Path(root) / resolved["path"]
-        metadata = json.loads((source / "metadata.json").read_text())
-        if metadata.get("format") != "flash-custom-v1":
-            raise ValueError("checkpoint does not contain custom training state")
-        return backend.restore_checkpoint(source)
+        from flash.engine.support.checkpoint_transport import restore_directory
+
+        with tempfile.TemporaryDirectory(prefix="flash-custom-resume-") as workspace:
+            root = snapshot_download(
+                local_dir=workspace,
+                repo_id=resolved["repo"],
+                repo_type="dataset",
+                revision=resolved["revision"],
+                allow_patterns=[f"{resolved['path']}/**"],
+                token=os.environ.get("HF_TOKEN"),
+            )
+            source = Path(root) / resolved["path"]
+            restore_directory(str(source))
+            metadata = json.loads((source / "metadata.json").read_text())
+            if metadata.get("format") != "flash-custom-v1":
+                raise ValueError("checkpoint does not contain custom training state")
+            return backend.restore_checkpoint(source)
 
     def finish(self, directory):
         from flash.engine.worker.io import hf

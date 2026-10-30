@@ -164,12 +164,6 @@ class TrainingClient:
     def load_checkpoint(self, name):
         return self._call("load_checkpoint", name=name)
 
-    def download_checkpoint(self, name, destination):
-        """Export a durable checkpoint to a local ZIP while the managed run is active."""
-        from flash.custom.artifacts import download_checkpoint
-
-        return download_checkpoint(self._http, name, destination)
-
     def close(self):
         if self._pending is not None:
             raise RuntimeError("resolve the pending operation with retry_pending() before closing")

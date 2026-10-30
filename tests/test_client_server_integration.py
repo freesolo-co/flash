@@ -358,22 +358,19 @@ def test_custom_cli_uses_hosted_auth_project_quote_and_run_lifecycle(
     asynchronous,
     fails,
 ):
-    from dataclasses import replace
     from types import SimpleNamespace
 
     from flash.cli.commands.ops.train import cmd_train
     from flash.custom import controller
     from flash.providers.core import registry
-    from flash.runner.lifecycle import preparation, status
+    from flash.runner.lifecycle import status
 
     api = make_client()
     monkeypatch.setattr(controller, "client_from_config", lambda: api)
     monkeypatch.setattr(registry, "available_providers", lambda: {"modal": object()})
-    monkeypatch.setattr(
-        preparation,
-        "_resolve_model_revision",
-        lambda spec, **kw: replace(spec, model_revision="a" * 40, model_revision_auto=True),
-    )
+    from flash.providers.core import allocator
+
+    monkeypatch.setattr(allocator, "available_providers", lambda: ("modal",))
     keyword = "async " if asynchronous else ""
     awaited = "await " if asynchronous else ""
     code = f"{keyword}def main(client):\n    {awaited}client.optim_step(learning_rate=0.001)\n"
@@ -422,3 +419,26 @@ def test_custom_cli_uses_hosted_auth_project_quote_and_run_lifecycle(
     assert len(runs) == 1
     assert updates == [{"learning_rate": 0.001}]
     assert api.get_run(runs[0])["state"] == ("cancelled" if fails else "done")
+
+    from flash.runner.results import checkpoints
+    from flash.serve.deployment import export
+
+    run_id = runs[0]
+    effective = status.effective_spec_from_status(status.get_status(run_id))
+    assert effective.gpu.disk_gb > 60
+    assert effective.train.hf_repo
+    assert effective.gpu.network_volume
+    monkeypatch.setattr(checkpoints, "list_checkpoints", lambda spec: [{"step": 1}])
+    seen = {}
+    monkeypatch.setattr(
+        export,
+        "export_adapter",
+        lambda **kw: (seen.update(kw), "https://huggingface.co/me/custom")[1],
+    )
+    exported = api.export(f"{run_id}/step-1", repository="me/custom", hf_token="hf-user-test")
+    assert exported["source"] == f"{run_id}/step-1"
+    assert seen["source_subfolder"] == f"custom/{run_id}/checkpoints/step-1/adapter"
+    assert seen["base_model_revision"] == effective.model_revision
+    with pytest.raises(ApiError) as denied:
+        make_client().export(f"{run_id}/step-1", repository="me/custom", hf_token="hf-user-test")
+    assert denied.value.status == 404

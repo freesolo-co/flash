@@ -75,9 +75,6 @@ class AsyncTrainingClient:
     async def load_checkpoint(self, name):
         return await self._call("load_checkpoint", name)
 
-    async def download_checkpoint(self, name, destination):
-        return await self._call("download_checkpoint", name, destination)
-
     async def status(self):
         return await self._call("status")
 

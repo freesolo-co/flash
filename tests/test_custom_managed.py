@@ -1,7 +1,6 @@
 """Managed custom config, async ordering and durable publication contracts."""
 
 import asyncio
-import json
 import threading
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -9,7 +8,6 @@ from unittest.mock import Mock
 import pytest
 
 from flash.custom.async_client import AsyncTrainingClient
-from flash.custom.checkpoints import RunCheckpoints
 from flash.schema import ConfigError, spec_from_dict
 
 
@@ -21,6 +19,44 @@ def custom_raw():
         "custom": {"file": "algorithm.py"},
         "train": {"max_steps": 6},
     }
+
+
+def test_custom_allocation_uses_shared_capacity_lookup_and_validated_hardware(monkeypatch):
+    from flash.cost.spec import estimate_for_spec
+    from flash.providers.core import allocator
+    from flash.providers.core.base import Candidate, UnsupportedGpuError
+
+    seen = []
+
+    def candidates(need, constraints):
+        seen.append((need, constraints))
+        return [Candidate("modal", "A100 SXM", 1.0, 80), Candidate("modal", "H100", 4.0, 80)]
+
+    monkeypatch.setattr(allocator, "available_providers", lambda: ("modal",))
+    provider = SimpleNamespace(live_candidates=candidates)
+    monkeypatch.setattr(allocator, "get_provider", lambda name: provider)
+    spec = spec_from_dict(custom_raw())
+    assert spec.gpu.type == ""  # no authored GPU pin; the backend capability limits the pool.
+    result = allocator.allocate(spec.model, spec.algorithm, train=spec.train)
+    assert result.gpu == "H100"
+    assert result.hourly_usd == 4.0
+    assert seen[0][1].max_gpu_count == 1
+    assert seen[0][1].gpu_type == "H100"
+    assert estimate_for_spec(spec, allocation=result).total_usd == 4.0
+    provider.live_candidates = lambda *a: []
+    with pytest.raises(UnsupportedGpuError):
+        allocator.allocate(spec.model, spec.algorithm, train=spec.train)
+
+
+def test_custom_config_uses_common_gpu_syntax_and_lora_validation():
+    raw = custom_raw()
+    raw["gpu"] = {"type": ["H100"], "provider": " MODAL "}
+    spec = spec_from_dict(raw)
+    assert spec.gpu.type == "H100"
+    assert spec.gpu.provider == "modal"
+    raw["train"]["lora_rank"] = 0
+    with pytest.raises(ConfigError, match="lora_rank"):
+        spec_from_dict(raw)
 
 
 def test_custom_config_roundtrip_and_default_specs_keep_their_bytes():
@@ -105,43 +141,6 @@ def test_async_queue_is_nonblocking_and_cancellation_does_not_overtake_update():
         assert calls == ["update-start", "update-end", "forward", "close"]
 
     asyncio.run(scenario())
-
-
-def test_checkpoint_atomically_publishes_state_and_adapter_in_existing_run_tree(
-    tmp_path, monkeypatch
-):
-    import flash.engine.worker.io.heartbeat as heartbeats
-    from flash.engine.worker.io import hf
-
-    (tmp_path / "adapter").mkdir()
-    (tmp_path / "adapter" / "adapter_model.safetensors").write_bytes(b"weights")
-    (tmp_path / "state.pt").write_bytes(b"optimizer")
-    (tmp_path / "algorithm.json").write_text('{"cursor": 10}')
-    context = SimpleNamespace(config=SimpleNamespace(run_id="run-test"))
-    upload = Mock(return_value=True)
-    monkeypatch.setattr(hf, "_write_deployable_provenance", Mock())
-    monkeypatch.setattr(hf, "hf_upload_folder", upload)
-    monkeypatch.setattr(heartbeats, "heartbeat", Mock())
-    store = RunCheckpoints(context)
-    receipt = store.publish(tmp_path, {"step": 2})
-    upload.assert_called_once_with(
-        str(tmp_path), "checkpoints/step-2", required=True, context=context
-    )
-    assert receipt == {"reference": "run-test/step-2", "durable": True}
-    assert json.loads((tmp_path / "metadata.json").read_text())["format"] == "flash-custom-v1"
-
-
-def test_failed_upload_never_acknowledges_durability(tmp_path, monkeypatch):
-    from flash.engine.worker.io import hf
-
-    monkeypatch.setattr(hf, "_write_deployable_provenance", Mock())
-    monkeypatch.setattr(
-        hf, "hf_upload_folder", Mock(side_effect=RuntimeError("storage unavailable"))
-    )
-    store = RunCheckpoints(SimpleNamespace(config=SimpleNamespace(run_id="run-test")))
-    with pytest.raises(RuntimeError, match="storage unavailable"):
-        store.publish(tmp_path, {"step": 2})
-    assert store.published == {}
 
 
 def test_connection_capability_requires_run_ownership_before_provider_lookup(monkeypatch):

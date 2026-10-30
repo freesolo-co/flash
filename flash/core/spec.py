@@ -649,7 +649,7 @@ class JobSpec:
             train.pop("lora_rank", None)
             train.pop("lora_alpha", None)
         if self.algorithm == "custom":
-            from flash.custom.config import TRAIN_KEYS
+            from flash.schema.custom import TRAIN_KEYS
 
             data["train"] = {
                 key: value for key, value in data["train"].items() if key in TRAIN_KEYS

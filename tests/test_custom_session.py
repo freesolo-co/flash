@@ -125,9 +125,6 @@ def test_step_cap_close_and_idle_state(tmp_path):
         session.execute(request(session))
     session.last_activity -= 31
     assert session.expired()
-    session.active_exports = 1
-    assert not session.expired()
-    session.active_exports = 0
     with session.lock:
         assert not session.expired()
     session.execute(request(session, operation="close"))

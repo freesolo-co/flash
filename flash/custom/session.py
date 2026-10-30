@@ -28,7 +28,6 @@ class TrainingSession:
         self.sequence = 0
         self.failed = False
         self.closed = False
-        self.active_exports = 0
         self.last_activity = time.monotonic()
         self.lock = threading.Lock()
         self.receipt = None
@@ -159,10 +158,7 @@ class TrainingSession:
             return (
                 self.closed
                 or self.failed
-                or (
-                    not self.active_exports
-                    and time.monotonic() - self.last_activity > self.idle_seconds
-                )
+                or (time.monotonic() - self.last_activity > self.idle_seconds)
             )
         finally:
             self.lock.release()

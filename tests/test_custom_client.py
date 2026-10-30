@@ -2,17 +2,13 @@
 
 from __future__ import annotations
 
-import contextlib
-import io
 import subprocess
 import sys
-from types import SimpleNamespace
 
 import pytest
 
-from flash.client.http import ApiError, ClientError, RequestTimeoutError
+from flash.client.http import ApiError, RequestTimeoutError
 from flash.custom import TrainingClient
-from flash.custom.artifacts import download_checkpoint
 from flash.custom.types import Datum
 
 
@@ -94,34 +90,6 @@ def test_oversized_batch_can_be_split_without_losing_session(monkeypatch):
     client.forward_backward([row])
     assert http.envelopes[0]["sequence"] == 1
     assert client.pending_request is None
-
-
-def test_checkpoint_download_streams_and_rejects_incomplete_file(tmp_path, monkeypatch):
-    class Response(io.BytesIO):
-        @property
-        def headers(self):
-            return {"Content-Length": "8"}
-
-    http = SimpleNamespace(
-        api_url="https://gpu.example",
-        _auth_headers=lambda: {"Authorization": "Bearer test"},
-        _translate_http_errors=lambda **kwargs: contextlib.nullcontext(),
-    )
-    monkeypatch.setattr(
-        "flash.custom.artifacts._urlopen_no_redirect", lambda *args, **kwargs: Response(b"complete")
-    )
-    path = download_checkpoint(http, "model", tmp_path / "model.zip")
-    assert path.read_bytes() == b"complete"
-    assert path.stat().st_mode & 0o777 == 0o600
-    with pytest.raises(FileExistsError):
-        download_checkpoint(http, "model", path)
-    monkeypatch.setattr(
-        "flash.custom.artifacts._urlopen_no_redirect", lambda *args, **kwargs: Response(b"short")
-    )
-    with pytest.raises(ClientError, match="incomplete"):
-        download_checkpoint(http, "model", tmp_path / "short.zip")
-    assert not (tmp_path / "short.zip").exists()
-    assert list(tmp_path.glob(".flash-checkpoint-*")) == []
 
 
 def test_scaffold_is_editable_and_never_overwrites(tmp_path):
