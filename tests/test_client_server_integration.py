@@ -439,6 +439,21 @@ def test_custom_cli_uses_hosted_auth_project_quote_and_run_lifecycle(
     assert exported["source"] == f"{run_id}/step-1"
     assert seen["source_subfolder"] == f"custom/{run_id}/checkpoints/step-1/adapter"
     assert seen["base_model_revision"] == effective.model_revision
+    from flash.server.routes import adapter_download
+
+    def build_archive(**kwargs):
+        assert kwargs["source_subfolder"] == seen["source_subfolder"]
+        path = kwargs["directory"] / "adapter.zip"
+        path.write_bytes(b"adapter archive")
+        return path, "test-digest"
+
+    monkeypatch.setattr(adapter_download, "build_archive", build_archive)
+    request = urllib.request.Request(
+        f"{api.api_url}/v1/runs/{run_id}/adapter?checkpoint_id={run_id}/step-1",
+        headers=api._auth_headers(),
+    )
+    with urllib.request.urlopen(request) as response:
+        assert response.read() == b"adapter archive"
     with pytest.raises(ApiError) as denied:
         make_client().export(f"{run_id}/step-1", repository="me/custom", hf_token="hf-user-test")
     assert denied.value.status == 404

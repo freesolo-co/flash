@@ -8,16 +8,40 @@ and checks exact restored logprobs and algorithm state before another optimizer 
 """
 
 import argparse
+import hashlib
 import json
 import os
 import re
 import shutil
 import subprocess
 import sys
+import urllib.parse
+import urllib.request
+import zipfile
 from pathlib import Path
 
+from flash._internal.http import _urlopen_no_redirect
 from flash.client import client_from_config
 from flash.custom.controller import require_custom_support
+
+
+def download_adapter(api, run_id, step, output):
+    checkpoint = f"{run_id}/step-{step}"
+    query = urllib.parse.urlencode({"checkpoint_id": checkpoint})
+    request = urllib.request.Request(
+        f"{api.api_url}/v1/runs/{run_id}/adapter?{query}", headers=api._auth_headers()
+    )
+    path = output / f"adapter-step-{step}.zip"
+    with _urlopen_no_redirect(request, timeout=300) as response, path.open("xb") as target:
+        digest = response.headers["X-Flash-Adapter-Sha256"]
+        shutil.copyfileobj(response, target, length=1024 * 1024)
+    with path.open("rb") as source:
+        assert hashlib.file_digest(source, "sha256").hexdigest() == digest
+    with zipfile.ZipFile(path) as archive:
+        manifest = json.loads(archive.read("manifest.json"))
+        assert manifest["checkpoint_id"] == checkpoint
+        assert "adapter_config.json" in archive.namelist()
+    return manifest
 
 
 def main():
@@ -73,12 +97,17 @@ def main():
                         process.wait(timeout=15)
         assert "RESTORE_EXACT" in (output / "run-3.log").read_text()
         assert "UPDATE_CHANGED_LOGPROBS" in (output / "run-3.log").read_text()
+        # download through the normal control plane after both training sessions have closed.
+        adapters = [
+            download_adapter(api, run, step, output) for run, step in zip(runs, (2, 3), strict=True)
+        ]
         evidence = {
             "runs": runs,
             "restored_logprobs_exact": True,
             "restored_algorithm_state_exact": True,
             "continued_update_changed_logprobs": True,
             "registered_checkpoints": [api.checkpoints(run) for run in runs],
+            "standard_adapter_downloads": adapters,
         }
         (output / "evidence.json").write_text(json.dumps(evidence, indent=2))
     finally:
