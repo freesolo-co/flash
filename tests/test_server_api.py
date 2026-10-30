@@ -239,7 +239,7 @@ def test_requests_without_key_are_rejected(api):
     assert api.get("/v1/models", headers=_bearer("nope")).status_code == 401
     health = api.get("/v1/health")
     assert health.status_code == 200  # health stays open
-    assert health.json()["capabilities"] == []
+    assert "custom_training_v1" in health.json()["capabilities"]
 
 
 def test_project_validation_blocks_before_run_preparation(api, monkeypatch) -> None:

@@ -184,6 +184,7 @@ def submit_attempt(
         source_snapshot=source_snapshot,
         deadline_at=deadline_at,
     )
+    payload["custom_training"] = spec.algorithm == "custom"
     import os
 
     if spec.gpu.network_volume and os.environ.get("FLASH_WEIGHT_CACHE_DISABLED", "").strip() != "1":

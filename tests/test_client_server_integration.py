@@ -192,6 +192,7 @@ def test_health_and_identity_roundtrip(make_client) -> None:
     client = make_client()
 
     health = client.health()
+    assert "custom_training_v1" in health["capabilities"]
     assert health["ok"] is True
     assert health["service"] == "flash"
 
@@ -346,3 +347,113 @@ def test_chat_without_deployment_maps_to_api_error(make_client) -> None:
     with pytest.raises(ApiError) as exc:
         client.chat(f"{run_id}/final", messages=[{"role": "user", "content": "hi"}])
     assert exc.value.status == 409
+
+
+@pytest.mark.parametrize("asynchronous", [False, True])
+@pytest.mark.parametrize("fails", [False, True])
+def test_custom_cli_uses_hosted_auth_project_quote_and_run_lifecycle(
+    make_client,
+    tmp_path,
+    monkeypatch,
+    asynchronous,
+    fails,
+):
+    from types import SimpleNamespace
+
+    from flash.cli.commands.ops.train import cmd_train
+    from flash.custom import controller
+    from flash.providers.core import registry
+    from flash.runner.lifecycle import status
+
+    api = make_client()
+    monkeypatch.setattr(controller, "client_from_config", lambda: api)
+    monkeypatch.setattr(registry, "available_providers", lambda: {"modal": object()})
+    from flash.providers.core import allocator
+
+    monkeypatch.setattr(allocator, "available_providers", lambda: ("modal",))
+    keyword = "async " if asynchronous else ""
+    awaited = "await " if asynchronous else ""
+    code = f"{keyword}def main(client):\n    {awaited}client.optim_step(learning_rate=0.001)\n"
+    if fails:
+        code += '    raise ValueError("local algorithm failed")\n'
+    (tmp_path / "algorithm.py").write_text(code)
+    config = tmp_path / "run.toml"
+    config.write_text(
+        f'project = "{SPEC["project"]}"\nmodel = "{SPEC["model"]}"\n'
+        'algorithm = "custom"\n[custom]\nfile = "algorithm.py"\n[train]\nmax_steps = 2\n'
+    )
+    runs, updates = [], []
+
+    class Remote:
+        def optim_step(self, **kwargs):
+            updates.append(kwargs)
+
+        def close(self):
+            status._update(runs[0], "done")
+
+    def connect(client, run_id, **kwargs):
+        record = client.get_run(run_id)
+        assert record["spec"]["project"] == SPEC["project"]
+        assert record["spec"]["algorithm"] == "custom"
+        assert record["estimated_cost_usd"] > 0
+        with pytest.raises(ApiError) as denied:
+            make_client().get_run(run_id)
+        assert denied.value.status == 404
+        runs.append(run_id)
+        return Remote()
+
+    monkeypatch.setattr(controller, "connect", connect)
+    args = SimpleNamespace(
+        config=str(config),
+        overrides=[],
+        extra_configs=[],
+        cost=False,
+        dry_run=False,
+        background=False,
+    )
+    if fails:
+        with pytest.raises(ValueError, match="local algorithm failed"):
+            cmd_train(args)
+    else:
+        assert cmd_train(args) == 0
+    assert len(runs) == 1
+    assert updates == [{"learning_rate": 0.001}]
+    assert api.get_run(runs[0])["state"] == ("cancelled" if fails else "done")
+
+    from flash.runner.results import checkpoints
+    from flash.serve.deployment import export
+
+    run_id = runs[0]
+    effective = status.effective_spec_from_status(status.get_status(run_id))
+    assert effective.gpu.disk_gb > 60
+    assert effective.train.hf_repo
+    assert effective.gpu.network_volume
+    monkeypatch.setattr(checkpoints, "list_checkpoints", lambda spec: [{"step": 1}])
+    seen = {}
+    monkeypatch.setattr(
+        export,
+        "export_adapter",
+        lambda **kw: (seen.update(kw), "https://huggingface.co/me/custom")[1],
+    )
+    exported = api.export(f"{run_id}/step-1", repository="me/custom", hf_token="hf-user-test")
+    assert exported["source"] == f"{run_id}/step-1"
+    assert seen["source_subfolder"] == f"custom/{run_id}/checkpoints/step-1/adapter"
+    assert seen["base_model_revision"] == effective.model_revision
+    from flash.server.routes import adapter_download
+
+    def build_archive(**kwargs):
+        assert kwargs["source_subfolder"] == seen["source_subfolder"]
+        path = kwargs["directory"] / "adapter.zip"
+        path.write_bytes(b"adapter archive")
+        return path, "test-digest"
+
+    monkeypatch.setattr(adapter_download, "build_archive", build_archive)
+    request = urllib.request.Request(
+        f"{api.api_url}/v1/runs/{run_id}/adapter?checkpoint_id={run_id}/step-1",
+        headers=api._auth_headers(),
+    )
+    with urllib.request.urlopen(request) as response:
+        assert response.read() == b"adapter archive"
+    with pytest.raises(ApiError) as denied:
+        make_client().export(f"{run_id}/step-1", repository="me/custom", hf_token="hf-user-test")
+    assert denied.value.status == 404

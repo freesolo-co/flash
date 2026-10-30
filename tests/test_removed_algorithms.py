@@ -21,7 +21,7 @@ def test_removed_algorithm_rejected_at_all_spec_boundaries(algorithm):
 
 
 def test_removed_algorithm_has_no_model_or_checkpoint_capability():
-    assert all(set(row["algos"]) <= {"sft", "grpo"} for row in public_model_rows())
+    assert all(set(row["algos"]) <= {"sft", "grpo", "custom"} for row in public_model_rows())
     assert parse_adapter_storage_ref("owner/repo:opd/old-run") is None
 
 

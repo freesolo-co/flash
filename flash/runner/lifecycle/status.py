@@ -144,6 +144,8 @@ def effective_spec_from_status(status: RunStatus, *, verify_source: bool = False
     validate_model_for_algorithm(public_spec.model, public_spec.algorithm)
     snapshot = status.effective_preparation
     if not isinstance(snapshot, dict):
+        if public_spec.algorithm == "custom":
+            raise ValueError("custom run requires its original preparation snapshot")
         if public_spec.train.init_from_adapter:
             raise ValueError(
                 f"warm-start source {public_spec.train.init_from_adapter!r} cannot be recovered "
@@ -351,6 +353,12 @@ def record_heartbeat(run_id: str, heartbeat: dict) -> None:
         # a boot/retry heartbeat for a NEW attempt must inherit nothing from the previous one: its
         # metrics are a different run of the steps and its gpu snapshot is a different card.
         same_attempt = prev is not None and prev.get("attempt") == hb.get("attempt")
+        if (
+            same_attempt
+            and status.spec.get("algorithm") == "custom"
+            and "session_started_at" in prev
+        ):
+            hb.setdefault("session_started_at", prev["session_started_at"])
         # Checkpoint-stage heartbeats (checkpoint_uploading/deployable/uploaded) omit metrics_last; carry
         # the existing per-step backlog forward so `flash runs log -f` doesn't drop it mid-save until the next
         # metrics-bearing heartbeat lands.
@@ -362,6 +370,7 @@ def record_heartbeat(run_id: str, heartbeat: dict) -> None:
             expected_stage = {
                 "sft": "sft_step",
                 "grpo": "rl_step",
+                "custom": "custom_step",
             }.get(status.spec.get("algorithm"))
             attempt = hb.get("attempt")
             remote_attempt = (

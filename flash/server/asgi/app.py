@@ -112,6 +112,7 @@ def create_app():
 
         from flash.server.routes import (
             adapter_download,
+            custom,
             env_files,
             envs,
             meta,
@@ -227,6 +228,7 @@ def create_app():
     app.include_router(envs.router)
     app.include_router(env_files.router)
     app.include_router(runs.router)
+    app.include_router(custom.router)
     app.include_router(serving.router)
     app.include_router(adapter_download.router)
     return app

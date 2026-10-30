@@ -58,6 +58,10 @@ def _run_worker_mode(*, context: WorkerContext) -> None:
         "sft": partial(sft_entry.run_sft_train, context=context),
         "rl": partial(rl_entry.run_rl, context=context),
     }
+    if context.config.run_mode == "custom":
+        from flash.custom.worker import run as run_custom
+
+        modes["custom"] = partial(run_custom, context=context)
     handler = modes.get(context.config.run_mode)
     if handler is None:
         raise RuntimeError("worker run mode is invalid")

@@ -61,6 +61,18 @@ def prepare_job(
     owner_key_id: int | None = None,
 ) -> PreparedJob:
     """Prepare all read-only submission inputs before persistence or allocation."""
+    if spec.algorithm == "custom":
+        from flash.custom.managed import resolve_resume
+
+        if not os.environ.get("HF_TOKEN"):
+            raise ValueError("managed custom training requires durable artifact storage")
+        if spec.custom.get("resume_from"):
+            spec = resolve_resume(
+                spec,
+                owner_org_id=preparation._context_org_id(billing_context)
+                or preparation._context_org_id(platform_context),
+                owner_key_id=owner_key_id,
+            )
     # before _resolve_model_revision, and before every sizing step below: a warm start inherits its
     # source's pin and provenance, and `resolve_model`/`_with_model_disk` size against whatever
     # revision the spec carries by then.
@@ -202,7 +214,7 @@ def _effective_preparation_snapshot(
         "preparation_digest": preparation._preparation_digest(
             public_spec, worker_spec, adapter_identity, stored_public=stored_public
         ),
-        "backend": TRAINER_BACKEND,
+        "backend": "custom" if worker_spec.algorithm == "custom" else TRAINER_BACKEND,
     }
 
 

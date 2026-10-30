@@ -367,9 +367,16 @@ def publish_deployable_checkpoint(
     required: bool = False,
     _provenance_ready: bool = False,
     _emit_heartbeat: bool = True,
+    checkpoint_dir: str | None = None,
     context: WorkerContext,
 ) -> PublicationResult:
-    """commit an adapter once; reporting can never trigger a second storage commit."""
+    """Commit an adapter, optionally atomically with its trainer state, then report it."""
+    from flash.engine.support.checkpoint_transport import upload_directory
+
+    if checkpoint_dir is not None and os.path.realpath(ckpt_dir) != os.path.realpath(
+        os.path.join(checkpoint_dir, "adapter")
+    ):
+        raise ValueError("checkpoint_dir must contain the published adapter directory")
     if not context.config.hf_repo or not _has_deployable_adapter(ckpt_dir):
         reason = "no_repository" if not context.config.hf_repo else "no_adapter"
         if required:
@@ -392,16 +399,20 @@ def publish_deployable_checkpoint(
         if _emit_heartbeat
         else contextlib.nullcontext()
     )
-    with heartbeat_context:
+    upload_context = (
+        upload_directory(checkpoint_dir) if checkpoint_dir else contextlib.nullcontext(ckpt_dir)
+    )
+    upload_path = subfolder.removesuffix("/adapter") if checkpoint_dir else subfolder
+    with heartbeat_context, upload_context as source:
         for attempt in range(attempts):
             try:
                 _require_hf_deadline_allowance(context=context)
                 receipt = hf_api().upload_folder(
-                    folder_path=ckpt_dir,
-                    path_in_repo=subfolder,
+                    folder_path=source,
+                    path_in_repo=upload_path,
                     repo_id=context.config.hf_repo,
                     repo_type="dataset",
-                    ignore_patterns=list(_CHECKPOINT_TRAINER_STATE),
+                    ignore_patterns=[] if checkpoint_dir else list(_CHECKPOINT_TRAINER_STATE),
                 )
                 break
             except Exception as error:
@@ -423,7 +434,11 @@ def publish_deployable_checkpoint(
         if _emit_heartbeat
         else None
     )
-    return PublicationResult(deployable=commit, reporting_error=reporting_error)
+    return PublicationResult(
+        deployable=commit,
+        resume=ArtifactCommit(upload_path, commit.revision) if checkpoint_dir else None,
+        reporting_error=reporting_error,
+    )
 
 
 def _deployable_adapter_on_hf(step: int, *, context: WorkerContext) -> bool:

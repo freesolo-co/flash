@@ -240,6 +240,10 @@ def cancelled_charge_usd(
     record of the rented basis. absent (legacy callers, never-allocated runs), the status's own
     handle is consulted, which still covers failed or unconfirmed teardowns.
     """
+    if getattr(spec, "algorithm", None) == "custom":
+        from flash.custom.billing import session_charge
+
+        return session_charge(status, spec)
     n = max(0, int(steps))
     if n == 0:
         # cancelled before any training step: nothing rented, nothing owed.
@@ -334,6 +338,10 @@ def _persisted_completed_work(spec) -> tuple[int | None, dict | None]:
 
 def _status_estimated_charge(status: RunStatus, spec, *, fallback: float = 0.0) -> float:
     """Charge the quote exactly for full work, or its estimated share for an early finish."""
+    if getattr(spec, "algorithm", None) == "custom":
+        from flash.custom.billing import session_charge
+
+        return session_charge(status, spec)
     completed_steps, persisted_basis = _persisted_completed_work(spec)
     if completed_steps is not None:
         # reuse cancellation's estimated-work fraction: one-time compile and reached saves stay

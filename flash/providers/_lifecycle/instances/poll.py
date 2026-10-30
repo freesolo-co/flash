@@ -325,6 +325,7 @@ SETUP_HEARTBEAT_STAGES = frozenset(
         "rl_data_loading",
         "rl_adapter_loading",
         "sft_model_load",
+        "custom_model_load",
         "sft_pretokenizing",
         "sft_configuring",
         "rl_configuring",
@@ -334,7 +335,7 @@ SETUP_HEARTBEAT_STAGES = frozenset(
     }
 )
 
-STEP_GATED_STAGES = frozenset({"rl_step", "sft_step"})
+STEP_GATED_STAGES = frozenset({"rl_step", "sft_step", "custom_step"})
 
 
 def is_training_heartbeat(stage: str | None, step: Any) -> bool:

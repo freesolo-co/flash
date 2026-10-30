@@ -110,7 +110,7 @@ def _adapter_ref_for_status(status: RunStatus) -> str | None:
     return format_checkpoint_ref(status.run_id, None)
 
 
-_TRAINING_STAGES = frozenset({"rl_step", "sft_step"})
+_TRAINING_STAGES = frozenset({"rl_step", "sft_step", "custom_step"})
 
 
 @dataclass
@@ -249,7 +249,7 @@ def _redact_internal_adapter_ref(data: dict) -> None:
         return
     _repo, prefix = resolved
     match = re.fullmatch(
-        r"(?:sft|rl)/(?P<run>[A-Za-z0-9][A-Za-z0-9._-]{0,127})"
+        r"(?:sft|rl|custom)/(?P<run>[A-Za-z0-9][A-Za-z0-9._-]{0,127})"
         r"(?:/checkpoints/step-(?P<step>\d+))?",
         prefix,
     )

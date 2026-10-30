@@ -110,6 +110,8 @@ def create(*, name, payload, image_reference, gpu, gpu_count, capsule, deadline_
                 .run_commands("mkdir -p /root/flash")
                 .add_local_file(str(archive), "/opt/flash/capsule.pyz", copy=True)
             )
+            if payload.get("custom_training"):
+                image = image.pip_install("fastapi>=0.136,<0.137", "uvicorn>=0.52,<1")
             volumes = {}
             if payload["env"].get("FLASH_WEIGHT_CACHE_DIR"):
                 volumes[CACHE_MOUNT] = modal.Volume.from_name(
@@ -149,6 +151,7 @@ def create(*, name, payload, image_reference, gpu, gpu_count, capsule, deadline_
                     timeout=timeout,
                     workdir="/root/flash",
                     volumes=volumes,
+                    encrypted_ports=[8000] if payload.get("custom_training") else [],
                     client=client,
                 )
                 return sandbox.object_id
@@ -221,3 +224,12 @@ def list_instances():
         return result
 
     return call(listing)
+
+
+def custom_tunnel(instance_id):
+    async def lookup(modal, client):
+        sandbox = await modal.Sandbox.from_id.aio(instance_id, client=client)
+        tunnels = await sandbox.tunnels.aio()
+        return tunnels[8000].url
+
+    return call(lookup)

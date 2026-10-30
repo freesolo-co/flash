@@ -159,6 +159,7 @@ def test_authored_surface_is_exactly_what_the_public_payload_carries():
     cannot fail, while comparing it to what the serializer actually emits can.
     """
     public = _fully_managed_internal_spec().to_dict()
-    assert set(public) == _TOP_LEVEL_KEYS
+    # empty custom settings stay absent to preserve historical preparation digests.
+    assert set(public) == _TOP_LEVEL_KEYS - {"custom"}
     assert set(public["environment"]) == _ENVIRONMENT_KEYS
     assert set(public["gpu"]) == _GPU_KEYS
