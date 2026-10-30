@@ -110,7 +110,16 @@ def create_app():
     try:
         from fastapi import FastAPI
 
-        from flash.server.routes import envs, meta, runs, serving, serving_completion, teacher
+        from flash.server.routes import (
+            adapter_download,
+            custom,
+            env_files,
+            envs,
+            meta,
+            runs,
+            serving,
+            serving_completion,
+        )
     except ImportError as exc:
         raise RuntimeError(_SERVER_EXTRAS_HINT) from exc
     from contextlib import asynccontextmanager
@@ -122,7 +131,6 @@ def create_app():
         from flash.server.billing.retry import charge_retry_enabled
 
         check_run_preflight()  # operator credentials: fail fast, before serving anyone
-        db.recover_teacher_request_ledger()
         deployment_jobs._open_deployment_jobs()
         _open_status_reporter()
         # Reserve the durable-backlog scanner before recovery can fill its bounded lane.
@@ -218,9 +226,11 @@ def create_app():
     app = FastAPI(title="Flash Control Plane", version=__version__, lifespan=lifespan)
     app.include_router(meta.router)
     app.include_router(envs.router)
+    app.include_router(env_files.router)
     app.include_router(runs.router)
+    app.include_router(custom.router)
     app.include_router(serving.router)
-    app.include_router(teacher.router)
+    app.include_router(adapter_download.router)
     return app
 
 

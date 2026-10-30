@@ -28,7 +28,7 @@ def test_heartbeat_start_failure_stops_the_field_sampler(monkeypatch, worker_con
         with (
             pytest.raises(RuntimeError, match="heartbeat startup failed"),
             heartbeat.liveness_heartbeat(
-                "opd_step", fields=fields, sample_off_thread=True, context=worker_context
+                "rl_step", fields=fields, sample_off_thread=True, context=worker_context
             ),
         ):
             pytest.fail("startup should not succeed")

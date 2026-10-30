@@ -14,7 +14,6 @@ from flash.adapters.lora_rank import ServingPreflightError, preflight_train_cont
 from flash.content.structured_outputs import parse_structured_outputs
 from flash.core.spec import JobSpec
 from flash.engine.plan.recipe import RECIPE
-from flash.engine.plan.vram import opd_completion_len
 
 SERVING_PROMPT_TOKEN_ALLOWANCE = 256
 
@@ -83,8 +82,6 @@ def _run_completion_budget(spec: JobSpec) -> int:
     """The completion budget the run itself trains at, before the smoke's own ceiling applies."""
     explicit = spec.train.max_completion_tokens
     positive_explicit = int(explicit) if explicit is not None and int(explicit) > 0 else None
-    if spec.algorithm == "opd":
-        return opd_completion_len(positive_explicit, spec.thinking)
     if spec.algorithm == "sft":
         # SFT ignores max_completion_tokens, so mirror the worker: use explicit max_context_tokens
         # with the recipe fallback.
@@ -131,8 +128,6 @@ def resolve_effective_completion_tokens(spec: JobSpec) -> int | None:
         return None
     explicit = spec.train.max_completion_tokens
     positive_explicit = int(explicit) if explicit is not None and int(explicit) > 0 else None
-    if spec.algorithm == "opd":
-        return opd_completion_len(positive_explicit, spec.thinking)
     if positive_explicit is not None:
         return positive_explicit
     recipe = RECIPE.rl

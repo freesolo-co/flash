@@ -71,14 +71,7 @@ def test_grpo_epochs_derive_steps_from_max_examples():
 
 
 def test_an_unbounded_prompt_pool_refuses_to_quote_instead_of_pricing_one_step():
-    """No stated row count used to mean "the pool is one step wide", which is never true.
-
-    The worker sizes the horizon from ``len(prompts)`` -- every row the environment yields -- so a
-    config that bounded nothing was quoted at one step regardless of dataset size. Against a
-    1153-row pool at batch 8 that is 145 real steps priced as 1, and the opd teacher capability in
-    ``capability_limits_for_spec`` is sized off the same number. The quote now refuses rather than
-    reporting a horizon nothing stated.
-    """
+    """No stated row count used to mean "the pool is one step wide", which is never true."""
     spec = _spec(**{"train.max_examples": None, "train.epochs": 2})
 
     with pytest.raises(UnknownPromptPoolSize, match="without a prompt-pool size") as refusal:
@@ -154,33 +147,12 @@ def test_required_save_overhead_uses_contractual_commit_counts():
     }
     serialize_per_save = REQUIRED_SAVE_S_PER_MODEL_B_AT_RANK32 * total_params_b(model_id)
 
-    for method, commits_per_save in (("sft", 2), ("grpo", 2), ("opd", 1)):
+    for method, commits_per_save in (("sft", 2), ("grpo", 2)):
         config = RunConfig(method=method, **common)
         expected = len(save_at_steps) * (
             commits_per_save * REQUIRED_SAVE_COMMIT_FLOOR_S + serialize_per_save
         )
         assert required_save_overhead_seconds(config) == pytest.approx(expected)
-
-
-def test_opd_required_saves_add_overhead_without_changing_steps():
-    from flash.cost.analytical import estimate_cost
-
-    common = {
-        "model_id": "Qwen/Qwen3.5-9B",
-        "method": "opd",
-        "steps": 10,
-        "seq_len": 1024,
-        "batch_size": 4,
-        "completion_len": 128,
-        "group_size": 1,
-    }
-    baseline = RunConfig(**common)
-    withsave = RunConfig(**common, save_at_steps=(2, 4, 6))
-
-    # opd publishes a deployable adapter at each exact save, so exact saves cost wall/dollars too.
-    assert baseline.steps == withsave.steps == 10
-    assert estimate_cost(withsave).train_seconds > estimate_cost(baseline).train_seconds
-    assert estimate_cost(withsave).total_usd > estimate_cost(baseline).total_usd
 
 
 def test_partial_reprice_counts_reached_saves_and_drops_future_saves():
@@ -199,49 +171,6 @@ def test_partial_reprice_counts_reached_saves_and_drops_future_saves():
     assert reached_save_charge != -1.0
     assert future_only_charge != -1.0
     assert reached_save_charge > future_only_charge > 0.0
-
-
-def test_opd_epochs_derive_steps_from_max_examples():
-    raw = copy.deepcopy(GRPO_RAW)
-    raw["algorithm"] = "opd"
-    raw["train"].update({"epochs": 2, "max_examples": 17, "prompts_per_step": 8, "group_size": 1})
-    spec = spec_from_dict(raw)
-    assert _spec_steps(spec) == 5  # ceil(17 rows * 2 epochs / batch_size 8)
-
-
-def test_opd_positive_max_steps_is_authoritative():
-    raw = copy.deepcopy(GRPO_RAW)
-    raw["algorithm"] = "opd"
-    raw["train"].update(
-        {"epochs": 2, "max_examples": 17, "prompts_per_step": 8, "group_size": 1, "max_steps": 31}
-    )
-    assert _spec_steps(spec_from_dict(raw)) == 31
-
-
-def test_opd_runconfig_carries_selected_teacher_and_prices_it():
-    from flash.cost.analytical import estimate_cost
-
-    def _opd(teacher=None):
-        raw = copy.deepcopy(GRPO_RAW)
-        raw["model"] = "Qwen/Qwen3.5-9B"
-        raw["algorithm"] = "opd"
-        raw["train"].update(
-            {"epochs": 1, "max_examples": 40, "prompts_per_step": 8, "group_size": 1}
-        )
-        if teacher is not None:
-            raw["train"]["teacher_model"] = teacher
-        return spec_from_dict(raw)
-
-    assert _runconfig_from_spec(_opd()).teacher_model == "glm-5.3"
-    qwen_cfg = _runconfig_from_spec(_opd("qwen3.5-397b-a17b"))
-    assert qwen_cfg.teacher_model == "qwen3.5-397b-a17b"
-
-    default_teacher_usd = estimate_cost(_runconfig_from_spec(_opd())).teacher_api_usd
-    qwen_teacher_usd = estimate_cost(qwen_cfg).teacher_api_usd
-    assert 0 < qwen_teacher_usd < default_teacher_usd
-
-    # sft/grpo carry no teacher.
-    assert _runconfig_from_spec(_spec()).teacher_model == ""
 
 
 def test_sft_cost_requires_the_measured_workload_rather_than_deriving_one():
@@ -1018,11 +947,11 @@ def test_sft_cost_warns_when_an_env_key_shadows_the_saved_login(tmp_path, monkey
     assert "shadowed!" in capsys.readouterr().err
 
 
-@pytest.mark.parametrize("algorithm", ["grpo", "opd"])
+@pytest.mark.parametrize("algorithm", ["grpo"])
 def test_warm_start_non_sft_cost_uses_the_authoritative_server_quote(
     tmp_path, monkeypatch, capsys, algorithm
 ):
-    """warm-start grpo/opd use submit preparation so the resolved source rank prices the quote."""
+    """warm-start grpo uses submit preparation so the resolved source rank prices the quote."""
     from flash.cli.commands.ops import train as commands
 
     client = _use_client(
@@ -1046,7 +975,7 @@ def test_warm_start_non_sft_cost_uses_the_authoritative_server_quote(
     monkeypatch.setenv("FLASH_STYLE", "1")
     monkeypatch.setenv("WARM_START_TOKEN", "server-only-secret")
     monkeypatch.delenv("WANDB_API_KEY", raising=False)
-    # group_size 2 is grpo's floor and is valid for opd too.
+    # group_size 2 is GRPO's floor.
     body = (
         SFT_TOML.replace('algorithm = "sft"', f'algorithm = "{algorithm}"')
         .replace(
@@ -1084,11 +1013,11 @@ def test_warm_start_non_sft_cost_uses_the_authoritative_server_quote(
     assert "provisional rank-1" not in captured.err
 
 
-@pytest.mark.parametrize("algorithm", ["grpo", "opd"])
+@pytest.mark.parametrize("algorithm", ["grpo"])
 def test_plain_non_sft_cost_uses_the_authoritative_server_quote(
     tmp_path, monkeypatch, capsys, algorithm
 ):
-    """ordinary grpo/opd use preparation so resolved revision and disk cannot change the quote."""
+    """ordinary grpo uses preparation so resolved revision and disk cannot change the quote."""
     from flash.cli.commands.ops import train as commands
 
     client = _use_client(monkeypatch, _QuotingClient({"estimated_cost_usd": 3.25}))

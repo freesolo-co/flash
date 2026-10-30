@@ -17,14 +17,14 @@ from flash.engine.profiling.workload_profile import (
 
 
 class UnknownPromptPoolSize(ValueError):
-    """Raised when a grpo/opd quote has no stated prompt-pool size to derive a horizon from."""
+    """Raised when a grpo quote has no stated prompt-pool size to derive a horizon from."""
 
 
 def _on_policy_epochs(spec) -> int:
     from flash.engine.plan.recipe import RECIPE
 
     t = spec.train
-    default = RECIPE.rl.num_epochs if spec.algorithm == "grpo" else RECIPE.opd.num_epochs
+    default = RECIPE.rl.num_epochs
     return int(t.epochs) if t.epochs is not None else default
 
 
@@ -54,7 +54,7 @@ def _on_policy_example_count(spec) -> int:
     """Retained prompts the run will iterate, from the one field that states a row count.
 
     Only ``[train] max_examples`` counts. It is a validated ``TrainSpec`` field the worker enforces
-    unconditionally as ``train[:max_examples]`` (rl/inputs.py:195, opd_train_runner.py:166), so it
+    unconditionally as ``train[:max_examples]`` (rl/inputs.py), so it
     is a real ceiling on the retained pool.
 
     ``[environment.params] max_examples`` is deliberately NOT read, in either direction. It is not a
@@ -86,9 +86,7 @@ def _on_policy_requested_prompts_per_step(spec) -> int:
     from flash.engine.plan.recipe import RECIPE
 
     t = spec.train
-    default = (
-        RECIPE.rl.prompts_per_step if spec.algorithm == "grpo" else RECIPE.opd.prompts_per_step
-    )
+    default = RECIPE.rl.prompts_per_step
     return max(1, int(t.prompts_per_step) if t.prompts_per_step is not None else default)
 
 
@@ -139,11 +137,11 @@ def spec_steps(spec) -> int:
     sft reads the horizon its workload profile measured: the profile already resolved epochs,
     retained rows, realized batch, and ``max_steps`` against the exact tokenized dataset, so
     re-deriving it here from the config would reintroduce the guess the profile exists to replace.
-    grpo/opd still derive passes over retained prompts, and positive ``max_steps`` replaces that
+    grpo still derives passes over retained prompts, and positive ``max_steps`` replaces that
     derived count -- so it is read first: a stated horizon needs no pool size to derive one from,
     and asking for a row count the answer does not depend on would reject a fully specified run.
     """
-    if spec.algorithm in ("grpo", "opd"):
+    if spec.algorithm == "grpo":
         pinned_horizon = int(spec.train.max_steps or 0)
         if pinned_horizon > 0:
             return pinned_horizon
@@ -164,21 +162,9 @@ def run_config_from_spec(spec) -> RunConfig:
     preserved so the quote matches the allocatable hardware contract.
     """
     t, g = spec.train, spec.gpu
-    # Both grpo and opd sample on-policy student completions, so both carry the rollout
+    # GRPO samples on-policy student completions, so carry the rollout
     # dimensions (completion length + group size) into the cost model.
     has_rollout = samples_on_policy(spec.algorithm)
-    # price the actual opd teacher the run will use. [train].teacher_model is the canonical friendly
-    # alias, so a higher/lower-priced teacher moves the itemized
-    # teacher-api estimate; "" means the default glm 5.2, and "" for sft/grpo (no teacher).
-    teacher_model = ""
-    opd_multi_turn = False
-    opd_max_turns = None
-    if spec.algorithm == "opd":
-        from flash.engine.plan.recipe import RECIPE
-        from flash.teacher.limits import configured_opd_turn_limit
-
-        teacher_model = t.teacher_model or RECIPE.opd.teacher_model
-        opd_multi_turn, opd_max_turns = configured_opd_turn_limit(spec.environment)
     profile = _sft_profile(spec) if spec.algorithm == "sft" else None
     return RunConfig(
         model_id=spec.model,
@@ -187,7 +173,7 @@ def run_config_from_spec(spec) -> RunConfig:
         seq_len=profile.max_length if profile is not None else t.max_context_tokens,
         completion_len=t.max_completion_tokens if has_rollout else None,
         # RunConfig.batch_size is the cost model's own name for "examples per optimizer update", and
-        # each algorithm reaches it by a different key: sft through the measured profile, grpo/opd
+        # each algorithm reaches it by a different key: sft through the measured profile, grpo
         # through the retained-prompt cap. reading t.batch_size for rl would always find None now and
         # silently price the recipe default, ignoring an authored batch.
         #
@@ -205,9 +191,6 @@ def run_config_from_spec(spec) -> RunConfig:
         group_size=t.group_size if has_rollout else None,
         lora_rank=t.lora_rank,
         thinking=spec.thinking,
-        teacher_model=teacher_model,
-        opd_multi_turn=opd_multi_turn,
-        opd_max_turns=opd_max_turns,
         provider=g.provider or "auto",
         # `g` is always a GpuSpec: `spec.gpu` is a typed field whose default_factory constructs one,
         # and `g.provider` / `g.type` / `g.count` / `g.max_wall_seconds` are read plainly right here,
@@ -275,6 +258,10 @@ def sft_ranking_overrides(spec) -> dict:
 
 def estimate_for_spec(spec, *, allocation=None) -> CostEstimate:
     """Cost estimate for a parsed spec, optionally pinned to the selected live candidate."""
+    if spec.algorithm == "custom":
+        from flash.custom.billing import estimate
+
+        return estimate(spec, allocation=allocation)
     return estimate_cost(run_config_from_spec(spec), allocation=allocation)
 
 

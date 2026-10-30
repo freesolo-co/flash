@@ -1140,7 +1140,7 @@ def test_causal_conv1d_is_required_not_best_effort_in_the_image():
 
     It used to be best-effort in both interpreters, on the premise that a failed build meant "gdn
     trains unpacked". That premise is dead: every catalog model is a gdn hybrid, and
-    ``require_gdn_boundary_resets`` RAISES for grpo/opd when the child cannot reset, because the old
+    ``require_gdn_boundary_resets`` RAISES for grpo when the child cannot reset, because the old
     padded fallback dies at ``padding.py:144`` against the hardcoded ``use_fused_kernels=True``. A
     conv-less image therefore does not degrade -- it fails those runs after paying for a gpu.
 
@@ -1183,7 +1183,7 @@ def test_venv_sanity_block_uses_no_cuda_gated_probe():
 
     The build asserts what a cpu can prove (importable, and fla >= the 0.2.2 the probe demands). The
     cuda-gated capability is asserted where a device exists: the child probe feeding
-    ``require_gdn_boundary_resets``, which raises for grpo/opd before a step runs.
+    ``require_gdn_boundary_resets``, which raises for grpo before a step runs.
     """
     import pathlib
 
@@ -1777,9 +1777,9 @@ def test_no_except_handler_supplies_a_fallback_gdn_hybrid():
     import ast
     import inspect as _inspect
 
-    from flash.engine.worker.train.entry import opd_train, rl_train, sft_train
+    from flash.engine.worker.train.entry import rl_train, sft_train
 
-    for module in (sft_train, opd_train, rl_train):
+    for module in (sft_train, rl_train):
         tree = ast.parse(_inspect.getsource(module))
         for handler in (n for n in ast.walk(tree) if isinstance(n, ast.ExceptHandler)):
             assigned = {
@@ -1807,9 +1807,9 @@ def test_each_path_resolves_the_gdn_arch_question_exactly_once():
     import ast
     import inspect as _inspect
 
-    from flash.engine.worker.train.entry import opd_train, rl_train, sft_train
+    from flash.engine.worker.train.entry import rl_train, sft_train
 
-    for module in (sft_train, opd_train, rl_train):
+    for module in (sft_train, rl_train):
         tree = ast.parse(_inspect.getsource(module))
         calls = [
             node
@@ -1836,15 +1836,14 @@ def test_every_algorithm_records_whether_gdn_boundary_resets_engaged():
     """
     import inspect as _inspect
 
-    from flash.engine.worker.train.entry import opd_train, rl_train, sft_train
+    from flash.engine.worker.train.entry import rl_train, sft_train
 
-    # grpo renders its run metadata in train.rl.verl_config and opd in train.opd.overrides, so
+    # GRPO renders its run metadata in train.rl.launch.verl_config, so
     # each trainer's source is its module plus wherever its notes are built.
-    from flash.engine.worker.train.opd.orchestration import overrides as opd_overrides
     from flash.engine.worker.train.rl.launch import verl_config as rl_verl_config
 
-    extra = {"rl_train": rl_verl_config, "opd_train": opd_overrides}
-    for module in (sft_train, opd_train, rl_train):
+    extra = {"rl_train": rl_verl_config}
+    for module in (sft_train, rl_train):
         source = _inspect.getsource(module)
         if module.__name__.rsplit(".", 1)[-1] in extra:
             source += _inspect.getsource(extra[module.__name__.rsplit(".", 1)[-1]])
@@ -1893,7 +1892,7 @@ def test_sft_remove_padding_is_ungated_tensor_layout():
     )
 
 
-def test_grpo_and_opd_do_not_launch_into_the_unrunnable_padded_fallback():
+def test_grpo_do_not_launch_into_the_unrunnable_padded_fallback():
     """A gdn hybrid whose child cannot reset boundaries must fail AT THE GATE, not mid-run.
 
     The padded fallback (`use_remove_padding=False`) is boundary-correct but cannot complete a step
@@ -1906,7 +1905,7 @@ def test_grpo_and_opd_do_not_launch_into_the_unrunnable_padded_fallback():
     import inspect as _inspect
     import textwrap as _textwrap
 
-    from flash.engine.worker.train.entry import backend_common, opd_train, rl_train, sft_train
+    from flash.engine.worker.train.entry import backend_common, rl_train, sft_train
 
     # the gate lives in one shared helper, so the assertions split: the helper must raise, and each
     # affected algorithm must route through it rather than re-deriving a decision of its own.
@@ -1926,7 +1925,7 @@ def test_grpo_and_opd_do_not_launch_into_the_unrunnable_padded_fallback():
         "without resets has no exit but the raise."
     )
 
-    for module in (opd_train, rl_train):
+    for module in (rl_train,):
         src = _inspect.getsource(module)
         assert "require_gdn_boundary_resets(" in src, (
             f"{module.__name__} no longer routes its gdn decision through the raising gate, so it "
@@ -1939,7 +1938,7 @@ def test_grpo_and_opd_do_not_launch_into_the_unrunnable_padded_fallback():
             "alongside the use_fused_kernels=True this recipe also sets."
         )
 
-    # sft is conditional where grpo/opd are unconditional, and the condition is the whole point: a
+    # sft is conditional where grpo are unconditional, and the condition is the whole point: a
     # packed gdn profile has packed neighbours to contaminate, so it must take the raising gate. the
     # control-plane gate cannot answer this because it is device-independent by construction, so it
     # proves the kernels are installed, never that the conv kernel runs on this
@@ -2324,7 +2323,7 @@ def test_attempt_contexts_keep_identity_uploads_and_heartbeat_progress_independe
     first_env = {"RUN_ID": "first", "HF_REPO": "owner/first", "PHASE": "sft", "SEED": "7"}
     first = WorkerContext.from_env(first_env)
     second = WorkerContext.from_env(
-        {"RUN_ID": "second", "HF_REPO": "owner/second", "PHASE": "opd", "ATTEMPT": "2"}
+        {"RUN_ID": "second", "HF_REPO": "owner/second", "PHASE": "rl", "ATTEMPT": "2"}
     )
     first_env["RUN_ID"] = "mutated-after-construction"
     monkeypatch.setenv("RUN_ID", "unrelated-process-value")
@@ -2339,7 +2338,7 @@ def test_attempt_contexts_keep_identity_uploads_and_heartbeat_progress_independe
     worker_heartbeat.heartbeat("sft_step", step=1, context=first)
     assert [(repo, path) for repo, path, _ in uploads[:2]] == [
         ("owner/first", "sft/first/heartbeat.json"),
-        ("owner/second", "opd/second/heartbeat.json"),
+        ("owner/second", "rl/second/heartbeat.json"),
     ]
     assert uploads[0][2]["seed"] == 7
     assert uploads[1][2]["attempt"] == 2

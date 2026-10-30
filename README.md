@@ -1,6 +1,6 @@
 # Flash
 
-LoRA post-training for open-weight models: SFT, GRPO, and on-policy distillation. You
+LoRA post-training for open-weight models: SFT and GRPO. You
 describe a run in a TOML file, Flash allocates a GPU, trains, streams checkpoints, and
 serves the resulting adapter.
 
@@ -109,6 +109,26 @@ export HF_TOKEN=hf_...
 flash models export --adapter-id RUN_ID/final --repository your-org/your-repo
 ```
 
+To download adapter files directly, use the run owner's existing API key. No user
+Hugging Face token or destination repository is needed:
+
+```bash
+curl --fail --get "https://flash.freesolo.co/v1/runs/$RUN_ID/adapter" \
+  -H "Authorization: Bearer $FREESOLO_API_KEY" \
+  --data-urlencode "checkpoint_id=$RUN_ID/final" \
+  --output adapter.zip
+```
+
+The checkpoint is required: use `RUN_ID/final` for a finished run or an available
+`RUN_ID/step-N` checkpoint. The ZIP contains normalized PEFT configuration and safetensors
+weights, plus `manifest.json` (`flash-adapter-download-v1`) with run/checkpoint identity,
+base-model and artifact-source revisions, and each file's byte count and SHA-256.
+`X-Flash-Run-Id`, `X-Flash-Checkpoint-Id`, and `X-Flash-Adapter-Sha256` response headers
+identify the archive. Verify the requested checkpoint and archive/file hashes before
+loading. Artifact-storage credentials remain on the control plane, and downloads do not
+create Hugging Face repositories. Downloads use private, non-cacheable responses and
+are limited to 8 GiB of adapter files.
+
 There are no built-in task environments — the environment you push defines the task.
 Single-turn and bounded multi-turn environments are supported.
 
@@ -121,6 +141,71 @@ requiring finished responses. By default, length-limited responses are masked, i
 when `stop_sequences` is configured. Responses that actually finish on a stop string remain
 trainable. This option is not supported for multi-turn environments, whose actions must
 be complete and usable.
+
+### Token probabilities in GRPO reward functions
+
+Single-turn SDK scorers can read `response_text.rollout_context` from the string
+passed to `score_response` (or each string in `score_responses`). Existing string
+operations and callback signatures are unchanged. Multi-turn scorers receive the
+same context in `episode.metadata["rollout_context"]`. Flash-native environment
+callbacks can read `state["rollout_context"]`.
+
+The optional `RolloutContext` contains `policy` (including `policy_version`, base
+revision and tokenizer/template digests), `optimizer_step`, `sample_index`,
+`rollout_ordinal`, `logprob_definition`, and an ordered tuple of `turns`. Each turn has:
+
+- `prompt_token_ids`: the exact token prefix used for this generation.
+- `token_ids` and `token_logprobs`: aligned tuples of generated token IDs and their
+  natural-log probabilities, captured during rollout generation.
+- `sampling`: effective engine sampling parameters, including temperature and
+  truncation settings; `finish_reason`: `stop` or `length`.
+
+These are complete engine generations, including reasoning and special/stop tokens,
+before text cleanup or loss masking. They need not match the answer-only string's
+tokenization. Environment replies occur in subsequent prompts, never as generated
+tokens with fabricated probabilities. Multi-turn contexts also include generated
+turns rejected as unusable by the environment; they are not a loss mask or a list of
+only scoreable actions. Image-conditioned generations carry token prefixes, not image
+payloads; a separate target scorer must also receive the original image context.
+
+`logprob_definition` explicitly distinguishes `raw_logprobs` (model distribution)
+from `processed_logprobs` (after the engine's sampling transformations). Do not treat
+raw probabilities as the sampling distribution when temperature, top-p or other
+processors change it. These are ordinary numbers with no gradient connection.
+Only sampled-token probabilities are provided, not vocabulary distributions or
+scores for arbitrary target tokens.
+
+For example, a probabilistic speculative-decoding reward can combine draft logprobs
+with a separately implemented target scorer:
+
+```python
+import math
+
+
+def expected_accepted_prefix(draft_logprobs, target_logprobs):
+    prefix_probability = 1.0
+    expected_tokens = 0.0
+    for draft, target in zip(draft_logprobs, target_logprobs, strict=True):
+        prefix_probability *= math.exp(min(0.0, target - draft))
+        expected_tokens += prefix_probability
+    return expected_tokens
+
+
+# Inside score_response(example, response_text):
+context = getattr(response_text, "rollout_context", None)
+if context is not None:
+    turn = context.turns[0]
+    # Score turn.token_ids with your target at the SAME prefixes/tokenization,
+    # using the intended target distribution. Draft probabilities must describe
+    # the actual proposal distribution; inspect context.logprob_definition.
+```
+
+The target-scoring call is user supplied. Greedy speculative decoding instead uses
+token-prefix agreement. A policy-dependent reward is frozen during each GRPO update;
+this alone does not implement an exact differentiable acceptance-rate objective.
+Context is absent for replay/echo evaluation and other paths without generation
+metadata. Handle that explicitly; Flash never reconstructs probabilities from text.
+Converting a scorer input with `str(response_text)` drops its structured attributes.
 
 ### Calling a deployed adapter from your own app
 
@@ -204,7 +289,7 @@ into `dev`**.
 - `tests/` — pytest suite, CPU-only and offline
 
 Within `flash/engine/worker/`, trainers live under `train/`, split by algorithm (`sft/`,
-`rl/`, `opd/`) over a shared `core/`. Each carries a `child/` holding stdlib-only modules
+`rl/`) over a shared `core/`. Each carries a `child/` holding stdlib-only modules
 **copied** into the verl subprocess rather than imported — flash and verl pin incompatible
 torch/vllm versions, so neither can import the other.
 

@@ -30,6 +30,8 @@ from flash.engine.worker.train.entry.backend_common import BoundedThreadingHTTPS
 from flash.engine.worker.train.entry.score_batcher import ScoreBatcher
 from flash.engine.worker.train.rl.rollout.scoring import RolloutScoreRequest, score_rollouts
 from flash.engine.worker.verl.parent_work import ParentWorkGauge
+from flash.envs.scoring.context import RolloutContext
+from flash.envs.scoring.response import ScoredResponseText
 
 # how many concurrently-finished episodes the multi-turn bridge scores in ONE env call. a whole
 # generation is prompts_per_step * group_size episodes and they finish at different turn counts,
@@ -98,6 +100,18 @@ def _request_field(payload: dict, key: str):
         return payload[key]
     except KeyError as exc:
         raise _BadRequest(f"missing required field {key!r}") from exc
+
+
+def _reward_context(payload: dict) -> RolloutContext | None:
+    value = payload.get("rollout_context")
+    if value is None:
+        return None
+    try:
+        context = RolloutContext.decode(value)
+        context.validate_identity(payload.get("identity") or {})
+        return context
+    except (ValueError, TypeError, KeyError, AttributeError) as exc:
+        raise _BadRequest(f"invalid reward context: {exc}") from exc
 
 
 def request_int(payload: dict, key: str) -> int:
@@ -293,7 +307,6 @@ class MultiTurnBridge:
         A regression that ended every episode after one turn still produces finite gradients, a
         nonzero adapter delta, and complete artifacts -- every existing gate stays green while the
         environment's multi-turn contract is silently dead. These counters make that visible.
-        OPD already publishes the same pair as `episodes_seen` / `mt_turn_records`.
         """
         with self._lock:
             episodes = self._scored_episodes
@@ -468,7 +481,6 @@ class MultiTurnBridge:
             response_ids = [int(token_id) for token_id in payload.get("response_ids", [])]
             completion_text = str(payload.get("completion_text") or "")
             session["next_turn"] += 1
-            # an unusable turn is terminal and must not be shown to the env or teacher.
             if bool(payload.get("truncated")) or str(payload.get("skip_reason") or ""):
                 session["aborted_turn"] = {
                     "role": "assistant",
@@ -494,8 +506,6 @@ class MultiTurnBridge:
             replies = self._env_call("env_reply", list(state.get("messages") or ()), state)
             terminal = bool(self._env_call("rollout_done", state, self._max_turns))
             if terminal:
-                # terminal replies remain available to environment scoring but are never actor or
-                # teacher context, so their media is deliberately neither normalized nor transported.
                 session["required_prefix"] = next_prefix
                 return self._step_response(
                     session,
@@ -553,9 +563,12 @@ class MultiTurnBridge:
 
     def score(self, payload: dict) -> dict:
         turn_count = request_int(payload, "turn_count")
+        rollout_context = _reward_context(payload)
         with self._lock:
             session = self._session(payload)
             state = session["state"]
+            if rollout_context is not None:
+                state = dict(state, rollout_context=rollout_context)
             expected_identity = session.get("identity")
         if self._identity_ledger is not None:
             identity = self._identity_ledger.validate_for_index(
@@ -724,6 +737,13 @@ def start_reward_server(
         if index < 0 or index >= example_count:
             raise _BadIndex(f"reward example index {index} is outside [0, {example_count})")
         solution_str = payload.get("solution_str", "")
+        rollout_context = _reward_context(payload)
+        if rollout_context is not None:
+            if rollout_context.sample_index != index:
+                raise _BadRequest("reward context does not match example index")
+            solution_str = ScoredResponseText(
+                solution_str, raw=solution_str, thinking=None, rollout_context=rollout_context
+            )
         if identity_ledger is not None:
             identity_ledger.record(payload.get("identity"), index)
         if score_batcher is not None:

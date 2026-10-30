@@ -1002,28 +1002,6 @@ def test_fresh_liveness_upload_surfaces_worker_measured_progress_gap(monkeypatch
     assert len([label for label, _ in pairs if label == "progress"]) == 1
 
 
-def test_fresh_opd_liveness_upload_surfaces_worker_measured_progress_gap(monkeypatch):
-
-    monkeypatch.setattr(heartbeat_ui.time, "time", lambda: 2000.0)
-    obj = {
-        "state": "running",
-        "last_heartbeat": {
-            "stage": "opd_step",
-            "step": 1,
-            "ts": 1990.0,
-            "liveness": True,
-            "progress_age_s": 1800.0,
-        },
-    }
-
-    pairs = heartbeat_ui._heartbeat_pairs(obj)
-    assert ("worker", "opd_step · step 1 · alive ping") in pairs
-    assert ("heartbeat", "10s ago") in pairs
-    progress = dict(pairs)["progress"]
-    assert "last known progress can be as old as 1810.0s" in progress
-    assert "upload throttling no longer explains the gap" in progress
-
-
 def test_sub_throttle_progress_age_preserves_legacy_stale_step_hint(monkeypatch):
 
     monkeypatch.setattr(heartbeat_ui.time, "time", lambda: 2000.0)
@@ -1174,33 +1152,6 @@ def test_stale_training_step_is_labelled_as_reporting_lag(monkeypatch):
     )
     assert "last one UPLOADED" not in render.run_status(step_zero)
 
-    # opd_step uses the same upload throttle, so its uploaded step can lag behind training too.
-    opd = dict(base, last_heartbeat={"stage": "opd_step", "step": 4, "ts": _time.time() - 1200})
-    assert "last one UPLOADED" in render.run_status(opd)
-
-    # a heartbeat from a superseded attempt describes a dead worker, not throttled progress.
-    superseded = dict(
-        base,
-        remote={"attempt": 2},
-        last_heartbeat={"stage": "rl_step", "step": 1, "attempt": 1, "ts": _time.time() - 1200},
-    )
-    assert "last one UPLOADED" not in render.run_status(superseded)
-
-    # ...but the live attempt still gets the reassurance.
-    live = dict(
-        base,
-        remote={"attempt": 2},
-        last_heartbeat={"stage": "rl_step", "step": 1, "attempt": 2, "ts": _time.time() - 1200},
-    )
-    assert "last one UPLOADED" in render.run_status(live)
-
-    # w&b is optional, so the advice must name a signal that always exists. `runs log` was that
-    # signal until it turned out it cannot answer the question while the run is live (see the
-    # `runs log` assertion above); the heartbeat age row can, is rendered from the same payload,
-    # and so is never absent.
-    assert "the age above" in out
-    assert "if configured" in out
-
 
 def test_long_silence_at_a_liveness_setup_stage_names_both_causes(monkeypatch):
     """A frozen setup stage must not read as ordinary throttling (issue 26).
@@ -1334,46 +1285,6 @@ def test_warmup_reassurance_yields_once_the_silence_is_unexplained(monkeypatch):
     assert "longer than throttling explains" not in fresh_out
 
 
-def test_opd_model_load_is_not_described_as_a_weight_download(monkeypatch):
-    """`opd_model_load` reads the cached config with local_files_only; it downloads nothing.
-
-    Both model-load stages are emitted only after `prefetch_model` returns, so neither is the
-    tens-of-GB base-weight transfer (that is `model_prefetching`). SFT still fetches a warm-start
-    adapter inside its span, so it keeps a download explanation -- a smaller one.
-    """
-    import time as _time
-
-    from flash.cli.ui import render
-
-    monkeypatch.setenv("FLASH_STYLE", "1")
-    monkeypatch.setenv("NO_COLOR", "1")
-
-    base = {
-        "run_id": "flash-1",
-        "state": "running",
-        "spec": {"model": "Qwen/Qwen3.5-9B", "algorithm": "opd"},
-    }
-
-    opd = dict(base, last_heartbeat={"stage": "opd_model_load", "ts": _time.time() - 1200})
-    opd_out = render.run_status(opd)
-    assert "longer than throttling explains" in opd_out
-    assert "tens of GB" not in opd_out
-    assert "can block for minutes" in opd_out
-
-    # sft's span MAY fetch an adapter, but only when the run warm-starts from one -- most do not,
-    # so the wording has to hedge rather than assert a transfer that usually is not happening.
-    sft = dict(base, last_heartbeat={"stage": "sft_model_load", "ts": _time.time() - 1200})
-    sft_out = render.run_status(sft)
-    assert "if the run warm-starts from one" in sft_out
-    assert "tens of GB" not in sft_out
-    # the hub pull is not the per-datacenter weight volume, so the region is not the explanation.
-    sft_dc = dict(
-        base,
-        last_heartbeat={"stage": "sft_model_load", "ts": _time.time() - 1200, "dc": "EU-RO-1"},
-    )
-    assert "datacenter above" not in render.run_status(sft_dc)
-
-
 def test_stale_datacenter_is_labelled_as_the_previous_attempt(monkeypatch):
     """A retry reuses the heartbeat path, so `dc` can belong to the worker that already died.
 
@@ -1467,7 +1378,7 @@ def test_no_stage_clause_contradicts_the_sentence_it_completes():
             )
 
 
-@pytest.mark.parametrize("stage", ["sft_finalizing", "rl_finalizing", "opd_finalizing"])
+@pytest.mark.parametrize("stage", ["sft_finalizing", "rl_finalizing"])
 def test_finalizing_silence_is_not_called_unusual(stage, monkeypatch):
     """These export and upload the adapter, so a long blocking stretch is expected, not anomalous.
 

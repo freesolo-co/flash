@@ -6,8 +6,6 @@ framework-init block and add no GRPO reward-function latency term.
 
 from __future__ import annotations
 
-import math
-
 from flash.cost.facts import (
     GPU_COMPUTE_TFLOPS,
     _catalog_model_info,
@@ -17,22 +15,16 @@ from flash.cost.facts import (
     gpu_vram_gb,
     has_nvlink,
     model_quant,
-    teacher_seconds_per_completion,
-    teacher_token_cost_usd,
     total_params_b,
 )
 from flash.cost.types import CostEstimate, RunConfig
 from flash.engine.plan.steps import rl_data_parallel_cards, sft_data_parallel_cards
 from flash.providers.core.allocator import geometry_safe_gpu_cap, required_vram_gb, vram_headroom
-from flash.teacher.limits import OPD_TEACHER_SCORING_CONCURRENCY, opd_teacher_request_multiplier
 
 # FLOPs per token per active-parameter.
 SFT_FLOPS_PER_TOKEN_PER_PARAM = 6.0  # forward (2) + backward (4)
 GRPO_GEN_FLOPS_PER_TOKEN_PER_PARAM = 2.0  # autoregressive rollout forward
 GRPO_UPDATE_FLOPS_PER_TOKEN_PER_PARAM = 8.0  # policy fwd+bwd (6) + frozen-ref fwd (2)
-# OPD's update is policy fwd+bwd ONLY (6): the teacher's per-token logprobs come from the
-# parasail api, so there is no local frozen-reference forward (grpo's extra 2).
-OPD_UPDATE_FLOPS_PER_TOKEN_PER_PARAM = 6.0
 
 MFU_TRAIN = 0.35  # GRPO policy/reference update
 MFU_SFT_TRAIN = 0.25  # SFT fwd/bwd (smaller effective batch, long sequences)
@@ -94,9 +86,7 @@ def sft_step_floor_seconds(steps: int) -> float:
 def _step_floor_seconds_for(config: RunConfig, gpu: str) -> float:
     """Step-floor seconds ``config`` pays on ``gpu``; 0 for sft, which runs no rollout."""
     n = config.normalized()
-    if n.is_opd:
-        completions, _seq_tokens = _opd_step_shape(n)
-    elif n.is_grpo:
+    if n.is_grpo:
         completions = n.batch_size * n.group_size
     else:
         return 0.0
@@ -108,12 +98,12 @@ def _step_floor_seconds_for(config: RunConfig, gpu: str) -> float:
 # small batch. price MoE on total params with reduced MFU, per-step overhead, and one-time compile;
 # dense models retain the active-param path.
 MFU_SFT_TRAIN_MOE = 0.10  # MoE SFT fwd/bwd priced on total params
-MFU_TRAIN_MOE = 0.09  # MoE GRPO/OPD policy update priced on total params
+MFU_TRAIN_MOE = 0.09  # MoE GRPO policy update priced on total params
 MOE_STEP_OVERHEAD_S = 2.0  # routing/dispatch/kernel-launch overhead an MoE pays every step
 # One-time kernel/graph compile amortized into the first training step (fused Triton kernels;
 # + vLLM cudagraph capture for rollout methods). MoE-only; the prior model omitted it entirely.
 COMPILE_MOE_SFT_S = 35.0
-COMPILE_MOE_ROLLOUT_S = 48.0  # GRPO / OPD (adds vLLM cudagraph capture)
+COMPILE_MOE_ROLLOUT_S = 48.0  # GRPO (adds vLLM cudagraph capture)
 
 # cold-start seconds are empirically calibrated from a fresh worker. model load dominates short
 # jobs: MODEL_LOAD_BASE_S covers fixed deserialize/init work; download scales with checkpoint size.
@@ -123,13 +113,9 @@ MODEL_LOAD_BASE_S = 235.0  # fixed checkpoint deserialize + GPU placement + fram
 VLLM_INIT_S = 120.0
 DOWNLOAD_RATE_GBPS = 0.4  # effective hf snapshot download, on top of the base load
 
-# synchronous required saves serialize the lora state and publish it. sft/grpo make two hf commits
-# per save (deployable adapter plus resume checkpoint); opd publishes a single deployable adapter.
-# price a per-commit floor plus a conservative model-size/rank serialize term. this changes wall/cost
-# only, never optimizer steps.
 REQUIRED_SAVE_COMMIT_FLOOR_S = 7.5
 REQUIRED_SAVE_S_PER_MODEL_B_AT_RANK32 = 1.5
-_REQUIRED_SAVE_COMMITS = {"sft": 2, "grpo": 2, "opd": 1}
+_REQUIRED_SAVE_COMMITS = {"sft": 2, "grpo": 2}
 
 DEFAULT_WALL_CAP_S = 24 * 3600  # spec gpu.max_wall_seconds default
 
@@ -158,16 +144,8 @@ def setup_seconds(config: RunConfig) -> float:
     return s
 
 
-def _opd_step_shape(n: RunConfig) -> tuple[int, float]:
-    """(completions per step, prompt+completion tokens per step) for one OPD step, from a NORMALIZED
-    config. completions = batch x group; each is billed over the FULL prompt+completion length
-    (not completion-only) since the loss forward runs model(prompt_ids + student_ids)."""
-    completions = n.batch_size * n.group_size
-    return completions, completions * float(n.seq_len)
-
-
 def required_save_overhead_seconds(config: RunConfig) -> float:
-    """Conservative synchronous required-save wall time for exact save_at_steps (sft/grpo/opd)."""
+    """Conservative synchronous required-save wall time for exact save_at_steps (sft/grpo)."""
     commits = _REQUIRED_SAVE_COMMITS.get(config.method, 0)
     if not commits or not config.save_at_steps:
         return 0.0
@@ -266,7 +244,7 @@ def executed_gpu_count(config: RunConfig, gpu_count: int) -> int:
     the offline shape search below. They must not answer it separately: the quote reporting a shape
     the allocator then rejects tells a user a run is feasible and priced, and then refuses it at
     submit. Every algorithm shards by data, so every width is bounded by the work one step holds --
-    rows for sft, sequences (prompts times group) for grpo and opd. Mirrors
+    rows for sft, sequences (prompts times group) for grpo. Mirrors
     ``allocator._executed_gpu_count``; the two are one rule stated on each side of the quote.
     """
     n = config.normalized()
@@ -297,7 +275,6 @@ def sharded_step_seconds(config: RunConfig, gpu: str, gpu_count: int, provider: 
 def step_seconds_split(config: RunConfig, gpu: str) -> tuple[float, float]:
     """Return ``(gpu-bound, gpu-independent)`` seconds for one optimizer step.
 
-    Remote OPD scoring stays fixed across cards; hardware ranking shards only the gpu-bound half.
     ``seconds_per_step`` is their sum.
     """
     n = config.normalized()
@@ -313,35 +290,6 @@ def step_seconds_split(config: RunConfig, gpu: str) -> tuple[float, float]:
     overhead = MOE_STEP_OVERHEAD_S if moe else 0.0
     sft_mfu = MFU_SFT_TRAIN_MOE if moe else MFU_SFT_TRAIN
     update_mfu = MFU_TRAIN_MOE if moe else MFU_TRAIN
-
-    if n.is_opd:
-        # opd step = on-policy student rollout (like grpo) + remote teacher scoring (concurrent
-        # parasail round-trips, replaces reward grading) + policy update (fwd+bwd only, no local
-        # reference forward - the teacher is the api). bill local compute on the full prompt+completion
-        # sequence (see _opd_step_shape), not completion-only, or long-prompt opd is underquoted.
-        completions, seq_tokens = _opd_step_shape(n)
-        gen_s = (GRPO_GEN_FLOPS_PER_TOKEN_PER_PARAM * params * seq_tokens) / (peak * MFU_DECODE)
-        update_s = (OPD_UPDATE_FLOPS_PER_TOKEN_PER_PARAM * params * seq_tokens) / (
-            peak * update_mfu
-        )
-        teacher_lat = teacher_seconds_per_completion()
-        request_multiplier = opd_teacher_request_multiplier(
-            multi_turn=n.opd_multi_turn,
-            max_turns=n.opd_max_turns,
-        )
-        score_items = completions * request_multiplier
-        # conservative retry-and-turn wave policy: every potentially scored request consumes one slot,
-        # including bounded no-signal replacement attempts and every bounded multi-turn assistant turn.
-        # the worker and broker enforce the same shared concurrency ceiling.
-        teacher_waves = math.ceil(score_items / OPD_TEACHER_SCORING_CONCURRENCY)
-        teacher_s = teacher_waves * teacher_lat
-        # unvalidated extrapolation: the floor was fitted only on grpo. opd uses the same rollout
-        # engine, weight sync, and checkpointing, but no matched opd campaign has confirmed these
-        # constants; its larger floor share increases the uncertainty.
-        floor_s = step_floor_seconds(gpu, completions)
-        # the teacher is a remote api: its latency is identical on every card, so it is the part of an
-        # opd step that a faster or more numerous gpu cannot shorten.
-        return gen_s + update_s + floor_s, overhead + teacher_s
 
     if not n.is_grpo:
         flops = SFT_FLOPS_PER_TOKEN_PER_PARAM * params * (n.batch_size * n.seq_len)
@@ -729,19 +677,7 @@ def _notes(
     notes: list[str] = []
     if (quant := model_quant(n.model_id)) != "bf16":
         notes.append(f"{quant}: smaller VRAM footprint -> cheaper GPU class fits")
-    if n.is_opd:
-        comps, _ = _opd_step_shape(n)
-        tsec = teacher_seconds_per_completion()
-        from flash.engine.plan.recipe import resolve_teacher
-
-        teacher_name = resolve_teacher(n.teacher_model).display_name
-        notes.append(
-            f"opd step = student rollout of {n.batch_size}x{n.group_size}={comps} completions "
-            f"@ {n.completion_len} tok + {teacher_name} teacher scoring "
-            f"({tsec:.2f}s/request, {OPD_TEACHER_SCORING_CONCURRENCY} concurrent) + policy "
-            "update (no local reference forward)"
-        )
-    elif n.is_grpo:
+    if n.is_grpo:
         comps = n.batch_size * n.group_size
         notes.append(
             f"GRPO step = vLLM rollout of {n.batch_size}x{n.group_size}={comps} completions "
@@ -814,7 +750,7 @@ def estimate_cost(
     # synchronous fixed overhead; neither is divided by the number of cards.
     compile_s = compile_seconds(config, gpu)
     # setup_seconds is excluded for every method. the separately identifiable sft framework-init
-    # block is excluded here too; grpo/opd retain their aggregate recurring-work floor because its
+    # block is excluded here too; grpo retains its aggregate recurring-work floor because its
     # calibration cannot safely split synchronization, checkpointing, and any in-train init.
     sft_floor_s = sft_step_floor_seconds(config.steps) if config.method == "sft" else 0.0
     raw_train = compile_s + config.steps * sps + required_save_s + sft_floor_s
@@ -834,27 +770,6 @@ def estimate_cost(
     train = max(0.0, cap_s - setup) if wall_capped else raw_train
     wall = setup + train
 
-    # opd: add the external parasail teacher token spend. the teacher echo-scores every
-    # sampled completion (input ~ prompt+completion per completion), so bill input tokens over the
-    # effective (wall-capped) step count - not the uncapped `steps` - so a wall-capped run's teacher
-    # bill tracks the GPU time it is actually billed for.
-    teacher_api_usd = 0.0
-    if config.is_opd:
-        n = config.normalized()
-        effective_steps = (train / sps) if sps > 0 else config.steps
-        completions_per_step, tokens_per_step = _opd_step_shape(n)
-        request_multiplier = opd_teacher_request_multiplier(
-            multi_turn=n.opd_multi_turn,
-            max_turns=n.opd_max_turns,
-        )
-        teacher_input_tokens = effective_steps * tokens_per_step * request_multiplier
-        teacher_output_tokens = effective_steps * completions_per_step * request_multiplier
-        teacher_api_usd = teacher_token_cost_usd(
-            teacher_input_tokens,
-            teacher_output_tokens,
-            config.teacher_model,
-        )
-
     return CostEstimate(
         model_id=config.model_id,
         method=config.method,
@@ -873,10 +788,6 @@ def estimate_cost(
         # the width the run LAUNCHES on, which a small batch can bound below the billed count.
         # billing follows the rented cards; the vram a shape offers follows the ranks that join.
         executed_gpu_count=executed_gpu_count(config, billed_gpu_count),
-        # total_usd is the customer gpu charge. the platform-owned teacher spend is itemized
-        # only as a diagnostic and is not passed through to the customer. an n-card job occupies
-        # n cards for the billed training wall, so the charge scales linearly with gpu_count.
         total_usd=train / 3600.0 * hourly * billed_gpu_count,
-        teacher_api_usd=teacher_api_usd,
         notes=_notes(config, raw_train, wall_capped, cap_s),
     )

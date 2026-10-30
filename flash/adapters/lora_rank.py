@@ -549,7 +549,7 @@ def serving_completion_token_capacity(spec: JobSpec, *, prompt_allowance: int) -
 def _effective_train_context(
     spec: JobSpec, *, completion_tokens: int | None = None
 ) -> tuple[int, str] | None:
-    from flash.engine.plan.vram import grpo_rollout_seq_len, opd_rollout_seq_len
+    from flash.engine.plan.vram import grpo_rollout_seq_len
 
     max_completion_tokens = (
         completion_tokens if completion_tokens is not None else spec.train.max_completion_tokens
@@ -564,18 +564,6 @@ def _effective_train_context(
             (
                 "train.max_context_tokens / train.max_completion_tokens "
                 "(GRPO rollout prompt+completion)"
-            ),
-        )
-    if spec.algorithm == "opd":
-        return (
-            opd_rollout_seq_len(
-                spec.train.max_context_tokens or 0,
-                max_completion_tokens,
-                spec.thinking,
-            ),
-            (
-                "train.max_context_tokens / train.max_completion_tokens "
-                "(OPD rollout prompt+completion)"
             ),
         )
     effective = int(spec.train.max_context_tokens or 0)

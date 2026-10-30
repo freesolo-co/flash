@@ -18,6 +18,7 @@ from flash.providers.core.base import (
     _run_cost_key,
     authored_gpu_ceiling,
     canonical_gpu,
+    custom_gpu_shape,
     largest_rentable_count,
     providers_for,
     rentable_gpu_counts,
@@ -62,6 +63,11 @@ def required_vram_gb(
     model_revision: str = "",
 ) -> int:
     """VRAM required for the full run, sized to actual knobs via model_required_vram_gb."""
+    if algorithm == "custom":
+        from flash.core.catalog import CUSTOM_TRAINING_GPUS
+
+        custom_gpu_shape(model_id, "", (), None)
+        return min(GPU_INFO[gpu].vram_gb for gpu in CUSTOM_TRAINING_GPUS[model_id])
     from flash.engine.plan.vram import model_required_vram_gb
 
     return model_required_vram_gb(
@@ -114,6 +120,8 @@ def _step_cost_ranker(model_id, algorithm, train, thinking, model_revision="", o
     single-card paths (parse-time provisional, cost estimate) have no notion of: a combination
     bills every card but only the gpu-bound half of a step is divided among them.
     """
+    if algorithm == "custom":
+        return None  # arbitrary local work has no recipe-derived step-time prediction.
     cost_key = _run_cost_key(
         model_id,
         algorithm,
@@ -145,7 +153,7 @@ def _step_cost_ranker(model_id, algorithm, train, thinking, model_revision="", o
             # agree exactly whenever one card is enough.
             return cost_key(candidate.gpu, candidate.hourly_usd)
         # scaling is per-class (an nvlink pair keeps ~0.88 of linear per card, a pcie pair ~0.71),
-        # and for grpo/opd the step floor is only ~80% shardable -- sharded_step_seconds owns both,
+        # and for grpo the step floor is only ~80% shardable -- sharded_step_seconds owns both,
         # so ranking cannot drift from the quote the run is actually billed against. the candidate's
         # provider is part of that: it is what decides whether the combination gets nvlink credit,
         # and `config` here is the ranking config, which carries no provider at all.
@@ -178,11 +186,11 @@ def _executed_gpu_count(algorithm: str, train, overrides, gpu_count: int) -> int
     every rows-bound narrowing.
 
     Both branches are the same rule -- verl divides the batch across dp ranks, so a rank with no
-    share cannot launch -- over each algorithm's own unit of work: sft counts rows, grpo/opd count
+    share cannot launch -- over each algorithm's own unit of work: sft counts rows, grpo count
     the sequences one step holds after the group repeat.
     """
     algo = (algorithm or "").strip().lower()
-    if algo in ("grpo", "rl", "opd"):
+    if algo in ("grpo", "rl"):
         return _executed_rl_gpu_count(algo, train, gpu_count)
     if algo != "sft":
         return gpu_count
@@ -203,10 +211,10 @@ def _executed_gpu_count(algorithm: str, train, overrides, gpu_count: int) -> int
 
 
 def _executed_rl_gpu_count(algorithm: str, train, gpu_count: int) -> int:
-    """Ranks grpo/opd would launch: bounded by the SEQUENCES one step holds, not the prompt count.
+    """Ranks grpo would launch: bounded by the SEQUENCES one step holds, not the prompt count.
 
     Both algorithms hand verl ``data.train_batch_size = prompts_per_step`` (grpo
-    ``train/rl/verl_config.py``, opd ``opd_train_runner`` via ``train/opd/overrides.py``) and then
+    ``train/rl/verl_config.py``) and then
     ``batch.repeat(rollout.n)``, so a step carries ``prompts_per_step * group_size`` sequences. That
     product is the quantity verl chunks across dp ranks -- verl derives its own agent-loop worker
     count from the same product -- and it must divide the width exactly or the run aborts at step 0.
@@ -220,8 +228,7 @@ def _executed_rl_gpu_count(algorithm: str, train, gpu_count: int) -> int:
     the one the cost path fills in (``RunConfig.normalized``). Hardcoding 1 here would under-credit a
     grpo step eightfold -- `RECIPE.rl.group_size` is 8 -- so one prompt on eight cards would be
     sized as a single rank and a model that fits across the fsdp group would be REJECTED before it
-    could launch. The two defaults differ by algorithm (grpo groups, opd distills one completion per
-    prompt), which is exactly why this reads the recipe rather than a literal.
+    could launch. Read the GRPO recipe rather than a literal to keep allocation in sync.
     """
     prompts = _sizing_int(train, "prompts_per_step", 0)
     if prompts <= 0:
@@ -229,7 +236,7 @@ def _executed_rl_gpu_count(algorithm: str, train, gpu_count: int) -> int:
     from flash.engine.plan.recipe import RECIPE
     from flash.engine.plan.steps import rl_data_parallel_cards
 
-    recipe = RECIPE.opd if algorithm == "opd" else RECIPE.rl
+    recipe = RECIPE.rl
     group = _sizing_int(train, "group_size", recipe.group_size)
     return rl_data_parallel_cards(gpu_count, prompts * group)
 
@@ -319,7 +326,7 @@ def geometry_safe_gpu_cap(
     """Rentable ceiling whose head divisibility is known before paid allocation.
 
     The width becomes vLLM's ``tensor_model_parallel_size`` for the rollout engine (grpo
-    ``train/rl/verl_config.py``, opd ``train/opd/overrides.py``), and vLLM requires
+    ``train/rl/verl_config.py``), and vLLM requires
     ``num_attention_heads % tp_size == 0`` -- it raises at engine init otherwise -- so a catalog row
     is only safe at the counts that divide its OWN head count. Curated membership is not uniform
     geometry: catalog head counts are 8, 8, 16, 16, 24, and 16, so trusting membership alone
@@ -520,10 +527,6 @@ def _resolve_exact_gpu(
             + (
                 f" (of the {cap} cards allowed, only {tried} "
                 f"{'joins' if tried == 1 else 'join'} this run"
-                # the reason comes from the shared formatter rather than being spelled again here:
-                # this copy said "sft" unconditionally, so a pinned small-batch grpo/opd run was sent
-                # to a batch knob opd rejects at parse time and rows rl does not have. the dash form,
-                # not the parenthetical: this clause is already inside parens.
                 f"{batch_bound_width_note(algorithm=algorithm)})"
                 if tried != cap
                 else ""
@@ -809,6 +812,14 @@ def allocate(
     # the authored request. an exact-unpacked run executes batch 1 at the measured length, so sizing
     # off the authored batch over-reserves (4 GB on a 4B at batch 8 / 4096) and can reject a card the
     # run would have fit on. `_fits` reads it too, so the requirement and the fit cannot disagree.
+    if algorithm == "custom":
+        if provider and providers:
+            raise UnsupportedGpuError("provider and providers cannot both be set")
+        validated_provider_preferences(providers, allow_empty=isinstance(providers, tuple))
+        provider, gpu_type, gpu_type_fallbacks, max_gpu_count = custom_gpu_shape(
+            model_id, provider, (gpu_type, *gpu_type_fallbacks) if gpu_type else (), max_gpu_count
+        )
+        providers = ()  # only Modal has a validated custom worker transport today.
     sized_train = _overridden_train(train, overrides)
     # bound before the pinned-class checks below, which need it too: every question about a card
     # count in this function is asked through this one rule. see `_executed_width`.

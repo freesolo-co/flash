@@ -14,7 +14,6 @@ import copy
 import io
 import json
 import multiprocessing
-import subprocess
 import tarfile
 import time
 import types
@@ -63,26 +62,6 @@ def _targz(members: list[tuple[tarfile.TarInfo, bytes | None]]) -> bytes:
 # ===========================================================================
 
 
-def test_pure_url_and_redact_helpers():
-    # the repository url is always credential-free.
-    url = envs._repo_url("owner/repo")
-    assert url == "https://github.com/owner/repo.git"
-
-    # _redact with an empty token is a no-op (the early-return branch).
-    assert envs._redact("nothing to redact", "") == "nothing to redact"
-
-
-def test_is_retryable_git_publish_error_classifies_markers():
-    # Permanent auth/not-found failures are never retried.
-    for permanent in ("authentication failed", "Repository not found", "HTTP 403 Forbidden"):
-        assert envs._is_retryable_git_publish_error(permanent) is False
-    # Transient push races are retryable.
-    for transient in ("failed to push some refs", "non-fast-forward update", "cannot lock ref"):
-        assert envs._is_retryable_git_publish_error(transient) is True
-    # An unclassified message defaults to non-retryable.
-    assert envs._is_retryable_git_publish_error("some totally novel git error") is False
-
-
 def test_publish_slug_and_input_validation(monkeypatch):
     # A namespaced name must be exactly three non-empty segments.
     with pytest.raises(envs.EnvPublishError, match="namespace/project/name"):
@@ -91,7 +70,9 @@ def test_publish_slug_and_input_validation(monkeypatch):
         envs.publish_slug_for_name("acme/proj/", {"org_slug": "acme"}, "proj")
 
     # publish_package validates argument TYPES before touching storage.
-    monkeypatch.setattr(envs, "_github_publish_once", lambda **_k: None)
+    monkeypatch.setattr(
+        envs.blob_envs, "publish", lambda *args: pytest.fail("storage must not be touched")
+    )
     with pytest.raises(envs.EnvPublishError, match="env name must be a string"):
         envs.publish_package(package_b64="x", name=123, key={}, project_slug="proj")  # type: ignore[arg-type]
     with pytest.raises(envs.EnvPublishError, match="base64 string"):
@@ -143,114 +124,6 @@ def test_safe_extract_enforces_member_cap(tmp_path, monkeypatch):
     )
     with pytest.raises(envs.EnvPublishError, match="too many members"):
         envs._safe_extract(payload, tmp_path)
-
-
-def test_package_checkout_directory_error_branches(tmp_path, monkeypatch):
-    # No environment.py in the checkout -> 404 "environment package not found".
-    empty = tmp_path / "empty"
-    empty.mkdir()
-    with pytest.raises(envs.EnvPublishError) as missing:
-        envs._package_checkout_directory(empty)
-    assert missing.value.status == 404
-
-    # A repo-control top-level dir inside the package is a 502.
-    repo_control = tmp_path / "repoctl"
-    repo_control.mkdir()
-    (repo_control / "environment.py").write_text("def load_environment(**k): pass\n")
-    (repo_control / ".git").mkdir()
-    (repo_control / ".git" / "config").write_text("[core]\n")
-    with pytest.raises(envs.EnvPublishError, match="top-level paths") as blocked:
-        envs._package_checkout_directory(repo_control)
-    assert blocked.value.status == 502
-
-    # A symlink inside the package is a 502.
-    linked = tmp_path / "linked"
-    linked.mkdir()
-    (linked / "environment.py").write_text("def load_environment(**k): pass\n")
-    (linked / "zzz-link.py").symlink_to(linked / "environment.py")
-    with pytest.raises(envs.EnvPublishError, match="links are not allowed") as sym:
-        envs._package_checkout_directory(linked)
-    assert sym.value.status == 502
-
-    # Too many members trips the member cap.
-    many = tmp_path / "many"
-    many.mkdir()
-    (many / "environment.py").write_text("def load_environment(**k): pass\n")
-    (many / "extra.py").write_text("x = 1\n")
-    monkeypatch.setattr(envs, "_MAX_MEMBERS", 1)
-    with pytest.raises(envs.EnvPublishError, match="too many members"):
-        envs._package_checkout_directory(many)
-
-
-def test_run_git_translates_missing_binary_and_nonzero_exit(tmp_path, monkeypatch):
-    # git binary absent -> 503 phrased for the download verb.
-    def _missing(*_a, **_k):
-        raise FileNotFoundError("git")
-
-    monkeypatch.setattr(envs.subprocess, "run", _missing)
-    with pytest.raises(envs.EnvPublishError) as no_git:
-        envs._run_git(tmp_path, ["clone"], token="tok", operation="download")
-    assert no_git.value.status == 503
-    assert "download" in str(no_git.value)
-    assert "from Freesolo" in str(no_git.value)
-
-    # A nonzero exit -> 502, with the credential scrubbed out of the surfaced output.
-    def _fail(*_a, **_k):
-        return subprocess.CompletedProcess(["git"], 128, "", "fatal: ghp-secret rejected")
-
-    monkeypatch.setattr(envs.subprocess, "run", _fail)
-    with pytest.raises(envs.EnvPublishError) as failed:
-        envs._run_git(tmp_path, ["push"], token="ghp-secret", operation="upload")
-    assert failed.value.status == 502
-    assert "ghp-secret" not in str(failed.value)
-    assert "<redacted>" in str(failed.value)
-
-
-def test_staged_has_changes_timeout_is_504(tmp_path, monkeypatch):
-    def _timeout(*_a, **_k):
-        raise subprocess.TimeoutExpired(cmd=["git"], timeout=180)
-
-    monkeypatch.setattr(envs.subprocess, "run", _timeout)
-    with pytest.raises(envs.EnvPublishError) as exc:
-        envs._staged_has_changes(tmp_path)
-    assert exc.value.status == 504
-    assert "timed out" in str(exc.value)
-
-
-def test_github_publish_does_not_retry_permanent_error(tmp_path, monkeypatch):
-    monkeypatch.setenv("GITHUB_TOKEN", "ghp-test")
-    (tmp_path / "environment.py").write_text("def load_environment(**k): pass\n")
-    calls = {"n": 0}
-
-    def fake_once(**_kwargs):
-        calls["n"] += 1
-        raise envs.EnvPublishError("authentication failed", status=502)
-
-    monkeypatch.setattr(envs, "_github_publish_once", fake_once)
-    # Guard: if the code ever retried, this sleep would be exercised — no-op it either way.
-    monkeypatch.setattr(
-        envs.time, "sleep", lambda _s: pytest.fail("permanent error must not retry")
-    )
-
-    with pytest.raises(envs.EnvPublishError, match="authentication failed"):
-        envs._github_publish(tmp_path, name="e", key={"org_slug": "acme"}, project_slug="proj")
-    assert calls["n"] == 1
-
-
-def test_github_download_wrapper_uses_default_repo(monkeypatch):
-    seen: dict[str, object] = {}
-
-    def fake_once(*, repo, token, publish_root):
-        seen.update(repo=repo, token=token, publish_root=publish_root)
-        return b"package-bytes"
-
-    monkeypatch.setattr(envs, "_github_download_once", fake_once)
-    assert envs._github_download("ns/project/env", token="tok") == b"package-bytes"
-    assert seen == {
-        "repo": envs._DEFAULT_GITHUB_REPO,
-        "token": "tok",
-        "publish_root": "ns/project/env",
-    }
 
 
 # ===========================================================================
@@ -1178,7 +1051,6 @@ def test_run_deployment_smoke_does_not_cap_a_constrained_request(monkeypatch):
             max_completion_tokens=8192,
         ),
         _smoke_spec(algorithm="grpo", thinking=False, max_completion_tokens=8192),
-        _smoke_spec(algorithm="opd", thinking=False, max_completion_tokens=8192),
     ],
 )
 def test_run_deployment_smoke_keeps_non_thinking_paths_at_256(monkeypatch, spec):
@@ -1198,12 +1070,7 @@ def test_run_deployment_smoke_keeps_non_thinking_paths_at_256(monkeypatch, spec)
 
 @pytest.mark.parametrize(
     ("spec", "expected"),
-    [
-        # opd without grammar must still get a thinking-sized budget, bounded by the smoke ceiling.
-        (_smoke_spec(algorithm="opd", thinking=True, max_completion_tokens=8192), 2048),
-        # grpo thinking with no grammar and no explicit budget -> the thinking recipe default.
-        (_smoke_spec(algorithm="grpo", thinking=True), 1536),
-    ],
+    [(_smoke_spec(algorithm="grpo", thinking=True), 1536)],
 )
 def test_run_deployment_smoke_budgets_thinking_without_structured_outputs(
     monkeypatch, spec, expected
@@ -1244,7 +1111,7 @@ def test_run_deployment_smoke_rejects_truncated_thinking_without_a_grammar(monke
     )
 
     with pytest.raises(ServingError, match="smoke generation was truncated at the maximum token"):
-        _run_smoke(_smoke_spec(algorithm="opd", thinking=True, max_completion_tokens=8192))
+        _run_smoke(_smoke_spec(algorithm="grpo", thinking=True, max_completion_tokens=8192))
 
 
 def test_run_deployment_smoke_forwards_configured_stop_sequences(monkeypatch):
@@ -1489,7 +1356,6 @@ def test_smoke_budget_is_capped_independently_of_the_training_context():
     assert SMOKE_COMPLETION_TOKEN_CEILING < 8192
     for spec in (
         _smoke_spec(thinking=True, algorithm="sft", max_context_tokens=8192),
-        _smoke_spec(thinking=True, algorithm="opd", max_completion_tokens=8192),
         _smoke_spec(thinking=True, algorithm="grpo", max_completion_tokens=8192),
     ):
         assert resolve_smoke_completion_tokens(spec) == SMOKE_COMPLETION_TOKEN_CEILING
@@ -1498,7 +1364,6 @@ def test_smoke_budget_is_capped_independently_of_the_training_context():
     # what it does today, so capping cannot truncate a checkpoint that passes now.
     assert RECIPE.sft.max_seq_len_thinking <= SMOKE_COMPLETION_TOKEN_CEILING
     assert RECIPE.rl.max_completion_len_thinking <= SMOKE_COMPLETION_TOKEN_CEILING
-    assert RECIPE.opd.max_completion_len_thinking <= SMOKE_COMPLETION_TOKEN_CEILING
 
 
 def test_a_configured_grammar_keeps_the_runs_own_budget():
@@ -1515,7 +1380,7 @@ def test_a_configured_grammar_keeps_the_runs_own_budget():
         resolve_smoke_completion_tokens,
     )
 
-    for algorithm in ("grpo", "opd"):
+    for algorithm in ("grpo",):
         spec = _smoke_spec(
             thinking=True,
             algorithm=algorithm,

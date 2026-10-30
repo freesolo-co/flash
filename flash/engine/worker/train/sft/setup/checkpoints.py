@@ -279,15 +279,6 @@ class _VerlCheckpointWatcher:
         # watcher thread dies on that exception anyway, and the retry would race its own teardown.
         self.lifecycle.mark_discovered(step)
 
-        # the try opens before the export, so a run that dies partway through writing the adapter
-        # still frees the partial directory. nothing in the sft path reads the export again --
-        # `step` is discovered above, `_pending` filters on that, and no sweep or finalization walks
-        # `export_root` -- so an adapter kept past this call has no reader and would just accumulate
-        # one directory per save.
-        #
-        # not safe in the two sibling watchers, which keep their exports for a real later reader:
-        # the rl uploader republishes from its staged adapters on subsequent sweeps, and the opd
-        # watcher hands `adapter_dir` to `_stage_retry_contract`. sft is done with it inside this call.
         try:
             _sft_train()._export_checkpoint_adapter(
                 actor_dir,

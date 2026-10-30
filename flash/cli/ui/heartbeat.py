@@ -142,9 +142,7 @@ _STALE_STEP_AFTER_S = _HB_QUIET_HINT_AFTER_S
 # for a conservative current bound, and speak once that bound reaches the throttle without claiming
 # either health or a stall: newer progress may be uncommitted, or the worker may be silent.
 _UPLOAD_THROTTLE_S = 900.0
-# only the stages the worker actually holds on the 900s upload throttle. opd_step emits ordinary
-# post-step and liveness heartbeats, so its uploaded step can lag just like rl_step and sft_step.
-_TRAINING_STEP_STAGES = frozenset({"opd_step", "rl_step", "sft_step"})
+_TRAINING_STEP_STAGES = frozenset({"rl_step", "sft_step"})
 
 # the setup stages that hold a liveness thread on the 240s tight cadence (_HB_SETUP_LIVENESS_INTERVAL_S).
 # these are the ones where age is genuinely informative: the worker pings every 240s while alive, so
@@ -154,27 +152,21 @@ _LIVENESS_SETUP_STAGES = frozenset(
         "model_prefetching",
         "checkpoint_prefetching",
         "sft_model_load",
-        "opd_model_load",
+        "custom_model_load",
         "sft_data_loading",
         "rl_data_loading",
         "rl_adapter_loading",
         "sft_pretokenizing",
         "sft_configuring",
         "rl_configuring",
-        "opd_configuring",
-        "opd_filtering_prompts",
-        "opd_prompt_scan",
-        "opd_image_prep",
         "sft_initializing",
         "rl_initializing",
-        "opd_initializing",
         # adapter export/upload holds a keepalive liveness wrap on the same 240s cadence, so a long
         # silence here is no more ordinary than at any other setup stage. these run AFTER training,
         # where the reassuring reading is the expensive one to get wrong: the work is done and only
         # the upload stands between the user and their adapter.
         "sft_finalizing",
         "rl_finalizing",
-        "opd_finalizing",
     }
 )
 # a liveness-backed setup stage pings every 240s, so silence past ~3 missed ticks is the point where
@@ -197,7 +189,7 @@ _ADAPTER_DOWNLOAD_STAGES = frozenset({"sft_model_load", "rl_adapter_loading"})
 # these export and upload the trained adapter. a long blocking stretch is EXPECTED here, so calling
 # it unusual would be actively wrong -- and worst of all after training has already finished, when
 # the only thing between the user and their result is this upload.
-_UPLOAD_STAGES = frozenset({"sft_finalizing", "rl_finalizing", "opd_finalizing"})
+_UPLOAD_STAGES = frozenset({"sft_finalizing", "rl_finalizing"})
 
 
 def _stale_setup_hint(

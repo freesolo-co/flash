@@ -1,7 +1,7 @@
 [project]
 name = "freesolo-flash"
-version = "1.3.33"
-description ="Flash — managed LoRA post-training (SFT/GRPO/OPD) for Freesolo environments, driven by the `flash` CLI"
+version = "1.4.1"
+description ="Flash — managed LoRA post-training (SFT/GRPO) for Freesolo environments, driven by the `flash` CLI"
 readme = "README.md"
 # The training and serving stack is validated on Python 3.11 and 3.12.
 requires-python = ">=3.11,<3.13"
@@ -24,19 +24,21 @@ classifiers = [
 dependencies = []
 
 [project.optional-dependencies]
+# local custom-loss autograd; provider and artifact dependencies stay on the server.
+custom = ["torch==2.10.0"]
 # heavy deps for running the fine-tuning worker locally (the deployed gpu worker installs its exact
 # stack in Dockerfile.worker, with the fallback verl venv mirrored in capabilities.py).
 gpu = [
     "torch==2.10.0",
     "transformers>=5.8,<5.13",
     "tokenizers>=0.22",
-    "tiktoken>=0.12",
-    "httpx>=0.27",  # client-lived managed teacher connection pool
+    "httpx>=0.27",
+    # Shared Hub error classification also recognizes requests transport errors.
+    "requests>=2.32,<3",
     "peft>=0.19",
     "vllm==0.19.1",
     "accelerate>=1.4",
-    # resolve_verl_python shells out to `uv` to provision the isolated verl interpreter whenever
-    # FLASH_VERL_PYTHON is unset. sft and opd are verl-only, so that call is unconditional here.
+    # resolve_verl_python uses uv when FLASH_VERL_PYTHON is not supplied.
     "uv>=0.5",
     # Worker runtime: Freesolo environment loading and HF checkpoint I/O.
     "datasets>=2.19",
@@ -54,6 +56,8 @@ gpu = [
 # sft cost, dry-run, and submit statically read packaged rows plus the defined training contract.
 # environment.py is not imported; other environment prompt transformations remain estimate gaps.
 server = [
+    "azure-identity>=1.19,<2",
+    "azure-storage-blob>=12.24,<13",
     "pydantic-settings>=2.7",
     "orjson>=3.10",
     # 0.136 floor keeps modal's serving+serve-runtime pair solvable under vllm's resolver-only <0.137
@@ -63,6 +67,8 @@ server = [
     # customer-owned modal lifecycle mutations execute in the control plane.
     "modal==1.6.2",
     "httpx>=0.27",
+    # Shared Hub error classification also recognizes requests transport errors.
+    "requests>=2.32,<3",
     "jsonschema>=4.23",
     "referencing>=0.28.4",
     "regex>=2024.11.6",
@@ -72,11 +78,7 @@ server = [
     "transformers>=5.8,<5.13",
     # Tokenizer chat templates are rendered during control-plane workload profiling.
     "jinja2>=3.1.0",
-    # the control plane decodes images: flash/server/routes/runs.py imports
-    # preflight_validate_image_opd at module load, and flash/content/multimodal.py opens every image
-    # source with PIL to validate it. without Pillow a self-hoster on [server] gets
-    # `RuntimeError: Pillow is required for multimodal image training` at preflight on any
-    # multimodal opd run. the gpu extra gets Pillow transitively via vllm; server does not.
+    # Shared multimodal workload profiling decodes and validates images.
     "pillow>=11.0.0",
 ]
 # The serving app (flash/serving/) that runs inside the GPU container. Kept out of `server` because
@@ -155,6 +157,8 @@ dev = [
     "fastapi>=0.136,<1",
     "uvicorn>=0.52,<1",
     "httpx>=0.27",
+    # Shared Hub error classification also recognizes requests transport errors.
+    "requests>=2.32,<3",
     "jsonschema>=4.23",
     "referencing>=0.28.4",
     "regex>=2024.11.6",
@@ -163,8 +167,7 @@ dev = [
     "freesolo>=0.4.2",
     "transformers>=5.8,<5.13",
     "tokenizers>=0.22",
-    "tiktoken>=0.12",
-    "httpx>=0.27",  # client-lived managed teacher connection pool
+    "httpx>=0.27",
     # flash/content/multimodal.py imports PIL directly to validate and decode every image source, so the
     # image tests are not optional coverage: without Pillow they importorskip and CI reports green
     # on a multimodal path it never executed. the control plane decodes images too, so `server`
@@ -204,7 +207,7 @@ artifacts = ["flash/py.typed"]
 # auto-published by .github/workflows/publish-dev.yml: a push to `dev` whose version isn't yet on
 # PyPI publishes it; pushes that don't change it find it already published and no-op. So cutting a
 # dev-channel release = bump this (and [project].version) and merge to `dev`.
-version = "1.3.33"
+version = "1.4.1"
 
 [tool.pytest.ini_options]
 pythonpath = ["."]
@@ -228,6 +231,10 @@ package = true
 # into one environment. uv records both resolutions while rejecting only the incompatible combination.
 conflicts = [
     [
+        { extra = "custom" },
+        { extra = "serve-runtime" },
+    ],
+    [
         { extra = "gpu" },
         { extra = "serve-runtime" },
     ],
@@ -247,8 +254,9 @@ dev = [
     "datasets>=2.19",
     "freesolo>=0.4.2",
     "tokenizers>=0.22",
-    "tiktoken>=0.12",
-    "httpx>=0.27",  # client-lived managed teacher connection pool
+    "httpx>=0.27",
+    # Shared Hub error classification also recognizes requests transport errors.
+    "requests>=2.32,<3",
     # flash/content/multimodal.py imports PIL directly to validate and decode every image source, so the
     # image tests are not optional coverage: without Pillow they importorskip and CI reports green
     # on a multimodal path it never executed. the control plane decodes images too, so `server`
@@ -330,6 +338,3 @@ ignore = [
 # Annotated[..., Depends(closure_local)] cannot be resolved by get_type_hints,
 # so the definition-time `= Depends(...)` form is required here.
 "flash/server/asgi/app.py" = ["FAST002"]
-# `_ScoredResponseText` subclasses `str` to stay grader-compatible while carrying the structured
-# views as attributes; __slots__ would defeat that.
-"flash/envs/loading/adapter.py" = ["SLOT000"]

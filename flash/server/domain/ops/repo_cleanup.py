@@ -62,7 +62,7 @@ def _throttle_tree_list() -> None:
 # plus the VL warm-start ``recomb`` recombined adapter). Anything else — ``code/`` snapshots,
 # ``referenced_by/`` lineage markers, telemetry, or an unrecognized future phase — is NEVER a delete
 # target. Allowlist, not denylist, so a new artifact kind can't be silently reaped.
-ARTIFACT_PHASES = frozenset({"sft", "rl", "opd", "dpo", "grpo", "recomb"})
+ARTIFACT_PHASES = frozenset({"sft", "rl", "dpo", "grpo", "recomb", "custom"})
 # 0-byte warm-start lineage back-reference written into the SOURCE repo: ``referenced_by/<child_run_id>``.
 REF_MARKER = "referenced_by"
 

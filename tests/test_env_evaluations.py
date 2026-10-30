@@ -3545,19 +3545,7 @@ def test_every_state_accepting_scorer_shape_actually_receives_the_episode(
 
 
 def test_env_eval_applies_the_last_model_turn_before_scoring_at_the_turn_cap() -> None:
-    """The final model action must reach the scored state, including at the turn cap.
-
-    `env_reply` is what runs the env's `step_episode`, so a state that never sees the last action
-    is scored with board state, metadata and `final_response_text` one move stale -- the model is
-    graded as though its last turn never happened.
-
-    Training does apply it. `rl/multi_turn.py` gates its reply solely on `rollout_done`, which
-    counts `state["turn"]` -- incremented only by `env_reply`, never by `record_model_turn` -- so
-    at the cap the counter is still one short, the check passes, and the env is stepped.
-
-    What is skipped is only the inter-turn glue: no SECOND reply that would append a user turn no
-    model turn will ever answer, which is what `opd/bridge.py` guards against.
-    """
+    """The final model action must reach the scored state, including at the turn cap."""
     import argparse
 
     from flash.cli.commands.env.testing import episode as episode_module
@@ -3670,12 +3658,7 @@ def test_env_eval_does_not_step_an_environment_that_already_reported_done() -> N
 
 
 def test_env_eval_honours_a_per_example_turn_budget_below_the_env_ceiling() -> None:
-    """A case whose `max_episode_turns` is lower than `max_turns` must stop at its own budget.
-
-    `rollout_done` gives the per-example budget precedence (`flash/envs/loading/adapter.py`), and both
-    training bridges derive the same effective limit (`opd/bridge.py:512`, `rl/multi_turn.py:174`).
-    Counting only the dataset-wide ceiling generates turns training would never have run.
-    """
+    """A case whose `max_episode_turns` is lower than `max_turns` must stop at its own budget."""
     import argparse
 
     from flash.cli.commands.env.testing import episode as episode_module

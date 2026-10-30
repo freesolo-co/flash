@@ -95,7 +95,7 @@ def list_envs(key: Annotated[dict, Depends(require_key)]):
 
 @router.get("/v1/envs/{env_id:path}/package")
 def download_env_package(env_id: str, key: Annotated[dict, Depends(require_key)]):
-    """Download a managed Freesolo environment package from the GitHub-backed hub."""
+    """Download a managed Freesolo environment package from the private managed registry."""
     from flash.server.domain.registry import envs
 
     try:
@@ -191,7 +191,7 @@ def delete_env(
         except envs.EnvPublishError as exc:
             raise HTTPException(status_code=exc.status, detail=str(exc)) from exc
 
-    # github (the package store) is the source of truth and is already updated; dropping the
+    # The package store is the source of truth and is already updated; dropping the
     # web-ui metadata mirror remains best-effort and must never turn a successful delete into a 500.
     try:
         record_deleted_environment(

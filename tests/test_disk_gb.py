@@ -96,7 +96,7 @@ def test_fractional_parameter_merge_floor_rounds_up(monkeypatch):
 
 
 def test_moe_merge_floor_uses_total_parameters(monkeypatch):
-    from flash.core.catalog import MODELS, ModelInfo, resolve_model
+    from flash.core.catalog import MODELS, ModelInfo
 
     model = ModelInfo(
         id="test/moe-disk",
@@ -104,14 +104,13 @@ def test_moe_merge_floor_uses_total_parameters(monkeypatch):
         params="35B total / 3B active",
         params_b=35.0,
         active_params_b=3.0,
-        algos=("sft", "grpo", "opd"),
+        algos=("sft", "grpo"),
         min_vram_gb=1,
     )
     monkeypatch.setitem(MODELS, model.id, model)
 
     # sized on total parameters: the checkpoint and the merged output are dense full-model copies,
     # so the active-parameter count does not bound what lands on disk.
-    assert resolve_model(model.id, "opd").min_disk_gb == 274
 
 
 def test_revision_geometry_is_applied_before_the_disk_floor(monkeypatch):

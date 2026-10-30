@@ -39,11 +39,11 @@ from flash.engine.worker.io.heartbeat import liveness_heartbeat
 from flash.engine.worker.runtime.rng import backend_seed, seed_training_rngs
 from flash.engine.worker.runtime.state import WorkerContext
 from flash.engine.worker.train.core.child.glue import validate_glue_template
+from flash.engine.worker.train.core.rollout.generation import generation_eos_from_cached_config
 from flash.engine.worker.train.entry.backend_common import (
     clamp_engine_len,
     model_max_position_embeddings,
 )
-from flash.engine.worker.train.opd.orchestration.gkd import generation_eos_from_cached_config
 from flash.engine.worker.train.rl.launch.verl_config import (
     _processor_expanded_prompt,
     _verl_epochs_for_horizon,
@@ -60,8 +60,6 @@ def _validate_grpo_environment(env):
     if not multi_turn:
         return False
 
-    # the bridge drives the env through exactly these four calls, so a missing one would only
-    # surface mid-rollout on the first episode. same gate the opd verl path applies.
     missing = [
         name
         for name in ("new_rollout_state", "record_model_turn", "env_reply", "rollout_done")
@@ -436,12 +434,6 @@ def _assemble_grpo_inputs(
         "prompts": prompts,
         "prompts_per_step": schedule["prompts_per_step"],
         "group_size": options["group_size"],
-        # the ranks this attempt launches verl at, resolved ONCE here because two phases ask: the
-        # child config (`_configure_rl_child`) and the resume probe, which discards a checkpoint whose
-        # shard count disagrees with the width it is handed. deriving it twice from the raw knobs let
-        # them drift -- resume compared the RENTED count while the child launched the clamped one, so
-        # a checkpoint written at the executed width read as the wrong topology and every retry
-        # restarted from step 0. opd binds one value for both phases; this is grpo's.
         "dp_cards": rl_data_parallel_cards(
             gpu_count_of(context.config.spec),
             int(schedule["prompts_per_step"]) * int(options["group_size"]),
@@ -534,11 +526,7 @@ def _resolve_grpo_inputs(*, context: WorkerContext):
 
         # the model must actually support image training; this raises for a text-only checkpoint
         # rather than letting the processor silently drop the pixels.
-        validate_multimodal_training(
-            model_id,
-            "grpo",
-            getattr(_t, "teacher_model", None),
-        )
+        validate_multimodal_training(model_id)
         from transformers import AutoProcessor
 
         processor = AutoProcessor.from_pretrained(

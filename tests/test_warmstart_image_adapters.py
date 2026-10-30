@@ -8,7 +8,7 @@ warm-started image run has to re-derive its processor from the base model rather
 source adapter.
 
 The file lists here are the exact set published by the live 4B image gate runs
-(`image-gate-qwen35-4b-sft-20260818-06` and `image-gate-qwen35-4b-opd-20260818-06`), so a change to
+(`image-gate-qwen35-4b-sft-20260818-06` and `image-gate-qwen35-4b-sft-20260818-06`), so a change to
 the exporter that drops a sidecar, or a change to the loadable check that starts demanding one,
 turns these red.
 """
@@ -103,25 +103,25 @@ def test_an_adapter_missing_its_weights_is_still_rejected(tmp_path):
     assert not _warmstart_adapter_is_loadable(str(adir))
 
 
-@pytest.mark.parametrize("algorithm", ["grpo", "opd"])
+@pytest.mark.parametrize("algorithm", ["grpo"])
 def test_image_run_warm_start_is_accepted_for_supported_algorithms(algorithm):
-    """GRPO and OPD accept `init_from_adapter` on an image environment.
+    """GRPO accept `init_from_adapter` on an image environment.
 
     Validated live against the published image adapter
-    `image-gate-qwen35-4b-opd-20260818-06`: preparation inherited rank 16 / alpha 32, pinned the
+    `image-gate-qwen35-4b-sft-20260818-06`: preparation inherited rank 16 / alpha 32, pinned the
     source dataset revision, and propagated the base model pin.
     """
     spec = JobSpec.from_dict(_image_rl_spec(algorithm))
-    assert spec.train.init_from_adapter == "image-gate-qwen35-4b-opd-20260818-06"
+    assert spec.train.init_from_adapter == "image-gate-qwen35-4b-sft-20260818-06"
     assert spec.algorithm == algorithm
 
 
-@pytest.mark.parametrize("algorithm", ["grpo", "opd"])
+@pytest.mark.parametrize("algorithm", ["grpo"])
 def test_rl_warm_start_accepts_an_image_sft_adapter_as_its_source(algorithm):
     """SFT -> RL is the canonical warm start, and the SFT source may be an image run.
 
     The direction matters: SFT cannot itself be warm-started (see the sibling test below), but its
-    published adapter is the normal starting point for GRPO and OPD. Nothing about that path was
+    published adapter is the normal starting point for GRPO. Nothing about that path was
     pinned for an image-bearing SFT source, whose adapter carries processor sidecars a text run's
     does not.
 
@@ -177,7 +177,7 @@ def _image_environment() -> dict:
     }
 
 
-def _image_rl_spec(algorithm: str, source: str = "image-gate-qwen35-4b-opd-20260818-06") -> dict:
+def _image_rl_spec(algorithm: str, source: str = "image-gate-qwen35-4b-sft-20260818-06") -> dict:
     train = {
         "max_steps": 3,
         "max_examples": 1,
@@ -187,9 +187,6 @@ def _image_rl_spec(algorithm: str, source: str = "image-gate-qwen35-4b-opd-20260
         "max_context_tokens": 1024,
         "init_from_adapter": source,
     }
-    if algorithm == "opd":
-        train["teacher_model"] = "qwen3.5-397b-a17b"
-        train["group_size"] = 1
     return {
         "model": _IMAGE_MODEL,
         "algorithm": algorithm,

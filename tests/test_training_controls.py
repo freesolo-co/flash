@@ -473,22 +473,6 @@ def test_runtime_secret_cannot_override_control_plane_seed():
     assert env["SEED"] == "987"
 
 
-def test_provider_worker_env_carries_control_plane_resume_revision():
-    from flash.providers._lifecycle.net.worker import build_worker_env
-    from flash.teacher.retry_contract import OPD_RESUME_REVISION_ENV
-
-    spec = JobSpec(model="m", algorithm="opd", seed=987)
-    env = build_worker_env(
-        spec,
-        runtime_secrets={
-            OPD_RESUME_REVISION_ENV: "a" * 40,
-            "FLASH_PUBLIC_URL": "https://broker.example",
-            "FLASH_TEACHER_CAPABILITY": "capability-test-value",
-        },
-    )
-    assert env[OPD_RESUME_REVISION_ENV] == "a" * 40
-
-
 def test_toml_environment_secrets_reject_control_plane_seed(tmp_path):
     path = tmp_path / "seed-secret.toml"
     path.write_text(
@@ -516,7 +500,7 @@ def _spec_with_declared_secret(algorithm: str, secret: str) -> dict:
 
 
 @pytest.mark.parametrize("secret", GRPO_NATIVE_THREAD_ENV)
-@pytest.mark.parametrize("algorithm", ["sft", "opd"])
+@pytest.mark.parametrize("algorithm", ["sft"])
 def test_non_grpo_authoring_accepts_grpo_native_thread_secrets(algorithm, secret):
     spec = spec_from_dict(_spec_with_declared_secret(algorithm, secret))
 
@@ -532,7 +516,7 @@ def test_grpo_authoring_rejects_native_thread_secrets(secret):
         spec_from_dict(_spec_with_declared_secret("grpo", secret))
 
 
-@pytest.mark.parametrize("algorithm", ["sft", "opd", "grpo"])
+@pytest.mark.parametrize("algorithm", ["sft", "grpo"])
 def test_all_algorithms_reject_unconditional_control_plane_secrets(algorithm):
     with pytest.raises(
         ConfigError,

@@ -154,7 +154,7 @@ def test_training_report_projects_only_conservative_lifecycle_booleans(monkeypat
 
 @pytest.mark.parametrize(
     ("algorithm", "stage"),
-    [("sft", "sft_step"), ("grpo", "rl_step"), ("opd", "opd_step")],
+    [("sft", "sft_step"), ("grpo", "rl_step")],
 )
 def test_progress_projects_each_training_algorithm(
     monkeypatch,
@@ -190,7 +190,6 @@ def test_progress_projects_each_training_algorithm(
         ("sft", {"attempt": 1, "stage": "sft_step", "step": 1}),
         ("sft", {"attempt": 0, "stage": "rl_step", "step": 1}),
         ("grpo", {"attempt": 0, "stage": "sft_step", "step": 1}),
-        ("opd", {"attempt": 0, "stage": "rl_step", "step": 1}),
     ],
 )
 def test_progress_requires_exact_algorithm_attempt_and_positive_integer_step(
@@ -216,7 +215,7 @@ def test_progress_requires_exact_algorithm_attempt_and_positive_integer_step(
 def test_terminal_done_heartbeat_preserves_exact_progress_evidence(monkeypatch, tmp_path):
     monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
     monkeypatch.setattr(runner_reporting, "_report_status", lambda _status: None)
-    spec = _spec(algorithm="opd")
+    spec = _spec(algorithm="grpo")
     status = _status(spec)
     status.state = "running"
     status.remote = _remote()
@@ -289,7 +288,7 @@ def test_progress_remains_true_across_provider_retry(monkeypatch, tmp_path):
 def test_checkpoint_heartbeat_rejects_stale_or_mismatched_progress_evidence(monkeypatch, tmp_path):
     monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
     monkeypatch.setattr(runner_reporting, "_report_status", lambda _status: None)
-    spec = _spec(algorithm="opd")
+    spec = _spec(algorithm="grpo")
     status = _status(spec)
     status.state = "running"
     status.remote = _remote(attempt=1)
@@ -297,7 +296,7 @@ def test_checkpoint_heartbeat_rejects_stale_or_mismatched_progress_evidence(monk
 
     runner_status.record_heartbeat(
         spec.run_id,
-        {"attempt": 0, "stage": "opd_step", "step": 1},
+        {"attempt": 0, "stage": "rl_step", "step": 1},
     )
     runner_status.record_heartbeat(
         spec.run_id,
@@ -308,7 +307,7 @@ def test_checkpoint_heartbeat_rejects_stale_or_mismatched_progress_evidence(monk
 
     runner_status.record_heartbeat(
         spec.run_id,
-        {"attempt": 1, "stage": "rl_step", "step": 1},
+        {"attempt": 1, "stage": "sft_step", "step": 1},
     )
     runner_status.record_heartbeat(
         spec.run_id,

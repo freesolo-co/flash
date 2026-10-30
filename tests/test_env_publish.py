@@ -1,4 +1,4 @@
-"""Server-side managed Freesolo env publishing to GitHub."""
+"""Server-side managed Freesolo env publishing to Azure."""
 
 from __future__ import annotations
 
@@ -6,10 +6,8 @@ import base64
 import gzip
 import io
 import json
-import subprocess
 import tarfile
 import tracemalloc
-from pathlib import Path
 
 import pytest
 
@@ -92,15 +90,17 @@ def _issued_token(prefix: str) -> str:
     return prefix + body
 
 
-def test_publish_rejects_direct_token_archive_before_github_publish(monkeypatch):
+def test_publish_rejects_direct_token_archive_before_registry_publish(monkeypatch):
     token = _issued_token("fslo_")
     path = "scripts/bootstrap.sh"
     package = {**_MINIMAL, path: f"#!/bin/sh\nexport FREESOLO_API_KEY={token}\n"}
     calls: list[str] = []
     monkeypatch.setattr(
-        envs,
-        "_github_publish",
-        lambda *_args, **_kwargs: calls.append("github") or pytest.fail("github must not start"),
+        envs.blob_envs,
+        "publish",
+        lambda *_args, **_kwargs: (
+            calls.append("registry") or pytest.fail("registry must not start")
+        ),
     )
 
     with pytest.raises(envs.EnvPublishError) as excinfo:
@@ -127,9 +127,11 @@ def test_publish_direct_token_scan_failure_is_safe_400(monkeypatch):
         lambda _dest: (_ for _ in ()).throw(envs.DirectTokenScanError()),
     )
     monkeypatch.setattr(
-        envs,
-        "_github_publish",
-        lambda *_args, **_kwargs: calls.append("github") or pytest.fail("github must not start"),
+        envs.blob_envs,
+        "publish",
+        lambda *_args, **_kwargs: (
+            calls.append("registry") or pytest.fail("registry must not start")
+        ),
     )
 
     with pytest.raises(envs.EnvPublishError) as excinfo:
@@ -145,15 +147,15 @@ def test_publish_direct_token_scan_failure_is_safe_400(monkeypatch):
     assert calls == []
 
 
-def test_publish_direct_token_clean_control_reaches_github_publish(monkeypatch):
+def test_publish_direct_token_clean_control_reaches_registry_publish(monkeypatch):
     calls: list[str] = []
 
-    def fake_publish(dest, *, name, key, project_slug):
-        calls.append("github")
+    def fake_publish(slug, dest):
+        calls.append("registry")
         assert (dest / "environment.py").is_file()
-        return f"{key['org_slug']}/{project_slug}/{name}"
+        return slug
 
-    monkeypatch.setattr(envs, "_github_publish", fake_publish)
+    monkeypatch.setattr(envs.blob_envs, "publish", fake_publish)
 
     result = envs.publish_package(
         package_b64=_pkg_b64({**_MINIMAL, "assets/data.bin": "clean opaque bytes"}),
@@ -163,7 +165,7 @@ def test_publish_direct_token_clean_control_reaches_github_publish(monkeypatch):
     )
 
     assert result == "acme/checkout-bot/clean-control"
-    assert calls == ["github"]
+    assert calls == ["registry"]
 
 
 def test_namespace_uses_org_slug():
@@ -201,22 +203,19 @@ def test_sanitize_name_never_returns_path_segments():
     assert envs._sanitize_name("My Env!") == "my-env"
 
 
-def test_publish_uploads_to_github_and_returns_slug(monkeypatch):
-    monkeypatch.setenv("GITHUB_TOKEN", "ghp-test")
+def test_publish_uploads_to_registry_and_returns_slug(monkeypatch):
     captured: dict[str, object] = {}
 
-    def fake_publish_once(*, dest, repo, token, publish_root, message):
+    def fake_publish_once(slug, dest):
         captured.update(
-            repo=repo,
-            token=token,
-            publish_root=publish_root,
-            message=message,
+            publish_root=slug,
             files=sorted(
                 path.relative_to(dest).as_posix() for path in dest.rglob("*") if path.is_file()
             ),
         )
+        return slug
 
-    monkeypatch.setattr(envs, "_github_publish_once", fake_publish_once)
+    monkeypatch.setattr(envs.blob_envs, "publish", fake_publish_once)
     ref = envs.publish_package(
         package_b64=_pkg_b64(_MINIMAL),
         name="My Env!",
@@ -226,20 +225,16 @@ def test_publish_uploads_to_github_and_returns_slug(monkeypatch):
 
     root = "acme/checkout-bot/my-env"
     assert ref == root
-    assert captured["repo"] == "freesolo-co/environment-hub"
-    assert captured["token"] == "ghp-test"
     assert captured["publish_root"] == root
-    assert captured["message"] == "Upload Flash environment acme/checkout-bot/my-env"
     assert captured["files"] == ["environment.py", "pyproject.toml"]
 
 
 def test_same_name_in_two_projects_publishes_to_separate_roots(monkeypatch):
-    monkeypatch.setenv("GITHUB_TOKEN", "ghp-test")
     published_roots: list[str] = []
     monkeypatch.setattr(
-        envs,
-        "_github_publish_once",
-        lambda *, publish_root, **_kwargs: published_roots.append(publish_root),
+        envs.blob_envs,
+        "publish",
+        lambda slug, dest: published_roots.append(slug) or slug,
     )
     key = {"org_slug": "acme"}
 
@@ -262,13 +257,13 @@ def test_same_name_in_two_projects_publishes_to_separate_roots(monkeypatch):
 
 
 def test_publish_accepts_matching_explicit_namespace(monkeypatch):
-    monkeypatch.setenv("GITHUB_TOKEN", "ghp-test")
     captured: dict[str, object] = {}
 
-    def fake_publish_once(*, publish_root, message, **_kwargs):
-        captured.update(publish_root=publish_root, message=message)
+    def fake_publish_once(slug, dest):
+        captured.update(publish_root=slug)
+        return slug
 
-    monkeypatch.setattr(envs, "_github_publish_once", fake_publish_once)
+    monkeypatch.setattr(envs.blob_envs, "publish", fake_publish_once)
 
     ref = envs.publish_package(
         package_b64=_pkg_b64(_MINIMAL),
@@ -279,12 +274,12 @@ def test_publish_accepts_matching_explicit_namespace(monkeypatch):
 
     assert ref == "benchmark/checkout-bot/math-python"
     assert captured["publish_root"] == "benchmark/checkout-bot/math-python"
-    assert captured["message"] == "Upload Flash environment benchmark/checkout-bot/math-python"
 
 
 def test_publish_rejects_mismatched_explicit_namespace(monkeypatch):
-    monkeypatch.setenv("GITHUB_TOKEN", "ghp-test")
-    monkeypatch.setattr(envs, "_github_publish_once", lambda **_kwargs: None)
+    monkeypatch.setattr(
+        envs.blob_envs, "publish", lambda *args: pytest.fail("storage must not be touched")
+    )
 
     with pytest.raises(envs.EnvPublishError) as excinfo:
         envs.publish_package(
@@ -299,8 +294,9 @@ def test_publish_rejects_mismatched_explicit_namespace(monkeypatch):
 
 
 def test_publish_rejects_invalid_explicit_namespace(monkeypatch):
-    monkeypatch.setenv("GITHUB_TOKEN", "ghp-test")
-    monkeypatch.setattr(envs, "_github_publish_once", lambda **_kwargs: None)
+    monkeypatch.setattr(
+        envs.blob_envs, "publish", lambda *args: pytest.fail("storage must not be touched")
+    )
 
     with pytest.raises(envs.EnvPublishError) as excinfo:
         envs.publish_package(
@@ -315,8 +311,9 @@ def test_publish_rejects_invalid_explicit_namespace(monkeypatch):
 
 
 def test_publish_rejects_bad_input(monkeypatch):
-    monkeypatch.setenv("GITHUB_TOKEN", "ghp-test")
-    monkeypatch.setattr(envs, "_github_publish_once", lambda **_kwargs: None)
+    monkeypatch.setattr(
+        envs.blob_envs, "publish", lambda *args: pytest.fail("storage must not be touched")
+    )
     with pytest.raises(envs.EnvPublishError, match="base64"):
         envs.publish_package(
             package_b64="not base64!!!", name="e", key={}, project_slug="checkout-bot"
@@ -334,27 +331,6 @@ def test_publish_rejects_bad_input(monkeypatch):
             key={"org_slug": "acme"},
             project_slug="checkout-bot",
         )
-
-
-def test_publish_requires_github_token(monkeypatch):
-    monkeypatch.delenv("GITHUB_TOKEN", raising=False)
-    with pytest.raises(envs.EnvPublishError) as excinfo:
-        envs.publish_package(
-            package_b64=_pkg_b64(_MINIMAL), name="e", key={}, project_slug="checkout-bot"
-        )
-    assert excinfo.value.status == 503
-    assert "GITHUB_TOKEN" in str(excinfo.value)
-
-
-def test_publish_does_not_accept_github_pat_alias(monkeypatch):
-    monkeypatch.delenv("GITHUB_TOKEN", raising=False)
-    monkeypatch.setenv("GITHUB_PAT", "github_pat_test")
-    with pytest.raises(envs.EnvPublishError) as excinfo:
-        envs.publish_package(
-            package_b64=_pkg_b64(_MINIMAL), name="e", key={}, project_slug="checkout-bot"
-        )
-    assert excinfo.value.status == 503
-    assert "GITHUB_TOKEN" in str(excinfo.value)
 
 
 def test_record_published_environment_posts_to_backend(monkeypatch):
@@ -1378,24 +1354,6 @@ def test_record_training_checkpoint_rejects_invalid_persisted_project(
     )
 
 
-def test_redacts_raw_and_url_encoded_token():
-    token = "ghp_test/with:special"
-    encoded = "ghp_test%2Fwith%3Aspecial"
-    assert envs._redact(f"https://x-access-token:{encoded}@github.com\n{token}", token) == (
-        "https://x-access-token:<redacted>@github.com\n<redacted>"
-    )
-
-
-def test_copy_package_to_checkout_rejects_escape(tmp_path):
-    source = tmp_path / "source"
-    checkout = tmp_path / "checkout"
-    source.mkdir()
-    checkout.mkdir()
-    (source / "environment.py").write_text("def load_environment(**k): pass\n")
-    with pytest.raises(envs.EnvPublishError, match="unsafe"):
-        envs._copy_package_to_checkout(source=source, checkout=checkout, publish_root="../escape")
-
-
 def test_safe_extract_rejects_traversal(tmp_path):
     buf = io.BytesIO()
     with tarfile.open(fileobj=buf, mode="w:gz") as tar:
@@ -1527,144 +1485,26 @@ def test_safe_extract_allows_environment_sidecars(tmp_path):
         assert (tmp_path / name).read_text() == content
 
 
-def test_push_environment_commit_rebases_before_push(monkeypatch, tmp_path):
-    calls: list[list[str]] = []
-
-    def fake_run_git(cwd, args, *, token):
-        calls.append(args)
-        return subprocess.CompletedProcess(["git", *args], 0, "", "")
-
-    monkeypatch.setattr(envs, "_run_git", fake_run_git)
-    envs._push_environment_commit(checkout=tmp_path, token="tok")
-
-    assert calls == [
-        ["pull", "--rebase", "origin", "main"],
-        ["push", "origin", "HEAD:main"],
-    ]
-
-
-def test_github_publish_retries_concurrent_push(monkeypatch, tmp_path):
-    monkeypatch.setenv("GITHUB_TOKEN", "ghp-test")
-    (tmp_path / "environment.py").write_text("def load_environment(**k): pass\n")
-    calls = {"count": 0}
-
-    def fake_publish_once(**_kwargs):
-        calls["count"] += 1
-        if calls["count"] == 1:
-            raise envs.EnvPublishError("failed to push some refs")
-
-    monkeypatch.setattr(envs, "_github_publish_once", fake_publish_once)
-    monkeypatch.setattr(envs.time, "sleep", lambda _seconds: None)
-
-    ref = envs._github_publish(
-        tmp_path, name="e", key={"org_slug": "acme"}, project_slug="checkout-bot"
-    )
-
-    assert calls["count"] == 2
-    assert ref == "acme/checkout-bot/e"
-
-
-def _git(cwd: Path, *args: str) -> None:
-    subprocess.run(["git", *args], cwd=cwd, check=True, capture_output=True, text=True)
-
-
-def test_github_publish_once_commits_pull_rebases_and_pushes(tmp_path, monkeypatch):
-    remote = tmp_path / "training.git"
-    seed = tmp_path / "seed"
-    seed.mkdir()
-    _git(seed, "init", "--initial-branch", "main")
-    _git(seed, "config", "user.name", "test")
-    _git(seed, "config", "user.email", "test@example.com")
-    (seed / "README.md").write_text("hub\n")
-    _git(seed, "add", "README.md")
-    _git(seed, "commit", "-m", "seed")
-    _git(seed, "init", "--bare", str(remote))
-    _git(seed, "remote", "add", "origin", str(remote))
-    _git(seed, "push", "origin", "main")
-
-    package = tmp_path / "package"
-    package.mkdir()
-    (package / "environment.py").write_text("def load_environment(**k): pass\n")
-
-    monkeypatch.setattr(envs, "_repo_url", lambda repo: str(remote))
-
-    envs._github_publish_once(
-        dest=package,
-        repo="ignored/repo",
-        token="tok",
-        publish_root="ns/env/publish-1",
-        message="Upload test env",
-    )
-
-    verify = tmp_path / "verify"
-    _git(tmp_path, "clone", "--branch", "main", str(remote), str(verify))
-    assert (verify / "ns/env/publish-1/environment.py").read_text() == (
-        "def load_environment(**k): pass\n"
-    )
-
-
-def test_github_publish_once_pushes_toml_configs(tmp_path, monkeypatch):
-    remote = tmp_path / "training.git"
-    seed = tmp_path / "seed"
-    seed.mkdir()
-    _git(seed, "init", "--initial-branch", "main")
-    _git(seed, "config", "user.name", "test")
-    _git(seed, "config", "user.email", "test@example.com")
-    (seed / "README.md").write_text("hub\n")
-    _git(seed, "add", "README.md")
-    _git(seed, "commit", "-m", "seed")
-    _git(seed, "init", "--bare", str(remote))
-    _git(seed, "remote", "add", "origin", str(remote))
-    _git(seed, "push", "origin", "main")
-
-    package = tmp_path / "package"
-    configs = package / "configs"
-    configs.mkdir(parents=True)
-    (package / "environment.py").write_text("def load_environment(**k): pass\n")
-    sft_config = "[training]\nalgorithm = 'sft'\n"
-    opd_config = "[teacher]\nthinking = true\n"
-    (configs / "sft.toml").write_text(sft_config)
-    (configs / "opd_thinking.toml").write_text(opd_config)
-
-    monkeypatch.setattr(envs, "_repo_url", lambda repo: str(remote))
-
-    envs._github_publish_once(
-        dest=package,
-        repo="ignored/repo",
-        token="tok",
-        publish_root="ns/env/publish-1",
-        message="Upload test env",
-    )
-
-    verify = tmp_path / "verify"
-    _git(tmp_path, "clone", "--branch", "main", str(remote), str(verify))
-    published = verify / "ns/env/publish-1/configs"
-    assert (published / "sft.toml").read_text() == sft_config
-    assert (published / "opd_thinking.toml").read_text() == opd_config
-
-
 # ---------------------------------------------------------------------------
 # delete
 # ---------------------------------------------------------------------------
 
 
 def test_delete_package_user_can_delete_own_namespace(monkeypatch):
-    monkeypatch.setenv("GITHUB_TOKEN", "ghp-test")
     seen: dict[str, object] = {}
 
-    def fake_github_delete(slug, *, token):
-        seen.update(slug=slug, token=token)
+    def fake_delete(slug):
+        seen.update(slug=slug)
         return True
 
-    monkeypatch.setattr(envs, "_github_delete", fake_github_delete)
+    monkeypatch.setattr(envs.blob_envs, "delete", fake_delete)
     assert envs.delete_package(slug="acme/checkout-bot/my-env", key={"org_slug": "acme"}) is True
-    assert seen == {"slug": "acme/checkout-bot/my-env", "token": "ghp-test"}
+    assert seen == {"slug": "acme/checkout-bot/my-env"}
 
 
 def test_delete_package_rejects_other_users_namespace(monkeypatch):
-    monkeypatch.setenv("GITHUB_TOKEN", "ghp-test")
     monkeypatch.setattr(
-        envs, "_github_delete", lambda *a, **k: pytest.fail("storage must not be touched")
+        envs.blob_envs, "delete", lambda *a, **k: pytest.fail("storage must not be touched")
     )
     with pytest.raises(envs.EnvPublishError) as excinfo:
         envs.delete_package(slug="someone-else/checkout-bot/env", key={"org_slug": "acme"})
@@ -1672,11 +1512,8 @@ def test_delete_package_rejects_other_users_namespace(monkeypatch):
 
 
 def test_delete_package_internal_key_can_delete_any_namespace(monkeypatch):
-    monkeypatch.setenv("GITHUB_TOKEN", "ghp-test")
     seen: dict[str, object] = {}
-    monkeypatch.setattr(
-        envs, "_github_delete", lambda slug, *, token: seen.update(slug=slug) or True
-    )
+    monkeypatch.setattr(envs.blob_envs, "delete", lambda slug: seen.update(slug=slug) or True)
     assert (
         envs.delete_package(slug="acme/checkout-bot/paper-foo", key={"auth_kind": "internal"})
         is True
@@ -1686,13 +1523,9 @@ def test_delete_package_internal_key_can_delete_any_namespace(monkeypatch):
 
 def test_delete_package_internal_key_rejects_repo_control_namespace(monkeypatch):
     # The internal key bypasses the namespace-ownership check, so _validate_slug is the ONLY barrier
-    # before `git rm -r -- <namespace>/<project>/<name>`. A GENUINE repo-control top-level path (a dir at the
-    # root of the hub checkout) must be rejected so e.g. DELETE /v1/envs/.github/workflows can't
-    # remove tracked repo infrastructure. Only `.git`/`.github` qualify because org slugs can never
-    # be dot-prefixed, so these are never publishable.
-    monkeypatch.setenv("GITHUB_TOKEN", "ghp-test")
+    # before storage is accessed. Reserved namespaces remain invalid after the migration.
     monkeypatch.setattr(
-        envs, "_github_delete", lambda *a, **k: pytest.fail("storage must not be touched")
+        envs.blob_envs, "delete", lambda *a, **k: pytest.fail("storage must not be touched")
     )
     assert {".git", ".github"} == envs._REPO_CONTROL_TOP_LEVEL_PATHS
     assert "source" not in envs._REPO_CONTROL_TOP_LEVEL_PATHS
@@ -1706,14 +1539,13 @@ def test_delete_package_allows_publishable_source_namespace(monkeypatch):
     # blocklist (_BLOCKED_TOP_LEVEL_PATHS via _safe_extract) but is a legitimate org namespace.
     # Delete must therefore reach storage for `source/<project>/<name>` (not 400), or those envs would be
     # publishable-but-undeletable.
-    monkeypatch.setenv("GITHUB_TOKEN", "ghp-test")
     seen: dict[str, str] = {}
 
-    def fake_delete(canonical, *, token):
+    def fake_delete(canonical):
         seen["slug"] = canonical
         return True
 
-    monkeypatch.setattr(envs, "_github_delete", fake_delete)
+    monkeypatch.setattr(envs.blob_envs, "delete", fake_delete)
     # A user key whose org slug is `source` deletes its OWN `source/<project>/<name>`.
     source_key = {"org_slug": "source"}
     assert envs.namespace_for(source_key) == "source"
@@ -1728,9 +1560,8 @@ def test_delete_package_allows_publishable_source_namespace(monkeypatch):
 
 
 def test_delete_package_validates_slug(monkeypatch):
-    monkeypatch.setenv("GITHUB_TOKEN", "ghp-test")
     monkeypatch.setattr(
-        envs, "_github_delete", lambda *a, **k: pytest.fail("storage must not be touched")
+        envs.blob_envs, "delete", lambda *a, **k: pytest.fail("storage must not be touched")
     )
     # incl. a valid three-segment id with a trailing or leading slash from a `:path` route
     # capture, or surrounding or embedded whitespace: each must be rejected rather than normalized,
@@ -1770,169 +1601,6 @@ def test_canonical_env_id_accepts_only_canonical_form():
     ):
         with pytest.raises(envs.EnvPublishError):
             envs.canonical_env_id(bad)
-
-
-def test_delete_package_requires_github_token(monkeypatch):
-    monkeypatch.delenv("GITHUB_TOKEN", raising=False)
-    with pytest.raises(envs.EnvPublishError) as excinfo:
-        envs.delete_package(slug="acme/checkout-bot/x", key={"auth_kind": "internal"})
-    assert excinfo.value.status == 503
-    assert "GITHUB_TOKEN" in str(excinfo.value)
-
-
-def test_github_delete_once_removes_dir_and_pushes(tmp_path, monkeypatch):
-    remote = tmp_path / "hub.git"
-    seed = tmp_path / "seed"
-    seed.mkdir()
-    _git(seed, "init", "--initial-branch", "main")
-    _git(seed, "config", "user.name", "test")
-    _git(seed, "config", "user.email", "test@example.com")
-    (seed / "README.md").write_text("hub\n")
-    env_dir = seed / "ns" / "project" / "env"
-    env_dir.mkdir(parents=True)
-    (env_dir / "environment.py").write_text("def load_environment(**k): pass\n")
-    _git(seed, "add", "-A")
-    _git(seed, "commit", "-m", "seed")
-    _git(seed, "init", "--bare", str(remote))
-    _git(seed, "remote", "add", "origin", str(remote))
-    _git(seed, "push", "origin", "main")
-
-    monkeypatch.setattr(envs, "_repo_url", lambda repo: str(remote))
-    removed = envs._github_delete_once(
-        repo="ignored/repo", token="tok", publish_root="ns/project/env", message="Delete test env"
-    )
-
-    assert removed is True
-    verify = tmp_path / "verify"
-    _git(tmp_path, "clone", "--branch", "main", str(remote), str(verify))
-    assert not (verify / "ns" / "project" / "env").exists()
-    # unrelated content is untouched
-    assert (verify / "README.md").read_text() == "hub\n"
-
-
-def test_github_delete_once_idempotent_when_absent(tmp_path, monkeypatch):
-    remote = tmp_path / "hub.git"
-    seed = tmp_path / "seed"
-    seed.mkdir()
-    _git(seed, "init", "--initial-branch", "main")
-    _git(seed, "config", "user.name", "test")
-    _git(seed, "config", "user.email", "test@example.com")
-    (seed / "README.md").write_text("hub\n")
-    _git(seed, "add", "-A")
-    _git(seed, "commit", "-m", "seed")
-    _git(seed, "init", "--bare", str(remote))
-    _git(seed, "remote", "add", "origin", str(remote))
-    _git(seed, "push", "origin", "main")
-
-    monkeypatch.setattr(envs, "_repo_url", lambda repo: str(remote))
-    removed = envs._github_delete_once(
-        repo="ignored/repo", token="tok", publish_root="ns/project/absent", message="Delete absent"
-    )
-    assert removed is False
-
-
-def test_staged_has_changes_maps_exit_codes(monkeypatch, tmp_path):
-    # 1 => staged changes, 0 => clean; any other code (e.g. 128 for a broken repo) is a controlled
-    # error, never a "go ahead and commit/push" signal, and a missing git binary is a 503.
-    def fake_run(returncode):
-        def _run(*_a, **_k):
-            return subprocess.CompletedProcess(["git"], returncode, "", "fatal: not a git repo")
-
-        return _run
-
-    monkeypatch.setattr(envs.subprocess, "run", fake_run(1))
-    assert envs._staged_has_changes(tmp_path) is True
-    monkeypatch.setattr(envs.subprocess, "run", fake_run(0))
-    assert envs._staged_has_changes(tmp_path) is False
-
-    monkeypatch.setattr(envs.subprocess, "run", fake_run(128))
-    with pytest.raises(envs.EnvPublishError) as excinfo:
-        envs._staged_has_changes(tmp_path)
-    assert excinfo.value.status == 502
-
-    def _missing(*_a, **_k):
-        raise FileNotFoundError("git")
-
-    monkeypatch.setattr(envs.subprocess, "run", _missing)
-    with pytest.raises(envs.EnvPublishError) as exc_missing:
-        envs._staged_has_changes(tmp_path)
-    assert exc_missing.value.status == 503
-
-
-def test_github_delete_once_reapplies_removal_after_concurrent_publish(tmp_path, monkeypatch):
-    # A concurrent publish adds a NEW sidecar under the SAME slug after our checkout clones but
-    # before the push. The rebase only replays our original removal, so without re-running `git rm`
-    # the sidecar would survive and the slug would be only partially deleted while we report success.
-    remote = tmp_path / "hub.git"
-    seed = tmp_path / "seed"
-    seed.mkdir()
-    _git(seed, "init", "--initial-branch", "main")
-    _git(seed, "config", "user.name", "test")
-    _git(seed, "config", "user.email", "test@example.com")
-    (seed / "README.md").write_text("hub\n")
-    env_dir = seed / "ns" / "project" / "env"
-    env_dir.mkdir(parents=True)
-    (env_dir / "environment.py").write_text("def load_environment(**k): pass\n")
-    _git(seed, "add", "-A")
-    _git(seed, "commit", "-m", "seed")
-    _git(seed, "init", "--bare", str(remote))
-    _git(seed, "remote", "add", "origin", str(remote))
-    _git(seed, "push", "origin", "main")
-
-    monkeypatch.setattr(envs, "_repo_url", lambda repo: str(remote))
-
-    # Inject the concurrent publish exactly once, right as the original delete commit is staged
-    # (the first `_staged_has_changes` call) — before `_push_environment_delete` rebases — by pushing
-    # a sidecar under ns/project/env through a separate clone.
-    real_staged = envs._staged_has_changes
-    state = {"injected": False}
-
-    def staged_with_injection(checkout, *, token=""):
-        result = real_staged(checkout, token=token)
-        if not state["injected"]:
-            state["injected"] = True
-            other = tmp_path / "other"
-            _git(tmp_path, "clone", "--branch", "main", str(remote), str(other))
-            _git(other, "config", "user.name", "other")
-            _git(other, "config", "user.email", "other@example.com")
-            (other / "ns" / "project" / "env" / "extra.py").write_text(
-                "# concurrently added sidecar\n"
-            )
-            _git(other, "add", "-A")
-            _git(other, "commit", "-m", "concurrent publish under same slug")
-            _git(other, "push", "origin", "main")
-        return result
-
-    monkeypatch.setattr(envs, "_staged_has_changes", staged_with_injection)
-
-    removed = envs._github_delete_once(
-        repo="ignored/repo",
-        token="tok",
-        publish_root="ns/project/env",
-        message="Delete ns/project/env",
-    )
-    assert removed is True
-
-    verify = tmp_path / "verify"
-    _git(tmp_path, "clone", "--branch", "main", str(remote), str(verify))
-    # The slug directory is FULLY gone despite the concurrent re-add under it.
-    assert not (verify / "ns" / "project" / "env").exists()
-    assert (verify / "README.md").read_text() == "hub\n"
-
-
-def test_github_delete_retries_concurrent_push(monkeypatch):
-    calls = {"count": 0}
-
-    def fake_delete_once(**_kwargs):
-        calls["count"] += 1
-        if calls["count"] == 1:
-            raise envs.EnvPublishError("failed to push some refs")
-        return True
-
-    monkeypatch.setattr(envs, "_github_delete_once", fake_delete_once)
-    monkeypatch.setattr(envs.time, "sleep", lambda _seconds: None)
-    assert envs._github_delete("ns/project/env", token="tok") is True
-    assert calls["count"] == 2
 
 
 def test_record_deleted_environment_sends_delete(monkeypatch):

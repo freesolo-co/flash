@@ -380,7 +380,7 @@ def cmd_checkpoints(args) -> int:
     if not checkpoints:
         message = (
             f"no deployable checkpoints for {args.run_id} yet "
-            "(RL/opd stream one per save interval; SFT-only runs have none)."
+            "(RL stream one per save interval; SFT-only runs have none)."
         )
         if render.styled():
             print(render.empty("checkpoints", "0 deployable", message))

@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import base64
 import io
-import json
 import urllib.parse
 from dataclasses import dataclass
 from pathlib import Path
@@ -41,9 +40,7 @@ _IMAGE_TARGET_BLOCK_TYPES = (*_IMAGE_BLOCK_TYPES, "output_image")
 _TEXT_BLOCK_TYPES = ("text", "input_text")
 _IMAGE_DETAIL_VALUES = ("auto", "low", "high")
 _ALLOWED_MESSAGE_ROLES = ("system", "user", "assistant", "tool")
-IMAGE_TEACHER_PLACEHOLDER = "<|media_pad|>"
-# the model's real image-expansion token, as opposed to the placeholder above. one definition so
-# the renderer's rejection and the teacher client's drop guard cannot drift apart.
+# The model's real image-expansion token.
 IMAGE_PAD_TOKEN = "<|image_pad|>"
 
 
@@ -277,7 +274,7 @@ def completion_has_images(messages: object) -> bool:
 
 
 def text_only_prompt_messages(messages: list[dict]) -> list[dict]:
-    """Drop image content blocks while preserving the teacher's message order and text."""
+    """Drop image content blocks while preserving message order and text."""
     stripped: list[dict] = []
     for message in messages:
         copied = dict(message)
@@ -294,91 +291,13 @@ def text_only_prompt_messages(messages: list[dict]) -> list[dict]:
     return stripped
 
 
-def _reject_literal_image_placeholder(
-    text: str,
-    message_index: int,
-    markers: tuple[str, ...] = (IMAGE_TEACHER_PLACEHOLDER, IMAGE_PAD_TOKEN),
-) -> None:
-    """Reject prompt text that already contains a reserved image marker.
-
-    two distinct markers, one reason. the rendered prompt marks image positions with
-    ``IMAGE_TEACHER_PLACEHOLDER`` and the teacher client splits on every occurrence to pair each
-    one with an image, so a placeholder in the USER'S OWN text is indistinguishable from one this
-    renderer inserted and would be paired with an image that does not exist.
-
-    ``IMAGE_PAD_TOKEN`` is the model's real special token: whatever the provider expands an image
-    into. the silent-drop guard counts its runs in the returned prompt ids and requires at least
-    one run per supplied image. text containing the literal token encodes to that same id, so it
-    contributes a run the renderer never produced -- and a run from text can make up for an image
-    the provider silently dropped, which is exactly the failure the guard exists to catch. keeping
-    it out of the source text is what makes "one run per image" mean what it says.
-
-    ``markers`` narrows the set for callers where only one of the two is live. local sft training
-    never renders the teacher placeholder, so a literal ``<|media_pad|>`` there is ordinary text
-    for a qwen tokenizer and rejecting it would be a false refusal.
-    """
-    for marker in markers:
-        if marker in text:
-            raise ValueError(
-                f"message {message_index} text contains the reserved image marker "
-                f"{marker!r}; remove it from the prompt"
-            )
-
-
-def image_teacher_prompt_messages(messages: list[dict], descriptor_count: int) -> list[dict]:
-    """Render normalized image blocks as Kimi media placeholders without changing text order."""
-    from flash.content.thinking import _messages_for_content_only_serialization
-
-    messages = _messages_for_content_only_serialization(messages)
-    rendered: list[dict] = []
-    image_count = 0
-    for message_index, message in enumerate(messages):
-        copied = dict(message)
-        content = copied.get("content")
-        if isinstance(content, list):
-            parts: list[str] = []
-            # text blocks since the last image, joined and checked as one run. a marker split
-            # across adjacent text blocks ("<|media_" then "pad|>") is invisible per block and
-            # only becomes literal once concatenated, so the run is the unit that has to be
-            # validated. an image block ends a run: the renderer's own placeholder goes there,
-            # and user text on either side of it cannot reach across to form a marker.
-            text_run: list[str] = []
-            for block_index, block in enumerate(content):
-                if not isinstance(block, dict):
-                    raise ValueError(
-                        f"malformed content block at message {message_index}, index {block_index}: "
-                        "expected an object"
-                    )
-                block_type = block.get("type")
-                if block_type in _TEXT_BLOCK_TYPES and isinstance(block.get("text"), str):
-                    _reject_literal_image_placeholder(block["text"], message_index)
-                    text_run.append(block["text"])
-                    parts.append(block["text"])
-                elif block_type in _IMAGE_BLOCK_TYPES:
-                    _reject_literal_image_placeholder("".join(text_run), message_index)
-                    text_run = []
-                    parts.append(IMAGE_TEACHER_PLACEHOLDER)
-                    image_count += 1
-                else:
-                    raise ValueError(
-                        f"unsupported content block type {block_type!r} at message "
-                        f"{message_index}, index {block_index}"
-                    )
-            _reject_literal_image_placeholder("".join(text_run), message_index)
-            copied["content"] = "".join(parts)
-        elif content is None:
-            copied["content"] = ""
-        elif isinstance(content, str):
-            _reject_literal_image_placeholder(content, message_index)
-        else:
-            raise ValueError(f"message {message_index} content must be text or content blocks")
-        rendered.append(copied)
-    if image_count != descriptor_count:
+def _reject_literal_image_placeholder(text: str, message_index: int) -> None:
+    """Reject authored text that could impersonate a processor-generated image token."""
+    if IMAGE_PAD_TOKEN in text:
         raise ValueError(
-            f"image teacher prompt contains {image_count} placeholder(s), expected "
-            f"{descriptor_count} normalized image descriptor(s)"
+            f"message {message_index} text contains the reserved image marker "
+            f"{IMAGE_PAD_TOKEN!r}; remove it from the prompt"
         )
-    return rendered
 
 
 def _canonical_message_role(role: object, message_index: int) -> str:
@@ -510,23 +429,15 @@ def normalize_prompt_images(
             add_descriptor(source)
             image_blocks.append({"type": "image"})
         normalized[first_user]["content"] = [*content, *image_blocks]
-    # checked here, on the finished blocks, rather than inside the loop above: string content never
-    # enters that loop, and the top-level-image path appends to a message the loop already passed.
-    # this is the one point every shape has converged to the same form.
-    #
-    # the unit is a RUN of consecutive text blocks, not one block, for the reason the teacher
-    # renderer already documents: "<|image_" and "pad|>" are each harmless alone and only become
-    # the reserved marker once the template concatenates them. an image block ends a run, since the
-    # processor puts its own expansion there and user text cannot reach across it.
     for message_index, message in enumerate(normalized):
         text_run: list[str] = []
         for block in message["content"]:
             if block.get("type") == "text":
                 text_run.append(block["text"])
                 continue
-            _reject_literal_image_placeholder("".join(text_run), message_index, (IMAGE_PAD_TOKEN,))
+            _reject_literal_image_placeholder("".join(text_run), message_index)
             text_run = []
-        _reject_literal_image_placeholder("".join(text_run), message_index, (IMAGE_PAD_TOKEN,))
+        _reject_literal_image_placeholder("".join(text_run), message_index)
     if not defer_validation:
         validate_image_descriptors(descriptors, package_root)
     return NormalizedImages(normalized, descriptors)
@@ -675,7 +586,7 @@ def _decode_image_bytes(data: bytes):
 def messages_with_decoded_images(messages: list[dict], images: list[object]) -> list[dict]:
     """Bind decoded images into a message list's image blocks, in order.
 
-    Shared by sft, opd, and grpo: each algorithm decodes the row's descriptors itself and then
+    Shared by SFT and GRPO: each algorithm decodes the row's descriptors itself and then
     needs the same binding into the chat-template input.
     """
     image_iter = iter(images)
@@ -766,34 +677,18 @@ def resolve_image_pad_token_id(processor, tok) -> int:
     raise ValueError("could not resolve a valid image-pad token id from the processor or tokenizer")
 
 
-def validate_multimodal_training(model_id: str, algorithm: str, teacher_model: str | None) -> None:
+def validate_multimodal_training(model_id: str) -> None:
     from flash.core.catalog import supports_image_training
-    from flash.engine.plan.recipe import resolve_teacher, teacher_supports_images
 
     if not supports_image_training(model_id):
         raise ValueError(f"{model_id} does not support image-bearing training records")
-    if algorithm == "opd":
-        teacher = resolve_teacher(teacher_model)
-        if not teacher_supports_images(teacher.alias):
-            from flash.engine.plan.recipe import image_capable_teacher_aliases
-
-            choices = " or ".join(f'"{alias}"' for alias in image_capable_teacher_aliases())
-            raise ValueError(
-                f"image-bearing opd requires [train] teacher_model = {choices}; "
-                f"the selected teacher {teacher.alias!r} cannot see images"
-            )
 
 
 def validate_image_observation_environment(env: object, spec: object) -> None:
     """Require image-capable training inputs for an env that can emit image observations."""
     if not bool(getattr(env, "image_observations", False)):
         return
-    train = getattr(spec, "train", None)
-    validate_multimodal_training(
-        str(getattr(spec, "model", "")),
-        str(getattr(spec, "algorithm", "")),
-        getattr(train, "teacher_model", None),
-    )
+    validate_multimodal_training(str(getattr(spec, "model", "")))
 
 
 def message_content_text(content: object) -> str:
@@ -812,88 +707,3 @@ def message_content_text(content: object) -> str:
             if isinstance(block, dict) and block.get("type") in _TEXT_BLOCK_TYPES
         )
     return ""
-
-
-def _record_messages(record: dict) -> list[dict]:
-    value = record.get("input")
-    if isinstance(value, list) and all(isinstance(message, dict) for message in value):
-        return value
-    return []
-
-
-def _read_json_records(path: Path) -> list[dict]:
-    if path.suffix.lower() == ".jsonl":
-        rows = []
-        with path.open(encoding="utf-8") as handle:
-            for line_number, line in enumerate(handle, 1):
-                if not line.strip():
-                    continue
-                try:
-                    row = json.loads(line)
-                except json.JSONDecodeError as exc:
-                    raise ValueError(
-                        f"invalid packaged dataset JSON at {path}:{line_number}"
-                    ) from exc
-                if not isinstance(row, dict):
-                    raise ValueError(f"packaged dataset row {line_number} must be an object")
-                rows.append(row)
-        return rows
-    try:
-        value = json.loads(path.read_text(encoding="utf-8"))
-    except json.JSONDecodeError as exc:
-        raise ValueError(f"invalid packaged dataset JSON at {path}") from exc
-    if isinstance(value, dict):
-        value = value.get("records", value.get("data"))
-    if not isinstance(value, list) or not all(isinstance(row, dict) for row in value):
-        raise ValueError(f"packaged dataset at {path} must contain a list of objects")
-    return value
-
-
-def preflight_validate_image_opd(spec, *, scan_packaged_environment: bool = True) -> None:
-    """validate statically discoverable image opd datasets before gpu allocation."""
-    if getattr(spec, "algorithm", "") != "opd":
-        return
-    environment = getattr(spec, "environment", None)
-    params = dict(getattr(environment, "params", None) or {})
-    records = params.get("records")
-    if records is not None:
-        if not isinstance(records, list) or not all(isinstance(row, dict) for row in records):
-            return
-    else:
-        if not scan_packaged_environment:
-            return
-        from flash.envs.loading.loader import (
-            _packaged_dataset_file,
-            _resolve_environment_reference,
-            _resolve_path_arg,
-            _validate_packaged_dataset_split,
-        )
-
-        env = spec.environment
-        reference = _resolve_environment_reference(env.id, env.resolved_sha or None)
-        reference_path = Path(reference)
-        base_dir = reference_path.parent if reference_path.exists() else Path.cwd()
-        source = params.get("dataset_path")
-        if source:
-            source = _resolve_path_arg(source, base_dir)
-            path = Path(source) if isinstance(source, str) else None
-        else:
-            split = params.get("split")
-            split = split.strip() if isinstance(split, str) else "train"
-            split = _validate_packaged_dataset_split(split or "train")
-            path = _packaged_dataset_file(base_dir, split)
-        if path is None or not path.is_file() or path.suffix.lower() not in {".json", ".jsonl"}:
-            return
-        records = _read_json_records(path)
-    train = getattr(spec, "train", None)
-    max_examples = int(getattr(train, "max_examples", 0) or 0)
-    if max_examples > 0:
-        records = records[:max_examples]
-    for record in records:
-        if record_has_images(record, _record_messages(record)):
-            validate_multimodal_training(
-                str(getattr(spec, "model", "")),
-                "opd",
-                getattr(train, "teacher_model", None),
-            )
-            return

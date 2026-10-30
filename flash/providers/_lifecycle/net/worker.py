@@ -13,15 +13,11 @@ from flash.client.runtime_secrets import DEFAULT_RUNTIME_SECRET_KEYS
 from flash.core.grpo import GRPO_CONTROL_PLANE_OWNED_ENV_KEYS, GRPO_NATIVE_THREAD_ENV
 from flash.core.spec import (
     CONTROL_PLANE_OWNED_ENV_KEYS,
-    MANAGED_TEACHER_CREDENTIAL_ENV_KEYS,
-    PUBLIC_URL_ENV,
-    TEACHER_CAPABILITY_ENV,
     JobSpec,
     parse_seed,
 )
 from flash.providers.artifacts.hf import hf_call, hf_status_code
 from flash.providers.core.base import get_gpu_info
-from flash.teacher.retry_contract import OPD_RESUME_REVISION_ENV
 
 logger = get_logger(__name__)
 
@@ -135,15 +131,7 @@ def build_worker_env(
     runtime_secrets: dict[str, str] | None = None,
 ) -> dict:
     """Per-run env passed to the worker from managed control-plane inputs."""
-    declared_managed_credentials = sorted(
-        set(spec.environment.secrets) & MANAGED_TEACHER_CREDENTIAL_ENV_KEYS
-    )
-    if declared_managed_credentials:
-        raise ValueError(
-            "environment secrets must not include managed teacher credential names: "
-            + ", ".join(declared_managed_credentials)
-        )
-    # GRPO and OPD run a verl vLLM rollout (`actor_rollout_ref.rollout.name=vllm`), and verl
+    # GRPO run a verl vLLM rollout (`actor_rollout_ref.rollout.name=vllm`), and verl
     # leaves rollout.enable_sleep_mode defaulted True, so the engine always builds a
     # CuMemAllocator -- which asserts outright on "expandable_segments:True"
     # (vllm/device_allocator/cumem.py:132, pytorch#147851). Both therefore take the
@@ -195,27 +183,6 @@ def build_worker_env(
     for k, v in (runtime_secrets or {}).items():
         if k in allowed_runtime_secrets and v:
             env[k] = str(v)
-    # the pinned resume revision is control-plane-owned transport, not a user-declared secret.
-    # lifecycle removes caller input and supplies only the gate-approved sha on a required replacement.
-    env.pop(OPD_RESUME_REVISION_ENV, None)
-    resume_revision = (runtime_secrets or {}).get(OPD_RESUME_REVISION_ENV)
-    if resume_revision:
-        env[OPD_RESUME_REVISION_ENV] = str(resume_revision)
-
-    # managed teacher provider credentials stay control-plane-only even if a caller declares or
-    # supplies the same names as runtime secrets. opd receives only the control-panel origin and its
-    # attempt-scoped teacher capability.
-    for key in MANAGED_TEACHER_CREDENTIAL_ENV_KEYS:
-        env.pop(key, None)
-    env.pop(PUBLIC_URL_ENV, None)
-    env.pop(TEACHER_CAPABILITY_ENV, None)
-    if str(getattr(spec, "algorithm", "")).lower() == "opd":
-        public_url = str((runtime_secrets or {}).get(PUBLIC_URL_ENV) or "").strip()
-        capability = str((runtime_secrets or {}).get(TEACHER_CAPABILITY_ENV) or "").strip()
-        if not public_url or not capability:
-            raise RuntimeError("managed opd control-panel teacher transport is missing")
-        env[PUBLIC_URL_ENV] = public_url
-        env[TEACHER_CAPABILITY_ENV] = capability
     if str(getattr(spec, "algorithm", "")).lower() == "grpo":
         env.update(GRPO_NATIVE_THREAD_ENV)
     # declared runtime secrets can carry any name, so their names are listed explicitly for the
@@ -223,7 +190,7 @@ def build_worker_env(
     # heuristic alone would let AWS_SECRET_ACCESS_KEY-style values through. set last so no
     # runtime secret can clobber it -- SECRET_ENV_KEYS_ENV is control-plane-owned, so a job cannot
     # declare it as a secret and have its value overwritten by this list.
-    secret_keys = (set(allowed_runtime_secrets) | {TEACHER_CAPABILITY_ENV}) & set(env)
+    secret_keys = set(allowed_runtime_secrets) & set(env)
     # the list is comma-joined, so a name containing a comma would arrive at every redactor as two
     # unrelated names and its value would never be recognized. [environment] secrets rejects those
     # names at declaration; this is the fail-closed guard, because emitting a silently ambiguous

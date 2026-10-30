@@ -38,7 +38,7 @@ def test_normalized_environment_name_starts_with_alphanumeric(value):
     assert normalize_env_name_segment(value) == "my-env"
 
 
-@pytest.mark.parametrize("algorithm", ["sft", "grpo", "opd"])
+@pytest.mark.parametrize("algorithm", ["sft", "grpo"])
 @pytest.mark.parametrize("field", ["lora_rank", "max_context_tokens", "max_completion_tokens"])
 def test_spec_rejects_dimensions_that_overflow_sizing(algorithm, field):
     with pytest.raises(ConfigError):

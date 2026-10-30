@@ -92,25 +92,17 @@ def test_shape_sizing_keeps_the_measured_lora_floor(model_id: str):
         (in_features + out_features) * count
         for in_features, out_features, count in info.lora_target_shapes
     )
-    exact_opd_gb = rank * target_dims * _LORA_ADAMW_BYTES_PER_PARAM / 1e9
-    sized_gb = _lora_memory_gb(rank, effective_params_b, "opd", info)
+    exact_sft_gb = rank * target_dims * _LORA_ADAMW_BYTES_PER_PARAM / 1e9
+    sized_gb = _lora_memory_gb(rank, effective_params_b, "sft", info)
 
-    assert sized_gb >= exact_opd_gb
+    assert sized_gb >= exact_sft_gb
     assert sized_gb >= _legacy_lora_floor_gb(rank, effective_params_b)
 
 
-@pytest.mark.parametrize("algorithm", ["sft", "opd"])
+@pytest.mark.parametrize("algorithm", ["sft"])
 @pytest.mark.parametrize("model_id", tuple(MODELS))
-def test_sizing_covers_fp32_adamw_for_sft_and_opd(model_id: str, algorithm: str):
-    """SFT and OPD size on fp32 AdamW. verl builds torch.optim.AdamW for both -- OPD inherits verl's
-    own default and SFT names it explicitly for FSDP2/DTensor safety. the managed backend is not a
-    sizing input, so the estimate must cover the AdamW footprint unconditionally; sizing on the
-    8-bit paged optimizer under-reserves a verl run and
-    places it on a card that cannot hold its optimizer state.
-
-    GRPO is excluded on purpose: verl GRPO runs AdamW too, but its estimate is already at the B200
-    ceiling (the 35B MoE at 4096 ctx sizes to 180 GB exactly), so widening it rejects a configuration
-    that runs today. that gap is tracked separately and needs the resident-peak model retuned."""
+def test_sizing_covers_fp32_adamw_for_sft(model_id: str, algorithm: str):
+    """SFT sizing covers the fp32 AdamW state used by the trainer."""
     info = MODELS[model_id]
     rank = serving_lora_rank_cap(model_id) or 64
     target_dims = sum(

@@ -92,7 +92,7 @@ def _write_terminal_metadata(
         train_wall=train_wall,
         setup_seconds=setup_seconds,
         train_tokens=0,
-        # carry the completed step, as the sft and opd finalizers already do. without it the
+        # carry the completed step, as the sft finalizers already do. without it the
         # rl_train_done and done heartbeats land stepless and overwrite the stepped rl_trained ping
         # above, so a cancel arriving between here and DONE reprices a fully trained run at zero
         # steps (actual_steps_run returns 0 for a non-training stage with no step).

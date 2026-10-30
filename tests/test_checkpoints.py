@@ -99,7 +99,7 @@ def test_publish_deployable_checkpoint_uploads_adapter_only(worker_context, tmp_
 def test_publish_deployable_checkpoint_writes_base_model_provenance(
     worker_context, tmp_path, monkeypatch
 ):
-    # regression (#538 finding 6): a per-step / opd-reconcile deployable is published straight from a
+    # regression (#538 finding 6): a per-step deployable is published straight from a
     # trainer dir that never passed through the final _save_adapter path, so publish itself stamps the
     # base-model provenance sidecar, sourced from the job spec's pinned base model, before uploading.
     import json
@@ -765,14 +765,13 @@ def test_deployable_commit_survives_reporting_failure_without_reupload(
     assert len(uploads) == 1
 
 
-@pytest.mark.parametrize("algorithm", ["sft", "opd"])
+@pytest.mark.parametrize("algorithm", ["sft"])
 def test_required_watcher_retries_adapter_before_publishing_resume(
     worker_context, tmp_path, monkeypatch, algorithm
 ):
     from pathlib import Path
 
     from flash.engine.worker.train.entry import sft_train
-    from flash.engine.worker.train.opd.orchestration import failures as opd
     from flash.engine.worker.train.sft.setup.checkpoints import _VerlCheckpointWatcher
 
     uploads = []
@@ -801,8 +800,6 @@ def test_required_watcher_retries_adapter_before_publishing_resume(
         return worker.PublicationResult(resume=worker.ArtifactCommit("native", "native-commit"))
 
     monkeypatch.setattr(sft_train, "_export_checkpoint_adapter", export)
-    monkeypatch.setattr(opd, "_export_checkpoint_adapter", export)
-    monkeypatch.setattr(opd, "_stage_retry_contract", lambda *args, **kwargs: None)
     monkeypatch.setattr(worker, "upload_resume_checkpoint", resume)
     options = {
         "local_dir": str(tmp_path),
@@ -812,18 +809,7 @@ def test_required_watcher_retries_adapter_before_publishing_resume(
         "model_revision": "commit",
         "required_steps": (1,),
     }
-    if algorithm == "opd":
-        watcher = opd._OpdVerlCheckpointWatcher(
-            **options,
-            seed=42,
-            prompt_pool_fingerprint="a" * 64,
-            prompts_per_step=2,
-            group_size=3,
-            accounting_state=lambda step: {},
-            context=worker_context,
-        )
-    else:
-        watcher = _VerlCheckpointWatcher(**options, context=worker_context)
+    watcher = _VerlCheckpointWatcher(**options, context=worker_context)
     checkpoint = tmp_path / "global_step_1"
     (checkpoint / "actor").mkdir(parents=True)
     watcher._publish(1, str(checkpoint))

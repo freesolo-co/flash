@@ -1,26 +1,8 @@
-"""Coalesce concurrent scoring requests into one ordered batched call.
+"""Coalesce concurrent GRPO reward requests into ordered batches in the parent worker.
 
-Both RL paths need the same thing: verl's child process fires many scoring requests at once, and the
-thing that answers them (a flash env's judge for GRPO, a managed teacher for OPD) is far cheaper per
-item when handed a batch. A single daemon thread takes whatever is pending once the oldest waiter's
-grace period expires, scores it in one call, and scatters the results back in request order. One
-thread means the scorer still sees exactly one top-level call at a time; concurrency lives inside the
-scorer's own batched implementation.
-
-Parent-side only. The batchers live on the flash side of the verl process boundary (the child
-reaches them over the reward/teacher rpc bridges), so this module must never be imported by the
-packaged child modules -- this batcher is owned by the parent worker.
-
-Callers differ in three ways, each a constructor argument rather than a fork in the code:
-
-* ``make_error`` builds the errors this module raises itself -- shutdown, a stopped thread, a waiter
-  that completed with nothing. GRPO wants a plain ``RuntimeError``; OPD wants a permanent
-  ``TeacherError`` so the caller does not retry a batcher that is gone.
-* ``wrap_batch_error`` re-shapes an exception raised by ``score_batch`` before it reaches the
-  waiters. GRPO propagates as-is; OPD narrows to its own error type, preserving permanence.
-* ``cancel_undispatched_on_close`` decides whether ``close`` immediately cancels work that has not
-  yet won the condition-protected dispatch claim. Leaving it off gives the consumer the bounded
-  shutdown window to claim the final partial batch; turning it on fails that work without scoring it.
+A single daemon thread gathers requests until the oldest waiter's grace period expires,
+scores the batch, and scatters results in request order. Shutdown gives pending work a
+bounded drain window and propagates scoring failures to all affected waiters.
 """
 
 from __future__ import annotations
@@ -57,14 +39,14 @@ class _Waiter:
             self.error = error
             self.done.set()
 
-    def wait(self, make_error: Callable[[str], Exception]) -> Any:
+    def wait(self) -> Any:
         # no deadline: the wait is the scorer's own time plus however long the batch ahead of it
         # takes, and the caller's stall watchdog is what catches a genuinely wedged scorer.
         self.done.wait()
         if self.error is not None:
             raise self.error
         if self.result is None:
-            raise make_error(f"{self.label} waiter completed without a result")
+            raise RuntimeError(f"{self.label} waiter completed without a result")
         return self.result
 
 
@@ -85,9 +67,6 @@ class ScoreBatcher:
         flush_wait_s: float,
         label: str,
         thread_name: str,
-        make_error: Callable[[str], Exception] = RuntimeError,
-        wrap_batch_error: Callable[[Exception], Exception] | None = None,
-        cancel_undispatched_on_close: bool = False,
     ) -> None:
         if max_batch_size <= 0:
             raise ValueError(f"{label} batch size must be positive")
@@ -98,9 +77,6 @@ class ScoreBatcher:
         self.flush_wait_s = float(flush_wait_s)
         self.label = label
         self.thread_name = thread_name
-        self._make_error = make_error
-        self._wrap_batch_error = wrap_batch_error
-        self._cancel_undispatched_on_close = bool(cancel_undispatched_on_close)
         self._condition = threading.Condition()
         self._pending: list[_Waiter] = []
         self._in_flight: list[_Waiter] = []
@@ -111,7 +87,7 @@ class ScoreBatcher:
         """Start the consumer thread; idempotent and safe to race."""
         with self._condition:
             if self._closed:
-                raise self._make_error(f"{self.label} shut down")
+                raise RuntimeError(f"{self.label} shut down")
             if self._thread is not None:
                 return
             thread = threading.Thread(target=self._run, name=self.thread_name, daemon=True)
@@ -123,11 +99,11 @@ class ScoreBatcher:
         self.start()
         with self._condition:
             if self._closed:
-                raise self._make_error(f"{self.label} shut down")
+                raise RuntimeError(f"{self.label} shut down")
             waiter = _Waiter(request, enqueued_at=time.monotonic(), label=self.label)
             self._pending.append(waiter)
             self._condition.notify_all()
-        return waiter.wait(self._make_error)
+        return waiter.wait()
 
     def _claim_batch(self) -> list[_Waiter] | None:
         """Wait for work, then atomically cancel it or claim it for dispatch."""
@@ -164,16 +140,15 @@ class ScoreBatcher:
                     for waiter, result in scattered:
                         waiter.complete(result=result)
                 except Exception as error:
-                    wrapped = self._wrap_batch_error(error) if self._wrap_batch_error else error
                     for waiter in batch:
-                        waiter.complete(error=wrapped)
+                        waiter.complete(error=error)
                 with self._condition:
                     self._in_flight = []
                     self._condition.notify_all()
         finally:
             # the thread is leaving for good, so anything still queued or in flight will never be
             # answered. fail them here rather than leaving their callers blocked forever.
-            error = self._make_error(f"{self.label} stopped")
+            error = RuntimeError(f"{self.label} stopped")
             with self._condition:
                 stranded = [*self._pending, *self._in_flight]
                 self._pending.clear()
@@ -201,20 +176,14 @@ class ScoreBatcher:
         there is no flag for it: a thread that exited has already cleared ``_in_flight`` and settled
         its own stranded waiters in ``_run``'s ``finally``, leaving nothing for the drain to find.
         """
-        error = self._make_error(f"{self.label} shut down")
+        error = RuntimeError(f"{self.label} shut down")
         deadline = time.monotonic() + max(0.0, timeout_s)
         with self._condition:
             self._closed = True
             self._condition.notify_all()
             thread = self._thread
-            # the consumer cannot run while this holds the condition, so skipping the window below
-            # means it never gets to claim -- which is exactly what an unbillable dispatch needs.
-            while (
-                not self._cancel_undispatched_on_close
-                and self._pending
-                and thread is not None
-                and thread.is_alive()
-            ):
+            # Release the condition during each wait so the consumer can claim the final batch.
+            while self._pending and thread is not None and thread.is_alive():
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     break

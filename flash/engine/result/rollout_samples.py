@@ -1,7 +1,7 @@
 """Credential-safe rollout samples (full, untruncated) for heartbeat diagnostics.
 
 A "sample" is one on-policy generation surfaced so a user can SEE what the model produced on a logged
-training step (GRPO carries the scored ``reward``; OPD carries the distillation ``loss``). Text content
+GRPO training step, together with the scored ``reward``. Text content
 is shown in full with credential redaction and terminal control-character neutralization; non-text
 multimodal parts are replaced with placeholders. Sizes are already bounded by the training config
 (``max_completion_tokens`` / the prompt budget), so full text stays sane on the wire.
@@ -18,8 +18,7 @@ from flash._internal.diagnostics import neutralize_control_chars, sanitize_diagn
 
 # Exactly three samples per logged step, always. Not configurable.
 _SAMPLE_LIMIT = 3
-# The scalar a sample carries: GRPO reward, OPD distillation loss.
-_SAMPLE_SCALARS = ("reward", "loss")
+_SAMPLE_SCALARS = ("reward",)
 
 
 def sampled_completion_scalar(sample: dict) -> tuple[str, float] | None:
@@ -110,12 +109,11 @@ def build_rollout_sample(
     completion: Any,
     *,
     reward: Any = None,
-    loss: Any = None,
     generated_at_step: Any = None,
 ) -> dict[str, Any]:
     """Build one full, credential-safe rollout sample without retaining source example objects.
 
-    Exactly one of ``reward`` (GRPO) or ``loss`` (OPD) is supplied and stored under its own key."""
+    The GRPO reward is stored with each sample."""
     prompt_text = sample_completion_text(prompt)
     completion_text = sample_completion_text(completion)
     try:
@@ -132,7 +130,7 @@ def build_rollout_sample(
     # and a strict reader rejects the whole heartbeat over it -- losing the step's other fields too.
     # a sample without its scalar is then skipped by the reader, so a diverged step publishes fewer
     # samples rather than a payload that will not parse.
-    for key, value in (("reward", reward), ("loss", loss)):
+    for key, value in (("reward", reward),):
         if value is None:
             continue
         scalar = float(value)
@@ -150,7 +148,7 @@ def select_rollout_samples(
     """Select up to three deterministic samples, preferring one completion per distinct prompt.
 
     Each triple is ``(prompt, completion, value)``; ``value`` is stored under ``scalar`` — ``"reward"``
-    for GRPO, ``"loss"`` for OPD."""
+    for GRPO."""
     if scalar not in _SAMPLE_SCALARS:
         raise ValueError(f"rollout sample scalar must be one of {_SAMPLE_SCALARS}, got {scalar!r}")
 

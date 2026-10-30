@@ -25,7 +25,6 @@ import huggingface_hub
 import pytest
 from huggingface_hub.errors import HfHubHTTPError, RemoteEntryNotFoundError
 
-import flash.engine.worker.entry.opd as opd_entry
 import flash.engine.worker.entry.worker as worker
 import flash.engine.worker.io.heartbeat as heartbeat_io
 import flash.engine.worker.io.hf as hf_io
@@ -184,29 +183,6 @@ def test_worker_dispatches_sft_adapter_continuation_to_the_handler(worker_contex
     except _HardExit as e:
         raised = e
     assert ran["v"] is True, "a warm-started sft run must invoke run_sft"
-    assert raised is not None
-    assert raised.code == 0
-
-
-def test_worker_dispatches_opd_run_mode(worker_context, monkeypatch):
-    """RUN_MODE=='opd' must dispatch to run_opd (the third algorithm's worker handler)."""
-    ran = {"v": False}
-
-    def fake_exit(code=0):
-        raise _HardExit(code)
-
-    _patch_common(monkeypatch, fake_exit, worker_context=worker_context)
-    monkeypatch.setattr(worker_context, "config", replace(worker_context.config, run_mode="opd"))
-    monkeypatch.setattr(
-        opd_entry, "run_opd", lambda context=None, **_context: ran.__setitem__("v", True)
-    )
-
-    raised = None
-    try:
-        worker.main(context=worker_context)
-    except _HardExit as e:
-        raised = e
-    assert ran["v"] is True, "RUN_MODE=opd must invoke run_opd"
     assert raised is not None
     assert raised.code == 0
 

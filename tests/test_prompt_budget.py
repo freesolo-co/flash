@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-from contextlib import nullcontext
 from dataclasses import replace
 from types import SimpleNamespace
 
@@ -16,8 +15,6 @@ from flash.engine.plan.recipe import RECIPE
 from flash.engine.plan.vram import (
     grpo_completion_len,
     grpo_rollout_seq_len,
-    opd_completion_len,
-    opd_rollout_seq_len,
 )
 from flash.schema import ConfigError, spec_from_dict
 
@@ -139,103 +136,10 @@ def test_grpo_worker_keeps_clamp_and_value_error_contract(
         )
 
 
-def _opd_prompt_state(
-    monkeypatch, *, max_length: int, architecture_limit: int = 32768, worker_context
-):
-    import flash.engine.worker.teacher.client as teacher_client
-    from flash.engine.worker.entry.opd import OpdKnobs
-    from flash.engine.worker.train.opd.orchestration import prompt_preparation
-    from flash.engine.worker.train.opd.orchestration.state import _OpdRequest
-
-    class Tokenizer:
-        pad_token = None
-        eos_token = "<eos>"
-
-        def apply_chat_template(self, *_args, **_kwargs):
-            return list(range(100))
-
-    monkeypatch.setattr(worker_context, "config", replace(worker_context.config, thinking=False))
-    monkeypatch.setattr(
-        prompt_preparation._worker_hf,
-        "load_tokenizer",
-        lambda *_args, **_kwargs: Tokenizer(),
-    )
-    monkeypatch.setattr(
-        prompt_preparation,
-        "_thinking_prefill_text",
-        lambda _tokenizer, context=None, **_context: "",
-    )
-    monkeypatch.setattr(
-        prompt_preparation._backend,
-        "model_max_position_embeddings",
-        lambda *_args: architecture_limit,
-    )
-    monkeypatch.setattr(
-        prompt_preparation,
-        "liveness_heartbeat",
-        lambda *_args, context=None, **_kwargs: nullcontext(),
-    )
-    monkeypatch.setattr(teacher_client, "TeacherClient", lambda *_args, **_kwargs: object())
-    request = _OpdRequest(
-        spec=None,
-        env=SimpleNamespace(package_root=None),
-        multi_turn=False,
-        max_turns=0,
-        knobs=OpdKnobs(max_completion=512, max_length=max_length),
-        model_id="Qwen/Qwen3.5-9B",
-        model_revision="",
-    )
-    state = prompt_preparation.prepare_prompts(
-        request,
-        [({}, [{"role": "user", "content": "question"}])],
-        False,
-        "capability",
-        "http://control-plane",
-        context=worker_context,
-    )
-    return request, state
-
-
-@pytest.mark.parametrize("max_length", [0, 2048])
-def test_reporter_matches_opd_worker_for_authored_and_default_lengths(
-    worker_context, monkeypatch, max_length
-) -> None:
-    request, state = _opd_prompt_state(
-        monkeypatch, max_length=max_length, worker_context=worker_context
-    )
-    train = {"max_completion_tokens": request.knobs.max_completion}
-    if max_length:
-        train["max_context_tokens"] = max_length
-    reported = rl_prompt_budget(_budget_spec("opd", train))
-    assert reported is not None
-    assert reported["engine_len"] == state.max_model_len
-    assert reported["max_completion"] == request.knobs.max_completion
-    assert reported["prompt_budget"] == state.prompt_budget
-
-
-def test_opd_worker_keeps_clamp_log_and_runtime_error_contract(
-    worker_context, monkeypatch, capsys
-) -> None:
-    _request, state = _opd_prompt_state(
-        monkeypatch, max_length=2048, architecture_limit=1024, worker_context=worker_context
-    )
-    assert state.max_model_len == 1024
-    assert state.prompt_budget == 512
-    assert "training at 1024" in capsys.readouterr().out
-
-    with pytest.raises(RuntimeError, match="opd max_context_tokens leaves no room for a prompt"):
-        _opd_prompt_state(
-            monkeypatch, max_length=512, architecture_limit=512, worker_context=worker_context
-        )
-
-
 def test_rollout_helpers_preserve_omitted_zero_and_thinking_behavior() -> None:
     assert grpo_completion_len(None, False) == RECIPE.rl.max_completion_len
     assert grpo_completion_len(0, True) == RECIPE.rl.max_completion_len_thinking
     assert grpo_rollout_seq_len(0, 512, False) == RECIPE.rl.max_prompt_len + 512
-    assert opd_completion_len(None, False) == RECIPE.opd.max_completion_len
-    assert opd_completion_len(0, True) == RECIPE.opd.max_completion_len_thinking
-    assert opd_rollout_seq_len(0, 512, False) == RECIPE.opd.max_prompt_len + 512
 
 
 def test_defaulted_budget_warning_and_authored_silence(capsys) -> None:

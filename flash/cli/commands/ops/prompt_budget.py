@@ -18,7 +18,7 @@ def _budget_from_status(status: object) -> PromptBudget | None:
     budget = status.get("prompt_budget") if isinstance(status, dict) else None
     if not isinstance(budget, dict):
         return None
-    if budget.get("algorithm") not in {"grpo", "opd", "rl"}:
+    if budget.get("algorithm") not in {"grpo", "rl"}:
         return None
     if budget.get("context_source") not in {"authored", "recipe_default"}:
         return None

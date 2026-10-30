@@ -89,16 +89,6 @@ def test_normalization_allows_marker_fragments_separated_by_an_image_block():
     ]
 
 
-def test_normalization_keeps_the_teacher_placeholder_out_of_the_local_sft_check():
-    normalized = mm.normalize_prompt_images(
-        {"image": _VALID_PNG_DATA_URI},
-        [{"role": "user", "content": f"literally {mm.IMAGE_TEACHER_PLACEHOLDER} here"}],
-        None,
-    )
-    assert len(normalized.descriptors) == 1
-    assert normalized.messages[0]["content"][0]["text"].endswith("here")
-
-
 class _ToolCallChatTemplate:
     chat_template = (
         "{% for message in messages %}<|im_start|>{{ message['role'] }}\n"
@@ -188,15 +178,13 @@ def test_image_sft_rendered_tool_call_guard_allows_ordinary_fields_and_media_pad
     completion = [
         {
             "role": "assistant",
-            "content": f"literal {mm.IMAGE_TEACHER_PLACEHOLDER}",
+            "content": "literal ordinary text",
             "tool_calls": [
                 {
                     "type": "function",
                     "function": {
                         "name": "lookup",
-                        "arguments": json.dumps(
-                            {"marker": mm.IMAGE_TEACHER_PLACEHOLDER, "city": "london"}
-                        ),
+                        "arguments": json.dumps({"marker": "ordinary marker", "city": "london"}),
                     },
                 }
             ],

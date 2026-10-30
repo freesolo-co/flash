@@ -24,15 +24,10 @@ def _config(algorithm):
         from tests.test_rl_train import _overrides_cfg
 
         overrides = build_verl_overrides(_overrides_cfg())
-    else:
-        from flash.engine.worker.train.opd.orchestration.overrides import build_opd_overrides
-        from tests.test_opd_train import _config as opd_config
-
-        overrides = build_opd_overrides(opd_config())
     return configure(RuntimeOptions(algorithm, 10, "ready"), overrides)
 
 
-@pytest.mark.parametrize("algorithm", ["sft", "grpo", "opd"])
+@pytest.mark.parametrize("algorithm", ["sft", "grpo"])
 def test_production_overrides_validate_with_upstream(algorithm):
     from verl.utils.config import omega_conf_to_dataclass, validate_config
 
@@ -57,26 +52,11 @@ def test_production_overrides_validate_with_upstream(algorithm):
     assert engine.native_config().strategy == "fsdp2"
 
 
-@pytest.mark.parametrize("algorithm", ["sft", "rl", "opd"])
+@pytest.mark.parametrize("algorithm", ["sft", "rl"])
 def test_packaged_trainers_import_against_real_upstream(algorithm):
     importlib.import_module(f"flash.engine.worker.train.{algorithm}.child.trainer")
     if algorithm != "sft":
         importlib.import_module(f"flash.engine.worker.train.{algorithm}.child.rollout")
-
-
-def test_opd_uses_only_student_pool_and_preserves_distillation_config():
-    from verl.trainer.ppo.utils import Role
-
-    from flash.engine.worker.train.opd.child.trainer import FlashPPOTrainer
-
-    trainer = FlashPPOTrainer.__new__(FlashPPOTrainer)
-    config = trainer.config = _config("opd")
-    trainer._init_resource_pool_mgr()
-    assert trainer.config is config
-    assert config.distillation.enabled
-    assert Role.TeacherModel not in trainer.mapping
-    assert set(trainer.resource_pool_manager.resource_pool_spec) == {"global_pool"}
-    assert trainer.get_teacher_client() is None
 
 
 @pytest.mark.parametrize("nested", [False, True])
@@ -135,9 +115,9 @@ def test_grpo_rejects_mask_emptied_after_advantage_calculation(monkeypatch):
 def test_native_replay_returns_whole_groups_or_fails_before_consuming(monkeypatch, failed):
     from omegaconf import OmegaConf
 
-    from flash.engine.worker.train.opd.child import replay as recipe
+    config = _config("grpo")
+    from flash.engine.worker.train.core.child import replay as recipe
 
-    config = _config("opd")
     buffer = recipe.BoundedReplayBuffer(
         SimpleNamespace(),
         trainer_mode="sync",
@@ -194,7 +174,6 @@ def test_task_runner_closes_resources_without_masking_startup_failure(
         def get_llm_client(self):
             return None
 
-        get_teacher_client = get_llm_client
         get_reward_handles = get_llm_client
 
         def fit(self, manager):
@@ -211,25 +190,18 @@ def test_task_runner_closes_resources_without_masking_startup_failure(
         def _shutdown_dump_executor(self):
             events.append("drained")
 
-    original_import = recipe.importlib.import_module
-
-    def import_module(name):
-        if name == "flash.engine.worker.train.opd.child.trainer":
-            return SimpleNamespace(FlashPPOTrainer=Trainer)
-        if name == "flash.engine.worker.train.opd.child.rollout":
-            return SimpleNamespace(
-                FlashOpdManager=SimpleNamespace(create=lambda **kwargs: events.append("manager"))
-            )
-        return original_import(name)
-
-    config = _config("opd")
+    config = _config("grpo")
 
     def init_queue(*args):
         events.append("queue")
         if failure == "queue":
             raise RuntimeError("queue initialization timed out")
 
-    monkeypatch.setattr(recipe.importlib, "import_module", import_module)
+    monkeypatch.setattr("flash.engine.worker.train.rl.child.trainer.FlashGrpoTrainer", Trainer)
+    monkeypatch.setattr(
+        "flash.engine.worker.train.rl.child.rollout.FlashGrpoManager",
+        SimpleNamespace(create=lambda **kwargs: events.append("manager")),
+    )
     monkeypatch.setattr(recipe, "_init_transfer_queue", init_queue)
     monkeypatch.setattr(recipe, "publish_ready", lambda options: events.append("ready"))
     monkeypatch.setattr(tq, "close", lambda: events.append("closed"))
@@ -324,41 +296,6 @@ def test_grpo_agent_carries_identity_and_masks_only_truncation(
     assert actual.extra_fields["min_global_steps"] == actual.extra_fields["max_global_steps"] == 1
 
 
-def test_opd_teacher_facts_survive_native_agent_serialization(monkeypatch):
-    import asyncio
-
-    import torch
-    from verl.experimental.agent_loop.agent_loop import AgentLoopOutput
-
-    from flash.engine.worker.train.opd.child.teacher import compute_flash_teacher_logprobs
-
-    ids = torch.tensor([[-1], [0], [1]], dtype=torch.int32)
-    logs = torch.tensor([[0.0], [-0.4], [-0.6]])
-    calls = []
-
-    async def score(**kwargs):
-        calls.append(kwargs)
-        return ids, logs
-
-    agent = SimpleNamespace(
-        distillation_enabled=True,
-        teacher_key="index",
-        teacher_server_manager=SimpleNamespace(compute_teacher_logprobs_single=score),
-    )
-    output = AgentLoopOutput(
-        prompt_ids=[1], response_ids=[2, 3], response_mask=[1, 1], reward_score=0.0, metrics={}
-    )
-    monkeypatch.delenv("FLASH_OPD_STRUCTURED_OUTPUTS", raising=False)
-    asyncio.run(compute_flash_teacher_logprobs(agent, output, [1], [2, 3], False, {"index": 7}))
-    asyncio.run(compute_flash_teacher_logprobs(agent, output, [1], [2, 3], False, {"index": 7}))
-    assert len(calls) == 1
-    assert calls[0]["routing_key"] == 7
-    fields = output.as_dict()
-    torch.testing.assert_close(fields["teacher_ids"], ids)
-    torch.testing.assert_close(fields["teacher_logprobs"], logs)
-    assert fields["rm_scores"].tolist() == [0.0, 0.0]
-
-
 def test_grpo_manager_registers_whole_tensordict_batch_before_native_dispatch(monkeypatch):
     from tensordict import NonTensorData, NonTensorStack, TensorDict
     from verl.trainer.ppo.v1.agent_loop_tq import AgentLoopManagerTQ
@@ -400,7 +337,7 @@ def test_grpo_manager_registers_whole_tensordict_batch_before_native_dispatch(mo
     ledger.finalize({17})
 
 
-@pytest.mark.parametrize("algorithm", ["grpo", "opd"])
+@pytest.mark.parametrize("algorithm", ["grpo"])
 def test_rollout_server_decodes_extended_model_config(monkeypatch, algorithm):
     from flash.engine.worker.train.core.child.configuration import FlashModelConfig
     from tests.test_verl_child_plugins import _import_recipe, _modules
@@ -622,42 +559,3 @@ def test_flash_worker_decodes_positions_before_upstream_execution(monkeypatch, m
     assert (
         getattr(FlashTrainingWorker.__new__(FlashTrainingWorker), method)(data) == "native result"
     )
-
-
-def test_opd_multiturn_bridge_scores_skip_native_reward_recomputation(monkeypatch):
-    import asyncio
-
-    from verl.experimental.agent_loop.agent_loop import AgentLoopOutput, AgentLoopWorker
-
-    from flash.engine.worker.train.opd.child import rollout
-
-    outputs = [
-        AgentLoopOutput(
-            prompt_ids=[1] * size,
-            response_ids=[2],
-            response_mask=[1],
-            metrics={},
-            extra_fields={"teacher_ids": [size], "teacher_logprobs": [-0.3]},
-        )
-        for size in (89, 111)
-    ]
-
-    async def run(self, sampling_params, **kwargs):
-        return outputs
-
-    monkeypatch.setattr(rollout._MultiTurn, "run", run)
-    agent = rollout.FlashMultiTurnAgentLoop.__new__(rollout.FlashMultiTurnAgentLoop)
-
-    async def verify():
-        result = await agent.run({})
-        # A configured reward service must not be invoked or reconstruct multimodal positions.
-        worker = AgentLoopWorker.__new__(AgentLoopWorker)
-        worker.reward_loop_worker_handles = [object()]
-        await worker._compute_score(result, {})
-        assert result is outputs
-        for output in result:
-            assert output.reward_score == 0.0
-            assert output.extra_fields["teacher_logprobs"] == [-0.3]
-            assert output.extra_fields["reward_extra_info"] == {}
-
-    asyncio.run(verify())

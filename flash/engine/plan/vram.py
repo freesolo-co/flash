@@ -19,8 +19,6 @@ _VOCAB_DEFAULT = 248_320
 # (verl/utils/experimental/torch_functional.py). the child projects the vocab in chunks of this
 # many token rows, so a smaller value here under-reserves and admits a job that then OOMs.
 VERL_FUSED_CE_CHUNK_TOKENS = 512
-OPD_CE_CHUNK_SIZE = VERL_FUSED_CE_CHUNK_TOKENS
-_OPD_CE_PEAK_BYTES_PER_LOGIT = 16
 
 
 def _sft_per_device_bs() -> int:
@@ -38,9 +36,8 @@ def sft_grad_accum(
     return per_device, grad_accum
 
 
-# adapter bytes per trainable parameter: 16 for SFT/OPD AdamW, about 10 for paged GRPO.
-# SFT uses AdamW because bitsandbytes fails on FSDP2 DTensors; OPD inherits it. GRPO's known
-# undercount cannot change alone because its resident-peak model is calibrated at the B200 ceiling.
+# SFT uses fp32 AdamW because bitsandbytes fails on FSDP2 DTensors. GRPO's lower adapter
+# allowance is part of its calibrated resident-peak model and must change with that calibration.
 _LORA_PAGED_BYTES_PER_PARAM = 10.0
 _LORA_ADAMW_BYTES_PER_PARAM = 16.0
 
@@ -68,60 +65,6 @@ def grpo_rollout_seq_len(
 
     completion = grpo_completion_len(max_tokens, thinking)
     return int(max_length or max(1024, RECIPE.rl.max_prompt_len + completion))
-
-
-def opd_completion_len(max_tokens: int | None, thinking: bool) -> int:
-    """The completion-token budget an OPD run uses: an explicit ``max_tokens`` else the OPD recipe
-    default (thinking uses the longer ``max_completion_len_thinking``). Single source of truth for the
-    four sites that must resolve the SAME integer — run_opd's knob resolution, ``opd_rollout_seq_len``,
-    ``estimate_vram_gb``'s opd path, and the spec-parse prompt-budget guard."""
-    from flash.engine.plan.recipe import RECIPE
-
-    opd = RECIPE.opd
-    return int(
-        max_tokens or (opd.max_completion_len_thinking if thinking else opd.max_completion_len)
-    )
-
-
-def opd_rollout_seq_len(
-    max_length: int = 0,
-    max_tokens: int | None = None,
-    thinking: bool = False,
-) -> int:
-    """Sequence length an OPD run uses, mirroring run_opd()'s ``seq_cap``: the loss forward runs
-    ``model(prompt_ids + student_ids)`` over prompt+completion, so size for both — else a raised
-    ``max_tokens`` (unset ``max_length``) is sized as an SFT 1024-token job and OOMs on an
-    under-sized GPU."""
-    from flash.engine.plan.recipe import RECIPE
-
-    completion = opd_completion_len(max_tokens, thinking)
-    return int(max_length or max(1024, RECIPE.opd.max_prompt_len + completion))
-
-
-def opd_rollout_concurrency(prompts_per_step: int = 1, group_size: int = 1) -> int:
-    """Concurrent student generations in one OPD vLLM rollout batch."""
-
-    def _positive_int(value: object, default: int) -> int:
-        try:
-            if isinstance(value, bool):
-                return default
-            return max(1, int(value))
-        except (TypeError, ValueError):
-            return default
-
-    return _positive_int(prompts_per_step, 1) * _positive_int(group_size, 1)
-
-
-def opd_loss_microbatch(params_b: float, prompts_per_step: int = 1, group_size: int = 1) -> int:
-    """Loss microbatch size used by OPD's GKD backward.
-
-    Keep in lockstep with `worker.opd._opd_loss_microbatch_size`; 35B-class models stay serial for
-    VRAM safety.
-    """
-    total = opd_rollout_concurrency(prompts_per_step, group_size)
-    params = float(params_b or 0.0)
-    default = 4 if params and params <= 10.0 else 1
-    return max(1, min(total, default))
 
 
 def _legacy_lora_floor_gb(lora_rank: int, effective_params_b: float) -> float:
@@ -178,9 +121,6 @@ def _lora_memory_gb(
 
 _TRAIN_COEF = 0.27
 _VLLM_COLOCATE_FLOOR_GB = 28.0
-# opd builds its resident vllm engine after the hf/peft student is already loaded. keep the
-# colocated engine off <=40 gb classes so allocation leaves enough free memory for vllm startup.
-_OPD_VLLM_COLOCATE_FLOOR_GB = 41.0
 _LOGITS_BUDGET_GB = 6.0
 # 16 B/elem: fp32 logits+grad + bf16 logits+grad + CE temp. 8 B/elem under-counts (live OOM confirmed).
 _SFT_LOGITS_BYTES_PER_ELEM = 16.0
@@ -234,31 +174,11 @@ def grpo_seq_escalation_gb(params_b: float | None, seq_len: int) -> int:
     return math.ceil(coef * params_b * (seq_len / seq_thresh - 1))
 
 
-def _rollout_stays_resident(model_info, model_id: str = "") -> bool:
-    """True when the rollout engine is pinned resident and never sleeps.
-
-    Named for the property sizing actually depends on rather than the catalog flag that currently
-    implies it: ``sleep_unsupported`` records that a model HANGS on wake, and
-    ``rollout_resident_overrides`` turns that into ``free_cache_engine=false``. Sizing cares only
-    about the second fact, so it reads through this predicate -- the worker gate
-    (``rollout_fp8_kv``) answers the same question, and the two must not drift.
-    """
-    if getattr(model_info, "sleep_unsupported", False):
-        return True
-    if not model_id:
-        return False
-    from flash.core.catalog import MODELS
-
-    info = MODELS.get(model_id)
-    return bool(info is not None and getattr(info, "sleep_unsupported", False))
-
-
 def _declares_linear_attention(model_info, model_id: str = "") -> bool:
     """True for a GDN hybrid, using the catalog rather than a network config fetch.
 
     A GDN worker rejects fp8 KV only when its rollout engine sleeps, because the crash is vllm's
-    ``init_fp8_kv_scales`` on wake; a model the catalog pins resident keeps fp8. Callers that size a
-    KV pool must therefore pair this with ``_rollout_stays_resident``. Fall back to catalog lookup
+    ``init_fp8_kv_scales`` on wake; a model the catalog pins resident keeps fp8. Resident models use their separately calibrated sizing floor. Fall back to catalog lookup
     by model id for pinned revisions because attention family is revision-independent.
     """
     if int(getattr(model_info, "num_linear_attention_layers", 0) or 0) > 0:
@@ -279,7 +199,6 @@ def _rollout_kv_floor_gb(
     active_params_b: float | None = None,
     model_info=None,
     model_id: str = "",
-    preserve_parameter_floor: bool = False,
     lora_rank: int = 0,
     rollout_cache_min_gb: float = 0.0,
 ) -> int:
@@ -290,7 +209,6 @@ def _rollout_kv_floor_gb(
         active_params_b=active_params_b,
         model_info=model_info,
         rollout_cache_min_gb=rollout_cache_min_gb,
-        preserve_parameter_floor=preserve_parameter_floor,
         lora_rank=lora_rank,
     )
     from flash.providers.core.base import max_non_fp8_kv_vram_gb
@@ -312,7 +230,6 @@ def _rollout_kv_floor_gb(
         fp8_kv=True,
         model_info=model_info,
         rollout_cache_min_gb=rollout_cache_min_gb,
-        preserve_parameter_floor=preserve_parameter_floor,
         lora_rank=lora_rank,
     )
     return max(fp8_floor, ceiling + 1)
@@ -344,7 +261,6 @@ def estimate_vram_gb(
     bpp = _BYTES_PER_PARAM.get(quant, 2.0)
     weights = params_b * bpp
     eff_b = float(active_params_b) if active_params_b else params_b
-    is_opd = (algorithm or "").lower() == "opd"
     algo = "grpo" if (algorithm or "").lower() in ("grpo", "rl") else "sft"
     width = math.sqrt(max(eff_b, 0.1))
     lora_opt = _lora_memory_gb(lora_rank, eff_b, algorithm, model_info)
@@ -377,41 +293,6 @@ def estimate_vram_gb(
         logits = min(completion * vocab * 4 / 1e9, _LOGITS_BUDGET_GB)
         train = activations + logits
         return base + (max(rollout, train) if sleep_offload else rollout + train)
-    if is_opd:
-        # OPD always samples the student through a resident colocated vLLM engine, while the HF/PEFT
-        # trainer model stays resident for the GKD loss forward/backward. Budget the second bf16
-        # weight copy plus a viable KV pool through the training step.
-        rollout_concurrency = opd_rollout_concurrency(batch_size, group_size)
-        rollout = weights + max(
-            _KV_CAP,
-            _resident_kv_gb(
-                eff_b,
-                seq_len,
-                rollout_concurrency,
-                fp8_kv=fp8_kv,
-                model_info=model_info,
-                rollout_cache_min_gb=rollout_cache_min_gb,
-                preserve_parameter_floor=True,
-            ),
-        )
-        # text opd computes exact full-vocabulary ce in chunks of VERL_FUSED_CE_CHUNK_TOKENS rows.
-        # the child projects prompt AND completion positions (verl's fused qwen forward takes no
-        # `logits_to_keep` and does not slice hidden states), so the chunk cap, not the completion
-        # length, is what bounds the projection. image samples still use the dense full-sequence
-        # logits path and are processed one at a time. allocation does not know the dataset modality,
-        # so reserve the larger of one text ce chunk and one dense image loss forward/backward peak.
-        completion = opd_completion_len(max_tokens, thinking)
-        loss_mb = opd_loss_microbatch(params_b, batch_size, group_size)
-        activations = loss_mb * _ACT_COEF * (seq_len / 1024.0) * width
-        # rows are bounded by seq_len, NOT completion: the same fused forward that ignores
-        # `logits_to_keep` projects prompt positions too. inert while the cap was 64 (any completion
-        # saturated it), live at 512 -- a serial loss microbatch with a short completion reserved
-        # up to 1.5 GB short of one full chunk.
-        ce_rows = min(OPD_CE_CHUNK_SIZE, loss_mb * seq_len)
-        chunked_logits = ce_rows * vocab * _OPD_CE_PEAK_BYTES_PER_LOGIT / 1e9
-        dense_image_logits = (seq_len * 4 + completion * 8) * vocab / 1e9
-        logits = max(chunked_logits, dense_image_logits)
-        return base + rollout + activations + logits
     # direct callers default to the conservative plain-nll estimate. model_required_vram_gb passes
     # the worker's validated chunked-nll decision explicitly when it knows the model identity.
     fused = False if sft_fused_ce is None else bool(sft_fused_ce)
@@ -581,7 +462,7 @@ def _optimizer_batch_value(train, algorithm: str):
     """Return the authored optimizer batch under whichever key this algorithm accepts.
 
     The optimizer batch is one sizing input here but two config keys: sft authors `batch_size`,
-    grpo/opd author `prompts_per_step`, and the schema rejects each name under the other algorithm.
+    grpo authors `prompts_per_step`, and the schema rejects each name under the other algorithm.
     Reading only `batch_size` therefore sized every rl run on the recipe default no matter what the
     user wrote, because an rl spec's `batch_size` is always None -- so a wide `prompts_per_step`
     silently under-provisioned the card instead of escalating it.
@@ -653,59 +534,6 @@ def _model_vram_need(
     return math.ceil(est * headroom)
 
 
-def _opd_fp8_adjust(
-    need: int,
-    params_b: float,
-    *,
-    model_id: str,
-    seq_len: int,
-    max_tokens: int | None,
-    lora_rank: int,
-    batch_size: int,
-    group_size: int,
-    thinking: bool,
-    sft_fused_ce: bool | None,
-    headroom: float,
-    quant: str = "bf16",
-    vocab: int = _VOCAB_DEFAULT,
-    active_params_b: float | None = None,
-    model_info=None,
-    rollout_cache_min_gb: float = 0.0,
-) -> int:
-    """Re-size an OPD requirement with fp8 KV on modern cards when sufficient."""
-    from flash.providers.core.base import max_non_fp8_kv_vram_gb
-
-    # a gdn hybrid keeps the bf16 reservation only while its engine sleeps. once the catalog pins
-    # it resident the worker sends fp8 (rollout_fp8_kv), so sizing must price the same cache or it
-    # reserves a full-width pool nobody allocates.
-    if _declares_linear_attention(model_info, model_id) and not _rollout_stays_resident(
-        model_info, model_id
-    ):
-        return need
-    ceiling = max_non_fp8_kv_vram_gb()
-    if need <= ceiling:
-        return need
-    fp8_need = _model_vram_need(
-        params_b,
-        "opd",
-        seq_len=seq_len,
-        max_tokens=max_tokens,
-        lora_rank=lora_rank,
-        batch_size=batch_size,
-        group_size=group_size,
-        thinking=thinking,
-        sft_fused_ce=sft_fused_ce,
-        headroom=headroom,
-        quant=quant,
-        vocab=vocab,
-        active_params_b=active_params_b,
-        fp8_kv=True,
-        model_info=model_info,
-        rollout_cache_min_gb=rollout_cache_min_gb,
-    )
-    return fp8_need if fp8_need > ceiling else need
-
-
 def _catalog_model_required_vram_gb(
     model_id: str,
     algorithm: str,
@@ -721,9 +549,6 @@ def _catalog_model_required_vram_gb(
     thinking: bool,
     headroom: float,
     is_grpo: bool,
-    is_opd: bool,
-    is_vllm_rollout: bool,
-    vllm_concurrency: int,
     sft_fused_ce: bool | None,
 ) -> int:
     """Size a catalog model with its run-specific floors."""
@@ -753,25 +578,6 @@ def _catalog_model_required_vram_gb(
         model_info=sizing_info,
         rollout_cache_min_gb=rollout_cache_min_gb,
     )
-    if is_opd:
-        need = _opd_fp8_adjust(
-            need,
-            params_b or 4.0,
-            model_id=model_id,
-            seq_len=seq_len,
-            max_tokens=max_tokens,
-            lora_rank=lora_rank,
-            batch_size=batch_size,
-            group_size=group_size,
-            thinking=thinking,
-            sft_fused_ce=sft_fused_ce,
-            headroom=headroom,
-            quant=quant,
-            vocab=model_vocab,
-            active_params_b=active_b,
-            model_info=sizing_info,
-            rollout_cache_min_gb=rollout_cache_min_gb,
-        )
     floor = 0
     if is_grpo and getattr(info, "grpo_min_vram_gb", 0):
         floor = int(info.grpo_min_vram_gb)
@@ -814,10 +620,8 @@ def _catalog_model_required_vram_gb(
         else:
             floor += grpo_seq_escalation_gb(active_b or params_b, seq_len)
     need = max(need, floor)
-    if is_vllm_rollout:
+    if is_grpo:
         floor_gb = 24 if (params_b or 0.0) <= 1.0 else int(_VLLM_COLOCATE_FLOOR_GB)
-        if is_opd and (params_b or 0.0) >= 2.0:
-            floor_gb = max(floor_gb, int(_OPD_VLLM_COLOCATE_FLOOR_GB))
         need = max(need, floor_gb)
         # vLLM KV-cache init preflight: the card must leave a viable cache-block pool
         # under the colocate utilization cap, or the engine dies at init ("No available
@@ -827,12 +631,11 @@ def _catalog_model_required_vram_gb(
             _rollout_kv_floor_gb(
                 params_b or 4.0,
                 seq_len,
-                vllm_concurrency,
+                group_size,
                 active_params_b=active_b,
                 model_info=sizing_info,
                 rollout_cache_min_gb=rollout_cache_min_gb,
                 model_id=model_id,
-                preserve_parameter_floor=is_opd,
                 lora_rank=lora_rank,
             ),
         )
@@ -855,26 +658,14 @@ def model_required_vram_gb(
     _algo = (algorithm or "").lower()
     if _algo in ("grpo", "rl"):
         _default_len = grpo_rollout_seq_len(0, max_tokens, thinking)
-    elif _algo == "opd":
-        # opd sizes prompt plus completion for the resident rollout path.
-        _default_len = opd_rollout_seq_len(0, max_tokens, thinking)
     else:
-        # sft trims rows to RECIPE.sft.max_seq_len_thinking when thinking is on (sft_max_length).
-        # defaulting to the non-thinking cap here sizes activations for half the sequence the worker
-        # actually trains on.
         from flash.engine.plan.recipe import RECIPE
 
         _default_len = int(RECIPE.sft.max_seq_len_thinking if thinking else RECIPE.sft.max_seq_len)
     seq_len = _positive_int_or_default(_sizing_value(train, "max_context_tokens"), _default_len)
     lora_rank = _positive_int_or_default(_sizing_value(train, "lora_rank"), 32)
-    if _algo == "opd":
-        from flash.engine.plan.recipe import RECIPE
-
-        batch_size_default = int(RECIPE.opd.prompts_per_step)
-        group_size_default = int(RECIPE.opd.group_size)
-    else:
-        batch_size_default = _sft_per_device_bs()
-        group_size_default = 8
+    batch_size_default = _sft_per_device_bs()
+    group_size_default = 8
     group_size = _positive_int_or_default(_sizing_value(train, "group_size"), group_size_default)
     batch_size = _positive_int_or_default(_optimizer_batch_value(train, _algo), batch_size_default)
 
@@ -883,9 +674,6 @@ def model_required_vram_gb(
     info = MODELS.get(model_id)
     model_vocab = vocab_size_for(model_id)
     is_grpo = _algo in ("grpo", "rl")
-    is_opd = _algo == "opd"
-    is_vllm_rollout = is_grpo or is_opd
-    vllm_concurrency = opd_rollout_concurrency(batch_size, group_size) if is_opd else group_size
     # the fused sft loss removes ignored positions before the lm head and projects valid tokens
     # without materializing dense logits. size validated qwen sft jobs without a [batch, seq, vocab]
     # term; models outside that validated set keep the conservative plain-nll estimate and cap.
@@ -905,9 +693,6 @@ def model_required_vram_gb(
             thinking=thinking,
             headroom=headroom,
             is_grpo=is_grpo,
-            is_opd=is_opd,
-            is_vllm_rollout=is_vllm_rollout,
-            vllm_concurrency=vllm_concurrency,
             sft_fused_ce=sft_fused_ce,
         )
     # Only curated models are trainable, so `info` is never None here in practice. Kept as a

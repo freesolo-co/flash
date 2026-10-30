@@ -20,8 +20,6 @@ from flash.engine.worker.train.core.child.startup import initialize_process
 class FlashFSDPEngine(FSDPEngineWithLMHead):
     def __init__(self, *args, **kwargs):
         initialize_process()
-        if kwargs["model_config"].runtime_options.get("algorithm") == "opd":
-            from flash.engine.worker.train.opd.child import loss  # noqa: F401
         kwargs["engine_config"] = kwargs["engine_config"].native_config()
         super().__init__(*args, **kwargs)
         self.runtime = RuntimeOptions.decode(self.model_config.runtime_options)
@@ -91,20 +89,6 @@ class FlashFSDPEngine(FSDPEngineWithLMHead):
         return linear_warmup_scheduler(
             optimizer, num_warmup_steps=warmup, num_training_steps=config.total_training_steps
         )
-
-    def _build_optimizer(self, module):
-        optimizer = super()._build_optimizer(module)
-        if self.runtime.algorithm == "opd":
-            import os
-
-            from flash.engine.worker.train.opd.child.bridge import (
-                _wrap_optimizer_with_mutation_notice,
-            )
-
-            _wrap_optimizer_with_mutation_notice(
-                optimizer, os.environ["FLASH_OPD_BRIDGE_URL"], os.environ["FLASH_OPD_BRIDGE_TOKEN"]
-            )
-        return optimizer
 
     @training_phase("checkpoint_capture")
     def save_checkpoint(self, local_path, *args, **kwargs):

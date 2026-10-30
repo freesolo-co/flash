@@ -2,7 +2,7 @@
 
 stdlib only: the parent copies it into the child interpreter. GRPO must return one output per
 episode
-because main_ppo cannot postprocess OPD's list form; response_mask marks model tokens only.
+and response_mask marks model tokens only.
 """
 
 from __future__ import annotations
@@ -282,6 +282,9 @@ def _episode_turn_rewards(score_payload, turn_spans):
 
 
 async def _score_episode(self, bridge_post, bridge_url, session_id, episode, identity):
+    # Read the ContextVar on the event loop before crossing into the executor thread.
+    context_provider = getattr(self.server_manager, "reward_context", None)
+    context_fields = {"rollout_context": context_provider()} if callable(context_provider) else {}
     score_payload = await run_executor_call(
         self.loop,
         lambda: bridge_post(
@@ -293,6 +296,7 @@ async def _score_episode(self, bridge_post, bridge_url, session_id, episode, ide
                 "session_id": session_id,
                 "turn_count": len(episode.turn_spans),
                 "identity": dict(identity),
+                **context_fields,
             },
         ),
     )

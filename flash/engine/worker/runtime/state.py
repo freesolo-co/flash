@@ -17,7 +17,6 @@ from flash.envs.loading.staged import (
     StagedEnvironmentMaterialization,
     load_staged_freesolo_environment,
 )
-from flash.teacher.retry_contract import OPD_RESUME_REVISION_ENV
 
 if TYPE_CHECKING:
     from flash.engine.worker.io.heartbeat import HeartbeatState
@@ -43,7 +42,6 @@ class WorkerConfig:
     seed: int = FIXED_SEED
     phase: str = "sft"
     thinking: bool = False
-    opd_resume_revision: str = ""
     deadline_at: float | None = None
 
     @classmethod
@@ -75,7 +73,6 @@ class WorkerConfig:
             seed=_resolve_worker_seed(spec, env.get("SEED")),
             phase=env.get("PHASE", spec.phase if spec else mode),
             thinking=bool(spec and spec.thinking),
-            opd_resume_revision=env.get(OPD_RESUME_REVISION_ENV, "").strip(),
             deadline_at=deadline,
         )
 

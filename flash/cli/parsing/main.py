@@ -19,6 +19,7 @@ from flash.cli.commands.ops.runs import cmd_cancel
 from flash.cli.commands.ops.traces import cmd_traces_export
 from flash.cli.commands.ops.train import cmd_train
 from flash.cli.parsing import account, env, models, traces, training
+from flash.cli.parsing.custom import add_custom_commands
 from flash.cli.parsing.errors import friendly_error
 from flash.cli.parsing.serve_parser import _add_serve_commands
 from flash.cli.ui import render
@@ -70,6 +71,7 @@ _HELP_GROUPS: list[tuple[str, list[tuple[str, str]]]] = [
         "training",
         [
             ("train", "submit a managed run from a TOML config"),
+            ("custom init", "write a local custom algorithm using a dedicated GPU"),
             ("runs list", "list runs with their state and cost"),
             ("runs status", "show a run's current status"),
             ("runs log", "print or follow a run's logs"),
@@ -189,6 +191,7 @@ def _build_parser() -> argparse.ArgumentParser:
     env._add_env_commands(sub)
     traces._add_traces_commands(sub)
     training._add_train_commands(sub)
+    add_custom_commands(sub)
     training._add_runs_commands(sub)
     models._add_deployment_commands(models_sub)
     _add_serve_commands(sub)

@@ -446,48 +446,42 @@ def test_a_nonexistent_environment_is_refused_before_the_402(api, monkeypatch):
     balance" for a typo'd environment -- sending the user to top up, for a run no balance can buy.
     Both faults are live here at once, and the spec's own defect has to win.
     """
-    import flash.envs.loading.loader as env_loader
     import flash.server.billing.charges as billing_mod
-    from flash.envs.meta.identity import GitHubPermanentError
+    from flash.envs.registry import packages
+    from flash.envs.registry.azure import RegistryError
 
     def _block(**k):
         raise precheck_http_error(402, detail="insufficient balance")
 
     def _permanent(_parsed, *_a, **_k):
-        raise GitHubPermanentError("GitHub environment request failed (404): Not Found")
+        raise RegistryError("environment not found", status=404)
 
     monkeypatch.setattr(billing_mod, "precheck_training_run", _block)
-    monkeypatch.setattr(env_loader, "_github_token", lambda: "ghp_test")
-    monkeypatch.setattr(env_loader, "_resolve_ref_sha", _permanent)
+    monkeypatch.setattr(packages, "resolve_revision", _permanent)
 
     res = api.post("/v1/runs", json={"spec": SPEC}, headers=_bearer("fslo-user-1"))
 
     assert res.status_code == 400, res.text
-    assert "could not be resolved on GitHub" in res.text
+    assert "not found in the managed registry" in res.text
     assert "insufficient" not in res.text
 
 
 def test_transient_environment_resolve_is_attempted_once_per_request(api, monkeypatch):
-    """packaged opd defers after one bounded request-side attempt on a transient failure."""
-    import flash.envs.loading.loader as env_loader
-    from flash.envs.meta.identity import GitHubUnavailableError
+    """packaged grpo defers after one bounded request-side attempt on a transient failure."""
+    from flash.envs.registry import packages
+    from flash.envs.registry.azure import RegistryError
 
     calls = []
 
     def _transient(_parsed, *_args, **_kwargs):
         calls.append(1)
-        raise GitHubUnavailableError("GitHub server error (503, transient)")
+        raise RegistryError("Azure unavailable", status=503)
 
-    monkeypatch.setattr(env_loader, "_github_token", lambda: "ghp_test")
-    monkeypatch.setattr(env_loader, "_resolve_ref_sha", _transient)
-    monkeypatch.setattr(
-        "flash.server.domain.teacher.broker.preflight_validate_managed_teacher",
-        lambda _spec: None,
-    )
+    monkeypatch.setattr(packages, "resolve_revision", _transient)
     spec = {
         **SPEC,
-        "algorithm": "opd",
-        "train": {**SPEC["train"], "teacher_model": "deepseek-v4.1-flash-1017"},
+        "algorithm": "grpo",
+        "train": SPEC["train"],
     }
 
     res = api.post(
@@ -501,27 +495,23 @@ def test_transient_environment_resolve_is_attempted_once_per_request(api, monkey
     assert calls == [1], f"environment ref was resolved {len(calls)} times"
 
 
-def test_tokenless_packaged_opd_defers_without_anonymous_github_lookup(api, monkeypatch):
-    """a tokenless plane must not turn a private packaged opd environment into a false 404."""
-    import flash.envs.loading.loader as env_loader
-    from flash.envs.meta.identity import GitHubPermanentError
+def test_managed_grpo_attempts_azure_without_a_github_token(api, monkeypatch):
+    """Managed resolution uses Azure even when no GitHub credential exists."""
+    from flash.envs.registry import packages
+    from flash.envs.registry.azure import RegistryError
 
     calls = []
 
-    def _anonymous_404(_parsed, *_args, **_kwargs):
+    def _resolve(_slug, *_args, **_kwargs):
         calls.append(1)
-        raise GitHubPermanentError("GitHub environment request failed (404): Not Found")
+        raise RegistryError("Azure unavailable", status=503)
 
-    monkeypatch.setattr(env_loader, "_github_token", lambda: None)
-    monkeypatch.setattr(env_loader, "_resolve_ref_sha", _anonymous_404)
-    monkeypatch.setattr(
-        "flash.server.domain.teacher.broker.preflight_validate_managed_teacher",
-        lambda _spec: None,
-    )
+    monkeypatch.delenv("GITHUB_TOKEN", raising=False)
+    monkeypatch.setattr(packages, "resolve_revision", _resolve)
     spec = {
         **SPEC,
-        "algorithm": "opd",
-        "train": {**SPEC["train"], "teacher_model": "deepseek-v4.1-flash-1017"},
+        "algorithm": "grpo",
+        "train": SPEC["train"],
     }
 
     res = api.post(
@@ -532,7 +522,7 @@ def test_tokenless_packaged_opd_defers_without_anonymous_github_lookup(api, monk
 
     assert res.status_code == 200, res.text
     assert res.json()["state"] == "dry_run"
-    assert calls == []
+    assert calls == [1]
 
 
 @pytest.mark.parametrize("status", [408, 425, 429, 500, 502, 503, 504])
@@ -744,34 +734,7 @@ def test_unsupported_spec_reports_itself_rather_than_insufficient_balance(api, m
         raise precheck_http_error(402, detail="insufficient balance")
 
     monkeypatch.setattr(billing_mod, "precheck_training_run", _block)
-    unsupported_spec = {
-        **SPEC,
-        # image records distilled from a text-only teacher. the subject of this test is the
-        # ORDERING, so the case only has to be something static validation refuses; it deliberately
-        # is not a warm-start or a multi-turn-image case, because both of those were once
-        # unsupported and have since been implemented, and each silently turned this into a test
-        # that asserted nothing the moment its premise became supported. a teacher that cannot see
-        # images is a property of the teacher, not a gap waiting to be closed.
-        "algorithm": "opd",
-        "train": {**SPEC["train"], "teacher_model": "deepseek-v4.1-flash-1017"},
-        "environment": {
-            **SPEC["environment"],
-            "params": {
-                "records": [
-                    {
-                        "input": [
-                            {
-                                "role": "user",
-                                "content": [
-                                    {"type": "image_url", "image_url": {"url": "http://x/y.png"}}
-                                ],
-                            }
-                        ]
-                    }
-                ],
-            },
-        },
-    }
+    unsupported_spec = {**SPEC, "algorithm": "opd"}
     res = api.post(
         "/v1/runs",
         json={"spec": unsupported_spec, "dry_run": True},
@@ -779,7 +742,7 @@ def test_unsupported_spec_reports_itself_rather_than_insufficient_balance(api, m
     )
 
     assert res.status_code == 400, res.text
-    assert "cannot see images" in res.text
+    assert "unsupported algorithm" in res.text
     assert "insufficient" not in res.text
 
 

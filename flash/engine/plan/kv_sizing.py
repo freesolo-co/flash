@@ -84,7 +84,6 @@ def _resident_kv_gb(
     num_generations: int = 8,
     fp8_kv: bool = False,
     model_info=None,
-    preserve_parameter_floor: bool = False,
     rollout_cache_min_gb: float = 0.0,
 ) -> float:
     """Estimate cache memory, keeping the runtime minimum independent of model geometry."""
@@ -100,10 +99,6 @@ def _resident_kv_gb(
     profiled = max(
         _KV_CAP, rollout_cache_min_gb, _KV_PROFILE_OVERHEAD_GB + raw * _KV_FRAGMENTATION_MARGIN
     )
-    # opd startup tiers and the resident-only 35b boundary are live-calibrated. retain their old
-    # conservative pool until the architecture equation is validated on those exact gpu paths.
-    # a hybrid model whose linear-attention dims are absent yields a PARTIAL estimate (attention KV
-    # only); retain the parameter estimate so the missing recurrent/conv state cannot under-size it.
     declares_linear = int(getattr(model_info, "num_linear_attention_layers", 0) or 0) > 0
     linear_dims_known = all(
         int(getattr(model_info, _f, 0) or 0)
@@ -115,10 +110,8 @@ def _resident_kv_gb(
             "linear_conv_kernel_dim",
         )
     )
-    if (
-        preserve_parameter_floor
-        or getattr(model_info, "sleep_unsupported", False)
-        or (declares_linear and not linear_dims_known)
+    if getattr(model_info, "sleep_unsupported", False) or (
+        declares_linear and not linear_dims_known
     ):
         profiled = max(profiled, parameter_estimate_gb)
     return profiled
@@ -162,7 +155,6 @@ def grpo_kv_floor_gb(
     active_params_b: float | None = None,
     fp8_kv: bool = False,
     model_info=None,
-    preserve_parameter_floor: bool = False,
     lora_rank: int = 0,
     tensor_parallel: int = 1,
     rollout_cache_min_gb: float = 0.0,
@@ -181,7 +173,6 @@ def grpo_kv_floor_gb(
         fp8_kv=fp8_kv,
         model_info=model_info,
         rollout_cache_min_gb=rollout_cache_min_gb,
-        preserve_parameter_floor=preserve_parameter_floor,
     )
     need = weights_gb + adapter_gb + 0.5 * kv_gb
     lower = math.ceil(need / 0.55)
@@ -201,7 +192,6 @@ def colocate_kv_util(
     active_params_b: float | None = None,
     fp8_kv: bool = False,
     model_info=None,
-    preserve_parameter_floor: bool = False,
     tensor_parallel: int = 1,
     lora_rank: int = 0,
     rollout_cache_min_gb: float = 0.0,
@@ -233,7 +223,6 @@ def colocate_kv_util(
         num_generations,
         fp8_kv=fp8_kv,
         model_info=model_info,
-        preserve_parameter_floor=preserve_parameter_floor,
         rollout_cache_min_gb=rollout_cache_min_gb,
     )
     # Sleep mode keeps a larger pool (1.5x margin): the engine is offloaded during the backward, so a

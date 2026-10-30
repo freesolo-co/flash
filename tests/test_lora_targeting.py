@@ -462,10 +462,9 @@ def test_runtime_installer_rejects_stale_or_non_dataclass_configs_and_incomplete
         engine_cls(_FrozenModelConfig())._build_lora_module(_runtime_topology())
 
 
-def test_sft_grpo_and_opd_serialize_text_targeting_only_for_text_jobs(tmp_path):
+def test_sft_grpo_serialize_text_targeting_only_for_text_jobs(tmp_path):
     importlib.import_module("flash.engine.worker.train.entry.sft_train")
     from flash.engine.worker.train.entry import rl_train_runner, sft_train_runner
-    from flash.engine.worker.train.opd.orchestration.overrides import _build_opd_launch_config
 
     for text_only in (False, True):
         prefix = "model.language_model" if text_only else ""
@@ -509,15 +508,6 @@ def test_sft_grpo_and_opd_serialize_text_targeting_only_for_text_jobs(tmp_path):
             json.loads(Path(files["launch_config_path"]).read_text())["lora_language_prefix"]
             == prefix
         )
-        raw = _build_opd_launch_config(
-            runtime_dir=str(tmp_path),
-            save_at_steps=(),
-            total_steps=1,
-            gdn_model_type=None,
-            loggers=[],
-            lora_language_prefix=prefix,
-        )
-        assert json.loads(raw).get("lora_language_prefix", "") == prefix
 
 
 def test_exact_verl_hf_model_reproduces_old_peft_failure_and_attaches_new_targets():

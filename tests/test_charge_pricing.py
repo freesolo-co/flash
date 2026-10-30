@@ -108,7 +108,7 @@ def test_charge_usd_for_spec_falls_back_when_unpriceable():
 
 
 def _unbounded_on_policy_spec(algorithm: str):
-    """A grpo/opd spec that states no prompt-pool size and no horizon -- the shape a quote refuses.
+    """A grpo spec that states no prompt-pool size and no horizon -- the shape a quote refuses.
 
     Neither ``max_examples`` nor ``max_steps`` is set, so ``spec_steps`` cannot derive an update
     horizon and raises rather than inventing one. Submitting this is blocked; a run that predates
@@ -134,7 +134,7 @@ def test_cancel_prices_an_unbounded_on_policy_run_from_its_completed_steps():
     # regression -- the raise propagated through the blanket except here and returned the fallback,
     # so a cancelled unbounded run billed $0 and settled as a pricing failure while having really
     # rented the GPU. both algorithms derive the same way, so both regressed.
-    for algorithm in ("grpo", "opd"):
+    for algorithm in ("grpo",):
         spec = _unbounded_on_policy_spec(algorithm)
         charge = runner_costs.charge_usd_for_spec(spec, steps=7, fallback=float("nan"))
         assert math.isfinite(charge), f"{algorithm} cancel was unpriceable"
@@ -151,7 +151,7 @@ def test_cancel_prices_an_unbounded_on_policy_run_from_its_completed_steps():
 def test_cancelled_unbounded_on_policy_run_never_exceeds_its_quote():
     # when the full-work horizon is unknowable, cancellation falls back to the completed-step
     # reprice. that fallback still cannot exceed the price the customer accepted at submission.
-    for algorithm in ("grpo", "opd"):
+    for algorithm in ("grpo",):
         spec = _unbounded_on_policy_spec(algorithm)
         repriced = runner_costs.charge_usd_for_spec(spec, steps=7, fallback=float("nan"))
         accepted_quote = repriced / 2
@@ -173,7 +173,7 @@ def test_quoting_an_unbounded_on_policy_run_still_refuses_to_guess():
     # raise exists to prevent, and the test above would pass just as well.
     from flash.cost.spec import UnknownPromptPoolSize, spec_steps
 
-    for algorithm in ("grpo", "opd"):
+    for algorithm in ("grpo",):
         spec = _unbounded_on_policy_spec(algorithm)
         with pytest.raises(UnknownPromptPoolSize):
             spec_steps(spec)
@@ -389,15 +389,6 @@ def test_actual_steps_run_reads_last_heartbeat_step():
     assert runner_costs.actual_steps_run(st({"stage": "rl_step", "step": 0})) == 1
     assert runner_costs.actual_steps_run(st({"stage": "rl_step"})) == 1
     assert runner_costs.actual_steps_run(st({"stage": "sft_step"})) == 1
-    # A completed OPD run's final pre-DONE heartbeats (opd_trained / opd_train_done) are NOT
-    # training stages, so a STEPLESS one floors a cancel-between-publish-and-DONE to 0 -- re-pricing
-    # a fully trained run as $0. opd.py/finalize.py attach step=opt_steps so the true count bills.
-    assert (
-        runner_costs.actual_steps_run(st({"stage": "opd_trained"})) == 0
-    )  # the bug the step guards against
-    assert runner_costs.actual_steps_run(st({"stage": "opd_train_done"})) == 0
-    assert runner_costs.actual_steps_run(st({"stage": "opd_trained", "step": 12})) == 12
-    assert runner_costs.actual_steps_run(st({"stage": "opd_train_done", "step": 12})) == 12
     # Terminal `done` heartbeat: a cancel racing the DONE upload (done recorded, run not yet
     # transitioned) reads a STEPLESS done and floors a fully-trained run to 0. _publish_training_completion carries
     # opt_steps onto `done` so the true count bills.

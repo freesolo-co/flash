@@ -8,7 +8,7 @@ from flash.engine.worker.train.core.lifecycle.ledger import CheckpointLedger
 def test_resume_and_deployable_are_recorded_independently_in_either_order():
     """both publication orders are legitimate, so neither may imply or overwrite the other.
 
-    sft and opd publish the deployable from `before_upload`, reaching deployable_published FIRST.
+    sft publish the deployable from `before_upload`, reaching deployable_published FIRST.
     grpo stages a required adapter while its gradient gate is shut, uploads resume state meanwhile,
     and publishes on a later sweep -- the opposite order. a linear enum would have to call one of
     these a regression, which is exactly why the facts are independent.

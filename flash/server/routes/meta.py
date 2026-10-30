@@ -8,6 +8,7 @@ from fastapi import APIRouter, Depends
 
 from flash import __version__
 from flash.core.catalog import public_model_rows
+from flash.custom.types import CUSTOM_TRAINING_CAPABILITY
 from flash.server.platform.auth import _IDENTITY_PASSTHROUGH_FIELDS
 from flash.server.platform.deps import require_key
 
@@ -24,7 +25,7 @@ async def health():
         "ok": True,
         "service": "flash",
         "version": __version__,
-        "capabilities": [],
+        "capabilities": [CUSTOM_TRAINING_CAPABILITY],
     }
 
 

@@ -44,11 +44,7 @@ def test_sft_max_context_tokens_at_cap_allowed():
 
 @pytest.mark.parametrize(
     ("algorithm", "kwargs"),
-    [
-        ("sft", {"max_context_tokens": 32768}),
-        ("grpo", {"max_completion_tokens": 30720}),
-        ("opd", {"max_completion_tokens": 31744}),
-    ],
+    [("sft", {"max_context_tokens": 32768}), ("grpo", {"max_completion_tokens": 30720})],
 )
 def test_qwen38_context_at_approved_serving_cap_allowed(algorithm: str, kwargs: dict):
     preflight_train_context_within_serving(
@@ -56,7 +52,7 @@ def test_qwen38_context_at_approved_serving_cap_allowed(algorithm: str, kwargs: 
     )
 
 
-@pytest.mark.parametrize("algorithm", ["sft", "grpo", "opd"])
+@pytest.mark.parametrize("algorithm", ["sft", "grpo"])
 def test_qwen38_context_above_approved_serving_cap_rejected(algorithm: str):
     kwargs = (
         {"max_context_tokens": 32769} if algorithm == "sft" else {"max_completion_tokens": 31745}
@@ -96,29 +92,6 @@ def test_grpo_big_max_completion_tokens_pushes_rollout_over_cap_rejected():
     spec = _spec(model="Qwen/Qwen3.5-9B", algorithm="grpo", max_completion_tokens=40000)
     with pytest.raises(ValueError, match=r"exceeds .*serving max_model_len=32768"):
         preflight_train_context_within_serving(spec)
-
-
-def test_opd_rollout_context_above_serving_cap_rejected():
-    spec = _spec(
-        model="Qwen/Qwen3.6-35B-A3B",
-        algorithm="opd",
-        max_completion_tokens=32000,
-    )
-    with pytest.raises(
-        ValueError,
-        match=r"OPD rollout prompt\+completion\)=33024 exceeds .*max_model_len=32768",
-    ):
-        preflight_train_context_within_serving(spec)
-
-
-def test_opd_rollout_context_within_serving_cap_allowed():
-    preflight_train_context_within_serving(
-        _spec(
-            model="Qwen/Qwen3.6-35B-A3B",
-            algorithm="opd",
-            max_completion_tokens=3000,
-        )
-    )
 
 
 def test_a_model_without_a_serving_entry_is_skipped(monkeypatch):

@@ -252,7 +252,6 @@ def _fail_blocked_recovery(
 def _start_handleless_resubmit(spec, expected_state: str) -> bool | None:
     """Claim one provider-clear handleless launch without advancing an active claim."""
     from flash.runner.lifecycle.attempts import (
-        _verified_opd_retry_state,
         active_launch_claim_from_raw,
         claim_is_live,
         reserve_handleless_recovery_launch,
@@ -282,28 +281,12 @@ def _start_handleless_resubmit(spec, expected_state: str) -> bool | None:
     stale_claim = active_launch_claim_from_raw(raw)
     if stale_claim is not None and claim_is_live(spec.run_id, stale_claim):
         return None
-    revision = world_size = None
-    verified_attempt = None
-    if spec.algorithm == "opd":
-        # reclaiming a stale claim is not exempt. the lost worker can cross `optimizer.step()` and
-        # upload its mutation marker before provider cleanup finds and terminates it, so the claim's
-        # pre-launch resume evidence is already stale. reverify every attempt the counter names and
-        # carry that revision instead of the one the claim pinned.
-        try:
-            verified_attempt, revision, world_size = _verified_opd_retry_state(spec.run_id)
-            if verified_attempt != decode_next_attempt(raw):
-                raise RuntimeError("opd recovery attempt identity changed")
-        except Exception as exc:
-            _fail_blocked_recovery(spec, str(exc), expected_remote=None)
-            return False
     reservation = reserve_handleless_recovery_launch(
         spec.run_id,
         expected_state=expected_state,
         provider_clear_confirmed=True,
         expected_stale_claim=stale_claim,
-        expected_next_attempt=verified_attempt,
-        resume_revision=revision,
-        resume_world_size=world_size,
+        expected_next_attempt=decode_next_attempt(raw),
     )
     if reservation.active:
         return None

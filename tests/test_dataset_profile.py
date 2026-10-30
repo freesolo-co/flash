@@ -1304,6 +1304,38 @@ def test_profile_rejects_cumulative_unique_decoded_work_before_crossing_decode(
     assert successful_decodes == [(56, 56)]
 
 
+def test_profile_decode_budget_admits_a_screenshot_dataset_independent_of_row_limits(
+    tmp_path,
+) -> None:
+    import io
+
+    from flash.content.multimodal import (
+        MAX_IMAGES_PER_EXAMPLE,
+        MAX_TOTAL_DECODED_BYTES,
+        normalize_image_source,
+        validate_image_descriptor_data,
+    )
+    from flash.engine.profiling import image_tokens
+
+    image_module = pytest.importorskip("PIL.Image")
+    (tmp_path / "dataset").mkdir()
+    buffer = io.BytesIO()
+    image_module.new("RGB", (498, 321), (200, 10, 10)).save(buffer, format="PNG")
+    (tmp_path / "dataset" / "shot.png").write_bytes(buffer.getvalue())
+    descriptor = normalize_image_source("dataset/shot.png", tmp_path)
+    charged = validate_image_descriptor_data(
+        descriptor, buffer.getvalue(), decode_pixels=False
+    ).decoded_peak_bytes
+
+    # A MiniWoB teacher-trace SFT package holds ~3,250 unique 498x321 screenshots.
+    assert 3250 * charged <= image_tokens.MAX_PROFILE_DECODED_WORK_BYTES
+    # The dataset-wide budget is not the per-row decode bound scaled by images per row.
+    assert (
+        image_tokens.MAX_PROFILE_DECODED_WORK_BYTES
+        != MAX_TOTAL_DECODED_BYTES * MAX_IMAGES_PER_EXAMPLE
+    )
+
+
 def test_an_unreadable_image_is_a_packaging_error_not_a_crash(tmp_path, published_geometry) -> None:
     entrypoint = _package(
         tmp_path,

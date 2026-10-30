@@ -26,10 +26,6 @@ from flash.engine.worker.perf import (  # noqa: F401
 )
 from flash.engine.worker.runtime.phases import timed_phase
 from flash.engine.worker.runtime.state import WorkerContext
-from flash.teacher.retry_contract import (
-    canonical_opd_optimizer_start_json,
-    opd_optimizer_start_marker_path,
-)
 
 
 @dataclass(frozen=True)
@@ -117,36 +113,6 @@ def hf_api():
 
 def hf_prefix(*, context: WorkerContext) -> str:
     return f"{context.config.phase}/{context.config.run_id}"
-
-
-def publish_opd_optimizer_start_marker(*, context: WorkerContext) -> None:
-    """Synchronously publish the first-update mutation marker before optimizer.step()."""
-    if not isinstance(context.config.hf_repo, str) or not context.config.hf_repo.strip():
-        raise RuntimeError("opd optimizer-start marker requires a private HF repository")
-    marker_path = opd_optimizer_start_marker_path(context.config.run_id, context.config.attempt)
-    local_path = f"/tmp/opd-optimizer-start-attempt-{context.config.attempt}.json"
-    payload = canonical_opd_optimizer_start_json(
-        run_id=context.config.run_id,
-        attempt=context.config.attempt,
-        seed=context.config.seed,
-    )
-    with open(local_path, "wb") as file:
-        file.write(payload)
-        file.flush()
-        os.fsync(file.fileno())
-    try:
-        _require_hf_deadline_allowance(context=context)
-        hf_api().upload_file(
-            path_or_fileobj=local_path,
-            path_in_repo=marker_path,
-            repo_id=context.config.hf_repo,
-            repo_type="dataset",
-        )
-    except Exception as error:
-        detail = sanitize_diagnostic(error, limit=500)
-        raise RetriableInfraError(
-            f"required upload of OPD optimizer-start marker failed: {detail}"
-        ) from error
 
 
 def _require_hf_deadline_allowance(*, context: WorkerContext) -> float | None:
@@ -401,9 +367,16 @@ def publish_deployable_checkpoint(
     required: bool = False,
     _provenance_ready: bool = False,
     _emit_heartbeat: bool = True,
+    checkpoint_dir: str | None = None,
     context: WorkerContext,
 ) -> PublicationResult:
-    """commit an adapter once; reporting can never trigger a second storage commit."""
+    """Commit an adapter, optionally atomically with its trainer state, then report it."""
+    from flash.engine.support.checkpoint_transport import upload_directory
+
+    if checkpoint_dir is not None and os.path.realpath(ckpt_dir) != os.path.realpath(
+        os.path.join(checkpoint_dir, "adapter")
+    ):
+        raise ValueError("checkpoint_dir must contain the published adapter directory")
     if not context.config.hf_repo or not _has_deployable_adapter(ckpt_dir):
         reason = "no_repository" if not context.config.hf_repo else "no_adapter"
         if required:
@@ -426,16 +399,20 @@ def publish_deployable_checkpoint(
         if _emit_heartbeat
         else contextlib.nullcontext()
     )
-    with heartbeat_context:
+    upload_context = (
+        upload_directory(checkpoint_dir) if checkpoint_dir else contextlib.nullcontext(ckpt_dir)
+    )
+    upload_path = subfolder.removesuffix("/adapter") if checkpoint_dir else subfolder
+    with heartbeat_context, upload_context as source:
         for attempt in range(attempts):
             try:
                 _require_hf_deadline_allowance(context=context)
                 receipt = hf_api().upload_folder(
-                    folder_path=ckpt_dir,
-                    path_in_repo=subfolder,
+                    folder_path=source,
+                    path_in_repo=upload_path,
                     repo_id=context.config.hf_repo,
                     repo_type="dataset",
-                    ignore_patterns=list(_CHECKPOINT_TRAINER_STATE),
+                    ignore_patterns=[] if checkpoint_dir else list(_CHECKPOINT_TRAINER_STATE),
                 )
                 break
             except Exception as error:
@@ -457,7 +434,11 @@ def publish_deployable_checkpoint(
         if _emit_heartbeat
         else None
     )
-    return PublicationResult(deployable=commit, reporting_error=reporting_error)
+    return PublicationResult(
+        deployable=commit,
+        resume=ArtifactCommit(upload_path, commit.revision) if checkpoint_dir else None,
+        reporting_error=reporting_error,
+    )
 
 
 def _deployable_adapter_on_hf(step: int, *, context: WorkerContext) -> bool:

@@ -181,11 +181,18 @@ def _resolve_ref_sha(
     deadline_at: float | None = None,
 ) -> str:
     # Control plane pins sha once; workers skip GitHub entirely on a fan-out.
+    from flash.envs.registry import packages
+
+    slug = packages.managed_slug(parsed.canonical())
+    if slug is not None:
+        return packages.resolve_revision(
+            slug, pinned_sha or "", deadline_at=deadline_at or time.time() + timeout
+        )
     if pinned_sha and is_commit_sha(pinned_sha):
         return pinned_sha
     if is_commit_sha(parsed.ref):
         return parsed.ref
-    # Symbolic refs are NOT cached in-process: managed slugs point at environment-hub@main which moves.
+    # Symbolic external repository refs are not cached because branches move.
     headers = _github_headers("application/vnd.github+json")
     commit_url = f"https://api.github.com/repos/{parsed.repo_full_name}/commits/{urllib.parse.quote(parsed.ref, safe='')}"
     req = urllib.request.Request(commit_url, headers=headers)
@@ -378,39 +385,6 @@ def _download_github_tarball(
     return tar_path
 
 
-def _managed_hub_package_root(ref: GitHubEnvironmentRef) -> str:
-    """The directory holding ONE environment's package: ``<org>/<project>/<name>``.
-
-    All three segments, not two: the package root is what gets downloaded and copied into the
-    cache entry, and ``<org>/<project>`` is the project directory holding every environment
-    the project has published. Stopping at two would fetch all of them to import one.
-    """
-    if ref.repo_full_name.lower() != _DEFAULT_MANAGED_ENV_REPO.lower():
-        return ""
-    parts = [part for part in ref.path.split("/") if part]
-    if len(parts) < 3 or not _is_safe_github_path_parts(tuple(parts[:3])):
-        return ""
-    return "/".join(parts[:3])
-
-
-def _github_contents_url(ref: GitHubEnvironmentRef, path: str) -> str:
-    quoted_path = "/".join(urllib.parse.quote(part, safe="") for part in path.split("/") if part)
-    return (
-        f"https://api.github.com/repos/{ref.repo_full_name}/contents/{quoted_path}"
-        f"?ref={urllib.parse.quote(ref.ref, safe='')}"
-    )
-
-
-def _github_tree_url(ref: GitHubEnvironmentRef, treeish: str, *, recursive: bool = False) -> str:
-    url = (
-        f"https://api.github.com/repos/{ref.repo_full_name}/git/trees/"
-        f"{urllib.parse.quote(treeish, safe='')}"
-    )
-    if recursive:
-        url = f"{url}?recursive=1"
-    return url
-
-
 def _github_token() -> str | None:
     """The GitHub token, or ``None`` when unset OR blank.
 
@@ -428,227 +402,6 @@ def _github_headers(accept: str) -> dict[str, str]:
     if token:
         headers["Authorization"] = f"Bearer {token}"
     return headers
-
-
-def _safe_contents_path(path: object, root_parts: list[str]) -> str:
-    if not isinstance(path, str):
-        raise RuntimeError("GitHub contents response did not include a path")
-    try:
-        normalized = _normalize_env_path(path)
-    except ValueError as exc:
-        raise RuntimeError(f"unsafe path in environment contents: {path!r}") from exc
-    parts = normalized.split("/")
-    if parts[: len(root_parts)] != root_parts:
-        raise RuntimeError(f"unexpected path in environment contents: {path!r}")
-    return normalized
-
-
-def _download_github_json(
-    ref: GitHubEnvironmentRef,
-    url: str,
-    context: str,
-    *,
-    timeout: float = 120.0,
-    max_rate_limit_retries: int = 5,
-    deadline_at: float | None = None,
-) -> object:
-    request_options = {"timeout": timeout, "max_bytes": _MAX_CONTENTS_JSON_BYTES}
-    if deadline_at is not None:
-        request_options["deadline_at"] = deadline_at
-    if max_rate_limit_retries != 5:
-        request_options["max_rate_limit_retries"] = max_rate_limit_retries
-    data = _urlopen(
-        urllib.request.Request(url, headers=_github_headers("application/vnd.github+json")),
-        **request_options,
-    )
-    try:
-        return json.loads(data)
-    except json.JSONDecodeError as exc:
-        raise RuntimeError(
-            "GitHub environment request failed for "
-            f"{ref.repo_full_name}@{ref.ref}:{context}: invalid response"
-        ) from exc
-
-
-def _github_response_message(payload: object) -> str:
-    if isinstance(payload, dict):
-        message = payload.get("message")
-        if isinstance(message, str) and message:
-            return f" ({message})"
-    return ""
-
-
-def _github_tree_entries(
-    ref: GitHubEnvironmentRef,
-    treeish: str,
-    context: str,
-    *,
-    recursive: bool = False,
-    timeout: float = 120.0,
-    max_rate_limit_retries: int = 5,
-    deadline_at: float | None = None,
-) -> list[dict]:
-    request_options = {
-        "timeout": timeout,
-        "max_rate_limit_retries": max_rate_limit_retries,
-    }
-    if deadline_at is not None:
-        request_options["deadline_at"] = deadline_at
-    payload = _download_github_json(
-        ref,
-        _github_tree_url(ref, treeish, recursive=recursive),
-        context,
-        **request_options,
-    )
-    if not isinstance(payload, dict) or not isinstance(payload.get("tree"), list):
-        raise RuntimeError(
-            f"GitHub path {context!r} is not an environment directory"
-            f"{_github_response_message(payload)}"
-        )
-    if payload.get("truncated"):
-        raise RuntimeError(
-            f"GitHub tree response for environment directory {context!r} was truncated"
-        )
-    entries = payload["tree"]
-    if not all(isinstance(entry, dict) for entry in entries):
-        raise RuntimeError("GitHub tree response included an invalid entry")
-    return entries
-
-
-def _resolve_github_directory_tree_sha(
-    ref: GitHubEnvironmentRef,
-    repo_dir: str,
-    *,
-    deadline_at: float | None = None,
-) -> str:
-    treeish = ref.ref
-    current = ""
-    for part in [part for part in repo_dir.split("/") if part]:
-        request_options = {"deadline_at": deadline_at} if deadline_at is not None else {}
-        entries = _github_tree_entries(
-            ref,
-            treeish,
-            current or ref.ref,
-            **request_options,
-        )
-        match = next(
-            (
-                entry
-                for entry in entries
-                if entry.get("path") == part
-                and entry.get("type") == "tree"
-                and isinstance(entry.get("sha"), str)
-            ),
-            None,
-        )
-        current = f"{current}/{part}" if current else part
-        if match is None:
-            raise RuntimeError(f"GitHub path {repo_dir!r} is not an environment directory")
-        treeish = match["sha"]
-    return treeish
-
-
-def _download_github_directory(
-    ref: GitHubEnvironmentRef,
-    repo_dir: str,
-    dest: Path,
-    *,
-    deadline_at: float | None = None,
-) -> Path:
-    """Download one GitHub directory into a repo-shaped tree under ``dest``."""
-    repo_root = dest / "repo"
-    root_parts = [part for part in repo_dir.split("/") if part]
-    state = {"members": 0, "bytes": 0}
-
-    def record_member(path: str) -> None:
-        state["members"] += 1
-        if state["members"] > _MAX_ARCHIVE_MEMBERS:
-            raise RuntimeError(f"env package has too many members (limit {_MAX_ARCHIVE_MEMBERS})")
-        target = (repo_root / path).resolve()
-        root = repo_root.resolve()
-        if target != root and root not in target.parents:
-            raise RuntimeError(f"unsafe path in environment contents: {path!r}")
-
-    def download_file(path: str, declared_size: object, mode: object = None) -> None:
-        record_member(path)
-        if (
-            isinstance(declared_size, int)
-            and declared_size >= 0
-            and state["bytes"] + declared_size > _MAX_ARCHIVE_BYTES
-        ):
-            raise RuntimeError(
-                "environment archive is too large uncompressed "
-                f"({state['bytes'] + declared_size} bytes; limit {_MAX_ARCHIVE_BYTES} bytes)"
-            )
-        remaining = _MAX_ARCHIVE_BYTES - state["bytes"]
-        target = repo_root / path
-        target.parent.mkdir(parents=True, exist_ok=True)
-        with target.open("wb") as out:
-            request_options = {
-                "timeout": 120.0,
-                "max_bytes": remaining,
-                "out": out,
-            }
-            if deadline_at is not None:
-                request_options["deadline_at"] = deadline_at
-            _urlopen(
-                urllib.request.Request(
-                    _github_contents_url(ref, path),
-                    headers=_github_headers("application/vnd.github.raw"),
-                ),
-                **request_options,
-            )
-        state["bytes"] += target.stat().st_size
-        if state["bytes"] > _MAX_ARCHIVE_BYTES:
-            raise RuntimeError(
-                "environment archive is too large uncompressed "
-                f"({state['bytes']} bytes; limit {_MAX_ARCHIVE_BYTES} bytes)"
-            )
-        if isinstance(mode, str):
-            with contextlib.suppress(ValueError):
-                target.chmod(int(mode, 8) & 0o777)
-
-    def create_dir(path: str) -> None:
-        record_member(path)
-        (repo_root / path).mkdir(parents=True, exist_ok=True)
-
-    create_dir(repo_dir)
-    request_options = {"deadline_at": deadline_at} if deadline_at is not None else {}
-    package_tree_sha = _resolve_github_directory_tree_sha(
-        ref,
-        repo_dir,
-        **request_options,
-    )
-    payload = _download_github_json(
-        ref,
-        _github_tree_url(ref, package_tree_sha, recursive=True),
-        repo_dir,
-        **request_options,
-    )
-    if not isinstance(payload, dict) or not isinstance(payload.get("tree"), list):
-        raise RuntimeError(
-            f"GitHub path {repo_dir!r} is not an environment directory"
-            f"{_github_response_message(payload)}"
-        )
-    if payload.get("truncated"):
-        raise RuntimeError(
-            f"GitHub tree response for environment directory {repo_dir!r} was truncated"
-        )
-    for entry in payload["tree"]:
-        if not isinstance(entry, dict):
-            raise RuntimeError("GitHub tree response included an invalid entry")
-        rel_path = entry.get("path")
-        if not isinstance(rel_path, str):
-            raise RuntimeError("GitHub tree response included an entry without a path")
-        child_path = _safe_contents_path(f"{repo_dir}/{rel_path}", root_parts)
-        kind = entry.get("type")
-        if kind == "tree":
-            create_dir(child_path)
-        elif kind == "blob" and entry.get("mode") != "120000":
-            download_file(child_path, entry.get("size"), entry.get("mode"))
-        else:
-            raise RuntimeError(f"unsupported entry in environment contents: {child_path!r}")
-    return repo_root
 
 
 def _extract_github_tarball(
@@ -797,18 +550,17 @@ def _evict_env_cache(keep: Path) -> None:
 
 
 def _resolve_github_environment_file(env_ref: str, pinned_sha: str | None = None) -> Path:
+    from flash.envs.registry import packages
+
+    slug = packages.managed_slug(env_ref)
+    if slug is not None:
+        return packages.cached_entrypoint(slug, pinned_sha or "")
     parsed = _parse_github_environment_ref(env_ref)
     if parsed is None:
         raise ValueError(f"not a GitHub environment ref: {env_ref!r}")
     resolved_ref = _resolve_ref_sha(parsed, pinned_sha=pinned_sha)
-    package_root = _managed_hub_package_root(parsed)
-    if parsed.repo_full_name.lower() == _DEFAULT_MANAGED_ENV_REPO.lower() and not package_root:
-        raise ValueError(
-            "managed environment hub refs must include a namespace/project/name environment path"
-        )
-    cache_scope = "managed-hub" if package_root else "github"
     cache_key = hashlib.sha256(
-        f"{cache_scope}:github:{parsed.repo_full_name}@{resolved_ref}:{parsed.path}".encode()
+        f"github:{parsed.repo_full_name}@{resolved_ref}:{parsed.path}".encode()
     ).hexdigest()[:24]
     cache_dir = _ensure_cache_root() / cache_key
     env_file = find_cached_entry(cache_dir, parsed.path, _DEFAULT_ENVIRONMENT_PATH)
@@ -822,14 +574,7 @@ def _resolve_github_environment_file(env_ref: str, pinned_sha: str | None = None
         parsed.path,
     )
     try:
-        if package_root:
-            # the shared managed hub can be much larger than one environment. download only the
-            # requested package so worker cache/extraction limits apply to that env, not the hub.
-            extracted = _download_github_directory(resolved, package_root, tmp_parent)
-        else:
-            # generic github refs keep repo-level sidecars available to relative paths/imports.
-            # user-facing pulls filter to the requested env subtree in flash.envs.loading.pull.
-            extracted = _extract_github_tarball(resolved, tmp_parent)
+        extracted = _extract_github_tarball(resolved, tmp_parent)
         candidate = extracted / parsed.path
         if candidate.is_dir():
             candidate = candidate / _DEFAULT_ENVIRONMENT_PATH
@@ -846,10 +591,11 @@ def _resolve_github_environment_file(env_ref: str, pinned_sha: str | None = None
 
 
 def _resolve_environment_reference(env_ref: str, pinned_sha: str | None = None) -> str:
-    if is_managed_environment_slug(env_ref):
-        return str(
-            _resolve_github_environment_file(managed_slug_to_github_ref(env_ref), pinned_sha)
-        )
+    from flash.envs.registry import packages
+
+    slug = packages.managed_slug(env_ref)
+    if slug is not None:
+        return str(packages.cached_entrypoint(slug, pinned_sha or ""))
     parsed = _parse_github_environment_ref(env_ref)
     if parsed is None:
         path = Path(env_ref)

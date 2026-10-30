@@ -30,8 +30,12 @@ _DEFAULT_MIN_PIXELS = 56 * 56
 _DEFAULT_MAX_PIXELS = 14 * 14 * 4 * 1280
 # the same bound transformers enforces: beyond it smart_resize cannot hold the aspect ratio.
 _MAX_ASPECT_RATIO = 200
-# profile-wide unique full-decode work; per-row decoded bytes keep their separate bound.
-MAX_PROFILE_DECODED_WORK_BYTES = MAX_TOTAL_DECODED_BYTES * MAX_IMAGES_PER_EXAMPLE
+# profile-wide unique full-decode work; per-row decoded bytes keep their separate bound. this
+# bounds the control plane's cpu time across a whole dataset, so it is sized for datasets, not
+# derived from the per-row image count: images decode one at a time and are discarded, and the
+# charged peak bytes overstate real work (3,250 498x321 screenshots charge 4.35 GiB yet decode in
+# under 3 s with ~30 MiB resident).
+MAX_PROFILE_DECODED_WORK_BYTES = 16 * 1024 * 1024 * 1024
 
 
 @dataclass(frozen=True)

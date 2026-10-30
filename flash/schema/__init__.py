@@ -7,10 +7,15 @@ import sys
 import tomllib
 from collections.abc import Collection, Mapping
 from dataclasses import fields as dataclass_fields
+from dataclasses import replace
 from typing import Any
 
 from flash._internal.channel import CLI_NAME
-from flash.core.catalog import normalize_algorithm, resolve_model, serving_lora_rank_cap
+from flash.core.catalog import (
+    normalize_algorithm,
+    resolve_model,
+    serving_lora_rank_cap,
+)
 from flash.core.grpo import resolve_grpo_rollout_shape
 from flash.core.spec import (
     FIXED_SEED,
@@ -46,7 +51,6 @@ from flash.schema.fields import (
     _train_int,
     _train_stops,
     _train_structured_outputs,
-    _train_teacher,
     _wandb_spec,
 )
 
@@ -64,7 +68,7 @@ _CHECKPOINT_REF_RE = re.compile(
 # INTERNAL artifact-store locator (`<owner>/<repo>:<phase>/<run_id>[/checkpoints/step-N]`); built by
 # the control plane from run metadata and consumed by the worker — not accepted from users anywhere.
 _ADAPTER_STORAGE_REF_RE = re.compile(
-    rf"^(?P<repo>{_OWNER_REPO_RE}/{_OWNER_REPO_RE}):(?P<phase>sft|rl|opd)/"
+    rf"^(?P<repo>{_OWNER_REPO_RE}/{_OWNER_REPO_RE}):(?P<phase>sft|rl|custom)/"
     rf"(?P<run_id>{_RUN_ID_RE})(?P<checkpoint>/checkpoints/step-\d+)?$"
 )
 
@@ -151,7 +155,7 @@ def spec_and_train_keys_from_file(
     *,
     project_required: bool = False,
 ) -> tuple[JobSpec, frozenset[str]]:
-    """parse a config and retain the raw authored [train] keys for schema preflights."""
+    """Parse a new training request and retain authored [train] keys for schema preflights."""
     raw = load_toml(path)
     for extra in extra_configs or []:
         _deep_merge(raw, load_toml(extra))
@@ -284,13 +288,13 @@ def validate_train_keys(keys: Collection[str]) -> None:
 
 # the optimizer batch has a different name per algorithm because it is a different quantity, and one
 # name for both was a silent trap: under sft the packaged-dataset estimate turns `batch_size` into
-# examples_per_update, while under grpo/opd the key IS prompts-per-step. so the standard sft
+# examples_per_update, while under grpo the key IS prompts-per-step. so the standard sft
 # out-of-memory workaround, `batch_size = 1`, copied into an rl config meant one prompt per optimizer
 # update -- the run trained, logged and billed, and nothing errored. rejecting the wrong name makes
 # that copy a parse error naming the right key instead of a quiet, expensive misconfiguration.
 _ALGORITHM_ONLY_TRAIN_KEYS = {
     "batch_size": ("sft",),
-    "prompts_per_step": ("grpo", "opd"),
+    "prompts_per_step": ("grpo",),
 }
 
 
@@ -325,7 +329,7 @@ def _validate_top_level(
     unknown = sorted(set(raw) - _TOP_LEVEL_KEYS)
     if unknown:
         hint = ""
-        if {"grpo", "sft", "opd"} & set(unknown):
+        if {"grpo", "sft"} & set(unknown):
             hint = (
                 " - algorithm knobs (group_size, batch_size, max_completion_tokens, ...) "
                 "belong under [train], not a per-algorithm table"
@@ -403,6 +407,12 @@ def _validate_train_section(raw: dict[str, Any], algorithm: str) -> dict[str, An
     if not isinstance(train_raw, dict):
         raise ConfigError("[train] must be a table")
     validate_train_keys(train_raw)
+    if algorithm == "custom":
+        from flash.schema.custom import TRAIN_DEFAULTS, TRAIN_KEYS
+
+        if set(train_raw) - TRAIN_KEYS:
+            raise ConfigError(f"[train] custom mode accepts only: {', '.join(sorted(TRAIN_KEYS))}")
+        return {**TRAIN_DEFAULTS, **train_raw}
     validate_train_keys_for_algorithm(train_raw, algorithm)
     return train_raw
 
@@ -503,6 +513,15 @@ def _validate_gpu_section(
         )
     except (TypeError, ValueError) as exc:
         raise ConfigError(str(exc)) from exc
+
+    if algorithm == "custom":
+        from flash.providers.core.base import custom_gpu_shape
+
+        try:
+            custom_gpu_shape(model, gpu_spec.provider, gpu_spec.acceptable_types, gpu_count)
+        except ValueError as exc:
+            raise ConfigError(str(exc)) from exc
+        return gpu_spec, authored_gpu_ceiling(gpu_spec.type, gpu_count) is None
 
     gpu_types = gpu_spec.acceptable_types
     for candidate in gpu_types:
@@ -639,6 +658,9 @@ def spec_from_dict(
     raw: dict[str, Any], run_id: str | None = None, *, project_required: bool = False
 ) -> JobSpec:
     model, model_revision, project, algorithm, thinking = _validate_top_level(raw, project_required)
+    from flash.schema.custom import parse_custom_section
+
+    custom = parse_custom_section(raw.get("custom"), algorithm)
     env_raw, environment_pip, environment_secrets = _validate_environment_section(raw, algorithm)
     train_raw = _validate_train_section(raw, algorithm)
     if algorithm == "grpo":
@@ -659,6 +681,8 @@ def spec_from_dict(
         init_from_adapter=init_from_adapter,
         thinking=thinking,
     )
+    if custom:
+        gpu_spec = replace(gpu_spec, max_retries=0, max_wall_seconds=custom["max_wall_seconds"])
     init_from_adapter, lora_rank, lora_alpha = _validate_algorithm_model_consistency(
         model,
         algorithm,
@@ -688,8 +712,6 @@ def spec_from_dict(
             thinking_length_penalty_coef=_train_float(
                 train_raw, "thinking_length_penalty_coef", minimum=0.0, maximum=1.0
             ),
-            # opd-only managed teacher alias, validated against the allow-list; "" -> default glm 5.2.
-            teacher_model=_train_teacher(train_raw),
             stop_sequences=_train_stops(train_raw),
             structured_outputs=_train_structured_outputs(train_raw),
             credit_assignment=_train_credit_assignment(train_raw),
@@ -719,6 +741,7 @@ def spec_from_dict(
         thinking=thinking,
         wandb=wandb_spec,
         project=project,
+        custom=custom,
     )
     _validate_spec(spec)
     if spec.train.structured_outputs and thinking:
@@ -741,52 +764,27 @@ _INAPPLICABLE_TRAIN_KNOBS: dict[str, dict[str, str]] = {
     "sft": {
         "mask_truncated_completions": "only applies to single-turn grpo rollouts",
         "structured_outputs": (
-            "only applies to rollout algorithms (grpo, opd); SFT trains on dataset completions "
-            "and never generates"
+            "only applies to grpo; SFT trains on dataset completions and never generates"
         ),
         "group_size": (
-            "only applies to rollout algorithms (grpo, opd); it sizes the generations per prompt, "
-            "and SFT never generates"
+            "only applies to grpo; it sizes the generations per prompt, and SFT never generates"
         ),
         "temperature": (
-            "only applies to rollout algorithms (grpo, opd); SFT trains on dataset completions "
-            "and never samples"
+            "only applies to grpo; SFT trains on dataset completions and never samples"
         ),
         "max_completion_tokens": (
-            "only applies to rollout algorithms (grpo, opd); SFT never generates, so cap the "
+            "only applies to grpo; SFT never generates, so cap the "
             "training rows with max_context_tokens instead"
         ),
-        "kl_penalty_coef": (
-            "only applies to rollout algorithms (grpo, opd); SFT's objective has no KL term"
-        ),
+        "kl_penalty_coef": ("only applies to grpo; SFT's objective has no KL term"),
         "thinking_length_penalty_coef": (
             "only applies to grpo; it penalizes generated reasoning length, and SFT never generates"
         ),
-        "teacher_model": "only applies to opd; SFT trains on dataset completions, not a teacher",
         "credit_assignment": (
             "only applies to grpo; it distributes rollout advantage across turns, and SFT has no "
             "rollouts"
         ),
-        "stop_sequences": (
-            "only applies to rollout algorithms (grpo, opd); they bound sampling, and SFT never "
-            "generates"
-        ),
-    },
-    "opd": {
-        "mask_truncated_completions": "only applies to single-turn grpo rollouts",
-        "thinking_length_penalty_coef": (
-            "only applies to grpo; it shapes the grpo reward, and opd optimizes a distillation "
-            "objective with no reward term"
-        ),
-        "credit_assignment": (
-            "only applies to grpo; it distributes group-relative advantage, and opd has no "
-            "advantages to assign"
-        ),
-    },
-    "grpo": {
-        "teacher_model": (
-            "only applies to opd; grpo optimizes its environment reward and has no teacher"
-        ),
+        "stop_sequences": ("only applies to grpo; they bound sampling, and SFT never generates"),
     },
 }
 
@@ -830,15 +828,14 @@ def _validate_on_policy_prompt_budget(spec: JobSpec, algorithm: str) -> None:
     each algorithm resolves its completion length off its own recipe, so read it through the same
     helper its worker does, since a shared number would reject runs the worker accepts. the worker
     clamps the requested context down to the model architecture before subtracting
-    (`train/rl/inputs.py`, `opd_train_runner`), and clamping can only shrink the budget, so
+    (`train/rl/inputs.py`), and clamping can only shrink the budget, so
     checking the unclamped value here is never stricter than the worker's own enforcement.
     """
     if not spec.train.max_context_tokens:
         return
-    from flash.engine.plan.vram import grpo_completion_len, opd_completion_len
+    from flash.engine.plan.vram import grpo_completion_len
 
-    resolve = grpo_completion_len if algorithm == "grpo" else opd_completion_len
-    max_completion = resolve(spec.train.max_completion_tokens, spec.thinking)
+    max_completion = grpo_completion_len(spec.train.max_completion_tokens, spec.thinking)
     if spec.train.max_context_tokens - max_completion < 1:
         raise ConfigError(
             f"[train] max_context_tokens ({spec.train.max_context_tokens}) leaves no prompt budget "
@@ -848,23 +845,12 @@ def _validate_on_policy_prompt_budget(spec: JobSpec, algorithm: str) -> None:
         )
 
 
-def _validate_opd(spec: JobSpec) -> None:
-    """validate opd-specific training constraints."""
-    if spec.train.kl_penalty_coef == 0.0:
-        raise ConfigError(
-            "[train] kl_penalty_coef must be > 0 for opd because it scales the gkd "
-            "distillation objective; omit it to use the default 1.0 or set a positive value"
-        )
-    _validate_on_policy_prompt_budget(spec, "opd")
-
-
 # each algorithm's spec-level contract lives in one validator, dispatched by name. sft has no entry:
 # its one rule (structured_outputs) moved into _INAPPLICABLE_TRAIN_KNOBS, and it needs no row-count
 # requirement because an sft quote is backed by a workload profile that materializes and tokenizes
 # the real dataset -- an omitted or zero max_examples means "every row" and is measured, not guessed.
 _ALGO_VALIDATORS = {
     "grpo": _validate_grpo,
-    "opd": _validate_opd,
 }
 
 
@@ -888,6 +874,11 @@ def _validate_spec(spec: JobSpec) -> None:
     validator = _ALGO_VALIDATORS.get(spec.algorithm)
     if validator is not None:
         validator(spec)
+    if spec.algorithm == "custom":
+        from flash.schema.custom import validate_custom_spec
+
+        validate_custom_spec(spec)
+        return
     if not spec.environment.id:
         raise ConfigError(
             "config must set [environment] id (upload an environment with "

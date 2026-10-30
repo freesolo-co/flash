@@ -59,7 +59,9 @@ def test_server_requires_training_adapter_and_preserves_exact_finish_reason(monk
     recipe = _import_recipe(monkeypatch, "flash.engine.worker.train.core.child.rollout")
     server = recipe.FlashVLLMServer()
     server.lora_as_adapter = True
-    server.model_config = SimpleNamespace(runtime_options={"algorithm": "opd"})
+    server.model_config = SimpleNamespace(runtime_options={"algorithm": "grpo"})
+    # Isolate adapter admission and finish reasons; rollout identity has its own contract tests.
+    monkeypatch.setattr(server, "_contract", lambda: None)
 
     async def list_loras():
         return [123] if loaded else []
@@ -214,51 +216,6 @@ def test_tracking_link_lookup_is_optional(monkeypatch, capsys, failed_property, 
             "wandb_url": "https://wandb.example/run",
             "wandb_id": "run-id",
         }
-
-
-@pytest.mark.parametrize("multimodal", [False, True])
-def test_opd_parent_passes_model_checkpointing_and_vision_policy(
-    worker_context, monkeypatch, multimodal
-):
-    from flash.engine.worker.train.entry import opd_train_runner as runner
-
-    request = SimpleNamespace(
-        model_id="Qwen/Qwen3.5-9B",
-        knobs=SimpleNamespace(stop_sequences=(), save_at_steps=()),
-        structured_outputs=None,
-        model_vocab_size=248320,
-        multi_turn=False,
-        max_turns=1,
-    )
-    workload = SimpleNamespace(
-        runtime_dir="/runtime",
-        update_horizon=2,
-        exclude_modules=None,
-        multimodal=multimodal,
-        **dict.fromkeys(
-            (
-                "mutation_failure_path",
-                "score_delivery_failure_path",
-                "rollout_failure_path",
-                "abandonment_failure_path",
-                "resample_failure_path",
-                "cycle_commit_failure_path",
-            ),
-            "",
-        ),
-    )
-    runtime = SimpleNamespace(
-        bridge=SimpleNamespace(url="http://teacher", token="test"),
-        loggers=[],
-        gdn_reset_arch="qwen3_5",
-    )
-    monkeypatch.setattr(runner._opd_overrides, "_build_opd_child_env", lambda **kwargs: kwargs)
-    child = runner._build_child_env(
-        request, SimpleNamespace(max_model_len=256), workload, runtime, (), context=worker_context
-    )
-    options = json.loads(child["launch_config"])
-    assert options["reentrant_checkpointing"] is True
-    assert options["multimodal"] is multimodal
 
 
 @pytest.mark.parametrize("lengths", [(89, 89), (19, 23), (4, 4), (1, 1, 1, 1)])

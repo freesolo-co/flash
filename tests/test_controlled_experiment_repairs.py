@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import inspect
 import json
 from types import SimpleNamespace
 
@@ -42,16 +41,6 @@ def _stub_prepare_dependencies(monkeypatch, spec=None):
     )
     monkeypatch.setattr(
         "flash.adapters.lora_rank.preflight_train_context_within_serving", lambda _spec: None
-    )
-    # these tests isolate model revision and structured-output validation. environment image
-    # discovery and managed-teacher configuration have their own boundary suites.
-    monkeypatch.setattr(
-        "flash.content.multimodal.preflight_validate_image_opd",
-        lambda _spec, **_kwargs: None,
-    )
-    monkeypatch.setattr(
-        "flash.server.domain.teacher.broker.preflight_validate_managed_teacher",
-        lambda _spec: None,
     )
 
 
@@ -337,30 +326,6 @@ def test_prefetch_pinned_revision_wraps_transient_download_failure(worker_contex
     assert exc_info.value.__cause__ is transient
 
 
-def test_opd_model_revision_is_keyword_only():
-    # a pinned revision must never be positional: model_id and model_revision are adjacent strings,
-    # so a positional call that transposes them silently loads the wrong commit and breaks the
-    # controlled comparison this file exists to protect. the guard moved from trl's rollout engine
-    # (OpdVllmRolloutEngine, deleted) to the verl checkpoint watcher, which is what carries the
-    # revision through opd now -- it re-exports each checkpoint adapter under that pin.
-    from flash.engine.worker.train.entry.sft_train import _VerlCheckpointWatcher
-    from flash.engine.worker.train.opd.orchestration.failures import _OpdVerlCheckpointWatcher
-
-    # the opd subclass forwards **kwargs, so the binding it inherits is what has to be keyword-only.
-    assert issubclass(_OpdVerlCheckpointWatcher, _VerlCheckpointWatcher)
-    parameters = inspect.signature(_VerlCheckpointWatcher.__init__).parameters
-    assert parameters["model_revision"].kind is inspect.Parameter.KEYWORD_ONLY
-    # model_id sits next to it and is equally transposable.
-    assert parameters["model_id"].kind is inspect.Parameter.KEYWORD_ONLY
-    # and the subclass must not reintroduce a positional path around the base.
-    opd_parameters = inspect.signature(_OpdVerlCheckpointWatcher.__init__).parameters
-    assert all(
-        parameter.kind is not inspect.Parameter.POSITIONAL_OR_KEYWORD
-        for name, parameter in opd_parameters.items()
-        if name != "self"
-    )
-
-
 def test_resolve_vocab_size_is_revision_aware_for_open_policy_model(monkeypatch, tmp_path):
     # regression (PR #538 finding 4): SFT batch sizing resolves vocab through resolve_vocab_size. for a
     # pinned revision on an uncataloged open-policy model it must return the commit's real vocab (mirroring
@@ -389,118 +354,3 @@ def test_resolve_vocab_size_is_revision_aware_for_open_policy_model(monkeypatch,
     got = resolve_vocab_size("open-org/Open-Model-3B", revision="d" * 40)
     assert got == 151936
     assert got != _DEFAULT_VOCAB_SIZE
-
-
-def _stub_structured_opd_hub(monkeypatch):
-    """Pin revision resolution, which runs before the preflight and would otherwise hit the hub."""
-    import huggingface_hub
-
-    class Api:
-        def __init__(self, *, token=None):
-            pass
-
-        def model_info(self, model, **kwargs):
-            return SimpleNamespace(sha="a" * 40)
-
-    monkeypatch.setattr(huggingface_hub, "HfApi", Api)
-    monkeypatch.setattr(
-        "flash.adapters.lora_rank.preflight_train_context_within_serving",
-        lambda _spec, **_kwargs: None,
-    )
-
-
-def _structured_opd_spec(structured_outputs: str):
-    """An opd spec carrying a structured-output constraint, ready for prepare_job."""
-    from flash.core.spec import EnvironmentSpec, JobSpec, TrainSpec
-
-    return JobSpec(
-        model="Qwen/Qwen3.5-9B",
-        model_revision="a" * 40,
-        model_revision_auto=True,
-        algorithm="opd",
-        environment=EnvironmentSpec(id="freesolo/example-project/gsm8k", resolved_sha="e" * 40),
-        train=TrainSpec(
-            epochs=1,
-            max_examples=1,
-            teacher_model="parasail-kimi-k3-fast",
-            structured_outputs=structured_outputs,
-        ),
-        run_id="structured-preflight",
-    )
-
-
-def test_structured_opd_guidance_only_feature_is_rejected_before_allocation(monkeypatch):
-    """A constraint the worker refuses deterministically must not reach a rented gpu.
-
-    `format`, `multipleOf` and `uniqueItems` need vLLM's guidance backend, and verl OPD pins
-    xgrammar for exact forced-token replay -- so the job can NEVER run. That check lived only in the
-    worker, past allocation, so the user paid for a card to receive a permanent validation failure
-    The generic serving preflight does not catch it: it validates the schema's shape,
-    and this schema is perfectly valid.
-    """
-    _stub_prepare_dependencies(monkeypatch)
-    _stub_structured_opd_hub(monkeypatch)
-    # allocation-side work must not be reached. estimate_for_spec is the last step of preparation
-    # and the gate the run is priced through, so a rejection that happens before it happens before
-    # anything is persisted or provisioned.
-    monkeypatch.setattr(
-        "flash.cost.spec.estimate_for_spec",
-        lambda _spec: (_ for _ in ()).throw(AssertionError("preparation must reject first")),
-    )
-    schema = {
-        "type": "object",
-        "properties": {"a": {"type": "string", "format": "email"}},
-        "required": ["a"],
-        "additionalProperties": False,
-    }
-    spec = _structured_opd_spec(json.dumps({"json": schema}))
-
-    with pytest.raises(ValueError, match="guidance fallback"):
-        runner_submit.prepare_job(spec)
-
-
-def test_structured_opd_mistral_tokenizer_model_is_rejected_before_allocation(monkeypatch):
-    """The other permanently-failing input: a vLLM MistralTokenizer model.
-
-    Decided by the model id alone, so it needs no allocation to judge either.
-    """
-    _stub_prepare_dependencies(monkeypatch)
-    _stub_structured_opd_hub(monkeypatch)
-    monkeypatch.setattr(
-        "flash.cost.spec.estimate_for_spec",
-        lambda _spec: (_ for _ in ()).throw(AssertionError("preparation must reject first")),
-    )
-    monkeypatch.setattr(
-        "flash.engine.worker.train.opd.orchestration.validation._resolve_structured_model_metadata",
-        lambda _model, _rev: (151936, ("tekken.json",)),
-    )
-    spec = _structured_opd_spec(json.dumps({"json": {"type": "object"}}))
-
-    with pytest.raises(ValueError, match="MistralTokenizer"):
-        runner_submit.prepare_job(spec)
-
-
-def test_a_valid_structured_opd_constraint_still_prepares(monkeypatch):
-    """The preflight must reject only what the worker rejects.
-
-    A constraint xgrammar can compile has to pass preparation untouched -- otherwise the fix trades
-    a paid failure for a submission that refuses valid work, which is worse.
-    """
-    _stub_prepare_dependencies(monkeypatch)
-    _stub_structured_opd_hub(monkeypatch)
-    monkeypatch.setattr(
-        "flash.engine.worker.train.opd.orchestration.validation._resolve_structured_model_metadata",
-        lambda _model, _rev: (151936, ("tokenizer.json",)),
-    )
-    schema = {
-        "type": "object",
-        "properties": {"a": {"type": "string"}},
-        "required": ["a"],
-        "additionalProperties": False,
-    }
-    spec = _structured_opd_spec(json.dumps({"json": schema}))
-
-    prepared = runner_submit.prepare_job(spec)
-
-    assert prepared.public_spec.algorithm == "opd"
-    assert prepared.public_spec.train.structured_outputs

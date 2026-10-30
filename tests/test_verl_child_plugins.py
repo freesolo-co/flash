@@ -51,9 +51,7 @@ def _import_recipe(monkeypatch, name):
     return importlib.import_module(name)
 
 
-@pytest.mark.parametrize(
-    ("algorithm", "directory"), [("sft", "sft"), ("grpo", "rl"), ("opd", "opd")]
-)
+@pytest.mark.parametrize(("algorithm", "directory"), [("sft", "sft"), ("grpo", "rl")])
 def test_entry_help_runs_from_an_unrelated_directory_without_verl(tmp_path, algorithm, directory):
     result = subprocess.run(
         [sys.executable, "-m", f"flash.engine.worker.train.{directory}.child.entry", "--help"],
@@ -68,7 +66,7 @@ def test_entry_help_runs_from_an_unrelated_directory_without_verl(tmp_path, algo
     assert algorithm in result.stdout
 
 
-@pytest.mark.parametrize("algorithm", ["sft", "grpo", "opd"])
+@pytest.mark.parametrize("algorithm", ["sft", "grpo"])
 def test_launch_config_is_data_and_can_exceed_environment_limits(tmp_path, algorithm):
     path = tmp_path / "launch.json"
     payload = {
@@ -94,7 +92,7 @@ def test_launch_config_is_data_and_can_exceed_environment_limits(tmp_path, algor
         {"save_at_steps": [0]},
         {"save_at_steps": [10]},
         {"algorithm": "unknown"},
-        {"no_signal_attempts": 0},
+        {"dp_cards": 0},
     ],
 )
 def test_launch_rejects_invalid_policy(changes):
@@ -136,7 +134,6 @@ def test_packaged_runtime_has_no_import_interception_or_dependency_method_rebind
         "sitecustomize",
         "VERL_USE_EXTERNAL_MODULES",
         "FSDPEngine._build",
-        "AgentLoopWorker._compute_teacher_logprobs =",
         "wandb.init =",
         "CheckpointHandler.save_checkpoint =",
         ".chunk_gated_delta_rule =",
@@ -196,7 +193,7 @@ def test_model_options_are_owned_by_each_engine(monkeypatch, enabled, reentrant)
     assert calls == expected
 
 
-@pytest.mark.parametrize("algorithm", ["sft", "grpo", "opd"])
+@pytest.mark.parametrize("algorithm", ["sft", "grpo"])
 def test_every_engine_delegates_model_loading_to_upstream(monkeypatch, algorithm):
     calls = []
     model = object()
@@ -377,24 +374,6 @@ def test_gdn_boundaries_are_confined_to_the_constructed_model():
     assert configured(position_ids=torch.tensor([[0, 1, 2]])) == {}
     explicit = torch.tensor([0, 5])
     assert configured(position_ids=positions, cu_seq_lens_q=explicit)["cu_seq_lens_q"] is explicit
-
-
-def test_optimizer_mutation_notice_precedes_real_update_and_is_once_per_optimizer(monkeypatch):
-    torch = pytest.importorskip("torch")
-    from flash.engine.worker.train.opd.child import bridge
-
-    parameter = torch.nn.Parameter(torch.tensor(2.0))
-    optimizer = torch.optim.SGD([parameter], lr=0.25)
-    before = []
-    monkeypatch.setattr(
-        bridge, "_coordinate_first_mutation_notice", lambda *_: before.append(parameter.item())
-    )
-    bridge._wrap_optimizer_with_mutation_notice(optimizer, "url", "token")
-    for _ in range(2):
-        parameter.grad = torch.tensor(1.0)
-        optimizer.step()
-    assert before == [2.0]
-    assert parameter.item() == 1.5
 
 
 def test_physical_device_claims_reject_cross_rank_collisions(monkeypatch, tmp_path):

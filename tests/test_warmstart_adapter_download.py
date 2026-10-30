@@ -285,7 +285,7 @@ def test_snapshot_success_but_adapter_never_complete_raises_retriable(worker_con
 def _warmstart_guard_call(
     monkeypatch, tmp_path, *, rank, alpha, expected_rank, expected_alpha, worker_context
 ):
-    """Drive the real sft/opd warm-start guard against an on-disk adapter config."""
+    """Drive the real sft warm-start guard against an on-disk adapter config."""
     import flash.engine.worker.train.entry.sft_train as sft_train
 
     adapter_dir = tmp_path / "src-adapter"
@@ -311,12 +311,7 @@ def _warmstart_guard_call(
 
 
 def test_warmstart_rejects_an_alpha_change(worker_context, monkeypatch, tmp_path):
-    """A warm start may not silently rescale the adapter it continues.
-
-    rank and alpha together set the LoRA scaling, so continuing at the source rank under a
-    different alpha rescales every trained delta. grpo already rereads both from the source; sft
-    and opd share this guard, which failed closed on rank and open on alpha.
-    """
+    """A warm start may not silently rescale the adapter it continues."""
     with pytest.raises(
         ValueError, match=r"alpha 19 does not match the prepared train\.lora_alpha 77"
     ):

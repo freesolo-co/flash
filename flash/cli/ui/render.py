@@ -650,7 +650,6 @@ def env_setup(paths: list[str], project_id: str, *, can_publish: bool = True) ->
         "dataset/train.jsonl": "starter training rows",
         "configs/sft.toml": "SFT run config",
         "configs/rl.toml": "GRPO run config",
-        "configs/opd.toml": "OPD (distillation) run config",
         "TRAINING.md": "how to train well — read this first",
     }
     keyw = max(len(p) for p in paths)

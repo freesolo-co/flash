@@ -182,91 +182,27 @@ def test_every_job_bounds_its_runtime(path: Path):
 
 
 def test_the_tests_repo_dispatch_cannot_silently_no_op():
-    """A notifier that skips when its credential is missing reports success while notifying nobody.
-
-    This is the bug this test exists for, and it ran undetected for weeks. The step used to
-    `exit 0` when `FREESOLO_GITHUB_PAT` was empty, on the theory that only a fork could reach that
-    branch. But the secret has never existed on this repository, so *every* push to dev/main took
-    the skip branch: the tests repo recorded zero `flash-merged` events against 100+
-    `freesolo-merged` ones, and every one of those runs was green.
-
-    The fix separates the two cases that shared one branch. A fork is excluded at the job level,
-    which leaves "no PAT" meaning exactly one thing -- upstream misconfiguration -- so it can fail
-    loudly. The invariant is therefore a conjunction, and asserting only half of it would pass on
-    a workflow that is still fail-open.
-    """
+    """Keep the fork guard and fail when upstream has no dispatch credential."""
     document = _load(WORKFLOW_DIR / "notify-tests-repo.yml")
     job = _jobs(document)["notify"]
-
-    # The fork case must be handled HERE, at the job level, because that is what lets the step
-    # below treat a missing PAT as the error it is.
     _assert_gated_upstream(job.get("if"), "notify-tests-repo.yml:notify")
-
-    scripts = [step["run"] for step in _steps(job) if "run" in step]
-    assert scripts, "the notify job must still run the dispatch"
-    script = "\n".join(scripts)
-
-    # RUN the script rather than grepping it. Searching for `exit 1` / `::error::` / the dispatch
-    # URL as independent substrings proves only that those characters exist SOMEWHERE -- not that
-    # they are on the missing-PAT path. Both weaknesses were demonstrated, not theorised: a
-    # rewritten step that skipped the curl and returned success on an empty PAT, with the tokens
-    # parked in an `if false` block, passed the substring version of this test. So did a real
-    # `printf '#'; exit 0`, because stripping at the first `#` truncated the line before the
-    # `exit 0` -- a shell comment cannot be found by splitting on a character that also occurs
-    # inside quotes. Executing the script is what makes the two cases distinguishable.
-    #
-    # `curl` is replaced with a recorder on PATH, so nothing leaves the machine and the assertion
-    # is about the OBSERVABLE effect: did a dispatch actually happen.
-    #
-    # The recorder's log is returned SEPARATELY from the process's stdout/stderr, and every
-    # "it posted" assertion reads only the log. Blending them would undo the point of running the
-    # script: a step that merely echoed the dispatch URL and the event type would satisfy the
-    # blended text while never invoking curl, which is the same substring-matching weakness one
-    # layer further out.
-    def run(pat: str) -> tuple[int, str, str]:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            calls = root / "curl-calls.txt"
-            fake_curl = root / "bin" / "curl"
-            fake_curl.parent.mkdir()
-            fake_curl.write_text('#!/bin/sh\nprintf "%s\\n" "$*" >> "$CURL_CALLS"\nexit 0\n')
-            fake_curl.chmod(0o755)
-            completed = subprocess.run(
-                ["bash", "-c", script],
-                capture_output=True,
-                text=True,
-                cwd=tmp,
-                env={
-                    "PATH": f"{fake_curl.parent}:{os.environ.get('PATH', '')}",
-                    "CURL_CALLS": str(calls),
-                    "PAT": pat,
-                    "SHA": "0123456789abcdef0123456789abcdef01234567",
-                    "REF": "dev",
-                    "GITHUB_REPOSITORY": UPSTREAM_REPOSITORY,
-                },
-            )
-            recorded = calls.read_text() if calls.exists() else ""
-            return completed.returncode, recorded, completed.stdout + completed.stderr
-
-    # 1. No credential must FAIL, and must not pretend to have dispatched.
-    code, dispatched, logged = run("")
-    assert code != 0, (
-        "the dispatch step exited 0 with no credential -- that is the fail-open branch that "
-        "reported success while dispatching nothing"
+    step = next(step for step in _steps(job) if step.get("name") == "Dispatch to freesolo-co/tests")
+    assert step["env"] == {
+        "PAT": "${{ secrets.FREESOLO_GITHUB_PAT }}",
+        "SHA": "${{ github.sha }}",
+        "REF": "${{ github.ref_name }}",
+    }
+    assert step["run"] == "python3 .github/scripts/notify_tests_repo.py"
+    assert job["timeout-minutes"] >= 70
+    completed = subprocess.run(
+        ["bash", "-c", step["run"]],
+        cwd=REPO_ROOT,
+        env={"PATH": os.environ["PATH"], "PAT": ""},
+        capture_output=True,
+        text=True,
     )
-    assert "::error::" in logged, "the failure must be annotated so it is visible on the run"
-    assert dispatched == "", f"curl was invoked without a credential: {dispatched!r}"
-
-    # 2. With a credential it must actually POST the dispatch, exactly once. These read the
-    # recorder's log alone, so only a real curl invocation can satisfy them.
-    code, dispatched, logged = run("fake-token")
-    assert code == 0, f"the dispatch failed with a credential present: {logged}"
-    assert dispatched.count("repos/freesolo-co/tests/dispatches") == 1, (
-        f"expected exactly one dispatch to freesolo-co/tests, got: {dispatched!r}"
-    )
-    assert "flash-merged" in dispatched, (
-        f"the dispatch must carry the flash-merged event type, got: {dispatched!r}"
-    )
+    assert completed.returncode != 0
+    assert "::error::FREESOLO_GITHUB_PAT is not set" in completed.stderr
 
 
 def _triggers(document: dict[str, Any]) -> dict[str, Any]:

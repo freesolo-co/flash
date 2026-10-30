@@ -346,7 +346,7 @@ def test_persisted_legacy_shapes_reach_allocation(prompts_per_step, group_size):
 
 @pytest.mark.parametrize(
     ("algorithm", "prompts_per_step", "group_size"),
-    [("opd", 8, 1), ("sft", None, None)],
+    [("sft", None, None)],
 )
 def test_non_grpo_jobspec_behavior_is_unchanged(algorithm, prompts_per_step, group_size):
     spec = JobSpec(
