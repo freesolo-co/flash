@@ -24,6 +24,8 @@ classifiers = [
 dependencies = []
 
 [project.optional-dependencies]
+# local custom-loss autograd and dedicated GPU provisioning; base CLI stays stdlib-only.
+custom = ["torch==2.10.0", "modal==1.6.2"]
 # heavy deps for running the fine-tuning worker locally (the deployed gpu worker installs its exact
 # stack in Dockerfile.worker, with the fallback verl venv mirrored in capabilities.py).
 gpu = [
@@ -228,6 +230,10 @@ package = true
 # training and serving intentionally validate different exact vllm builds and cannot be installed
 # into one environment. uv records both resolutions while rejecting only the incompatible combination.
 conflicts = [
+    [
+        { extra = "custom" },
+        { extra = "serve-runtime" },
+    ],
     [
         { extra = "gpu" },
         { extra = "serve-runtime" },
