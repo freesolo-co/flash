@@ -265,8 +265,9 @@ def _start_handleless_resubmit(spec, expected_state: str) -> bool | None:
 
     try:
         status = get_status(spec.run_id)
-        if status.requires_runtime_secrets:
-            raise ValueError("recovery cannot restore request runtime secrets; resubmit the run")
+        from flash.runner.lifecycle.runtime_credentials import restore
+
+        runtime_secrets = restore(status)
         source_snapshot_from_status(status, required=True)
     except Exception as exc:
         _fail_blocked_recovery(spec, str(exc), expected_remote=None)
@@ -304,7 +305,7 @@ def _start_handleless_resubmit(spec, expected_state: str) -> bool | None:
             spec.run_id,
             "control plane restarted without a durable handle; resubmitting",
         )
-    _run_job_background(spec, None, reservation.claim)
+    _run_job_background(spec, runtime_secrets or None, reservation.claim)
     return True
 
 
@@ -339,8 +340,9 @@ def _enqueue_resubmit(spec) -> bool:
 
     try:
         status = get_status(spec.run_id)
-        if status.requires_runtime_secrets:
-            raise ValueError("recovery cannot restore request runtime secrets; resubmit the run")
+        from flash.runner.lifecycle.runtime_credentials import restore
+
+        restore(status)
         source_snapshot_from_status(status, required=True)
     except Exception as exc:
         _fail_blocked_recovery(spec, str(exc), expected_remote=None)

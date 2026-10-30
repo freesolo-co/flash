@@ -56,6 +56,7 @@ gpu = [
 # sft cost, dry-run, and submit statically read packaged rows plus the defined training contract.
 # environment.py is not imported; other environment prompt transformations remain estimate gaps.
 server = [
+    "cryptography>=46",
     "azure-identity>=1.19,<2",
     "azure-storage-blob>=12.24,<13",
     "pydantic-settings>=2.7",
@@ -140,6 +141,7 @@ serve-runtime = [
 ]
 # CI compatibility: some workflows use `uv sync --extra dev` rather than `--group dev`.
 dev = [
+    "cryptography>=46",
     "modal==1.6.2",
     "orjson>=3.10",
     "pydantic-settings>=2.7",
@@ -242,6 +244,7 @@ conflicts = [
 
 [dependency-groups]
 dev = [
+    "cryptography>=46",
     "cloudpickle>=3.0",
     "mypy>=1.13.0",
     "pytest>=9.0.3",
