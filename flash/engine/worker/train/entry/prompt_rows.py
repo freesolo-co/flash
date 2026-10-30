@@ -1,4 +1,4 @@
-"""canonical parent-side prompt rows shared by grpo and opd parquet writers."""
+"""canonical parent-side prompt rows shared by grpo parquet writers."""
 
 from __future__ import annotations
 

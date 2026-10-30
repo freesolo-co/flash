@@ -264,7 +264,7 @@ def _format_heartbeat(hb: dict) -> str:
             completion = sample.get("completion")
             if not isinstance(prompt_tail, str) or not isinstance(completion, str):
                 continue
-            # A sample carries exactly one scalar: GRPO reward (3dp) or OPD distillation loss (4dp).
+            # A sample carries the GRPO reward.
             scalar = sampled_completion_scalar(sample)
             if scalar is None:
                 continue
@@ -331,29 +331,10 @@ SETUP_HEARTBEAT_STAGES = frozenset(
         "rl_train_start",
         "sft_initializing",
         "rl_initializing",
-        # opd cold-start stages must keep setup grace until the first opd_step. filtering emits real
-        # progress, so omitting it would stickily switch preprocessing to the training stall window.
-        "opd_start",
-        "opd_configuring",
-        "opd_filtering_prompts",
-        # the prompt-budget scan and image preparation opd_train actually emits today
-        # (opd_train.py `liveness_heartbeat("opd_prompt_scan")` / `("opd_image_prep")`). both carry a
-        # progress callback, so without them here is_training_heartbeat flips the run into the tight
-        # training stall window while it is still preprocessing, and a large split is torn down as
-        # "stalled" before the first step. the worker-side registry in heartbeat.py already lists
-        # both; this is the provider half of the same pair.
-        "opd_prompt_scan",
-        "opd_image_prep",
-        "opd_model_load",
-        "opd_initializing",
     }
 )
 
-# step=0 is emitted throughout the silent first step — only step>=1 tightens the stall window. opd_step
-# is gated too: its progress pings report opt_steps (0 until the FIRST optimizer update lands), so a
-# long teacher-bound first step keeps the wide setup grace instead of the tight training window — the
-# mid-step ping must not prematurely flip a still-running first step out of setup grace.
-STEP_GATED_STAGES = frozenset({"rl_step", "sft_step", "opd_step"})
+STEP_GATED_STAGES = frozenset({"rl_step", "sft_step"})
 
 
 def is_training_heartbeat(stage: str | None, step: Any) -> bool:

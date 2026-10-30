@@ -120,11 +120,7 @@ def _resolve_sft_tokenization(
         tokenizer = tokenizer_loader(spec.model, spec.model_revision)
         resolved = _SftTokenization(tokenizer, None, None)
     else:
-        validate_multimodal_training(
-            spec.model,
-            "sft",
-            getattr(spec.train, "teacher_model", None),
-        )
+        validate_multimodal_training(spec.model)
         if require_processor:
             processor = (processor_loader or _default_processor_loader)(
                 spec.model,

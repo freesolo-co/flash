@@ -33,19 +33,9 @@ MAX_COMBINATION_CARDS = 8
 # GB bf16 weight, i.e. 0.843x. Across a 2.1x weight increase the ratio moved -4.5%, so the penalty
 # tracks weight size rather than growing super-linearly with it.
 ZERO2_WEIGHT_RESIDENCY = 0.883
-# What the GATE charges, which is deliberately more than what was measured. The measurements above
-# span 1.59B-3.37B; the catalog runs up to 35B, so the gate still extrapolates the ratio about 10x
-# beyond its evidence. Charging the measured value directly leaves the biggest models almost no room
-# for that extrapolation to be wrong: 35B-A3B opd on 2x B200 clears the requirement by 0.4% and
-# breaks if the true residency is 0.906 (2.6% above measured), and 27B grpo on 4x H200 breaks at
-# 0.927 (5.0% above). An understatement there does not forgo a speedup, it OOMs a paid multi-card
-# run that ZeRO-3 would have completed.
-#
-# 1.25 is above 1.0 -- a FULL retained bf16 copy plus a quarter -- so the charge stays conservative
-# even if the residency is really "the whole weight copy and then some" at scale. It costs almost
-# nothing: 155 of the 168 firing configs survive it, and the 13 it drops are exactly the ones
-# sitting closest to the edge. Lower it only with matched multi-size measurements, never to admit a
-# specific shape.
+# Charge a full retained bf16 copy plus 25% for extrapolation beyond the measured model sizes.
+# Lower this only with matched multi-size measurements: understating residency can enable ZeRO-2
+# on a paid run that would have fit only with ZeRO-3.
 ZERO2_CHARGED_RESIDENCY = 1.25
 _BF16_BYTES_PER_PARAM = 2.0
 

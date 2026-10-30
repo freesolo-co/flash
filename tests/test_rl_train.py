@@ -995,25 +995,7 @@ def test_build_verl_overrides_shards_every_card_by_data(n_gpus):
 
 
 def test_grpo_launches_the_width_the_step_can_fill():
-    """`n_gpus` handed to verl is the executed dp width, never the rented card count.
-
-    Pinning ulysses off makes every rank a dp rank, so verl now chunks the step's sequences across
-    them and asserts exact divisibility (`DataProto.chunk`, and `_balance_batch` with
-    `equal_size=True`). At sp = card count the dp width was 1 and this could not fire; that is why
-    this guard arrives with the pin rather than before it. Launching wider than the sequences divide
-    aborts at step 0 on a box already rented.
-
-    The width is resolved ONCE, in `_assemble_grpo_inputs`, because two phases consume it: the child
-    config here and the resume probe in `_prepare_rl_files`, which discards a checkpoint whose shard
-    count disagrees with the width it is handed. Deriving it separately let them drift -- resume
-    compared the RENTED count while the child launched the clamped one, so a checkpoint written at the
-    executed width read as the wrong topology and every retry restarted from step 0.
-
-    Asserted on the source: both call sites write child files or download weights, so neither is
-    drivable offline. The rule itself is covered by
-    `test_rl_width_never_exceeds_the_sequences_one_step_holds` in the opd suite, and the allocator
-    and quote agree through `executed_gpu_count`.
-    """
+    """`n_gpus` handed to verl is the executed dp width, never the rented card count."""
     import inspect
 
     from flash.engine.worker.train.entry import rl_train_runner
@@ -3371,7 +3353,7 @@ def test_model_revision_resolves_pinned_snapshot_for_verl():
     resolver_src = inspect.getsource(rl_inputs._resolve_grpo_inputs)
     assert "model_revision pinning is not yet supported" not in resolver_src
     # assert on the resolver being CALLED, not on snapshot_download's keywords appearing inline:
-    # the resolution moved into _cached_model_path (shared with sft/opd), so pinning the argument
+    # the resolution moved into _cached_model_path (shared with sft), so pinning the argument
     # spelling here would only re-assert where the code happens to live today.
     run_src = inspect.getsource(rl_train.run_rl_train)
     assert '_cached_model_path(inp["model_id"], inp["model_revision"])' in run_src
@@ -3649,7 +3631,7 @@ def test_train_notes_omit_wandb_identity_when_wandb_is_off(
 def test_verl_grpo_logs_to_the_runs_own_wandb_project_and_name():
     # a hardcoded project/experiment pair lands every grpo run in one wandb experiment, so
     # concurrent runs overwrite each other's curves and an explicit [wandb] project is ignored. the
-    # sft and opd verl backends already resolve both from the spec.
+    # sft verl backends already resolve both from the spec.
     o = rl_verl.build_verl_overrides(
         _overrides_cfg(project_name="acme", experiment_name="flash-rl-run123")
     )
@@ -7447,11 +7429,7 @@ def test_every_turn_is_spanned_when_none_of_them_abort(monkeypatch):
 
 
 def test_the_rl_trainer_stores_the_frozen_base_in_bf16():
-    """VERL-150: verl's fsdp.yaml default is fp32, which doubles the trainer's resident base.
-
-    Keep the frozen base in bf16; FSDP computes in bf16 while LoRA weights remain fp32.
-    The OPD half is pinned in test_opd_train.
-    """
+    """VERL-150: verl's fsdp.yaml default is fp32, which doubles the trainer's resident base."""
     overrides = rl_verl.build_verl_overrides(_overrides_cfg())
     want = "actor_rollout_ref.actor.fsdp_config.model_dtype=bfloat16"
     # exact, not substring: "x=bfloat16" is a substring of "+x=bfloat16", so the obvious `in`
@@ -7487,7 +7465,7 @@ def test_the_verl_child_allowlist_keeps_the_kernel_choice_but_drops_credentials(
 ):
     """The grpo child still needs the FLA_ kernel backend the parent picked (on sm100 FLA_TILELANG=0
     is a correctness floor, not a preference), so the allowlist must carry it while excluding the
-    credentials. This pins both halves of that split for the path grpo now shares with sft/opd."""
+    credentials. This pins both halves of that split for the path grpo now shares with sft."""
     from flash.engine.worker.train.entry.sft_train import _build_verl_child_env
 
     keep = {"FLA_TILELANG": "0", "CUDA_VISIBLE_DEVICES": "0", "HF_HOME": "/cache/hf"}
@@ -7612,7 +7590,7 @@ def test_grpo_finalization_carries_the_completed_step():
     terminal `done`. Called without `step`, both land stepless and overwrite the stepped `rl_trained`
     heartbeat above them, and actual_steps_run() deliberately returns 0 for a non-training stage with
     no step -- so a cancel arriving between finalization and DONE reprices a fully trained run at
-    zero steps and bills $0. The sft and opd finalizers already pass their final step; grpo was the
+    zero steps and bills $0. The sft finalizers already pass their final step; grpo was the
     only one that did not.
     """
     tree = ast.parse(textwrap.dedent(inspect.getsource(rl_train._write_terminal_metadata)))

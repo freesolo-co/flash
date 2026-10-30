@@ -296,100 +296,6 @@ def test_estimator_logits_term_uses_max_tokens_and_caps_at_budget():
     )
 
 
-def test_opd_vram_estimate_reserves_one_dense_image_loss_peak():
-    from flash.engine.plan.vram import estimate_vram_gb as e
-
-    seq_len = 4096
-    completion = 512
-    vocab = 248_320
-    with_vocab = e(
-        2.0,
-        "opd",
-        seq_len=seq_len,
-        max_tokens=completion,
-        vocab=vocab,
-        batch_size=4,
-        group_size=4,
-    )
-    without_vocab = e(
-        2.0,
-        "opd",
-        seq_len=seq_len,
-        max_tokens=completion,
-        vocab=0,
-        batch_size=4,
-        group_size=4,
-    )
-    expected = (seq_len * 4 + completion * 8) * vocab / 1e9
-    assert with_vocab - without_vocab == pytest.approx(expected)
-
-    short = e(2.0, "opd", seq_len=seq_len, max_tokens=128, vocab=vocab)
-    long = e(2.0, "opd", seq_len=seq_len, max_tokens=2048, vocab=vocab)
-    assert long > short
-
-
-def test_opd_uses_opd_sizing_not_grpo():
-    """OPD must size on its own dense-logit estimator, never on the GRPO colocate path.
-
-    Regression (vram.py): a sizing branch hardcoded ``_need(params_b, 'grpo', ...)``, so
-    an OPD run was sized as a colocated-vLLM GRPO job -- rejecting fitting runs or routing them to
-    pricier GPUs. The real algorithm must reach the estimator, so the two diverge.
-    """
-    from flash.engine.plan.vram import model_required_vram_gb
-
-    train = {"max_context_tokens": 8192, "max_completion_tokens": 8192, "lora_rank": 16}
-    for model_id in ("Qwen/Qwen3.5-9B", "Qwen/Qwen3.8-27B"):
-        opd_need = model_required_vram_gb(model_id, "opd", train=train)
-        grpo_need = model_required_vram_gb(model_id, "grpo", train=train)
-        assert opd_need != grpo_need, f"{model_id} OPD must not size as the GRPO colocate path"
-        assert opd_need > 0
-
-
-def test_opd_sizes_on_the_authored_prompts_per_step():
-    """The rl optimizer batch is named ``prompts_per_step``, and sizing must read THAT key.
-
-    Regression: the sizer only ever read ``batch_size``. Once the rl batch was split out under its
-    own name, an rl spec's ``batch_size`` was always None, so every authored ``prompts_per_step``
-    fell through to the recipe default -- a wide batch sized as if it were the default one and
-    under-provisioned the card it was then rented on. Sizing has to move with the knob, on the
-    TrainSpec the submit path passes and on the raw dict the parse gate passes.
-    """
-    from flash.engine.plan.vram import model_required_vram_gb
-    from flash.schema import spec_from_dict
-
-    def _train(**over):
-        return {
-            "epochs": 1,
-            "group_size": 1,
-            "max_context_tokens": 1536,
-            "max_completion_tokens": 512,
-            "lora_rank": 16,
-            **over,
-        }
-
-    narrow = model_required_vram_gb("Qwen/Qwen3.5-9B", "opd", train=_train(prompts_per_step=1))
-    wide = model_required_vram_gb("Qwen/Qwen3.5-9B", "opd", train=_train(prompts_per_step=32))
-    assert wide > narrow, "an authored prompts_per_step must move the opd vram floor"
-
-    # the submit path allocates from the parsed TrainSpec, not the raw dict, and that object carries
-    # the batch ONLY under prompts_per_step -- so it has to size identically to the dict above.
-    def _spec_need(pps):
-        spec = spec_from_dict(
-            {
-                "model": "Qwen/Qwen3.5-9B",
-                "algorithm": "opd",
-                "environment": {"id": "github:owner/repo@main:env/environment.py"},
-                "gpu": {},
-                "train": _train(prompts_per_step=pps),
-            },
-            run_id="pps",
-        )
-        return model_required_vram_gb(spec.model, "opd", train=spec.train)
-
-    assert _spec_need(1) == narrow
-    assert _spec_need(32) == wide
-
-
 def test_vram_headroom_consistent_across_sizing_paths():
     """provisional_gpu (parse-time) and required_vram_gb (submit-time) must size with the SAME
     headroom (a validated constant), so they never disagree."""
@@ -437,170 +343,6 @@ def test_allocate_never_selects_below_matrix_need():
         assert get_gpu_info(alloc.gpu).vram_gb >= need, (model, algo, tr, alloc.gpu, need)
 
 
-def test_opd_catalog_model_config_gpu_matrix_routes_to_fitting_cards(monkeypatch):
-    """opd configs auto-size unpinned shapes while exact type pins keep single-card validation."""
-    from flash.core.catalog import MODELS
-    from flash.cost import RunConfig, estimate_cost
-    from flash.providers.core import allocator
-    from flash.providers.core.allocator import required_vram_gb
-    from flash.providers.core.base import (
-        GPU_INFO,
-        UnsupportedGpuError,
-        get_gpu_info,
-        providers_for,
-        provisional_gpu,
-        provisional_gpu_count,
-    )
-    from flash.providers.core.sharding import (
-        MAX_COMBINATION_CARDS,
-        combined_vram_gb,
-    )
-    from flash.schema import ConfigError, spec_from_dict
-
-    monkeypatch.setattr(allocator, "available_providers", lambda: ("modal",))
-    configured_gpu_types = tuple(name for name, gpu_info in GPU_INFO.items() if gpu_info.validated)
-    configs = {
-        # Matches the failed continuation shape from the OPD/vLLM L40S report.
-        "observed_2b_128tok_r32": {
-            "epochs": 1,
-            "max_completion_tokens": 128,
-            "lora_rank": 32,
-        },
-        "recipe_default": {"epochs": 1},
-        # opd takes the optimizer batch as `prompts_per_step`; `batch_size` is sft-only and is
-        # rejected outright, so spelling it here would fail the parse rather than size a shape.
-        "opd_prompt_batch": {
-            "epochs": 1,
-            "prompts_per_step": 8,
-            "group_size": 1,
-            "max_context_tokens": 1536,
-            "max_completion_tokens": 512,
-            "lora_rank": 16,
-        },
-        "longer_context": {
-            "epochs": 1,
-            "prompts_per_step": 8,
-            "group_size": 1,
-            "max_context_tokens": 4096,
-            "max_completion_tokens": 512,
-            "lora_rank": 16,
-        },
-        # this case varies the COMPLETION length, so its batch only has to be wide enough not to
-        # bound the rank count: one prompt in a group of one is a single sequence, which launches one
-        # rank however many cards are rented (see `rl_data_parallel_cards`) and would make this a test
-        # of the width clamp rather than of long completions.
-        "longer_completion": {
-            "epochs": 1,
-            "prompts_per_step": 8,
-            "group_size": 1,
-            "max_context_tokens": 4096,
-            "max_completion_tokens": 2048,
-            "lora_rank": 16,
-        },
-        "wide_rollout_batch": {
-            "epochs": 1,
-            "prompts_per_step": 8,
-            "group_size": 4,
-            "max_context_tokens": 4096,
-            "max_completion_tokens": 512,
-            "lora_rank": 16,
-        },
-    }
-    checked: set[tuple[str, str]] = set()
-    rejected: set[tuple[str, str]] = set()
-
-    for model_id, info in MODELS.items():
-        if "opd" not in info.algos:
-            continue
-        for label, train in configs.items():
-            need = required_vram_gb(model_id, "opd", train=train)
-            rc = RunConfig(
-                model_id,
-                "opd",
-                int(train.get("epochs", 1)),
-                seq_len=train.get("max_context_tokens"),
-                completion_len=train.get("max_completion_tokens"),
-                batch_size=train.get("prompts_per_step"),
-                group_size=train.get("group_size"),
-                lora_rank=train.get("lora_rank"),
-                provider="modal",
-            )
-
-            auto_count = provisional_gpu_count(model_id, "opd", train=train)
-            auto_cap = allocator.geometry_safe_gpu_cap(model_id, MAX_COMBINATION_CARDS)
-            max_auto_vram = max(
-                combined_vram_gb(gpu.vram_gb, auto_cap)
-                for gpu in GPU_INFO.values()
-                if gpu.modal_name and gpu.validated
-            )
-            if need > max_auto_vram:
-                with pytest.raises(UnsupportedGpuError):
-                    allocator.allocate(model_id, "opd", train=train)
-                with pytest.raises(ValueError, match="opd needs"):
-                    estimate_cost(rc)
-                rejected.add((model_id, label))
-                continue
-
-            preview_gpu = provisional_gpu(model_id, "opd", train=train)
-            preview_info = get_gpu_info(preview_gpu)
-            assert preview_info.validated
-            assert combined_vram_gb(preview_info.vram_gb, auto_count) >= need, (
-                model_id,
-                label,
-                preview_gpu,
-                auto_count,
-                need,
-            )
-
-            alloc = allocator.allocate(model_id, "opd", train=train)
-            alloc_info = get_gpu_info(alloc.gpu)
-            assert alloc.provider == "modal"
-            assert alloc.min_vram_gb == need
-            assert alloc.gpu == preview_gpu
-            assert alloc.gpu_count == auto_count
-            assert alloc_info.validated
-            assert combined_vram_gb(alloc_info.vram_gb, alloc.gpu_count) >= need
-            assert all(
-                combined_vram_gb(candidate.vram_gb, candidate.gpu_count) >= need
-                for candidate in alloc.candidates
-            )
-
-            estimate = estimate_cost(rc)
-            assert estimate.required_vram_gb == need
-            assert estimate.gpu == alloc.gpu
-            assert estimate.gpu_count == alloc.gpu_count
-            assert combined_vram_gb(estimate.gpu_vram_gb, estimate.gpu_count) >= need
-
-            for configured_gpu in configured_gpu_types:
-                raw = {
-                    "model": model_id,
-                    "algorithm": "opd",
-                    "environment": {"id": "github:freesolo-co/envs@main:gsm8k/environment.py"},
-                    "train": dict(train),
-                    "gpu": {"type": configured_gpu},
-                }
-                if get_gpu_info(configured_gpu).vram_gb < need:
-                    with pytest.raises(ConfigError, match="requires at least"):
-                        spec_from_dict(raw, run_id="opd-matrix")
-                    continue
-
-                spec = spec_from_dict(raw, run_id="opd-matrix")
-                assert spec.gpu.type == configured_gpu
-                assert providers_for(spec.gpu.type)
-                assert get_gpu_info(spec.gpu.type).vram_gb >= need
-
-            checked.add((model_id, label))
-
-    expected = {
-        (model_id, label)
-        for model_id, info in MODELS.items()
-        if "opd" in info.algos
-        for label in configs
-    }
-    assert checked | rejected == expected
-    assert checked
-
-
 def test_catalog_model_algorithm_gpu_matrix_routes_to_fitting_cards(monkeypatch):
     """Full catalog matrix guard: every supported model x algorithm route must pick a card that
     meets the shared VRAM requirement across schema preview, submit allocation, and cost estimate."""
@@ -630,7 +372,7 @@ def test_catalog_model_algorithm_gpu_matrix_routes_to_fitting_cards(monkeypatch)
             train = {}
             need = allocator.required_vram_gb(model_id, algo, train=train, thinking=False)
             # most cells fit one card. the 35B MoE trains 256 routed experts per fused tensor, so its
-            # GRPO/OPD peaks exceed every single card and the route is only defined across two.
+            # GRPO peaks exceed every single card and the route is only defined across two.
             cards = 2 if need > max(g.vram_gb for g in GPU_INFO.values() if g.validated) else 1
 
             preview_gpu = provisional_gpu(
@@ -1160,7 +902,6 @@ def test_fused_ce_chunk_matches_verl_default():
 
     assert vram.VERL_FUSED_CE_CHUNK_TOKENS == 512
     assert vram._SFT_CHUNKED_NLL_TOKENS == 512
-    assert vram.OPD_CE_CHUNK_SIZE == 512
 
 
 def test_sft_default_context_tracks_thinking_mode():
@@ -1246,7 +987,7 @@ def test_wider_shape_remedy_is_bounded_by_the_geometry_cap():
     `geometry_safe_gpu_cap` exists because vllm rejects `num_attention_heads % tp_size != 0` at
     rollout-engine init -- AFTER the box is rented. A remedy that ignored it would bill the user for
     a box that cannot start. (This gate outlived Ulysses: sequence parallelism is pinned off on all
-    three algorithms now, but grpo and opd still hand the rented width to the rollout engine as
+    both algorithms now, but grpo still hand the rented width to the rollout engine as
     `tensor_model_parallel_size`, so head divisibility is still load-bearing.)
     """
     from flash.providers.core.base import GPU_INFO, wider_shape_remedy
@@ -1294,7 +1035,7 @@ def test_remedy_never_names_a_width_the_run_will_not_launch_on():
         "naming one sends the user to pay twice for the same failure"
     )
     # the default is unchanged for everything that DOES launch what it rents, so this cannot
-    # silently suppress a real remedy on grpo/opd.
+    # silently suppress a real remedy on grpo.
     assert "--gpus 2" in wider_shape_remedy((card,), need, ceiling=8, above=1)
     assert "--gpus 2" in wider_shape_remedy(
         (card,), need, ceiling=8, above=1, executed_width=lambda n: n
@@ -1508,13 +1249,7 @@ def test_a_shape_label_reconciles_with_the_capacity_printed_beside_it():
 
 
 def test_pinned_class_names_the_bounding_knob_of_the_algorithm_it_rejected():
-    """A pinned small-batch grpo/opd run must not be told that sft's rows bound its ranks.
-
-    `_resolve_exact_gpu` spelled this reason itself and hardcoded "sft", so once the width clamp let
-    an rl run narrow below its ceiling, a pinned rl rejection pointed at `batch_size` -- which opd
-    rejects at parse time -- and at retained rows, which rl has no concept of. The reason now comes
-    from the one shared formatter, so the two cannot drift apart again.
-    """
+    """A pinned small-batch grpo run must not be told that sft's rows bound its ranks."""
     from flash.providers.core.allocator import _executed_width, _resolve_exact_gpu
     from flash.providers.core.base import UnsupportedGpuError
 
@@ -1533,7 +1268,7 @@ def test_pinned_class_names_the_bounding_knob_of_the_algorithm_it_rejected():
             )
         return str(exc.value)
 
-    rl = reject("opd", {"prompts_per_step": 1, "group_size": 1})
+    rl = reject("grpo", {"prompts_per_step": 1, "group_size": 1})
     assert "only 1 joins this run" in rl
     assert "prompts_per_step x group_size bounds the rank count" in rl
     assert "batch and retained rows" not in rl

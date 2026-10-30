@@ -195,7 +195,7 @@ def test_a_pinned_small_class_still_does_not_pin_the_card_count():
 
     # 9B SFT on a 24 GB class does not fit alone, so this is the combination path, not the
     # fit-alone one. the algorithm is load-bearing: the same model+class does not allocate AT ALL
-    # under grpo or opd, which the next test pins.
+    # under grpo, which the next test pins.
     allocated = [
         allocate(
             "Qwen/Qwen3.5-9B", "sft", provider="modal", gpu_type="L4", max_gpu_count=asked
@@ -211,10 +211,10 @@ def test_a_pinned_small_class_still_does_not_pin_the_card_count():
     )
 
 
-def test_a_pinned_class_can_need_a_wider_ceiling_for_grpo_and_opd():
+def test_a_pinned_class_can_need_a_wider_ceiling_for_grpo():
     """The doc's 9B/L4 example is labelled SFT because fit is per algorithm.
 
-    SFT fits on two cards. GRPO and OPD exceed a four-card ceiling but fit at the public maximum of
+    SFT fits on two cards. GRPO exceed a four-card ceiling but fit at the public maximum of
     eight, so copying the SFT example into a rollout config without widening the ceiling fails
     loudly instead of silently selecting an undersized shape.
     """
@@ -230,7 +230,7 @@ def test_a_pinned_class_can_need_a_wider_ceiling_for_grpo_and_opd():
         ).gpu_count
         == 2
     )
-    for algorithm in ("grpo", "opd"):
+    for algorithm in ("grpo",):
         with pytest.raises(UnsupportedGpuError):
             allocate(
                 "Qwen/Qwen3.5-9B",

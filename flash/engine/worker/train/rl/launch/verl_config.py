@@ -305,7 +305,6 @@ def _actor_overrides(cfg: dict) -> list[str]:
         # grpo requires fsdp2 for dense and fused-expert actors. reshard_after_forward above still
         # independently selects zero-2 or zero-3, so the allocator's memory decision is unchanged.
         *actor_fsdp_strategy_overrides(),
-        # store the frozen base in bf16, not verl's fp32 yaml default. shared with the opd driver.
         *trainer_dtype_overrides(),
     ]
 
@@ -348,8 +347,6 @@ def _rollout_overrides(cfg: dict) -> list[str]:
         # above, which verl checks as base_sync_done before allowing the layered walk.
         *rollout_layered_summon_overrides(cfg.get("target_parameters")),
         *rollout_mm_processor_cache_overrides(),
-        # keep the rollout engine RESIDENT for models whose vLLM wake/reload HANGS (catalog
-        # sleep_unsupported). shared with the opd driver, which runs the same verl sleep path.
         *rollout_resident_overrides(bool(cfg.get("sleep_unsupported"))),
         f"actor_rollout_ref.rollout.gpu_memory_utilization={cfg['gpu_mem_util']}",
         f"actor_rollout_ref.rollout.tensor_model_parallel_size={cfg['n_gpus']}",
@@ -410,7 +407,7 @@ def _trainer_overrides(cfg: dict) -> list[str]:
         "trainer.test_freq=-1",
         "trainer.val_before_train=False",
         f"trainer.logger={_hydra_val(cfg['loggers'])}",
-        # the run's own wandb project/name, exactly as the sft and opd verl backends resolve them. a
+        # the run's own wandb project/name, exactly as the sft verl backends resolve them. a
         # hardcoded pair would land every grpo run in one wandb project under one experiment name, so
         # concurrent runs overwrite each other's curves and an explicit [wandb] config is ignored.
         f"trainer.project_name={_hydra_val(cfg['project_name'])}",
@@ -502,7 +499,6 @@ def resolve_gpu_mem_util(
     n_gpus: int,
     fp8_kv: bool,
     sleep_unsupported: bool,
-    preserve_parameter_floor: bool = False,
 ) -> float:
     """size vllm's colocated executor budget from this run's geometry.
 
@@ -567,7 +563,6 @@ def resolve_gpu_mem_util(
             fp8_kv=fp8_kv,
             model_info=info,
             rollout_cache_min_gb=getattr(catalog_info, "rollout_cache_min_gb", 0.0),
-            preserve_parameter_floor=preserve_parameter_floor,
             tensor_parallel=n_gpus,
             lora_rank=int(inp["lora_rank"]),
         )
@@ -636,7 +631,7 @@ def _build_verl_training_cfg(
         "max_model_len": engine_len,
         # one full-length sequence is the floor: a budget below engine_len cannot schedule the
         # longest sequence the engine will ever produce, and verl would fail to place it in any
-        # micro-batch. this is the same sequence_length-derived budget sft and opd use.
+        # micro-batch. this is the same sequence_length-derived budget sft use.
         "max_token_len_per_gpu": engine_len,
         "max_prompt_len": inp["max_prompt_len"],
         "max_completion": inp["max_completion"],

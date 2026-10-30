@@ -144,32 +144,3 @@ def model_quant(model_id: str) -> str:
 def download_weight_gb(model_id: str, revision: str = "") -> float:
     """Full bf16 checkpoint size in GB (2 bytes/param)."""
     return total_params_b(model_id, revision) * 2.0
-
-
-# parasail supplied-token scoring round-trip per completion.
-AVG_TEACHER_SECONDS_PER_COMPLETION = 2.0
-
-
-def teacher_price_per_1m(teacher_model: str) -> tuple[float, float]:
-    """(input, output) $/1M tokens for a teacher model.
-
-    Routes through the closed managed-teacher catalog. Parasail bills every supplied-token score as
-    all prompt tokens plus the one generated output token required by its completions endpoint."""
-    from flash.engine.plan.recipe import resolve_teacher
-
-    return resolve_teacher(teacher_model).usd_per_1m
-
-
-def teacher_token_cost_usd(
-    input_tokens: float, output_tokens: float = 0.0, teacher_model: str = ""
-) -> float:
-    """External teacher-API dollar cost for a token count. Deterministic; no network."""
-    inp, outp = teacher_price_per_1m(teacher_model)
-    return (max(0.0, input_tokens) * inp + max(0.0, output_tokens) * outp) / 1_000_000.0
-
-
-def teacher_seconds_per_completion(override: float | None = None) -> float:
-    """Per-completion teacher-scoring latency (s): the explicit override, else the average."""
-    if override is not None:
-        return max(0.0, override)
-    return AVG_TEACHER_SECONDS_PER_COMPLETION

@@ -120,7 +120,7 @@ def _add_env_test_commands(env_sub: argparse._SubParsersAction) -> None:
         choices=ALGORITHMS,
         help=(
             "algorithm the environment is for, matching [train] algorithm (default: grpo). "
-            "only grpo trains from the environment reward, so sft and opd skip the reward gate"
+            "only grpo trains from the environment reward, so sft skips the reward gate"
         ),
     )
     env_test.add_argument(

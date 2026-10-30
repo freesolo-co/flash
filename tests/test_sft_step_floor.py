@@ -70,7 +70,7 @@ def test_sft_step_floor_reaches_both_step_and_token_quote_paths(monkeypatch):
     assert token_with - token_without == pytest.approx(floor)
 
 
-@pytest.mark.parametrize("method", ["grpo", "opd"])
+@pytest.mark.parametrize("method", ["grpo"])
 def test_rollout_quotes_do_not_pay_the_sft_step_floor(method, monkeypatch):
     import flash.cost.analytical as analytical
 

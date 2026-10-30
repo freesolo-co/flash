@@ -9,7 +9,6 @@ import pytest
 import flash.engine.worker.train.entry.rl_train_runner as rl_train_runner
 from flash.engine.worker.io import heartbeat
 from flash.engine.worker.io.heartbeat import RewardObservabilityBuffer
-from flash.engine.worker.teacher.client import TeacherClient
 from flash.engine.worker.train.entry import backend_common
 from flash.engine.worker.verl import diagnostics
 from flash.engine.worker.verl.parent_work import ParentWorkGauge
@@ -199,18 +198,6 @@ def test_reward_observability_lifetime_count_and_busy_depth_survive_generations(
     with buffer.parent_work.busy():
         assert buffer.heartbeat_fields()["reward_grading_depth"] == 1
     assert buffer.heartbeat_fields()["reward_grading_depth"] == 0
-
-
-def test_teacher_score_many_calls_completion_callback_per_result():
-    client = TeacherClient.__new__(TeacherClient)
-    client._score_one = lambda prompt, completion: (prompt, completion)
-    completed = []
-    scored = client.score_many(
-        [("p1", "c1"), ("p2", "c2")],
-        on_scored=lambda: completed.append(True),
-    )
-    assert scored == [("p1", "c1"), ("p2", "c2")]
-    assert completed == [True, True]
 
 
 def test_authoritative_tail_classification_precedes_generic_silence():

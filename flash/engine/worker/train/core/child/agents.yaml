@@ -2,7 +2,3 @@
   _target_: flash.engine.worker.train.rl.child.rollout.FlashGrpoSingleTurnAgentLoop
 - name: flash_grpo_multi_turn
   _target_: flash.engine.worker.train.rl.child.rollout.FlashGrpoMultiTurnAgentLoop
-- name: flash_single_turn
-  _target_: flash.engine.worker.train.opd.child.rollout.FlashSingleTurnAgentLoop
-- name: flash_multi_turn
-  _target_: flash.engine.worker.train.opd.child.rollout.FlashMultiTurnAgentLoop

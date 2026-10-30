@@ -220,15 +220,11 @@ Edit dataset/train.jsonl and the episode logic, then ENVIRONMENT_GUIDANCE
 This starter implements a tiny "guess the secret number" game so you can see the
 episode hooks wired end-to-end. Replace it with your real task before a real run.
 
-All three algorithms train off this file:
+Both built-in algorithms train off this file:
 - GRPO (configs/rl.toml) rolls out full episodes and optimizes `score_episode`.
 - SFT (configs/sft.toml) learns the gold trajectory. Provide it per row as
   `output = {"messages": [...]}` (a full assistant/tool trajectory) or a scalar
   `output` for a single gold assistant turn.
-- OPD (configs/opd.toml) rolls out each episode and distils EVERY assistant turn against
-  the managed Parasail teacher (GLM 5.3 by default; pick another with [train] teacher_model),
-  conditioned on the transcript so far — the multi-turn on-policy-distillation objective. The
-  teacher key is platform-managed (nothing to set).
 """
 
 from __future__ import annotations
@@ -489,7 +485,7 @@ def _validate_existing_config_projects(project_id: str) -> None:
     from flash.client import ClientError
     from flash.core.spec import require_project_id
 
-    for path in (Path("configs/sft.toml"), Path("configs/rl.toml"), Path("configs/opd.toml")):
+    for path in (Path("configs/sft.toml"), Path("configs/rl.toml")):
         if not path.exists():
             continue
         try:
@@ -509,7 +505,7 @@ def _validate_existing_config_projects(project_id: str) -> None:
 def _existing_reasoning(configs: tuple[Path, ...]) -> bool | None:
     """The `thinking` state the generated configs already agree on, or None if none exist.
 
-    Read every existing config so pre-#824 scaffolds with stale OPD settings are detected. Missing
+    Read every existing config so inconsistent reasoning settings are detected. Missing
     configs are not disagreements because they are about to be written.
     """
     from flash.client import ClientError
@@ -734,69 +730,6 @@ def _write_sft_config(
         )
 
 
-_OPD_MANAGED_TEACHER_NOTE = (
-    "# the teacher and its parasail key are platform-managed; nothing to set up or export.\n"
-)
-
-# Only the managed plane manages the key. `require_teacher_broker_configuration` reads
-# PARASAIL_API_KEY and FLASH_PUBLIC_URL from the CONTROL PLANE's environment, so on a self-hosted
-# plane the operator sets both -- and the failure lands at submit, after the scaffold has already
-# claimed there was nothing to do.
-_OPD_SELF_HOSTED_TEACHER_NOTE = (
-    "# opd uses a managed parasail teacher, which this plane brokers itself: set PARASAIL_API_KEY\n"
-    "# and FLASH_PUBLIC_URL in the CONTROL PLANE's environment (not your shell) before submitting.\n"
-    "# FLASH_PUBLIC_URL must be an origin the rented worker can reach, not localhost or a tunnel.\n"
-)
-
-
-def _write_opd_config(
-    opd: Path,
-    multi_turn: bool,
-    project_line: str,
-    project_id: str,
-    thinking_line: str,
-    wandb_block: str,
-    max_examples_line: str,
-    *,
-    can_publish: bool = True,
-) -> None:
-    """write the opd config-file phase."""
-    if not opd.exists():
-        # opd (on-policy distillation) works in BOTH modes: single-turn distils one sampled completion
-        # per prompt; multi-turn rolls out each episode and distils every assistant turn against the
-        # transcript so far. The scaffold differs only by a one-line note pointing at the mode.
-        opd_multiturn_note = (
-            "# note: opd rolls out each episode and distils every assistant turn (conditioned on the\n"
-            "# transcript so far) against the managed parasail teacher - the multi-turn distillation path.\n\n"
-            if multi_turn
-            else ""
-        )
-        opd.write_text(
-            f"{opd_multiturn_note}"
-            'model = "Qwen/Qwen3.5-9B"\n'
-            f"{project_line}"
-            'algorithm = "opd"   # on-policy distillation from a managed parasail teacher (default glm 5.2)\n'
-            f"{thinking_line}"
-            "\n"
-            f"{wandb_block}"
-            + _environment_comment(
-                project_id,
-                can_publish=can_publish,
-                extra=(_OPD_MANAGED_TEACHER_NOTE if can_publish else _OPD_SELF_HOSTED_TEACHER_NOTE),
-            )
-            + "[train]\n"
-            "epochs = 1\n"
-            f"{max_examples_line}"
-            "lora_rank = 32\n"
-            '# teacher_model = "glm-5.3"   # teacher: glm-5.3 (default) | kimi-k3 |\n'
-            "#                             # qwen3.5-397b-a17b | deepseek-v4.1-flash-1017 |\n"
-            "#                             # qwen3.8-27b | qwen3-vl-235b\n"
-            "#                             # (key stays managed)\n"
-            "# GPU and HF artifacts are managed automatically by the platform: the GPU is\n"
-            "# the cheapest fitting managed class, and artifacts live in a private environment-scoped repo.\n"
-        )
-
-
 def _write_training_guide(training: Path, project_id: str) -> None:
     """write the training guide phase."""
     if not training.exists():
@@ -839,12 +772,7 @@ def cmd_env_setup(args) -> int:
 
     rl = Path("configs/rl.toml")
     sft = Path("configs/sft.toml")
-    opd = Path("configs/opd.toml")
-    # All THREE configs persist `thinking`, so all three must anchor it and all three must be named in
-    # the deletion guidance. Anchoring on a subset lets a user follow this warning literally, delete
-    # exactly what it names, and end up with the deleted configs rewritten one way and the unnamed one
-    # still holding the old setting -- the same silent cross-algorithm mismatch, just relocated.
-    reasoning_configs = (rl, opd, sft)
+    reasoning_configs = (rl, sft)
     reasoning = _resolve_reasoning_mode(args, reasoning_configs)
 
     can_publish = _plane_can_publish_environments(api_url)
@@ -900,7 +828,7 @@ def cmd_env_setup(args) -> int:
         + '# secrets = ["SERPAPI_API_KEY"]\n\n'
     )
     # `thinking=true` is algorithm-agnostic. only GRPO needs a generated completion increase;
-    # OPD raises its own via `opd_completion_len`, and SFT does not generate. empty strings preserve
+    # SFT does not generate. Empty strings preserve
     # the non-reasoning scaffold.
     thinking_line = "thinking = true\n" if reasoning else ""
     rl_reasoning_train = (
@@ -932,17 +860,6 @@ def cmd_env_setup(args) -> int:
         max_examples_line,
         sft_reasoning_note,
     )
-    opd = Path("configs/opd.toml")
-    _write_opd_config(
-        opd,
-        multi_turn,
-        project_line,
-        project_id,
-        thinking_line,
-        _wandb_block(project_name, f"{folder_name}-opd"),
-        max_examples_line,
-        can_publish=can_publish,
-    )
     training = Path("TRAINING.md")
     _write_training_guide(training, project_id)
     scaffolded = [
@@ -951,7 +868,6 @@ def cmd_env_setup(args) -> int:
         "dataset/train.jsonl",
         "configs/sft.toml",
         "configs/rl.toml",
-        "configs/opd.toml",
         "TRAINING.md",
     ]
     if render.styled():

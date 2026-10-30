@@ -181,14 +181,13 @@ def test_spec_payload_filters_normalized_train_values_by_authored_keys() -> None
         {
             "model": "Qwen/Qwen3.5-9B",
             "project": "11111111-1111-4111-8111-111111111111",
-            "algorithm": "opd",
+            "algorithm": "grpo",
             "environment": {"id": "owner/project/env"},
             "train": {
                 "epochs": 1,
                 "max_examples": 1,
                 "temperature": 0,
                 "stop_sequences": [],
-                "teacher_model": "GLM 5.3",
                 "structured_outputs": False,
             },
         }
@@ -198,7 +197,6 @@ def test_spec_payload_filters_normalized_train_values_by_authored_keys() -> None
         "max_examples",
         "temperature",
         "stop_sequences",
-        "teacher_model",
         "structured_outputs",
     }
 
@@ -211,7 +209,6 @@ def test_spec_payload_filters_normalized_train_values_by_authored_keys() -> None
         "max_examples": 1,
         "temperature": 0.0,
         "stop_sequences": (),
-        "teacher_model": "glm-5.3",
         "structured_outputs": "",
     }
     assert "lora_rank" not in sparse["train"]

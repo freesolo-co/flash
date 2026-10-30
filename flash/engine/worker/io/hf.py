@@ -26,10 +26,6 @@ from flash.engine.worker.perf import (  # noqa: F401
 )
 from flash.engine.worker.runtime.phases import timed_phase
 from flash.engine.worker.runtime.state import WorkerContext
-from flash.teacher.retry_contract import (
-    canonical_opd_optimizer_start_json,
-    opd_optimizer_start_marker_path,
-)
 
 
 @dataclass(frozen=True)
@@ -117,36 +113,6 @@ def hf_api():
 
 def hf_prefix(*, context: WorkerContext) -> str:
     return f"{context.config.phase}/{context.config.run_id}"
-
-
-def publish_opd_optimizer_start_marker(*, context: WorkerContext) -> None:
-    """Synchronously publish the first-update mutation marker before optimizer.step()."""
-    if not isinstance(context.config.hf_repo, str) or not context.config.hf_repo.strip():
-        raise RuntimeError("opd optimizer-start marker requires a private HF repository")
-    marker_path = opd_optimizer_start_marker_path(context.config.run_id, context.config.attempt)
-    local_path = f"/tmp/opd-optimizer-start-attempt-{context.config.attempt}.json"
-    payload = canonical_opd_optimizer_start_json(
-        run_id=context.config.run_id,
-        attempt=context.config.attempt,
-        seed=context.config.seed,
-    )
-    with open(local_path, "wb") as file:
-        file.write(payload)
-        file.flush()
-        os.fsync(file.fileno())
-    try:
-        _require_hf_deadline_allowance(context=context)
-        hf_api().upload_file(
-            path_or_fileobj=local_path,
-            path_in_repo=marker_path,
-            repo_id=context.config.hf_repo,
-            repo_type="dataset",
-        )
-    except Exception as error:
-        detail = sanitize_diagnostic(error, limit=500)
-        raise RetriableInfraError(
-            f"required upload of OPD optimizer-start marker failed: {detail}"
-        ) from error
 
 
 def _require_hf_deadline_allowance(*, context: WorkerContext) -> float | None:

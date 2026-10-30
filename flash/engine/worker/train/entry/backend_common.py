@@ -1,10 +1,10 @@
-"""shared out-of-process verl harness reused by the sft and opd verl trainers.
+"""shared out-of-process verl harness reused by the sft verl trainers.
 
 verl pins its own torch/vllm, incompatible with flash's, so flash never imports verl in-process: it
 runs a verl trainer entrypoint as a subprocess against a separate interpreter and merges the
 fsdp-sharded lora checkpoint back into a flash-servable peft adapter. these are the framework- and
 algorithm-neutral pieces (interpreter resolution, checkpoint export, provenance, progress
-streaming); the sft/opd/grpo modules layer their own dataset rows, hydra overrides, and
+streaming); the sft/grpo modules layer their own dataset rows, hydra overrides, and
 orchestration on top.
 """
 
@@ -100,7 +100,7 @@ VERL_FLASHINFER_REQUIREMENTS = (
 
 # the stamp must identify every separately installed package the venv holds. omitting flash-attn,
 # fla, causal_conv1d, or the exact transformers pin lets an older partial venv match forever; conv1d
-# leaves GRPO/OPD failing ``require_gdn_boundary_resets`` with no rebuild path, and a stale venv
+# leaves GRPO failing ``require_gdn_boundary_resets`` with no rebuild path, and a stale venv
 # resolved before the transformers pin keeps training on a different transformers indefinitely.
 # bump when a repair applied at build time changes what a fully provisioned venv looks like. the
 # libcudart repair runs only on the rebuild path, so a venv stamped by a release that predates it
@@ -117,7 +117,7 @@ VERL_VENV_STAMP = (
     f"{VERL_REQUIREMENT}\n{FLASH_ATTN_INSTALL_SPEC}\n{FLA_REQUIREMENT}\n{FLASH_QLA_REQUIREMENT}\n"
     f"{CAUSAL_CONV1D_REQUIREMENT}\n{TRANSFORMERS_INSTALL_REQUIREMENT}\n"
     + "\n".join(VERL_FLASHINFER_REQUIREMENTS)
-    + "\n"
+    + "\nvllm-native-structured-dependencies-v1\n"
     + VERL_VENV_BUILD_REPAIRS
 )
 
@@ -175,7 +175,7 @@ def _install_causal_conv1d(py: str) -> bool:
 
     Best-effort, deliberately: unlike flash-attn this cannot fail the provisioning. Dying here would
     turn a compiler hiccup into a dead paid run, and returning False is not the end of the story --
-    ``require_gdn_boundary_resets`` raises for grpo/opd on a gdn model whose child cannot reset, so
+    ``require_gdn_boundary_resets`` raises for grpo on a gdn model whose child cannot reset, so
     the failure still surfaces, with a message naming the missing kernel. SFT is unaffected either
     way (``_packing_mode`` pins gdn to one example per update, so there is nothing to contaminate).
 
@@ -335,7 +335,7 @@ _BRIDGE_WORKER_THREADS = 16
 class _DaemonBridgeThreadPool(ThreadPoolExecutor):
     """A ``ThreadPoolExecutor`` whose workers cannot hold the interpreter open.
 
-    A hung environment reward or teacher callback must not stop the worker from publishing its
+    A hung environment reward callback must not stop the worker from publishing its
     terminal result and releasing a paid GPU -- and it is also the property the old daemon
     ``ThreadingHTTPServer`` had before requests moved onto a pool. Only the thread creation differs
     from the stdlib; queueing, idle reuse, and shutdown are inherited unchanged.

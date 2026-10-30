@@ -308,9 +308,6 @@ def _prepare_rl_files(inp, prompts, *, context: WorkerContext):
     val_pq = os.path.join(workdir, "val.parquet")
     reward_py = os.path.join(workdir, "reward.py")
 
-    # multimodal: decode each prompt's images to png on disk and carry file:// uris in the parquet.
-    # verl's dataset loads them through qwen_vl_utils.fetch_image, which reads file:// natively, so
-    # the pixels never have to round-trip through arrow. same contract the opd verl path writes.
     image_uris = None
     if inp["multimodal"]:
         image_dir = os.path.join(workdir, "images")

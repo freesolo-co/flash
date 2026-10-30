@@ -61,7 +61,6 @@ def test_parser_tolerates_a_missing_id():
 # to stay under the file-size limit. paths are relative to _WORKER.
 _NOTES_BUILDER_MODULES = {
     "rl_train.py": ("train/rl/launch/verl_config.py",),
-    "opd_train.py": ("train/opd/orchestration/overrides.py",),
     "sft_train.py": ("train/sft/setup/config.py",),
 }
 
@@ -126,7 +125,7 @@ def _emitted_notes_keys(module: str) -> set[str]:
     return keys
 
 
-@pytest.mark.parametrize("module", ["sft_train.py", "opd_train.py", "rl_train.py"])
+@pytest.mark.parametrize("module", ["sft_train.py", "rl_train.py"])
 def test_every_verl_backend_emits_the_wandb_link_keys(module):
     # all three run wandb.init out of process, so all three need the marker channel. one backend
     # quietly missing it is invisible to the consumer-side contract test.

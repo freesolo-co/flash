@@ -1,14 +1,8 @@
-"""bounded replay sampling guard for the isolated opd verl child."""
+"""bounded replay sampling guard for the isolated GRPO verl child."""
 
 from __future__ import annotations
 
-import os
-
 from flash._internal.diagnostics import sanitize_diagnostic
-from flash.engine.worker.train.opd.child.bridge import (
-    _read_rollout_failure_fallback,
-    _render_rollout_failure,
-)
 
 _REPLAY_STALL_SECONDS = 1200.0
 _REPLAY_POLL_SECONDS = 0.1
@@ -44,26 +38,20 @@ def _actor_probe_state(trainer) -> str:
 
 
 def _raise_prompt_failure(key: str, global_steps: int) -> None:
-    recorded = _read_rollout_failure_fallback(os.environ.get("FLASH_OPD_ROLLOUT_FAILURE_PATH", ""))
-    if recorded is not None:
-        detail = _render_rollout_failure(recorded)
-        raise RuntimeError(
-            f"multi-turn OPD rollout failed at global_steps={global_steps}: {detail}"
-        )
     detail = sanitize_diagnostic(
-        f"opd replay observed failed prompt {key!r} at global_steps={global_steps}",
+        f"GRPO replay observed failed prompt {key!r} at global_steps={global_steps}",
         limit=2000,
     )
     raise RuntimeError(detail)
 
 
 def _raise_actor_death(global_steps: int) -> None:
-    raise RuntimeError(f"opd rollout actor died at global_steps={global_steps}")
+    raise RuntimeError(f"GRPO rollout actor died at global_steps={global_steps}")
 
 
 def _raise_stall(global_steps: int, statuses: tuple[tuple[str, str], ...]) -> None:
     detail = sanitize_diagnostic(
-        f"opd_replay_stall: current-step statuses did not change at global_steps={global_steps}: "
+        f"GRPO_replay_stall: current-step statuses did not change at global_steps={global_steps}: "
         f"{statuses!r}",
         limit=2000,
     )

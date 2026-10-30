@@ -56,19 +56,12 @@ def _run_job(
     runtime_secrets: dict[str, str] | None = None,
     reserved_claim: AttemptLaunchClaim | None = None,
 ) -> None:
-    from flash.content.multimodal import preflight_validate_image_opd
     from flash.runner.lifecycle.state import RUNS_DIR, TERMINAL_STATES
     from flash.runner.lifecycle.status import _update, get_status
     from flash.runner.supervise.lifecycle import _run_job_inner
     from flash.runner.supervise.recovery import _gc_run_sandboxes
 
-    # setup runs inside the cleanup scope: a raise from the opd preflight, the status read, or the
-    # provisioning update is caught by `_run_job_background`, which cannot consume the claim itself.
-    # an unconsumed claim holds its flock for the process lifetime and reads as live to every
-    # observer, so handleless recovery refuses to resume a run nobody is working on.
     try:
-        preflight_validate_image_opd(spec)
-
         # Cancel can land before this thread starts; don't overwrite a terminal state with provisioning.
         if get_status(spec.run_id).state in TERMINAL_STATES:
             return
@@ -172,15 +165,7 @@ def _terminal_failure_detail(exc: BaseException) -> str:
 
     `RunStatus.error` is shown to the submitter, so an arbitrary exception's text is NOT safe to
     put there: it can carry internal storage paths, provider payloads, and upstream bodies. The
-    default therefore keeps only the type. The exception is the managed-teacher configuration gate,
-    whose messages are authored for exactly this audience -- redacting those made a missing
-    plane-side credential indistinguishable from a bad spec, since both surfaced as a bare
-    `RuntimeError: run failed`.
     """
-    from flash.server.domain.teacher.broker import TeacherBrokerConfigurationError
-
-    if isinstance(exc, TeacherBrokerConfigurationError):
-        return f"{type(exc).__name__}: {exc}"
     return f"{type(exc).__name__}: run failed"
 
 
@@ -244,10 +229,6 @@ def _run_training(
     from flash.runner.supervise.errors import _RunCancelled
     from flash.runner.supervise.lifecycle import _run_attempts_supervised
 
-    if spec.algorithm == "opd":
-        from flash.server.domain.teacher.broker import preflight_validate_managed_teacher
-
-        preflight_validate_managed_teacher(spec)
     status = get_status(spec.run_id)
     if source_snapshot is None:
         source_snapshot = source_snapshot_from_status(status, required=True)

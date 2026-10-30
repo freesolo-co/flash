@@ -20,10 +20,6 @@ except ImportError:  # pragma: no cover - linux production fails closed below
 from flash._internal.paths import data_dir
 from flash.core.spec import JobSpec
 from flash.engine.plan.prompt_budget import PromptBudget
-from flash.teacher.retry_contract import (
-    OPD_RETRY_CONTRACT_STATUS_KEY,
-    require_opd_retry_contract_version,
-)
 
 _STATE_DIR = str(data_dir())
 RUNS_DIR = os.path.join(_STATE_DIR, "runs")
@@ -36,7 +32,6 @@ _UNDEPLOYABLE_STATES = TERMINAL_STATES - {"done"}
 _RUN_DEADLINE_AT_KEY = "run_deadline_at"
 _NEXT_ATTEMPT_KEY = "next_attempt"
 _CLEANUP_REMOTES_KEY = "cleanup_remotes"
-_OPD_RETRY_CONTRACT_KEY = OPD_RETRY_CONTRACT_STATUS_KEY
 _RETRY_STATE_KEY = "retry_state"
 _ACTIVE_LAUNCH_CLAIM_KEY = "active_launch_claim"
 _PRIVATE_STATUS_KEYS = frozenset(
@@ -44,7 +39,6 @@ _PRIVATE_STATUS_KEYS = frozenset(
         _RUN_DEADLINE_AT_KEY,
         _NEXT_ATTEMPT_KEY,
         _CLEANUP_REMOTES_KEY,
-        _OPD_RETRY_CONTRACT_KEY,
         _RETRY_STATE_KEY,
         _ACTIVE_LAUNCH_CLAIM_KEY,
     }
@@ -116,11 +110,7 @@ def _adapter_ref_for_status(status: RunStatus) -> str | None:
     return format_checkpoint_ref(status.run_id, None)
 
 
-# Heartbeat stages that mean the worker has entered training (GPU work underway). The per-step
-# `step` field is 1-indexed and only appears once a step COMPLETES, so the expensive first step (a
-# GRPO rollout can be ~17 min, an opd step waits on the teacher round-trips) streams one of these
-# stages with NO step yet -- still real GPU time.
-_TRAINING_STAGES = frozenset({"rl_step", "sft_step", "opd_step"})
+_TRAINING_STAGES = frozenset({"rl_step", "sft_step"})
 
 
 @dataclass
@@ -166,7 +156,7 @@ class RunStatus:
     gpu_status: dict | None = None
     workload_profile_input_digest: str | None = None
     workload_profile: dict | None = None
-    # submit-time derived grpo/opd prompt budget from flash.engine.plan.prompt_budget. workers drop
+    # submit-time derived grpo prompt budget from flash.engine.plan.prompt_budget. workers drop
     # over-budget prompts rather than truncating them, so record the value before gpu allocation.
     # none for sft, which reports truncation through workload_profile, and for older records.
     prompt_budget: PromptBudget | None = None
@@ -259,7 +249,7 @@ def _redact_internal_adapter_ref(data: dict) -> None:
         return
     _repo, prefix = resolved
     match = re.fullmatch(
-        r"(?:sft|rl|opd)/(?P<run>[A-Za-z0-9][A-Za-z0-9._-]{0,127})"
+        r"(?:sft|rl)/(?P<run>[A-Za-z0-9][A-Za-z0-9._-]{0,127})"
         r"(?:/checkpoints/step-(?P<step>\d+))?",
         prefix,
     )
@@ -331,17 +321,12 @@ def _save_status(
     _run_deadline_at: float | object = _PRIVATE_VALUE_UNSET,
     _next_attempt: int | object = _PRIVATE_VALUE_UNSET,
     _cleanup_remotes: list[dict] | object | None = _PRIVATE_VALUE_UNSET,
-    _opd_retry_contract_version: int | object = _PRIVATE_VALUE_UNSET,
     _retry_state: dict | object | None = _PRIVATE_VALUE_UNSET,
     _active_launch_claim: dict | object | None = _PRIVATE_VALUE_UNSET,
 ) -> None:
     from flash.runner.lifecycle import deadlines
 
     with _status_guard(status.run_id):
-        if _opd_retry_contract_version is not _PRIVATE_VALUE_UNSET:
-            require_opd_retry_contract_version(_opd_retry_contract_version)
-            if JobSpec.from_dict(status.spec).algorithm != "opd":
-                raise ValueError("opd retry contract cannot be stored for a non-opd run")
         if not os.path.exists(runs_file_path(status.run_id, ".json")):
             # both defaults below are derived from the internal spec, so parse it once. a record
             # whose spec no longer parses (an older writer's shape, reached by the billing sweep)
@@ -373,7 +358,6 @@ def _save_status(
             _run_deadline_at=_run_deadline_at,
             _next_attempt=_next_attempt,
             _cleanup_remotes=_cleanup_remotes,
-            _opd_retry_contract_version=_opd_retry_contract_version,
             _retry_state=_retry_state,
             _active_launch_claim=_active_launch_claim,
         )
@@ -385,7 +369,6 @@ def _save_status_unlocked(
     _run_deadline_at: float | object = _PRIVATE_VALUE_UNSET,
     _next_attempt: int | object = _PRIVATE_VALUE_UNSET,
     _cleanup_remotes: list[dict] | object | None = _PRIVATE_VALUE_UNSET,
-    _opd_retry_contract_version: int | object = _PRIVATE_VALUE_UNSET,
     _retry_state: dict | object | None = _PRIVATE_VALUE_UNSET,
     _active_launch_claim: dict | object | None = _PRIVATE_VALUE_UNSET,
 ) -> None:
@@ -404,7 +387,6 @@ def _save_status_unlocked(
         _RUN_DEADLINE_AT_KEY: _run_deadline_at,
         _NEXT_ATTEMPT_KEY: _next_attempt,
         _CLEANUP_REMOTES_KEY: _cleanup_remotes,
-        _OPD_RETRY_CONTRACT_KEY: _opd_retry_contract_version,
         _RETRY_STATE_KEY: _retry_state,
         _ACTIVE_LAUNCH_CLAIM_KEY: _active_launch_claim,
     }

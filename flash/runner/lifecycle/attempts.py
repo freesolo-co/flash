@@ -11,9 +11,8 @@ from flash.adapters.artifacts import MAX_ATTEMPT_ID
 from flash.core.spec import JobSpec
 from flash.runner.lifecycle import claim_lock, state
 from flash.runner.lifecycle import status as status_ops
-from flash.teacher.retry_contract import require_opd_retry_contract_version
 
-_CLAIM_KEYS = frozenset({"attempt", "token", "resume_revision", "resume_world_size"})
+_CLAIM_KEYS = frozenset({"attempt", "token"})
 
 
 @dataclass(frozen=True)
@@ -27,44 +26,29 @@ class LaunchReservationResult:
 class AttemptLaunchClaim:
     attempt: int
     token: str
-    resume_revision: str | None = None
-    resume_world_size: int | None = None
 
     def __post_init__(self) -> None:
         if isinstance(self.attempt, bool) or not isinstance(self.attempt, int) or self.attempt < 0:
             raise ValueError("launch claim attempt is invalid")
         if not isinstance(self.token, str) or not self.token.strip():
             raise ValueError("launch claim token is invalid")
-        if self.resume_revision is not None and (
-            not isinstance(self.resume_revision, str) or not self.resume_revision.strip()
-        ):
-            raise ValueError("launch claim resume revision is invalid")
-        if self.resume_world_size is not None and (
-            isinstance(self.resume_world_size, bool)
-            or not isinstance(self.resume_world_size, int)
-            or self.resume_world_size < 1
-        ):
-            raise ValueError("launch claim resume world size is invalid")
-        if (self.resume_revision is None) != (self.resume_world_size is None):
-            raise ValueError("launch claim resume revision and world size must be paired")
 
     def to_dict(self) -> dict:
         return {
             "attempt": self.attempt,
             "token": self.token,
-            "resume_revision": self.resume_revision,
-            "resume_world_size": self.resume_world_size,
         }
 
     @classmethod
     def from_dict(cls, raw: object) -> AttemptLaunchClaim:
-        if not isinstance(raw, dict) or set(raw) != _CLAIM_KEYS:
+        if (
+            not isinstance(raw, dict)
+            or {key for key, value in raw.items() if value is not None} != _CLAIM_KEYS
+        ):
             raise ValueError("persisted launch claim has an invalid shape")
         return cls(
             raw["attempt"],
             raw["token"],
-            raw["resume_revision"],
-            raw["resume_world_size"],
         )
 
 
@@ -92,64 +76,6 @@ def active_launch_claim_from_raw(raw: dict) -> AttemptLaunchClaim | None:
         return AttemptLaunchClaim.from_dict(value)
     except ValueError as exc:
         raise RuntimeError("persisted launch claim is invalid") from exc
-
-
-def _verified_opd_retry_state(run_id: str) -> tuple[int, str | None, int | None]:
-    """Verify one opd retry snapshot and its optional resumable checkpoint."""
-    with state._status_guard(run_id):
-        raw = status_ops._load_status_json(run_id)
-        status = status_ops._run_status_from_json(raw)
-        spec = state._internal_spec_from_status(status)
-        if spec.algorithm != "opd":
-            raise RuntimeError("opd retry verification requires an opd run")
-        try:
-            contract_version = require_opd_retry_contract_version(
-                raw.get(state._OPD_RETRY_CONTRACT_KEY)
-            )
-        except ValueError as exc:
-            raise RuntimeError(
-                "opd retry contract is missing or invalid; replacement is blocked"
-            ) from exc
-        next_attempt = status_ops.decode_next_attempt(raw)
-        hf_repo = spec.train.hf_repo
-        phase = spec.phase
-        seed = spec.seed
-
-    from flash.providers.artifacts.hf import verify_opd_replacement_safe
-
-    verified = verify_opd_replacement_safe(
-        hf_repo=hf_repo,
-        run_id=run_id,
-        seed=seed,
-        next_attempt=next_attempt,
-        contract_version=contract_version,
-        phase=phase,
-    )
-    resume_revision, checkpoint_world_size = verified if verified is not None else (None, None)
-    return next_attempt, resume_revision, checkpoint_world_size
-
-
-def _validate_opd_evidence(
-    spec: JobSpec,
-    raw: dict,
-    attempt: int,
-    resume_revision: str | None,
-    resume_world_size: int | None,
-) -> None:
-    if spec.algorithm != "opd":
-        if resume_revision is not None or resume_world_size is not None:
-            raise RuntimeError("non-opd launch cannot carry opd resume evidence")
-        return
-    try:
-        require_opd_retry_contract_version(raw.get(state._OPD_RETRY_CONTRACT_KEY))
-    except ValueError as exc:
-        raise RuntimeError(
-            "opd retry contract is missing or invalid; replacement is blocked"
-        ) from exc
-    if (resume_revision is None) != (resume_world_size is None):
-        raise RuntimeError("opd resume revision and world size must be paired")
-    if attempt > 0 and resume_revision is not None and resume_world_size is None:
-        raise RuntimeError("opd resume checkpoint width is missing")
 
 
 def _owns_attempt(
@@ -251,8 +177,6 @@ def _reserve_attempt_launch(
     expected_state: str | None = None,
     expected_next_attempt: int | None = None,
     transition_state: str | None = None,
-    resume_revision: str | None = None,
-    resume_world_size: int | None = None,
     recover_handleless: bool = False,
     provider_clear_confirmed: bool = False,
     expected_stale_claim: AttemptLaunchClaim | None = None,
@@ -308,21 +232,9 @@ def _reserve_attempt_launch(
                 if current - 1 != existing.attempt:
                     raise RuntimeError("stale launch claim no longer names the newest attempt")
                 require_retry_authorization_from_raw(spec, raw, existing.attempt)
-                # the claim pinned its resume evidence before its worker launched, and that worker
-                # may have mutated the checkpoint before it was lost. take the caller's freshly
-                # verified evidence, which covers every attempt the counter names.
-                _validate_opd_evidence(
-                    spec,
-                    raw,
-                    existing.attempt,
-                    resume_revision,
-                    resume_world_size,
-                )
                 claim = AttemptLaunchClaim(
                     existing.attempt,
                     uuid.uuid4().hex,
-                    resume_revision,
-                    resume_world_size,
                 )
             else:
                 if expected_stale_claim is not None:
@@ -343,7 +255,6 @@ def _reserve_attempt_launch(
                         return LaunchReservationResult(None, retry_plan=plan)
                 reservation_raw = {**raw, state._RETRY_STATE_KEY: snapshot}
                 require_retry_authorization_from_raw(spec, reservation_raw, current)
-                _validate_opd_evidence(spec, raw, current, resume_revision, resume_world_size)
                 if current >= MAX_ATTEMPT_ID:
                     raise RuntimeError("run attempt identity is exhausted")
                 claim_fd = claim_lock.try_acquire(run_id)
@@ -352,8 +263,6 @@ def _reserve_attempt_launch(
                 claim = AttemptLaunchClaim(
                     current,
                     uuid.uuid4().hex,
-                    resume_revision,
-                    resume_world_size,
                 )
                 current += 1
             _persist_reservation_unlocked(
@@ -390,23 +299,12 @@ def reserve_handleless_recovery_launch(
     provider_clear_confirmed: bool,
     expected_stale_claim: AttemptLaunchClaim | None,
     expected_next_attempt: int | None = None,
-    resume_revision: str | None = None,
-    resume_world_size: int | None = None,
 ) -> LaunchReservationResult:
-    """Reserve one provider-clear recovery through the shared ownership primitive.
-
-    `expected_next_attempt` is the counter the caller's resume evidence was verified against. opd
-    verification reaches hugging face outside the status lock, so a concurrent observer can reserve
-    and settle an attempt while it runs. Passing the verified counter rejects evidence that predates
-    the intervening attempt's mutation marker instead of resuming from a checkpoint that excludes it.
-    """
     return _reserve_attempt_launch(
         run_id,
         expected_state=expected_state,
         expected_next_attempt=expected_next_attempt,
         transition_state="provisioning",
-        resume_revision=resume_revision,
-        resume_world_size=resume_world_size,
         recover_handleless=True,
         provider_clear_confirmed=provider_clear_confirmed,
         expected_stale_claim=expected_stale_claim,
@@ -421,24 +319,14 @@ def reserve_verified_attempt_launch(
     expected_next_attempt: int | None = None,
     transition_state: str | None = None,
 ) -> AttemptLaunchClaim | None:
-    """Reserve one launch after verifying any required opd resume evidence."""
-    status = status_ops.get_status(run_id)
-    spec = state._internal_spec_from_status(status)
-    if spec.algorithm == "opd":
-        verified_next, revision, world_size = _verified_opd_retry_state(run_id)
-        if expected_next_attempt is not None and verified_next != expected_next_attempt:
-            return None
-        expected_next = verified_next
-    else:
-        expected_next, revision, world_size = expected_next_attempt, None, None
+    """Reserve a launch after validating its persisted specification."""
+    state._internal_spec_from_status(status_ops.get_status(run_id))
     return _reserve_attempt_launch(
         run_id,
         expected_remote=expected_remote,
         expected_state=expected_state,
-        expected_next_attempt=expected_next,
+        expected_next_attempt=expected_next_attempt,
         transition_state=transition_state,
-        resume_revision=revision,
-        resume_world_size=world_size,
     ).claim
 
 

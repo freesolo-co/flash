@@ -1,6 +1,6 @@
 # Flash
 
-LoRA post-training for open-weight models: SFT, GRPO, and on-policy distillation. You
+LoRA post-training for open-weight models: SFT and GRPO. You
 describe a run in a TOML file, Flash allocates a GPU, trains, streams checkpoints, and
 serves the resulting adapter.
 
@@ -289,7 +289,7 @@ into `dev`**.
 - `tests/` — pytest suite, CPU-only and offline
 
 Within `flash/engine/worker/`, trainers live under `train/`, split by algorithm (`sft/`,
-`rl/`, `opd/`) over a shared `core/`. Each carries a `child/` holding stdlib-only modules
+`rl/`) over a shared `core/`. Each carries a `child/` holding stdlib-only modules
 **copied** into the verl subprocess rather than imported — flash and verl pin incompatible
 torch/vllm versions, so neither can import the other.
 

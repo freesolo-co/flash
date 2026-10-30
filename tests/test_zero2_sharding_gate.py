@@ -16,7 +16,6 @@ from __future__ import annotations
 import pytest
 
 from flash.core.catalog import MODELS
-from flash.engine.worker.train.opd.orchestration.overrides import build_opd_overrides
 from flash.engine.worker.verl.parallelism import resolve_reshard_after_forward
 from flash.providers.core.sharding import (
     REPLICATED_PER_CARD_GB,
@@ -66,12 +65,7 @@ def test_zero2_floor_is_the_zero3_floor_plus_a_retained_weight_copy():
 
 
 def test_the_gate_charges_more_than_it_measured():
-    """A full retained bf16 copy, plus margin, is the floor the gate is allowed to assume.
-
-    The residency was measured once, at 1.59B. Charging it bare left 35B-A3B opd on 2x B200 clearing
-    its requirement by 0.4%, which an extrapolation error of 2.6% would turn into an OOM on a paid
-    multi-card run. Anything at or below 1.0 would be assuming the retained copy is FREE in part.
-    """
+    """A full retained bf16 copy, plus margin, is the floor the gate is allowed to assume."""
     assert ZERO2_CHARGED_RESIDENCY >= 1.0
 
 
@@ -115,7 +109,7 @@ def test_the_gate_is_off_on_a_single_rank():
     for params_b in _CATALOG_PARAMS_B:
         assert not zero2_enabled(180, 1, params_b, 10)
     assert resolve_reshard_after_forward(
-        model_id="Qwen/Qwen3.5-9B", algorithm="opd", gpu_type="L40S", n_gpus=1
+        model_id="Qwen/Qwen3.5-9B", algorithm="grpo", gpu_type="L40S", n_gpus=1
     )
 
 
@@ -129,14 +123,14 @@ def test_an_unknown_card_falls_closed_to_zero3(gpu_type, n_gpus):
     A wrong ZeRO-2 answer OOMs a paid run; a wrong ZeRO-3 answer only forgoes a speedup.
     """
     assert resolve_reshard_after_forward(
-        model_id="Qwen/Qwen3.5-9B", algorithm="opd", gpu_type=gpu_type, n_gpus=n_gpus
+        model_id="Qwen/Qwen3.5-9B", algorithm="grpo", gpu_type=gpu_type, n_gpus=n_gpus
     )
 
 
 def test_an_unsizable_model_falls_closed_to_zero3():
     """An uncataloged id cannot be priced, so it cannot be granted the memory trade."""
     assert resolve_reshard_after_forward(
-        model_id="nobody/not-a-model", algorithm="opd", gpu_type="L40S", n_gpus=2
+        model_id="nobody/not-a-model", algorithm="grpo", gpu_type="L40S", n_gpus=2
     )
     assert not zero2_enabled(80, 2, 0.0, 41)
 
@@ -161,21 +155,12 @@ def test_a_shape_with_room_takes_zero2():
     """
     assert zero2_enabled(80, 2, 0.9, 84)
     assert not resolve_reshard_after_forward(
-        model_id="Qwen/Qwen3.5-9B", algorithm="opd", gpu_type="A100 SXM", n_gpus=2
+        model_id="Qwen/Qwen3.5-9B", algorithm="grpo", gpu_type="A100 SXM", n_gpus=2
     )
 
 
 def test_the_gate_never_admits_more_than_a_card_physically_holds():
-    """Every enabled shape must fit CARD-BY-CARD, not just in the pooled model.
-
-    The pooled comparison is not sufficient on its own: `combined_vram_gb` ends in a trailing
-    addend, and adding the ZeRO-2 floor there instead of `REPLICATED_PER_CARD_GB` refunds exactly
-    the retained copy the floor just charged. That refund is invisible to a pooled check (the gate
-    and the capacity move together) but shows up immediately here, because `need` never included a
-    retained copy. It admitted 10 catalog shapes whose per-card demand exceeded the card, including
-    35B-A3B opd on 2x B200 asking 210.79 GB of a 180 GB card -- paid runs ZeRO-3 would have
-    completed.
-    """
+    """Every enabled shape must fit CARD-BY-CARD, not just in the pooled model."""
     from flash.engine.plan.vram import model_required_vram_gb
     from flash.providers.core.base import get_gpu_info
 
@@ -183,7 +168,7 @@ def test_the_gate_never_admits_more_than_a_card_physically_holds():
     fired = 0
     for model_id in MODELS:
         params_b = float(MODELS[model_id].params_b)
-        for algorithm in ("grpo", "opd"):
+        for algorithm in ("grpo",):
             need = float(model_required_vram_gb(model_id, algorithm))
             for gpu_type in ("L4", "L40S", "A100 SXM", "H200", "B200"):
                 vram = int(get_gpu_info(gpu_type).vram_gb)
@@ -218,12 +203,12 @@ def test_the_worker_and_the_allocator_cannot_disagree():
 
     checked = 0
     fired = 0
-    # grpo and opd only: they are the two callers that render the key. sft never calls the resolver,
+    # grpo only: they are the two callers that render the key. sft never calls the resolver,
     # so sweeping it here would assert agreement about a run that stays on zero-3 either way and
     # read as coverage the gate does not have.
     for model_id in MODELS:
         params_b = float(MODELS[model_id].params_b)
-        for algorithm in ("grpo", "opd"):
+        for algorithm in ("grpo",):
             need = float(model_required_vram_gb(model_id, algorithm))
             for gpu_type in ("L4", "L40S", "A100 SXM", "H200", "B200"):
                 vram = int(get_gpu_info(gpu_type).vram_gb)
@@ -243,24 +228,3 @@ def test_the_worker_and_the_allocator_cannot_disagree():
                     fired += int(allocator_says)
     assert checked, "the cross-check swept nothing"
     assert fired, "the gate never fired across the whole catalog: it would be dead code"
-
-
-def test_opd_renders_the_verl_key_and_defaults_to_zero3_when_absent(monkeypatch):
-    """The rendered hydra key is the one verl reads, and omission must mean ZeRO-3.
-
-    A config assembled without the gate has to render verl's own default rather than fall into the
-    memory-hungry strategy by omission.
-    """
-    from tests.test_opd_train import _config
-
-    config = _config()
-    config.pop("reshard_after_forward", None)
-    rendered = build_opd_overrides(config)
-    # hydra bools render lowercase, which is what verl's config parser reads.
-    assert "actor_rollout_ref.actor.fsdp_config.reshard_after_forward=true" in rendered, (
-        "an absent gate must render verl's zero-3 default"
-    )
-
-    config["reshard_after_forward"] = False
-    rendered = build_opd_overrides(config)
-    assert "actor_rollout_ref.actor.fsdp_config.reshard_after_forward=false" in rendered

@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import contextlib
 import gzip
 import io
 import json
@@ -2288,121 +2287,6 @@ def _thinking_env(monkeypatch, sdk_env, *, prompt_opens_thinking: bool):
     env.thinking = True
     env.prompt_opens_thinking = prompt_opens_thinking
     return env
-
-
-def test_opd_prepared_thinking_completion_steps_raw_and_grades_answer_only(
-    worker_context, monkeypatch
-):
-    from flash.engine.worker.train.opd.orchestration import prompt_preparation
-    from flash.engine.worker.train.opd.orchestration.state import _OpdRequest
-
-    class _Tokenizer:
-        pad_token = "<pad>"
-        eos_token = "<eos>"
-
-        def apply_chat_template(
-            self,
-            messages,
-            *,
-            tokenize,
-            add_generation_prompt,
-            enable_thinking,
-            preserve_thinking,
-        ):
-            assert messages == [{"role": "user", "content": "go"}]
-            assert add_generation_prompt is True
-            assert enable_thinking is True
-            assert preserve_thinking is False
-            if tokenize:
-                return [10, 11]
-            return "<|im_start|>assistant\n<think>\n"
-
-    class _TeacherClient:
-        def __init__(self, *_args):
-            pass
-
-    sdk_env = _SteppingMultiTurnEnv()
-    _install_fake_freesolo(monkeypatch, sdk_env=sdk_env)
-    from flash.envs.loading.adapter import FreesoloEnvironment
-
-    env = FreesoloEnvironment(sdk_env, "owner/env", source=None, contract_text="")
-    tokenizer = _Tokenizer()
-    monkeypatch.setattr(worker_context, "config", replace(worker_context.config, thinking=True))
-    monkeypatch.setattr(
-        prompt_preparation._worker_hf,
-        "load_tokenizer",
-        lambda model_id, revision: tokenizer,
-    )
-    monkeypatch.setattr(
-        prompt_preparation,
-        "_thinking_prefill_text",
-        lambda _tokenizer, context=None, **_context: "<think>\n",
-    )
-    monkeypatch.setattr(
-        prompt_preparation._backend,
-        "clamp_engine_len",
-        lambda requested, _limit: requested,
-    )
-    monkeypatch.setattr(
-        prompt_preparation._backend,
-        "model_max_position_embeddings",
-        lambda *_args: None,
-    )
-    monkeypatch.setattr(
-        prompt_preparation,
-        "validate_glue_template",
-        lambda *_args, **_kwargs: None,
-    )
-    monkeypatch.setattr(
-        prompt_preparation,
-        "liveness_heartbeat",
-        lambda *_args, context=None, **_kwargs: contextlib.nullcontext(),
-    )
-    import flash.engine.worker.teacher.client as teacher_client
-
-    monkeypatch.setattr(teacher_client, "TeacherClient", _TeacherClient)
-    request = _OpdRequest(
-        spec=None,
-        env=env,
-        multi_turn=True,
-        max_turns=2,
-        knobs=types.SimpleNamespace(
-            teacher_model="teacher",
-            max_length=128,
-            max_completion=8,
-        ),
-        model_id="model",
-        model_revision="revision",
-    )
-    prompt_preparation.prepare_prompts(
-        request,
-        [
-            (
-                {"id": "a", "input": "2+2?", "output": "4"},
-                [{"role": "user", "content": "go"}],
-            )
-        ],
-        False,
-        "capability",
-        "https://control.invalid",
-        context=worker_context,
-    )
-
-    example = {"id": "a", "input": "2+2?", "output": "4"}
-    state = env.new_rollout_state(example)
-    env.record_model_turn(state, _THINK_COMPLETION)
-    env.env_reply(state["messages"], state)
-    env._score_episode(example, state)
-
-    assert env.thinking is True
-    assert env.prompt_opens_thinking is True
-    handed, last_message = sdk_env.stepped[0]
-    assert handed == _THINK_COMPLETION
-    assert last_message == _THINK_COMPLETION
-    scored = sdk_env.scored[0]
-    assert str(scored) == "the answer is 4"
-    assert scored.raw == _THINK_COMPLETION
-    assert scored.thinking == "let me work it out"
 
 
 def test_multi_turn_grading_honors_a_prompt_opened_think_block(monkeypatch):

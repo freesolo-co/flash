@@ -149,19 +149,12 @@ def test_unset_max_length_still_resolves_the_real_rollout_length():
 
 
 # ---------------------------------------------------------------------------
-# expandable_segments vs verl's rollout allocator. verl's GRPO and OPD trainers both run a vLLM
+# expandable_segments vs verl's rollout allocator. verl's GRPO trainers both run a vLLM
 # rollout and leave rollout.enable_sleep_mode defaulted True, so the engine ALWAYS builds a
 # CuMemAllocator -- and CuMemAllocator asserts outright on "expandable_segments:True"
 # (vllm/device_allocator/cumem.py:132, pytorch#147851). The launcher's per-algorithm choice is now
 # the only route to that conf, so it carries the whole invariant.
 # ---------------------------------------------------------------------------
-def _worker_runtime_for(algorithm: str) -> dict[str, str] | None:
-    if algorithm != "opd":
-        return None
-    return {
-        "FLASH_PUBLIC_URL": "https://broker.example",
-        "FLASH_TEACHER_CAPABILITY": "capability-test-value",
-    }
 
 
 def _built_env_for(algorithm: str, phase: str) -> dict:
@@ -170,12 +163,12 @@ def _built_env_for(algorithm: str, phase: str) -> dict:
 
     spec = JobSpec.from_dict({"model": "m", "seed": 0, "algorithm": algorithm})
     assert spec.phase == phase, "phase is derived from algorithm; the mapping moved"
-    return build_worker_env(spec, runtime_secrets=_worker_runtime_for(algorithm))
+    return build_worker_env(spec)
 
 
-@pytest.mark.parametrize(("algorithm", "phase"), [("grpo", "rl"), ("opd", "opd")])
+@pytest.mark.parametrize(("algorithm", "phase"), [("grpo", "rl")])
 def test_verl_rollout_never_gets_expandable_segments(algorithm, phase):
-    """GRPO and OPD are the algorithms that build a vLLM rollout, so they are the ones whose
+    """GRPO are the algorithms that build a vLLM rollout, so they are the ones whose
     CuMemAllocator asserts on expandable_segments. SFT is covered below: it has no rollout and must
     KEEP the expandable conf."""
     env = _built_env_for(algorithm, phase)

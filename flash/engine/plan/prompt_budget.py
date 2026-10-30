@@ -1,4 +1,4 @@
-"""derived grpo/opd prompt-budget data reported before paid training."""
+"""derived grpo prompt-budget data reported before paid training."""
 
 from __future__ import annotations
 
@@ -7,15 +7,13 @@ from typing import Literal, NotRequired, TypedDict
 from flash.engine.plan.vram import (
     grpo_completion_len,
     grpo_rollout_seq_len,
-    opd_completion_len,
-    opd_rollout_seq_len,
 )
 
 
 class PromptBudget(TypedDict):
     """serialized prompt-budget descriptor carried by prepared and persisted runs."""
 
-    algorithm: Literal["grpo", "opd", "rl"]
+    algorithm: Literal["grpo", "rl"]
     engine_len: int
     max_completion: int
     prompt_budget: int
@@ -25,7 +23,7 @@ class PromptBudget(TypedDict):
 
 
 def rl_prompt_budget(spec, *, warm_start_context: int | None = None) -> PromptBudget | None:
-    """derive the pre-clamp prompt budget used by a grpo/opd worker.
+    """derive the pre-clamp prompt budget used by a grpo worker.
 
     the worker clamps ``engine_len`` to the model architecture before subtracting the completion
     allowance, so this control-plane value is an upper bound. sft returns ``None`` because it
@@ -38,17 +36,13 @@ def rl_prompt_budget(spec, *, warm_start_context: int | None = None) -> PromptBu
     raw_algorithm = getattr(spec, "algorithm", "")
     if not samples_on_policy(raw_algorithm):
         return None
-    algorithm = cast("Literal['grpo', 'opd', 'rl']", raw_algorithm)
+    algorithm = cast("Literal['grpo', 'rl']", raw_algorithm)
     train = spec.train
     authored = int(getattr(train, "max_context_tokens", 0) or 0)
     max_tokens = getattr(train, "max_completion_tokens", None)
     thinking = bool(getattr(spec, "thinking", False))
-    if algorithm == "opd":
-        max_completion = opd_completion_len(max_tokens, thinking)
-        engine_len = opd_rollout_seq_len(authored, max_tokens, thinking)
-    else:
-        max_completion = grpo_completion_len(max_tokens, thinking)
-        engine_len = grpo_rollout_seq_len(authored, max_tokens, thinking)
+    max_completion = grpo_completion_len(max_tokens, thinking)
+    engine_len = grpo_rollout_seq_len(authored, max_tokens, thinking)
     budget: PromptBudget = {
         "algorithm": algorithm,
         "engine_len": int(engine_len),

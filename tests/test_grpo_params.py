@@ -559,20 +559,6 @@ def test_grpo_rejects_single_generation_group_before_paid_worker() -> None:
     assert spec.train.group_size == 2
 
 
-def test_opd_allows_single_generation_group() -> None:
-    """OPD distils individual completions, so group_size=1 remains a valid smoke/test setting."""
-    spec = spec_from_dict(
-        {
-            "model": "Qwen/Qwen3.5-9B",
-            "algorithm": "opd",
-            "environment": {"id": "github:owner/repo@main:env/environment.py"},
-            "train": {"epochs": 1, "max_examples": 8, "group_size": 1},
-        },
-        run_id="opd-ok",
-    )
-    assert spec.train.group_size == 1
-
-
 def test_epochs_reject_non_integer_at_parse() -> None:
     # epochs must run through _train_int like every other integer knob: a
     # non-integer (e.g. epochs=1.5) must 400 at parse time, not slip through to the
@@ -714,7 +700,7 @@ def test_grpo_rejects_prompt_budget_at_parse_time_before_provisioning() -> None:
     with pytest.raises(ConfigError, match="prompt budget"):
         _spec({"max_context_tokens": 400, "max_completion_tokens": 512})
     # max_completion_tokens omitted -> the RL recipe default, per thinking, exactly as the worker
-    # resolves it; NOT the opd recipe's.
+    # resolves the recipe default.
     _spec({"max_context_tokens": RECIPE.rl.max_completion_len + 1})
     with pytest.raises(ConfigError, match="prompt budget"):
         _spec({"max_context_tokens": RECIPE.rl.max_completion_len})

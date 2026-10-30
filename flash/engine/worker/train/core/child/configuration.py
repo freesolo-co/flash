@@ -13,8 +13,6 @@ class FlashModelConfig(HFModelConfig):
     def __post_init__(self):
         from flash.engine.worker.train.core.child import registration  # noqa: F401
 
-        if self.runtime_options.get("algorithm") == "opd":
-            from flash.engine.worker.train.opd.child import loss  # noqa: F401
         super().__post_init__()
 
 

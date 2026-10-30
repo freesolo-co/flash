@@ -8,11 +8,11 @@ from typing import Any
 
 from flash.content.image_descriptors import MAX_IMAGES_PER_CONVERSATION
 
-ALGORITHMS = ("sft", "grpo", "opd")
+ALGORITHMS = ("sft", "grpo")
 
 # algorithms whose training step samples on-policy student completions, unlike fixed-dataset sft.
 # import ``samples_on_policy`` instead of hand-rolling algorithm tuples at each call site.
-_ON_POLICY_ALGORITHMS = frozenset({"grpo", "opd"})
+_ON_POLICY_ALGORITHMS = frozenset({"grpo"})
 _IMAGE_TRAINING_MODELS = frozenset(
     {
         "Qwen/Qwen3.5-9B",
@@ -23,7 +23,7 @@ _IMAGE_TRAINING_MODELS = frozenset(
 
 
 def supports_image_training(model: str | ModelInfo | None) -> bool:
-    """Return whether a curated model supports image-bearing SFT, GRPO, and OPD."""
+    """Return whether a curated model supports image-bearing SFT and GRPO."""
     model_id = model.id if isinstance(model, ModelInfo) else model
     return bool(model_id and model_id in _IMAGE_TRAINING_MODELS)
 
@@ -50,7 +50,7 @@ def optimizer_batch_key(algorithm: str) -> str:
     anything that is not recognisably rl.
     """
     algo = (algorithm or "").strip().lower()
-    return "prompts_per_step" if algo in ("grpo", "rl", "opd") else "batch_size"
+    return "prompts_per_step" if algo in ("grpo", "rl") else "batch_size"
 
 
 def normalize_algorithm(value: str) -> str:
@@ -144,9 +144,9 @@ class ModelInfo:
     # QUERY heads, from the checkpoint's own config. NOT derivable as hidden_size // head_dim: these
     # models decouple head_dim from that ratio (3.5-9b is hidden 4096 / head_dim 256 and has 16
     # heads). vllm tensor parallelism requires this to divide the rented card count -- grpo
-    # and opd hand that count to the rollout engine as tensor_model_parallel_size -- so a derived
+    # hands that count to the rollout engine as tensor_model_parallel_size -- so a derived
     # value silently caps runs on a number that is not the constraint. no longer a sequence-parallel
-    # constraint: all three algorithms pin ulysses off and shard by data.
+    # constraint: both algorithms pin ulysses off and shard by data.
     num_attention_heads: int = 0
     head_dim: int = 0
     linear_num_key_heads: int = 0
@@ -426,7 +426,7 @@ MODELS: dict[str, ModelInfo] = {
             (6144, 5120, 64),
             (17408, 5120, 64),
         ),
-        algos=("sft", "grpo", "opd"),
+        algos=("sft", "grpo"),
         min_vram_gb=80,
         grpo_min_vram_gb=142,  # colocated GRPO (two ~54GB copies) needs B200; triggers resident-peak sizing ~150GB
         sft_min_vram_gb=80,
@@ -663,8 +663,6 @@ def resolve_model(model_id: str, algorithm: str, model_revision: str = "") -> Mo
 def validate_model_for_algorithm(model_id: str, algorithm: str) -> ModelInfo:
     info = get_model(model_id)
     algo = normalize_algorithm(algorithm)
-    # Each algorithm gates on its own capability entry (sft/grpo/opd), so a model must
-    # explicitly opt into opd via its algos tuple — same contract as sft/grpo.
     if algo not in info.algos:
         allowed = ", ".join(info.algos)
         raise ValueError(f"{model_id} supports {allowed}, not {algo}")

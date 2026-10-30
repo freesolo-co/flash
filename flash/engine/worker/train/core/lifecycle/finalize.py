@@ -81,9 +81,6 @@ def write_train_meta(
     m = RunMetrics(
         arm=os.environ.get("FLASH_ARM", "modal"),
         phase=phase,
-        # Completed optimizer updates (opd passes step=opt_steps; sft/rl omit it -> None).
-        # _publish_training_completion reads metrics.step to carry the true step onto the
-        # terminal `done` heartbeat.
         step=step,
         seed=context.config.seed,
         model_id=model_id,

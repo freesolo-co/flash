@@ -8,7 +8,6 @@ import time
 import traceback
 from functools import partial
 
-import flash.engine.worker.entry.opd as opd_entry
 import flash.engine.worker.entry.rl as rl_entry
 import flash.engine.worker.io.heartbeat as heartbeat_io
 import flash.engine.worker.io.hf as hf_io
@@ -58,7 +57,6 @@ def _run_worker_mode(*, context: WorkerContext) -> None:
     modes = {
         "sft": partial(sft_entry.run_sft_train, context=context),
         "rl": partial(rl_entry.run_rl, context=context),
-        "opd": partial(opd_entry.run_opd, context=context),
     }
     handler = modes.get(context.config.run_mode)
     if handler is None:

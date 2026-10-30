@@ -26,7 +26,6 @@ from flash.runner.accounting import artifacts, weight_cache
 from flash.runner.lifecycle import preparation, reporting, state
 from flash.runner.lifecycle import status as status_ops
 from flash.runner.supervise import lifecycle as supervision
-from flash.teacher.retry_contract import OPD_RETRY_CONTRACT_VERSION
 
 logger = logging.getLogger(__name__)
 
@@ -121,25 +120,6 @@ def prepare_job(
                 if not any(name in configured for name in providers_for(gpu_type)):
                     raise ValueError(f"no configured provider can provision gpu.type {gpu_type!r}")
     info = catalog.resolve_model(spec.model, spec.algorithm, model_revision=spec.model_revision)
-    if spec.algorithm == "opd" and spec.train.structured_outputs:
-        # the generic serving preflight above validates the schema's SHAPE, but the
-        # constraint can still be one verl OPD deterministically refuses: a guidance-only
-        # json feature (format, multipleOf, uniqueItems) or a vllm MistralTokenizer model.
-        # that check lived only on the worker, so the user rented a gpu to receive a
-        # permanent validation failure. only the allocation-independent half runs here.
-        # the vocab-size comparison needs the ALLOCATED card count -- judging a shardable
-        # run on one card would reject a shape the allocator would have placed -- so it
-        # stays on the worker, which also keeps that check as defense in depth for any
-        # path that reaches training without passing through here.
-        from flash.engine.worker.train.opd.orchestration.validation import (
-            preflight_opd_structured_outputs,
-        )
-
-        preflight_opd_structured_outputs(
-            spec.train.structured_outputs,
-            model_id=spec.model,
-            model_revision=spec.model_revision,
-        )
     run_id = spec.run_id if (spec.run_id and spec.run_id != "local") else state.new_run_id()
     spec = JobSpec.from_dict({**_with_model_disk(spec, info), "run_id": run_id})
     spec = artifacts._assign_managed_hf_repo(spec)
@@ -157,17 +137,7 @@ def prepare_job(
     )
     # these read-only gates belong to preparation: every submit path passes here exactly once, and
     # callers receive the pinned worker spec before quoting, affordability, persistence, or allocation.
-    worker_spec, environment_ref_deferred = artifacts.preflight_validate_environment_ref(
-        worker_spec
-    )
-    from flash.content.multimodal import preflight_validate_image_opd
-    from flash.server.domain.teacher.broker import preflight_validate_managed_teacher
-
-    preflight_validate_image_opd(
-        worker_spec,
-        scan_packaged_environment=not environment_ref_deferred,
-    )
-    preflight_validate_managed_teacher(worker_spec)
+    worker_spec, _ = artifacts.preflight_validate_environment_ref(worker_spec)
     from flash.cost.currency import usd_amount
     from flash.cost.spec import estimate_for_spec
 
@@ -354,11 +324,6 @@ def _submit_prepared_job(
     save_kwargs = {
         "_run_deadline_at": status.created_at + float(public_spec.gpu.max_wall_seconds),
         "_next_attempt": 0,
-        "_opd_retry_contract_version": (
-            OPD_RETRY_CONTRACT_VERSION
-            if public_spec.algorithm == "opd"
-            else state._PRIVATE_VALUE_UNSET
-        ),
     }
     state._save_status(status, **save_kwargs)
     reporting._report_status(status)

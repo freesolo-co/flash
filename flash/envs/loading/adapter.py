@@ -34,11 +34,10 @@ from flash.envs.loading.loader import (
     managed_slug_to_github_ref,
 )
 from flash.envs.scoring.response import ScoredResponseText as _ScoredResponseText
-from flash.teacher.limits import (
-    OPD_DEFAULT_EPISODE_TURNS,
-    OPD_MAX_EPISODE_TURNS,
-    OPD_MIN_EPISODE_TURNS,
-)
+
+_MIN_EPISODE_TURNS = 8
+_DEFAULT_EPISODE_TURNS = 24
+_MAX_EPISODE_TURNS = 64
 
 _CANONICAL_INPUT_KEY = "input"
 _CANONICAL_OUTPUT_KEY = "output"
@@ -145,9 +144,9 @@ class FreesoloEnvironment(BaseEnvironment):
         """Batch-level turn ceiling: dataset-wide max of per-example budgets, clamped to [8, 64]."""
         if self._max_turns_cache is not None:
             return self._max_turns_cache
-        cap = OPD_MIN_EPISODE_TURNS
+        cap = _MIN_EPISODE_TURNS
         if self.multi_turn:
-            cap = OPD_DEFAULT_EPISODE_TURNS
+            cap = _DEFAULT_EPISODE_TURNS
             best: int | None = None
             for ex in self.dataset():
                 try:
@@ -157,7 +156,7 @@ class FreesoloEnvironment(BaseEnvironment):
                 if best is None or turns > best:
                     best = turns
             if best is not None:
-                cap = max(OPD_MIN_EPISODE_TURNS, min(OPD_MAX_EPISODE_TURNS, best))
+                cap = max(_MIN_EPISODE_TURNS, min(_MAX_EPISODE_TURNS, best))
         self._max_turns_cache = cap
         return cap
 

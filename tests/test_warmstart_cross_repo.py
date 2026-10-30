@@ -914,7 +914,6 @@ def test_recovery_revalidates_pinned_revision_after_default_branch_moves(monkeyp
     [
         ("rank", 32),
         ("alpha", 128),
-        ("algorithm", "opd"),
         ("environment", "other/environment"),
         ("gpu", "H200"),
         ("hf_repo", "private-owner/other-child"),
@@ -1060,8 +1059,8 @@ def test_persist_metrics_reports_only_sanitized_worker_metrics(monkeypatch, tmp_
     assert "private/child" not in json.dumps(persisted)
 
 
-@pytest.mark.parametrize("source_algorithm", ["sft", "grpo", "opd"])
-@pytest.mark.parametrize("target_algorithm", ["sft", "grpo", "opd"])
+@pytest.mark.parametrize("source_algorithm", ["sft", "grpo"])
+@pytest.mark.parametrize("target_algorithm", ["sft", "grpo"])
 def test_every_algorithm_pair_prepares_a_warm_start(
     monkeypatch, source_algorithm, target_algorithm
 ):

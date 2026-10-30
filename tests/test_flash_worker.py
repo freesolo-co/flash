@@ -69,41 +69,6 @@ def test_build_worker_env_ignores_alloc_conf_override(monkeypatch):
     assert "expandable_segments" not in env["PYTORCH_CUDA_ALLOC_CONF"]
 
 
-def test_build_worker_env_opd_uses_sleep_safe_allocator(monkeypatch):
-    """OPD must get the sleep-safe NON-expandable allocator conf, like GRPO.
-
-    This inverts an earlier regression test, and the inversion is the point. Under trl, OPD drove its
-    own HF generate loop with no sleep engine, so the anti-fragmentation expandable allocator was
-    right. run_opd now delegates to verl unconditionally, and verl leaves rollout.enable_sleep_mode
-    defaulted True -- so the engine always builds a CuMemAllocator, which asserts outright on
-    expandable_segments (vllm cumem.py, pytorch#147851). An OPD run with the old conf dies before
-    step 1. SFT keeps expandable: its verl trainer is pure FSDP and builds no rollout at all.
-    """
-    from flash.core.spec import JobSpec, TrainSpec
-    from flash.providers._lifecycle.net.worker import build_worker_env
-
-    monkeypatch.delenv("PYTORCH_CUDA_ALLOC_CONF", raising=False)
-    monkeypatch.delenv("PYTORCH_ALLOC_CONF", raising=False)
-    opd_spec = JobSpec(
-        model="Qwen/Qwen3.5-9B",
-        algorithm="opd",
-        train=TrainSpec(epochs=1, max_examples=10, hf_repo="owner/runs"),
-        seed=0,
-    )
-    env = build_worker_env(
-        opd_spec,
-        runtime_secrets={
-            "FLASH_PUBLIC_URL": "https://broker.example",
-            "FLASH_TEACHER_CAPABILITY": "capability-test-value",
-        },
-    )
-    assert "expandable_segments" not in env["PYTORCH_CUDA_ALLOC_CONF"]
-    assert "expandable_segments" not in env["PYTORCH_ALLOC_CONF"]
-    # GRPO still ships the sleep-safe non-expandable conf.
-    grpo_env = build_worker_env(_spec())
-    assert "expandable_segments" not in grpo_env["PYTORCH_CUDA_ALLOC_CONF"]
-
-
 def test_build_worker_env_does_not_forward_judge_creds(monkeypatch):
     """flash is fully managed: reward-judge creds and the judge-model id are NOT hardcoded
     control-plane forwards. An env that needs a judge provider key declares it as an
@@ -127,76 +92,6 @@ def test_build_worker_env_forwards_github_only_for_private_vcs_pip(monkeypatch):
     env = build_worker_env(_spec())
     assert env["GITHUB_TOKEN"] == "ghp-secret"
     assert "GIT_ASKPASS" not in env
-
-
-def test_build_worker_env_forwards_only_managed_teacher_capability_for_opd(monkeypatch):
-    """opd receives bounded broker transport while provider credentials remain control-plane-only."""
-    from flash.core.spec import JobSpec, TrainSpec
-    from flash.providers._lifecycle.net.worker import build_worker_env
-
-    monkeypatch.setenv("PARASAIL_API_KEY", "platform-managed-parasail")
-    opd_spec = JobSpec(
-        model="Qwen/Qwen3.5-9B",
-        algorithm="opd",
-        train=TrainSpec(epochs=1, max_examples=10, hf_repo="owner/runs"),
-        seed=0,
-    )
-    env = build_worker_env(
-        opd_spec,
-        runtime_secrets={
-            "FLASH_PUBLIC_URL": "https://broker.example",
-            "FLASH_TEACHER_CAPABILITY": "capability-test-value",
-        },
-    )
-    assert env["FLASH_PUBLIC_URL"] == "https://broker.example"
-    assert env["FLASH_TEACHER_CAPABILITY"] == "capability-test-value"
-    assert "PARASAIL_API_KEY" not in env
-    grpo = build_worker_env(_spec())
-    assert "FLASH_PUBLIC_URL" not in grpo
-    assert "FLASH_TEACHER_CAPABILITY" not in grpo
-
-
-def test_build_worker_env_does_not_accept_legacy_teacher_broker_url():
-    from flash.core.spec import JobSpec, TrainSpec
-    from flash.providers._lifecycle.net.worker import build_worker_env
-
-    opd_spec = JobSpec(
-        model="Qwen/Qwen3.5-9B",
-        algorithm="opd",
-        train=TrainSpec(epochs=1, max_examples=10, hf_repo="owner/runs"),
-        seed=0,
-    )
-
-    with pytest.raises(RuntimeError, match="control-panel teacher transport is missing"):
-        build_worker_env(
-            opd_spec,
-            runtime_secrets={
-                "FLASH_TEACHER_BROKER_URL": "https://broker.example",
-                "FLASH_TEACHER_CAPABILITY": "capability-test-value",
-            },
-        )
-
-
-def test_build_worker_env_rejects_managed_teacher_byo_names():
-    from flash.core.spec import EnvironmentSpec, JobSpec, TrainSpec
-    from flash.providers._lifecycle.net.worker import build_worker_env
-
-    opd_spec = JobSpec(
-        model="Qwen/Qwen3.5-9B",
-        algorithm="opd",
-        environment=EnvironmentSpec(id="org/env", secrets=("PARASAIL_API_KEY",)),
-        train=TrainSpec(epochs=1, max_examples=10, hf_repo="owner/runs"),
-        seed=0,
-    )
-    with pytest.raises(ValueError, match="managed teacher credential names"):
-        build_worker_env(
-            opd_spec,
-            runtime_secrets={
-                "PARASAIL_API_KEY": "byo-parasail-key",
-                "FLASH_PUBLIC_URL": "https://broker.example",
-                "FLASH_TEACHER_CAPABILITY": "capability-test-value",
-            },
-        )
 
 
 def test_build_worker_env_wandb_is_user_runtime_secret_not_control_plane_env(monkeypatch):
@@ -503,7 +398,7 @@ def test_worker_and_control_plane_agree_on_the_error_artifact_name():
     from flash.engine.worker.io.hf import error_artifact_name as worker_name
     from flash.providers.artifacts.hf import error_artifact_name as plane_name
 
-    for phase in ("sft", "rl", "opd"):
+    for phase in ("sft", "rl"):
         for attempt in (0, 1, 7):
             assert worker_name(phase, attempt) == plane_name(phase, attempt)
 
@@ -663,7 +558,6 @@ def test_sft_train_keeps_the_optimizations_that_survived_the_trl_deletion():
     assert "grad_checkpointing_on(" in train_src
     assert "grpo_use_reentrant(" in train_src
     assert "linear_warmup_scheduler" in engine_src
-    assert "optimizer = super()._build_optimizer(module)" in engine_src
 
 
 @pytest.fixture

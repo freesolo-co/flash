@@ -172,10 +172,10 @@ def test_a_failed_pinned_lookup_is_not_cached(monkeypatch):
     )
 
 
-def test_ranking_sizing_and_quote_read_the_same_optimizer_batch_key():
+def test_ranking_sizing_and_quote_read_the_same_optimizer_batch_key(monkeypatch):
     """The three readers of the optimizer batch must agree on its per-algorithm name.
 
-    `[train] batch_size` is sft-only and the schema REJECTS it for grpo/opd, so a reader that looks
+    `[train] batch_size` is sft-only and the schema REJECTS it for grpo, so a reader that looks
     for the wrong name finds nothing and falls back to the recipe default -- a plausible number, not
     an error. That makes disagreement silent: ranking would pick hardware for one batch while
     sizing and the persisted quote used another.
@@ -188,7 +188,6 @@ def test_ranking_sizing_and_quote_read_the_same_optimizer_batch_key():
     from flash.providers.core.base import run_config_for_ranking
 
     assert optimizer_batch_key("grpo") == "prompts_per_step"
-    assert optimizer_batch_key("opd") == "prompts_per_step"
     assert optimizer_batch_key("rl") == "prompts_per_step"  # phase-name alias
     assert optimizer_batch_key("GRPO") == "prompts_per_step"  # callers pass it unnormalized
     assert optimizer_batch_key("sft") == "batch_size"
@@ -206,12 +205,21 @@ def test_ranking_sizing_and_quote_read_the_same_optimizer_batch_key():
     assert ranked.train_knobs()["prompts_per_step"] == 64
     assert "batch_size" not in ranked.train_knobs()
 
-    # sizing must move off the recipe default for the same authored value
-    sized = model_required_vram_gb(model, "opd", train=authored)
-    defaulted = model_required_vram_gb(model, "opd", train={"max_completion_tokens": 512})
-    assert sized > defaulted, (
-        f"an authored prompts_per_step must change sizing; got {sized} vs default {defaulted}"
-    )
+    # GRPO's per-device peak need not change with the optimizer batch, but the authored
+    # batch must still reach sizing under the correct key.
+    from flash.engine.plan import vram
+
+    batches = []
+    original = vram.estimate_vram_gb
+
+    def capture_batch(*args, **kwargs):
+        batches.append(kwargs["batch_size"])
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(vram, "estimate_vram_gb", capture_batch)
+    model_required_vram_gb(model, "grpo", train=authored)
+    assert batches
+    assert all(batch == 64 for batch in batches)
 
     # sft keeps its own name end to end
     sft_ranked = run_config_for_ranking(model, "sft", train={"batch_size": 8})

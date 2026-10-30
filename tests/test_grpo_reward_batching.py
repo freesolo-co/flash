@@ -67,18 +67,11 @@ def _assert_batcher_empty(batcher):
         assert batcher._in_flight == []
 
 
-@pytest.mark.parametrize("failure_mode", ["score_base_exception", "error_wrapper_exception"])
-def test_score_batcher_abnormal_consumer_exit_settles_claimed_waiter(failure_mode):
+def test_score_batcher_abnormal_consumer_exit_settles_claimed_waiter():
     score_error = SystemExit("scorer exited")
-    wrapper_error = RuntimeError("error wrapper failed")
 
     def score_batch(_requests):
-        if failure_mode == "score_base_exception":
-            raise score_error
-        raise ValueError("scoring failed")
-
-    def wrap_batch_error(_error):
-        raise wrapper_error
+        raise score_error
 
     batcher = ScoreBatcher(
         score_batch,
@@ -86,11 +79,10 @@ def test_score_batcher_abnormal_consumer_exit_settles_claimed_waiter(failure_mod
         flush_wait_s=0.01,
         label="test",
         thread_name="test-abnormal-exit-score-batcher",
-        wrap_batch_error=wrap_batch_error if failure_mode == "error_wrapper_exception" else None,
     )
     waiter = score_batcher._Waiter("request", enqueued_at=0.0, label="test")
     batcher._pending.append(waiter)
-    escaped = score_error if failure_mode == "score_base_exception" else wrapper_error
+    escaped = score_error
 
     with pytest.raises(type(escaped), match=str(escaped)) as raised:
         batcher._run()
@@ -127,7 +119,6 @@ def test_score_batcher_claim_is_atomic_against_close():
         flush_wait_s=0.01,
         label="test",
         thread_name=consumer_name,
-        cancel_undispatched_on_close=True,
     )
     condition = _ConditionContentionProbe(closer_name)
     batcher._condition = condition

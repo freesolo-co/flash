@@ -1,14 +1,4 @@
-"""child-side multi-turn rollout primitives shared by the OPD and GRPO verl agent loops.
-
-The parent and packaged trainer import these primitives directly. Image decoding loads Pillow
-only for validated image prompts and replies.
-
-everything here is algorithm-neutral: turning an environment reply into the exact tokens the chat
-template would have produced, deciding whether an assistant turn terminated or was truncated, and
-the two small accounting helpers the loops share. what is NOT here is either loop's body -- OPD
-distils each turn against a teacher and returns one output per turn, GRPO scores the episode and
-returns one output per episode, and those differences are the point.
-"""
+"""Child-side multi-turn rollout, tokenization, and image primitives for GRPO."""
 
 from __future__ import annotations
 
@@ -687,10 +677,6 @@ def trim_trailing_stop(
     at.
     """
     ids = [int(token_id) for token_id in response_ids]
-    # Pick the LONGEST configured stop that is a trailing match (the earliest stop boundary in the
-    # text). Overlapping delimiters like ["\n", "\n\n"] would otherwise trim only the first-listed
-    # shorter suffix off a "\n\n" tail, leaving one newline for the teacher to score/distil; taking
-    # the longest match removes the whole delimiter in one shot regardless of config order.
     stop = max(
         (value for value in stop_sequences if value and stop_text.endswith(value)),
         key=len,
@@ -706,11 +692,6 @@ def trim_trailing_stop(
     kept = len(ids)
     while kept > 0 and len(tokenizer.decode(ids[:kept], skip_special_tokens=False)) > keep_length:
         kept -= 1
-    # Return the kept ids decoded WITHOUT special tokens -- the teacher/alignment text. Decoding the
-    # kept ids (not slicing stop_text at keep_length) keeps the teacher-scored text and the student
-    # ids identical even when the stop starts INSIDE the final sampled token (that token decodes to
-    # e.g. "B</answer>"): the whole token is excluded from `kept`, so the fused "B" is dropped rather
-    # than left dangling to desync the loss alignment / token count.
     return ids[:kept], tokenizer.decode(ids[:kept], skip_special_tokens=True)
 
 
@@ -807,31 +788,6 @@ async def run_executor_call(loop, callback):
         with contextlib.suppress(Exception):
             await asyncio.shield(task)
         raise
-
-
-def multi_modal_image_count(multi_modal_data) -> int:
-    """how many images a verl multimodal payload carries.
-
-    single-turn and multi-turn both report this count to the bridge, which compares it against the
-    frozen parent prompt. two counters would let the two paths disagree about the same payload, so
-    this is the one definition: verl carries "image" (singular) for a single-image row and "images"
-    for a list, and a bare non-sequence value under either key is one image.
-    """
-    if not multi_modal_data:
-        return 0
-    if not isinstance(multi_modal_data, dict):
-        raise TypeError("verl multimodal data must be a mapping")
-    images = multi_modal_data.get("images")
-    if images is None:
-        images = multi_modal_data.get("image")
-    if images is None:
-        return 0
-    if not isinstance(images, (list, tuple)):
-        return 1
-    try:
-        return len(images)
-    except TypeError as error:
-        raise TypeError("verl multimodal images must be a sized collection") from error
 
 
 class EpisodePrompt:

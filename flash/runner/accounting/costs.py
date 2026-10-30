@@ -80,7 +80,7 @@ def _pinned_offline_allocation(provider: str, gpu_type: str, gpu_count: int):
 def _spec_pinned_to_horizon(spec, steps: int):
     """``spec`` with its update horizon stated as ``steps``, for pricing a run that already ran.
 
-    ``max_steps`` is the one field that states a grpo/opd horizon outright, so pinning it is what
+    ``max_steps`` is the one field that states a grpo horizon outright, so pinning it is what
     lets a completed step count stand in for the prompt-pool size the estimator would otherwise
     have to derive one from. floored at 1 because ``RunConfig`` rejects a zero horizon; the callers
     all return $0 for a zero-step cancel before the estimate is reached, so the floor never prices
@@ -119,7 +119,7 @@ def charge_usd_for_spec(
             cfg = run_config_from_spec(spec)
         except UnknownPromptPoolSize:
             # a cancel prices work that already happened, so it must not need a PREDICTED horizon.
-            # grpo/opd derive theirs from a stated prompt-pool size and refuse to guess without one,
+            # grpo derive theirs from a stated prompt-pool size and refuse to guess without one,
             # which would make an unbounded run unpriceable at exactly the moment its cost is known
             # exactly. the completed count answers that question with the measurement instead --
             # spec_steps reads max_steps first, so the pool size is never consulted. only the
@@ -368,7 +368,7 @@ def actual_steps_run(status: RunStatus) -> int:
     step = hb.get("step")
     if isinstance(step, (int, float)) and step > 0:
         return int(step)
-    # training started (rl_step/sft_step/opd_step) but no completed step yet means mid-first-step.
+    # training started (rl_step/sft_step_step) but no completed step yet means mid-first-step.
     if hb.get("stage") in state._TRAINING_STAGES:
         return 1
     return 0

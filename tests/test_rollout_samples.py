@@ -103,16 +103,7 @@ def test_build_rollout_sample_replaces_non_text_multimodal_parts() -> None:
     assert "do-not-log" not in sample["prompt_tail"]
 
 
-def test_build_rollout_sample_carries_loss_scalar_for_opd() -> None:
-    sample = build_rollout_sample("prompt", "student answer", loss=0.4213, generated_at_step=3)
-
-    assert sample["loss"] == 0.4213
-    assert "reward" not in sample
-    assert sample["completion"] == "student answer"
-    assert sample["generated_at_step"] == 3
-
-
-@pytest.mark.parametrize("scalar", ["reward", "loss"])
+@pytest.mark.parametrize("scalar", ["reward"])
 @pytest.mark.parametrize("value", [float("nan"), float("inf"), float("-inf")])
 def test_a_non_finite_scalar_is_omitted_so_the_heartbeat_stays_parseable(scalar, value) -> None:
     """A diverged step must not publish a scalar json cannot represent.
@@ -150,20 +141,6 @@ def test_select_rollout_samples_hard_caps_at_three() -> None:
     selected = select_rollout_samples(triples, generated_at_step=1)
 
     assert len(selected) == 3
-
-
-def test_select_rollout_samples_loss_scalar_for_opd() -> None:
-    triples = [
-        ([{"role": "user", "content": "q-a"}], "answer-a", 0.11),
-        ([{"role": "user", "content": "q-b"}], "answer-b", 0.22),
-    ]
-
-    selected = select_rollout_samples(triples, generated_at_step=5, scalar="loss")
-
-    assert [sample["loss"] for sample in selected] == [0.11, 0.22]
-    assert all("reward" not in sample for sample in selected)
-    assert [sample["prompt_tail"] for sample in selected] == ["user: q-a", "user: q-b"]
-    assert all(sample["generated_at_step"] == 5 for sample in selected)
 
 
 def test_select_rollout_samples_rejects_unknown_scalar() -> None:
@@ -256,29 +233,6 @@ def test_format_heartbeat_renders_reward_samples_after_reward_metrics() -> None:
     )
     assert _format_heartbeat({"stage": "rl_step", "reward": 0.6}) == (
         "worker: stage=rl_step reward=0.600"
-    )
-
-
-def test_format_heartbeat_renders_opd_loss_samples() -> None:
-    heartbeat = {
-        "stage": "opd_step",
-        "step": 3,
-        "loss": 0.4213,
-        "sampled_completions": [
-            {
-                "prompt_tail": "distil prompt",
-                "completion": "student answer",
-                "loss": 0.4213,
-                "generated_at_step": 3,
-            }
-        ],
-    }
-
-    assert _format_heartbeat(heartbeat) == (
-        "worker: stage=opd_step step=3 loss=0.4213\n"
-        "  sample 1 loss=0.4213 step=3\n"
-        "    prompt: distil prompt\n"
-        "    completion: student answer"
     )
 
 

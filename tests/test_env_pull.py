@@ -489,14 +489,14 @@ def test_cmd_env_pull_whole_env(monkeypatch, tmp_path):
 
 def test_cmd_env_pull_whole_env_preserves_toml_configs(monkeypatch, tmp_path):
     sft_config = b"[training]\nalgorithm = 'sft'\n"
-    opd_config = b"[teacher]\nthinking = true\n"
+    custom_config = b"[train]\nthinking = true\n"
     _patch_client(
         monkeypatch,
         _package_tarball(
             {
                 "environment.py": b"# env\n",
                 "configs/sft.toml": sft_config,
-                "configs/nested/opd.toml": opd_config,
+                "configs/nested/experiment.toml": custom_config,
             }
         ),
     )
@@ -506,7 +506,7 @@ def test_cmd_env_pull_whole_env_preserves_toml_configs(monkeypatch, tmp_path):
 
     assert rc == 0
     assert (dest / "configs" / "sft.toml").read_bytes() == sft_config
-    assert (dest / "configs" / "nested" / "opd.toml").read_bytes() == opd_config
+    assert (dest / "configs" / "nested" / "experiment.toml").read_bytes() == custom_config
 
 
 def test_cmd_env_pull_whole_env_refuses_nonempty_dest_without_force(monkeypatch, tmp_path):

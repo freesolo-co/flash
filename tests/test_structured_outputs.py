@@ -156,13 +156,8 @@ def test_invalid_forms_are_config_errors(bad, hint):
 
 def test_sft_rejects_structured_outputs():
     # SFT never generates; a constraint there is a silent no-op -> parse-time rejection.
-    with pytest.raises(ConfigError, match="only applies to rollout algorithms"):
+    with pytest.raises(ConfigError, match="only applies to grpo"):
         spec_from_dict(_raw({"json": _SCHEMA}, algorithm="sft"), run_id="so-sft")
-
-
-def test_opd_accepts_structured_outputs():
-    spec = spec_from_dict(_raw({"json": _SCHEMA}, algorithm="opd"), run_id="so-opd")
-    assert json.loads(spec.train.structured_outputs) == {"json": _SCHEMA}
 
 
 # ---------------------------------------------------------------- roundtrip + worker decode

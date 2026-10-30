@@ -42,23 +42,16 @@ _HB_SETUP_LIVENESS_STAGES = frozenset(
         # the one-shot transition itself is exempted in ``heartbeat`` (see _HB_MODEL_LOAD_STAGES):
         # only the repeated liveness ticks are what this throttle is for.
         "sft_model_load",
-        "opd_model_load",
         "sft_data_loading",
         "rl_data_loading",
         "rl_adapter_loading",
         "sft_pretokenizing",
         "sft_configuring",
         "rl_configuring",
-        "opd_configuring",
-        "opd_filtering_prompts",
-        "opd_prompt_scan",
-        "opd_image_prep",
         "sft_initializing",
         "rl_initializing",
-        "opd_initializing",
         "sft_finalizing",
         "rl_finalizing",
-        "opd_finalizing",
     }
 )
 # synchronous checkpoint uploads freeze global_step (dev #445), so checkpoint_uploading must
@@ -67,19 +60,12 @@ _HB_UPLOAD_LIVENESS_STAGES = frozenset({"checkpoint_uploading"})
 # Liveness stages that ride the tighter setup-liveness upload interval (setup + mid-train upload).
 _HB_TIGHT_LIVENESS_STAGES = _HB_SETUP_LIVENESS_STAGES | _HB_UPLOAD_LIVENESS_STAGES
 
-# latest per-step GRPO backlog, exposed so a top-level error heartbeat can preserve it
-# for `flash runs log -f` when a short run raises before the throttled rl_step ping committed
-# throttle these stages to protect the hf repository commit budget; terminal transitions are never throttled.
-# opd_filtering_prompts emits a real heartbeat on each scan tick, while opd_prompt_scan and
-# opd_image_prep emit one when progress advances. opd_finalizing emits one on every keepalive tick.
-# without throttling, these opd stages can make roughly 120 commit attempts per hour. tight-liveness,
-# per-step training, and checkpoint_uploading keepalive stages share the same throttle.
-_HB_THROTTLED_STAGES = _HB_TIGHT_LIVENESS_STAGES | frozenset({"rl_step", "sft_step", "opd_step"})
+_HB_THROTTLED_STAGES = _HB_TIGHT_LIVENESS_STAGES | frozenset({"rl_step", "sft_step"})
 # stages whose one-shot transition must always commit even though their liveness ticks are
 # throttled: the transition is the only record that the run reached the stage, and it is emitted
 # right after a download that has been pinging throughout, so the throttle would almost always
 # swallow it. the wrap that follows re-emits with liveness=True and stays throttled.
-_HB_MODEL_LOAD_STAGES = frozenset({"sft_model_load", "opd_model_load"})
+_HB_MODEL_LOAD_STAGES = frozenset({"sft_model_load"})
 _HB_SUCCESS_TERMINAL_STAGES = frozenset({"done", "already_done"})
 # 600s -> ~6 commits/hr; keeps stall detector alive without hitting the HF commit cap.
 _HB_TERMINAL_ONLY_INTERVAL_S = 600.0

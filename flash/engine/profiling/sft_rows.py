@@ -143,7 +143,7 @@ def sft_finished_before_expected_steps(final_step: int, update_horizon: int) -> 
     the horizon caps every run (trainer.total_training_steps in _prepare_sft_child), so a fresh run
     lands exactly on it. a resume from a checkpoint past a lowered horizon does zero new steps yet
     holds a fully-trained adapter (final_step >= horizon). fail loudly only on a genuine under-run,
-    mirroring grpo (steps_run < steps) and opd (opt_steps < steps).
+    mirroring grpo (steps_run < steps) (opt_steps < steps).
     """
     return int(final_step) < int(update_horizon)
 

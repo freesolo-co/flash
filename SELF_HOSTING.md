@@ -96,10 +96,6 @@ leaves the machine: `flash login` and every command after it send `FREESOLO_INTE
 boundary and owns every run - anyone who observes it on the wire can submit billed GPU jobs and
 read or cancel your existing ones. Plaintext `http://` is for loopback only (`http://127.0.0.1:8080`
 during local development); `flash login` warns when you give it a non-loopback `http://` URL.
-On-policy distillation additionally needs the address a
-**rented GPU worker** reaches it at, which is usually a different, public one - set
-`FLASH_PUBLIC_URL` on the plane for that (see [optional pieces](#optional-pieces)). `sft` and
-`grpo` do not need it.
 
 Every run config needs a top-level `project` uuid - it groups runs and is required in
 standalone mode too (see [project ids](#what-flashstandalone1-does)). Any uuid works
@@ -251,7 +247,7 @@ python -m flash.providers.artifacts.weight_cache
 
 `--teardown` deletes this cache Volume. Stop users of the cache before deleting it.
 
-The training engine retains SFT, GRPO and OPD; LoRA/QLoRA, packing, FlashAttention, FP8 KV cache,
+The training engine retains SFT and GRPO; LoRA/QLoRA, packing, FlashAttention, FP8 KV cache,
 compiled kernel images, multi-GPU sharding, checkpoint streaming and resume use the same worker
 implementation. GPU selection now uses Modal's supported card counts and estimated GPU, CPU and
 memory rates. Cross-cloud fallback and marketplace offer selection have been removed. Modal
@@ -361,7 +357,7 @@ An entry is a `ModelInfo`. Copy the nearest existing one and correct it against 
 | `vocab_size`                                                        | Drives the logits term, which dominates SFT peak memory on a large vocabulary.           |
 | `num_layers`, `hidden_size`, `num_key_value_heads`, `head_dim`      | The KV-cache geometry. Wrong here means a run that OOMs on the card it was sold.         |
 | `num_attention_layers`, `num_linear_attention_layers`, `linear_*`   | Hybrid/linear-attention geometry, if the model has any.                                  |
-| `algos`                                                             | Which of SFT/GRPO/OPD you are vouching for.                                              |
+| `algos`                                                             | Which of SFT/GRPO you are vouching for.                                              |
 | `min_vram_gb`, `min_disk_gb`, `grpo_min_vram_gb`, `sft_min_vram_gb` | Allocation floors. The generic estimate is a starting point, not a substitute.           |
 | `thinking`                                                          | `none`, `always`, or `hybrid` - whether the chat template opens a `<think>` block.       |
 | `serving`                                                           | Serving capacity, if you intend to serve the adapter. Omit to train only.                |
@@ -413,8 +409,6 @@ without `FLASH_STANDALONE` and set `FREESOLO_BASE_URL` to point at it.
 | Variable               | Effect if unset                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
 | ---------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `GITHUB_TOKEN`         | Environments in **private** GitHub repos cannot be fetched and `flash env push` is unavailable. Environments in **public** GitHub repos still work. Warns at startup.                                                                                                                                                                                                                                                                                                      |
-| `PARASAIL_API_KEY`     | On-policy distillation (`opd`) submissions fail before GPU allocation. Set it on the control plane; workers never receive it. `sft` and `grpo` do not use it.                                                                                                                                                                                                                                                                                                              |
-| `FLASH_PUBLIC_URL`     | On-policy distillation (`opd`) submissions fail before GPU allocation. This is **this plane's own public HTTPS origin** - the address a rented GPU worker dials back to reach the teacher broker. It is not the same setting as the client's `FLASH_API_URL` / `--api-url`, which may point at a private address (`http://your-plane:8080`, a tunnel, a VPN) that no worker can resolve; set this one to an origin reachable from outside. `sft` and `grpo` do not use it. |
 | `FREESOLO_SERVING_URL` | In standalone mode `flash models deploy`/`undeploy`/`chat` **refuse to run** rather than send your plane's key to Freesolo's serving app - and refuse the same way if you point it AT that app. Training is unaffected. See below.                                                                                                                                                                                                                                         |
 
 ## Serving

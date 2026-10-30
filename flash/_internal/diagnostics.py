@@ -14,9 +14,6 @@ _SECRET_KEY_RE = re.compile(
 _BEARER_RE = re.compile(r"(?i)\bbearer\s+[A-Za-z0-9._~+/=-]+")
 _SECRET_ENV_SUFFIXES = ("_API_KEY", "_TOKEN", "_SECRET", "_PASSWORD")
 
-# comma-separated env-variable names whose values are secrets regardless of naming shape: declared
-# runtime secrets can carry any name (AWS_SECRET_ACCESS_KEY, FLASH_TEACHER_CAPABILITY, ...), so the
-# control plane lists them explicitly in the worker env instead of relying on the suffix heuristic.
 SECRET_ENV_KEYS_ENV = "FLASH_SECRET_ENV_KEYS"
 
 # multiline secrets may appear only partially in truncated logs. register long component lines as

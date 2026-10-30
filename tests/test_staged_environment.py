@@ -622,7 +622,6 @@ def test_initial_lifecycle_defers_transient_staging_before_training(monkeypatch,
         "_run_training",
         lambda *_args, **_kwargs: calls.__setitem__("train", calls["train"] + 1),
     )
-    monkeypatch.setattr("flash.content.multimodal.preflight_validate_image_opd", lambda _spec: None)
     monkeypatch.setattr(lifecycle.time, "sleep", lambda _delay: None)
 
     lifecycle._run_job(unstaged)
@@ -655,7 +654,6 @@ def test_staging_deadline_prevents_training_and_provider_allocation(monkeypatch,
         "_run_training",
         lambda *_args, **_kwargs: calls.__setitem__("train", calls["train"] + 1),
     )
-    monkeypatch.setattr("flash.content.multimodal.preflight_validate_image_opd", lambda _spec: None)
 
     with pytest.raises(RuntimeError, match="deadline exhausted during environment staging"):
         lifecycle._run_job(unstaged)

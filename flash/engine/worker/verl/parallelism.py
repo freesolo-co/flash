@@ -6,7 +6,7 @@ catalog rather than of any one trainer.
 
 from __future__ import annotations
 
-# Ulysses sequence-parallel width for EVERY algorithm (sft, grpo, opd): off, always.
+# Ulysses sequence-parallel width for EVERY algorithm (sft, grpo): off, always.
 #
 # Every catalog model is a Qwen3.5/3.6 GatedDeltaNet hybrid: linear attention plus a causal conv on
 # most layers, whose state runs ALONG the sequence. verl gathers the full sequence only inside

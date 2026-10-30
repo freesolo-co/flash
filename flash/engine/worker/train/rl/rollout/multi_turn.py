@@ -307,7 +307,6 @@ class MultiTurnBridge:
         A regression that ended every episode after one turn still produces finite gradients, a
         nonzero adapter delta, and complete artifacts -- every existing gate stays green while the
         environment's multi-turn contract is silently dead. These counters make that visible.
-        OPD already publishes the same pair as `episodes_seen` / `mt_turn_records`.
         """
         with self._lock:
             episodes = self._scored_episodes
@@ -482,7 +481,6 @@ class MultiTurnBridge:
             response_ids = [int(token_id) for token_id in payload.get("response_ids", [])]
             completion_text = str(payload.get("completion_text") or "")
             session["next_turn"] += 1
-            # an unusable turn is terminal and must not be shown to the env or teacher.
             if bool(payload.get("truncated")) or str(payload.get("skip_reason") or ""):
                 session["aborted_turn"] = {
                     "role": "assistant",
@@ -508,8 +506,6 @@ class MultiTurnBridge:
             replies = self._env_call("env_reply", list(state.get("messages") or ()), state)
             terminal = bool(self._env_call("rollout_done", state, self._max_turns))
             if terminal:
-                # terminal replies remain available to environment scoring but are never actor or
-                # teacher context, so their media is deliberately neither normalized nor transported.
                 session["required_prefix"] = next_prefix
                 return self._step_response(
                     session,

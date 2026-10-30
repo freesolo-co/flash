@@ -609,7 +609,7 @@ def test_env_setup_scaffolds_the_github_form_on_a_self_hosted_plane(monkeypatch,
 
     written = _scaffold(monkeypatch, tmp_path, "https://plane.example.test")
 
-    for name in ("sft.toml", "rl.toml", "opd.toml"):
+    for name in ("sft.toml", "rl.toml"):
         assert 'id = "github:OWNER/REPO@REF:environment.py"' in written[name], name
         assert "flash env push --project" not in written[name], name
         # the id must PARSE, or the scaffold just trades one unusable id for another:
@@ -639,7 +639,7 @@ def test_scaffolded_ref_is_a_placeholder_not_a_branch_name(monkeypatch, tmp_path
     """
     written = _scaffold(monkeypatch, tmp_path, "https://plane.example.test")
 
-    for name in ("sft.toml", "rl.toml", "opd.toml", "TRAINING.md"):
+    for name in ("sft.toml", "rl.toml", "TRAINING.md"):
         assert "OWNER/REPO@main" not in written[name], (
             f"{name} scaffolds a concrete branch where a placeholder belongs"
         )
@@ -657,7 +657,7 @@ def test_env_setup_keeps_the_push_workflow_on_the_managed_plane(monkeypatch, tmp
     for index, api_url in enumerate(("https://flash.freesolo.co", None)):
         written = _scaffold(monkeypatch, tmp_path / f"case{index}", api_url)
 
-        for name in ("sft.toml", "rl.toml", "opd.toml"):
+        for name in ("sft.toml", "rl.toml"):
             assert (
                 f"flash env push --project {_SCAFFOLD_PROJECT} --name my-env ." in written[name]
             ), name
@@ -693,12 +693,12 @@ def test_env_setup_warns_when_a_hosted_scaffold_is_rerun_on_a_self_hosted_plane(
     assert "`github:OWNER/REPO@REF:PATH`" in warning
     for name in ("environment.py", "evaluations.py"):
         assert name in warning, name
-    for name in ("sft.toml", "rl.toml", "opd.toml"):
+    for name in ("sft.toml", "rl.toml"):
         assert f"configs/{name}" in warning, name
     # the premise the warning exists for: the files really are retained unrewritten
     assert retained["environment.py"] == hosted["environment.py"]
     assert retained["evaluations.py"] == hosted["evaluations.py"]
-    for name in ("sft.toml", "rl.toml", "opd.toml"):
+    for name in ("sft.toml", "rl.toml"):
         assert retained[name] == hosted[name], name
 
 
@@ -745,7 +745,7 @@ def test_env_setup_warns_when_a_self_hosted_scaffold_is_rerun_on_a_hosted_plane(
     assert "Run `flash env push`" in warning
     for name in ("environment.py", "evaluations.py"):
         assert name in warning, name
-    for name in ("sft.toml", "rl.toml", "opd.toml"):
+    for name in ("sft.toml", "rl.toml"):
         assert f"configs/{name}" in warning, name
         assert retained[name] == self_hosted[name], name
 
@@ -853,24 +853,6 @@ def test_env_setup_does_not_let_an_unreadable_env_override_the_turn_flag(
         Path(tmp_path / "dataset" / "train.jsonl"),
     )
     assert multi_turn is True  # the flag decides, because the anchor could not be read
-
-
-def test_env_setup_names_the_plane_side_opd_teacher_setup_when_self_hosted(
-    monkeypatch, tmp_path
-) -> None:
-    """ "nothing to set up" is true only where the platform holds the key.
-
-    `require_teacher_broker_configuration` reads PARASAIL_API_KEY and FLASH_PUBLIC_URL from the
-    CONTROL PLANE's environment, so on a self-hosted plane the operator sets both. Telling them
-    otherwise moves the discovery to a submit-time failure.
-    """
-    hosted = _scaffold(monkeypatch, tmp_path / "hosted", "https://flash.freesolo.co")["opd.toml"]
-    assert "nothing to set up or export" in hosted
-
-    self_hosted = _scaffold(monkeypatch, tmp_path / "own", "https://plane.example.test")["opd.toml"]
-    assert "nothing to set up or export" not in self_hosted
-    assert "PARASAIL_API_KEY" in self_hosted
-    assert "FLASH_PUBLIC_URL" in self_hosted
 
 
 def test_env_setup_caveats_that_a_github_id_needs_a_standalone_plane(monkeypatch, tmp_path) -> None:
@@ -1143,7 +1125,7 @@ def test_env_setup_interactive_retains_the_selected_project_name(monkeypatch, tm
         "input": "trace input",
         "output": "trace output",
     }
-    for name in ("sft.toml", "rl.toml", "opd.toml"):
+    for name in ("sft.toml", "rl.toml"):
         parsed = tomllib.loads((tmp_path / "configs" / name).read_text())
         assert parsed["wandb"]["project"] == project_name
 
@@ -2285,21 +2267,8 @@ def test_env_setup_scaffolds_grpo_and_sft_configs(monkeypatch, tmp_path, capsys)
     assert "max_examples = 2" in sft.read_text()
     assert "cheapest fitting managed class" in sft.read_text()
     assert "private environment-scoped repo" in sft.read_text()
-    opd = tmp_path / "configs/opd.toml"
-    assert opd.is_file()
-    opd_text = opd.read_text()
-    assert 'project = "11111111-1111-4111-8111-111111111111"' in opd_text
-    assert 'algorithm = "opd"' in opd_text
-    assert "epochs = 1" in opd_text
-    assert "max_examples = 2" in opd_text
-    # the teacher key is platform-managed: the scaffold neither declares it as a secret nor tells
-    # the user to export it, so the generated config must not mention the provider credential.
-    assert "PARASAIL_API_KEY" not in opd_text
-    assert "secrets" not in opd_text
-    assert "platform-managed" in opd_text
-    # single-turn opd runs fine, so it carries NO multi-turn "fails fast" warning
-    assert "fail fast" not in opd_text
-    for name, suffix in (("sft.toml", "sft"), ("rl.toml", "grpo"), ("opd.toml", "opd")):
+    assert not (tmp_path / "configs/opd.toml").exists()
+    for name, suffix in (("sft.toml", "sft"), ("rl.toml", "grpo")):
         parsed = tomllib.loads((tmp_path / "configs" / name).read_text())
         assert parsed["wandb"] == {
             "project": "Test",
@@ -2337,7 +2306,7 @@ def test_env_setup_scaffolds_grpo_and_sft_configs(monkeypatch, tmp_path, capsys)
     assert "evaluations.py" in out
     assert "dataset/train.jsonl" in out
     assert "configs/rl.toml" in out
-    assert "configs/opd.toml" in out
+    assert "configs/opd.toml" not in out
     assert "TRAINING.md" in out
 
 
@@ -2353,7 +2322,7 @@ def test_env_setup_wandb_metadata_escapes_project_and_folder_names(monkeypatch, 
 
     assert _run(["env", "setup", "--project", _SCAFFOLD_PROJECT]) == 0
 
-    for name, suffix in (("sft.toml", "sft"), ("rl.toml", "grpo"), ("opd.toml", "opd")):
+    for name, suffix in (("sft.toml", "sft"), ("rl.toml", "grpo")):
         config_text = (folder / "configs" / name).read_text()
         assert "🚀" in config_text
         assert "🧪" in config_text
@@ -2391,7 +2360,7 @@ def test_env_setup_falls_back_to_project_id_for_unusable_wandb_project_names(
 
     assert _run(["env", "setup", "--project", _SCAFFOLD_PROJECT]) == 0
 
-    for name in ("sft.toml", "rl.toml", "opd.toml"):
+    for name in ("sft.toml", "rl.toml"):
         parsed = tomllib.loads((tmp_path / "configs" / name).read_text())
         assert parsed["wandb"]["project"] == _SCAFFOLD_PROJECT
 
@@ -2402,7 +2371,7 @@ def test_env_setup_does_not_backfill_wandb_into_existing_configs(monkeypatch, tm
     assert _run(["env", "setup", *project]) == 0
 
     retained = {}
-    for name in ("sft.toml", "rl.toml", "opd.toml"):
+    for name in ("sft.toml", "rl.toml"):
         path = tmp_path / "configs" / name
         before, rest = path.read_text().split("[wandb]\n", 1)
         _, after = rest.split("[environment]\n", 1)
@@ -2443,10 +2412,10 @@ def test_env_setup_does_not_add_starter_evaluations_to_a_custom_environment(
     assert (tmp_path / "configs/rl.toml").is_file()
 
 
-def test_env_setup_multi_turn_scaffolds_opd_for_multi_turn(monkeypatch, tmp_path, capsys) -> None:
-    """`flash env setup --multi-turn` scaffolds all three configs (sft/rl/opd). opd now supports
-    multi-turn (it rolls out each episode and distils every assistant turn), so the multi-turn opd.toml
-    and the starter env docstring must NOT warn it is single-turn only / fails fast."""
+def test_env_setup_multi_turn_scaffolds_only_offered_algorithms(
+    monkeypatch, tmp_path, capsys
+) -> None:
+    """Multi-turn setup offers SFT and GRPO without a retired OPD config."""
     monkeypatch.chdir(tmp_path)
 
     assert (
@@ -2467,23 +2436,17 @@ def test_env_setup_multi_turn_scaffolds_opd_for_multi_turn(monkeypatch, tmp_path
     assert "step_episode" in evaluations_text
     assert "`messages` already ends with this action" in env_py
     assert "`messages[:-1]` and apply `assistant_response` once" in env_py
-    # the docstring documents all three algorithms train off the multi-turn env (no opd carve-out)
-    assert "distils EVERY assistant turn" in env_py
+    assert "OPD" not in env_py
     assert "single-turn only" not in env_py
-    # all three algorithm configs are scaffolded in multi-turn mode too
-    for name in ("configs/sft.toml", "configs/rl.toml", "configs/opd.toml"):
+    # Both offered algorithm configs are scaffolded in multi-turn mode too
+    for name in ("configs/sft.toml", "configs/rl.toml"):
         assert (tmp_path / name).is_file(), name
-    opd_text = (tmp_path / "configs/opd.toml").read_text()
-    assert 'algorithm = "opd"' in opd_text
-    # ...and the multi-turn opd.toml notes it distils every assistant turn, with NO fail-fast warning
-    assert "distils every assistant turn" in opd_text
-    assert "SINGLE-TURN only" not in opd_text
-    assert "fail fast" not in opd_text
-    assert "configs/opd.toml" in capsys.readouterr().out
+    assert not (tmp_path / "configs/opd.toml").exists()
+    assert "configs/opd.toml" not in capsys.readouterr().out
 
 
-def test_env_setup_reasoning_emits_parseable_opd_config(monkeypatch, tmp_path) -> None:
-    """The reasoning opd.toml must still be valid TOML with the key at top level.
+def test_env_setup_reasoning_emits_parseable_configs(monkeypatch, tmp_path) -> None:
+    """The reasoning configs must still be valid TOML with the key at top level.
 
     `thinking` is a root key, not a `[train]` one, so it has to be written before the first table
     header. Asserting only on the substring would pass just as happily with the line stranded under
@@ -2504,7 +2467,7 @@ def test_env_setup_reasoning_emits_parseable_opd_config(monkeypatch, tmp_path) -
         == 0
     )
 
-    for name in ("configs/opd.toml", "configs/rl.toml", "configs/sft.toml"):
+    for name in ("configs/rl.toml", "configs/sft.toml"):
         parsed = tomllib.loads((tmp_path / name).read_text())
         assert parsed["thinking"] is True, name
         assert "thinking" not in parsed.get("train", {}), name
@@ -2529,7 +2492,7 @@ def test_env_setup_reasoning_conflict_names_every_stale_config(
     assert _run(["env", "setup", *project, "--no-reasoning"]) == 0
     warning = capsys.readouterr().err
     assert "ignoring --no-reasoning" in warning
-    for name in ("configs/rl.toml", "configs/opd.toml", "configs/sft.toml"):
+    for name in ("configs/rl.toml", "configs/sft.toml"):
         assert name in warning, f"{name} missing from: {warning}"
 
     # follow the instruction exactly: delete what it named, nothing more.
@@ -2538,7 +2501,7 @@ def test_env_setup_reasoning_conflict_names_every_stale_config(
         (tmp_path / name).unlink()
     assert _run(["env", "setup", *project, "--no-reasoning"]) == 0
 
-    for name in ("configs/rl.toml", "configs/opd.toml", "configs/sft.toml"):
+    for name in ("configs/rl.toml", "configs/sft.toml"):
         parsed = tomllib.loads((tmp_path / name).read_text())
         assert "thinking" not in parsed, f"{name} kept reasoning after a --no-reasoning re-scaffold"
 
@@ -2557,27 +2520,21 @@ def test_existing_reasoning_ignores_thinking_text_in_comments(tmp_path) -> None:
     assert env_setup._existing_reasoning((sft, rl)) is False
 
 
-def _drop_thinking(path) -> None:
-    """Rewrite a config the way the pre-#824 release left opd.toml: no `thinking` key at all."""
-    path.write_text(path.read_text().replace("thinking = true\n", ""))
-
-
 def test_env_setup_refuses_a_scaffold_whose_configs_disagree_about_reasoning(
     monkeypatch, tmp_path, capsys
 ) -> None:
     """Anchoring on the first config found accepts a project whose configs contradict each other.
 
-    This is the exact shape a scaffold from before #824 has: that release wrote `thinking` into rl
-    and sft but never into opd. `configs/rl.toml` is visited first, reports reasoning, and the stale
-    opd config is neither reported nor rewritten -- configs are only written when absent, so the
-    rerun leaves the project training GRPO with reasoning and OPD without it, silently.
+    The GRPO config enables reasoning while the SFT config does not.
 
     There is no anchor to pick here: either side leaves a mismatch, so setup has to refuse.
     """
     monkeypatch.chdir(tmp_path)
     project = ["--project", "11111111-1111-4111-8111-111111111111"]
     assert _run(["env", "setup", *project, "--reasoning"]) == 0
-    _drop_thinking(tmp_path / "configs/opd.toml")
+    (tmp_path / "configs/sft.toml").write_text(
+        'project = "11111111-1111-4111-8111-111111111111"\nmodel = "Qwen/Qwen3.5-9B"\nalgorithm = "sft"\n'
+    )
     capsys.readouterr()
 
     # a user upgrading re-runs setup with no flag at all -- the case that used to pass silently.
@@ -2587,14 +2544,13 @@ def test_env_setup_refuses_a_scaffold_whose_configs_disagree_about_reasoning(
     # the message has to name which side is which, or the user cannot tell what state they are in.
     assert "configs/rl.toml" in err, err
     assert "configs/sft.toml" in err, err
-    assert "configs/opd.toml" in err, err
     # and it must name every config to delete, so following it literally cannot leave one behind.
     named = {w.strip(" ,.`") for w in err.split() if w.startswith("configs/")}
-    assert named == {"configs/rl.toml", "configs/sft.toml", "configs/opd.toml"}, err
+    assert named == {"configs/rl.toml", "configs/sft.toml"}, err
 
     # refusing must not have half-written anything: the disagreeing scaffold is left exactly as it
     # was, so the user's own files are still theirs to inspect before deleting.
-    assert "thinking" not in tomllib.loads((tmp_path / "configs/opd.toml").read_text())
+    assert "thinking" not in tomllib.loads((tmp_path / "configs/sft.toml").read_text())
     assert tomllib.loads((tmp_path / "configs/rl.toml").read_text())["thinking"] is True
 
 
@@ -2607,7 +2563,9 @@ def test_env_setup_refusal_is_not_dodged_by_an_explicit_reasoning_flag(
     monkeypatch.chdir(tmp_path)
     project = ["--project", "11111111-1111-4111-8111-111111111111"]
     assert _run(["env", "setup", *project, "--reasoning"]) == 0
-    _drop_thinking(tmp_path / "configs/opd.toml")
+    (tmp_path / "configs/sft.toml").write_text(
+        'project = "11111111-1111-4111-8111-111111111111"\nmodel = "Qwen/Qwen3.5-9B"\nalgorithm = "sft"\n'
+    )
     capsys.readouterr()
 
     for flag in ("--reasoning", "--no-reasoning"):
@@ -2627,7 +2585,7 @@ def test_env_setup_still_accepts_a_scaffold_whose_configs_agree(monkeypatch, tmp
         assert _run(["env", "setup", *project, flag]) == 0
         assert _run(["env", "setup", *project]) == 0, f"a consistent {flag} rerun was rejected"
         expected = True if flag == "--reasoning" else None
-        for name in ("configs/rl.toml", "configs/sft.toml", "configs/opd.toml"):
+        for name in ("configs/rl.toml", "configs/sft.toml"):
             parsed = tomllib.loads((target / name).read_text())
             assert parsed.get("thinking") is expected, name
 
@@ -2641,11 +2599,10 @@ def test_env_setup_reasoning_anchor_survives_a_partially_scaffolded_directory(
     monkeypatch.chdir(tmp_path)
     project = ["--project", "11111111-1111-4111-8111-111111111111"]
     assert _run(["env", "setup", *project, "--reasoning"]) == 0
-    (tmp_path / "configs/opd.toml").unlink()
     (tmp_path / "configs/sft.toml").unlink()
 
     assert _run(["env", "setup", *project]) == 0
-    for name in ("configs/rl.toml", "configs/sft.toml", "configs/opd.toml"):
+    for name in ("configs/rl.toml", "configs/sft.toml"):
         parsed = tomllib.loads((tmp_path / name).read_text())
         assert parsed["thinking"] is True, f"{name} was rewritten off the surviving anchor"
 
@@ -2657,10 +2614,8 @@ def test_env_setup_default_omits_reasoning(monkeypatch, tmp_path) -> None:
     assert _run(["env", "setup", "--project", "11111111-1111-4111-8111-111111111111"]) == 0
     rl = (tmp_path / "configs/rl.toml").read_text()
     sft = (tmp_path / "configs/sft.toml").read_text()
-    opd = (tmp_path / "configs/opd.toml").read_text()
     assert "thinking = true" not in rl
     assert "thinking = true" not in sft
-    assert "thinking = true" not in opd
     assert "max_completion_tokens" not in rl
     assert "EnvironmentSingleTurn" in (tmp_path / "environment.py").read_text()
 
@@ -2673,24 +2628,13 @@ def test_env_setup_reasoning_flag_enables_thinking(monkeypatch, tmp_path) -> Non
     )
     rl = (tmp_path / "configs/rl.toml").read_text()
     sft = (tmp_path / "configs/sft.toml").read_text()
-    opd = (tmp_path / "configs/opd.toml").read_text()
     assert "thinking = true" in rl
     assert "thinking = true" in sft
-    # opd too. `thinking` is algorithm-agnostic in the spec and the opd worker reads it to pick a
-    # reasoning parser, so a scaffold that emitted it for two of the three algorithms would hand a
-    # user asking for reasoning an opd config that silently trains without it.
-    assert "thinking = true" in opd
     # GRPO raises the generation budget so reasoning does not truncate the answer.
     assert "max_completion_tokens = 2048" in rl
     # SFT can't share a token budget it doesn't generate; it gets the gold think-tag guidance instead.
     assert "warn_missing_think_tags" in sft
     assert "max_completion_tokens" not in sft
-    # nor opd -- not because the knob is inert there (opd honors it, via `_resolve_opd_knobs` ->
-    # `opd_completion_len` at flash/engine/plan/vram.py:97, which feeds verl's max_response_length) but
-    # because opd ALREADY raises its own budget under thinking: 512 -> 1536. Writing a literal would
-    # pin what the recipe should choose, and would go stale the moment that default moves. GRPO needs
-    # the line only because its non-thinking default is 320, too tight to leave to a scaffold reader.
-    assert "max_completion_tokens" not in opd
 
 
 def test_env_setup_no_reasoning_flag_is_explicit_off(monkeypatch, tmp_path) -> None:
@@ -2904,7 +2848,7 @@ def test_env_setup_uses_project_id_when_canonical_name_is_unusable(
 
     assert _run(["env", "setup", "--project", _SCAFFOLD_PROJECT]) == 0
 
-    for name in ("sft.toml", "rl.toml", "opd.toml"):
+    for name in ("sft.toml", "rl.toml"):
         parsed = tomllib.loads((tmp_path / "configs" / name).read_text())
         assert parsed["wandb"]["project"] == _SCAFFOLD_PROJECT
 

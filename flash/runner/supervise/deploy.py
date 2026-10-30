@@ -362,27 +362,14 @@ def _cancellation_billing(
     }
 
 
-def _prepare_cancellation(run_id: str) -> list[Exception]:
-    """Fence teacher authority before teardown begins."""
-    from flash.server.platform import db as server_db
-
-    deferred_fencing_errors: list[Exception] = []
-    try:
-        server_db.revoke_teacher_capabilities_for_run(run_id)
-    except Exception as exc:
-        deferred_fencing_errors.append(exc)
-    return deferred_fencing_errors
-
-
 def cancel_run(run_id: str) -> RunStatus:
     """Cancel training while preserving verified serving and durable cleanup targets."""
     from flash.runner.lifecycle.state import TERMINAL_STATES
     from flash.runner.lifecycle.status import _update, effective_spec_from_status, get_status
     from flash.runner.supervise.recovery import _gc_run_sandboxes
-    from flash.server.platform import db as server_db
     from flash.server.platform.locks import _deploy_lock
 
-    deferred_fencing_errors = _prepare_cancellation(run_id)
+    deferred_fencing_errors: list[Exception] = []
 
     def _clear_exact_remote(expected_remote: dict) -> bool:
         return _clear_remote_if_unchanged(run_id, expected_remote)
@@ -427,12 +414,6 @@ def cancel_run(run_id: str) -> RunStatus:
             deploy_lock.acquire()
             lock_acquired = True
 
-        # close the race where submission held the deploy lock, minted a capability after the
-        # pre-lock fence, and released the lock only after persisting its provider handle.
-        try:
-            server_db.revoke_teacher_capabilities_for_run(run_id)
-        except Exception as exc:
-            deferred_fencing_errors.append(exc)
         if requires_early_cancellation_fence:
             _persist_cancellation_fence()
         status = get_status(run_id)

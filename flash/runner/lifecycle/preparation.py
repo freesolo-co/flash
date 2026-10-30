@@ -500,7 +500,7 @@ def _validate_effective_spec(public_spec: JobSpec, worker_spec: JobSpec) -> None
         raise ValueError("persisted effective preparation has an invalid source adapter")
     _repo, prefix = resolved
     match = re.fullmatch(
-        r"(?:sft|rl|opd)/(?P<run>[A-Za-z0-9][A-Za-z0-9._-]{0,127})"
+        r"(?:sft|rl)/(?P<run>[A-Za-z0-9][A-Za-z0-9._-]{0,127})"
         r"(?:/checkpoints/step-(?P<step>\d+))?",
         prefix,
     )

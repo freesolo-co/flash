@@ -57,7 +57,7 @@ def test_expanded_gpu_table():
 
 
 def test_sm_capability_and_fp8_kv_support():
-    """fp8 KV cache is a cc >= 8.9 feature the OPD/GRPO workers enable off get_device_capability();
+    """fp8 KV cache is a cc >= 8.9 feature the GRPO workers enable off get_device_capability();
     sizing infers it from a class's ``sm`` string. Ada (4090, sm89), Hopper (H100/H200, sm90) and
     Blackwell (B200 sm100, RTX Pro 6000/5090 sm120) qualify; Ampere (A100 sm80, A10 sm86) does not."""
     from flash.providers.core.base import (
@@ -134,26 +134,7 @@ def test_batch_bound_sft_is_rejected_at_parse_time():
 
 @pytest.mark.parametrize(
     ("algorithm", "train", "expected_count"),
-    [
-        (
-            "grpo",
-            {"max_context_tokens": 32768, "max_completion_tokens": 512},
-            4,
-        ),
-        (
-            "opd",
-            {
-                "max_context_tokens": 32768,
-                "max_completion_tokens": 512,
-                "group_size": 1,
-                # 2, not 1: rl is bound by the sequences one step holds, so a single-sequence step
-                # launches ONE rank whatever it rents (`rl_data_parallel_cards`) and this case would
-                # assert the width clamp instead of the parse-time sizing it is here to cover.
-                "prompts_per_step": 2,
-            },
-            2,
-        ),
-    ],
+    [("grpo", {"max_context_tokens": 32768, "max_completion_tokens": 512}, 4)],
 )
 def test_non_sft_provisional_count_is_unchanged(algorithm, train, expected_count):
     from flash.providers.core.allocator import _executed_width
@@ -162,43 +143,6 @@ def test_non_sft_provisional_count_is_unchanged(algorithm, train, expected_count
     count = provisional_gpu_count("Qwen/Qwen3.8-27B", algorithm, train=train)
     assert count == expected_count
     assert _executed_width(algorithm, train, None)(count) == count
-
-
-def test_width_bound_rl_is_told_to_raise_its_step_not_shrink_it():
-    """A rank-bound rl run fits by RAISING prompts_per_step, so the message must not say lower.
-
-    The clamp that pins grpo/opd to the sequences one step holds created this case: 27B opd at 32k
-    with one sequence needs 233 GB and launches one rank (180 GB max), so it is now rejected at parse
-    instead of aborting at step 0. But `vram_knob_advice` says to LOWER prompts_per_step, and at one
-    prompt there is nothing below to lower -- while two sequences need 278 GB against 300 GB pooled
-    and fit. MEASURED across the catalog: every width-bound row fits by widening the step, none by
-    shrinking it.
-    """
-    from flash.schema import ConfigError, spec_from_dict
-
-    raw = {
-        "model": "Qwen/Qwen3.8-27B",
-        "algorithm": "opd",
-        "environment": {"id": "freesolo/example/example"},
-        "train": {
-            "max_context_tokens": 32768,
-            "max_completion_tokens": 512,
-            "prompts_per_step": 1,
-            "group_size": 1,
-            "lora_rank": 32,
-        },
-    }
-    with pytest.raises(ConfigError) as exc:
-        spec_from_dict(raw, run_id="parse-rl-width")
-    message = str(exc.value)
-    assert "1 of which joins this run" in message
-    assert "prompts_per_step x group_size bounds the rank count" in message
-    assert "RAISE it to buy ranks" in message
-    # the same knobs widened must actually be admitted, or the advice is still a dead end. asserted
-    # as acceptance rather than on `gpu.count`, which stays at the authored ceiling here (unset = 1)
-    # because parse gates the shape and the allocator sizes it later.
-    raw["train"]["prompts_per_step"] = 2
-    assert spec_from_dict(raw, run_id="parse-rl-width-ok").algorithm == "opd"
 
 
 @pytest.mark.parametrize(("sequence", "accepted"), [(131072, True), (262144, False)])
@@ -307,52 +251,6 @@ def test_build_worker_env():
     assert "SFT_EPOCHS" not in env
 
 
-def test_opd_kv_floor_keeps_the_bf16_floor_for_a_gdn_hybrid():
-    """The fp8 KV discount must NOT apply to a linear-attention (GDN) model.
-
-    Both vLLM rollout workers refuse an fp8 KV cache for GDN hybrids (vllm's fp8 wake path
-    init_fp8_kv_scales assumes a plain kv tensor and crashes on the hybrid cache), so their cache
-    really is bf16. Discounting it reserves half the cache the run allocates, which admits the run
-    onto a card that cannot hold it -- it then OOMs at rollout init on a paid GPU. Every model in
-    the flash catalog is currently a GDN hybrid, so the routed requirement must be the bf16 floor.
-    """
-    from flash.core.catalog import MODELS
-    from flash.engine.plan.vram import grpo_kv_floor_gb, model_required_vram_gb
-    from flash.providers.core.base import max_non_fp8_kv_vram_gb
-
-    info = MODELS["Qwen/Qwen3.5-9B"]
-    assert info.num_linear_attention_layers > 0
-    concurrency = 8 * 16
-    ceiling = max_non_fp8_kv_vram_gb()
-    bf16_floor = grpo_kv_floor_gb(
-        info.params_b,
-        4096,
-        concurrency,
-        active_params_b=info.active_params_b,
-        model_info=info,
-        preserve_parameter_floor=True,
-    )
-    fp8_floor = grpo_kv_floor_gb(
-        info.params_b,
-        4096,
-        concurrency,
-        active_params_b=info.active_params_b,
-        fp8_kv=True,
-        model_info=info,
-        preserve_parameter_floor=True,
-    )
-    need = model_required_vram_gb(
-        info.id,
-        "opd",
-        train={"batch_size": 8, "group_size": 16, "max_context_tokens": 4096},
-    )
-
-    # the discount is real and would be decisive here, which is why skipping it matters.
-    assert fp8_floor < bf16_floor
-    assert bf16_floor > ceiling
-    assert need >= bf16_floor
-
-
 def test_35b_expert_lora_shapes_and_multicard_sizing():
     from flash.core.catalog import MODELS
     from flash.engine.plan.vram import model_required_vram_gb
@@ -379,8 +277,8 @@ def test_35b_expert_lora_shapes_and_multicard_sizing():
     # projected 512 rows. the selected card is unchanged on both ranks (H200 at 32, B200 at 64), so
     # this corrects the reserve without rerouting any run.
     expected_need = {
-        32: {"sft": 119, "grpo": 200, "opd": 204},
-        64: {"sft": 152, "grpo": 222, "opd": 238},
+        32: {"sft": 119, "grpo": 200},
+        64: {"sft": 152, "grpo": 222},
     }
     for rank, by_algorithm in expected_need.items():
         for algorithm, need in by_algorithm.items():
@@ -396,8 +294,6 @@ def test_35b_expert_lora_shapes_and_multicard_sizing():
                     )
 
     assert provisional_gpu(model_id, "grpo", train={"lora_rank": 32}, gpu_count=2) == "H200"
-    assert provisional_gpu(model_id, "opd", train={"lora_rank": 32}, gpu_count=2) == "H200"
-    assert provisional_gpu(model_id, "opd", train={"lora_rank": 64}, gpu_count=2) == "B200"
 
 
 def test_grpo_terminal_vram_error_names_only_effective_knobs(monkeypatch):

@@ -24,7 +24,6 @@ class RuntimeOptions:
     structured_outputs: dict | None = None
     kl_ref_adapter: bool = False
     multi_turn: bool = False
-    no_signal_attempts: int = 1
     rollout_run_id: str = ""
     rollout_template_kwargs: dict = field(default_factory=dict)
 
@@ -34,12 +33,12 @@ class RuntimeOptions:
         if unknown:
             raise ValueError(f"unknown trainer runtime options: {sorted(unknown)}")
         options = cls(**value)
-        if options.algorithm not in {"sft", "grpo", "opd"}:
+        if options.algorithm not in {"sft", "grpo"}:
             raise ValueError("unknown training algorithm")
         if type(options.total_steps) is not int or options.total_steps <= 0:
             raise ValueError("total_steps must be a positive integer")
-        if options.no_signal_attempts <= 0 or options.dp_cards <= 0:
-            raise ValueError("attempt and device counts must be positive")
+        if options.dp_cards <= 0:
+            raise ValueError("device count must be positive")
         if any(
             type(step) is not int or not 0 < step <= options.total_steps
             for step in options.save_at_steps
