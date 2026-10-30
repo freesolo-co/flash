@@ -323,6 +323,7 @@ def _preparation_digest(
     adapter_identity: dict | None,
     *,
     stored_public: object = None,
+    stored_worker: object = None,
 ) -> str:
     public_payload = public_spec.to_dict()
     # `lora_alpha` became user-authorable in 1.1.35, so `to_dict()` now MATERIALIZES it (defaulting
@@ -345,6 +346,15 @@ def _preparation_digest(
         ):
             public_payload["train"].pop("lora_alpha", None)
     worker_payload = worker_spec.to_internal_dict()
+    # Pre-removal SFT/GRPO snapshots hashed an explicit empty teacher_model in
+    # both halves. Replay its original presence for verification only; new specs
+    # continue to omit it. All other fields still come from the validated specs.
+    for payload, stored in ((public_payload, stored_public), (worker_payload, stored_worker)):
+        train = stored.get("train") if isinstance(stored, Mapping) else None
+        if isinstance(train, Mapping) and "teacher_model" in train:
+            if train["teacher_model"] != "":
+                raise ValueError("persisted train.teacher_model must be the retired empty default")
+            payload["train"]["teacher_model"] = ""
     # NORMALIZATION, not legacy replay: this is the canonical shape `dev` hashes TODAY (1.2.88), and
     # it is unconditional -- it reads nothing off the stored record and applies to every run this
     # build prepares. Deleting it as "historical" made the digest depend on which build wrote it, so

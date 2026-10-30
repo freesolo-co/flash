@@ -7319,22 +7319,51 @@ def _make_run(api, key, state):
     return run_id
 
 
-def test_list_checkpoints_endpoint(api, monkeypatch):
+def _add_retired_teacher_default(run_id):
+    from flash.core.spec import JobSpec
+    from flash.runner.lifecycle.preparation import _preparation_digest
 
+    status = runner_status.get_status(run_id)
+    status.spec["train"]["teacher_model"] = ""
+    snapshot = status.effective_preparation
+    if snapshot and isinstance(snapshot.get("worker_spec"), dict):
+        raw_worker = snapshot["worker_spec"]
+        raw_worker["train"]["teacher_model"] = ""
+        snapshot["preparation_digest"] = _preparation_digest(
+            JobSpec.from_dict(status.spec),
+            JobSpec.from_dict(raw_worker),
+            snapshot.get("adapter_identity"),
+            stored_public=status.spec,
+            stored_worker=raw_worker,
+        )
+    runner_state._save_status(status)
+
+
+@pytest.mark.parametrize("historical", [False, True])
+def test_list_checkpoints_endpoint(api, monkeypatch, historical):
+
+    from flash.server.domain.registry import checkpoints as registry_checkpoints
+
+    monkeypatch.setattr(registry_checkpoints, "list_checkpoints", lambda spec: _FAKE_CKPTS)
     monkeypatch.setattr(run_checkpoints, "list_checkpoints", lambda spec: _FAKE_CKPTS)
     key = _new_user_token()
     run_id = _make_run(api, key, "done")
+    if historical:
+        _add_retired_teacher_default(run_id)
     r = api.get(f"/v1/runs/{run_id}/checkpoints", headers=_bearer(key))
     assert r.status_code == 200, r.text
     assert [c["step"] for c in r.json()["checkpoints"]] == [40, 80]
 
 
-def test_deploy_specific_checkpoint_of_finished_run(api, monkeypatch):
+@pytest.mark.parametrize("historical", [False, True])
+def test_deploy_specific_checkpoint_of_finished_run(api, monkeypatch, historical):
 
     monkeypatch.setattr(run_checkpoints, "list_checkpoints", lambda spec: _FAKE_CKPTS)
     captured = {}
     key = _new_user_token()
     run_id = _make_run(api, key, "done")
+    if historical:
+        _add_retired_teacher_default(run_id)
     revision = f"{run_id}/step-40"
 
     def fake_deploy(**kwargs):

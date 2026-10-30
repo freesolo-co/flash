@@ -43,6 +43,18 @@ def validated_section(
     return section
 
 
+def validated_train_section(data: dict[str, Any], allowed: set[str]) -> dict[str, Any]:
+    """Read old SFT/GRPO records carrying the removed teacher's empty default."""
+    train = validated_section(data, "train", allowed | {"teacher_model"})
+    if "teacher_model" not in train:
+        return train
+    if train["teacher_model"] != "":
+        raise ValueError("persisted train.teacher_model must be the retired empty default")
+    # The retired serializer emitted this on every algorithm. Do not reintroduce
+    # an authored setting, alter the stored record, or revive teacher execution.
+    return {key: value for key, value in train.items() if key != "teacher_model"}
+
+
 def validated_persisted_providers(
     gpu: dict[str, Any], gpu_type: str, gpu_type_fallbacks: tuple[str, ...]
 ) -> tuple[str, tuple[str, ...]]:

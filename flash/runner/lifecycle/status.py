@@ -186,7 +186,7 @@ def effective_spec_from_status(status: RunStatus, *, verify_source: bool = False
         not isinstance(stored_digest, str)
         or stored_digest
         != preparation._preparation_digest(
-            public_spec, worker_spec, expected, stored_public=status.spec
+            public_spec, worker_spec, expected, stored_public=status.spec, stored_worker=raw_worker
         )
     ):
         raise ValueError("persisted effective preparation failed integrity validation")
@@ -197,7 +197,7 @@ def effective_spec_from_status(status: RunStatus, *, verify_source: bool = False
                 "because its original artifact identity is unavailable"
             )
         if not isinstance(stored_digest, str) or stored_digest != preparation._preparation_digest(
-            public_spec, worker_spec, expected, stored_public=status.spec
+            public_spec, worker_spec, expected, stored_public=status.spec, stored_worker=raw_worker
         ):
             raise ValueError("persisted effective preparation failed integrity validation")
     if verify_source and public_spec.train.init_from_adapter:

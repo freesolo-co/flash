@@ -33,6 +33,7 @@ from flash.core.spec_persistence import (
     str_tuple,
     validated_persisted_providers,
     validated_section,
+    validated_train_section,
     volume_gb,
 )
 
@@ -735,7 +736,7 @@ class JobSpec:
             if raw_package is not None
             else None
         )
-        train = validated_section(data, "train", {item.name for item in fields(TrainSpec)})
+        train = validated_train_section(data, {item.name for item in fields(TrainSpec)})
         credit_assignment = (
             _coerce_credit_assignment(train["credit_assignment"])
             if "credit_assignment" in train

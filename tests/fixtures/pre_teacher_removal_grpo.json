@@ -1,0 +1,118 @@
+{
+  "generated_by": "486dc58f (before OPD removal); synthetic spec, no credentials or remote calls",
+  "state": "done",
+  "run_id": "historical-grpo",
+  "spec": {
+    "model": "Qwen/Qwen3.5-9B",
+    "algorithm": "grpo",
+    "environment": {
+      "id": "",
+      "params": {},
+      "pip": [],
+      "secrets": []
+    },
+    "train": {
+      "epochs": 1,
+      "lora_rank": 32,
+      "lora_alpha": 64,
+      "init_from_adapter": "",
+      "learning_rate": null,
+      "batch_size": null,
+      "prompts_per_step": null,
+      "max_context_tokens": null,
+      "save_every": null,
+      "max_steps": null,
+      "save_at_steps": [],
+      "max_examples": null,
+      "group_size": null,
+      "temperature": null,
+      "max_completion_tokens": null,
+      "kl_penalty_coef": null,
+      "thinking_length_penalty_coef": null,
+      "teacher_model": "",
+      "stop_sequences": [],
+      "structured_outputs": "",
+      "credit_assignment": "per_episode"
+    },
+    "gpu": {
+      "type": "H100",
+      "provider": "",
+      "count": 1
+    },
+    "seed": 42,
+    "thinking": false,
+    "wandb": {
+      "project": null,
+      "run_name": null
+    },
+    "project": "11111111-1111-4111-8111-111111111111"
+  },
+  "effective_preparation": {
+    "version": 1,
+    "worker_spec": {
+      "model": "Qwen/Qwen3.5-9B",
+      "algorithm": "grpo",
+      "environment": {
+        "id": "",
+        "params": {},
+        "pip": [],
+        "secrets": [],
+        "resolved_sha": ""
+      },
+      "train": {
+        "epochs": 1,
+        "lora_rank": 32,
+        "lora_alpha": 64,
+        "init_from_adapter": "",
+        "init_from_adapter_revision": "",
+        "hf_repo": "fixtures/historical-checkpoints",
+        "learning_rate": null,
+        "batch_size": null,
+        "prompts_per_step": null,
+        "max_context_tokens": null,
+        "save_every": null,
+        "max_steps": null,
+        "save_at_steps": [],
+        "max_examples": null,
+        "group_size": null,
+        "temperature": null,
+        "max_completion_tokens": null,
+        "kl_penalty_coef": null,
+        "thinking_length_penalty_coef": null,
+        "teacher_model": "",
+        "stop_sequences": [],
+        "structured_outputs": "",
+        "credit_assignment": "per_episode"
+      },
+      "gpu": {
+        "type": "H100",
+        "disk_gb": 60,
+        "max_wall_seconds": 86400,
+        "max_retries": 5,
+        "network_volume": null,
+        "network_volume_gb": 100,
+        "provider": "",
+        "count": 1
+      },
+      "run_id": "historical-grpo",
+      "seed": 42,
+      "thinking": false,
+      "wandb": {
+        "project": null,
+        "run_name": null
+      },
+      "model_revision": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "model_revision_auto": true,
+      "model_revision_force_pin": false,
+      "gpu_count_auto": false,
+      "workload_profile_input_digest": "",
+      "workload_profile_producer_version": "",
+      "workload_profile": {},
+      "project": "11111111-1111-4111-8111-111111111111"
+    },
+    "workload_profile": null,
+    "adapter_identity": null,
+    "preparation_digest": "8868c05fee2796578a9d97cf5f948e4afbc18be9b5457536248000736b3bfd17",
+    "backend": "verl"
+  }
+}
