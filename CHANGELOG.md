@@ -126,6 +126,9 @@ This file starts at 1.1.35. Earlier releases are not reconstructed here; use
 
 ### Fixed
 
+- Image SFT quotes now bound profile-wide decode work at an explicit 16 GiB instead of the
+  per-row decode cap times the per-example image count (2 GiB), so screenshot datasets with a few
+  thousand unique images, such as MiniWoB teacher traces, are no longer rejected before training.
 - Qwen3.6 FP8 MoE serving now preserves unquantized activations for LoRA A while keeping the base
   MoE path quantized, backporting the exact vLLM PR #42120 behavior into the pinned 0.23.0 image.
 - GRPO publication now validates complete finite optimizer-step actor gradient norms instead of
