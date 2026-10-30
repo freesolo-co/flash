@@ -1,42 +1,31 @@
-"""Server-side managed Freesolo env download from GitHub."""
+"""Server-side managed Freesolo env download from Azure."""
 
 from __future__ import annotations
-
-import io
-import subprocess
-import tarfile
-from pathlib import Path
 
 import pytest
 
 from flash.server.domain.registry import envs
 
 
-def _git(cwd: Path, *args: str) -> None:
-    subprocess.run(["git", *args], cwd=cwd, check=True, capture_output=True, text=True)
-
-
 def test_download_package_user_can_download_own_namespace(monkeypatch):
-    monkeypatch.setenv("GITHUB_TOKEN", "ghp-test")
     seen: dict[str, object] = {}
 
-    def fake_download(slug, *, token):
-        seen.update(slug=slug, token=token)
+    def fake_download(slug):
+        seen.update(slug=slug)
         return b"package"
 
-    monkeypatch.setattr(envs, "_github_download", fake_download)
+    monkeypatch.setattr(envs.blob_envs, "download", fake_download)
 
     assert (
         envs.download_package(slug="acme/checkout-bot/my-env", key={"org_slug": "acme"})
         == b"package"
     )
-    assert seen == {"slug": "acme/checkout-bot/my-env", "token": "ghp-test"}
+    assert seen == {"slug": "acme/checkout-bot/my-env"}
 
 
 def test_download_package_rejects_other_users_namespace(monkeypatch):
-    monkeypatch.setenv("GITHUB_TOKEN", "ghp-test")
     monkeypatch.setattr(
-        envs, "_github_download", lambda *a, **k: pytest.fail("storage must not be touched")
+        envs.blob_envs, "download", lambda *a, **k: pytest.fail("storage must not be touched")
     )
 
     with pytest.raises(envs.EnvPublishError) as excinfo:
@@ -46,64 +35,15 @@ def test_download_package_rejects_other_users_namespace(monkeypatch):
 
 
 def test_download_package_internal_key_can_download_any_namespace(monkeypatch):
-    monkeypatch.setenv("GITHUB_TOKEN", "ghp-test")
     seen: dict[str, object] = {}
     monkeypatch.setattr(
-        envs,
-        "_github_download",
-        lambda slug, *, token: seen.update(slug=slug, token=token) or b"package",
+        envs.blob_envs,
+        "download",
+        lambda slug: seen.update(slug=slug) or b"package",
     )
 
     assert (
         envs.download_package(slug="acme/project/paper-foo", key={"auth_kind": "internal"})
         == b"package"
     )
-    assert seen == {"slug": "acme/project/paper-foo", "token": "ghp-test"}
-
-
-def test_download_package_requires_control_plane_github_credential(monkeypatch):
-    monkeypatch.delenv("GITHUB_TOKEN", raising=False)
-
-    with pytest.raises(envs.EnvPublishError) as excinfo:
-        envs.download_package(slug="acme/project/x", key={"auth_kind": "internal"})
-
-    assert excinfo.value.status == 503
-    assert "control plane" in str(excinfo.value)
-
-
-def test_github_download_once_packages_slug_directory(tmp_path, monkeypatch):
-    remote = tmp_path / "hub.git"
-    seed = tmp_path / "seed"
-    seed.mkdir()
-    _git(seed, "init", "--initial-branch", "main")
-    _git(seed, "config", "user.name", "test")
-    _git(seed, "config", "user.email", "test@example.com")
-    env_dir = seed / "ns" / "project" / "env"
-    env_dir.mkdir(parents=True)
-    (env_dir / "environment.py").write_text("def load_environment(**k): pass\n")
-    (env_dir / "datasets").mkdir()
-    (env_dir / "datasets" / "train.jsonl").write_text('{"a":1}\n')
-    other = seed / "other" / "env"
-    other.mkdir(parents=True)
-    (other / "environment.py").write_text("# other\n")
-    _git(seed, "add", "-A")
-    _git(seed, "commit", "-m", "seed")
-    _git(seed, "init", "--bare", str(remote))
-    _git(seed, "remote", "add", "origin", str(remote))
-    _git(seed, "push", "origin", "main")
-
-    monkeypatch.setattr(envs, "_repo_url", lambda repo: str(remote))
-
-    package = envs._github_download_once(
-        repo="ignored/repo", token="tok", publish_root="ns/project/env"
-    )
-
-    with tarfile.open(fileobj=io.BytesIO(package), mode="r:gz") as tar:
-        names = sorted(member.name for member in tar.getmembers() if member.isfile())
-        env_file = tar.extractfile("environment.py")
-        dataset_file = tar.extractfile("datasets/train.jsonl")
-        assert env_file is not None
-        assert dataset_file is not None
-        assert env_file.read() == b"def load_environment(**k): pass\n"
-        assert dataset_file.read() == b'{"a":1}\n'
-    assert names == ["datasets/train.jsonl", "environment.py"]
+    assert seen == {"slug": "acme/project/paper-foo"}

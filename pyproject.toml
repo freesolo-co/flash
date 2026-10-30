@@ -54,6 +54,8 @@ gpu = [
 # sft cost, dry-run, and submit statically read packaged rows plus the defined training contract.
 # environment.py is not imported; other environment prompt transformations remain estimate gaps.
 server = [
+    "azure-identity>=1.19,<2",
+    "azure-storage-blob>=12.24,<13",
     "pydantic-settings>=2.7",
     "orjson>=3.10",
     # 0.136 floor keeps modal's serving+serve-runtime pair solvable under vllm's resolver-only <0.137

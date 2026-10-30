@@ -65,17 +65,10 @@ def _reference_for_environment_id(env_id: str) -> tuple[str, Any]:
     from flash.envs.meta.identity import (
         _parse_github_environment_ref,
         canonical_environment_id,
-        is_managed_environment_slug,
-        managed_slug_to_github_ref,
     )
 
     canonical_id = canonical_environment_id(env_id)
-    reference = (
-        managed_slug_to_github_ref(canonical_id)
-        if is_managed_environment_slug(canonical_id)
-        else canonical_id
-    )
-    parsed = _parse_github_environment_ref(reference)
+    parsed = _parse_github_environment_ref(canonical_id)
     if parsed is None:
         raise ValueError(f"environment {env_id!r} is not a GitHub environment reference")
     return canonical_id, parsed
@@ -84,12 +77,15 @@ def _reference_for_environment_id(env_id: str) -> tuple[str, Any]:
 def is_staged_environment_transient_error(exc: BaseException) -> bool:
     """Classify timeout, connection, rate-limit, and server failures across clients."""
     from flash.envs.meta.identity import GitHubTransientError
+    from flash.envs.registry.azure import RegistryError
     from flash.providers.artifacts.hf import hf_status_code
 
     current: BaseException | None = exc
     seen: set[int] = set()
     while current is not None and id(current) not in seen:
         seen.add(id(current))
+        if isinstance(current, RegistryError) and current.status in {429, 503}:
+            return True
         if isinstance(current, (StagedEnvironmentTransientError, GitHubTransientError)):
             return True
         status = hf_status_code(current)
@@ -120,6 +116,18 @@ def resolve_environment_source(
     """Download one fresh exact package tree without touching the executable environment cache."""
     from flash.envs.loading import loader
     from flash.envs.meta.identity import GitHubEnvironmentRef, is_commit_sha
+    from flash.envs.registry import packages
+
+    slug = packages.managed_slug(env_id)
+    if slug is not None:
+        try:
+            return packages.resolve_source(slug, resolved_sha, deadline_at=deadline_at)
+        except Exception as exc:
+            if is_staged_environment_transient_error(exc):
+                raise StagedEnvironmentTransientError(
+                    "environment source is temporarily unavailable"
+                ) from exc
+            raise
 
     canonical_id, parsed = _reference_for_environment_id(env_id)
     _require_staging_deadline(deadline_at)
@@ -142,24 +150,7 @@ def resolve_environment_source(
     _require_staging_deadline(deadline_at)
     staging_root = Path(tempfile.mkdtemp(prefix="flash-stage-env-source-"))
     try:
-        package_root = loader._managed_hub_package_root(exact_ref)
-        if exact_ref.repo_full_name.lower() == loader._DEFAULT_MANAGED_ENV_REPO.lower():
-            if not package_root:
-                raise ValueError(
-                    "managed environment hub refs must include a namespace/project/name environment path"
-                )
-            root = loader._download_github_directory(
-                exact_ref,
-                package_root,
-                staging_root,
-                **request_options,
-            )
-        else:
-            root = loader._extract_github_tarball(
-                exact_ref,
-                staging_root,
-                **request_options,
-            )
+        root = loader._extract_github_tarball(exact_ref, staging_root, **request_options)
         candidate = root / parsed.path
         if candidate.is_dir():
             candidate = candidate / loader._DEFAULT_ENVIRONMENT_PATH

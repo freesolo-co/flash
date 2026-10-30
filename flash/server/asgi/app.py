@@ -112,6 +112,7 @@ def create_app():
 
         from flash.server.routes import (
             adapter_download,
+            env_files,
             envs,
             meta,
             runs,
@@ -226,6 +227,7 @@ def create_app():
     app = FastAPI(title="Flash Control Plane", version=__version__, lifespan=lifespan)
     app.include_router(meta.router)
     app.include_router(envs.router)
+    app.include_router(env_files.router)
     app.include_router(runs.router)
     app.include_router(serving.router)
     app.include_router(adapter_download.router)

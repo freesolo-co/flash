@@ -602,11 +602,9 @@ def test_a_blank_github_token_is_not_forwarded_as_a_credential(monkeypatch) -> N
     whitespace-only GITHUB_TOKEN makes PUBLIC environment repos fail -- repos that load fine with
     no token at all. Every consumer must read blank as absent."""
     from flash.envs.loading import loader
-    from flash.server.domain.registry import envs as server_envs
 
     monkeypatch.setenv("GITHUB_TOKEN", "   \n  ")
     assert loader._github_token() is None
-    assert server_envs._github_token() is None
     assert "Authorization" not in loader._github_headers("application/vnd.github+json")
 
     # a real token still authenticates, stripped.
