@@ -9,7 +9,7 @@ from flash.schema import ConfigError, spec_from_dict
 
 
 def test_algorithm_registry_contains_only_supported_algorithms():
-    assert set(ALGORITHMS) == {"sft", "grpo", "opd"}
+    assert set(ALGORITHMS) == {"sft", "grpo"}
 
 
 @pytest.mark.parametrize("algorithm", ALGORITHMS)
@@ -24,7 +24,7 @@ def test_unknown_algorithm_rejected():
         spec_from_dict({"model": "Qwen/Qwen3.5-9B", "algorithm": "ppo"}, run_id="x")
 
 
-def test_opd_algorithm_accepted():
+def test_retired_opd_config_remains_readable():
     spec = spec_from_dict(
         {
             "model": "Qwen/Qwen3.5-9B",

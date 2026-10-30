@@ -300,7 +300,7 @@ def test_env_setup_can_start_from_a_projects_traces(
     assert _rows(tmp_path / "dataset/train.jsonl") == _RECORDS
     assert fake_traces["records"] == ["11111111-1111-4111-8111-111111111111"]
     # max_examples tracks the rows actually written, so a run trains on all of them
-    for config in ("configs/sft.toml", "configs/rl.toml", "configs/opd.toml"):
+    for config in ("configs/sft.toml", "configs/rl.toml"):
         text = (tmp_path / config).read_text()
         assert "max_examples = 2" in text
         assert "exported from your traces" in text

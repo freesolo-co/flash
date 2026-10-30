@@ -1,6 +1,6 @@
 # Flash
 
-LoRA post-training for open-weight models: SFT, GRPO, and on-policy distillation. You
+LoRA post-training for open-weight models: SFT and GRPO. You
 describe a run in a TOML file, Flash allocates a GPU, trains, streams checkpoints, and
 serves the resulting adapter.
 
@@ -384,3 +384,10 @@ Removal stays `undeploying` until confirmed, including retries after cleanup err
 it never becomes `undeployed` merely because a removal request was sent. Existing
 persisted states are translated when loaded, preserving registration and generation
 fences. Deploy alongside the matching Freesolo deployment-state migration and backend.
+
+### Retired built-in OPD
+
+New built-in OPD runs and quotes are no longer offered. Use the custom algorithm API
+([#1553](https://github.com/freesolo-co/flash/pull/1553)) for on-policy distillation, with
+teacher access and the distillation loop owned by your custom algorithm. Existing OPD
+runs, recovery, checkpoints, exports, and deployments remain supported.

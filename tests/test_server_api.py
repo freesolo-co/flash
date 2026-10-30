@@ -895,92 +895,32 @@ def test_dry_run_accepts_valid_regex_and_local_ref_constraints(api, structured_o
     assert response.json()["state"] == "dry_run"
 
 
-@pytest.mark.parametrize(
-    ("max_completion_tokens", "status_code"),
-    [(32000, 400), (2950, 200)],
-)
-def test_opd_structured_dry_run_checks_rollout_context_before_allocation(
-    api, monkeypatch, tmp_path, max_completion_tokens, status_code
-) -> None:
-    import flash.engine.worker.train.opd.orchestration.validation as opd_validation
-    import flash.envs.loading.loader as envs_loader
-    import flash.schema as schema
-    from tests._helpers.teacher import configure_managed_teacher
+@pytest.mark.parametrize("dry_run", [False, True])
+@pytest.mark.parametrize("algorithm", ["opd", "OPD"])
+def test_retired_opd_rejected_before_preparation_or_persistence(
+    api, monkeypatch, dry_run, algorithm
+):
+    import flash.server.routes.runs as runs_route
 
-    # an opd submission is now validated against the plane's managed-teacher configuration before
-    # the run record; this test is about rollout context ordering, so give it a configured plane.
-    configure_managed_teacher(monkeypatch)
-    monkeypatch.setattr(schema, "provisional_gpu", lambda *_a, **_k: "B200")
-    # offline: the structured-OPD preflight resolves model metadata over the network -- geometry
-    # (model_info + a config.json download) and list_repo_files, to detect a mistral tokenizer.
-    # Without this the dry run reached hf.co and passed only on a connected runner. The values are
-    # not what this test asserts on (it checks that an invalid context is rejected BEFORE
-    # allocation), so stub the resolver itself rather than pin geometry numbers that read as
-    # meaningful; vocab comes from the catalog entry for this model.
     monkeypatch.setattr(
-        opd_validation,
-        "_resolve_structured_model_metadata",
-        lambda *_a, **_k: (151936, ("config.json", "tokenizer.json")),
-        raising=False,
+        runs_route.run_submission,
+        "prepare_job",
+        lambda *_a, **_k: pytest.fail("retired OPD must fail before preparation"),
     )
-    # offline: the valid-context path pins the github env ref to a sha; stub it so the
-    # test never makes a real github request (the api fixture only sets a fake token)
-    monkeypatch.setattr(envs_loader, "_resolve_ref_sha", lambda *_a, **_k: "0" * 40)
-    # the valid-context path also runs the image-opd preflight, which resolves the env
-    # reference to inspect its dataset for images. point it at an empty local dir so the
-    # preflight finds no packaged dataset and returns without a real github request.
-    _offline_env_dir = tmp_path / "env"
-    _offline_env_dir.mkdir()
-    (_offline_env_dir / "environment.py").write_text("")
     monkeypatch.setattr(
-        envs_loader,
-        "_resolve_environment_reference",
-        lambda *_a, **_k: str(_offline_env_dir / "environment.py"),
+        "flash.server.domain.teacher.broker.preflight_validate_managed_teacher",
+        lambda *_a, **_k: pytest.fail("retired OPD must not contact a teacher"),
     )
-    if status_code == 400:
-        monkeypatch.setattr(
-            runner_submit,
-            "submit_job",
-            lambda *_a, **_k: pytest.fail("invalid context must fail before allocation"),
-        )
-    spec = {
-        "project": "11111111-1111-4111-8111-111111111111",
-        **SPEC,
-        "model": "Qwen/Qwen3.6-35B-A3B",
-        "algorithm": "opd",
-        "thinking": False,
-        "train": {
-            **SPEC["train"],
-            # the 35b is a gdn hybrid, so opd sizes it with a bf16 kv cache (the worker refuses fp8
-            # for them). training the routed experts puts this past every single card at any batch
-            # size, so the run is pinned to two below; otherwise the valid-context case would fail
-            # allocation instead of exercising the ordering this test is about.
-            "prompts_per_step": 4,
-            # both cards only JOIN a step wide enough to give each one a share, and the RETAINED pool
-            # bounds that width, not the requested batch: `SPEC["train"]` retains one row, which caps
-            # the priced step at one prompt however many this asks for, so the second rank holds no
-            # share, contributes no memory, and the 213 GB need is refused on one 180 GB card. two
-            # retained rows are what make the pin above real.
-            "max_examples": 2,
-            "max_completion_tokens": max_completion_tokens,
-            "structured_outputs": {"choice": ["4"]},
-        },
-        "gpu": {"count": 2},
-    }
-
+    token = _new_user_token()
     response = api.post(
         "/v1/runs",
-        headers=_bearer(_new_user_token()),
-        json={"spec": spec, "dry_run": True},
+        headers=_bearer(token),
+        json={"spec": {**SPEC, "algorithm": algorithm}, "dry_run": dry_run},
     )
-
-    assert response.status_code == status_code, response.text
-    if status_code == 400:
-        detail = response.json()["detail"]
-        assert "OPD rollout prompt+completion)=33024" in detail
-        assert "serving max_model_len=32768" in detail
-    else:
-        assert response.json()["state"] == "dry_run"
+    assert response.status_code == 400, response.text
+    assert "Built-in OPD has been retired" in response.json()["detail"]
+    assert "custom" in response.json()["detail"]
+    assert api.get("/v1/runs", headers=_bearer(token)).json()["runs"] == []
 
 
 def test_grpo_rollout_shape_rejects_before_secrets_persistence_or_submission(
@@ -8312,57 +8252,3 @@ def test_record_model_exported_posts_allowlisted_event(monkeypatch):
         is False
     )
     assert posted == {}
-
-
-@pytest.mark.parametrize(
-    ("plane_misconfigured", "status_code"),
-    [
-        # the plane's own credential is unset: nothing the submitter can author fixes it
-        (True, 503),
-        # the submitted shape exceeds the broker's limits: their spec is the fix
-        (False, 400),
-    ],
-)
-def test_managed_teacher_rejection_reports_which_side_is_at_fault(
-    api, monkeypatch, tmp_path, plane_misconfigured, status_code
-) -> None:
-    """A plane outage must not be reported as a bad request.
-
-    The submit path funnels every exception into one 400, which is right for a spec the user must
-    change and wrong for a credential only an operator can set. Reporting both as a client error
-    would re-create, at the HTTP layer, the same "misconfiguration looks like a spec error"
-    conflation that hoisting this gate to submit time exists to end.
-    """
-    import flash.envs.loading.loader as envs_loader
-    from tests._helpers.teacher import configure_managed_teacher
-
-    configure_managed_teacher(monkeypatch)
-    # offline: the image-opd preflight ahead of this gate resolves the environment reference to
-    # inspect its dataset. point it at an empty local dir so no github request is made.
-    offline_env = tmp_path / "offline-env"
-    offline_env.mkdir()
-    (offline_env / "environment.py").write_text("")
-    monkeypatch.setattr(envs_loader, "_resolve_ref_sha", lambda *_a, **_k: "0" * 40)
-    monkeypatch.setattr(
-        envs_loader,
-        "_resolve_environment_reference",
-        lambda *_a, **_k: str(offline_env / "environment.py"),
-    )
-    train = {**SPEC["train"], "teacher_model": "glm-5.3"}
-    if plane_misconfigured:
-        monkeypatch.delenv("PARASAIL_API_KEY", raising=False)
-    else:
-        # a shape whose planned teacher score items exceed the broker ceiling. the multiplier is
-        # 192 (64 turns x 3 no-signal attempts), so this asks for ~9.8M against a 1M limit.
-        train |= {"max_steps": 100, "batch_size": 64, "group_size": 8, "max_examples": 6400}
-    spec = {**SPEC, "algorithm": "opd", "train": train}
-
-    response = api.post(
-        "/v1/runs", headers=_bearer(_new_user_token()), json={"spec": spec, "dry_run": True}
-    )
-
-    assert response.status_code == status_code, response.text
-    detail = str(response.json()["detail"])
-    # the reason has to survive the mapping too: a bare status code still leaves an operator
-    # guessing which of the two plane-side names is unset.
-    assert ("PARASAIL_API_KEY" in detail) is plane_misconfigured, detail

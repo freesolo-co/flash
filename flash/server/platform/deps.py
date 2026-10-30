@@ -10,6 +10,7 @@ from fastapi import Header, HTTPException
 
 import flash.runner.lifecycle.status as run_status
 from flash.client.runtime_secrets import DEFAULT_RUNTIME_SECRET_KEYS
+from flash.core.catalog import validate_new_run_algorithm
 from flash.core.spec import JobSpec, require_project_id
 from flash.schema import ConfigError, spec_from_dict
 from flash.server.platform import auth, db
@@ -205,6 +206,10 @@ def _parse_spec(payload: dict, run_id: str) -> JobSpec:
         spec_raw = {}
     if not isinstance(spec_raw, dict):
         raise HTTPException(status_code=400, detail="spec must be a JSON object")
+    try:
+        validate_new_run_algorithm(spec_raw.get("algorithm"))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     env_raw = spec_raw.get("environment")
     if env_raw is None:
         env_raw = {}

@@ -1018,11 +1018,11 @@ def test_sft_cost_warns_when_an_env_key_shadows_the_saved_login(tmp_path, monkey
     assert "shadowed!" in capsys.readouterr().err
 
 
-@pytest.mark.parametrize("algorithm", ["grpo", "opd"])
+@pytest.mark.parametrize("algorithm", ["grpo"])
 def test_warm_start_non_sft_cost_uses_the_authoritative_server_quote(
     tmp_path, monkeypatch, capsys, algorithm
 ):
-    """warm-start grpo/opd use submit preparation so the resolved source rank prices the quote."""
+    """warm-start grpo uses submit preparation so the resolved source rank prices the quote."""
     from flash.cli.commands.ops import train as commands
 
     client = _use_client(
@@ -1084,11 +1084,11 @@ def test_warm_start_non_sft_cost_uses_the_authoritative_server_quote(
     assert "provisional rank-1" not in captured.err
 
 
-@pytest.mark.parametrize("algorithm", ["grpo", "opd"])
+@pytest.mark.parametrize("algorithm", ["grpo"])
 def test_plain_non_sft_cost_uses_the_authoritative_server_quote(
     tmp_path, monkeypatch, capsys, algorithm
 ):
-    """ordinary grpo/opd use preparation so resolved revision and disk cannot change the quote."""
+    """ordinary grpo uses preparation so resolved revision and disk cannot change the quote."""
     from flash.cli.commands.ops import train as commands
 
     client = _use_client(monkeypatch, _QuotingClient({"estimated_cost_usd": 3.25}))

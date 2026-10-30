@@ -467,7 +467,7 @@ def test_a_nonexistent_environment_is_refused_before_the_402(api, monkeypatch):
 
 
 def test_transient_environment_resolve_is_attempted_once_per_request(api, monkeypatch):
-    """packaged opd defers after one bounded request-side attempt on a transient failure."""
+    """packaged grpo defers after one bounded request-side attempt on a transient failure."""
     from flash.envs.registry import packages
     from flash.envs.registry.azure import RegistryError
 
@@ -478,14 +478,10 @@ def test_transient_environment_resolve_is_attempted_once_per_request(api, monkey
         raise RegistryError("Azure unavailable", status=503)
 
     monkeypatch.setattr(packages, "resolve_revision", _transient)
-    monkeypatch.setattr(
-        "flash.server.domain.teacher.broker.preflight_validate_managed_teacher",
-        lambda _spec: None,
-    )
     spec = {
         **SPEC,
-        "algorithm": "opd",
-        "train": {**SPEC["train"], "teacher_model": "deepseek-v4.1-flash-1017"},
+        "algorithm": "grpo",
+        "train": SPEC["train"],
     }
 
     res = api.post(
@@ -499,7 +495,7 @@ def test_transient_environment_resolve_is_attempted_once_per_request(api, monkey
     assert calls == [1], f"environment ref was resolved {len(calls)} times"
 
 
-def test_managed_opd_attempts_azure_without_a_github_token(api, monkeypatch):
+def test_managed_grpo_attempts_azure_without_a_github_token(api, monkeypatch):
     """Managed resolution uses Azure even when no GitHub credential exists."""
     from flash.envs.registry import packages
     from flash.envs.registry.azure import RegistryError
@@ -512,14 +508,10 @@ def test_managed_opd_attempts_azure_without_a_github_token(api, monkeypatch):
 
     monkeypatch.delenv("GITHUB_TOKEN", raising=False)
     monkeypatch.setattr(packages, "resolve_revision", _resolve)
-    monkeypatch.setattr(
-        "flash.server.domain.teacher.broker.preflight_validate_managed_teacher",
-        lambda _spec: None,
-    )
     spec = {
         **SPEC,
-        "algorithm": "opd",
-        "train": {**SPEC["train"], "teacher_model": "deepseek-v4.1-flash-1017"},
+        "algorithm": "grpo",
+        "train": SPEC["train"],
     }
 
     res = api.post(
@@ -742,34 +734,7 @@ def test_unsupported_spec_reports_itself_rather_than_insufficient_balance(api, m
         raise precheck_http_error(402, detail="insufficient balance")
 
     monkeypatch.setattr(billing_mod, "precheck_training_run", _block)
-    unsupported_spec = {
-        **SPEC,
-        # image records distilled from a text-only teacher. the subject of this test is the
-        # ORDERING, so the case only has to be something static validation refuses; it deliberately
-        # is not a warm-start or a multi-turn-image case, because both of those were once
-        # unsupported and have since been implemented, and each silently turned this into a test
-        # that asserted nothing the moment its premise became supported. a teacher that cannot see
-        # images is a property of the teacher, not a gap waiting to be closed.
-        "algorithm": "opd",
-        "train": {**SPEC["train"], "teacher_model": "deepseek-v4.1-flash-1017"},
-        "environment": {
-            **SPEC["environment"],
-            "params": {
-                "records": [
-                    {
-                        "input": [
-                            {
-                                "role": "user",
-                                "content": [
-                                    {"type": "image_url", "image_url": {"url": "http://x/y.png"}}
-                                ],
-                            }
-                        ]
-                    }
-                ],
-            },
-        },
-    }
+    unsupported_spec = {**SPEC, "algorithm": "opd"}
     res = api.post(
         "/v1/runs",
         json={"spec": unsupported_spec, "dry_run": True},
@@ -777,7 +742,7 @@ def test_unsupported_spec_reports_itself_rather_than_insufficient_balance(api, m
     )
 
     assert res.status_code == 400, res.text
-    assert "cannot see images" in res.text
+    assert "Built-in OPD has been retired" in res.text
     assert "insufficient" not in res.text
 
 

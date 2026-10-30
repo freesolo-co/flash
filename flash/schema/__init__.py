@@ -10,7 +10,12 @@ from dataclasses import fields as dataclass_fields
 from typing import Any
 
 from flash._internal.channel import CLI_NAME
-from flash.core.catalog import normalize_algorithm, resolve_model, serving_lora_rank_cap
+from flash.core.catalog import (
+    normalize_algorithm,
+    resolve_model,
+    serving_lora_rank_cap,
+    validate_new_run_algorithm,
+)
 from flash.core.grpo import resolve_grpo_rollout_shape
 from flash.core.spec import (
     FIXED_SEED,
@@ -151,12 +156,16 @@ def spec_and_train_keys_from_file(
     *,
     project_required: bool = False,
 ) -> tuple[JobSpec, frozenset[str]]:
-    """parse a config and retain the raw authored [train] keys for schema preflights."""
+    """Parse a new training request and retain authored [train] keys for schema preflights."""
     raw = load_toml(path)
     for extra in extra_configs or []:
         _deep_merge(raw, load_toml(extra))
     for item in overrides or []:
         _apply_override(raw, item)
+    try:
+        validate_new_run_algorithm(raw.get("algorithm"))
+    except ValueError as exc:
+        raise ConfigError(str(exc)) from exc
     train_raw = raw.get("train")
     authored_train_keys = frozenset(train_raw) if isinstance(train_raw, dict) else frozenset()
     return (
@@ -638,6 +647,7 @@ def _validate_wandb_section(raw: dict[str, Any]) -> WandbSpec:
 def spec_from_dict(
     raw: dict[str, Any], run_id: str | None = None, *, project_required: bool = False
 ) -> JobSpec:
+    # Keep legacy configs readable. New CLI/API requests separately validate offered algorithms.
     model, model_revision, project, algorithm, thinking = _validate_top_level(raw, project_required)
     env_raw, environment_pip, environment_secrets = _validate_environment_section(raw, algorithm)
     train_raw = _validate_train_section(raw, algorithm)

@@ -8,7 +8,9 @@ from typing import Any
 
 from flash.content.image_descriptors import MAX_IMAGES_PER_CONVERSATION
 
-ALGORITHMS = ("sft", "grpo", "opd")
+# Algorithms offered for new built-in runs. Retired workers remain readable/recoverable.
+ALGORITHMS = ("sft", "grpo")
+_WORKER_ALGORITHMS = (*ALGORITHMS, "opd")
 
 # algorithms whose training step samples on-policy student completions, unlike fixed-dataset sft.
 # import ``samples_on_policy`` instead of hand-rolling algorithm tuples at each call site.
@@ -62,9 +64,20 @@ def normalize_algorithm(value: str) -> str:
         # escapes the callers' ValueError/ConfigError guards -> uncaught 500. Raise ValueError instead.
         raise ValueError(f"algorithm must be a string, got {type(value).__name__}")
     value = value.lower()
-    if value not in ALGORITHMS:
+    if value not in _WORKER_ALGORITHMS:
         raise ValueError(f"unsupported algorithm: {value}; known: {', '.join(ALGORITHMS)}")
     return value
+
+
+def validate_new_run_algorithm(value: str) -> str:
+    """Reject retired offerings at admission, without invalidating persisted job specs."""
+    algorithm = normalize_algorithm(value)
+    if algorithm == "opd":
+        raise ValueError(
+            "Built-in OPD has been retired. Use the custom algorithm API for on-policy "
+            "distillation (algorithm = 'custom'); existing OPD runs and checkpoints remain accessible."
+        )
+    return algorithm
 
 
 DEFAULT_GPU = "RTX 5090"
@@ -365,7 +378,7 @@ MODELS: dict[str, ModelInfo] = {
             (4608, 4608, 1),
             (12288, 4096, 32),
         ),
-        algos=ALGORITHMS,
+        algos=_WORKER_ALGORITHMS,
         min_vram_gb=48,
         min_disk_gb=120,
         # NOT QLoRA: a peft bnb merge during GRPO rollout diverges the rollout's precision from the
@@ -496,7 +509,7 @@ MODELS: dict[str, ModelInfo] = {
         ),
         lora_expert_count=256,
         vocab_size=248_320,
-        algos=ALGORITHMS,
+        algos=_WORKER_ALGORITHMS,
         min_vram_gb=141,
         # Floor to 100 GB so SFT lands on H200, not the thin-margin consumer Blackwell or 80 GB H100.
         sft_min_vram_gb=100,
@@ -672,4 +685,10 @@ def validate_model_for_algorithm(model_id: str, algorithm: str) -> ModelInfo:
 
 
 def public_model_rows() -> list[dict[str, Any]]:
-    return [_with_merge_disk_floor(model).to_dict() for model in list_models()]
+    return [
+        replace(
+            _with_merge_disk_floor(model),
+            algos=tuple(algo for algo in model.algos if algo in ALGORITHMS),
+        ).to_dict()
+        for model in list_models()
+    ]

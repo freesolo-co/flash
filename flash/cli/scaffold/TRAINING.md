@@ -15,8 +15,7 @@ actually produced, and decide — honestly — whether the model got better.
 ## Using Flash
 
 Flash is a **managed** training service with a thin CLI/client. You author an
-environment (the task + its reward), publish it, and submit SFT, GRPO, or on-policy
-**distillation** runs from a TOML config. Flash allocates the cheapest fitting managed GPU class, runs the job,
+environment (the task + its reward), publish it, and submit SFT or GRPO runs from a TOML config. Flash allocates the cheapest fitting managed GPU class, runs the job,
 streams logs back, and serves the result. You never handle infrastructure credentials —
 you authenticate once with a freesolo API key, and everything below is a `flash` CLI
 command.
@@ -86,7 +85,6 @@ environment.py          # the task: how to prompt the model and how to score it
 dataset/train.jsonl     # training rows, one JSON object per line: {"input": ..., "output": ...}
 configs/sft.toml        # an SFT run config
 configs/rl.toml         # a GRPO (RL) run config
-configs/opd.toml        # an on-policy distillation run config
 TRAINING.md             # this file
 ```
 
@@ -142,7 +140,7 @@ conversation across turns. The reward is the same `RewardResult` contract either
 
 If the environment class can return image-bearing user observations from `step_episode`, declare
 `image_observations = True` on that class. This is a class capability, not a TOML setting: Flash uses
-it to reject a text-only model or OPD teacher before model work. Set it only for environments that
+it to reject a text-only model before model work. Set it only for environments that
 can actually emit images. The capability does not by itself enable per-turn image rollout wiring.
 
 ### 2. Publish the environment
@@ -253,7 +251,7 @@ contract should be identical — and hash the dataset files for the data half.
 ```toml
 model = "Qwen/Qwen3.5-9B"   # see `flash models list`
 project = "PROJECT_UUID"  # required UUID from `flash projects create`
-algorithm = "sft"           # "sft" (supervised), "grpo" (RL), or "opd" (on-policy distillation)
+algorithm = "sft"           # "sft" (supervised) or "grpo" (RL)
 # thinking = true           # opt-in reasoning mode, for models that support it
 # seed = 42                 # the run's one seed; omitted defaults to 42
 
@@ -274,7 +272,7 @@ max_examples = 2            # rows to train on (the starter dataset has 2)
 # max_steps = 100           # positive values set the exact optimizer-update horizon
 # save_at_steps = [10, 50, 100]  # requires max_steps; overrides save_every
 lora_rank = 32              # lora_alpha defaults to 2 x lora_rank; set it to override
-# All knobs live under [train]. Do not add [sft], [grpo], or [opd] tables.
+# All knobs live under [train]. Do not add [sft] or [grpo] tables.
 
 [wandb]
 # new scaffolds set `project` from the selected Freesolo project and `run_name` from the folder
@@ -283,31 +281,30 @@ lora_rank = 32              # lora_alpha defaults to 2 x lora_rank; set it to ov
 # run_name = "sft-run-1"
 ```
 
-**Knobs are scoped by algorithm.** `[train]` is one flat table shared by all three algorithms,
+**Knobs are scoped by algorithm.** `[train]` is one flat table shared by the built-in algorithms,
 but a knob the run's algorithm cannot consume is REJECTED at parse time rather than silently
 ignored. Everything in the block above (`epochs`, `max_examples`, `max_steps`, `save_every`,
 `save_at_steps`, `lora_rank`, `lora_alpha`, `learning_rate`, `max_context_tokens`,
 `init_from_adapter`) applies everywhere. These do not:
 
-| knob                                                                                                            | sft      | grpo     | opd      |
-| --------------------------------------------------------------------------------------------------------------- | -------- | -------- | -------- |
-| `batch_size`                                                                                                    | yes      | rejected | rejected |
-| `prompts_per_step`                                                                                              | rejected | yes      | yes      |
-| `group_size`, `temperature`, `max_completion_tokens`, `kl_penalty_coef`, `stop_sequences`, `structured_outputs` | rejected | yes      | yes      |
-| `thinking_length_penalty_coef`, `credit_assignment`                                         | rejected | yes      | rejected |
-| `teacher_model`                                                                                                 | rejected | rejected | yes      |
+| knob                                                                                                            | sft      | grpo     |
+| --------------------------------------------------------------------------------------------------------------- | -------- | -------- |
+| `batch_size`                                                                                                    | yes      | rejected |
+| `prompts_per_step`                                                                                              | rejected | yes      |
+| `group_size`, `temperature`, `max_completion_tokens`, `kl_penalty_coef`, `stop_sequences`, `structured_outputs` | rejected | yes      |
+| `thinking_length_penalty_coef`, `credit_assignment`                                         | rejected | yes      |
 
 **The optimizer batch has a different name per algorithm because it is a different quantity.**
 Under SFT, `batch_size` is an input to the packaged-dataset estimate, which resolves it against the
 selected row count into the optimizer batch (and pins it to 1 when packing is off). Under
-GRPO/OPD there is no profile: `prompts_per_step` IS the optimizer batch, straight through to verl's
+GRPO there is no profile: `prompts_per_step` IS the optimizer batch, straight through to verl's
 `data.train_batch_size` and `ppo_mini_batch_size`. They were one key once, which meant the standard
 SFT out-of-memory workaround `batch_size = 1`, copied into an RL config, silently trained one prompt
 per update. Now it is a parse error naming the key you want.
 
 So `credit_assignment` (multi-turn GRPO defaults to one reward per rollout; `"per_turn"` gives
 turn-level credit, needs `per_turn_rewards` metadata, and is unsupported for tool-calling envs —
-see below) belongs on a `grpo` run, and setting it on `sft` or `opd` is a submit-time error.
+see below) belongs on a `grpo` run, and setting it on `sft` is a submit-time error.
 
 **Key placement that is easy to get wrong.** Every one of these is a real submit-time
 error or a wrong-config-that-still-runs; `--dry-run` catches the loud ones for free.
@@ -428,7 +425,7 @@ is the _expected_ steady state, not a symptom. Upload failures can stretch the g
 `flash runs status` says so itself once the heartbeat passes 5 minutes — _"heartbeat uploads
 are throttled; quiet is not dead"_.
 
-**The threshold is algorithm-dependent: OPD is far tighter than 15 min.** The 900 s figure is
+**Legacy OPD runs use a tighter heartbeat threshold.** The 900 s figure is
 the throttle for an ordinary stage ping. OPD's post-update ping is issued with `force=True`,
 which bypasses that throttle and is instead bounded by the forced-commit floor of **60 s**
 (`_HB_FORCE_MIN_INTERVAL_S`), gated on the step having advanced. So an OPD run that is still
@@ -438,7 +435,7 @@ exactly the window the 15 min guidance below would tell you to ignore on a bille
 
 So treat age as a threshold, not a verdict, and pick the threshold for the algorithm:
 
-- _OPD, past ~2-3 min in a stepping stage (`opd_step`):_ act. Updates should be re-publishing
+- _Legacy OPD, past ~2-3 min in a stepping stage (`opd_step`):_ act. Updates should be re-publishing
   at the 60 s floor, so a multi-minute gap is already anomalous rather than expected quiet.
   (Setup and rollout stages — `opd_model_load`, `opd_filtering_prompts`, `opd_vllm_initializing`
   — are liveness-driven and legitimately quieter; the tight threshold is for stepping.)
@@ -690,8 +687,7 @@ spending another GPU run:
 | Thinking reward grades the wrong text                        | Rewards accidentally score hidden reasoning, or ignore reasoning you meant to inspect                                                                                                    | By default, score the answer text. In thinking mode the response object is still string-compatible, but also exposes `.completion`, `.thinking`, and `.raw` when a reward intentionally needs those fields.                                                                                                                                                                                                                     |
 | All-zero or flat GRPO reward                                 | `reward` stays near 0 and outputs do not improve                                                                                                                                         | Make the reward dense: give partial credit for parse/format/execution/correctness tiers, and log a separate clean `success` metric. Do not keep rerunning an all-zero reward.                                                                                                                                                                                                                                                   |
 | Reward rises but behavior is worse                           | Short, templated, malformed, or reward-hacked outputs score well                                                                                                                         | Deploy the adapter and probe real examples. Add hard validity gates before judge calls, penalize degenerate shortcuts, and judge the outcome rather than the surface string.                                                                                                                                                                                                                                                    |
-| OPD makes the student worse, not better                      | The distilled adapter scores _below_ its SFT/base start even though the per-token loss fell                                                                                              | The teacher, not a knob, is the ceiling. Reverse-KL only pulls the student toward the managed GLM-5.3 teacher, so a teacher that is weak or wrong on _your_ task transfers its mistakes. Vet the teacher before you spend — the "On-policy distillation" section gives the two ways to do that with a managed key. If it can't beat your student, use GRPO or SFT instead — OPD cannot exceed a teacher that can't do the task. |
-| Output is truncated                                          | Correct-looking answers cut off mid-response or JSON is incomplete                                                                                                                       | Increase `max_completion_tokens` for GRPO/OPD rollouts or `max_context_tokens` for total prompt+completion context only after seeing truncation. Oversizing them by default just burns memory/cost.                                                                                                                                                                                                                             |
+| Output is truncated                                          | Correct-looking answers cut off mid-response or JSON is incomplete                                                                                                                       | Increase `max_completion_tokens` for GRPO rollouts or `max_context_tokens` for total prompt+completion context only after seeing truncation. Oversizing them by default just burns memory/cost.                                                                                                                                                                                                                             |
 | Infrastructure, CUDA, OOM, vLLM, or kernel failure           | Run errors before useful metrics, often during setup/model load                                                                                                                          | Read `flash runs log <run-id>`. Flash advances a single executed-width-aware usable-VRAM floor for candidate-bound infrastructure and OOM failures, then retries only a strictly larger fitting candidate while keeping infrastructure and OOM budgets separate. Reduce `max_context_tokens`, `max_completion_tokens`, or `group_size` when no larger candidate remains.                                                        |
 | Run looks stuck after disconnecting                          | Terminal stopped streaming but the job may still be alive                                                                                                                                | Ctrl-C detaches. Use `flash runs log <run-id> --follow` to reattach, `flash runs log <run-id>` for the console/error output, or `flash runs cancel <run-id>` if you intentionally want to stop it.                                                                                                                                                                                                                              |
 | Two runs training the same thing                             | `flash runs list` shows a live run you thought you had killed, on top of the one you just submitted                                                                                      | Killing the `flash train` client only detaches; it never cancels. Always `flash runs list` and cancel the stale run _before_ re-submitting, and never wrap `flash train` in `timeout`.                                                                                                                                                                                                                                          |
@@ -712,9 +708,9 @@ spending another GPU run:
   value and the final value. A flat or noisy trend with no improvement is not success.
 - **Read the model's outputs, not just the metrics.** A rising reward (or falling loss)
   can come from reward-hacking or a degenerate output the metric still credits — metrics
-  alone never establish that the model got better. For GRPO and OPD, `flash runs log` surfaces a
+  alone never establish that the model got better. For GRPO, `flash runs log` surfaces a
   handful of full (untruncated) sample completions at the heartbeat cadence — GRPO shows
-  each completion's reward, OPD its distillation loss — with the first sample-bearing update
+  each completion's reward — with the first sample-bearing update
   forced through, so you can catch skipped reasoning or a parroted prompt placeholder by
   step 1-2. These are bounded diagnostics, not every rollout or a held-out
   evaluation, so still **deploy the adapter and probe it**: `flash models deploy <run-id>/final` then
@@ -883,7 +879,7 @@ Pick SFT when you already have good answers and want the model to imitate them.
   GRPO-sleep sizing, so setting either alongside `init_from_adapter` is rejected at submit; it
   also rejects a source adapter whose rank exceeds the serving cap.
 - **Any algorithm can warm-start from any other.** All nine source/target combinations are
-  supported — `sft`, `grpo`, and `opd` each read a source adapter produced by any of the three,
+  supported — SFT and GRPO can read adapters from SFT, GRPO, or legacy OPD runs,
   including same-algorithm continuation (`sft` → `sft` to keep training on more data, `grpo` →
   `grpo` to extend a run). The source is named the same way in every case, and the only
   cross-run requirements are the shared base model and the rank/alpha rules above.
@@ -895,13 +891,13 @@ algorithm = "grpo"
 [train]
 # use the source run's permanent final checkpoint, or /step-n for a specific checkpoint
 # listed by `flash runs checkpoint <run-id>`. the source may be an sft, grpo, or opd run,
-# and `algorithm` above may be any of the three.
+# and `algorithm` above may be sft or grpo.
 init_from_adapter = "<source-run-id>/final"
 # do NOT set lora_rank or lora_alpha for a warm-start: the source adapter's rank and alpha
 # metadata are authoritative, and setting either alongside init_from_adapter is rejected
 ```
 
-SFT, GRPO, and OPD all accept **epoch-driven** configs (`epochs`). For GRPO/OPD,
+SFT and GRPO accept **epoch-driven** configs (`epochs`). For GRPO,
 an epoch is one pass over the retained prompt pool after `max_examples` and prompt-budget filtering;
 optimizer-step counts are derived from those epochs. A positive `[train] max_steps` replaces that
 derived count with an exact update horizon for every algorithm. `[train] save_at_steps`
@@ -911,186 +907,17 @@ run fails if a requested exact save cannot be saved and published.
 
 ---
 
-## On-policy distillation (`algorithm = "opd"`)
+## On-policy distillation migration
 
-Pick distillation when a much stronger **teacher** model can grade your student's work
-token-by-token. The student samples on-policy (like GRPO), a managed teacher (GLM 5.3 by default,
-or another via `[train] teacher_model`) scores each of the _student's_ completions, and a dense per-token
-loss teaches the student to match the teacher — far more sample-efficient than reward-based RL and
-with no reward to design. It supports `epochs` like SFT/GRPO and produces a LoRA served exactly like SFT.
+Built-in `algorithm = "opd"` is retired. New training runs, dry runs, and cost quotes reject it.
+Use `algorithm = "custom"` and implement the distillation loop with the custom algorithm API
+instead. The custom loop owns teacher access, token alignment, sampling, and the loss; the old
+managed `train.teacher_model` configuration does not transfer automatically.
 
-- **Vet the teacher on your task before you distil — this is a precondition, not a formality.**
-  Reverse-KL can only pull the student _toward_ the selected teacher, so OPD's ceiling is
-  roughly the teacher's own competence at your task. If the teacher is weak, frequently wrong, or
-  solves the task with a strategy your environment can't reward, distillation faithfully transfers
-  those flaws and **drives the student _below_ its SFT/base starting point instead of above it** — a
-  low per-token loss just means it matched a bad teacher. Only run OPD when the teacher clearly
-  beats your student (and your target bar) _and_ solves the task the way you want the student to. When
-  the teacher is at or below your student on the task, OPD is the wrong tool — reach for GRPO
-  (reward-driven, can exceed any single teacher) or SFT on curated data instead. `[train] teacher_model`
-  lets you pick the teacher that best fits your task without changing anything else.
-
-  **How to check, given the key is managed.** Flash has no command that generates teacher
-  rollouts. The control-plane broker owns `PARASAIL_API_KEY`; GPU workers receive only
-  `FLASH_PUBLIC_URL` and an attempt-scoped `FLASH_TEACHER_CAPABILITY`, never the provider key.
-  The broker scores the student's own
-  tokens, so there is nothing to run locally with your Flash credentials alone.
-  Two workable routes:
-
-  - _Best, if you can:_ get your own access to the same model (the allow-list is Parasail-hosted,
-    and these are widely available elsewhere too), point your environment's scorer at it, and grade
-    a held-out split exactly as you would a student. Read the score _and_ a sample of trajectories —
-    a teacher that is right for the wrong reasons transfers the wrong reasons.
-  - _Cheapest, always available:_ run a deliberately short OPD probe (a small `max_steps` on a
-    slice of the data), deploy that adapter, and evaluate it against the same student baseline. A
-    short run that moves the student the wrong way is a warning, not a verdict — trajectories dip
-    before recovering, and a slice need not represent the eval distribution. Treat it as a signal
-    to spend a little more evidence, not a lot more steps: evaluate two or three checkpoints from
-    that probe on the full split before deciding. A dip that deepens across checkpoints is the
-    teacher or the algorithm; a single down reading is noise until it repeats.
-
-    **Schedule those checkpoints before you submit, or they will not exist.** OPD saves every
-    **20** optimizer steps by default, so a probe short enough to be cheap (under 20 updates)
-    publishes only its final step and there is nothing to compare. Name the steps explicitly:
-
-    ```toml
-    [train]
-    max_steps    = 12
-    save_at_steps = [4, 8, 12]   # exact steps; overrides the periodic save_every entirely
-    ```
-
-    Every entry must land within `max_steps`, and an out-of-range one is **rejected, not skipped**:
-    config validation fails the submit outright, and the worker re-checks it again before training
-    starts. So a stale entry left over from a longer run does not quietly cost you one checkpoint —
-    it stops the run from starting.
-
-- **Pick the teacher with `[train] teacher_model`; the key stays managed.** The teacher defaults to
-  the managed **GLM 5.3** and is selectable from a fixed, managed allow-list:
-  `glm-5.3` (default), `kimi-k3`, `qwen3.8-27b`, `qwen3.5-397b-a17b`, `deepseek-v4.1-flash-1017`, or `qwen3-vl-235b`.
-  Every option is a Parasail-hosted model reached through the control-plane broker, so there is
-  nothing to export or declare. An opd run submits like any other, and a `PARASAIL_API_KEY` in your
-  shell is ignored. Arbitrary bring-your-own teacher models or keys are not supported (the allow-list
-  is curated to teachers verified to score the student's tokens). Image-bearing opd requires
-  `qwen3.8-27b`, `qwen3-vl-235b`, or `qwen3.5-397b-a17b` and is single-turn only.
-  These routes have verified image expansion and supplied-token scoring. Other teachers are
-  available for text OPD only: native model vision support alone does not establish compatibility
-  with Flash's image scoring contract. The key is never stored in the spec or needed at serving time;
-  teacher token cost varies by model and is shown in the pre-flight estimate.
-- **The student (Qwen) and the teacher have different tokenizers.** Flash
-  bridges the vocabulary mismatch with **groupwise reverse-KL** (the collinear-ai _spider_ / Tinker
-  method): it aligns the two tokenizations by shared source-text spans and applies per-span reverse
-  KL using only realized-token logprobs — no vocabulary projection, so it covers every token exactly
-  and works for any student tokenizer. When the tokenizers happen to agree it reduces to plain
-  per-token reverse KL (Thinking Machines, _On-Policy Distillation_). Nothing to configure.
-- **Works for multi-turn envs too.** Against an `EnvironmentMultiTurn`, opd rolls out each episode
-  (driving `step_episode` / observations just like GRPO) and distils EVERY assistant turn against the
-  teacher, each conditioned on the transcript up to that turn — the episode's total reverse-KL over
-  the student's generated tokens is the sum of its per-turn reverse-KLs. Env/observation tokens are
-  never distilled (they're context, not the student's output). Set `[train] max_context_tokens` to bound the
-  transcript; the teacher must cover it (the allow-listed teachers' contexts far exceed the default budget).
-- **Judge it like SFT.** Distillation logs a falling per-token loss; a low loss alone is not proof.
-  Keep a held-out split, `flash models deploy` the adapter, and score it — confirm the student actually
-  moved toward the teacher's behavior, not just its surface tokens.
-
-```toml
-# configs/opd.toml
-model = "Qwen/Qwen3.5-9B"
-algorithm = "opd"
-
-[environment]
-id = "your-org/your-project/my-env"
-
-[train]
-epochs = 1
-max_examples = 2
-lora_rank = 32
-# teacher_model = "glm-5.3"                             # managed teacher to distil from; one of
-#                                                       # glm-5.3 (default) | kimi-k3 |
-#                                                       # qwen3.5-397b-a17b | deepseek-v4.1-flash-1017 |
-#                                                       # qwen3.8-27b | qwen3-vl-235b
-#                                                       # (key stays managed)
-# kl_penalty_coef = 1.0                                 # reverse-KL scale
-```
-
-The cross-tokenizer reverse-KL is computed over shared decoded-text spans and so **cannot supervise
-the zero-width stop token**. No auxiliary EOS loss is applied. `truncated_rollouts` records completions
-that reached the length cap without EOS or a configured stop. Warm-starting from an SFT adapter can
-still improve initial termination behavior.
-
-A verbose teacher can also inflate the _content_ the student distils toward through long per-turn
-reasoning and extra multi-turn looping, so episodes still forfeit against the length/turn budget
-regardless of stop-token behavior. Because the teacher scores the
-student's rollouts **conditioned on your environment's own system prompt**, you can shrink its target
-distribution at the source: give the prompt used for OPD rollouts a **hard, specific reasoning
-budget** — e.g. "reason in at most two or three sentences, then act; once you have started, do not
-reconsider" — rather than a vague "be brief." The phrasing matters. A soft brevity request can
-**backfire on a thinking teacher**, trimming the median while _inflating_ the long tail (the model
-spirals when told to be brief on a problem it finds hard), which is exactly the tail that drives
-runaway. Constrain the content with the prompt and monitor `truncated_rollouts` for length-cap
-failures. This assumes the teacher is still strong at the task (vet it first, above).
-
-### Reverse-KL over-sharpens — cut steps and watch entropy (every model)
-
-Reverse-KL is **mode-seeking**: it sharpens the student's next-token distribution toward the
-teacher's dominant mode, and it keeps sharpening for as long as you train. This affects **every OPD
-run, at every size**. Treat over-sharpening as a default risk, not a small-model edge case. The student's
-per-token entropy falls as training proceeds; past the point where it has learned the task, extra
-steps only over-sharpen — _lowering_ accuracy. Push it far enough and the distribution peaks so hard
-that **greedy (temperature=0) decoding falls into a repetition loop** that repeats a phrase to the
-length cap and never emits your answer. The loss looks healthy the whole run (reverse-KL is being
-minimized _by_ the collapse), so it is invisible in the loss curve and only surfaces at serving —
-where **temperature=0 is the default**, so it hits real callers, not just a sampled eval.
-
-**Severity scales with size**: on the largest catalog models over-training mostly just leaves
-accuracy on the table (a late checkpoint slightly worse than an earlier one); on the smallest it
-turns into the full-blown greedy loop. But the fix is the same everywhere, and cutting steps helped
-_every_ size tested. Four levers, each attacking the same over-sharpening — the first two apply to
-every run, the last two matter more the smaller the model:
-
-- **Train fewer steps (highest leverage, every size).** The student typically peaks early — often
-  around ~20 optimizer steps — and every step after is pure over-sharpening that _lowers_ accuracy
-  while _raising_ the loop rate. **Which knob to cut depends on whether your config sets `max_steps`.**
-  A positive `max_steps` is the authoritative update count (`resolve_update_horizon()` returns it and
-  ignores the derived horizon), so with one set, cutting `max_examples` or `epochs` does not shorten
-  training at all — you would rerun the identical overlong horizon at the same cost. Lower or remove
-  `max_steps` instead. Only when the horizon is _derived_ (no `max_steps`, or `max_steps = 0`) does
-  cutting `max_examples` (or `epochs`) stop the run before the collapse. Either way,
-  deploy an early **checkpoint** (`flash runs checkpoint <run>`, `flash models deploy <run>/step-N`) rather
-  than the final adapter. This helped at every size tested, and models that never looped still came
-  out equal-or-better at the earlier checkpoint. When in doubt, sweep a few checkpoints and pick the best, don't assume the last
-  step is the best.
-- **Lower the rank (more, the smaller the model).** A rank-32 adapter is a larger relative
-  perturbation on smaller models, giving reverse-KL more capacity to over-sharpen. Prefer a modest
-  rank (16) as the default for OPD and only raise it with a reason.
-- **Match the teacher to the student.** A _stronger_ teacher is not universally better. The harder
-  it is for the student to match, the harder the collapse. Early-stopping largely neutralizes this
-  gap, since the teacher-driven
-  over-sharpening only compounds over many steps.
-- **Diagnose it at serving.** Evaluate at **temperature=0** and flag
-  `finish_reason=length` completions that never emit your answer token. Compare an early checkpoint
-  against the final one to watch the loop emerge over steps.
-
-### Distilling from base with no format anchor
-
-`opd` straight from a base model (no SFT warm-start) faithfully distils the teacher's _reasoning_ but
-the student never learns your **answer format** — it terminates (`finish_reason=stop`) without ever
-emitting the boxed/tagged answer, so completions score unparseable even when the reasoning is fine.
-On-policy distillation reinforces the student's _own_ tokens, so if the base never produces the
-format there is nothing to reinforce (and a downstream GRPO pass can't rescue it — with no
-correctly-formatted rollout to reward, RL has no signal to climb). Two fixes:
-
-- **Warm-start from an SFT adapter** (`[train] init_from_adapter`) — the SFT installs the output
-  format first, then OPD refines the content. This is the reliable default for structured-answer tasks.
-- **Constrain the rollouts with `[train] structured_outputs`** (guided decoding) so the answer is
-  forced into your schema instead of being left to the base model's habits. This fixes the _format_
-  problem only; the _loop_ problem is fixed by the levers above.
-
-  Field order in that schema is a `thinking = false` lever, not a rescue for runaway reasoning.
-  Under `thinking = true` the grammar is deliberately held until the model emits `</think>`, so it
-  constrains only what comes after the reasoning phase — putting `answer` first cannot make the
-  answer precede the thinking, and if reasoning never terminates the answer is never generated at
-  all. For thinking runs, treat a length cap or a reasoning loop as a budget problem and reach for
-  the SFT warm-start and the prompt/`max_completion_tokens` levers above.
+The custom algorithm API is introduced in [PR #1553](https://github.com/freesolo-co/flash/pull/1553).
+Existing OPD runs keep their worker and recovery path. Their status, logs, checkpoints, exports,
+and deployments remain accessible, and their adapters can still warm-start SFT or GRPO.
+`flash env setup` no longer creates `configs/opd.toml` and leaves existing files untouched.
 
 ---
 
@@ -1108,7 +935,7 @@ in a sensible value, so only override with a reason.
 | `thinking_length_penalty_coef` | Per-reasoning-token reward deduction — curb overthinking, but watch it doesn't push the model into terse degeneracy.                                                                                                                                                                                                                                                                                              |
 | `learning_rate`                | Change it in small steps. Too high destabilizes RL and degrades output quality; if the model is collapsing, lower it.                                                                                                                                                                                                                                                                                             |
 | `prompts_per_step`             | The optimizer prompt batch. It defaults to `64`. Flash preserves the authored positive integer in the job spec and admission checks and never rounds it. At execution, after `max_examples` and prompt-budget filtering, the effective value clamps to the number of retained valid prompts when fewer remain. Too small and the reward trend is pure noise.                                                      |
-| `structured_outputs`           | Guided decoding for every GRPO/OPD rollout: a JSON schema (inline table or JSON string), `regex`, or `choice`. The sampler then _cannot_ emit off-format text, so the reward measures content instead of formatting. Works with `thinking = true`: the grammar is held until the `</think>` boundary (via a reasoning-aware decoding gate), so the model reasons freely first and only its answer is constrained. |
+| `structured_outputs`           | Guided decoding for every GRPO rollout: a JSON schema (inline table or JSON string), `regex`, or `choice`. The sampler then _cannot_ emit off-format text, so the reward measures content instead of formatting. Works with `thinking = true`: the grammar is held until the `</think>` boundary (via a reasoning-aware decoding gate), so the model reasons freely first and only its answer is constrained. |
 
 The default GRPO step is `64 * 8 = 512` completions. Every configured step must satisfy
 `prompts_per_step * group_size <= 512`; admission checks the authored values, or their defaults when
@@ -1120,16 +947,13 @@ Rollout generation, reward work, and cost multiply by the effective execution pr
 For thinking models, each turn's `max_completion_tokens` is shared between `<think>` reasoning and
 its final answer or action, so undersizing it can truncate the action and teach the model to stop
 reasoning. In multi-turn runs, also size `max_context_tokens` for the accumulated transcript or later
-turns can run out of context. Watch `truncation_rate`, but know what it measures on each algorithm.
-In OPD it counts model turns that did not end in EOS or a configured stop, and OPD additionally
-reports a per-step `discarded_rollouts` count alongside it. In GRPO it comes from verl's
-episode-level clipping, so a single turn hitting the cap does not raise it on its own: that turn
+turns can run out of context. GRPO's `truncation_rate` comes from verl's episode-level clipping, so a single turn hitting the cap does not raise it on its own: that turn
 ends the episode early, which leaves the concatenated response short of the widened capacity verl
 measures against. On multi-turn GRPO, treat a zero rate as "no episode filled its response budget",
 not as "no turn was cut off", and read episode length against the environment's turn limit instead.
 
-Neither metric detects the other way `max_context_tokens` shortens an episode. When an environment
-reply would leave no room to generate, both multi-turn loops stop _before_ dispatching the next
+This metric does not detect the other way `max_context_tokens` shortens an episode. When an environment
+reply would leave no room to generate, the multi-turn loop stops _before_ dispatching the next
 turn. The last model turn ended normally, so nothing is counted as truncated and the episode simply
 ends early. A run can therefore train on systematically shortened trajectories at
 `truncation_rate = 0`. If episodes are ending sooner than the environment's turn limit, suspect the
@@ -1155,13 +979,13 @@ context budget rather than the turn cap.
 > **`[train] max_steps` overrides the derived horizon**: with it set the step count is
 > exactly what you asked for, lowering `prompts_per_step` does not add steps at all, and you
 > simply train on fewer prompts. And per-step cost is not purely token-proportional —
-> GRPO reward waves and OPD teacher calls add latency per step, so multiplying steps can
+> GRPO reward waves add latency per step, so multiplying steps can
 > multiply that overhead into a materially larger GPU bill. Smaller batches also mean
 > noisier per-step gradients. Compare concrete `--cost` estimates before and after the
 > change and let those numbers, not the ratio, decide.
 
-Multi-turn generation requests carry no per-request deadline or retry. Neither GRPO nor OPD
-times out an individual generation, an environment call, or a teacher call, and there is no
+Multi-turn generation requests carry no per-request deadline or retry. GRPO does not
+time out an individual generation or an environment call, and there is no
 episode elapsed-time cutoff. A wedged generation is caught by the training stall watchdog,
 which tears the run down after 25 minutes without progress. That watchdog measures whether
 training is advancing rather than how long one request has taken, so a slow-but-live engine
@@ -1579,24 +1403,14 @@ targeted fix rather than leaning on the reward gate to slowly select against it.
 
 | Failure mode                                        | What you see                                                                             | Targeted fix                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
 | --------------------------------------------------- | ---------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Repetition / looping collapse                       | the same phrase repeats until truncation                                                 | repetition or length penalty. Then split the cause before touching `temperature`: if loops appear from the start and the outputs are incoherent, sampling is too hot — lower it. If they _emerge_ over steps while the loss looks fine, this is the entropy collapse described under OPD above, and lowering `temperature` sharpens the dominant tokens further and strips the within-group diversity GRPO needs. Fix that one with fewer steps / an earlier checkpoint, a lower `lora_rank`, or a KL anchor — not with colder sampling. |
+| Repetition / looping collapse                       | the same phrase repeats until truncation                                                 | repetition or length penalty. Then split the cause before touching `temperature`: if loops appear from the start and the outputs are incoherent, sampling is too hot — lower it. If they _emerge_ over steps while the loss looks fine, this is entropy collapse, and lowering `temperature` sharpens the dominant tokens further and strips the within-group diversity GRPO needs. Fix that one with fewer steps / an earlier checkpoint, a lower `lora_rank`, or a KL anchor — not with colder sampling. |
 | Overthinking / verbose reasoning                    | reasoning eats the whole token budget                                                    | `thinking_length_penalty_coef`; tighten the prompt with a _hard, specific_ budget ("reason in at most N sentences, then act") — a vague "be brief" can backfire on a thinking model and lengthen the tail                                                                                                                                                                                                                                                                                                                                |
 | Completion truncation                               | answers cut off mid-thought                                                              | raise `max_completion_tokens` / `max_context_tokens`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
-| OPD rollouts never stop (high `truncated_rollouts`) | on-policy completions run to the length cap without an EOS; raising the cap barely helps | No auxiliary EOS loss is applied. Warm-start from SFT and shrink what has to terminate: constrain the _teacher's_ reasoning at the source with a hard, specific budget in the env prompt used for OPD rollouts (the teacher scores the student conditioned on it); a vague "be brief" can backfire on a thinking teacher. First confirm the teacher itself terminates and is strong on the task; a bad teacher is distilled in, not out.                                                                                                 |
 | Unparsed / over-escaped output                      | reward can't read the answer                                                             | robust parser; return `0.0` on parse fail; format gate                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
 | Wrapper / markdown around structured output         | prose around the JSON/answer                                                             | a format gate; `stop_sequences`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
 | Uniform-reward groups                               | every rollout in a group scores the same → no gradient                                   | shape the reward for partial credit; raise `temperature`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
 | Too-hard prompts                                    | the base never succeeds, reward stays at 0                                               | curriculum / easier prompts; warm-start with SFT                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
 | Judge-rewarded degenerate output                    | short, templated answers a judge still rates well                                        | a minimum-substance zero-gate ahead of the judge                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
-
-In OPD, a model turn that reaches its cap without EOS or a configured stop is classified as
-truncated, ends the episode, and is dropped before teacher scoring. If every rollout in a step is
-dropped, the step fails with `produced no aligned teacher signal`. Partial dropping is more dangerous:
-it can silently bias training toward shorter episodes, so monitor the per-step `truncation_rate` and
-`discarded_rollouts` metrics rather than relying on the loss alone. Read them as a sampled indicator,
-not a ledger: heartbeats are throttled, so a step that finishes shortly after the previous one does
-not publish its own values, and a nonzero reading means truncation pressure around that point in the
-run rather than an exact count for that step.
 
 ---
 
@@ -1719,7 +1533,7 @@ pin: if the run needs two cards, Flash rejects it and names the smallest count t
 than silently escalating. Eight cards is the public maximum; ceilings between powers of two round
 down to the next rentable count.
 
-The fit test is per algorithm. GRPO and OPD can need a wider combination than SFT because rollout
+The fit test is per algorithm. GRPO can need a wider combination than SFT because rollout
 memory raises the whole-run floor. Raising `--gpus` still cannot rescue a pin the algorithm does not
 fit on even as an 8-card combination.
 
@@ -1737,13 +1551,13 @@ not a reliable place to look either: the mid-run heartbeats
 `gpu_status` wholesale, so the field is usually absent while a run is live and reappears only on the
 terminal heartbeat.
 
-GRPO, SFT and OPD all shard across the selected count with no backend key to set, and all three shard
+GRPO and SFT shard across the selected count with no backend key to set, and both shard
 by **data**: one rank per card, with each rank holding whole sequences. Sequence parallelism is not
 used, because it is wrong for the catalog's GatedDeltaNet models, whose linear attention and causal
 conv carry state along the sequence and so cannot be split mid-sequence across cards. Weights,
 gradients and optimizer state still shard across every card, so multi-card capacity is unchanged.
 
-How the batch reaches those ranks differs. GRPO and OPD bound work by tokens, so the scheduler
+How the batch reaches those ranks differs. GRPO bounds work by tokens, so the scheduler
 balances the same global batch across the ranks and any card count is usable. SFT splits a fixed
 batch instead, which gives it two things to watch, and the card count has to divide **both** or some
 cards go
@@ -1765,22 +1579,6 @@ model, so fewer cards can mean less memory, not just a smaller bill. When the su
 below the ranks you are training on, the warning says "if the run still fits" — check it before
 acting, because a large model can run on the ranks it launched and be rejected on the narrower
 shape. Raising `batch_size` never has this problem: it uses cards you are already paying for.
-
-OPD has one unsupported combination, and because there is no other backend to fall back to it
-raises at startup: a multi-turn env together with `[train] structured_outputs`. Multi-turn OPD
-alone runs, and structured outputs alone run; only the combination is refused.
-
-Structured-output OPD additionally requires the constraint to be exactly replayable on CPU, which
-pins it to xgrammar. These raise at startup even on a single-turn env: a `whitespace_pattern`,
-`disable_additional_properties` (guidance-backend only), a JSON schema using features that need
-vLLM's guidance fallback, or a model carrying a vLLM Mistral tokenizer.
-
-Note what a multi-turn structured-output run would actually mean: one schema applied to EVERY
-assistant turn, mid-rollout turns included, because the env contract has no per-turn schema
-channel. If your intermediate turns and your final answer have different shapes, that silently
-constrains the intermediate ones to the final-answer schema. That is the contract the worker
-declines to guess at, which is why the fix is a per-turn constraint channel rather than simply
-lifting the check — it raises at startup rather than training on a contract you did not ask for.
 
 ---
 
