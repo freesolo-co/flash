@@ -151,6 +151,18 @@ def test_new_backend_restores_optimizer_rng_and_algorithm_state(client_and_backe
     assert torch.equal(fresh.model.projection.weight, expected_weights)
 
 
+def test_managed_rollback_cannot_diverge_from_published_step(client_and_backend):
+    client, backend = client_and_backend
+    client.save_checkpoint("earlier")
+    client.forward_backward([Datum([1, 2], [1])])
+    client.optim_step(learning_rate=0.1)
+    backend.checkpoints = SimpleNamespace(published={1: backend.checkpoint_dir / "step-1"})
+    before = backend.model.projection.weight.detach().clone()
+    with pytest.raises(ValueError, match=r"custom\.resume_from"):
+        backend.validate("load_checkpoint", {"name": "earlier"})
+    assert torch.equal(before, backend.model.projection.weight)
+
+
 def test_mismatched_base_revision_rejected_before_weight_mutation(client_and_backend, tmp_path):
     client, _original = client_and_backend
     client.save_checkpoint("base")

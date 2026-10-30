@@ -72,6 +72,10 @@ def validate_operation(backend, operation, arguments):
         args["tokens"] = [integer(t, "token", 0, backend.vocab_size - 1) for t in tokens]
     elif operation in {"save_checkpoint", "load_checkpoint"}:
         args["name"] = checkpoint_name(args.get("name"))
+        if operation == "load_checkpoint" and getattr(backend, "checkpoints", None) is not None:
+            raise ValueError(
+                "managed checkpoints are immutable; restore with custom.resume_from in a new run"
+            )
         if backend.pending_backward:
             raise ValueError("apply or clear accumulated gradients before checkpoint operations")
         if operation == "save_checkpoint":

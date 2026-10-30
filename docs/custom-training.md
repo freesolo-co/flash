@@ -132,6 +132,8 @@ Explicit `save_checkpoint(name, algorithm_state=...)` is also available at optim
 boundaries. A step already saved automatically is immutable; use its `RUN_ID/step-N`
 reference rather than saving a second version of that step. `download_checkpoint` remains
 an optional ZIP export; downloading is no longer necessary to preserve managed progress.
+Managed restores always start a new run through `custom.resume_from`; in-place rollback
+cannot replace weights beneath an already-published run/step identity.
 
 ## Inspection and custom losses
 
@@ -145,7 +147,7 @@ an optional ZIP export; downloading is no longer necessary to preserve managed p
 | `optim_step(...)` | AdamW update, gradient norm, accumulation count, scheduled checkpoint |
 | `zero_grad()` | Discard accumulated gradients |
 | `save_checkpoint(...)` | Durable managed snapshot and run/step reference |
-| `load_checkpoint(name)` | Restore a locally present snapshot within the live session |
+| `load_checkpoint(name)` | Standalone sessions only; managed runs use `custom.resume_from` |
 | `status()`, `logs(after=cursor)` | Session state and bounded worker events |
 
 For tokens `[10, 20, 30, 40]`, the outputs score targets `20, 30, 40` respectively.
