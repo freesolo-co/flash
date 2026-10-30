@@ -1,7 +1,8 @@
 """Local DPO. Select this file with algorithm = "custom" and [custom] file in run.toml.
 
 Run: flash train run.toml
-The local function can be async def main(client) or def main(client).
+Async is the default. For blocking calls, use def main(client), remove await, and
+replace asyncio.to_thread(file_operation, ...) with file_operation(...).
 """
 
 import asyncio

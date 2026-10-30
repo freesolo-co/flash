@@ -43,8 +43,9 @@ within that cap. Model initialization is excluded from measured session time.
 
 ## The local file
 
-Define `async def main(client)` for a nonblocking interface, or `def main(client)` for the
-blocking interface. Flash selects the matching client automatically. Both have the same
+Async is the default: `flash custom init` generates `async def main(client)` with awaited
+client operations. Use `def main(client)` for the blocking interface. Flash selects the
+matching client automatically, without a TOML setting. Both have the same
 operations and correctness guarantees. The generated file contains editable DPO data and
 loss code, not a request to run a hidden server-side DPO recipe.
 
@@ -73,7 +74,9 @@ async def main(client):
 ```
 
 For the synchronous version, use `def main(client)` and remove `await`. No configuration
-switch is needed. Independent reward calls, data preparation, and other sessions can run
+switch is needed. In the generated example, also replace `await asyncio.to_thread(fn, ...)`
+with a direct `fn(...)` call for local file operations. Independent reward calls, data
+preparation, and other sessions can run
 concurrently with an awaited GPU operation. Operations on **one model stay serialized**;
 async does not run conflicting weight updates concurrently or add multi-GPU training.
 The complete two-pass custom loss holds its place in the same ordered queue.

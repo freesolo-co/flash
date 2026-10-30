@@ -16,11 +16,12 @@ def cmd_custom_init(args):
     print(
         f'Created {destination}. Set algorithm = "custom" and [custom] file = "{destination.name}" in your TOML, then run: flash train run.toml'
     )
+    print("Async by default. For blocking calls, use def main(client) and remove await.")
 
 
 def add_custom_commands(sub: argparse._SubParsersAction):
     custom = sub.add_parser("custom", help="build a local algorithm controlling a dedicated GPU")
     commands = custom.add_subparsers(dest="custom_cmd", required=True)
-    init = commands.add_parser("init", help="write an editable DPO training script")
+    init = commands.add_parser("init", help="write an editable async DPO training script")
     init.add_argument("path", nargs="?", default="algorithm.py", help="new script path")
     init.set_defaults(func=cmd_custom_init)

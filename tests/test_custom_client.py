@@ -107,6 +107,9 @@ def test_checkpoint_download_streams_and_rejects_incomplete_file(tmp_path, monke
 
 
 def test_scaffold_is_editable_and_never_overwrites(tmp_path):
+    import inspect
+    import runpy
+
     from flash.cli.parsing.main import _build_parser
 
     destination = tmp_path / "algorithm.py"
@@ -114,6 +117,7 @@ def test_scaffold_is_editable_and_never_overwrites(tmp_path):
     args.func(args)
     assert "make_dpo_loss" in destination.read_text()
     compile(destination.read_text(), str(destination), "exec")
+    assert inspect.iscoroutinefunction(runpy.run_path(str(destination))["main"])
     with pytest.raises(FileExistsError):
         args.func(args)
 
