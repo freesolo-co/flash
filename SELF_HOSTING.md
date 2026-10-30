@@ -471,6 +471,23 @@ curl https://<your-app>.modal.run/v1/chat/completions \
   -d '{"model": "<run-id>", "messages": [{"role": "user", "content": "hello"}]}'
 ```
 
+To expose top-K log probabilities, add `"logprobs": true` and `"top_logprobs": K`
+to the inference request; no deployment flag is needed:
+
+```bash
+curl https://<your-app>.modal.run/v1/chat/completions \
+  -H "Authorization: Bearer $FLASH_SERVING_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"model": "<run-id>", "messages": [{"role": "user", "content": "hello"}], "logprobs": true, "top_logprobs": 5}'
+```
+
+`top_logprobs` accepts 0–20. Each entry in `choices[0].logprobs.content` contains
+the generated token's `token`, `bytes`, and `logprob`, plus up to K alternatives in
+`top_logprobs`. A value of 0 returns only the generated token's probability.
+With `"stream": true`, the same token records appear in each SSE choice's
+`logprobs.content`. Log probabilities require non-thinking generation and cannot
+be combined with tool calling; an adapter's thinking policy comes from its manifest.
+
 Do **not** point `FREESOLO_SERVING_URL` at this endpoint. Those commands authenticate with
 `X-Freesolo-Internal-Key` and carry `FREESOLO_INTERNAL_KEY`, the key that controls your whole plane;
 a customer-owned deployment does not read that header at all, so the request would fail `401` after

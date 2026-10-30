@@ -577,6 +577,18 @@ def cmd_chat(args) -> int:
     system = getattr(args, "system", None)
     if system:
         messages.insert(0, {"role": "system", "content": system})
+    top_logprobs = getattr(args, "top_logprobs", None)
+    if getattr(args, "logprobs", False) or top_logprobs is not None:
+        response = client.chat(
+            chat_target,
+            messages=messages,
+            temperature=args.temperature,
+            max_tokens=args.max_tokens,
+            logprobs=True,
+            top_logprobs=top_logprobs if top_logprobs is not None else 0,
+        )
+        print(json.dumps(response, indent=2))
+        return 0
     wrote = False
     pending: list[str] = []
     for chunk in client.chat_stream(

@@ -93,6 +93,20 @@ flash models deploy RUN_ID/final             # serve the final checkpoint
 flash models chat RUN_ID/final -m "hello"    # talk to it
 ```
 
+Request generated-token log probabilities and the top K alternatives per token with:
+
+```bash
+flash models chat RUN_ID/final -m "hello" --top-logprobs 5
+```
+
+`--top-logprobs K` accepts 0–20 and prints the complete, non-streaming JSON response.
+Read token probabilities from `choices[0].logprobs.content`; each token includes its
+`logprob` and `top_logprobs` alternatives. `--logprobs` alone includes the generated
+tokens' probabilities without alternatives. Python callers can use
+`ApiClient.chat(..., logprobs=True, top_logprobs=5)`. These options require a
+non-thinking deployment and cannot be combined with tool calling. For direct
+Modal endpoint requests, see [SELF_HOSTING.md](SELF_HOSTING.md#serving).
+
 Run management lives under `flash runs` (`list`, `status`, `log`, `cancel`, `checkpoint`)
 and serving under `flash models` (`deploy`, `chat`, `deployments`, `undeploy`, `export`).
 `flash models` lists supported base models — six curated Qwen checkpoints — and `flash gpus`
