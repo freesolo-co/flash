@@ -6,6 +6,7 @@ import json
 import os
 import time
 
+from flash._internal.diagnostics import sanitize_diagnostic
 from flash.custom.session import SessionConflict, TrainingSession
 from flash.custom.types import checkpoint_name
 
@@ -65,13 +66,27 @@ def create_app(session, token):
             return await run_in_threadpool(session.execute, payload)
         except (SessionConflict, ValueError) as error:
             if session.failed:
-                raise HTTPException(500, "GPU operation failed; session cannot continue") from error
+                raise HTTPException(
+                    500,
+                    {
+                        "code": "custom_session_failed",
+                        "message": sanitize_diagnostic(error, limit=2000),
+                        "session_id": session.id,
+                    },
+                ) from error
             raise HTTPException(
                 409 if isinstance(error, SessionConflict) else 400,
                 {"code": "custom_rejected", "message": str(error)},
             ) from error
         except Exception as error:
-            raise HTTPException(500, "GPU operation failed; session cannot continue") from error
+            raise HTTPException(
+                500,
+                {
+                    "code": "custom_session_failed",
+                    "message": sanitize_diagnostic(error, limit=2000),
+                    "session_id": session.id,
+                },
+            ) from error
 
     @app.get("/v1/custom/checkpoints/{name}")
     def download(name: str):

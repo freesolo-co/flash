@@ -162,3 +162,19 @@ def test_http_auth_validation_logs_and_retry(tmp_path):
         == 413
     )
     assert session.step == 1
+
+
+def test_gpu_failure_detail_reaches_client_before_worker_teardown(tmp_path):
+    session = TrainingSession(CounterBackend(tmp_path))
+    client = TestClient(create_app(session, "s" * 40))
+    response = client.post(
+        "/v1/custom/operation",
+        headers={"Authorization": "Bearer " + "s" * 40},
+        json=request(session, operation="crash"),
+    )
+    assert response.status_code == 500
+    assert response.json()["detail"] == {
+        "code": "custom_session_failed",
+        "message": "RuntimeError: partial GPU mutation",
+        "session_id": session.id,
+    }
