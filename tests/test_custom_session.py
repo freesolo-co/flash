@@ -169,17 +169,18 @@ def test_signed_weights_preserved_without_implicit_normalization():
 @pytest.mark.parametrize(
     ("row", "message"),
     [
-        ({"target_tokens": [[3]]}, "len\\(tokens\\)-1"),
-        ({"target_tokens": [[3, 3], []]}, "distinct"),
-        ({"target_tokens": [[3], [100]]}, "target token"),
-        ({"target_weights": [[1.0], []]}, "require target_tokens"),
-        ({"target_tokens": [[3], []], "target_weights": [[1.0, 2.0], []]}, "match"),
-        ({"target_tokens": [[3], []], "target_weights": [[float("inf")], []]}, "finite"),
-        ({"target_tokens": [list(range(65)), []]}, "at most 64"),
-        ({"weights": [0, 0], "target_tokens": [[3], []]}, "target_weights for target_tokens"),
+        ({"target_tokens": [[3]], "weights": [[1.0]]}, "len\\(tokens\\)-1 rows"),
+        ({"target_tokens": [[3, 4], [5]], "weights": [[1, 0], [1]]}, "rectangular"),
+        ({"target_tokens": [[], []], "weights": [[], []]}, "rectangular"),
+        ({"target_tokens": [[3], [100]], "weights": [[1], [1]]}, "target token"),
+        ({"target_tokens": [[3, 4], [5, 6]], "weights": [0, 0]}, "rectangular"),
+        ({"target_tokens": [[3, 4], [5, 6]], "weights": [[1], [1]]}, "shape of target_tokens"),
+        ({"target_tokens": [[3], [5]], "weights": [[float("inf")], [0]]}, "finite"),
+        ({"target_tokens": [list(range(65))] * 2, "weights": [[0] * 65] * 2}, "1-64 columns"),
+        ({"target_tokens": [[3], [5]]}, "explicit weights"),
     ],
 )
-def test_invalid_soft_targets_rejected(row, message):
+def test_invalid_target_matrices_rejected(row, message):
     with pytest.raises(ValueError, match=message):
         parse_batch(
             [{"tokens": [1, 2, 4], **row}],
@@ -190,20 +191,19 @@ def test_invalid_soft_targets_rejected(row, message):
         )
 
 
-def test_soft_targets_alone_satisfy_forward_backward_weighting():
+def test_target_matrix_and_matching_weights_parse():
     rows = parse_batch(
-        [{"tokens": [1, 2, 4], "target_tokens": [[2, 7], []], "target_weights": [[0.6, 0.4], []]}],
+        [{"tokens": [1, 2, 4], "target_tokens": [[2, 7], [4, 0]], "weights": [[0.6, 0.4], [1, 0]]}],
         vocab_size=100,
         max_tokens=10,
         max_batch=2,
         weighted=True,
     )
-    assert rows[0].weights is None
-    assert rows[0].target_tokens == [[2, 7], []]
-    assert rows[0].target_weights == [[0.6, 0.4], []]
+    assert rows[0].target_tokens == [[2, 7], [4, 0]]
+    assert rows[0].weights == [[0.6, 0.4], [1.0, 0.0]]
 
 
-def test_soft_target_entries_are_bounded_per_request():
+def test_target_matrix_cells_are_bounded_per_request():
     row = {"tokens": [1] * 1601, "target_tokens": [list(range(64))] * 1600}
     with pytest.raises(ValueError, match="split the batch"):
         parse_batch([row], vocab_size=100, max_tokens=2048, max_batch=2)

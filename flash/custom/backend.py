@@ -56,34 +56,19 @@ class TorchBackend:
 
         return torch.tensor([tokens], device=self.parameters[0].device, dtype=torch.long)
 
-    def _logprobs(self, tokens):
+    def _logprobs(self, tokens, target_tokens=None):
+        """Logprobs of the targets: the next token ([T]) or a [T, K] target matrix."""
         import torch
 
         ids = self._tensor(tokens)
         logits = self.model(input_ids=ids[:, :-1], use_cache=False).logits[0].float()
-        targets = ids[0, 1:]
-        selected = logits.gather(-1, targets[:, None]).squeeze(-1)
-        return selected - torch.logsumexp(logits, dim=-1), logits
-
-    def _target_logprobs(self, logits, target_tokens):
-        """Flat logprobs of every listed candidate, with their positions, in listed order."""
-        import torch
-
-        positions = [i for i, ids in enumerate(target_tokens) for _ in ids]
-        ids = [token for row in target_tokens for token in row]
-        device = logits.device
-        rows = torch.tensor(positions, device=device, dtype=torch.long)
-        columns = torch.tensor(ids, device=device, dtype=torch.long)
-        # gather candidates and one normalizer per position; never copy a vocabulary row each.
-        return logits[rows, columns] - torch.logsumexp(logits, dim=-1)[rows]
-
-    @staticmethod
-    def _ragged(values, target_tokens):
-        result, start = [], 0
-        for ids in target_tokens:
-            result.append(values[start : start + len(ids)])
-            start += len(ids)
-        return result
+        if target_tokens is None:
+            targets = ids[0, 1:, None]
+        else:
+            targets = torch.tensor(target_tokens, device=logits.device, dtype=torch.long)
+        # gather targets and one normalizer per position; never copy a vocabulary row each.
+        selected = logits.gather(-1, targets) - torch.logsumexp(logits, dim=-1, keepdim=True)
+        return (selected.squeeze(-1) if target_tokens is None else selected), logits
 
     def forward(self, data, top_k=0):
         import torch
@@ -91,11 +76,8 @@ class TorchBackend:
         outputs = []
         with torch.no_grad():
             for row in data:
-                logprobs, logits = self._logprobs(row.tokens)
+                logprobs, logits = self._logprobs(row.tokens, row.target_tokens)
                 output = {"logprobs": logprobs.cpu().tolist()}
-                if row.target_tokens is not None:
-                    values = self._target_logprobs(logits, row.target_tokens).cpu().tolist()
-                    output["target_logprobs"] = self._ragged(values, row.target_tokens)
                 if top_k:
                     values, indices = logits.topk(top_k, dim=-1)
                     values -= torch.logsumexp(logits, dim=-1, keepdim=True)
@@ -112,26 +94,14 @@ class TorchBackend:
         loss_total = 0.0
         outputs = []
         for row in data:
-            logprobs, logits = self._logprobs(row.tokens)
-            loss = logprobs.new_zeros(())
-            output = {"logprobs": logprobs.detach().cpu().tolist()}
-            if row.weights is not None:
-                weights = torch.tensor(row.weights, device=logprobs.device, dtype=logprobs.dtype)
-                loss = loss - (weights * logprobs).sum()
-            if row.target_tokens is not None:
-                selected = self._target_logprobs(logits, row.target_tokens)
-                flat = [w for values in row.target_weights for w in values]
-                weights = torch.tensor(flat, device=selected.device, dtype=selected.dtype)
-                loss = loss - (weights * selected).sum()
-                output["target_logprobs"] = self._ragged(
-                    selected.detach().cpu().tolist(), row.target_tokens
-                )
+            logprobs, _ = self._logprobs(row.tokens, row.target_tokens)
+            weights = torch.tensor(row.weights, device=logprobs.device, dtype=logprobs.dtype)
+            loss = -(weights * logprobs).sum()
             if not torch.isfinite(loss):
                 raise RuntimeError("non-finite loss; session cannot continue")
-            if loss.requires_grad:  # a row whose target lists are all empty contributes nothing
-                loss.backward()
+            loss.backward()
             loss_total += loss.detach().item()
-            outputs.append(output)
+            outputs.append({"logprobs": logprobs.detach().cpu().tolist()})
         self.pending_backward += 1
         return {"outputs": outputs, "metrics": {**(metrics or {}), "surrogate_loss": loss_total}}
 

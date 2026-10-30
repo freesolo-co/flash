@@ -8,7 +8,7 @@ from dataclasses import dataclass
 
 MAX_BODY_BYTES = 4 * 1024 * 1024
 CUSTOM_TRAINING_CAPABILITY = "custom_training_v1"
-# Candidate targets per position and per request; a teacher top-20 fits within both.
+# Target columns per position and target cells per request; a teacher top-20 fits both.
 MAX_TARGETS_PER_POSITION = 64
 MAX_TARGET_ENTRIES = 100_000
 
@@ -39,56 +39,40 @@ def checkpoint_name(name):
 class Datum:
     """tokens[i] predicts tokens[i+1]; weights[i] weights that target's negative logprob.
 
-    target_tokens[i] optionally lists further candidate tokens scored at the same position,
-    and target_weights[i] weights their negative logprobs. Weighting a teacher's top-k tokens
-    by its probabilities gives a soft-target (forward KL) loss. An empty list scores nothing.
+    target_tokens optionally replaces the implicit next-token targets with a rectangular
+    [len(tokens)-1, K] matrix: row i lists K tokens scored at the position that predicts
+    tokens[i+1], and weights then has the same [len(tokens)-1, K] shape. Logprobs come back
+    with the shape of the targets. Weighting a teacher's top-k tokens by its probabilities
+    gives a soft-target (forward KL) loss; give unused cells weight zero.
 
     No implicit averaging: the weighted loss is a sum across all supplied tokens and rows.
     Set prompt-target weights to zero, and divide by your chosen denominator yourself.
     """
 
     tokens: list[int]
-    weights: list[float] | None = None
+    weights: list[float] | list[list[float]] | None = None
     target_tokens: list[list[int]] | None = None
-    target_weights: list[list[float]] | None = None
 
     def to_dict(self):
         result = {"tokens": list(self.tokens)}
         if self.weights is not None:
-            result["weights"] = list(self.weights)
+            result["weights"] = [list(w) if isinstance(w, list) else w for w in self.weights]
         if self.target_tokens is not None:
             result["target_tokens"] = [list(ids) for ids in self.target_tokens]
-        if self.target_weights is not None:
-            result["target_weights"] = [list(values) for values in self.target_weights]
         return result
 
 
-def _targets(row, positions, vocab_size):
-    tokens, weights = row.get("target_tokens"), row.get("target_weights")
-    if tokens is None:
-        if weights is not None:
-            raise ValueError("target_weights require target_tokens")
-        return None, None
-    if not isinstance(tokens, list) or len(tokens) != positions:
-        raise ValueError("target_tokens must have len(tokens)-1 entries")
-    if weights is not None and (not isinstance(weights, list) or len(weights) != positions):
-        raise ValueError("target_weights must have len(tokens)-1 entries")
-    parsed_tokens, parsed_weights = [], []
-    for index, ids in enumerate(tokens):
-        if not isinstance(ids, list) or len(ids) > MAX_TARGETS_PER_POSITION:
-            raise ValueError(
-                f"each position takes at most {MAX_TARGETS_PER_POSITION} target tokens"
-            )
-        ids = [integer(t, "target token", 0, vocab_size - 1) for t in ids]
-        if len(set(ids)) != len(ids):
-            raise ValueError("target tokens must be distinct at each position")
-        parsed_tokens.append(ids)
-        if weights is not None:
-            values = weights[index]
-            if not isinstance(values, list) or len(values) != len(ids):
-                raise ValueError("target_weights must match target_tokens at every position")
-            parsed_weights.append([number(w, "target weight") for w in values])
-    return parsed_tokens, parsed_weights if weights is not None else None
+def _matrix(value, name, rows, convert):
+    if not isinstance(value, list) or len(value) != rows:
+        raise ValueError(f"{name} must have len(tokens)-1 rows")
+    width = len(value[0]) if value and isinstance(value[0], list) else -1
+    if not 1 <= width <= MAX_TARGETS_PER_POSITION or any(
+        not isinstance(row, list) or len(row) != width for row in value
+    ):
+        raise ValueError(
+            f"{name} must be a rectangular matrix with 1-{MAX_TARGETS_PER_POSITION} columns"
+        )
+    return [[convert(item) for item in row] for row in value]
 
 
 def parse_batch(raw, *, vocab_size, max_tokens, max_batch, weighted=False):
@@ -96,37 +80,38 @@ def parse_batch(raw, *, vocab_size, max_tokens, max_batch, weighted=False):
         raise ValueError(f"data must contain 1-{max_batch} rows")
     rows, entries = [], 0
     for row in raw:
-        if not isinstance(row, dict) or set(row) - {
-            "tokens",
-            "weights",
-            "target_tokens",
-            "target_weights",
-        }:
+        if not isinstance(row, dict) or set(row) - {"tokens", "weights", "target_tokens"}:
             raise ValueError(
-                "each datum must contain tokens and optional weights, target_tokens "
-                "and target_weights"
+                "each datum must contain tokens and optional weights and target_tokens"
             )
         tokens = row.get("tokens")
         if not isinstance(tokens, list) or not 2 <= len(tokens) <= max_tokens:
             raise ValueError(f"each datum needs 2-{max_tokens} tokens")
         tokens = [integer(t, "token", 0, vocab_size - 1) for t in tokens]
+        positions = len(tokens) - 1
         weights = row.get("weights")
-        target_tokens, target_weights = _targets(row, len(tokens) - 1, vocab_size)
+        if weighted and weights is None:
+            raise ValueError("forward_backward requires explicit weights for every target token")
+        target_tokens = row.get("target_tokens")
         if target_tokens is not None:
-            entries += sum(len(ids) for ids in target_tokens)
+            target_tokens = _matrix(
+                target_tokens,
+                "target_tokens",
+                positions,
+                lambda t: integer(t, "target token", 0, vocab_size - 1),
+            )
+            entries += positions * len(target_tokens[0])
             if entries > MAX_TARGET_ENTRIES:
                 raise ValueError(
-                    f"target tokens exceed {MAX_TARGET_ENTRIES} entries; split the batch"
+                    f"target_tokens exceed {MAX_TARGET_ENTRIES} entries; split the batch"
                 )
-        if weighted and weights is None and target_weights is None:
-            raise ValueError(
-                "forward_backward requires explicit weights or target_weights for every row"
-            )
-        if weighted and target_tokens is not None and target_weights is None:
-            raise ValueError("forward_backward requires target_weights for target_tokens")
-        if weights is not None:
-            if not isinstance(weights, list) or len(weights) != len(tokens) - 1:
+            if weights is not None:
+                weights = _matrix(weights, "weights", positions, lambda w: number(w, "weight"))
+                if len(weights[0]) != len(target_tokens[0]):
+                    raise ValueError("weights must have the shape of target_tokens")
+        elif weights is not None:
+            if not isinstance(weights, list) or len(weights) != positions:
                 raise ValueError("weights must have len(tokens)-1 entries")
             weights = [number(w, "weight") for w in weights]
-        rows.append(Datum(tokens, weights, target_tokens, target_weights))
+        rows.append(Datum(tokens, weights, target_tokens))
     return rows
