@@ -10,13 +10,13 @@ import asyncio
 import json
 from pathlib import Path
 
-import torch
-import torch.nn.functional as functional
-
 from flash.custom import Datum
 
 
 def make_dpo_loss(reference, prompt_lengths, *, beta=0.1):
+    import torch
+    import torch.nn.functional as functional
+
     # reference probabilities stay frozen at the initial adapter. chosen/rejected rows are paired.
     reference_scores = [
         sum(probs[prompt_length - 1 :])
