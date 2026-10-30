@@ -1,8 +1,10 @@
 # Managed environments in Azure Blob Storage
 
-Managed `namespace/project/name` environments can use a private Azure Blob registry.
-Explicit references to other GitHub repositories continue using GitHub. The default
-is `FLASH_ENV_STORE=github`, so installing this release alone does not change storage.
+Managed `namespace/project/name` environments use the private Azure Blob registry.
+The former GitHub environment-hub storage implementation and mode switch are removed.
+Explicit references to unrelated GitHub repositories remain supported as source imports.
+Deploying this release activates Azure for managed environments: complete the backfill
+and configure all three services before deployment.
 
 ## Provisioned resources
 
@@ -22,7 +24,6 @@ Install Flash's `server` extra (includes Azure Identity and Blob SDKs). On the F
 control plane:
 
 ```sh
-FLASH_ENV_STORE=azure
 FLASH_ENV_BLOB_ACCOUNT_URL=https://freesoloenvs.blob.core.windows.net
 FLASH_ENV_BLOB_CONTAINER=environments
 ```
@@ -34,8 +35,10 @@ workers still consume the checksum-verified package staged into the existing HF
 artifact repository, and never receive Azure storage credentials.
 
 The companion Freesolo frontend and platform backend changes are required. Configure
-both with `FLASH_ENV_STORE=azure`, their existing `FREESOLO_INTERNAL_KEY`, and an
-explicit `FLASH_API_URL` pointing at the corresponding Flash control plane. The web
+both with their existing `FREESOLO_INTERNAL_KEY` and an explicit `FLASH_API_URL`
+pointing at the corresponding Flash control plane. The Freesolo Compose files configure
+Flash with this account URL and distinct production/development containers, and preserve
+those settings when loading Infisical secrets. The web
 browser proxies file previews through Flash; the platform provisioner calls the
 internal create-if-absent seed endpoint. Existing database hub coordinates remain
 compatible and are interpreted as managed slugs; no schema migration is required.
@@ -65,7 +68,8 @@ authorization, and worker hash verification remain enforced.
 
 ## Backfill and cutover
 
-1. Deploy both compatible releases while leaving `FLASH_ENV_STORE=github`.
+1. Keep the currently deployed GitHub-backed releases running until the import is verified.
+   Prepare both new releases and the frontend settings without activating them.
 2. Pause environment publishing/deletion and example provisioning for the final
    snapshot. Finish staging queued jobs before switching; jobs with already staged
    packages continue independently. Existing Git revision pins other than the final
@@ -83,13 +87,14 @@ authorization, and worker hash verification remain enforced.
    nonzero exit; do not switch while failures remain. Backfills never overwrite heads,
    so prepare an empty target for the final snapshot rather than assuming a second
    import will update packages modified since the first snapshot.
-4. Switch the Flash control plane, frontend and platform provisioner together.
+4. Deploy the Flash control plane, frontend and platform provisioner together. There is no
+   storage feature flag or GitHub fallback in the new releases.
    Resume writes after verifying list, push, pull, file preview, example creation,
    run staging, and delete with a disposable environment.
-5. Keep GitHub and old staged artifacts during the rollback window. Before any new
-   Azure publish, rollback is a coordinated configuration reversal. After Azure
-   writes begin, switching back requires exporting those packages/deletions and
-   preserving their revision mappings; blindly flipping the flag loses updates.
+5. Keep the source repository and old staged artifacts during the rollback window.
+   Rolling back requires the previous application images; the new release has no GitHub
+   storage mode. After Azure writes begin, export those packages/deletions and preserve
+   their revision mappings before reverting, or updates will be lost.
 
 Storage provisioning does not itself switch the live services. No GitHub data is
 deleted by this migration.

@@ -27,13 +27,6 @@ class RegistryError(RuntimeError):
         self.status = status
 
 
-def enabled() -> bool:
-    mode = os.environ.get("FLASH_ENV_STORE", "github").strip()
-    if mode not in {"github", "azure"}:
-        raise RegistryError("FLASH_ENV_STORE must be github or azure", status=503)
-    return mode == "azure"
-
-
 def validate_slug(slug: str) -> str:
     parts = slug.split("/")
     if len(parts) != 3 or not _is_safe_github_path_parts(parts):

@@ -17,11 +17,6 @@ def api_errors():
         raise EnvPublishError(str(exc), status=exc.status) from exc
 
 
-def enabled() -> bool:
-    with api_errors():
-        return azure.enabled()
-
-
 def publish(slug, directory, *, create_only=False):
     with api_errors():
         packages.publish_directory(slug, directory, create_only=create_only)

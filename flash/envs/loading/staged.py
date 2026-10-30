@@ -65,17 +65,10 @@ def _reference_for_environment_id(env_id: str) -> tuple[str, Any]:
     from flash.envs.meta.identity import (
         _parse_github_environment_ref,
         canonical_environment_id,
-        is_managed_environment_slug,
-        managed_slug_to_github_ref,
     )
 
     canonical_id = canonical_environment_id(env_id)
-    reference = (
-        managed_slug_to_github_ref(canonical_id)
-        if is_managed_environment_slug(canonical_id)
-        else canonical_id
-    )
-    parsed = _parse_github_environment_ref(reference)
+    parsed = _parse_github_environment_ref(canonical_id)
     if parsed is None:
         raise ValueError(f"environment {env_id!r} is not a GitHub environment reference")
     return canonical_id, parsed
@@ -157,24 +150,7 @@ def resolve_environment_source(
     _require_staging_deadline(deadline_at)
     staging_root = Path(tempfile.mkdtemp(prefix="flash-stage-env-source-"))
     try:
-        package_root = loader._managed_hub_package_root(exact_ref)
-        if exact_ref.repo_full_name.lower() == loader._DEFAULT_MANAGED_ENV_REPO.lower():
-            if not package_root:
-                raise ValueError(
-                    "managed environment hub refs must include a namespace/project/name environment path"
-                )
-            root = loader._download_github_directory(
-                exact_ref,
-                package_root,
-                staging_root,
-                **request_options,
-            )
-        else:
-            root = loader._extract_github_tarball(
-                exact_ref,
-                staging_root,
-                **request_options,
-            )
+        root = loader._extract_github_tarball(exact_ref, staging_root, **request_options)
         candidate = root / parsed.path
         if candidate.is_dir():
             candidate = candidate / loader._DEFAULT_ENVIRONMENT_PATH

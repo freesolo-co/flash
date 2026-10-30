@@ -198,30 +198,6 @@ def test_parse_github_ref_from_https_urls():
     assert loader._parse_github_environment_ref("https://github.com/owner") is None
 
 
-def test_managed_hub_package_root_is_one_environment_not_the_project():
-    """The package root is `<org>/<project>/<name>`, the directory of a single environment.
-
-    `<org>/<project>` is the project directory holding every environment the project has
-    published, and the package root is what gets downloaded and copied into the cache, so
-    stopping a segment short fetches all of a project's environments to import one.
-    """
-    ref = loader._parse_github_environment_ref(
-        loader.managed_slug_to_github_ref("acme/checkout-bot/math")
-    )
-    assert ref.path == "acme/checkout-bot/math/environment.py"
-    assert loader._managed_hub_package_root(ref) == "acme/checkout-bot/math"
-
-    # A managed ref that stops at the project has no environment to root on.
-    two_segment = loader._parse_github_environment_ref(
-        "github:freesolo-co/environment-hub@main:acme/environment.py"
-    )
-    assert loader._managed_hub_package_root(two_segment) == ""
-
-    # Outside the managed hub the layout is the user's own, so there is no root to derive.
-    foreign = loader._parse_github_environment_ref("github:owner/repo@main:a/b/c/environment.py")
-    assert loader._managed_hub_package_root(foreign) == ""
-
-
 def test_resolve_path_arg_variants(tmp_path):
     # Non-string / empty values pass through unchanged.
     assert loader._resolve_path_arg(123, tmp_path) == 123
@@ -284,22 +260,6 @@ def test_resolve_environment_reference_local_and_passthrough(tmp_path):
 
     # A non-ref that doesn't exist on disk is returned unchanged.
     assert loader._resolve_environment_reference("not-a-real-thing-xyz") == "not-a-real-thing-xyz"
-
-
-def test_github_response_message_and_safe_contents_path():
-    assert loader._github_response_message({"message": "Not Found"}) == " (Not Found)"
-    assert loader._github_response_message({"message": ""}) == ""
-    assert loader._github_response_message({"other": 1}) == ""
-    assert loader._github_response_message("not a dict") == ""
-
-    assert loader._safe_contents_path("pkg/environment.py", ["pkg"]) == "pkg/environment.py"
-
-    with pytest.raises(RuntimeError, match="did not include a path"):
-        loader._safe_contents_path(123, ["pkg"])
-    with pytest.raises(RuntimeError, match="unsafe path in environment contents"):
-        loader._safe_contents_path("../escape.py", ["pkg"])
-    with pytest.raises(RuntimeError, match="unexpected path in environment contents"):
-        loader._safe_contents_path("other/environment.py", ["pkg"])
 
 
 def test_freesolo_import_error_reports_the_real_failure(monkeypatch):

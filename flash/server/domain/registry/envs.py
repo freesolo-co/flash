@@ -5,19 +5,11 @@ from __future__ import annotations
 import base64
 import gzip
 import io
-import os
 import re
-import shutil
-import subprocess
 import tarfile
 import tempfile
-import time
-import urllib.parse
-from collections.abc import Iterator
-from contextlib import contextmanager
 from pathlib import Path
 
-from flash.envs.loading.loader import _github_token
 from flash.envs.package.direct_tokens import DirectTokenScanError, package_contains_direct_token
 from flash.envs.package.limits import (
     ARCHIVE_MEMBER_LIMIT,
@@ -31,17 +23,10 @@ from flash.server.domain.registry import blob_envs
 
 _MAX_UPLOAD_BYTES = 64 * 1024 * 1024
 _MAX_UNCOMPRESSED_BYTES = 256 * 1024 * 1024
-_MAX_DOWNLOAD_BYTES = _MAX_UNCOMPRESSED_BYTES
 _MAX_MEMBERS = ARCHIVE_MEMBER_LIMIT
 _MAX_SCAN_MEMBERS = ARCHIVE_SCAN_MEMBER_LIMIT
-_DEFAULT_GITHUB_REPO = "freesolo-co/environment-hub"
-_GITHUB_BRANCH = "main"
 _DEFAULT_ENVIRONMENT_FILE = "environment.py"
-# Genuine repo-control directories that live at the ROOT of the environment-hub checkout. A DELETE
-# runs `git rm -r -- <org-slug>/<name>` directly against that checkout, so a slug whose namespace is
-# one of these would target tracked repo infrastructure (e.g. `DELETE /v1/envs/.github/workflows`).
-# Org slugs can never be dot-prefixed, so these are never publishable namespaces and are always safe
-# to reject on delete.
+# Reserved namespaces and archive paths remain invalid after the storage migration.
 _REPO_CONTROL_TOP_LEVEL_PATHS = {
     ".github",
     ".git",
@@ -51,8 +36,6 @@ _REPO_CONTROL_TOP_LEVEL_PATHS = {
 # NOT a repo-control namespace, so the delete validator must reject only
 # `_REPO_CONTROL_TOP_LEVEL_PATHS`, not this set, or `source/<name>` envs become undeletable.
 _BLOCKED_TOP_LEVEL_PATHS = _REPO_CONTROL_TOP_LEVEL_PATHS | {"source"}
-_GIT_TIMEOUT_S = 180
-_GIT_PUSH_RETRY_DELAYS_SECONDS = (2.0, 5.0)
 _NAMESPACE_RE = re.compile(r"[a-z0-9][a-z0-9._-]*")
 
 
@@ -91,7 +74,7 @@ def publish_slug_for_name(name: str, key: dict, project_slug: str) -> tuple[str,
 
     Environment names are unique per PROJECT, so the owning project is part of the published
     identity: the destination is ``<org-slug>/<project-slug>/<name>``, which is also the
-    directory the package occupies in the hub repository.
+    key prefix in the managed registry.
 
     Pure and side-effect free, so the publish route can resolve the destination slug before
     uploading anything. Accepts a bare name, or a fully qualified id whose namespace and project
@@ -203,334 +186,6 @@ def _safe_extract(tar_bytes: bytes, dest: Path) -> None:
         raise EnvPublishError(f"env package could not be extracted: {exc}") from exc
 
 
-def _token_representation_pattern(token: str) -> re.Pattern[str]:
-    encoded = urllib.parse.quote(token, safe="")
-    parts = []
-    cursor = 0
-    for match in re.finditer(r"%[0-9A-F]{2}", encoded):
-        parts.append(re.escape(encoded[cursor : match.start()]))
-        octet = match.group()[1:]
-        parts.append(
-            "%"
-            + "".join(
-                f"[{digit.lower()}{digit.upper()}]" if digit in "ABCDEF" else digit
-                for digit in octet
-            )
-        )
-        cursor = match.end()
-    parts.append(re.escape(encoded[cursor:]))
-    return re.compile(f"(?:{re.escape(token)}|{''.join(parts)})")
-
-
-def _redact(value: str, token: str) -> str:
-    if not token:
-        return value
-    return _token_representation_pattern(token).sub("<redacted>", value)
-
-
-def _repo_url(repo: str) -> str:
-    return f"https://github.com/{repo}.git"
-
-
-@contextmanager
-def _git_credential_env(token: str) -> Iterator[dict[str, str]]:
-    """Yield a git environment backed by short-lived, mode-restricted askpass files."""
-    with tempfile.TemporaryDirectory(prefix="flash-git-auth-") as tmp:
-        auth_dir = Path(tmp)
-        token_file = auth_dir / "token"
-        askpass = auth_dir / "askpass.sh"
-        token_fd = os.open(token_file, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-        os.fchmod(token_fd, 0o600)
-        with os.fdopen(token_fd, "w", encoding="utf-8") as stream:
-            stream.write(token)
-        askpass_fd = os.open(askpass, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o700)
-        os.fchmod(askpass_fd, 0o700)
-        with os.fdopen(askpass_fd, "w", encoding="utf-8") as stream:
-            stream.write(
-                "#!/bin/sh\n"
-                'case "$1" in\n'
-                "  *Username*) printf '%s\\n' x-access-token ;;\n"
-                '  *Password*) exec cat "$FLASH_GIT_TOKEN_FILE" ;;\n'
-                "  *) exit 1 ;;\n"
-                "esac\n"
-            )
-
-        token_pattern = _token_representation_pattern(token) if token else None
-        env = {
-            key: value
-            for key, value in os.environ.items()
-            if key
-            not in {
-                "GH_TOKEN",
-                "GITHUB_PAT",
-                "GITHUB_TOKEN",
-                "GIT_CONFIG_COUNT",
-                "GIT_CONFIG_PARAMETERS",
-            }
-            and not key.startswith(("GIT_CONFIG_KEY_", "GIT_CONFIG_VALUE_"))
-            and not (
-                token_pattern
-                and (
-                    token_pattern.search(key) is not None or token_pattern.search(value) is not None
-                )
-            )
-        }
-        env.update(
-            {
-                "GIT_ASKPASS": str(askpass),
-                "GIT_CONFIG_COUNT": "1",
-                "GIT_CONFIG_KEY_0": "credential.helper",
-                "GIT_CONFIG_VALUE_0": "",
-                "GIT_TERMINAL_PROMPT": "0",
-                "FLASH_GIT_TOKEN_FILE": str(token_file),
-            }
-        )
-        yield env
-
-
-def _checkout_child(checkout: Path, publish_root: str, *, operation: str) -> Path:
-    target = checkout / publish_root
-    checkout_root = checkout.resolve()
-    target_root = target.resolve()
-    if target_root != checkout_root and checkout_root not in target_root.parents:
-        raise EnvPublishError(f"unsafe environment {operation} path")
-    return target
-
-
-def _run_git(
-    cwd: Path, args: list[str], *, token: str, operation: str = "upload"
-) -> subprocess.CompletedProcess[str]:
-    # ``operation`` is the user-facing verb for the action that ran this git command ("upload" for
-    # publish, "delete" for delete) so a git failure reports what the caller actually attempted
-    # instead of a misleading "upload" on the delete path. The trailing preposition mirrors the
-    # wording used elsewhere in this module ("environments to Freesolo" for upload, "from Freesolo"
-    # for delete — see `_staged_has_changes` / `delete_package`).
-    try:
-        with _git_credential_env(token) as env:
-            proc = subprocess.run(
-                ["git", *args],
-                cwd=cwd,
-                env=env,
-                capture_output=True,
-                text=True,
-                timeout=_GIT_TIMEOUT_S,
-            )
-    except FileNotFoundError as exc:
-        direction = "from" if operation in {"delete", "download"} else "to"
-        raise EnvPublishError(
-            f"git is required to {operation} environments {direction} Freesolo", status=503
-        ) from exc
-    except subprocess.TimeoutExpired as exc:
-        raise EnvPublishError(
-            f"Freesolo environment {operation} git command timed out after {_GIT_TIMEOUT_S}s",
-            status=504,
-        ) from exc
-    if proc.returncode != 0:
-        output = _redact(f"{proc.stdout or ''}\n{proc.stderr or ''}".strip(), token)
-        cmd = "git " + " ".join(args)
-        raise EnvPublishError(
-            _redact(
-                f"Freesolo environment {operation} failed during `{cmd}`: {output[:1000]}", token
-            ),
-            status=502,
-        )
-    return proc
-
-
-def _clone_hub_checkout(
-    *,
-    parent: Path,
-    checkout: Path,
-    repo: str,
-    token: str,
-    operation: str,
-    shallow: bool = False,
-) -> None:
-    args = ["clone"]
-    if shallow:
-        args.extend(["--depth", "1"])
-    args.extend(
-        [
-            "--branch",
-            _GITHUB_BRANCH,
-            "--single-branch",
-            _repo_url(repo),
-            str(checkout),
-        ]
-    )
-    _run_git(parent, args, token=token, operation=operation)
-
-
-def _is_retryable_git_publish_error(message: str) -> bool:
-    lowered = message.lower()
-    permanent = (
-        "authentication failed",
-        "could not read username",
-        "repository not found",
-        "permission denied",
-        "403",
-        "401",
-    )
-    if any(marker in lowered for marker in permanent):
-        return False
-    retryable = (
-        "failed to push some refs",
-        "fetch first",
-        "non-fast-forward",
-        "stale info",
-        "cannot lock ref",
-        "connection reset",
-        "operation timed out",
-        "the remote end hung up",
-        "early eof",
-        "index.lock",
-        "rebase",
-    )
-    return any(marker in lowered for marker in retryable)
-
-
-def _copy_package_to_checkout(*, source: Path, checkout: Path, publish_root: str) -> None:
-    target = _checkout_child(checkout, publish_root, operation="publish")
-    shutil.rmtree(target, ignore_errors=True)
-    target.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copytree(source, target)
-
-
-def _commit_environment_update(
-    *, checkout: Path, publish_root: str, message: str, token: str
-) -> bool:
-    _run_git(checkout, ["config", "user.name", "freesolo-bot"], token=token)
-    _run_git(checkout, ["config", "user.email", "bot@freesolo.co"], token=token)
-    _run_git(checkout, ["add", "-A", "--", publish_root], token=token)
-    try:
-        with _git_credential_env(token) as env:
-            proc = subprocess.run(
-                ["git", "diff", "--cached", "--quiet", "--", publish_root],
-                cwd=checkout,
-                env=env,
-                capture_output=True,
-                text=True,
-                timeout=_GIT_TIMEOUT_S,
-            )
-    except subprocess.TimeoutExpired as exc:
-        raise EnvPublishError(
-            f"Freesolo environment upload git command timed out after {_GIT_TIMEOUT_S}s",
-            status=504,
-        ) from exc
-    if proc.returncode == 0:
-        return False
-    if proc.returncode != 1:
-        output = f"{proc.stdout or ''}\n{proc.stderr or ''}".strip()
-        raise EnvPublishError(
-            _redact(
-                f"Freesolo environment upload failed during staged diff check: {output}", token
-            ),
-            status=502,
-        )
-    _run_git(checkout, ["commit", "-m", message], token=token)
-    return True
-
-
-def _push_environment_commit(*, checkout: Path, token: str) -> None:
-    _run_git(checkout, ["pull", "--rebase", "origin", _GITHUB_BRANCH], token=token)
-    _run_git(checkout, ["push", "origin", f"HEAD:{_GITHUB_BRANCH}"], token=token)
-
-
-def _push_environment_delete(*, checkout: Path, publish_root: str, token: str) -> None:
-    """Rebase onto the remote tip, re-apply the slug removal, then push.
-
-    Re-run ``git rm -r`` after rebasing so concurrent files under the slug are deleted too.
-    """
-    _run_git(
-        checkout, ["pull", "--rebase", "origin", _GITHUB_BRANCH], token=token, operation="delete"
-    )
-    _run_git(
-        checkout,
-        ["rm", "-r", "--quiet", "--ignore-unmatch", "--", publish_root],
-        token=token,
-        operation="delete",
-    )
-    if _staged_has_changes(checkout, token=token):
-        _run_git(checkout, ["commit", "--amend", "--no-edit"], token=token, operation="delete")
-    _run_git(
-        checkout, ["push", "origin", f"HEAD:{_GITHUB_BRANCH}"], token=token, operation="delete"
-    )
-
-
-def _github_publish_once(
-    *,
-    dest: Path,
-    repo: str,
-    token: str,
-    publish_root: str,
-    message: str,
-) -> None:
-    with tempfile.TemporaryDirectory(prefix="flash-env-hub-") as tmp:
-        tmp_path = Path(tmp)
-        checkout = tmp_path / "environment-hub"
-        _clone_hub_checkout(
-            parent=tmp_path,
-            checkout=checkout,
-            repo=repo,
-            token=token,
-            operation="upload",
-        )
-        _copy_package_to_checkout(source=dest, checkout=checkout, publish_root=publish_root)
-        if _commit_environment_update(
-            checkout=checkout,
-            publish_root=publish_root,
-            message=message,
-            token=token,
-        ):
-            _push_environment_commit(checkout=checkout, token=token)
-
-
-def _github_publish(
-    dest: Path,
-    *,
-    name: str,
-    key: dict,
-    project_slug: str,
-) -> str:
-    token = _github_token()
-    if not token:
-        raise EnvPublishError(
-            "GITHUB_TOKEN is required for the Flash control plane to publish environments",
-            status=503,
-        )
-    repo = _DEFAULT_GITHUB_REPO
-    ns, project, clean = publish_slug_for_name(name, key, project_slug)
-    publish_root = f"{ns}/{project}/{clean}"
-    if not (dest / _DEFAULT_ENVIRONMENT_FILE).is_file():
-        raise EnvPublishError("env package must contain environment.py")
-    if not any(path.is_file() for path in dest.rglob("*")):
-        raise EnvPublishError("env package contains no files")
-    message = f"Upload Flash environment {publish_root}"
-
-    last_error: EnvPublishError | None = None
-    max_attempts = len(_GIT_PUSH_RETRY_DELAYS_SECONDS) + 1
-    for attempt in range(max_attempts):
-        if attempt:
-            time.sleep(_GIT_PUSH_RETRY_DELAYS_SECONDS[attempt - 1])
-        try:
-            _github_publish_once(
-                dest=dest,
-                repo=repo,
-                token=token,
-                publish_root=publish_root,
-                message=message,
-            )
-            # the id the caller pastes into `[environment] id` must be the SAME three segments
-            # the package was written under, or it resolves to nothing.
-            return publish_root
-        except EnvPublishError as exc:
-            last_error = exc
-            if attempt == max_attempts - 1 or not _is_retryable_git_publish_error(str(exc)):
-                raise
-    assert last_error is not None
-    raise last_error
-
-
 def validate_publish_inputs(*, package_b64: object, name: object) -> bytes:
     """Check a publish request's own inputs and return its decoded package.
 
@@ -577,6 +232,8 @@ def publish_package(
     with tempfile.TemporaryDirectory(prefix="flash-env-publish-") as tmp:
         dest = Path(tmp)
         _safe_extract(tar_bytes, dest)
+        if not (dest / _DEFAULT_ENVIRONMENT_FILE).is_file():
+            raise EnvPublishError("env package must contain environment.py")
         try:
             contains_direct_token = package_contains_direct_token(dest)
         except DirectTokenScanError:
@@ -585,10 +242,8 @@ def publish_package(
             raise EnvPublishError(
                 "env package contains a direct access token; remove it before publishing"
             )
-        if blob_envs.enabled():
-            slug = "/".join(publish_slug_for_name(name, key, project_slug))
-            return blob_envs.publish(slug, dest)
-        return _github_publish(dest, name=name, key=key, project_slug=project_slug)
+        slug = "/".join(publish_slug_for_name(name, key, project_slug))
+        return blob_envs.publish(slug, dest)
 
 
 _SLUG_SEGMENT_RE = re.compile(r"^[a-z0-9._-]+$")
@@ -613,9 +268,7 @@ def _validate_slug(slug: str) -> tuple[str, str, str]:
         if segment in {".", ".."} or not _SLUG_SEGMENT_RE.fullmatch(segment):
             raise EnvPublishError(f"invalid env id segment: {segment!r}")
     namespace, project, name = parts
-    # delete runs git rm against the hub checkout, so block repo-control top-level paths here.
-    # use only _REPO_CONTROL_TOP_LEVEL_PATHS because valid namespaces such as source must remain
-    # deletable.
+    # Preserve the existing namespace contract, including the valid source namespace.
     if namespace in _REPO_CONTROL_TOP_LEVEL_PATHS:
         raise EnvPublishError(f"invalid env id segment: {namespace!r}")
     return namespace, project, name
@@ -644,253 +297,20 @@ def _require_namespace_access(canonical: str, key: dict, *, action: str) -> None
         )
 
 
-def _package_checkout_directory(source: Path) -> bytes:
-    if not (source / _DEFAULT_ENVIRONMENT_FILE).is_file():
-        raise EnvPublishError("environment package not found", status=404)
-
-    total = 0
-    members = 0
-    buf = io.BytesIO()
-    with tarfile.open(fileobj=buf, mode="w:gz") as tar:
-        for path in sorted(source.rglob("*")):
-            rel = path.relative_to(source).as_posix()
-            if rel.split("/", 1)[0] in _BLOCKED_TOP_LEVEL_PATHS:
-                raise EnvPublishError(
-                    "env packages must not contain repo-control or source top-level paths",
-                    status=502,
-                )
-            if path.is_symlink():
-                raise EnvPublishError(f"links are not allowed in env packages: {rel!r}", status=502)
-            if path.is_file():
-                total += path.stat().st_size
-                if total > _MAX_UNCOMPRESSED_BYTES:
-                    raise EnvPublishError(
-                        "env package is too large uncompressed "
-                        f"(limit {_human_mb(_MAX_UNCOMPRESSED_BYTES)})",
-                        status=413,
-                    )
-            elif not path.is_dir():
-                raise EnvPublishError(
-                    f"only regular files and directories are allowed in env packages, "
-                    f"but {rel!r} is a special file",
-                    status=502,
-                )
-
-            members += 1
-            if members > _MAX_MEMBERS:
-                raise EnvPublishError(f"env package has too many members (limit {_MAX_MEMBERS})")
-            tar.add(path, arcname=rel, recursive=False)
-            if buf.tell() > _MAX_DOWNLOAD_BYTES:
-                raise EnvPublishError(
-                    f"env package download is too large (limit {_human_mb(_MAX_DOWNLOAD_BYTES)})",
-                    status=413,
-                )
-
-    data = buf.getvalue()
-    if len(data) > _MAX_DOWNLOAD_BYTES:
-        raise EnvPublishError(
-            f"env package download is too large (limit {_human_mb(_MAX_DOWNLOAD_BYTES)})",
-            status=413,
-        )
-    return data
-
-
-def _github_download_once(*, repo: str, token: str, publish_root: str) -> bytes:
-    with tempfile.TemporaryDirectory(prefix="flash-env-hub-") as tmp:
-        tmp_path = Path(tmp)
-        checkout = tmp_path / "environment-hub"
-        _clone_hub_checkout(
-            parent=tmp_path,
-            checkout=checkout,
-            repo=repo,
-            token=token,
-            operation="download",
-            shallow=True,
-        )
-        target = _checkout_child(checkout, publish_root, operation="download")
-        if not target.is_dir():
-            raise EnvPublishError("environment package not found", status=404)
-        return _package_checkout_directory(target)
-
-
-def _github_download(slug: str, *, token: str) -> bytes:
-    return _github_download_once(repo=_DEFAULT_GITHUB_REPO, token=token, publish_root=slug)
-
-
-def _authorized_hub_request(slug: str, key: dict, *, action: str) -> tuple[str, str]:
-    """Resolve one hub operation's target and credential, or refuse it.
-
-    Every hub operation asks the same two questions in the same order -- is this key allowed to touch
-    this namespace, and does the control plane have a hub credential at all -- and they must stay in
-    that order: a caller with no access should be told so whether or not the server happens to be
-    configured. Returns the canonical ``namespace/project/name`` and the token.
-    """
-    namespace, project, name = _validate_slug(slug)
-    canonical = f"{namespace}/{project}/{name}"
-    _require_namespace_access(canonical, key, action=action)
-    token = _github_token()
-    if not token:
-        # both halves are load-bearing and each has a test: GITHUB_TOKEN names the variable to set,
-        # and "control plane" says whose it is -- this is a 503 because the SERVER is unconfigured,
-        # not a 4xx telling the caller to supply a credential of their own.
-        raise EnvPublishError(
-            f"GITHUB_TOKEN is required for the Flash control plane to {action} environments",
-            status=503,
-        )
-    return canonical, token
-
-
 def download_package(*, slug: str, key: dict) -> bytes:
-    """Return a tar.gz package for a published environment from the GitHub hub."""
-    if blob_envs.enabled():
-        canonical = canonical_env_id(slug)
-        _require_namespace_access(canonical, key, action="download")
-        return blob_envs.download(canonical)
-    canonical, token = _authorized_hub_request(slug, key, action="download")
-    return _github_download(canonical, token=token)
+    """Download the current package from the private managed registry."""
+    canonical = canonical_env_id(slug)
+    _require_namespace_access(canonical, key, action="download")
+    return blob_envs.download(canonical)
 
 
 def list_namespace_slugs(*, key: dict) -> list[str]:
-    """Return the published ``namespace/project/name`` slugs the caller's org owns, sorted.
-
-    Reads the hub through the GitHub tree API rather than the clone the publish/delete paths use:
-    the hub is hundreds of MB and clones non-shallow, so a read-only list must not pay for a
-    checkout it would immediately throw away.
-
-    The namespace comes from the authenticated key, never from the caller, so this cannot enumerate
-    another org. The internal key is org-agnostic and has no namespace of its own to list, so it is
-    refused here instead of being silently answered with an empty list.
-    """
-    if key.get("auth_kind") == "internal":
-        raise EnvPublishError(
-            "listing environments requires a Freesolo user key, which carries the org namespace "
-            "to list; the internal service key is org-agnostic",
-            status=403,
-        )
-    namespace = namespace_for(key)
-    if blob_envs.enabled():
-        return blob_envs.list_slugs(namespace)
-    if not _github_token():
-        raise EnvPublishError(
-            "GITHUB_TOKEN is required for the Flash control plane to list environments",
-            status=503,
-        )
-    from flash.envs.loading import loader
-
-    try:
-        return loader.list_managed_namespace_slugs(namespace)
-    except loader.GitHubRateLimitError as exc:
-        raise EnvPublishError(
-            f"Freesolo environment list is rate limited: {exc}", status=429
-        ) from exc
-    except loader.GitHubUnavailableError as exc:
-        # 503, not 429: a 5xx or a connection failure is GitHub being unreachable, and telling the
-        # caller they exceeded a quota is both wrong and unactionable -- there is no quota to wait
-        # out, and the real cause never reaches them.
-        raise EnvPublishError(
-            f"Freesolo environment list is temporarily unavailable: {exc}", status=503
-        ) from exc
-    except RuntimeError as exc:
-        raise EnvPublishError(f"Freesolo environment list failed: {exc}", status=502) from exc
-
-
-def _staged_has_changes(checkout: Path, *, token: str = "") -> bool:
-    try:
-        with _git_credential_env(token) as env:
-            proc = subprocess.run(
-                ["git", "diff", "--cached", "--quiet"],
-                cwd=checkout,
-                env=env,
-                capture_output=True,
-                text=True,
-                timeout=_GIT_TIMEOUT_S,
-            )
-    except FileNotFoundError as exc:
-        raise EnvPublishError(
-            "git is required to delete environments from Freesolo", status=503
-        ) from exc
-    except subprocess.TimeoutExpired as exc:
-        raise EnvPublishError(
-            f"Freesolo environment delete git command timed out after {_GIT_TIMEOUT_S}s",
-            status=504,
-        ) from exc
-    # `git diff --cached --quiet` exits 0 (nothing staged) or 1 (staged changes). Treat ONLY 1 as
-    # "has changes"; any other code (e.g. 128 for a broken/unexpected repo state) is an error, not a
-    # signal to commit-and-push, so surface it as a controlled EnvPublishError instead of a bare 500.
-    if proc.returncode not in (0, 1):
-        output = f"{proc.stdout or ''}\n{proc.stderr or ''}".strip()
-        raise EnvPublishError(
-            _redact(
-                f"Freesolo environment delete failed during staged diff check: {output}", token
-            ),
-            status=502,
-        )
-    return proc.returncode == 1
-
-
-def _github_delete_once(*, repo: str, token: str, publish_root: str, message: str) -> bool:
-    with tempfile.TemporaryDirectory(prefix="flash-env-hub-") as tmp:
-        tmp_path = Path(tmp)
-        checkout = tmp_path / "environment-hub"
-        _clone_hub_checkout(
-            parent=tmp_path,
-            checkout=checkout,
-            repo=repo,
-            token=token,
-            operation="delete",
-        )
-        target = _checkout_child(checkout, publish_root, operation="delete")
-        if not target.exists():
-            # absence in the freshly cloned tip is idempotent. another pull cannot eliminate the
-            # publish/delete race; concurrent additions to an existing slug are handled on push.
-            return False
-        _run_git(checkout, ["config", "user.name", "freesolo-bot"], token=token, operation="delete")
-        _run_git(
-            checkout, ["config", "user.email", "bot@freesolo.co"], token=token, operation="delete"
-        )
-        _run_git(
-            checkout,
-            ["rm", "-r", "--quiet", "--ignore-unmatch", "--", publish_root],
-            token=token,
-            operation="delete",
-        )
-        if not _staged_has_changes(checkout, token=token):
-            # The directory was present on disk but untracked (never committed) — nothing to push.
-            return False
-        _run_git(checkout, ["commit", "-m", message], token=token, operation="delete")
-        _push_environment_delete(checkout=checkout, publish_root=publish_root, token=token)
-        return True
-
-
-def _github_delete(slug: str, *, token: str) -> bool:
-    repo = _DEFAULT_GITHUB_REPO
-    message = f"Delete Flash environment {slug}"
-    last_error: EnvPublishError | None = None
-    max_attempts = len(_GIT_PUSH_RETRY_DELAYS_SECONDS) + 1
-    for attempt in range(max_attempts):
-        if attempt:
-            time.sleep(_GIT_PUSH_RETRY_DELAYS_SECONDS[attempt - 1])
-        try:
-            return _github_delete_once(repo=repo, token=token, publish_root=slug, message=message)
-        except EnvPublishError as exc:
-            last_error = exc
-            if attempt == max_attempts - 1 or not _is_retryable_git_publish_error(str(exc)):
-                raise
-    assert last_error is not None
-    raise last_error
+    """List packages belonging to the authenticated organization."""
+    return blob_envs.list_slugs(namespace_for(key))
 
 
 def delete_package(*, slug: str, key: dict) -> bool:
-    """Remove a published environment from the hub.
-
-    Returns ``True`` when a package was removed and ``False`` when it was already absent
-    (idempotent). Authorization mirrors publish's namespace isolation: a user key may delete
-    only environments in its own org-slug namespace, while the internal service key
-    (``auth_kind == "internal"``) may delete any environment.
-    """
-    if blob_envs.enabled():
-        canonical = canonical_env_id(slug)
-        _require_namespace_access(canonical, key, action="delete")
-        return blob_envs.delete(canonical)
-    canonical, token = _authorized_hub_request(slug, key, action="delete")
-    return _github_delete(canonical, token=token)
+    """Remove the current head, retaining immutable revisions for pinned jobs."""
+    canonical = canonical_env_id(slug)
+    _require_namespace_access(canonical, key, action="delete")
+    return blob_envs.delete(canonical)

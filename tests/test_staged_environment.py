@@ -136,7 +136,6 @@ def _disable_github(monkeypatch) -> None:
     for name in (
         "_resolve_ref_sha",
         "_resolve_github_environment_file",
-        "_download_github_directory",
         "_extract_github_tarball",
         "_urlopen",
     ):
@@ -155,44 +154,6 @@ def _prepared_status(public: JobSpec, worker: JobSpec, *, state: str = "provisio
             "preparation_digest": runner_preparation._preparation_digest(public, worker, None),
         },
     )
-
-
-def test_controller_acquires_fresh_managed_tree_without_reading_poisoned_cache(
-    monkeypatch, tmp_path
-) -> None:
-    from flash.envs.loading import loader
-    from flash.envs.loading.staged import resolve_environment_source
-
-    poisoned = tmp_path / "cache" / "poisoned"
-    poisoned.mkdir(parents=True)
-    (poisoned / "environment.py").write_text("POISON = True\n", encoding="utf-8")
-    monkeypatch.setattr(loader, "_CACHE_ROOT", tmp_path / "cache")
-    monkeypatch.setattr(loader, "_resolve_ref_sha", lambda *_args, **_kwargs: _SHA)
-    monkeypatch.setattr(loader, "_managed_hub_package_root", lambda _ref: "org/project/env")
-    monkeypatch.setattr(
-        loader,
-        "_resolve_github_environment_file",
-        lambda *_args, **_kwargs: pytest.fail("staging must not read the executable env cache"),
-    )
-
-    def fresh_download(_ref, repo_dir, dest, **_kwargs):
-        assert repo_dir == "org/project/env"
-        root = dest / "repo"
-        package = root / repo_dir
-        package.mkdir(parents=True)
-        (package / "environment.py").write_text("FRESH = True\n", encoding="utf-8")
-        (package / "sidecar.txt").write_text("fresh\n", encoding="utf-8")
-        return root
-
-    monkeypatch.setattr(loader, "_download_github_directory", fresh_download)
-    source = resolve_environment_source("org/project/env")
-    try:
-        assert source.root != loader._CACHE_ROOT
-        assert (source.root / source.entrypoint).read_text(encoding="utf-8") == "FRESH = True\n"
-        assert (source.root / "org/project/env/sidecar.txt").is_file()
-    finally:
-        assert source.staging_root is not None
-        shutil.rmtree(source.staging_root, ignore_errors=True)
 
 
 @pytest.mark.parametrize(

@@ -7,11 +7,11 @@ import tempfile
 from pathlib import Path
 
 from flash.envs.meta.identity import canonical_managed_environment_slug
-from flash.envs.registry.azure import RegistryError, enabled, open_registry
+from flash.envs.registry.azure import RegistryError, open_registry
 
 
 def managed_slug(value: str) -> str | None:
-    return canonical_managed_environment_slug(value) if enabled() else None
+    return canonical_managed_environment_slug(value)
 
 
 def resolve_revision(slug: str, revision: str = "", *, deadline_at: float | None = None) -> str:

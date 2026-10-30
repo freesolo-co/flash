@@ -42,8 +42,6 @@ def seed_environment(env_id: str, payload: dict, key: Annotated[dict, Depends(re
         raise HTTPException(status_code=403, detail="internal service key required")
     try:
         slug = envs.canonical_env_id(env_id)
-        if not blob_envs.enabled():
-            raise envs.EnvPublishError("Azure environment registry is not enabled", status=503)
         package = envs.validate_publish_inputs(
             package_b64=payload.get("package_b64"), name=slug.split("/")[-1]
         )

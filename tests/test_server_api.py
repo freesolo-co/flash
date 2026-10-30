@@ -6536,7 +6536,6 @@ def test_recover_runs_rejects_warmstart_artifact_drift(monkeypatch, tmp_path):
 
 def test_publish_env_endpoint_publishes_under_managed_account(api, monkeypatch):
     """POST /v1/envs publishes an uploaded package to the managed environment hub."""
-    monkeypatch.setenv("GITHUB_TOKEN", "token-for-publish-path")
     import base64
     import io
     import tarfile
@@ -6545,9 +6544,9 @@ def test_publish_env_endpoint_publishes_under_managed_account(api, monkeypatch):
 
     published_roots: list[str] = []
     monkeypatch.setattr(
-        envs_mod,
-        "_github_publish_once",
-        lambda *, publish_root, **_kwargs: published_roots.append(publish_root),
+        envs_mod.blob_envs,
+        "publish",
+        lambda slug, _dest: published_roots.append(slug) or slug,
     )
 
     buf = io.BytesIO()
@@ -6820,7 +6819,6 @@ def _b64_targz(members: dict[str, bytes]) -> str:
 )
 def test_publish_env_validates_the_archive_before_publication(api, monkeypatch, package, message):
     """Base64-valid but structurally invalid packages keep their own 400."""
-    monkeypatch.setenv("GITHUB_TOKEN", "token-for-publish-path")
 
     response = api.post(
         "/v1/envs",

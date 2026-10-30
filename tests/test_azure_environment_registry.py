@@ -73,7 +73,6 @@ def registry(monkeypatch):
         except ResourceNotFoundError as exc:
             raise azure.RegistryError("not found", status=404) from exc
 
-    monkeypatch.setenv("FLASH_ENV_STORE", "azure")
     monkeypatch.delenv("GITHUB_TOKEN", raising=False)
     monkeypatch.setattr(azure, "open_registry", opened)
     monkeypatch.setattr(packages, "open_registry", opened)
@@ -288,3 +287,43 @@ def test_source_outage_uses_controller_retry_contract(registry, monkeypatch):
     monkeypatch.setattr(packages, "resolve_source", unavailable)
     with pytest.raises(StagedEnvironmentTransientError):
         resolve_environment_source(SLUG)
+
+
+@pytest.mark.parametrize(
+    "reference",
+    [
+        SLUG,
+        f"github:freesolo-co/environment-hub@main:{SLUG}/environment.py",
+        f"https://github.com/freesolo-co/environment-hub/blob/main/{SLUG}/environment.py",
+    ],
+)
+def test_legacy_managed_aliases_use_azure_without_mode_flag(
+    registry, monkeypatch, tmp_path, reference
+):
+    from flash.envs.loading import loader
+
+    monkeypatch.setattr(loader, "_CACHE_ROOT", tmp_path / "cache")
+    monkeypatch.setattr(loader, "_urlopen", lambda *a, **kw: pytest.fail("called GitHub"))
+    registry.publish(SLUG, archive())
+    assert loader._resolve_environment_reference(reference).endswith("environment.py")
+
+
+def test_staging_ignores_poisoned_executable_cache(registry, monkeypatch, tmp_path):
+    import shutil
+
+    from flash.envs.loading import loader, staged
+
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    (cache / "environment.py").write_text("POISON = True\n")
+    monkeypatch.setattr(loader, "_CACHE_ROOT", cache)
+    monkeypatch.setattr(
+        packages, "cached_entrypoint", lambda *a: pytest.fail("staging read executable cache")
+    )
+    registry.publish(SLUG, archive())
+    source = staged.resolve_environment_source(SLUG)
+    try:
+        assert source.root != cache
+        assert (source.root / source.entrypoint).read_text() == "VALUE = 1\n"
+    finally:
+        shutil.rmtree(source.staging_root)
