@@ -230,6 +230,10 @@ def _run_training(
     from flash.runner.supervise.lifecycle import _run_attempts_supervised
 
     status = get_status(spec.run_id)
+    if runtime_secrets is None and status.state not in TERMINAL_STATES:
+        from flash.runner.lifecycle.runtime_credentials import restore
+
+        runtime_secrets = restore(status) or None
     if source_snapshot is None:
         source_snapshot = source_snapshot_from_status(status, required=True)
     # defense in depth against the recovery toctou (see attach_run): a run can be flipped into any

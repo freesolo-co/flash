@@ -164,7 +164,7 @@ class RunStatus:
     # full managed source descriptor, kept private because it carries the repository path.
     source_snapshot: dict | None = None
     source_verified_attempt: int | None = None
-    # Only the requirement is persisted, never request secret names or values.
+    # Only the requirement is in status; credentials live in the private encrypted store.
     requires_runtime_secrets: bool = False
 
     def to_dict(self) -> dict:
@@ -411,6 +411,11 @@ def _save_status_unlocked(
             os.fsync(dir_fd)
         finally:
             os.close(dir_fd)
+        if status.state in TERMINAL_STATES:
+            from flash.runner.lifecycle.runtime_credentials import discard
+
+            with contextlib.suppress(OSError):
+                discard(status.run_id)
     finally:
         with contextlib.suppress(FileNotFoundError):
             os.unlink(tmp)
