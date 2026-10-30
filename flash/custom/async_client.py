@@ -10,24 +10,12 @@ import asyncio
 from concurrent.futures import ThreadPoolExecutor
 from functools import partial
 
-from flash.custom.client import TrainingClient
-
 
 class AsyncTrainingClient:
     def __init__(self, client):
         self._client = client
         self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="flash-training")
         self._closing = False
-
-    @classmethod
-    async def create(cls, *args, **kwargs):
-        task = asyncio.create_task(asyncio.to_thread(TrainingClient.create, *args, **kwargs))
-        try:
-            return cls(await asyncio.shield(task))
-        except asyncio.CancelledError:
-            client = await task
-            await asyncio.to_thread(client.close)
-            raise
 
     @property
     def step(self):

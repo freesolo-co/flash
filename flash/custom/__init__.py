@@ -1,4 +1,4 @@
-"""User-owned training loops over a dedicated remote GPU session.
+"""Local training algorithms controlling a managed Flash run.
 
 The client and data contract import without torch, Modal, or server dependencies.
 """

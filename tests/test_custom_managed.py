@@ -238,7 +238,7 @@ def test_submission_error_reconciles_exact_controller_without_a_second_create(ht
     api = Mock(timeout=60)
     captured = []
 
-    def created_but_lost(payload):
+    def created_but_lost(payload, **kwargs):
         captured.append(payload)
         if http_status is not None:
             raise ApiError(http_status, "submission response failed")
@@ -341,6 +341,7 @@ def test_train_command_runs_local_sync_or_async_file(tmp_path, monkeypatch, asyn
     )
     api = Mock(timeout=60)
     api.create_run.return_value = {"run_id": "new-custom-run"}
+    api.health.return_value = {"capabilities": ["custom_training_v1"]}
     client = Mock()
     monkeypatch.setattr(controller, "client_from_config", lambda: api)
     monkeypatch.setattr(controller, "connect", lambda *a, **k: client)
@@ -357,6 +358,7 @@ def test_train_command_runs_local_sync_or_async_file(tmp_path, monkeypatch, asyn
     client.optim_step.assert_called_once_with(learning_rate=0.01)
     client.close.assert_called_once()
     api.cancel_run.assert_not_called()
+    assert api.create_run.call_args.kwargs["client_train_schema"]["fields"]
 
 
 def test_custom_preview_never_executes_user_code(tmp_path, monkeypatch):
@@ -366,10 +368,34 @@ def test_custom_preview_never_executes_user_code(tmp_path, monkeypatch):
         'raise AssertionError("must not execute during a quote")'
     )
     api = Mock(timeout=60)
-    api.create_run.return_value = {"state": "dry_run"}
+    api.health.return_value = {"capabilities": ["custom_training_v1"]}
+    api.create_run.return_value = {"state": "dry_run", "estimated_cost_usd": 4.0}
     monkeypatch.setattr(controller, "client_from_config", lambda: api)
     args = SimpleNamespace(
         config=str(tmp_path / "run.toml"), cost=True, dry_run=False, background=False
     )
     assert controller.run_custom(args, spec_from_dict(custom_raw()), set()) == 0
     assert api.create_run.call_args.kwargs["dry_run"] is True
+
+
+def test_custom_rejects_old_deployed_server_before_importing_script_or_submitting(
+    tmp_path, monkeypatch
+):
+    from flash.client.http import ClientError
+    from flash.custom import controller
+
+    (tmp_path / "algorithm.py").write_text('raise AssertionError("must not execute")')
+    api = Mock(timeout=60)
+    api.health.return_value = {"capabilities": []}
+    monkeypatch.setattr(controller, "client_from_config", lambda: api)
+    args = SimpleNamespace(config=str(tmp_path / "run.toml"), cost=False, dry_run=False)
+    with pytest.raises(ClientError, match="Deploy a server release"):
+        controller.run_custom(args, spec_from_dict(custom_raw()), set())
+    api.create_run.assert_not_called()
+
+
+def test_custom_catalog_advertises_only_the_supported_model():
+    from flash.core.catalog import public_model_rows
+
+    models = [row["id"] for row in public_model_rows() if "custom" in row["algos"]]
+    assert models == ["Qwen/Qwen3.5-9B"]

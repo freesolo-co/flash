@@ -22,41 +22,8 @@ class TrainingClient:
         self._http = ApiClient(url, api_key, timeout=timeout)
         self._lock = threading.RLock()
         self._pending = None
-        self._cleanup = None
         self._state = self.status()
         self.session_id = self._state["session_id"]
-
-    @classmethod
-    def create(
-        cls,
-        model,
-        *,
-        gpu="A10G",
-        max_steps=1000,
-        max_wall_seconds=3600,
-        idle_seconds=900,
-        max_context_tokens=2048,
-        lora_rank=16,
-        revision=None,
-        hf_token=None,
-    ):
-        """Provision a dedicated GPU in your Modal account; use as a context manager.
-
-        This is separate from Freesolo-hosted TOML run submission and billing.
-        """
-        from flash.custom.provision import create_modal_session
-
-        return create_modal_session(
-            model=model,
-            gpu=gpu,
-            max_steps=max_steps,
-            max_wall_seconds=max_wall_seconds,
-            idle_seconds=idle_seconds,
-            max_context_tokens=max_context_tokens,
-            lora_rank=lora_rank,
-            revision=revision,
-            hf_token=hf_token,
-        )
 
     @property
     def step(self):
@@ -198,19 +165,16 @@ class TrainingClient:
         return self._call("load_checkpoint", name=name)
 
     def download_checkpoint(self, name, destination):
-        """Download a checkpoint ZIP before closing the ephemeral GPU session."""
+        """Export a durable checkpoint to a local ZIP while the managed run is active."""
         from flash.custom.artifacts import download_checkpoint
 
         return download_checkpoint(self._http, name, destination)
 
     def close(self):
-        try:
-            if self._pending is None and not self._state.get("closed"):
-                self._call("close")
-        finally:
-            if self._cleanup is not None:
-                self._cleanup()
-                self._cleanup = None
+        if self._pending is not None:
+            raise RuntimeError("resolve the pending operation with retry_pending() before closing")
+        if not self._state.get("closed"):
+            self._call("close")
 
     def __enter__(self):
         return self

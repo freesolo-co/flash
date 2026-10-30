@@ -1302,8 +1302,6 @@ source = { editable = "." }
 
 [package.optional-dependencies]
 custom = [
-    { name = "huggingface-hub" },
-    { name = "modal" },
     { name = "torch", version = "2.10.0", source = { registry = "https://pypi.org/simple" } },
 ]
 dev = [
@@ -1427,7 +1425,6 @@ requires-dist = [
     { name = "httpx", marker = "extra == 'gpu'", specifier = ">=0.27" },
     { name = "httpx", marker = "extra == 'server'", specifier = ">=0.27" },
     { name = "httpx", marker = "extra == 'serving'", specifier = ">=0.27.0" },
-    { name = "huggingface-hub", marker = "extra == 'custom'", specifier = ">=1.2.0" },
     { name = "huggingface-hub", marker = "extra == 'dev'", specifier = ">=1.2.0" },
     { name = "huggingface-hub", marker = "extra == 'gpu'", specifier = ">=1.2.0" },
     { name = "huggingface-hub", marker = "extra == 'serve-runtime'", specifier = ">=1.2.0" },
@@ -1435,7 +1432,6 @@ requires-dist = [
     { name = "jinja2", marker = "extra == 'server'", specifier = ">=3.1.0" },
     { name = "jsonschema", marker = "extra == 'dev'", specifier = ">=4.23" },
     { name = "jsonschema", marker = "extra == 'server'", specifier = ">=4.23" },
-    { name = "modal", marker = "extra == 'custom'", specifier = "==1.6.2" },
     { name = "modal", marker = "extra == 'dev'", specifier = "==1.6.2" },
     { name = "modal", marker = "extra == 'server'", specifier = "==1.6.2" },
     { name = "modal", marker = "extra == 'serving'", specifier = "==1.6.2" },

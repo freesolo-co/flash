@@ -7,9 +7,8 @@ no effect whatsoever on what docker copies. ``Dockerfile`` is single-stage and d
 an image layer and shipped. that is the same leak path .env is already excluded for, and the failure
 is silent -- the build succeeds and the secret rides along.
 
-``scripts/scrub_identities.env`` is the sharp case: it holds the addresses and the internal hostname
-that ``scripts/scrub_history.sh`` exists to delete from history, so a local build on the maintainer's
-machine would republish in an image exactly what the scrub removes from the repo.
+``scripts/scrub_identities.env`` is a legacy operator identity file. A maintainer may still have
+an untracked copy, so it must remain excluded even though its one-time tooling was removed.
 """
 
 from __future__ import annotations

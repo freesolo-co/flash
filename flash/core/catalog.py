@@ -672,4 +672,8 @@ def validate_model_for_algorithm(model_id: str, algorithm: str) -> ModelInfo:
 
 
 def public_model_rows() -> list[dict[str, Any]]:
-    return [_with_merge_disk_floor(model).to_dict() for model in list_models()]
+    rows = [_with_merge_disk_floor(model).to_dict() for model in list_models()]
+    for row in rows:
+        if row["id"] == "Qwen/Qwen3.5-9B":
+            row["algos"] = (*row["algos"], "custom")
+    return rows

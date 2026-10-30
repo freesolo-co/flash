@@ -1,11 +1,11 @@
-"""DPO conformance controller: run through scripts/check_custom_managed_gpu.py."""
+"""DPO conformance controller used by the recurring managed training smoke."""
 
 import asyncio
 import json
 from pathlib import Path
 
 from flash.custom import Datum
-from flash.custom.managed_starter import make_dpo_loss
+from flash.custom.starter import make_dpo_loss
 
 
 async def main(client):

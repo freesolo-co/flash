@@ -455,9 +455,8 @@ In hosted serving, `artifact_digest` hashes adapter configuration and repository
 it contributes to cache identity, but is not a post-download checksum of the weight bytes.
 `artifact_fingerprint` identifies the immutable binding to an organization, checkpoint, source
 revision, base model and serving configuration, including that digest. Neither hash is an
-authentication credential. The fingerprint now hashes the `model_id` key, so previously
-stored fingerprints require the offline migration in
-[`scripts/migrate_checkpoint_fingerprints.py`](../../../scripts/migrate_checkpoint_fingerprints.py).
+authentication credential. The fingerprint hashes the `model_id` key; records using the
+legacy `adapter_id` encoding are rejected.
 
 `POST /adapters`:
 

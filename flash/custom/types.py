@@ -7,6 +7,7 @@ import re
 from dataclasses import dataclass
 
 MAX_BODY_BYTES = 4 * 1024 * 1024
+CUSTOM_TRAINING_CAPABILITY = "custom_training_v1"
 
 
 def integer(value, name, minimum, maximum):

@@ -1,7 +1,7 @@
-"""Paid managed lifecycle check against a Flash server running this branch.
+"""Repeatable paid release smoke against the configured Flash service.
 
 flash login
-python scripts/check_custom_managed_gpu.py --run-paid-test --project PROJECT_UUID --output evidence
+python scripts/smoke_custom_training.py --run-paid-test --project PROJECT_UUID --output evidence
 
 Runs local DPO through flash train, closes its GPU, resumes on a fresh managed worker,
 and checks exact restored logprobs and algorithm state before another optimizer update.
@@ -18,6 +18,7 @@ import zipfile
 from pathlib import Path
 
 from flash.client import client_from_config
+from flash.custom.controller import require_custom_support
 
 
 def main():
@@ -28,10 +29,11 @@ def main():
     args = parser.parse_args()
     if not args.run_paid_test:
         parser.error("pass --run-paid-test to provision two managed H100 sessions")
+    api = client_from_config()
+    require_custom_support(api)
     output = args.output.resolve()
     output.mkdir(parents=True, exist_ok=False)
     shutil.copy(Path(__file__).parent / "fixtures/custom_algorithm.py", output / "algorithm.py")
-    api = client_from_config()
     env = dict(os.environ)
     root = str(Path(__file__).resolve().parents[1])
     env["PYTHONPATH"] = os.pathsep.join(filter(None, [root, env.get("PYTHONPATH")]))

@@ -3,11 +3,10 @@
 import asyncio
 import hmac
 import json
-import os
 import time
 
 from flash._internal.diagnostics import sanitize_diagnostic
-from flash.custom.session import SessionConflict, TrainingSession
+from flash.custom.session import SessionConflict
 from flash.custom.types import MAX_BODY_BYTES, checkpoint_name
 
 
@@ -104,24 +103,6 @@ def create_app(session, token):
     return app
 
 
-def main():
-    from flash.custom.backend import load_backend
-
-    token = os.environ["FLASH_CUSTOM_TOKEN"]
-    config = json.loads(os.environ["FLASH_CUSTOM_CONFIG"])
-    backend = load_backend(
-        config["model"],
-        revision=config.get("revision"),
-        lora_rank=config["lora_rank"],
-        checkpoint_dir="/tmp/flash-custom-checkpoints",
-        max_tokens=config["max_context_tokens"],
-    )
-    session = TrainingSession(
-        backend, max_steps=config["max_steps"], idle_seconds=config["idle_seconds"]
-    )
-    serve_session(session, token, config["max_wall_seconds"])
-
-
 def serve_session(session, token, max_wall_seconds, *, tick=None):
     import uvicorn
 
@@ -154,7 +135,3 @@ def serve_session(session, token, max_wall_seconds, *, tick=None):
             task.cancel()
 
     asyncio.run(serve())
-
-
-if __name__ == "__main__":
-    main()

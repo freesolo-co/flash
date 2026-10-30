@@ -125,8 +125,7 @@ def test_checkpoint_download_streams_and_rejects_incomplete_file(tmp_path, monke
 
 
 def test_scaffold_is_editable_and_never_overwrites(tmp_path):
-    import inspect
-    import runpy
+    import ast
 
     from flash.cli.parsing.main import _build_parser
 
@@ -135,7 +134,10 @@ def test_scaffold_is_editable_and_never_overwrites(tmp_path):
     args.func(args)
     assert "make_dpo_loss" in destination.read_text()
     compile(destination.read_text(), str(destination), "exec")
-    assert inspect.iscoroutinefunction(runpy.run_path(str(destination))["main"])
+    assert any(
+        isinstance(node, ast.AsyncFunctionDef) and node.name == "main"
+        for node in ast.parse(destination.read_text()).body
+    )
     with pytest.raises(FileExistsError):
         args.func(args)
 
@@ -148,3 +150,37 @@ def test_custom_api_imports_without_any_site_packages():
         check=False,
     )
     assert result.returncode == 0, result.stderr
+
+
+def test_scaffold_project_creates_normal_train_config_without_overwriting(tmp_path):
+    from flash.cli.parsing.main import _build_parser
+    from flash.schema import spec_and_train_keys_from_file
+
+    destination = tmp_path / "algorithm.py"
+    args = _build_parser().parse_args(
+        [
+            "custom",
+            "init",
+            str(destination),
+            "--project",
+            "11111111-1111-4111-8111-111111111111",
+        ]
+    )
+    args.func(args)
+    config = destination.with_suffix(".toml")
+    spec, _ = spec_and_train_keys_from_file(str(config), project_required=True)
+    assert spec.algorithm == "custom"
+    assert spec.custom["file"] == destination.name
+    assert spec.project == args.project
+    destination.unlink()
+    with pytest.raises(FileExistsError):
+        args.func(args)
+    assert not destination.exists()
+    assert spec_and_train_keys_from_file(str(config))[0].project == args.project
+
+
+def test_clients_have_no_user_owned_provisioning_api():
+    from flash.custom import AsyncTrainingClient
+
+    assert not hasattr(TrainingClient, "create")
+    assert not hasattr(AsyncTrainingClient, "create")

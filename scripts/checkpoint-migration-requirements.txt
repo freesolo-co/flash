@@ -1,7 +1,0 @@
-# Operator-only dependencies for migrate_checkpoint_fingerprints.py.
-# Match the serving schemas/settings and HTTP persistence imports used for validation.
-pydantic>=2.7.0,<3
-pydantic-settings>=2.7,<3
-httpx>=0.27,<1
-# Include libpq so the migration does not require a separate PostgreSQL client installation.
-psycopg[binary]>=3.2,<4
