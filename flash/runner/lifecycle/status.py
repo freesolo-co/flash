@@ -251,8 +251,9 @@ def reallocation_spec_from_status(status: RunStatus, *, verify_source: bool = Fa
     failed, so a run authored for up to 4 cards can never again be offered a 4-card shape. gpu.count
     is a CEILING, so restoring it re-widens the search rather than forcing a size.
     """
-    if status.requires_runtime_secrets:
-        raise ValueError("recovery cannot restore request runtime secrets; resubmit the run")
+    from flash.runner.lifecycle.runtime_credentials import restore
+
+    restore(status)
     worker_spec = effective_spec_from_status(status, verify_source=verify_source)
     public_gpu = JobSpec.from_dict(status.spec).gpu
     # `gpu_count_auto` needs no restoring here: it is provenance, so the worker half carries it

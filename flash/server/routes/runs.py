@@ -276,6 +276,15 @@ def _submit_failure_http_error(exc: Exception) -> HTTPException:
     return HTTPException(status_code=400, detail=str(exc))
 
 
+def _has_recovery_credentials(run_id: str) -> bool:
+    from flash.runner.lifecycle.runtime_credentials import restore
+
+    try:
+        return bool(restore(runner_status.get_status(run_id)))
+    except (ValueError, OSError):
+        return False
+
+
 def _dispose_failed_submission(
     run_id: str,
     *,
@@ -302,12 +311,9 @@ def _dispose_failed_submission(
         # asked to rent. recovery walks the ownership rows, so dropping the row keeps the
         # record out of it exactly as before the retain guard existed.
         db.delete_run(run_id)
-    elif had_runtime_secrets:
-        # this run's secrets live only in the request: recovery resubmits from the persisted
-        # spec, which deliberately excludes them, so a retained secretful run would silently
-        # train without its credentials. fail it loudly instead; the owner keeps the row and
-        # the error, and recovery ignores terminal runs. the update is terminal-sticky, so a
-        # record that already reached a terminal state is left untouched.
+    elif had_runtime_secrets and not _has_recovery_credentials(run_id):
+        # Retain admitted work only when its private credentials survived. Never
+        # launch a replacement with missing credentials after a failed submission.
         terminalized = False
         try:
             runner_status._update(

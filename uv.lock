@@ -440,7 +440,7 @@ name = "cffi"
 version = "2.0.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "pycparser", marker = "implementation_name != 'PyPy'" },
+    { name = "pycparser", marker = "implementation_name != 'PyPy' or (extra == 'extra-14-freesolo-flash-custom' and extra == 'extra-14-freesolo-flash-serve-runtime') or (extra == 'extra-14-freesolo-flash-gpu' and extra == 'extra-14-freesolo-flash-serve-runtime')" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/eb/56/b1ba7935a17738ae8453301356628e8147c79dbb825bcbc73dc7401f9846/cffi-2.0.0.tar.gz", hash = "sha256:44d1b5909021139fe36001ae048dbdde8214afa20200eda0f64c068cac5d5529", size = 523588, upload-time = "2025-09-08T23:24:04.541Z" }
 wheels = [
@@ -595,7 +595,7 @@ name = "cryptography"
 version = "50.0.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "cffi", marker = "platform_python_implementation != 'PyPy'" },
+    { name = "cffi", marker = "platform_python_implementation != 'PyPy' or (extra == 'extra-14-freesolo-flash-custom' and extra == 'extra-14-freesolo-flash-serve-runtime') or (extra == 'extra-14-freesolo-flash-gpu' and extra == 'extra-14-freesolo-flash-serve-runtime')" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/de/41/6cbdcf9142d00fe82836fbb51e503e58088575cf7a0fe1dbff6695bf0840/cryptography-50.0.0.tar.gz", hash = "sha256:eeac2acb5a20ed25e0ad6d1df9891a520b78b404266b6d11778f25d5d691a6c9", size = 880201, upload-time = "2026-07-31T14:25:10.11Z" }
 wheels = [
@@ -1306,6 +1306,7 @@ custom = [
 ]
 dev = [
     { name = "cloudpickle" },
+    { name = "cryptography" },
     { name = "datasets" },
     { name = "fastapi", version = "0.136.3", source = { registry = "https://pypi.org/simple" }, marker = "extra == 'extra-14-freesolo-flash-serve-runtime'" },
     { name = "fastapi", version = "0.141.1", source = { registry = "https://pypi.org/simple" }, marker = "extra == 'extra-14-freesolo-flash-custom' or extra == 'extra-14-freesolo-flash-gpu' or extra != 'extra-14-freesolo-flash-serve-runtime'" },
@@ -1355,6 +1356,7 @@ serve-runtime = [
 server = [
     { name = "azure-identity" },
     { name = "azure-storage-blob" },
+    { name = "cryptography" },
     { name = "datasets" },
     { name = "fastapi", version = "0.136.3", source = { registry = "https://pypi.org/simple" }, marker = "extra == 'extra-14-freesolo-flash-serve-runtime'" },
     { name = "fastapi", version = "0.141.1", source = { registry = "https://pypi.org/simple" }, marker = "extra == 'extra-14-freesolo-flash-custom' or extra == 'extra-14-freesolo-flash-gpu' or extra != 'extra-14-freesolo-flash-serve-runtime'" },
@@ -1390,6 +1392,7 @@ serving = [
 [package.dev-dependencies]
 dev = [
     { name = "cloudpickle" },
+    { name = "cryptography" },
     { name = "datasets" },
     { name = "freesolo" },
     { name = "httpx" },
@@ -1411,6 +1414,8 @@ requires-dist = [
     { name = "azure-identity", marker = "extra == 'server'", specifier = ">=1.19,<2" },
     { name = "azure-storage-blob", marker = "extra == 'server'", specifier = ">=12.24,<13" },
     { name = "cloudpickle", marker = "extra == 'dev'", specifier = ">=3.0" },
+    { name = "cryptography", marker = "extra == 'dev'", specifier = ">=46" },
+    { name = "cryptography", marker = "extra == 'server'", specifier = ">=46" },
     { name = "datasets", marker = "extra == 'dev'", specifier = ">=2.19" },
     { name = "datasets", marker = "extra == 'gpu'", specifier = ">=2.19" },
     { name = "datasets", marker = "extra == 'server'", specifier = ">=2.19" },
@@ -1483,6 +1488,7 @@ provides-extras = ["custom", "gpu", "server", "serving", "serve-runtime", "dev"]
 [package.metadata.requires-dev]
 dev = [
     { name = "cloudpickle", specifier = ">=3.0" },
+    { name = "cryptography", specifier = ">=46" },
     { name = "datasets", specifier = ">=2.19" },
     { name = "freesolo", specifier = ">=0.4.2" },
     { name = "httpx", specifier = ">=0.27" },
