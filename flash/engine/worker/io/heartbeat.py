@@ -61,9 +61,7 @@ _HB_UPLOAD_LIVENESS_STAGES = frozenset({"checkpoint_uploading"})
 # Liveness stages that ride the tighter setup-liveness upload interval (setup + mid-train upload).
 _HB_TIGHT_LIVENESS_STAGES = _HB_SETUP_LIVENESS_STAGES | _HB_UPLOAD_LIVENESS_STAGES
 
-_HB_THROTTLED_STAGES = _HB_TIGHT_LIVENESS_STAGES | frozenset(
-    {"rl_step", "sft_step", "custom_step"}
-)
+_HB_THROTTLED_STAGES = _HB_TIGHT_LIVENESS_STAGES | frozenset({"rl_step", "sft_step", "custom_step"})
 # stages whose one-shot transition must always commit even though their liveness ticks are
 # throttled: the transition is the only record that the run reached the stage, and it is emitted
 # right after a download that has been pinging throughout, so the throttle would almost always

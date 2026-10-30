@@ -182,7 +182,7 @@ def _prepare_attempt(ctx: _SubmitContext):
 
 
 def _allocate_attempt(ctx: _SubmitContext, prepared):
-    claim, attempt_spec, _, _ = prepared
+    _, attempt_spec, _, _ = prepared
     from flash.providers.core.allocator import allocate
     from flash.providers.core.base import CapacityUnavailableError, PollResult, UnsupportedGpuError
     from flash.runner.lifecycle.deadlines import _load_run_deadline_at
