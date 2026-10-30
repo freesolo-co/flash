@@ -393,8 +393,8 @@ def test_custom_rejects_old_deployed_server_before_importing_script_or_submittin
     api.create_run.assert_not_called()
 
 
-def test_custom_catalog_advertises_only_the_supported_model():
+def test_custom_catalog_advertises_only_the_supported_models():
     from flash.core.catalog import public_model_rows
 
     models = [row["id"] for row in public_model_rows() if "custom" in row["algos"]]
-    assert models == ["Qwen/Qwen3.5-9B"]
+    assert models == ["Qwen/Qwen3.5-0.8B", "Qwen/Qwen3.5-9B"]

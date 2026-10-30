@@ -120,33 +120,64 @@ class TrainingClient:
         loss_fn returns a scalar torch tensor and a JSON dictionary of metrics. No callable
         or pickle is sent to the GPU. Both passes use the same model version and dropout-free
         model. Cross-sequence objectives (DPO, PPO, ranking, etc.) are supported.
+
+        When any row lists target_tokens, loss_fn(data, logprobs, target_logprobs) also
+        receives, per row, a list holding one tensor of candidate logprobs per position (None
+        for rows without targets), so soft-target losses such as KL to a teacher's top-k can
+        use them.
         """
         import torch
 
         with self._lock:
-            snapshot = [Datum(list(row.tokens)) for row in data]
+            snapshot = [Datum(list(row.tokens), target_tokens=row.target_tokens) for row in data]
             scored = self.forward(snapshot)
             logprobs = [
                 torch.tensor(row["logprobs"], dtype=torch.float32, requires_grad=True)
                 for row in scored["outputs"]
             ]
-            loss, metrics = loss_fn(data, logprobs)
+            soft = any(row.target_tokens is not None for row in snapshot)
+            candidates = [
+                [
+                    torch.tensor(values, dtype=torch.float32, requires_grad=True)
+                    for values in output["target_logprobs"]
+                ]
+                if row.target_tokens is not None
+                else None
+                for row, output in zip(snapshot, scored["outputs"], strict=True)
+            ]
+            loss, metrics = loss_fn(data, logprobs, candidates) if soft else loss_fn(data, logprobs)
             if not isinstance(loss, torch.Tensor) or loss.ndim != 0 or not torch.isfinite(loss):
                 raise ValueError("custom loss must return a finite scalar torch tensor")
             if not isinstance(metrics, dict):
                 raise ValueError("custom loss metrics must be a JSON dictionary")
             json.dumps(metrics, allow_nan=False)
-            gradients = torch.autograd.grad(loss, logprobs, allow_unused=True)
-            weights = []
-            for row, gradient in zip(snapshot, gradients, strict=True):
-                if gradient is None:
-                    weight = [0.0] * (len(row.tokens) - 1)
-                else:
-                    if not torch.isfinite(gradient).all():
-                        raise ValueError("custom loss produced non-finite token gradients")
-                    weight = (-gradient).tolist()
-                weights.append(Datum(row.tokens, weight))
-            return self.forward_backward(weights, metrics={**metrics, "custom_loss": loss.item()})
+            inputs = logprobs + [tensor for row in candidates if row for tensor in row]
+            gradients = list(torch.autograd.grad(loss, inputs, allow_unused=True))
+            if any(g is not None and not torch.isfinite(g).all() for g in gradients):
+                raise ValueError("custom loss produced non-finite token gradients")
+
+            def descent(gradient, size):
+                return [0.0] * size if gradient is None else (-gradient).tolist()
+
+            rows, cursor = [], len(logprobs)
+            for row, gradient, row_candidates in zip(
+                snapshot, gradients[: len(logprobs)], candidates, strict=True
+            ):
+                target_weights = None
+                if row_candidates is not None:
+                    target_weights = []
+                    for tensor in row_candidates:
+                        target_weights.append(descent(gradients[cursor], tensor.numel()))
+                        cursor += 1
+                rows.append(
+                    Datum(
+                        row.tokens,
+                        descent(gradient, len(row.tokens) - 1),
+                        row.target_tokens,
+                        target_weights,
+                    )
+                )
+            return self.forward_backward(rows, metrics={**metrics, "custom_loss": loss.item()})
 
     def optim_step(self, *, learning_rate, max_grad_norm=1.0, algorithm_state=None):
         extra = {"algorithm_state": algorithm_state} if algorithm_state is not None else {}

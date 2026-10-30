@@ -65,6 +65,26 @@ class TorchBackend:
         selected = logits.gather(-1, targets[:, None]).squeeze(-1)
         return selected - torch.logsumexp(logits, dim=-1), logits
 
+    def _target_logprobs(self, logits, target_tokens):
+        """Flat logprobs of every listed candidate, with their positions, in listed order."""
+        import torch
+
+        positions = [i for i, ids in enumerate(target_tokens) for _ in ids]
+        ids = [token for row in target_tokens for token in row]
+        device = logits.device
+        rows = torch.tensor(positions, device=device, dtype=torch.long)
+        columns = torch.tensor(ids, device=device, dtype=torch.long)
+        # gather candidates and one normalizer per position; never copy a vocabulary row each.
+        return logits[rows, columns] - torch.logsumexp(logits, dim=-1)[rows]
+
+    @staticmethod
+    def _ragged(values, target_tokens):
+        result, start = [], 0
+        for ids in target_tokens:
+            result.append(values[start : start + len(ids)])
+            start += len(ids)
+        return result
+
     def forward(self, data, top_k=0):
         import torch
 
@@ -73,6 +93,9 @@ class TorchBackend:
             for row in data:
                 logprobs, logits = self._logprobs(row.tokens)
                 output = {"logprobs": logprobs.cpu().tolist()}
+                if row.target_tokens is not None:
+                    values = self._target_logprobs(logits, row.target_tokens).cpu().tolist()
+                    output["target_logprobs"] = self._ragged(values, row.target_tokens)
                 if top_k:
                     values, indices = logits.topk(top_k, dim=-1)
                     values -= torch.logsumexp(logits, dim=-1, keepdim=True)
@@ -89,14 +112,26 @@ class TorchBackend:
         loss_total = 0.0
         outputs = []
         for row in data:
-            logprobs, _ = self._logprobs(row.tokens)
-            weights = torch.tensor(row.weights, device=logprobs.device, dtype=logprobs.dtype)
-            loss = -(weights * logprobs).sum()
+            logprobs, logits = self._logprobs(row.tokens)
+            loss = logprobs.new_zeros(())
+            output = {"logprobs": logprobs.detach().cpu().tolist()}
+            if row.weights is not None:
+                weights = torch.tensor(row.weights, device=logprobs.device, dtype=logprobs.dtype)
+                loss = loss - (weights * logprobs).sum()
+            if row.target_tokens is not None:
+                selected = self._target_logprobs(logits, row.target_tokens)
+                flat = [w for values in row.target_weights for w in values]
+                weights = torch.tensor(flat, device=selected.device, dtype=selected.dtype)
+                loss = loss - (weights * selected).sum()
+                output["target_logprobs"] = self._ragged(
+                    selected.detach().cpu().tolist(), row.target_tokens
+                )
             if not torch.isfinite(loss):
                 raise RuntimeError("non-finite loss; session cannot continue")
-            loss.backward()
+            if loss.requires_grad:  # a row whose target lists are all empty contributes nothing
+                loss.backward()
             loss_total += loss.detach().item()
-            outputs.append({"logprobs": logprobs.detach().cpu().tolist()})
+            outputs.append(output)
         self.pending_backward += 1
         return {"outputs": outputs, "metrics": {**(metrics or {}), "surrogate_loss": loss_total}}
 

@@ -30,6 +30,14 @@ This file starts at 1.1.35. Earlier releases are not reconstructed here; use
 
 ### Added
 
+- Custom training rows accept per-position candidate targets (`target_tokens` and
+  `target_weights`, up to 64 per position and 100,000 per request). `forward` returns their
+  logprobs, `forward_backward` adds `-sum(target_weights * logprob)` to the loss, and
+  `forward_backward_custom` passes them to three-argument losses, so soft-target objectives
+  such as forward KL to a teacher's top-k train directly. Existing rows and two-argument
+  losses are unchanged.
+- Custom training supports `Qwen/Qwen3.5-0.8B` on H100 as well as `Qwen/Qwen3.5-9B`.
+
 - Versioned rollout request/result contracts for synchronous GRPO, binding generation to
   acknowledged policy snapshots and checking token probabilities, turn provenance, attempts,
   and training-row identity before optimization.

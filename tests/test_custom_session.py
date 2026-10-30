@@ -166,6 +166,49 @@ def test_signed_weights_preserved_without_implicit_normalization():
     assert rows[0].weights == [0.0, -0.5]
 
 
+@pytest.mark.parametrize(
+    ("row", "message"),
+    [
+        ({"target_tokens": [[3]]}, "len\\(tokens\\)-1"),
+        ({"target_tokens": [[3, 3], []]}, "distinct"),
+        ({"target_tokens": [[3], [100]]}, "target token"),
+        ({"target_weights": [[1.0], []]}, "require target_tokens"),
+        ({"target_tokens": [[3], []], "target_weights": [[1.0, 2.0], []]}, "match"),
+        ({"target_tokens": [[3], []], "target_weights": [[float("inf")], []]}, "finite"),
+        ({"target_tokens": [list(range(65)), []]}, "at most 64"),
+        ({"weights": [0, 0], "target_tokens": [[3], []]}, "target_weights for target_tokens"),
+    ],
+)
+def test_invalid_soft_targets_rejected(row, message):
+    with pytest.raises(ValueError, match=message):
+        parse_batch(
+            [{"tokens": [1, 2, 4], **row}],
+            vocab_size=100,
+            max_tokens=10,
+            max_batch=2,
+            weighted=True,
+        )
+
+
+def test_soft_targets_alone_satisfy_forward_backward_weighting():
+    rows = parse_batch(
+        [{"tokens": [1, 2, 4], "target_tokens": [[2, 7], []], "target_weights": [[0.6, 0.4], []]}],
+        vocab_size=100,
+        max_tokens=10,
+        max_batch=2,
+        weighted=True,
+    )
+    assert rows[0].weights is None
+    assert rows[0].target_tokens == [[2, 7], []]
+    assert rows[0].target_weights == [[0.6, 0.4], []]
+
+
+def test_soft_target_entries_are_bounded_per_request():
+    row = {"tokens": [1] * 1601, "target_tokens": [list(range(64))] * 1600}
+    with pytest.raises(ValueError, match="split the batch"):
+        parse_batch([row], vocab_size=100, max_tokens=2048, max_batch=2)
+
+
 def test_http_auth_validation_logs_and_retry(tmp_path):
     session = TrainingSession(CounterBackend(tmp_path))
     client = TestClient(create_app(session, "s" * 40))
