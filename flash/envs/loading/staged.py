@@ -84,12 +84,15 @@ def _reference_for_environment_id(env_id: str) -> tuple[str, Any]:
 def is_staged_environment_transient_error(exc: BaseException) -> bool:
     """Classify timeout, connection, rate-limit, and server failures across clients."""
     from flash.envs.meta.identity import GitHubTransientError
+    from flash.envs.registry.azure import RegistryError
     from flash.providers.artifacts.hf import hf_status_code
 
     current: BaseException | None = exc
     seen: set[int] = set()
     while current is not None and id(current) not in seen:
         seen.add(id(current))
+        if isinstance(current, RegistryError) and current.status in {429, 503}:
+            return True
         if isinstance(current, (StagedEnvironmentTransientError, GitHubTransientError)):
             return True
         status = hf_status_code(current)
@@ -120,6 +123,18 @@ def resolve_environment_source(
     """Download one fresh exact package tree without touching the executable environment cache."""
     from flash.envs.loading import loader
     from flash.envs.meta.identity import GitHubEnvironmentRef, is_commit_sha
+    from flash.envs.registry import packages
+
+    slug = packages.managed_slug(env_id)
+    if slug is not None:
+        try:
+            return packages.resolve_source(slug, resolved_sha, deadline_at=deadline_at)
+        except Exception as exc:
+            if is_staged_environment_transient_error(exc):
+                raise StagedEnvironmentTransientError(
+                    "environment source is temporarily unavailable"
+                ) from exc
+            raise
 
     canonical_id, parsed = _reference_for_environment_id(env_id)
     _require_staging_deadline(deadline_at)

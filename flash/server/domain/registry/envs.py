@@ -27,6 +27,7 @@ from flash.envs.package.limits import (
     archive_stream_limit,
     tar_member_segments,
 )
+from flash.server.domain.registry import blob_envs
 
 _MAX_UPLOAD_BYTES = 64 * 1024 * 1024
 _MAX_UNCOMPRESSED_BYTES = 256 * 1024 * 1024
@@ -584,6 +585,9 @@ def publish_package(
             raise EnvPublishError(
                 "env package contains a direct access token; remove it before publishing"
             )
+        if blob_envs.enabled():
+            slug = "/".join(publish_slug_for_name(name, key, project_slug))
+            return blob_envs.publish(slug, dest)
         return _github_publish(dest, name=name, key=key, project_slug=project_slug)
 
 
@@ -738,6 +742,10 @@ def _authorized_hub_request(slug: str, key: dict, *, action: str) -> tuple[str, 
 
 def download_package(*, slug: str, key: dict) -> bytes:
     """Return a tar.gz package for a published environment from the GitHub hub."""
+    if blob_envs.enabled():
+        canonical = canonical_env_id(slug)
+        _require_namespace_access(canonical, key, action="download")
+        return blob_envs.download(canonical)
     canonical, token = _authorized_hub_request(slug, key, action="download")
     return _github_download(canonical, token=token)
 
@@ -760,6 +768,8 @@ def list_namespace_slugs(*, key: dict) -> list[str]:
             status=403,
         )
     namespace = namespace_for(key)
+    if blob_envs.enabled():
+        return blob_envs.list_slugs(namespace)
     if not _github_token():
         raise EnvPublishError(
             "GITHUB_TOKEN is required for the Flash control plane to list environments",
@@ -878,5 +888,9 @@ def delete_package(*, slug: str, key: dict) -> bool:
     only environments in its own org-slug namespace, while the internal service key
     (``auth_kind == "internal"``) may delete any environment.
     """
+    if blob_envs.enabled():
+        canonical = canonical_env_id(slug)
+        _require_namespace_access(canonical, key, action="delete")
+        return blob_envs.delete(canonical)
     canonical, token = _authorized_hub_request(slug, key, action="delete")
     return _github_delete(canonical, token=token)

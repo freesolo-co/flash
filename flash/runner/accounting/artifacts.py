@@ -238,14 +238,23 @@ def preflight_validate_environment_ref(spec: JobSpec) -> tuple[JobSpec, bool]:
     """
     from flash.envs.loading.loader import _github_token
     from flash.envs.meta.identity import GitHubPermanentError
+    from flash.envs.registry import packages
+    from flash.envs.registry.azure import RegistryError
 
     parsed = _github_environment_ref(spec)
     if parsed is None:
         return spec, False
-    if not _github_token():
+    azure_managed = packages.managed_slug(spec.environment.id) is not None
+    if not azure_managed and not _github_token():
         return spec, True
 
     pinned, error = _resolve_environment_sha_once(spec, parsed, timeout=4.0)
+    if isinstance(error, RegistryError) and error.status == 404:
+        from flash.runner.lifecycle.preparation import EnvironmentRefNotFound
+
+        raise EnvironmentRefNotFound(
+            f"environment {spec.environment.id!r} was not found in the managed registry"
+        ) from error
     if isinstance(error, GitHubPermanentError):
         env_id = spec.environment.id
         from flash.runner.lifecycle.preparation import EnvironmentRefNotFound

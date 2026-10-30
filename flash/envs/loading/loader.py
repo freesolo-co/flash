@@ -181,6 +181,13 @@ def _resolve_ref_sha(
     deadline_at: float | None = None,
 ) -> str:
     # Control plane pins sha once; workers skip GitHub entirely on a fan-out.
+    from flash.envs.registry import packages
+
+    slug = packages.managed_slug(parsed.canonical())
+    if slug is not None:
+        return packages.resolve_revision(
+            slug, pinned_sha or "", deadline_at=deadline_at or time.time() + timeout
+        )
     if pinned_sha and is_commit_sha(pinned_sha):
         return pinned_sha
     if is_commit_sha(parsed.ref):
@@ -797,6 +804,11 @@ def _evict_env_cache(keep: Path) -> None:
 
 
 def _resolve_github_environment_file(env_ref: str, pinned_sha: str | None = None) -> Path:
+    from flash.envs.registry import packages
+
+    slug = packages.managed_slug(env_ref)
+    if slug is not None:
+        return packages.cached_entrypoint(slug, pinned_sha or "")
     parsed = _parse_github_environment_ref(env_ref)
     if parsed is None:
         raise ValueError(f"not a GitHub environment ref: {env_ref!r}")
