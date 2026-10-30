@@ -31,6 +31,8 @@ gpu = [
     "transformers>=5.8,<5.13",
     "tokenizers>=0.22",
     "httpx>=0.27",
+    # Shared Hub error classification also recognizes requests transport errors.
+    "requests>=2.32,<3",
     "peft>=0.19",
     "vllm==0.19.1",
     "accelerate>=1.4",
@@ -63,6 +65,8 @@ server = [
     # customer-owned modal lifecycle mutations execute in the control plane.
     "modal==1.6.2",
     "httpx>=0.27",
+    # Shared Hub error classification also recognizes requests transport errors.
+    "requests>=2.32,<3",
     "jsonschema>=4.23",
     "referencing>=0.28.4",
     "regex>=2024.11.6",
@@ -151,6 +155,8 @@ dev = [
     "fastapi>=0.136,<1",
     "uvicorn>=0.52,<1",
     "httpx>=0.27",
+    # Shared Hub error classification also recognizes requests transport errors.
+    "requests>=2.32,<3",
     "jsonschema>=4.23",
     "referencing>=0.28.4",
     "regex>=2024.11.6",
@@ -243,6 +249,8 @@ dev = [
     "freesolo>=0.4.2",
     "tokenizers>=0.22",
     "httpx>=0.27",
+    # Shared Hub error classification also recognizes requests transport errors.
+    "requests>=2.32,<3",
     # flash/content/multimodal.py imports PIL directly to validate and decode every image source, so the
     # image tests are not optional coverage: without Pillow they importorskip and CI reports green
     # on a multimodal path it never executed. the control plane decodes images too, so `server`

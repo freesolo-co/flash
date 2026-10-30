@@ -59,6 +59,7 @@ RUN pip install --no-cache-dir \
     "datasets==5.0.1" \
     "huggingface_hub==1.28.0" \
     "httpx==0.28.1" \
+    "requests==2.34.2" \
     "accelerate==1.14.0" \
     "wandb==0.28.2" \
     "flash-linear-attention @ git+https://github.com/fla-org/flash-linear-attention.git@9c8e42e762fce087c27b673af4922795d9edb85e" \
