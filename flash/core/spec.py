@@ -554,6 +554,7 @@ class JobSpec:
     # canonical freesolo project uuid. every config, control-plane record, and worker round trip
     # carries the same explicit identity; there is no name/default/sole-project resolution.
     project: str = ""
+    custom: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "seed", parse_seed(self.seed))
@@ -637,6 +638,8 @@ class JobSpec:
         for section, managed_keys in MANAGED_SECTION_KEYS:
             for managed in managed_keys:
                 data[section].pop(managed, None)
+        if "custom" in data:
+            data["custom"].pop("resolved_resume", None)
         train = data["train"]
         if train.get("init_from_adapter"):
             # the source adapter's topology is authoritative for a warm start, so the parser rejects
@@ -645,6 +648,12 @@ class JobSpec:
             # a combination the parser refuses. conditional, so it cannot be a registry entry.
             train.pop("lora_rank", None)
             train.pop("lora_alpha", None)
+        if self.algorithm == "custom":
+            from flash.custom.config import TRAIN_KEYS
+
+            data["train"] = {
+                key: value for key, value in data["train"].items() if key in TRAIN_KEYS
+            }
         # restore the public list spelling for an ordered pin -- a reshape rather than a removal,
         # which is the other thing no registry can express. the default stands in for the key the
         # worker payload omits when there are no fallbacks: unlike `providers`, this one is read
@@ -671,6 +680,8 @@ class JobSpec:
         differently, so removing either pop would break existing digests.
         """
         data = asdict(self)
+        if not data["custom"]:
+            data.pop("custom")
         # Preserve public and worker preparation digests for all existing runs.
         if data["train"]["mask_truncated_completions"] is None:
             data["train"].pop("mask_truncated_completions")
@@ -824,6 +835,7 @@ class JobSpec:
             ),
             workload_profile=dict(data.get("workload_profile") or {}),
             project=project,
+            custom=dict(data.get("custom") or {}),
         )
 
     @classmethod

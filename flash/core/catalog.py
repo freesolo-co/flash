@@ -62,7 +62,7 @@ def normalize_algorithm(value: str) -> str:
         # escapes the callers' ValueError/ConfigError guards -> uncaught 500. Raise ValueError instead.
         raise ValueError(f"algorithm must be a string, got {type(value).__name__}")
     value = value.lower()
-    if value not in ALGORITHMS:
+    if value not in (*ALGORITHMS, "custom"):
         raise ValueError(f"unsupported algorithm: {value}; known: {', '.join(ALGORITHMS)}")
     return value
 
@@ -663,6 +663,8 @@ def resolve_model(model_id: str, algorithm: str, model_revision: str = "") -> Mo
 def validate_model_for_algorithm(model_id: str, algorithm: str) -> ModelInfo:
     info = get_model(model_id)
     algo = normalize_algorithm(algorithm)
+    if algo == "custom" and model_id == "Qwen/Qwen3.5-9B":
+        return info
     if algo not in info.algos:
         allowed = ", ".join(info.algos)
         raise ValueError(f"{model_id} supports {allowed}, not {algo}")

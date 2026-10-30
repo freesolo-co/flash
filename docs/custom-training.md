@@ -1,189 +1,190 @@
 # Build your own training algorithm
 
-Custom mode lets a local Python script own the algorithm while a dedicated remote GPU owns
-the model and optimizer. Install `freesolo-flash[custom]`, run `flash custom init algorithm.py`,
-and edit the generated DPO example. DPO is implemented entirely in that script; it is not a
-new built-in worker recipe.
+Custom mode uses the same `flash train run.toml` entry point, project ownership, GPU
+supervision, private artifact repository, checkpoint listing, and adapter deployment paths
+as SFT and GRPO. Your Python file stays on your machine. Flash runs the model and optimizer
+on the remote GPU; your file owns data, sampling, rewards, losses, and update timing.
 
-This first version provisions a **single GPU in your own Modal account** using your Modal
-profile or `MODAL_TOKEN_ID` / `MODAL_TOKEN_SECRET`. Modal bills the dedicated GPU, including
-time spent inspecting results between calls. It does not submit a managed Freesolo TOML run,
-use Freesolo credits, or appear in `flash runs`. The existing SFT/GRPO/OPD paths are unchanged.
+Both the CLI and the control plane must include custom-mode support. This feature is under
+review; an existing deployed server does not acquire it just by upgrading the client.
 
 ```bash
 pip install 'freesolo-flash[custom]'
-modal token new  # if you have not configured Modal already
+flash login
 flash custom init algorithm.py
-python algorithm.py --model Qwen/Qwen3-0.6B --gpu A10G --steps 6 --output my-training
+flash train run.toml
 ```
 
-The generated script saves a probability inspection file, per-step metrics, worker events,
-and a checkpoint ZIP. Start with a small model and short context while developing the algorithm.
-Use `--model Qwen/Qwen3.5-9B --gpu H100` for a larger model after checking your GPU budget.
+```toml
+project = "YOUR-PROJECT-UUID"
+model = "Qwen/Qwen3.5-9B"
+algorithm = "custom"
 
-## What the user builds
+[custom]
+file = "algorithm.py"          # relative to this TOML file
+max_wall_seconds = 3600
+idle_seconds = 900
 
-1. **Choose the data and sampling policy.** Tokenize locally supplied text through the
-   session tokenizer, or sample from the current adapter. Keep the returned token IDs,
-   policy log-probabilities, sampling log-probabilities, finish reason, and model version.
-2. **Compute supervision.** Your script owns rewards, judges, preference pairs, baselines,
-   advantage normalization, replay selection, filtering, and reference probabilities.
-3. **Write the objective.** A regular PyTorch function consumes one differentiable vector of
-   target-token log-probabilities per example. It may compare multiple examples, mask any
-   positions, or combine objectives. Return a scalar loss and finite numeric metrics.
-4. **Choose updates and evaluation.** Explicitly accumulate gradients, call `optim_step`,
-   sample or score an evaluation batch, inspect metrics, and save checkpoints. No hidden
-   optimizer step, scheduler, reward normalization, or epoch loop runs on the worker.
+[train]
+max_steps = 100
+max_context_tokens = 2048
+lora_rank = 16
+save_every = 10
+
+[gpu]
+type = "H100"
+```
+
+Managed custom mode currently supports the GPU-tested Qwen3.5 9B on one Modal H100.
+Users authenticate to Flash; provider and artifact credentials remain on the control plane
+and worker. `flash train run.toml --cost` previews the dedicated-session cost cap.
+The server charges measured session time, including time waiting for the local script,
+within that cap. Model initialization is excluded from measured session time.
+
+## The local file
+
+Define `async def main(client)` for a nonblocking interface, or `def main(client)` for the
+blocking interface. Flash selects the matching client automatically. Both have the same
+operations and correctness guarantees. The generated file contains editable DPO data and
+loss code, not a request to run a hidden server-side DPO recipe.
 
 ```python
-from flash.custom import Datum, TrainingClient
+from flash.custom import Datum
 
-with TrainingClient.create(
-    "Qwen/Qwen3-0.6B",
-    gpu="A10G",
-    max_steps=20,
-    max_wall_seconds=1800,
-    idle_seconds=300,
-) as client:
-    prompt = client.encode("Question: What is 2 + 2?\nAnswer:")
-    answer = client.encode(" 4.")
+
+async def main(client):
+    prompt = await client.encode("Question: What is 2 + 2?\nAnswer:")
+    answer = await client.encode(" 4.")
     batch = [Datum(prompt + answer)]
 
     def objective(data, logprobs):
         loss = -logprobs[0][len(prompt) - 1 :].mean()
         return loss, {"answer_nll": loss.item()}
 
-    result = client.forward_backward_custom(batch, objective)
-    print(result["metrics"])
-    print(client.optim_step(learning_rate=1e-4)["metrics"])
-    print(client.forward(batch, top_k=5)["outputs"])
-    client.save_checkpoint("experiment-1")
-    client.download_checkpoint("experiment-1", "experiment-1.zip")
+    for step in range(client.step, client.config["train"]["max_steps"]):
+        result = await client.forward_backward_custom(batch, objective)
+        update = await client.optim_step(
+            learning_rate=1e-4,
+            algorithm_state={"next_example": step + 1},
+        )
+        print(result["metrics"], update["metrics"])
+        if update.get("checkpoint_ref"):
+            print("Saved", update["checkpoint_ref"])
 ```
 
-The starter uses DPO: score chosen and rejected answers under the initial model, keep those
-reference scores fixed, then optimize the log-sigmoid of the policy/reference preference
-margin. The same API can express clipped PPO, REINFORCE, sequence ranking, or mixtures of
-SFT and preference losses without adding algorithm names to Flash's catalog.
+For the synchronous version, use `def main(client)` and remove `await`. No configuration
+switch is needed. Independent reward calls, data preparation, and other sessions can run
+concurrently with an awaited GPU operation. Operations on **one model stay serialized**;
+async does not run conflicting weight updates concurrently or add multi-GPU training.
+The complete two-pass custom loss holds its place in the same ordered queue.
 
-## Token alignment and probability semantics
+Cancellation of an await does not cancel a submitted GPU mutation. A later operation cannot
+overtake it. If an HTTP response is lost, new operations fail closed until
+`retry_pending()` retrieves that operation's receipt. This avoids applying an update twice.
 
-For `Datum(tokens=[10, 20, 30, 40])`, the three outputs are
-`log p(20 | 10)`, `log p(30 | 10,20)`, and `log p(40 | 10,20,30)`.
-There is no invented BOS/EOS and no probability for the first input token. For a prompt of
-length `P`, the first completion target is at output index `P-1`.
+Keep the local process running (for example in tmux). `--background` is rejected for custom
+mode because the algorithm lives locally. A local exception cancels the managed run;
+completed durable checkpoints remain available. Idle and wall limits bound abandoned GPUs.
+Automatic worker restart is disabled: continuing arbitrary local algorithm state requires
+an explicit resume.
 
-`forward_backward` requires `len(tokens)-1` explicit weights and accumulates gradients of
-`-sum(weight * logprob)` across every row. Signed weights are allowed. Use zero weights for
-prompt targets and divide by your chosen token/sequence/batch denominator explicitly. Calls
-accumulate until `optim_step` or `zero_grad`; the engine never divides by the number of calls.
+## Durable progress and resume
 
-`forward` returns untempered policy log-probabilities and optional top-k alternatives at
-each position. Obtain probabilities with `math.exp(logprob)`. `sample` returns both these
-policy scores and the actual temperature-adjusted sampling-distribution scores. Greedy
-sampling has behavior log-probability zero. Use the correct behavior scores for importance
-sampling; changing temperature changes the behavior distribution. The initial sampler uses
-temperature only (no top-p/top-k filtering), and returns raw completion token IDs including
-EOS if generated. `finish_reason="length"` is an actual truncation; your algorithm decides
-whether to train on it.
+`train.save_every`, `train.save_at_steps`, the final optimizer update, and normal completion
+save durable checkpoints. A successful save means the adapter and full training state have
+committed together to the run's private artifact repository. The files survive GPU teardown.
 
-## How custom losses reach the GPU
+Each snapshot contains:
 
-The first GPU forward returns log-probabilities. Your loss runs on CPU tensors with autograd
-enabled. Flash sends `-dLoss/dLogprob` as weights for a second GPU forward/backward. By the
-chain rule, this weighted surrogate has the same parameter gradient as your original loss.
-The surrogate's numeric value is **not** the custom loss; both are named separately in the
-result and worker metrics. This costs an additional forward pass.
+- The PEFT adapter, tokenizer, and immutable base-model revision.
+- AdamW state, CPU/CUDA RNG state, completed step, and parameter digest.
+- The JSON `algorithm_state` supplied with the latest optimizer update (up to 1 MiB).
 
-The model runs with dropout disabled for both passes, while autograd remains enabled. The
-client serializes its operations and the worker rejects stale model versions. Your Python
-callback is never uploaded, pickled, imported, or executed on the worker.
+Use `algorithm_state` for your dataset cursor, frozen reference scores, reward statistics,
+and other state required to continue. Flash cannot infer arbitrary state inside your Python
+process. Large datasets should remain external; save stable identifiers/cursors instead.
+The generated DPO example saves its initial reference scores and restores them without
+recomputing the reference from the updated policy.
 
-## Observability and state
+```bash
+flash runs checkpoint RUN_ID
+flash models deploy RUN_ID/step-100
+```
+
+To continue on a fresh GPU, add the saved reference and increase the **total** step horizon:
+
+```toml
+[custom]
+file = "algorithm.py"
+resume_from = "RUN_ID/step-100"
+
+[train]
+max_steps = 200
+lora_rank = 16
+```
+
+The other model/project settings remain in the TOML. Resume verifies access to the source
+run, pins its artifact revision, and restores the model, optimizer, RNG, and algorithm state
+before invoking the local file. Read `client.step` and `client.restored_state`. The source
+LoRA rank and alpha must match. A resumed experiment gets its own run ID and checkpoints.
+
+Explicit `save_checkpoint(name, algorithm_state=...)` is also available at optimizer
+boundaries. A step already saved automatically is immutable; use its `RUN_ID/step-N`
+reference rather than saving a second version of that step. `download_checkpoint` remains
+an optional ZIP export; downloading is no longer necessary to preserve managed progress.
+
+## Inspection and custom losses
 
 | Operation | Result or effect |
 | --- | --- |
-| `encode`, `decode` | Use the model's tokenizer without installing Transformers locally |
-| `sample` | Completion tokens/text, policy and sampling logprobs, finish reason |
-| `forward(data, top_k=5)` | Per-target logprobs and up to 20 alternatives per position |
-| `forward_backward(data)` | Explicit weighted NLL; accumulate gradients only |
-| `forward_backward_custom(data, loss_fn)` | Local differentiable loss, custom metrics, remote gradients |
-| `optim_step(learning_rate=..., max_grad_norm=...)` | AdamW update, gradient norm, accumulation count; clears gradients |
+| `encode`, `decode` | Model tokenizer, without local Transformers |
+| `sample` | Tokens/text, policy and temperature-adjusted sampling logprobs, finish reason |
+| `forward(data, top_k=5)` | Target-token logprobs and up to 20 alternatives per position |
+| `forward_backward(data)` | Explicit weighted negative log-likelihood; accumulate gradients |
+| `forward_backward_custom(data, loss_fn)` | Local differentiable loss and metrics; remote gradients |
+| `optim_step(...)` | AdamW update, gradient norm, accumulation count, scheduled checkpoint |
 | `zero_grad()` | Discard accumulated gradients |
-| `save_checkpoint(name)` | Immutable adapter + optimizer + RNG snapshot, weight digest and model metadata |
-| `load_checkpoint(name)` | Restore a checkpoint within the same live session; advances model version |
-| `download_checkpoint(name, path)` | Export the checkpoint ZIP before session shutdown |
-| `status()`, `logs(after=cursor)` | Session state and bounded, cursor-addressed worker metrics/events |
-| `close()` | Close the session and terminate the GPU provisioned by `create` |
+| `save_checkpoint(...)` | Durable managed snapshot and run/step reference |
+| `load_checkpoint(name)` | Restore a locally present snapshot within the live session |
+| `status()`, `logs(after=cursor)` | Session state and bounded worker events |
 
-Every operation receipt includes `session_id`, `sequence`, `model_version`, completed update
-count, pending backward count, and configured limits. Loading a checkpoint restores the
-optimizer and RNG but never rewinds the session's billed update counter or bypasses its cap.
-Checkpoints require an optimizer boundary: apply or discard pending gradients first.
+For tokens `[10, 20, 30, 40]`, the outputs score targets `20, 30, 40` respectively.
+For a prompt of length P, the first completion score is at index P-1. Prompt masking,
+normalization, rewards, baselines, and reference policies belong to the local algorithm.
+Convert a logprob to probability with `math.exp(logprob)`.
 
-Keep your own dataset cursor, reference scores, reward state, and hyperparameters alongside
-the checkpoint. The server cannot capture arbitrary state inside your local Python program.
-Checkpoint storage is ephemeral in this first version; download before closing. The ZIP
-contains a standard PEFT adapter, tokenizer, engine state, and metadata. Cross-session
-optimizer resume and direct registration in hosted `flash models` are not implemented yet.
+The custom loss runs locally over CPU PyTorch tensors. Flash sends its token derivatives
+back for a second GPU forward/backward. By the chain rule this gives the original loss's
+parameter gradient. Dropout is disabled and weights cannot change between the two passes.
+The callback is never uploaded or pickled. This requires an extra forward pass; the
+weighted surrogate's numeric value is logged separately from the actual custom loss.
 
-Worker logs contain operation timings and numeric metrics, not prompts or complete token
-arrays. Those arrays are returned directly for your script to inspect/store. Logs retain the
-latest 1000 events and report `truncated=true` when a reader has fallen behind.
+Worker logs contain timing and numeric metrics, not prompts or full token arrays. Those
+arrays are returned directly to the user's script. The session log retains 1000 events
+and reports truncation; normal Flash console artifacts preserve worker output.
 
-## Retry and lifecycle contract
+The current runtime is text-only, single-GPU LoRA with AdamW. It does not expose hidden
+states, full-vocabulary logits, arbitrary optimizers, model layers, or distributed training.
+The async API overlaps local/independent work; it is not a distributed execution engine.
 
-An optimizer timeout is ambiguous: the weights may already have changed. Flash retains the
-exact pending request. Call `retry_pending()`; the worker returns its previous receipt without
-applying the operation again. All other new operations are blocked until that outcome is
-resolved. Do not replace a timed-out request with a new client and blindly repeat it.
+## Validation and low-level experiments
 
-The worker serializes execution, rejects reused sequences with different contents, and
-rejects old receipts after a newer operation. A restarted worker has a new session ID, so
-old operations cannot silently replay into fresh weights. A partial GPU failure poisons the
-session and it cannot continue. There is no automatic replay/restart of a paid training step.
+The [managed GPU resume evidence](custom-managed-gpu-validation.json) records a local DPO
+script training Qwen3.5 9B on an H100, publishing step 2, and shutting down its GPU. A new
+managed run on a fresh H100 restored identical logprobs and algorithm state, completed step
+3 with changed weights, and published a new checkpoint through the normal listing. Both
+workers terminated successfully. This used the branch's control-plane lifecycle with real
+Modal GPUs and private artifact storage; the hosted production API was not deployed.
+`scripts/check_custom_managed_gpu.py` provides an opt-in paid reproduction against a server
+running this branch.
 
-Always use a context manager. Normal completion and Python exceptions attempt GPU teardown.
-An idle timeout shuts down an abandoned worker; a provider-enforced hard wall limit bounds
-even a killed local process or wedged GPU call. The startup path reconciles the unique sandbox
-name after ambiguous creation and attempts teardown rather than launching a duplicate GPU.
+The original [GPU evidence](custom-training-gpu-validation.json) covers local custom DPO,
+nonzero gradients, changed weights, scoring/sampling agreement, optimizer restoration, and
+exactly-once retries on A10G (Qwen3 0.6B) and H100 (Qwen3.5 9B). These are synthetic
+correctness tests, not generalization benchmarks. CPU tests compare the two-pass custom
+loss gradient to direct PyTorch autograd.
 
-## Scope and validation
-
-This is an experimental, text-only, single-GPU LoRA runtime for Hugging Face causal language
-models on A10G or H100 GPUs. It uses the pinned Flash worker image, standard PEFT LoRA, dropout-free training and
-AdamW with zero weight decay. It does not expose hidden states, full vocabulary logits,
-custom model layers, arbitrary optimizers, multimodal batches, or distributed training.
-Custom objectives must be differentiable functions of the returned target-token logprobs.
-It favors a small inspectable API over the throughput of the optimized verl recipes.
-
-`scripts/check_custom_gpu.py` provisions real hardware and implements DPO locally. It checks
-that loss improves, gradients are nonzero, adapter weights change, sampling matches policy
-scoring, checkpoint restoration reproduces scores/updates, and losing an optimizer response
-then retrying applies the update only once. This is a correctness canary on synthetic examples,
-not a claim about generalization or production-scale training quality.
-
-```bash
-python scripts/check_custom_gpu.py --output /tmp/custom-small.json
-python scripts/check_custom_gpu.py --model Qwen/Qwen3.5-9B --gpu H100 \
-  --output /tmp/custom-9b.json
-```
-
-The unit tests also compare custom-loss gradients against direct PyTorch autograd and test
-HTTP authentication, malformed masks, stale versions, concurrent duplicate submissions,
-partial failures, optimizer limits, and checkpoint boundary validation without network access.
-
-### Recorded GPU runs
-
-[Machine-readable validation results](custom-training-gpu-validation.json) record these
-2026-10-29 runs, with nonzero gradients, changed adapter hashes, checkpoint export/restore,
-sampling/scoring agreement, and safe retry after losing an optimizer response:
-
-| Model | GPU | DPO updates | Initial loss | Final loss |
-| --- | --- | ---: | ---: | ---: |
-| Qwen3 0.6B | A10G | 6 | 0.693147 | 0.000514 |
-| Qwen3.5 9B | H100 | 6 | 0.693147 | 0.000460 |
-
-The A10G run also restored the optimizer and reproduced the first update's exact parameter
-hash. The generated CLI starter ran independently on A10G, produced its local artifacts,
-and exported a checkpoint. All of these GPU sessions were terminated afterward.
+`TrainingClient.create(...)` / `AsyncTrainingClient.create(...)` remain low-level,
+customer-owned Modal sandbox helpers for experiments and conformance tests. Those standalone
+sandboxes do **not** use managed durable storage. Use `algorithm = "custom"` with
+`flash train` for the normal Flash run/checkpoint lifecycle described above.

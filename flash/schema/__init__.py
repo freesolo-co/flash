@@ -67,7 +67,7 @@ _CHECKPOINT_REF_RE = re.compile(
 # INTERNAL artifact-store locator (`<owner>/<repo>:<phase>/<run_id>[/checkpoints/step-N]`); built by
 # the control plane from run metadata and consumed by the worker — not accepted from users anywhere.
 _ADAPTER_STORAGE_REF_RE = re.compile(
-    rf"^(?P<repo>{_OWNER_REPO_RE}/{_OWNER_REPO_RE}):(?P<phase>sft|rl)/"
+    rf"^(?P<repo>{_OWNER_REPO_RE}/{_OWNER_REPO_RE}):(?P<phase>sft|rl|custom)/"
     rf"(?P<run_id>{_RUN_ID_RE})(?P<checkpoint>/checkpoints/step-\d+)?$"
 )
 
@@ -642,6 +642,12 @@ def spec_from_dict(
     raw: dict[str, Any], run_id: str | None = None, *, project_required: bool = False
 ) -> JobSpec:
     model, model_revision, project, algorithm, thinking = _validate_top_level(raw, project_required)
+    if algorithm == "custom":
+        from flash.custom.config import parse_spec
+
+        return parse_spec(raw, run_id=run_id, project=project)
+    if raw.get("custom"):
+        raise ConfigError("[custom] only applies to algorithm = custom")
     env_raw, environment_pip, environment_secrets = _validate_environment_section(raw, algorithm)
     train_raw = _validate_train_section(raw, algorithm)
     if algorithm == "grpo":

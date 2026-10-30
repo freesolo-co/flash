@@ -258,6 +258,10 @@ def sft_ranking_overrides(spec) -> dict:
 
 def estimate_for_spec(spec, *, allocation=None) -> CostEstimate:
     """Cost estimate for a parsed spec, optionally pinned to the selected live candidate."""
+    if spec.algorithm == "custom":
+        from flash.custom.managed import estimate
+
+        return estimate(spec)
     return estimate_cost(run_config_from_spec(spec), allocation=allocation)
 
 

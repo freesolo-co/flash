@@ -52,6 +52,10 @@ def _cmd_train_cost(args) -> int:
         extra_configs=args.extra_configs,
         project_required=True,
     )
+    if spec.algorithm == "custom":
+        from flash.custom.controller import run_custom
+
+        return run_custom(args, spec, authored_train_keys)
     preflight_train_context_within_serving(spec)
     if spec.algorithm == "sft":
         return _cmd_train_cost_sft(args, spec, authored_train_keys)
@@ -415,6 +419,10 @@ def cmd_train(args) -> int:
         extra_configs=args.extra_configs,
         project_required=True,
     )
+    if spec.algorithm == "custom":
+        from flash.custom.controller import run_custom
+
+        return run_custom(args, spec, authored_train_keys)
     payload = spec_payload(spec, authored_train_keys=authored_train_keys)
     client = client_from_config()
     client_train_schema = _client_train_schema(authored_train_keys)

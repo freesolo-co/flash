@@ -6,7 +6,8 @@ serves the resulting adapter.
 
 For a Python loop that owns its loss, rewards, optimizer steps, and token-level inspection,
 see [custom algorithm mode](docs/custom-training.md). `flash custom init algorithm.py`
-writes an editable DPO example that controls a dedicated GPU in your own Modal account.
+writes an editable local DPO example. Set `algorithm = "custom"` and `[custom] file = "algorithm.py"`
+in your training TOML, then use `flash train` with managed durable checkpoints and sync or async calls.
 
 ```bash
 pip install freesolo-flash

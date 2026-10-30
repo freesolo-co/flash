@@ -42,6 +42,7 @@ _HB_SETUP_LIVENESS_STAGES = frozenset(
         # the one-shot transition itself is exempted in ``heartbeat`` (see _HB_MODEL_LOAD_STAGES):
         # only the repeated liveness ticks are what this throttle is for.
         "sft_model_load",
+        "custom_model_load",
         "sft_data_loading",
         "rl_data_loading",
         "rl_adapter_loading",
@@ -60,12 +61,14 @@ _HB_UPLOAD_LIVENESS_STAGES = frozenset({"checkpoint_uploading"})
 # Liveness stages that ride the tighter setup-liveness upload interval (setup + mid-train upload).
 _HB_TIGHT_LIVENESS_STAGES = _HB_SETUP_LIVENESS_STAGES | _HB_UPLOAD_LIVENESS_STAGES
 
-_HB_THROTTLED_STAGES = _HB_TIGHT_LIVENESS_STAGES | frozenset({"rl_step", "sft_step"})
+_HB_THROTTLED_STAGES = _HB_TIGHT_LIVENESS_STAGES | frozenset(
+    {"rl_step", "sft_step", "custom_step"}
+)
 # stages whose one-shot transition must always commit even though their liveness ticks are
 # throttled: the transition is the only record that the run reached the stage, and it is emitted
 # right after a download that has been pinging throughout, so the throttle would almost always
 # swallow it. the wrap that follows re-emits with liveness=True and stays throttled.
-_HB_MODEL_LOAD_STAGES = frozenset({"sft_model_load"})
+_HB_MODEL_LOAD_STAGES = frozenset({"sft_model_load", "custom_model_load"})
 _HB_SUCCESS_TERMINAL_STAGES = frozenset({"done", "already_done"})
 # 600s -> ~6 commits/hr; keeps stall detector alive without hitting the HF commit cap.
 _HB_TERMINAL_ONLY_INTERVAL_S = 600.0

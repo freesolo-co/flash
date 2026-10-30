@@ -9,11 +9,13 @@ from pathlib import Path
 
 def cmd_custom_init(args):
     destination = Path(args.path)
-    source = files("flash.custom").joinpath("starter.py").read_text()
+    source = files("flash.custom").joinpath("managed_starter.py").read_text()
     destination.parent.mkdir(parents=True, exist_ok=True)
     with destination.open("x") as handle:
         handle.write(source)
-    print(f"Created {destination}. Edit its data and loss, then run: python {destination}")
+    print(
+        f'Created {destination}. Set algorithm = "custom" and [custom] file = "{destination.name}" in your TOML, then run: flash train run.toml'
+    )
 
 
 def add_custom_commands(sub: argparse._SubParsersAction):

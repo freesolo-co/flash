@@ -152,6 +152,7 @@ _LIVENESS_SETUP_STAGES = frozenset(
         "model_prefetching",
         "checkpoint_prefetching",
         "sft_model_load",
+        "custom_model_load",
         "sft_data_loading",
         "rl_data_loading",
         "rl_adapter_loading",

@@ -34,6 +34,8 @@ class TrainingSession:
         self.receipt = None
         self.events = deque(maxlen=1000)
         self.event_cursor = 0
+        self.on_commit = None
+        self.restored_state = {}
 
     def status(self):
         return {
@@ -44,6 +46,7 @@ class TrainingSession:
             "failed": self.failed,
             "closed": self.closed,
             "max_steps": self.max_steps,
+            "restored_state": self.restored_state,
             **self.backend.info(),
         }
 
@@ -103,6 +106,11 @@ class TrainingSession:
             # validation must finish before any CUDA work or gradient mutation.
             arguments = self.backend.validate(operation, request["arguments"])
             if operation == "save_checkpoint":
+                store = getattr(self.backend, "checkpoints", None)
+                if store is not None and self.step in store.published:
+                    raise ValueError(
+                        "this step already has an immutable durable checkpoint; use its run/step-N reference"
+                    )
                 arguments["metadata"] = {
                     "session_id": self.id,
                     "model_version": self.version,
@@ -122,12 +130,20 @@ class TrainingSession:
                     time.monotonic() - start,
                 )
                 raise
+            if operation == "load_checkpoint":
+                self.restored_state = output.get("algorithm_state", {})
             if operation in {"optim_step", "load_checkpoint"}:
                 self.version += 1
             if operation == "optim_step":
                 self.step += 1
             if operation == "close":
                 self.closed = True
+            if self.on_commit is not None:
+                try:
+                    self.on_commit(self, operation, output)
+                except BaseException:
+                    self.failed = True
+                    raise
             self.sequence = sequence
             self.last_activity = time.monotonic()
             output = {**output, **self.status()}

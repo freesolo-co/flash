@@ -399,6 +399,9 @@ def _validate_effective_spec(public_spec: JobSpec, worker_spec: JobSpec) -> None
         "workload_profile",
     ):
         effective[managed_top] = public.get(managed_top)
+    if public_spec.algorithm == "custom":
+        effective["custom"].pop("resolved_resume", None)
+        public["custom"].pop("resolved_resume", None)
     public_train = dict(public["train"])
     effective_train = dict(effective["train"])
     public_ref = public_train.get("init_from_adapter") or ""
@@ -500,7 +503,7 @@ def _validate_effective_spec(public_spec: JobSpec, worker_spec: JobSpec) -> None
         raise ValueError("persisted effective preparation has an invalid source adapter")
     _repo, prefix = resolved
     match = re.fullmatch(
-        r"(?:sft|rl)/(?P<run>[A-Za-z0-9][A-Za-z0-9._-]{0,127})"
+        r"(?:sft|rl|custom)/(?P<run>[A-Za-z0-9][A-Za-z0-9._-]{0,127})"
         r"(?:/checkpoints/step-(?P<step>\d+))?",
         prefix,
     )

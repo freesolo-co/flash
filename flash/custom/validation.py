@@ -7,12 +7,12 @@ def validate_operation(backend, operation, arguments):
     allowed = {
         "forward": {"data", "top_k"},
         "forward_backward": {"data", "metrics"},
-        "optim_step": {"learning_rate", "max_grad_norm"},
+        "optim_step": {"learning_rate", "max_grad_norm", "algorithm_state"},
         "zero_grad": set(),
         "sample": {"prompt", "max_tokens", "temperature", "num_samples"},
         "encode": {"text"},
         "decode": {"tokens"},
-        "save_checkpoint": {"name"},
+        "save_checkpoint": {"name", "algorithm_state"},
         "load_checkpoint": {"name"},
         "close": set(),
     }
@@ -43,6 +43,10 @@ def validate_operation(backend, operation, arguments):
     elif operation == "optim_step":
         args["learning_rate"] = number(args.get("learning_rate"), "learning_rate", 1e-12, 1)
         args["max_grad_norm"] = number(args.get("max_grad_norm", 1.0), "max_grad_norm", 1e-12, 1000)
+        if "algorithm_state" in args:
+            from flash.custom.checkpoints import validate_algorithm_state
+
+            args["algorithm_state"] = validate_algorithm_state(args["algorithm_state"])
         if not backend.pending_backward:
             raise ValueError("optim_step requires accumulated gradients")
     elif operation == "sample":
@@ -70,6 +74,11 @@ def validate_operation(backend, operation, arguments):
         args["name"] = checkpoint_name(args.get("name"))
         if backend.pending_backward:
             raise ValueError("apply or clear accumulated gradients before checkpoint operations")
+        if operation == "save_checkpoint":
+            from flash.custom.checkpoints import validate_algorithm_state
+
+            if "algorithm_state" in args:
+                args["algorithm_state"] = validate_algorithm_state(args["algorithm_state"])
         path = backend.checkpoint_dir / args["name"]
         if operation == "save_checkpoint" and path.exists():
             raise ValueError("checkpoint already exists; choose a new immutable name")

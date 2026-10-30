@@ -182,7 +182,11 @@ def _prepare_attempt(ctx: _SubmitContext):
 
 
 def _allocate_attempt(ctx: _SubmitContext, prepared):
-    _, attempt_spec, _, _ = prepared
+    claim, attempt_spec, _, _ = prepared
+    if attempt_spec.algorithm == "custom":
+        from flash.custom.managed import allocation
+
+        return allocation(attempt_spec), None
     from flash.providers.core.allocator import allocate
     from flash.providers.core.base import CapacityUnavailableError, PollResult, UnsupportedGpuError
     from flash.runner.lifecycle.deadlines import _load_run_deadline_at

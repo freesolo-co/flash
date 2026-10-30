@@ -57,6 +57,14 @@ class TrainingClient:
         )
 
     @property
+    def step(self):
+        return self._state["step"]
+
+    @property
+    def restored_state(self):
+        return self._state.get("restored_state", {})
+
+    @property
     def model_version(self):
         return self._state["model_version"]
 
@@ -168,14 +176,18 @@ class TrainingClient:
                 weights.append(Datum(row.tokens, weight))
             return self.forward_backward(weights, metrics={**metrics, "custom_loss": loss.item()})
 
-    def optim_step(self, *, learning_rate, max_grad_norm=1.0):
-        return self._call("optim_step", learning_rate=learning_rate, max_grad_norm=max_grad_norm)
+    def optim_step(self, *, learning_rate, max_grad_norm=1.0, algorithm_state=None):
+        extra = {"algorithm_state": algorithm_state} if algorithm_state is not None else {}
+        return self._call(
+            "optim_step", learning_rate=learning_rate, max_grad_norm=max_grad_norm, **extra
+        )
 
     def zero_grad(self):
         return self._call("zero_grad")
 
-    def save_checkpoint(self, name):
-        return self._call("save_checkpoint", name=name)
+    def save_checkpoint(self, name, *, algorithm_state=None):
+        extra = {"algorithm_state": algorithm_state} if algorithm_state is not None else {}
+        return self._call("save_checkpoint", name=name, **extra)
 
     def load_checkpoint(self, name):
         return self._call("load_checkpoint", name=name)

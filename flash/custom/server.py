@@ -122,8 +122,6 @@ def create_app(session, token):
 
 
 def main():
-    import uvicorn
-
     from flash.custom.backend import load_backend
 
     token = os.environ["FLASH_CUSTOM_TOKEN"]
@@ -138,6 +136,12 @@ def main():
     session = TrainingSession(
         backend, max_steps=config["max_steps"], idle_seconds=config["idle_seconds"]
     )
+    serve_session(session, token, config["max_wall_seconds"])
+
+
+def serve_session(session, token, max_wall_seconds, *, tick=None):
+    import uvicorn
+
     app = create_app(session, token)
     server = uvicorn.Server(
         uvicorn.Config(
@@ -155,7 +159,9 @@ def main():
         async def watchdog():
             while not server.should_exit:
                 await asyncio.sleep(5)
-                if session.expired() or time.monotonic() - started >= config["max_wall_seconds"]:
+                if tick is not None:
+                    await asyncio.to_thread(tick)
+                if session.expired() or time.monotonic() - started >= max_wall_seconds:
                     server.should_exit = True
 
         task = asyncio.create_task(watchdog())

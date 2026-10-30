@@ -27,6 +27,8 @@ class TorchBackend:
             raise ValueError("model has no trainable parameters")
         self.optimizer = torch.optim.AdamW(self.parameters, lr=1e-4, weight_decay=0.0)
         self.pending_backward = 0
+        self.algorithm_state = {}
+        self.checkpoints = None
         self.vocab_size = model.get_output_embeddings().weight.shape[0]
         self.max_tokens = max_tokens
         self.max_batch = max_batch
@@ -98,7 +100,7 @@ class TorchBackend:
         self.pending_backward += 1
         return {"outputs": outputs, "metrics": {**(metrics or {}), "surrogate_loss": loss_total}}
 
-    def optim_step(self, learning_rate, max_grad_norm):
+    def optim_step(self, learning_rate, max_grad_norm, algorithm_state=None):
         import torch
 
         for group in self.optimizer.param_groups:
@@ -107,6 +109,8 @@ class TorchBackend:
             self.parameters, max_grad_norm, error_if_nonfinite=True
         )
         self.optimizer.step()
+        if algorithm_state is not None:
+            self.algorithm_state = algorithm_state
         self.optimizer.zero_grad(set_to_none=True)
         accumulated = self.pending_backward
         self.pending_backward = 0
@@ -174,7 +178,7 @@ class TorchBackend:
     def decode(self, tokens):
         return {"text": self.tokenizer.decode(tokens, skip_special_tokens=False)}
 
-    def save_checkpoint(self, name, metadata=None):
+    def save_checkpoint(self, name, metadata=None, algorithm_state=None):
         import torch
 
         # checkpoints contain only trusted engine state; no arbitrary client serialization is loaded.
@@ -205,19 +209,37 @@ class TorchBackend:
                 },
                 stage / "state.pt",
             )
+            (stage / "algorithm.json").write_text(
+                json.dumps(
+                    self.algorithm_state if algorithm_state is None else algorithm_state,
+                    allow_nan=False,
+                )
+            )
             (stage / "metadata.json").write_text(json.dumps(metadata))
             stage.rename(destination)
         finally:
             if stage.exists():
                 shutil.rmtree(stage)
+        publication = self.checkpoints.publish(destination, metadata) if self.checkpoints else {}
         shutil.make_archive(str(destination), "zip", destination)
-        return {"checkpoint": metadata}
+        return {"checkpoint": {**metadata, **publication}}
 
     def load_checkpoint(self, name):
+        return self.restore_checkpoint(self.checkpoint_dir / name)
+
+    def restore_checkpoint(self, source):
         import torch
 
-        source = self.checkpoint_dir / name
+        source = Path(source)
+        metadata = json.loads((source / "metadata.json").read_text())
+        if any(metadata.get(key) != self.info().get(key) for key in ("model", "model_revision")):
+            raise ValueError("checkpoint base model or immutable revision differs")
         state = torch.load(source / "state.pt", map_location="cpu", weights_only=True)
+        trainable = {key: p for key, p in self.model.named_parameters() if p.requires_grad}
+        if set(trainable) != set(state["parameters"]) or any(
+            p.shape != state["parameters"][key].shape for key, p in trainable.items()
+        ):
+            raise ValueError("checkpoint adapter topology differs")
         with torch.no_grad():
             for key, parameter in self.model.named_parameters():
                 if parameter.requires_grad:
@@ -226,24 +248,51 @@ class TorchBackend:
         torch.set_rng_state(state["rng"])
         if torch.cuda.is_available():
             torch.cuda.set_rng_state_all(state["cuda_rng"])
-        return {"checkpoint": json.loads((source / "metadata.json").read_text())}
+        self.algorithm_state = (
+            json.loads((source / "algorithm.json").read_text())
+            if (source / "algorithm.json").exists()
+            else {}
+        )
+        return {"checkpoint": metadata, "algorithm_state": self.algorithm_state}
 
     def close(self):
         self.zero_grad()
         return {}
 
 
-def load_backend(model_id, *, revision=None, lora_rank=16, checkpoint_dir, max_tokens=2048):
+def load_backend(
+    model_id,
+    *,
+    revision=None,
+    lora_rank=16,
+    lora_alpha=None,
+    seed=42,
+    checkpoint_dir,
+    max_tokens=2048,
+):
     import torch
     from peft import LoraConfig, get_peft_model
     from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 
-    torch.manual_seed(42)
+    torch.manual_seed(seed)
     config = AutoConfig.from_pretrained(model_id, revision=revision, trust_remote_code=False)
     # pin tokenizer and weights to the same immutable revision, even if the author used a branch.
     revision = getattr(config, "_commit_hash", None) or revision
     tokenizer = AutoTokenizer.from_pretrained(model_id, revision=revision, trust_remote_code=False)
-    model = AutoModelForCausalLM.from_pretrained(
+    model_class = AutoModelForCausalLM
+    targeting = {}
+    if model_id == "Qwen/Qwen3.5-9B":
+        from transformers import AutoModelForImageTextToText
+
+        from flash.adapters.targets import resolve_lora_targeting
+
+        model_class = AutoModelForImageTextToText
+        surface = resolve_lora_targeting(model_id, algorithm="custom", multimodal=False)
+        targeting = {
+            "exclude_modules": surface.exclude_modules,
+            "target_parameters": surface.target_parameters,
+        }
+    model = model_class.from_pretrained(
         model_id,
         revision=revision,
         trust_remote_code=False,
@@ -254,11 +303,12 @@ def load_backend(model_id, *, revision=None, lora_rank=16, checkpoint_dir, max_t
         model,
         LoraConfig(
             r=lora_rank,
-            lora_alpha=2 * lora_rank,
+            lora_alpha=lora_alpha or 2 * lora_rank,
             lora_dropout=0,
             target_modules="all-linear",
             task_type="CAUSAL_LM",
             revision=revision,
+            **targeting,
         ),
     )
     model.config._commit_hash = revision

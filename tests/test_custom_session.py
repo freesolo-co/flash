@@ -56,6 +56,38 @@ def test_concurrent_duplicate_optimizer_request_applies_once(tmp_path):
     assert session.version == 1
 
 
+def test_duplicate_optimizer_receipt_does_not_publish_checkpoint_twice(tmp_path):
+    backend = CounterBackend(tmp_path)
+    session = TrainingSession(backend)
+    published = []
+
+    def commit(current, operation, output):
+        published.append(current.step)
+        output["checkpoint_ref"] = f"run/step-{current.step}"
+
+    session.on_commit = commit
+    payload = request(session)
+    first = session.execute(payload)
+    assert session.execute(payload) == first
+    assert first["checkpoint_ref"] == "run/step-1"
+    assert published == [1]
+
+
+def test_failed_checkpoint_commit_poisoned_session_cannot_reapply_update(tmp_path):
+    session = TrainingSession(CounterBackend(tmp_path))
+
+    def commit(*args):
+        raise RuntimeError("artifact upload failed after update")
+
+    session.on_commit = commit
+    payload = request(session)
+    with pytest.raises(RuntimeError, match="upload failed"):
+        session.execute(payload)
+    with pytest.raises(SessionConflict, match="failed"):
+        session.execute(payload)
+    assert session.backend.value == 1
+
+
 def test_stale_changed_and_expired_sequences_never_mutate(tmp_path):
     session = TrainingSession(CounterBackend(tmp_path))
     first = request(session)

@@ -126,3 +126,37 @@ def test_checkpoint_rejects_pending_gradients_and_name_traversal(client_and_back
         backend.validate("save_checkpoint", {"name": "pending"})
     with pytest.raises(ValueError, match="checkpoint name"):
         backend.validate("load_checkpoint", {"name": "../../untrusted"})
+
+
+def test_new_backend_restores_optimizer_rng_and_algorithm_state(client_and_backend, tmp_path):
+    client, original = client_and_backend
+    data = [Datum([1, 2, 3], [0, 1])]
+    client.forward_backward(data)
+    client.optim_step(learning_rate=0.1, algorithm_state={"cursor": 17, "reference": [-2.0]})
+    client.save_checkpoint("durable")
+    expected_random = torch.rand(4)
+    expected_scores = original.forward(data)["outputs"]
+    client.forward_backward(data)
+    client.optim_step(learning_rate=0.1)
+    expected_weights = original.model.projection.weight.detach().clone()
+
+    # a new model, optimizer and checkpoint directory: nothing relies on the old session.
+    fresh = TorchBackend(TinyLM(), TinyTokenizer(), checkpoint_dir=tmp_path / "fresh")
+    restored = fresh.restore_checkpoint(tmp_path / "durable")
+    assert restored["algorithm_state"] == {"cursor": 17, "reference": [-2.0]}
+    assert torch.equal(torch.rand(4), expected_random)
+    assert fresh.forward(data)["outputs"] == expected_scores
+    fresh.forward_backward(data)
+    fresh.optim_step(learning_rate=0.1, max_grad_norm=1.0)
+    assert torch.equal(fresh.model.projection.weight, expected_weights)
+
+
+def test_mismatched_base_revision_rejected_before_weight_mutation(client_and_backend, tmp_path):
+    client, _original = client_and_backend
+    client.save_checkpoint("base")
+    fresh = TorchBackend(TinyLM(), TinyTokenizer(), checkpoint_dir=tmp_path / "fresh")
+    fresh.model.config._commit_hash = "a" * 40
+    before = fresh.model.projection.weight.detach().clone()
+    with pytest.raises(ValueError, match="revision differs"):
+        fresh.restore_checkpoint(tmp_path / "base")
+    assert torch.equal(before, fresh.model.projection.weight)
