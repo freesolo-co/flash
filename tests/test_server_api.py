@@ -7321,10 +7321,8 @@ def _make_run(api, key, state):
 
 
 def test_list_checkpoints_endpoint(api, monkeypatch):
-    import flash.server.domain.registry.checkpoints as checkpoint_registry
 
     monkeypatch.setattr(run_checkpoints, "list_checkpoints", lambda spec: _FAKE_CKPTS)
-    monkeypatch.setattr(checkpoint_registry, "list_checkpoints", lambda spec: _FAKE_CKPTS)
     key = _new_user_token()
     run_id = _make_run(api, key, "done")
     r = api.get(f"/v1/runs/{run_id}/checkpoints", headers=_bearer(key))

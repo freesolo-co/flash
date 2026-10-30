@@ -709,13 +709,6 @@ class JobSpec:
         """
         if not isinstance(data, dict):
             raise TypeError("job spec must be an object")
-        # Completed SFT/GRPO records written before OPD removal include this inert
-        # default. Accept only that exact value; authored configs remain strict.
-        if isinstance(data.get("train"), dict) and data["train"].get("teacher_model") == "":
-            data = {
-                **data,
-                "train": {k: v for k, v in data["train"].items() if k != "teacher_model"},
-            }
         allowed_top_level = {item.name for item in fields(cls)}
         unknown_top_level = sorted(set(data) - allowed_top_level)
         if unknown_top_level:
