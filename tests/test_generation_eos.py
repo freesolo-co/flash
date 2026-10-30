@@ -5,7 +5,7 @@ from types import SimpleNamespace
 
 def test_generation_eos_ids_unions_tokenizer_and_model_text_config():
     """every tokenizer, generation, top-level, and decoder text-config eos remains a halt id."""
-    from flash.engine.worker.train.core.generation import _generation_eos_ids
+    from flash.engine.worker.train.core.rollout.generation import _generation_eos_ids
 
     nested_config = SimpleNamespace(eos_token_id=248044)
     text_config_calls = []
@@ -34,7 +34,7 @@ def test_generation_eos_ids_unions_tokenizer_and_model_text_config():
 
 
 def test_generation_eos_ids_ignores_malformed_or_missing_nested_values():
-    from flash.engine.worker.train.core.generation import _generation_eos_ids
+    from flash.engine.worker.train.core.rollout.generation import _generation_eos_ids
 
     class _BrokenSupportedAccess:
         text_config = SimpleNamespace(eos_token_id=[248044, "248045", True, None])

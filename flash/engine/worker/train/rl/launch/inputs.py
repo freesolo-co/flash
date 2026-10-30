@@ -39,7 +39,7 @@ from flash.engine.worker.io.heartbeat import liveness_heartbeat
 from flash.engine.worker.runtime.rng import backend_seed, seed_training_rngs
 from flash.engine.worker.runtime.state import WorkerContext
 from flash.engine.worker.train.core.child.glue import validate_glue_template
-from flash.engine.worker.train.core.generation import generation_eos_from_cached_config
+from flash.engine.worker.train.core.rollout.generation import generation_eos_from_cached_config
 from flash.engine.worker.train.entry.backend_common import (
     clamp_engine_len,
     model_max_position_embeddings,
