@@ -2,7 +2,7 @@
 
 stdlib only: the parent copies it into the child interpreter. GRPO must return one output per
 episode
-because main_ppo cannot postprocess OPD's list form; response_mask marks model tokens only.
+and response_mask marks model tokens only.
 """
 
 from __future__ import annotations

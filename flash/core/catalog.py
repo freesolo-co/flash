@@ -8,13 +8,11 @@ from typing import Any
 
 from flash.content.image_descriptors import MAX_IMAGES_PER_CONVERSATION
 
-# Algorithms offered for new built-in runs. Retired workers remain readable/recoverable.
 ALGORITHMS = ("sft", "grpo")
-_WORKER_ALGORITHMS = (*ALGORITHMS, "opd")
 
 # algorithms whose training step samples on-policy student completions, unlike fixed-dataset sft.
 # import ``samples_on_policy`` instead of hand-rolling algorithm tuples at each call site.
-_ON_POLICY_ALGORITHMS = frozenset({"grpo", "opd"})
+_ON_POLICY_ALGORITHMS = frozenset({"grpo"})
 _IMAGE_TRAINING_MODELS = frozenset(
     {
         "Qwen/Qwen3.5-9B",
@@ -25,7 +23,7 @@ _IMAGE_TRAINING_MODELS = frozenset(
 
 
 def supports_image_training(model: str | ModelInfo | None) -> bool:
-    """Return whether a curated model supports image-bearing SFT, GRPO, and OPD."""
+    """Return whether a curated model supports image-bearing SFT and GRPO."""
     model_id = model.id if isinstance(model, ModelInfo) else model
     return bool(model_id and model_id in _IMAGE_TRAINING_MODELS)
 
@@ -52,7 +50,7 @@ def optimizer_batch_key(algorithm: str) -> str:
     anything that is not recognisably rl.
     """
     algo = (algorithm or "").strip().lower()
-    return "prompts_per_step" if algo in ("grpo", "rl", "opd") else "batch_size"
+    return "prompts_per_step" if algo in ("grpo", "rl") else "batch_size"
 
 
 def normalize_algorithm(value: str) -> str:
@@ -64,20 +62,9 @@ def normalize_algorithm(value: str) -> str:
         # escapes the callers' ValueError/ConfigError guards -> uncaught 500. Raise ValueError instead.
         raise ValueError(f"algorithm must be a string, got {type(value).__name__}")
     value = value.lower()
-    if value not in _WORKER_ALGORITHMS:
+    if value not in ALGORITHMS:
         raise ValueError(f"unsupported algorithm: {value}; known: {', '.join(ALGORITHMS)}")
     return value
-
-
-def validate_new_run_algorithm(value: str) -> str:
-    """Reject retired offerings at admission, without invalidating persisted job specs."""
-    algorithm = normalize_algorithm(value)
-    if algorithm == "opd":
-        raise ValueError(
-            "Built-in OPD has been retired. Use the custom algorithm API for on-policy "
-            "distillation (algorithm = 'custom'); existing OPD runs and checkpoints remain accessible."
-        )
-    return algorithm
 
 
 DEFAULT_GPU = "RTX 5090"
@@ -157,9 +144,9 @@ class ModelInfo:
     # QUERY heads, from the checkpoint's own config. NOT derivable as hidden_size // head_dim: these
     # models decouple head_dim from that ratio (3.5-9b is hidden 4096 / head_dim 256 and has 16
     # heads). vllm tensor parallelism requires this to divide the rented card count -- grpo
-    # and opd hand that count to the rollout engine as tensor_model_parallel_size -- so a derived
+    # hands that count to the rollout engine as tensor_model_parallel_size -- so a derived
     # value silently caps runs on a number that is not the constraint. no longer a sequence-parallel
-    # constraint: all three algorithms pin ulysses off and shard by data.
+    # constraint: both algorithms pin ulysses off and shard by data.
     num_attention_heads: int = 0
     head_dim: int = 0
     linear_num_key_heads: int = 0
@@ -378,7 +365,7 @@ MODELS: dict[str, ModelInfo] = {
             (4608, 4608, 1),
             (12288, 4096, 32),
         ),
-        algos=_WORKER_ALGORITHMS,
+        algos=ALGORITHMS,
         min_vram_gb=48,
         min_disk_gb=120,
         # NOT QLoRA: a peft bnb merge during GRPO rollout diverges the rollout's precision from the
@@ -439,7 +426,7 @@ MODELS: dict[str, ModelInfo] = {
             (6144, 5120, 64),
             (17408, 5120, 64),
         ),
-        algos=("sft", "grpo", "opd"),
+        algos=("sft", "grpo"),
         min_vram_gb=80,
         grpo_min_vram_gb=142,  # colocated GRPO (two ~54GB copies) needs B200; triggers resident-peak sizing ~150GB
         sft_min_vram_gb=80,
@@ -509,7 +496,7 @@ MODELS: dict[str, ModelInfo] = {
         ),
         lora_expert_count=256,
         vocab_size=248_320,
-        algos=_WORKER_ALGORITHMS,
+        algos=ALGORITHMS,
         min_vram_gb=141,
         # Floor to 100 GB so SFT lands on H200, not the thin-margin consumer Blackwell or 80 GB H100.
         sft_min_vram_gb=100,
@@ -676,8 +663,6 @@ def resolve_model(model_id: str, algorithm: str, model_revision: str = "") -> Mo
 def validate_model_for_algorithm(model_id: str, algorithm: str) -> ModelInfo:
     info = get_model(model_id)
     algo = normalize_algorithm(algorithm)
-    # Each algorithm gates on its own capability entry (sft/grpo/opd), so a model must
-    # explicitly opt into opd via its algos tuple — same contract as sft/grpo.
     if algo not in info.algos:
         allowed = ", ".join(info.algos)
         raise ValueError(f"{model_id} supports {allowed}, not {algo}")
@@ -685,10 +670,4 @@ def validate_model_for_algorithm(model_id: str, algorithm: str) -> ModelInfo:
 
 
 def public_model_rows() -> list[dict[str, Any]]:
-    return [
-        replace(
-            _with_merge_disk_floor(model),
-            algos=tuple(algo for algo in model.algos if algo in ALGORITHMS),
-        ).to_dict()
-        for model in list_models()
-    ]
+    return [_with_merge_disk_floor(model).to_dict() for model in list_models()]

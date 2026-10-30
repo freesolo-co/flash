@@ -65,7 +65,7 @@ def _warmstart_adapter_path(
 ) -> str | None:
     """Stage and verify this run's warm-start source adapter; None when it is not a warm start.
 
-    Shared by the SFT and OPD runners (see ``opd_train``), and the source adapter may come from a
+    Used by the SFT runners, and the source adapter may come from a
     run of any algorithm, so nothing here may describe either end as SFT: warm start continues one
     LoRA in place across every algorithm pair.
     """
@@ -88,7 +88,7 @@ def _warmstart_adapter_path(
     # alpha is checked alongside rank because the pair sets the adapter's scaling: continuing a
     # LoRA at the source rank but a different alpha silently rescales every trained delta. grpo
     # already rereads both from the source (see rl/inputs.py::_resolve_warmstart_config); without
-    # this, sft and opd failed closed on rank and open on alpha.
+    # this, sft failed closed on rank and open on alpha.
     alpha = alpha_from_adapter_config(config, source=config_path)
     if alpha != expected_alpha:
         raise ValueError(
@@ -143,7 +143,7 @@ def _seed_resume_lifecycle(
     """record what a previous attempt already made durable, before the watcher's first sweep.
 
     the resume-state half of this is the shared rule and lives on the ledger. what stays here is the
-    part only sft and opd can answer: the prior attempt's deployable publish was best-effort for a
+    part only sft can answer: the prior attempt's deployable publish was best-effort for a
     periodic save, so a required step is credited only when ``_durable_required_save_steps`` finds
     its adapter on hf. The restored step can still be exported by this watcher; an earlier
     missing save cannot be recreated and must fail before launching the training child.

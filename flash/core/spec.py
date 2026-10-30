@@ -35,7 +35,6 @@ from flash.core.spec_persistence import (
     validated_section,
     volume_gb,
 )
-from flash.teacher.retry_contract import OPD_RESUME_REVISION_ENV
 
 _FALSE_STRINGS = {"", "0", "false", "no", "off", "none"}
 
@@ -235,13 +234,6 @@ def parse_max_steps(value: Any) -> int | None:
     return value if value > 0 else None
 
 
-# this plane's own public origin: the address a gpu worker dials back on to reach the teacher
-# broker. distinct from FLASH_API_URL, which is where an operator's cli dials in from and may be a
-# private address the worker cannot resolve. control-plane-owned, so a caller cannot declare it as
-# a worker env override or an [environment] secret.
-PUBLIC_URL_ENV = "FLASH_PUBLIC_URL"
-TEACHER_CAPABILITY_ENV = "FLASH_TEACHER_CAPABILITY"
-MANAGED_TEACHER_CREDENTIAL_ENV_KEYS = frozenset({"PARASAIL_API_KEY"})
 CONTROL_PLANE_OWNED_ENV_KEYS = frozenset(
     {
         "RUN_ID",
@@ -250,21 +242,14 @@ CONTROL_PLANE_OWNED_ENV_KEYS = frozenset(
         "GIT_ASKPASS",
         "FLASH_ARM",
         "SEED",
-        OPD_RESUME_REVISION_ENV,
-        PUBLIC_URL_ENV,
-        TEACHER_CAPABILITY_ENV,
         # the redactors' own transport: build_worker_env overwrites this with the generated list of
         # declared secret names, so a job declaring it would have its credential silently replaced
         # by that list and fail at runtime. control-plane-owned, hence rejected at declaration.
         SECRET_ENV_KEYS_ENV,
-        *MANAGED_TEACHER_CREDENTIAL_ENV_KEYS,
     }
 )
 
 
-# the trainer every run reports. run_sft, run_opd and run_rl all delegate straight to verl, so this
-# is a constant rather than a resolution: no job-spec field can select anything else. recorded on
-# effective_preparation so a stored run says which trainer produced it.
 TRAINER_BACKEND = "verl"
 
 
@@ -366,12 +351,12 @@ class TrainSpec:
     # None -> worker's tuned recipe default.
     learning_rate: float | None = field(default=None, metadata={"introduced_in": "0.2.0"})
     # sft only. the packaged-dataset estimate resolves this against the selected row count into
-    # examples_per_update (packed) or pins the optimizer batch to 1 (unpacked). grpo/opd have no
+    # examples_per_update (packed) or pins the optimizer batch to 1 (unpacked). grpo has no
     # profile, so they take prompts_per_step instead and reject this key: the two are not the same
     # quantity, and accepting one name for both let the standard sft memory workaround
     # (batch_size = 1) silently mean one prompt per optimizer update on rl.
     batch_size: int | None = field(default=None, metadata={"introduced_in": "0.2.0"})
-    # grpo/opd ONLY: the optimizer batch itself, straight through to verl's data.train_batch_size
+    # grpo ONLY: the optimizer batch itself, straight through to verl's data.train_batch_size
     # and ppo_mini_batch_size. no workload profile sits in between.
     prompts_per_step: int | None = field(default=None, metadata={"introduced_in": "1.1.43"})
     max_context_tokens: int | None = field(default=None, metadata={"introduced_in": "0.2.49"})
@@ -391,9 +376,6 @@ class TrainSpec:
     thinking_length_penalty_coef: float | None = field(
         default=None, metadata={"introduced_in": "0.2.0"}
     )
-    # opd only: the managed teacher's canonical friendly alias. provider and repository ids are not
-    # accepted as user input. an empty value selects the recipe default, glm-5.3.
-    teacher_model: str = field(default="", metadata={"introduced_in": "0.2.56"})
     stop_sequences: tuple[str, ...] = field(default=(), metadata={"introduced_in": "0.2.0"})
     # canonical json of vllm structured-output kwargs ("" = unconstrained). normalized once
     # at parse time (schema/fields.py) so worker/hub/api hops carry one stable string form.
@@ -438,7 +420,7 @@ class GpuSpec:
     provider: str = ""
     providers: tuple[str, ...] = ()
     # number of cards of `type` a single training worker occupies (1..8). count > 1 provisions a
-    # multi-gpu pod; the training loop shards across them in the sft/opd multi-gpu paths.
+    # multi-gpu pod; the training loop shards across them in the sft multi-gpu paths.
     count: int = 1
     # authored alternatives after the concrete head class.
     type_fallbacks: tuple[str, ...] = ()
@@ -760,7 +742,7 @@ class JobSpec:
         if model_revision and not model_revision_auto:
             raise ValueError("model_revision requires model_revision_auto=True")
         algorithm = normalize_algorithm(data.get("algorithm", cls.algorithm))
-        if algorithm in {"grpo", "opd"} and train.get("batch_size") is not None:
+        if algorithm in {"grpo"} and train.get("batch_size") is not None:
             raise ValueError(
                 f"train.batch_size does not apply to {algorithm}; use train.prompts_per_step"
             )
@@ -810,7 +792,6 @@ class JobSpec:
                 mask_truncated_completions=train.get("mask_truncated_completions"),
                 kl_penalty_coef=opt_float(train.get("kl_penalty_coef")),
                 thinking_length_penalty_coef=opt_float(train.get("thinking_length_penalty_coef")),
-                teacher_model=str(train.get("teacher_model") or ""),
                 stop_sequences=str_tuple(train.get("stop_sequences")),
                 structured_outputs=str(train.get("structured_outputs") or ""),
                 credit_assignment=credit_assignment,

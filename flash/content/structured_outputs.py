@@ -1,4 +1,4 @@
-"""Structured-output helpers shared by GRPO and OPD rollouts.
+"""Structured-output helpers shared by GRPO rollouts.
 
 ``TrainSpec.structured_outputs`` is canonical JSON for vLLM ``StructuredOutputsParams``, normalized
 in ``schema/fields.py``. Keep this module free of GPU dependencies.

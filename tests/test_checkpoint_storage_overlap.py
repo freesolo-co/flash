@@ -15,7 +15,6 @@ from flash.engine.worker.train.core.lifecycle.persistence import (
     pin_checkpoint,
 )
 from flash.engine.worker.train.entry import sft_train
-from flash.engine.worker.train.opd.orchestration import failures as opd
 from flash.engine.worker.train.rl.launch import checkpoints as grpo
 from flash.engine.worker.train.sft.setup.checkpoints import _VerlCheckpointWatcher
 
@@ -38,7 +37,6 @@ def _watcher(algorithm, tmp_path, monkeypatch, worker_context):
         (Path(adapter) / "weights").write_text((Path(actor) / "weights").read_text())
 
     monkeypatch.setattr(sft_train, "_export_checkpoint_adapter", export)
-    monkeypatch.setattr(opd, "_export_checkpoint_adapter", export)
     options = {
         "local_dir": str(tmp_path / "native"),
         "export_root": str(tmp_path / "exports"),
@@ -51,20 +49,6 @@ def _watcher(algorithm, tmp_path, monkeypatch, worker_context):
     }
     if algorithm == "sft":
         return _VerlCheckpointWatcher(**options)
-    if algorithm == "opd":
-
-        def retry_contract(path, **kwargs):
-            (Path(path) / "opd_state.json").write_text(json.dumps(kwargs["accounting_state"]))
-
-        monkeypatch.setattr(opd, "_stage_retry_contract", retry_contract)
-        return opd._OpdVerlCheckpointWatcher(
-            **options,
-            seed=42,
-            prompt_pool_fingerprint="fingerprint",
-            prompts_per_step=1,
-            group_size=1,
-            accounting_state=lambda step: {"step": step},
-        )
 
     def stage(self, step, path):
         adapter = str(tmp_path / "exports" / f"step-{step}")
@@ -83,7 +67,7 @@ def _watcher(algorithm, tmp_path, monkeypatch, worker_context):
     )
 
 
-@pytest.mark.parametrize("algorithm", ["sft", "opd", "grpo"])
+@pytest.mark.parametrize("algorithm", ["sft", "grpo"])
 @pytest.mark.parametrize("final_staged", [False, True])
 def test_next_adapter_publishes_while_recovery_upload_is_blocked(
     algorithm, final_staged, tmp_path, monkeypatch, worker_context
@@ -109,8 +93,6 @@ def test_next_adapter_publishes_while_recovery_upload_is_blocked(
             uploading.set()
             assert release.wait(10), "test did not release the blocked uploader"
         assert (Path(path) / "actor" / "weights").read_text() == f"weights-{step}"
-        if algorithm == "opd":
-            assert json.loads((Path(path) / "opd_state.json").read_text()) == {"step": step}
         if algorithm == "grpo":
             manifest = json.loads((Path(path) / "_flash_resume_manifest.json").read_text())
             assert manifest["checkpoint_step"] == step
@@ -190,7 +172,7 @@ def test_persistence_bounds_admission_and_drains_in_order(worker_context):
     assert completions == [1, 2, 3]
 
 
-@pytest.mark.parametrize("algorithm", ["sft", "opd", "grpo"])
+@pytest.mark.parametrize("algorithm", ["sft", "grpo"])
 def test_publication_failure_drains_and_cleans_accepted_snapshots(
     algorithm, tmp_path, monkeypatch, worker_context
 ):

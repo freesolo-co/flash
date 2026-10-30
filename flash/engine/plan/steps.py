@@ -74,7 +74,7 @@ def widest_usable_dp_width(candidates, train_batch_size: int, row_count: int) ->
 
 
 def rl_data_parallel_cards(gpu_count: int, sequences_per_step: int) -> int:
-    """Cards grpo/opd can actually train on, because verl splits the batch evenly across dp ranks.
+    """Cards grpo can actually train on, because verl splits the batch evenly across dp ranks.
 
     With ulysses pinned off (see ``verl.parallelism.ULYSSES_SEQUENCE_PARALLEL_SIZE``) every rank is a
     DATA-parallel rank, so verl's dp width is the card count rather than 1. Two places then require
@@ -134,7 +134,7 @@ def on_policy_steps(
     prompt_count: int,
     prompts_per_step: int,
 ) -> int:
-    """Resolve GRPO/OPD optimizer steps from full passes over the retained prompt pool."""
+    """Resolve GRPO optimizer steps from full passes over the retained prompt pool."""
     prompt_count = int(prompt_count)
     if prompt_count <= 0:
         raise ValueError("cannot derive epoch-based steps without at least one retained prompt")

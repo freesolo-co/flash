@@ -24,9 +24,6 @@ from flash.cli.ui import render
 
 _ALLOWED_ROLES = frozenset({"system", "user", "assistant", "tool"})
 _ECHO_RESPONSE = "test"
-# the one algorithm that trains from the environment reward. sft optimizes a supervised loss and opd
-# a teacher token loss; neither reads `env.reward` anywhere (flash/engine/worker/entry/sft.py, opd.py), so
-# a scorer they never call cannot be evidence of anything for them.
 _REWARD_DRIVEN_ALGORITHM = "grpo"
 _PREVIEW_CHARS = 200
 _DEFAULT_EPISODES = 3
@@ -358,17 +355,6 @@ def _drive_multi_turn(env, example: dict, record: dict, *, force_echo: bool = Fa
         # reward. normalize copies so the check cannot replace authoritative rollout messages.
         _validate_multi_turn_reply(env, example, state, env_msgs)
 
-    # the driver-side exits above stop before the inter-turn env_reply, so the last replayed turn
-    # is still unapplied. a stateful env would then score a board or transcript missing the last
-    # thing the model did, so give it that turn before scoring -- only the inter-turn glue is
-    # skipped, since no further model turn is conditioned on the reply. this mirrors the worker
-    # loops (opd_train / rl_train), which check termination before requesting an env_reply for the
-    # same reason: this command exists to catch a contract break before a paid run does, and it can
-    # only do that while it scores the state the run would score.
-    #
-    # env_step_pending is False once the last generated turn has already been through env_reply (an
-    # env that replied with nothing, a natural finish) -- stepping again there would be a spurious
-    # extra move. rollout_done covers the env having declared the episode over.
     if env_step_pending and not env.rollout_done(state, hard_cap):
         # apply the final action's side effects, but do not validate its reply as a future prompt:
         # no later model generation consumes it in the online path.
@@ -625,7 +611,7 @@ def _check_grader(env, algorithm: str, tally: _Tally) -> bool:
     Returns whether the grader was shown to recognize its own reference answers. Blocks only when
     every gold answer scores zero and deliberate junk scores at least as well; centered rewards may
     legitimately score gold at zero, and partial failures remain warnings. The gate applies only to
-    grpo, which trains from env.reward -- sft and opd use other losses.
+    grpo, which trains from env.reward -- sft use other losses.
     """
     # the blocking gate's own condition, unchanged: every episode the gate can hold responsible
     # scored zero. deliberately NOT widened with "and no other episode scored anything" -- an echo
@@ -663,7 +649,7 @@ def _check_grader(env, algorithm: str, tally: _Tally) -> bool:
     #
     # what the extra spend would buy is `separates`, and `separates` only ever suppresses a WARNING.
     # so it is worth a paid call exactly when the answer could change what this command prints AND
-    # the run is one whose reward drives training. for sft and opd the reward is not read at all
+    # the run is one whose reward drives training. for sft the reward is not read at all
     # (`_REWARD_DRIVEN_ALGORITHM`), so the warning's weaker wording is the honest output either way
     # and the judge is left alone. a healthy environment reaches neither probe under any algorithm
     # and is billed exactly what it was before this change (measured: 1 -> 1, sft and grpo).
@@ -679,7 +665,7 @@ def _check_grader(env, algorithm: str, tally: _Tally) -> bool:
     # a run whose accountable gold was never zero has nothing for the probe to compare against, and
     # driving it there bought an unusable number at the cost of an extra billed episode.
     #
-    # bounded by algorithm for the same reason as the per-turn probe above: for sft and opd its
+    # bounded by algorithm for the same reason as the per-turn probe above: for sft its
     # answer can only soften a warning about a reward those algorithms never read, which is not
     # worth an extra billed episode through user code.
     junk_reward = (
@@ -703,7 +689,7 @@ def _check_grader(env, algorithm: str, tally: _Tally) -> bool:
             "environment."
         )
         return False
-    # the blocking gate abstains far more often than it fires: for sft and opd, for a reference in
+    # the blocking gate abstains far more often than it fires: for sft, for a reference in
     # reasoning markup, for a replay that ran out mid-episode, for an echo run with no gold answer at
     # all, and whenever the junk probe raises. in every one of those a run that scored exactly zero
     # on every episode still printed `overall: PASS` and nothing else -- and a uniformly-zero reward

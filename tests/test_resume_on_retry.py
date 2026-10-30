@@ -23,7 +23,6 @@ import pytest
 
 import flash.engine.worker.io.heartbeat as worker_heartbeat
 import flash.engine.worker.io.hf as worker_hf
-import flash.engine.worker.train.opd.orchestration.failures as opd_failures
 import flash.engine.worker.train.rl.launch.checkpoints as rl_checkpoints
 import flash.runner.lifecycle.state as runner_state
 import flash.runner.supervise.recovery as attempt_recovery
@@ -391,7 +390,7 @@ def test_hf_resume_checkpoint_pinned_without_numeric_dir_raises(
 def _staged_checkpoint(root, step, *, world_size=None, fsdp_version=2, shards=0, nested=True):
     """build a downloaded ``checkpoint-N`` shaped like the one verl uploaded.
 
-    ``nested`` mirrors verl's two trainers: rl/opd put the shards under ``actor/``, while sft writes
+    ``nested`` mirrors verl's two trainers: rl put the shards under ``actor/``, while sft writes
     them straight into the step dir. a complete native checkpoint has one model, optimizer, and
     extra-state shard for every rank.
     """
@@ -911,60 +910,6 @@ def test_sft_resume_prefers_compatible_checkpoint_over_higher_incompatible_one(
     assert counts == {str(incompatible): 1, str(compatible): 1}
     assert (local_dir / "global_step_5" / "model.safetensors").exists()
     assert not (local_dir / "global_step_9").exists()
-
-
-def test_opd_discards_a_mismatched_checkpoint_with_its_accounting(
-    worker_context, monkeypatch, tmp_path
-):
-    """OPD returns the fresh-run answer rather than half-restoring the loop state.
-
-    The accounting in opd_state.json describes steps a discarded resume simply redoes, so the pair
-    has to move together; reading it back beside shards this attempt cannot load would be worse.
-    """
-
-    src = _staged_checkpoint(tmp_path, 2, world_size=4, shards=4)
-    (src / "opd_state.json").write_text(json.dumps({"unreadable": True}))
-    local_dir = tmp_path / "ckpt"
-    local_dir.mkdir()
-    monkeypatch.setattr(
-        worker_context, "config", replace(worker_context.config, opd_resume_revision="")
-    )
-    monkeypatch.setattr(worker_hf, "hf_resume_checkpoint", lambda context=None, **_k: str(src))
-
-    step, state = opd_failures._restore_verl_resume(
-        str(local_dir),
-        prompt_pool_fingerprint="a" * 64,
-        update_horizon=8,
-        world_size=1,
-        context=worker_context,
-    )
-
-    assert (step, state) == (0, None)
-    assert not (local_dir / "global_step_2").exists()
-
-
-def test_opd_pinned_revision_topology_mismatch_fails_closed(worker_context, monkeypatch, tmp_path):
-    """A pinned OPD_RESUME_REVISION means an optimizer step already crossed and the replacement
-    gate approved continuation from exactly that checkpoint; discarding it and restarting from
-    step 0 would repeat billed teacher work, so a world-size mismatch must raise, not restart."""
-
-    src = _staged_checkpoint(tmp_path, 2, world_size=4, shards=4)
-    local_dir = tmp_path / "ckpt"
-    local_dir.mkdir()
-    monkeypatch.setattr(
-        worker_context, "config", replace(worker_context.config, opd_resume_revision="pinned-sha")
-    )
-    monkeypatch.setattr(worker_hf, "hf_resume_checkpoint", lambda context=None, **_k: str(src))
-
-    with pytest.raises(RuntimeError, match=r"permanent OPD resume failure.*'pinned-sha'"):
-        opd_failures._restore_verl_resume(
-            str(local_dir),
-            prompt_pool_fingerprint="a" * 64,
-            update_horizon=8,
-            world_size=1,
-            context=worker_context,
-        )
-    assert not (local_dir / "global_step_2").exists()
 
 
 # ============================================================================================

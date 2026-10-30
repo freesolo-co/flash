@@ -485,7 +485,7 @@ def _validate_existing_config_projects(project_id: str) -> None:
     from flash.client import ClientError
     from flash.core.spec import require_project_id
 
-    for path in (Path("configs/sft.toml"), Path("configs/rl.toml"), Path("configs/opd.toml")):
+    for path in (Path("configs/sft.toml"), Path("configs/rl.toml")):
         if not path.exists():
             continue
         try:
@@ -505,7 +505,7 @@ def _validate_existing_config_projects(project_id: str) -> None:
 def _existing_reasoning(configs: tuple[Path, ...]) -> bool | None:
     """The `thinking` state the generated configs already agree on, or None if none exist.
 
-    Read every existing config so pre-#824 scaffolds with stale OPD settings are detected. Missing
+    Read every existing config so inconsistent reasoning settings are detected. Missing
     configs are not disagreements because they are about to be written.
     """
     from flash.client import ClientError
@@ -772,12 +772,7 @@ def cmd_env_setup(args) -> int:
 
     rl = Path("configs/rl.toml")
     sft = Path("configs/sft.toml")
-    opd = Path("configs/opd.toml")
-    # Legacy OPD configs also persist `thinking`, so include them when checking existing files and in
-    # the deletion guidance. Anchoring on a subset lets a user follow this warning literally, delete
-    # exactly what it names, and end up with the deleted configs rewritten one way and the unnamed one
-    # still holding the old setting -- the same silent cross-algorithm mismatch, just relocated.
-    reasoning_configs = (rl, opd, sft)
+    reasoning_configs = (rl, sft)
     reasoning = _resolve_reasoning_mode(args, reasoning_configs)
 
     can_publish = _plane_can_publish_environments(api_url)

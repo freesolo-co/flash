@@ -16,9 +16,6 @@ import sys
 
 from flash.cli.ui import render
 
-# the one algorithm that trains from the environment reward. sft optimizes a supervised loss and opd
-# a teacher token loss; neither reads `env.reward`, so a scorer they never call cannot be evidence
-# of anything for them.
 _REWARD_DRIVEN_ALGORITHM = "grpo"
 
 # the roles whose adjacency collapses into one rendered block. `tool` is deliberately absent: one
@@ -377,7 +374,7 @@ def _warn_on_uniformly_zero_rewards(
                 "shape it expects"
             )
         else:
-            # sft and opd never read `env.reward` (`_REWARD_DRIVEN_ALGORITHM`), so an all-zero
+            # sft never read `env.reward` (`_REWARD_DRIVEN_ALGORITHM`), so an all-zero
             # scorer is not a defect for THIS run and "check the reward function" is the wrong
             # instruction: a placeholder `reward()` on an sft-only environment is a deliberate,
             # correct choice, and telling its author to debug it sends them to fix working code.

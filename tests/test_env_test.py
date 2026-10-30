@@ -921,10 +921,7 @@ def test_env_test_still_blames_the_grader_for_a_replay_that_covers_the_episode(
 def test_env_test_does_not_apply_the_reward_gate_to_an_sft_environment(
     monkeypatch, tmp_path, capsys
 ):
-    """Skip the reward gate for SFT and OPD.
-
-    SFT uses supervised loss and OPD uses teacher-token loss, so a no-op scorer is valid.
-    """
+    """Skip the reward gate for SFT."""
     env_dir = _environment_dir(tmp_path)
     env = _SingleTurnEnv(rows=[{"input": "what is 2 + 2?", "output": "4"}], reward=0.0)
     _patch_loader(monkeypatch, env)
@@ -1204,7 +1201,7 @@ def test_env_test_does_not_bill_the_probes_for_a_non_reward_driven_algorithm(
     """The advisory warning must not spend a paid judge on an algorithm that ignores the reward.
 
     Both probes exist to decide whether the grader separates, and separation only ever SUPPRESSES
-    the warning. For sft and opd the reward is never read during training, so the answer cannot
+    the warning. For sft the reward is never read during training, so the answer cannot
     change the verdict -- but `_separates_on_turn_rewards` calls the env's own `score_episodes` and
     the junk probe drives a whole extra episode, so an unbounded rule billed the same judge three
     times for an all-zero sft run where `dev` billed it once.
@@ -1417,7 +1414,7 @@ def test_env_test_multi_turn_replays_text_free_turn_positionally(monkeypatch, tm
 
 def test_env_test_steps_the_env_on_the_final_turn_before_scoring(monkeypatch, tmp_path, capsys):
     # the worker applies the last assistant turn before scoring (see the turn loops in
-    # opd_train / rl_train). without the same close-out here the command scores a
+    # rl_train). without the same close-out here the command scores a
     # board missing the model's last move, so it disagrees with the paid run it exists to predict:
     # a passing env can look unrankable, and a final step that raises goes unseen until training.
     env_dir = _environment_dir(tmp_path)
@@ -2632,7 +2629,7 @@ def test_env_test_warns_when_every_episode_scores_zero_under_sft(monkeypatch, tm
     """The blocking gate is grpo-only, so an all-zero sft run printed PASS and nothing else.
 
     This is the shape that reaches paid GPUs: one published environment serves all three
-    algorithms, and an `output` shape that only the SFT rows satisfy leaves every GRPO/OPD rollout
+    algorithms, and an `output` shape that only the SFT rows satisfy leaves every GRPO rollout
     scoring 0.0. The warning's job here is to stop this run being read as clearance to train GRPO
     later - NOT to claim the sft run itself is broken. SFT never reads `env.reward`, so an all-zero
     scorer costs this run nothing, and a placeholder `reward()` on an sft-only environment is a

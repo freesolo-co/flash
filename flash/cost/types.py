@@ -29,22 +29,17 @@ class RunConfig:
     """One training run to price. ``None`` knobs resolve to recipe defaults."""
 
     model_id: str
-    method: str  # "sft" | "grpo" | "opd"
+    method: str  # "sft" | "grpo"
     steps: int
 
     # Engine context length (forwarded as [train].max_context_tokens, NOT prompt length). When unset the
     # GRPO default mirrors the worker's max(1024, max_prompt_len + completion); see normalized().
     seq_len: int | None = None
-    completion_len: int | None = None  # GRPO/OPD only (max_completion_tokens)
+    completion_len: int | None = None  # GRPO only (max_completion_tokens)
     batch_size: int | None = None  # SFT effective batch / GRPO prompts_per_step
     group_size: int | None = None  # GRPO completions per prompt (G)
     lora_rank: int | None = None
     thinking: bool = False
-    # opd only: the canonical friendly teacher alias from [train].teacher_model.
-    # prices the teacher-api estimate; an empty value resolves to the default glm 5.2 teacher (an
-    # omitted [train].teacher_model).
-    teacher_model: str = ""
-
     max_wall_seconds: int | None = None  # wall cap (spec gpu.max_wall_seconds); None = 24h
     provider: str = "auto"
     environment: str | None = None  # Freesolo environment id; descriptive only
@@ -63,14 +58,6 @@ class RunConfig:
     supervised_train_tokens: int | None = None
     sft_packing_mode: str = ""
     sft_packed_blocks: int | None = None
-    opd_multi_turn: bool = False
-    opd_max_turns: int | None = None
-    # rows the trainer iterates (profile `retained_examples`), which is what verl's sampler shards.
-    # NOT derivable from sft_packed_blocks: that is ceil(rows / examples_per_update), so a packed
-    # profile with 10 rows and a batch of 8 reports 2 blocks and reconstructs as 16.
-    # APPENDED, not slotted beside the other sft fields: this class keeps a positional constructor
-    # (see `test_runconfig_preserves_old_positional_constructor`), so inserting here would shift
-    # every later field and silently rebind an old caller's opd flag to this one.
     sft_retained_examples: int | None = None
     # appended for the same positional-constructor reason as sft_retained_examples above.
     providers: tuple[str, ...] = ()
@@ -170,12 +157,6 @@ class RunConfig:
                 raise ValueError(
                     f"sft_retained_examples must be >= 1, got {self.sft_retained_examples}"
                 )
-        if not isinstance(self.opd_multi_turn, bool):
-            raise TypeError("opd_multi_turn must be a boolean")
-        if self.opd_max_turns is not None and (
-            isinstance(self.opd_max_turns, bool) or not isinstance(self.opd_max_turns, int)
-        ):
-            raise TypeError("opd_max_turns must be an integer")
         save_at_steps = parse_positive_int_tuple(self.save_at_steps, name="save_at_steps")
         if save_at_steps and save_at_steps[-1] > self.steps:
             raise ValueError("save_at_steps cannot exceed steps")
@@ -186,10 +167,6 @@ class RunConfig:
         return self.method == "grpo"
 
     @property
-    def is_opd(self) -> bool:
-        return self.method == "opd"
-
-    @property
     def has_rollout(self) -> bool:
         """True when a step samples on-policy student completions."""
         return samples_on_policy(self.method)
@@ -198,8 +175,7 @@ class RunConfig:
         """A copy with every ``None`` knob filled from the recipe for this method."""
         lora = self.lora_rank if self.lora_rank is not None else RECIPE.lora.rank
         if self.has_rollout:
-            # rollout algorithms use either the opd-style single-rollout recipe or grpo's group recipe.
-            rc = RECIPE.opd if self.is_opd else RECIPE.rl
+            rc = RECIPE.rl
             comp = self.completion_len
             if comp is None:
                 comp = rc.max_completion_len_thinking if self.thinking else rc.max_completion_len
@@ -256,8 +232,7 @@ class RunConfig:
 class CostEstimate:
     """report a pre-flight estimate.
 
-    ``total_usd`` bills training gpu hours only. setup is elapsed but unbilled; opd teacher api cost is
-    itemized separately because it uses the platform-managed key.
+    ``total_usd`` bills training GPU hours only. Setup is elapsed but unbilled.
     """
 
     model_id: str
@@ -268,7 +243,7 @@ class CostEstimate:
     gpu_vram_gb: int
     required_vram_gb: int
     gpu_hourly_usd: float
-    setup_seconds: float  # cold start: boot + deps + model load (+ vllm init for grpo/opd)
+    setup_seconds: float  # cold start: boot + deps + model load (+ vllm init for grpo)
     seconds_per_step: float
     train_seconds: float  # steps * seconds_per_step (post wall-clock cap)
     wall_clock_seconds: float
@@ -276,11 +251,6 @@ class CostEstimate:
     total_usd: float
     # cards the job occupies; total_usd already reflects n-card billing. 1 = single-gpu quote.
     gpu_count: int = 1
-    # opd only: external parasail teacher token spend (0.0 for sft/grpo). billed by parasail
-    # to the platform-managed teacher key (users don't supply one), tracked separately from the
-    # platform-billed gpu charge, so it is not part of total_usd and is shown as its own itemized
-    # diagnostic line only.
-    teacher_api_usd: float = 0.0
     notes: tuple[str, ...] = ()
     # ranks that actually JOIN the run, which a small batch can bound below the billed gpu_count
     # (``analytical.executed_gpu_count``). The fit gate values a shape at this width, not the
@@ -341,11 +311,6 @@ class CostEstimate:
             f"Wall clock : {self.wall_clock_hours:.2f} h",
             f"Billable   : {self.billable_hours:.2f} h (training only)",
         ]
-        if self.teacher_api_usd > 0:
-            lines.append(
-                f"Teacher API: ${self.teacher_api_usd:.2f} (Parasail teacher token spend on the "
-                "platform-managed teacher key — tracked separately, NOT included in TOTAL)"
-            )
         lines.append(f"TOTAL      : {format_usd(self.total_usd)}")
         if self.notes:
             lines.append("Notes      :")

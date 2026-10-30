@@ -58,7 +58,7 @@ KNOWN = tuple(GPU_INFO)
 VALIDATED = tuple(g.name for g in GPU_CLASSES if g.validated)
 
 # fp8 KV cache is an Ada/Hopper/Blackwell feature; the training workers enable it exactly when the
-# device compute capability is >= (8, 9) (see engine/worker/rl_train.py and opd_train.py). Sizing has
+# device compute capability is >= (8, 9) (see engine/worker/rl_train.py_train.py). Sizing has
 # no live device, so it infers fp8 support from a candidate class's ``sm`` string.
 _FP8_KV_MIN_CAPABILITY = (8, 9)
 
@@ -227,14 +227,14 @@ def run_config_for_ranking(
         """Prompts a rollout step really trains on: the authored batch, capped by the pool.
 
         Both workers retain at most ``max_examples`` rows and then clamp the batch to what is left
-        (`resolve_grpo_prompts_per_step`, and opd's `min(knobs.prompts_per_step, len(prompts))`), so
+        (`resolve_grpo_prompts_per_step`,'s `min(knobs.prompts_per_step, len(prompts))`), so
         an authored 128 against `max_examples = 2` trains on 2. Ranking the raw 128 would size
         hardware for a step that cannot happen. `flash.cost.spec._on_policy_prompts_per_step` already
         takes this same minimum, so skipping it here left ranking and the persisted quote disagreeing.
 
         The recipe default is resolved BEFORE the minimum, because the workers clamp it too: they
         cap whatever the batch resolved to, authored or defaulted. Returning None for an unauthored
-        batch would let `normalized()` fill 64 (grpo) or 8 (opd) uncapped, so a run whose whole pool
+        batch would let `normalized()` fill 64 (grpo) uncapped, so a run whose whole pool
         is 2 rows would still rank for 64.
         """
         from flash.engine.plan.recipe import RECIPE
@@ -243,7 +243,7 @@ def run_config_for_ranking(
         retained = knob("max_examples")
         if retained is None:
             return authored
-        recipe = RECIPE.opd if algorithm == "opd" else RECIPE.rl
+        recipe = RECIPE.rl
         return min(authored if authored is not None else int(recipe.prompts_per_step), retained)
 
     fields = {
@@ -253,7 +253,7 @@ def run_config_for_ranking(
         "seq_len": knob("max_context_tokens"),
         "completion_len": knob("max_completion_tokens"),
         # RunConfig.batch_size is "examples per optimizer update", which each algorithm authors
-        # under a different key: sft as `batch_size`, grpo/opd as `prompts_per_step` (the schema
+        # under a different key: sft as `batch_size`, grpo as `prompts_per_step` (the schema
         # rejects `batch_size` outright for them). Reading only the sft name left every authored
         # rollout batch as None here, so ranking priced the recipe default -- 64 against an
         # authored 32 -- and could select a costlier shape than the run actually needs.
@@ -588,7 +588,7 @@ def rentable_gpu_counts(max_gpu_count: int) -> tuple[int, ...]:
     """Return rentable card counts, largest first, up to ``max_gpu_count``.
 
     Use powers of two: providers sell those shapes, and vLLM requires ``num_attention_heads %
-    tp_size == 0`` wherever the rollout engine runs tensor-parallel (grpo and opd hand it the rented
+    tp_size == 0`` wherever the rollout engine runs tensor-parallel (grpo hand it the rented
     card count; sft has no rollout engine, and its width is bounded by the batch instead -- see
     ``sft_data_parallel_cards``). Every current catalog head count (8, 8, 16, 16, 24, 16) divides 1,
     2, 4, and 8, so today every rentable shape is legal for every row. That is a property of today's

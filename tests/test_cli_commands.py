@@ -855,16 +855,6 @@ def test_env_setup_does_not_let_an_unreadable_env_override_the_turn_flag(
     assert multi_turn is True  # the flag decides, because the anchor could not be read
 
 
-def test_env_setup_omits_retired_opd_on_hosted_and_self_hosted_planes(monkeypatch, tmp_path):
-    for name, url in (
-        ("hosted", "https://flash.freesolo.co"),
-        ("own", "https://plane.example.test"),
-    ):
-        written = _scaffold(monkeypatch, tmp_path / name, url)
-        assert "opd.toml" not in written
-        assert not (tmp_path / name / "configs/opd.toml").exists()
-
-
 def test_env_setup_caveats_that_a_github_id_needs_a_standalone_plane(monkeypatch, tmp_path) -> None:
     """The scaffolded github: id is rejected by an identity-backed self-hosted plane.
 
@@ -2530,37 +2520,20 @@ def test_existing_reasoning_ignores_thinking_text_in_comments(tmp_path) -> None:
     assert env_setup._existing_reasoning((sft, rl)) is False
 
 
-def test_env_setup_preserves_existing_legacy_opd_config(monkeypatch, tmp_path) -> None:
-    monkeypatch.chdir(tmp_path)
-    project = ["--project", "11111111-1111-4111-8111-111111111111"]
-    assert _run(["env", "setup", *project]) == 0
-    legacy = tmp_path / "configs/opd.toml"
-    content = (
-        'project = "11111111-1111-4111-8111-111111111111"\n'
-        'model = "Qwen/Qwen3.5-9B"\nalgorithm = "opd"\n# user-owned legacy config\n'
-    )
-    legacy.write_text(content)
-    assert _run(["env", "setup", *project]) == 0
-    assert legacy.read_text() == content
-
-
 def test_env_setup_refuses_a_scaffold_whose_configs_disagree_about_reasoning(
     monkeypatch, tmp_path, capsys
 ) -> None:
     """Anchoring on the first config found accepts a project whose configs contradict each other.
 
-    This is the exact shape a scaffold from before #824 has: that release wrote `thinking` into rl
-    and sft but never into opd. `configs/rl.toml` is visited first, reports reasoning, and the stale
-    opd config is neither reported nor rewritten -- configs are only written when absent, so the
-    rerun leaves the project training GRPO with reasoning and OPD without it, silently.
+    The GRPO config enables reasoning while the SFT config does not.
 
     There is no anchor to pick here: either side leaves a mismatch, so setup has to refuse.
     """
     monkeypatch.chdir(tmp_path)
     project = ["--project", "11111111-1111-4111-8111-111111111111"]
     assert _run(["env", "setup", *project, "--reasoning"]) == 0
-    (tmp_path / "configs/opd.toml").write_text(
-        'project = "11111111-1111-4111-8111-111111111111"\nmodel = "Qwen/Qwen3.5-9B"\nalgorithm = "opd"\n'
+    (tmp_path / "configs/sft.toml").write_text(
+        'project = "11111111-1111-4111-8111-111111111111"\nmodel = "Qwen/Qwen3.5-9B"\nalgorithm = "sft"\n'
     )
     capsys.readouterr()
 
@@ -2571,14 +2544,13 @@ def test_env_setup_refuses_a_scaffold_whose_configs_disagree_about_reasoning(
     # the message has to name which side is which, or the user cannot tell what state they are in.
     assert "configs/rl.toml" in err, err
     assert "configs/sft.toml" in err, err
-    assert "configs/opd.toml" in err, err
     # and it must name every config to delete, so following it literally cannot leave one behind.
     named = {w.strip(" ,.`") for w in err.split() if w.startswith("configs/")}
-    assert named == {"configs/rl.toml", "configs/sft.toml", "configs/opd.toml"}, err
+    assert named == {"configs/rl.toml", "configs/sft.toml"}, err
 
     # refusing must not have half-written anything: the disagreeing scaffold is left exactly as it
     # was, so the user's own files are still theirs to inspect before deleting.
-    assert "thinking" not in tomllib.loads((tmp_path / "configs/opd.toml").read_text())
+    assert "thinking" not in tomllib.loads((tmp_path / "configs/sft.toml").read_text())
     assert tomllib.loads((tmp_path / "configs/rl.toml").read_text())["thinking"] is True
 
 
@@ -2591,8 +2563,8 @@ def test_env_setup_refusal_is_not_dodged_by_an_explicit_reasoning_flag(
     monkeypatch.chdir(tmp_path)
     project = ["--project", "11111111-1111-4111-8111-111111111111"]
     assert _run(["env", "setup", *project, "--reasoning"]) == 0
-    (tmp_path / "configs/opd.toml").write_text(
-        'project = "11111111-1111-4111-8111-111111111111"\nmodel = "Qwen/Qwen3.5-9B"\nalgorithm = "opd"\n'
+    (tmp_path / "configs/sft.toml").write_text(
+        'project = "11111111-1111-4111-8111-111111111111"\nmodel = "Qwen/Qwen3.5-9B"\nalgorithm = "sft"\n'
     )
     capsys.readouterr()
 

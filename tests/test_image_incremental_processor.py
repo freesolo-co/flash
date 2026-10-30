@@ -505,7 +505,6 @@ def test_real_processor_preserves_dynamic_reply_pixels_and_media_identity(real_p
         EnvGlueProcessor,
         parent_image_digests,
     )
-    from flash.engine.worker.train.opd.child.multiturn import _validate_opd_reply_media
     from flash.engine.worker.train.rl.child.multiturn import _validate_grpo_reply_media
 
     class _ProcessorProbe:
@@ -568,7 +567,6 @@ def test_real_processor_preserves_dynamic_reply_pixels_and_media_identity(real_p
 
         prompt = SimpleNamespace(image_digests=[])
         step = {"image_count": 1, "image_digests": expected_digests}
-        _validate_opd_reply_media(prompt, result, step)
         _validate_grpo_reply_media(prompt, result, step)
         assert result.images[0].getpixel((7, 11))
     finally:

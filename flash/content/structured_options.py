@@ -115,11 +115,6 @@ def _compact_json_grammar(schema: str) -> str:
         has_xgrammar_unsupported_json_features,
     )
 
-    # Lowering JSON to EBNF bypasses vLLM's backend selection. Use the installed
-    # version's feature check before doing so, including in OPD mask replay.
-    # Falling back to JSON here would silently discard the compact option again.
-    # check each actual schema node separately: the backend's recursive scan also
-    # visits literal data in defaults, enums and constants as if it were a schema.
     if any(
         has_xgrammar_unsupported_json_features(_node_features(node))
         for node in _schema_nodes(json.loads(schema))

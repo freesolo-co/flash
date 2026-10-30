@@ -347,9 +347,6 @@ def _offline(monkeypatch):
 
     for _key in {
         "FREESOLO_API_KEY",
-        "PARASAIL_API_KEY",
-        "FLASH_PUBLIC_URL",
-        "FLASH_TEACHER_CAPABILITY",
         "FLASH_STANDALONE",
         "FLASH_HF_NAMESPACE",
     } | set(DEFAULT_RUNTIME_SECRET_KEYS):

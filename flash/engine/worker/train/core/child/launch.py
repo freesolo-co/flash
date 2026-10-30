@@ -1,4 +1,4 @@
-"""explicit, packaged startup shared by SFT, GRPO, and OPD entrypoints."""
+"""explicit, packaged startup shared by SFT and GRPO entrypoints."""
 
 import argparse
 import json
@@ -56,11 +56,9 @@ def configure(options, overrides):
             config.trainer.use_v1 = True
             config.trainer.v1.trainer_mode = "sync"
             config.transfer_queue.enable = True
-            module = "rl" if options.algorithm == "grpo" else "opd"
-            name = "FlashGrpoManager" if module == "rl" else "FlashOpdManager"
             agent = config.actor_rollout_ref.rollout.agent
             agent.agent_loop_manager_class = (
-                f"flash.engine.worker.train.{module}.child.rollout.{name}"
+                "flash.engine.worker.train.rl.child.rollout.FlashGrpoManager"
             )
             agent.agent_loop_config_path = str(Path(__file__).with_name("agents.yaml"))
             if options.algorithm == "grpo" and agent.default_agent_loop == "single_turn_agent":
@@ -74,10 +72,6 @@ def configure(options, overrides):
 
 def run(algorithm, argv=None):
     options, overrides = load_launch(algorithm, argv)
-    if algorithm == "opd" and options.structured_outputs:
-        from flash.engine.worker.train.opd.child.policy import _require_structured_runtime_versions
-
-        _require_structured_runtime_versions()
     validate_environment()
     initialize_process(options.seed if algorithm == "sft" else None)
     config = configure(options, overrides)

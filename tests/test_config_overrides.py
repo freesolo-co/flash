@@ -67,7 +67,7 @@ def test_authored_train_keys_follow_composed_config() -> None:
 
     with tempfile.TemporaryDirectory() as tmp:
         base = _write(tmp, "base.toml", BASE)
-        # BASE is grpo, so the composed key has to be one grpo accepts: teacher_model is opd-only
+        # BASE is grpo, so the composed key has to be one grpo accepts.
         # and is now rejected by the parser, which would fail before key tracking is exercised.
         extra = _write(tmp, "extra.toml", "[train]\nthinking_length_penalty_coef = 0.8\n")
         spec, keys = spec_and_train_keys_from_file(

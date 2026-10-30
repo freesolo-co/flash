@@ -4,7 +4,7 @@ import time
 
 from verl.trainer.ppo.v1.replay_buffer import ReplayBuffer
 
-from flash.engine.worker.train.opd.child.replay_guard import (
+from flash.engine.worker.train.core.child.replay_guard import (
     _ACTOR_PROBE_SECONDS,
     _REPLAY_POLL_SECONDS,
     _REPLAY_STALL_SECONDS,

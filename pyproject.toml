@@ -30,13 +30,11 @@ gpu = [
     "torch==2.10.0",
     "transformers>=5.8,<5.13",
     "tokenizers>=0.22",
-    "tiktoken>=0.12",
-    "httpx>=0.27",  # client-lived managed teacher connection pool
+    "httpx>=0.27",
     "peft>=0.19",
     "vllm==0.19.1",
     "accelerate>=1.4",
-    # resolve_verl_python shells out to `uv` to provision the isolated verl interpreter whenever
-    # FLASH_VERL_PYTHON is unset. sft and opd are verl-only, so that call is unconditional here.
+    # resolve_verl_python uses uv when FLASH_VERL_PYTHON is not supplied.
     "uv>=0.5",
     # Worker runtime: Freesolo environment loading and HF checkpoint I/O.
     "datasets>=2.19",
@@ -74,11 +72,7 @@ server = [
     "transformers>=5.8,<5.13",
     # Tokenizer chat templates are rendered during control-plane workload profiling.
     "jinja2>=3.1.0",
-    # the control plane decodes images: flash/server/routes/runs.py imports
-    # preflight_validate_image_opd at module load, and flash/content/multimodal.py opens every image
-    # source with PIL to validate it. without Pillow a self-hoster on [server] gets
-    # `RuntimeError: Pillow is required for multimodal image training` at preflight on any
-    # multimodal opd run. the gpu extra gets Pillow transitively via vllm; server does not.
+    # Shared multimodal workload profiling decodes and validates images.
     "pillow>=11.0.0",
 ]
 # The serving app (flash/serving/) that runs inside the GPU container. Kept out of `server` because
@@ -165,8 +159,7 @@ dev = [
     "freesolo>=0.4.2",
     "transformers>=5.8,<5.13",
     "tokenizers>=0.22",
-    "tiktoken>=0.12",
-    "httpx>=0.27",  # client-lived managed teacher connection pool
+    "httpx>=0.27",
     # flash/content/multimodal.py imports PIL directly to validate and decode every image source, so the
     # image tests are not optional coverage: without Pillow they importorskip and CI reports green
     # on a multimodal path it never executed. the control plane decodes images too, so `server`
@@ -249,8 +242,7 @@ dev = [
     "datasets>=2.19",
     "freesolo>=0.4.2",
     "tokenizers>=0.22",
-    "tiktoken>=0.12",
-    "httpx>=0.27",  # client-lived managed teacher connection pool
+    "httpx>=0.27",
     # flash/content/multimodal.py imports PIL directly to validate and decode every image source, so the
     # image tests are not optional coverage: without Pillow they importorskip and CI reports green
     # on a multimodal path it never executed. the control plane decodes images too, so `server`

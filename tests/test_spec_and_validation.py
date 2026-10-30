@@ -166,7 +166,6 @@ def test_train_key_registry_is_derived_from_trainspec_metadata() -> None:
     assert "hf_repo" not in TRAIN_KEY_MIN_VERSIONS
     assert TRAIN_KEY_MIN_VERSIONS["max_context_tokens"] == "0.2.49"
     assert TRAIN_KEY_MIN_VERSIONS["max_completion_tokens"] == "0.2.49"
-    assert TRAIN_KEY_MIN_VERSIONS["teacher_model"] == "0.2.56"
     assert TRAIN_KEY_MIN_VERSIONS["structured_outputs"] == "0.2.56"
     assert TRAIN_KEY_MIN_VERSIONS["save_at_steps"] == "0.2.57"
     assert TRAIN_KEY_MIN_VERSIONS["credit_assignment"] == "1.0.2"
@@ -178,8 +177,6 @@ def test_train_key_registry_is_derived_from_trainspec_metadata() -> None:
     assert TRAIN_KEY_MIN_VERSIONS["prompts_per_step"] == "1.1.43"
     assert TRAIN_KEY_MIN_VERSIONS["batch_size"] == "0.2.0"
     assert TRAIN_KEY_MIN_VERSIONS["mask_truncated_completions"] == "1.3.33"
-    # opd has no auxiliary eos loss or user-facing eos-loss key.
-    assert "opd_eos_loss_coef" not in TRAIN_KEY_MIN_VERSIONS
     assert {
         value
         for key, value in TRAIN_KEY_MIN_VERSIONS.items()
@@ -187,7 +184,6 @@ def test_train_key_registry_is_derived_from_trainspec_metadata() -> None:
         not in {
             "max_context_tokens",
             "max_completion_tokens",
-            "teacher_model",
             "structured_outputs",
             "save_at_steps",
             "credit_assignment",
@@ -295,69 +291,12 @@ def test_train_key_validator_rejects_unknown_names_only() -> None:
     assert "allowed:" in message
 
 
-def test_historical_train_schema_shapes_are_immutable_source_snapshots() -> None:
-    established = frozenset(
-        {
-            "advantage_clip",
-            "batch_size",
-            "epochs",
-            "group_size",
-            "hf_repo",
-            "init_from_adapter",
-            "kl_penalty_coef",
-            "learning_rate",
-            "lora_alpha",
-            "lora_rank",
-            "max_completion_tokens",
-            "max_context_tokens",
-            "max_examples",
-            "max_steps",
-            "opd_eos_loss_coef",
-            "save_every",
-            "stop_sequences",
-            "temperature",
-            "thinking_length_penalty_coef",
-        }
-    )
-    historical_shapes = {
-        "20c4452c": established,
-        "699a8aab": established | {"structured_outputs"},
-        "861571e7": established | {"structured_outputs", "teacher_model"},
-    }
-    baseline = {"epochs", "hf_repo", "max_examples"}
-
-    # historical snapshots remain exact to their commits, including fields now managed or removed.
-    # current adds save_at_steps, credit_assignment and prompts_per_step; opd eos
-    # is removed. lora_alpha is in both: authorable then, managed in between, a user knob again now.
-    # prompts_per_step is current-only: the rl half of the optimizer-batch split, which those
-    # snapshots predate because back then batch_size still carried both meanings.
-    assert historical_shapes["861571e7"] - {
-        "opd_eos_loss_coef",
-        "hf_repo",
-        "advantage_clip",
-    } == TRAIN_SCHEMA_KEYS - {
-        "credit_assignment",
-        "save_at_steps",
-        "prompts_per_step",
-        "mask_truncated_completions",
-    }
-    assert "opd_eos_loss_coef" not in TRAIN_SCHEMA_KEYS
-    assert "advantage_clip" not in TRAIN_SCHEMA_KEYS
-    assert all(baseline <= shape for shape in historical_shapes.values())
-    for key in ("structured_outputs", "teacher_model"):
-        rejected_by = {commit for commit, shape in historical_shapes.items() if key not in shape}
-        assert rejected_by == {
-            "20c4452c",
-            *({"699a8aab"} if key == "teacher_model" else set()),
-        }
-
-
-@pytest.mark.parametrize("algorithm", ["sft", "grpo", "opd"])
+@pytest.mark.parametrize("algorithm", ["sft", "grpo"])
 def test_init_from_adapter_parses_for_every_target_algorithm(algorithm) -> None:
     """Warm start is target-algorithm agnostic: every algorithm may continue an adapter.
 
     SFT used to be rejected here. The restriction described the retired trl SFT backend; the verl
-    backend loads a warm-start adapter exactly like GRPO and OPD do, so all nine source/target
+    backend loads a warm-start adapter exactly like GRPO do, so all four source/target
     combinations parse.
     """
     raw = _raw(algorithm=algorithm, **{"train.init_from_adapter": "source-run/final"})
@@ -698,7 +637,7 @@ def test_lora_rank_must_fit_default_serving_cap() -> None:
         spec_from_dict(_raw(**{"train.lora_rank": 129}))
 
 
-@pytest.mark.parametrize("algorithm", ["sft", "grpo", "opd"])
+@pytest.mark.parametrize("algorithm", ["sft", "grpo"])
 def test_qwen38_training_rank_must_fit_the_approved_serving_cap(algorithm: str) -> None:
     from flash.core.catalog import serving_lora_rank_cap
 
@@ -791,19 +730,14 @@ def test_env_ref_validator_matches_adapter_acceptor() -> None:
 # consume used to parse clean and do nothing. (algorithm, knob, value) pairs that must be rejected.
 _INAPPLICABLE_CASES = [
     ("sft", "mask_truncated_completions", False),
-    ("opd", "mask_truncated_completions", True),
     ("sft", "group_size", 8),
     ("sft", "temperature", 0.7),
     ("sft", "max_completion_tokens", 512),
     ("sft", "kl_penalty_coef", 0.5),
     ("sft", "thinking_length_penalty_coef", 0.1),
-    ("sft", "teacher_model", "glm-5.3"),
     ("sft", "credit_assignment", "per_turn"),
     ("sft", "stop_sequences", ["END"]),
     ("sft", "structured_outputs", '{"type": "object"}'),
-    ("opd", "thinking_length_penalty_coef", 0.1),
-    ("opd", "credit_assignment", "per_turn"),
-    ("grpo", "teacher_model", "glm-5.3"),
 ]
 
 # the same knobs on an algorithm whose worker DOES read them. without this direction a validator
@@ -812,20 +746,13 @@ _APPLICABLE_CASES = [
     ("grpo", "mask_truncated_completions", False),
     ("grpo", "mask_truncated_completions", True),
     ("grpo", "group_size", 8),
-    ("opd", "group_size", 2),
     ("grpo", "temperature", 0.7),
-    ("opd", "temperature", 0.7),
     ("grpo", "max_completion_tokens", 512),
-    ("opd", "max_completion_tokens", 512),
     ("grpo", "kl_penalty_coef", 0.5),
-    ("opd", "kl_penalty_coef", 0.5),
     ("grpo", "stop_sequences", ["END"]),
-    ("opd", "stop_sequences", ["END"]),
     ("grpo", "structured_outputs", '{"type": "object"}'),
-    ("opd", "structured_outputs", '{"type": "object"}'),
     ("grpo", "thinking_length_penalty_coef", 0.1),
     ("grpo", "credit_assignment", "per_turn"),
-    ("opd", "teacher_model", "glm-5.3"),
 ]
 
 
@@ -844,7 +771,7 @@ def test_train_knob_accepted_by_algorithms_that_consume_it(algorithm, knob, valu
     assert spec_from_dict(raw).algorithm == algorithm
 
 
-@pytest.mark.parametrize("algorithm", ["sft", "grpo", "opd"])
+@pytest.mark.parametrize("algorithm", ["sft", "grpo"])
 def test_full_public_dict_round_trips_despite_knob_scoping(algorithm) -> None:
     """Round-trip every serialized TrainSpec field through algorithm scoping.
 
@@ -1106,25 +1033,6 @@ def test_environment_subfields_reject_wrong_types() -> None:
         "secrets": ["HF_TOKEN"],
     }
     with pytest.raises(ConfigError, match=r"platform-managed"):
-        spec_from_dict(raw)
-
-
-@pytest.mark.parametrize(
-    "key",
-    [
-        "PARASAIL_API_KEY",
-        "FLASH_PUBLIC_URL",
-        "FLASH_TEACHER_CAPABILITY",
-    ],
-)
-def test_environment_cannot_declare_managed_teacher_transport_or_credentials(key) -> None:
-    raw = _raw()
-    raw["environment"] = {
-        "id": "github:freesolo-co/envs@main:gsm8k/environment.py",
-        "secrets": [key],
-    }
-
-    with pytest.raises(ConfigError, match="platform-managed"):
         spec_from_dict(raw)
 
 
@@ -1750,7 +1658,7 @@ def test_forced_model_revision_rejects_a_mismatched_hub_resolution(monkeypatch, 
         _resolve_model_revision(forced, required=True)
 
 
-@pytest.mark.parametrize("algorithm", ["grpo", "opd"])
+@pytest.mark.parametrize("algorithm", ["grpo"])
 def test_forced_model_revision_verifies_for_rollout_algorithms(monkeypatch, algorithm) -> None:
     from flash.runner.lifecycle.preparation import _resolve_model_revision
 
@@ -1782,7 +1690,7 @@ def test_forced_model_revision_verifies_for_rollout_algorithms(monkeypatch, algo
     assert resolved.model_revision_force_pin is False
 
 
-@pytest.mark.parametrize("algorithm", ["sft", "grpo", "opd"])
+@pytest.mark.parametrize("algorithm", ["sft", "grpo"])
 def test_qwen38_catalog_revision_is_forced_and_verified(monkeypatch, algorithm) -> None:
     from flash.runner.lifecycle.preparation import _resolve_model_revision
 
@@ -1951,7 +1859,7 @@ def test_programmatic_sft_submit_fails_closed_without_a_profilable_environment(
         runner_status.get_status(spec.run_id)
 
 
-@pytest.mark.parametrize("algorithm", ["sft", "grpo", "opd"])
+@pytest.mark.parametrize("algorithm", ["sft", "grpo"])
 def test_adapter_continuation_preparation_is_target_algorithm_agnostic(
     tmp_path, monkeypatch, algorithm
 ) -> None:
@@ -2211,7 +2119,7 @@ def test_gpu_count_of_reads_spec_and_defaults() -> None:
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("algorithm", ["grpo", "opd"])
+@pytest.mark.parametrize("algorithm", ["grpo"])
 def test_persisted_rl_batch_size_is_rejected_and_names_the_right_key(algorithm) -> None:
     record = JobSpec(algorithm=algorithm).to_internal_dict()
     record["train"]["batch_size"] = 16
@@ -2228,11 +2136,11 @@ def test_persisted_rl_batch_size_is_rejected_and_names_the_right_key(algorithm) 
 def test_sft_batch_size_is_rejected_on_rl_and_names_the_right_key() -> None:
     """The trap this split exists to close.
 
-    `batch_size = 1` is the standard sft out-of-memory workaround. Copied into a grpo/opd config it
+    `batch_size = 1` is the standard sft out-of-memory workaround. Copied into a grpo config it
     used to parse and silently mean one prompt per optimizer update -- the run trained, logged and
     billed, and nothing errored. It must now fail at parse and say which key to use instead.
     """
-    for algorithm in ("grpo", "opd"):
+    for algorithm in ("grpo",):
         with pytest.raises(ConfigError) as excinfo:
             spec_from_dict(_raw(algorithm=algorithm, **{"train.batch_size": 1}))
 
@@ -2253,7 +2161,7 @@ def test_rl_prompts_per_step_is_rejected_on_sft_and_names_the_right_key() -> Non
 def test_each_algorithm_still_accepts_its_own_optimizer_batch_key() -> None:
     """The rejection is per-algorithm, not a blanket ban on either name."""
     assert spec_from_dict(_raw(algorithm="sft", **{"train.batch_size": 4})).train.batch_size == 4
-    for algorithm in ("grpo", "opd"):
+    for algorithm in ("grpo",):
         spec = spec_from_dict(_raw(algorithm=algorithm, **{"train.prompts_per_step": 16}))
         assert spec.train.prompts_per_step == 16
         assert spec.train.batch_size is None
@@ -2261,7 +2169,7 @@ def test_each_algorithm_still_accepts_its_own_optimizer_batch_key() -> None:
 
 def test_neither_optimizer_batch_key_is_required() -> None:
     """Both are optional; an unset key leaves the worker's tuned recipe default in place."""
-    for algorithm in ("sft", "grpo", "opd"):
+    for algorithm in ("sft", "grpo"):
         spec = spec_from_dict(_raw(algorithm=algorithm))
         assert spec.train.batch_size is None
         assert spec.train.prompts_per_step is None

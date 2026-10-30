@@ -195,16 +195,8 @@ def test_the_cpu_pool_scales_with_gpu_count():
 
 
 def _trainer_source(module: str) -> str:
-    """Every file a trainer's verl config is rendered from, concatenated.
-
-    opd renders its hydra overrides in `train/opd/overrides.py` rather than in `opd_train.py`, so a
-    guard that reads only `worker/<module>.py` would stop seeing the opd call sites and pass
-    vacuously. These are read by PATH rather than imported because the assertions are on source
-    text, so the set of files has to be maintained here when a trainer is split further.
-    """
+    """Read the entrypoint and its split override builder for source-contract checks."""
     parts = [f"flash/engine/worker/train/entry/{module}.py"]
-    if module == "opd_train":
-        parts.append("flash/engine/worker/train/opd/orchestration/overrides.py")
     if module == "rl_train":
         parts.append("flash/engine/worker/train/rl/launch/verl_config.py")
     return "\n".join(pathlib.Path(_REPO_ROOT, p).read_text() for p in parts)
@@ -213,18 +205,14 @@ def _trainer_source(module: str) -> str:
 def test_both_trainers_size_the_cpu_pool_from_their_own_gpu_count():
     # a floor that the call sites never pass a gpu count to is a floor that only ever protects
     # 1-gpu jobs, which is the shape of the bug this fixes. pin the wiring, not just the helper.
-    for module, expected in (
-        ("rl_train", "ray_num_cpus(cfg['n_gpus'])"),
-        ("opd_train", "ray_num_cpus(config['n_gpus_per_node'])"),
-    ):
+    for module, expected in (("rl_train", "ray_num_cpus(cfg['n_gpus'])"),):
         assert expected in _trainer_source(module), module
 
 
 def test_every_ray_backed_trainer_constrains_rays_cpu_pool():
     # asserted across BOTH ray entrypoints rather than in one file: ray autodetects the host's cores
-    # and eagerly forks one idle worker per core, which killed grpo (fatal raylet fork failure) and
-    # opd (host-ram oom) on real gpus. sft is excluded on purpose -- it runs torchrun, not ray.
-    for module in ("rl_train", "opd_train"):
+    # and eagerly forks one idle worker per core. SFT uses torchrun, so only GRPO needs this.
+    for module in ("rl_train",):
         assert "ray_kwargs.ray_init.num_cpus={ray_num_cpus(" in _trainer_source(module), module
 
 
@@ -396,7 +384,7 @@ def test_resolve_verl_python_installs_pinned_gpu_dependencies(monkeypatch, tmp_p
     assert "bitsandbytes" not in install
     assert "qwen-vl-utils==0.0.14" in install
     assert "torchvision==0.25.0" in install
-    assert "xgrammar==0.1.25" in install
+    assert not any(arg.startswith("xgrammar==") for arg in install)
     assert "tqdm==4.70.0" in install
     assert "pyarrow==25.0.1" in install
     overrides = (tmp_path / "verl-overrides.txt").read_text()
@@ -516,15 +504,14 @@ def test_the_fallback_install_keeps_compatibility_overrides_and_exact_runtime_pi
     assert "--override" in install
     override_file = install[install.index("--override") + 1]
     written = pathlib.Path(override_file).read_text()
-    # runtime pins stay aligned; xgrammar overrides incompatible metadata.
+    # Runtime pins stay aligned; structured decoding uses vLLM's supported xgrammar.
     assert "vllm==0.19.1" in written  # matches the worker image
     assert "numpy==2.2.6" in written  # matches the worker image
-    assert "xgrammar==0.1.25" in written  # vllm declares xgrammar>=0.1.32
+    assert "xgrammar" not in written
 
 
 def test_provisioned_venv_can_import_the_entrypoints_flash_launches(monkeypatch, tmp_path):
-    # grpo used to stay in flash's own interpreter, so this fallback only ever had to satisfy sft and
-    # opd. now every backend routes through it, and Dockerfile.worker records what a verl-only install
+    # Every backend routes through this interpreter. Dockerfile.worker records what a verl-only install
     # yields: `main_ppo` dies on ModuleNotFoundError cachetools, `main_ppo_sync` on uvicorn. verl
     # declares none of vllm/cachetools/uvicorn/fastapi yet imports them at module level on the launch
     # path, so an install of VERL_REQUIREMENT alone provisions an interpreter that cannot launch.
@@ -543,7 +530,7 @@ def test_provisioned_venv_can_import_the_entrypoints_flash_launches(monkeypatch,
         assert requirement in install, (
             f"verl must install its exact direct dependency {requirement}"
         )
-    # opd's entrypoint calls tq.init()/tq.close() and verl's setup.py omits TransferQueue.
+    # The GRPO entrypoint calls tq.init()/tq.close(); upstream setup.py omits TransferQueue.
     assert "TransferQueue==0.1.11" in install
 
 
@@ -771,7 +758,7 @@ def test_a_decorated_gdn_forward_is_read_through_to_the_real_body(monkeypatch, t
 
     assert "gdn boundary resets unavailable" not in out, (
         "a decorated forward that DOES thread cu_seq_lens_q and seq_idx was reported as incapable; "
-        "grpo and opd then die on every gdn model with advice that cannot fix it"
+        "grpo then die on every gdn model with advice that cannot fix it"
     )
     # silence is not the answer -- a positive case prints nothing, so assert the affirmative the
     # caller actually gates on. otherwise this passes just as well when the branch never ran.
@@ -1096,7 +1083,7 @@ def test_the_verl_venv_gets_the_gdn_kernels(monkeypatch, tmp_path):
 def test_causal_conv1d_install_is_best_effort_and_leaves_no_env_residue(monkeypatch):
     # best-effort on purpose: failing the provisioning would turn a compiler hiccup into a dead paid
     # run, and sft is fine without the kernel (one example per update, so nothing to contaminate).
-    # the OUTCOME is not optional though -- see the stamp tests below, since grpo/opd raise without
+    # the OUTCOME is not optional though -- see the stamp tests below, since grpo raise without
     # it. and the build flag must not leak into the environment verl inherits from this process.
     seen = {}
 
@@ -1235,7 +1222,7 @@ def test_a_conv_build_that_installs_but_cannot_import_leaves_the_venv_unstamped(
     stamp = tmp_path / "verl-venv" / "flash-verl-requirement"
     assert not stamp.exists(), (
         "a venv whose conv kernel installed but cannot import was stamped as fully provisioned, so "
-        "every later attempt on this pod reuses it and grpo/opd stay unrunnable"
+        "every later attempt on this pod reuses it and grpo stay unrunnable"
     )
     # and the broken build must not be left importable-looking for the next find_spec probe.
     assert any(c[:3] == ["uv", "pip", "uninstall"] for c in calls), (
@@ -1470,16 +1457,6 @@ def test_verl_pin_is_an_immutable_commit_on_upstream():
     assert url == "https://github.com/verl-project/verl"
     assert len(commit) == 40
     assert all(c in "0123456789abcdef" for c in commit)
-
-
-def test_verl_pin_matches_the_version_opd_requires_exactly():
-    from flash.engine.worker.train.opd.child import policy as plugin
-
-    assert plugin._STRUCTURED_RUNTIME_EXACT_VERSIONS["verl"] == "0.10.0.dev0"
-    # bind the structured-output version gate to the verified upstream source.
-    _, _, ref = vc.VERL_REQUIREMENT.partition("git+")
-    _, _, commit = ref.rpartition("@")
-    assert commit == "ddf700725c34bb8966685c8ecf5ca36a2cc54a35"
 
 
 def test_resolve_verl_python_installs_wandb_best_effort_when_requested(monkeypatch, tmp_path):
@@ -3763,7 +3740,7 @@ def test_a_session_without_a_logs_dir_yields_nothing_rather_than_raising(tmp_pat
 
 
 # ---------------------------------------------------------------------------------------------
-# VERL-139: the reward/teacher bridges must not spawn one os thread per request.
+# VERL-139: the reward bridges must not spawn one os thread per request.
 # ---------------------------------------------------------------------------------------------
 def _drive_bridge(server_cls, *, callers: int, hold: threading.Event, await_arrivals: int):
     """fire `callers` concurrent requests at a bridge whose handler blocks until `hold` is set.
@@ -3881,22 +3858,14 @@ def test_the_bridge_serves_concurrent_requests_from_a_bounded_pool():
 
 
 def test_both_verl_bridges_use_the_bounded_server():
-    """the fix is only real if the reward AND teacher bridges inherit it.
+    """The reward bridge must use the bounded HTTP server."""
 
-    each bridge is defined in its own module, so a fix applied to one leaves the other able to
-    exhaust the thread table on exactly the same rollout shape.
-    """
-    import flash.engine.worker.train.opd.bridging.batching as opd_batching
     import flash.engine.worker.train.rl.rollout.multi_turn as rl_multi_turn
 
-    # the teacher bridge is a module-level class, so check the type itself.
-    assert issubclass(opd_batching._TeacherBridgeHTTPServer, vc.BoundedThreadingHTTPServer), (
-        "the opd teacher bridge does not use BoundedThreadingHTTPServer"
-    )
     # the reward bridge is defined inside the function that starts it, so it is only reachable
     # through the source. parse rather than substring-match: a comment mentioning the old name
     # must not pass, and a real subclass must not be missed.
-    for mod in (rl_multi_turn, opd_batching):
+    for mod in (rl_multi_turn,):
         tree = ast.parse(pathlib.Path(inspect.getfile(mod)).read_text())
         for node in ast.walk(tree):
             if not isinstance(node, ast.ClassDef):
@@ -3939,11 +3908,7 @@ _EXIT_PROBE_HANDLER_S = 10.0
 
 
 def test_a_hung_bridge_handler_cannot_hold_the_worker_process_open():
-    """A wedged reward/teacher callback must not delay worker exit.
-
-    `ThreadPoolExecutor` workers are joined at interpreter exit even after `shutdown(wait=False)`; a
-    hung handler can retain a paid GPU. The stock-executor control must fail the bound.
-    """
+    """A wedged reward callback must not delay worker exit."""
     control = _exit_delay_with_pool("ThreadPoolExecutor(max_workers=2)")
     assert control > _EXIT_PROBE_HANDLER_S * 0.5, (
         f"control exited in {control:.1f}s, so a stock pool did NOT block on its running handler "
@@ -4163,11 +4128,11 @@ def test_every_trainer_asks_for_the_backend_rather_than_hardcoding_one():
     Each trainer resolves the backend once from `caps` and threads the ANSWER through its config
     dict, so the override builders read `cfg[...]` and only the call sites name the helper.
     """
-    import flash.engine.worker.train.entry.opd_train as opd_train
+
     import flash.engine.worker.train.entry.rl_train as rl_train
     import flash.engine.worker.train.entry.sft_train as sft_train
 
-    for module in (sft_train, rl_train, opd_train):
+    for module in (sft_train, rl_train):
         source = pathlib.Path(module.__file__).read_text()
         code = "\n".join(line for line in source.splitlines() if not line.lstrip().startswith("#"))
         assert "impl_backend=torch" not in code, module.__name__
@@ -4190,11 +4155,11 @@ def test_every_trainer_probes_capabilities_for_every_model_not_just_gdn():
     triton measured 2.25x faster. That failure is invisible today -- every catalog model is a gdn
     hybrid -- which is exactly why it needs a test rather than a reader noticing it later.
     """
-    import flash.engine.worker.train.entry.opd_train as opd_train
+
     import flash.engine.worker.train.entry.rl_train as rl_train
     import flash.engine.worker.train.entry.sft_train as sft_train
 
-    for module in (sft_train, rl_train, opd_train):
+    for module in (sft_train, rl_train):
         lines = pathlib.Path(module.__file__).read_text().splitlines()
         probes = [
             (n, line)

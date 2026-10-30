@@ -11,8 +11,6 @@ from types import SimpleNamespace
 
 import pytest
 
-from flash.engine.worker.train.opd.child import bridge
-
 
 @pytest.fixture
 def recipe(monkeypatch):
@@ -47,7 +45,7 @@ def recipe(monkeypatch):
     dependency = types.ModuleType("verl.trainer.ppo.v1.replay_buffer")
     dependency.ReplayBuffer = ReplayBuffer
     monkeypatch.setitem(sys.modules, dependency.__name__, dependency)
-    name = "flash.engine.worker.train.opd.child.replay"
+    name = "flash.engine.worker.train.core.child.replay"
     monkeypatch.setitem(sys.modules, name, types.ModuleType(name))
     sys.modules.pop(name)
     module = importlib.import_module(name)
@@ -55,7 +53,6 @@ def recipe(monkeypatch):
     monkeypatch.setattr(module, "_REPLAY_POLL_SECONDS", 0.1)
     monkeypatch.setattr(module, "_REPLAY_STALL_SECONDS", 0.3)
     monkeypatch.setattr(module, "_actor_probe_state", lambda _: "unknown")
-    monkeypatch.delenv("FLASH_OPD_ROLLOUT_FAILURE_PATH", raising=False)
     return module, module.BoundedReplayBuffer(SimpleNamespace()), clock
 
 
@@ -67,18 +64,6 @@ def test_failed_prompt_beats_running_siblings_and_successful_rollouts(recipe):
     with pytest.raises(RuntimeError, match=r"failed prompt.*failed"):
         buffer.sample(7, "train", 2)
     assert not buffer.snapshots
-
-
-def test_recorded_rollout_cause_beats_generic_failed_prompt(recipe, monkeypatch, tmp_path):
-    _, buffer, _ = recipe
-    monkeypatch.setenv("FLASH_OPD_ROLLOUT_FAILURE_PATH", str(tmp_path / "failure"))
-    try:
-        raise LookupError("replay-original-sentinel")
-    except LookupError as error:
-        bridge._write_rollout_failure_fallback(error, "permanent")
-    buffer.failure_keys["train"].add("failed")
-    with pytest.raises(RuntimeError, match=r"LookupError.*replay-original-sentinel"):
-        buffer.sample(7, "train", 1)
 
 
 def test_empty_queue_waits_then_delegates_selection_to_upstream(recipe):
@@ -128,6 +113,6 @@ def test_stalled_replay_is_named_without_a_sampling_thread(recipe):
     _, buffer, _ = recipe
     buffer.running_keys["train"].add("prompt")
     before = set(threading.enumerate())
-    with pytest.raises(RuntimeError, match="opd_replay_stall"):
+    with pytest.raises(RuntimeError, match="GRPO_replay_stall"):
         buffer.sample(7, "train", 1)
     assert set(threading.enumerate()) == before

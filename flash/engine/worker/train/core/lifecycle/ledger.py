@@ -1,4 +1,4 @@
-"""One checkpoint lifecycle vocabulary shared by the sft, grpo and opd publishers.
+"""One checkpoint lifecycle vocabulary shared by the SFT and GRPO publishers.
 
 The three trainers each grew their own bookkeeping and reused the same words for different facts:
 grpo's "uploaded" meant *attempted*, sft's "staged" was a transient hardlink of the full checkpoint
@@ -9,7 +9,7 @@ mean durability.
 The five facts below are recorded where each one actually becomes true, and are deliberately
 INDEPENDENT rather than a linear enum, because both publication orders occur legitimately:
 
-- sft and opd explicitly publish the deployable first, so a required step reaches
+- sft explicitly publish the deployable first, so a required step reaches
   ``deployable_published`` BEFORE ``resume_uploaded``.
 - grpo stages a required adapter while its terminal publication latch is shut, uploads resume state meanwhile,
   and publishes the deployable on a later sweep -- the opposite order.

@@ -631,7 +631,6 @@ def test_dry_run_schema_disagreement_is_diagnostic_only(api) -> None:
     from flash.schema import train_schema_metadata
 
     fields = train_schema_metadata()
-    fields.pop("teacher_model")
     fields.pop("structured_outputs")
     fields["epochs"] = "0.2.1"
     metadata = {
@@ -649,7 +648,7 @@ def test_dry_run_schema_disagreement_is_diagnostic_only(api) -> None:
     compatibility = response.json()["train_schema_compatibility"]
     assert compatibility["status"] == "disagreement"
     assert compatibility["client_only"] == []
-    assert compatibility["server_only"] == ["structured_outputs", "teacher_model"]
+    assert compatibility["server_only"] == ["structured_outputs"]
     assert compatibility["introduced_in_differences"] == [
         {"key": "epochs", "client": "0.2.1", "server": "0.2.0"}
     ]
@@ -893,34 +892,6 @@ def test_dry_run_accepts_valid_regex_and_local_ref_constraints(api, structured_o
 
     assert response.status_code == 200, response.text
     assert response.json()["state"] == "dry_run"
-
-
-@pytest.mark.parametrize("dry_run", [False, True])
-@pytest.mark.parametrize("algorithm", ["opd", "OPD"])
-def test_retired_opd_rejected_before_preparation_or_persistence(
-    api, monkeypatch, dry_run, algorithm
-):
-    import flash.server.routes.runs as runs_route
-
-    monkeypatch.setattr(
-        runs_route.run_submission,
-        "prepare_job",
-        lambda *_a, **_k: pytest.fail("retired OPD must fail before preparation"),
-    )
-    monkeypatch.setattr(
-        "flash.server.domain.teacher.broker.preflight_validate_managed_teacher",
-        lambda *_a, **_k: pytest.fail("retired OPD must not contact a teacher"),
-    )
-    token = _new_user_token()
-    response = api.post(
-        "/v1/runs",
-        headers=_bearer(token),
-        json={"spec": {**SPEC, "algorithm": algorithm}, "dry_run": dry_run},
-    )
-    assert response.status_code == 400, response.text
-    assert "Built-in OPD has been retired" in response.json()["detail"]
-    assert "custom" in response.json()["detail"]
-    assert api.get("/v1/runs", headers=_bearer(token)).json()["runs"] == []
 
 
 def test_grpo_rollout_shape_rejects_before_secrets_persistence_or_submission(
@@ -2327,7 +2298,7 @@ def test_ray_log_name_is_built_the_same_way_the_worker_builds_it():
     from flash.engine.worker.io.hf import ray_log_artifact_name
     from flash.server.platform.runtime import _ray_log_name_for_attempt
 
-    for phase in ("rl", "sft", "opd"):
+    for phase in ("rl", "sft"):
         for attempt in (0, 1, 7):
             assert _ray_log_name_for_attempt(
                 phase, f"error_{phase}_attempt{attempt}.txt"
@@ -8252,3 +8223,25 @@ def test_record_model_exported_posts_allowlisted_event(monkeypatch):
         is False
     )
     assert posted == {}
+
+
+@pytest.mark.parametrize("algorithm", ["opd", "OPD"])
+@pytest.mark.parametrize("dry_run", [False, True])
+def test_removed_algorithm_is_rejected_before_preparation(api, monkeypatch, algorithm, dry_run):
+    def unexpected_preparation(*args, **kwargs):
+        pytest.fail("removed algorithm reached job preparation")
+
+    monkeypatch.setattr(runner_submit, "prepare_job", unexpected_preparation)
+    response = api.post(
+        "/v1/runs",
+        headers=_bearer("fslo-internal-test"),
+        json={"spec": {**SPEC, "algorithm": algorithm}, "dry_run": dry_run},
+    )
+    assert response.status_code == 400, response.text
+    assert "unsupported algorithm" in response.text
+
+
+@pytest.mark.parametrize("path", ["/v1/teacher/completions", "/v1/teacher/chat_completions"])
+def test_removed_teacher_route_is_not_registered(api, path):
+    response = api.post(path, headers=_bearer("fslo-internal-test"), json={})
+    assert response.status_code == 404

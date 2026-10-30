@@ -110,8 +110,8 @@ def test_multi_card_speedup_never_decreases_with_card_count():
         assert vals == sorted(vals), f"{name} speedup decreases: {vals}"
 
 
-def test_sft_shards_by_data_like_grpo_and_opd(monkeypatch):
-    """sft must read the fsdp data-parallel constant, the same one grpo/opd read.
+def test_sft_shards_by_data_like_grpo(monkeypatch):
+    """sft must read the fsdp data-parallel constant, the same one grpo read.
 
     sft used to pin ulysses_sp_size to the card count (dp_size == 1: pure sequence parallelism) and
     carried its own scaling pair for it. Sequence parallelism is wrong for the catalog's GDN
@@ -138,7 +138,7 @@ def test_sft_shards_by_data_like_grpo_and_opd(monkeypatch):
     monkeypatch.setattr(analytical, "MULTI_CARD_SCALING_NVLINK", 0.95)
 
     for card in ("L4", "A100 SXM"):
-        for method in ("sft", "grpo", "opd"):
+        for method in ("sft", "grpo"):
             speedup = analytical.method_card_speedup(cfg(method), 2, card)
             assert speedup == pytest.approx(2 * 0.95), (
                 f"{method} on {card} ignored the data-parallel constant: {speedup}"
@@ -180,7 +180,7 @@ def test_multi_card_sft_quote_moves_with_the_data_parallel_constant(monkeypatch)
 def test_ranking_prices_the_authored_rollout_batch_not_the_recipe_default():
     """Regression: hardware ranking read the optimizer batch from the sft-only key.
 
-    `RunConfig.batch_size` means "examples per optimizer update", but grpo/opd author that as
+    `RunConfig.batch_size` means "examples per optimizer update", but grpo author that as
     `prompts_per_step` -- the schema rejects `batch_size` for them outright. Reading only the sft
     name left the ranker at None for every authored rollout batch, so it priced the recipe default
     (64) against an authored 32 and could select a costlier shape than the run needs. The persisted
@@ -194,7 +194,7 @@ def test_ranking_prices_the_authored_rollout_batch_not_the_recipe_default():
     # must differ from the default, or the assertions below pass on the broken read too.
     assert authored != RECIPE.rl.prompts_per_step
 
-    for algorithm in ("grpo", "opd"):
+    for algorithm in ("grpo",):
         train = {"epochs": 1, "group_size": 4, "prompts_per_step": authored}
         config = run_config_for_ranking("Qwen/Qwen3.5-9B", algorithm, train=train)
         assert config.batch_size == authored, algorithm
@@ -227,8 +227,8 @@ def test_ranking_caps_the_rollout_batch_at_the_retained_prompt_count():
     from flash.engine.plan.recipe import RECIPE
     from flash.providers.core.base import run_config_for_ranking
 
-    for algorithm in ("grpo", "opd"):
-        default = int((RECIPE.opd if algorithm == "opd" else RECIPE.rl).prompts_per_step)
+    for algorithm in ("grpo",):
+        default = int(RECIPE.rl.prompts_per_step)
         # (authored prompts_per_step, max_examples, expected ranked batch)
         for authored, retained, expected in (
             (128, 2, 2),  # the reported shape: pool far below the authored batch
@@ -291,7 +291,7 @@ def test_the_persisted_quote_prices_the_same_batch_ranking_selects_hardware_for(
         "environment": {"id": "github:owner/repo@main:env/environment.py"},
         "gpu": {"type": "H100", "count": 1},
     }
-    for algorithm in ("grpo", "opd"):
+    for algorithm in ("grpo",):
         for label, train in (
             (
                 "authored above the pool",
@@ -469,27 +469,24 @@ def test_sft_fit_credits_only_the_ranks_that_will_launch():
         "memory only the wider world would have had"
     )
 
-    # grpo and opd bound their width too, but on their OWN unit of work: they never read
+    # grpo bound their width too, but on their OWN unit of work: they never read
     # `batch_size` (their batch is `prompts_per_step`, repeated `group_size` times), so an sft-shaped
     # knob must leave them at full width rather than silently narrowing them through the wrong field.
     assert fits(2, algorithm="grpo", train=unpacked)
-    assert fits(2, algorithm="opd", train=unpacked)
 
     # their real narrowing: one prompt in a group of two is 2 sequences, which cannot fill 4 dp
     # ranks. verl raises on the uneven chunk instead of degrading, so crediting 4 would admit a run
     # that dies at step 0 on paid hardware -- the same over-credit as the sft case above.
     tiny_rl = {"prompts_per_step": 1, "group_size": 2}
     assert _executed_gpu_count("grpo", tiny_rl, None, 4) == 2
-    assert _executed_gpu_count("opd", {"prompts_per_step": 1, "group_size": 1}, None, 2) == 1
     # and a real step fills every card, so the fix costs no capacity where it matters.
     assert _executed_gpu_count("grpo", {"prompts_per_step": 8, "group_size": 4}, None, 8) == 8
 
     # an OMITTED group takes the recipe default for that algorithm, which is what the worker resolves
     # it to (`train/rl/inputs.py`) and what the quote fills in (`RunConfig.normalized`). the defaults
-    # differ -- grpo groups 8 completions per prompt, opd distills 1 -- so hardcoding either number
+    # use the GRPO recipe default rather than duplicating its group size
     # here breaks the other. reading 1 for grpo under-credited it eightfold and REJECTED runs that fit.
     assert _executed_gpu_count("grpo", {"prompts_per_step": 1}, None, 8) == 8
-    assert _executed_gpu_count("opd", {"prompts_per_step": 1}, None, 8) == 1
     # an explicit supported group still wins over the default.
     assert _executed_gpu_count("grpo", {"prompts_per_step": 1, "group_size": 2}, None, 8) == 2
 
@@ -497,7 +494,7 @@ def test_sft_fit_credits_only_the_ranks_that_will_launch():
     from flash.cost.analytical import executed_gpu_count
     from flash.cost.types import RunConfig
 
-    for method, prompts, group in (("grpo", 1, None), ("opd", 1, None), ("grpo", 1, 2)):
+    for method, prompts, group in (("grpo", 1, None), ("grpo", 1, 2)):
         train = {"prompts_per_step": prompts} | ({"group_size": group} if group else {})
         quoted = executed_gpu_count(
             RunConfig(

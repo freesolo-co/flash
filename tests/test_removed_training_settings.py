@@ -25,7 +25,7 @@ def _raw(train, algorithm="sft"):
 
 @pytest.mark.parametrize("key", ["loraplus_ratio", "entropy_quantile"])
 @pytest.mark.parametrize("value", [None, 0.0, 0.5, 1.0, 16.0])
-@pytest.mark.parametrize("algorithm", ["sft", "grpo", "opd"])
+@pytest.mark.parametrize("algorithm", ["sft", "grpo"])
 def test_removed_fields_are_rejected_at_public_and_persisted_boundaries(key, value, algorithm):
     raw = _raw({key: value}, algorithm)
     with pytest.raises(ConfigError, match=key):
@@ -36,7 +36,7 @@ def test_removed_fields_are_rejected_at_public_and_persisted_boundaries(key, val
         TrainSpec(**{key: value})
 
 
-@pytest.mark.parametrize("algorithm", ["sft", "grpo", "opd"])
+@pytest.mark.parametrize("algorithm", ["sft", "grpo"])
 def test_current_specs_round_trip_without_removed_settings(algorithm):
     spec = spec_from_dict(_raw({}, algorithm))
     restored = JobSpec.from_json(spec.to_json())

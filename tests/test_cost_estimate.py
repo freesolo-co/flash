@@ -92,7 +92,6 @@ def test_runconfig_preserves_old_positional_constructor():
         None,
         8,
         False,
-        "",
         3600,
         "modal",
         "owner/environment",
@@ -109,27 +108,6 @@ def test_runconfig_preserves_old_positional_constructor():
     assert config.train_tokens == 16_000
     assert config.save_at_steps == (2, 5)
     assert config.gpu_type == ""
-    assert config.opd_multi_turn is False
-    assert config.opd_max_turns is None
-
-    # the 15 args above stop short of the opd fields, so they cannot catch a field INSERTED among
-    # the later ones -- the shift only rebinds from that position on. pin the order itself, which is
-    # what the positional contract actually is.
-    import dataclasses
-
-    order = [f.name for f in dataclasses.fields(RunConfig)]
-    assert order.index("opd_multi_turn") < order.index("opd_max_turns")
-    assert order.index("opd_max_turns") < order.index("sft_retained_examples")
-    # anything added later must be APPENDED, never slotted beside a related field: an old positional
-    # caller would silently bind its opd flag to the newcomer rather than fail. asserted as a
-    # PREFIX rather than an exact tail so the guard keeps failing on an insertion while a correctly
-    # appended field does not have to edit it -- the previous exact-tail form failed either way,
-    # which makes the failure uninformative about which mistake was made.
-    appended_so_far = ["sft_retained_examples", "providers", "gpu_type_fallbacks"]
-    assert order[-len(appended_so_far) :] == appended_so_far, (
-        "a new RunConfig field must be appended; inserting one shifts every later parameter and "
-        "silently reinterprets old positional calls as different quantities"
-    )
 
 
 def test_a_malformed_retained_example_count_is_rejected_not_read_as_unknown():
@@ -206,32 +184,6 @@ def test_runconfig_from_spec_preserves_gpu_constraints():
     assert config.disk_gb == 200.0
 
 
-@pytest.mark.parametrize(
-    ("environment", "expected"),
-    [
-        ({"id": "owner/single", "params": {"multi_turn": False}}, (False, None)),
-        ({"id": "owner/multi", "params": {"multi_turn": True, "max_turns": 24}}, (True, 24)),
-        ({"id": "owner/unknown"}, (True, None)),
-    ],
-)
-def test_runconfig_from_spec_preserves_conservative_opd_turn_budget(environment, expected):
-    from flash.core.spec import JobSpec
-    from flash.cost.spec import run_config_from_spec
-
-    spec = JobSpec.from_dict(
-        {
-            "model": "Qwen/Qwen3.5-9B",
-            "algorithm": "opd",
-            "environment": environment,
-            "train": {"max_examples": 8, "max_steps": 1},
-        }
-    )
-
-    config = run_config_from_spec(spec)
-
-    assert (config.opd_multi_turn, config.opd_max_turns) == expected
-
-
 def test_quote_preparation_never_calls_live_allocate(monkeypatch):
     """A market/API failure belongs to the retrying lifecycle, never quote preparation."""
     import flash.providers.core.allocator as allocator_mod
@@ -270,18 +222,11 @@ def test_b200_not_cheaper_or_faster_than_h200_for_grpo():
     assert b200.total_usd > h200.total_usd
 
 
-def test_b200_never_beats_h200_at_any_card_count_for_grpo_or_opd():
-    """The never-faster contract must survive sharding, on both rollout algorithms.
-
-    The single-card test above passes on equal per-step seconds. Sharding divides only the
-    gpu-bound half, so a card whose floor offset differed would diverge as the count rises even
-    while the 1-card numbers matched -- the tie has to hold per-count, not just at count=1. opd is
-    covered too because it carries the same floor with a much larger share of its step (~94% of the
-    gpu-bound half vs ~88% for grpo), so it is the more sensitive of the two, not a duplicate.
-    """
+def test_b200_never_beats_h200_at_any_card_count_for_grpo():
+    """The per-card GRPO cost ordering must survive sharding of the GPU-bound work."""
     from flash.cost.analytical import multi_card_speedup, step_seconds_split
 
-    for method in ("grpo", "opd"):
+    for method in ("grpo",):
         h_bound, h_fixed = step_seconds_split(
             RunConfig("Qwen/Qwen3.5-9B", method, 100, gpu_type="H200"), "H200"
         )

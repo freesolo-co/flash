@@ -23,7 +23,6 @@ import flash.engine.worker.entry.worker as worker_entry
 import flash.engine.worker.io.hf as _publication
 import flash.engine.worker.io.hf as worker_hf
 import flash.engine.worker.train.entry.rl_train_runner as rl_train_runner
-import flash.engine.worker.train.opd.orchestration.failures as opd_failures
 from flash.content.multimodal import message_content_text
 from flash.engine.profiling.sft_image_rows import _serialize_multimodal_inputs
 from flash.engine.profiling.sft_rows import _pretokenize_completion_only
@@ -389,7 +388,7 @@ def test_sft_quote_credits_only_the_ranks_that_will_execute():
 
     `gpu_count` at the quote boundary is the BILLED shape. SFT shards by data, so the executed
     width is bounded by the batch: an unpacked run on 2 cards trains on one rank. Crediting the
-    billed width there understates wall time against the run's own cap. GRPO and OPD also shard by
+    billed width there understates wall time against the run's own cap. GRPO also shard by
     data, but they bound work by TOKENS (`use_dynamic_bsz`), so the scheduler balances the batch
     across every rank instead of leaving one unfed -- their executed width is the allocation, and the
     clamp must stay SFT-only.
@@ -1834,7 +1833,6 @@ def test_child_environment_excludes_provider_and_control_plane_secrets(
     monkeypatch.setenv("HF_HOME", "/cache/hf")
     monkeypatch.setenv("FLASH_VERL_PYTHON", "/verl/python")
     monkeypatch.setenv("WANDB_API_KEY", "wandb-secret")
-    monkeypatch.setenv("PARASAIL_API_KEY", "teacher-secret")
     monkeypatch.setenv("FREESOLO_INTERNAL_KEY", "control-secret")
     monkeypatch.setenv("MODAL_TOKEN_SECRET", "provider-secret")
     monkeypatch.setenv("HF_TOKEN", "hub-secret")
@@ -1846,7 +1844,6 @@ def test_child_environment_excludes_provider_and_control_plane_secrets(
     assert without_wandb["FLASH_VERL_PYTHON"] == "/verl/python"
     assert "WANDB_API_KEY" not in without_wandb
     for secret in (
-        "PARASAIL_API_KEY",
         "FREESOLO_INTERNAL_KEY",
         "MODAL_TOKEN_SECRET",
         "HF_TOKEN",
@@ -3537,15 +3534,7 @@ def test_overrides_enable_fused_linear_ce_for_long_context():
 
 
 def test_sft_line_handler_reads_metrics_through_the_shared_parser():
-    """sft shares OPD's numpy-2-aware parser instead of keeping its own float() copy.
-
-    sft's three metrics reach the logger as plain python floats today (engine_workers.py
-    returns loss/grad_norm via .item() and lr via get_last_lr()), so unlike OPD's
-    Metric(SUM) they do not currently print in numpy's np.float64(...) spelling. the
-    duplicate parser was still removed: one upstream metric-type change would have
-    reintroduced the same silent drop, and the shared helper additionally rejects nan/inf,
-    which would otherwise serialize into the heartbeat as bare NaN.
-    """
+    """SFT reads NumPy-wrapped metrics through the shared parser."""
     import ast
     import textwrap
 
@@ -4419,7 +4408,7 @@ def test_a_failed_optional_publish_is_not_credited_as_a_durable_deployable(
 
     The sibling coalescing test cannot catch this -- its publish mock returns a subfolder, so the
     guard is never exercised with a falsy return. Verified by mutation: deleting the `if published:`
-    guard leaves the whole sft/grpo/opd suite green and fails only this test.
+    guard leaves the whole sft/grpo suite green and fails only this test.
     """
     from flash.engine.worker.train.entry import sft_train
     from flash.engine.worker.train.sft.setup import checkpoints as sft_checkpoints
@@ -4598,112 +4587,6 @@ def test_a_required_backlog_still_drops_its_superseded_optional_saves(
     # those get an artifact. selection bounds the disk; publication honours the authored contract.
     assert published == [350], (
         f"an optional save was exported alongside a required one: {published}"
-    )
-
-
-def test_the_opd_watcher_publishes_every_step_despite_the_sft_bound(
-    worker_context, monkeypatch, tmp_path
-):
-    """opd keeps all pending retry states."""
-
-    watcher = opd_failures._OpdVerlCheckpointWatcher(
-        local_dir=str(tmp_path / "ckpts"),
-        export_root=str(tmp_path / "exports"),
-        python_bin="/verl/python",
-        model_id="org/model",
-        model_revision="commit",
-        required_steps=(),
-        seed=0,
-        prompt_pool_fingerprint="fp",
-        prompts_per_step=1,
-        group_size=1,
-        accounting_state=lambda step: None,
-        context=worker_context,
-    )
-    pending = [(1, "/ckpts/global_step_1"), (2, "/ckpts/global_step_2")]
-
-    assert watcher._publishable(pending) == pending, (
-        "the opd watcher inherited the sft backlog skip, dropping a resume point"
-    )
-    assert watcher.lifecycle.discovered_steps == set(), (
-        "opd claimed a step during backlog selection without publishing it"
-    )
-
-
-def test_the_opd_watcher_still_keeps_its_export(worker_context, monkeypatch, tmp_path):
-    """the sft cleanup must not be generalized to the siblings that have a reader.
-
-    `_OpdVerlCheckpointWatcher` subclasses the sft watcher, so a cleanup placed in a shared method
-    would silently reach it. Both siblings hand their export to something that runs LATER -- rl
-    republishes from `staged_adapters` on a subsequent sweep, opd passes `adapter_dir` into
-    `_stage_retry_contract` -- so for them the directory is live state, not garbage. The sft path is
-    safe to clear precisely because it has no such consumer.
-
-    Asserted by running the opd watcher's real `_publish` and looking at the disk afterwards. An
-    earlier version of this test grepped `inspect.getsource` for `"rmtree(adapter_dir"`, which
-    proved nothing: writing the deletion as `rmtree(os.fspath(adapter_dir))` does not match that
-    substring, so the adapter could be destroyed with the assertion still green. Source text is not
-    the contract; the surviving directory is.
-    """
-    from flash.engine.worker.train.sft.setup import checkpoints as sft_checkpoints
-
-    assert (
-        opd_failures._OpdVerlCheckpointWatcher._publish
-        is not sft_checkpoints._VerlCheckpointWatcher._publish
-    ), "opd no longer overrides _publish, so it now inherits the sft deletion"
-
-    staged: dict[str, object] = {}
-    monkeypatch.setattr(
-        opd_failures,
-        "_export_checkpoint_adapter",
-        lambda actor, adapter, **kwargs: os.makedirs(adapter, exist_ok=True),
-    )
-    monkeypatch.setattr(
-        opd_failures,
-        "_stage_retry_contract",
-        lambda checkpoint_dir, **kwargs: staged.update(kwargs),
-    )
-    monkeypatch.setattr(
-        opd_failures._worker_hf,
-        "publish_deployable_checkpoint",
-        lambda adapter, step, **kw: _publication.PublicationResult(
-            deployable=_publication.ArtifactCommit(f"step-{step}", "test-revision")
-        ),
-    )
-    monkeypatch.setattr(
-        opd_failures._worker_hf,
-        "upload_resume_checkpoint",
-        lambda step, ckpt, **kwargs: (
-            _publication.PublicationResult(
-                resume=_publication.ArtifactCommit("test-commit", "test-revision")
-            ),
-        )[0],
-    )
-
-    export_root = tmp_path / "opd-exports"
-    checkpoint_dir = tmp_path / "ckpts" / "global_step_2"
-    (checkpoint_dir / "actor").mkdir(parents=True)
-
-    watcher = opd_failures._OpdVerlCheckpointWatcher(
-        local_dir=str(tmp_path / "ckpts"),
-        export_root=str(export_root),
-        python_bin="/verl/python",
-        model_id="org/model",
-        model_revision="commit",
-        required_steps=(2,),
-        seed=0,
-        prompt_pool_fingerprint="fp",
-        prompts_per_step=1,
-        group_size=1,
-        accounting_state=lambda step: None,
-        context=worker_context,
-    )
-    watcher._publish(2, str(checkpoint_dir))
-
-    # the retry contract recorded this exact path, so the directory has to still be there.
-    assert staged["adapter_dir"] == str(export_root / "step-2")
-    assert os.path.isdir(export_root / "step-2"), (
-        "the opd watcher deleted an adapter its retry contract still points at"
     )
 
 

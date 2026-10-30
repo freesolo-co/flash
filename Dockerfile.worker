@@ -249,10 +249,9 @@ print('worker stack OK | torch', torch.__version__, '| cudnn', cudnn, '| triton'
 'freesolo','httpx']]"
 
 # ---------------------------------------------------------------------------------------------
-# verl venv (GRPO/OPD/SFT verl backends): ISOLATED from the main interpreter on purpose.
+# verl venv (GRPO/SFT verl backends): ISOLATED from the main interpreter on purpose.
 #
-# Flash's structured-OPD gate pins xgrammar to exactly 0.1.25 against vLLM's declared
-# >=0.1.32 floor. The trainer stack is isolated from the worker interpreter so changing its
+# The trainer stack is isolated from the worker interpreter so changing its
 # dependency resolution cannot move the main worker's pins. Resolving verl into the main
 # interpreter would move shared pins under every other worker path (peft/transformers/vllm all
 # live there), so verl gets its own venv and flash launches it out-of-process via FLASH_VERL_PYTHON.
@@ -269,12 +268,6 @@ print('worker stack OK | torch', torch.__version__, '| cudnn', cudnn, '| triton'
 # Install the bare upstream package and Flash's explicit GPU stack. Upstream's [vllm] extra
 # selects its complete CUDA 13 / Torch 2.13 environment; this image uses CUDA 12.8 / Torch 2.10.
 # Flash pins vLLM and Transformers alongside the exact upstream source.
-# The remaining dependency-metadata override is xgrammar: vLLM declares >=0.1.32,
-# while structured OPD requires exactly 0.1.25. Upstream Verl and TransferQueue now support numpy>=2.
-# xgrammar 0.1.25 was exercised against vLLM 0.19.1's own XgrammarBackend (schema compile, grammar
-# build, token-mask fill+apply) so the floor is not required to drive the API.
-#
-# xgrammar needs uv's --override to resolve conflicting dependency metadata.
 # Repeating exact numpy, vllm, and transformers pins keeps the baked and fallback
 # training environments aligned. GPU qualification remains required for this runtime.
 #
@@ -323,7 +316,7 @@ ENV FLASH_VERL_PYTHON=/opt/verl-venv/bin/python \
 # Keep these requirements and the cubin digest aligned with VERL_FLASHINFER_REQUIREMENTS.
 ARG VERL_FLASHINFER_CUBIN="flashinfer-cubin @ https://github.com/flashinfer-ai/flashinfer/releases/download/v0.6.14/flashinfer_cubin-0.6.14-py3-none-any.whl#sha256=7bbed9f3851b59f3f6f6cb344810775bbce8a1c012ecf9a502bebd91cfb6433e"
 RUN --mount=type=cache,id=flash-worker-uv-cu128,target=/root/.cache/uv,sharing=locked \
-    printf '%s\n' "numpy==2.2.6" "xgrammar==0.1.25" "vllm==0.19.1" "transformers==5.12.1" \
+    printf '%s\n' "numpy==2.2.6" "vllm==0.19.1" "transformers==5.12.1" \
         "flashinfer-python==0.6.14" "${VERL_FLASHINFER_CUBIN}" \
         "nvidia-cutlass-dsl==4.8.1" "cuda-tile==1.4.0" > /tmp/verl-overrides.txt \
     && uv venv --seed /opt/verl-venv \
@@ -333,7 +326,6 @@ RUN --mount=type=cache,id=flash-worker-uv-cu128,target=/root/.cache/uv,sharing=l
         "vllm==0.19.1" \
         "flashinfer-python==0.6.14" "${VERL_FLASHINFER_CUBIN}" \
         "nvidia-cutlass-dsl==4.8.1" "cuda-tile==1.4.0" \
-        "xgrammar==0.1.25" \
         "numpy==2.2.6" \
         "transformers==5.12.1" \
         "datasets==5.0.1" \
@@ -348,9 +340,8 @@ RUN --mount=type=cache,id=flash-worker-uv-cu128,target=/root/.cache/uv,sharing=l
         "apache-tvm-ffi==0.1.9" \
     && rm -f /tmp/verl-overrides.txt
 
-# flash-attn is REQUIRED in here, not best-effort like it is in the main interpreter above. All three
-# backends default remove-padding ON (train/rl/verl_config.py, train/sft/config.py,
-# train/opd/overrides.py; only a GDN model whose child cannot reset packed boundaries turns it off),
+# flash-attn is REQUIRED here. Both backends default remove-padding ON
+# (train/rl/launch/verl_config.py and train/sft/config.py),
 # and verl's CUDA remove-padding path imports
 # flash_attn.bert_padding UNGUARDED (verl/utils/attention_utils.py:30, torch_functional.py:627,657).
 # There is no SDPA fallback on that path: without the module the run dies at the first training
@@ -392,10 +383,10 @@ RUN --mount=type=cache,id=flash-worker-uv-cu128,target=/root/.cache/uv,sharing=l
 #
 # REQUIRED, not best-effort. This was best-effort on the premise that a failed build degrades to
 # unpacked training, and that premise no longer holds: every catalog model is a GDN hybrid, and
-# backend_common.require_gdn_boundary_resets now RAISES for grpo/opd when the child cannot reset,
+# backend_common.require_gdn_boundary_resets now RAISES for grpo when the child cannot reset,
 # because the old padded fallback (use_remove_padding=False) is incompatible with the
 # use_fused_kernels=True these recipes hardcode and dies at padding.py:144 on every batch size.
-# So a conv-less image does not train unpacked here -- it fails grpo and opd after paying for the
+# So a conv-less image does not train unpacked here -- it fails grpo after paying for the
 # gpu. Failing the BUILD is strictly cheaper than failing the run. No `|| uninstall` branch: the
 # import check below is part of the same && chain, so an ABI-broken build (which passes
 # transformers' find_spec probe) fails the image rather than shipping as present-but-broken.
@@ -411,7 +402,7 @@ RUN --mount=type=cache,id=flash-worker-uv-cu128,target=/root/.cache/uv,sharing=l
 # Neutralize tilelang's libcudart stub in THIS venv, after the last install that can write tilelang
 # into it (the install above and the flash-attn one before it) and before anything imports vLLM here.
 # vLLM aborts its import when it finds that stub (it has no cudaDeviceReset) in /proc/self/maps, and
-# this venv is where the child actually trains, so an unrepaired stub kills grpo/opd on a rented gpu.
+# this venv is where the child actually trains, so an unrepaired stub kills grpo on a rented gpu.
 #
 # resolve_verl_python applies the same repair to the venv it provisions itself, but it returns a
 # preset FLASH_VERL_PYTHON untouched -- flash does not own a foreign interpreter -- and this image
@@ -430,7 +421,7 @@ RUN python /tmp/cudartfix/extract_cudart_fix.py /tmp/cudartfix/capabilities.py /
 
 # Sanity: the verl venv must be able to LAUNCH, not merely install. This is the assert that would
 # have caught the shipped-but-unrunnable venv. Import the three entrypoints flash actually invokes
-# (rl_train -> main_ppo, opd child trainer -> ppo.v1.trainer_sync, sft_train -> sft_trainer; note it is
+# (rl_train -> main_ppo, GRPO child trainer -> ppo.v1.trainer_sync, sft_train -> sft_trainer; note it is
 # sft_trainer, NOT fsdp_sft_trainer, which does not exist in this pin), the vLLM rollout modules
 # where a version mismatch would surface, and verify the installed upstream VCS source. Also assert the Qwen3.5 archs are registered, since that is the entire reason this
 # venv carries 0.19.1 instead of 0.11.2.
@@ -442,7 +433,7 @@ RUN python /tmp/cudartfix/extract_cudart_fix.py /tmp/cudartfix/capabilities.py /
 # cpu CAN prove is what this checks: the packages import, and fla is at least the 0.2.2 the probe
 # demands, so a device-bearing worker will get True. The capability itself is asserted where a gpu
 # exists: verl_child_can_reset_gdn_boundaries runs the real probes in the child, and
-# backend_common.require_gdn_boundary_resets RAISES for grpo/opd before a step runs.
+# backend_common.require_gdn_boundary_resets RAISES for grpo before a step runs.
 #
 # The stakes, unchanged: without fla transformers binds chunk_gated_delta_rule to the pure-torch
 # fallback, which accepts cu_seqlens and discards it, and without causal_conv1d the conv falls back
@@ -460,13 +451,12 @@ importlib.import_module('fla'); \
 assert version.parse(M.version('flash-linear-attention')) >= version.parse('0.2.2'), 'flash-linear-attention older than the 0.2.2 transformers requires: packed GDN boundary resets would be silently discarded'; \
 importlib.import_module('causal_conv1d'); \
 import json; source=json.loads(M.distribution('verl').read_text('direct_url.json')); assert source['url'].removesuffix('.git') == 'https://github.com/verl-project/verl' and source['vcs_info']['commit_id'] == '${VERL_SPEC##*@}', 'wrong upstream Verl source'; \
-assert M.version('xgrammar') == '0.1.25', 'opd structured gate requires xgrammar exactly 0.1.25, got ' + M.version('xgrammar'); \
 from vllm import ModelRegistry; \
 archs = set(ModelRegistry.get_supported_archs()); \
 missing = {'Qwen3_5ForConditionalGeneration','Qwen3_5MoeForConditionalGeneration'} - archs; \
 assert not missing, 'vllm cannot serve the default-model archs: ' + repr(sorted(missing)); \
 print('verl venv OK | verl', M.version('verl'), '| vllm', M.version('vllm'), '| torch', M.version('torch'), '| numpy', M.version('numpy'), '| xgrammar', M.version('xgrammar')); \
-print('  entrypoints: main_ppo (grpo), ppo.v1.trainer_sync (grpo/opd), sft_trainer (sft)'); \
+print('  entrypoints: main_ppo (grpo), ppo.v1.trainer_sync (grpo), sft_trainer (sft)'); \
 print('  qwen3.5 archs registered; exact upstream source verified'); \
 print('  gdn boundary resets: fla', M.version('flash-linear-attention'), 'and causal_conv1d installed and importable (capability itself is cuda-gated, asserted on the worker)')"
 

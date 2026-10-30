@@ -3,14 +3,11 @@ steps, GRPO > SFT, bigger model costs more, the wall cap bounds runs) + arithmet
 
 from __future__ import annotations
 
-import math
-
 import pytest
 
 from flash.cost import RunConfig, estimate_cost
 from flash.cost.analytical import (
     DEFAULT_WALL_CAP_S,
-    VLLM_INIT_S,
     _offline_gpu_shape,
     seconds_per_step,
     setup_seconds,
@@ -109,13 +106,6 @@ def test_setup_grpo_exceeds_sft_and_scales_with_model_size():
     assert setup_seconds(RunConfig(MID, "grpo", 1)) > setup_seconds(RunConfig(MID, "sft", 1))
     assert setup_seconds(RunConfig("Qwen/Qwen3.8-27B", "sft", 1)) > setup_seconds(
         RunConfig("Qwen/Qwen3.5-9B", "sft", 1)
-    )
-
-
-def test_setup_opd_includes_vllm_init():
-    # OPD now starts a colocated vLLM rollout engine too; wall-cap estimates must include that setup.
-    assert setup_seconds(RunConfig(MID, "opd", 1)) == pytest.approx(
-        setup_seconds(RunConfig(MID, "sft", 1)) + VLLM_INIT_S
     )
 
 
@@ -294,77 +284,6 @@ def test_nonpositive_run_knobs_rejected(knob, bad):
     # A <= 0 run knob produces a bogus quote, so it's rejected up front (like steps >= 1).
     with pytest.raises(ValueError, match=f"{knob} must be"):
         RunConfig(MID, "grpo", 100, **{knob: bad})
-
-
-@pytest.mark.parametrize(
-    ("multi_turn", "max_turns", "multiplier"),
-    [(False, None, 3), (True, 24, 72), (True, 64, 192), (True, None, 192)],
-)
-def test_opd_teacher_cost_uses_authoritative_request_multiplier(multi_turn, max_turns, multiplier):
-    from flash.cost.facts import teacher_token_cost_usd
-
-    config = RunConfig(
-        MID,
-        "opd",
-        1,
-        seq_len=1024,
-        batch_size=2,
-        group_size=1,
-        teacher_model="glm-5.3",
-        opd_multi_turn=multi_turn,
-        opd_max_turns=max_turns,
-    )
-
-    estimate = estimate_cost(config)
-
-    input_tokens = 2 * 1024 * multiplier
-    output_tokens = 2 * multiplier
-    assert estimate.teacher_api_usd == pytest.approx(
-        teacher_token_cost_usd(input_tokens, output_tokens, "glm-5.3")
-    )
-
-
-@pytest.mark.parametrize(
-    ("completions", "multi_turn", "max_turns", "expected_scored_requests"),
-    [
-        # single-turn: every completion costs OPD_NO_SIGNAL_ATTEMPTS (3) potentially-scored
-        # requests, because a bounded no-signal replacement consumes a slot whether or not it is
-        # needed. so 8 completions -> 24 requests, 9 -> 27, 16 -> 48.
-        (8, False, None, 24),
-        (9, False, None, 27),
-        (16, False, None, 48),
-        # multi-turn with no explicit cap bounds at OPD_MAX_EPISODE_TURNS (64) assistant turns,
-        # each of which is separately scored and separately retried: 1 * 64 * 3 = 192.
-        (1, True, None, 192),
-    ],
-)
-def test_opd_teacher_latency_uses_conservative_retry_and_turn_wave_policy(
-    completions,
-    multi_turn,
-    max_turns,
-    expected_scored_requests,
-):
-    from flash.cost.analytical import step_seconds_split
-    from flash.cost.facts import teacher_seconds_per_completion
-    from flash.teacher.limits import OPD_TEACHER_SCORING_CONCURRENCY
-
-    config = RunConfig(
-        MID,
-        "opd",
-        1,
-        batch_size=completions,
-        group_size=1,
-        opd_multi_turn=multi_turn,
-        opd_max_turns=max_turns,
-    )
-
-    _gpu_seconds, fixed_seconds = step_seconds_split(config, "L40S")
-
-    # hand-write the policy request count, including retries and per-turn scoring, but derive waves
-    # from the measured concurrency constant. using the production count helper would make this test
-    # self-fulfilling.
-    expected_waves = math.ceil(expected_scored_requests / OPD_TEACHER_SCORING_CONCURRENCY)
-    assert fixed_seconds == pytest.approx(expected_waves * teacher_seconds_per_completion())
 
 
 def test_revision_pinned_sizing_flows_into_setup_and_required_save(monkeypatch, tmp_path):

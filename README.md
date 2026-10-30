@@ -289,7 +289,7 @@ into `dev`**.
 - `tests/` — pytest suite, CPU-only and offline
 
 Within `flash/engine/worker/`, trainers live under `train/`, split by algorithm (`sft/`,
-`rl/`, `opd/`) over a shared `core/`. Each carries a `child/` holding stdlib-only modules
+`rl/`) over a shared `core/`. Each carries a `child/` holding stdlib-only modules
 **copied** into the verl subprocess rather than imported — flash and verl pin incompatible
 torch/vllm versions, so neither can import the other.
 
@@ -384,10 +384,3 @@ Removal stays `undeploying` until confirmed, including retries after cleanup err
 it never becomes `undeployed` merely because a removal request was sent. Existing
 persisted states are translated when loaded, preserving registration and generation
 fences. Deploy alongside the matching Freesolo deployment-state migration and backend.
-
-### Retired built-in OPD
-
-New built-in OPD runs and quotes are no longer offered. Use the custom algorithm API
-([#1553](https://github.com/freesolo-co/flash/pull/1553)) for on-policy distillation, with
-teacher access and the distillation loop owned by your custom algorithm. Existing OPD
-runs, recovery, checkpoints, exports, and deployments remain supported.

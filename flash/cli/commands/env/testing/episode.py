@@ -50,10 +50,6 @@ def _drive_episode(client, target: str, environment, case: EvalCase, args) -> di
     eval_module = _eval_module()
     example = _evaluation_example(case)
     state = environment.new_rollout_state(example)
-    # The per-example budget wins over the dataset-wide ceiling, the same precedence
-    # `rollout_done` applies (flash/envs/loading/adapter.py) and both training bridges compute
-    # (opd/bridge.py, rl/multi_turn.py). Using only `environment.max_turns` would run a case whose
-    # `max_episode_turns` is lower past its own budget.
     hard_cap = _effective_turn_cap(environment, state)
     turns = 0
     # True while the newest turn has not been through env_reply, mirroring the worker's own flag.
@@ -83,26 +79,6 @@ def _drive_episode(client, target: str, environment, case: EvalCase, args) -> di
         if environment.rollout_done(state, max_turns=hard_cap):
             break
 
-    # The loop exits before the inter-turn env_reply, leaving the last model turn unapplied. A
-    # stateful env would then score a transcript missing the last thing the model did: `env_reply`
-    # is what runs `step_episode`, so board state, metadata and `final_response_text` all lag one
-    # action behind. Apply it before scoring. Only the inter-turn glue is skipped, since no further
-    # model turn is conditioned on the reply.
-    #
-    # This DOES run at the turn cap, matching training. `rl/multi_turn.py` gates its reply solely on
-    # `rollout_done`, which counts `state["turn"]` -- incremented only by `env_reply`, never by
-    # `record_model_turn`. So after the capped model turn the counter is still one short, the check
-    # passes, and RL steps the env on that turn. `opd/bridge.py` skips only the reply that would
-    # glue on a next-turn prompt, which is the same thing skipped here by exiting the loop.
-    #
-    # An earlier revision suppressed this at the cap. That was wrong twice over: it dropped the
-    # last action's side effects from the scored state, and it made the branch unreachable outright
-    # -- `env_step_pending` survives only the line-70 break, whose condition is exactly what the
-    # extra guard then excluded.
-    #
-    # An env that already reports done is the one case still skipped: it has ended the episode
-    # itself, so `step_episode` has nothing left to apply and both `env test` and the RL worker
-    # stop there. Only the CAP half of the old guard was wrong.
     if env_step_pending and not environment.rollout_done(state, hard_cap):
         environment.env_reply(state["messages"], state)
     return state

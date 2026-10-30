@@ -20,6 +20,10 @@ This file starts at 1.1.35. Earlier releases are not reconstructed here; use
 
 ### Removed
 
+- Removed built-in OPD completely: training workers, managed teacher API and ledger, configuration,
+  sizing and pricing, retry and checkpoint support, and scaffolding. Existing OPD runs and OPD
+  artifact references are no longer supported; implement distillation through custom algorithms.
+
 - Removed training provider-cost reconciliation, realized-cost reporting and displays, and serving
   settlement reconciliation writes to Supabase. Customer charges, price estimates, and serving
   usage capture and delivery remain supported.

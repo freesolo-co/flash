@@ -367,7 +367,7 @@ def gdn_reset_arch_from_caps(caps: dict, gdn_module: str) -> str | None:
 def require_gdn_boundary_resets(caps: dict, gdn_module: str) -> str | None:
     """The arch to patch for a gdn hybrid, raising if the child cannot honor boundary resets.
 
-    On grpo/opd there is no safe fallback, so this raises rather than launching. verl's padded path
+    On grpo there is no safe fallback, so this raises rather than launching. verl's padded path
     (``use_remove_padding=False``) is boundary-correct but cannot complete a step: flash sets
     ``use_fused_kernels=True`` unconditionally and verl's fsdp engine has no guard for that pair, so
     the padded+fused branch returns a dense ``[bsz, response_len]`` where siblings re-nest via
@@ -425,13 +425,12 @@ def resolve_verl_python(workdir: str, *, install_wandb: bool = False) -> str:
         # dev-only fallback (production uses FLASH_VERL_PYTHON on a prebuilt verl image): verl brings
         # its own torch/vllm, so use a full install rather than --no-deps to include runtime deps.
         subprocess.run(["uv", "venv", "--python", VERL_VENV_PYTHON, venv], check=True)
-        # keep these overrides aligned with Dockerfile.worker. numpy and xgrammar
-        # override conflicting dependency metadata; vllm and transformers name the
+        # keep these overrides aligned with Dockerfile.worker. numpy, vllm and transformers name the
         # exact APIs used by the explicit model and tensor-adapter runtime.
         overrides = os.path.join(workdir, "verl-overrides.txt")
         with open(overrides, "w") as f:
             f.write(
-                f"numpy==2.2.6\nxgrammar==0.1.25\nvllm==0.19.1\n"
+                f"numpy==2.2.6\nvllm==0.19.1\n"
                 f"{TRANSFORMERS_INSTALL_REQUIREMENT}\n"
                 + "\n".join(VERL_FLASHINFER_REQUIREMENTS)
                 + "\n"
@@ -460,13 +459,11 @@ def resolve_verl_python(workdir: str, *, install_wandb: bool = False) -> str:
                 "cachetools==7.1.7",
                 "uvicorn==0.52.4",
                 "fastapi==0.141.1",
-                # opd's entrypoint calls tq.init()/tq.close(); absent from verl's setup.py.
                 "TransferQueue==0.1.11",
                 # older raises AttributeError on PyArrow PyExtensionType.
                 "datasets==5.0.1",
                 "qwen-vl-utils==0.0.14",
                 "torchvision==0.25.0",
-                "xgrammar==0.1.25",
                 "tqdm==4.70.0",
                 "pyarrow==25.0.1",
                 # gated-deltanet kernels, in LOCKSTEP with Dockerfile.worker's
@@ -502,7 +499,7 @@ def resolve_verl_python(workdir: str, *, install_wandb: bool = False) -> str:
         # written only after ALL installs succeed, so a venv that died between them is
         # unstamped and the next attempt rebuilds it rather than reusing a
         # half-provisioned interpreter. the conv kernel is best-effort to INSTALL but not
-        # optional to RECORD. grpo and opd pack, so require_gdn_boundary_resets raises for
+        # optional to RECORD. grpo pack, so require_gdn_boundary_resets raises for
         # a gdn model whose child lacks it; stamping a venv that missed the build would
         # hand every later attempt on this pod the same broken interpreter, with the stamp
         # asserting it is fully provisioned. leaving it unstamped costs one rebuild and
@@ -730,7 +727,7 @@ def rollout_sleep_unsupported(model_id: str) -> bool:
     """whether vLLM's sleep/wake cycle is non-functional for this model.
 
     a few models HANG on wake/reload rather than erroring (live-confirmed, every attempt), so the
-    catalog flags them and the rollout engine must stay RESIDENT instead. shared by grpo and opd:
+    catalog flags them and the rollout engine must stay RESIDENT instead. shared by grpo:
     verl runs the same ``vllm_async_server`` sleep path for both, so the flag has to mean the same
     thing on both drivers or the one that ignores it wedges on the flagged model.
     """
@@ -741,7 +738,7 @@ def rollout_sleep_unsupported(model_id: str) -> bool:
 
 
 def rollout_fp8_kv(cc_ok: bool, gdn_hybrid: bool, model_id: str) -> bool:
-    """whether the rollout engine may cache KV in fp8. shared by grpo and opd.
+    """whether the rollout engine may cache KV in fp8. shared by grpo.
 
     ``cc_ok`` (cc>=8.9) is the hardware floor. the gdn exclusion on top of it is narrower than it
     looks: the crash it avoids is vllm's ``init_fp8_kv_scales``, which zeroes each cache tensor and
@@ -798,7 +795,7 @@ def rollout_max_num_seqs(rollout_batch: int) -> int:
       allocation that -- unlike paged kv -- cannot be shared, paged out, or grown on demand.
 
     both are paid before the first rollout token, inside the ``gpu_memory_utilization`` budget. a
-    grpo/opd step submits exactly ``prompts_per_step * group_size`` sequences, so a run with 32
+    grpo step submits exactly ``prompts_per_step * group_size`` sequences, so a run with 32
     concurrent generations was provisioning for 1024 and dying during graph capture with ~80% of
     the card free -- on 234, 358, and 460 GB alike, since the cost is fixed rather than
     proportional to the card.
@@ -846,7 +843,7 @@ def rollout_layered_summon_overrides(target_parameters: Sequence[str] | None) ->
 
     verl gates the layered path on the base weights already living in vllm
     (``fsdp_utils.py:684``: it raises unless ``base_sync_done``, which
-    ``engine_workers.py:614`` derives as ``"dummy" not in load_format``). the rl and opd drivers
+    ``engine_workers.py:614`` derives as ``"dummy" not in load_format``). the rl drivers
     both already pin ``load_format=safetensors``, so that precondition holds wherever this
     applies. ``layered_summon`` is a rollout dataclass field
     (``workers/config/rollout.py:261``) that is also declared in ``rollout.yaml:98``, so it takes

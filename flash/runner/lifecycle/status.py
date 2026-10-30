@@ -164,7 +164,7 @@ def effective_spec_from_status(status: RunStatus, *, verify_source: bool = False
         worker_spec.workload_profile_input_digest or worker_spec.workload_profile
     )
     # a runner-managed revision exists only in the worker half, so bind it and its provenance marker
-    # to the preparation digest. a plain grpo or opd run otherwise reaches neither digest branch.
+    # to the preparation digest. a plain grpo run otherwise reaches neither digest branch.
     if has_workload_profile and snapshot.get("workload_profile") != (
         worker_spec.workload_profile or None
     ):
@@ -362,7 +362,6 @@ def record_heartbeat(run_id: str, heartbeat: dict) -> None:
             expected_stage = {
                 "sft": "sft_step",
                 "grpo": "rl_step",
-                "opd": "opd_step",
             }.get(status.spec.get("algorithm"))
             attempt = hb.get("attempt")
             remote_attempt = (

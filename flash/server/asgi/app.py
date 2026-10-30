@@ -118,7 +118,6 @@ def create_app():
             runs,
             serving,
             serving_completion,
-            teacher,
         )
     except ImportError as exc:
         raise RuntimeError(_SERVER_EXTRAS_HINT) from exc
@@ -131,7 +130,6 @@ def create_app():
         from flash.server.billing.retry import charge_retry_enabled
 
         check_run_preflight()  # operator credentials: fail fast, before serving anyone
-        db.recover_teacher_request_ledger()
         deployment_jobs._open_deployment_jobs()
         _open_status_reporter()
         # Reserve the durable-backlog scanner before recovery can fill its bounded lane.
@@ -231,7 +229,6 @@ def create_app():
     app.include_router(runs.router)
     app.include_router(serving.router)
     app.include_router(adapter_download.router)
-    app.include_router(teacher.router)
     return app
 
 

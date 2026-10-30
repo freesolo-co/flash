@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import contextlib
 import time
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
 
 import flash.runner.supervise.recovery as attempt_recovery
 from flash._internal.background import checkpoint, pause
@@ -19,7 +19,6 @@ from flash.runner.supervise.retry_decision import (
     _drop_weight_cache,
     _managed_cache_mounted,
 )
-from flash.teacher.retry_contract import OPD_RESUME_REVISION_ENV
 
 
 @dataclass
@@ -101,19 +100,6 @@ def _build_context(
     )
 
 
-def _require_opd_configuration(ctx: _SubmitContext) -> None:
-    if ctx.spec.algorithm != "opd":
-        return
-    from flash.runner.lifecycle.deadlines import _load_run_deadline_at
-    from flash.server.domain.teacher.broker import require_teacher_broker_configuration
-
-    # configuration and absolute policy fail before allocation can create a paid worker.
-    require_teacher_broker_configuration(
-        ctx.spec,
-        deadline_at=_load_run_deadline_at(ctx.spec.run_id),
-    )
-
-
 def _cleanup_previous_attempt(ctx: _SubmitContext, attempt: int) -> dict | None:
     if not ctx.last_handle:
         return None
@@ -192,14 +178,11 @@ def _prepare_attempt(ctx: _SubmitContext):
     retry_state = require_attempt_launch_current(ctx.spec.run_id, ctx.spec, claim)
     _mark_attempt_boundary(ctx, claim.attempt)
     attempt_runtime_secrets = dict(ctx.runtime_secrets or {})
-    attempt_runtime_secrets.pop(OPD_RESUME_REVISION_ENV, None)
-    if claim.resume_revision is not None:
-        attempt_runtime_secrets[OPD_RESUME_REVISION_ENV] = claim.resume_revision
     return (claim, attempt_spec, attempt_runtime_secrets, retry_state), None
 
 
 def _allocate_attempt(ctx: _SubmitContext, prepared):
-    claim, attempt_spec, _, _ = prepared
+    _, attempt_spec, _, _ = prepared
     from flash.providers.core.allocator import allocate
     from flash.providers.core.base import CapacityUnavailableError, PollResult, UnsupportedGpuError
     from flash.runner.lifecycle.deadlines import _load_run_deadline_at
@@ -239,37 +222,7 @@ def _allocate_attempt(ctx: _SubmitContext, prepared):
             failure="poll_error",
             detail=f"allocation failed ({type(exc).__name__})",
         )
-    return _pinned_to_resume_width(allocation, claim.resume_world_size), None
-
-
-def _pinned_to_resume_width(allocation, resume_world_size: int | None):
-    """Keep only candidates matching a pinned opd checkpoint's executed width."""
-    if not resume_world_size:
-        return allocation
-    loadable = []
-    for candidate in allocation.candidates:
-        executed_gpu_count = getattr(candidate, "executed_gpu_count", None)
-        width = (
-            executed_gpu_count
-            if type(executed_gpu_count) is int and executed_gpu_count > 0
-            else int(getattr(candidate, "gpu_count", 1))
-        )
-        if width == resume_world_size:
-            loadable.append(candidate)
-    loadable = tuple(loadable)
-    if loadable == allocation.candidates:
-        return allocation
-    if not loadable:
-        return replace(allocation, candidates=())
-    best = loadable[0]
-    return replace(
-        allocation,
-        candidates=loadable,
-        provider=best.provider,
-        gpu=best.gpu,
-        hourly_usd=best.hourly_usd,
-        gpu_count=best.gpu_count,
-    )
+    return allocation, None
 
 
 def _build_candidate_plan(ctx: _SubmitContext, prepared, allocation):
@@ -277,14 +230,6 @@ def _build_candidate_plan(ctx: _SubmitContext, prepared, allocation):
     from flash.providers.core.allocator import allocation_summary
     from flash.runner.lifecycle.deadlines import _spec_with_remaining_wall
     from flash.runner.supervise.lifecycle import _spec_with_gpu
-
-    if claim.resume_world_size and not allocation.candidates:
-        width = claim.resume_world_size
-        ctx.last_detail = (
-            f"no candidate executing at checkpoint world size {width} is available, and this "
-            "retry must preserve that executed rank width"
-        )
-        return None
 
     candidates, chosen = retry_state.select_candidate(allocation.candidates)
     if chosen is None:
@@ -412,32 +357,25 @@ def _submit_provider(ctx: _SubmitContext, prepared, candidate_plan):
         UnreconciledCreateError,
     )
     from flash.providers.core.registry import get_provider
-    from flash.runner.lifecycle.deadlines import _load_run_deadline_at, _worker_deadline_at
+    from flash.runner.lifecycle.deadlines import _worker_deadline_at
     from flash.runner.supervise.errors import _TerminalHandleRace
-    from flash.server.domain.teacher.broker import teacher_attempt_transport
 
     provider = get_provider(chosen.provider)
     try:
-        with teacher_attempt_transport(
-            run_spec,
-            attempt=claim.attempt,
-            deadline_at=_load_run_deadline_at(ctx.spec.run_id),
-        ) as teacher_secrets:
-            attempt_runtime_secrets.update(teacher_secrets)
-            submit_kwargs = {
-                "log": ctx.log,
-                "on_handle": _handle_callback(ctx, prepared, candidate_plan),
-                "attempt": claim.attempt,
-                "source_snapshot": ctx.source_snapshot,
-                # bounded, not the raw run deadline: while a profile is unarmed the
-                # persisted one still carries the queue allowance, and the bootstrap
-                # enforces whatever absolute deadline it is handed regardless of
-                # max_wall_seconds. see _worker_deadline_at.
-                "_deadline_at": _worker_deadline_at(ctx.spec.run_id, run_spec),
-            }
-            if attempt_runtime_secrets:
-                submit_kwargs["runtime_secrets"] = attempt_runtime_secrets
-            return provider.submit_attempt(run_spec, **submit_kwargs), False
+        submit_kwargs = {
+            "log": ctx.log,
+            "on_handle": _handle_callback(ctx, prepared, candidate_plan),
+            "attempt": claim.attempt,
+            "source_snapshot": ctx.source_snapshot,
+            # bounded, not the raw run deadline: while a profile is unarmed the
+            # persisted one still carries the queue allowance, and the bootstrap
+            # enforces whatever absolute deadline it is handed regardless of
+            # max_wall_seconds. see _worker_deadline_at.
+            "_deadline_at": _worker_deadline_at(ctx.spec.run_id, run_spec),
+        }
+        if attempt_runtime_secrets:
+            submit_kwargs["runtime_secrets"] = attempt_runtime_secrets
+        return provider.submit_attempt(run_spec, **submit_kwargs), False
     except _TerminalHandleRace:
         raise
     except Exception as exc:
@@ -587,12 +525,6 @@ def run_attempts_supervised(
     """Run one run's attempts with bounded auto-retry on infra-shaped failures."""
     ctx = None
     try:
-        if spec.algorithm == "opd":
-            from flash.server.domain.teacher.broker import preflight_validate_managed_teacher
-
-            # policy and plane configuration are spec-level gates and must fail before durable run state
-            # or source identity is consulted. the deadline-dependent gate still runs after context load.
-            preflight_validate_managed_teacher(spec)
         ctx = _build_context(
             spec,
             log,
@@ -600,7 +532,6 @@ def run_attempts_supervised(
             source_snapshot,
             reserved_claim,
         )
-        _require_opd_configuration(ctx)
         while True:
             checkpoint()
             prepared, completed_metrics = _prepare_attempt(ctx)

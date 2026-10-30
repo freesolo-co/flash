@@ -1051,7 +1051,6 @@ def test_run_deployment_smoke_does_not_cap_a_constrained_request(monkeypatch):
             max_completion_tokens=8192,
         ),
         _smoke_spec(algorithm="grpo", thinking=False, max_completion_tokens=8192),
-        _smoke_spec(algorithm="opd", thinking=False, max_completion_tokens=8192),
     ],
 )
 def test_run_deployment_smoke_keeps_non_thinking_paths_at_256(monkeypatch, spec):
@@ -1071,12 +1070,7 @@ def test_run_deployment_smoke_keeps_non_thinking_paths_at_256(monkeypatch, spec)
 
 @pytest.mark.parametrize(
     ("spec", "expected"),
-    [
-        # opd without grammar must still get a thinking-sized budget, bounded by the smoke ceiling.
-        (_smoke_spec(algorithm="opd", thinking=True, max_completion_tokens=8192), 2048),
-        # grpo thinking with no grammar and no explicit budget -> the thinking recipe default.
-        (_smoke_spec(algorithm="grpo", thinking=True), 1536),
-    ],
+    [(_smoke_spec(algorithm="grpo", thinking=True), 1536)],
 )
 def test_run_deployment_smoke_budgets_thinking_without_structured_outputs(
     monkeypatch, spec, expected
@@ -1117,7 +1111,7 @@ def test_run_deployment_smoke_rejects_truncated_thinking_without_a_grammar(monke
     )
 
     with pytest.raises(ServingError, match="smoke generation was truncated at the maximum token"):
-        _run_smoke(_smoke_spec(algorithm="opd", thinking=True, max_completion_tokens=8192))
+        _run_smoke(_smoke_spec(algorithm="grpo", thinking=True, max_completion_tokens=8192))
 
 
 def test_run_deployment_smoke_forwards_configured_stop_sequences(monkeypatch):
@@ -1362,7 +1356,6 @@ def test_smoke_budget_is_capped_independently_of_the_training_context():
     assert SMOKE_COMPLETION_TOKEN_CEILING < 8192
     for spec in (
         _smoke_spec(thinking=True, algorithm="sft", max_context_tokens=8192),
-        _smoke_spec(thinking=True, algorithm="opd", max_completion_tokens=8192),
         _smoke_spec(thinking=True, algorithm="grpo", max_completion_tokens=8192),
     ):
         assert resolve_smoke_completion_tokens(spec) == SMOKE_COMPLETION_TOKEN_CEILING
@@ -1371,7 +1364,6 @@ def test_smoke_budget_is_capped_independently_of_the_training_context():
     # what it does today, so capping cannot truncate a checkpoint that passes now.
     assert RECIPE.sft.max_seq_len_thinking <= SMOKE_COMPLETION_TOKEN_CEILING
     assert RECIPE.rl.max_completion_len_thinking <= SMOKE_COMPLETION_TOKEN_CEILING
-    assert RECIPE.opd.max_completion_len_thinking <= SMOKE_COMPLETION_TOKEN_CEILING
 
 
 def test_a_configured_grammar_keeps_the_runs_own_budget():
@@ -1388,7 +1380,7 @@ def test_a_configured_grammar_keeps_the_runs_own_budget():
         resolve_smoke_completion_tokens,
     )
 
-    for algorithm in ("grpo", "opd"):
+    for algorithm in ("grpo",):
         spec = _smoke_spec(
             thinking=True,
             algorithm=algorithm,

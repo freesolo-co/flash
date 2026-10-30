@@ -129,7 +129,7 @@ def test_checkpoint_hooks_are_scoped_to_one_model_and_removed_after_failure(monk
     assert not selected._load_state_dict_pre_hooks
 
 
-@pytest.mark.parametrize("algorithm", ["sft", "grpo", "opd"])
+@pytest.mark.parametrize("algorithm", ["sft", "grpo"])
 def test_submission_pins_base_before_other_preparation(monkeypatch, algorithm):
     from flash.core.spec import JobSpec
     from flash.runner.lifecycle import preparation, submit

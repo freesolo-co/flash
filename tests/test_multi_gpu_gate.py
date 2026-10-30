@@ -1,6 +1,6 @@
 """CPU tests for multi-gpu parity: every provider rents n cards on one machine, none is special.
 
-There is no submit-time multi-gpu gate any more. Every phase shards (sft, grpo and opd all delegate
+There is no submit-time multi-gpu gate any more. Every phase shards (sft, grpo all delegate
 to verl, whose workers launch nproc-per-node == gpu.count ranks) and all three providers can reach a
 real n-card box, so a rejection would have nothing left to reject. What replaces the gate is a
 contract each provider must hold up, and that is what these tests pin:
@@ -16,7 +16,6 @@ from __future__ import annotations
 
 import os
 import tempfile
-from types import SimpleNamespace
 
 import pytest
 
@@ -24,7 +23,6 @@ import flash.runner.lifecycle.state as runner_state
 import flash.runner.lifecycle.submit as runner_submit
 from tests._helpers.profile import satisfy_sft_profile
 from tests._helpers.source_snapshot import valid_source_snapshot
-from tests._helpers.teacher import configure_managed_teacher
 
 _PROVIDERS = ("modal",)
 _SOURCE_SNAPSHOT = valid_source_snapshot()
@@ -71,7 +69,7 @@ def test_no_multi_gpu_gate_survives_anywhere():
 
 
 @pytest.mark.parametrize("provider", _PROVIDERS)
-@pytest.mark.parametrize("algorithm", ["sft", "grpo", "opd"])
+@pytest.mark.parametrize("algorithm", ["sft", "grpo"])
 def test_submit_accepts_multi_gpu_on_every_provider(
     monkeypatch, all_providers_configured, provider, algorithm
 ):
@@ -84,7 +82,6 @@ def test_submit_accepts_multi_gpu_on_every_provider(
         monkeypatch.setattr(runner_state, "RUNS_DIR", os.path.join(tmp, "runs"))
         spec = _submittable(algorithm, count=4, provider=provider)
         satisfy_sft_profile(monkeypatch, spec)
-        configure_managed_teacher(monkeypatch, spec)
         status = runner_submit.submit_job(spec, dry_run=True)
         assert status is not None
 
@@ -152,8 +149,6 @@ def _submittable(
     from flash.core.spec import JobSpec
 
     train: dict = {"max_examples": 4}
-    if algorithm == "opd":
-        train["teacher_model"] = "kimi-k3"
     body: dict = {
         "model": "Qwen/Qwen3.5-9B",
         "algorithm": algorithm,
@@ -167,7 +162,7 @@ def _submittable(
     return JobSpec.from_dict(body)
 
 
-@pytest.mark.parametrize("algorithm", ["grpo", "sft", "opd"])
+@pytest.mark.parametrize("algorithm", ["grpo", "sft"])
 def test_submit_records_the_resolved_backend(monkeypatch, algorithm):
 
     # the run records which trainer actually ran, so it stays auditable from the run itself.
@@ -176,7 +171,6 @@ def test_submit_records_the_resolved_backend(monkeypatch, algorithm):
         monkeypatch.setattr(runner_state, "RUNS_DIR", os.path.join(tmp, "runs"))
         spec = _submittable(algorithm)
         satisfy_sft_profile(monkeypatch, spec)
-        configure_managed_teacher(monkeypatch, spec)
         status = runner_submit.submit_job(spec, dry_run=True)
         assert (status.effective_preparation or {}).get("backend") == expected
 
@@ -843,36 +837,6 @@ def test_unpinned_quote_bills_the_allocator_selected_count():
     assert two.total_usd < 2 * one.total_usd
 
 
-def test_structured_opd_compiler_vocab_is_card_independent():
-    """The worker's structured-OPD check reads vocabulary size, which no card shape can change.
-
-    This used to thread the allocated gpu/gpu_count down so an open model's fit check would judge the
-    shape it was actually placed on -- resolving a shardable run as one card re-raised "does not fit"
-    on the worker, after the box was rented. With only curated models trainable there is no fit check
-    inside resolution, so the shape cannot reach it and cannot reject anything: the resolved
-    vocabulary is a function of the model and its revision alone.
-    """
-    from flash.engine.worker.train.opd.orchestration.validation import _resolve_compiler_vocab_size
-
-    seen: list[tuple] = []
-
-    def _fake_resolve(model, algo, model_revision="", **kwargs):
-        seen.append((model, algo, model_revision, tuple(sorted(kwargs))))
-        return SimpleNamespace(vocab_size=151936)
-
-    monkey = pytest.MonkeyPatch()
-    try:
-        monkey.setattr("flash.core.catalog.resolve_model", _fake_resolve)
-        assert (
-            _resolve_compiler_vocab_size(model_id="Qwen/Qwen3.5-9B", model_revision="a" * 40)
-            == 151936
-        )
-        # the pin reaches resolution, and no card shape is passed along with it.
-        assert seen == [("Qwen/Qwen3.5-9B", "opd", "a" * 40, ())]
-    finally:
-        monkey.undo()
-
-
 def _vllm_tp_axis_failures(info, tp: int) -> list[str]:
     """Names of the vllm tensor-parallel axes a catalog row violates at width ``tp``.
 
@@ -899,27 +863,7 @@ def _vllm_tp_axis_failures(info, tp: int) -> list[str]:
 
 
 def test_every_catalog_row_shards_on_every_vllm_tensor_parallel_axis():
-    """A rentable width must satisfy EVERY vllm tp axis, not just the query heads we gate on.
-
-    grpo and opd hand the rented card count straight to the rollout engine as
-    ``tensor_model_parallel_size`` (``train/rl/verl_config.py``, ``train/opd/overrides.py``), and
-    vllm shards four INDEPENDENT axes when the engine initializes -- which happens after the box is
-    rented and billing has started. ``geometry_safe_gpu_cap`` certifies only the first of them and
-    documents that limit; the other three hold today purely as a property of this catalog, and a
-    new row is exactly what would break that silently.
-
-    The axes, read out of vllm 0.19.1 rather than inferred from docs:
-
-      * query heads -- ``config/model.py`` raises when ``total_num_attention_heads % tp != 0``.
-      * kv heads -- ``models/qwen3_next.py`` PARTITIONS them when ``kv >= tp`` (needs
-        ``kv % tp == 0``) and REPLICATES otherwise (needs ``tp % kv == 0``).
-      * GDN value heads and conv width -- ``layers/mamba/mamba_utils.py`` sizes the recurrent state
-        with ``divide(num_v_heads, tp)`` and ``divide(conv_dim, tp)``, and ``divide`` asserts exact
-        divisibility.
-
-    This pins the whole surface at the widths a run can actually be rented at, so a row that only
-    divides on query heads is caught here rather than on a paid box.
-    """
+    """A rentable width must satisfy EVERY vllm tp axis, not just the query heads we gate on."""
     from flash.core.catalog import MODELS
     from flash.providers.core.allocator import geometry_safe_gpu_cap
     from flash.providers.core.base import rentable_gpu_counts

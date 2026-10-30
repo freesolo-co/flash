@@ -26,7 +26,6 @@ from flash.runner.supervise.deploy import (
 )
 from flash.schema import train_schema_metadata
 from flash.serve.deployment.preflight import ServingPreflightError
-from flash.server.domain.teacher.broker import TeacherBrokerConfigurationError
 from flash.server.platform import db
 from flash.server.platform.deps import (
     _parse_spec,
@@ -272,10 +271,7 @@ def _submit_failure_http_error(exc: Exception) -> HTTPException:
     """
     if isinstance(exc, (SourceSnapshotPublicationError, TaskAdmissionError)):
         return HTTPException(status_code=503, detail=str(exc))
-    if (
-        isinstance(exc, (ImageGeometryUnavailable, TeacherBrokerConfigurationError))
-        and exc.plane_fault
-    ):
+    if isinstance(exc, ImageGeometryUnavailable) and exc.plane_fault:
         return HTTPException(status_code=503, detail=str(exc))
     return HTTPException(status_code=400, detail=str(exc))
 

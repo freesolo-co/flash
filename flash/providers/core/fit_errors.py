@@ -47,21 +47,16 @@ def batch_bound_width_note(*, algorithm: str = "", parenthetical: bool = False) 
     THE wording for that gap, shared by every message that shows one. The operator has to learn that
     the card ceiling is not the limiter, or they raise `--gpus` and hit the identical failure.
 
-    The reason is per-algorithm because the bounding quantity is: sft counts rows, grpo and opd count
-    the sequences one step holds. Naming sft's rows to an opd user would point them at a knob opd
-    rejects at parse time -- which is exactly what the pinned-class path in ``allocator`` did while it
-    spelled this sentence itself.
-
-    For grpo and opd it also states the DIRECTION, because the general knob advice appended after it
+    For grpo it also states the DIRECTION, because the general knob advice appended after it
     says to lower those same knobs and here that is a dead end: a step bound by its sequence count
     cannot go below one prompt, and RAISING the count is what buys ranks. MEASURED at 32k on eight
     180 GB cards -- every width-bound catalog row fits once the step is wide enough to fill more
-    ranks (27B grpo at 4, 35B grpo and both 27B/35B opd at 2), and none of them fits by shrinking.
+    ranks (27B grpo at 4, 35B grpo at 2), and none of them fits by shrinking.
 
     ``parenthetical`` when a remedy clause follows -- a trailing dash clause would swallow it, so
     "..., or lower batch_size" would read as part of the explanation rather than as the fix.
     """
-    if (algorithm or "").lower() in ("grpo", "rl", "opd"):
+    if (algorithm or "").lower() in ("grpo", "rl"):
         reason = (
             "every rank needs its own share of the step, so prompts_per_step x group_size bounds "
             "the rank count; RAISE it to buy ranks"
@@ -89,14 +84,6 @@ def vram_knob_advice(algorithm: str) -> str:
         return (
             "lower [train].max_context_tokens / [train].max_completion_tokens / "
             "[train].lora_rank to fit"
-        )
-    if algorithm == "opd":
-        # names prompts_per_step, not batch_size: opd REJECTS batch_size at parse time, so the old
-        # wording sent a user whose run did not fit straight into a config error.
-        return (
-            "lower [train].group_size and/or [train].prompts_per_step (rollout concurrency = "
-            "prompts_per_step x group_size; distillation needs no group variance, so group_size=1 "
-            "is fine) and/or [train].max_completion_tokens / [train].max_context_tokens to fit"
         )
     return "lower [train].batch_size / [train].max_context_tokens / [train].lora_rank to fit"
 
@@ -337,13 +324,6 @@ def vram_fit_error_message(
     ceiling = (
         f"{shape} ({biggest:g} GB max){_batch_bound_width_note(widest_join, algorithm=algorithm)}"
     )
-    if algorithm == "opd":
-        return (
-            f"opd needs >= {need:g} GB VRAM, more than {ceiling}. "
-            "opd is resident-only: the trainer and the colocated vLLM student rollout engine hold "
-            "two model-weight copies plus the rollout KV cache at once. "
-            f"{vram_knob_advice(algorithm).capitalize()}."
-        )
     return (
         f"{algorithm} needs >= {need:g} GB VRAM, more than {ceiling}. "
         f"{vram_knob_advice(algorithm).capitalize()}."

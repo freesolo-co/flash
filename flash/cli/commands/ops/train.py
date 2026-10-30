@@ -76,7 +76,7 @@ def _request_server_quote(args, spec, authored_train_keys: frozenset[str]) -> di
 
 
 def _cmd_train_cost_rl(args, spec, authored_train_keys: frozenset[str]) -> int:
-    """Authoritative grpo/opd quote from the same preparation used by submission."""
+    """Authoritative grpo quote from the same preparation used by submission."""
     from flash.cli.commands.ops.prompt_budget import print_status_prompt_budget_warning
 
     status = _request_server_quote(args, spec, authored_train_keys)

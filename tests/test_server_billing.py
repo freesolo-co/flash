@@ -742,7 +742,7 @@ def test_unsupported_spec_reports_itself_rather_than_insufficient_balance(api, m
     )
 
     assert res.status_code == 400, res.text
-    assert "Built-in OPD has been retired" in res.text
+    assert "unsupported algorithm" in res.text
     assert "insufficient" not in res.text
 
 

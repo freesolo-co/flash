@@ -1,7 +1,6 @@
 """Shared synchronous trainer policy using upstream Verl's V1 lifecycle hooks."""
 
 import contextlib
-import importlib
 
 from omegaconf import OmegaConf
 from verl.trainer.ppo.utils import Role
@@ -9,11 +8,11 @@ from verl.trainer.ppo.v1.trainer_sync import PPOTrainerSync
 
 from flash.engine.worker.runtime.phases import training_phase
 from flash.engine.worker.train.core.child.options import RuntimeOptions
+from flash.engine.worker.train.core.child.queue import _init_transfer_queue
 from flash.engine.worker.train.core.child.readiness import publish_ready
+from flash.engine.worker.train.core.child.replay import BoundedReplayBuffer
 from flash.engine.worker.train.core.child.tracking import publish_tracking_link
 from flash.engine.worker.train.core.lifecycle.timing import checkpoint_phase
-from flash.engine.worker.train.opd.child.policy import _init_transfer_queue
-from flash.engine.worker.train.opd.child.replay import BoundedReplayBuffer
 
 
 class FlashSyncTrainer(PPOTrainerSync):
@@ -66,15 +65,9 @@ class FlashTaskRunner:
         import transfer_queue as tq
 
         options = RuntimeOptions.decode(dict(config.actor_rollout_ref.model.runtime_options))
-        module = "rl" if options.algorithm == "grpo" else "opd"
-        name = "FlashGrpoTrainer" if module == "rl" else "FlashPPOTrainer"
-        trainer_type = getattr(
-            importlib.import_module(f"flash.engine.worker.train.{module}.child.trainer"), name
-        )
-        manager_type = getattr(
-            importlib.import_module(f"flash.engine.worker.train.{module}.child.rollout"),
-            "FlashGrpoManager" if module == "rl" else "FlashOpdManager",
-        )
+        from flash.engine.worker.train.rl.child.rollout import FlashGrpoManager
+        from flash.engine.worker.train.rl.child.trainer import FlashGrpoTrainer
+
         OmegaConf.resolve(config)
         trainer = None
         succeeded = False
@@ -83,12 +76,11 @@ class FlashTaskRunner:
         _init_transfer_queue(tq.init, config.transfer_queue)
         try:
             with training_phase("trainer_initialization"):
-                trainer = trainer_type(config=config)
+                trainer = FlashGrpoTrainer(config=config)
                 trainer.init()
-            manager = manager_type.create(
+            manager = FlashGrpoManager.create(
                 config=config,
                 llm_client=trainer.get_llm_client(),
-                teacher_client=trainer.get_teacher_client(),
                 reward_loop_worker_handles=trainer.get_reward_handles(),
             )
             publish_ready(options)

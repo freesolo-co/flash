@@ -1299,7 +1299,6 @@ dev = [
     { name = "referencing" },
     { name = "regex" },
     { name = "ruff" },
-    { name = "tiktoken" },
     { name = "tokenizers" },
     { name = "transformers" },
     { name = "uvicorn" },
@@ -1311,7 +1310,6 @@ gpu = [
     { name = "httpx" },
     { name = "huggingface-hub" },
     { name = "peft" },
-    { name = "tiktoken" },
     { name = "tokenizers" },
     { name = "torch", version = "2.10.0", source = { registry = "https://pypi.org/simple" } },
     { name = "transformers" },
@@ -1375,7 +1373,6 @@ dev = [
     { name = "pytest-xdist" },
     { name = "pyyaml" },
     { name = "ruff" },
-    { name = "tiktoken" },
     { name = "tokenizers" },
 ]
 
@@ -1434,8 +1431,6 @@ requires-dist = [
     { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.6,<0.18" },
     { name = "safetensors", marker = "extra == 'serve-runtime'", specifier = ">=0.8,<1" },
     { name = "starlette", marker = "extra == 'serving'", specifier = ">=0.46,<2" },
-    { name = "tiktoken", marker = "extra == 'dev'", specifier = ">=0.12" },
-    { name = "tiktoken", marker = "extra == 'gpu'", specifier = ">=0.12" },
     { name = "tokenizers", marker = "extra == 'dev'", specifier = ">=0.22" },
     { name = "tokenizers", marker = "extra == 'gpu'", specifier = ">=0.22" },
     { name = "tokenizers", marker = "extra == 'serve-runtime'", specifier = ">=0.22" },
@@ -1466,7 +1461,6 @@ dev = [
     { name = "pytest-xdist", specifier = ">=3.6" },
     { name = "pyyaml", specifier = ">=6" },
     { name = "ruff", specifier = ">=0.6,<0.18" },
-    { name = "tiktoken", specifier = ">=0.12" },
     { name = "tokenizers", specifier = ">=0.22" },
 ]
 

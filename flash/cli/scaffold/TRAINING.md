@@ -425,22 +425,8 @@ is the _expected_ steady state, not a symptom. Upload failures can stretch the g
 `flash runs status` says so itself once the heartbeat passes 5 minutes — _"heartbeat uploads
 are throttled; quiet is not dead"_.
 
-**Legacy OPD runs use a tighter heartbeat threshold.** The 900 s figure is
-the throttle for an ordinary stage ping. OPD's post-update ping is issued with `force=True`,
-which bypasses that throttle and is instead bounded by the forced-commit floor of **60 s**
-(`_HB_FORCE_MIN_INTERVAL_S`), gated on the step having advanced. So an OPD run that is still
-applying updates re-publishes roughly every optimizer step, subject only to that 60 s floor —
-and an OPD heartbeat stuck for several minutes already means updates have stopped, which is
-exactly the window the 15 min guidance below would tell you to ignore on a billed run.
-
-So treat age as a threshold, not a verdict, and pick the threshold for the algorithm:
-
-- _Legacy OPD, past ~2-3 min in a stepping stage (`opd_step`):_ act. Updates should be re-publishing
-  at the 60 s floor, so a multi-minute gap is already anomalous rather than expected quiet.
-  (Setup and rollout stages — `opd_model_load`, `opd_filtering_prompts`, `opd_vllm_initializing`
-  — are liveness-driven and legitimately quieter; the tight threshold is for stepping.)
-- _Otherwise, under ~15 min:_ tells you nothing is wrong. Do not act.
-- _Otherwise, well past ~15 min:_ suspicious, still not conclusive. Corroborate before deciding —
+- _ under ~15 min:_ tells you nothing is wrong. Do not act.
+- _ well past ~15 min:_ suspicious, still not conclusive. Corroborate before deciding —
   check the provider/attempt state, and your `[wandb]` run if you configured one. A retry that has
   already started will show a new attempt.
 
@@ -879,7 +865,7 @@ Pick SFT when you already have good answers and want the model to imitate them.
   GRPO-sleep sizing, so setting either alongside `init_from_adapter` is rejected at submit; it
   also rejects a source adapter whose rank exceeds the serving cap.
 - **Any algorithm can warm-start from any other.** All nine source/target combinations are
-  supported — SFT and GRPO can read adapters from SFT, GRPO, or legacy OPD runs,
+  supported — SFT and GRPO can read adapters from SFT or GRPO runs,
   including same-algorithm continuation (`sft` → `sft` to keep training on more data, `grpo` →
   `grpo` to extend a run). The source is named the same way in every case, and the only
   cross-run requirements are the shared base model and the rank/alpha rules above.
@@ -890,7 +876,7 @@ algorithm = "grpo"
 
 [train]
 # use the source run's permanent final checkpoint, or /step-n for a specific checkpoint
-# listed by `flash runs checkpoint <run-id>`. the source may be an sft, grpo, or opd run,
+# listed by `flash runs checkpoint <run-id>`. the source may be an sft or grpo run,
 # and `algorithm` above may be sft or grpo.
 init_from_adapter = "<source-run-id>/final"
 # do NOT set lora_rank or lora_alpha for a warm-start: the source adapter's rank and alpha
@@ -904,20 +890,6 @@ derived count with an exact update horizon for every algorithm. `[train] save_at
 requires a positive `max_steps` so its horizon is authoritative even when SFT packing changes the
 realized batch shape. When non-empty, exact save steps suppress periodic `save_every` checkpoints, and the
 run fails if a requested exact save cannot be saved and published.
-
----
-
-## On-policy distillation migration
-
-Built-in `algorithm = "opd"` is retired. New training runs, dry runs, and cost quotes reject it.
-Use `algorithm = "custom"` and implement the distillation loop with the custom algorithm API
-instead. The custom loop owns teacher access, token alignment, sampling, and the loss; the old
-managed `train.teacher_model` configuration does not transfer automatically.
-
-The custom algorithm API is introduced in [PR #1553](https://github.com/freesolo-co/flash/pull/1553).
-Existing OPD runs keep their worker and recovery path. Their status, logs, checkpoints, exports,
-and deployments remain accessible, and their adapters can still warm-start SFT or GRPO.
-`flash env setup` no longer creates `configs/opd.toml` and leaves existing files untouched.
 
 ---
 
@@ -1547,7 +1519,7 @@ Do **not** read the allocated count off `spec.gpu.count` in `flash runs status`.
 authored ceiling, and an auto-sized public spec retains the digest-stable integer placeholder rather
 than the selected shape. `gpu_status.device_count` is a genuine worker-side observation, but it is
 not a reliable place to look either: the mid-run heartbeats
-(`sft_train`, `opd_step`, `rl_step`) collect diagnostics without torch, and each heartbeat _replaces_
+(`sft_train`, `rl_step`) collect diagnostics without torch, and each heartbeat _replaces_
 `gpu_status` wholesale, so the field is usually absent while a run is live and reappears only on the
 terminal heartbeat.
 

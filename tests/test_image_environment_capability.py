@@ -6,7 +6,6 @@ from types import SimpleNamespace
 import pytest
 
 import flash.engine.worker.runtime.state as worker_state
-from flash.content.multimodal import validate_image_observation_environment
 from flash.envs.loading.adapter import FreesoloEnvironment
 from flash.envs.loading.base import BaseEnvironment
 
@@ -15,11 +14,11 @@ class _PlainEnvironment(BaseEnvironment):
     pass
 
 
-def _spec(model: str, algorithm: str = "grpo", teacher_model: str | None = None):
+def _spec(model: str, algorithm: str = "grpo"):
     return SimpleNamespace(
         model=model,
         algorithm=algorithm,
-        train=SimpleNamespace(teacher_model=teacher_model),
+        train=SimpleNamespace(),
     )
 
 
@@ -50,7 +49,7 @@ def test_worker_environment_load_applies_the_capability_guard(worker_context, mo
         environment=SimpleNamespace(id="local", params={}, resolved_sha=""),
         model="meta-llama/Llama-3.2-1B",
         algorithm="grpo",
-        train=SimpleNamespace(teacher_model=None, hf_repo=""),
+        train=SimpleNamespace(hf_repo=""),
         thinking=False,
     )
     monkeypatch.setattr(worker_context, "config", replace(worker_context.config, spec=spec))
@@ -62,33 +61,3 @@ def test_worker_environment_load_applies_the_capability_guard(worker_context, mo
 
     with pytest.raises(ValueError, match="does not support image-bearing"):
         worker_context.require_active_env()
-
-
-@pytest.mark.parametrize("teacher", ["qwen3-vl-235b", "qwen3.5-397b-a17b", "qwen3.8-27b"])
-def test_dynamic_image_capability_requires_an_image_capable_model_and_opd_teacher(teacher):
-    dynamic = SimpleNamespace(image_observations=True)
-    static = SimpleNamespace(image_observations=False)
-
-    validate_image_observation_environment(
-        dynamic,
-        _spec("Qwen/Qwen3.5-9B"),
-    )
-    validate_image_observation_environment(
-        dynamic,
-        _spec("Qwen/Qwen3.5-9B", "opd", teacher),
-    )
-    validate_image_observation_environment(
-        static,
-        _spec("meta-llama/Llama-3.2-1B", "opd", "glm-5.3"),
-    )
-
-    with pytest.raises(ValueError, match="does not support image-bearing"):
-        validate_image_observation_environment(
-            dynamic,
-            _spec("meta-llama/Llama-3.2-1B"),
-        )
-    with pytest.raises(ValueError, match=r"selected teacher 'glm-5\.3' cannot see images"):
-        validate_image_observation_environment(
-            dynamic,
-            _spec("Qwen/Qwen3.5-9B", "opd", "glm-5.3"),
-        )

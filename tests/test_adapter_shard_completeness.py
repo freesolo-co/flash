@@ -275,17 +275,6 @@ def test_checkpoint_listing_offers_a_sharded_step():
     assert not _has_required_adapter_files({"adapter_config.json", _SHARDS[0]})
 
 
-def test_opd_resume_gate_rejects_an_orphan_shard():
-    from flash.teacher.retry_contract import (
-        OPD_RESUME_STATE_REQUIRED_FILES,
-        opd_resume_checkpoint_complete,
-    )
-
-    state = set(OPD_RESUME_STATE_REQUIRED_FILES)
-    assert opd_resume_checkpoint_complete({*state, *_SHARDS, _INDEX})
-    assert not opd_resume_checkpoint_complete({*state, _SHARDS[0]})
-
-
 def test_export_refuses_shards_without_an_index(tmp_path):
     """export fell back to shipping every matching shard, producing weights peft loads as a no-op."""
     from flash.serve.deployment import export

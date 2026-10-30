@@ -771,38 +771,7 @@ def test_sft_step_liveness_upload_is_throttled(worker_context, monkeypatch):
     assert len(uploads) == 1, "sft_step uploads must be throttled to one per _HB_MIN_INTERVAL_S"
 
 
-def test_opd_step_post_update_heartbeat_forces_through_throttle(worker_context, monkeypatch):
-    """Regression (heartbeat.py/opd.py): a mid-step opd_step progress ping (carrying the
-    PREVIOUS opt_steps) can claim the throttle slot immediately before the post-update ping (the
-    incremented step). Without force the stepped commit is throttled out, so a cancellation is billed
-    from the STALE step even though the update landed. heartbeat(force=True) must upload within the
-    throttle interval; a NON-forced opd_step in the same window is still throttled."""
-
-    uploads: list = []
-    monkeypatch.setattr(worker_heartbeat, "_HB_MIN_INTERVAL_S", 60.0)
-    monkeypatch.setattr(
-        worker_hf, "hf_upload_file", lambda local, *a, context=None, **k: uploads.append(local)
-    )
-    worker_context.heartbeat_state.last_upload = 0.0
-    worker_context.heartbeat_state.last_forced_upload = 0.0
-    worker_context.heartbeat_state.last_committed_step = 0
-    worker_heartbeat.heartbeat(
-        "opd_step", step=5, samples_done=1, context=worker_context
-    )  # mid-step ping claims the slot (stale step 5)
-    assert len(uploads) == 1
-    worker_heartbeat.heartbeat(
-        "opd_step", step=6, samples_done=2, context=worker_context
-    )  # normal ping within 60s -> throttled out
-    assert len(uploads) == 1, "a non-forced opd_step within the interval must be throttled"
-    worker_heartbeat.heartbeat(
-        "opd_step", step=6, loss=0.1, coverage=1.0, force=True, context=worker_context
-    )  # post-update forces through
-    assert len(uploads) == 2, (
-        "force=True must commit the stepped post-update ping despite the throttle"
-    )
-
-
-@pytest.mark.parametrize("stage", ["rl_step", "opd_step"])
+@pytest.mark.parametrize("stage", ["rl_step"])
 def test_forced_sample_payload_commits_after_same_step_liveness(worker_context, monkeypatch, stage):
     """a liveness commit for a step must not throttle the first sample payload for that step."""
 
@@ -900,63 +869,6 @@ def test_initial_rl_step_lock_timeout_is_retriable(worker_context, monkeypatch):
         worker_context.heartbeat_state.upload_lock.release()
 
 
-def test_forced_opd_step_commits_each_distinct_step_advance(worker_context, monkeypatch):
-    """Regression (heartbeat.py): when optimizer steps land FARTHER apart than the force
-    floor (the normal teacher-round-trip-gated regime), every DISTINCT completed step still commits
-    exactly once within the 900s throttle window, so a cancel always bills the true latest step — none
-    is dropped. (A sub-floor BURST is instead coalesced to protect the HF commit cap; see the burst test
-    below.) Modelled with a zero force floor: each advancing step exceeds it, so none is floored out."""
-
-    uploads: list = []
-    monkeypatch.setattr(worker_heartbeat, "_HB_MIN_INTERVAL_S", 900.0)
-    monkeypatch.setattr(worker_heartbeat, "_HB_FORCE_MIN_INTERVAL_S", 0.0)
-    monkeypatch.setattr(
-        worker_hf, "hf_upload_file", lambda local, *a, context=None, **k: uploads.append(local)
-    )
-    worker_context.heartbeat_state.last_upload = 0.0
-    worker_context.heartbeat_state.last_forced_upload = 0.0
-    worker_context.heartbeat_state.last_committed_step = 0
-    for stepv in (1, 2, 3, 4):
-        worker_heartbeat.heartbeat(
-            "opd_step", step=stepv, loss=0.1, force=True, context=worker_context
-        )
-    assert len(uploads) == 4, "each distinct forced step advance beyond the floor must commit"
-    assert worker_context.heartbeat_state.last_committed_step == 4
-
-
-def test_forced_opd_step_burst_within_floor_coalesces_to_protect_commit_cap(
-    worker_context, monkeypatch
-):
-    """Regression (heartbeat.py): a tiny/fast OPD config (batch=1, group=1, small student,
-
-    cached teacher) can land optimizer updates many times per minute. Unthrottled, force=True would
-    turn every post-step ping into an HF commit and blow the per-repo commit cap before the final
-    adapter/DONE upload.
-    """
-
-    uploads: list = []
-    monkeypatch.setattr(worker_heartbeat, "_HB_MIN_INTERVAL_S", 900.0)
-    monkeypatch.setattr(worker_heartbeat, "_HB_FORCE_MIN_INTERVAL_S", 60.0)
-    monkeypatch.setattr(
-        worker_hf, "hf_upload_file", lambda local, *a, context=None, **k: uploads.append(local)
-    )
-    worker_context.heartbeat_state.last_upload = (
-        time.time()
-    )  # a recent upload -> the 900s regular throttle blocks every ping
-    worker_context.heartbeat_state.last_forced_upload = (
-        0.0  # forced clock cold -> only the first advance punches through
-    )
-    worker_context.heartbeat_state.last_committed_step = 0
-    for stepv in (1, 2, 3, 4, 5):
-        worker_heartbeat.heartbeat(
-            "opd_step", step=stepv, loss=0.1, force=True, context=worker_context
-        )
-    assert len(uploads) == 1, (
-        "a sub-floor burst of forced step-advances must commit once, not per step"
-    )
-    assert worker_context.heartbeat_state.last_committed_step == 1
-
-
 def test_force_commit_via_regular_throttle_arms_the_floor(worker_context, monkeypatch):
     """Regression (heartbeat.py): a force=True heartbeat that commits because the regular
     throttle was ALREADY due (not because the force branch bypassed it) must STILL arm the forced-commit
@@ -975,86 +887,16 @@ def test_force_commit_via_regular_throttle_arms_the_floor(worker_context, monkey
     worker_context.heartbeat_state.last_forced_upload = 0.0
     worker_context.heartbeat_state.last_committed_step = 0
     worker_heartbeat.heartbeat(
-        "opd_step", step=1, loss=0.1, force=True, context=worker_context
+        "rl_step", step=1, loss=0.1, force=True, context=worker_context
     )  # commits via the elapsed regular throttle
     assert len(uploads) == 1
     worker_heartbeat.heartbeat(
-        "opd_step", step=2, loss=0.1, force=True, context=worker_context
+        "rl_step", step=2, loss=0.1, force=True, context=worker_context
     )  # sub-floor advance -> must be COALESCED now
     assert len(uploads) == 1, (
         "the regular-path force commit must arm the floor so the next is coalesced"
     )
     assert worker_context.heartbeat_state.last_committed_step == 1
-
-
-def test_forced_opd_step_repeated_same_step_does_not_recommit(worker_context, monkeypatch):
-    """Self-limiting counterpart: a forced ping whose step does NOT advance past the last committed step
-    (a redundant post-update carrying the same opt_steps, or a retry) stays throttled. So forcing can't
-    inflate commits beyond the actual optimizer-step rate and blow the HF per-repo commit cap."""
-
-    uploads: list = []
-    monkeypatch.setattr(worker_heartbeat, "_HB_MIN_INTERVAL_S", 900.0)
-    monkeypatch.setattr(
-        worker_hf, "hf_upload_file", lambda local, *a, context=None, **k: uploads.append(local)
-    )
-    worker_context.heartbeat_state.last_upload = 0.0
-    worker_context.heartbeat_state.last_forced_upload = 0.0
-    worker_context.heartbeat_state.last_committed_step = 0
-    worker_heartbeat.heartbeat(
-        "opd_step", step=7, loss=0.1, force=True, context=worker_context
-    )  # first commit at step 7
-    assert len(uploads) == 1
-    for _ in range(3):  # same step, within throttle -> force must NOT re-commit
-        worker_heartbeat.heartbeat("opd_step", step=7, loss=0.1, force=True, context=worker_context)
-    assert len(uploads) == 1, "forced pings that don't advance the step must not re-commit"
-    assert worker_context.heartbeat_state.last_committed_step == 7
-
-
-def test_forced_opd_step_commit_failure_rolls_back_committed_step(worker_context, monkeypatch):
-    """If a forced commit's upload FAILS, the committed-step marker AND the forced-commit clock roll back
-
-    with the throttle slot -- so the retry at the same step still forces through (fstep must again
-    exceed the last committed step, and the floor must not treat the failed attempt as a landed
-    forced commit that delays the retry). Otherwise the failed step would be recorded as committed /
-    the retry would be floored out, and a cancel would bill the stale prior step.
-    """
-
-    attempts: list = []
-    fail = {"on": False}
-
-    def _upload(local, *a, context=None, **k):
-        attempts.append(1)
-        return not fail["on"]
-
-    monkeypatch.setattr(worker_heartbeat, "_HB_MIN_INTERVAL_S", 900.0)
-    monkeypatch.setattr(worker_heartbeat, "_HB_FORCE_MIN_INTERVAL_S", 0.0)
-    monkeypatch.setattr(worker_hf, "hf_upload_file", _upload)
-    worker_context.heartbeat_state.last_upload = 0.0
-    worker_context.heartbeat_state.last_forced_upload = 0.0
-    worker_context.heartbeat_state.last_committed_step = 0
-    worker_heartbeat.heartbeat(
-        "opd_step", step=2, force=True, context=worker_context
-    )  # succeeds -> committed step = 2, slot claimed
-    assert worker_context.heartbeat_state.last_committed_step == 2
-    forced_clock_after_2 = (
-        worker_context.heartbeat_state.last_forced_upload
-    )  # any force=True commit arms the forced clock
-    fail["on"] = True
-    worker_heartbeat.heartbeat(
-        "opd_step", step=3, force=True, context=worker_context
-    )  # forces (3>2) within throttle, but upload FAILS
-    assert worker_context.heartbeat_state.last_committed_step == 2, (
-        "a failed forced commit must roll back the committed step"
-    )
-    assert forced_clock_after_2 == worker_context.heartbeat_state.last_forced_upload, (
-        "and roll back the forced clock"
-    )
-    fail["on"] = False
-    worker_heartbeat.heartbeat(
-        "opd_step", step=3, force=True, context=worker_context
-    )  # retry: still throttled by time, must force on 3>2
-    assert worker_context.heartbeat_state.last_committed_step == 3
-    assert len(attempts) == 3, "the retry must re-attempt the upload, not be throttled/blocked out"
 
 
 def test_setup_liveness_upload_uses_shorter_interval(worker_context, monkeypatch):
@@ -1294,17 +1136,17 @@ def test_is_training_heartbeat_gates_setup_vs_training():
     assert is_training_heartbeat("rl_step", 0) is False
     assert is_training_heartbeat("sft_step", 0) is False
     assert (
-        is_training_heartbeat("opd_step", 0) is False
-    )  # opd first-step in-progress ping (opt_steps==0)
+        is_training_heartbeat("rl_step", 0) is False
+    )  # first-step in-progress ping (opt_steps==0)
     assert is_training_heartbeat("rl_step", 1) is True
     assert is_training_heartbeat("sft_step", 3) is True
     assert (
-        is_training_heartbeat("opd_step", 1) is True
+        is_training_heartbeat("rl_step", 1) is True
     )  # tightens once a real optimizer update lands
     # A malformed/missing step on a per-step stage is treated as 0 (must not raise) -> stays setup.
     assert is_training_heartbeat("rl_step", None) is False
     assert is_training_heartbeat("sft_step", "not-a-number") is False
-    assert is_training_heartbeat("opd_step", None) is False
+    assert is_training_heartbeat("rl_step", None) is False
     # POST-training stages carry NO step but mean training is DONE -> tighten so a hung teardown/DONE
     # upload falls under the tight window, not the wide setup grace.
     assert is_training_heartbeat("rl_trained", None) is True
@@ -1440,14 +1282,13 @@ def test_quiet_phases_are_wrapped_in_liveness_heartbeat(modname, outer, stages):
     [
         ("flash.engine.worker.train.entry.sft_train", "run_sft_train", "sft_configuring"),
         ("flash.engine.worker.train.entry.rl_train", "run_rl_train", "rl_configuring"),
-        ("flash.engine.worker.train.entry.opd_train", "run_opd_train", "opd_configuring"),
     ],
 )
 def test_venv_provisioning_and_the_capability_probe_run_under_one_wrap(modname, outer, stage):
-    """All THREE trainers must wrap the verl-interpreter setup, not just sft and opd.
+    """All THREE trainers must wrap the verl-interpreter setup, not just sft.
 
     That is minutes of silence with no training step to report and no liveness thread otherwise
-    running -- long enough for the stall watchdog to fail a healthy run on a paid GPU. sft and opd
+    running -- long enough for the stall watchdog to fail a healthy run on a paid GPU. sft
     have wrapped it since dev #442; grpo called it bare, which is the gap this pins shut.
     """
     mod = importlib.import_module(modname)
@@ -1519,15 +1360,8 @@ def test_resume_checkpoint_download_is_wrapped_in_liveness_heartbeat():
 
 
 def test_post_download_model_setup_runs_under_a_liveness_wrap():
-    """The span AFTER the weights land must keep pinging (issue 26).
-
-    `prefetch_model` covers the download itself, but the model-setup reads that follow it (adapter,
-    tokenizer/vocab, architecture config) hit the hub or a cold cache mount and emit nothing of
-    their own. Without a wrap the last ping is the one-shot `*_model_load` transition, so `runs
-    status` freezes there for the whole span and a healthy cold cache is indistinguishable from a
-    dead worker.
-    """
-    from flash.engine.worker.train.entry import opd_train, sft_train_runner
+    """Post-download SFT setup must continue reporting liveness during cold-cache reads."""
+    from flash.engine.worker.train.entry import sft_train_runner
 
     sft_src = inspect.getsource(sft_train_runner._prepare_sft_model)
     assert re.search(r'liveness_heartbeat\(\s*"sft_model_load"', sft_src), (
@@ -1554,28 +1388,8 @@ def test_post_download_model_setup_runs_under_a_liveness_wrap():
     for call in ("make_lora", "_warmstart_adapter_path", "_resolve_sft_vocab_size"):
         assert call in wrapped, f"{call} is part of the silent span and must share the wrap"
 
-    opd_src = inspect.getsource(opd_train._load_opd_model)
-    assert re.search(r'liveness_heartbeat\(\s*"opd_model_load"', opd_src), (
-        "the post-download opd model setup must keep the heartbeat fresh"
-    )
-    # the config read is the silent span, so it has to be inside the wrap rather than after it.
-    assert "generation_eos_from_cached_config" in opd_src
-    # and the phase must still be reached from the entry point.
-    assert "_load_opd_model(" in inspect.getsource(opd_train.run_opd_train)
 
-
-def test_opd_model_load_stage_is_actually_emitted():
-    """`opd_model_load` is classified as setup by the poller and documented to users in TRAINING.md,
-    but nothing ever emitted it -- so the stage users are told to expect never appeared."""
-    from flash.engine.worker.train.entry import opd_train
-
-    src = inspect.getsource(opd_train._load_opd_model)
-    assert re.search(r'heartbeat\(\s*\n?\s*"opd_model_load"', src), (
-        "opd must emit the opd_model_load stage the poller and TRAINING.md already name"
-    )
-
-
-@pytest.mark.parametrize("stage", ["sft_model_load", "opd_model_load"])
+@pytest.mark.parametrize("stage", ["sft_model_load"])
 def test_model_load_is_a_throttled_setup_stage(stage):
     """Now that these hold a liveness thread, they re-emit every 30s -- so they must be throttled or
     a slow cold mount spends the HF commit budget on them, and must keep the WIDE setup grace since
@@ -1592,7 +1406,7 @@ def test_model_load_is_a_throttled_setup_stage(stage):
     assert stage in ne._HB_THROTTLED_STAGES
 
 
-@pytest.mark.parametrize("stage", ["sft_model_load", "opd_model_load"])
+@pytest.mark.parametrize("stage", ["sft_model_load"])
 def test_model_load_transition_commits_even_behind_a_fresh_setup_ping(
     worker_context, stage, monkeypatch
 ):

@@ -24,51 +24,6 @@ def test_unknown_algorithm_rejected():
         spec_from_dict({"model": "Qwen/Qwen3.5-9B", "algorithm": "ppo"}, run_id="x")
 
 
-def test_retired_opd_config_remains_readable():
-    spec = spec_from_dict(
-        {
-            "model": "Qwen/Qwen3.5-9B",
-            "algorithm": "opd",
-            "environment": {"id": "github:owner/repo@main:env/environment.py"},
-            "train": {"epochs": 1, "max_examples": 10},
-        },
-        run_id="x",
-    )
-    assert spec.algorithm == "opd"
-    # phase drives RUN_MODE + the artifact path segment; grpo->rl, everything else->itself.
-    assert spec.phase == "opd"
-    # the teacher provider key is control-plane-only, not a user-declared environment secret.
-    assert "PARASAIL_API_KEY" not in spec.environment.secrets
-
-
-def test_opd_capability_gated_per_model():
-    # A model whose algos lack "opd" rejects a opd run through the config path.
-    from flash.core import catalog
-    from flash.core.catalog import ModelInfo
-
-    catalog.MODELS["test/no-opd"] = ModelInfo(
-        id="test/no-opd",
-        display_name="no opd",
-        params="1B",
-        params_b=1.0,
-        algos=("sft", "grpo"),
-        min_vram_gb=12,
-    )
-    try:
-        with pytest.raises(ConfigError):
-            spec_from_dict(
-                {
-                    "model": "test/no-opd",
-                    "algorithm": "opd",
-                    "environment": {"id": "github:owner/repo@main:env/environment.py"},
-                    "train": {"epochs": 1, "max_examples": 1},
-                },
-                run_id="x",
-            )
-    finally:
-        catalog.MODELS.pop("test/no-opd", None)
-
-
 def test_grpo_capability_still_enforced():
     # The guardrail: an SFT-only model rejects GRPO through the config path. No catalog
     # entry is SFT-only anymore, so inject a temporary one.

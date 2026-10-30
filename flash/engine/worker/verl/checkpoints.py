@@ -417,7 +417,7 @@ def resume_upload_unavailable(step: int, checkpoint_dir: str, *, job_label: str)
     using it; this warning never claims an unconfirmed checkpoint is recoverable.
 
     grpo already treats this same upload as non-fatal (``rl/checkpoints.py``, "resume uploads are
-    ungated internal retry state"); this makes sft and opd agree with it rather than inventing a
+    ungated internal retry state"); this makes sft agree with it rather than inventing a
     new policy. the step stays marked failed on the ledger, so the loss of restart state is
     recorded rather than hidden.
     """

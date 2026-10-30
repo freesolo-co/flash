@@ -168,7 +168,7 @@ def test_the_floor_is_never_negative_and_never_shrinks(gpu, completions):
     assert value >= step_floor_seconds(gpu, max(0, completions - 1))
 
 
-@pytest.mark.parametrize("method", ["grpo", "opd"])
+@pytest.mark.parametrize("method", ["grpo"])
 def test_a_bigger_rollout_batch_pays_a_bigger_floor(method):
     """Measured: the floor is 77.2s at 32 completions and 230.5s at 256. It tracks the rollout
     batch because old_log_prob is a forward pass over exactly that batch."""
@@ -177,7 +177,7 @@ def test_a_bigger_rollout_batch_pays_a_bigger_floor(method):
     assert large > small
 
 
-@pytest.mark.parametrize("method", ["grpo", "opd"])
+@pytest.mark.parametrize("method", ["grpo"])
 def test_the_floor_is_gpu_time_not_overhead(method):
     """old_log_prob and update_weights run ON the card, so the floor belongs to the gpu-bound half
     of the split. Filing it as fixed overhead would under-report gpu utilisation and mislead the
@@ -227,11 +227,11 @@ def test_the_card_reaches_the_floor_through_the_real_quote_path(monkeypatch):
 # is disk i/o; dividing them by the card count credits a wide run with time it still spends.
 
 
-@pytest.mark.parametrize("method", ["grpo", "opd"])
+@pytest.mark.parametrize("method", ["grpo"])
 def test_part_of_the_floor_survives_any_card_count(method):
     """The unshardable phases are a floor under the floor.
 
-    Whatever the card count, a grpo/opd step can never drop below the part of the floor every rank
+    Whatever the card count, a grpo step can never drop below the part of the floor every rank
     pays. Dividing the whole floor makes the step tend to (gpu_bound/N + fixed), which understates
     a wide run without bound as N grows.
     """
@@ -256,7 +256,7 @@ def test_part_of_the_floor_survives_any_card_count(method):
         )
 
 
-@pytest.mark.parametrize("method", ["grpo", "opd"])
+@pytest.mark.parametrize("method", ["grpo"])
 def test_sharding_the_whole_floor_would_under_quote_a_wide_run(method, monkeypatch):
     """Mutation guard on STEP_FLOOR_SHARDED_FRACTION.
 
@@ -283,7 +283,7 @@ def test_sharding_the_whole_floor_would_under_quote_a_wide_run(method, monkeypat
 def test_sft_is_untouched_by_the_floor_split():
     """sft runs no rollout, so it has no floor and must shard exactly as before.
 
-    Without this, a future change could route sft through the grpo/opd correction and silently
+    Without this, a future change could route sft through the grpo correction and silently
     inflate every sft quote -- the split is a rollout-only correction.
     """
     from flash.cost.analytical import (
@@ -301,7 +301,7 @@ def test_sft_is_untouched_by_the_floor_split():
         assert sharded_step_seconds(config, "H100", count) == pytest.approx(plain)
 
 
-@pytest.mark.parametrize("method", ["grpo", "opd"])
+@pytest.mark.parametrize("method", ["grpo"])
 def test_multi_card_still_beats_single_card(method):
     """The correction must not overshoot into modelling extra cards as useless.
 
