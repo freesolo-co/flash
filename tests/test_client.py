@@ -384,6 +384,43 @@ def test_chat_omits_thinking_template_controls(stub):
     }
 
 
+@pytest.mark.parametrize("top_logprobs", [0, 5, 20])
+def test_chat_sends_logprob_options(stub, top_logprobs):
+    url, seen = stub
+    client = ApiClient(url, "fslo-user-test")
+    client.chat(
+        "json-chat/final",
+        [{"role": "user", "content": "hi"}],
+        logprobs=True,
+        top_logprobs=top_logprobs,
+    )
+    assert seen["body"]["logprobs"] is True
+    assert seen["body"]["top_logprobs"] == top_logprobs
+    assert "stream" not in seen["body"]
+
+
+@pytest.mark.parametrize(
+    ("options", "message"),
+    [
+        ({"logprobs": 1}, "logprobs must be a boolean"),
+        ({"logprobs": True, "top_logprobs": True}, "top_logprobs must be an integer"),
+        ({"logprobs": True, "top_logprobs": -1}, "top_logprobs must be an integer"),
+        ({"logprobs": True, "top_logprobs": 21}, "top_logprobs must be an integer"),
+        ({"logprobs": True, "top_logprobs": 1.5}, "top_logprobs must be an integer"),
+        ({"top_logprobs": 5}, "positive top_logprobs requires logprobs=true"),
+    ],
+)
+def test_chat_rejects_invalid_logprobs_before_request(monkeypatch, options, message):
+    client = ApiClient("http://unused")
+
+    def unexpected_request(*args, **kwargs):
+        pytest.fail("invalid logprob options must not reach the network")
+
+    monkeypatch.setattr(client, "_request", unexpected_request)
+    with pytest.raises(ClientError, match=message):
+        client.chat("run-a/final", [], **options)
+
+
 def test_chat_sends_user_supplied_system_prompt(stub):
     url, seen = stub
     client = ApiClient(url, "fslo-user-test")
