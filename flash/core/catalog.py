@@ -16,11 +16,38 @@ ALGORITHMS = ("sft", "grpo")
 # Cheapest first: the allocator tries the first entry first. A model needs an entry here to
 # accept custom training.
 CUSTOM_TRAINING_GPUS = {
-    "Qwen/Qwen3.5-0.8B": ("L4", "L40S"),
-    "Qwen/Qwen3.5-4B": ("L40S", "A100 SXM 40GB"),
-    "Qwen/Qwen3.5-9B": ("L40S", "A100 SXM 40GB", "A100 SXM", "H100"),
-    "Qwen/Qwen3.8-27B": ("A100 SXM", "H100", "H200"),
-    "Qwen/Qwen3.6-35B-A3B": ("H200",),
+    "Qwen/Qwen3.5-0.8B": (
+        "L4",
+        "A10",
+        "L40S",
+        "A100 SXM 40GB",
+        "A100 SXM",
+        "RTX Pro 6000",
+        "H100",
+        "H200",
+        "B200",
+    ),
+    "Qwen/Qwen3.5-4B": (
+        "L40S",
+        "A100 SXM 40GB",
+        "A100 SXM",
+        "RTX Pro 6000",
+        "H100",
+        "H200",
+        "B200",
+    ),
+    "Qwen/Qwen3.5-9B": (
+        "L40S",
+        "A100 SXM 40GB",
+        "A100 SXM",
+        "RTX Pro 6000",
+        "H100",
+        "H200",
+        "B200",
+    ),
+    "Qwen/Qwen3.8-27B": ("A100 SXM", "RTX Pro 6000", "H100", "H200", "B200"),
+    # RTX Pro 6000 reserves 93.3 of its 95 GB at the 4,096-token ceiling.
+    "Qwen/Qwen3.6-35B-A3B": ("RTX Pro 6000", "H200", "B200"),
 }
 
 # algorithms whose training step samples on-policy student completions, unlike fixed-dataset sft.
