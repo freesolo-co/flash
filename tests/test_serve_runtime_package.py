@@ -60,7 +60,7 @@ def test_serve_runtime_extra_is_independent_and_pinned() -> None:
         "vllm==0.23.0",
     ]
     assert "vllm==0.19.1" in extras["gpu"]
-    assert extras["custom"] == ["torch==2.10.0", "modal==1.6.2"]
+    assert extras["custom"] == ["torch==2.10.0", "modal==1.6.2", "huggingface-hub>=1.2.0"]
     assert project["tool"]["uv"]["conflicts"] == [
         [{"extra": "custom"}, {"extra": "serve-runtime"}],
         [{"extra": "gpu"}, {"extra": "serve-runtime"}],
