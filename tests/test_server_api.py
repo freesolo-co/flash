@@ -6329,6 +6329,7 @@ def test_recover_runs_reuses_verified_effective_snapshot_for_no_handle_resubmit(
     )
     monkeypatch.setattr(app_mod.db, "all_runs", lambda: [{"run_id": "nohandle-warm"}])
     monkeypatch.setattr(runner_recovery, "_gc_run_sandboxes", lambda s: None)
+    monkeypatch.setattr(runner_preparation, "_mark_warmstart_source", lambda *_args: None)
     monkeypatch.setattr(
         rank_mod,
         "load_hf_adapter_config",
@@ -7320,8 +7321,10 @@ def _make_run(api, key, state):
 
 
 def test_list_checkpoints_endpoint(api, monkeypatch):
+    import flash.server.domain.registry.checkpoints as checkpoint_registry
 
     monkeypatch.setattr(run_checkpoints, "list_checkpoints", lambda spec: _FAKE_CKPTS)
+    monkeypatch.setattr(checkpoint_registry, "list_checkpoints", lambda spec: _FAKE_CKPTS)
     key = _new_user_token()
     run_id = _make_run(api, key, "done")
     r = api.get(f"/v1/runs/{run_id}/checkpoints", headers=_bearer(key))

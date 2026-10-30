@@ -345,6 +345,15 @@ def _preparation_digest(
         ):
             public_payload["train"].pop("lora_alpha", None)
     worker_payload = worker_spec.to_internal_dict()
+    # Reproduce the bytes that bound an existing preparation before the unused
+    # teacher default was removed. Never accept a nonempty teacher or skip its digest.
+    if (
+        isinstance(stored_public, Mapping)
+        and isinstance(stored_public.get("train"), Mapping)
+        and stored_public["train"].get("teacher_model") == ""
+    ):
+        public_payload["train"]["teacher_model"] = ""
+        worker_payload["train"]["teacher_model"] = ""
     # NORMALIZATION, not legacy replay: this is the canonical shape `dev` hashes TODAY (1.2.88), and
     # it is unconditional -- it reads nothing off the stored record and applies to every run this
     # build prepares. Deleting it as "historical" made the digest depend on which build wrote it, so

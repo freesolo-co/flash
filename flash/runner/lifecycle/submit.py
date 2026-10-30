@@ -337,7 +337,18 @@ def _submit_prepared_job(
         "_run_deadline_at": status.created_at + float(public_spec.gpu.max_wall_seconds),
         "_next_attempt": 0,
     }
-    state._save_status(status, **save_kwargs)
+    from flash.runner.lifecycle import runtime_credentials
+
+    if runtime_secrets and not dry_run:
+        runtime_credentials.save(public_spec.run_id, runtime_secrets)
+    try:
+        state._save_status(status, **save_kwargs)
+    except Exception:
+        # If the status commit succeeded before a later fsync failed, keep its
+        # credentials: recovery may already observe the durable run.
+        if not os.path.exists(state.runs_file_path(public_spec.run_id, ".json")):
+            runtime_credentials.discard(public_spec.run_id)
+        raise
     reporting._report_status(status)
     if dry_run:
         # A dry-run persists a state=dry_run record (retrievable, listable, and stageable for a
