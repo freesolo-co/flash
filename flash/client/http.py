@@ -34,6 +34,11 @@ from flash.client.streaming import (
 from flash.core.spec import require_project_id
 from flash.serve.contract.urls import is_freesolo_hosted_url
 from flash.serve.request.tool_calls import validate_tool_control_presence
+from flash.serve.runtime.sampling import (
+    validate_logprobs,
+    validate_sampling_relationships,
+    validate_top_logprobs,
+)
 
 
 class ClientError(RuntimeError):
@@ -812,10 +817,25 @@ class ApiClient:
         max_tokens: int = 512,
         timeout: float | None = None,
         *,
+        logprobs: bool = False,
+        top_logprobs: int = 0,
         tools: list[dict[str, Any]] | None = None,
         tool_choice: str | None = None,
         parallel_tool_calls: bool | None = None,
     ) -> dict:
+        """Return a complete chat response, optionally including per-token log probabilities.
+
+        Set ``logprobs=True`` and ``top_logprobs=K`` (0-20) to include the top K
+        alternatives per generated token in ``choices[].logprobs.content``.
+        """
+        try:
+            logprobs = validate_logprobs(logprobs)
+            top_logprobs = validate_top_logprobs(top_logprobs)
+            validate_sampling_relationships(
+                n=1, temperature=temperature, logprobs=logprobs, top_logprobs=top_logprobs
+            )
+        except ValueError as exc:
+            raise ClientError(str(exc)) from exc
         base_run_id, body = _prepare_chat_request(
             run_id,
             messages,
@@ -825,6 +845,8 @@ class ApiClient:
             tool_choice=tool_choice,
             parallel_tool_calls=parallel_tool_calls,
         )
+        if logprobs:
+            body.update(logprobs=True, top_logprobs=top_logprobs)
         return self._request(
             "POST",
             f"/v1/runs/{base_run_id}/chat",

@@ -135,4 +135,17 @@ def _add_deployment_commands(models_sub: argparse._SubParsersAction) -> None:
     )
     chat.add_argument("--max-tokens", type=int, default=512)
     chat.add_argument("--temperature", type=float, default=0.0)
+    chat.add_argument(
+        "--logprobs",
+        action="store_true",
+        help="return the full JSON response with generated-token log probabilities",
+    )
+    chat.add_argument(
+        "--top-logprobs",
+        type=int,
+        choices=range(21),
+        metavar="K",
+        default=None,
+        help="return top K token alternatives (0-20); implies --logprobs and JSON output",
+    )
     chat.set_defaults(func=cmd_chat)

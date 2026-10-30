@@ -2,9 +2,13 @@
 
 from __future__ import annotations
 
+import json
 from types import SimpleNamespace
 
+import pytest
+
 import flash.cli.commands.env.ops.list as env_list_commands
+import flash.cli.parsing.main as cli
 from flash.cli.commands.ops import deploy as deploy_commands
 from flash.cli.commands.ops import runs as commands
 
@@ -242,6 +246,69 @@ def test_chat_prints_styled_label_before_streaming(monkeypatch, capsys) -> None:
 
     assert result == 0
     assert capsys.readouterr().out.startswith("assistant-label\nhi")
+
+
+@pytest.mark.parametrize(
+    ("flags", "expected_k"),
+    [(["--logprobs"], 0), (["--top-logprobs", "0"], 0), (["--top-logprobs", "5"], 5)],
+)
+def test_chat_logprobs_prints_full_json(monkeypatch, capsys, flags, expected_k) -> None:
+    token = {
+        "token": "hi",
+        "bytes": [104, 105],
+        "logprob": -0.2,
+        "top_logprobs": [{"token": "hi", "bytes": [104, 105], "logprob": -0.2}],
+    }
+    response = {
+        "choices": [{"message": {"content": "hi"}, "logprobs": {"content": [token]}}],
+        "usage": {"completion_tokens": 1},
+    }
+
+    class ChatClient:
+        def chat(self, target, **kwargs):
+            assert target == "flash-1/final"
+            assert kwargs == {
+                "messages": [
+                    {"role": "system", "content": "be brief"},
+                    {"role": "user", "content": "hello"},
+                ],
+                "temperature": 0.5,
+                "max_tokens": 32,
+                "logprobs": True,
+                "top_logprobs": expected_k,
+            }
+            return response
+
+    monkeypatch.setattr(deploy_commands, "client_from_config", ChatClient)
+    monkeypatch.setattr(commands.render, "styled", lambda: True)
+    args = cli._build_parser().parse_args(
+        [
+            "models",
+            "chat",
+            "flash-1/final",
+            "-m",
+            "hello",
+            "--system",
+            "be brief",
+            "--temperature",
+            "0.5",
+            "--max-tokens",
+            "32",
+            *flags,
+        ]
+    )
+    assert args.func(args) == 0
+    captured = capsys.readouterr()
+    assert json.loads(captured.out) == response
+    assert captured.err == ""
+
+
+@pytest.mark.parametrize("value", ["-1", "21", "1.5"])
+def test_chat_parser_rejects_invalid_top_logprobs(value) -> None:
+    with pytest.raises(SystemExit):
+        cli._build_parser().parse_args(
+            ["models", "chat", "flash-1/final", "-m", "hi", "--top-logprobs", value]
+        )
 
 
 def test_chat_fails_when_the_stream_carries_no_text(monkeypatch, capsys) -> None:
