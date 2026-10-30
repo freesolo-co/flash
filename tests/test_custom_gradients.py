@@ -173,6 +173,46 @@ def test_gradient_accumulation_step_and_checkpoint_restore_optimizer(client_and_
     assert client.model_version == 3
 
 
+class CheckpointedLM(TinyLM):
+    supports_gradient_checkpointing = True
+
+    def __init__(self, dropout=0.0):
+        super().__init__()
+        self.dropout = torch.nn.Dropout(dropout)
+        self.checkpointing_kwargs = None
+        self.modes = []
+
+    def gradient_checkpointing_enable(self, gradient_checkpointing_kwargs=None):
+        self.checkpointing_kwargs = gradient_checkpointing_kwargs
+
+    def forward(self, input_ids, use_cache=False):
+        self.modes.append(self.training)
+        return super().forward(input_ids, use_cache)
+
+
+def test_checkpointed_backward_runs_in_train_mode_and_returns_to_eval(tmp_path):
+    model = CheckpointedLM()
+    backend = TorchBackend(model, TinyTokenizer(), checkpoint_dir=tmp_path)
+    assert backend.checkpointing
+    assert model.checkpointing_kwargs == {"use_reentrant": False}
+    backend.forward([Datum([1, 2, 3])])
+    backend.forward_backward([Datum([1, 2, 3], [1.0, 1.0])])
+    with pytest.raises(RuntimeError, match="non-finite"):
+        backend.forward_backward([Datum([1, 2, 3], [float("inf"), 0.0])])
+    # scoring stays in eval; only backward passes recompute, and eval returns after a failure.
+    assert model.modes == [False, True, True]
+    assert not model.training
+
+
+def test_models_with_active_dropout_never_checkpoint(tmp_path):
+    model = CheckpointedLM(dropout=0.1)
+    backend = TorchBackend(model, TinyTokenizer(), checkpoint_dir=tmp_path)
+    assert not backend.checkpointing
+    assert model.checkpointing_kwargs is None
+    backend.forward_backward([Datum([1, 2, 3], [1.0, 1.0])])
+    assert model.modes == [False]
+
+
 def test_bad_custom_loss_never_accumulates_gradients(client_and_backend):
     client, backend = client_and_backend
     data = [Datum([1, 2])]

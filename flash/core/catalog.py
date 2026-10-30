@@ -10,7 +10,18 @@ from flash.content.image_descriptors import MAX_IMAGES_PER_CONVERSATION
 
 ALGORITHMS = ("sft", "grpo")
 # measured custom Torch backend shapes; widening this requires GPU validation of that backend.
-CUSTOM_TRAINING_GPUS = {"Qwen/Qwen3.5-0.8B": ("H100",), "Qwen/Qwen3.5-9B": ("H100",)}
+# GPUs that passed custom-training conformance in the qualified worker image for each card's
+# architecture, at the 4,096-token custom context ceiling with a [4095, 20] target matrix
+# (forward_backward, optim_step, top-20 forward, sampling, checkpoint save and restore).
+# Cheapest first: the allocator tries the first entry first. A model needs an entry here to
+# accept custom training.
+CUSTOM_TRAINING_GPUS = {
+    "Qwen/Qwen3.5-0.8B": ("L4", "L40S"),
+    "Qwen/Qwen3.5-4B": ("L40S", "A100 SXM 40GB"),
+    "Qwen/Qwen3.5-9B": ("L40S", "A100 SXM 40GB", "A100 SXM", "H100"),
+    "Qwen/Qwen3.8-27B": ("A100 SXM", "H100", "H200"),
+    "Qwen/Qwen3.6-35B-A3B": ("H200",),
+}
 
 # algorithms whose training step samples on-policy student completions, unlike fixed-dataset sft.
 # import ``samples_on_policy`` instead of hand-rolling algorithm tuples at each call site.
