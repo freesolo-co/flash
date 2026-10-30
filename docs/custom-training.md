@@ -172,3 +172,18 @@ python scripts/check_custom_gpu.py --model Qwen/Qwen3.5-9B --gpu H100 \
 The unit tests also compare custom-loss gradients against direct PyTorch autograd and test
 HTTP authentication, malformed masks, stale versions, concurrent duplicate submissions,
 partial failures, optimizer limits, and checkpoint boundary validation without network access.
+
+### Recorded GPU runs
+
+[Machine-readable validation results](custom-training-gpu-validation.json) record these
+2026-10-29 runs, with nonzero gradients, changed adapter hashes, checkpoint export/restore,
+sampling/scoring agreement, and safe retry after losing an optimizer response:
+
+| Model | GPU | DPO updates | Initial loss | Final loss |
+| --- | --- | ---: | ---: | ---: |
+| Qwen3 0.6B | A10G | 6 | 0.693147 | 0.000514 |
+| Qwen3.5 9B | H100 | 6 | 0.693147 | 0.000460 |
+
+The A10G run also restored the optimizer and reproduced the first update's exact parameter
+hash. The generated CLI starter ran independently on A10G, produced its local artifacts,
+and exported a checkpoint. All of these GPU sessions were terminated afterward.

@@ -84,7 +84,9 @@ def test_serve_runtime_extra_is_independent_and_pinned() -> None:
     # `uv sync --frozen --extra serve-runtime`, and --frozen refuses to re-resolve. adding the extra
     # to pyproject without re-locking leaves provides-extras stale, and the image build dies at that
     # step even though every assertion above still passes.
-    assert 'provides-extras = ["custom", "gpu", "server", "serving", "serve-runtime", "dev"]' in lock
+    assert (
+        'provides-extras = ["custom", "gpu", "server", "serving", "serve-runtime", "dev"]' in lock
+    )
     # both vllm builds are recorded side by side; that is what the gpu/serve-runtime conflict buys.
     assert (
         '{ name = "vllm", marker = "extra == \'serve-runtime\'", specifier = "==0.23.0" }' in lock
