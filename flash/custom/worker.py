@@ -38,6 +38,7 @@ def run(*, context):
         session.restored_state = restored["algorithm_state"]
         backend.algorithm_state = session.restored_state
     started = time.monotonic()
+    session.last_activity = started
     started_at = time.time()
 
     def save():

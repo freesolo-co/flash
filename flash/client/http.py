@@ -61,10 +61,18 @@ class ApiError(ClientError):
     The message is unchanged, so callers that match on ``str(exc)`` behave exactly as before.
     """
 
-    def __init__(self, status: int, message: str, *, detail: object | None = None):
+    def __init__(
+        self,
+        status: int,
+        message: str,
+        *,
+        detail: object | None = None,
+        submission_outcome: str | None = None,
+    ):
         super().__init__(message)
         self.status = status
         self.detail = message if detail is None else detail
+        self.submission_outcome = submission_outcome
 
     @property
     def code(self) -> str:
@@ -167,7 +175,12 @@ def _detail_from_http_error(
 
 def _api_error(exc: urllib.error.HTTPError) -> ApiError:
     detail = _detail_from_http_error(exc)
-    return ApiError(exc.code, str(detail), detail=detail)
+    return ApiError(
+        exc.code,
+        str(detail),
+        detail=detail,
+        submission_outcome=(exc.headers or {}).get("X-Flash-Submission-Outcome"),
+    )
 
 
 def _unexpected_response(api_url: str, path: str, problem: str) -> ClientError:
@@ -333,7 +346,12 @@ class ApiClient:
             detail = self._auth_error_detail(
                 exc.code, _detail_from_http_error(exc, deadline=deadline)
             )
-            raise ApiError(exc.code, str(detail), detail=detail) from exc
+            raise ApiError(
+                exc.code,
+                str(detail),
+                detail=detail,
+                submission_outcome=(exc.headers or {}).get("X-Flash-Submission-Outcome"),
+            ) from exc
         except urllib.error.URLError as exc:
             if isinstance(getattr(exc, "reason", None), TimeoutError):
                 raise RequestTimeoutError(

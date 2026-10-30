@@ -13,6 +13,7 @@ import pytest
 from flash.client.http import ApiError, ClientError, RequestTimeoutError
 from flash.custom import TrainingClient
 from flash.custom.artifacts import download_checkpoint
+from flash.custom.types import Datum
 
 
 class LostReplyHTTP:
@@ -55,6 +56,8 @@ def test_pending_optimizer_request_freezes_intent_and_blocks_new_work(monkeypatc
     [
         (400, {"code": "custom_rejected"}, False),
         (409, {"code": "custom_rejected"}, False),
+        (413, {"code": "custom_rejected"}, False),
+        (413, "unrecognized proxy response", True),
         (502, "proxy failure", True),
         (400, "unrecognized proxy response", True),
     ],
@@ -76,6 +79,21 @@ def test_only_known_preexecution_rejections_clear_pending(
     with pytest.raises(ApiError):
         client.optim_step(learning_rate=0.001)
     assert (client.pending_request is not None) is remains_pending
+
+
+def test_oversized_batch_can_be_split_without_losing_session(monkeypatch):
+    http = LostReplyHTTP()
+    http.drop = False
+    monkeypatch.setattr("flash.custom.client.ApiClient", lambda *args, **kwargs: http)
+    client = TrainingClient("https://gpu.example", api_key="session-token")
+    row = Datum([1] * 32768, [0.123456789] * 32767)
+    with pytest.raises(ValueError, match="split the batch"):
+        client.forward_backward([row] * 16)
+    assert client.pending_request is None
+    assert http.envelopes == []
+    client.forward_backward([row])
+    assert http.envelopes[0]["sequence"] == 1
+    assert client.pending_request is None
 
 
 def test_checkpoint_download_streams_and_rejects_incomplete_file(tmp_path, monkeypatch):

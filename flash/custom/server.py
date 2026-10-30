@@ -8,14 +8,11 @@ import time
 
 from flash._internal.diagnostics import sanitize_diagnostic
 from flash.custom.session import SessionConflict, TrainingSession
-from flash.custom.types import checkpoint_name
-
-MAX_BODY_BYTES = 4 * 1024 * 1024
+from flash.custom.types import MAX_BODY_BYTES, checkpoint_name
 
 
 def create_app(session, token):
     from fastapi import FastAPI, HTTPException, Request
-    from fastapi.responses import StreamingResponse
     from starlette.concurrency import run_in_threadpool
 
     if not isinstance(token, str) or len(token) < 32:
@@ -56,7 +53,13 @@ def create_app(session, token):
                 async for chunk in request.stream():
                     raw.extend(chunk)
                     if len(raw) > MAX_BODY_BYTES:
-                        raise HTTPException(413, "custom operation body exceeds 4 MiB")
+                        raise HTTPException(
+                            413,
+                            {
+                                "code": "custom_rejected",
+                                "message": "custom operation body exceeds 4 MiB",
+                            },
+                        )
             payload = json.loads(raw)
         except (ValueError, TimeoutError) as error:
             raise HTTPException(
@@ -90,33 +93,13 @@ def create_app(session, token):
 
     @app.get("/v1/custom/checkpoints/{name}")
     def download(name: str):
+        from flash.custom.exports import checkpoint_response
+
         try:
             checkpoint_name(name)
         except ValueError as error:
             raise HTTPException(400, str(error)) from error
-        path = session.backend.checkpoint_dir / f"{name}.zip"
-        if not path.is_file():
-            raise HTTPException(404, "unknown checkpoint")
-        session.last_activity = time.monotonic()
-
-        async def content():
-            session.active_exports += 1
-            try:
-                with path.open("rb") as handle:
-                    while chunk := await run_in_threadpool(handle.read, 1024 * 1024):
-                        yield chunk
-            finally:
-                session.active_exports -= 1
-                session.last_activity = time.monotonic()
-
-        return StreamingResponse(
-            content(),
-            media_type="application/zip",
-            headers={
-                "Content-Length": str(path.stat().st_size),
-                "Content-Disposition": f'attachment; filename="{name}.zip"',
-            },
-        )
+        return checkpoint_response(session, name)
 
     return app
 

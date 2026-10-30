@@ -84,7 +84,17 @@ def validate_operation(backend, operation, arguments):
             if "algorithm_state" in args:
                 args["algorithm_state"] = validate_algorithm_state(args["algorithm_state"])
         path = backend.checkpoint_dir / args["name"]
-        if operation == "save_checkpoint" and path.exists():
+        store = getattr(backend, "checkpoints", None)
+        if (
+            operation == "save_checkpoint"
+            and store is not None
+            and args["name"].startswith("step-")
+            and args["name"][5:].isdigit()
+        ):
+            raise ValueError("step-N names are reserved for automatic managed checkpoints")
+        if operation == "save_checkpoint" and (
+            path.exists() or (store is not None and args["name"] in store.by_name)
+        ):
             raise ValueError("checkpoint already exists; choose a new immutable name")
         if operation == "load_checkpoint" and not (path / "state.pt").is_file():
             raise ValueError("unknown checkpoint")

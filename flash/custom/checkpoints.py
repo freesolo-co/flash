@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 from pathlib import Path
 
 
@@ -11,6 +12,8 @@ class RunCheckpoints:
     def __init__(self, context):
         self.context = context
         self.published = {}
+        self.by_name = {}
+        self.cached = None
 
     def publish(self, directory, metadata):
         from flash.engine.worker.io import hf
@@ -26,10 +29,36 @@ class RunCheckpoints:
         )
         reference = f"{self.context.config.run_id}/step-{step}"
         self.published[step] = directory
+        self.by_name[directory.name] = step
+        previous = self.cached
+        self.cached = directory
+        if previous is not None and previous != directory:
+            shutil.rmtree(previous)
         from flash.engine.worker.io.heartbeat import heartbeat
 
         heartbeat("checkpoint_deployable", step=step, context=self.context)
         return {"reference": reference, "durable": True}
+
+    def export_source(self, name, workspace):
+        """Rehydrate evicted snapshots only inside the temporary export workspace."""
+        from huggingface_hub import snapshot_download
+
+        if name not in self.by_name:
+            raise FileNotFoundError("unknown checkpoint")
+        step = self.by_name[name]
+        directory = self.published[step]
+        if directory.is_dir():
+            return directory
+        config = self.context.config
+        prefix = f"{config.phase}/{config.run_id}/checkpoints/step-{step}"
+        root = snapshot_download(
+            repo_id=config.hf_repo,
+            repo_type="dataset",
+            allow_patterns=[f"{prefix}/**"],
+            local_dir=workspace / "source",
+            token=os.environ.get("HF_TOKEN"),
+        )
+        return Path(root) / prefix
 
     def restore(self, backend, resolved):
         from huggingface_hub import snapshot_download

@@ -134,6 +134,7 @@ def test_new_backend_restores_optimizer_rng_and_algorithm_state(client_and_backe
     client.forward_backward(data)
     client.optim_step(learning_rate=0.1, algorithm_state={"cursor": 17, "reference": [-2.0]})
     client.save_checkpoint("durable")
+    assert not (tmp_path / "durable.zip").exists()
     expected_random = torch.rand(4)
     expected_scores = original.forward(data)["outputs"]
     client.forward_backward(data)

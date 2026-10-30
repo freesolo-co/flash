@@ -7,7 +7,7 @@ import threading
 from urllib.parse import urlsplit
 
 from flash.client.http import ApiClient, ApiError
-from flash.custom.types import Datum
+from flash.custom.types import MAX_BODY_BYTES, Datum
 
 
 class TrainingClient:
@@ -38,6 +38,7 @@ class TrainingClient:
         max_context_tokens=2048,
         lora_rank=16,
         revision=None,
+        hf_token=None,
     ):
         """Provision a dedicated GPU in your Modal account; use as a context manager.
 
@@ -54,6 +55,7 @@ class TrainingClient:
             max_context_tokens=max_context_tokens,
             lora_rank=lora_rank,
             revision=revision,
+            hf_token=hf_token,
         )
 
     @property
@@ -93,7 +95,10 @@ class TrainingClient:
                 "arguments": arguments,
             }
             # detach from mutable user lists; retries must send byte-equivalent intent.
-            self._pending = json.loads(json.dumps(envelope, allow_nan=False))
+            serialized = json.dumps(envelope, allow_nan=False)
+            if len(serialized.encode()) > MAX_BODY_BYTES:
+                raise ValueError("custom operation exceeds 4 MiB; split the batch and try again")
+            self._pending = json.loads(serialized)
             return self.retry_pending()
 
     def retry_pending(self):
@@ -105,8 +110,8 @@ class TrainingClient:
                     "POST", "/v1/custom/operation", self._pending, max_bytes=32 * 1024 * 1024
                 )
             except ApiError as error:
-                # our worker's 400/409 rejects before GPU execution. a proxy error is ambiguous.
-                if error.status in {400, 409} and error.code == "custom_rejected":
+                # structured worker rejections precede GPU execution; proxy errors are ambiguous.
+                if error.status in {400, 409, 413} and error.code == "custom_rejected":
                     self._pending = None
                 raise
             if (

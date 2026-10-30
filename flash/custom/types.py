@@ -6,6 +6,8 @@ import math
 import re
 from dataclasses import dataclass
 
+MAX_BODY_BYTES = 4 * 1024 * 1024
+
 
 def integer(value, name, minimum, maximum):
     if isinstance(value, bool) or not isinstance(value, int) or not minimum <= value <= maximum:

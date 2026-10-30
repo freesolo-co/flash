@@ -24,9 +24,9 @@ def submit_custom(api, payload):
     api.timeout = max(api.timeout, 300)
     try:
         return api.create_run(payload)
-    except ApiError:
-        raise
     except ClientError as error:
+        if isinstance(error, ApiError) and error.submission_outcome == "not-created":
+            raise
         deadline = time.monotonic() + 120
         while time.monotonic() < deadline:
             try:

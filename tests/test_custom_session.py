@@ -187,13 +187,17 @@ def test_http_auth_validation_logs_and_retry(tmp_path):
         client.get("/v1/custom/logs", headers=headers).json()["events"][0]["operation"]
         == "optim_step"
     )
-    assert (
-        client.post(
-            "/v1/custom/operation", headers=headers, content="x" * (4 * 1024 * 1024 + 1)
-        ).status_code
-        == 413
+    oversized = client.post(
+        "/v1/custom/operation", headers=headers, content="x" * (4 * 1024 * 1024 + 1)
     )
+    assert oversized.status_code == 413
+    assert oversized.json()["detail"]["code"] == "custom_rejected"
     assert session.step == 1
+    assert (
+        client.post("/v1/custom/operation", headers=headers, json=request(session)).status_code
+        == 200
+    )
+    assert session.step == 2
 
 
 def test_gpu_failure_detail_reaches_client_before_worker_teardown(tmp_path):

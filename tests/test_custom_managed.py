@@ -230,8 +230,9 @@ def test_async_ambiguous_failure_blocks_queued_updates_until_explicit_retry():
     asyncio.run(scenario())
 
 
-def test_submission_timeout_reconciles_exact_controller_without_a_second_create():
-    from flash.client.http import ClientError
+@pytest.mark.parametrize("http_status", [None, 400, 500, 502, 503])
+def test_submission_error_reconciles_exact_controller_without_a_second_create(http_status):
+    from flash.client.http import ApiError, ClientError
     from flash.custom.controller import submit_custom
 
     api = Mock(timeout=60)
@@ -239,6 +240,8 @@ def test_submission_timeout_reconciles_exact_controller_without_a_second_create(
 
     def created_but_lost(payload):
         captured.append(payload)
+        if http_status is not None:
+            raise ApiError(http_status, "submission response failed")
         raise ClientError("response lost")
 
     api.create_run.side_effect = created_but_lost
@@ -252,6 +255,47 @@ def test_submission_timeout_reconciles_exact_controller_without_a_second_create(
     assert result["run_id"] == "created-once"
     assert api.create_run.call_count == 1
     assert api.timeout == 300
+
+
+def test_explicit_not_created_submission_error_does_not_reconcile():
+    from flash.client.http import ApiError
+    from flash.custom.controller import submit_custom
+
+    api = Mock(timeout=60)
+    error = ApiError(400, "invalid config", submission_outcome="not-created")
+    api.create_run.side_effect = error
+    with pytest.raises(ApiError) as caught:
+        submit_custom(api, custom_raw())
+    assert caught.value is error
+    api._request.assert_not_called()
+    assert api.create_run.call_count == 1
+
+
+@pytest.mark.parametrize("outcome", [None, "not-created"])
+def test_submission_outcome_survives_http_error_translation(monkeypatch, outcome):
+    import io
+    from email.message import Message
+    from urllib.error import HTTPError
+
+    from flash.client import http
+
+    headers = Message()
+    if outcome:
+        headers["X-Flash-Submission-Outcome"] = outcome
+
+    def fail(*args, **kwargs):
+        raise HTTPError(
+            "https://flash.example/v1/runs",
+            503,
+            "unavailable",
+            headers,
+            io.BytesIO(b'{"detail": "unavailable"}'),
+        )
+
+    monkeypatch.setattr(http, "_urlopen_no_redirect", fail)
+    with pytest.raises(http.ApiError) as caught:
+        http.ApiClient("https://flash.example")._request("POST", "/v1/runs", {})
+    assert caught.value.submission_outcome == outcome
 
 
 def test_custom_adapter_uses_existing_checkpoint_listing_and_storage_reference():

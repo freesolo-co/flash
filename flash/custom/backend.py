@@ -221,7 +221,6 @@ class TorchBackend:
             if stage.exists():
                 shutil.rmtree(stage)
         publication = self.checkpoints.publish(destination, metadata) if self.checkpoints else {}
-        shutil.make_archive(str(destination), "zip", destination)
         return {"checkpoint": {**metadata, **publication}}
 
     def load_checkpoint(self, name):

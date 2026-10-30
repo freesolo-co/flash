@@ -24,6 +24,7 @@ def create_modal_session(
     max_context_tokens,
     lora_rank,
     revision,
+    hf_token=None,
 ):
     import modal
 
@@ -42,6 +43,11 @@ def create_modal_session(
         raise ValueError("revision must be a nonempty string or None")
     if gpu not in {"A10G", "H100"}:
         raise ValueError("custom mode currently supports the GPU-validated A10G and H100 classes")
+    from huggingface_hub import get_token
+
+    if hf_token is not None and (not isinstance(hf_token, str) or not hf_token.strip()):
+        raise ValueError("hf_token must be a nonempty string or None")
+    hf_token = hf_token if hf_token is not None else get_token()
     config = {
         "model": model,
         "max_steps": max_steps,
@@ -63,6 +69,9 @@ def create_modal_session(
     app = modal.App.lookup("flash-custom-training", create_if_missing=True)
     name = f"flash-custom-{uuid.uuid4().hex}"
     token = secrets.token_urlsafe(48)
+    worker_secrets = {"FLASH_CUSTOM_TOKEN": token}
+    if hf_token:
+        worker_secrets["HF_TOKEN"] = hf_token
     sandbox = None
     try:
         sandbox = modal.Sandbox.create(
@@ -77,7 +86,7 @@ def create_modal_session(
             cpu=4,
             memory=16384,
             encrypted_ports=[8000],
-            secrets=[modal.Secret.from_dict({"FLASH_CUSTOM_TOKEN": token})],
+            secrets=[modal.Secret.from_dict(worker_secrets)],
             env={
                 "PYTHONPATH": "/opt/custom",
                 "PYTHONUNBUFFERED": "1",

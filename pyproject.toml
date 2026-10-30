@@ -25,7 +25,7 @@ dependencies = []
 
 [project.optional-dependencies]
 # local custom-loss autograd and dedicated GPU provisioning; base CLI stays stdlib-only.
-custom = ["torch==2.10.0", "modal==1.6.2"]
+custom = ["torch==2.10.0", "modal==1.6.2", "huggingface-hub>=1.2.0"]
 # heavy deps for running the fine-tuning worker locally (the deployed gpu worker installs its exact
 # stack in Dockerfile.worker, with the fallback verl venv mirrored in capabilities.py).
 gpu = [

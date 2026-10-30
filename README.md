@@ -4,11 +4,6 @@ LoRA post-training for open-weight models: SFT and GRPO. You
 describe a run in a TOML file, Flash allocates a GPU, trains, streams checkpoints, and
 serves the resulting adapter.
 
-For a Python loop that owns its loss, rewards, optimizer steps, and token-level inspection,
-see [custom algorithm mode](docs/custom-training.md). `flash custom init algorithm.py`
-writes an editable local DPO example. Set `algorithm = "custom"` and `[custom] file = "algorithm.py"`
-in your training TOML, then use `flash train` with managed durable checkpoints and sync or async calls.
-
 ```bash
 pip install freesolo-flash
 export FREESOLO_API_KEY=fslo_...
