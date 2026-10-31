@@ -754,8 +754,72 @@ def test_profile_validates_rows_beyond_max_examples(tmp_path, suffix, invalid):
 def test_profile_rejects_an_empty_packaged_dataset_at_the_shared_worker_gate(tmp_path) -> None:
     entrypoint = _package(tmp_path, {"dataset/train.json": "[]"})
 
-    with pytest.raises(ValueError, match="every SFT example has an empty completion"):
+    with pytest.raises(ValueError, match="no SFT examples retain supervised answer tokens"):
         _profile(entrypoint)
+
+
+@pytest.mark.parametrize("output", [{}, {"output": None}, {"output": ""}])
+@pytest.mark.parametrize("inline", [False, True])
+def test_missing_sft_targets_report_the_data_contract_not_truncation(
+    tmp_path, output, inline, monkeypatch
+):
+    from flash.engine.profiling import dataset_profile
+
+    def unexpected_preparation(*args, **kwargs):
+        pytest.fail("missing raw targets must be diagnosed before tokenization")
+
+    monkeypatch.setattr(dataset_profile, "prepare_sft_workload", unexpected_preparation)
+    row = {"input": "short prompt", "demonstration": {"messages": []}, **output}
+    entrypoint = _package(tmp_path, {"dataset/train.jsonl": json.dumps(row) + "\n"})
+    with pytest.raises(ValueError, match="missing or empty top-level 'output'") as error:
+        _profile(entrypoint, params={"records": [row]} if inline else None)
+    assert "environment.params.dataset_path" in str(error.value)
+    assert "environment.params.records" in str(error.value)
+    assert "without executing environment loaders" in str(error.value)
+    assert "truncation" not in str(error.value)
+
+
+def test_explicit_sft_dataset_fixes_raw_nested_demonstration_selection(tmp_path):
+    row = {"input": "short prompt", "demonstration": {"messages": []}}
+    target = {
+        "input": "short prompt",
+        "output": {"messages": [{"role": "assistant", "content": "actual answer"}]},
+    }
+    entrypoint = _package(
+        tmp_path,
+        {
+            "dataset/train.jsonl": json.dumps(row) + "\n",
+            "dataset/demonstrations.jsonl": json.dumps(target) + "\n",
+        },
+    )
+    with pytest.raises(ValueError, match="top-level 'output'"):
+        _profile(entrypoint)
+    _, profile = _profile(entrypoint, params={"dataset_path": "dataset/demonstrations.jsonl"})
+    assert profile.retained_examples == 1
+    assert profile.supervised_tokens_per_epoch > 0
+
+
+@pytest.mark.parametrize("target", ["answer", 0, False])
+def test_missing_target_check_preserves_mixed_datasets_and_scalar_targets(tmp_path, target):
+    from flash.engine.profiling.dataset_profile import _read_dataset_rows
+
+    rows = [{"input": "unlabeled"}, {"input": "labeled", "output": target}]
+    entrypoint = _package(tmp_path, {"dataset/train.jsonl": "\n".join(map(json.dumps, rows))})
+    _, selected = _read_dataset_rows(tmp_path / "dataset/train.jsonl", max_examples=0)
+    assert selected[1]["output"] == target
+    _, profile = _profile(entrypoint)
+    assert profile.selected_examples == 2
+    assert profile.supervised_tokens_per_epoch > 0
+
+
+def test_missing_target_diagnostic_uses_only_the_selected_prefix(tmp_path):
+    from flash.engine.profiling.dataset_profile import _read_dataset_rows
+
+    path = tmp_path / "train.jsonl"
+    path.write_text('{"input":"unlabeled"}\n{"input":"labeled","output":"answer"}\n')
+    with pytest.raises(ValueError, match="top-level 'output'"):
+        _read_dataset_rows(path, max_examples=1)
+    assert _read_dataset_rows(path, max_examples=2)[0] == 2
 
 
 def test_profile_uses_explicit_records_instead_of_a_packaged_dataset_file(
@@ -934,7 +998,7 @@ def test_training_contract_participates_in_retention_and_truncation(tmp_path) ->
         },
     )
 
-    with pytest.raises(ValueError, match="empty completion after"):
+    with pytest.raises(ValueError, match=r"train\.max_context_tokens"):
         _profile(entrypoint)
 
 
