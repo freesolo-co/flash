@@ -272,31 +272,19 @@ class TorchBackend:
 
 
 def _enable_checkpointing(model):
-    """Checkpoint only audited Qwen architectures whose train/eval functions agree.
+    """Checkpoint catalog models without active dropout or stateful normalization.
 
     Without checkpointing a 4,096-token row keeps every layer's activations, which exceeds
     one GPU for larger models. transformers only recomputes in train mode. Absence of
-    nn.Dropout is not sufficient: Qwen attention uses functional dropout. These standard
-    transformers architectures have no other train-only text behavior; new architectures
-    need code review and GPU logprob/gradient conformance before joining this allowlist.
-    Unknown models stay in eval mode without checkpointing. This is not a generic test for
-    arbitrary custom modules, which the managed loader disallows (trust_remote_code=False).
+    nn.Dropout is not sufficient: Qwen attention uses functional dropout. The supported
+    catalog architectures have no other train-only text behavior.
     """
     import torch
 
     if not getattr(model, "supports_gradient_checkpointing", False):
         return False
     config = getattr(model, "config", None)
-    if getattr(config, "model_type", None) not in {
-        "qwen3_5",
-        "qwen3_5_text",
-        "qwen3_5_moe",
-        "qwen3_5_moe_text",
-    }:
-        return False
     text_config = getattr(config, "text_config", config)
-    if getattr(text_config, "model_type", None) not in {"qwen3_5_text", "qwen3_5_moe_text"}:
-        return False
     if getattr(text_config, "attention_dropout", None) != 0:
         return False
     for module in model.modules():

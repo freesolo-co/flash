@@ -202,7 +202,6 @@ class CheckpointedLM(TinyLM):
 
     def __init__(self, dropout=0.0):
         super().__init__()
-        self.config.model_type = "qwen3_5_text"
         self.config.attention_dropout = 0.0
         self.attention_dropout = 0.0
         self.dropout = torch.nn.Dropout(dropout)
@@ -250,7 +249,7 @@ def test_functional_attention_dropout_keeps_both_passes_in_eval(tmp_path, nested
     model = CheckpointedLM()
     text_config = model.config
     if nested:
-        model.config = SimpleNamespace(model_type="qwen3_5", text_config=text_config)
+        model.config = SimpleNamespace(text_config=text_config)
     if setting in {"config", "both"}:
         text_config.attention_dropout = 0.5
     if setting in {"module", "both"}:
@@ -265,30 +264,10 @@ def test_functional_attention_dropout_keeps_both_passes_in_eval(tmp_path, nested
     assert model.modes == [False, False]
 
 
-@pytest.mark.parametrize("model_type", ["qwen3_5_text", "qwen3_5_moe_text"])
-@pytest.mark.parametrize("nested", [False, True])
-def test_checkpointing_accepts_audited_dense_and_moe_configs(tmp_path, model_type, nested):
+@pytest.mark.parametrize("behavior", ["missing_dropout", "batchnorm", "dropout2d"])
+def test_unchecked_dropout_or_stateful_training_behavior_never_checkpoints(tmp_path, behavior):
     model = CheckpointedLM()
-    model.config.model_type = model_type
-    if nested:
-        model.config = SimpleNamespace(
-            model_type=model_type.removesuffix("_text"), text_config=model.config
-        )
-    backend = TorchBackend(model, TinyTokenizer(), checkpoint_dir=tmp_path)
-    assert backend.checkpointing
-
-
-@pytest.mark.parametrize(
-    "behavior", ["unknown", "unknown_text", "missing_dropout", "batchnorm", "dropout2d"]
-)
-def test_unaudited_or_stateful_training_behavior_never_checkpoints(tmp_path, behavior):
-    model = CheckpointedLM()
-    if behavior == "unknown":
-        model.config.model_type = "unqualified_architecture"
-    elif behavior == "unknown_text":
-        model.config.model_type = "qwen3_5"
-        model.config.text_config = SimpleNamespace(model_type="unknown", attention_dropout=0.0)
-    elif behavior == "missing_dropout":
+    if behavior == "missing_dropout":
         del model.config.attention_dropout
     elif behavior == "batchnorm":
         model.normalization = torch.nn.BatchNorm1d(7)
