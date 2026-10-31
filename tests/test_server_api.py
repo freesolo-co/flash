@@ -1481,6 +1481,26 @@ def test_create_run_does_not_blame_the_adapter_for_an_unrelated_failure(api, mon
     assert api.get("/v1/runs", headers=_bearer("fslo-internal-test")).json()["runs"] == []
 
 
+def test_create_run_only_queues_while_another_plane_holds_the_lease(api, monkeypatch):
+    """A plane started beside a draining one leaves new runs for the lease holder to launch."""
+    seen = []
+
+    def submit(spec, **kwargs):
+        seen.append(kwargs["queue_only"])
+        status = runner_state.RunStatus(run_id=spec.run_id, state="queued", spec=spec.to_dict())
+        runner_state._save_status(status)
+        return status
+
+    monkeypatch.setattr(runner_submit, "submit_job", submit)
+    key = _new_user_token()
+
+    assert api.post("/v1/runs", headers=_bearer(key), json={"spec": SPEC}).status_code == 200
+    api.app.state.plane_standby = True
+    assert api.post("/v1/runs", headers=_bearer(key), json={"spec": SPEC}).status_code == 200
+
+    assert seen == [False, True]
+
+
 def test_create_run_keeps_ownership_when_submit_fails_after_persisting_status(api, monkeypatch):
     """A submit that dies after saving status leaves a run the owner can still see and cancel.
 
