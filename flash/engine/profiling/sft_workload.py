@@ -637,8 +637,9 @@ def _filter_retained_rows(tokenized: _TokenizedSftRows, tokenizer) -> _RetainedS
             dropped += 1
     if not rows:
         raise ValueError(
-            "every SFT example has an empty completion after sft_max_len truncation "
-            "(nothing to train on); increase sft_max_len or shorten the prompts"
+            "no SFT examples retain supervised answer tokens after formatting and truncation. "
+            "Check the assistant targets; if prompts exhaust train.max_context_tokens, "
+            "shorten them or increase train.max_context_tokens."
         )
     return _RetainedSftRows(
         rows=rows,
