@@ -107,15 +107,59 @@ def test_context_sizes_full_logits_instead_of_sft_chunked_loss(modal_capacity):
 
 
 @pytest.mark.parametrize("model", MODELS)
-@pytest.mark.parametrize("rank", [1, 16, 64])
-def test_catalog_custom_runs_choose_cheapest_fitting_single_card(model, rank, modal_capacity):
-    spec = custom_spec(model, rank=rank)
+@pytest.mark.parametrize("rank", range(1, 65))
+@pytest.mark.parametrize("context", [2, 512, 1024, 2048, 4096])
+def test_catalog_custom_runs_choose_cheapest_fitting_single_card(model, rank, context, monkeypatch):
+    from flash.engine.plan import vram
+    from flash.providers.modal.pricing import hourly_rate
+    from flash.providers.modal.provider import ModalProvider
+
+    # Exercise the production candidate filtering and prices, without renting hardware.
+    monkeypatch.setattr(allocator, "available_providers", lambda: ("modal",))
+    monkeypatch.setattr(allocator, "get_provider", lambda _: ModalProvider())
+    info = MODELS[model]
+    monkeypatch.setattr(
+        vram,
+        "fetch_hf_model_geometry",
+        lambda *args, **kwargs: (
+            info.params_b,
+            info.vocab_size,
+            info.hidden_size,
+            info.num_layers,
+            info.num_attention_heads,
+        ),
+    )
+    spec = custom_spec(model, rank=rank, context=context)
     need = allocator.required_vram_gb(model, "custom", train=spec.train)
-    expected = min((c for c in modal_capacity if c.vram_gb >= need), key=lambda c: c.hourly_usd)
-    result = allocator.allocate(model, "custom", train=spec.train)
-    assert result.gpu == expected.gpu
-    assert result.gpu_count == 1
-    assert provisional_gpu(model, "custom", train=spec.train) == expected.gpu
+    # Independently bound resident BF16 weights plus FP32 adapters, gradients and AdamW state.
+    adapter_params = rank * sum((i + o) * count for i, o, count in info.lora_target_shapes)
+    assert need >= info.params_b * 2 + adapter_params * 16 / 1e9
+    expected = min(
+        (gpu for gpu in GPU_INFO.values() if gpu.validated and gpu.vram_gb >= need),
+        key=lambda gpu: hourly_rate(gpu.name),
+    )
+    for revision in ("", "custom-matrix-revision"):
+        result = allocator.allocate(model, "custom", train=spec.train, model_revision=revision)
+        assert result.gpu == expected.name
+        assert result.gpu_count == 1
+        assert (
+            provisional_gpu(model, "custom", train=spec.train, model_revision=revision)
+            == expected.name
+        )
+    for gpu in GPU_INFO.values():
+        if gpu.vram_gb < need:
+            with pytest.raises(ConfigError, match="requires at least"):
+                custom_spec(model, rank=rank, context=context, gpu={"type": gpu.name})
+            with pytest.raises(UnsupportedGpuError):
+                allocator.allocate(model, "custom", train=spec.train, gpu_type=gpu.name)
+        else:
+            pinned = custom_spec(model, rank=rank, context=context, gpu={"type": gpu.name})
+            assert (
+                allocator.allocate(
+                    model, "custom", train=pinned.train, gpu_type=pinned.gpu.type
+                ).gpu
+                == gpu.name
+            )
 
 
 def test_custom_sizing_defaults_match_parsed_worker_defaults():
