@@ -30,6 +30,26 @@ This file starts at 1.1.35. Earlier releases are not reconstructed here; use
 
 ### Added
 
+- Custom training rows accept a rectangular `target_tokens` matrix, `[len(tokens)-1, K]`
+  with K up to 64, scoring K tokens at every position instead of the next token. `weights`
+  then has the same shape and logprobs come back with it, so `forward_backward` computes
+  `-sum(weights * logprobs)` over every cell and two-argument `forward_backward_custom`
+  losses read `[T, K]` logprobs. Weighting a teacher's top-k by its probabilities trains
+  forward KL directly. Requests hold at most 100,000 target cells. Rows without
+  `target_tokens` are unchanged.
+- Custom training supports every catalog model and uses the shared SFT/GRPO GPU allocator
+  and memory estimator. Selection accounts for LoRA rank, full AdamW state (including all
+  MoE experts), context length and custom training's full logits. It chooses the cheapest
+  fitting available GPU, within the backend's single-GPU Modal constraint.
+- Custom `forward_backward` recomputes layer activations (gradient checkpointing) for models
+  without active module or functional attention dropout, running `forward_backward` in train
+  mode and scoring in eval mode. Models with stateful batch normalization stay in eval mode
+  without checkpointing.
+  Peak memory for a 4,096-token Qwen3.5-0.8B row falls from 26.7 GB to 16.8 GB, and
+  eval-mode and checkpointed logprobs agree exactly on every catalog model.
+- Custom losses snapshot both input tokens and nested target matrices before scoring, so
+  mutations in a loss callback cannot change the targets used for the backward pass.
+
 - Versioned rollout request/result contracts for synchronous GRPO, binding generation to
   acknowledged policy snapshots and checking token probabilities, turn provenance, attempts,
   and training-row identity before optimization.
@@ -130,6 +150,12 @@ This file starts at 1.1.35. Earlier releases are not reconstructed here; use
 
 ### Fixed
 
+- Image SFT no longer stores processed pixel tensors in the training parquet. The worker keeps
+  each row's small processor fields (image grid, token types) and its saved image files, and the
+  training dataset rebuilds `pixel_values` per item, checking the stored grid. Before this,
+  multi-image rows (about 4 MB of float32 pixels per screenshot, repeated across rows that share
+  history) overflowed the 2 GiB `binary` column with `ArrowInvalid: offset overflow` before the
+  first step. The column is now `large_binary`.
 - Image SFT quotes now bound profile-wide decode work at an explicit 16 GiB instead of the
   per-row decode cap times the per-example image count (2 GiB), so screenshot datasets with a few
   thousand unique images, such as MiniWoB teacher traces, are no longer rejected before training.

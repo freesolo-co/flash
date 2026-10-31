@@ -119,12 +119,23 @@ class TrainingClient:
 
         loss_fn returns a scalar torch tensor and a JSON dictionary of metrics. No callable
         or pickle is sent to the GPU. Both passes use the same model version and dropout-free
-        model. Cross-sequence objectives (DPO, PPO, ranking, etc.) are supported.
+        model. Cross-sequence objectives (DPO, PPO, ranking, etc.) are supported. Rows with a
+        [T, K] target_tokens matrix receive [T, K] logprobs, so soft-target losses such as KL
+        to a teacher's top-k read them directly.
         """
         import torch
 
         with self._lock:
-            snapshot = [Datum(list(row.tokens)) for row in data]
+            # Both passes must score identical targets even if loss_fn mutates the caller's data.
+            snapshot = [
+                Datum(
+                    list(row.tokens),
+                    target_tokens=[list(ids) for ids in row.target_tokens]
+                    if row.target_tokens is not None
+                    else None,
+                )
+                for row in data
+            ]
             scored = self.forward(snapshot)
             logprobs = [
                 torch.tensor(row["logprobs"], dtype=torch.float32, requires_grad=True)
@@ -138,14 +149,14 @@ class TrainingClient:
             json.dumps(metrics, allow_nan=False)
             gradients = torch.autograd.grad(loss, logprobs, allow_unused=True)
             weights = []
-            for row, gradient in zip(snapshot, gradients, strict=True):
+            for row, gradient, scores in zip(snapshot, gradients, logprobs, strict=True):
                 if gradient is None:
-                    weight = [0.0] * (len(row.tokens) - 1)
+                    weight = torch.zeros_like(scores).tolist()
                 else:
                     if not torch.isfinite(gradient).all():
                         raise ValueError("custom loss produced non-finite token gradients")
                     weight = (-gradient).tolist()
-                weights.append(Datum(row.tokens, weight))
+                weights.append(Datum(row.tokens, weight, row.target_tokens))
             return self.forward_backward(weights, metrics={**metrics, "custom_loss": loss.item()})
 
     def optim_step(self, *, learning_rate, max_grad_norm=1.0, algorithm_state=None):

@@ -355,42 +355,42 @@ def create_run(
     authorization: Annotated[str | None, Header()] = None,
     x_freesolo_org_id: Annotated[str | None, Header()] = None,
 ):
-    dry_run = _require_bool(payload, "dry_run", False)
-    schema = _client_train_schema(payload)
-    submitted = payload.get("spec")
-    submitted_train = submitted.get("train") if isinstance(submitted, dict) else None
-    try:
-        spec = _parse_spec(payload, run_id=new_run_id())
-    except HTTPException as exc:
-        detail = _schema_disagreement_detail(exc, schema, submitted_train)
-        if detail is None:
-            raise
-        raise HTTPException(status_code=400, detail=detail) from exc
-    from flash.server.domain.registry.projects import require_project_access
-
-    project_id = require_project_access(
-        project_id=spec.project,
-        key=key,
-        authorization=authorization,
-        org_id=x_freesolo_org_id,
-    )
-    reporting_key = {**key, "org_id": key.get("org_id") or x_freesolo_org_id}
-    environment_slug = _resolve_managed_environment(
-        spec, project_id=project_id, reporting_key=reporting_key
-    )
-    runtime_secrets = _runtime_secrets(payload, spec)
-    ctx = _submission_context(
-        key=key, dry_run=dry_run, project_id=project_id, org_id_header=x_freesolo_org_id
-    )
-    affordability_org_id = ctx.affordability_org_id
-    billable_key = ctx.billable_key
-    bill_on_completion = ctx.bill_on_completion
-    billing_context = ctx.billing_context
-    platform_context = ctx.platform_context
-    run_id = spec.run_id
-    affordability_verified = False
     submission_started = False
     try:
+        dry_run = _require_bool(payload, "dry_run", False)
+        schema = _client_train_schema(payload)
+        submitted = payload.get("spec")
+        submitted_train = submitted.get("train") if isinstance(submitted, dict) else None
+        try:
+            spec = _parse_spec(payload, run_id=new_run_id())
+        except HTTPException as exc:
+            detail = _schema_disagreement_detail(exc, schema, submitted_train)
+            if detail is None:
+                raise
+            raise HTTPException(status_code=400, detail=detail) from exc
+        from flash.server.domain.registry.projects import require_project_access
+
+        project_id = require_project_access(
+            project_id=spec.project,
+            key=key,
+            authorization=authorization,
+            org_id=x_freesolo_org_id,
+        )
+        reporting_key = {**key, "org_id": key.get("org_id") or x_freesolo_org_id}
+        environment_slug = _resolve_managed_environment(
+            spec, project_id=project_id, reporting_key=reporting_key
+        )
+        runtime_secrets = _runtime_secrets(payload, spec)
+        ctx = _submission_context(
+            key=key, dry_run=dry_run, project_id=project_id, org_id_header=x_freesolo_org_id
+        )
+        affordability_org_id = ctx.affordability_org_id
+        billable_key = ctx.billable_key
+        bill_on_completion = ctx.bill_on_completion
+        billing_context = ctx.billing_context
+        platform_context = ctx.platform_context
+        run_id = spec.run_id
+        affordability_verified = False
         try:
             prepared = run_submission.prepare_job(
                 spec,
@@ -458,8 +458,8 @@ def create_run(
             )
         error = exc if isinstance(exc, HTTPException) else _submit_failure_http_error(exc)
         if not submission_started:
-            # Preparation is read-only. After admission a failed response may still
-            # leave a recoverable paid run, so status codes alone cannot authorize retry.
+            # Validation and preparation have not admitted a run. After admission a
+            # failed response may leave a recoverable paid run; never authorize retry.
             error.headers = {**(error.headers or {}), "X-Flash-Submission-Outcome": "not-created"}
         if error is exc:
             raise

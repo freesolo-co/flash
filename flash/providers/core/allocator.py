@@ -63,11 +63,6 @@ def required_vram_gb(
     model_revision: str = "",
 ) -> int:
     """VRAM required for the full run, sized to actual knobs via model_required_vram_gb."""
-    if algorithm == "custom":
-        from flash.core.catalog import CUSTOM_TRAINING_GPUS
-
-        custom_gpu_shape(model_id, "", (), None)
-        return min(GPU_INFO[gpu].vram_gb for gpu in CUSTOM_TRAINING_GPUS[model_id])
     from flash.engine.plan.vram import model_required_vram_gb
 
     return model_required_vram_gb(
@@ -120,8 +115,6 @@ def _step_cost_ranker(model_id, algorithm, train, thinking, model_revision="", o
     single-card paths (parse-time provisional, cost estimate) have no notion of: a combination
     bills every card but only the gpu-bound half of a step is divided among them.
     """
-    if algorithm == "custom":
-        return None  # arbitrary local work has no recipe-derived step-time prediction.
     cost_key = _run_cost_key(
         model_id,
         algorithm,
@@ -192,6 +185,8 @@ def _executed_gpu_count(algorithm: str, train, overrides, gpu_count: int) -> int
     algo = (algorithm or "").strip().lower()
     if algo in ("grpo", "rl"):
         return _executed_rl_gpu_count(algo, train, gpu_count)
+    if algo == "custom":
+        return 1
     if algo != "sft":
         return gpu_count
     batch = _sizing_int(train, "batch_size", 0)

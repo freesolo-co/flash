@@ -21,7 +21,7 @@ def custom_raw():
     }
 
 
-def test_custom_allocation_uses_shared_capacity_lookup_and_validated_hardware(monkeypatch):
+def test_custom_allocation_uses_shared_capacity_lookup_and_memory_fit(monkeypatch):
     from flash.cost.spec import estimate_for_spec
     from flash.providers.core import allocator
     from flash.providers.core.base import Candidate, UnsupportedGpuError
@@ -30,19 +30,24 @@ def test_custom_allocation_uses_shared_capacity_lookup_and_validated_hardware(mo
 
     def candidates(need, constraints):
         seen.append((need, constraints))
-        return [Candidate("modal", "A100 SXM", 1.0, 80), Candidate("modal", "H100", 4.0, 80)]
+        return [
+            # cheapest, but too small for Qwen3.5-9B custom training.
+            Candidate("modal", "L4", 0.5, 24),
+            Candidate("modal", "A100 SXM", 1.0, 80),
+            Candidate("modal", "H100", 4.0, 80),
+        ]
 
     monkeypatch.setattr(allocator, "available_providers", lambda: ("modal",))
     provider = SimpleNamespace(live_candidates=candidates)
     monkeypatch.setattr(allocator, "get_provider", lambda name: provider)
     spec = spec_from_dict(custom_raw())
-    assert spec.gpu.type == ""  # no authored GPU pin; the backend capability limits the pool.
+    assert spec.gpu.type == ""  # no authored GPU pin; shared sizing limits the pool.
     result = allocator.allocate(spec.model, spec.algorithm, train=spec.train)
-    assert result.gpu == "H100"
-    assert result.hourly_usd == 4.0
+    assert result.gpu == "A100 SXM"
+    assert result.hourly_usd == 1.0
     assert seen[0][1].max_gpu_count == 1
-    assert seen[0][1].gpu_type == "H100"
-    assert estimate_for_spec(spec, allocation=result).total_usd == 4.0
+    assert seen[0][1].gpu_type == ""  # no synthetic pin from a per-model GPU list
+    assert estimate_for_spec(spec, allocation=result).total_usd == 1.0
     provider.live_candidates = lambda *a: []
     with pytest.raises(UnsupportedGpuError):
         allocator.allocate(spec.model, spec.algorithm, train=spec.train)
@@ -393,8 +398,14 @@ def test_custom_rejects_old_deployed_server_before_importing_script_or_submittin
     api.create_run.assert_not_called()
 
 
-def test_custom_catalog_advertises_only_the_supported_model():
-    from flash.core.catalog import public_model_rows
+def test_every_catalog_model_supports_custom_training(monkeypatch):
+    from dataclasses import replace
 
+    from flash.core.catalog import MODELS, public_model_rows, validate_model_for_algorithm
+
+    model = replace(MODELS["Qwen/Qwen3.5-9B"], id="test/new-catalog-model")
+    monkeypatch.setitem(MODELS, model.id, model)
     models = [row["id"] for row in public_model_rows() if "custom" in row["algos"]]
-    assert models == ["Qwen/Qwen3.5-9B"]
+    assert set(models) == set(MODELS)
+    for model_id, info in MODELS.items():
+        assert validate_model_for_algorithm(model_id, "custom") == info
