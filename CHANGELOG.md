@@ -43,10 +43,14 @@ This file starts at 1.1.35. Earlier releases are not reconstructed here; use
   9B on L40S, A100 40GB, A100 80GB, RTX Pro 6000, H100, H200 or B200; Qwen3.8-27B on
   A100 80GB, RTX Pro 6000, H100, H200 or B200; and Qwen3.6-35B-A3B on RTX Pro 6000, H200
   or B200.
-- Custom `forward_backward` recomputes layer activations (gradient checkpointing) for models
-  without active dropout, running `forward_backward` in train mode and scoring in eval mode.
+- Custom `forward_backward` recomputes layer activations (gradient checkpointing) for audited
+  Qwen architectures without active module or functional attention dropout, running
+  `forward_backward` in train mode and scoring in eval mode. Unknown architectures and models
+  with stateful batch normalization stay in eval mode without checkpointing.
   Peak memory for a 4,096-token Qwen3.5-0.8B row falls from 26.7 GB to 16.8 GB, and
   eval-mode and checkpointed logprobs agree exactly on every catalog model.
+- Custom losses snapshot both input tokens and nested target matrices before scoring, so
+  mutations in a loss callback cannot change the targets used for the backward pass.
 
 - Versioned rollout request/result contracts for synchronous GRPO, binding generation to
   acknowledged policy snapshots and checking token probabilities, turn provenance, attempts,

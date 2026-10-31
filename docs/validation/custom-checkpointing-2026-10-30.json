@@ -1,0 +1,36 @@
+{
+  "model": "Qwen/Qwen3.5-0.8B",
+  "revision": "2fc06364715b967f1860aea9cf38778875588b17",
+  "gpu": "NVIDIA H100 80GB HBM3",
+  "torch": "2.10.0+cu128",
+  "transformers": "5.12.1",
+  "snapshot_and_checkpointed_gradients": {
+    "gradient_relative_l2_error": 0.0,
+    "logprob_max_error": 0.0,
+    "first_layer_forward_calls": 3,
+    "mutated_callback_targets": true
+  },
+  "context_ceiling": {
+    "tokens": 4096,
+    "target_shape": [
+      4095,
+      20
+    ],
+    "logprob_max_error": 0.0,
+    "optimizer_grad_norm": 134.21817016601562,
+    "peak_reserved_bytes": 20768096256
+  },
+  "functional_dropout_fallback": {
+    "attention_dropout": 0.5,
+    "attention_modules": 6,
+    "checkpointing": false,
+    "logprobs_equal": true,
+    "remained_in_eval": true
+  },
+  "worker_image": "ghcr.io/freesolo-co/flash-worker@sha256:80d1341d749cf30e59d3200a8cf78a48ed180f2392b88f4edaea2d488ee9981e",
+  "source_sha256": {
+    "flash/custom/backend.py": "5f363658904825bca093d9eab75062de75150a17dea73b34bfa9f5767e208e8a",
+    "flash/custom/client.py": "89cb404ace150265874c32ed7ba9eee324545ab3acc528566397b7b78bff99fe",
+    "scripts/qualify_custom_checkpointing.py": "f3d8d1878cdfd21b56bbe56a2d0d408288c2803a01e32ad68b8a1765a4718c8b"
+  }
+}

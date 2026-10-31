@@ -150,6 +150,30 @@ def test_custom_loss_reads_target_shaped_logprobs(client_and_backend):
     )
 
 
+def test_custom_loss_snapshots_nested_targets_before_callback(client_and_backend):
+    client, backend = client_and_backend
+    direct = copy.deepcopy(backend.model)
+    data = [Datum([1, 2, 3], target_tokens=[[2, 5], [3, 4]])]
+    selected = _direct_log_softmax(direct, data[0].tokens).gather(
+        -1, torch.tensor(data[0].target_tokens)
+    )
+    expected = -selected.square().sum()
+    expected.backward()
+
+    def loss_fn(rows, logprobs):
+        rows[0].tokens[1] = 6
+        rows[0].target_tokens[0][0] = 6  # mutate an inner list
+        rows[0].target_tokens[1] = [0, 0]  # replace a row in the outer list
+        return -logprobs[0].square().sum(), {}
+
+    result = client.forward_backward_custom(data, loss_fn)
+    assert result["metrics"]["custom_loss"] == pytest.approx(expected.item(), abs=1e-5)
+    assert torch.allclose(torch.tensor(result["outputs"][0]["logprobs"]), selected, atol=1e-6)
+    assert torch.allclose(
+        backend.model.projection.weight.grad, direct.projection.weight.grad, atol=1e-5
+    )
+
+
 def test_gradient_accumulation_step_and_checkpoint_restore_optimizer(client_and_backend):
     client, backend = client_and_backend
     data = [Datum([1, 2, 3], [0, 1])]
@@ -178,6 +202,9 @@ class CheckpointedLM(TinyLM):
 
     def __init__(self, dropout=0.0):
         super().__init__()
+        self.config.model_type = "qwen3_5_text"
+        self.config.attention_dropout = 0.0
+        self.attention_dropout = 0.0
         self.dropout = torch.nn.Dropout(dropout)
         self.checkpointing_kwargs = None
         self.modes = []
@@ -187,7 +214,11 @@ class CheckpointedLM(TinyLM):
 
     def forward(self, input_ids, use_cache=False):
         self.modes.append(self.training)
-        return super().forward(input_ids, use_cache)
+        output = super().forward(input_ids, use_cache)
+        output.logits = torch.nn.functional.dropout(
+            output.logits, p=self.attention_dropout, training=self.training
+        )
+        return output
 
 
 def test_checkpointed_backward_runs_in_train_mode_and_returns_to_eval(tmp_path):
@@ -210,6 +241,63 @@ def test_models_with_active_dropout_never_checkpoint(tmp_path):
     assert not backend.checkpointing
     assert model.checkpointing_kwargs is None
     backend.forward_backward([Datum([1, 2, 3], [1.0, 1.0])])
+    assert model.modes == [False]
+
+
+@pytest.mark.parametrize("nested", [False, True])
+@pytest.mark.parametrize("setting", ["config", "module", "both"])
+def test_functional_attention_dropout_keeps_both_passes_in_eval(tmp_path, nested, setting):
+    model = CheckpointedLM()
+    text_config = model.config
+    if nested:
+        model.config = SimpleNamespace(model_type="qwen3_5", text_config=text_config)
+    if setting in {"config", "both"}:
+        text_config.attention_dropout = 0.5
+    if setting in {"module", "both"}:
+        model.attention_dropout = 0.5
+    backend = TorchBackend(model, TinyTokenizer(), checkpoint_dir=tmp_path)
+    assert not backend.checkpointing
+    assert model.checkpointing_kwargs is None
+    targets = [[2, 5], [3, 4]]
+    scored = backend.forward([Datum([1, 2, 3], target_tokens=targets)])
+    trained = backend.forward_backward([Datum([1, 2, 3], [[1, 0], [0, 1]], targets)])
+    assert scored["outputs"] == trained["outputs"]
+    assert model.modes == [False, False]
+
+
+@pytest.mark.parametrize("model_type", ["qwen3_5_text", "qwen3_5_moe_text"])
+@pytest.mark.parametrize("nested", [False, True])
+def test_checkpointing_accepts_audited_dense_and_moe_configs(tmp_path, model_type, nested):
+    model = CheckpointedLM()
+    model.config.model_type = model_type
+    if nested:
+        model.config = SimpleNamespace(
+            model_type=model_type.removesuffix("_text"), text_config=model.config
+        )
+    backend = TorchBackend(model, TinyTokenizer(), checkpoint_dir=tmp_path)
+    assert backend.checkpointing
+
+
+@pytest.mark.parametrize(
+    "behavior", ["unknown", "unknown_text", "missing_dropout", "batchnorm", "dropout2d"]
+)
+def test_unaudited_or_stateful_training_behavior_never_checkpoints(tmp_path, behavior):
+    model = CheckpointedLM()
+    if behavior == "unknown":
+        model.config.model_type = "unqualified_architecture"
+    elif behavior == "unknown_text":
+        model.config.model_type = "qwen3_5"
+        model.config.text_config = SimpleNamespace(model_type="unknown", attention_dropout=0.0)
+    elif behavior == "missing_dropout":
+        del model.config.attention_dropout
+    elif behavior == "batchnorm":
+        model.normalization = torch.nn.BatchNorm1d(7)
+    else:
+        model.dropout = torch.nn.Dropout2d(0.5)
+    backend = TorchBackend(model, TinyTokenizer(), checkpoint_dir=tmp_path)
+    assert not backend.checkpointing
+    assert model.checkpointing_kwargs is None
+    backend.forward_backward([Datum([1, 2], [1])])
     assert model.modes == [False]
 
 

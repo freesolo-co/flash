@@ -272,18 +272,41 @@ class TorchBackend:
 
 
 def _enable_checkpointing(model):
-    """Recompute layer activations during backward when that cannot change the function.
+    """Checkpoint only audited Qwen architectures whose train/eval functions agree.
 
     Without checkpointing a 4,096-token row keeps every layer's activations, which exceeds
-    one GPU for larger models. transformers only recomputes in train mode, so checkpointing
-    is enabled only for models with no active dropout, where train and eval agree.
+    one GPU for larger models. transformers only recomputes in train mode. Absence of
+    nn.Dropout is not sufficient: Qwen attention uses functional dropout. These standard
+    transformers architectures have no other train-only text behavior; new architectures
+    need code review and GPU logprob/gradient conformance before joining this allowlist.
+    Unknown models stay in eval mode without checkpointing. This is not a generic test for
+    arbitrary custom modules, which the managed loader disallows (trust_remote_code=False).
     """
     import torch
 
     if not getattr(model, "supports_gradient_checkpointing", False):
         return False
-    if any(isinstance(m, torch.nn.Dropout) and m.p > 0 for m in model.modules()):
+    config = getattr(model, "config", None)
+    if getattr(config, "model_type", None) not in {
+        "qwen3_5",
+        "qwen3_5_text",
+        "qwen3_5_moe",
+        "qwen3_5_moe_text",
+    }:
         return False
+    text_config = getattr(config, "text_config", config)
+    if getattr(text_config, "model_type", None) not in {"qwen3_5_text", "qwen3_5_moe_text"}:
+        return False
+    if getattr(text_config, "attention_dropout", None) != 0:
+        return False
+    for module in model.modules():
+        # Inspect the live attention setting too: it is copied from config on construction.
+        if getattr(module, "attention_dropout", 0) != 0:
+            return False
+        if isinstance(module, torch.nn.modules.dropout._DropoutNd) and module.p > 0:
+            return False
+        if isinstance(module, torch.nn.modules.batchnorm._BatchNorm):
+            return False
     model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
     return True
 

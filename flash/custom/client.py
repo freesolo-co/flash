@@ -126,7 +126,16 @@ class TrainingClient:
         import torch
 
         with self._lock:
-            snapshot = [Datum(list(row.tokens), target_tokens=row.target_tokens) for row in data]
+            # Both passes must score identical targets even if loss_fn mutates the caller's data.
+            snapshot = [
+                Datum(
+                    list(row.tokens),
+                    target_tokens=[list(ids) for ids in row.target_tokens]
+                    if row.target_tokens is not None
+                    else None,
+                )
+                for row in data
+            ]
             scored = self.forward(snapshot)
             logprobs = [
                 torch.tensor(row["logprobs"], dtype=torch.float32, requires_grad=True)
