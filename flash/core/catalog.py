@@ -9,8 +9,6 @@ from typing import Any
 from flash.content.image_descriptors import MAX_IMAGES_PER_CONVERSATION
 
 ALGORITHMS = ("sft", "grpo")
-# measured custom Torch backend shapes; widening this requires GPU validation of that backend.
-CUSTOM_TRAINING_GPUS = {"Qwen/Qwen3.5-9B": ("H100",)}
 
 # algorithms whose training step samples on-policy student completions, unlike fixed-dataset sft.
 # import ``samples_on_policy`` instead of hand-rolling algorithm tuples at each call site.
@@ -665,7 +663,7 @@ def resolve_model(model_id: str, algorithm: str, model_revision: str = "") -> Mo
 def validate_model_for_algorithm(model_id: str, algorithm: str) -> ModelInfo:
     info = get_model(model_id)
     algo = normalize_algorithm(algorithm)
-    if algo == "custom" and model_id in CUSTOM_TRAINING_GPUS:
+    if algo == "custom":
         return info
     if algo not in info.algos:
         allowed = ", ".join(info.algos)
@@ -676,6 +674,5 @@ def validate_model_for_algorithm(model_id: str, algorithm: str) -> ModelInfo:
 def public_model_rows() -> list[dict[str, Any]]:
     rows = [_with_merge_disk_floor(model).to_dict() for model in list_models()]
     for row in rows:
-        if row["id"] in CUSTOM_TRAINING_GPUS:
-            row["algos"] = (*row["algos"], "custom")
+        row["algos"] = (*row["algos"], "custom")
     return rows

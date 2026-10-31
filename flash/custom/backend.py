@@ -22,6 +22,7 @@ class TorchBackend:
         self.tokenizer = tokenizer
         # eval disables dropout while retaining autograd: two-pass custom losses must see the same function.
         self.model.eval()
+        self.checkpointing = _enable_checkpointing(model)
         self.parameters = [p for p in model.parameters() if p.requires_grad]
         if not self.parameters:
             raise ValueError("model has no trainable parameters")
@@ -56,14 +57,19 @@ class TorchBackend:
 
         return torch.tensor([tokens], device=self.parameters[0].device, dtype=torch.long)
 
-    def _logprobs(self, tokens):
+    def _logprobs(self, tokens, target_tokens=None):
+        """Logprobs of the targets: the next token ([T]) or a [T, K] target matrix."""
         import torch
 
         ids = self._tensor(tokens)
         logits = self.model(input_ids=ids[:, :-1], use_cache=False).logits[0].float()
-        targets = ids[0, 1:]
-        selected = logits.gather(-1, targets[:, None]).squeeze(-1)
-        return selected - torch.logsumexp(logits, dim=-1), logits
+        if target_tokens is None:
+            targets = ids[0, 1:, None]
+        else:
+            targets = torch.tensor(target_tokens, device=logits.device, dtype=torch.long)
+        # gather targets and one normalizer per position; never copy a vocabulary row each.
+        selected = logits.gather(-1, targets) - torch.logsumexp(logits, dim=-1, keepdim=True)
+        return (selected.squeeze(-1) if target_tokens is None else selected), logits
 
     def forward(self, data, top_k=0):
         import torch
@@ -71,7 +77,7 @@ class TorchBackend:
         outputs = []
         with torch.no_grad():
             for row in data:
-                logprobs, logits = self._logprobs(row.tokens)
+                logprobs, logits = self._logprobs(row.tokens, row.target_tokens)
                 output = {"logprobs": logprobs.cpu().tolist()}
                 if top_k:
                     values, indices = logits.topk(top_k, dim=-1)
@@ -88,15 +94,21 @@ class TorchBackend:
 
         loss_total = 0.0
         outputs = []
-        for row in data:
-            logprobs, _ = self._logprobs(row.tokens)
-            weights = torch.tensor(row.weights, device=logprobs.device, dtype=logprobs.dtype)
-            loss = -(weights * logprobs).sum()
-            if not torch.isfinite(loss):
-                raise RuntimeError("non-finite loss; session cannot continue")
-            loss.backward()
-            loss_total += loss.detach().item()
-            outputs.append({"logprobs": logprobs.detach().cpu().tolist()})
+        # transformers recomputes checkpointed layers only in train mode; the model has no
+        # train-only behavior when checkpointing is enabled, so this is the eval function.
+        self.model.train(self.checkpointing)
+        try:
+            for row in data:
+                logprobs, _ = self._logprobs(row.tokens, row.target_tokens)
+                weights = torch.tensor(row.weights, device=logprobs.device, dtype=logprobs.dtype)
+                loss = -(weights * logprobs).sum()
+                if not torch.isfinite(loss):
+                    raise RuntimeError("non-finite loss; session cannot continue")
+                loss.backward()
+                loss_total += loss.detach().item()
+                outputs.append({"logprobs": logprobs.detach().cpu().tolist()})
+        finally:
+            self.model.eval()
         self.pending_backward += 1
         return {"outputs": outputs, "metrics": {**(metrics or {}), "surrogate_loss": loss_total}}
 
@@ -259,6 +271,34 @@ class TorchBackend:
         return {}
 
 
+def _enable_checkpointing(model):
+    """Checkpoint catalog models without active dropout or stateful normalization.
+
+    Without checkpointing a 4,096-token row keeps every layer's activations, which exceeds
+    one GPU for larger models. transformers only recomputes in train mode. Absence of
+    nn.Dropout is not sufficient: Qwen attention uses functional dropout. The supported
+    catalog architectures have no other train-only text behavior.
+    """
+    import torch
+
+    if not getattr(model, "supports_gradient_checkpointing", False):
+        return False
+    config = getattr(model, "config", None)
+    text_config = getattr(config, "text_config", config)
+    if getattr(text_config, "attention_dropout", None) != 0:
+        return False
+    for module in model.modules():
+        # Inspect the live attention setting too: it is copied from config on construction.
+        if getattr(module, "attention_dropout", 0) != 0:
+            return False
+        if isinstance(module, torch.nn.modules.dropout._DropoutNd) and module.p > 0:
+            return False
+        if isinstance(module, torch.nn.modules.batchnorm._BatchNorm):
+            return False
+    model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+    return True
+
+
 def load_backend(
     model_id,
     *,
@@ -278,9 +318,13 @@ def load_backend(
     # pin tokenizer and weights to the same immutable revision, even if the author used a branch.
     revision = getattr(config, "_commit_hash", None) or revision
     tokenizer = AutoTokenizer.from_pretrained(model_id, revision=revision, trust_remote_code=False)
+    from flash.core.catalog import supports_image_training
+
     model_class = AutoModelForCausalLM
     targeting = {}
-    if model_id == "Qwen/Qwen3.5-9B":
+    # Image-trained checkpoints keep the multimodal module layout their adapters target;
+    # custom training adapts only the cataloged language modules of that layout.
+    if supports_image_training(model_id):
         from transformers import AutoModelForImageTextToText
 
         from flash.adapters.targets import resolve_lora_targeting

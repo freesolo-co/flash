@@ -83,6 +83,97 @@ def test_two_pass_cross_sequence_loss_has_exact_direct_autograd_gradient(client_
     assert torch.count_nonzero(backend.model.projection.weight.grad[1]) == 0
 
 
+def _direct_log_softmax(model, tokens):
+    return model(torch.tensor([tokens[:-1]])).logits[0].log_softmax(-1)
+
+
+def test_target_matrix_gives_exact_forward_kl_gradient(client_and_backend):
+    client, backend = client_and_backend
+    direct = copy.deepcopy(backend.model)
+    tokens = [1, 2, 3, 4]
+    # [T, K]: each row lists K tokens scored where tokens[i+1] is predicted; zero weights pad.
+    target_tokens = [[2, 5, 0], [3, 0, 0], [4, 6, 1]]
+    weights = [[0.7, 0.2, 0.1], [0.0, 0.0, 0.0], [0.9, 0.1, 0.0]]
+    log_probs = _direct_log_softmax(direct, tokens)
+    selected = log_probs.gather(-1, torch.tensor(target_tokens))
+    expected = -(torch.tensor(weights) * selected).sum()
+    expected.backward()
+
+    result = client.forward_backward([Datum(tokens, weights, target_tokens)])
+    assert result["metrics"]["surrogate_loss"] == pytest.approx(expected.item(), abs=1e-6)
+    assert torch.allclose(
+        backend.model.projection.weight.grad, direct.projection.weight.grad, atol=1e-6
+    )
+    assert torch.allclose(torch.tensor(result["outputs"][0]["logprobs"]), selected, atol=1e-6)
+
+
+def test_forward_returns_logprobs_with_the_target_shape(client_and_backend):
+    client, backend = client_and_backend
+    tokens = [1, 2, 3]
+    log_probs = _direct_log_softmax(backend.model, tokens)
+    shaped = client.forward([Datum(tokens, target_tokens=[[6, 2], [3, 1]])])["outputs"][0]
+    assert torch.allclose(
+        torch.tensor(shaped["logprobs"]),
+        log_probs.gather(-1, torch.tensor([[6, 2], [3, 1]])),
+        atol=1e-6,
+    )
+    # without target_tokens the targets remain the next tokens, one per position.
+    plain = client.forward([Datum(tokens)])["outputs"][0]
+    assert plain["logprobs"] == pytest.approx(
+        log_probs.gather(-1, torch.tensor([[2], [3]])).squeeze(-1).tolist(), abs=1e-6
+    )
+    assert backend.pending_backward == 0
+
+
+def test_custom_loss_reads_target_shaped_logprobs(client_and_backend):
+    client, backend = client_and_backend
+    direct = copy.deepcopy(backend.model)
+    tokens = [1, 2, 3]
+    target_tokens = [[2, 5, 6], [3, 1, 4]]
+    teacher = torch.tensor([[-0.2, -1.8, -9.0], [-0.1, -2.5, -3.0]]).softmax(-1)
+
+    def kl_loss(rows, probs):
+        # forward KL to the teacher's renormalized top-k: the loss sees [T, K] logprobs.
+        return (teacher * (teacher.log() - probs[0])).sum(), {"positions": probs[0].shape[0]}
+
+    expected, _ = kl_loss(
+        None, [_direct_log_softmax(direct, tokens).gather(-1, torch.tensor(target_tokens))]
+    )
+    expected.backward()
+
+    data = [Datum(tokens, target_tokens=target_tokens)]
+    result = client.forward_backward_custom(data, kl_loss)
+    assert result["metrics"]["custom_loss"] == pytest.approx(expected.item(), abs=1e-6)
+    assert result["metrics"]["positions"] == 2
+    assert torch.allclose(
+        backend.model.projection.weight.grad, direct.projection.weight.grad, atol=1e-6
+    )
+
+
+def test_custom_loss_snapshots_nested_targets_before_callback(client_and_backend):
+    client, backend = client_and_backend
+    direct = copy.deepcopy(backend.model)
+    data = [Datum([1, 2, 3], target_tokens=[[2, 5], [3, 4]])]
+    selected = _direct_log_softmax(direct, data[0].tokens).gather(
+        -1, torch.tensor(data[0].target_tokens)
+    )
+    expected = -selected.square().sum()
+    expected.backward()
+
+    def loss_fn(rows, logprobs):
+        rows[0].tokens[1] = 6
+        rows[0].target_tokens[0][0] = 6  # mutate an inner list
+        rows[0].target_tokens[1] = [0, 0]  # replace a row in the outer list
+        return -logprobs[0].square().sum(), {}
+
+    result = client.forward_backward_custom(data, loss_fn)
+    assert result["metrics"]["custom_loss"] == pytest.approx(expected.item(), abs=1e-5)
+    assert torch.allclose(torch.tensor(result["outputs"][0]["logprobs"]), selected, atol=1e-6)
+    assert torch.allclose(
+        backend.model.projection.weight.grad, direct.projection.weight.grad, atol=1e-5
+    )
+
+
 def test_gradient_accumulation_step_and_checkpoint_restore_optimizer(client_and_backend):
     client, backend = client_and_backend
     data = [Datum([1, 2, 3], [0, 1])]
@@ -104,6 +195,89 @@ def test_gradient_accumulation_step_and_checkpoint_restore_optimizer(client_and_
     client.optim_step(learning_rate=0.1)
     assert torch.equal(updated, backend.model.projection.weight)
     assert client.model_version == 3
+
+
+class CheckpointedLM(TinyLM):
+    supports_gradient_checkpointing = True
+
+    def __init__(self, dropout=0.0):
+        super().__init__()
+        self.config.attention_dropout = 0.0
+        self.attention_dropout = 0.0
+        self.dropout = torch.nn.Dropout(dropout)
+        self.checkpointing_kwargs = None
+        self.modes = []
+
+    def gradient_checkpointing_enable(self, gradient_checkpointing_kwargs=None):
+        self.checkpointing_kwargs = gradient_checkpointing_kwargs
+
+    def forward(self, input_ids, use_cache=False):
+        self.modes.append(self.training)
+        output = super().forward(input_ids, use_cache)
+        output.logits = torch.nn.functional.dropout(
+            output.logits, p=self.attention_dropout, training=self.training
+        )
+        return output
+
+
+def test_checkpointed_backward_runs_in_train_mode_and_returns_to_eval(tmp_path):
+    model = CheckpointedLM()
+    backend = TorchBackend(model, TinyTokenizer(), checkpoint_dir=tmp_path)
+    assert backend.checkpointing
+    assert model.checkpointing_kwargs == {"use_reentrant": False}
+    backend.forward([Datum([1, 2, 3])])
+    backend.forward_backward([Datum([1, 2, 3], [1.0, 1.0])])
+    with pytest.raises(RuntimeError, match="non-finite"):
+        backend.forward_backward([Datum([1, 2, 3], [float("inf"), 0.0])])
+    # scoring stays in eval; only backward passes recompute, and eval returns after a failure.
+    assert model.modes == [False, True, True]
+    assert not model.training
+
+
+def test_models_with_active_dropout_never_checkpoint(tmp_path):
+    model = CheckpointedLM(dropout=0.1)
+    backend = TorchBackend(model, TinyTokenizer(), checkpoint_dir=tmp_path)
+    assert not backend.checkpointing
+    assert model.checkpointing_kwargs is None
+    backend.forward_backward([Datum([1, 2, 3], [1.0, 1.0])])
+    assert model.modes == [False]
+
+
+@pytest.mark.parametrize("nested", [False, True])
+@pytest.mark.parametrize("setting", ["config", "module", "both"])
+def test_functional_attention_dropout_keeps_both_passes_in_eval(tmp_path, nested, setting):
+    model = CheckpointedLM()
+    text_config = model.config
+    if nested:
+        model.config = SimpleNamespace(text_config=text_config)
+    if setting in {"config", "both"}:
+        text_config.attention_dropout = 0.5
+    if setting in {"module", "both"}:
+        model.attention_dropout = 0.5
+    backend = TorchBackend(model, TinyTokenizer(), checkpoint_dir=tmp_path)
+    assert not backend.checkpointing
+    assert model.checkpointing_kwargs is None
+    targets = [[2, 5], [3, 4]]
+    scored = backend.forward([Datum([1, 2, 3], target_tokens=targets)])
+    trained = backend.forward_backward([Datum([1, 2, 3], [[1, 0], [0, 1]], targets)])
+    assert scored["outputs"] == trained["outputs"]
+    assert model.modes == [False, False]
+
+
+@pytest.mark.parametrize("behavior", ["missing_dropout", "batchnorm", "dropout2d"])
+def test_unchecked_dropout_or_stateful_training_behavior_never_checkpoints(tmp_path, behavior):
+    model = CheckpointedLM()
+    if behavior == "missing_dropout":
+        del model.config.attention_dropout
+    elif behavior == "batchnorm":
+        model.normalization = torch.nn.BatchNorm1d(7)
+    else:
+        model.dropout = torch.nn.Dropout2d(0.5)
+    backend = TorchBackend(model, TinyTokenizer(), checkpoint_dir=tmp_path)
+    assert not backend.checkpointing
+    assert model.checkpointing_kwargs is None
+    backend.forward_backward([Datum([1, 2], [1])])
+    assert model.modes == [False]
 
 
 def test_bad_custom_loss_never_accumulates_gradients(client_and_backend):
