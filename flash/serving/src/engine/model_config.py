@@ -41,7 +41,7 @@ from flash.serving.src.engine.prequant_config import (
 # The dense small models use L4, the FP8 9B uses L40S, the FP8 27B uses A100 80GB, and
 # the BF16 35B MoE uses H200. See the hosted GPU qualification table in app/README.md.
 #   - Qwen3.6-35B-A3B (vision-language MoE; arch ``Qwen3_5MoeForConditionalGeneration``) -> H200
-#     (141 GB) with the base bf16 weights, 6 x 64 LoRA at 32k. bf16 (not FP8) is the one path giving
+#     (141 GB) with the base bf16 weights, 6 x 64 LoRA at native 256k. bf16 (not FP8) is the one path giving
 #     full-expert LoRA + CUDA graphs because the fused-MoE LoRA path won't compile on fp8e4nv. see the
 #     detailed 35B block below.
 #
@@ -63,7 +63,7 @@ SERVING_MODELS: list[dict[str, Any]] = [
             "max_loras": 4,
             "max_cpu_loras": 4,
             "max_lora_rank": 64,
-            "max_model_len": 32768,
+            "max_model_len": 262144,
             "max_num_seqs": 8,
             "enforce_eager": False,
             "reasoning_parser": "qwen3",
@@ -83,7 +83,7 @@ SERVING_MODELS: list[dict[str, Any]] = [
             "max_loras": 4,
             "max_cpu_loras": 4,
             "max_lora_rank": 64,
-            "max_model_len": 32768,
+            "max_model_len": 262144,
             "max_num_seqs": 8,
             "enforce_eager": False,
             "reasoning_parser": "qwen3",
@@ -97,14 +97,14 @@ SERVING_MODELS: list[dict[str, Any]] = [
             "tokenizer_model": "Qwen/Qwen3.5-9B",
             "tokenizer_revision": "c202236235762e1c871ad0ccb60c8ee5ba337b9a",
             "processor_revision": "c202236235762e1c871ad0ccb60c8ee5ba337b9a",
-            # Tau conversations can exceed 32k input tokens; reserve a 64k serving window.
+            # Use the checkpoint's native 262,144-token context, including generated output.
             # The former B200's KV capacity measurements do not apply to this smaller GPU.
             # keep CUDA graphs on because eager is about 10x slower for this hybrid GatedDeltaNet
             # model, and keep 0.90 for graph-capture headroom.
             "gpu_memory_utilization": 0.90,
             "max_loras": 16,
-            "max_lora_rank": 128,  # rank-128 / 16 hot LoRAs (cheap on the 9 GiB FP8 9B); 64k context.
-            "max_model_len": 65536,
+            "max_lora_rank": 128,  # rank-128 / 16 hot LoRAs (cheap on the 9 GiB FP8 9B); native 256k context.
+            "max_model_len": 262144,
             "max_num_seqs": 8,
             "enforce_eager": False,
             "reasoning_parser": "qwen3",
@@ -119,7 +119,7 @@ SERVING_MODELS: list[dict[str, Any]] = [
     #     the A100's Marlin kernel runs this MoE's full-expert LoRA.
     #   * bf16 sidesteps the FP8 kernel. on the 141 GB H200 this tier used to run on, 8 x 64 LoRA
     #     plus 32k overflowed the card (only about 19k context fit); six slots preserve the
-    #     configured 32k context and eight-sequence admission on H200.
+    #     original 32k context and eight-sequence admission on H200.
     #   * H200 qualification loaded 108.46 GiB for the model and configured LoRA buffers.
     #     Smaller 80/96 GB cards cannot fit that allocation; inference or adapter registration
     #     starts the engine within the raised startup_timeout in modal_app.
@@ -141,8 +141,8 @@ SERVING_MODELS: list[dict[str, Any]] = [
             "gpu_memory_utilization": 0.90,
             "max_loras": 6,
             "max_lora_rank": 64,
-            # 32k context at six hot rank-64 LoRAs; preserve the qualified H200 serving shape.
-            "max_model_len": 32768,
+            # Native 256k context with six hot rank-64 LoRAs; long requests share KV capacity.
+            "max_model_len": 262144,
             "max_num_batched_tokens": 4096,
             # CUDA graphs remain enabled and LoRA-specialized on H200.
             "enforce_eager": False,
@@ -174,7 +174,7 @@ SERVING_MODELS: list[dict[str, Any]] = [
             "gpu_memory_utilization": 0.90,
             "max_loras": 16,
             "max_lora_rank": 64,
-            "max_model_len": 32768,
+            "max_model_len": 262144,
             "max_num_seqs": 8,
             "enforce_eager": False,
             "reasoning_parser": "qwen3",

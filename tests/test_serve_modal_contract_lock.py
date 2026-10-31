@@ -18,24 +18,24 @@ from flash.cli.parsing.serve_parser import _add_serve_commands
 from flash.serve.provisioning.modal.planning.plan import build_modal_create_plan
 from tests.test_cli_serve_deploy import _args, _stub_resolution
 
-_MODAL_SPEC_ID = "1446ab28c4bdc4087e9af72fb08950636213136529a791d89a7b68fe38a0c2c9"
-_MODAL_IDENTITY_SHA256 = "1daf422fc339c61877060c446843c7b97a72fa90fb4c39c49be4db25612f0e44"
+_MODAL_SPEC_ID = "bb8e2fc51a56bb6e4e4b2c8306ec41ea36c02221dc014483d4d0d44e62d0e3ce"
+_MODAL_IDENTITY_SHA256 = "fab98be0b9255460d985022c592b1b00402c03c29acfcd01693ea9b762416c9d"
 _MODAL_NAMES = {
-    "app_or_pod": "flash-app-nzsf6nktjdgbgjx63v2yqgdxh3cwc6ss",
-    "volume": "flash-volume-i2fv6yrr5vebd6voygsoi4hddayf2ggp",
-    "template": "flash-template-qpexjixbfpnjzm37v2hu46xnbdhbzx4b",
-    "inference_secret": "flash-inference-secret-mjlqns73nknt2u3gajw2nja4lz424nim",
-    "artifact_secret": "flash-artifact-secret-w3vk3gxoueyjpjjqpodub33gdjr3idhk",
+    "app_or_pod": "flash-app-q6u72ddlwnubmxqniu5ldi37p7sqzk2y",
+    "volume": "flash-volume-mp5jmghv2jp4illstpjdw3uydmfdnfwj",
+    "template": "flash-template-ifryumjx3yvpkm6pctd3q4dr6s2ufe7f",
+    "inference_secret": "flash-inference-secret-jwlqyxoquwx43tquxub2w6wncl6wdfs5",
+    "artifact_secret": "flash-artifact-secret-klk34w3zpubp7surfjts6ymhklqq6i4h",
 }
 _MODAL_TAGS = (
     ("flash-deployment", "xxOvS4LyqBaN6-V5n2-PzBCz9R_VYmltmj_nFrKLEQ4"),
-    ("flash-engine", "VwqLYZPunnh3WiJ6BO0r3xXcjurn6etO1tFuIq3cG9g"),
+    ("flash-engine", "kGhUdeBLBw6qGyNcQLjAL8sgmOhe1IKBgV0b7sl1sYY"),
     ("flash-generation", "1"),
     ("flash-image", "qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqo"),
-    ("flash-manifest", "HBb_x6sZoADLP62F7J7YzdcGugRkD-7GoaLbKWr4HhE"),
+    ("flash-manifest", "ruJUSYp2_ZkimU4jW2HZ9g-2nQ2Rj4RxW0miSBx9tqQ"),
     ("flash-phase", "finalized"),
-    ("flash-spec", "FEarKMS9xAh-mvcvsIlQY2ITE2Upp5HYmnto_jigwsk"),
-    ("flash-topology", "Anai4glmcG-PYt0wQbSGV7rwqthAMVRMvJEl00ls6Mo"),
+    ("flash-spec", "u44vxRpWu25OSyyDBuxB6jbAIiHcAUSD1NDUTmLQ484"),
+    ("flash-topology", "7Bw3elYyaiLBvSCWHMl-jsghOi0cBo9CVKp7AsnuEIc"),
 )
 
 
@@ -121,7 +121,7 @@ def test_modal_schema_v2_identity_spec_and_plan_are_byte_stable(
     assert plan.tags == _MODAL_TAGS
     assert (
         plan.expected_public_url
-        == "https://workspace--fsw-dylgttjqzd7m5xx7kzp5hqzg3rlv6omhrqgphwvaaiacihdx.modal.run"
+        == "https://workspace--fsw-jl6t4yxq4s52w5nzzljagadzgukwcbhswblslcvilacdv74c.modal.run"
     )
 
 

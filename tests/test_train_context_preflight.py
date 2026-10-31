@@ -28,23 +28,23 @@ def _spec(
 
 
 def test_sft_max_context_tokens_above_serving_cap_rejected():
-    # The 9B serves at 64k; reject contexts above the advertised window.
-    spec = _spec(model="Qwen/Qwen3.5-9B", algorithm="sft", max_context_tokens=65537)
+    # The 9B serves at native 256k; reject contexts above the advertised window.
+    spec = _spec(model="Qwen/Qwen3.5-9B", algorithm="sft", max_context_tokens=262145)
     with pytest.raises(
-        ValueError, match=r"train\.max_context_tokens=65537 exceeds .*max_model_len=65536"
+        ValueError, match=r"train\.max_context_tokens=262145 exceeds .*max_model_len=262144"
     ):
         preflight_train_context_within_serving(spec)
 
 
 def test_sft_max_context_tokens_at_cap_allowed():
     preflight_train_context_within_serving(
-        _spec(model="Qwen/Qwen3.5-9B", algorithm="sft", max_context_tokens=65536)
+        _spec(model="Qwen/Qwen3.5-9B", algorithm="sft", max_context_tokens=262144)
     )
 
 
 @pytest.mark.parametrize(
     ("algorithm", "kwargs"),
-    [("sft", {"max_context_tokens": 32768}), ("grpo", {"max_completion_tokens": 30720})],
+    [("sft", {"max_context_tokens": 262144}), ("grpo", {"max_completion_tokens": 260096})],
 )
 def test_qwen38_context_at_approved_serving_cap_allowed(algorithm: str, kwargs: dict):
     preflight_train_context_within_serving(
@@ -55,9 +55,9 @@ def test_qwen38_context_at_approved_serving_cap_allowed(algorithm: str, kwargs: 
 @pytest.mark.parametrize("algorithm", ["sft", "grpo"])
 def test_qwen38_context_above_approved_serving_cap_rejected(algorithm: str):
     kwargs = (
-        {"max_context_tokens": 32769} if algorithm == "sft" else {"max_completion_tokens": 31745}
+        {"max_context_tokens": 262145} if algorithm == "sft" else {"max_completion_tokens": 261121}
     )
-    with pytest.raises(ValueError, match=r"exceeds .*serving max_model_len=32768"):
+    with pytest.raises(ValueError, match=r"exceeds .*serving max_model_len=262144"):
         preflight_train_context_within_serving(
             _spec(model="Qwen/Qwen3.8-27B", algorithm=algorithm, **kwargs)
         )
@@ -68,20 +68,20 @@ def test_sft_unset_max_context_tokens_allowed():
     preflight_train_context_within_serving(_spec(model="Qwen/Qwen3.5-9B", algorithm="sft"))
 
 
-def test_35b_32768_context_allowed():
+def test_35b_262144_context_allowed():
     preflight_train_context_within_serving(
-        _spec(model="Qwen/Qwen3.6-35B-A3B", algorithm="sft", max_context_tokens=32768)
+        _spec(model="Qwen/Qwen3.6-35B-A3B", algorithm="sft", max_context_tokens=262144)
     )
 
 
 def test_35b_context_above_serving_cap_rejected():
-    spec = _spec(model="Qwen/Qwen3.6-35B-A3B", algorithm="sft", max_context_tokens=32769)
-    with pytest.raises(ValueError, match=r"exceeds .*serving max_model_len=32768"):
+    spec = _spec(model="Qwen/Qwen3.6-35B-A3B", algorithm="sft", max_context_tokens=262145)
+    with pytest.raises(ValueError, match=r"exceeds .*serving max_model_len=262144"):
         preflight_train_context_within_serving(spec)
 
 
 def test_grpo_unset_rollout_within_35b_cap_allowed():
-    # unset grpo rollout defaults (max_prompt 2048 + completion) stay under 32768, even for thinking.
+    # unset grpo rollout defaults (max_prompt 2048 + completion) stay under 262144, even for thinking.
     preflight_train_context_within_serving(
         _spec(model="Qwen/Qwen3.6-35B-A3B", algorithm="grpo", thinking=True)
     )
@@ -89,8 +89,8 @@ def test_grpo_unset_rollout_within_35b_cap_allowed():
 
 def test_grpo_big_max_completion_tokens_pushes_rollout_over_cap_rejected():
     # a large completion budget makes prompt+completion exceed the served context.
-    spec = _spec(model="Qwen/Qwen3.5-9B", algorithm="grpo", max_completion_tokens=65536)
-    with pytest.raises(ValueError, match=r"exceeds .*serving max_model_len=65536"):
+    spec = _spec(model="Qwen/Qwen3.5-9B", algorithm="grpo", max_completion_tokens=262144)
+    with pytest.raises(ValueError, match=r"exceeds .*serving max_model_len=262144"):
         preflight_train_context_within_serving(spec)
 
 
@@ -104,5 +104,5 @@ def test_a_model_without_a_serving_entry_is_skipped(monkeypatch):
     model = "Qwen/Qwen3.5-9B"
     monkeypatch.setitem(catalog.MODELS, model, replace(catalog.MODELS[model], serving=None))
     preflight_train_context_within_serving(
-        _spec(model=model, algorithm="sft", max_context_tokens=32768)
+        _spec(model=model, algorithm="sft", max_context_tokens=262144)
     )

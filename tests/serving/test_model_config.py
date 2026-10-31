@@ -126,7 +126,7 @@ def test_9b_has_l40s_rank128_serving_overrides() -> None:
     ov = engine_overrides_for("Qwen/Qwen3.5-9B")
     assert ov["max_loras"] == 16
     assert ov["max_lora_rank"] == 128
-    assert ov["max_model_len"] == 65536
+    assert ov["max_model_len"] == 262144
     assert ov["max_num_seqs"] == 8
     assert gpu_for("Qwen/Qwen3.5-9B") == "L40S"
     assert ov["gpu_memory_utilization"] == 0.90
@@ -138,7 +138,7 @@ def test_9b_has_l40s_rank128_serving_overrides() -> None:
 def test_qwen38_27b_is_active_on_a100_80gb_with_pinned_immutable_revisions() -> None:
     # 27B is a FULLY ACTIVE hosted tier: every active lookup resolves it, and its served checkpoint,
     # tokenizer and processor stay pinned to immutable revisions so a served engine cannot follow an
-    # upstream retag. The rank-64 x 16 LoRA shape and 32k context stay unchanged.
+    # upstream retag. The rank-64 x 16 LoRA shape and native 256k context are explicit.
     base_model = "Qwen/Qwen3.8-27B"
 
     assert base_model in base_models()
@@ -152,7 +152,7 @@ def test_qwen38_27b_is_active_on_a100_80gb_with_pinned_immutable_revisions() -> 
     assert ov["tokenizer_model"] == base_model
     assert ov["max_loras"] == 16
     assert ov["max_lora_rank"] == 64
-    assert ov["max_model_len"] == 32768
+    assert ov["max_model_len"] == 262144
     assert ov["max_num_seqs"] == 8
     assert ov["gpu_memory_utilization"] == 0.90
     assert ov["enforce_eager"] is False
@@ -176,7 +176,7 @@ def test_35b_has_h200_bf16_rank64_six_loras_overrides() -> None:
     ov = engine_overrides_for("Qwen/Qwen3.6-35B-A3B")
     assert ov["max_loras"] == 6
     assert ov["max_lora_rank"] == 64
-    assert ov["max_model_len"] == 32768
+    assert ov["max_model_len"] == 262144
     assert ov["max_num_seqs"] == 8
     assert ov["max_num_batched_tokens"] == 4096
     assert (
