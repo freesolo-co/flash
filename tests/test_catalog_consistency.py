@@ -70,7 +70,7 @@ def test_serving_capacity_matches_validated_matrix():
             "image_limit": 32,
         },
         "Qwen/Qwen3.8-27B": {
-            "gpu": "A100-80GB",
+            "gpu": "H100",
             "serve_model_id": "Qwen/Qwen3.8-27B-FP8",
             "max_loras": 16,
             "max_cpu_loras": 16,

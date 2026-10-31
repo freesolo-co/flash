@@ -109,7 +109,7 @@ HOSTING_CACHE_MOUNT = "/vol/hosting-cache"
 SCALEDOWN_WINDOW_SECONDS_BY_GPU: dict[str, int] = {
     "L4": 2100,
     "L40S": 2100,
-    "A100-80GB": 2100,
+    "H100": 2100,
     "H200": 2100,
 }
 # The tiers this app is allowed to run an engine on. `gpu` in the serving catalog is a plain string,

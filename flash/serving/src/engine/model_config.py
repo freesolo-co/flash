@@ -38,7 +38,7 @@ from flash.serving.src.engine.prequant_config import (
 # checkpoints published to the operator HF org.
 #
 # sizing rationale. preallocated lora buffers and loaded checkpoint weights dominate engine vram.
-# The dense small models use L4, the FP8 9B uses L40S, the FP8 27B uses A100 80GB, and
+# The dense 0.8B uses L4, the BF16 4B and FP8 9B use L40S, the FP8 27B uses H100, and
 # the BF16 35B MoE uses H200. See the hosted GPU qualification table in app/README.md.
 #   - Qwen3.6-35B-A3B (vision-language MoE; arch ``Qwen3_5MoeForConditionalGeneration``) -> H200
 #     (141 GB) with the base bf16 weights, 6 x 64 LoRA at native 256k. bf16 (not FP8) is the one path giving
@@ -72,7 +72,7 @@ SERVING_MODELS: list[dict[str, Any]] = [
     {
         "base_model": "Qwen/Qwen3.5-4B",
         "image_input_limit": None,
-        "gpu": "L4",
+        "gpu": "L40S",
         "engine": {
             "serve_model_id": "Qwen/Qwen3.5-4B",
             "model_revision": "851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a",
@@ -156,7 +156,7 @@ SERVING_MODELS: list[dict[str, Any]] = [
             # the complete model and LoRA load is about 108 GiB, on the 141 GB H200.
         },
     },
-    # 27B dense on A100 80GB. Qualification loaded 45.53 GiB with 16 rank-64 LoRA
+    # 27B dense on H100 for native-context latency. A100 qualification loaded 45.53 GiB with 16 rank-64 LoRA
     # slots; L40S ran out of memory while allocating those buffers. The vision tower and
     # non-quantized tensors remain bf16. Every
     # repository here is pinned to an immutable revision so a served engine cannot silently follow an
@@ -165,7 +165,7 @@ SERVING_MODELS: list[dict[str, Any]] = [
     {
         "base_model": "Qwen/Qwen3.8-27B",
         "image_input_limit": MAX_IMAGES_PER_CONVERSATION,
-        "gpu": "A100-80GB",
+        "gpu": "H100",
         "engine": {
             "model_revision": "017b9c7af6b5689d5dd426a76e0bc077eb5ca20a",
             "tokenizer_model": "Qwen/Qwen3.8-27B",

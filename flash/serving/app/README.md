@@ -102,7 +102,7 @@ The streaming probe uses the shared deadlines in `timeouts.py`: the full 2700-se
 startup allowance plus 600 seconds for its short request and 60 seconds of network headroom (3360
 seconds total). Full serving requests allow 1800 seconds for long-context queues; that larger
 budget does not extend the short canary. The job allows
-90 minutes including rollback.
+180 minutes including rollout drain and rollback.
 Rollback resolves the serving entrypoint from the restored tree, including the pre-reorganization
 `flash/serving/modal_app.py` path.
 
@@ -265,16 +265,16 @@ max_lora_rank`, regardless of how many adapters load. Both are linear levers. Th
 
 ### Hosted GPU configuration
 
-Hosted Qwen engines use L4, L40S, A100 80GB, or H200 with a 2100-second idle window. Each catalog entry must
+Hosted Qwen engines use L4, L40S, H100, or H200 with a 2100-second idle window. Each catalog entry must
 explicitly declare its GPU; unsupported hardware is rejected before deployment. Training GPU
 selection and customer-owned serving profiles are separate.
 
 | Base model | Checkpoint | GPU | Hot LoRA shape | Context |
 | --- | --- | --- | --- | --- |
 | Qwen3.5-0.8B | official bf16 | L4 | 4 × 64 | 262144 |
-| Qwen3.5-4B | official bf16 | L4 | 4 × 64 | 262144 |
+| Qwen3.5-4B | official bf16 | L40S | 4 × 64 | 262144 |
 | Qwen3.5-9B | owned FP8 (`Freesolo-Co/*-FP8`) | L40S | 16 × 128 | 262144 |
-| Qwen3.8-27B | official native FP8 (`Qwen/Qwen3.8-27B-FP8`) | A100 80GB | 16 × 64 | 262144 |
+| Qwen3.8-27B | official native FP8 (`Qwen/Qwen3.8-27B-FP8`) | H100 | 16 × 64 | 262144 |
 | Qwen3.6-35B-A3B (MoE, VL) | official bf16 | H200 | 6 × 64 | 262144 |
 
 The context budget includes prompt and generated output. All five Qwen checkpoints use

@@ -135,7 +135,7 @@ def test_9b_has_l40s_rank128_serving_overrides() -> None:
     )  # CUDA graphs on (~10x faster decode on this hybrid GDN model)
 
 
-def test_qwen38_27b_is_active_on_a100_80gb_with_pinned_immutable_revisions() -> None:
+def test_qwen38_27b_is_active_on_h100_with_pinned_immutable_revisions() -> None:
     # 27B is a FULLY ACTIVE hosted tier: every active lookup resolves it, and its served checkpoint,
     # tokenizer and processor stay pinned to immutable revisions so a served engine cannot follow an
     # upstream retag. The rank-64 x 16 LoRA shape and native 256k context are explicit.
@@ -143,7 +143,7 @@ def test_qwen38_27b_is_active_on_a100_80gb_with_pinned_immutable_revisions() -> 
 
     assert base_model in base_models()
     assert is_supported_base_model(base_model) is True
-    assert gpu_for(base_model) == "A100-80GB"
+    assert gpu_for(base_model) == "H100"
     assert image_limit_for(base_model) == 32
     assert serve_model_for(base_model) == "Qwen/Qwen3.8-27B-FP8"
 
@@ -186,15 +186,16 @@ def test_35b_has_h200_bf16_rank64_six_loras_overrides() -> None:
 
 
 @pytest.mark.parametrize(
-    ("model", "profile_gpu"), [("Qwen/Qwen3.5-0.8B", "L40S"), ("Qwen/Qwen3.5-4B", "H100!")]
+    ("model", "hosted_gpu", "profile_gpu"),
+    [("Qwen/Qwen3.5-0.8B", "L4", "L40S"), ("Qwen/Qwen3.5-4B", "L40S", "H100!")],
 )
-def test_small_models_use_l4_and_pinned_bf16(model, profile_gpu):
+def test_small_models_use_qualified_gpu_and_pinned_bf16(model, hosted_gpu, profile_gpu):
     from flash.core.catalog import get_model
     from flash.serve.deployment.profiles import get_profile
 
     info = get_model(model)
     overrides = engine_overrides_for(model)
-    assert gpu_for(model) == info.serving.gpu == "L4"
+    assert gpu_for(model) == info.serving.gpu == hosted_gpu
     assert serve_model_for(model) == model
     assert overrides["quantization"] is None
     assert overrides["max_loras"] == overrides["max_cpu_loras"] == 4
