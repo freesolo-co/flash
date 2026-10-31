@@ -122,14 +122,13 @@ def test_no_bitsandbytes_anywhere() -> None:
         assert entry.get("load_format") != "bitsandbytes"
 
 
-def test_9b_has_b200_rank128_serving_overrides() -> None:
+def test_9b_has_h100_rank128_serving_overrides() -> None:
     ov = engine_overrides_for("Qwen/Qwen3.5-9B")
     assert ov["max_loras"] == 16
     assert ov["max_lora_rank"] == 128
     assert ov["max_model_len"] == 32768
     assert ov["max_num_seqs"] == 8
-    # the 9B serves on B200: 132.87 GiB of KV and 217x concurrency at 32k with rank-128 x 16.
-    assert gpu_for("Qwen/Qwen3.5-9B") == "B200"
+    assert gpu_for("Qwen/Qwen3.5-9B") == "H100"
     assert ov["gpu_memory_utilization"] == 0.90
     assert (
         ov["enforce_eager"] is False

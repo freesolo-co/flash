@@ -38,8 +38,8 @@ from flash.serving.src.engine.prequant_config import (
 # checkpoints published to the operator HF org.
 #
 # sizing rationale. preallocated lora buffers and loaded checkpoint weights dominate engine vram.
-# all three active tiers serve on b200: the 9b uses 16 rank-128 slots, the 27b 16 rank-64 slots, and
-# the 35b moe 6 rank-64 slots.
+# the 9b serves on H100 with 16 rank-128 slots; the 27b and 35b moe remain on B200 with
+# 16 rank-64 and 6 rank-64 slots, respectively.
 #   - Qwen3.6-35B-A3B (vision-language MoE; arch ``Qwen3_5MoeForConditionalGeneration``) -> B200
 #     (178 GiB) with the base bf16 weights, 6 x 64 LoRA at 32k. bf16 (not FP8) is the one path giving
 #     full-expert LoRA + CUDA graphs because the fused-MoE LoRA path won't compile on fp8e4nv. see the
@@ -92,14 +92,13 @@ SERVING_MODELS: list[dict[str, Any]] = [
     {
         "base_model": "Qwen/Qwen3.5-9B",
         "image_input_limit": MAX_IMAGES_PER_CONVERSATION,
-        "gpu": "B200",
+        "gpu": "H100",
         "engine": {
             "tokenizer_model": "Qwen/Qwen3.5-9B",
             "tokenizer_revision": "c202236235762e1c871ad0ccb60c8ee5ba337b9a",
             "processor_revision": "c202236235762e1c871ad0ccb60c8ee5ba337b9a",
-            # measured on B200 (2026-08-31): 132.87 GiB of KV, 7,109,793 tokens, 217x concurrency at
-            # 32k with rank-128 x 16 LoRA. this tier previously ran on the L40S (48 GiB, Ada sm89),
-            # the cheapest card that fit the LoRA buffer; L4 and 2xL4 OOMed in the real-GPU sweep.
+            # Use H100 for the FP8 9B while retaining rank-128 x 16 LoRA and 32k context.
+            # The former B200's KV capacity measurements do not apply to this smaller GPU.
             # keep CUDA graphs on because eager is about 10x slower for this hybrid GatedDeltaNet
             # model, and keep 0.90 for graph-capture headroom.
             "gpu_memory_utilization": 0.90,
