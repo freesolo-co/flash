@@ -157,9 +157,9 @@ def test_profile_matches_the_catalog_serving_capacity(model_id: str) -> None:
         serving.gpu
         == {
             "Qwen/Qwen3.5-0.8B": "L4",
-            "Qwen/Qwen3.5-4B": "L4",
+            "Qwen/Qwen3.5-4B": "L40S",
             "Qwen/Qwen3.5-9B": "L40S",
-            "Qwen/Qwen3.8-27B": "A100-80GB",
+            "Qwen/Qwen3.8-27B": "H100",
             "Qwen/Qwen3.6-35B-A3B": "H200",
         }[model_id]
     )
