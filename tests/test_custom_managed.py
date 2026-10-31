@@ -398,9 +398,14 @@ def test_custom_rejects_old_deployed_server_before_importing_script_or_submittin
     api.create_run.assert_not_called()
 
 
-def test_every_catalog_model_supports_custom_training():
-    from flash.core.catalog import CUSTOM_TRAINING_MODELS, MODELS, public_model_rows
+def test_every_catalog_model_supports_custom_training(monkeypatch):
+    from dataclasses import replace
 
-    assert set(MODELS) == CUSTOM_TRAINING_MODELS
+    from flash.core.catalog import MODELS, public_model_rows, validate_model_for_algorithm
+
+    model = replace(MODELS["Qwen/Qwen3.5-9B"], id="test/new-catalog-model")
+    monkeypatch.setitem(MODELS, model.id, model)
     models = [row["id"] for row in public_model_rows() if "custom" in row["algos"]]
-    assert models == list(MODELS)
+    assert set(models) == set(MODELS)
+    for model_id, info in MODELS.items():
+        assert validate_model_for_algorithm(model_id, "custom") == info
