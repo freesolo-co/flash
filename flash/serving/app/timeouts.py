@@ -1,6 +1,9 @@
 """Shared serving and promotion deadlines, without deployment dependencies."""
 
 from flash.serve.deployment.readiness import (
+    DEPLOYMENT_SMOKE_TIMEOUT_SECONDS,
+)
+from flash.serve.deployment.readiness import (
     ENGINE_REQUEST_TIMEOUT_SECONDS as REQUEST_TIMEOUT_SECONDS,
 )
 from flash.serve.deployment.readiness import (
@@ -17,8 +20,9 @@ ROUTER_TIMEOUT_SECONDS = max(
     DEEPINFER_REQUEST_SECONDS,
 )
 
-# Let the client receive the router's final response before declaring a failed promotion.
+# The canary sends a short request, not a full native-context batch. Keep its short smoke
+# allowance independent of the long-request budget so promotion retains time to roll back.
 CANARY_NETWORK_HEADROOM_SECONDS = 60
 CANARY_TIMEOUT_SECONDS = (
-    STARTUP_TIMEOUT_SECONDS + REQUEST_TIMEOUT_SECONDS + CANARY_NETWORK_HEADROOM_SECONDS
+    STARTUP_TIMEOUT_SECONDS + DEPLOYMENT_SMOKE_TIMEOUT_SECONDS + CANARY_NETWORK_HEADROOM_SECONDS
 )
