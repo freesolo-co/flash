@@ -283,9 +283,15 @@ def create_app():
                 async with managed_lifespan(app):
                     yield
         finally:
-            if not await asyncio.to_thread(owner.close, 5.0):
-                _log.warning("training tasks still in blocking calls at shutdown deadline")
-            plane_lease.release()
+            if await asyncio.to_thread(owner.close, 5.0):
+                plane_lease.release()
+            else:
+                # A task still in a provider call may be launching or supervising a run. Keep the
+                # lease so no other plane recovers that run; the kernel drops it when we exit.
+                _log.warning(
+                    "training tasks still in blocking calls at shutdown deadline; "
+                    "keeping the control-plane lease until this process exits"
+                )
 
     app = FastAPI(title="Flash Control Plane", version=__version__, lifespan=lifespan)
     app.include_router(meta.router)

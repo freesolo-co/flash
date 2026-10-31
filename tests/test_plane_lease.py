@@ -108,6 +108,23 @@ def _wait_for(condition, seconds: float = 10) -> None:
         time.sleep(0.02)
 
 
+def test_lease_is_kept_until_exit_when_training_tasks_outlive_shutdown(monkeypatch):
+    """A task stuck in a provider call may still be launching; no other plane may recover it."""
+    import flash.server.asgi.app as app_mod
+    from flash._internal.background import Supervisor
+
+    recovered = []
+    _stub_lifespan(monkeypatch, recovered)
+    monkeypatch.setattr(Supervisor, "close", lambda self, timeout=None: False)
+
+    with TestClient(app_mod.create_app()):
+        assert plane_lease.held()
+
+    assert plane_lease.held()
+    with pytest.raises(BlockingIOError):
+        _hold_elsewhere()
+
+
 def test_takeover_keeps_submissions_queued_until_recovery_finishes(monkeypatch):
     """A launch racing takeover recovery's orphan sweep would be reaped, so it must wait."""
     import flash.server.asgi.app as app_mod
