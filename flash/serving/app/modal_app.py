@@ -103,10 +103,15 @@ HOSTING_CACHE_MOUNT = "/vol/hosting-cache"
 # doesn't; there is nothing to tune at deploy time. Every value is the proven default. (The wiring
 # below — HF/internal key, backend + Supabase URLs — stays env-configured because it is per-deploy
 # credentials, not tuning.)
-# Large models use B200; small dense models use L40S/H100. The slowest measured
+# Hosted models use their qualified GPU tier from the catalog. The slowest measured
 # cold boot is 1821s (27b); retain
 # its 2100s idle window so warm replicas survive normal gaps between requests.
-SCALEDOWN_WINDOW_SECONDS_BY_GPU: dict[str, int] = {"B200": 2100, "L40S": 2100, "H100": 2100}
+SCALEDOWN_WINDOW_SECONDS_BY_GPU: dict[str, int] = {
+    "L4": 2100,
+    "L40S": 2100,
+    "A100-80GB": 2100,
+    "H200": 2100,
+}
 # The tiers this app is allowed to run an engine on. `gpu` in the serving catalog is a plain string,
 # so a typo ("b200", "B2OO") or an unvalidated new card used to fall through `dict.get` to a default
 # window and deploy anyway, at that card's real hourly rate. Membership here is the one gate.
@@ -351,7 +356,7 @@ def _build_engine(
 ) -> Any:
     """Register one Modal ``@app.cls`` LoraEngine pinned to ``gpu``.
 
-    Modal fixes a class's GPU at decoration time, so the A100-80GB 35B model and the L4 models need
+    Modal fixes a class's GPU at decoration time, so the H200 35B model and the L4 models need
     distinct classes. The Modal entrypoints are defined fresh here (so each class owns its own method
     objects) and forward to the shared ``_``-prefixed impl on ``_LoraEngineImpl``.
 

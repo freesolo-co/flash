@@ -55,7 +55,7 @@ for concurrent stream framing and request handling. It uses non-preemptible CPU 
 an interrupted HTTP stream cannot resume. Modal applies a 3x CPU/RAM price multiplier to this
 setting; GPU allocation and pricing are unchanged. `BUFFER_CONTAINERS = 1` applies to the router and every
 engine, but only while active, so GPU engines still scale to zero when idle. Idle windows are set by
-`SCALEDOWN_WINDOW_SECONDS_BY_GPU`; the active B200 tiers use 2100 seconds. The router uses
+`SCALEDOWN_WINDOW_SECONDS_BY_GPU`; the active Qwen tiers use 2100 seconds. The router uses
 `MAX_INPUTS = 64` with `TARGET_INPUTS = 48`; engine concurrency follows each model's `max_num_seqs`.
 
 ### Production
@@ -240,7 +240,7 @@ GPUs, so there's nothing to tune at deploy time:
   blocks and the logical BF16 tokenizer/processor pinned to
   `1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0`. The 35B-A3B vision-language MoE is the
   **exception**: it serves the **official bf16
-  base weights** on a B200 (`quantization=None`), because vLLM's fused-MoE LoRA path cannot run under
+  base weights** on an H200 (`quantization=None`), because vLLM's fused-MoE LoRA path cannot run under
   FP8 at the shape a full all-expert flash adapter needs.
 
   vLLM auto-detects each checkpoint's declared quantization, so the engine passes no online
@@ -250,11 +250,11 @@ GPUs, so there's nothing to tune at deploy time:
   404-crash-loops, which is why the old GPTQ `serve_model_id` was removed); the owned `Freesolo-Co/*-FP8`
   checkpoints are VL-preserving (each VL-unified base's vision tower + MoE router gates stay in
   original precision) and already published to the operator HF org. Native FP8 tensor cores need
-  compute capability ≥ 8.9; all active hosted engines run on B200.
+  compute capability ≥ 8.9; see the qualified hardware below.
 
 - **The real memory lever — LoRA buffers:** vLLM PRE-ALLOCATES the GPU LoRA buffers at `max_loras ×
 max_lora_rank`, regardless of how many adapters load. Both are linear levers. The qualified 9B runs
-  **16 × 128** and the 35B MoE runs **6 × 64** bf16, both on B200. The hosted 27B uses **16 × 64**. Adapters trained above the effective rank are rejected at load; a base regularly serving
+  **16 × 128** on L40S and the 35B MoE runs **6 × 64** bf16 on H200. The hosted 27B uses **16 × 64**. Adapters trained above the effective rank are rejected at load; a base regularly serving
   more distinct adapters than its hot limit pays a swap latency from the CPU pool unless its hot
   limit equals `MAX_CPU_LORAS`.
 
@@ -264,15 +264,20 @@ max_lora_rank`, regardless of how many adapters load. Both are linear levers. Th
 
 ### Hosted GPU configuration
 
-Hosted engines use L40S, H100, or B200 with a 2100-second idle window. Each catalog entry must
+Hosted Qwen engines use L4, L40S, A100 80GB, or H200 with a 2100-second idle window. Each catalog entry must
 explicitly declare its GPU; unsupported hardware is rejected before deployment. Training GPU
 selection and customer-owned serving profiles are separate.
 
 | Base model | Checkpoint | GPU | Hot LoRA shape | Context |
 | --- | --- | --- | --- | --- |
-| Qwen3.5-9B | owned FP8 (`Freesolo-Co/*-FP8`) | H100 | 16 × 128 | 32768 |
-| Qwen3.8-27B | official native FP8 (`Qwen/Qwen3.8-27B-FP8`) | B200 | 16 × 64 | 32768 |
-| Qwen3.6-35B-A3B (MoE, VL) | official bf16 | B200 | 6 × 64 | 32768 |
+| Qwen3.5-0.8B | official bf16 | L4 | 4 × 64 | 32768 |
+| Qwen3.5-4B | official bf16 | L4 | 4 × 64 | 32768 |
+| Qwen3.5-9B | owned FP8 (`Freesolo-Co/*-FP8`) | L40S | 16 × 128 | 32768 |
+| Qwen3.8-27B | official native FP8 (`Qwen/Qwen3.8-27B-FP8`) | A100 80GB | 16 × 64 | 32768 |
+| Qwen3.6-35B-A3B (MoE, VL) | official bf16 | H200 | 6 × 64 | 32768 |
+
+See [GPU qualification](GPU_QUALIFICATION.md) for live checks, smaller-card rejections,
+rate comparisons, and validation limits. DeepSeek retains its four-B200 pool and current capacity.
 
 CUDA graphs, prefix caching, FP8 KV, and the persistent compilation cache remain enabled.
 The 35B keeps bf16 weights because the FP8 fused-MoE kernel cannot load full-expert LoRA.

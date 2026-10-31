@@ -265,7 +265,7 @@ MODELS: dict[str, ModelInfo] = {
             (3584, 1024, 24),
         ),
         serving=ServingCapacity(
-            gpu="L40S",
+            gpu="L4",
             serve_model_id="Qwen/Qwen3.5-0.8B",
             max_loras=4,
             max_cpu_loras=4,
@@ -275,7 +275,7 @@ MODELS: dict[str, ModelInfo] = {
             tensor_parallel_size=1,
             gpu_memory_utilization=0.90,
         ),
-        notes="Text-only BF16 LoRA SFT/GRPO. Hosted serving uses L40S; no thinking mode.",
+        notes="Text-only BF16 LoRA SFT/GRPO. Hosted serving uses L4; no thinking mode.",
     ),
     "Qwen/Qwen3.5-4B": ModelInfo(
         id="Qwen/Qwen3.5-4B",
@@ -320,7 +320,7 @@ MODELS: dict[str, ModelInfo] = {
             (9216, 2560, 32),
         ),
         serving=ServingCapacity(
-            gpu="H100",
+            gpu="L4",
             serve_model_id="Qwen/Qwen3.5-4B",
             max_loras=4,
             max_cpu_loras=4,
@@ -330,7 +330,7 @@ MODELS: dict[str, ModelInfo] = {
             tensor_parallel_size=1,
             gpu_memory_utilization=0.90,
         ),
-        notes="Text-only BF16 LoRA SFT/GRPO. Hosted serving uses H100.",
+        notes="Text-only BF16 LoRA SFT/GRPO. Hosted serving uses L4.",
     ),
     "Qwen/Qwen3.5-9B": ModelInfo(
         id="Qwen/Qwen3.5-9B",
@@ -374,7 +374,7 @@ MODELS: dict[str, ModelInfo] = {
         quant="bf16",
         recommended_gpu="H100",
         serving=ServingCapacity(
-            gpu="B200",
+            gpu="L40S",
             serve_model_id=SERVING_MODEL_REPOS["Qwen/Qwen3.5-9B"],
             max_loras=16,
             max_cpu_loras=16,
@@ -434,7 +434,7 @@ MODELS: dict[str, ModelInfo] = {
         recommended_gpu="H100",
         min_disk_gb=160,
         serving=ServingCapacity(
-            gpu="B200",
+            gpu="A100-80GB",
             serve_model_id=SERVING_MODEL_REPOS["Qwen/Qwen3.8-27B"],
             max_loras=16,
             max_cpu_loras=16,
@@ -448,7 +448,7 @@ MODELS: dict[str, ModelInfo] = {
         thinking="hybrid",
         notes="Dense 27.781427952B multimodal VL checkpoint with image-capable bf16 LoRA training. "
         "SFT fits the 80GB A100 (~55.6GB weights); colocated GRPO needs the B200 (trainer + vLLM "
-        "rollout = two copies). Hosted serving runs the official FP8 checkpoint on the B200.",
+        "rollout = two copies). Hosted serving runs the official FP8 checkpoint on A100 80GB.",
     ),
     "Qwen/Qwen3.6-35B-A3B": ModelInfo(
         id="Qwen/Qwen3.6-35B-A3B",
@@ -509,10 +509,10 @@ MODELS: dict[str, ModelInfo] = {
         quant="bf16",
         recommended_gpu="H200",
         serving=ServingCapacity(
-            gpu="B200",
+            gpu="H200",
             serve_model_id=SERVING_MODEL_REPOS["Qwen/Qwen3.6-35B-A3B"],
             # bf16 is the validated full-expert lora path. six hot rank-64 adapters plus 32k fit
-            # with cuda graphs; the b200 measured 49.38 GiB of kv (3,678,952 tokens) for this shape.
+            # with CUDA graphs on the qualified H200 serving tier.
             max_loras=6,
             max_cpu_loras=6,
             max_lora_rank=64,

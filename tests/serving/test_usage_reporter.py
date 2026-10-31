@@ -924,8 +924,9 @@ def test_evict_uncached_alias_does_not_remove_a_colliding_adapter(modal_app_modu
 
 
 def test_only_active_gpus_have_a_hosted_idle_window(modal_app_module):
-    assert {"B200", "L40S", "H100"} == modal_app_module.SUPPORTED_GPUS
-    assert modal_app_module.scaledown_window_for("B200") == 2100
-    for dormant_gpu in ("L4", "H200", "B300"):
+    assert {"L4", "L40S", "A100-80GB", "H200"} == modal_app_module.SUPPORTED_GPUS
+    for gpu in modal_app_module.SUPPORTED_GPUS:
+        assert modal_app_module.scaledown_window_for(gpu) == 2100
+    for dormant_gpu in ("H100", "B200", "B300"):
         with pytest.raises(ValueError, match="Unsupported serving GPU tier"):
             modal_app_module.scaledown_window_for(dormant_gpu)

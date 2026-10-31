@@ -58,7 +58,7 @@ def test_serving_capacity_matches_validated_matrix():
     # freesolo tree; compare both repos in the pinned freesolo-co/tests checkout.
     expected = {
         "Qwen/Qwen3.5-9B": {
-            "gpu": "B200",
+            "gpu": "L40S",
             "serve_model_id": "Freesolo-Co/Qwen3.5-9B-FP8",
             "max_loras": 16,
             "max_cpu_loras": 16,
@@ -70,7 +70,7 @@ def test_serving_capacity_matches_validated_matrix():
             "image_limit": 32,
         },
         "Qwen/Qwen3.8-27B": {
-            "gpu": "B200",
+            "gpu": "A100-80GB",
             "serve_model_id": "Qwen/Qwen3.8-27B-FP8",
             "max_loras": 16,
             "max_cpu_loras": 16,
@@ -82,7 +82,7 @@ def test_serving_capacity_matches_validated_matrix():
             "image_limit": 32,
         },
         "Qwen/Qwen3.6-35B-A3B": {
-            "gpu": "B200",
+            "gpu": "H200",
             "serve_model_id": "Qwen/Qwen3.6-35B-A3B",
             "max_loras": 6,
             "max_cpu_loras": 6,
@@ -104,7 +104,7 @@ def test_serving_capacity_matches_validated_matrix():
 
 def test_public_rows_include_serving_capacity():
     row = get_model("Qwen/Qwen3.5-9B").to_dict()
-    assert row["serving"]["gpu"] == "B200"
+    assert row["serving"]["gpu"] == "L40S"
     assert row["serving"]["max_loras"] == 16
     assert row["serving"]["max_lora_rank"] == 128
     assert row["serving"]["serve_model_id"] == "Freesolo-Co/Qwen3.5-9B-FP8"
@@ -114,7 +114,7 @@ def test_public_rows_prune_unset_serving_capacity_fields():
     row = get_model("Qwen/Qwen3.5-9B").to_dict()
     # serve_model_id survives while zero-valued optional capacity fields are pruned.
     assert row["serving"] == {
-        "gpu": "B200",
+        "gpu": "L40S",
         "serve_model_id": "Freesolo-Co/Qwen3.5-9B-FP8",
         "max_loras": 16,
         "max_cpu_loras": 16,

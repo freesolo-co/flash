@@ -153,8 +153,15 @@ def test_profile_matches_the_catalog_serving_capacity(model_id: str) -> None:
     # freesolo-owned hosted plane's card, modal_gpu is the card THIS customer-owned profile was
     # live-qualified on. Pinned per model rather than asserted "different", so a profile silently
     # drifting to some other unqualified card still fails here.
-    assert serving.gpu == {"Qwen/Qwen3.5-0.8B": "L40S", "Qwen/Qwen3.5-4B": "H100"}.get(
-        model_id, "B200"
+    assert (
+        serving.gpu
+        == {
+            "Qwen/Qwen3.5-0.8B": "L4",
+            "Qwen/Qwen3.5-4B": "L4",
+            "Qwen/Qwen3.5-9B": "L40S",
+            "Qwen/Qwen3.8-27B": "A100-80GB",
+            "Qwen/Qwen3.6-35B-A3B": "H200",
+        }[model_id]
     )
     assert (
         profile.modal_gpu
