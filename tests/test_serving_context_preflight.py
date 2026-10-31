@@ -8,7 +8,7 @@ from flash.core.spec import JobSpec
 @pytest.mark.parametrize(
     ("model", "expected_cap"),
     [
-        ("Qwen/Qwen3.5-9B", 32768),
+        ("Qwen/Qwen3.5-9B", 65536),
         ("Qwen/Qwen3.8-27B", 32768),
         ("Qwen/Qwen3.6-35B-A3B", 32768),
     ],
@@ -28,12 +28,12 @@ def _sft_spec(max_context_tokens: int, model: str = "Qwen/Qwen3.5-9B") -> JobSpe
 
 
 def test_training_context_preflight_allows_serving_cap() -> None:
-    preflight_train_context_within_serving(_sft_spec(32768))
+    preflight_train_context_within_serving(_sft_spec(65536))
 
 
 def test_training_context_preflight_rejects_above_serving_cap() -> None:
-    with pytest.raises(ValueError, match=r"max_context_tokens=40000.*max_model_len=32768"):
-        preflight_train_context_within_serving(_sft_spec(40000))
+    with pytest.raises(ValueError, match=r"max_context_tokens=65537.*max_model_len=65536"):
+        preflight_train_context_within_serving(_sft_spec(65537))
 
 
 @pytest.mark.parametrize("max_context_tokens", [32768, 32769])

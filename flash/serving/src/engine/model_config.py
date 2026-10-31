@@ -97,14 +97,14 @@ SERVING_MODELS: list[dict[str, Any]] = [
             "tokenizer_model": "Qwen/Qwen3.5-9B",
             "tokenizer_revision": "c202236235762e1c871ad0ccb60c8ee5ba337b9a",
             "processor_revision": "c202236235762e1c871ad0ccb60c8ee5ba337b9a",
-            # L40S qualification retains rank-128 x 16 LoRA and 32k context with CUDA graphs.
+            # Tau conversations can exceed 32k input tokens; reserve a 64k serving window.
             # The former B200's KV capacity measurements do not apply to this smaller GPU.
             # keep CUDA graphs on because eager is about 10x slower for this hybrid GatedDeltaNet
             # model, and keep 0.90 for graph-capture headroom.
             "gpu_memory_utilization": 0.90,
             "max_loras": 16,
-            "max_lora_rank": 128,  # rank-128 / 16 hot LoRAs (cheap on the 9 GiB FP8 9B); 32k context.
-            "max_model_len": 32768,
+            "max_lora_rank": 128,  # rank-128 / 16 hot LoRAs (cheap on the 9 GiB FP8 9B); 64k context.
+            "max_model_len": 65536,
             "max_num_seqs": 8,
             "enforce_eager": False,
             "reasoning_parser": "qwen3",

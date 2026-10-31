@@ -564,10 +564,10 @@ def test_health_reports_effective_max_model_len_override(modal_app_module):
     assert impl._health(_Big())["quantization"] is None  # validated bf16 weights
 
     class _Dense:
-        base_model = "Qwen/Qwen3.5-9B"  # per-model 32k override
+        base_model = "Qwen/Qwen3.5-9B"  # per-model 64k override
         registry = type("R", (), {"list_ready": lambda self: []})()
 
-    assert impl._health(_Dense())["max_model_len"] == 32768
+    assert impl._health(_Dense())["max_model_len"] == 65536
     assert impl._health(_Dense())["max_model_len"] != cfg.MAX_MODEL_LEN
     assert impl._health(_Dense())["quantization"] == "fp8"
 
@@ -899,14 +899,14 @@ def test_hosted_hot_pools_remain_unpinned(modal_app_module, monkeypatch, tmp_pat
 
 
 def test_load_prequant_checkpoint_for_9b(modal_app_module, monkeypatch, tmp_path):
-    """The 9B loads a pre-quantized FP8 checkpoint with FP8 KV and the validated 32k context."""
+    """The 9B loads a pre-quantized FP8 checkpoint with FP8 KV and the 64k context."""
     args = _capture_engine_args(modal_app_module, monkeypatch, tmp_path, "Qwen/Qwen3.5-9B")
     assert args.model == "Freesolo-Co/Qwen3.5-9B-FP8"  # owned pre-quant checkpoint
     assert args.quantization is None  # auto-detected from the checkpoint, not online-quantized
     assert args.kv_cache_dtype == "fp8"
     assert args.max_loras == 16
     assert args.max_lora_rank == 128
-    assert args.max_model_len == 32768
+    assert args.max_model_len == 65536
     assert args.max_num_seqs == 8
     assert args.gpu_memory_utilization == 0.90  # 0.90 leaves CUDA-graph capture headroom (was 0.98)
     assert args.enforce_eager is False  # CUDA graphs ON: ~10x faster decode on the hybrid GDN model

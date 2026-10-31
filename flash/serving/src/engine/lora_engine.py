@@ -704,7 +704,7 @@ class _LoraEngineImpl(TextPromptTokenizer):
             ),
             "prompt_token_cache_entries": len(getattr(self, "_prompt_token_cache", {})),
             # Report the EFFECTIVE context limit this engine was built with, not the global default:
-            # a per-model override (every tier now pins 32k) must be reflected here, or
+            # a per-model override (including the 9B 64k window) must be reflected here, or
             # health/monitoring misreports the limit vLLM actually serves.
             "max_model_len": _ov.get("max_model_len", cfg.MAX_MODEL_LEN),
         }

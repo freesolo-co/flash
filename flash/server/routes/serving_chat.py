@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
+import httpx
 from fastapi import HTTPException
 from fastapi.responses import StreamingResponse
 
@@ -303,5 +304,21 @@ def managed_chat(
         return validate_body_provenance(response, provenance)
     except HTTPException:
         raise
+    except httpx.HTTPStatusError as exc:
+        if exc.response.status_code not in {400, 422}:
+            raise HTTPException(status_code=502, detail=f"inference failure: {exc}") from exc
+        # Preserve deterministic request errors (notably context overflow). Turning these into
+        # 502 hides the token counts and tells clients to retry an unchanged, invalid request.
+        detail = f"Serving rejected the inference request (HTTP {exc.response.status_code})."
+        try:
+            body = exc.response.json()
+            message = body.get("detail")
+            if not isinstance(message, str) and isinstance(body.get("error"), dict):
+                message = body["error"].get("message")
+            if isinstance(message, str) and message.strip():
+                detail = message[:4096]
+        except (ValueError, AttributeError):
+            pass
+        raise HTTPException(status_code=exc.response.status_code, detail=detail) from exc
     except Exception as exc:
         raise HTTPException(status_code=502, detail=f"inference failure: {exc}") from exc

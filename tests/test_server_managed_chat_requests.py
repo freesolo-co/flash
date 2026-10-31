@@ -284,3 +284,54 @@ def test_managed_chat_rejects_legacy_readiness_before_internal_forwarding(
     )
     assert response.status_code == 409, response.text
     assert "has not passed" in response.json()["detail"]
+
+
+@pytest.mark.parametrize(
+    ("status", "body", "expected_status", "expected_detail"),
+    [
+        (
+            400,
+            {"detail": "maximum context length 32768; input tokens 33410"},
+            400,
+            "maximum context length 32768; input tokens 33410",
+        ),
+        (
+            400,
+            {"error": {"message": "input exceeds context window"}},
+            400,
+            "input exceeds context window",
+        ),
+        (422, {"detail": "invalid tool arguments"}, 422, "invalid tool arguments"),
+        (400, ["unexpected envelope"], 400, "Serving rejected the inference request (HTTP 400)."),
+        (503, {"detail": "engine unavailable"}, 502, "inference failure:"),
+    ],
+)
+def test_managed_chat_preserves_serving_request_errors(
+    api, monkeypatch, status, body, expected_status, expected_detail
+):
+    import httpx
+
+    key, run_id = _deployed_chat_run(api)
+    calls = []
+
+    def reject(**kwargs):
+        calls.append(kwargs)
+        response = httpx.Response(
+            status,
+            json=body,
+            request=httpx.Request("POST", "https://serve.example/v1/chat/completions"),
+        )
+        response.raise_for_status()
+
+    monkeypatch.setattr(serving_deploy, "chat", reject)
+    response = api.post(
+        f"/v1/runs/{run_id}/chat",
+        json={
+            "checkpoint_id": f"{run_id}/final",
+            "messages": [{"role": "user", "content": "hello"}],
+        },
+        headers=_bearer(key),
+    )
+    assert response.status_code == expected_status
+    assert expected_detail in response.json()["detail"]
+    assert len(calls) == 1

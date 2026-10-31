@@ -105,7 +105,7 @@ def test_profiles_carry_the_qwen3_reasoning_parser() -> None:
 def test_profiles_keep_the_validated_fp8_kv_cache() -> None:
     # unlike `quantization` above, the KV cache dtype is the engine's own and no checkpoint
     # rejects it. hosted serving runs fp8 for every base because it halves KV bytes, and the
-    # 32k context / rank-128 / 16-hot-lora shape below was validated on that footprint.
+    # Keep the 9B context and LoRA allocations aligned with its serving catalog.
     #
     # `None` is not a harmless "use the default": `engine_config_from_manifest` omits the key
     # entirely, so vllm falls back to auto and the same card holds half the cache blocks -- fewer
@@ -181,7 +181,7 @@ def test_profile_matches_the_catalog_serving_capacity(model_id: str) -> None:
 @pytest.mark.parametrize(
     ("field", "value"),
     [
-        ("max_model_len", 65536),
+        ("max_model_len", 131072),
         ("max_lora_rank", 64),
         ("max_num_seqs", 4),
         ("max_num_batched_tokens", 2048),
