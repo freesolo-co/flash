@@ -2,6 +2,7 @@
 
 import fcntl
 import os
+import threading
 import time
 
 import pytest
@@ -94,13 +95,102 @@ def test_plane_beside_a_draining_one_serves_and_takes_over_when_it_exits(monkeyp
         assert recovered == []
 
         _release_elsewhere(old_plane)
-        deadline = time.monotonic() + 10
-        while recovered != ["runs", "deployments"] and time.monotonic() < deadline:
-            time.sleep(0.05)
+        _wait_for(lambda: client.app.state.plane_standby is False)
 
         assert recovered == ["runs", "deployments"]
-        assert client.app.state.plane_standby is False
         assert plane_lease.held()
+
+
+def _wait_for(condition, seconds: float = 10) -> None:
+    deadline = time.monotonic() + seconds
+    while not condition():
+        assert time.monotonic() < deadline, "condition not reached"
+        time.sleep(0.02)
+
+
+def test_takeover_keeps_submissions_queued_until_recovery_finishes(monkeypatch):
+    """A launch racing takeover recovery's orphan sweep would be reaped, so it must wait."""
+    import flash.server.asgi.app as app_mod
+    import flash.server.platform.runtime as server_runtime
+
+    recovered = []
+    _stub_lifespan(monkeypatch, recovered)
+    started, proceed = threading.Event(), threading.Event()
+
+    def slow_recovery():
+        started.set()
+        assert proceed.wait(10)
+        recovered.append("runs")
+
+    monkeypatch.setattr(server_runtime, "recover_runs", slow_recovery)
+    old_plane = _hold_elsewhere()
+
+    with TestClient(app_mod.create_app()) as client:
+        _release_elsewhere(old_plane)
+        assert started.wait(10)
+        # leading, but still recovering: submissions stay queued for the scanner.
+        assert plane_lease.held()
+        assert client.app.state.plane_standby is True
+
+        proceed.set()
+        _wait_for(lambda: client.app.state.plane_standby is False)
+        assert recovered == ["runs", "deployments"]
+
+
+def test_takeover_recovery_failure_stops_the_plane_instead_of_serving_as_leader(monkeypatch):
+    import flash.server.asgi.app as app_mod
+    import flash.server.platform.runtime as server_runtime
+
+    recovered, stopped, loops = [], threading.Event(), []
+    _stub_lifespan(monkeypatch, recovered)
+
+    def broken_recovery():
+        raise OSError("status directory unavailable")
+
+    monkeypatch.setattr(server_runtime, "recover_runs", broken_recovery)
+    monkeypatch.setattr(app_mod, "_stop_plane", stopped.set)
+    monkeypatch.setattr(app_mod._LeaderWork, "start", lambda self: loops.append("started"))
+    old_plane = _hold_elsewhere()
+
+    with TestClient(app_mod.create_app()) as client:
+        _release_elsewhere(old_plane)
+        assert stopped.wait(10)
+        assert client.app.state.plane_standby is True
+        assert loops == []
+
+
+def test_shutdown_waits_for_takeover_recovery_before_releasing_the_lease(monkeypatch):
+    import flash.server.asgi.app as app_mod
+    import flash.server.platform.runtime as server_runtime
+
+    recovered = []
+    _stub_lifespan(monkeypatch, recovered)
+    started, proceed = threading.Event(), threading.Event()
+
+    def slow_recovery():
+        started.set()
+        assert proceed.wait(10)
+        recovered.append("runs")
+
+    monkeypatch.setattr(server_runtime, "recover_runs", slow_recovery)
+    old_plane = _hold_elsewhere()
+    client = TestClient(app_mod.create_app())
+    client.__enter__()
+    _release_elsewhere(old_plane)
+    assert started.wait(10)
+
+    shutdown = threading.Thread(target=client.__exit__, args=(None, None, None))
+    shutdown.start()
+    time.sleep(0.3)
+    # shutdown is blocked on the recovery thread, which still owns the shared state.
+    assert shutdown.is_alive()
+    assert plane_lease.held()
+
+    proceed.set()
+    shutdown.join(10)
+    assert not shutdown.is_alive()
+    assert "runs" in recovered
+    assert not plane_lease.held()
 
 
 def test_queue_only_submission_persists_without_dispatch(monkeypatch):

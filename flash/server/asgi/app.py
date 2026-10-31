@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import signal
 import threading
 import time
 
@@ -115,6 +116,8 @@ class _LeaderWork:
         self.startup_report_stop = threading.Event()
         # (task, tolerate_errors): the status replay may fail at shutdown, the loops may not.
         self.tasks: list[tuple[asyncio.Task, bool]] = []
+        # A takeover's recovery thread; shutdown waits for it, since a thread cannot be cancelled.
+        self.recovery: asyncio.Future | None = None
 
     def recover(self) -> None:
         from flash.server.routes import serving_completion
@@ -180,13 +183,30 @@ class _LeaderWork:
                 await task
 
 
+def _stop_plane() -> None:
+    """Shut this server down gracefully; the container's restart policy brings it back."""
+    signal.raise_signal(signal.SIGTERM)
+
+
 async def _lead_when_free(work: _LeaderWork) -> None:
     """Wait for the previous plane to exit, then take over recovery and the loops."""
     await plane_lease.acquire()
     _log.info("control-plane lease acquired; starting recovery and background work")
-    # Submissions launch locally again; recovery adopts the runs queued during standby.
+    # Submissions stay queued until recovery and its orphan sweep finish: a launch racing the sweep
+    # has no persisted handle yet, so the sweep would reap its instance. The recovery scanner that
+    # recover() dispatches launches the runs queued meanwhile.
+    work.recovery = asyncio.ensure_future(asyncio.to_thread(work.recover))
+    try:
+        await asyncio.shield(work.recovery)
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        # A lone plane fails startup when recovery fails; a takeover must not keep serving as if
+        # it led. Stop, and let the restart recover from a clean start.
+        _log.critical("control-plane recovery failed after lease takeover; stopping", exc_info=True)
+        _stop_plane()
+        return
     work.app.state.plane_standby = False
-    await asyncio.to_thread(work.recover)
     work.start()
 
 
@@ -237,6 +257,10 @@ def create_app():
                 waiter.cancel()
                 with contextlib.suppress(asyncio.CancelledError, Exception):
                     await waiter
+            if work.recovery is not None:
+                # The lease is released after shutdown; never hand it over mid-recovery.
+                with contextlib.suppress(Exception):
+                    await work.recovery
             work.signal_stop()
             app.state.training_jobs.close()
             await work.cancel()
