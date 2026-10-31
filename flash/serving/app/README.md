@@ -99,9 +99,9 @@ usage is attributed and charged to that organization, never to an invented tenan
 arbitrary customer. Missing or malformed UUIDs fail before deployment; operators must also
 verify that the organization exists and can settle usage before enabling the workflow.
 The streaming probe uses the shared deadlines in `timeouts.py`: the full 2700-second engine
-startup allowance plus 600 seconds for its short request and 60 seconds of network headroom (3360
-seconds total). Full serving requests allow 1800 seconds for long-context queues; that larger
-budget does not extend the short canary. The job allows
+startup allowance plus 900 seconds for a request, including long-context queueing, and
+60 seconds of network headroom (3660 seconds total). The server and probe derive these
+limits from the same constants. The job allows
 180 minutes including rollout drain and rollback.
 Rollback resolves the serving entrypoint from the restored tree, including the pre-reorganization
 `flash/serving/modal_app.py` path.

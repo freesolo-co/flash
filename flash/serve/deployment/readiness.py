@@ -5,9 +5,9 @@ from __future__ import annotations
 # The slowest measured B200 cold boot was 1821s. Compilation depends on model
 # architecture, not just parameter count: the dense 27B boots slower than the 35B MoE.
 ENGINE_STARTUP_TIMEOUT_SECONDS = 45 * 60
-# Native 256k prompts can queue behind other long prefills on the smaller hosted GPUs.
-# Match the existing managed-chat transport budget instead of killing those requests at 10 min.
-ENGINE_REQUEST_TIMEOUT_SECONDS = 30 * 60
+# Native 256k batches took up to 627s on the selected GPUs. Allow queueing headroom
+# beyond the old 10-minute cap, within the managed-chat transport's 30-minute budget.
+ENGINE_REQUEST_TIMEOUT_SECONDS = 15 * 60
 REVISION_READY_MAX_BUDGET_SECONDS = ENGINE_STARTUP_TIMEOUT_SECONDS + ENGINE_REQUEST_TIMEOUT_SECONDS
 DEPLOYMENT_SMOKE_TIMEOUT_SECONDS = 10 * 60
 DEPLOYMENT_OVERHEAD_SECONDS = 5 * 60

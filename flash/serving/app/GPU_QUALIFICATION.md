@@ -1,8 +1,85 @@
-# Hosted GPU qualification, 2026-10-30
+# Hosted GPU qualification
+
+## Native Qwen context, 2026-10-31
+
+All five hosted Qwen models now use their native **262,144-token total context**,
+including generated output. The public catalog and customer serving profiles agree
+with the hosted engines. The loaded checkpoint configurations specify this native
+limit with default RoPE; no context-extension scaling is enabled. See the official
+[0.8B](https://huggingface.co/Qwen/Qwen3.5-0.8B),
+[4B](https://huggingface.co/Qwen/Qwen3.5-4B),
+[9B](https://huggingface.co/Qwen/Qwen3.5-9B),
+[27B](https://huggingface.co/Qwen/Qwen3.8-27B), and
+[35B](https://huggingface.co/Qwen/Qwen3.6-35B-A3B) model cards.
+DeepSeek retains its separate 1,048,576-token limit and four-B200 pool.
+
+Hosted 4B moves from L4 to L40S and hosted 27B from A100 80GB to H100 for
+long-context latency. Weight/KV precision, LoRA slot/rank allocations, CUDA graphs,
+eight-sequence scheduling, and the 2,100-second idle window remain unchanged.
+Customer-owned profile placements remain separate; this does not activate the
+provisional small-model customer profiles.
+
+| Hosted model / GPU | Hot LoRA shape | Base 262,112-token prompt | Eight distinct long adapter requests, final completion |
+| --- | --- | --- | --- |
+| 0.8B / L4 | 4 × 64 | 73.2 s | 626.9 s |
+| 4B / L40S | 4 × 64 | 52.9 s | 452.1 s |
+| 9B / L40S | 16 × 128 | 60.7 s | 533.0 s |
+| 27B / H100 | 16 × 64 | 55.9 s | 534.7 s |
+| 35B / H200 | 6 × 64 | 21.5 s | 172.1 s |
+
+The near-limit requests reserve 32 output tokens. Qualifying runs check the actual
+arithmetic answer, load every configured LoRA identity, submit eight prompts with
+asserted distinct first-token IDs, separately identify a red image on the three
+vision tiers, and reject a 262,145-token input. Small models use the pinned real
+rank-64 SFT adapters described below. The 9B/27B stress adapters are synthetic
+zero-valued maximum-rank attention adapters; 35B additionally exercises every expert
+in one layer. Each slot reuses the same model-specific weights under a distinct ID.
+The configured full-model LoRA buffers remain allocated.
+
+The real rank-32 Tau adapter from `flash-1793406137-62169ab1/step-16` also passed at
+33,410 and 262,016 input tokens, for both base and adapted generation. The adapted
+near-limit request took 65.8 seconds; eight distinct near-limit Tau-adapter
+requests all answered correctly in 539.5 seconds. Oversized input was rejected.
+
+These are isolated engine checks with short synthetic outputs, not a full Tau
+replay, long-context quality benchmark, or sustained-throughput guarantee. Batch
+latencies include queueing and incidental kernel warmup. The context limit is per
+request; the GPUs do not all hold eight full-length requests in KV memory at once.
+Client and evaluator deadlines remain independently bounded.
+
+**Timeouts:** the 0.8B batch exceeded the former 600-second engine deadline. Hosted
+GPU requests now allow 900 seconds, within the managed-chat transport's existing
+1,800-second budget. The promotion canary allows the full 3,660-second combined
+startup/request/network budget, including queueing behind long requests.
+The deployment workflow allows 180 minutes so the larger rollout drain allowance,
+canary, accounting checks, and rollback fit their declared worst-case deadlines.
+
+**Cost and screening:** 4B/L4 took 200.0 seconds for the same near-limit base prompt,
+versus 52.9 on L40S. 27B/A100 took 298.6 seconds versus 55.9 on H100. Those slower
+placements passed individual generations; their full batches were intentionally
+stopped after latency screening, so they are not qualified here for the full batch.
+The new GPU rates are higher per hour: 4B is approximately $0.80 → $1.95 and 27B
+$2.50 → $3.95 per GPU-hour. For these measured long-prefill requests, shorter runtime
+more than offsets the higher GPU rate; that does not establish lower total cost
+for short requests, cold starts, or idle replicas. Rates were checked against
+[Modal pricing](https://modal.com/pricing) on October 31 and exclude CPU, RAM,
+storage, regional premiums, and network.
+
+Evidence:
+
+- [Distinct-prompt qualification and slow-tier screening](https://modal.com/apps/freesolo/main/ap-vAnAanDHuhozeDXtOKsMn5).
+- [4B L40S qualification](https://modal.com/apps/freesolo/main/ap-Uj657tU2ojx0zlDAcNMqdx).
+- [Real Tau adapter qualification](https://modal.com/apps/freesolo/main/ap-fXykqIvFdtINdOK28mr19G).
+
+An earlier screening harness truncated numeric prefixes to their first token,
+causing some inputs to coincide. The qualifying rerun uses distinct alphabetic
+first tokens and asserts uniqueness before submission. No production serving app
+was deployed during qualification.
 
 ## Qwen 9B context follow-up, 2026-10-31
 
-Qwen3.5-9B now supports 65,536 tokens. An original Tau evaluation had reached
+This intermediate step raised Qwen3.5-9B to 65,536 tokens; the native-context
+qualification above supersedes that limit. An original Tau evaluation had reached
 33,410 input tokens and exceeded the previous 32,768-token limit. The hosted
 engine, public catalog and customer serving profile now agree on the larger limit.
 L40S placement, FP8 weights/KV cache, CUDA graphs, eight-sequence scheduling and
