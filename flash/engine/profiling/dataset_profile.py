@@ -214,6 +214,14 @@ def _validate_dataset_rows(
     selected = rows[:max_examples] if max_examples > 0 else rows
     if not selected and empty_message is not None:
         raise PackagedDatasetUnavailable(empty_message)
+    if selected and all(row.get(_CANONICAL_OUTPUT_KEY) in (None, "") for row in selected):
+        raise ValueError(
+            "all selected SFT records have missing or empty top-level 'output' fields. "
+            "Submission profiling reads explicit records without executing environment loaders. "
+            "Supply input/output records via environment.params.records or select a packaged "
+            "SFT dataset with environment.params.dataset_path; nested demonstrations and "
+            "targets constructed only by a custom loader are not read by this check."
+        )
     return source_examples, [dict(row) for row in selected]
 
 
