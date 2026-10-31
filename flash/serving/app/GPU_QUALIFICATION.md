@@ -1,5 +1,35 @@
 # Hosted GPU qualification, 2026-10-30
 
+## Qwen 9B context follow-up, 2026-10-31
+
+Qwen3.5-9B now supports 65,536 tokens. An original Tau evaluation had reached
+33,410 input tokens and exceeded the previous 32,768-token limit. The hosted
+engine, public catalog and customer serving profile now agree on the larger limit.
+L40S placement, FP8 weights/KV cache, CUDA graphs, eight-sequence scheduling and
+16 rank-128 LoRA slots remain unchanged.
+
+Two isolated runs used the hosted image and engine with the real rank-32 Tau
+adapter from `flash-1793406137-62169ab1/step-16`. Both base and adapted generation
+returned the expected arithmetic answer with exactly 33,410 and 64,000 input
+tokens. A 65,537-token input was rejected with the correct context-limit error.
+The first cold boot took 291 seconds; the second, with compiler cache, took 90
+seconds. Model and preallocated LoRA buffers occupied 24.94 GiB.
+
+Eight concurrently submitted, distinct 64,000-token adapter prompts all returned
+the expected answer without OOM. Their distinguishing prefix prevents shared-prefix
+reuse; completion latency ranged from 8.36 to 65.07 seconds. The earlier
+shared-prefix batch also passed. These are short-output compatibility and memory
+checks, not sustained throughput measurements or a replay of the failed Tau case.
+This follow-up loads one real adapter; it does not repeat the earlier all-slot,
+maximum-rank adapter qualification. No production deployment was performed.
+
+- [Cold-start and shared-prefix checks](https://modal.com/apps/freesolo/main/ap-mIlun7NT9ODdRd9nmmjNX4).
+- [Distinct long-prompt concurrency checks](https://modal.com/apps/freesolo/main/ap-0NA2ta2jcfvyw0PYdwPP5T).
+
+The remaining sections record the original October 30 qualification at 32,768 tokens.
+
+## Original sizing
+
 This change sizes the five hosted Qwen engines with their existing checkpoints,
 precision, 32,768-token context, eight-sequence scheduler, CUDA graphs, vision
 support, and maximum LoRA rank/slot allocations. Training hardware and customer-owned
