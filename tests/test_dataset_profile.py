@@ -760,7 +760,15 @@ def test_profile_rejects_an_empty_packaged_dataset_at_the_shared_worker_gate(tmp
 
 @pytest.mark.parametrize("output", [{}, {"output": None}, {"output": ""}])
 @pytest.mark.parametrize("inline", [False, True])
-def test_missing_sft_targets_report_the_data_contract_not_truncation(tmp_path, output, inline):
+def test_missing_sft_targets_report_the_data_contract_not_truncation(
+    tmp_path, output, inline, monkeypatch
+):
+    from flash.engine.profiling import dataset_profile
+
+    def unexpected_preparation(*args, **kwargs):
+        pytest.fail("missing raw targets must be diagnosed before tokenization")
+
+    monkeypatch.setattr(dataset_profile, "prepare_sft_workload", unexpected_preparation)
     row = {"input": "short prompt", "demonstration": {"messages": []}, **output}
     entrypoint = _package(tmp_path, {"dataset/train.jsonl": json.dumps(row) + "\n"})
     with pytest.raises(ValueError, match="missing or empty top-level 'output'") as error:
