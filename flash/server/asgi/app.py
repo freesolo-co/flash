@@ -265,9 +265,16 @@ def create_app():
             app.state.training_jobs.close()
             await work.cancel()
             shutdown_deadline = time.monotonic() + 15.0
+            deployments_drained = False
             with contextlib.suppress(Exception):
-                if not await asyncio.to_thread(deployment_jobs._wait_for_deployment_jobs, 10.0):
-                    _log.warning("deployment jobs still running at shutdown deadline")
+                deployments_drained = await asyncio.to_thread(
+                    deployment_jobs._wait_for_deployment_jobs, 10.0
+                )
+            if not deployments_drained:
+                _log.warning("deployment jobs still running at shutdown deadline")
+            # A deployment still holding its run lock would be skipped by a successor's one-time
+            # deployment recovery and then stranded in `deploying`; lifespan keeps the lease.
+            app.state.deployments_drained = deployments_drained
             with contextlib.suppress(Exception):
                 from flash.runner.lifecycle.reporting import _shutdown_status_reporter
 
@@ -283,13 +290,15 @@ def create_app():
                 async with managed_lifespan(app):
                     yield
         finally:
-            if await asyncio.to_thread(owner.close, 5.0):
+            tasks_stopped = await asyncio.to_thread(owner.close, 5.0)
+            if tasks_stopped and getattr(app.state, "deployments_drained", True):
                 plane_lease.release()
             else:
-                # A task still in a provider call may be launching or supervising a run. Keep the
-                # lease so no other plane recovers that run; the kernel drops it when we exit.
+                # A task still in a provider call may be launching or supervising a run, and a
+                # deployment job may still hold its run lock. Keep the lease so no other plane
+                # recovers either; the kernel drops it when this process exits.
                 _log.warning(
-                    "training tasks still in blocking calls at shutdown deadline; "
+                    "work still running at shutdown deadline; "
                     "keeping the control-plane lease until this process exits"
                 )
 

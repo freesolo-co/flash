@@ -125,6 +125,22 @@ def test_lease_is_kept_until_exit_when_training_tasks_outlive_shutdown(monkeypat
         _hold_elsewhere()
 
 
+def test_lease_is_kept_until_exit_when_deployment_jobs_outlive_shutdown(monkeypatch):
+    """A successor's one-time deployment recovery would skip a locked deployment and strand it."""
+    import flash.server.asgi.app as app_mod
+
+    recovered = []
+    _stub_lifespan(monkeypatch, recovered)
+    monkeypatch.setattr(deployment_jobs, "_wait_for_deployment_jobs", lambda _timeout: False)
+
+    with TestClient(app_mod.create_app()):
+        assert plane_lease.held()
+
+    assert plane_lease.held()
+    with pytest.raises(BlockingIOError):
+        _hold_elsewhere()
+
+
 def test_takeover_keeps_submissions_queued_until_recovery_finishes(monkeypatch):
     """A launch racing takeover recovery's orphan sweep would be reaped, so it must wait."""
     import flash.server.asgi.app as app_mod
