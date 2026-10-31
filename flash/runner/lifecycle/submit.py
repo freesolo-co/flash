@@ -254,8 +254,13 @@ def submit_job(
     owner_key_id: int | None = None,
     prepared_job: PreparedJob | None = None,
     supervisor: Supervisor | None = None,
+    queue_only: bool = False,
 ) -> state.RunStatus:
-    """Submit a prepared job, allocating resources only outside dry-run mode."""
+    """Submit a prepared job, allocating resources only outside dry-run mode.
+
+    ``queue_only`` persists the run as queued without launching it, for a control plane that does
+    not hold the plane lease; the holder's recovery scan launches it.
+    """
     if prepared_job is not None:
         prepared = prepared_job
     else:
@@ -271,11 +276,17 @@ def submit_job(
         "billing_context": billing_context,
         "platform_context": platform_context,
     }
+    if queue_only and not dry_run:
+        return _submit_prepared_job(prepared, dispatch=_leave_queued, **kwargs)
     if background and not dry_run:
         owner = supervisor or current_supervisor()
         with owner.reserve(("run", prepared.public_spec.run_id), "training") as dispatch:
             return _submit_prepared_job(prepared, dispatch=dispatch, **kwargs)
     return _submit_prepared_job(prepared, **kwargs)
+
+
+def _leave_queued(job) -> None:
+    """Dispatch nowhere: the persisted queued status is what the recovery scan launches."""
 
 
 def _submit_prepared_job(

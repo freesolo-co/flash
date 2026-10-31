@@ -17,7 +17,7 @@ import flash.server.platform.deployment_jobs as deployment_jobs
 import flash.server.platform.runtime as server_runtime
 from flash import __version__
 from flash._internal.background import Supervisor
-from flash.server.platform import db
+from flash.server.platform import db, plane_lease
 
 _SERVER_EXTRAS_HINT = "the control plane needs the server extras: pip install 'flash[server]'"
 
@@ -106,6 +106,90 @@ def _instance_providers_configured() -> bool:
     return any(name in INSTANCE_PROVIDERS for name in available_providers())
 
 
+class _LeaderWork:
+    """Recovery and background loops. Only the control-plane lease holder runs them."""
+
+    def __init__(self, app) -> None:
+        self.app = app
+        self.deployment_cleanup_stop = threading.Event()
+        self.startup_report_stop = threading.Event()
+        # (task, tolerate_errors): the status replay may fail at shutdown, the loops may not.
+        self.tasks: list[tuple[asyncio.Task, bool]] = []
+
+    def recover(self) -> None:
+        from flash.server.routes import serving_completion
+
+        # Reserve the durable-backlog scanner before recovery can fill its bounded lane.
+        with self.app.state.training_jobs.reserve(
+            ("scan", "runs"), "recovery", delay=30.0
+        ) as dispatch:
+            server_runtime.recover_runs()
+            dispatch(server_runtime.recover_pending_runs)
+        serving_completion.recover_deployments()
+
+    def start(self) -> None:
+        """Start the background loops; call on the event loop after recover()."""
+        from flash.server.billing.retry import charge_retry_enabled
+        from flash.server.domain.ops.repo_cleanup import repo_cleanup_enabled
+        from flash.server.routes import serving_completion
+
+        deployment_jobs.start_deployment_job(
+            serving_completion.run_deployment_cleanup_worker,
+            self.deployment_cleanup_stop,
+            background=True,
+        )
+        # replay one persisted status at a time in the background. synchronous per-item delivery
+        # prevents a historical backlog from filling the shared reporter ahead of live updates.
+        self._spawn(
+            asyncio.to_thread(serving_completion.replay_status_reports, self.startup_report_stop),
+            tolerate_errors=True,
+        )
+        if charge_retry_enabled():
+            # retry completion charges missed by transient failure or a crash after done, then keep
+            # re-charging any run left pending/failed by a transient blip so it can't leak revenue.
+            # run in background so billing timeouts cannot delay startup; backend runId makes it
+            # idempotent. Same internal-key gate as the charge itself.
+            self._spawn(server_runtime._charge_retry_startup())
+            self._spawn(server_runtime._charge_retry_loop())
+        if _instance_providers_configured():
+            self._spawn(_sweep_orphan_instances_loop())
+        # periodic artifact gc: delete aged (>7d), undeployed run prefixes inside the per-environment
+        # hf repos (<artifact namespace>/flashrun-*) so old runs' checkpoints/adapters don't pile up
+        # against the org's storage quota. only on a plane with an operator `hf_token` (it deletes
+        # operator-owned repos); fails closed on any live-set uncertainty. see
+        # flash.server.domain.ops.repo_cleanup.
+        if repo_cleanup_enabled():
+            self._spawn(server_runtime._repo_cleanup_loop())
+
+    def _spawn(self, coroutine, *, tolerate_errors: bool = False) -> None:
+        self.tasks.append((asyncio.create_task(coroutine), tolerate_errors))
+
+    def signal_stop(self) -> None:
+        self.deployment_cleanup_stop.set()
+        self.startup_report_stop.set()
+
+    async def cancel(self) -> None:
+        for task, tolerate_errors in self.tasks:
+            task.cancel()
+            ignored = (
+                (asyncio.CancelledError, Exception)
+                if tolerate_errors
+                else (asyncio.CancelledError,)
+            )
+            with contextlib.suppress(*ignored):
+                await task
+
+
+async def _lead_when_free(work: _LeaderWork) -> None:
+    """Wait for the previous plane to exit, then take over recovery and the loops."""
+    await plane_lease.acquire()
+    _log.info("control-plane lease acquired; starting recovery and background work")
+    # Submissions launch locally again; recovery adopts the runs queued during standby.
+    work.app.state.plane_standby = False
+    await asyncio.to_thread(work.recover)
+    work.start()
+
+
 def create_app():
     try:
         from fastapi import FastAPI
@@ -118,7 +202,6 @@ def create_app():
             meta,
             runs,
             serving,
-            serving_completion,
         )
     except ImportError as exc:
         raise RuntimeError(_SERVER_EXTRAS_HINT) from exc
@@ -128,79 +211,35 @@ def create_app():
     async def managed_lifespan(app):
         from flash.providers.core.preflight import check_run_preflight
         from flash.runner.lifecycle.reporting import _open_status_reporter
-        from flash.server.billing.retry import charge_retry_enabled
 
         check_run_preflight()  # operator credentials: fail fast, before serving anyone
         deployment_jobs._open_deployment_jobs()
         _open_status_reporter()
-        # Reserve the durable-backlog scanner before recovery can fill its bounded lane.
-        with app.state.training_jobs.reserve(("scan", "runs"), "recovery", delay=30.0) as dispatch:
-            server_runtime.recover_runs()
-            dispatch(server_runtime.recover_pending_runs)
-        serving_completion.recover_deployments()
-        deployment_cleanup_stop = threading.Event()
-        deployment_jobs.start_deployment_job(
-            serving_completion.run_deployment_cleanup_worker,
-            deployment_cleanup_stop,
-            background=True,
-        )
-        # replay one persisted status at a time in the background. synchronous per-item delivery
-        # prevents a historical backlog from filling the shared reporter ahead of live updates.
-        startup_report_stop = threading.Event()
-        startup_report_task = asyncio.create_task(
-            asyncio.to_thread(serving_completion.replay_status_reports, startup_report_stop)
-        )
-        # retry completion charges missed by transient failure or a crash after done.
-        # run in background so billing timeouts cannot delay startup; backend runId makes it
-        # idempotent.
-        startup_charge_task = (
-            asyncio.create_task(server_runtime._charge_retry_startup())
-            if charge_retry_enabled()
-            else None
-        )
-        # Periodic completion-charge retry: re-charge any run left pending/failed by a transient blip
-        # so it can't leak revenue. Same internal-key gate as the charge itself.
-        charge_task = (
-            asyncio.create_task(server_runtime._charge_retry_loop())
-            if charge_retry_enabled()
-            else None
-        )
-        sweep_task = (
-            asyncio.create_task(_sweep_orphan_instances_loop())
-            if _instance_providers_configured()
-            else None
-        )
-        # periodic artifact gc: delete aged (>7d), undeployed run prefixes inside the per-environment
-        # hf repos (<artifact namespace>/flashrun-*) so old runs' checkpoints/adapters don't pile up
-        # against the org's storage quota. only on a plane with an operator `hf_token` (it deletes
-        # operator-owned repos); fails closed on any live-set uncertainty. see
-        # flash.server.domain.ops.repo_cleanup.
-        from flash.server.domain.ops.repo_cleanup import repo_cleanup_enabled
-
-        cleanup_task = (
-            asyncio.create_task(server_runtime._repo_cleanup_loop())
-            if repo_cleanup_enabled()
-            else None
-        )
+        work = _LeaderWork(app)
+        waiter = None
+        if plane_lease.try_acquire():
+            # The usual case: no other plane on this state directory. Recover before serving.
+            work.recover()
+            work.start()
+        else:
+            # A deploy started this plane while the previous one drains. Serve HTTP now; new runs
+            # stay queued for the holder's recovery scan until its exit hands the lease over.
+            _log.warning(
+                "another control plane holds %s; serving without recovery until it exits",
+                plane_lease.lease_path(),
+            )
+            app.state.plane_standby = True
+            waiter = asyncio.create_task(_lead_when_free(work))
         try:
             yield
         finally:
-            deployment_cleanup_stop.set()
+            if waiter is not None:
+                waiter.cancel()
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await waiter
+            work.signal_stop()
             app.state.training_jobs.close()
-            startup_report_stop.set()
-            startup_report_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError, Exception):
-                await startup_report_task
-            for task in (
-                startup_charge_task,
-                charge_task,
-                sweep_task,
-                cleanup_task,
-            ):
-                if task is not None:
-                    task.cancel()
-                    with contextlib.suppress(asyncio.CancelledError):
-                        await task
+            await work.cancel()
             shutdown_deadline = time.monotonic() + 15.0
             with contextlib.suppress(Exception):
                 if not await asyncio.to_thread(deployment_jobs._wait_for_deployment_jobs, 10.0):
@@ -222,6 +261,7 @@ def create_app():
         finally:
             if not await asyncio.to_thread(owner.close, 5.0):
                 _log.warning("training tasks still in blocking calls at shutdown deadline")
+            plane_lease.release()
 
     app = FastAPI(title="Flash Control Plane", version=__version__, lifespan=lifespan)
     app.include_router(meta.router)

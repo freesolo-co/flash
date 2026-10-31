@@ -30,6 +30,11 @@ This file starts at 1.1.35. Earlier releases are not reconstructed here; use
 
 ### Added
 
+- Control planes sharing a state directory take a lease (`control-plane.lock` in the data
+  directory) so a deploy can start a new plane while the old one drains. Only the holder runs
+  run recovery, deployment recovery and the background loops; a plane started beside it serves
+  HTTP and leaves new runs queued for the holder until the old plane exits.
+
 - Custom training rows accept a rectangular `target_tokens` matrix, `[len(tokens)-1, K]`
   with K up to 64, scoring K tokens at every position instead of the next token. `weights`
   then has the same shape and logprobs come back with it, so `forward_backward` computes
