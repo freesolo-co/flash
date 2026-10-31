@@ -464,12 +464,13 @@ def test_class_names_are_distinct_and_modal_safe(modal_app_module):
     assert modal_app_module._engine_class_name("A100-80GB", 16) == "LoraEngine_A100_80GB_c16"
 
 
-def test_9b_routes_to_b200(modal_app_module):
-    """Rank-128 LoRA serving for 9B uses the B200 tier (8-seq -> (B200, 8))."""
+def test_9b_routes_to_h100(modal_app_module):
+    """Rank-128 LoRA serving for 9B uses the H100 tier (8-seq -> (H100, 8))."""
     by_key = modal_app_module.ENGINE_BY_KEY
-    assert gpu_for("Qwen/Qwen3.5-9B") == "B200"
-    assert modal_app_module._engine_cls_for("Qwen/Qwen3.5-9B") is by_key[("B200", 8)]
-    assert by_key[("B200", 8)].__name__ == "LoraEngine_B200_c8"
+    assert gpu_for("Qwen/Qwen3.5-9B") == "H100"
+    assert modal_app_module._engine_cls_for("Qwen/Qwen3.5-9B") is by_key[("H100", 8)]
+    assert by_key[("H100", 8)].__name__ == "LoraEngine_H100_c8"
+    assert by_key[("H100", 8)].pinned_gpu == "H100"
 
 
 def test_27b_routes_to_b200(modal_app_module):
@@ -546,7 +547,7 @@ def test_health_reports_pinned_gpu_over_derived_tier(modal_app_module):
         base_model = "Qwen/Qwen3.5-9B"
         registry = type("R", (), {"list_ready": lambda self: []})()
 
-    assert impl._health(_Bare())["configured_gpu"] == "B200"
+    assert impl._health(_Bare())["configured_gpu"] == "H100"
 
 
 def test_health_reports_effective_max_model_len_override(modal_app_module):

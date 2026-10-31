@@ -264,13 +264,13 @@ max_lora_rank`, regardless of how many adapters load. Both are linear levers. Th
 
 ### Hosted GPU configuration
 
-All active hosted engines use B200 with a 2100-second idle window. Each catalog entry must
+Hosted engines use L40S, H100, or B200 with a 2100-second idle window. Each catalog entry must
 explicitly declare its GPU; unsupported hardware is rejected before deployment. Training GPU
 selection and customer-owned serving profiles are separate.
 
 | Base model | Checkpoint | GPU | Hot LoRA shape | Context |
 | --- | --- | --- | --- | --- |
-| Qwen3.5-9B | owned FP8 (`Freesolo-Co/*-FP8`) | B200 | 16 × 128 | 32768 |
+| Qwen3.5-9B | owned FP8 (`Freesolo-Co/*-FP8`) | H100 | 16 × 128 | 32768 |
 | Qwen3.8-27B | official native FP8 (`Qwen/Qwen3.8-27B-FP8`) | B200 | 16 × 64 | 32768 |
 | Qwen3.6-35B-A3B (MoE, VL) | official bf16 | B200 | 6 × 64 | 32768 |
 
