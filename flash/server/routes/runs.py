@@ -438,6 +438,9 @@ def create_run(
             "owner_key_id": key["id"],
             "prepared_job": prepared,
             "supervisor": request.app.state.training_jobs,
+            # A plane started beside a draining one must not launch: the lease holder's recovery
+            # scan picks the queued run up (see flash.server.platform.plane_lease).
+            "queue_only": getattr(request.app.state, "plane_standby", False),
         }
         if runtime_secrets:
             submit_kwargs["runtime_secrets"] = runtime_secrets

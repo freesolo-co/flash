@@ -96,7 +96,7 @@ class TextPromptTokenizer:
     ) -> dict[str, Any]:
         # TTFT: an LRU hit is microseconds, so it is served inline - a thread hop would cost more
         # than the work. A MISS runs the chat template + tokenizer, which is 10 ms at 6k tokens and
-        # ~51 ms at 24k (measured, Qwen3.5 fast tokenizer). Every tier serves 32k context and
+        # ~51 ms at 24k (measured, Qwen3.5 fast tokenizer). The served context is model-specific and
         # modal.concurrent packs up to max_inputs requests onto ONE container, so tokenizing on the
         # event loop head-of-line blocks EVERY co-resident request's TTFT, not just this one. HF
         # fast tokenizers are Rust and release the GIL (measured 5.6x on 8 threads), so the offload

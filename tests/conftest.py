@@ -281,6 +281,20 @@ def _close_status_reporter_after_suite():
 
 
 @pytest.fixture(autouse=True)
+def _private_plane_lease(monkeypatch, tmp_path):
+    """Give each test its own control-plane lease.
+
+    The real lease lives under the shared data dir, so parallel workers (or a local plane) would
+    otherwise put a test's lifespan into standby, skipping recovery and the background loops.
+    """
+    from flash.server.platform import plane_lease
+
+    monkeypatch.setattr(plane_lease, "lease_path", lambda: str(tmp_path / "control-plane.lock"))
+    yield
+    plane_lease.release()
+
+
+@pytest.fixture(autouse=True)
 def _reset_status_reporter_before_test():
     from flash.runner.lifecycle import reporting
 

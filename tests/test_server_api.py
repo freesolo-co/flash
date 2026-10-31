@@ -708,8 +708,8 @@ def test_dry_run_rejects_structured_completion_budget_above_serving_capacity(api
             # the context must still leave a prompt budget, or the grpo spec-parse guard rejects it
             # first and this test would stop covering the serving-capacity message.
             **SPEC["train"],
-            "max_context_tokens": 32769,
-            "max_completion_tokens": 32513,
+            "max_context_tokens": 262145,
+            "max_completion_tokens": 261889,
             "structured_outputs": {"choice": ["4"]},
         },
     }
@@ -722,9 +722,9 @@ def test_dry_run_rejects_structured_completion_budget_above_serving_capacity(api
 
     assert response.status_code == 400
     detail = response.json()["detail"]
-    assert "effective budget (32513) cannot fit" in detail
-    assert "serving max_model_len=32768" in detail
-    assert "lower train.max_completion_tokens to <= 32512" in detail
+    assert "effective budget (261889) cannot fit" in detail
+    assert "serving max_model_len=262144" in detail
+    assert "lower train.max_completion_tokens to <= 261888" in detail
 
 
 def test_valid_thinking_structured_run_passes_dry_run(api) -> None:
@@ -841,7 +841,7 @@ def test_warmstart_dry_run_preserves_context_preflight_error(api) -> None:
         "train": {
             **SPEC["train"],
             "init_from_adapter": "source-run/final",
-            "max_completion_tokens": 34000,
+            "max_completion_tokens": 263168,
         },
     }
 
@@ -1479,6 +1479,26 @@ def test_create_run_does_not_blame_the_adapter_for_an_unrelated_failure(api, mon
     assert "no configured provider can provision" in detail
     assert "could not be prepared" not in detail
     assert api.get("/v1/runs", headers=_bearer("fslo-internal-test")).json()["runs"] == []
+
+
+def test_create_run_only_queues_while_another_plane_holds_the_lease(api, monkeypatch):
+    """A plane started beside a draining one leaves new runs for the lease holder to launch."""
+    seen = []
+
+    def submit(spec, **kwargs):
+        seen.append(kwargs["queue_only"])
+        status = runner_state.RunStatus(run_id=spec.run_id, state="queued", spec=spec.to_dict())
+        runner_state._save_status(status)
+        return status
+
+    monkeypatch.setattr(runner_submit, "submit_job", submit)
+    key = _new_user_token()
+
+    assert api.post("/v1/runs", headers=_bearer(key), json={"spec": SPEC}).status_code == 200
+    api.app.state.plane_standby = True
+    assert api.post("/v1/runs", headers=_bearer(key), json={"spec": SPEC}).status_code == 200
+
+    assert seen == [False, True]
 
 
 def test_create_run_keeps_ownership_when_submit_fails_after_persisting_status(api, monkeypatch):

@@ -561,7 +561,7 @@ def test_lora_engine_health_reports_served_model_and_baked_config(modal_app_modu
         "enable_prefix_caching": True,
         "prompt_token_cache_size": 2048,
         "prompt_token_cache_entries": 1,
-        "max_model_len": 32768,
+        "max_model_len": 262144,
     }
 
 
@@ -924,9 +924,9 @@ def test_evict_uncached_alias_does_not_remove_a_colliding_adapter(modal_app_modu
 
 
 def test_only_active_gpus_have_a_hosted_idle_window(modal_app_module):
-    assert {"L4", "L40S", "A100-80GB", "H200"} == modal_app_module.SUPPORTED_GPUS
+    assert {"L4", "L40S", "H100", "H200"} == modal_app_module.SUPPORTED_GPUS
     for gpu in modal_app_module.SUPPORTED_GPUS:
         assert modal_app_module.scaledown_window_for(gpu) == 2100
-    for dormant_gpu in ("H100", "B200", "B300"):
+    for dormant_gpu in ("A100-80GB", "B200", "B300"):
         with pytest.raises(ValueError, match="Unsupported serving GPU tier"):
             modal_app_module.scaledown_window_for(dormant_gpu)

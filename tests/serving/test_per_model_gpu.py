@@ -440,7 +440,7 @@ def test_one_engine_class_per_distinct_engine_key(modal_app_module):
     assert set(modal_app_module.ENGINE_BY_KEY) == {
         ("L4", 8),
         ("L40S", 8),
-        ("A100-80GB", 8),
+        ("H100", 8),
         ("H200", 8),
     }
 
@@ -473,9 +473,9 @@ def test_class_names_are_distinct_and_modal_safe(modal_app_module):
     ("model", "gpu"),
     [
         ("Qwen/Qwen3.5-0.8B", "L4"),
-        ("Qwen/Qwen3.5-4B", "L4"),
+        ("Qwen/Qwen3.5-4B", "L40S"),
         ("Qwen/Qwen3.5-9B", "L40S"),
-        ("Qwen/Qwen3.8-27B", "A100-80GB"),
+        ("Qwen/Qwen3.8-27B", "H100"),
         ("Qwen/Qwen3.6-35B-A3B", "H200"),
     ],
 )
@@ -557,17 +557,17 @@ def test_health_reports_effective_max_model_len_override(modal_app_module):
     impl = modal_app_module._LoraEngineImpl
 
     class _Big:
-        base_model = "Qwen/Qwen3.6-35B-A3B"  # engine override max_model_len=32768
+        base_model = "Qwen/Qwen3.6-35B-A3B"  # engine override max_model_len=262144
         registry = type("R", (), {"list_ready": lambda self: []})()
 
-    assert impl._health(_Big())["max_model_len"] == 32768  # the override, not cfg.MAX_MODEL_LEN
+    assert impl._health(_Big())["max_model_len"] == 262144  # the override, not cfg.MAX_MODEL_LEN
     assert impl._health(_Big())["quantization"] is None  # validated bf16 weights
 
     class _Dense:
-        base_model = "Qwen/Qwen3.5-9B"  # per-model 32k override
+        base_model = "Qwen/Qwen3.5-9B"  # per-model native 256k override
         registry = type("R", (), {"list_ready": lambda self: []})()
 
-    assert impl._health(_Dense())["max_model_len"] == 32768
+    assert impl._health(_Dense())["max_model_len"] == 262144
     assert impl._health(_Dense())["max_model_len"] != cfg.MAX_MODEL_LEN
     assert impl._health(_Dense())["quantization"] == "fp8"
 
@@ -899,14 +899,14 @@ def test_hosted_hot_pools_remain_unpinned(modal_app_module, monkeypatch, tmp_pat
 
 
 def test_load_prequant_checkpoint_for_9b(modal_app_module, monkeypatch, tmp_path):
-    """The 9B loads a pre-quantized FP8 checkpoint with FP8 KV and the validated 32k context."""
+    """The 9B loads a pre-quantized FP8 checkpoint with FP8 KV and the native 256k context."""
     args = _capture_engine_args(modal_app_module, monkeypatch, tmp_path, "Qwen/Qwen3.5-9B")
     assert args.model == "Freesolo-Co/Qwen3.5-9B-FP8"  # owned pre-quant checkpoint
     assert args.quantization is None  # auto-detected from the checkpoint, not online-quantized
     assert args.kv_cache_dtype == "fp8"
     assert args.max_loras == 16
     assert args.max_lora_rank == 128
-    assert args.max_model_len == 32768
+    assert args.max_model_len == 262144
     assert args.max_num_seqs == 8
     assert args.gpu_memory_utilization == 0.90  # 0.90 leaves CUDA-graph capture headroom (was 0.98)
     assert args.enforce_eager is False  # CUDA graphs ON: ~10x faster decode on the hybrid GDN model
@@ -936,7 +936,7 @@ def test_load_bf16_base_with_full_experts_for_35b(modal_app_module, monkeypatch,
     assert getattr(args, "moe_backend", None) in (None, "auto")
     assert args.max_loras == 6
     assert args.max_lora_rank == 64
-    assert args.max_model_len == 32768
+    assert args.max_model_len == 262144
     assert args.max_num_batched_tokens == 4096
     assert args.gpu_memory_utilization == 0.90
     assert args.enforce_eager is False  # CUDA graphs ON
