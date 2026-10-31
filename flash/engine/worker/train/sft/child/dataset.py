@@ -54,6 +54,51 @@ class FlashTokenizedSFTDataset:
         with np.load(io.BytesIO(payload), allow_pickle=False) as arrays:
             return {key: torch.from_numpy(arrays[key].copy()) for key in arrays.files}
 
+    @staticmethod
+    def _image_paths(value):
+        if value is None or value is pd.NA:
+            return []
+        if hasattr(value, "to_pylist"):
+            value = value.to_pylist()
+        elif hasattr(value, "tolist"):
+            value = value.tolist()
+        from urllib.parse import unquote, urlparse
+
+        return [unquote(urlparse(str(uri)).path) for uri in value]
+
+    def _with_image_pixels(self, multi_modal_inputs, images):
+        """rebuild the pixel tensors the worker did not store, from the row's saved image files.
+
+        the worker keeps the processor's small per-row fields (image grid, token types) and drops
+        pixel_values, which would be gigabytes across a screenshot dataset. every field the image
+        processor recomputes must equal its stored value, so pixels cannot drift from the tokens.
+        """
+        paths = self._image_paths(images)
+        if not paths or "pixel_values" in multi_modal_inputs:
+            return multi_modal_inputs
+        if self.processor is None:
+            raise ValueError("an image sft row needs a processor to rebuild its pixel values")
+        from PIL import Image
+
+        loaded = []
+        try:
+            for path in paths:
+                with Image.open(path) as image:
+                    image.load()
+                    loaded.append(image.copy())
+            processed = self.processor.image_processor(images=loaded, return_tensors="pt")
+        finally:
+            for image in loaded:
+                image.close()
+        merged = dict(multi_modal_inputs)
+        for key, value in dict(processed).items():
+            if key in merged:
+                if value.tolist() != merged[key].tolist():
+                    raise ValueError(f"rebuilt {key} does not match the tokenized image row")
+            else:
+                merged[key] = value
+        return merged
+
     def __getitem__(self, index):
         import torch
 
@@ -70,7 +115,9 @@ class FlashTokenizedSFTDataset:
         input_ids_tensor = torch.tensor(input_ids, dtype=torch.long)
         loss_mask_tensor = torch.tensor(loss_mask, dtype=torch.long)
         attention_mask = torch.ones_like(input_ids_tensor)
-        multi_modal_inputs = self._multimodal_inputs(row["multimodal_inputs"])
+        multi_modal_inputs = self._with_image_pixels(
+            self._multimodal_inputs(row["multimodal_inputs"]), row["images"]
+        )
         if (
             self.processor is not None
             and "Qwen2VLImageProcessor" in self.processor.image_processor.__class__.__name__

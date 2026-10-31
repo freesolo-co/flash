@@ -40,7 +40,8 @@ def _serialize_multimodal_inputs(values: dict) -> bytes:
     if not arrays:
         return b""
     payload = io.BytesIO()
-    np.savez(payload, **arrays)
+    # token-type ids are mostly zeros; compression keeps per-row metadata small.
+    np.savez_compressed(payload, **arrays)
     return payload.getvalue()
 
 
@@ -222,6 +223,10 @@ def process_sft_image_row(
             rendered_probe=rendered_probe,
         )
         full.pop("attention_mask", None)
+        # pixel tensors are the bulk of an image row (~4 MB per 498x321 screenshot, repeated for
+        # every row whose history shows it), so they are not stored: the training child rebuilds
+        # them from the row's saved image files and checks the stored image_grid_thw.
+        full.pop("pixel_values", None)
         return (
             input_ids,
             mask,

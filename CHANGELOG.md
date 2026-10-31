@@ -130,6 +130,12 @@ This file starts at 1.1.35. Earlier releases are not reconstructed here; use
 
 ### Fixed
 
+- Image SFT no longer stores processed pixel tensors in the training parquet. The worker keeps
+  each row's small processor fields (image grid, token types) and its saved image files, and the
+  training dataset rebuilds `pixel_values` per item, checking the stored grid. Before this,
+  multi-image rows (about 4 MB of float32 pixels per screenshot, repeated across rows that share
+  history) overflowed the 2 GiB `binary` column with `ArrowInvalid: offset overflow` before the
+  first step. The column is now `large_binary`.
 - Image SFT quotes now bound profile-wide decode work at an explicit 16 GiB instead of the
   per-row decode cap times the per-example image count (2 GiB), so screenshot datasets with a few
   thousand unique images, such as MiniWoB teacher traces, are no longer rejected before training.
