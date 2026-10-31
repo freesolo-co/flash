@@ -556,9 +556,10 @@ def _catalog_model_required_vram_gb(
     if model_revision:
         params_b, model_vocab = _validated_revision_geometry(model_id, model_revision, info)
     quant = getattr(info, "quant", "bf16") or "bf16"
-    # Pinned revisions use their validated params/vocab, not unverified catalog layer geometry.
-    # The model's runtime memory allowance still applies independently of that geometry.
-    sizing_info = None if model_revision else info
+    # Recipe sizing drops unverified layer geometry for pinned revisions. Custom training
+    # uses the catalog adapter targets even for its validated immutable worker revision.
+    # Dropping them would lose the full MoE expert-state allowance at higher ranks.
+    sizing_info = info if not model_revision or algorithm == "custom" else None
     rollout_cache_min_gb = getattr(info, "rollout_cache_min_gb", 0.0)
     active_b = float(getattr(sizing_info, "active_params_b", 0.0) or 0.0)
     need = _model_vram_need(
@@ -658,16 +659,22 @@ def model_required_vram_gb(
     _algo = (algorithm or "").lower()
     if _algo in ("grpo", "rl"):
         _default_len = grpo_rollout_seq_len(0, max_tokens, thinking)
+    elif _algo == "custom":
+        _default_len = 2048
     else:
         from flash.engine.plan.recipe import RECIPE
 
         _default_len = int(RECIPE.sft.max_seq_len_thinking if thinking else RECIPE.sft.max_seq_len)
     seq_len = _positive_int_or_default(_sizing_value(train, "max_context_tokens"), _default_len)
-    lora_rank = _positive_int_or_default(_sizing_value(train, "lora_rank"), 32)
+    lora_rank = _positive_int_or_default(
+        _sizing_value(train, "lora_rank"), 16 if _algo == "custom" else 32
+    )
     batch_size_default = _sft_per_device_bs()
     group_size_default = 8
     group_size = _positive_int_or_default(_sizing_value(train, "group_size"), group_size_default)
     batch_size = _positive_int_or_default(_optimizer_batch_value(train, _algo), batch_size_default)
+    if _algo == "custom":
+        batch_size = 1  # TorchBackend processes rows sequentially, accumulating gradients.
 
     from flash.core.catalog import MODELS, vocab_size_for
 
@@ -677,7 +684,7 @@ def model_required_vram_gb(
     # the fused sft loss removes ignored positions before the lm head and projects valid tokens
     # without materializing dense logits. size validated qwen sft jobs without a [batch, seq, vocab]
     # term; models outside that validated set keep the conservative plain-nll estimate and cap.
-    sft_fused_ce = None if is_grpo else sft_chunked_nll_enabled(model_id)
+    sft_fused_ce = None if is_grpo else (_algo == "sft" and sft_chunked_nll_enabled(model_id))
     if info is not None:
         return _catalog_model_required_vram_gb(
             model_id,

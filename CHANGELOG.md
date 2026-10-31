@@ -37,12 +37,10 @@ This file starts at 1.1.35. Earlier releases are not reconstructed here; use
   losses read `[T, K]` logprobs. Weighting a teacher's top-k by its probabilities trains
   forward KL directly. Requests hold at most 100,000 target cells. Rows without
   `target_tokens` are unchanged.
-- Custom training supports every catalog model. Each model lists the GPUs that passed
-  conformance in the qualified worker image for the card's architecture at the 4,096-token
-  custom context ceiling, cheapest first: Qwen3.5-0.8B on every GPU class; Qwen3.5-4B and
-  9B on L40S, A100 40GB, A100 80GB, RTX Pro 6000, H100, H200 or B200; Qwen3.8-27B on
-  A100 80GB, RTX Pro 6000, H100, H200 or B200; and Qwen3.6-35B-A3B on RTX Pro 6000, H200
-  or B200.
+- Custom training supports every catalog model and uses the shared SFT/GRPO GPU allocator
+  and memory estimator. Selection accounts for LoRA rank, full AdamW state (including all
+  MoE experts), context length and custom training's full logits. It chooses the cheapest
+  fitting available GPU, within the backend's single-GPU Modal constraint.
 - Custom `forward_backward` recomputes layer activations (gradient checkpointing) for models
   without active module or functional attention dropout, running `forward_backward` in train
   mode and scoring in eval mode. Models with stateful batch normalization stay in eval mode

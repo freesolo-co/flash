@@ -280,6 +280,8 @@ def _run_cost_key(
     overrides: dict | None = None,
 ):
     """``(gpu, hourly_rate) -> dollars per step`` for this run, or None if it can't be priced."""
+    if algorithm == "custom":
+        return None  # arbitrary local work has no recipe-derived step-time prediction.
     try:
         from flash.cost.analytical import step_cost_key
 
@@ -298,20 +300,16 @@ def _run_cost_key(
 
 
 def custom_gpu_shape(model_id, provider, gpu_types, count):
-    """Constrain the shared allocator to shapes validated for the custom Torch backend."""
-    from flash.core.catalog import CUSTOM_TRAINING_GPUS
+    """Keep the custom transport single-GPU; use shared sizing and hardware eligibility."""
+    from flash.core.catalog import validate_model_for_algorithm
 
-    supported = CUSTOM_TRAINING_GPUS.get(model_id)
-    if not supported:
-        raise ValueError(f"{model_id} has no GPU-validated custom training profile")
+    validate_model_for_algorithm(model_id, "custom")
     if provider not in {"", "modal"} or (
         count is not None and (type(count) is not int or count != 1)
     ):
         raise ValueError("custom training currently requires one managed Modal GPU")
-    allowed = tuple(gpu_types) or supported
-    if any(gpu not in supported for gpu in allowed):
-        raise ValueError(f"custom training for {model_id} supports: {', '.join(supported)}")
-    return "modal", allowed[0], allowed[1:], 1
+    allowed = tuple(gpu_types)
+    return "modal", allowed[0] if allowed else "", allowed[1:], 1
 
 
 def authored_gpu_ceiling(gpu_type: str, gpu_count: int | None) -> int | None:
@@ -458,6 +456,8 @@ def provisional_gpu_count(
         required_vram_gb,
     )
 
+    if algorithm == "custom":
+        gpu_count = 1
     ceiling = MAX_COMBINATION_CARDS if gpu_count is None else gpu_count
     geometry_revision = (
         model_revision if geometry_model_revision is None else geometry_model_revision

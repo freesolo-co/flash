@@ -521,7 +521,7 @@ def _validate_gpu_section(
             custom_gpu_shape(model, gpu_spec.provider, gpu_spec.acceptable_types, gpu_count)
         except ValueError as exc:
             raise ConfigError(str(exc)) from exc
-        return gpu_spec, authored_gpu_ceiling(gpu_spec.type, gpu_count) is None
+        gpu_count = 1
 
     gpu_types = gpu_spec.acceptable_types
     for candidate in gpu_types:
