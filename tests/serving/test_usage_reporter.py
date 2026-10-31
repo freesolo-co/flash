@@ -561,7 +561,7 @@ def test_lora_engine_health_reports_served_model_and_baked_config(modal_app_modu
         "enable_prefix_caching": True,
         "prompt_token_cache_size": 2048,
         "prompt_token_cache_entries": 1,
-        "max_model_len": 32768,
+        "max_model_len": 65536,
     }
 
 

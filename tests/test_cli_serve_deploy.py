@@ -249,7 +249,7 @@ def test_registry_inconsistency_fails_before_artifact_resolution(
         monkeypatch.setitem(
             profiles._PROFILES,
             MODEL,
-            replace(get_profile(MODEL), max_model_len=65536),
+            replace(get_profile(MODEL), max_model_len=131072),
         )
     else:
         monkeypatch.setitem(
