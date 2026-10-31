@@ -35,7 +35,7 @@ is unchanged, so idle-time costs still exist.
 - **27B:** L40S failed with CUDA OOM while allocating LoRA buffers (44.35 GiB in
   use, 62.75 MiB free, failed 10 MiB allocation). Smaller 24/40 GB cards cannot
   contain the observed 45.53 GiB load plus KV and graphs. A100 80GB is the least
-  expensive passing 80 GB option; H100 also passes the initial generation probe.
+  expensive passing 80 GB option; H100 also passes the final generation, adapter and image checks.
 - **35B:** the observed 108.46 GiB model/LoRA load alone exceeds 80 GB and 96 GB
   options. H200 fits with six rank-64 slots; reducing slots or changing precision
   would change the supported serving shape. Smaller cards were excluded by this
@@ -57,8 +57,8 @@ active. No production deployment is performed by this qualification.
 Small models use a real rank-64 SFT adapter from the pinned
 `DavidBShan/flash-pr1520-validation-20261026` dataset revision
 `d8cd13a007101c2bd5d39ca5b9c53097eb02650b`. Larger models use synthetic zero-valued,
-maximum-rank attention LoRA; the 35B expert check additionally exercises all experts
-in one layer at rank 64. These checks verify loading, dispatch, kernels and memory,
+maximum-rank attention LoRA; the 35B expert check additionally exercises all 256 experts
+in one layer at rank 64, using the same fused parameter layout as Flash exports. These checks verify loading, dispatch, kernels and memory,
 not fine-tuned quality or every possible adapter/vision workload. All-slot identity
 loading reuses the same adapter weights under distinct IDs. The runtime allocates
 its configured full-model LoRA buffers regardless of the synthetic adapter's keys.
@@ -66,3 +66,43 @@ its configured full-model LoRA buffers regardless of the synthetic adapter's key
 This is a serving compatibility and memory qualification, not a sustained throughput
 benchmark or a guarantee of unchanged latency. Review latency after deployment
 before increasing traffic; the current admission limits remain unchanged.
+
+## Results and latency limits
+
+All five selected tiers pass the final checks with correct arithmetic outputs,
+all configured adapter identities loaded, and correct red-image responses on the
+three vision tiers. The fused-expert H200 run also passes. Runtime KV estimates at
+32,768 tokens are 69.97 sequences for 0.8B/L4, 12.84 for 4B/L4, 20.03 for 9B/L40S,
+17.93 for 27B/A100 80GB, and 33.95 for 35B/H200, all above the configured eight.
+These are cache-capacity estimates, not measured throughput.
+
+**27B trades latency for the lowest hourly rate.** In the final smoke runs, all eight
+distinct 32k prompts completed in 109.15 seconds on A100 80GB versus 20.9 seconds on
+H100; with adapters, 127.54 versus 31.5 seconds. These are single-run batch completion
+times, including incidental kernel warmup, with short outputs. They do not establish
+steady-state tokens/second, but the difference is substantial. A100 is selected for
+the requested lowest hourly cost among passing GPUs; busy long-context traffic may
+cost more per request than on H100 despite the lower hourly rate. H100 remains a
+verified alternative if latency or active-work cost becomes the priority.
+
+Offline validation in the locked server/serving environment passed: 12,074 tests,
+162 skips (normal plus isolated wall-clock test runs). Ruff lint/format, file and
+function size, and source layout checks passed.
+
+## Evidence runs
+
+- [Initial candidate and H100 screening](https://modal.com/apps/freesolo/main/ap-Pz7F3fIde5bFXfUFdULbJ1).
+- [27B L40S OOM and A100 80GB screening](https://modal.com/apps/freesolo/main/ap-7IAvnrhQI1d9spJFQEndlW).
+- [Rejected 9B A100 alternative](https://modal.com/apps/freesolo/main/ap-IQulSlhj2Y5zcCJPmcmAqu).
+- [Final 0.8B/L4, 9B/L40S and 35B/H200 checks](https://modal.com/apps/freesolo/main/ap-p7JClnWG52T7tvYy9tUqsd).
+- [Final 4B/L4 checks](https://modal.com/apps/freesolo/main/ap-HmaNiXvgbDrngHfZz5t32v).
+- [Final 27B/A100 80GB checks](https://modal.com/apps/freesolo/main/ap-1wmYDWMnxWMN5y1g90WFH1).
+- [27B/H100 comparison](https://modal.com/apps/freesolo/main/ap-pwuREqhd8pWiE7HuxnKoZh).
+- [35B/H200 fused-expert checks](https://modal.com/apps/freesolo/main/ap-vxBJ9GLnXe5rmPuPxZMeHT).
+
+The first screening harness recorded completion as `ok`; its captured text was also
+reviewed for correctness. The 9B/A100 run's `ok=true` is therefore **not a pass**.
+Final outputs are checked against arithmetic and image-color answers; the harness
+was tightened to assert those answers directly as well. The first synthetic expert
+probe used per-expert keys instead of Flash's fused format and was rejected during
+loading; the linked fused-format rerun is the qualifying result.
