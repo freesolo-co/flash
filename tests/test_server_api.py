@@ -5129,7 +5129,8 @@ def test_redeploy_after_inactive_deployment_state_is_allowed(api, monkeypatch, d
     assert deployment["requested_at"] != 1.0
 
 
-def test_deploy_ignores_stored_training_gpu(api, monkeypatch):
+@pytest.mark.parametrize("legacy_teacher_default", [False, True])
+def test_deploy_ignores_stored_training_gpu(api, monkeypatch, legacy_teacher_default):
     from dataclasses import replace
 
     from flash.core.spec import JobSpec
@@ -5143,6 +5144,18 @@ def test_deploy_ignores_stored_training_gpu(api, monkeypatch):
     status.effective_preparation = runner_submit._effective_preparation_snapshot(
         JobSpec.from_dict(status.spec), replace(worker, gpu=replace(worker.gpu, type="H200")), None
     )
+    if legacy_teacher_default:
+        status.spec["train"]["teacher_model"] = ""
+        snapshot = status.effective_preparation
+        raw_worker = snapshot["worker_spec"]
+        raw_worker["train"]["teacher_model"] = ""
+        snapshot["preparation_digest"] = runner_preparation._preparation_digest(
+            JobSpec.from_dict(status.spec),
+            JobSpec.from_dict(raw_worker),
+            None,
+            stored_public=status.spec,
+            stored_worker=raw_worker,
+        )
     status.state = "done"
     # keep the internal worker-spec carrier: hf_repo + run_id (adapter identity) are platform-managed
     # and stripped from the public spec, so deploy resolves them from effective_preparation.

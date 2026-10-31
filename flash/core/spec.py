@@ -702,10 +702,10 @@ class JobSpec:
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> JobSpec:
-        """Decode a current persisted or internal job spec.
+        """Decode a persisted or internal job spec.
 
         Authored configuration goes through ``flash.schema.spec_from_dict``. This parser accepts
-        platform-managed fields but rejects keys outside the current internal schema.
+        platform-managed fields and the retired empty teacher default; other keys stay strict.
         """
         if not isinstance(data, dict):
             raise TypeError("job spec must be an object")
@@ -735,7 +735,12 @@ class JobSpec:
             if raw_package is not None
             else None
         )
-        train = validated_section(data, "train", {item.name for item in fields(TrainSpec)})
+        train = validated_section(
+            data, "train", {item.name for item in fields(TrainSpec)} | {"teacher_model"}
+        )
+        # Older writers included this unused default on SFT and GRPO records too.
+        if train.get("teacher_model", "") != "":
+            raise ValueError("persisted train.teacher_model must be the retired empty default")
         credit_assignment = (
             _coerce_credit_assignment(train["credit_assignment"])
             if "credit_assignment" in train

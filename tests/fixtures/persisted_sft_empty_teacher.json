@@ -1,0 +1,117 @@
+{
+  "state": "done",
+  "run_id": "legacy-sft-empty-teacher",
+  "spec": {
+    "model": "Qwen/Qwen3.5-9B",
+    "algorithm": "sft",
+    "environment": {
+      "id": "org/project/env",
+      "params": {},
+      "pip": [],
+      "secrets": []
+    },
+    "train": {
+      "epochs": 3,
+      "lora_rank": 32,
+      "lora_alpha": 64,
+      "init_from_adapter": "",
+      "learning_rate": 0.0001,
+      "batch_size": 16,
+      "prompts_per_step": null,
+      "max_context_tokens": 16384,
+      "save_every": null,
+      "max_steps": null,
+      "save_at_steps": [],
+      "max_examples": null,
+      "group_size": null,
+      "temperature": null,
+      "max_completion_tokens": null,
+      "kl_penalty_coef": null,
+      "thinking_length_penalty_coef": null,
+      "teacher_model": "",
+      "stop_sequences": [],
+      "structured_outputs": "",
+      "credit_assignment": "per_episode"
+    },
+    "gpu": {
+      "type": "H100",
+      "provider": "",
+      "count": 1
+    },
+    "seed": 42,
+    "thinking": false,
+    "wandb": {
+      "project": null,
+      "run_name": null
+    },
+    "project": "11111111-1111-4111-8111-111111111111"
+  },
+  "effective_preparation": {
+    "version": 1,
+    "worker_spec": {
+      "model": "Qwen/Qwen3.5-9B",
+      "algorithm": "sft",
+      "environment": {
+        "id": "org/project/env",
+        "params": {},
+        "pip": [],
+        "secrets": [],
+        "resolved_sha": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+      },
+      "train": {
+        "epochs": 3,
+        "lora_rank": 32,
+        "lora_alpha": 64,
+        "init_from_adapter": "",
+        "init_from_adapter_revision": "",
+        "hf_repo": "org/legacy-adapters",
+        "learning_rate": 0.0001,
+        "batch_size": 16,
+        "prompts_per_step": null,
+        "max_context_tokens": 16384,
+        "save_every": null,
+        "max_steps": null,
+        "save_at_steps": [],
+        "max_examples": null,
+        "group_size": null,
+        "temperature": null,
+        "max_completion_tokens": null,
+        "kl_penalty_coef": null,
+        "thinking_length_penalty_coef": null,
+        "teacher_model": "",
+        "stop_sequences": [],
+        "structured_outputs": "",
+        "credit_assignment": "per_episode"
+      },
+      "gpu": {
+        "type": "H100",
+        "disk_gb": 60,
+        "max_wall_seconds": 86400,
+        "max_retries": 5,
+        "network_volume": null,
+        "network_volume_gb": 100,
+        "provider": "",
+        "count": 1
+      },
+      "run_id": "legacy-sft-empty-teacher",
+      "seed": 42,
+      "thinking": false,
+      "wandb": {
+        "project": null,
+        "run_name": null
+      },
+      "model_revision": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "model_revision_auto": true,
+      "model_revision_force_pin": false,
+      "gpu_count_auto": false,
+      "workload_profile_input_digest": "",
+      "workload_profile_producer_version": "",
+      "workload_profile": {},
+      "project": "11111111-1111-4111-8111-111111111111"
+    },
+    "workload_profile": null,
+    "adapter_identity": null,
+    "preparation_digest": "63749add35edfae0851005c162e33e17123fe69f6f2553f24325b09f05c71bd7",
+    "backend": "freesolo"
+  }
+}
