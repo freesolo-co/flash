@@ -1410,6 +1410,57 @@ def test_clean_multimodal_row_reuses_the_validated_prepared_probe(monkeypatch):
     assert processor.probe_renders == 1
 
 
+def test_image_row_payload_keeps_processor_metadata_but_not_pixels(monkeypatch):
+    from flash.engine.profiling import sft_image_rows
+
+    np = pytest.importorskip("numpy")
+
+    class _PixelProcessor(_PreparedSourceProcessor):
+        def apply_chat_template(self, messages, **kwargs):
+            result = super().apply_chat_template(messages, **kwargs)
+            if isinstance(result, dict):
+                result = {
+                    **result,
+                    "pixel_values": np.ones((640, 1536), dtype=np.float32),
+                    "image_grid_thw": np.asarray([[1, 20, 32]], dtype=np.int64),
+                }
+            return result
+
+    tokenizer = _ExactChatMlTokenizer()
+    prepared_image = SimpleNamespace(close=lambda: None)
+    processor = _PixelProcessor(tokenizer, prepared_image)
+    monkeypatch.setattr(
+        sft_image_rows, "decode_image_descriptors", lambda descriptors, root: [prepared_image]
+    )
+
+    _ids, _mask, payload, _length, _role_aware = sft_image_rows.process_sft_image_row(
+        processor,
+        [{"role": "user", "content": [{"type": "image"}]}],
+        [
+            {
+                "role": "assistant",
+                "content": "answer",
+                "tool_calls": [
+                    {
+                        "type": "function",
+                        "function": {"name": "lookup", "arguments": '{"city":"london"}'},
+                    }
+                ],
+            }
+        ],
+        ["descriptor"],
+        package_root=None,
+        max_length=4096,
+        thinking=False,
+    )
+
+    # a 498x321 screenshot's pixels are ~3.9 MB; the stored row keeps only the small grid.
+    assert len(payload) < 4096
+    with np.load(io.BytesIO(payload), allow_pickle=False) as arrays:
+        assert arrays.files == ["image_grid_thw"]
+        assert arrays["image_grid_thw"].tolist() == [[1, 20, 32]]
+
+
 def test_exact_mask_keeps_prompt_assistant_history_masked_and_full_target_active():
     tokenizer = _ExactTokenizer()
     prompt = "<user>q</user><assistant>history</assistant><assistant>"
@@ -1509,10 +1560,13 @@ def test_explicit_schema_and_custom_dataset_read_text_image_orders(
     fake_torch.cat = lambda values, dim=0: FakeTensor(
         np.concatenate([value.value for value in values], axis=dim)
     )
+    image_module = pytest.importorskip("PIL.Image")
+    image_path = tmp_path / "image.png"
+    image_module.new("RGB", (4, 4), (200, 10, 10)).save(image_path, format="PNG")
     image_row = {
         "input_ids": [20, 21, 22],
         "loss_mask": [0, 1, 1],
-        "images": ["file:///tmp/image.png"],
+        "images": [image_path.as_uri()],
         "multimodal_inputs": _serialize_multimodal_inputs(
             {"image_grid_thw": np.asarray([[1, 2, 3]], dtype=np.int64)}
         ),
@@ -1549,7 +1603,14 @@ def test_explicit_schema_and_custom_dataset_read_text_image_orders(
         monkeypatch.setitem(sys.modules, name, injected)
 
     class Qwen2VLImageProcessorFake:
-        pass
+        # the worker stores no pixel tensors; the child rebuilds them from the saved image file.
+        def __call__(self, images, return_tensors):
+            assert return_tensors == "pt"
+            assert [(image.mode, image.size) for image in images] == [("RGB", (4, 4))]
+            return {
+                "pixel_values": FakeTensor(np.ones((4, 6), dtype=np.float32)),
+                "image_grid_thw": FakeTensor(np.asarray([[1, 2, 3]], dtype=np.int64)),
+            }
 
     module = _load_custom_dataset_module(tmp_path)
     dataset = module.FlashTokenizedSFTDataset(
@@ -1568,6 +1629,9 @@ def test_explicit_schema_and_custom_dataset_read_text_image_orders(
     assert len(second["position_ids"].tolist()) == 4
     image_item = first if image_first else second
     assert image_item["multi_modal_inputs"]["image_grid_thw"].tolist() == [[1, 2, 3]]
+    assert image_item["multi_modal_inputs"]["pixel_values"].tolist() == [[1.0] * 6] * 4
+    text_item = second if image_first else first
+    assert "pixel_values" not in text_item["multi_modal_inputs"]
 
 
 def test_mrope_processor_check_matches_every_image_training_model():

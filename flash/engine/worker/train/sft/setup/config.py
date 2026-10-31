@@ -165,7 +165,8 @@ def _sft_parquet_features():
             "input_ids": Sequence(Value("int64")),
             "loss_mask": Sequence(Value("int8")),
             "images": Sequence(Value("string")),
-            "multimodal_inputs": Value("binary"),
+            # 64-bit offsets: a 32-bit binary column overflows past 2 GiB per dataset.
+            "multimodal_inputs": Value("large_binary"),
         }
     )
 
