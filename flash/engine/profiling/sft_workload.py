@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any, Protocol, TypedDict, cast
 
 from flash.content.multimodal import NormalizedImages
+from flash.content.processor import inherit_tokenizer_chat_template
 from flash.content.thinking import messages_for_chat_template
 from flash.engine.plan.recipe import RECIPE
 from flash.engine.plan.steps import resolve_update_horizon, sft_update_steps
@@ -190,11 +191,11 @@ def _default_processor_loader(model_id: str, revision: str):
 
     from flash.engine.support.huggingface import model_revision_kwargs
 
-    return AutoProcessor.from_pretrained(
-        model_id,
-        trust_remote_code=True,
-        **model_revision_kwargs(revision),
+    processor = AutoProcessor.from_pretrained(
+        model_id, trust_remote_code=True, **model_revision_kwargs(revision)
     )
+    inherit_tokenizer_chat_template(processor)
+    return processor
 
 
 def _packing_mode(

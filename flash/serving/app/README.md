@@ -278,7 +278,7 @@ selection and customer-owned serving profiles are separate.
 | Qwen3.8-27B | official native FP8 (`Qwen/Qwen3.8-27B-FP8`) | H100 | 16 × 64 | 262144 |
 | Qwen3.6-35B-A3B (MoE, VL) | official bf16 | H200 | 6 × 64 | 262144 |
 
-The context budget includes prompt and generated output. All five Qwen checkpoints use
+The context budget includes prompt and generated output. All six Qwen checkpoints use
 their native 262,144-token window without RoPE scaling. Eight admitted sequences share
 GPU KV memory; long requests can queue or be preempted as that memory fills.
 
