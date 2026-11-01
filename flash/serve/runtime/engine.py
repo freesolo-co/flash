@@ -12,9 +12,9 @@ from dataclasses import dataclass
 from typing import Any
 
 from flash.content.processor import inherit_tokenizer_chat_template
+from flash.content.stop_tokens import chat_stop_token_ids
 from flash.content.structured_options import vllm_structured_kwargs
 from flash.serve.request.runtime_support import reasoning_compatibility_guard
-from flash.serve.request.stop_tokens import chat_stop_token_ids
 from flash.serve.request.tool_calls import tools_active
 
 from .adapters import AdapterBinding, AdapterManager

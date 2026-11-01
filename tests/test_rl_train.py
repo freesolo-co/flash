@@ -3793,6 +3793,7 @@ def _capability_resolve(
     gpu_count=1,
     *,
     worker_context,
+    eos_token_ids=frozenset({151645}),
 ):
     """run the resolver against one env, with everything else on the supported path."""
     from flash.core.spec import JobSpec
@@ -3840,9 +3841,63 @@ def _capability_resolve(
     # so on a machine without one (a clean CI runner) they raise instead of resolving. The tests
     # using this helper assert on turn/agent-loop wiring, not on which ids halt a rollout.
     monkeypatch.setattr(
-        rl_inputs, "generation_eos_from_cached_config", lambda *a, **k: frozenset({151645})
+        rl_inputs, "generation_eos_from_cached_config", lambda *a, **k: frozenset(eos_token_ids)
     )
     return rl_inputs._resolve_grpo_inputs(context=worker_context)
+
+
+@pytest.mark.parametrize("stop_sequences", [(), ("</answer>",)])
+@pytest.mark.parametrize(
+    ("model", "multi_turn", "metadata_ids", "expected_ids"),
+    [
+        ("Qwen/Qwen3.5-9B-Base", True, {248044, 99}, {248044, 248046, 99}),
+        ("Qwen/Qwen3.5-9B", True, {248046}, {248046}),
+        ("Qwen/Qwen3.5-9B-Base", False, {248044}, set()),
+    ],
+)
+def test_grpo_chat_boundaries_reach_child_sampling_and_turn_validation(
+    worker_context, monkeypatch, stop_sequences, model, multi_turn, metadata_ids, expected_ids
+):
+    monkeypatch.setattr(_CapabilityTokenizer, "unk_token_id", None, raising=False)
+    monkeypatch.setattr(_CapabilityTokenizer, "convert_tokens_to_ids", lambda self, token: 248046)
+    inp = _capability_resolve(
+        monkeypatch,
+        _capability_env(multi_turn=multi_turn),
+        train={"stop_sequences": list(stop_sequences)},
+        model=model,
+        worker_context=worker_context,
+        eos_token_ids=metadata_ids,
+    )
+    assert inp["eos_token_ids"] == expected_ids
+    assert inp["stop_sequences"] == stop_sequences
+    if not multi_turn:
+        return
+    emitted = rl_multi.multi_turn_child_env(inp, reward_url="http://bridge.invalid", thinking=False)
+    for key, value in emitted.items():
+        monkeypatch.setenv(key, value)
+    settings = grpo_multiturn._EpisodeSettings()
+    sampling = grpo_multiturn._turn_sampling_params(
+        {"temperature": 0.7},
+        max_tokens=2,
+        eos_token_ids=settings.eos_token_ids,
+        stop_sequences=settings.stop_sequences,
+    )
+    assert sampling["stop_token_ids"] == sorted(expected_ids)
+    assert sampling.get("stop", []) == list(stop_sequences)
+    assert sampling["temperature"] == 0.7
+    tokenizer = SimpleNamespace(decode=lambda ids, **kwargs: "action")
+    for ending in expected_ids | {8}:
+        turn = grpo_multiturn.prepare_assistant_turn(
+            tokenizer,
+            [7, ending],
+            stop_reason="completed",
+            max_tokens=2,
+            eos_token_ids=settings.eos_token_ids,
+            stop_sequences=settings.stop_sequences,
+        )
+        # A boundary at the exact cap is still a usable action; an actual cutoff is not.
+        assert turn["truncated"] is (ending not in expected_ids)
+        assert turn["termination"] == ("eos" if ending in expected_ids else "truncated")
 
 
 def test_capability_guard_rejects_tool_env(worker_context, monkeypatch):

@@ -10,7 +10,7 @@ import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable
 from typing import Any, NotRequired, TypedDict
 
-from flash.serve.request.stop_tokens import chat_stop_token_ids
+from flash.content.stop_tokens import chat_stop_token_ids
 from flash.serve.request.tool_calls import (
     normalize_tools,
     tools_active,
