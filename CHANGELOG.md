@@ -30,6 +30,13 @@ This file starts at 1.1.35. Earlier releases are not reconstructed here; use
 
 ### Added
 
+- SFT rows accept `tools`: OpenAI-style function declarations, validated and normalized exactly
+  as a chat request's `tools`. They are rendered through the chat template into every training
+  view of the row (transcript, prompt boundary and loss-mask probe), so a tool-calling adapter
+  trains on the prompt it is served with. Previously every SFT row rendered without tools, so for
+  Qwen3.5 the `# Tools` block that serving prepends to the system turn never appeared in
+  training. The block is prompt only, so supervised tokens are unchanged. Rows without `tools`
+  render as before; `tools` on an image-bearing row is refused.
 - Custom training rows accept a rectangular `target_tokens` matrix, `[len(tokens)-1, K]`
   with K up to 64, scoring K tokens at every position instead of the next token. `weights`
   then has the same shape and logprobs come back with it, so `forward_backward` computes

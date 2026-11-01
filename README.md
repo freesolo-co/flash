@@ -252,8 +252,14 @@ The estimate tokenizes raw `input`/`output` fields plus the statically readable 
 contract. SFT rows can instead supply `prompt_messages`, a nonempty chat-message list
 that is authoritative for both profiling and training. This preserves stored multi-turn
 histories and screenshot blocks; image-bearing transcripts use unpacked execution.
-The row still requires `input` for dataset identity. Environment-added prompts, few-shot
-examples, tool schemas, filters, and transformations are **not** executed, so real training
+The row still requires `input` for dataset identity. A row for a tool-calling agent can also
+supply `tools`, the same OpenAI-style function declarations a chat request sends. Flash
+validates them as serving does and renders them into the row's prompt through the chat template,
+so the adapter trains on the prompt it is served with: Qwen3.5, for example, prepends a
+`# Tools` block to the system turn. The block is prompt, not target, so it lengthens rows
+without adding supervised tokens. Without `tools`, a row trained for a tool-calling deployment
+never sees that block. Environment-added prompts, few-shot
+examples, environment-built tool schemas, filters, and transformations are **not** executed, so real training
 can retain fewer rows, truncate more often, and cost more than the estimate. If no readable dataset exists, cost, dry-run, and
 submit all fail before GPU allocation rather than billing a profiling run.
 

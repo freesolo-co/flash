@@ -44,6 +44,7 @@ from flash.engine.worker.model.packing import (
     probe_is_gdn_hybrid,
     probe_is_pure_attention,
 )
+from flash.serve.request.tool_calls import normalize_tools, tools_wire
 
 
 @dataclass
@@ -335,6 +336,24 @@ def _sft_completion_with_provenance(env, example: dict) -> tuple[list[dict], boo
     return env.sft_completion(example), False
 
 
+def _sft_row_tools(example) -> list[dict[str, Any]] | None:
+    """The tool declarations an SFT row trains against, in the form serving renders them.
+
+    A tool-calling agent is served with ``tools=``, and the chat template renders those
+    declarations into the prompt (Qwen3.5 prepends a ``# Tools`` block to the system turn). A row
+    rendered without them trains on a prompt the deployed adapter never sees. A row may therefore
+    carry ``tools`` -- the same per-example field as OpenAI fine-tuning data -- which is validated
+    and normalized exactly as a chat request's ``tools`` are, then rendered into every training view
+    of the row. A row without ``tools`` renders as before.
+    """
+    if not isinstance(example, dict) or example.get("tools") is None:
+        return None
+    try:
+        return tools_wire(normalize_tools(example["tools"]))
+    except ValueError as exc:
+        raise ValueError(f"sft tools: {exc}") from exc
+
+
 def _encoded_length(tokenizer, text: str) -> int:
     """Token count of ``text``, for either the batched or unbatched ``input_ids`` shape.
 
@@ -417,22 +436,29 @@ def _text_sft_row_spec(
     max_length: int,
     row_index: int,
     multiturn: bool,
+    tools: list[dict[str, Any]] | None = None,
 ) -> tuple[str, _RowReasoning, dict[str, Any]]:
     normalized_prompt = messages_for_chat_template(prompt_messages)
     normalized_completion = messages_for_chat_template(completion_messages)
     normalized_source = [*normalized_prompt, *normalized_completion]
-    text = render_transcript(normalized_source)
+    # every view of the row -- full transcript, prompt boundary, reasoning probe and the loss
+    # mask's field probe (via template_kwargs) -- renders with the same tools, so the supervised
+    # tokens are located in exactly the text that is trained on.
+    template_kwargs: dict[str, Any] = {"enable_thinking": spec.thinking, "preserve_thinking": False}
+    if tools is not None:
+        template_kwargs["tools"] = tools
+    render = partial(render_transcript, tools=tools)
+    text = render(normalized_source)
     prompt_text = tokenizer.apply_chat_template(
         normalized_prompt,
         tokenize=False,
         add_generation_prompt=True,
-        enable_thinking=spec.thinking,
-        preserve_thinking=False,
+        **template_kwargs,
     )
     reasoning = _row_reasoning(
         prompt_messages,
         completion_messages,
-        render=render_transcript,
+        render=render,
         tokenizer=tokenizer,
         max_length=max_length,
     )
@@ -444,7 +470,7 @@ def _text_sft_row_spec(
             "prompt_text": prompt_text,
             "target_messages": normalized_completion,
             "source_messages": normalized_source,
-            "template_kwargs": {"enable_thinking": spec.thinking, "preserve_thinking": False},
+            "template_kwargs": template_kwargs,
             # measurement carried alongside the row rather than in it: the parquet row is built from
             # an explicit key list below, so neither key reaches verl.
             "row_index": row_index,
@@ -481,13 +507,15 @@ def _tokenize_prompt_rows(
     # denominator. summed after filtering instead.
     reasoning_by_index: dict[int, _RowReasoning] = {}
 
-    def render_transcript(messages: list[dict]) -> str:
+    def render_transcript(messages: list[dict], tools: list[dict[str, Any]] | None = None) -> str:
+        extra = {} if tools is None else {"tools": tools}
         return tokenizer.apply_chat_template(
             messages_for_chat_template(messages),
             tokenize=False,
             add_generation_prompt=False,
             enable_thinking=spec.thinking,
             preserve_thinking=False,
+            **extra,
         )
 
     for row_index, (
@@ -498,6 +526,8 @@ def _tokenize_prompt_rows(
     ) in enumerate(prompt_rows):
         has_images = record_has_images(example, prompt_messages)
         _reject_image_completion(completion_messages, image_bearing=has_images)
+        # validated (and image rows refused) when the rows were collected in prepare_sft_workload
+        tools = _sft_row_tools(example)
         # read before the image branch rewrites `completion_messages` to its text-only form.
         multiturn = len(completion_messages) > 1
         if multiturn:
@@ -561,6 +591,7 @@ def _tokenize_prompt_rows(
                 max_length=max_length,
                 row_index=row_index,
                 multiturn=multiturn,
+                tools=tools,
             )
             sampled_texts.append(text)
             reasoning_by_index[row_index] = reasoning
@@ -913,6 +944,12 @@ def prepare_sft_workload(
         else:
             prompt_messages = env.prompt_messages(example)
         completion_messages, coerced_scalar_output = _sft_completion_with_provenance(env, example)
+        # validate tools before any tokenizer or processor is resolved, so a bad declaration fails
+        # the profile with its own message rather than surfacing as a tokenizer-capability error.
+        if _sft_row_tools(example) is not None and record_has_images(example, prompt_messages):
+            # the image pipeline tokenizes through the processor's own render; refusing keeps it
+            # from silently training an image row without the declarations it was given.
+            raise ValueError("sft tools are not supported on image-bearing rows")
         prompt_rows.append((example, prompt_messages, completion_messages, coerced_scalar_output))
     package_root = getattr(env, "package_root", None)
     multimodal = any(
