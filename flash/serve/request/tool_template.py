@@ -1,8 +1,7 @@
 """the text the qwen tool template renders around an assistant turn's call blocks.
 
-replay validation has to see the same prefix the model does. the parser selects the first complete
-`<tool_call>` marker in the turn, so a marker anywhere ahead of the call blocks steals the parse,
-and a marker the template discards must not be validated as though it survived.
+Replay validates the rendered answer prefix. Reasoning is counted toward the full
+rendered size, but only text after its first close can contain executable tools.
 """
 
 from __future__ import annotations
@@ -55,7 +54,9 @@ def last_query_index(messages: Sequence[Mapping[str, Any]]) -> int:
     return len(messages) - 1
 
 
-def rendered_turn_prefix(message: Mapping[str, Any], with_reasoning: bool) -> str:
+def rendered_turn_prefix(
+    message: Mapping[str, Any], with_reasoning: bool, *, answer_only: bool = False
+) -> str:
     """the text the template renders before this turn's call blocks."""
     # deriving the prefix from the same normalization the prompt path applies is what keeps this
     # exact. validating the raw request fields instead would reject a turn whose markers the
@@ -84,6 +85,8 @@ def rendered_turn_prefix(message: Mapping[str, Any], with_reasoning: bool) -> st
     # earlier turn's reasoning is dropped, so including it would reject a replayable turn.
     if with_reasoning and reasoning:
         prefix += f"{THINK_START}\n{reasoning}\n{THINK_END}\n\n"
+        if answer_only:
+            prefix = prefix.partition(THINK_END)[2]
     if content:
         prefix += f"{content}\n\n"
     return prefix

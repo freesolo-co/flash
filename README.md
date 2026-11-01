@@ -256,6 +256,12 @@ and unions on top-level function arguments are unsupported. Top-level arguments 
 native parameter text, where a string such as `"12"` and a number would be ambiguous;
 nested JSON preserves those types during generation, streaming, and history replay.
 
+Qualified Qwen tool-calling routes support thinking-enabled generation. Tool calls are
+parsed only after the first `</think>`; tool-like text inside reasoning stays in
+`reasoning_content`. A response that ends before that boundary cannot execute tools.
+Streaming preserves the same separation, and saved adapters retain their configured
+thinking mode. Tools still cannot be combined with logprobs or structured outputs.
+
 ### Workload estimates (SFT)
 
 `flash train`, `--dry-run`, and `--cost` read the pinned environment's packaged dataset

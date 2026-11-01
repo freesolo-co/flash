@@ -1299,3 +1299,66 @@ def test_stream_cleanup_failure_still_releases_prompt_images(monkeypatch) -> Non
             await runtime.close()
 
     asyncio.run(run())
+
+
+@pytest.mark.parametrize("streaming", [False, True])
+@pytest.mark.parametrize("adapter", [False, True])
+def test_thinking_tools_use_answer_only_and_preserve_reasoning(adapter_dir, streaming, adapter):
+    runtime = VllmLoraRuntime(EngineConfig(model="Qwen/Qwen3.5-9B", tool_parser="qwen3_coder"))
+    asyncio.run(runtime.start())
+    engine = _Engine.latest
+    if adapter:
+        asyncio.run(
+            runtime.register_adapter(
+                AdapterSpec(
+                    adapter_id="adapter",
+                    path=str(adapter_dir),
+                    incarnation="incarnation-1",
+                    thinking=True,
+                )
+            )
+        )
+    call = "<tool_call><function=weather><parameter=city>Paris</parameter></function></tool_call>"
+    text = call + "</think>" + call
+    if streaming:
+        engine.responses.append(
+            [
+                _output(c, [i + 1], finish_reason="stop" if i == len(text) - 1 else None)
+                for i, c in enumerate(text)
+            ]
+        )
+    else:
+        engine.responses.append([_output(text, list(range(1, len(text) + 1)))])
+    request = GenerationRequest(
+        messages=[{"role": "user", "content": "weather"}],
+        tools=TOOLS,
+        tool_choice="auto",
+        parallel_tool_calls=True,
+        thinking=not adapter,
+        adapter_id="adapter" if adapter else None,
+        expected_incarnation="incarnation-1" if adapter else None,
+    )
+    if streaming:
+
+        async def collect():
+            return [event async for event in runtime.stream(request)]
+
+        events = asyncio.run(collect())
+        result = events[-1]
+        assert (
+            "".join(event.text for event in events if isinstance(event, StreamDelta))
+            == call + "</think>"
+        )
+        assert (
+            sum(bool(event.tool_calls) for event in events if isinstance(event, StreamDelta)) == 1
+        )
+    else:
+        result = asyncio.run(runtime.generate(request))
+    assert result.thinking is True
+    assert runtime._tokenizer.template_calls[-1]["enable_thinking"] is True
+    assert result.completion_tokens == len(text)
+    assert result.choices[0].text == call + "</think>"
+    assert result.choices[0].finish_reason == "tool_calls"
+    assert len(result.choices[0].tool_calls) == 1
+    assert result.choices[0].tool_calls[0].arguments == '{"city":"Paris"}'
+    asyncio.run(runtime.close())

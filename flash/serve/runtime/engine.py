@@ -30,8 +30,9 @@ from .prompt import (
     effective_chat_template_kwargs,
     resolve_thinking,
 )
+from .reasoning_tools import ReasoningToolStreamParser, parse_tool_output
 from .sampling import complete_indexed_outputs, indexed_outputs, normalize_token_logprobs
-from .tool_calls import ParsedToolCall, ToolCallStreamParser, parse_qwen3_coder_output
+from .tool_calls import ParsedToolCall
 from .types import (
     AdapterSpec,
     EngineConfig,
@@ -61,7 +62,7 @@ class _StructuredState:
 class _ChoiceStreamState:
     token_ids: list[int]
     logprobs: list[dict[str, Any]]
-    tool_parser: ToolCallStreamParser | None = None
+    tool_parser: ReasoningToolStreamParser | None = None
     text: str = ""
     finish_reason: str | None = None
     tool_calls: tuple[Any, ...] = ()
@@ -78,7 +79,9 @@ class _StreamState:
     cached_reported: bool = False
 
     @classmethod
-    def create(cls, n: int, top_logprobs: int, tools: Any = None) -> _StreamState:
+    def create(
+        cls, n: int, top_logprobs: int, tools: Any = None, *, thinking: bool = False
+    ) -> _StreamState:
         return cls(
             n=n,
             top_logprobs=top_logprobs,
@@ -86,7 +89,9 @@ class _StreamState:
                 index: _ChoiceStreamState(
                     token_ids=[],
                     logprobs=[],
-                    tool_parser=ToolCallStreamParser(tools) if tools is not None else None,
+                    tool_parser=ReasoningToolStreamParser(tools, thinking=thinking)
+                    if tools is not None
+                    else None,
                 )
                 for index in range(n)
             },
@@ -159,7 +164,7 @@ class _StreamState:
 
 
 def _generation_choice(
-    index: int, output: Any, *, top_logprobs: int, tools: Any = None
+    index: int, output: Any, *, top_logprobs: int, tools: Any = None, thinking: bool = False
 ) -> GenerationChoice:
     token_ids = tuple(int(value) for value in (getattr(output, "token_ids", None) or []))
     finish_reason = getattr(output, "finish_reason", None)
@@ -168,7 +173,7 @@ def _generation_choice(
     text = str(getattr(output, "text", "") or "")
     tool_calls: tuple[ParsedToolCall, ...] = ()
     if tools is not None:
-        parsed = parse_qwen3_coder_output(text, tools)
+        parsed = parse_tool_output(text, tools, thinking=thinking)
         if parsed.tools_called:
             text = parsed.content or ""
             tool_calls = parsed.calls
@@ -366,6 +371,7 @@ class VllmLoraRuntime:
                 output,
                 top_logprobs=request.top_logprobs,
                 tools=request.tools if tools_active(request.tools, request.tool_choice) else None,
+                thinking=bool(thinking),
             )
             for index, output in sorted(complete_indexed_outputs(final_output, n=request.n).items())
         )
@@ -418,6 +424,7 @@ class VllmLoraRuntime:
                     request.n,
                     request.top_logprobs,
                     request.tools if tools_active(request.tools, request.tool_choice) else None,
+                    thinking=bool(thinking),
                 )
                 output = first_output
                 while True:
@@ -583,8 +590,6 @@ class VllmLoraRuntime:
     def _validate_tools(self, request: GenerationRequest, thinking: bool | None) -> None:
         if not tools_active(request.tools, request.tool_choice):
             return
-        if thinking:
-            raise PromptError("tools are not supported for thinking-enabled generation")
         if self.config.tool_parser != "qwen3_coder":
             raise PromptError("this serving engine is not qualified for tool calling")
 
