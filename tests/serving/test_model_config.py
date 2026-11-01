@@ -25,6 +25,7 @@ def test_catalog_has_only_canary_qualified_active_models() -> None:
         "Qwen/Qwen3.5-0.8B",
         "Qwen/Qwen3.5-4B",
         "Qwen/Qwen3.5-9B",
+        "Qwen/Qwen3.5-9B-Base",
         "Qwen/Qwen3.8-27B",
         "Qwen/Qwen3.6-35B-A3B",
     }
@@ -40,6 +41,7 @@ def test_every_catalog_model_has_an_intentional_image_classification() -> None:
     image_models = {model for model in base_models() if supports_image_input(model)}
     assert image_models == {
         "Qwen/Qwen3.5-9B",
+        "Qwen/Qwen3.5-9B-Base",
         "Qwen/Qwen3.8-27B",
         "Qwen/Qwen3.6-35B-A3B",
     }

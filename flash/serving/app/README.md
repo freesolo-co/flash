@@ -274,6 +274,7 @@ selection and customer-owned serving profiles are separate.
 | Qwen3.5-0.8B | official bf16 | L4 | 4 × 64 | 262144 |
 | Qwen3.5-4B | official bf16 | L40S | 4 × 64 | 262144 |
 | Qwen3.5-9B | owned FP8 (`Freesolo-Co/*-FP8`) | L40S | 16 × 128 | 262144 |
+| Qwen3.5-9B-Base | official pretrained BF16 | H100 | 16 × 128 | 262144 |
 | Qwen3.8-27B | official native FP8 (`Qwen/Qwen3.8-27B-FP8`) | H100 | 16 × 64 | 262144 |
 | Qwen3.6-35B-A3B (MoE, VL) | official bf16 | H200 | 6 × 64 | 262144 |
 

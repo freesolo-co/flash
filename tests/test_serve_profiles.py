@@ -159,6 +159,7 @@ def test_profile_matches_the_catalog_serving_capacity(model_id: str) -> None:
             "Qwen/Qwen3.5-0.8B": "L4",
             "Qwen/Qwen3.5-4B": "L40S",
             "Qwen/Qwen3.5-9B": "L40S",
+            "Qwen/Qwen3.5-9B-Base": "H100",
             "Qwen/Qwen3.8-27B": "H100",
             "Qwen/Qwen3.6-35B-A3B": "H200",
         }[model_id]
@@ -169,12 +170,13 @@ def test_profile_matches_the_catalog_serving_capacity(model_id: str) -> None:
             "Qwen/Qwen3.5-0.8B": "L40S",
             "Qwen/Qwen3.5-4B": "H100",
             "Qwen/Qwen3.5-9B": "L40S",
+            "Qwen/Qwen3.5-9B-Base": "H100",
             "Qwen/Qwen3.8-27B": "H100",
             "Qwen/Qwen3.6-35B-A3B": "H200",
         }[model_id]
     )
     assert profile.modal_live_qualified is (
-        model_id not in {"Qwen/Qwen3.5-0.8B", "Qwen/Qwen3.5-4B"}
+        model_id not in {"Qwen/Qwen3.5-0.8B", "Qwen/Qwen3.5-4B", "Qwen/Qwen3.5-9B-Base"}
     )
 
 

@@ -12,7 +12,7 @@ from tests.test_modal_provider import AsyncMethod
 
 
 def test_warmer_downloads_catalog_pins_and_default_revisions(monkeypatch):
-    models = ["Qwen/Qwen3.8-27B", "Qwen/Qwen3.5-9B"]
+    models = ["Qwen/Qwen3.8-27B", "Qwen/Qwen3.5-9B", "Qwen/Qwen3.5-9B-Base"]
     downloads = []
 
     def create(*args, **kwargs):

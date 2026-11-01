@@ -87,12 +87,13 @@ def stage_environment(hub, repo, root):
     return environment, rows
 
 
-def prepare(hub, repo, run_id, volume, root, gpu):
+def prepare(hub, repo, run_id, volume, root, gpu, model="Qwen/Qwen3.5-9B"):
     from importlib.metadata import version
 
     environment, rows = stage_environment(hub, repo, root)
-    model = "Qwen/Qwen3.5-9B"
-    revision = hub.model_info(model).sha
+    from flash.core.catalog import get_model
+
+    revision = get_model(model).managed_revision or hub.model_info(model).sha
     producer = version("freesolo-flash")
     spec = JobSpec(
         run_id=run_id,
@@ -134,7 +135,7 @@ def prepare(hub, repo, run_id, volume, root, gpu):
     )
 
 
-def run(repo, gpu):
+def run(repo, gpu, model="Qwen/Qwen3.5-9B"):
     hub = HfApi()
     if not hub.repo_info(repo, repo_type="dataset").private:
         raise ValueError("qualification requires a disposable private dataset repository")
@@ -159,7 +160,7 @@ def run(repo, gpu):
         with tempfile.TemporaryDirectory(prefix="flash-modal-sft-") as directory:
             root = Path(directory) / "environment"
             root.mkdir()
-            spec = prepare(hub, repo, run_id, volume, root, gpu)
+            spec = prepare(hub, repo, run_id, volume, root, gpu, model)
             snapshot = publish_source_snapshot(repo)
             first = jobs.submit_attempt(
                 spec,
@@ -213,6 +214,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--repo", required=True)
     parser.add_argument("--gpu", choices=("L40S", "H100"), default="L40S")
+    parser.add_argument("--model", default="Qwen/Qwen3.5-9B")
     parser.add_argument("--run-paid-test", action="store_true", required=True)
     args = parser.parse_args()
-    run(args.repo, args.gpu)
+    run(args.repo, args.gpu, args.model)
