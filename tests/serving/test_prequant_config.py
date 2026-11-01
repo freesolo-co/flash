@@ -29,6 +29,7 @@ def test_official_fp8_contains_the_active_27b_and_35b_moe_defaults() -> None:
     assert set(FP8_SERVE_MODEL_REPOS) == set(base_models()) - {
         "Qwen/Qwen3.5-0.8B",
         "Qwen/Qwen3.5-4B",
+        "Qwen/Qwen3.5-9B-Base",
     }
 
 

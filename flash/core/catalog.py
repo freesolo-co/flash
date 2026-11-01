@@ -16,6 +16,7 @@ _ON_POLICY_ALGORITHMS = frozenset({"grpo"})
 _IMAGE_TRAINING_MODELS = frozenset(
     {
         "Qwen/Qwen3.5-9B",
+        "Qwen/Qwen3.5-9B-Base",
         "Qwen/Qwen3.8-27B",
         "Qwen/Qwen3.6-35B-A3B",
     }
@@ -218,6 +219,7 @@ SERVING_MODEL_REPOS: dict[str, str] = {
     "Qwen/Qwen3.5-0.8B": "Qwen/Qwen3.5-0.8B",
     "Qwen/Qwen3.5-4B": "Qwen/Qwen3.5-4B",
     "Qwen/Qwen3.5-9B": "Freesolo-Co/Qwen3.5-9B-FP8",
+    "Qwen/Qwen3.5-9B-Base": "Qwen/Qwen3.5-9B-Base",
     "Qwen/Qwen3.8-27B": "Qwen/Qwen3.8-27B-FP8",
     "Qwen/Qwen3.6-35B-A3B": "Qwen/Qwen3.6-35B-A3B",
 }
@@ -530,6 +532,32 @@ MODELS: dict[str, ModelInfo] = {
         "VRAM); colocated GRPO needs the 180 GB B200 (trainer + vLLM rollout = two 70 GB copies).",
     ),
 }
+
+
+# The pretrained checkpoint has the same architecture and native chat template as 9B,
+# but distinct weights, EOS metadata, and adapter identity. Never serve it via the
+# post-trained model's FP8 repository.
+MODELS["Qwen/Qwen3.5-9B-Base"] = replace(
+    MODELS["Qwen/Qwen3.5-9B"],
+    id="Qwen/Qwen3.5-9B-Base",
+    display_name="Qwen3.5 9B Base (pretrained)",
+    managed_revision="68c46c4b3498877f3ef123c856ecfde50c39f404",
+    serving=ServingCapacity(
+        gpu="H100",
+        serve_model_id="Qwen/Qwen3.5-9B-Base",
+        max_loras=16,
+        max_cpu_loras=16,
+        max_lora_rank=128,
+        max_model_len=262144,
+        max_num_seqs=8,
+        tensor_parallel_size=1,
+        gpu_memory_utilization=0.90,
+        image_limit=MAX_IMAGES_PER_CONVERSATION,
+    ),
+    notes="Pretrained-only Qwen3.5 9B; bf16 LoRA SFT/GRPO. Uses its own weights and "
+    "tokenizer, not the post-trained 9B. Native chat/thinking formatting is available for "
+    "fine-tuning; instruction following and reasoning are not post-trained. BF16 serving on H100.",
+)
 
 
 def list_models() -> list[ModelInfo]:

@@ -22,6 +22,7 @@ import flash.engine.worker.model.decoding as _worker_decoding
 import flash.engine.worker.perf as _worker_perf
 import flash.engine.worker.train.rl.launch.config as _worker_config
 from flash.adapters.targets import LoraTargeting, resolve_lora_targeting
+from flash.content.processor import inherit_tokenizer_chat_template
 from flash.content.structured_outputs import (
     describe_structured_outputs,
     parse_structured_outputs,
@@ -532,6 +533,7 @@ def _resolve_grpo_inputs(*, context: WorkerContext):
         processor = AutoProcessor.from_pretrained(
             model_id, trust_remote_code=True, **_worker_hf.model_revision_kwargs(model_revision)
         )
+        inherit_tokenizer_chat_template(processor)
         tok = processor.tokenizer
         image_pad_token_id = resolve_image_pad_token_id(processor, tok)
     else:

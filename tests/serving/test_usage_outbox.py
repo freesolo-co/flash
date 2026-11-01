@@ -203,6 +203,11 @@ def test_freesolo_prices_match_committed_catalog_fixed_point_contract() -> None:
             "cached_prompt_token_usd": "0.0000000276",
             "completion_token_usd": "0.0000001425",
         },
+        "Qwen/Qwen3.5-9B-Base": {
+            "prompt_token_usd": "0.000000095",
+            "cached_prompt_token_usd": "0.0000000276",
+            "completion_token_usd": "0.0000001425",
+        },
         "Qwen/Qwen3.8-27B": {
             "prompt_token_usd": "0.0000003325",
             "cached_prompt_token_usd": "0.00000003325",

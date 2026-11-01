@@ -57,7 +57,8 @@ class FunctionTool:
 
 
 def qualified_tool_parser(base_model: str) -> str | None:
-    return TOOL_PARSER_QWEN3_CODER if base_model == "Qwen/Qwen3.5-9B" else None
+    supported = {"Qwen/Qwen3.5-9B", "Qwen/Qwen3.5-9B-Base"}
+    return TOOL_PARSER_QWEN3_CODER if base_model in supported else None
 
 
 def normalize_tools(
