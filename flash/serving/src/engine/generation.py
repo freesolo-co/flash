@@ -10,6 +10,7 @@ import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable
 from typing import Any, NotRequired, TypedDict
 
+from flash.serve.request.stop_tokens import chat_stop_token_ids
 from flash.serve.request.tool_calls import (
     normalize_tools,
     tools_active,
@@ -69,7 +70,9 @@ def _payload(payload_dict: dict[str, Any]) -> tuple[OpenAIGenerateRequest, bool]
     return payload, is_openai
 
 
-def _sampling_params(payload: OpenAIGenerateRequest, structured: Any, output_kind: Any) -> Any:
+def _sampling_params(
+    payload: OpenAIGenerateRequest, structured: Any, output_kind: Any, *, owner: Any
+) -> Any:
     from vllm import SamplingParams
 
     return SamplingParams(
@@ -84,6 +87,11 @@ def _sampling_params(payload: OpenAIGenerateRequest, structured: Any, output_kin
         output_kind=output_kind,
         structured_outputs=structured,
         stop=payload.stop,
+        stop_token_ids=chat_stop_token_ids(
+            owner.base_model,
+            getattr(owner, "tokenizer", None),
+            is_chat=payload.messages is not None,
+        ),
     )
 
 
@@ -230,7 +238,7 @@ async def generate(
     reasoning_counter = ReasoningTokenCounter(
         owner._reasoning_usage_token_ids if thinking else None
     )
-    sampling = _sampling_params(payload, structured, RequestOutputKind.FINAL_ONLY)
+    sampling = _sampling_params(payload, structured, RequestOutputKind.FINAL_ONLY, owner=owner)
     request_id = generation_id or payload.generation_id or f"fsgen-{uuid.uuid4().hex}"
     start = time.monotonic()
     final_output = None
@@ -447,7 +455,7 @@ async def stream_generate(
     reasoning_counter = ReasoningTokenCounter(
         owner._reasoning_usage_token_ids if thinking else None
     )
-    sampling = _sampling_params(payload, structured, RequestOutputKind.DELTA)
+    sampling = _sampling_params(payload, structured, RequestOutputKind.DELTA, owner=owner)
     request_id = generation_id or payload.generation_id or f"fsgen-{uuid.uuid4().hex}"
     start = time.monotonic()
     prompt_input = await owner._prepare_prompt_input(payload, thinking)

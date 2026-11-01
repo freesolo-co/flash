@@ -14,6 +14,7 @@ from typing import Any
 from flash.content.processor import inherit_tokenizer_chat_template
 from flash.content.structured_options import vllm_structured_kwargs
 from flash.serve.request.runtime_support import reasoning_compatibility_guard
+from flash.serve.request.stop_tokens import chat_stop_token_ids
 from flash.serve.request.tool_calls import tools_active
 
 from .adapters import AdapterBinding, AdapterManager
@@ -633,8 +634,8 @@ class VllmLoraRuntime:
             parser_kwargs=parser_kwargs,
         )
 
-    @staticmethod
     def _sampling_params(
+        self,
         request: GenerationRequest,
         structured: _StructuredState,
         *,
@@ -657,6 +658,9 @@ class VllmLoraRuntime:
             structured_outputs=structured.params,
             # pass none rather than an empty list so vllm keeps its own default.
             stop=list(request.stop) or None,
+            stop_token_ids=chat_stop_token_ids(
+                self.config.model, self._tokenizer, is_chat=request.messages is not None
+            ),
         )
 
     async def _prepare_prompt(
