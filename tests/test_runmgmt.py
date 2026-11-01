@@ -2476,7 +2476,10 @@ def test_attach_cache_fallback_restores_exact_shape_and_drops_managed_cache(monk
     assert retry["cache_retry_shape"] == ["modal", "H100", 2]
 
 
-def test_nonretryable_attached_failure_tears_down_without_resubmitting(monkeypatch, tmp_path):
+@pytest.mark.parametrize("failure", ["job_failed", "job_preempted"])
+def test_nonretryable_attached_failure_tears_down_without_resubmitting(
+    monkeypatch, tmp_path, failure
+):
     import io
 
     from flash.core.spec import GpuSpec, JobSpec
@@ -2504,7 +2507,7 @@ def test_nonretryable_attached_failure_tears_down_without_resubmitting(monkeypat
 
     class Provider:
         def poll_attempt(self, *_args, **_kwargs):
-            return PollResult(False, failure="job_failed", detail="worker assertion")
+            return PollResult(False, failure=failure, detail="worker stopped")
 
         def cancel(self, _handle):
             teardown.append("cancel")
@@ -2513,6 +2516,7 @@ def test_nonretryable_attached_failure_tears_down_without_resubmitting(monkeypat
             teardown.append("destroy")
 
     monkeypatch.setattr(providers, "get_provider", lambda _name: Provider())
+    monkeypatch.setattr(runner_recovery, "_completed_worker_metrics", lambda *_a, **_k: None)
     monkeypatch.setattr(runner_recovery, "_gc_run_sandboxes", lambda _spec: None)
     monkeypatch.setattr(
         runner_lifecycle,

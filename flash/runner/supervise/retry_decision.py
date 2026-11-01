@@ -8,7 +8,7 @@ from dataclasses import dataclass, replace
 from flash.core.spec import JobSpec
 
 INFRA_RETRY_FLOOR = 5
-INFRA_RETRY_FAILURES = frozenset({"stalled", "no_capacity", "poll_error", "job_preempted"})
+INFRA_RETRY_FAILURES = frozenset({"stalled", "no_capacity", "poll_error"})
 CANDIDATE_RETRY_FAILURES = INFRA_RETRY_FAILURES | {"oom"}
 CACHE_FALLBACK_FAILURES = frozenset({"no_capacity", "poll_error"})
 _STATE_KEYS = frozenset(
@@ -185,7 +185,11 @@ def _restore_last_decision(raw: object, counters: dict) -> PersistedRetryDecisio
         or not failure
     ):
         raise ValueError("persisted retry state has an invalid last decision")
-    return PersistedRetryDecision(attempt, failure, _restore_plan(raw["plan"], counters))
+    plan = _restore_plan(raw["plan"], counters)
+    # an older saved decision cannot authorize a failure the current policy no longer retries.
+    if plan.retry and failure not in CANDIDATE_RETRY_FAILURES:
+        plan = RetryPlan(False, "not retrying")
+    return PersistedRetryDecision(attempt, failure, plan)
 
 
 def _decision_snapshot(decision: PersistedRetryDecision | None) -> dict | None:
@@ -325,20 +329,6 @@ def transition_failure(
             observation,
             attempt,
         )
-    if failure == "job_preempted":
-        # Preemption says nothing about memory demand. Advancing the OOM floor here
-        # made a healthy worker at the largest allowed shape impossible to resume.
-        if state.infra_used >= state.infra_retries:
-            plan = RetryPlan(False, "not retrying: infrastructure retry budget exhausted")
-        else:
-            ordinal = state.infra_used + 1
-            state = replace(state, infra_used=ordinal, cache_retry_shape=None)
-            plan = RetryPlan(
-                True,
-                "retrying after preemption (resume from last checkpoint)",
-                ordinal,
-            )
-        return _finish(state, plan, observation, attempt)
     floor = max(state.usable_vram_floor, _candidate_usable_vram_gb(chosen))
     state = replace(state, usable_vram_floor=floor, cache_retry_shape=None)
     if candidates is not None and not any(

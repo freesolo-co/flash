@@ -221,28 +221,34 @@ def test_atomic_retry_cas_has_one_owner_and_reuses_persisted_plan(monkeypatch, t
     assert persisted.last_decision.failure == "stalled"
 
 
-def test_preemption_resumes_at_the_largest_shape_without_raising_the_oom_floor():
-    chosen = _candidate("modal", "H100", 80, 8)
-    original = replace(RetryState.initial_for_spec(_spec()), usable_vram_floor=40)
+@pytest.mark.parametrize("budget", [0, 2, 5])
+def test_preemption_is_terminal_without_spending_retry_budget(budget):
+    chosen = _candidate("modal", "L4", 24)
+    larger = _candidate("modal", "H100", 80)
+    original = replace(RetryState(budget, 2, 1), usable_vram_floor=12)
     updated, plan = transition_failure(
-        original, _observe("job_preempted", chosen, (chosen,)), attempt=0
+        original, _observe("job_preempted", chosen, (chosen, larger)), attempt=0
     )
-    restored = RetryState.from_snapshot(_spec(), updated.to_snapshot())
-    assert plan.retry
-    assert plan.infra_retry_ordinal == 1
-    assert restored.usable_vram_floor == 40
-    assert restored.oom_used == 0
-    assert restored.select_candidate((chosen,)) == ((chosen,), chosen)
+    assert not plan.retry
+    assert updated.infra_used == original.infra_used
+    assert updated.oom_used == original.oom_used
+    assert updated.usable_vram_floor == original.usable_vram_floor
+    assert updated.last_decision.failure == "job_preempted"
 
 
-@pytest.mark.parametrize("budget", [0, 2])
-def test_preemption_retries_are_bounded_even_when_the_same_shape_is_available(budget):
-    chosen = _candidate("modal", "H100", 80, 8)
-    retry_state = RetryState(budget, 2, 1)
-    for attempt in range(budget + 1):
-        retry_state, plan = transition_failure(
-            retry_state, _observe("job_preempted", chosen, (chosen,)), attempt=attempt
-        )
-        assert plan.retry is (attempt < budget)
-    assert retry_state.infra_used == budget
-    assert "budget exhausted" in plan.action
+def test_saved_preemption_retry_cannot_authorize_a_replacement_worker():
+    from flash.runner.supervise.retry_decision import require_retry_authorization_from_raw
+
+    spec = _spec()
+    old_state = replace(
+        RetryState.initial_for_spec(spec),
+        infra_used=1,
+        last_decision=PersistedRetryDecision(
+            0, "job_preempted", RetryPlan(True, "retrying after preemption", 1)
+        ),
+    ).to_snapshot()
+    restored = RetryState.from_snapshot(spec, old_state)
+    assert not restored.persisted_plan(0).retry
+    assert restored.infra_used == 1
+    with pytest.raises(RuntimeError, match="lacks exact persisted retry authorization"):
+        require_retry_authorization_from_raw(spec, {state._RETRY_STATE_KEY: old_state}, 1)

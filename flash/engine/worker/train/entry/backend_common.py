@@ -159,10 +159,7 @@ def _install_flash_attn(py: str) -> None:
             return
         except subprocess.CalledProcessError as e:
             if attempt == FLASH_ATTN_INSTALL_ATTEMPTS - 1:
-                # hand the arm back to the plane as infra-shaped: it retries as job_preempted on a
-                # fresh worker instead of failing the run. bounded by the plane's own retry budget
-                # (INFRA_RETRY_FLOOR), so a genuinely broken wheel spec still terminates rather than
-                # looping -- it just costs a few provisioning attempts to establish that.
+                # preserve the infrastructure failure in the terminal record after local retries.
                 raise RetriableInfraError(
                     f"prebuilt flash-attn wheel install failed {FLASH_ATTN_INSTALL_ATTEMPTS}x "
                     f"(exit {e.returncode}): {FLASH_ATTN_SPEC}"
