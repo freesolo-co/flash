@@ -12,6 +12,7 @@ from typing import Any
 
 from flash.serve.contract.protocol import MAX_CHAT_REQUEST_BYTES, TEXT_TYPES
 from flash.serve.request import text_scan
+from flash.serve.request.schema_types import _decimal_is_integral, _matches_type
 from flash.serve.request.text_scan import TOOL_CALL_END, TOOL_CALL_START
 from flash.serve.request.text_scan import skip_whitespace as _skip_whitespace
 from flash.serve.request.tool_template import last_query_index, rendered_turn_prefix
@@ -37,6 +38,7 @@ _MAX_FIXED_DECIMAL_DIGITS = _MAX_NUMERIC_LITERAL_DIGITS = 1024
 _MAX_NUMERIC_LITERAL_EXPONENT = 1_000_000
 _MAX_ENUM_INTEGER_MAGNITUDE = 10**_MAX_NUMERIC_LITERAL_DIGITS
 _SCHEMA_TYPES = frozenset(["array", "boolean", "integer", "null", "number", "object", "string"])  # fmt: skip
+_SCALAR_SCHEMA_TYPES = _SCHEMA_TYPES - {"array", "object"}
 _SCHEMA_KEYS = frozenset(["additionalProperties", "description", "enum", "items", "properties", "required", "type"])  # fmt: skip
 
 
@@ -317,7 +319,22 @@ def _normalize_schema(
     if unknown:
         raise error_type(f"{path} uses unsupported schema keyword(s): {', '.join(sorted(unknown))}")
     schema_type = raw.get("type")
-    if type(schema_type) is not str or schema_type not in _SCHEMA_TYPES:
+    if type(schema_type) is list:
+        if (
+            not 1 <= len(schema_type) <= len(_SCALAR_SCHEMA_TYPES)
+            or any(
+                type(member) is not str or member not in _SCALAR_SCHEMA_TYPES
+                for member in schema_type
+            )
+            or len(set(schema_type)) != len(schema_type)
+        ):
+            raise error_type(
+                f"{path}.type must be a nonempty unique list of supported scalar types"
+            )
+        if root or direct:
+            raise error_type(f"{path}.type unions are supported only inside JSON arrays or objects")
+        schema_type = list(schema_type)
+    elif type(schema_type) is not str or schema_type not in _SCHEMA_TYPES:
         raise error_type(f"{path}.type must be one supported JSON Schema type")
     if root and schema_type != "object":
         raise error_type(f"{path} must be a root object schema")
@@ -498,7 +515,8 @@ def _validate_tool_result(
 
 def _canonicalize_integer_values(value: Any, schema: Mapping[str, Any]) -> Any:
     schema_type = schema["type"]
-    if schema_type == "integer" and type(value) is Decimal:
+    types = schema_type if type(schema_type) is list else [schema_type]
+    if "integer" in types and "number" not in types and type(value) is Decimal:
         return value.to_integral_value()
     if schema_type == "object":
         properties = schema["properties"]
@@ -509,35 +527,6 @@ def _canonicalize_integer_values(value: Any, schema: Mapping[str, Any]) -> Any:
     if schema_type == "array":
         return [_canonicalize_integer_values(nested, schema["items"]) for nested in value]
     return value
-
-
-def _matches_type(value: Any, schema_type: str) -> bool:
-    if schema_type == "null":
-        return value is None
-    if schema_type == "boolean":
-        return type(value) is bool
-    if schema_type == "integer":
-        return (
-            type(value) is int
-            or (type(value) is Decimal and _decimal_is_integral(value))
-            or (type(value) is float and math.isfinite(value) and value.is_integer())
-        )
-    if schema_type == "number":
-        if type(value) is Decimal:
-            return value.is_finite()
-        return type(value) is int or (type(value) is float and math.isfinite(value))
-    if schema_type == "string":
-        return type(value) is str
-    if schema_type == "array":
-        return type(value) is list
-    return type(value) is dict
-
-
-def _decimal_is_integral(value: Decimal) -> bool:
-    if not value.is_finite():
-        return False
-    digits, exponent = value.as_tuple().digits, value.as_tuple().exponent
-    return exponent >= 0 or all(digit == 0 for digit in digits[exponent:])
 
 
 def _load_exact_json(value: str) -> Any:

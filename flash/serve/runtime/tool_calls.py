@@ -660,7 +660,7 @@ def _validate_value(value: Any, schema: Mapping[str, Any]) -> bool:
         return type(value) in {dict, list}
     if not _matches_type(value, schema_type):
         return False
-    if schema_type == "string" and _contains_unpaired_surrogate(value):
+    if type(value) is str and _contains_unpaired_surrogate(value):
         return False
     if "enum" in schema and not any(_json_values_equal(value, item) for item in schema["enum"]):
         return False
