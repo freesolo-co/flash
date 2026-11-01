@@ -15,6 +15,7 @@ from flash.content.multimodal import NormalizedImages
 from flash.content.thinking import messages_for_chat_template
 from flash.engine.plan.recipe import RECIPE
 from flash.engine.plan.steps import resolve_update_horizon, sft_update_steps
+from flash.engine.profiling import sft_tools
 from flash.engine.profiling.sft_image_rows import (
     estimate_sft_image_row,
     process_sft_image_row,
@@ -417,22 +418,24 @@ def _text_sft_row_spec(
     max_length: int,
     row_index: int,
     multiturn: bool,
+    tools: list[dict[str, Any]] | None = None,
 ) -> tuple[str, _RowReasoning, dict[str, Any]]:
     normalized_prompt = messages_for_chat_template(prompt_messages)
     normalized_completion = messages_for_chat_template(completion_messages)
     normalized_source = [*normalized_prompt, *normalized_completion]
-    text = render_transcript(normalized_source)
+    template_kwargs = sft_tools.sft_template_kwargs(spec.thinking, tools)
+    render = partial(render_transcript, tools=tools)
+    text = render(normalized_source)
     prompt_text = tokenizer.apply_chat_template(
         normalized_prompt,
         tokenize=False,
         add_generation_prompt=True,
-        enable_thinking=spec.thinking,
-        preserve_thinking=False,
+        **template_kwargs,
     )
     reasoning = _row_reasoning(
         prompt_messages,
         completion_messages,
-        render=render_transcript,
+        render=render,
         tokenizer=tokenizer,
         max_length=max_length,
     )
@@ -444,7 +447,7 @@ def _text_sft_row_spec(
             "prompt_text": prompt_text,
             "target_messages": normalized_completion,
             "source_messages": normalized_source,
-            "template_kwargs": {"enable_thinking": spec.thinking, "preserve_thinking": False},
+            "template_kwargs": template_kwargs,
             # measurement carried alongside the row rather than in it: the parquet row is built from
             # an explicit key list below, so neither key reaches verl.
             "row_index": row_index,
@@ -481,13 +484,12 @@ def _tokenize_prompt_rows(
     # denominator. summed after filtering instead.
     reasoning_by_index: dict[int, _RowReasoning] = {}
 
-    def render_transcript(messages: list[dict]) -> str:
+    def render_transcript(messages: list[dict], tools: list[dict[str, Any]] | None = None) -> str:
         return tokenizer.apply_chat_template(
             messages_for_chat_template(messages),
             tokenize=False,
             add_generation_prompt=False,
-            enable_thinking=spec.thinking,
-            preserve_thinking=False,
+            **sft_tools.sft_template_kwargs(spec.thinking, tools),
         )
 
     for row_index, (
@@ -498,6 +500,7 @@ def _tokenize_prompt_rows(
     ) in enumerate(prompt_rows):
         has_images = record_has_images(example, prompt_messages)
         _reject_image_completion(completion_messages, image_bearing=has_images)
+        tools = sft_tools.sft_row_tools(example)
         # read before the image branch rewrites `completion_messages` to its text-only form.
         multiturn = len(completion_messages) > 1
         if multiturn:
@@ -561,6 +564,7 @@ def _tokenize_prompt_rows(
                 max_length=max_length,
                 row_index=row_index,
                 multiturn=multiturn,
+                tools=tools,
             )
             sampled_texts.append(text)
             reasoning_by_index[row_index] = reasoning
@@ -913,6 +917,9 @@ def prepare_sft_workload(
         else:
             prompt_messages = env.prompt_messages(example)
         completion_messages, coerced_scalar_output = _sft_completion_with_provenance(env, example)
+        sft_tools.reject_image_row_tools(
+            example, image_bearing=record_has_images(example, prompt_messages)
+        )
         prompt_rows.append((example, prompt_messages, completion_messages, coerced_scalar_output))
     package_root = getattr(env, "package_root", None)
     multimodal = any(
