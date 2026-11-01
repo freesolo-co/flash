@@ -68,8 +68,8 @@ def poll(handle, spec, *, log=None, deadline_at=None):
 
     def process_failure():
         # the provider exit status survives an artifact-store outage. ordinary process errors
-        # must not become paid preemption retries merely because their failure upload hit 429.
-        # signals/unknown status remain host-loss candidates; explicit retriable markers still win.
+        # must not be mislabeled as host loss merely because their failure upload hit 429.
+        # signals/unknown status remain host-loss candidates; explicit worker markers still win.
         if type(returncode) is int and 0 < returncode < 128:
             return f"Modal worker stopped with exit code {returncode} without a terminal record"
         return None

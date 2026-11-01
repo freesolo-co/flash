@@ -1,15 +1,7 @@
-"""Resume-from-latest-checkpoint on crash/preemption retry (CPU-only).
+"""Checkpoint resume for supported infrastructure retries; all network/GPU boundaries are stubbed.
 
-A crash- or preemption-killed run is relaunched on a fresh worker by the control-plane
-retry loop, and that fresh worker continues training from the latest streamed checkpoint
-rather than restarting from scratch. This file locks in the two live load-bearing pieces:
-
-  1. worker resume: ``hf_resume_checkpoint`` pulls the stream and returns the highest-step
-     checkpoint directory used by the training backend.
-  2. control plane: ``_run_attempts_supervised`` relaunches on the same run id and seed for every
-     infra-shaped failure; a genuine worker error fails fast instead.
-
-All HF/provider/network boundaries are stubbed; nothing here touches a GPU or the network.
+Host preemption is terminal. Checkpoint loading remains necessary for the supervisor's other
+retry categories and explicit checkpoint-based training.
 """
 
 from __future__ import annotations
@@ -30,9 +22,6 @@ from flash.core.spec import JobSpec
 from tests._helpers.profile import attach_sft_profile, stub_revision_geometry
 from tests._helpers.source_snapshot import valid_source_snapshot
 
-# Infra-shaped failure categories the retry loop resumes on (see lifecycle._run_attempts_supervised).
-# Mirrors the literal tuple in the source; this test is the guard that the set doesn't silently drift.
-INFRA_SHAPED = ("stalled", "no_capacity", "poll_error", "job_preempted")
 _SOURCE_SNAPSHOT = valid_source_snapshot()
 
 

@@ -56,7 +56,7 @@ _MAX_ATTEMPT_ID = (1 << 63) - 1
 
 
 class RetriableBootstrapError(RuntimeError):
-    """Infra-shaped failure → marker carries retriable=True → poller retries (job_preempted) instead of job_failed."""
+    """Infrastructure failure recorded in the attempt's terminal marker."""
 
 
 class WorkerInterrupted(BaseException):
