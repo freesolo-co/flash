@@ -1533,3 +1533,105 @@ def test_valid_message_shapes_still_reach_the_runtime(label: str, messages: list
     assert list(forwarded) == messages, (
         f"{label} was mutated on the way to the runtime: {forwarded}"
     )
+
+
+@pytest.mark.parametrize("stream", [False, True])
+def test_packaged_thinking_tools_preserve_reasoning_and_tool_only_content(stream):
+    from flash.serve.runtime.tool_calls import ParsedToolCall
+
+    owner, runtime = _published_owner(thinking_default=True)
+    resolved = owner.models["run-1/final"].adapter
+    call = ParsedToolCall("call_weather", "weather", '{"city":"Paris"}')
+    choice = GenerationChoice(
+        0, "consider <tool_call></think>", "tool_calls", (1, 2), tool_calls=(call,)
+    )
+    result = GenerationResult(
+        request_id="request-tools",
+        adapter_id=resolved.checkpoint_id,
+        incarnation=resolved.aggregate_sha256,
+        choices=(choice,),
+        prompt_tokens=5,
+        completion_tokens=2,
+        cached_tokens=0,
+        cached_tokens_reported=False,
+        thinking=True,
+    )
+
+    async def generate(request):
+        runtime.generation_requests.append(request)
+        return result
+
+    runtime.generate = generate
+    runtime.stream_events = [
+        StreamReady(
+            "request-tools", "runtime", resolved.checkpoint_id, resolved.aggregate_sha256, True
+        ),
+        StreamDelta(0, "consider <tool_call></thi"),
+        StreamDelta(0, "nk>"),
+        StreamDelta(0, "", tool_calls=(call,)),
+        StreamChoiceFinished(0, choice.text, "tool_calls", (1, 2)),
+        StreamFinished(
+            request_id="request-tools",
+            runtime_id="runtime",
+            adapter_id=resolved.checkpoint_id,
+            incarnation=resolved.aggregate_sha256,
+            choices=(choice,),
+            prompt_tokens=5,
+            completion_tokens=2,
+            cached_tokens=0,
+            cached_tokens_reported=False,
+            thinking=True,
+        ),
+    ]
+    tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "weather",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"city": {"type": "string"}},
+                    "required": ["city"],
+                    "additionalProperties": False,
+                },
+            },
+        }
+    ]
+    response = asyncio.run(
+        _request(
+            create_app(owner, bearer_token=AUTH_TOKEN),
+            "POST",
+            "/v1/chat/completions",
+            headers=_auth(),
+            json=_chat_body(stream=stream, tools=tools),
+        )
+    )
+    assert response.status_code == 200, response.text
+    assert runtime.generation_requests[-1].thinking is True
+    if stream:
+        payloads = _sse_payloads(response)
+        assert payloads[-1] == "[DONE]"
+        choices = [
+            payload["choices"][0]
+            for payload in payloads
+            if isinstance(payload, dict) and payload.get("choices")
+        ]
+        assert (
+            "".join(c["delta"].get("reasoning_content", "") for c in choices)
+            == "consider <tool_call>"
+        )
+        assert "".join(c["delta"].get("content", "") for c in choices) == ""
+        assert [c["delta"]["tool_calls"] for c in choices if "tool_calls" in c["delta"]] == [
+            [call.wire(index=0)]
+        ]
+        assert [c["finish_reason"] for c in choices if c["finish_reason"]] == ["tool_calls"]
+    else:
+        choice = response.json()["choices"][0]
+        assert choice["message"] == {
+            "role": "assistant",
+            "content": None,
+            "reasoning_content": "consider <tool_call>",
+            "tool_calls": [call.wire()],
+        }
+        assert choice["finish_reason"] == "tool_calls"
+    asyncio.run(owner.close())
