@@ -1397,9 +1397,20 @@ def test_run_mode_reaps_periodic_uploader_before_terminal_marker_reserve(monkeyp
     assert events[-1] == ("marker", marker_started_at, False)
 
 
-@pytest.mark.wallclock
-@pytest.mark.parametrize("_iteration", range(3))
-def test_run_mode_reserves_cleanup_before_watchdog_marker_with_real_timing(monkeypatch, _iteration):
+def test_run_mode_reserves_cleanup_before_watchdog_marker(monkeypatch):
+    # The worker and uploader are fakes: advance their waits explicitly so imports, filesystem
+    # setup, and scheduler pauses cannot consume the worker budget before it even starts.
+    # Real child-process reaping remains covered by the wallclock tests below.
+    clock = {"now": 100.0}
+    monkeypatch.setattr(b.time, "time", lambda: clock["now"])
+    watchdogs = []
+    monkeypatch.setattr(threading.Timer, "start", lambda timer: watchdogs.append(timer))
+
+    def advance(seconds):
+        clock["now"] += seconds or 0.0
+        if clock["now"] >= deadline:
+            watchdogs[0].function()
+
     stop_timeout = 0.03
     final_timeout = 0.03
     terminate_timeout = 0.02
@@ -1433,7 +1444,7 @@ def test_run_mode_reserves_cleanup_before_watchdog_marker_with_real_timing(monke
         def wait(self, timeout=None):
             self.wait_timeouts.append(timeout)
             if self.killed_at is None:
-                time.sleep(timeout or 0.0)
+                advance(timeout)
                 raise subprocess.TimeoutExpired(self.args, timeout)
             self.returncode = -9
             return self.returncode
@@ -1448,7 +1459,7 @@ def test_run_mode_reserves_cleanup_before_watchdog_marker_with_real_timing(monke
             self.closed = False
 
         def join(self, timeout=None):
-            time.sleep(timeout or 0.0)
+            advance(timeout)
 
         def is_alive(self):
             return self.alive
@@ -1503,6 +1514,15 @@ def test_run_mode_reserves_cleanup_before_watchdog_marker_with_real_timing(monke
     monkeypatch.setattr(b, "fetch_code", lambda _payload: None)
     monkeypatch.setattr(b, "build_worker_env", lambda _payload: {})
     monkeypatch.setattr(b.subprocess, "Popen", lambda *_args, **_kwargs: worker)
+    # Empty stdout is already drained; do not make that depend on a real thread being scheduled
+    # before the fake worker advances directly to its deadline.
+    pump_done = threading.Event()
+    pump_done.set()
+    monkeypatch.setattr(
+        b,
+        "_start_console_pump",
+        lambda *_args: (types.SimpleNamespace(join=lambda: None), pump_done, lambda: None),
+    )
     # route the group teardown at the fake rather than a real killpg on its invented pid: the
     # timing of the kill is what this measures, not the signalling mechanics.
     monkeypatch.setattr(
@@ -1530,7 +1550,7 @@ def test_run_mode_reserves_cleanup_before_watchdog_marker_with_real_timing(monke
     assert b.main() == 1
 
     assert worker.killed_at is not None
-    assert worker.killed_at <= worker_cutoff + 0.02
+    assert worker.killed_at == pytest.approx(worker_cutoff)
     assert stop_upload.set_at is not None
     assert worker.killed_at <= stop_upload.set_at
     assert uploader.is_alive() is False
@@ -1539,8 +1559,13 @@ def test_run_mode_reserves_cleanup_before_watchdog_marker_with_real_timing(monke
     assert all(uploader_alive is False for _, _, uploader_alive in markers)
     terminal_markers = [marker for marker in markers if marker[0] == "terminal"]
     assert len(terminal_markers) == 1
-    assert deadline - terminal_markers[0][1] >= bookkeeping_reserve - 0.01
+    assert deadline - terminal_markers[0][1] >= bookkeeping_reserve
     assert terminal_markers[0][1] <= reaping_deadline
+    assert len(watchdogs) == 1
+    assert watchdogs[0].finished.is_set()
+    # A callback already queued when cleanup finishes must also observe the done event.
+    advance(deadline - clock["now"])
+    assert markers == terminal_markers
 
 
 @pytest.mark.wallclock
