@@ -54,6 +54,7 @@ class _Engine:
 class _Owner:
     def __init__(self, record: AdapterRecord) -> None:
         self.record = record
+        self.base_model = record.base_model
         self.engine = _Engine()
 
     async def _lora_request(self, _adapter_id: str, _record_dict: Any) -> tuple[Any, Any]:
