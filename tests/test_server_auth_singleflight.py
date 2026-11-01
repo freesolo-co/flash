@@ -40,10 +40,12 @@ def _clear_verify_state():
     with auth._verify_cache_lock:
         auth._verify_cache.clear()
         auth._verify_inflight.clear()
+        auth._verify_last_good.clear()
     yield
     with auth._verify_cache_lock:
         auth._verify_cache.clear()
         auth._verify_inflight.clear()
+        auth._verify_last_good.clear()
 
 
 def _http_error(code: int) -> urllib.error.HTTPError:
@@ -289,3 +291,88 @@ def test_local_disabled_key_stays_rejected_after_upstream_allow(monkeypatch, tmp
         )
 
     assert auth.authenticate("Bearer fslo-disabled") is None
+
+
+def _scripted_urlopen(monkeypatch, outcomes: list[object]) -> list[object]:
+    def fake_urlopen(req, timeout=None):
+        outcome = outcomes.pop(0)
+        if isinstance(outcome, BaseException):
+            raise outcome
+        return outcome
+
+    monkeypatch.setattr(auth.urllib.request, "urlopen", fake_urlopen)
+    return outcomes
+
+
+@pytest.mark.parametrize(
+    "outage",
+    [urllib.error.URLError("connection reset"), _http_error(503)],
+    ids=["transport", "server-error"],
+)
+def test_recently_verified_key_survives_identity_service_outage(monkeypatch, outage) -> None:
+    outcomes = _scripted_urlopen(monkeypatch, [_Response(), outage, _Response()])
+
+    assert auth._freesolo_verify("rollout-key") == _IDENTITY
+    # the outage is bridged by the identity verified moments ago, and nothing is negatively cached.
+    assert auth._freesolo_verify("rollout-key") == _IDENTITY
+    assert auth._verify_key_digest("rollout-key") not in auth._verify_cache
+    assert auth._verify_key_digest("rollout-key") not in auth._verify_inflight
+    # once the service answers again every request is verified live as before.
+    assert auth._freesolo_verify("rollout-key") == _IDENTITY
+    assert outcomes == []
+
+
+def test_outage_after_the_grace_window_still_fails(monkeypatch) -> None:
+    clock = [1000.0]
+    monkeypatch.setattr(auth.time, "monotonic", lambda: clock[0])
+    _scripted_urlopen(monkeypatch, [_Response(), _http_error(503)])
+
+    assert auth._freesolo_verify("old-key") == _IDENTITY
+    clock[0] += auth._VERIFY_STALE_GRACE_S + 1
+    with pytest.raises(auth.AuthVerificationUnavailable):
+        auth._freesolo_verify("old-key")
+
+
+def test_definitive_rejection_is_never_bridged_by_an_earlier_success(monkeypatch) -> None:
+    clock = [1000.0]
+    monkeypatch.setattr(auth.time, "monotonic", lambda: clock[0])
+    _scripted_urlopen(monkeypatch, [_Response(), _http_error(401), _http_error(503)])
+
+    assert auth._freesolo_verify("revoked-key") == _IDENTITY
+    assert auth._freesolo_verify("revoked-key") is None
+    assert auth._verify_key_digest("revoked-key") not in auth._verify_last_good
+    # after the negative cache expires, an outage must not resurrect the revoked key.
+    clock[0] += auth._VERIFY_CACHE_NEG_TTL_S + 1
+    with pytest.raises(auth.AuthVerificationUnavailable):
+        auth._freesolo_verify("revoked-key")
+
+
+def test_concurrent_waiters_share_the_bridged_identity(monkeypatch) -> None:
+    worker_count = 8
+    start = threading.Barrier(worker_count)
+
+    def fake_urlopen(req, timeout=None):
+        time.sleep(0.1)
+        raise urllib.error.URLError("connection reset")
+
+    with auth._verify_cache_lock:
+        auth._remember_good_locked(auth._verify_key_digest("shared"), _IDENTITY, time.monotonic())
+    monkeypatch.setattr(auth.urllib.request, "urlopen", fake_urlopen)
+
+    def verify() -> dict[str, object] | None:
+        start.wait()
+        return auth._freesolo_verify("shared")
+
+    with ThreadPoolExecutor(max_workers=worker_count) as pool:
+        results = list(pool.map(lambda _: verify(), range(worker_count)))
+    assert results == [_IDENTITY] * worker_count
+
+
+def test_last_good_identities_are_bounded_and_keep_no_token(monkeypatch) -> None:
+    monkeypatch.setattr(auth, "_VERIFY_CACHE_MAX", 3)
+    monkeypatch.setattr(auth.urllib.request, "urlopen", lambda req, timeout=None: _Response())
+
+    for index in range(5):
+        assert auth._freesolo_verify(f"key-{index}") == _IDENTITY
+    assert len(auth._verify_last_good) == 3
+    assert b"key-4" not in repr(auth._verify_last_good).encode()
