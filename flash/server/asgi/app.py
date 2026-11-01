@@ -198,16 +198,18 @@ async def _lead_when_free(work: _LeaderWork) -> None:
     work.recovery = asyncio.ensure_future(asyncio.to_thread(work.recover))
     try:
         await asyncio.shield(work.recovery)
+        # Starting the loops can fail too, e.g. the deployment-job pool is full of jobs the plane
+        # accepted in standby. Leave standby only once the holder's work is actually running.
+        work.start()
     except asyncio.CancelledError:
         raise
     except Exception:
-        # A lone plane fails startup when recovery fails; a takeover must not keep serving as if
-        # it led. Stop, and let the restart recover from a clean start.
-        _log.critical("control-plane recovery failed after lease takeover; stopping", exc_info=True)
+        # A lone plane fails startup when recovery or its loops fail; a takeover must not keep
+        # serving as if it led. Stop, and let the restart recover from a clean start.
+        _log.critical("control-plane takeover failed; stopping", exc_info=True)
         _stop_plane()
         return
     work.app.state.plane_standby = False
-    work.start()
 
 
 def create_app():
