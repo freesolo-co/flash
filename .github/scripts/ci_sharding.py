@@ -7,7 +7,16 @@ from collections.abc import Iterable
 import pytest
 
 # slow-file weights come from offline junit timings; unmeasured files still participate.
-FILE_SECONDS: dict[str, float] = {}
+FILE_SECONDS = {
+    "tests/test_client.py": 23,
+    "tests/test_instance_bootstrap_coverage.py": 6,
+    "tests/test_repo_cleanup.py": 24,
+    "tests/test_runmgmt.py": 16,
+    "tests/test_server_api.py": 39,
+    "tests/test_server_envs_coverage.py": 15,
+    "tests/test_weight_cache.py": 7,
+    "tests/test_worker_init_heartbeat.py": 4,
+}
 
 
 def assign_files(paths: Iterable[str], count: int) -> dict[str, int]:

@@ -29,6 +29,13 @@ def test_new_files_are_partitioned_exactly_once_and_deterministically():
     assert abs(list(assigned.values()).count(0) - list(assigned.values()).count(1)) == 1
 
 
+def test_measured_heavy_files_are_balanced_without_dropping_new_files(monkeypatch):
+    monkeypatch.setattr(sharding, "FILE_SECONDS", {"slow-a.py": 40, "slow-b.py": 35})
+    assigned = sharding.assign_files({"slow-a.py", "slow-b.py", "new.py"}, 2)
+    assert assigned["slow-a.py"] != assigned["slow-b.py"]
+    assert set(assigned) == {"slow-a.py", "slow-b.py", "new.py"}
+
+
 @pytest.mark.parametrize(("index", "count"), [(None, 2), (-1, 2), (2, 2), (0, 0)])
 def test_invalid_shard_fails_before_collection(index, count):
     class Config:
