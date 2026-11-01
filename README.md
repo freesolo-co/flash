@@ -249,6 +249,13 @@ endpoint returns `409` with a hint to deploy first. Prefer this control-plane en
 directly: it enforces run ownership and forwards per-run serving options such as
 thinking-mode parity.
 
+Tool parameters use a restricted JSON Schema profile. Inside JSON arrays and objects,
+scalar types can be combined explicitly, for example `"type": ["string", "number",
+"boolean", "null"]` for spreadsheet cells. Empty schemas (`{}`), container unions,
+and unions on top-level function arguments are unsupported. Top-level arguments use
+native parameter text, where a string such as `"12"` and a number would be ambiguous;
+nested JSON preserves those types during generation, streaming, and history replay.
+
 ### Workload estimates (SFT)
 
 `flash train`, `--dry-run`, and `--cost` read the pinned environment's packaged dataset
