@@ -192,6 +192,28 @@ def test_takeover_recovery_failure_stops_the_plane_instead_of_serving_as_leader(
         assert loops == []
 
 
+def test_takeover_that_cannot_start_its_loops_stops_the_plane(monkeypatch):
+    """Recovery succeeding is not enough: e.g. a full deployment-job pool fails the loops' start."""
+    import flash.server.asgi.app as app_mod
+
+    recovered, stopped = [], threading.Event()
+    _stub_lifespan(monkeypatch, recovered)
+
+    def pool_full(self):
+        raise RuntimeError("deployment job capacity reached")
+
+    monkeypatch.setattr(app_mod, "_stop_plane", stopped.set)
+    monkeypatch.setattr(app_mod._LeaderWork, "start", pool_full)
+    old_plane = _hold_elsewhere()
+
+    with TestClient(app_mod.create_app()) as client:
+        _release_elsewhere(old_plane)
+        assert stopped.wait(10)
+        assert recovered == ["runs", "deployments"]
+        # never leaves standby, so submissions are not launched by a plane without its loops.
+        assert client.app.state.plane_standby is True
+
+
 def test_shutdown_waits_for_takeover_recovery_before_releasing_the_lease(monkeypatch):
     import flash.server.asgi.app as app_mod
     import flash.server.platform.runtime as server_runtime
