@@ -2,33 +2,83 @@ name: ci
 
 on:
   push:
-    branches: [main, dev]
+    branches: [main, dev, devV2]
   pull_request:
-    branches: [main, dev]
+    branches: [main, dev, devV2]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
-  test:
-    name: lint + offline tests
+  lint:
+    name: lint
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v6
-
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
       - name: Install uv
-        uses: astral-sh/setup-uv@v6
+        uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6
         with:
+          version: "0.12.5"
           python-version: "3.11"
-
-      - name: Sync (server extra + dev)
-        run: uv sync --extra server --dev
+      - name: Sync dependencies
+        run: uv sync --extra server --dev --locked
 
       - name: Ruff check
         run: uv run ruff check .
-
-      # The formatter was never gated, so 102 files had drifted out of `ruff format` shape while
-      # CI stayed green. Enforcing it here keeps that from happening again; freesolo's backend job
-      # runs the same two commands against the same shared config.
       - name: Ruff format check
         run: uv run ruff format --check .
 
+  test:
+    name: offline tests (py${{ matrix.python-version }}, shard ${{ matrix.shard }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12"]
+        shard: [0, 1]
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - name: Install uv
+        uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6
+        with:
+          version: "0.12.5"
+          python-version: ${{ matrix.python-version }}
+      - name: Sync dependencies
+        run: uv sync --extra server --dev --locked
+
+      # each shard runs serially to preserve real-time assertions and module-level state.
       - name: Tests (CPU, offline)
-        run: uv run pytest -q
+        env:
+          HF_HUB_OFFLINE: "1"
+          TRANSFORMERS_OFFLINE: "1"
+          HF_HUB_DISABLE_TELEMETRY: "1"
+          PYTHONPATH: .github/scripts
+        run: >-
+          uv run pytest -q -p ci_sharding --ci-shard ${{ matrix.shard }}
+          --ci-shard-count 2 --durations=20
+
+  test-result:
+    name: lint + offline tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    needs: [lint, test]
+    if: always()
+    steps:
+      - name: Require every test group to have succeeded
+        env:
+          LINT: ${{ needs.lint.result }}
+          TEST: ${{ needs.test.result }}
+        run: |
+          for result in "$LINT" "$TEST"; do
+            if [ "$result" != "success" ]; then
+              echo "::error::required ci group finished with result '$result'."
+              exit 1
+            fi
+          done
+          echo "all required ci groups passed"

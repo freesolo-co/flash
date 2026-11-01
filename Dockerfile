@@ -12,13 +12,14 @@
 FROM python:3.12-slim
 
 WORKDIR /app
-COPY . .
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates git curl \
     && curl -1sLf 'https://artifacts-cli.infisical.com/setup.deb.sh' | bash \
     && apt-get update && apt-get install -y --no-install-recommends infisical \
-    && rm -rf /var/lib/apt/lists/* \
-    && chmod +x /app/infisical-entrypoint.sh
+    && rm -rf /var/lib/apt/lists/*
+# source changes reuse the operating-system and infisical installation layers.
+COPY . .
+RUN chmod +x /app/infisical-entrypoint.sh
 RUN pip install --no-cache-dir ".[server]"
 
 VOLUME /root/.flash
