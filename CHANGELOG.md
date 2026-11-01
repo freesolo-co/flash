@@ -162,6 +162,12 @@ This file starts at 1.1.35. Earlier releases are not reconstructed here; use
 
 ### Fixed
 
+- API-key verification bridges brief Freesolo identity-service outages. A key that verified
+  successfully within the last 5 minutes is accepted when verification is unavailable (transport
+  errors or 5xx), instead of failing the request with `503 Authentication service unavailable`.
+  Live verification still runs on every request while the service answers, and a definitive
+  rejection forgets the key, so revocation stays immediate. Long multi-turn rollouts previously
+  lost about 13% of episodes to these 503s.
 - Image SFT no longer stores processed pixel tensors in the training parquet. The worker keeps
   each row's small processor fields (image grid, token types) and its saved image files, and the
   training dataset rebuilds `pixel_values` per item, checking the stored grid. Before this,

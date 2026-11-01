@@ -31,6 +31,12 @@ _verify_cache: dict[str, float] = {}
 _verify_cache_lock = threading.Lock()
 _verify_inflight: dict[str, Future[dict[str, Any] | None]] = {}
 _VERIFY_CACHE_MAX = 1024
+# token digest -> (monotonic verified-at, identity) of the last successful verification. it is never
+# served while the identity service answers, so revocation stays immediate; it only bridges brief
+# identity-service outages for keys verified moments ago, which otherwise fail every request with a
+# 503 (e.g. thousands of rollout chat calls). a definitive rejection forgets it.
+_VERIFY_STALE_GRACE_S = 300.0
+_verify_last_good: dict[str, tuple[float, dict[str, Any]]] = {}
 
 
 class AuthVerificationUnavailable(RuntimeError):
@@ -51,6 +57,27 @@ def _prune_verify_cache_locked(now: float) -> None:
             : len(_verify_cache) - _VERIFY_CACHE_MAX + 1
         ]:
             del _verify_cache[digest]
+
+
+def _remember_good_locked(digest: str, identity: dict[str, Any], now: float) -> None:
+    """Record a successful verification. Caller must hold ``_verify_cache_lock``."""
+    for stale in [
+        d for d, (at, _) in _verify_last_good.items() if now - at > _VERIFY_STALE_GRACE_S
+    ]:
+        del _verify_last_good[stale]
+    if digest not in _verify_last_good and len(_verify_last_good) >= _VERIFY_CACHE_MAX:
+        oldest = min(_verify_last_good, key=lambda d: _verify_last_good[d][0])
+        del _verify_last_good[oldest]
+    _verify_last_good[digest] = (now, dict(identity))
+
+
+def _recent_good_identity(digest: str) -> dict[str, Any] | None:
+    """Identity verified within the grace window, for use only when verification is unavailable."""
+    with _verify_cache_lock:
+        entry = _verify_last_good.get(digest)
+        if entry is None or time.monotonic() - entry[0] > _VERIFY_STALE_GRACE_S:
+            return None
+        return dict(entry[1])
 
 
 def _freesolo_key_prefix(token: str) -> str:
@@ -232,6 +259,22 @@ def _freesolo_verify(token: str) -> dict[str, Any] | None:
                 now = time.monotonic()
                 _prune_verify_cache_locked(now)
                 _verify_cache[digest] = now + _VERIFY_CACHE_NEG_TTL_S
+                _verify_last_good.pop(digest, None)
+        elif identity is not None:
+            with _verify_cache_lock:
+                _remember_good_locked(digest, identity, time.monotonic())
+    except AuthVerificationUnavailable as exc:
+        fallback = _recent_good_identity(digest)
+        with _verify_cache_lock:
+            if _verify_inflight.get(digest) is pending:
+                del _verify_inflight[digest]
+            if fallback is None:
+                pending.set_exception(exc)
+            else:
+                pending.set_result(fallback)
+        if fallback is None:
+            raise
+        return fallback
     except BaseException as exc:
         with _verify_cache_lock:
             if _verify_inflight.get(digest) is pending:
