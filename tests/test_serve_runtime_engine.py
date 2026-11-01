@@ -108,6 +108,7 @@ class _AsyncEngineArgs:
     quantization: str | None = None
     kv_cache_dtype: str | None = None
     max_model_len: int | None = None
+    scheduler_cls: str | None = None
     nested: Any = None
 
 
@@ -978,29 +979,42 @@ def test_stream_requires_some_delta_to_report_prompt_tokens() -> None:
     asyncio.run(runtime.close())
 
 
-def test_stop_sequences_reach_sampling_params_in_both_paths() -> None:
-    runtime = VllmLoraRuntime(EngineConfig(model="model"))
+@pytest.mark.parametrize(
+    ("model", "prompt", "expected_ids"),
+    [
+        ("model", {"prompt": "hello"}, None),
+        ("Qwen/Qwen3.5-9B-Base", {"prompt": "hello"}, None),
+        ("Qwen/Qwen3.5-9B-Base", {"messages": [{"role": "user", "content": "hi"}]}, [42]),
+    ],
+)
+def test_stop_sequences_reach_sampling_params_in_both_paths(
+    monkeypatch, model, prompt, expected_ids
+):
+    monkeypatch.setattr(_Tokenizer, "convert_tokens_to_ids", lambda self, token: 42, raising=False)
+    monkeypatch.setattr(_Tokenizer, "unk_token_id", None, raising=False)
+    runtime = VllmLoraRuntime(EngineConfig(model=model))
     asyncio.run(runtime.start())
     engine = _Engine.latest
     assert engine is not None
     engine.responses.append([_output("hi", [1])])
-    asyncio.run(runtime.generate(GenerationRequest(prompt="hello", stop=["END", "STOP"])))
+    asyncio.run(runtime.generate(GenerationRequest(**prompt, stop=["END", "STOP"])))
     assert engine.generate_calls[0]["sampling"].kwargs["stop"] == ["END", "STOP"]
 
     engine.responses.append([_output("hi", [1])])
 
     async def collect():
-        return [
-            event async for event in runtime.stream(GenerationRequest(prompt="hello", stop="DONE"))
-        ]
+        return [event async for event in runtime.stream(GenerationRequest(**prompt, stop="DONE"))]
 
     asyncio.run(collect())
     assert engine.generate_calls[1]["sampling"].kwargs["stop"] == ["DONE"]
 
     # absent stop sequences must reach vllm as none, not as an empty list.
     engine.responses.append([_output("hi", [1])])
-    asyncio.run(runtime.generate(GenerationRequest(prompt="hello")))
+    asyncio.run(runtime.generate(GenerationRequest(**prompt)))
     assert engine.generate_calls[2]["sampling"].kwargs["stop"] is None
+    for call in engine.generate_calls:
+        assert call["sampling"].kwargs["stop_token_ids"] == expected_ids
+    assert runtime._tokenizer.eos_token_id == 9
     asyncio.run(runtime.close())
 
 

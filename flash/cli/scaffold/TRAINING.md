@@ -461,13 +461,10 @@ described above.
 Never derive seconds-per-step from total elapsed time (early steps include one-time warmup
 that can dominate a short run).
 
-> **Even on a genuinely stale heartbeat, do NOT cancel.** Flash **auto-retries a preempted job from its
-> last checkpoint**, and the provider's `job_preempted` notice can lag the freeze by ~10
-> minutes. Cancelling races that retry and kills a run that was recovering on its own.
-> Wait for either the automatic retry or a genuine terminal state. Cancel only when a run
-> is confirmed dead with no retry pending, or is burning money on a definite unrecoverable
-> fault. An idle GPU during model load is also not evidence of a hang — and it is not
-> evidence that your GPU class is unhealthy, so do not "fix" it by pinning another one.
+A stale heartbeat alone does not identify the failure. Check the provider/attempt state and
+wait for a terminal result or a retry decision for a supported failure category. Host preemption
+is terminal: Flash does not automatically restart a preempted job. Preserve any published
+checkpoints for an explicit follow-up run. An idle GPU during model loading can be normal.
 
 ### 6. Deploy & chat
 

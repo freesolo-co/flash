@@ -11,6 +11,7 @@ the card they were found on.
 
 from typing import Any
 
+from flash.content.processor import inherit_tokenizer_chat_template
 from flash.serving.src.engine.model_config import (
     engine_overrides_for,
     image_limit_for,
@@ -49,6 +50,7 @@ def load_tokenizer(
             token=settings.hf_api_key,
             trust_remote_code=cfg.TRUST_REMOTE_CODE,
         )
+        inherit_tokenizer_chat_template(processor)
         tokenizer = getattr(processor, "tokenizer", None)
         if tokenizer is None:
             raise RuntimeError("image-capable model processor has no tokenizer")

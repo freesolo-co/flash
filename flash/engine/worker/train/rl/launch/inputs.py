@@ -22,6 +22,8 @@ import flash.engine.worker.model.decoding as _worker_decoding
 import flash.engine.worker.perf as _worker_perf
 import flash.engine.worker.train.rl.launch.config as _worker_config
 from flash.adapters.targets import LoraTargeting, resolve_lora_targeting
+from flash.content.processor import inherit_tokenizer_chat_template
+from flash.content.stop_tokens import chat_stop_token_ids
 from flash.content.structured_outputs import (
     describe_structured_outputs,
     parse_structured_outputs,
@@ -420,10 +422,11 @@ def _assemble_grpo_inputs(
         "max_turns": int(getattr(env, "max_turns", 0) or 0) if multi_turn else 0,
         # the child decides whether an assistant turn ended naturally or was cut off, and it has no
         # access to the model config -- so the full halting set is resolved here and handed over.
-        # the union of the tokenizer's eos and the model's generation_config eos, because a model can
-        # stop on a secondary id its tokenizer never exposes.
+        # Keep every checkpoint EOS plus any chat-turn boundary the model needs. Base checkpoints
+        # can use document EOS while the environment still requires one assistant turn at a time.
         "eos_token_ids": (
             generation_eos_from_cached_config(model_id, model_revision, tok)
+            | frozenset(chat_stop_token_ids(model_id, tok, is_chat=True) or ())
             if multi_turn
             else frozenset()
         ),
@@ -532,6 +535,7 @@ def _resolve_grpo_inputs(*, context: WorkerContext):
         processor = AutoProcessor.from_pretrained(
             model_id, trust_remote_code=True, **_worker_hf.model_revision_kwargs(model_revision)
         )
+        inherit_tokenizer_chat_template(processor)
         tok = processor.tokenizer
         image_pad_token_id = resolve_image_pad_token_id(processor, tok)
     else:

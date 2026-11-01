@@ -1037,3 +1037,31 @@ def test_authenticated_cache_salts_reach_vllm_without_cross_request_leakage(
     asyncio.run(run())
     assert {prompt.pop("cache_salt") for prompt in prompts} == {"a" * 64, "b" * 64}
     assert prompts[0] == prompts[1]
+
+
+@pytest.mark.parametrize("streaming", [False, True])
+@pytest.mark.parametrize("chat", [False, True])
+def test_base_chat_stops_at_turn_boundary_without_changing_raw_completion(
+    modal_app_module, monkeypatch, streaming, chat
+):
+    eng = _engine(modal_app_module, base_model="Qwen/Qwen3.5-9B-Base")
+    monkeypatch.setattr(eng.tokenizer, "convert_tokens_to_ids", lambda token: 42)
+    monkeypatch.setattr(eng.tokenizer, "unk_token_id", None, raising=False)
+    payload = {"messages": [{"role": "user", "content": "hi"}]} if chat else {"prompt": "hi"}
+    payload["stop"] = ["END"]
+    if streaming:
+
+        async def collect():
+            return [
+                event
+                async for event in eng._stream_generate(
+                    {"model_id": "r1", **payload}, _forwarded_record(eng, "r1")
+                )
+            ]
+
+        asyncio.run(collect())
+        sampling = eng.engine.sampling_params[-1]
+    else:
+        sampling = _generate(eng, **payload)
+    assert sampling.stop == ["END"]
+    assert sampling.stop_token_ids == ([42] if chat else None)

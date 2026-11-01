@@ -1,5 +1,50 @@
 # Hosted GPU qualification
 
+## Pretrained Qwen 9B Base, 2026-11-01
+
+`Qwen/Qwen3.5-9B-Base` is a separate pretrained checkpoint, pinned to
+`68c46c4b3498877f3ef123c856ecfde50c39f404`. It uses its own BF16 weights and
+tokenizer, including its EOS metadata. It is never redirected to the post-trained
+9B FP8 repository. Hosted and customer-owned profiles select H100, 262,144 total
+context tokens, FP8 KV, 16 hot/CPU LoRA slots at maximum rank 128, eight sequences,
+and CUDA graphs.
+
+A two-step H100 SFT run (`flash-modal-sft-smoke-2a2996da6a0a`) passed adapter
+publication, artifact recovery, and checkpoint resume. The rank-8 adapter records
+the Base identity and pinned revision; all 496 tensors are finite and all 248 LoRA
+B matrices are nonzero. The Modal training weight cache was warmed at the same pin.
+This checks training execution and recovery, not learning quality or GRPO quality.
+
+The [hosted engine qualification](https://modal.com/apps/freesolo/main/ap-bOjg4Q2AbsWHvD6KWvFXEF)
+loaded 31.41 GiB of weights and LoRA buffers and passed:
+
+- Eight concurrent short base requests.
+- A 262,112-token prompt with 32 output tokens reserved (17.8 seconds).
+- All 16 synthetic zero-valued rank-128 attention adapters loaded, with eight
+  distinct near-limit prompts submitted concurrently (25.5–192.5 seconds).
+- Image generation and rejection of a 262,145-token input.
+
+The [customer-owned runtime qualification](https://modal.com/apps/freesolo/main/ap-wWJ3AS4Y2Iggvy470MWK4h)
+used the profile-derived `VllmLoraRuntime` on Modal H100 with the hosted image and
+real rank-8 SFT adapter. It passed base generation, eight concurrent adapted
+requests, an image request, and a parsed tool call with `finish_reason=tool_calls`.
+This qualifies the runtime shape; it is not an OCI digest certification or a full
+provider provisioning/lifecycle test.
+
+Live tests exposed two checkpoint metadata differences. AutoProcessor did not
+inherit the template embedded in the Base tokenizer config, so image rendering
+failed. Loaders now inherit that same checkpoint's template only if the processor
+has none. Base also uses document EOS rather than chat-turn EOS: without an
+explicit assistant-turn stop, it continued past a tool call into an invented tool
+response. Buffered and streaming chat now stop at the checkpoint's `im_end` token,
+while raw completions and tokenizer EOS metadata remain unchanged. The final live
+canary verifies a single parsed tool call without a synthetic tool response.
+
+These are execution and capacity checks with short outputs. They do not establish
+instruction following, tool-use accuracy, long-context quality, or sustained
+throughput. Queued near-limit requests do not imply eight full contexts fit in KV
+memory simultaneously. No shared production serving app was deployed.
+
 ## Native Qwen context, 2026-10-31
 
 All five hosted Qwen models now use their native **262,144-token total context**,

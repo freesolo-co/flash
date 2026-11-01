@@ -138,6 +138,7 @@ _SFT_CHUNKED_NLL_MODELS = frozenset(
         "Qwen/Qwen3.5-0.8B",
         "Qwen/Qwen3.5-4B",
         "Qwen/Qwen3.5-9B",
+        "Qwen/Qwen3.5-9B-Base",
         "Qwen/Qwen3.8-27B",
         "Qwen/Qwen3.6-35B-A3B",
     }

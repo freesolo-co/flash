@@ -44,11 +44,19 @@ path is self-hostable end to end — see **[SELF_HOSTING.md](SELF_HOSTING.md)**.
 
 ## Using the hosted service
 
-The active training catalog is `Qwen/Qwen3.5-9B`, `Qwen/Qwen3.8-27B`, and
-`Qwen/Qwen3.6-35B-A3B`. The hosted serving catalog routes all three models on B200.
-The retired dense Qwen3.6 27B identity is never translated into Qwen3.8. Customer-owned
-Modal supports all three active models; 27B and 35B-A3B are bound to the certified serving image
-digest. Customer-owned `flash serve` requires explicit `--provider modal`. Training and serving both use Modal.
+The training catalog includes Qwen3.5 0.8B, 4B, 9B, and **9B Base**, Qwen3.8 27B,
+and Qwen3.6 35B-A3B. `Qwen/Qwen3.5-9B` is Qwen's post-trained chat model and remains
+the default. Select `model = "Qwen/Qwen3.5-9B-Base"` to fine-tune the pretrained-only
+checkpoint with SFT or GRPO. It has its own weights, tokenizer revision, adapters,
+and Modal cache entry; it is never mapped to the post-trained model's FP8 weights.
+Its native chat template supports text, images, and tool calls, but the pretrained
+weights have not been tuned for instruction following.
+
+Hosted serving uses the [per-model GPU placements](flash/serving/app/README.md#hosted-gpu-configuration).
+The 9B Base checkpoint serves in BF16 on H100 with a 262,144-token context.
+Customer-owned `flash serve` requires explicit `--provider modal` and a live-qualified
+profile. The retired dense Qwen3.6 27B identity is never translated into Qwen3.8.
+Training and serving both use Modal.
 
 `flash login` is not interactive. Export `FREESOLO_API_KEY` first so the key does not appear in process listings:
 
@@ -240,6 +248,13 @@ checkpoint id is the permanent serving identity. If that checkpoint is not deplo
 endpoint returns `409` with a hint to deploy first. Prefer this control-plane endpoint over calling the serving backend
 directly: it enforces run ownership and forwards per-run serving options such as
 thinking-mode parity.
+
+Tool parameters use a restricted JSON Schema profile. Inside JSON arrays and objects,
+scalar types can be combined explicitly, for example `"type": ["string", "number",
+"boolean", "null"]` for spreadsheet cells. Empty schemas (`{}`), container unions,
+and unions on top-level function arguments are unsupported. Top-level arguments use
+native parameter text, where a string such as `"12"` and a number would be ambiguous;
+nested JSON preserves those types during generation, streaming, and history replay.
 
 ### Workload estimates (SFT)
 

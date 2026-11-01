@@ -475,6 +475,7 @@ def test_class_names_are_distinct_and_modal_safe(modal_app_module):
         ("Qwen/Qwen3.5-0.8B", "L4"),
         ("Qwen/Qwen3.5-4B", "L40S"),
         ("Qwen/Qwen3.5-9B", "L40S"),
+        ("Qwen/Qwen3.5-9B-Base", "H100"),
         ("Qwen/Qwen3.8-27B", "H100"),
         ("Qwen/Qwen3.6-35B-A3B", "H200"),
     ],

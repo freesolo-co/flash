@@ -110,6 +110,27 @@ SERVING_MODELS: list[dict[str, Any]] = [
             "reasoning_parser": "qwen3",
         },
     },
+    {
+        "base_model": "Qwen/Qwen3.5-9B-Base",
+        "image_input_limit": MAX_IMAGES_PER_CONVERSATION,
+        "gpu": "H100",
+        "engine": {
+            "serve_model_id": "Qwen/Qwen3.5-9B-Base",
+            "model_revision": "68c46c4b3498877f3ef123c856ecfde50c39f404",
+            "tokenizer_model": "Qwen/Qwen3.5-9B-Base",
+            "tokenizer_revision": "68c46c4b3498877f3ef123c856ecfde50c39f404",
+            "processor_revision": "68c46c4b3498877f3ef123c856ecfde50c39f404",
+            "quantization": None,
+            "gpu_memory_utilization": 0.90,
+            "max_loras": 16,
+            "max_cpu_loras": 16,
+            "max_lora_rank": 128,
+            "max_model_len": 262144,
+            "max_num_seqs": 8,
+            "enforce_eager": False,
+            "reasoning_parser": "qwen3",
+        },
+    },
     # 35B-A3B MoE: bf16 on an H200 (141 GB) is the one serving path that gives a flash adapter its
     # full all-expert LoRA and CUDA graphs at speed. it gets rank 64 at 6 hot slots (6 x 64).
     # why bf16 and not the FP8 checkpoint used by every other tier:
@@ -234,7 +255,7 @@ def gpu_for(base_model: str) -> str:
 def serve_model_for(base_model: str) -> str:
     """return the pre-quantized checkpoint an active hosted engine loads."""
     _config_for(base_model)
-    if base_model in {"Qwen/Qwen3.5-0.8B", "Qwen/Qwen3.5-4B"}:
+    if base_model in {"Qwen/Qwen3.5-0.8B", "Qwen/Qwen3.5-4B", "Qwen/Qwen3.5-9B-Base"}:
         return base_model
     if base_model == DEEPSEEK_MODEL_ID:
         return DEEPSEEK_MODEL_ID

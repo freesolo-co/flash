@@ -68,6 +68,7 @@ if main_environment:
         schedule=modal.Period(seconds=POOL_SAMPLE_SECONDS),
         cpu=0.25,
         memory=256,
+        nonpreemptible=True,
         min_containers=1,
         max_containers=1,
         timeout=15,
