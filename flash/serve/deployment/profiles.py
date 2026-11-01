@@ -245,7 +245,7 @@ _PROFILES: dict[str, ServingProfile] = {
         processor_kwargs={},
         modal_gpu="H100",
         modal_gpu_request="H100!",
-        modal_live_qualified=False,
+        modal_live_qualified=True,
     ),
     "Qwen/Qwen3.8-27B": ServingProfile(
         model_id="Qwen/Qwen3.8-27B",

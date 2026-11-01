@@ -176,7 +176,7 @@ def test_profile_matches_the_catalog_serving_capacity(model_id: str) -> None:
         }[model_id]
     )
     assert profile.modal_live_qualified is (
-        model_id not in {"Qwen/Qwen3.5-0.8B", "Qwen/Qwen3.5-4B", "Qwen/Qwen3.5-9B-Base"}
+        model_id not in {"Qwen/Qwen3.5-0.8B", "Qwen/Qwen3.5-4B"}
     )
 
 
