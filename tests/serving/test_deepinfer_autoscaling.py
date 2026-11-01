@@ -1,6 +1,8 @@
 """Pool thresholds, telemetry failures, and complete streaming request lifetimes."""
 
 import asyncio
+import runpy
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -235,3 +237,14 @@ def test_counter_covers_preparation_and_stream_lifetime(path, finish):
         assert counts["active"] == 0
 
     asyncio.run(run())
+
+
+def test_deployed_pool_controller_uses_nonpreemptible_cpu_capacity(monkeypatch):
+    monkeypatch.setenv("MODAL_ENVIRONMENT", "main")
+    module = runpy.run_path(
+        str(Path(__file__).parents[2] / "flash/serving/deepinfer/app/modal_app.py")
+    )
+    info = module["scale_pool"].info()
+    assert info.nonpreemptible
+    assert not info.gpus
+    assert info.schedule is not None
