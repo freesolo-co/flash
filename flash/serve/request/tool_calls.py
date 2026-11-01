@@ -140,8 +140,6 @@ def validate_tool_request_contract(
 
     if not tools_active(tools, tool_choice):
         return
-    if thinking:
-        raise error_type("tools are not supported for thinking-enabled generation")
     if tool_parser != TOOL_PARSER_QWEN3_CODER:
         raise error_type("this serving engine is not qualified for tool calling")
 
@@ -256,7 +254,11 @@ def validate_tool_history_replay(
         # would accept a turn the parser rejects as ambiguous.
         try:
             _validate_template_roundtrip(
-                probe, rendered_turn_prefix(message, message_index > last_query)
+                probe,
+                rendered_turn_prefix(message, message_index > last_query),
+                answer_prefix=rendered_turn_prefix(
+                    message, message_index > last_query, answer_only=True
+                ),
             )
         except ValueError as exc:
             raise error_type(f"message {message_index} {exc}") from exc
@@ -593,6 +595,8 @@ def _historical_replay_type(value: Any) -> str:
 def _validate_template_roundtrip(
     probe: Sequence[tuple[FunctionTool, dict[str, Any], dict[str, Any]]],
     prefix: str = "",
+    *,
+    answer_prefix: str | None = None,
 ) -> None:
     from flash.serve.runtime.tool_calls import parse_qwen3_coder_output
 
@@ -620,6 +624,8 @@ def _validate_template_roundtrip(
         size += len(blocks[-1])
         if size > _MAX_REPLAY_TEMPLATE_CHARS:
             raise ValueError(failure)
+    if prefix and answer_prefix is not None:
+        blocks[0] = answer_prefix
     text = "".join(blocks)
     replay_tools = _merged_replay_tools(probe)
     # replay must grant exactly what a generation parse of this same text would grant. restating

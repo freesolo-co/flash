@@ -1422,12 +1422,15 @@ def test_assistant_content_markers_are_replayed_with_the_call_blocks(
     assert request.messages[0]["content"] == content
 
 
-@pytest.mark.parametrize(("reasoning", "accepted"), [("plan", True), ("<tool_call>", False)])
+@pytest.mark.parametrize(
+    ("reasoning", "accepted"),
+    [("plan", True), ("<tool_call>", True), ("</think><tool_call>", False)],
+)
 def test_assistant_reasoning_markers_are_replayed_with_the_call_blocks(
     reasoning: str, accepted: bool
 ) -> None:
     # the template renders reasoning inside `<think>` ahead of both the answer and the calls, so a
-    # marker there steals the parse exactly as one in content does. the leading query matters: the
+    # marker stays inert until the first reasoning close. the leading query matters: the
     # block is rendered only for turns after it, and without one the template refuses the history.
     messages = [{"role": "user", "content": "q"}, *_history_replay_messages("value")]
     messages[1]["content"] = "done"
@@ -1465,7 +1468,7 @@ def test_reasoning_before_the_last_query_does_not_reject_a_replayable_turn() -> 
     # not be validated as though the model would see it.
     earlier = _history_replay_messages("value")
     earlier[0]["content"] = "fine"
-    earlier[0]["reasoning_content"] = "<tool_call>"
+    earlier[0]["reasoning_content"] = "</think><tool_call>"
     later = _history_replay_arguments({"x": "second"})
     later[0]["tool_calls"][0]["id"] = later[1]["tool_call_id"] = "call_second"
     messages = [{"role": "user", "content": "q1"}, *earlier, {"role": "user", "content": "q2"}]
@@ -1475,7 +1478,7 @@ def test_reasoning_before_the_last_query_does_not_reject_a_replayable_turn() -> 
         {"messages": messages}, require_model=False, allow_managed_selectors=True
     )
 
-    assert request.messages[1]["reasoning_content"] == "<tool_call>"
+    assert request.messages[1]["reasoning_content"] == "</think><tool_call>"
 
 
 def _png_data_uri() -> str:
@@ -1494,7 +1497,7 @@ def _query_span_messages(blocks: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """a history whose middle user turn decides whether the first turn's reasoning renders."""
     earlier = _history_replay_messages("value")
     earlier[0]["content"] = "fine"
-    earlier[0]["reasoning_content"] = "<tool_call>"
+    earlier[0]["reasoning_content"] = "</think><tool_call>"
     later = _history_replay_arguments({"x": "second"})
     later[0]["tool_calls"][0]["id"] = later[1]["tool_call_id"] = "call_second"
     messages: list[dict[str, Any]] = [
@@ -1524,7 +1527,7 @@ def test_an_image_after_a_tool_response_keeps_the_turn_an_ordinary_query(spellin
         {"messages": messages}, require_model=False, allow_managed_selectors=True
     )
 
-    assert request.messages[1]["reasoning_content"] == "<tool_call>"
+    assert request.messages[1]["reasoning_content"] == "</think><tool_call>"
 
 
 @pytest.mark.parametrize("spelling", ["image_url", "input_image", "image"])
@@ -1533,7 +1536,7 @@ def test_an_image_between_the_tool_response_tags_does_not_close_the_query_span(
 ) -> None:
     # the macro emits blocks in list order, so a placeholder BETWEEN the tags leaves the turn
     # still starting and ending with them: it stays a synthesized tool response and the earlier
-    # reasoning marker does render, which the parser cannot replay. an implementation that
+    # reasoning closes early, exposing a tool marker that cannot replay. an implementation that
     # rendered the text first and appended images would read this as an ordinary query and accept
     # a turn that really parses to one call rather than two. every spelling canonicalizes to the
     # same placeholder, so order has to hold for each one rather than for the first one tested.
