@@ -193,7 +193,7 @@ def test_engine_config_loads_served_checkpoint_not_logical_provenance() -> None:
 
 @pytest.mark.parametrize(
     "model_id",
-    ["Qwen/Qwen3.5-9B", "Qwen/Qwen3.8-27B", "Qwen/Qwen3.6-35B-A3B"],
+    ["Qwen/Qwen3.5-9B", "Qwen/Qwen3.5-9B-Base", "Qwen/Qwen3.8-27B", "Qwen/Qwen3.6-35B-A3B"],
 )
 def test_profile_fields_reach_the_runtime_engine_config(model_id: str) -> None:
     manifest = build_serving_manifest(*_profile_spec_and_inputs(model_id))

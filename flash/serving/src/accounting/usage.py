@@ -36,6 +36,8 @@ _FREESOLO_USD_PER_MTOK: dict[str, tuple[str, str, str]] = {
     "Qwen/Qwen3.5-4B": ("0.036", "0.18", "0.0072"),
     "deepseek-ai/DeepSeek-V4.1-Flash-1017": ("0.15", "0.60", "0.003"),
     "Qwen/Qwen3.5-9B": ("0.095", "0.1425", "0.0276"),
+    # Pretrained 9B uses the same customer token rates as post-trained 9B.
+    "Qwen/Qwen3.5-9B-Base": ("0.095", "0.1425", "0.0276"),
     "Qwen/Qwen3.8-27B": ("0.3325", "2.4225", "0.03325"),
     "Qwen/Qwen3.6-35B-A3B": ("0.095", "0.9025", "0.0475"),
 }

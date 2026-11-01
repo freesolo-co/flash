@@ -1668,7 +1668,7 @@ def test_mrope_processor_check_matches_every_image_training_model():
     # config model_type for the catalog's image-training models. Qwen3.6-* ship as qwen3_5 configs
     # (the product version is not the architecture), and the -A3B moe variant is a separate one.
     model_types = {"qwen3_5", "qwen3_5_moe"}
-    assert len(_IMAGE_TRAINING_MODELS) == 3, (
+    assert len(_IMAGE_TRAINING_MODELS) == 4, (
         "the image-training catalog changed; confirm the new models' config model_type is covered"
     )
 
