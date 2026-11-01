@@ -2,7 +2,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from flash.serve.request.stop_tokens import chat_stop_token_ids
+from flash.content.stop_tokens import chat_stop_token_ids
 
 
 @pytest.mark.parametrize("token_id", [None, -1, True, 7])
