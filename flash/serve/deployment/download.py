@@ -73,7 +73,7 @@ def _fetch_adapter(source_repo: str, subfolder: str, destination: Path) -> tuple
     except ServingError:
         raise
     except Exception:
-        # hub exceptions can contain private repository names and signed URLs.
+        # storage exceptions can contain private repository names and signed URLs.
         raise ServingError("could not read checkpoint adapter from artifact storage") from None
     return destination / subfolder, revision
 

@@ -1,6 +1,6 @@
 """Adapter artifact validation for serving deployments.
 
-Before an adapter is registered with the serving backend, its files on the Hub must be
+Before an adapter is registered with the serving backend, its files in Azure storage must be
 checked: the tensor file has to exist, and the rank recorded in `adapter_config.json` has
 to be one the serving engine was built for. That validation is independent of the
 deployment state machine, so it lives here.
