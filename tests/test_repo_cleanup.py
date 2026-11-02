@@ -52,11 +52,11 @@ def _frozen(monkeypatch):
     # this an operator shell that exports it (per SELF_HOSTING.md) would make the sweep scan
     # `<their-ns>/...` while every fixture repo id says `Freesolo-Co/...`, and the allowlist would
     # match nothing -- failing locally while CI, whose env is clean, stayed green.
-    monkeypatch.setenv("FLASH_HF_NAMESPACE", NS)
+    monkeypatch.setenv("FLASH_ARTIFACT_NAMESPACE", NS)
     monkeypatch.setattr(rc, "_now", lambda: NOW)
     monkeypatch.setattr(rc, "_DELETE_SLEEP_S", 0)
     monkeypatch.setattr(rc, "run_scheduled_cleanup", _REAL_RUN_SCHEDULED_CLEANUP)
-    monkeypatch.delenv("HF_TOKEN", raising=False)
+    monkeypatch.delenv("FLASH_ARTIFACT_BLOB_ACCOUNT_URL", raising=False)
 
 
 class _DummyHeld:
@@ -132,7 +132,7 @@ def _adapter(path: str, age: float, size: int = 1000):
 
 def test_enabled_requires_hf_token(monkeypatch):
     assert rc.repo_cleanup_enabled() is False
-    monkeypatch.setenv("HF_TOKEN", "tok")
+    monkeypatch.setenv("FLASH_ARTIFACT_BLOB_ACCOUNT_URL", "tok")
     assert rc.repo_cleanup_enabled() is True
 
 
@@ -152,19 +152,6 @@ def test_scan_workers_ignores_environment(value):
         text=True,
     )
     assert result.stdout.strip() == "8"
-
-
-def test_sweep_noops_when_huggingface_hub_unavailable(monkeypatch):
-    monkeypatch.setattr(rc, "HfApi", None)
-    monkeypatch.setattr(rc, "_warned_hf_unavailable", False)
-    # If it didn't short-circuit it would confirm the live set; make that explode to catch a regression.
-    monkeypatch.setattr(
-        rc, "_confirm_live_set", lambda: (_ for _ in ()).throw(AssertionError("called"))
-    )
-    assert rc.run_scheduled_cleanup(dry_run=False, api=None) == 0
-
-
-# ---- helpers ----------------------------------------------------------------------------------
 
 
 def test_is_managed_env_repo_allowlist():
@@ -681,8 +668,7 @@ def test_deletion_rechecks_only_target_and_references(monkeypatch):
     "failure", ["missing_references", "missing_target", "unreadable_references"]
 )
 def test_scoped_recheck_handles_missing_paths_and_read_failures(monkeypatch, failure):
-    import httpx
-    from huggingface_hub.errors import RemoteEntryNotFoundError
+    from flash.artifacts.manifest import ArtifactNotFoundError as RemoteEntryNotFoundError
 
     _wire(monkeypatch)
     repo = _managed("e")
@@ -695,12 +681,7 @@ def test_scoped_recheck_handles_missing_paths_and_read_failures(monkeypatch, fai
             if path == (prefix if failure == "missing_target" else rc.REF_MARKER):
                 if failure == "unreadable_references":
                     raise RuntimeError("HF 429")
-                raise RemoteEntryNotFoundError(
-                    "missing directory",
-                    response=httpx.Response(
-                        404, request=httpx.Request("GET", "https://hf.test/tree")
-                    ),
-                )
+                raise RemoteEntryNotFoundError("missing directory")
             yield from super().list_repo_tree(**kwargs)
 
     api = FailingListingApi({repo: [_adapter(f"{prefix}/w", OLD)]})

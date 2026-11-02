@@ -190,9 +190,9 @@ def _prepare_init_from_adapter_inner(
     from flash.adapters.fused_experts import validate_fused_expert_adapter_config
     from flash.adapters.lora_rank import (
         adapter_artifact_identity,
-        load_hf_adapter_config,
+        load_artifact_adapter_config,
         preflight_init_adapter_lora_rank,
-        resolve_hf_dataset_revision,
+        resolve_artifact_revision,
     )
     from flash.adapters.targets import require_modality_marker
     from flash.runner.results.checkpoints import CheckpointListingError, adapter_artifact_exists
@@ -251,7 +251,7 @@ def _prepare_init_from_adapter_inner(
             f"{src_run_id}/step-N checkpoint"
         )
     storage = checkpoint_storage_ref(src_spec.train.hf_repo, src_spec.phase, src_run_id, step)
-    revision = resolve_hf_dataset_revision(src_spec.train.hf_repo, token)
+    revision = resolve_artifact_revision(src_spec.train.hf_repo, token)
     try:
         exists = adapter_artifact_exists(src_spec, step=step, revision=revision)
     except CheckpointListingError as exc:
@@ -270,7 +270,7 @@ def _prepare_init_from_adapter_inner(
             init_from_adapter_revision=revision,
         ),
     )
-    config = load_hf_adapter_config(storage, token, revision)
+    config = load_artifact_adapter_config(storage, token, revision)
     # here rather than only in the worker: this is the same config the worker will re-download and
     # re-check, and an unmarked adapter is unusable by every algorithm, so deciding it now turns a
     # post-allocation worker failure into a submit-time error and spends no GPU on a doomed run.
@@ -307,9 +307,9 @@ def _mark_warmstart_source(worker_spec: JobSpec, child_run_id: str) -> None:
     if not source_repo:
         return
     with contextlib.suppress(Exception):
-        from huggingface_hub import HfApi
+        from flash.artifacts.api import ArtifactStore
 
-        HfApi().upload_file(
+        ArtifactStore().upload_file(
             path_or_fileobj=io.BytesIO(b""),
             path_in_repo=f"referenced_by/{child_run_id}",
             repo_id=source_repo,

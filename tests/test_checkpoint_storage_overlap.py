@@ -9,7 +9,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from flash.engine.worker.io import hf
+from flash.engine.worker.io import artifacts as hf
 from flash.engine.worker.train.core.lifecycle.persistence import (
     CheckpointPersistence,
     pin_checkpoint,

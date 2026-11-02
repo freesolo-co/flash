@@ -9,15 +9,15 @@ import traceback
 from functools import partial
 
 import flash.engine.worker.entry.rl as rl_entry
+import flash.engine.worker.io.artifacts as hf_io
 import flash.engine.worker.io.heartbeat as heartbeat_io
-import flash.engine.worker.io.hf as hf_io
 import flash.engine.worker.perf as worker_perf
 import flash.engine.worker.runtime.kernel_warmup as kernel_warmup
 import flash.engine.worker.train.entry.backend_common as backend_common
 import flash.engine.worker.train.entry.sft_train as sft_entry
 from flash._internal.diagnostics import sanitize_diagnostic
+from flash.artifacts.errors import artifact_error_transience
 from flash.core.spec import gpu_count_of
-from flash.engine.support.huggingface import hub_error_transience
 from flash.engine.worker.runtime.state import WorkerContext
 from flash.envs.loading.staged import (
     StagedEnvironmentTransientError,
@@ -49,11 +49,6 @@ def _preflight_gpu_occupancy_for_spec(*, context: WorkerContext) -> None:
 
 
 def _run_worker_mode(*, context: WorkerContext) -> None:
-    # first statement in the worker, ahead of every import below it: `huggingface_hub.constants`
-    # captures HF_HUB_DISABLE_XET when it is imported, so setting it afterwards has no effect on
-    # which upload path is used. anything imported before this line could freeze the default.
-    hf_io._disable_xet_upload_staging()
-
     modes = {
         "sft": partial(sft_entry.run_sft_train, context=context),
         "rl": partial(rl_entry.run_rl, context=context),
@@ -70,21 +65,21 @@ def _run_worker_mode(*, context: WorkerContext) -> None:
         raise RuntimeError("worker run wall deadline exceeded")
     # Idempotency: check DONE before any env-mutating pip install (fla fast path).
     if context.config.hf_repo:
-        from huggingface_hub import hf_hub_download
-        from huggingface_hub.errors import RemoteEntryNotFoundError
+        from flash.artifacts.api import download_file
+        from flash.artifacts.manifest import ArtifactNotFoundError as RemoteEntryNotFoundError
 
         try:
-            hf_hub_download(
+            download_file(
                 repo_id=context.config.hf_repo,
                 repo_type="dataset",
                 filename=f"{hf_io.hf_prefix(context=context)}/DONE",
-                token=os.environ.get("HF_TOKEN"),
+                token=None,
             )
             done = True
         except Exception as exc:
             if type(exc) is RemoteEntryNotFoundError:
                 done = False
-            elif hub_error_transience(exc) is True:
+            elif artifact_error_transience(exc) is True:
                 raise worker_perf.RetriableInfraError(
                     f"DONE marker read failed transiently ({type(exc).__name__})"
                 ) from exc
@@ -108,11 +103,11 @@ def _run_worker_mode(*, context: WorkerContext) -> None:
                 if remaining is not None and remaining <= 0:
                     break
                 try:
-                    got = hf_hub_download(
+                    got = download_file(
                         repo_id=context.config.hf_repo,
                         repo_type="dataset",
                         filename=f"{hf_io.hf_prefix(context=context)}/metrics.json",
-                        token=os.environ.get("HF_TOKEN"),
+                        token=None,
                     )
                     import shutil
 
@@ -180,7 +175,7 @@ def main(*, context: WorkerContext):
             err_path = f"/tmp/{err_name}"
             with open(err_path, "w") as f:
                 f.write(tb)
-            hf_io.hf_upload_file(err_path, err_name, context=context)
+            hf_io.upload_artifact_file(err_path, err_name, context=context)
         except Exception as up_err:
             print("error-upload warn:", sanitize_diagnostic(up_err, limit=500))
         try:
@@ -194,7 +189,7 @@ def main(*, context: WorkerContext):
                 ray_path = f"/tmp/{ray_name}"
                 with open(ray_path, "w") as f:
                     f.write(ray_logs)
-                hf_io.hf_upload_file(ray_path, ray_name, context=context)
+                hf_io.upload_artifact_file(ray_path, ray_name, context=context)
         except Exception as ray_err:
             # this is the failure path already. a collector that could raise here would replace the
             # run's real error with its own.

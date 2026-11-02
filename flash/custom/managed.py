@@ -11,16 +11,17 @@ from pathlib import Path
 
 
 def session_token(run_id, attempt):
-    secret = os.environ.get("HF_TOKEN", "")
+    secret = os.environ.get("FREESOLO_INTERNAL_KEY", "")
     if not secret:
-        raise RuntimeError("managed custom sessions require artifact credentials")
+        raise RuntimeError(
+            "managed custom sessions require FREESOLO_INTERNAL_KEY on the controller"
+        )
     message = json.dumps(["flash-custom-session-v1", run_id, attempt]).encode()
     return hmac.new(secret.encode(), message, hashlib.sha256).hexdigest()
 
 
 def resolve_resume(spec, *, owner_org_id, owner_key_id):
-    from huggingface_hub import HfApi, hf_hub_download
-
+    from flash.artifacts.api import ArtifactStore, download_file
     from flash.engine.support.checkpoint_transport import MANIFEST, parse_manifest
     from flash.runner.lifecycle import preparation, status
     from flash.runner.results.checkpoints import (
@@ -47,19 +48,19 @@ def resolve_resume(spec, *, owner_org_id, owner_key_id):
     ):
         raise ValueError("custom resume requires the source LoRA rank and alpha")
     repo = source.train.hf_repo
-    api = HfApi(token=os.environ.get("HF_TOKEN"))
+    api = ArtifactStore(token=None)
     revision = api.repo_info(repo, repo_type="dataset").sha
     path = checkpoint_adapter_prefix(source, step)
     required = {f"{path}/{name}" for name in ("metadata.json", "algorithm.json")}
     files = api.list_repo_files(repo, repo_type="dataset", revision=revision)
     native_state = f"{path}/state.pt" in files
     if not native_state and f"{path}/{MANIFEST}" in files:
-        manifest = hf_hub_download(
+        manifest = download_file(
             repo,
             f"{path}/{MANIFEST}",
             repo_type="dataset",
             revision=revision,
-            token=os.environ.get("HF_TOKEN"),
+            token=None,
         )
         entry = parse_manifest(Path(manifest).read_bytes()).get("state.pt")
         native_state = entry is not None and all(
@@ -71,12 +72,12 @@ def resolve_resume(spec, *, owner_org_id, owner_key_id):
         or not _adapter_folder_has_required_files(files, path)
     ):
         raise ValueError("custom checkpoint is incomplete")
-    metadata_file = hf_hub_download(
+    metadata_file = download_file(
         repo,
         f"{path}/metadata.json",
         repo_type="dataset",
         revision=revision,
-        token=os.environ.get("HF_TOKEN"),
+        token=None,
     )
     metadata = json.loads(Path(metadata_file).read_text())
     if metadata.get("format") != "flash-custom-v1" or metadata.get("step") != step:

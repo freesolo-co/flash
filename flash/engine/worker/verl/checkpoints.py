@@ -283,7 +283,7 @@ def select_verl_resume_checkpoint(
     context: WorkerContext,
 ) -> tuple[str | None, FsdpCheckpointInspection | None]:
     """select the newest caller-accepted loadable checkpoint and return its cached inspection."""
-    import flash.engine.worker.io.hf as worker_hf
+    import flash.engine.worker.io.artifacts as worker_hf
 
     inspections: dict[str, FsdpCheckpointInspection] = {}
 
@@ -297,7 +297,7 @@ def select_verl_resume_checkpoint(
             inspections[path] = inspection
         return inspection.loadable and (accept is None or accept(path, inspection))
 
-    resume = worker_hf.hf_resume_checkpoint(prefer=prefer, context=context)
+    resume = worker_hf.resume_checkpoint(prefer=prefer, context=context)
     if not resume:
         return None, None
     inspection = inspections.get(resume)

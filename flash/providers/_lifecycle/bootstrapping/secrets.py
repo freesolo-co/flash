@@ -140,9 +140,12 @@ def _redact_values(text: str, values: set[str]) -> str:
 
 def _is_secret_env_name(name: str) -> bool:
     upper = str(name).upper()
-    return upper in {"AUTHORIZATION", "HF_TOKEN"} or upper.endswith(
-        ("_API_KEY", "_TOKEN", "_SECRET", "_PASSWORD")
-    )
+    return upper in {
+        "AUTHORIZATION",
+        "HF_TOKEN",
+        "FLASH_ARTIFACT_BLOB_CONNECTION_STRING",
+        "FLASH_ARTIFACT_BLOB_SAS_URL",
+    } or upper.endswith(("_API_KEY", "_TOKEN", "_SECRET", "_PASSWORD"))
 
 
 def _payload_secrets(payload: dict) -> dict:

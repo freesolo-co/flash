@@ -11,13 +11,11 @@ endpoint GC - pointed at hardware you pay for directly.
 
 ## What you need
 
-Your Modal credentials, a Hugging Face write token, and a control-plane auth key:
+Your Modal credentials, private Azure artifact storage, and a control-plane auth key:
 
 |                         |                                                                                                                                                                               |
 | ----------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | **Modal workspace**    | a Modal workspace with GPU access.                                                                                                                         |
-| `HF_TOKEN`              | a HuggingFace token with **write** access. Flash streams code, checkpoints, and adapters through HuggingFace dataset repos, so every run needs it. |
-| `FLASH_HF_NAMESPACE`    | the HuggingFace user or org those repos are created under - **set this to one your `HF_TOKEN` can write to.** It defaults to Freesolo's namespace, which you cannot write to. |
 | `FREESOLO_INTERNAL_KEY` | the key your clients present to your plane. Generate it yourself.                                                                                                             |
 
 Everything else is optional.
@@ -34,8 +32,9 @@ pip install 'freesolo-flash[server]'   # the base install is client-only
 
 export FLASH_STANDALONE=1
 export FREESOLO_INTERNAL_KEY=$(openssl rand -hex 32)
-export HF_TOKEN=hf_...
-export FLASH_HF_NAMESPACE=your-hf-username   # where run artifacts are created
+export FLASH_ARTIFACT_BLOB_ACCOUNT_URL=https://youraccount.blob.core.windows.net
+export FLASH_ARTIFACT_BLOB_CONTAINER=artifacts
+# Authenticate DefaultAzureCredential, or set FLASH_ARTIFACT_BLOB_CONNECTION_STRING.
 export MODAL_TOKEN_ID=...
 export MODAL_TOKEN_SECRET=...
 
@@ -221,11 +220,11 @@ defaults to `main`. Keep that environment and credential owner stable while runs
 persisted attempts are bound to their owner, and cleanup refuses a different credential scope.
 
 Flash creates named GPU Sandboxes in `flash-training`. The controller persists the exact sandbox
-ID before polling. It reconnects after a restart, streams artifacts through Hugging Face, resumes
+ID before polling. It reconnects after a restart, streams artifacts through private Azure Blob Storage, resumes
 from streamed checkpoints after preemption, and confirms termination on cancellation. Ambiguous
 creation is reconciled by exact name and attempt metadata before another launch is allowed.
 Native resume files larger than 40 GB are uploaded in checksum-verified parts and reassembled
-before restore, so single-GPU checkpoints can exceed Hugging Face's per-file upload limit.
+before restore, so single-GPU checkpoints can exceed individual transport part limits.
 Staging and reassembly temporarily need another copy of those large files on local disk.
 
 The shared `flash-weights` Modal Volume retains trusted public base-model weights. Tenant artifacts
@@ -274,7 +273,7 @@ uv run python scripts/smoke_modal_training.py --run-paid-test
 This reserves two L4 GPUs with a 15-minute deadline, checks NCCL, duplicate adoption, cache
 persistence and confirmed termination, then removes its own sandboxes and temporary Volume.
 
-With `HF_TOKEN` exported and a disposable private dataset repo, run the full two-step SFT smoke:
+With Azure artifact storage configured and a disposable logical artifact namespace, run the full two-step SFT smoke:
 
 ```bash
 uv run python scripts/smoke_modal_sft.py --run-paid-test --repo your-account/private-smoke
@@ -288,8 +287,9 @@ removed afterward; artifacts remain in the supplied repository for inspection.
 
 Migrating an existing installation requires draining its active training runs and retiring its old
 provider resources using the pre-migration release before starting this Modal-only controller.
-Historical provider handles are not converted into Modal identities. Existing Hugging Face
-checkpoints and adapters remain usable; the provider migration does not rewrite those artifacts.
+Historical provider handles are not converted into Modal identities. The Azure artifact cutover requires the separate three-day backfill described in
+[Azure artifact migration](docs/azure-artifacts.md). Older Hub artifacts are not available through
+the new runtime; it has no Hub storage fallback.
 
 This requires a clean control-plane cutover. Export needed artifacts and back up run state
 using the old release; retain it with the old records for historical access. Draining jobs does
@@ -431,7 +431,8 @@ six rank-64 LoRA slots.
 # the `server` extra, not the bare install: `serve deploy` resolves the adapter through
 # huggingface_hub and drives modal's sdk, and `[project].dependencies` is empty by design.
 pip install 'freesolo-flash[server]'
-export HF_TOKEN=hf_...
+export HF_TOKEN=hf_... # optional upstream model access
+export FLASH_ARTIFACT_BLOB_SAS_URL="https://youraccount.blob.core.windows.net/artifacts?<read-only-sas>"
 export FLASH_SERVING_KEY=$(python -c 'import secrets; print(secrets.token_urlsafe(32))')
 
 # modal: `modal token new` writes these, or set them directly
@@ -520,7 +521,7 @@ configuration that only degrades an optional capability warns instead of blockin
 It fails on:
 
 - either `MODAL_TOKEN_ID` or `MODAL_TOKEN_SECRET` missing
-- `HF_TOKEN` missing
+- Azure artifact storage not configured
 - `FREESOLO_INTERNAL_KEY` missing
 
 It warns on a missing `GITHUB_TOKEN`, then logs the
@@ -547,3 +548,5 @@ non-empty and non-whitespace. Both Modal token variables must be present.
 
 **Runs fail to allocate on a class you expected.** The allocator only proposes classes on
 configured providers. Check the `GPU provider(s) configured:` startup line.
+
+See [Azure artifact migration](docs/azure-artifacts.md) before upgrading an existing controller.

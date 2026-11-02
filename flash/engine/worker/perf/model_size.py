@@ -51,7 +51,7 @@ def _checkpointing_default_for_model(model_id: str, revision: str = "") -> bool:
     try:
         from transformers import AutoConfig
 
-        from flash.engine.worker.io.hf import model_revision_kwargs
+        from flash.engine.worker.io.artifacts import model_revision_kwargs
 
         cfg = AutoConfig.from_pretrained(
             model_id,

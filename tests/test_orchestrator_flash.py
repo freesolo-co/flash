@@ -155,10 +155,10 @@ def _install_snapshot_hub(monkeypatch, api_type, download):
     import sys
     import types
 
-    fake_hub = types.ModuleType("huggingface_hub")
-    fake_hub.HfApi = api_type
-    fake_hub.hf_hub_download = download
-    monkeypatch.setitem(sys.modules, "huggingface_hub", fake_hub)
+    fake_hub = types.ModuleType("flash.artifacts.api")
+    fake_hub.ArtifactStore = api_type
+    fake_hub.download_file = download
+    monkeypatch.setitem(sys.modules, "flash.artifacts.api", fake_hub)
 
 
 def test_publish_source_snapshot_forces_private_and_captures_commit(monkeypatch, tmp_path):
@@ -265,7 +265,7 @@ def test_publish_source_snapshot_creates_missing_repo(monkeypatch, tmp_path):
     assert calls["settings"][0]["private"] is True
 
 
-def test_hf_call_honors_retry_after(monkeypatch):
+def test_artifact_call_honors_retry_after(monkeypatch):
     import flash.providers._lifecycle.net.worker as flash_train
 
     sleeps: list[float] = []
@@ -291,12 +291,12 @@ def test_hf_call_honors_retry_after(monkeypatch):
     monkeypatch.setattr("flash.providers._lifecycle.net.worker.time.sleep", sleeps.append)
     monkeypatch.setattr(flash_train.logger, "warning", lambda msg, *args: logs.append((msg, args)))
 
-    assert flash_train._hf_call(flaky, "upload") == "ok"
+    assert flash_train._artifact_call(flaky, "upload") == "ok"
     assert sleeps == [17.0]
     assert logs
 
 
-def test_hf_call_caps_http_date_retry_after(monkeypatch):
+def test_artifact_call_caps_http_date_retry_after(monkeypatch):
     import flash.providers._lifecycle.net.worker as flash_train
 
     sleeps: list[float] = []
@@ -321,7 +321,7 @@ def test_hf_call_caps_http_date_retry_after(monkeypatch):
     monkeypatch.setattr("flash.providers._lifecycle.net.worker.time.sleep", sleeps.append)
     monkeypatch.setattr(flash_train.logger, "warning", lambda *_args: None)
 
-    assert flash_train._hf_call(flaky, "upload") == "ok"
+    assert flash_train._artifact_call(flaky, "upload") == "ok"
     assert sleeps == [60.0]
 
 

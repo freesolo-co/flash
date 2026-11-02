@@ -138,7 +138,7 @@ def test_paths_are_matched_by_basename():
 
 def test_worker_deployable_check_accepts_a_sharded_save(tmp_path):
     """the worker publishes per-step adapters; a sharded save must not be silently skipped."""
-    from flash.engine.worker.io.hf import _has_deployable_adapter
+    from flash.engine.worker.io.artifacts import _has_deployable_adapter
 
     (tmp_path / "adapter_config.json").write_text("{}")
     for name in _SHARDS:
@@ -149,7 +149,7 @@ def test_worker_deployable_check_accepts_a_sharded_save(tmp_path):
 
 
 def test_worker_deployable_check_rejects_an_orphan_shard(tmp_path):
-    from flash.engine.worker.io.hf import _has_deployable_adapter
+    from flash.engine.worker.io.artifacts import _has_deployable_adapter
 
     (tmp_path / "adapter_config.json").write_text("{}")
     (tmp_path / _SHARDS[0]).write_bytes(b"\x00")
@@ -289,8 +289,7 @@ def test_serving_validation_refuses_an_orphan_shard(monkeypatch):
     """registering it deploys a base model the user benchmarks as their adapter."""
     from types import SimpleNamespace
 
-    import huggingface_hub
-
+    from flash.artifacts import api as artifact_storage
     from flash.serve.contract.errors import AdapterTensorMissing
     from flash.serve.deployment.adapter_check import _verify_adapter_artifact_tensors
 
@@ -298,7 +297,7 @@ def test_serving_validation_refuses_an_orphan_shard(monkeypatch):
         def list_repo_tree(self, **_kwargs):
             return [SimpleNamespace(path=f"sft/run/adapter/{_SHARDS[0]}", size=456)]
 
-    monkeypatch.setattr(huggingface_hub, "HfApi", lambda *a, **k: FakeApi())
+    monkeypatch.setattr(artifact_storage, "ArtifactStore", lambda *a, **k: FakeApi())
 
     with pytest.raises(AdapterTensorMissing, match="no complete index-referenced set"):
         _verify_adapter_artifact_tensors("org/repo", "sft/run/adapter", artifact_revision="sha")
@@ -307,8 +306,7 @@ def test_serving_validation_refuses_an_orphan_shard(monkeypatch):
 def test_serving_validation_accepts_a_complete_shard_set(monkeypatch):
     from types import SimpleNamespace
 
-    import huggingface_hub
-
+    from flash.artifacts import api as artifact_storage
     from flash.serve.deployment.adapter_check import _verify_adapter_artifact_tensors
 
     class FakeApi:
@@ -318,7 +316,7 @@ def test_serving_validation_accepts_a_complete_shard_set(monkeypatch):
                 for name in (*_SHARDS, _INDEX)
             ]
 
-    monkeypatch.setattr(huggingface_hub, "HfApi", lambda *a, **k: FakeApi())
+    monkeypatch.setattr(artifact_storage, "ArtifactStore", lambda *a, **k: FakeApi())
 
     _verify_adapter_artifact_tensors("org/repo", "sft/run/adapter", artifact_revision="sha")
 
@@ -331,9 +329,8 @@ def test_warmstart_identity_binds_every_shard(monkeypatch):
     """
     from types import SimpleNamespace
 
-    import huggingface_hub
-
     from flash.adapters.lora_rank import adapter_artifact_identity
+    from flash.artifacts import api as artifact_storage
 
     oids = {name: f"sha256:{name}-v1" for name in _SHARDS}
 
@@ -355,7 +352,7 @@ def test_warmstart_identity_binds_every_shard(monkeypatch):
                 for name in (*_SHARDS, _INDEX)
             ]
 
-    monkeypatch.setattr(huggingface_hub, "HfApi", FakeApi)
+    monkeypatch.setattr(artifact_storage, "ArtifactStore", FakeApi)
     config = {"peft_type": "LORA", "r": 16, "lora_alpha": 32}
     first = adapter_artifact_identity("owner/runs:sft/run", config, token="t")
     assert first.weight_filename == ",".join(_SHARDS)

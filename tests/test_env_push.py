@@ -414,7 +414,7 @@ def test_push_allows_clean_binary_placeholders_and_embedded_direct_token_shapes(
     )
     (env_dir / "notes.txt").write_text(
         "ordinary text without credentials\n"
-        "hf_resume_checkpoint\n"
+        "resume_checkpoint\n"
         "fslo_retry_after_close\n"
         "pit_environment_identifier\n"
     )

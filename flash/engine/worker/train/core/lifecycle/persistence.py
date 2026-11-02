@@ -16,8 +16,8 @@ from collections import deque
 from collections.abc import Callable
 from concurrent.futures import Future
 
+from flash.engine.worker.io.artifacts import PublicationResult
 from flash.engine.worker.io.heartbeat import join_while_draining
-from flash.engine.worker.io.hf import PublicationResult
 from flash.engine.worker.runtime.state import WorkerContext
 
 

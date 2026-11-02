@@ -27,35 +27,6 @@ def _present(var: str) -> bool:
     return bool((os.environ.get(var) or "").strip())
 
 
-def _artifact_namespace_problem(value: str) -> str:
-    """Why ``value`` cannot serve as an artifact namespace, or "" if it can.
-
-    A namespace is ONE hugging face id segment. ``managed_hf_repo_for_environment`` appends the
-    repo name to it, so an operator who writes the natural-looking ``owner/repo`` produces a
-    three-segment id that hugging face rejects -- and rejects at the first submit, long after
-    preflight called the plane healthy. Validating the assembled id rather than the segment alone
-    keeps this honest about what actually gets created.
-    """
-    if "/" in value:
-        return (
-            f"{value!r} contains '/', but this is a single namespace (a HuggingFace user or org), "
-            "not a repo id. Flash appends the repo name itself, so this would build "
-            f"'{value}/flashrun-...', which HuggingFace rejects as an id"
-        )
-    from huggingface_hub.utils import validate_repo_id
-
-    from flash.runner.accounting.artifacts import _environment_artifact_repo_name
-
-    # validate the id that WILL be created, not the segment in isolation: the repo half is
-    # generated and already known-good, so anything rejected here is the operator's namespace.
-    candidate = f"{value}/{_environment_artifact_repo_name('preflight-probe')}"
-    try:
-        validate_repo_id(candidate)
-    except Exception as exc:
-        return f"{value!r} is not a usable HuggingFace namespace: {exc}"
-    return ""
-
-
 # Credentials the plane reads straight from ``os.environ`` at many call sites rather than through
 # one accessor. Normalized in place at startup so the value consumers read is the value preflight
 # accepted -- see ``_normalize_operator_credentials``.
@@ -103,7 +74,6 @@ def require_operator_config() -> None:
     env vars, so running it twice changes nothing.
     """
     from flash.providers.core.registry import available_providers
-    from flash.server.platform.auth import standalone
 
     _normalize_operator_credentials()
 
@@ -119,34 +89,17 @@ def require_operator_config() -> None:
             )
         )
 
-    if not _present("HF_TOKEN"):
+    from flash.artifacts.config import configured
+
+    if not configured():
         problems.append(
-            "  - HF_TOKEN: a token with write access to each run's "
-            "`[train] hf_repo`, e.g. `export HF_TOKEN=hf_...`. Flash streams code, "
-            "checkpoints and adapters through HuggingFace dataset repos, so every run "
-            "needs it regardless of GPU provider"
+            "  - configure private Azure artifact storage (FLASH_ARTIFACT_BLOB_ACCOUNT_URL or FLASH_ARTIFACT_BLOB_CONNECTION_STRING)"
         )
-    if standalone() and not _present("FLASH_HF_NAMESPACE"):
-        # Only in standalone. The managed plane's HF_TOKEN owns the default namespace; a
-        # self-hoster's does not, so leaving it unset defers a certain failure to the first
-        # submit, where it surfaces as an HF permission error on repo creation long after
-        # preflight reported the plane healthy.
-        problems.append(
-            "  - FLASH_HF_NAMESPACE: the HuggingFace user or org that run artifacts are "
-            "created under. Required with FLASH_STANDALONE=1: it defaults to Freesolo's "
-            "namespace, which your HF_TOKEN cannot write to, so every run would fail at "
-            "artifact upload before training starts. Set it to a namespace your HF_TOKEN "
-            "owns, e.g. `export FLASH_HF_NAMESPACE=your-hf-username`"
-        )
-    elif _present("FLASH_HF_NAMESPACE"):
-        # set, but not necessarily usable. presence alone was the whole check, so `owner/repo` --
-        # the natural spelling for anyone used to HF ids -- passed preflight and then failed every
-        # submit while creating the artifact repo, with the plane reported healthy.
-        namespace_problem = _artifact_namespace_problem(
-            (os.environ.get("FLASH_HF_NAMESPACE") or "").strip()
-        )
-        if namespace_problem:
-            problems.append(f"  - FLASH_HF_NAMESPACE: {namespace_problem}")
+    import re
+
+    namespace = os.environ.get("FLASH_ARTIFACT_NAMESPACE", "Freesolo-Co").strip()
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", namespace):
+        problems.append("  - FLASH_ARTIFACT_NAMESPACE must be one path-safe namespace")
     if not _present("FREESOLO_INTERNAL_KEY"):
         problems.append(
             "  - FREESOLO_INTERNAL_KEY: the control plane's own auth key. On a self-hosted "

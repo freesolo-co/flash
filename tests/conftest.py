@@ -362,7 +362,7 @@ def _offline(monkeypatch):
     for _key in {
         "FREESOLO_API_KEY",
         "FLASH_STANDALONE",
-        "FLASH_HF_NAMESPACE",
+        "FLASH_ARTIFACT_NAMESPACE",
     } | set(DEFAULT_RUNTIME_SECRET_KEYS):
         monkeypatch.delenv(_key, raising=False)
 
@@ -536,3 +536,13 @@ def worker_context():
     from flash.engine.worker.runtime.state import WorkerContext
 
     return WorkerContext.from_env()
+
+
+@pytest.fixture(autouse=True)
+def _offline_azure_transport(monkeypatch):
+    from azure.core.pipeline.transport import RequestsTransport
+
+    def blocked(self, request, **kwargs):
+        raise AssertionError("unstubbed Azure request in offline tests")
+
+    monkeypatch.setattr(RequestsTransport, "send", blocked)

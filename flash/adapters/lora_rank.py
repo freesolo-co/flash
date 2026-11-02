@@ -81,7 +81,7 @@ def _positive_int(value: Any, *, source: str, field: str) -> int:
         if math.isfinite(value) and value.is_integer():
             parsed = int(value)
     elif isinstance(value, Decimal):
-        # load_hf_adapter_config parses json floats as decimal for exact textual fidelity.
+        # load_artifact_adapter_config parses json floats as decimal for exact textual fidelity.
         if value.is_finite() and value == value.to_integral_value():
             parsed = int(value)
     elif isinstance(value, str):
@@ -105,7 +105,7 @@ def _positive_int(value: Any, *, source: str, field: str) -> int:
 
 
 def _file_identity(file_info: Any) -> str:
-    # the producer is `HfApi.list_repo_tree`, which yields `RepoFile` -- whose `__init__` always
+    # the producer is `ArtifactStore.list_repo_tree`, which yields `ArtifactFile` -- whose `__init__` always
     # sets `path`/`size`/`blob_id` and builds `lfs` as a `BlobLfsInfo` (field `sha256`, no `oid`).
     # verified at the declared floor `huggingface-hub>=1.2.0` and at the installed 1.27.0, so the
     # mapping-shaped `lfs` and the `lfs.oid` spelling have no producer in the supported range.
@@ -123,12 +123,14 @@ def _file_identity(file_info: Any) -> str:
     return f"{immutable}:{size if size is not None else 'unknown'}"
 
 
-def resolve_hf_dataset_revision(repo: str, token: str | None = None) -> str:
+def resolve_artifact_revision(repo: str, token: str | None = None) -> str:
     """Resolve a dataset's current revision to an immutable commit SHA."""
     try:
-        from huggingface_hub import HfApi
+        from flash.artifacts.api import ArtifactStore
 
-        revision = str(HfApi(token=token).repo_info(repo, repo_type="dataset").sha or "").strip()
+        revision = str(
+            ArtifactStore(token=token).repo_info(repo, repo_type="dataset").sha or ""
+        ).strip()
     except Exception as exc:
         raise ValueError("could not pin source adapter revision") from exc
     if not re.fullmatch(r"[0-9a-fA-F]{40,64}", revision):
@@ -212,10 +214,10 @@ def adapter_artifact_identity(
     config_sha256 = hashlib.sha256(config_bytes).hexdigest()
     folder = f"{prefix}/adapter"
     try:
-        from huggingface_hub import HfApi
+        from flash.artifacts.api import ArtifactStore
 
         infos = list(
-            HfApi(token=token).list_repo_tree(
+            ArtifactStore(token=token).list_repo_tree(
                 repo_id=repo,
                 path_in_repo=folder,
                 repo_type="dataset",
@@ -482,19 +484,19 @@ def inspect_adapter_config(
     return AdapterMetadata(rank=rank, alpha=alpha)
 
 
-def load_hf_adapter_config(
+def load_artifact_adapter_config(
     adapter_ref: str, token: str | None = None, revision: str | None = None
 ) -> Mapping[str, Any]:
     """Read ``adapter_config.json`` for a Flash adapter ref from Hugging Face datasets."""
     repo, filename = adapter_config_path_from_ref(adapter_ref)
     try:
-        from huggingface_hub import hf_hub_download
+        from flash.artifacts.api import download_file
     except ImportError as exc:  # pragma: no cover - package extra is present in supported installs
         raise ValueError(
-            "could not verify train.init_from_adapter metadata: huggingface_hub is not installed"
+            "could not verify train.init_from_adapter metadata: Azure artifact support is not installed"
         ) from exc
     try:
-        local = hf_hub_download(
+        local = download_file(
             repo_id=repo,
             filename=filename,
             repo_type="dataset",
@@ -530,7 +532,7 @@ def preflight_init_adapter_lora_rank(
     if not adapter_storage_ref:
         return None
     repo, filename = adapter_config_path_from_ref(adapter_storage_ref)
-    loader = config_loader or load_hf_adapter_config
+    loader = config_loader or load_artifact_adapter_config
     return inspect_adapter_config(
         loader(adapter_storage_ref, token, spec.train.init_from_adapter_revision or None),
         source=f"{repo}:{filename}",

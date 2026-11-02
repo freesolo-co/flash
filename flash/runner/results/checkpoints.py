@@ -11,7 +11,6 @@ truth for what's deployable; backend persistence is a mirror (see
 
 from __future__ import annotations
 
-import os
 import re
 
 from flash.adapters.artifacts import has_loadable_adapter_weights
@@ -59,9 +58,9 @@ def _repo_files(spec: JobSpec, *, strict: bool, revision: str | None = None) -> 
     if not repo:
         return []
     try:
-        from huggingface_hub import HfApi
+        from flash.artifacts.api import ArtifactStore
 
-        return HfApi(token=os.environ.get("HF_TOKEN")).list_repo_files(
+        return ArtifactStore(token=None).list_repo_files(
             repo, repo_type="dataset", revision=revision
         )
     except Exception as exc:

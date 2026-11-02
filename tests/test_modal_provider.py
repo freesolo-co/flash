@@ -219,6 +219,10 @@ def sdk(monkeypatch):
     )
 
     class Image:
+        def pip_install(self, *args):
+            assert "azure-storage-blob>=12.24,<13" in args
+            return self
+
         def run_commands(self, *args):
             return self
 

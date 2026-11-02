@@ -1,4 +1,4 @@
-"""`flash export` core: the HF-to-HF adapter copy and the destination-token resolution.
+"""`flash export` core: the Azure-to-HF adapter copy and the destination-token resolution.
 
 These run offline by faking ``huggingface_hub`` (the copy is a download-then-upload, so we record
 the calls instead of touching the Hub).
@@ -24,13 +24,16 @@ class _FakeHfHubHTTPError(OSError):
     pass
 
 
-def _install_fake_hub(monkeypatch, *, download, hf_api):
+def _install_fake_hub(monkeypatch, *, download, artifact_api):
     """Inject a fake ``huggingface_hub`` module exposing HfApi + snapshot_download."""
+    monkeypatch.setenv(
+        "FLASH_ARTIFACT_BLOB_SAS_URL", "https://test.blob.core.windows.net/artifacts?sig=test"
+    )
     fake = types.ModuleType("huggingface_hub")
     fake_errors = types.ModuleType("huggingface_hub.errors")
     fake_errors.HfHubHTTPError = _FakeHfHubHTTPError
-    fake.HfApi = hf_api
-    fake.snapshot_download = download
+    fake.HfApi = artifact_api
+    monkeypatch.setattr("flash.artifacts.api.download_snapshot", download)
     fake.errors = fake_errors
     monkeypatch.setitem(sys.modules, "huggingface_hub", fake)
     monkeypatch.setitem(sys.modules, "huggingface_hub.errors", fake_errors)
@@ -149,7 +152,7 @@ def test_export_adapter_reads_source_with_operator_token_writes_dest_with_user_t
                 "parent_commit": parent_commit,
             }
 
-    _install_fake_hub(monkeypatch, download=fake_snapshot_download, hf_api=FakeHfApi)
+    _install_fake_hub(monkeypatch, download=fake_snapshot_download, artifact_api=FakeHfApi)
 
     from flash.serve.deployment.export import export_adapter
 
@@ -159,7 +162,7 @@ def test_export_adapter_reads_source_with_operator_token_writes_dest_with_user_t
         dest_repo="me/adapters",
         dest_token="hf_user",
         base_model=BASE_MODEL,
-        source_token="hf_operator",
+        source_token="https://test.blob.core.windows.net/artifacts?sig=operator",
         private=True,
     )
     assert url == "https://huggingface.co/me/adapters"
@@ -167,7 +170,7 @@ def test_export_adapter_reads_source_with_operator_token_writes_dest_with_user_t
     assert calls["download"]["repo_id"] == "org/test-runs"
     assert calls["download"]["repo_type"] == "dataset"
     assert calls["download"]["allow_patterns"] == ["rl/run-x/seed0/adapter/*"]
-    assert calls["download"]["token"] == "hf_operator"
+    assert calls["download"]["token"] == "https://test.blob.core.windows.net/artifacts?sig=operator"
     # Write the user's MODEL repo with the user's token; create it (private) if missing.
     assert calls["dest_token"] == "hf_user"
     assert calls["create_repo"] == {
@@ -236,7 +239,7 @@ def test_export_adapter_normalizes_safetensors_keys_for_vanilla_peft(monkeypatch
         def upload_folder(self, *, folder_path, **kw):
             uploaded["weights"] = (Path(folder_path) / "adapter_model.safetensors").read_bytes()
 
-    _install_fake_hub(monkeypatch, download=fake_snapshot_download, hf_api=FakeHfApi)
+    _install_fake_hub(monkeypatch, download=fake_snapshot_download, artifact_api=FakeHfApi)
     from flash.serve.deployment.export import export_adapter
 
     export_adapter(
@@ -245,7 +248,7 @@ def test_export_adapter_normalizes_safetensors_keys_for_vanilla_peft(monkeypatch
         dest_repo="me/adapters",
         dest_token="hf_user",
         base_model=BASE_MODEL,
-        source_token="hf_operator",
+        source_token="https://test.blob.core.windows.net/artifacts?sig=operator",
     )
 
     uploaded_header, uploaded_data = _parse_safetensors_bytes(uploaded["weights"])
@@ -307,7 +310,7 @@ def test_export_adapter_key_collision_fails_the_export(monkeypatch):
         def upload_folder(self, *, folder_path, **kw):
             uploaded["weights"] = (Path(folder_path) / "adapter_model.safetensors").read_bytes()
 
-    _install_fake_hub(monkeypatch, download=fake_snapshot_download, hf_api=FakeHfApi)
+    _install_fake_hub(monkeypatch, download=fake_snapshot_download, artifact_api=FakeHfApi)
     from flash.serve.contract.errors import ServingError
     from flash.serve.deployment.export import export_adapter
 
@@ -318,7 +321,7 @@ def test_export_adapter_key_collision_fails_the_export(monkeypatch):
             dest_repo="me/adapters",
             dest_token="hf_user",
             base_model=BASE_MODEL,
-            source_token="hf_operator",
+            source_token="https://test.blob.core.windows.net/artifacts?sig=operator",
         )
 
     assert "weights" not in uploaded
@@ -418,7 +421,7 @@ def test_export_adapter_with_vision_keys_leaves_safetensors_unchanged(monkeypatc
         def upload_folder(self, *, folder_path, **kw):
             uploaded["weights"] = (Path(folder_path) / "adapter_model.safetensors").read_bytes()
 
-    _install_fake_hub(monkeypatch, download=fake_snapshot_download, hf_api=FakeHfApi)
+    _install_fake_hub(monkeypatch, download=fake_snapshot_download, artifact_api=FakeHfApi)
     from flash.serve.deployment.export import export_adapter
 
     export_adapter(
@@ -427,7 +430,7 @@ def test_export_adapter_with_vision_keys_leaves_safetensors_unchanged(monkeypatc
         dest_repo="me/adapters",
         dest_token="hf_user",
         base_model=BASE_MODEL,
-        source_token="hf_operator",
+        source_token="https://test.blob.core.windows.net/artifacts?sig=operator",
     )
 
     assert uploaded["weights"] == source_bytes
@@ -519,7 +522,7 @@ def test_export_adapter_normalizes_sharded_safetensors_and_index(monkeypatch):
                 (folder / "adapter_model.safetensors.index.json").read_text()
             )
 
-    _install_fake_hub(monkeypatch, download=fake_snapshot_download, hf_api=FakeHfApi)
+    _install_fake_hub(monkeypatch, download=fake_snapshot_download, artifact_api=FakeHfApi)
     from flash.serve.deployment.export import export_adapter
 
     export_adapter(
@@ -528,7 +531,7 @@ def test_export_adapter_normalizes_sharded_safetensors_and_index(monkeypatch):
         dest_repo="me/adapters",
         dest_token="hf_user",
         base_model=BASE_MODEL,
-        source_token="hf_operator",
+        source_token="https://test.blob.core.windows.net/artifacts?sig=operator",
     )
 
     expected_a = infixed_a.replace(".language_model.", ".", 1)
@@ -551,7 +554,7 @@ def test_export_adapter_normalizes_sharded_safetensors_and_index(monkeypatch):
 def test_stale_shards_left_by_a_shorter_retry_are_not_scanned(tmp_path):
     """The index names the live shard set; same-suffix leftovers from a longer attempt do not.
 
-    hf_upload_folder writes a retry's adapter over the previous attempt without deleting what it no
+    upload_artifact_folder writes a retry's adapter over the previous attempt without deleting what it no
     longer writes, so a 3-shard attempt followed by a 2-shard one leaves shard 3 on disk. Scanning
     it would let its dead visual tensor pin the live text-only shards to the multimodal namespace,
     exporting keys peft loads as a no-op.
@@ -678,7 +681,7 @@ def test_export_adapter_rewrites_temp_merged_base_model_metadata(monkeypatch):
             uploaded["adapter_config"] = json.loads((folder / "adapter_config.json").read_text())
             uploaded["readme"] = (folder / "README.md").read_text()
 
-    _install_fake_hub(monkeypatch, download=fake_snapshot_download, hf_api=FakeHfApi)
+    _install_fake_hub(monkeypatch, download=fake_snapshot_download, artifact_api=FakeHfApi)
     from flash.serve.deployment.export import export_adapter
 
     export_adapter(
@@ -686,7 +689,7 @@ def test_export_adapter_rewrites_temp_merged_base_model_metadata(monkeypatch):
         source_subfolder="rl/run-x/seed0/adapter",
         dest_repo="me/adapters",
         dest_token="hf_user",
-        source_token="hf_operator",
+        source_token="https://test.blob.core.windows.net/artifacts?sig=operator",
         base_model=BASE_MODEL,
     )
 
@@ -786,7 +789,7 @@ def test_export_clears_stale_adapter_weights_without_touching_user_files(monkeyp
             calls["files"] = sorted(p.name for p in Path(folder_path).iterdir())
             calls["delete_patterns"] = delete_patterns
 
-    _install_fake_hub(monkeypatch, download=fake_snapshot_download, hf_api=FakeHfApi)
+    _install_fake_hub(monkeypatch, download=fake_snapshot_download, artifact_api=FakeHfApi)
     from flash.serve.deployment.export import export_adapter
 
     export_adapter(
@@ -795,7 +798,7 @@ def test_export_clears_stale_adapter_weights_without_touching_user_files(monkeyp
         dest_repo="me/adapters",
         dest_token="hf_user",
         base_model=BASE_MODEL,
-        source_token="hf_operator",
+        source_token="https://test.blob.core.windows.net/artifacts?sig=operator",
     )
     # Static, adapter-scoped delete patterns: ``adapter_model*`` clears a stale ``.bin`` (and sharded /
     # index variants); ``adapter_config.json`` clears the old config. A hypothetical ``extra_weights.pt``
@@ -835,7 +838,7 @@ def test_export_public_visibility_is_deferred_until_after_upload(monkeypatch):
         def upload_folder(self, **kw):
             order.append(("upload", None))
 
-    _install_fake_hub(monkeypatch, download=fake_snapshot_download, hf_api=FakeHfApi)
+    _install_fake_hub(monkeypatch, download=fake_snapshot_download, artifact_api=FakeHfApi)
     from flash.serve.deployment.export import export_adapter
 
     export_adapter(
@@ -844,7 +847,7 @@ def test_export_public_visibility_is_deferred_until_after_upload(monkeypatch):
         dest_repo="me/adapters",
         dest_token="hf_user",
         base_model=BASE_MODEL,
-        source_token="hf_operator",
+        source_token="https://test.blob.core.windows.net/artifacts?sig=operator",
         private=False,
     )
     # Created private, uploaded, THEN made public — never public before the content lands.
@@ -880,7 +883,7 @@ def test_export_private_is_enforced_before_upload(monkeypatch):
         def upload_folder(self, **kw):
             order.append(("upload", None))
 
-    _install_fake_hub(monkeypatch, download=fake_snapshot_download, hf_api=FakeHfApi)
+    _install_fake_hub(monkeypatch, download=fake_snapshot_download, artifact_api=FakeHfApi)
     from flash.serve.deployment.export import export_adapter
 
     export_adapter(
@@ -889,14 +892,14 @@ def test_export_private_is_enforced_before_upload(monkeypatch):
         dest_repo="me/adapters",
         dest_token="hf_user",
         base_model=BASE_MODEL,
-        source_token="hf_operator",
+        source_token="https://test.blob.core.windows.net/artifacts?sig=operator",
         private=True,
     )
     # Locked private BEFORE the upload (no post-upload visibility flip needed for a private export).
     assert order == [("create_repo", True), ("update_settings", True), ("upload", None)]
 
 
-def test_export_adapter_falls_back_to_hf_token_env_for_source(monkeypatch):
+def test_export_adapter_uses_azure_config_without_forwarding_upstream_token(monkeypatch):
     monkeypatch.setenv("HF_TOKEN", "hf_from_env")
     seen: dict = {}
 
@@ -924,7 +927,7 @@ def test_export_adapter_falls_back_to_hf_token_env_for_source(monkeypatch):
         def upload_folder(self, **kw):
             pass
 
-    _install_fake_hub(monkeypatch, download=fake_snapshot_download, hf_api=FakeHfApi)
+    _install_fake_hub(monkeypatch, download=fake_snapshot_download, artifact_api=FakeHfApi)
     from flash.serve.deployment.export import export_adapter
 
     export_adapter(
@@ -934,7 +937,7 @@ def test_export_adapter_falls_back_to_hf_token_env_for_source(monkeypatch):
         dest_token="hf_user",
         base_model=BASE_MODEL,
     )
-    assert seen["token"] == "hf_from_env"  # no source_token -> HF_TOKEN
+    assert seen["token"] is None  # native store resolves Azure configuration
 
 
 def test_export_adapter_raises_value_error_when_source_is_empty(monkeypatch):
@@ -946,7 +949,7 @@ def test_export_adapter_raises_value_error_when_source_is_empty(monkeypatch):
         def __init__(self, token=None):
             pass
 
-    _install_fake_hub(monkeypatch, download=fake_snapshot_download, hf_api=FakeHfApi)
+    _install_fake_hub(monkeypatch, download=fake_snapshot_download, artifact_api=FakeHfApi)
     from flash.serve.deployment.export import export_adapter
 
     with pytest.raises(ValueError, match="no loadable LoRA adapter"):
@@ -956,7 +959,7 @@ def test_export_adapter_raises_value_error_when_source_is_empty(monkeypatch):
             dest_repo="me/adapters",
             dest_token="hf_user",
             base_model=BASE_MODEL,
-            source_token="hf_operator",
+            source_token="https://test.blob.core.windows.net/artifacts?sig=operator",
         )
 
 
@@ -983,7 +986,7 @@ def test_export_rejects_source_with_config_but_no_adapter_weight(monkeypatch):
         def upload_folder(self, **kw):
             uploaded["called"] = True
 
-    _install_fake_hub(monkeypatch, download=fake_snapshot_download, hf_api=FakeHfApi)
+    _install_fake_hub(monkeypatch, download=fake_snapshot_download, artifact_api=FakeHfApi)
     from flash.serve.deployment.export import export_adapter
 
     with pytest.raises(ValueError, match="no loadable LoRA adapter"):
@@ -993,7 +996,7 @@ def test_export_rejects_source_with_config_but_no_adapter_weight(monkeypatch):
             dest_repo="me/adapters",
             dest_token="hf_user",
             base_model=BASE_MODEL,
-            source_token="hf_operator",
+            source_token="https://test.blob.core.windows.net/artifacts?sig=operator",
         )
     assert not uploaded["called"], "must reject before touching the destination repo"
 
@@ -1201,7 +1204,7 @@ def test_export_refuses_rank_mismatch_before_touching_the_destination_repo(monke
         def upload_folder(self, **kw):
             touched["called"] = True
 
-    _install_fake_hub(monkeypatch, download=fake_snapshot_download, hf_api=FakeHfApi)
+    _install_fake_hub(monkeypatch, download=fake_snapshot_download, artifact_api=FakeHfApi)
     from flash.serve.deployment.export import export_adapter
 
     with pytest.raises(ValueError, match="do not carry the rank configured"):
@@ -1211,7 +1214,7 @@ def test_export_refuses_rank_mismatch_before_touching_the_destination_repo(monke
             dest_repo="me/adapters",
             dest_token="hf_user",
             base_model=BASE_MODEL,
-            source_token="hf_operator",
+            source_token="https://test.blob.core.windows.net/artifacts?sig=operator",
         )
     assert not touched["called"], "must refuse before touching the destination repo"
 
@@ -1400,7 +1403,7 @@ def test_export_adapter_wraps_download_failure_in_serving_error(monkeypatch):
         def __init__(self, token=None):
             pass
 
-    _install_fake_hub(monkeypatch, download=fake_snapshot_download, hf_api=FakeHfApi)
+    _install_fake_hub(monkeypatch, download=fake_snapshot_download, artifact_api=FakeHfApi)
     from flash.serve.deployment.export import export_adapter
 
     with pytest.raises(ServingError, match="could not download adapter"):
@@ -1410,7 +1413,7 @@ def test_export_adapter_wraps_download_failure_in_serving_error(monkeypatch):
             dest_repo="me/adapters",
             dest_token="hf_user",
             base_model=BASE_MODEL,
-            source_token="hf_operator",
+            source_token="https://test.blob.core.windows.net/artifacts?sig=operator",
         )
 
 
@@ -1426,7 +1429,7 @@ def test_export_adapter_wraps_hub_download_oserror_in_serving_error(monkeypatch)
         def __init__(self, token=None):
             pass
 
-    _install_fake_hub(monkeypatch, download=fake_snapshot_download, hf_api=FakeHfApi)
+    _install_fake_hub(monkeypatch, download=fake_snapshot_download, artifact_api=FakeHfApi)
     from flash.serve.deployment.export import export_adapter
 
     with pytest.raises(ServingError) as exc_info:
@@ -1436,7 +1439,7 @@ def test_export_adapter_wraps_hub_download_oserror_in_serving_error(monkeypatch)
             dest_repo="me/adapters",
             dest_token="hf_user",
             base_model=BASE_MODEL,
-            source_token="hf_operator",
+            source_token="https://test.blob.core.windows.net/artifacts?sig=operator",
         )
 
     assert message in str(exc_info.value)
@@ -1452,7 +1455,7 @@ def test_export_adapter_propagates_local_download_oserror(monkeypatch):
         def __init__(self, token=None):
             pass
 
-    _install_fake_hub(monkeypatch, download=fake_snapshot_download, hf_api=FakeHfApi)
+    _install_fake_hub(monkeypatch, download=fake_snapshot_download, artifact_api=FakeHfApi)
     from flash.serve.deployment.export import export_adapter
 
     with pytest.raises(PermissionError) as exc_info:
@@ -1462,7 +1465,7 @@ def test_export_adapter_propagates_local_download_oserror(monkeypatch):
             dest_repo="me/adapters",
             dest_token="hf_user",
             base_model=BASE_MODEL,
-            source_token="hf_operator",
+            source_token="https://test.blob.core.windows.net/artifacts?sig=operator",
         )
 
     assert not isinstance(exc_info.value, ServingError)
@@ -1487,7 +1490,7 @@ def test_export_adapter_wraps_hub_create_repo_oserror_in_serving_error(monkeypat
         def create_repo(self, **kw):
             raise _FakeHfHubHTTPError(message)
 
-    _install_fake_hub(monkeypatch, download=fake_snapshot_download, hf_api=FakeHfApi)
+    _install_fake_hub(monkeypatch, download=fake_snapshot_download, artifact_api=FakeHfApi)
     from flash.serve.deployment.export import export_adapter
 
     with pytest.raises(ServingError) as exc_info:
@@ -1497,7 +1500,7 @@ def test_export_adapter_wraps_hub_create_repo_oserror_in_serving_error(monkeypat
             dest_repo="me/adapters",
             dest_token="hf_user",
             base_model=BASE_MODEL,
-            source_token="hf_operator",
+            source_token="https://test.blob.core.windows.net/artifacts?sig=operator",
         )
 
     assert message in str(exc_info.value)
@@ -1556,7 +1559,7 @@ def test_hf_api_missing_extra_raises_runtime_error_not_serving_error(monkeypatch
     assert "huggingface_hub" in str(ei.value)
 
 
-def test_export_missing_operator_token_raises_runtime_error_not_serving_error(monkeypatch):
+def test_export_missing_azure_config_raises_runtime_error_not_serving_error(monkeypatch):
     # No operator read token (neither source_token nor HF_TOKEN) is an internal server
     # misconfiguration (-> 500), NOT an upstream auth failure (ServingError -> 502). export_adapter
     # must raise a plain RuntimeError BEFORE snapshot_download, rather than passing token=None and
@@ -1576,4 +1579,4 @@ def test_export_missing_operator_token_raises_runtime_error_not_serving_error(mo
             source_token=None,
         )
     assert not isinstance(ei.value, ServingError)  # NOT the 502 path
-    assert "HF_TOKEN" in str(ei.value)
+    assert "Azure artifact storage" in str(ei.value)

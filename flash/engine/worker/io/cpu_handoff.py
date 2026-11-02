@@ -77,7 +77,7 @@ def main() -> None:
         spec_path.read_bytes()
     ).hexdigest() != os.environ.get("FLASH_EXPECTED_SPEC_SHA256"):
         raise ValueError("CPU checkpoint job specification mismatch")
-    from flash.engine.worker.io import hf
+    from flash.engine.worker.io import artifacts as hf
 
     root = Path(MOUNT)
     descriptor = root / "handoff.json"
@@ -109,7 +109,7 @@ def main() -> None:
         raise RuntimeError("CPU checkpoint publication failed")
     receipt = root / "receipt.json"
     receipt.write_text(json.dumps({**expected, "upload_seconds": time.time() - started}))
-    hf.hf_upload_file(
+    hf.upload_artifact_file(
         str(receipt),
         f"cpu_upload_attempt{context.config.attempt}.json",
         required=True,
@@ -117,10 +117,10 @@ def main() -> None:
     )
     metrics.setdefault("notes", {})["cpu_upload_seconds"] = time.time() - started
     metrics_path.write_text(json.dumps(metrics))
-    hf.hf_upload_file(str(metrics_path), "metrics.json", required=True, context=context)
-    hf.hf_upload_file(str(root / "DONE"), "DONE", required=True, context=context)
+    hf.upload_artifact_file(str(metrics_path), "metrics.json", required=True, context=context)
+    hf.upload_artifact_file(str(root / "DONE"), "DONE", required=True, context=context)
     # The original, source-attested terminal marker becomes public only after every artifact.
-    hf.hf_upload_file(
+    hf.upload_artifact_file(
         str(root / "terminal.json"),
         f"modal_attempt{context.config.attempt}.json",
         required=True,

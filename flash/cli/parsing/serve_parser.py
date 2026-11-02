@@ -132,8 +132,8 @@ def _add_serve_deploy(serve_sub: argparse._SubParsersAction) -> None:
     request and never persisted, so they cannot leak into shell history, a process list, or a
     durable record. The command reads ``MODAL_TOKEN_ID``/``MODAL_TOKEN_SECRET`` for the provider,
     ``FLASH_SERVING_KEY`` for the endpoint's own auth, and
-    ``HF_TOKEN`` so the container can hydrate its adapter -- required for a private artifact repo,
-    which is the default.
+    ``FLASH_ARTIFACT_BLOB_SAS_URL`` for private adapters. Optional ``HF_TOKEN`` grants upstream
+    base-model/tokenizer access; it cannot authorize artifact hydration.
     """
 
     deploy = serve_sub.add_parser(

@@ -11,8 +11,8 @@ from __future__ import annotations
 import contextlib
 import os
 
+import flash.engine.worker.io.artifacts as _worker_hf
 import flash.engine.worker.io.heartbeat as _worker_heartbeat
-import flash.engine.worker.io.hf as _worker_hf
 import flash.engine.worker.train.core.lifecycle.finalize as _worker_finalize
 from flash.engine.plan.steps import final_save_due
 from flash.engine.worker.io.heartbeat import liveness_heartbeat
@@ -270,7 +270,7 @@ def _publish_rl_result(
         keepalive=True,
         context=context,
     ):
-        _worker_hf.hf_upload_file(
+        _worker_hf.upload_artifact_file(
             env_for_verl["VERL_FILE_LOGGER_PATH"],
             "step_metrics.jsonl",
             required=True,
@@ -285,7 +285,7 @@ def _publish_rl_result(
             steps_run=steps_run,
         )
         preprocessor.save_pretrained(adapter_dir)
-        _worker_hf.hf_upload_folder(adapter_dir, "adapter", required=True, context=context)
+        _worker_hf.upload_artifact_folder(adapter_dir, "adapter", required=True, context=context)
         # preserve the final checkpoint only when exact save steps are not configured: with
         # save_at_steps set the customer asked for those steps and nothing else.
         if final_save_due(steps_run, inp["save_at_steps"]):

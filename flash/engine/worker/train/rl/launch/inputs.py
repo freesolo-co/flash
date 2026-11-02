@@ -16,7 +16,7 @@ import random
 from functools import reduce
 from math import gcd
 
-import flash.engine.worker.io.hf as _worker_hf
+import flash.engine.worker.io.artifacts as _worker_hf
 import flash.engine.worker.model.adapter as _worker_adapter
 import flash.engine.worker.model.decoding as _worker_decoding
 import flash.engine.worker.perf as _worker_perf

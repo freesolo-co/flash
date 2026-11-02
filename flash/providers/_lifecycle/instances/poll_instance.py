@@ -37,7 +37,7 @@ from flash.providers._lifecycle.net.deadline import (
     remaining_seconds,
     require_deadline_at,
 )
-from flash.providers.artifacts.hf import TextArtifactReader, worker_flagged_retriable
+from flash.providers.artifacts.channel import TextArtifactReader, worker_flagged_retriable
 from flash.providers.core.base import PollResult
 
 # a strict success marker can precede the separately uploaded metrics.json under hf read-after-write

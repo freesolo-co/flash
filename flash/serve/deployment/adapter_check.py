@@ -12,7 +12,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import os
 from dataclasses import dataclass
 
 from flash.adapters.artifacts import has_loadable_adapter_weights, is_adapter_weight_filename
@@ -32,25 +31,14 @@ class AdapterArtifactMetadata:
     artifact_digest: str
 
 
-def _is_hf_not_found_error(exc: Exception) -> bool:
-    try:
-        import huggingface_hub.errors as hf_errors  # type: ignore[import-not-found]
+def _is_artifact_not_found_error(exc: Exception) -> bool:
+    from flash.artifacts.manifest import ArtifactNotFoundError
 
-        not_found_types = tuple(
-            cls
-            for name in (
-                "EntryNotFoundError",
-                "LocalEntryNotFoundError",
-                "RepositoryNotFoundError",
-                "RevisionNotFoundError",
-            )
-            if isinstance((cls := getattr(hf_errors, name, None)), type)
-        )
-        if not_found_types and isinstance(exc, not_found_types):
-            return True
-    except Exception:
-        pass
-    return getattr(getattr(exc, "response", None), "status_code", None) == 404
+    return (
+        isinstance(exc, ArtifactNotFoundError)
+        or getattr(exc, "status_code", None) == 404
+        or getattr(getattr(exc, "response", None), "status_code", None) == 404
+    )
 
 
 def validate_serving_lora_rank(model: str, lora_rank: int, *, rank_source: str = "adapter") -> None:
@@ -72,25 +60,25 @@ def _verify_adapter_artifact_tensors(
 ) -> tuple[dict[str, object], ...]:
     """Confirm the adapter has tensor weights before registering it with serving."""
     try:
-        from huggingface_hub import HfApi
+        from flash.artifacts.api import ArtifactStore
     except ImportError as exc:  # pragma: no cover - package extra is present in supported installs
         raise ServingError(
-            "could not verify adapter tensors: huggingface_hub is not installed"
+            "could not verify adapter tensors: Azure artifact support is not installed"
         ) from exc
     try:
         entries = list(
-            HfApi().list_repo_tree(
+            ArtifactStore().list_repo_tree(
                 repo_id=hf_repo,
                 path_in_repo=subfolder.rstrip("/"),
                 repo_type="dataset",
                 recursive=False,
                 revision=artifact_revision,
-                token=os.environ.get("HF_TOKEN"),
+                token=None,
             )
         )
     except Exception as exc:
         message = f"could not verify adapter tensors: failed to list {hf_repo}:{subfolder}"
-        if _is_hf_not_found_error(exc):
+        if _is_artifact_not_found_error(exc):
             raise AdapterTensorMissing(message) from exc
         raise ServingError(message) from exc
 
@@ -158,22 +146,22 @@ def _load_adapter_config(
 ) -> tuple[DeclaredAdapterConfig, str]:
     filename = f"{subfolder.rstrip('/')}/adapter_config.json"
     try:
-        from huggingface_hub import hf_hub_download
+        from flash.artifacts.api import download_file
     except ImportError as exc:  # pragma: no cover - package extra is present in supported installs
         raise ServingError(
-            "could not verify adapter rank: huggingface_hub is not installed"
+            "could not verify adapter rank: Azure artifact support is not installed"
         ) from exc
     try:
-        local = hf_hub_download(
+        local = download_file(
             repo_id=hf_repo,
             filename=filename,
             repo_type="dataset",
             revision=artifact_revision,
-            token=os.environ.get("HF_TOKEN"),
+            token=None,
         )
     except Exception as exc:
         message = f"could not verify adapter rank: failed to read {hf_repo}:{filename}"
-        if _is_hf_not_found_error(exc):
+        if _is_artifact_not_found_error(exc):
             raise AdapterConfigMissing(message) from exc
         raise ServingError(message) from exc
     try:

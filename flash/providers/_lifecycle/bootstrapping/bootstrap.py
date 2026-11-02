@@ -16,6 +16,7 @@ from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
 
 if __package__:
+    from flash.artifacts.config import ENV_KEYS as ARTIFACT_ENV_KEYS
     from flash.providers._lifecycle.bootstrapping import console as _bootstrap_console
     from flash.providers._lifecycle.bootstrapping import pip as bootstrap_pip
     from flash.providers._lifecycle.bootstrapping import processes as _bootstrap_processes
@@ -33,6 +34,7 @@ else:
     import bootstrap_console as _bootstrap_console  # type: ignore[no-redef]
     import bootstrap_pip  # type: ignore[no-redef]
     import bootstrap_processes as _bootstrap_processes  # type: ignore[no-redef]
+    from artifact_config import ENV_KEYS as ARTIFACT_ENV_KEYS
     from bootstrap_attempt import AttemptState  # type: ignore[no-redef]
     from bootstrap_secrets import (  # type: ignore[no-redef]
         _payload_secrets,
@@ -48,8 +50,8 @@ _CONSOLE_UPLOAD_STOP_TIMEOUT_S = 2.0
 _CONSOLE_UPLOAD_FINAL_TIMEOUT_S = 10.0
 _CONSOLE_UPLOAD_TERMINATE_TIMEOUT_S = 1.0
 _CONSOLE_UPLOAD_REAP_RESERVE_S = 2 * _CONSOLE_UPLOAD_TERMINATE_TIMEOUT_S
-_HF_RETRY_DELAYS_S = (1.0, 3.0, 8.0, 20.0, 60.0)
-_HF_RETRY_AFTER_MAX_S = 60.0
+_ARTIFACT_RETRY_DELAYS_S = (1.0, 3.0, 8.0, 20.0, 60.0)
+_ARTIFACT_RETRY_AFTER_MAX_S = 60.0
 _TERMINAL_MARKER_GRACE_S = 0.25
 _TERMINAL_BOOKKEEPING_RESERVE_S = _TERMINAL_MARKER_GRACE_S
 _MAX_ATTEMPT_ID = (1 << 63) - 1
@@ -169,11 +171,11 @@ def _code_dir(payload: dict) -> str:
     )
 
 
-def _hf_status_code(exc: BaseException) -> int | None:
+def _artifact_status_code(exc: BaseException) -> int | None:
     return _source_snapshot.response_status_code(exc)
 
 
-def _hf_retry_after(exc: BaseException) -> float | None:
+def _artifact_retry_after(exc: BaseException) -> float | None:
     response = getattr(exc, "response", None)
     headers = getattr(response, "headers", None) or {}
     value = headers.get("retry-after") if hasattr(headers, "get") else None
@@ -194,13 +196,13 @@ def _hf_retry_after(exc: BaseException) -> float | None:
             seconds = (retry_at - datetime.now(UTC)).total_seconds()
         except (TypeError, ValueError):
             return None
-    return min(_HF_RETRY_AFTER_MAX_S, max(0.0, seconds))
+    return min(_ARTIFACT_RETRY_AFTER_MAX_S, max(0.0, seconds))
 
 
-def _hf_call(call, label: str, *, deadline_at: float, secrets: dict | None = None):
+def _artifact_call(call, label: str, *, deadline_at: float, secrets: dict | None = None):
     """``secrets`` must carry the run's payload secrets whenever the wrapped call takes a payload
     credential (the retried error message can echo it, and it is absent from ``os.environ``)."""
-    for attempt in range(len(_HF_RETRY_DELAYS_S) + 1):
+    for attempt in range(len(_ARTIFACT_RETRY_DELAYS_S) + 1):
         remaining = deadline_at - _finite_positive_number(time.time(), "current clock")
         if remaining <= 0:
             raise TimeoutError(f"{label} exceeded the run wall deadline")
@@ -208,11 +210,11 @@ def _hf_call(call, label: str, *, deadline_at: float, secrets: dict | None = Non
             return call()
         except Exception as exc:
             if not _source_snapshot.is_transient_fetch_error(exc) or attempt >= len(
-                _HF_RETRY_DELAYS_S
+                _ARTIFACT_RETRY_DELAYS_S
             ):
                 raise
-            retry_after = _hf_retry_after(exc)
-            delay = retry_after if retry_after is not None else _HF_RETRY_DELAYS_S[attempt]
+            retry_after = _artifact_retry_after(exc)
+            delay = retry_after if retry_after is not None else _ARTIFACT_RETRY_DELAYS_S[attempt]
             remaining = deadline_at - _finite_positive_number(time.time(), "current clock")
             if remaining <= 0:
                 raise TimeoutError(f"{label} exceeded the run wall deadline") from None
@@ -227,20 +229,18 @@ def _hf_call(call, label: str, *, deadline_at: float, secrets: dict | None = Non
     raise AssertionError("unreachable")
 
 
-def hf_upload(
+def upload_artifact(
     payload: dict,
     local_path: str,
     repo_subpath: str,
     *,
     enforce_deadline: bool = True,
 ) -> bool:
-    """Upload one artifact under the run's HF prefix; never raises."""
+    """Upload one artifact under the run's artifact prefix; never raises."""
     try:
-        from huggingface_hub import HfApi
-
         if enforce_deadline:
             require_deadline_at(payload)
-        HfApi(token=(payload.get("env") or {}).get("HF_TOKEN")).upload_file(
+        _artifact_api(payload).upload_file(
             path_or_fileobj=local_path,
             path_in_repo=f"{payload['hf_prefix']}/{repo_subpath}",
             repo_id=payload["hf_repo"],
@@ -279,7 +279,7 @@ def _upload_console_snapshot(
         tail += extra
     with open(tail_path, "w", encoding="utf-8", errors="replace") as f:
         f.write(_safe_detail(tail, 64_000, secrets=_payload_secrets(payload)))
-    return hf_upload(payload, tail_path, f"console_{mode}{kind}.txt")
+    return upload_artifact(payload, tail_path, f"console_{mode}{kind}.txt")
 
 
 def _console_upload_loop(
@@ -497,12 +497,31 @@ def _upload_console_tail_bounded(
     )
 
 
-def hf_file_exists(payload: dict, repo_subpath: str) -> bool:
-    """True iff ``<hf_prefix>/<repo_subpath>`` exists in the run's HF dataset repo. Raises on API error."""
-    from huggingface_hub import HfApi
+def _artifact_module():
+    import importlib
+
+    return importlib.import_module("flash.artifacts.api" if __package__ else "artifact_api")
+
+
+def _configure_artifact_environment(payload):
+    environment = payload.get("env") or {}
+    for key in ARTIFACT_ENV_KEYS:
+        if environment.get(key):
+            os.environ[key] = str(environment[key])
+        else:
+            os.environ.pop(key, None)
+
+
+def _artifact_api(payload):
+    _configure_artifact_environment(payload)
+    return _artifact_module().ArtifactStore()
+
+
+def artifact_file_exists(payload: dict, repo_subpath: str) -> bool:
+    """True iff ``<hf_prefix>/<repo_subpath>`` exists in the run's Azure artifact namespace. Raises on API error."""
 
     require_deadline_at(payload)
-    api = HfApi(token=(payload.get("env") or {}).get("HF_TOKEN"))
+    api = _artifact_api(payload)
     return api.file_exists(
         repo_id=payload["hf_repo"],
         filename=f"{payload['hf_prefix']}/{repo_subpath}",
@@ -513,7 +532,9 @@ def hf_file_exists(payload: dict, repo_subpath: str) -> bool:
 def remote_completion_confirmed(payload: dict) -> bool:
     """True iff DONE + metrics.json are on HF. Local /tmp/metrics.json is not sufficient proof."""
     try:
-        return hf_file_exists(payload, "DONE") and hf_file_exists(payload, "metrics.json")
+        return artifact_file_exists(payload, "DONE") and artifact_file_exists(
+            payload, "metrics.json"
+        )
     except Exception as exc:
         # read errors are infra-shaped and leave completion unconfirmed.
         print(
@@ -566,14 +587,14 @@ def install_extra_pip(payload: dict) -> None:
 
 
 def fetch_code(payload: dict) -> None:
-    from huggingface_hub import hf_hub_download
 
     deadline_at = require_deadline_at(payload)
     descriptor = _source_descriptor(payload)
-    token = (payload.get("env") or {}).get("HF_TOKEN")
+    _configure_artifact_environment(payload)
+    token = None
     try:
-        archive_path = _hf_call(
-            lambda: hf_hub_download(
+        archive_path = _artifact_call(
+            lambda: _artifact_module().download_file(
                 repo_id=payload["hf_repo"],
                 repo_type="dataset",
                 filename=descriptor.archive_path,
@@ -596,6 +617,10 @@ def fetch_code(payload: dict) -> None:
         descriptor,
         _code_dir(payload),
     )
+    if os.path.exists(os.path.join(_code_dir(payload), "flash/engine/worker/io/hf.py")):
+        raise RuntimeError(
+            "source snapshot predates Azure artifact storage; start a new run from a migrated checkpoint"
+        )
 
 
 def _start_console_pump(proc, cf, payload):
@@ -827,7 +852,7 @@ def _publish_terminal_marker(payload, p, ok):
         if (handoff / "handoff.json").is_file():
             shutil.copyfile(p, handoff / "terminal.json")
             marker_name = f"modal_gpu_attempt{attempt}.json"
-    hf_upload(payload, p, marker_name, enforce_deadline=False)
+    upload_artifact(payload, p, marker_name, enforce_deadline=False)
 
 
 def main() -> int:
@@ -855,16 +880,14 @@ def _publish_started(payload: dict) -> None:
     """Publish actual bootstrap start before source downloads and package installation."""
     import tempfile
 
-    from huggingface_hub import HfApi
-
     marker = {"run_id": payload["run_id"], "attempt": payload["attempt"], "ts": time.time()}
     name = f"modal_started_attempt{payload['attempt']}.json"
     with tempfile.NamedTemporaryFile(mode="w", suffix=".json") as file:
         json.dump(marker, file)
         file.flush()
         try:
-            _hf_call(
-                lambda: HfApi(token=(payload.get("env") or {}).get("HF_TOKEN")).upload_file(
+            _artifact_call(
+                lambda: _artifact_api(payload).upload_file(
                     path_or_fileobj=file.name,
                     path_in_repo=f"{payload['hf_prefix']}/{name}",
                     repo_id=payload["hf_repo"],

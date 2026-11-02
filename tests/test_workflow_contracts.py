@@ -1032,6 +1032,9 @@ def test_canary_attribution_is_validated_before_production_deployment(org_id):
     env = dict.fromkeys(
         (
             "HF_TOKEN",
+            "AZURE_TENANT_ID",
+            "AZURE_CLIENT_ID",
+            "AZURE_CLIENT_SECRET",
             "SUPABASE_URL",
             "SUPABASE_SERVICE_ROLE_KEY",
             "FREESOLO_INTERNAL_KEY",

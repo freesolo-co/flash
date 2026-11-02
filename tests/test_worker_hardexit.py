@@ -21,15 +21,16 @@ from dataclasses import replace
 from pathlib import Path
 
 import httpx
-import huggingface_hub
 import pytest
-from huggingface_hub.errors import HfHubHTTPError, RemoteEntryNotFoundError
+from huggingface_hub.errors import HfHubHTTPError
 
 import flash.engine.worker.entry.worker as worker
+import flash.engine.worker.io.artifacts as hf_io
 import flash.engine.worker.io.heartbeat as heartbeat_io
-import flash.engine.worker.io.hf as hf_io
 import flash.engine.worker.perf as worker_perf
 import flash.engine.worker.train.entry.sft_train as sft_entry
+from flash.artifacts import api as artifact_storage
+from flash.artifacts.manifest import ArtifactNotFoundError as RemoteEntryNotFoundError
 from flash.engine.support.worker_entrypoint import WORKER_FAILURE_LINE
 
 
@@ -188,6 +189,8 @@ def test_worker_dispatches_sft_adapter_continuation_to_the_handler(worker_contex
 
 
 def _hub_download_error(error_type, status_code):
+    if issubclass(error_type, FileNotFoundError):
+        return error_type("missing")
     if status_code is None:
         from types import SimpleNamespace
 
@@ -215,7 +218,7 @@ def _patch_done_marker_worker(monkeypatch, *, worker_context):
     monkeypatch.setattr(worker_context, "close", lambda: None)
     monkeypatch.setattr(hf_io, "hf_prefix", lambda context=None, **_context: "sft/run-id")
     monkeypatch.setattr(hf_io, "error_artifact_name", lambda *a, **k: "error.txt")
-    monkeypatch.setattr(hf_io, "hf_upload_file", lambda *a, context=None, **k: None)
+    monkeypatch.setattr(hf_io, "upload_artifact_file", lambda *a, context=None, **k: None)
     monkeypatch.setattr(
         heartbeat_io, "heartbeat", lambda *a, context=None, **k: heartbeats.append((a, k))
     )
@@ -250,7 +253,7 @@ def test_done_marker_present_restores_metrics_without_gpu_or_handler(
         downloads.append(filename)
         return str(done_marker if filename.endswith("/DONE") else metrics)
 
-    monkeypatch.setattr(huggingface_hub, "hf_hub_download", fake_download)
+    monkeypatch.setattr(artifact_storage, "download_file", fake_download)
     monkeypatch.setattr(
         shutil, "copy", lambda source, destination: copies.append((source, destination))
     )
@@ -269,8 +272,8 @@ def test_exact_remote_done_entry_absence_reaches_gpu_and_handler(worker_context,
     _heartbeats, events = _patch_done_marker_worker(monkeypatch, worker_context=worker_context)
     absence = _hub_download_error(RemoteEntryNotFoundError, 404)
     monkeypatch.setattr(
-        huggingface_hub,
-        "hf_hub_download",
+        artifact_storage,
+        "download_file",
         lambda **kwargs: (_ for _ in ()).throw(absence),
     )
 
@@ -283,13 +286,12 @@ def test_exact_remote_done_entry_absence_reaches_gpu_and_handler(worker_context,
 
 def test_done_marker_transient_failure_wraps_before_gpu(worker_context, monkeypatch):
     heartbeats, events = _patch_done_marker_worker(monkeypatch, worker_context=worker_context)
-    transient = httpx.ReadTimeout(
-        "timed out",
-        request=httpx.Request("GET", "https://huggingface.co"),
-    )
+    from azure.core.exceptions import ServiceResponseError
+
+    transient = ServiceResponseError("timed out")
     monkeypatch.setattr(
-        huggingface_hub,
-        "hf_hub_download",
+        artifact_storage,
+        "download_file",
         lambda **kwargs: (_ for _ in ()).throw(transient),
     )
 
@@ -316,8 +318,8 @@ def test_done_marker_terminal_failures_fail_closed_before_gpu(
     heartbeats, events = _patch_done_marker_worker(monkeypatch, worker_context=worker_context)
     error = error_factory()
     monkeypatch.setattr(
-        huggingface_hub,
-        "hf_hub_download",
+        artifact_storage,
+        "download_file",
         lambda **kwargs: (_ for _ in ()).throw(error),
     )
 
@@ -336,8 +338,8 @@ def test_done_marker_remote_absence_subclass_is_terminal_before_gpu(worker_conte
     heartbeats, events = _patch_done_marker_worker(monkeypatch, worker_context=worker_context)
     error = _hub_download_error(SyntheticRemoteEntryNotFoundError, 404)
     monkeypatch.setattr(
-        huggingface_hub,
-        "hf_hub_download",
+        artifact_storage,
+        "download_file",
         lambda **kwargs: (_ for _ in ()).throw(error),
     )
 
@@ -370,7 +372,7 @@ def test_idempotency_replay_metrics_read_failure_is_retriable(
     monkeypatch.setattr(hf_io, "hf_prefix", lambda context=None, **_context: "seed0")
     monkeypatch.setattr(worker_perf, "gpu_diagnostics", lambda **k: {})
     monkeypatch.setattr(hf_io, "error_artifact_name", lambda *a, **k: "error.txt")
-    monkeypatch.setattr(hf_io, "hf_upload_file", lambda *a, context=None, **k: None)
+    monkeypatch.setattr(hf_io, "upload_artifact_file", lambda *a, context=None, **k: None)
     monkeypatch.setattr(worker.time, "sleep", lambda *a, **k: None)
     monkeypatch.setattr(heartbeat_io, "heartbeat", lambda *a, context=None, **k: hb.append((a, k)))
 
@@ -382,7 +384,7 @@ def test_idempotency_replay_metrics_read_failure_is_retriable(
             return str(done_marker)
         raise OSError("503 transient HF read")  # metrics.json read keeps failing
 
-    monkeypatch.setattr(huggingface_hub, "hf_hub_download", fake_download)
+    monkeypatch.setattr(artifact_storage, "download_file", fake_download)
 
     with pytest.raises(worker_perf.RetriableInfraError):
         worker.main(context=worker_context)
@@ -406,7 +408,7 @@ def test_idempotency_metrics_reread_backoff_stops_at_run_deadline(
     monkeypatch.setattr(hf_io, "hf_prefix", lambda context=None, **_context: "seed0")
     monkeypatch.setattr(worker_perf, "gpu_diagnostics", lambda **_kwargs: {})
     monkeypatch.setattr(hf_io, "error_artifact_name", lambda *_args, **_kwargs: "error.txt")
-    monkeypatch.setattr(hf_io, "hf_upload_file", lambda *_args, context=None, **_kwargs: None)
+    monkeypatch.setattr(hf_io, "upload_artifact_file", lambda *_args, context=None, **_kwargs: None)
     monkeypatch.setattr(heartbeat_io, "heartbeat", lambda *_args, context=None, **_kwargs: None)
     monkeypatch.setattr(worker.time, "time", lambda: clock["now"])
 
@@ -424,7 +426,7 @@ def test_idempotency_metrics_reread_backoff_stops_at_run_deadline(
             return str(done_marker)
         raise OSError("private provider response")
 
-    monkeypatch.setattr(huggingface_hub, "hf_hub_download", fake_download)
+    monkeypatch.setattr(artifact_storage, "download_file", fake_download)
 
     with pytest.raises(worker_perf.RetriableInfraError) as exc_info:
         worker.main(context=worker_context)

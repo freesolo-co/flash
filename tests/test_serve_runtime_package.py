@@ -25,6 +25,12 @@ CONTROL_FILES = {
 }
 APP_FILES = {
     "flash/serve/app/__init__.py",
+    "flash/artifacts/__init__.py",
+    "flash/artifacts/api.py",
+    "flash/artifacts/storage.py",
+    "flash/artifacts/config.py",
+    "flash/artifacts/manifest.py",
+    "flash/serve/app/hydration_credentials.py",
     "flash/serve/app/__main__.py",
     "flash/serve/app/bootstrap.py",
     "flash/serve/app/http.py",
@@ -50,6 +56,8 @@ def test_serve_runtime_extra_is_independent_and_pinned() -> None:
 
     assert project["project"]["dependencies"] == []
     assert extras["serve-runtime"] == [
+        "azure-storage-blob>=12.24,<13",
+        "azure-identity>=1.19,<2",
         "fastapi>=0.136,<0.137",
         "uvicorn>=0.52,<1",
         "huggingface-hub>=1.2.0",

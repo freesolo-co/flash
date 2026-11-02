@@ -1,6 +1,6 @@
 """Export a run's trained LoRA adapter into a user-owned HuggingFace repo.
 
-Runs server-side: operator token reads the private source dataset repo, user token writes
+Runs server-side: Azure credentials read private source artifacts, the user HF token writes
 the destination model repo, so the user never needs access to internal artifact storage.
 """
 
@@ -479,13 +479,13 @@ def _repair_export_metadata(
 def _hf_api():
     """Import huggingface_hub lazily (it's a server extra, not a base CLI dependency)."""
     try:
-        from huggingface_hub import HfApi, snapshot_download
+        from huggingface_hub import HfApi
     except ModuleNotFoundError as exc:
         raise RuntimeError(
             "huggingface_hub is required to export adapters; install the server extras "
             "(pip install 'flash[server]')"
         ) from exc
-    return HfApi, snapshot_download
+    return HfApi
 
 
 def _hub_error_types() -> tuple[type[BaseException], ...]:
@@ -520,16 +520,17 @@ def export_adapter(
     if not isinstance(base_model, str) or not base_model.strip():
         raise RuntimeError("base_model is required to export adapter metadata")
     base_model = base_model.strip()
-    HfApi, snapshot_download = _hf_api()
-    read_token = source_token or os.environ.get("HF_TOKEN")
-    if not read_token:
-        raise RuntimeError(
-            "no operator HF token available to read the source adapter; set HF_TOKEN on the "
-            "server (or pass source_token)"
-        )
+    from flash.artifacts.api import download_snapshot
+
+    HfApi = _hf_api()
+    read_token = source_token
+    from flash.artifacts.config import configured
+
+    if not read_token and not configured():
+        raise RuntimeError("Azure artifact storage is not configured")
     with tempfile.TemporaryDirectory(prefix="flash-export-") as tmp:
         try:
-            snapshot_download(
+            download_snapshot(
                 repo_id=source_repo,
                 repo_type="dataset",
                 allow_patterns=[f"{source_subfolder}/*"],

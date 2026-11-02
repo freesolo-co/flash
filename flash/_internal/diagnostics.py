@@ -82,7 +82,13 @@ def _configured_secrets() -> tuple[tuple[_ValueMatcher, ...], tuple[str, ...], f
     for key, value in os.environ.items():
         upper = key.upper()
         if not value or not (
-            upper in {"AUTHORIZATION", "HF_TOKEN"}
+            upper
+            in {
+                "AUTHORIZATION",
+                "HF_TOKEN",
+                "FLASH_ARTIFACT_BLOB_CONNECTION_STRING",
+                "FLASH_ARTIFACT_BLOB_SAS_URL",
+            }
             or upper in declared
             or upper.endswith(_SECRET_ENV_SUFFIXES)
         ):

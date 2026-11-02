@@ -59,13 +59,14 @@ jobs:
           # :<branch>. every build also gets an immutable :sha-<short> tag.
           short_sha="$(git rev-parse --short HEAD)"
           branch="${GITHUB_REF_NAME}"
+          tag_branch="$(printf '%s' "$branch" | sed 's/[^a-zA-Z0-9_.-]/-/g')"
           {
             echo "tags<<EOF"
             if [ "$branch" = "main" ]; then
               echo "${IMAGE}:main"
               echo "${IMAGE}:latest"
             else
-              echo "${IMAGE}:${branch}"
+              echo "${IMAGE}:${tag_branch}"
             fi
             echo "${IMAGE}:sha-${short_sha}"
             echo "EOF"

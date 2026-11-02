@@ -16,8 +16,8 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from uuid import uuid4
 
+import flash.engine.worker.io.artifacts as _worker_hf
 import flash.engine.worker.io.heartbeat as _worker_heartbeat
-import flash.engine.worker.io.hf as _worker_hf
 import flash.engine.worker.io.wandb_log as _worker_wandb_log
 import flash.engine.worker.train.rl.launch.checkpoints as rl_checkpoints
 import flash.engine.worker.train.rl.launch.config as _worker_config

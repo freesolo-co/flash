@@ -10,7 +10,7 @@ from requests.exceptions import Timeout
 from safetensors.numpy import save
 
 import flash.engine.worker.model.adapter as adapter
-from flash.engine.worker.io.hf import RetriableInfraError
+from flash.engine.worker.io.artifacts import RetriableInfraError
 
 _ADAPTER_REF = "Freesolo-Co/flashrun-source:sft/source-run"
 _ADAPTER_DIR = "/tmp/evdl/sft/source-run/adapter"
@@ -39,7 +39,7 @@ def _prepare_download(monkeypatch, *, worker_context):
     )
     monkeypatch.setattr(
         adapter,
-        "_require_hf_deadline_allowance",
+        "_require_artifact_deadline_allowance",
         lambda context=None, **_context: deadline_checks.append(None),
     )
     return deadline_checks
@@ -77,7 +77,7 @@ def test_warmstart_loadability_rejects_truncated_weights(tmp_path):
 
 
 def test_transient_throttling_retries_then_downloads(worker_context, monkeypatch):
-    import huggingface_hub
+    from flash.artifacts import api as artifact_storage
 
     deadline_checks = _prepare_download(monkeypatch, worker_context=worker_context)
     calls = []
@@ -85,15 +85,15 @@ def test_transient_throttling_retries_then_downloads(worker_context, monkeypatch
     transient = _hf_error(429)
     monkeypatch.setattr(adapter, "_warmstart_adapter_is_loadable", lambda _path: len(calls) >= 3)
 
-    def snapshot_download(**kwargs):
+    def download_snapshot(**kwargs):
         calls.append(kwargs)
         if len(calls) < 3:
             raise transient
 
-    monkeypatch.setattr(huggingface_hub, "snapshot_download", snapshot_download)
+    monkeypatch.setattr(artifact_storage, "download_snapshot", download_snapshot)
     monkeypatch.setattr(
         adapter,
-        "_sleep_with_hf_deadline",
+        "_sleep_with_artifact_deadline",
         lambda delay, context=None, **_context: sleeps.append(delay) or True,
     )
 
@@ -104,20 +104,20 @@ def test_transient_throttling_retries_then_downloads(worker_context, monkeypatch
 
 
 def test_transient_sidecar_error_accepts_completed_adapter(worker_context, monkeypatch):
-    import huggingface_hub
+    from flash.artifacts import api as artifact_storage
 
     deadline_checks = _prepare_download(monkeypatch, worker_context=worker_context)
     calls = []
     monkeypatch.setattr(adapter, "_warmstart_adapter_is_loadable", lambda _path: True)
 
-    def snapshot_download(**kwargs):
+    def download_snapshot(**kwargs):
         calls.append(kwargs)
         raise Timeout("sidecar timed out after adapter weights completed")
 
-    monkeypatch.setattr(huggingface_hub, "snapshot_download", snapshot_download)
+    monkeypatch.setattr(artifact_storage, "download_snapshot", download_snapshot)
     monkeypatch.setattr(
         adapter,
-        "_sleep_with_hf_deadline",
+        "_sleep_with_artifact_deadline",
         lambda _delay, context=None, **_context: pytest.fail(
             "a complete adapter must not back off"
         ),
@@ -137,7 +137,7 @@ def test_transient_sidecar_error_accepts_completed_adapter(worker_context, monke
 
 
 def test_persistent_transient_failure_raises_exact_retriable_error(worker_context, monkeypatch):
-    import huggingface_hub
+    from flash.artifacts import api as artifact_storage
 
     deadline_checks = _prepare_download(monkeypatch, worker_context=worker_context)
     calls = []
@@ -145,14 +145,14 @@ def test_persistent_transient_failure_raises_exact_retriable_error(worker_contex
     transient = Timeout("timed out")
     monkeypatch.setattr(adapter, "_warmstart_adapter_is_loadable", lambda _path: False)
 
-    def snapshot_download(**kwargs):
+    def download_snapshot(**kwargs):
         calls.append(kwargs)
         raise transient
 
-    monkeypatch.setattr(huggingface_hub, "snapshot_download", snapshot_download)
+    monkeypatch.setattr(artifact_storage, "download_snapshot", download_snapshot)
     monkeypatch.setattr(
         adapter,
-        "_sleep_with_hf_deadline",
+        "_sleep_with_artifact_deadline",
         lambda delay, context=None, **_context: sleeps.append(delay) or True,
     )
 
@@ -166,20 +166,20 @@ def test_persistent_transient_failure_raises_exact_retriable_error(worker_contex
 
 
 def test_terminal_hf_error_fails_without_retry(worker_context, monkeypatch):
-    import huggingface_hub
+    from flash.artifacts import api as artifact_storage
 
     deadline_checks = _prepare_download(monkeypatch, worker_context=worker_context)
     calls = []
     monkeypatch.setattr(adapter, "_warmstart_adapter_is_loadable", lambda _path: False)
 
-    def snapshot_download(**kwargs):
+    def download_snapshot(**kwargs):
         calls.append(kwargs)
         raise _hf_error(403)
 
-    monkeypatch.setattr(huggingface_hub, "snapshot_download", snapshot_download)
+    monkeypatch.setattr(artifact_storage, "download_snapshot", download_snapshot)
     monkeypatch.setattr(
         adapter,
-        "_sleep_with_hf_deadline",
+        "_sleep_with_artifact_deadline",
         lambda _delay, context=None, **_context: pytest.fail("terminal errors must not back off"),
     )
 
@@ -193,21 +193,21 @@ def test_terminal_hf_error_fails_without_retry(worker_context, monkeypatch):
 
 
 def test_deadline_exhausted_during_backoff_raises_retriable_error(worker_context, monkeypatch):
-    import huggingface_hub
+    from flash.artifacts import api as artifact_storage
 
     deadline_checks = _prepare_download(monkeypatch, worker_context=worker_context)
     calls = []
     sleeps = []
     monkeypatch.setattr(adapter, "_warmstart_adapter_is_loadable", lambda _path: False)
 
-    def snapshot_download(**kwargs):
+    def download_snapshot(**kwargs):
         calls.append(kwargs)
         raise Timeout("timed out")
 
-    monkeypatch.setattr(huggingface_hub, "snapshot_download", snapshot_download)
+    monkeypatch.setattr(artifact_storage, "download_snapshot", download_snapshot)
     monkeypatch.setattr(
         adapter,
-        "_sleep_with_hf_deadline",
+        "_sleep_with_artifact_deadline",
         lambda delay, context=None, **_context: sleeps.append(delay) or False,
     )
 
@@ -221,17 +221,17 @@ def test_deadline_exhausted_during_backoff_raises_retriable_error(worker_context
 
 
 def test_incomplete_snapshot_retries_until_adapter_is_complete(worker_context, monkeypatch):
-    import huggingface_hub
+    from flash.artifacts import api as artifact_storage
 
     deadline_checks = _prepare_download(monkeypatch, worker_context=worker_context)
     calls = []
     sleeps = []
     removed = []
 
-    def snapshot_download(**kwargs):
+    def download_snapshot(**kwargs):
         calls.append(kwargs)
 
-    monkeypatch.setattr(huggingface_hub, "snapshot_download", snapshot_download)
+    monkeypatch.setattr(artifact_storage, "download_snapshot", download_snapshot)
     monkeypatch.setattr(
         adapter.shutil,
         "rmtree",
@@ -239,7 +239,7 @@ def test_incomplete_snapshot_retries_until_adapter_is_complete(worker_context, m
     )
     monkeypatch.setattr(
         adapter,
-        "_sleep_with_hf_deadline",
+        "_sleep_with_artifact_deadline",
         lambda delay, context=None, **_context: sleeps.append(delay) or True,
     )
     # first returned snapshot is incomplete (missing weights), the retry lands a loadable adapter.
@@ -255,19 +255,21 @@ def test_incomplete_snapshot_retries_until_adapter_is_complete(worker_context, m
 
 
 def test_snapshot_success_but_adapter_never_complete_raises_retriable(worker_context, monkeypatch):
-    import huggingface_hub
+    from flash.artifacts import api as artifact_storage
 
     deadline_checks = _prepare_download(monkeypatch, worker_context=worker_context)
     calls = []
     sleeps = []
 
-    monkeypatch.setattr(huggingface_hub, "snapshot_download", lambda **kwargs: calls.append(kwargs))
+    monkeypatch.setattr(
+        artifact_storage, "download_snapshot", lambda **kwargs: calls.append(kwargs)
+    )
     monkeypatch.setattr(
         adapter,
-        "_sleep_with_hf_deadline",
+        "_sleep_with_artifact_deadline",
         lambda delay, context=None, **_context: sleeps.append(delay) or True,
     )
-    # snapshot_download keeps returning, but a loadable adapter never materializes -> infra retry.
+    # download_snapshot keeps returning, but a loadable adapter never materializes -> infra retry.
     monkeypatch.setattr(adapter, "_warmstart_adapter_is_loadable", lambda _path: False)
     # the directory itself is present on disk, so this test also fails if the completeness check
     # regresses to a directory-only `os.path.isdir` check.

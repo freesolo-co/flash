@@ -2609,7 +2609,7 @@ def test_attach_does_not_reset_a_consumed_infrastructure_budget(monkeypatch, tmp
 def test_attach_expired_run_adopts_completed_attempt_at_deadline(monkeypatch, tmp_path):
     import io
 
-    import flash.providers.artifacts.hf as hf_artifacts
+    import flash.providers.artifacts.channel as hf_artifacts
     from flash.core.spec import GpuSpec, JobSpec, TrainSpec
 
     monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
@@ -2648,7 +2648,7 @@ def test_attach_expired_run_adopts_completed_attempt_at_deadline(monkeypatch, tm
         completion_checks.append((args, kwargs))
         return real_completed_metrics(*args, **kwargs)
 
-    monkeypatch.setattr(hf_artifacts, "make_hf_text_reader", artifact_reader)
+    monkeypatch.setattr(hf_artifacts, "make_artifact_text_reader", artifact_reader)
     monkeypatch.setattr(runner_recovery, "_completed_attempt_metrics", completed_metrics)
     monkeypatch.setattr(runner_recovery, "_gc_run_sandboxes", lambda _spec: None)
     monkeypatch.setattr(
@@ -2685,7 +2685,7 @@ def test_attach_expired_run_adopts_completed_attempt_at_deadline(monkeypatch, tm
 def test_attach_adoption_prices_a_multi_card_run_for_every_card(monkeypatch, tmp_path):
     import io
 
-    import flash.providers.artifacts.hf as hf_artifacts
+    import flash.providers.artifacts.channel as hf_artifacts
     from flash.core.spec import GpuSpec, JobSpec, TrainSpec
 
     monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
@@ -2732,7 +2732,7 @@ def test_attach_adoption_prices_a_multi_card_run_for_every_card(monkeypatch, tmp
         adopted.update(metrics)
         return real_adopt(run_id, adopt_spec, expected_remote, metrics, **kwargs)
 
-    monkeypatch.setattr(hf_artifacts, "make_hf_text_reader", artifact_reader)
+    monkeypatch.setattr(hf_artifacts, "make_artifact_text_reader", artifact_reader)
     monkeypatch.setattr(runner_recovery, "_adopt_completed_attempt", capture_adopt)
     monkeypatch.setattr(runner_recovery, "_gc_run_sandboxes", lambda _spec: None)
 

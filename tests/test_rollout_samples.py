@@ -8,8 +8,8 @@ import sys
 
 import pytest
 
+import flash.engine.worker.io.artifacts as worker_hf
 import flash.engine.worker.io.heartbeat as worker_heartbeat
-import flash.engine.worker.io.hf as worker_hf
 from flash.engine.result.rollout_samples import build_rollout_sample, select_rollout_samples
 from flash.providers._lifecycle.instances.poll import _format_heartbeat
 
@@ -154,7 +154,7 @@ def test_heartbeat_reports_failed_then_successful_forced_delivery(
 
     outcomes = iter([False, True])
     monkeypatch.setattr(
-        worker_hf, "hf_upload_file", lambda *args, context=None, **kwargs: next(outcomes)
+        worker_hf, "upload_artifact_file", lambda *args, context=None, **kwargs: next(outcomes)
     )
     monkeypatch.setattr(worker_context.heartbeat_state, "terminal_only", False)
     monkeypatch.setattr(worker_heartbeat, "_HB_MIN_INTERVAL_S", 900.0)

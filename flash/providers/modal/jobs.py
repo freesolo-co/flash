@@ -18,10 +18,10 @@ from flash.providers._lifecycle.instances.poll_instance import (
 )
 from flash.providers._lifecycle.net.deadline import require_deadline_at
 from flash.providers._lifecycle.net.worker import worker_image_for_gpu
-from flash.providers.artifacts.hf import (
+from flash.providers.artifacts.channel import (
     error_artifact_name,
     heartbeat_reader_for,
-    make_hf_text_reader,
+    make_artifact_text_reader,
 )
 from flash.providers.core.base import JobHandle, get_gpu_info
 from flash.providers.modal import api, prefetch
@@ -40,7 +40,7 @@ def poll(handle, spec, *, log=None, deadline_at=None):
     say = make_say(log)
 
     def reader(filename, **kwargs):
-        return make_hf_text_reader(
+        return make_artifact_text_reader(
             spec.train.hf_repo, f"{prefix}/{filename}", deadline_at=deadline_at, **kwargs
         )
 

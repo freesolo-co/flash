@@ -14,7 +14,7 @@ import shutil
 import threading
 import time
 
-import flash.engine.worker.io.hf as _worker_hf
+import flash.engine.worker.io.artifacts as _worker_hf
 from flash.engine.worker.io.heartbeat import join_while_draining
 from flash.engine.worker.runtime.state import WorkerContext
 from flash.engine.worker.train.core.lifecycle.ledger import CheckpointLedger

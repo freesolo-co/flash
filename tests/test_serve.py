@@ -75,14 +75,14 @@ def _stub_adapter_config(
     cfg.write_text(json.dumps(config), encoding="utf-8")
     seen: dict = {}
 
-    def fake_hf_hub_download(**kwargs):
+    def fake_download_file(**kwargs):
         seen.update(kwargs)
         return str(cfg)
 
     if tensor_files is None:
         tensor_files = {"adapter_model.safetensors": 123}
 
-    class _HfApi:
+    class _ArtifactStore:
         def repo_info(self, **kwargs):
             seen["repo_info"] = kwargs
             return types.SimpleNamespace(sha="a" * 40)
@@ -97,8 +97,8 @@ def _stub_adapter_config(
 
     monkeypatch.setitem(
         sys.modules,
-        "huggingface_hub",
-        types.SimpleNamespace(hf_hub_download=fake_hf_hub_download, HfApi=_HfApi),
+        "flash.artifacts.api",
+        types.SimpleNamespace(download_file=fake_download_file, ArtifactStore=_ArtifactStore),
     )
 
     import flash.serve.deployment.deploy as deploy
@@ -397,11 +397,11 @@ def test_deploy_rejects_falsey_invalid_rank_pattern(monkeypatch, tmp_path):
 def test_deploy_adapter_rank_download_failure_is_serving_error(monkeypatch):
     import flash.serve.deployment.deploy as d
 
-    def fake_hf_hub_download(**_kwargs):
+    def fake_download_file(**_kwargs):
         raise RuntimeError("hub timeout")
 
     monkeypatch.setitem(
-        sys.modules, "huggingface_hub", types.SimpleNamespace(hf_hub_download=fake_hf_hub_download)
+        sys.modules, "flash.artifacts.api", types.SimpleNamespace(download_file=fake_download_file)
     )
     monkeypatch.setattr(d, "resolve_artifact_revision", lambda repo: "a" * 40)
 
@@ -428,11 +428,11 @@ def test_deploy_adapter_missing_config_is_adapter_config_missing(monkeypatch):
     class _NotFound(RuntimeError):
         response = _Response()
 
-    def fake_hf_hub_download(**_kwargs):
+    def fake_download_file(**_kwargs):
         raise _NotFound("adapter_config.json not found")
 
     monkeypatch.setitem(
-        sys.modules, "huggingface_hub", types.SimpleNamespace(hf_hub_download=fake_hf_hub_download)
+        sys.modules, "flash.artifacts.api", types.SimpleNamespace(download_file=fake_download_file)
     )
     monkeypatch.setattr(d, "resolve_artifact_revision", lambda repo: "a" * 40)
 

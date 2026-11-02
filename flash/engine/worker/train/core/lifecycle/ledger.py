@@ -29,7 +29,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from flash.engine.worker.io.hf import PublicationResult
+    from flash.engine.worker.io.artifacts import PublicationResult
 
 
 @dataclass(frozen=True)

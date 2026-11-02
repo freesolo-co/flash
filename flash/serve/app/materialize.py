@@ -30,6 +30,7 @@ from flash.adapters.lora_rank import (
     strict_declared_lora_ranks,
 )
 from flash.engine.worker.model.lora import _read_safetensors_tensor_metadata
+from flash.serve.app.hydration_credentials import _hydration_credential
 from flash.serve.runtime.hub import TOKENIZER_WEIGHT_PATTERNS
 
 from .manifest import ArtifactFile, ManifestAdapter, ServingManifest
@@ -192,6 +193,7 @@ def hydrate_base_weights(
     if type(manifest) is not ServingManifest:
         raise MaterializationError("base weight hydration requires an exact ServingManifest")
     token = read_artifact_token_fd(token_fd)
+    token = _hydration_credential(token, "upstream")
     try:
         if snapshot_download_fn is None:
             from huggingface_hub import snapshot_download
@@ -285,9 +287,10 @@ def _materialize_all(
     if type(token) is not str or not token:
         raise MaterializationError("artifact token is required for hydration")
     if snapshot_download_fn is None:
-        from huggingface_hub import snapshot_download
+        from flash.artifacts.api import download_snapshot
 
-        snapshot_download_fn = snapshot_download
+        snapshot_download_fn = download_snapshot
+    token = _hydration_credential(token, "azure")
     root = _prepare_cache_root(cache_root)
     hydrated: dict[str, Path] = {}
     for adapter in manifest.adapters:

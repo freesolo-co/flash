@@ -6,7 +6,8 @@ from dataclasses import replace
 
 import pytest
 
-from flash.engine.worker.io import cpu_handoff, hf
+from flash.engine.worker.io import artifacts as hf
+from flash.engine.worker.io import cpu_handoff
 from flash.providers.modal import checkpoint_upload
 from flash.providers.modal.handles import ModalJobHandle
 from tests._helpers.modal import modal_remote
@@ -64,7 +65,9 @@ def test_cpu_failure_cannot_publish_done_or_success(worker_context, staged, monk
         "upload_resume_checkpoint",
         lambda *a, **k: hf.PublicationResult(upload_error="test failure"),
     )
-    monkeypatch.setattr(hf, "hf_upload_file", lambda *a, **k: pytest.fail("premature completion"))
+    monkeypatch.setattr(
+        hf, "upload_artifact_file", lambda *a, **k: pytest.fail("premature completion")
+    )
     with pytest.raises(RuntimeError, match="publication failed"):
         cpu_handoff.main()
 
@@ -84,7 +87,7 @@ def test_cpu_commit_precedes_metrics_done_and_attested_success(worker_context, s
             or hf.PublicationResult(resume=hf.ArtifactCommit("native", "revision"))
         ),
     )
-    monkeypatch.setattr(hf, "hf_upload_file", lambda path, name, **k: events.append(name))
+    monkeypatch.setattr(hf, "upload_artifact_file", lambda path, name, **k: events.append(name))
     cpu_handoff.main()
     assert events == [
         "native",
@@ -170,7 +173,7 @@ def test_bootstrap_withholds_attested_marker_for_handoff(tmp_path, monkeypatch):
     published = []
     monkeypatch.setattr(bootstrap, "CHECKPOINT_HANDOFF_ROOT", str(root))
     monkeypatch.setattr(
-        bootstrap, "hf_upload", lambda payload, path, name, **kw: published.append(name)
+        bootstrap, "upload_artifact", lambda payload, path, name, **kw: published.append(name)
     )
     payload = {"attempt": 2, "flash_arm": "modal", "handoff_volume": "owned-volume"}
     # Initial publication and replay both go through this gate.
@@ -189,7 +192,9 @@ def test_final_staging_does_not_claim_a_remote_commit(worker_context, staged, mo
     monkeypatch.setattr(
         worker_context, "config", replace(worker_context.config, hf_repo="owner/artifacts")
     )
-    monkeypatch.setattr(hf, "hf_api", lambda: pytest.fail("GPU must not upload final native state"))
+    monkeypatch.setattr(
+        hf, "artifact_api", lambda: pytest.fail("GPU must not upload final native state")
+    )
     result = hf.upload_resume_checkpoint(
         2, str(source), final_step=2, emit_heartbeat=False, context=worker_context
     )
@@ -206,6 +211,8 @@ def test_staged_result_cannot_authorize_cpu_completion(worker_context, staged, m
     monkeypatch.setattr(
         hf, "upload_resume_checkpoint", lambda *a, **k: hf.PublicationResult(resume_staged=True)
     )
-    monkeypatch.setattr(hf, "hf_upload_file", lambda *a, **k: pytest.fail("premature completion"))
+    monkeypatch.setattr(
+        hf, "upload_artifact_file", lambda *a, **k: pytest.fail("premature completion")
+    )
     with pytest.raises(RuntimeError, match="publication failed"):
         cpu_handoff.main()

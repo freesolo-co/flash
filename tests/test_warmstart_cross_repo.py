@@ -21,14 +21,14 @@ _REVISION = "a" * 40
 
 
 def _capture(monkeypatch, prefix, hf_repo="Freesolo-Co/flashrun-self", *, worker_context):
-    """Call _download_adapter with snapshot_download stubbed; return its kwargs + the result.
+    """Call _download_adapter with download_snapshot stubbed; return its kwargs + the result.
 
     _download_adapter targets an absolute local_dir (/tmp/evdl), so no chdir is needed; the
     stub just materializes the expected adapter dir there (cleaned up by the caller).
     """
     calls = {}
 
-    def fake_snapshot_download(**kw):
+    def fake_download_snapshot(**kw):
         calls.update(kw)
         adapter_prefix = kw["allow_patterns"][0].removesuffix("/adapter/*")
         adapter_dir = os.path.join(kw["local_dir"], adapter_prefix, "adapter")
@@ -48,9 +48,9 @@ def _capture(monkeypatch, prefix, hf_repo="Freesolo-Co/flashrun-self", *, worker
             and os.path.isfile(os.path.join(adapter_dir, "adapter_model.safetensors"))
         ),
     )
-    import huggingface_hub
+    from flash.artifacts import api as artifact_storage
 
-    monkeypatch.setattr(huggingface_hub, "snapshot_download", fake_snapshot_download)
+    monkeypatch.setattr(artifact_storage, "download_snapshot", fake_download_snapshot)
     try:
         return calls, worker_adapter._download_adapter(prefix, context=worker_context)
     finally:
@@ -112,14 +112,14 @@ def test_bare_prefix_is_not_an_internal_storage_ref(worker_context, monkeypatch)
 
 
 def test_worker_download_failure_redacts_internal_storage_ref(worker_context, monkeypatch, capsys):
-    import huggingface_hub
+    from flash.artifacts import api as artifact_storage
 
     internal_ref = "private-owner/private-repo:sft/source-run/checkpoints/step-20"
 
     def fail_download(**kwargs):
         raise RuntimeError(f"failed to fetch {kwargs['repo_id']} {kwargs['allow_patterns']}")
 
-    monkeypatch.setattr(huggingface_hub, "snapshot_download", fail_download)
+    monkeypatch.setattr(artifact_storage, "download_snapshot", fail_download)
     with pytest.raises(RuntimeError) as exc_info:
         worker_adapter._download_adapter(internal_ref, context=worker_context)
 
@@ -143,10 +143,10 @@ def test_managed_repo_without_prefix_is_not_an_internal_storage_ref(worker_conte
 
 
 def _mark(monkeypatch, ref, child_run_id):
-    """Call _mark_warmstart_source with HfApi.upload_file stubbed; return captured upload kwargs."""
+    """Call _mark_warmstart_source with ArtifactStore.upload_file stubbed; return captured upload kwargs."""
     import types
 
-    import huggingface_hub
+    from flash.artifacts import api as artifact_storage
 
     captured = {}
 
@@ -156,7 +156,7 @@ def _mark(monkeypatch, ref, child_run_id):
         ):
             captured.update(path_in_repo=path_in_repo, repo_id=repo_id, repo_type=repo_type)
 
-    monkeypatch.setattr(huggingface_hub, "HfApi", _FakeApi)
+    monkeypatch.setattr(artifact_storage, "ArtifactStore", _FakeApi)
     worker_spec = types.SimpleNamespace(train=types.SimpleNamespace(init_from_adapter=ref))
     runner_preparation._mark_warmstart_source(worker_spec, child_run_id)
     return captured
@@ -208,7 +208,7 @@ def test_prepare_init_adapter_preserves_public_ref_and_loads_config_once(monkeyp
     calls = []
 
     monkeypatch.setattr(runner_status, "get_status", lambda run_id: source_status)
-    monkeypatch.setattr(rank_mod, "resolve_hf_dataset_revision", lambda repo, token: _REVISION)
+    monkeypatch.setattr(rank_mod, "resolve_artifact_revision", lambda repo, token: _REVISION)
     monkeypatch.setattr(
         checkpoints, "adapter_artifact_exists", lambda spec, *, step, revision=None: True
     )
@@ -228,7 +228,7 @@ def test_prepare_init_adapter_preserves_public_ref_and_loads_config_once(monkeyp
             "exclude_modules": None,
         }
 
-    monkeypatch.setattr(rank_mod, "load_hf_adapter_config", load_config)
+    monkeypatch.setattr(rank_mod, "load_artifact_adapter_config", load_config)
     monkeypatch.setattr(
         rank_mod,
         "adapter_artifact_identity",
@@ -367,7 +367,7 @@ def test_warm_start_inherits_a_runner_assigned_source_revision(monkeypatch):
     # ends up carrying. Reaching the sentinel IS the pass condition -- it means execution got past
     # the equality check, which is what used to raise.
     monkeypatch.setattr(
-        "flash.adapters.lora_rank.resolve_hf_dataset_revision",
+        "flash.adapters.lora_rank.resolve_artifact_revision",
         lambda *_a, **_kw: "rev",
     )
     monkeypatch.setattr(
@@ -435,13 +435,13 @@ def test_warm_start_pin_is_inherited_before_the_spec_is_sized_against_it(monkeyp
         return real_resolve(model_id, algorithm)  # unpinned: no HF geometry fetch in a unit test
 
     monkeypatch.setattr(catalog, "resolve_model", spy)
-    monkeypatch.setattr(rank_mod, "resolve_hf_dataset_revision", lambda repo, token: _REVISION)
+    monkeypatch.setattr(rank_mod, "resolve_artifact_revision", lambda repo, token: _REVISION)
     monkeypatch.setattr(
         checkpoints, "adapter_artifact_exists", lambda spec, *, step, revision=None: True
     )
     monkeypatch.setattr(
         rank_mod,
-        "load_hf_adapter_config",
+        "load_artifact_adapter_config",
         lambda adapter_ref, token, revision: {
             "peft_type": "LORA",
             "task_type": "CAUSAL_LM",
@@ -575,7 +575,7 @@ def test_warm_start_preparation_refuses_a_tampered_source_snapshot(monkeypatch):
     monkeypatch.setattr(runner_status, "get_status", lambda run_id: status)
     # would be reached only if the tampered pin were adopted; getting here at all is the failure
     monkeypatch.setattr(
-        "flash.adapters.lora_rank.resolve_hf_dataset_revision", lambda *_a, **_kw: "rev"
+        "flash.adapters.lora_rank.resolve_artifact_revision", lambda *_a, **_kw: "rev"
     )
     monkeypatch.setattr(
         "flash.runner.results.checkpoints.adapter_artifact_exists",
@@ -635,13 +635,13 @@ def test_prepare_job_estimates_from_source_effective_worker_spec(monkeypatch):
         return source_status
 
     monkeypatch.setattr(runner_status, "get_status", get_source)
-    monkeypatch.setattr(rank_mod, "resolve_hf_dataset_revision", lambda repo, token: _REVISION)
+    monkeypatch.setattr(rank_mod, "resolve_artifact_revision", lambda repo, token: _REVISION)
     monkeypatch.setattr(
         checkpoints, "adapter_artifact_exists", lambda spec, *, step, revision=None: True
     )
     monkeypatch.setattr(
         rank_mod,
-        "load_hf_adapter_config",
+        "load_artifact_adapter_config",
         lambda adapter_ref, token, revision: {
             "peft_type": "LORA",
             "task_type": "CAUSAL_LM",
@@ -900,7 +900,7 @@ def test_recovery_revalidates_pinned_revision_after_default_branch_moves(monkeyp
             "exclude_modules": None,
         }
 
-    monkeypatch.setattr(rank_mod, "load_hf_adapter_config", load_config)
+    monkeypatch.setattr(rank_mod, "load_artifact_adapter_config", load_config)
     monkeypatch.setattr(rank_mod, "adapter_artifact_identity", lambda *a, **k: identity)
 
     recovered = runner_status.effective_spec_from_status(status, verify_source=True)
@@ -1105,7 +1105,7 @@ def test_every_algorithm_pair_prepares_a_warm_start(
     assert inherited.model_revision_auto is True
 
     monkeypatch.setattr(
-        "flash.adapters.lora_rank.resolve_hf_dataset_revision",
+        "flash.adapters.lora_rank.resolve_artifact_revision",
         lambda *_a, **_kw: "rev",
     )
     monkeypatch.setattr(
@@ -1177,13 +1177,13 @@ def test_sft_child_prepares_against_the_inherited_source_pin(monkeypatch):
         "_require_sft_workload_profile",
         lambda spec: profiled.append(spec.model_revision) or spec,
     )
-    monkeypatch.setattr(rank_mod, "resolve_hf_dataset_revision", lambda repo, token: _REVISION)
+    monkeypatch.setattr(rank_mod, "resolve_artifact_revision", lambda repo, token: _REVISION)
     monkeypatch.setattr(
         checkpoints, "adapter_artifact_exists", lambda spec, *, step, revision=None: True
     )
     monkeypatch.setattr(
         rank_mod,
-        "load_hf_adapter_config",
+        "load_artifact_adapter_config",
         lambda adapter_ref, token, revision: {
             "peft_type": "LORA",
             "task_type": "CAUSAL_LM",

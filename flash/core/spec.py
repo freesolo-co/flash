@@ -238,6 +238,11 @@ CONTROL_PLANE_OWNED_ENV_KEYS = frozenset(
     {
         "RUN_ID",
         "HF_REPO",
+        "FLASH_ARTIFACT_BLOB_ACCOUNT_URL",
+        "FLASH_ARTIFACT_BLOB_CONTAINER",
+        "FLASH_ARTIFACT_BLOB_CONNECTION_STRING",
+        "FLASH_ARTIFACT_BLOB_SAS_URL",
+        "FLASH_CUSTOM_SESSION_TOKEN",
         "GITHUB_TOKEN",
         "GIT_ASKPASS",
         "FLASH_ARM",
@@ -347,6 +352,8 @@ class TrainSpec:
     # PLATFORM-MANAGED: control-plane-assigned HF artifact repo. Not a user config key: it has no
     # ``introduced_in`` so it is absent from TRAIN_SCHEMA_KEYS and ``[train] hf_repo`` is rejected.
     # JobSpec.from_dict still round-trips the control-plane-assigned value; to_dict() omits it.
+    # Legacy serialized spelling retained so existing preparation digests remain valid.
+    # This is now a logical Azure artifact namespace, never a Hugging Face repository.
     hf_repo: str = ""
     # None -> worker's tuned recipe default.
     learning_rate: float | None = field(default=None, metadata={"introduced_in": "0.2.0"})
@@ -816,7 +823,7 @@ class JobSpec:
                 max_retries=int(gpu.get("max_retries", 5)),
                 # network_volume/network_volume_gb round-trip so the runner-assigned weight cache
                 # survives the to_dict()->from_dict() hops in _with_model_disk / _spec_with_gpu /
-                # _assign_managed_hf_repo before deploy.
+                # _assign_managed_artifact_repo before deploy.
                 network_volume=gpu.get("network_volume"),
                 network_volume_gb=volume_gb(gpu.get("network_volume_gb")),
                 count=gpu.get("count", 1),

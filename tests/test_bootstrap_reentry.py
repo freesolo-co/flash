@@ -35,6 +35,9 @@ def capsule_run(tmp_path):
     metrics = tmp_path / "metrics.json"
     bootstrap = root / "flash/providers/_lifecycle/bootstrapping/bootstrap.py"
     text = bootstrap.read_text()
+    text = text.replace(
+        '"flash.artifacts.api" if __package__ else "artifact_api"', '"migration_test_artifacts"'
+    )
     # redirect original scratch paths before inserting paths that may themselves contain /tmp/.
     text = text.replace("/tmp/", str(tmp_path) + "/")
     text = text.replace('"/root/flash/payload.json"', repr(str(payload_path)))
@@ -88,14 +91,14 @@ print('NODE DONE', flush=True)
     }
     payload_path.write_text(json.dumps(payload))
     # only the artifact transport is substituted; bootstrap and subprocess orchestration are real.
-    (tmp_path / "huggingface_hub.py").write_text(f"""
+    (tmp_path / "migration_test_artifacts.py").write_text(f"""
 import json
 import os
 from pathlib import Path
 root = Path({str(tmp_path)!r})
-def hf_hub_download(**kwargs):
+def download_file(**kwargs):
     return str(root / 'source.zip')
-class HfApi:
+class ArtifactStore:
     def __init__(self, **kwargs):
         pass
     def upload_file(self, path_or_fileobj, path_in_repo, **kwargs):

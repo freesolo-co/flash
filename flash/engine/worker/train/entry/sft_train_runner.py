@@ -14,8 +14,8 @@ from dataclasses import dataclass
 from functools import reduce
 from math import gcd
 
+import flash.engine.worker.io.artifacts as _worker_hf
 import flash.engine.worker.io.heartbeat as _worker_heartbeat
-import flash.engine.worker.io.hf as _worker_hf
 import flash.engine.worker.io.wandb_log as _worker_wandb
 import flash.engine.worker.model.adapter as _worker_adapter
 import flash.engine.worker.perf as _worker_perf

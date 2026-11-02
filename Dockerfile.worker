@@ -58,6 +58,7 @@ RUN pip install --no-cache-dir \
     "flashinfer-python==0.6.6" \
     "datasets==5.0.1" \
     "huggingface_hub==1.28.0" \
+    "azure-storage-blob>=12.24,<13" "azure-identity>=1.19,<2" \
     "httpx==0.28.1" \
     "requests==2.34.2" \
     "accelerate==1.14.0" \

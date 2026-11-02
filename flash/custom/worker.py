@@ -1,16 +1,16 @@
 """Managed worker: remote primitives, standard Flash checkpoints and run telemetry."""
 
 import json
+import os
 import tempfile
 import time
 from pathlib import Path
 
 from flash.custom.backend import load_backend
 from flash.custom.checkpoints import RunCheckpoints
-from flash.custom.managed import session_token
 from flash.custom.server import serve_session
 from flash.custom.session import TrainingSession
-from flash.engine.worker.io import hf
+from flash.engine.worker.io import artifacts as hf
 from flash.engine.worker.io.heartbeat import heartbeat, liveness_heartbeat
 
 
@@ -129,7 +129,7 @@ def run(*, context):
     )
     serve_session(
         session,
-        session_token(spec.run_id, context.config.attempt),
+        os.environ["FLASH_CUSTOM_SESSION_TOKEN"],
         context.remaining_wall_seconds() or spec.gpu.max_wall_seconds,
         tick=tick,
     )
@@ -141,10 +141,10 @@ def run(*, context):
     metrics = {"steps": session.step, "session_seconds": seconds, "train_seconds": seconds}
     path = Path("/tmp/metrics.json")
     path.write_text(json.dumps(metrics))
-    hf.hf_upload_file(str(path), "metrics.json", required=True, context=context)
+    hf.upload_artifact_file(str(path), "metrics.json", required=True, context=context)
     done = Path("/tmp/custom-DONE")
     done.write_text("done")
-    hf.hf_upload_file(str(done), "DONE", required=True, context=context)
+    hf.upload_artifact_file(str(done), "DONE", required=True, context=context)
     heartbeat(
         "done",
         step=session.step,

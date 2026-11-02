@@ -37,7 +37,7 @@ def _install_hub(monkeypatch, tmp_path, *, raw: bytes) -> None:
     cfg = tmp_path / "adapter_config.json"
     cfg.write_bytes(raw)
 
-    class _HfApi:
+    class _ArtifactStore:
         def list_repo_tree(self, **kwargs):
             prefix = str(kwargs.get("path_in_repo") or "").rstrip("/")
             return [
@@ -46,8 +46,10 @@ def _install_hub(monkeypatch, tmp_path, *, raw: bytes) -> None:
 
     monkeypatch.setitem(
         __import__("sys").modules,
-        "huggingface_hub",
-        types.SimpleNamespace(hf_hub_download=lambda **_kwargs: str(cfg), HfApi=_HfApi),
+        "flash.artifacts.api",
+        types.SimpleNamespace(
+            download_file=lambda **_kwargs: str(cfg), ArtifactStore=_ArtifactStore
+        ),
     )
 
 
@@ -70,7 +72,7 @@ def test_declared_base_model_mismatch_is_rejected_before_tensor_listing(monkeypa
     """The exact failure the container raises as `adapter logical base model does not match`."""
     listed: list[str] = []
 
-    class _HfApi:
+    class _ArtifactStore:
         def list_repo_tree(self, **kwargs):
             listed.append(str(kwargs.get("path_in_repo")))
             return []
@@ -79,8 +81,10 @@ def test_declared_base_model_mismatch_is_rejected_before_tensor_listing(monkeypa
     cfg.write_text(json.dumps({**_valid_config(), "base_model_name_or_path": "Qwen/Qwen3.8-27B"}))
     monkeypatch.setitem(
         __import__("sys").modules,
-        "huggingface_hub",
-        types.SimpleNamespace(hf_hub_download=lambda **_kwargs: str(cfg), HfApi=_HfApi),
+        "flash.artifacts.api",
+        types.SimpleNamespace(
+            download_file=lambda **_kwargs: str(cfg), ArtifactStore=_ArtifactStore
+        ),
     )
 
     with pytest.raises(ValueError, match=re.escape("trained against 'Qwen/Qwen3.8-27B'")):
@@ -156,7 +160,7 @@ def test_config_is_validated_before_tensors_are_listed(monkeypatch, tmp_path):
     """Ordering is the whole point: the cheap local verdict must precede the remote tree walk."""
     listed: list[str] = []
 
-    class _HfApi:
+    class _ArtifactStore:
         def list_repo_tree(self, **kwargs):
             listed.append(str(kwargs.get("path_in_repo")))
             return []
@@ -165,8 +169,10 @@ def test_config_is_validated_before_tensors_are_listed(monkeypatch, tmp_path):
     cfg.write_text(json.dumps({"r": 32, "peft_type": "IA3"}))
     monkeypatch.setitem(
         __import__("sys").modules,
-        "huggingface_hub",
-        types.SimpleNamespace(hf_hub_download=lambda **_kwargs: str(cfg), HfApi=_HfApi),
+        "flash.artifacts.api",
+        types.SimpleNamespace(
+            download_file=lambda **_kwargs: str(cfg), ArtifactStore=_ArtifactStore
+        ),
     )
 
     with pytest.raises(ValueError, match="peft_type must be LORA"):
@@ -179,7 +185,7 @@ def test_config_is_validated_before_tensors_are_listed(monkeypatch, tmp_path):
 def test_valid_config_still_reaches_the_tensor_check(monkeypatch, tmp_path):
     """The new gates must not swallow the tensor verification that already existed."""
 
-    class _HfApi:
+    class _ArtifactStore:
         def list_repo_tree(self, **kwargs):
             prefix = str(kwargs.get("path_in_repo") or "").rstrip("/")
             return [types.SimpleNamespace(path=f"{prefix}/README.md", size=12)]
@@ -188,8 +194,10 @@ def test_valid_config_still_reaches_the_tensor_check(monkeypatch, tmp_path):
     cfg.write_text(json.dumps(_valid_config()))
     monkeypatch.setitem(
         __import__("sys").modules,
-        "huggingface_hub",
-        types.SimpleNamespace(hf_hub_download=lambda **_kwargs: str(cfg), HfApi=_HfApi),
+        "flash.artifacts.api",
+        types.SimpleNamespace(
+            download_file=lambda **_kwargs: str(cfg), ArtifactStore=_ArtifactStore
+        ),
     )
 
     with pytest.raises(AdapterTensorMissing, match="no adapter_model tensor file"):

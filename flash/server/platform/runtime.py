@@ -29,7 +29,7 @@ async def _repo_cleanup_loop() -> None:
     """Sweep aged undeployed HF prefixes on startup, then daily.
 
     The 7-day age and daily cadence are fixed in ``flash.server.domain.repo_cleanup``. Each threaded sweep
-    fails closed when the live serving set is unconfirmed and requires operator ``HF_TOKEN``.
+    fails closed when the live serving set is unconfirmed and requires Azure artifact configuration.
     """
     from flash.server.domain.ops.repo_cleanup import CleanupAborted, run_scheduled_cleanup
 
@@ -453,11 +453,9 @@ def _latest_worker_artifact_name(repo: str, prefix: str, phase: str, kind: str) 
         f"{kind}_{phase}.txt" if kind == "console" else attempt_scoped_artifact_name(kind, phase, 0)
     )
     try:
-        from huggingface_hub import HfApi
+        from flash.artifacts.api import ArtifactStore
 
-        files = HfApi(token=os.environ.get("HF_TOKEN")).list_repo_files(
-            repo_id=repo, repo_type="dataset"
-        )
+        files = ArtifactStore(token=None).list_repo_files(repo_id=repo, repo_type="dataset")
     except Exception:
         return default
     pat = re.compile(rf"^{re.escape(prefix)}/{kind}_{re.escape(phase)}(?:_attempt(\d+))?\.txt$")
@@ -504,13 +502,13 @@ def _worker_artifacts(spec) -> dict[str, str]:
     """Fetch train-subprocess stdout and traceback from the private HF artifact repo.
 
     The control-plane log contains only orchestration and a truncated terminal tail. Use operator
-    ``HF_TOKEN`` so ``flash runs log`` can read private worker artifacts; missing data returns ``{}``.
+    Azure credentials so ``flash runs log`` can read private worker artifacts; missing data returns ``{}``.
     """
     repo = getattr(getattr(spec, "train", None), "hf_repo", None)
     if not repo:
         return {}
     try:
-        from huggingface_hub import hf_hub_download
+        from flash.artifacts.api import download_file
     except Exception:
         return {}
     prefix = adapter_prefix(spec)
@@ -542,14 +540,14 @@ def _worker_artifacts(spec) -> dict[str, str]:
         *([ray_name] if ray_name else []),
     ):
         try:
-            path = hf_hub_download(
+            path = download_file(
                 repo_id=repo,
                 repo_type="dataset",
                 filename=f"{prefix}/{name}",
-                token=os.environ.get("HF_TOKEN"),
+                token=None,
                 # the worker appends to console/error files across the run, so a cached copy goes
                 # stale; force a fresh pull (matches other HF artifact readers, e.g.
-                # flash/providers/artifacts/hf.py:make_hf_text_reader).
+                # flash/providers/artifacts/hf.py:make_artifact_text_reader).
                 force_download=True,
             )
             # errors="replace": worker stdout can carry non-UTF-8 bytes (tracebacks, progress bars);
