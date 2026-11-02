@@ -8,6 +8,7 @@ import pathlib
 import time
 from unittest import mock
 
+import httpx
 import pytest
 
 from flash.serving.promotion import gate as gate_module
@@ -23,6 +24,7 @@ from flash.serving.promotion.evidence import (
     HEALTH_DEPLOYMENT_ID_MISMATCH,
     HEALTH_SHA_MISMATCH,
     STREAM_NO_CONTENT,
+    PromotionVerdict,
     StreamEvidence,
 )
 from flash.serving.promotion.gate import (
@@ -366,6 +368,46 @@ def test_an_unreadable_snapshot_never_passes_as_settled():
         accounting_deadline_seconds=0,
     )
     assert verdict.reason == ACCOUNTING_MALFORMED
+
+
+def _statement_timeout() -> httpx.HTTPStatusError:
+    request = httpx.Request(
+        "POST",
+        "https://project.supabase.co/rest/v1/rpc/serving_promotion_accounting_snapshot",
+        headers={"apikey": "service-role-secret", "Authorization": "Bearer service-role-secret"},
+    )
+    response = httpx.Response(
+        500,
+        request=request,
+        json={"code": "57014", "message": "canceling statement due to statement timeout"},
+    )
+    return httpx.HTTPStatusError("server error", request=request, response=response)
+
+
+def test_an_rpc_failure_names_its_cause_without_changing_the_verdict():
+    """A statement timeout and schema drift share a reason code; the detail tells them apart."""
+    verdict, _ = _evaluate(
+        health=_health(),
+        stream=_good_stream(),
+        accounting=_statement_timeout(),
+        accounting_deadline_seconds=1,
+    )
+    assert verdict == PromotionVerdict(ok=False, reason=ACCOUNTING_MALFORMED)
+    assert "HTTP 500" in verdict.detail
+    assert "57014" in verdict.detail
+    assert "service-role-secret" not in verdict.detail
+
+
+def test_the_failure_line_carries_the_detail(monkeypatch, capsys):
+    detail = "HTTPStatusError: HTTP 500 statement timeout"
+
+    async def failed(plan):
+        return PromotionVerdict(ok=False, reason=ACCOUNTING_MALFORMED, detail=detail)
+
+    monkeypatch.setattr(gate_module, "_resolve", lambda base_url, env: object())
+    monkeypatch.setattr(gate_module, "_run", failed)
+    assert gate_module.main([]) == 1
+    assert f"promotion gate failed: {ACCOUNTING_MALFORMED} ({detail})" in capsys.readouterr().err
 
 
 def test_promotion_passes_only_when_all_three_layers_prove_themselves():
