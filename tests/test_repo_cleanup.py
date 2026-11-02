@@ -25,7 +25,7 @@ _REAL_HOLD_RUN_LOCK = rc._hold_run_lock
 _REAL_RUN_SCHEDULED_CLEANUP = rc.run_scheduled_cleanup
 
 # The DEFAULT managed namespace, not whatever the ambient env resolves to. This is read at IMPORT
-# time while `artifact_namespace()` reads FLASH_HF_NAMESPACE at CALL time, so deriving it from the
+# time while `artifact_namespace()` reads FLASH_ARTIFACT_NAMESPACE at CALL time, so deriving it from the
 # live env would bind it before the offline fixture scrubs that var -- every expectation built from
 # NS would then name a different namespace than the code under test. The `_frozen` fixture below
 # makes the two agree for real by forcing the env to this value for the duration of each test.
@@ -48,13 +48,12 @@ def _managed(slug: str) -> str:
 @pytest.fixture(autouse=True)
 def _frozen(monkeypatch):
     # Pin the namespace the code under test resolves to the same constant the expectations above
-    # were built from. `artifact_namespace()` reads FLASH_HF_NAMESPACE on every call, so without
+    # were built from. `artifact_namespace()` reads FLASH_ARTIFACT_NAMESPACE on every call, so without
     # this an operator shell that exports it (per SELF_HOSTING.md) would make the sweep scan
     # `<their-ns>/...` while every fixture repo id says `Freesolo-Co/...`, and the allowlist would
     # match nothing -- failing locally while CI, whose env is clean, stayed green.
     monkeypatch.setenv("FLASH_ARTIFACT_NAMESPACE", NS)
     monkeypatch.setattr(rc, "_now", lambda: NOW)
-    monkeypatch.setattr(rc, "_DELETE_SLEEP_S", 0)
     monkeypatch.setattr(rc, "run_scheduled_cleanup", _REAL_RUN_SCHEDULED_CLEANUP)
     monkeypatch.delenv("FLASH_ARTIFACT_BLOB_ACCOUNT_URL", raising=False)
 
@@ -644,7 +643,6 @@ def test_restat_spares_source_referenced_after_enumeration(monkeypatch):
 
 def test_deletion_rechecks_only_target_and_references(monkeypatch):
     _wire(monkeypatch)
-    monkeypatch.setattr(rc, "_throttle_tree_list", lambda: None)
     repo = _managed("many-runs")
     listings = []
     entries_read = []

@@ -90,7 +90,7 @@ def resolve_artifact_revision(hf_repo: str) -> str:
             f"could not resolve checkpoint for {hf_repo}: {exc}"
         ) from exc
     if not is_commit_sha(revision):
-        raise serving_errors.ServingError(f"could not resolve full Hub commit SHA for {hf_repo}")
+        raise serving_errors.ServingError(f"could not resolve immutable artifact revision for {hf_repo}")
     return revision.lower()
 
 
