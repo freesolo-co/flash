@@ -105,7 +105,26 @@ async def _find_owned_uploader(modal, client, handle, try_index: int = 0):
     return sandbox
 
 
-def finish(handle, spec, *, deadline_at):
+async def _launched_spec_sha256(modal, client, handle):
+    """Bind publication to the original launch, not a reconstructed polling spec."""
+    sandbox = await modal.Sandbox.from_id.aio(handle.instance_id, client=client)
+    tags = await sandbox.get_tags.aio()
+    expected = {
+        "flash_owner": "flash-training",
+        "flash_run": handle.run_id,
+        "flash_attempt": str(handle.attempt),
+        "flash_name": handle.name,
+        "flash_handoff": volume_name(handle.scope, handle.run_id, handle.attempt),
+    }
+    if any(tags.get(key) != value for key, value in expected.items()):
+        raise api.ModalApiError("CPU checkpoint parent launch identity mismatch")
+    digest = tags.get("flash_spec")
+    if not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest):
+        raise api.ModalApiError("CPU checkpoint parent launch has no valid specification digest")
+    return digest
+
+
+def finish(handle, *, deadline_at):
     """The GPU must be stopped and its Volume committed before attaching a CPU reader."""
     from flash.providers._lifecycle.net.worker import worker_image_for_gpu
 
@@ -119,7 +138,6 @@ def finish(handle, spec, *, deadline_at):
     environment = {
         **storage_environment,
         "FLASH_JOB_SPEC_PATH": f"{MOUNT}/spec.json",
-        "FLASH_EXPECTED_SPEC_SHA256": hashlib.sha256(spec.to_json().encode()).hexdigest(),
         "HF_REPO": handle.hf_repo,
         "RUN_ID": handle.run_id,
         "PHASE": handle.phase,
@@ -140,6 +158,11 @@ def finish(handle, spec, *, deadline_at):
         # its exit code is the result for that try.
         sandbox = await _find_owned_uploader(modal, client, handle, try_index)
         if sandbox is None:
+            # Recovery reduces gpu.max_wall_seconds on the poll spec. Hashing that spec
+            # rejects the untouched handoff from the original GPU launch on every retry.
+            environment["FLASH_EXPECTED_SPEC_SHA256"] = await _launched_spec_sha256(
+                modal, client, handle
+            )
             app = await modal.App.lookup.aio(
                 api.APP_NAME,
                 environment_name=api.environment(),
@@ -177,8 +200,11 @@ def finish(handle, spec, *, deadline_at):
                         "CPU upload launch could not be reconciled"
                     ) from None
         await sandbox.wait.aio()
-        if await sandbox.poll.aio() != 0:
-            raise api.ModalApiError("CPU checkpoint upload failed; prior durable save is preserved")
+        returncode = await sandbox.poll.aio()
+        if returncode != 0:
+            raise api.ModalApiError(
+                f"CPU checkpoint uploader {sandbox.object_id} exited with code {returncode}"
+            )
 
     tries = 0
     for try_index in range(UPLOAD_TRIES):
@@ -191,7 +217,7 @@ def finish(handle, spec, *, deadline_at):
             if tries >= UPLOAD_TRIES or remaining <= 0:
                 raise CheckpointUploadError(
                     f"CPU checkpoint upload failed after {tries} "
-                    f"{'try' if tries == 1 else 'tries'}; prior durable save is preserved"
+                    f"{'try' if tries == 1 else 'tries'}; prior durable save is preserved; {exc}"
                 ) from exc
             time.sleep(
                 min(
