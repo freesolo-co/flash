@@ -54,7 +54,6 @@ def _frozen(monkeypatch):
     # match nothing -- failing locally while CI, whose env is clean, stayed green.
     monkeypatch.setenv("FLASH_ARTIFACT_NAMESPACE", NS)
     monkeypatch.setattr(rc, "_now", lambda: NOW)
-    monkeypatch.setattr(rc, "_DELETE_SLEEP_S", 0)
     monkeypatch.setattr(rc, "run_scheduled_cleanup", _REAL_RUN_SCHEDULED_CLEANUP)
     monkeypatch.delenv("FLASH_ARTIFACT_BLOB_ACCOUNT_URL", raising=False)
 
@@ -644,7 +643,6 @@ def test_restat_spares_source_referenced_after_enumeration(monkeypatch):
 
 def test_deletion_rechecks_only_target_and_references(monkeypatch):
     _wire(monkeypatch)
-    monkeypatch.setattr(rc, "_throttle_tree_list", lambda: None)
     repo = _managed("many-runs")
     listings = []
     entries_read = []

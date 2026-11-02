@@ -109,89 +109,86 @@ def test_verify_rejects_legacy_blob_without_raw_kernels(tmp_path):
     assert bake_module()._verify(str(tmp_path), "sm100") == 1
 
 
-@pytest.mark.parametrize("failure", [None, "status", "download", "verify", "exec"])
-def test_direct_modal_transfer_checks_completion_and_always_terminates(
-    monkeypatch, tmp_path, failure
+@pytest.mark.parametrize("verification_fails", [False, True])
+@pytest.mark.parametrize("upload_fails", [False, True])
+@pytest.mark.parametrize("cleanup_fails", [False, True])
+def test_cleanup_covers_input_upload_and_never_overrides_result(
+    monkeypatch, tmp_path, upload_fails, cleanup_fails, verification_fails
 ):
-    import asyncio
-    import io
     import sys
-    import tarfile
     from types import SimpleNamespace
-    from unittest.mock import AsyncMock, Mock
 
+    from flash.artifacts import api as artifact_api
     from flash.providers.modal import api
 
     bake = bake_module()
-    process = SimpleNamespace(wait=SimpleNamespace(aio=AsyncMock(return_value=0)))
-    status = "rc=0\narch=10.0\n" if failure != "status" else "rc=1\narch=10.0\n"
+    deleted = []
 
-    async def download(remote, local):
-        if failure == "download":
-            raise OSError("download interrupted")
-        if remote.endswith(".tar.gz"):
-            with tarfile.open(local, "w:gz") as archive:
-                member = tarfile.TarInfo("bake-warmup.log")
-                member.size = len(b"stale log")
-                archive.addfile(member, io.BytesIO(b"stale log"))
-        else:
-            local.write_bytes(b"current bake")
+    def delete(**kwargs):
+        deleted.append(kwargs["repo_id"])
+        if cleanup_fails:
+            raise RuntimeError("cleanup outage")
 
-    sandbox = SimpleNamespace(
-        exec=SimpleNamespace(aio=AsyncMock(return_value=process)),
-        filesystem=SimpleNamespace(
-            read_text=SimpleNamespace(aio=AsyncMock(return_value=status)),
-            copy_to_local=SimpleNamespace(aio=AsyncMock(side_effect=download)),
-        ),
-        terminate=SimpleNamespace(aio=AsyncMock()),
+    hf = SimpleNamespace(
+        create_repo=lambda **kw: None,
+        upload_folder=lambda **kw: None,
     )
-    if failure == "exec":
-        sandbox.exec.aio.side_effect = RuntimeError("exec unavailable")
-    image = Mock()
-    image.add_local_dir.return_value = image
-    image.add_local_file.return_value = image
-    secret = Mock()
-    create = AsyncMock(return_value=sandbox)
-    modal = SimpleNamespace(
-        App=SimpleNamespace(lookup=SimpleNamespace(aio=AsyncMock())),
-        Image=SimpleNamespace(from_registry=Mock(return_value=image)),
-        Sandbox=SimpleNamespace(create=SimpleNamespace(aio=create)),
-        Secret=SimpleNamespace(from_dict=secret),
+
+    def upload(**kwargs):
+        if upload_fails:
+            raise RuntimeError("input upload outage")
+
+    hf.upload_folder = upload
+    monkeypatch.setattr(artifact_api, "ArtifactStore", lambda **kw: hf)
+    monkeypatch.setattr(
+        "flash.artifacts.config.runtime_environment",
+        lambda: {"FLASH_ARTIFACT_BLOB_SAS_URL": "test-sas"},
     )
-    monkeypatch.setattr(api, "call", lambda fn, **kw: asyncio.run(fn(modal, None)))
-    monkeypatch.setattr(bake, "_verify", lambda *a: int(failure == "verify"))
-    monkeypatch.setenv("HF_TOKEN", "model-read-token")
-    out = tmp_path / "published"
+    monkeypatch.setattr(bake, "_delete_artifacts", lambda repo: delete(repo_id=repo))
+    monkeypatch.setattr(api, "call", lambda *a, **kw: None)
+    monkeypatch.setattr(bake, "_status_present", lambda *a, **kw: True)
+    monkeypatch.setattr(bake, "_verify", lambda *a: int(verification_fails))
+
+    def download(**kwargs):
+        import io
+        import tarfile
+
+        out = Path(kwargs["local_dir"]) / "out"
+        out.mkdir()
+        (out / "STATUS").write_text("rc=0\narch=blackwell\n")
+        (out / "bake-warmup.log").write_bytes(b"current bake")
+        with tarfile.open(out / "kernel_cache.tar.gz", "w:gz") as archive:
+            entry = tarfile.TarInfo("bake-warmup.log")
+            entry.size = len(b"old image log")
+            archive.addfile(entry, io.BytesIO(b"old image log"))
+
+    monkeypatch.setattr(artifact_api, "download_snapshot", download)
     monkeypatch.setattr(
         sys,
         "argv",
         [
             "bake",
             "--arch",
-            "10.0",
+            "blackwell",
             "--sm",
             "sm100",
             "--image",
             "test/image",
             "--out",
-            str(out),
+            str(tmp_path / "out"),
         ],
     )
-    if failure in {"status", "download", "exec"}:
-        with pytest.raises((api.ModalApiError, OSError, RuntimeError)):
+    if upload_fails:
+        with pytest.raises(RuntimeError, match="input upload outage"):
             bake.main()
     else:
-        assert bake.main() == int(failure == "verify")
-    assert out.exists() == (failure is None)
-    if failure is None:
-        assert (out / "warmup.log").read_bytes() == b"current bake"
-        assert (out / "bake-warmup.log").read_bytes() == b"current bake"
-    if failure in {"status", "exec"}:
-        sandbox.filesystem.copy_to_local.aio.assert_not_awaited()
-    sandbox.terminate.aio.assert_awaited_once_with(wait=True)
-    assert create.call_args.args == ("sleep", "infinity")
-    assert secret.call_args.args == ({"BAKE_ARCH": "10.0", "HF_TOKEN": "model-read-token"},)
-    assert image.add_local_dir.call_args.args[1] == "/runcode/code/flash"
+        assert bake.main() == int(verification_fails)
+        if verification_fails:
+            assert not (tmp_path / "out").exists()
+        else:
+            assert (tmp_path / "out/bake-warmup.log").read_bytes() == b"current bake"
+            assert (tmp_path / "out/warmup.log").read_bytes() == b"current bake"
+    assert len(deleted) == 1
 
 
 @pytest.mark.parametrize("returncode", [1, 137])
@@ -200,10 +197,20 @@ def test_failed_sandbox_preserves_exit_diagnostic_and_cleans_up(monkeypatch, ret
     from types import SimpleNamespace
     from unittest.mock import AsyncMock, Mock
 
+    from flash.artifacts import api as artifact_api
     from flash.providers.modal import api
 
     bake = bake_module()
-    monkeypatch.setenv("HF_TOKEN", "test")
+    hf = SimpleNamespace()
+    delete = Mock()
+    monkeypatch.setattr(bake, "_delete_artifacts", delete)
+    monkeypatch.setattr(bake, "_bake_image", lambda *args: "bake-image")
+    monkeypatch.setattr(artifact_api, "ArtifactStore", lambda **kw: hf)
+    monkeypatch.setattr(
+        "flash.artifacts.config.runtime_environment",
+        lambda: {"FLASH_ARTIFACT_BLOB_SAS_URL": "test-sas"},
+    )
+    monkeypatch.setattr(bake, "_upload_flash_code", lambda *args: None)
     monkeypatch.setattr(api, "credentials", lambda: ("test-id", "test-secret"))
     monkeypatch.setattr(api, "call", call_modal)
     monkeypatch.setattr(
@@ -213,20 +220,13 @@ def test_failed_sandbox_preserves_exit_diagnostic_and_cleans_up(monkeypatch, ret
     )
     sandbox = SimpleNamespace(
         object_id="sb-test-h100",
-        exec=SimpleNamespace(
-            aio=AsyncMock(
-                return_value=SimpleNamespace(
-                    wait=SimpleNamespace(aio=AsyncMock(return_value=returncode)),
-                )
-            )
-        ),
+        wait=SimpleNamespace(aio=AsyncMock()),
+        poll=SimpleNamespace(aio=AsyncMock(return_value=returncode)),
         terminate=SimpleNamespace(aio=AsyncMock()),
     )
     create = AsyncMock(return_value=sandbox)
     client = SimpleNamespace(__aexit__=AsyncMock())
-    image = Mock()
-    image.add_local_dir.return_value = image
-    image.add_local_file.return_value = image
+    image = SimpleNamespace(add_local_file=Mock(return_value="bake-image"))
     monkeypatch.setitem(
         sys.modules,
         "modal",
@@ -249,6 +249,7 @@ def test_failed_sandbox_preserves_exit_diagnostic_and_cleans_up(monkeypatch, ret
     assert create.call_args.kwargs["memory"] == (32768, 131072)
     sandbox.terminate.aio.assert_awaited_once_with(wait=True)
     client.__aexit__.assert_awaited_once_with(None, None, None)
+    delete.assert_called_once()
 
 
 @pytest.mark.parametrize("name", ["../escape", "/absolute"])
@@ -276,3 +277,79 @@ def test_cache_archive_preserves_hidden_backend_directories(tmp_path):
         archive.addfile(entry, io.BytesIO(b"compiled"))
     bake_module()._extract_cache_archive(path, tmp_path / "out")
     assert (tmp_path / "out/flashinfer/.cache/kernel.so").read_bytes() == b"compiled"
+
+
+def test_upload_uses_base_pinned_source_without_importing_it(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    import flash
+
+    root = tmp_path / "older-base"
+    package = root / "flash"
+    warmup = package / "engine/worker/runtime/kernel_warmup.py"
+    warmup.parent.mkdir(parents=True)
+    warmup.write_text("BASE_REVISION = 'older-base'\n")
+    (package / "__init__.py").write_text("raise RuntimeError('old package must not be imported')\n")
+    # A historical checkout can have an HF-only helper; the current helper must never execute it.
+    (root / "docker").mkdir()
+    (root / "docker/bake_kernel_cache.py").write_text("import os; os.environ['HF_TOKEN']\n")
+    monkeypatch.delenv("HF_TOKEN", raising=False)
+    seen = []
+
+    def upload_folder(**kwargs):
+        uploaded = Path(kwargs["folder_path"])
+        seen.append(uploaded)
+        assert (
+            uploaded / "engine/worker/runtime/kernel_warmup.py"
+        ).read_bytes() == warmup.read_bytes()
+        assert kwargs["path_in_repo"] == "code/flash"
+
+    bake_module()._upload_flash_code(
+        SimpleNamespace(create_repo=lambda **kw: None, upload_folder=upload_folder),
+        "test/bake",
+        root,
+    )
+    assert seen == [package]
+    assert seen[0] != Path(flash.__file__).parent
+
+
+def test_invalid_base_source_fails_before_publishing(tmp_path):
+    from types import SimpleNamespace
+
+    store = SimpleNamespace(create_repo=lambda **kw: pytest.fail("must validate before publishing"))
+    with pytest.raises(ValueError, match="base image's Flash warmup package"):
+        bake_module()._upload_flash_code(store, "test/bake", tmp_path)
+
+
+def test_workflow_keeps_transport_and_base_source_in_separate_checkouts():
+    import shlex
+
+    import yaml
+
+    workflow = yaml.safe_load(
+        (Path(__file__).parents[1] / ".github/workflows/bake-kernel-cache.yml").read_text()
+    )
+    steps = workflow["jobs"]["bake"]["steps"]
+    checkouts = {
+        step["with"]["path"]: step["with"]["ref"]
+        for step in steps
+        if step.get("uses", "").startswith("actions/checkout@")
+    }
+    assert checkouts["bake-tools"] == "${{ github.workflow_sha }}"
+    assert checkouts["base-source"] == "${{ steps.base.outputs.revision || github.sha }}"
+    warm = next(step for step in steps if step.get("name", "").startswith("Warm kernels"))
+    command = shlex.split(warm["run"].replace("\\\n", " "))
+    assert command[command.index("--project") + 1] == "bake-tools"
+    assert command[command.index("python") + 1] == "bake-tools/docker/bake_kernel_cache.py"
+    assert command[command.index("--source-root") + 1] == "base-source"
+    assert command[command.index("--out") + 1] == "base-source/build/kernel_cache"
+    sync = next(step["run"] for step in steps if "uv sync" in step.get("run", ""))
+    assert "--project bake-tools" in sync
+    assert "--locked" in sync
+    build = next(
+        step["with"]
+        for step in steps
+        if step.get("uses", "").startswith("docker/build-push-action@")
+    )
+    assert build["context"] == "base-source"
+    assert build["file"] == "base-source/docker/Dockerfile.kernelcache"

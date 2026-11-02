@@ -50,52 +50,39 @@ revision data; physical reclamation of unreferenced objects is intentionally not
 part of this cutover. Do not attach an age-only Blob lifecycle deletion policy:
 it can delete objects still referenced by pinned checkpoints.
 
+## Kernel-cache builds
+
+Kernel-cache CI uses the separate private `build-artifacts` container. Its dedicated
+identity has Blob Data Contributor on that container and Blob Delegator on the
+account. GitHub uses `AZURE_BUILD_CLIENT_ID` and `AZURE_BUILD_CLIENT_SECRET`, with
+the existing tenant setting. It cannot access dev or production training artifacts.
+The GPU sandbox receives only a bounded SAS; the CI identity deletes its disposable
+source/cache namespace afterward. Hugging Face is no longer used for build transport.
+
 ## Three-day migration
 
-The migration tool is the only Hugging Face reader for Flash-owned storage. It is
-an operator tool, never imported by the runtime. It freezes a rolling **72-hour**
-UTC window when the plan is created. It selects files by their authoritative
-last-commit timestamps at pinned source revisions. A checkpoint is selected as a
-whole by its newest file, so an upload crossing the cutoff does not lose shards.
-Older checkpoints are excluded even when their repository has a recent heartbeat.
-Unknown timestamps fail the plan rather than widening the window.
+The one-time importer was retired after the final inventory was published and
+verified. The completed window is **2026-10-30 04:33:53.792845 UTC through
+2026-11-02 04:33:53.792845 UTC**. Files were selected by authoritative last-commit
+timestamps at pinned revisions; whole checkpoints were selected by their newest
+file, so the cutoff did not split checkpoint shards.
 
-1. Drain active training runs and pause submissions on the old release. Back up
-   the private run records and checkpoint/serving registry. Export the registry's
-   immutable artifact pins into `serving-references.json`, an array of
-   `{"repo":"Freesolo-Co/flashrun-...","revision":"<40-hex>","path":"sft/<run>/checkpoints/step-1/adapter"}`. Use `[]` only
-   after confirming no registry pins need preservation. Nonterminal run-state source,
-   environment, warm-start, and custom-resume pins are collected automatically.
-2. Create a plan for each controller/container. Keep the plan outside Git:
+The import verified 11,159 distinct repository/content objects (601,802,167,791
+bytes), then published and read back 629 revision snapshots covering 29,321 file
+entries. Original Hub revision aliases preserve existing checkpoint bindings.
+673 staged objects outside the final referenced inventory were removed only after
+checking every published manifest. Source Hugging Face data was not deleted.
 
-   ```sh
-   PYTHONPATH=. python scripts/migrate_recent_hf_artifacts.py plan /secure/recent-artifacts.json \
-     --run-state-directory /backup/.flash/runs \
-     --references /secure/serving-references.json
-   ```
+The private inventory and per-object verification receipts remain with the migration
+operator. The importer can be recovered from the pre-cleanup Git revision for an
+explicitly reviewed recovery; it is no longer shipped with Flash. See
+[the migration evidence](azure-migration-evidence-20261102.json).
 
-3. Review its UTC cutoff/end, repositories, exact revisions, paths, sizes, and
-   source hashes. A required pin outside the window is an explicit planning error;
-   retire that binding or run before proceeding. Do not silently broaden the
-   three-day window. Stop source writes while planning and copying; otherwise
-   create a fresh plan after the final drain.
-4. With the intended Azure destination configured, apply the reviewed inventory:
-
-   ```sh
-   PYTHONPATH=. python scripts/migrate_recent_hf_artifacts.py apply /secure/recent-artifacts.json
-   ```
-
-   Every file is checked against its pinned Git/LFS identity, streamed to Azure,
-   downloaded again, and verified before its manifest and original-revision alias
-   are published. The operation can be rerun. It never overwrites an existing
-   Azure head and never deletes source Hub data. Inspect the `.verified.json`
-   report before cutover. Reusing a destination with an existing head preserves
-   that head; reconcile deliberately if it predates the reviewed inventory.
-5. Deploy the matching Flash controller, worker source, and serving changes, plus
-   the Freesolo companion. Check the selected run's logs, checkpoint listing,
-   adapter download/export, a paid SFT save/resume, custom restore, and serving
-   generation in dev before promoting. The Modal image extension installs the
-   Azure SDK even when a qualified base image predates this release.
+Deployment is a separate step: keep submissions paused while switching the matching
+Flash controller, serving release, and Freesolo configuration. Verify production
+checkpoint downloads and generation before reopening submissions. Dev SFT and
+custom save/resume, exact checkpoint/optimizer restoration, downloads, and hosted
+serving already passed before the production drain.
 
 Archived worker source from before this cutover is retained only as data. The new
 bootstrap refuses to execute its retired HF backend. Start a new run from a migrated

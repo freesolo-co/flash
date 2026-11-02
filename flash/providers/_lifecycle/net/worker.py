@@ -224,24 +224,9 @@ def _ensure_private_artifact_repo(
     *,
     deadline_at: float | None = None,
 ) -> None:
-    try:
-        _artifact_call(
-            lambda: api.repo_info(repo_id=repo, repo_type="dataset"),
-            f"lookup artifact repo {repo}",
-            deadline_at=deadline_at,
-        )
-    except Exception as exc:
-        if artifact_status_code(exc) != 404 and exc.__class__.__name__ != "RepositoryNotFoundError":
-            raise
-        _artifact_call(
-            lambda: api.create_repo(repo, repo_type="dataset", exist_ok=True, private=True),
-            f"create artifact repo {repo}",
-            deadline_at=deadline_at,
-        )
-    # assert the private-only storage contract, including namespaces that already existed.
     _artifact_call(
-        lambda: api.update_repo_settings(repo_id=repo, repo_type="dataset", private=True),
-        f"force artifact repo private {repo}",
+        lambda: api.create_repo(repo, exist_ok=True, private=True),
+        f"ensure private artifact namespace {repo}",
         deadline_at=deadline_at,
     )
 
@@ -281,10 +266,7 @@ def _download_source_archive(
             deadline_at=deadline_at,
         )
     except Exception as exc:
-        if artifact_status_code(exc) == 404 or exc.__class__.__name__ in {
-            "EntryNotFoundError",
-            "LocalEntryNotFoundError",
-        }:
+        if artifact_status_code(exc) == 404:
             return None
         raise
     with open(local_path, "rb") as source:

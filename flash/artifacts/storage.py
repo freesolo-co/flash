@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import os
 import shutil
@@ -79,13 +80,19 @@ class BlobArtifacts:
             if existing != data:
                 raise ValueError("immutable artifact revision collision") from None
 
-    def put_file(self, repo, source):
+    def put_file(self, repo, source, *, immutable=False):
         from azure.core.exceptions import ResourceExistsError
 
-        # Logs may still be appended while uploading. Hash and send the same private copy.
-        with open(source, "rb") as input_file, tempfile.TemporaryFile() as stream:
-            shutil.copyfileobj(input_file, stream, length=1024 * 1024)
-            stream.seek(0)
+        # Finalized checkpoint callers guarantee stable files for the entire upload. Stream
+        # those from the original descriptor; a second multi-GB copy can exhaust worker disk.
+        # Mutable artifacts (including live logs) still hash and send one private snapshot.
+        with contextlib.ExitStack() as stack:
+            stream = stack.enter_context(open(source, "rb"))
+            if not immutable:
+                snapshot = stack.enter_context(tempfile.TemporaryFile())
+                shutil.copyfileobj(stream, snapshot, length=1024 * 1024)
+                stream = snapshot
+                stream.seek(0)
             digest = hashlib.file_digest(stream, "sha256").hexdigest()
             size = os.fstat(stream.fileno()).st_size
             stream.seek(0)

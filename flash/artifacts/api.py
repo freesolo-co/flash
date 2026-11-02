@@ -70,16 +70,17 @@ class ArtifactStore:
                 revision = store.commit(repo_id, {})
         return SimpleNamespace(oid=revision)
 
-    def update_repo_settings(self, repo_id, *, repo_type="dataset", private=True):
-        if not private:
-            raise ValueError("Flash artifact storage is private")
-        with open_container(self.token) as container:
-            if container.get_container_properties().public_access:
-                raise ValueError("Flash artifact container must deny public access")
-
     def upload_file(
-        self, *, path_or_fileobj, path_in_repo, repo_id, repo_type="dataset", commit_message=None
+        self,
+        *,
+        path_or_fileobj,
+        path_in_repo,
+        repo_id,
+        repo_type="dataset",
+        commit_message=None,
+        immutable=False,
     ):
+        # immutable=True is reserved for finalized files that cannot change until this call returns.
         validate_path(path_in_repo)
         with tempfile.TemporaryDirectory(prefix="flash-artifact-upload-") as temporary:
             source = path_or_fileobj
@@ -94,7 +95,10 @@ class ArtifactStore:
                         shutil.copyfileobj(path_or_fileobj, output, length=1024 * 1024)
             with open_container(self.token) as container:
                 store = BlobArtifacts(container)
-                entry = {**store.put_file(repo_id, source), "modified": time.time()}
+                entry = {
+                    **store.put_file(repo_id, source, immutable=immutable),
+                    "modified": time.time(),
+                }
                 revision = store.commit(repo_id, {path_in_repo: entry})
         return SimpleNamespace(oid=revision)
 
@@ -110,7 +114,9 @@ class ArtifactStore:
         delete_patterns=None,
         commit_message=None,
         parent_commit=None,
+        immutable=False,
     ):
+        # immutable=True requires the caller to keep every file stable for the entire publication.
         if path_in_repo:
             validate_path(path_in_repo)
         root = Path(folder_path).resolve()
@@ -131,7 +137,7 @@ class ArtifactStore:
                 ):
                     continue
                 additions[prefix + relative] = {
-                    **store.put_file(repo_id, path),
+                    **store.put_file(repo_id, path, immutable=immutable),
                     "modified": time.time(),
                 }
             revision = store.commit(

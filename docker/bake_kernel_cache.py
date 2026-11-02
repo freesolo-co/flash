@@ -7,9 +7,10 @@ import json
 import os
 import shutil
 import tarfile
-import tempfile
 import time
 import uuid
+
+ARTIFACT_NAMESPACE = "Freesolo-Co"
 
 # One Modal GPU per compiler architecture; the worker verifies the requested SM.
 GPU_BY_SM = {
@@ -26,30 +27,58 @@ def log(msg: str) -> None:
     print(f"[bake-ci] {msg}", flush=True)
 
 
-async def _collect_bake(sandbox, out, arch: str, deadline: int) -> None:
-    """Run warmup while the sandbox stays alive, then stream its outputs before teardown."""
-    from flash.providers.modal import api as modal_api
+def _upload_flash_code(api, repo: str, source_root) -> None:
+    """Upload the base-pinned warmup package without importing it into the transport process."""
+    from pathlib import Path
 
-    process = await sandbox.exec.aio("python", "-u", "/opt/flash/bake.py", timeout=deadline)
-    returncode = await process.wait.aio()
-    if returncode != 0:
-        raise modal_api.ModalApiError(
-            f"Kernel warmup exited with code {returncode}; "
-            f"inspect Modal sandbox {sandbox.object_id}"
-        )
-    status = await sandbox.filesystem.read_text.aio("/out/STATUS")
-    if status != f"rc=0\narch={arch}\n":
-        raise modal_api.ModalApiError("kernel warmup finished without a valid completion marker")
-    await sandbox.filesystem.copy_to_local.aio(
-        "/out/kernel_cache.tar.gz", out / "kernel_cache.tar.gz"
+    pkg_dir = Path(source_root).resolve() / "flash"
+    if not (pkg_dir / "engine/worker/runtime/kernel_warmup.py").is_file():
+        raise ValueError("bake source must contain the base image's Flash warmup package")
+    api.create_repo(repo_id=repo, repo_type="dataset", private=True, exist_ok=True)
+    api.upload_folder(
+        folder_path=str(pkg_dir),
+        path_in_repo="code/flash",
+        repo_id=repo,
+        repo_type="dataset",
+        ignore_patterns=["__pycache__/*", "*.pyc"],
+        delete_patterns=["**"],
     )
-    await sandbox.filesystem.copy_to_local.aio("/out/warmup.log", out / "bake-warmup.log")
+    log(f"uploaded flash code -> {repo}:code/flash (from {pkg_dir})")
+
+
+def _bake_image(modal, image_ref, entry):
+    """Seed the same standalone Azure client used by managed worker bootstrap."""
+    from pathlib import Path
+
+    import flash.artifacts
+
+    image = (
+        modal.Image.from_registry(image_ref)
+        .pip_install("azure-storage-blob==12.31.1", "azure-identity==1.27.0")
+        .add_local_file(str(entry), "/opt/flash/bake.py", copy=True)
+    )
+    package = Path(flash.artifacts.__file__).parent
+    for module in ("api", "config", "manifest", "storage"):
+        image = image.add_local_file(
+            str(package / f"{module}.py"), f"/opt/flash/artifact_{module}.py", copy=True
+        )
+    return image
+
+
+def _delete_artifacts(repo):
+    from flash.artifacts.config import open_container
+    from flash.artifacts.manifest import repo_prefix
+
+    with open_container() as container:
+        for blob in container.list_blobs(name_starts_with=repo_prefix(repo) + "/"):
+            container.delete_blob(blob.name)
 
 
 def main() -> int:
     from pathlib import Path
 
-    import flash
+    from flash.artifacts.api import ArtifactStore, download_snapshot
+    from flash.artifacts.config import runtime_environment
     from flash.providers.modal import api as modal_api
 
     parser = argparse.ArgumentParser(description="Bake worker kernels on Modal")
@@ -57,13 +86,23 @@ def main() -> int:
     parser.add_argument("--sm", required=True, choices=tuple(GPU_BY_SM))
     parser.add_argument("--image", required=True)
     parser.add_argument("--out", default="build/kernel_cache")
+    parser.add_argument(
+        "--source-root",
+        type=Path,
+        default=Path(__file__).resolve().parents[1],
+        help="Checkout matching the base image; transport runs from this helper's checkout",
+    )
     parser.add_argument("--deadline-min", type=int, default=90)
     parser.add_argument("--run-id", default="")
     args = parser.parse_args()
     if not 1 <= args.deadline_min <= 1440:
         parser.error("deadline must be between 1 and 1440 minutes")
-    token = os.environ["HF_TOKEN"]
+    artifacts = ArtifactStore()
+    worker_secrets = runtime_environment()
+    if not worker_secrets:
+        raise RuntimeError("Azure build artifact storage is not configured")
     suffix = args.run_id or f"{int(time.time())}-{uuid.uuid4().hex[:8]}"
+    repo = f"{os.environ.get('FLASH_ARTIFACT_NAMESPACE', ARTIFACT_NAMESPACE)}/kernel-bake-{args.sm}-{suffix}"
     entry = Path(__file__).with_name("bake_sandbox_entry.py")
 
     async def bake(modal, client):
@@ -73,51 +112,76 @@ def main() -> int:
             create_if_missing=True,
             client=client,
         )
-        image = (
-            modal.Image.from_registry(args.image)
-            .add_local_dir(
-                Path(flash.__file__).parent,
-                "/runcode/code/flash",
-                copy=True,
-                ignore=["**/__pycache__/**", "**/*.pyc"],
-            )
-            .add_local_file(str(entry), "/opt/flash/bake.py", copy=True)
-        )
+        image = _bake_image(modal, args.image, entry)
         sandbox = await modal.Sandbox.create.aio(
-            "sleep",
-            "infinity",
+            "python",
+            "-u",
+            "/opt/flash/bake.py",
             app=app,
             image=image,
             name=f"bake-{args.sm}-{suffix}",
             gpu=GPU_BY_SM[args.sm],
-            timeout=min(86400, args.deadline_min * 60 + 600),
+            timeout=args.deadline_min * 60,
             cpu=(4, 8),
             # Keep the reservation at 32 GiB, but allow compiler memory to burst. The
             # H100 warmup was evicted for thrashing at the previous 64 GiB limit.
             memory=(32768, 131072),
-            secrets=[modal.Secret.from_dict({"BAKE_ARCH": args.arch, "HF_TOKEN": token})],
+            secrets=[
+                modal.Secret.from_dict(
+                    {"BAKE_ARTIFACT_REPO": repo, "BAKE_ARCH": args.arch, **worker_secrets}
+                )
+            ],
             client=client,
         )
         try:
-            await _collect_bake(sandbox, staging, args.arch, args.deadline_min * 60)
+            await sandbox.wait.aio()
+            returncode = await sandbox.poll.aio()
+            if returncode != 0:
+                # The provider wrapper sanitizes ordinary exceptions. Preserve this
+                # credential-free diagnostic so CI names the failed sandbox and exit.
+                raise modal_api.ModalApiError(
+                    f"Kernel warmup exited with code {returncode}; "
+                    f"inspect Modal sandbox {sandbox.object_id}"
+                )
         finally:
             await sandbox.terminate.aio(wait=True)
 
-    # Never let leftovers from a previous bake satisfy this run's verification.
-    with tempfile.TemporaryDirectory(prefix="flash-kernel-") as temp:
-        staging = Path(temp)
-        modal_api.call(bake, timeout=args.deadline_min * 60 + 600)
-        archive = staging / "kernel_cache.tar.gz"
-        # Preserve the current log even if an older log exists inside the exported cache.
-        current_log = (staging / "bake-warmup.log").read_bytes()
-        _extract_cache_archive(archive, staging)
-        archive.unlink()
-        (staging / "bake-warmup.log").write_bytes(current_log)
-        (staging / "warmup.log").write_bytes(current_log)
-        result = _verify(str(staging), args.sm)
-        if result == 0:
-            shutil.copytree(staging, args.out, dirs_exist_ok=True)
-        return result
+    try:
+        _upload_flash_code(artifacts, repo, args.source_root)
+        modal_api.call(bake, timeout=args.deadline_min * 60 + 120)
+        if not _status_present(artifacts, repo, retries=3):
+            raise RuntimeError("kernel warmup finished without its completion marker")
+        import tempfile
+
+        with tempfile.TemporaryDirectory(prefix="flash-kernel-") as temp:
+            download_snapshot(
+                repo_id=repo,
+                repo_type="dataset",
+                allow_patterns=["out/**"],
+                local_dir=temp,
+            )
+            staging = Path(temp) / "out"
+            status = (staging / "STATUS").read_text()
+            if status != f"rc=0\narch={args.arch}\n":
+                raise RuntimeError("kernel warmup returned an invalid completion marker")
+            archive = staging / "kernel_cache.tar.gz"
+            current_log = (staging / "bake-warmup.log").read_bytes()
+            _extract_cache_archive(archive, staging)
+            archive.unlink()
+            # A cache may contain an older log. Keep this run's subprocess log authoritative.
+            (staging / "bake-warmup.log").write_bytes(current_log)
+            (staging / "warmup.log").write_bytes(current_log)
+            result = _verify(str(staging), args.sm)
+            if result == 0:
+                shutil.copytree(staging, args.out, dirs_exist_ok=True)
+            return result
+    finally:
+        try:
+            _delete_artifacts(repo)
+        except Exception:
+            log(
+                f"WARNING: could not delete temporary Azure artifacts for {repo}; remove it manually"
+            )
 
 
 def _extract_cache_archive(archive_path, destination) -> None:
@@ -136,6 +200,19 @@ def _extract_cache_archive(archive_path, destination) -> None:
             if total > 32 * 1024**3:
                 raise ValueError("kernel cache archive exceeds 32 GiB")
         archive.extractall(root, members=members, filter="data")
+
+
+def _status_present(api, repo: str, retries: int = 1) -> bool:
+    """Authoritative out/STATUS check, retried to ride out a transient Azure read error."""
+    for i in range(retries):
+        try:
+            if "out/STATUS" in api.list_repo_files(repo, repo_type="dataset"):
+                return True
+        except Exception as e:
+            log(f"artifact status recheck {i + 1}/{retries}: {type(e).__name__}")
+        if i < retries - 1:
+            time.sleep(5)
+    return False
 
 
 def _verify(out: str, sm: str) -> int:

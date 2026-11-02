@@ -90,6 +90,7 @@ def test_publish_deployable_checkpoint_uploads_adapter_only(worker_context, tmp_
     up = rec.uploads[0]
     assert up["path_in_repo"] == "rl/flash-ckpt-1/checkpoints/step-80/adapter"
     assert up["repo_type"] == "dataset"
+    assert up["immutable"] is True
     # Trainer-state files are excluded so each per-step snapshot is just the small LoRA adapter.
     assert "optimizer.pt" in up["ignore_patterns"]
     # The deployable path must NOT prune older steps (every step stays deployable).
@@ -900,3 +901,21 @@ def test_deployable_retry_budget_is_bounded(
         assert "storage unavailable" in result.upload_error
     assert len(uploads) == expected_attempts
     assert delays == ([5.0, 10.0] if required else [])
+
+
+def test_native_checkpoint_publication_streams_finalized_files(
+    worker_context, tmp_path, monkeypatch
+):
+    rec = _RecordingArtifactStore()
+    worker = _prime_worker(monkeypatch, rec, worker_context=worker_context)
+    checkpoint = tmp_path / "checkpoint-80"
+    checkpoint.mkdir()
+    (checkpoint / "optimizer.pt").write_bytes(b"optimizer state")
+    result = worker.upload_resume_checkpoint(
+        80,
+        str(checkpoint),
+        emit_heartbeat=False,
+        context=worker_context,
+    )
+    assert result.resume is not None
+    assert rec.uploads[0]["immutable"] is True

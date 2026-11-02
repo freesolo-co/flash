@@ -264,3 +264,77 @@ def test_supplied_sas_cannot_redirect_development_to_production(monkeypatch):
     with pytest.raises(ValueError, match="destination does not match") as error:
         runtime_environment()
     assert "sig=secret" not in str(error.value)
+
+
+def test_namespace_initialization_preserves_existing_head(azure):
+    _, client, _ = azure
+    empty = client.create_repo(REPO).oid
+    assert client.repo_info(REPO).sha == empty
+    updated = upload(client, "checkpoint", b"weights")
+    assert client.create_repo(REPO).oid == updated
+    assert client.list_repo_files(REPO) == ["checkpoint"]
+
+
+def test_namespace_initialization_rejects_public_container(azure, monkeypatch):
+    container, client, _ = azure
+    monkeypatch.setattr(
+        container, "get_container_properties", lambda: SimpleNamespace(public_access="blob")
+    )
+    with pytest.raises(ValueError, match="public access"):
+        client.create_repo(REPO)
+    assert not container.blobs
+
+
+@pytest.mark.parametrize("method", ["file", "folder"])
+@pytest.mark.parametrize("relative", ["optimizer.pt", "flash_checkpoint_parts/digest/00000"])
+def test_finalized_checkpoint_upload_does_not_stage_another_copy(
+    azure, tmp_path, monkeypatch, method, relative
+):
+    import errno
+    import os
+
+    from flash.artifacts import storage
+
+    container, client, _ = azure
+    checkpoint = tmp_path / "checkpoint"
+    checkpoint.mkdir()
+    source = checkpoint / relative
+    source.parent.mkdir(parents=True, exist_ok=True)
+    source.write_bytes(b"finalized optimizer state")
+    original = container.get_blob_client
+    transferred = []
+
+    def no_disk_for_copy(*args, **kwargs):
+        raise OSError(errno.ENOSPC, "no disk available for a duplicate checkpoint")
+
+    def get_blob(name):
+        blob = original(name)
+        upload_blob = blob.upload_blob
+
+        def upload_original(data, **kwargs):
+            if "/objects/" in name:
+                assert os.fstat(data.fileno()).st_ino == source.stat().st_ino
+                transferred.append(name)
+            return upload_blob(data, **kwargs)
+
+        blob.upload_blob = upload_original
+        return blob
+
+    monkeypatch.setattr(storage.tempfile, "TemporaryFile", no_disk_for_copy)
+    monkeypatch.setattr(container, "get_blob_client", get_blob)
+    if method == "folder":
+        receipt = client.upload_folder(
+            repo_id=REPO, folder_path=checkpoint, path_in_repo="checkpoint/step-1", immutable=True
+        )
+    else:
+        receipt = client.upload_file(
+            repo_id=REPO,
+            path_or_fileobj=source,
+            path_in_repo=f"checkpoint/step-1/{relative}",
+            immutable=True,
+        )
+    downloaded = api.download_file(
+        REPO, f"checkpoint/step-1/{relative}", revision=receipt.oid, local_dir=tmp_path / "restored"
+    )
+    assert Path(downloaded).read_bytes() == source.read_bytes()
+    assert len(transferred) == 1

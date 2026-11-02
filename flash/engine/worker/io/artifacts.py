@@ -380,6 +380,7 @@ def publish_deployable_checkpoint(
                 _require_artifact_deadline_allowance(context=context)
                 receipt = artifact_api().upload_folder(
                     folder_path=source,
+                    immutable=True,
                     path_in_repo=upload_path,
                     repo_id=context.config.hf_repo,
                     repo_type="dataset",
@@ -528,6 +529,7 @@ def upload_resume_checkpoint(
                         _require_artifact_deadline_allowance(context=context)
                         receipt = artifact_api().upload_folder(
                             folder_path=folder,
+                            immutable=True,
                             path_in_repo=path,
                             repo_id=context.config.hf_repo,
                             repo_type="dataset",
