@@ -4210,7 +4210,7 @@ def test_a_failed_upload_still_frees_the_exported_adapter(worker_context, monkey
     )
 
     def boom(step, checkpoint, **kwargs):
-        raise RuntimeError("hf upload failed")
+        raise RuntimeError("artifact upload failed")
 
     monkeypatch.setattr(worker, "upload_resume_checkpoint", boom)
 
@@ -4223,7 +4223,7 @@ def test_a_failed_upload_still_frees_the_exported_adapter(worker_context, monkey
         required_steps=(3,),
         context=worker_context,
     )
-    with pytest.raises(RuntimeError, match="hf upload failed"):
+    with pytest.raises(RuntimeError, match="artifact upload failed"):
         watcher._publish(3, str(checkpoint_dir))
 
     assert not os.path.exists(export_root / "step-3"), (

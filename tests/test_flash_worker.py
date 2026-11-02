@@ -386,7 +386,7 @@ def test_ray_log_artifact_name_is_scoped_exactly_like_the_traceback_beside_it():
 def test_worker_and_control_plane_agree_on_the_error_artifact_name():
     """The process that WRITES the error artifact and the one that READS it must spell it the same.
 
-    These live on opposite sides of a machine boundary -- the worker uploads to HF, the pollers fetch
+    These live on opposite sides of a machine boundary -- the worker uploads to Azure, the pollers fetch
     from it -- and nothing at runtime ever compares the two names. A disagreement surfaces only as a
     missing artifact, which is indistinguishable from "the worker crashed before uploading": exactly
     the situation the file exists to explain, so the failure erases its own evidence.

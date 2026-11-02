@@ -319,7 +319,7 @@ def test_gpu_diagnostics_parses_nvidia_smi(monkeypatch):
 
 
 def test_heartbeat_commit_is_throttled(worker_context, monkeypatch):
-    """heartbeat() must rate-limit HF commits (per-step commits blow HF's 128/hour repo cap),
+    """heartbeat() must rate-limit artifact commits to bound storage traffic,
     while always committing milestone stages."""
     monkeypatch.setenv("RUN_MODE", "rl")
     monkeypatch.delenv("FLASH_JOB_SPEC_JSON", raising=False)
@@ -352,10 +352,8 @@ def test_heartbeat_commit_is_throttled(worker_context, monkeypatch):
 )
 def test_setup_progress_heartbeats_are_throttled(worker_context, monkeypatch, stage):
     """The periodic setup pings run on a side thread every 30s through a long phase (a cold
-    snapshot_download can pull tens of GB for ~40 min, and disaggregated workers share one HF_REPO),
-    so their HF UPLOAD must be throttled like rl_step or they blow HF's 128/hour repo commit cap. The
-    "HEARTBEAT" stderr line still prints every call (the only per-call side effect now — HF is the one
-    durable channel); this pins only that the repeated stage does NOT commit to HF on every call."""
+    snapshot_download can pull tens of GB for ~40 min), so throttle uploads like rl_step.
+    The "HEARTBEAT" stderr line still prints every call; only durable artifact writes are throttled."""
     monkeypatch.setenv("RUN_MODE", "rl")
     monkeypatch.delenv("FLASH_JOB_SPEC_JSON", raising=False)
     import flash.engine.worker.io.heartbeat as w
@@ -376,7 +374,7 @@ def test_setup_progress_heartbeats_are_throttled(worker_context, monkeypatch, st
 def test_heartbeat_artifact_upload_runs_outside_lock(worker_context, monkeypatch):
     """Perf regression guard: the synchronous upload_artifact_file network call must run OUTSIDE
     _HB_LOCK. Holding the lock across the upload serializes the trainer's per-step reward
-    callback behind the checkpoint daemon's HF commit during GRPO."""
+    callback behind the checkpoint daemon's artifact commit during GRPO."""
     monkeypatch.setenv("RUN_MODE", "rl")
     monkeypatch.delenv("FLASH_JOB_SPEC_JSON", raising=False)
     import flash.engine.worker.io.heartbeat as w
@@ -443,7 +441,7 @@ def test_heartbeat_upload_skips_when_lock_is_stuck(worker_context, monkeypatch):
 
 def test_heartbeat_rolls_back_slot_when_upload_reports_failure(worker_context, monkeypatch):
     """The optimistic _HB_LAST_UPLOAD slot is claimed BEFORE the best-effort HF commit. If that commit
-    fails, upload_artifact_file swallows the error and returns False (it never raises on best-effort) — HF is
+    fails, upload_artifact_file swallows the error and returns False (it never raises on best-effort) — artifact storage is
     still stale, so the slot must roll back exactly as the lock-timeout skip does. Otherwise the
     throttle defers the next retry on the strength of an upload that never happened.
     """

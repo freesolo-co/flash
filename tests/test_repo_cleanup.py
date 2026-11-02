@@ -1,5 +1,5 @@
 """The always-on artifact GC is CROSS-PLANE: it reaps a run's ``<phase>/<run_id>`` prefix inside the
-shared per-environment HF repo once it ages out and isn't in the GLOBAL serving set — never touching a
+logical Azure artifact namespace once it ages out and isn't in the GLOBAL serving set — never touching a
 deployed adapter (on any plane), a recently-written (in-flight) prefix, a warm-start source with a
 recent ``referenced_by`` marker, ``code/``/unknown dirs, or deleting blind when the serving registry
 can't be confirmed. These tests pin those invariants and the fixed 7-day policy."""
@@ -25,7 +25,7 @@ _REAL_HOLD_RUN_LOCK = rc._hold_run_lock
 _REAL_RUN_SCHEDULED_CLEANUP = rc.run_scheduled_cleanup
 
 # The DEFAULT managed namespace, not whatever the ambient env resolves to. This is read at IMPORT
-# time while `artifact_namespace()` reads FLASH_HF_NAMESPACE at CALL time, so deriving it from the
+# time while `artifact_namespace()` reads FLASH_ARTIFACT_NAMESPACE at CALL time, so deriving it from the
 # live env would bind it before the offline fixture scrubs that var -- every expectation built from
 # NS would then name a different namespace than the code under test. The `_frozen` fixture below
 # makes the two agree for real by forcing the env to this value for the duration of each test.
@@ -48,7 +48,7 @@ def _managed(slug: str) -> str:
 @pytest.fixture(autouse=True)
 def _frozen(monkeypatch):
     # Pin the namespace the code under test resolves to the same constant the expectations above
-    # were built from. `artifact_namespace()` reads FLASH_HF_NAMESPACE on every call, so without
+    # were built from. `artifact_namespace()` reads FLASH_ARTIFACT_NAMESPACE on every call, so without
     # this an operator shell that exports it (per SELF_HOSTING.md) would make the sweep scan
     # `<their-ns>/...` while every fixture repo id says `Freesolo-Co/...`, and the allowlist would
     # match nothing -- failing locally while CI, whose env is clean, stayed green.
@@ -616,7 +616,7 @@ def test_cleanup_rechecks_durable_binding_created_on_another_plane(monkeypatch):
     class RegisteringApi(FakeApi):
         def list_repo_tree(self, **kwargs):
             if kwargs.get("path_in_repo"):
-                # Another plane binds a checkpoint during the slow pre-delete HF stat.
+                # Another plane binds a checkpoint during the slow pre-delete artifact stat.
                 # It is still disabled/loading and never enters this plane's ready router.
                 records.append({"repo_id": repo, "subfolder": "sft/flash-1-a/checkpoints/step-4"})
             return super().list_repo_tree(**kwargs)
