@@ -412,7 +412,11 @@ def _validate_train_section(raw: dict[str, Any], algorithm: str) -> dict[str, An
 
         if set(train_raw) - TRAIN_KEYS:
             raise ConfigError(f"[train] custom mode accepts only: {', '.join(sorted(TRAIN_KEYS))}")
-        return {**TRAIN_DEFAULTS, **train_raw}
+        defaults = dict(TRAIN_DEFAULTS)
+        if train_raw.get("init_from_adapter"):
+            # a warm start inherits the source adapter's rank and alpha.
+            defaults.pop("lora_rank")
+        return {**defaults, **train_raw}
     validate_train_keys_for_algorithm(train_raw, algorithm)
     return train_raw
 

@@ -409,3 +409,24 @@ def test_every_catalog_model_supports_custom_training(monkeypatch):
     assert set(models) == set(MODELS)
     for model_id, info in MODELS.items():
         assert validate_model_for_algorithm(model_id, "custom") == info
+
+
+def test_custom_warm_start_inherits_source_rank_and_excludes_custom_resume():
+    from flash.client.specs import spec_payload
+
+    raw = custom_raw()
+    raw["train"]["init_from_adapter"] = "source-run/step-874"
+    spec = spec_from_dict(raw)
+    assert spec.train.init_from_adapter == "source-run/step-874"
+    # no injected default rank, so the source adapter's rank and alpha stay authoritative.
+    assert spec_from_dict(spec_payload(spec)).to_dict() == spec.to_dict()
+    for key, value in (("lora_rank", 16), ("lora_alpha", 32)):
+        bad = custom_raw()
+        bad["train"].update(init_from_adapter="source-run/step-874", **{key: value})
+        with pytest.raises(ConfigError, match="init_from_adapter"):
+            spec_from_dict(bad)
+    both = custom_raw()
+    both["train"]["init_from_adapter"] = "source-run/step-874"
+    both["custom"]["resume_from"] = "source-run/step-2"
+    with pytest.raises(ConfigError, match="Set only one"):
+        spec_from_dict(both)

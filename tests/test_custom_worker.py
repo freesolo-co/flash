@@ -53,3 +53,44 @@ def test_slow_restore_does_not_consume_controller_idle_allowance(tmp_path, monke
     monkeypatch.setattr(worker, "serve_session", server)
     worker.run(context=context)
     server.assert_called_once()
+
+
+def test_warm_start_downloads_verified_source_before_loading_backend(monkeypatch):
+    from flash.custom import worker
+    from flash.engine.worker.train.entry import sft_train
+    from flash.schema import spec_from_dict
+
+    spec = spec_from_dict(
+        {
+            "model": "Qwen/Qwen3.5-0.8B",
+            "algorithm": "custom",
+            "custom": {"file": "algorithm.py"},
+            "train": {"init_from_adapter": "source-run/step-874"},
+        }
+    )
+    spec = replace(spec, train=replace(spec.train, lora_rank=32, lora_alpha=64))
+    context = SimpleNamespace(
+        config=SimpleNamespace(spec=spec, attempt=0), remaining_wall_seconds=lambda: 3600
+    )
+    calls = []
+
+    def warmstart(model, revision, rank, alpha, targeting, *, context):
+        calls.append((model, rank, alpha, targeting is not None))
+        return "/tmp/evdl/source/adapter"
+
+    monkeypatch.setattr(sft_train, "_warmstart_adapter_path", warmstart)
+    load = Mock(side_effect=RuntimeError("stop after model load"))
+    monkeypatch.setattr(worker, "load_backend", load)
+    monkeypatch.setattr(worker, "heartbeat", Mock())
+    monkeypatch.setattr(worker, "liveness_heartbeat", lambda *a, **k: nullcontext())
+    import pytest
+
+    with pytest.raises(RuntimeError, match="stop after model load"):
+        worker.run(context=context)
+    from flash.core.catalog import supports_image_training
+
+    # image-training models check the source against custom's text-only surface.
+    multimodal = supports_image_training("Qwen/Qwen3.5-0.8B")
+    assert calls == [("Qwen/Qwen3.5-0.8B", 32, 64, multimodal)]
+    assert load.call_args.kwargs["init_adapter"] == "/tmp/evdl/source/adapter"
+    assert load.call_args.kwargs["lora_rank"] == 32
