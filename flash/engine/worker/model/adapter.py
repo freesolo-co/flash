@@ -15,11 +15,11 @@ from flash.adapters.fused_experts import (
 )
 from flash.adapters.lora_rank import resolve_adapter_ref
 from flash.adapters.targets import LoraTargeting, require_modality_marker, resolve_lora_targeting
+from flash.artifacts.errors import artifact_error_transience
 from flash.engine.plan.recipe import RECIPE
 from flash.engine.worker.io.artifacts import (
     RetriableInfraError,
     _has_deployable_adapter,
-    _prefetch_error_is_retriable,
     _require_artifact_deadline_allowance,
     _sleep_with_artifact_deadline,
 )
@@ -153,7 +153,7 @@ def _download_adapter(adapter_prefix: str | None, *, context: WorkerContext) -> 
             # a later nonessential sidecar may fail after the config and weights are already complete.
             if _warmstart_adapter_is_loadable(adir):
                 return adir
-            if not _prefetch_error_is_retriable(error):
+            if artifact_error_transience(error) is not True:
                 raise RuntimeError(
                     "the prepared warm-start source adapter could not be downloaded"
                 ) from None

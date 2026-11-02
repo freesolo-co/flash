@@ -152,18 +152,21 @@ def main() -> int:
                 allow_patterns=["out/**"],
                 local_dir=temp,
             )
-            shutil.copytree(Path(temp) / "out", args.out, dirs_exist_ok=True)
-            archive = Path(args.out) / "kernel_cache.tar.gz"
-            if archive.exists():
-                _extract_cache_archive(archive, Path(args.out))
-                archive.unlink()
-            # The base image can contain an older warmup.log inside its cache tree. Keep the
-            # current subprocess log authoritative after archive extraction.
-            log_path = Path(temp) / "out" / "bake-warmup.log"
-            if log_path.exists():
-                shutil.copy2(log_path, Path(args.out) / "bake-warmup.log")
-                shutil.copy2(log_path, Path(args.out) / "warmup.log")
-        return _verify(args.out, args.sm)
+            staging = Path(temp) / "out"
+            status = (staging / "STATUS").read_text()
+            if status != f"rc=0\narch={args.arch}\n":
+                raise RuntimeError("kernel warmup returned an invalid completion marker")
+            archive = staging / "kernel_cache.tar.gz"
+            current_log = (staging / "bake-warmup.log").read_bytes()
+            _extract_cache_archive(archive, staging)
+            archive.unlink()
+            # A cache may contain an older log. Keep this run's subprocess log authoritative.
+            (staging / "bake-warmup.log").write_bytes(current_log)
+            (staging / "warmup.log").write_bytes(current_log)
+            result = _verify(str(staging), args.sm)
+            if result == 0:
+                shutil.copytree(staging, args.out, dirs_exist_ok=True)
+            return result
     finally:
         try:
             _delete_artifacts(repo)

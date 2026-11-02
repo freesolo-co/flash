@@ -99,3 +99,15 @@ def test_xet_is_disabled_before_importing_huggingface(staging):
     (snapshot / "model.safetensors").write_bytes(b"weights")
     run(check_transport=True)
     assert len(calls) == 1
+
+
+@pytest.mark.parametrize("token", [None, "", "   ", " valid-token "])
+def test_optional_upstream_token_is_normalized(staging, monkeypatch, token):
+    snapshot, calls, run = staging
+    (snapshot / "model.safetensors").write_bytes(b"weights")
+    if token is None:
+        monkeypatch.delenv("HF_TOKEN", raising=False)
+    else:
+        monkeypatch.setenv("HF_TOKEN", token)
+    run()
+    assert calls[0][1]["token"] == ((token or "").strip() or None)

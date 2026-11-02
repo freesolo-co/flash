@@ -109,10 +109,11 @@ def test_verify_rejects_legacy_blob_without_raw_kernels(tmp_path):
     assert bake_module()._verify(str(tmp_path), "sm100") == 1
 
 
+@pytest.mark.parametrize("verification_fails", [False, True])
 @pytest.mark.parametrize("upload_fails", [False, True])
 @pytest.mark.parametrize("cleanup_fails", [False, True])
 def test_cleanup_covers_input_upload_and_never_overrides_result(
-    monkeypatch, tmp_path, upload_fails, cleanup_fails
+    monkeypatch, tmp_path, upload_fails, cleanup_fails, verification_fails
 ):
     import sys
     from types import SimpleNamespace
@@ -146,7 +147,7 @@ def test_cleanup_covers_input_upload_and_never_overrides_result(
     monkeypatch.setattr(bake, "_delete_artifacts", lambda repo: delete(repo_id=repo))
     monkeypatch.setattr(api, "call", lambda *a, **kw: None)
     monkeypatch.setattr(bake, "_status_present", lambda *a, **kw: True)
-    monkeypatch.setattr(bake, "_verify", lambda *a: 0)
+    monkeypatch.setattr(bake, "_verify", lambda *a: int(verification_fails))
 
     def download(**kwargs):
         import io
@@ -154,6 +155,7 @@ def test_cleanup_covers_input_upload_and_never_overrides_result(
 
         out = Path(kwargs["local_dir"]) / "out"
         out.mkdir()
+        (out / "STATUS").write_text("rc=0\narch=blackwell\n")
         (out / "bake-warmup.log").write_bytes(b"current bake")
         with tarfile.open(out / "kernel_cache.tar.gz", "w:gz") as archive:
             entry = tarfile.TarInfo("bake-warmup.log")
@@ -180,9 +182,12 @@ def test_cleanup_covers_input_upload_and_never_overrides_result(
         with pytest.raises(RuntimeError, match="input upload outage"):
             bake.main()
     else:
-        assert bake.main() == 0
-        assert (tmp_path / "out/bake-warmup.log").read_bytes() == b"current bake"
-        assert (tmp_path / "out/warmup.log").read_bytes() == b"current bake"
+        assert bake.main() == int(verification_fails)
+        if verification_fails:
+            assert not (tmp_path / "out").exists()
+        else:
+            assert (tmp_path / "out/bake-warmup.log").read_bytes() == b"current bake"
+            assert (tmp_path / "out/warmup.log").read_bytes() == b"current bake"
     assert len(deleted) == 1
 
 
