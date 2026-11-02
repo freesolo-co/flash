@@ -344,6 +344,15 @@ def _preparation_digest(
             and not stored_train.get("init_from_adapter")
         ):
             public_payload["train"].pop("lora_alpha", None)
+        # a custom run's public `train` is filtered to `flash.schema.custom.TRAIN_KEYS`, so adding a
+        # key there (`init_from_adapter` in 1.4.9) makes `to_dict()` emit it, empty, for every
+        # custom run prepared before -- and their digests then fail. replay the omission the same
+        # way: drop a key only when the STORED spec lacks it and its value is empty, so a set value
+        # stays bound and a run prepared with the key keeps hashing it.
+        if public_spec.algorithm == "custom" and isinstance(stored_train, Mapping):
+            for key in [k for k, v in public_payload["train"].items() if k not in stored_train]:
+                if not public_payload["train"][key]:
+                    public_payload["train"].pop(key)
     worker_payload = worker_spec.to_internal_dict()
     # NORMALIZATION, not legacy replay: this is the canonical shape `dev` hashes TODAY (1.2.88), and
     # it is unconditional -- it reads nothing off the stored record and applies to every run this
