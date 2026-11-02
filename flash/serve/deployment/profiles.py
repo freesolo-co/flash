@@ -41,7 +41,7 @@ _CERTIFIED_MODAL_IMAGE_DIGEST = (
     "sha256:9dc811c3458f979ce2e020509ffbbe3e51364f551234df4c3139ef8e497192dc"
 )
 # Azure hydration and generation passed on all shipping Modal profiles on 2026-11-02.
-# See docs/azure-serving-qualification-20261102.json. Older Hub-only images remain blocked.
+# Older Hub-only images remain blocked.
 _AZURE_ARTIFACT_IMAGE_DIGESTS: frozenset[str] = frozenset(
     {"sha256:9dc811c3458f979ce2e020509ffbbe3e51364f551234df4c3139ef8e497192dc"}
 )

@@ -124,7 +124,7 @@ def serving_base_url() -> str:
             "A standalone plane has no serving backend of its own, and using the hosted one would "
             "send FREESOLO_INTERNAL_KEY - the key that controls this plane - to a service you do "
             "not operate. Point FREESOLO_SERVING_URL at your own multi-LoRA deployment, or export "
-            "the adapter and serve it yourself (see SELF_HOSTING.md). Training does not require "
+            "the adapter and serve it yourself. Training does not require "
             "this."
         )
     return serving_control_url(configured or default_serving_url())

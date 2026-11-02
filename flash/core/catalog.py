@@ -571,8 +571,7 @@ def get_model(model_id: str) -> ModelInfo:
         allowed = ", ".join(MODELS)
         raise ValueError(
             f"unsupported model {model_id!r}; choose one of: {allowed} — or, to train another "
-            f"model, fork Flash and add a ModelInfo entry for it to flash/core/catalog.py "
-            f"(see SELF_HOSTING.md)"
+            "model, fork Flash and add a ModelInfo entry for it to flash/core/catalog.py"
         ) from exc
 
 

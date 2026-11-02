@@ -131,8 +131,8 @@ def has_freesolo_backend(api_url: str) -> bool:
     send a self-hosted plane's operator key to it.
 
     The presence of ``FREESOLO_API_KEY`` deliberately does NOT count. It looks like a hosted
-    signal but cannot be one: ``SELF_HOSTING.md`` has self-hosters log in with the
-    plane-controlling ``FREESOLO_INTERNAL_KEY``, and ``cmd_login`` reads that env var as the login
+    signal but cannot be one: self-hosters log in with the plane-controlling
+    ``FREESOLO_INTERNAL_KEY``, and ``cmd_login`` reads that env var as the login
     key, so its value is as likely to be the operator key as a hosted account key. Nothing marks
     which, and guessing wrong ships the plane credential to Freesolo. A hosted account reached
     from a self-hosted plane needs ``FREESOLO_BASE_URL`` set explicitly.

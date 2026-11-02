@@ -128,7 +128,7 @@ jobs:
             publish=true
           elif ! changed="$(git diff --name-only "$last_published_sha" "$CURRENT_SHA" 2>/dev/null)"; then
             publish=true
-          elif grep -qE "^(flash/|docker/patch_vllm_moe_lora\.py$|Dockerfile\.serve$|\.dockerignore$|serve_launch\.py$|pyproject\.toml$|uv\.lock$|README\.md$|LICENSE$|NOTICE$|\.github/workflows/publish-serving-image\.yml$)" <<< "$changed"; then
+          elif grep -qE "^(flash/|docker/patch_vllm_moe_lora\.py$|Dockerfile\.serve$|\.dockerignore$|serve_launch\.py$|pyproject\.toml$|uv\.lock$|LICENSE$|NOTICE$|\.github/workflows/publish-serving-image\.yml$)" <<< "$changed"; then
             publish=true
           fi
           echo "publish=$publish" >> "$GITHUB_OUTPUT"

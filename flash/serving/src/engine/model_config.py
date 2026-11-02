@@ -39,7 +39,7 @@ from flash.serving.src.engine.prequant_config import (
 #
 # sizing rationale. preallocated lora buffers and loaded checkpoint weights dominate engine vram.
 # The dense 0.8B uses L4, the BF16 4B and FP8 9B use L40S, the FP8 27B uses H100, and
-# the BF16 35B MoE uses H200. See the hosted GPU qualification table in app/README.md.
+# the BF16 35B MoE uses H200.
 #   - Qwen3.6-35B-A3B (vision-language MoE; arch ``Qwen3_5MoeForConditionalGeneration``) -> H200
 #     (141 GB) with the base bf16 weights, 6 x 64 LoRA at native 256k. bf16 (not FP8) is the one path giving
 #     full-expert LoRA + CUDA graphs because the fused-MoE LoRA path won't compile on fp8e4nv. see the

@@ -187,7 +187,8 @@ def standalone() -> bool:
     """True when this self-hosted plane has no Freesolo backend.
 
     Standalone mode trusts ``FREESOLO_INTERNAL_KEY`` as the single-tenant authorization boundary and
-    cannot distinguish organizations. Use it only under the trust model in ``SELF_HOSTING.md``.
+    cannot distinguish organizations. All authenticated clients share one tenant and can access
+    its resources.
     """
     return (os.environ.get(STANDALONE_ENV) or "").strip().lower() in {"1", "true", "yes", "on"}
 

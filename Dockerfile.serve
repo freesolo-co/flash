@@ -24,7 +24,7 @@ RUN python -c 'import sys; assert sys.version_info[:2] == (3, 12)' \
         --require-hashes -r /tmp/uv-requirements.txt \
     && rm -f /tmp/uv-requirements.txt
 
-COPY pyproject.toml uv.lock README.md LICENSE NOTICE ./
+COPY pyproject.toml uv.lock LICENSE NOTICE ./
 COPY flash ./flash
 COPY docker/patch_vllm_moe_lora.py ./docker/patch_vllm_moe_lora.py
 COPY serve_launch.py ./serve_launch.py
