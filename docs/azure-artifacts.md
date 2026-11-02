@@ -111,7 +111,14 @@ separate operational steps. Adding this code does not perform those steps.
 
 Customer-owned `flash serve deploy` accepts only image digests in
 `_AZURE_ARTIFACT_IMAGE_DIGESTS`. The Azure hydration and generation canary passed
-on a Modal L40S on 2026-11-02 for
+on all four shipping Modal profiles on 2026-11-02 for
 `ghcr.io/freesolo-co/freesolo-flash-serve@sha256:9dc811c3458f979ce2e020509ffbbe3e51364f551234df4c3139ef8e497192dc`.
 Model-specific image qualifications still apply independently. Older certified
 digests contain the retired Hub hydrator and must never receive Azure credentials.
+
+The live matrix covers Qwen3.5-9B (L40S), Qwen3.5-9B-Base (H100),
+Qwen3.8-27B (H100), and Qwen3.6-35B-A3B (H200). The 27B and 35B tests
+use fresh zero LoRA fixtures; the 35B fixture includes every fused expert layer.
+Each test hydrated private Azure artifacts, generated a response, and confirmed
+removal of its app, secrets, and volume. See
+[the qualification evidence](azure-serving-qualification-20261102.json).

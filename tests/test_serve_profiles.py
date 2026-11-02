@@ -28,9 +28,13 @@ DIGEST = "sha256:" + "a" * 64
 REVISION = "b" * 40
 
 
-def test_azure_qualified_image_allows_native_adapter_deployment():
+@pytest.mark.parametrize(
+    "model",
+    [MODEL, "Qwen/Qwen3.5-9B-Base", "Qwen/Qwen3.8-27B", "Qwen/Qwen3.6-35B-A3B"],
+)
+def test_azure_qualified_image_allows_native_adapter_deployment(model):
     require_live_qualification(
-        get_profile(MODEL),
+        get_profile(model),
         "modal",
         "sha256:9dc811c3458f979ce2e020509ffbbe3e51364f551234df4c3139ef8e497192dc",
     )
@@ -413,7 +417,7 @@ def test_model_specific_checkpoint_and_scheduler_choices() -> None:
     assert twenty_seven.modal_gpu_request == "H100!"
     assert twenty_seven.modal_live_qualified is True
     assert twenty_seven.modal_certified_image_digest == (
-        "sha256:fc8ed231211562b3c67ca80ffbf7fb3e992aad6a42087a16c0dd26c1e249a758"
+        "sha256:9dc811c3458f979ce2e020509ffbbe3e51364f551234df4c3139ef8e497192dc"
     )
     assert thirty_five.served_model == "Qwen/Qwen3.6-35B-A3B"
     assert thirty_five.modal_gpu_request == "H200"

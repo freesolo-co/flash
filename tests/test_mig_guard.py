@@ -164,7 +164,7 @@ def test_wait_for_gpu_propagates_verify_mismatch(monkeypatch):
     monkeypatch.setattr(
         lifecycle,
         "verify_gpu",
-        lambda g: (_ for _ in ()).throw(RetriableInfraError("WRONG GPU substituted")),
+        lambda g, **kwargs: (_ for _ in ()).throw(RetriableInfraError("WRONG GPU substituted")),
     )
     with pytest.raises(RetriableInfraError) as exc:
         wait_for_gpu("H100")
