@@ -308,6 +308,7 @@ def load_backend(
     seed=42,
     checkpoint_dir,
     max_tokens=2048,
+    init_adapter=None,
 ):
     import torch
     from peft import LoraConfig, get_peft_model
@@ -342,17 +343,47 @@ def load_backend(
         torch_dtype=torch.bfloat16,
         attn_implementation="sdpa",
     ).to("cuda")
-    model = get_peft_model(
-        model,
-        LoraConfig(
-            r=lora_rank,
-            lora_alpha=lora_alpha or 2 * lora_rank,
-            lora_dropout=0,
-            target_modules="all-linear",
-            task_type="CAUSAL_LM",
-            revision=revision,
-            **targeting,
-        ),
-    )
+    if init_adapter:
+        model = _warm_start(model, init_adapter, lora_rank, lora_alpha)
+    else:
+        model = get_peft_model(
+            model,
+            LoraConfig(
+                r=lora_rank,
+                lora_alpha=lora_alpha or 2 * lora_rank,
+                lora_dropout=0,
+                target_modules="all-linear",
+                task_type="CAUSAL_LM",
+                revision=revision,
+                **targeting,
+            ),
+        )
     model.config._commit_hash = revision
     return TorchBackend(model, tokenizer, checkpoint_dir=checkpoint_dir, max_tokens=max_tokens)
+
+
+def _warm_start(model, adapter_dir, lora_rank, lora_alpha):
+    """Continue a verified source LoRA: its exact modules and weights, with fresh optimizer state.
+
+    The source config keeps its target modules; dropout is disabled like every custom adapter so
+    gradient checkpointing stays exact. Every source tensor must land on a trainable parameter:
+    peft only warns about unmatched keys, which would silently restart from zero.
+    """
+    from peft import LoraConfig, get_peft_model, load_peft_weights, set_peft_model_state_dict
+
+    config = LoraConfig.from_pretrained(adapter_dir)
+    if (config.r, config.lora_alpha) != (lora_rank, lora_alpha or 2 * lora_rank):
+        raise ValueError("warm-start adapter rank or alpha differs from the prepared run")
+    config.lora_dropout = 0
+    config.inference_mode = False
+    model = get_peft_model(model, config)
+    weights = load_peft_weights(adapter_dir, device="cuda")
+    result = set_peft_model_state_dict(model, weights)
+    trainable = [name for name, p in model.named_parameters() if p.requires_grad]
+    if result.unexpected_keys or len(weights) != len(trainable):
+        raise ValueError(
+            "warm-start adapter weights do not match the model's LoRA parameters "
+            f"({len(weights)} source tensors, {len(trainable)} trainable, "
+            f"{len(result.unexpected_keys)} unmatched)"
+        )
+    return model
