@@ -42,6 +42,23 @@ class RunCheckpoints:
             shutil.rmtree(previous)
         return {"reference": reference, "durable": True}
 
+    def download_adapter(self, resolved, destination):
+        """Fetch only a checkpoint's adapter folder, whose config fixes the LoRA topology."""
+        from huggingface_hub import snapshot_download
+
+        root = snapshot_download(
+            local_dir=destination,
+            repo_id=resolved["repo"],
+            repo_type="dataset",
+            revision=resolved["revision"],
+            allow_patterns=[f"{resolved['path']}/adapter/*"],
+            token=os.environ.get("HF_TOKEN"),
+        )
+        adapter = Path(root) / resolved["path"] / "adapter"
+        if not (adapter / "adapter_config.json").is_file():
+            raise ValueError("custom checkpoint is missing its adapter")
+        return adapter
+
     def restore(self, backend, resolved):
         from huggingface_hub import snapshot_download
 
