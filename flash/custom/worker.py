@@ -1,6 +1,7 @@
 """Managed worker: remote primitives, standard Flash checkpoints and run telemetry."""
 
 import json
+import tempfile
 import time
 from pathlib import Path
 
@@ -26,10 +27,19 @@ def _custom_targeting(model_id):
 
 def run(*, context):
     spec = context.config.spec
+    checkpoints = RunCheckpoints(context)
+    resolved = spec.custom.get("resolved_resume")
     heartbeat("custom_model_load", context=context)
-    with liveness_heartbeat("custom_model_load", context=context):
+    with (
+        liveness_heartbeat("custom_model_load", context=context),
+        tempfile.TemporaryDirectory(prefix="flash-custom-resume-adapter-") as workspace,
+    ):
         init_adapter = None
-        if spec.train.init_from_adapter:
+        if resolved:
+            # a resumed checkpoint keeps the LoRA layout it was trained with, including a
+            # warm-started source's multimodal module paths; restore then loads its exact state.
+            init_adapter = checkpoints.download_adapter(resolved, workspace)
+        elif spec.train.init_from_adapter:
             from flash.engine.worker.train.entry.sft_train import _warmstart_adapter_path
 
             # downloads the prepared source and checks its rank, alpha, modules and base model.
@@ -51,12 +61,10 @@ def run(*, context):
             max_tokens=spec.train.max_context_tokens,
             init_adapter=init_adapter,
         )
-    checkpoints = RunCheckpoints(context)
     backend.checkpoints = checkpoints
     session = TrainingSession(
         backend, max_steps=spec.train.max_steps, idle_seconds=spec.custom["idle_seconds"]
     )
-    resolved = spec.custom.get("resolved_resume")
     if resolved:
         restored = checkpoints.restore(backend, resolved)
         session.step = restored["checkpoint"]["step"]

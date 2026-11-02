@@ -116,3 +116,40 @@ def test_warm_start_detects_the_source_adapters_module_layout(tmp_path):
             {key: np.zeros((2, 2), dtype=np.float32)}, str(adapter / "adapter_model.safetensors")
         )
         assert _uses_language_model_layout(adapter) is expected
+
+
+def test_resume_builds_the_lora_from_the_checkpoint_adapter(monkeypatch):
+    from flash.custom import worker
+    from flash.schema import spec_from_dict
+
+    spec = spec_from_dict(
+        {
+            "model": "Qwen/Qwen3.5-0.8B",
+            "algorithm": "custom",
+            "custom": {"file": "algorithm.py"},
+            "train": {"lora_rank": 32, "lora_alpha": 64},
+        }
+    )
+    resolved = {
+        "repo": "org/artifacts",
+        "revision": "abc",
+        "path": "custom/run/checkpoints/step-50",
+    }
+    spec = replace(spec, custom={**spec.custom, "resolved_resume": resolved})
+    context = SimpleNamespace(
+        config=SimpleNamespace(spec=spec, attempt=0), remaining_wall_seconds=lambda: 3600
+    )
+    store = Mock()
+    store.download_adapter.return_value = "/tmp/resume/adapter"
+    monkeypatch.setattr(worker, "RunCheckpoints", lambda *a: store)
+    load = Mock(side_effect=RuntimeError("stop after model load"))
+    monkeypatch.setattr(worker, "load_backend", load)
+    monkeypatch.setattr(worker, "heartbeat", Mock())
+    monkeypatch.setattr(worker, "liveness_heartbeat", lambda *a, **k: nullcontext())
+    import pytest
+
+    with pytest.raises(RuntimeError, match="stop after model load"):
+        worker.run(context=context)
+    assert store.download_adapter.call_args.args[0] == resolved
+    # the checkpoint's own adapter config fixes the topology that restore then overwrites.
+    assert load.call_args.kwargs["init_adapter"] == "/tmp/resume/adapter"
