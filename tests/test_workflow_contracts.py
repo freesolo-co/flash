@@ -1032,6 +1032,7 @@ def test_canary_attribution_is_validated_before_production_deployment(org_id):
     env = dict.fromkeys(
         (
             "HF_TOKEN",
+            "FLASH_ARTIFACT_BLOB_SAS_URL",
             "SUPABASE_URL",
             "SUPABASE_SERVICE_ROLE_KEY",
             "FREESOLO_INTERNAL_KEY",
