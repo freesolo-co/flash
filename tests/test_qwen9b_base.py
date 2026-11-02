@@ -47,6 +47,8 @@ def test_pretrained_serving_uses_its_own_weights_tokenizer_and_revision():
     assert profile.served_model_revision == REVISION
     assert profile.modal_gpu_request == "H100!"
     assert profile.max_model_len == 262144
+    assert profile.max_num_seqs == get_model(BASE).serving.max_num_seqs == 32
+    assert overrides["max_num_seqs"] == 32
     assert tool_parser_for(BASE) == "qwen3_coder"
     # Existing instruction-tuned serving still uses its original FP8 checkpoint.
     assert serve_model_for(POST_TRAINED) == "Freesolo-Co/Qwen3.5-9B-FP8"
