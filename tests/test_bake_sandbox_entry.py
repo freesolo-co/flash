@@ -3,7 +3,6 @@
 import importlib.util
 import json
 from pathlib import Path
-from types import SimpleNamespace
 
 import pytest
 
@@ -46,8 +45,6 @@ def test_exported_copy_replaces_originals_and_preserves_absolute_references(tmp_
 def test_bake_clears_inherited_cache_and_replays_export(monkeypatch, tmp_path, warm_rc, replay_rc):
     import tarfile
 
-    import huggingface_hub
-
     entry = entry_module()
     cache = tmp_path / "cache"
     cache.mkdir()
@@ -59,10 +56,8 @@ def test_bake_clears_inherited_cache_and_replays_export(monkeypatch, tmp_path, w
     trainer = tmp_path / "trainer-python"
     trainer.touch()
     monkeypatch.setenv("FLASH_VERL_PYTHON", str(trainer))
-    monkeypatch.setenv("BAKE_HF_REPO", "test/bake")
     monkeypatch.setenv("HF_TOKEN", "test")
     calls = []
-    uploaded = {}
     actual_replace_cache = entry._replace_cache_with_exported_copy
 
     def replace_cache_with_exported_copy(cache_dir, archive_path):
@@ -89,18 +84,10 @@ def test_bake_clears_inherited_cache_and_replays_export(monkeypatch, tmp_path, w
 
     monkeypatch.setattr(entry.subprocess, "call", run)
 
-    def upload(**kwargs):
-        source = kwargs["path_or_fileobj"]
-        if hasattr(source, "getvalue"):
-            uploaded[kwargs["path_in_repo"]] = source.getvalue()
-        elif source.endswith(".tar.gz"):
-            with tarfile.open(source) as archive:
-                assert archive.extractfile("./kernel.cubin").read() == b"compiled"
-
-    monkeypatch.setattr(huggingface_hub, "HfApi", lambda **kw: SimpleNamespace(upload_file=upload))
-    monkeypatch.setattr(huggingface_hub, "snapshot_download", lambda **kw: None)
     expected = warm_rc or replay_rc
     assert entry.main() == expected
     validation = json.loads((cache / "cache_validation.json").read_text())
     assert validation.get("exported_cache_replayed", False) == (warm_rc == 0)
-    assert uploaded["out/STATUS"].startswith(f"rc={expected}\n".encode())
+    assert (tmp_path / "out/STATUS").read_text().startswith(f"rc={expected}\n")
+    with tarfile.open(entry.CACHE_ARCHIVE) as archive:
+        assert archive.extractfile("./kernel.cubin").read() == b"compiled"

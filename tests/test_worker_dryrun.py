@@ -35,7 +35,7 @@ def test_on_policy_epochs_resolve_to_prompt_pool_passes():
 def test_heartbeat_concurrent_calls_stay_safe(worker_context, monkeypatch):
     """Regression: heartbeat() is called concurrently from the trainer reward callback and the
     checkpoint-upload daemon during GRPO. There is no worker-local heartbeat file (the control plane
-    reads the HF copy), so each call must hand its HF upload a COMPLETE, valid JSON snapshot (never a
+    reads the stored artifact), so each call must hand its artifact upload a COMPLETE, valid JSON snapshot (never a
     truncated/interleaved one) and leave no upload temp files behind."""
     import contextlib
     import glob

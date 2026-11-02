@@ -1,8 +1,8 @@
 """shared rent-a-box instance polling and terminal-artifact handling.
 
 provider-specific status, markers, costs, and messages live in ``InstancePollAdapter``. every timeout,
-dead-host, stall, or status-outage path performs a bounded artifact reread so hf visibility lag cannot
-turn completed work into a retry.
+dead-host, stall, or status-outage path performs a bounded artifact reread so transient read failures
+cannot turn completed work into a retry.
 
 reference ``time`` as a module attribute so provider poll tests patch the shared fake clock.
 """
@@ -40,13 +40,13 @@ from flash.providers._lifecycle.net.deadline import (
 from flash.providers.artifacts.channel import TextArtifactReader, worker_flagged_retriable
 from flash.providers.core.base import PollResult
 
-# a strict success marker can precede the separately uploaded metrics.json under hf read-after-write
-# lag. re-read metrics before falling back to the infra-retryable poll_error so marker-authorized
+# a strict success marker and its metrics.json are separate artifacts; transient reads can fail.
+# re-read metrics before falling back to the infra-retryable poll_error so marker-authorized
 # success is not hard-failed on a transient read gap.
 _METRICS_AFTER_SUCCESS_RETRIES = 6
 _METRICS_AFTER_SUCCESS_WAIT_S = 5.0
 
-# any boundary exit can race terminal-artifact visibility under hf read-after-write lag. re-read
+# any boundary exit can race terminal-artifact publication. re-read
 # terminal artifacts before classifying the exit so a completed seed is not retried against its work.
 # distinguishes "caller passed no read deadline" from an explicit ``None`` (unbounded read). the
 # closures this replaced bound ``absolute_deadline`` as a default at definition time; a method cannot,
@@ -75,7 +75,7 @@ class InstancePollAdapter:
     current_attempt: int
     launch_ts: float
 
-    # Terminal-artifact readers (built from the provider's monkeypatchable ``_make_hf_file_reader``).
+    # Terminal-artifact readers, built from the monkeypatchable ``make_artifact_text_reader``.
     done_reader: TextArtifactReader
     marker_reader: TextArtifactReader
     metrics_reader: TextArtifactReader
@@ -103,7 +103,7 @@ class InstancePollAdapter:
 
 
 class _TerminalArtifacts:
-    """Reads HF terminal artifacts (marker, done, metrics) and classifies them into a ``PollResult``.
+    """Reads Azure terminal artifacts (marker, done, metrics) and classifies them into a ``PollResult``.
 
     Groups the reads that every give-up path shares. ``last_hb_key`` and ``deferred_deadline_failure``
     live here because the give-up paths mutate them across calls, exactly as the closures they replace
@@ -212,7 +212,7 @@ class _TerminalArtifacts:
             ),
             say=self._say,
             metrics_message=(
-                "DONE seen but metrics.json not visible yet; waiting for HF read-after-write"
+                "DONE seen but metrics.json not visible yet; retrying the artifact read"
             ),
         )
         if resolution.kind is TerminalKind.ABSENT:
@@ -227,15 +227,15 @@ class _TerminalArtifacts:
             )
         if resolution.kind is TerminalKind.PENDING:
             # the strict success marker has authorized completion, so unreadable metrics are a
-            # transient hf read gap, not a worker error. return the infra-retryable poll_error so the
+            # transient artifact read gap, not a worker error. return the infra-retryable poll_error so the
             # run gets its bounded infra budget instead of a hard terminal failure.
             return PollResult(
                 False,
                 failure="poll_error",
                 detail=(
-                    "DONE with unparseable metrics.json (transient HF read)"
+                    "DONE with unparseable metrics.json (transient artifact read)"
                     if resolution.metrics_unparseable
-                    else "DONE without metrics.json (transient HF read)"
+                    else "DONE without metrics.json (transient artifact read)"
                 ),
             )
         marker = resolution.marker
@@ -285,7 +285,7 @@ class _TerminalArtifacts:
             ),
             _reread_budget(read_deadline),
             say=self._say,
-            message="deadline reached; waiting for HF to expose any terminal DONE/marker before stalled",
+            message="deadline reached; waiting for terminal DONE/marker artifacts before stalled",
         )
         if terminal is not None:
             self.surface_final_heartbeat()
@@ -297,11 +297,11 @@ class _TerminalArtifacts:
     def stalled_unless_terminal(self, detail: str) -> PollResult:
         # A stall exit still checks for terminal artifacts — the worker may have finished right at the
         # boundary. Use the BOUNDED read (like the deadline / dead-host / poll-error paths) so a fresh
-        # DONE/marker not yet visible under HF read-after-write lag isn't missed and mis-classified stalled
+        # DONE/marker not yet published or readable isn't missed and mis-classified stalled
         # (which would fail a max_retries=0 run that actually completed, or rent a second box for the seed).
         self.surface_final_heartbeat()
         terminal = self.reread_before_giving_up(
-            "stall boundary; waiting for HF to expose any terminal DONE/marker before stalled"
+            "stall boundary; waiting for terminal DONE/marker artifacts before stalled"
         )
         if terminal is not None:
             return terminal
@@ -443,11 +443,11 @@ def _classify_poll_error(
     if not poll_errors.record(error, deadline_at=ctx.absolute_deadline):
         return None
     ctx.surface_final_heartbeat()
-    # the status endpoint can fail while the worker finishes through hf. perform the same
+    # the status endpoint can fail while the worker publishes its artifacts. perform the same
     # bounded terminal-artifact reread used by deadline/dead-host paths so visibility lag
     # cannot relaunch completed work and double-bill it.
     terminal = ctx.reread_before_giving_up(
-        "status-poll outage; waiting for HF to expose any terminal DONE/marker before poll_error"
+        "status-poll outage; waiting for terminal DONE/marker artifacts before poll_error"
     )
     if terminal is not None:
         return terminal
@@ -524,10 +524,10 @@ def _classify_dead_host(
         return None
     ctx.surface_final_heartbeat()
     # The worker may have finished just before the box self-destroyed, with its DONE/marker not
-    # yet visible on HF (read-after-write lag). Re-read terminal artifacts a bounded number of
+    # yet readable from artifact storage. Re-read terminal artifacts a bounded number of
     # times before concluding loss.
     terminal = ctx.reread_before_giving_up(
-        "instance gone; waiting for HF to expose any terminal DONE/marker before failover"
+        "instance gone; waiting for terminal DONE/marker artifacts before failover"
     )
     if terminal is not None:
         return terminal
@@ -667,7 +667,7 @@ def poll_instance_job(
     load_timeout_s: float,
     deadline_at: float | None = None,
 ) -> PollResult:
-    """poll instance status and hf artifacts to a terminal result.
+    """poll instance status and Azure artifacts to a terminal result.
 
     completed requires a strict ok marker and metrics. worker markers fail fast; dead hosts, stalls,
     status outages, and unreadable signalled-success metrics remain infrastructure-retryable.

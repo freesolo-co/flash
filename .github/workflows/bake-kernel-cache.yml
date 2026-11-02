@@ -218,11 +218,11 @@ jobs:
           # marks the whole job red even though the bake + push already succeeded.
           enable-cache: false
 
-      - name: Sync deps (flash + modal + hf)
+      - name: Sync bake dependencies
         if: steps.gate.outputs.run == 'true'
         run: uv sync --extra server
 
-      # MODAL_TOKEN_ID + MODAL_TOKEN_SECRET (the warmup GPU sandbox) + HF_TOKEN (the temp dataset that ferries code/cache) are
+      # MODAL_TOKEN_ID + MODAL_TOKEN_SECRET (the warmup GPU sandbox) + HF_TOKEN (upstream model/tokenizer downloads) are
       # native repo Actions secrets, synced from Infisical (prod:/flash-ci) by the github-ci-flash
       # Secret Sync. No Infisical CLI/login at job time -- Infisical stays the source of truth and
       # rotations propagate via the sync. BASE_IMAGE

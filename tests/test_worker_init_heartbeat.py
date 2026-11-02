@@ -230,7 +230,7 @@ def test_liveness_heartbeat_keepalive_forces_real_heartbeats_on_constant_progres
 
 def test_checkpoint_uploading_keepalive_stage_is_throttled_on_tight_cadence():
     """The checkpoint-upload keepalive daemon re-emits a REAL heartbeat every 30s, so it MUST be
-    throttled (else ~120/hr blows the HF commit cap) AND ride the tighter setup-liveness interval, so
+    throttled (else ~120/hr blows the artifact commit cap) AND ride the tighter setup-liveness interval, so
     the provider stall clock is refreshed well inside STALL_AFTER_S rather than every _HB_MIN_INTERVAL_S."""
     import flash.engine.worker.io.heartbeat as ne
     from flash.providers._lifecycle.instances.poll import STALL_AFTER_S
@@ -401,7 +401,7 @@ def test_heartbeat_console_marks_commit_state_and_bounds_payload():
 
 
 def test_concurrent_heartbeat_commits_once_and_skips_the_duplicate(worker_context, monkeypatch):
-    """Two throttled heartbeats racing one HF commit produce exactly one upload.
+    """Two throttled heartbeats racing one artifact commit produce exactly one upload.
 
     Previously the second thread proved this by BLOCKING on the upload lock and re-checking
     eligibility after the first commit landed. That wait is the contention this no longer pays: the
@@ -742,7 +742,7 @@ def test_error_heartbeat_fallback_preserves_metric_backlog():
 
 
 def test_per_step_training_stages_are_throttled():
-    """Both per-step training stages must be in _HB_THROTTLED_STAGES so their HF upload is capped at
+    """Both per-step training stages must be in _HB_THROTTLED_STAGES so their artifact upload is capped at
     _HB_MIN_INTERVAL_S. The reward/SFT log callbacks AND the train-loop liveness daemon re-emit the
     SAME stage frequently; without throttling sft_step (liveness ~every 30s ~= 120 commits/hr plus the
     log callback) would blow the 128/hr repo commit cap — exactly the regression rl_step's throttle
@@ -877,7 +877,7 @@ def test_force_commit_via_regular_throttle_arms_the_floor(worker_context, monkey
     """Regression (heartbeat.py): a force=True heartbeat that commits because the regular
     throttle was ALREADY due (not because the force branch bypassed it) must STILL arm the forced-commit
     clock — else the clock stays stale and a following sub-floor forced ping punches through, defeating
-    the burst coalescing that protects the HF commit cap."""
+    the burst coalescing that protects the artifact commit cap."""
 
     uploads: list = []
     monkeypatch.setattr(worker_heartbeat, "_HB_MIN_INTERVAL_S", 900.0)
@@ -980,7 +980,7 @@ def test_quiet_phases_upload_at_setup_liveness_interval():
 
 
 # --------------------------------------------------------------------------------------------
-# Progress-carry latch: a real heartbeat that never reached HF (throttled away or failed upload)
+# Progress-carry latch: a real heartbeat that never reached artifact storage (throttled away or failed upload)
 # upgrades the NEXT committed liveness ping to a real heartbeat. Without it, the train-loop liveness
 # daemon can win the shared 900s upload slot with a bare ping, deferring the real per-step heartbeat
 # to T+1800s > the provider's 1500s stall window — a healthy training run killed as "stalled".
@@ -1343,7 +1343,7 @@ def test_rl_warmstart_adapter_download_is_wrapped_in_liveness_heartbeat():
 def test_sft_configuring_is_a_setup_stage_on_the_tight_liveness_cadence():
     """The config span's stage must behave like every other pre-training liveness stage: it keeps the
     wide setup grace (it has not even loaded the model yet), refreshes status on the faster setup
-    cadence, and is throttled so its 30s re-emit can't blow the HF commit cap."""
+    cadence, and is throttled so its 30s re-emit can't blow the artifact commit cap."""
     import flash.engine.worker.io.heartbeat as ne
     from flash.providers._lifecycle.instances.poll import (
         SETUP_HEARTBEAT_STAGES,
@@ -1398,7 +1398,7 @@ def test_post_download_model_setup_runs_under_a_liveness_wrap():
 @pytest.mark.parametrize("stage", ["sft_model_load"])
 def test_model_load_is_a_throttled_setup_stage(stage):
     """Now that these hold a liveness thread, they re-emit every 30s -- so they must be throttled or
-    a slow cold mount spends the HF commit budget on them, and must keep the WIDE setup grace since
+    a slow cold mount spends the artifact commit budget on them, and must keep the WIDE setup grace since
     no training has started."""
     import flash.engine.worker.io.heartbeat as ne
     from flash.providers._lifecycle.instances.poll import (
@@ -1500,7 +1500,7 @@ def test_bounded_reward_metrics_sanitizes_and_bounds_names() -> None:
 
 
 def test_throttled_heartbeat_does_not_block_behind_an_in_flight_upload(worker_context, monkeypatch):
-    """A slow HF commit must not stall every other throttled heartbeat on the upload lock.
+    """A slow artifact commit must not stall every other throttled heartbeat on the upload lock.
 
     The throttle clock only advances AFTER a commit lands, so while one is in flight every other
     throttled caller still computes ``upload_due`` and blocks in ``_HB_UPLOAD_LOCK.acquire()`` for

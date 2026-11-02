@@ -567,7 +567,7 @@ def test_best_effort_noop_without_internal_key(monkeypatch):
     import flash.server.domain.registry.checkpoints as ck
 
     monkeypatch.delenv("FREESOLO_INTERNAL_KEY", raising=False)
-    # Even if HF had checkpoints, no internal key => skip persistence (HF stays source of truth).
+    # Even if Azure had checkpoints, no internal key => skip persistence (Azure stays source of truth).
     monkeypatch.setattr(ck, "list_checkpoints", lambda spec: _CKPTS)
     assert ck.register_checkpoints_best_effort(_status()) == 0
 
@@ -607,7 +607,7 @@ def test_best_effort_swallows_backend_failure(monkeypatch):
 
 def test_best_effort_skips_silently_when_no_org(monkeypatch):
     # Internal/operator run with no org in either context: skip quietly, do NOT warn, do NOT hit the
-    # backend, and do NOT perform the HF checkpoint listing — the org check short-circuits BEFORE
+    # backend, and do NOT perform the Azure checkpoint listing — the org check short-circuits BEFORE
     # the network call. Regression guard for the noisy "missing org id" log and the wasted HF
     # listing on an expected-skip run.
     import io

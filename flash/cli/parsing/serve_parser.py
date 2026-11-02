@@ -16,7 +16,7 @@ def _positive_finite_seconds(raw: str) -> float:
 
     Without this, `--timeout 0`, a negative, `nan`, or `inf` parses fine and only fails inside the
     provider's `validate_deadline`, which raises `ValueError` outside the lifecycle error handling
-    -- so the CLI prints a traceback *after* resolving and downloading the Hub inputs, instead of
+    -- so the CLI prints a traceback *after* resolving and downloading the model and artifact inputs, instead of
     the ordinary argument error the user should get before any work happens.
     """
     value = float(raw)
@@ -31,8 +31,8 @@ def _positive_int(raw: str) -> int:
     """reject a nonpositive integer before deployment input resolution.
 
     a bare `type=int` accepts `0` and negatives, while downstream validation runs only after
-    `resolve_adapter` has already resolved and downloaded the hub inputs. argparse can reject these
-    values before they cost a hub round trip.
+    `resolve_adapter` has already resolved and downloaded the model and artifact inputs. argparse can reject these
+    values before they cost a storage round trip.
     """
     value = int(raw)
     if value <= 0:
@@ -73,18 +73,19 @@ def _add_deployment_arguments(command: argparse.ArgumentParser) -> None:
         required=True,
         help="digest-qualified serving image reference (name@sha256:...)",
     )
-    command.add_argument("--artifact-repo", required=True, help="hub repo holding the adapter")
+    command.add_argument(
+        "--artifact-repo", required=True, help="Azure artifact namespace holding the adapter"
+    )
     command.add_argument(
         "--artifact-subfolder", required=True, help="path within the repo holding the adapter"
     )
-    # flash runs publish adapters into dataset repos, so that stays the default. the override
-    # exists for an adapter published as a model repo, where resolution would otherwise fail
-    # against the wrong repo type rather than reporting that the repo is a different kind.
+    # keep serialized type labels compatible with existing deployment manifests.
+    # both labels resolve through Azure artifact storage, never an upstream model repository.
     command.add_argument(
         "--artifact-repo-type",
         choices=("dataset", "model"),
         default="dataset",
-        help="hub repo type holding the adapter (default: dataset, as flash runs publish)",
+        help="legacy artifact type label (default: dataset; storage uses Azure)",
     )
     command.add_argument(
         "--lora-rank", type=_positive_int, required=True, help="the adapter's lora rank"
@@ -156,7 +157,7 @@ def _add_existing_deployment_identity(command: argparse.ArgumentParser) -> None:
         "--deployment-identity",
         default="",
         help=(
-            "immutable identity printed by deploy; avoids Hub resolution when checking or removing "
+            "immutable identity printed by deploy; avoids artifact resolution when checking or removing "
             "an existing deployment"
         ),
     )

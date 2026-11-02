@@ -150,7 +150,7 @@ def build_sft_overrides(cfg: dict) -> list[str]:
         "trainer.resume_mode=auto",
         # retain only the latest full-state checkpoint on the pod: each global_step_N holds model
         # +optimizer shards (GBs); unbounded retention fills the container disk on long runs. flash
-        # publishes required interval checkpoints to HF durably, so on-pod history is redundant.
+        # publishes required interval checkpoints to Azure durably, so on-pod history is redundant.
         "trainer.max_ckpt_to_keep=1",
     ]
     overrides.append(f"trainer.total_training_steps={steps}")

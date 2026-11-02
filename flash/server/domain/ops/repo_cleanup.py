@@ -28,9 +28,9 @@ logger = get_logger(__name__)
 RUN_REPO_PREFIX = "flashrun-"
 # Delete an unbound run's prefix once its newest file was committed this long ago (fixed: 7 days).
 DELETE_AGE_SECONDS = 7.0 * 86400.0
-_DELETE_SLEEP_S = 0.5  # pause between deletes — HF repo-mutation rate-limit courtesy
-_SCAN_WORKERS = 8  # hf tree-listing concurrency
-# expanded HF tree listings hit origin and rate-limit below the general quota.
+_DELETE_SLEEP_S = 0.5  # pause between deletes — bounded artifact cleanup request rate
+_SCAN_WORKERS = 8  # artifact tree-listing concurrency
+# artifact scans can be large; keep their storage request rate bounded.
 # pace every call globally so _SCAN_WORKERS concurrency cannot create request bursts.
 _TREE_LIST_MIN_INTERVAL_S = 0.5  # cap ~2 req/s across the whole sweep, workers included
 _tree_list_lock = threading.Lock()
@@ -243,7 +243,7 @@ def _run_artifacts_recently_used(
 
 def _collect_targets(api, live, whole, now: float, max_age_s: float) -> list[_RunTarget]:
     """Enumerate every ``flashrun-*`` repo and return the aged, unbound, non-warm-start-source run
-    prefixes to delete. Per-repo scan failures (HF rate-limit / transient) are skipped and logged, not
+    prefixes to delete. Per-repo scan failures (storage rate-limit / transient) are skipped and logged, not
     fatal — the sweep reaps what it could read and tries the rest next cycle."""
     repos = [
         d.id for d in api.list_datasets(author=artifact_namespace()) if _is_managed_env_repo(d.id)
@@ -334,8 +334,8 @@ def run_scheduled_cleanup(*, dry_run: bool = False, api=None, should_stop=None) 
         try:
             # Re-stat the prefix: its newest file may have been written since enumeration (a cross-plane
             # warm-start touch, a late checkpoint, a redeploy read-back). Do this FIRST — it is a slow
-            # recursive HF list — so the live-set re-confirm below is the LAST thing before the delete
-            # and its confirm->delete window is ~microseconds, not a full HF round-trip.
+            # recursive artifact list — so the live-set re-confirm below is the LAST thing before the delete
+            # and its confirm->delete window is ~microseconds, not a full storage round-trip.
             try:
                 if _run_artifacts_recently_used(api, target.repo_id, target.prefix, now, max_age_s):
                     logger.warning(
@@ -374,5 +374,5 @@ def run_scheduled_cleanup(*, dry_run: bool = False, api=None, should_stop=None) 
                 )
         finally:
             held.release()
-        time.sleep(_DELETE_SLEEP_S)  # HF repo-mutation rate-limit courtesy
+        time.sleep(_DELETE_SLEEP_S)  # bounded artifact cleanup request rate
     return deleted

@@ -130,7 +130,7 @@ def _durable_required_save_steps(
             )
         except Exception as error:
             raise _worker_perf.RetriableInfraError(
-                f"could not verify required SFT save step {step} on hf"
+                f"could not verify required SFT save step {step} in artifact storage"
             ) from error
         if exists:
             durable.add(step)
@@ -535,7 +535,7 @@ def _publish_sft_result(
         _worker_hf.upload_artifact_folder(adapter_dir, "adapter", required=True, context=context)
         # only a durably published adapter may suppress the final publish. the seeded resume step no
         # longer needs excluding by hand: it is credited as deployable_published only when its
-        # adapter was actually found on hf, so a resume that carried resumable state without a
+        # adapter was actually found in artifact storage, so a resume that carried resumable state without a
         # servable adapter falls through to this publish instead of being skipped.
         if (
             final_save_due(final_step, options.save_at_steps)

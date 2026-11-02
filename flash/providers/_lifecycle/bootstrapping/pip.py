@@ -113,7 +113,7 @@ def _drain_pip(proc, tail) -> int:
 def install(payload: dict, *, require_deadline_at, retriable_error) -> None:
     """Install the run's extra requirements; retry an index blip, fail fast on a bad package spec.
 
-    Same precedent as the pre-worker HF fetches: an index blip is infra, not user error, so it
+    Same precedent as the pre-worker artifact fetches: an index blip is infra, not user error, so it
     retries in place and surfaces as ``retriable_error`` rather than failing a paid run.
     """
     extra_pip = payload.get("extra_pip") or []

@@ -109,80 +109,89 @@ def test_verify_rejects_legacy_blob_without_raw_kernels(tmp_path):
     assert bake_module()._verify(str(tmp_path), "sm100") == 1
 
 
-@pytest.mark.parametrize("upload_fails", [False, True])
-@pytest.mark.parametrize("cleanup_fails", [False, True])
-def test_cleanup_covers_input_upload_and_never_overrides_result(
-    monkeypatch, tmp_path, upload_fails, cleanup_fails
+@pytest.mark.parametrize("failure", [None, "status", "download", "verify", "exec"])
+def test_direct_modal_transfer_checks_completion_and_always_terminates(
+    monkeypatch, tmp_path, failure
 ):
+    import asyncio
+    import io
     import sys
+    import tarfile
     from types import SimpleNamespace
-
-    import huggingface_hub
+    from unittest.mock import AsyncMock, Mock
 
     from flash.providers.modal import api
 
     bake = bake_module()
-    deleted = []
+    process = SimpleNamespace(wait=SimpleNamespace(aio=AsyncMock(return_value=0)))
+    status = "rc=0\narch=10.0\n" if failure != "status" else "rc=1\narch=10.0\n"
 
-    def delete(**kwargs):
-        deleted.append(kwargs["repo_id"])
-        if cleanup_fails:
-            raise RuntimeError("cleanup outage")
+    async def download(remote, local):
+        if failure == "download":
+            raise OSError("download interrupted")
+        if remote.endswith(".tar.gz"):
+            with tarfile.open(local, "w:gz") as archive:
+                member = tarfile.TarInfo("bake-warmup.log")
+                member.size = len(b"stale log")
+                archive.addfile(member, io.BytesIO(b"stale log"))
+        else:
+            local.write_bytes(b"current bake")
 
-    hf = SimpleNamespace(
-        create_repo=lambda **kw: None,
-        update_repo_settings=lambda **kw: None,
-        upload_folder=lambda **kw: None,
-        delete_repo=delete,
+    sandbox = SimpleNamespace(
+        exec=SimpleNamespace(aio=AsyncMock(return_value=process)),
+        filesystem=SimpleNamespace(
+            read_text=SimpleNamespace(aio=AsyncMock(return_value=status)),
+            copy_to_local=SimpleNamespace(aio=AsyncMock(side_effect=download)),
+        ),
+        terminate=SimpleNamespace(aio=AsyncMock()),
     )
-
-    def upload(**kwargs):
-        if upload_fails:
-            raise RuntimeError("input upload outage")
-
-    hf.upload_folder = upload
-    monkeypatch.setattr(huggingface_hub, "HfApi", lambda **kw: hf)
-    monkeypatch.setenv("HF_TOKEN", "test")
-    monkeypatch.setattr(api, "call", lambda *a, **kw: None)
-    monkeypatch.setattr(bake, "_status_present", lambda *a, **kw: True)
-    monkeypatch.setattr(bake, "_verify", lambda *a: 0)
-
-    def download(**kwargs):
-        import io
-        import tarfile
-
-        out = Path(kwargs["local_dir"]) / "out"
-        out.mkdir()
-        (out / "bake-warmup.log").write_bytes(b"current bake")
-        with tarfile.open(out / "kernel_cache.tar.gz", "w:gz") as archive:
-            entry = tarfile.TarInfo("bake-warmup.log")
-            entry.size = len(b"old image log")
-            archive.addfile(entry, io.BytesIO(b"old image log"))
-
-    monkeypatch.setattr(huggingface_hub, "snapshot_download", download)
+    if failure == "exec":
+        sandbox.exec.aio.side_effect = RuntimeError("exec unavailable")
+    image = Mock()
+    image.add_local_dir.return_value = image
+    image.add_local_file.return_value = image
+    secret = Mock()
+    create = AsyncMock(return_value=sandbox)
+    modal = SimpleNamespace(
+        App=SimpleNamespace(lookup=SimpleNamespace(aio=AsyncMock())),
+        Image=SimpleNamespace(from_registry=Mock(return_value=image)),
+        Sandbox=SimpleNamespace(create=SimpleNamespace(aio=create)),
+        Secret=SimpleNamespace(from_dict=secret),
+    )
+    monkeypatch.setattr(api, "call", lambda fn, **kw: asyncio.run(fn(modal, None)))
+    monkeypatch.setattr(bake, "_verify", lambda *a: int(failure == "verify"))
+    monkeypatch.setenv("HF_TOKEN", "model-read-token")
+    out = tmp_path / "published"
     monkeypatch.setattr(
         sys,
         "argv",
         [
             "bake",
             "--arch",
-            "blackwell",
+            "10.0",
             "--sm",
             "sm100",
             "--image",
             "test/image",
             "--out",
-            str(tmp_path / "out"),
+            str(out),
         ],
     )
-    if upload_fails:
-        with pytest.raises(RuntimeError, match="input upload outage"):
+    if failure in {"status", "download", "exec"}:
+        with pytest.raises((api.ModalApiError, OSError, RuntimeError)):
             bake.main()
     else:
-        assert bake.main() == 0
-        assert (tmp_path / "out/bake-warmup.log").read_bytes() == b"current bake"
-        assert (tmp_path / "out/warmup.log").read_bytes() == b"current bake"
-    assert len(deleted) == 1
+        assert bake.main() == int(failure == "verify")
+    assert out.exists() == (failure is None)
+    if failure is None:
+        assert (out / "warmup.log").read_bytes() == b"current bake"
+        assert (out / "bake-warmup.log").read_bytes() == b"current bake"
+    if failure in {"status", "exec"}:
+        sandbox.filesystem.copy_to_local.aio.assert_not_awaited()
+    sandbox.terminate.aio.assert_awaited_once_with(wait=True)
+    assert create.call_args.args == ("sleep", "infinity")
+    assert secret.call_args.args == ({"BAKE_ARCH": "10.0", "HF_TOKEN": "model-read-token"},)
+    assert image.add_local_dir.call_args.args[1] == "/runcode/code/flash"
 
 
 @pytest.mark.parametrize("returncode", [1, 137])
@@ -191,14 +200,9 @@ def test_failed_sandbox_preserves_exit_diagnostic_and_cleans_up(monkeypatch, ret
     from types import SimpleNamespace
     from unittest.mock import AsyncMock, Mock
 
-    import huggingface_hub
-
     from flash.providers.modal import api
 
     bake = bake_module()
-    hf = SimpleNamespace(delete_repo=Mock())
-    monkeypatch.setattr(huggingface_hub, "HfApi", lambda **kw: hf)
-    monkeypatch.setattr(bake, "_upload_flash_code", lambda *args: None)
     monkeypatch.setenv("HF_TOKEN", "test")
     monkeypatch.setattr(api, "credentials", lambda: ("test-id", "test-secret"))
     monkeypatch.setattr(api, "call", call_modal)
@@ -209,13 +213,20 @@ def test_failed_sandbox_preserves_exit_diagnostic_and_cleans_up(monkeypatch, ret
     )
     sandbox = SimpleNamespace(
         object_id="sb-test-h100",
-        wait=SimpleNamespace(aio=AsyncMock()),
-        poll=SimpleNamespace(aio=AsyncMock(return_value=returncode)),
+        exec=SimpleNamespace(
+            aio=AsyncMock(
+                return_value=SimpleNamespace(
+                    wait=SimpleNamespace(aio=AsyncMock(return_value=returncode)),
+                )
+            )
+        ),
         terminate=SimpleNamespace(aio=AsyncMock()),
     )
     create = AsyncMock(return_value=sandbox)
     client = SimpleNamespace(__aexit__=AsyncMock())
-    image = SimpleNamespace(add_local_file=Mock(return_value="bake-image"))
+    image = Mock()
+    image.add_local_dir.return_value = image
+    image.add_local_file.return_value = image
     monkeypatch.setitem(
         sys.modules,
         "modal",
@@ -238,7 +249,6 @@ def test_failed_sandbox_preserves_exit_diagnostic_and_cleans_up(monkeypatch, ret
     assert create.call_args.kwargs["memory"] == (32768, 131072)
     sandbox.terminate.aio.assert_awaited_once_with(wait=True)
     client.__aexit__.assert_awaited_once_with(None, None, None)
-    hf.delete_repo.assert_called_once()
 
 
 @pytest.mark.parametrize("name", ["../escape", "/absolute"])

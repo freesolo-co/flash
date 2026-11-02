@@ -220,7 +220,7 @@ def _artifact_call(call, label: str, *, deadline_at: float, secrets: dict | None
                 raise TimeoutError(f"{label} exceeded the run wall deadline") from None
             delay = min(delay, remaining)
             print(
-                f"{label} transient Hugging Face error; retrying in {delay:.0f}s: "
+                f"{label} transient Azure artifact error; retrying in {delay:.0f}s: "
                 f"{_safe_detail(exc, 500, secrets=secrets)}",
                 flush=True,
             )
@@ -249,7 +249,7 @@ def upload_artifact(
         return True
     except Exception as exc:
         print(
-            f"hf upload warn ({repo_subpath}): {_safe_detail(exc, secrets=_payload_secrets(payload))}",
+            f"artifact upload warn ({repo_subpath}): {_safe_detail(exc, secrets=_payload_secrets(payload))}",
             flush=True,
         )
         return False
@@ -530,7 +530,7 @@ def artifact_file_exists(payload: dict, repo_subpath: str) -> bool:
 
 
 def remote_completion_confirmed(payload: dict) -> bool:
-    """True iff DONE + metrics.json are on HF. Local /tmp/metrics.json is not sufficient proof."""
+    """True iff DONE + metrics.json are in Azure. Local /tmp/metrics.json is not sufficient proof."""
     try:
         return artifact_file_exists(payload, "DONE") and artifact_file_exists(
             payload, "metrics.json"
@@ -922,27 +922,27 @@ def _run_attempt(payload: dict) -> int:
         # run_mode enforces the absolute subprocess deadline. once it returns, required completion
         # artifacts take precedence over bootstrap bookkeeping that happens to cross the boundary.
         if not os.path.exists("/tmp/metrics.json"):
-            # Missing local metrics but the run is confirmed complete on HF (DONE+metrics uploaded) —
-            # e.g. the idempotency replay hit a transient HF read. The run SUCCEEDED; retry so a fresh
+            # local metrics are missing, but Azure may already confirm completion (DONE + metrics).
+            # a transient artifact read must retry so a fresh
             # worker re-fetches the metrics, never fail a confirmed-complete run as a crash.
             if remote_completion_confirmed(payload):
                 raise RetriableBootstrapError(
-                    f"train phase '{phase}' is complete on HF but its local metrics.json is missing "
-                    f"(transient HF read); retrying to re-fetch the persisted metrics"
+                    f"train phase '{phase}' is complete in Azure but its local metrics.json is missing "
+                    f"(transient Azure artifact read); retrying to re-fetch the persisted metrics"
                 )
             raise RuntimeError(
                 f"train phase '{phase}' produced no /tmp/metrics.json (it crashed before "
-                f"finishing); see error_{phase}_attempt*.txt and console_{phase}.txt in the HF "
-                f"dataset repo"
+                f"finishing); see error_{phase}_attempt*.txt and console_{phase}.txt in the "
+                f"Azure artifact namespace"
             )
-        # Non-zero rc is tolerated only when completion artifacts landed on HF: RL's vLLM can
+        # Non-zero rc is tolerated only when completion artifacts landed in Azure: RL's vLLM can
         # segfault at interpreter exit AFTER DONE/metrics.json are already uploaded.
         if rc != 0 and not remote_completion_confirmed(payload):
             raise RetriableBootstrapError(
                 f"train phase '{phase}' exited non-zero ({rc}) and its required completion "
-                f"artifacts (DONE/metrics.json) are not on HF — the run did not finish (e.g. a "
+                f"artifacts (DONE/metrics.json) are not in Azure — the run did not finish (e.g. a "
                 f"failed upload after the local metrics.json was written); see "
-                f"error_{phase}_attempt*.txt and console_{phase}.txt in the HF dataset repo"
+                f"error_{phase}_attempt*.txt and console_{phase}.txt in the Azure artifact namespace"
             )
         ok = True
     except BaseException as exc:  # shutdown signals must still publish an attempt marker

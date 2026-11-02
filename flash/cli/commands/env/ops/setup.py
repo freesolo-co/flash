@@ -696,7 +696,7 @@ def _write_rl_config(
             "# Constrain every rollout with guided decoding (a JSON schema is shown; regex and\n"
             "# choice forms also parse) — see `flash train --doc`:\n"
             '# structured_outputs = \'{"type": "object", "properties": {"answer": {"type": "string"}}, "required": ["answer"]}\'\n'
-            "# GPU and HF artifacts are managed automatically by the platform: the GPU is\n"
+            "# GPU and Azure artifacts are managed automatically by the platform: the GPU is\n"
             "# the cheapest fitting managed class, and artifacts live in a private environment-scoped repo.\n"
         )
 
@@ -725,7 +725,7 @@ def _write_sft_config(
             f"{max_examples_line}"
             "lora_rank = 32\n"
             f"{sft_reasoning_note}"
-            "# GPU and HF artifacts are managed automatically by the platform: the GPU is\n"
+            "# GPU and Azure artifacts are managed automatically by the platform: the GPU is\n"
             "# the cheapest fitting managed class, and artifacts live in a private environment-scoped repo.\n"
         )
 

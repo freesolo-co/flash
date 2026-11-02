@@ -26,7 +26,7 @@ _RECOVERABLE = {"queued", "provisioning", "running"}
 
 
 async def _repo_cleanup_loop() -> None:
-    """Sweep aged undeployed HF prefixes on startup, then daily.
+    """Sweep aged undeployed Azure artifact prefixes on startup, then daily.
 
     The 7-day age and daily cadence are fixed in ``flash.server.domain.repo_cleanup``. Each threaded sweep
     fails closed when the live serving set is unconfirmed and requires Azure artifact configuration.
@@ -499,7 +499,7 @@ def _ray_log_name_for_attempt(phase: str, error_name: str) -> str | None:
 
 
 def _worker_artifacts(spec) -> dict[str, str]:
-    """Fetch train-subprocess stdout and traceback from the private HF artifact repo.
+    """Fetch train-subprocess stdout and traceback from the private Azure artifact namespace.
 
     The control-plane log contains only orchestration and a truncated terminal tail. Use operator
     Azure credentials so ``flash runs log`` can read private worker artifacts; missing data returns ``{}``.
@@ -546,8 +546,8 @@ def _worker_artifacts(spec) -> dict[str, str]:
                 filename=f"{prefix}/{name}",
                 token=None,
                 # the worker appends to console/error files across the run, so a cached copy goes
-                # stale; force a fresh pull (matches other HF artifact readers, e.g.
-                # flash/providers/artifacts/hf.py:make_artifact_text_reader).
+                # stale; force a fresh pull (matches other artifact readers, e.g.
+                # flash/providers/artifacts/channel.py:make_artifact_text_reader).
                 force_download=True,
             )
             # errors="replace": worker stdout can carry non-UTF-8 bytes (tracebacks, progress bars);

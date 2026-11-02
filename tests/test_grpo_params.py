@@ -390,7 +390,7 @@ def test_init_from_adapter_rejects_non_string_value(bad_ref: object) -> None:
 
 
 def test_hf_repo_is_managed_not_user_set() -> None:
-    # [train] hf_repo is the platform-managed per-run HF artifact repo: the control plane assigns
+    # [train] hf_repo is the platform-managed per-run Azure artifact namespace: the control plane assigns
     # it server-side at submit (see runner_submit.submit_job). It is not a user config key -- the schema
     # rejects a user-supplied value outright rather than silently ignoring it.
     raw = {

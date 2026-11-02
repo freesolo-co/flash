@@ -7,10 +7,9 @@ import json
 import os
 import shutil
 import tarfile
+import tempfile
 import time
 import uuid
-
-ARTIFACT_NAMESPACE = "Freesolo-Co"
 
 # One Modal GPU per compiler architecture; the worker verifies the requested SM.
 GPU_BY_SM = {
@@ -27,31 +26,30 @@ def log(msg: str) -> None:
     print(f"[bake-ci] {msg}", flush=True)
 
 
-def _upload_flash_code(api, repo: str, token: str) -> None:
-    """Mirror the worker's upload_code: push the running flash package to code/flash (exact mirror)."""
-    import flash
+async def _collect_bake(sandbox, out, arch: str, deadline: int) -> None:
+    """Run warmup while the sandbox stays alive, then stream its outputs before teardown."""
+    from flash.providers.modal import api as modal_api
 
-    pkg_dir = os.path.realpath(os.path.dirname(os.path.abspath(flash.__file__)))
-    api.create_repo(repo_id=repo, repo_type="dataset", private=True, exist_ok=True)
-    # mirror upload_code: force private even if the id pre-existed as a public repo, before any
-    # flash source is uploaded.
-    api.update_repo_settings(repo_id=repo, repo_type="dataset", private=True)
-    api.upload_folder(
-        folder_path=pkg_dir,
-        path_in_repo="code/flash",
-        repo_id=repo,
-        repo_type="dataset",
-        ignore_patterns=["__pycache__/*", "*.pyc"],
-        delete_patterns=["**"],
+    process = await sandbox.exec.aio("python", "-u", "/opt/flash/bake.py", timeout=deadline)
+    returncode = await process.wait.aio()
+    if returncode != 0:
+        raise modal_api.ModalApiError(
+            f"Kernel warmup exited with code {returncode}; "
+            f"inspect Modal sandbox {sandbox.object_id}"
+        )
+    status = await sandbox.filesystem.read_text.aio("/out/STATUS")
+    if status != f"rc=0\narch={arch}\n":
+        raise modal_api.ModalApiError("kernel warmup finished without a valid completion marker")
+    await sandbox.filesystem.copy_to_local.aio(
+        "/out/kernel_cache.tar.gz", out / "kernel_cache.tar.gz"
     )
-    log(f"uploaded flash code -> {repo}:code/flash (from {pkg_dir})")
+    await sandbox.filesystem.copy_to_local.aio("/out/warmup.log", out / "bake-warmup.log")
 
 
 def main() -> int:
     from pathlib import Path
 
-    from huggingface_hub import HfApi, snapshot_download
-
+    import flash
     from flash.providers.modal import api as modal_api
 
     parser = argparse.ArgumentParser(description="Bake worker kernels on Modal")
@@ -65,11 +63,7 @@ def main() -> int:
     if not 1 <= args.deadline_min <= 1440:
         parser.error("deadline must be between 1 and 1440 minutes")
     token = os.environ["HF_TOKEN"]
-    hf = HfApi(token=token)
     suffix = args.run_id or f"{int(time.time())}-{uuid.uuid4().hex[:8]}"
-    repo = (
-        f"{os.environ.get('FLASH_HF_NAMESPACE', ARTIFACT_NAMESPACE)}/kernel-bake-{args.sm}-{suffix}"
-    )
     entry = Path(__file__).with_name("bake_sandbox_entry.py")
 
     async def bake(modal, client):
@@ -79,74 +73,51 @@ def main() -> int:
             create_if_missing=True,
             client=client,
         )
-        image = modal.Image.from_registry(args.image).add_local_file(
-            str(entry), "/opt/flash/bake.py", copy=True
+        image = (
+            modal.Image.from_registry(args.image)
+            .add_local_dir(
+                Path(flash.__file__).parent,
+                "/runcode/code/flash",
+                copy=True,
+                ignore=["**/__pycache__/**", "**/*.pyc"],
+            )
+            .add_local_file(str(entry), "/opt/flash/bake.py", copy=True)
         )
         sandbox = await modal.Sandbox.create.aio(
-            "python",
-            "-u",
-            "/opt/flash/bake.py",
+            "sleep",
+            "infinity",
             app=app,
             image=image,
             name=f"bake-{args.sm}-{suffix}",
             gpu=GPU_BY_SM[args.sm],
-            timeout=args.deadline_min * 60,
+            timeout=min(86400, args.deadline_min * 60 + 600),
             cpu=(4, 8),
             # Keep the reservation at 32 GiB, but allow compiler memory to burst. The
             # H100 warmup was evicted for thrashing at the previous 64 GiB limit.
             memory=(32768, 131072),
-            secrets=[
-                modal.Secret.from_dict(
-                    {"BAKE_HF_REPO": repo, "BAKE_ARCH": args.arch, "HF_TOKEN": token}
-                )
-            ],
+            secrets=[modal.Secret.from_dict({"BAKE_ARCH": args.arch, "HF_TOKEN": token})],
             client=client,
         )
         try:
-            await sandbox.wait.aio()
-            returncode = await sandbox.poll.aio()
-            if returncode != 0:
-                # The provider wrapper sanitizes ordinary exceptions. Preserve this
-                # credential-free diagnostic so CI names the failed sandbox and exit.
-                raise modal_api.ModalApiError(
-                    f"Kernel warmup exited with code {returncode}; "
-                    f"inspect Modal sandbox {sandbox.object_id}"
-                )
+            await _collect_bake(sandbox, staging, args.arch, args.deadline_min * 60)
         finally:
             await sandbox.terminate.aio(wait=True)
 
-    try:
-        _upload_flash_code(hf, repo, token)
-        modal_api.call(bake, timeout=args.deadline_min * 60 + 120)
-        if not _status_present(hf, repo, retries=3):
-            raise RuntimeError("kernel warmup finished without its completion marker")
-        import tempfile
-
-        with tempfile.TemporaryDirectory(prefix="flash-kernel-") as temp:
-            snapshot_download(
-                repo_id=repo,
-                repo_type="dataset",
-                allow_patterns=["out/**"],
-                local_dir=temp,
-                token=token,
-            )
-            shutil.copytree(Path(temp) / "out", args.out, dirs_exist_ok=True)
-            archive = Path(args.out) / "kernel_cache.tar.gz"
-            if archive.exists():
-                _extract_cache_archive(archive, Path(args.out))
-                archive.unlink()
-            # The base image can contain an older warmup.log inside its cache tree. Keep the
-            # current subprocess log authoritative after archive extraction.
-            log_path = Path(temp) / "out" / "bake-warmup.log"
-            if log_path.exists():
-                shutil.copy2(log_path, Path(args.out) / "bake-warmup.log")
-                shutil.copy2(log_path, Path(args.out) / "warmup.log")
-        return _verify(args.out, args.sm)
-    finally:
-        try:
-            hf.delete_repo(repo_id=repo, repo_type="dataset")
-        except Exception:
-            log(f"WARNING: could not delete temporary repository {repo}; remove it manually")
+    # Never let leftovers from a previous bake satisfy this run's verification.
+    with tempfile.TemporaryDirectory(prefix="flash-kernel-") as temp:
+        staging = Path(temp)
+        modal_api.call(bake, timeout=args.deadline_min * 60 + 600)
+        archive = staging / "kernel_cache.tar.gz"
+        # Preserve the current log even if an older log exists inside the exported cache.
+        current_log = (staging / "bake-warmup.log").read_bytes()
+        _extract_cache_archive(archive, staging)
+        archive.unlink()
+        (staging / "bake-warmup.log").write_bytes(current_log)
+        (staging / "warmup.log").write_bytes(current_log)
+        result = _verify(str(staging), args.sm)
+        if result == 0:
+            shutil.copytree(staging, args.out, dirs_exist_ok=True)
+        return result
 
 
 def _extract_cache_archive(archive_path, destination) -> None:
@@ -165,19 +136,6 @@ def _extract_cache_archive(archive_path, destination) -> None:
             if total > 32 * 1024**3:
                 raise ValueError("kernel cache archive exceeds 32 GiB")
         archive.extractall(root, members=members, filter="data")
-
-
-def _status_present(api, repo: str, retries: int = 1) -> bool:
-    """Authoritative out/STATUS check, retried to ride out a transient HF list error."""
-    for i in range(retries):
-        try:
-            if "out/STATUS" in api.list_repo_files(repo, repo_type="dataset"):
-                return True
-        except Exception as e:
-            log(f"hf list err (status recheck {i + 1}/{retries}): {str(e)[:100]}")
-        if i < retries - 1:
-            time.sleep(5)
-    return False
 
 
 def _verify(out: str, sm: str) -> int:

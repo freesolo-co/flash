@@ -2,7 +2,7 @@
 
 These target under-covered helpers in ``flash.providers._lifecycle.bootstrap``: payload loading,
 code-prefix validation, the Hugging Face transient-retry machinery (status/Retry-After parsing +
-backoff), the HF upload/exists/fetch wrappers, ``run_mode``'s subprocess tee (success + wall-clock
+backoff), the artifact upload/exists/fetch wrappers, ``run_mode``'s subprocess tee (success + wall-clock
 timeout), the attempt-marker writer, the preload wall-cap watchdog ``_fire`` path, and ``main()``'s
 preload branch. Everything is CPU-only and offline: the huggingface_hub package is stubbed via
 sys.modules, subprocess.Popen is faked, and targeted real multiprocessing children exercise uploader

@@ -170,7 +170,7 @@ def build_worker_env(
     ):
         env.update(weight_cache_env())
     # runtime secrets and declared env secrets may never clobber a control-plane-owned key:
-    # the canonical seed, run id, hf repo, and arm are set above, and a runtime seed override
+    # the canonical seed, run id, artifact namespace, and arm are set above, and a runtime seed override
     # would break the authoritative-seed invariant regardless of how environment.secrets was
     # populated. removed keys are filtered here too. the two sets are disjoint and answer
     # different questions: control-plane ownership prevents overrides such as SEED, while removed
@@ -238,7 +238,7 @@ def _ensure_private_artifact_repo(
             f"create artifact repo {repo}",
             deadline_at=deadline_at,
         )
-    # create_repo(exist_ok=True) won't flip an existing public repo private; force it explicitly.
+    # assert the private-only storage contract, including namespaces that already existed.
     _artifact_call(
         lambda: api.update_repo_settings(repo_id=repo, repo_type="dataset", private=True),
         f"force artifact repo private {repo}",

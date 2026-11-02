@@ -105,13 +105,9 @@ def _positive_int(value: Any, *, source: str, field: str) -> int:
 
 
 def _file_identity(file_info: Any) -> str:
-    # the producer is `ArtifactStore.list_repo_tree`, which yields `ArtifactFile` -- whose `__init__` always
-    # sets `path`/`size`/`blob_id` and builds `lfs` as a `BlobLfsInfo` (field `sha256`, no `oid`).
-    # verified at the declared floor `huggingface-hub>=1.2.0` and at the installed 1.27.0, so the
-    # mapping-shaped `lfs` and the `lfs.oid` spelling have no producer in the supported range.
-    # `getattr` stays only on `lfs` itself, which is legitimately optional (non-LFS files), and on
-    # the entry object, because a listing also yields `RepoFolder` -- no size, no blob_id -- which
-    # must fail closed rather than hash to a folder's tree id.
+    # Azure ArtifactFile entries carry path, size and the content digest in blob_id.
+    # lfs.sha256 remains accepted for saved source metadata from before the migration.
+    # reject entries without file identity rather than hashing a folder or missing metadata.
     lfs = getattr(file_info, "lfs", None)
     oid = getattr(lfs, "sha256", None)
     size = getattr(lfs, "size", None)
@@ -487,7 +483,7 @@ def inspect_adapter_config(
 def load_artifact_adapter_config(
     adapter_ref: str, token: str | None = None, revision: str | None = None
 ) -> Mapping[str, Any]:
-    """Read ``adapter_config.json`` for a Flash adapter ref from Hugging Face datasets."""
+    """Read ``adapter_config.json`` for a Flash adapter ref from private Azure storage."""
     repo, filename = adapter_config_path_from_ref(adapter_ref)
     try:
         from flash.artifacts.api import download_file

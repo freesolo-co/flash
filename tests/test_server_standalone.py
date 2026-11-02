@@ -262,10 +262,7 @@ def test_a_whitespace_only_operator_key_authenticates_nothing(monkeypatch) -> No
 
 
 def test_artifact_namespace_is_operator_configurable(monkeypatch) -> None:
-    """Flash CREATES the HF dataset repos it streams artifacts through, so the namespace has to be
-    one the operator's HF_TOKEN can write to. Hardcoding Freesolo's made self-hosting impossible:
-    the assignment runs on every submit, and a self-hoster cannot create Freesolo-Co/flashrun-*, so
-    the run died at upload before training started."""
+    """Self-hosters can select their logical Azure artifact namespace without a code change."""
     from flash.server.domain.ops import repo_cleanup
 
     monkeypatch.delenv("FLASH_ARTIFACT_NAMESPACE", raising=False)

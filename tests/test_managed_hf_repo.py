@@ -1,9 +1,8 @@
-"""The run's HF artifact repo is platform-managed, not a user field.
+"""The run's Azure artifact namespace is platform-managed, not a user field.
 
-``submit_job`` assigns it server-side — a private dataset under the operator's namespace,
-scoped by environment and finalized run id — after the run_id is finalized, overwriting any inbound value.
-This is what prevents the 403: the operator HF_TOKEN (which the control plane uploads/writes
-with) cannot create a dataset under a user-chosen namespace like ``freesolo-founders``.
+``submit_job`` assigns the private logical namespace server-side, scoped by environment
+and finalized run id, overwriting inbound values. The serialized field retains its old
+``hf_repo`` name; it does not select a Hugging Face repository.
 """
 
 from __future__ import annotations

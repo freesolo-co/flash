@@ -53,7 +53,7 @@ def artifacts_dir(spec: JobSpec) -> str:
 
 
 def adapter_prefix(spec: JobSpec) -> str:
-    """A run's adapter location on the HF artifact store: ``<phase>/<run_id>``."""
+    """A run's adapter location in the Azure artifact store: ``<phase>/<run_id>``."""
     return f"{spec.phase}/{spec.run_id}"
 
 
