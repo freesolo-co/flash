@@ -2,7 +2,7 @@ name: flash worker kernel-cache (per-arch)
 
 # Builds per-SM worker images with compiled kernel caches baked in to reuse matching kernels
 # on cold workers. Each matrix leg:
-#   1. offloads the warmup to a Modal GPU of that arch (GH runners have none) -> build/kernel_cache,
+#   1. offloads the warmup to a Modal GPU of that arch (GH runners have none) -> base-source/build/kernel_cache,
 #   2. builds docker/Dockerfile.kernelcache -> ghcr.io/freesolo-co/flash-worker:cu128-<sm>,
 #   3. pushes it. After live qualification, record its immutable digest in QUALIFIED_WORKER_IMAGES
 #      (flash/providers/_lifecycle/net/worker.py); publishing a tag does not enable it for workers.
@@ -196,13 +196,22 @@ jobs:
             echo "revision=$(echo "$cfg" | jq -r '.config.Labels["org.opencontainers.image.revision"] // ""')" >> "$GITHUB_OUTPUT"
           fi
 
-      # Pin the checkout to the base's source commit so the warmed flash code matches the base exactly
-      # (the cache is content-keyed by the code that compiled it). Falls back to the event sha if the
-      # base predates the revision label.
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # Transport and its dependencies follow this workflow, even when manually rebaking an
+      # older image whose helper still required Hugging Face artifact credentials.
+      - name: Checkout bake transport
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: steps.gate.outputs.run == 'true'
+        with:
+          ref: ${{ github.workflow_sha }}
+          path: bake-tools
+
+      # Only the warmup source and thin image recipe follow the base image's source revision.
+      - name: Checkout base warmup source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         if: steps.gate.outputs.run == 'true'
         with:
           ref: ${{ steps.base.outputs.revision || github.sha }}
+          path: base-source
 
       - name: Install uv
         if: steps.gate.outputs.run == 'true'
@@ -217,10 +226,10 @@ jobs:
 
       - name: Sync deps (flash + modal + Azure)
         if: steps.gate.outputs.run == 'true'
-        run: uv sync --extra server
+        run: uv sync --project bake-tools --extra server --locked
 
       # The digest-pinned base keeps the warmup toolchain identical to the published image.
-      - name: Warm kernels on a Modal ${{ matrix.sm }} GPU -> build/kernel_cache
+      - name: Warm kernels on a Modal ${{ matrix.sm }} GPU -> base-source/build/kernel_cache
         if: steps.gate.outputs.run == 'true'
         env:
           MODAL_TOKEN_ID: ${{ secrets.MODAL_TOKEN_ID }}
@@ -233,11 +242,12 @@ jobs:
           BASE_IMAGE: ${{ steps.base.outputs.ref }}
           BAKE_DEADLINE_MINUTES: ${{ inputs.deadline_minutes }}
         run: |
-          uv run python docker/bake_kernel_cache.py \
+          uv run --project bake-tools --locked python bake-tools/docker/bake_kernel_cache.py \
             --arch "${{ matrix.arch }}" --sm "${{ matrix.sm }}" \
             --image "$BASE_IMAGE" \
+            --source-root base-source \
             --deadline-min "$BAKE_DEADLINE_MINUTES" \
-            --out build/kernel_cache
+            --out base-source/build/kernel_cache
 
       - name: Free disk space
         if: steps.gate.outputs.run == 'true'
@@ -260,8 +270,8 @@ jobs:
         if: steps.gate.outputs.run == 'true'
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
-          context: .
-          file: docker/Dockerfile.kernelcache
+          context: base-source
+          file: base-source/docker/Dockerfile.kernelcache
           push: true
           tags: ghcr.io/freesolo-co/flash-worker:${{ inputs.target_tag_prefix || 'cu128' }}-${{ matrix.sm }}
           provenance: false

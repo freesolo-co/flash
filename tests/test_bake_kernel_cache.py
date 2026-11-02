@@ -277,3 +277,79 @@ def test_cache_archive_preserves_hidden_backend_directories(tmp_path):
         archive.addfile(entry, io.BytesIO(b"compiled"))
     bake_module()._extract_cache_archive(path, tmp_path / "out")
     assert (tmp_path / "out/flashinfer/.cache/kernel.so").read_bytes() == b"compiled"
+
+
+def test_upload_uses_base_pinned_source_without_importing_it(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    import flash
+
+    root = tmp_path / "older-base"
+    package = root / "flash"
+    warmup = package / "engine/worker/runtime/kernel_warmup.py"
+    warmup.parent.mkdir(parents=True)
+    warmup.write_text("BASE_REVISION = 'older-base'\n")
+    (package / "__init__.py").write_text("raise RuntimeError('old package must not be imported')\n")
+    # A historical checkout can have an HF-only helper; the current helper must never execute it.
+    (root / "docker").mkdir()
+    (root / "docker/bake_kernel_cache.py").write_text("import os; os.environ['HF_TOKEN']\n")
+    monkeypatch.delenv("HF_TOKEN", raising=False)
+    seen = []
+
+    def upload_folder(**kwargs):
+        uploaded = Path(kwargs["folder_path"])
+        seen.append(uploaded)
+        assert (
+            uploaded / "engine/worker/runtime/kernel_warmup.py"
+        ).read_bytes() == warmup.read_bytes()
+        assert kwargs["path_in_repo"] == "code/flash"
+
+    bake_module()._upload_flash_code(
+        SimpleNamespace(create_repo=lambda **kw: None, upload_folder=upload_folder),
+        "test/bake",
+        root,
+    )
+    assert seen == [package]
+    assert seen[0] != Path(flash.__file__).parent
+
+
+def test_invalid_base_source_fails_before_publishing(tmp_path):
+    from types import SimpleNamespace
+
+    store = SimpleNamespace(create_repo=lambda **kw: pytest.fail("must validate before publishing"))
+    with pytest.raises(ValueError, match="base image's Flash warmup package"):
+        bake_module()._upload_flash_code(store, "test/bake", tmp_path)
+
+
+def test_workflow_keeps_transport_and_base_source_in_separate_checkouts():
+    import shlex
+
+    import yaml
+
+    workflow = yaml.safe_load(
+        (Path(__file__).parents[1] / ".github/workflows/bake-kernel-cache.yml").read_text()
+    )
+    steps = workflow["jobs"]["bake"]["steps"]
+    checkouts = {
+        step["with"]["path"]: step["with"]["ref"]
+        for step in steps
+        if step.get("uses", "").startswith("actions/checkout@")
+    }
+    assert checkouts["bake-tools"] == "${{ github.workflow_sha }}"
+    assert checkouts["base-source"] == "${{ steps.base.outputs.revision || github.sha }}"
+    warm = next(step for step in steps if step.get("name", "").startswith("Warm kernels"))
+    command = shlex.split(warm["run"].replace("\\\n", " "))
+    assert command[command.index("--project") + 1] == "bake-tools"
+    assert command[command.index("python") + 1] == "bake-tools/docker/bake_kernel_cache.py"
+    assert command[command.index("--source-root") + 1] == "base-source"
+    assert command[command.index("--out") + 1] == "base-source/build/kernel_cache"
+    sync = next(step["run"] for step in steps if "uv sync" in step.get("run", ""))
+    assert "--project bake-tools" in sync
+    assert "--locked" in sync
+    build = next(
+        step["with"]
+        for step in steps
+        if step.get("uses", "").startswith("docker/build-push-action@")
+    )
+    assert build["context"] == "base-source"
+    assert build["file"] == "base-source/docker/Dockerfile.kernelcache"

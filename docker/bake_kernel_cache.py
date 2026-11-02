@@ -27,14 +27,16 @@ def log(msg: str) -> None:
     print(f"[bake-ci] {msg}", flush=True)
 
 
-def _upload_flash_code(api, repo: str) -> None:
-    """Mirror the worker's upload_code: push the running flash package to code/flash (exact mirror)."""
-    import flash
+def _upload_flash_code(api, repo: str, source_root) -> None:
+    """Upload the base-pinned warmup package without importing it into the transport process."""
+    from pathlib import Path
 
-    pkg_dir = os.path.realpath(os.path.dirname(os.path.abspath(flash.__file__)))
+    pkg_dir = Path(source_root).resolve() / "flash"
+    if not (pkg_dir / "engine/worker/runtime/kernel_warmup.py").is_file():
+        raise ValueError("bake source must contain the base image's Flash warmup package")
     api.create_repo(repo_id=repo, repo_type="dataset", private=True, exist_ok=True)
     api.upload_folder(
-        folder_path=pkg_dir,
+        folder_path=str(pkg_dir),
         path_in_repo="code/flash",
         repo_id=repo,
         repo_type="dataset",
@@ -84,6 +86,12 @@ def main() -> int:
     parser.add_argument("--sm", required=True, choices=tuple(GPU_BY_SM))
     parser.add_argument("--image", required=True)
     parser.add_argument("--out", default="build/kernel_cache")
+    parser.add_argument(
+        "--source-root",
+        type=Path,
+        default=Path(__file__).resolve().parents[1],
+        help="Checkout matching the base image; transport runs from this helper's checkout",
+    )
     parser.add_argument("--deadline-min", type=int, default=90)
     parser.add_argument("--run-id", default="")
     args = parser.parse_args()
@@ -139,7 +147,7 @@ def main() -> int:
             await sandbox.terminate.aio(wait=True)
 
     try:
-        _upload_flash_code(artifacts, repo)
+        _upload_flash_code(artifacts, repo, args.source_root)
         modal_api.call(bake, timeout=args.deadline_min * 60 + 120)
         if not _status_present(artifacts, repo, retries=3):
             raise RuntimeError("kernel warmup finished without its completion marker")
