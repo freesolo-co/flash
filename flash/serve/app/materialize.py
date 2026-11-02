@@ -403,7 +403,7 @@ def validate_manifest_cache(
     manifest: ServingManifest,
     cache_root: str | os.PathLike[str],
 ) -> dict[str, Path]:
-    """revalidate every cached adapter without contacting Hugging Face."""
+    """revalidate every cached adapter without contacting Azure storage."""
 
     with locked_manifest_cache(manifest, cache_root) as paths:
         return dict(paths)

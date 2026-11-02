@@ -1,4 +1,4 @@
-"""List a run's deployable per-step training checkpoints from its HF artifact repo.
+"""List a run's deployable per-step training checkpoints from its Azure artifact namespace.
 
 The GPU worker publishes each trainer save's LoRA adapter to a stable, NON-pruned path
 (``<adapter_prefix>/checkpoints/step-<N>/adapter``; see
@@ -110,7 +110,7 @@ def list_checkpoints(spec: JobSpec) -> list[dict]:
     entry: ``{"step", "adapter_prefix", "subfolder", "repo_id", "repo_type"}`` where
     ``adapter_prefix`` is the value to hand ``deploy_adapter`` to serve that exact step and
     ``subfolder`` is the full path of the adapter folder in the repo. Returns ``[]`` when the
-    run has no HF repo or no published snapshots (older runs, or none saved yet)."""
+    run has no artifact namespace or no published snapshots (older runs, or none saved yet)."""
     return _checkpoints_from_files(spec, _repo_files(spec, strict=False))
 
 

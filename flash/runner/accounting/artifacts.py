@@ -25,7 +25,7 @@ def artifact_namespace() -> str:
 
 
 def _environment_artifact_repo_name(env_id: str) -> str:
-    """Stable HF dataset repo name for all runs of one environment."""
+    """Stable logical artifact namespace for all runs of one environment."""
     raw = (env_id or "default-environment").strip() or "default-environment"
     digest = hashlib.sha1(raw.encode("utf-8")).hexdigest()[:16]
     slug = re.sub(r"[^A-Za-z0-9]+", "-", raw.lower()).strip("-") or "environment"
@@ -35,15 +35,15 @@ def _environment_artifact_repo_name(env_id: str) -> str:
 
 
 def managed_artifact_repo_for_environment(env_id: str) -> str:
-    """Private HF dataset repo shared by runs that use the same environment id."""
+    """Private Azure artifact namespace shared by runs that use the same environment id."""
     return f"{artifact_namespace()}/{_environment_artifact_repo_name(env_id)}"
 
 
 def managed_artifact_repo_for_run(env_id: str, run_id: str) -> str:
-    """isolate each new run's commits while keeping retries in one stable private repo."""
+    """isolate each new run's artifacts while keeping retries in one stable private namespace."""
     if not run_id or run_id == "local":
         raise ValueError("run_id must be finalized before assigning the artifact repo")
-    # environment-only repositories share an upstream commit quota across every concurrent run.
+    # per-run namespaces keep independently published manifests separate.
     # hash a framed identity so different environment/run pairs cannot alias by concatenation.
     identity = f"{len(env_id)}:{env_id}{run_id}"
     digest = hashlib.sha256(identity.encode("utf-8")).hexdigest()[:24]

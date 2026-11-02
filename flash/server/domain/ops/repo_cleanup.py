@@ -28,7 +28,7 @@ logger = get_logger(__name__)
 RUN_REPO_PREFIX = "flashrun-"
 # Delete an unbound run's prefix once its newest file was committed this long ago (fixed: 7 days).
 DELETE_AGE_SECONDS = 7.0 * 86400.0
-_DELETE_SLEEP_S = 0.5  # pause between deletes — HF repo-mutation rate-limit courtesy
+_DELETE_SLEEP_S = 0.5  # pause between deletes — bounded artifact cleanup request rate
 _SCAN_WORKERS = 8  # hf tree-listing concurrency
 # expanded HF tree listings hit origin and rate-limit below the general quota.
 # pace every call globally so _SCAN_WORKERS concurrency cannot create request bursts.
@@ -374,5 +374,5 @@ def run_scheduled_cleanup(*, dry_run: bool = False, api=None, should_stop=None) 
                 )
         finally:
             held.release()
-        time.sleep(_DELETE_SLEEP_S)  # HF repo-mutation rate-limit courtesy
+        time.sleep(_DELETE_SLEEP_S)  # bounded artifact cleanup request rate
     return deleted

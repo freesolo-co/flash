@@ -667,7 +667,7 @@ def poll_instance_job(
     load_timeout_s: float,
     deadline_at: float | None = None,
 ) -> PollResult:
-    """poll instance status and hf artifacts to a terminal result.
+    """poll instance status and Azure artifacts to a terminal result.
 
     completed requires a strict ok marker and metrics. worker markers fail fast; dead hosts, stalls,
     status outages, and unreadable signalled-success metrics remain infrastructure-retryable.

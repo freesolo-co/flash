@@ -499,7 +499,7 @@ def _ray_log_name_for_attempt(phase: str, error_name: str) -> str | None:
 
 
 def _worker_artifacts(spec) -> dict[str, str]:
-    """Fetch train-subprocess stdout and traceback from the private HF artifact repo.
+    """Fetch train-subprocess stdout and traceback from the private Azure artifact namespace.
 
     The control-plane log contains only orchestration and a truncated terminal tail. Use operator
     Azure credentials so ``flash runs log`` can read private worker artifacts; missing data returns ``{}``.
@@ -546,7 +546,7 @@ def _worker_artifacts(spec) -> dict[str, str]:
                 filename=f"{prefix}/{name}",
                 token=None,
                 # the worker appends to console/error files across the run, so a cached copy goes
-                # stale; force a fresh pull (matches other HF artifact readers, e.g.
+                # stale; force a fresh pull (matches other artifact readers, e.g.
                 # flash/providers/artifacts/hf.py:make_artifact_text_reader).
                 force_download=True,
             )
