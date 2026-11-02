@@ -13,6 +13,31 @@ from flash.custom.checkpoints import RunCheckpoints
 from flash.engine.worker.io import artifacts as hf
 
 
+def test_resume_adapter_uses_pinned_azure_snapshot(tmp_path, monkeypatch):
+    from flash.artifacts import api
+
+    resolved = {
+        "repo": "private/repo",
+        "revision": "a" * 40,
+        "path": "custom/run/checkpoints/step-2",
+    }
+    adapter = tmp_path / resolved["path"] / "adapter"
+    adapter.mkdir(parents=True)
+    (adapter / "adapter_config.json").write_text("{}")
+    download = Mock(return_value=str(tmp_path))
+    monkeypatch.setattr(api, "download_snapshot", download)
+
+    assert RunCheckpoints(None).download_adapter(resolved, tmp_path) == adapter
+    download.assert_called_once_with(
+        local_dir=tmp_path,
+        repo_id=resolved["repo"],
+        repo_type="dataset",
+        revision=resolved["revision"],
+        allow_patterns=[resolved["path"] + "/adapter/*"],
+        token=None,
+    )
+
+
 @pytest.fixture
 def store(tmp_path, monkeypatch, worker_context):
     durable = tmp_path / "durable"
