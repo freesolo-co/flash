@@ -1558,3 +1558,91 @@ def test_a_snapshot_written_before_the_version_key_still_recovers(monkeypatch, t
         validate_persisted_spec_envelope({"version": "1"})
     with pytest.raises(ValueError, match="unsupported persisted preparation envelope version"):
         validate_persisted_spec_envelope({"version": PREPARATION_ENVELOPE_VERSION + 1})
+
+
+def _custom_run_status(monkeypatch, tmp_path, *, legacy_train_keys=False):
+    """A provisioned custom run as `submit` persists it, optionally as a pre-1.4.9 build wrote it.
+
+    A pre-1.4.9 build filtered custom `train` through `TRAIN_KEYS` without `init_from_adapter`, so
+    its stored public spec and its digest both lack the key. `model_revision_auto` puts the run on
+    the digest branch of `effective_spec_from_status`, as every auto-pinned custom run is.
+    """
+    import flash.schema.custom as custom_schema
+    from flash.core.spec import JobSpec
+
+    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
+    raw = {
+        "run_id": "custom-run",
+        "model": "Qwen/Qwen3.5-9B",
+        "algorithm": "custom",
+        "gpu": {"type": "H200"},
+        "train": {
+            "max_steps": 10,
+            "max_context_tokens": 4096,
+            "save_every": 10,
+            "lora_rank": 32,
+            "lora_alpha": 64,
+        },
+        "custom": {"file": "loop.py", "idle_seconds": 900, "max_wall_seconds": 3600},
+    }
+    public = JobSpec.from_dict(raw)
+    worker = JobSpec.from_dict(
+        {**public.to_internal_dict(), "model_revision": "a" * 40, "model_revision_auto": True}
+    )
+    with monkeypatch.context() as legacy:
+        if legacy_train_keys:
+            legacy.setattr(
+                custom_schema, "TRAIN_KEYS", custom_schema.TRAIN_KEYS - {"init_from_adapter"}
+            )
+        stored_public = public.to_dict()
+        snapshot = runner_submit._effective_preparation_snapshot(public, worker, None)
+    runner_state._save_status(
+        runner_state.RunStatus(
+            run_id=public.run_id, state="done", spec=stored_public, effective_preparation=snapshot
+        )
+    )
+    return stored_public
+
+
+def test_custom_run_prepared_before_init_from_adapter_still_verifies(monkeypatch, tmp_path):
+    """Adding `init_from_adapter` to custom `TRAIN_KEYS` must not invalidate older custom runs.
+
+    `to_dict()` now emits the key, empty, for every custom run, so rehashing one prepared before
+    hashed bytes it never had: resume and deploy of every earlier custom checkpoint failed with
+    "persisted effective preparation failed integrity validation".
+    """
+    from flash.core.spec import JobSpec
+
+    stored = _custom_run_status(monkeypatch, tmp_path, legacy_train_keys=True)
+    assert "init_from_adapter" not in stored["train"]
+    assert "init_from_adapter" in JobSpec.from_dict(stored).to_dict()["train"]
+
+    recovered = runner_status.effective_spec_from_status(runner_status.get_status("custom-run"))
+    assert recovered.algorithm == "custom"
+    assert recovered.train.lora_rank == 32
+
+
+def test_custom_digest_replay_drops_only_empty_omitted_train_keys():
+    """The replay may drop a key only when it is empty; a set source adapter stays hashed."""
+    from flash.core.spec import JobSpec
+
+    raw = {
+        "run_id": "custom-run",
+        "model": "Qwen/Qwen3.5-9B",
+        "algorithm": "custom",
+        "train": {"max_steps": 10, "lora_rank": 32, "lora_alpha": 64},
+        "custom": {"file": "loop.py"},
+    }
+    plain = JobSpec.from_dict(raw)
+    warm = replace(plain, train=replace(plain.train, init_from_adapter="flash-1/final"))
+    stored_without_key = plain.to_dict()
+    stored_without_key["train"].pop("init_from_adapter")
+
+    def digest(spec, stored):
+        return runner_preparation._preparation_digest(spec, spec, None, stored_public=stored)
+
+    # an empty, omitted key hashes like the older serialization that never had it
+    assert digest(plain, stored_without_key) != digest(plain, plain.to_dict())
+    # a set value is never dropped, whatever the stored record claims
+    assert digest(warm, stored_without_key) == digest(warm, warm.to_dict())
+    assert digest(warm, stored_without_key) != digest(plain, stored_without_key)
