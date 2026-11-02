@@ -36,9 +36,8 @@ def resolve_project(
     only validated for SHAPE -- exactly what ``flash/server/domain/registry/projects.py`` does under
     ``standalone()`` when the same run is submitted. Without this the ownership lookup went to
     ``api.freesolo.co``, which has no relationship with the operator's key and answers 401, so
-    ``flash env setup`` died before writing a file on the very quickstart SELF_HOSTING.md
-    documents. A backend-less plane exposes no project routes at all, so there is nothing else to
-    ask.
+    ``flash env setup`` died before writing a file on a standalone plane. A backend-less plane
+    exposes no project routes at all, so there is nothing else to ask.
 
     ``api_url`` is passed in rather than re-read from config because the caller has already
     resolved it (and because ``FLASH_STANDALONE`` lives on the SERVER, so the client cannot see

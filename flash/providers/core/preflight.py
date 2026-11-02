@@ -113,7 +113,7 @@ def require_operator_config() -> None:
         raise PreflightError(
             "the Flash control plane is missing required operator configuration:\n"
             + "\n".join(problems)
-            + "\n\nSet these on the control-plane host. See SELF_HOSTING.md."
+            + "\n\nSet these on the control-plane host."
         )
 
 

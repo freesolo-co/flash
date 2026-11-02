@@ -17,7 +17,6 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 MODAL_APP = ROOT / "flash" / "serving" / "app" / "modal_app.py"
-SERVING_README = ROOT / "flash" / "serving" / "app" / "README.md"
 DEPLOY_WORKFLOWS = ("deploy-modal.yml", "deploy-modal-dev.yml")
 
 
@@ -104,32 +103,12 @@ def test_modal_image_applies_and_verifies_the_shared_vllm_repair() -> None:
     assert command.index(apply) < command.index(verify) < command.index(cleanup)
 
 
-def test_hosted_deploy_docs_and_workflows_point_at_paths_that_exist() -> None:
-    """The documented deploy commands and the workflows that run them must match the move.
-
-    The README's blocks were written when the app was a top-level `serving/` directory, so they said
-    `cd serving` and `modal deploy modal_app.py`. Both are now wrong in a way that fails only when an
-    operator follows them during an incident: there is no repo-root `serving/`, and deploying from
-    the package directory raises `ModuleNotFoundError: No module named 'flash'` because modal's CLI
-    puts the *working directory* on sys.path.
-    """
-    readme = SERVING_README.read_text(encoding="utf-8")
-    assert "cd serving" not in readme
-    # both documented deploys must name the app by its repo-root-relative path.
-    assert readme.count("modal deploy flash/serving/app/modal_app.py") == 1
-    assert readme.count("modal deploy --env dev flash/serving/app/modal_app.py") == 1
-    assert readme.count('export FREESOLO_DEPLOYMENT_ID="manual-production-') == 1
-    assert readme.count('export FREESOLO_DEPLOYMENT_ID="manual-development-') == 1
-
+def test_hosted_deploy_workflows_use_the_repository_root() -> None:
     for workflow in DEPLOY_WORKFLOWS:
         path = ROOT / ".github" / "workflows" / workflow
-        # the README cites these by name; a citation that resolves to nothing stranded the hosted
-        # fleet with no redeploy path, which is why they were ported alongside the app.
         assert path.is_file(), workflow
-        assert workflow in readme, workflow
         body = path.read_text(encoding="utf-8")
         assert "modal deploy" in body
-        # run from the repo root, for the sys.path reason above.
         assert "working-directory: ." in body
 
 
@@ -238,25 +217,3 @@ def test_serving_workflow_gates_include_the_shared_repair_script() -> None:
         gate_lines = [line for line in source.splitlines() if "grep -qE" in line]
         assert len(gate_lines) == 1, workflow
         assert path in gate_lines[0], workflow
-
-
-def test_self_hosting_docs_name_the_image_the_workflow_actually_publishes() -> None:
-    """The documented `--image` must be the repository the publish workflow pushes to.
-
-    These are two independent strings with no shared constant: the docs said
-    `ghcr.io/freesolo-co/flash-serve` while the workflow publishes
-    `ghcr.io/freesolo-co/freesolo-flash-serve`. A wrong image name is not caught by the deploy
-    dry-run, which only validates that the digest is syntactically well formed -- it fails at
-    provisioning, against the customer's own provider account.
-    """
-    workflow = (ROOT / ".github" / "workflows" / "publish-serving-image.yml").read_text(
-        encoding="utf-8"
-    )
-    published = re.search(r"IMAGE:\s*(\S+)", workflow)
-    assert published is not None, "the publish workflow must state the image it pushes"
-    image = published.group(1)
-
-    docs = (ROOT / "SELF_HOSTING.md").read_text(encoding="utf-8")
-    cited = re.findall(r"ghcr\.io/[\w./-]+(?=@sha256:)", docs)
-    assert cited, "SELF_HOSTING.md must show a pinned --image to deploy"
-    assert set(cited) == {image}, (cited, image)

@@ -6,7 +6,7 @@ body:
     attributes:
       value: |
         Do not paste API keys, tokens, or credentials. Redact them before posting.
-        For security vulnerabilities, use private reporting instead (see SECURITY.md).
+        For security vulnerabilities, use private vulnerability reporting on GitHub instead.
 
   - type: textarea
     id: what-happened

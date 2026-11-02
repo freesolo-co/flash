@@ -1,7 +1,6 @@
 """Modal app: multi-LoRA serving with one GPU container per base model. ``LoraEngine`` is a
 Modal class parametrized by ``base_model`` (one GPU per base model, sharing its adapters via
-``enable_lora``); ``router`` is the CPU front door that dispatches to the right engine. See
-README to deploy.
+``enable_lora``); ``router`` is the CPU front door that dispatches to the right engine.
 """
 
 import asyncio

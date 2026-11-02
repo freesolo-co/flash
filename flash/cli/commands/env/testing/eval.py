@@ -436,8 +436,8 @@ def _require_accessible_project(project_id: object) -> str:
             f"not logged in — run `{CLI_NAME} login` with your freesolo API key (or set FREESOLO_API_KEY)"
         )
     # pass `api_url` so self-hosted planes get shape validation without sending
-    # `FREESOLO_INTERNAL_KEY` to api.freesolo.co (SELF_HOSTING.md,
-    # `_verifies_against_freesolo`). upload may still fail later, but credential leakage is worse.
+    # `FREESOLO_INTERNAL_KEY` to api.freesolo.co (see `_verifies_against_freesolo`).
+    # upload may still fail later, but credential leakage is worse.
     return resolve_project_id(project_id, api_key, api_url)
 
 

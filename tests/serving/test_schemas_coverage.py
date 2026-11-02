@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-from pathlib import Path
-
 import pytest
 from pydantic import ValidationError
 
@@ -133,18 +131,6 @@ def test_generate_request_requires_exactly_one_nonempty_prompt_source(
         match="exactly one nonempty prompt or messages source is required",
     ):
         GenerateRequest.model_validate({"model_id": CHECKPOINT_ID, **sources})
-
-
-def test_serving_readme_uses_generate_request_field_names() -> None:
-    readme = Path(__file__).parents[2] / "flash" / "serving" / "app" / "README.md"
-    text = readme.read_text()
-
-    assert "`POST /generate` with `model_id`" in text
-    assert '"max_tokens": 512' in text
-    assert '"structured_outputs": {' in text
-    assert "adapterId" not in text
-    assert "maxTokens" not in text
-    assert "structuredOutputs" not in text
 
 
 @pytest.mark.parametrize(

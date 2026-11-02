@@ -22,8 +22,8 @@ _CLI_SCRIPT_NAMES = (
     else frozenset({"flash", "flash-cli"})
 )
 
-# The `-m` form of the same entry point, which README/CONTRIBUTING/SELF_HOSTING all name as the
-# way around the shadowing. Not channel-dependent: the dev build renames the console scripts but
+# The `-m` form of the same entry point works around shadowing.
+# Not channel-dependent: the dev build renames the console scripts but
 # ships the identical `flash` package, so this module path is its escape hatch too.
 _CLI_MODULE = "flash.cli"
 

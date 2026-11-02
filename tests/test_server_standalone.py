@@ -639,15 +639,6 @@ def test_a_blank_github_token_is_not_shipped_to_the_worker(monkeypatch) -> None:
     assert env["HF_TOKEN"] == "hf_real"
 
 
-def test_self_hosting_docs_do_not_promise_an_endpoint_concurrency_cap() -> None:
-    """Document Modal workspace quotas without promising a Flash concurrency cap."""
-    import pathlib
-
-    doc = (pathlib.Path(__file__).resolve().parent.parent / "SELF_HOSTING.md").read_text()
-    assert "in-process semaphore, which is the correct" not in doc
-    assert "Modal workspace GPU quotas bound concurrent reservations" in doc
-
-
 def test_the_serving_repos_are_not_on_the_training_path() -> None:
     """The catalog names a serving checkpoint per model, separate from the trained base model.
 
@@ -677,9 +668,6 @@ def test_the_serving_repos_are_not_on_the_training_path() -> None:
     # and the field is genuinely populated, so the check above is not vacuous.
     assert any(m.serving and m.serving.serve_model_id for m in MODELS.values())
     assert SERVING_MODEL_REPOS
-
-    doc = (root.parent / "SELF_HOSTING.md").read_text()
-    assert "informational\nonly" in doc or "informational only" in doc
 
 
 def test_enabling_standalone_adopts_runs_already_in_the_store(monkeypatch, tmp_path) -> None:
