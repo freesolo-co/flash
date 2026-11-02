@@ -104,10 +104,14 @@ def test_run_job_persists_flash_metrics(monkeypatch):
         assert m["notes"]["gpu"] == "L4"
 
 
-def test_source_publication_failure_is_generic_at_submission_and_api_boundary(monkeypatch, caplog):
+def test_source_publication_failure_defers_and_stays_generic_at_api_boundary(
+    monkeypatch, caplog, tmp_path
+):
     from flash.core.spec import JobSpec, TrainSpec
     from flash.server.routes.runs import _submit_failure_http_error
 
+    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
+    monkeypatch.setattr(runner_state, "RESULTS_DIR", str(tmp_path / "results"))
     spec = JobSpec(
         run_id="source-publication-failure",
         model="Qwen/Qwen3.5-9B",
@@ -128,15 +132,23 @@ def test_source_publication_failure_is_generic_at_submission_and_api_boundary(mo
         ),
     )
 
-    with (
-        caplog.at_level(logging.WARNING),
-        pytest.raises(runner_submit.SourceSnapshotPublicationError) as raised,
-    ):
-        runner_submit.submit_job(spec, prepared_job=prepared)
+    # a Hugging Face failure no longer rejects the submission: the run is queued without a
+    # descriptor and publication is retried before launch.
+    with caplog.at_level(logging.WARNING):
+        status = runner_submit.submit_job(spec, prepared_job=prepared, queue_only=True)
+    assert status.state == "queued"
+    assert runner_status.get_status(spec.run_id).source_snapshot is None
+    assert "managed source publication failed" in caplog.text
+
+    # when deferred publication finally gives up, the run fails with a generic public error.
+    monkeypatch.setattr(runner_submit, "SOURCE_PUBLICATION_LAUNCH_DEADLINE_S", 0.0)
+    with pytest.raises(runner_submit.SourceSnapshotPublicationError) as raised:
+        runner_submit.ensure_source_snapshot(spec, sleep=lambda _s: None)
+    assert str(raised.value) == "managed source publication failed"
+    assert runner_lifecycle._terminal_failure_detail(raised.value) == str(raised.value)
 
     public_error = _submit_failure_http_error(raised.value)
     assert public_error.status_code == 503
-    assert public_error.detail == "managed source publication failed; retry the submission later"
     rendered = str(raised.value) + str(public_error.detail)
     for private_value in (
         "private-org/private-run-repo",

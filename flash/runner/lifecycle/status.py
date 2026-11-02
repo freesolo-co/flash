@@ -127,6 +127,28 @@ def source_snapshot_from_status(status: RunStatus, *, required: bool = False) ->
     return parse_descriptor(raw).to_dict()
 
 
+def record_source_snapshot(run_id: str, descriptor: dict) -> dict:
+    """Persist a deferred source descriptor once; an already-persisted descriptor wins.
+
+    Compare-and-set under the status guard, so concurrent launchers (a recovery scan racing the
+    original supervisor) converge on one immutable descriptor instead of overwriting it.
+    """
+    from flash.snapshot.archive import parse_descriptor
+
+    canonical = parse_descriptor(descriptor).to_dict()
+    report_status: RunStatus | None = None
+    with state._status_guard(run_id):
+        status = get_status(run_id)
+        if status.source_snapshot is not None:
+            return parse_descriptor(status.source_snapshot).to_dict()
+        status.source_snapshot = canonical
+        status.updated_at = time.time()
+        state._save_status_unlocked(status)
+        report_status = status
+    reporting._report_status(report_status)
+    return canonical
+
+
 def effective_spec_from_status(status: RunStatus, *, verify_source: bool = False) -> JobSpec:
     """Load the private prepared worker spec, optionally revalidating its source artifact."""
     managed_revision_keys = {

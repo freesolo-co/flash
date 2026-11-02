@@ -215,14 +215,111 @@ def _hf_call(call, label: str, *, deadline_at: float | None = None):
     )
 
 
+# Managed source publication runs on the submit path, so a short Hugging Face blip used to reject
+# the whole submission. It gets its own bounded deadline and retries a wider set of failures than
+# `hf_call` (which only retries 429/5xx): transport errors that carry no HTTP status, request
+# timeouts, and commit races on the shared artifact repo.
+SOURCE_PUBLICATION_DEADLINE_S = 90.0
+_PUBLICATION_RETRY_STATUS_CODES = frozenset({408, 409, 412, 425})
+_PUBLICATION_RETRY_DELAYS_S = (2.0, 5.0, 10.0, 20.0, 30.0)
+
+
+def _publication_failure_category(cause: BaseException) -> str:
+    status = hf_status_code(cause)
+    if status == 429:
+        return "rate limited"
+    if status is not None and (status >= 500 or status == 408):
+        return "service unavailable"
+    if status is None and _is_transport_error(cause):
+        return "network error"
+    if status is None and isinstance(cause, TimeoutError):
+        return "timed out"
+    return "rejected"
+
+
+class SourcePublicationStepError(RuntimeError):
+    """One managed source publication step failed.
+
+    The message names only a fixed step label and a coarse category, never the artifact repo,
+    token, upstream body or raw status, so it is safe to show the submitter. `status_code` and
+    `cause_type` are for server-side logs only.
+    """
+
+    def __init__(self, step: str, cause: BaseException):
+        self.step = step
+        self.status_code = hf_status_code(cause)
+        self.cause_type = type(cause).__name__
+        self.category = _publication_failure_category(cause)
+        super().__init__(f"{step} failed ({self.category})")
+
+
+def _is_transport_error(exc: BaseException) -> bool:
+    """Network-level failures with no HTTP response (connection reset, DNS, read timeout)."""
+    if isinstance(exc, ConnectionError):
+        return True
+    try:
+        import httpx
+
+        if isinstance(exc, httpx.TransportError):
+            return True
+    except ImportError:
+        pass
+    try:
+        import requests
+
+        if isinstance(exc, (requests.exceptions.ConnectionError, requests.exceptions.Timeout)):
+            return True
+    except ImportError:
+        pass
+    return False
+
+
+def _is_retryable_publication_error(exc: BaseException) -> bool:
+    status = hf_status_code(exc)
+    if status is None:
+        return _is_transport_error(exc)
+    return status in _PUBLICATION_RETRY_STATUS_CODES
+
+
+def _publication_call(call, label: str, *, deadline_at: float):
+    """`_hf_call` plus retries for transport errors and commit races, bounded by `deadline_at`.
+
+    Re-raises the original exception (not a wrapper) so callers keep classifying it by status.
+    """
+    from flash.providers._lifecycle.net.deadline import remaining_seconds
+
+    for attempt in range(len(_PUBLICATION_RETRY_DELAYS_S) + 1):
+        try:
+            return _hf_call(call, label, deadline_at=deadline_at)
+        except Exception as exc:
+            if not _is_retryable_publication_error(exc) or attempt >= len(
+                _PUBLICATION_RETRY_DELAYS_S
+            ):
+                raise
+            remaining = remaining_seconds(deadline_at)
+            if remaining <= 0:
+                raise
+            delay = min(_PUBLICATION_RETRY_DELAYS_S[attempt], remaining)
+            logger.warning(
+                "%s failed (%s); retrying in %.0fs",
+                label,
+                type(exc).__name__,
+                delay,
+            )
+            time.sleep(delay)
+    raise AssertionError("unreachable")
+
+
 def _ensure_private_artifact_repo(
     api,
     repo: str,
     *,
     deadline_at: float | None = None,
+    call=None,
 ) -> None:
+    call = call or _hf_call
     try:
-        _hf_call(
+        info = call(
             lambda: api.repo_info(repo_id=repo, repo_type="dataset"),
             f"lookup artifact repo {repo}",
             deadline_at=deadline_at,
@@ -230,21 +327,26 @@ def _ensure_private_artifact_repo(
     except Exception as exc:
         if hf_status_code(exc) != 404 and exc.__class__.__name__ != "RepositoryNotFoundError":
             raise
-        _hf_call(
+        call(
             lambda: api.create_repo(repo, repo_type="dataset", exist_ok=True, private=True),
             f"create artifact repo {repo}",
             deadline_at=deadline_at,
         )
+    else:
+        # Every submission used to issue this settings write, which Hugging Face rate-limits
+        # aggressively; skip it when the repo already reports itself private.
+        if getattr(info, "private", None) is True:
+            return
     # create_repo(exist_ok=True) won't flip an existing public repo private; force it explicitly.
-    _hf_call(
+    call(
         lambda: api.update_repo_settings(repo_id=repo, repo_type="dataset", private=True),
         f"force artifact repo private {repo}",
         deadline_at=deadline_at,
     )
 
 
-def _repo_revision(api, repo: str, *, deadline_at: float | None) -> str:
-    info = _hf_call(
+def _repo_revision(api, repo: str, *, deadline_at: float | None, call=None) -> str:
+    info = (call or _hf_call)(
         lambda: api.repo_info(repo_id=repo, repo_type="dataset"),
         f"read artifact repo revision {repo}",
         deadline_at=deadline_at,
@@ -262,11 +364,12 @@ def _download_source_archive(
     token: str | None,
     *,
     deadline_at: float | None,
+    call=None,
 ) -> bytes | None:
     from huggingface_hub import hf_hub_download
 
     try:
-        local_path = _hf_call(
+        local_path = (call or _hf_call)(
             lambda: hf_hub_download(
                 repo_id=repo,
                 repo_type="dataset",
@@ -293,7 +396,11 @@ def publish_source_snapshot(
     *,
     deadline_at: float | None = None,
 ) -> dict:
-    """Publish one deterministic source archive and return its immutable descriptor."""
+    """Publish one deterministic source archive and return its immutable descriptor.
+
+    Bounded by `deadline_at` (default: SOURCE_PUBLICATION_DEADLINE_S from now). Any failure is
+    raised as `SourcePublicationStepError`, whose message names the failing step and status only.
+    """
     from huggingface_hub import HfApi
 
     import flash
@@ -309,54 +416,75 @@ def publish_source_snapshot(
         raise RuntimeError(
             "hf_repo must be set (the run's [train] hf_repo: HF dataset repo for code + artifacts)"
         )
-    token = os.environ.get("HF_TOKEN")
-    api = HfApi(token=token)
-    _ensure_private_artifact_repo(api, repo, deadline_at=deadline_at)
-    package_dir = os.path.realpath(os.path.dirname(os.path.abspath(flash.__file__)))
-    archive = build_source_archive(package_dir=Path(package_dir))
-    digest = sha256_bytes(archive)
-    archive_path = canonical_archive_path(digest)
+    if deadline_at is None:
+        deadline_at = time.time() + SOURCE_PUBLICATION_DEADLINE_S
+    step = {"name": "prepare artifact repo"}
 
-    def verified_at(revision: str) -> dict | None:
-        candidate = _download_source_archive(
-            repo,
-            archive_path,
-            revision,
-            token,
-            deadline_at=deadline_at,
-        )
-        if candidate is None:
-            return None
-        descriptor = descriptor_for_archive(archive, revision)
-        read_verified_archive(candidate, descriptor)
-        return descriptor.to_dict()
+    def call(fn, label, *, deadline_at):
+        return _publication_call(fn, label, deadline_at=deadline_at)
 
-    head = _repo_revision(api, repo, deadline_at=deadline_at)
-    existing = verified_at(head)
-    if existing is not None:
-        return existing
     try:
-        commit = _hf_call(
-            lambda: api.upload_file(
-                path_or_fileobj=BytesIO(archive),
-                path_in_repo=archive_path,
-                repo_id=repo,
-                repo_type="dataset",
-                commit_message=f"publish flash source {digest}",
-            ),
-            f"publish source snapshot {repo}:{archive_path}",
-            deadline_at=deadline_at,
-        )
-        revision = str(getattr(commit, "oid", None) or "").strip()
-        if not revision:
-            raise RuntimeError("source snapshot publication returned no immutable revision")
-        published = verified_at(revision)
-        if published is None:
-            raise RuntimeError("published source snapshot is not readable at its commit revision")
-        return published
-    except Exception:
-        winner_revision = _repo_revision(api, repo, deadline_at=deadline_at)
-        winner = verified_at(winner_revision)
-        if winner is not None:
-            return winner
+        token = os.environ.get("HF_TOKEN")
+        api = HfApi(token=token)
+        _ensure_private_artifact_repo(api, repo, deadline_at=deadline_at, call=call)
+        step["name"] = "build source archive"
+        package_dir = os.path.realpath(os.path.dirname(os.path.abspath(flash.__file__)))
+        archive = build_source_archive(package_dir=Path(package_dir))
+        digest = sha256_bytes(archive)
+        archive_path = canonical_archive_path(digest)
+
+        def verified_at(revision: str) -> dict | None:
+            step["name"] = "verify source snapshot"
+            candidate = _download_source_archive(
+                repo,
+                archive_path,
+                revision,
+                token,
+                deadline_at=deadline_at,
+                call=call,
+            )
+            if candidate is None:
+                return None
+            descriptor = descriptor_for_archive(archive, revision)
+            read_verified_archive(candidate, descriptor)
+            return descriptor.to_dict()
+
+        step["name"] = "read artifact repo revision"
+        head = _repo_revision(api, repo, deadline_at=deadline_at, call=call)
+        existing = verified_at(head)
+        if existing is not None:
+            return existing
+        try:
+            step["name"] = "upload source snapshot"
+            commit = call(
+                lambda: api.upload_file(
+                    path_or_fileobj=BytesIO(archive),
+                    path_in_repo=archive_path,
+                    repo_id=repo,
+                    repo_type="dataset",
+                    commit_message=f"publish flash source {digest}",
+                ),
+                f"publish source snapshot {repo}:{archive_path}",
+                deadline_at=deadline_at,
+            )
+            revision = str(getattr(commit, "oid", None) or "").strip()
+            if not revision:
+                raise RuntimeError("source snapshot publication returned no immutable revision")
+            published = verified_at(revision)
+            if published is None:
+                raise RuntimeError(
+                    "published source snapshot is not readable at its commit revision"
+                )
+            return published
+        except Exception:
+            failed_step = step["name"]
+            winner_revision = _repo_revision(api, repo, deadline_at=deadline_at, call=call)
+            winner = verified_at(winner_revision)
+            if winner is not None:
+                return winner
+            step["name"] = failed_step
+            raise
+    except SourcePublicationStepError:
         raise
+    except Exception as exc:
+        raise SourcePublicationStepError(step["name"], exc) from exc

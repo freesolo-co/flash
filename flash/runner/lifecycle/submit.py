@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import logging
 import os
+import time
 from dataclasses import dataclass
 from functools import partial
 
@@ -31,9 +32,79 @@ logger = logging.getLogger(__name__)
 
 
 class SourceSnapshotPublicationError(RuntimeError):
-    """Managed source publication failed before a provider could be created."""
+    """Managed source publication failed before a provider could be created.
+
+    The message is built only from fixed text and `SourcePublicationStepError`'s safe step label
+    and category, so it may be persisted as the run's public `error`.
+    """
 
     plane_fault = True
+
+
+# Deferred publication (see `_submit_prepared_job`) keeps retrying for this long before failing
+# the queued run; it never outlives the run's own wall deadline.
+SOURCE_PUBLICATION_LAUNCH_DEADLINE_S = 900.0
+_SOURCE_PUBLICATION_LAUNCH_BACKOFF_S = (10.0, 30.0, 60.0, 120.0)
+
+
+def _publication_log_detail(exc: BaseException) -> str:
+    """Server-log detail: step, status and cause type, then the sanitized message."""
+    step_error = exc if isinstance(exc, provider_worker.SourcePublicationStepError) else None
+    prefix = ""
+    if step_error is not None:
+        prefix = (
+            f"step={step_error.step} status={step_error.status_code} "
+            f"cause={step_error.cause_type}: "
+        )
+        exc = step_error.__cause__ or step_error
+    return prefix + sanitize_diagnostic(exc, limit=500)
+
+
+def _public_publication_error(exc: BaseException) -> SourceSnapshotPublicationError:
+    if isinstance(exc, provider_worker.SourcePublicationStepError):
+        return SourceSnapshotPublicationError(f"managed source publication failed: {exc}")
+    return SourceSnapshotPublicationError("managed source publication failed")
+
+
+def ensure_source_snapshot(
+    spec: JobSpec,
+    *,
+    deadline_at: float | None = None,
+    sleep=None,
+) -> dict:
+    """Return the run's persisted source descriptor, publishing it first if submit deferred it.
+
+    Called before any provider is allocated. Retries with backoff for up to
+    SOURCE_PUBLICATION_LAUNCH_DEADLINE_S (capped by `deadline_at`, the run's wall deadline), then
+    raises `SourceSnapshotPublicationError` so the queued run fails without spending GPU time.
+    """
+    existing = status_ops.source_snapshot_from_status(status_ops.get_status(spec.run_id))
+    if existing is not None:
+        return existing
+    # resolved per call (not as a default argument) so a patched clock is honoured.
+    sleep = sleep or time.sleep
+    stop = time.time() + SOURCE_PUBLICATION_LAUNCH_DEADLINE_S
+    if deadline_at is not None:
+        stop = min(stop, float(deadline_at))
+    attempt = 0
+    while True:
+        try:
+            descriptor = provider_worker.publish_source_snapshot(spec.train.hf_repo)
+        except Exception as exc:
+            logger.warning(
+                "deferred managed source publication failed for run %s (attempt %d): %s",
+                spec.run_id,
+                attempt + 1,
+                _publication_log_detail(exc),
+            )
+            remaining = stop - time.time()
+            if remaining <= 0:
+                raise _public_publication_error(exc) from None
+            delays = _SOURCE_PUBLICATION_LAUNCH_BACKOFF_S
+            sleep(min(delays[min(attempt, len(delays) - 1)], remaining))
+            attempt += 1
+            continue
+        return status_ops.record_source_snapshot(spec.run_id, descriptor)
 
 
 @dataclass(frozen=True)
@@ -306,20 +377,20 @@ def _submit_prepared_job(
     source_snapshot = None
     if not dry_run:
         # record the warm-start dependency on the source repo so artifact gc spares it while this
-        # child is around. source publication is also real-submit-only and completes before status
-        # persistence, so no provider can be created without a durable immutable descriptor.
+        # child is around. source publication is real-submit-only. it is attempted here (bounded
+        # by SOURCE_PUBLICATION_DEADLINE_S) so the common case persists the descriptor with the
+        # run; if Hugging Face is unavailable the run is persisted queued WITHOUT a descriptor and
+        # `ensure_source_snapshot` publishes it in `_run_job_inner`, before `_run_training`
+        # allocates any provider. no provider is ever created without a durable descriptor.
         preparation._mark_warmstart_source(worker_spec, public_spec.run_id)
         try:
             source_snapshot = provider_worker.publish_source_snapshot(worker_spec.train.hf_repo)
         except Exception as exc:
             logger.warning(
-                "managed source publication failed for run %s: %s",
+                "managed source publication failed for run %s; deferring to launch: %s",
                 public_spec.run_id,
-                sanitize_diagnostic(exc, limit=500),
+                _publication_log_detail(exc),
             )
-            raise SourceSnapshotPublicationError(
-                "managed source publication failed; retry the submission later"
-            ) from None
     # env ref->sha pin is deferred (background) or after status save (sync), never on creation path.
     # environment staging runs after status persistence and before provider allocation.
     status = state.RunStatus(

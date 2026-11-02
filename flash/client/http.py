@@ -105,6 +105,11 @@ ENV_LIST_SERVER_BUDGET_SECONDS = _ENV_LIST_GITHUB_READS * (
 )
 ENV_LIST_CLIENT_TIMEOUT_SECONDS = ENV_LIST_SERVER_BUDGET_SECONDS + 60.0
 ENV_LIST_MAX_RESPONSE_BYTES = 32 * 1024 * 1024
+# a real submit prepares the job server-side (model resolution, warm-start adapter checks,
+# environment pinning) and attempts managed source publication for up to 90s before replying.
+# the 60s client default timed out while the server was still working; a timed-out submit is
+# ambiguous (the run may exist), so give it a budget comfortably above the server's.
+SUBMIT_CLIENT_TIMEOUT_SECONDS = 600.0
 
 
 def freesolo_base_url(override: str | None = None) -> str:
@@ -610,7 +615,13 @@ class ApiClient:
             body["dry_run"] = True
         if client_train_schema is not None:
             body["client_train_schema"] = client_train_schema
-        return self._request("POST", "/v1/runs", body=body, require={"run_id": str})
+        return self._request(
+            "POST",
+            "/v1/runs",
+            body=body,
+            require={"run_id": str},
+            timeout=SUBMIT_CLIENT_TIMEOUT_SECONDS,
+        )
 
     def list_runs(self) -> list[dict]:
         return self._request("GET", "/v1/runs", require={"runs": [dict]})["runs"]

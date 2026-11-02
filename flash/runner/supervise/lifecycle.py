@@ -166,6 +166,11 @@ def _terminal_failure_detail(exc: BaseException) -> str:
     `RunStatus.error` is shown to the submitter, so an arbitrary exception's text is NOT safe to
     put there: it can carry internal storage paths, provider payloads, and upstream bodies. The
     """
+    from flash.runner.lifecycle.submit import SourceSnapshotPublicationError
+
+    if isinstance(exc, SourceSnapshotPublicationError):
+        # built only from fixed text plus a safe step label and category (see its docstring)
+        return str(exc)
     return f"{type(exc).__name__}: run failed"
 
 
@@ -189,6 +194,11 @@ def _run_job_inner(
         # here would
         # hash a half-planned spec no later integrity check can reproduce.
         deadline_at = _load_run_deadline_at(spec.run_id)
+        # submit persists the run without a source descriptor when Hugging Face was unavailable;
+        # publish it now, before staging or any provider allocation (no-op when already present).
+        from flash.runner.lifecycle.submit import ensure_source_snapshot
+
+        ensure_source_snapshot(spec, deadline_at=deadline_at)
         spec = stage_environment_package(spec, deadline_at=deadline_at)
         with open(log_path, "a") as log:
             _run_training(

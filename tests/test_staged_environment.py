@@ -143,11 +143,15 @@ def _disable_github(monkeypatch) -> None:
 
 
 def _prepared_status(public: JobSpec, worker: JobSpec, *, state: str = "provisioning"):
+    from tests._helpers.source_snapshot import valid_source_snapshot
 
     return runner_state.RunStatus(
         run_id=worker.run_id,
         state=state,
         spec=public.to_dict(),
+        # a submitted run carries its published source descriptor before any launch path runs
+        # (submit persists it, or `ensure_source_snapshot` does before staging).
+        source_snapshot=valid_source_snapshot(),
         effective_preparation={
             "worker_spec": worker.to_internal_dict(),
             "version": 1,
