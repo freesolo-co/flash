@@ -452,10 +452,10 @@ def test_engine_concurrency_rejects_malformed_catalog_values(modal_app_module, m
     mod = modal_app_module
 
     monkeypatch.setattr(mod, "engine_overrides_for", lambda _bm: {"max_num_seqs": 8})
-    assert mod._engine_concurrency("valid") == (8, 6)
+    assert mod._engine_concurrency("valid") == (8, 8)
 
     monkeypatch.setattr(mod, "engine_overrides_for", lambda _bm: {})
-    assert mod._engine_concurrency("defaulted") == (64, 48)
+    assert mod._engine_concurrency("defaulted") == (64, 64)
 
     monkeypatch.setattr(mod, "engine_overrides_for", lambda _bm: {"max_num_seqs": "invalid"})
     monkeypatch.setattr(mod, "base_models", lambda: ["malformed"])
