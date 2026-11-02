@@ -31,6 +31,7 @@ jobs:
       MODAL_TOKEN_ID: ${{ secrets.MODAL_TOKEN_ID }}
       MODAL_TOKEN_SECRET: ${{ secrets.MODAL_TOKEN_SECRET }}
       HF_TOKEN: ${{ secrets.HF_TOKEN }}
+      FLASH_ARTIFACT_BLOB_SAS_URL: ${{ secrets.FLASH_ARTIFACT_BLOB_SAS_URL_DEV }}
       FREESOLO_INTERNAL_KEY: ${{ secrets.FREESOLO_INTERNAL_KEY }}
       SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY_DEV }}
       SUPABASE_PROJECT_REF: ${{ secrets.SUPABASE_PROJECT_REF }}
@@ -122,7 +123,7 @@ jobs:
         run: |
           set -euo pipefail
           missing=""
-          for name in MODAL_TOKEN_ID MODAL_TOKEN_SECRET HF_TOKEN FREESOLO_INTERNAL_KEY SUPABASE_SERVICE_ROLE_KEY SUPABASE_PROJECT_REF SUPABASE_PROJECT_REF_DEV; do
+          for name in MODAL_TOKEN_ID MODAL_TOKEN_SECRET HF_TOKEN FLASH_ARTIFACT_BLOB_SAS_URL FREESOLO_INTERNAL_KEY SUPABASE_SERVICE_ROLE_KEY SUPABASE_PROJECT_REF SUPABASE_PROJECT_REF_DEV; do
             if [ -z "${!name}" ]; then
               missing="$missing $name"
             fi
