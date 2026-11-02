@@ -252,9 +252,9 @@ class _LoraEngineImpl(TextPromptTokenizer):
             raise RuntimeError("vLLM cannot confirm LoRA removal")
         result = remove(entry.lora_request.lora_int_id)
         if inspect.isawaitable(result):
-            result = await result
-        if result is False:
-            raise RuntimeError("vLLM rejected LoRA removal")
+            await result
+        # vLLM returns False when the adapter is already absent (e.g. CPU LRU eviction).
+        # Either boolean confirms absence; only an exception leaves removal uncertain.
         entries.pop(adapter_key)
 
     async def _add_lora_locked(self, record: Any, path: Path) -> None:
@@ -284,11 +284,14 @@ class _LoraEngineImpl(TextPromptTokenizer):
         local_dir = _adapter_source_cache_dir(ADAPTER_CACHE_DIR, record)
         subfolder = getattr(record, "subfolder", None)
         cached_path = _adapter_cache_path(local_dir, subfolder)
-        # Stale cached path (source changed) -> evict the old LoRA before re-downloading; check
-        # before local_path(), which clears the stale entry.
-        if self.registry.local_path_is_stale(record):
-            # eviction releases this adapter's single lifecycle entry after confirmed removal.
-            await self._evict_loaded_lora(record_key(record))
+        # Retry uncertain removal before reusing an ID, including when local files are current.
+        # Also evict a changed source before local_path() clears its stale path identity.
+        adapter_key = record_key(record)
+        entry = self._entries().get(adapter_key)
+        if (
+            entry is not None and entry.state == "unconfirmed"
+        ) or self.registry.local_path_is_stale(record):
+            await self._evict_loaded_lora(adapter_key)
         path = self.registry.local_path(record)
         if path is not None:
             _assert_source_cache_containment(local_dir, path)
