@@ -10,7 +10,9 @@ from fastapi import HTTPException
 
 logger = logging.getLogger(__name__)
 AUTHORIZATION_BUDGET_SECONDS = 20.0
-_ATTEMPTS = 2
+# Enough attempts to span the deadline even when a restarting proxy rejects immediately.
+# Two attempts exhausted in ~300ms, well before a healthy replacement could bind its port.
+_ATTEMPTS = 20
 _TRANSIENT_STATUS = {500, 502, 503, 504}
 _TRANSIENT_ERRORS = (httpx.TimeoutException, httpx.NetworkError, httpx.RemoteProtocolError)
 
@@ -51,7 +53,8 @@ async def post_authorization(client, url, *, api_key, model_id, scope):
                     int((time.monotonic() - started) * 1000),
                 )
                 if attempt < _ATTEMPTS:
-                    await asyncio.sleep(random.uniform(0.2, 0.4))
+                    delay = min(0.25 * 2 ** (attempt - 1), 2.0)
+                    await asyncio.sleep(delay * random.uniform(0.8, 1.2))
     except TimeoutError:
         logger.warning(
             "serving_auth_deadline_exceeded budget_seconds=%s", AUTHORIZATION_BUDGET_SECONDS

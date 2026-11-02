@@ -317,6 +317,16 @@ The one-off quantization job that produced them is not kept in this repo.
 - `POST /adapters/{model_id}/generate`
 - `POST /v1/chat/completions` where `model` is the adapter id
 
+### Authorization during deployments
+
+External base-model and checkpoint requests wait through transient authorization backend
+connection failures and HTTP 500/502/503/504 responses within a 20-second total budget.
+Retries use exponential backoff with jitter, capped at roughly two seconds between attempts.
+Only the authorization lookup is retried, before inference or usage capture; generation is
+not replayed. Explicit denials and quota responses return immediately, and no request is
+admitted without a successful authorization. Longer backend outages still return 503.
+This protects short backend restarts; it does not replace a healthy rolling backend deployment.
+
 ### Per-key rate limits
 
 An operator can assign one API key an independent RPM and total TPM allowance in
