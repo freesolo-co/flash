@@ -400,11 +400,11 @@ def test_failed_authorization_is_not_cached(modal_app_module, monkeypatch):
 
     from fastapi import HTTPException
 
-    # First lookup 500 (-> 503), second lookup 200: the failure must NOT be cached, so the second
+    # Both attempts fail 500 (-> 503), next lookup 200: the failure must NOT be cached, so the next
     # call re-checks the backend and succeeds (a transient blip doesn't poison the cache).
     calls = _counting_client(
         monkeypatch,
-        lambda n: _FakeResp(500, {}) if n == 1 else _FakeResp(200, {"orgId": "org-1"}),
+        lambda n: _FakeResp(500, {}) if n <= 2 else _FakeResp(200, {"orgId": "org-1"}),
     )
     authorize = _new_authorizer(modal_app_module)
 
@@ -416,7 +416,7 @@ def test_failed_authorization_is_not_cached(modal_app_module, monkeypatch):
 
     org = asyncio.run(run())
     assert org.principal.orgId == "org-1"
-    assert calls["n"] == 2
+    assert calls["n"] == 3
 
 
 _EMPTY_SCOPE_DIGEST = hashlib.sha256(b"").hexdigest()
@@ -641,3 +641,91 @@ def test_failed_background_refresh_evicts_allow_and_cannot_extend_ttl(
         await authorize.aclose()
 
     asyncio.run(run())
+
+
+def test_transient_refresh_retains_only_unexpired_approval(modal_app_module, monkeypatch):
+    import asyncio
+    import inspect
+    import time
+
+    from fastapi import HTTPException
+
+    from flash.serving.src.http import authorization_transport
+
+    monkeypatch.setattr(authorization_transport.random, "uniform", lambda *_: 0)
+    calls = _counting_client(
+        monkeypatch, lambda n: _FakeResp(200, {"orgId": "org-1"}) if n == 1 else _FakeResp(503, {})
+    )
+    authorize = _new_authorizer(modal_app_module)
+    closure = inspect.getclosurevars(authorize).nonlocals
+    cache = closure["_cache"]
+
+    async def run():
+        approved = await authorize("key", _QWEN)
+        key = next(iter(cache))
+        expiry = time.monotonic() + 5
+        cache[key] = (expiry, approved)
+        assert await authorize("key", _QWEN) == approved
+        task = inspect.getclosurevars(closure["refresh"]).nonlocals["_inflight"][key]
+        with pytest.raises(HTTPException):
+            await asyncio.shield(task)
+        assert cache[key] == (expiry, approved)
+        for _ in range(20):
+            assert await authorize("key", _QWEN) == approved
+        assert calls["n"] == 3  # one approval, two refresh attempts, then cooldown
+        cache[key] = (float("-inf"), approved)
+        with pytest.raises(HTTPException):
+            await authorize("key", _QWEN)
+        assert key not in cache
+        assert key not in closure["_refresh_after"]
+        await authorize.aclose()
+
+    asyncio.run(run())
+
+
+def test_concurrent_requests_share_the_transient_retry(modal_app_module, monkeypatch):
+    import asyncio
+
+    import httpx
+
+    from flash.serving.src.http import authorization_transport
+
+    monkeypatch.setattr(authorization_transport.random, "uniform", lambda *_: 0)
+    calls = _counting_client(
+        monkeypatch,
+        lambda n: (
+            httpx.ConnectError("DNS unavailable") if n == 1 else _FakeResp(200, {"orgId": "org-1"})
+        ),
+    )
+    authorize = _new_authorizer(modal_app_module)
+
+    async def run():
+        results = await asyncio.gather(*(authorize("key", _QWEN) for _ in range(50)))
+        assert all(r.principal.orgId == "org-1" for r in results)
+        await authorize.aclose()
+
+    asyncio.run(run())
+    assert calls["n"] == 2
+
+
+def test_retry_can_never_override_a_later_denial(modal_app_module, monkeypatch):
+    import asyncio
+
+    from fastapi import HTTPException
+
+    from flash.serving.src.http import authorization_transport
+
+    monkeypatch.setattr(authorization_transport.random, "uniform", lambda *_: 0)
+    calls = _counting_client(
+        monkeypatch, lambda n: _FakeResp(503, {}) if n == 1 else _FakeResp(403, {})
+    )
+    authorize = _new_authorizer(modal_app_module)
+
+    async def run():
+        with pytest.raises(HTTPException) as error:
+            await authorize("key", _QWEN)
+        assert error.value.status_code == 403
+        await authorize.aclose()
+
+    asyncio.run(run())
+    assert calls["n"] == 2

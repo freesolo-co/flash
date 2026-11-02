@@ -711,7 +711,11 @@ def _build_chat_authorizer(settings: Any) -> Any:
     import time
 
     import httpx
-    from fastapi import HTTPException, status
+
+    from flash.serving.src.http.authorization_transport import (
+        TransientAuthorizationError,
+        post_authorization,
+    )
 
     _client = httpx.AsyncClient(timeout=10.0, headers={"Authorization": f"Bearer {key}"})
 
@@ -720,43 +724,44 @@ def _build_chat_authorizer(settings: Any) -> Any:
     _cache: dict[tuple[str, str, str], tuple[float, AuthorizedTraffic]] = {}
     # In-flight single-flight tasks so concurrent identical misses share ONE backend call.
     _inflight: dict[tuple[str, str, str], asyncio.Task[AuthorizedTraffic]] = {}
+    _refresh_after: dict[tuple[str, str, str], float] = {}
 
     async def _authorize_backend(
         api_key: str, model_id: str, scope: "dict[str, str]"
     ) -> "AuthorizedTraffic":
-        try:
-            resp = await _client.post(
-                url,
-                json={"apiKey": api_key, "modelId": model_id},
-                # A training container authenticates with the platform internal key rather
-                # than a customer key, so the backend cannot resolve it via
-                # authenticate_api_key. It identifies the calling job from these headers and
-                # re-checks them against the live job row. Dropping them here is
-                # indistinguishable, to the backend, from a request that never had them: it
-                # refuses with missing_training_context and catalog sampling fails closed.
-                headers=scope or None,
-            )
-        except Exception as exc:  # backend unreachable -> fail closed, never serve unauthorized
-            raise HTTPException(
-                status.HTTP_503_SERVICE_UNAVAILABLE, "serving auth backend unreachable"
-            ) from exc
+        resp = await post_authorization(
+            _client, url, api_key=api_key, model_id=model_id, scope=scope
+        )
         return _authorize_response(resp, model_id, require_api_key_id=api_key.startswith("fslo_"))
 
     def _prune(now: float) -> None:
         for expired in [k for k, (exp, _) in _cache.items() if exp <= now]:
             _cache.pop(expired, None)
+            _refresh_after.pop(expired, None)
         if len(_cache) > _AUTH_CACHE_MAX_ENTRIES:
             n_drop = len(_cache) - _AUTH_CACHE_MAX_ENTRIES
             for k in sorted(_cache, key=lambda c: _cache[c][0])[:n_drop]:
                 _cache.pop(k, None)
+                _refresh_after.pop(k, None)
 
     async def _authorize_and_cache(
         ck: tuple[str, str, str], api_key: str, model_id: str, scope: "dict[str, str]"
     ) -> "AuthorizedTraffic":
         try:
             authorization = await _authorize_backend(api_key, model_id, scope)
+        except TransientAuthorizationError:
+            # Keep the original approval only until its existing expiry; never renew it on error.
+            cached = _cache.get(ck)
+            now = time.monotonic()
+            if cached is not None and cached[0] > now:
+                _refresh_after[ck] = min(cached[0], now + 1.0)
+            else:
+                _cache.pop(ck, None)
+                _refresh_after.pop(ck, None)
+            raise
         except BaseException:
             _cache.pop(ck, None)
+            _refresh_after.pop(ck, None)
             raise
         finally:
             # Drop the single-flight slot regardless of outcome so a failed lookup re-checks next
@@ -764,6 +769,7 @@ def _build_chat_authorizer(settings: Any) -> Any:
             _inflight.pop(ck, None)
         now = time.monotonic()
         # Cache the ALLOW only — reached iff _authorize_backend did not raise above.
+        _refresh_after.pop(ck, None)
         _cache[ck] = (now + _AUTH_CACHE_TTL_SECONDS, authorization)
         _prune(now)
         return authorization
@@ -799,11 +805,14 @@ def _build_chat_authorizer(settings: Any) -> Any:
         if cached is not None:
             if cached[0] > now:
                 # Refresh active keys before expiry, but never serve past the original TTL
-                # unless the backend has approved them again. Failures evict the old ALLOW.
-                if cached[0] - now <= _AUTH_CACHE_REFRESH_SECONDS:
+                # unless approved again. Denials evict immediately; transient failures do not.
+                if cached[0] - now <= _AUTH_CACHE_REFRESH_SECONDS and now >= _refresh_after.get(
+                    ck, 0
+                ):
                     refresh(ck, api_key, model_id, scope)
                 return cached[1]
             _cache.pop(ck, None)
+            _refresh_after.pop(ck, None)
         return await asyncio.shield(refresh(ck, api_key, model_id, scope))
 
     async def close():
