@@ -49,7 +49,7 @@ def state_references(directory, *, now):
         train = spec.get("train", {})
         repo = train.get("hf_repo")
         # Completed runs are read through checkpoints, not restarted with old worker code.
-        if record.get("state") in {"done", "failed", "cancelled", "dry_run"}:
+        if record.get("state") in {"done", "deployed", "failed", "cancelled", "dry_run"}:
             continue
         source_snapshot = record.get("source_snapshot") or {}
         add(repo, source_snapshot.get("revision"), source_snapshot.get("archive_path"))

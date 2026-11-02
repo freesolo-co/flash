@@ -65,7 +65,11 @@ jobs:
       MODAL_TOKEN_SECRET: ${{ secrets.MODAL_TOKEN_SECRET }}
       # runtime secrets forwarded into the serving app's Modal secret at deploy time.
       HF_TOKEN: ${{ secrets.HF_TOKEN }}
-      FLASH_ARTIFACT_BLOB_SAS_URL: ${{ secrets.FLASH_ARTIFACT_BLOB_SAS_URL }}
+      FLASH_ARTIFACT_BLOB_ACCOUNT_URL: https://freesoloenvs.blob.core.windows.net
+      FLASH_ARTIFACT_BLOB_CONTAINER: artifacts
+      AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+      AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+      AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
       FREESOLO_INTERNAL_KEY: ${{ secrets.FREESOLO_INTERNAL_KEY }}
       PLATFORM_BACKEND_URL: ${{ secrets.PLATFORM_BACKEND_URL }}
       SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
@@ -202,7 +206,7 @@ jobs:
           if [ -z "$SUPABASE_SERVICE_ROLE_KEY" ]; then
             missing="$missing SUPABASE_SERVICE_ROLE_KEY"
           fi
-          required="FLASH_ARTIFACT_BLOB_SAS_URL FREESOLO_INTERNAL_KEY PLATFORM_BACKEND_URL SERVING_CANARY_ORG_ID"
+          required="AZURE_TENANT_ID AZURE_CLIENT_ID AZURE_CLIENT_SECRET FREESOLO_INTERNAL_KEY PLATFORM_BACKEND_URL SERVING_CANARY_ORG_ID"
           for name in $required; do
             # indirect expansion: the secrets are exported into the env via the job-level `env:` block.
             if [ -z "${!name}" ]; then

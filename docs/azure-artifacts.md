@@ -29,8 +29,13 @@ deployment's artifact container, like the previous shared artifact write token;
 it is not a per-run authorization boundary. Environment subprocesses must retain
 the existing secret isolation. Do not share these containers with unrelated data.
 
-Hosted serving engines need separately provisioned **read-only** access using
-`FLASH_ARTIFACT_BLOB_SAS_URL`. Rotate that secret before its expiry and redeploy
+Hosted serving engines need separately provisioned **read-only** access. The
+hosted deployments use separate dev/prod service principals with `Storage Blob
+Data Reader` scoped to their artifact container, configured through `AZURE_TENANT_ID`,
+`AZURE_CLIENT_ID`, `AZURE_CLIENT_SECRET`, and the artifact account/container variables.
+They do not receive the controller identity or an account key. Azure SDK access tokens
+refresh automatically; rotate the client secret before its expiry. A read-only
+`FLASH_ARTIFACT_BLOB_SAS_URL` is also supported; rotate it before expiry and redeploy
 engines. For customer-owned serving, set the same variable locally; the launcher
 passes Azure and optional upstream `HF_TOKEN` credentials separately through its
 existing private descriptor transport. Upstream tokens never authorize Azure. Custom sessions use the controller’s

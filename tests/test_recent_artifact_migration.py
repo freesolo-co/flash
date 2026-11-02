@@ -162,7 +162,8 @@ def test_recent_heartbeat_does_not_hide_an_out_of_window_serving_pin():
         )
 
 
-def test_private_run_dependencies_use_effective_spec_and_skip_finished_runs(tmp_path):
+@pytest.mark.parametrize("terminal", ["done", "deployed", "failed", "cancelled", "dry_run"])
+def test_private_run_dependencies_use_effective_spec_and_skip_finished_runs(tmp_path, terminal):
     spec = {
         "train": {
             "hf_repo": REPO,
@@ -189,6 +190,6 @@ def test_private_run_dependencies_use_effective_spec_and_skip_finished_runs(tmp_
     references = state_references(tmp_path, now=NOW)
     assert {ref["revision"] for ref in references} == {"a" * 40, "b" * 40, "c" * 40}
     assert all(ref["path"] for ref in references)
-    record["state"] = "done"
+    record["state"] = terminal
     path.write_text(json.dumps(record))
     assert state_references(tmp_path, now=NOW) == []

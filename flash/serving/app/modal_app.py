@@ -81,7 +81,17 @@ if _validate_deploy_wiring and SERVING_DEPLOYMENT_MODE == "development":
     if not os.environ.get("HF_TOKEN", "").strip():
         missing.append("HF_TOKEN")
     if not os.environ.get("FLASH_ARTIFACT_BLOB_SAS_URL", "").strip():
-        missing.append("FLASH_ARTIFACT_BLOB_SAS_URL")
+        missing.extend(
+            name
+            for name in (
+                "FLASH_ARTIFACT_BLOB_ACCOUNT_URL",
+                "FLASH_ARTIFACT_BLOB_CONTAINER",
+                "AZURE_TENANT_ID",
+                "AZURE_CLIENT_ID",
+                "AZURE_CLIENT_SECRET",
+            )
+            if not os.environ.get(name, "").strip()
+        )
     if missing:
         raise ValueError(
             "development serving requires explicit environment wiring: " + ", ".join(missing)
@@ -161,10 +171,16 @@ TARGET_INPUTS = max(1, MAX_INPUTS * 3 // 4)
 
 # engines enable trust_remote_code, so their secret uses an allowlist: future credentials
 # default to staying router-only. engines hydrate adapter state per request from the router-forwarded
-# record; HF_TOKEN reads upstream weights and a read-only Azure SAS reads adapters.
+# record; HF_TOKEN reads upstream weights. Azure uses a read-only container SAS or a
+# dedicated service principal with Blob Data Reader scoped only to this artifact container.
 _ENGINE_SECRET_NAMES = (
     "HF_TOKEN",
     "FLASH_ARTIFACT_BLOB_SAS_URL",
+    "FLASH_ARTIFACT_BLOB_ACCOUNT_URL",
+    "FLASH_ARTIFACT_BLOB_CONTAINER",
+    "AZURE_TENANT_ID",
+    "AZURE_CLIENT_ID",
+    "AZURE_CLIENT_SECRET",
 )
 _RUNTIME_SECRET_NAMES = (
     *_ENGINE_SECRET_NAMES,
