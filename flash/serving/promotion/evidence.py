@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import math
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 _SHA_PATTERN = re.compile(r"^[0-9a-f]{40}$")
@@ -76,6 +76,9 @@ ACCOUNTING_UNSETTLED = "accounting_canary_unsettled"
 class PromotionVerdict:
     ok: bool
     reason: str = ""
+    # diagnostic only (e.g. the error behind an unreadable accounting snapshot); never compared, so
+    # verdicts stay equal by outcome and reason.
+    detail: str = field(default="", compare=False)
 
 
 PASS = PromotionVerdict(ok=True)
