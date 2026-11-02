@@ -340,6 +340,48 @@ def test_vllm_logprobs_rank_candidates_before_truncating(top_logprobs, candidate
     json.dumps(normalized, allow_nan=False)
 
 
+def _logprob_candidate(value, token):
+    return SimpleNamespace(logprob=value, decoded_token=token)
+
+
+def test_vllm_logprobs_drop_grammar_masked_alternatives():
+    # structured outputs mask forbidden tokens to -inf; with top_logprobs > 0 vllm can return
+    # them as alternatives. they must be dropped, not turn the request into a 500.
+    masked = float("-inf")
+    normalized = normalize_token_logprobs(
+        [10, 20],
+        [
+            {
+                10: _logprob_candidate(-0.05, "true"),
+                11: _logprob_candidate(-3.0, "false"),
+                12: _logprob_candidate(masked, "maybe"),
+                13: _logprob_candidate(masked, "{"),
+            },
+            {20: _logprob_candidate(0.0, '"'), 21: _logprob_candidate(masked, "x")},
+        ],
+        top_logprobs=5,
+    )
+    assert normalized is not None
+    assert [r["token"] for r in normalized[0]["top_logprobs"]] == ["true", "false"]
+    assert [r["token"] for r in normalized[1]["top_logprobs"]] == ['"']
+    json.dumps(normalized, allow_nan=False)  # the response stays valid strict JSON
+
+
+@pytest.mark.parametrize(
+    "candidates",
+    [
+        # a masked SELECTED token is still a malformed result
+        {10: _logprob_candidate(float("-inf"), "a"), 11: _logprob_candidate(-0.1, "b")},
+        # NaN and +inf are never grammar masking
+        {10: _logprob_candidate(-0.1, "a"), 11: _logprob_candidate(float("nan"), "b")},
+        {10: _logprob_candidate(-0.1, "a"), 11: _logprob_candidate(float("inf"), "b")},
+    ],
+)
+def test_vllm_logprobs_still_reject_non_finite_values_that_are_not_masking(candidates):
+    with pytest.raises(RuntimeNotReadyError, match="non-finite"):
+        normalize_token_logprobs([10], [candidates], top_logprobs=5)
+
+
 def test_buffered_response_preserves_indexed_choices_and_aggregate_usage():
     choices = tuple(
         GenerationChoice(
