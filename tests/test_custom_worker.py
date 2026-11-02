@@ -94,3 +94,25 @@ def test_warm_start_downloads_verified_source_before_loading_backend(monkeypatch
     assert calls == [("Qwen/Qwen3.5-0.8B", 32, 64, multimodal)]
     assert load.call_args.kwargs["init_adapter"] == "/tmp/evdl/source/adapter"
     assert load.call_args.kwargs["lora_rank"] == 32
+
+
+def test_warm_start_detects_the_source_adapters_module_layout(tmp_path):
+    import numpy as np
+    from safetensors.numpy import save_file
+
+    from flash.custom.backend import _uses_language_model_layout
+
+    for name, key, expected in (
+        (
+            "multimodal",
+            "base_model.model.model.language_model.layers.0.mlp.up_proj.lora_A.weight",
+            True,
+        ),
+        ("text", "base_model.model.model.layers.0.mlp.up_proj.lora_A.weight", False),
+    ):
+        adapter = tmp_path / name
+        adapter.mkdir()
+        save_file(
+            {key: np.zeros((2, 2), dtype=np.float32)}, str(adapter / "adapter_model.safetensors")
+        )
+        assert _uses_language_model_layout(adapter) is expected
