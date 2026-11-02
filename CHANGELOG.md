@@ -162,6 +162,10 @@ This file starts at 1.1.35. Earlier releases are not reconstructed here; use
 
 ### Fixed
 
+- Serving authorization retries now span short backend restarts within the existing 20-second
+  deadline, instead of returning 503 after two immediate connection/proxy failures. Explicit
+  authorization denials still return immediately; inference and billing are never replayed.
+
 - API-key verification bridges brief Freesolo identity-service outages. A key that verified
   successfully within the last 5 minutes is accepted when verification is unavailable (transport
   errors or 5xx), instead of failing the request with `503 Authentication service unavailable`.
