@@ -75,6 +75,7 @@ def _reference_for_environment_id(env_id: str) -> tuple[str, Any]:
 
 def is_staged_environment_transient_error(exc: BaseException) -> bool:
     """Classify timeout, connection, rate-limit, and server failures across clients."""
+    from flash.artifacts.errors import artifact_error_transience
     from flash.envs.meta.identity import GitHubTransientError
     from flash.envs.registry.azure import RegistryError
     from flash.providers.artifacts.channel import artifact_status_code
@@ -87,6 +88,9 @@ def is_staged_environment_transient_error(exc: BaseException) -> bool:
             return True
         if isinstance(current, (StagedEnvironmentTransientError, GitHubTransientError)):
             return True
+        transience = artifact_error_transience(current)
+        if transience is not None:
+            return transience
         status = artifact_status_code(current)
         if status == 429 or (status is not None and status >= 500):
             return True
