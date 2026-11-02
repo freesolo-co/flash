@@ -59,8 +59,20 @@ def cleanup_run(run_id: str) -> None:
         api.call(remove, timeout=api.TERMINATION_TIMEOUT_SECONDS)
 
 
-def _uploader_tags(handle):
-    return {
+# Training is finished and the GPU released by the time the CPU uploader runs, and the handoff
+# Volume keeps the committed checkpoint, so a failed upload is retried on a fresh uploader instead
+# of failing the run (`cpu_handoff` re-validates and re-uploads idempotently). Try 0 keeps the
+# original name and tags so uploads launched by an older control plane still reconcile.
+UPLOAD_TRIES = 3
+_UPLOAD_RETRY_DELAYS_S = (15.0, 60.0)
+
+
+class CheckpointUploadError(api.ModalApiError):
+    """Every CPU uploader try failed; the committed handoff Volume is preserved."""
+
+
+def _uploader_tags(handle, try_index: int = 0):
+    tags = {
         "flash_owner": "flash-training",
         "flash_run": handle.run_id,
         "flash_attempt": str(handle.attempt),
@@ -68,23 +80,27 @@ def _uploader_tags(handle):
         "flash_role": "checkpoint-upload",
         "flash_scope": handle.scope,
     }
+    if try_index:
+        tags["flash_upload_try"] = str(try_index)
+    return tags
 
 
-def _uploader_name(handle):
-    return "upload-" + handle.instance_id
+def _uploader_name(handle, try_index: int = 0):
+    name = "upload-" + handle.instance_id
+    return f"{name}-r{try_index}" if try_index else name
 
 
-async def _find_owned_uploader(modal, client, handle):
+async def _find_owned_uploader(modal, client, handle, try_index: int = 0):
     try:
         sandbox = await modal.Sandbox.from_name.aio(
             api.APP_NAME,
-            _uploader_name(handle),
+            _uploader_name(handle, try_index),
             environment_name=api.environment(),
             client=client,
         )
     except modal.exception.NotFoundError:
         return None
-    if await sandbox.get_tags.aio() != _uploader_tags(handle):
+    if await sandbox.get_tags.aio() != _uploader_tags(handle, try_index):
         raise UnreconciledCreateError("CPU uploader name belongs to another attempt")
     return sandbox
 
@@ -113,8 +129,16 @@ def finish(handle, spec, *, deadline_at):
         "PYTHONPATH": f"{MOUNT}/source",
     }
 
-    async def upload(modal, client):
-        sandbox = await _find_owned_uploader(modal, client, handle)
+    def uploader(try_index: int):
+        async def upload(modal, client):
+            await _run_uploader(modal, client, try_index)
+
+        return upload
+
+    async def _run_uploader(modal, client, try_index: int):
+        # a finished sandbox from an earlier try (or an earlier control plane) is not relaunched:
+        # its exit code is the result for that try.
+        sandbox = await _find_owned_uploader(modal, client, handle, try_index)
         if sandbox is None:
             app = await modal.App.lookup.aio(
                 api.APP_NAME,
@@ -134,8 +158,8 @@ def finish(handle, spec, *, deadline_at):
                     "-m",
                     "flash.engine.worker.io.cpu_handoff",
                     app=app,
-                    name=_uploader_name(handle),
-                    tags=_uploader_tags(handle),
+                    name=_uploader_name(handle, try_index),
+                    tags=_uploader_tags(handle, try_index),
                     image=modal.Image.from_registry(worker_image_for_gpu(handle.gpu)).pip_install(
                         "azure-storage-blob>=12.24,<13", "azure-identity>=1.19,<2"
                     ),
@@ -147,7 +171,7 @@ def finish(handle, spec, *, deadline_at):
                     client=client,
                 )
             except Exception:
-                sandbox = await _find_owned_uploader(modal, client, handle)
+                sandbox = await _find_owned_uploader(modal, client, handle, try_index)
                 if sandbox is None:
                     raise UnreconciledCreateError(
                         "CPU upload launch could not be reconciled"
@@ -156,10 +180,30 @@ def finish(handle, spec, *, deadline_at):
         if await sandbox.poll.aio() != 0:
             raise api.ModalApiError("CPU checkpoint upload failed; prior durable save is preserved")
 
-    api.call(upload, deadline_at=deadline_at, timeout=1900)
+    tries = 0
+    for try_index in range(UPLOAD_TRIES):
+        tries = try_index + 1
+        try:
+            api.call(uploader(try_index), deadline_at=deadline_at, timeout=1900)
+            break
+        except (api.ModalApiError, TimeoutError) as exc:
+            remaining = deadline_at - time.time()
+            if tries >= UPLOAD_TRIES or remaining <= 0:
+                raise CheckpointUploadError(
+                    f"CPU checkpoint upload failed after {tries} "
+                    f"{'try' if tries == 1 else 'tries'}; prior durable save is preserved"
+                ) from exc
+            time.sleep(
+                min(
+                    _UPLOAD_RETRY_DELAYS_S[min(try_index, len(_UPLOAD_RETRY_DELAYS_S) - 1)],
+                    remaining,
+                )
+            )
     seconds = time.time() - started
     return {
         "cpu_upload_wall_seconds": seconds,
+        "cpu_upload_tries": tries,
+        # tries run one after another, so wall time already covers every uploader
         "cpu_upload_cost_upper_estimate_usd": seconds
         / 3600
         * (4 * CPU_HOURLY + 8 * MEMORY_GIB_HOURLY),
@@ -170,11 +214,12 @@ def cleanup(handle):
     """Cancel an owned CPU child before deleting its per-attempt storage."""
 
     async def remove(modal, client):
-        sandbox = await _find_owned_uploader(modal, client, handle)
-        if sandbox is not None:
-            await sandbox.terminate.aio(wait=True)
-            if await sandbox.poll.aio() is None:
-                raise api.ModalApiError("CPU uploader termination was not confirmed")
+        for try_index in range(UPLOAD_TRIES):
+            sandbox = await _find_owned_uploader(modal, client, handle, try_index)
+            if sandbox is not None:
+                await sandbox.terminate.aio(wait=True)
+                if await sandbox.poll.aio() is None:
+                    raise api.ModalApiError("CPU uploader termination was not confirmed")
         with contextlib.suppress(modal.exception.NotFoundError):
             await modal.Volume.objects.delete.aio(
                 volume_name(handle.scope, handle.run_id, handle.attempt),

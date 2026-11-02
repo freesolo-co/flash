@@ -102,7 +102,7 @@ def _checkpoints_from_files(spec: JobSpec, files: list[str]) -> list[dict]:
     return out
 
 
-def list_checkpoints(spec: JobSpec) -> list[dict]:
+def list_checkpoints(spec: JobSpec, *, strict: bool = False) -> list[dict]:
     """Deployable per-step adapter snapshots for ``spec``, ascending by step.
 
     A step is included only if its adapter folder carries BOTH ``adapter_config.json`` AND a
@@ -110,8 +110,12 @@ def list_checkpoints(spec: JobSpec) -> list[dict]:
     entry: ``{"step", "adapter_prefix", "subfolder", "repo_id", "repo_type"}`` where
     ``adapter_prefix`` is the value to hand ``deploy_adapter`` to serve that exact step and
     ``subfolder`` is the full path of the adapter folder in the repo. Returns ``[]`` when the
-    run has no artifact namespace or no published snapshots (older runs, or none saved yet)."""
-    return _checkpoints_from_files(spec, _repo_files(spec, strict=False))
+    run has no artifact namespace or no published snapshots (older runs, or none saved yet).
+
+    ``strict=True`` raises ``CheckpointListingError`` when the artifact listing itself fails,
+    instead of reporting that failure as "no checkpoints". User-facing listing and deploy routes
+    use it so a transient store error is not shown as a run whose checkpoints are gone."""
+    return _checkpoints_from_files(spec, _repo_files(spec, strict=strict))
 
 
 def adapter_artifact_exists(

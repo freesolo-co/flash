@@ -430,7 +430,7 @@ def test_custom_cli_uses_hosted_auth_project_quote_and_run_lifecycle(
     assert effective.gpu.disk_gb > 60
     assert effective.train.hf_repo
     assert effective.gpu.network_volume
-    monkeypatch.setattr(checkpoints, "list_checkpoints", lambda spec: [{"step": 1}])
+    monkeypatch.setattr(checkpoints, "list_checkpoints", lambda spec, **_kwargs: [{"step": 1}])
     seen = {}
     monkeypatch.setattr(
         export,
