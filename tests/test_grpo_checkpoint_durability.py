@@ -252,7 +252,7 @@ def test_resume_uploader_uploads_each_completed_step(worker_context, tmp_path):
 
 
 def test_resume_uploader_skips_the_step_it_resumed_from(worker_context, tmp_path):
-    # that checkpoint is already durable on hf; re-uploading it wastes the upload slot.
+    # that checkpoint is already durable in Azure; re-uploading it wastes the upload slot.
     local_dir = tmp_path / "ckpt"
     local_dir.mkdir()
     seen = []

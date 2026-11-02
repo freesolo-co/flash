@@ -158,8 +158,8 @@ def _download_adapter(adapter_prefix: str | None, *, context: WorkerContext) -> 
                     "the prepared warm-start source adapter could not be downloaded"
                 ) from None
         else:
-            # a returned snapshot can still be incomplete: an interrupted transfer, or hf falling
-            # back to a partial local_dir when a throttled metadata call cannot confirm the file set.
+            # a returned snapshot can still be incomplete: an interrupted transfer can leave
+            # a partial local_dir, so validate both config and weights before accepting it.
             if _warmstart_adapter_is_loadable(adir):
                 return adir
         # discard partial local_dir materialization so the next attempt cannot reuse stale files.

@@ -225,7 +225,7 @@ def _run_artifacts_recently_used(
 
 def _collect_targets(api, live, whole, now: float, max_age_s: float) -> list[_RunTarget]:
     """Enumerate every ``flashrun-*`` repo and return the aged, unbound, non-warm-start-source run
-    prefixes to delete. Per-repo scan failures (HF rate-limit / transient) are skipped and logged, not
+    prefixes to delete. Per-repo scan failures (storage rate-limit / transient) are skipped and logged, not
     fatal — the sweep reaps what it could read and tries the rest next cycle."""
     repos = [
         d.id for d in api.list_datasets(author=artifact_namespace()) if _is_managed_env_repo(d.id)
@@ -316,8 +316,8 @@ def run_scheduled_cleanup(*, dry_run: bool = False, api=None, should_stop=None) 
         try:
             # Re-stat the prefix: its newest file may have been written since enumeration (a cross-plane
             # warm-start touch, a late checkpoint, a redeploy read-back). Do this FIRST — it is a slow
-            # recursive HF list — so the live-set re-confirm below is the LAST thing before the delete
-            # and its confirm->delete window is ~microseconds, not a full HF round-trip.
+            # recursive artifact list — so the live-set re-confirm below is the LAST thing before the delete
+            # and its confirm->delete window is ~microseconds, not a full storage round-trip.
             try:
                 if _run_artifacts_recently_used(api, target.repo_id, target.prefix, now, max_age_s):
                     logger.warning(

@@ -291,7 +291,7 @@ def _prepare_init_from_adapter_inner(
 
 
 def _mark_warmstart_source(worker_spec: JobSpec, child_run_id: str) -> None:
-    """Drop a 0-byte ``referenced_by/<child_run_id>`` marker into the warm-start SOURCE run's HF repo.
+    """Drop a 0-byte ``referenced_by/<child_run_id>`` marker into the warm-start SOURCE run's Azure artifact namespace.
 
     ``worker_spec`` is post-resolution, so its ``init_from_adapter`` is the internal
     ``<repo>:<phase>/<run_id>...`` storage ref whose repo is the source. Best-effort: a failed

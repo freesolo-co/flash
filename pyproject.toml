@@ -42,19 +42,15 @@ gpu = [
     "accelerate>=1.4",
     # resolve_verl_python uses uv when FLASH_VERL_PYTHON is not supplied.
     "uv>=0.5",
-    # Worker runtime: Freesolo environment loading and HF checkpoint I/O.
+    # Worker runtime: Freesolo environments and upstream model/tokenizer downloads.
     "datasets>=2.19",
     "freesolo>=0.4.2",
     "huggingface-hub>=1.2.0",
 ]
 # Operator dependencies stay out of the base CLI install. Modal runs the GPU workloads;
-# huggingface-hub handles source and artifact storage, and httpx connects serving clients.
-# huggingface-hub>=1.2.0:
-# 1.2.0+ adds built-in RateLimit-header-aware 429 retry for downloads (resolvers) and paginated Hub
-# API calls. Our outer _hf_call wrappers stay on top: the library does not retry the complete mutating
-# operations (create_commit / create_repo / update_repo_settings) and the wrappers also bound an
-# overall deadline. (>=0.34 was already required for upload_code()'s update_repo_settings(private=True);
-# 0.25.x only accepts `gated` and raises TypeError on `private`.)
+# Azure stores managed artifacts; huggingface-hub downloads upstream models/tokenizers and
+# supports explicit user exports. httpx connects serving clients. huggingface-hub>=1.2.0
+# provides RateLimit-header-aware retries for downloads and paginated model Hub API calls.
 # sft cost, dry-run, and submit statically read packaged rows plus the defined training contract.
 # environment.py is not imported; other environment prompt transformations remain estimate gaps.
 server = [

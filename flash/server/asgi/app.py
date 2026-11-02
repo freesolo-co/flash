@@ -157,7 +157,7 @@ class _LeaderWork:
         if _instance_providers_configured():
             self._spawn(_sweep_orphan_instances_loop())
         # periodic artifact gc: delete aged (>7d), undeployed run prefixes inside the per-environment
-        # hf repos (<artifact namespace>/flashrun-*) so old runs' checkpoints/adapters don't pile up
+        # Azure artifact namespaces (<artifact namespace>/flashrun-*) so old runs' checkpoints/adapters don't pile up
         # against the org's storage quota. only on a plane with an operator `hf_token` (it deletes
         # operator-owned repos); fails closed on any live-set uncertainty. see
         # flash.server.domain.ops.repo_cleanup.

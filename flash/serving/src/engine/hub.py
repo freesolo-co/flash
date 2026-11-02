@@ -30,7 +30,7 @@ def download_adapter(
             continue
         path = PurePosixPath(entry.path)
         if path.is_absolute() or ".." in path.parts or not path.is_relative_to(prefix):
-            raise ValueError("Hub returned a file outside the adapter directory")
+            raise ValueError("Azure artifact storage returned a file outside the adapter directory")
         target = Path(local_dir) / entry.path
         if not target.resolve().is_relative_to(Path(local_dir).resolve()):
             raise ValueError("adapter download escapes its exact-SHA source cache")
@@ -39,7 +39,7 @@ def download_adapter(
 
 
 def download_retry_delay(error: Exception, attempt: int) -> float:
-    """Honor Hub throttling within a bounded five-minute retry window."""
+    """Honor artifact-storage throttling within a bounded five-minute retry window."""
     fallback = 0.5 * (2**attempt)
     response = getattr(error, "response", None)
     if response is None or response.status_code != 429:

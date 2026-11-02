@@ -1,11 +1,11 @@
-"""List a run's deployable per-step training checkpoints from its HF artifact repo.
+"""List a run's deployable per-step training checkpoints from its Azure artifact namespace.
 
 The GPU worker publishes each trainer save's LoRA adapter to a stable, NON-pruned path
 (``<adapter_prefix>/checkpoints/step-<N>/adapter``; see
 ``flash.engine.worker.publish_deployable_checkpoint``). This module is the control-plane
 reader: it enumerates those snapshots so ``flash runs checkpoint`` can list them and
 ``flash models deploy <run-id>/step-N`` can serve a specific one — including for a run that was cancelled or
-failed mid-training and so never sealed a final adapter. HF (not the backend DB) is the source of
+failed mid-training and so never sealed a final adapter. Azure artifact storage (not the backend DB) is the source of
 truth for what's deployable; backend persistence is a mirror (see
 ``flash.server.domain.checkpoints``)."""
 
@@ -20,7 +20,7 @@ from flash.schema import parse_checkpoint_ref
 
 
 class CheckpointListingError(RuntimeError):
-    """Raised when checkpoint listing must be authoritative but HF cannot be queried."""
+    """Raised when checkpoint listing must be authoritative but Azure cannot be queried."""
 
 
 def checkpoint_adapter_prefix(spec: JobSpec, step: int) -> str:

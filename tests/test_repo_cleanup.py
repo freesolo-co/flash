@@ -1,5 +1,5 @@
 """The always-on artifact GC is CROSS-PLANE: it reaps a run's ``<phase>/<run_id>`` prefix inside the
-shared per-environment HF repo once it ages out and isn't in the GLOBAL serving set — never touching a
+logical Azure artifact namespace once it ages out and isn't in the GLOBAL serving set — never touching a
 deployed adapter (on any plane), a recently-written (in-flight) prefix, a warm-start source with a
 recent ``referenced_by`` marker, ``code/``/unknown dirs, or deleting blind when the serving registry
 can't be confirmed. These tests pin those invariants and the fixed 7-day policy."""
@@ -615,7 +615,7 @@ def test_cleanup_rechecks_durable_binding_created_on_another_plane(monkeypatch):
     class RegisteringApi(FakeApi):
         def list_repo_tree(self, **kwargs):
             if kwargs.get("path_in_repo"):
-                # Another plane binds a checkpoint during the slow pre-delete HF stat.
+                # Another plane binds a checkpoint during the slow pre-delete artifact stat.
                 # It is still disabled/loading and never enters this plane's ready router.
                 records.append({"repo_id": repo, "subfolder": "sft/flash-1-a/checkpoints/step-4"})
             return super().list_repo_tree(**kwargs)

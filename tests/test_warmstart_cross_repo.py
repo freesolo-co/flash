@@ -739,7 +739,7 @@ def test_effective_preparation_persists_but_is_not_public(monkeypatch, tmp_path)
     ],
 )
 def test_public_status_redacts_internal_storage_ref_on_valid_spec(stored_ref, expected_ref):
-    # A worker spec persists the internal storage locator (which embeds the private HF repo) as a
+    # A worker spec persists the internal storage locator (which embeds the private artifact namespace) as a
     # valid spec; the public status must rewrite it back to
     # the user-facing checkpoint ref instead of leaking the repo.
 

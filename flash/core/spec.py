@@ -349,7 +349,7 @@ class TrainSpec:
     # internal: immutable source dataset commit used for a prepared warm-start. parsed only from
     # control-plane jobspec payloads; the public config schema does not accept this key.
     init_from_adapter_revision: str = ""
-    # PLATFORM-MANAGED: control-plane-assigned HF artifact repo. Not a user config key: it has no
+    # PLATFORM-MANAGED: Azure artifact namespace. Not a user config key: it has no
     # ``introduced_in`` so it is absent from TRAIN_SCHEMA_KEYS and ``[train] hf_repo`` is rejected.
     # JobSpec.from_dict still round-trips the control-plane-assigned value; to_dict() omits it.
     # Legacy serialized spelling retained so existing preparation digests remain valid.

@@ -6,7 +6,7 @@ actually serve? Answering it separately let them drift -- customer-owned resolut
 config that hosted admission accepted, so the same artifact was refused before provisioning on one
 path and refused inside the paid container on the other.
 
-Every rule here is decidable from the config alone. Nothing in this module reads the hub, the
+Every rule here is decidable from the config alone. Nothing in this module reads artifact storage, the
 filesystem, or a provider, so a verdict costs a caller nothing beyond the bytes it already holds.
 That is why it sits beside the rank and target rules rather than under a deployment path: the
 GPU-side materializer revalidates a cache entry it already holds, and it needs the same verdict
@@ -44,7 +44,7 @@ class _DuplicateConfigKey(AdapterConfigError):
 def parse_declared_adapter_config(raw: bytes, *, source: str) -> DeclaredAdapterConfig:
     """read one adapter's declared provenance, or refuse the bytes.
 
-    ``source`` names the file in every message, so a caller that fetched the config from the hub and
+    ``source`` names the file in every message, so a caller that fetched the config from artifact storage and
     one that read it off disk both report a location the reader can go look at.
     """
 

@@ -68,7 +68,7 @@ _HB_THROTTLED_STAGES = _HB_TIGHT_LIVENESS_STAGES | frozenset({"rl_step", "sft_st
 # swallow it. the wrap that follows re-emits with liveness=True and stays throttled.
 _HB_MODEL_LOAD_STAGES = frozenset({"sft_model_load", "custom_model_load"})
 _HB_SUCCESS_TERMINAL_STAGES = frozenset({"done", "already_done"})
-# 600s -> ~6 commits/hr; keeps stall detector alive without hitting the HF commit cap.
+# 600s -> ~6 commits/hr; keeps the stall detector alive while bounding storage writes.
 _HB_TERMINAL_ONLY_INTERVAL_S = 600.0
 
 
@@ -99,22 +99,22 @@ def _is_critical_stage(stage: str) -> bool:
 
     `_failed` earns this as much as the `error_` prefix does: a failure heartbeat is emitted once, at
     the moment the failure is known, and nothing later restates it. `checkpoint_upload_failed` is
-    raised from inside a long HF upload, which is precisely when `_HB_UPLOAD_IN_FLIGHT` is set and an
+    raised from inside a long artifact upload, which is precisely when `_HB_UPLOAD_IN_FLIGHT` is set and an
     unforced ping is dropped -- so the one report of the failure would be discarded exactly in the
     case that produces it.
     """
     return _is_terminal_stage(stage) or stage.endswith("_failed")
 
 
-# Guards throttle bookkeeping; slow HF commit runs outside this lock so heartbeat and liveness
+# Guards throttle bookkeeping; slow artifact commit runs outside this lock so heartbeat and liveness
 # threads don't block on the network.
-# Serializes HF commits to prevent reorder; each thread uploads its own per-call temp file.
+# Serializes artifact commits to prevent reorder; each thread uploads its own per-call temp file.
 # Terminal/error commits wait longer — no later heartbeat can repair them.
 _HB_UPLOAD_LOCK_TIMEOUT_S = 30.0
 _HB_CRITICAL_UPLOAD_LOCK_TIMEOUT_S = 120.0
-# True while a thread holds _HB_UPLOAD_LOCK and is inside the HF commit. Read under _HB_LOCK.
+# True while a thread holds _HB_UPLOAD_LOCK and is inside the artifact commit. Read under _HB_LOCK.
 #
-# The throttle clock (_HB_LAST_UPLOAD) only advances AFTER a commit lands, so during a slow HF
+# The throttle clock (_HB_LAST_UPLOAD) only advances AFTER a commit lands, so during a slow artifact
 # commit every other throttled caller still computes upload_due=True, walks into
 # _HB_UPLOAD_LOCK.acquire() and blocks there for up to the acquire timeout -- 30s, or 120s on a
 # critical stage. That stalls the liveness daemon, and `liveness_heartbeat`'s join delays leaving
@@ -141,7 +141,7 @@ def _dump_thread_stacks(reason: str) -> None:
 def _console_heartbeat_snapshot(
     payload: dict, payload_committed: bool = True, upload_due: bool = False
 ) -> str:
-    """render one bounded console record with explicit hf commit state."""
+    """render one bounded console record with explicit artifact commit state."""
     console_payload = dict(payload)
     metrics_last = console_payload.pop("metrics_last", None)
     if isinstance(metrics_last, list):
@@ -155,7 +155,7 @@ def _console_heartbeat_snapshot(
 
 
 def _set_upload_in_flight(value: bool, *, context: WorkerContext) -> None:
-    """Mark whether an HF heartbeat commit is running. Call with _HB_LOCK held."""
+    """Mark whether an artifact heartbeat commit is running. Call with _HB_LOCK held."""
 
     context.heartbeat_state.upload_in_flight = value
 
@@ -248,7 +248,7 @@ def heartbeat(
             context.heartbeat_state.last_progress_ts = ts
             context.heartbeat_state.progress_seq += 1
         elif context.heartbeat_state.progress_seq > context.heartbeat_state.progress_uploaded_seq:
-            # carry real progress that has not reached hf yet.
+            # carry real progress that has not reached artifact storage yet.
             liveness = False
         latest_progress_ts = float(context.heartbeat_state.last_progress_ts or 0.0)
         my_progress_seq = context.heartbeat_state.progress_seq

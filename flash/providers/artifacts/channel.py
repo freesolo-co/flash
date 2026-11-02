@@ -135,7 +135,7 @@ def make_artifact_failure_detail_reader(
     *,
     deadline_at: float | None = None,
 ):
-    """Reader for worker-uploaded failure artifacts on HF (error/console txt); force-read after terminal failure."""
+    """Reader for worker-uploaded failure artifacts in Azure (error/console txt); force-read after terminal failure."""
     # Attempt-scoped to match the worker's error_artifact_name(mode, attempt).
     err_name = error_artifact_name(phase, attempt)
     live_console_name = attempt_scoped_artifact_name("console", phase, attempt)

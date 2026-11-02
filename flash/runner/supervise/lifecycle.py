@@ -146,7 +146,7 @@ def _run_attempts_supervised(
 ) -> dict:
     """Run one run's attempts with bounded auto-retry on infra-shaped failures.
 
-    Retries resume from the latest HF checkpoint on a fresh host. Genuine worker errors fail fast.
+    Retries resume from the latest Azure checkpoint on a fresh host. Genuine worker errors fail fast.
     ``attempt_start`` offsets persisted identities without expanding this invocation's retry budget.
     """
     from flash.runner.supervise.execution import run_attempts_supervised

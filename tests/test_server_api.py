@@ -1948,7 +1948,7 @@ def test_logs_offset_paging(api):
 
 
 def test_worker_output_route(api, monkeypatch):
-    # /worker surfaces the train-subprocess stdout/traceback from the run's HF repo (operator
+    # /worker surfaces the train-subprocess stdout/traceback from the run's artifact namespace (operator
     # token, server-side). Best-effort: no artifacts -> empty dict; present -> passed through.
 
     key = _new_user_token()
@@ -1957,7 +1957,7 @@ def test_worker_output_route(api, monkeypatch):
     ).json()["run_id"]
 
     # Stub _worker_artifacts to {} BEFORE the first request: the real impl would download_file from
-    # the run's HF repo (slow/flaky network in a unit test). This keeps the "no artifacts -> {}"
+    # the run's artifact namespace (slow/flaky network in a unit test). This keeps the "no artifacts -> {}"
     # assertion fully offline/deterministic.
     monkeypatch.setattr(server_runtime, "_worker_artifacts", lambda spec: {})
     empty = api.get(f"/v1/runs/{run_id}/worker", headers=_bearer(key)).json()
@@ -5848,7 +5848,7 @@ def test_recover_runs_blocks_expired_handleless_resubmit(monkeypatch, tmp_path):
 
 def test_recover_runs_defers_resubmit_when_instance_not_confirmed_reaped(monkeypatch, tmp_path):
     # an unconfirmed Vast delete may leave a live phantom. recovery must defer while
-    # ``run_instances_remaining`` reports it, or a second worker can write the same HF artifacts.
+    # ``run_instances_remaining`` reports it, or a second worker can write the same Azure artifacts.
     import flash.server.platform.db as db_mod
 
     monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
@@ -7709,8 +7709,8 @@ def test_export_copies_final_adapter_to_user_repo(api, monkeypatch):
 
     key = _new_user_token()
     run_id = _finished_run(api, key)
-    # The platform auto-assigns each run a per-run HF dataset repo under the OPERATOR's org, so
-    # only the control plane (operator token) can read the source. hf_repo is platform-managed and
+    # The platform auto-assigns each run a per-run Azure artifact namespace, so
+    # only the control plane (storage credentials) can read the source. hf_repo is platform-managed and
     # stripped from the public spec, so read it back from the internal worker-spec carrier.
     src_repo = runner_status.get_status(run_id).effective_preparation["worker_spec"]["train"][
         "hf_repo"

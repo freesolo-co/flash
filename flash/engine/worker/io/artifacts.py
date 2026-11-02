@@ -1,4 +1,4 @@
-"""hf artifact channel for code delivery, adapters, metrics, and checkpoints."""
+"""Azure artifact channel for code delivery, adapters, metrics, and checkpoints."""
 
 from __future__ import annotations
 
@@ -106,9 +106,9 @@ def _sleep_with_artifact_deadline(delay: float, *, context: WorkerContext) -> bo
 def _artifact_upload(
     do_upload, repo_subpath: str, required: bool, label: str, *, context: WorkerContext
 ) -> bool:
-    """HF upload loop: retries + raises on required artifacts; warn-only on optional.
+    """Artifact upload loop: retries + raises on required artifacts; warn-only on optional.
 
-    Returns True when a commit landed (or HF_REPO is unset), False on best-effort failure.
+    Returns True when a commit landed (or the artifact namespace is unset), False on best-effort failure.
     """
     if not context.config.hf_repo:
         return True
@@ -145,7 +145,7 @@ def _artifact_upload(
 def upload_artifact_file(
     local_path: str, repo_subpath: str, required: bool = False, *, context: WorkerContext
 ) -> bool:
-    """Upload one file to the run's HF prefix. Returns True on success (see ``_artifact_upload``)."""
+    """Upload one file to the run's artifact prefix. Returns True on success (see ``_artifact_upload``)."""
     return _artifact_upload(
         lambda: artifact_api().upload_file(
             path_or_fileobj=local_path,
@@ -177,7 +177,7 @@ def _resume_checkpoint_upload_slot(timeout_s: float | None = None, *, context: W
 def upload_artifact_folder(
     local_dir: str, repo_subpath: str, required: bool = False, *, context: WorkerContext
 ) -> bool:
-    """Upload a folder to the run's HF prefix. Returns True on success (see ``_artifact_upload``)."""
+    """Upload a folder to the run's artifact prefix. Returns True on success (see ``_artifact_upload``)."""
     return _artifact_upload(
         lambda: artifact_api().upload_folder(
             folder_path=local_dir,

@@ -18,6 +18,10 @@ This file starts at 1.1.35. Earlier releases are not reconstructed here; use
 
 ## Unreleased
 
+- Correct artifact diagnostics, generated training guidance, and internal documentation to name
+  Azure storage. Upstream model/tokenizer downloads and explicit Hugging Face exports remain
+  supported; legacy serialized storage-field names remain compatible.
+
 ### Removed
 
 - Removed built-in OPD completely: training workers, managed teacher API and ledger, configuration,
