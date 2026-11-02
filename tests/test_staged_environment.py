@@ -377,6 +377,69 @@ def test_missing_immutable_revision_is_terminal(monkeypatch, tmp_path) -> None:
         )
 
 
+@pytest.mark.parametrize("stage", ["manifest", "archive"])
+@pytest.mark.parametrize("wrapper", [None, "__cause__", "__context__"])
+@pytest.mark.parametrize(
+    ("failure_kind", "retriable"),
+    [
+        ("request", True),
+        ("response", True),
+        (408, True),
+        (409, True),
+        (412, True),
+        (429, True),
+        (503, True),
+        (400, False),
+        (401, False),
+        (403, False),
+        (404, False),
+    ],
+)
+def test_azure_hydration_failure_preserves_worker_retry_budget(
+    monkeypatch, tmp_path, stage, wrapper, failure_kind, retriable
+) -> None:
+    from azure.core.exceptions import HttpResponseError, ServiceRequestError, ServiceResponseError
+
+    from flash.envs.loading.staged import materialize_staged_environment
+
+    package, manifest, archive, manifest_path, archive_path = _staged_files(tmp_path)
+    if failure_kind == "request":
+        failure = ServiceRequestError("transport interrupted")
+    elif failure_kind == "response":
+        # no timeout/connection-named cause: the Azure type alone must be enough.
+        failure = ServiceResponseError("transport interrupted")
+    else:
+        failure = HttpResponseError("artifact request failed")
+        failure.status_code = failure_kind
+    if wrapper:
+        outer = RuntimeError("download failed")
+        setattr(outer, wrapper, failure)
+        failure = outer
+    calls = []
+    failed_path = manifest_path if stage == "manifest" else archive_path
+
+    def download(**kwargs):
+        filename = kwargs["filename"]
+        calls.append(filename)
+        if filename == failed_path:
+            raise failure
+        return {manifest_path: str(manifest), archive_path: str(archive)}[filename]
+
+    monkeypatch.setattr("flash.artifacts.api.download_file", download)
+    with pytest.raises(RuntimeError) as raised:
+        materialize_staged_environment(
+            _spec(package=package).environment,
+            hf_repo="owner/run-artifacts",
+        )
+    assert calls == ([manifest_path] if stage == "manifest" else [manifest_path, archive_path])
+    assert isinstance(raised.value, StagedEnvironmentTransientError) is retriable
+    assert raised.value.__cause__ is failure
+    assert worker_entry._worker_failure_flags(raised.value) == {
+        "retriable": retriable,
+        "oom": False,
+    }
+
+
 def test_worker_failure_boundary_marks_staged_transient_retriable() -> None:
     from flash.envs.meta.identity import GitHubUnavailableError
 

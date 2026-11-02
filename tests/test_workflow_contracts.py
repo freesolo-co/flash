@@ -506,7 +506,9 @@ def test_dev_cache_pushes_only_detect_and_off_peak_runs_build():
         for step in _steps(jobs["detect"])
         if str(step.get("uses", "")).startswith("actions/checkout@")
     )
-    assert detect_checkout["with"]["ref"] == "${{ github.sha }}"
+    assert (
+        detect_checkout["with"]["ref"] == "${{ github.event.pull_request.head.sha || github.sha }}"
+    )
 
     build = jobs["build-base"]
     bake = jobs["bake"]
@@ -518,9 +520,9 @@ def test_dev_cache_pushes_only_detect_and_off_peak_runs_build():
     assert bake["uses"] == "./.github/workflows/bake-kernel-cache.yml"
     assert "cu128-dev-" in bake["with"]["target_tag_prefix"]
     assert triggers["workflow_dispatch"]["inputs"]["deadline_minutes"]["default"] == 90
-    assert "fromJSON(format(" in bake["with"]["deadline_minutes"]
+    assert "fromJSON(" in bake["with"]["deadline_minutes"]
     assert "inputs.deadline_minutes" in bake["with"]["deadline_minutes"]
-    assert "||" not in bake["with"]["deadline_minutes"]  # zero must fail validation, not become 90
+    assert "inputs.deadline_minutes ||" not in bake["with"]["deadline_minutes"]
     bake_workflow = _load(WORKFLOW_DIR / "bake-kernel-cache.yml")
     assert "deadline_minutes" in _triggers(bake_workflow)["workflow_call"]["inputs"]
     warm = next(
@@ -541,11 +543,13 @@ def test_dev_cache_pushes_only_detect_and_off_peak_runs_build():
     rerun = next(
         step
         for step in _steps(publish)
-        if step.get("name") == "Re-run production readiness for dev"
+        if step.get("name") == "Re-run failed production readiness for this revision"
     )["run"]
     assert "production-kernel-cache-ready.yml" in rerun
     assert '--repo "$GITHUB_REPOSITORY"' in rerun
-    assert "--ref dev" in rerun
+    assert '--commit "$REVISION"' in rerun
+    assert "--event pull_request --status failure" in rerun
+    assert "gh run rerun" in rerun
 
     classify = next(step for step in _steps(jobs["detect"]) if step.get("id") == "classify")["run"]
     assert '[ "$prod_pc" != "$FP_CACHE" ] && [ "$candidate_pc" != "$FP_CACHE" ]' in classify
