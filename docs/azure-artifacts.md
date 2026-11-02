@@ -109,9 +109,9 @@ are unavailable through the new Flash runtime.
 The migration plan, copy, GPU qualification, and production deployment are
 separate operational steps. Adding this code does not perform those steps.
 
-Customer-owned `flash serve deploy` allocations are disabled until a rebuilt
-`Dockerfile.serve` image passes an Azure hydration and generation GPU canary. The
-existing certified digests contain the retired Hub hydrator and must never receive
-Azure credentials. After qualification, record the new digest in the relevant
-profile and `_AZURE_ARTIFACT_IMAGE_DIGESTS`. Dry runs remain available. This is a
-merge/rollout prerequisite for this draft migration, not a claim of live coverage.
+Customer-owned `flash serve deploy` accepts only image digests in
+`_AZURE_ARTIFACT_IMAGE_DIGESTS`. The Azure hydration and generation canary passed
+on a Modal L40S on 2026-11-02 for
+`ghcr.io/freesolo-co/freesolo-flash-serve@sha256:9dc811c3458f979ce2e020509ffbbe3e51364f551234df4c3139ef8e497192dc`.
+Model-specific image qualifications still apply independently. Older certified
+digests contain the retired Hub hydrator and must never receive Azure credentials.

@@ -22,10 +22,8 @@ MODAL_TOKEN_SECRET_ENV = "MODAL_TOKEN_SECRET"
 # the serving app authenticates callers with this. a provider endpoint url is public, so without
 # it anyone who finds the url can load adapters and spend the customer's gpu budget.
 INFERENCE_KEY_ENV = "FLASH_SERVING_KEY"
-# the container hydrates its adapter from the hub itself, so it needs the same read token the
-# control plane used to resolve that adapter. an artifact repo is private by default, and without
-# this the launcher reaches `_prepare_cache` with nothing to authenticate as and dies after the
-# provider has already created and started billing for every resource.
+# The container hydrates its private adapter from Azure using a read-only container SAS.
+# The optional upstream model token is a separate credential.
 ARTIFACT_TOKEN_ENV = "FLASH_ARTIFACT_BLOB_SAS_URL"
 
 

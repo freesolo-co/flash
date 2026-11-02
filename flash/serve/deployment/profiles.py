@@ -40,9 +40,11 @@ SERVE_RUNTIME_FAMILY = "vllm-0.23.0-pr42120"
 _CERTIFIED_MODAL_IMAGE_DIGEST = (
     "sha256:fc8ed231211562b3c67ca80ffbf7fb3e992aad6a42087a16c0dd26c1e249a758"
 )
-# Existing image qualifications predate Azure hydration. Populate only after a rebuilt
-# image passes the live adapter hydration/generation canary; never send a SAS to an old Hub client.
-_AZURE_ARTIFACT_IMAGE_DIGESTS: frozenset[str] = frozenset()
+# Azure hydration and generation passed on a Modal L40S with a native step-2 checkpoint
+# on 2026-11-02. Never send an Azure SAS to an older Hub-only image.
+_AZURE_ARTIFACT_IMAGE_DIGESTS: frozenset[str] = frozenset(
+    {"sha256:9dc811c3458f979ce2e020509ffbbe3e51364f551234df4c3139ef8e497192dc"}
+)
 
 
 class ProfileError(ValueError):
