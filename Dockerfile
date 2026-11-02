@@ -18,11 +18,9 @@
 FROM python:3.12-slim@sha256:2c941e860699f878900b0edc2403613c234d4b32eda3cc9fa7036991a2a63c4a
 
 WORKDIR /app
-COPY . .
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates git curl \
     && rm -rf /var/lib/apt/lists/*
-RUN pip install --no-cache-dir ".[server]"
 
 # Optional Infisical CLI, for deployments that pull secrets from a vault at container start
 # instead of receiving them as environment variables. OFF by default: a plain `docker build .`
@@ -66,6 +64,10 @@ RUN if [ "${INSTALL_INFISICAL}" = "true" ]; then \
         rm -rf /var/lib/apt/lists/*; \
         infisical --version; \
     fi
+
+# Source changes reuse the operating-system and optional Infisical layers.
+COPY . .
+RUN pip install --no-cache-dir ".[server]"
 
 VOLUME /root/.flash
 EXPOSE 8080
