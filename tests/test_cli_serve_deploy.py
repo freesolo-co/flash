@@ -16,7 +16,7 @@ from flash.serve.provisioning import InterruptedProvisioning
 
 DIGEST = "sha256:" + "a" * 64
 IMAGE = f"ghcr.io/freesolo-co/freesolo-flash-serve@{DIGEST}"
-CERTIFIED_DIGEST = "sha256:fc8ed231211562b3c67ca80ffbf7fb3e992aad6a42087a16c0dd26c1e249a758"
+CERTIFIED_DIGEST = "sha256:9dc811c3458f979ce2e020509ffbbe3e51364f551234df4c3139ef8e497192dc"
 CERTIFIED_IMAGE = f"ghcr.io/freesolo-co/freesolo-flash-serve@{CERTIFIED_DIGEST}"
 MODEL = "Qwen/Qwen3.5-9B"
 
@@ -960,5 +960,7 @@ def test_retired_hub_image_cannot_receive_azure_credentials(monkeypatch, capsys,
         pytest.fail("retired image reached artifact resolution or provider allocation")
 
     monkeypatch.setattr(serve_deploy, "_deployment_bundle", reject_resolution)
-    assert cmd_serve_deploy(_args(model=model, image=CERTIFIED_IMAGE)) == 1
-    assert "pending Azure artifact image qualification" in capsys.readouterr().err
+    retired_image = "ghcr.io/freesolo-co/freesolo-flash-serve@sha256:fc8ed231211562b3c67ca80ffbf7fb3e992aad6a42087a16c0dd26c1e249a758"
+    assert cmd_serve_deploy(_args(model=model, image=retired_image)) == 1
+    expected = "pending Azure artifact image qualification" if model == MODEL else "qualified only"
+    assert expected in capsys.readouterr().err
