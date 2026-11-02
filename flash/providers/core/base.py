@@ -596,7 +596,9 @@ class JobHandle:
 class PollResult:
     ok: bool
     metrics: dict | None = None
-    # failure: job_failed, oom, job_preempted, no_capacity, stalled, or poll_error.
+    # failure: job_failed, oom, job_preempted, no_capacity, stalled, poll_error, or
+    # checkpoint_upload_failed (training finished; the final CPU checkpoint upload failed after
+    # its own retries, and the committed handoff is preserved).
     failure: str | None = None
     detail: str | None = None
 

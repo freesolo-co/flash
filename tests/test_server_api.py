@@ -5241,7 +5241,7 @@ def test_deploy_missing_run_level_adapter_points_at_checkpoint_steps(api, monkey
 
     monkeypatch.setattr(serving_deploy, "deploy_adapter", boom)
     monkeypatch.setattr(
-        run_checkpoints, "list_checkpoints", lambda spec: [{"step": 10}, {"step": 40}]
+        run_checkpoints, "list_checkpoints", lambda spec, **_kwargs: [{"step": 10}, {"step": 40}]
     )
 
     resp = api.post(
@@ -5270,7 +5270,7 @@ def test_deploy_missing_adapter_without_checkpoints_stays_502(api, monkeypatch):
         raise AdapterConfigMissing("could not verify adapter rank: failed to read org/repo:x")
 
     monkeypatch.setattr(serving_deploy, "deploy_adapter", boom)
-    monkeypatch.setattr(run_checkpoints, "list_checkpoints", lambda spec: [])
+    monkeypatch.setattr(run_checkpoints, "list_checkpoints", lambda spec, **_kwargs: [])
 
     resp = api.post(
         f"/v1/runs/{run_id}/deploy", json={"checkpoint_id": f"{run_id}/final"}, headers=_bearer(key)
@@ -7336,7 +7336,7 @@ def _make_run(api, key, state):
 
 def test_list_checkpoints_endpoint(api, monkeypatch):
 
-    monkeypatch.setattr(run_checkpoints, "list_checkpoints", lambda spec: _FAKE_CKPTS)
+    monkeypatch.setattr(run_checkpoints, "list_checkpoints", lambda spec, **_kwargs: _FAKE_CKPTS)
     key = _new_user_token()
     run_id = _make_run(api, key, "done")
     r = api.get(f"/v1/runs/{run_id}/checkpoints", headers=_bearer(key))
@@ -7344,9 +7344,38 @@ def test_list_checkpoints_endpoint(api, monkeypatch):
     assert [c["step"] for c in r.json()["checkpoints"]] == [40, 80]
 
 
+def _failing_listing(spec, *, strict=False):
+    if strict:
+        raise run_checkpoints.CheckpointListingError("artifact store unavailable")
+    return []
+
+
+def test_list_checkpoints_endpoint_reports_listing_failure_not_empty(api, monkeypatch):
+    # a transient artifact-store error must not read as "this run has no checkpoints".
+    monkeypatch.setattr(run_checkpoints, "list_checkpoints", _failing_listing)
+    key = _new_user_token()
+    run_id = _make_run(api, key, "failed")
+    r = api.get(f"/v1/runs/{run_id}/checkpoints", headers=_bearer(key))
+    assert r.status_code == 503, r.text
+    assert "retry" in r.json()["detail"]
+
+
+def test_deploy_checkpoint_reports_listing_failure_not_missing_step(api, monkeypatch):
+    monkeypatch.setattr(run_checkpoints, "list_checkpoints", _failing_listing)
+    key = _new_user_token()
+    run_id = _make_run(api, key, "done")
+    r = api.post(
+        f"/v1/runs/{run_id}/deploy",
+        json={"checkpoint_id": f"{run_id}/step-40"},
+        headers=_bearer(key),
+    )
+    assert r.status_code == 503, r.text
+    assert "available: none" not in r.text
+
+
 def test_deploy_specific_checkpoint_of_finished_run(api, monkeypatch):
 
-    monkeypatch.setattr(run_checkpoints, "list_checkpoints", lambda spec: _FAKE_CKPTS)
+    monkeypatch.setattr(run_checkpoints, "list_checkpoints", lambda spec, **_kwargs: _FAKE_CKPTS)
     captured = {}
     key = _new_user_token()
     run_id = _make_run(api, key, "done")
@@ -7385,7 +7414,7 @@ def test_deploy_specific_checkpoint_of_finished_run(api, monkeypatch):
 def test_deploy_checkpoint_of_cancelled_run_keeps_terminal_state(api, monkeypatch):
     """The headline fix: a run cancelled mid-RL can deploy a checkpoint, and stays `cancelled`."""
 
-    monkeypatch.setattr(run_checkpoints, "list_checkpoints", lambda spec: _FAKE_CKPTS)
+    monkeypatch.setattr(run_checkpoints, "list_checkpoints", lambda spec, **_kwargs: _FAKE_CKPTS)
 
     key = _new_user_token()
     run_id = _make_run(api, key, "cancelled")
@@ -7423,7 +7452,7 @@ def test_deploy_checkpoint_of_cancelled_run_keeps_terminal_state(api, monkeypatc
 def test_deploy_checkpoint_ignores_run_state_once_step_exists(api, monkeypatch, state):
     """A resolved checkpoint step proves the adapter exists, so run state does not gate serving it."""
 
-    monkeypatch.setattr(run_checkpoints, "list_checkpoints", lambda spec: _FAKE_CKPTS)
+    monkeypatch.setattr(run_checkpoints, "list_checkpoints", lambda spec, **_kwargs: _FAKE_CKPTS)
 
     key = _new_user_token()
     run_id = _make_run(api, key, state)
@@ -7459,7 +7488,7 @@ def test_deploy_checkpoint_ignores_run_state_once_step_exists(api, monkeypatch, 
 
 def test_deploy_checkpoint_promotes_if_run_finishes_during_registration(api, monkeypatch):
 
-    monkeypatch.setattr(run_checkpoints, "list_checkpoints", lambda spec: _FAKE_CKPTS)
+    monkeypatch.setattr(run_checkpoints, "list_checkpoints", lambda spec, **_kwargs: _FAKE_CKPTS)
     key = _new_user_token()
     run_id = _make_run(api, key, "running")
     revision = f"{run_id}/step-40"
@@ -7495,7 +7524,7 @@ def test_deploy_checkpoint_promotes_if_run_finishes_during_registration(api, mon
 
 def test_deploy_checkpoint_preserves_final_deploy_that_wins_cas(api, monkeypatch):
 
-    monkeypatch.setattr(run_checkpoints, "list_checkpoints", lambda spec: _FAKE_CKPTS)
+    monkeypatch.setattr(run_checkpoints, "list_checkpoints", lambda spec, **_kwargs: _FAKE_CKPTS)
     undeploys = []
     monkeypatch.setattr(
         serving_deploy, "undeploy_adapter", lambda run_id, **_: undeploys.append(run_id)
@@ -7530,7 +7559,7 @@ def test_deploy_checkpoint_preserves_final_deploy_that_wins_cas(api, monkeypatch
 
 def test_deploy_checkpoint_of_dry_run_run_is_409(api, monkeypatch):
 
-    monkeypatch.setattr(run_checkpoints, "list_checkpoints", lambda spec: _FAKE_CKPTS)
+    monkeypatch.setattr(run_checkpoints, "list_checkpoints", lambda spec, **_kwargs: _FAKE_CKPTS)
     monkeypatch.setattr(
         serving_deploy,
         "deploy_adapter",
@@ -7550,7 +7579,7 @@ def test_deploy_checkpoint_of_dry_run_run_is_409(api, monkeypatch):
 
 def test_undeploy_checkpoint_of_running_run_keeps_training_state(api, monkeypatch):
 
-    monkeypatch.setattr(run_checkpoints, "list_checkpoints", lambda spec: _FAKE_CKPTS)
+    monkeypatch.setattr(run_checkpoints, "list_checkpoints", lambda spec, **_kwargs: _FAKE_CKPTS)
     monkeypatch.setattr(
         serving_deploy, "deploy_adapter", lambda **k: _FakeDeployment(k["adapter_prefix"])
     )
@@ -7587,7 +7616,7 @@ def test_deploy_cancelled_run_without_step_is_409(api):
 
 def test_deploy_unknown_step_is_404_with_available(api, monkeypatch):
 
-    monkeypatch.setattr(run_checkpoints, "list_checkpoints", lambda spec: _FAKE_CKPTS)
+    monkeypatch.setattr(run_checkpoints, "list_checkpoints", lambda spec, **_kwargs: _FAKE_CKPTS)
     key = _new_user_token()
     run_id = _make_run(api, key, "done")
     r = api.post(
@@ -7603,7 +7632,7 @@ def test_deploy_rejects_non_integer_step(api, monkeypatch):
     """A bool (True->1) or non-integer step must be rejected, not silently coerced. An all-digit string
     over Python's 4300-digit int()-conversion limit must also be a clean 400, not int()->uncaught 500."""
 
-    monkeypatch.setattr(run_checkpoints, "list_checkpoints", lambda spec: _FAKE_CKPTS)
+    monkeypatch.setattr(run_checkpoints, "list_checkpoints", lambda spec, **_kwargs: _FAKE_CKPTS)
     key = _new_user_token()
     run_id = _make_run(api, key, "done")
     for bad in (True, 40.9, "40.9", "1" * 5000):
@@ -8082,7 +8111,7 @@ def test_export_step_targets_the_checkpoint_adapter(api, monkeypatch):
     monkeypatch.setattr(
         run_checkpoints,
         "list_checkpoints",
-        lambda spec: [
+        lambda spec, **_kwargs: [
             {
                 "step": 40,
                 "subfolder": f"rl/{run_id}/checkpoints/step-40/adapter",
