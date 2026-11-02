@@ -115,7 +115,7 @@ def _index_shard_names(names: set[str], suffix: str) -> set[str]:
 
 
 # The largest attempt identity any artifact name may carry. An attempt number reaches a filename and
-# an HF path, so it is bounded rather than merely nonnegative: an unbounded int would still format,
+# an artifact path, so it is bounded rather than merely nonnegative: an unbounded int would still format,
 # and the resulting name is the one thing a later reader has to match exactly.
 MAX_ATTEMPT_ID = (1 << 63) - 1
 

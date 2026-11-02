@@ -16,7 +16,7 @@ router = APIRouter()
 
 
 # NOTE: must stay `async def`. Sync (`def`) route handlers share one CapacityLimiter (default 40
-# tokens); when slow sync handlers (chat->Modal, auth/billing/HF calls) saturate it under upstream
+# tokens); when slow sync handlers (chat->Modal, auth/billing/artifact calls) saturate it under upstream
 # degradation, a sync health handler gets queued and its Docker HEALTHCHECK times out -> container
 # marked unhealthy -> 502, even though the process is fine.
 @router.get("/v1/health")

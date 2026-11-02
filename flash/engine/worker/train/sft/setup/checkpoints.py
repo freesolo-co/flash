@@ -137,7 +137,7 @@ class _VerlCheckpointWatcher:
         self._thread = threading.Thread(target=self._run, daemon=True)
 
     def start(self) -> None:
-        # Resumed steps already verified on HF must release the child's retention gate too.
+        # Resumed steps already verified in Azure must release the child's retention gate too.
         for step in self.lifecycle.deployable_published_steps:
             self._acknowledge_publication(step)
         self._thread.start()

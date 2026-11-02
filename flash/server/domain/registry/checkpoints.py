@@ -84,7 +84,7 @@ def register_checkpoints_best_effort(status, *, log=None) -> int:
 
     token = internal_key()  # already whitespace-stripped; None when unset/blank
     if not token:
-        return 0  # local/dev control plane: HF still has the checkpoints
+        return 0  # local/dev control plane: Azure still has the checkpoints
     try:
         # run_id + hf_repo are platform-managed and stripped from the public spec; read the
         # authoritative values from the internal worker-spec carrier (see _internal_spec_from_status).
@@ -96,7 +96,7 @@ def register_checkpoints_best_effort(status, *, log=None) -> int:
         return 0
     if not run_org_id(status):
         # Internal/operator run with no org attribution: nothing to scope the rows to. Skip
-        # quietly BEFORE the HF listing — Azure stays the source of truth — so an expected-skip run
+        # quietly BEFORE the artifact listing — Azure stays the source of truth — so an expected-skip run
         # does no unnecessary network work and emits no `[ckpt] list warn` noise.
         return 0
     checkpoints = list_checkpoints(spec)

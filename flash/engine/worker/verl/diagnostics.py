@@ -471,7 +471,7 @@ def collect_ray_failure_logs(
     which holds the actual cause -- lives on the pod and goes away with it. that makes a raylet
     failure undiagnosable from uploaded artifacts and costs a paid gpu run per guess (VERL-115). one
     string rather than a directory of copies: the caller writes it exactly like the traceback
-    artifact beside it, so a dying pod does one upload instead of six against the same bounded hf
+    artifact beside it, so a dying pod does one upload instead of six against the same bounded artifact
     deadline allowance, and there is no staging directory whose only purpose is to be uploaded.
     """
     session = latest_ray_session_dir(root, started_after=started_after)

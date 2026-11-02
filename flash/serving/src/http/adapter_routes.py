@@ -40,7 +40,7 @@ adapter_router = APIRouter(tags=["adapters"])
 @adapter_router.get("/adapters")
 async def list_adapters(request: Request) -> dict[str, Any]:
     # Gate the listing behind the internal key, same as register/teardown. Even with org_id
-    # excluded from the schema, repo_id + url still leak the adapter->tenant mapping and HF
+    # excluded from the schema, repo_id + url still leak the adapter->tenant mapping and artifact
     # namespaces to anon callers. Internal consumers (backend/deployment) already send
     # X-Freesolo-Internal-Key, so this preserves their access while blocking enumeration.
     context = ServingContext.of(request)

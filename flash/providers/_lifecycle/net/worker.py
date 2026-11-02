@@ -238,7 +238,7 @@ def _ensure_private_artifact_repo(
             f"create artifact repo {repo}",
             deadline_at=deadline_at,
         )
-    # create_repo(exist_ok=True) won't flip an existing public repo private; force it explicitly.
+    # assert the private-only storage contract, including namespaces that already existed.
     _artifact_call(
         lambda: api.update_repo_settings(repo_id=repo, repo_type="dataset", private=True),
         f"force artifact repo private {repo}",

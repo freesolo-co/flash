@@ -94,7 +94,7 @@ def _run_worker_mode(*, context: WorkerContext) -> None:
                 "already_done", gpu=worker_perf.gpu_diagnostics(), context=context
             )
             # DONE is written only AFTER metrics.json uploads (required=True), so a failed read here
-            # is a transient HF blip, never a missing file. Retry, then signal RETRIABLE (reschedule)
+            # is a transient artifact read failure, never a missing file. Retry, then signal RETRIABLE (reschedule)
             # rather than SystemExit — a BaseException that bypasses the retriable-stamping handler
             # below and would report a genuinely-succeeded run as a fatal failure.
             last_err: Exception | None = None
@@ -129,7 +129,7 @@ def _run_worker_mode(*, context: WorkerContext) -> None:
             error_kind = type(last_err).__name__ if last_err is not None else "unknown error"
             raise worker_perf.RetriableInfraError(
                 "DONE present but metrics.json unreadable after retries "
-                f"(transient HF; {error_kind})"
+                f"(transient artifact read; {error_kind})"
             )
     # these setups run in the parent; verl trains in FLASH_VERL_PYTHON.
     # only _force_fla_triton_gdn_on_sm100 propagates through FLA_* env vars. the install and the
@@ -159,7 +159,7 @@ def _run_worker_mode(*, context: WorkerContext) -> None:
         handler()
     finally:
         context.close()
-    # hard-exit: colocated vllm can deadlock on nccl/cuda teardown; all artifacts are already on hf.
+    # hard-exit: colocated vllm can deadlock on nccl/cuda teardown; all artifacts are already in Azure.
     sys.stdout.flush()
     sys.stderr.flush()
     os._exit(0)
