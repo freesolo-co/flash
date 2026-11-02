@@ -13,10 +13,34 @@ from flash.engine.worker.io import hf
 from flash.engine.worker.io.heartbeat import heartbeat, liveness_heartbeat
 
 
+def _custom_targeting(model_id):
+    """Custom runs adapt only text modules; a warm-start source must have the same modality."""
+    from flash.core.catalog import supports_image_training
+
+    if not supports_image_training(model_id):
+        return None
+    from flash.adapters.targets import resolve_lora_targeting
+
+    return resolve_lora_targeting(model_id, algorithm="custom", multimodal=False)
+
+
 def run(*, context):
     spec = context.config.spec
     heartbeat("custom_model_load", context=context)
     with liveness_heartbeat("custom_model_load", context=context):
+        init_adapter = None
+        if spec.train.init_from_adapter:
+            from flash.engine.worker.train.entry.sft_train import _warmstart_adapter_path
+
+            # downloads the prepared source and checks its rank, alpha, modules and base model.
+            init_adapter = _warmstart_adapter_path(
+                spec.model,
+                spec.model_revision,
+                spec.train.lora_rank,
+                spec.train.lora_alpha,
+                _custom_targeting(spec.model),
+                context=context,
+            )
         backend = load_backend(
             spec.model,
             revision=spec.model_revision,
@@ -25,6 +49,7 @@ def run(*, context):
             seed=spec.seed,
             checkpoint_dir="/tmp/flash-custom-checkpoints",
             max_tokens=spec.train.max_context_tokens,
+            init_adapter=init_adapter,
         )
     checkpoints = RunCheckpoints(context)
     backend.checkpoints = checkpoints

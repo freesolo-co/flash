@@ -10,6 +10,7 @@ TRAIN_KEYS = {
     "lora_alpha",
     "save_every",
     "save_at_steps",
+    "init_from_adapter",
 }
 TRAIN_DEFAULTS = {"max_steps": 1000, "max_context_tokens": 2048, "lora_rank": 16, "save_every": 10}
 CUSTOM_KEYS = {"file", "resume_from", "idle_seconds", "max_wall_seconds", "controller_id"}
@@ -70,3 +71,8 @@ def validate_custom_spec(spec):
         integer(spec.train.save_every, "train.save_every", 1, 1_000_000)
     except ValueError as exc:
         raise ConfigError(str(exc)) from exc
+    if spec.train.init_from_adapter and spec.custom.get("resume_from"):
+        raise ConfigError(
+            "train.init_from_adapter starts fresh optimizer state from any adapter; "
+            "custom.resume_from continues a custom checkpoint. Set only one"
+        )
