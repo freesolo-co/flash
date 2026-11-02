@@ -23,7 +23,9 @@ def _evaluate(expression, **context):
     expression = expression.replace("&&", " and ").replace("||", " or ")
     expression = re.sub(r"!(?!=)", " not ", expression)
     return eval(
-        expression, {"__builtins__": {}, "fromJSON": json.loads, "format": str.format}, context
+        f"({expression})",
+        {"__builtins__": {}, "fromJSON": json.loads, "format": str.format},
+        context,
     )
 
 
@@ -63,6 +65,10 @@ def test_only_trusted_nondraft_promotions_enter_candidate_workflow(
         )
         is allowed
     )
+    group = WORKFLOW["concurrency"]["group"].removeprefix("dev-kernel-cache-")
+    assert _evaluate(group, github=_github(event, repo=head_repo, head=head, draft=draft)) == (
+        "build" if allowed and event in {"workflow_dispatch", "pull_request"} else "detect"
+    )
 
 
 @pytest.mark.parametrize("event", ["push", "workflow_dispatch", "pull_request"])
@@ -82,7 +88,8 @@ def test_metadata_push_cannot_displace_a_queued_bake():
     group = WORKFLOW["concurrency"]["group"].removeprefix("dev-kernel-cache-")
     assert WORKFLOW["concurrency"]["cancel-in-progress"] is False
     assert _evaluate(group, github=_github("push")) == "detect"
-    for event in ("workflow_dispatch", "pull_request", "schedule"):
+    assert _evaluate(group, github=_github("schedule")) == "detect"
+    for event in ("workflow_dispatch", "pull_request"):
         assert _evaluate(group, github=_github(event)) == "build"
 
 
@@ -106,7 +113,9 @@ def test_promotion_has_bounded_deadline_without_masking_invalid_manual_zero(
 @pytest.mark.parametrize("run_ids", ["", "123\n456\n"])
 def test_ready_publication_retries_failed_pr_checks_for_exact_baked_revision(tmp_path, run_ids):
     step = next(
-        step for step in JOBS["publish-ready"]["steps"] if step.get("name", "").startswith("Re-run")
+        step
+        for step in JOBS["refresh-readiness"]["steps"]
+        if step.get("name", "").startswith("Re-run")
     )
     assert step["env"]["REVISION"] == "${{ needs.detect.outputs.revision }}"
     gh = tmp_path / "gh"
@@ -156,3 +165,38 @@ def test_ready_publication_retries_failed_pr_checks_for_exact_baked_revision(tmp
         ["run", "rerun", run_id, "--repo", "freesolo-co/flash", "--failed"]
         for run_id in run_ids.split()
     ]
+
+
+@pytest.mark.parametrize("event", ["pull_request", "workflow_dispatch", "push"])
+@pytest.mark.parametrize(
+    ("detected", "missing", "published", "cancelled", "refresh"),
+    [
+        ("success", "true", "success", False, True),
+        # B was queued behind A; A has now published a compatible cache for B.
+        ("success", "false", "skipped", False, True),
+        ("success", "true", "failure", False, False),
+        ("success", "true", "skipped", False, False),
+        ("failure", "false", "skipped", False, False),
+        ("skipped", "false", "skipped", False, False),
+        ("success", "false", "skipped", True, False),
+    ],
+)
+def test_readiness_refresh_handles_queued_cache_hits_and_failed_dependencies(
+    event, detected, missing, published, cancelled, refresh
+):
+    class Needs(SimpleNamespace):
+        def __getitem__(self, key):
+            return getattr(self, key)
+
+    job = JOBS["refresh-readiness"]
+    assert job["needs"] == ["detect", "publish-ready"]
+    assert _evaluate(
+        job["if"],
+        github=_github(event),
+        needs=Needs(
+            detect=SimpleNamespace(result=detected, outputs=SimpleNamespace(needs_bake=missing)),
+            **{"publish-ready": SimpleNamespace(result=published)},
+        ),
+        always=lambda: True,
+        cancelled=lambda: cancelled,
+    ) is (refresh and event != "push")

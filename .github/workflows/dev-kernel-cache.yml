@@ -35,8 +35,15 @@ permissions:
   packages: write
 
 concurrency:
-  # a metadata-only push must not replace a queued promotion bake in the pending slot.
-  group: dev-kernel-cache-${{ github.event_name == 'push' && 'detect' || 'build' }}
+  # metadata pushes and rejected PRs must not replace a queued bake in the pending slot.
+  group: >-
+    dev-kernel-cache-${{
+      (github.event_name == 'workflow_dispatch' ||
+       (github.event_name == 'pull_request' &&
+        github.event.pull_request.head.repo.full_name == github.repository &&
+        github.event.pull_request.head.ref == 'dev' && !github.event.pull_request.draft))
+      && 'build' || 'detect'
+    }}
   cancel-in-progress: false
 
 jobs:
@@ -220,6 +227,17 @@ jobs:
               "$repo:cu128-dev-ready-$sm"
           done
 
+  refresh-readiness:
+    needs: [detect, publish-ready]
+    # a queued revision may find compatible caches published by the preceding bake.
+    # always() permits the skipped publication dependency; failed/cancelled work stays red.
+    if: >-
+      always() && !cancelled() && needs.detect.result == 'success' &&
+      (github.event_name == 'workflow_dispatch' || github.event_name == 'pull_request') &&
+      (needs.detect.outputs.needs_bake == 'false' || needs['publish-ready'].result == 'success')
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
       - name: Re-run failed production readiness for this revision
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

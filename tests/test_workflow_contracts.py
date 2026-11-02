@@ -542,7 +542,7 @@ def test_dev_cache_pushes_only_detect_and_off_peak_runs_build():
     assert script.index("candidate validation failed") < script.index("crane copy")
     rerun = next(
         step
-        for step in _steps(publish)
+        for step in _steps(jobs["refresh-readiness"])
         if step.get("name") == "Re-run failed production readiness for this revision"
     )["run"]
     assert "production-kernel-cache-ready.yml" in rerun
