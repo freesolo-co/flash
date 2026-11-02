@@ -117,8 +117,7 @@ def test_cleanup_covers_input_upload_and_never_overrides_result(
     import sys
     from types import SimpleNamespace
 
-    import huggingface_hub
-
+    from flash.artifacts import api as artifact_api
     from flash.providers.modal import api
 
     bake = bake_module()
@@ -131,9 +130,7 @@ def test_cleanup_covers_input_upload_and_never_overrides_result(
 
     hf = SimpleNamespace(
         create_repo=lambda **kw: None,
-        update_repo_settings=lambda **kw: None,
         upload_folder=lambda **kw: None,
-        delete_repo=delete,
     )
 
     def upload(**kwargs):
@@ -141,8 +138,12 @@ def test_cleanup_covers_input_upload_and_never_overrides_result(
             raise RuntimeError("input upload outage")
 
     hf.upload_folder = upload
-    monkeypatch.setattr(huggingface_hub, "HfApi", lambda **kw: hf)
-    monkeypatch.setenv("HF_TOKEN", "test")
+    monkeypatch.setattr(artifact_api, "ArtifactStore", lambda **kw: hf)
+    monkeypatch.setattr(
+        "flash.artifacts.config.runtime_environment",
+        lambda: {"FLASH_ARTIFACT_BLOB_SAS_URL": "test-sas"},
+    )
+    monkeypatch.setattr(bake, "_delete_artifacts", lambda repo: delete(repo_id=repo))
     monkeypatch.setattr(api, "call", lambda *a, **kw: None)
     monkeypatch.setattr(bake, "_status_present", lambda *a, **kw: True)
     monkeypatch.setattr(bake, "_verify", lambda *a: 0)
@@ -159,7 +160,7 @@ def test_cleanup_covers_input_upload_and_never_overrides_result(
             entry.size = len(b"old image log")
             archive.addfile(entry, io.BytesIO(b"old image log"))
 
-    monkeypatch.setattr(huggingface_hub, "snapshot_download", download)
+    monkeypatch.setattr(artifact_api, "download_snapshot", download)
     monkeypatch.setattr(
         sys,
         "argv",
@@ -191,15 +192,20 @@ def test_failed_sandbox_preserves_exit_diagnostic_and_cleans_up(monkeypatch, ret
     from types import SimpleNamespace
     from unittest.mock import AsyncMock, Mock
 
-    import huggingface_hub
-
+    from flash.artifacts import api as artifact_api
     from flash.providers.modal import api
 
     bake = bake_module()
-    hf = SimpleNamespace(delete_repo=Mock())
-    monkeypatch.setattr(huggingface_hub, "HfApi", lambda **kw: hf)
+    hf = SimpleNamespace()
+    delete = Mock()
+    monkeypatch.setattr(bake, "_delete_artifacts", delete)
+    monkeypatch.setattr(bake, "_bake_image", lambda *args: "bake-image")
+    monkeypatch.setattr(artifact_api, "ArtifactStore", lambda **kw: hf)
+    monkeypatch.setattr(
+        "flash.artifacts.config.runtime_environment",
+        lambda: {"FLASH_ARTIFACT_BLOB_SAS_URL": "test-sas"},
+    )
     monkeypatch.setattr(bake, "_upload_flash_code", lambda *args: None)
-    monkeypatch.setenv("HF_TOKEN", "test")
     monkeypatch.setattr(api, "credentials", lambda: ("test-id", "test-secret"))
     monkeypatch.setattr(api, "call", call_modal)
     monkeypatch.setattr(
@@ -238,7 +244,7 @@ def test_failed_sandbox_preserves_exit_diagnostic_and_cleans_up(monkeypatch, ret
     assert create.call_args.kwargs["memory"] == (32768, 131072)
     sandbox.terminate.aio.assert_awaited_once_with(wait=True)
     client.__aexit__.assert_awaited_once_with(None, None, None)
-    hf.delete_repo.assert_called_once()
+    delete.assert_called_once()
 
 
 @pytest.mark.parametrize("name", ["../escape", "/absolute"])

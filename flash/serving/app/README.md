@@ -120,7 +120,7 @@ workflow runs `python -m flash.serving.promotion.gate`, which must prove all thr
    and no undelivered row at or beyond the 360-second stall threshold.
 
 Exact-head binding comes from steps 1 and 2 together. The router proves its identity, and then that
-same router serves a real generation; engines receive only `HF_TOKEN` and cannot report a release
+same router serves a real generation; engines receive only upstream-model and Azure artifact credentials and cannot report a release
 sha, and `engine_replica_id` is stripped from public bodies, so the response itself cannot carry it.
 
 Step 3 calls `serving_promotion_accounting_snapshot` with the canary's organization, correlation ID,

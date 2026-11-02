@@ -264,3 +264,22 @@ def test_supplied_sas_cannot_redirect_development_to_production(monkeypatch):
     with pytest.raises(ValueError, match="destination does not match") as error:
         runtime_environment()
     assert "sig=secret" not in str(error.value)
+
+
+def test_namespace_initialization_preserves_existing_head(azure):
+    _, client, _ = azure
+    empty = client.create_repo(REPO).oid
+    assert client.repo_info(REPO).sha == empty
+    updated = upload(client, "checkpoint", b"weights")
+    assert client.create_repo(REPO).oid == updated
+    assert client.list_repo_files(REPO) == ["checkpoint"]
+
+
+def test_namespace_initialization_rejects_public_container(azure, monkeypatch):
+    container, client, _ = azure
+    monkeypatch.setattr(
+        container, "get_container_properties", lambda: SimpleNamespace(public_access="blob")
+    )
+    with pytest.raises(ValueError, match="public access"):
+        client.create_repo(REPO)
+    assert not container.blobs

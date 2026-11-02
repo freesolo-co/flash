@@ -1,0 +1,17 @@
+{
+  "window": {
+    "cutoff": "2026-10-30T04:33:53.792845+00:00",
+    "end": "2026-11-02T04:33:53.792845+00:00"
+  },
+  "container": "artifacts",
+  "snapshots": 629,
+  "repositories": 423,
+  "manifest_file_entries": 29321,
+  "verified_distinct_objects": 11159,
+  "verified_distinct_bytes": 601802167791,
+  "errors": 0,
+  "aliases_manifests_heads_read_back": true,
+  "unreferenced_staging_objects_removed": 673,
+  "unreferenced_staging_bytes_removed": 41242800594,
+  "source_hugging_face_data_deleted": false
+}

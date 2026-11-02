@@ -10,12 +10,9 @@ name: flash worker kernel-cache (per-arch)
 # Depends on the base ghcr.io/freesolo-co/flash-worker:cu128 image existing (worker-image.yml) — the
 # warmup runs INSIDE it so the cache matches the image's pinned torch/triton/fla/liger toolchain.
 #
-# Secrets: MODAL_TOKEN_ID + MODAL_TOKEN_SECRET (the warmup GPU sandbox) + HF_TOKEN (the temp dataset that ferries code + the
-# cache artifact) are native repo Actions secrets, synced from Infisical (prod:/flash-ci) by the
-# github-ci-flash Secret Sync; the GHCR push uses the default GITHUB_TOKEN. Heavy + paid,
-# but UNGATED: the fingerprint detection in auto-rebake.yml decides WHEN this runs (only on a real
-# kernel-toolchain change), so there is no manual approval step. Invoked by hand (workflow_dispatch)
-# OR automatically by auto-rebake.yml (workflow_call) when the kernel toolchain changed.
+# Modal credentials launch the warmup sandbox. A dedicated Azure build identity writes
+# only the build-artifacts container and issues bounded sandbox SAS credentials.
+# GHCR publication uses GITHUB_TOKEN. Automatic invocation remains fingerprint-gated.
 
 on:
   workflow_dispatch:
@@ -218,21 +215,21 @@ jobs:
           # marks the whole job red even though the bake + push already succeeded.
           enable-cache: false
 
-      - name: Sync deps (flash + modal + hf)
+      - name: Sync deps (flash + modal + Azure)
         if: steps.gate.outputs.run == 'true'
         run: uv sync --extra server
 
-      # MODAL_TOKEN_ID + MODAL_TOKEN_SECRET (the warmup GPU sandbox) + HF_TOKEN (the temp dataset that ferries code/cache) are
-      # native repo Actions secrets, synced from Infisical (prod:/flash-ci) by the github-ci-flash
-      # Secret Sync. No Infisical CLI/login at job time -- Infisical stays the source of truth and
-      # rotations propagate via the sync. BASE_IMAGE
-      # is digest-pinned so the warm runs inside the EXACT base the per-arch tag will sit on.
+      # The digest-pinned base keeps the warmup toolchain identical to the published image.
       - name: Warm kernels on a Modal ${{ matrix.sm }} GPU -> build/kernel_cache
         if: steps.gate.outputs.run == 'true'
         env:
           MODAL_TOKEN_ID: ${{ secrets.MODAL_TOKEN_ID }}
           MODAL_TOKEN_SECRET: ${{ secrets.MODAL_TOKEN_SECRET }}
-          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          FLASH_ARTIFACT_BLOB_ACCOUNT_URL: https://freesoloenvs.blob.core.windows.net
+          FLASH_ARTIFACT_BLOB_CONTAINER: build-artifacts
+          AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+          AZURE_CLIENT_ID: ${{ secrets.AZURE_BUILD_CLIENT_ID }}
+          AZURE_CLIENT_SECRET: ${{ secrets.AZURE_BUILD_CLIENT_SECRET }}
           BASE_IMAGE: ${{ steps.base.outputs.ref }}
           BAKE_DEADLINE_MINUTES: ${{ inputs.deadline_minutes }}
         run: |

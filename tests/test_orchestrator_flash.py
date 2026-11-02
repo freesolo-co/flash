@@ -151,17 +151,19 @@ def test_source_publication_failure_is_generic_at_submission_and_api_boundary(mo
     assert "managed source publication failed" in caplog.text
 
 
-def _install_snapshot_hub(monkeypatch, api_type, download):
+def _install_snapshot_artifacts(monkeypatch, api_type, download):
     import sys
     import types
 
-    fake_hub = types.ModuleType("flash.artifacts.api")
-    fake_hub.ArtifactStore = api_type
-    fake_hub.download_file = download
-    monkeypatch.setitem(sys.modules, "flash.artifacts.api", fake_hub)
+    fake_artifacts = types.ModuleType("flash.artifacts.api")
+    fake_artifacts.ArtifactStore = api_type
+    fake_artifacts.download_file = download
+    monkeypatch.setitem(sys.modules, "flash.artifacts.api", fake_artifacts)
 
 
-def test_publish_source_snapshot_forces_private_and_captures_commit(monkeypatch, tmp_path):
+def test_publish_source_snapshot_ensures_private_namespace_and_captures_commit(
+    monkeypatch, tmp_path
+):
     import hashlib
     import types
 
@@ -170,7 +172,7 @@ def test_publish_source_snapshot_forces_private_and_captures_commit(monkeypatch,
     archive = b"deterministic-source-archive"
     archive_file = tmp_path / "archive.zip"
     archive_file.write_bytes(archive)
-    calls = {"info": 0, "settings": [], "upload": []}
+    calls = {"info": 0, "create": [], "upload": []}
 
     class _Missing(Exception):
         response = types.SimpleNamespace(status_code=404)
@@ -183,8 +185,8 @@ def test_publish_source_snapshot_forces_private_and_captures_commit(monkeypatch,
             calls["info"] += 1
             return types.SimpleNamespace(sha="1" * 40, private=False)
 
-        def update_repo_settings(self, **kwargs):
-            calls["settings"].append(kwargs)
+        def create_repo(self, repo, **kwargs):
+            calls["create"].append(kwargs)
 
         def upload_file(self, **kwargs):
             calls["upload"].append(kwargs)
@@ -196,7 +198,7 @@ def test_publish_source_snapshot_forces_private_and_captures_commit(monkeypatch,
         assert revision == "c" * 40
         return str(archive_file)
 
-    _install_snapshot_hub(monkeypatch, _Api, download)
+    _install_snapshot_artifacts(monkeypatch, _Api, download)
     monkeypatch.setattr("flash.snapshot.archive.build_source_archive", lambda **_kwargs: archive)
     monkeypatch.setattr(
         "flash.snapshot.archive.read_verified_archive", lambda data, _desc: {"ok": data}
@@ -206,7 +208,7 @@ def test_publish_source_snapshot_forces_private_and_captures_commit(monkeypatch,
 
     assert descriptor["sha256"] == hashlib.sha256(archive).hexdigest()
     assert descriptor["revision"] == "c" * 40
-    assert calls["settings"][0]["private"] is True
+    assert calls["create"][0]["private"] is True
     assert len(calls["upload"]) == 1
     assert calls["upload"][0]["path_in_repo"] == descriptor["archive_path"]
 
@@ -219,12 +221,7 @@ def test_publish_source_snapshot_creates_missing_repo(monkeypatch, tmp_path):
     archive = b"archive"
     archive_file = tmp_path / "archive.zip"
     archive_file.write_bytes(archive)
-    calls = {"info": 0, "create": [], "settings": []}
-
-    class _RepositoryNotFoundError(Exception):
-        pass
-
-    _RepositoryNotFoundError.__name__ = "RepositoryNotFoundError"
+    calls = {"info": 0, "create": []}
 
     class _MissingEntry(Exception):
         response = types.SimpleNamespace(status_code=404)
@@ -235,15 +232,10 @@ def test_publish_source_snapshot_creates_missing_repo(monkeypatch, tmp_path):
 
         def repo_info(self, **kwargs):
             calls["info"] += 1
-            if calls["info"] == 1:
-                raise _RepositoryNotFoundError("missing")
             return types.SimpleNamespace(sha="1" * 40, private=True)
 
         def create_repo(self, repo, **kwargs):
             calls["create"].append((repo, kwargs))
-
-        def update_repo_settings(self, **kwargs):
-            calls["settings"].append(kwargs)
 
         def upload_file(self, **_kwargs):
             return types.SimpleNamespace(oid="c" * 40)
@@ -253,16 +245,13 @@ def test_publish_source_snapshot_creates_missing_repo(monkeypatch, tmp_path):
             raise _MissingEntry("absent")
         return str(archive_file)
 
-    _install_snapshot_hub(monkeypatch, _Api, download)
+    _install_snapshot_artifacts(monkeypatch, _Api, download)
     monkeypatch.setattr("flash.snapshot.archive.build_source_archive", lambda **_kwargs: archive)
     monkeypatch.setattr("flash.snapshot.archive.read_verified_archive", lambda *_args: {})
 
     worker.publish_source_snapshot("owner/new-env-artifacts")
 
-    assert calls["create"] == [
-        ("owner/new-env-artifacts", {"repo_type": "dataset", "exist_ok": True, "private": True})
-    ]
-    assert calls["settings"][0]["private"] is True
+    assert calls["create"] == [("owner/new-env-artifacts", {"exist_ok": True, "private": True})]
 
 
 def test_artifact_call_honors_retry_after(monkeypatch):
@@ -342,7 +331,7 @@ def test_publish_source_snapshot_reuses_verified_archive_at_exact_head(monkeypat
         def repo_info(self, **_kwargs):
             return types.SimpleNamespace(sha="d" * 40, private=True)
 
-        def update_repo_settings(self, **_kwargs):
+        def create_repo(self, repo, **_kwargs):
             pass
 
         def upload_file(self, **_kwargs):
@@ -353,7 +342,7 @@ def test_publish_source_snapshot_reuses_verified_archive_at_exact_head(monkeypat
         calls["downloads"].append(kwargs)
         return str(archive_file)
 
-    _install_snapshot_hub(monkeypatch, _Api, download)
+    _install_snapshot_artifacts(monkeypatch, _Api, download)
     monkeypatch.setattr("flash.snapshot.archive.build_source_archive", lambda **_kwargs: archive)
     monkeypatch.setattr("flash.snapshot.archive.read_verified_archive", lambda *_args: {})
 
@@ -384,7 +373,7 @@ def test_publish_source_snapshot_rereads_concurrent_winner(monkeypatch, tmp_path
         def repo_info(self, **_kwargs):
             return types.SimpleNamespace(sha=next(heads), private=True)
 
-        def update_repo_settings(self, **_kwargs):
+        def create_repo(self, repo, **_kwargs):
             pass
 
         def upload_file(self, **_kwargs):
@@ -396,7 +385,7 @@ def test_publish_source_snapshot_rereads_concurrent_winner(monkeypatch, tmp_path
         assert revision == "e" * 40
         return str(archive_file)
 
-    _install_snapshot_hub(monkeypatch, _Api, download)
+    _install_snapshot_artifacts(monkeypatch, _Api, download)
     monkeypatch.setattr("flash.snapshot.archive.build_source_archive", lambda **_kwargs: archive)
     monkeypatch.setattr("flash.snapshot.archive.read_verified_archive", lambda *_args: {})
 

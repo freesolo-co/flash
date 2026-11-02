@@ -70,13 +70,6 @@ class ArtifactStore:
                 revision = store.commit(repo_id, {})
         return SimpleNamespace(oid=revision)
 
-    def update_repo_settings(self, repo_id, *, repo_type="dataset", private=True):
-        if not private:
-            raise ValueError("Flash artifact storage is private")
-        with open_container(self.token) as container:
-            if container.get_container_properties().public_access:
-                raise ValueError("Flash artifact container must deny public access")
-
     def upload_file(
         self, *, path_or_fileobj, path_in_repo, repo_id, repo_type="dataset", commit_message=None
     ):

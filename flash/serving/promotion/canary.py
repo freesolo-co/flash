@@ -6,7 +6,7 @@ generation produces is identifiable afterwards; the router stamps that id onto t
 alongside its own release identity (`flash/serving/src/accounting/usage.py`).
 
 Engine-side proof cannot come from the response: `flash/serving/src/io/responses.py` deliberately
-strips `engine_replica_id` from public bodies, and the engines only receive `HF_TOKEN`, so they
+strips `engine_replica_id` from public bodies, and the engines receive only upstream-model and Azure artifact credentials, so they
 cannot report the release sha either. The response proves generation happened; accounting proves
 which release it happened on.
 """
