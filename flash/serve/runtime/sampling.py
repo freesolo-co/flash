@@ -115,6 +115,12 @@ def _normalize_token_position(
     for candidate_id, candidate in candidates.items():
         if type(candidate_id) is not int:
             raise RuntimeNotReadyError("vllm returned a non-integer logprob token id")
+        if candidate_id != token_id and _is_masked_alternative(candidate):
+            # guided decoding (structured outputs, tool grammars) masks forbidden tokens to -inf,
+            # and vllm can still return them among the top-k alternatives. they have zero
+            # probability, so they are dropped instead of failing the whole request; the
+            # response may then carry fewer than `top_logprobs` alternatives.
+            continue
         record = _normalize_logprob_candidate(candidate_id, candidate)
         normalized.append((candidate_id, record))
         if candidate_id == token_id:
@@ -128,6 +134,12 @@ def _normalize_token_position(
         **selected,
         "top_logprobs": [record for _, record in normalized[:top_logprobs]],
     }
+
+
+def _is_masked_alternative(candidate: Any) -> bool:
+    """A grammar-masked candidate: logprob is exactly -inf (NaN and +inf stay errors)."""
+    value = getattr(candidate, "logprob", None)
+    return type(value) in {int, float} and math.isinf(value) and value < 0
 
 
 def _normalize_logprob_candidate(token_id: int, candidate: Any) -> dict[str, Any]:
