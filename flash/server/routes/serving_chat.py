@@ -26,6 +26,7 @@ from flash.serve.request.tool_calls import qualified_tool_parser, validate_tool_
 from flash.serve.request.transport import RawChatStream, is_event_stream_content_type
 from flash.server.platform.deps import require_manageable_run
 from flash.server.platform.internal_client import run_serving_org_id
+from flash.server.routes.serving_errors import upstream_chat_error
 from flash.server.routes.serving_revisions import (
     _DEPLOYMENT_BUSY_STATES,
     _authorized_chat_checkpoint,
@@ -305,20 +306,6 @@ def managed_chat(
     except HTTPException:
         raise
     except httpx.HTTPStatusError as exc:
-        if exc.response.status_code not in {400, 422}:
-            raise HTTPException(status_code=502, detail=f"inference failure: {exc}") from exc
-        # Preserve deterministic request errors (notably context overflow). Turning these into
-        # 502 hides the token counts and tells clients to retry an unchanged, invalid request.
-        detail = f"Serving rejected the inference request (HTTP {exc.response.status_code})."
-        try:
-            body = exc.response.json()
-            message = body.get("detail")
-            if not isinstance(message, str) and isinstance(body.get("error"), dict):
-                message = body["error"].get("message")
-            if isinstance(message, str) and message.strip():
-                detail = message[:4096]
-        except (ValueError, AttributeError):
-            pass
-        raise HTTPException(status_code=exc.response.status_code, detail=detail) from exc
+        raise upstream_chat_error(exc, checkpoint_id=authorized_checkpoint) from exc
     except Exception as exc:
         raise HTTPException(status_code=502, detail=f"inference failure: {exc}") from exc
