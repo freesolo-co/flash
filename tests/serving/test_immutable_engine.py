@@ -409,3 +409,71 @@ def test_request_loaded_adapter_is_registered_once_and_evicted_on_undeploy(tmp_p
     asyncio.run(exercise())
     assert len(added) == 2
     assert removed == added[:1]
+
+
+def _hot_path_engine(tmp_path: Path, calls: list[str]) -> _LoraEngineImpl:
+    engine = _LoraEngineImpl()
+    engine.base_model = BASE_MODEL
+    engine.registry = AdapterRegistry()
+    engine._adapter_locks = {}
+    engine._adapter_locks_guard = asyncio.Lock()
+
+    class _Engine:
+        async def add_lora(self, request):
+            return True
+
+        async def remove_lora(self, int_id):
+            return True
+
+    async def local_path(record):
+        # stands in for the stat/iterdir scan of the network-backed adapter volume.
+        calls.append(record.artifact_revision)
+        engine.registry.set_local_path(record, tmp_path)
+        return tmp_path
+
+    engine.engine = _Engine()
+    engine._ensure_adapter_local_locked = local_path
+    return engine
+
+
+def test_loaded_adapter_requests_skip_the_volume_readiness_scan(tmp_path: Path) -> None:
+    record = _revision("a" * 40)
+    calls: list[str] = []
+    engine = _hot_path_engine(tmp_path, calls)
+    payload = internal_adapter_payload(record)
+
+    async def exercise():
+        first, _ = await engine._lora_request(record.model_id, payload)
+        concurrent = await asyncio.gather(
+            *(engine._lora_request(record.model_id, payload) for _ in range(8))
+        )
+        return first, [request for request, _ in concurrent]
+
+    first, rest = asyncio.run(exercise())
+    # only the first, loading request touches the adapter volume.
+    assert calls == ["a" * 40]
+    assert all(request is first for request in rest)
+
+
+def test_loaded_lora_fast_path_requires_loaded_current_source(tmp_path: Path) -> None:
+    from flash.serve.contract.provenance import record_key
+
+    record = _revision("a" * 40)
+    engine = _hot_path_engine(tmp_path, [])
+    request = SimpleNamespace(lora_int_id=7)
+    ident = _adapter_source_ident(record)
+    entries = {record_key(record): _LoraEntry(ident, request, "loaded")}
+    engine._lora_entries = entries
+
+    # no verified local path yet: the full path must run.
+    assert engine._loaded_lora_request_locked(record) is None
+    engine.registry.set_local_path(record, tmp_path)
+    assert engine._loaded_lora_request_locked(record) is request
+
+    for state in ("reserved", "unconfirmed"):
+        entries[record_key(record)] = _LoraEntry(ident, request, state)
+        assert engine._loaded_lora_request_locked(record) is None
+    entries[record_key(record)] = _LoraEntry(ident, request, "loaded")
+
+    # a different immutable source for the same checkpoint id never reuses the loaded entry.
+    assert engine._loaded_lora_request_locked(_revision("c" * 40)) is None

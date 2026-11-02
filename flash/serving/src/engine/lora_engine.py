@@ -362,6 +362,28 @@ class _LoraEngineImpl(TextPromptTokenizer):
     def _cached_lora_request_locked(self, record: Any, path: Path) -> Any:
         return cached_lora_request(self, record, path)
 
+    def _loaded_lora_request_locked(self, record: Any) -> Any | None:
+        """Steady-state hit: vLLM already holds exactly this adapter source.
+
+        Every checkpoint request runs under the per-adapter lock, and the full path re-verifies the
+        adapter directory with stat/iterdir calls on a network-backed Modal Volume. Repeating that
+        scan per request serialized concurrent requests for one checkpoint behind filesystem
+        latency (~3.5 s per queued request under load), while base-model requests never take this
+        lock. Once the entry is loaded from the same source and the registry's local path is still
+        current, the scan cannot change the answer. Any other state, including a changed source,
+        an unconfirmed removal, or a stale or missing local path, takes the full path.
+        """
+        entry = self._entries().get(record_key(record))
+        if (
+            entry is None
+            or entry.state != "loaded"
+            or entry.source_ident != _adapter_source_ident(record)
+            or self.registry.local_path_is_stale(record)
+            or self.registry.local_path(record) is None
+        ):
+            return None
+        return entry.lora_request
+
     async def _lora_request(
         self, model_id: str, record_dict: dict[str, Any] | None = None
     ) -> tuple[Any, Any]:
@@ -392,6 +414,9 @@ class _LoraEngineImpl(TextPromptTokenizer):
                 raise ValueError(f"Unknown adapter id on {self.base_model}: {model_id}")
             if not record.serve_base_model and not record.is_checkpoint:
                 raise ValueError(f"Unknown adapter id on {self.base_model}: {model_id}")
+            loaded = self._loaded_lora_request_locked(record)
+            if loaded is not None:
+                return loaded, record
             path = await self._ensure_adapter_local_locked(record)
             lora_request = self._cached_lora_request_locked(record, path)
             # first-use loading must enter the same lifecycle as explicit registration so
