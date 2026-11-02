@@ -336,6 +336,12 @@ def load_backend(
             "exclude_modules": surface.exclude_modules,
             "target_parameters": surface.target_parameters,
         }
+    if init_adapter and _uses_language_model_layout(init_adapter):
+        # SFT and GRPO adapt Qwen3.5 text modules under model.language_model even for text-only
+        # runs; load that same layout so the source's module paths and exclusions resolve.
+        from transformers import AutoModelForImageTextToText
+
+        model_class = AutoModelForImageTextToText
     model = model_class.from_pretrained(
         model_id,
         revision=revision,
@@ -360,6 +366,15 @@ def load_backend(
         )
     model.config._commit_hash = revision
     return TorchBackend(model, tokenizer, checkpoint_dir=checkpoint_dir, max_tokens=max_tokens)
+
+
+def _uses_language_model_layout(adapter_dir):
+    """Whether a source adapter's tensors address the multimodal class's language_model."""
+    from safetensors import safe_open
+
+    with safe_open(str(Path(adapter_dir) / "adapter_model.safetensors"), "np") as weights:
+        names = weights.keys()  # a safetensors handle, not a dict
+    return any(".language_model." in name for name in names)
 
 
 def _warm_start(model, adapter_dir, lora_rank, lora_alpha):
