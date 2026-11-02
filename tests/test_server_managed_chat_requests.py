@@ -303,7 +303,8 @@ def test_managed_chat_rejects_legacy_readiness_before_internal_forwarding(
         ),
         (422, {"detail": "invalid tool arguments"}, 422, "invalid tool arguments"),
         (400, ["unexpected envelope"], 400, "Serving rejected the inference request (HTTP 400)."),
-        (503, {"detail": "engine unavailable"}, 502, "inference failure:"),
+        (503, {"detail": "engine unavailable"}, 503, "engine unavailable"),
+        (429, {"detail": "serving capacity busy"}, 429, "serving capacity busy"),
     ],
 )
 def test_managed_chat_preserves_serving_request_errors(
