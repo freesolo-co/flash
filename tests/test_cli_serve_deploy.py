@@ -584,6 +584,7 @@ def _result(bundle):
 
 
 def _stub_environment(monkeypatch: pytest.MonkeyPatch) -> None:
+    _qualify_test_transport(monkeypatch)
     monkeypatch.setenv(serve_deploy.MODAL_TOKEN_ID_ENV, "token-id")
     monkeypatch.setenv(serve_deploy.MODAL_TOKEN_SECRET_ENV, "token-secret")
     monkeypatch.setenv(serve_deploy.INFERENCE_KEY_ENV, "inference-key")
@@ -602,6 +603,8 @@ def _stub_resolution(monkeypatch: pytest.MonkeyPatch) -> None:
     from flash.serve.app import AdapterExecutionInput, ArtifactFile, aggregate_file_digest
     from flash.serve.control import ResolvedAdapter
     from flash.serve.deployment.resolve import ResolvedDeploymentInputs
+
+    _qualify_test_transport(monkeypatch)
 
     artifact_revision = "c" * 40
     files = (
@@ -942,3 +945,20 @@ def test_9b_qualification_remains_image_digest_agnostic(
     )
 
     assert cmd_serve_deploy(_args(model=MODEL, image=IMAGE)) == 0
+
+
+def _qualify_test_transport(monkeypatch):
+    monkeypatch.setattr(
+        "flash.serve.deployment.profiles._AZURE_ARTIFACT_IMAGE_DIGESTS",
+        frozenset({DIGEST, CERTIFIED_DIGEST}),
+    )
+
+
+@pytest.mark.parametrize("model", [MODEL, "Qwen/Qwen3.8-27B"])
+def test_retired_hub_image_cannot_receive_azure_credentials(monkeypatch, capsys, model):
+    def reject_resolution(*args, **kwargs):
+        pytest.fail("retired image reached artifact resolution or provider allocation")
+
+    monkeypatch.setattr(serve_deploy, "_deployment_bundle", reject_resolution)
+    assert cmd_serve_deploy(_args(model=model, image=CERTIFIED_IMAGE)) == 1
+    assert "pending Azure artifact image qualification" in capsys.readouterr().err

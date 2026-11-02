@@ -103,3 +103,10 @@ are unavailable through the new Flash runtime.
 
 The migration plan, copy, GPU qualification, and production deployment are
 separate operational steps. Adding this code does not perform those steps.
+
+Customer-owned `flash serve deploy` allocations are disabled until a rebuilt
+`Dockerfile.serve` image passes an Azure hydration and generation GPU canary. The
+existing certified digests contain the retired Hub hydrator and must never receive
+Azure credentials. After qualification, record the new digest in the relevant
+profile and `_AZURE_ARTIFACT_IMAGE_DIGESTS`. Dry runs remain available. This is a
+merge/rollout prerequisite for this draft migration, not a claim of live coverage.
