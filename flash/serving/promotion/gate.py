@@ -199,6 +199,22 @@ async def _await_health(
     return verdict
 
 
+def _error_detail(error: Exception) -> str:
+    """name the failure behind an unreadable snapshot without request headers or credentials.
+
+    an RPC failure (for example a postgres statement timeout, SQLSTATE 57014) otherwise reads as
+    schema drift, because both surface as accounting_malformed.
+    """
+    response = getattr(error, "response", None)
+    if response is not None and getattr(response, "status_code", None) is not None:
+        try:
+            body = response.text
+        except Exception:
+            body = ""
+        return f"{type(error).__name__}: HTTP {response.status_code} {body[:300]}".strip()
+    return f"{type(error).__name__}: {str(error)[:300]}".rstrip(": ")
+
+
 async def _await_accounting(
     loader: AccountingLoader,
     *,
@@ -215,8 +231,10 @@ async def _await_accounting(
             snapshot = await asyncio.wait_for(loader(), timeout=remaining)
         except TimeoutError:
             return verdict
-        except Exception:
-            verdict = PromotionVerdict(ok=False, reason=ACCOUNTING_MALFORMED)
+        except Exception as error:
+            verdict = PromotionVerdict(
+                ok=False, reason=ACCOUNTING_MALFORMED, detail=_error_detail(error)
+            )
         else:
             # even a successful response arriving at the deadline cannot promote the release.
             if clock() >= deadline:
@@ -385,7 +403,8 @@ def main(argv: list[str] | None = None) -> int:
     if verdict.ok:
         print("promotion gate passed")
         return 0
-    print(f"promotion gate failed: {verdict.reason}", file=sys.stderr)
+    detail = f" ({verdict.detail})" if verdict.detail else ""
+    print(f"promotion gate failed: {verdict.reason}{detail}", file=sys.stderr)
     return 1
 
 
