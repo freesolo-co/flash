@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 
 import pytest
 
@@ -136,14 +137,19 @@ def test_hub_token_reaches_provisioning_so_the_container_can_hydrate(
 
     _stub_resolution(monkeypatch)
     _stub_environment(monkeypatch)
-    monkeypatch.setenv(serve_deploy.ARTIFACT_TOKEN_ENV, "hf-token")
+    monkeypatch.setenv(
+        serve_deploy.ARTIFACT_TOKEN_ENV, "https://test.blob.core.windows.net/artifacts?sig=test"
+    )
     monkeypatch.setattr(
         "flash.serve.provisioning.modal.execution.operations.provision_modal_deployment",
         _capture,
     )
 
     assert cmd_serve_deploy(_args()) == 0
-    assert seen == [("inference-key", "hf-token")]
+    assert seen[0][0] == "inference-key"
+    assert (
+        json.loads(seen[0][1])["azure"] == "https://test.blob.core.windows.net/artifacts?sig=test"
+    )
 
 
 def test_the_deploy_proceeds_once_a_token_is_present(
@@ -159,14 +165,19 @@ def test_the_deploy_proceeds_once_a_token_is_present(
 
     _stub_resolution(monkeypatch)
     _stub_environment(monkeypatch)
-    monkeypatch.setenv(serve_deploy.ARTIFACT_TOKEN_ENV, "hf-token")
+    monkeypatch.setenv(
+        serve_deploy.ARTIFACT_TOKEN_ENV, "https://test.blob.core.windows.net/artifacts?sig=test"
+    )
     monkeypatch.setattr(
         "flash.serve.provisioning.modal.execution.operations.provision_modal_deployment",
         _capture,
     )
 
     assert cmd_serve_deploy(_args()) == 0
-    assert seen == [("inference-key", "hf-token")]
+    assert seen[0][0] == "inference-key"
+    assert (
+        json.loads(seen[0][1])["azure"] == "https://test.blob.core.windows.net/artifacts?sig=test"
+    )
 
 
 def test_resolver_validation_failures_are_cli_errors_not_tracebacks(
@@ -579,7 +590,9 @@ def _stub_environment(monkeypatch: pytest.MonkeyPatch) -> None:
     # a deployable environment includes the artifact token: hydration on a fresh volume is
     # token-only, so the command rejects a missing one before contacting any provider. tests
     # about that rejection unset it explicitly.
-    monkeypatch.setenv(serve_deploy.ARTIFACT_TOKEN_ENV, "hf-token")
+    monkeypatch.setenv(
+        serve_deploy.ARTIFACT_TOKEN_ENV, "https://test.blob.core.windows.net/artifacts?sig=test"
+    )
 
 
 def _stub_resolution(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -879,12 +892,14 @@ def test_tokenless_fresh_create_rejection_is_actionable(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    def _reject(*_args, **_kwargs):
+    def _reject(bundle, credentials, secrets, **_kwargs):
+        assert secrets._reveal_for_launch()[1] is None
         raise serve_deploy.FreshDeploymentArtifactTokenRequired
 
     _stub_resolution(monkeypatch)
     _stub_environment(monkeypatch)
     monkeypatch.delenv(serve_deploy.ARTIFACT_TOKEN_ENV, raising=False)
+    monkeypatch.setenv("HF_TOKEN", "upstream-only")
     monkeypatch.setattr(
         "flash.serve.provisioning.modal.execution.operations.provision_modal_deployment",
         _reject,

@@ -29,6 +29,8 @@ custom = ["torch==2.10.0"]
 # heavy deps for running the fine-tuning worker locally (the deployed gpu worker installs its exact
 # stack in Dockerfile.worker, with the fallback verl venv mirrored in capabilities.py).
 gpu = [
+    "azure-storage-blob>=12.24,<13",
+    "azure-identity>=1.19,<2",
     "torch==2.10.0",
     "transformers>=5.8,<5.13",
     "tokenizers>=0.22",
@@ -88,6 +90,8 @@ server = [
 # (vllm==0.23.0, held exactly by a 25h 35B outage on 0.21.0), and the offline tests substitute a
 # stub whenever the real package is unimportable, so CI exercises the app without it.
 serving = [
+    "azure-storage-blob>=12.24,<13",
+    "azure-identity>=1.19,<2",
     # response lifetime ownership uses cancellation shielding and ASGI response types.
     "anyio>=4.0,<5",
     "starlette>=0.46,<2",
@@ -126,6 +130,8 @@ serving = [
 # dependencies validated by the current production serving image. vllm stays exact until a real-gpu
 # base plus lora canary validates a replacement.
 serve-runtime = [
+    "azure-storage-blob>=12.24,<13",
+    "azure-identity>=1.19,<2",
     # vllm==0.23.0 has a resolver-only fastapi<0.137 ceiling omitted from its registry metadata;
     # modal installs this with serving, so both share the 0.136 floor while this extra keeps the ceiling.
     "fastapi>=0.136,<0.137",

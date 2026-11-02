@@ -4,25 +4,37 @@ from flash.providers.core import preflight
 
 
 @pytest.mark.parametrize(
-    "key", ["MODAL_TOKEN_ID", "MODAL_TOKEN_SECRET", "HF_TOKEN", "FREESOLO_INTERNAL_KEY"]
+    "key",
+    [
+        "MODAL_TOKEN_ID",
+        "MODAL_TOKEN_SECRET",
+        "FLASH_ARTIFACT_BLOB_ACCOUNT_URL",
+        "FREESOLO_INTERNAL_KEY",
+    ],
 )
 def test_missing_required_configuration(monkeypatch, key):
-    monkeypatch.setenv("HF_TOKEN", "test-hf")
+    monkeypatch.setenv(
+        "FLASH_ARTIFACT_BLOB_ACCOUNT_URL", "https://testartifacts.blob.core.windows.net"
+    )
     monkeypatch.setenv("FREESOLO_INTERNAL_KEY", "test-internal")
     monkeypatch.delenv(key)
     with pytest.raises(preflight.PreflightError):
         preflight.require_operator_config()
 
 
-def test_modal_configuration_is_sufficient(monkeypatch):
-    monkeypatch.setenv("HF_TOKEN", "test-hf")
+def test_modal_configuration_needs_no_hub_write_token(monkeypatch):
+    monkeypatch.delenv("HF_TOKEN", raising=False)
+    monkeypatch.setenv(
+        "FLASH_ARTIFACT_BLOB_ACCOUNT_URL", "https://testartifacts.blob.core.windows.net"
+    )
     monkeypatch.setenv("FREESOLO_INTERNAL_KEY", "test-internal")
     preflight.require_operator_config()
 
 
-def test_standalone_requires_artifact_namespace(monkeypatch):
-    monkeypatch.setenv("HF_TOKEN", "test-hf")
+def test_standalone_uses_operator_azure_storage(monkeypatch):
+    monkeypatch.setenv(
+        "FLASH_ARTIFACT_BLOB_ACCOUNT_URL", "https://testartifacts.blob.core.windows.net"
+    )
     monkeypatch.setenv("FREESOLO_INTERNAL_KEY", "test-internal")
     monkeypatch.setenv("FLASH_STANDALONE", "1")
-    with pytest.raises(preflight.PreflightError, match="FLASH_HF_NAMESPACE"):
-        preflight.require_operator_config()
+    preflight.require_operator_config()

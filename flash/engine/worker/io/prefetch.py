@@ -5,7 +5,7 @@ shared cache volume over a per-pod download, retrying only the failures worth re
 refusing a snapshot that arrived without weights. The rest resolves the commit that was actually
 fetched and writes it down, so a later deployment can name the exact base it trained against.
 
-Split out of `flash.engine.worker.io.hf` to keep that module under the file-size limit.
+Split out of `flash.engine.worker.io.artifacts` to keep that module under the file-size limit.
 """
 
 from __future__ import annotations
@@ -30,7 +30,7 @@ def _hf():
     prefetch tests patch selected attributes of `io.hf`. resolving them through the parent keeps
     those patches effective while avoiding an import cycle.
     """
-    from flash.engine.worker.io import hf
+    from flash.engine.worker.io import artifacts as hf
 
     return hf
 
@@ -180,7 +180,7 @@ def prefetch_model(model_id: str, revision: str = "", *, context: WorkerContext)
     ):
 
         def _download() -> None:
-            _hf()._require_hf_deadline_allowance(context=context)
+            _hf()._require_artifact_deadline_allowance(context=context)
             local_path = snapshot_download(
                 repo_id=model_id,
                 cache_dir=shared_hub,

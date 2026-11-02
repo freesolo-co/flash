@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import contextlib
 import math
-import os
 import time
 from collections.abc import Callable, Iterator
 from dataclasses import asdict, dataclass
@@ -70,18 +69,18 @@ class Deployment:
 def resolve_artifact_revision(hf_repo: str) -> str:
     """Resolve the full immutable commit SHA for the uploaded adapter repository."""
     try:
-        from huggingface_hub import HfApi
+        from flash.artifacts.api import ArtifactStore
     except ImportError as exc:  # pragma: no cover
         raise serving_errors.ServingError(
-            "could not resolve checkpoint: huggingface_hub is not installed"
+            "could not resolve checkpoint: Azure artifact support is not installed"
         ) from exc
     try:
         revision = str(
-            HfApi()
+            ArtifactStore()
             .repo_info(
                 repo_id=hf_repo,
                 repo_type="dataset",
-                token=os.environ.get("HF_TOKEN"),
+                token=None,
             )
             .sha
             or ""

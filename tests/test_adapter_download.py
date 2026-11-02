@@ -193,9 +193,9 @@ def test_archive_contains_only_normalized_adapter_and_hash_manifest(tmp_path, mo
 
 
 def test_fetch_pins_source_revision_and_downloads_only_checkpoint_files(tmp_path, monkeypatch):
-    import huggingface_hub as hub
+    from flash.artifacts import api as hub
 
-    class RepoFile:
+    class ArtifactFile:
         def __init__(self, name):
             self.path = f"run/step-12/adapter/{name}"
             self.size = 32
@@ -203,17 +203,17 @@ def test_fetch_pins_source_revision_and_downloads_only_checkpoint_files(tmp_path
     api = Mock()
     api.repo_info.return_value = SimpleNamespace(sha="b" * 40)
     api.list_repo_tree.return_value = [
-        RepoFile(n)
+        ArtifactFile(n)
         for n in ("adapter_config.json", "adapter_model.safetensors", "trainer-secret.json")
     ]
     factory = Mock(return_value=api)
     fetch = Mock()
     monkeypatch.setenv("HF_TOKEN", "server-secret")
-    monkeypatch.setattr(hub, "RepoFile", RepoFile)
-    monkeypatch.setattr(hub, "HfApi", factory)
-    monkeypatch.setattr(hub, "hf_hub_download", fetch)
+    monkeypatch.setattr(hub, "ArtifactFile", ArtifactFile)
+    monkeypatch.setattr(hub, "ArtifactStore", factory)
+    monkeypatch.setattr(hub, "download_file", fetch)
     path, revision = download._fetch_adapter("private/repo", "run/step-12/adapter", tmp_path)
-    factory.assert_called_once_with(token="server-secret")
+    factory.assert_called_once_with(token=None)
     assert path == tmp_path / "run/step-12/adapter"
     assert revision == "b" * 40
     api.list_repo_tree.assert_called_once_with(
@@ -226,7 +226,7 @@ def test_fetch_pins_source_revision_and_downloads_only_checkpoint_files(tmp_path
     assert fetch.call_count == 2
     for call in fetch.call_args_list:
         assert call.kwargs["revision"] == revision
-        assert call.kwargs["token"] == "server-secret"
+        assert call.kwargs["token"] is None
         assert call.kwargs["filename"].startswith("run/step-12/adapter/")
 
 

@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import contextlib
 import hashlib
-import os
 import re
 import time
 
@@ -96,10 +95,13 @@ def finish(handle, spec, *, deadline_at):
 
     api.terminate(handle.instance_id)
     started = time.time()
+    from flash.artifacts.config import runtime_environment
+
+    storage_environment = runtime_environment()
+    if not storage_environment:
+        raise ValueError("Azure artifact credentials are required for CPU checkpoint publication")
     environment = {
-        "HF_TOKEN": os.environ.get("HF_TOKEN", ""),
-        "HF_HUB_DISABLE_XET": "1",
-        "FLASH_HF_UPLOAD_THREADS": os.environ.get("FLASH_HF_UPLOAD_THREADS", "8"),
+        **storage_environment,
         "FLASH_JOB_SPEC_PATH": f"{MOUNT}/spec.json",
         "FLASH_EXPECTED_SPEC_SHA256": hashlib.sha256(spec.to_json().encode()).hexdigest(),
         "HF_REPO": handle.hf_repo,
@@ -110,8 +112,6 @@ def finish(handle, spec, *, deadline_at):
         "FLASH_RUN_DEADLINE_AT": str(deadline_at),
         "PYTHONPATH": f"{MOUNT}/source",
     }
-    if not environment["HF_TOKEN"]:
-        raise ValueError("HF_TOKEN is required for CPU checkpoint publication")
 
     async def upload(modal, client):
         sandbox = await _find_owned_uploader(modal, client, handle)
@@ -136,7 +136,9 @@ def finish(handle, spec, *, deadline_at):
                     app=app,
                     name=_uploader_name(handle),
                     tags=_uploader_tags(handle),
-                    image=modal.Image.from_registry(worker_image_for_gpu(handle.gpu)),
+                    image=modal.Image.from_registry(worker_image_for_gpu(handle.gpu)).pip_install(
+                        "azure-storage-blob>=12.24,<13", "azure-identity>=1.19,<2"
+                    ),
                     secrets=[modal.Secret.from_dict(environment)],
                     volumes={MOUNT: volume},
                     cpu=(2, 4),

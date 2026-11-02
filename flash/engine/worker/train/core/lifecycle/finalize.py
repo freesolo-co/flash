@@ -6,8 +6,8 @@ import json
 import os
 
 from flash.engine.result.accounting import RunMetrics, sanitize_worker_metrics
+from flash.engine.worker.io import artifacts as hf_io
 from flash.engine.worker.io import heartbeat as heartbeat_io
-from flash.engine.worker.io import hf as hf_io
 from flash.engine.worker.perf import gpu_diagnostics
 from flash.engine.worker.runtime.state import WorkerContext
 
@@ -64,7 +64,7 @@ def write_train_meta(
     )
     with open("/tmp/train_meta.json", "w") as f:
         json.dump(meta, f)
-    hf_io.hf_upload_file("/tmp/train_meta.json", "train_meta.json", context=context)
+    hf_io.upload_artifact_file("/tmp/train_meta.json", "train_meta.json", context=context)
     # Carry the completed optimizer ``step`` (when the caller supplies it) so this final pre-DONE
     # heartbeat doesn't clobber the last stepped training ping with a stepless one -- a cancel
     # between here and DONE would otherwise re-price a fully-trained run to 0 steps.
@@ -110,13 +110,13 @@ def _publish_training_completion(
     import time
 
     metrics.save("/tmp/metrics.json")
-    hf_io.hf_upload_file("/tmp/metrics.json", "metrics.json", required=True, context=context)
+    hf_io.upload_artifact_file("/tmp/metrics.json", "metrics.json", required=True, context=context)
     with open("/tmp/DONE", "w") as handle:
         handle.write(str(time.time()))
     from flash.engine.worker.io.cpu_handoff import defer_completion
 
     if not defer_completion("/tmp/DONE"):
-        hf_io.hf_upload_file("/tmp/DONE", "DONE", required=True, context=context)
+        hf_io.upload_artifact_file("/tmp/DONE", "DONE", required=True, context=context)
     step = metrics.step
     step_field = {"step": int(step)} if isinstance(step, (int, float)) and step > 0 else {}
     heartbeat_io.heartbeat(

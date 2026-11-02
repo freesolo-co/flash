@@ -1,7 +1,7 @@
-"""Provider-neutral HF-artifact reading + heartbeat provenance.
+"""Provider-neutral Azure-artifact reading + heartbeat provenance.
 
-The control plane observes a remote worker purely through the artifacts it uploads to a private HF
-dataset repo: rate-limited text/JSON readers for ``heartbeat.json`` / ``error_*.txt`` / console logs,
+The control plane observes a remote worker purely through the artifacts it uploads to private Azure
+Blob Storage: rate-limited text/JSON readers for ``heartbeat.json`` / ``error_*.txt`` / console logs,
 plus the provenance predicates that decide whether a heartbeat belongs to THIS attempt or a leftover
 prior one. None of this is provider-specific — Modal all poll the same artifact
 shape — so it lives here in the shared kernel and no provider package imports another for it.
@@ -14,7 +14,6 @@ from __future__ import annotations
 
 import json
 import math
-import os
 import time
 from collections.abc import Callable
 from datetime import UTC, datetime
@@ -37,14 +36,14 @@ class TextArtifactReader(Protocol):
     def __call__(self, force: bool = False, *, deadline_at: float | None = None) -> str | None: ...
 
 
-def make_hf_text_reader(
+def make_artifact_text_reader(
     hf_repo: str,
     path_in_repo: str,
     min_interval_s: float = 45.0,
     *,
     deadline_at: float | None = None,
 ) -> TextArtifactReader:
-    """Rate-limited reader for an HF artifact; returns None until it exists or on any error."""
+    """Rate-limited reader for an Azure artifact; returns None until it exists or on any error."""
     deadline = require_deadline_at(deadline_at) if deadline_at is not None else None
     state = {"last": 0.0}
 
@@ -60,13 +59,13 @@ def make_hf_text_reader(
             return None
         state["last"] = now
         try:
-            from huggingface_hub import hf_hub_download
+            from flash.artifacts.api import download_file
 
-            p = hf_hub_download(
+            p = download_file(
                 hf_repo,
                 path_in_repo,
                 repo_type="dataset",
-                token=os.environ.get("HF_TOKEN"),
+                token=None,
                 force_download=True,
             )
             with open(p) as f:
@@ -77,15 +76,15 @@ def make_hf_text_reader(
     return read
 
 
-def make_hf_heartbeat_reader(
+def make_artifact_heartbeat_reader(
     hf_repo: str,
     prefix: str,
     min_interval_s: float = 30.0,
     *,
     deadline_at: float | None = None,
 ):
-    """Rate-limited JSON reader for ``{prefix}/heartbeat.json`` on HF."""
-    text_reader = make_hf_text_reader(
+    """Rate-limited JSON reader for ``{prefix}/heartbeat.json`` in Azure."""
+    text_reader = make_artifact_text_reader(
         hf_repo,
         f"{prefix}/heartbeat.json",
         min_interval_s,
@@ -105,10 +104,10 @@ def make_hf_heartbeat_reader(
 
 
 def heartbeat_reader_for(spec, *, deadline_at: float | None = None):
-    """The HF heartbeat reader for a run's spec (None when the run has no hf_repo)."""
+    """The artifact heartbeat reader for a run's spec (None when the run has no hf_repo)."""
     hf_repo = spec.train.hf_repo
     return (
-        make_hf_heartbeat_reader(
+        make_artifact_heartbeat_reader(
             hf_repo,
             f"{spec.phase}/{spec.run_id}",
             deadline_at=deadline_at,
@@ -127,7 +126,7 @@ def error_artifact_name(phase: str, attempt) -> str:
     return attempt_scoped_artifact_name("error", phase, attempt)
 
 
-def make_hf_failure_detail_reader(
+def make_artifact_failure_detail_reader(
     hf_repo: str,
     prefix: str,
     phase: str,
@@ -140,19 +139,19 @@ def make_hf_failure_detail_reader(
     # Attempt-scoped to match the worker's error_artifact_name(mode, attempt).
     err_name = error_artifact_name(phase, attempt)
     live_console_name = attempt_scoped_artifact_name("console", phase, attempt)
-    error_reader = make_hf_text_reader(
+    error_reader = make_artifact_text_reader(
         hf_repo,
         f"{prefix}/{err_name}",
         min_interval_s,
         deadline_at=deadline_at,
     )
-    console_reader = make_hf_text_reader(
+    console_reader = make_artifact_text_reader(
         hf_repo,
         f"{prefix}/console_{phase}.txt",
         min_interval_s,
         deadline_at=deadline_at,
     )
-    live_console_reader = make_hf_text_reader(
+    live_console_reader = make_artifact_text_reader(
         hf_repo,
         f"{prefix}/{live_console_name}",
         min_interval_s,
@@ -213,21 +212,21 @@ def worker_flagged_retriable(
 
 T = TypeVar("T")
 
-HF_TRANSIENT_STATUS_CODES = frozenset({429, 500, 502, 503, 504})
-HF_RETRY_DELAYS_S = (1.0, 3.0, 8.0, 20.0, 60.0)
-HF_RETRY_AFTER_MAX_S = 60.0
+ARTIFACT_TRANSIENT_STATUS_CODES = frozenset({429, 500, 502, 503, 504})
+ARTIFACT_RETRY_DELAYS_S = (1.0, 3.0, 8.0, 20.0, 60.0)
+ARTIFACT_RETRY_AFTER_MAX_S = 60.0
 
 
-def hf_status_code(exc: BaseException) -> int | None:
+def artifact_status_code(exc: BaseException) -> int | None:
     response = getattr(exc, "response", None)
-    code = getattr(response, "status_code", None)
+    code = getattr(exc, "status_code", None) or getattr(response, "status_code", None)
     try:
         return int(code)
     except (TypeError, ValueError):
         return None
 
 
-def hf_retry_after(exc: BaseException) -> float | None:
+def artifact_retry_after(exc: BaseException) -> float | None:
     response = getattr(exc, "response", None)
     headers = getattr(response, "headers", None) or {}
     value = headers.get("retry-after") if hasattr(headers, "get") else None
@@ -248,17 +247,17 @@ def hf_retry_after(exc: BaseException) -> float | None:
             seconds = (retry_at - datetime.now(UTC)).total_seconds()
         except (TypeError, ValueError):
             return None
-    return min(HF_RETRY_AFTER_MAX_S, max(0.0, seconds))
+    return min(ARTIFACT_RETRY_AFTER_MAX_S, max(0.0, seconds))
 
 
-def hf_call(
+def artifact_call(
     call: Callable[[], T],
     label: str,
     *,
     logger: Logger,
     sleep: Callable[[float], object] = time.sleep,
-    retry_delays: tuple[float, ...] = HF_RETRY_DELAYS_S,
-    transient_status_codes: frozenset[int] = HF_TRANSIENT_STATUS_CODES,
+    retry_delays: tuple[float, ...] = ARTIFACT_RETRY_DELAYS_S,
+    transient_status_codes: frozenset[int] = ARTIFACT_TRANSIENT_STATUS_CODES,
     deadline_at: float | None = None,
 ) -> T:
     deadline = require_deadline_at(deadline_at) if deadline_at is not None else None
@@ -268,9 +267,11 @@ def hf_call(
                 raise TimeoutError(f"{label} exceeded the run wall deadline")
             return call()
         except Exception as exc:
-            if hf_status_code(exc) not in transient_status_codes or attempt >= len(retry_delays):
+            if artifact_status_code(exc) not in transient_status_codes or attempt >= len(
+                retry_delays
+            ):
                 raise
-            retry_after = hf_retry_after(exc)
+            retry_after = artifact_retry_after(exc)
             delay = retry_after if retry_after is not None else retry_delays[attempt]
             if deadline is not None:
                 remaining = remaining_seconds(deadline)
@@ -278,7 +279,7 @@ def hf_call(
                     raise
                 delay = min(delay, remaining)
             logger.warning(
-                "%s transient Hugging Face error; retrying in %.0fs: %s",
+                "%s transient Azure artifact error; retrying in %.0fs: %s",
                 label,
                 delay,
                 sanitize_diagnostic(exc, limit=500),

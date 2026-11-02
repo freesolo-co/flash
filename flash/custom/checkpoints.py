@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import os
 import shutil
 import tempfile
 from pathlib import Path
@@ -17,7 +16,7 @@ class RunCheckpoints:
         self.cached = None
 
     def publish(self, directory, metadata):
-        from flash.engine.worker.io import hf
+        from flash.engine.worker.io import artifacts as hf
 
         step = metadata["step"]
         # adapter and full optimizer state commit together. a listed adapter therefore always
@@ -44,15 +43,15 @@ class RunCheckpoints:
 
     def download_adapter(self, resolved, destination):
         """Fetch only a checkpoint's adapter folder, whose config fixes the LoRA topology."""
-        from huggingface_hub import snapshot_download
+        from flash.artifacts.api import download_snapshot
 
-        root = snapshot_download(
+        root = download_snapshot(
             local_dir=destination,
             repo_id=resolved["repo"],
             repo_type="dataset",
             revision=resolved["revision"],
             allow_patterns=[f"{resolved['path']}/adapter/*"],
-            token=os.environ.get("HF_TOKEN"),
+            token=None,
         )
         adapter = Path(root) / resolved["path"] / "adapter"
         if not (adapter / "adapter_config.json").is_file():
@@ -60,18 +59,17 @@ class RunCheckpoints:
         return adapter
 
     def restore(self, backend, resolved):
-        from huggingface_hub import snapshot_download
-
+        from flash.artifacts.api import download_snapshot
         from flash.engine.support.checkpoint_transport import restore_directory
 
         with tempfile.TemporaryDirectory(prefix="flash-custom-resume-") as workspace:
-            root = snapshot_download(
+            root = download_snapshot(
                 local_dir=workspace,
                 repo_id=resolved["repo"],
                 repo_type="dataset",
                 revision=resolved["revision"],
                 allow_patterns=[f"{resolved['path']}/**"],
-                token=os.environ.get("HF_TOKEN"),
+                token=None,
             )
             source = Path(root) / resolved["path"]
             restore_directory(str(source))
@@ -81,10 +79,10 @@ class RunCheckpoints:
             return backend.restore_checkpoint(source)
 
     def finish(self, directory):
-        from flash.engine.worker.io import hf
+        from flash.engine.worker.io import artifacts as hf
 
         # final adapters use the existing run/final deploy path as well as step-N listing.
-        hf.hf_upload_folder(
+        hf.upload_artifact_folder(
             str(directory / "adapter"), "adapter", required=True, context=self.context
         )
 

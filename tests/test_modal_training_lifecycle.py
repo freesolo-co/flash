@@ -123,7 +123,9 @@ def test_recovery_rejects_a_different_run_before_any_artifact_read(monkeypatch):
     from tests._helpers.modal import modal_remote
 
     handle = JobHandle.from_dict(modal_remote(run_id="another-run"))
-    monkeypatch.setattr(jobs, "make_hf_text_reader", lambda *a, **k: pytest.fail("foreign run"))
+    monkeypatch.setattr(
+        jobs, "make_artifact_text_reader", lambda *a, **k: pytest.fail("foreign run")
+    )
     with pytest.raises(ValueError, match="does not belong"):
         jobs.poll(handle, spec(), deadline_at=time.time() + 60)
 
@@ -151,7 +153,7 @@ def test_successful_artifacts_are_recovered_without_provider_credentials(monkeyp
         value = marker if path.endswith("modal_attempt2.json") else {"train_tokens": 10}
         return lambda **kw: json.dumps(value)
 
-    monkeypatch.setattr("flash.providers.artifacts.hf.make_hf_text_reader", reader)
+    monkeypatch.setattr("flash.providers.artifacts.channel.make_artifact_text_reader", reader)
     monkeypatch.delenv("MODAL_TOKEN_ID")
     monkeypatch.delenv("MODAL_TOKEN_SECRET")
     result = _completed_worker_metrics(raw, deadline_at=time.time())

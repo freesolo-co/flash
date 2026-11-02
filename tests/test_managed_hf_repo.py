@@ -45,7 +45,7 @@ def _submit_worker_spec(monkeypatch, spec: JobSpec) -> tuple[str, dict]:
 
 def test_managed_hf_repo_assigned_per_run(monkeypatch):
     _run_id, worker = _submit_worker_spec(monkeypatch, _spec())
-    assert worker["train"]["hf_repo"] == runner_artifacts.managed_hf_repo_for_run(
+    assert worker["train"]["hf_repo"] == runner_artifacts.managed_artifact_repo_for_run(
         worker["environment"]["id"], worker["run_id"]
     )
 
@@ -53,7 +53,7 @@ def test_managed_hf_repo_assigned_per_run(monkeypatch):
 def test_managed_hf_repo_overrides_user_value(monkeypatch):
     # Even if a legacy/old-client spec carries a user namespace, the control plane overrides it.
     _run_id, worker = _submit_worker_spec(monkeypatch, _spec(hf_repo="freesolo-founders/whatever"))
-    assert worker["train"]["hf_repo"] == runner_artifacts.managed_hf_repo_for_run(
+    assert worker["train"]["hf_repo"] == runner_artifacts.managed_artifact_repo_for_run(
         worker["environment"]["id"], worker["run_id"]
     )
 
@@ -74,19 +74,21 @@ def test_managed_hf_repo_finalizes_local_run_id(monkeypatch):
     assert base.run_id == "local"
     run_id, worker = _submit_worker_spec(monkeypatch, base)
     assert run_id != "local"
-    assert worker["train"]["hf_repo"] == runner_artifacts.managed_hf_repo_for_run(
+    assert worker["train"]["hf_repo"] == runner_artifacts.managed_artifact_repo_for_run(
         worker["environment"]["id"], worker["run_id"]
     )
 
 
 def test_managed_hf_repo_reuses_repo_for_same_environment():
     env_id = "github:owner/repo@main:env/environment.py"
-    assert runner_artifacts.managed_hf_repo_for_environment(
+    assert runner_artifacts.managed_artifact_repo_for_environment(
         env_id
-    ) == runner_artifacts.managed_hf_repo_for_environment(env_id)
-    assert runner_artifacts.managed_hf_repo_for_environment(
+    ) == runner_artifacts.managed_artifact_repo_for_environment(env_id)
+    assert runner_artifacts.managed_artifact_repo_for_environment(
         env_id
-    ) != runner_artifacts.managed_hf_repo_for_environment("github:owner/repo@main:env/other.py")
+    ) != runner_artifacts.managed_artifact_repo_for_environment(
+        "github:owner/repo@main:env/other.py"
+    )
 
 
 def test_source_archive_path_is_content_addressed():
@@ -100,14 +102,16 @@ def test_concurrent_runs_do_not_share_the_repository_commit_quota():
     from huggingface_hub.utils import validate_repo_id
 
     env = "owner/project/environment"
-    one = runner_artifacts.managed_hf_repo_for_run(env, "flash-run-1")
-    two = runner_artifacts.managed_hf_repo_for_run(env, "flash-run-2")
+    one = runner_artifacts.managed_artifact_repo_for_run(env, "flash-run-1")
+    two = runner_artifacts.managed_artifact_repo_for_run(env, "flash-run-2")
     assert one != two
-    assert one == runner_artifacts.managed_hf_repo_for_run(env, "flash-run-1")
-    assert one != runner_artifacts.managed_hf_repo_for_run("another/environment", "flash-run-1")
-    assert one != runner_artifacts.managed_hf_repo_for_environment(env)
+    assert one == runner_artifacts.managed_artifact_repo_for_run(env, "flash-run-1")
+    assert one != runner_artifacts.managed_artifact_repo_for_run(
+        "another/environment", "flash-run-1"
+    )
+    assert one != runner_artifacts.managed_artifact_repo_for_environment(env)
     validate_repo_id(one)
-    validate_repo_id(runner_artifacts.managed_hf_repo_for_run(env, "long/" * 100))
+    validate_repo_id(runner_artifacts.managed_artifact_repo_for_run(env, "long/" * 100))
 
 
 def test_existing_preparation_keeps_legacy_repository_during_recovery(monkeypatch, tmp_path):
@@ -116,18 +120,18 @@ def test_existing_preparation_keeps_legacy_repository_during_recovery(monkeypatc
     spec = _spec()
     monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
     satisfy_sft_profile(monkeypatch, spec)
-    legacy = runner_artifacts.managed_hf_repo_for_environment(spec.environment.id)
+    legacy = runner_artifacts.managed_artifact_repo_for_environment(spec.environment.id)
 
     def legacy_assignment(job):
         raw = job.to_internal_dict()
         raw["train"]["hf_repo"] = legacy
         return JobSpec.from_dict(raw)
 
-    monkeypatch.setattr(runner_artifacts, "_assign_managed_hf_repo", legacy_assignment)
+    monkeypatch.setattr(runner_artifacts, "_assign_managed_artifact_repo", legacy_assignment)
     status = runner_submit.submit_job(spec, dry_run=True)
 
     def unexpected_assignment(_job):
         raise AssertionError("recovery must use its persisted artifact repository")
 
-    monkeypatch.setattr(runner_artifacts, "_assign_managed_hf_repo", unexpected_assignment)
+    monkeypatch.setattr(runner_artifacts, "_assign_managed_artifact_repo", unexpected_assignment)
     assert effective_spec_from_status(status).train.hf_repo == legacy

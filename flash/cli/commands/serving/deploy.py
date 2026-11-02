@@ -26,7 +26,7 @@ INFERENCE_KEY_ENV = "FLASH_SERVING_KEY"
 # control plane used to resolve that adapter. an artifact repo is private by default, and without
 # this the launcher reaches `_prepare_cache` with nothing to authenticate as and dies after the
 # provider has already created and started billing for every resource.
-ARTIFACT_TOKEN_ENV = "HF_TOKEN"
+ARTIFACT_TOKEN_ENV = "FLASH_ARTIFACT_BLOB_SAS_URL"
 
 
 def _report_command_error(message: str) -> int:
@@ -139,6 +139,18 @@ def _build_provider_plan(bundle):
     return build_modal_create_plan(bundle, phase="finalized")
 
 
+def _hydration_credentials():
+    import json
+
+    azure = _optional_env(ARTIFACT_TOKEN_ENV)
+    upstream = _optional_env("HF_TOKEN")
+    if azure is None:
+        return None
+    from flash.artifacts.config import validate_sas_url
+
+    return json.dumps({"azure": validate_sas_url(azure), "upstream": upstream})
+
+
 def _runtime_secrets():
     """build request-scoped endpoint secrets from the environment."""
 
@@ -146,7 +158,7 @@ def _runtime_secrets():
 
     return ServingRuntimeSecrets(
         inference_token=_required_env(INFERENCE_KEY_ENV),
-        artifact_token=_optional_env(ARTIFACT_TOKEN_ENV),
+        artifact_token=_hydration_credentials(),
     )
 
 

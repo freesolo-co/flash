@@ -5,7 +5,6 @@ from __future__ import annotations
 import gzip
 import hashlib
 import json
-import os
 import shutil
 import tarfile
 import tempfile
@@ -78,7 +77,7 @@ def is_staged_environment_transient_error(exc: BaseException) -> bool:
     """Classify timeout, connection, rate-limit, and server failures across clients."""
     from flash.envs.meta.identity import GitHubTransientError
     from flash.envs.registry.azure import RegistryError
-    from flash.providers.artifacts.hf import hf_status_code
+    from flash.providers.artifacts.channel import artifact_status_code
 
     current: BaseException | None = exc
     seen: set[int] = set()
@@ -88,7 +87,7 @@ def is_staged_environment_transient_error(exc: BaseException) -> bool:
             return True
         if isinstance(current, (StagedEnvironmentTransientError, GitHubTransientError)):
             return True
-        status = hf_status_code(current)
+        status = artifact_status_code(current)
         if status == 429 or (status is not None and status >= 500):
             return True
         name = type(current).__name__.lower()
@@ -387,11 +386,11 @@ def _download_staged_file(
     filename: str,
     token: str,
 ) -> Path:
-    from huggingface_hub import hf_hub_download
+    from flash.artifacts.api import download_file
 
     try:
         return Path(
-            hf_hub_download(
+            download_file(
                 repo_id=repo_id,
                 repo_type="dataset",
                 filename=filename,
@@ -420,9 +419,6 @@ def verify_staged_environment(
     package = environment.package
     if package is None:
         raise RuntimeError("worker job spec has no staged environment package")
-    token = (token if token is not None else os.environ.get("HF_TOKEN") or "").strip()
-    if not token:
-        raise RuntimeError("staged environment package requires HF_TOKEN")
     manifest_path = manifest_path_for_digest(package.manifest_sha256)
     manifest_file = _download_staged_file(
         repo_id=hf_repo,

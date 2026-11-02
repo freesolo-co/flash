@@ -19,7 +19,7 @@ import flash.engine.worker.perf as worker_perf
 from flash.engine.result.rollout_samples import (
     select_rollout_samples,
 )
-from flash.engine.worker.io import hf as hf_io
+from flash.engine.worker.io import artifacts as hf_io
 from flash.engine.worker.runtime.state import WorkerContext
 from flash.engine.worker.verl.parent_work import ParentWorkGauge
 
@@ -309,11 +309,13 @@ def heartbeat(
                         _set_upload_in_flight(True, context=context)
                     try:
                         if initial:
-                            committed = hf_io.hf_upload_file(
+                            committed = hf_io.upload_artifact_file(
                                 up, "heartbeat.json", required=True, context=context
                             )
                         else:
-                            committed = hf_io.hf_upload_file(up, "heartbeat.json", context=context)
+                            committed = hf_io.upload_artifact_file(
+                                up, "heartbeat.json", context=context
+                            )
                     finally:
                         # cleared before the throttle clock is advanced below, and in a finally so a
                         # raising upload cannot leave every later heartbeat permanently skipped.

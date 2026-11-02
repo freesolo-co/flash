@@ -399,7 +399,9 @@ def test_me_surfaces_verify_identity_fields_through_api(tmp_path, monkeypatch) -
     from fastapi.testclient import TestClient
 
     monkeypatch.setenv("FREESOLO_INTERNAL_KEY", "fslo-internal-test")
-    monkeypatch.setenv("HF_TOKEN", "hf-test")
+    monkeypatch.setenv(
+        "FLASH_ARTIFACT_BLOB_SAS_URL", "https://test.blob.core.windows.net/artifacts?sig=test"
+    )
     monkeypatch.setenv("FREESOLO_BASE_URL", "https://freesolo.test")
     monkeypatch.setenv("GITHUB_TOKEN", "ghp-test")
 

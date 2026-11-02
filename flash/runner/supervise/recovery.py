@@ -41,7 +41,7 @@ def _completed_worker_metrics(handle, *, deadline_at=None):
         TerminalKind,
         resolve_terminal_artifacts,
     )
-    from flash.providers.artifacts.hf import make_hf_text_reader
+    from flash.providers.artifacts.channel import make_artifact_text_reader
     from flash.providers.modal.handles import ModalJobHandle
 
     try:
@@ -52,10 +52,10 @@ def _completed_worker_metrics(handle, *, deadline_at=None):
         ) + _RECOVERY_MARKER_GRACE_S
         read_deadline = min(cutoff, time.time() + _MODAL_STATUS_PROBE_TIMEOUT_S)
         prefix = f"{h.phase}/{h.run_id}"
-        marker = make_hf_text_reader(
+        marker = make_artifact_text_reader(
             h.hf_repo, f"{prefix}/modal_attempt{h.attempt}.json", deadline_at=read_deadline
         )
-        metrics = make_hf_text_reader(
+        metrics = make_artifact_text_reader(
             h.hf_repo, f"{prefix}/metrics.json", deadline_at=read_deadline
         )
         resolution = resolve_terminal_artifacts(
@@ -121,14 +121,14 @@ def _completed_attempt_metrics(
         TerminalKind,
         resolve_terminal_artifacts,
     )
-    from flash.providers.artifacts.hf import make_hf_text_reader
+    from flash.providers.artifacts.channel import make_artifact_text_reader
 
     prefix = f"{spec.phase}/{spec.run_id}"
-    marker_reader = make_hf_text_reader(
+    marker_reader = make_artifact_text_reader(
         spec.train.hf_repo,
         f"{prefix}/{provider}_attempt{attempt}.json",
     )
-    metrics_reader = make_hf_text_reader(spec.train.hf_repo, f"{prefix}/metrics.json")
+    metrics_reader = make_artifact_text_reader(spec.train.hf_repo, f"{prefix}/metrics.json")
     say = make_say(log)
     marker_bound = deadline_at + _RECOVERY_MARKER_GRACE_S
     # ONE observation window for both artifacts. it previously computed a fresh window for the

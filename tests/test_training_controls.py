@@ -7,8 +7,8 @@ from types import SimpleNamespace
 
 import pytest
 
+import flash.engine.worker.io.artifacts as worker_hf
 import flash.engine.worker.io.heartbeat as worker_heartbeat
-import flash.engine.worker.io.hf as worker_hf
 from flash.core.grpo import GRPO_NATIVE_THREAD_ENV
 from flash.core.spec import FIXED_SEED, EnvironmentSpec, JobSpec, TrainSpec
 from flash.engine.plan.steps import (
@@ -203,7 +203,7 @@ def test_resume_checkpoint_failure_heartbeat_surfaces_sanitized_error(
     monkeypatch.setattr(
         worker_context, "config", replace(worker_context.config, hf_repo="org/runs")
     )
-    monkeypatch.setattr(worker_hf, "hf_api", lambda: Api())
+    monkeypatch.setattr(worker_hf, "artifact_api", lambda: Api())
     monkeypatch.setattr(
         worker_heartbeat,
         "heartbeat",
@@ -550,7 +550,7 @@ def test_resume_commit_survives_post_commit_failures(
     monkeypatch.setattr(
         worker_context, "config", replace(worker_context.config, hf_repo="org/runs")
     )
-    monkeypatch.setattr(worker_hf, "hf_api", lambda: Api())
+    monkeypatch.setattr(worker_hf, "artifact_api", lambda: Api())
     monkeypatch.setattr(worker_heartbeat, "heartbeat", report)
     result = worker_hf.upload_resume_checkpoint(4, str(tmp_path), context=worker_context)
     assert result.resume.revision == "immutable-revision"
@@ -601,8 +601,8 @@ def test_resume_transport_cleanup_failure_still_clears_previous_failure(
     monkeypatch.setattr(
         worker_context, "config", replace(worker_context.config, hf_repo="org/runs")
     )
-    monkeypatch.setattr(worker_hf, "hf_api", Api)
-    monkeypatch.setattr(worker_hf, "hf_upload_file", upload_report)
+    monkeypatch.setattr(worker_hf, "artifact_api", Api)
+    monkeypatch.setattr(worker_hf, "upload_artifact_file", upload_report)
     monkeypatch.setattr(checkpoint_transport, "upload_directory", broken_cleanup)
     worker_heartbeat.heartbeat(
         "checkpoint_upload_failed",

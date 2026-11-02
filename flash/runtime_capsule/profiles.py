@@ -29,12 +29,16 @@ _INSTANCE_BOOTSTRAP_SOURCES = (
     (f"{_LIFECYCLE}/bootstrapping/pip.py", "bootstrap_pip.py"),
     (f"{_LIFECYCLE}/bootstrapping/processes.py", "bootstrap_processes.py"),
     ("flash/snapshot/archive.py", "archive.py"),
+    ("flash/artifacts/config.py", "artifact_config.py"),
+    ("flash/artifacts/manifest.py", "artifact_manifest.py"),
+    ("flash/artifacts/storage.py", "artifact_storage.py"),
+    ("flash/artifacts/api.py", "artifact_api.py"),
 )
 
 PROFILES: dict[str, Profile] = {
     "instance-bootstrap": Profile(
         name="instance-bootstrap",
-        version=7,
+        version=8,
         entrypoint="bootstrap.py",
         sources=_INSTANCE_BOOTSTRAP_SOURCES,
     ),

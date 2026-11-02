@@ -55,7 +55,8 @@ def _install_hub(monkeypatch, tmp_path: Path, config: dict) -> None:
         return str(tmp_path / Path(filename).name)
 
     monkeypatch.setattr(resolve_module, "_hub_api", lambda: _Api())
-    monkeypatch.setattr("huggingface_hub.hf_hub_download", _download)
+    monkeypatch.setattr("flash.artifacts.api.ArtifactStore", lambda: _Api())
+    monkeypatch.setattr("flash.artifacts.api.download_file", _download)
 
 
 def _resolve(**overrides):
@@ -175,7 +176,7 @@ def test_unusable_adapter_weights_fail_resolution_without_an_extra_download(
         downloads.append(filename)
         return str(tmp_path / Path(filename).name)
 
-    monkeypatch.setattr("huggingface_hub.hf_hub_download", download)
+    monkeypatch.setattr("flash.artifacts.api.download_file", download)
 
     with pytest.raises(ResolveError, match=expected):
         _resolve()
@@ -345,8 +346,9 @@ def test_an_unreadable_config_is_a_resolve_error(monkeypatch, tmp_path) -> None:
             return _Info()
 
     monkeypatch.setattr(resolve_module, "_hub_api", lambda: _Api())
+    monkeypatch.setattr("flash.artifacts.api.ArtifactStore", lambda: _Api())
     monkeypatch.setattr(
-        "huggingface_hub.hf_hub_download",
+        "flash.artifacts.api.download_file",
         lambda *, filename, **_kwargs: str(tmp_path / Path(filename).name),
     )
 
@@ -399,8 +401,9 @@ def test_a_duplicate_key_is_rejected_before_provider_resources_exist(monkeypatch
             return _Info()
 
     monkeypatch.setattr(resolve_module, "_hub_api", lambda: _Api())
+    monkeypatch.setattr("flash.artifacts.api.ArtifactStore", lambda: _Api())
     monkeypatch.setattr(
-        "huggingface_hub.hf_hub_download",
+        "flash.artifacts.api.download_file",
         lambda *, filename, **_kwargs: str(tmp_path / Path(filename).name),
     )
 
@@ -486,8 +489,9 @@ def test_a_config_the_container_cannot_decode_is_rejected_here(
             return _Info()
 
     monkeypatch.setattr(resolve_module, "_hub_api", lambda: _Api())
+    monkeypatch.setattr("flash.artifacts.api.ArtifactStore", lambda: _Api())
     monkeypatch.setattr(
-        "huggingface_hub.hf_hub_download",
+        "flash.artifacts.api.download_file",
         lambda *, filename, **_kwargs: str(tmp_path / Path(filename).name),
     )
 

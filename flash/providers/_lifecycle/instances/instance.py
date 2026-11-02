@@ -148,6 +148,10 @@ def build_payload(
     attempt_id = _attempt_int(attempt)
     if attempt_id is None:
         raise ValueError("instance attempt identity is invalid")
+    if spec.algorithm == "custom":
+        from flash.custom.managed import session_token
+
+        env["FLASH_CUSTOM_SESSION_TOKEN"] = session_token(spec.run_id, attempt_id)
     max_wall_seconds = float(spec.gpu.max_wall_seconds)
     payload = {
         "hf_repo": spec.train.hf_repo,

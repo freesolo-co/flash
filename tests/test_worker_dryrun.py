@@ -65,7 +65,7 @@ def test_heartbeat_concurrent_calls_stay_safe(worker_context, monkeypatch):
         except Exception as e:  # truncated/garbled/missing -> a concurrency bug
             bad.append(e)
 
-    monkeypatch.setattr(ne.hf_io, "hf_upload_file", fake_upload)
+    monkeypatch.setattr(ne.hf_io, "upload_artifact_file", fake_upload)
 
     errors: list[Exception] = []
     barrier = _threading.Barrier(8)
@@ -146,7 +146,7 @@ def test_heartbeat_uploads_are_serialized_and_use_claimed_snapshot(worker_contex
                 mismatches.append((expected_stage, obj))
             inflight -= 1
 
-    monkeypatch.setattr(ne.hf_io, "hf_upload_file", fake_upload)
+    monkeypatch.setattr(ne.hf_io, "upload_artifact_file", fake_upload)
 
     barrier = _threading.Barrier(6)
     errors: list[Exception] = []

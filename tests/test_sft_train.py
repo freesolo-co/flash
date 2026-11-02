@@ -19,9 +19,8 @@ from types import SimpleNamespace
 
 import pytest
 
-import flash.engine.worker.entry.worker as worker_entry
-import flash.engine.worker.io.hf as _publication
-import flash.engine.worker.io.hf as worker_hf
+import flash.engine.worker.io.artifacts as _publication
+import flash.engine.worker.io.artifacts as worker_hf
 import flash.engine.worker.train.entry.rl_train_runner as rl_train_runner
 from flash.content.multimodal import message_content_text
 from flash.engine.profiling.sft_image_rows import _serialize_multimodal_inputs
@@ -2015,7 +2014,7 @@ def test_child_env_carries_every_baked_kernel_cache_dir(worker_context, monkeypa
 def test_checkpoint_watcher_exports_and_uploads_required_step(
     worker_context, monkeypatch, tmp_path
 ):
-    import flash.engine.worker.io.hf as worker
+    import flash.engine.worker.io.artifacts as worker
     from flash.engine.worker.train.entry import sft_train
 
     checkpoint_dir = tmp_path / "checkpoints" / "global_step_5"
@@ -2080,7 +2079,7 @@ def test_checkpoint_watcher_exports_and_uploads_required_step(
 def test_checkpoint_watcher_exports_the_sft_layout(worker_context, monkeypatch, tmp_path):
     # this is the layout verl's sft trainer actually writes: shards + huggingface/ directly under
     # global_step_N. exporting <dir>/actor here hands the merger a path that does not exist.
-    import flash.engine.worker.io.hf as worker
+    import flash.engine.worker.io.artifacts as worker
     from flash.engine.worker.train.entry import sft_train
 
     checkpoint_dir = tmp_path / "checkpoints" / "global_step_5"
@@ -2139,7 +2138,7 @@ def test_a_required_save_survives_verl_pruning_it_mid_publish(
     deletes verl's directory the way verl would, then reads the source it was handed. before staging,
     that read fails and takes the whole paid run down with a required-save error.
     """
-    import flash.engine.worker.io.hf as worker
+    import flash.engine.worker.io.artifacts as worker
     from flash.engine.worker.train.entry import sft_train
 
     local_dir = tmp_path / "checkpoints"
@@ -2193,7 +2192,7 @@ def test_a_required_save_survives_verl_pruning_it_mid_publish(
 
 
 def test_resume_credits_only_required_saves_that_are_durable(worker_context, monkeypatch):
-    import flash.engine.worker.io.hf as worker
+    import flash.engine.worker.io.artifacts as worker
     from flash.engine.worker.train.entry import sft_train
 
     class Api:
@@ -2204,7 +2203,7 @@ def test_resume_credits_only_required_saves_that_are_durable(worker_context, mon
         worker_context, "config", replace(worker_context.config, hf_repo="owner/artifacts")
     )
     monkeypatch.setattr(worker, "hf_prefix", lambda context=None, **_context: "sft/run")
-    monkeypatch.setattr(worker_hf, "hf_api", Api)
+    monkeypatch.setattr(worker_hf, "artifact_api", Api)
 
     assert sft_train._durable_required_save_steps((3, 5, 9), 5, context=worker_context) == {3}
 
@@ -2237,7 +2236,7 @@ def test_a_resumed_sft_run_does_not_republish_the_step_it_resumed_from(
     ``verl.model_merger`` and re-uploads multi-GB state hf already holds, holding the single
     resume-upload lock while the first genuinely new checkpoint waits behind it.
     """
-    import flash.engine.worker.io.hf as worker
+    import flash.engine.worker.io.artifacts as worker
     from flash.engine.worker.train.entry import sft_train
     from flash.engine.worker.train.entry.backend_common import stage_verl_resume
 
@@ -2329,8 +2328,8 @@ def _stub_sft_run(
     """
     import flash.core.catalog as catalog
     import flash.engine.plan.vram as vram
+    import flash.engine.worker.io.artifacts as worker_hf
     import flash.engine.worker.io.heartbeat as worker_heartbeat
-    import flash.engine.worker.io.hf as worker_hf
     import flash.engine.worker.io.wandb_log as worker_wandb
     import flash.engine.worker.model.adapter as worker_adapter
     import flash.engine.worker.perf as worker_perf
@@ -2339,6 +2338,7 @@ def _stub_sft_run(
     from flash.engine.worker.train.entry import sft_train
 
     monkeypatch.setattr(catalog, "resolve_vocab_size", lambda *_args, **_kwargs: 151936)
+    monkeypatch.setattr(sft_train, "model_is_gdn_hybrid", lambda *_args, **_kwargs: False)
 
     spec = SimpleNamespace(
         model="Qwen/Qwen3.5-9B",
@@ -2579,7 +2579,7 @@ def _stub_sft_run(
     )
     monkeypatch.setattr(
         worker_hf,
-        "hf_upload_folder",
+        "upload_artifact_folder",
         lambda local, remote, required=False, context=None, **_context: captured["uploads"].append(
             (local, remote, required)
         ),
@@ -4129,7 +4129,7 @@ def test_publish_does_not_leave_every_step_adapter_on_the_container_disk(
     asserts the directory is gone AFTER publish rather than counting bytes: the leak is one
     undeleted directory per save, and its size is a property of the model, not of this bug.
     """
-    import flash.engine.worker.io.hf as worker
+    import flash.engine.worker.io.artifacts as worker
     from flash.engine.worker.train.entry import sft_train
 
     local_dir = tmp_path / "checkpoints"
@@ -4187,7 +4187,7 @@ def test_a_failed_upload_still_frees_the_exported_adapter(worker_context, monkey
     retrying uploads is exactly the run that is short on space -- so once the adapter is durable on
     hf, a LATER failure in the same publish must not strand the now-redundant local copy.
     """
-    import flash.engine.worker.io.hf as worker
+    import flash.engine.worker.io.artifacts as worker
     from flash.engine.worker.train.entry import sft_train
 
     local_dir = tmp_path / "checkpoints"
@@ -4231,37 +4231,9 @@ def test_a_failed_upload_still_frees_the_exported_adapter(worker_context, monkey
     )
 
 
-def test_worker_disables_xet_upload_staging_before_importing_hf(monkeypatch):
-    """uploads must stream from the checkpoint, not stage a second copy beside it.
-
-    `hf_xet` is an unconditional dependency of `huggingface-hub` on x86_64, and Xet is selected
-    merely because it imports -- so `upload_folder` chunks through a cache under `HF_XET_CACHE`
-    (default `$HF_HOME/xet`), the same container disk holding the checkpoint. The legacy path
-    streams from the source handle instead. A real 35b run died with ENOSPC under that staging dir.
-    """
-    from flash.engine.worker.io import hf
-
-    monkeypatch.delenv("HF_HUB_DISABLE_XET", raising=False)
-    hf._disable_xet_upload_staging()
-    assert os.environ["HF_HUB_DISABLE_XET"] == "1"
-
-
-def test_an_explicit_xet_choice_is_not_overridden(monkeypatch):
-    """paired control: an operator who deliberately set the variable keeps their value.
-
-    Proves the fix is a default, not a hardcode -- and that the assertion above is reading flash's
-    own write rather than a value that was already there.
-    """
-    from flash.engine.worker.io import hf
-
-    monkeypatch.setenv("HF_HUB_DISABLE_XET", "0")
-    hf._disable_xet_upload_staging()
-    assert os.environ["HF_HUB_DISABLE_XET"] == "0"
-
-
 def test_an_adapter_is_freed_when_publication_is_skipped(worker_context, monkeypatch, tmp_path):
     """No watcher reads a discovered step's export again, even when publication was skipped."""
-    import flash.engine.worker.io.hf as worker
+    import flash.engine.worker.io.artifacts as worker
     from flash.engine.worker.train.entry import sft_train
 
     local_dir = tmp_path / "checkpoints"
@@ -4302,43 +4274,6 @@ def test_an_adapter_is_freed_when_publication_is_skipped(worker_context, monkeyp
     )
 
 
-def test_importing_the_worker_package_does_not_freeze_the_xet_default(monkeypatch):
-    """the disable must still be able to take effect when the worker starts.
-
-    `huggingface_hub.constants` reads HF_HUB_DISABLE_XET into a module constant at import time, so
-    setting the variable afterwards changes nothing -- `is_xet_available()` keeps returning True and
-    uploads keep staging through the xet cache. That makes this an ORDERING contract, not just a
-    setenv: if anything ever pulls huggingface_hub in at `flash.engine.worker` import time, the fix
-    silently becomes a no-op while every assertion about the env var still passes.
-
-    Asserts the resulting behaviour rather than the call order, so a refactor that moves the call,
-    or adds a module-level hf import above it, fails here instead of in production.
-    """
-    import subprocess
-    import sys
-
-    probe = (
-        "import os, sys\n"
-        "os.environ.pop('HF_HUB_DISABLE_XET', None)\n"
-        "import flash.engine.worker\n"
-        "assert not [m for m in sys.modules if m.startswith('huggingface_hub')], (\n"
-        "    'huggingface_hub was imported during flash.engine.worker import; '\n"
-        "    'the xet default is frozen before the worker can disable it'\n"
-        ")\n"
-        "from flash.engine.worker.io.hf import _disable_xet_upload_staging\n"
-        "_disable_xet_upload_staging()\n"
-        "from huggingface_hub.utils._runtime import is_xet_available\n"
-        "assert not is_xet_available(), 'xet is still selected for uploads'\n"
-    )
-    result = subprocess.run(
-        [sys.executable, "-c", probe],
-        capture_output=True,
-        text=True,
-        cwd=str(pathlib.Path(__file__).resolve().parent.parent),
-    )
-    assert result.returncode == 0, result.stderr
-
-
 def test_repeated_swallowed_publish_failures_do_not_accumulate_adapters(
     worker_context, monkeypatch, tmp_path
 ):
@@ -4357,7 +4292,7 @@ def test_repeated_swallowed_publish_failures_do_not_accumulate_adapters(
     once": I mutated the cleanup to skip exactly one step and a single-step version still passed,
     while this one caught it.
     """
-    import flash.engine.worker.io.hf as worker
+    import flash.engine.worker.io.artifacts as worker
     from flash.engine.worker.train.entry import sft_train
 
     local_dir = tmp_path / "checkpoints"
@@ -4701,7 +4636,7 @@ def test_the_rl_watcher_keeps_a_staged_adapter_until_a_later_sweep_publishes_it(
         ),
     )
 
-    monkeypatch.setattr(rl_checkpoints._worker_hf, "hf_upload_folder", lambda *a, **kw: True)
+    monkeypatch.setattr(rl_checkpoints._worker_hf, "upload_artifact_folder", lambda *a, **kw: True)
 
     local_dir = tmp_path / "ckpts"
     export_root = tmp_path / "rl-exports"
@@ -4767,7 +4702,7 @@ def test_a_failed_export_does_not_strand_a_partial_adapter(worker_context, monke
     run whose exports keep failing that is one partial adapter per save -- the accumulation this
     class exists to bound, reached through the failure path instead of the success one.
     """
-    import flash.engine.worker.io.hf as worker
+    import flash.engine.worker.io.artifacts as worker
     from flash.engine.worker.train.entry import sft_train
 
     local_dir = tmp_path / "checkpoints"
@@ -4812,43 +4747,6 @@ def test_a_failed_export_does_not_strand_a_partial_adapter(worker_context, monke
 
     assert not os.path.exists(export_root / "step-7"), (
         "a failed export left a partial adapter on the container disk"
-    )
-
-
-def test_the_worker_disables_xet_as_its_very_first_action():
-    """the startup wiring itself, not just the helper.
-
-    The other xet tests call `_disable_xet_upload_staging()` directly, or assert that importing the
-    worker package does not freeze the default. Neither notices if the CALL is deleted from
-    `_run_worker_mode` -- I verified that by removing it, and all three stayed green.
-
-    Asserted over the AST rather than by running the worker. `_run_worker_mode` performs real boot
-    work (heartbeat, kernel cache, gpu probe) and cannot be driven to a mode handler in a test
-    process, and observing `os.environ` in-process cannot attribute the value anyway: an earlier
-    test in the same session may already have set it.
-
-    What actually has to hold is an ordering property, and ordering is exactly what the AST shows:
-    the disable must be the FIRST executable statement, because `huggingface_hub.constants` captures
-    `HF_HUB_DISABLE_XET` at import time and any import above it would freeze the default first.
-    Matching the call by name also survives the alternate spellings a substring grep would miss.
-    """
-    import ast
-    import textwrap
-
-    tree = ast.parse(textwrap.dedent(inspect.getsource(worker_entry._run_worker_mode)))
-    body = ast.get_docstring(tree.body[0], clean=False) and tree.body[0].body[1:]
-    first = (body or tree.body[0].body)[0]
-
-    value = first.value if isinstance(first, ast.Expr) else None
-    called = value.func if isinstance(value, ast.Call) else None
-    assert isinstance(called, ast.Name | ast.Attribute), (
-        f"the first statement of _run_worker_mode is {ast.dump(first)[:80]}, not a call; "
-        "xet staging must be disabled before anything else can import huggingface_hub"
-    )
-    name = called.attr if isinstance(called, ast.Attribute) else called.id
-    assert name == "_disable_xet_upload_staging", (
-        f"_run_worker_mode starts by calling {name!r}, not _disable_xet_upload_staging; "
-        "uploads would stage a second copy of every checkpoint through the xet cache"
     )
 
 
@@ -4934,7 +4832,7 @@ def test_an_unuploadable_resume_checkpoint_does_not_fail_a_published_required_sa
 
     The deployable result proves a commit; the native result contains only an upload error.
     """
-    import flash.engine.worker.io.hf as worker
+    import flash.engine.worker.io.artifacts as worker
     from flash.engine.worker.train.entry import sft_train
 
     local_dir = tmp_path / "checkpoints"
@@ -4994,7 +4892,7 @@ def test_a_required_save_whose_adapter_never_published_still_fails_the_run(
     other half -- a required step that never became servable must still raise -- so that relaxation
     can never be widened into "required saves are best effort" without turning this red.
     """
-    import flash.engine.worker.io.hf as worker
+    import flash.engine.worker.io.artifacts as worker
     from flash.engine.worker.train.entry import sft_train
 
     local_dir = tmp_path / "checkpoints"

@@ -39,9 +39,9 @@ def test_file_identity_rejects_metadata_without_immutable_content() -> None:
 
 
 @pytest.mark.parametrize("mode", ["api-error", "invalid-sha"])
-def test_resolve_hf_dataset_revision_fails_closed(monkeypatch, mode) -> None:
+def test_resolve_artifact_revision_fails_closed(monkeypatch, mode) -> None:
     """Dataset revision pinning must reject both API failures and mutable revision values."""
-    import huggingface_hub
+    from flash.artifacts import api as artifact_storage
 
     class FakeApi:
         def __init__(self, token=None):
@@ -52,10 +52,10 @@ def test_resolve_hf_dataset_revision_fails_closed(monkeypatch, mode) -> None:
                 raise RuntimeError("hub unavailable")
             return SimpleNamespace(sha="main")
 
-    monkeypatch.setattr(huggingface_hub, "HfApi", FakeApi)
+    monkeypatch.setattr(artifact_storage, "ArtifactStore", FakeApi)
     message = "could not pin" if mode == "api-error" else "immutable commit SHA"
     with pytest.raises(ValueError, match=message):
-        lora_rank.resolve_hf_dataset_revision("owner/data", token="token")
+        lora_rank.resolve_artifact_revision("owner/data", token="token")
 
 
 def test_typed_canonical_tree_encodes_all_json_scalar_and_array_types() -> None:
@@ -84,7 +84,7 @@ def test_adapter_artifact_identity_rejects_invalid_reference(monkeypatch) -> Non
 @pytest.mark.parametrize("mode", ["api-error", "no-weight"])
 def test_adapter_artifact_identity_fails_closed_on_remote_metadata(monkeypatch, mode) -> None:
     """Artifact identity must reject unavailable metadata and repositories without required weights."""
-    import huggingface_hub
+    from flash.artifacts import api as artifact_storage
 
     monkeypatch.setattr(lora_rank, "resolve_adapter_ref", lambda ref: ("owner/runs", "sft/run"))
 
@@ -97,7 +97,7 @@ def test_adapter_artifact_identity_fails_closed_on_remote_metadata(monkeypatch, 
                 raise RuntimeError("hub unavailable")
             return [SimpleNamespace(path="sft/run/adapter/README.md")]
 
-    monkeypatch.setattr(huggingface_hub, "HfApi", FakeApi)
+    monkeypatch.setattr(artifact_storage, "ArtifactStore", FakeApi)
     message = "could not verify" if mode == "api-error" else "no required weight file"
     with pytest.raises(ValueError, match=message):
         lora_rank.adapter_artifact_identity("owner/runs:sft/run", {"r": 8})
@@ -123,11 +123,11 @@ def test_inspect_adapter_config_rejects_non_mapping_config() -> None:
 
 
 @pytest.mark.parametrize("mode", ["download", "invalid-json", "non-object"])
-def test_load_hf_adapter_config_reports_remote_and_json_failures(
+def test_load_artifact_adapter_config_reports_remote_and_json_failures(
     tmp_path, monkeypatch, mode
 ) -> None:
     """Adapter config loading must classify download, parse, and top-level shape failures."""
-    import huggingface_hub
+    from flash.artifacts import api as artifact_storage
 
     monkeypatch.setattr(
         lora_rank,
@@ -145,14 +145,14 @@ def test_load_hf_adapter_config_reports_remote_and_json_failures(
             raise RuntimeError("hub unavailable")
         return str(path)
 
-    monkeypatch.setattr(huggingface_hub, "hf_hub_download", download)
+    monkeypatch.setattr(artifact_storage, "download_file", download)
     message = {
         "download": "failed to read",
         "invalid-json": "invalid JSON",
         "non-object": "is not a JSON object",
     }[mode]
     with pytest.raises(ValueError, match=message):
-        lora_rank.load_hf_adapter_config("owner/runs:sft/run")
+        lora_rank.load_artifact_adapter_config("owner/runs:sft/run")
 
 
 def test_preflight_without_warm_start_returns_none() -> None:

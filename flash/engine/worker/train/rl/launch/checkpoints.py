@@ -10,7 +10,7 @@ import shutil
 import threading
 import time
 
-import flash.engine.worker.io.hf as _worker_hf
+import flash.engine.worker.io.artifacts as _worker_hf
 import flash.engine.worker.verl.checkpoints as verl_checkpoints
 from flash._internal.fileio import reject_duplicate_keys
 from flash.adapters.artifacts import MAX_ATTEMPT_ID, has_loadable_adapter_weights
@@ -293,7 +293,7 @@ class _VerlResumeUploader:
     def credit_durable_required_steps(self, resume_step: int) -> None:
         """credit required deployables that are verifiably servable before this attempt."""
         for step in sorted(self.required_steps):
-            if step <= int(resume_step) and _worker_hf._deployable_adapter_on_hf(
+            if step <= int(resume_step) and _worker_hf._deployable_adapter_in_storage(
                 step, context=self.context
             ):
                 self.lifecycle.mark_deployable_published(step)
@@ -421,7 +421,7 @@ class _VerlResumeUploader:
         if step in self._internal_adapter_attempts:
             return
         _validate_internal_adapter_dir(adapter_dir, label=f"step-{step}")
-        uploaded = _worker_hf.hf_upload_folder(
+        uploaded = _worker_hf.upload_artifact_folder(
             adapter_dir,
             f"checkpoint/{_HF_REQUIRED_ADAPTER_ROOT}/attempt-{self._attempt}/step-{step}/adapter",
             required=True,

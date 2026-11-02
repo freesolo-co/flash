@@ -124,7 +124,7 @@ def _artifact_files(repo_id: str, repo_type: str, revision: str, subfolder: str)
     verification is exactly what a missing digest would defeat.
     """
 
-    from huggingface_hub import hf_hub_download
+    from flash.artifacts.api import download_file
 
     prefix = subfolder.strip("/")
     files: list[ArtifactFile] = []
@@ -132,12 +132,12 @@ def _artifact_files(repo_id: str, repo_type: str, revision: str, subfolder: str)
     for name in (ADAPTER_CONFIG, ADAPTER_WEIGHTS):
         remote = f"{prefix}/{name}" if prefix else name
         try:
-            local = hf_hub_download(
+            local = download_file(
                 repo_id=repo_id,
                 filename=remote,
                 repo_type=repo_type,
                 revision=revision,
-                token=_token(),
+                token=None,
             )
         except Exception as exc:
             raise ResolveError(f"could not read {repo_id}@{revision}:{remote}") from exc
@@ -229,7 +229,9 @@ def resolve_adapter(
 
     checkpoint_step = _checkpoint_step_from_subfolder(artifact_subfolder, checkpoint_step)
     try:
-        info = _hub_api().repo_info(repo_id=artifact_repo_id, repo_type=artifact_repo_type)
+        from flash.artifacts.api import ArtifactStore
+
+        info = ArtifactStore().repo_info(repo_id=artifact_repo_id, repo_type=artifact_repo_type)
         artifact_revision = str(getattr(info, "sha", "") or "").strip().lower()
     except Exception as exc:
         raise ResolveError(f"could not resolve the revision for {artifact_repo_id}") from exc

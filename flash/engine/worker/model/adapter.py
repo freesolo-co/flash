@@ -16,12 +16,12 @@ from flash.adapters.fused_experts import (
 from flash.adapters.lora_rank import resolve_adapter_ref
 from flash.adapters.targets import LoraTargeting, require_modality_marker, resolve_lora_targeting
 from flash.engine.plan.recipe import RECIPE
-from flash.engine.worker.io.hf import (
+from flash.engine.worker.io.artifacts import (
     RetriableInfraError,
     _has_deployable_adapter,
     _prefetch_error_is_retriable,
-    _require_hf_deadline_allowance,
-    _sleep_with_hf_deadline,
+    _require_artifact_deadline_allowance,
+    _sleep_with_artifact_deadline,
 )
 from flash.engine.worker.model.lora import (
     _read_adapter_tensor_keys,
@@ -125,7 +125,7 @@ def _download_adapter(adapter_prefix: str | None, *, context: WorkerContext) -> 
     if not resolved:
         return None
     repo, prefix = resolved
-    from huggingface_hub import snapshot_download
+    from flash.artifacts.api import download_snapshot
 
     adir = os.path.join("/tmp/evdl", prefix, "adapter")
     # start from a clean path so the loadable-check can only ever accept files THIS download
@@ -134,14 +134,14 @@ def _download_adapter(adapter_prefix: str | None, *, context: WorkerContext) -> 
     # mask a terminal 404/403/429 for the current repo/revision.
     shutil.rmtree(adir, ignore_errors=True)
     for attempt in range(_ADAPTER_DOWNLOAD_RETRIES):
-        _require_hf_deadline_allowance(context=context)
+        _require_artifact_deadline_allowance(context=context)
         try:
-            snapshot_download(
+            download_snapshot(
                 repo_id=repo,
                 repo_type="dataset",
                 allow_patterns=[f"{prefix}/adapter/*"],
                 local_dir="/tmp/evdl",
-                token=os.environ.get("HF_TOKEN"),
+                token=None,
                 revision=(
                     context.config.spec.train.init_from_adapter_revision
                     if context.config.spec
@@ -166,7 +166,7 @@ def _download_adapter(adapter_prefix: str | None, *, context: WorkerContext) -> 
         shutil.rmtree(adir, ignore_errors=True)
         if attempt + 1 < _ADAPTER_DOWNLOAD_RETRIES:
             try:
-                if not _sleep_with_hf_deadline(
+                if not _sleep_with_artifact_deadline(
                     _ADAPTER_DOWNLOAD_BACKOFF_S * (attempt + 1), context=context
                 ):
                     break

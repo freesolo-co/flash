@@ -15,6 +15,7 @@ _DEPLOYMENT_ENV_VARS = (
     "MODAL_IS_REMOTE",
     "FREESOLO_INTERNAL_KEY",
     "HF_TOKEN",
+    "FLASH_ARTIFACT_BLOB_SAS_URL",
     "PLATFORM_BACKEND_URL",
     "SUPABASE_PROJECT_REF",
     "SUPABASE_PROJECT_REF_DEV",
@@ -24,6 +25,7 @@ _DEPLOYMENT_ENV_VARS = (
 _DEVELOPMENT_WIRING = {
     "FREESOLO_INTERNAL_KEY": "dev-internal-key",
     "HF_TOKEN": "dev-hf-key",
+    "FLASH_ARTIFACT_BLOB_SAS_URL": "https://test.blob.core.windows.net/artifacts-dev?sig=test",
     "PLATFORM_BACKEND_URL": "https://api-dev.freesolo.co",
     "SERVING_CUSTOM_DOMAIN": "serve-dev.freesolo.co",
     "SERVING_DEPLOYMENT_MODE": "development",

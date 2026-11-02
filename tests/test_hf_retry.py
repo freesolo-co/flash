@@ -5,10 +5,10 @@ import time
 
 import pytest
 
-from flash.providers.artifacts.hf import hf_call
+from flash.providers.artifacts.channel import artifact_call
 
 
-def test_hf_call_returns_real_success_after_deadline() -> None:
+def test_artifact_call_returns_real_success_after_deadline() -> None:
     mutations: list[str] = []
 
     def finish_late() -> str:
@@ -16,7 +16,7 @@ def test_hf_call_returns_real_success_after_deadline() -> None:
         mutations.append("done")
         return "uploaded"
 
-    result = hf_call(
+    result = artifact_call(
         finish_late,
         "upload",
         logger=logging.getLogger(__name__),
@@ -27,7 +27,7 @@ def test_hf_call_returns_real_success_after_deadline() -> None:
     assert mutations == ["done"]
 
 
-def test_hf_call_returns_real_failure_after_deadline_without_retry() -> None:
+def test_artifact_call_returns_real_failure_after_deadline_without_retry() -> None:
     attempts = 0
 
     class TransientError(RuntimeError):
@@ -40,7 +40,7 @@ def test_hf_call_returns_real_failure_after_deadline_without_retry() -> None:
         raise TransientError("provider unavailable")
 
     with pytest.raises(TransientError, match="provider unavailable"):
-        hf_call(
+        artifact_call(
             fail_late,
             "download",
             logger=logging.getLogger(__name__),
@@ -51,7 +51,7 @@ def test_hf_call_returns_real_failure_after_deadline_without_retry() -> None:
     assert attempts == 1
 
 
-def test_hf_call_starts_no_attempt_after_deadline() -> None:
+def test_artifact_call_starts_no_attempt_after_deadline() -> None:
     called = False
 
     def call() -> None:
@@ -59,7 +59,7 @@ def test_hf_call_starts_no_attempt_after_deadline() -> None:
         called = True
 
     with pytest.raises(TimeoutError, match="upload exceeded the run wall deadline"):
-        hf_call(
+        artifact_call(
             call,
             "upload",
             logger=logging.getLogger(__name__),

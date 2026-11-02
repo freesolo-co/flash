@@ -326,7 +326,7 @@ def strict_gdn_probe_module(model_id: str, revision: str = "") -> str:
     """
     from transformers import AutoConfig
 
-    from flash.engine.worker.io.hf import model_revision_kwargs
+    from flash.engine.worker.io.artifacts import model_revision_kwargs
 
     try:
         cfg = AutoConfig.from_pretrained(

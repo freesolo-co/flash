@@ -13,11 +13,12 @@ from dataclasses import replace
 
 import pytest
 
+import flash.engine.worker.io.artifacts as worker_hf
 import flash.engine.worker.io.heartbeat as worker_heartbeat
-import flash.engine.worker.io.hf as worker_hf
 import flash.engine.worker.train.rl.launch.checkpoints as rl_checkpoints
 import flash.runner.lifecycle.state as runner_state
 import flash.runner.supervise.recovery as attempt_recovery
+from flash.artifacts import api as artifact_storage
 from flash.core.spec import JobSpec
 from tests._helpers.profile import attach_sft_profile, stub_revision_geometry
 from tests._helpers.source_snapshot import valid_source_snapshot
@@ -25,7 +26,7 @@ from tests._helpers.source_snapshot import valid_source_snapshot
 _SOURCE_SNAPSHOT = valid_source_snapshot()
 
 
-class _RecordingHfApi:
+class _RecordingArtifactStore:
     def __init__(self, files: list[str] | None = None):
         self.uploads: list[dict] = []
         self.deleted: list[str] = []
@@ -48,15 +49,15 @@ def _prime_worker(
     monkeypatch.setattr(worker_context, "config", replace(worker_context.config, phase="rl"))
     monkeypatch.setattr(worker_context, "config", replace(worker_context.config, run_id=run))
     monkeypatch.setattr(worker_context, "config", replace(worker_context.config, seed=0))
-    monkeypatch.setattr(worker_hf, "hf_api", lambda: recorder)
+    monkeypatch.setattr(worker_hf, "artifact_api", lambda: recorder)
     monkeypatch.setattr(worker_heartbeat, "heartbeat", lambda *a, context=None, **k: None)
 
 
 # ============================================================================================
-# worker resume: hf_resume_checkpoint
+# worker resume: resume_checkpoint
 # ============================================================================================
 def _fake_snapshot(steps, *, with_weights=True):
-    """Stand in for huggingface_hub.snapshot_download: materialize the selected checkpoint dirs.
+    """Stand in for flash.artifacts.api.download_snapshot: materialize the selected checkpoint dirs.
 
 
 
@@ -79,11 +80,11 @@ def _fake_snapshot(steps, *, with_weights=True):
 
 @pytest.fixture
 def resume_run_id():
-    """hf_resume_checkpoint downloads to the worker's hardcoded /tmp/resume; reap our subtree.
+    """resume_checkpoint downloads to the worker's hardcoded /tmp/resume; reap our subtree.
 
     Hermetic: the run id is unique per process and the subtree is cleaned BOTH before and after, so
     stale data left under the same id (a prior aborted run, or a concurrent xdist worker) can't make
-    hf_resume_checkpoint resolve an unexpected higher checkpoint and flake the latest-step assertions."""
+    resume_checkpoint resolve an unexpected higher checkpoint and flake the latest-step assertions."""
     run = f"flash-resume-utest-{os.getpid()}"
     path = os.path.join("/tmp/resume", "rl", run)
     shutil.rmtree(path, ignore_errors=True)
@@ -91,13 +92,13 @@ def resume_run_id():
     shutil.rmtree(path, ignore_errors=True)
 
 
-def test_hf_resume_checkpoint_returns_latest_step(worker_context, monkeypatch, resume_run_id):
+def test_resume_checkpoint_returns_latest_step(worker_context, monkeypatch, resume_run_id):
     huggingface_hub = pytest.importorskip("huggingface_hub")
-    rec = _RecordingHfApi()
+    rec = _RecordingArtifactStore()
     _prime_worker(monkeypatch, rec, run=resume_run_id, worker_context=worker_context)
-    monkeypatch.setattr(huggingface_hub, "snapshot_download", _fake_snapshot([40, 80, 60]))
+    monkeypatch.setattr(artifact_storage, "download_snapshot", _fake_snapshot([40, 80, 60]))
 
-    path = worker_hf.hf_resume_checkpoint(context=worker_context)
+    path = worker_hf.resume_checkpoint(context=worker_context)
 
     assert path is not None
     assert path.endswith("checkpoint-80"), (
@@ -106,11 +107,11 @@ def test_hf_resume_checkpoint_returns_latest_step(worker_context, monkeypatch, r
     assert os.path.isdir(path)
 
 
-def test_hf_resume_checkpoint_uses_pinned_revision_and_ignores_stray_dir(
+def test_resume_checkpoint_uses_pinned_revision_and_ignores_stray_dir(
     worker_context, monkeypatch, resume_run_id
 ):
     huggingface_hub = pytest.importorskip("huggingface_hub")
-    rec = _RecordingHfApi()
+    rec = _RecordingArtifactStore()
     _prime_worker(monkeypatch, rec, run=resume_run_id, worker_context=worker_context)
     seen = {}
 
@@ -121,9 +122,9 @@ def test_hf_resume_checkpoint_uses_pinned_revision_and_ignores_stray_dir(
             os.makedirs(os.path.join(base, name), exist_ok=True)
         return kwargs["local_dir"]
 
-    monkeypatch.setattr(huggingface_hub, "snapshot_download", snapshot)
+    monkeypatch.setattr(artifact_storage, "download_snapshot", snapshot)
 
-    path = worker_hf.hf_resume_checkpoint(
+    path = worker_hf.resume_checkpoint(
         fail_closed=True, revision="pinned-sha", context=worker_context
     )
 
@@ -133,13 +134,13 @@ def test_hf_resume_checkpoint_uses_pinned_revision_and_ignores_stray_dir(
 
 
 @pytest.mark.parametrize("name", ["checkpoint-0", "checkpoint-040"])
-def test_hf_resume_checkpoint_pinned_rejects_noncanonical_only(
+def test_resume_checkpoint_pinned_rejects_noncanonical_only(
     worker_context, monkeypatch, resume_run_id, name
 ):
     huggingface_hub = pytest.importorskip("huggingface_hub")
     from flash.engine.worker.perf import RetriableInfraError
 
-    rec = _RecordingHfApi()
+    rec = _RecordingArtifactStore()
     _prime_worker(monkeypatch, rec, run=resume_run_id, worker_context=worker_context)
 
     def snapshot(**kwargs):
@@ -147,19 +148,17 @@ def test_hf_resume_checkpoint_pinned_rejects_noncanonical_only(
         os.makedirs(base, exist_ok=True)
         return kwargs["local_dir"]
 
-    monkeypatch.setattr(huggingface_hub, "snapshot_download", snapshot)
+    monkeypatch.setattr(artifact_storage, "download_snapshot", snapshot)
 
     with pytest.raises(RetriableInfraError, match="required resume checkpoint is missing"):
-        worker_hf.hf_resume_checkpoint(
-            fail_closed=True, revision="pinned-sha", context=worker_context
-        )
+        worker_hf.resume_checkpoint(fail_closed=True, revision="pinned-sha", context=worker_context)
 
 
-def test_hf_resume_checkpoint_selects_canonical_alongside_noncanonical(
+def test_resume_checkpoint_selects_canonical_alongside_noncanonical(
     worker_context, monkeypatch, resume_run_id
 ):
     huggingface_hub = pytest.importorskip("huggingface_hub")
-    rec = _RecordingHfApi()
+    rec = _RecordingArtifactStore()
     _prime_worker(monkeypatch, rec, run=resume_run_id, worker_context=worker_context)
 
     def snapshot(**kwargs):
@@ -168,9 +167,9 @@ def test_hf_resume_checkpoint_selects_canonical_alongside_noncanonical(
             os.makedirs(os.path.join(base, name), exist_ok=True)
         return kwargs["local_dir"]
 
-    monkeypatch.setattr(huggingface_hub, "snapshot_download", snapshot)
+    monkeypatch.setattr(artifact_storage, "download_snapshot", snapshot)
 
-    path = worker_hf.hf_resume_checkpoint(
+    path = worker_hf.resume_checkpoint(
         fail_closed=True, revision="pinned-sha", context=worker_context
     )
 
@@ -178,153 +177,147 @@ def test_hf_resume_checkpoint_selects_canonical_alongside_noncanonical(
     assert path.endswith("checkpoint-40")
 
 
-def test_hf_resume_checkpoint_none_without_repo(worker_context, monkeypatch):
-    rec = _RecordingHfApi()
+def test_resume_checkpoint_none_without_repo(worker_context, monkeypatch):
+    rec = _RecordingArtifactStore()
     _prime_worker(monkeypatch, rec, repo="", worker_context=worker_context)
     # no repo is a legitimate fresh start only when the control plane did not require resume.
-    assert worker_hf.hf_resume_checkpoint(context=worker_context) is None
+    assert worker_hf.resume_checkpoint(context=worker_context) is None
 
 
-def test_hf_resume_checkpoint_required_without_repo_raises(worker_context, monkeypatch):
+def test_resume_checkpoint_required_without_repo_raises(worker_context, monkeypatch):
     from flash.engine.worker.perf import RetriableInfraError
 
-    rec = _RecordingHfApi()
+    rec = _RecordingArtifactStore()
     _prime_worker(monkeypatch, rec, repo="", worker_context=worker_context)
     with pytest.raises(RetriableInfraError, match="has no artifact repository"):
-        worker_hf.hf_resume_checkpoint(revision="pinned-sha", context=worker_context)
+        worker_hf.resume_checkpoint(revision="pinned-sha", context=worker_context)
 
 
-def test_hf_resume_checkpoint_none_when_nothing_streamed(
-    worker_context, monkeypatch, resume_run_id
-):
+def test_resume_checkpoint_none_when_nothing_streamed(worker_context, monkeypatch, resume_run_id):
     huggingface_hub = pytest.importorskip("huggingface_hub")
-    rec = _RecordingHfApi()
+    rec = _RecordingArtifactStore()
     _prime_worker(monkeypatch, rec, run=resume_run_id, worker_context=worker_context)
     # A run preempted before its first save has no streamed checkpoint -> fresh start, not a crash.
-    monkeypatch.setattr(huggingface_hub, "snapshot_download", _fake_snapshot([]))
-    assert worker_hf.hf_resume_checkpoint(context=worker_context) is None
+    monkeypatch.setattr(artifact_storage, "download_snapshot", _fake_snapshot([]))
+    assert worker_hf.resume_checkpoint(context=worker_context) is None
 
 
-def test_hf_resume_checkpoint_swallows_download_error(worker_context, monkeypatch, resume_run_id):
+def test_resume_checkpoint_swallows_download_error(worker_context, monkeypatch, resume_run_id):
     huggingface_hub = pytest.importorskip("huggingface_hub")
-    rec = _RecordingHfApi()
+    rec = _RecordingArtifactStore()
     _prime_worker(monkeypatch, rec, run=resume_run_id, worker_context=worker_context)
 
     def _boom(**_):
         raise RuntimeError("hf down")
 
     # A transient HF outage must degrade to "start fresh", never abort the paid run.
-    monkeypatch.setattr(huggingface_hub, "snapshot_download", _boom)
-    assert worker_hf.hf_resume_checkpoint(context=worker_context) is None
+    monkeypatch.setattr(artifact_storage, "download_snapshot", _boom)
+    assert worker_hf.resume_checkpoint(context=worker_context) is None
 
 
-def test_hf_resume_checkpoint_starts_no_download_at_deadline(
+def test_resume_checkpoint_starts_no_download_at_deadline(
     worker_context, monkeypatch, resume_run_id
 ):
     huggingface_hub = pytest.importorskip("huggingface_hub")
-    rec = _RecordingHfApi()
+    rec = _RecordingArtifactStore()
     _prime_worker(monkeypatch, rec, run=resume_run_id, worker_context=worker_context)
     monkeypatch.setattr(worker_context, "remaining_wall_seconds", lambda: 0.0)
     monkeypatch.setattr(
-        huggingface_hub,
-        "snapshot_download",
+        artifact_storage,
+        "download_snapshot",
         lambda **kwargs: pytest.fail("snapshot download must not start at the deadline"),
     )
 
-    assert worker_hf.hf_resume_checkpoint(context=worker_context) is None
+    assert worker_hf.resume_checkpoint(context=worker_context) is None
 
 
-def test_hf_resume_checkpoint_fail_closed_on_download_error(
+def test_resume_checkpoint_fail_closed_on_download_error(
     worker_context, monkeypatch, resume_run_id
 ):
     huggingface_hub = pytest.importorskip("huggingface_hub")
     from flash.engine.worker.perf import RetriableInfraError
 
-    rec = _RecordingHfApi()
+    rec = _RecordingArtifactStore()
     _prime_worker(monkeypatch, rec, run=resume_run_id, worker_context=worker_context)
 
     def _boom(**_):
         raise RuntimeError("hf down")
 
-    monkeypatch.setattr(huggingface_hub, "snapshot_download", _boom)
+    monkeypatch.setattr(artifact_storage, "download_snapshot", _boom)
     with pytest.raises(RetriableInfraError, match="required resume checkpoint fetch failed"):
-        worker_hf.hf_resume_checkpoint(fail_closed=True, context=worker_context)
+        worker_hf.resume_checkpoint(fail_closed=True, context=worker_context)
 
 
-def test_hf_resume_checkpoint_fail_closed_at_deadline(worker_context, monkeypatch, resume_run_id):
+def test_resume_checkpoint_fail_closed_at_deadline(worker_context, monkeypatch, resume_run_id):
     huggingface_hub = pytest.importorskip("huggingface_hub")
     from flash.engine.worker.perf import RetriableInfraError
 
-    rec = _RecordingHfApi()
+    rec = _RecordingArtifactStore()
     _prime_worker(monkeypatch, rec, run=resume_run_id, worker_context=worker_context)
     monkeypatch.setattr(worker_context, "remaining_wall_seconds", lambda: 0.0)
     monkeypatch.setattr(
-        huggingface_hub,
-        "snapshot_download",
+        artifact_storage,
+        "download_snapshot",
         lambda **kwargs: pytest.fail("snapshot download must not start at the deadline"),
     )
 
     with pytest.raises(RetriableInfraError, match="required resume checkpoint fetch failed"):
-        worker_hf.hf_resume_checkpoint(fail_closed=True, context=worker_context)
+        worker_hf.resume_checkpoint(fail_closed=True, context=worker_context)
 
 
-def test_hf_resume_checkpoint_fail_closed_allows_confirmed_absence(
+def test_resume_checkpoint_fail_closed_allows_confirmed_absence(
     worker_context, monkeypatch, resume_run_id
 ):
     huggingface_hub = pytest.importorskip("huggingface_hub")
-    rec = _RecordingHfApi()
+    rec = _RecordingArtifactStore()
     _prime_worker(monkeypatch, rec, run=resume_run_id, worker_context=worker_context)
-    monkeypatch.setattr(huggingface_hub, "snapshot_download", _fake_snapshot([]))
+    monkeypatch.setattr(artifact_storage, "download_snapshot", _fake_snapshot([]))
 
-    assert worker_hf.hf_resume_checkpoint(fail_closed=True, context=worker_context) is None
+    assert worker_hf.resume_checkpoint(fail_closed=True, context=worker_context) is None
 
 
-def test_hf_resume_checkpoint_pinned_missing_base_raises(
-    worker_context, monkeypatch, resume_run_id
-):
+def test_resume_checkpoint_pinned_missing_base_raises(worker_context, monkeypatch, resume_run_id):
     huggingface_hub = pytest.importorskip("huggingface_hub")
     from flash.engine.worker.perf import RetriableInfraError
 
-    rec = _RecordingHfApi()
+    rec = _RecordingArtifactStore()
     _prime_worker(monkeypatch, rec, run=resume_run_id, worker_context=worker_context)
-    monkeypatch.setattr(huggingface_hub, "snapshot_download", _fake_snapshot([]))
+    monkeypatch.setattr(artifact_storage, "download_snapshot", _fake_snapshot([]))
 
     with pytest.raises(RetriableInfraError, match="required resume checkpoint is missing"):
-        worker_hf.hf_resume_checkpoint(
-            fail_closed=True, revision="pinned-sha", context=worker_context
-        )
+        worker_hf.resume_checkpoint(fail_closed=True, revision="pinned-sha", context=worker_context)
 
 
-def test_hf_resume_checkpoint_pinned_absence_clears_stale_local_state(
+def test_resume_checkpoint_pinned_absence_clears_stale_local_state(
     worker_context, monkeypatch, resume_run_id
 ):
     huggingface_hub = pytest.importorskip("huggingface_hub")
     from flash.engine.worker.perf import RetriableInfraError
 
-    rec = _RecordingHfApi()
+    rec = _RecordingArtifactStore()
     _prime_worker(monkeypatch, rec, run=resume_run_id, worker_context=worker_context)
     stale = os.path.join("/tmp/resume", "rl", resume_run_id, "checkpoint", "checkpoint-80")
     os.makedirs(stale, exist_ok=True)
-    monkeypatch.setattr(huggingface_hub, "snapshot_download", _fake_snapshot([]))
+    monkeypatch.setattr(artifact_storage, "download_snapshot", _fake_snapshot([]))
 
     with pytest.raises(RetriableInfraError, match="required resume checkpoint is missing"):
-        worker_hf.hf_resume_checkpoint(revision="pinned-sha", context=worker_context)
+        worker_hf.resume_checkpoint(revision="pinned-sha", context=worker_context)
 
     assert not os.path.exists(stale)
 
 
-def test_hf_resume_checkpoint_prefer_picks_highest_satisfying_candidate(
+def test_resume_checkpoint_prefer_picks_highest_satisfying_candidate(
     worker_context, monkeypatch, resume_run_id
 ):
     """`prefer` steers the pick to the highest candidate it accepts, not the highest step overall,
     when a later, higher, unaccepted checkpoint also streamed -- the case that used to starve a
     compatible lower checkpoint forever once a higher incompatible one became the remote max."""
     huggingface_hub = pytest.importorskip("huggingface_hub")
-    rec = _RecordingHfApi()
+    rec = _RecordingArtifactStore()
     _prime_worker(monkeypatch, rec, run=resume_run_id, worker_context=worker_context)
-    monkeypatch.setattr(huggingface_hub, "snapshot_download", _fake_snapshot([40, 60, 80]))
+    monkeypatch.setattr(artifact_storage, "download_snapshot", _fake_snapshot([40, 60, 80]))
 
-    path = worker_hf.hf_resume_checkpoint(
+    path = worker_hf.resume_checkpoint(
         prefer=lambda p: not p.endswith("checkpoint-80"), context=worker_context
     )
 
@@ -332,30 +325,30 @@ def test_hf_resume_checkpoint_prefer_picks_highest_satisfying_candidate(
     assert path.endswith("checkpoint-60"), "must pick the highest candidate prefer accepts"
 
 
-def test_hf_resume_checkpoint_prefer_falls_back_to_highest_overall(
+def test_resume_checkpoint_prefer_falls_back_to_highest_overall(
     worker_context, monkeypatch, resume_run_id
 ):
     """when no candidate satisfies `prefer`, the selection falls back to the plain highest step --
     the same answer this returned before `prefer` existed, leaving the caller's own discard log as
     the thing that explains a restart from zero."""
     huggingface_hub = pytest.importorskip("huggingface_hub")
-    rec = _RecordingHfApi()
+    rec = _RecordingArtifactStore()
     _prime_worker(monkeypatch, rec, run=resume_run_id, worker_context=worker_context)
-    monkeypatch.setattr(huggingface_hub, "snapshot_download", _fake_snapshot([40, 60, 80]))
+    monkeypatch.setattr(artifact_storage, "download_snapshot", _fake_snapshot([40, 60, 80]))
 
-    path = worker_hf.hf_resume_checkpoint(prefer=lambda _p: False, context=worker_context)
+    path = worker_hf.resume_checkpoint(prefer=lambda _p: False, context=worker_context)
 
     assert path is not None
     assert path.endswith("checkpoint-80")
 
 
-def test_hf_resume_checkpoint_pinned_without_numeric_dir_raises(
+def test_resume_checkpoint_pinned_without_numeric_dir_raises(
     worker_context, monkeypatch, resume_run_id
 ):
     huggingface_hub = pytest.importorskip("huggingface_hub")
     from flash.engine.worker.perf import RetriableInfraError
 
-    rec = _RecordingHfApi()
+    rec = _RecordingArtifactStore()
     _prime_worker(monkeypatch, rec, run=resume_run_id, worker_context=worker_context)
 
     def snapshot(**kwargs):
@@ -365,12 +358,10 @@ def test_hf_resume_checkpoint_pinned_without_numeric_dir_raises(
         os.makedirs(base, exist_ok=True)
         return kwargs["local_dir"]
 
-    monkeypatch.setattr(huggingface_hub, "snapshot_download", snapshot)
+    monkeypatch.setattr(artifact_storage, "download_snapshot", snapshot)
 
     with pytest.raises(RetriableInfraError, match="required resume checkpoint is missing"):
-        worker_hf.hf_resume_checkpoint(
-            fail_closed=True, revision="pinned-sha", context=worker_context
-        )
+        worker_hf.resume_checkpoint(fail_closed=True, revision="pinned-sha", context=worker_context)
 
 
 # ============================================================================================
@@ -412,7 +403,7 @@ def _rl_resume(monkeypatch, tmp_path, src, *, world_size, worker_context):
 
     local_dir = tmp_path / "ckpt"
     local_dir.mkdir()
-    monkeypatch.setattr(worker_hf, "hf_resume_checkpoint", lambda *a, context=None, **k: str(src))
+    monkeypatch.setattr(worker_hf, "resume_checkpoint", lambda *a, context=None, **k: str(src))
     return (
         rl_checkpoints._restore_verl_resume(
             str(local_dir), world_size=world_size, context=worker_context
@@ -661,7 +652,7 @@ def test_sft_flat_layout_is_guarded_too(worker_context, monkeypatch, tmp_path, c
     src = _staged_checkpoint(tmp_path, 9, world_size=2, shards=2, nested=False)
     local_dir = tmp_path / "ckpt"
     local_dir.mkdir()
-    monkeypatch.setattr(worker_hf, "hf_resume_checkpoint", lambda *a, **k: str(src))
+    monkeypatch.setattr(worker_hf, "resume_checkpoint", lambda *a, **k: str(src))
 
     assert sft_train._restore_verl_resume(str(local_dir), world_size=2, context=worker_context) == 9
     shutil.rmtree(local_dir)
@@ -680,7 +671,7 @@ def test_sft_flat_layout_is_guarded_too(worker_context, monkeypatch, tmp_path, c
         shards=2,
         nested=False,
     )
-    monkeypatch.setattr(worker_hf, "hf_resume_checkpoint", lambda *a, **k: str(fsdp1))
+    monkeypatch.setattr(worker_hf, "resume_checkpoint", lambda *a, **k: str(fsdp1))
     assert sft_train._restore_verl_resume(str(local_dir), world_size=2, context=worker_context) == 0
     assert not (local_dir / "global_step_10").exists()
 
@@ -745,7 +736,7 @@ def test_canonical_resume_selection_inspects_once_and_stages_the_same_verdict(
         return 5
 
     monkeypatch.setattr(verl_checkpoints, "inspect_resume_checkpoint", inspect)
-    monkeypatch.setattr(worker_hf, "hf_resume_checkpoint", select)
+    monkeypatch.setattr(worker_hf, "resume_checkpoint", select)
     monkeypatch.setattr(verl_checkpoints, "stage_verl_resume", stage)
 
     assert (
@@ -791,8 +782,8 @@ def test_resume_restore_fails_closed_when_selection_omits_its_inspection(
     assert staged == []
 
 
-def _fake_hf_resume_checkpoint_over(*candidates):
-    """Stand in for hf_resume_checkpoint's own selection, over an already-downloaded set of dirs.
+def _fake_resume_checkpoint_over(*candidates):
+    """Stand in for resume_checkpoint's own selection, over an already-downloaded set of dirs.
 
     Mirrors ``_highest_resume_candidate``: highest step ``prefer`` accepts, else highest overall.
     Used to test that the GRPO/SFT resume paths wire a ``prefer`` that actually reaches a compatible
@@ -830,7 +821,7 @@ def test_grpo_resume_prefers_compatible_checkpoint_over_higher_incompatible_one(
     """A restart after checkpoint-7 was rejected must resume from a compatible checkpoint-3 streamed
     afterward, instead of re-fetching and re-discarding checkpoint-7 forever.
 
-    Before the ``prefer`` wiring, ``hf_resume_checkpoint`` always picked the highest step regardless
+    Before the ``prefer`` wiring, ``resume_checkpoint`` always picked the highest step regardless
     of whether this attempt could load it, so checkpoint-3 could never be reached while checkpoint-7
     stayed the remote max -- exactly the repeat-discard loop this fix closes.
     """
@@ -842,8 +833,8 @@ def test_grpo_resume_prefers_compatible_checkpoint_over_higher_incompatible_one(
     local_dir.mkdir()
     monkeypatch.setattr(
         worker_hf,
-        "hf_resume_checkpoint",
-        _fake_hf_resume_checkpoint_over(incompatible, compatible),
+        "resume_checkpoint",
+        _fake_resume_checkpoint_over(incompatible, compatible),
     )
 
     step = rl_checkpoints._restore_verl_resume(str(local_dir), world_size=2, context=worker_context)
@@ -865,8 +856,8 @@ def test_grpo_resume_skips_a_higher_loadable_checkpoint_with_a_malformed_manifes
     local_dir.mkdir()
     monkeypatch.setattr(
         worker_hf,
-        "hf_resume_checkpoint",
-        _fake_hf_resume_checkpoint_over(malformed, valid),
+        "resume_checkpoint",
+        _fake_resume_checkpoint_over(malformed, valid),
     )
 
     assert (
@@ -891,8 +882,8 @@ def test_sft_resume_prefers_compatible_checkpoint_over_higher_incompatible_one(
     local_dir.mkdir()
     monkeypatch.setattr(
         worker_hf,
-        "hf_resume_checkpoint",
-        _fake_hf_resume_checkpoint_over(incompatible, compatible),
+        "resume_checkpoint",
+        _fake_resume_checkpoint_over(incompatible, compatible),
     )
 
     assert sft_train._restore_verl_resume(str(local_dir), world_size=2, context=worker_context) == 5

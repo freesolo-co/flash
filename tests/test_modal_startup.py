@@ -24,8 +24,8 @@ def polling(monkeypatch):
         paths.append(path)
         return lambda **kw: artifacts.get(path.rsplit("/", 1)[-1])
 
-    monkeypatch.setattr(jobs, "make_hf_text_reader", reader)
-    monkeypatch.setattr(startup, "make_hf_text_reader", reader)
+    monkeypatch.setattr(jobs, "make_artifact_text_reader", reader)
+    monkeypatch.setattr(startup, "make_artifact_text_reader", reader)
     monkeypatch.setattr(jobs, "heartbeat_reader_for", lambda *a, **k: lambda **kw: None)
     monkeypatch.setattr(api, "get_instance", lambda *a, **k: {"status": "pending"})
     raw = modal_remote(started_ts=100.0, hourly_usd=3.6)
@@ -133,7 +133,9 @@ def test_long_queue_then_bootstrap_can_finish_with_queue_excluded_from_cost(
 def test_start_marker_rejects_wrong_identity_or_invalid_time(monkeypatch, change):
     marker = {"run_id": "flash-test", "attempt": 0, "ts": 150, **change}
     monkeypatch.setattr(startup.time, "time", lambda: 200)
-    monkeypatch.setattr(startup, "make_hf_text_reader", lambda *a, **k: lambda: json.dumps(marker))
+    monkeypatch.setattr(
+        startup, "make_artifact_text_reader", lambda *a, **k: lambda: json.dumps(marker)
+    )
     assert startup.start_time_reader(modal_remote(started_ts=100))() is None
 
 
@@ -141,8 +143,7 @@ def test_bootstrap_publishes_start_identity_before_setup(monkeypatch):
     from pathlib import Path
     from types import SimpleNamespace
 
-    import huggingface_hub
-
+    from flash.artifacts import api as artifact_storage
     from flash.providers._lifecycle.bootstrapping import bootstrap
 
     uploads = []
@@ -152,7 +153,9 @@ def test_bootstrap_publishes_start_identity_before_setup(monkeypatch):
             (kwargs["path_in_repo"], json.loads(Path(kwargs["path_or_fileobj"]).read_text()))
         )
 
-    monkeypatch.setattr(huggingface_hub, "HfApi", lambda **kw: SimpleNamespace(upload_file=upload))
+    monkeypatch.setattr(
+        artifact_storage, "ArtifactStore", lambda **kw: SimpleNamespace(upload_file=upload)
+    )
     monkeypatch.setattr(bootstrap.time, "time", lambda: 150)
     bootstrap._publish_started(
         {

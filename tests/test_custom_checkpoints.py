@@ -10,7 +10,7 @@ from unittest.mock import Mock
 import pytest
 
 from flash.custom.checkpoints import RunCheckpoints
-from flash.engine.worker.io import hf
+from flash.engine.worker.io import artifacts as hf
 
 
 @pytest.fixture
@@ -31,11 +31,11 @@ def store(tmp_path, monkeypatch, worker_context):
     worker_context.config = replace(
         worker_context.config, run_id="run", phase="custom", hf_repo="private/repo"
     )
-    monkeypatch.setattr(hf, "hf_api", lambda: SimpleNamespace(upload_folder=upload))
+    monkeypatch.setattr(hf, "artifact_api", lambda: SimpleNamespace(upload_folder=upload))
     monkeypatch.setattr(hf, "_write_deployable_provenance", Mock())
-    monkeypatch.setattr(hf, "_sleep_with_hf_deadline", lambda *a, **k: False)
+    monkeypatch.setattr(hf, "_sleep_with_artifact_deadline", lambda *a, **k: False)
     monkeypatch.setattr("flash.engine.worker.io.heartbeat.heartbeat", Mock())
-    monkeypatch.setattr("huggingface_hub.snapshot_download", fetch)
+    monkeypatch.setattr("flash.artifacts.api.download_snapshot", fetch)
     return RunCheckpoints(worker_context)
 
 
@@ -75,7 +75,7 @@ def test_failed_publication_preserves_previous_local_checkpoint(store, tmp_path,
     first = publish(store, tmp_path / "checkpoints", 1)
     monkeypatch.setattr(
         hf,
-        "hf_api",
+        "artifact_api",
         lambda: SimpleNamespace(upload_folder=Mock(side_effect=RuntimeError("storage offline"))),
     )
     with pytest.raises(hf.RetriableInfraError, match="upload failed"):
@@ -172,13 +172,13 @@ def test_resume_validates_pinned_shared_artifacts_before_gpu_allocation(
             repo_info=lambda *a, **k: SimpleNamespace(sha="b" * 40),
             list_repo_files=lambda *a, **k: files,
         )
-        monkeypatch.setattr("huggingface_hub.HfApi", lambda **kw: api)
+        monkeypatch.setattr("flash.artifacts.api.ArtifactStore", lambda **kw: api)
 
         def download(repo, path, **kwargs):
             assert kwargs["revision"] == "b" * 40
             return str(staged / path.removeprefix(prefix + "/"))
 
-        monkeypatch.setattr("huggingface_hub.hf_hub_download", download)
+        monkeypatch.setattr("flash.artifacts.api.download_file", download)
         resolved = resolve_resume(target, owner_org_id="org", owner_key_id=1)
         assert resolved.custom["resolved_resume"] == {
             "repo": "private/repo",

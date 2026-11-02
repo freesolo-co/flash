@@ -27,9 +27,9 @@ def test_slow_restore_does_not_consume_controller_idle_allowance(tmp_path, monke
     monkeypatch.setattr(worker, "load_backend", Mock(return_value=Mock()))
     monkeypatch.setattr(worker, "heartbeat", Mock())
     monkeypatch.setattr(worker, "liveness_heartbeat", lambda *a, **k: nullcontext())
-    monkeypatch.setattr(worker, "session_token", lambda *a: "session-token")
+    monkeypatch.setenv("FLASH_CUSTOM_SESSION_TOKEN", "session-token")
     monkeypatch.setattr(worker, "Path", lambda path: tmp_path / Path(path).name)
-    monkeypatch.setattr(worker.hf, "hf_upload_file", Mock())
+    monkeypatch.setattr(worker.hf, "upload_artifact_file", Mock())
 
     def restore(*args):
         clock[0] += 45
