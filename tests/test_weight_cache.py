@@ -136,7 +136,7 @@ def _patch_prefetch_io(monkeypatch, ephemeral_hub):
     import huggingface_hub
     import huggingface_hub.constants
 
-    import flash.engine.worker.io.hf as hf
+    import flash.engine.worker.io.artifacts as hf
 
     calls = []
 
@@ -238,7 +238,7 @@ def test_prefetch_model_starts_no_download_at_deadline(worker_context, tmp_path,
 
 def test_shared_weight_cache_dir_requires_the_modal_mount(tmp_path, monkeypatch):
     """Resolve the configured cache only when its persistent mount exists."""
-    import flash.engine.worker.io.hf as hf
+    import flash.engine.worker.io.artifacts as hf
 
     monkeypatch.delenv("FLASH_WEIGHT_CACHE_DIR", raising=False)
     assert hf._shared_weight_cache_dir() is None  # unset

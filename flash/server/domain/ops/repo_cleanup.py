@@ -1,61 +1,33 @@
-"""Always-on GC for aged run artifacts in per-environment ``flashrun-*`` HF repos.
+"""Always-on GC for aged run artifacts in per-environment ``flashrun-*`` Azure namespaces.
 
 The daily cross-plane sweep deletes unbound ``<phase>/<run_id>`` prefixes whose newest commit is
 older than seven days. It never deletes whole repos, shared code snapshots, or unknown phases.
 
 Durable checkpoint bindings are the fail-closed do-not-delete set and are rechecked before each delete.
 Recent warm-start markers, undatable prefixes, and in-flight writes are protected. The loop requires
-an operator ``HF_TOKEN`` and has no manual CLI or policy knobs.
+Azure artifact configuration and has no manual CLI or policy knobs.
 """
 
 from __future__ import annotations
 
-import os
-import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 
 from flash._internal.logging import get_logger
+from flash.artifacts.api import ArtifactStore
 from flash.runner.accounting.artifacts import artifact_namespace
 from flash.serve.contract import urls as serving_urls
 from flash.serve.request import transport as serving_transport
 
 logger = get_logger(__name__)
 
-# huggingface_hub is an OPTIONAL server extra (see pyproject ``[server]``). The rest of the control
-# plane treats it as optional, so mirror that: without the extra there is no way to list or delete
-# repos, so the always-on GC degrades to a logged no-op instead of crashing the loop with a
-# ``ModuleNotFoundError`` every cycle.
-try:
-    from huggingface_hub import HfApi
-except ModuleNotFoundError:  # pragma: no cover - the test venv always has the server extra
-    HfApi = None  # type: ignore[assignment,misc]
-
-# Latch so a plane missing the extra warns ONCE (the sweep runs daily — don't spam the log).
-_warned_hf_unavailable = False
-
 # Hard allowlist: only <artifact namespace>/flashrun-* dataset repos are ever touched (never env
 # packages, paper-*/oracle/eval sets, or a user's own datasets).
 RUN_REPO_PREFIX = "flashrun-"
 # Delete an unbound run's prefix once its newest file was committed this long ago (fixed: 7 days).
 DELETE_AGE_SECONDS = 7.0 * 86400.0
-_DELETE_SLEEP_S = 0.5  # pause between deletes — HF repo-mutation rate-limit courtesy
-_SCAN_WORKERS = 8  # hf tree-listing concurrency
-# expanded HF tree listings hit origin and rate-limit below the general quota.
-# pace every call globally so _SCAN_WORKERS concurrency cannot create request bursts.
-_TREE_LIST_MIN_INTERVAL_S = 0.5  # cap ~2 req/s across the whole sweep, workers included
-_tree_list_lock = threading.Lock()
-_tree_list_last_call = 0.0
-
-
-def _throttle_tree_list() -> None:
-    global _tree_list_last_call
-    with _tree_list_lock:
-        wait = _tree_list_last_call + _TREE_LIST_MIN_INTERVAL_S - time.monotonic()
-        if wait > 0:
-            time.sleep(wait)
-        _tree_list_last_call = time.monotonic()
+_SCAN_WORKERS = 8  # bounded Azure manifest reads
 
 
 # Only these top-level dirs are deletable model-artifact phases (``JobSpec.phase``: grpo -> "rl",
@@ -87,20 +59,21 @@ def _now() -> float:
 def repo_cleanup_enabled() -> bool:
     """Whether the always-on artifact GC should run on this control plane.
 
-    Require an operator ``HF_TOKEN`` and never run standalone: the hosted serving registry is not a
+    Require Azure artifact configuration and never run standalone: the hosted serving registry is not a
     self-hosted authority and querying it would expose ``FREESOLO_INTERNAL_KEY``.
     """
+    from flash.artifacts.config import configured
     from flash.server.platform.auth import standalone
 
-    return bool((os.environ.get("HF_TOKEN") or "").strip()) and not standalone()
+    return configured() and not standalone()
 
 
 def _is_managed_env_repo(repo_id) -> bool:
     """True only for ``<artifact namespace>/flashrun-*`` dataset repos (the hard allowlist).
 
     Reads the namespace through ``artifact_namespace()`` so the allowlist always names the same
-    place ``managed_hf_repo_for_environment`` creates repos in; a fixed constant here would stop
-    matching the moment an operator sets ``FLASH_HF_NAMESPACE``, silently disabling the GC."""
+    place ``managed_artifact_repo_for_environment`` creates repos in; a fixed constant here would stop
+    matching the moment an operator sets ``FLASH_ARTIFACT_NAMESPACE``, silently disabling the GC."""
     if not isinstance(repo_id, str):
         return False
     return repo_id.startswith(f"{artifact_namespace()}/") and repo_id.split("/", 1)[-1].startswith(
@@ -170,7 +143,6 @@ def _scan_repo(api, repo_id: str) -> tuple[dict[str, list], float | None, set[st
     ``prefixes`` maps ``"<phase>/<run_id>"`` -> ``[total_size, newest_commit_ts]`` for ARTIFACT_PHASES
     only, ``ref_recent_ts`` is the newest commit among ``referenced_by/`` markers (warm-start-source
     signal), and ``unknown_tops`` are unrecognized top-level dirs (reported, never deleted)."""
-    _throttle_tree_list()
     entries = api.list_repo_tree(repo_id=repo_id, repo_type="dataset", recursive=True, expand=True)
     prefixes: dict[str, list] = {}
     ref_recent_ts: float | None = None
@@ -227,10 +199,9 @@ def _run_artifacts_recently_used(
     api, repo_id: str, prefix: str, now: float, max_age_s: float
 ) -> bool:
     """Recheck run writes and warm-start references without rescanning unrelated runs."""
-    from huggingface_hub.errors import RemoteEntryNotFoundError
+    from flash.artifacts.manifest import ArtifactNotFoundError as RemoteEntryNotFoundError
 
     for path in (prefix, REF_MARKER):
-        _throttle_tree_list()
         try:
             entries = api.list_repo_tree(
                 repo_id=repo_id,
@@ -254,7 +225,7 @@ def _run_artifacts_recently_used(
 
 def _collect_targets(api, live, whole, now: float, max_age_s: float) -> list[_RunTarget]:
     """Enumerate every ``flashrun-*`` repo and return the aged, unbound, non-warm-start-source run
-    prefixes to delete. Per-repo scan failures (HF rate-limit / transient) are skipped and logged, not
+    prefixes to delete. Per-repo scan failures (storage rate-limit / transient) are skipped and logged, not
     fatal — the sweep reaps what it could read and tries the rest next cycle."""
     repos = [
         d.id for d in api.list_datasets(author=artifact_namespace()) if _is_managed_env_repo(d.id)
@@ -312,18 +283,8 @@ def run_scheduled_cleanup(*, dry_run: bool = False, api=None, should_stop=None) 
     Raise ``CleanupAborted`` before deleting if the serving set is unconfirmed. ``should_stop`` is
     checked between deletes because cancelling the caller cannot interrupt the worker thread.
     """
-    global _warned_hf_unavailable
     if api is None:
-        if HfApi is None:
-            # No HF client on this plane -> nothing to list or delete. Degrade to a no-op (warn ONCE)
-            # rather than crash the always-on loop with ModuleNotFoundError every cycle.
-            if not _warned_hf_unavailable:
-                logger.warning(
-                    "repo GC: huggingface_hub not installed (server extra absent); skipping sweeps"
-                )
-                _warned_hf_unavailable = True
-            return 0
-        api = HfApi()
+        api = ArtifactStore()
     max_age_s = DELETE_AGE_SECONDS
 
     live, whole = _confirm_live_set()  # fail closed before we even list
@@ -355,8 +316,8 @@ def run_scheduled_cleanup(*, dry_run: bool = False, api=None, should_stop=None) 
         try:
             # Re-stat the prefix: its newest file may have been written since enumeration (a cross-plane
             # warm-start touch, a late checkpoint, a redeploy read-back). Do this FIRST — it is a slow
-            # recursive HF list — so the live-set re-confirm below is the LAST thing before the delete
-            # and its confirm->delete window is ~microseconds, not a full HF round-trip.
+            # recursive artifact list — so the live-set re-confirm below is the LAST thing before the delete
+            # and its confirm->delete window is ~microseconds, not a full storage round-trip.
             try:
                 if _run_artifacts_recently_used(api, target.repo_id, target.prefix, now, max_age_s):
                     logger.warning(
@@ -395,5 +356,4 @@ def run_scheduled_cleanup(*, dry_run: bool = False, api=None, should_stop=None) 
                 )
         finally:
             held.release()
-        time.sleep(_DELETE_SLEEP_S)  # HF repo-mutation rate-limit courtesy
     return deleted

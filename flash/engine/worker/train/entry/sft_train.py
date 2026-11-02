@@ -14,8 +14,8 @@ import sys
 import threading
 from functools import partial
 
+import flash.engine.worker.io.artifacts as _worker_hf
 import flash.engine.worker.io.heartbeat as _worker_heartbeat
-import flash.engine.worker.io.hf as _worker_hf
 import flash.engine.worker.model.adapter as _worker_adapter
 import flash.engine.worker.perf as _worker_perf
 import flash.engine.worker.train.core.lifecycle.finalize as _worker_finalize
@@ -33,7 +33,7 @@ _MAX_ZERO_GRAD_STEPS = 2
 def _cached_model_path(model_id: str, model_revision: str) -> str:
     from huggingface_hub import snapshot_download
 
-    from flash.engine.worker.io.hf import _shared_weight_cache_dir
+    from flash.engine.worker.io.artifacts import _shared_weight_cache_dir
     from flash.engine.worker.perf import RetriableInfraError
 
     # prefetch lands weights on the shared volume when attached; resolve from the same cache first.
@@ -123,14 +123,14 @@ def _durable_required_save_steps(
     for step in candidates:
         marker = f"{_worker_hf.hf_prefix(context=context)}/checkpoints/step-{step}/adapter/adapter_config.json"
         try:
-            exists = _worker_hf.hf_api().file_exists(
+            exists = _worker_hf.artifact_api().file_exists(
                 repo_id=context.config.hf_repo,
                 filename=marker,
                 repo_type="dataset",
             )
         except Exception as error:
             raise _worker_perf.RetriableInfraError(
-                f"could not verify required SFT save step {step} on hf"
+                f"could not verify required SFT save step {step} in artifact storage"
             ) from error
         if exists:
             durable.add(step)
@@ -532,10 +532,10 @@ def _publish_sft_result(
             python_bin=child.python_bin,
             preprocessor=data.processor,
         )
-        _worker_hf.hf_upload_folder(adapter_dir, "adapter", required=True, context=context)
+        _worker_hf.upload_artifact_folder(adapter_dir, "adapter", required=True, context=context)
         # only a durably published adapter may suppress the final publish. the seeded resume step no
         # longer needs excluding by hand: it is credited as deployable_published only when its
-        # adapter was actually found on hf, so a resume that carried resumable state without a
+        # adapter was actually found in artifact storage, so a resume that carried resumable state without a
         # servable adapter falls through to this publish instead of being skipped.
         if (
             final_save_due(final_step, options.save_at_steps)

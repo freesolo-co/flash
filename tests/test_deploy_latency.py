@@ -291,11 +291,11 @@ def test_adapter_preflight_validates_config_before_listing_tensors(monkeypatch, 
     )
     calls = []
 
-    def hf_hub_download(**_kwargs):
+    def download_file(**_kwargs):
         calls.append("config")
         return str(config_path)
 
-    class _HfApi:
+    class _ArtifactStore:
         def list_repo_tree(self, **kwargs):
             calls.append("tensors")
             subfolder = kwargs["path_in_repo"]
@@ -308,8 +308,8 @@ def test_adapter_preflight_validates_config_before_listing_tensors(monkeypatch, 
 
     monkeypatch.setitem(
         sys.modules,
-        "huggingface_hub",
-        types.SimpleNamespace(hf_hub_download=hf_hub_download, HfApi=_HfApi),
+        "flash.artifacts.api",
+        types.SimpleNamespace(download_file=download_file, ArtifactStore=_ArtifactStore),
     )
 
     assert (
@@ -328,10 +328,10 @@ def test_adapter_preflight_config_failure_does_not_start_tensor_listing(monkeypa
 
     tensor_started = False
 
-    def hf_hub_download(**_kwargs):
+    def download_file(**_kwargs):
         raise RuntimeError("config failed")
 
-    class _HfApi:
+    class _ArtifactStore:
         def list_repo_tree(self, **_kwargs):
             nonlocal tensor_started
             tensor_started = True
@@ -339,8 +339,8 @@ def test_adapter_preflight_config_failure_does_not_start_tensor_listing(monkeypa
 
     monkeypatch.setitem(
         sys.modules,
-        "huggingface_hub",
-        types.SimpleNamespace(hf_hub_download=hf_hub_download, HfApi=_HfApi),
+        "flash.artifacts.api",
+        types.SimpleNamespace(download_file=download_file, ArtifactStore=_ArtifactStore),
     )
 
     with pytest.raises(serving_errors.ServingError, match="failed to read org/repo"):

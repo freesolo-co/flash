@@ -14,8 +14,8 @@ from dataclasses import dataclass
 from functools import reduce
 from math import gcd
 
+import flash.engine.worker.io.artifacts as _worker_hf
 import flash.engine.worker.io.heartbeat as _worker_heartbeat
-import flash.engine.worker.io.hf as _worker_hf
 import flash.engine.worker.io.wandb_log as _worker_wandb
 import flash.engine.worker.model.adapter as _worker_adapter
 import flash.engine.worker.perf as _worker_perf
@@ -356,8 +356,8 @@ def _prepare_sft_model(
         gpu=_worker_perf.gpu_diagnostics(),
         context=context,
     )
-    # everything below reads adapter/tokenizer/architecture config from the hub or cache, which is
-    # minutes on a cold mount and emits nothing of its own. without this the run's last ping is the
+    # adapter config comes from artifact storage; model/tokenizer config comes from the hub or
+    # cache. cold reads can take minutes without emitting anything. without this the last ping is the
     # one-shot above, so `runs status` freezes on sft_model_load for the whole span and a healthy
     # cold cache is indistinguishable from a dead worker -- the exact ambiguity the stage was added
     # to resolve. same stage name, so the provider's setup-grace classification is unchanged.
@@ -698,7 +698,7 @@ def _prepare_sft_child(
         context=context,
     )
     # the staged resume checkpoint is already a pending global_step_N on disk, so an unseeded
-    # watcher re-merges it and re-uploads full state hf already has, holding the resume-upload
+    # watcher re-merges it and re-uploads full state already stored in Azure, holding the resume-upload
     # lock while the first genuinely new checkpoint waits behind it.
     _sft_train._seed_resume_lifecycle(watcher, options.save_at_steps, resume_step, context=context)
     if resume_step >= model.update_horizon:

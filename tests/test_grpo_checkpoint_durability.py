@@ -13,7 +13,7 @@ from pathlib import Path
 
 import pytest
 
-import flash.engine.worker.io.hf as _publication
+import flash.engine.worker.io.artifacts as _publication
 import flash.engine.worker.train.entry.rl_train_runner as rl_runner
 import flash.engine.worker.train.rl.launch.checkpoints as rl_checkpoints
 from flash.engine.worker.train.entry import backend_common, rl_train
@@ -43,7 +43,7 @@ def test_resume_uploader_publishes_required_steps_and_reports_missing(
     )
     monkeypatch.setattr(
         rl_checkpoints._worker_hf,
-        "hf_upload_folder",
+        "upload_artifact_folder",
         lambda *a, context=None, **kw: True,
         raising=False,
     )
@@ -95,7 +95,7 @@ def test_resume_credits_required_steps_already_durable_on_hf(worker_context, tmp
     # steps a retry that resumes at 20 would report step 10 missing and fail a successful run.
     monkeypatch.setattr(
         rl_checkpoints._worker_hf,
-        "_deployable_adapter_on_hf",
+        "_deployable_adapter_in_storage",
         lambda step, context=None, **_context: step == 10,
     )
 
@@ -128,7 +128,7 @@ def test_resume_step_is_not_credited_without_a_durable_adapter(
     # so the restored step counter alone must never credit a required save.
     monkeypatch.setattr(
         rl_checkpoints._worker_hf,
-        "_deployable_adapter_on_hf",
+        "_deployable_adapter_in_storage",
         lambda step, context=None, **_context: False,
     )
 
@@ -146,7 +146,7 @@ def test_resume_step_is_not_credited_without_a_durable_adapter(
 
 def test_restore_verl_resume_is_a_noop_without_a_checkpoint(worker_context, tmp_path, monkeypatch):
     monkeypatch.setattr(
-        rl_checkpoints._worker_hf, "hf_resume_checkpoint", lambda *a, context=None, **k: None
+        rl_checkpoints._worker_hf, "resume_checkpoint", lambda *a, context=None, **k: None
     )
     assert (
         rl_checkpoints._restore_verl_resume(str(tmp_path), world_size=1, context=worker_context)
@@ -171,7 +171,7 @@ def test_restore_verl_resume_stages_the_checkpoint_where_verl_looks(
     local_dir = tmp_path / "ckpt"
     local_dir.mkdir()
     monkeypatch.setattr(
-        rl_checkpoints._worker_hf, "hf_resume_checkpoint", lambda *a, context=None, **k: str(src)
+        rl_checkpoints._worker_hf, "resume_checkpoint", lambda *a, context=None, **k: str(src)
     )
 
     assert (
@@ -189,7 +189,7 @@ def test_restore_verl_resume_rejects_an_unparseable_checkpoint_path(
     bad = tmp_path / "not-a-checkpoint"
     bad.mkdir()
     monkeypatch.setattr(
-        rl_checkpoints._worker_hf, "hf_resume_checkpoint", lambda *a, context=None, **k: str(bad)
+        rl_checkpoints._worker_hf, "resume_checkpoint", lambda *a, context=None, **k: str(bad)
     )
     with pytest.raises(RuntimeError, match="invalid GRPO resume checkpoint path"):
         rl_checkpoints._restore_verl_resume(
@@ -252,7 +252,7 @@ def test_resume_uploader_uploads_each_completed_step(worker_context, tmp_path):
 
 
 def test_resume_uploader_skips_the_step_it_resumed_from(worker_context, tmp_path):
-    # that checkpoint is already durable on hf; re-uploading it wastes the upload slot.
+    # that checkpoint is already durable in Azure; re-uploading it wastes the upload slot.
     local_dir = tmp_path / "ckpt"
     local_dir.mkdir()
     seen = []
@@ -588,7 +588,7 @@ def test_internal_required_adapters_upload_once_and_restore_from_latest_manifest
 
     monkeypatch.setattr(rl_checkpoints._VerlResumeUploader, "_stage_deployable", stage)
     monkeypatch.setattr(
-        rl_checkpoints._worker_hf, "hf_upload_folder", upload_internal, raising=False
+        rl_checkpoints._worker_hf, "upload_artifact_folder", upload_internal, raising=False
     )
     monkeypatch.setattr(
         rl_checkpoints._worker_hf, "upload_resume_checkpoint", upload_native, raising=False
@@ -642,12 +642,12 @@ def test_internal_required_adapters_upload_once_and_restore_from_latest_manifest
 
     monkeypatch.setattr(
         rl_checkpoints._worker_hf,
-        "hf_resume_checkpoint",
+        "resume_checkpoint",
         lambda context=None, **kwargs: str(latest),
     )
     monkeypatch.setattr(
         rl_checkpoints._worker_hf,
-        "_deployable_adapter_on_hf",
+        "_deployable_adapter_in_storage",
         lambda step, context=None, **_context: False,
     )
     restored = tmp_path / "restored"
@@ -690,7 +690,7 @@ def test_attempt_scoped_internal_adapter_survives_an_incompatible_retry_window(
     (old_adapter / "adapter_model.safetensors").write_bytes(b"old-trajectory")
     monkeypatch.setattr(
         rl_checkpoints._worker_hf,
-        "hf_resume_checkpoint",
+        "resume_checkpoint",
         lambda context=None, **kwargs: str(checkpoint),
     )
 
@@ -713,7 +713,7 @@ def test_attempt_scoped_internal_adapter_survives_an_incompatible_retry_window(
         return True
 
     monkeypatch.setattr(
-        rl_checkpoints._worker_hf, "hf_upload_folder", upload_internal, raising=False
+        rl_checkpoints._worker_hf, "upload_artifact_folder", upload_internal, raising=False
     )
     new_adapter = tmp_path / "new-adapter"
     _write_internal_adapter(new_adapter)
@@ -929,7 +929,7 @@ def test_required_adapter_upload_failure_blocks_later_native_replacement(
     _write_internal_adapter(tmp_path / "step-2")
     monkeypatch.setattr(
         rl_checkpoints._worker_hf,
-        "hf_upload_folder",
+        "upload_artifact_folder",
         lambda *args, context=None, **kwargs: (_ for _ in ()).throw(RuntimeError("hf down")),
         raising=False,
     )
@@ -1023,7 +1023,7 @@ def test_resume_manifest_and_internal_tree_fail_closed(worker_context, tmp_path,
     _write_internal_adapter(internal, weights="sharded")
     monkeypatch.setattr(
         rl_checkpoints._worker_hf,
-        "hf_resume_checkpoint",
+        "resume_checkpoint",
         lambda context=None, **kwargs: str(checkpoint),
     )
 
@@ -1098,7 +1098,7 @@ def test_published_required_adapter_is_not_restored_or_republished(
     _write_internal_adapter(local / "_flash_required_adapter_store" / "step-2" / "adapter")
     monkeypatch.setattr(
         rl_checkpoints._worker_hf,
-        "_deployable_adapter_on_hf",
+        "_deployable_adapter_in_storage",
         lambda step, context=None, **_context: step == 2,
     )
     published = []
@@ -1130,7 +1130,7 @@ def test_start_resume_uploader_hydrates_manifest_before_thread_start(
     started = []
     monkeypatch.setattr(
         rl_checkpoints._worker_hf,
-        "_deployable_adapter_on_hf",
+        "_deployable_adapter_in_storage",
         lambda step, context=None, **_context: False,
     )
     monkeypatch.setattr(
@@ -1589,7 +1589,7 @@ def test_resumed_required_step_can_still_publish_its_withheld_deployable(
     # resumed at exactly the required step, and no adapter on hf for it, so it stays uncredited.
     monkeypatch.setattr(
         rl_checkpoints._worker_hf,
-        "_deployable_adapter_on_hf",
+        "_deployable_adapter_in_storage",
         lambda step, context=None, **_context: False,
     )
     uploader = rl_checkpoints._VerlResumeUploader(
@@ -1705,7 +1705,7 @@ def test_required_step_publishes_after_verl_prunes_its_checkpoint(
     )
     monkeypatch.setattr(
         rl_checkpoints._worker_hf,
-        "hf_upload_folder",
+        "upload_artifact_folder",
         lambda *a, context=None, **kw: True,
         raising=False,
     )
@@ -1787,7 +1787,7 @@ def test_staging_failure_does_not_strand_an_earlier_publishable_step(
     )
     monkeypatch.setattr(
         rl_checkpoints._worker_hf,
-        "hf_upload_folder",
+        "upload_artifact_folder",
         lambda *a, context=None, **kw: True,
         raising=False,
     )

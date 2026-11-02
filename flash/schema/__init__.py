@@ -702,7 +702,7 @@ def spec_from_dict(
             lora_rank=lora_rank,
             lora_alpha=lora_alpha,
             init_from_adapter=init_from_adapter,
-            hf_repo="",  # assigned server-side; see submit_job._assign_managed_hf_repo
+            hf_repo="",  # assigned server-side; see submit_job._assign_managed_artifact_repo
             learning_rate=_train_float(train_raw, "learning_rate", minimum=0.0, exclusive=True),
             batch_size=_train_int(train_raw, "batch_size", minimum=1),
             prompts_per_step=_train_int(train_raw, "prompts_per_step", minimum=1),

@@ -351,7 +351,7 @@ There is no "all" sentinel, so this number is duplicated from the data into the 
 **can drift**: if the dataset later grows, a stale `max_examples` silently trains on a
 subset instead of erroring. Re-check it whenever the dataset or the params change.
 
-GPU allocation and HF artifacts are **managed by default**: leave `[gpu] type` unset to
+GPU allocation and Azure artifacts are **managed by default**: leave `[gpu] type` unset to
 let the allocator pick the cheapest fitting validated class, while `train.hf_repo` remains
 platform-managed. `[gpu] providers` takes an ordered list of provider names and prefers them in
 that order: the preference ranks ahead of cost, so a preferred provider wins even when a cheaper

@@ -213,7 +213,7 @@ def test_rank_metadata_rejects_inexact_decimal_string():
 
 @pytest.mark.parametrize("value", [Decimal("1"), Decimal("1.0"), Decimal("1E0")])
 def test_rank_metadata_accepts_integral_decimal_values(value):
-    # load_hf_adapter_config parses json floats as decimal, so decimal instances reach the parser.
+    # load_artifact_adapter_config parses json floats as decimal, so decimal instances reach the parser.
     assert rank_from_adapter_config(_config(r=value), source="adapter") == 1
 
 
@@ -240,7 +240,7 @@ _FLOAT_CONFIG_JSON = (
 
 
 def _parsed_config(text: str = _FLOAT_CONFIG_JSON):
-    # mirror load_hf_adapter_config: floats arrive as decimal, not float.
+    # mirror load_artifact_adapter_config: floats arrive as decimal, not float.
     return json.loads(text, parse_float=Decimal)
 
 
@@ -257,7 +257,7 @@ def test_preflight_parses_decimal_typed_topology_from_real_json():
 
 
 def test_adapter_identity_binds_config_and_weight_metadata(monkeypatch):
-    import huggingface_hub
+    from flash.artifacts import api as artifact_storage
 
     state = {"oid": "sha256:weights-v1"}
 
@@ -274,13 +274,13 @@ def test_adapter_identity_binds_config_and_weight_metadata(monkeypatch):
                     path="sft/sft-run/adapter/adapter_model.safetensors",
                     blob_id=None,
                     size=123,
-                    # attribute-style, as `list_repo_tree` really returns it: `RepoFile.__init__`
+                    # attribute-style, as `list_repo_tree` really returns it: `ArtifactFile.__init__`
                     # builds a `BlobLfsInfo` dataclass, never a mapping.
                     lfs=SimpleNamespace(sha256=state["oid"], size=123),
                 )
             ]
 
-    monkeypatch.setattr(huggingface_hub, "HfApi", FakeApi)
+    monkeypatch.setattr(artifact_storage, "ArtifactStore", FakeApi)
     first = adapter_artifact_identity(_ADAPTER_REF, _config(), token="token")
     second = adapter_artifact_identity(_ADAPTER_REF, _config(), token="token")
     assert first == second
@@ -293,7 +293,7 @@ def test_adapter_identity_binds_config_and_weight_metadata(monkeypatch):
 
 
 def test_adapter_identity_digests_decimal_config_values_exactly(monkeypatch):
-    import huggingface_hub
+    from flash.artifacts import api as artifact_storage
 
     class FakeApi:
         def __init__(self, token=None):
@@ -309,7 +309,7 @@ def test_adapter_identity_digests_decimal_config_values_exactly(monkeypatch):
                 )
             ]
 
-    monkeypatch.setattr(huggingface_hub, "HfApi", FakeApi)
+    monkeypatch.setattr(artifact_storage, "ArtifactStore", FakeApi)
     first = adapter_artifact_identity(_ADAPTER_REF, _parsed_config(), token="token")
     second = adapter_artifact_identity(_ADAPTER_REF, _parsed_config(), token="token")
     assert first == second
@@ -638,8 +638,8 @@ def _patch_fused_submit_preflight(
     )
     monkeypatch.setattr(preparation, "_adopted_warmstart_revision", lambda spec, _source: spec)
     monkeypatch.setattr(checkpoints, "adapter_artifact_exists", lambda *_args, **_kwargs: True)
-    monkeypatch.setattr(lora_rank, "resolve_hf_dataset_revision", lambda *_args: "revision")
-    monkeypatch.setattr(lora_rank, "load_hf_adapter_config", load_config)
+    monkeypatch.setattr(lora_rank, "resolve_artifact_revision", lambda *_args: "revision")
+    monkeypatch.setattr(lora_rank, "load_artifact_adapter_config", load_config)
     monkeypatch.setattr(lora_rank, "preflight_init_adapter_lora_rank", preflight)
     monkeypatch.setattr(
         lora_rank,

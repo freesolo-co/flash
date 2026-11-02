@@ -508,7 +508,7 @@ def export(run_id: str, key: Annotated[dict, Depends(require_key)], payload: dic
         except ServingError as exc:
             raise HTTPException(status_code=502, detail=str(exc)) from exc
     # best-effort product-analytics report: exports never otherwise touch the
-    # platform backend (the copy is hf-to-hf inside flash).
+    # platform backend (the copy is Azure-to-Hugging-Face inside flash).
     with contextlib.suppress(Exception):
         from flash.server.domain.registry.runs import record_model_exported
 

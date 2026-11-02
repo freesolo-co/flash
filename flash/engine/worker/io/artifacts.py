@@ -1,4 +1,4 @@
-"""hf artifact channel for code delivery, adapters, metrics, and checkpoints."""
+"""Azure artifact channel for code delivery, adapters, metrics, and checkpoints."""
 
 from __future__ import annotations
 
@@ -77,53 +77,25 @@ def ray_log_artifact_name(mode: str, attempt: int = 0) -> str:
     return attempt_scoped_artifact_name("raylogs", mode, attempt)
 
 
-def _disable_xet_upload_staging() -> None:
-    """Route this process's hf uploads through the streaming lfs path instead of xet.
-
-    `hf_xet` is an unconditional dependency of `huggingface-hub` on every arch flash runs on, and
-    `is_xet_available()` turns it on merely because it imports (utils/_runtime.py) -- so the xet
-    path is the default for `upload_folder`. Xet chunks and dedups through a local cache rooted at
-    `HF_XET_CACHE` (default `$HF_HOME/xet`), i.e. the SAME container disk holding the checkpoint
-    being uploaded. The legacy lfs path streams from the source file handle instead
-    (`CommitOperationAdd.as_file` -> `http_backoff(data=fileobj)`), so it adds no second on-disk
-    copy of a ~60 GB fsdp save.
-
-    The verl child, the rl child, and the model-merger subprocess already pin this. The parent is
-    the process that actually uploads checkpoints, and it was the one left reading the default --
-    which is where a real 35b run hit `No space left on device` under
-    `.../huggingface/xet/.../staging/`.
-
-    How much that staging holds at peak is not knowable from source (it lives in the compiled
-    `hf_xet` extension), which is the point: the streaming path needs no such assumption. The
-    checkpoint is already on this disk, so uploading it should not require room for a second copy
-    of unknown size.
-
-    `HF_HUB_DISABLE_XET` is captured into a module constant when `huggingface_hub.constants` is
-    imported, so this must run before the first import. Every `huggingface_hub` import in the
-    worker is function-local, so calling this during worker startup is early enough.
-    """
-    os.environ.setdefault("HF_HUB_DISABLE_XET", "1")
-
-
-def hf_api():
+def artifact_api():
     from flash.engine.worker.io.transfer import upload_api
 
-    return upload_api(token=os.environ.get("HF_TOKEN"))
+    return upload_api(token=None)
 
 
 def hf_prefix(*, context: WorkerContext) -> str:
     return f"{context.config.phase}/{context.config.run_id}"
 
 
-def _require_hf_deadline_allowance(*, context: WorkerContext) -> float | None:
+def _require_artifact_deadline_allowance(*, context: WorkerContext) -> float | None:
     remaining = context.remaining_wall_seconds()
     if remaining is not None and remaining <= 0:
         raise TimeoutError("run wall deadline exceeded")
     return remaining
 
 
-def _sleep_with_hf_deadline(delay: float, *, context: WorkerContext) -> bool:
-    remaining = _require_hf_deadline_allowance(context=context)
+def _sleep_with_artifact_deadline(delay: float, *, context: WorkerContext) -> bool:
+    remaining = _require_artifact_deadline_allowance(context=context)
     sleep_for = delay if remaining is None else min(delay, remaining)
     if sleep_for > 0:
         time.sleep(sleep_for)
@@ -131,12 +103,12 @@ def _sleep_with_hf_deadline(delay: float, *, context: WorkerContext) -> bool:
     return remaining is None or remaining > 0
 
 
-def _hf_upload(
+def _artifact_upload(
     do_upload, repo_subpath: str, required: bool, label: str, *, context: WorkerContext
 ) -> bool:
-    """HF upload loop: retries + raises on required artifacts; warn-only on optional.
+    """Artifact upload loop: retries + raises on required artifacts; warn-only on optional.
 
-    Returns True when a commit landed (or HF_REPO is unset), False on best-effort failure.
+    Returns True when a commit landed (or the artifact namespace is unset), False on best-effort failure.
     """
     if not context.config.hf_repo:
         return True
@@ -144,7 +116,7 @@ def _hf_upload(
     last_err: Exception | None = None
     for attempt in range(attempts):
         try:
-            _require_hf_deadline_allowance(context=context)
+            _require_artifact_deadline_allowance(context=context)
             do_upload()
             return True
         except Exception as e:
@@ -153,7 +125,7 @@ def _hf_upload(
             if required and attempt + 1 < attempts:
                 print(f"{label} retry {attempt + 1}/{attempts}: {detail}")
                 try:
-                    if not _sleep_with_hf_deadline(5 * (attempt + 1), context=context):
+                    if not _sleep_with_artifact_deadline(5 * (attempt + 1), context=context):
                         break
                 except Exception:
                     break
@@ -170,12 +142,12 @@ def _hf_upload(
     return False
 
 
-def hf_upload_file(
+def upload_artifact_file(
     local_path: str, repo_subpath: str, required: bool = False, *, context: WorkerContext
 ) -> bool:
-    """Upload one file to the run's HF prefix. Returns True on success (see ``_hf_upload``)."""
-    return _hf_upload(
-        lambda: hf_api().upload_file(
+    """Upload one file to the run's artifact prefix. Returns True on success (see ``_artifact_upload``)."""
+    return _artifact_upload(
+        lambda: artifact_api().upload_file(
             path_or_fileobj=local_path,
             path_in_repo=f"{hf_prefix(context=context)}/{repo_subpath}",
             repo_id=context.config.hf_repo,
@@ -183,7 +155,7 @@ def hf_upload_file(
         ),
         repo_subpath,
         required,
-        "hf_upload_file",
+        "upload_artifact_file",
         context=context,
     )
 
@@ -202,12 +174,12 @@ def _resume_checkpoint_upload_slot(timeout_s: float | None = None, *, context: W
 
 
 @timed_phase("publication")
-def hf_upload_folder(
+def upload_artifact_folder(
     local_dir: str, repo_subpath: str, required: bool = False, *, context: WorkerContext
 ) -> bool:
-    """Upload a folder to the run's HF prefix. Returns True on success (see ``_hf_upload``)."""
-    return _hf_upload(
-        lambda: hf_api().upload_folder(
+    """Upload a folder to the run's artifact prefix. Returns True on success (see ``_artifact_upload``)."""
+    return _artifact_upload(
+        lambda: artifact_api().upload_folder(
             folder_path=local_dir,
             path_in_repo=f"{hf_prefix(context=context)}/{repo_subpath}",
             repo_id=context.config.hf_repo,
@@ -215,7 +187,7 @@ def hf_upload_folder(
         ),
         repo_subpath,
         required,
-        "hf_upload_folder",
+        "upload_artifact_folder",
         context=context,
     )
 
@@ -223,9 +195,9 @@ def hf_upload_folder(
 def _highest_resume_candidate(
     base: str, candidates: list[tuple[int, str]], prefer: Callable[[str], bool] | None
 ) -> str:
-    """the candidate name hf_resume_checkpoint stages, given the caller's optional ``prefer``.
+    """the candidate name resume_checkpoint stages, given the caller's optional ``prefer``.
 
-    every candidate is already staged on local disk by the snapshot_download above, so evaluating
+    every candidate is already staged on local disk by the download_snapshot above, so evaluating
     ``prefer`` per candidate costs no extra fetch. picks the highest step ``prefer`` accepts and
     falls back to the highest step overall when none do -- the same answer this returned before
     ``prefer`` existed, so a caller with nothing to prefer sees no behaviour change, and the caller's
@@ -238,7 +210,7 @@ def _highest_resume_candidate(
     return max(candidates)[1]
 
 
-def hf_resume_checkpoint(
+def resume_checkpoint(
     fail_closed: bool = False,
     revision: str | None = None,
     *,
@@ -258,21 +230,20 @@ def hf_resume_checkpoint(
         return None
     base = os.path.join("/tmp/resume", hf_prefix(context=context), "checkpoint")
     try:
-        from huggingface_hub import snapshot_download
-
+        from flash.artifacts.api import download_snapshot
         from flash.engine.worker.io.heartbeat import liveness_heartbeat
 
         # remove prior local materialization so pinned absence cannot reuse a stale checkpoint.
         shutil.rmtree(base, ignore_errors=True)
         # resume checkpoints carry the full optimizer state (multi-gb); keep the heartbeat fresh.
         with liveness_heartbeat("checkpoint_prefetching", context=context):
-            _require_hf_deadline_allowance(context=context)
-            snapshot_download(
+            _require_artifact_deadline_allowance(context=context)
+            download_snapshot(
                 repo_id=context.config.hf_repo,
                 repo_type="dataset",
                 allow_patterns=[f"{hf_prefix(context=context)}/checkpoint/**"],
                 local_dir="/tmp/resume",
-                token=os.environ.get("HF_TOKEN"),
+                token=None,
                 revision=revision,
             )
         if not os.path.isdir(base):
@@ -299,14 +270,14 @@ def hf_resume_checkpoint(
 
         with liveness_heartbeat("checkpoint_prefetching", context=context):
             for _step, name in candidates:
-                _require_hf_deadline_allowance(context=context)
+                _require_artifact_deadline_allowance(context=context)
                 restore_directory(os.path.join(base, name))
         latest = _highest_resume_candidate(base, candidates, prefer)
         path = os.path.join(base, latest)
         print(f"[resume] found streamed checkpoint: {path}")
         return path
     except Exception as e:
-        print("hf_resume_checkpoint warn:", e)
+        print("resume_checkpoint warn:", e)
         if strict:
             if isinstance(e, RetriableInfraError):
                 raise
@@ -406,9 +377,10 @@ def publish_deployable_checkpoint(
     with heartbeat_context, upload_context as source:
         for attempt in range(attempts):
             try:
-                _require_hf_deadline_allowance(context=context)
-                receipt = hf_api().upload_folder(
+                _require_artifact_deadline_allowance(context=context)
+                receipt = artifact_api().upload_folder(
                     folder_path=source,
+                    immutable=True,
                     path_in_repo=upload_path,
                     repo_id=context.config.hf_repo,
                     repo_type="dataset",
@@ -419,7 +391,9 @@ def publish_deployable_checkpoint(
                 print(f"[ckpt] deployable publish warn (step {step}):", error)
                 if attempt + 1 < attempts:
                     try:
-                        if _sleep_with_hf_deadline(backoff_s * (attempt + 1), context=context):
+                        if _sleep_with_artifact_deadline(
+                            backoff_s * (attempt + 1), context=context
+                        ):
                             continue
                     except Exception:
                         pass
@@ -441,16 +415,16 @@ def publish_deployable_checkpoint(
     )
 
 
-def _deployable_adapter_on_hf(step: int, *, context: WorkerContext) -> bool:
-    """True when a required step's deployable adapter is durably present on hf.
+def _deployable_adapter_in_storage(step: int, *, context: WorkerContext) -> bool:
+    """True when a required step's deployable adapter is durably present in Azure.
 
     Resume credits a required save only after confirming its published adapter exists, so the
-    final completeness check verifies the durability guarantee against hf instead of assuming it from the
+    final completeness check verifies the durability guarantee against storage instead of assuming it from the
     restored step counter (a pre-resume worker could have advanced past the step without ever
     landing its deployable). publish_deployable_checkpoint uploads the adapter folder in a single
     atomic upload_folder commit, so the config marker's presence implies the whole folder landed.
 
-    Raises RetriableInfraError when hf cannot be reached: a transient lookup outage must retry the
+    Raises RetriableInfraError when storage cannot be reached: a transient lookup outage must retry the
     resume, not be misread as a permanently-missing required save. file_exists returns False cleanly
     for a genuinely absent file (that stays uncredited and fails the final completeness check).
     """
@@ -459,12 +433,12 @@ def _deployable_adapter_on_hf(step: int, *, context: WorkerContext) -> bool:
     marker = f"{hf_prefix(context=context)}/checkpoints/step-{step}/adapter/adapter_config.json"
     try:
         return bool(
-            hf_api().file_exists(
+            artifact_api().file_exists(
                 repo_id=context.config.hf_repo, filename=marker, repo_type="dataset"
             )
         )
     except Exception as e:
-        raise RetriableInfraError(f"could not verify required save step {step} on hf") from e
+        raise RetriableInfraError(f"could not verify required save step {step} in Azure") from e
 
 
 def _prune_stale_resume_checkpoints(keep_step: int, *, context: WorkerContext) -> tuple[str, ...]:
@@ -478,10 +452,10 @@ def _prune_stale_resume_checkpoints(keep_step: int, *, context: WorkerContext) -
     """
     if not context.config.hf_repo:
         return ()
-    api = hf_api()
+    api = artifact_api()
     base = f"{hf_prefix(context=context)}/checkpoint/"
     try:
-        _require_hf_deadline_allowance(context=context)
+        _require_artifact_deadline_allowance(context=context)
         files = api.list_repo_files(repo_id=context.config.hf_repo, repo_type="dataset")
     except Exception as e:
         return (sanitize_diagnostic(e, limit=300),)
@@ -495,7 +469,7 @@ def _prune_stale_resume_checkpoints(keep_step: int, *, context: WorkerContext) -
             stale.add(f"{base}{seg}")
     for folder in sorted(stale):
         try:
-            _require_hf_deadline_allowance(context=context)
+            _require_artifact_deadline_allowance(context=context)
             api.delete_folder(
                 path_in_repo=folder, repo_id=context.config.hf_repo, repo_type="dataset"
             )
@@ -541,7 +515,7 @@ def upload_resume_checkpoint(
             prune_errors = ()
             for attempt in range(_CKPT_UPLOAD_RETRIES):
                 try:
-                    _require_hf_deadline_allowance(context=context)
+                    _require_artifact_deadline_allowance(context=context)
                     if stage_final_checkpoint(
                         step, ckpt_dir, final_step=final_step, context=context
                     ):
@@ -552,9 +526,10 @@ def upload_resume_checkpoint(
                         )
                         return PublicationResult(resume_staged=True, reporting_error=report_error)
                     with upload_directory(ckpt_dir) as folder:
-                        _require_hf_deadline_allowance(context=context)
-                        receipt = hf_api().upload_folder(
+                        _require_artifact_deadline_allowance(context=context)
+                        receipt = artifact_api().upload_folder(
                             folder_path=folder,
+                            immutable=True,
                             path_in_repo=path,
                             repo_id=context.config.hf_repo,
                             repo_type="dataset",
@@ -570,7 +545,7 @@ def upload_resume_checkpoint(
                         break
                     if attempt + 1 < _CKPT_UPLOAD_RETRIES:
                         try:
-                            if _sleep_with_hf_deadline(
+                            if _sleep_with_artifact_deadline(
                                 _CKPT_UPLOAD_BACKOFF_S * (attempt + 1), context=context
                             ):
                                 continue

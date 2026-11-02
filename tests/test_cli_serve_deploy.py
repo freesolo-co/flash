@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 
 import pytest
 
@@ -15,7 +16,7 @@ from flash.serve.provisioning import InterruptedProvisioning
 
 DIGEST = "sha256:" + "a" * 64
 IMAGE = f"ghcr.io/freesolo-co/freesolo-flash-serve@{DIGEST}"
-CERTIFIED_DIGEST = "sha256:fc8ed231211562b3c67ca80ffbf7fb3e992aad6a42087a16c0dd26c1e249a758"
+CERTIFIED_DIGEST = "sha256:9dc811c3458f979ce2e020509ffbbe3e51364f551234df4c3139ef8e497192dc"
 CERTIFIED_IMAGE = f"ghcr.io/freesolo-co/freesolo-flash-serve@{CERTIFIED_DIGEST}"
 MODEL = "Qwen/Qwen3.5-9B"
 
@@ -136,14 +137,19 @@ def test_hub_token_reaches_provisioning_so_the_container_can_hydrate(
 
     _stub_resolution(monkeypatch)
     _stub_environment(monkeypatch)
-    monkeypatch.setenv(serve_deploy.ARTIFACT_TOKEN_ENV, "hf-token")
+    monkeypatch.setenv(
+        serve_deploy.ARTIFACT_TOKEN_ENV, "https://test.blob.core.windows.net/artifacts?sig=test"
+    )
     monkeypatch.setattr(
         "flash.serve.provisioning.modal.execution.operations.provision_modal_deployment",
         _capture,
     )
 
     assert cmd_serve_deploy(_args()) == 0
-    assert seen == [("inference-key", "hf-token")]
+    assert seen[0][0] == "inference-key"
+    assert (
+        json.loads(seen[0][1])["azure"] == "https://test.blob.core.windows.net/artifacts?sig=test"
+    )
 
 
 def test_the_deploy_proceeds_once_a_token_is_present(
@@ -159,14 +165,19 @@ def test_the_deploy_proceeds_once_a_token_is_present(
 
     _stub_resolution(monkeypatch)
     _stub_environment(monkeypatch)
-    monkeypatch.setenv(serve_deploy.ARTIFACT_TOKEN_ENV, "hf-token")
+    monkeypatch.setenv(
+        serve_deploy.ARTIFACT_TOKEN_ENV, "https://test.blob.core.windows.net/artifacts?sig=test"
+    )
     monkeypatch.setattr(
         "flash.serve.provisioning.modal.execution.operations.provision_modal_deployment",
         _capture,
     )
 
     assert cmd_serve_deploy(_args()) == 0
-    assert seen == [("inference-key", "hf-token")]
+    assert seen[0][0] == "inference-key"
+    assert (
+        json.loads(seen[0][1])["azure"] == "https://test.blob.core.windows.net/artifacts?sig=test"
+    )
 
 
 def test_resolver_validation_failures_are_cli_errors_not_tracebacks(
@@ -573,13 +584,16 @@ def _result(bundle):
 
 
 def _stub_environment(monkeypatch: pytest.MonkeyPatch) -> None:
+    _qualify_test_transport(monkeypatch)
     monkeypatch.setenv(serve_deploy.MODAL_TOKEN_ID_ENV, "token-id")
     monkeypatch.setenv(serve_deploy.MODAL_TOKEN_SECRET_ENV, "token-secret")
     monkeypatch.setenv(serve_deploy.INFERENCE_KEY_ENV, "inference-key")
     # a deployable environment includes the artifact token: hydration on a fresh volume is
     # token-only, so the command rejects a missing one before contacting any provider. tests
     # about that rejection unset it explicitly.
-    monkeypatch.setenv(serve_deploy.ARTIFACT_TOKEN_ENV, "hf-token")
+    monkeypatch.setenv(
+        serve_deploy.ARTIFACT_TOKEN_ENV, "https://test.blob.core.windows.net/artifacts?sig=test"
+    )
 
 
 def _stub_resolution(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -589,6 +603,8 @@ def _stub_resolution(monkeypatch: pytest.MonkeyPatch) -> None:
     from flash.serve.app import AdapterExecutionInput, ArtifactFile, aggregate_file_digest
     from flash.serve.control import ResolvedAdapter
     from flash.serve.deployment.resolve import ResolvedDeploymentInputs
+
+    _qualify_test_transport(monkeypatch)
 
     artifact_revision = "c" * 40
     files = (
@@ -879,12 +895,14 @@ def test_tokenless_fresh_create_rejection_is_actionable(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    def _reject(*_args, **_kwargs):
+    def _reject(bundle, credentials, secrets, **_kwargs):
+        assert secrets._reveal_for_launch()[1] is None
         raise serve_deploy.FreshDeploymentArtifactTokenRequired
 
     _stub_resolution(monkeypatch)
     _stub_environment(monkeypatch)
     monkeypatch.delenv(serve_deploy.ARTIFACT_TOKEN_ENV, raising=False)
+    monkeypatch.setenv("HF_TOKEN", "upstream-only")
     monkeypatch.setattr(
         "flash.serve.provisioning.modal.execution.operations.provision_modal_deployment",
         _reject,
@@ -927,3 +945,22 @@ def test_9b_qualification_remains_image_digest_agnostic(
     )
 
     assert cmd_serve_deploy(_args(model=MODEL, image=IMAGE)) == 0
+
+
+def _qualify_test_transport(monkeypatch):
+    monkeypatch.setattr(
+        "flash.serve.deployment.profiles._AZURE_ARTIFACT_IMAGE_DIGESTS",
+        frozenset({DIGEST, CERTIFIED_DIGEST}),
+    )
+
+
+@pytest.mark.parametrize("model", [MODEL, "Qwen/Qwen3.8-27B"])
+def test_retired_hub_image_cannot_receive_azure_credentials(monkeypatch, capsys, model):
+    def reject_resolution(*args, **kwargs):
+        pytest.fail("retired image reached artifact resolution or provider allocation")
+
+    monkeypatch.setattr(serve_deploy, "_deployment_bundle", reject_resolution)
+    retired_image = "ghcr.io/freesolo-co/freesolo-flash-serve@sha256:fc8ed231211562b3c67ca80ffbf7fb3e992aad6a42087a16c0dd26c1e249a758"
+    assert cmd_serve_deploy(_args(model=model, image=retired_image)) == 1
+    expected = "pending Azure artifact image qualification" if model == MODEL else "qualified only"
+    assert expected in capsys.readouterr().err

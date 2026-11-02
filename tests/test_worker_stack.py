@@ -137,7 +137,7 @@ def _import_worker(monkeypatch):
     [("refs/pr/123", {"revision": "refs/pr/123"}), ("", {})],
 )
 def test_model_revision_keyword_is_present_only_when_nonempty(revision, expected):
-    from flash.engine.worker.io.hf import model_revision_kwargs
+    from flash.engine.worker.io.artifacts import model_revision_kwargs
 
     assert model_revision_kwargs(revision) == expected
 
@@ -257,7 +257,7 @@ def test_model_revision_threads_through_tokenizer_and_prefetch(worker_context, m
 
     import huggingface_hub
 
-    from flash.engine.worker.io import hf
+    from flash.engine.worker.io import artifacts as hf
 
     monkeypatch.setattr(
         huggingface_hub,
@@ -319,14 +319,16 @@ def test_gpu_diagnostics_parses_nvidia_smi(monkeypatch):
 
 
 def test_heartbeat_commit_is_throttled(worker_context, monkeypatch):
-    """heartbeat() must rate-limit HF commits (per-step commits blow HF's 128/hour repo cap),
+    """heartbeat() must rate-limit artifact commits to bound storage traffic,
     while always committing milestone stages."""
     monkeypatch.setenv("RUN_MODE", "rl")
     monkeypatch.delenv("FLASH_JOB_SPEC_JSON", raising=False)
     import flash.engine.worker.io.heartbeat as w
 
     calls = []
-    monkeypatch.setattr(w.hf_io, "hf_upload_file", lambda *a, context=None, **k: calls.append(a[1]))
+    monkeypatch.setattr(
+        w.hf_io, "upload_artifact_file", lambda *a, context=None, **k: calls.append(a[1])
+    )
 
     # Large interval -> only milestone + the first commit; per-step heartbeats throttled.
     monkeypatch.setattr(worker_heartbeat, "_HB_MIN_INTERVAL_S", 9999.0)
@@ -350,16 +352,16 @@ def test_heartbeat_commit_is_throttled(worker_context, monkeypatch):
 )
 def test_setup_progress_heartbeats_are_throttled(worker_context, monkeypatch, stage):
     """The periodic setup pings run on a side thread every 30s through a long phase (a cold
-    snapshot_download can pull tens of GB for ~40 min, and disaggregated workers share one HF_REPO),
-    so their HF UPLOAD must be throttled like rl_step or they blow HF's 128/hour repo commit cap. The
-    "HEARTBEAT" stderr line still prints every call (the only per-call side effect now — HF is the one
-    durable channel); this pins only that the repeated stage does NOT commit to HF on every call."""
+    snapshot_download can pull tens of GB for ~40 min), so throttle uploads like rl_step.
+    The "HEARTBEAT" stderr line still prints every call; only durable artifact writes are throttled."""
     monkeypatch.setenv("RUN_MODE", "rl")
     monkeypatch.delenv("FLASH_JOB_SPEC_JSON", raising=False)
     import flash.engine.worker.io.heartbeat as w
 
     calls = []
-    monkeypatch.setattr(w.hf_io, "hf_upload_file", lambda *a, context=None, **k: calls.append(a[1]))
+    monkeypatch.setattr(
+        w.hf_io, "upload_artifact_file", lambda *a, context=None, **k: calls.append(a[1])
+    )
     # Large interval -> only the FIRST emit of the stage commits; the rest are upload-throttled.
     monkeypatch.setattr(worker_heartbeat, "_HB_MIN_INTERVAL_S", 9999.0)
     monkeypatch.setattr(worker_context.heartbeat_state, "last_upload", 0.0)
@@ -369,15 +371,15 @@ def test_setup_progress_heartbeats_are_throttled(worker_context, monkeypatch, st
     assert calls.count("heartbeat.json") == 1, f"{stage} must be upload-throttled, got {calls}"
 
 
-def test_heartbeat_hf_upload_runs_outside_lock(worker_context, monkeypatch):
-    """Perf regression guard: the synchronous hf_upload_file network call must run OUTSIDE
+def test_heartbeat_artifact_upload_runs_outside_lock(worker_context, monkeypatch):
+    """Perf regression guard: the synchronous upload_artifact_file network call must run OUTSIDE
     _HB_LOCK. Holding the lock across the upload serializes the trainer's per-step reward
-    callback behind the checkpoint daemon's HF commit during GRPO."""
+    callback behind the checkpoint daemon's artifact commit during GRPO."""
     monkeypatch.setenv("RUN_MODE", "rl")
     monkeypatch.delenv("FLASH_JOB_SPEC_JSON", raising=False)
     import flash.engine.worker.io.heartbeat as w
 
-    # When hf_upload_file is invoked, the lock must be acquirable (i.e. not held).
+    # When upload_artifact_file is invoked, the lock must be acquirable (i.e. not held).
     lock_free_during_upload = []
 
     def fake_upload(*a, context=None, **k):
@@ -386,11 +388,11 @@ def test_heartbeat_hf_upload_runs_outside_lock(worker_context, monkeypatch):
         if acquired:
             worker_context.heartbeat_state.lock.release()
 
-    monkeypatch.setattr(w.hf_io, "hf_upload_file", fake_upload)
+    monkeypatch.setattr(w.hf_io, "upload_artifact_file", fake_upload)
     monkeypatch.setattr(worker_heartbeat, "_HB_MIN_INTERVAL_S", 0.0)
     monkeypatch.setattr(worker_context.heartbeat_state, "last_upload", 0.0)
     worker_heartbeat.heartbeat("rl_start", context=worker_context)
-    assert lock_free_during_upload == [True], "hf_upload_file must run with _HB_LOCK released"
+    assert lock_free_during_upload == [True], "upload_artifact_file must run with _HB_LOCK released"
 
 
 def test_heartbeat_upload_skips_when_lock_is_stuck(worker_context, monkeypatch):
@@ -409,7 +411,9 @@ def test_heartbeat_upload_skips_when_lock_is_stuck(worker_context, monkeypatch):
 
     monkeypatch.setattr(hbmod, "_HB_UPLOAD_LOCK_TIMEOUT_S", 0.05)
     uploads = []
-    monkeypatch.setattr(w.hf_io, "hf_upload_file", lambda *a, context=None, **k: uploads.append(a))
+    monkeypatch.setattr(
+        w.hf_io, "upload_artifact_file", lambda *a, context=None, **k: uploads.append(a)
+    )
     monkeypatch.setattr(worker_heartbeat, "_HB_MIN_INTERVAL_S", 0.0)
     sentinel_last_upload = 123.0  # a prior successful-commit timestamp the skip must NOT clobber
     monkeypatch.setattr(worker_context.heartbeat_state, "last_upload", sentinel_last_upload)
@@ -437,7 +441,7 @@ def test_heartbeat_upload_skips_when_lock_is_stuck(worker_context, monkeypatch):
 
 def test_heartbeat_rolls_back_slot_when_upload_reports_failure(worker_context, monkeypatch):
     """The optimistic _HB_LAST_UPLOAD slot is claimed BEFORE the best-effort HF commit. If that commit
-    fails, hf_upload_file swallows the error and returns False (it never raises on best-effort) — HF is
+    fails, upload_artifact_file swallows the error and returns False (it never raises on best-effort) — artifact storage is
     still stale, so the slot must roll back exactly as the lock-timeout skip does. Otherwise the
     throttle defers the next retry on the strength of an upload that never happened.
     """
@@ -456,9 +460,11 @@ def test_heartbeat_rolls_back_slot_when_upload_reports_failure(worker_context, m
     monkeypatch.setattr(worker_context.heartbeat_state, "last_upload", sentinel_last_upload)
 
     calls = []
-    # Mirror the real hf_upload_file contract: best-effort failure returns False (does not raise).
+    # Mirror the real upload_artifact_file contract: best-effort failure returns False (does not raise).
     monkeypatch.setattr(
-        w.hf_io, "hf_upload_file", lambda *a, context=None, **k: (calls.append(a[1]), False)[1]
+        w.hf_io,
+        "upload_artifact_file",
+        lambda *a, context=None, **k: (calls.append(a[1]), False)[1],
     )
 
     worker_heartbeat.heartbeat("model_prefetched", context=worker_context)
@@ -483,7 +489,7 @@ def test_heartbeat_keeps_slot_when_upload_reports_success(worker_context, monkey
 
     monkeypatch.setattr(worker_heartbeat, "_HB_MIN_INTERVAL_S", 0.0)
     monkeypatch.setattr(worker_context.heartbeat_state, "last_upload", 0.0)
-    monkeypatch.setattr(w.hf_io, "hf_upload_file", lambda *a, context=None, **k: True)
+    monkeypatch.setattr(w.hf_io, "upload_artifact_file", lambda *a, context=None, **k: True)
 
     worker_heartbeat.heartbeat("model_prefetched", context=worker_context)
 
@@ -509,7 +515,7 @@ def test_critical_stages_wait_longer_for_upload_lock(worker_context, monkeypatch
 
     monkeypatch.setattr(hbmod, "_HB_UPLOAD_LOCK_TIMEOUT_S", 0.05)
     monkeypatch.setattr(hbmod, "_HB_CRITICAL_UPLOAD_LOCK_TIMEOUT_S", 0.4)
-    monkeypatch.setattr(w.hf_io, "hf_upload_file", lambda *a, context=None, **k: None)
+    monkeypatch.setattr(w.hf_io, "upload_artifact_file", lambda *a, context=None, **k: None)
     monkeypatch.setattr(worker_heartbeat, "_HB_MIN_INTERVAL_S", 0.0)
     monkeypatch.setattr(worker_context.heartbeat_state, "last_upload", 0.0)
 
@@ -554,7 +560,7 @@ def test_heartbeat_terminal_only_mode(worker_context, monkeypatch):
         calls.append(a[1])
         return True  # simulate a successful commit so the throttle clock advances
 
-    monkeypatch.setattr(w.hf_io, "hf_upload_file", _fake_upload)
+    monkeypatch.setattr(w.hf_io, "upload_artifact_file", _fake_upload)
     monkeypatch.setattr(worker_context.heartbeat_state, "terminal_only", True)
     monkeypatch.setattr(worker_heartbeat, "_HB_MIN_INTERVAL_S", 9999.0)
     monkeypatch.setattr(worker_context.heartbeat_state, "last_upload", 0.0)
@@ -699,7 +705,7 @@ def test_train_metadata_keeps_model_revision_in_nested_job_spec(worker_context, 
     monkeypatch.setattr(worker_context, "config", replace(worker_context.config, thinking=False))
     monkeypatch.setattr(worker_context, "require_active_env", lambda: SimpleNamespace(id="org/env"))
     monkeypatch.setattr(
-        finalize.hf_io, "hf_upload_file", lambda *args, context=None, **kwargs: None
+        finalize.hf_io, "upload_artifact_file", lambda *args, context=None, **kwargs: None
     )
     monkeypatch.setattr(
         finalize.heartbeat_io, "heartbeat", lambda *args, context=None, **kwargs: None
@@ -738,7 +744,7 @@ def test_train_metadata_preserves_terminal_heartbeat_fields(worker_context, monk
     monkeypatch.setattr(worker_context, "config", replace(worker_context.config, thinking=False))
     monkeypatch.setattr(worker_context, "require_active_env", lambda: SimpleNamespace(id="org/env"))
     monkeypatch.setattr(
-        finalize.hf_io, "hf_upload_file", lambda *args, context=None, **kwargs: None
+        finalize.hf_io, "upload_artifact_file", lambda *args, context=None, **kwargs: None
     )
     monkeypatch.setattr(
         finalize.heartbeat_io,
@@ -780,7 +786,7 @@ def test_finalize_preserves_terminal_heartbeat_fields(worker_context, monkeypatc
     metrics_last = [{"step": 4, "reward": 0.75}]
     monkeypatch.setattr(RunMetrics, "save", lambda self, path: None)
     monkeypatch.setattr(
-        finalize.hf_io, "hf_upload_file", lambda *args, context=None, **kwargs: None
+        finalize.hf_io, "upload_artifact_file", lambda *args, context=None, **kwargs: None
     )
     monkeypatch.setattr(
         finalize.heartbeat_io,
@@ -810,7 +816,7 @@ def test_finalize_uploads_metrics_before_done(worker_context, monkeypatch):
     monkeypatch.setattr(RunMetrics, "save", lambda self, path: None)
     monkeypatch.setattr(
         finalize.hf_io,
-        "hf_upload_file",
+        "upload_artifact_file",
         lambda local_path, remote_name, context=None, **kwargs: uploads.append(
             (remote_name, kwargs)
         ),
@@ -1310,7 +1316,7 @@ def test_wait_for_gpu_raises_retriable_infra_error(monkeypatch):
 
 def test_required_upload_exhaustion_raises_retriable_infra_error(worker_context, monkeypatch):
     # A required upload that fails after its retries is bad host/network -> RetriableInfraError.
-    import flash.engine.worker.io.hf as worker
+    import flash.engine.worker.io.artifacts as worker
     from flash.engine.worker.perf import RetriableInfraError
 
     monkeypatch.setattr(
@@ -1322,11 +1328,11 @@ def test_required_upload_exhaustion_raises_retriable_infra_error(worker_context,
         raise OSError("connection reset by peer")
 
     with pytest.raises(RetriableInfraError):
-        worker._hf_upload(boom, "DONE", required=True, label="DONE", context=worker_context)
+        worker._artifact_upload(boom, "DONE", required=True, label="DONE", context=worker_context)
 
 
-def test_required_upload_starts_no_hf_call_at_deadline(worker_context, monkeypatch):
-    import flash.engine.worker.io.hf as worker
+def test_required_upload_starts_no_artifact_call_at_deadline(worker_context, monkeypatch):
+    import flash.engine.worker.io.artifacts as worker
     from flash.engine.worker.perf import RetriableInfraError
 
     calls = []
@@ -1336,7 +1342,7 @@ def test_required_upload_starts_no_hf_call_at_deadline(worker_context, monkeypat
     monkeypatch.setattr(worker_context, "remaining_wall_seconds", lambda: 0.0)
 
     with pytest.raises(RetriableInfraError):
-        worker._hf_upload(
+        worker._artifact_upload(
             lambda: calls.append("upload"),
             "DONE",
             required=True,
@@ -1350,7 +1356,7 @@ def test_required_upload_starts_no_hf_call_at_deadline(worker_context, monkeypat
 def test_required_upload_caps_retry_sleep_and_starts_no_late_retry(
     worker_context, monkeypatch, capsys
 ):
-    import flash.engine.worker.io.hf as worker
+    import flash.engine.worker.io.artifacts as worker
     from flash.engine.worker.perf import RetriableInfraError
 
     calls = []
@@ -1368,7 +1374,7 @@ def test_required_upload_caps_retry_sleep_and_starts_no_late_retry(
         raise OSError("Authorization: Bearer bearer-secret provider-body-private")
 
     with pytest.raises(RetriableInfraError):
-        worker._hf_upload(boom, "DONE", required=True, label="DONE", context=worker_context)
+        worker._artifact_upload(boom, "DONE", required=True, label="DONE", context=worker_context)
 
     assert calls == ["upload"]
     assert sleeps == [2.0]
@@ -1378,7 +1384,7 @@ def test_required_upload_caps_retry_sleep_and_starts_no_late_retry(
 
 
 def test_optional_upload_without_deadline_preserves_single_attempt(worker_context, monkeypatch):
-    import flash.engine.worker.io.hf as worker
+    import flash.engine.worker.io.artifacts as worker
 
     calls = []
     monkeypatch.setattr(
@@ -1390,7 +1396,7 @@ def test_optional_upload_without_deadline_preserves_single_attempt(worker_contex
         calls.append("upload")
         raise OSError("offline")
 
-    assert not worker._hf_upload(
+    assert not worker._artifact_upload(
         boom, "debug.json", required=False, label="debug", context=worker_context
     )
     assert calls == ["upload"]
@@ -2317,7 +2323,7 @@ def test_attempt_contexts_keep_identity_uploads_and_heartbeat_progress_independe
     import json
     from pathlib import Path
 
-    from flash.engine.worker.io import hf
+    from flash.engine.worker.io import artifacts as hf
     from flash.engine.worker.runtime.state import WorkerContext
 
     first_env = {"RUN_ID": "first", "HF_REPO": "owner/first", "PHASE": "sft", "SEED": "7"}
@@ -2332,7 +2338,7 @@ def test_attempt_contexts_keep_identity_uploads_and_heartbeat_progress_independe
     def upload_file(*, path_or_fileobj, path_in_repo, repo_id, **kwargs):
         uploads.append((repo_id, path_in_repo, json.loads(Path(path_or_fileobj).read_text())))
 
-    monkeypatch.setattr(hf, "hf_api", lambda: SimpleNamespace(upload_file=upload_file))
+    monkeypatch.setattr(hf, "artifact_api", lambda: SimpleNamespace(upload_file=upload_file))
     worker_heartbeat.heartbeat("boot", context=first)
     worker_heartbeat.heartbeat("boot", context=second)
     worker_heartbeat.heartbeat("sft_step", step=1, context=first)

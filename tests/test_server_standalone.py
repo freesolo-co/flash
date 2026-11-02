@@ -129,6 +129,10 @@ def test_standalone_disables_the_artifact_gc_sweep(monkeypatch) -> None:
     from flash.server.domain.ops.repo_cleanup import repo_cleanup_enabled
 
     monkeypatch.setenv("HF_TOKEN", "hf-operator-token")
+    monkeypatch.setenv(
+        "FLASH_ARTIFACT_BLOB_SAS_URL",
+        "https://testartifacts.blob.core.windows.net/artifacts?sig=offline",
+    )
     monkeypatch.delenv(auth.STANDALONE_ENV, raising=False)
     assert repo_cleanup_enabled() is True
 
@@ -258,26 +262,25 @@ def test_a_whitespace_only_operator_key_authenticates_nothing(monkeypatch) -> No
 
 
 def test_artifact_namespace_is_operator_configurable(monkeypatch) -> None:
-    """Flash CREATES the HF dataset repos it streams artifacts through, so the namespace has to be
-    one the operator's HF_TOKEN can write to. Hardcoding Freesolo's made self-hosting impossible:
-    the assignment runs on every submit, and a self-hoster cannot create Freesolo-Co/flashrun-*, so
-    the run died at upload before training started."""
+    """Self-hosters can select their logical Azure artifact namespace without a code change."""
     from flash.server.domain.ops import repo_cleanup
 
-    monkeypatch.delenv("FLASH_HF_NAMESPACE", raising=False)
+    monkeypatch.delenv("FLASH_ARTIFACT_NAMESPACE", raising=False)
     assert runner_artifacts.artifact_namespace() == runner_artifacts._DEFAULT_ARTIFACT_NAMESPACE
-    assert runner_artifacts.managed_hf_repo_for_environment("env-1").startswith(
+    assert runner_artifacts.managed_artifact_repo_for_environment("env-1").startswith(
         f"{runner_artifacts._DEFAULT_ARTIFACT_NAMESPACE}/"
     )
 
-    monkeypatch.setenv("FLASH_HF_NAMESPACE", "self-hoster")
+    monkeypatch.setenv("FLASH_ARTIFACT_NAMESPACE", "self-hoster")
     assert runner_artifacts.artifact_namespace() == "self-hoster"
-    assert runner_artifacts.managed_hf_repo_for_environment("env-1").startswith("self-hoster/")
+    assert runner_artifacts.managed_artifact_repo_for_environment("env-1").startswith(
+        "self-hoster/"
+    )
     # the GC allowlist must follow the same namespace, or it silently stops matching
     assert repo_cleanup._is_managed_env_repo("self-hoster/flashrun-env-1-abc") is True
     assert repo_cleanup._is_managed_env_repo("someone-else/flashrun-env-1-abc") is False
     # a blank override falls back rather than producing a "/flashrun-*" repo id
-    monkeypatch.setenv("FLASH_HF_NAMESPACE", "   ")
+    monkeypatch.setenv("FLASH_ARTIFACT_NAMESPACE", "   ")
     assert runner_artifacts.artifact_namespace() == runner_artifacts._DEFAULT_ARTIFACT_NAMESPACE
 
 
@@ -494,27 +497,23 @@ def test_the_owner_row_is_still_provisioned_on_a_cold_database(monkeypatch, tmp_
     assert writes == [], f"re-provisioned an owner row that already existed: {writes}"
 
 
-def test_standalone_startup_requires_a_writable_artifact_namespace(monkeypatch) -> None:
-    """Without FLASH_HF_NAMESPACE a self-hoster's artifacts default to a namespace their HF_TOKEN
-    cannot write to, so every run dies at artifact upload -- AFTER preflight called the plane
-    healthy. Fail at startup, where the operator can act on it."""
+def test_standalone_startup_requires_azure_storage(monkeypatch) -> None:
     from flash.providers.core.preflight import PreflightError, check_run_preflight
 
-    monkeypatch.setenv("HF_TOKEN", "hf-operator-token")
     monkeypatch.setenv(auth.INTERNAL_KEY_ENV, "operator-key")
-    monkeypatch.delenv("FLASH_HF_NAMESPACE", raising=False)
-
     monkeypatch.setenv(auth.STANDALONE_ENV, "1")
-    with pytest.raises(PreflightError, match="FLASH_HF_NAMESPACE"):
+    for key in (
+        "FLASH_ARTIFACT_BLOB_ACCOUNT_URL",
+        "FLASH_ARTIFACT_BLOB_SAS_URL",
+        "FLASH_ARTIFACT_BLOB_CONNECTION_STRING",
+    ):
+        monkeypatch.delenv(key, raising=False)
+    with pytest.raises(PreflightError, match="Azure"):
         check_run_preflight()
-
-    # set: boots.
-    monkeypatch.setenv("FLASH_HF_NAMESPACE", "self-hoster")
-    check_run_preflight()
-
-    # and it is standalone-ONLY: the managed plane's token owns the default namespace.
-    monkeypatch.delenv("FLASH_HF_NAMESPACE")
-    monkeypatch.delenv(auth.STANDALONE_ENV)
+    monkeypatch.setenv(
+        "FLASH_ARTIFACT_BLOB_ACCOUNT_URL", "https://testartifacts.blob.core.windows.net"
+    )
+    monkeypatch.delenv("HF_TOKEN", raising=False)
     check_run_preflight()
 
 
@@ -522,35 +521,39 @@ def test_startup_rejects_an_artifact_namespace_that_cannot_form_a_repo_id(monkey
     """Presence was the whole check, so a malformed namespace boots and then fails every submit.
 
     `owner/repo` is the natural spelling for anyone used to HuggingFace ids, and
-    `managed_hf_repo_for_environment` appends the repo name to it -- producing a three-segment id
+    `managed_artifact_repo_for_environment` appends the repo name to it -- producing a three-segment id
     HuggingFace rejects while creating the artifact repo, long after preflight called the plane
     healthy.
     """
     from flash.providers.core.preflight import PreflightError, check_run_preflight
 
     monkeypatch.setenv("HF_TOKEN", "hf-operator-token")
+    monkeypatch.setenv(
+        "FLASH_ARTIFACT_BLOB_SAS_URL",
+        "https://testartifacts.blob.core.windows.net/artifacts?sig=offline",
+    )
     monkeypatch.setenv(auth.INTERNAL_KEY_ENV, "operator-key")
     monkeypatch.setenv(auth.STANDALONE_ENV, "1")
 
-    monkeypatch.setenv("FLASH_HF_NAMESPACE", "owner/repo")
-    with pytest.raises(PreflightError, match="FLASH_HF_NAMESPACE"):
+    monkeypatch.setenv("FLASH_ARTIFACT_NAMESPACE", "owner/repo")
+    with pytest.raises(PreflightError, match="FLASH_ARTIFACT_NAMESPACE"):
         check_run_preflight()
 
     # not just the slash: anything HuggingFace will not accept as an id segment.
-    monkeypatch.setenv("FLASH_HF_NAMESPACE", "bad name")
-    with pytest.raises(PreflightError, match="FLASH_HF_NAMESPACE"):
+    monkeypatch.setenv("FLASH_ARTIFACT_NAMESPACE", "bad name")
+    with pytest.raises(PreflightError, match="FLASH_ARTIFACT_NAMESPACE"):
         check_run_preflight()
 
     # a real namespace still boots -- the guard must reject malformed values, not all of them.
-    monkeypatch.setenv("FLASH_HF_NAMESPACE", "self-hoster")
+    monkeypatch.setenv("FLASH_ARTIFACT_NAMESPACE", "self-hoster")
     check_run_preflight()
 
     # and the value it accepts must actually build a valid id, which is the property that failed.
     from huggingface_hub.utils import validate_repo_id
 
-    from flash.runner.accounting.artifacts import managed_hf_repo_for_environment
+    from flash.runner.accounting.artifacts import managed_artifact_repo_for_environment
 
-    validate_repo_id(managed_hf_repo_for_environment("github:owner/project/envs@main:gsm8k"))
+    validate_repo_id(managed_artifact_repo_for_environment("github:owner/project/envs@main:gsm8k"))
 
 
 def test_the_env_template_does_not_preset_the_hosted_serving_url() -> None:
@@ -636,15 +639,6 @@ def test_a_blank_github_token_is_not_shipped_to_the_worker(monkeypatch) -> None:
     assert env["HF_TOKEN"] == "hf_real"
 
 
-def test_self_hosting_docs_do_not_promise_an_endpoint_concurrency_cap() -> None:
-    """Document Modal workspace quotas without promising a Flash concurrency cap."""
-    import pathlib
-
-    doc = (pathlib.Path(__file__).resolve().parent.parent / "SELF_HOSTING.md").read_text()
-    assert "in-process semaphore, which is the correct" not in doc
-    assert "Modal workspace GPU quotas bound concurrent reservations" in doc
-
-
 def test_the_serving_repos_are_not_on_the_training_path() -> None:
     """The catalog names a serving checkpoint per model, separate from the trained base model.
 
@@ -674,9 +668,6 @@ def test_the_serving_repos_are_not_on_the_training_path() -> None:
     # and the field is genuinely populated, so the check above is not vacuous.
     assert any(m.serving and m.serving.serve_model_id for m in MODELS.values())
     assert SERVING_MODEL_REPOS
-
-    doc = (root.parent / "SELF_HOSTING.md").read_text()
-    assert "informational\nonly" in doc or "informational only" in doc
 
 
 def test_enabling_standalone_adopts_runs_already_in_the_store(monkeypatch, tmp_path) -> None:

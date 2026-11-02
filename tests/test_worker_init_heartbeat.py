@@ -20,8 +20,8 @@ import types
 
 import pytest
 
+import flash.engine.worker.io.artifacts as worker_hf
 import flash.engine.worker.io.heartbeat as worker_heartbeat
-import flash.engine.worker.io.hf as worker_hf
 import flash.engine.worker.perf as worker_perf
 import flash.engine.worker.train.core.lifecycle.finalize as worker_finalize
 import flash.engine.worker.train.rl.launch.inputs as rl_inputs
@@ -230,7 +230,7 @@ def test_liveness_heartbeat_keepalive_forces_real_heartbeats_on_constant_progres
 
 def test_checkpoint_uploading_keepalive_stage_is_throttled_on_tight_cadence():
     """The checkpoint-upload keepalive daemon re-emits a REAL heartbeat every 30s, so it MUST be
-    throttled (else ~120/hr blows the HF commit cap) AND ride the tighter setup-liveness interval, so
+    throttled (else ~120/hr blows the artifact commit cap) AND ride the tighter setup-liveness interval, so
     the provider stall clock is refreshed well inside STALL_AFTER_S rather than every _HB_MIN_INTERVAL_S."""
     import flash.engine.worker.io.heartbeat as ne
     from flash.providers._lifecycle.instances.poll import STALL_AFTER_S
@@ -247,7 +247,7 @@ def test_liveness_heartbeat_survives_inline_thread_stub(worker_context, monkeypa
     """Several suites stub threading.Thread to run targets INLINE on .start() (to make the
     checkpoint-upload daemon synchronous). The liveness daemon must detect it is running on the
     spawning thread and bail, or the inlined loop spins forever and hangs the whole test run
-    (bit test_resume_on_retry via the checkpoint_prefetching wrap in hf_resume_checkpoint)."""
+    (bit test_resume_on_retry via the checkpoint_prefetching wrap in resume_checkpoint)."""
     hb, _ = _liveness_env(monkeypatch)
     emitted: list = []
     monkeypatch.setattr(
@@ -329,7 +329,7 @@ def test_heartbeat_publishes_canonical_progress_age(worker_context, monkeypatch)
         with open(local) as f:
             seen.append(json.load(f))
 
-    monkeypatch.setattr(worker_hf, "hf_upload_file", _capture)
+    monkeypatch.setattr(worker_hf, "upload_artifact_file", _capture)
     monkeypatch.setattr(worker_context.heartbeat_state, "last_progress_ts", 900.0)
 
     worker_heartbeat.heartbeat("rl_step", step=1, context=worker_context)
@@ -366,7 +366,7 @@ def test_heartbeat_omits_progress_age_before_first_progress(worker_context, monk
         with open(local) as f:
             seen.append(json.load(f))
 
-    monkeypatch.setattr(worker_hf, "hf_upload_file", _capture)
+    monkeypatch.setattr(worker_hf, "upload_artifact_file", _capture)
 
     worker_heartbeat.heartbeat("rl_step", liveness=True, step=0, context=worker_context)
 
@@ -401,7 +401,7 @@ def test_heartbeat_console_marks_commit_state_and_bounds_payload():
 
 
 def test_concurrent_heartbeat_commits_once_and_skips_the_duplicate(worker_context, monkeypatch):
-    """Two throttled heartbeats racing one HF commit produce exactly one upload.
+    """Two throttled heartbeats racing one artifact commit produce exactly one upload.
 
     Previously the second thread proved this by BLOCKING on the upload lock and re-checking
     eligibility after the first commit landed. That wait is the contention this no longer pays: the
@@ -421,7 +421,7 @@ def test_concurrent_heartbeat_commits_once_and_skips_the_duplicate(worker_contex
         assert release_first.wait(5.0)
         return True
 
-    monkeypatch.setattr(worker_hf, "hf_upload_file", upload)
+    monkeypatch.setattr(worker_hf, "upload_artifact_file", upload)
     monkeypatch.setattr(worker_heartbeat, "_HB_MIN_INTERVAL_S", 900.0)
     monkeypatch.setattr(worker_context.heartbeat_state, "last_upload", 0.0)
     monkeypatch.setattr(worker_context.heartbeat_state, "last_committed_step", 0)
@@ -504,7 +504,7 @@ def _capture_heartbeat_payloads(monkeypatch, worker, *, worker_context) -> list[
         return True
 
     _reset_console_heartbeat_state(monkeypatch, worker, worker_context=worker_context)
-    monkeypatch.setattr(worker_hf, "hf_upload_file", capture)
+    monkeypatch.setattr(worker_hf, "upload_artifact_file", capture)
     return committed
 
 
@@ -602,12 +602,12 @@ def test_heartbeat_console_and_upload_marker_matrix(
     _reset_console_heartbeat_state(monkeypatch, worker, worker_context=worker_context)
     held = False
     if scenario in {"success", "upload-false"}:
-        monkeypatch.setattr(worker_hf, "hf_upload_file", _upload)
+        monkeypatch.setattr(worker_hf, "upload_artifact_file", _upload)
     elif scenario == "lock-skip":
         monkeypatch.setattr(heartbeat_module, "_HB_UPLOAD_LOCK_TIMEOUT_S", 0.01)
         monkeypatch.setattr(
             worker_hf,
-            "hf_upload_file",
+            "upload_artifact_file",
             lambda *args, context=None, **kwargs: pytest.fail("a skipped upload must not call hf"),
         )
         assert worker_context.heartbeat_state.upload_lock.acquire(timeout=1.0)
@@ -618,7 +618,7 @@ def test_heartbeat_console_and_upload_marker_matrix(
         monkeypatch.setattr(worker_heartbeat, "_HB_MIN_INTERVAL_S", 900.0)
         monkeypatch.setattr(
             worker_hf,
-            "hf_upload_file",
+            "upload_artifact_file",
             lambda *args, context=None, **kwargs: pytest.fail(
                 "a throttled heartbeat must not call hf"
             ),
@@ -742,7 +742,7 @@ def test_error_heartbeat_fallback_preserves_metric_backlog():
 
 
 def test_per_step_training_stages_are_throttled():
-    """Both per-step training stages must be in _HB_THROTTLED_STAGES so their HF upload is capped at
+    """Both per-step training stages must be in _HB_THROTTLED_STAGES so their artifact upload is capped at
     _HB_MIN_INTERVAL_S. The reward/SFT log callbacks AND the train-loop liveness daemon re-emit the
     SAME stage frequently; without throttling sft_step (liveness ~every 30s ~= 120 commits/hr plus the
     log callback) would blow the 128/hr repo commit cap — exactly the regression rl_step's throttle
@@ -762,7 +762,9 @@ def test_sft_step_liveness_upload_is_throttled(worker_context, monkeypatch):
     uploads: list = []
     monkeypatch.setattr(worker_heartbeat, "_HB_MIN_INTERVAL_S", 60.0)
     monkeypatch.setattr(
-        worker_hf, "hf_upload_file", lambda local, *a, context=None, **k: uploads.append(local)
+        worker_hf,
+        "upload_artifact_file",
+        lambda local, *a, context=None, **k: uploads.append(local),
     )
     worker_context.heartbeat_state.last_upload = 0.0
     # First sft_step claims the slot; the next two (well within 60s) must be throttled out.
@@ -779,7 +781,9 @@ def test_forced_sample_payload_commits_after_same_step_liveness(worker_context, 
     monkeypatch.setattr(worker_heartbeat, "_HB_MIN_INTERVAL_S", 900.0)
     monkeypatch.setattr(worker_heartbeat, "_HB_FORCE_MIN_INTERVAL_S", 0.0)
     monkeypatch.setattr(
-        worker_hf, "hf_upload_file", lambda local, *a, context=None, **k: uploads.append(local)
+        worker_hf,
+        "upload_artifact_file",
+        lambda local, *a, context=None, **k: uploads.append(local),
     )
     worker_context.heartbeat_state.last_upload = 0.0
     worker_context.heartbeat_state.last_forced_upload = 0.0
@@ -819,7 +823,7 @@ def test_initial_rl_step_persists_through_throttle_and_bills_cancel(worker_conte
             persisted.append(json.load(f))
         return True
 
-    monkeypatch.setattr(worker_hf, "hf_upload_file", upload)
+    monkeypatch.setattr(worker_hf, "upload_artifact_file", upload)
     worker_context.heartbeat_state.last_upload = time.time()
     worker_context.heartbeat_state.last_committed_step = 0
 
@@ -844,7 +848,7 @@ def test_initial_rl_step_lock_timeout_is_retriable(worker_context, monkeypatch):
     monkeypatch.setattr(hb, "_HB_UPLOAD_LOCK_TIMEOUT_S", 0.01)
     monkeypatch.setattr(
         worker_hf,
-        "hf_upload_file",
+        "upload_artifact_file",
         lambda *args, context=None, **kwargs: pytest.fail(
             "lock timeout must not attempt an upload"
         ),
@@ -873,13 +877,15 @@ def test_force_commit_via_regular_throttle_arms_the_floor(worker_context, monkey
     """Regression (heartbeat.py): a force=True heartbeat that commits because the regular
     throttle was ALREADY due (not because the force branch bypassed it) must STILL arm the forced-commit
     clock — else the clock stays stale and a following sub-floor forced ping punches through, defeating
-    the burst coalescing that protects the HF commit cap."""
+    the burst coalescing that protects the artifact commit cap."""
 
     uploads: list = []
     monkeypatch.setattr(worker_heartbeat, "_HB_MIN_INTERVAL_S", 900.0)
     monkeypatch.setattr(worker_heartbeat, "_HB_FORCE_MIN_INTERVAL_S", 60.0)
     monkeypatch.setattr(
-        worker_hf, "hf_upload_file", lambda local, *a, context=None, **k: uploads.append(local)
+        worker_hf,
+        "upload_artifact_file",
+        lambda local, *a, context=None, **k: uploads.append(local),
     )
     worker_context.heartbeat_state.last_upload = (
         0.0  # regular throttle is DUE -> the first force commits via it, not the bypass
@@ -916,7 +922,7 @@ def test_setup_liveness_upload_uses_shorter_interval(worker_context, monkeypatch
             uploads.append(json.load(f))
 
     monkeypatch.setattr(hbmod.time, "time", lambda: now["t"])
-    monkeypatch.setattr(worker_hf, "hf_upload_file", _capture)
+    monkeypatch.setattr(worker_hf, "upload_artifact_file", _capture)
     monkeypatch.setattr(worker_heartbeat, "_HB_MIN_INTERVAL_S", 900.0)
     monkeypatch.setattr(ne, "_HB_SETUP_LIVENESS_INTERVAL_S", 240.0)
 
@@ -974,7 +980,7 @@ def test_quiet_phases_upload_at_setup_liveness_interval():
 
 
 # --------------------------------------------------------------------------------------------
-# Progress-carry latch: a real heartbeat that never reached HF (throttled away or failed upload)
+# Progress-carry latch: a real heartbeat that never reached artifact storage (throttled away or failed upload)
 # upgrades the NEXT committed liveness ping to a real heartbeat. Without it, the train-loop liveness
 # daemon can win the shared 900s upload slot with a bare ping, deferring the real per-step heartbeat
 # to T+1800s > the provider's 1500s stall window — a healthy training run killed as "stalled".
@@ -1001,7 +1007,7 @@ def test_progress_carry_upgrades_ping_after_throttled_real_heartbeat(worker_cont
             uploads.append(json.load(f))
 
     monkeypatch.setattr(hbmod.time, "time", lambda: now["t"])
-    monkeypatch.setattr(worker_hf, "hf_upload_file", _capture)
+    monkeypatch.setattr(worker_hf, "upload_artifact_file", _capture)
     monkeypatch.setattr(worker_heartbeat, "_HB_MIN_INTERVAL_S", 900.0)
     _reset_hb_state(monkeypatch, ne, last_upload=1000.0, worker_context=worker_context)
 
@@ -1055,7 +1061,7 @@ def test_progress_carry_survives_failed_upload(worker_context, monkeypatch):
         return outcome["ok"]
 
     monkeypatch.setattr(hbmod.time, "time", lambda: now["t"])
-    monkeypatch.setattr(worker_hf, "hf_upload_file", _capture)
+    monkeypatch.setattr(worker_hf, "upload_artifact_file", _capture)
     monkeypatch.setattr(worker_heartbeat, "_HB_MIN_INTERVAL_S", 0.0)
     _reset_hb_state(monkeypatch, ne, worker_context=worker_context)
 
@@ -1085,7 +1091,7 @@ def test_progress_carry_does_not_mark_new_progress(worker_context, monkeypatch):
     import flash.engine.worker.io.heartbeat as ne
 
     monkeypatch.setattr(
-        worker_hf, "hf_upload_file", lambda *a, context=None, **k: False
+        worker_hf, "upload_artifact_file", lambda *a, context=None, **k: False
     )  # keep the latch pending
     monkeypatch.setattr(worker_heartbeat, "_HB_MIN_INTERVAL_S", 0.0)
     _reset_hb_state(monkeypatch, ne, worker_context=worker_context)
@@ -1107,7 +1113,7 @@ def test_progress_carry_does_not_mark_new_progress(worker_context, monkeypatch):
 def test_hf_cache_bytes_counts_blobs_and_reports_unmeasurable_as_none(tmp_path, monkeypatch):
     import huggingface_hub.constants as hconst
 
-    from flash.engine.worker.io import hf
+    from flash.engine.worker.io import artifacts as hf
 
     monkeypatch.setattr(hconst, "HF_HUB_CACHE", str(tmp_path))
     assert hf._hf_cache_bytes("org/model") is None  # no repo dir yet -> unmeasurable
@@ -1238,7 +1244,7 @@ def test_train_phase_wraps_train_in_liveness_heartbeat(modname, outer, stage):
 
 
 def test_prefetch_wraps_download_in_liveness_heartbeat_gated_on_bytes():
-    from flash.engine.worker.io import hf
+    from flash.engine.worker.io import artifacts as hf
 
     src = inspect.getsource(hf.prefetch_model)
     assert "liveness_heartbeat(" in src
@@ -1337,7 +1343,7 @@ def test_rl_warmstart_adapter_download_is_wrapped_in_liveness_heartbeat():
 def test_sft_configuring_is_a_setup_stage_on_the_tight_liveness_cadence():
     """The config span's stage must behave like every other pre-training liveness stage: it keeps the
     wide setup grace (it has not even loaded the model yet), refreshes status on the faster setup
-    cadence, and is throttled so its 30s re-emit can't blow the HF commit cap."""
+    cadence, and is throttled so its 30s re-emit can't blow the artifact commit cap."""
     import flash.engine.worker.io.heartbeat as ne
     from flash.providers._lifecycle.instances.poll import (
         SETUP_HEARTBEAT_STAGES,
@@ -1351,9 +1357,9 @@ def test_sft_configuring_is_a_setup_stage_on_the_tight_liveness_cadence():
 
 
 def test_resume_checkpoint_download_is_wrapped_in_liveness_heartbeat():
-    from flash.engine.worker.io import hf
+    from flash.engine.worker.io import artifacts as hf
 
-    src = inspect.getsource(hf.hf_resume_checkpoint)
+    src = inspect.getsource(hf.resume_checkpoint)
     assert 'liveness_heartbeat("checkpoint_prefetching", context=context)' in src, (
         "the multi-GB resume checkpoint download must keep the heartbeat fresh"
     )
@@ -1392,7 +1398,7 @@ def test_post_download_model_setup_runs_under_a_liveness_wrap():
 @pytest.mark.parametrize("stage", ["sft_model_load"])
 def test_model_load_is_a_throttled_setup_stage(stage):
     """Now that these hold a liveness thread, they re-emit every 30s -- so they must be throttled or
-    a slow cold mount spends the HF commit budget on them, and must keep the WIDE setup grace since
+    a slow cold mount spends the artifact commit budget on them, and must keep the WIDE setup grace since
     no training has started."""
     import flash.engine.worker.io.heartbeat as ne
     from flash.providers._lifecycle.instances.poll import (
@@ -1429,7 +1435,7 @@ def test_model_load_transition_commits_even_behind_a_fresh_setup_ping(
             committed.append(json.load(f)["stage"])
         return True
 
-    monkeypatch.setattr(worker_hf, "hf_upload_file", _fake_upload)
+    monkeypatch.setattr(worker_hf, "upload_artifact_file", _fake_upload)
     monkeypatch.setattr(worker_perf, "gpu_diagnostics", lambda **k: {})
     monkeypatch.setattr(worker_context.heartbeat_state, "last_upload", 0.0)
     monkeypatch.setattr(worker_context.heartbeat_state, "last_committed_step", -1)
@@ -1494,7 +1500,7 @@ def test_bounded_reward_metrics_sanitizes_and_bounds_names() -> None:
 
 
 def test_throttled_heartbeat_does_not_block_behind_an_in_flight_upload(worker_context, monkeypatch):
-    """A slow HF commit must not stall every other throttled heartbeat on the upload lock.
+    """A slow artifact commit must not stall every other throttled heartbeat on the upload lock.
 
     The throttle clock only advances AFTER a commit lands, so while one is in flight every other
     throttled caller still computes ``upload_due`` and blocks in ``_HB_UPLOAD_LOCK.acquire()`` for
@@ -1515,7 +1521,7 @@ def test_throttled_heartbeat_does_not_block_behind_an_in_flight_upload(worker_co
         release_upload.wait(10)
         return True
 
-    monkeypatch.setattr(worker_hf, "hf_upload_file", slow_upload)
+    monkeypatch.setattr(worker_hf, "upload_artifact_file", slow_upload)
 
     committer = threading.Thread(
         target=lambda: worker_heartbeat.heartbeat("rl_step", step=1, context=worker_context),
@@ -1591,7 +1597,7 @@ def test_failed_upload_clears_the_in_flight_marker(worker_context, monkeypatch):
     def boom(*args, context=None, **kwargs):
         raise RuntimeError("hf unreachable")
 
-    monkeypatch.setattr(worker_hf, "hf_upload_file", boom)
+    monkeypatch.setattr(worker_hf, "upload_artifact_file", boom)
     with pytest.raises(RuntimeError, match="hf unreachable"):
         worker_heartbeat.heartbeat("rl_step", step=1, context=worker_context)
 

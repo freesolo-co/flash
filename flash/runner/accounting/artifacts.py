@@ -20,19 +20,12 @@ _ARTIFACT_REPO_NAME_MAX = 96
 
 
 def artifact_namespace() -> str:
-    """The HuggingFace namespace run artifacts are created under.
-
-    Flash streams code, checkpoints and adapters through HF dataset repos that the control plane
-    CREATES, so the namespace has to be one the operator's ``HF_TOKEN`` can write to. Hardcoding
-    Freesolo's made self-hosting impossible: ``_assign_managed_hf_repo`` runs on every submit, and a
-    self-hoster's token cannot create ``Freesolo-Co/flashrun-*``, so the run failed at upload before
-    any training started.
-    """
-    return (os.environ.get("FLASH_HF_NAMESPACE") or "").strip() or _DEFAULT_ARTIFACT_NAMESPACE
+    """Stable logical namespace inside the private Azure artifact container."""
+    return (os.environ.get("FLASH_ARTIFACT_NAMESPACE") or "").strip() or _DEFAULT_ARTIFACT_NAMESPACE
 
 
 def _environment_artifact_repo_name(env_id: str) -> str:
-    """Stable HF dataset repo name for all runs of one environment."""
+    """Stable logical artifact namespace for all runs of one environment."""
     raw = (env_id or "default-environment").strip() or "default-environment"
     digest = hashlib.sha1(raw.encode("utf-8")).hexdigest()[:16]
     slug = re.sub(r"[^A-Za-z0-9]+", "-", raw.lower()).strip("-") or "environment"
@@ -41,16 +34,16 @@ def _environment_artifact_repo_name(env_id: str) -> str:
     return f"{_ARTIFACT_REPO_PREFIX}{slug}-{digest}"
 
 
-def managed_hf_repo_for_environment(env_id: str) -> str:
-    """Private HF dataset repo shared by runs that use the same environment id."""
+def managed_artifact_repo_for_environment(env_id: str) -> str:
+    """Private Azure artifact namespace shared by runs that use the same environment id."""
     return f"{artifact_namespace()}/{_environment_artifact_repo_name(env_id)}"
 
 
-def managed_hf_repo_for_run(env_id: str, run_id: str) -> str:
-    """isolate each new run's commits while keeping retries in one stable private repo."""
+def managed_artifact_repo_for_run(env_id: str, run_id: str) -> str:
+    """isolate each new run's artifacts while keeping retries in one stable private namespace."""
     if not run_id or run_id == "local":
         raise ValueError("run_id must be finalized before assigning the artifact repo")
-    # environment-only repositories share an upstream commit quota across every concurrent run.
+    # per-run namespaces keep independently published manifests separate.
     # hash a framed identity so different environment/run pairs cannot alias by concatenation.
     identity = f"{len(env_id)}:{env_id}{run_id}"
     digest = hashlib.sha256(identity.encode("utf-8")).hexdigest()[:24]
@@ -60,11 +53,11 @@ def managed_hf_repo_for_run(env_id: str, run_id: str) -> str:
     return f"{artifact_namespace()}/{name}"
 
 
-def _assign_managed_hf_repo(spec: JobSpec) -> JobSpec:
+def _assign_managed_artifact_repo(spec: JobSpec) -> JobSpec:
     """Assign a private run-scoped repo at submit; persisted older assignments stay intact."""
     if not spec.run_id or spec.run_id == "local":
         raise ValueError("run_id must be finalized before assigning the artifact repo")
-    repo = managed_hf_repo_for_run(spec.environment.id, spec.run_id)
+    repo = managed_artifact_repo_for_run(spec.environment.id, spec.run_id)
     d = spec.to_internal_dict()
     d["train"] = {**d["train"], "hf_repo": repo}
     return JobSpec.from_dict(d)
@@ -80,9 +73,7 @@ def stage_environment_package(
         return spec
     if not spec.train.hf_repo:
         raise RuntimeError("hf_repo must be assigned before staging the environment package")
-    token = (os.environ.get("HF_TOKEN") or "").strip()
-    if not token:
-        raise RuntimeError("staging the environment package requires HF_TOKEN")
+    token = None
 
     from flash.envs.loading.staged import (
         StagedEnvironmentTransientError,
@@ -104,10 +95,9 @@ def stage_environment_package(
         )
         return spec
 
-    from huggingface_hub import HfApi
-
+    from flash.artifacts.api import ArtifactStore
     from flash.core.spec import EnvironmentPackageSpec
-    from flash.providers._lifecycle.net.worker import _ensure_private_artifact_repo, _hf_call
+    from flash.providers._lifecycle.net.worker import _artifact_call, _ensure_private_artifact_repo
 
     source = resolve_environment_source(
         spec.environment.id,
@@ -115,7 +105,7 @@ def stage_environment_package(
         deadline_at=deadline_at,
     )
     try:
-        api = HfApi(token=token)
+        api = ArtifactStore(token=token)
         _ensure_private_artifact_repo(api, spec.train.hf_repo, deadline_at=deadline_at)
         with tempfile.TemporaryDirectory(prefix="flash-stage-env-") as tmp:
             archive_file = Path(tmp) / "package.tar.gz"
@@ -124,7 +114,7 @@ def stage_environment_package(
             manifest_bytes = encode_manifest(manifest_payload(source, archive_sha256, archive_path))
             manifest_sha256 = hashlib.sha256(manifest_bytes).hexdigest()
             manifest_path = manifest_path_for_digest(manifest_sha256)
-            _hf_call(
+            _artifact_call(
                 lambda: api.upload_file(
                     path_or_fileobj=str(archive_file),
                     path_in_repo=archive_path,
@@ -134,7 +124,7 @@ def stage_environment_package(
                 f"upload environment package {spec.train.hf_repo}:{archive_path}",
                 deadline_at=deadline_at,
             )
-            commit = _hf_call(
+            commit = _artifact_call(
                 lambda: api.upload_file(
                     path_or_fileobj=BytesIO(manifest_bytes),
                     path_in_repo=manifest_path,

@@ -14,32 +14,32 @@ def download_adapter(
     token: str | None,
     subfolder: str | None,
 ) -> str:
-    from huggingface_hub import HfApi, RepoFile, hf_hub_download, snapshot_download
+    from flash.artifacts.api import ArtifactFile, ArtifactStore, download_file, download_snapshot
 
-    args = {"repo_id": repo_id, "repo_type": repo_type, "revision": revision, "token": token}
+    args = {"repo_id": repo_id, "repo_type": repo_type, "revision": revision, "token": None}
     if not subfolder:
-        return snapshot_download(**args, local_dir=local_dir)
+        return download_snapshot(**args, local_dir=local_dir)
     prefix = PurePosixPath(subfolder)
     if prefix.is_absolute() or ".." in prefix.parts:
         raise ValueError("adapter subfolder must stay inside its repository")
-    # snapshot_download(allow_patterns=...) still enumerates the entire repository.
+    # download_snapshot(allow_patterns=...) still enumerates the entire repository.
     # Training datasets can contain thousands of native checkpoint shards; scope the
     # tree request itself, retaining the same immutable SHA for every file download.
-    for entry in HfApi().list_repo_tree(**args, path_in_repo=subfolder, recursive=True):
-        if not isinstance(entry, RepoFile):
+    for entry in ArtifactStore().list_repo_tree(**args, path_in_repo=subfolder, recursive=True):
+        if not isinstance(entry, ArtifactFile):
             continue
         path = PurePosixPath(entry.path)
         if path.is_absolute() or ".." in path.parts or not path.is_relative_to(prefix):
-            raise ValueError("Hub returned a file outside the adapter directory")
+            raise ValueError("Azure artifact storage returned a file outside the adapter directory")
         target = Path(local_dir) / entry.path
         if not target.resolve().is_relative_to(Path(local_dir).resolve()):
             raise ValueError("adapter download escapes its exact-SHA source cache")
-        hf_hub_download(**args, filename=entry.path, local_dir=local_dir)
+        download_file(**args, filename=entry.path, local_dir=local_dir)
     return local_dir
 
 
 def download_retry_delay(error: Exception, attempt: int) -> float:
-    """Honor Hub throttling within a bounded five-minute retry window."""
+    """Honor artifact-storage throttling within a bounded five-minute retry window."""
     fallback = 0.5 * (2**attempt)
     response = getattr(error, "response", None)
     if response is None or response.status_code != 429:

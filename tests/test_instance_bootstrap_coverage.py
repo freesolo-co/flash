@@ -2,7 +2,7 @@
 
 These target under-covered helpers in ``flash.providers._lifecycle.bootstrap``: payload loading,
 code-prefix validation, the Hugging Face transient-retry machinery (status/Retry-After parsing +
-backoff), the HF upload/exists/fetch wrappers, ``run_mode``'s subprocess tee (success + wall-clock
+backoff), the artifact upload/exists/fetch wrappers, ``run_mode``'s subprocess tee (success + wall-clock
 timeout), the attempt-marker writer, the preload wall-cap watchdog ``_fire`` path, and ``main()``'s
 preload branch. Everything is CPU-only and offline: the huggingface_hub package is stubbed via
 sys.modules, subprocess.Popen is faked, and targeted real multiprocessing children exercise uploader
@@ -93,7 +93,7 @@ def _install_fake_hf(monkeypatch, **attrs):
     hub = types.ModuleType("huggingface_hub")
     for name, value in attrs.items():
         setattr(hub, name, value)
-    monkeypatch.setitem(sys.modules, "huggingface_hub", hub)
+    monkeypatch.setitem(sys.modules, "flash.artifacts.api", hub)
     return hub
 
 
@@ -196,49 +196,57 @@ def test_source_descriptor_rejects_missing_and_malformed():
 
 
 # ---------------------------------------------------------------------------
-# _hf_status_code
+# _artifact_status_code
 # ---------------------------------------------------------------------------
-def test_hf_status_code_parses_and_falls_back_to_none():
-    assert b._hf_status_code(_err(status="503")) == 503  # numeric-string coerces to int
-    assert b._hf_status_code(_err(status=429)) == 429
+def test_artifact_status_code_parses_and_falls_back_to_none():
+    assert b._artifact_status_code(_err(status="503")) == 503  # numeric-string coerces to int
+    assert b._artifact_status_code(_err(status=429)) == 429
     # No response attribute at all -> int(None) -> TypeError -> None.
-    assert b._hf_status_code(_err()) is None
+    assert b._artifact_status_code(_err()) is None
     # Unparseable status -> ValueError -> None.
-    assert b._hf_status_code(_err(status="not-a-number")) is None
+    assert b._artifact_status_code(_err(status="not-a-number")) is None
 
 
 # ---------------------------------------------------------------------------
-# _hf_retry_after
+# _artifact_retry_after
 # ---------------------------------------------------------------------------
-def test_hf_retry_after_numeric_clamped_and_case_insensitive():
+def test_artifact_retry_after_numeric_clamped_and_case_insensitive():
     # plain integer seconds
-    assert b._hf_retry_after(_err(headers={"retry-after": "30"})) == 30.0
+    assert b._artifact_retry_after(_err(headers={"retry-after": "30"})) == 30.0
     # clamped to the 60s ceiling
-    assert b._hf_retry_after(_err(headers={"retry-after": "120"})) == 60.0
+    assert b._artifact_retry_after(_err(headers={"retry-after": "120"})) == 60.0
     # negative clamps up to 0
-    assert b._hf_retry_after(_err(headers={"retry-after": "-5"})) == 0.0
+    assert b._artifact_retry_after(_err(headers={"retry-after": "-5"})) == 0.0
     # header key match is case-insensitive (dict .get miss -> items() fallback)
-    assert b._hf_retry_after(_err(headers={"Retry-After": "45"})) == 45.0
+    assert b._artifact_retry_after(_err(headers={"Retry-After": "45"})) == 45.0
     # no header / no response -> None
-    assert b._hf_retry_after(_err(headers={})) is None
-    assert b._hf_retry_after(_err()) is None
+    assert b._artifact_retry_after(_err(headers={})) is None
+    assert b._artifact_retry_after(_err()) is None
 
 
-def test_hf_retry_after_http_date_variants():
+def test_artifact_retry_after_http_date_variants():
     # RFC-1123 date with an explicit zone (tz-aware) far in the future -> clamped to 60.
-    assert b._hf_retry_after(_err(headers={"retry-after": "Wed, 21 Oct 2099 07:28:00 GMT"})) == 60.0
+    assert (
+        b._artifact_retry_after(_err(headers={"retry-after": "Wed, 21 Oct 2099 07:28:00 GMT"}))
+        == 60.0
+    )
     # Naive RFC date (no zone) exercises the tzinfo-is-None -> assume-UTC branch, still future -> 60.
-    assert b._hf_retry_after(_err(headers={"retry-after": "Wed, 21 Oct 2099 07:28:00"})) == 60.0
+    assert (
+        b._artifact_retry_after(_err(headers={"retry-after": "Wed, 21 Oct 2099 07:28:00"})) == 60.0
+    )
     # A past date -> negative delta clamps to 0.
-    assert b._hf_retry_after(_err(headers={"retry-after": "Mon, 01 Jan 2001 00:00:00 GMT"})) == 0.0
+    assert (
+        b._artifact_retry_after(_err(headers={"retry-after": "Mon, 01 Jan 2001 00:00:00 GMT"}))
+        == 0.0
+    )
     # Neither a float nor a parseable date -> None (both inner excepts).
-    assert b._hf_retry_after(_err(headers={"retry-after": "garbage-not-a-date"})) is None
+    assert b._artifact_retry_after(_err(headers={"retry-after": "garbage-not-a-date"})) is None
 
 
 # ---------------------------------------------------------------------------
-# _hf_call retry machinery
+# _artifact_call retry machinery
 # ---------------------------------------------------------------------------
-def test_hf_call_retries_transient_then_raises_and_passes_nontransient_through(monkeypatch):
+def test_artifact_call_retries_transient_then_raises_and_passes_nontransient_through(monkeypatch):
     sleeps: list[float] = []
     monkeypatch.setattr(b.time, "sleep", lambda s: sleeps.append(s))
 
@@ -252,10 +260,12 @@ def test_hf_call_retries_transient_then_raises_and_passes_nontransient_through(m
 
     deadline_at = time.time() + 3600.0
     with pytest.raises(_HFError) as ei:
-        b._hf_call(always_503, "list", deadline_at=deadline_at)
+        b._artifact_call(always_503, "list", deadline_at=deadline_at)
     assert "boom" in str(ei.value)
-    assert attempts["n"] == len(b._HF_RETRY_DELAYS_S) + 1  # initial try + one per delay
-    assert sleeps == [5.0] * len(b._HF_RETRY_DELAYS_S)  # Retry-After overrides the default schedule
+    assert attempts["n"] == len(b._ARTIFACT_RETRY_DELAYS_S) + 1  # initial try + one per delay
+    assert sleeps == [5.0] * len(
+        b._ARTIFACT_RETRY_DELAYS_S
+    )  # Retry-After overrides the default schedule
 
     # A non-transient status (400) is re-raised on the very first attempt with no sleep.
     sleeps.clear()
@@ -266,7 +276,7 @@ def test_hf_call_retries_transient_then_raises_and_passes_nontransient_through(m
         raise _err(status=400)
 
     with pytest.raises(_HFError):
-        b._hf_call(bad_request, "list", deadline_at=deadline_at)
+        b._artifact_call(bad_request, "list", deadline_at=deadline_at)
     assert calls["n"] == 1
     assert sleeps == []
 
@@ -280,11 +290,13 @@ def test_hf_call_retries_transient_then_raises_and_passes_nontransient_through(m
             raise nxt
         return nxt
 
-    assert b._hf_call(flaky, "download", deadline_at=deadline_at) == "ok-result"
-    assert sleeps == [b._HF_RETRY_DELAYS_S[0]]  # one default-scheduled backoff before the retry
+    assert b._artifact_call(flaky, "download", deadline_at=deadline_at) == "ok-result"
+    assert sleeps == [
+        b._ARTIFACT_RETRY_DELAYS_S[0]
+    ]  # one default-scheduled backoff before the retry
 
 
-def test_hf_call_caps_retry_sleep_at_deadline(monkeypatch):
+def test_artifact_call_caps_retry_sleep_at_deadline(monkeypatch):
     clock = {"now": 100.0}
     sleeps = []
     attempts = []
@@ -301,16 +313,16 @@ def test_hf_call_caps_retry_sleep_at_deadline(monkeypatch):
     monkeypatch.setattr(b.time, "sleep", sleep)
 
     with pytest.raises(TimeoutError, match="deadline"):
-        b._hf_call(always_503, "list", deadline_at=102.0)
+        b._artifact_call(always_503, "list", deadline_at=102.0)
 
     assert attempts == [True]
     assert sleeps == [2.0]
 
 
 # ---------------------------------------------------------------------------
-# hf_upload / hf_file_exists / fetch_spec_from_hf
+# hf_upload / artifact_file_exists / fetch_spec_from_hf
 # ---------------------------------------------------------------------------
-def test_hf_upload_targets_prefixed_path_and_swallows_errors(monkeypatch):
+def test_artifact_upload_targets_prefixed_path_and_swallows_errors(monkeypatch):
     recorded = {}
 
     class _Api:
@@ -320,7 +332,7 @@ def test_hf_upload_targets_prefixed_path_and_swallows_errors(monkeypatch):
         def upload_file(self, **kw):
             recorded.update(kw)
 
-    _install_fake_hf(monkeypatch, HfApi=_Api)
+    _install_fake_hf(monkeypatch, ArtifactStore=_Api)
     created_at = time.time()
     payload = {
         "hf_repo": "org/repo",
@@ -332,8 +344,8 @@ def test_hf_upload_targets_prefixed_path_and_swallows_errors(monkeypatch):
     }
     # True only when the artifact landed: the error is swallowed, so a caller tracking what is
     # already stored would otherwise read a failed upload as success and skip its retry.
-    assert b.hf_upload(payload, "/tmp/x.txt", "console.txt") is True
-    assert recorded["token"] == "hf-tok"
+    assert b.upload_artifact(payload, "/tmp/x.txt", "console.txt") is True
+    assert recorded["token"] is None
     assert recorded["path_or_fileobj"] == "/tmp/x.txt"
     assert recorded["path_in_repo"] == "sft/run/console.txt"
     assert recorded["repo_id"] == "org/repo"
@@ -347,18 +359,18 @@ def test_hf_upload_targets_prefixed_path_and_swallows_errors(monkeypatch):
         def upload_file(self, **kw):
             raise RuntimeError("hf 500")
 
-    _install_fake_hf(monkeypatch, HfApi=_BoomApi)
-    assert b.hf_upload(payload, "/tmp/x.txt", "console.txt") is False
+    _install_fake_hf(monkeypatch, ArtifactStore=_BoomApi)
+    assert b.upload_artifact(payload, "/tmp/x.txt", "console.txt") is False
 
 
-def test_hf_upload_starts_no_request_at_deadline(monkeypatch):
+def test_artifact_upload_starts_no_request_at_deadline(monkeypatch):
     calls = []
 
     class _Api:
         def __init__(self, token=None):
             calls.append("init")
 
-    _install_fake_hf(monkeypatch, HfApi=_Api)
+    _install_fake_hf(monkeypatch, ArtifactStore=_Api)
     monkeypatch.setattr(b.time, "time", lambda: 200.0)
     payload = {
         "hf_repo": "o/r",
@@ -369,11 +381,11 @@ def test_hf_upload_starts_no_request_at_deadline(monkeypatch):
         "run_max_wall_seconds": 100.0,
     }
 
-    assert b.hf_upload(payload, "/tmp/x.txt", "console.txt") is False
+    assert b.upload_artifact(payload, "/tmp/x.txt", "console.txt") is False
     assert calls == []
 
 
-def test_hf_file_exists_delegates_to_api(monkeypatch):
+def test_artifact_file_exists_delegates_to_api(monkeypatch):
     seen = {}
 
     class _Api:
@@ -384,7 +396,7 @@ def test_hf_file_exists_delegates_to_api(monkeypatch):
             seen.update(kw)
             return kw["filename"].endswith("DONE")
 
-    _install_fake_hf(monkeypatch, HfApi=_Api)
+    _install_fake_hf(monkeypatch, ArtifactStore=_Api)
     created_at = time.time()
     payload = {
         "hf_repo": "o/r",
@@ -394,12 +406,12 @@ def test_hf_file_exists_delegates_to_api(monkeypatch):
         "run_created_at": created_at,
         "run_max_wall_seconds": 60.0,
     }
-    assert b.hf_file_exists(payload, "DONE") is True
+    assert b.artifact_file_exists(payload, "DONE") is True
     assert seen["filename"] == "p/DONE"
     assert seen["repo_id"] == "o/r"
     assert seen["repo_type"] == "dataset"
-    assert seen["token"] == "t"
-    assert b.hf_file_exists(payload, "metrics.json") is False
+    assert seen["token"] is None
+    assert b.artifact_file_exists(payload, "metrics.json") is False
 
 
 def test_bootstrap_network_helpers_reject_payload_without_deadline(monkeypatch):
@@ -409,7 +421,7 @@ def test_bootstrap_network_helpers_reject_payload_without_deadline(monkeypatch):
         def __init__(self, token=None):
             calls.append(("init", token))
 
-    _install_fake_hf(monkeypatch, HfApi=_Api)
+    _install_fake_hf(monkeypatch, ArtifactStore=_Api)
     monkeypatch.setattr(
         b.bootstrap_pip.subprocess,
         "Popen",
@@ -422,22 +434,22 @@ def test_bootstrap_network_helpers_reject_payload_without_deadline(monkeypatch):
         "extra_pip": ["private-package"],
     }
 
-    assert b.hf_upload(payload, "/tmp/x.txt", "console.txt") is False
+    assert b.upload_artifact(payload, "/tmp/x.txt", "console.txt") is False
     with pytest.raises(RuntimeError, match="run wall deadline"):
-        b.hf_file_exists(payload, "DONE")
+        b.artifact_file_exists(payload, "DONE")
     with pytest.raises(RuntimeError, match="run wall deadline"):
         b.install_extra_pip(payload)
     assert calls == []
 
 
-def test_hf_file_exists_starts_no_request_at_deadline(monkeypatch):
+def test_artifact_file_exists_starts_no_request_at_deadline(monkeypatch):
     calls = []
 
     class _Api:
         def __init__(self, token=None):
             calls.append("init")
 
-    _install_fake_hf(monkeypatch, HfApi=_Api)
+    _install_fake_hf(monkeypatch, ArtifactStore=_Api)
     monkeypatch.setattr(b.time, "time", lambda: 200.0)
     payload = {
         "hf_repo": "o/r",
@@ -449,7 +461,7 @@ def test_hf_file_exists_starts_no_request_at_deadline(monkeypatch):
     }
 
     with pytest.raises(TimeoutError, match="deadline"):
-        b.hf_file_exists(payload, "DONE")
+        b.artifact_file_exists(payload, "DONE")
     assert calls == []
 
 
@@ -498,7 +510,7 @@ def test_fetch_code_uses_exact_revision_and_verified_file_materialization(monkey
         events.append("download")
         return "/tmp/archive.zip"
 
-    _install_fake_hf(monkeypatch, hf_hub_download=download)
+    _install_fake_hf(monkeypatch, download_file=download)
     monkeypatch.setattr(
         b._source_snapshot,
         "materialize_verified_archive_file",
@@ -522,17 +534,32 @@ def test_fetch_code_uses_exact_revision_and_verified_file_materialization(monkey
     ]
 
 
+def test_fetch_code_refuses_to_execute_retired_hf_backend(monkeypatch):
+    from pathlib import Path
+
+    _install_fake_hf(monkeypatch, download_file=lambda **kwargs: "/tmp/archive.zip")
+
+    def materialize(path, descriptor, destination):
+        retired = Path(destination) / "flash/engine/worker/io/hf.py"
+        retired.parent.mkdir(parents=True)
+        retired.write_text("old worker code")
+
+    monkeypatch.setattr(b._source_snapshot, "materialize_verified_archive_file", materialize)
+    with pytest.raises(RuntimeError, match="predates Azure"):
+        b.fetch_code(_source_payload())
+
+
 def test_fetch_code_distinguishes_transport_from_integrity_failure(monkeypatch):
     monkeypatch.setattr(
         b,
-        "_hf_call",
+        "_artifact_call",
         lambda *_args, **_kwargs: (_ for _ in ()).throw(ConnectionError("network down")),
     )
     with pytest.raises(b.RetriableBootstrapError, match="pinned flash source"):
         b.fetch_code(_source_payload())
 
-    _install_fake_hf(monkeypatch, hf_hub_download=lambda **_kwargs: "/tmp/archive.zip")
-    monkeypatch.setattr(b, "_hf_call", lambda call, *_args, **_kwargs: call())
+    _install_fake_hf(monkeypatch, download_file=lambda **_kwargs: "/tmp/archive.zip")
+    monkeypatch.setattr(b, "_artifact_call", lambda call, *_args, **_kwargs: call())
     monkeypatch.setattr(
         b._source_snapshot,
         "materialize_verified_archive_file",
@@ -548,7 +575,7 @@ def test_fetch_code_distinguishes_transport_from_integrity_failure(monkeypatch):
 def test_fetch_code_http_client_failures_are_terminal(monkeypatch, status):
     monkeypatch.setattr(
         b,
-        "_hf_call",
+        "_artifact_call",
         lambda *_args, **_kwargs: (_ for _ in ()).throw(_err(status=status)),
     )
     with pytest.raises(RuntimeError, match="pinned flash source") as raised:
@@ -560,7 +587,7 @@ def test_fetch_code_http_client_failures_are_terminal(monkeypatch, status):
 def test_fetch_code_http_transient_failures_are_retriable(monkeypatch, status):
     monkeypatch.setattr(
         b,
-        "_hf_call",
+        "_artifact_call",
         lambda *_args, **_kwargs: (_ for _ in ()).throw(_err(status=status)),
     )
     with pytest.raises(b.RetriableBootstrapError, match="pinned flash source"):
@@ -718,7 +745,7 @@ def test_run_mode_success_returns_rc_and_uploads_console(monkeypatch):
     popen_calls = []
     _disable_periodic_console_upload(monkeypatch)
     monkeypatch.setattr(b, "_upload_console_tail_bounded", _run_final_console_upload_inline)
-    monkeypatch.setattr(b, "hf_upload", lambda p, path, sub: uploads.append((path, sub)))
+    monkeypatch.setattr(b, "upload_artifact", lambda p, path, sub: uploads.append((path, sub)))
     proc = _FakeProc(["hello\n", "world\n"], rc=0)
 
     def popen(*args, **kwargs):
@@ -766,7 +793,7 @@ def test_run_mode_sanitizes_the_echoed_child_line_but_not_the_console_file(monke
     secret = "vast-runtime-7c1de9f4b3a20685"
     _disable_periodic_console_upload(monkeypatch)
     monkeypatch.setattr(b, "_upload_console_tail_bounded", lambda *a, **k: True)
-    monkeypatch.setattr(b, "hf_upload", lambda *a, **k: None)
+    monkeypatch.setattr(b, "upload_artifact", lambda *a, **k: None)
     proc = _FakeProc([f"boto3 auth failed with {secret}\n", "worker exiting\n"], rc=1)
     monkeypatch.setattr(b.subprocess, "Popen", lambda *a, **k: proc)
 
@@ -799,7 +826,7 @@ def test_run_mode_echoes_the_end_of_an_oversized_child_line(monkeypatch, capfd):
     """
     _disable_periodic_console_upload(monkeypatch)
     monkeypatch.setattr(b, "_upload_console_tail_bounded", lambda *a, **k: True)
-    monkeypatch.setattr(b, "hf_upload", lambda *a, **k: None)
+    monkeypatch.setattr(b, "upload_artifact", lambda *a, **k: None)
     proc = _FakeProc(["x" * 120_000 + "ROOTCAUSE: CUDA OOM\n"], rc=1)
     monkeypatch.setattr(b.subprocess, "Popen", lambda *a, **k: proc)
 
@@ -845,7 +872,7 @@ def test_run_mode_caps_the_worker_at_the_declared_wall_budget(monkeypatch):
     """
     _disable_periodic_console_upload(monkeypatch)
     monkeypatch.setattr(b, "_upload_console_tail_bounded", lambda *a, **k: True)
-    monkeypatch.setattr(b, "hf_upload", lambda *a, **k: None)
+    monkeypatch.setattr(b, "upload_artifact", lambda *a, **k: None)
     popen_calls = []
 
     def popen(*args, **kwargs):
@@ -881,7 +908,7 @@ def test_run_mode_leaves_a_deadline_already_inside_the_budget_alone(monkeypatch)
     """The cap must not shorten an ordinary run whose deadline is already within its budget."""
     _disable_periodic_console_upload(monkeypatch)
     monkeypatch.setattr(b, "_upload_console_tail_bounded", lambda *a, **k: True)
-    monkeypatch.setattr(b, "hf_upload", lambda *a, **k: None)
+    monkeypatch.setattr(b, "upload_artifact", lambda *a, **k: None)
     popen_calls = []
 
     def popen(*args, **kwargs):
@@ -1299,7 +1326,7 @@ def test_run_mode_drains_delayed_terminal_output_before_upload(monkeypatch):
             uploads.append((subpath, file.read()))
 
     monkeypatch.setattr(b, "open", tracked_open, raising=False)
-    monkeypatch.setattr(b, "hf_upload", upload)
+    monkeypatch.setattr(b, "upload_artifact", upload)
     proc = _FakeProc(_DelayedOutput(), rc=0)
     monkeypatch.setattr(b.subprocess, "Popen", lambda *args, **kwargs: proc)
     payload = {
@@ -1758,7 +1785,7 @@ def test_unreapable_uploader_with_interrupt_exits_before_marker(
 def test_run_mode_timeout_tears_down_the_whole_worker_group_and_raises(monkeypatch):
     _disable_periodic_console_upload(monkeypatch)
     monkeypatch.setattr(b, "_upload_console_tail_bounded", lambda *_args: True)
-    monkeypatch.setattr(b, "hf_upload", lambda p, path, sub: None)
+    monkeypatch.setattr(b, "upload_artifact", lambda p, path, sub: None)
     proc = _FakeProc(["partial\n"], rc=0, timeout_once=True)
     monkeypatch.setattr(b.subprocess, "Popen", lambda *a, **k: proc)
     # never let a fake pid reach a real killpg; record the call instead.
@@ -1796,7 +1823,7 @@ def test_run_mode_timeout_reports_a_worker_group_that_survived_teardown(monkeypa
         return True
 
     monkeypatch.setattr(b, "_upload_console_tail_bounded", _upload)
-    monkeypatch.setattr(b, "hf_upload", lambda p, path, sub: None)
+    monkeypatch.setattr(b, "upload_artifact", lambda p, path, sub: None)
     proc = _FakeProc(["partial\n"], rc=0, timeout_once=True)
     monkeypatch.setattr(b.subprocess, "Popen", lambda *a, **k: proc)
 
@@ -1900,7 +1927,7 @@ def test_run_mode_hands_teardown_a_deadline_it_can_actually_use(monkeypatch):
     """The cap ``run_mode`` passes to teardown must outlast the cutoff that triggered it."""
     _disable_periodic_console_upload(monkeypatch)
     monkeypatch.setattr(b, "_upload_console_tail_bounded", lambda *a, **k: True)
-    monkeypatch.setattr(b, "hf_upload", lambda *a, **k: None)
+    monkeypatch.setattr(b, "upload_artifact", lambda *a, **k: None)
 
     handed = {}
 
@@ -2134,7 +2161,7 @@ def test_write_attempt_marker_truncates_error_and_uploads_arm_named(monkeypatch)
     uploads: list[tuple] = []
     monkeypatch.setattr(
         b,
-        "hf_upload",
+        "upload_artifact",
         lambda p, path, sub, **kwargs: uploads.append((path, sub, kwargs)),
     )
     monkeypatch.setattr(b.time, "time", lambda: 100.0)
@@ -2168,7 +2195,7 @@ def test_write_attempt_marker_truncates_error_and_uploads_arm_named(monkeypatch)
 
 
 def test_write_attempt_marker_preserves_success_after_deadline(monkeypatch):
-    monkeypatch.setattr(b, "hf_upload", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(b, "upload_artifact", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(b.time, "time", lambda: 205.0)
     payload = {
         "hf_repo": "o/r",
@@ -2197,7 +2224,7 @@ def test_write_attempt_marker_preserves_success_after_deadline(monkeypatch):
 
 def test_write_attempt_marker_rejects_noncanonical_deadline(monkeypatch):
     uploads = []
-    monkeypatch.setattr(b, "hf_upload", lambda *_args: uploads.append(True))
+    monkeypatch.setattr(b, "upload_artifact", lambda *_args: uploads.append(True))
     monkeypatch.setattr(b.time, "time", lambda: 250.0)
     payload = {
         "hf_repo": "o/r",
@@ -2294,7 +2321,9 @@ def test_periodic_console_snapshot_cannot_clobber_the_terminal_one(tmp_path, mon
     overwrite the terminal artifact the control plane reads as the failure detail."""
     monkeypatch.delenv("WANDB_API_KEY", raising=False)
     uploads: list[tuple] = []
-    monkeypatch.setattr(b, "hf_upload", lambda p, path, sub: uploads.append((path, sub)) or True)
+    monkeypatch.setattr(
+        b, "upload_artifact", lambda p, path, sub: uploads.append((path, sub)) or True
+    )
     console = tmp_path / "console_sft.txt"
     console.write_text(f"training step 1 {_PAYLOAD_SECRET}\n")
     payload = {
@@ -2335,7 +2364,7 @@ def test_periodic_console_snapshot_cannot_clobber_the_terminal_one(tmp_path, mon
 def test_console_snapshot_redacts_a_payload_env_secret(tmp_path, monkeypatch):
     monkeypatch.delenv("WANDB_API_KEY", raising=False)
     uploads: list[tuple] = []
-    monkeypatch.setattr(b, "hf_upload", lambda p, path, sub: uploads.append((path, sub)))
+    monkeypatch.setattr(b, "upload_artifact", lambda p, path, sub: uploads.append((path, sub)))
     console = tmp_path / "console_sft.txt"
     console.write_text(
         "Traceback (most recent call last):\n"
@@ -2361,7 +2390,7 @@ def test_console_snapshot_redacts_a_payload_env_secret(tmp_path, monkeypatch):
 
 def test_attempt_marker_error_redacts_a_payload_env_secret(monkeypatch):
     monkeypatch.delenv("WANDB_API_KEY", raising=False)
-    monkeypatch.setattr(b, "hf_upload", lambda p, path, sub, **kwargs: None)
+    monkeypatch.setattr(b, "upload_artifact", lambda p, path, sub, **kwargs: None)
     monkeypatch.setattr(b.time, "time", lambda: 100.0)
     payload = {
         "hf_repo": "o/r",
@@ -2660,7 +2689,7 @@ def test_safe_detail_redacts_the_percent_encoded_form_of_a_secret():
 def test_console_snapshot_drops_the_truncated_first_line_before_redacting(tmp_path, monkeypatch):
     """when the 64k tail boundary lands inside a one-line credential, the surviving suffix no
     longer value-matches; the partial first line must go before sanitizing."""
-    monkeypatch.setattr(b, "hf_upload", lambda p, path, sub: None)
+    monkeypatch.setattr(b, "upload_artifact", lambda p, path, sub: None)
     secret = "wandb-boundary-secret-0123456789abcdef"
     console = tmp_path / "console_sft.txt"
     head = f"key {secret}\n"
@@ -2681,7 +2710,7 @@ def test_console_snapshot_drops_the_truncated_first_line_before_redacting(tmp_pa
     assert "tail line survives" in tail
 
 
-def test_hf_call_retry_log_redacts_payload_secrets(monkeypatch, capsys):
+def test_artifact_call_retry_log_redacts_payload_secrets(monkeypatch, capsys):
     """the retried hf error message can echo the payload-only token, which os.environ does not
     know; the retry path must redact against the payload env."""
     monkeypatch.delenv("HF_TOKEN", raising=False)
@@ -2699,7 +2728,7 @@ def test_hf_call_retry_log_redacts_payload_secrets(monkeypatch, capsys):
         return "ok"
 
     assert (
-        b._hf_call(
+        b._artifact_call(
             call,
             "download spec",
             deadline_at=time.time() + 3600.0,

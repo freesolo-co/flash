@@ -14,13 +14,13 @@ class ModalProvider:
         return credentials() is not None
 
     def preflight(self, require_hf=True):
-        import os
+        from flash.artifacts.config import configured
 
         problems = []
         if not self.is_configured():
             problems.append("MODAL_TOKEN_ID and MODAL_TOKEN_SECRET are required")
-        if require_hf and not os.environ.get("HF_TOKEN", "").strip():
-            problems.append("HF_TOKEN is required")
+        if require_hf and not configured():
+            problems.append("Azure artifact storage is required")
         return problems
 
     def gpu_classes(self):

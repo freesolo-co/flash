@@ -1,16 +1,9 @@
-"""Sandbox-side entry for the kernel-cache bake (runs INSIDE the cu128 worker image on a GPU sandbox).
+"""Warm kernels using private Azure source and output artifacts.
 
-The published worker image ships DEPS only — the flash code (incl. kernel_warmup.py) is fetched from
-HF at runtime, exactly like a real worker. So this entry:
-  1. snapshot_downloads the flash package (code/**) the CI helper uploaded to a temp HF dataset,
-  2. warms kernels at their final /opt/flash/kernelcache path in the training interpreter,
-  3. replays an exported copy, then uploads the verified archive back under out/,
-  4. writes an out/STATUS marker LAST so the helper knows the run finished (and its rc).
-
-It is invoked by the CI helper via the sandbox command. Env:
-  BAKE_HF_REPO  the temp HF dataset (private) holding code/** and receiving out/
-  BAKE_ARCH     TORCH_CUDA_ARCH_LIST target, e.g. "9.0"
-  HF_TOKEN      write token for BAKE_HF_REPO
+The CI helper seeds the standalone Azure client into the sandbox image. The entry
+fetches code/**, compiles and replays the exported cache, then publishes out/STATUS
+last. BAKE_ARTIFACT_REPO names the disposable namespace; BAKE_ARCH selects CUDA.
+Only a bounded Azure container SAS reaches the sandbox.
 """
 
 import io
@@ -36,18 +29,16 @@ def _replace_cache_with_exported_copy(cache_dir: str, archive_path: str) -> None
 
 
 def main() -> int:
-    os.environ["HF_HUB_DISABLE_XET"] = "1"
-    from huggingface_hub import HfApi, snapshot_download
+    from artifact_api import ArtifactStore, download_snapshot
 
-    repo = os.environ["BAKE_HF_REPO"]
-    token = os.environ["HF_TOKEN"]
+    repo = os.environ["BAKE_ARTIFACT_REPO"]
     arch = os.environ.get("BAKE_ARCH", "")
-    api = HfApi(token=token)
+    api = ArtifactStore()
 
     # Upload a STARTED marker FIRST -- before the code download / warmup -- so a CI-side
     # timeout can tell whether this entrypoint even ran. Present on a timeout = the warmup started (so it
     # hung or was slow); absent = the pod ran the wrong entrypoint, OR this upload itself failed while
-    # the warmup is still running. Retry a few times so a transient HF blip doesn't drop the marker and
+    # the warmup is still running. Retry a few times so a transient Azure error doesn't drop the marker and
     # make the helper misread a slow run as a wrong entrypoint.
     started_uploaded = False
     for attempt in range(3):
@@ -63,7 +54,10 @@ def main() -> int:
             break
         except Exception as e:
             # keep the "out/STARTED" token in the line so it greps the same as the success/WARNING lines
-            print(f"[bake] out/STARTED upload attempt {attempt + 1}/3 failed: {e}", flush=True)
+            print(
+                f"[bake] out/STARTED upload attempt {attempt + 1}/3 failed: {type(e).__name__}",
+                flush=True,
+            )
             if attempt < 2:  # no point sleeping after the last attempt
                 time.sleep(3)
     if not started_uploaded:
@@ -72,12 +66,11 @@ def main() -> int:
         print("[bake] WARNING: out/STARTED never uploaded; warmup still proceeds", flush=True)
 
     # the flash code the helper uploaded (upload_code -> code/flash); run the warmup from it.
-    snapshot_download(
+    download_snapshot(
         repo_id=repo,
         repo_type="dataset",
         allow_patterns=["code/**"],
         local_dir="/runcode",
-        token=token,
     )
 
     env = {**os.environ, "PYTHONPATH": "/runcode/code"}
@@ -124,8 +117,7 @@ def main() -> int:
     with open(os.path.join(cache_dir, "cache_validation.json"), "w") as output:
         json.dump(validation, output)
     print(f"[bake] kernel_warmup rc={rc}", flush=True)
-    # Hub repositories reject nested .cache paths (FlashInfer uses one). Transport the exact
-    # directory layout as an archive, compiled at its final image path, without a second tree copy.
+    # Preserve nested cache paths and their absolute compilation locations in one archive.
     try:
         with tarfile.open(CACHE_ARCHIVE, "w:gz", compresslevel=1) as archive:
             archive.add(cache_dir, arcname=".")
@@ -143,7 +135,7 @@ def main() -> int:
         )
     except Exception as e:
         rc = 1
-        print(f"[bake] artifact upload failed: {e}", flush=True)
+        print(f"[bake] artifact upload failed: {type(e).__name__}", flush=True)
     # STATUS marker LAST: its presence is the helper's completion signal.
     api.upload_file(
         path_or_fileobj=io.BytesIO(f"rc={rc}\narch={arch}\n".encode()),

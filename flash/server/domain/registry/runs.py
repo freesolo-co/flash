@@ -244,7 +244,7 @@ def record_model_exported(
 ) -> bool:
     """Report an adapter export as a platform product-analytics event.
 
-    An export is an hf-to-hf copy that never otherwise touches the platform
+    An export is an Azure-to-Hugging-Face copy that never otherwise touches the platform
     backend, so it is reported explicitly through the (allowlisted) internal
     product-event endpoint. Best-effort like every other internal reporter.
     """

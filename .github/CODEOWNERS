@@ -21,6 +21,5 @@
 /pyproject.toml             @DavidBShan
 /uv.lock                    @DavidBShan
 
-# Security policy and the operator-facing credential template.
-/SECURITY.md                @DavidBShan
+# Operator-facing credential template.
 /.env.example               @DavidBShan

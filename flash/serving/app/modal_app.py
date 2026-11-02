@@ -1,7 +1,6 @@
 """Modal app: multi-LoRA serving with one GPU container per base model. ``LoraEngine`` is a
 Modal class parametrized by ``base_model`` (one GPU per base model, sharing its adapters via
-``enable_lora``); ``router`` is the CPU front door that dispatches to the right engine. See
-README to deploy.
+``enable_lora``); ``router`` is the CPU front door that dispatches to the right engine.
 """
 
 import asyncio
@@ -80,6 +79,18 @@ if _validate_deploy_wiring and SERVING_DEPLOYMENT_MODE == "development":
     missing = [name for name in required if not os.environ.get(name, "").strip()]
     if not os.environ.get("HF_TOKEN", "").strip():
         missing.append("HF_TOKEN")
+    if not os.environ.get("FLASH_ARTIFACT_BLOB_SAS_URL", "").strip():
+        missing.extend(
+            name
+            for name in (
+                "FLASH_ARTIFACT_BLOB_ACCOUNT_URL",
+                "FLASH_ARTIFACT_BLOB_CONTAINER",
+                "AZURE_TENANT_ID",
+                "AZURE_CLIENT_ID",
+                "AZURE_CLIENT_SECRET",
+            )
+            if not os.environ.get(name, "").strip()
+        )
     if missing:
         raise ValueError(
             "development serving requires explicit environment wiring: " + ", ".join(missing)
@@ -159,8 +170,17 @@ TARGET_INPUTS = max(1, MAX_INPUTS * 3 // 4)
 
 # engines enable trust_remote_code, so their secret uses an allowlist: future credentials
 # default to staying router-only. engines hydrate adapter state per request from the router-forwarded
-# record; only the hf token is needed to download private base weights and adapters.
-_ENGINE_SECRET_NAMES = ("HF_TOKEN",)
+# record; HF_TOKEN reads upstream weights. Azure uses a read-only container SAS or a
+# dedicated service principal with Blob Data Reader scoped only to this artifact container.
+_ENGINE_SECRET_NAMES = (
+    "HF_TOKEN",
+    "FLASH_ARTIFACT_BLOB_SAS_URL",
+    "FLASH_ARTIFACT_BLOB_ACCOUNT_URL",
+    "FLASH_ARTIFACT_BLOB_CONTAINER",
+    "AZURE_TENANT_ID",
+    "AZURE_CLIENT_ID",
+    "AZURE_CLIENT_SECRET",
+)
 _RUNTIME_SECRET_NAMES = (
     *_ENGINE_SECRET_NAMES,
     "SERVING_DEPLOYMENT_MODE",

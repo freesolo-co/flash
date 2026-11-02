@@ -237,7 +237,7 @@ def model_max_position_embeddings(model_id: str, revision: str = "") -> int | No
     try:
         from transformers import AutoConfig
 
-        from flash.engine.worker.io.hf import model_revision_kwargs
+        from flash.engine.worker.io.artifacts import model_revision_kwargs
 
         cfg = AutoConfig.from_pretrained(
             model_id, trust_remote_code=True, **model_revision_kwargs(revision)

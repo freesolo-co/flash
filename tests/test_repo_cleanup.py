@@ -1,5 +1,5 @@
 """The always-on artifact GC is CROSS-PLANE: it reaps a run's ``<phase>/<run_id>`` prefix inside the
-shared per-environment HF repo once it ages out and isn't in the GLOBAL serving set — never touching a
+logical Azure artifact namespace once it ages out and isn't in the GLOBAL serving set — never touching a
 deployed adapter (on any plane), a recently-written (in-flight) prefix, a warm-start source with a
 recent ``referenced_by`` marker, ``code/``/unknown dirs, or deleting blind when the serving registry
 can't be confirmed. These tests pin those invariants and the fixed 7-day policy."""
@@ -25,7 +25,7 @@ _REAL_HOLD_RUN_LOCK = rc._hold_run_lock
 _REAL_RUN_SCHEDULED_CLEANUP = rc.run_scheduled_cleanup
 
 # The DEFAULT managed namespace, not whatever the ambient env resolves to. This is read at IMPORT
-# time while `artifact_namespace()` reads FLASH_HF_NAMESPACE at CALL time, so deriving it from the
+# time while `artifact_namespace()` reads FLASH_ARTIFACT_NAMESPACE at CALL time, so deriving it from the
 # live env would bind it before the offline fixture scrubs that var -- every expectation built from
 # NS would then name a different namespace than the code under test. The `_frozen` fixture below
 # makes the two agree for real by forcing the env to this value for the duration of each test.
@@ -48,15 +48,14 @@ def _managed(slug: str) -> str:
 @pytest.fixture(autouse=True)
 def _frozen(monkeypatch):
     # Pin the namespace the code under test resolves to the same constant the expectations above
-    # were built from. `artifact_namespace()` reads FLASH_HF_NAMESPACE on every call, so without
+    # were built from. `artifact_namespace()` reads FLASH_ARTIFACT_NAMESPACE on every call, so without
     # this an operator shell that exports it (per SELF_HOSTING.md) would make the sweep scan
     # `<their-ns>/...` while every fixture repo id says `Freesolo-Co/...`, and the allowlist would
     # match nothing -- failing locally while CI, whose env is clean, stayed green.
-    monkeypatch.setenv("FLASH_HF_NAMESPACE", NS)
+    monkeypatch.setenv("FLASH_ARTIFACT_NAMESPACE", NS)
     monkeypatch.setattr(rc, "_now", lambda: NOW)
-    monkeypatch.setattr(rc, "_DELETE_SLEEP_S", 0)
     monkeypatch.setattr(rc, "run_scheduled_cleanup", _REAL_RUN_SCHEDULED_CLEANUP)
-    monkeypatch.delenv("HF_TOKEN", raising=False)
+    monkeypatch.delenv("FLASH_ARTIFACT_BLOB_ACCOUNT_URL", raising=False)
 
 
 class _DummyHeld:
@@ -132,7 +131,7 @@ def _adapter(path: str, age: float, size: int = 1000):
 
 def test_enabled_requires_hf_token(monkeypatch):
     assert rc.repo_cleanup_enabled() is False
-    monkeypatch.setenv("HF_TOKEN", "tok")
+    monkeypatch.setenv("FLASH_ARTIFACT_BLOB_ACCOUNT_URL", "tok")
     assert rc.repo_cleanup_enabled() is True
 
 
@@ -152,19 +151,6 @@ def test_scan_workers_ignores_environment(value):
         text=True,
     )
     assert result.stdout.strip() == "8"
-
-
-def test_sweep_noops_when_huggingface_hub_unavailable(monkeypatch):
-    monkeypatch.setattr(rc, "HfApi", None)
-    monkeypatch.setattr(rc, "_warned_hf_unavailable", False)
-    # If it didn't short-circuit it would confirm the live set; make that explode to catch a regression.
-    monkeypatch.setattr(
-        rc, "_confirm_live_set", lambda: (_ for _ in ()).throw(AssertionError("called"))
-    )
-    assert rc.run_scheduled_cleanup(dry_run=False, api=None) == 0
-
-
-# ---- helpers ----------------------------------------------------------------------------------
 
 
 def test_is_managed_env_repo_allowlist():
@@ -629,7 +615,7 @@ def test_cleanup_rechecks_durable_binding_created_on_another_plane(monkeypatch):
     class RegisteringApi(FakeApi):
         def list_repo_tree(self, **kwargs):
             if kwargs.get("path_in_repo"):
-                # Another plane binds a checkpoint during the slow pre-delete HF stat.
+                # Another plane binds a checkpoint during the slow pre-delete artifact stat.
                 # It is still disabled/loading and never enters this plane's ready router.
                 records.append({"repo_id": repo, "subfolder": "sft/flash-1-a/checkpoints/step-4"})
             return super().list_repo_tree(**kwargs)
@@ -657,7 +643,6 @@ def test_restat_spares_source_referenced_after_enumeration(monkeypatch):
 
 def test_deletion_rechecks_only_target_and_references(monkeypatch):
     _wire(monkeypatch)
-    monkeypatch.setattr(rc, "_throttle_tree_list", lambda: None)
     repo = _managed("many-runs")
     listings = []
     entries_read = []
@@ -681,8 +666,7 @@ def test_deletion_rechecks_only_target_and_references(monkeypatch):
     "failure", ["missing_references", "missing_target", "unreadable_references"]
 )
 def test_scoped_recheck_handles_missing_paths_and_read_failures(monkeypatch, failure):
-    import httpx
-    from huggingface_hub.errors import RemoteEntryNotFoundError
+    from flash.artifacts.manifest import ArtifactNotFoundError as RemoteEntryNotFoundError
 
     _wire(monkeypatch)
     repo = _managed("e")
@@ -695,12 +679,7 @@ def test_scoped_recheck_handles_missing_paths_and_read_failures(monkeypatch, fai
             if path == (prefix if failure == "missing_target" else rc.REF_MARKER):
                 if failure == "unreadable_references":
                     raise RuntimeError("HF 429")
-                raise RemoteEntryNotFoundError(
-                    "missing directory",
-                    response=httpx.Response(
-                        404, request=httpx.Request("GET", "https://hf.test/tree")
-                    ),
-                )
+                raise RemoteEntryNotFoundError("missing directory")
             yield from super().list_repo_tree(**kwargs)
 
     api = FailingListingApi({repo: [_adapter(f"{prefix}/w", OLD)]})

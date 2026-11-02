@@ -146,6 +146,10 @@ def api(tmp_path, monkeypatch):
     monkeypatch.setenv("FREESOLO_INTERNAL_KEY", "fslo-internal-test")
     monkeypatch.setenv("GITHUB_TOKEN", "ghp-test")
     monkeypatch.setenv("HF_TOKEN", "hf-test")
+    monkeypatch.setenv(
+        "FLASH_ARTIFACT_BLOB_SAS_URL",
+        "https://testartifacts.blob.core.windows.net/artifacts?sig=offline",
+    )
     monkeypatch.setenv("FLASH_DEPLOY_SYNC", "1")
 
     import flash.server.domain.registry.environment_registry as environment_registry_mod
@@ -1313,7 +1317,7 @@ def test_create_run_preflights_init_adapter_rank_before_submit(api, monkeypatch)
     monkeypatch.setattr(checkpoints, "adapter_artifact_exists", lambda spec, *, step: True)
     monkeypatch.setattr(
         rank_mod,
-        "load_hf_adapter_config",
+        "load_artifact_adapter_config",
         lambda *a, **k: {
             "peft_type": "LORA",
             "task_type": "CAUSAL_LM",
@@ -1366,7 +1370,7 @@ def test_create_run_dry_run_still_preflights_init_adapter_rank(api, monkeypatch)
     monkeypatch.setattr(checkpoints, "adapter_artifact_exists", lambda spec, *, step: True)
     monkeypatch.setattr(
         rank_mod,
-        "load_hf_adapter_config",
+        "load_artifact_adapter_config",
         lambda *a, **k: {
             "peft_type": "LORA",
             "task_type": "CAUSAL_LM",
@@ -1944,7 +1948,7 @@ def test_logs_offset_paging(api):
 
 
 def test_worker_output_route(api, monkeypatch):
-    # /worker surfaces the train-subprocess stdout/traceback from the run's HF repo (operator
+    # /worker surfaces the train-subprocess stdout/traceback from the run's artifact namespace (operator
     # token, server-side). Best-effort: no artifacts -> empty dict; present -> passed through.
 
     key = _new_user_token()
@@ -1952,8 +1956,8 @@ def test_worker_output_route(api, monkeypatch):
         "/v1/runs", json={"spec": SPEC, "dry_run": True}, headers=_bearer(key)
     ).json()["run_id"]
 
-    # Stub _worker_artifacts to {} BEFORE the first request: the real impl would hf_hub_download from
-    # the run's HF repo (slow/flaky network in a unit test). This keeps the "no artifacts -> {}"
+    # Stub _worker_artifacts to {} BEFORE the first request: the real impl would download_file from
+    # the run's artifact namespace (slow/flaky network in a unit test). This keeps the "no artifacts -> {}"
     # assertion fully offline/deterministic.
     monkeypatch.setattr(server_runtime, "_worker_artifacts", lambda spec: {})
     empty = api.get(f"/v1/runs/{run_id}/worker", headers=_bearer(key)).json()
@@ -2083,8 +2087,7 @@ def test_internal_key_cannot_read_run_without_persisted_org(api, monkeypatch):
 def test_latest_error_artifact_name_picks_highest_attempt(monkeypatch):
     """The logs fetcher resolves the newest attempt-scoped error file, so a retried-then-failed run
     surfaces the FINAL attempt's traceback, not attempt0's stale one."""
-    import huggingface_hub
-
+    from flash.artifacts import api as artifact_storage
     from flash.server.platform.runtime import _latest_error_artifact_name
 
     prefix = "sft/run-1/seed0"
@@ -2104,14 +2107,13 @@ def test_latest_error_artifact_name_picks_highest_attempt(monkeypatch):
         def list_repo_files(self, repo_id, repo_type):
             return listed
 
-    monkeypatch.setattr(huggingface_hub, "HfApi", _FakeApi)
+    monkeypatch.setattr(artifact_storage, "ArtifactStore", _FakeApi)
     assert _latest_error_artifact_name("org/repo", prefix, "sft") == "error_sft_attempt2.txt"
 
 
 def test_latest_error_artifact_name_defaults_when_unlistable(monkeypatch):
     """If the repo can't be listed, fall back to attempt0 rather than failing the logs fetch."""
-    import huggingface_hub
-
+    from flash.artifacts import api as artifact_storage
     from flash.server.platform.runtime import _latest_error_artifact_name
 
     class _BoomApi:
@@ -2121,7 +2123,7 @@ def test_latest_error_artifact_name_defaults_when_unlistable(monkeypatch):
         def list_repo_files(self, repo_id, repo_type):
             raise RuntimeError("HF down")
 
-    monkeypatch.setattr(huggingface_hub, "HfApi", _BoomApi)
+    monkeypatch.setattr(artifact_storage, "ArtifactStore", _BoomApi)
     assert _latest_error_artifact_name("org/repo", "rl/r/seed0", "rl") == "error_rl_attempt0.txt"
 
 
@@ -2130,8 +2132,7 @@ def test_worker_artifacts_fetches_console_and_latest_attempt_error(monkeypatch, 
     (error_<phase>_attempt<N>.txt) — on a retried run only the highest attempt is the real crash."""
     import types
 
-    import huggingface_hub
-
+    from flash.artifacts import api as artifact_storage
     from flash.server.platform.runtime import _worker_artifacts
 
     spec = types.SimpleNamespace(
@@ -2159,8 +2160,8 @@ def test_worker_artifacts_fetches_console_and_latest_attempt_error(monkeypatch, 
         def list_repo_files(self, repo_id, repo_type):
             return list(content)
 
-    monkeypatch.setattr(huggingface_hub, "hf_hub_download", fake_dl)
-    monkeypatch.setattr(huggingface_hub, "HfApi", _FakeApi)
+    monkeypatch.setattr(artifact_storage, "download_file", fake_dl)
+    monkeypatch.setattr(artifact_storage, "ArtifactStore", _FakeApi)
 
     out = _worker_artifacts(spec)
     assert out["console_rl.txt"] == "worker console\n"
@@ -2178,8 +2179,7 @@ def test_worker_artifacts_surfaces_the_ray_failure_logs(monkeypatch, tmp_path):
     """
     import types
 
-    import huggingface_hub
-
+    from flash.artifacts import api as artifact_storage
     from flash.server.platform.runtime import _worker_artifacts
 
     spec = types.SimpleNamespace(
@@ -2208,8 +2208,8 @@ def test_worker_artifacts_surfaces_the_ray_failure_logs(monkeypatch, tmp_path):
         def list_repo_files(self, repo_id, repo_type):
             return list(content)
 
-    monkeypatch.setattr(huggingface_hub, "hf_hub_download", fake_dl)
-    monkeypatch.setattr(huggingface_hub, "HfApi", _FakeApi)
+    monkeypatch.setattr(artifact_storage, "download_file", fake_dl)
+    monkeypatch.setattr(artifact_storage, "ArtifactStore", _FakeApi)
 
     out = _worker_artifacts(spec)
     assert out["raylogs_rl_attempt1.txt"] == (
@@ -2232,8 +2232,7 @@ def test_worker_artifacts_does_not_pair_a_prior_attempts_ray_logs_with_this_trac
     """
     import types
 
-    import huggingface_hub
-
+    from flash.artifacts import api as artifact_storage
     from flash.server.platform.runtime import _worker_artifacts
 
     spec = types.SimpleNamespace(
@@ -2259,8 +2258,8 @@ def test_worker_artifacts_does_not_pair_a_prior_attempts_ray_logs_with_this_trac
         def list_repo_files(self, repo_id, repo_type):
             return list(content)
 
-    monkeypatch.setattr(huggingface_hub, "hf_hub_download", fake_dl)
-    monkeypatch.setattr(huggingface_hub, "HfApi", _FakeApi)
+    monkeypatch.setattr(artifact_storage, "download_file", fake_dl)
+    monkeypatch.setattr(artifact_storage, "ArtifactStore", _FakeApi)
 
     out = _worker_artifacts(spec)
     assert not [k for k in out if k.startswith("raylogs")], (
@@ -2278,8 +2277,7 @@ def test_worker_artifacts_skips_ray_logs_when_the_traceback_is_unscoped(monkeypa
     # be checked.
     import types
 
-    import huggingface_hub
-
+    from flash.artifacts import api as artifact_storage
     from flash.server.platform.runtime import _worker_artifacts
 
     spec = types.SimpleNamespace(
@@ -2304,8 +2302,8 @@ def test_worker_artifacts_skips_ray_logs_when_the_traceback_is_unscoped(monkeypa
         def list_repo_files(self, repo_id, repo_type):
             return list(content)
 
-    monkeypatch.setattr(huggingface_hub, "hf_hub_download", fake_dl)
-    monkeypatch.setattr(huggingface_hub, "HfApi", _FakeApi)
+    monkeypatch.setattr(artifact_storage, "download_file", fake_dl)
+    monkeypatch.setattr(artifact_storage, "ArtifactStore", _FakeApi)
 
     out = _worker_artifacts(spec)
     assert not [k for k in out if k.startswith("raylogs")]
@@ -2315,7 +2313,7 @@ def test_worker_artifacts_skips_ray_logs_when_the_traceback_is_unscoped(monkeypa
 def test_ray_log_name_is_built_the_same_way_the_worker_builds_it():
     # the control plane derives this name; the worker writes it. they are in different processes with
     # no shared constant, so pin the two spellings against each other rather than against a literal.
-    from flash.engine.worker.io.hf import ray_log_artifact_name
+    from flash.engine.worker.io.artifacts import ray_log_artifact_name
     from flash.server.platform.runtime import _ray_log_name_for_attempt
 
     for phase in ("rl", "sft"):
@@ -2333,8 +2331,7 @@ def test_worker_artifacts_is_unaffected_when_ray_never_failed(monkeypatch, tmp_p
     """
     import types
 
-    import huggingface_hub
-
+    from flash.artifacts import api as artifact_storage
     from flash.server.platform.runtime import _worker_artifacts
 
     spec = types.SimpleNamespace(
@@ -2361,8 +2358,8 @@ def test_worker_artifacts_is_unaffected_when_ray_never_failed(monkeypatch, tmp_p
         def list_repo_files(self, repo_id, repo_type):
             return list(content)
 
-    monkeypatch.setattr(huggingface_hub, "hf_hub_download", fake_dl)
-    monkeypatch.setattr(huggingface_hub, "HfApi", _FakeApi)
+    monkeypatch.setattr(artifact_storage, "download_file", fake_dl)
+    monkeypatch.setattr(artifact_storage, "ArtifactStore", _FakeApi)
 
     out = _worker_artifacts(spec)
     assert out["console_sft.txt"] == "worker console\n"
@@ -2374,8 +2371,7 @@ def test_worker_artifacts_prefers_latest_attempt_console(monkeypatch, tmp_path):
     """When console output is attempt-scoped, /worker should show the current attempt's tail."""
     import types
 
-    import huggingface_hub
-
+    from flash.artifacts import api as artifact_storage
     from flash.server.platform.runtime import _worker_artifacts
 
     spec = types.SimpleNamespace(
@@ -2403,8 +2399,8 @@ def test_worker_artifacts_prefers_latest_attempt_console(monkeypatch, tmp_path):
         def list_repo_files(self, repo_id, repo_type):
             return list(content)
 
-    monkeypatch.setattr(huggingface_hub, "hf_hub_download", fake_dl)
-    monkeypatch.setattr(huggingface_hub, "HfApi", _FakeApi)
+    monkeypatch.setattr(artifact_storage, "download_file", fake_dl)
+    monkeypatch.setattr(artifact_storage, "ArtifactStore", _FakeApi)
 
     out = _worker_artifacts(spec)
     assert out["console_rl_attempt2.txt"] == "current console\n"
@@ -2422,8 +2418,7 @@ def test_worker_artifacts_keep_previous_attempt_evidence_until_the_retry_uploads
     """
     import types
 
-    import huggingface_hub
-
+    from flash.artifacts import api as artifact_storage
     from flash.server.platform.runtime import _worker_artifacts
 
     spec = types.SimpleNamespace(
@@ -2451,8 +2446,8 @@ def test_worker_artifacts_keep_previous_attempt_evidence_until_the_retry_uploads
         def list_repo_files(self, repo_id, repo_type):
             return list(content)
 
-    monkeypatch.setattr(huggingface_hub, "hf_hub_download", fake_dl)
-    monkeypatch.setattr(huggingface_hub, "HfApi", _FakeApi)
+    monkeypatch.setattr(artifact_storage, "download_file", fake_dl)
+    monkeypatch.setattr(artifact_storage, "ArtifactStore", _FakeApi)
 
     assert _worker_artifacts(spec) == {
         "console_rl_attempt0.txt": "HEARTBEAT attempt=0 device=NVIDIA H200\n",
@@ -2473,8 +2468,7 @@ def test_worker_artifacts_surface_the_terminal_console_tail_not_only_the_snapsho
     """
     import types
 
-    import huggingface_hub
-
+    from flash.artifacts import api as artifact_storage
     from flash.server.platform.runtime import _worker_artifacts
 
     spec = types.SimpleNamespace(
@@ -2505,8 +2499,8 @@ def test_worker_artifacts_surface_the_terminal_console_tail_not_only_the_snapsho
         def list_repo_files(self, repo_id, repo_type):
             return list(content)
 
-    monkeypatch.setattr(huggingface_hub, "hf_hub_download", fake_dl)
-    monkeypatch.setattr(huggingface_hub, "HfApi", _FakeApi)
+    monkeypatch.setattr(artifact_storage, "download_file", fake_dl)
+    monkeypatch.setattr(artifact_storage, "ArtifactStore", _FakeApi)
 
     out = _worker_artifacts(spec)
     assert "illegal memory access" in out["console_rl.txt"]
@@ -5854,7 +5848,7 @@ def test_recover_runs_blocks_expired_handleless_resubmit(monkeypatch, tmp_path):
 
 def test_recover_runs_defers_resubmit_when_instance_not_confirmed_reaped(monkeypatch, tmp_path):
     # an unconfirmed Vast delete may leave a live phantom. recovery must defer while
-    # ``run_instances_remaining`` reports it, or a second worker can write the same HF artifacts.
+    # ``run_instances_remaining`` reports it, or a second worker can write the same Azure artifacts.
     import flash.server.platform.db as db_mod
 
     monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
@@ -6352,7 +6346,7 @@ def test_recover_runs_reuses_verified_effective_snapshot_for_no_handle_resubmit(
     monkeypatch.setattr(runner_preparation, "_mark_warmstart_source", lambda *_args: None)
     monkeypatch.setattr(
         rank_mod,
-        "load_hf_adapter_config",
+        "load_artifact_adapter_config",
         lambda *a, **k: {
             "peft_type": "LORA",
             "task_type": "CAUSAL_LM",
@@ -6431,7 +6425,7 @@ def test_recover_runs_rejects_warmstart_artifact_drift(monkeypatch, tmp_path):
     monkeypatch.setattr(app_mod.db, "all_runs", lambda: [{"run_id": "drifted-warm"}])
     monkeypatch.setattr(
         rank_mod,
-        "load_hf_adapter_config",
+        "load_artifact_adapter_config",
         lambda *a, **k: {
             "peft_type": "LORA",
             "task_type": "CAUSAL_LM",
@@ -7715,8 +7709,8 @@ def test_export_copies_final_adapter_to_user_repo(api, monkeypatch):
 
     key = _new_user_token()
     run_id = _finished_run(api, key)
-    # The platform auto-assigns each run a per-run HF dataset repo under the OPERATOR's org, so
-    # only the control plane (operator token) can read the source. hf_repo is platform-managed and
+    # The platform auto-assigns each run a per-run Azure artifact namespace, so
+    # only the control plane (storage credentials) can read the source. hf_repo is platform-managed and
     # stripped from the public spec, so read it back from the internal worker-spec carrier.
     src_repo = runner_status.get_status(run_id).effective_preparation["worker_spec"]["train"][
         "hf_repo"
@@ -7996,7 +7990,7 @@ def test_export_validates_repository_and_token(api):
         assert "owner/name" in malformed.json()["detail"]
     # GRAMMAR check: two segments but NOT a valid HF repo id — embedded whitespace, a segment that
     # starts/ends with '-' or '.', a '--'/'..' run, or a >96-char name. The full Hub grammar
-    # (huggingface_hub.validate_repo_id) must reject these FAST with a 400, not let export_adapter
+    # (flash.artifacts.api.validate_repo_id) must reject these FAST with a 400, not let export_adapter
     # download the private source adapter first and hit a wrapped 502 from create_repo.
     for bad_repo in (
         "owner/ name",

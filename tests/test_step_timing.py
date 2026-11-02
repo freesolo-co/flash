@@ -3,8 +3,8 @@ import math
 
 import pytest
 
+import flash.engine.worker.io.artifacts as worker_hf
 import flash.engine.worker.io.heartbeat as worker_heartbeat
-import flash.engine.worker.io.hf as worker_hf
 from flash.cli.ui.heartbeat import _heartbeat_pairs, _step_timing_pairs
 from flash.engine.worker.train.core.lifecycle.step_timing import StepTiming
 from flash.engine.worker.train.entry import rl_train_runner
@@ -191,7 +191,7 @@ def test_first_timing_bypasses_force_floor_and_retries_with_real_wrapper(
         return next(outcomes)
 
     monkeypatch.setattr(heartbeat_module.time, "time", lambda: now["value"])
-    monkeypatch.setattr(worker_hf, "hf_upload_file", upload)
+    monkeypatch.setattr(worker_hf, "upload_artifact_file", upload)
     monkeypatch.setattr(worker_heartbeat, "_HB_MIN_INTERVAL_S", 900.0)
     monkeypatch.setattr(worker_heartbeat, "_HB_FORCE_MIN_INTERVAL_S", 60.0)
     monkeypatch.setattr(worker_context.heartbeat_state, "last_upload", 999.0)

@@ -350,7 +350,7 @@ class _LoraEngineImpl(TextPromptTokenizer):
                     self._source_paths[source_ident] = path
                     self.registry.set_local_path(record, path)
                     return path
-                except Exception as exc:  # Hub/network errors are often transient
+                except Exception as exc:  # Artifact-storage/network errors are often transient
                     last_exc = exc
                     if attempt == 2:
                         break

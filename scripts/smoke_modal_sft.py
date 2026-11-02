@@ -1,9 +1,9 @@
 """Paid two-step SFT, artifact recovery, and checkpoint resume qualification on Modal.
 
-Export MODAL_TOKEN_ID, MODAL_TOKEN_SECRET, and HF_TOKEN, then run:
+Configure Azure artifact storage and export MODAL_TOKEN_ID and MODAL_TOKEN_SECRET, then run:
     uv run python scripts/smoke_modal_sft.py --run-paid-test --repo owner/private-test-dataset
 
-The dataset repo must already exist and be private. Test artifacts remain there for inspection.
+The Azure artifact container must already exist and be private. Artifacts remain for inspection.
 Only this invocation's sandboxes and cache Volume are removed. Each attempt is capped at 30 minutes.
 """
 
@@ -18,8 +18,7 @@ import uuid
 from dataclasses import replace
 from pathlib import Path
 
-from huggingface_hub import CommitOperationAdd, HfApi
-
+from flash.artifacts.api import ArtifactStore
 from flash.core.spec import EnvironmentPackageSpec, EnvironmentSpec, GpuSpec, JobSpec, TrainSpec
 from flash.engine.profiling.dataset_profile import _RawRecordEnvironment
 from flash.engine.profiling.sft_workload import prepare_sft_workload
@@ -66,18 +65,13 @@ def stage_environment(hub, repo, root):
     digest = write_environment_archive(source, archive)
     manifest = encode_manifest(manifest_payload(source, digest, archive_path_for_digest(digest)))
     manifest_digest = hashlib.sha256(manifest).hexdigest()
-    commit = hub.create_commit(
+    hub.upload_file(
+        repo_id=repo, path_in_repo=archive_path_for_digest(digest), path_or_fileobj=str(archive)
+    )
+    commit = hub.upload_file(
         repo_id=repo,
-        repo_type="dataset",
-        commit_message="Stage disposable Modal qualification environment",
-        operations=[
-            CommitOperationAdd(
-                path_in_repo=archive_path_for_digest(digest), path_or_fileobj=str(archive)
-            ),
-            CommitOperationAdd(
-                path_in_repo=manifest_path_for_digest(manifest_digest), path_or_fileobj=manifest
-            ),
-        ],
+        path_in_repo=manifest_path_for_digest(manifest_digest),
+        path_or_fileobj=manifest,
     )
     environment = EnvironmentSpec(
         id=env_id,
@@ -91,9 +85,11 @@ def prepare(hub, repo, run_id, volume, root, gpu, model="Qwen/Qwen3.5-9B"):
     from importlib.metadata import version
 
     environment, rows = stage_environment(hub, repo, root)
+    from huggingface_hub import HfApi
+
     from flash.core.catalog import get_model
 
-    revision = get_model(model).managed_revision or hub.model_info(model).sha
+    revision = get_model(model).managed_revision or HfApi().model_info(model).sha
     producer = version("freesolo-flash")
     spec = JobSpec(
         run_id=run_id,
@@ -136,7 +132,8 @@ def prepare(hub, repo, run_id, volume, root, gpu, model="Qwen/Qwen3.5-9B"):
 
 
 def run(repo, gpu, model="Qwen/Qwen3.5-9B"):
-    hub = HfApi()
+    hub = ArtifactStore()
+    hub.create_repo(repo, exist_ok=True, private=True)
     if not hub.repo_info(repo, repo_type="dataset").private:
         raise ValueError("qualification requires a disposable private dataset repository")
     run_id = "flash-modal-sft-smoke-" + uuid.uuid4().hex[:12]

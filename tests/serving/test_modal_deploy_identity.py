@@ -15,6 +15,12 @@ _DEPLOYMENT_ENV_VARS = (
     "MODAL_IS_REMOTE",
     "FREESOLO_INTERNAL_KEY",
     "HF_TOKEN",
+    "FLASH_ARTIFACT_BLOB_SAS_URL",
+    "FLASH_ARTIFACT_BLOB_ACCOUNT_URL",
+    "FLASH_ARTIFACT_BLOB_CONTAINER",
+    "AZURE_TENANT_ID",
+    "AZURE_CLIENT_ID",
+    "AZURE_CLIENT_SECRET",
     "PLATFORM_BACKEND_URL",
     "SUPABASE_PROJECT_REF",
     "SUPABASE_PROJECT_REF_DEV",
@@ -24,6 +30,7 @@ _DEPLOYMENT_ENV_VARS = (
 _DEVELOPMENT_WIRING = {
     "FREESOLO_INTERNAL_KEY": "dev-internal-key",
     "HF_TOKEN": "dev-hf-key",
+    "FLASH_ARTIFACT_BLOB_SAS_URL": "https://test.blob.core.windows.net/artifacts-dev?sig=test",
     "PLATFORM_BACKEND_URL": "https://api-dev.freesolo.co",
     "SERVING_CUSTOM_DOMAIN": "serve-dev.freesolo.co",
     "SERVING_DEPLOYMENT_MODE": "development",
@@ -110,3 +117,37 @@ def test_deploy_time_development_requires_wiring(monkeypatch) -> None:
         match="development serving requires explicit environment wiring: SUPABASE_SERVICE_ROLE_KEY",
     ):
         _import_modal_app(monkeypatch, is_local=True, environment="dev")
+
+
+@pytest.mark.parametrize("missing", [None, "AZURE_CLIENT_SECRET", "FLASH_ARTIFACT_BLOB_CONTAINER"])
+def test_development_identity_requires_complete_container_credentials(monkeypatch, missing):
+    _clear_deployment_environment(monkeypatch)
+    values = {
+        key: value
+        for key, value in _DEVELOPMENT_WIRING.items()
+        if key != "FLASH_ARTIFACT_BLOB_SAS_URL"
+    }
+    values.update(
+        {
+            "FLASH_ARTIFACT_BLOB_ACCOUNT_URL": "https://test.blob.core.windows.net",
+            "FLASH_ARTIFACT_BLOB_CONTAINER": "artifacts-dev",
+            "AZURE_TENANT_ID": "tenant",
+            "AZURE_CLIENT_ID": "reader",
+            "AZURE_CLIENT_SECRET": "reader-secret",
+        }
+    )
+    for name, value in values.items():
+        if name != missing:
+            monkeypatch.setenv(name, value)
+    if missing:
+        with pytest.raises(ValueError, match=missing):
+            _import_modal_app(monkeypatch, is_local=True, environment="dev")
+    else:
+        app = _import_modal_app(monkeypatch, is_local=True, environment="dev")
+        app.modal.Secret.from_dict.reset_mock()
+        app._engine_secret()
+        engine = app.modal.Secret.from_dict.call_args.args[0]
+        assert engine["AZURE_CLIENT_SECRET"] == "reader-secret"
+        assert engine["FLASH_ARTIFACT_BLOB_CONTAINER"] == "artifacts-dev"
+        assert "FREESOLO_INTERNAL_KEY" not in engine
+        assert "SUPABASE_SERVICE_ROLE_KEY" not in engine

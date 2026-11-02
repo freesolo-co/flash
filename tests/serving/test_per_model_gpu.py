@@ -54,6 +54,7 @@ _DEVELOPMENT_CUSTOM_DOMAIN = "serve-dev.freesolo.co"
 _DEVELOPMENT_WIRING = {
     "FREESOLO_INTERNAL_KEY": "dev-internal-key",
     "HF_TOKEN": "dev-hf-key",
+    "FLASH_ARTIFACT_BLOB_SAS_URL": "https://test.blob.core.windows.net/artifacts-dev?sig=test",
     "PLATFORM_BACKEND_URL": "https://api-dev.freesolo.co",
     "SUPABASE_PROJECT_REF": "production-project-ref",
     "SUPABASE_PROJECT_REF_DEV": "dev-project-ref",
@@ -66,6 +67,7 @@ _DEPLOYMENT_ENV_VARS = (
     "SERVING_CUSTOM_DOMAIN",
     "FREESOLO_INTERNAL_KEY",
     "HF_TOKEN",
+    "FLASH_ARTIFACT_BLOB_SAS_URL",
     "PLATFORM_BACKEND_URL",
     "SUPABASE_PROJECT_REF",
     "SUPABASE_PROJECT_REF_DEV",
@@ -294,6 +296,7 @@ def test_engine_secret_allowlists_only_hf_token(modal_app_module, monkeypatch) -
         "PLATFORM_BACKEND_URL": "https://api-dev.freesolo.co",
         "FREESOLO_DEPLOYMENT_SHA": "deployment-sha",
         "FREESOLO_DEPLOYMENT_ID": "deployment-id",
+        "FLASH_ARTIFACT_BLOB_CONNECTION_STRING": "account-key-secret",
         "SUPABASE_PROJECT_REF": "production-project-ref",
         "SUPABASE_PROJECT_REF_DEV": "dev-project-ref",
         "SUPABASE_URL": "https://dev-project-ref.supabase.co",

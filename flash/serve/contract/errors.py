@@ -40,7 +40,7 @@ class RetryableServingUnavailable(ServingError):
 
 
 class AdapterConfigMissing(ServingError):
-    """The adapter's adapter_config.json could not be read from HF (artifact likely absent)."""
+    """The adapter's adapter_config.json could not be read from Azure artifact storage (artifact likely absent)."""
 
 
 class AdapterTensorMissing(ServingError):

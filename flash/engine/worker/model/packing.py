@@ -19,7 +19,7 @@ def _load_text_config(model_id: str, revision: str, *, trust_remote_code: bool =
     """The checkpoint's decoder config. Raises when the config cannot be resolved."""
     from transformers import AutoConfig
 
-    from flash.engine.worker.io.hf import model_revision_kwargs
+    from flash.engine.worker.io.artifacts import model_revision_kwargs
 
     return _text_config(
         AutoConfig.from_pretrained(
@@ -91,7 +91,7 @@ def gdn_model_type(model_id: str | None, revision: str = "") -> str:
     try:
         from transformers import AutoConfig
 
-        from flash.engine.worker.io.hf import model_revision_kwargs
+        from flash.engine.worker.io.artifacts import model_revision_kwargs
 
         cfg = AutoConfig.from_pretrained(
             model_id,

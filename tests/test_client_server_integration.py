@@ -101,7 +101,9 @@ def make_client(tmp_path, monkeypatch):
     control-plane app via a ``urllib`` -> ``TestClient`` shim."""
     monkeypatch.setenv("FREESOLO_INTERNAL_KEY", "fslo-internal-test")
     monkeypatch.setenv("GITHUB_TOKEN", "ghp-test")
-    monkeypatch.setenv("HF_TOKEN", "hf-test")
+    monkeypatch.setenv(
+        "FLASH_ARTIFACT_BLOB_SAS_URL", "https://test.blob.core.windows.net/artifacts?sig=test"
+    )
     monkeypatch.setenv("FLASH_DEPLOY_SYNC", "1")
 
     import flash.server.platform.auth as auth_mod

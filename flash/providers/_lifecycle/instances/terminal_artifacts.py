@@ -48,7 +48,7 @@ class TerminalKind(Enum):
     into "no evidence", and keeping it distinct is what stops that from reappearing.
     """
 
-    # no marker is visible. the attempt may still be running, or hf has not exposed the upload yet.
+    # no marker is visible. the attempt may still be running, or publication has not completed yet.
     ABSENT = "absent"
     # a marker exists but cannot be tied to this attempt, so it cannot be trusted to speak for it.
     # distinct from ABSENT: absence means nothing settled, this means something settled unreadably.
@@ -94,8 +94,8 @@ class AttemptIdentity:
 class ProbeBudget:
     """One observation window, computed ONCE and shared by every read inside a resolution.
 
-    the marker and its metrics are two uploads of the same completion racing the same hf
-    read-after-write lag, so they are one budget, not two. ``cutoff_at`` is absolute and is threaded
+    the marker and its metrics are two uploads of the same completion sharing the same bounded
+    artifact-read retries, so they are one budget, not two. ``cutoff_at`` is absolute and is threaded
     through both reads: a marker read that burns most of the window leaves metrics the remainder
     instead of starting a fresh allowance. that makes the ceiling the cutoff rather than the sum of
     however many reads a path happens to make.

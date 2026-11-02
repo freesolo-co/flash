@@ -44,6 +44,8 @@ _TRANSIENT_NETWORK_ERROR_NAMES = frozenset(
         "ReadTimeout",
         "RemoteProtocolError",
         "SSLError",
+        "ServiceRequestError",
+        "ServiceResponseError",
         "TimeoutError",
         "TimeoutException",
         "WriteError",
@@ -81,7 +83,7 @@ def sha256_bytes(data: bytes) -> str:
 
 def response_status_code(exc: BaseException) -> int | None:
     response = getattr(exc, "response", None)
-    code = getattr(response, "status_code", None)
+    code = getattr(exc, "status_code", None) or getattr(response, "status_code", None)
     try:
         return int(code)
     except (TypeError, ValueError):
@@ -97,7 +99,10 @@ def is_transient_fetch_error(exc: BaseException) -> bool:
         status = response_status_code(current)
         if status is not None:
             return status == 429 or 500 <= status <= 599
-        if isinstance(current, (TimeoutError, ConnectionError)):
+        if isinstance(current, (TimeoutError, ConnectionError)) or type(current).__name__ in {
+            "ServiceRequestError",
+            "ServiceResponseError",
+        }:
             return True
         if any(cls.__name__ in _TRANSIENT_NETWORK_ERROR_NAMES for cls in type(current).__mro__):
             return True

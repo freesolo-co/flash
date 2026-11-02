@@ -1297,7 +1297,7 @@ wheels = [
 
 [[package]]
 name = "freesolo-flash"
-version = "1.4.10"
+version = "1.4.15"
 source = { editable = "." }
 
 [package.optional-dependencies]
@@ -1331,6 +1331,8 @@ dev = [
 ]
 gpu = [
     { name = "accelerate" },
+    { name = "azure-identity" },
+    { name = "azure-storage-blob" },
     { name = "datasets" },
     { name = "freesolo" },
     { name = "httpx" },
@@ -1344,6 +1346,8 @@ gpu = [
     { name = "vllm", version = "0.19.1", source = { registry = "https://pypi.org/simple" } },
 ]
 serve-runtime = [
+    { name = "azure-identity" },
+    { name = "azure-storage-blob" },
     { name = "fastapi", version = "0.136.3", source = { registry = "https://pypi.org/simple" } },
     { name = "huggingface-hub" },
     { name = "pillow" },
@@ -1377,6 +1381,8 @@ server = [
 ]
 serving = [
     { name = "anyio" },
+    { name = "azure-identity" },
+    { name = "azure-storage-blob" },
     { name = "fastapi", version = "0.136.3", source = { registry = "https://pypi.org/simple" }, marker = "extra == 'extra-14-freesolo-flash-serve-runtime'" },
     { name = "fastapi", version = "0.141.1", source = { registry = "https://pypi.org/simple" }, marker = "extra == 'extra-14-freesolo-flash-custom' or extra == 'extra-14-freesolo-flash-gpu' or extra != 'extra-14-freesolo-flash-serve-runtime'" },
     { name = "httpx" },
@@ -1411,8 +1417,14 @@ dev = [
 requires-dist = [
     { name = "accelerate", marker = "extra == 'gpu'", specifier = ">=1.4" },
     { name = "anyio", marker = "extra == 'serving'", specifier = ">=4.0,<5" },
+    { name = "azure-identity", marker = "extra == 'gpu'", specifier = ">=1.19,<2" },
+    { name = "azure-identity", marker = "extra == 'serve-runtime'", specifier = ">=1.19,<2" },
     { name = "azure-identity", marker = "extra == 'server'", specifier = ">=1.19,<2" },
+    { name = "azure-identity", marker = "extra == 'serving'", specifier = ">=1.19,<2" },
+    { name = "azure-storage-blob", marker = "extra == 'gpu'", specifier = ">=12.24,<13" },
+    { name = "azure-storage-blob", marker = "extra == 'serve-runtime'", specifier = ">=12.24,<13" },
     { name = "azure-storage-blob", marker = "extra == 'server'", specifier = ">=12.24,<13" },
+    { name = "azure-storage-blob", marker = "extra == 'serving'", specifier = ">=12.24,<13" },
     { name = "cloudpickle", marker = "extra == 'dev'", specifier = ">=3.0" },
     { name = "cryptography", marker = "extra == 'dev'", specifier = ">=46" },
     { name = "cryptography", marker = "extra == 'server'", specifier = ">=46" },

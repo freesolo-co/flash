@@ -21,7 +21,6 @@ import pytest
 
 import flash.engine.worker.entry.worker as worker_entry
 import flash.engine.worker.io.heartbeat as worker_heartbeat
-import flash.engine.worker.io.hf as worker_hf
 import flash.engine.worker.perf as worker_perf
 import flash.engine.worker.runtime.kernel_warmup as worker_kernel_warmup
 import flash.engine.worker.train.entry.sft_train as worker_sft
@@ -123,7 +122,7 @@ def _hf_downloads(
             return str(manifest)
         return str(archive)
 
-    monkeypatch.setattr("huggingface_hub.hf_hub_download", fake_download)
+    monkeypatch.setattr("flash.artifacts.api.download_file", fake_download)
     return calls
 
 
@@ -348,7 +347,7 @@ def test_actual_staged_download_classifies_transient_failures(
     package, _manifest, _archive, _manifest_path, _archive_path = _staged_files(tmp_path)
     monkeypatch.setenv("HF_TOKEN", "hf-test")
     monkeypatch.setattr(
-        "huggingface_hub.hf_hub_download",
+        "flash.artifacts.api.download_file",
         lambda **_kwargs: (_ for _ in ()).throw(failure),
     )
     with pytest.raises(StagedEnvironmentTransientError):
@@ -368,7 +367,7 @@ def test_missing_immutable_revision_is_terminal(monkeypatch, tmp_path) -> None:
 
     monkeypatch.setenv("HF_TOKEN", "hf-test")
     monkeypatch.setattr(
-        "huggingface_hub.hf_hub_download",
+        "flash.artifacts.api.download_file",
         lambda **_kwargs: (_ for _ in ()).throw(MissingRevision()),
     )
     with pytest.raises(RuntimeError, match="unavailable at its immutable revision"):
@@ -376,6 +375,69 @@ def test_missing_immutable_revision_is_terminal(monkeypatch, tmp_path) -> None:
             _spec(package=package).environment,
             hf_repo="owner/run-artifacts",
         )
+
+
+@pytest.mark.parametrize("stage", ["manifest", "archive"])
+@pytest.mark.parametrize("wrapper", [None, "__cause__", "__context__"])
+@pytest.mark.parametrize(
+    ("failure_kind", "retriable"),
+    [
+        ("request", True),
+        ("response", True),
+        (408, True),
+        (409, True),
+        (412, True),
+        (429, True),
+        (503, True),
+        (400, False),
+        (401, False),
+        (403, False),
+        (404, False),
+    ],
+)
+def test_azure_hydration_failure_preserves_worker_retry_budget(
+    monkeypatch, tmp_path, stage, wrapper, failure_kind, retriable
+) -> None:
+    from azure.core.exceptions import HttpResponseError, ServiceRequestError, ServiceResponseError
+
+    from flash.envs.loading.staged import materialize_staged_environment
+
+    package, manifest, archive, manifest_path, archive_path = _staged_files(tmp_path)
+    if failure_kind == "request":
+        failure = ServiceRequestError("transport interrupted")
+    elif failure_kind == "response":
+        # no timeout/connection-named cause: the Azure type alone must be enough.
+        failure = ServiceResponseError("transport interrupted")
+    else:
+        failure = HttpResponseError("artifact request failed")
+        failure.status_code = failure_kind
+    if wrapper:
+        outer = RuntimeError("download failed")
+        setattr(outer, wrapper, failure)
+        failure = outer
+    calls = []
+    failed_path = manifest_path if stage == "manifest" else archive_path
+
+    def download(**kwargs):
+        filename = kwargs["filename"]
+        calls.append(filename)
+        if filename == failed_path:
+            raise failure
+        return {manifest_path: str(manifest), archive_path: str(archive)}[filename]
+
+    monkeypatch.setattr("flash.artifacts.api.download_file", download)
+    with pytest.raises(RuntimeError) as raised:
+        materialize_staged_environment(
+            _spec(package=package).environment,
+            hf_repo="owner/run-artifacts",
+        )
+    assert calls == ([manifest_path] if stage == "manifest" else [manifest_path, archive_path])
+    assert isinstance(raised.value, StagedEnvironmentTransientError) is retriable
+    assert raised.value.__cause__ is failure
+    assert worker_entry._worker_failure_flags(raised.value) == {
+        "retriable": retriable,
+        "oom": False,
+    }
 
 
 def test_worker_failure_boundary_marks_staged_transient_retriable() -> None:
@@ -434,10 +496,9 @@ def test_manifest_identity_tampering_fails_before_environment_import(
 def test_controller_stage_uploads_completion_last_and_verifies_returned_revision(
     monkeypatch, tmp_path
 ) -> None:
-    import huggingface_hub
-
     import flash.envs.loading.staged as staged
     import flash.providers._lifecycle.net.worker as provider_worker
+    from flash.artifacts import api as artifact_storage
     from flash.runner.accounting.artifacts import stage_environment_package
 
     source = _source(tmp_path)
@@ -446,7 +507,7 @@ def test_controller_stage_uploads_completion_last_and_verifies_returned_revision
 
     class FakeApi:
         def __init__(self, token):
-            assert token == "hf-controller"
+            assert token is None
 
         def upload_file(self, **kwargs):
             uploads.append(kwargs)
@@ -455,15 +516,15 @@ def test_controller_stage_uploads_completion_last_and_verifies_returned_revision
     def fake_verify(environment, *, hf_repo, token):
         assert environment.package is not None
         verified.append((environment.package.artifact_revision, hf_repo))
-        assert token == "hf-controller"
+        assert token is None
         return SimpleNamespace()
 
     monkeypatch.setenv("HF_TOKEN", "hf-controller")
-    monkeypatch.setattr(huggingface_hub, "HfApi", FakeApi)
+    monkeypatch.setattr(artifact_storage, "ArtifactStore", FakeApi)
     monkeypatch.setattr(staged, "resolve_environment_source", lambda *_args, **_kwargs: source)
     monkeypatch.setattr(staged, "verify_staged_environment", fake_verify)
     monkeypatch.setattr(provider_worker, "_ensure_private_artifact_repo", lambda *_a, **_k: None)
-    monkeypatch.setattr(provider_worker, "_hf_call", lambda call, *_a, **_k: call())
+    monkeypatch.setattr(provider_worker, "_artifact_call", lambda call, *_a, **_k: call())
 
     staged_spec = stage_environment_package(_spec())
     package = staged_spec.environment.package
@@ -486,10 +547,9 @@ def test_controller_stage_uploads_completion_last_and_verifies_returned_revision
 def test_identical_archives_for_different_git_shas_use_distinct_manifests_concurrently(
     monkeypatch, tmp_path
 ) -> None:
-    import huggingface_hub
-
     import flash.envs.loading.staged as staged
     import flash.providers._lifecycle.net.worker as provider_worker
+    from flash.artifacts import api as artifact_storage
     from flash.runner.accounting.artifacts import stage_environment_package
 
     sources = {
@@ -503,7 +563,7 @@ def test_identical_archives_for_different_git_shas_use_distinct_manifests_concur
 
     class FakeApi:
         def __init__(self, token):
-            assert token == "hf-controller"
+            assert token is None
 
         def upload_file(self, **kwargs):
             value = kwargs["path_or_fileobj"]
@@ -525,11 +585,11 @@ def test_identical_archives_for_different_git_shas_use_distinct_manifests_concur
         payload = json.loads(raw)
         assert payload["resolved_sha"] == environment.resolved_sha
         assert hf_repo == "owner/run-artifacts"
-        assert token == "hf-controller"
+        assert token is None
         return SimpleNamespace()
 
     monkeypatch.setenv("HF_TOKEN", "hf-controller")
-    monkeypatch.setattr(huggingface_hub, "HfApi", FakeApi)
+    monkeypatch.setattr(artifact_storage, "ArtifactStore", FakeApi)
     monkeypatch.setattr(
         staged,
         "resolve_environment_source",
@@ -537,7 +597,7 @@ def test_identical_archives_for_different_git_shas_use_distinct_manifests_concur
     )
     monkeypatch.setattr(staged, "verify_staged_environment", fake_verify)
     monkeypatch.setattr(provider_worker, "_ensure_private_artifact_repo", lambda *_a, **_k: None)
-    monkeypatch.setattr(provider_worker, "_hf_call", lambda call, *_a, **_k: call())
+    monkeypatch.setattr(provider_worker, "_artifact_call", lambda call, *_a, **_k: call())
 
     specs = [_spec(resolved_sha=_SHA), _spec(resolved_sha=_OTHER_SHA)]
     with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
@@ -851,7 +911,6 @@ def test_worker_cleans_materialized_package_after_training_handler(
     monkeypatch.setattr(worker_context, "config", replace(worker_context.config, spec=None))
     monkeypatch.setattr(worker_context, "config", replace(worker_context.config, hf_repo=""))
     monkeypatch.setattr(worker_sft, "run_sft_train", handler)
-    monkeypatch.setattr(worker_hf, "_disable_xet_upload_staging", lambda: None)
     monkeypatch.setattr(worker_context, "remaining_wall_seconds", lambda: None)
     monkeypatch.setattr(
         worker_entry, "_preflight_gpu_occupancy_for_spec", lambda context=None, **_context: None
@@ -886,9 +945,11 @@ def test_package_descriptor_contains_only_immutable_transport_values(tmp_path) -
 
 
 def test_artifact_repository_identity_keeps_raw_environment_spelling(monkeypatch) -> None:
-    from flash.runner.accounting.artifacts import managed_hf_repo_for_environment
+    from flash.runner.accounting.artifacts import managed_artifact_repo_for_environment
 
-    monkeypatch.setenv("FLASH_HF_NAMESPACE", "owner")
+    monkeypatch.setenv("FLASH_ARTIFACT_NAMESPACE", "owner")
     managed = "org/project/env"
     url = "https://github.com/freesolo-co/environment-hub/blob/main/org/project/env/environment.py"
-    assert managed_hf_repo_for_environment(managed) != managed_hf_repo_for_environment(url)
+    assert managed_artifact_repo_for_environment(managed) != managed_artifact_repo_for_environment(
+        url
+    )

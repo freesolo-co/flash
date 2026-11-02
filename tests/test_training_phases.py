@@ -74,11 +74,12 @@ def test_child_records_survive_ray_prefix_and_reject_malformed_values():
 
 
 def test_heartbeat_and_metadata_share_measured_timings(worker_context, monkeypatch):
-    from flash.engine.worker.io import heartbeat, hf
+    from flash.engine.worker.io import artifacts as hf
+    from flash.engine.worker.io import heartbeat
     from flash.engine.worker.train.core.lifecycle import finalize
 
     payloads = []
-    monkeypatch.setattr(hf, "hf_upload_file", lambda *a, **k: True)
+    monkeypatch.setattr(hf, "upload_artifact_file", lambda *a, **k: True)
     monkeypatch.setattr(
         heartbeat,
         "_console_heartbeat_snapshot",

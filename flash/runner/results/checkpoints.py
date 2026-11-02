@@ -1,17 +1,16 @@
-"""List a run's deployable per-step training checkpoints from its HF artifact repo.
+"""List a run's deployable per-step training checkpoints from its Azure artifact namespace.
 
 The GPU worker publishes each trainer save's LoRA adapter to a stable, NON-pruned path
 (``<adapter_prefix>/checkpoints/step-<N>/adapter``; see
 ``flash.engine.worker.publish_deployable_checkpoint``). This module is the control-plane
 reader: it enumerates those snapshots so ``flash runs checkpoint`` can list them and
 ``flash models deploy <run-id>/step-N`` can serve a specific one — including for a run that was cancelled or
-failed mid-training and so never sealed a final adapter. HF (not the backend DB) is the source of
+failed mid-training and so never sealed a final adapter. Azure artifact storage (not the backend DB) is the source of
 truth for what's deployable; backend persistence is a mirror (see
 ``flash.server.domain.checkpoints``)."""
 
 from __future__ import annotations
 
-import os
 import re
 
 from flash.adapters.artifacts import has_loadable_adapter_weights
@@ -21,7 +20,7 @@ from flash.schema import parse_checkpoint_ref
 
 
 class CheckpointListingError(RuntimeError):
-    """Raised when checkpoint listing must be authoritative but HF cannot be queried."""
+    """Raised when checkpoint listing must be authoritative but Azure cannot be queried."""
 
 
 def checkpoint_adapter_prefix(spec: JobSpec, step: int) -> str:
@@ -59,9 +58,9 @@ def _repo_files(spec: JobSpec, *, strict: bool, revision: str | None = None) -> 
     if not repo:
         return []
     try:
-        from huggingface_hub import HfApi
+        from flash.artifacts.api import ArtifactStore
 
-        return HfApi(token=os.environ.get("HF_TOKEN")).list_repo_files(
+        return ArtifactStore(token=None).list_repo_files(
             repo, repo_type="dataset", revision=revision
         )
     except Exception as exc:
@@ -111,7 +110,7 @@ def list_checkpoints(spec: JobSpec) -> list[dict]:
     entry: ``{"step", "adapter_prefix", "subfolder", "repo_id", "repo_type"}`` where
     ``adapter_prefix`` is the value to hand ``deploy_adapter`` to serve that exact step and
     ``subfolder`` is the full path of the adapter folder in the repo. Returns ``[]`` when the
-    run has no HF repo or no published snapshots (older runs, or none saved yet)."""
+    run has no artifact namespace or no published snapshots (older runs, or none saved yet)."""
     return _checkpoints_from_files(spec, _repo_files(spec, strict=False))
 
 

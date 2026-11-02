@@ -109,16 +109,16 @@ def test_verify_rejects_legacy_blob_without_raw_kernels(tmp_path):
     assert bake_module()._verify(str(tmp_path), "sm100") == 1
 
 
+@pytest.mark.parametrize("verification_fails", [False, True])
 @pytest.mark.parametrize("upload_fails", [False, True])
 @pytest.mark.parametrize("cleanup_fails", [False, True])
 def test_cleanup_covers_input_upload_and_never_overrides_result(
-    monkeypatch, tmp_path, upload_fails, cleanup_fails
+    monkeypatch, tmp_path, upload_fails, cleanup_fails, verification_fails
 ):
     import sys
     from types import SimpleNamespace
 
-    import huggingface_hub
-
+    from flash.artifacts import api as artifact_api
     from flash.providers.modal import api
 
     bake = bake_module()
@@ -131,9 +131,7 @@ def test_cleanup_covers_input_upload_and_never_overrides_result(
 
     hf = SimpleNamespace(
         create_repo=lambda **kw: None,
-        update_repo_settings=lambda **kw: None,
         upload_folder=lambda **kw: None,
-        delete_repo=delete,
     )
 
     def upload(**kwargs):
@@ -141,11 +139,15 @@ def test_cleanup_covers_input_upload_and_never_overrides_result(
             raise RuntimeError("input upload outage")
 
     hf.upload_folder = upload
-    monkeypatch.setattr(huggingface_hub, "HfApi", lambda **kw: hf)
-    monkeypatch.setenv("HF_TOKEN", "test")
+    monkeypatch.setattr(artifact_api, "ArtifactStore", lambda **kw: hf)
+    monkeypatch.setattr(
+        "flash.artifacts.config.runtime_environment",
+        lambda: {"FLASH_ARTIFACT_BLOB_SAS_URL": "test-sas"},
+    )
+    monkeypatch.setattr(bake, "_delete_artifacts", lambda repo: delete(repo_id=repo))
     monkeypatch.setattr(api, "call", lambda *a, **kw: None)
     monkeypatch.setattr(bake, "_status_present", lambda *a, **kw: True)
-    monkeypatch.setattr(bake, "_verify", lambda *a: 0)
+    monkeypatch.setattr(bake, "_verify", lambda *a: int(verification_fails))
 
     def download(**kwargs):
         import io
@@ -153,13 +155,14 @@ def test_cleanup_covers_input_upload_and_never_overrides_result(
 
         out = Path(kwargs["local_dir"]) / "out"
         out.mkdir()
+        (out / "STATUS").write_text("rc=0\narch=blackwell\n")
         (out / "bake-warmup.log").write_bytes(b"current bake")
         with tarfile.open(out / "kernel_cache.tar.gz", "w:gz") as archive:
             entry = tarfile.TarInfo("bake-warmup.log")
             entry.size = len(b"old image log")
             archive.addfile(entry, io.BytesIO(b"old image log"))
 
-    monkeypatch.setattr(huggingface_hub, "snapshot_download", download)
+    monkeypatch.setattr(artifact_api, "download_snapshot", download)
     monkeypatch.setattr(
         sys,
         "argv",
@@ -179,9 +182,12 @@ def test_cleanup_covers_input_upload_and_never_overrides_result(
         with pytest.raises(RuntimeError, match="input upload outage"):
             bake.main()
     else:
-        assert bake.main() == 0
-        assert (tmp_path / "out/bake-warmup.log").read_bytes() == b"current bake"
-        assert (tmp_path / "out/warmup.log").read_bytes() == b"current bake"
+        assert bake.main() == int(verification_fails)
+        if verification_fails:
+            assert not (tmp_path / "out").exists()
+        else:
+            assert (tmp_path / "out/bake-warmup.log").read_bytes() == b"current bake"
+            assert (tmp_path / "out/warmup.log").read_bytes() == b"current bake"
     assert len(deleted) == 1
 
 
@@ -191,15 +197,20 @@ def test_failed_sandbox_preserves_exit_diagnostic_and_cleans_up(monkeypatch, ret
     from types import SimpleNamespace
     from unittest.mock import AsyncMock, Mock
 
-    import huggingface_hub
-
+    from flash.artifacts import api as artifact_api
     from flash.providers.modal import api
 
     bake = bake_module()
-    hf = SimpleNamespace(delete_repo=Mock())
-    monkeypatch.setattr(huggingface_hub, "HfApi", lambda **kw: hf)
+    hf = SimpleNamespace()
+    delete = Mock()
+    monkeypatch.setattr(bake, "_delete_artifacts", delete)
+    monkeypatch.setattr(bake, "_bake_image", lambda *args: "bake-image")
+    monkeypatch.setattr(artifact_api, "ArtifactStore", lambda **kw: hf)
+    monkeypatch.setattr(
+        "flash.artifacts.config.runtime_environment",
+        lambda: {"FLASH_ARTIFACT_BLOB_SAS_URL": "test-sas"},
+    )
     monkeypatch.setattr(bake, "_upload_flash_code", lambda *args: None)
-    monkeypatch.setenv("HF_TOKEN", "test")
     monkeypatch.setattr(api, "credentials", lambda: ("test-id", "test-secret"))
     monkeypatch.setattr(api, "call", call_modal)
     monkeypatch.setattr(
@@ -238,7 +249,7 @@ def test_failed_sandbox_preserves_exit_diagnostic_and_cleans_up(monkeypatch, ret
     assert create.call_args.kwargs["memory"] == (32768, 131072)
     sandbox.terminate.aio.assert_awaited_once_with(wait=True)
     client.__aexit__.assert_awaited_once_with(None, None, None)
-    hf.delete_repo.assert_called_once()
+    delete.assert_called_once()
 
 
 @pytest.mark.parametrize("name", ["../escape", "/absolute"])
@@ -266,3 +277,79 @@ def test_cache_archive_preserves_hidden_backend_directories(tmp_path):
         archive.addfile(entry, io.BytesIO(b"compiled"))
     bake_module()._extract_cache_archive(path, tmp_path / "out")
     assert (tmp_path / "out/flashinfer/.cache/kernel.so").read_bytes() == b"compiled"
+
+
+def test_upload_uses_base_pinned_source_without_importing_it(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    import flash
+
+    root = tmp_path / "older-base"
+    package = root / "flash"
+    warmup = package / "engine/worker/runtime/kernel_warmup.py"
+    warmup.parent.mkdir(parents=True)
+    warmup.write_text("BASE_REVISION = 'older-base'\n")
+    (package / "__init__.py").write_text("raise RuntimeError('old package must not be imported')\n")
+    # A historical checkout can have an HF-only helper; the current helper must never execute it.
+    (root / "docker").mkdir()
+    (root / "docker/bake_kernel_cache.py").write_text("import os; os.environ['HF_TOKEN']\n")
+    monkeypatch.delenv("HF_TOKEN", raising=False)
+    seen = []
+
+    def upload_folder(**kwargs):
+        uploaded = Path(kwargs["folder_path"])
+        seen.append(uploaded)
+        assert (
+            uploaded / "engine/worker/runtime/kernel_warmup.py"
+        ).read_bytes() == warmup.read_bytes()
+        assert kwargs["path_in_repo"] == "code/flash"
+
+    bake_module()._upload_flash_code(
+        SimpleNamespace(create_repo=lambda **kw: None, upload_folder=upload_folder),
+        "test/bake",
+        root,
+    )
+    assert seen == [package]
+    assert seen[0] != Path(flash.__file__).parent
+
+
+def test_invalid_base_source_fails_before_publishing(tmp_path):
+    from types import SimpleNamespace
+
+    store = SimpleNamespace(create_repo=lambda **kw: pytest.fail("must validate before publishing"))
+    with pytest.raises(ValueError, match="base image's Flash warmup package"):
+        bake_module()._upload_flash_code(store, "test/bake", tmp_path)
+
+
+def test_workflow_keeps_transport_and_base_source_in_separate_checkouts():
+    import shlex
+
+    import yaml
+
+    workflow = yaml.safe_load(
+        (Path(__file__).parents[1] / ".github/workflows/bake-kernel-cache.yml").read_text()
+    )
+    steps = workflow["jobs"]["bake"]["steps"]
+    checkouts = {
+        step["with"]["path"]: step["with"]["ref"]
+        for step in steps
+        if step.get("uses", "").startswith("actions/checkout@")
+    }
+    assert checkouts["bake-tools"] == "${{ github.workflow_sha }}"
+    assert checkouts["base-source"] == "${{ steps.base.outputs.revision || github.sha }}"
+    warm = next(step for step in steps if step.get("name", "").startswith("Warm kernels"))
+    command = shlex.split(warm["run"].replace("\\\n", " "))
+    assert command[command.index("--project") + 1] == "bake-tools"
+    assert command[command.index("python") + 1] == "bake-tools/docker/bake_kernel_cache.py"
+    assert command[command.index("--source-root") + 1] == "base-source"
+    assert command[command.index("--out") + 1] == "base-source/build/kernel_cache"
+    sync = next(step["run"] for step in steps if "uv sync" in step.get("run", ""))
+    assert "--project bake-tools" in sync
+    assert "--locked" in sync
+    build = next(
+        step["with"]
+        for step in steps
+        if step.get("uses", "").startswith("docker/build-push-action@")
+    )
+    assert build["context"] == "base-source"
+    assert build["file"] == "base-source/docker/Dockerfile.kernelcache"

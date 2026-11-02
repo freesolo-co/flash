@@ -187,7 +187,7 @@ def require_project_access_slug(
             detail=(
                 "publishing environments requires a Freesolo project directory to resolve "
                 "the project slug, which a standalone plane does not have; reference the "
-                "environment from git instead (see SELF_HOSTING.md)"
+                "environment from git instead"
             ),
         )
 

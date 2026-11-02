@@ -17,7 +17,7 @@ ADAPTER_CACHE_DIR = HOSTING_CACHE_DIR / "adapters"
 # a value here in code if it ever needs to move.
 TRUST_REMOTE_CODE = True
 DTYPE = "auto"
-# FP8 everywhere, baked in (memory-first; see README "Quantization"). For models without
+# FP8 everywhere, baked in to minimize memory use. For models without
 # `serve_model_id`, vLLM ONLINE-quantizes the normal bf16 HF checkpoint to FP8 (E4M3) at load time.
 # Larger validated tiers can instead set model_config.engine.serve_model_id to load a pre-quantized
 # FP8 checkpoint directly, avoiding the bf16 load transient. The old per-base GPTQ-Int8 repos were

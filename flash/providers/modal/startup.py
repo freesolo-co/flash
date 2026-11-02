@@ -4,7 +4,7 @@ import json
 import math
 import time
 
-from flash.providers.artifacts.hf import make_hf_text_reader
+from flash.providers.artifacts.channel import make_artifact_text_reader
 
 
 def start_time_reader(remote, *, deadline_at=None):
@@ -20,7 +20,7 @@ def start_time_reader(remote, *, deadline_at=None):
         or launch <= 0
     ):
         return lambda: None
-    reader = make_hf_text_reader(
+    reader = make_artifact_text_reader(
         repo,
         f"{phase}/{run_id}/modal_started_attempt{attempt}.json",
         deadline_at=deadline_at,

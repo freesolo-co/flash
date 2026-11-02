@@ -3539,7 +3539,7 @@ def test_ray_logs_are_redacted_because_they_are_third_party_text(tmp_path):
     # ray logs a raylet's argv and flash passes credentials to the worker through the environment,
     # so this content has never been through flash's redactor -- unlike the traceback beside it,
     # which main() sanitizes before upload. an unsanitized path here would publish a live token to
-    # the run's HF artifacts.
+    # the run's Azure artifacts.
     root = tmp_path / "ray"
     _ray_session(
         root,

@@ -22,7 +22,7 @@ _SCRIPT = (
 model, revision = json.loads(os.environ['FLASH_BASE_MODEL'])
 for force in (False, True):
     root = snapshot_download(model, revision=revision, cache_dir='/weight-cache/hf-cache/hub',
-        token=os.environ.get('HF_TOKEN'), force_download=force,
+        token=(os.environ.get('HF_TOKEN') or '').strip() or None, force_download=force,
         ignore_patterns=['*.pth', '*.gguf', 'original/*', '*.onnx', '*.msgpack', '*.h5'])
     if snapshot_has_weights(root):
         break

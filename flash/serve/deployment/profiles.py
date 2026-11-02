@@ -38,7 +38,12 @@ from flash.serve.provisioning import ServingImage
 # against different execution bytes.
 SERVE_RUNTIME_FAMILY = "vllm-0.23.0-pr42120"
 _CERTIFIED_MODAL_IMAGE_DIGEST = (
-    "sha256:fc8ed231211562b3c67ca80ffbf7fb3e992aad6a42087a16c0dd26c1e249a758"
+    "sha256:9dc811c3458f979ce2e020509ffbbe3e51364f551234df4c3139ef8e497192dc"
+)
+# Azure hydration and generation passed on all shipping Modal profiles on 2026-11-02.
+# Older Hub-only images remain blocked.
+_AZURE_ARTIFACT_IMAGE_DIGESTS: frozenset[str] = frozenset(
+    {"sha256:9dc811c3458f979ce2e020509ffbbe3e51364f551234df4c3139ef8e497192dc"}
 )
 
 
@@ -486,6 +491,11 @@ def require_live_qualification(
         raise ProfileError(
             f"{profile.model_id} modal serving profile is qualified only for certified image "
             f"digest {certified_digest}; requested {image_digest}"
+        )
+    if image_digest not in _AZURE_ARTIFACT_IMAGE_DIGESTS:
+        raise ProfileError(
+            "customer-owned serving is pending Azure artifact image qualification; "
+            "dry runs are available, but provider allocation is disabled"
         )
 
 

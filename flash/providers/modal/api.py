@@ -107,6 +107,7 @@ def create(*, name, payload, image_reference, gpu, gpu_count, capsule, deadline_
                 return existing.object_id
             image = (
                 modal.Image.from_registry(image_reference)
+                .pip_install("azure-storage-blob>=12.24,<13", "azure-identity>=1.19,<2")
                 .run_commands("mkdir -p /root/flash")
                 .add_local_file(str(archive), "/opt/flash/capsule.pyz", copy=True)
             )

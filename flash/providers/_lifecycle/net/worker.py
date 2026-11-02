@@ -16,7 +16,7 @@ from flash.core.spec import (
     JobSpec,
     parse_seed,
 )
-from flash.providers.artifacts.hf import hf_call, hf_status_code
+from flash.providers.artifacts.channel import artifact_call, artifact_status_code
 from flash.providers.core.base import get_gpu_info
 
 logger = get_logger(__name__)
@@ -160,6 +160,9 @@ def build_worker_env(
         value = (os.environ.get(key) or "").strip()
         if value:
             env[key] = value
+    from flash.artifacts.config import runtime_environment
+
+    env.update(runtime_environment())
     env["HF_REPO"] = spec.train.hf_repo
     if (
         getattr(spec.gpu, "network_volume", None)
@@ -167,7 +170,7 @@ def build_worker_env(
     ):
         env.update(weight_cache_env())
     # runtime secrets and declared env secrets may never clobber a control-plane-owned key:
-    # the canonical seed, run id, hf repo, and arm are set above, and a runtime seed override
+    # the canonical seed, run id, artifact namespace, and arm are set above, and a runtime seed override
     # would break the authoritative-seed invariant regardless of how environment.secrets was
     # populated. removed keys are filtered here too. the two sets are disjoint and answer
     # different questions: control-plane ownership prevents overrides such as SEED, while removed
@@ -205,8 +208,8 @@ def build_worker_env(
     return env
 
 
-def _hf_call(call, label: str, *, deadline_at: float | None = None):
-    return hf_call(
+def _artifact_call(call, label: str, *, deadline_at: float | None = None):
+    return artifact_call(
         call,
         label,
         logger=logger,
@@ -221,30 +224,15 @@ def _ensure_private_artifact_repo(
     *,
     deadline_at: float | None = None,
 ) -> None:
-    try:
-        _hf_call(
-            lambda: api.repo_info(repo_id=repo, repo_type="dataset"),
-            f"lookup artifact repo {repo}",
-            deadline_at=deadline_at,
-        )
-    except Exception as exc:
-        if hf_status_code(exc) != 404 and exc.__class__.__name__ != "RepositoryNotFoundError":
-            raise
-        _hf_call(
-            lambda: api.create_repo(repo, repo_type="dataset", exist_ok=True, private=True),
-            f"create artifact repo {repo}",
-            deadline_at=deadline_at,
-        )
-    # create_repo(exist_ok=True) won't flip an existing public repo private; force it explicitly.
-    _hf_call(
-        lambda: api.update_repo_settings(repo_id=repo, repo_type="dataset", private=True),
-        f"force artifact repo private {repo}",
+    _artifact_call(
+        lambda: api.create_repo(repo, exist_ok=True, private=True),
+        f"ensure private artifact namespace {repo}",
         deadline_at=deadline_at,
     )
 
 
 def _repo_revision(api, repo: str, *, deadline_at: float | None) -> str:
-    info = _hf_call(
+    info = _artifact_call(
         lambda: api.repo_info(repo_id=repo, repo_type="dataset"),
         f"read artifact repo revision {repo}",
         deadline_at=deadline_at,
@@ -263,11 +251,11 @@ def _download_source_archive(
     *,
     deadline_at: float | None,
 ) -> bytes | None:
-    from huggingface_hub import hf_hub_download
+    from flash.artifacts.api import download_file
 
     try:
-        local_path = _hf_call(
-            lambda: hf_hub_download(
+        local_path = _artifact_call(
+            lambda: download_file(
                 repo_id=repo,
                 repo_type="dataset",
                 filename=archive_path,
@@ -278,10 +266,7 @@ def _download_source_archive(
             deadline_at=deadline_at,
         )
     except Exception as exc:
-        if hf_status_code(exc) == 404 or exc.__class__.__name__ in {
-            "EntryNotFoundError",
-            "LocalEntryNotFoundError",
-        }:
+        if artifact_status_code(exc) == 404:
             return None
         raise
     with open(local_path, "rb") as source:
@@ -294,9 +279,8 @@ def publish_source_snapshot(
     deadline_at: float | None = None,
 ) -> dict:
     """Publish one deterministic source archive and return its immutable descriptor."""
-    from huggingface_hub import HfApi
-
     import flash
+    from flash.artifacts.api import ArtifactStore
     from flash.snapshot.archive import (
         build_source_archive,
         canonical_archive_path,
@@ -307,10 +291,10 @@ def publish_source_snapshot(
 
     if not repo:
         raise RuntimeError(
-            "hf_repo must be set (the run's [train] hf_repo: HF dataset repo for code + artifacts)"
+            "hf_repo must be set (the run's [train] hf_repo: logical Azure namespace for code + artifacts)"
         )
-    token = os.environ.get("HF_TOKEN")
-    api = HfApi(token=token)
+    token = None
+    api = ArtifactStore()
     _ensure_private_artifact_repo(api, repo, deadline_at=deadline_at)
     package_dir = os.path.realpath(os.path.dirname(os.path.abspath(flash.__file__)))
     archive = build_source_archive(package_dir=Path(package_dir))
@@ -336,7 +320,7 @@ def publish_source_snapshot(
     if existing is not None:
         return existing
     try:
-        commit = _hf_call(
+        commit = _artifact_call(
             lambda: api.upload_file(
                 path_or_fileobj=BytesIO(archive),
                 path_in_repo=archive_path,

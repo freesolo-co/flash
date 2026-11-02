@@ -247,7 +247,7 @@ def test_prefetch_error_classification():
     )
     from requests.exceptions import ConnectionError, Timeout
 
-    from flash.engine.worker.io.hf import _prefetch_error_is_retriable
+    from flash.engine.worker.io.artifacts import _prefetch_error_is_retriable
 
     def hf_error(error_type, status):
         response = SimpleNamespace(
@@ -279,14 +279,14 @@ def test_prefetch_error_classification():
 
 
 def test_prefetch_pinned_revision_does_not_swallow_download_failure(worker_context, monkeypatch):
+    import flash.engine.worker.io.artifacts as worker_hf
     import flash.engine.worker.io.heartbeat as worker_heartbeat
-    import flash.engine.worker.io.hf as worker_hf
     import flash.engine.worker.io.prefetch as worker_prefetch
     import flash.engine.worker.perf as worker_perf
 
     monkeypatch.setattr(worker_prefetch, "_shared_weight_cache_dir", lambda: None)
     monkeypatch.setattr(
-        worker_hf, "_require_hf_deadline_allowance", lambda context=None, **_context: None
+        worker_hf, "_require_artifact_deadline_allowance", lambda context=None, **_context: None
     )
     monkeypatch.setattr(worker_perf, "gpu_diagnostics", dict)
     monkeypatch.setattr(worker_heartbeat, "heartbeat", lambda *args, context=None, **kwargs: None)
@@ -302,8 +302,8 @@ def test_prefetch_pinned_revision_does_not_swallow_download_failure(worker_conte
 def test_prefetch_pinned_revision_wraps_transient_download_failure(worker_context, monkeypatch):
     from requests.exceptions import Timeout
 
+    import flash.engine.worker.io.artifacts as worker_hf
     import flash.engine.worker.io.heartbeat as worker_heartbeat
-    import flash.engine.worker.io.hf as worker_hf
     import flash.engine.worker.io.prefetch as worker_prefetch
     import flash.engine.worker.perf as worker_perf
     from flash.engine.worker.perf.lifecycle import RetriableInfraError
@@ -311,7 +311,7 @@ def test_prefetch_pinned_revision_wraps_transient_download_failure(worker_contex
     transient = Timeout("timed out")
     monkeypatch.setattr(worker_prefetch, "_shared_weight_cache_dir", lambda: None)
     monkeypatch.setattr(
-        worker_hf, "_require_hf_deadline_allowance", lambda context=None, **_context: None
+        worker_hf, "_require_artifact_deadline_allowance", lambda context=None, **_context: None
     )
     monkeypatch.setattr(worker_perf, "gpu_diagnostics", dict)
     monkeypatch.setattr(worker_heartbeat, "heartbeat", lambda *args, context=None, **kwargs: None)

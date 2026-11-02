@@ -44,9 +44,12 @@ def test_exported_copy_replaces_originals_and_preserves_absolute_references(tmp_
 
 @pytest.mark.parametrize(("warm_rc", "replay_rc"), [(0, 0), (1, 0), (0, 1)])
 def test_bake_clears_inherited_cache_and_replays_export(monkeypatch, tmp_path, warm_rc, replay_rc):
+    import sys
     import tarfile
 
-    import huggingface_hub
+    from flash.artifacts import api as artifact_api
+
+    monkeypatch.setitem(sys.modules, "artifact_api", artifact_api)
 
     entry = entry_module()
     cache = tmp_path / "cache"
@@ -59,8 +62,7 @@ def test_bake_clears_inherited_cache_and_replays_export(monkeypatch, tmp_path, w
     trainer = tmp_path / "trainer-python"
     trainer.touch()
     monkeypatch.setenv("FLASH_VERL_PYTHON", str(trainer))
-    monkeypatch.setenv("BAKE_HF_REPO", "test/bake")
-    monkeypatch.setenv("HF_TOKEN", "test")
+    monkeypatch.setenv("BAKE_ARTIFACT_REPO", "test/bake")
     calls = []
     uploaded = {}
     actual_replace_cache = entry._replace_cache_with_exported_copy
@@ -97,8 +99,10 @@ def test_bake_clears_inherited_cache_and_replays_export(monkeypatch, tmp_path, w
             with tarfile.open(source) as archive:
                 assert archive.extractfile("./kernel.cubin").read() == b"compiled"
 
-    monkeypatch.setattr(huggingface_hub, "HfApi", lambda **kw: SimpleNamespace(upload_file=upload))
-    monkeypatch.setattr(huggingface_hub, "snapshot_download", lambda **kw: None)
+    monkeypatch.setattr(
+        artifact_api, "ArtifactStore", lambda **kw: SimpleNamespace(upload_file=upload)
+    )
+    monkeypatch.setattr(artifact_api, "download_snapshot", lambda **kw: None)
     expected = warm_rc or replay_rc
     assert entry.main() == expected
     validation = json.loads((cache / "cache_validation.json").read_text())

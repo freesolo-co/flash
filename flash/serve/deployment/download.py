@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import os
 import re
 import zipfile
 from pathlib import Path, PurePosixPath
@@ -28,15 +27,13 @@ def file_digest(path: Path) -> str:
 
 
 def _fetch_adapter(source_repo: str, subfolder: str, destination: Path) -> tuple[Path, str]:
-    from huggingface_hub import HfApi, RepoFile, hf_hub_download
+    from flash.artifacts.api import ArtifactFile, ArtifactStore, download_file
 
-    token = os.environ.get("HF_TOKEN", "").strip()
-    if not token:
-        raise ServingError("server artifact-storage credential is unavailable")
+    token = None
     prefix = PurePosixPath(subfolder)
     if prefix.is_absolute() or ".." in prefix.parts or str(prefix) != subfolder:
         raise ValueError("invalid checkpoint artifact directory")
-    api = HfApi(token=token)
+    api = ArtifactStore(token=token)
     try:
         revision = api.repo_info(repo_id=source_repo, repo_type="dataset").sha
         if not isinstance(revision, str) or not re.fullmatch(r"[0-9a-f]{40}", revision):
@@ -50,7 +47,7 @@ def _fetch_adapter(source_repo: str, subfolder: str, destination: Path) -> tuple
         )
         size = 0
         for entry in entries:
-            if not isinstance(entry, RepoFile):
+            if not isinstance(entry, ArtifactFile):
                 continue
             path = PurePosixPath(entry.path)
             if path.parent != prefix:
@@ -65,7 +62,7 @@ def _fetch_adapter(source_repo: str, subfolder: str, destination: Path) -> tuple
             size += entry.size
             if size > MAX_ARCHIVE_BYTES:
                 raise ServingError("checkpoint adapter exceeds download size limit")
-            hf_hub_download(
+            download_file(
                 repo_id=source_repo,
                 repo_type="dataset",
                 revision=revision,
@@ -76,7 +73,7 @@ def _fetch_adapter(source_repo: str, subfolder: str, destination: Path) -> tuple
     except ServingError:
         raise
     except Exception:
-        # hub exceptions can contain private repository names and signed URLs.
+        # storage exceptions can contain private repository names and signed URLs.
         raise ServingError("could not read checkpoint adapter from artifact storage") from None
     return destination / subfolder, revision
 

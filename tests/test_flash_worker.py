@@ -357,7 +357,7 @@ def test_alloc_conf_default_expandable_for_sft(monkeypatch):
 def test_error_artifact_name_is_per_phase_and_attempt():
     """Error files are scoped per-phase and per-attempt so a stale prior-attempt
     traceback can't be mistaken for the current attempt's crash on a retry."""
-    from flash.engine.worker.io.hf import error_artifact_name
+    from flash.engine.worker.io.artifacts import error_artifact_name
 
     names = {error_artifact_name(m) for m in ("sft", "rl")}
     assert len(names) == 2  # distinct per phase -> no clobber
@@ -373,7 +373,7 @@ def test_ray_log_artifact_name_is_scoped_exactly_like_the_traceback_beside_it():
     """Ray's failure logs upload to the same per-RUN hf_prefix() as the traceback, so they need the
     same per-attempt scoping. A raylet failure is precisely the case that gets retried, and an
     unscoped name would let the retry overwrite the attempt that actually reproduced it."""
-    from flash.engine.worker.io.hf import error_artifact_name, ray_log_artifact_name
+    from flash.engine.worker.io.artifacts import error_artifact_name, ray_log_artifact_name
 
     assert ray_log_artifact_name("rl") == "raylogs_rl_attempt0.txt"
     assert ray_log_artifact_name("rl", 0) != ray_log_artifact_name("rl", 1)
@@ -386,7 +386,7 @@ def test_ray_log_artifact_name_is_scoped_exactly_like_the_traceback_beside_it():
 def test_worker_and_control_plane_agree_on_the_error_artifact_name():
     """The process that WRITES the error artifact and the one that READS it must spell it the same.
 
-    These live on opposite sides of a machine boundary -- the worker uploads to HF, the pollers fetch
+    These live on opposite sides of a machine boundary -- the worker uploads to Azure, the pollers fetch
     from it -- and nothing at runtime ever compares the two names. A disagreement surfaces only as a
     missing artifact, which is indistinguishable from "the worker crashed before uploading": exactly
     the situation the file exists to explain, so the failure erases its own evidence.
@@ -395,8 +395,8 @@ def test_worker_and_control_plane_agree_on_the_error_artifact_name():
     agree by coincidence of two assertions rather than by construction -- so the assertion is
     writer-against-reader, not either against a string.
     """
-    from flash.engine.worker.io.hf import error_artifact_name as worker_name
-    from flash.providers.artifacts.hf import error_artifact_name as plane_name
+    from flash.engine.worker.io.artifacts import error_artifact_name as worker_name
+    from flash.providers.artifacts.channel import error_artifact_name as plane_name
 
     for phase in ("sft", "rl"):
         for attempt in (0, 1, 7):
@@ -604,7 +604,7 @@ def test_console_heartbeat_stays_flat_so_the_scanner_can_match_on_substrings(tmp
 
 
 def test_snapshot_weight_validation(tmp_path):
-    from flash.engine.worker.io.hf import _snapshot_has_weights
+    from flash.engine.worker.io.artifacts import _snapshot_has_weights
 
     d = tmp_path / "snap"
     d.mkdir()

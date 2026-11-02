@@ -62,9 +62,10 @@ def prepare_job(
 ) -> PreparedJob:
     """Prepare all read-only submission inputs before persistence or allocation."""
     if spec.algorithm == "custom":
+        from flash.artifacts.config import configured
         from flash.custom.managed import resolve_resume
 
-        if not os.environ.get("HF_TOKEN"):
+        if not configured():
             raise ValueError("managed custom training requires durable artifact storage")
         if spec.custom.get("resume_from"):
             spec = resolve_resume(
@@ -134,7 +135,7 @@ def prepare_job(
     info = catalog.resolve_model(spec.model, spec.algorithm, model_revision=spec.model_revision)
     run_id = spec.run_id if (spec.run_id and spec.run_id != "local") else state.new_run_id()
     spec = JobSpec.from_dict({**_with_model_disk(spec, info), "run_id": run_id})
-    spec = artifacts._assign_managed_hf_repo(spec)
+    spec = artifacts._assign_managed_artifact_repo(spec)
     spec = weight_cache._assign_weight_cache_volume(spec, info)
     owner_org_id = preparation._context_org_id(billing_context) or preparation._context_org_id(
         platform_context
@@ -144,7 +145,7 @@ def prepare_job(
             spec,
             owner_org_id=owner_org_id,
             owner_key_id=owner_key_id,
-            token=os.environ.get("HF_TOKEN"),
+            token=None,
         )
     )
     # these read-only gates belong to preparation: every submit path passes here exactly once, and

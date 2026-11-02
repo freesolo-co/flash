@@ -205,13 +205,13 @@ def effective_spec_from_status(status: RunStatus, *, verify_source: bool = False
             from flash.adapters.lora_rank import (
                 adapter_artifact_identity,
                 inspect_adapter_config,
-                load_hf_adapter_config,
+                load_artifact_adapter_config,
             )
 
             revision = worker_spec.train.init_from_adapter_revision
-            config = load_hf_adapter_config(
+            config = load_artifact_adapter_config(
                 worker_spec.train.init_from_adapter,
-                os.environ.get("HF_TOKEN"),
+                None,
                 revision,
             )
             metadata = inspect_adapter_config(
@@ -227,7 +227,7 @@ def effective_spec_from_status(status: RunStatus, *, verify_source: bool = False
             current = adapter_artifact_identity(
                 worker_spec.train.init_from_adapter,
                 config,
-                os.environ.get("HF_TOKEN"),
+                None,
                 revision,
             ).to_dict()
         except Exception as exc:

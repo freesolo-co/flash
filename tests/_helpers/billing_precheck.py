@@ -77,7 +77,9 @@ def billing_api(
 ):
     monkeypatch.setenv("FREESOLO_INTERNAL_KEY", "fslo-internal-test")
     monkeypatch.setenv("GITHUB_TOKEN", "ghp-test")
-    monkeypatch.setenv("HF_TOKEN", "hf-test")
+    monkeypatch.setenv(
+        "FLASH_ARTIFACT_BLOB_SAS_URL", "https://test.blob.core.windows.net/artifacts?sig=test"
+    )
 
     import flash.providers._lifecycle.net.worker as provider_worker
     import flash.runner.lifecycle.state as runner_state

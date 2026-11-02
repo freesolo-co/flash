@@ -2,6 +2,7 @@ name: dev kernel-cache candidate
 
 # dev pushes only run the metadata detector. the scheduled or manual run builds the newest
 # missing candidate, so several daytime changes coalesce into one off-peak gpu bake.
+# a dev -> main promotion builds missing candidates immediately and retries its readiness gate.
 
 on:
   push:
@@ -11,11 +12,12 @@ on:
       - .github/workflows/worker-image.yml
       - .github/workflows/bake-kernel-cache.yml
       - .github/workflows/dev-kernel-cache.yml
-      - docker/kernel_fingerprint.py
-      - docker/make_rp_handler.py
-      - docker/extract_cudart_fix.py
+      - docker/**
       - flash/**
       - pyproject.toml
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened, ready_for_review]
   schedule:
     # 09:00 utc is 01:00 pst / 02:00 pdt.
     - cron: "0 9 * * *"
@@ -33,7 +35,15 @@ permissions:
   packages: write
 
 concurrency:
-  group: dev-kernel-cache
+  # metadata pushes and rejected PRs must not replace a queued bake in the pending slot.
+  group: >-
+    dev-kernel-cache-${{
+      (github.event_name == 'workflow_dispatch' ||
+       (github.event_name == 'pull_request' &&
+        github.event.pull_request.head.repo.full_name == github.repository &&
+        github.event.pull_request.head.ref == 'dev' && !github.event.pull_request.draft))
+      && 'build' || 'detect'
+    }}
   cancel-in-progress: false
 
 jobs:
@@ -48,7 +58,11 @@ jobs:
         run: gh workflow run dev-kernel-cache.yml --repo "$GITHUB_REPOSITORY" --ref dev
 
   detect:
-    if: github.repository == 'freesolo-co/flash' && github.event_name != 'schedule'
+    if: >-
+      github.repository == 'freesolo-co/flash' && github.event_name != 'schedule' &&
+      (github.event_name != 'pull_request' ||
+       (github.event.pull_request.head.repo.full_name == github.repository &&
+        github.event.pull_request.head.ref == 'dev' && !github.event.pull_request.draft))
     runs-on: ubuntu-latest
     timeout-minutes: 15
     outputs:
@@ -63,7 +77,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ github.sha }}
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
 
       - name: Resolve source metadata
         id: source
@@ -143,7 +157,7 @@ jobs:
 
   build-base:
     needs: detect
-    if: github.event_name == 'workflow_dispatch' && needs.detect.outputs.needs_bake == 'true'
+    if: (github.event_name == 'workflow_dispatch' || github.event_name == 'pull_request') && needs.detect.outputs.needs_bake == 'true'
     uses: ./.github/workflows/worker-image.yml
     with:
       tag: cu128-dev-${{ needs.detect.outputs.revision }}
@@ -152,11 +166,11 @@ jobs:
 
   bake:
     needs: [detect, build-base]
-    if: github.event_name == 'workflow_dispatch' && needs.detect.outputs.needs_bake == 'true'
+    if: (github.event_name == 'workflow_dispatch' || github.event_name == 'pull_request') && needs.detect.outputs.needs_bake == 'true'
     uses: ./.github/workflows/bake-kernel-cache.yml
     with:
       sms: ${{ needs.detect.outputs.sms }}
-      deadline_minutes: ${{ fromJSON(format('{0}', inputs.deadline_minutes)) }}
+      deadline_minutes: ${{ fromJSON(github.event_name == 'pull_request' && '90' || format('{0}', inputs.deadline_minutes)) }}
       fp_cache: ${{ needs.build-base.outputs.fp_cache }}
       fp_base: ${{ needs.build-base.outputs.fp_base }}
       base_ref: ${{ needs.build-base.outputs.base_ref }}
@@ -166,7 +180,7 @@ jobs:
 
   publish-ready:
     needs: [detect, bake]
-    if: github.event_name == 'workflow_dispatch' && needs.detect.outputs.needs_bake == 'true'
+    if: (github.event_name == 'workflow_dispatch' || github.event_name == 'pull_request') && needs.detect.outputs.needs_bake == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -213,7 +227,26 @@ jobs:
               "$repo:cu128-dev-ready-$sm"
           done
 
-      - name: Re-run production readiness for dev
+  refresh-readiness:
+    needs: [detect, publish-ready]
+    # a queued revision may find compatible caches published by the preceding bake.
+    # always() permits the skipped publication dependency; failed/cancelled work stays red.
+    if: >-
+      always() && !cancelled() && needs.detect.result == 'success' &&
+      (github.event_name == 'workflow_dispatch' || github.event_name == 'pull_request') &&
+      (needs.detect.outputs.needs_bake == 'false' || needs['publish-ready'].result == 'success')
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Re-run failed production readiness for this revision
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: gh workflow run production-kernel-cache-ready.yml --repo "$GITHUB_REPOSITORY" --ref dev
+          REVISION: ${{ needs.detect.outputs.revision }}
+        run: |
+          set -euo pipefail
+          runs=$(gh run list --repo "$GITHUB_REPOSITORY" \
+            --workflow production-kernel-cache-ready.yml --commit "$REVISION" \
+            --event pull_request --status failure --json databaseId --jq '.[].databaseId')
+          for run_id in $runs; do
+            gh run rerun "$run_id" --repo "$GITHUB_REPOSITORY" --failed
+          done
