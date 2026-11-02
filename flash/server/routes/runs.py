@@ -588,7 +588,14 @@ def run_checkpoints(run_id: str, key: Annotated[dict, Depends(require_key)]):
     from flash.runner.lifecycle.state import _internal_spec_from_status
 
     spec = _internal_spec_from_status(status)
-    checkpoints = checkpoint_service.list_checkpoints(spec)
+    try:
+        checkpoints = checkpoint_service.list_checkpoints(spec, strict=True)
+    except checkpoint_service.CheckpointListingError:
+        # a failed artifact listing is not "this run has no checkpoints" (which reads as lost).
+        raise HTTPException(
+            status_code=503,
+            detail=f"could not list checkpoints for run {run_id} right now; retry shortly",
+        ) from None
     with contextlib.suppress(Exception):
         from flash.server.domain.registry.checkpoints import register_checkpoints_best_effort
 

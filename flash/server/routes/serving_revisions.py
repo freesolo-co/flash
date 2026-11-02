@@ -79,7 +79,14 @@ def _resolve_deploy_step(run_id: str, spec, checkpoint_id: object) -> int | None
     step = parsed[1]
     if step is None:
         return None
-    checkpoints = run_checkpoints.list_checkpoints(spec)
+    try:
+        checkpoints = run_checkpoints.list_checkpoints(spec, strict=True)
+    except run_checkpoints.CheckpointListingError:
+        # do not turn a transient listing failure into "no deployable checkpoint (available: none)"
+        raise HTTPException(
+            status_code=503,
+            detail=f"could not list checkpoints for run {run_id} right now; retry shortly",
+        ) from None
     if any(candidate["step"] == step for candidate in checkpoints):
         return step
     available = ", ".join(str(candidate["step"]) for candidate in checkpoints) or "none"

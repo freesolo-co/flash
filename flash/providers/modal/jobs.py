@@ -147,10 +147,15 @@ def poll(handle, spec, *, log=None, deadline_at=None):
 
         try:
             notes = checkpoint_upload.finish(h, spec, deadline_at=deadline_at)
-        except (api.ModalApiError, TimeoutError):
-            return PollResult(
-                False, failure="job_preempted", detail="Final CPU checkpoint publication failed"
+        except (api.ModalApiError, TimeoutError) as exc:
+            # training completed and the handoff Volume is preserved; this is an upload failure
+            # (finish already retried it), not a preemption -- report it as its own category.
+            detail = (
+                str(exc)
+                if isinstance(exc, checkpoint_upload.CheckpointUploadError)
+                else "Final CPU checkpoint publication failed"
             )
+            return PollResult(False, failure="checkpoint_upload_failed", detail=detail)
         result.metrics.setdefault("notes", {}).update(notes)
     return result
 

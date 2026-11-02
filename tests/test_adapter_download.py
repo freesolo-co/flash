@@ -103,7 +103,7 @@ def test_download_step_requires_known_artifact_and_final_requires_finished_run(
     status = runner_status.get_status(run_id)
     status.state = "running"
     runner_state._save_status(status)
-    monkeypatch.setattr(checkpoints, "list_checkpoints", lambda spec: [{"step": 12}])
+    monkeypatch.setattr(checkpoints, "list_checkpoints", lambda spec, **_kwargs: [{"step": 12}])
     url = f"/v1/runs/{run_id}/adapter"
     for target, expected in (("final", 409), ("step-9", 404), ("step-12", 200)):
         response = api.get(

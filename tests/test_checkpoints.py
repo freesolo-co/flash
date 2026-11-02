@@ -569,7 +569,7 @@ def test_best_effort_noop_without_internal_key(monkeypatch):
 
     monkeypatch.delenv("FREESOLO_INTERNAL_KEY", raising=False)
     # Even if Azure had checkpoints, no internal key => skip persistence (Azure stays source of truth).
-    monkeypatch.setattr(ck, "list_checkpoints", lambda spec: _CKPTS)
+    monkeypatch.setattr(ck, "list_checkpoints", lambda spec, **_kwargs: _CKPTS)
     assert ck.register_checkpoints_best_effort(_status()) == 0
 
 
@@ -577,7 +577,7 @@ def test_best_effort_registers(monkeypatch):
     import flash.server.domain.registry.checkpoints as ck
 
     monkeypatch.setenv("FREESOLO_INTERNAL_KEY", "int-key")
-    monkeypatch.setattr(ck, "list_checkpoints", lambda spec: _CKPTS)
+    monkeypatch.setattr(ck, "list_checkpoints", lambda spec, **_kwargs: _CKPTS)
     posted = {}
     monkeypatch.setattr(
         ck, "_post_checkpoints", lambda *, token, body: posted.update(body=body) or {}
@@ -594,7 +594,7 @@ def test_best_effort_swallows_backend_failure(monkeypatch):
     import flash.server.domain.registry.checkpoints as ck
 
     monkeypatch.setenv("FREESOLO_INTERNAL_KEY", "int-key")
-    monkeypatch.setattr(ck, "list_checkpoints", lambda spec: _CKPTS)
+    monkeypatch.setattr(ck, "list_checkpoints", lambda spec, **_kwargs: _CKPTS)
 
     def boom(*, token, body):
         raise urllib.error.URLError("backend down")
@@ -639,7 +639,7 @@ def test_best_effort_no_checkpoints(monkeypatch):
     import flash.server.domain.registry.checkpoints as ck
 
     monkeypatch.setenv("FREESOLO_INTERNAL_KEY", "int-key")
-    monkeypatch.setattr(ck, "list_checkpoints", lambda spec: [])
+    monkeypatch.setattr(ck, "list_checkpoints", lambda spec, **_kwargs: [])
     assert ck.register_checkpoints_best_effort(_status()) == 0
 
 

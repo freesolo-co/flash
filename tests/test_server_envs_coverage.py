@@ -360,7 +360,7 @@ def test_validate_hf_repo_id_accepts_valid_and_rejects_malformed():
 
 def test_resolve_deploy_step_branches(monkeypatch):
     monkeypatch.setattr(
-        run_checkpoints, "list_checkpoints", lambda spec: [{"step": 20}, {"step": 40}]
+        run_checkpoints, "list_checkpoints", lambda spec, **_kwargs: [{"step": 20}, {"step": 40}]
     )
 
     # a permanent checkpoint id is mandatory at this boundary.
