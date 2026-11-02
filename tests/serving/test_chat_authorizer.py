@@ -31,6 +31,7 @@ from unittest.mock import MagicMock
 import pytest
 from fastapi.testclient import TestClient
 
+from flash.serving.src.http import authorization_transport
 from flash.serving.src.http.rate_limit import allow_offline_inference
 from flash.serving.src.http.router import (
     AdapterRouter,
@@ -39,6 +40,12 @@ from flash.serving.src.http.router import (
 )
 from flash.serving.src.io.schemas import AdapterRecord
 from tests.serving.conftest import RecordingUsageStore, attest
+
+
+@pytest.fixture(autouse=True)
+def immediate_auth_retry_delays(monkeypatch):
+    # Cache/status tests exercise all attempts without waiting through a real rollout.
+    monkeypatch.setattr(authorization_transport.random, "uniform", lambda *_: 0)
 
 
 def _passthrough_decorator(*_a: Any, **_k: Any):
@@ -244,8 +251,8 @@ class _CountingPool:
             },
         )
 
-    async def stream_generate(self, *_a, **_k):  # pragma: no cover - unused here
-        yield {"type": "final", "finish_reason": "stop", "prompt_tokens": 1, "completion_tokens": 1}
+    async def stream_generate(self, *args, **kwargs):
+        yield {**await self.generate(*args, **kwargs), "type": "final"}
 
     async def register(self, _base_model, _record) -> None:  # pragma: no cover - unused here
         return None
@@ -400,11 +407,15 @@ def test_failed_authorization_is_not_cached(modal_app_module, monkeypatch):
 
     from fastapi import HTTPException
 
-    # Both attempts fail 500 (-> 503), next lookup 200: the failure must NOT be cached, so the next
+    # All attempts fail 500 (-> 503), next lookup 200: the failure must NOT be cached, so the next
     # call re-checks the backend and succeeds (a transient blip doesn't poison the cache).
     calls = _counting_client(
         monkeypatch,
-        lambda n: _FakeResp(500, {}) if n <= 2 else _FakeResp(200, {"orgId": "org-1"}),
+        lambda n: (
+            _FakeResp(500, {})
+            if n <= authorization_transport._ATTEMPTS
+            else _FakeResp(200, {"orgId": "org-1"})
+        ),
     )
     authorize = _new_authorizer(modal_app_module)
 
@@ -416,7 +427,7 @@ def test_failed_authorization_is_not_cached(modal_app_module, monkeypatch):
 
     org = asyncio.run(run())
     assert org.principal.orgId == "org-1"
-    assert calls["n"] == 3
+    assert calls["n"] == authorization_transport._ATTEMPTS + 1
 
 
 _EMPTY_SCOPE_DIGEST = hashlib.sha256(b"").hexdigest()
@@ -672,7 +683,9 @@ def test_transient_refresh_retains_only_unexpired_approval(modal_app_module, mon
         assert cache[key] == (expiry, approved)
         for _ in range(20):
             assert await authorize("key", _QWEN) == approved
-        assert calls["n"] == 3  # one approval, two refresh attempts, then cooldown
+        assert (
+            calls["n"] == authorization_transport._ATTEMPTS + 1
+        )  # approval + refresh, then cooldown
         cache[key] = (float("-inf"), approved)
         with pytest.raises(HTTPException):
             await authorize("key", _QWEN)
@@ -729,3 +742,35 @@ def test_retry_can_never_override_a_later_denial(modal_app_module, monkeypatch):
 
     asyncio.run(run())
     assert calls["n"] == 2
+
+
+@pytest.mark.parametrize("stream", [False, True])
+def test_chat_waits_for_authorization_backend_rollout(modal_app_module, monkeypatch, stream):
+    """A cold router must wait through more than two pre-admission 502s."""
+    from flash.serving.src.http import authorization_transport
+
+    monkeypatch.setattr(authorization_transport.random, "uniform", lambda *_: 0)
+    calls = _counting_client(
+        monkeypatch,
+        lambda n: _FakeResp(502, {}) if n <= 3 else _FakeResp(200, {"orgId": "org-1"}),
+    )
+    authorize = _new_authorizer(modal_app_module)
+    pool = _CountingPool()
+    store = RecordingUsageStore()
+    with _base_model_client(authorize, pool, usage_store=store) as client:
+        response = client.post(
+            "/v1/chat/completions",
+            json={
+                "model": _QWEN,
+                "messages": [{"role": "user", "content": "hi"}],
+                "stream": stream,
+            },
+            headers={"Authorization": "Bearer fs-user-key"},
+        )
+    assert response.status_code == 200, response.text
+    if stream:
+        assert "data: [DONE]" in response.text
+        assert '"error"' not in response.text
+    assert calls["n"] == 4
+    assert pool.generate_calls == 1
+    assert len(store.finalized) == 1
