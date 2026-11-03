@@ -64,8 +64,8 @@ SERVING_MODELS: list[dict[str, Any]] = [
             "max_cpu_loras": 4,
             "max_lora_rank": 64,
             "max_model_len": 262144,
-            # L4 sweep: 32 sequences improve short-prompt throughput ~2.4x over eight.
-            "max_num_seqs": 32,
+            # L4 sweep: 64 sequences improve short/4k throughput ~3x/~1.6x over eight.
+            "max_num_seqs": 64,
             "enforce_eager": False,
             "reasoning_parser": "qwen3",
         },
@@ -132,6 +132,9 @@ SERVING_MODELS: list[dict[str, Any]] = [
             # Matched-load H100 sweep: 64 improves both short and 4k prompts;
             # 128 regresses the 4k workload. benchmark_qwen_serving.py reproduces it.
             "max_num_seqs": 64,
+            # Larger prefill chunks add ~8% at 4k and improve the mixed LoRA wave;
+            # the full 64-request 32k-prompt LoRA stress also passes at this budget.
+            "max_num_batched_tokens": 8192,
             "enforce_eager": False,
             "reasoning_parser": "qwen3",
         },
