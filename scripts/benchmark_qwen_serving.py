@@ -3,6 +3,7 @@
 Run: modal run scripts/benchmark_qwen_serving.py --base-model Qwen/Qwen3.5-9B-Base
 Use --caps and --concurrency to compare scheduler caps at the same offered load.
 Use --profile stress to add mixed lengths and a full-cap 32k LoRA burst.
+Use --profile sweep-stress for both, and --token-budget to vary chunked prefill.
 QWEN_BENCH_IMAGE_ID optionally reuses an already-built serving image.
 Each sequence cap gets a fresh single-use GPU. Results exclude startup and report
 aggregate output tokens / wall seconds for a concurrent wave, not summed per-request
@@ -39,13 +40,15 @@ if image_id := os.environ.get("QWEN_BENCH_IMAGE_ID"):
     timeout=3600,
     volumes={"/vol/hosting-cache": hf_cache_volume},
 )
-async def measure(model, sequence_cap, offered_concurrency, profile):
+async def measure(model, sequence_cap, offered_concurrency, profile, token_budget):
     from vllm import SamplingParams
 
     from flash.serving.src.engine import model_config
     from flash.serving.src.engine.lora_engine import _LoraEngineImpl
 
     model_config._BY_MODEL[model]["engine"]["max_num_seqs"] = sequence_cap
+    if token_budget:
+        model_config._BY_MODEL[model]["engine"]["max_num_batched_tokens"] = token_budget
     engine = _LoraEngineImpl()
     engine.base_model = model
     start = time.monotonic()
@@ -174,7 +177,7 @@ async def measure(model, sequence_cap, offered_concurrency, profile):
         row = await wave(min(sequence_cap, 8) if length == 32768 else sequence_cap, length, lora)
         results.append(row)
         print("BENCH", json.dumps({"sequence_cap": sequence_cap, **row}), flush=True)
-    if profile == "stress":
+    if profile in ("stress", "sweep-stress"):
         for length in ([512] * 11 + [4096] * 4 + [32768], 32768):
             row = await wave(sequence_cap, length, lora)
             results.append(row)
@@ -183,6 +186,7 @@ async def measure(model, sequence_cap, offered_concurrency, profile):
         "model": model,
         "sequence_cap": sequence_cap,
         "profile": profile,
+        "token_budget_override": token_budget or None,
         "boot_seconds": boot,
         "health": engine._health(),
         "measurements": results,
@@ -199,12 +203,15 @@ def main(
     caps: str = "32,64,128",
     concurrency: str = "1,16,32,64,128",
     profile: str = "sweep",
+    token_budget: int = 0,
     output: str = "results/qwen-throughput.json",
 ):
     if base_model not in base_models():
         raise ValueError(f"Unknown hosted Qwen model: {base_model}")
-    if profile not in ("sweep", "stress"):
-        raise ValueError("Profile must be sweep or stress")
+    if profile not in ("sweep", "stress", "sweep-stress"):
+        raise ValueError("Profile must be sweep, stress, or sweep-stress")
+    if token_budget and not 2048 <= token_budget <= 32768:
+        raise ValueError("Token budget must be 0 (catalog default) or between 2048 and 32768")
     sequence_caps = [int(value) for value in caps.split(",")]
     if not sequence_caps or any(value < 1 or value > 128 for value in sequence_caps):
         raise ValueError("Sequence caps must be between 1 and 128")
@@ -217,6 +224,9 @@ def main(
     path.parent.mkdir(parents=True, exist_ok=True)
     results = []
     for cap in sequence_caps:
-        results.append(benchmark.remote(base_model, cap, offered_concurrency, profile))
+        print(f"Starting {base_model}: cap={cap}, profile={profile}, token_budget={token_budget}")
+        results.append(
+            benchmark.remote(base_model, cap, offered_concurrency, profile, token_budget)
+        )
         path.write_text(json.dumps(results, indent=2) + "\n")
         print(f"Saved {base_model} sequence-cap {cap} measurements to {path}", flush=True)
