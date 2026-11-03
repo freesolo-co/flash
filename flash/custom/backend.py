@@ -50,6 +50,7 @@ class TorchBackend:
         return validate_operation(self, operation, arguments)
 
     def execute(self, operation, arguments):
+        _ensure_cuda_headroom()
         return getattr(self, operation)(**arguments)
 
     def _tensor(self, tokens):
@@ -269,6 +270,35 @@ class TorchBackend:
     def close(self):
         self.zero_grad()
         return {}
+
+
+# cuBLAS handle/workspace creation and Triton kernels allocate outside PyTorch's caching
+# allocator, so they need memory the driver can still hand out.
+CUDA_HEADROOM_BYTES = 6 * 1024**3
+
+
+def _ensure_cuda_headroom(min_free_bytes=CUDA_HEADROOM_BYTES):
+    """Return PyTorch's unused cached blocks to the driver when free GPU memory runs low.
+
+    A session's operations see many sequence lengths, so cached blocks rarely fit the next
+    request and the caching allocator keeps reserving: a resumed Qwen3.5-9B DPO session held
+    ~78 GiB reserved with only ~19 GiB allocated. The first backward then needed memory outside
+    that cache (cuBLAS handle creation, Triton kernels) and failed with CUBLAS_STATUS_ALLOC_FAILED
+    / "Triton Error [CUDA]: out of memory" at <1 GiB free. Releasing the cache before an operation
+    restores that headroom; it changes no tensors. Best effort, a no-op without CUDA.
+    """
+    try:
+        import torch
+
+        if not torch.cuda.is_available():
+            return False
+        free, _ = torch.cuda.mem_get_info()
+        if free >= min_free_bytes:
+            return False
+        torch.cuda.empty_cache()
+        return True
+    except Exception:
+        return False
 
 
 def _enable_checkpointing(model):

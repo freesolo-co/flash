@@ -135,10 +135,12 @@ def build_worker_env(
     # leaves rollout.enable_sleep_mode defaulted True, so the engine always builds a
     # CuMemAllocator -- which asserts outright on "expandable_segments:True"
     # (vllm/device_allocator/cumem.py:132, pytorch#147851). Both therefore take the
-    # non-expandable conf.
+    # non-expandable conf. SFT and custom runs never build a vLLM engine (custom samples with
+    # HF generate), so they take expandable segments: a custom session's varied sequence lengths
+    # otherwise fragment the caching allocator until cuBLAS/Triton allocations outside it fail.
     _alloc_conf = (
         "expandable_segments:True"
-        if str(getattr(spec, "algorithm", "")).lower() == "sft"
+        if str(getattr(spec, "algorithm", "")).lower() in ("sft", "custom")
         else "garbage_collection_threshold:0.8,max_split_size_mb:256"
     )
     env: dict[str, str] = {

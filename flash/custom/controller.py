@@ -10,7 +10,7 @@ import uuid
 from pathlib import Path
 
 from flash.client import client_from_config
-from flash.client.http import ApiError, ClientError
+from flash.client.http import ApiError, ClientError, RequestTimeoutError, ServiceUnreachableError
 from flash.client.specs import spec_payload
 from flash.custom.async_client import AsyncTrainingClient
 from flash.custom.client import TrainingClient
@@ -64,15 +64,16 @@ _ATTACH_RETRY_MAX_SECONDS = 30.0
 def _transient_attach_error(exc):
     """Whether a failed attach lookup can be retried rather than ending the run.
 
-    425 is the documented "GPU still provisioning" answer. A 5xx or a transport failure (no
-    status) means the control plane could not answer this time -- for example a slow Modal
+    425 is the documented "GPU still provisioning" answer. A 5xx or a typed transport failure
+    means the control plane could not answer this time -- for example a slow Modal
     tunnel lookup or an overloaded plane -- not that the run is gone. Treating those as fatal made
-    run_custom cancel healthy runs. Every other 4xx (ended run, auth, ownership) stays fatal.
+    run_custom cancel healthy runs. Every other 4xx (ended run, auth, ownership) and untyped
+    ClientError (such as a malformed successful response) stays fatal.
     """
     if isinstance(exc, ApiError):
         status = exc.status or 0
         return status == 425 or status >= 500
-    return isinstance(exc, ClientError)
+    return isinstance(exc, (RequestTimeoutError, ServiceUnreachableError))
 
 
 def connect(api, run_id, *, timeout=1200, sleep=time.sleep, clock=time.monotonic):
