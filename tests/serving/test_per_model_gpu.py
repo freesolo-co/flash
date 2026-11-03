@@ -443,7 +443,7 @@ def test_one_engine_class_per_distinct_engine_key(modal_app_module):
     assert set(modal_app_module.ENGINE_BY_KEY) == {
         ("L4", 64),
         ("L40S", 8),
-        ("L40S", 16),
+        ("L40S", 32),
         ("H100", 8),
         ("H100", 64),
         ("H200", 8),
@@ -479,7 +479,7 @@ def test_class_names_are_distinct_and_modal_safe(modal_app_module):
     [
         ("Qwen/Qwen3.5-0.8B", "L4", 64),
         ("Qwen/Qwen3.5-4B", "L40S", 8),
-        ("Qwen/Qwen3.5-9B", "L40S", 16),
+        ("Qwen/Qwen3.5-9B", "L40S", 32),
         ("Qwen/Qwen3.5-9B-Base", "H100", 64),
         ("Qwen/Qwen3.8-27B", "H100", 8),
         ("Qwen/Qwen3.6-35B-A3B", "H200", 8),
@@ -914,7 +914,7 @@ def test_load_prequant_checkpoint_for_9b(modal_app_module, monkeypatch, tmp_path
     assert args.max_loras == 16
     assert args.max_lora_rank == 128
     assert args.max_model_len == 262144
-    assert args.max_num_seqs == 16
+    assert args.max_num_seqs == 32
     assert args.gpu_memory_utilization == 0.90  # 0.90 leaves CUDA-graph capture headroom (was 0.98)
     assert args.enforce_eager is False  # CUDA graphs ON: ~10x faster decode on the hybrid GDN model
     assert getattr(args, "max_num_batched_tokens", None) is None

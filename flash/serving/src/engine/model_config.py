@@ -106,9 +106,9 @@ SERVING_MODELS: list[dict[str, Any]] = [
             "max_loras": 16,
             "max_lora_rank": 128,  # rank-128 / 16 hot LoRAs (cheap on the 9 GiB FP8 9B); native 256k context.
             "max_model_len": 262144,
-            # L40S throughput + rank-128/32k-prompt sweep qualified sixteen sequences.
-            # Thirty-two 32k prompts exceed this tier's measured ~780k-token KV capacity.
-            "max_num_seqs": 16,
+            # L40S: 32 improves short/4k throughput ~61%/~28% over sixteen and
+            # completes a full 32-request 32k-prompt rank-128 q_proj LoRA burst.
+            "max_num_seqs": 32,
             "enforce_eager": False,
             "reasoning_parser": "qwen3",
         },

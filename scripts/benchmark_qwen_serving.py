@@ -5,7 +5,8 @@ Use --caps and --concurrency to compare scheduler caps at the same offered load.
 Use --profile stress to add mixed lengths and a full-cap 32k LoRA burst.
 Use --profile sweep-stress for both, and --token-budget to vary chunked prefill.
 QWEN_BENCH_IMAGE_ID optionally reuses an already-built serving image.
-Each sequence cap gets a fresh single-use GPU. Results exclude startup and report
+--hold-gpu restarts engines within one allocation instead of requeueing between caps.
+By default each sequence cap gets a fresh single-use GPU. Results exclude startup and report
 aggregate output tokens / wall seconds for a concurrent wave, not summed per-request
 rates. Unique cache salts prevent repeated prompts from inflating prefix-cache gains.
 The adapter check uses a synthetic zero q_proj LoRA at the supported rank; it is a
@@ -197,6 +198,41 @@ async def measure(model, sequence_cap, offered_concurrency, profile, token_budge
     return result
 
 
+@app.function(
+    image=image,
+    secrets=engine_secrets,
+    max_containers=1,
+    buffer_containers=0,
+    single_use_containers=True,
+    timeout=7200,
+    volumes={"/vol/hosting-cache": hf_cache_volume},
+)
+async def measure_matrix(model, sequence_caps, offered_concurrency, profile, token_budget):
+    import gc
+
+    results = []
+    for cap in sequence_caps:
+        result = await measure.local(model, cap, offered_concurrency, profile, token_budget)
+        results.append(result)
+        print("CAP_RESULT", json.dumps(result), flush=True)
+        # Each vLLM EngineCore is a separate child process and shutdown waits for
+        # it to exit. Reclaim parent references, then reject a leaked GPU allocation
+        # instead of allowing it to bias the next engine's memory profiling.
+        gc.collect()
+        await asyncio.sleep(1)
+        used = (
+            await asyncio.to_thread(
+                subprocess.check_output,
+                ["nvidia-smi", "--query-gpu=memory.used", "--format=csv,noheader,nounits"],
+                text=True,
+            )
+        ).strip()
+        print("GPU_AFTER_SHUTDOWN_MIB", used, flush=True)
+        if any(int(value) > 1024 for value in used.splitlines()):
+            raise RuntimeError("Engine shutdown retained more than 1 GiB of GPU memory")
+    return results
+
+
 @app.local_entrypoint()
 def main(
     base_model: str = "Qwen/Qwen3.5-9B-Base",
@@ -204,6 +240,7 @@ def main(
     concurrency: str = "1,16,32,64,128",
     profile: str = "sweep",
     token_budget: int = 0,
+    hold_gpu: bool = False,
     output: str = "results/qwen-throughput.json",
 ):
     if base_model not in base_models():
@@ -219,12 +256,23 @@ def main(
     if not offered_concurrency or any(value < 1 or value > 128 for value in offered_concurrency):
         raise ValueError("Offered concurrency must be between 1 and 128")
     gpu = gpu_for(base_model)
-    benchmark = measure.with_options(gpu="H100!" if gpu == "H100" else gpu, region="us")
     path = Path(output)
     path.parent.mkdir(parents=True, exist_ok=True)
+    if hold_gpu:
+        benchmark = measure_matrix.with_options(gpu="H100!" if gpu == "H100" else gpu, region="us")
+        results = benchmark.remote(
+            base_model, sequence_caps, offered_concurrency, profile, token_budget
+        )
+        path.write_text(json.dumps(results, indent=2) + "\n")
+        print(f"Saved {base_model} matrix measurements to {path}", flush=True)
+        return
+    benchmark = measure.with_options(gpu="H100!" if gpu == "H100" else gpu, region="us")
     results = []
     for cap in sequence_caps:
-        print(f"Starting {base_model}: cap={cap}, profile={profile}, token_budget={token_budget}")
+        print(
+            f"Starting {base_model}: cap={cap}, profile={profile}, token_budget={token_budget}",
+            flush=True,
+        )
         results.append(
             benchmark.remote(base_model, cap, offered_concurrency, profile, token_budget)
         )

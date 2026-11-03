@@ -129,7 +129,7 @@ def test_9b_has_l40s_rank128_serving_overrides() -> None:
     assert ov["max_loras"] == 16
     assert ov["max_lora_rank"] == 128
     assert ov["max_model_len"] == 262144
-    assert ov["max_num_seqs"] == 16
+    assert ov["max_num_seqs"] == 32
     assert gpu_for("Qwen/Qwen3.5-9B") == "L40S"
     assert ov["gpu_memory_utilization"] == 0.90
     assert (
