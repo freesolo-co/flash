@@ -354,6 +354,22 @@ def test_alloc_conf_default_expandable_for_sft(monkeypatch):
     assert env["PYTORCH_ALLOC_CONF"] == "expandable_segments:True"
 
 
+def test_alloc_conf_expandable_for_custom(monkeypatch):
+    # custom runs build no vLLM engine; without expandable segments a session's varied sequence
+    # lengths fragment the cache until cuBLAS/Triton allocations outside it fail.
+    from flash.core.spec import JobSpec, TrainSpec
+    from flash.providers._lifecycle.net.worker import build_worker_env
+
+    monkeypatch.delenv("PYTORCH_ALLOC_CONF", raising=False)
+    monkeypatch.delenv("PYTORCH_CUDA_ALLOC_CONF", raising=False)
+    spec = JobSpec(
+        model="Qwen/Qwen3.5-9B", algorithm="custom", train=TrainSpec(max_steps=4), seed=0
+    )
+    env = build_worker_env(spec)
+    assert env["PYTORCH_CUDA_ALLOC_CONF"] == "expandable_segments:True"
+    assert env["PYTORCH_ALLOC_CONF"] == env["PYTORCH_CUDA_ALLOC_CONF"]
+
+
 def test_error_artifact_name_is_per_phase_and_attempt():
     """Error files are scoped per-phase and per-attempt so a stale prior-attempt
     traceback can't be mistaken for the current attempt's crash on a retry."""
