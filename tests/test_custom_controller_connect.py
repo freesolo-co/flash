@@ -2,7 +2,13 @@
 
 import pytest
 
-from flash.client.http import ApiError, ClientError
+from flash.client.http import (
+    ApiClient,
+    ApiError,
+    ClientError,
+    RequestTimeoutError,
+    ServiceUnreachableError,
+)
 from flash.custom import controller
 
 
@@ -73,7 +79,9 @@ def test_provisioning_then_ready(clock):
         ApiError(500, "Internal Server Error"),
         ApiError(502, "Bad Gateway"),
         ApiError(503, "Service Unavailable"),
-        ClientError("request to the Flash service timed out"),
+        ApiError(504, "Gateway Timeout"),
+        RequestTimeoutError("request to the Flash service timed out"),
+        ServiceUnreachableError("connection reset"),
     ],
 )
 def test_transient_control_plane_failures_are_retried(clock, transient):
@@ -90,6 +98,21 @@ def test_backoff_is_capped(clock):
     api = FakeApi([ApiError(500, "boom")] * 8 + [CONNECTION])
     attach(api, clock, timeout=3600)
     assert max(clock.sleeps) == controller._ATTACH_RETRY_MAX_SECONDS
+
+
+@pytest.mark.parametrize("body", [b"<html>wrong service</html>", b"[]", b"null"])
+def test_malformed_control_plane_response_fails_without_retry(clock, body):
+    decoder = ApiClient("https://plane.example", "test-key")
+    with pytest.raises(ClientError) as decoded:
+        decoder._decode_response("/v1/runs/run-1/custom", body)
+    api = FakeApi([decoded.value, CONNECTION])
+
+    with pytest.raises(ClientError) as caught:
+        attach(api, clock)
+
+    assert caught.value is decoded.value
+    assert api.calls == 1
+    assert clock.sleeps == []
 
 
 @pytest.mark.parametrize("status", [400, 401, 403, 404, 409])
