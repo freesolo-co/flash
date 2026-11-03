@@ -17,6 +17,7 @@ from flash.content.image_descriptors import MAX_IMAGES_PER_CONVERSATION
 from flash.content.reasoning_normalization import (
     messages_for_chat_template as _messages_for_chat_template,
 )
+from flash.content.training_template import training_template_kwargs
 from flash.engine.worker.train.core.child.tool_messages import (
     TOOL_MESSAGE_KEYS,
     template_tool_messages,
@@ -282,17 +283,6 @@ def dedup_seam_terminator(response_ids: list[int], glue_ids: list[int]) -> list[
     return glue_ids
 
 
-def tool_template_kwargs(tools: list[dict] | None) -> dict[str, Any]:
-    """the ``tools=`` chat-template kwarg of a tool environment, and nothing for any other.
-
-    ``tools`` is already the serving wire form (``tools_wire(normalize_tools(...))``), so every
-    render that passes it -- prompt, glue, and the serving request -- sees identical declarations.
-    omitting the key, rather than passing ``tools=None``, keeps a tool-free render byte-identical
-    to the one before tools existed.
-    """
-    return {} if tools is None else {"tools": tools}
-
-
 class EnvGlueTokenizer:
     """derive exact inter-turn glue without re-rendering accepted transcript history."""
 
@@ -325,9 +315,7 @@ class EnvGlueTokenizer:
             ),
             add_generation_prompt=True,
             tokenize=False,
-            enable_thinking=self.thinking,
-            preserve_thinking=False,
-            **tool_template_kwargs(self.tools),
+            **training_template_kwargs(self.thinking, self.tools),
         )
         first = text.find(probe)
         if first == -1 or text.find(probe, first + len(probe)) != -1:

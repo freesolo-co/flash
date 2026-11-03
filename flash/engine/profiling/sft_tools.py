@@ -12,7 +12,10 @@ from __future__ import annotations
 
 from typing import Any
 
+from flash.content.training_template import training_template_kwargs as sft_template_kwargs
 from flash.serve.request.tool_calls import normalize_tools, tools_wire
+
+__all__ = ["reject_image_row_tools", "sft_row_tools", "sft_template_kwargs"]
 
 
 def sft_row_tools(example) -> list[dict[str, Any]] | None:
@@ -23,19 +26,6 @@ def sft_row_tools(example) -> list[dict[str, Any]] | None:
         return tools_wire(normalize_tools(example["tools"]))
     except ValueError as exc:
         raise ValueError(f"sft tools: {exc}") from exc
-
-
-def sft_template_kwargs(thinking: bool, tools: list[dict[str, Any]] | None) -> dict[str, Any]:
-    """Chat-template kwargs for every training view of a row.
-
-    The transcript, the prompt boundary, the reasoning probe and the loss mask's field probe all
-    render with these, so the supervised tokens are located in exactly the text that is trained on.
-    Without tools this is the pre-existing thinking-only render.
-    """
-    kwargs: dict[str, Any] = {"enable_thinking": thinking, "preserve_thinking": False}
-    if tools is not None:
-        kwargs["tools"] = tools
-    return kwargs
 
 
 def reject_image_row_tools(example, *, image_bearing: bool) -> None:

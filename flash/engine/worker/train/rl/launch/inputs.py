@@ -29,6 +29,7 @@ from flash.content.structured_outputs import (
     parse_structured_outputs,
 )
 from flash.content.thinking import messages_for_chat_template
+from flash.content.training_template import training_template_kwargs
 from flash.core.spec import DEFAULT_CREDIT_ASSIGNMENT, gpu_count_of
 from flash.engine.plan.recipe import RECIPE
 from flash.engine.plan.steps import (
@@ -41,7 +42,6 @@ from flash.engine.worker.io.heartbeat import liveness_heartbeat
 from flash.engine.worker.runtime.rng import backend_seed, seed_training_rngs
 from flash.engine.worker.runtime.state import WorkerContext
 from flash.engine.worker.train.core.child.glue import (
-    tool_template_kwargs,
     validate_glue_template,
 )
 from flash.engine.worker.train.core.rollout.generation import generation_eos_from_cached_config
@@ -358,9 +358,7 @@ def _build_grpo_prompts(
                 template_messages,
                 tokenize=False,
                 add_generation_prompt=True,
-                enable_thinking=context.config.thinking,
-                preserve_thinking=False,
-                **tool_template_kwargs(tools),
+                **training_template_kwargs(context.config.thinking, tools),
             )
             prompt_ids = list(tok(rendered, add_special_tokens=False).input_ids)
             prompt_len = len(prompt_ids)

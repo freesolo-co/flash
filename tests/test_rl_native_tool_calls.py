@@ -424,7 +424,7 @@ def test_tool_env_transcript_accepts_only_openai_tool_fields_on_their_roles():
                 "content": "",
                 "tool_calls": [dict(call, function={"name": "f", "arguments": "[1]"})],
             },
-            "must encode an object",
+            "must encode a JSON object",
         ),
         ({"role": "tool", "content": "x", "metadata": {}}, "unsupported transcript metadata"),
     ):
