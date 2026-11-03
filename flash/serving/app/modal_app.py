@@ -13,6 +13,7 @@ from typing import TYPE_CHECKING, Any
 import modal
 
 from flash.schema import parse_checkpoint_ref
+from flash.serving.app.rollout import LEGACY_ENGINE_KEYS, model_engine_name, warm_active_models
 from flash.serving.app.timeouts import (
     REQUEST_TIMEOUT_SECONDS,
     ROUTER_TIMEOUT_SECONDS,
@@ -363,11 +364,14 @@ def _build_engine(
     class_name: str,
     max_inputs: int,
     target_inputs: int,
+    *,
+    legacy: bool = False,
 ) -> Any:
     """Register one Modal ``@app.cls`` LoraEngine pinned to ``gpu``.
 
     Modal fixes a class's GPU at decoration time, so the H200 35B model and the L4 models need
-    distinct classes. The Modal entrypoints are defined fresh here (so each class owns its own method
+    distinct classes. Each model now has a stable class; tier classes remain for draining old
+    routers. The Modal entrypoints are defined fresh here (so each class owns its own method
     objects) and forward to the shared ``_``-prefixed impl on ``_LoraEngineImpl``.
 
     Class identity (name/qualname + module-global binding) is fixed BEFORE the class-level decorators
@@ -459,7 +463,7 @@ def _build_engine(
         region="us",
         secrets=engine_secrets,
         volumes={HOSTING_CACHE_MOUNT: hf_cache_volume},
-        scaledown_window=scaledown_window_for(gpu),
+        scaledown_window=60 if legacy else scaledown_window_for(gpu),
         startup_timeout=STARTUP_TIMEOUT_SECONDS,
         timeout=REQUEST_TIMEOUT_SECONDS,
         min_containers=MIN_CONTAINERS,
@@ -472,39 +476,41 @@ def _build_engine(
     return engine
 
 
-def _engine_key(base_model: str) -> tuple[str, int]:
-    """(gpu, max_inputs) — the identity of the engine CLASS a base model runs on."""
-    return gpu_for(base_model), _engine_concurrency(base_model)[0]
-
-
-def _distinct_engine_keys() -> list[tuple[str, int]]:
-    """Distinct (gpu, max_inputs) engine classes needed across the catalog, order-stable."""
-    keys: dict[tuple[str, int], None] = {}
-    for bm in base_models():
-        keys.setdefault(_engine_key(bm), None)
-    return list(keys)
-
-
-# One engine class per distinct (GPU tier, concurrency) — see _engine_concurrency for why max_inputs
-# is part of the class identity (Modal fixes concurrency per class).
+# Keep the deployed tier identities callable while pre-migration routers drain.
+# These are compatibility pools, never selected for new inference. Their zero floor
+# lets them disappear after old traffic stops; do not derive this list from the catalog.
 ENGINE_BY_KEY: dict[tuple[str, int], Any] = {
-    (gpu, mi): _build_engine(gpu, _engine_class_name(gpu, mi), mi, mi)
-    for (gpu, mi) in _distinct_engine_keys()
+    (gpu, mi): _build_engine(gpu, _engine_class_name(gpu, mi), mi, mi, legacy=True)
+    for (gpu, mi) in dict.fromkeys(LEGACY_ENGINE_KEYS.values())
+}
+
+
+# GPU and concurrency may change without deleting the identity old routers call.
+ENGINE_BY_MODEL: dict[str, Any] = {
+    bm: _build_engine(gpu_for(bm), model_engine_name(bm), *_engine_concurrency(bm))
+    for bm in base_models()
 }
 
 
 def _engine_cls_for(base_model: str) -> Any:
-    """The Modal LoraEngine class to run ``base_model`` on (its (GPU, concurrency) class)."""
-    return ENGINE_BY_KEY[_engine_key(base_model)]
+    """Stable model identity, with independently qualified hardware and concurrency."""
+    gpu_for(base_model)  # Reject unsupported models before dispatch.
+    return ENGINE_BY_MODEL[base_model]
 
 
 class _ModalEnginePool:
-    """Dispatches router calls to each base model's per-gpu-tier ``LoraEngine`` container."""
+    """Dispatches router calls through a stable, independently scaled model identity."""
 
     def __init__(self):
         from flash.serving.deepinfer.app.client import HostedDeepInfer
 
         self._deepinfer = HostedDeepInfer()
+
+    async def start(self):
+        await warm_active_models(
+            {bm: cls(base_model=bm) for bm, cls in ENGINE_BY_MODEL.items()},
+            {bm: ENGINE_BY_KEY[key](base_model=bm) for bm, key in LEGACY_ENGINE_KEYS.items()},
+        )
 
     async def aclose(self):
         await self._deepinfer.aclose()
@@ -869,6 +875,7 @@ def _base_model_records() -> list:
     nonpreemptible=True,  # a CPU-host interruption cannot resume an open token stream
     min_containers=1,  # one warm CPU front door (hardcoded; no deploy-time knob)
     buffer_containers=ROUTER_BUFFER_CONTAINERS,
+    startup_timeout=ROUTER_TIMEOUT_SECONDS + 60,  # warm active pools before accepting traffic
     timeout=ROUTER_TIMEOUT_SECONDS,  # must cover engine cold start (see ROUTER_TIMEOUT_SECONDS)
 )
 @modal.concurrent(max_inputs=MAX_INPUTS, target_inputs=TARGET_INPUTS)
@@ -918,16 +925,13 @@ def start_all(base_model: str | None = None) -> None:
     matching base model. This manual diagnostic can boot one model with ``--base-model`` or every
     catalog model without changing the scale-to-zero deployment.
     """
-    from flash.serving.src.engine.model_config import base_models, gpu_for
+    from flash.serving.src.engine.model_config import base_models
 
     started = {}
     failures: list[str] = []
     models = [base_model] if base_model else list(base_models())
     for bm in models:
-        # Each base model's engine lives on its (GPU tier, concurrency) class.
-        engine = modal.Cls.from_name(
-            APP_NAME, _engine_class_name(gpu_for(bm), _engine_concurrency(bm)[0])
-        )
+        engine = modal.Cls.from_name(APP_NAME, model_engine_name(bm))
         instance = engine(base_model=bm)
         started[bm] = instance.health.spawn()
     for bm, handle in started.items():
