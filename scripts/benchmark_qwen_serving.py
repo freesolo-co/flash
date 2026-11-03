@@ -4,6 +4,9 @@ Run: modal run scripts/benchmark_qwen_serving.py --base-model Qwen/Qwen3.5-9B-Ba
 Use --caps and --concurrency to compare scheduler caps at the same offered load.
 Use --profile stress to add mixed lengths and a full-cap 32k LoRA burst.
 Use --profile sweep-stress for both, and --token-budget to vary chunked prefill.
+Use --gpu-override to compare hardware without changing production routing.
+Use --hot-loras to measure a smaller GPU-resident adapter cache (zero keeps the catalog).
+Use --checkpoint with --checkpoint-revision for an immutable quantized candidate.
 QWEN_BENCH_IMAGE_ID optionally reuses an already-built serving image.
 --hold-gpu restarts engines within one allocation instead of requeueing between caps.
 By default each sequence cap gets a fresh single-use GPU. Results exclude startup and report
@@ -32,6 +35,34 @@ if image_id := os.environ.get("QWEN_BENCH_IMAGE_ID"):
     image = modal.Image.from_id(image_id).add_local_python_source("flash")
 
 
+async def generation_smokes(engine):
+    """Exercise ordinary detokenization and the preserved vision path separately from rates."""
+    from vllm import SamplingParams
+
+    prompts = {"text": "The capital of France is"}
+    if engine.processor is not None:
+        from PIL import Image
+
+        prompts["image"] = {
+            "prompt": "<|im_start|>user\n<|vision_start|><|image_pad|><|vision_end|>"
+            "Describe the image.<|im_end|>\n<|im_start|>assistant\n",
+            "multi_modal_data": {"image": Image.new("RGB", (64, 64), "blue")},
+        }
+    outputs = {}
+    for kind, prompt in prompts.items():
+        last = None
+        async with asyncio.timeout(120):
+            async for output in engine.engine.generate(
+                prompt, SamplingParams(temperature=0, max_tokens=64), "smoke-" + uuid.uuid4().hex
+            ):
+                last = output
+        if last is None or not last.finished or not last.outputs[0].token_ids:
+            raise RuntimeError(f"Incomplete {kind} generation smoke")
+        outputs[kind] = last.outputs[0].text
+    print("GENERATION_SMOKES", json.dumps(outputs), flush=True)
+    return outputs
+
+
 @app.function(
     image=image,
     secrets=engine_secrets,
@@ -41,13 +72,31 @@ if image_id := os.environ.get("QWEN_BENCH_IMAGE_ID"):
     timeout=3600,
     volumes={"/vol/hosting-cache": hf_cache_volume},
 )
-async def measure(model, sequence_cap, offered_concurrency, profile, token_budget):
+async def measure(
+    model,
+    sequence_cap,
+    offered_concurrency,
+    profile,
+    token_budget,
+    gpu_override="",
+    hot_loras=0,
+    checkpoint="",
+    checkpoint_revision="",
+):
     from vllm import SamplingParams
 
     from flash.serving.src.engine import model_config
     from flash.serving.src.engine.lora_engine import _LoraEngineImpl
 
     model_config._BY_MODEL[model]["engine"]["max_num_seqs"] = sequence_cap
+    if gpu_override:
+        model_config._BY_MODEL[model]["gpu"] = gpu_override
+    if hot_loras:
+        model_config._BY_MODEL[model]["engine"]["max_loras"] = hot_loras
+    if checkpoint:
+        model_config._BY_MODEL[model]["engine"].update(
+            serve_model_id=checkpoint, model_revision=checkpoint_revision, quantization=None
+        )
     if token_budget:
         model_config._BY_MODEL[model]["engine"]["max_num_batched_tokens"] = token_budget
     engine = _LoraEngineImpl()
@@ -106,7 +155,9 @@ async def measure(model, sequence_cap, offered_concurrency, profile, token_budge
 
         memory_before = gpu_memory()
         start = time.monotonic()
-        async with asyncio.timeout(240):
+        # Full-cap 32k bursts can take minutes on smaller GPUs. Measure that
+        # latency explicitly instead of confusing a four-minute cutoff with OOM.
+        async with asyncio.timeout(600):
             rows = await asyncio.gather(*(request(index) for index in range(concurrency)))
         elapsed = time.monotonic() - start
         return {
@@ -188,7 +239,12 @@ async def measure(model, sequence_cap, offered_concurrency, profile, token_budge
         "sequence_cap": sequence_cap,
         "profile": profile,
         "token_budget_override": token_budget or None,
+        "gpu_override": gpu_override or None,
+        "hot_loras_override": hot_loras or None,
+        "checkpoint_override": checkpoint or None,
+        "checkpoint_revision": checkpoint_revision or None,
         "boot_seconds": boot,
+        "generation_smokes": await generation_smokes(engine),
         "health": engine._health(),
         "measurements": results,
     }
@@ -207,12 +263,32 @@ async def measure(model, sequence_cap, offered_concurrency, profile, token_budge
     timeout=7200,
     volumes={"/vol/hosting-cache": hf_cache_volume},
 )
-async def measure_matrix(model, sequence_caps, offered_concurrency, profile, token_budget):
+async def measure_matrix(
+    model,
+    sequence_caps,
+    offered_concurrency,
+    profile,
+    token_budget,
+    gpu_override="",
+    hot_loras=0,
+    checkpoint="",
+    checkpoint_revision="",
+):
     import gc
 
     results = []
     for cap in sequence_caps:
-        result = await measure.local(model, cap, offered_concurrency, profile, token_budget)
+        result = await measure.local(
+            model,
+            cap,
+            offered_concurrency,
+            profile,
+            token_budget,
+            gpu_override,
+            hot_loras,
+            checkpoint,
+            checkpoint_revision,
+        )
         results.append(result)
         print("CAP_RESULT", json.dumps(result), flush=True)
         # Each vLLM EngineCore is a separate child process and shutdown waits for
@@ -240,6 +316,10 @@ def main(
     concurrency: str = "1,16,32,64,128",
     profile: str = "sweep",
     token_budget: int = 0,
+    gpu_override: str = "",
+    hot_loras: int = 0,
+    checkpoint: str = "",
+    checkpoint_revision: str = "",
     hold_gpu: bool = False,
     output: str = "results/qwen-throughput.json",
 ):
@@ -255,13 +335,32 @@ def main(
     offered_concurrency = [int(value) for value in concurrency.split(",")]
     if not offered_concurrency or any(value < 1 or value > 128 for value in offered_concurrency):
         raise ValueError("Offered concurrency must be between 1 and 128")
-    gpu = gpu_for(base_model)
+    if gpu_override and gpu_override not in ("L4", "L40S", "H100", "H200"):
+        raise ValueError("GPU override must be L4, L40S, H100, or H200")
+    if hot_loras not in (0, 1, 2, 4, 8, 16):
+        raise ValueError("Hot LoRAs must be 0 (catalog default), 1, 2, 4, 8, or 16")
+    if bool(checkpoint) != bool(checkpoint_revision):
+        raise ValueError("Checkpoint and immutable revision must be provided together")
+    if checkpoint_revision and (
+        len(checkpoint_revision) != 40
+        or any(c not in "0123456789abcdef" for c in checkpoint_revision)
+    ):
+        raise ValueError("Checkpoint revision must be a full lowercase commit SHA")
+    gpu = gpu_override or gpu_for(base_model)
     path = Path(output)
     path.parent.mkdir(parents=True, exist_ok=True)
     if hold_gpu:
         benchmark = measure_matrix.with_options(gpu="H100!" if gpu == "H100" else gpu, region="us")
         results = benchmark.remote(
-            base_model, sequence_caps, offered_concurrency, profile, token_budget
+            base_model,
+            sequence_caps,
+            offered_concurrency,
+            profile,
+            token_budget,
+            gpu_override,
+            hot_loras,
+            checkpoint,
+            checkpoint_revision,
         )
         path.write_text(json.dumps(results, indent=2) + "\n")
         print(f"Saved {base_model} matrix measurements to {path}", flush=True)
@@ -274,7 +373,17 @@ def main(
             flush=True,
         )
         results.append(
-            benchmark.remote(base_model, cap, offered_concurrency, profile, token_budget)
+            benchmark.remote(
+                base_model,
+                cap,
+                offered_concurrency,
+                profile,
+                token_budget,
+                gpu_override,
+                hot_loras,
+                checkpoint,
+                checkpoint_revision,
+            )
         )
         path.write_text(json.dumps(results, indent=2) + "\n")
         print(f"Saved {base_model} sequence-cap {cap} measurements to {path}", flush=True)

@@ -106,9 +106,9 @@ SERVING_MODELS: list[dict[str, Any]] = [
             "max_loras": 16,
             "max_lora_rank": 128,  # rank-128 / 16 hot LoRAs (cheap on the 9 GiB FP8 9B); native 256k context.
             "max_model_len": 262144,
-            # L40S: 32 improves short/4k throughput ~61%/~28% over sixteen and
-            # completes a full 32-request 32k-prompt rank-128 q_proj LoRA burst.
-            "max_num_seqs": 32,
+            # L40S: 64 improves short/4k throughput ~127%/~40% over sixteen and
+            # completes a full 64-request 32k-prompt rank-128 q_proj LoRA burst.
+            "max_num_seqs": 64,
             "enforce_eager": False,
             "reasoning_parser": "qwen3",
         },
@@ -118,8 +118,8 @@ SERVING_MODELS: list[dict[str, Any]] = [
         "image_input_limit": MAX_IMAGES_PER_CONVERSATION,
         "gpu": "H100",
         "engine": {
-            "serve_model_id": "Qwen/Qwen3.5-9B-Base",
-            "model_revision": "68c46c4b3498877f3ef123c856ecfde50c39f404",
+            # FP8 conversion of the pinned Base weights; never alias the Instruct checkpoint.
+            "model_revision": "b1a2cf5f5e7bb4ad786e206f834569be3a3d8aa9",
             "tokenizer_model": "Qwen/Qwen3.5-9B-Base",
             "tokenizer_revision": "68c46c4b3498877f3ef123c856ecfde50c39f404",
             "processor_revision": "68c46c4b3498877f3ef123c856ecfde50c39f404",
@@ -129,8 +129,7 @@ SERVING_MODELS: list[dict[str, Any]] = [
             "max_cpu_loras": 16,
             "max_lora_rank": 128,
             "max_model_len": 262144,
-            # Matched-load H100 sweep: 64 improves both short and 4k prompts;
-            # 128 regresses the 4k workload. benchmark_qwen_serving.py reproduces it.
+            # Keep Modal admission aligned with this per-container scheduler capacity.
             "max_num_seqs": 64,
             "enforce_eager": False,
             "reasoning_parser": "qwen3",
@@ -260,7 +259,7 @@ def gpu_for(base_model: str) -> str:
 def serve_model_for(base_model: str) -> str:
     """return the pre-quantized checkpoint an active hosted engine loads."""
     _config_for(base_model)
-    if base_model in {"Qwen/Qwen3.5-0.8B", "Qwen/Qwen3.5-4B", "Qwen/Qwen3.5-9B-Base"}:
+    if base_model in {"Qwen/Qwen3.5-0.8B", "Qwen/Qwen3.5-4B"}:
         return base_model
     if base_model == DEEPSEEK_MODEL_ID:
         return DEEPSEEK_MODEL_ID
