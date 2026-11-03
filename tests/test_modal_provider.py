@@ -215,7 +215,13 @@ def sdk(monkeypatch):
         pass
 
     state = SimpleNamespace(
-        created=[], active=None, failures=False, terminated=[], secrets=[], volumes=[]
+        created=[],
+        active=None,
+        failures=False,
+        create_error=None,
+        terminated=[],
+        secrets=[],
+        volumes=[],
     )
 
     class Image:
@@ -232,6 +238,8 @@ def sdk(monkeypatch):
 
     def create(*args, **kwargs):
         state.created.append((args, kwargs))
+        if state.create_error is not None:
+            raise state.create_error
         state.active = SimpleNamespace(
             object_id="sb-created", get_tags=AsyncMethod(lambda: kwargs["tags"])
         )
@@ -307,6 +315,17 @@ def test_duplicate_submission_adopts_without_second_create(sdk):
     launch()
     assert launch() == "sb-created"
     assert len(sdk.created) == 1
+
+
+def test_unreconciled_create_names_the_cause_class_but_never_its_text(sdk):
+    class GpuCapacityTimeout(Exception):
+        pass
+
+    sdk.create_error = GpuCapacityTimeout("private transport detail")
+    with pytest.raises(UnreconciledCreateError) as error:
+        launch()
+    assert error.value.cause == "GpuCapacityTimeout"
+    assert "private transport detail" not in str(error.value) + error.value.cause
 
 
 def test_name_collision_with_different_spec_fails_closed(sdk):

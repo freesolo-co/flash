@@ -156,7 +156,7 @@ def create(*, name, payload, image_reference, gpu, gpu_count, capsule, deadline_
                     client=client,
                 )
                 return sandbox.object_id
-            except Exception:
+            except Exception as error:
                 # a create may have landed. reattach only to the exact named and tagged attempt.
                 try:
                     sandbox = await modal.Sandbox.from_name.aio(
@@ -167,7 +167,7 @@ def create(*, name, payload, image_reference, gpu, gpu_count, capsule, deadline_
                 except Exception:
                     pass
                 raise UnreconciledCreateError(
-                    "Modal sandbox creation could not be reconciled"
+                    "Modal sandbox creation could not be reconciled", cause=type(error).__name__
                 ) from None
 
         try:

@@ -114,13 +114,13 @@ def test_lora_engine_scales_to_zero_by_default(modal_app_module):
 
 def test_gpu_engines_scale_from_demand_without_a_paid_spare(modal_app_module):
     # Verify the limit reaches Modal's decorators. Each base_model parameter has its own pool.
-    assert modal_app_module.MAX_CONTAINERS == 4
+    assert modal_app_module.MAX_CONTAINERS == 2
     assert modal_app_module.ENGINE_BUFFER_CONTAINERS == 0
     assert modal_app_module.ROUTER_BUFFER_CONTAINERS == 1
 
     cls_calls = [call.kwargs for call in modal_app_module.app.cls.call_args_list]
     assert len(cls_calls) == len(modal_app_module.ENGINE_BY_KEY)
-    assert all(kwargs["max_containers"] == 4 for kwargs in cls_calls)
+    assert all(kwargs["max_containers"] == 2 for kwargs in cls_calls)
     # An active, lightly loaded model must not reserve a second GPU.
     assert all(kwargs["buffer_containers"] == 0 for kwargs in cls_calls)
     assert all(kwargs["min_containers"] == 0 for kwargs in cls_calls)

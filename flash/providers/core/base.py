@@ -151,7 +151,14 @@ class UnreconciledCreateError(RuntimeError):
 
     Retrying could double-provision while the first resource materializes later. Fail terminally so
     teardown and the later unshielded orphan sweep can reclaim it.
+
+    ``cause`` is the class name of the error behind the ambiguous create (never its text, which can
+    quote a request body), so a capacity timeout can be told apart from an image or schema failure.
     """
+
+    def __init__(self, message: str = "", *, cause: str = "") -> None:
+        super().__init__(message)
+        self.cause = cause
 
 
 def canonical_gpu(name: str) -> str:
