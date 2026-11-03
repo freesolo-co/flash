@@ -15,10 +15,8 @@ it cannot recover a lost database. Legacy POST /v1/runs remains non-idempotent.
 
 from __future__ import annotations
 
-import fcntl
 import hashlib
 import json
-import os
 import re
 from contextlib import contextmanager
 from typing import Annotated
@@ -28,6 +26,7 @@ from fastapi import APIRouter, Depends, Header, HTTPException, Request
 from flash.runner.lifecycle import state, status
 from flash.server.platform import db
 from flash.server.platform.deps import require_key
+from flash.server.platform.submission_admission import SubmissionBusy, submission_lock
 from flash.server.routes import runs
 
 router = APIRouter()
@@ -40,20 +39,13 @@ def _validate_id(submission_id: str) -> None:
 
 @contextmanager
 def _submission_lock(run_id: str):
-    # Unlike a timeout-based lease, a live but slow submitter cannot lose ownership.
-    # Separate descriptors contend even within a process; the kernel releases on crash.
-    os.makedirs(state.RUNS_DIR, exist_ok=True)
-    fd = os.open(state.runs_file_path(run_id, ".submission.lock"), os.O_CREAT | os.O_RDWR, 0o600)
     try:
-        try:
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
-            raise HTTPException(
-                409, "submission is in progress; retry the same ID", headers={"Retry-After": "2"}
-            ) from None
-        yield
-    finally:
-        os.close(fd)
+        with submission_lock(run_id):
+            yield
+    except SubmissionBusy:
+        raise HTTPException(
+            409, "submission is in progress; retry the same ID", headers={"Retry-After": "2"}
+        ) from None
 
 
 def _existing(row: dict) -> dict | None:

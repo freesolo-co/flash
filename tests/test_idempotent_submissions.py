@@ -10,6 +10,8 @@ from types import SimpleNamespace
 
 import pytest
 
+pytest.importorskip("fastapi")
+
 from flash.runner.lifecycle import state, status
 from flash.runner.lifecycle import submit as runner_submit
 from flash.server.platform import db
@@ -256,3 +258,130 @@ def test_acceptance_hook_runs_after_durable_status_and_before_dispatch(api, monk
             on_persisted=interrupted,
         )
     assert dispatched == []
+
+
+@pytest.mark.parametrize("cancelled", [False, True])
+def test_standby_status_is_not_recovered_before_admission_finishes(api, monkeypatch, cancelled):
+    from flash.providers._lifecycle.net import worker
+    from flash.server.platform import runtime
+    from tests._helpers.source_snapshot import valid_source_snapshot
+
+    api.app.state.plane_standby = True
+    headers = _bearer(_new_user_token())
+    persisted, release = threading.Event(), threading.Event()
+    original_submit = runner_submit.submit_job
+    admitted = []
+    enqueued = []
+
+    def paused_submit(spec, **kwargs):
+        accepted = kwargs["on_persisted"]
+
+        def pause(run_id):
+            admitted.append(run_id)
+            persisted.set()
+            assert release.wait(10)
+            accepted(run_id)
+
+        return original_submit(spec, **{**kwargs, "on_persisted": pause})
+
+    monkeypatch.setattr(runner_submit, "submit_job", paused_submit)
+    monkeypatch.setattr(
+        runner_submit,
+        "prepare_job",
+        lambda spec, **kwargs: runner_submit.PreparedJob(spec, spec, estimated_cost_usd=0),
+    )
+    monkeypatch.setattr(worker, "publish_source_snapshot", lambda _repo: valid_source_snapshot())
+    monkeypatch.setattr("flash.runner.supervise.recovery._gc_run_sandboxes", lambda spec: None)
+    monkeypatch.setattr(runtime, "_recovery_block_reason", lambda spec: None)
+    monkeypatch.setattr(
+        runtime, "_enqueue_resubmit", lambda spec: enqueued.append(spec.run_id) or True
+    )
+    with ThreadPoolExecutor(1) as pool:
+        pending = pool.submit(api.put, URL, headers=headers, json={"spec": SPEC})
+        try:
+            assert persisted.wait(10)
+            assert status.get_status(admitted[0]).state == "queued"
+            runtime.recover_runs(sweep=False)
+            assert enqueued == []
+            if cancelled:
+                assert api.delete(URL, headers=headers).status_code == 409
+                runtime.recover_runs(sweep=False)
+                assert enqueued == []
+        finally:
+            release.set()
+        response = pending.result(timeout=10)
+    assert response.status_code == (410 if cancelled else 200), response.text
+    runtime.recover_runs(sweep=False)
+    assert enqueued == ([] if cancelled else admitted)
+    assert status.get_status(admitted[0]).state == ("cancelled" if cancelled else "queued")
+
+
+@pytest.mark.parametrize("cancelled", [False, True])
+def test_recovery_settles_admission_after_submitter_dies(api, monkeypatch, cancelled):
+    from flash.server.platform.submission_admission import recovery_ready, submission_lock
+
+    key = db.ensure_external_key("abandoned-submitter")
+    row = db.reserve_submission(key["id"], ID, "fingerprint", "abandoned")
+    db.record_run(row["run_id"], key["id"])
+    state._save_status(state.RunStatus(run_id=row["run_id"], state="queued", spec=SPEC))
+    monkeypatch.setattr("flash.runner.supervise.recovery._gc_run_sandboxes", lambda spec: None)
+    with submission_lock(row["run_id"]):
+        if cancelled:
+            db.reserve_submission(key["id"], ID, None, "unused", cancelled=True)
+        assert not recovery_ready(row["run_id"])
+        assert not db.submission_for_run(row["run_id"])["accepted"]
+    # Releasing the OS lock represents a crashed owner; recovery must not wait forever
+    # for its callback, and must never revive a durable cancellation tombstone.
+    assert recovery_ready(row["run_id"]) is (not cancelled)
+    assert status.get_status(row["run_id"]).state == ("cancelled" if cancelled else "queued")
+    if not cancelled:
+        assert db.submission_for_run(row["run_id"])["accepted"]
+
+
+@pytest.mark.parametrize("entry", ["_enqueue_resubmit", "_start_handleless_resubmit"])
+def test_recovery_rechecks_cancelled_intent_after_classification(api, monkeypatch, entry):
+    from flash.core.spec import JobSpec
+    from flash.server.platform import runtime
+
+    key = db.ensure_external_key("stale-recovery")
+    db.reserve_submission(key["id"], ID, "fingerprint", "stale")
+    spec = JobSpec.from_dict({**SPEC, "run_id": "stale"})
+    state._save_status(state.RunStatus(run_id=spec.run_id, state="queued", spec=spec.to_dict()))
+    db.accept_submission(spec.run_id)
+    # The scan's earlier observation was admissible; DELETE arrived before the task ran.
+    db.reserve_submission(key["id"], ID, None, "unused", cancelled=True)
+    monkeypatch.setattr("flash.runner.supervise.recovery._gc_run_sandboxes", lambda spec: None)
+    monkeypatch.setattr(
+        "flash.runner.lifecycle.attempts.reserve_handleless_recovery_launch",
+        lambda *a, **kw: pytest.fail("cancelled submission acquired a launch claim"),
+    )
+    monkeypatch.setattr(
+        runtime, "current_supervisor", lambda: pytest.fail("cancelled job enqueued")
+    )
+    args = (spec, "queued") if entry == "_start_handleless_resubmit" else (spec,)
+    assert getattr(runtime, entry)(*args) is False
+    assert status.get_status(spec.run_id).state == "cancelled"
+
+
+@pytest.mark.parametrize("handle_field", ["remote", "cleanup_confirmed_remote"])
+def test_busy_submission_does_not_expose_live_job_to_orphan_sweep(api, monkeypatch, handle_field):
+    from flash.server.platform import runtime
+    from flash.server.platform.submission_admission import submission_lock
+
+    key = db.ensure_external_key("running-submission")
+    db.reserve_submission(key["id"], ID, "fingerprint", "live")
+    db.record_run("live", key["id"])
+    snapshot = SimpleNamespace(
+        run_id="live",
+        state="running",
+        remote=None,
+        cleanup_confirmed_remote=None,
+    )
+    setattr(snapshot, handle_field, {"provider": "modal", "instance_id": "live-instance"})
+    monkeypatch.setattr(status, "get_status", lambda run_id: snapshot)
+    monkeypatch.setattr(runtime, "_schedule_cleanup", lambda run_id: None)
+    active, known, resubmit = set(), set(), []
+    with submission_lock("live"):
+        runtime._classify_recoverable_runs(active, known, resubmit)
+    assert active == known == {"live"}
+    assert resubmit == []

@@ -387,6 +387,12 @@ def get_submission(key_id: int, submission_id: str) -> dict | None:
     return dict(row) if row else None
 
 
+def submission_for_run(run_id: str) -> dict | None:
+    with _connect() as conn:
+        row = conn.execute("SELECT * FROM run_submissions WHERE run_id = ?", (run_id,)).fetchone()
+    return dict(row) if row else None
+
+
 def accept_submission(run_id: str) -> None:
     with _connect() as conn:
         conn.execute("UPDATE run_submissions SET accepted = 1 WHERE run_id = ?", (run_id,))
