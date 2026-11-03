@@ -355,14 +355,21 @@ def create_run(
     authorization: Annotated[str | None, Header()] = None,
     x_freesolo_org_id: Annotated[str | None, Header()] = None,
 ):
+    return _create_run(payload, request, key, authorization, x_freesolo_org_id)
+
+
+def _create_run(
+    payload, request, key, authorization, x_freesolo_org_id, *, run_id=None, on_persisted=None
+):
     submission_started = False
+    reserved_identity = run_id is not None
     try:
         dry_run = _require_bool(payload, "dry_run", False)
         schema = _client_train_schema(payload)
         submitted = payload.get("spec")
         submitted_train = submitted.get("train") if isinstance(submitted, dict) else None
         try:
-            spec = _parse_spec(payload, run_id=new_run_id())
+            spec = _parse_spec(payload, run_id=run_id or new_run_id())
         except HTTPException as exc:
             detail = _schema_disagreement_detail(exc, schema, submitted_train)
             if detail is None:
@@ -430,8 +437,12 @@ def create_run(
                 estimate_usd=prepared.estimated_cost_usd,
                 org_id=affordability_org_id,
             )
+        owner = db.run_owner(run_id)
+        if owner is None:
+            db.record_run(run_id, key["id"])
+        elif owner != key["id"] or not reserved_identity:
+            raise HTTPException(409, "run ownership conflict")
         submission_started = True
-        db.record_run(run_id, key["id"])
         submit_kwargs = {
             "dry_run": dry_run,
             "background": True,
@@ -442,6 +453,8 @@ def create_run(
             # scan picks the queued run up (see flash.server.platform.plane_lease).
             "queue_only": getattr(request.app.state, "plane_standby", False),
         }
+        if on_persisted is not None:
+            submit_kwargs["on_persisted"] = on_persisted
         if runtime_secrets:
             submit_kwargs["runtime_secrets"] = runtime_secrets
         if billing_context:
