@@ -245,6 +245,19 @@ def _unique_glue_probe(messages: list[dict]) -> str:
             return probe
 
 
+# Chat templates such as Qwen3.5's raise "No user query found in messages" when a conversation
+# has no ordinary user turn; tool results are deliberately not one. Glue is the text after the
+# probe, which the turns before the probe do not change, so a tool-only reply is rendered after
+# this anchor to give the template the query it requires.
+_GLUE_ANCHOR = {"role": "user", "content": "Continue."}
+
+
+def _glue_conversation(probe: str, messages: list[dict]) -> list[dict]:
+    """the probe conversation: anchored only when the reply itself carries no user turn."""
+    head = [] if any(message.get("role") == "user" for message in messages) else [_GLUE_ANCHOR]
+    return [*head, {"role": "assistant", "content": probe}, *messages]
+
+
 def dedup_seam_terminator(response_ids: list[int], glue_ids: list[int]) -> list[int]:
     """keep the sampled terminator and drop the duplicate leading glue copy."""
     if response_ids and glue_ids and response_ids[-1] == glue_ids[0]:
@@ -269,7 +282,7 @@ class EnvGlueTokenizer:
             return list(cached)
         probe = _unique_glue_probe(messages)
         text = self.tokenizer.apply_chat_template(
-            _messages_for_chat_template([{"role": "assistant", "content": probe}, *messages]),
+            _messages_for_chat_template(_glue_conversation(probe, messages)),
             add_generation_prompt=True,
             tokenize=False,
             enable_thinking=self.thinking,
@@ -522,7 +535,7 @@ def _processor_glue_ids(
     structured = validate_structured_messages(messages, source="environment reply")
     probe = _unique_glue_probe(structured)
     rendered = processor.apply_chat_template(
-        [{"role": "assistant", "content": probe}, *structured],
+        _glue_conversation(probe, structured),
         tokenize=False,
         add_generation_prompt=True,
         **apply_chat_template_kwargs,
