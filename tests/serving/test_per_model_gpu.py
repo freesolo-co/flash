@@ -443,7 +443,9 @@ def test_one_engine_class_per_distinct_engine_key(modal_app_module):
     assert set(modal_app_module.ENGINE_BY_KEY) == {
         ("L4", 8),
         ("L40S", 8),
+        ("L40S", 16),
         ("H100", 8),
+        ("H100", 32),
         ("H200", 8),
     }
 
@@ -452,10 +454,10 @@ def test_engine_concurrency_rejects_malformed_catalog_values(modal_app_module, m
     mod = modal_app_module
 
     monkeypatch.setattr(mod, "engine_overrides_for", lambda _bm: {"max_num_seqs": 8})
-    assert mod._engine_concurrency("valid") == (8, 6)
+    assert mod._engine_concurrency("valid") == (8, 8)
 
     monkeypatch.setattr(mod, "engine_overrides_for", lambda _bm: {})
-    assert mod._engine_concurrency("defaulted") == (64, 48)
+    assert mod._engine_concurrency("defaulted") == (64, 64)
 
     monkeypatch.setattr(mod, "engine_overrides_for", lambda _bm: {"max_num_seqs": "invalid"})
     monkeypatch.setattr(mod, "base_models", lambda: ["malformed"])
@@ -473,21 +475,22 @@ def test_class_names_are_distinct_and_modal_safe(modal_app_module):
 
 
 @pytest.mark.parametrize(
-    ("model", "gpu"),
+    ("model", "gpu", "sequences"),
     [
-        ("Qwen/Qwen3.5-0.8B", "L4"),
-        ("Qwen/Qwen3.5-4B", "L40S"),
-        ("Qwen/Qwen3.5-9B", "L40S"),
-        ("Qwen/Qwen3.5-9B-Base", "H100"),
-        ("Qwen/Qwen3.8-27B", "H100"),
-        ("Qwen/Qwen3.6-35B-A3B", "H200"),
+        ("Qwen/Qwen3.5-0.8B", "L4", 8),
+        ("Qwen/Qwen3.5-4B", "L40S", 8),
+        ("Qwen/Qwen3.5-9B", "L40S", 16),
+        ("Qwen/Qwen3.5-9B-Base", "H100", 32),
+        ("Qwen/Qwen3.8-27B", "H100", 8),
+        ("Qwen/Qwen3.6-35B-A3B", "H200", 8),
     ],
 )
-def test_models_route_to_qualified_gpu(modal_app_module, model, gpu):
+def test_models_route_to_qualified_gpu(modal_app_module, model, gpu, sequences):
     cls = modal_app_module._engine_cls_for(model)
     assert gpu_for(model) == gpu
-    assert cls is modal_app_module.ENGINE_BY_KEY[(gpu, 8)]
-    assert cls.__name__ == modal_app_module._engine_class_name(gpu, 8)
+    assert cls is modal_app_module.ENGINE_BY_KEY[(gpu, sequences)]
+    assert cls.__name__ == modal_app_module._engine_class_name(gpu, sequences)
+    assert modal_app_module._engine_concurrency(model) == (sequences, sequences)
     assert cls.pinned_gpu == gpu
 
 
@@ -808,7 +811,7 @@ def _load_engine_and_args(
     async def warmup(native_engine, tokenizer, max_sequences):
         assert native_engine.engine_args is captured["args"]
         assert tokenizer is fake_tok
-        assert max_sequences == 8
+        assert max_sequences == captured["args"].max_num_seqs
 
     monkeypatch.setattr("flash.serving.src.engine.warmup.warmup", warmup)
 
@@ -911,7 +914,7 @@ def test_load_prequant_checkpoint_for_9b(modal_app_module, monkeypatch, tmp_path
     assert args.max_loras == 16
     assert args.max_lora_rank == 128
     assert args.max_model_len == 262144
-    assert args.max_num_seqs == 8
+    assert args.max_num_seqs == 16
     assert args.gpu_memory_utilization == 0.90  # 0.90 leaves CUDA-graph capture headroom (was 0.98)
     assert args.enforce_eager is False  # CUDA graphs ON: ~10x faster decode on the hybrid GDN model
     assert getattr(args, "max_num_batched_tokens", None) is None

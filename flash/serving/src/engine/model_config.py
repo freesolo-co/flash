@@ -105,7 +105,9 @@ SERVING_MODELS: list[dict[str, Any]] = [
             "max_loras": 16,
             "max_lora_rank": 128,  # rank-128 / 16 hot LoRAs (cheap on the 9 GiB FP8 9B); native 256k context.
             "max_model_len": 262144,
-            "max_num_seqs": 8,
+            # L40S throughput + rank-128/32k-prompt sweep qualified sixteen sequences.
+            # Thirty-two 32k prompts exceed this tier's measured ~780k-token KV capacity.
+            "max_num_seqs": 16,
             "enforce_eager": False,
             "reasoning_parser": "qwen3",
         },
@@ -126,7 +128,9 @@ SERVING_MODELS: list[dict[str, Any]] = [
             "max_cpu_loras": 16,
             "max_lora_rank": 128,
             "max_model_len": 262144,
-            "max_num_seqs": 8,
+            # Single-H100 sweep qualified thirty-two sequences, including rank-128
+            # q_proj LoRA at 32k prompts; benchmark_qwen_serving.py reproduces the check.
+            "max_num_seqs": 32,
             "enforce_eager": False,
             "reasoning_parser": "qwen3",
         },
