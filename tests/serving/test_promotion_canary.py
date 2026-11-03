@@ -305,6 +305,7 @@ def test_result_redirect_loop_is_bounded_without_resubmitting_post():
     assert calls == ["POST"] + ["GET"] * _MAX_RESULT_REDIRECTS
 
 
+@pytest.mark.wallclock  # 30 ms mock responses against a 50 ms real deadline
 def test_result_polling_shares_the_original_wall_clock_deadline():
     import httpx
 
