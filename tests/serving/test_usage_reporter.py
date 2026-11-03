@@ -112,23 +112,22 @@ def test_lora_engine_scales_to_zero_by_default(modal_app_module):
     assert modal_app_module.app.function.call_args.kwargs["min_containers"] == 1
 
 
-def test_gpu_engines_are_capped_at_four_and_each_keeps_one_buffer(modal_app_module):
+def test_gpu_engines_scale_from_demand_without_a_paid_spare(modal_app_module):
     # Verify the limit reaches Modal's decorators. Each base_model parameter has its own pool.
     assert modal_app_module.MAX_CONTAINERS == 4
-    assert modal_app_module.BUFFER_CONTAINERS == 1
+    assert modal_app_module.ENGINE_BUFFER_CONTAINERS == 0
+    assert modal_app_module.ROUTER_BUFFER_CONTAINERS == 1
 
     cls_calls = [call.kwargs for call in modal_app_module.app.cls.call_args_list]
     assert len(cls_calls) == len(modal_app_module.ENGINE_BY_KEY)
     assert all(kwargs["max_containers"] == 4 for kwargs in cls_calls)
-    # One spare warm container per engine absorbs a burst past TARGET_INPUTS without a cold boot.
-    # `buffer_containers` only provisions while the Function is ACTIVE, so this preserves scale-to-zero
-    # (MIN_CONTAINERS stays 0) rather than paying for an idle gpu.
-    assert all(kwargs["buffer_containers"] == 1 for kwargs in cls_calls)
+    # An active, lightly loaded model must not reserve a second GPU.
+    assert all(kwargs["buffer_containers"] == 0 for kwargs in cls_calls)
     assert all(kwargs["min_containers"] == 0 for kwargs in cls_calls)
 
     # The cpu router is uncapped: it is the front door that triggers cold engines, and
     # capping it would throttle every model at once rather than bounding gpu spend per model. It
-    # carries the same buffer, so a burst does not queue behind the front door it just cleared.
+    # keeps its CPU buffer so a burst does not wait on front-door startup.
     router_kwargs = modal_app_module.app.function.call_args.kwargs
     assert "max_containers" not in router_kwargs
     assert router_kwargs["buffer_containers"] == 1
@@ -155,17 +154,16 @@ def test_unknown_gpu_tier_is_rejected_not_silently_defaulted(modal_app_module):
 
 
 def test_modal_concurrency_is_per_engine_key(modal_app_module):
-    # Each engine class caps max_inputs near its engine's real max_num_seqs (see _engine_concurrency)
-    # so Modal autoscales instead of over-packing one container; target_inputs = 3/4 of that. The
-    # router keeps the global 64/48. MAX_INPUTS 64 came from a real-GPU sweep (near-linear to 128).
+    # GPU engines fill their qualified batch before scaling. Router headroom stays separate.
     assert modal_app_module.MAX_INPUTS == 64
     assert modal_app_module.TARGET_INPUTS == 48
     # One @modal.concurrent per distinct engine key plus one on the router.
     calls = [call.kwargs for call in modal_app_module.modal.concurrent.call_args_list]
     assert len(calls) == len(modal_app_module.ENGINE_BY_KEY) + 1
     seen = {(c["max_inputs"], c["target_inputs"]) for c in calls}
-    # Router carries the global sizing; each engine key carries max_inputs with target = 3/4 of it.
-    expected = {(mi, max(1, mi * 3 // 4)) for (_gpu, mi) in modal_app_module.ENGINE_BY_KEY}
+    # Check the actual decorators: changing only _engine_concurrency must not leave
+    # a second target calculation deploying the old 75% threshold.
+    expected = {(mi, mi) for (_gpu, mi) in modal_app_module.ENGINE_BY_KEY}
     expected.add((modal_app_module.MAX_INPUTS, modal_app_module.TARGET_INPUTS))
     assert seen == expected
 

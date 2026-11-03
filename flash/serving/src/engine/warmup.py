@@ -33,7 +33,12 @@ async def warmup(engine, tokenizer, max_sequences):
             if not finished:
                 await engine.abort(request_id)
 
-    for concurrency in (1, 2, 4, max_sequences):
+    # Cover intermediate decode batches too: jumping straight from four to a larger
+    # cap leaves the first eight/sixteen-request burst paying for lazy kernel compilation.
+    batch_sizes = [1]
+    while batch_sizes[-1] < max_sequences:
+        batch_sizes.append(min(max_sequences, batch_sizes[-1] * 2))
+    for concurrency in batch_sizes:
         async with asyncio.TaskGroup() as group:
             for index in range(concurrency):
                 group.create_task(request(index))

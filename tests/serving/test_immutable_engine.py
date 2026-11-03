@@ -130,7 +130,6 @@ def test_rejected_new_lora_releases_entry_and_reaches_engine_on_retry(tmp_path: 
     [
         ("missing", "vLLM cannot confirm LoRA removal"),
         ("raises", "worker unavailable"),
-        ("false", "vLLM rejected LoRA removal"),
     ],
 )
 def test_loaded_lora_failed_removal_retains_unconfirmed_entry(
@@ -149,9 +148,7 @@ def test_loaded_lora_failed_removal_retains_unconfirmed_entry(
 
         class _Engine:
             async def remove_lora(self, _int_id: int) -> bool:
-                if outcome == "raises":
-                    raise RuntimeError("worker unavailable")
-                return False
+                raise RuntimeError("worker unavailable")
 
         engine.engine = _Engine()
 
@@ -365,7 +362,10 @@ def test_cold_unregister_without_authoritative_record_leaves_registry_untouched(
     assert engine.registry.get(record.org_id, record.model_id) == record
 
 
-def test_request_loaded_adapter_is_registered_once_and_evicted_on_undeploy(tmp_path):
+@pytest.mark.parametrize("already_evicted", [False, True])
+def test_request_loaded_adapter_is_registered_once_and_evicted_on_undeploy(
+    tmp_path, already_evicted
+):
     record = _revision("a" * 40).model_copy(update={"deployment_generation": "generation-one"})
     engine = _LoraEngineImpl()
     engine.base_model = BASE_MODEL
@@ -384,9 +384,10 @@ def test_request_loaded_adapter_is_registered_once_and_evicted_on_undeploy(tmp_p
             return True
 
         async def remove_lora(self, int_id):
-            resident.remove(int_id)
+            was_resident = int_id in resident
+            resident.discard(int_id)
             removed.append(int_id)
-            return True
+            return was_resident
 
     async def local_path(record):
         return tmp_path
@@ -400,6 +401,8 @@ def test_request_loaded_adapter_is_registered_once_and_evicted_on_undeploy(tmp_p
         assert first.lora_int_id in resident
         second, _ = await engine._lora_request(record.model_id, payload)
         assert second is first
+        if already_evicted:
+            resident.clear()  # vLLM may evict the CPU cache entry before undeploy.
         await engine._unregister(record.org_id, record.model_id, "generation-one")
         assert not resident
         # the same immutable checkpoint can subsequently be deployed again.
@@ -477,3 +480,81 @@ def test_loaded_lora_fast_path_requires_loaded_current_source(tmp_path: Path) ->
 
     # a different immutable source for the same checkpoint id never reuses the loaded entry.
     assert engine._loaded_lora_request_locked(_revision("c" * 40)) is None
+
+
+@pytest.mark.parametrize("operation", ["request", "register"])
+@pytest.mark.parametrize("removed_before_error", [False, True])
+def test_adapter_recovers_after_uncertain_removal(
+    monkeypatch, tmp_path: Path, operation: str, removed_before_error: bool
+) -> None:
+    record = _revision("a" * 40)
+    path = _adapter_source_cache_dir(tmp_path, record) / record.subfolder
+    path.mkdir(parents=True)
+    (path / "adapter_config.json").write_text("{}")
+    (path / "adapter_model.safetensors").write_bytes(b"weights")
+    monkeypatch.setattr("flash.serving.src.store.settings.ADAPTER_CACHE_DIR", tmp_path)
+    engine = _LoraEngineImpl()
+    engine.base_model = BASE_MODEL
+    engine.registry = AdapterRegistry()
+    engine.registry.set_local_path(record, path)
+    engine._adapter_locks = {}
+    engine._adapter_locks_guard = asyncio.Lock()
+    resident = set()
+    additions = []
+    removals = []
+    unavailable = True
+
+    class _Engine:
+        async def add_lora(self, request):
+            assert request.lora_int_id not in resident
+            resident.add(request.lora_int_id)
+            additions.append(request)
+            return True
+
+        async def remove_lora(self, int_id):
+            removals.append(int_id)
+            was_resident = int_id in resident
+            if removed_before_error or not unavailable:
+                resident.discard(int_id)
+            if unavailable:
+                raise RuntimeError("worker unavailable")
+            return was_resident
+
+    engine.engine = _Engine()
+    payload = internal_adapter_payload(record)
+
+    async def invoke():
+        if operation == "register":
+            return await engine._register(payload, "generation-new")
+        return await engine._lora_request(record.model_id, payload)
+
+    async def exercise():
+        nonlocal unavailable
+        await engine._register(payload, "generation-old")
+        old_request = additions[0]
+        with pytest.raises(RuntimeError, match="worker unavailable"):
+            await engine._evict_loaded_lora(record.storage_key)
+        # A failed retry must keep the old ID reserved and must not load new weights.
+        with pytest.raises(RuntimeError, match="worker unavailable"):
+            await invoke()
+        assert engine._entries()[record.storage_key].state == "unconfirmed"
+        assert engine._entries()[record.storage_key].lora_request is old_request
+        assert additions == [old_request]
+
+        unavailable = False
+        await invoke()
+        entry = engine._entries()[record.storage_key]
+        assert entry.state == "loaded"
+        assert entry.source_ident == _adapter_source_ident(record)
+        assert entry.lora_request is additions[-1]
+        assert entry.lora_request is not old_request
+        assert resident == {entry.lora_request.lora_int_id}
+        # The recovered adapter now serves concurrent requests without another removal or load.
+        requests = await asyncio.gather(
+            *(engine._lora_request(record.model_id, payload) for _ in range(3))
+        )
+        assert all(request is entry.lora_request for request, _ in requests)
+
+    asyncio.run(exercise())
+    assert len(additions) == 2
+    assert removals == [additions[0].lora_int_id] * 3

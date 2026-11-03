@@ -6,6 +6,7 @@ import argparse
 import base64
 import hashlib
 import json
+from dataclasses import replace
 
 import pytest
 
@@ -15,27 +16,29 @@ from flash.cli.commands.serving.identity import (
     encode_deployment_identity,
 )
 from flash.cli.parsing.serve_parser import _add_serve_commands
+from flash.serve.deployment import profiles
 from flash.serve.provisioning.modal.planning.plan import build_modal_create_plan
 from tests.test_cli_serve_deploy import _args, _stub_resolution
 
-_MODAL_SPEC_ID = "bb8e2fc51a56bb6e4e4b2c8306ec41ea36c02221dc014483d4d0d44e62d0e3ce"
-_MODAL_IDENTITY_SHA256 = "fab98be0b9255460d985022c592b1b00402c03c29acfcd01693ea9b762416c9d"
+# The 16-sequence 9B profile changes immutable engine identity and derived resource names.
+_MODAL_SPEC_ID = "3aa08d4776e88bce2d4e577ca66b60356be4fd85661c093cd0ea0cdb22248f2a"
+_MODAL_IDENTITY_SHA256 = "84786ca7c2d2259148742fa0a17f1d559e3eb8615d264f68e9c5fbe8f695f3b3"
 _MODAL_NAMES = {
-    "app_or_pod": "flash-app-q6u72ddlwnubmxqniu5ldi37p7sqzk2y",
-    "volume": "flash-volume-mp5jmghv2jp4illstpjdw3uydmfdnfwj",
-    "template": "flash-template-ifryumjx3yvpkm6pctd3q4dr6s2ufe7f",
-    "inference_secret": "flash-inference-secret-jwlqyxoquwx43tquxub2w6wncl6wdfs5",
-    "artifact_secret": "flash-artifact-secret-klk34w3zpubp7surfjts6ymhklqq6i4h",
+    "app_or_pod": "flash-app-g4vcmuc2pbsrbhunoavaqryrohjeow2o",
+    "volume": "flash-volume-7sshkclmwgosriu42i5vlvzoybq4uer4",
+    "template": "flash-template-26velvq5g3m6myxtybvqtljwhmhqjuxs",
+    "inference_secret": "flash-inference-secret-oiao3fxkhjmr3f3bzufpbxg2dwphgd43",
+    "artifact_secret": "flash-artifact-secret-ma55j5jvjixrxmbvvvajyhlskddve7ap",
 }
 _MODAL_TAGS = (
     ("flash-deployment", "xxOvS4LyqBaN6-V5n2-PzBCz9R_VYmltmj_nFrKLEQ4"),
-    ("flash-engine", "kGhUdeBLBw6qGyNcQLjAL8sgmOhe1IKBgV0b7sl1sYY"),
+    ("flash-engine", "wMOuc0RbeZ_xDgI1K76wNpkJkVKYMhap1U5uzPCCn2I"),
     ("flash-generation", "1"),
     ("flash-image", "qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqo"),
-    ("flash-manifest", "ruJUSYp2_ZkimU4jW2HZ9g-2nQ2Rj4RxW0miSBx9tqQ"),
+    ("flash-manifest", "L4fej7fPAEFf8WLqNA3f0XTewhxtPS7A4VJlweeUWN0"),
     ("flash-phase", "finalized"),
-    ("flash-spec", "u44vxRpWu25OSyyDBuxB6jbAIiHcAUSD1NDUTmLQ484"),
-    ("flash-topology", "7Bw3elYyaiLBvSCWHMl-jsghOi0cBo9CVKp7AsnuEIc"),
+    ("flash-spec", "OqCNR3boi84tTld8pmtgNWvk_YVmHAk80OoM2yIkjyo"),
+    ("flash-topology", "VVeqHM_RN6ygFgODG2HP_Fd4UJT61MvLktjOhLMSJ2k"),
 )
 
 
@@ -121,8 +124,27 @@ def test_modal_schema_v2_identity_spec_and_plan_are_byte_stable(
     assert plan.tags == _MODAL_TAGS
     assert (
         plan.expected_public_url
-        == "https://workspace--fsw-jl6t4yxq4s52w5nzzljagadzgukwcbhswblslcvilacdv74c.modal.run"
+        == "https://workspace--fsw-uuhoqbgvdstecfamiy7sijnvt3z2hlzmqmrcn5a6i7huoy3i.modal.run"
     )
+
+
+def test_existing_eight_sequence_identity_survives_the_profile_capacity_change(monkeypatch):
+    _stub_resolution(monkeypatch)
+    args = _args()
+    current = serve_deploy._deployment_bundle(args)
+    legacy_profile = replace(profiles.get_profile(args.model), max_num_seqs=8)
+    with monkeypatch.context() as legacy:
+        legacy.setattr(profiles, "get_profile", lambda _model: legacy_profile)
+        previous = serve_deploy._deployment_bundle(args)
+    identity = encode_deployment_identity(previous)
+
+    # Existing status/undeploy tokens must retain their recorded engine shape after
+    # a new default changes the identity assigned to newly provisioned deployments.
+    assert profiles.get_profile(args.model).max_num_seqs == 16
+    assert current.spec.spec_id != previous.spec.spec_id
+    decoded = decode_deployment_identity(identity)
+    assert decoded.spec.spec_id == previous.spec.spec_id
+    assert encode_deployment_identity(decoded) == identity
 
 
 @pytest.mark.parametrize("command", ["deploy", "status", "undeploy"])

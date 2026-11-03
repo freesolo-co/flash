@@ -148,23 +148,17 @@ def scaledown_window_for(gpu: str) -> int:
 # gpu model engines scale to zero. inference and adapter registration remote calls start the matching
 # parameter-bound engine on demand.
 MIN_CONTAINERS = 0
-# Limit GPU autoscaling to four containers per model, including its active buffer. `base_model` is
+# Limit GPU autoscaling to four containers per model. `base_model` is
 # a modal.parameter(), so each model has its own pool and cannot borrow another model's capacity.
 # Requests queue when all four containers are busy. This applies independently in each environment.
 MAX_CONTAINERS = 4
-# One spare warm container for each autoscaling pool -- every base-model engine AND the cpu router --
-# so a burst past `TARGET_INPUTS` does not pay a full cold boot (420s on L40S, 900s on H100, 1010s on
-# H200) before it can be served. Modal only provisions the buffer while a Function is ACTIVE, so this
-# does not defeat `MIN_CONTAINERS = 0`: idle engines still scale to zero and bill nothing.
-BUFFER_CONTAINERS = 1
-# Concurrent requests packed onto one base-model GPU before Modal autoscales a new (costly) one.
-# A prior real-GPU sweep on A10G/Qwen2.5-1.5B showed vLLM
-# throughput scaling near-linearly with no saturation through 128 concurrent, while TTFT stayed
-# <60 ms — so the old default of 32 left ~2x of each GPU idle. 64 packs ~2.3x the throughput per
-# GPU for ~+14% per-request latency (now blunted by the fp8 KV cache, which is on for every base —
-# see settings.KV_CACHE_DTYPE), roughly halving GPU count for the same load.
-# Per-engine concurrency is sized by _engine_concurrency from each model's max_num_seqs; these are
-# the router/global ceiling. TARGET_INPUTS auto-derives to 48 (= 64*3//4).
+# A spare GPU per active model doubles the allocation for lightly loaded pools, then
+# remains billable through the 35-minute idle window. Scale GPUs from actual demand;
+# retain a cheap CPU-router buffer so admission does not wait on router startup.
+ENGINE_BUFFER_CONTAINERS = 0
+ROUTER_BUFFER_CONTAINERS = 1
+# Router concurrency and the fallback ceiling for engines without a sequence cap.
+# Qwen engines use their own qualified max_num_seqs, not this router capacity.
 MAX_INPUTS = 64
 TARGET_INPUTS = max(1, MAX_INPUTS * 3 // 4)
 
@@ -341,22 +335,18 @@ from flash.serving.src.engine.model_config import (  # noqa: E402
 def _engine_concurrency(base_model: str) -> tuple[int, int]:
     """return Modal input admission aligned with the engine's sequence capacity.
 
-    Modal counts requests while vLLM schedules sequences. The prior 2x buffer admitted 16 requests
-    onto every current 8-sequence engine, so normal ``n=1`` traffic queued half of them inside the
-    container and delayed scale-out until 12 inputs. OpenAI ``n`` can fan one input out to as many as
-    four sequences, but sizing every container for that rare worst case would leave normal traffic
-    underutilizing the GPU and cold-boot expensive replicas prematurely. Cap request admission at the
-    authored sequence capacity instead: current tiers admit 8 and scale out at 6. This deliberately
-    changes Modal's request knobs, not ``max_num_seqs``: raising the engine cap is not allocation-free,
-    and the 35B tier has a documented startup profiling OOM at higher sequence counts. Models without
-    an authored sequence cap retain the global sizing until their real capacity is explicit.
+    Fill the qualified sequence capacity before requesting another GPU. A 75% target
+    provisioned extra replicas while ordinary n=1 batches still had room. Keep the hard
+    request cap at the sequence limit so this does not introduce a hidden vLLM queue.
+    n>1 requests still share the same bounded scheduler capacity. Larger sequence caps
+    need GPU qualification, especially for the memory-bound 35B MoE. Models without an
+    authored cap use the global ceiling.
     """
     configured = engine_overrides_for(base_model).get("max_num_seqs")
     if configured is None:
-        return MAX_INPUTS, TARGET_INPUTS
+        return MAX_INPUTS, MAX_INPUTS
     max_inputs = max(1, min(MAX_INPUTS, int(configured)))
-    target_inputs = max(1, max_inputs * 3 // 4)
-    return max_inputs, target_inputs
+    return max_inputs, max_inputs
 
 
 def _engine_class_name(gpu: str, max_inputs: int) -> str:
@@ -474,7 +464,7 @@ def _build_engine(
         timeout=REQUEST_TIMEOUT_SECONDS,
         min_containers=MIN_CONTAINERS,
         max_containers=MAX_CONTAINERS,
-        buffer_containers=BUFFER_CONTAINERS,
+        buffer_containers=ENGINE_BUFFER_CONTAINERS,
     )(modal.concurrent(max_inputs=max_inputs, target_inputs=target_inputs)(_Engine))
     # Rebind the module name to the decorated handle, matching the normal ``@app.cls class X`` pattern
     # where the module attribute ends up referring to the decorated class.
@@ -498,7 +488,7 @@ def _distinct_engine_keys() -> list[tuple[str, int]]:
 # One engine class per distinct (GPU tier, concurrency) — see _engine_concurrency for why max_inputs
 # is part of the class identity (Modal fixes concurrency per class).
 ENGINE_BY_KEY: dict[tuple[str, int], Any] = {
-    (gpu, mi): _build_engine(gpu, _engine_class_name(gpu, mi), mi, max(1, mi * 3 // 4))
+    (gpu, mi): _build_engine(gpu, _engine_class_name(gpu, mi), mi, mi)
     for (gpu, mi) in _distinct_engine_keys()
 }
 
@@ -874,11 +864,11 @@ def _base_model_records() -> list:
 @app.function(
     secrets=runtime_secrets,
     region="us-east",  # keep admission, private HTTP dispatch, and serving ingress nearby
-    cpu=8,  # exact long-context token counting and concurrent stream framing
-    memory=16384,  # pinned tokenizers plus bounded in-flight prompt state
+    cpu=2,  # HTTP parsing and stream framing; the engine handles tokenization
+    memory=4096,  # reservation, not a hard cap: near-limit request bursts need additional memory
     nonpreemptible=True,  # a CPU-host interruption cannot resume an open token stream
     min_containers=1,  # one warm CPU front door (hardcoded; no deploy-time knob)
-    buffer_containers=BUFFER_CONTAINERS,  # scales out with the engines; see BUFFER_CONTAINERS
+    buffer_containers=ROUTER_BUFFER_CONTAINERS,
     timeout=ROUTER_TIMEOUT_SECONDS,  # must cover engine cold start (see ROUTER_TIMEOUT_SECONDS)
 )
 @modal.concurrent(max_inputs=MAX_INPUTS, target_inputs=TARGET_INPUTS)

@@ -146,7 +146,7 @@ def poll(handle, spec, *, log=None, deadline_at=None):
         from flash.providers.modal import checkpoint_upload
 
         try:
-            notes = checkpoint_upload.finish(h, spec, deadline_at=deadline_at)
+            notes = checkpoint_upload.finish(h, deadline_at=deadline_at)
         except (api.ModalApiError, TimeoutError) as exc:
             # training completed and the handoff Volume is preserved; this is an upload failure
             # (finish already retried it), not a preemption -- report it as its own category.

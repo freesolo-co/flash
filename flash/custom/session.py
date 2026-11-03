@@ -13,6 +13,41 @@ from flash._internal.diagnostics import sanitize_diagnostic
 from flash.custom.types import integer
 
 
+def _reset_cuda_peak():
+    """Start a fresh per-operation peak; best effort, a no-op without CUDA."""
+    try:
+        import torch
+
+        if torch.cuda.is_available():
+            torch.cuda.reset_peak_memory_stats()
+    except Exception:
+        pass
+
+
+def _cuda_memory():
+    """GPU memory at the end of an operation (GiB), or None without CUDA.
+
+    Logged with every operation event so an out-of-memory failure shows whether memory crept up
+    over earlier operations or spiked inside the failing one. Never raises.
+    """
+    try:
+        import torch
+
+        if not torch.cuda.is_available():
+            return None
+        gib = 1024**3
+        free, total = torch.cuda.mem_get_info()
+        return {
+            "allocated_gib": round(torch.cuda.memory_allocated() / gib, 2),
+            "reserved_gib": round(torch.cuda.memory_reserved() / gib, 2),
+            "peak_allocated_gib": round(torch.cuda.max_memory_allocated() / gib, 2),
+            "free_gib": round(free / gib, 2),
+            "total_gib": round(total / gib, 2),
+        }
+    except Exception:
+        return None
+
+
 class SessionConflict(ValueError):
     """The caller must inspect/reconcile session state before doing more work."""
 
@@ -61,6 +96,9 @@ class TrainingSession:
         }
         if result.get("error"):
             event["error"] = result["error"]
+        memory = _cuda_memory()
+        if memory is not None:
+            event["cuda_memory"] = memory
         self.events.append(event)
         # prompts, token ids and credentials never enter worker stdout.
         print(json.dumps({"custom_training": event}, allow_nan=False), flush=True)
@@ -116,6 +154,7 @@ class TrainingSession:
                     "step": self.step,
                 }
             start = time.monotonic()
+            _reset_cuda_peak()
             try:
                 output = self.backend.execute(operation, arguments)
                 # reject invalid numerical results before committing a success receipt.
