@@ -336,6 +336,8 @@ async def _stream_chat_completion(
                 "X-Accel-Buffering": "no",
                 "Cache-Control": "no-cache",
                 **checkpoint_headers,
+                "X-Freesolo-Serving-Release": usage_session.serving_release or "",
+                "X-Freesolo-Serving-Deployment-Id": usage_session.deployment_id or "",
             },
         )
         transferred = True

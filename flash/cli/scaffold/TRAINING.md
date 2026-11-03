@@ -138,6 +138,62 @@ def load_environment(**kwargs) -> MyEnv:
 For tool use, dialogue, or games, subclass `EnvironmentMultiTurn` instead and drive the
 conversation across turns. The reward is the same `RewardResult` contract either way.
 
+**Native tool calling (multi-turn GRPO).** Declare the tools the model may call as
+`tool_schemas` on the environment — a list of OpenAI function declarations (the `tools` array of
+a chat request), as a class attribute or a zero-argument method. Do not render them into the system
+prompt yourself and do not parse `<tool_call>` text yourself:
+
+```python
+class RetailEnv(EnvironmentMultiTurn):
+    tool_schemas = [
+        {
+            "type": "function",
+            "function": {
+                "name": "get_order_details",
+                "description": "Look up one order by id.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"order_id": {"type": "string"}},
+                    "required": ["order_id"],
+                    "additionalProperties": False,
+                },
+            },
+        }
+    ]
+
+    def step_episode(self, example, messages, assistant_response):
+        turn = messages[-1]  # {"role": "assistant", "content": ..., "tool_calls": [...]}
+        replies = [
+            {
+                "role": "tool",
+                "tool_call_id": call["id"],
+                "name": call["function"]["name"],
+                "content": run_tool(
+                    call["function"]["name"], json.loads(call["function"]["arguments"])
+                ),
+            }
+            for call in turn.get("tool_calls", [])
+        ]
+        return EnvironmentStepResult(done=not replies, messages=tuple(replies))
+```
+
+- Declarations are validated exactly as a serving chat request's `tools` are (closed object schemas
+  with `"additionalProperties": false`, no `strict`); a malformed one fails at load.
+- Flash renders them with the chat template's own `tools=` into the first prompt, every
+  generation prefix, and the glue for every environment reply, so the policy trains on exactly the
+  prompt serving renders for the same conversation (and that SFT renders for a row's `tools`).
+- After each turn Flash parses the text with the serving tool-call parser. `messages[-1]` is the
+  OpenAI assistant message: `content` is the text before the call (`""` when none) and
+  `tool_calls[].function.arguments` is a JSON string. `assistant_response` stays the raw text, so
+  for a call it no longer equals `messages[-1]["content"]`. Text that is not a well-formed call of a
+  declared tool stays plain `content` with no `tool_calls`, as serving would return it.
+- Reply with `{"role": "tool", "tool_call_id": ..., "name": ..., "content": ...}` messages (and/or
+  `user` messages); the template renders them in its native tool-response format. Only environment
+  replies carry these fields — the initial prompt stays role/content.
+- Supported on text-only multi-turn GRPO. Single-turn and image-bearing runs with `tool_schemas`
+  are refused at startup, as are `[train].stop_sequences` that overlap the tool-call grammar. A
+  dataset row may also carry `tools` (as SFT rows do), but it must equal `tool_schemas`.
+
 If the environment class can return image-bearing user observations from `step_episode`, declare
 `image_observations = True` on that class. This is a class capability, not a TOML setting: Flash uses
 it to reject a text-only model before model work. Set it only for environments that
@@ -971,8 +1027,10 @@ is never killed for being slow.
 ### `credit_assignment = "per_turn"` is inert unless your environment emits `per_turn_rewards`
 
 **First, check that per-turn credit is available to you at all.** It is supported on the
-pure multi-turn rollout path — an `EnvironmentMultiTurn` that drives its own turn loop. A
-multi-turn environment that exposes **tools** is not supported at all: the worker raises
+pure multi-turn rollout path — an `EnvironmentMultiTurn` that drives its own turn loop
+(including one that declares native `tool_schemas` and executes the calls in `step_episode`). An
+environment whose **callables Flash would execute** (trl-style function calling) is not supported
+at all: the worker raises
 `verl grpo does not support openai function-calling tool environments; this env reports
 is_tool_env` and the run dies at startup. Nothing catches this earlier —
 `flash train --dry-run` accepts the config, because the check depends on the environment

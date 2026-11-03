@@ -7,9 +7,9 @@ readiness poll. Order is load-bearing and short-circuits:
   stream  -> did a real authenticated request generate real tokens over a real stream?
   usage   -> is this release's durable delivery loop running rather than wedged?
 
-Each stage is skipped when an earlier one failed. Streaming against a router that is not this
-release would prove nothing about it, and inspecting an accounting backlog for a generation that
-never happened would just burn the deadline before failing anyway.
+Each stage is skipped when an earlier one failed. Health is a preliminary observation: the next
+request can still reach an old router during a rolling handoff. The streaming canary checks its
+own response's release identity before accounting waits for that candidate's durable usage.
 
 The accounting RPC scopes durable settlement to the canary's correlation id, organization, model,
 deployment id, and release SHA. Stall reads cover that deployment across all organizations and
@@ -162,7 +162,7 @@ async def _await_health(
     sleep: Callable[[float], Awaitable[None]],
     clock: Callable[[], float],
 ) -> PromotionVerdict:
-    """Wait out rollout identity drift without sending a canary to a stale release."""
+    """Wait for stable candidate health before attempting the release-bound canary."""
     deadline = clock() + max(0.0, deadline_seconds)
     verdict = PromotionVerdict(ok=False, reason=HEALTH_UNREACHABLE)
     matched_since: float | None = None
@@ -355,6 +355,8 @@ def _resolve(base_url: str, env: dict[str, str]) -> GatePlan:
             correlation_id=correlation_id,
             timeout_seconds=CANARY_TIMEOUT_SECONDS,
             max_tokens=_MAX_TOKENS,
+            expected_sha=env["GITHUB_SHA"],
+            expected_deployment_id=deployment_id,
         ),
         read_backlog=read_backlog,
         expected_sha=env["GITHUB_SHA"],

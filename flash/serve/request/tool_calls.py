@@ -192,11 +192,11 @@ def validate_tool_history(
                 raise error_type(
                     f"message {message_index} starts a new turn before all tool calls were resolved"
                 )
-            calls = _validate_history_calls(
+            calls = validate_tool_calls(
                 message.get("tool_calls"),
-                message_index,
-                all_ids,
-                error_type,
+                message_index=message_index,
+                all_ids=all_ids,
+                error_type=error_type,
             )
             pending = dict(calls)
             resolved.clear()
@@ -423,12 +423,16 @@ def _normalize_schema(
     return normalized
 
 
-def _validate_history_calls(
+def validate_tool_calls(
     value: object,
+    *,
     message_index: int,
-    all_ids: set[str],
-    error_type: type[Exception],
+    all_ids: set[str] | None = None,
+    error_type: type[Exception] = ValueError,
 ) -> list[tuple[str, str]]:
+    """Validate one call turn; optionally track IDs across a complete serving history."""
+    if all_ids is None:
+        all_ids = set()
     if type(value) is not list or not value:
         raise error_type(f"message {message_index} tool_calls must be a nonempty list")
     calls: list[tuple[str, str]] = []

@@ -207,6 +207,7 @@ class MultiTurnBridge:
         processor=None,
         tokenizer=None,
         thinking: bool = False,
+        tools: list[dict] | None = None,
         per_turn_credit: bool = False,
         on_episode_scored: Callable[[object, object, float], None] | None = None,
         parent_work: ParentWorkGauge | None = None,
@@ -242,6 +243,9 @@ class MultiTurnBridge:
         self._package_root = package_root
         self._tokenizer = tokenizer
         self._thinking = bool(thinking)
+        # serving wire-form declarations of a tool environment, rendered into every parent glue so
+        # it stays byte-identical to the child's; None keeps the tool-free transcript contract.
+        self._tools = tools
         self._max_turns = int(max_turns)
         self._per_turn_credit = bool(per_turn_credit)
         self._on_episode_scored = on_episode_scored
@@ -492,8 +496,14 @@ class MultiTurnBridge:
                     messages=[],
                     authenticated=authenticated,
                 )
-            self._env_call("record_model_turn", state, completion_text)
-            session["messages"].append({"role": "assistant", "content": completion_text})
+            recorded = self._env_call("record_model_turn", state, completion_text)
+            # a tool environment records the structured turn the serving parser recovered from the
+            # text (content plus openai tool_calls); mirror exactly that into the session transcript.
+            session["messages"].append(
+                dict(recorded)
+                if self._tools is not None and isinstance(recorded, dict)
+                else {"role": "assistant", "content": completion_text}
+            )
             next_prefix = [*accepted_prefix, *response_ids]
             if self._env_call("rollout_done", state, self._max_turns):
                 session["required_prefix"] = next_prefix
@@ -527,6 +537,7 @@ class MultiTurnBridge:
                         normalized.descriptors,
                         self._package_root,
                         thinking=self._thinking,
+                        tools=self._tools,
                     )
                 else:
                     glue_ids, new_digests = [], []
@@ -690,6 +701,8 @@ def multi_turn_child_env(inp: dict, *, reward_url: str, thinking: bool) -> dict[
         # sorted so the child sees a stable set regardless of frozenset iteration order.
         "FLASH_VERL_EOS_TOKEN_IDS": json.dumps(sorted(inp["eos_token_ids"])),
         "FLASH_VERL_THINKING": "1" if thinking else "0",
+        # the tool environment's declarations, already in serving wire form; empty for none.
+        "FLASH_VERL_TOOLS": json.dumps(inp["tools"]) if inp.get("tools") else "",
     }
 
 

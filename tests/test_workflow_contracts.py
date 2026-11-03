@@ -16,6 +16,7 @@ import json
 import os
 import re
 import shlex
+import shutil
 import subprocess
 import tempfile
 import tomllib
@@ -773,6 +774,7 @@ def _run_rollback(
     entrypoint: str | None = "flash/serving/app/modal_app.py",
     schema_status: str = "200",
     has_schema_contract: bool = True,
+    compatibility_failure: str | None = None,
 ) -> tuple[int, str, str]:
     """Execute the rollback script with `modal`, `curl`, `git`, and `sleep` stubbed on PATH.
 
@@ -794,6 +796,29 @@ def _run_rollback(
         app = root / "flash/serving/app/modal_app.py"
         app.parent.mkdir(parents=True, exist_ok=True)
         app.touch()
+        # Run the real snapshot/preparation commands against a tiny forward package.
+        # Checkout below removes this helper, proving it was saved before checkout.
+        for package in (
+            "flash",
+            "flash/serving",
+            "flash/serving/app",
+            "flash/serving/src",
+            "flash/serving/src/engine",
+        ):
+            directory = root / package
+            directory.mkdir(parents=True, exist_ok=True)
+            (directory / "__init__.py").touch()
+        shutil.copyfile(REPO_ROOT / "flash/serving/app/rollback.py", app.parent / "rollback.py")
+        (app.parent / "rollout.py").write_text(
+            'LEGACY_ENGINE_KEYS = {"base": ("L40S", 4)}\n'
+            'def model_engine_name(model): return "StableEngine"\n'
+        )
+        (app.parent / "timeouts.py").write_text("ROUTER_TIMEOUT_SECONDS = 60\n")
+        (root / "flash/serving/src/engine/model_config.py").write_text(
+            'def base_models(): return ["base"]\n'
+        )
+        if compatibility_failure == "snapshot":
+            (app.parent / "rollback.py").write_text('raise RuntimeError("snapshot unavailable")\n')
         columns_path = root / (
             "flash/serving/src/persisted_columns.py"
             if entrypoint == "flash/serving/modal_app.py"
@@ -804,7 +829,10 @@ def _run_rollback(
             columns_path.write_text('PERSISTED_COLUMNS = "adapter_id,base_model"\n')
         calls = root / "modal-calls.txt"
         (bin_dir / "modal").write_text(
-            '#!/bin/sh\n[ -f "$2" ] || exit 2\nprintf "%s sha=%s id=%s\\n" "$*" "$FREESOLO_DEPLOYMENT_SHA" '
+            '#!/bin/sh\n[ "$2" = "--strategy" ] && [ "$3" = "rolling" ] || exit 2\n'
+            '[ -f "$4" ] && [ -f flash/serving/_rollback_compat.py ] || exit 2\n'
+            'grep -q "install_compatibility(globals()" "$4" || exit 2\n'
+            'printf "%s sha=%s id=%s\\n" "$*" "$FREESOLO_DEPLOYMENT_SHA" '
             '"$FREESOLO_DEPLOYMENT_ID" >> "$MODAL_CALLS"\nexit 0\n'
         )
         # the health body is served from a file; `--output` is where the script wants it.
@@ -822,7 +850,8 @@ def _run_rollback(
             "  rm -f flash/serving/app/modal_app.py flash/serving/modal_app.py\n"
             '  if [ -n "$RESTORED_ENTRYPOINT" ]; then\n'
             '    mkdir -p "$(dirname "$RESTORED_ENTRYPOINT")"\n'
-            '    touch "$RESTORED_ENTRYPOINT"\n'
+            '    printf "%s" "$RESTORED_SOURCE" > "$RESTORED_ENTRYPOINT"\n'
+            "    rm -f flash/serving/app/rollback.py\n"
             "  fi\nfi\nexit 0\n"
         )
         for stub in bin_dir.iterdir():
@@ -847,6 +876,12 @@ def _run_rollback(
                 "PATH": f"{bin_dir}:{os.environ.get('PATH', '')}",
                 "MODAL_CALLS": str(calls),
                 "RESTORED_ENTRYPOINT": entrypoint or "",
+                "RESTORED_SOURCE": (
+                    "unknown = True\n"
+                    if compatibility_failure == "prepare"
+                    else '@app.function(timeout=900)\ndef router():\n    return "previous router"\n'
+                ),
+                "HEALTH_URL": "https://serve.example/healthz",
                 "ANCESTOR_EXIT": "0" if is_ancestor else "1",
                 "HEALTH_BODY": health,
                 "SCHEMA_STATUS": schema_status,
@@ -897,6 +932,19 @@ def test_a_failed_promotion_restores_the_previous_release_and_still_fails_the_jo
     assert "flash/serving/app/modal_app.py" in deployed
     assert code != 0, "a completed rollback exited 0 -- this commit would be recorded as deployed"
     assert "is NOT deployed" in logged
+
+
+@pytest.mark.parametrize("phase", ["snapshot", "prepare"])
+def test_rollback_never_deploys_without_retaining_forward_handles(phase):
+    code, deployed, logged = _run_rollback(
+        previous_sha=PREVIOUS,
+        is_ancestor=True,
+        health=_health(PREVIOUS, "9-1-rollback"),
+        compatibility_failure=phase,
+    )
+    assert code != 0
+    assert deployed == ""
+    assert "refusing unsafe rollback" in logged
 
 
 @pytest.mark.parametrize(
@@ -1007,7 +1055,7 @@ def test_rollback_can_restore_a_release_before_the_serving_source_move():
         health=_health(PREVIOUS, "9-1-rollback"),
         entrypoint="flash/serving/modal_app.py",
     )
-    assert "deploy flash/serving/modal_app.py" in deployed
+    assert "deploy --strategy rolling flash/serving/modal_app.py" in deployed
     assert f"sha={PREVIOUS}" in deployed
     assert code != 0
     assert "is NOT deployed" in logged
