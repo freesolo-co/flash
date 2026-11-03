@@ -124,3 +124,110 @@ def test_malformed_scoped_rows_do_not_look_like_an_empty_backlog(rows):
 def test_missing_or_naive_database_time_fails_closed(value):
     with pytest.raises(ValueError, match="accounting"):
         _read(snapshot=_snapshot(captured_at=value))
+
+
+# --- the global snapshot RPC is unavailable (statement timeout / gateway timeout) -------------
+
+DB_DATE = "Thu, 29 Oct 2026 00:58:18 GMT"
+SETTLED_ROW = {
+    "state": "delivered",
+    "completion_tokens": 7,
+    "terminal_at": "2026-10-29T00:58:01+00:00",
+    "delivered_at": "2026-10-29T00:58:05+00:00",
+    "billing_usage_id": "b0d2",
+}
+
+
+def _read_without_rpc(*, rpc=None, canary_rows=None, date=DB_DATE, oldest=None, lease=None):
+    """The RPC fails with `rpc` (an HTTP status or an exception); scoped reads answer."""
+    rpc = 500 if rpc is None else rpc
+    canary_rows = [SETTLED_ROW] if canary_rows is None else canary_rows
+    seen = []
+
+    def respond(request):
+        seen.append(request)
+        if request.method == "POST":
+            if isinstance(rpc, Exception):
+                raise rpc
+            return httpx.Response(
+                rpc,
+                json={"code": "57014", "message": "canceling statement due to statement timeout"},
+            )
+        params = request.url.params
+        assert request.headers["Accept-Profile"] == "internal"
+        if params["select"] == "state,completion_tokens,terminal_at,delivered_at,billing_usage_id":
+            # the canary's exact scope, served by idx_serving_usage_outbox_canary
+            assert params["org_id"] == "eq.canary-org"
+            assert params["correlation_id"] == "eq.fspromo-123-1"
+            assert params["serving_deployment_id"] == "eq.123-1"
+            assert params["serving_release"] == "eq." + "a" * 40
+            assert params["public_model_id"] == "eq.canary-model"
+            headers = {"date": date} if date is not None else {}
+            return httpx.Response(200, json=canary_rows, headers=headers)
+        if params["select"] == "captured_at":
+            return httpx.Response(200, json=[] if oldest is None else oldest)
+        return httpx.Response(200, json=[] if lease is None else lease)
+
+    async def read():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as client:
+            return await read_accounting(client, RPC, HEADERS, SCOPE)
+
+    return asyncio.run(read()), seen
+
+
+@pytest.mark.parametrize("rpc", [500, 502, 503, 504, httpx.ReadTimeout("statement still running")])
+def test_a_timed_out_global_snapshot_does_not_roll_back_a_settled_release(rpc):
+    result, seen = _read_without_rpc(rpc=rpc)
+    assert verify_accounting(parse_accounting(result)).ok
+    assert result["canary_settled"] is True
+    assert result["global_backlog"]["unavailable"] in {
+        "HTTP 500",
+        "HTTP 502",
+        "HTTP 503",
+        "HTTP 504",
+        "ReadTimeout",
+    }
+    # the database's error text never becomes gate evidence
+    assert "57014" not in json.dumps(result)
+    assert [request.method for request in seen] == ["POST", "GET", "GET", "GET"]
+
+
+@pytest.mark.parametrize("status", [400, 401, 403, 404])
+def test_client_errors_from_the_snapshot_rpc_still_fail_closed(status):
+    with pytest.raises(httpx.HTTPStatusError):
+        _read_without_rpc(rpc=status)
+
+
+@pytest.mark.parametrize(
+    "rows",
+    [
+        [],  # canary not recorded yet
+        [{**SETTLED_ROW, "state": "pending"}],
+        [{**SETTLED_ROW, "completion_tokens": 0}],
+        [{**SETTLED_ROW, "billing_usage_id": None}],
+        [{**SETTLED_ROW, "delivered_at": None}],
+        [SETTLED_ROW, {**SETTLED_ROW, "terminal_at": None}],
+    ],
+)
+def test_fallback_canary_proof_matches_the_rpc_predicate(rows):
+    result, _ = _read_without_rpc(canary_rows=rows)
+    assert result["canary_settled"] is False
+    assert not verify_accounting(parse_accounting(result)).ok
+
+
+def test_fallback_still_blocks_a_stalled_release():
+    result, _ = _read_without_rpc(oldest=[{"captured_at": "2026-10-29T00:50:00+00:00"}])
+    assert result["oldest_undelivered_age_seconds"] == 498
+    assert not verify_accounting(parse_accounting(result)).ok
+
+
+@pytest.mark.parametrize("date", [None, "not a date"])
+def test_fallback_without_database_time_fails_closed(date):
+    with pytest.raises(ValueError, match="accounting"):
+        _read_without_rpc(date=date)
+
+
+@pytest.mark.parametrize("rows", [{}, [None], [SETTLED_ROW] * 100])
+def test_fallback_rejects_malformed_or_truncated_canary_rows(rows):
+    with pytest.raises(ValueError, match="accounting"):
+        _read_without_rpc(canary_rows=rows)
