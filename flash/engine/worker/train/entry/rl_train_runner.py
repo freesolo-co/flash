@@ -456,6 +456,7 @@ def _start_reward_runtime(
             processor=inp["processor"],
             tokenizer=tok,
             thinking=bool(context.config.thinking),
+            tools=inp.get("tools"),
             per_turn_credit=bool(inp["per_turn_credit"]),
             on_episode_scored=observability.record,
             parent_work=observability.parent_work,

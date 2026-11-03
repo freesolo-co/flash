@@ -203,6 +203,10 @@ class _EpisodeSettings:
             int(value) for value in json.loads(os.environ.get("FLASH_VERL_EOS_TOKEN_IDS", "[]"))
         )
         self.thinking = os.environ.get("FLASH_VERL_THINKING") == "1"
+        # the environment's declared tools in serving wire form, or None for a tool-free env. the
+        # parent normalized them; every child render (first prompt and glue) passes them unchanged.
+        raw_tools = os.environ.get("FLASH_VERL_TOOLS", "")
+        self.tools = json.loads(raw_tools) if raw_tools else None
 
 
 def _turn_sampling_params(
@@ -439,16 +443,16 @@ async def _grpo_run(
     agent_loop_output,
     **kwargs,
 ):
-    prompt = await prepare_episode_prompt(self, kwargs["raw_prompt"])
-    prompt_ids = prompt.prompt_ids
     settings = _EpisodeSettings()
+    prompt = await prepare_episode_prompt(self, kwargs["raw_prompt"], tools=settings.tools)
+    prompt_ids = prompt.prompt_ids
     bridge_url = settings.bridge_url
     example_index = int(kwargs["index"])
     identity = kwargs.get("flash_rollout_identity")
     if not isinstance(identity, dict):
         raise RuntimeError("flash multi-turn rollout is missing its completion identity")
     identity = dict(identity)
-    glue_processor = EnvGlueProcessor(self, thinking=settings.thinking)
+    glue_processor = EnvGlueProcessor(self, thinking=settings.thinking, tools=settings.tools)
     session_id = uuid4().hex
 
     # the response tensor's width. the whole EPISODE has to fit in it, not just one turn:
