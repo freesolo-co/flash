@@ -29,6 +29,16 @@ CREATE TABLE IF NOT EXISTS runs (
   created_at REAL NOT NULL
 );
 CREATE INDEX IF NOT EXISTS runs_key_idx ON runs(key_id);
+CREATE TABLE IF NOT EXISTS run_submissions (
+  key_id INTEGER NOT NULL REFERENCES api_keys(id),
+  submission_id TEXT NOT NULL,
+  request_hash TEXT,
+  run_id TEXT NOT NULL UNIQUE,
+  accepted INTEGER NOT NULL DEFAULT 0,
+  cancelled INTEGER NOT NULL DEFAULT 0,
+  created_at REAL NOT NULL,
+  PRIMARY KEY (key_id, submission_id)
+);
 """
 
 
@@ -344,3 +354,45 @@ def all_runs() -> list[dict]:
     with _connect() as conn:
         rows = conn.execute("SELECT run_id, key_id, kind, created_at FROM runs").fetchall()
         return [dict(r) for r in rows]
+
+
+def reserve_submission(
+    key_id: int, submission_id: str, request_hash: str | None, run_id: str, *, cancelled=False
+) -> dict:
+    """Bind an owner-scoped logical submission to one run, durably before any launch."""
+    with _connect() as conn:
+        conn.execute(
+            "INSERT OR IGNORE INTO run_submissions "
+            "(key_id, submission_id, request_hash, run_id, created_at, cancelled) VALUES (?, ?, ?, ?, ?, ?)",
+            (key_id, submission_id, request_hash, run_id, time.time(), int(cancelled)),
+        )
+        if cancelled:
+            conn.execute(
+                "UPDATE run_submissions SET cancelled = 1 WHERE key_id = ? AND submission_id = ?",
+                (key_id, submission_id),
+            )
+        row = conn.execute(
+            "SELECT * FROM run_submissions WHERE key_id = ? AND submission_id = ?",
+            (key_id, submission_id),
+        ).fetchone()
+    return dict(row)
+
+
+def get_submission(key_id: int, submission_id: str) -> dict | None:
+    with _connect() as conn:
+        row = conn.execute(
+            "SELECT * FROM run_submissions WHERE key_id = ? AND submission_id = ?",
+            (key_id, submission_id),
+        ).fetchone()
+    return dict(row) if row else None
+
+
+def submission_for_run(run_id: str) -> dict | None:
+    with _connect() as conn:
+        row = conn.execute("SELECT * FROM run_submissions WHERE run_id = ?", (run_id,)).fetchone()
+    return dict(row) if row else None
+
+
+def accept_submission(run_id: str) -> None:
+    with _connect() as conn:
+        conn.execute("UPDATE run_submissions SET accepted = 1 WHERE run_id = ?", (run_id,))

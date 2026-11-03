@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import logging
 import os
+from collections.abc import Callable
 from dataclasses import dataclass
 from functools import partial
 
@@ -256,11 +257,13 @@ def submit_job(
     prepared_job: PreparedJob | None = None,
     supervisor: Supervisor | None = None,
     queue_only: bool = False,
+    on_persisted: Callable[[str], None] | None = None,
 ) -> state.RunStatus:
     """Submit a prepared job, allocating resources only outside dry-run mode.
 
     ``queue_only`` persists the run as queued without launching it, for a control plane that does
-    not hold the plane lease; the holder's recovery scan launches it.
+    not hold the plane lease; the holder's recovery scan launches it. ``on_persisted``
+    durably acknowledges admission after status/secrets are saved, before dispatch.
     """
     if prepared_job is not None:
         prepared = prepared_job
@@ -273,6 +276,7 @@ def submit_job(
         )
     kwargs = {
         "dry_run": dry_run,
+        "on_persisted": on_persisted,
         "runtime_secrets": runtime_secrets,
         "billing_context": billing_context,
         "platform_context": platform_context,
@@ -298,6 +302,7 @@ def _submit_prepared_job(
     billing_context: dict | None,
     platform_context: dict | None,
     dispatch=None,
+    on_persisted: Callable[[str], None] | None = None,
 ) -> state.RunStatus:
     public_spec = prepared.public_spec
     worker_spec = prepared.worker_spec
@@ -361,6 +366,8 @@ def _submit_prepared_job(
         if not os.path.exists(state.runs_file_path(public_spec.run_id, ".json")):
             runtime_credentials.discard(public_spec.run_id)
         raise
+    if on_persisted is not None:
+        on_persisted(status.run_id)
     reporting._report_status(status)
     if dry_run:
         # A dry-run persists a state=dry_run record (retrievable, listable, and stageable for a

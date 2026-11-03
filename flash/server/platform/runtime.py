@@ -18,6 +18,7 @@ from flash.core.spec import JobSpec
 from flash.runner.lifecycle.state import adapter_prefix, runs_file_path
 from flash.runner.lifecycle.status import get_status
 from flash.server.platform import db
+from flash.server.platform.submission_admission import recovery_ready
 
 _log = logging.getLogger("flash.server")
 
@@ -263,6 +264,8 @@ def _start_handleless_resubmit(spec, expected_state: str) -> bool | None:
     )
     from flash.runner.supervise.lifecycle import _run_job_background
 
+    if not recovery_ready(spec.run_id):
+        return False
     try:
         status = get_status(spec.run_id)
         from flash.runner.lifecycle.runtime_credentials import restore
@@ -338,6 +341,8 @@ def _enqueue_resubmit(spec) -> bool:
     """Reserve execution capacity before acquiring any durable launch claim."""
     from flash.runner.lifecycle.status import source_snapshot_from_status
 
+    if not recovery_ready(spec.run_id):
+        return False
     try:
         status = get_status(spec.run_id)
         from flash.runner.lifecycle.runtime_credentials import restore
@@ -683,6 +688,12 @@ def _classify_recoverable_runs(
         # A separate lane keeps provider outages from consuming training/recovery capacity.
         _schedule_cleanup(status.run_id)
         if status.state not in _RECOVERABLE:
+            continue
+        if not recovery_ready(status.run_id):
+            # A PUT replay/GET may briefly own the fence of an already-running job.
+            # Deferring recovery must not expose its live resources to orphan reaping.
+            if status.remote or status.cleanup_confirmed_remote:
+                active.add(status.run_id)
             continue
         owner = current_supervisor()
         if any(owner.contains((kind, status.run_id)) for kind in ("run", "retry", "attach")):
