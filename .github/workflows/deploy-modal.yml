@@ -44,7 +44,7 @@ jobs:
     # accounting settlement, image builds, and a rollback with its own readiness
     # poll. The workflow contract test sums these budgets so rollback is never
     # cut off by the job timeout.
-    timeout-minutes: 180
+    timeout-minutes: 300
     # serialize serving deploys across runs because each deploy mutates the live app. github can still
     # replace a pending run, so the gate compares against the sha reported by the deployed app rather
     # than assuming every push predecessor was deployed.
@@ -325,7 +325,7 @@ jobs:
         env:
           FREESOLO_DEPLOYMENT_SHA: ${{ github.sha }}
           FREESOLO_DEPLOYMENT_ID: ${{ github.run_id }}-${{ github.run_attempt }}
-        run: modal deploy flash/serving/app/modal_app.py
+        run: modal deploy --strategy rolling flash/serving/app/modal_app.py
 
       - name: Wait for production serving readiness
         if: steps.gate.outputs.deploy == 'true'
@@ -335,12 +335,13 @@ jobs:
           expected_deployment_id="${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
           response_file="$(mktemp)"
           trap 'rm -f "$response_file"' EXIT
-          deadline=$((SECONDS + 300))
+          # Match router startup: its full engine budget plus 60 seconds of headroom.
+          deadline=$((SECONDS + 3660))
 
           while true; do
             remaining=$((deadline - SECONDS))
             if (( remaining <= 0 )); then
-              echo "::error::Production serving health check did not become ready within 300 seconds."
+              echo "::error::Production serving health check did not become ready within 3660 seconds."
               exit 1
             fi
 
@@ -511,7 +512,8 @@ jobs:
 
           response_file="$(mktemp)"
           trap 'rm -f "$response_file"' EXIT
-          deadline=$((SECONDS + 300))
+          # Match router startup: its full engine budget plus 60 seconds of headroom.
+          deadline=$((SECONDS + 3660))
           restored=false
           while (( SECONDS < deadline )); do
             if curl --silent --show-error --output "$response_file" --fail \

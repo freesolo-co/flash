@@ -11,9 +11,8 @@ jobs:
     name: Deploy development serving Modal app
     if: github.ref == 'refs/heads/dev'
     runs-on: ubuntu-latest
-    # same bound as the production deploy: its own readiness polls plus the remote image build fit
-    # well inside this, and a wedged job releases the runner instead of holding it for 6 hours.
-    timeout-minutes: 30
+    # Allow active GPU pools to warm before router readiness, plus image builds.
+    timeout-minutes: 90
     # github can replace a pending run even though a running deploy is preserved. compare against the
     # sha reported by the deployed app so the replacement repeats every change not actually deployed.
     concurrency:
@@ -233,7 +232,7 @@ jobs:
 
       - name: Deploy development serving
         if: steps.gate.outputs.deploy == 'true'
-        run: modal deploy --env dev flash/serving/app/modal_app.py
+        run: modal deploy --strategy rolling --env dev flash/serving/app/modal_app.py
 
       - name: Verify development serving URL
         if: steps.gate.outputs.deploy == 'true'
@@ -272,12 +271,13 @@ jobs:
           expected_deployment_id="${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
           response_file="$(mktemp)"
           trap 'rm -f "$response_file"' EXIT
-          deadline=$((SECONDS + 300))
+          # Match router startup: its full engine budget plus 60 seconds of headroom.
+          deadline=$((SECONDS + 3660))
 
           while true; do
             remaining=$((deadline - SECONDS))
             if (( remaining <= 0 )); then
-              echo "::error::Development serving custom domain did not become DNS-, TLS-, and health-ready within 300 seconds."
+              echo "::error::Development serving custom domain did not become DNS-, TLS-, and health-ready within 3660 seconds."
               exit 1
             fi
 
