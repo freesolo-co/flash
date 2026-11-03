@@ -384,7 +384,11 @@ def _submit_provider(ctx: _SubmitContext, prepared, candidate_plan):
                 PollResult(
                     False,
                     failure="job_failed",
-                    detail=f"provider create could not be reconciled ({type(exc).__name__})",
+                    detail=(
+                        f"provider create could not be reconciled ({type(exc).__name__}"
+                        + (f" after {exc.cause}" if getattr(exc, "cause", "") else "")
+                        + ")"
+                    ),
                 ),
                 False,
             )
