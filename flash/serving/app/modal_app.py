@@ -148,10 +148,10 @@ def scaledown_window_for(gpu: str) -> int:
 # gpu model engines scale to zero. inference and adapter registration remote calls start the matching
 # parameter-bound engine on demand.
 MIN_CONTAINERS = 0
-# Limit GPU autoscaling to four containers per model. `base_model` is
+# Limit GPU autoscaling to two containers per model. `base_model` is
 # a modal.parameter(), so each model has its own pool and cannot borrow another model's capacity.
-# Requests queue when all four containers are busy. This applies independently in each environment.
-MAX_CONTAINERS = 4
+# Requests queue when both containers are busy. This applies independently in each environment.
+MAX_CONTAINERS = 2
 # A spare GPU per active model doubles the allocation for lightly loaded pools, then
 # remains billable through the 35-minute idle window. Scale GPUs from actual demand;
 # retain a cheap CPU-router buffer so admission does not wait on router startup.
