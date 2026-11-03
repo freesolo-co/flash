@@ -485,6 +485,8 @@ def test_the_gate_is_constructible_from_the_environment_the_workflow_supplies():
 
     assert plan.expected_sha == "x"
     assert plan.expected_deployment_id == "x-x"
+    assert plan.request.expected_sha == plan.expected_sha
+    assert plan.request.expected_deployment_id == plan.expected_deployment_id
     assert callable(plan.read_backlog)
 
 
