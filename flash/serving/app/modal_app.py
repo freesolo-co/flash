@@ -864,8 +864,8 @@ def _base_model_records() -> list:
 @app.function(
     secrets=runtime_secrets,
     region="us-east",  # keep admission, private HTTP dispatch, and serving ingress nearby
-    cpu=8,  # exact long-context token counting and concurrent stream framing
-    memory=16384,  # pinned tokenizers plus bounded in-flight prompt state
+    cpu=2,  # HTTP parsing and stream framing; the engine handles tokenization
+    memory=4096,  # reservation, not a hard cap: near-limit request bursts need additional memory
     nonpreemptible=True,  # a CPU-host interruption cannot resume an open token stream
     min_containers=1,  # one warm CPU front door (hardcoded; no deploy-time knob)
     buffer_containers=ROUTER_BUFFER_CONTAINERS,
