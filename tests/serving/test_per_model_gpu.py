@@ -1,10 +1,7 @@
-"""Per-model GPU tier routing: each base model's engine runs on the GPU class from the catalog.
+"""Model-scoped routing keeps qualified hardware separate from dispatch identity.
 
-Modal fixes a class's GPU and concurrency at decoration time, so the serving app registers one
-``LoraEngine`` ``@app.cls`` per distinct (GPU tier, max_inputs) key and dispatches each base model to
-its class (all active tiers -> b200). modal_app imports the ``modal`` sdk
-at module top, which isn't installed offline, so we stub it just enough to import the module and
-reach the built engine classes.
+The old tier classes stay registered for routers draining during migration. Stub
+Modal to inspect both sets of decorators without allocating GPUs.
 """
 
 from __future__ import annotations
@@ -437,9 +434,8 @@ def test_deployed_timeouts_use_the_shared_serving_budget(modal_app_module):
     )
 
 
-def test_one_engine_class_per_distinct_engine_key(modal_app_module):
-    """a loraengine class is built for each active gpu tier and concurrency key."""
-    # Models sharing a GPU and concurrency key share a class, with separate containers.
+def test_legacy_engine_keys_are_retained_for_draining_routers(modal_app_module):
+    """A catalog edit must not delete handles held by pre-migration routers."""
     assert set(modal_app_module.ENGINE_BY_KEY) == {
         ("L4", 64),
         ("L40S", 8),
@@ -462,7 +458,7 @@ def test_engine_concurrency_rejects_malformed_catalog_values(modal_app_module, m
     monkeypatch.setattr(mod, "base_models", lambda: ["malformed"])
     monkeypatch.setattr(mod, "gpu_for", lambda _bm: "L4")
     with pytest.raises(ValueError, match="invalid literal"):
-        mod._distinct_engine_keys()
+        mod._engine_concurrency("malformed")
 
 
 def test_class_names_are_distinct_and_modal_safe(modal_app_module):
@@ -487,8 +483,8 @@ def test_class_names_are_distinct_and_modal_safe(modal_app_module):
 def test_models_route_to_qualified_gpu(modal_app_module, model, gpu, sequences):
     cls = modal_app_module._engine_cls_for(model)
     assert gpu_for(model) == gpu
-    assert cls is modal_app_module.ENGINE_BY_KEY[(gpu, sequences)]
-    assert cls.__name__ == modal_app_module._engine_class_name(gpu, sequences)
+    assert cls is modal_app_module.ENGINE_BY_MODEL[model]
+    assert cls.__name__ == modal_app_module.model_engine_name(model)
     assert modal_app_module._engine_concurrency(model) == (sequences, sequences)
     assert cls.pinned_gpu == gpu
 
@@ -525,8 +521,14 @@ def test_tier_class_identity_is_fixed_before_decoration(modal_app_module):
     (no ``<locals>``) plus a module attribute under that name. The rename + global binding happen on the
     REAL class BEFORE ``@modal.concurrent`` wraps it — otherwise (renaming after the decorator) every tier
     would register under ``_Engine`` and the ``<locals>`` qualname would fail Modal's global-scope check."""
-    for (gpu, max_inputs), cls in modal_app_module.ENGINE_BY_KEY.items():
-        class_name = modal_app_module._engine_class_name(gpu, max_inputs)
+    classes = [
+        (modal_app_module._engine_class_name(gpu, mi), cls)
+        for (gpu, mi), cls in modal_app_module.ENGINE_BY_KEY.items()
+    ] + [
+        (modal_app_module.model_engine_name(model), cls)
+        for model, cls in modal_app_module.ENGINE_BY_MODEL.items()
+    ]
+    for class_name, cls in classes:
         assert cls.__name__ == class_name
         assert cls.__qualname__ == class_name  # clean — no `_build_engine.<locals>.` prefix
         assert getattr(modal_app_module, class_name) is cls  # reachable as a module global by name

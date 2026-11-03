@@ -31,6 +31,26 @@ WORKFLOW_DIR = REPO_ROOT / ".github" / "workflows"
 UPSTREAM_REPOSITORY = "freesolo-co/flash"
 
 
+@pytest.mark.parametrize("filename", ["deploy-modal.yml", "deploy-modal-dev.yml"])
+def test_qwen_rollout_waits_for_active_pool_startup(filename):
+    from flash.serving.app.timeouts import ROUTER_TIMEOUT_SECONDS
+
+    workflow = _load(WORKFLOW_DIR / filename)
+    job = workflow["jobs"]["deploy"]
+    deployment = next(
+        step["run"]
+        for step in _steps(job)
+        if step.get("name") in {"Deploy serving", "Deploy development serving"}
+    )
+    assert "--strategy rolling" in deployment
+    readiness = next(
+        step["run"] for step in _steps(job) if "serving readiness" in step.get("name", "")
+    )
+    budget = int(re.search(r"SECONDS \+ (\d+)", readiness)[1])
+    assert budget >= ROUTER_TIMEOUT_SECONDS + 60
+    assert job["timeout-minutes"] * 60 >= budget + 15 * 60
+
+
 def test_deepinfer_warm_rollout_is_opt_in_and_verifies_the_replacement():
     workflow = yaml.safe_load((WORKFLOW_DIR / "deploy-deepinfer.yml").read_text())
     assert workflow["concurrency"]["cancel-in-progress"] is False
