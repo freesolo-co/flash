@@ -445,7 +445,6 @@ def test_one_engine_class_per_distinct_engine_key(modal_app_module):
         ("L40S", 8),
         ("L40S", 64),
         ("H100", 8),
-        ("H100", 64),
         ("H200", 8),
     }
 
@@ -480,7 +479,7 @@ def test_class_names_are_distinct_and_modal_safe(modal_app_module):
         ("Qwen/Qwen3.5-0.8B", "L4", 64),
         ("Qwen/Qwen3.5-4B", "L40S", 8),
         ("Qwen/Qwen3.5-9B", "L40S", 64),
-        ("Qwen/Qwen3.5-9B-Base", "H100", 64),
+        ("Qwen/Qwen3.5-9B-Base", "L40S", 64),
         ("Qwen/Qwen3.8-27B", "H100", 8),
         ("Qwen/Qwen3.6-35B-A3B", "H200", 8),
     ],
@@ -885,6 +884,18 @@ def test_every_catalog_model_forwards_its_reasoning_parser(
 ):
     args = _capture_engine_args(modal_app_module, monkeypatch, tmp_path, base_model)
     assert args.reasoning_parser == "qwen3"
+
+
+@pytest.mark.parametrize("base_model", base_models())
+def test_hosted_multimodal_args_preserve_images_without_reserving_video(
+    modal_app_module, monkeypatch, tmp_path, base_model: str
+):
+    from flash.serving.src.engine.model_config import image_limit_for
+
+    args = _capture_engine_args(modal_app_module, monkeypatch, tmp_path, base_model)
+    image_limit = image_limit_for(base_model)
+    expected = None if image_limit is None else {"image": image_limit, "video": 0}
+    assert args.limit_mm_per_prompt == expected
 
 
 def test_hosted_hot_pools_remain_unpinned(modal_app_module, monkeypatch, tmp_path):

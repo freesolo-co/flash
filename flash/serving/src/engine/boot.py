@@ -75,7 +75,10 @@ def _multimodal_args(
     if image_limit is None:
         return {}
     return {
-        "limit_mm_per_prompt": {"image": image_limit},
+        # Hosted requests accept text and images, never video. Leaving video unspecified
+        # makes vLLM reserve/profile its default video input, which can consume the KV
+        # budget on L40S even though that input is unreachable through our API.
+        "limit_mm_per_prompt": {"image": image_limit, "video": 0},
         "mm_processor_cache_gb": 0,
         "enable_tower_connector_lora": True,
     }

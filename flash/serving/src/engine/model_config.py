@@ -38,7 +38,7 @@ from flash.serving.src.engine.prequant_config import (
 # checkpoints published to the operator HF org.
 #
 # sizing rationale. preallocated lora buffers and loaded checkpoint weights dominate engine vram.
-# The dense 0.8B uses L4, the BF16 4B and FP8 9B use L40S, the FP8 27B uses H100, and
+# The dense 0.8B uses L4, the BF16 4B and both FP8 9B models use L40S, the FP8 27B uses H100, and
 # the BF16 35B MoE uses H200.
 #   - Qwen3.6-35B-A3B (vision-language MoE; arch ``Qwen3_5MoeForConditionalGeneration``) -> H200
 #     (141 GB) with the base bf16 weights, 6 x 64 LoRA at native 256k. bf16 (not FP8) is the one path giving
@@ -116,7 +116,7 @@ SERVING_MODELS: list[dict[str, Any]] = [
     {
         "base_model": "Qwen/Qwen3.5-9B-Base",
         "image_input_limit": MAX_IMAGES_PER_CONVERSATION,
-        "gpu": "H100",
+        "gpu": "L40S",
         "engine": {
             # FP8 conversion of the pinned Base weights; never alias the Instruct checkpoint.
             "model_revision": "b1a2cf5f5e7bb4ad786e206f834569be3a3d8aa9",
