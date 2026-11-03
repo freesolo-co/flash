@@ -17,8 +17,16 @@ from flash.content.image_descriptors import MAX_IMAGES_PER_CONVERSATION
 from flash.content.reasoning_normalization import (
     messages_for_chat_template as _messages_for_chat_template,
 )
+from flash.engine.worker.train.core.child.tool_messages import (
+    TOOL_MESSAGE_KEYS,
+    template_tool_messages,
+    tool_message_fields,
+)
 
 _ALLOWED_MESSAGE_KEYS = frozenset({"role", "content", "reasoning_content"})
+# the processor glue path renders without tools, and a tool environment's images would need it to
+# render with them; refuse rather than glue a reply whose declarations silently disappeared.
+_TOOL_IMAGE_REPLY_ERROR = "environment replies with images are not supported for tool environments"
 _PROBE_PREFIX = "flash-env-glue-probe"
 # the media block types verl's own dataset parser substitutes for a placeholder, and the exact set
 # it then extracts (rl_dataset.py `_build_messages`: `<image>`/`<video>`/`<audio>` become blocks of
@@ -122,7 +130,36 @@ def content_block_text(content, *, source: str, position: int) -> str:
     return "".join(parts)
 
 
-def validate_structured_messages(messages: list[dict], *, source: str) -> list[dict]:
+def _message_metadata(message: dict, *, source: str, position: int, tools: bool) -> dict:
+    """the validated non-content fields one transcript message keeps.
+
+    ``tools`` admits the openai tool-call fields, and only for an environment that declares tools:
+    without them the template cannot render a call natively, so a tool-free transcript keeps
+    rejecting them rather than training on a turn the model never saw.
+    """
+    allowed = _ALLOWED_MESSAGE_KEYS | TOOL_MESSAGE_KEYS if tools else _ALLOWED_MESSAGE_KEYS
+    extras = sorted(key for key in message if key not in allowed)
+    if extras:
+        raise ValueError(
+            f"{source} message {position} carries unsupported transcript metadata {extras}; "
+            "tool names, call ids, tool calls, and other message fields cannot be represented "
+            "in a role/content multi-turn transcript"
+        )
+    role = message.get("role")
+    reasoning = message.get("reasoning_content")
+    if not isinstance(role, str) or not role.strip():
+        raise ValueError(f"{source} message {position} has an invalid role")
+    if "reasoning_content" in message and not isinstance(reasoning, str):
+        raise ValueError(f"{source} message {position} reasoning_content must be text")
+    metadata = {"reasoning_content": reasoning} if reasoning is not None else {}
+    if tools:
+        metadata.update(tool_message_fields(message, source=source, position=position))
+    return metadata
+
+
+def validate_structured_messages(
+    messages: list[dict], *, source: str, tools: bool = False
+) -> list[dict]:
     """validate and canonicalize role/content messages without dropping media placement."""
     if not isinstance(messages, list):
         raise ValueError(f"{source} messages must be a list")
@@ -130,21 +167,12 @@ def validate_structured_messages(messages: list[dict], *, source: str) -> list[d
     for position, message in enumerate(messages):
         if not isinstance(message, dict):
             raise ValueError(f"{source} message {position} must be an object")
-        extras = sorted(key for key in message if key not in _ALLOWED_MESSAGE_KEYS)
-        if extras:
-            raise ValueError(
-                f"{source} message {position} carries unsupported transcript metadata {extras}; "
-                "tool names, call ids, tool calls, and other message fields cannot be represented "
-                "in a role/content multi-turn transcript"
-            )
-        role = message.get("role")
+        metadata = _message_metadata(message, source=source, position=position, tools=tools)
+        role = message["role"]
         content = message.get("content")
-        reasoning = message.get("reasoning_content")
-        if not isinstance(role, str) or not role.strip():
-            raise ValueError(f"{source} message {position} has an invalid role")
-        if "reasoning_content" in message and not isinstance(reasoning, str):
-            raise ValueError(f"{source} message {position} reasoning_content must be text")
-        metadata = {"reasoning_content": reasoning} if reasoning is not None else {}
+        if content is None and "tool_calls" in metadata:
+            # an openai assistant turn that only calls tools may carry null content.
+            content = ""
         if isinstance(content, str):
             normalized.append({"role": role, "content": content, **metadata})
             continue
@@ -190,7 +218,7 @@ def validate_structured_messages(messages: list[dict], *, source: str) -> list[d
 
 
 def validate_transcript_messages(
-    messages: list[dict], *, source: str, allow_content_blocks: bool = False
+    messages: list[dict], *, source: str, allow_content_blocks: bool = False, tools: bool = False
 ) -> list[dict]:
     """require the exact role/content transcript shape the child rollout loops can represent.
 
@@ -206,30 +234,19 @@ def validate_transcript_messages(
     for position, message in enumerate(messages):
         if not isinstance(message, dict):
             raise ValueError(f"{source} message {position} must be an object")
-        extras = sorted(key for key in message if key not in _ALLOWED_MESSAGE_KEYS)
-        if extras:
-            raise ValueError(
-                f"{source} message {position} carries unsupported transcript metadata {extras}; "
-                "tool names, call ids, tool calls, and other message fields cannot be represented "
-                "in a role/content multi-turn transcript"
-            )
-        role = message.get("role")
+        metadata = _message_metadata(message, source=source, position=position, tools=tools)
+        role = message["role"]
         content = message.get("content")
-        reasoning = message.get("reasoning_content")
-        if not isinstance(role, str) or not role.strip():
-            raise ValueError(f"{source} message {position} has an invalid role")
-        if "reasoning_content" in message and not isinstance(reasoning, str):
-            raise ValueError(f"{source} message {position} reasoning_content must be text")
+        if content is None and "tool_calls" in metadata:
+            # an openai assistant turn that only calls tools may carry null content.
+            content = ""
         if allow_content_blocks and isinstance(content, list):
             # a multimodal prompt arrives as content BLOCKS, not a string; flatten to the text this
             # transcript can represent. the media rides separately as decoded pixels.
             content = content_block_text(content, source=source, position=position)
         elif not isinstance(content, str):
             raise ValueError(f"{source} message {position} content must be text for multi-turn")
-        normalized_message = {"role": role, "content": content}
-        if reasoning is not None:
-            normalized_message["reasoning_content"] = reasoning
-        normalized.append(normalized_message)
+        normalized.append({"role": role, "content": content, **metadata})
     return normalized
 
 
@@ -265,28 +282,52 @@ def dedup_seam_terminator(response_ids: list[int], glue_ids: list[int]) -> list[
     return glue_ids
 
 
+def tool_template_kwargs(tools: list[dict] | None) -> dict[str, Any]:
+    """the ``tools=`` chat-template kwarg of a tool environment, and nothing for any other.
+
+    ``tools`` is already the serving wire form (``tools_wire(normalize_tools(...))``), so every
+    render that passes it -- prompt, glue, and the serving request -- sees identical declarations.
+    omitting the key, rather than passing ``tools=None``, keeps a tool-free render byte-identical
+    to the one before tools existed.
+    """
+    return {} if tools is None else {"tools": tools}
+
+
 class EnvGlueTokenizer:
     """derive exact inter-turn glue without re-rendering accepted transcript history."""
 
-    def __init__(self, tokenizer, *, thinking: bool, cache_size: int = 8192) -> None:
+    def __init__(
+        self,
+        tokenizer,
+        *,
+        thinking: bool,
+        tools: list[dict] | None = None,
+        cache_size: int = 8192,
+    ) -> None:
         self.tokenizer = tokenizer
         self.thinking = bool(thinking)
+        self.tools = tools
         self.cache_size = int(cache_size)
         self.cache: dict[str, list[int]] = {}
 
     def __call__(self, env_messages: list[dict]) -> list[int]:
-        messages = validate_transcript_messages(env_messages, source="environment reply")
+        messages = validate_transcript_messages(
+            env_messages, source="environment reply", tools=self.tools is not None
+        )
         key = json.dumps(messages, sort_keys=True, separators=(",", ":"))
         cached = self.cache.get(key)
         if cached is not None:
             return list(cached)
         probe = _unique_glue_probe(messages)
         text = self.tokenizer.apply_chat_template(
-            _messages_for_chat_template(_glue_conversation(probe, messages)),
+            template_tool_messages(
+                _messages_for_chat_template(_glue_conversation(probe, messages))
+            ),
             add_generation_prompt=True,
             tokenize=False,
             enable_thinking=self.thinking,
             preserve_thinking=False,
+            **tool_template_kwargs(self.tools),
         )
         first = text.find(probe)
         if first == -1 or text.find(probe, first + len(probe)) != -1:
@@ -580,16 +621,22 @@ def parent_environment_glue(
     package_root: str | None,
     *,
     thinking: bool,
+    tools: list[dict] | None = None,
 ) -> tuple[list[int], list[str]]:
     """derive the authenticated parent copy of one reply's glue and ordered image digests."""
-    structured = validate_structured_messages(messages, source="environment reply")
+    structured = validate_structured_messages(
+        messages, source="environment reply", tools=tools is not None
+    )
     if not image_descriptors:
         transcript = validate_transcript_messages(
             structured,
             source="environment reply",
             allow_content_blocks=True,
+            tools=tools is not None,
         )
-        return EnvGlueTokenizer(tokenizer, thinking=thinking)(transcript), []
+        return EnvGlueTokenizer(tokenizer, thinking=thinking, tools=tools)(transcript), []
+    if tools is not None:
+        raise ValueError(_TOOL_IMAGE_REPLY_ERROR)
     if processor is None:
         raise ValueError("environment reply carries images but the parent has no processor")
     from flash.content.multimodal import decode_image_descriptors
@@ -625,9 +672,10 @@ class EnvironmentReplyGlue:
 class EnvGlueProcessor:
     """derive text or processor-aware environment glue and decode only newly transported images."""
 
-    def __init__(self, loop_self, *, thinking: bool) -> None:
+    def __init__(self, loop_self, *, thinking: bool, tools: list[dict] | None = None) -> None:
         self.loop_self = loop_self
-        self.text = EnvGlueTokenizer(loop_self.tokenizer, thinking=thinking)
+        self.tools = tools
+        self.text = EnvGlueTokenizer(loop_self.tokenizer, thinking=thinking, tools=tools)
         self.apply_chat_template_kwargs = dict(
             getattr(loop_self, "apply_chat_template_kwargs", {}) or {}
         )
@@ -640,15 +688,19 @@ class EnvGlueProcessor:
         image_data_uris: list[str] | None = None,
     ) -> EnvironmentReplyGlue:
         image_data_uris = list(image_data_uris or ())
-        structured = validate_structured_messages(messages, source="environment reply")
+        tools = self.tools is not None
+        structured = validate_structured_messages(messages, source="environment reply", tools=tools)
         _validate_reply_image_count(structured, image_data_uris)
         if not image_data_uris:
             text_messages = validate_transcript_messages(
                 structured,
                 source="environment reply",
                 allow_content_blocks=True,
+                tools=tools,
             )
             return EnvironmentReplyGlue(self.text(text_messages), [], [])
+        if tools:
+            raise ValueError(_TOOL_IMAGE_REPLY_ERROR)
         processor = getattr(self.loop_self, "processor", None)
         if processor is None:
             raise ValueError("environment reply carries images but the rollout has no processor")
@@ -673,9 +725,9 @@ class EnvGlueProcessor:
             raise
 
 
-def validate_glue_template(tokenizer, *, thinking: bool) -> None:
+def validate_glue_template(tokenizer, *, thinking: bool, tools: list[dict] | None = None) -> None:
     """fail before rollout when assistant content cannot round-trip through the template."""
-    EnvGlueTokenizer(tokenizer, thinking=thinking)(
+    EnvGlueTokenizer(tokenizer, thinking=thinking, tools=tools)(
         [{"role": "user", "content": "flash multi-turn glue validation"}]
     )
 
@@ -848,12 +900,16 @@ class EpisodePrompt:
         return snapshot
 
 
-async def prepare_episode_prompt(loop_self, raw_prompt) -> EpisodePrompt:
+async def prepare_episode_prompt(
+    loop_self, raw_prompt, *, tools: list[dict] | None = None
+) -> EpisodePrompt:
     """extract media and ids before building the canonical structured prompt view.
 
     order matters: an image prompt arrives as content blocks, so the media and block-rendered ids
     must be captured before structured validation. the canonical view preserves media placement for
     bridge authentication and rejects unsupported blocks and message metadata before rollout.
+    ``tools`` reaches verl's native ``tools=`` render, the same declarations the parent froze the
+    prompt ids with, so a tool environment's first prompt matches serving's.
     """
     messages = [dict(message) for message in raw_prompt]
     for message in messages:
@@ -877,6 +933,7 @@ async def prepare_episode_prompt(loop_self, raw_prompt) -> EpisodePrompt:
     mm_processor_kwargs = loop_self._get_mm_processor_kwargs(audios)
     prompt_ids = await loop_self.ct_build_initial_tokens(
         messages,
+        tools=tools,
         images=images,
         videos=videos,
         audios=audios,

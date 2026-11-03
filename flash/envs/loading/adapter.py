@@ -71,6 +71,29 @@ def _copied_message_list(value: Any, *, row_id: Any, source: str) -> list[dict]:
     return [dict(message) for message in value]
 
 
+def _declared_tool_schemas(sdk_env: object) -> tuple | None:
+    """The environment's native tool declarations, validated exactly as serving validates them.
+
+    An environment opts in with ``tool_schemas``: a list of OpenAI function declarations (the
+    ``tools`` array of a chat request), as an attribute or a zero-argument method. The name is
+    deliberately not ``tools``, which environments already use for their own toolkit objects.
+    ``normalize_tools`` is the serving request validator, so a declaration serving would refuse
+    fails here at load, naming the problem, instead of training against a prompt serving cannot
+    reproduce. Absent (or None) means a tool-free environment.
+    """
+    declared = getattr(sdk_env, "tool_schemas", None)
+    if callable(declared):
+        declared = declared()
+    if declared is None:
+        return None
+    from flash.serve.request.tool_calls import normalize_tools
+
+    try:
+        return normalize_tools(list(declared) if isinstance(declared, tuple) else declared)
+    except ValueError as exc:
+        raise ValueError(f"environment tool_schemas: {exc}") from exc
+
+
 def _completion_for_scoring(completion: str, state: dict | None) -> str:
     if state:
         raw = state.get("raw")
@@ -121,7 +144,10 @@ class FreesoloEnvironment(BaseEnvironment):
         # only an explicit class capability opts in. instance data and environment params cannot
         # turn dynamic image observations on accidentally.
         self.image_observations = getattr(type(sdk_env), "image_observations", False) is True
+        # trl-style function-calling (flash executing python callables) stays unsupported;
+        # `tool_schemas` below is the environment-executed native tool contract instead.
         self.is_tool_env = False
+        self._tool_schemas = _declared_tool_schemas(sdk_env)
         self._max_turns_cache: int | None = None
         self._dataset_cache: list[dict] | None = None
         # cached dataset rows own the task that prompt preparation mutates. single-turn scoring
@@ -549,7 +575,12 @@ class FreesoloEnvironment(BaseEnvironment):
         return bool(self._score_one(completion, example, state).resolved_success())
 
     def tools(self) -> list:
-        return []
+        """The declared tools in serving wire form (``tools_wire(normalize_tools(...))``), or []."""
+        if self._tool_schemas is None:
+            return []
+        from flash.serve.request.tool_calls import tools_wire
+
+        return tools_wire(self._tool_schemas)
 
     def new_rollout_state(self, example: dict, prepared_prompt: list[dict] | None = None) -> dict:
         if prepared_prompt is None:
@@ -587,7 +618,7 @@ class FreesoloEnvironment(BaseEnvironment):
         # what the single-turn path grades. without this the two modes give a grader different shapes
         # of the same completion, so an env can score correctly in one mode and silently mis-grade in
         # the other.
-        msg = {"role": "assistant", "content": content}
+        msg = self._assistant_message(content)
         state.setdefault("messages", []).append(msg)
         state.setdefault("turns", []).append(
             self._EnvironmentTurn(role="assistant", content=content)
@@ -596,8 +627,32 @@ class FreesoloEnvironment(BaseEnvironment):
         # step_episode drives the episode, it does not grade it: it parses the action, and often
         # requires assistant_response to equal messages[-1]["content"]. that message is raw, so
         # handing it the stripped text would step the env on something the model never emitted.
+        # a tool environment is the exception: messages[-1] is the parsed turn (content without
+        # the call text, plus tool_calls) while assistant_response stays the raw text.
         state["raw_response_text"] = content
         return msg
+
+    def _assistant_message(self, content: str) -> dict:
+        """The transcript message for one raw assistant turn.
+
+        A tool environment gets the turn serving would return for the same text: the serving
+        parser splits it into content and OpenAI ``tool_calls`` (arguments as a JSON string), after
+        the reasoning close when thinking is on. Text that is not a well-formed call of a declared
+        tool stays plain content with no ``tool_calls``, as serving answers it, so a malformed call
+        is a bad action the environment sees rather than a crashed rollout.
+        """
+        if self._tool_schemas is None:
+            return {"role": "assistant", "content": content}
+        from flash.serve.runtime.reasoning_tools import parse_tool_output
+
+        parsed = parse_tool_output(content, self._tool_schemas, thinking=self.thinking)
+        if not parsed.tools_called:
+            return {"role": "assistant", "content": content}
+        return {
+            "role": "assistant",
+            "content": parsed.content or "",
+            "tool_calls": [call.wire() for call in parsed.calls],
+        }
 
     def _scored_turn_text(self, content: str):
         """The assistant turn as the scorer should see it: answer-only, reasoning available.

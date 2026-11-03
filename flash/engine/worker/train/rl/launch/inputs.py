@@ -40,7 +40,10 @@ from flash.engine.plan.steps import (
 from flash.engine.worker.io.heartbeat import liveness_heartbeat
 from flash.engine.worker.runtime.rng import backend_seed, seed_training_rngs
 from flash.engine.worker.runtime.state import WorkerContext
-from flash.engine.worker.train.core.child.glue import validate_glue_template
+from flash.engine.worker.train.core.child.glue import (
+    tool_template_kwargs,
+    validate_glue_template,
+)
 from flash.engine.worker.train.core.rollout.generation import generation_eos_from_cached_config
 from flash.engine.worker.train.entry.backend_common import (
     clamp_engine_len,
@@ -74,6 +77,46 @@ def _validate_grpo_environment(env):
     if int(getattr(env, "max_turns", 0) or 0) <= 0:
         raise RuntimeError("multi-turn grpo environment requires a positive bounded turn limit")
     return True
+
+
+def _resolve_grpo_tools(env, train, *, multi_turn, multimodal, stop_sequences):
+    """the environment's native tool declarations in serving wire form, or None for none.
+
+    every multi-turn render passes these as ``tools=`` (prompt, generation prefix, glue), so the
+    policy trains on exactly the prompt serving renders for the same conversation. the shapes that
+    could not keep that promise are refused here, before anything launches.
+    """
+    tools_of = getattr(env, "tools", None)
+    tools = list(tools_of() or ()) if callable(tools_of) else []
+    if not tools:
+        return None
+    if not multi_turn:
+        raise RuntimeError(
+            "environment tool_schemas are supported only for multi-turn grpo; the environment "
+            "executes the calls in step_episode, which a single-turn rollout never reaches"
+        )
+    if multimodal:
+        raise RuntimeError("environment tool_schemas are not supported on image-bearing grpo runs")
+    from flash.serve.request.tool_calls import (
+        normalize_tools,
+        tools_wire,
+        validate_tool_stop_sequences,
+    )
+
+    normalized = normalize_tools(tools)
+    # the same refusal serving applies to a tool request: a stop string inside the call grammar
+    # would cut every call short, so no turn could ever parse as one.
+    validate_tool_stop_sequences(list(stop_sequences), tools=normalized, tool_choice="auto")
+    for example in train:
+        row_tools = example.get("tools") if isinstance(example, dict) else None
+        # a dataset shared with sft may carry per-row `tools`; rl renders the environment's, so a
+        # row declaring anything else would train on a prompt its sft twin never saw.
+        if row_tools is not None and tools_wire(normalize_tools(row_tools)) != tools:
+            raise ValueError(
+                "a dataset row's tools differ from the environment's tool_schemas; multi-turn "
+                "grpo renders the environment's declarations for every row"
+            )
+    return tools
 
 
 def _resolve_grpo_options(train_spec, rl, multi_turn, *, context: WorkerContext):
@@ -216,7 +259,16 @@ def _grpo_is_multimodal(env, train, message_prompts):
 
 
 def _resolve_sequence_lengths(
-    model_id, model_revision, train_spec, rl, gcfg, tok, multi_turn, *, context: WorkerContext
+    model_id,
+    model_revision,
+    train_spec,
+    rl,
+    gcfg,
+    tok,
+    multi_turn,
+    *,
+    context: WorkerContext,
+    tools: list[dict] | None = None,
 ):
     from flash.engine.plan.vram import grpo_completion_len, grpo_rollout_seq_len
 
@@ -248,7 +300,7 @@ def _resolve_sequence_lengths(
         # the child derives inter-turn glue by probing this template. a template that cannot
         # round-trip assistant content would fail on the first environment reply, after the rollout
         # has already burned gpu time -- fail here instead, before anything is launched.
-        validate_glue_template(tok, thinking=bool(context.config.thinking))
+        validate_glue_template(tok, thinking=bool(context.config.thinking), tools=tools)
     return {
         "max_completion": max_completion,
         "vllm_max_len": vllm_max_len,
@@ -266,6 +318,7 @@ def _build_grpo_prompts(
     prompt_budget,
     *,
     context: WorkerContext,
+    tools: list[dict] | None = None,
 ):
     from flash.content.multimodal import normalize_prompt_images
 
@@ -307,6 +360,7 @@ def _build_grpo_prompts(
                 add_generation_prompt=True,
                 enable_thinking=context.config.thinking,
                 preserve_thinking=False,
+                **tool_template_kwargs(tools),
             )
             prompt_ids = list(tok(rendered, add_special_tokens=False).input_ids)
             prompt_len = len(prompt_ids)
@@ -412,6 +466,7 @@ def _assemble_grpo_inputs(
     warmstart_adapter,
     pinned,
     context: WorkerContext,
+    tools: list[dict] | None = None,
 ):
     return {
         "env": env,
@@ -420,6 +475,8 @@ def _assemble_grpo_inputs(
         "multimodal": multimodal,
         "multi_turn": multi_turn,
         "max_turns": int(getattr(env, "max_turns", 0) or 0) if multi_turn else 0,
+        # serving wire-form tool declarations, or None for a tool-free environment.
+        "tools": tools,
         # the child decides whether an assistant turn ended naturally or was cut off, and it has no
         # access to the model config -- so the full halting set is resolved here and handed over.
         # Keep every checkpoint EOS plus any chat-turn boundary the model needs. Base checkpoints
@@ -508,6 +565,13 @@ def _resolve_grpo_inputs(*, context: WorkerContext):
 
     train, message_prompts = _load_training_records(env, _t, context=context)
     multimodal = _grpo_is_multimodal(env, train, message_prompts)
+    tools = _resolve_grpo_tools(
+        env,
+        train,
+        multi_turn=multi_turn,
+        multimodal=multimodal,
+        stop_sequences=options["stop_sequences"],
+    )
     targeting = resolve_lora_targeting(model_id, algorithm="grpo", multimodal=multimodal)
     if warmstart_adapter:
         options["lora_rank"], options["lora_alpha"] = _resolve_warmstart_config(
@@ -544,7 +608,15 @@ def _resolve_grpo_inputs(*, context: WorkerContext):
         tok.pad_token = tok.eos_token
 
     lengths = _resolve_sequence_lengths(
-        model_id, model_revision, _t, rl, options["gcfg"], tok, multi_turn, context=context
+        model_id,
+        model_revision,
+        _t,
+        rl,
+        options["gcfg"],
+        tok,
+        multi_turn,
+        context=context,
+        tools=tools,
     )
     prompts = _build_grpo_prompts(
         train,
@@ -555,6 +627,7 @@ def _resolve_grpo_inputs(*, context: WorkerContext):
         package_root,
         lengths["prompt_budget"],
         context=context,
+        tools=tools,
     )
     prompt_opened_thinking = bool(
         context.config.thinking
@@ -595,4 +668,5 @@ def _resolve_grpo_inputs(*, context: WorkerContext):
         warmstart_adapter=warmstart_adapter,
         pinned=pinned,
         context=context,
+        tools=tools,
     )
