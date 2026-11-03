@@ -445,6 +445,16 @@ def test_legacy_engine_keys_are_retained_for_draining_routers(modal_app_module):
     }
 
 
+def test_rollback_manifest_retains_every_registered_engine(modal_app_module):
+    from flash.serving.app.rollback import engine_manifest
+
+    manifest = engine_manifest("a" * 40)
+    classes = [*modal_app_module.ENGINE_BY_KEY.values(), *modal_app_module.ENGINE_BY_MODEL.values()]
+    assert set(manifest["classes"]) == {cls.__name__ for cls in classes}
+    for model, cls in modal_app_module.ENGINE_BY_MODEL.items():
+        assert manifest["classes"][cls.__name__] == [model]
+
+
 def test_engine_concurrency_rejects_malformed_catalog_values(modal_app_module, monkeypatch):
     mod = modal_app_module
 

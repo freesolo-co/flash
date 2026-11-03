@@ -463,6 +463,7 @@ jobs:
           ROLLBACK_DEPLOYMENT_ID: ${{ github.run_id }}-${{ github.run_attempt }}-rollback
           HEALTH_URL: https://serve.freesolo.co/healthz
         run: |
+          set -euo pipefail
           if [ -z "$PREVIOUS_SHA" ]; then
             echo "::error::Promotion failed and NO previous release was recorded, so the broken release is still live. Restore production manually."
             exit 1
@@ -474,6 +475,15 @@ jobs:
             exit 1
           fi
 
+          # Capture the forward dispatch contract before checkout removes its code.
+          # A bare predecessor deploy deletes new engine handles held by live routers.
+          rollback_bundle="$(mktemp -d)"
+          trap 'rm -rf "$rollback_bundle"' EXIT
+          if ! python -m flash.serving.app.rollback snapshot \
+            --source-sha "$CURRENT_SHA" --directory "$rollback_bundle"; then
+            echo "::error::Cannot preserve forward engine identities; refusing unsafe rollback."
+            exit 1
+          fi
           echo "Promotion failed; restoring ${PREVIOUS_SHA}."
           git checkout --quiet --force "$PREVIOUS_SHA"
 
@@ -505,13 +515,23 @@ jobs:
             exit 1
           fi
 
-          # the restored app must report the RESTORED sha, deployed from the restored tree.
+          # Build a compatibility artifact from the predecessor: retain forward handles,
+          # restore the predecessor's engine implementation, and gate router startup on
+          # active restored pools. Failure occurs before Modal mutates the deployment.
+          if ! python "$rollback_bundle/rollback.py" prepare \
+            --manifest "$rollback_bundle/manifest.json" --entrypoint "$rollback_app"; then
+            echo "::error::Previous release cannot retain active engine handles; refusing unsafe rollback."
+            exit 1
+          fi
+
+          # The source behavior is the predecessor; the distinct attempt identifies
+          # this rollback artifact and its forward-handle compatibility overlay.
           FREESOLO_DEPLOYMENT_SHA="$PREVIOUS_SHA" \
           FREESOLO_DEPLOYMENT_ID="$ROLLBACK_DEPLOYMENT_ID" \
-            modal deploy "$rollback_app"
+            modal deploy --strategy rolling "$rollback_app"
 
           response_file="$(mktemp)"
-          trap 'rm -f "$response_file"' EXIT
+          trap 'rm -f "$response_file"; rm -rf "$rollback_bundle"' EXIT
           # Match router startup: its full engine budget plus 60 seconds of headroom.
           deadline=$((SECONDS + 3660))
           restored=false
