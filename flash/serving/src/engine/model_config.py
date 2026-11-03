@@ -64,7 +64,8 @@ SERVING_MODELS: list[dict[str, Any]] = [
             "max_cpu_loras": 4,
             "max_lora_rank": 64,
             "max_model_len": 262144,
-            "max_num_seqs": 8,
+            # L4 sweep: 32 sequences improve short-prompt throughput ~2.4x over eight.
+            "max_num_seqs": 32,
             "enforce_eager": False,
             "reasoning_parser": "qwen3",
         },
@@ -128,9 +129,9 @@ SERVING_MODELS: list[dict[str, Any]] = [
             "max_cpu_loras": 16,
             "max_lora_rank": 128,
             "max_model_len": 262144,
-            # Single-H100 sweep qualified thirty-two sequences, including rank-128
-            # q_proj LoRA at 32k prompts; benchmark_qwen_serving.py reproduces the check.
-            "max_num_seqs": 32,
+            # Matched-load H100 sweep: 64 improves both short and 4k prompts;
+            # 128 regresses the 4k workload. benchmark_qwen_serving.py reproduces it.
+            "max_num_seqs": 64,
             "enforce_eager": False,
             "reasoning_parser": "qwen3",
         },

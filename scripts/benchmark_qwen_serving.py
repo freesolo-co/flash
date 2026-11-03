@@ -1,6 +1,9 @@
 """Paid, isolated throughput sweep; never deploys or routes customer traffic.
 
 Run: modal run scripts/benchmark_qwen_serving.py --base-model Qwen/Qwen3.5-9B-Base
+Use --caps and --concurrency to compare scheduler caps at the same offered load.
+Use --profile stress to add mixed lengths and a full-cap 32k LoRA burst.
+QWEN_BENCH_IMAGE_ID optionally reuses an already-built serving image.
 Each sequence cap gets a fresh single-use GPU. Results exclude startup and report
 aggregate output tokens / wall seconds for a concurrent wave, not summed per-request
 rates. Unique cache salts prevent repeated prompts from inflating prefix-cache gains.
@@ -10,6 +13,9 @@ kernel/memory smoke test, not a quality or full multimodal adapter qualification
 
 import asyncio
 import json
+import math
+import os
+import subprocess
 import time
 import uuid
 from pathlib import Path
@@ -20,6 +26,8 @@ from flash.serving.app.modal_app import engine_secrets, hf_cache_volume, image
 from flash.serving.src.engine.model_config import base_models, gpu_for
 
 app = modal.App("flash-qwen-throughput-qualification")
+if image_id := os.environ.get("QWEN_BENCH_IMAGE_ID"):
+    image = modal.Image.from_id(image_id).add_local_python_source("flash")
 
 
 @app.function(
@@ -28,10 +36,10 @@ app = modal.App("flash-qwen-throughput-qualification")
     max_containers=1,
     buffer_containers=0,
     single_use_containers=True,
-    timeout=2400,
+    timeout=3600,
     volumes={"/vol/hosting-cache": hf_cache_volume},
 )
-async def measure(model, sequence_cap):
+async def measure(model, sequence_cap, offered_concurrency, profile):
     from vllm import SamplingParams
 
     from flash.serving.src.engine import model_config
@@ -47,14 +55,30 @@ async def measure(model, sequence_cap):
         "A checklist for testing reliable software systems. " * 5000, add_special_tokens=False
     )
 
+    def gpu_memory():
+        # vLLM owns a child process, so parent torch allocator statistics miss its VRAM.
+        return subprocess.check_output(
+            ["nvidia-smi", "--query-gpu=memory.used,memory.total", "--format=csv,noheader,nounits"],
+            text=True,
+        ).strip()
+
+    def percentile(values, fraction):
+        ordered = sorted(values)
+        return ordered[max(0, math.ceil(len(ordered) * fraction) - 1)]
+
     async def wave(concurrency, prompt_length, lora=None):
-        async def request():
+        async def request(index):
+            length = (
+                prompt_length[index % len(prompt_length)]
+                if isinstance(prompt_length, list)
+                else prompt_length
+            )
             request_id = "bench-" + uuid.uuid4().hex
             start = time.monotonic()
             first = None
             last = None
             stream = engine.engine.generate(
-                {"prompt_token_ids": tokens[:prompt_length], "cache_salt": request_id},
+                {"prompt_token_ids": tokens[:length], "cache_salt": request_id},
                 SamplingParams(temperature=0, max_tokens=256, ignore_eos=True),
                 request_id,
                 lora_request=lora,
@@ -76,8 +100,10 @@ async def measure(model, sequence_cap):
                 "elapsed": time.monotonic() - start,
             }
 
+        memory_before = gpu_memory()
         start = time.monotonic()
-        rows = await asyncio.gather(*(request() for _ in range(concurrency)))
+        async with asyncio.timeout(240):
+            rows = await asyncio.gather(*(request(index) for index in range(concurrency)))
         elapsed = time.monotonic() - start
         return {
             "concurrency": concurrency,
@@ -87,12 +113,19 @@ async def measure(model, sequence_cap):
             "output_tokens_per_second": sum(r["tokens"] for r in rows) / elapsed,
             "max_ttft": max(r["ttft"] for r in rows),
             "mean_ttft": sum(r["ttft"] for r in rows) / len(rows),
+            "p50_ttft": percentile([r["ttft"] for r in rows], 0.5),
+            "p95_ttft": percentile([r["ttft"] for r in rows], 0.95),
+            "p50_latency": percentile([r["elapsed"] for r in rows], 0.5),
+            "p95_latency": percentile([r["elapsed"] for r in rows], 0.95),
+            "gpu_memory_mib_before": memory_before,
+            "gpu_memory_mib_after": gpu_memory(),
+            "completed_requests": len(rows),
             "lora": lora is not None,
         }
 
     results = []
-    for length in (512, 4096):
-        for concurrency in (1, 6, 8, 16, 32):
+    for length in () if profile == "stress" else (512, 4096):
+        for concurrency in offered_concurrency:
             for repeat in range(2):
                 row = await wave(concurrency, length)
                 row["repeat"] = repeat
@@ -136,12 +169,20 @@ async def measure(model, sequence_cap):
     lora = LoRARequest("throughput", 1, str(root))
     await engine.engine.add_lora(lora)
     for length in (512, 4096, 32768):
-        row = await wave(sequence_cap, length, lora)
+        # Keep the long-context smoke bounded. A full high-cap 32k wave is a
+        # separate overload experiment, not representative of mixed production input.
+        row = await wave(min(sequence_cap, 8) if length == 32768 else sequence_cap, length, lora)
         results.append(row)
         print("BENCH", json.dumps({"sequence_cap": sequence_cap, **row}), flush=True)
+    if profile == "stress":
+        for length in ([512] * 11 + [4096] * 4 + [32768], 32768):
+            row = await wave(sequence_cap, length, lora)
+            results.append(row)
+            print("BENCH", json.dumps({"sequence_cap": sequence_cap, **row}), flush=True)
     result = {
         "model": model,
         "sequence_cap": sequence_cap,
+        "profile": profile,
         "boot_seconds": boot,
         "health": engine._health(),
         "measurements": results,
@@ -155,20 +196,27 @@ async def measure(model, sequence_cap):
 @app.local_entrypoint()
 def main(
     base_model: str = "Qwen/Qwen3.5-9B-Base",
-    caps: str = "8,16,32",
+    caps: str = "32,64,128",
+    concurrency: str = "1,16,32,64,128",
+    profile: str = "sweep",
     output: str = "results/qwen-throughput.json",
 ):
     if base_model not in base_models():
         raise ValueError(f"Unknown hosted Qwen model: {base_model}")
+    if profile not in ("sweep", "stress"):
+        raise ValueError("Profile must be sweep or stress")
     sequence_caps = [int(value) for value in caps.split(",")]
-    if not sequence_caps or any(value < 1 or value > 64 for value in sequence_caps):
-        raise ValueError("Sequence caps must be between 1 and 64")
+    if not sequence_caps or any(value < 1 or value > 128 for value in sequence_caps):
+        raise ValueError("Sequence caps must be between 1 and 128")
+    offered_concurrency = [int(value) for value in concurrency.split(",")]
+    if not offered_concurrency or any(value < 1 or value > 128 for value in offered_concurrency):
+        raise ValueError("Offered concurrency must be between 1 and 128")
     gpu = gpu_for(base_model)
-    benchmark = measure.with_options(gpu="H100!" if gpu == "H100" else gpu)
+    benchmark = measure.with_options(gpu="H100!" if gpu == "H100" else gpu, region="us")
     path = Path(output)
     path.parent.mkdir(parents=True, exist_ok=True)
     results = []
     for cap in sequence_caps:
-        results.append(benchmark.remote(base_model, cap))
+        results.append(benchmark.remote(base_model, cap, offered_concurrency, profile))
         path.write_text(json.dumps(results, indent=2) + "\n")
         print(f"Saved {base_model} sequence-cap {cap} measurements to {path}", flush=True)

@@ -441,11 +441,11 @@ def test_one_engine_class_per_distinct_engine_key(modal_app_module):
     """a loraengine class is built for each active gpu tier and concurrency key."""
     # Models sharing a GPU and concurrency key share a class, with separate containers.
     assert set(modal_app_module.ENGINE_BY_KEY) == {
-        ("L4", 8),
+        ("L4", 32),
         ("L40S", 8),
         ("L40S", 16),
         ("H100", 8),
-        ("H100", 32),
+        ("H100", 64),
         ("H200", 8),
     }
 
@@ -477,10 +477,10 @@ def test_class_names_are_distinct_and_modal_safe(modal_app_module):
 @pytest.mark.parametrize(
     ("model", "gpu", "sequences"),
     [
-        ("Qwen/Qwen3.5-0.8B", "L4", 8),
+        ("Qwen/Qwen3.5-0.8B", "L4", 32),
         ("Qwen/Qwen3.5-4B", "L40S", 8),
         ("Qwen/Qwen3.5-9B", "L40S", 16),
-        ("Qwen/Qwen3.5-9B-Base", "H100", 32),
+        ("Qwen/Qwen3.5-9B-Base", "H100", 64),
         ("Qwen/Qwen3.8-27B", "H100", 8),
         ("Qwen/Qwen3.6-35B-A3B", "H200", 8),
     ],
