@@ -58,9 +58,28 @@ def submit_custom(api, payload, *, client_train_schema=None):
         ) from error
 
 
-def connect(api, run_id, *, timeout=1200):
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
+_ATTACH_RETRY_MAX_SECONDS = 30.0
+
+
+def _transient_attach_error(exc):
+    """Whether a failed attach lookup can be retried rather than ending the run.
+
+    425 is the documented "GPU still provisioning" answer. A 5xx or a transport failure (no
+    status) means the control plane could not answer this time -- for example a slow Modal
+    tunnel lookup or an overloaded plane -- not that the run is gone. Treating those as fatal made
+    run_custom cancel healthy runs. Every other 4xx (ended run, auth, ownership) stays fatal.
+    """
+    if isinstance(exc, ApiError):
+        status = exc.status or 0
+        return status == 425 or status >= 500
+    return isinstance(exc, ClientError)
+
+
+def connect(api, run_id, *, timeout=1200, sleep=time.sleep, clock=time.monotonic):
+    deadline = clock() + timeout
+    failures = 0
+    last = None
+    while clock() < deadline:
         try:
             connection = api._request("GET", f"/v1/runs/{run_id}/custom")
             try:
@@ -70,13 +89,26 @@ def connect(api, run_id, *, timeout=1200):
                 client._http.timeout = 300
                 client.run_id = run_id
                 return client
-            except ClientError:
-                pass  # tunnel can exist before model loading finishes.
-        except ApiError as exc:
-            if exc.status != 425:
+            except ClientError as exc:
+                last = exc  # tunnel can exist before model loading finishes.
+            delay = 2.0
+        except ClientError as exc:
+            if not _transient_attach_error(exc):
                 raise
-        time.sleep(2)
-    raise TimeoutError(f"custom run {run_id} did not become ready")
+            last = exc
+            if isinstance(exc, ApiError) and exc.status == 425:
+                delay = 2.0
+            else:
+                failures += 1
+                delay = min(_ATTACH_RETRY_MAX_SECONDS, 2.0 * 2 ** min(failures, 4))
+                if failures == 1:
+                    print(
+                        f"control plane could not attach {run_id} yet ({exc}); retrying",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+        sleep(max(0.0, min(delay, deadline - clock())))
+    raise TimeoutError(f"custom run {run_id} did not become ready ({last})")
 
 
 def run_custom(args, spec, authored_train_keys):
