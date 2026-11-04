@@ -33,6 +33,11 @@ def upstream_chat_error(error: httpx.HTTPStatusError, *, checkpoint_id: str) -> 
     except (ValueError, AttributeError):
         pass
     headers = {}
+    request_id = response.headers.get("X-Freesolo-Auth-Request-Id", "")
+    if status == 503 and re.fullmatch(r"[a-f0-9]{32}", request_id):
+        headers["X-Freesolo-Auth-Request-Id"] = request_id
+        if response.headers.get("X-Freesolo-Inference-Started") == "false":
+            headers["X-Freesolo-Inference-Started"] = "false"
     if status in {429, 503}:
         # Retain a bounded numeric hint without accepting arbitrary upstream headers.
         retry_after = response.headers.get("Retry-After", "")
@@ -42,9 +47,10 @@ def upstream_chat_error(error: httpx.HTTPStatusError, *, checkpoint_id: str) -> 
             headers["X-Flash-Upstream-Code"] = code
         # Do not log request bodies, authorization material, or arbitrary error text.
         logger.warning(
-            "serving_unavailable checkpoint=%s upstream_status=%d code=%s",
+            "serving_unavailable checkpoint=%s upstream_status=%d code=%s auth_request_id=%s",
             checkpoint_id,
             status,
             code or "unspecified",
+            headers.get("X-Freesolo-Auth-Request-Id", "none"),
         )
     return HTTPException(status_code=status, detail=detail, headers=headers or None)

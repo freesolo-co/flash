@@ -51,7 +51,9 @@ def test_transient_status_exhaustion_stays_unavailable(status, monkeypatch):
             transport.post_authorization(client, "url", api_key="key", model_id="m", scope={})
         )
     assert error.value.status_code == 503
-    assert error.value.headers == {"Retry-After": "1"}
+    assert error.value.headers["Retry-After"] == "1"
+    assert error.value.headers["X-Freesolo-Inference-Started"] == "false"
+    assert len(error.value.headers["X-Freesolo-Auth-Request-Id"]) == 32
     assert client.post.await_count == transport._ATTEMPTS
 
 
@@ -133,3 +135,71 @@ def test_cancellation_during_backoff_stops_further_attempts():
         client.post.assert_awaited_once()
 
     asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("status", [500, 502, 503, 504])
+def test_backend_backpressure_is_respected_before_retry(status, monkeypatch):
+    waits = []
+
+    async def sleep(delay):
+        waits.append(delay)
+
+    monkeypatch.setattr(transport.asyncio, "sleep", sleep)
+    monkeypatch.setattr(transport.random, "uniform", lambda *_: 0.8)
+    client = AsyncMock()
+    client.post.side_effect = [
+        httpx.Response(status, headers={"Retry-After": "3"}),
+        httpx.Response(200),
+    ]
+    result = asyncio.run(
+        transport.post_authorization(client, "url", api_key="key", model_id="m", scope={})
+    )
+    assert result.status_code == 200
+    assert waits == [3.0]
+    assert client.post.await_count == 2
+
+
+@pytest.mark.parametrize("hint", ["", "invalid", "-2", "nan", "inf"])
+def test_invalid_retry_hint_keeps_bounded_backoff(hint, monkeypatch):
+    waits = []
+
+    async def sleep(delay):
+        waits.append(delay)
+
+    monkeypatch.setattr(transport.asyncio, "sleep", sleep)
+    monkeypatch.setattr(transport.random, "uniform", lambda *_: 1)
+    client = AsyncMock()
+    client.post.side_effect = [
+        httpx.Response(503, headers={"Retry-After": hint}),
+        httpx.Response(200),
+    ]
+    asyncio.run(transport.post_authorization(client, "url", api_key="key", model_id="m", scope={}))
+    assert waits == [0.25]
+
+
+def test_long_retry_hint_expires_deadline_without_replaying_lookup(monkeypatch):
+    monkeypatch.setattr(transport, "AUTHORIZATION_BUDGET_SECONDS", 0.01)
+    client = AsyncMock()
+    client.post.return_value = httpx.Response(503, headers={"Retry-After": "60"})
+    with pytest.raises(transport.TransientAuthorizationError):
+        asyncio.run(
+            transport.post_authorization(client, "url", api_key="key", model_id="m", scope={})
+        )
+    client.post.assert_awaited_once()
+
+
+def test_trace_id_links_attempts_to_backend_and_safe_interruption(monkeypatch, caplog):
+    monkeypatch.setattr(transport.random, "uniform", lambda *_: 0)
+    client = AsyncMock()
+    client.post.side_effect = httpx.ReadTimeout("secret")
+    with pytest.raises(transport.TransientAuthorizationError) as failure:
+        asyncio.run(
+            transport.post_authorization(client, "url", api_key="secret", model_id="m", scope={})
+        )
+    request_id = failure.value.headers["X-Freesolo-Auth-Request-Id"]
+    assert all(
+        call.kwargs["headers"]["X-Freesolo-Auth-Request-Id"] == request_id
+        for call in client.post.call_args_list
+    )
+    assert "request_id=" + request_id in caplog.text
+    assert "secret" not in caplog.text
