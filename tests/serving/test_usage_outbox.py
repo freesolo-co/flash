@@ -1543,7 +1543,11 @@ def test_startup_claim_recovers_expired_lease_and_delivers() -> None:
     assert any(url.endswith("/rpc/acknowledge_serving_usage_delivered") for url, _ in client.calls)
 
 
-def test_slow_delivery_shutdown_releases_claim() -> None:
+@pytest.mark.parametrize(
+    "release_response",
+    [(200, None), (400, {"code": "P0001", "message": "serving_usage_lease_lost"})],
+)
+def test_slow_delivery_shutdown_releases_claim(release_response) -> None:
     row = _claimed_row()
     entered = asyncio.Event()
     unblock = asyncio.Event()
@@ -1553,7 +1557,9 @@ def test_slow_delivery_shutdown_releases_claim() -> None:
         await unblock.wait()
         return 200, {}
 
-    client = _QueuedClient([(200, []), (200, []), (200, [row]), blocked_settlement, (200, None)])
+    client = _QueuedClient(
+        [(200, []), (200, []), (200, [row]), blocked_settlement, release_response]
+    )
     fixed_now = datetime(2026, 8, 24, 12, 0, tzinfo=UTC)
     outbox = DurableUsageOutbox(
         _outbox_settings(),
@@ -2195,3 +2201,48 @@ def test_missing_thinking_usage_remains_fail_closed(stream: bool) -> None:
         )
     assert response.status_code == 503
     assert store.finalized == []
+
+
+@pytest.mark.parametrize(
+    "response",
+    [
+        (400, {"code": "P0001", "message": "serving_usage_lease_lost"}),
+        (200, None),
+    ],
+)
+def test_shutdown_releases_or_forgets_a_lost_lease(response) -> None:
+    client = _QueuedClient([response])
+    outbox = DurableUsageOutbox(_outbox_settings(), client=client, worker_id="worker-1")
+    outbox._active_leases.add("lease-1")
+    asyncio.run(outbox.aclose())
+    assert not outbox._active_leases
+    assert len(client.calls) == 1
+    assert client.calls[0][0].endswith("/rpc/reschedule_serving_usage")
+
+
+@pytest.mark.parametrize(
+    "response",
+    [
+        (400, {"code": "P0001", "message": "unexpected database failure"}),
+        (400, {"code": "OTHER", "message": "serving_usage_lease_lost"}),
+        (400, ["serving_usage_lease_lost"]),
+        (503, {"code": "P0001", "message": "serving_usage_lease_lost"}),
+        httpx.Response(400, content=b"not json"),
+        httpx.ConnectError("private network detail"),
+    ],
+)
+def test_shutdown_preserves_unexpected_release_failures(response) -> None:
+    client = _QueuedClient([response])
+    outbox = DurableUsageOutbox(_outbox_settings(), client=client, worker_id="worker-1")
+    outbox._active_leases.add("lease-1")
+    with pytest.raises(UsageOutboxError, match="usage_outbox_shutdown_failed") as error:
+        asyncio.run(outbox.aclose())
+    assert outbox._active_leases == {"lease-1"}
+    assert "private network detail" not in str(error.value.__cause__)
+
+
+def test_lost_lease_outside_shutdown_remains_an_error() -> None:
+    client = _QueuedClient([(400, {"code": "P0001", "message": "serving_usage_lease_lost"})])
+    outbox = DurableUsageOutbox(_outbox_settings(), client=client, worker_id="worker-1")
+    with pytest.raises(UsageOutboxError, match="serving_usage_lease_lost"):
+        asyncio.run(outbox._rpc("reschedule_serving_usage", {}))

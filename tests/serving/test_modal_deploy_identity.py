@@ -68,6 +68,7 @@ def _import_modal_app(monkeypatch: pytest.MonkeyPatch, *, is_local: bool, enviro
     modal_stub.concurrent.side_effect = _passthrough_decorator
     modal_stub.method.side_effect = _passthrough_decorator
     modal_stub.enter.side_effect = _passthrough_decorator
+    modal_stub.exit.side_effect = _passthrough_decorator
     modal_stub.asgi_app.side_effect = _passthrough_decorator
     modal_stub.parameter.return_value = None
     app_mock = MagicMock(name="app")
@@ -151,3 +152,17 @@ def test_development_identity_requires_complete_container_credentials(monkeypatc
         assert engine["FLASH_ARTIFACT_BLOB_CONTAINER"] == "artifacts-dev"
         assert "FREESOLO_INTERNAL_KEY" not in engine
         assert "SUPABASE_SERVICE_ROLE_KEY" not in engine
+
+
+def test_engine_exit_hook_awaits_shutdown(monkeypatch) -> None:
+    import asyncio
+    from unittest.mock import AsyncMock
+
+    _clear_deployment_environment(monkeypatch)
+    app = _import_modal_app(monkeypatch, is_local=False, environment="main")
+    engine_cls = app._build_engine("L4", "TestShutdownEngine", 64, 48)
+    engine = engine_cls()
+    engine._shutdown = AsyncMock()
+    asyncio.run(engine.shutdown())
+    engine._shutdown.assert_awaited_once_with()
+    assert app.modal.exit.called
