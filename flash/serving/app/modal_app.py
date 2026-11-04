@@ -388,6 +388,10 @@ def _build_engine(
         async def load(self) -> None:
             await self._load()
 
+        @modal.exit()
+        async def shutdown(self) -> None:
+            await self._shutdown()
+
         @modal.method()
         async def register(
             self,
@@ -786,8 +790,9 @@ def _build_chat_authorizer(settings: Any) -> Any:
         now = time.monotonic()
         # Cache the ALLOW only — reached iff _authorize_backend did not raise above.
         _refresh_after.pop(ck, None)
-        _cache[ck] = (now + _AUTH_CACHE_TTL_SECONDS, authorization)
-        _prune(now)
+        if parse_checkpoint_ref(model_id) is None:
+            _cache[ck] = (now + _AUTH_CACHE_TTL_SECONDS, authorization)
+            _prune(now)
         return authorization
 
     def refresh(ck, api_key, model_id, scope):
@@ -806,8 +811,6 @@ def _build_chat_authorizer(settings: Any) -> Any:
 
         # A checkpoint can be disabled and reloaded within the positive-auth TTL.
         # Always recheck its verified generation; base-model authorization remains cached.
-        if parse_checkpoint_ref(model_id) is not None:
-            return await _authorize_backend(api_key, model_id, scope)
         # The scope is part of the key, not just the payload. Every training container presents
         # the SAME platform internal key, so keying on (key, model) alone would let one job's
         # cached authorization answer another job's request -- and the cached value is the
@@ -816,6 +819,9 @@ def _build_chat_authorizer(settings: Any) -> Any:
             "\x00".join(f"{k}={scope[k]}" for k in sorted(scope)).encode("utf-8")
         ).hexdigest()
         ck = (hashlib.sha256(api_key.encode("utf-8")).hexdigest(), model_id, scope_digest)
+        if parse_checkpoint_ref(model_id) is not None:
+            # Coalesce simultaneous generation checks only; never reuse a completed approval.
+            return await asyncio.shield(refresh(ck, api_key, model_id, scope))
         cached = _cache.get(ck)
         now = time.monotonic()
         if cached is not None:

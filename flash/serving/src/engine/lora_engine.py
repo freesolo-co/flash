@@ -142,6 +142,27 @@ class _LoraEngineImpl(TextPromptTokenizer):
             # capacity telemetry is observational and must never make a healthy replica fail.
             self._replica_boot_duration_seconds = None
 
+    async def _shutdown(self) -> None:
+        """Finish background tasks on their serving loop before Modal closes it."""
+        monitor = getattr(self, "_liveness_task", None)
+        if monitor is not None:
+            monitor.cancel()
+            await asyncio.wait_for(asyncio.gather(monitor, return_exceptions=True), timeout=5.0)
+            self._liveness_task = None
+        engine = getattr(self, "engine", None)
+        if engine is None:
+            return
+        handler = getattr(engine, "output_handler", None)
+        try:
+            # vLLM 0.23's synchronous shutdown bounds EngineCore teardown and
+            # schedules output-handler cancellation; it does not await that task.
+            engine.shutdown(timeout=10.0)
+        finally:
+            if handler is not None:
+                handler.cancel()
+                await asyncio.wait_for(asyncio.gather(handler, return_exceptions=True), timeout=5.0)
+        self.engine = None
+
     def _admit_generation(self) -> dict[str, Any]:
         """record honest process-local demand at request admission."""
 
