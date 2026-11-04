@@ -17,6 +17,7 @@ from functools import cached_property
 from pathlib import Path
 from typing import Any
 
+from flash.content.processor import processor_template_kwargs
 from flash.content.structured_options import vllm_structured_kwargs
 
 # Adapter-cache paths and token accounting live in engine_support.py, alongside
@@ -519,7 +520,7 @@ class _LoraEngineImpl(TextPromptTokenizer):
                     messages_for_chat_template(detached_template_messages(template_messages)),
                     tokenize=False,
                     add_generation_prompt=True,
-                    **ctk,
+                    **processor_template_kwargs(processor, ctk),
                 )
             )
         except BaseException:

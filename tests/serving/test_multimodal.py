@@ -1151,3 +1151,47 @@ def test_a_usable_tool_call_history_still_passes() -> None:
         {"role": "tool", "tool_call_id": "call_1", "content": "ok"},
     ]
     assert normalize_chat_messages(messages, supports_images=False, image_limit=4) == messages
+
+
+@pytest.mark.parametrize("runtime", ["hosted", "packaged"])
+@pytest.mark.parametrize("thinking", [False, True])
+@pytest.mark.parametrize("named_template", [False, True])
+def test_processor_render_does_not_route_unused_template_flags_to_processing(
+    runtime, thinking, named_template, caplog
+):
+    from transformers.processing_utils import ProcessorMixin
+
+    from flash.serve.runtime import EngineConfig, GenerationRequest
+    from flash.serve.runtime.prompt import PromptPreparer
+
+    # Use the real HF method: a stub accepting **kwargs cannot catch this warning.
+    # preserve_thinking is deliberately absent, as it is in some served templates.
+    template = (
+        "{{ enable_thinking }}|{{ custom }}|"
+        "{% for m in messages %}{% for c in m.content %}{{ c.type }};{% endfor %}{% endfor %}"
+    )
+    processor = types.SimpleNamespace(
+        chat_template={"default": template} if named_template else template,
+        tokenizer=types.SimpleNamespace(special_tokens_map={}),
+    )
+    processor.apply_chat_template = types.MethodType(ProcessorMixin.apply_chat_template, processor)
+    kwargs = {"custom": "kept", "preserve_thinking": False, "unused": "ignored"}
+    if runtime == "hosted":
+        engine = _engine_impl(processor=processor)
+        payload = types.SimpleNamespace(messages=_messages(), chat_template_kwargs=kwargs)
+        value = asyncio.run(engine._prepare_prompt_input(payload, thinking))
+
+        def close():
+            engine._close_prompt_images(value)
+    else:
+        preparer = PromptPreparer(EngineConfig(model=QWEN, image_limit=4), None, processor)
+        request = GenerationRequest(messages=_messages(), chat_template_kwargs=kwargs)
+        prepared = asyncio.run(preparer.prepare(request, thinking))
+        value, close = prepared.value, prepared.close
+    try:
+        assert value["prompt"].startswith(f"{thinking}|kept|")
+        assert "image;" in value["prompt"]
+        assert isinstance(value["multi_modal_data"]["image"], Image.Image)
+        assert "Kwargs passed to" not in caplog.text
+    finally:
+        close()
