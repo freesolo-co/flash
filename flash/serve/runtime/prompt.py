@@ -9,6 +9,7 @@ from collections import OrderedDict
 from dataclasses import dataclass
 from typing import Any
 
+from flash.content.processor import processor_template_kwargs
 from flash.content.reasoning_normalization import messages_for_chat_template
 from flash.serve.request.tool_calls import detached_template_messages, tools_active, tools_wire
 
@@ -222,7 +223,7 @@ class PromptPreparer:
                     template_messages,
                     tokenize=False,
                     add_generation_prompt=True,
-                    **kwargs,
+                    **processor_template_kwargs(self._processor, kwargs),
                 )
             except ServingRuntimeError:
                 raise

@@ -67,3 +67,32 @@ def test_serving_and_training_loaders_accept_inline_tokenizer_template(monkeypat
     assert loaded_tokenizer.eos_token == "<|endoftext|>"
     assert calls[0][0] == model
     assert calls[0][1]["revision"] == revision
+
+
+def test_referenced_preserve_thinking_remains_a_template_option(caplog):
+    from types import MethodType
+
+    from transformers.processing_utils import ProcessorMixin
+
+    from flash.content.processor import processor_template_kwargs
+
+    processor = SimpleNamespace(
+        chat_template="{{ enable_thinking }}|{{ preserve_thinking }}|{{ tools[0].function.name }}",
+        tokenizer=SimpleNamespace(special_tokens_map={}),
+    )
+    processor.apply_chat_template = MethodType(ProcessorMixin.apply_chat_template, processor)
+    kwargs = {
+        "enable_thinking": True,
+        "preserve_thinking": False,
+        "unused": 1,
+        "tools": [{"type": "function", "function": {"name": "lookup"}}],
+    }
+    messages = [{"role": "user", "content": [{"type": "text", "text": "hello"}]}]
+    original = processor.apply_chat_template(messages, tokenize=False, **kwargs)
+    assert "Kwargs passed to" in caplog.text
+    caplog.clear()
+    rendered = processor.apply_chat_template(
+        messages, tokenize=False, **processor_template_kwargs(processor, kwargs)
+    )
+    assert rendered == original == "True|False|lookup"
+    assert "Kwargs passed to" not in caplog.text
