@@ -1,4 +1,4 @@
-"""The one real request a promotion has to survive.
+"""Release-bound streaming proof for a serving promotion.
 
 Sends an authenticated streaming chat completion to the freshly deployed router and reduces the SSE
 body to `StreamEvidence`. It supplies its own `X-Correlation-ID` so the durable usage row this
@@ -7,8 +7,8 @@ alongside its own release identity (`flash/serving/src/accounting/usage.py`).
 
 Engine-side proof cannot come from the response: `flash/serving/src/io/responses.py` deliberately
 strips `engine_replica_id` from public bodies, and the engines receive only upstream-model and Azure artifact credentials, so they
-cannot report the release sha either. The response proves generation happened; accounting proves
-which release it happened on.
+cannot report the release sha either. Router response headers bind the stream to the candidate;
+accounting independently proves that candidate's generation reached billing.
 """
 
 from __future__ import annotations
@@ -30,7 +30,10 @@ _DONE = "[DONE]"
 CANARY_TIMEOUT = "canary_timeout"
 CANARY_TRANSPORT_FAILURE = "canary_transport_failure"
 CANARY_RESULT_REDIRECT_REJECTED = "canary_result_redirect_rejected"
+CANARY_RELEASE_MISMATCH = "canary_release_mismatch"
 _MAX_RESULT_REDIRECTS = 24
+_MAX_RELEASE_ATTEMPTS = 12
+_RELEASE_RETRY_SECONDS = 5.0
 
 
 class CanaryError(Exception):
@@ -60,6 +63,8 @@ class CanaryRequest:
     # gate, so `if: failure()` would redeploy the PREDECESSOR over a healthy release on every
     # deploy. The name is pinned to the wire key so the two cannot drift apart silently.
     max_tokens: int
+    expected_sha: str
+    expected_deployment_id: str
 
 
 def correlation_id_for(run_id: str, run_attempt: str) -> str:
@@ -94,6 +99,8 @@ def _headers(request: CanaryRequest) -> dict[str, str]:
         "X-Freesolo-Org-Id": request.org_id,
         "Accept": "text/event-stream",
         "Content-Type": "application/json",
+        # Avoid reusing the client's connection across handoff retries.
+        "Connection": "close",
     }
 
 
@@ -159,15 +166,23 @@ class _StreamReader:
 
 
 async def run_stream_canary(request: CanaryRequest, *, client: httpx.AsyncClient) -> StreamEvidence:
-    """Stream one completion and report what it proved.
+    """Obtain a candidate completion, retrying only an older router's response.
 
     The whole read loop is bounded, not just the connect: a stream that opens and then never sends
     another byte would otherwise hold the deploy job until the runner's own timeout, turning a
-    failed promotion into a hung one.
+    failed promotion into a hung one. Handoff retries share that original deadline and an attempt
+    cap; HTTP errors, transport errors, and malformed candidate streams are not retried.
     """
     try:
         async with asyncio.timeout(request.timeout_seconds):
-            return await _read_stream(request, client=client)
+            for attempt in range(_MAX_RELEASE_ATTEMPTS):
+                try:
+                    return await _read_stream(request, client=client)
+                except CanaryError as exc:
+                    if str(exc) != CANARY_RELEASE_MISMATCH or attempt == _MAX_RELEASE_ATTEMPTS - 1:
+                        raise
+                    await asyncio.sleep(_RELEASE_RETRY_SECONDS)
+            raise CanaryError(CANARY_RELEASE_MISMATCH)
     except TimeoutError as exc:
         raise CanaryError(CANARY_TIMEOUT) from exc
     except CanaryError:
@@ -222,5 +237,15 @@ async def _read_stream(request: CanaryRequest, *, client: httpx.AsyncClient) -> 
             async for line in response.aiter_lines():
                 if not reader.feed(line):
                     break
+            # A matching /healthz response says nothing about which router serves the next POST.
+            # Drain the old stream before retrying so its generation can finalize normally. Old
+            # releases without these headers also fail this check. Reuse the correlation id:
+            # accounting scopes rows to the exact candidate SHA AND deployment attempt.
+            if (
+                response.headers.get("x-freesolo-serving-release") != request.expected_sha
+                or response.headers.get("x-freesolo-serving-deployment-id")
+                != request.expected_deployment_id
+            ):
+                raise CanaryError(CANARY_RELEASE_MISMATCH)
             return reader.evidence(content_type_ok=content_type_ok)
     raise CanaryError(CANARY_RESULT_REDIRECT_REJECTED)

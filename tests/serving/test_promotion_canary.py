@@ -31,6 +31,8 @@ def _request(**overrides) -> CanaryRequest:
         "correlation_id": correlation_id_for("12345", "1"),
         "timeout_seconds": 5.0,
         "max_tokens": 32,
+        "expected_sha": "candidate-sha",
+        "expected_deployment_id": "12345-1",
     }
     fields.update(overrides)
     return CanaryRequest(**fields)
@@ -40,6 +42,12 @@ class _FakeResponse:
     def __init__(self, lines: list[str], *, content_type: str, status_code: int = 200) -> None:
         self._lines = lines
         self.headers = {"content-type": content_type}
+        self.headers.update(
+            {
+                "x-freesolo-serving-release": "candidate-sha",
+                "x-freesolo-serving-deployment-id": "12345-1",
+            }
+        )
         self.status_code = status_code
 
     async def aiter_lines(self):
@@ -229,7 +237,11 @@ def test_modal_result_redirects_poll_the_original_generation_with_get():
         else:
             response = httpx.Response(
                 200,
-                headers={"content-type": "text/event-stream"},
+                headers={
+                    "content-type": "text/event-stream",
+                    "x-freesolo-serving-release": "candidate-sha",
+                    "x-freesolo-serving-deployment-id": "12345-1",
+                },
                 text="\n\n".join(_sse(_delta("ready"), _TERMINAL, _USAGE, "[DONE]")),
             )
         responses.append(response)
