@@ -183,6 +183,10 @@ class UsageOutboxError(RuntimeError):
     """Sanitized durable accounting failure safe to expose by class only."""
 
 
+class ServingUsageLeaseLost(UsageOutboxError):
+    """The database no longer grants this worker ownership of an outbox lease."""
+
+
 class ReasoningSettlementUnavailable(UsageOutboxError):
     """Exact reasoning-token facts are unavailable for this generation."""
 
@@ -413,6 +417,19 @@ class DurableUsageOutbox:
         if response is None:
             raise UsageOutboxError("supabase_transport_failure")
         if response.is_error:
+            # PostgREST represents a PL/pgSQL RAISE EXCEPTION as P0001. Only
+            # recognize this exact public identifier; never expose arbitrary DB text.
+            if response.status_code == 400:
+                try:
+                    error = response.json()
+                except ValueError:
+                    error = None
+                if (
+                    isinstance(error, dict)
+                    and error.get("code") == "P0001"
+                    and error.get("message") == "serving_usage_lease_lost"
+                ):
+                    raise ServingUsageLeaseLost("serving_usage_lease_lost")
             raise UsageOutboxError(f"supabase_rpc_{response.status_code}")
         if not response.content:
             return None
@@ -723,6 +740,10 @@ class DurableUsageOutbox:
                     ),
                     timeout=_CLEANUP_TIMEOUT_SECONDS,
                 )
+            except ServingUsageLeaseLost:
+                # Expiry or settlement may win the race with shutdown. We no
+                # longer own this row; leave the durable state to its owner.
+                self._active_leases.discard(outbox_id)
             except BaseException as exc:
                 errors.append(exc)
             else:

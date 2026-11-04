@@ -388,6 +388,10 @@ def _build_engine(
         async def load(self) -> None:
             await self._load()
 
+        @modal.exit()
+        async def shutdown(self) -> None:
+            await self._shutdown()
+
         @modal.method()
         async def register(
             self,
