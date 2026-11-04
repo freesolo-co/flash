@@ -2,6 +2,7 @@
 
 import asyncio
 import logging
+import math
 import random
 import time
 
@@ -30,6 +31,7 @@ async def post_authorization(client, url, *, api_key, model_id, scope):
     try:
         async with asyncio.timeout(AUTHORIZATION_BUDGET_SECONDS):
             for attempt in range(1, _ATTEMPTS + 1):
+                retry_after = 0.0
                 try:
                     response = await client.post(
                         url, json={"apiKey": api_key, "modelId": model_id}, headers=scope or None
@@ -46,6 +48,13 @@ async def post_authorization(client, url, *, api_key, model_id, scope):
                         return response
                     kind = f"http_{response.status_code}"
                     detail = "serving auth backend unavailable"
+                    try:
+                        hint = float(response.headers.get("Retry-After", ""))
+                    except ValueError:
+                        pass
+                    else:
+                        if math.isfinite(hint) and hint >= 0:
+                            retry_after = hint
                 logger.warning(
                     "serving_auth_transient_failure kind=%s attempt=%d elapsed_ms=%d",
                     kind,
@@ -54,7 +63,9 @@ async def post_authorization(client, url, *, api_key, model_id, scope):
                 )
                 if attempt < _ATTEMPTS:
                     delay = min(0.25 * 2 ** (attempt - 1), 2.0)
-                    await asyncio.sleep(delay * random.uniform(0.8, 1.2))
+                    # Backpressure is a minimum wait, not a jitter ceiling. The enclosing
+                    # deadline cancels long hints without issuing another backend request.
+                    await asyncio.sleep(max(retry_after, delay * random.uniform(0.8, 1.2)))
     except TimeoutError:
         logger.warning(
             "serving_auth_deadline_exceeded budget_seconds=%s", AUTHORIZATION_BUDGET_SECONDS
