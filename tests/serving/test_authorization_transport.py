@@ -51,7 +51,9 @@ def test_transient_status_exhaustion_stays_unavailable(status, monkeypatch):
             transport.post_authorization(client, "url", api_key="key", model_id="m", scope={})
         )
     assert error.value.status_code == 503
-    assert error.value.headers == {"Retry-After": "1"}
+    assert error.value.headers["Retry-After"] == "1"
+    assert error.value.headers["X-Freesolo-Inference-Started"] == "false"
+    assert len(error.value.headers["X-Freesolo-Auth-Request-Id"]) == 32
     assert client.post.await_count == transport._ATTEMPTS
 
 
@@ -184,3 +186,20 @@ def test_long_retry_hint_expires_deadline_without_replaying_lookup(monkeypatch):
             transport.post_authorization(client, "url", api_key="key", model_id="m", scope={})
         )
     client.post.assert_awaited_once()
+
+
+def test_trace_id_links_attempts_to_backend_and_safe_interruption(monkeypatch, caplog):
+    monkeypatch.setattr(transport.random, "uniform", lambda *_: 0)
+    client = AsyncMock()
+    client.post.side_effect = httpx.ReadTimeout("secret")
+    with pytest.raises(transport.TransientAuthorizationError) as failure:
+        asyncio.run(
+            transport.post_authorization(client, "url", api_key="secret", model_id="m", scope={})
+        )
+    request_id = failure.value.headers["X-Freesolo-Auth-Request-Id"]
+    assert all(
+        call.kwargs["headers"]["X-Freesolo-Auth-Request-Id"] == request_id
+        for call in client.post.call_args_list
+    )
+    assert "request_id=" + request_id in caplog.text
+    assert "secret" not in caplog.text

@@ -775,3 +775,28 @@ def test_chat_waits_for_authorization_backend_rollout(modal_app_module, monkeypa
     assert calls["n"] == 4
     assert pool.generate_calls == 1
     assert len(store.finalized) == 1
+
+
+def test_checkpoint_misses_share_work_but_never_cache_generation(modal_app_module, monkeypatch):
+    import asyncio
+
+    calls = _counting_client(
+        monkeypatch,
+        lambda n: _FakeResp(200, {"orgId": "org-1", "deploymentGeneration": f"generation-{n}"}),
+        delay=0.03,
+    )
+    authorize = _new_authorizer(modal_app_module)
+
+    async def scenario():
+        callers = [asyncio.create_task(authorize("key", "run-1/final")) for _ in range(50)]
+        await asyncio.sleep(0.01)
+        callers[0].cancel()
+        results = await asyncio.gather(*callers, return_exceptions=True)
+        assert isinstance(results[0], asyncio.CancelledError)
+        assert all(row.deployment_generation == "generation-1" for row in results[1:])
+        assert calls["n"] == 1
+        fresh = await authorize("key", "run-1/final")
+        assert fresh.deployment_generation == "generation-2"
+        await authorize.aclose()
+
+    asyncio.run(scenario())

@@ -63,3 +63,16 @@ def test_error_headers_and_logs_reject_untrusted_codes(caplog):
     result = upstream_chat_error(error, checkpoint_id="run/final")
     assert result.headers is None
     assert "secret-value" not in caplog.text
+
+
+@pytest.mark.parametrize(("request_id", "expected"), [("a" * 32, True), ("malformed", False)])
+def test_proxy_forwards_only_valid_pre_generation_authorization_marker(request_id, expected):
+    response = httpx.Response(
+        503,
+        json={"detail": "serving auth backend unreachable"},
+        headers={"X-Freesolo-Auth-Request-Id": request_id, "X-Freesolo-Inference-Started": "false"},
+        request=httpx.Request("POST", "https://example.test"),
+    )
+    error = httpx.HTTPStatusError("unavailable", request=response.request, response=response)
+    result = upstream_chat_error(error, checkpoint_id="run/final")
+    assert ((result.headers or {}).get("X-Freesolo-Inference-Started") == "false") == expected
