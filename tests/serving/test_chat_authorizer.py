@@ -75,6 +75,7 @@ def modal_app_module(load_modal_app_under_stub):
 class _FakeResp:
     def __init__(self, status_code: int, payload: Any = None) -> None:
         self.status_code = status_code
+        self.headers = {}
         self._payload = payload
 
     def json(self) -> Any:
