@@ -434,22 +434,17 @@ def test_deployed_timeouts_use_the_shared_serving_budget(modal_app_module):
     )
 
 
-def test_legacy_engine_keys_are_retained_for_draining_routers(modal_app_module):
-    """A catalog edit must not delete handles held by pre-migration routers."""
-    assert set(modal_app_module.ENGINE_BY_KEY) == {
-        ("L4", 64),
-        ("L40S", 8),
-        ("L40S", 64),
-        ("H100", 8),
-        ("H200", 8),
-    }
+def test_only_model_scoped_engines_are_registered(modal_app_module):
+    registered = {name for name in vars(modal_app_module) if name.startswith("LoraEngine_")}
+    assert registered == {modal_app_module.model_engine_name(model) for model in base_models()}
+    assert modal_app_module.app.cls.call_count == len(base_models())
 
 
 def test_rollback_manifest_retains_every_registered_engine(modal_app_module):
     from flash.serving.app.rollback import engine_manifest
 
     manifest = engine_manifest("a" * 40)
-    classes = [*modal_app_module.ENGINE_BY_KEY.values(), *modal_app_module.ENGINE_BY_MODEL.values()]
+    classes = list(modal_app_module.ENGINE_BY_MODEL.values())
     assert set(manifest["classes"]) == {cls.__name__ for cls in classes}
     for model, cls in modal_app_module.ENGINE_BY_MODEL.items():
         assert manifest["classes"][cls.__name__] == [model]
@@ -469,14 +464,6 @@ def test_engine_concurrency_rejects_malformed_catalog_values(modal_app_module, m
     monkeypatch.setattr(mod, "gpu_for", lambda _bm: "L4")
     with pytest.raises(ValueError, match="invalid literal"):
         mod._engine_concurrency("malformed")
-
-
-def test_class_names_are_distinct_and_modal_safe(modal_app_module):
-    """Each tier registers under an app-unique, alnum/underscore-only class name that encodes both
-    the GPU and its concurrency (max_inputs is part of the class identity)."""
-    assert modal_app_module._engine_class_name("L4", 64) == "LoraEngine_L4_c64"
-    assert modal_app_module._engine_class_name("L4", 16) == "LoraEngine_L4_c16"
-    assert modal_app_module._engine_class_name("A100-80GB", 16) == "LoraEngine_A100_80GB_c16"
 
 
 @pytest.mark.parametrize(
@@ -508,7 +495,7 @@ def test_unknown_base_model_is_rejected_before_engine_dispatch(modal_app_module)
 def test_tier_classes_inherit_the_shared_impl(modal_app_module):
     """Each tier class subclasses _LoraEngineImpl (so _load/_generate/etc resolve) and defines the
     public Modal entrypoints itself (so Modal collects them per class)."""
-    tier = modal_app_module.ENGINE_BY_KEY[("H200", 8)]
+    tier = modal_app_module.ENGINE_BY_MODEL["Qwen/Qwen3.6-35B-A3B"]
     assert issubclass(tier, modal_app_module._LoraEngineImpl)
     for impl in ("_load", "_register", "_generate", "_stream_generate", "_unregister", "_health"):
         assert hasattr(tier, impl)
@@ -519,11 +506,8 @@ def test_tier_classes_inherit_the_shared_impl(modal_app_module):
 def test_each_tier_class_records_its_pinned_gpu(modal_app_module):
     """Each per-tier class records the GPU it was actually pinned to in _build_engine, so health/ops
     can detect a base model misrouted onto the wrong tier instead of trusting the derived lookup."""
-    by_key = modal_app_module.ENGINE_BY_KEY
-    # Every class records the GPU half of its (gpu, max_inputs) key.
-    for (gpu, _max_inputs), cls in by_key.items():
-        assert cls.pinned_gpu == gpu
-    assert by_key[("H200", 8)].pinned_gpu == "H200"
+    for model, cls in modal_app_module.ENGINE_BY_MODEL.items():
+        assert cls.pinned_gpu == gpu_for(model)
 
 
 def test_tier_class_identity_is_fixed_before_decoration(modal_app_module):
@@ -532,9 +516,6 @@ def test_tier_class_identity_is_fixed_before_decoration(modal_app_module):
     REAL class BEFORE ``@modal.concurrent`` wraps it — otherwise (renaming after the decorator) every tier
     would register under ``_Engine`` and the ``<locals>`` qualname would fail Modal's global-scope check."""
     classes = [
-        (modal_app_module._engine_class_name(gpu, mi), cls)
-        for (gpu, mi), cls in modal_app_module.ENGINE_BY_KEY.items()
-    ] + [
         (modal_app_module.model_engine_name(model), cls)
         for model, cls in modal_app_module.ENGINE_BY_MODEL.items()
     ]
@@ -996,7 +977,7 @@ def test_modal_stream_entrypoint_uses_regular_call(modal_app_module, monkeypatch
 
     from flash.serving.src.stream_channel import engine as channel_engine
 
-    engine = modal_app_module.ENGINE_BY_KEY[("H200", 8)]()
+    engine = modal_app_module.ENGINE_BY_MODEL["Qwen/Qwen3.6-35B-A3B"]()
     run = AsyncMock(return_value={"terminal_kind": "event"})
     monkeypatch.setattr(channel_engine, "stream_generate_call", run)
     assert not inspect.isasyncgenfunction(engine.stream_generate_call)

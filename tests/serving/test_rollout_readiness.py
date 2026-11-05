@@ -7,6 +7,7 @@ from unittest.mock import AsyncMock
 import pytest
 
 from flash.serving.app import rollout
+from flash.serving.src.engine.model_config import base_models
 from flash.serving.src.http.router import _lifespan_for
 
 
@@ -26,7 +27,7 @@ def _engine(model="base", *, runners=0, running=0, backlog=0):
 
 
 def test_model_identity_is_distinct_and_independent_of_hardware():
-    names = [rollout.model_engine_name(model) for model in rollout.LEGACY_ENGINE_KEYS]
+    names = [rollout.model_engine_name(model) for model in base_models()]
     assert len(set(names)) == len(names)
     assert all(name.replace("_", "").isalnum() for name in names)
     # Normalization must not merge different public model IDs.
@@ -52,7 +53,7 @@ def test_active_or_queued_models_require_readiness(activity, migrating):
 
 def test_first_deployment_does_not_need_a_legacy_pool():
     current = _engine()
-    asyncio.run(rollout.warm_active_models({"base": current}, {}))
+    asyncio.run(rollout.warm_active_models({"base": current}))
     current.health.remote.aio.assert_not_awaited()
 
 
@@ -63,7 +64,7 @@ def test_unhealthy_replacements_cannot_pass_startup(health):
     current = _engine(runners=1)
     current.health.remote.aio.return_value = health
     with pytest.raises(ExceptionGroup, match="TaskGroup") as error:
-        asyncio.run(rollout.warm_active_models({"base": current}, {}))
+        asyncio.run(rollout.warm_active_models({"base": current}))
     assert isinstance(error.value.exceptions[0], RuntimeError)
 
 
@@ -71,7 +72,7 @@ def test_stats_failure_does_not_silently_mark_a_pool_inactive():
     current = _engine()
     current.health.get_current_stats.aio.side_effect = RuntimeError("stats unavailable")
     with pytest.raises(ExceptionGroup) as error:
-        asyncio.run(rollout.warm_active_models({"base": current}, {}))
+        asyncio.run(rollout.warm_active_models({"base": current}))
     assert str(error.value.exceptions[0]) == "stats unavailable"
     current.health.remote.aio.assert_not_awaited()
 
