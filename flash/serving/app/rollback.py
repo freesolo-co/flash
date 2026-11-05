@@ -18,14 +18,11 @@ from typing import Any
 
 
 def engine_manifest(source_sha: str) -> dict[str, Any]:
-    from flash.serving.app.rollout import LEGACY_ENGINE_KEYS, model_engine_name
+    from flash.serving.app.rollout import model_engine_name
     from flash.serving.app.timeouts import ROUTER_TIMEOUT_SECONDS
     from flash.serving.src.engine.model_config import base_models
 
     classes: dict[str, list[str]] = {}
-    for model, (gpu, concurrency) in LEGACY_ENGINE_KEYS.items():
-        safe_gpu = "".join(ch if ch.isalnum() else "_" for ch in gpu)
-        classes.setdefault(f"LoraEngine_{safe_gpu}_c{concurrency}", []).append(model)
     for model in base_models():
         classes[model_engine_name(model)] = [model]
     return validate_manifest(

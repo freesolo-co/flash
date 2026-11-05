@@ -1,4 +1,4 @@
-"""Availability during the migration and later rolling engine replacements."""
+"""Availability during rolling engine replacements."""
 
 import asyncio
 from types import SimpleNamespace
@@ -7,6 +7,7 @@ from unittest.mock import AsyncMock
 import pytest
 
 from flash.serving.app import rollout
+from flash.serving.src.engine.model_config import base_models
 from flash.serving.src.http.router import _lifespan_for
 
 
@@ -26,7 +27,7 @@ def _engine(model="base", *, runners=0, running=0, backlog=0):
 
 
 def test_model_identity_is_distinct_and_independent_of_hardware():
-    names = [rollout.model_engine_name(model) for model in rollout.LEGACY_ENGINE_KEYS]
+    names = [rollout.model_engine_name(model) for model in base_models()]
     assert len(set(names)) == len(names)
     assert all(name.replace("_", "").isalnum() for name in names)
     # Normalization must not merge different public model IDs.
@@ -34,26 +35,16 @@ def test_model_identity_is_distinct_and_independent_of_hardware():
 
 
 def test_inactive_models_stay_at_zero():
-    current, legacy = _engine(), _engine()
-    asyncio.run(rollout.warm_active_models({"base": current}, {"base": legacy}))
+    current = _engine()
+    asyncio.run(rollout.warm_active_models({"base": current}))
     current.health.remote.aio.assert_not_awaited()
-    legacy.health.remote.aio.assert_not_awaited()
 
 
 @pytest.mark.parametrize("activity", [{"runners": 1}, {"running": 1}, {"backlog": 1}])
-@pytest.mark.parametrize("migrating", [True, False])
-def test_active_or_queued_models_require_readiness(activity, migrating):
-    current = _engine(**({} if migrating else activity))
-    legacy = _engine(**(activity if migrating else {}))
-    asyncio.run(rollout.warm_active_models({"base": current}, {"base": legacy}))
+def test_active_or_queued_models_require_readiness(activity):
+    current = _engine(**activity)
+    asyncio.run(rollout.warm_active_models({"base": current}))
     current.health.remote.aio.assert_awaited_once()
-    legacy.health.remote.aio.assert_not_awaited()
-
-
-def test_first_deployment_does_not_need_a_legacy_pool():
-    current = _engine()
-    asyncio.run(rollout.warm_active_models({"base": current}, {}))
-    current.health.remote.aio.assert_not_awaited()
 
 
 @pytest.mark.parametrize(
@@ -63,7 +54,7 @@ def test_unhealthy_replacements_cannot_pass_startup(health):
     current = _engine(runners=1)
     current.health.remote.aio.return_value = health
     with pytest.raises(ExceptionGroup, match="TaskGroup") as error:
-        asyncio.run(rollout.warm_active_models({"base": current}, {}))
+        asyncio.run(rollout.warm_active_models({"base": current}))
     assert isinstance(error.value.exceptions[0], RuntimeError)
 
 
@@ -71,7 +62,7 @@ def test_stats_failure_does_not_silently_mark_a_pool_inactive():
     current = _engine()
     current.health.get_current_stats.aio.side_effect = RuntimeError("stats unavailable")
     with pytest.raises(ExceptionGroup) as error:
-        asyncio.run(rollout.warm_active_models({"base": current}, {}))
+        asyncio.run(rollout.warm_active_models({"base": current}))
     assert str(error.value.exceptions[0]) == "stats unavailable"
     current.health.remote.aio.assert_not_awaited()
 
@@ -79,7 +70,7 @@ def test_stats_failure_does_not_silently_mark_a_pool_inactive():
 def test_router_does_not_admit_requests_until_replacement_is_ready():
     async def scenario():
         warming, ready = asyncio.Event(), asyncio.Event()
-        current, legacy = _engine(), _engine(runners=2, running=128)
+        current = _engine(runners=2, running=128)
 
         async def health():
             warming.set()
@@ -89,7 +80,7 @@ def test_router_does_not_admit_requests_until_replacement_is_ready():
         current.health.remote.aio.side_effect = health
         usage = SimpleNamespace(start=AsyncMock(), aclose=AsyncMock())
         pool = SimpleNamespace(
-            start=lambda: rollout.warm_active_models({"base": current}, {"base": legacy}),
+            start=lambda: rollout.warm_active_models({"base": current}),
             aclose=AsyncMock(),
         )
         context = SimpleNamespace(usage=usage, pool=pool, rate_limiter=None)
@@ -122,7 +113,7 @@ def test_startup_timeout_cancels_probes_and_closes_router_resources(monkeypatch)
         current.health.remote.aio.side_effect = blocked
         usage = SimpleNamespace(start=AsyncMock(), aclose=AsyncMock())
         pool = SimpleNamespace(
-            start=lambda: rollout.warm_active_models({"base": current}, {}),
+            start=lambda: rollout.warm_active_models({"base": current}),
             aclose=AsyncMock(),
         )
         context = SimpleNamespace(usage=usage, pool=pool, rate_limiter=None)
