@@ -110,7 +110,7 @@ def test_lora_engine_scales_to_zero_by_default(modal_app_module):
     cls_calls = cls_calls[legacy_count:]
     assert {kwargs["gpu"]: kwargs["scaledown_window"] for kwargs in cls_calls} == {
         ("H100!" if gpu == "H100" else gpu): modal_app_module.scaledown_window_for(gpu)
-        for gpu, _mi in modal_app_module.ENGINE_BY_KEY
+        for gpu in {cls.pinned_gpu for cls in modal_app_module.ENGINE_BY_MODEL.values()}
     }
 
     assert modal_app_module.app.function.call_count == 1
@@ -173,7 +173,10 @@ def test_modal_concurrency_is_per_engine_key(modal_app_module):
     seen = {(c["max_inputs"], c["target_inputs"]) for c in calls}
     # Check the actual decorators: changing only _engine_concurrency must not leave
     # a second target calculation deploying the old 75% threshold.
-    expected = {(mi, mi) for (_gpu, mi) in modal_app_module.ENGINE_BY_KEY}
+    expected = {
+        modal_app_module._engine_concurrency(model)
+        for model in modal_app_module.ENGINE_BY_MODEL
+    }
     expected.add((modal_app_module.MAX_INPUTS, modal_app_module.TARGET_INPUTS))
     assert seen == expected
 
