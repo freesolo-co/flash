@@ -8,10 +8,6 @@ from typing import Any
 
 from flash.serving.app.timeouts import ROUTER_TIMEOUT_SECONDS
 
-# The migration to model-scoped identities is complete. Keep the compatibility
-# interface empty so deployment and router startup cannot recreate retired pools.
-LEGACY_ENGINE_KEYS: dict[str, tuple[str, int]] = {}
-
 
 def model_engine_name(base_model: str) -> str:
     """Hardware changes must update a function, never replace its dispatch name."""
@@ -38,11 +34,12 @@ async def _warm_model(model: str, engine: Any, legacy: Any | None) -> None:
         raise RuntimeError(f"Replacement engine is not healthy for {model}")
 
 
-async def warm_active_models(engines: dict[str, Any], legacy: dict[str, Any]) -> None:
+async def warm_active_models(engines: dict[str, Any], legacy: dict[str, Any] | None = None) -> None:
     """Finish before ASGI startup succeeds and Modal admits traffic to this router.
 
-    Keep old routers serving during first migration to model-scoped pools. Later
-    deploys keep each pool's identity stable, allowing Modal's rolling strategy to
+    Production supplies only model-scoped pools. The isolated rollout qualification
+    may supply legacy handles to exercise migration readiness. Deploys keep each
+    pool's identity stable, allowing Modal's rolling strategy to
     drain its old replicas. Health may reach a still-serving old replica during
     that transition; this is an availability gate, not a release-identity canary.
     Stats/readiness failures fail startup rather than declaring an unready router
@@ -50,4 +47,4 @@ async def warm_active_models(engines: dict[str, Any], legacy: dict[str, Any]) ->
     """
     async with asyncio.timeout(ROUTER_TIMEOUT_SECONDS), asyncio.TaskGroup() as tasks:
         for model, engine in engines.items():
-            tasks.create_task(_warm_model(model, engine, legacy.get(model)))
+            tasks.create_task(_warm_model(model, engine, (legacy or {}).get(model)))

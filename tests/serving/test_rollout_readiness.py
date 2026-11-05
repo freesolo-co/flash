@@ -34,10 +34,6 @@ def test_model_identity_is_distinct_and_independent_of_hardware():
     assert rollout.model_engine_name("a/b-c") != rollout.model_engine_name("a/b_c")
 
 
-def test_retired_legacy_pools_are_not_registered():
-    assert rollout.LEGACY_ENGINE_KEYS == {}
-
-
 def test_inactive_models_stay_at_zero():
     current, legacy = _engine(), _engine()
     asyncio.run(rollout.warm_active_models({"base": current}, {"base": legacy}))
@@ -57,7 +53,7 @@ def test_active_or_queued_models_require_readiness(activity, migrating):
 
 def test_first_deployment_does_not_need_a_legacy_pool():
     current = _engine()
-    asyncio.run(rollout.warm_active_models({"base": current}, {}))
+    asyncio.run(rollout.warm_active_models({"base": current}))
     current.health.remote.aio.assert_not_awaited()
 
 
@@ -68,7 +64,7 @@ def test_unhealthy_replacements_cannot_pass_startup(health):
     current = _engine(runners=1)
     current.health.remote.aio.return_value = health
     with pytest.raises(ExceptionGroup, match="TaskGroup") as error:
-        asyncio.run(rollout.warm_active_models({"base": current}, {}))
+        asyncio.run(rollout.warm_active_models({"base": current}))
     assert isinstance(error.value.exceptions[0], RuntimeError)
 
 
@@ -76,7 +72,7 @@ def test_stats_failure_does_not_silently_mark_a_pool_inactive():
     current = _engine()
     current.health.get_current_stats.aio.side_effect = RuntimeError("stats unavailable")
     with pytest.raises(ExceptionGroup) as error:
-        asyncio.run(rollout.warm_active_models({"base": current}, {}))
+        asyncio.run(rollout.warm_active_models({"base": current}))
     assert str(error.value.exceptions[0]) == "stats unavailable"
     current.health.remote.aio.assert_not_awaited()
 
