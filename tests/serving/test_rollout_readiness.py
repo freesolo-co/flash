@@ -7,6 +7,7 @@ from unittest.mock import AsyncMock
 import pytest
 
 from flash.serving.app import rollout
+from flash.serving.src.engine.model_config import base_models
 from flash.serving.src.http.router import _lifespan_for
 
 
@@ -26,11 +27,15 @@ def _engine(model="base", *, runners=0, running=0, backlog=0):
 
 
 def test_model_identity_is_distinct_and_independent_of_hardware():
-    names = [rollout.model_engine_name(model) for model in rollout.LEGACY_ENGINE_KEYS]
+    names = [rollout.model_engine_name(model) for model in base_models()]
     assert len(set(names)) == len(names)
     assert all(name.replace("_", "").isalnum() for name in names)
     # Normalization must not merge different public model IDs.
     assert rollout.model_engine_name("a/b-c") != rollout.model_engine_name("a/b_c")
+
+
+def test_retired_legacy_pools_are_not_registered():
+    assert rollout.LEGACY_ENGINE_KEYS == {}
 
 
 def test_inactive_models_stay_at_zero():
