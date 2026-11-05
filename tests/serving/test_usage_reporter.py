@@ -174,8 +174,7 @@ def test_modal_concurrency_is_per_engine_key(modal_app_module):
     # Check the actual decorators: changing only _engine_concurrency must not leave
     # a second target calculation deploying the old 75% threshold.
     expected = {
-        modal_app_module._engine_concurrency(model)
-        for model in modal_app_module.ENGINE_BY_MODEL
+        modal_app_module._engine_concurrency(model) for model in modal_app_module.ENGINE_BY_MODEL
     }
     expected.add((modal_app_module.MAX_INPUTS, modal_app_module.TARGET_INPUTS))
     assert seen == expected
