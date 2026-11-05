@@ -225,8 +225,8 @@ def test_prepare_refuses_an_unknown_router_before_changing_source(tmp_path):
     assert not (tmp_path / "flash/serving/_rollback_compat.py").exists()
 
 
-def test_manifest_captures_current_models_and_all_compatibility_names():
-    from flash.serving.app.rollout import LEGACY_ENGINE_KEYS, model_engine_name
+def test_manifest_captures_only_current_model_identities():
+    from flash.serving.app.rollout import model_engine_name
     from flash.serving.src.engine.model_config import base_models
 
     manifest = json.loads(json.dumps(engine_manifest("b" * 40)))
@@ -235,5 +235,4 @@ def test_manifest_captures_current_models_and_all_compatibility_names():
     )
     for model in base_models():
         assert manifest["classes"][model_engine_name(model)] == [model]
-    for model, (gpu, cap) in LEGACY_ENGINE_KEYS.items():
-        assert model in manifest["classes"][f"LoraEngine_{gpu}_c{cap}"]
+    assert set(manifest["classes"]) == {model_engine_name(model) for model in base_models()}
