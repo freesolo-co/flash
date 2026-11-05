@@ -74,9 +74,8 @@ def test_tool_parser_is_qualified_only_for_exact_qwen35() -> None:
 
 
 def test_no_model_runs_language_model_only() -> None:
-    # No tier sets language_model_only: flash adapters adapt the FULL multimodal tree, so their
-    # vision-tower LoRA keys need the vision encoder loaded to bind to. Every base loads the whole
-    # VL model (the 35B included) — none carries the text-only skip.
+    # Image-capable tiers retain the full multimodal tree so vision-tower LoRA keys
+    # can bind. Text-only tiers instead disable image/video through their input limits.
     assert "language_model_only" not in engine_overrides_for("Qwen/Qwen3.6-35B-A3B")
     assert "language_model_only" not in engine_overrides_for("Qwen/Qwen3.5-9B")
 

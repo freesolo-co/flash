@@ -906,8 +906,9 @@ def test_hosted_multimodal_args_preserve_images_without_reserving_video(
 
     args = _capture_engine_args(modal_app_module, monkeypatch, tmp_path, base_model)
     image_limit = image_limit_for(base_model)
-    expected = None if image_limit is None else {"image": image_limit, "video": 0}
-    assert args.limit_mm_per_prompt == expected
+    assert args.limit_mm_per_prompt == {"image": image_limit or 0, "video": 0}
+    assert args.enable_lora is True
+    assert args.enable_tower_connector_lora is (image_limit is not None)
 
 
 def test_hosted_hot_pools_remain_unpinned(modal_app_module, monkeypatch, tmp_path):
