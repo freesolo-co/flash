@@ -181,10 +181,15 @@ def cloud_init(payload, capsule_ref, image, *, deadline_at):
         "--workdir",
         "/root/flash",
         image,
-        "python",
-        "-u",
-        "/opt/flash/capsule.pyz",
-        "bootstrap",
+        "sh",
+        "-c",
+        # Qualified image digests can predate the Azure artifact backend. Match
+        # Modal's launch-time dependencies before the capsule publishes liveness.
+        (
+            "python -m pip install --disable-pip-version-check --no-input "
+            "'azure-storage-blob>=12.24,<13' 'azure-identity>=1.19,<2' "
+            "&& exec python -u /opt/flash/capsule.pyz bootstrap"
+        ),
     ]
     user_data = "#cloud-config\n" + json.dumps(
         {
