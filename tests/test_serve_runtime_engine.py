@@ -11,7 +11,10 @@ from types import SimpleNamespace
 from typing import Any, ClassVar
 
 import pytest
+from transformers.utils import chat_template_utils  # noqa: F401 -- preload before runtime stubs
 
+from flash.core.catalog import MODELS
+from flash.serve.request.tool_calls import qualified_tool_parser
 from flash.serve.runtime import (
     AdapterSpec,
     EngineConfig,
@@ -55,6 +58,7 @@ class _Tokenizer:
         self.pad_token_id = None
         self.eos_token = "<eos>"
         self.eos_token_id = 9
+        self.unk_token_id = None
         self.template_calls: list[dict[str, Any]] = []
         self.template_messages: list[Any] = []
 
@@ -67,6 +71,10 @@ class _Tokenizer:
         self.template_messages.append(messages)
         self.template_calls.append(kwargs)
         return [10, 11, 12]
+
+    def convert_tokens_to_ids(self, token):
+        assert token == "<|im_end|>"
+        return 8
 
     def encode(self, _prompt: str, **_kwargs: Any):
         return [20, 21]
@@ -1303,8 +1311,11 @@ def test_stream_cleanup_failure_still_releases_prompt_images(monkeypatch) -> Non
 
 @pytest.mark.parametrize("streaming", [False, True])
 @pytest.mark.parametrize("adapter", [False, True])
-def test_thinking_tools_use_answer_only_and_preserve_reasoning(adapter_dir, streaming, adapter):
-    runtime = VllmLoraRuntime(EngineConfig(model="Qwen/Qwen3.5-9B", tool_parser="qwen3_coder"))
+@pytest.mark.parametrize("model", MODELS)
+def test_thinking_tools_use_answer_only_and_preserve_reasoning(
+    adapter_dir, streaming, adapter, model
+):
+    runtime = VllmLoraRuntime(EngineConfig(model=model, tool_parser=qualified_tool_parser(model)))
     asyncio.run(runtime.start())
     engine = _Engine.latest
     if adapter:
