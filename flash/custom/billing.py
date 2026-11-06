@@ -8,6 +8,7 @@ from pathlib import Path
 def estimate(spec, *, allocation=None):
     from flash.cost.types import CostEstimate
     from flash.providers.core.allocator import allocate
+    from flash.providers.core.base import get_gpu_info
 
     rented = allocation or allocate(
         spec.model,
@@ -28,8 +29,9 @@ def estimate(spec, *, allocation=None):
         method="custom",
         steps=spec.train.max_steps,
         gpu=rented.gpu,
+        gpu_count=rented.gpu_count,
         provider=rented.provider,
-        gpu_vram_gb=rented.min_vram_gb,
+        gpu_vram_gb=get_gpu_info(rented.gpu).vram_gb,
         required_vram_gb=rented.min_vram_gb,
         gpu_hourly_usd=rented.hourly_usd,
         setup_seconds=0,
@@ -37,7 +39,7 @@ def estimate(spec, *, allocation=None):
         train_seconds=seconds,
         wall_clock_seconds=seconds,
         wall_capped=True,
-        total_usd=seconds * rented.hourly_usd / 3600,
+        total_usd=seconds * rented.hourly_usd * rented.gpu_count / 3600,
         notes=(
             "Upper bound for a dedicated custom session, including time waiting for the local script.",
         ),

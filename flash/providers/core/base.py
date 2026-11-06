@@ -309,16 +309,16 @@ def _run_cost_key(
 
 
 def custom_gpu_shape(model_id, provider, gpu_types, count):
-    """Keep the custom transport single-GPU; use shared sizing and hardware eligibility."""
+    """Bound custom layer sharding to validated one/two-GPU Modal shapes."""
     from flash.core.catalog import validate_model_for_algorithm
 
     validate_model_for_algorithm(model_id, "custom")
     if provider not in {"", "modal"} or (
-        count is not None and (type(count) is not int or count != 1)
+        count is not None and (type(count) is not int or count not in (1, 2))
     ):
-        raise ValueError("custom training currently requires one managed Modal GPU")
+        raise ValueError("custom training supports one or two managed Modal GPUs")
     allowed = tuple(gpu_types)
-    return "modal", allowed[0] if allowed else "", allowed[1:], 1
+    return "modal", allowed[0] if allowed else "", allowed[1:], count or 1
 
 
 def authored_gpu_ceiling(gpu_type: str, gpu_count: int | None) -> int | None:
@@ -465,7 +465,7 @@ def provisional_gpu_count(
         required_vram_gb,
     )
 
-    if algorithm == "custom":
+    if algorithm == "custom" and gpu_count is None:
         gpu_count = 1
     ceiling = MAX_COMBINATION_CARDS if gpu_count is None else gpu_count
     geometry_revision = (
@@ -546,6 +546,10 @@ def provisional_gpu(
         geometry_model_revision=geometry_model_revision,
         gpu_count=gpu_count,
     )
+    if algorithm == "custom":
+        from flash.custom.placement import preview_gpu
+
+        return preview_gpu(model_id, train, effective_count, total_need=min_vram)
     geometry_revision = (
         model_revision if geometry_model_revision is None else geometry_model_revision
     )

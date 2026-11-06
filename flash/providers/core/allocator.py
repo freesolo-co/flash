@@ -186,7 +186,7 @@ def _executed_gpu_count(algorithm: str, train, overrides, gpu_count: int) -> int
     if algo in ("grpo", "rl"):
         return _executed_rl_gpu_count(algo, train, gpu_count)
     if algo == "custom":
-        return 1
+        return gpu_count  # layer sharding uses every card even for a single sequence
     if algo != "sft":
         return gpu_count
     batch = _sizing_int(train, "batch_size", 0)
@@ -912,6 +912,14 @@ def allocate(
         provider=provider,
     )
     candidates = _fitting_candidates(candidates, need, executed_width)
+    if algorithm == "custom":
+        from flash.custom.placement import per_device_vram_gb
+
+        candidates = [
+            c
+            for c in candidates
+            if c.vram_gb >= per_device_vram_gb(model_id, sized_train, c.gpu_count, total_need=need)
+        ]
     supported_available = tuple(name for name in available if name not in structurally_unsupported)
     if not candidates:
         _raise_no_candidate_error(

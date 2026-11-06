@@ -1,4 +1,4 @@
-"""Reference single-GPU LoRA engine for explicit custom-loop operations.
+"""GPU-resident LoRA engine for explicit custom-loop operations.
 
 No server-side user code: the client supplies only tokens and dLoss/dLogprob weights.
 """
@@ -56,7 +56,9 @@ class TorchBackend:
     def _tensor(self, tokens):
         import torch
 
-        return torch.tensor([tokens], device=self.parameters[0].device, dtype=torch.long)
+        return torch.tensor(
+            [tokens], device=self.model.get_input_embeddings().weight.device, dtype=torch.long
+        )
 
     def _logprobs(self, tokens, target_tokens=None):
         """Logprobs of the targets: the next token ([T]) or a [T, K] target matrix."""
@@ -65,7 +67,7 @@ class TorchBackend:
         ids = self._tensor(tokens)
         logits = self.model(input_ids=ids[:, :-1], use_cache=False).logits[0].float()
         if target_tokens is None:
-            targets = ids[0, 1:, None]
+            targets = ids[0, 1:, None].to(logits.device)
         else:
             targets = torch.tensor(target_tokens, device=logits.device, dtype=torch.long)
         # gather targets and one normalizer per position; never copy a vocabulary row each.
@@ -259,7 +261,9 @@ class TorchBackend:
         self.optimizer.load_state_dict(state["optimizer"])
         torch.set_rng_state(state["rng"])
         if torch.cuda.is_available():
-            torch.cuda.set_rng_state_all(state["cuda_rng"])
+            from flash.custom.model_parallel import restore_cuda_rng
+
+            restore_cuda_rng(state["cuda_rng"])
         self.algorithm_state = (
             json.loads((source / "algorithm.json").read_text())
             if (source / "algorithm.json").exists()
@@ -292,8 +296,10 @@ def _ensure_cuda_headroom(min_free_bytes=CUDA_HEADROOM_BYTES):
 
         if not torch.cuda.is_available():
             return False
-        free, _ = torch.cuda.mem_get_info()
-        if free >= min_free_bytes:
+        if all(
+            torch.cuda.mem_get_info(device)[0] >= min_free_bytes
+            for device in range(torch.cuda.device_count())
+        ):
             return False
         torch.cuda.empty_cache()
         return True
@@ -339,6 +345,7 @@ def load_backend(
     checkpoint_dir,
     max_tokens=2048,
     init_adapter=None,
+    gpu_count=1,
 ):
     import torch
     from peft import LoraConfig, get_peft_model
@@ -372,13 +379,19 @@ def load_backend(
         from transformers import AutoModelForImageTextToText
 
         model_class = AutoModelForImageTextToText
+    from flash.custom.model_parallel import load_placement, validate_placement
+
+    placement = load_placement(model_id, lora_rank, max_tokens, gpu_count)
     model = model_class.from_pretrained(
         model_id,
         revision=revision,
         trust_remote_code=False,
         torch_dtype=torch.bfloat16,
         attn_implementation="sdpa",
-    ).to("cuda")
+        **placement,
+    )
+    if gpu_count == 1:
+        model = model.to("cuda")
     if init_adapter:
         model = _warm_start(model, init_adapter, lora_rank, lora_alpha)
     else:
@@ -394,6 +407,7 @@ def load_backend(
                 **targeting,
             ),
         )
+    validate_placement(model, gpu_count)
     model.config._commit_hash = revision
     return TorchBackend(model, tokenizer, checkpoint_dir=checkpoint_dir, max_tokens=max_tokens)
 
