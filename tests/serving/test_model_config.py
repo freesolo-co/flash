@@ -68,9 +68,17 @@ def test_reasoning_parser_is_configured_for_every_model() -> None:
         assert reasoning_parser_for(model) == "qwen3"
 
 
-def test_tool_parser_is_qualified_only_for_exact_qwen35() -> None:
-    assert tool_parser_for("Qwen/Qwen3.5-9B") == "qwen3_coder"
-    assert tool_parser_for("Qwen/Qwen3.6-35B-A3B") is None
+@pytest.mark.parametrize("model", base_models())
+def test_tool_parser_is_qualified_for_every_catalog_model(model) -> None:
+    assert tool_parser_for(model) == "qwen3_coder"
+
+
+def test_uncataloged_tool_parsers_remain_closed() -> None:
+    from flash.serve.request.tool_calls import qualified_tool_parser
+
+    assert qualified_tool_parser("Qwen/unqualified-future-model") is None
+    assert qualified_tool_parser("unknown/model") is None
+    assert tool_parser_for(DEEPSEEK_MODEL_ID) is None
 
 
 def test_no_model_runs_language_model_only() -> None:

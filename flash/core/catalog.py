@@ -23,6 +23,20 @@ _IMAGE_TRAINING_MODELS = frozenset(
 )
 
 
+# Native templates qualified against the shared Qwen3 coder grammar and replay contract.
+# New model families must pass the tool-template matrix before joining this set.
+TOOL_CALLING_MODELS = frozenset(
+    {
+        "Qwen/Qwen3.5-0.8B",
+        "Qwen/Qwen3.5-4B",
+        "Qwen/Qwen3.5-9B",
+        "Qwen/Qwen3.5-9B-Base",
+        "Qwen/Qwen3.8-27B",
+        "Qwen/Qwen3.6-35B-A3B",
+    }
+)
+
+
 def supports_image_training(model: str | ModelInfo | None) -> bool:
     """Return whether a curated model supports image-bearing SFT and GRPO."""
     model_id = model.id if isinstance(model, ModelInfo) else model
