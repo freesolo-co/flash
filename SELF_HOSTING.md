@@ -15,6 +15,12 @@ admit fitting rentals in H100, H200, B200 priority order, even when H200 is chea
 The entry thresholds price Flash's estimates; running prices can be higher. Estimates exclude disk, network and taxes and are not Nebius invoices.
 Nebius presets are 1 or 8 GPUs. All rented cards contribute to the price.
 
+Customer charges use the accepted Spot-priced quote: $1 per GPU-hour for H100/H200
+or $4 for B200 in the work estimate. Completion charges that quote; early completion
+or cancellation charges its completed-work fraction, capped at the accepted quote.
+Recovery preserves Spot pricing even when a saved resource record lacks its provider.
+These are fixed Flash Spot rates, not a pass-through of fluctuating Nebius invoices.
+
 Flash reads Nebius's public spot-price API and queues jobs if prices are over the
 cap, absent, stale, or unavailable. It checks again every 60 seconds, without
 consuming training retries or creating a VM. Queueing respects cancellation and
