@@ -12,6 +12,7 @@ the real Qwen3.5-9B tokenizer.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -21,6 +22,7 @@ from typing import ClassVar
 import jinja2
 import pytest
 
+from flash.core.catalog import MODELS
 from flash.engine.worker.train.core.child.glue import (
     EnvGlueTokenizer,
     validate_structured_messages,
@@ -34,6 +36,23 @@ from flash.serve.request.tool_calls import (
 from flash.serve.runtime.reasoning_tools import parse_tool_output
 
 TEMPLATE = (Path(__file__).parent / "fixtures/qwen3_5_9b_chat_template.jinja").read_text()
+TOOL_TEMPLATES = Path(__file__).parent / "fixtures/tool_templates"
+TEMPLATE_MANIFEST = json.loads((TOOL_TEMPLATES / "manifest.json").read_text())
+
+
+@pytest.fixture(params=list(TEMPLATE_MANIFEST))
+def catalog_template(request, monkeypatch):
+    metadata = TEMPLATE_MANIFEST[request.param]
+    source = (TOOL_TEMPLATES / metadata["file"]).read_bytes()
+    assert hashlib.sha256(source).hexdigest() == metadata["sha256"]
+    monkeypatch.setattr(__name__ + ".TEMPLATE", source.decode())
+    return request.param
+
+
+def test_tool_template_fixtures_cover_every_catalog_model():
+    assert TEMPLATE_MANIFEST.keys() == MODELS.keys()
+
+
 IM_END = "<|im_end|>"
 IM_END_ID = 0xE000
 
@@ -297,7 +316,9 @@ def _drive_episode(monkeypatch, env, generations):
     return captured, prefixes, tokenizer, prompts[0]
 
 
-def test_tool_env_rollout_steps_on_the_parsed_call_and_renders_like_serving(monkeypatch):
+def test_tool_env_rollout_steps_on_the_parsed_call_and_renders_like_serving(
+    monkeypatch, catalog_template
+):
     steps: list = []
     env = _adapter(schemas=TOOLS, steps=steps)
     output, prefixes, tokenizer, prompt = _drive_episode(monkeypatch, env, [CALL, ANSWER])
@@ -432,7 +453,7 @@ def test_tool_env_transcript_accepts_only_openai_tool_fields_on_their_roles():
             validate_structured_messages([message], source="environment reply", tools=True)
 
 
-def test_tool_env_glue_matches_the_full_serving_render():
+def test_tool_env_glue_matches_the_full_serving_render(catalog_template):
     tokenizer = _CharTokenizer()
     user = {"role": "user", "content": "Where is my order #W1?"}
     call_turn = {
@@ -519,14 +540,13 @@ def test_grpo_tool_resolution_refuses_shapes_that_cannot_match_serving():
 
 
 _LIVE = os.environ.get("FLASH_RL_TOOLS_TEMPLATE_LIVE") == "1"
-_QWEN = "Qwen/Qwen3.5-9B"
-_QWEN_REVISION = "c202236235762e1c871ad0ccb60c8ee5ba337b9a"
 
 
 @pytest.mark.skipif(
     not _LIVE, reason="set FLASH_RL_TOOLS_TEMPLATE_LIVE=1 (needs the cached tokenizer)"
 )
-def test_live_qwen35_rl_tool_prompt_equals_the_serving_render():
+@pytest.mark.parametrize("model", TEMPLATE_MANIFEST)
+def test_live_catalog_rl_tool_prompt_equals_the_serving_render(model):
     from transformers import AutoTokenizer
 
     from flash.content.stop_tokens import chat_stop_token_ids
@@ -536,7 +556,9 @@ def test_live_qwen35_rl_tool_prompt_equals_the_serving_render():
     )
     from flash.engine.worker.train.rl.launch.inputs import _build_grpo_prompts
 
-    tokenizer = AutoTokenizer.from_pretrained(_QWEN, revision=_QWEN_REVISION)
+    tokenizer = AutoTokenizer.from_pretrained(
+        model, revision=TEMPLATE_MANIFEST[model]["revision"], local_files_only=True
+    )
     env = _adapter(schemas=TOOLS)
     examples = env.dataset()
     tools = env.tools()
@@ -564,9 +586,9 @@ def test_live_qwen35_rl_tool_prompt_equals_the_serving_render():
 
     # the policy emits the call followed by <|im_end|>, which stops generation as an eos: the same
     # halting set the launch hands the child (checkpoint eos plus any chat-turn boundary).
-    eos = generation_eos_from_cached_config(_QWEN, _QWEN_REVISION, tokenizer) | frozenset(
-        chat_stop_token_ids(_QWEN, tokenizer, is_chat=True) or ()
-    )
+    eos = generation_eos_from_cached_config(
+        model, TEMPLATE_MANIFEST[model]["revision"], tokenizer
+    ) | frozenset(chat_stop_token_ids(model, tokenizer, is_chat=True) or ())
     im_end = tokenizer.convert_tokens_to_ids(IM_END)
     assert im_end in eos
     generated = [*tokenizer(CALL, add_special_tokens=False).input_ids, im_end]
@@ -608,3 +630,57 @@ def test_live_qwen35_rl_tool_prompt_equals_the_serving_render():
     (recovered,) = parsed.calls
     assert recovered.name == "get_order_details"
     assert json.loads(recovered.arguments) == {"order_id": "#W1"}
+
+
+@pytest.mark.parametrize("thinking", [False, True])
+def test_catalog_template_roundtrips_parallel_calls_with_reasoning(catalog_template, thinking):
+    from flash.content.reasoning_normalization import messages_for_chat_template
+    from flash.serve.request.tool_calls import qualified_tool_parser, validate_tool_request_contract
+
+    validate_tool_request_contract(
+        tools=normalize_tools(TOOLS),
+        tool_choice="auto",
+        thinking=thinking,
+        tool_parser=qualified_tool_parser(catalog_template),
+    )
+    tokenizer = _CharTokenizer()
+    user = {"role": "user", "content": "Look up my order and transfer me"}
+    calls = [
+        {
+            "id": "call_one",
+            "type": "function",
+            "function": {"name": "get_order_details", "arguments": '{"order_id":"#W1"}'},
+        },
+        {
+            "id": "call_two",
+            "type": "function",
+            "function": {"name": "transfer_to_human_agents", "arguments": "{}"},
+        },
+    ]
+    assistant = {"role": "assistant", "content": "", "tool_calls": calls}
+    if thinking:
+        assistant["reasoning_content"] = "look it up first"
+
+    def render(messages, generation):
+        return tokenizer.apply_chat_template(
+            detached_template_messages(messages_for_chat_template(messages)),
+            tools=WIRE,
+            add_generation_prompt=generation,
+            tokenize=False,
+            enable_thinking=thinking,
+            preserve_thinking=False,
+        )
+
+    prefix = render([SYSTEM, user], True)
+    rendered = render([SYSTEM, user, assistant], False)
+    assert rendered.startswith(prefix)
+    completion = rendered[len(prefix) :].removesuffix(IM_END + "\n")
+    parsed = parse_tool_output(completion, normalize_tools(TOOLS), thinking=thinking)
+    assert [call.name for call in parsed.calls] == [call["function"]["name"] for call in calls]
+    assert [json.loads(call.arguments) for call in parsed.calls] == [{"order_id": "#W1"}, {}]
+    assert len({call.id for call in parsed.calls}) == 2
+    replies = [{"role": "tool", "tool_call_id": call["id"], "content": "done"} for call in calls]
+    glue = EnvGlueTokenizer(tokenizer, thinking=thinking, tools=WIRE)(replies)
+    assert rendered.removesuffix(IM_END + "\n") + tokenizer.decode(glue) == render(
+        [SYSTEM, user, assistant, *replies], True
+    )
