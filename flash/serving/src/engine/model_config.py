@@ -38,7 +38,7 @@ from flash.serving.src.engine.prequant_config import (
 # checkpoints published to the operator HF org.
 #
 # sizing rationale. preallocated lora buffers and loaded checkpoint weights dominate engine vram.
-# The dense 0.8B uses L4, the BF16 4B and both FP8 9B models use L40S, the FP8 27B uses H100, and
+# The dense 0.8B uses L4, the BF16 4B uses L40S, both FP8 9B models and the FP8 27B use H100, and
 # the BF16 35B MoE uses H200.
 #   - Qwen3.6-35B-A3B (vision-language MoE; arch ``Qwen3_5MoeForConditionalGeneration``) -> H200
 #     (141 GB) with the base bf16 weights, 6 x 64 LoRA at native 256k. bf16 (not FP8) is the one path giving
@@ -93,7 +93,7 @@ SERVING_MODELS: list[dict[str, Any]] = [
     {
         "base_model": "Qwen/Qwen3.5-9B",
         "image_input_limit": MAX_IMAGES_PER_CONVERSATION,
-        "gpu": "L40S",
+        "gpu": "H100",
         "engine": {
             "tokenizer_model": "Qwen/Qwen3.5-9B",
             "tokenizer_revision": "c202236235762e1c871ad0ccb60c8ee5ba337b9a",
@@ -106,8 +106,7 @@ SERVING_MODELS: list[dict[str, Any]] = [
             "max_loras": 16,
             "max_lora_rank": 128,  # rank-128 / 16 hot LoRAs (cheap on the 9 GiB FP8 9B); native 256k context.
             "max_model_len": 262144,
-            # L40S: 64 improves short/4k throughput ~127%/~40% over sixteen and
-            # completes a full 64-request 32k-prompt rank-128 q_proj LoRA burst.
+            # Keep the qualified 64-sequence scheduler capacity on H100.
             "max_num_seqs": 64,
             "enforce_eager": False,
             "reasoning_parser": "qwen3",
@@ -116,7 +115,7 @@ SERVING_MODELS: list[dict[str, Any]] = [
     {
         "base_model": "Qwen/Qwen3.5-9B-Base",
         "image_input_limit": MAX_IMAGES_PER_CONVERSATION,
-        "gpu": "L40S",
+        "gpu": "H100",
         "engine": {
             # FP8 conversion of the pinned Base weights; never alias the Instruct checkpoint.
             "model_revision": "b1a2cf5f5e7bb4ad786e206f834569be3a3d8aa9",

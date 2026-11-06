@@ -471,8 +471,8 @@ def test_engine_concurrency_rejects_malformed_catalog_values(modal_app_module, m
     [
         ("Qwen/Qwen3.5-0.8B", "L4", 64),
         ("Qwen/Qwen3.5-4B", "L40S", 8),
-        ("Qwen/Qwen3.5-9B", "L40S", 64),
-        ("Qwen/Qwen3.5-9B-Base", "L40S", 64),
+        ("Qwen/Qwen3.5-9B", "H100", 64),
+        ("Qwen/Qwen3.5-9B-Base", "H100", 64),
         ("Qwen/Qwen3.8-27B", "H100", 8),
         ("Qwen/Qwen3.6-35B-A3B", "H200", 8),
     ],
@@ -544,7 +544,7 @@ def test_health_reports_pinned_gpu_over_derived_tier(modal_app_module):
         base_model = "Qwen/Qwen3.5-9B"
         registry = type("R", (), {"list_ready": lambda self: []})()
 
-    assert impl._health(_Bare())["configured_gpu"] == "L40S"
+    assert impl._health(_Bare())["configured_gpu"] == "H100"
 
 
 def test_health_reports_effective_max_model_len_override(modal_app_module):

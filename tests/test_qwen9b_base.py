@@ -51,8 +51,8 @@ def test_pretrained_serving_uses_its_own_weights_tokenizer_and_revision():
     assert profile.modal_gpu_request == "H100!"
     assert profile.max_model_len == 262144
     assert profile.max_num_seqs == get_model(BASE).serving.max_num_seqs == 32
-    # Hosted FP8 serving uses L40S; the separate customer-owned BF16 profile stays on H100.
-    assert gpu_for(BASE) == gpu_for(POST_TRAINED) == "L40S"
+    # Hosted FP8 serving uses H100; the separate customer-owned BF16 profile stays on H100.
+    assert gpu_for(BASE) == gpu_for(POST_TRAINED) == "H100"
     assert overrides["max_num_seqs"] == 64
     assert "max_num_batched_tokens" not in overrides
     assert tool_parser_for(BASE) == "qwen3_coder"
