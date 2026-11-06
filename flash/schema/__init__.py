@@ -506,12 +506,27 @@ def _validate_gpu_section(
         raise ConfigError(
             f"gpu.provider must be one of {', '.join(PROVIDER_NAMES)}; got {provider_raw!r}"
         )
+    spot = gpu_raw.get("spot", False)
+    if type(spot) is not bool:
+        raise ConfigError("gpu.spot must be a boolean")
+    if (
+        "spot" in gpu_raw
+        and not spot
+        and (gpu_provider == "spot" or gpu_raw.get("providers") == ["spot"])
+    ):
+        raise ConfigError("gpu.spot=false conflicts with the Spot provider")
+    if spot:
+        if gpu_provider not in ("", "spot"):
+            raise ConfigError("gpu.spot=true cannot use another provider")
+        if not gpu_raw.get("providers"):
+            gpu_provider = "spot"
     gpu_entries = _authored_gpu_type_entries(gpu_raw.get("type", ""))
     try:
         gpu_spec = GpuSpec(
             type=gpu_entries[0] if gpu_entries else "",
             provider=gpu_provider,
             providers=gpu_raw.get("providers", ()),
+            spot=spot,
             count=gpu_count if gpu_count is not None else 1,
             type_fallbacks=gpu_entries[1:],
         )

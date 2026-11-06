@@ -51,10 +51,10 @@ def reconcile_cleanup(run_id: str, remote: dict) -> CleanupOutcome:
 def _remote_resource_identity(remote: object) -> tuple | None:
     if not isinstance(remote, dict):
         return None
-    from flash.providers.modal.handles import ModalJobHandle
+    from flash.providers.core.handles import parse_handle
 
     try:
-        h = ModalJobHandle.from_dict(remote)
+        h = parse_handle(remote)
         return (h.provider, h.attempt, h.instance_id, h.name, h.run_id)
     except (TypeError, ValueError):
         return None
@@ -202,9 +202,9 @@ def _compare_and_complete_remote(
 def _canonical_cleanup_remote(remote: object) -> dict | None:
     if not isinstance(remote, dict) or _remote_resource_identity(remote) is None:
         return None
-    from flash.providers.modal.handles import ModalJobHandle
+    from flash.providers.core.handles import parse_handle
 
-    return ModalJobHandle.from_dict(remote).to_dict()
+    return parse_handle(remote).to_dict()
 
 
 def _cleanup_remote_key(remote: object) -> tuple | None:

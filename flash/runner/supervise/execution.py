@@ -182,6 +182,38 @@ def _prepare_attempt(ctx: _SubmitContext):
 
 
 def _allocate_attempt(ctx: _SubmitContext, prepared):
+    """Price/capacity waiting is queue time, not a failed training attempt."""
+    from flash.runner.lifecycle.deadlines import _load_run_deadline_at
+    from flash.runner.lifecycle.status import _update
+
+    spec = prepared[1]
+    if spec.gpu.provider != "spot" and spec.gpu.providers != ("spot",):
+        return _allocate_attempt_once(ctx, prepared)
+    from flash.providers.core.base import PollResult
+
+    while True:
+        ctx.raise_if_cancelled()
+        remaining = _load_run_deadline_at(ctx.spec.run_id) - time.time()
+        if remaining <= 0:
+            return None, PollResult(
+                False, failure="stalled", detail="Spot queue reached run deadline"
+            )
+        allocation, failure = _allocate_attempt_once(ctx, prepared)
+        if failure is None or failure.failure not in {"no_capacity", "poll_error"}:
+            return allocation, failure
+        _update(ctx.spec.run_id, "queued")
+        print(
+            "Spot queued: waiting for Nebius capacity below the GPU price cap",
+            file=ctx.log,
+            flush=True,
+        )
+        until = min(time.time() + 60, _load_run_deadline_at(ctx.spec.run_id))
+        while time.time() < until:
+            ctx.raise_if_cancelled()
+            time.sleep(max(0, min(1, until - time.time())))
+
+
+def _allocate_attempt_once(ctx: _SubmitContext, prepared):
     _, attempt_spec, _, _ = prepared
     from flash.providers.core.allocator import allocate
     from flash.providers.core.base import CapacityUnavailableError, PollResult, UnsupportedGpuError

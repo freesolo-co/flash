@@ -7,6 +7,7 @@ from verl.trainer.ppo.utils import Role
 from verl.trainer.ppo.v1.trainer_sync import PPOTrainerSync
 
 from flash.engine.worker.runtime.phases import training_phase
+from flash.engine.worker.train.core.child import checkpoint_schedule
 from flash.engine.worker.train.core.child.options import RuntimeOptions
 from flash.engine.worker.train.core.child.queue import _init_transfer_queue
 from flash.engine.worker.train.core.child.readiness import publish_ready
@@ -50,9 +51,20 @@ class FlashSyncTrainer(PPOTrainerSync):
                 self.role_worker_mapping[role] = ray.remote(FlashActorRolloutWorker)
 
     def _save_checkpoint(self):
-        if self.runtime.should_save(int(self.global_steps)):
+        adaptive = checkpoint_schedule.enabled()
+        due = (
+            checkpoint_schedule.should_save(
+                self, int(self.global_steps), self.runtime.save_at_steps, self.runtime.total_steps
+            )
+            if adaptive
+            else self.runtime.should_save(int(self.global_steps))
+        )
+        if due:
             with checkpoint_phase(int(self.global_steps), "capture"):
-                return super()._save_checkpoint()
+                result = super()._save_checkpoint()
+            if adaptive:
+                checkpoint_schedule.saved(self)
+            return result
         return None
 
     def on_train_begin(self):

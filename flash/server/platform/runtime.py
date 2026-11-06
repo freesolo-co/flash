@@ -756,7 +756,7 @@ def _classify_recoverable_runs(
                     _update(status.run_id, "failed", error=detail)
                 with contextlib.suppress(Exception):
                     _append_run_log(status.run_id, detail)
-                from flash.providers.modal.provider import terminate_persisted_resources
+                from flash.providers.core.registry import terminate_persisted_resources
 
                 try:
                     terminate_persisted_resources(status.spec, status.run_id)

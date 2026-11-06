@@ -92,3 +92,47 @@ def test_current_envelope_version_is_validated_but_absence_still_recovers() -> N
     status.effective_preparation = {**snapshot, "version": PREPARATION_ENVELOPE_VERSION + 1}
     with pytest.raises(ValueError, match="unsupported persisted preparation envelope version"):
         runner_status.effective_spec_from_status(status)
+
+
+def test_pre_spot_preparation_digest_still_recovers(monkeypatch):
+    from flash.runner.lifecycle.submit import _effective_preparation_snapshot
+
+    spec = _current_spec()
+    serializer = JobSpec.to_internal_dict
+
+    def legacy_serializer(self):
+        payload = serializer(self)
+        payload["gpu"].pop("spot", None)
+        return payload
+
+    # Construct the envelope using the serialization contract from before Spot existed.
+    with monkeypatch.context() as legacy:
+        legacy.setattr(JobSpec, "to_internal_dict", legacy_serializer)
+        status = runner_state.RunStatus(
+            state="running",
+            run_id=spec.run_id,
+            spec=spec.to_dict(),
+            effective_preparation=_effective_preparation_snapshot(spec, spec, None),
+        )
+    assert "spot" not in spec.to_dict()["gpu"]
+    assert "spot" not in spec.to_internal_dict()["gpu"]
+    assert runner_status.effective_spec_from_status(status) == spec
+
+
+def test_spot_opt_in_is_bound_to_preparation_integrity():
+    from flash.runner.lifecycle.submit import _effective_preparation_snapshot
+
+    spec = _current_spec()
+    spec = replace(spec, gpu=replace(spec.gpu, spot=True))
+    snapshot = _effective_preparation_snapshot(spec, spec, None)
+    status = runner_state.RunStatus(
+        state="running", run_id=spec.run_id, spec=spec.to_dict(), effective_preparation=snapshot
+    )
+    assert snapshot["worker_spec"]["gpu"]["spot"] is True
+    assert runner_status.effective_spec_from_status(status) == spec
+    snapshot["worker_spec"]["gpu"]["spot"] = False
+    snapshot["worker_spec"]["gpu"]["provider"] = "modal"
+    status.spec["gpu"]["spot"] = False
+    status.spec["gpu"]["provider"] = "modal"
+    with pytest.raises(ValueError, match="failed integrity validation"):
+        runner_status.effective_spec_from_status(status)

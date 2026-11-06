@@ -1,7 +1,7 @@
 """Checkpoint resume for supported infrastructure retries; all network/GPU boundaries are stubbed.
 
-Host preemption is terminal. Checkpoint loading remains necessary for the supervisor's other
-retry categories and explicit checkpoint-based training.
+Modal host preemption is terminal; Spot preemption can retry within its infrastructure budget.
+Checkpoint loading supports authorized retries and explicit checkpoint-based training.
 """
 
 from __future__ import annotations

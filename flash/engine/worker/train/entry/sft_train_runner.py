@@ -405,6 +405,11 @@ def _prepare_sft_model(
         else max(1, min(options.save_every, update_horizon))
     )
 
+    from flash.core.checkpoint_policy import is_spot_spec
+
+    if is_spot_spec(options.spec):
+        save_freq = 1
+
     card_vram_gb = float(options.gpu_probe.get("memory_gb") or 0.0)
     info = MODELS.get(options.model_id)
     active_params_b = float(getattr(info, "active_params_b", 0.0) or 0.0) or None

@@ -9,7 +9,7 @@ from flash.core.spec import JobSpec
 
 INFRA_RETRY_FLOOR = 5
 INFRA_RETRY_FAILURES = frozenset({"stalled", "no_capacity", "poll_error"})
-CANDIDATE_RETRY_FAILURES = INFRA_RETRY_FAILURES | {"oom"}
+CANDIDATE_RETRY_FAILURES = INFRA_RETRY_FAILURES | {"oom", "job_preempted"}
 CACHE_FALLBACK_FAILURES = frozenset({"no_capacity", "poll_error"})
 _STATE_KEYS = frozenset(
     {
@@ -106,7 +106,7 @@ class RetryState:
             raise ValueError("persisted retry state exceeds cache retry budget")
         if shape is not None and not drop:
             raise ValueError("persisted retry state has an unarmed cache retry shape")
-        decision = _restore_last_decision(raw["last_decision"], counters)
+        decision = _restore_last_decision(raw["last_decision"], counters, spot=spec.gpu.spot)
         return cls(
             maxima.infra_retries,
             maxima.oom_retries,
@@ -169,7 +169,9 @@ def _restore_plan(raw: object, counters: dict) -> RetryPlan:
     return RetryPlan(retry, action, ordinal)
 
 
-def _restore_last_decision(raw: object, counters: dict) -> PersistedRetryDecision | None:
+def _restore_last_decision(
+    raw: object, counters: dict, *, spot: bool
+) -> PersistedRetryDecision | None:
     if raw is None:
         if any(counters.values()):
             raise ValueError("persisted retry state has an incomplete last decision")
@@ -187,7 +189,9 @@ def _restore_last_decision(raw: object, counters: dict) -> PersistedRetryDecisio
         raise ValueError("persisted retry state has an invalid last decision")
     plan = _restore_plan(raw["plan"], counters)
     # an older saved decision cannot authorize a failure the current policy no longer retries.
-    if plan.retry and failure not in CANDIDATE_RETRY_FAILURES:
+    if plan.retry and (
+        failure not in CANDIDATE_RETRY_FAILURES or (failure == "job_preempted" and not spot)
+    ):
         plan = RetryPlan(False, "not retrying")
     return PersistedRetryDecision(attempt, failure, plan)
 
@@ -287,6 +291,18 @@ def _finish(
     ), plan
 
 
+def _spot_preemption_plan(state: RetryState, chosen) -> tuple[RetryState, RetryPlan]:
+    if chosen is None or chosen.provider != "spot":
+        return state, RetryPlan(False, "not retrying")
+    if state.infra_used >= state.infra_retries:
+        return state, RetryPlan(False, "not retrying: infrastructure retry budget exhausted")
+    ordinal = state.infra_used + 1
+    # Preemption says nothing about memory requirements: keep the same shape eligible.
+    return replace(state, infra_used=ordinal), RetryPlan(
+        True, "retrying Spot allocation (resume from last checkpoint)", ordinal
+    )
+
+
 def transition_failure(
     state: RetryState,
     observation: FailureObservation,
@@ -297,6 +313,9 @@ def transition_failure(
     failure = observation.failure
     chosen = observation.chosen
     candidates = observation.candidates
+    if failure == "job_preempted":
+        state, plan = _spot_preemption_plan(state, chosen)
+        return _finish(state, plan, observation, attempt)
     if failure not in CANDIDATE_RETRY_FAILURES:
         return _finish(state, RetryPlan(False, "not retrying"), observation, attempt)
     if chosen is None:

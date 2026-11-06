@@ -229,7 +229,12 @@ class _VerlCheckpointWatcher:
 
     def _publish(self, step: int, checkpoint_dir: str) -> None:
         if not self._should_publish(step):
+            from flash.core.checkpoint_policy import is_spot_spec
+
             self.lifecycle.mark_discovered(step)
+            if is_spot_spec(self.context.config.spec):
+                staged_dir = self._staged_source(step, checkpoint_dir)
+                self._persist_resume(step, staged_dir, job_label="sft")
             return
         staged_dir = self._staged_source(step, checkpoint_dir)
         try:

@@ -162,4 +162,5 @@ def test_authored_surface_is_exactly_what_the_public_payload_carries():
     # empty custom settings stay absent to preserve historical preparation digests.
     assert set(public) == _TOP_LEVEL_KEYS - {"custom"}
     assert set(public["environment"]) == _ENVIRONMENT_KEYS
-    assert set(public["gpu"]) == _GPU_KEYS
+    # The false Spot default stays absent to preserve pre-Spot preparation digests.
+    assert set(public["gpu"]) == _GPU_KEYS - {"spot"}

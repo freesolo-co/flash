@@ -438,6 +438,8 @@ def _quote_gpu_ceiling(
         return geometry_safe_gpu_cap(config.model_id, ceiling, model_revision=config.model_revision)
     from flash.providers.core.base import smallest_fitting_gpu_count
 
+    if config.provider == "spot":
+        return auto_cap
     return (
         smallest_fitting_gpu_count(
             need,
@@ -462,7 +464,7 @@ def _offline_preferred_gpu_shape(config: RunConfig) -> tuple[str, int, int, str,
     configured = available_providers()
     # an unconfigured plane (no credentials anywhere) has nothing to filter against; fall back to the
     # registered set so the quote keeps its historical structural answer instead of going empty.
-    eligible = configured or PROVIDER_NAMES
+    eligible = tuple(name for name in (configured or PROVIDER_NAMES) if name != "spot")
     for provider in config.providers:
         if provider not in eligible:
             continue
@@ -497,6 +499,10 @@ def _offline_gpu_shape(config: RunConfig) -> tuple[str, int, int, str, float]:
     Preparation must not consume live-capacity failures before run creation. Rank rentable shapes
     offline, then replace the quote with the selected live candidate before provisioning.
     """
+    if config.providers == ("spot",):
+        from dataclasses import replace
+
+        return _offline_gpu_shape(replace(config, provider="spot", providers=()))
     if config.providers:
         return _offline_preferred_gpu_shape(config)
     # Fail closed on a model that cannot be sized at all. Curated entries answer from the catalog
@@ -522,7 +528,7 @@ def _offline_gpu_shape(config: RunConfig) -> tuple[str, int, int, str, float]:
         combined_vram_gb,
     )
 
-    provider = config.provider if config.provider != "auto" else "auto"
+    provider = config.provider
     if config.gpu_type:
         # rank every class the author declared acceptable, not just the head. `allocate()` cost-ranks
         # the whole ordered set, so quoting the head alone prices a shape the run may never be given
@@ -547,7 +553,12 @@ def _offline_gpu_shape(config: RunConfig) -> tuple[str, int, int, str, float]:
     ranked = []
     for gpu in names:
         info = GPU_INFO[gpu]
-        for count in rentable_gpu_counts(min(safe_gpu_count, info.max_count)):
+        counts = rentable_gpu_counts(min(safe_gpu_count, info.max_count))
+        if provider == "spot":
+            from flash.providers.nebius.pricing import SPOT_GPUS
+
+            counts = tuple(n for n in counts if n in SPOT_GPUS[gpu].counts)
+        for count in counts:
             # credit only the cards that JOIN the run, matching the allocator's `_fits`. quoting the
             # billed count here made the two disagree: a 27B at 128k over 10 rows was quoted 4x H200
             # (460 GB credited against a 422 GB need) while the allocator launches 2 ranks -- 234 GB
@@ -555,15 +566,20 @@ def _offline_gpu_shape(config: RunConfig) -> tuple[str, int, int, str, float]:
             launched = executed_gpu_count(config, count)
             if combined_vram_gb(info.vram_gb, launched) < need:
                 continue
-            from flash.providers.modal.pricing import hourly_rate
+            from flash.providers.core.registry import get_provider
 
-            hourly = hourly_rate(gpu)
+            hourly = get_provider("modal" if provider == "auto" else provider).hourly_rate(gpu)
             step_seconds = sharded_step_seconds(
                 config, gpu, count, "" if provider == "auto" else provider
             )
+            from flash.providers.nebius.pricing import priority as spot_priority
+
             ranked.append(
                 (
-                    hourly * count * step_seconds,
+                    (
+                        spot_priority(gpu) if provider == "spot" else 0,
+                        hourly * count * step_seconds,
+                    ),
                     count,
                     combined_vram_gb(info.vram_gb, launched),
                     info.vram_gb,

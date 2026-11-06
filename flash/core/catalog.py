@@ -376,7 +376,7 @@ MODELS: dict[str, ModelInfo] = {
         quant="bf16",
         recommended_gpu="H100",
         serving=ServingCapacity(
-            gpu="L40S",
+            gpu="H100",
             serve_model_id=SERVING_MODEL_REPOS["Qwen/Qwen3.5-9B"],
             max_loras=16,
             max_cpu_loras=16,
@@ -543,7 +543,7 @@ MODELS["Qwen/Qwen3.5-9B-Base"] = replace(
     display_name="Qwen3.5 9B Base (pretrained)",
     managed_revision="68c46c4b3498877f3ef123c856ecfde50c39f404",
     serving=ServingCapacity(
-        gpu="L40S",
+        gpu="H100",
         serve_model_id="Qwen/Qwen3.5-9B-Base",
         max_loras=16,
         max_cpu_loras=16,
@@ -557,7 +557,7 @@ MODELS["Qwen/Qwen3.5-9B-Base"] = replace(
     notes="Pretrained-only Qwen3.5 9B; bf16 LoRA SFT/GRPO. Uses its own weights and "
     "tokenizer, not the post-trained 9B. Native chat/thinking formatting is available for "
     "fine-tuning; instruction following and reasoning are not post-trained. Hosted FP8 serving "
-    "on L40S; customer-owned BF16 serving on H100.",
+    "on H100; customer-owned BF16 serving on H100.",
 )
 
 

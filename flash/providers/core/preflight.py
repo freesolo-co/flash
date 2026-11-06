@@ -19,7 +19,10 @@ __all__ = [
 
 logger = get_logger(__name__)
 
-_PROVIDER_SETUP = (("modal", "MODAL_TOKEN_ID + MODAL_TOKEN_SECRET", "Modal workspace credentials"),)
+_PROVIDER_SETUP = (
+    ("modal", "MODAL_TOKEN_ID + MODAL_TOKEN_SECRET", "Modal workspace credentials"),
+    ("spot", "FLASH_NEBIUS_PROJECT_ID/REGION/SUBNET_ID/IMAGE_ID", "Nebius CLI and GPU host image"),
+)
 
 
 def _present(var: str) -> bool:
@@ -121,4 +124,6 @@ def check_run_preflight() -> None:
     require_operator_config()
     if not _present("GITHUB_TOKEN"):
         logger.warning("GITHUB_TOKEN is not set; private environment repositories are unavailable.")
-    logger.info("GPU provider configured: modal")
+    from flash.providers.core.registry import available_providers
+
+    logger.info("GPU providers configured: %s", ", ".join(available_providers()))
