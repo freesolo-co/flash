@@ -73,11 +73,11 @@ def _multimodal_args(
 ) -> dict[str, Any]:
     image_limit = image_limit_for(base_model)
     if image_limit is None:
-        # Text-only Qwen tiers still use a multimodal checkpoint architecture. vLLM
-        # defaults omitted modalities to one item, loading/profiling an unused vision
-        # tower and warning for every vision module without a tower LoRA wrapper.
-        # Zero both modalities so vLLM skips the tower; text LoRA stays enabled.
-        return {"limit_mm_per_prompt": {"image": 0, "video": 0}}
+        # Preserve the qualified vLLM startup path for text-only Qwen tiers.
+        # Disabling both modalities switches profiling to input_ids with no
+        # inputs_embeds; the current compiled Qwen3Next path crashes on None.size.
+        # Request validation still rejects image inputs for these catalog tiers.
+        return {}
     return {
         # Hosted requests accept text and images, never video. Leaving video unspecified
         # makes vLLM reserve/profile its default video input, which can consume the KV
