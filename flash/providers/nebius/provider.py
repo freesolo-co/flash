@@ -104,7 +104,6 @@ class SpotProvider:
         ]
 
     def sweep_orphans(self, active_labels=None, known_labels=None):
-        from flash.providers._lifecycle.instances.instance import run_label_prefix
         from flash.providers.nebius import api
 
         instances = api.list_instances()
@@ -112,7 +111,7 @@ class SpotProvider:
         known = known_labels() if callable(known_labels) else known_labels
         deleted = []
         for item in instances:
-            label = run_label_prefix(item["metadata"]["labels"].get("flash-run", ""))
+            label = item["metadata"]["labels"].get("flash-run", "")
             if (known is not None and label not in known) or (active and label in active):
                 continue
             api.terminate(item["metadata"]["id"])

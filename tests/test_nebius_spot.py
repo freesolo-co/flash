@@ -531,3 +531,27 @@ def test_bootstrap_download_uses_private_blob_and_checks_content(
     assert requests == [
         "https://example.blob.core.windows.net/private/repo/capsules/content.pyz?sig=secret"
     ]
+
+
+@pytest.mark.parametrize("run_id", ["custom-run", "flash-" + "x" * 60])
+@pytest.mark.parametrize("callbacks", [False, True])
+def test_orphan_sweep_compares_original_run_ids(monkeypatch, run_id, callbacks):
+    instances = [
+        {"metadata": {"id": name, "labels": {"flash-run": label}}}
+        for name, label in (
+            ("terminal", run_id),
+            ("active", run_id + "-active"),
+            ("unknown", "another-run"),
+        )
+    ]
+    monkeypatch.setattr(api, "list_instances", lambda: instances)
+    deleted = []
+    monkeypatch.setattr(api, "terminate", deleted.append)
+    active = {run_id + "-active"}
+    known = {run_id, *active}
+    provider = get_provider("spot")
+    result = provider.sweep_orphans(
+        (lambda: active) if callbacks else active,
+        (lambda: known) if callbacks else known,
+    )
+    assert result == deleted == ["terminal"]

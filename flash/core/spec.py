@@ -703,6 +703,9 @@ class JobSpec:
         differently, so removing either pop would break existing digests.
         """
         data = asdict(self)
+        # Keep pre-Spot preparation digests stable while binding opt-in Spot to integrity checks.
+        if not self.gpu.spot:
+            data["gpu"].pop("spot", None)
         if not data["custom"]:
             data.pop("custom")
         # Preserve public and worker preparation digests for all existing runs.
