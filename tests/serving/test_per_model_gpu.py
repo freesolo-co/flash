@@ -880,14 +880,17 @@ def test_every_catalog_model_forwards_its_reasoning_parser(
 
 
 @pytest.mark.parametrize("base_model", base_models())
-def test_hosted_multimodal_args_preserve_images_without_reserving_video(
+def test_hosted_multimodal_args_preserve_qualified_startup(
     modal_app_module, monkeypatch, tmp_path, base_model: str
 ):
     from flash.serving.src.engine.model_config import image_limit_for
 
     args = _capture_engine_args(modal_app_module, monkeypatch, tmp_path, base_model)
     image_limit = image_limit_for(base_model)
-    assert args.limit_mm_per_prompt == {"image": image_limit or 0, "video": 0}
+    if image_limit is None:
+        assert args.limit_mm_per_prompt is None
+    else:
+        assert args.limit_mm_per_prompt == {"image": image_limit, "video": 0}
     assert args.enable_lora is True
     assert args.enable_tower_connector_lora is (image_limit is not None)
 
