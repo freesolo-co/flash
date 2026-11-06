@@ -1,7 +1,7 @@
 """Custom-only fields and constraints; common sections use the normal JobSpec parser."""
 
 from flash.custom.types import integer
-from flash.schema.fields import ConfigError
+from flash.schema.fields import ConfigError, _train_int
 
 TRAIN_KEYS = {
     "max_steps",
@@ -65,9 +65,14 @@ def validate_custom_spec(spec):
         )
     try:
         integer(spec.train.max_steps, "train.max_steps", 1, 1_000_000)
-        integer(spec.train.max_context_tokens, "train.max_context_tokens", 2, 4096)
-        integer(spec.train.lora_rank, "train.lora_rank", 1, 64)
-        integer(spec.train.lora_alpha, "train.lora_alpha", 1, 256)
+        # Rank/alpha use the common parser and model's serving rank cap. Context
+        # uses the shared submission preflight and GPU memory-fit checks; custom
+        # next-token losses only add a two-token minimum, not a separate ceiling.
+        _train_int(
+            {"max_context_tokens": spec.train.max_context_tokens},
+            "max_context_tokens",
+            minimum=2,
+        )
         integer(spec.train.save_every, "train.save_every", 1, 1_000_000)
     except ValueError as exc:
         raise ConfigError(str(exc)) from exc
@@ -76,3 +81,14 @@ def validate_custom_spec(spec):
             "train.init_from_adapter starts fresh optimizer state from any adapter; "
             "custom.resume_from continues a custom checkpoint. Set only one"
         )
+
+
+def validate_custom_gpu_count(model, gpu_spec, gpu_count):
+    """Validate custom GPU placement and apply its single-device default."""
+    from flash.providers.core.base import custom_gpu_shape
+
+    try:
+        custom_gpu_shape(model, gpu_spec.provider, gpu_spec.acceptable_types, gpu_count)
+    except ValueError as exc:
+        raise ConfigError(str(exc)) from exc
+    return gpu_count or 1

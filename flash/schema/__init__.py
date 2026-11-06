@@ -534,13 +534,9 @@ def _validate_gpu_section(
         raise ConfigError(str(exc)) from exc
 
     if algorithm == "custom":
-        from flash.providers.core.base import custom_gpu_shape
+        from flash.schema.custom import validate_custom_gpu_count
 
-        try:
-            custom_gpu_shape(model, gpu_spec.provider, gpu_spec.acceptable_types, gpu_count)
-        except ValueError as exc:
-            raise ConfigError(str(exc)) from exc
-        gpu_count = 1
+        gpu_count = validate_custom_gpu_count(model, gpu_spec, gpu_count)
 
     gpu_types = gpu_spec.acceptable_types
     for candidate in gpu_types:
@@ -568,7 +564,7 @@ def _validate_gpu_section(
             geometry_model_revision=model_revision,
             gpu_count=requested_gpu_count,
         )
-        if gpu_types and preflight_gpu_count <= 1 and not model_revision:
+        if gpu_types and (preflight_gpu_count <= 1 or algorithm == "custom") and not model_revision:
             from flash.providers.core.allocator import required_vram_gb
 
             # sized from `preflight_train`, so an unresolved warm start is measured at rank 1 rather
@@ -587,6 +583,12 @@ def _validate_gpu_section(
             # run is one allocation would never rent, so accepting it here would advertise failover
             # the run does not actually have and surface the shortfall only after the head ran out
             # of capacity.
+            if algorithm == "custom":
+                from flash.custom.placement import per_device_vram_gb
+
+                required_vram = per_device_vram_gb(
+                    model, preflight_train, preflight_gpu_count, total_need=required_vram
+                )
             for candidate in gpu_types:
                 if get_gpu_info(candidate).vram_gb < required_vram:
                     raise ConfigError(

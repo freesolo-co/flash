@@ -1,4 +1,4 @@
-"""Authenticated, single-session worker. Run one process per dedicated GPU."""
+"""Authenticated, single-session worker for one dedicated GPU allocation."""
 
 import asyncio
 import hmac
