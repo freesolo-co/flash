@@ -65,7 +65,40 @@ RUN if [ "${INSTALL_INFISICAL}" = "true" ]; then \
         infisical --version; \
     fi
 
-# Source changes reuse the operating-system and optional Infisical layers.
+# Optional Nebius CLI, required only by the Nebius Spot provider (`[gpu] spot = true`): Flash
+# drives Nebius through `nebius ... --no-browser` and treats the provider as unconfigured when the
+# binary is absent (flash/providers/nebius/config.py). OFF by default, like Infisical, so a plain
+# `docker build .` stays vendor-free; Freesolo's published images turn it on
+# (.github/workflows/publish-image.yml passes INSTALL_NEBIUS=true). The binary alone grants
+# nothing: the operator still mounts an authenticated service-account profile at /root/.nebius
+# and sets FLASH_NEBIUS_* (see SELF_HOSTING.md).
+#
+# Pinned by version AND sha256 rather than piping the vendor's install.sh into a shell. Nebius
+# publishes the binaries at artifacts.nebius.cloud/cli/release/<version>/linux/<arch>/nebius
+# without a checksums file, so the digests below were taken from those exact release binaries.
+# Bump NEBIUS_CLI_VERSION and both digests together; a mismatch fails the build.
+ARG INSTALL_NEBIUS=false
+ARG NEBIUS_CLI_VERSION=0.12.302
+ARG NEBIUS_CLI_SHA256_AMD64=44315ff3fec500bcf3e7836f738ab456dcdf2b796c79b531ded6ca8f40622f56
+ARG NEBIUS_CLI_SHA256_ARM64=0d4781905d777b3a4fc295158d0f382691e453cc7828c02dca2212cf331712b9
+RUN if [ "${INSTALL_NEBIUS}" = "true" ]; then \
+        set -eu; \
+        case "$(dpkg --print-architecture)" in \
+            amd64) arch="x86_64"; sha="${NEBIUS_CLI_SHA256_AMD64}" ;; \
+            arm64) arch="arm64"; sha="${NEBIUS_CLI_SHA256_ARM64}" ;; \
+            *) echo "no pinned nebius CLI build for this architecture" >&2; exit 1 ;; \
+        esac; \
+        bin="/tmp/nebius"; \
+        curl -fsSL -o "${bin}" \
+            "https://artifacts.nebius.cloud/cli/release/${NEBIUS_CLI_VERSION}/linux/${arch}/nebius"; \
+        # Verify BEFORE installing: a mismatch must fail the build, never install.
+        echo "${sha}  ${bin}" | sha256sum -c -; \
+        install -m 0755 "${bin}" /usr/local/bin/nebius; \
+        rm -f "${bin}"; \
+        test "$(nebius version)" = "${NEBIUS_CLI_VERSION}"; \
+    fi
+
+# Source changes reuse the operating-system and optional Infisical and Nebius layers.
 COPY . .
 RUN pip install --no-cache-dir ".[server]"
 

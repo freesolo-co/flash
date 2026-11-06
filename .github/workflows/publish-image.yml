@@ -104,8 +104,11 @@ jobs:
           context: .
           file: ./Dockerfile
           push: true
+          # INSTALL_NEBIUS=true adds the pinned Nebius CLI that the optional Spot provider drives;
+          # it stays inert until an operator mounts a Nebius profile and sets FLASH_NEBIUS_*.
           build-args: |
             INSTALL_INFISICAL=true
+            INSTALL_NEBIUS=true
           tags: ${{ steps.tags.outputs.tags }}
           cache-from: type=gha
           cache-to: type=gha,mode=min
