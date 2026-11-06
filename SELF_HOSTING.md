@@ -40,7 +40,12 @@ checkpoint whose upload was still in progress. Portal is not used.
 On the control-plane host:
 
 1. Install and authenticate the current Nebius CLI with access to the intended
-   USD-billed project, compute resources and billing pricing policies.
+   USD-billed project, compute resources and billing pricing policies. Freesolo's
+   published control-plane images already contain a pinned CLI (`INSTALL_NEBIUS=true`;
+   a plain `docker build .` omits it). Flash calls it non-interactively with
+   `--no-browser`, so give the container a service-account profile, not a browser
+   login: for example, mount a root-only directory holding `config.yaml` and the
+   authorized-key PEM at `/root/.nebius`.
 2. Set `FLASH_NEBIUS_PROJECT_ID`, `FLASH_NEBIUS_REGION`,
    `FLASH_NEBIUS_SUBNET_ID`, and `FLASH_NEBIUS_IMAGE_ID`. The region must match
    the project and subnet. The configured GPU host image must have Docker,
