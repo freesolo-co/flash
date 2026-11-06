@@ -17,9 +17,12 @@ def publish_capsule(payload, capsule, *, deadline_at):
     blob = f"{repo_prefix(payload['hf_repo'])}/capsules/{digest}.pyz"
 
     def publish():
-        with open_container(token) as container:
+        # Container properties require control-plane credentials; a worker
+        # user-delegation SAS only authorizes blob operations.
+        with open_container() as container:
             if container.get_container_properties().public_access:
                 raise ValueError("Nebius capsule container must be private")
+        with open_container(token) as container:
             BlobArtifacts(container).immutable(blob, capsule)
 
     artifact_call(

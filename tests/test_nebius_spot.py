@@ -205,6 +205,13 @@ def test_create_always_attaches_server_price_cap_and_owned_disk(monkeypatch, dis
     assert spec["boot_disk"]["managed_disk"]["spec"]["type"] == "NETWORK_SSD_NON_REPLICATED"
     init = json.loads(spec["cloud_init_user_data"].split("\n", 1)[1])
     assert all(f["permissions"] == "0600" for f in init["write_files"])
+    launch = init["runcmd"][1]
+    assert launch[0] == "timeout"
+    assert launch[-3:-1] == ["sh", "-c"]
+    install, bootstrap_command = launch[-1].split(" && ")
+    assert "'azure-storage-blob>=12.24,<13'" in install
+    assert "'azure-identity>=1.19,<2'" in install
+    assert bootstrap_command == "exec python -u /opt/flash/capsule.pyz bootstrap"
 
 
 def test_spot_handle_roundtrips_through_cleanup_identity():
@@ -442,9 +449,14 @@ def test_capsule_publication_pins_revision_and_checksum(monkeypatch):
     from contextlib import contextmanager
 
     @contextmanager
-    def container(token):
-        assert token == "private-capability"
-        yield SimpleNamespace(get_container_properties=lambda: SimpleNamespace(public_access=None))
+    def container(token=None):
+        assert token in (None, "private-capability")
+        # A worker SAS cannot read container properties.
+        yield (
+            SimpleNamespace(get_container_properties=lambda: SimpleNamespace(public_access=None))
+            if token is None
+            else SimpleNamespace()
+        )
 
     monkeypatch.setattr(bootstrap, "open_container", container)
     monkeypatch.setattr(
@@ -555,3 +567,24 @@ def test_orphan_sweep_compares_original_run_ids(monkeypatch, run_id, callbacks):
         (lambda: known) if callbacks else known,
     )
     assert result == deleted == ["terminal"]
+
+
+def test_capsule_rejects_public_container_before_using_worker_sas(monkeypatch):
+    from contextlib import contextmanager
+
+    from flash.providers.nebius import bootstrap
+
+    @contextmanager
+    def container(token=None):
+        assert token is None, "must reject public storage before using the worker capability"
+        yield SimpleNamespace(
+            get_container_properties=lambda: SimpleNamespace(public_access="blob")
+        )
+
+    monkeypatch.setattr(bootstrap, "open_container", container)
+    with pytest.raises(ValueError, match="must be private"):
+        bootstrap.publish_capsule(
+            {"hf_repo": "test/artifacts", "env": {"FLASH_ARTIFACT_BLOB_SAS_URL": "worker-sas"}},
+            b"capsule",
+            deadline_at=time.time() + 60,
+        )
