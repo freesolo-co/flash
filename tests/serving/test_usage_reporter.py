@@ -96,21 +96,15 @@ def test_lora_engine_scales_to_zero_by_default(modal_app_module):
     assert modal_app_module.MIN_CONTAINERS == 0
 
     cls_calls = [call.kwargs for call in modal_app_module.app.cls.call_args_list]
-    assert len(cls_calls) == (
-        len(modal_app_module.ENGINE_BY_KEY) + len(modal_app_module.ENGINE_BY_MODEL)
-    )
+    assert len(cls_calls) == len(modal_app_module.ENGINE_BY_MODEL)
     # asserted on the kwargs modal is actually CALLED with, not on the constant: the floor is only
     # real if it reaches `app.cls`. `AutoscalerSettings.min_containers` is an `optional` proto field
     # (has_presence), so omitting it and sending 0 are distinguishable on the wire -- an omitted
     # field leaves the floor to whatever the server defaults to, which is not ours to assume.
     assert all(kwargs["min_containers"] == modal_app_module.MIN_CONTAINERS for kwargs in cls_calls)
-    # Compatibility pools drain promptly; current pools retain the qualified idle window.
-    legacy_count = len(modal_app_module.ENGINE_BY_KEY)
-    assert all(kwargs["scaledown_window"] == 60 for kwargs in cls_calls[:legacy_count])
-    cls_calls = cls_calls[legacy_count:]
     assert {kwargs["gpu"]: kwargs["scaledown_window"] for kwargs in cls_calls} == {
         ("H100!" if gpu == "H100" else gpu): modal_app_module.scaledown_window_for(gpu)
-        for gpu, _mi in modal_app_module.ENGINE_BY_KEY
+        for gpu in modal_app_module.SUPPORTED_GPUS
     }
 
     assert modal_app_module.app.function.call_count == 1
@@ -124,9 +118,7 @@ def test_gpu_engines_scale_from_demand_without_a_paid_spare(modal_app_module):
     assert modal_app_module.ROUTER_BUFFER_CONTAINERS == 1
 
     cls_calls = [call.kwargs for call in modal_app_module.app.cls.call_args_list]
-    assert len(cls_calls) == (
-        len(modal_app_module.ENGINE_BY_KEY) + len(modal_app_module.ENGINE_BY_MODEL)
-    )
+    assert len(cls_calls) == len(modal_app_module.ENGINE_BY_MODEL)
     assert all(kwargs["max_containers"] == 2 for kwargs in cls_calls)
     # An active, lightly loaded model must not reserve a second GPU.
     assert all(kwargs["buffer_containers"] == 0 for kwargs in cls_calls)
@@ -166,14 +158,13 @@ def test_modal_concurrency_is_per_engine_key(modal_app_module):
     assert modal_app_module.TARGET_INPUTS == 48
     # One @modal.concurrent per distinct engine key plus one on the router.
     calls = [call.kwargs for call in modal_app_module.modal.concurrent.call_args_list]
-    assert (
-        len(calls)
-        == (len(modal_app_module.ENGINE_BY_KEY) + len(modal_app_module.ENGINE_BY_MODEL)) + 1
-    )
+    assert len(calls) == len(modal_app_module.ENGINE_BY_MODEL) + 1
     seen = {(c["max_inputs"], c["target_inputs"]) for c in calls}
     # Check the actual decorators: changing only _engine_concurrency must not leave
     # a second target calculation deploying the old 75% threshold.
-    expected = {(mi, mi) for (_gpu, mi) in modal_app_module.ENGINE_BY_KEY}
+    expected = {
+        modal_app_module._engine_concurrency(model) for model in modal_app_module.ENGINE_BY_MODEL
+    }
     expected.add((modal_app_module.MAX_INPUTS, modal_app_module.TARGET_INPUTS))
     assert seen == expected
 

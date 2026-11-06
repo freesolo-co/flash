@@ -73,6 +73,10 @@ def _multimodal_args(
 ) -> dict[str, Any]:
     image_limit = image_limit_for(base_model)
     if image_limit is None:
+        # Preserve the qualified vLLM startup path for text-only Qwen tiers.
+        # Disabling both modalities switches profiling to input_ids with no
+        # inputs_embeds; the current compiled Qwen3Next path crashes on None.size.
+        # Request validation still rejects image inputs for these catalog tiers.
         return {}
     return {
         # Hosted requests accept text and images, never video. Leaving video unspecified
