@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
+import anyio
 import httpx
 from fastapi import HTTPException
 from fastapi.responses import StreamingResponse
@@ -74,7 +75,10 @@ class _UpstreamStreamingResponse(StreamingResponse):
         try:
             await super().__call__(scope, receive, send)
         finally:
-            self._upstream.close()
+            # Closing a synchronous HTTP stream can wait on transport locks or I/O.
+            # Keep health checks responsive, and finish cleanup even on disconnect.
+            with anyio.CancelScope(shield=True):
+                await anyio.to_thread.run_sync(self._upstream.close)
 
 
 def _resolve_chat_request(
