@@ -407,6 +407,17 @@ There is no "all" sentinel, so this number is duplicated from the data into the 
 **can drift**: if the dataset later grows, a stale `max_examples` silently trains on a
 subset instead of erroring. Re-check it whenever the dataset or the params change.
 
+Select Spot directly in your editable training TOML:
+
+```toml
+[gpu]
+spot = false # set true for Nebius Spot; false uses regular training
+```
+
+Spot only uses Nebius and prefers fitting H100s, then H200s, then B200s.
+It queues until the price is below $1, $1, or $4 per GPU-hour respectively.
+Once running, the corresponding maximum prices are $1.50, $2, and $5.
+
 GPU allocation and Azure artifacts are **managed by default**: leave `[gpu] type` unset to
 let the allocator pick the cheapest fitting validated class, while `train.hf_repo` remains
 platform-managed. `[gpu] providers` takes an ordered list of provider names and prefers them in
@@ -941,7 +952,7 @@ an epoch is one pass over the retained prompt pool after `max_examples` and prom
 optimizer-step counts are derived from those epochs. A positive `[train] max_steps` replaces that
 derived count with an exact update horizon for every algorithm. `[train] save_at_steps`
 requires a positive `max_steps` so its horizon is authoritative even when SFT packing changes the
-realized batch shape. When non-empty, exact save steps suppress periodic `save_every` checkpoints, and the
+realized batch shape. For Modal, non-empty exact save steps suppress periodic `save_every` checkpoints, and the
 run fails if a requested exact save cannot be saved and published.
 
 ---
@@ -1644,3 +1655,15 @@ See the full reference at https://docs.freesolo.co.
 LoRA+ and entropy-quantile filtering have been removed, including their stored configuration
 fields and resume support. Configs and stored job payloads containing either removed field are
 rejected as unknown settings; no legacy optimizer or loss shim is installed.
+
+### Spot recovery checkpoints
+
+With `[gpu] spot = true`, Flash uses Nebius and manages recovery checkpoints automatically.
+A greedy scheduler uses the latest step duration, targeting at most 10 minutes of
+unsaved training: 5-minute steps save every 2 steps; 1-minute steps every 10.
+The first and final completed steps also save. Steps lasting 10 minutes or longer save after every step. Slow steps or uploads can exceed
+the recovery target. Omit `train.save_every`. Set `spot = false` for regular training.
+An optional `train.save_at_steps` schedule adds model exports to those automatic
+saves; it cannot disable them. After preemption, the replacement Nebius Spot VM
+resumes the latest fully uploaded trainer checkpoint. An interrupted upload is
+not a valid resume point.

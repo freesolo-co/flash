@@ -252,3 +252,41 @@ def test_saved_preemption_retry_cannot_authorize_a_replacement_worker():
     assert restored.infra_used == 1
     with pytest.raises(RuntimeError, match="lacks exact persisted retry authorization"):
         require_retry_authorization_from_raw(spec, {state._RETRY_STATE_KEY: old_state}, 1)
+
+
+@pytest.mark.parametrize("budget", [0, 2, 5])
+def test_spot_preemption_reuses_shape_until_infrastructure_budget_exhausted(budget):
+    chosen = _candidate("spot", "H100", 80)
+    current = replace(RetryState(budget, 2, 1), usable_vram_floor=24)
+    for attempt in range(budget + 1):
+        current, plan = transition_failure(
+            current, _observe("job_preempted", chosen, (chosen,)), attempt=attempt
+        )
+        assert plan.retry is (attempt < budget)
+        assert current.infra_used == min(attempt + 1, budget)
+        assert current.oom_used == 0
+        assert current.usable_vram_floor == 24
+        assert current.select_candidate((chosen,))[1] == chosen
+
+
+def test_spot_preemption_persists_authorization_for_replacement(monkeypatch, tmp_path):
+    from flash.runner.supervise.retry_decision import require_retry_authorization_from_raw
+
+    monkeypatch.setattr(state, "RUNS_DIR", str(tmp_path / "runs"))
+    spec = _spec("spot-preemption")
+    spec = replace(spec, gpu=replace(spec.gpu, spot=True))
+    state._save_status(state.RunStatus(spec.run_id, "running", spec.to_dict()))
+    claim = attempts.reserve_verified_attempt_launch(spec.run_id)
+    chosen = _candidate("spot", "H100", 80)
+    plan = decide_attempt_failure(
+        spec.run_id,
+        claim_token=claim.token,
+        expected_remote=None,
+        observation=_observe("job_preempted", chosen, (chosen,)),
+        attempt=0,
+    )
+    assert plan.retry
+    restored = require_retry_authorization_from_raw(spec, status._load_status_json(spec.run_id), 1)
+    assert restored.last_decision.failure == "job_preempted"
+    assert restored.infra_used == 1
+    assert restored.select_candidate((chosen,))[1] == chosen

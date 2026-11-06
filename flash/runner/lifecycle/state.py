@@ -145,6 +145,7 @@ class RunStatus:
     # for runs created outside submit() / pre-feature records.
     submitted_instance_providers: list[str] | None = None
     submitted_modal_scope: str | None = None
+    submitted_spot_scope: str | None = None
     # Stamped ONCE on first terminal transition; survives later updated_at bumps from deployment updates.
     finished_at: float | None = None
     billing_context: dict | None = None

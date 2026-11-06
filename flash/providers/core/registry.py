@@ -1,4 +1,4 @@
-"""Modal training substrate registry."""
+"""Training substrate registry."""
 
 from __future__ import annotations
 
@@ -8,7 +8,7 @@ from flash.providers.core.base import Provider
 
 # registry order is not a primary selection preference. it affects only exact full-key allocation
 # ties through Python's stable sort.
-PROVIDER_NAMES: tuple[str, ...] = ("modal",)
+PROVIDER_NAMES: tuple[str, ...] = ("modal", "spot")
 
 
 def validated_provider_preferences(value, *, allow_empty: bool = False) -> tuple[str, ...]:
@@ -30,10 +30,12 @@ def validated_provider_preferences(value, *, allow_empty: bool = False) -> tuple
         if name not in seen:
             result.append(name)
             seen.add(name)
+    if "spot" in result and len(result) != 1:
+        raise ValueError("Spot cannot fall back to another provider; use gpu.provider = 'spot'")
     return tuple(result)
 
 
-INSTANCE_PROVIDERS: tuple[str, ...] = ("modal",)
+INSTANCE_PROVIDERS: tuple[str, ...] = ("modal", "spot")
 
 
 def get_provider(name: str) -> Provider:
@@ -47,7 +49,11 @@ def _get_provider(key: str) -> Provider:
         from flash.providers.modal.provider import PROVIDER
 
         return PROVIDER
-    raise KeyError(f"unknown provider {key!r}; Flash uses Modal")
+    if key == "spot":
+        from flash.providers.nebius.provider import PROVIDER
+
+        return PROVIDER
+    raise KeyError(f"unknown provider {key!r}")
 
 
 def available_providers() -> tuple[str, ...]:
@@ -58,3 +64,9 @@ def available_providers() -> tuple[str, ...]:
 def configured_providers() -> list[Provider]:
     """enabled Provider objects in registered order (see available_providers)."""
     return [get_provider(n) for n in available_providers()]
+
+
+def terminate_persisted_resources(spec, run_id):
+    """Clean owned training resources even when the persisted spec cannot be parsed."""
+    for provider in configured_providers():
+        provider.terminate_run(run_id)

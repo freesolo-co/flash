@@ -227,6 +227,10 @@ def _build_verl_child_env(*, wandb_enabled: bool, context: WorkerContext) -> dic
         for key, value in os.environ.items()
         if key in _CHILD_ENV_EXACT or key.startswith(_CHILD_ENV_PREFIXES)
     }
+    from flash.core.checkpoint_policy import SPOT_CHECKPOINT_SECONDS, is_spot_spec
+
+    if is_spot_spec(context.config.spec):
+        child["FLASH_SPOT_CHECKPOINT_SECONDS"] = str(SPOT_CHECKPOINT_SECONDS)
     if wandb_enabled:
         child.update({key: value for key, value in os.environ.items() if key.startswith("WANDB_")})
     # retained runtime namespaces are filtered by applied-secret provenance. authenticated child-side

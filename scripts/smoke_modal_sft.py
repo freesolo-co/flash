@@ -81,7 +81,7 @@ def stage_environment(hub, repo, root):
     return environment, rows
 
 
-def prepare(hub, repo, run_id, volume, root, gpu, model="Qwen/Qwen3.5-9B"):
+def prepare(hub, repo, run_id, volume, root, gpu, model="Qwen/Qwen3.5-9B", *, provider="modal"):
     from importlib.metadata import version
 
     environment, rows = stage_environment(hub, repo, root)
@@ -109,7 +109,7 @@ def prepare(hub, repo, run_id, volume, root, gpu, model="Qwen/Qwen3.5-9B"):
             lora_rank=8,
         ),
         gpu=GpuSpec(
-            type=gpu, count=1, provider="modal", max_wall_seconds=1800, network_volume=volume
+            type=gpu, count=1, provider=provider, max_wall_seconds=1800, network_volume=volume
         ),
     )
     spec = replace(

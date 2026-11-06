@@ -62,9 +62,9 @@ def _pinned_offline_allocation(provider: str, gpu_type: str, gpu_count: int):
         from flash.providers.core.base import Allocation, canonical_gpu
 
         gpu = canonical_gpu(gpu_type)
-        from flash.providers.modal.pricing import hourly_rate
+        from flash.providers.core.registry import get_provider
 
-        hourly = hourly_rate(gpu)
+        hourly = get_provider(provider or "modal").hourly_rate(gpu)
         return Allocation(
             provider=provider,
             gpu=gpu,
@@ -112,6 +112,7 @@ def charge_usd_for_spec(
     the 1-card offline optimum.
     """
     try:
+        from flash.core.checkpoint_policy import is_spot_spec
         from flash.cost.analytical import estimate_cost
         from flash.cost.spec import UnknownPromptPoolSize, run_config_from_spec
 
@@ -127,13 +128,19 @@ def charge_usd_for_spec(
             if steps is None:
                 raise
             cfg = run_config_from_spec(_spec_pinned_to_horizon(spec, int(steps)))
-        if provider:
+        if is_spot_spec(spec):
+            # The authored Spot choice remains authoritative after teardown or retry,
+            # even if a legacy/incomplete rented handle omits or misstates its provider.
+            provider = "spot"
+            cfg = replace(cfg, provider=provider, providers=())
+        elif provider:
             # suppressed ValueError: the registry no longer maps this provider to the spec's
             # class. the combination was rentable when the run launched, so degrade to the spec's
             # own pricing substrate rather than turning a chargeable cancel into a pricing failure.
             with contextlib.suppress(ValueError):
                 cfg = replace(cfg, provider=provider)
-        allocation = _pinned_offline_allocation(provider, gpu_type, gpu_count)
+        pricing_provider = provider or (cfg.provider if cfg.provider != "auto" else "")
+        allocation = _pinned_offline_allocation(pricing_provider, gpu_type, gpu_count)
         if steps is None:
             return float(estimate_cost(cfg, allocation=allocation).total_usd)
         n = max(0, int(steps))

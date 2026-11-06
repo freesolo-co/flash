@@ -3404,7 +3404,7 @@ def test_recover_runs_rejects_handleless_removed_model_before_resubmit_or_gc(
         if cleanup_fails:
             raise RuntimeError("temporary Modal outage")
 
-    monkeypatch.setattr("flash.providers.modal.provider.terminate_persisted_resources", cleanup)
+    monkeypatch.setattr("flash.providers.core.registry.terminate_persisted_resources", cleanup)
 
     from flash._internal.background import current_supervisor
 

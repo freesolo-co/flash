@@ -9,6 +9,7 @@ from verl.trainer.sft_trainer import SFTTrainer
 from verl.utils.checkpoint import CheckpointHandler
 from verl.utils.dataset.dataset_utils import SFTTensorCollator
 
+from flash.engine.worker.train.core.child import checkpoint_schedule
 from flash.engine.worker.train.core.child.options import RuntimeOptions
 from flash.engine.worker.train.core.lifecycle.timing import checkpoint_phase
 from flash.engine.worker.train.sft.child.dataset import FlashTokenizedSFTDataset
@@ -21,11 +22,22 @@ class FlashCheckpointHandler(CheckpointHandler):
         super().__init__(**kwargs)
 
     def save_checkpoint(self, step):
-        if self.runtime.should_save(step):
+        adaptive = checkpoint_schedule.enabled()
+        due = (
+            checkpoint_schedule.should_save(
+                self, step, self.runtime.save_at_steps, self.runtime.total_steps, distributed=True
+            )
+            if adaptive
+            else self.runtime.should_save(step)
+        )
+        if due:
             with checkpoint_phase(step, "retention_wait"):
                 self._wait_for_publication(step)
             with checkpoint_phase(step, "capture"):
-                return super().save_checkpoint(step)
+                result = super().save_checkpoint(step)
+            if adaptive:
+                checkpoint_schedule.saved(self)
+            return result
         return None
 
     def _wait_for_publication(self, step):

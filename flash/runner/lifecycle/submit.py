@@ -23,6 +23,7 @@ from flash.core.spec import TRAINER_BACKEND, JobSpec
 from flash.core.spec_persistence import PREPARATION_ENVELOPE_VERSION
 from flash.providers._lifecycle.net import worker as provider_worker
 from flash.providers.modal.auth import scope_fingerprint
+from flash.providers.nebius.config import scope_fingerprint as spot_scope_fingerprint
 from flash.runner.accounting import artifacts, weight_cache
 from flash.runner.lifecycle import preparation, reporting, state
 from flash.runner.lifecycle import status as status_ops
@@ -347,7 +348,10 @@ def _submit_prepared_job(
         # snapshot the instance providers available at submit so a later handle-less recovery can fail
         # closed for any phantom-capable one whose creds were since dropped (see _confirm_run_clear).
         # Creds-only check (available_providers -> is_configured), no network on the create path.
-        submitted_modal_scope=scope_fingerprint(),
+        submitted_modal_scope=(scope_fingerprint() if "modal" in available_providers() else None),
+        submitted_spot_scope=(
+            spot_scope_fingerprint() if "spot" in available_providers() else None
+        ),
         submitted_instance_providers=[n for n in available_providers() if n in INSTANCE_PROVIDERS],
     )
     save_kwargs = {
