@@ -175,8 +175,10 @@ def get_gpu_info(name: str) -> GpuClass:
 
 def providers_for(name: str) -> tuple[str, ...]:
     """The training substrate supporting this validated GPU class."""
-    get_gpu_info(name)
-    return ("modal",)
+    from flash.providers.nebius.pricing import SPOT_GPUS
+
+    gpu = get_gpu_info(name)
+    return ("modal", "spot") if gpu.name in SPOT_GPUS else ("modal",)
 
 
 def gpu_short(name: str) -> str:

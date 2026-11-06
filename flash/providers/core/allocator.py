@@ -301,7 +301,12 @@ def _structurally_fits(available, need: int, cap: int, executed_width, acceptabl
         for gpu_class in classes:
             if allowed and gpu_class.name not in allowed:
                 continue
-            for count in rentable_gpu_counts(cap):
+            counts = rentable_gpu_counts(min(cap, gpu_class.max_count))
+            if name == "spot":
+                from flash.providers.nebius.pricing import SPOT_GPUS
+
+                counts = tuple(n for n in counts if n in SPOT_GPUS[gpu_class.name].counts)
+            for count in counts:
                 if combined_vram_gb(gpu_class.vram_gb, executed_width(count)) >= need:
                     return True
     return False
@@ -629,7 +634,7 @@ def _resolved_gpu_count(
             need, max_gpu_count=auto_cap, gpu_names=gpu_names, executed_width=executed_width
         )
         if fitting_count is not None:
-            return fitting_count
+            return auto_cap if available == ("spot",) else fitting_count
         effective_count = auto_cap
     else:
         effective_count = geometry_safe_gpu_cap(
@@ -840,6 +845,10 @@ def allocate(
     if provider and providers:
         raise UnsupportedGpuError("provider and providers cannot both be set")
     available = available_providers()
+    if providers == ("spot",):
+        provider = "spot"
+    if provider != "spot":
+        available = tuple(name for name in available if name != "spot")
     # kept across the narrowing below so a rejection can ask what dropping the pin would restore.
     unpinned = None
     if provider:
@@ -923,7 +932,7 @@ def allocate(
     return _cheapest_allocation(
         candidates,
         need=need,
-        cost_per_step=cost_per_step,
+        cost_per_step=None if provider == "spot" else cost_per_step,
         provider_rank=provider_rank,
     )
 
@@ -942,12 +951,15 @@ def _cheapest_allocation(
     matches. A run the cost model cannot price (``cost_per_step`` is ``None``) falls back to total
     $/hr.
     """
+    from flash.providers.nebius.pricing import priority as spot_priority
+
     primary = cost_per_step if cost_per_step is not None else (lambda c: c.total_hourly_usd)
     unnamed_rank = len(provider_rank)
     ranked = sorted(
         candidates,
         key=lambda c: (
             provider_rank.get(c.provider, unnamed_rank),
+            spot_priority(c.gpu) if c.provider == "spot" else 0,
             primary(c),
             c.total_hourly_usd,
             c.gpu_count,
@@ -955,6 +967,13 @@ def _cheapest_allocation(
             c.gpu,
         ),
     )
+    # Spot prioritizes GPU class, then current price; fixed entry rates price estimates.
+    from flash.providers.nebius.pricing import hourly_rate as spot_hourly_rate
+
+    ranked = [
+        replace(c, hourly_usd=spot_hourly_rate(c.gpu)) if c.provider == "spot" else c
+        for c in ranked
+    ]
     best = ranked[0]
     return Allocation(
         provider=best.provider,

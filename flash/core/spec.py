@@ -424,6 +424,7 @@ class GpuSpec:
     # PLATFORM-MANAGED: runner assigns weight-cache volume; None = cold download.
     network_volume: str | None = None
     network_volume_gb: int = 100
+    spot: bool = False
     provider: str = ""
     providers: tuple[str, ...] = ()
     # number of cards of `type` a single training worker occupies (1..8). count > 1 provisions a
@@ -441,6 +442,17 @@ class GpuSpec:
         )
         if self.provider and providers:
             raise ValueError("gpu.provider and gpu.providers cannot both be set")
+        if type(self.spot) is not bool:
+            raise TypeError("gpu.spot must be a boolean")
+        if self.spot:
+            if self.provider not in ("", "spot") or providers not in ((), ("spot",)):
+                raise ValueError(
+                    "gpu.spot=true requires Nebius Spot; remove other provider choices"
+                )
+            if not providers:
+                object.__setattr__(self, "provider", "spot")
+        if self.provider == "spot" or providers == ("spot",):
+            object.__setattr__(self, "spot", True)
         if not isinstance(self.type, str):
             raise TypeError("gpu.type must be a string")
         gpu_type = (
@@ -564,6 +576,10 @@ class JobSpec:
     custom: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
+        if self.gpu.provider.strip().lower() == "spot" or self.gpu.providers == ("spot",):
+            from flash.core.checkpoint_policy import spot_checkpoint_train
+
+            object.__setattr__(self, "train", spot_checkpoint_train(self.train))
         object.__setattr__(self, "seed", parse_seed(self.seed))
         object.__setattr__(self, "model_revision", _model_revision(self.model_revision))
         for field_name in ("model_revision_auto", "model_revision_force_pin"):
@@ -818,6 +834,7 @@ class JobSpec:
                 type=gpu_type,
                 provider=provider,
                 providers=providers,
+                spot=gpu.get("spot", False),
                 disk_gb=int(gpu.get("disk_gb", 60)),
                 max_wall_seconds=int(gpu.get("max_wall_seconds", 24 * 3600)),
                 max_retries=int(gpu.get("max_retries", 5)),

@@ -27,10 +27,10 @@ class _CompletedAttemptPending(RuntimeError):
 
 def _canonical_provider_handle(handle):
     from flash.providers.core.base import JobHandle
-    from flash.providers.modal.handles import ModalJobHandle
+    from flash.providers.core.handles import parse_handle
 
     data = handle.to_dict() if hasattr(handle, "to_dict") else dict(handle)
-    return JobHandle.from_dict(ModalJobHandle.from_dict(data).to_dict())
+    return JobHandle.from_dict(parse_handle(data).to_dict())
 
 
 def _completed_worker_metrics(handle, *, deadline_at=None):
@@ -42,18 +42,18 @@ def _completed_worker_metrics(handle, *, deadline_at=None):
         resolve_terminal_artifacts,
     )
     from flash.providers.artifacts.channel import make_artifact_text_reader
-    from flash.providers.modal.handles import ModalJobHandle
+    from flash.providers.core.handles import parse_handle
 
     try:
         data = handle.to_dict() if hasattr(handle, "to_dict") else dict(handle)
-        h = ModalJobHandle.from_dict(data)
+        h = parse_handle(data)
         cutoff = (
             deadline_at if deadline_at is not None else time.time()
         ) + _RECOVERY_MARKER_GRACE_S
         read_deadline = min(cutoff, time.time() + _MODAL_STATUS_PROBE_TIMEOUT_S)
         prefix = f"{h.phase}/{h.run_id}"
         marker = make_artifact_text_reader(
-            h.hf_repo, f"{prefix}/modal_attempt{h.attempt}.json", deadline_at=read_deadline
+            h.hf_repo, f"{prefix}/{h.provider}_attempt{h.attempt}.json", deadline_at=read_deadline
         )
         metrics = make_artifact_text_reader(
             h.hf_repo, f"{prefix}/metrics.json", deadline_at=read_deadline
@@ -78,11 +78,16 @@ def _worker_provably_gone(run_id: str, handle) -> bool:
 
     try:
         h = _canonical_provider_handle(handle)
-        from flash.providers.modal.handles import ModalJobHandle, require_scope
+        if h.provider == "spot":
+            from flash.providers.nebius import api
+            from flash.providers.nebius.handles import require_scope
+        else:
+            from flash.providers.modal.handles import require_scope
+        from flash.providers.core.handles import parse_handle
 
-        require_scope(ModalJobHandle.from_dict(h.to_dict()))
+        require_scope(parse_handle(h.to_dict()))
         instance = api.get_instance(h.to_dict()["instance_id"])
-        return instance is None or instance.get("status") == "terminated"
+        return instance is None or instance.get("status") in {"terminated", "stopped", "error"}
     except Exception:
         return False
 
@@ -107,7 +112,7 @@ def _completed_attempt_metrics(
     log=None,
 ) -> dict | None:
     """Read a strict successful instance marker plus its run-scoped metrics."""
-    if provider != "modal" or not spec.train.hf_repo:
+    if provider not in ("modal", "spot") or not spec.train.hf_repo:
         return None
     from flash.providers._lifecycle.instances.poll import make_say
     from flash.providers._lifecycle.instances.poll_instance import (
@@ -326,7 +331,7 @@ def _gc_run_sandboxes(spec: JobSpec) -> None:
             resource_deleted = _destroy_and_confirm_worker(status.remote, spec.run_id)
             if resource_deleted:
                 _compare_and_confirm_remote_teardown(spec.run_id, status.remote)
-            elif status.remote.get("provider") == "modal":
+            elif status.remote.get("provider") in ("modal", "spot"):
                 from flash.runner.lifecycle.cleanup import _record_cleanup_remote
 
                 _record_cleanup_remote(spec.run_id, status.remote)

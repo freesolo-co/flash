@@ -521,7 +521,9 @@ def _assemble_grpo_inputs(
         "epochs": schedule["epochs"],
         "verl_total_epochs": schedule["verl_total_epochs"],
         "steps": schedule["steps"],
-        "save_freq": schedule["save_freq"],
+        "save_freq": 1
+        if context.config.spec and context.config.spec.gpu.spot
+        else schedule["save_freq"],
         "save_at_steps": schedule["save_at_steps"],
         "ckpt_to_keep": schedule["ckpt_to_keep"],
         # verl's default preserves the update horizon and on-policy baseline; with no generation reuse, each

@@ -22,6 +22,12 @@ def scope_fingerprint() -> str:
 
 def require_recorded_scope(status) -> None:
     """A lost launch must be reconciled in the same workspace and environment."""
+    spot_scope = getattr(status, "submitted_spot_scope", None)
+    if spot_scope is not None:
+        from flash.providers.nebius.config import scope_fingerprint as spot_scope_fingerprint
+
+        if spot_scope != spot_scope_fingerprint():
+            raise RuntimeError("Nebius project or region differs from this run's owner")
     recorded = getattr(status, "submitted_modal_scope", None)
     if recorded is not None and recorded != scope_fingerprint():
         raise RuntimeError("Modal credentials or environment differ from this run's owner")

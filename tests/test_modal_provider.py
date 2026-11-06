@@ -33,8 +33,9 @@ def remote(**changes):
     return ModalJobHandle(**values).to_dict()
 
 
-def test_registry_has_only_modal():
-    assert PROVIDER_NAMES == available_providers() == ("modal",)
+def test_registry_has_modal_and_opt_in_spot():
+    assert PROVIDER_NAMES == ("modal", "spot")
+    assert available_providers() == ("modal",)
     assert get_provider("modal").name == "modal"
     with pytest.raises(KeyError):
         get_provider("unsupported")

@@ -565,7 +565,7 @@ def _fail_unparseable_attach(run_id: str, status: RunStatus, exc: Exception, log
         _record_cleanup_remote(run_id, persisted_remote)
     _compare_and_fail_remote(run_id, persisted_remote, detail)
     if not confirmed_teardown:
-        from flash.providers.modal.provider import terminate_persisted_resources
+        from flash.providers.core.registry import terminate_persisted_resources
 
         terminate_persisted_resources(status.spec, run_id)
     print(f"attach: {run_id} {detail}", file=log)

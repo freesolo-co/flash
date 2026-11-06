@@ -60,7 +60,11 @@ def gpus_table(rows: list[tuple[str, int, float | None]], tip: str) -> str:
     """GPU classes: (name, vram_gb, $/hr or None)."""
     body = []
     for name, vram, rate in rows:
-        rate_cell = (f"${rate:.2f}", _TEAL) if rate else ("-", _FAINT)
+        rate_cell = (
+            ((f"${rate:.3f}" if "(Spot)" in name else f"${rate:.2f}"), _TEAL)
+            if rate
+            else ("-", _FAINT)
+        )
         body.append([(name, _ACCENT2), (f"{vram} GB", _GRAY), rate_cell])
     table = _format_table(["GPU", "VRAM", "$/HR"], body, aligns=["l", "r", "r"])
     return _stdout_encodable_text(
