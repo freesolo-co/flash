@@ -81,3 +81,14 @@ def validate_custom_spec(spec):
             "train.init_from_adapter starts fresh optimizer state from any adapter; "
             "custom.resume_from continues a custom checkpoint. Set only one"
         )
+
+
+def validate_custom_gpu_count(model, gpu_spec, gpu_count):
+    """Validate custom GPU placement and apply its single-device default."""
+    from flash.providers.core.base import custom_gpu_shape
+
+    try:
+        custom_gpu_shape(model, gpu_spec.provider, gpu_spec.acceptable_types, gpu_count)
+    except ValueError as exc:
+        raise ConfigError(str(exc)) from exc
+    return gpu_count or 1

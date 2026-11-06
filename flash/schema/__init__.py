@@ -534,13 +534,9 @@ def _validate_gpu_section(
         raise ConfigError(str(exc)) from exc
 
     if algorithm == "custom":
-        from flash.providers.core.base import custom_gpu_shape
+        from flash.schema.custom import validate_custom_gpu_count
 
-        try:
-            custom_gpu_shape(model, gpu_spec.provider, gpu_spec.acceptable_types, gpu_count)
-        except ValueError as exc:
-            raise ConfigError(str(exc)) from exc
-        gpu_count = gpu_count or 1
+        gpu_count = validate_custom_gpu_count(model, gpu_spec, gpu_count)
 
     gpu_types = gpu_spec.acceptable_types
     for candidate in gpu_types:

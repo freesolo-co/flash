@@ -34,6 +34,16 @@ def per_device_vram_gb(model_id, train, count, *, total_need=None):
     )
 
 
+def fitting_candidates(candidates, model_id, train, *, total_need):
+    """Keep only allocations that fit the custom worker on every device."""
+    return [
+        candidate
+        for candidate in candidates
+        if candidate.vram_gb
+        >= per_device_vram_gb(model_id, train, candidate.gpu_count, total_need=total_need)
+    ]
+
+
 def preview_gpu(model_id, train, max_count, *, total_need):
     from flash.providers.core.base import GPU_INFO, UnsupportedGpuError
     from flash.providers.core.sharding import combined_vram_gb
@@ -52,3 +62,16 @@ def preview_gpu(model_id, train, max_count, *, total_need):
     if not shapes:
         raise UnsupportedGpuError("custom training cannot fit the per-device memory budget")
     return min(shapes)[2]
+
+
+def allocation_shape(model_id, provider, providers, gpu_type, fallbacks, max_count):
+    """Validate custom provider preferences before resolving the allocation shape."""
+    from flash.providers.core.base import UnsupportedGpuError, custom_gpu_shape
+    from flash.providers.core.registry import validated_provider_preferences
+
+    if provider and providers:
+        raise UnsupportedGpuError("provider and providers cannot both be set")
+    validated_provider_preferences(providers, allow_empty=isinstance(providers, tuple))
+    return custom_gpu_shape(
+        model_id, provider, (gpu_type, *fallbacks) if gpu_type else (), max_count
+    )

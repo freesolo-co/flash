@@ -7,6 +7,7 @@ from dataclasses import replace
 from typing import NoReturn
 
 from flash._internal.logging import get_logger
+from flash.custom.placement import allocation_shape, fitting_candidates
 from flash.providers.core.base import (
     GPU_INFO,
     Allocation,
@@ -18,7 +19,6 @@ from flash.providers.core.base import (
     _run_cost_key,
     authored_gpu_ceiling,
     canonical_gpu,
-    custom_gpu_shape,
     largest_rentable_count,
     providers_for,
     rentable_gpu_counts,
@@ -674,7 +674,6 @@ def _resolved_gpu_count(
 def _gather_candidates(
     available: tuple[str, ...],
     *,
-    per_card_need: float,
     constraints: AllocationConstraints,
     acceptable: tuple[str, ...],
     provider: str,
@@ -686,6 +685,17 @@ def _gather_candidates(
 
     ``acceptable`` is the authoritative class filter; empty means unpinned.
     """
+    # with multiple cards allowed, a card can contribute as one of N; query providers at the reduced
+    # per-card floor so classes too small to fit alone still surface, then keep only the shapes that
+    # actually fit below.
+    per_card_need = constraints.required_vram_gb
+    if constraints.max_gpu_count > 1:
+        per_card_need = max(
+            1,
+            math.ceil(
+                constraints.required_vram_gb / (constraints.max_gpu_count * SHARD_VRAM_EFFICIENCY)
+            ),
+        )
     allowed = set(acceptable)
     queries = tuple(replace(constraints, gpu_type=gpu) for gpu in acceptable) or (constraints,)
     candidates: list[Candidate] = []
@@ -813,11 +823,8 @@ def allocate(
     # off the authored batch over-reserves (4 GB on a 4B at batch 8 / 4096) and can reject a card the
     # run would have fit on. `_fits` reads it too, so the requirement and the fit cannot disagree.
     if algorithm == "custom":
-        if provider and providers:
-            raise UnsupportedGpuError("provider and providers cannot both be set")
-        validated_provider_preferences(providers, allow_empty=isinstance(providers, tuple))
-        provider, gpu_type, gpu_type_fallbacks, max_gpu_count = custom_gpu_shape(
-            model_id, provider, (gpu_type, *gpu_type_fallbacks) if gpu_type else (), max_gpu_count
+        provider, gpu_type, gpu_type_fallbacks, max_gpu_count = allocation_shape(
+            model_id, provider, providers, gpu_type, gpu_type_fallbacks, max_gpu_count
         )
         providers = ()  # only Modal has a validated custom worker transport today.
     sized_train = _overridden_train(train, overrides)
@@ -898,28 +905,15 @@ def allocate(
         required_vram_gb=need,
         max_gpu_count=cap,
     )
-    # with multiple cards allowed, a card can contribute as one of N; query providers at the reduced
-    # per-card floor so classes too small to fit alone still surface, then keep only the shapes that
-    # actually fit below.
-    per_card_need = need
-    if cap > 1:
-        per_card_need = max(1, math.ceil(need / (cap * SHARD_VRAM_EFFICIENCY)))
     candidates, lookup_failed, structurally_unsupported = _gather_candidates(
         available,
-        per_card_need=per_card_need,
         constraints=constraints,
         acceptable=acceptable,
         provider=provider,
     )
     candidates = _fitting_candidates(candidates, need, executed_width)
     if algorithm == "custom":
-        from flash.custom.placement import per_device_vram_gb
-
-        candidates = [
-            c
-            for c in candidates
-            if c.vram_gb >= per_device_vram_gb(model_id, sized_train, c.gpu_count, total_need=need)
-        ]
+        candidates = fitting_candidates(candidates, model_id, sized_train, total_need=need)
     supported_available = tuple(name for name in available if name not in structurally_unsupported)
     if not candidates:
         _raise_no_candidate_error(
