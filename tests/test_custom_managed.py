@@ -87,7 +87,7 @@ def test_custom_config_roundtrip_and_default_specs_keep_their_bytes():
         ("custom", "max_wall_seconds", True),
         ("train", "learning_rate", 0.01),
         ("train", "max_steps", 0),
-        ("gpu", "count", 2),
+        ("gpu", "count", 3),
         ("gpu", "type", "A10G"),
     ],
 )

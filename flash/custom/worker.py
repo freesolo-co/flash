@@ -59,6 +59,7 @@ def run(*, context):
             seed=spec.seed,
             checkpoint_dir="/tmp/flash-custom-checkpoints",
             max_tokens=spec.train.max_context_tokens,
+            gpu_count=spec.gpu.count,
             init_adapter=init_adapter,
         )
     backend.checkpoints = checkpoints

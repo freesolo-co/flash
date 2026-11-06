@@ -23,6 +23,9 @@ class TinyLM(torch.nn.Module):
     def get_output_embeddings(self):
         return self.projection
 
+    def get_input_embeddings(self):
+        return self.projection
+
     def forward(self, input_ids, use_cache=False):
         return SimpleNamespace(logits=self.projection(input_ids))
 

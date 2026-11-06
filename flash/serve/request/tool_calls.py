@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from decimal import Decimal, DecimalException
 from typing import Any
 
+from flash.core.catalog import TOOL_CALLING_MODELS
 from flash.serve.contract.protocol import MAX_CHAT_REQUEST_BYTES, TEXT_TYPES
 from flash.serve.request import text_scan
 from flash.serve.request.schema_types import _decimal_is_integral, _matches_type
@@ -57,8 +58,7 @@ class FunctionTool:
 
 
 def qualified_tool_parser(base_model: str) -> str | None:
-    supported = {"Qwen/Qwen3.5-9B", "Qwen/Qwen3.5-9B-Base"}
-    return TOOL_PARSER_QWEN3_CODER if base_model in supported else None
+    return TOOL_PARSER_QWEN3_CODER if base_model in TOOL_CALLING_MODELS else None
 
 
 def normalize_tools(

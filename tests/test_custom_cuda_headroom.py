@@ -15,13 +15,14 @@ GIB = 1024**3
 def fake_cuda(monkeypatch, *, available=True, free=1 * GIB, total=80 * GIB, fail=False):
     calls = []
 
-    def mem_get_info():
+    def mem_get_info(device=0):
         if fail:
             raise RuntimeError("driver unavailable")
         return free, total
 
     cuda = types.SimpleNamespace(
         is_available=lambda: available,
+        device_count=lambda: 1,
         mem_get_info=mem_get_info,
         empty_cache=lambda: calls.append("empty_cache"),
     )
@@ -39,6 +40,15 @@ def test_enough_free_memory_keeps_the_cache(monkeypatch):
     calls = fake_cuda(monkeypatch, free=backend.CUDA_HEADROOM_BYTES)
     assert backend._ensure_cuda_headroom() is False
     assert calls == []
+
+
+def test_low_free_memory_on_second_gpu_releases_cache(monkeypatch):
+    calls = fake_cuda(monkeypatch)
+    cuda = sys.modules["torch"].cuda
+    cuda.device_count = lambda: 2
+    cuda.mem_get_info = lambda device: ((20 if device == 0 else 1) * GIB, 80 * GIB)
+    assert backend._ensure_cuda_headroom() is True
+    assert calls == ["empty_cache"]
 
 
 def test_no_cuda_is_a_no_op(monkeypatch):
