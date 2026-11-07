@@ -15,9 +15,23 @@ from flash.serving.src.engine.lora_engine import _LoraEngineImpl
 from flash.serving.src.engine.model_config import engine_overrides_for
 
 from .config import PORT, placement
+from .leases import GenerationLeases
 
 
 class LambdaWorker(_LoraEngineImpl):
+    async def _load(self):
+        import torch
+
+        _, expected = placement(self.base_model)
+        if torch.cuda.device_count() != 1 or expected not in torch.cuda.get_device_name(0):
+            raise RuntimeError("Lambda worker received an unexpected GPU shape")
+        if (
+            torch.cuda.get_device_properties(0).total_memory
+            < (75 if expected == "H100" else 170) * 2**30
+        ):
+            raise RuntimeError("Lambda worker received a partitioned or undersized GPU")
+        await super()._load()
+
     def _self_heal_if_dead(self, reason):
         if self._engine_dead():
             # Docker restarts the same worker; other models and replicas are isolated.
@@ -29,6 +43,9 @@ def create_app(engine, token):
         raise ValueError("worker bearer token is required")
     slots = asyncio.Semaphore(int(engine_overrides_for(engine.base_model).get("max_num_seqs", 64)))
     active = set()
+    leases = GenerationLeases(
+        2 * int(engine_overrides_for(engine.base_model).get("max_num_seqs", 64))
+    )
 
     @asynccontextmanager
     async def lifespan(app):
@@ -39,6 +56,8 @@ def create_app(engine, token):
             await engine._shutdown()
 
     app = FastAPI(lifespan=lifespan, docs_url=None, redoc_url=None, openapi_url=None)
+
+    app.state.generation_leases = leases
 
     @app.middleware("http")
     async def authenticate(request, call_next):
@@ -70,6 +89,12 @@ def create_app(engine, token):
             body["org_id"], body["model_id"], body.get("expected_generation")
         )
 
+    @app.post("/lease")
+    async def renew_lease(request: Request):
+        body = await request.json()
+        leases.renew(body.get("generation_id"))
+        return {"ok": True}
+
     @app.post("/abort")
     async def abort(request: Request):
         body = await request.json()
@@ -85,7 +110,11 @@ def create_app(engine, token):
         async with slots:
             if generation_id in active:
                 raise ValueError("generation id is already running")
+            await leases.check(generation_id)
             active.add(generation_id)
+            watcher = asyncio.create_task(
+                leases.watch(generation_id, asyncio.current_task(), engine.engine.abort)
+            )
             try:
                 async with asyncio.timeout(REQUEST_TIMEOUT_SECONDS):
                     yield (
@@ -95,7 +124,10 @@ def create_app(engine, token):
                         generation_id,
                     )
             finally:
+                watcher.cancel()
+                await asyncio.gather(watcher, return_exceptions=True)
                 active.discard(generation_id)
+                leases.finish(generation_id)
 
     @app.post("/generate")
     async def generate(request: Request):
@@ -121,7 +153,11 @@ def create_app(engine, token):
         async def events():
             try:
                 async with admission(body) as args:
-                    generator = engine._stream_generate(*args)
+
+                    async def check_lease():
+                        await leases.check(args[-1])
+
+                    generator = engine._stream_generate(*args, pre_generate_check=check_lease)
                     try:
                         async for event in generator:
                             yield json.dumps(event, allow_nan=False) + "\n"

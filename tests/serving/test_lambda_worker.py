@@ -39,7 +39,7 @@ def fake_engine():
         engine=SimpleNamespace(abort=AsyncMock()),
     )
 
-    async def stream(*args):
+    async def stream(*args, **kwargs):
         yield {"type": "delta", "text": "ok"}
         yield {"type": "final", "usage": {"completion_tokens": 1}}
 
@@ -59,10 +59,12 @@ def test_worker_auth_lifecycle_and_exact_payload_forwarding():
         assert client.get("/health").status_code == 401
         headers = {"Authorization": "Bearer private"}
         assert client.get("/health", headers=headers).json()["base_model"] == MODEL
+        client.post("/lease", json={"generation_id": "g1"}, headers=headers)
         assert client.post("/generate", json=body, headers=headers).json() == {"text": "ok"}
         engine._generate.assert_awaited_once_with(
             body["payload"], body["record"], "checkpoint", "g1"
         )
+        client.post("/lease", json={"generation_id": "g1"}, headers=headers)
         response = client.post("/stream", json=body, headers=headers)
         assert [json.loads(line)["type"] for line in response.text.splitlines()] == [
             "delta",
@@ -106,6 +108,8 @@ async def test_transport_rejects_truncated_stream_and_preserves_validation(tls):
     async def handler(request):
         assert request.headers["authorization"] == f"Bearer {tls['token']}"
         assert request.extensions["sni_hostname"] == "lambda-worker.internal"
+        if request.url.path == "/lease":
+            return httpx.Response(200, json={"ok": True})
         if request.url.path == "/stream":
             return httpx.Response(200, text=json.dumps({"type": "delta"}) + "\n")
         return httpx.Response(
@@ -115,9 +119,9 @@ async def test_transport_rejects_truncated_stream_and_preserves_validation(tls):
     transport = WorkerTransport("8.8.8.8", tls, transport=httpx.MockTransport(handler))
     try:
         with pytest.raises(ValueError, match="checkpoint mismatch"):
-            await transport.call("/generate", {})
+            await transport.call("/generate", {"generation_id": "test"})
         with pytest.raises(WorkerError, match="without completion"):
-            _ = [event async for event in transport.stream({})]
+            _ = [event async for event in transport.stream({"generation_id": "test"})]
     finally:
         await transport.aclose()
 
@@ -127,7 +131,7 @@ async def test_worker_cancellation_closes_generation():
     engine = fake_engine()
     closed = asyncio.Event()
 
-    async def stream(*args):
+    async def stream(*args, **kwargs):
         try:
             yield {"type": "delta", "text": "first"}
             await asyncio.Event().wait()
@@ -136,6 +140,7 @@ async def test_worker_cancellation_closes_generation():
 
     engine._stream_generate = stream
     app = create_app(engine, "private")
+    app.state.generation_leases.renew("cancel-me")
     # Drive ASGI directly so disconnect occurs while the response is still open.
     body = json.dumps({"generation_id": "cancel-me", "payload": {}}).encode()
     first = True
@@ -168,3 +173,76 @@ async def test_worker_cancellation_closes_generation():
     }
     await asyncio.wait_for(app(scope, receive, send), timeout=3)
     assert closed.is_set()
+
+
+@pytest.mark.anyio
+async def test_real_tls_checks_certificate_and_worker_hostname(tls, tmp_path):
+    import ssl
+    import threading
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b'{"ok": true}')
+
+        def log_message(self, *args):
+            pass
+
+    cert, key = tmp_path / "cert.pem", tmp_path / "key.pem"
+    cert.write_text(tls["cert"])
+    key.write_text(tls["key"])
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    context.load_cert_chain(cert, key)
+    server = HTTPServer(("127.0.0.1", 0), Handler)
+    server.socket = context.wrap_socket(server.socket, server_side=True)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    worker = WorkerTransport("8.8.8.8", tls)
+    worker.client.base_url = f"https://127.0.0.1:{server.server_port}"
+    try:
+        assert await worker.call("/health") == {"ok": True}
+        # The certificate is for the worker DNS identity, not its transport IP.
+        wrong_name = worker.client.build_request("GET", "/health")
+        with pytest.raises(httpx.ConnectError, match="CERTIFICATE_VERIFY_FAILED"):
+            await worker.client.send(wrong_name)
+    finally:
+        await worker.aclose()
+        await asyncio.to_thread(server.shutdown)
+        server.server_close()
+        thread.join(timeout=2)
+
+
+@pytest.mark.anyio
+async def test_generation_lease_expiry_aborts_gpu_before_cancelling_owner():
+    from unittest.mock import Mock
+
+    from flash.serving.lambda_cloud.leases import GenerationLeases
+    from flash.serving.src.stream_channel.protocol import LEASE_SECONDS
+
+    now = 100
+    leases = GenerationLeases(2, clock=lambda: now)
+    leases.renew("generation")
+    await leases.check("generation")
+    now += LEASE_SECONDS + 0.1
+    with pytest.raises(TimeoutError, match="lease expired"):
+        await leases.check("generation")
+    owner = Mock()
+    abort = AsyncMock()
+    await leases.watch("generation", owner, abort)
+    abort.assert_awaited_once_with("generation")
+    owner.cancel.assert_called_once()
+
+
+def test_runtime_pin_allows_version_only_bumps_but_rejects_dependency_drift(tmp_path):
+    from flash.serving.lambda_cloud.runtime_image import verify
+
+    base = '[[package]]\nname="freesolo-flash"\nversion="1.4.25"\n[[package]]\nname="vllm"\nversion="0.23.0"\n'
+    image, source = tmp_path / "image.lock", tmp_path / "source.lock"
+    image.write_text(base)
+    source.write_text(base.replace("1.4.25", "1.4.26"))
+    verify(image, source)
+    source.write_text(base.replace("0.23.0", "0.24.0"))
+    with pytest.raises(RuntimeError, match="dependency lock mismatch"):
+        verify(image, source)

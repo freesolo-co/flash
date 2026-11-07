@@ -20,11 +20,14 @@ class Ledger:
     async def put(self, key, value):
         await self.store.put.aio(key, value)
 
+    async def delete(self, key):
+        await self.store.pop.aio(key, None)
+
     def items(self):
         return self.store.items.aio()
 
 
-def register_control(app, secret, image):
+def register_control(app, secret, image, module_name):
     class LambdaFleet:
         @modal.enter()
         async def start(self):
@@ -37,8 +40,8 @@ def register_control(app, secret, image):
             await self.api.aclose()
 
         @modal.method()
-        async def launch(self, owner, model, user_data):
-            return await self.fleet.launch(owner, model, user_data)
+        async def launch(self, owner, model, user_data, revision):
+            return await self.fleet.launch(owner, model, user_data, revision)
 
         @modal.method()
         async def inspect(self, owner):
@@ -59,7 +62,7 @@ def register_control(app, secret, image):
     async def reap_lambda_workers():
         return await control().reap.remote.aio()
 
-    module = sys.modules["flash.serving.app.modal_app"]
+    module = sys.modules[module_name]
     LambdaFleet.__module__ = module.__name__
     LambdaFleet.__qualname__ = "LambdaFleet"
     module.LambdaFleet = LambdaFleet

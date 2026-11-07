@@ -28,6 +28,9 @@ class Ledger:
     async def put(self, key, value):
         self.data[key] = copy.deepcopy(value)
 
+    async def delete(self, key):
+        self.data.pop(key, None)
+
     async def items(self):
         for item in list(copy.deepcopy(self.data).items()):
             yield item
@@ -76,8 +79,8 @@ async def test_ambiguous_launch_is_reconciled_without_duplicate():
     api.lose_response = True
     fleet = Fleet(api, ledger, "dev", clock=lambda: 100)
     with pytest.raises(httpx.ReadTimeout):
-        await fleet.launch(OWNER, MODEL, "bootstrap")
-    assert (await fleet.launch(OWNER, MODEL, "bootstrap"))["id"] == "vm1"
+        await fleet.launch(OWNER, MODEL, "bootstrap", "b" * 40)
+    assert (await fleet.launch(OWNER, MODEL, "bootstrap", "b" * 40))["id"] == "vm1"
     assert api.launches == 1
     assert ledger.data[OWNER]["instance_id"] == "vm1"
 
@@ -87,7 +90,7 @@ async def test_reaping_preserves_active_foreign_and_other_environment_instances(
     api, ledger = API(), Ledger()
     now = 100
     fleet = Fleet(api, ledger, "dev", clock=lambda: now)
-    await fleet.launch(OWNER, MODEL, "bootstrap")
+    await fleet.launch(OWNER, MODEL, "bootstrap", "b" * 40)
     foreign = copy.deepcopy(api.instances[0])
     foreign.update(id="foreign", name="someone-elses-worker")
     api.instances.append(foreign)
@@ -112,11 +115,11 @@ async def test_release_finds_vm_after_launch_response_loss():
     api.lose_response = True
     fleet = Fleet(api, ledger, "dev")
     with pytest.raises(httpx.ReadTimeout):
-        await fleet.launch(OWNER, MODEL, "bootstrap")
+        await fleet.launch(OWNER, MODEL, "bootstrap", "b" * 40)
     await fleet.release(OWNER)
     assert api.terminated == ["vm1"]
     with pytest.raises(ValueError, match="already used"):
-        await fleet.launch(OWNER, MODEL, "bootstrap")
+        await fleet.launch(OWNER, MODEL, "bootstrap", "b" * 40)
     assert api.launches == 1
 
 
@@ -127,3 +130,26 @@ def test_hardware_choices_and_capacity_fail_closed():
         placement("deepseek-ai/DeepSeek-V4.1-Flash-1017")
     with pytest.raises(RuntimeError, match="no US capacity"):
         select_region({}, MODEL)
+
+
+@pytest.mark.anyio
+async def test_uncertain_leases_count_toward_per_release_replica_limit():
+    api, ledger = API(), Ledger()
+    fleet = Fleet(api, ledger, "dev", clock=lambda: 100)
+    for owner in ("a" * 32, "b" * 32):
+        await ledger.put(
+            owner,
+            {
+                "model": MODEL,
+                "revision": "c" * 40,
+                "heartbeat": 100,
+                "created": 100,
+                "instance_id": None,
+            },
+        )
+    with pytest.raises(RuntimeError, match="replica limit"):
+        await fleet.launch("d" * 32, MODEL, "bootstrap", "c" * 40)
+    assert api.launches == 0
+    # A new release may overlap the old one during the existing rolling handoff.
+    await fleet.launch("d" * 32, MODEL, "bootstrap", "e" * 40)
+    assert api.launches == 1

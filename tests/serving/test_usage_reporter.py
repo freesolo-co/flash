@@ -109,7 +109,7 @@ def test_lora_engine_scales_to_zero_by_default(modal_app_module):
     assert all("gpu" not in kwargs for kwargs in cls_calls)
     assert {kwargs["scaledown_window"] for kwargs in cls_calls} == {2100}
 
-    assert modal_app_module.app.function.call_count == 2
+    assert modal_app_module.app.function.call_count == 1
     assert modal_app_module.app.function.call_args.kwargs["min_containers"] == 1
 
 

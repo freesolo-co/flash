@@ -26,24 +26,32 @@ class Fleet:
             and tags.get("flash-environment") == self.environment
         )
 
-    async def launch(self, owner, model, user_data):
+    async def launch(self, owner, model, user_data, revision):
         name = self.name(owner)
+        if not re.fullmatch(r"[0-9a-f]{40}", revision):
+            raise ValueError("Lambda launch requires a source revision")
         previous = await self.ledger.get(owner)
         if previous is not None:
             # Even an ambiguous launch is at-most-once. Reconciliation discovers it later.
-            if previous["model"] != model or previous.get("released"):
+            if (
+                previous["model"] != model
+                or previous["revision"] != revision
+                or previous.get("released")
+            ):
                 raise ValueError("Lambda owner already used")
             return await self.inspect(owner)
+        await self._check_capacity(model, revision)
         instance_type, region = select_region(await self.api.call("GET", "instance-types"), model)
         record = {
             "model": model,
+            "revision": revision,
             "created": self.clock(),
             "heartbeat": self.clock(),
             "instance_id": None,
         }
-        await self.ledger.put(owner, record)
         firewall_id = await firewall(self.api, self.environment, region)
         filesystem_id = await cache_filesystem(self.api, self.environment, region)
+        await self.ledger.put(owner, record)
         # A process failure after this write must never cause a blind second launch.
         result = await self.api.call(
             "POST",
@@ -71,6 +79,27 @@ class Fleet:
         record["instance_id"] = ids[0]
         await self.ledger.put(owner, record)
         return {"id": ids[0], "status": "booting"}
+
+    async def _check_capacity(self, model, revision):
+        # Modal normally enforces this. Include uncertain/orphan launches so a
+        # replacement CPU replica cannot silently allocate a third GPU.
+        instances = await self.api.call("GET", "instances")
+        occupied = 0
+        async for owner, record in self.ledger.items():
+            if record["model"] != model or record["revision"] != revision:
+                continue
+            live = any(
+                self.owns(instance, owner) and instance["status"] != "terminated"
+                for instance in instances
+            )
+            uncertain = (
+                not record.get("instance_id")
+                and self.clock() - record["heartbeat"] <= LEASE_SECONDS
+            )
+            if not record.get("released") or live or uncertain:
+                occupied += 1
+        if occupied >= 2:
+            raise RuntimeError("Lambda model/release replica limit reached; pending cleanup")
 
     async def inspect(self, owner):
         record = await self.ledger.get(owner)
@@ -125,6 +154,17 @@ class Fleet:
         count = 0
         async for owner, record in self.ledger.items():
             if not record.get("released") and self.clock() - record["heartbeat"] <= LEASE_SECONDS:
+                continue
+            # A snapshot may span a heartbeat; reread before claiming an expired lease.
+            record = await self.ledger.get(owner)
+            if not record.get("released") and self.clock() - record["heartbeat"] <= LEASE_SECONDS:
+                continue
+            if (
+                record.get("released")
+                and self.clock() - record["heartbeat"] > 86400
+                and not any(self.owns(instance, owner) for instance in instances)
+            ):
+                await self.ledger.delete(owner)
                 continue
             record["released"] = True
             await self.ledger.put(owner, record)

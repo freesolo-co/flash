@@ -322,7 +322,6 @@ hf_cache_volume = modal.Volume.from_name(HF_CACHE_VOLUME_NAME, create_if_missing
 # ``add_local_python_source("flash")`` ships it to the remote container under the same import path
 # it has here), re-exported so ``_build_engine`` can subclass it.
 # CPU replicas retain Modal admission/scaling; each owns one Lambda GPU worker.
-from flash.serving.lambda_cloud.modal_control import register_control  # noqa: E402
 from flash.serving.lambda_cloud.proxy import LambdaEngineProxy  # noqa: E402
 from flash.serving.src.engine.lora_engine import _LoraEngineImpl  # noqa: E402, F401
 
@@ -340,17 +339,6 @@ lambda_proxy_secrets = [
         }
     )
 ]
-lambda_control_secret = modal.Secret.from_dict(
-    {
-        "LAMBDA_API_KEY": os.environ.get("LAMBDA_API_KEY", ""),
-        "FLASH_LAMBDA_ENVIRONMENT": "dev" if SERVING_DEPLOYMENT_MODE == "development" else "main",
-    }
-)
-LambdaFleet, reap_lambda_workers = register_control(
-    app, lambda_control_secret, lambda_controller_image
-)
-
-
 # ---- One Modal LoraEngine class per GPU tier -----------------------------------------------------
 # model_config is a pure-stdlib module (no heavy deps), so importing it at module scope is safe for
 # `modal deploy` (which imports modal_app.py locally) — unlike the vllm/transformers imports, which

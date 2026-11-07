@@ -320,6 +320,11 @@ jobs:
             sleep "$sleep_seconds"
           done
 
+      # This app survives a serving rollback so orphan VM cleanup continues.
+      - name: Deploy Lambda fleet control
+        if: steps.gate.outputs.deploy == 'true'
+        run: modal deploy --strategy rolling --env main -m flash.serving.lambda_cloud.control_app
+
       - name: Deploy serving
         id: deploy_serving
         if: steps.gate.outputs.deploy == 'true'

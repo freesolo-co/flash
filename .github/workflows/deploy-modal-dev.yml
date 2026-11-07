@@ -231,6 +231,11 @@ jobs:
           fi
           echo "Development Supabase flash.hosted_lora_adapters is queryable."
 
+      # This app survives a serving rollback so orphan VM cleanup continues.
+      - name: Deploy Lambda fleet control
+        if: steps.gate.outputs.deploy == 'true'
+        run: modal deploy --strategy rolling --env dev -m flash.serving.lambda_cloud.control_app
+
       - name: Deploy development serving
         if: steps.gate.outputs.deploy == 'true'
         run: modal deploy --strategy rolling --env dev flash/serving/app/modal_app.py

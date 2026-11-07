@@ -439,7 +439,7 @@ def test_deployed_timeouts_use_the_shared_serving_budget(modal_app_module):
 def test_only_model_scoped_engines_are_registered(modal_app_module):
     registered = {name for name in vars(modal_app_module) if name.startswith("LoraEngine_")}
     assert registered == {modal_app_module.model_engine_name(model) for model in base_models()}
-    assert modal_app_module.app.cls.call_count == len(base_models()) + 1
+    assert modal_app_module.app.cls.call_count == len(base_models())
 
 
 def test_rollback_manifest_retains_every_registered_engine(modal_app_module):

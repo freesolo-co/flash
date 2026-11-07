@@ -8,7 +8,7 @@ import uuid
 from flash.serving.app.timeouts import STARTUP_TIMEOUT_SECONDS
 
 from .bootstrap import identity, user_data
-from .config import HEARTBEAT_SECONDS
+from .config import APP_NAME, HEARTBEAT_SECONDS
 from .transport import WorkerError, WorkerTransport
 
 
@@ -17,7 +17,7 @@ class LambdaEngineProxy:
         import modal
 
         self._owner = uuid.uuid4().hex
-        self._fleet = modal.Cls.from_name("freesolo-lora-serving", "LambdaFleet")()
+        self._fleet = modal.Cls.from_name(APP_NAME, "LambdaFleet")()
         self._transport = None
         self._heartbeat_task = None
         self._health_cache = {"ok": False, "base_model": self.base_model}
@@ -26,7 +26,9 @@ class LambdaEngineProxy:
         bootstrap = user_data(self.base_model, revision, os.environ, tls)
         try:
             async with asyncio.timeout(STARTUP_TIMEOUT_SECONDS):
-                await self._fleet.launch.remote.aio(self._owner, self.base_model, bootstrap)
+                await self._fleet.launch.remote.aio(
+                    self._owner, self.base_model, bootstrap, revision
+                )
                 self._heartbeat_task = asyncio.create_task(self._heartbeat())
                 await self._wait_ready(tls, revision)
                 self.engine = self._transport  # stream-channel cancellation calls engine.abort

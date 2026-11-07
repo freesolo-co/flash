@@ -14,6 +14,9 @@ class LambdaAPIError(RuntimeError):
         self.code = code
         super().__init__(f"Lambda API failed ({status}, {code})")
 
+    def __reduce__(self):
+        return type(self), (self.status, self.code)
+
 
 class LambdaAPI:
     def __init__(self, key, *, transport=None):
