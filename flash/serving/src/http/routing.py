@@ -9,6 +9,7 @@ from collections.abc import AsyncIterator
 from typing import Any, Protocol
 
 from flash.schema import parse_checkpoint_ref
+from flash.serving.lambda_cloud.config import placement
 from flash.serving.src.engine.model_config import (
     gpu_for,
     is_supported_base_model,
@@ -120,7 +121,9 @@ def health_body(
     # report configured per-model gpu tiers rather than live container counts, which modal does
     # not expose here. ``gpus`` is the supported base-model engine count and remains stable when
     # demand-driven containers scale to zero.
-    gpu_by_model = {m: gpu_for(m) for m in supported_models}
+    gpu_by_model = {
+        m: placement(m)[1] if m.startswith("Qwen/") else gpu_for(m) for m in supported_models
+    }
     body = {
         "ok": True,
         "deployment_sha": deployment_sha,

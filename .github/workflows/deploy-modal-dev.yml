@@ -27,6 +27,7 @@ jobs:
         # free. (in freesolo the app WAS the root of its own tree and used cwd-relative imports.)
         working-directory: .
     env:
+      LAMBDA_API_KEY: ${{ secrets.LAMBDA_API_KEY }}
       MODAL_TOKEN_ID: ${{ secrets.MODAL_TOKEN_ID }}
       MODAL_TOKEN_SECRET: ${{ secrets.MODAL_TOKEN_SECRET }}
       HF_TOKEN: ${{ secrets.HF_TOKEN }}
@@ -229,6 +230,11 @@ jobs:
             exit 1
           fi
           echo "Development Supabase flash.hosted_lora_adapters is queryable."
+
+      # This app survives a serving rollback so orphan VM cleanup continues.
+      - name: Deploy Lambda fleet control
+        if: steps.gate.outputs.deploy == 'true'
+        run: modal deploy --strategy rolling --env dev -m flash.serving.lambda_cloud.control_app
 
       - name: Deploy development serving
         if: steps.gate.outputs.deploy == 'true'
