@@ -543,8 +543,9 @@ def test_engine_secret_contains_only_engine_credentials(modal_app_module, monkey
     assert router_values["SUPABASE_URL"] == "value-for-SUPABASE_URL"
     assert router_values["SUPABASE_SERVICE_ROLE_KEY"] == "value-for-SUPABASE_SERVICE_ROLE_KEY"
     assert all(
-        call.kwargs["secrets"] is modal_app_module.engine_secrets
+        call.kwargs["secrets"] is modal_app_module.lambda_proxy_secrets
         for call in modal_app_module.app.cls.call_args_list
+        if "startup_timeout" in call.kwargs
     ), "engine classes must not receive the full router secret"
     assert (
         modal_app_module.app.function.call_args.kwargs["secrets"]

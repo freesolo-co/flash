@@ -61,6 +61,7 @@ jobs:
         working-directory: .
     env:
       # Modal CLI auth (read from the environment by `modal`).
+      LAMBDA_API_KEY: ${{ secrets.LAMBDA_API_KEY }}
       MODAL_TOKEN_ID: ${{ secrets.MODAL_TOKEN_ID }}
       MODAL_TOKEN_SECRET: ${{ secrets.MODAL_TOKEN_SECRET }}
       # runtime secrets forwarded into the serving app's Modal secret at deploy time.

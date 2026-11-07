@@ -27,6 +27,7 @@ jobs:
         # free. (in freesolo the app WAS the root of its own tree and used cwd-relative imports.)
         working-directory: .
     env:
+      LAMBDA_API_KEY: ${{ secrets.LAMBDA_API_KEY }}
       MODAL_TOKEN_ID: ${{ secrets.MODAL_TOKEN_ID }}
       MODAL_TOKEN_SECRET: ${{ secrets.MODAL_TOKEN_SECRET }}
       HF_TOKEN: ${{ secrets.HF_TOKEN }}

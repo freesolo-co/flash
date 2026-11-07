@@ -1,6 +1,7 @@
-"""Modal app: multi-LoRA serving with one GPU container per base model. ``LoraEngine`` is a
-Modal class parametrized by ``base_model`` (one GPU per base model, sharing its adapters via
-``enable_lora``); ``router`` is the CPU front door that dispatches to the right engine.
+"""Hosted serving: Modal CPU admission controllers own Lambda GPU workers.
+
+Model-scoped identities preserve admission, scale-to-zero and rolling handoffs.
+The public router and the separate DeepSeek deployment remain on Modal.
 """
 
 import asyncio
@@ -320,7 +321,35 @@ hf_cache_volume = modal.Volume.from_name(HF_CACHE_VOLUME_NAME, create_if_missing
 # import so it registers nothing, and inside the ``flash`` package so the image's
 # ``add_local_python_source("flash")`` ships it to the remote container under the same import path
 # it has here), re-exported so ``_build_engine`` can subclass it.
-from flash.serving.src.engine.lora_engine import _LoraEngineImpl  # noqa: E402
+# CPU replicas retain Modal admission/scaling; each owns one Lambda GPU worker.
+from flash.serving.lambda_cloud.modal_control import register_control  # noqa: E402
+from flash.serving.lambda_cloud.proxy import LambdaEngineProxy  # noqa: E402
+from flash.serving.src.engine.lora_engine import _LoraEngineImpl  # noqa: E402, F401
+
+lambda_controller_image = (
+    modal.Image.debian_slim(python_version="3.12")
+    .apt_install("openssl")
+    .pip_install("httpx>=0.27", "modal==1.6.2")
+    .add_local_python_source("flash")
+)
+lambda_proxy_secrets = [
+    modal.Secret.from_dict(
+        {
+            **{name: os.environ[name] for name in _ENGINE_SECRET_NAMES if os.environ.get(name)},
+            "FREESOLO_DEPLOYMENT_SHA": os.environ.get("FREESOLO_DEPLOYMENT_SHA", ""),
+        }
+    )
+]
+lambda_control_secret = modal.Secret.from_dict(
+    {
+        "LAMBDA_API_KEY": os.environ.get("LAMBDA_API_KEY", ""),
+        "FLASH_LAMBDA_ENVIRONMENT": "dev" if SERVING_DEPLOYMENT_MODE == "development" else "main",
+    }
+)
+LambdaFleet, reap_lambda_workers = register_control(
+    app, lambda_control_secret, lambda_controller_image
+)
+
 
 # ---- One Modal LoraEngine class per GPU tier -----------------------------------------------------
 # model_config is a pure-stdlib module (no heavy deps), so importing it at module scope is safe for
@@ -356,11 +385,11 @@ def _build_engine(
     max_inputs: int,
     target_inputs: int,
 ) -> Any:
-    """Register one Modal ``@app.cls`` LoraEngine pinned to ``gpu``.
+    """Register one CPU admission controller for a Lambda GPU worker.
 
-    Modal fixes a class's GPU at decoration time, so the H200 35B model and the L4 models need
-    distinct classes. Each model has a stable class. The Modal entrypoints are defined
-    fresh here (so each class owns its own method objects) and forward to the shared ``_``-prefixed impl on ``_LoraEngineImpl``.
+    Each model retains its stable class identity and qualified sequence capacity.
+    Entry points forward to LambdaEngineProxy, which binds one Lambda instance to
+    the lifetime of this Modal replica.
 
     Class identity (name/qualname + module-global binding) is fixed BEFORE the class-level decorators
     run. With the real Modal SDK ``@modal.concurrent`` returns a wrapper that holds the user class
@@ -369,7 +398,7 @@ def _build_engine(
     would fail Modal's global-scope validation. So we apply ``modal.concurrent``/``app.cls`` in call
     form on an already-renamed, already-module-global class."""
 
-    class _Engine(_LoraEngineImpl):
+    class _Engine(LambdaEngineProxy):
         base_model: str = modal.parameter()
 
         @modal.enter()
@@ -436,14 +465,14 @@ def _build_engine(
             return await self._unregister(org_id, model_id, expected_generation)
 
         @modal.method()
-        def health(self) -> dict[str, Any]:
-            return self._health()
+        async def health(self) -> dict[str, Any]:
+            return await self._health()
 
     # Record the GPU this class was actually pinned to (a plain class attribute, NOT a
     # modal.parameter() field). _health() reports THIS rather than re-deriving the tier from the base
     # model name, so a base model accidentally routed onto the wrong tier's class surfaces in health
     # instead of being masked by the expected-tier lookup.
-    _Engine.pinned_gpu = gpu
+    _Engine.pinned_gpu = "B200" if gpu == "H200" else "H100"
     # Give the REAL class its distinct, module-level identity BEFORE decorating. A clean (no-``<locals>``)
     # __qualname__ satisfies Modal's global-scope validation, and binding it as a module attribute under
     # that name makes ``getattr(module, class_name)`` resolve the class Modal re-imports in the container.
@@ -451,10 +480,12 @@ def _build_engine(
     _Engine.__qualname__ = class_name
     globals()[class_name] = _Engine
     engine = app.cls(
-        gpu="H100!" if gpu == "H100" else gpu,
+        image=lambda_controller_image,
+        cpu=1,
+        memory=2048,
+        nonpreemptible=True,
         region="us",
-        secrets=engine_secrets,
-        volumes={HOSTING_CACHE_MOUNT: hf_cache_volume},
+        secrets=lambda_proxy_secrets,
         scaledown_window=scaledown_window_for(gpu),
         startup_timeout=STARTUP_TIMEOUT_SECONDS,
         timeout=REQUEST_TIMEOUT_SECONDS,

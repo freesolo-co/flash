@@ -417,12 +417,14 @@ def test_deployed_timeouts_use_the_shared_serving_budget(modal_app_module):
     from flash.serving.app import timeouts
 
     app = modal_app_module.modal.App.return_value
-    engine_calls = app.cls.call_args_list
+    engine_calls = [call for call in app.cls.call_args_list if "startup_timeout" in call.kwargs]
     assert engine_calls
     for call in engine_calls:
         assert call.kwargs["startup_timeout"] == timeouts.STARTUP_TIMEOUT_SECONDS
         assert call.kwargs["timeout"] == timeouts.REQUEST_TIMEOUT_SECONDS
-    router_calls = app.function.call_args_list
+    router_calls = [
+        call for call in app.function.call_args_list if "startup_timeout" in call.kwargs
+    ]
     assert len(router_calls) == 1
     assert router_calls[0].kwargs["timeout"] == timeouts.ROUTER_TIMEOUT_SECONDS
     assert (
@@ -437,7 +439,7 @@ def test_deployed_timeouts_use_the_shared_serving_budget(modal_app_module):
 def test_only_model_scoped_engines_are_registered(modal_app_module):
     registered = {name for name in vars(modal_app_module) if name.startswith("LoraEngine_")}
     assert registered == {modal_app_module.model_engine_name(model) for model in base_models()}
-    assert modal_app_module.app.cls.call_count == len(base_models())
+    assert modal_app_module.app.cls.call_count == len(base_models()) + 1
 
 
 def test_rollback_manifest_retains_every_registered_engine(modal_app_module):
@@ -483,7 +485,7 @@ def test_models_route_to_qualified_gpu(modal_app_module, model, gpu, sequences):
     assert cls is modal_app_module.ENGINE_BY_MODEL[model]
     assert cls.__name__ == modal_app_module.model_engine_name(model)
     assert modal_app_module._engine_concurrency(model) == (sequences, sequences)
-    assert cls.pinned_gpu == gpu
+    assert cls.pinned_gpu == ("B200" if gpu == "H200" else "H100")
 
 
 def test_unknown_base_model_is_rejected_before_engine_dispatch(modal_app_module):
@@ -496,7 +498,7 @@ def test_tier_classes_inherit_the_shared_impl(modal_app_module):
     """Each tier class subclasses _LoraEngineImpl (so _load/_generate/etc resolve) and defines the
     public Modal entrypoints itself (so Modal collects them per class)."""
     tier = modal_app_module.ENGINE_BY_MODEL["Qwen/Qwen3.6-35B-A3B"]
-    assert issubclass(tier, modal_app_module._LoraEngineImpl)
+    assert issubclass(tier, modal_app_module.LambdaEngineProxy)
     for impl in ("_load", "_register", "_generate", "_stream_generate", "_unregister", "_health"):
         assert hasattr(tier, impl)
     for entry in ("load", "register", "generate", "stream_generate_call", "unregister", "health"):
@@ -507,7 +509,7 @@ def test_each_tier_class_records_its_pinned_gpu(modal_app_module):
     """Each per-tier class records the GPU it was actually pinned to in _build_engine, so health/ops
     can detect a base model misrouted onto the wrong tier instead of trusting the derived lookup."""
     for model, cls in modal_app_module.ENGINE_BY_MODEL.items():
-        assert cls.pinned_gpu == gpu_for(model)
+        assert cls.pinned_gpu == ("B200" if gpu_for(model) == "H200" else "H100")
 
 
 def test_tier_class_identity_is_fixed_before_decoration(modal_app_module):
