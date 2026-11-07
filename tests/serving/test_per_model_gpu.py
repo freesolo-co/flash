@@ -925,7 +925,7 @@ def test_load_prequant_checkpoint_for_9b(modal_app_module, monkeypatch, tmp_path
     assert args.max_num_seqs == 64
     assert args.gpu_memory_utilization == 0.90  # 0.90 leaves CUDA-graph capture headroom (was 0.98)
     assert args.enforce_eager is False  # CUDA graphs ON: ~10x faster decode on the hybrid GDN model
-    assert getattr(args, "max_num_batched_tokens", None) is None
+    assert args.max_num_batched_tokens == 8192
 
 
 def test_qwen38_immutable_args_fail_closed_when_vllm_drops_revision_support():
