@@ -185,13 +185,11 @@ def _usage_fields(
     checkpoint: str,
     thinking: bool,
     reasoning_counter: ReasoningTokenCounter,
+    include_token_ids: bool = True,
 ) -> dict[str, Any]:
-    prompt_token_ids = [
-        int(value) for value in (getattr(request_output, "prompt_token_ids", []) or [])
-    ]
+    # Only boundaries carry full histories. Progress receipts settle from native
+    # counters; copying growing histories per token makes transport quadratic.
     fields = {
-        "prompt_token_ids": prompt_token_ids,
-        "completion_token_ids": list(completion_token_ids),
         "prompt_tokens": _num_prompt_tokens(request_output),
         "completion_tokens": len(completion_token_ids),
         "cached_tokens": _num_cached_tokens(request_output),
@@ -209,6 +207,11 @@ def _usage_fields(
         "checkpoint": checkpoint,
         "thinking": thinking,
     }
+    if include_token_ids:
+        fields["prompt_token_ids"] = [
+            int(value) for value in (getattr(request_output, "prompt_token_ids", []) or [])
+        ]
+        fields["completion_token_ids"] = list(completion_token_ids)
     fields["reasoning_tokens"] = reasoning_counter.total
     return fields
 
@@ -351,14 +354,21 @@ def _consume_stream_output(
                     "index": index,
                     "text": visible,
                     "logprobs": logprobs,
-                    **_usage_fields(current, completion_ids, **usage_kwargs),
+                    "token_ids": token_ids,
+                    **_usage_fields(
+                        current, completion_ids, include_token_ids=False, **usage_kwargs
+                    ),
                 }
             )
         elif token_ids:
             events.append(
                 {
                     "type": "usage_progress",
-                    **_usage_fields(current, completion_ids, **usage_kwargs),
+                    "index": index,
+                    "token_ids": token_ids,
+                    **_usage_fields(
+                        current, completion_ids, include_token_ids=False, **usage_kwargs
+                    ),
                 }
             )
         finish_reason = getattr(output, "finish_reason", None)
@@ -401,7 +411,9 @@ def _finish_stream_choice(
                     "index": index,
                     "text": "",
                     "tool_calls": tool_calls,
-                    **_usage_fields(current, completion_ids, **usage_kwargs),
+                    **_usage_fields(
+                        current, completion_ids, include_token_ids=False, **usage_kwargs
+                    ),
                 }
             )
         elif parsed.content:
@@ -411,7 +423,9 @@ def _finish_stream_choice(
                     "type": "delta",
                     "index": index,
                     "text": parsed.content,
-                    **_usage_fields(current, completion_ids, **usage_kwargs),
+                    **_usage_fields(
+                        current, completion_ids, include_token_ids=False, **usage_kwargs
+                    ),
                 }
             )
     state["finish_reason"] = finish_reason
@@ -422,7 +436,7 @@ def _finish_stream_choice(
             "type": "choice_finished",
             "index": index,
             "finish_reason": finish_reason,
-            **_usage_fields(current, completion_ids, **usage_kwargs),
+            **_usage_fields(current, completion_ids, include_token_ids=False, **usage_kwargs),
         }
     )
     return events
