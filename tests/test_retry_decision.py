@@ -255,15 +255,15 @@ def test_saved_preemption_retry_cannot_authorize_a_replacement_worker():
 
 
 @pytest.mark.parametrize("budget", [0, 2, 5])
-def test_spot_preemption_reuses_shape_until_infrastructure_budget_exhausted(budget):
+def test_spot_preemption_reuses_shape_without_spending_infrastructure_budget(budget):
     chosen = _candidate("spot", "H100", 80)
     current = replace(RetryState(budget, 2, 1), usable_vram_floor=24)
     for attempt in range(budget + 1):
         current, plan = transition_failure(
             current, _observe("job_preempted", chosen, (chosen,)), attempt=attempt
         )
-        assert plan.retry is (attempt < budget)
-        assert current.infra_used == min(attempt + 1, budget)
+        assert plan.retry
+        assert current.infra_used == 0
         assert current.oom_used == 0
         assert current.usable_vram_floor == 24
         assert current.select_candidate((chosen,))[1] == chosen
@@ -288,5 +288,35 @@ def test_spot_preemption_persists_authorization_for_replacement(monkeypatch, tmp
     assert plan.retry
     restored = require_retry_authorization_from_raw(spec, status._load_status_json(spec.run_id), 1)
     assert restored.last_decision.failure == "job_preempted"
-    assert restored.infra_used == 1
+    assert restored.infra_used == 0
     assert restored.select_candidate((chosen,))[1] == chosen
+
+
+@pytest.mark.parametrize("budget", [0, 2])
+def test_spot_preemption_requeues_after_retry_budget_exhaustion(budget):
+    spec = replace(_spec(max_retries=budget), gpu=GpuSpec(provider="spot", max_retries=budget))
+    chosen = _candidate("spot", "H100", 80, 8)
+    initial = RetryState.initial_for_spec(spec)
+    retry_state = replace(initial, infra_used=initial.infra_retries, usable_vram_floor=40)
+    for attempt in range(10):
+        retry_state, plan = transition_failure(
+            retry_state, _observe("job_preempted", chosen, (chosen,)), attempt=attempt
+        )
+        retry_state = RetryState.from_snapshot(spec, retry_state.to_snapshot())
+        assert plan.retry
+        assert plan.infra_retry_ordinal is None
+        assert retry_state.persisted_plan(attempt) == plan
+        assert retry_state.infra_used == initial.infra_retries
+        assert retry_state.oom_used == 0
+        assert retry_state.usable_vram_floor == 40
+        assert retry_state.select_candidate((chosen,)) == ((chosen,), chosen)
+
+
+def test_spot_worker_failure_is_not_treated_as_preemption():
+    chosen = _candidate("spot", "H100", 80)
+    _, plan = transition_failure(
+        RetryState.initial_for_spec(_spec()),
+        _observe("job_failed", chosen, (chosen,)),
+        attempt=0,
+    )
+    assert not plan.retry

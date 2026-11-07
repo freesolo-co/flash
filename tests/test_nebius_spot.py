@@ -588,3 +588,61 @@ def test_capsule_rejects_public_container_before_using_worker_sas(monkeypatch):
             b"capsule",
             deadline_at=time.time() + 60,
         )
+
+
+def test_stopped_spot_worker_requeues_until_price_recovers(monkeypatch):
+    from flash.core.spec import GpuSpec, JobSpec, TrainSpec
+    from flash.providers.core.base import Candidate
+    from flash.providers.nebius import jobs
+    from flash.providers.nebius.handles import SpotJobHandle
+    from flash.runner.lifecycle import status
+    from flash.runner.supervise.retry_decision import (
+        FailureObservation,
+        RetryState,
+        transition_failure,
+    )
+
+    now = [100.0]
+    monkeypatch.setattr(time, "time", lambda: now[0])
+    monkeypatch.setattr(time, "sleep", lambda seconds: now.__setitem__(0, now[0] + seconds))
+    spec = JobSpec(
+        run_id="flash-test",
+        gpu=GpuSpec(provider="spot", max_retries=0),
+        train=TrainSpec(hf_repo="org/artifacts"),
+    )
+    handle = SpotJobHandle(
+        instance_id="computeinstance-test",
+        gpu="H100",
+        hourly_usd=1,
+        attempt=0,
+        started_ts=90,
+        name="flash-test-a0",
+        run_id=spec.run_id,
+        hf_repo=spec.train.hf_repo,
+        phase=spec.phase,
+        scope="test",
+    )
+    monkeypatch.setattr(jobs, "require_scope", lambda handle: None)
+    monkeypatch.setattr(jobs, "make_artifact_text_reader", lambda *a, **kw: lambda **kw: None)
+    monkeypatch.setattr(jobs, "heartbeat_reader_for", lambda *a, **kw: None)
+    monkeypatch.setattr(api, "get_instance", lambda *a, **kw: {"status": "stopped"})
+    result = jobs.poll(handle, spec, log=io.StringIO(), deadline_at=500)
+    assert result.failure == "job_preempted"
+    chosen = Candidate("spot", "H100", 1, 80, 1)
+    _, plan = transition_failure(
+        RetryState.initial_for_spec(spec),
+        FailureObservation(result.failure, chosen, (chosen,)),
+        attempt=0,
+    )
+    assert plan.retry
+
+    states = []
+    prices_to_check = iter([{}, {}, {"H100": 0.9}])
+    monkeypatch.setattr(queue, "settings", lambda: {"region": "test"})
+    monkeypatch.setattr(queue, "affordable_gpus", lambda region: next(prices_to_check))
+    monkeypatch.setattr(status, "get_status", lambda run: SimpleNamespace(state="queued"))
+    monkeypatch.setattr(status, "_update", lambda run, state: states.append(state))
+    queued_at = now[0]
+    queue.wait_for_price("H100", spec.run_id, deadline_at=500, log=io.StringIO())
+    assert now[0] == queued_at + 120
+    assert states == ["queued", "queued", "provisioning"]

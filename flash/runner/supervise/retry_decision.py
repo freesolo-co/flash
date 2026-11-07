@@ -294,12 +294,11 @@ def _finish(
 def _spot_preemption_plan(state: RetryState, chosen) -> tuple[RetryState, RetryPlan]:
     if chosen is None or chosen.provider != "spot":
         return state, RetryPlan(False, "not retrying")
-    if state.infra_used >= state.infra_retries:
-        return state, RetryPlan(False, "not retrying: infrastructure retry budget exhausted")
-    ordinal = state.infra_used + 1
-    # Preemption says nothing about memory requirements: keep the same shape eligible.
-    return replace(state, infra_used=ordinal), RetryPlan(
-        True, "retrying Spot allocation (resume from last checkpoint)", ordinal
+    # Spot eviction is expected, including when the running price cap is hit.
+    # Fresh prices gate the replacement worker; cancellation and the run deadline
+    # bound the wait rather than the failure budget. Keep the same shape eligible.
+    return replace(state, cache_retry_shape=None), RetryPlan(
+        True, "requeuing spot capacity (resume from last checkpoint)"
     )
 
 
