@@ -62,7 +62,7 @@ class Fleet:
                 "ssh_key_names": [SSH_KEY_NAME],
                 "firewall_rulesets": [{"id": firewall_id}],
                 "file_system_mounts": [
-                    {"file_system_id": filesystem_id, "mount_point": "/vol/hosting-cache"}
+                    {"file_system_id": filesystem_id, "mount_point": "/data/hosting-cache"}
                 ],
                 "name": name,
                 "image": {"family": "gpu-base-24-04"},

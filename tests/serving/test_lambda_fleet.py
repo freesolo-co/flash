@@ -53,7 +53,7 @@ class API:
         if path == "instance-operations/launch":
             self.launches += 1
             assert body["instance_type_name"] == "gpu_1x_h100_sxm5"
-            assert body["file_system_mounts"][0]["mount_point"] == "/vol/hosting-cache"
+            assert body["file_system_mounts"][0]["mount_point"] == "/data/hosting-cache"
             assert body["firewall_rulesets"]
             self.instances.append(
                 {"id": "vm1", "name": body["name"], "tags": body["tags"], "status": "active"}

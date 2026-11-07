@@ -95,7 +95,7 @@ def test_bootstrap_forwards_only_gpu_credentials_and_pins_source(tls):
     for secret in ("provider-secret", "database-secret", "router-secret"):
         assert secret not in content
     assert all(item["permissions"] == "0600" for item in payload["write_files"])
-    assert "mountpoint -q /vol/hosting-cache" in files["/opt/flash/setup.sh"]
+    assert "mountpoint -q /data/hosting-cache" in files["/opt/flash/setup.sh"]
     assert "@sha256:" in content
     assert "a" * 40 in content
     assert "python -m flash.serving.lambda_cloud.worker" in content

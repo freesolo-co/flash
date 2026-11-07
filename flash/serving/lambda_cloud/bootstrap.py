@@ -89,16 +89,16 @@ def user_data(model, revision, credentials, tls):
 set -euo pipefail
 mkdir -p /opt/flash-source
 for attempt in $(seq 1 60); do
-    mountpoint -q /vol/hosting-cache && break
+    mountpoint -q /data/hosting-cache && break
     sleep 5
 done
-mountpoint -q /vol/hosting-cache
+mountpoint -q /data/hosting-cache
 curl --fail --silent --show-error --location https://github.com/freesolo-co/flash/archive/{revision}.tar.gz -o /opt/flash/source.tar.gz
 tar -xzf /opt/flash/source.tar.gz --strip-components=1 -C /opt/flash-source
 docker pull {RUNTIME_IMAGE}
 # Keep the qualified dependency stack; source overlays must use identical runtime locks.
 docker run --rm --entrypoint python -v /opt/flash-source:/source:ro -v /opt/flash-source/flash:/app/flash:ro {RUNTIME_IMAGE} -m flash.serving.lambda_cloud.runtime_image /app/uv.lock /source/uv.lock
-docker run -d --restart unless-stopped --name flash-worker --gpus all --ipc host --env-file /opt/flash/worker.env -p {PORT}:{PORT} -v /opt/flash-source/flash:/app/flash:ro -v /opt/flash:/run/flash:ro -v /vol/hosting-cache:/vol/hosting-cache {RUNTIME_IMAGE} python -m flash.serving.lambda_cloud.worker
+docker run -d --restart unless-stopped --name flash-worker --gpus all --ipc host --env-file /opt/flash/worker.env -p {PORT}:{PORT} -v /opt/flash-source/flash:/app/flash:ro -v /opt/flash:/run/flash:ro -v /data/hosting-cache:/vol/hosting-cache {RUNTIME_IMAGE} python -m flash.serving.lambda_cloud.worker
 """
     files["setup.sh"] = setup
     payload = {
