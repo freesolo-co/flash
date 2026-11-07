@@ -108,7 +108,7 @@ SERVING_MODELS: list[dict[str, Any]] = [
             "max_model_len": 262144,
             # Keep the qualified 64-sequence scheduler capacity on H100.
             "max_num_seqs": 64,
-            # H100 trials: 8,192 improved aggregate and per-stream throughput ~5% over 4,096.
+            # H100 trials: larger prefill batches improve throughput for concurrent long prompts.
             "max_num_batched_tokens": 8192,
             "enforce_eager": False,
             "reasoning_parser": "qwen3",
