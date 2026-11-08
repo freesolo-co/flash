@@ -35,7 +35,7 @@ RUN apt-get update \
 # Pinned by version AND sha256 against the vendor's signed release artifact rather than piped
 # from a setup script: `curl ... | bash` executes whatever the vendor serves at request time,
 # which is neither reviewable nor reproducible, and a repository that ships it is teaching the
-# pattern to everyone who reads its Dockerfile. Bump INFISICAL_VERSION and both digests
+# pattern to everyone who reads its Dockerfile. Bump INFISICAL_VERSION, both digests, and fallback asset IDs
 # together -- a stale digest fails the build loudly instead of installing an unverified binary.
 #
 # Digests are the vendor's published checksums.txt entries for this version:
@@ -49,13 +49,16 @@ RUN if [ "${INSTALL_INFISICAL}" = "true" ]; then \
         # dpkg's architecture, not uname's: the .deb asset names use Debian arch strings.
         arch="$(dpkg --print-architecture)"; \
         case "${arch}" in \
-            amd64) sha="${INFISICAL_SHA256_AMD64}" ;; \
-            arm64) sha="${INFISICAL_SHA256_ARM64}" ;; \
+            amd64) sha="${INFISICAL_SHA256_AMD64}"; asset=505765742 ;; \
+            arm64) sha="${INFISICAL_SHA256_ARM64}"; asset=505765736 ;; \
             *) echo "no pinned infisical build for dpkg arch: ${arch}" >&2; exit 1 ;; \
         esac; \
         deb="/tmp/infisical.deb"; \
         curl -fsSL --retry 4 --retry-delay 2 --connect-timeout 15 --max-time 120 -o "${deb}" \
-            "https://github.com/Infisical/cli/releases/download/v${INFISICAL_VERSION}/infisical_${INFISICAL_VERSION}_linux_${arch}.deb"; \
+            "https://github.com/Infisical/cli/releases/download/v${INFISICAL_VERSION}/infisical_${INFISICAL_VERSION}_linux_${arch}.deb" || \
+            curl -fsSL --retry 2 --connect-timeout 15 --max-time 600 \
+                -H "Accept: application/octet-stream" -o "${deb}" \
+                "https://api.github.com/repos/Infisical/cli/releases/assets/${asset}"; \
         # Verify BEFORE dpkg touches it: a mismatch must fail the build, never install.
         echo "${sha}  ${deb}" | sha256sum -c -; \
         apt-get update; \
