@@ -137,6 +137,7 @@ def test_9b_has_h100_rank128_serving_overrides() -> None:
     assert ov["max_lora_rank"] == 128
     assert ov["max_model_len"] == 262144
     assert ov["max_num_seqs"] == 64
+    assert ov["max_num_batched_tokens"] == 8192
     assert gpu_for("Qwen/Qwen3.5-9B") == "H100"
     assert ov["gpu_memory_utilization"] == 0.90
     assert (
