@@ -93,3 +93,18 @@ def test_moe_fp8_pin_and_unapproved_profile():
     assert result["quantization"] == "fp8"
     with pytest.raises(ValueError, match="Unapproved"):
         engine_profile(MOE, "A100-80GB")
+
+
+@pytest.mark.parametrize(
+    "model", ["Qwen/Qwen3.5-9B", "Qwen/Qwen3.5-9B-Base", "Qwen/Qwen3.8-27B", MOE]
+)
+def test_a10_is_never_selected_for_larger_models(model):
+    with pytest.raises(RuntimeError, match="no US capacity"):
+        select_region({"a10": offer("A10 (24 GB PCIe)", 129)}, model)
+
+
+def test_a10_is_cheapest_small_model_option():
+    catalog = {"a10": offer("A10 (24 GB PCIe)", 129), "h100": offer("H100 (80 GB SXM5)", 429)}
+    for model in (SMALL, "Qwen/Qwen3.5-4B"):
+        assert select_region(catalog, model) == ("a10", "us-west-1")
+        assert validate_gpu(model, "NVIDIA A10", 22.06 * 2**30, 1) == "A10"

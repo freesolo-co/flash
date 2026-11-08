@@ -43,6 +43,8 @@ class Fleet:
         await self._check_capacity(model, revision)
         instance_type, region = select_region(await self.api.call("GET", "instance-types"), model)
         record = {
+            "instance_type": instance_type,
+            "region": region,
             "model": model,
             "revision": revision,
             "created": self.clock(),
