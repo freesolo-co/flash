@@ -1,7 +1,8 @@
-"""Isolated A10G/A100/H200 FP8 qualification; never changes production placement."""
+"""Isolated GPU FP8 qualification; never changes production placement."""
 
 import asyncio
 import json
+import os
 import time
 import uuid
 from pathlib import Path
@@ -205,6 +206,8 @@ async def expert_lora_smoke(engine, model, rank):
 async def qualify(
     model, fp8_revision="", selective=False, online_dense=False, tensor_parallel=1, gpu="A100-80GB"
 ):
+    # Match hosted Modal isolation: never reuse another GPU's AOT kernels.
+    os.environ["VLLM_CACHE_ROOT"] = f"/vol/hosting-cache/vllm/{gpu}"
     import torch
     from vllm import SamplingParams
 
@@ -380,7 +383,7 @@ def main(
         raise ValueError("qualification concurrency must be one or two")
     if tensor_parallel not in (1, 2):
         raise ValueError("qualification supports one or two GPUs")
-    if gpu not in ("A10G", "A100-80GB", "H100", "H200", "B200"):
+    if gpu not in ("A10G", "L40S", "A100-80GB", "H100", "H200", "B200"):
         raise ValueError("unsupported qualification GPU")
     function = qualify.with_options(gpu=gpu if tensor_parallel == 1 else f"{gpu}:2")
     with ThreadPoolExecutor(max_workers=concurrency) as pool:

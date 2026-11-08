@@ -40,7 +40,7 @@ def test_registered_pools_and_combined_limit(mode, monkeypatch, load_modal_app_u
     for model, cls in mod.ENGINE_BY_MODEL.items():
         if mode == "modal":
             assert issubclass(cls, mod.HostedModalEngine)
-            assert cls.pinned_gpu == policy.modal_gpu_for(model)
+            assert cls.pinned_gpu == policy.modal_gpus_for(model)
         else:
             assert issubclass(cls, mod.LambdaEngineProxy)
     assert bool(mod.MODAL_FALLBACK_BY_MODEL) == (mode == "all")
@@ -71,7 +71,7 @@ def test_unknown_mode_and_deepseek_are_not_reinterpreted():
     with pytest.raises(ValueError, match="INFERENCE_PROVIDER"):
         policy.validate_provider("automatic")
     with pytest.raises(ValueError, match="only defined for hosted Qwen"):
-        policy.modal_gpu_for("deepseek-ai/DeepSeek-V4.1-Flash-1017")
+        policy.modal_gpus_for("deepseek-ai/DeepSeek-V4.1-Flash-1017")
 
 
 @pytest.mark.anyio
@@ -97,3 +97,66 @@ async def test_unregister_clears_both_active_pools_without_waking_idle_gpu():
     for engine in engines[:2]:
         engine.unregister.remote.aio.assert_awaited_once_with("org", "adapter", "generation")
     engines[2].unregister.remote.aio.assert_not_awaited()
+
+
+@pytest.mark.parametrize(
+    ("model", "options"),
+    [
+        ("Qwen/Qwen3.5-0.8B", ["A10G", "L40S", "A100-80GB"]),
+        ("Qwen/Qwen3.5-4B", ["A10G", "L40S", "A100-80GB"]),
+        ("Qwen/Qwen3.5-9B", ["L40S", "A100-80GB"]),
+        ("Qwen/Qwen3.5-9B-Base", ["L40S", "A100-80GB"]),
+        ("Qwen/Qwen3.8-27B", ["A100-80GB"]),
+        ("Qwen/Qwen3.6-35B-A3B", ["H200"]),
+    ],
+)
+def test_modal_fallbacks_and_hardware_profiles(model, options):
+    from flash.serving.lambda_cloud.profiles import engine_profile
+
+    assert policy.modal_gpus_for(model) == options
+    for gpu in options:
+        profile = engine_profile(model, "A10" if gpu == "A10G" else gpu)
+        assert profile["max_model_len"] == 262144
+    if "9B" in model:
+        assert engine_profile(model, "A100-80GB")["quantization"] == "fp8_per_tensor"
+        assert engine_profile(model, "L40S")["serve_model_id"] != model
+
+
+def test_modal_gpu_selection_uses_actual_device_and_rejects_wrong_shapes():
+    from flash.serving.app.modal_engine import selected_gpu
+
+    options = ["A10G", "L40S", "A100-80GB"]
+    assert selected_gpu(options, "NVIDIA L40S", 48 * 2**30, 1) == "L40S"
+    assert selected_gpu(options, "NVIDIA A100-SXM4-80GB", 80 * 2**30, 1) == "A100-80GB"
+    assert selected_gpu(options, "NVIDIA A10", 24 * 2**30, 1) == "A10G"
+    for name, gib, count in [("NVIDIA L40", 48, 1), ("NVIDIA A100", 40, 1), ("NVIDIA L40S", 48, 2)]:
+        with pytest.raises(RuntimeError, match="unapproved GPU"):
+            selected_gpu(options, name, gib * 2**30, count)
+
+
+@pytest.mark.anyio
+async def test_modal_load_selects_actual_profile_and_isolates_compiled_cache(monkeypatch):
+    import os
+    import sys
+
+    from flash.serving.app.modal_engine import HostedModalEngine, _LoraEngineImpl
+
+    monkeypatch.setenv("VLLM_CACHE_ROOT", "/cache/vllm")
+    torch = SimpleNamespace(
+        cuda=SimpleNamespace(
+            get_device_name=lambda _: "NVIDIA L40S",
+            get_device_properties=lambda _: SimpleNamespace(total_memory=48 * 2**30),
+            device_count=lambda: 1,
+        )
+    )
+    monkeypatch.setitem(sys.modules, "torch", torch)
+    load = AsyncMock()
+    monkeypatch.setattr(_LoraEngineImpl, "_load", load)
+    engine = HostedModalEngine()
+    engine.base_model = "Qwen/Qwen3.5-9B"
+    engine.pinned_gpu = policy.modal_gpus_for(engine.base_model)
+    await engine._load()
+    assert engine.pinned_gpu == "L40S"
+    assert engine.engine_overrides["serve_model_id"] == "Freesolo-Co/Qwen3.5-9B-FP8"
+    assert os.environ["VLLM_CACHE_ROOT"] == "/cache/vllm/L40S"
+    load.assert_awaited_once()

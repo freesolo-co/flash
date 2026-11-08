@@ -1,13 +1,14 @@
 """Hardware-specific FP8 settings; public model identity and admission stay unchanged."""
 
+from flash.serving.app.inference_provider import modal_gpus_for
 from flash.serving.src.engine.model_config import engine_overrides_for
 
 from .config import placements
 
 
 def engine_profile(model, gpu):
-    if gpu not in placements(model):
-        raise ValueError(f"Unapproved Lambda GPU {gpu} for {model}")
+    if gpu not in placements(model) and gpu not in modal_gpus_for(model):
+        raise ValueError(f"Unapproved serving GPU {gpu} for {model}")
     overrides = engine_overrides_for(model)
     small = model in {"Qwen/Qwen3.5-0.8B", "Qwen/Qwen3.5-4B"}
     online_nine = gpu in {"A10", "A100-80GB"} and model in {

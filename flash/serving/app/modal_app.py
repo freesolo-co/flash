@@ -322,7 +322,7 @@ hf_cache_volume = modal.Volume.from_name(HF_CACHE_VOLUME_NAME, create_if_missing
 # Retain the GPU implementation, registering only the providers selected below.
 from flash.serving.app.inference_provider import (  # noqa: E402
     INFERENCE_PROVIDER,
-    modal_gpu_for,
+    modal_gpus_for,
     replica_limit,
     validate_provider,
 )
@@ -373,7 +373,7 @@ def _engine_concurrency(base_model: str) -> tuple[int, int]:
 
 
 def _build_engine(
-    gpu: str,
+    gpu: str | list[str],
     class_name: str,
     max_inputs: int,
     target_inputs: int,
@@ -481,7 +481,7 @@ def _build_engine(
         **resources,
         nonpreemptible=True,
         region="us",
-        scaledown_window=scaledown_window_for(gpu),
+        scaledown_window=scaledown_window_for(gpu[0] if isinstance(gpu, list) else gpu),
         startup_timeout=STARTUP_TIMEOUT_SECONDS,
         timeout=REQUEST_TIMEOUT_SECONDS,
         min_containers=MIN_CONTAINERS,
@@ -497,7 +497,7 @@ validate_provider(INFERENCE_PROVIDER)
 _PRIMARY_PROVIDER = "modal" if INFERENCE_PROVIDER == "modal" else "lambda"
 ENGINE_BY_MODEL: dict[str, Any] = {
     bm: _build_engine(
-        modal_gpu_for(bm) if _PRIMARY_PROVIDER == "modal" else gpu_for(bm),
+        modal_gpus_for(bm) if _PRIMARY_PROVIDER == "modal" else gpu_for(bm),
         model_engine_name(bm),
         *_engine_concurrency(bm),
         provider=_PRIMARY_PROVIDER,
@@ -507,7 +507,7 @@ ENGINE_BY_MODEL: dict[str, Any] = {
 MODAL_FALLBACK_BY_MODEL: dict[str, Any] = (
     {
         bm: _build_engine(
-            modal_gpu_for(bm),
+            modal_gpus_for(bm),
             model_engine_name(bm) + "_ModalGPU",
             *_engine_concurrency(bm),
             provider="modal",

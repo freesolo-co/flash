@@ -9,7 +9,7 @@ from collections.abc import AsyncIterator
 from typing import Any, Protocol
 
 from flash.schema import parse_checkpoint_ref
-from flash.serving.app.inference_provider import INFERENCE_PROVIDER, modal_gpu_for
+from flash.serving.app.inference_provider import INFERENCE_PROVIDER, modal_gpus_for
 from flash.serving.lambda_cloud.config import placements
 from flash.serving.src.engine.model_config import (
     gpu_for,
@@ -123,7 +123,15 @@ def health_body(
     # not expose here. ``gpus`` is the supported base-model engine count and remains stable when
     # demand-driven containers scale to zero.
     gpu_by_model = {
-        m: (modal_gpu_for(m) if INFERENCE_PROVIDER == "modal" else " | ".join(placements(m)))
+        m: (
+            " | ".join(modal_gpus_for(m))
+            if INFERENCE_PROVIDER == "modal"
+            else " | ".join(
+                dict.fromkeys(
+                    [*placements(m), *(modal_gpus_for(m) if INFERENCE_PROVIDER == "all" else [])]
+                )
+            )
+        )
         if m.startswith("Qwen/")
         else gpu_for(m)
         for m in supported_models
