@@ -787,6 +787,8 @@ def test_modal_deploy_client_matches_the_runtime_dependency_pin(workflow):
         if argument.startswith("modal==")
     ]
     assert requirements == [expected]
+    # Fleet control imports httpx on the deployment host before building its image.
+    assert '"httpx==0.28.1"' in installs[0]["run"]
 
 
 @pytest.mark.parametrize("branch", ["dev", "main", "codex/modal-migration", ".feature"])
