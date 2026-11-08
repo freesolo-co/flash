@@ -152,23 +152,20 @@ async def expert_lora_smoke(engine, model, rank):
                 "lora_alpha": rank,
                 "lora_dropout": 0,
                 "bias": "none",
-                "target_modules": ["gate_proj", "up_proj", "down_proj"],
+                "target_modules": [],
+                "target_parameters": ["mlp.experts.gate_up_proj", "mlp.experts.down_proj"],
             }
         )
     )
     weights = {}
-    for expert in range(info.lora_expert_count):
-        for projection in ("gate_proj", "up_proj", "down_proj"):
-            inputs, outputs = (
-                (intermediate, info.hidden_size)
-                if projection == "down_proj"
-                else (info.hidden_size, intermediate)
-            )
-            name = (
-                f"base_model.model.model.language_model.layers.0.mlp.experts.{expert}.{projection}"
-            )
-            weights[name + ".lora_A.weight"] = torch.zeros(rank, inputs, dtype=torch.bfloat16)
-            weights[name + ".lora_B.weight"] = torch.zeros(outputs, rank, dtype=torch.bfloat16)
+    stacked_rank = rank * info.lora_expert_count
+    for suffix, inputs, outputs in (
+        (".base_layer", info.hidden_size, 2 * intermediate),
+        ("", intermediate, info.hidden_size),
+    ):
+        name = f"base_model.model.model.language_model.layers.0.mlp.experts{suffix}"
+        weights[name + ".lora_A.weight"] = torch.zeros(stacked_rank, inputs, dtype=torch.bfloat16)
+        weights[name + ".lora_B.weight"] = torch.zeros(outputs, stacked_rank, dtype=torch.bfloat16)
     save_file(weights, str(root / "adapter_model.safetensors"))
     del weights
     adapter = LoRARequest("a100-fp8-expert-smoke", 2, str(root))
@@ -189,7 +186,8 @@ async def expert_lora_smoke(engine, model, rank):
         "rank": rank,
         "layer": 0,
         "experts": info.lora_expert_count,
-        "projections": ["gate_proj", "up_proj", "down_proj"],
+        "projections": ["gate_up_proj", "down_proj"],
+        "format": "PEFT fused target_parameters",
         "text": last.outputs[0].text,
         "synthetic_zero_adapter": True,
     }
