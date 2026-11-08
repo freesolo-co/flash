@@ -505,10 +505,9 @@ def test_tier_classes_inherit_the_shared_impl(modal_app_module):
         assert entry in tier.__dict__
 
 
-def test_each_tier_class_records_its_pinned_gpu(modal_app_module):
-    """Each per-tier class records the GPU it was actually pinned to in _build_engine, so health/ops
-    can detect a base model misrouted onto the wrong tier instead of trusting the derived lookup."""
-    for model, cls in modal_app_module.ENGINE_BY_MODEL.items():
+def test_cpu_proxy_does_not_claim_a_fixed_gpu(modal_app_module):
+    """Worker health identifies the selected GPU after capacity-dependent placement."""
+    for cls in modal_app_module.ENGINE_BY_MODEL.values():
         assert cls.pinned_gpu is None
 
 
