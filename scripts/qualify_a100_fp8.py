@@ -8,33 +8,29 @@ from pathlib import Path
 
 import modal
 
-from flash.serving.lambda_cloud.config import RUNTIME_IMAGE
-from flash.serving.src.engine.model_config import base_models
-
+app = modal.App("flash-a100-fp8-qualification")
 if modal.is_local():
     from flash.serving.app.modal_app import engine_secrets, hf_cache_volume
-else:
-    engine_secrets = []
-    hf_cache_volume = modal.Volume.from_name(
-        "freesolo-lora-serving-hf-cache", create_if_missing=True
-    )
+    from flash.serving.lambda_cloud.config import RUNTIME_IMAGE
 
-app = modal.App("flash-a100-fp8-qualification")
-image = (
-    modal.Image.from_registry(RUNTIME_IMAGE)
-    .env(
-        {
-            "PYTHONPATH": "/root:/app",
-            "HF_HOME": "/vol/hosting-cache",
-            "HF_HUB_CACHE": "/vol/hosting-cache/hub",
-            "VLLM_CACHE_ROOT": "/vol/hosting-cache/vllm",
-            "HF_HUB_DISABLE_XET": "1",
-            "VLLM_WORKER_MULTIPROC_METHOD": "spawn",
-            "VLLM_MOE_USE_DEEP_GEMM": "0",
-        }
+    image = (
+        modal.Image.from_registry(RUNTIME_IMAGE)
+        .env(
+            {
+                "HF_HOME": "/vol/hosting-cache",
+                "HF_HUB_CACHE": "/vol/hosting-cache/hub",
+                "VLLM_CACHE_ROOT": "/vol/hosting-cache/vllm",
+                "HF_HUB_DISABLE_XET": "1",
+                "VLLM_WORKER_MULTIPROC_METHOD": "spawn",
+                "VLLM_MOE_USE_DEEP_GEMM": "0",
+            }
+        )
+        .add_local_dir(Path(__file__).resolve().parent.parent / "flash", "/app/flash", copy=True)
     )
-    .add_local_python_source("flash")
-)
+else:
+    image = None
+    engine_secrets = []
+    hf_cache_volume = modal.Volume.from_name("freesolo-lora-serving-hf-cache")
 
 
 def inspect_quantization(worker):
@@ -179,6 +175,8 @@ async def qualify(model, fp8_revision=""):
 @app.local_entrypoint()
 def main(output: str, models: str = ""):
     from huggingface_hub import model_info
+
+    from flash.serving.src.engine.model_config import base_models
 
     folder = Path(output)
     folder.mkdir(parents=True, exist_ok=True)
