@@ -27,6 +27,7 @@ jobs:
         # free. (in freesolo the app WAS the root of its own tree and used cwd-relative imports.)
         working-directory: .
     env:
+      LAMBDA_API_KEY: ${{ secrets.LAMBDA_API_KEY }}
       MODAL_TOKEN_ID: ${{ secrets.MODAL_TOKEN_ID }}
       MODAL_TOKEN_SECRET: ${{ secrets.MODAL_TOKEN_SECRET }}
       HF_TOKEN: ${{ secrets.HF_TOKEN }}
@@ -118,7 +119,7 @@ jobs:
           # pinned to the exact client pyproject declares; see deploy-modal.yml for why an
           # unbounded range is unsafe for the deploy path.
           # exact pins keep the deploy client bootstrap reproducible across runner image changes.
-          uv pip install --system "modal==1.6.2" "python-dotenv==1.2.3"
+          uv pip install --system "modal==1.6.2" "python-dotenv==1.2.3" "httpx==0.28.1"
 
       - name: Verify development deployment inputs
         if: steps.gate.outputs.deploy == 'true'
@@ -229,6 +230,26 @@ jobs:
             exit 1
           fi
           echo "Development Supabase flash.hosted_lora_adapters is queryable."
+
+      # This independent app keeps orphan VM cleanup running across serving releases.
+      - name: Validate inference provider
+        id: provider
+        if: steps.gate.outputs.deploy == 'true'
+        run: |
+          python3 - <<'PYCODE'
+          import os
+          import runpy
+          policy = runpy.run_path("flash/serving/app/inference_provider.py")
+          enabled = policy["INFERENCE_PROVIDER"] != "modal"
+          if enabled and not os.environ.get("LAMBDA_API_KEY"):
+              raise SystemExit("LAMBDA_API_KEY is required for lambda/all inference")
+          with open(os.environ["GITHUB_OUTPUT"], "a") as output:
+              output.write(f"lambda_enabled={str(enabled).lower()}\n")
+          PYCODE
+
+      - name: Deploy Lambda fleet control
+        if: steps.gate.outputs.deploy == 'true' && steps.provider.outputs.lambda_enabled == 'true'
+        run: modal deploy --strategy rolling --env dev -m flash.serving.lambda_cloud.control_app
 
       - name: Deploy development serving
         if: steps.gate.outputs.deploy == 'true'

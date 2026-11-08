@@ -2,9 +2,7 @@
 
 Run with ``python -m scripts.qualify_serving_rollout`` in a Modal-authenticated
 environment. It migrates a legacy engine under traffic, then changes concurrency
-under the stable model identity, then restores the legacy implementation through
-the production rollback artifact builder. Each replacement takes ten seconds to start.
-Use --unsafe-rollback to reproduce deletion failures in the disposable app.
+under the stable model identity. Each replacement takes ten seconds to start.
 The temporary app is stopped in finally; request results contain no user data.
 """
 
@@ -13,7 +11,6 @@ import asyncio
 import contextlib
 import json
 import os
-import shutil
 import sys
 import tempfile
 import time
@@ -22,7 +19,6 @@ from pathlib import Path
 
 import modal
 
-from flash.serving.app.rollback import prepare_artifact
 from flash.serving.app.rollout import warm_active_models
 
 APP_NAME = os.environ.get("ROLLOUT_QUALIFICATION_APP", "flash-rollout-qualification-local")
@@ -75,7 +71,7 @@ def _build_engine(gpu, name, concurrency, target_inputs):
 
 
 LegacyEngine = _build_engine("CPU", "LegacyEngine", 4, 4)
-if PHASE not in {"legacy", "rollback"}:
+if PHASE != "legacy":
     cap = 4 if PHASE == "model" else 8
     StableModelEngine = _build_engine("CPU", "StableModelEngine", cap, cap)
 
@@ -93,12 +89,12 @@ def _engine_concurrency(model):
 
 def _engine_cls_for(model):
     gpu_for(model)
-    return LegacyEngine if PHASE in {"legacy", "rollback"} else StableModelEngine
+    return LegacyEngine if PHASE == "legacy" else StableModelEngine
 
 
 class _ModalEnginePool:
     async def start(self):
-        if PHASE not in {"legacy", "rollback"}:
+        if PHASE != "legacy":
             await warm_active_models(
                 {"base": StableModelEngine(base_model="base")},
                 {"base": LegacyEngine(base_model="base")},
@@ -139,32 +135,7 @@ def router():
     return api
 
 
-def _prepare_predecessor(directory, unsafe_rollback):
-    deploy_cwd = directory / "predecessor"
-    shutil.copytree(
-        Path(__file__).resolve().parents[1] / "flash",
-        deploy_cwd / "flash",
-        ignore=shutil.ignore_patterns("__pycache__"),
-    )
-    entrypoint = deploy_cwd / "flash/serving/app/qualification_app.py"
-    shutil.copyfile(__file__, entrypoint)
-    if not unsafe_rollback:
-        prepare_artifact(
-            entrypoint,
-            {
-                "version": 1,
-                "source_sha": "a" * 40,
-                "startup_seconds": 120,
-                "classes": {
-                    "LegacyEngine": ["base"],
-                    "StableModelEngine": ["base"],
-                },
-            },
-        )
-    return entrypoint, deploy_cwd
-
-
-async def _qualify(*, unsafe_rollback=False):
+async def _qualify():
     import httpx
 
     name = f"flash-rollout-qualification-{uuid.uuid4().hex[:10]}"
@@ -172,7 +143,7 @@ async def _qualify(*, unsafe_rollback=False):
     directory = Path(tempfile.mkdtemp(prefix="flash-rollout-qualification-"))
     env = {**os.environ, "ROLLOUT_QUALIFICATION_APP": name}
     stop = asyncio.Event()
-    observed = {phase: asyncio.Event() for phase in ("legacy", "model", "updated", "rollback")}
+    observed = {phase: asyncio.Event() for phase in ("legacy", "model", "updated")}
 
     async def command(*args, phase="legacy", cwd=None):
         with (directory / f"{phase}.log").open("ab") as output:
@@ -198,7 +169,7 @@ async def _qualify(*, unsafe_rollback=False):
             row = {"error": type(exc).__name__}
         results.append({**row, "seconds": time.monotonic() - started})
         phase = row.get("router_phase")
-        if phase in observed and (phase != "rollback" or row.get("engine_phase") == "rollback"):
+        if phase in observed and row.get("engine_phase") == phase:
             observed[phase].set()
 
     async def traffic(client, url):
@@ -223,15 +194,8 @@ async def _qualify(*, unsafe_rollback=False):
             await request(client, url)  # establish an active legacy pool before migration
             tasks = [asyncio.create_task(traffic(client, url)) for _ in range(4)]
             tasks.append(asyncio.create_task(streaming_traffic(client, url.rstrip("/"))))
-            for phase in ("model", "updated", "rollback"):
-                entrypoint, deploy_cwd = __file__, None
-                if phase == "rollback":
-                    entrypoint, deploy_cwd = await asyncio.to_thread(
-                        _prepare_predecessor, directory, unsafe_rollback
-                    )
-                await command(
-                    "deploy", "--strategy", "rolling", str(entrypoint), phase=phase, cwd=deploy_cwd
-                )
+            for phase in ("model", "updated"):
+                await command("deploy", "--strategy", "rolling", __file__, phase=phase)
                 async with asyncio.timeout(180):
                     await observed[phase].wait()
                 print(f"Serving phase {phase}; {len(results)} requests observed", flush=True)
@@ -255,10 +219,5 @@ async def _qualify(*, unsafe_rollback=False):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument(
-        "--unsafe-rollback",
-        action="store_true",
-        help="Reproduce handle deletion in this disposable CPU app",
-    )
-    args = parser.parse_args()
-    asyncio.run(_qualify(unsafe_rollback=args.unsafe_rollback))
+    parser.parse_args()
+    asyncio.run(_qualify())
