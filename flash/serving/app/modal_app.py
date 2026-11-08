@@ -124,6 +124,8 @@ SCALEDOWN_WINDOW_SECONDS_BY_GPU: dict[str, int] = {
     "L40S": 2100,
     "H100": 2100,
     "H200": 2100,
+    "A10G": 2100,
+    "A100-80GB": 2100,
 }
 # The tiers this app is allowed to run an engine on. `gpu` in the serving catalog is a plain string,
 # so a typo ("b200", "B2OO") or an unvalidated new card used to fall through `dict.get` to a default
@@ -317,13 +319,14 @@ app = modal.App(APP_NAME, image=image)
 hf_cache_volume = modal.Volume.from_name(HF_CACHE_VOLUME_NAME, create_if_missing=True)
 
 
-# ``_LoraEngineImpl`` lives in ``flash.serving.src.engine.lora_engine`` (kept free of any ``modal``
-# import so it registers nothing, and inside the ``flash`` package so the image's
-# ``add_local_python_source("flash")`` ships it to the remote container under the same import path
-# it has here), re-exported so ``_build_engine`` can subclass it.
-# CPU replicas retain Modal admission/scaling; each owns one Lambda GPU worker.
-# This is a deployment invariant, not an environment-controlled fallback switch.
-HOSTED_QWEN_GPU_PROVIDER = "lambda"
+# Retain the GPU implementation, registering only the providers selected below.
+from flash.serving.app.inference_provider import (  # noqa: E402
+    INFERENCE_PROVIDER,
+    modal_gpu_for,
+    replica_limit,
+    validate_provider,
+)
+from flash.serving.app.modal_engine import HostedModalEngine  # noqa: E402
 from flash.serving.lambda_cloud.proxy import LambdaEngineProxy  # noqa: E402
 from flash.serving.src.engine.lora_engine import _LoraEngineImpl  # noqa: E402, F401
 
@@ -374,21 +377,15 @@ def _build_engine(
     class_name: str,
     max_inputs: int,
     target_inputs: int,
+    provider: str = "lambda",
 ) -> Any:
-    """Register one CPU admission controller for a Lambda GPU worker.
+    """Register a Modal GPU engine or Lambda CPU proxy under a stable model name.
 
-    Each model retains its stable class identity and qualified sequence capacity.
-    Entry points forward to LambdaEngineProxy, which binds one Lambda instance to
-    the lifetime of this Modal replica.
+    Set the class identity before decorators so Modal can re-import it remotely.
+    """
+    implementation = HostedModalEngine if provider == "modal" else LambdaEngineProxy
 
-    Class identity (name/qualname + module-global binding) is fixed BEFORE the class-level decorators
-    run. With the real Modal SDK ``@modal.concurrent`` returns a wrapper that holds the user class
-    separately, so renaming the bound name AFTER the decorator would rename the wrapper, not the class
-    Modal registers — every tier would then register under ``_Engine`` and the ``<locals>`` qualname
-    would fail Modal's global-scope validation. So we apply ``modal.concurrent``/``app.cls`` in call
-    form on an already-renamed, already-module-global class."""
-
-    class _Engine(LambdaEngineProxy):
+    class _Engine(implementation):
         base_model: str = modal.parameter()
 
         @modal.enter()
@@ -456,44 +453,70 @@ def _build_engine(
 
         @modal.method()
         async def health(self) -> dict[str, Any]:
-            return await self._health()
+            result = self._health()
+            return await result if hasattr(result, "__await__") else result
 
-    # Record the GPU this class was actually pinned to (a plain class attribute, NOT a
-    # modal.parameter() field). _health() reports THIS rather than re-deriving the tier from the base
-    # model name, so a base model accidentally routed onto the wrong tier's class surfaces in health
-    # instead of being masked by the expected-tier lookup.
-    _Engine.pinned_gpu = None  # Actual selected hardware is reported by worker health.
-    # Give the REAL class its distinct, module-level identity BEFORE decorating. A clean (no-``<locals>``)
-    # __qualname__ satisfies Modal's global-scope validation, and binding it as a module attribute under
-    # that name makes ``getattr(module, class_name)`` resolve the class Modal re-imports in the container.
+    # Lambda reports actual hardware remotely; Modal is pinned by its decorator.
+    _Engine.pinned_gpu = gpu if provider == "modal" else None
+    # Modal must see the final module-level identity before decoration.
     _Engine.__name__ = class_name
     _Engine.__qualname__ = class_name
     globals()[class_name] = _Engine
+    resources = (
+        {
+            "image": image,
+            "gpu": gpu,
+            "secrets": engine_secrets,
+            "volumes": {HOSTING_CACHE_MOUNT: hf_cache_volume},
+        }
+        if provider == "modal"
+        else {
+            "image": lambda_controller_image,
+            "cpu": 1,
+            "memory": 2048,
+            "secrets": lambda_proxy_secrets,
+        }
+    )
     engine = app.cls(
-        image=lambda_controller_image,
-        cpu=1,
-        memory=2048,
+        **resources,
         nonpreemptible=True,
         region="us",
-        secrets=lambda_proxy_secrets,
         scaledown_window=scaledown_window_for(gpu),
         startup_timeout=STARTUP_TIMEOUT_SECONDS,
         timeout=REQUEST_TIMEOUT_SECONDS,
         min_containers=MIN_CONTAINERS,
-        max_containers=MAX_CONTAINERS,
+        max_containers=replica_limit(INFERENCE_PROVIDER),
         buffer_containers=ENGINE_BUFFER_CONTAINERS,
     )(modal.concurrent(max_inputs=max_inputs, target_inputs=target_inputs)(_Engine))
-    # Rebind the module name to the decorated handle, matching the normal ``@app.cls class X`` pattern
-    # where the module attribute ends up referring to the decorated class.
     globals()[class_name] = engine
     return engine
 
 
-# GPU and concurrency may change without deleting the identity old routers call.
+# Both pools are registered only in all mode; each is then capped at one replica.
+validate_provider(INFERENCE_PROVIDER)
+_PRIMARY_PROVIDER = "modal" if INFERENCE_PROVIDER == "modal" else "lambda"
 ENGINE_BY_MODEL: dict[str, Any] = {
-    bm: _build_engine(gpu_for(bm), model_engine_name(bm), *_engine_concurrency(bm))
+    bm: _build_engine(
+        modal_gpu_for(bm) if _PRIMARY_PROVIDER == "modal" else gpu_for(bm),
+        model_engine_name(bm),
+        *_engine_concurrency(bm),
+        provider=_PRIMARY_PROVIDER,
+    )
     for bm in base_models()
 }
+MODAL_FALLBACK_BY_MODEL: dict[str, Any] = (
+    {
+        bm: _build_engine(
+            modal_gpu_for(bm),
+            model_engine_name(bm) + "_ModalGPU",
+            *_engine_concurrency(bm),
+            provider="modal",
+        )
+        for bm in base_models()
+    }
+    if INFERENCE_PROVIDER == "all"
+    else {}
+)
 
 
 def _engine_cls_for(base_model: str) -> Any:
@@ -509,11 +532,25 @@ class _ModalEnginePool:
         from flash.serving.deepinfer.app.client import HostedDeepInfer
 
         self._deepinfer = HostedDeepInfer()
+        self._provider_selection = None
+        if INFERENCE_PROVIDER == "all":
+            from flash.serving.app.provider_selection import ProviderSelection
+            from flash.serving.lambda_cloud.config import APP_NAME as fleet_app
+
+            fleet = modal.Cls.from_name(fleet_app, "LambdaFleet")()
+            self._provider_selection = ProviderSelection(fleet.has_capacity.remote.aio)
+
+    async def _engine_for(self, model):
+        if self._provider_selection and await self._provider_selection.choose(model) == "modal":
+            return MODAL_FALLBACK_BY_MODEL[model](base_model=model)
+        return _engine_cls_for(model)(base_model=model)
 
     async def start(self):
-        await warm_active_models(
-            {bm: cls(base_model=bm) for bm, cls in ENGINE_BY_MODEL.items()},
-        )
+        await warm_active_models({bm: cls(base_model=bm) for bm, cls in ENGINE_BY_MODEL.items()})
+        if MODAL_FALLBACK_BY_MODEL:
+            await warm_active_models(
+                {bm: cls(base_model=bm) for bm, cls in MODAL_FALLBACK_BY_MODEL.items()}
+            )
 
     async def aclose(self):
         await self._deepinfer.aclose()
@@ -543,7 +580,7 @@ class _ModalEnginePool:
         generation_id = payload.generation_id
         if not generation_id:
             raise RuntimeError("generation id is required before modal dispatch")
-        engine = _engine_cls_for(base_model)(base_model=base_model)
+        engine = await self._engine_for(base_model)
         return await engine.generate.remote.aio(
             internal_generation_payload(payload),
             self._record_payload(record),
@@ -576,7 +613,7 @@ class _ModalEnginePool:
         generation_id = payload.generation_id
         if not generation_id:
             raise RuntimeError("generation id is required before modal dispatch")
-        engine = _engine_cls_for(base_model)(base_model=base_model)
+        engine = await self._engine_for(base_model)
         from flash.serving.src.stream_channel.client import CancellableStreamChannel
 
         remote_stream = CancellableStreamChannel(
@@ -597,7 +634,7 @@ class _ModalEnginePool:
                 await close()
 
     async def register(self, base_model: str, record: Any) -> None:
-        engine = _engine_cls_for(base_model)(base_model=base_model)
+        engine = await self._engine_for(base_model)
         await engine.register.remote.aio(
             self._record_payload(record),
             getattr(record, "deployment_generation", None),
@@ -610,8 +647,17 @@ class _ModalEnginePool:
         model_id: str,
         expected_generation: str | None = None,
     ) -> None:
-        engine = _engine_cls_for(base_model)(base_model=base_model)
-        await engine.unregister.remote.aio(org_id, model_id, expected_generation)
+        if INFERENCE_PROVIDER == "all":
+            from flash.serving.app.provider_selection import unregister_active
+
+            engines = [
+                ENGINE_BY_MODEL[base_model](base_model=base_model),
+                MODAL_FALLBACK_BY_MODEL[base_model](base_model=base_model),
+            ]
+            await unregister_active(engines, org_id, model_id, expected_generation)
+        else:
+            engine = await self._engine_for(base_model)
+            await engine.unregister.remote.aio(org_id, model_id, expected_generation)
 
 
 def _build_usage_outbox(settings: Any) -> Any:

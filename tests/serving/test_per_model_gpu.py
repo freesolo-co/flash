@@ -442,16 +442,6 @@ def test_only_model_scoped_engines_are_registered(modal_app_module):
     assert modal_app_module.app.cls.call_count == len(base_models())
 
 
-def test_rollback_manifest_retains_every_registered_engine(modal_app_module):
-    from flash.serving.app.rollback import engine_manifest
-
-    manifest = engine_manifest("a" * 40)
-    classes = list(modal_app_module.ENGINE_BY_MODEL.values())
-    assert set(manifest["classes"]) == {cls.__name__ for cls in classes}
-    for model, cls in modal_app_module.ENGINE_BY_MODEL.items():
-        assert manifest["classes"][cls.__name__] == [model]
-
-
 def test_engine_concurrency_rejects_malformed_catalog_values(modal_app_module, monkeypatch):
     mod = modal_app_module
 
@@ -992,7 +982,6 @@ def test_modal_stream_entrypoint_uses_regular_call(modal_app_module, monkeypatch
 
 def test_hosted_qwen_never_registers_modal_gpu_or_fallback(modal_app_module):
     mod = modal_app_module
-    assert mod.HOSTED_QWEN_GPU_PROVIDER == "lambda"
     for call in mod.app.cls.call_args_list:
         assert "gpu" not in call.kwargs
     for cls in mod.ENGINE_BY_MODEL.values():

@@ -161,3 +161,16 @@ async def test_uncertain_leases_count_toward_per_release_replica_limit():
     # A new release may overlap the old one during the existing rolling handoff.
     await fleet.launch("d" * 32, MODEL, "bootstrap", "e" * 40)
     assert api.launches == 1
+
+
+@pytest.mark.anyio
+async def test_all_mode_reserves_only_one_lambda_slot(monkeypatch):
+    from flash.serving.lambda_cloud import fleet as fleet_module
+
+    monkeypatch.setattr(fleet_module, "INFERENCE_PROVIDER", "all")
+    api, ledger = API(), Ledger()
+    fleet = Fleet(api, ledger, "dev", clock=lambda: 100)
+    await fleet.launch(OWNER, MODEL, "bootstrap", "b" * 40)
+    with pytest.raises(RuntimeError, match="replica limit"):
+        await fleet.launch("c" * 32, MODEL, "bootstrap", "b" * 40)
+    assert api.launches == 1

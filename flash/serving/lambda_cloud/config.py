@@ -46,6 +46,10 @@ def validate_gpu(model, name, memory_bytes, count):
     raise RuntimeError(f"Lambda worker received an unapproved GPU shape for {model}: {name}")
 
 
+class NoCapacityError(RuntimeError):
+    """No approved shape advertises capacity; no VM launch was attempted."""
+
+
 def select_region(catalog, model):
     allowed = placements(model)
     candidates = []
@@ -69,7 +73,7 @@ def select_region(catalog, model):
             if region["name"].startswith("us-")
         )
     if not candidates:
-        raise RuntimeError(
+        raise NoCapacityError(
             f"Lambda has no US capacity for approved shapes {allowed}; no hardware fallback"
         )
     _, instance_type, region = min(candidates)

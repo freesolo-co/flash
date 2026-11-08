@@ -12,11 +12,9 @@ present" check passes while the guard is commented out.
 
 from __future__ import annotations
 
-import json
 import os
 import re
 import shlex
-import shutil
 import subprocess
 import tempfile
 import tomllib
@@ -656,18 +654,8 @@ def test_promotion_is_gated_on_a_real_stream_after_readiness():
     assert _step_index("real streaming canary") > _step_index("serving readiness")
 
 
-def test_the_job_cap_leaves_room_for_a_rollback_after_every_wait_is_exhausted():
-    """The job cap has to be derived from the waits, not chosen and left to rot.
-
-    `timeout-minutes` kills the job wherever it is, and the worst case ends INSIDE the rollback:
-    both readiness polls burn their full deadlines, the gate burns its canary and accounting
-    budgets, and only then does the restore start its own deploy and 300s verification. A cap that
-    fits the forward path but not the restore converts a recoverable failed promotion into a broken
-    release left live, which is the one outcome this whole step exists to prevent.
-
-    Summing the declared budgets rather than restating a number keeps the cap honest: lengthening
-    any poll, or the gate's own deadlines, moves this bound automatically.
-    """
+def test_the_job_cap_covers_readiness_and_promotion_budgets():
+    """The job cap includes readiness, canary, accounting and deployment time."""
     job = _load(WORKFLOW_DIR / "deploy-modal.yml")["jobs"]["deploy"]
     polls = sum(
         int(seconds)
@@ -682,11 +670,8 @@ def test_the_job_cap_leaves_room_for_a_rollback_after_every_wait_is_exhausted():
         gate_module.CANARY_TIMEOUT_SECONDS
         + gate_module._DEFAULT_ACCOUNTING_DEADLINE_SECONDS
         + gate_module._HEALTH_ROLLOUT_DEADLINE_SECONDS
-        + 15  # rollback schema probe
     )
-    # two `modal deploy` invocations (forward and restore), image build included, plus checkout and
-    # dependency installation. deliberately generous: the assertion should fail while there is still
-    # headroom to fix, not at the moment a real run gets killed.
+    # Allow for controller/serving deployment, image builds and dependency setup.
     deploy_allowance = 15 * 60
 
     required_minutes = (polls + gate_budget + deploy_allowance) / 60
@@ -694,7 +679,7 @@ def test_the_job_cap_leaves_room_for_a_rollback_after_every_wait_is_exhausted():
         f"the deploy job caps at {job['timeout-minutes']}m, but its own declared waits "
         f"({polls}s of polls + {gate_budget:.0f}s of gate budget) plus a "
         f"{deploy_allowance // 60}m deploy allowance need {required_minutes:.1f}m. A cap below that "
-        "can kill the job mid-rollback and leave a broken release serving."
+        "can terminate the job before promotion validation completes."
     )
 
 
@@ -710,18 +695,6 @@ def test_the_promotion_canary_receives_its_credentials_only_through_the_environm
     assert "SUPABASE_SERVICE_ROLE_KEY" in env
     for secret in ("FREESOLO_INTERNAL_KEY", "SUPABASE_SERVICE_ROLE_KEY", "secrets."):
         assert secret not in canary["run"]
-
-
-def test_the_previous_release_is_captured_before_the_deploy_overwrites_it():
-    """`modal deploy` replaces the app in place, so the predecessor is unrecoverable afterwards.
-
-    The gate step reads the live app's sha for its own diff bound; publishing it as an output is
-    what makes rollback possible at all. Reading it only on the non-dispatch path would leave a
-    manually dispatched deploy one-way.
-    """
-    gate = _deploy_steps()[_step_index("Decide whether to deploy")]
-    assert 'previous_sha=$last_deployed_sha" >> "$GITHUB_OUTPUT' in gate["run"]
-    assert _step_index("Decide whether to deploy") < _step_index("Deploy serving")
 
 
 PREVIOUS = "1111111111111111111111111111111111111111"
@@ -764,338 +737,6 @@ def test_explicit_reruns_reverify_even_when_the_current_sha_is_already_live(
         )
         assert completed.returncode == 0, completed.stderr
         assert f"deploy={expected}" in output.read_text().splitlines()
-
-
-def _run_rollback(
-    *,
-    previous_sha: str,
-    is_ancestor: bool,
-    health: str,
-    entrypoint: str | None = "flash/serving/app/modal_app.py",
-    schema_status: str = "200",
-    has_schema_contract: bool = True,
-    compatibility_failure: str | None = None,
-) -> tuple[int, str, str]:
-    """Execute the rollback script with `modal`, `curl`, `git`, and `sleep` stubbed on PATH.
-
-    RUN it rather than grep it, for the same reason the dispatch and fork guards above are run:
-    a substring is present in a step that never reaches the branch containing it. Every assertion
-    below reads an OBSERVABLE effect -- did `modal deploy` get invoked, with which identity, and
-    did the step exit nonzero -- so a rewritten step that echoed the right strings without
-    redeploying would be red here and green under a grep.
-
-    `modal`'s recorded invocation is returned separately from the step's stdout/stderr; blending
-    them would reintroduce the same weakness one layer out, since the script also echoes the sha
-    it intends to restore.
-    """
-    with tempfile.TemporaryDirectory() as tmp:
-        root = Path(tmp)
-        bin_dir = root / "bin"
-        bin_dir.mkdir()
-        # the working tree starts at the new layout; checkout installs the predecessor's layout.
-        app = root / "flash/serving/app/modal_app.py"
-        app.parent.mkdir(parents=True, exist_ok=True)
-        app.touch()
-        # Run the real snapshot/preparation commands against a tiny forward package.
-        # Checkout below removes this helper, proving it was saved before checkout.
-        for package in (
-            "flash",
-            "flash/serving",
-            "flash/serving/app",
-            "flash/serving/src",
-            "flash/serving/src/engine",
-        ):
-            directory = root / package
-            directory.mkdir(parents=True, exist_ok=True)
-            (directory / "__init__.py").touch()
-        shutil.copyfile(REPO_ROOT / "flash/serving/app/rollback.py", app.parent / "rollback.py")
-        (app.parent / "rollout.py").write_text(
-            'LEGACY_ENGINE_KEYS = {"base": ("L40S", 4)}\n'
-            'def model_engine_name(model): return "StableEngine"\n'
-        )
-        (app.parent / "timeouts.py").write_text("ROUTER_TIMEOUT_SECONDS = 60\n")
-        (root / "flash/serving/src/engine/model_config.py").write_text(
-            'def base_models(): return ["base"]\n'
-        )
-        if compatibility_failure == "snapshot":
-            (app.parent / "rollback.py").write_text('raise RuntimeError("snapshot unavailable")\n')
-        columns_path = root / (
-            "flash/serving/src/persisted_columns.py"
-            if entrypoint == "flash/serving/modal_app.py"
-            else "flash/serving/src/store/persisted_columns.py"
-        )
-        if has_schema_contract:
-            columns_path.parent.mkdir(parents=True, exist_ok=True)
-            columns_path.write_text('PERSISTED_COLUMNS = "adapter_id,base_model"\n')
-        calls = root / "modal-calls.txt"
-        (bin_dir / "modal").write_text(
-            '#!/bin/sh\n[ "$2" = "--strategy" ] && [ "$3" = "rolling" ] || exit 2\n'
-            '[ -f "$4" ] && [ -f flash/serving/_rollback_compat.py ] || exit 2\n'
-            'grep -q "install_compatibility(globals()" "$4" || exit 2\n'
-            'printf "%s sha=%s id=%s\\n" "$*" "$FREESOLO_DEPLOYMENT_SHA" '
-            '"$FREESOLO_DEPLOYMENT_ID" >> "$MODAL_CALLS"\nexit 0\n'
-        )
-        # the health body is served from a file; `--output` is where the script wants it.
-        (bin_dir / "curl").write_text(
-            '#!/bin/sh\ncase "$*" in\n'
-            '  *hosted_lora_adapters*) printf "%s" "$SCHEMA_STATUS"; exit 0;;\n'
-            'esac\nfor arg in "$@"; do\n'
-            '  if [ "$prev" = "--output" ]; then out="$arg"; fi\n  prev="$arg"\ndone\n'
-            'printf "%s" "$HEALTH_BODY" > "$out"\nexit 0\n'
-        )
-        # ancestry comes from the fixture, while checkout changes the files visible to rollback.
-        (bin_dir / "git").write_text(
-            '#!/bin/sh\nif [ "$1" = "merge-base" ]; then exit "$ANCESTOR_EXIT"; fi\n'
-            'if [ "$1" = "checkout" ]; then\n'
-            "  rm -f flash/serving/app/modal_app.py flash/serving/modal_app.py\n"
-            '  if [ -n "$RESTORED_ENTRYPOINT" ]; then\n'
-            '    mkdir -p "$(dirname "$RESTORED_ENTRYPOINT")"\n'
-            '    printf "%s" "$RESTORED_SOURCE" > "$RESTORED_ENTRYPOINT"\n'
-            "    rm -f flash/serving/app/rollback.py\n"
-            "  fi\nfi\nexit 0\n"
-        )
-        for stub in bin_dir.iterdir():
-            stub.chmod(0o755)
-
-        # `sleep` is shadowed by a shell FUNCTION, not a PATH stub. The verification loop is bounded
-        # by `$SECONDS`, which is wall-clock, so a stub that merely returns fast spins for the full
-        # real 300s -- the deadline advances whether anything sleeps or not. A function runs in the
-        # script's own shell, where `SECONDS` is assignable, so the loop's structure is preserved
-        # (same number of naps, same deadline arithmetic) while virtual time moves in place of real
-        # time.
-        script = (
-            "sleep() { SECONDS=$((SECONDS + 60)); }\n"
-            + (_deploy_steps()[_step_index("Restore the previous release")]["run"])
-        )
-        completed = subprocess.run(
-            ["bash", "-c", script],
-            capture_output=True,
-            text=True,
-            cwd=tmp,
-            env={
-                "PATH": f"{bin_dir}:{os.environ.get('PATH', '')}",
-                "MODAL_CALLS": str(calls),
-                "RESTORED_ENTRYPOINT": entrypoint or "",
-                "RESTORED_SOURCE": (
-                    "unknown = True\n"
-                    if compatibility_failure == "prepare"
-                    else '@app.function(timeout=900)\ndef router():\n    return "previous router"\n'
-                ),
-                "HEALTH_URL": "https://serve.example/healthz",
-                "ANCESTOR_EXIT": "0" if is_ancestor else "1",
-                "HEALTH_BODY": health,
-                "SCHEMA_STATUS": schema_status,
-                "SUPABASE_URL": "https://supabase.example",
-                "SUPABASE_SERVICE_ROLE_KEY": "sb_secret_test",
-                "PREVIOUS_SHA": previous_sha,
-                "CURRENT_SHA": CURRENT,
-                "ROLLBACK_DEPLOYMENT_ID": "9-1-rollback",
-            },
-        )
-        recorded = calls.read_text() if calls.exists() else ""
-        return completed.returncode, recorded, completed.stdout + completed.stderr
-
-
-def _health(sha: str, deployment_id: str, ok: bool = True) -> str:
-    return json.dumps({"ok": ok, "deployment_sha": sha, "deployment_id": deployment_id})
-
-
-def test_the_rollback_step_fires_on_failure_with_a_distinct_attempt_id():
-    """Wiring the script cannot prove: `if:` and `env:` are read by Actions, not by the shell.
-
-    The attempt id must differ from the forward deploy's, or the readiness identity already
-    published by the failed release would satisfy the restore check without anything being
-    restored.
-    """
-    rollback = _deploy_steps()[_step_index("Restore the previous release")]
-    assert rollback["if"].startswith("failure()")
-    env = rollback.get("env") or {}
-    assert env.get("PREVIOUS_SHA") == "${{ steps.gate.outputs.previous_sha }}"
-    assert env.get("ROLLBACK_DEPLOYMENT_ID", "").endswith("-rollback")
-    assert env["ROLLBACK_DEPLOYMENT_ID"] != "${{ github.run_id }}-${{ github.run_attempt }}"
-
-
-def test_a_failed_promotion_restores_the_previous_release_and_still_fails_the_job():
-    """The redeploy must carry the PREVIOUS sha, and a restore must never turn the run green.
-
-    A green run would mark an unpromotable commit as deployed: the next push diffs against a sha
-    that never passed its gate and skips the deploy entirely, so the failure compounds silently.
-    """
-    code, deployed, logged = _run_rollback(
-        previous_sha=PREVIOUS,
-        is_ancestor=True,
-        health=_health(PREVIOUS, "9-1-rollback"),
-    )
-
-    assert f"sha={PREVIOUS}" in deployed, f"the redeploy did not carry the restored sha: {deployed}"
-    assert "id=9-1-rollback" in deployed
-    assert "flash/serving/app/modal_app.py" in deployed
-    assert code != 0, "a completed rollback exited 0 -- this commit would be recorded as deployed"
-    assert "is NOT deployed" in logged
-
-
-@pytest.mark.parametrize("phase", ["snapshot", "prepare"])
-def test_rollback_never_deploys_without_retaining_forward_handles(phase):
-    code, deployed, logged = _run_rollback(
-        previous_sha=PREVIOUS,
-        is_ancestor=True,
-        health=_health(PREVIOUS, "9-1-rollback"),
-        compatibility_failure=phase,
-    )
-    assert code != 0
-    assert deployed == ""
-    assert "refusing unsafe rollback" in logged
-
-
-@pytest.mark.parametrize(
-    ("health", "why"),
-    [
-        (_health(CURRENT, "9-1"), "the broken release is still live"),
-        (_health(CURRENT, "9-1-rollback"), "stale sha under the rollback's own attempt id"),
-        (_health(PREVIOUS, "9-1"), "restored sha under the FORWARD deploy's attempt id"),
-        (_health(PREVIOUS, "9-1-rollback", ok=False), "right identity, but not serving"),
-    ],
-)
-def test_a_rollback_that_never_reports_the_restored_release_is_not_a_rollback(health, why):
-    """`modal deploy` exiting zero says the app was REPLACED, not that it came up serving.
-
-    This is the case a substring test cannot see: the identity comparison is present in the script
-    either way, so what matters is that a live app failing it is rejected rather than read as a
-    completed restore.
-
-    Each field is failed ALONE. A single fixture with everything wrong lets any one surviving check
-    mask the others -- disabling the sha comparison outright left such a test green, because the
-    attempt id was stale in the same body and failed first. Three of these four cases exist only to
-    make each comparison independently load-bearing.
-    """
-    code, deployed, logged = _run_rollback(previous_sha=PREVIOUS, is_ancestor=True, health=health)
-
-    assert f"sha={PREVIOUS}" in deployed, "the restore was never attempted"
-    assert code != 0, f"a rollback was accepted with {why}"
-    assert "never reported the restored release" in logged
-    assert "intervene manually" in logged
-
-
-@pytest.mark.parametrize(
-    ("previous_sha", "is_ancestor", "expected"),
-    [
-        ("", True, "NO previous release was recorded"),
-        (PREVIOUS, False, "is not an ancestor"),
-    ],
-)
-def test_rollback_refuses_a_previous_release_it_cannot_verify(previous_sha, is_ancestor, expected):
-    """An empty or non-ancestor sha must stop WITHOUT deploying, not redeploy an unknown tree.
-
-    Asserting the guard's text alone would pass on a script that printed the refusal and redeployed
-    anyway. The load-bearing assertion is that `modal` was never invoked.
-    """
-    code, deployed, logged = _run_rollback(
-        previous_sha=previous_sha, is_ancestor=is_ancestor, health=_health(PREVIOUS, "9-1-rollback")
-    )
-
-    assert deployed == "", f"an unverifiable predecessor was redeployed anyway: {deployed}"
-    assert code != 0
-    assert expected in logged
-    assert "Restore production manually" in logged
-
-
-def _rollback_fires(*, deploy_outcome: str, job_failed: bool = True) -> bool:
-    """Evaluate the rollback step's `if:` the way Actions would, for one step-outcome scenario.
-
-    Asserting the condition's text (`startswith("failure()")`) passes whether or not the guard that
-    keeps a pre-deploy failure from restoring is present at all. The expression is the thing under
-    test, so it has to be evaluated, not matched.
-    """
-    expression = _deploy_steps()[_step_index("Restore the previous release")]["if"]
-    python = (
-        expression.replace("&&", "and")
-        .replace("||", "or")
-        .replace("failure()", repr(job_failed))
-        .replace("steps.gate.outputs.deploy", repr("true"))
-        .replace("steps.deploy_serving.outcome", repr(deploy_outcome))
-    )
-    assert "steps." not in python, f"unresolved step reference in {expression!r}"
-    # the expression comes from our own workflow file, with every step reference substituted out.
-    return bool(eval(python))
-
-
-def test_a_failure_before_the_deploy_never_restores_over_an_untouched_production():
-    """The steps that verify secrets and auth run BEFORE any deploy, under the same gate output.
-
-    If those satisfy the rollback condition, a run that never replaced production would `modal
-    deploy` the previous sha over a live healthy app -- using the very secret set whose verification
-    just failed. Restoring is only meaningful when this run actually deployed something.
-    """
-    steps = _deploy_steps()
-    deploy_index = _step_index("Deploy serving")
-    assert steps[deploy_index].get("id") == "deploy_serving", (
-        "the rollback guard keys off the deploy step's id; without it the guard silently "
-        "evaluates an empty outcome"
-    )
-    for step in steps[:deploy_index]:
-        assert step.get("name") != "Restore the previous release"
-
-    # skipped and empty are the two outcomes a step that never ran reports.
-    assert not _rollback_fires(deploy_outcome="skipped")
-    assert not _rollback_fires(deploy_outcome="")
-
-    # a deploy that ran -- whether it succeeded and failed readiness later, or failed partway --
-    # leaves the new release live, so both must still restore.
-    assert _rollback_fires(deploy_outcome="success")
-    assert _rollback_fires(deploy_outcome="failure")
-
-    # and a green run never restores, whatever the deploy did.
-    assert not _rollback_fires(deploy_outcome="success", job_failed=False)
-
-
-def test_rollback_can_restore_a_release_before_the_serving_source_move():
-    code, deployed, logged = _run_rollback(
-        previous_sha=PREVIOUS,
-        is_ancestor=True,
-        health=_health(PREVIOUS, "9-1-rollback"),
-        entrypoint="flash/serving/modal_app.py",
-    )
-    assert "deploy --strategy rolling flash/serving/modal_app.py" in deployed
-    assert f"sha={PREVIOUS}" in deployed
-    assert code != 0
-    assert "is NOT deployed" in logged
-
-
-def test_rollback_refuses_a_release_without_a_serving_entrypoint():
-    code, deployed, logged = _run_rollback(
-        previous_sha=PREVIOUS,
-        is_ancestor=True,
-        health=_health(PREVIOUS, "9-1-rollback"),
-        entrypoint=None,
-    )
-    assert code != 0
-    assert deployed == ""
-    assert "no supported serving entrypoint" in logged
-
-
-@pytest.mark.parametrize("schema_status", ["400", "401", "500", "000"])
-def test_rollback_does_not_deploy_an_unverified_database_contract(schema_status):
-    code, deployed, logged = _run_rollback(
-        previous_sha=PREVIOUS,
-        is_ancestor=True,
-        health=_health(PREVIOUS, "9-1-rollback"),
-        schema_status=schema_status,
-    )
-    assert code != 0
-    assert deployed == ""
-    assert "refusing rollback" in logged
-
-
-def test_rollback_does_not_deploy_without_a_schema_contract():
-    code, deployed, logged = _run_rollback(
-        previous_sha=PREVIOUS,
-        is_ancestor=True,
-        health=_health(PREVIOUS, "9-1-rollback"),
-        has_schema_contract=False,
-    )
-    assert code != 0
-    assert deployed == ""
-    assert "Cannot verify" in logged
 
 
 @pytest.mark.parametrize("org_id", ["", "   ", "invalid", "11111111-2222-4333-8444-555555555555"])
@@ -1169,3 +810,53 @@ def test_serving_publish_tags_support_feature_branches(branch, tmp_path):
     assert (env["IMAGE"] + ":latest" in refs) is (branch == "main")
     if branch == "dev":
         assert env["IMAGE"] + ":dev" in refs
+
+
+def test_promotion_failure_has_no_automatic_redeployment_path():
+    steps = _deploy_steps()
+    scripts = "\n".join(step.get("run", "") for step in steps)
+    assert "flash.serving.app.rollback" not in scripts
+    assert "$PREVIOUS_SHA" not in scripts
+    assert not any(
+        "modal deploy" in step.get("run", "") and "failure()" in str(step.get("if", ""))
+        for step in steps
+    )
+    canary = steps[_step_index("real streaming canary")]
+    assert not canary.get("continue-on-error", False)
+
+
+@pytest.mark.parametrize("workflow", ["deploy-modal.yml", "deploy-modal-dev.yml"])
+@pytest.mark.parametrize(
+    ("mode", "key", "success", "enabled"),
+    [
+        ("modal", "", True, "false"),
+        ("lambda", "", False, None),
+        ("lambda", "test-key", True, "true"),
+        ("all", "test-key", True, "true"),
+        ("bad-mode", "test-key", False, None),
+    ],
+)
+def test_provider_deployment_requires_lambda_only_when_enabled(
+    workflow, mode, key, success, enabled, tmp_path
+):
+    job = _load(WORKFLOW_DIR / workflow)["jobs"]["deploy"]
+    step = next(s for s in _steps(job) if s.get("name") == "Validate inference provider")
+    target = tmp_path / "flash/serving/app/inference_provider.py"
+    target.parent.mkdir(parents=True)
+    source = (REPO_ROOT / "flash/serving/app/inference_provider.py").read_text()
+    target.write_text(
+        source.replace('INFERENCE_PROVIDER = "lambda"', f'INFERENCE_PROVIDER = "{mode}"')
+    )
+    output = tmp_path / "outputs"
+    result = subprocess.run(
+        ["bash", "-e", "-c", step["run"]],
+        cwd=tmp_path,
+        env={**os.environ, "LAMBDA_API_KEY": key, "GITHUB_OUTPUT": str(output)},
+        capture_output=True,
+        text=True,
+    )
+    assert (result.returncode == 0) is success
+    if success:
+        assert output.read_text() == f"lambda_enabled={enabled}\n"
+    control = next(s for s in _steps(job) if s.get("name") == "Deploy Lambda fleet control")
+    assert "steps.provider.outputs.lambda_enabled == 'true'" in control["if"]

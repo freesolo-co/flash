@@ -41,9 +41,8 @@ jobs:
     if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     # Include the full router drain window before the canary, its GPU cold start,
-    # accounting settlement, image builds, and a rollback with its own readiness
-    # poll. The workflow contract test sums these budgets so rollback is never
-    # cut off by the job timeout.
+    # accounting settlement and image builds. The workflow contract test checks
+    # these budgets against the job timeout.
     timeout-minutes: 300
     # serialize serving deploys across runs because each deploy mutates the live app. github can still
     # replace a pending run, so the gate compares against the sha reported by the deployed app rather
@@ -98,12 +97,7 @@ jobs:
           DEPLOYED_HEALTH_URL: https://serve.freesolo.co/healthz
         run: |
           deploy=false
-          # the sha reported by the LIVE app is read ONCE, before any decision, because it serves
-          # two purposes: it bounds the undeployed diff below, and it is the rollback target for a
-          # failed promotion. `modal deploy` overwrites the app in place, so after that point there
-          # is no way left to ask what the previous release was. reading it on workflow_dispatch
-          # too -- where the deploy decision does not need it -- is what makes a dispatched deploy
-          # rollback-capable rather than one-way.
+          # Read the live revision to bound the undeployed diff.
           read_ok=true
           last_deployed_sha="$(python3 - <<'PY'
           import json
@@ -127,11 +121,8 @@ jobs:
           if [ "$read_ok" != "true" ]; then
             last_deployed_sha=""
           fi
-          # an empty previous sha means rollback is IMPOSSIBLE for this run. the rollback step below
-          # says so out loud rather than reporting a restore it never performed.
-          echo "previous_sha=$last_deployed_sha" >> "$GITHUB_OUTPUT"
 
-          # A failed promotion may leave this SHA live after refusing rollback.
+          # A failed promotion may leave this SHA live; an explicit rerun must reverify it.
           # An explicit rerun must re-prove it, not pass by skipping the canary.
           if [ "$EVENT" = "workflow_dispatch" ] || [ "${GITHUB_RUN_ATTEMPT:-1}" -gt 1 ]; then
             deploy=true
@@ -320,9 +311,24 @@ jobs:
             sleep "$sleep_seconds"
           done
 
-      # This app survives a serving rollback so orphan VM cleanup continues.
-      - name: Deploy Lambda fleet control
+      # This independent app keeps orphan VM cleanup running across serving releases.
+      - name: Validate inference provider
+        id: provider
         if: steps.gate.outputs.deploy == 'true'
+        run: |
+          python3 - <<'PYCODE'
+          import os
+          import runpy
+          policy = runpy.run_path("flash/serving/app/inference_provider.py")
+          enabled = policy["INFERENCE_PROVIDER"] != "modal"
+          if enabled and not os.environ.get("LAMBDA_API_KEY"):
+              raise SystemExit("LAMBDA_API_KEY is required for lambda/all inference")
+          with open(os.environ["GITHUB_OUTPUT"], "a") as output:
+              output.write(f"lambda_enabled={str(enabled).lower()}\n")
+          PYCODE
+
+      - name: Deploy Lambda fleet control
+        if: steps.gate.outputs.deploy == 'true' && steps.provider.outputs.lambda_enabled == 'true'
         run: modal deploy --strategy rolling --env main -m flash.serving.lambda_cloud.control_app
 
       - name: Deploy serving
@@ -447,143 +453,6 @@ jobs:
         # credentials reach the gate ONLY through the environment above. passing any of them as an
         # argument would put them in the process table and in the step's own command echo.
         run: python -m flash.serving.promotion.gate
-
-      - name: Restore the previous release
-        # `failure()` alone is too broad. It also fires for the steps that run BEFORE any deploy --
-        # installing Modal, verifying auth, verifying the runtime secrets, waiting for the adapter
-        # schema. Restoring there would `modal deploy` the previous SHA over a live app this run never
-        # replaced, using the very secret set whose verification just failed: a healthy release
-        # overwritten by a rollback that had nothing to roll back. Gating on the deploy step's own
-        # outcome keeps the case the previous comment was right about -- a deploy that half-succeeded
-        # and then failed readiness is `failure`, not skipped, so it still restores. Any outcome other
-        # than an attempted deploy (empty, `skipped`) means production is untouched and must stay so.
-        if: >-
-          failure() && steps.gate.outputs.deploy == 'true'
-          && (steps.deploy_serving.outcome == 'success' || steps.deploy_serving.outcome == 'failure')
-        working-directory: .
-        env:
-          PREVIOUS_SHA: ${{ steps.gate.outputs.previous_sha }}
-          CURRENT_SHA: ${{ github.sha }}
-          # a distinct attempt id so /healthz cannot report the FORWARD deploy's identity and be
-          # mistaken for a completed rollback.
-          ROLLBACK_DEPLOYMENT_ID: ${{ github.run_id }}-${{ github.run_attempt }}-rollback
-          HEALTH_URL: https://serve.freesolo.co/healthz
-        run: |
-          set -euo pipefail
-          if [ -z "$PREVIOUS_SHA" ]; then
-            echo "::error::Promotion failed and NO previous release was recorded, so the broken release is still live. Restore production manually."
-            exit 1
-          fi
-          if ! git merge-base --is-ancestor "$PREVIOUS_SHA" "$CURRENT_SHA" 2>/dev/null; then
-            # refusing here is the safe branch: redeploying a sha that is not an ancestor of this
-            # head would deploy an unknown tree rather than the release that was actually live.
-            echo "::error::Recorded previous release ${PREVIOUS_SHA} is not an ancestor of ${CURRENT_SHA}; refusing to redeploy an unverified tree. Restore production manually."
-            exit 1
-          fi
-
-          # Capture the forward dispatch contract before checkout removes its code.
-          # A bare predecessor deploy deletes new engine handles held by live routers.
-          rollback_bundle="$(mktemp -d)"
-          trap 'rm -rf "$rollback_bundle"' EXIT
-          if ! python -m flash.serving.app.rollback snapshot \
-            --source-sha "$CURRENT_SHA" --directory "$rollback_bundle"; then
-            echo "::error::Cannot preserve forward engine identities; refusing unsafe rollback."
-            exit 1
-          fi
-          echo "Promotion failed; restoring ${PREVIOUS_SHA}."
-          git checkout --quiet --force "$PREVIOUS_SHA"
-
-          # resolve the entrypoint in the restored tree, including releases before the source move.
-          if [ -f flash/serving/app/modal_app.py ]; then
-            rollback_app=flash/serving/app/modal_app.py
-          elif [ -f flash/serving/modal_app.py ]; then
-            rollback_app=flash/serving/modal_app.py
-          else
-            echo "::error::Previous release has no supported serving entrypoint. Restore production manually."
-            exit 1
-          fi
-
-          # A source ancestor can be incompatible after an irreversible schema cutover.
-          # Probe its own column contract before replacing the schema-compatible app.
-          columns_file=flash/serving/src/store/persisted_columns.py
-          if [ ! -f "$columns_file" ]; then
-            columns_file=flash/serving/src/persisted_columns.py
-          fi
-          if ! columns="$(python -c 'import runpy, sys; print(runpy.run_path(sys.argv[1])["PERSISTED_COLUMNS"])' "$columns_file")" || [ -z "$columns" ]; then
-            echo "::error::Cannot verify the previous release's schema contract; refusing rollback. Restore production manually."
-            exit 1
-          fi
-          if ! schema_status="$(curl --silent --show-error --output /dev/null --write-out '%{http_code}' \
-            --connect-timeout 5 --max-time 15 \
-            --header "apikey: $SUPABASE_SERVICE_ROLE_KEY" --header "Accept-Profile: flash" \
-            "${SUPABASE_URL%/}/rest/v1/hosted_lora_adapters?select=${columns}&limit=1")" || [ "$schema_status" != "200" ]; then
-            echo "::error::Previous release is not compatible with the current database schema or its schema could not be verified; refusing rollback. Restore production manually."
-            exit 1
-          fi
-
-          # Build a compatibility artifact from the predecessor: retain forward handles,
-          # restore the predecessor's engine implementation, and gate router startup on
-          # active restored pools. Failure occurs before Modal mutates the deployment.
-          if ! python "$rollback_bundle/rollback.py" prepare \
-            --manifest "$rollback_bundle/manifest.json" --entrypoint "$rollback_app"; then
-            echo "::error::Previous release cannot retain active engine handles; refusing unsafe rollback."
-            exit 1
-          fi
-
-          # The source behavior is the predecessor; the distinct attempt identifies
-          # this rollback artifact and its forward-handle compatibility overlay.
-          FREESOLO_DEPLOYMENT_SHA="$PREVIOUS_SHA" \
-          FREESOLO_DEPLOYMENT_ID="$ROLLBACK_DEPLOYMENT_ID" \
-            modal deploy --strategy rolling "$rollback_app"
-
-          response_file="$(mktemp)"
-          trap 'rm -f "$response_file"; rm -rf "$rollback_bundle"' EXIT
-          # Match router startup: its full engine budget plus 60 seconds of headroom.
-          deadline=$((SECONDS + 3660))
-          restored=false
-          while (( SECONDS < deadline )); do
-            if curl --silent --show-error --output "$response_file" --fail \
-              --connect-timeout 5 --max-time 10 "$HEALTH_URL"; then
-              if python3 - "$response_file" "$PREVIOUS_SHA" "$ROLLBACK_DEPLOYMENT_ID" <<'PY'
-          import json
-          import sys
-
-
-          def reject_constant(_value: str) -> None:
-              raise ValueError
-
-
-          try:
-              with open(sys.argv[1], encoding="utf-8") as response:
-                  payload = json.load(response, parse_constant=reject_constant)
-          except (OSError, UnicodeDecodeError, ValueError):
-              sys.exit(1)
-
-          restored = (
-              isinstance(payload, dict)
-              and payload.get("ok") is True
-              and payload.get("deployment_sha") == sys.argv[2]
-              and payload.get("deployment_id") == sys.argv[3]
-          )
-          sys.exit(0 if restored else 1)
-          PY
-              then
-                restored=true
-                break
-              fi
-            fi
-            sleep 10
-          done
-
-          if [ "$restored" != "true" ]; then
-            echo "::error::Rollback to ${PREVIOUS_SHA} was deployed but production never reported the restored release. Production may be serving a broken release; intervene manually."
-            exit 1
-          fi
-          # exit nonzero regardless: a restored predecessor means production is serving again, NOT
-          # that this promotion succeeded. reporting green here would mark an unpromotable commit as
-          # deployed and let the next push build on a release that never passed its gate.
-          echo "::error::Promotion failed; production was restored to ${PREVIOUS_SHA}. This commit is NOT deployed."
-          exit 1
 
       - name: Nothing to deploy
         if: steps.gate.outputs.deploy != 'true'

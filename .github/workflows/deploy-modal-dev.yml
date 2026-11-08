@@ -231,9 +231,24 @@ jobs:
           fi
           echo "Development Supabase flash.hosted_lora_adapters is queryable."
 
-      # This app survives a serving rollback so orphan VM cleanup continues.
-      - name: Deploy Lambda fleet control
+      # This independent app keeps orphan VM cleanup running across serving releases.
+      - name: Validate inference provider
+        id: provider
         if: steps.gate.outputs.deploy == 'true'
+        run: |
+          python3 - <<'PYCODE'
+          import os
+          import runpy
+          policy = runpy.run_path("flash/serving/app/inference_provider.py")
+          enabled = policy["INFERENCE_PROVIDER"] != "modal"
+          if enabled and not os.environ.get("LAMBDA_API_KEY"):
+              raise SystemExit("LAMBDA_API_KEY is required for lambda/all inference")
+          with open(os.environ["GITHUB_OUTPUT"], "a") as output:
+              output.write(f"lambda_enabled={str(enabled).lower()}\n")
+          PYCODE
+
+      - name: Deploy Lambda fleet control
+        if: steps.gate.outputs.deploy == 'true' && steps.provider.outputs.lambda_enabled == 'true'
         run: modal deploy --strategy rolling --env dev -m flash.serving.lambda_cloud.control_app
 
       - name: Deploy development serving
