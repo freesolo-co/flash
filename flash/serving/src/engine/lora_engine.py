@@ -106,7 +106,9 @@ class _LoraEngineImpl(TextPromptTokenizer):
             self.base_model,
             self.settings,
             cfg,
+            overrides=getattr(self, "engine_overrides", None),
         )
+        self._loaded_engine_overrides = _overrides
         # Cloning the Rust tokenizer can hold the GIL for seconds, even in a
         # worker thread. Finish it before readiness so the first request cannot
         # starve the stream's control-lease watcher (or other admitted requests).
@@ -693,9 +695,18 @@ class _LoraEngineImpl(TextPromptTokenizer):
 
         from flash.serving.src.store import settings as cfg
 
-        _ov = engine_overrides_for(self.base_model)
+        _ov = getattr(self, "_loaded_engine_overrides", None) or engine_overrides_for(
+            self.base_model
+        )
         _served_model = _ov.get("serve_model_id") or self.base_model
-        _revisions = immutable_serving_revisions(self.base_model)
+        _revisions = {
+            **immutable_serving_revisions(self.base_model),
+            **{
+                key: _ov[key]
+                for key in ("model_revision", "tokenizer_revision", "processor_revision")
+                if _ov.get(key)
+            },
+        }
         _tokenizer_model = tokenizer_model_for(self.base_model)
         _processor_model = _tokenizer_model if supports_image_input(self.base_model) else None
         _immutable_identity = (

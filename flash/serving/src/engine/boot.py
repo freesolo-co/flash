@@ -170,6 +170,8 @@ def engine_args_for(
     if "max_num_seqs" in overrides:
         extra["max_num_seqs"] = int(overrides["max_num_seqs"])
     extra.update(_multimodal_args(base_model))
+    if "quantization_config" in overrides:
+        extra["quantization_config"] = overrides["quantization_config"]
 
     parser = overrides.get("reasoning_parser")
     reasoning_parser = str(parser) if parser else None
@@ -220,9 +222,10 @@ def load_engine_config(
     base_model: str,
     settings: Any,
     cfg: Any,
+    overrides: dict[str, Any] | None = None,
 ) -> tuple[Any, Any, dict[str, Any], dict[str, Any]]:
     """Resolve tokenizer, overrides, and engine kwargs for one engine startup."""
     processor, tokenizer = load_tokenizer(base_model, settings, cfg)
-    overrides = engine_overrides_for(base_model)
+    overrides = engine_overrides_for(base_model) if overrides is None else dict(overrides)
     kwargs = engine_args_for(base_model, overrides, cfg)
     return processor, tokenizer, overrides, kwargs

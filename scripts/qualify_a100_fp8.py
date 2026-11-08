@@ -1,4 +1,4 @@
-"""Isolated A100 FP8-weight qualification; never changes production placement."""
+"""Isolated A10G/A100/H200 FP8 qualification; never changes production placement."""
 
 import asyncio
 import json
@@ -202,7 +202,9 @@ async def expert_lora_smoke(engine, model, rank):
     single_use_containers=True,
     timeout=3600,
 )
-async def qualify(model, fp8_revision="", selective=False, online_dense=False, tensor_parallel=1):
+async def qualify(
+    model, fp8_revision="", selective=False, online_dense=False, tensor_parallel=1, gpu="A100-80GB"
+):
     import torch
     from vllm import SamplingParams
 
@@ -219,10 +221,10 @@ async def qualify(model, fp8_revision="", selective=False, online_dense=False, t
         "device_count": torch.cuda.device_count(),
         "device": torch.cuda.get_device_name(0),
         "gpu_bytes": torch.cuda.get_device_properties(0).total_memory,
-        "scope": f"FP8 candidate weights / 16-bit activations; {tensor_parallel} x A100 80GB; catalog context and LoRA buffers unchanged",
+        "scope": f"FP8 candidate weights; {tensor_parallel} x {gpu}; catalog context and LoRA buffers unchanged",
     }
     config = model_config._BY_MODEL[model]
-    config["gpu"] = "A100-80GB"
+    config["gpu"] = gpu
     if model in ("Qwen/Qwen3.5-0.8B", "Qwen/Qwen3.5-4B"):
         config["engine"]["quantization"] = "fp8"
     if model == "Qwen/Qwen3.6-35B-A3B":
@@ -256,7 +258,7 @@ async def qualify(model, fp8_revision="", selective=False, online_dense=False, t
     result["settings"] = model_config.engine_overrides_for(model)
     engine = _LoraEngineImpl()
     engine.base_model = model
-    engine.pinned_gpu = "A100-80GB"
+    engine.pinned_gpu = gpu
     try:
         async with asyncio.timeout(3000):
             await engine._load()
@@ -352,6 +354,7 @@ def main(
     online_dense: bool = False,
     concurrency: int = 2,
     tensor_parallel: int = 1,
+    gpu: str = "A100-80GB",
 ):
     from huggingface_hub import model_info
 
@@ -371,11 +374,13 @@ def main(
         raise ValueError("qualification concurrency must be one or two")
     if tensor_parallel not in (1, 2):
         raise ValueError("qualification supports one or two GPUs")
-    function = qualify if tensor_parallel == 1 else qualify.with_options(gpu="A100-80GB:2")
+    if gpu not in ("A10G", "A100-80GB", "H100", "H200", "B200"):
+        raise ValueError("unsupported qualification GPU")
+    function = qualify.with_options(gpu=gpu if tensor_parallel == 1 else f"{gpu}:2")
     with ThreadPoolExecutor(max_workers=concurrency) as pool:
         pending = {
             pool.submit(
-                function.remote, model, revision, selective, online_dense, tensor_parallel
+                function.remote, model, revision, selective, online_dense, tensor_parallel, gpu
             ): model
             for model in selected
         }

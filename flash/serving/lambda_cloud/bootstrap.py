@@ -8,7 +8,7 @@ import subprocess
 import tempfile
 from pathlib import Path
 
-from .config import PORT, RUNTIME_IMAGE, SERVER_NAME, placement
+from .config import PORT, RUNTIME_IMAGE, SERVER_NAME
 
 GPU_SECRET_NAMES = (
     "HF_TOKEN",
@@ -57,12 +57,10 @@ def identity():
 def user_data(model, revision, credentials, tls):
     if not re.fullmatch(r"[0-9a-f]{40}", revision):
         raise ValueError("Lambda workers require an exact source commit")
-    _, gpu = placement(model)
     env = {name: credentials[name] for name in GPU_SECRET_NAMES if credentials.get(name)}
     env.update(
         {
             "FLASH_LAMBDA_MODEL": model,
-            "FLASH_LAMBDA_GPU": gpu,
             "FLASH_LAMBDA_TOKEN": tls["token"],
             "FREESOLO_DEPLOYMENT_SHA": revision,
             "HF_HOME": "/vol/hosting-cache",

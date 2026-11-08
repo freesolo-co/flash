@@ -460,7 +460,7 @@ def _build_engine(
     # modal.parameter() field). _health() reports THIS rather than re-deriving the tier from the base
     # model name, so a base model accidentally routed onto the wrong tier's class surfaces in health
     # instead of being masked by the expected-tier lookup.
-    _Engine.pinned_gpu = "B200" if gpu == "H200" else "H100"
+    _Engine.pinned_gpu = None  # Actual selected hardware is reported by worker health.
     # Give the REAL class its distinct, module-level identity BEFORE decorating. A clean (no-``<locals>``)
     # __qualname__ satisfies Modal's global-scope validation, and binding it as a module attribute under
     # that name makes ``getattr(module, class_name)`` resolve the class Modal re-imports in the container.

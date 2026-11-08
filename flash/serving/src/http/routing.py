@@ -9,7 +9,7 @@ from collections.abc import AsyncIterator
 from typing import Any, Protocol
 
 from flash.schema import parse_checkpoint_ref
-from flash.serving.lambda_cloud.config import placement
+from flash.serving.lambda_cloud.config import placements
 from flash.serving.src.engine.model_config import (
     gpu_for,
     is_supported_base_model,
@@ -122,7 +122,8 @@ def health_body(
     # not expose here. ``gpus`` is the supported base-model engine count and remains stable when
     # demand-driven containers scale to zero.
     gpu_by_model = {
-        m: placement(m)[1] if m.startswith("Qwen/") else gpu_for(m) for m in supported_models
+        m: " | ".join(placements(m)) if m.startswith("Qwen/") else gpu_for(m)
+        for m in supported_models
     }
     body = {
         "ok": True,
@@ -132,7 +133,7 @@ def health_body(
         "base_models": models,
         "gpus": len(supported_models),
         "gpu_by_model": gpu_by_model,
-        "gpu_tiers": sorted(set(gpu_by_model.values())),
+        "gpu_tiers": sorted({gpu for value in gpu_by_model.values() for gpu in value.split(" | ")}),
         "adapters": len(router.ready_adapters()),
     }
     if unsupported_models:

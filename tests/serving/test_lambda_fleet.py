@@ -5,7 +5,7 @@ import copy
 import httpx
 import pytest
 
-from flash.serving.lambda_cloud.config import LEASE_SECONDS, placement, select_region
+from flash.serving.lambda_cloud.config import LEASE_SECONDS, placements, select_region
 from flash.serving.lambda_cloud.fleet import Fleet
 
 
@@ -46,7 +46,15 @@ class API:
     async def call(self, method, path, body=None):
         if path == "instance-types":
             return {
-                "gpu_1x_h100_sxm5": {"regions_with_capacity_available": [{"name": "us-south-2"}]}
+                "gpu_1x_h100_sxm5": {
+                    "instance_type": {
+                        "gpu_description": "H100 (80 GB SXM5)",
+                        "architecture": "x86_64",
+                        "specs": {"gpus": 1},
+                        "price_cents_per_hour": 400,
+                    },
+                    "regions_with_capacity_available": [{"name": "us-south-2"}],
+                }
             }
         if path in {"firewall-rulesets", "filesystems"}:
             return [] if method == "GET" else {"id": "resource"}
@@ -124,10 +132,10 @@ async def test_release_finds_vm_after_launch_response_loss():
 
 
 def test_hardware_choices_and_capacity_fail_closed():
-    assert placement(MODEL) == ("gpu_1x_h100_sxm5", "H100")
-    assert placement("Qwen/Qwen3.6-35B-A3B") == ("gpu_1x_b200_sxm6", "B200")
+    assert placements(MODEL) == ("A100-80GB", "H100")
+    assert placements("Qwen/Qwen3.6-35B-A3B") == ("H200", "B200")
     with pytest.raises(ValueError, match="only defined"):
-        placement("deepseek-ai/DeepSeek-V4.1-Flash-1017")
+        placements("deepseek-ai/DeepSeek-V4.1-Flash-1017")
     with pytest.raises(RuntimeError, match="no US capacity"):
         select_region({}, MODEL)
 

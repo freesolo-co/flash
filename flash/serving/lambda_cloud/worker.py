@@ -14,22 +14,22 @@ from flash.serving.app.timeouts import REQUEST_TIMEOUT_SECONDS
 from flash.serving.src.engine.lora_engine import _LoraEngineImpl
 from flash.serving.src.engine.model_config import engine_overrides_for
 
-from .config import PORT, placement
+from .config import PORT, validate_gpu
 from .leases import GenerationLeases
+from .profiles import engine_profile
 
 
 class LambdaWorker(_LoraEngineImpl):
     async def _load(self):
         import torch
 
-        _, expected = placement(self.base_model)
-        if torch.cuda.device_count() != 1 or expected not in torch.cuda.get_device_name(0):
-            raise RuntimeError("Lambda worker received an unexpected GPU shape")
-        if (
-            torch.cuda.get_device_properties(0).total_memory
-            < (75 if expected == "H100" else 170) * 2**30
-        ):
-            raise RuntimeError("Lambda worker received a partitioned or undersized GPU")
+        self.pinned_gpu = validate_gpu(
+            self.base_model,
+            torch.cuda.get_device_name(0),
+            torch.cuda.get_device_properties(0).total_memory,
+            torch.cuda.device_count(),
+        )
+        self.engine_overrides = engine_profile(self.base_model, self.pinned_gpu)
         await super()._load()
 
     def _self_heal_if_dead(self, reason):
@@ -180,7 +180,6 @@ def main():
 
     engine = LambdaWorker()
     engine.base_model = os.environ["FLASH_LAMBDA_MODEL"]
-    _, engine.pinned_gpu = placement(engine.base_model)
     app = create_app(engine, os.environ["FLASH_LAMBDA_TOKEN"])
     uvicorn.run(
         app,
