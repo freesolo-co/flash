@@ -134,7 +134,7 @@ async def lora_smoke(engine, model, rank):
     single_use_containers=True,
     timeout=3600,
 )
-async def qualify(model, fp8_revision="", selective=False):
+async def qualify(model, fp8_revision="", selective=False, online_dense=False):
     import torch
     from vllm import SamplingParams
 
@@ -158,7 +158,13 @@ async def qualify(model, fp8_revision="", selective=False):
         config["engine"].update(
             serve_model_id=model + "-FP8", model_revision=fp8_revision, quantization="fp8"
         )
-    if selective and model in ("Qwen/Qwen3.5-0.8B", "Qwen/Qwen3.5-4B"):
+    if online_dense and model in ("Qwen/Qwen3.5-9B", "Qwen/Qwen3.5-9B-Base"):
+        config["engine"].update(
+            serve_model_id=model,
+            model_revision=config["engine"]["tokenizer_revision"],
+            quantization="fp8",
+        )
+    if (selective and model in ("Qwen/Qwen3.5-0.8B", "Qwen/Qwen3.5-4B")) or online_dense:
         from flash.serving.src.engine import boot
 
         original_args = boot.engine_args_for
@@ -231,6 +237,13 @@ async def qualify(model, fp8_revision="", selective=False):
         result["lora_qproj_smoke"] = await lora_smoke(
             engine, model, result["settings"]["max_lora_rank"]
         )
+        if not model.endswith("-Base"):
+            result["greeting_sanity_passed"] = (
+                "hello" in result["buffered"]["text"].lower()
+                and "hello" in events[-1]["choices"][0]["text"].lower()
+            )
+            if not result["greeting_sanity_passed"]:
+                raise RuntimeError("Execution succeeded but instruction-output sanity failed")
         result["status"] = "passed_base_and_qproj_lora"
         result["limitations"] = [
             "Synthetic zero q_proj adapter only; no full-expert or trained-adapter quality qualification",
@@ -247,7 +260,7 @@ async def qualify(model, fp8_revision="", selective=False):
 
 
 @app.local_entrypoint()
-def main(output: str, models: str = "", selective: bool = False):
+def main(output: str, models: str = "", selective: bool = False, online_dense: bool = False):
     from huggingface_hub import model_info
 
     from flash.serving.src.engine.model_config import base_models
@@ -262,7 +275,8 @@ def main(output: str, models: str = "", selective: bool = False):
 
     with ThreadPoolExecutor(max_workers=2) as pool:
         pending = {
-            pool.submit(qualify.remote, model, revision, selective): model for model in selected
+            pool.submit(qualify.remote, model, revision, selective, online_dense): model
+            for model in selected
         }
         for future in as_completed(pending):
             model = pending[future]
