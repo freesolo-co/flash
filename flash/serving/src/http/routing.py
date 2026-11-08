@@ -9,6 +9,8 @@ from collections.abc import AsyncIterator
 from typing import Any, Protocol
 
 from flash.schema import parse_checkpoint_ref
+from flash.serving.app.inference_provider import INFERENCE_PROVIDER, modal_gpus_for
+from flash.serving.lambda_cloud.config import placements
 from flash.serving.src.engine.model_config import (
     gpu_for,
     is_supported_base_model,
@@ -120,16 +122,30 @@ def health_body(
     # report configured per-model gpu tiers rather than live container counts, which modal does
     # not expose here. ``gpus`` is the supported base-model engine count and remains stable when
     # demand-driven containers scale to zero.
-    gpu_by_model = {m: gpu_for(m) for m in supported_models}
+    gpu_by_model = {
+        m: (
+            " | ".join(modal_gpus_for(m))
+            if INFERENCE_PROVIDER == "modal"
+            else " | ".join(
+                dict.fromkeys(
+                    [*placements(m), *(modal_gpus_for(m) if INFERENCE_PROVIDER == "all" else [])]
+                )
+            )
+        )
+        if m.startswith("Qwen/")
+        else gpu_for(m)
+        for m in supported_models
+    }
     body = {
         "ok": True,
+        "inference_provider": INFERENCE_PROVIDER,
         "deployment_sha": deployment_sha,
         "deployment_id": deployment_id,
         "capabilities": capabilities,
         "base_models": models,
         "gpus": len(supported_models),
         "gpu_by_model": gpu_by_model,
-        "gpu_tiers": sorted(set(gpu_by_model.values())),
+        "gpu_tiers": sorted({gpu for value in gpu_by_model.values() for gpu in value.split(" | ")}),
         "adapters": len(router.ready_adapters()),
     }
     if unsupported_models:
