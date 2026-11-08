@@ -41,6 +41,7 @@ def inspect_quantization(worker):
     model = worker.model_runner.model
     methods = Counter()
     dtypes = Counter()
+    expert_dtypes = Counter()
     examples = []
     for name, module in model.named_modules():
         scheme = getattr(module, "scheme", None)
@@ -61,11 +62,14 @@ def inspect_quantization(worker):
                         "use_marlin": getattr(method, "use_marlin", None),
                     }
                 )
-    for value in model.parameters():
+    for name, value in model.named_parameters():
         dtypes[str(value.dtype)] += value.numel()
+        if name.rsplit(".", 1)[-1] in {"w13_weight", "w2_weight"}:
+            expert_dtypes[str(value.dtype)] += value.numel()
     return {
         "quant_methods": dict(methods),
         "parameter_elements_by_dtype": dict(dtypes),
+        "expert_weight_elements_by_dtype": dict(expert_dtypes),
         "examples": examples,
     }
 
@@ -134,20 +138,24 @@ async def lora_smoke(engine, model, rank):
     single_use_containers=True,
     timeout=3600,
 )
-async def qualify(model, fp8_revision="", selective=False, online_dense=False):
+async def qualify(model, fp8_revision="", selective=False, online_dense=False, tensor_parallel=1):
     import torch
     from vllm import SamplingParams
 
     from flash.serving.src.engine import model_config
     from flash.serving.src.engine.lora_engine import _LoraEngineImpl
     from flash.serving.src.io.schemas import AdapterRecord, internal_adapter_payload
+    from flash.serving.src.store import settings as serving_settings
 
+    serving_settings.TENSOR_PARALLEL_SIZE = tensor_parallel
     start = time.monotonic()
     result = {
         "model": model,
+        "tensor_parallel": tensor_parallel,
+        "device_count": torch.cuda.device_count(),
         "device": torch.cuda.get_device_name(0),
         "gpu_bytes": torch.cuda.get_device_properties(0).total_memory,
-        "scope": "FP8 weights / 16-bit activations; single A100 80GB; catalog context and LoRA buffers unchanged",
+        "scope": f"FP8 candidate weights / 16-bit activations; {tensor_parallel} x A100 80GB; catalog context and LoRA buffers unchanged",
     }
     config = model_config._BY_MODEL[model]
     config["gpu"] = "A100-80GB"
@@ -237,6 +245,9 @@ async def qualify(model, fp8_revision="", selective=False, online_dense=False):
         result["lora_qproj_smoke"] = await lora_smoke(
             engine, model, result["settings"]["max_lora_rank"]
         )
+        result["capital_sanity_passed"] = "paris" in result["lora_qproj_smoke"]["text"].lower()
+        if not result["capital_sanity_passed"]:
+            raise RuntimeError("Execution succeeded but zero-adapter factual-output sanity failed")
         if not model.endswith("-Base"):
             result["greeting_sanity_passed"] = (
                 "hello" in result["buffered"]["text"].lower()
@@ -260,7 +271,14 @@ async def qualify(model, fp8_revision="", selective=False, online_dense=False):
 
 
 @app.local_entrypoint()
-def main(output: str, models: str = "", selective: bool = False, online_dense: bool = False):
+def main(
+    output: str,
+    models: str = "",
+    selective: bool = False,
+    online_dense: bool = False,
+    concurrency: int = 2,
+    tensor_parallel: int = 1,
+):
     from huggingface_hub import model_info
 
     from flash.serving.src.engine.model_config import base_models
@@ -273,9 +291,16 @@ def main(output: str, models: str = "", selective: bool = False, online_dense: b
     )
     from concurrent.futures import ThreadPoolExecutor, as_completed
 
-    with ThreadPoolExecutor(max_workers=2) as pool:
+    if concurrency not in (1, 2):
+        raise ValueError("qualification concurrency must be one or two")
+    if tensor_parallel not in (1, 2):
+        raise ValueError("qualification supports one or two GPUs")
+    function = qualify if tensor_parallel == 1 else qualify.with_options(gpu="A100-80GB:2")
+    with ThreadPoolExecutor(max_workers=concurrency) as pool:
         pending = {
-            pool.submit(qualify.remote, model, revision, selective, online_dense): model
+            pool.submit(
+                function.remote, model, revision, selective, online_dense, tensor_parallel
+            ): model
             for model in selected
         }
         for future in as_completed(pending):
