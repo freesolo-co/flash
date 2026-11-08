@@ -102,7 +102,7 @@ async def test_unregister_clears_both_active_pools_without_waking_idle_gpu():
 @pytest.mark.parametrize(
     ("model", "options"),
     [
-        ("Qwen/Qwen3.5-0.8B", ["A10G", "L40S", "A100-80GB"]),
+        ("Qwen/Qwen3.5-0.8B", ["A10G", "A100-80GB"]),
         ("Qwen/Qwen3.5-4B", ["A10G", "L40S", "A100-80GB"]),
         ("Qwen/Qwen3.5-9B", ["L40S", "A100-80GB"]),
         ("Qwen/Qwen3.5-9B-Base", ["L40S", "A100-80GB"]),

@@ -20,7 +20,9 @@ def modal_gpus_for(model):
         raise ValueError("Provider policy is only defined for hosted Qwen")
     if model == "Qwen/Qwen3.6-35B-A3B":
         return ["H200"]
-    if model in {"Qwen/Qwen3.5-0.8B", "Qwen/Qwen3.5-4B"}:
+    if model == "Qwen/Qwen3.5-0.8B":
+        return ["A10G", "A100-80GB"]
+    if model == "Qwen/Qwen3.5-4B":
         return ["A10G", "L40S", "A100-80GB"]
     if model in {"Qwen/Qwen3.5-9B", "Qwen/Qwen3.5-9B-Base"}:
         return ["L40S", "A100-80GB"]
