@@ -242,7 +242,10 @@ async def qualify(model, fp8_revision="", selective=False, online_dense=False, t
         from flash.serving.src.engine import boot
 
         original_args = boot.engine_args_for
-        exclusions = ["re:.*visual.*", "re:.*lm_head$", "re:.*in_proj_(a|b|ba)$"]
+        # Retain the exact passing 4B candidate; smaller split gates need the
+        # expanded exclusion on 0.8B and the online-quantized 9B models.
+        gate_pattern = "ba" if model == "Qwen/Qwen3.5-4B" else "(a|b|ba)"
+        exclusions = ["re:.*visual.*", "re:.*lm_head$", f"re:.*in_proj_{gate_pattern}$"]
 
         def selective_args(*args, **kwargs):
             values = original_args(*args, **kwargs)
