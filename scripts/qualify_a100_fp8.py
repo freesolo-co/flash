@@ -129,6 +129,72 @@ async def lora_smoke(engine, model, rank):
     }
 
 
+async def expert_lora_smoke(engine, model, rank):
+    import torch
+    from safetensors.torch import save_file
+    from vllm import SamplingParams
+    from vllm.lora.request import LoRARequest
+
+    from flash.core.catalog import get_model
+
+    info = get_model(model)
+    config = engine.engine.vllm_config.model_config.hf_text_config
+    intermediate = config.moe_intermediate_size
+    root = Path("/tmp/a100-fp8-expert-adapter")
+    await asyncio.to_thread(root.mkdir, exist_ok=True)
+    (root / "adapter_config.json").write_text(
+        json.dumps(
+            {
+                "base_model_name_or_path": model,
+                "peft_type": "LORA",
+                "task_type": "CAUSAL_LM",
+                "r": rank,
+                "lora_alpha": rank,
+                "lora_dropout": 0,
+                "bias": "none",
+                "target_modules": ["gate_proj", "up_proj", "down_proj"],
+            }
+        )
+    )
+    weights = {}
+    for expert in range(info.lora_expert_count):
+        for projection in ("gate_proj", "up_proj", "down_proj"):
+            inputs, outputs = (
+                (intermediate, info.hidden_size)
+                if projection == "down_proj"
+                else (info.hidden_size, intermediate)
+            )
+            name = (
+                f"base_model.model.model.language_model.layers.0.mlp.experts.{expert}.{projection}"
+            )
+            weights[name + ".lora_A.weight"] = torch.zeros(rank, inputs, dtype=torch.bfloat16)
+            weights[name + ".lora_B.weight"] = torch.zeros(outputs, rank, dtype=torch.bfloat16)
+    save_file(weights, str(root / "adapter_model.safetensors"))
+    del weights
+    adapter = LoRARequest("a100-fp8-expert-smoke", 2, str(root))
+    await engine.engine.add_lora(adapter)
+    last = None
+    async for output in engine.engine.generate(
+        "The capital of France is",
+        SamplingParams(temperature=0, max_tokens=32),
+        uuid.uuid4().hex,
+        lora_request=adapter,
+    ):
+        last = output
+    if last is None or not last.finished or not last.outputs[0].token_ids:
+        raise RuntimeError("Expert LoRA generation incomplete")
+    if "paris" not in last.outputs[0].text.lower():
+        raise RuntimeError("Expert LoRA factual-output sanity failed")
+    return {
+        "rank": rank,
+        "layer": 0,
+        "experts": info.lora_expert_count,
+        "projections": ["gate_proj", "up_proj", "down_proj"],
+        "text": last.outputs[0].text,
+        "synthetic_zero_adapter": True,
+    }
+
+
 @app.function(
     image=image,
     gpu="A100-80GB",
@@ -245,6 +311,13 @@ async def qualify(model, fp8_revision="", selective=False, online_dense=False, t
         result["lora_qproj_smoke"] = await lora_smoke(
             engine, model, result["settings"]["max_lora_rank"]
         )
+        if model == "Qwen/Qwen3.6-35B-A3B":
+            result["expert_lora_smoke"] = await expert_lora_smoke(
+                engine, model, result["settings"]["max_lora_rank"]
+            )
+            result["quantization_after_expert_lora"] = await engine.engine.collective_rpc(
+                inspect_quantization
+            )
         result["capital_sanity_passed"] = "paris" in result["lora_qproj_smoke"]["text"].lower()
         if not result["capital_sanity_passed"]:
             raise RuntimeError("Execution succeeded but zero-adapter factual-output sanity failed")
@@ -257,7 +330,7 @@ async def qualify(model, fp8_revision="", selective=False, online_dense=False, t
                 raise RuntimeError("Execution succeeded but instruction-output sanity failed")
         result["status"] = "passed_base_and_qproj_lora"
         result["limitations"] = [
-            "Synthetic zero q_proj adapter only; no full-expert or trained-adapter quality qualification",
+            "Synthetic zero adapters only; trained/full-model adapter quality not qualified",
             "No full 256k input or quality benchmark",
             "Modal hardware test; not Lambda provisioning qualification",
         ]
@@ -286,6 +359,8 @@ def main(
     folder = Path(output)
     folder.mkdir(parents=True, exist_ok=True)
     selected = models.split(",") if models else base_models()
+    if set(selected) - set(base_models()):
+        raise ValueError("qualification accepts only hosted Qwen catalog models")
     revision = (
         model_info("Qwen/Qwen3.6-35B-A3B-FP8").sha if "Qwen/Qwen3.6-35B-A3B" in selected else ""
     )
