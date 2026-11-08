@@ -322,6 +322,8 @@ hf_cache_volume = modal.Volume.from_name(HF_CACHE_VOLUME_NAME, create_if_missing
 # ``add_local_python_source("flash")`` ships it to the remote container under the same import path
 # it has here), re-exported so ``_build_engine`` can subclass it.
 # CPU replicas retain Modal admission/scaling; each owns one Lambda GPU worker.
+# This is a deployment invariant, not an environment-controlled fallback switch.
+HOSTED_QWEN_GPU_PROVIDER = "lambda"
 from flash.serving.lambda_cloud.proxy import LambdaEngineProxy  # noqa: E402
 from flash.serving.src.engine.lora_engine import _LoraEngineImpl  # noqa: E402, F401
 

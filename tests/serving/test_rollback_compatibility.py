@@ -236,3 +236,34 @@ def test_manifest_captures_only_current_model_identities():
     for model in base_models():
         assert manifest["classes"][model_engine_name(model)] == [model]
     assert set(manifest["classes"]) == {model_engine_name(model) for model in base_models()}
+
+
+@pytest.mark.parametrize("marker", ["", 'HOSTED_QWEN_GPU_PROVIDER = "modal"\n'])
+def test_lambda_rollback_rejects_modal_predecessor_before_mutating_artifact(tmp_path, marker):
+    entrypoint = tmp_path / "flash/serving/app/modal_app.py"
+    entrypoint.parent.mkdir(parents=True)
+    source = marker + '@app.function(timeout=900)\ndef router():\n    return "old"\n'
+    entrypoint.write_text(source)
+    manifest = {**_manifest(), "gpu_provider": "lambda"}
+    with pytest.raises(ValueError, match="re-enable Modal"):
+        prepare_artifact(entrypoint, manifest)
+    assert entrypoint.read_text() == source
+    assert not (entrypoint.parent.parent / "_rollback_compat.py").exists()
+
+
+def test_lambda_rollback_accepts_only_lambda_predecessor(tmp_path):
+    entrypoint = tmp_path / "flash/serving/app/modal_app.py"
+    entrypoint.parent.mkdir(parents=True)
+    entrypoint.write_text(
+        'HOSTED_QWEN_GPU_PROVIDER = "lambda"\n@app.function(timeout=900)\ndef router():\n    return "old"\n'
+    )
+    manifest = {**_manifest(), "gpu_provider": "lambda"}
+    prepare_artifact(entrypoint, manifest)
+    namespace, built, _ = _predecessor()
+    with pytest.raises(ValueError, match="re-enable Modal"):
+        install_compatibility(namespace, manifest)
+    assert len(built) == 1
+    namespace["HOSTED_QWEN_GPU_PROVIDER"] = "lambda"
+    install_compatibility(namespace, manifest)
+    assert len(built) == 2
+    assert engine_manifest("b" * 40)["gpu_provider"] == "lambda"

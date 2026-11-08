@@ -988,3 +988,13 @@ def test_modal_stream_entrypoint_uses_regular_call(modal_app_module, monkeypatch
     args = ({"prompt": "hello"}, None, None, "fsgen-test", 123.0, "qu-test", "nonce")
     assert asyncio.run(engine.stream_generate_call(*args)) == {"terminal_kind": "event"}
     run.assert_awaited_once_with(engine, *args)
+
+
+def test_hosted_qwen_never_registers_modal_gpu_or_fallback(modal_app_module):
+    mod = modal_app_module
+    assert mod.HOSTED_QWEN_GPU_PROVIDER == "lambda"
+    for call in mod.app.cls.call_args_list:
+        assert "gpu" not in call.kwargs
+    for cls in mod.ENGINE_BY_MODEL.values():
+        assert issubclass(cls, mod.LambdaEngineProxy)
+        assert not issubclass(cls, mod._LoraEngineImpl)

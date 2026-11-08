@@ -28,6 +28,7 @@ def engine_manifest(source_sha: str) -> dict[str, Any]:
     return validate_manifest(
         {
             "version": 1,
+            "gpu_provider": "lambda",
             "source_sha": source_sha,
             "startup_seconds": ROUTER_TIMEOUT_SECONDS + 60,
             "classes": classes,
@@ -38,6 +39,8 @@ def engine_manifest(source_sha: str) -> dict[str, Any]:
 def validate_manifest(manifest: Any) -> dict[str, Any]:
     if not isinstance(manifest, dict) or manifest.get("version") != 1:
         raise ValueError("Unsupported rollback manifest")
+    if manifest.get("gpu_provider", "modal") not in {"lambda", "modal"}:
+        raise ValueError("Unsupported rollback GPU provider")
     if not re.fullmatch(r"[0-9a-f]{40}", manifest.get("source_sha", "")):
         raise ValueError("Rollback manifest requires the forward source SHA")
     budget = manifest.get("startup_seconds")
@@ -101,7 +104,27 @@ def _router_startup_budget(source: str, seconds: int) -> str:
 
 def prepare_artifact(entrypoint: Path, manifest: dict[str, Any]) -> None:
     manifest = validate_manifest(manifest)
-    source = _router_startup_budget(entrypoint.read_text(), manifest["startup_seconds"])
+    source = entrypoint.read_text()
+    if manifest.get("gpu_provider") == "lambda":
+        # Inspect without importing: an old module can register GPU classes on import.
+        declarations = [
+            node.value
+            for node in ast.parse(source).body
+            if isinstance(node, ast.Assign)
+            and any(
+                isinstance(target, ast.Name) and target.id == "HOSTED_QWEN_GPU_PROVIDER"
+                for target in node.targets
+            )
+        ]
+        if (
+            len(declarations) != 1
+            or not isinstance(declarations[0], ast.Constant)
+            or declarations[0].value != "lambda"
+        ):
+            raise ValueError(
+                "Rollback would re-enable Modal GPU serving; Lambda-only release required"
+            )
+    source = _router_startup_budget(source, manifest["startup_seconds"])
     # Both historical entrypoint layouts mount the flash package into the image.
     serving = next((parent for parent in entrypoint.parents if parent.name == "serving"), None)
     if serving is None or serving.parent.name != "flash":
@@ -136,6 +159,11 @@ def install_compatibility(namespace: dict[str, Any], manifest: dict[str, Any]) -
     function deletion. No failed inference or partial stream is retried.
     """
     manifest = validate_manifest(manifest)
+    if (
+        manifest.get("gpu_provider") == "lambda"
+        and namespace.get("HOSTED_QWEN_GPU_PROVIDER") != "lambda"
+    ):
+        raise ValueError("Rollback would re-enable Modal GPU serving; Lambda-only release required")
     required = (
         "_build_engine",
         "_engine_cls_for",
