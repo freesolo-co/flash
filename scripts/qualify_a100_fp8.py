@@ -68,6 +68,61 @@ def inspect_quantization(worker):
     }
 
 
+async def lora_smoke(engine, model, rank):
+    import torch
+    from safetensors.torch import save_file
+    from vllm import SamplingParams
+    from vllm.lora.request import LoRARequest
+
+    from flash.core.catalog import get_model
+
+    info = get_model(model)
+    root = Path("/tmp/a100-fp8-adapter")
+    await asyncio.to_thread(root.mkdir, exist_ok=True)
+    (root / "adapter_config.json").write_text(
+        json.dumps(
+            {
+                "base_model_name_or_path": model,
+                "peft_type": "LORA",
+                "task_type": "CAUSAL_LM",
+                "r": rank,
+                "lora_alpha": rank,
+                "lora_dropout": 0,
+                "bias": "none",
+                "target_modules": ["q_proj"],
+            }
+        )
+    )
+    name = "base_model.model.model.language_model.layers.3.self_attn.q_proj"
+    save_file(
+        {
+            name + ".lora_A.weight": torch.zeros(rank, info.hidden_size, dtype=torch.bfloat16),
+            name + ".lora_B.weight": torch.zeros(
+                2 * info.num_attention_heads * info.head_dim, rank, dtype=torch.bfloat16
+            ),
+        },
+        str(root / "adapter_model.safetensors"),
+    )
+    adapter = LoRARequest("a100-fp8-smoke", 1, str(root))
+    await engine.engine.add_lora(adapter)
+    last = None
+    async for output in engine.engine.generate(
+        "The capital of France is",
+        SamplingParams(temperature=0, max_tokens=32),
+        uuid.uuid4().hex,
+        lora_request=adapter,
+    ):
+        last = output
+    if last is None or not last.finished or not last.outputs[0].token_ids:
+        raise RuntimeError("LoRA generation incomplete")
+    return {
+        "rank": rank,
+        "target": "q_proj",
+        "text": last.outputs[0].text,
+        "synthetic_zero_adapter": True,
+    }
+
+
 @app.function(
     image=image,
     gpu="A100-80GB",
@@ -77,7 +132,7 @@ def inspect_quantization(worker):
     single_use_containers=True,
     timeout=3600,
 )
-async def qualify(model, fp8_revision=""):
+async def qualify(model, fp8_revision="", selective=False):
     import torch
     from vllm import SamplingParams
 
@@ -101,6 +156,20 @@ async def qualify(model, fp8_revision=""):
         config["engine"].update(
             serve_model_id=model + "-FP8", model_revision=fp8_revision, quantization="fp8"
         )
+    if selective and model in ("Qwen/Qwen3.5-0.8B", "Qwen/Qwen3.5-4B"):
+        from flash.serving.src.engine import boot
+
+        original_args = boot.engine_args_for
+        exclusions = ["re:.*visual.*", "re:.*lm_head$", "re:.*in_proj_ba$"]
+
+        def selective_args(*args, **kwargs):
+            values = original_args(*args, **kwargs)
+            values["quantization"] = "fp8_per_tensor"
+            values["quantization_config"] = {"ignore": exclusions}
+            return values
+
+        boot.engine_args_for = selective_args
+        result["fp8_exclusions"] = exclusions
     result["settings"] = model_config.engine_overrides_for(model)
     engine = _LoraEngineImpl()
     engine.base_model = model
@@ -157,9 +226,12 @@ async def qualify(model, fp8_revision=""):
             "prompt_tokens": len(tokens),
             "output_tokens": len(last.outputs[0].token_ids),
         }
-        result["status"] = "passed_base_inference"
+        result["lora_qproj_smoke"] = await lora_smoke(
+            engine, model, result["settings"]["max_lora_rank"]
+        )
+        result["status"] = "passed_base_and_qproj_lora"
         result["limitations"] = [
-            "No loaded LoRA adapter or full-expert LoRA qualification",
+            "Synthetic zero q_proj adapter only; no full-expert or trained-adapter quality qualification",
             "No full 256k input or quality benchmark",
             "Modal hardware test; not Lambda provisioning qualification",
         ]
@@ -173,7 +245,7 @@ async def qualify(model, fp8_revision=""):
 
 
 @app.local_entrypoint()
-def main(output: str, models: str = ""):
+def main(output: str, models: str = "", selective: bool = False):
     from huggingface_hub import model_info
 
     from flash.serving.src.engine.model_config import base_models
@@ -186,7 +258,7 @@ def main(output: str, models: str = ""):
     )
     for model in selected:
         try:
-            result = qualify.remote(model, revision)
+            result = qualify.remote(model, revision, selective)
         except Exception as exc:
             result = {
                 "model": model,
