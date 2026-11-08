@@ -54,7 +54,7 @@ RUN if [ "${INSTALL_INFISICAL}" = "true" ]; then \
             *) echo "no pinned infisical build for dpkg arch: ${arch}" >&2; exit 1 ;; \
         esac; \
         deb="/tmp/infisical.deb"; \
-        curl -fsSL -o "${deb}" \
+        curl -fsSL --retry 4 --retry-delay 2 --connect-timeout 15 --max-time 120 -o "${deb}" \
             "https://github.com/Infisical/cli/releases/download/v${INFISICAL_VERSION}/infisical_${INFISICAL_VERSION}_linux_${arch}.deb"; \
         # Verify BEFORE dpkg touches it: a mismatch must fail the build, never install.
         echo "${sha}  ${deb}" | sha256sum -c -; \
