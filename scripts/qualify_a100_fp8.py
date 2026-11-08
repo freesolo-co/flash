@@ -321,6 +321,12 @@ async def qualify(
             result["quantization_after_expert_lora"] = await engine.engine.collective_rpc(
                 inspect_quantization
             )
+            for worker in result["quantization_after_expert_lora"]:
+                dtypes = worker["expert_weight_elements_by_dtype"]
+                if not dtypes or set(dtypes) - {"torch.int32", "torch.float8_e4m3fn"}:
+                    raise RuntimeError(
+                        "Expert weights did not retain the FP8/Marlin storage format"
+                    )
         result["capital_sanity_passed"] = "paris" in result["lora_qproj_smoke"]["text"].lower()
         if not result["capital_sanity_passed"]:
             raise RuntimeError("Execution succeeded but zero-adapter factual-output sanity failed")
