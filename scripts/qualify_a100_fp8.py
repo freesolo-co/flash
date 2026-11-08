@@ -23,6 +23,8 @@ if modal.is_local():
                 "HF_HUB_DISABLE_XET": "1",
                 "VLLM_WORKER_MULTIPROC_METHOD": "spawn",
                 "VLLM_MOE_USE_DEEP_GEMM": "0",
+                # Trusted local test callback only; never enabled in hosted serving.
+                "VLLM_ALLOW_INSECURE_SERIALIZATION": "1",
             }
         )
         .add_local_dir(Path(__file__).resolve().parent.parent / "flash", "/app/flash", copy=True)
@@ -128,7 +130,7 @@ async def lora_smoke(engine, model, rank):
     gpu="A100-80GB",
     secrets=engine_secrets,
     volumes={"/vol/hosting-cache": hf_cache_volume},
-    max_containers=1,
+    max_containers=2,
     single_use_containers=True,
     timeout=3600,
 )
@@ -160,7 +162,7 @@ async def qualify(model, fp8_revision="", selective=False):
         from flash.serving.src.engine import boot
 
         original_args = boot.engine_args_for
-        exclusions = ["re:.*visual.*", "re:.*lm_head$", "re:.*in_proj_ba$"]
+        exclusions = ["re:.*visual.*", "re:.*lm_head$", "re:.*in_proj_(a|b|ba)$"]
 
         def selective_args(*args, **kwargs):
             values = original_args(*args, **kwargs)
@@ -256,14 +258,21 @@ def main(output: str, models: str = "", selective: bool = False):
     revision = (
         model_info("Qwen/Qwen3.6-35B-A3B-FP8").sha if "Qwen/Qwen3.6-35B-A3B" in selected else ""
     )
-    for model in selected:
-        try:
-            result = qualify.remote(model, revision, selective)
-        except Exception as exc:
-            result = {
-                "model": model,
-                "status": "remote_failed",
-                "error": type(exc).__name__ + ": " + str(exc)[:1500],
-            }
-        (folder / (model.rsplit("/", 1)[-1] + ".json")).write_text(json.dumps(result, indent=2))
-        print("QUALIFICATION_RESULT", json.dumps(result), flush=True)
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        pending = {
+            pool.submit(qualify.remote, model, revision, selective): model for model in selected
+        }
+        for future in as_completed(pending):
+            model = pending[future]
+            try:
+                result = future.result()
+            except Exception as exc:
+                result = {
+                    "model": model,
+                    "status": "remote_failed",
+                    "error": type(exc).__name__ + ": " + str(exc)[:1500],
+                }
+            (folder / (model.rsplit("/", 1)[-1] + ".json")).write_text(json.dumps(result, indent=2))
+            print("QUALIFICATION_RESULT", json.dumps(result), flush=True)
