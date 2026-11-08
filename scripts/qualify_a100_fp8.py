@@ -8,15 +8,23 @@ from pathlib import Path
 
 import modal
 
-from flash.serving.app.modal_app import engine_secrets, hf_cache_volume
 from flash.serving.lambda_cloud.config import RUNTIME_IMAGE
 from flash.serving.src.engine.model_config import base_models
+
+if modal.is_local():
+    from flash.serving.app.modal_app import engine_secrets, hf_cache_volume
+else:
+    engine_secrets = []
+    hf_cache_volume = modal.Volume.from_name(
+        "freesolo-lora-serving-hf-cache", create_if_missing=True
+    )
 
 app = modal.App("flash-a100-fp8-qualification")
 image = (
     modal.Image.from_registry(RUNTIME_IMAGE)
     .env(
         {
+            "PYTHONPATH": "/root:/app",
             "HF_HOME": "/vol/hosting-cache",
             "HF_HUB_CACHE": "/vol/hosting-cache/hub",
             "VLLM_CACHE_ROOT": "/vol/hosting-cache/vllm",
