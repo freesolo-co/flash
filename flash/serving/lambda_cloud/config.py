@@ -29,6 +29,8 @@ def placements(model):
         raise ValueError("Lambda placement is only defined for the hosted Qwen catalog")
     if model == "Qwen/Qwen3.6-35B-A3B":
         return ("H200", "B200")
+    if model in {"Qwen/Qwen3.5-0.8B", "Qwen/Qwen3.5-4B"}:
+        return ("A10", "A100-80GB", "H100")
     return ("A100-80GB", "H100")
 
 
