@@ -36,6 +36,9 @@ def test_registered_pools_and_combined_limit(mode, monkeypatch, load_modal_app_u
     n = len(base_models())
     assert len(gpu_calls) == (n if mode in {"modal", "all"} else 0)
     assert len(cpu_calls) == (n if mode in {"lambda", "all"} else 0)
+    # Modal rejects non-preemptible GPU workloads; Lambda proxies are CPU-only.
+    assert all(not call.kwargs.get("nonpreemptible", False) for call in gpu_calls)
+    assert all(call.kwargs["nonpreemptible"] for call in cpu_calls)
     assert sum(call.kwargs["max_containers"] for call in app.cls.call_args_list) == 2 * n
     for model, cls in mod.ENGINE_BY_MODEL.items():
         if mode == "modal":

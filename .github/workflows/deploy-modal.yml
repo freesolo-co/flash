@@ -43,7 +43,7 @@ jobs:
     # Include the full router drain window before the canary, its GPU cold start,
     # accounting settlement and image builds. The workflow contract test checks
     # these budgets against the job timeout.
-    timeout-minutes: 300
+    timeout-minutes: 360
     # serialize serving deploys across runs because each deploy mutates the live app. github can still
     # replace a pending run, so the gate compares against the sha reported by the deployed app rather
     # than assuming every push predecessor was deployed.
@@ -339,90 +339,6 @@ jobs:
           FREESOLO_DEPLOYMENT_ID: ${{ github.run_id }}-${{ github.run_attempt }}
         run: modal deploy --strategy rolling flash/serving/app/modal_app.py
 
-      - name: Wait for production serving readiness
-        if: steps.gate.outputs.deploy == 'true'
-        working-directory: .
-        run: |
-          endpoint="https://serve.freesolo.co/healthz"
-          expected_deployment_id="${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
-          response_file="$(mktemp)"
-          trap 'rm -f "$response_file"' EXIT
-          # Match router startup: its full engine budget plus 60 seconds of headroom.
-          deadline=$((SECONDS + 3660))
-
-          while true; do
-            remaining=$((deadline - SECONDS))
-            if (( remaining <= 0 )); then
-              echo "::error::Production serving health check did not become ready within 3660 seconds."
-              exit 1
-            fi
-
-            request_timeout=10
-            if (( remaining < request_timeout )); then
-              request_timeout=$remaining
-            fi
-
-            response_status=""
-            if response_status="$(curl --silent --show-error --output "$response_file" --write-out '%{http_code}' \
-              --connect-timeout 5 \
-              --max-time "$request_timeout" \
-              "$endpoint")"; then
-              curl_exit=0
-            else
-              curl_exit=$?
-            fi
-
-            status="000"
-            if (( curl_exit == 0 )); then
-              status="$response_status"
-            fi
-
-            if [[ "$status" = "200" ]]; then
-              if python - "$response_file" "$GITHUB_SHA" "$expected_deployment_id" <<'PY'
-          import json
-          import sys
-
-
-          def reject_constant(_value: str) -> None:
-              raise ValueError
-
-
-          try:
-              with open(sys.argv[1], encoding="utf-8") as response:
-                  payload = json.load(response, parse_constant=reject_constant)
-          except (OSError, UnicodeDecodeError, ValueError):
-              sys.exit(1)
-
-          ready = (
-              isinstance(payload, dict)
-              and payload.get("ok") is True
-              and payload.get("deployment_sha") == sys.argv[2]
-              and payload.get("deployment_id") == sys.argv[3]
-          )
-          sys.exit(0 if ready else 1)
-          PY
-              then
-                echo "Production serving router is ready for deployment ${GITHUB_SHA} (${expected_deployment_id})."
-                break
-              fi
-              echo "Production serving health check returned malformed, unhealthy, or stale deployment JSON; retrying."
-            elif [[ "$status" = "000" ]]; then
-              echo "Production serving health check had a transport error; retrying."
-            else
-              echo "Production serving health check returned HTTP ${status}; retrying."
-            fi
-
-            remaining=$((deadline - SECONDS))
-            if (( remaining <= 0 )); then
-              continue
-            fi
-            sleep_seconds=10
-            if (( remaining < sleep_seconds )); then
-              sleep_seconds=$remaining
-            fi
-            sleep "$sleep_seconds"
-          done
-
       - name: Install promotion gate dependencies
         if: steps.gate.outputs.deploy == 'true'
         working-directory: .
@@ -452,6 +368,8 @@ jobs:
           GITHUB_RUN_ATTEMPT: ${{ github.run_attempt }}
         # credentials reach the gate ONLY through the environment above. passing any of them as an
         # argument would put them in the process table and in the step's own command echo.
+        # The gate waits for a stable release identity over the full rolling-handoff budget
+        # before sending inference, then verifies durable accounting.
         run: python -m flash.serving.promotion.gate
 
       - name: Nothing to deploy

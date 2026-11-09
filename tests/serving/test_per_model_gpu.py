@@ -30,8 +30,8 @@ def _passthrough_decorator(*_a: Any, **_k: Any):
     return deco
 
 
-@pytest.fixture(scope="module")
-def modal_app_module(load_modal_app_under_stub):
+@pytest.fixture(scope="module", params=["modal", "lambda"])
+def modal_app_module(load_modal_app_under_stub, request):
     modal_stub = MagicMock(name="modal")
     modal_stub.concurrent.side_effect = _passthrough_decorator
     modal_stub.method.side_effect = _passthrough_decorator
@@ -44,7 +44,11 @@ def modal_app_module(load_modal_app_under_stub):
     app_mock.local_entrypoint.side_effect = _passthrough_decorator
     modal_stub.App.return_value = app_mock
     modal_stub.Period.return_value = MagicMock()
-    return load_modal_app_under_stub(modal_stub)
+    from flash.serving.app import inference_provider
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(inference_provider, "INFERENCE_PROVIDER", request.param)
+        return load_modal_app_under_stub(modal_stub)
 
 
 _DEVELOPMENT_CUSTOM_DOMAIN = "serve-dev.freesolo.co"
@@ -420,7 +424,12 @@ def test_deployed_timeouts_use_the_shared_serving_budget(modal_app_module):
     engine_calls = [call for call in app.cls.call_args_list if "startup_timeout" in call.kwargs]
     assert engine_calls
     for call in engine_calls:
-        assert call.kwargs["startup_timeout"] == timeouts.STARTUP_TIMEOUT_SECONDS
+        expected = (
+            timeouts.STARTUP_TIMEOUT_SECONDS
+            if "gpu" in call.kwargs
+            else timeouts.LAMBDA_STARTUP_TIMEOUT_SECONDS
+        )
+        assert call.kwargs["startup_timeout"] == expected
         assert call.kwargs["timeout"] == timeouts.REQUEST_TIMEOUT_SECONDS
     router_calls = [
         call for call in app.function.call_args_list if "startup_timeout" in call.kwargs
@@ -429,7 +438,7 @@ def test_deployed_timeouts_use_the_shared_serving_budget(modal_app_module):
     assert router_calls[0].kwargs["timeout"] == timeouts.ROUTER_TIMEOUT_SECONDS
     assert (
         max(
-            timeouts.STARTUP_TIMEOUT_SECONDS + timeouts.REQUEST_TIMEOUT_SECONDS,
+            timeouts.LAMBDA_STARTUP_TIMEOUT_SECONDS + timeouts.REQUEST_TIMEOUT_SECONDS,
             timeouts.DEEPINFER_REQUEST_SECONDS,
         )
         == timeouts.ROUTER_TIMEOUT_SECONDS
@@ -475,7 +484,12 @@ def test_models_route_to_qualified_gpu(modal_app_module, model, gpu, sequences):
     assert cls is modal_app_module.ENGINE_BY_MODEL[model]
     assert cls.__name__ == modal_app_module.model_engine_name(model)
     assert modal_app_module._engine_concurrency(model) == (sequences, sequences)
-    assert cls.pinned_gpu is None  # Worker health reports the selected alternative.
+    expected = (
+        modal_app_module.modal_gpus_for(model)
+        if modal_app_module.INFERENCE_PROVIDER == "modal"
+        else None
+    )
+    assert cls.pinned_gpu == expected
 
 
 def test_unknown_base_model_is_rejected_before_engine_dispatch(modal_app_module):
@@ -488,17 +502,22 @@ def test_tier_classes_inherit_the_shared_impl(modal_app_module):
     """Each tier class subclasses _LoraEngineImpl (so _load/_generate/etc resolve) and defines the
     public Modal entrypoints itself (so Modal collects them per class)."""
     tier = modal_app_module.ENGINE_BY_MODEL["Qwen/Qwen3.6-35B-A3B"]
-    assert issubclass(tier, modal_app_module.LambdaEngineProxy)
+    implementation = (
+        modal_app_module.HostedModalEngine
+        if modal_app_module.INFERENCE_PROVIDER == "modal"
+        else modal_app_module.LambdaEngineProxy
+    )
+    assert issubclass(tier, implementation)
     for impl in ("_load", "_register", "_generate", "_stream_generate", "_unregister", "_health"):
         assert hasattr(tier, impl)
     for entry in ("load", "register", "generate", "stream_generate_call", "unregister", "health"):
         assert entry in tier.__dict__
 
 
-def test_cpu_proxy_does_not_claim_a_fixed_gpu(modal_app_module):
+def test_only_modal_engines_claim_gpu_options(modal_app_module):
     """Worker health identifies the selected GPU after capacity-dependent placement."""
     for cls in modal_app_module.ENGINE_BY_MODEL.values():
-        assert cls.pinned_gpu is None
+        assert (cls.pinned_gpu is None) == (modal_app_module.INFERENCE_PROVIDER == "lambda")
 
 
 def test_tier_class_identity_is_fixed_before_decoration(modal_app_module):
@@ -980,10 +999,10 @@ def test_modal_stream_entrypoint_uses_regular_call(modal_app_module, monkeypatch
     run.assert_awaited_once_with(engine, *args)
 
 
-def test_hosted_qwen_never_registers_modal_gpu_or_fallback(modal_app_module):
+def test_hosted_qwen_registers_only_the_selected_provider(modal_app_module):
     mod = modal_app_module
     for call in mod.app.cls.call_args_list:
-        assert "gpu" not in call.kwargs
+        assert ("gpu" in call.kwargs) == (mod.INFERENCE_PROVIDER == "modal")
     for cls in mod.ENGINE_BY_MODEL.values():
-        assert issubclass(cls, mod.LambdaEngineProxy)
-        assert not issubclass(cls, mod._LoraEngineImpl)
+        assert issubclass(cls, mod.LambdaEngineProxy) == (mod.INFERENCE_PROVIDER == "lambda")
+        assert issubclass(cls, mod._LoraEngineImpl) == (mod.INFERENCE_PROVIDER == "modal")

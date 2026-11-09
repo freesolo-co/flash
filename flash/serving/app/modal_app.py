@@ -16,6 +16,7 @@ import modal
 from flash.schema import parse_checkpoint_ref
 from flash.serving.app.rollout import model_engine_name, warm_active_models
 from flash.serving.app.timeouts import (
+    LAMBDA_STARTUP_TIMEOUT_SECONDS,
     REQUEST_TIMEOUT_SECONDS,
     ROUTER_TIMEOUT_SECONDS,
     STARTUP_TIMEOUT_SECONDS,
@@ -465,6 +466,7 @@ def _build_engine(
     resources = (
         {
             "image": image,
+            "startup_timeout": STARTUP_TIMEOUT_SECONDS,
             "gpu": gpu,
             "secrets": engine_secrets,
             "volumes": {HOSTING_CACHE_MOUNT: hf_cache_volume},
@@ -472,17 +474,17 @@ def _build_engine(
         if provider == "modal"
         else {
             "image": lambda_controller_image,
+            "startup_timeout": LAMBDA_STARTUP_TIMEOUT_SECONDS,
             "cpu": 1,
             "memory": 2048,
+            "nonpreemptible": True,  # Modal supports this only for CPU workloads.
             "secrets": lambda_proxy_secrets,
         }
     )
     engine = app.cls(
         **resources,
-        nonpreemptible=True,
         region="us",
         scaledown_window=scaledown_window_for(gpu[0] if isinstance(gpu, list) else gpu),
-        startup_timeout=STARTUP_TIMEOUT_SECONDS,
         timeout=REQUEST_TIMEOUT_SECONDS,
         min_containers=MIN_CONTAINERS,
         max_containers=replica_limit(INFERENCE_PROVIDER),

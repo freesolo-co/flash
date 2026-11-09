@@ -12,7 +12,7 @@ jobs:
     if: github.ref == 'refs/heads/dev'
     runs-on: ubuntu-latest
     # Allow active GPU pools to warm before router readiness, plus image builds.
-    timeout-minutes: 90
+    timeout-minutes: 150
     # github can replace a pending run even though a running deploy is preserved. compare against the
     # sha reported by the deployed app so the replacement repeats every change not actually deployed.
     concurrency:
@@ -293,12 +293,12 @@ jobs:
           response_file="$(mktemp)"
           trap 'rm -f "$response_file"' EXIT
           # Match router startup: its full engine budget plus 60 seconds of headroom.
-          deadline=$((SECONDS + 3660))
+          deadline=$((SECONDS + 7260))
 
           while true; do
             remaining=$((deadline - SECONDS))
             if (( remaining <= 0 )); then
-              echo "::error::Development serving custom domain did not become DNS-, TLS-, and health-ready within 3660 seconds."
+              echo "::error::Development serving custom domain did not become DNS-, TLS-, and health-ready within 7260 seconds."
               exit 1
             fi
 

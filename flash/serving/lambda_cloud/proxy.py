@@ -8,6 +8,7 @@ import uuid
 from flash.serving.app.timeouts import STARTUP_TIMEOUT_SECONDS
 
 from .bootstrap import identity, user_data
+from .capacity import launch_with_capacity_wait
 from .config import APP_NAME, HEARTBEAT_SECONDS
 from .transport import WorkerError, WorkerTransport
 
@@ -25,10 +26,10 @@ class LambdaEngineProxy:
         revision = os.environ["FREESOLO_DEPLOYMENT_SHA"]
         bootstrap = user_data(self.base_model, revision, os.environ, tls)
         try:
+            await launch_with_capacity_wait(
+                self._fleet.launch.remote.aio, self._owner, self.base_model, bootstrap, revision
+            )
             async with asyncio.timeout(STARTUP_TIMEOUT_SECONDS):
-                await self._fleet.launch.remote.aio(
-                    self._owner, self.base_model, bootstrap, revision
-                )
                 self._heartbeat_task = asyncio.create_task(self._heartbeat())
                 await self._wait_ready(tls, revision)
                 self.engine = self._transport  # stream-channel cancellation calls engine.abort
