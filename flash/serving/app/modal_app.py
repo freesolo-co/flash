@@ -477,12 +477,12 @@ def _build_engine(
             "startup_timeout": LAMBDA_STARTUP_TIMEOUT_SECONDS,
             "cpu": 1,
             "memory": 2048,
+            "nonpreemptible": True,  # Modal supports this only for CPU workloads.
             "secrets": lambda_proxy_secrets,
         }
     )
     engine = app.cls(
         **resources,
-        nonpreemptible=True,
         region="us",
         scaledown_window=scaledown_window_for(gpu[0] if isinstance(gpu, list) else gpu),
         timeout=REQUEST_TIMEOUT_SECONDS,
