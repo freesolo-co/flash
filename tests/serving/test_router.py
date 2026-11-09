@@ -206,7 +206,11 @@ def test_unregister_safe_records_exact_gpu_cleanup_failure(capsys):
     )
 
 
-def test_healthz_reports_one_gpu_per_base_model(app_setup):
+@pytest.mark.parametrize("provider", ["modal", "lambda", "all"])
+def test_healthz_reports_one_gpu_per_base_model(app_setup, monkeypatch, provider):
+    from flash.serving.src.http import routing
+
+    monkeypatch.setattr(routing, "INFERENCE_PROVIDER", provider)
     client, _, _ = app_setup
     body = client.get("/healthz").json()
     assert body["ok"] is True
@@ -216,8 +220,15 @@ def test_healthz_reports_one_gpu_per_base_model(app_setup):
     ]
     assert body["base_models"] == [QWEN, QWEN_35B]  # sorted by model id
     assert body["gpus"] == 2  # two configured supported base-model engines
-    assert body["gpu_by_model"] == {QWEN: "A100-80GB | H100", QWEN_35B: "H200 | B200"}
-    assert body["gpu_tiers"] == ["A100-80GB", "B200", "H100", "H200"]  # configured alternatives
+    expected = {
+        "modal": {QWEN: "L40S | A100-80GB", QWEN_35B: "H200"},
+        "lambda": {QWEN: "A100-80GB | H100", QWEN_35B: "H200 | B200"},
+        "all": {QWEN: "A100-80GB | H100 | L40S", QWEN_35B: "H200 | B200"},
+    }[provider]
+    assert body["gpu_by_model"] == expected
+    assert body["gpu_tiers"] == sorted(
+        {gpu for options in expected.values() for gpu in options.split(" | ")}
+    )
     assert "configuredGpu" not in body  # the single-GPU field is gone (per-model now)
     assert body["adapters"] == 3
 

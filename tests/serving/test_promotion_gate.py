@@ -461,7 +461,7 @@ def _gate_step_env() -> dict[str, str]:
         .replace("\ton", "\t'on'")
     )
     steps = workflow["jobs"]["deploy"]["steps"]
-    gate_step = next(s for s in steps if s.get("run", "").strip().endswith("promotion.gate"))
+    gate_step = next(s for s in steps if "-m flash.serving.promotion.gate" in s.get("run", ""))
     supplied = set(gate_step.get("env", {}))
     values = {
         "SUPABASE_SERVICE_ROLE_KEY": "sb_secret_x",
@@ -561,14 +561,14 @@ def test_gate_rejects_missing_or_invalid_canary_organization(org_id):
 def test_canary_budget_covers_engine_startup_and_short_request_with_network_headroom():
     from flash.serving.app.timeouts import (
         CANARY_NETWORK_HEADROOM_SECONDS,
+        LAMBDA_STARTUP_TIMEOUT_SECONDS,
         REQUEST_TIMEOUT_SECONDS,
-        STARTUP_TIMEOUT_SECONDS,
     )
 
     plan = gate_module._resolve("https://serve.freesolo.co", _gate_step_env())
     assert CANARY_NETWORK_HEADROOM_SECONDS > 0
     assert plan.request.timeout_seconds == (
-        STARTUP_TIMEOUT_SECONDS + REQUEST_TIMEOUT_SECONDS + CANARY_NETWORK_HEADROOM_SECONDS
+        LAMBDA_STARTUP_TIMEOUT_SECONDS + REQUEST_TIMEOUT_SECONDS + CANARY_NETWORK_HEADROOM_SECONDS
     )
     assert plan.request.org_id == _gate_step_env()["SERVING_CANARY_ORG_ID"]
 
@@ -707,3 +707,55 @@ def test_old_release_draining_beyond_five_minutes_can_still_be_promoted():
     )
     assert verdict.ok
     assert calls == ["health"] * 72 + ["stream", "accounting"]
+
+
+def _health_http_error(status):
+    request = httpx.Request("GET", "https://serve.example/healthz")
+    return httpx.HTTPStatusError(
+        "health status", request=request, response=httpx.Response(status, request=request)
+    )
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        TimeoutError(),
+        httpx.ConnectError("connection failed"),
+        httpx.ReadTimeout("read timed out"),
+        *[_health_http_error(status) for status in (408, 429, 502, 503, 504)],
+    ],
+)
+def test_transient_health_failure_restarts_stability_before_streaming(error):
+    snapshots = iter([_health(), error, *[_health() for _ in range(7)]])
+
+    def health():
+        value = next(snapshots)
+        if isinstance(value, Exception):
+            raise value
+        return value
+
+    verdict, calls = _evaluate(
+        health=health,
+        stream=_good_stream(),
+        accounting=_Snapshot(),
+        health_stable_seconds=30,
+        health_deadline_seconds=60,
+    )
+    assert verdict.ok
+    assert calls == ["health"] * 9 + ["stream", "accounting"]
+
+
+@pytest.mark.parametrize("error", [httpx.ConnectError("offline"), _health_http_error(503)])
+def test_persistent_transient_health_failure_expires_without_streaming(error):
+    verdict, calls = _evaluate(
+        health=error, stream=_good_stream(), accounting=_Snapshot(), health_deadline_seconds=12
+    )
+    assert verdict.reason == gate_module.HEALTH_UNREACHABLE
+    assert calls == ["health"] * 3
+
+
+@pytest.mark.parametrize("error", [_health_http_error(401), _health_http_error(403), ValueError()])
+def test_non_transient_health_errors_fail_without_retrying(error):
+    verdict, calls = _evaluate(health=error, stream=_good_stream(), accounting=_Snapshot())
+    assert verdict.reason == gate_module.HEALTH_UNREACHABLE
+    assert calls == ["health"]

@@ -106,8 +106,15 @@ def test_lora_engine_scales_to_zero_by_default(modal_app_module):
     # (has_presence), so omitting it and sending 0 are distinguishable on the wire -- an omitted
     # field leaves the floor to whatever the server defaults to, which is not ours to assume.
     assert all(kwargs["min_containers"] == modal_app_module.MIN_CONTAINERS for kwargs in cls_calls)
-    assert all("gpu" not in kwargs for kwargs in cls_calls)
-    assert {kwargs["scaledown_window"] for kwargs in cls_calls} == {2100}
+    assert all(
+        ("gpu" in kwargs) == (modal_app_module.INFERENCE_PROVIDER == "modal")
+        for kwargs in cls_calls
+    )
+    assert all(
+        kwargs["scaledown_window"]
+        == modal_app_module.scaledown_window_for(kwargs.get("gpu", ["H100"])[0])
+        for kwargs in cls_calls
+    )
 
     assert modal_app_module.app.function.call_count == 1
     assert modal_app_module.app.function.call_args.kwargs["min_containers"] == 1
