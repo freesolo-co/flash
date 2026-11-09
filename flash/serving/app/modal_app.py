@@ -477,8 +477,7 @@ def _build_engine(
             "startup_timeout": LAMBDA_STARTUP_TIMEOUT_SECONDS,
             "cpu": 1,
             "memory": 2048,
-            # Modal supports non-preemptible capacity only for CPU workloads.
-            "nonpreemptible": True,
+            "nonpreemptible": True,  # Modal supports this only for CPU workloads.
             "secrets": lambda_proxy_secrets,
         }
     )
