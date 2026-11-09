@@ -42,10 +42,15 @@ def test_qwen_rollout_waits_for_active_pool_startup(filename):
         if step.get("name") in {"Deploy serving", "Deploy development serving"}
     )
     assert "--strategy rolling" in deployment
-    readiness = next(
-        step["run"] for step in _steps(job) if "serving readiness" in step.get("name", "")
-    )
-    budget = int(re.search(r"SECONDS \+ (\d+)", readiness)[1])
+    if filename == "deploy-modal.yml":
+        from flash.serving.promotion.gate import _HEALTH_ROLLOUT_DEADLINE_SECONDS
+
+        budget = _HEALTH_ROLLOUT_DEADLINE_SECONDS
+    else:
+        readiness = next(
+            step["run"] for step in _steps(job) if "serving readiness" in step.get("name", "")
+        )
+        budget = int(re.search(r"SECONDS \+ (\d+)", readiness)[1])
     assert budget >= ROUTER_TIMEOUT_SECONDS + 60
     assert job["timeout-minutes"] * 60 >= budget + 15 * 60
 
@@ -644,14 +649,14 @@ def _step_index(name_fragment: str) -> int:
 def test_promotion_is_gated_on_a_real_stream_after_readiness():
     """A healthy `/healthz` proves a ROUTER booted, not that the release can serve.
 
-    The readiness poll only reads back the identity the deploy step just injected, so a release
-    whose GPU engines never start, whose streaming path is broken, or whose accounting never
-    settles passes it unchanged. The canary has to run AFTER readiness (it needs the new router
-    live) and BEFORE the job can finish, or a broken release is promoted with a green check.
+    The gate must retain its full handoff budget, require a stable release identity, then
+    generate a stream and verify accounting. An earlier successful health response must not
+    shorten that budget while old routers are still draining.
     """
     canary = _deploy_steps()[_step_index("real streaming canary")]
     assert "flash.serving.promotion.gate" in canary["run"]
-    assert _step_index("real streaming canary") > _step_index("serving readiness")
+    assert canary["run"].strip() == "python -m flash.serving.promotion.gate"
+    assert _step_index("real streaming canary") > _step_index("Deploy serving")
 
 
 def test_the_job_cap_covers_readiness_and_promotion_budgets():
@@ -667,8 +672,8 @@ def test_the_job_cap_covers_readiness_and_promotion_budgets():
     from flash.serving.promotion import gate as gate_module
 
     canary = next(step for step in _steps(job) if "real streaming canary" in step.get("name", ""))
-    health_budget = int(re.search(r"--health-timeout-seconds (\d+)", canary["run"])[1])
-    assert health_budget == 300  # Full readiness wait already ran before this recheck.
+    assert "--health-timeout" not in canary["run"]
+    health_budget = gate_module._HEALTH_ROLLOUT_DEADLINE_SECONDS
     gate_budget = (
         gate_module.CANARY_TIMEOUT_SECONDS
         + gate_module._DEFAULT_ACCOUNTING_DEADLINE_SECONDS

@@ -707,14 +707,3 @@ def test_old_release_draining_beyond_five_minutes_can_still_be_promoted():
     )
     assert verdict.ok
     assert calls == ["health"] * 72 + ["stream", "accounting"]
-
-
-def test_cli_passes_bounded_health_recheck_to_gate(monkeypatch):
-    from unittest.mock import AsyncMock
-
-    plan = object()
-    monkeypatch.setattr(gate_module, "_resolve", lambda *_: plan)
-    run = AsyncMock(return_value=PromotionVerdict(ok=True))
-    monkeypatch.setattr(gate_module, "_run", run)
-    assert gate_module.main(["--health-timeout-seconds", "300"]) == 0
-    run.assert_awaited_once_with(plan, health_deadline_seconds=300)
