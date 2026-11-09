@@ -175,7 +175,10 @@ async def _await_health(
             verdict = PromotionVerdict(ok=False, reason=HEALTH_UNREACHABLE)
             transient = isinstance(error, (TimeoutError, httpx.TransportError)) or (
                 isinstance(error, httpx.HTTPStatusError)
-                and (error.response.status_code in (408, 429) or 500 <= error.response.status_code < 600)
+                and (
+                    error.response.status_code in (408, 429)
+                    or 500 <= error.response.status_code < 600
+                )
             )
             if not transient:
                 return verdict
