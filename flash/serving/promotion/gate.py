@@ -163,23 +163,30 @@ async def _await_health(
     clock: Callable[[], float],
 ) -> PromotionVerdict:
     """Wait for stable candidate health before attempting the release-bound canary."""
+    import httpx
+
     deadline = clock() + max(0.0, deadline_seconds)
     verdict = PromotionVerdict(ok=False, reason=HEALTH_UNREACHABLE)
     matched_since: float | None = None
     while (remaining := deadline - clock()) > 0:
         try:
             payload = await asyncio.wait_for(loader(), timeout=remaining)
-        except TimeoutError:
-            return verdict
-        except Exception:
-            return PromotionVerdict(ok=False, reason=HEALTH_UNREACHABLE)
-        if clock() >= deadline:
-            return verdict
-        verdict = verify_health(
-            parse_health(payload),
-            expected_sha=expected_sha,
-            expected_deployment_id=expected_deployment_id,
-        )
+        except Exception as error:
+            verdict = PromotionVerdict(ok=False, reason=HEALTH_UNREACHABLE)
+            transient = isinstance(error, (TimeoutError, httpx.TransportError)) or (
+                isinstance(error, httpx.HTTPStatusError)
+                and (error.response.status_code in (408, 429) or 500 <= error.response.status_code < 600)
+            )
+            if not transient:
+                return verdict
+        else:
+            if clock() >= deadline:
+                return verdict
+            verdict = verify_health(
+                parse_health(payload),
+                expected_sha=expected_sha,
+                expected_deployment_id=expected_deployment_id,
+            )
         if verdict.ok:
             if matched_since is None:
                 matched_since = clock()
@@ -188,7 +195,11 @@ async def _await_health(
             # One matching health response does not mean the old containers have
             # drained: the next request can still hit the previous release.
             verdict = PromotionVerdict(ok=False, reason=HEALTH_NOT_STABLE)
-        elif verdict.reason in (HEALTH_SHA_MISMATCH, HEALTH_DEPLOYMENT_ID_MISMATCH):
+        elif verdict.reason in (
+            HEALTH_SHA_MISMATCH,
+            HEALTH_DEPLOYMENT_ID_MISMATCH,
+            HEALTH_UNREACHABLE,
+        ):
             matched_since = None
         else:
             return verdict
