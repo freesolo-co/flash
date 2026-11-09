@@ -485,7 +485,6 @@ def _build_engine(
         nonpreemptible=True,
         region="us",
         scaledown_window=scaledown_window_for(gpu[0] if isinstance(gpu, list) else gpu),
-
         timeout=REQUEST_TIMEOUT_SECONDS,
         min_containers=MIN_CONTAINERS,
         max_containers=replica_limit(INFERENCE_PROVIDER),
