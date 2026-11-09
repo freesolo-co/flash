@@ -31,7 +31,7 @@ CANARY_TIMEOUT = "canary_timeout"
 CANARY_TRANSPORT_FAILURE = "canary_transport_failure"
 CANARY_RESULT_REDIRECT_REJECTED = "canary_result_redirect_rejected"
 CANARY_RELEASE_MISMATCH = "canary_release_mismatch"
-_MAX_RESULT_REDIRECTS = 24
+_MAX_RESULT_REDIRECTS = 100
 _MAX_RELEASE_ATTEMPTS = 12
 _RELEASE_RETRY_SECONDS = 5.0
 

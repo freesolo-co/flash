@@ -364,7 +364,9 @@ def _resolve(base_url: str, env: dict[str, str]) -> GatePlan:
     )
 
 
-async def _run(plan: GatePlan) -> PromotionVerdict:
+async def _run(
+    plan: GatePlan, *, health_deadline_seconds: float = _HEALTH_ROLLOUT_DEADLINE_SECONDS
+) -> PromotionVerdict:
     import httpx
 
     base_url = plan.request.base_url.rstrip("/")
@@ -382,6 +384,7 @@ async def _run(plan: GatePlan) -> PromotionVerdict:
             return await plan.read_backlog(client)
 
         return await evaluate_promotion(
+            health_deadline_seconds=health_deadline_seconds,
             health_loader=health_loader,
             stream_runner=stream_runner,
             accounting_loader=accounting_loader,
@@ -394,14 +397,22 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="prove a hosted serving promotion")
     # only non-secret configuration is accepted as an argument.
     parser.add_argument("--base-url", default=os.environ.get("SERVING_BASE_URL", ""))
+    parser.add_argument("--health-timeout-seconds", type=int, default=None)
     args = parser.parse_args(argv)
+    if args.health_timeout_seconds is not None and args.health_timeout_seconds <= 0:
+        parser.error("--health-timeout-seconds must be positive")
     env = {name: os.environ.get(name, "") for name in _REQUIRED_ENV}
     try:
         plan = _resolve(args.base_url, env)
     except GateConfigError:
         print(f"promotion gate failed: {GATE_CONFIG_INCOMPLETE}", file=sys.stderr)
         return 1
-    verdict = asyncio.run(_run(plan))
+    options = (
+        {"health_deadline_seconds": args.health_timeout_seconds}
+        if args.health_timeout_seconds is not None
+        else {}
+    )
+    verdict = asyncio.run(_run(plan, **options))
     if verdict.ok:
         print("promotion gate passed")
         return 0

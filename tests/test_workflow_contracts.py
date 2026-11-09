@@ -666,10 +666,13 @@ def test_the_job_cap_covers_readiness_and_promotion_budgets():
 
     from flash.serving.promotion import gate as gate_module
 
+    canary = next(step for step in _steps(job) if "real streaming canary" in step.get("name", ""))
+    health_budget = int(re.search(r"--health-timeout-seconds (\d+)", canary["run"])[1])
+    assert health_budget == 300  # Full readiness wait already ran before this recheck.
     gate_budget = (
         gate_module.CANARY_TIMEOUT_SECONDS
         + gate_module._DEFAULT_ACCOUNTING_DEADLINE_SECONDS
-        + gate_module._HEALTH_ROLLOUT_DEADLINE_SECONDS
+        + health_budget
     )
     # Allow for controller/serving deployment, image builds and dependency setup.
     deploy_allowance = 15 * 60
@@ -847,7 +850,7 @@ def test_provider_deployment_requires_lambda_only_when_enabled(
     target.parent.mkdir(parents=True)
     source = (REPO_ROOT / "flash/serving/app/inference_provider.py").read_text()
     target.write_text(
-        source.replace('INFERENCE_PROVIDER = "lambda"', f'INFERENCE_PROVIDER = "{mode}"')
+        re.sub(r'INFERENCE_PROVIDER = "[^"]+"', f'INFERENCE_PROVIDER = "{mode}"', source)
     )
     output = tmp_path / "outputs"
     result = subprocess.run(

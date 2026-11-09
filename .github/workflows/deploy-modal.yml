@@ -43,7 +43,7 @@ jobs:
     # Include the full router drain window before the canary, its GPU cold start,
     # accounting settlement and image builds. The workflow contract test checks
     # these budgets against the job timeout.
-    timeout-minutes: 300
+    timeout-minutes: 360
     # serialize serving deploys across runs because each deploy mutates the live app. github can still
     # replace a pending run, so the gate compares against the sha reported by the deployed app rather
     # than assuming every push predecessor was deployed.
@@ -348,12 +348,12 @@ jobs:
           response_file="$(mktemp)"
           trap 'rm -f "$response_file"' EXIT
           # Match router startup: its full engine budget plus 60 seconds of headroom.
-          deadline=$((SECONDS + 3660))
+          deadline=$((SECONDS + 7260))
 
           while true; do
             remaining=$((deadline - SECONDS))
             if (( remaining <= 0 )); then
-              echo "::error::Production serving health check did not become ready within 3660 seconds."
+              echo "::error::Production serving health check did not become ready within 7260 seconds."
               exit 1
             fi
 
@@ -452,7 +452,8 @@ jobs:
           GITHUB_RUN_ATTEMPT: ${{ github.run_attempt }}
         # credentials reach the gate ONLY through the environment above. passing any of them as an
         # argument would put them in the process table and in the step's own command echo.
-        run: python -m flash.serving.promotion.gate
+        # Readiness above already waited for this release; recheck its identity within five minutes.
+        run: python -m flash.serving.promotion.gate --health-timeout-seconds 300
 
       - name: Nothing to deploy
         if: steps.gate.outputs.deploy != 'true'

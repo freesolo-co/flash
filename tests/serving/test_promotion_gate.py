@@ -461,7 +461,7 @@ def _gate_step_env() -> dict[str, str]:
         .replace("\ton", "\t'on'")
     )
     steps = workflow["jobs"]["deploy"]["steps"]
-    gate_step = next(s for s in steps if s.get("run", "").strip().endswith("promotion.gate"))
+    gate_step = next(s for s in steps if "-m flash.serving.promotion.gate" in s.get("run", ""))
     supplied = set(gate_step.get("env", {}))
     values = {
         "SUPABASE_SERVICE_ROLE_KEY": "sb_secret_x",
@@ -561,14 +561,14 @@ def test_gate_rejects_missing_or_invalid_canary_organization(org_id):
 def test_canary_budget_covers_engine_startup_and_short_request_with_network_headroom():
     from flash.serving.app.timeouts import (
         CANARY_NETWORK_HEADROOM_SECONDS,
+        LAMBDA_STARTUP_TIMEOUT_SECONDS,
         REQUEST_TIMEOUT_SECONDS,
-        STARTUP_TIMEOUT_SECONDS,
     )
 
     plan = gate_module._resolve("https://serve.freesolo.co", _gate_step_env())
     assert CANARY_NETWORK_HEADROOM_SECONDS > 0
     assert plan.request.timeout_seconds == (
-        STARTUP_TIMEOUT_SECONDS + REQUEST_TIMEOUT_SECONDS + CANARY_NETWORK_HEADROOM_SECONDS
+        LAMBDA_STARTUP_TIMEOUT_SECONDS + REQUEST_TIMEOUT_SECONDS + CANARY_NETWORK_HEADROOM_SECONDS
     )
     assert plan.request.org_id == _gate_step_env()["SERVING_CANARY_ORG_ID"]
 
@@ -707,3 +707,14 @@ def test_old_release_draining_beyond_five_minutes_can_still_be_promoted():
     )
     assert verdict.ok
     assert calls == ["health"] * 72 + ["stream", "accounting"]
+
+
+def test_cli_passes_bounded_health_recheck_to_gate(monkeypatch):
+    from unittest.mock import AsyncMock
+
+    plan = object()
+    monkeypatch.setattr(gate_module, "_resolve", lambda *_: plan)
+    run = AsyncMock(return_value=PromotionVerdict(ok=True))
+    monkeypatch.setattr(gate_module, "_run", run)
+    assert gate_module.main(["--health-timeout-seconds", "300"]) == 0
+    run.assert_awaited_once_with(plan, health_deadline_seconds=300)

@@ -1,6 +1,6 @@
 """Deployment-time provider policy for hosted Qwen; DeepSeek is independent."""
 
-INFERENCE_PROVIDER = "lambda"  # "modal", "lambda", or "all"; redeploy after changing.
+INFERENCE_PROVIDER = "modal"  # "modal", "lambda", or "all"; redeploy after changing.
 
 
 def validate_provider(provider):

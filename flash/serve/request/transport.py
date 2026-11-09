@@ -23,6 +23,7 @@ from flash.serve.contract.urls import (
     serving_base_url,
     serving_control_url,
 )
+from flash.serve.deployment.readiness import REVISION_READY_MAX_BUDGET_SECONDS
 from flash.serve.request.tool_calls import (
     FunctionTool,
     tools_wire,
@@ -425,7 +426,7 @@ def request_chat_sse(
         url=url,
         body=body,
         headers=headers,
-        timeout=30 * 60.0,
+        timeout=float(REVISION_READY_MAX_BUDGET_SECONDS + 60),
         frame_bytes=frame_bytes,
     )
 
@@ -473,7 +474,7 @@ def request_chat_stream(
         url=url,
         body=body,
         headers=headers,
-        timeout=30 * 60.0,
+        timeout=float(REVISION_READY_MAX_BUDGET_SECONDS + 60),
         frame_bytes=frame_bytes,
     )
     try:
