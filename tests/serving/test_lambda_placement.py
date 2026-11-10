@@ -25,7 +25,7 @@ def offer(gpu, price=300, count=1, regions=("us-west-1",), architecture="x86_64"
 def test_select_cheapest_available_approved_gpu_without_guessing_instance_ids(monkeypatch):
     from flash.serving.app.inference_provider import MODEL_POLICIES, ModelPolicy
 
-    monkeypatch.setitem(MODEL_POLICIES, SMALL, ModelPolicy("lambda"))
+    monkeypatch.setitem(MODEL_POLICIES, SMALL, ModelPolicy())
     catalog = {
         "provider-a100": offer("A100 (80 GB SXM4)", 250),
         "provider-h100": offer("H100 (80 GB SXM5)", 400),
@@ -90,11 +90,15 @@ def test_ampere_profile_uses_passing_fp8_path_without_changing_admission(model):
     assert engine_overrides_for(model) == before
 
 
-def test_moe_fp8_pin_and_unapproved_profile():
-    result = engine_profile(MOE, "H200")
-    assert result["serve_model_id"] == MOE + "-FP8"
-    assert result["model_revision"] == "c653bba46dfa06e9658dcc0b0dc87fe4685f14a2"
-    assert result["quantization"] == "fp8"
+@pytest.mark.parametrize("gpu", ["H200", "B200"])
+def test_moe_preserves_qualified_bf16_lora_profile(gpu):
+    result = engine_profile(MOE, gpu)
+    assert result == engine_overrides_for(MOE)
+    assert result["serve_model_id"] == MOE
+    assert result["quantization"] is None
+    assert result["enforce_eager"] is False
+    assert result["max_loras"] == 6
+    assert result["max_lora_rank"] == 64
     with pytest.raises(ValueError, match="Unapproved"):
         engine_profile(MOE, "A100-80GB")
 
@@ -114,11 +118,14 @@ def test_a10_is_cheapest_small_model_option():
         assert validate_gpu(model, "NVIDIA A10", 22.06 * 2**30, 1) == "A10"
 
 
-def test_nine_base_stays_on_h100_even_when_a100_is_cheaper():
+@pytest.mark.parametrize("a100", ["A100 (40 GB SXM4)", "A100 (80 GB SXM4)"])
+def test_nine_base_uses_available_a100_or_h100(a100):
     model = "Qwen/Qwen3.5-9B-Base"
-    catalog = {"a100": offer("A100 (80 GB SXM4)", 200), "h100": offer("H100 (80 GB SXM5)", 400)}
+    catalog = {"a100": offer(a100, 200), "h100": offer("H100 (80 GB SXM5)", 400)}
+    assert select_region(catalog, model) == ("a100", "us-west-1")
+    catalog["a100"]["regions_with_capacity_available"] = []
     assert select_region(catalog, model) == ("h100", "us-west-1")
-    del catalog["h100"]
+    catalog["h100"]["regions_with_capacity_available"] = []
     with pytest.raises(RuntimeError, match="no US capacity"):
         select_region(catalog, model)
 
@@ -126,3 +133,9 @@ def test_nine_base_stays_on_h100_even_when_a100_is_cheaper():
 def test_small_model_does_not_fall_back_to_more_expensive_hardware():
     with pytest.raises(RuntimeError, match="no US capacity"):
         select_region({"h100": offer("H100 (80 GB SXM5)", 400)}, SMALL)
+
+
+def test_rejected_offer_does_not_prevent_trying_other_available_shapes():
+    model = "Qwen/Qwen3.5-9B-Base"
+    catalog = {"a100": offer("A100 (40 GB SXM4)", 200), "h100": offer("H100 (80 GB SXM5)", 400)}
+    assert select_region(catalog, model, excluded={("a100", "us-west-1")}) == ("h100", "us-west-1")

@@ -5,7 +5,8 @@ import time
 
 from flash.serving.app.inference_provider import capacity_for
 
-from .config import LEASE_SECONDS, SSH_KEY_NAME, select_region
+from .api import LambdaAPIError
+from .config import LEASE_SECONDS, SSH_KEY_NAME, NoCapacityError, placements, select_region
 from .resources import cache_filesystem, firewall
 
 
@@ -14,6 +15,8 @@ class Fleet:
         if environment not in {"main", "dev"}:
             raise ValueError("Lambda fleet must use the main or dev environment")
         self.api, self.ledger, self.environment, self.clock = api, ledger, environment, clock
+        self.shared_capacity = None
+        self._capacity_rejections = {}
 
     def name(self, owner):
         if not re.fullmatch(r"[0-9a-f]{32}", owner):
@@ -43,7 +46,16 @@ class Fleet:
                 raise ValueError("Lambda owner already used")
             return await self.inspect(owner)
         await self._check_capacity(model, revision)
-        instance_type, region = select_region(await self.api.call("GET", "instance-types"), model)
+        self._capacity_rejections = {
+            shape: expiry
+            for shape, expiry in self._capacity_rejections.items()
+            if expiry > self.clock()
+        }
+        instance_type, region = select_region(
+            await self.api.call("GET", "instance-types"),
+            model,
+            excluded=self._capacity_rejections,
+        )
         record = {
             "instance_type": instance_type,
             "region": region,
@@ -57,26 +69,40 @@ class Fleet:
         filesystem_id = await cache_filesystem(self.api, self.environment, region)
         await self.ledger.put(owner, record)
         # A process failure after this write must never cause a blind second launch.
-        result = await self.api.call(
-            "POST",
-            "instance-operations/launch",
-            {
-                "region_name": region,
-                "instance_type_name": instance_type,
-                "ssh_key_names": [SSH_KEY_NAME],
-                "firewall_rulesets": [{"id": firewall_id}],
-                "file_system_mounts": [
-                    {"file_system_id": filesystem_id, "mount_point": "/data/hosting-cache"}
-                ],
-                "name": name,
-                "image": {"family": "gpu-base-24-04"},
-                "user_data": user_data,
-                "tags": [
-                    {"key": "flash-owner", "value": owner},
-                    {"key": "flash-environment", "value": self.environment},
-                ],
-            },
-        )
+        try:
+            result = await self.api.call(
+                "POST",
+                "instance-operations/launch",
+                {
+                    "region_name": region,
+                    "instance_type_name": instance_type,
+                    "ssh_key_names": [SSH_KEY_NAME],
+                    "firewall_rulesets": [{"id": firewall_id}],
+                    "file_system_mounts": [
+                        {"file_system_id": filesystem_id, "mount_point": "/data/hosting-cache"}
+                    ],
+                    "name": name,
+                    "image": {"family": "gpu-base-24-04"},
+                    "user_data": user_data,
+                    "tags": [
+                        {"key": "flash-owner", "value": owner},
+                        {"key": "flash-environment", "value": self.environment},
+                    ],
+                },
+            )
+        except LambdaAPIError as exc:
+            # Only an explicit rejected launch proves that no VM was created.
+            # Keep ambiguous failures in the ownership ledger for reconciliation.
+            if (
+                400 <= exc.status < 500
+                and exc.code == "instance-operations/launch/insufficient-capacity"
+            ):
+                await self.ledger.delete(owner)
+                self._capacity_rejections[(instance_type, region)] = self.clock() + 120
+                raise NoCapacityError(
+                    "Lambda rejected capacity; retry approved alternatives"
+                ) from exc
+            raise
         ids = result.get("instance_ids", [])
         if len(ids) != 1:
             raise RuntimeError("Lambda launch did not return exactly one instance")
@@ -86,11 +112,12 @@ class Fleet:
 
     async def _check_capacity(self, model, revision):
         # Modal normally enforces this. Include uncertain/orphan launches so a
-        # replacement CPU replica cannot silently allocate a third GPU.
+        # replacement CPU replica cannot silently exceed its GPU budget.
         instances = await self.api.call("GET", "instances")
         occupied = 0
+        allocated = 0
         async for owner, record in self.ledger.items():
-            if record["model"] != model or record["revision"] != revision:
+            if record["model"] != model:
                 continue
             live = any(
                 self.owns(instance, owner) and instance["status"] != "terminated"
@@ -101,9 +128,13 @@ class Fleet:
                 and self.clock() - record["heartbeat"] <= LEASE_SECONDS
             )
             if not record.get("released") or live or uncertain:
-                occupied += 1
+                allocated += 1
+                if record["revision"] == revision:
+                    occupied += 1
+        if self.shared_capacity is not None:
+            await self.shared_capacity.before_launch(model, revision, allocated)
         if occupied >= capacity_for(model, "lambda")[1]:
-            raise RuntimeError("Lambda model/release replica limit reached; pending cleanup")
+            raise NoCapacityError("Lambda model/release replica limit reached; pending cleanup")
 
     async def inspect(self, owner):
         record = await self.ledger.get(owner)
@@ -124,12 +155,48 @@ class Fleet:
             return found[0]
         return {"status": "pending"}
 
-    async def heartbeat(self, owner):
+    async def allocated_count(self, model, *, exclude_revision=None):
+        instances = await self.api.call("GET", "instances")
+        count = 0
+        async for owner, record in self.ledger.items():
+            if record["model"] != model or record["revision"] == exclude_revision:
+                continue
+            live = any(
+                self.owns(instance, owner) and instance["status"] != "terminated"
+                for instance in instances
+            )
+            if live or not record.get("released"):
+                count += 1
+        return count
+
+    async def ready_count(self, model, *, revision=None):
+        count = 0
+        async for _owner, record in self.ledger.items():  # noqa: PERF102 - ledger exposes async items
+            if (
+                record["model"] == model
+                and (revision is None or record["revision"] == revision)
+                and not record.get("released")
+                and record.get("ready_at", 0) > max(0, self.clock() - 90)
+                and record.get("gpu") in placements(model)
+            ):
+                count += 1
+        return count
+
+    async def heartbeat(self, owner, health=None):
         self.name(owner)
         record = await self.ledger.get(owner)
         if record is None or record.get("released"):
             raise RuntimeError("Lambda replica lease has been released")
         record["heartbeat"] = self.clock()
+        ready = bool(
+            health
+            and health.get("ok") is True
+            and health.get("base_model") == record["model"]
+            and health.get("deployment_sha") == record["revision"]
+            and health.get("configured_gpu") in placements(record["model"])
+        )
+        record["ready_at"] = self.clock() if ready else 0
+        record["gpu"] = health.get("configured_gpu") if ready else None
         await self.ledger.put(owner, record)
 
     async def release(self, owner):

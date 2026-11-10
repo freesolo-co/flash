@@ -42,8 +42,8 @@ POOL_SAMPLE_MAX_AGE = 20
 POOL_STATE_NAME = "freesolo-deepseek-pool-load"
 # Main can scale to 16 B200s; rolling deploys allow a full replacement pool.
 _POLICY = policy_for(MODEL_ID)
-if _POLICY.provider != "modal" or _POLICY.lambda_gpus:
-    raise ValueError("DeepSeek supports only Modal serving")
+if _POLICY.lambda_gpus:
+    raise ValueError("DeepSeek does not support the Lambda worker runtime")
 MAIN_MIN_CONTAINERS = _POLICY.min_capacity
 MAIN_MAX_CONTAINERS = _POLICY.max_capacity
 MAIN_ROLLOUT_MAX_CONTAINERS = 2 * MAIN_MAX_CONTAINERS

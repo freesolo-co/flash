@@ -123,27 +123,22 @@ def health_body(
     # not expose here. ``gpus`` is the supported base-model engine count and remains stable when
     # demand-driven containers scale to zero.
     gpu_by_model = {
-        m: (
-            " | ".join(modal_gpus_for(m))
-            if policy_for(m).provider == "modal"
-            else " | ".join(
-                dict.fromkeys(
-                    [
-                        *placements(m),
-                        *(modal_gpus_for(m) if policy_for(m).provider == "all" else []),
-                    ]
-                )
-            )
-        )
+        m: " | ".join(dict.fromkeys([*placements(m), *modal_gpus_for(m)]))
         if m.startswith("Qwen/")
         else gpu_for(m)
         for m in supported_models
     }
-    providers = {policy_for(m).provider for m in supported_models}
+    providers = {m: "lambda" if m.startswith("Qwen/") else "modal" for m in supported_models}
+    primary_providers = set(providers.values())
     body = {
         "ok": True,
-        "inference_provider": (next(iter(providers)) if len(providers) == 1 else "mixed"),
-        "provider_by_model": {m: policy_for(m).provider for m in supported_models},
+        "inference_provider": next(iter(primary_providers))
+        if len(primary_providers) == 1
+        else "mixed",
+        "provider_by_model": providers,
+        "fallback_provider_by_model": {
+            m: "modal" for m in supported_models if m.startswith("Qwen/")
+        },
         "capacity_by_model": {
             m: {
                 "min": policy_for(m).min_capacity,

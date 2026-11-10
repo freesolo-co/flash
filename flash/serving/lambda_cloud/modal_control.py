@@ -12,8 +12,8 @@ from .fleet import Fleet
 
 
 class Ledger:
-    def __init__(self):
-        self.store = modal.Dict.from_name(LEDGER_NAME, create_if_missing=True)
+    def __init__(self, name=LEDGER_NAME):
+        self.store = modal.Dict.from_name(name, create_if_missing=True)
 
     async def get(self, key):
         return await self.store.get.aio(key)
@@ -35,6 +35,15 @@ def register_control(app, secret, image, module_name):
             environment = os.environ["FLASH_LAMBDA_ENVIRONMENT"]
             self.api = LambdaAPI(os.environ["LAMBDA_API_KEY"])
             self.fleet = Fleet(self.api, Ledger(), environment)
+            from .pool_capacity import SharedCapacity, modal_pools
+
+            self.capacity = SharedCapacity(
+                self.fleet,
+                modal_pools(environment),
+                Ledger(LEDGER_NAME + "-pools"),
+                os.environ.get("FREESOLO_DEPLOYMENT_SHA", ""),
+            )
+            self.fleet.shared_capacity = self.capacity
 
         @modal.exit()
         async def close(self):
@@ -60,8 +69,22 @@ def register_control(app, secret, image, module_name):
             return await self.fleet.inspect(owner)
 
         @modal.method()
-        async def heartbeat(self, owner):
-            return await self.fleet.heartbeat(owner)
+        async def heartbeat(self, owner, health=None):
+            return await self.fleet.heartbeat(owner, health)
+
+        @modal.method()
+        async def activate(self, revision):
+            return await self.capacity.activate(revision)
+
+        @modal.method()
+        async def refresh_capacity(self, model):
+            if not await self.capacity.active():
+                raise RuntimeError("Cannot refresh a superseded capacity controller")
+            await self.capacity.reconcile_model(model)
+
+        @modal.method()
+        async def choose(self, model):
+            return await self.capacity.choose(model)
 
         @modal.method()
         async def release(self, owner):
@@ -69,10 +92,28 @@ def register_control(app, secret, image, module_name):
 
         @modal.method()
         async def reap(self):
-            return await self.fleet.reap()
+            result = await self.fleet.reap()
+            await self.capacity.reconcile()
+            return result
 
     async def reap_lambda_workers():
         return await control().reap.remote.aio()
+
+    async def choose_provider(model):
+        # Routing reads leases independently of the serialized VM mutation queue.
+        # A slow cloud launch must not hold incoming requests behind it.
+        from .pool_capacity import SharedCapacity, modal_pools
+
+        environment = os.environ["FLASH_LAMBDA_ENVIRONMENT"]
+        fleet = Fleet(None, Ledger(), environment)
+        capacity = SharedCapacity(
+            fleet,
+            modal_pools(environment),
+            Ledger(LEDGER_NAME + "-pools"),
+            "",
+            refresh=control().refresh_capacity.remote.aio,
+        )
+        return await capacity.choose(model)
 
     module = sys.modules[module_name]
     LambdaFleet.__module__ = module.__name__
@@ -97,4 +138,14 @@ def register_control(app, secret, image, module_name):
         max_containers=1,
         nonpreemptible=True,
     )(reap_lambda_workers)
+    choose_provider.__module__ = module.__name__
+    choose_provider.__qualname__ = "choose_provider"
+    module.choose_provider = choose_provider
+    module.choose_provider = app.function(
+        image=image,
+        secrets=[secret],
+        timeout=30,
+        min_containers=1,
+        max_containers=2,
+    )(modal.concurrent(max_inputs=32)(choose_provider))
     return control, reaper

@@ -15,8 +15,11 @@ class ProviderSelection:
         async with self._lock:
             choice, expires = self._choices.get(model, (None, 0))
             if self.clock() >= expires:
-                choice = "lambda" if await self.capacity(model) else "modal"
-                self._choices[model] = choice, self.clock() + 30
+                async with asyncio.timeout(5):
+                    choice = await self.capacity(model)
+                if choice not in {"lambda", "modal"}:
+                    raise RuntimeError("Invalid serving provider choice")
+                self._choices[model] = choice, self.clock() + 1
             return choice
 
 
@@ -26,3 +29,14 @@ async def unregister_active(engines, org_id, model_id, expected_generation):
         stats = await engine.health.get_current_stats.aio()
         if any((stats.num_total_runners, stats.num_running_inputs, stats.backlog)):
             await engine.unregister.remote.aio(org_id, model_id, expected_generation)
+
+
+def bind_lambda_control():
+    """Keep request routing independent of the serialized VM mutation queue."""
+    import modal
+
+    from flash.serving.lambda_cloud.config import APP_NAME
+
+    fleet = modal.Cls.from_name(APP_NAME, "LambdaFleet")()
+    chooser = modal.Function.from_name(APP_NAME, "choose_provider")
+    return fleet, ProviderSelection(chooser.remote.aio)
