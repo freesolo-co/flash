@@ -208,9 +208,10 @@ def test_unregister_safe_records_exact_gpu_cleanup_failure(capsys):
 
 @pytest.mark.parametrize("provider", ["modal", "lambda", "all"])
 def test_healthz_reports_one_gpu_per_base_model(app_setup, monkeypatch, provider):
-    from flash.serving.src.http import routing
+    from flash.serving.app.inference_provider import MODEL_POLICIES, ModelPolicy
 
-    monkeypatch.setattr(routing, "INFERENCE_PROVIDER", provider)
+    for model in (QWEN, QWEN_35B):
+        monkeypatch.setitem(MODEL_POLICIES, model, ModelPolicy(provider))
     client, _, _ = app_setup
     body = client.get("/healthz").json()
     assert body["ok"] is True

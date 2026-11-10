@@ -240,7 +240,7 @@ jobs:
           import os
           import runpy
           policy = runpy.run_path("flash/serving/app/inference_provider.py")
-          enabled = policy["INFERENCE_PROVIDER"] != "modal"
+          enabled = policy["lambda_enabled"]()
           if enabled and not os.environ.get("LAMBDA_API_KEY"):
               raise SystemExit("LAMBDA_API_KEY is required for lambda/all inference")
           with open(os.environ["GITHUB_OUTPUT"], "a") as output:

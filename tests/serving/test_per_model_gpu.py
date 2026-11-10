@@ -47,7 +47,12 @@ def modal_app_module(load_modal_app_under_stub, request):
     from flash.serving.app import inference_provider
 
     with pytest.MonkeyPatch.context() as patch:
-        patch.setattr(inference_provider, "INFERENCE_PROVIDER", request.param)
+        for model in base_models():
+            patch.setitem(
+                inference_provider.MODEL_POLICIES,
+                model,
+                inference_provider.ModelPolicy(request.param),
+            )
         return load_modal_app_under_stub(modal_stub)
 
 
@@ -123,7 +128,6 @@ print(json.dumps({
     "mode": modal_app.SERVING_DEPLOYMENT_MODE,
     "custom_domain": modal_app.SERVING_CUSTOM_DOMAIN,
     "asgi_custom_domains": modal_stub.asgi_app.call_args.kwargs["custom_domains"],
-    "min_containers": modal_app.MIN_CONTAINERS,
 }))
 """
 
@@ -158,7 +162,6 @@ def test_deployment_mode_unset_defaults_to_production_with_zero_floor() -> None:
         "mode": "production",
         "custom_domain": "",
         "asgi_custom_domains": None,
-        "min_containers": 0,
     }
 
 
@@ -173,7 +176,6 @@ def test_explicit_production_mode_accepts_production_custom_domain() -> None:
         "mode": "production",
         "custom_domain": "serve.freesolo.co",
         "asgi_custom_domains": ["serve.freesolo.co"],
-        "min_containers": 0,
     }
 
 
@@ -189,7 +191,6 @@ def test_development_mode_accepts_exact_custom_domain_with_zero_floor() -> None:
         "mode": "development",
         "custom_domain": _DEVELOPMENT_CUSTOM_DOMAIN,
         "asgi_custom_domains": [_DEVELOPMENT_CUSTOM_DOMAIN],
-        "min_containers": 0,
     }
 
 
@@ -486,7 +487,7 @@ def test_models_route_to_qualified_gpu(modal_app_module, model, gpu, sequences):
     assert modal_app_module._engine_concurrency(model) == (sequences, sequences)
     expected = (
         modal_app_module.modal_gpus_for(model)
-        if modal_app_module.INFERENCE_PROVIDER == "modal"
+        if issubclass(cls, modal_app_module.HostedModalEngine)
         else None
     )
     assert cls.pinned_gpu == expected
@@ -504,7 +505,7 @@ def test_tier_classes_inherit_the_shared_impl(modal_app_module):
     tier = modal_app_module.ENGINE_BY_MODEL["Qwen/Qwen3.6-35B-A3B"]
     implementation = (
         modal_app_module.HostedModalEngine
-        if modal_app_module.INFERENCE_PROVIDER == "modal"
+        if issubclass(tier, modal_app_module.HostedModalEngine)
         else modal_app_module.LambdaEngineProxy
     )
     assert issubclass(tier, implementation)
@@ -517,7 +518,7 @@ def test_tier_classes_inherit_the_shared_impl(modal_app_module):
 def test_only_modal_engines_claim_gpu_options(modal_app_module):
     """Worker health identifies the selected GPU after capacity-dependent placement."""
     for cls in modal_app_module.ENGINE_BY_MODEL.values():
-        assert (cls.pinned_gpu is None) == (modal_app_module.INFERENCE_PROVIDER == "lambda")
+        assert (cls.pinned_gpu is None) == (issubclass(cls, modal_app_module.LambdaEngineProxy))
 
 
 def test_tier_class_identity_is_fixed_before_decoration(modal_app_module):
@@ -1001,8 +1002,6 @@ def test_modal_stream_entrypoint_uses_regular_call(modal_app_module, monkeypatch
 
 def test_hosted_qwen_registers_only_the_selected_provider(modal_app_module):
     mod = modal_app_module
-    for call in mod.app.cls.call_args_list:
-        assert ("gpu" in call.kwargs) == (mod.INFERENCE_PROVIDER == "modal")
-    for cls in mod.ENGINE_BY_MODEL.values():
-        assert issubclass(cls, mod.LambdaEngineProxy) == (mod.INFERENCE_PROVIDER == "lambda")
-        assert issubclass(cls, mod._LoraEngineImpl) == (mod.INFERENCE_PROVIDER == "modal")
+    for call, cls in zip(mod.app.cls.call_args_list, mod.ENGINE_BY_MODEL.values(), strict=True):
+        assert ("gpu" in call.kwargs) == issubclass(cls, mod.HostedModalEngine)
+        assert issubclass(cls, mod.LambdaEngineProxy) != issubclass(cls, mod._LoraEngineImpl)

@@ -1,5 +1,7 @@
 """Pinned identity and bounded capacity for the DeepSeek serving pool."""
 
+from flash.serving.app.inference_provider import policy_for
+
 MODEL_ID = "deepseek-ai/DeepSeek-V4.1-Flash-1017"
 APP_NAME = "freesolo-deepseek-serving"
 MODEL_REVISION = "1bae0e1088993b9b82de08f59de5be5a34e42170"
@@ -39,11 +41,14 @@ POOL_SAMPLE_SECONDS = 5
 POOL_SAMPLE_MAX_AGE = 20
 POOL_STATE_NAME = "freesolo-deepseek-pool-load"
 # Main can scale to 16 B200s; rolling deploys allow a full replacement pool.
-MAIN_MIN_CONTAINERS = 0
-MAIN_MAX_CONTAINERS = 4
+_POLICY = policy_for(MODEL_ID)
+if _POLICY.provider != "modal" or _POLICY.lambda_gpus:
+    raise ValueError("DeepSeek supports only Modal serving")
+MAIN_MIN_CONTAINERS = _POLICY.min_capacity
+MAIN_MAX_CONTAINERS = _POLICY.max_capacity
 MAIN_ROLLOUT_MAX_CONTAINERS = 2 * MAIN_MAX_CONTAINERS
 MAIN_BUFFER_CONTAINERS = 0
-MAX_CONTAINERS = 1
+MAX_CONTAINERS = _POLICY.dev_max_capacity or _POLICY.max_capacity
 BUFFER_CONTAINERS = 0
 SCALEDOWN_SECONDS = 600
 SCALEUP_SECONDS = 1
