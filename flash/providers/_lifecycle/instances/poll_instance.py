@@ -174,7 +174,9 @@ class _TerminalArtifacts:
         )
         return PollResult(
             False,
-            failure="job_preempted" if retriable else "job_failed",
+            # A worker-flagged transient fault is retried on the same shape (see retry_decision);
+            # a vanished instance is preemption and keeps its own policy below.
+            failure="worker_retriable" if retriable else "job_failed",
             detail=self._adapter.failure_detail(marker),
         )
 
@@ -536,16 +538,21 @@ def _classify_dead_host(
     # that is DETERMINISTIC -> fail FAST. A crash the worker flagged retriable still retries.
     err = ctx.adapter.read_current_error()
     # error files are attempt-scoped, so a present file already belongs to this exact handle.
-    worker_crashed = bool(err and err.strip()) and not worker_flagged_retriable(
+    errored = bool(err and err.strip())
+    flagged = worker_flagged_retriable(
         ctx.heartbeat_reader,
         launch_ts=ctx.adapter.launch_ts,
         current_attempt=ctx.adapter.current_attempt,
     )
-    return PollResult(
-        False,
-        failure="job_failed" if worker_crashed else "job_preempted",
-        detail=ctx.adapter.failure_detail(None),
-    )
+    if errored and not flagged:
+        failure = "job_failed"
+    elif errored or flagged:
+        # the worker itself reported a transient fault: retried on the same shape, unlike a host
+        # that vanished without a word (preemption), whose policy depends on Spot.
+        failure = "worker_retriable"
+    else:
+        failure = "job_preempted"
+    return PollResult(False, failure=failure, detail=ctx.adapter.failure_detail(None))
 
 
 def _process_heartbeat(ctx: _PollContext, state: _PollState) -> None:
