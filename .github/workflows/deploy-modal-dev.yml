@@ -11,7 +11,8 @@ jobs:
     name: Wait for Lambda GPU capacity
     if: github.ref == 'refs/heads/dev'
     runs-on: ubuntu-latest
-    # Keep the five-hour provider wait separate from deployment/readiness budgets.
+    # Informational watch: Modal fallback serves any model Lambda lacks, so missing capacity only
+    # emits a warning annotation. Kept separate from deployment/readiness budgets.
     timeout-minutes: 310
     permissions:
       contents: read
