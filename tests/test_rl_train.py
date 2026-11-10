@@ -5565,11 +5565,12 @@ def test_concurrently_finished_episodes_are_scored_in_one_env_call():
     assert sum(env.batch_sizes) == 8, "an episode was scored twice or not at all"
 
 
-def test_a_batched_score_reaches_the_env_under_the_same_lock_every_other_call_takes():
-    # scoring is batched to shorten how long the lock is held, NOT to drop it. `reward_thread_safe`
-    # licenses racing the scorer against ITSELF; it says nothing about racing it against a
-    # concurrent episode's `env_reply`, and no env contract permits that.
+def test_a_not_thread_safe_env_is_scored_under_the_same_lock_every_other_call_takes():
+    # an env that opts out with `reward_thread_safe = False` (a shared browser, a non-thread-safe
+    # client) must never have its scorer race a concurrent episode's `env_reply`.
     class _LockObservingEnv(_BridgeEnv):
+        reward_thread_safe = False
+
         def __init__(self):
             super().__init__()
             self.held_during_scoring: list[bool] = []
@@ -5589,6 +5590,114 @@ def test_a_batched_score_reaches_the_env_under_the_same_lock_every_other_call_ta
     bridge.step({"session_id": "a", "completion_text": "answer"})
     bridge.score({"session_id": "a", "turn_count": 1})
     assert env.held_during_scoring == [True], "the env was scored without the session lock held"
+
+
+def _parked_scorer_env(*, reward_thread_safe):
+    """an env whose scorer parks until released, to observe what a slow score blocks."""
+    entered = threading.Event()
+    release = threading.Event()
+
+    class _SlowScoringEnv(_BridgeEnv):
+        def rollout_rewards_many(self, items):
+            from flash.envs.loading.base import RolloutReward
+
+            entered.set()
+            release.wait(timeout=30)
+            return [RolloutReward(episode=1.0, turns=None) for _ in items]
+
+    env = _SlowScoringEnv(done_after=2)
+    env.reward_thread_safe = reward_thread_safe
+    return env, entered, release
+
+
+def _step_while_scoring(env, entered, release):
+    """park session a's score in the env, then step session b. returns (step finished early, score)."""
+    bridge = _bridge(env, examples=[{"index": 0}, {"index": 1}])
+    bridge.start({"index": 0, "session_id": "a"})
+    bridge.start({"index": 1, "session_id": "b"})
+    bridge.step({"session_id": "a", "completion_text": "answer"})
+    scored: list[float] = []
+    scorer = threading.Thread(
+        target=lambda: scored.append(bridge.score({"session_id": "a", "turn_count": 1})["score"])
+    )
+    scorer.start()
+    assert entered.wait(timeout=30), "the scorer never reached the env"
+    stepper = threading.Thread(
+        target=lambda: bridge.step({"session_id": "b", "completion_text": "search"})
+    )
+    stepper.start()
+    stepper.join(timeout=1.0)
+    finished_early = not stepper.is_alive()
+    release.set()
+    stepper.join(timeout=30)
+    scorer.join(timeout=30)
+    assert not stepper.is_alive(), "the step never completed"
+    assert not scorer.is_alive(), "the score never completed"
+    return finished_early, scored
+
+
+def test_a_thread_safe_env_keeps_stepping_while_a_slow_score_runs():
+    # a remote grader can take minutes per episode. scored under the step lock, that one score
+    # freezes every other in-flight episode's env_reply until verl's no-progress watchdog fires.
+    env, entered, release = _parked_scorer_env(reward_thread_safe=True)
+    finished_early, scored = _step_while_scoring(env, entered, release)
+    assert finished_early, "a step waited on an unrelated episode's score"
+    assert scored == [1.0]
+
+
+def test_a_not_thread_safe_env_still_makes_a_step_wait_for_a_score_in_progress():
+    # `reward_thread_safe = False` keeps the old behavior: the scorer is never raced against
+    # env_reply state.
+    env, entered, release = _parked_scorer_env(reward_thread_safe=False)
+    finished_early, scored = _step_while_scoring(env, entered, release)
+    assert not finished_early, "a step raced the scorer of an env that is not thread-safe"
+    assert scored == [1.0]
+
+
+def _step_while_another_episode_is_in_env_reply(*, reward_thread_safe):
+    """park episode a inside env_reply, then step episode b. returns whether b finished first."""
+    entered = threading.Event()
+    release = threading.Event()
+
+    class _SlowReplyEnv(_BridgeEnv):
+        def env_reply(self, messages, state):
+            if state["example"]["index"] == 0:
+                entered.set()
+                release.wait(timeout=30)
+            return super().env_reply(messages, state)
+
+    env = _SlowReplyEnv(done_after=3)
+    env.reward_thread_safe = reward_thread_safe
+    bridge = _bridge(env, examples=[{"index": 0}, {"index": 1}])
+    bridge.start({"index": 0, "session_id": "a"})
+    bridge.start({"index": 1, "session_id": "b"})
+    first = threading.Thread(
+        target=lambda: bridge.step({"session_id": "a", "completion_text": "search"})
+    )
+    first.start()
+    assert entered.wait(timeout=30), "episode a never reached env_reply"
+    second = threading.Thread(
+        target=lambda: bridge.step({"session_id": "b", "completion_text": "search"})
+    )
+    second.start()
+    second.join(timeout=1.0)
+    finished_first = not second.is_alive()
+    release.set()
+    first.join(timeout=30)
+    second.join(timeout=30)
+    assert not first.is_alive(), "episode a's step never completed"
+    assert not second.is_alive(), "episode b's step never completed"
+    return finished_first
+
+
+def test_a_thread_safe_env_runs_different_episodes_turns_concurrently():
+    # a tool call (a sandboxed search, a browser action) can take seconds; with every episode's
+    # env_reply serialized, a rollout batch runs its tools one at a time.
+    assert _step_while_another_episode_is_in_env_reply(reward_thread_safe=True)
+
+
+def test_a_not_thread_safe_env_runs_one_episodes_turn_at_a_time():
+    assert not _step_while_another_episode_is_in_env_reply(reward_thread_safe=False)
 
 
 def test_a_failing_batch_fails_every_episode_in_it_rather_than_hanging_them():

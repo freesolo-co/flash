@@ -41,6 +41,10 @@ from flash.envs.scoring.response import ScoredResponseText
 _MULTI_TURN_SCORE_BATCH_SIZE = 64
 _MULTI_TURN_SCORE_FLUSH_WAIT_S = 0.1
 _MULTI_TURN_SCORE_SHUTDOWN_WAIT_S = 5.0
+# batches a thread-safe env scores at once. a slow batch (a sandbox, a remote grader) must not hold
+# the episodes that finish after it; the env's own per-instance pool (`max_score_concurrency`) is
+# shared by overlapping calls, so this does not raise the rate the env's backend sees.
+_MULTI_TURN_CONCURRENT_SCORE_BATCHES = 16
 # reap sessions abandoned by dead ray actors, which otherwise retain env state forever.
 # the timeout must cover a live turn's full generation and env reply; late dead-session cleanup only
 # holds memory, while premature cleanup breaks a working rollout.
@@ -251,9 +255,18 @@ class MultiTurnBridge:
         self._on_episode_scored = on_episode_scored
         self._parent_work = parent_work or ParentWorkGauge()
         self._identity_ledger = identity_ledger
-        # the flash env is not required to be thread-safe, and verl runs many rollouts at once.
-        # every stateful episode touch below happens under this lock.
+        # guards the bridge's own bookkeeping (the session table and the turn counters).
         self._lock = threading.Lock()
+        # verl runs many rollouts at once, and an env is thread-safe unless it says otherwise
+        # (`reward_thread_safe`, default True). a thread-safe env is driven as concurrently as the
+        # rollouts arrive: each episode's turns run under that episode's own lock, and scoring runs
+        # under no bridge lock, so a slow env_reply or scorer (a sandbox, a remote grader) never
+        # stalls the other in-flight episodes. an env that sets `reward_thread_safe = False` gets
+        # every env call serialized under `_lock`, as before.
+        self._concurrent_env = bool(getattr(env, "reward_thread_safe", True))
+        # the processor/tokenizer render glue between turns; HF fast tokenizers are not safe to
+        # share across threads, and rendering is cheap next to the env calls around it.
+        self._render_lock = threading.Lock()
         self._warned_missing_turn_rewards = False
         # per-run turn totals, published through `turn_accounting`. guarded by the same lock as
         # every other mutable bridge state.
@@ -268,8 +281,8 @@ class MultiTurnBridge:
         self._sessions: dict[str, dict] = {}
         self._session_lease_s = float(session_lease_s)
         # score many episodes under one lock-held env call so judge work can use the env's own
-        # max_score_concurrency. keep the lock: reward_thread_safe permits scorer/scorer concurrency,
-        # not racing scoring against env_reply.
+        # max_score_concurrency. a thread-safe env is scored without the lock; one that sets
+        # reward_thread_safe = False is scored under it, never racing its env_reply.
         # the defaults are what this path wants: env scoring errors propagate as raised (the reward
         # routes already translate them for the child), and a batch assembled during the flush window
         # is still scored, so the last requests of a run answer instead of failing on shutdown.
@@ -279,6 +292,9 @@ class MultiTurnBridge:
             flush_wait_s=float(score_flush_wait_s),
             label="multi-turn episode score batcher",
             thread_name="flash-grpo-episode-scorer",
+            max_concurrent_batches=(
+                _MULTI_TURN_CONCURRENT_SCORE_BATCHES if self._concurrent_env else 1
+            ),
         )
 
     def routes(self) -> dict:
@@ -401,6 +417,11 @@ class MultiTurnBridge:
             raise _BadRequest(
                 "multi-turn child prompt ids do not match the frozen processor prompt"
             )
+        state = None
+        if self._concurrent_env:
+            # built before taking the bridge lock so a slow env setup (a sandbox, a browser) does
+            # not hold up other episodes; a duplicate session is still rejected below.
+            state = self._env_call("new_rollout_state", example, expected_prompt)
         with self._lock:
             # swept here rather than on a timer thread: a session is only ever abandoned by an
             # actor that stopped calling, and the actors that replace it announce themselves
@@ -408,8 +429,10 @@ class MultiTurnBridge:
             reaped = self._reap_abandoned_sessions()
             if session_id in self._sessions:
                 raise _BadSession(f"duplicate multi-turn session {session_id}")
-            state = self._env_call("new_rollout_state", example, expected_prompt)
+            if state is None:
+                state = self._env_call("new_rollout_state", example, expected_prompt)
             self._sessions[session_id] = {
+                "lock": threading.Lock(),
                 "example": example,
                 "state": state,
                 "identity": identity,
@@ -455,74 +478,80 @@ class MultiTurnBridge:
         return response
 
     def step(self, payload: dict) -> dict:
+        if not self._concurrent_env:
+            with self._lock:
+                return self._step_session(self._session(payload), payload)
         with self._lock:
             session = self._session(payload)
-            state = session["state"]
-            turn_ordinal = int(payload.get("turn_ordinal", session["next_turn"]))
-            if turn_ordinal != session["next_turn"]:
-                raise _BadRequest(
-                    f"multi-turn rollout expected turn {session['next_turn']}, got {turn_ordinal}"
-                )
-            authenticated = "accepted_prefix" in payload
-            accepted_prefix = [
-                int(token_id)
-                for token_id in payload.get("accepted_prefix", session["required_prefix"])
-            ]
-            if accepted_prefix != session["required_prefix"]:
-                raise _BadRequest(
-                    "multi-turn rollout prompt does not exactly match the authenticated environment context"
-                )
-            image_count, image_digests = self._payload_media_identity(
-                payload, required=authenticated
+        # one actor drives an episode turn by turn; the episode lock only guards against a retried
+        # or misrouted request racing it. other episodes step concurrently.
+        with session["lock"]:
+            return self._step_session(session, payload)
+
+    def _step_session(self, session: dict, payload: dict) -> dict:
+        """one turn of one episode. caller holds that episode's lock (or the bridge lock)."""
+        state = session["state"]
+        turn_ordinal = int(payload.get("turn_ordinal", session["next_turn"]))
+        if turn_ordinal != session["next_turn"]:
+            raise _BadRequest(
+                f"multi-turn rollout expected turn {session['next_turn']}, got {turn_ordinal}"
             )
-            if authenticated and (
-                image_count != len(session["image_digests"])
-                or image_digests != tuple(session["image_digests"])
-            ):
-                raise _BadRequest(
-                    "multi-turn rollout media does not match the authenticated context"
-                )
-            response_ids = [int(token_id) for token_id in payload.get("response_ids", [])]
-            completion_text = str(payload.get("completion_text") or "")
-            session["next_turn"] += 1
-            if bool(payload.get("truncated")) or str(payload.get("skip_reason") or ""):
-                session["aborted_turn"] = {
-                    "role": "assistant",
-                    "content": completion_text,
-                }
-                return self._step_response(
-                    session,
-                    terminal=True,
-                    messages=[],
-                    authenticated=authenticated,
-                )
-            recorded = self._env_call("record_model_turn", state, completion_text)
-            # a tool environment records the structured turn the serving parser recovered from the
-            # text (content plus openai tool_calls); mirror exactly that into the session transcript.
-            session["messages"].append(
-                dict(recorded)
-                if self._tools is not None and isinstance(recorded, dict)
-                else {"role": "assistant", "content": completion_text}
+        authenticated = "accepted_prefix" in payload
+        accepted_prefix = [
+            int(token_id) for token_id in payload.get("accepted_prefix", session["required_prefix"])
+        ]
+        if accepted_prefix != session["required_prefix"]:
+            raise _BadRequest(
+                "multi-turn rollout prompt does not exactly match the authenticated environment context"
             )
-            next_prefix = [*accepted_prefix, *response_ids]
-            if self._env_call("rollout_done", state, self._max_turns):
-                session["required_prefix"] = next_prefix
-                return self._step_response(
-                    session,
-                    terminal=True,
-                    messages=[],
-                    authenticated=authenticated,
-                )
-            replies = self._env_call("env_reply", list(state.get("messages") or ()), state)
-            terminal = bool(self._env_call("rollout_done", state, self._max_turns))
-            if terminal:
-                session["required_prefix"] = next_prefix
-                return self._step_response(
-                    session,
-                    terminal=True,
-                    messages=[],
-                    authenticated=authenticated,
-                )
+        image_count, image_digests = self._payload_media_identity(payload, required=authenticated)
+        if authenticated and (
+            image_count != len(session["image_digests"])
+            or image_digests != tuple(session["image_digests"])
+        ):
+            raise _BadRequest("multi-turn rollout media does not match the authenticated context")
+        response_ids = [int(token_id) for token_id in payload.get("response_ids", [])]
+        completion_text = str(payload.get("completion_text") or "")
+        session["next_turn"] += 1
+        if bool(payload.get("truncated")) or str(payload.get("skip_reason") or ""):
+            session["aborted_turn"] = {
+                "role": "assistant",
+                "content": completion_text,
+            }
+            return self._step_response(
+                session,
+                terminal=True,
+                messages=[],
+                authenticated=authenticated,
+            )
+        recorded = self._env_call("record_model_turn", state, completion_text)
+        # a tool environment records the structured turn the serving parser recovered from the
+        # text (content plus openai tool_calls); mirror exactly that into the session transcript.
+        session["messages"].append(
+            dict(recorded)
+            if self._tools is not None and isinstance(recorded, dict)
+            else {"role": "assistant", "content": completion_text}
+        )
+        next_prefix = [*accepted_prefix, *response_ids]
+        if self._env_call("rollout_done", state, self._max_turns):
+            session["required_prefix"] = next_prefix
+            return self._step_response(
+                session,
+                terminal=True,
+                messages=[],
+                authenticated=authenticated,
+            )
+        replies = self._env_call("env_reply", list(state.get("messages") or ()), state)
+        terminal = bool(self._env_call("rollout_done", state, self._max_turns))
+        if terminal:
+            session["required_prefix"] = next_prefix
+            return self._step_response(
+                session,
+                terminal=True,
+                messages=[],
+                authenticated=authenticated,
+            )
+        with self._render_lock:
             try:
                 normalized = normalize_environment_reply(
                     replies,
@@ -543,32 +572,37 @@ class MultiTurnBridge:
                     glue_ids, new_digests = [], []
             except ValueError as error:
                 raise _BadEnvReply(str(error)) from error
-            glue_ids = dedup_seam_terminator(response_ids, glue_ids)
-            session["messages"].extend(normalized.messages)
-            session["descriptors"].extend(normalized.descriptors)
-            session["image_digests"].extend(new_digests)
-            session["required_prefix"] = [*next_prefix, *glue_ids]
-            session["turns"].append(
-                {
-                    "messages": copy.deepcopy(session["messages"]),
-                    "descriptors": tuple(session["descriptors"]),
-                    "image_digests": tuple(session["image_digests"]),
-                }
-            )
-            return self._step_response(
-                session,
-                terminal=False,
-                messages=normalized.messages,
-                image_data_uris=normalized.data_uris,
-                authenticated=authenticated,
-            )
+        glue_ids = dedup_seam_terminator(response_ids, glue_ids)
+        session["messages"].extend(normalized.messages)
+        session["descriptors"].extend(normalized.descriptors)
+        session["image_digests"].extend(new_digests)
+        session["required_prefix"] = [*next_prefix, *glue_ids]
+        session["turns"].append(
+            {
+                "messages": copy.deepcopy(session["messages"]),
+                "descriptors": tuple(session["descriptors"]),
+                "image_digests": tuple(session["image_digests"]),
+            }
+        )
+        return self._step_response(
+            session,
+            terminal=False,
+            messages=normalized.messages,
+            image_data_uris=normalized.data_uris,
+            authenticated=authenticated,
+        )
 
     def _score_batch(self, requests: list) -> list:
         """score a whole batch of terminal episodes in ONE env call. runs on the batcher thread.
 
-        takes the same lock every other env touch takes, so scoring never overlaps a concurrent
-        episode's ``env_reply``. the win is that one lock acquisition now covers a whole batch.
+        a thread-safe env (``reward_thread_safe``, the default) is scored without the bridge lock,
+        so its scoring runs while other episodes keep stepping instead of holding all of them for
+        the slowest score. an env with ``reward_thread_safe = False`` is scored under the same lock
+        every other env touch takes, so its scoring never overlaps a concurrent ``env_reply``.
         """
+        if self._concurrent_env:
+            with self._parent_work.busy():
+                return score_rollouts(self._env, requests)
         with self._lock, self._parent_work.busy():
             return score_rollouts(self._env, requests)
 
