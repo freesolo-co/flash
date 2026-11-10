@@ -854,9 +854,7 @@ def test_provider_deployment_requires_lambda_only_when_enabled(
     target = tmp_path / "flash/serving/app/inference_provider.py"
     target.parent.mkdir(parents=True)
     source = (REPO_ROOT / "flash/serving/app/inference_provider.py").read_text()
-    target.write_text(
-        re.sub(r'INFERENCE_PROVIDER = "[^"]+"', f'INFERENCE_PROVIDER = "{mode}"', source)
-    )
+    target.write_text(source + f'\nMODEL_POLICIES = {{"test-model": ModelPolicy({mode!r})}}\n')
     output = tmp_path / "outputs"
     result = subprocess.run(
         ["bash", "-e", "-c", step["run"]],

@@ -9,7 +9,7 @@ from collections.abc import AsyncIterator
 from typing import Any, Protocol
 
 from flash.schema import parse_checkpoint_ref
-from flash.serving.app.inference_provider import INFERENCE_PROVIDER, modal_gpus_for
+from flash.serving.app.inference_provider import modal_gpus_for, policy_for
 from flash.serving.lambda_cloud.config import placements
 from flash.serving.src.engine.model_config import (
     gpu_for,
@@ -125,10 +125,13 @@ def health_body(
     gpu_by_model = {
         m: (
             " | ".join(modal_gpus_for(m))
-            if INFERENCE_PROVIDER == "modal"
+            if policy_for(m).provider == "modal"
             else " | ".join(
                 dict.fromkeys(
-                    [*placements(m), *(modal_gpus_for(m) if INFERENCE_PROVIDER == "all" else [])]
+                    [
+                        *placements(m),
+                        *(modal_gpus_for(m) if policy_for(m).provider == "all" else []),
+                    ]
                 )
             )
         )
@@ -136,9 +139,19 @@ def health_body(
         else gpu_for(m)
         for m in supported_models
     }
+    providers = {policy_for(m).provider for m in supported_models}
     body = {
         "ok": True,
-        "inference_provider": INFERENCE_PROVIDER,
+        "inference_provider": (next(iter(providers)) if len(providers) == 1 else "mixed"),
+        "provider_by_model": {m: policy_for(m).provider for m in supported_models},
+        "capacity_by_model": {
+            m: {
+                "min": policy_for(m).min_capacity,
+                "max": policy_for(m).max_capacity,
+                "dev_max": policy_for(m).dev_max_capacity,
+            }
+            for m in supported_models
+        },
         "deployment_sha": deployment_sha,
         "deployment_id": deployment_id,
         "capabilities": capabilities,

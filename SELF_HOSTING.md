@@ -83,3 +83,51 @@ is fully uploaded, then verifies that a replacement VM resumes and finishes step
 The harness deletes its VMs and managed disks; test artifacts remain in the private
 repository. GPU quota and active billing are required. Price thresholds, GPU
 priority, cancellation and adaptive checkpoint timing are covered by offline tests.
+
+# Hosted model capacity and providers
+
+Edit `MODEL_POLICIES` in `flash/serving/app/inference_provider.py`. Each model has
+one row with `provider`, `min_capacity`, and `max_capacity`; redeploy after editing.
+For example, to keep one 9B Base replica warm and allow up to three:
+
+```python
+"Qwen/Qwen3.5-9B-Base": ModelPolicy(
+    "lambda", min_capacity=1, max_capacity=3, lambda_gpus=("H100",),
+),
+```
+
+The shipping settings are:
+
+| Model | Provider | GPU pin | Minimum | Maximum |
+| --- | --- | --- | ---: | ---: |
+| Qwen3.5-0.8B | Lambda | A10 | 1 | 2 |
+| Qwen3.5-9B-Base | Lambda | H100 | 1 | 2 |
+| Other Qwen models | Modal | Existing per-model GPU options | 0 | 2 |
+| DeepSeek | Modal | Existing four-B200 group | 0 | 4 main / 1 dev |
+
+Capacity counts model replicas, not GPU cards, and applies independently in each
+environment. A positive minimum starts the parameterized pool during router startup and keeps
+it warm; GPU availability and worker startup still apply. Lambda's CPU proxy owns one VM
+per replica. Its lease guard enforces the same maximum per model and source
+revision; rolling releases can temporarily overlap old and new replicas.
+
+`lambda_gpus` restricts the model's qualified hardware. A10 is the cheapest
+currently [listed Lambda shape](https://lambda.com/pricing) supported by the 0.8B
+serving profile (24 GB, listed at $1.29/hour on 2026-11-09). An explicit
+pin waits for capacity instead of falling back to another GPU. An empty tuple
+permits the existing qualified alternatives, choosing the cheapest available US
+instance from Lambda's live catalog.
+
+For Qwen, `provider="all"` enables both providers: the maximum is split across
+them, with the odd slot and warm minimum assigned to Lambda first. Routing checks
+capacity before dispatch; an already dispatched generation is never retried on
+the other provider. Use `modal` or `lambda` to select just one provider. DeepSeek
+supports Modal only; its optional `dev_max_capacity` preserves the smaller dev
+pool and must be at least its minimum. Its main rolling deployment can temporarily
+double the maximum for a replacement pool.
+
+The deployment workflows require `LAMBDA_API_KEY` whenever any model uses Lambda
+and deploy the fleet controller before serving. `/healthz` exposes
+`provider_by_model`, `capacity_by_model` (including the optional dev override), and
+`gpu_by_model` so the deployed configuration can be inspected. These settings
+control hosted inference; training and customer-owned deployments are separate.

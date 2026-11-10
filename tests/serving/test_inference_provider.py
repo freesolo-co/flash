@@ -22,7 +22,8 @@ def passthrough(*args, **kwargs):
 
 @pytest.mark.parametrize("mode", ["modal", "lambda", "all"])
 def test_registered_pools_and_combined_limit(mode, monkeypatch, load_modal_app_under_stub):
-    monkeypatch.setattr(policy, "INFERENCE_PROVIDER", mode)
+    for model in base_models():
+        monkeypatch.setitem(policy.MODEL_POLICIES, model, policy.ModelPolicy(mode))
     modal = MagicMock()
     for name in ("concurrent", "method", "enter", "exit", "asgi_app"):
         getattr(modal, name).side_effect = passthrough
@@ -71,8 +72,8 @@ async def test_provider_api_failure_is_not_treated_as_missing_capacity():
 
 
 def test_unknown_mode_and_deepseek_are_not_reinterpreted():
-    with pytest.raises(ValueError, match="INFERENCE_PROVIDER"):
-        policy.validate_provider("automatic")
+    with pytest.raises(ValueError, match="provider must"):
+        policy.ModelPolicy("automatic")
     with pytest.raises(ValueError, match="only defined for hosted Qwen"):
         policy.modal_gpus_for("deepseek-ai/DeepSeek-V4.1-Flash-1017")
 
@@ -163,3 +164,69 @@ async def test_modal_load_selects_actual_profile_and_isolates_compiled_cache(mon
     assert engine.engine_overrides["serve_model_id"] == "Freesolo-Co/Qwen3.5-9B-FP8"
     assert os.environ["VLLM_CACHE_ROOT"] == "/cache/vllm/L40S"
     load.assert_awaited_once()
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"min_capacity": -1},
+        {"min_capacity": 3, "max_capacity": 2},
+        {"min_capacity": True},
+        {"max_capacity": 0},
+        {"max_capacity": None},
+        {"max_capacity": 1.5},
+        {"provider": "all", "max_capacity": 1},
+        {"dev_max_capacity": 0},
+        {"lambda_gpus": ("T4",)},
+    ],
+)
+def test_invalid_capacity_fails_before_deployment(kwargs):
+    with pytest.raises(ValueError, match=r"capacity|lambda_gpus"):
+        policy.ModelPolicy(**kwargs)
+
+
+def test_shipping_policy_covers_catalog_and_requested_placement():
+    from flash.serving.deepinfer.contract.config import MODEL_ID
+    from flash.serving.lambda_cloud.config import placements
+
+    assert set(policy.MODEL_POLICIES) == set(base_models()) | {MODEL_ID}
+    selected = {"Qwen/Qwen3.5-0.8B": "A10", "Qwen/Qwen3.5-9B-Base": "H100"}
+    for model, config in policy.MODEL_POLICIES.items():
+        if model in selected:
+            assert config.provider == "lambda"
+            assert policy.capacity_for(model, "lambda") == (1, 2)
+            assert placements(model) == (selected[model],)
+        else:
+            assert config.provider == "modal"
+            assert config.min_capacity == 0
+    with pytest.raises(ValueError, match="No serving"):
+        policy.policy_for("typo")
+
+
+def test_mixed_model_decorators_use_independent_capacity(monkeypatch, load_modal_app_under_stub):
+    monkeypatch.setitem(policy.MODEL_POLICIES, "Qwen/Qwen3.5-4B", policy.ModelPolicy("modal", 2, 5))
+    monkeypatch.setitem(policy.MODEL_POLICIES, "Qwen/Qwen3.5-9B", policy.ModelPolicy("all", 4, 7))
+    modal = MagicMock()
+    for name in ("concurrent", "method", "enter", "exit", "asgi_app"):
+        getattr(modal, name).side_effect = passthrough
+    modal.parameter.return_value = None
+    app = modal.App.return_value
+    for name in ("cls", "function", "local_entrypoint"):
+        getattr(app, name).side_effect = passthrough
+    mod = load_modal_app_under_stub(modal)
+    expected = [(1, 2), (2, 5), (4, 4), (1, 2), (0, 2), (0, 2), (0, 3)]
+    assert [
+        (c.kwargs["min_containers"], c.kwargs["max_containers"]) for c in app.cls.call_args_list
+    ] == expected
+    assert set(mod.MODAL_FALLBACK_BY_MODEL) == {"Qwen/Qwen3.5-9B"}
+    # A fallback on another model must never redirect a Lambda-only or Modal-only model.
+    for model in mod.ENGINE_BY_MODEL:
+        monkeypatch.setitem(mod.ENGINE_BY_MODEL, model, MagicMock())
+    monkeypatch.setitem(mod.MODAL_FALLBACK_BY_MODEL, "Qwen/Qwen3.5-9B", MagicMock())
+    pool = mod._ModalEnginePool()
+    pool._provider_selection = SimpleNamespace(choose=AsyncMock(return_value="modal"))
+    asyncio.run(pool._engine_for("Qwen/Qwen3.5-0.8B"))
+    asyncio.run(pool._engine_for("Qwen/Qwen3.5-4B"))
+    pool._provider_selection.choose.assert_not_awaited()
+    asyncio.run(pool._engine_for("Qwen/Qwen3.5-9B"))
+    pool._provider_selection.choose.assert_awaited_once_with("Qwen/Qwen3.5-9B")

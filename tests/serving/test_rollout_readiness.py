@@ -135,3 +135,20 @@ def test_startup_timeout_cancels_probes_and_closes_router_resources(monkeypatch)
         pool.aclose.assert_awaited_once()
 
     asyncio.run(scenario())
+
+
+def test_warm_floor_starts_on_first_deployment_without_waking_zero_floor_models():
+    warm, idle = _engine("warm"), _engine("idle")
+    asyncio.run(rollout.warm_active_models({"warm": warm, "idle": idle}, keep_warm={"warm"}))
+    warm.health.remote.aio.assert_awaited_once()
+    idle.health.remote.aio.assert_not_awaited()
+
+
+def test_configured_warm_models_start_and_modal_models_remain_idle():
+    models = {model: _engine(model) for model in base_models()}
+    asyncio.run(rollout.warm_configured_models(models))
+    for model, engine in models.items():
+        if model in {"Qwen/Qwen3.5-0.8B", "Qwen/Qwen3.5-9B-Base"}:
+            engine.health.remote.aio.assert_awaited_once()
+        else:
+            engine.health.remote.aio.assert_not_awaited()

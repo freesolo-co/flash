@@ -46,9 +46,9 @@ class API:
     async def call(self, method, path, body=None):
         if path == "instance-types":
             return {
-                "gpu_1x_h100_sxm5": {
+                "gpu_1x_a10": {
                     "instance_type": {
-                        "gpu_description": "H100 (80 GB SXM5)",
+                        "gpu_description": "A10 (24 GB PCIe)",
                         "architecture": "x86_64",
                         "specs": {"gpus": 1},
                         "price_cents_per_hour": 400,
@@ -60,7 +60,7 @@ class API:
             return [] if method == "GET" else {"id": "resource"}
         if path == "instance-operations/launch":
             self.launches += 1
-            assert body["instance_type_name"] == "gpu_1x_h100_sxm5"
+            assert body["instance_type_name"] == "gpu_1x_a10"
             assert body["file_system_mounts"][0]["mount_point"] == "/data/hosting-cache"
             assert body["firewall_rulesets"]
             self.instances.append(
@@ -132,7 +132,7 @@ async def test_release_finds_vm_after_launch_response_loss():
 
 
 def test_hardware_choices_and_capacity_fail_closed():
-    assert placements(MODEL) == ("A10", "A100-80GB", "H100")
+    assert placements(MODEL) == ("A10",)
     assert placements("Qwen/Qwen3.6-35B-A3B") == ("H200", "B200")
     with pytest.raises(ValueError, match="only defined"):
         placements("deepseek-ai/DeepSeek-V4.1-Flash-1017")
@@ -165,12 +165,29 @@ async def test_uncertain_leases_count_toward_per_release_replica_limit():
 
 @pytest.mark.anyio
 async def test_all_mode_reserves_only_one_lambda_slot(monkeypatch):
-    from flash.serving.lambda_cloud import fleet as fleet_module
+    from flash.serving.app.inference_provider import MODEL_POLICIES, ModelPolicy
 
-    monkeypatch.setattr(fleet_module, "INFERENCE_PROVIDER", "all")
+    monkeypatch.setitem(MODEL_POLICIES, MODEL, ModelPolicy("all"))
     api, ledger = API(), Ledger()
     fleet = Fleet(api, ledger, "dev", clock=lambda: 100)
     await fleet.launch(OWNER, MODEL, "bootstrap", "b" * 40)
     with pytest.raises(RuntimeError, match="replica limit"):
         await fleet.launch("c" * 32, MODEL, "bootstrap", "b" * 40)
     assert api.launches == 1
+
+
+@pytest.mark.anyio
+async def test_custom_model_maximum_is_enforced_independently(monkeypatch):
+    from flash.serving.app.inference_provider import MODEL_POLICIES, ModelPolicy
+
+    monkeypatch.setitem(MODEL_POLICIES, MODEL, ModelPolicy("lambda", 1, 3, ("A10",)))
+    api, ledger = API(), Ledger()
+    fleet = Fleet(api, ledger, "dev", clock=lambda: 100)
+    for owner in ("a" * 32, "b" * 32, "c" * 32):
+        await fleet.launch(owner, MODEL, "bootstrap", "e" * 40)
+    with pytest.raises(RuntimeError, match="replica limit"):
+        await fleet.launch("d" * 32, MODEL, "bootstrap", "e" * 40)
+    assert api.launches == 3
+    with pytest.raises(RuntimeError, match="replica limit"):
+        await fleet.launch("f" * 32, "Qwen/Qwen3.5-4B", "bootstrap", "e" * 40)
+    assert api.launches == 3
