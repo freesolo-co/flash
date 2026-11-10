@@ -112,6 +112,32 @@ def list_instances(*, deadline_at=None):
     ]
 
 
+def preemptible_in_use(*, deadline_at=None) -> int:
+    """Count preemptible VMs the project quota currently charges, from any owner.
+
+    `compute.instance.preemptible.count` covers every preemptible VM in the project (stopped ones
+    included), not only Flash's, so do not filter by the flash-owner label.
+    """
+    data = call(
+        "compute",
+        "instance",
+        "list",
+        "--parent-id",
+        settings()["project_id"],
+        "--all",
+        deadline_at=deadline_at,
+    )
+    if not isinstance(data, dict) or not isinstance(data.get("items", []), list):
+        raise NebiusApiError("Nebius returned an invalid instance list")
+    return sum(
+        1
+        for item in data.get("items", [])
+        if isinstance(item, dict)
+        and (item.get("spec") or {}).get("preemptible") is not None
+        and str((item.get("status") or {}).get("state", "")).upper() != "DELETING"
+    )
+
+
 def get_instance(instance_id, *, deadline_at=None):
     # Listing within our project also avoids trusting an id from a different account.
     for item in list_instances(deadline_at=deadline_at):

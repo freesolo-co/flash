@@ -142,6 +142,129 @@ def test_queue_waits_until_affordable_without_launching(monkeypatch):
     assert states == ["queued", "provisioning"]
 
 
+def _slot_queue(monkeypatch, limit, counts):
+    from flash.runner.lifecycle import status
+
+    current = [100.0]
+    states = []
+    monkeypatch.setattr(queue.time, "time", lambda: current[0])
+    monkeypatch.setattr(
+        queue.time, "sleep", lambda seconds: current.__setitem__(0, current[0] + seconds)
+    )
+    monkeypatch.setattr(status, "get_status", lambda run: SimpleNamespace(state="queued"))
+    monkeypatch.setattr(status, "_update", lambda run, state: states.append(state))
+    if limit is None:
+        monkeypatch.delenv("FLASH_NEBIUS_PREEMPTIBLE_VM_LIMIT", raising=False)
+    else:
+        monkeypatch.setenv("FLASH_NEBIUS_PREEMPTIBLE_VM_LIMIT", str(limit))
+    answers = iter(counts)
+    seen = []
+
+    def in_use(**kwargs):
+        value = next(answers)
+        seen.append(value)
+        if isinstance(value, Exception):
+            raise value
+        return value
+
+    monkeypatch.setattr(queue.api, "preemptible_in_use", in_use)
+    return current, states, seen
+
+
+def test_slot_queue_waits_at_the_quota_and_claims_the_next_free_slot(monkeypatch):
+    # Nebius allows `compute.instance.preemptible.count` (2 here) preemptible VMs per project.
+    current, states, seen = _slot_queue(monkeypatch, 2, [2, 2, 1])
+    log = io.StringIO()
+    queue.wait_for_slot("run", deadline_at=1000, log=log)
+    assert seen == [2, 2, 1]
+    assert current[0] == 220  # two 60 s waits, then a slot freed
+    assert states == ["queued", "queued"]
+    assert log.getvalue().count("preemptible VM slots are in use") == 1
+
+
+def test_slot_queue_is_off_without_a_configured_limit(monkeypatch):
+    _current, states, seen = _slot_queue(monkeypatch, None, [99])
+    queue.wait_for_slot("run", deadline_at=1000)
+    assert seen == []
+    assert states == []
+
+
+def test_slot_queue_tries_the_create_when_the_count_is_unknown(monkeypatch):
+    current, states, _seen = _slot_queue(monkeypatch, 2, [api.NebiusApiError("down")])
+    queue.wait_for_slot("run", deadline_at=1000)
+    assert current[0] == 100
+    assert states == []
+
+
+def test_slot_queue_stops_at_the_run_deadline(monkeypatch):
+    _slot_queue(monkeypatch, 1, [1] * 10)
+    with pytest.raises(TimeoutError, match="deadline"):
+        queue.wait_for_slot("run", deadline_at=250)
+
+
+def test_slot_queue_is_cancellable(monkeypatch):
+    from flash.runner.lifecycle import status
+    from flash.runner.supervise.errors import _RunCancelled
+
+    _slot_queue(monkeypatch, 1, [1] * 10)
+    monkeypatch.setattr(status, "get_status", lambda run: SimpleNamespace(state="cancelled"))
+    with pytest.raises(_RunCancelled):
+        queue.wait_for_slot("run", deadline_at=1000)
+
+
+@pytest.mark.parametrize("raw", ["0", "-1", "two", "1.5"])
+def test_invalid_preemptible_limit_is_rejected(monkeypatch, raw):
+    from flash.providers.nebius.config import preemptible_vm_limit
+
+    monkeypatch.setenv("FLASH_NEBIUS_PREEMPTIBLE_VM_LIMIT", raw)
+    with pytest.raises(ValueError, match="positive integer"):
+        preemptible_vm_limit()
+
+
+def test_quota_count_includes_every_preemptible_vm_but_not_deleting_or_regular(monkeypatch):
+    monkeypatch.setattr(
+        api, "settings", lambda: {"project_id": "p", "subnet_id": "s", "image_id": "i"}
+    )
+    items = [
+        {
+            "spec": {"preemptible": {"on_preemption": "STOP"}},
+            "status": {"state": "RUNNING"},
+            "metadata": {"labels": {"flash-owner": "flash-training"}},
+        },
+        {"spec": {"preemptible": {}}, "status": {"state": "STOPPED"}, "metadata": {"labels": {}}},
+        {"spec": {"preemptible": {}}, "status": {"state": "DELETING"}, "metadata": {}},
+        {"spec": {}, "status": {"state": "RUNNING"}, "metadata": {}},
+    ]
+    monkeypatch.setattr(api, "call", lambda *args, **kwargs: {"items": items})
+    assert api.preemptible_in_use() == 2
+
+
+def test_spot_submit_waits_for_a_slot_before_the_price_and_create(monkeypatch):
+    from flash.providers.nebius import jobs
+
+    order = []
+    monkeypatch.setattr(queue, "wait_for_slot", lambda *a, **k: order.append("slot"))
+    monkeypatch.setattr(queue, "wait_for_price", lambda *a, **k: order.append("price"))
+
+    def create(**kwargs):
+        order.append("create")
+        raise RuntimeError("stop after create")
+
+    monkeypatch.setattr(jobs.api, "create", create)
+    monkeypatch.setattr(jobs, "build_payload", lambda *a, **k: {})
+    monkeypatch.setattr(jobs, "scope_fingerprint", lambda: "scope")
+    import flash.runtime_capsule as runtime_capsule
+
+    monkeypatch.setattr(runtime_capsule, "build_capsule", lambda *a, **k: (b"capsule", None))
+    spec = SimpleNamespace(
+        gpu=SimpleNamespace(type="H100", disk_gb=100), run_id="run", train=SimpleNamespace()
+    )
+    monkeypatch.setattr("flash.core.spec.gpu_count_of", lambda spec: 1)
+    with pytest.raises(RuntimeError, match="stop after create"):
+        jobs.submit_attempt(spec, deadline_at=time.time() + 100)
+    assert order == ["slot", "price", "create"]
+
+
 def test_queue_is_cancellable(monkeypatch):
     from flash.runner.lifecycle import status
     from flash.runner.supervise.errors import _RunCancelled
