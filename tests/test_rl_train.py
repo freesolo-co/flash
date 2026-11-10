@@ -5654,6 +5654,52 @@ def test_a_not_thread_safe_env_still_makes_a_step_wait_for_a_score_in_progress()
     assert scored == [1.0]
 
 
+def _step_while_another_episode_is_in_env_reply(*, reward_thread_safe):
+    """park episode a inside env_reply, then step episode b. returns whether b finished first."""
+    entered = threading.Event()
+    release = threading.Event()
+
+    class _SlowReplyEnv(_BridgeEnv):
+        def env_reply(self, messages, state):
+            if state["example"]["index"] == 0:
+                entered.set()
+                release.wait(timeout=30)
+            return super().env_reply(messages, state)
+
+    env = _SlowReplyEnv(done_after=3)
+    env.reward_thread_safe = reward_thread_safe
+    bridge = _bridge(env, examples=[{"index": 0}, {"index": 1}])
+    bridge.start({"index": 0, "session_id": "a"})
+    bridge.start({"index": 1, "session_id": "b"})
+    first = threading.Thread(
+        target=lambda: bridge.step({"session_id": "a", "completion_text": "search"})
+    )
+    first.start()
+    assert entered.wait(timeout=30), "episode a never reached env_reply"
+    second = threading.Thread(
+        target=lambda: bridge.step({"session_id": "b", "completion_text": "search"})
+    )
+    second.start()
+    second.join(timeout=1.0)
+    finished_first = not second.is_alive()
+    release.set()
+    first.join(timeout=30)
+    second.join(timeout=30)
+    assert not first.is_alive(), "episode a's step never completed"
+    assert not second.is_alive(), "episode b's step never completed"
+    return finished_first
+
+
+def test_a_thread_safe_env_runs_different_episodes_turns_concurrently():
+    # a tool call (a sandboxed search, a browser action) can take seconds; with every episode's
+    # env_reply serialized, a rollout batch runs its tools one at a time.
+    assert _step_while_another_episode_is_in_env_reply(reward_thread_safe=True)
+
+
+def test_a_not_thread_safe_env_runs_one_episodes_turn_at_a_time():
+    assert not _step_while_another_episode_is_in_env_reply(reward_thread_safe=False)
+
+
 def test_a_failing_batch_fails_every_episode_in_it_rather_than_hanging_them():
     # a scoring raise must complete every waiter or the other episodes block until VERL-100 fires.
     # park the scorer until several episodes queue so the test exercises one real shared batch.

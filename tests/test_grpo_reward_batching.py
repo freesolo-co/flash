@@ -726,3 +726,80 @@ def test_score_single_turn_batch_repairs_every_row_on_a_wrong_length_return(
 
     assert env.scalar_calls == ["good-a", "good-b", "good-c"]
     assert [score for score, _ in results] == [5.0, 5.0, 5.0]
+
+
+def test_score_batcher_concurrent_batches_do_not_wait_on_a_slow_one():
+    # a remote grader can hold one batch for minutes; episodes finishing behind it must still score.
+    parked = threading.Event()
+    release = threading.Event()
+
+    def score_batch(requests):
+        if "slow" in requests:
+            parked.set()
+            release.wait(timeout=30)
+        return [f"scored:{request}" for request in requests]
+
+    batcher = ScoreBatcher(
+        score_batch,
+        max_batch_size=8,
+        flush_wait_s=0.01,
+        label="test batcher",
+        thread_name="test-concurrent-batches",
+        max_concurrent_batches=2,
+    )
+    try:
+        slow = concurrent.futures.ThreadPoolExecutor(1).submit(batcher.submit, "slow")
+        assert parked.wait(timeout=30)
+        fast = concurrent.futures.ThreadPoolExecutor(1).submit(batcher.submit, "fast")
+        assert fast.result(timeout=5) == "scored:fast"
+        assert not slow.done()
+        release.set()
+        assert slow.result(timeout=30) == "scored:slow"
+    finally:
+        release.set()
+        batcher.close(1.0)
+
+
+def test_score_batcher_idle_consumers_survive_losing_a_claim():
+    # several consumers wake for the same request; the ones that lose the claim must keep waiting,
+    # not exit as if the batcher had closed.
+    batcher = ScoreBatcher(
+        lambda requests: [f"scored:{request}" for request in requests],
+        max_batch_size=8,
+        flush_wait_s=0.01,
+        label="test batcher",
+        thread_name="test-claim-losers",
+        max_concurrent_batches=4,
+    )
+    try:
+        for index in range(5):
+            assert batcher.submit(index) == f"scored:{index}"
+        assert all(thread.is_alive() for thread in batcher._threads)
+    finally:
+        batcher.close(1.0)
+    assert not any(thread.is_alive() for thread in batcher._threads)
+
+
+def test_score_batcher_close_keeps_a_batch_another_consumer_is_still_scoring():
+    # an idle consumer exiting on close must not fail the batch a sibling is about to finish.
+    parked = threading.Event()
+    release = threading.Event()
+
+    def score_batch(requests):
+        parked.set()
+        release.wait(timeout=30)
+        return [f"scored:{request}" for request in requests]
+
+    batcher = ScoreBatcher(
+        score_batch,
+        max_batch_size=8,
+        flush_wait_s=0.01,
+        label="test batcher",
+        thread_name="test-close-siblings",
+        max_concurrent_batches=3,
+    )
+    pending = concurrent.futures.ThreadPoolExecutor(1).submit(batcher.submit, "parked")
+    assert parked.wait(timeout=30)
+    threading.Timer(0.3, release.set).start()
+    batcher.close(5.0)
+    assert pending.result(timeout=5) == "scored:parked"
