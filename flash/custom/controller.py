@@ -119,6 +119,17 @@ def connect(api, run_id, *, timeout=1200, sleep=time.sleep, clock=time.monotonic
 MAX_SPOT_RECONNECTS = 50
 
 
+def first_connect_timeout(spec):
+    """How long to wait for the first session before cancelling the run.
+
+    Modal provisions promptly, so a stuck launch is cut off after 20 minutes. A Spot run can
+    legitimately wait longer: it queues while prices exceed the cap and may be preempted and
+    replaced before its first session starts, all within the run's own wall-clock deadline.
+    """
+    wall = spec.custom["max_wall_seconds"]
+    return wall if spec.gpu.spot else min(1200, wall)
+
+
 def replacement_session(api, run_id, previous, *, timeout, connect=connect):
     """A newer attempt's session after the current one failed, or None if it is still the same.
 
@@ -197,7 +208,7 @@ def run_custom(args, spec, authored_train_keys):
             file=sys.stderr,
         )
         try:
-            client = connect(api, run_id, timeout=min(1200, spec.custom["max_wall_seconds"]))
+            client = connect(api, run_id, timeout=first_connect_timeout(spec))
             client.config = spec.to_dict()
             started = time.monotonic()
             reconnects = 0

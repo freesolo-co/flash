@@ -318,3 +318,13 @@ def test_custom_session_time_accumulates_across_spot_attempts(monkeypatch, tmp_p
     status.estimated_cost_usd = 36.0
     wall = spec.custom["max_wall_seconds"]
     assert session_charge(status, spec) == pytest.approx(36.0 * min(1.0, 1800.0 / wall))
+
+
+def test_spot_first_connection_waits_for_the_run_deadline_not_twenty_minutes():
+    from flash.custom.controller import first_connect_timeout
+
+    custom = {"file": "a.py", "max_wall_seconds": 7200}
+    modal = spec_from_dict({**custom_raw(), "custom": custom})
+    spot = spec_from_dict({**custom_raw(spot=True), "custom": custom})
+    assert first_connect_timeout(modal) == 1200
+    assert first_connect_timeout(spot) == 7200
