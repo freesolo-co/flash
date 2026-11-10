@@ -32,17 +32,13 @@ def controller(ready=0, modal_runners=0, running=0):
     fleet = SimpleNamespace(
         ready_count=AsyncMock(return_value=ready), allocated_count=AsyncMock(return_value=ready)
     )
+    fleet.allocated_count.side_effect = lambda model, exclude_revision=None: (
+        0 if exclude_revision is not None else fleet.allocated_count.return_value
+    )
+    data = {"active_revision": REVISION, MODEL: {"modal_slots": max(0, 4 - ready)}}
     state = SimpleNamespace(
-        get=AsyncMock(
-            side_effect=lambda key: (
-                None
-                if key.startswith("demand:") or key == "serving_release"
-                else REVISION
-                if key == "active_revision"
-                else {"modal_slots": max(0, 4 - ready)}
-            )
-        ),
-        put=AsyncMock(),
+        get=AsyncMock(side_effect=data.get),
+        put=AsyncMock(side_effect=lambda key, value: data.__setitem__(key, value)),
     )
     control = SharedCapacity(fleet, lambda _: (primary, fallback), state, REVISION)
     return control, primary, fallback
@@ -270,3 +266,50 @@ async def test_first_controller_upgrade_keeps_legacy_lambda_pools_usable():
     await control.activate(REVISION)
     with pytest.raises(NoCapacityError):
         await control.before_launch(MODEL, "b" * 40, allocated=0)
+
+
+@pytest.mark.anyio
+async def test_rolling_activation_routes_by_new_revision_but_budgets_all_workers():
+    from flash.serving.lambda_cloud.fleet import Fleet
+    from tests.serving.test_lambda_fleet import Ledger
+
+    old, new = REVISION, "b" * 40
+    ledger = Ledger()
+    for i in range(4):
+        await ledger.put(str(i), {"model": MODEL, "revision": old, "ready_at": 100, "gpu": "H100"})
+    api = SimpleNamespace(call=AsyncMock(return_value=[]))
+    fleet = Fleet(api, ledger, "dev", clock=lambda: 100)
+    primary, fallback = pool(), pool()
+    state = ReleaseState(old)
+    control = SharedCapacity(fleet, lambda _: (primary, fallback), state, new)
+    assert await fleet.ready_count(MODEL) == 4
+    assert await fleet.ready_count(MODEL, revision=new) == 0
+
+    await control.activate(new)
+    # Candidate reconciliation happens before the release switch, so it must
+    # explicitly use the candidate SHA instead of the previous active SHA.
+    assert state.data[MODEL]["modal_slots"] == 1
+    await control.reconcile_model(MODEL)
+    assert await fleet.allocated_count(MODEL) == 4
+    assert await control.choose(MODEL) == "modal"
+    assert fallback.update_autoscaler.aio.await_args.kwargs["max_containers"] == 1
+    # Do not allocate a sixth GPU while four old GPUs and a fallback slot exist.
+    with pytest.raises(NoCapacityError, match="handoff"):
+        await control.before_launch(MODEL, new, allocated=4)
+
+    # As old workers drain, the budget returns; they never became routing-ready
+    # just because a still newer controller was deployed.
+    ledger.data["0"]["released"] = True
+    ledger.data["1"]["released"] = True
+    await control.before_launch(MODEL, new, allocated=2)
+    await ledger.put("new", {"model": MODEL, "revision": new, "ready_at": 100, "gpu": "H100"})
+    control.revision = "c" * 40
+    await control.reconcile_model(MODEL)
+    assert await control.choose(MODEL) == "lambda"
+    assert await fleet.allocated_count(MODEL) == 3
+    assert await fleet.ready_count(MODEL, revision=new) == 1
+    assert state.data[MODEL]["modal_slots"] == 1
+
+    ledger.data["2"]["ready_at"] = 0  # An unhealthy old worker still consumes budget.
+    await control.before_launch(MODEL, new, allocated=3)
+    assert await fleet.allocated_count(MODEL) == 3

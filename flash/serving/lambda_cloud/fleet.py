@@ -155,11 +155,11 @@ class Fleet:
             return found[0]
         return {"status": "pending"}
 
-    async def allocated_count(self, model):
+    async def allocated_count(self, model, *, exclude_revision=None):
         instances = await self.api.call("GET", "instances")
         count = 0
         async for owner, record in self.ledger.items():
-            if record["model"] != model:
+            if record["model"] != model or record["revision"] == exclude_revision:
                 continue
             live = any(
                 self.owns(instance, owner) and instance["status"] != "terminated"
@@ -169,11 +169,12 @@ class Fleet:
                 count += 1
         return count
 
-    async def ready_count(self, model):
+    async def ready_count(self, model, *, revision=None):
         count = 0
         async for _owner, record in self.ledger.items():  # noqa: PERF102 - ledger exposes async items
             if (
                 record["model"] == model
+                and (revision is None or record["revision"] == revision)
                 and not record.get("released")
                 and record.get("ready_at", 0) > max(0, self.clock() - 90)
                 and record.get("gpu") in placements(model)

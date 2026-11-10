@@ -61,7 +61,7 @@ class SharedCapacity:
         errors = []
         for model in lambda_models():
             try:
-                await self.reconcile_model(model)
+                await self.reconcile_model(model, revision=self.revision if activating else None)
             except Exception as exc:
                 errors.append(exc)
                 logger.warning(
@@ -70,10 +70,17 @@ class SharedCapacity:
         if strict and errors:
             raise ExceptionGroup("Cannot configure shared serving capacity", errors)
 
-    async def reconcile_model(self, model):
+    async def serving_ready_count(self, model, revision=None):
+        revision = revision or (await self.serving_release())["revision"]
+        if not revision:
+            return 0
+        return await self.fleet.ready_count(model, revision=revision)
+
+    async def reconcile_model(self, model, *, revision=None):
+        revision = revision or (await self.serving_release())["revision"]
         policy = policy_for(model)
         primary, fallback = self.pools(model)
-        ready = await self.fleet.ready_count(model)
+        ready = await self.serving_ready_count(model, revision)
         primary_stats = await primary.health.get_current_stats.aio()
         fallback_stats = await fallback.health.get_current_stats.aio()
         inputs = sum(s.num_running_inputs + s.backlog for s in (primary_stats, fallback_stats))
@@ -89,11 +96,22 @@ class SharedCapacity:
                 math.ceil(inputs / sequence_capacity(model)),
             ),
         )
-        # With no ready Lambda worker, Modal can use the entire budget. Once
-        # replacements are healthy, reduce its ceiling and drain idle GPUs.
+        # Modal uses unoccupied slots until current-release Lambda workers
+        # become healthy, then reduces its ceiling and drains idle GPUs.
         allocated = await self.fleet.allocated_count(model)
+        old_allocated = await self.fleet.allocated_count(model, exclude_revision=revision)
+        # Draining old releases occupy steady slots. Leave one handoff slot for
+        # a new Lambda worker instead of letting fallback consume all headroom.
+        # At a completely old/full pool, the surge can serve one fallback until
+        # an old worker drains. Never exceed the aggregate allocation budget.
+        steady_slots = max(int(ready == 0), policy.max_capacity - old_allocated - ready)
         remaining = max(
-            0, min(policy.max_capacity - ready, policy.max_capacity + HANDOFF_SURGE - allocated)
+            0,
+            min(
+                steady_slots,
+                policy.max_capacity - ready,
+                policy.max_capacity + HANDOFF_SURGE - allocated,
+            ),
         )
         await fallback.update_autoscaler.aio(
             min_containers=0,
@@ -105,7 +123,7 @@ class SharedCapacity:
         await primary.update_autoscaler.aio(
             min_containers=desired, max_containers=policy.max_capacity, buffer_containers=0
         )
-        return ready, primary_stats, fallback_stats, desired
+        return ready, old_allocated, fallback_stats, desired
 
     async def before_launch(self, model, revision, allocated):
         release = await self.serving_release()
@@ -116,24 +134,27 @@ class SharedCapacity:
             return
         if revision != release["revision"] or not await self.active():
             raise NoCapacityError("Lambda pool is not active for this deployment")
-        ready, _, fallback_stats, desired = await self.reconcile_model(model)
+        ready, old_allocated, fallback_stats, desired = await self.reconcile_model(model)
         if desired == 0:
             raise NoCapacityError("Model is idle; waiting for new demand before allocating Lambda")
         maximum = policy_for(model).max_capacity
         # Reserve room for requests that can still scale Modal up to its ceiling,
         # as well as old containers that have not finished draining yet.
-        modal_reserved = max(maximum - ready, fallback_stats.num_total_runners)
+        routing = await self.state.get(model)
+        modal_reserved = max(routing["modal_slots"], fallback_stats.num_total_runners)
         if (
             allocated >= maximum + HANDOFF_SURGE
             or allocated + modal_reserved >= maximum + HANDOFF_SURGE
         ):
             raise NoCapacityError("Waiting for the previous GPU handoff to drain")
-        if allocated > ready:
+        # Draining old workers (healthy or not) consume budget, but only an
+        # unready current-release allocation is a second booting replacement.
+        if allocated - old_allocated > ready:
             raise NoCapacityError("A Lambda replacement is already starting")
 
     async def choose(self, model):
         await self.state.put("demand:" + model, self.clock())
-        ready = await self.fleet.ready_count(model)
+        ready = await self.serving_ready_count(model)
         routing = await self.state.get(model)
         if routing is None:
             raise RuntimeError("Serving capacity has not been configured")
