@@ -39,6 +39,25 @@ def checkpoint_due(train, clock, step, max_steps):
     return step % train.save_every == 0 or step in train.save_at_steps or step == max_steps
 
 
+def _latest_checkpoint_or_retry(lookup, spec):
+    """Checkpoint discovery whose transient storage failures reschedule the attempt.
+
+    A temporary artifact-store outage must not permanently fail a Spot run that has a durable
+    checkpoint waiting to be resumed, so classify it like the DONE-marker read does.
+    """
+    from flash.artifacts.errors import artifact_error_transience
+    from flash.engine.worker.perf.lifecycle import RetriableInfraError
+
+    try:
+        return lookup(spec)
+    except Exception as exc:
+        if artifact_error_transience(exc) is True:
+            raise RetriableInfraError(
+                f"custom checkpoint discovery failed transiently ({type(exc).__name__})"
+            ) from exc
+        raise
+
+
 def run(*, context):
     spec = context.config.spec
     checkpoints = RunCheckpoints(context)
@@ -48,7 +67,7 @@ def run(*, context):
         from flash.custom.managed import latest_run_checkpoint
 
         # A replacement for a preempted Spot VM continues from this run's newest durable state.
-        latest = latest_run_checkpoint(spec)
+        latest = _latest_checkpoint_or_retry(latest_run_checkpoint, spec)
         if latest is not None:
             resolved = {key: latest[key] for key in ("repo", "revision", "path")}
     heartbeat("custom_model_load", context=context)

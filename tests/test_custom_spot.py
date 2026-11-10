@@ -257,6 +257,42 @@ def test_replacement_session_only_reconnects_to_a_new_attempt():
 # --- billing across attempts ----------------------------------------------------------------
 
 
+def test_checkpoint_heartbeat_keeps_the_attempts_session_time(monkeypatch, tmp_path):
+    import flash.runner.lifecycle.state as runner_state
+    import flash.runner.lifecycle.status as runner_status
+
+    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
+    spec = spec_from_dict(custom_raw(spot=True))
+    runner_state._save_status(
+        runner_state.RunStatus(
+            run_id=spec.run_id, state="running", spec=spec.to_dict(), created_at=time.time()
+        )
+    )
+    beat = runner_status.record_heartbeat
+    beat(spec.run_id, {"stage": "custom_step", "attempt": 0, "session_seconds": 900.0})
+    beat(spec.run_id, {"stage": "checkpoint_deployable", "attempt": 0})  # no session_seconds
+    beat(spec.run_id, {"stage": "custom_model_load", "attempt": 1})
+    status = runner_status.get_status(spec.run_id)
+    assert status.last_heartbeat["session_seconds_prior"] == pytest.approx(900.0)
+
+
+def test_transient_checkpoint_discovery_failure_retries_the_attempt():
+    from flash.custom.worker import _latest_checkpoint_or_retry
+    from flash.engine.worker.perf.lifecycle import RetriableInfraError
+
+    def timeout(spec):
+        raise TimeoutError("storage timed out")
+
+    def broken(spec):
+        raise ValueError("not a storage error")
+
+    with pytest.raises(RetriableInfraError, match="transiently"):
+        _latest_checkpoint_or_retry(timeout, None)
+    with pytest.raises(ValueError, match="not a storage error"):
+        _latest_checkpoint_or_retry(broken, None)
+    assert _latest_checkpoint_or_retry(lambda spec: None, None) is None
+
+
 def test_custom_session_time_accumulates_across_spot_attempts(monkeypatch, tmp_path):
     import flash.runner.lifecycle.state as runner_state
     import flash.runner.lifecycle.status as runner_status

@@ -360,6 +360,10 @@ def record_heartbeat(run_id: str, heartbeat: dict) -> None:
             and "session_started_at" in prev
         ):
             hb.setdefault("session_started_at", prev["session_started_at"])
+        if same_attempt and status.spec.get("algorithm") == "custom" and "session_seconds" in prev:
+            # Checkpoint heartbeats omit session_seconds; keep the attempt's latest measurement so
+            # a later replacement attempt can bill it.
+            hb.setdefault("session_seconds", prev["session_seconds"])
         if prev is not None and status.spec.get("algorithm") == "custom":
             # A replacement (Spot) attempt starts a new session clock; keep earlier attempts'
             # measured session time so billing covers the whole run, not only the last VM.
