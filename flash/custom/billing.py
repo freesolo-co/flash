@@ -65,6 +65,10 @@ def session_charge(status, spec):
         or not math.isfinite(seconds)
     ):
         raise ValueError("invalid custom session time")
+    # Earlier attempts' session time (a Spot run continued on replacement VMs).
+    prior = (status.last_heartbeat or {}).get("session_seconds_prior", 0)
+    if not isinstance(prior, bool) and isinstance(prior, (int, float)) and math.isfinite(prior):
+        seconds = max(0.0, seconds) + max(0.0, prior)
     quote = status.estimated_cost_usd
     if (
         isinstance(quote, bool)

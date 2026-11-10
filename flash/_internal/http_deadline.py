@@ -57,13 +57,13 @@ class _DeadlineHTTPHandler(urllib.request.HTTPHandler):
 
 
 class _DeadlineHTTPSHandler(urllib.request.HTTPSHandler):
-    def __init__(self, deadline: float):
-        super().__init__()
+    def __init__(self, deadline: float, context=None):
+        super().__init__(context=context)
         self._connection = partial(_connection, http.client.HTTPSConnection, deadline)
 
     def https_open(self, req):
         return self.do_open(self._connection, req, context=self._context)
 
 
-def deadline_handlers(deadline: float) -> tuple:
-    return _DeadlineHTTPHandler(deadline), _DeadlineHTTPSHandler(deadline)
+def deadline_handlers(deadline: float, context=None) -> tuple:
+    return _DeadlineHTTPHandler(deadline), _DeadlineHTTPSHandler(deadline, context)

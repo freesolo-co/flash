@@ -3,6 +3,7 @@
 import asyncio
 import hmac
 import json
+import os
 import time
 
 from flash._internal.diagnostics import sanitize_diagnostic
@@ -93,10 +94,21 @@ def create_app(session, token):
     return app
 
 
-def serve_session(session, token, max_wall_seconds, *, tick=None):
+def serve_session(session, token, max_wall_seconds, *, tick=None, tls=None):
+    """Serve the session on :8000; ``tls`` ({cert, key} PEM) when no provider tunnel terminates it."""
+    import tempfile
+
     import uvicorn
 
     app = create_app(session, token)
+    tls_files = {}
+    if tls:
+        directory = tempfile.mkdtemp(prefix="flash-custom-tls-")
+        for name in ("cert", "key"):
+            path = f"{directory}/{name}.pem"
+            with open(path, "w", encoding="utf-8", opener=lambda p, f: os.open(p, f, 0o600)) as out:
+                out.write(tls[name])
+            tls_files[name] = path
     server = uvicorn.Server(
         uvicorn.Config(
             app,
@@ -104,6 +116,11 @@ def serve_session(session, token, max_wall_seconds, *, tick=None):
             port=8000,
             access_log=False,
             timeout_graceful_shutdown=5,
+            **(
+                {"ssl_certfile": tls_files["cert"], "ssl_keyfile": tls_files["key"]}
+                if tls_files
+                else {}
+            ),
         )
     )
 

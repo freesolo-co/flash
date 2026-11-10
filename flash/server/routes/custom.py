@@ -4,16 +4,47 @@ from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, Response
 
-from flash.custom.managed import session_token
+from flash.custom.managed import session_tls, session_token
 from flash.server.platform.deps import require_key, require_owned_run
 
 router = APIRouter()
 
 
-@router.get("/v1/runs/{run_id}/custom")
-def connection(run_id: str, response: Response, key: Annotated[dict, Depends(require_key)]):
+def _modal_connection(run_id, remote):
     from flash.providers.modal import api
     from flash.providers.modal.handles import ModalJobHandle, require_scope
+
+    handle = ModalJobHandle.from_dict(remote)
+    require_scope(handle)
+    return {
+        "url": api.custom_tunnel(handle.instance_id),
+        "api_key": session_token(run_id, handle.attempt),
+        "run_id": run_id,
+    }
+
+
+def _spot_connection(run_id, remote):
+    """A Spot VM is reached directly: its public IP, the attempt's token and pinned certificate."""
+    from flash.providers.nebius import api
+    from flash.providers.nebius.handles import SpotJobHandle, require_scope
+
+    handle = SpotJobHandle.from_dict(remote)
+    require_scope(handle)
+    if handle.run_id != run_id:
+        raise HTTPException(409, "custom Spot attempt does not belong to this run")
+    address = api.public_ip(handle.instance_id)
+    if address is None:
+        raise HTTPException(425, "custom Spot GPU has no public address yet")
+    return {
+        "url": f"https://{address}:{api.CUSTOM_SESSION_PORT}",
+        "api_key": session_token(run_id, handle.attempt),
+        "tls_cert": session_tls(run_id, handle.attempt)["cert"],
+        "run_id": run_id,
+    }
+
+
+@router.get("/v1/runs/{run_id}/custom")
+def connection(run_id: str, response: Response, key: Annotated[dict, Depends(require_key)]):
     from flash.runner.lifecycle.state import TERMINAL_STATES
 
     status = require_owned_run(run_id, key)
@@ -24,10 +55,6 @@ def connection(run_id: str, response: Response, key: Annotated[dict, Depends(req
         raise HTTPException(409, "custom run ended; resume its durable checkpoint in a new run")
     if not status.remote:
         raise HTTPException(425, "custom GPU is provisioning")
-    handle = ModalJobHandle.from_dict(status.remote)
-    require_scope(handle)
-    return {
-        "url": api.custom_tunnel(handle.instance_id),
-        "api_key": session_token(run_id, handle.attempt),
-        "run_id": run_id,
-    }
+    if status.remote.get("provider") == "spot":
+        return _spot_connection(run_id, status.remote)
+    return _modal_connection(run_id, status.remote)

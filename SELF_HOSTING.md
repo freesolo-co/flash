@@ -37,6 +37,28 @@ cannot suppress automatic recovery saves.
 Work since the latest fully uploaded checkpoint may be repeated, including any
 checkpoint whose upload was still in progress. Portal is not used.
 
+## Custom algorithms on Spot
+
+`algorithm = "custom"` runs accept `[gpu] spot = true` on exactly one GPU (custom layer
+sharding stops at two cards and Spot presets are 1 or 8). Without a provider tunnel, the local
+controller connects straight to the VM:
+
+- The worker serves its session over HTTPS on port 8000, published from the container. Allow
+  inbound TCP 8000 to Flash's Spot VMs from wherever controllers run (Nebius's default security
+  group allows all ingress).
+- Each attempt has its own Ed25519 TLS identity and session token, both derived from
+  `FREESOLO_INTERNAL_KEY`, so nothing new is stored. `GET /v1/runs/{id}/custom` returns the VM's
+  public address, the token and the certificate; the controller trusts only that certificate.
+- Recovery saves are automatic and time-based, as for other Spot jobs: the first step, every
+  `save_at_steps` entry, the final step, and before another typical step would exceed 10 minutes
+  of unsaved work. `train.save_every` must be omitted.
+- After preemption, the replacement attempt restores the run's newest complete custom
+  checkpoint (adapter, optimizer state and `algorithm_state`). The controller notices its
+  session failed, waits for the new attempt's session, and calls `main(client)` again; write
+  `main` to continue from `client.step` and `client.restored_state`. A failure while the same
+  session is still alive is the algorithm's own error and cancels the run as before.
+- Billing is session time across all attempts, as a fraction of the accepted quote.
+
 On the control-plane host:
 
 1. Install and authenticate the current Nebius CLI with access to the intended

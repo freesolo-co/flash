@@ -6,12 +6,14 @@ import tempfile
 import time
 from pathlib import Path
 
+from flash.core.checkpoint_policy import is_spot_spec
 from flash.custom.backend import load_backend
 from flash.custom.checkpoints import RunCheckpoints
 from flash.custom.server import serve_session
 from flash.custom.session import TrainingSession
 from flash.engine.worker.io import artifacts as hf
 from flash.engine.worker.io.heartbeat import heartbeat, liveness_heartbeat
+from flash.engine.worker.train.core.child.checkpoint_schedule import CheckpointClock
 
 
 def _custom_targeting(model_id):
@@ -25,10 +27,30 @@ def _custom_targeting(model_id):
     return resolve_lora_targeting(model_id, algorithm="custom", multimodal=False)
 
 
+def checkpoint_due(train, clock, step, max_steps):
+    """Whether an optimizer step publishes a checkpoint.
+
+    Spot (``clock`` set, ``save_every`` normalized away): automatic recovery saves before another
+    typical step would leave more than the Spot recovery target of unsaved work, plus the first,
+    requested and final steps. Otherwise the authored interval, requested and final steps.
+    """
+    if clock is not None:
+        return clock.due(step, required=train.save_at_steps, final_step=max_steps)
+    return step % train.save_every == 0 or step in train.save_at_steps or step == max_steps
+
+
 def run(*, context):
     spec = context.config.spec
     checkpoints = RunCheckpoints(context)
     resolved = spec.custom.get("resolved_resume")
+    spot = is_spot_spec(spec)
+    if spot:
+        from flash.custom.managed import latest_run_checkpoint
+
+        # A replacement for a preempted Spot VM continues from this run's newest durable state.
+        latest = latest_run_checkpoint(spec)
+        if latest is not None:
+            resolved = {key: latest[key] for key in ("repo", "revision", "path")}
     heartbeat("custom_model_load", context=context)
     with (
         liveness_heartbeat("custom_model_load", context=context),
@@ -84,14 +106,14 @@ def run(*, context):
             )
         return f"{spec.run_id}/step-{session.step}"
 
+    clock = CheckpointClock() if spot else None
+
     def committed(current, operation, output):
         if operation == "optim_step":
-            if (
-                current.step % spec.train.save_every == 0
-                or current.step in spec.train.save_at_steps
-                or current.step == current.max_steps
-            ):
+            if checkpoint_due(spec.train, clock, current.step, current.max_steps):
                 output["checkpoint_ref"] = save()
+                if clock is not None:
+                    clock.saved()
             heartbeat(
                 "custom_step",
                 step=current.step,
@@ -128,11 +150,18 @@ def run(*, context):
         session_started_at=started_at,
         context=context,
     )
+    tls = None
+    if os.environ.get("FLASH_CUSTOM_TLS_CERT") and os.environ.get("FLASH_CUSTOM_TLS_KEY"):
+        tls = {
+            "cert": os.environ["FLASH_CUSTOM_TLS_CERT"],
+            "key": os.environ["FLASH_CUSTOM_TLS_KEY"],
+        }
     serve_session(
         session,
         os.environ["FLASH_CUSTOM_SESSION_TOKEN"],
         context.remaining_wall_seconds() or spec.gpu.max_wall_seconds,
         tick=tick,
+        tls=tls,
     )
     if session.failed or not session.closed:
         raise RuntimeError(
