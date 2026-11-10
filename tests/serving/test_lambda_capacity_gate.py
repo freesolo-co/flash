@@ -1,4 +1,4 @@
-"""Deployment waits for the entire requested fleet without mutating it."""
+"""The deployment-side capacity watch reports Lambda shapes without mutating the fleet."""
 
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -22,11 +22,11 @@ def anyio_backend():
 async def test_waits_for_all_shapes_and_reports_each_five_minute_check(caplog):
     clock = Clock()
     api = SimpleNamespace(call=AsyncMock(side_effect=[{}, {"a10": AVAILABLE["a10"]}, AVAILABLE]))
-    await gate.wait_for_capacity(api, MODELS, clock=clock, sleep=clock.sleep)
+    assert await gate.wait_for_capacity(api, MODELS, clock=clock, sleep=clock.sleep) == []
     assert clock.waits == [300, 300]
     assert "elapsed 5 min, remaining 295 min" in caplog.text
     assert "checking again in 5 min" in caplog.text
-    assert "proceeding" in caplog.text
+    assert "seen for all configured models" in caplog.text
     assert all(call.args == ("GET", "instance-types") for call in api.call.call_args_list)
 
 
@@ -34,8 +34,7 @@ async def test_waits_for_all_shapes_and_reports_each_five_minute_check(caplog):
 async def test_no_capacity_stops_after_five_hours_without_a_late_check(caplog):
     clock = Clock()
     api = SimpleNamespace(call=AsyncMock(return_value={}))
-    with pytest.raises(TimeoutError, match="five hours"):
-        await gate.wait_for_capacity(api, MODELS, clock=clock, sleep=clock.sleep)
+    assert await gate.wait_for_capacity(api, MODELS, clock=clock, sleep=clock.sleep) == MODELS
     assert clock.now == 18000
     assert clock.waits == [300] * 60
     assert api.call.await_count == 60
@@ -63,7 +62,7 @@ async def test_all_hosted_deployments_require_lambda_credentials(monkeypatch):
 async def test_capacity_on_last_poll_still_allows_deployment():
     clock = Clock()
     api = SimpleNamespace(call=AsyncMock(side_effect=[{}] * 59 + [AVAILABLE]))
-    await gate.wait_for_capacity(api, MODELS, clock=clock, sleep=clock.sleep)
+    assert await gate.wait_for_capacity(api, MODELS, clock=clock, sleep=clock.sleep) == []
     assert clock.now == 17700
     assert api.call.await_count == 60
 
@@ -77,5 +76,31 @@ async def test_stalled_catalog_call_is_bounded(monkeypatch):
     async def call(*args):
         await asyncio.Event().wait()
 
-    with pytest.raises(TimeoutError):
-        await gate.wait_for_capacity(SimpleNamespace(call=call), MODELS)
+    assert await gate.wait_for_capacity(SimpleNamespace(call=call), MODELS) == MODELS
+
+
+@pytest.mark.anyio
+async def test_shapes_seen_at_different_checks_count_as_available():
+    # The 0.8B shape frees up first and is gone by the time the 9B shape appears.
+    clock = Clock()
+    api = SimpleNamespace(
+        call=AsyncMock(side_effect=[{"a10": AVAILABLE["a10"]}, {}, {"h100": AVAILABLE["h100"]}])
+    )
+    assert await gate.wait_for_capacity(api, MODELS, clock=clock, sleep=clock.sleep) == []
+    assert clock.waits == [300, 300]
+
+
+@pytest.mark.anyio
+async def test_missing_capacity_warns_without_failing_the_workflow(monkeypatch, capsys):
+    api = SimpleNamespace(aclose=AsyncMock())
+    monkeypatch.setenv("LAMBDA_API_KEY", "key")
+    monkeypatch.setenv("GITHUB_ACTIONS", "true")
+    monkeypatch.setattr(gate, "lambda_models", lambda: MODELS)
+    monkeypatch.setattr(gate, "LambdaAPI", lambda key: api)
+    monkeypatch.setattr(gate, "wait_for_capacity", AsyncMock(return_value=[MODELS[1]]))
+    await gate.main()
+    out = capsys.readouterr().out
+    assert out.startswith("::warning title=Lambda capacity unavailable::")
+    assert MODELS[1] in out
+    assert "Modal fallback" in out
+    api.aclose.assert_awaited_once()
