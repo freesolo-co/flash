@@ -4,6 +4,7 @@ on:
   push:
     branches: [main, dev]
     paths:
+      - flash/serving/app/inference_provider.py
       - flash/serving/deepinfer/**
       - flash/serving/src/**
       - flash/serve/**

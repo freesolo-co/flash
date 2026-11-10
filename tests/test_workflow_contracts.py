@@ -55,6 +55,13 @@ def test_qwen_rollout_waits_for_active_pool_startup(filename):
     assert job["timeout-minutes"] * 60 >= budget + 15 * 60
 
 
+def test_deepinfer_redeploys_when_shared_model_capacity_changes():
+    workflow = _load(WORKFLOW_DIR / "deploy-deepinfer.yml")
+    push = _triggers(workflow)["push"]
+    assert set(push["branches"]) == {"main", "dev"}
+    assert "flash/serving/app/inference_provider.py" in push["paths"]
+
+
 def test_deepinfer_warm_rollout_is_opt_in_and_verifies_the_replacement():
     workflow = yaml.safe_load((WORKFLOW_DIR / "deploy-deepinfer.yml").read_text())
     assert workflow["concurrency"]["cancel-in-progress"] is False
@@ -854,9 +861,7 @@ def test_provider_deployment_requires_lambda_only_when_enabled(
     target = tmp_path / "flash/serving/app/inference_provider.py"
     target.parent.mkdir(parents=True)
     source = (REPO_ROOT / "flash/serving/app/inference_provider.py").read_text()
-    target.write_text(
-        re.sub(r'INFERENCE_PROVIDER = "[^"]+"', f'INFERENCE_PROVIDER = "{mode}"', source)
-    )
+    target.write_text(source + f'\nMODEL_POLICIES = {{"test-model": ModelPolicy({mode!r})}}\n')
     output = tmp_path / "outputs"
     result = subprocess.run(
         ["bash", "-e", "-c", step["run"]],

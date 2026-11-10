@@ -2,6 +2,7 @@
 
 import re
 
+from flash.serving.app.inference_provider import policy_for
 from flash.serving.src.engine.model_config import base_models
 
 API_URL = "https://cloud.lambda.com/api/v1"
@@ -24,7 +25,7 @@ GPU_MEMORY_GIB = {"A10": 22, "A100-80GB": 75, "H100": 75, "H200": 130, "B200": 1
 CATALOG_MEMORY_GB = {"A10": 24, "A100-80GB": 80, "H100": 80, "H200": 141, "B200": 180}
 
 
-def placements(model):
+def qualified_placements(model):
     if model not in base_models():
         raise ValueError("Lambda placement is only defined for the hosted Qwen catalog")
     if model == "Qwen/Qwen3.6-35B-A3B":
@@ -32,6 +33,14 @@ def placements(model):
     if model in {"Qwen/Qwen3.5-0.8B", "Qwen/Qwen3.5-4B"}:
         return ("A10", "A100-80GB", "H100")
     return ("A100-80GB", "H100")
+
+
+def placements(model):
+    qualified = qualified_placements(model)
+    requested = policy_for(model).lambda_gpus
+    if any(gpu not in qualified for gpu in requested):
+        raise ValueError(f"Unqualified Lambda GPU for {model}: {requested}")
+    return requested or qualified
 
 
 def gpu_matches(gpu, description):

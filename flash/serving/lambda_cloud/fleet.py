@@ -3,7 +3,7 @@
 import re
 import time
 
-from flash.serving.app.inference_provider import INFERENCE_PROVIDER, replica_limit
+from flash.serving.app.inference_provider import capacity_for
 
 from .config import LEASE_SECONDS, SSH_KEY_NAME, select_region
 from .resources import cache_filesystem, firewall
@@ -102,7 +102,7 @@ class Fleet:
             )
             if not record.get("released") or live or uncertain:
                 occupied += 1
-        if occupied >= replica_limit(INFERENCE_PROVIDER):
+        if occupied >= capacity_for(model, "lambda")[1]:
             raise RuntimeError("Lambda model/release replica limit reached; pending cleanup")
 
     async def inspect(self, owner):

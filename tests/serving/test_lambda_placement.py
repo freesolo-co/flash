@@ -22,7 +22,10 @@ def offer(gpu, price=300, count=1, regions=("us-west-1",), architecture="x86_64"
     }
 
 
-def test_select_cheapest_available_approved_gpu_without_guessing_instance_ids():
+def test_select_cheapest_available_approved_gpu_without_guessing_instance_ids(monkeypatch):
+    from flash.serving.app.inference_provider import MODEL_POLICIES, ModelPolicy
+
+    monkeypatch.setitem(MODEL_POLICIES, SMALL, ModelPolicy("lambda"))
     catalog = {
         "provider-a100": offer("A100 (80 GB SXM4)", 250),
         "provider-h100": offer("H100 (80 GB SXM5)", 400),
@@ -66,8 +69,9 @@ def test_worker_rejects_wrong_actual_hardware(name, memory, count):
 
 
 def test_worker_reports_actual_approved_shape():
-    assert validate_gpu(SMALL, "NVIDIA A100-SXM4-80GB", 79 * 2**30, 1) == "A100-80GB"
-    assert validate_gpu(SMALL, "NVIDIA H100 80GB HBM3", 79 * 2**30, 1) == "H100"
+    assert validate_gpu(SMALL, "NVIDIA A10", 22.06 * 2**30, 1) == "A10"
+    with pytest.raises(RuntimeError, match="unapproved GPU"):
+        validate_gpu(SMALL, "NVIDIA H100 80GB HBM3", 79 * 2**30, 1)
     assert validate_gpu(MOE, "NVIDIA H200", 140 * 2**30, 1) == "H200"
 
 
@@ -108,3 +112,17 @@ def test_a10_is_cheapest_small_model_option():
     for model in (SMALL, "Qwen/Qwen3.5-4B"):
         assert select_region(catalog, model) == ("a10", "us-west-1")
         assert validate_gpu(model, "NVIDIA A10", 22.06 * 2**30, 1) == "A10"
+
+
+def test_nine_base_stays_on_h100_even_when_a100_is_cheaper():
+    model = "Qwen/Qwen3.5-9B-Base"
+    catalog = {"a100": offer("A100 (80 GB SXM4)", 200), "h100": offer("H100 (80 GB SXM5)", 400)}
+    assert select_region(catalog, model) == ("h100", "us-west-1")
+    del catalog["h100"]
+    with pytest.raises(RuntimeError, match="no US capacity"):
+        select_region(catalog, model)
+
+
+def test_small_model_does_not_fall_back_to_more_expensive_hardware():
+    with pytest.raises(RuntimeError, match="no US capacity"):
+        select_region({"h100": offer("H100 (80 GB SXM5)", 400)}, SMALL)

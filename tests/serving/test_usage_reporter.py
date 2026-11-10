@@ -91,9 +91,8 @@ def test_hosted_usage_outbox_worker_id_is_unique_per_instance(modal_app_module):
     asyncio.run(second.aclose())
 
 
-def test_lora_engine_scales_to_zero_by_default(modal_app_module):
-    # every gpu engine class scales to zero, while the cpu router stays available to trigger them.
-    assert modal_app_module.MIN_CONTAINERS == 0
+def test_lora_engine_uses_configured_capacity(modal_app_module):
+    from flash.serving.app.inference_provider import policy_for
 
     cls_calls = [
         call.kwargs
@@ -105,10 +104,14 @@ def test_lora_engine_scales_to_zero_by_default(modal_app_module):
     # real if it reaches `app.cls`. `AutoscalerSettings.min_containers` is an `optional` proto field
     # (has_presence), so omitting it and sending 0 are distinguishable on the wire -- an omitted
     # field leaves the floor to whatever the server defaults to, which is not ours to assume.
-    assert all(kwargs["min_containers"] == modal_app_module.MIN_CONTAINERS for kwargs in cls_calls)
     assert all(
-        ("gpu" in kwargs) == (modal_app_module.INFERENCE_PROVIDER == "modal")
-        for kwargs in cls_calls
+        kwargs["min_containers"] == policy_for(model).min_capacity
+        and kwargs["max_containers"] == policy_for(model).max_capacity
+        for kwargs, model in zip(cls_calls, modal_app_module.ENGINE_BY_MODEL, strict=True)
+    )
+    assert all(
+        ("gpu" in kwargs) == issubclass(cls, modal_app_module.HostedModalEngine)
+        for kwargs, cls in zip(cls_calls, modal_app_module.ENGINE_BY_MODEL.values(), strict=True)
     )
     assert all(
         kwargs["scaledown_window"]
@@ -122,7 +125,6 @@ def test_lora_engine_scales_to_zero_by_default(modal_app_module):
 
 def test_gpu_engines_scale_from_demand_without_a_paid_spare(modal_app_module):
     # Verify the limit reaches Modal's decorators. Each base_model parameter has its own pool.
-    assert modal_app_module.MAX_CONTAINERS == 2
     assert modal_app_module.ENGINE_BUFFER_CONTAINERS == 0
     assert modal_app_module.ROUTER_BUFFER_CONTAINERS == 1
 
@@ -135,7 +137,7 @@ def test_gpu_engines_scale_from_demand_without_a_paid_spare(modal_app_module):
     assert all(kwargs["max_containers"] == 2 for kwargs in cls_calls)
     # An active, lightly loaded model must not reserve a second GPU.
     assert all(kwargs["buffer_containers"] == 0 for kwargs in cls_calls)
-    assert all(kwargs["min_containers"] == 0 for kwargs in cls_calls)
+    assert sorted(kwargs["min_containers"] for kwargs in cls_calls) == [0, 0, 0, 0, 1, 1]
 
     # The cpu router is uncapped: it is the front door that triggers cold engines, and
     # capping it would throttle every model at once rather than bounding gpu spend per model. It

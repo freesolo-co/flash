@@ -14,7 +14,7 @@ from typing import TYPE_CHECKING, Any
 import modal
 
 from flash.schema import parse_checkpoint_ref
-from flash.serving.app.rollout import model_engine_name, warm_active_models
+from flash.serving.app.rollout import model_engine_name, warm_configured_models
 from flash.serving.app.timeouts import (
     LAMBDA_STARTUP_TIMEOUT_SECONDS,
     REQUEST_TIMEOUT_SECONDS,
@@ -150,13 +150,6 @@ def scaledown_window_for(gpu: str) -> int:
         ) from None
 
 
-# gpu model engines scale to zero. inference and adapter registration remote calls start the matching
-# parameter-bound engine on demand.
-MIN_CONTAINERS = 0
-# Limit GPU autoscaling to two containers per model. `base_model` is
-# a modal.parameter(), so each model has its own pool and cannot borrow another model's capacity.
-# Requests queue when both containers are busy. This applies independently in each environment.
-MAX_CONTAINERS = 2
 # A spare GPU per active model doubles the allocation for lightly loaded pools, then
 # remains billable through the 35-minute idle window. Scale GPUs from actual demand;
 # retain a cheap CPU-router buffer so admission does not wait on router startup.
@@ -272,7 +265,7 @@ image = (
             # It defaults to ~/.cache/vllm (vllm/envs.py), which is ephemeral container storage, so
             # every scale-from-zero re-compiled the model from scratch: vLLM writes its torch.compile
             # artifacts to VLLM_CACHE_ROOT/torch_compile_cache/<hash>/ (vllm/compilation/backends.py),
-            # plus modelinfos/ and the GPU p2p cache. With MIN_CONTAINERS = 0 and a 30-minute
+            # plus modelinfos/ and the GPU p2p cache. With a zero minimum and a 30-minute
             # scaledown window that cost is paid on every cold start — it is the torch.compile +
             # graph-capture portion of the cold boots measured for STARTUP_TIMEOUT_SECONDS.
             # vLLM's own startup benchmark DEFINES a cold start this way (benchmarks/startup.py
@@ -322,10 +315,9 @@ hf_cache_volume = modal.Volume.from_name(HF_CACHE_VOLUME_NAME, create_if_missing
 
 # Retain the GPU implementation, registering only the providers selected below.
 from flash.serving.app.inference_provider import (  # noqa: E402
-    INFERENCE_PROVIDER,
+    capacity_for,
     modal_gpus_for,
-    replica_limit,
-    validate_provider,
+    policy_for,
 )
 from flash.serving.app.modal_engine import HostedModalEngine  # noqa: E402
 from flash.serving.lambda_cloud.proxy import LambdaEngineProxy  # noqa: E402
@@ -379,6 +371,8 @@ def _build_engine(
     max_inputs: int,
     target_inputs: int,
     provider: str = "lambda",
+    min_capacity: int = 0,
+    max_capacity: int = 2,
 ) -> Any:
     """Register a Modal GPU engine or Lambda CPU proxy under a stable model name.
 
@@ -486,39 +480,35 @@ def _build_engine(
         region="us",
         scaledown_window=scaledown_window_for(gpu[0] if isinstance(gpu, list) else gpu),
         timeout=REQUEST_TIMEOUT_SECONDS,
-        min_containers=MIN_CONTAINERS,
-        max_containers=replica_limit(INFERENCE_PROVIDER),
+        min_containers=min_capacity,
+        max_containers=max_capacity,
         buffer_containers=ENGINE_BUFFER_CONTAINERS,
     )(modal.concurrent(max_inputs=max_inputs, target_inputs=target_inputs)(_Engine))
     globals()[class_name] = engine
     return engine
 
 
-# Both pools are registered only in all mode; each is then capped at one replica.
-validate_provider(INFERENCE_PROVIDER)
-_PRIMARY_PROVIDER = "modal" if INFERENCE_PROVIDER == "modal" else "lambda"
-ENGINE_BY_MODEL: dict[str, Any] = {
-    bm: _build_engine(
-        modal_gpus_for(bm) if _PRIMARY_PROVIDER == "modal" else gpu_for(bm),
-        model_engine_name(bm),
-        *_engine_concurrency(bm),
-        provider=_PRIMARY_PROVIDER,
+def _configured_engine(model, provider, suffix=""):
+    minimum, maximum = capacity_for(model, provider)
+    return _build_engine(
+        modal_gpus_for(model) if provider == "modal" else gpu_for(model),
+        model_engine_name(model) + suffix,
+        *_engine_concurrency(model),
+        provider=provider,
+        min_capacity=minimum,
+        max_capacity=maximum,
     )
+
+
+ENGINE_BY_MODEL: dict[str, Any] = {
+    bm: _configured_engine(bm, "modal" if policy_for(bm).provider == "modal" else "lambda")
     for bm in base_models()
 }
-MODAL_FALLBACK_BY_MODEL: dict[str, Any] = (
-    {
-        bm: _build_engine(
-            modal_gpus_for(bm),
-            model_engine_name(bm) + "_ModalGPU",
-            *_engine_concurrency(bm),
-            provider="modal",
-        )
-        for bm in base_models()
-    }
-    if INFERENCE_PROVIDER == "all"
-    else {}
-)
+MODAL_FALLBACK_BY_MODEL: dict[str, Any] = {
+    bm: _configured_engine(bm, "modal", "_ModalGPU")
+    for bm in base_models()
+    if policy_for(bm).provider == "all"
+}
 
 
 def _engine_cls_for(base_model: str) -> Any:
@@ -535,7 +525,7 @@ class _ModalEnginePool:
 
         self._deepinfer = HostedDeepInfer()
         self._provider_selection = None
-        if INFERENCE_PROVIDER == "all":
+        if MODAL_FALLBACK_BY_MODEL:
             from flash.serving.app.provider_selection import ProviderSelection
             from flash.serving.lambda_cloud.config import APP_NAME as fleet_app
 
@@ -543,15 +533,21 @@ class _ModalEnginePool:
             self._provider_selection = ProviderSelection(fleet.has_capacity.remote.aio)
 
     async def _engine_for(self, model):
-        if self._provider_selection and await self._provider_selection.choose(model) == "modal":
+        if (
+            model in MODAL_FALLBACK_BY_MODEL
+            and await self._provider_selection.choose(model) == "modal"
+        ):
             return MODAL_FALLBACK_BY_MODEL[model](base_model=model)
         return _engine_cls_for(model)(base_model=model)
 
     async def start(self):
-        await warm_active_models({bm: cls(base_model=bm) for bm, cls in ENGINE_BY_MODEL.items()})
+        await warm_configured_models(
+            {bm: cls(base_model=bm) for bm, cls in ENGINE_BY_MODEL.items()}
+        )
         if MODAL_FALLBACK_BY_MODEL:
-            await warm_active_models(
-                {bm: cls(base_model=bm) for bm, cls in MODAL_FALLBACK_BY_MODEL.items()}
+            await warm_configured_models(
+                {bm: cls(base_model=bm) for bm, cls in MODAL_FALLBACK_BY_MODEL.items()},
+                fallback=True,
             )
 
     async def aclose(self):
@@ -649,7 +645,7 @@ class _ModalEnginePool:
         model_id: str,
         expected_generation: str | None = None,
     ) -> None:
-        if INFERENCE_PROVIDER == "all":
+        if base_model in MODAL_FALLBACK_BY_MODEL:
             from flash.serving.app.provider_selection import unregister_active
 
             engines = [
