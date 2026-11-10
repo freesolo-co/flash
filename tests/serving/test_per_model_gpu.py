@@ -617,7 +617,10 @@ def test_start_all_raises_after_any_engine_fails(modal_app_module, monkeypatch):
 
         return _factory
 
-    monkeypatch.setattr(mod.modal.Cls, "from_name", _from_name)
+    # Patch the module-scoped stub through side_effect: undoing a monkeypatch.setattr on a
+    # MagicMock child deletes it (pytest>=9.2), which would break every later test that
+    # resolves modal.Cls.from_name on the shared stub.
+    monkeypatch.setattr(mod.modal.Cls.from_name, "side_effect", _from_name)
 
     with pytest.raises(RuntimeError, match="boom"):
         mod.start_all()
@@ -708,6 +711,10 @@ def test_scale_to_zero_pool_dispatches_inference_and_registration(modal_app_modu
         return engine
 
     monkeypatch.setattr(mod, "_engine_cls_for", lambda _base_model: _bind)
+    monkeypatch.setattr(
+        "flash.serving.app.provider_selection.bind_lambda_control",
+        lambda: (object(), types.SimpleNamespace(choose=None)),
+    )
     pool = mod._ModalEnginePool()
     from unittest.mock import AsyncMock
 

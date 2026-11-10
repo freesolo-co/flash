@@ -74,6 +74,11 @@ On the control-plane host:
    a suitable NVIDIA driver and NVIDIA container toolkit installed, plus outbound
    access to the worker container registry and Azure Blob Storage. B200 requires the
    driver/CUDA support of Flash's configured Blackwell worker image.
+   Optionally set `FLASH_NEBIUS_PREEMPTIBLE_VM_LIMIT` to the project's
+   `compute.instance.preemptible.count` quota (Nebius console: Administration → Limits).
+   Spot jobs then wait in the queue, without provisioning, while that many preemptible VMs
+   exist in the project, and the next waiting job claims the slot when a VM is deleted. Without
+   it, a create Nebius refuses for quota or capacity is requeued after 60 seconds instead.
 3. Retain the existing worker image, artifact and runtime-secret configuration.
    The VM launches the same Flash worker capsule and training container as Modal.
 4. Start the control plane and submit with `spot = true`. `flash gpus`

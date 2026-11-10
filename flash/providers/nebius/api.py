@@ -9,13 +9,53 @@ import tempfile
 import time
 from decimal import Decimal
 
-from flash.providers.core.base import UnreconciledCreateError
+from flash.providers.core.base import CapacityUnavailableError, UnreconciledCreateError
 from flash.providers.nebius.config import settings
 from flash.providers.nebius.pricing import SPOT_GPUS
 
 
 class NebiusApiError(RuntimeError):
-    pass
+    """A Nebius CLI call failed. ``code`` is a gRPC status name when Nebius answered definitively.
+
+    An empty code means the outcome is unknown (timeout, transport failure or unparsed output).
+    The CLI's error text is never stored: request bodies carry runtime credentials.
+    """
+
+    def __init__(self, message: str = "", *, code: str = "") -> None:
+        super().__init__(message)
+        self.code = code
+
+
+# A create Nebius refused for quota or capacity provisions nothing, so it is safe to wait and retry.
+CAPACITY_CODES = frozenset({"ResourceExhausted"})
+_STATUS_CODES = (
+    "ResourceExhausted",
+    "InvalidArgument",
+    "FailedPrecondition",
+    "PermissionDenied",
+    "Unauthenticated",
+    "NotFound",
+    "AlreadyExists",
+    "OutOfRange",
+    "Unimplemented",
+)
+_CAPACITY_PHRASES = ("quota", "not enough resources", "insufficient capacity", "out of capacity")
+
+
+def _status_code(stderr: bytes) -> str:
+    """Return a definitive gRPC status name from CLI error output, or "" when unknown.
+
+    Only the status name leaves this function; the text itself is discarded.
+    """
+    text = stderr.decode("utf-8", "replace")
+    compact = text.replace("_", "").lower()
+    for code in _STATUS_CODES:
+        if code.lower() in compact:
+            return code
+    lowered = text.lower()
+    if any(phrase in lowered for phrase in _CAPACITY_PHRASES):
+        return "ResourceExhausted"
+    return ""
 
 
 def call(*args, body=None, deadline_at=None):
@@ -44,6 +84,11 @@ def call(*args, body=None, deadline_at=None):
                 command += ["--file", path]
             result = subprocess.run(command, capture_output=True, timeout=budget, check=True)
             return json.loads(result.stdout)
+    except subprocess.CalledProcessError as error:
+        # The CLI exited after Nebius answered: keep only a definitive status name, if any.
+        raise NebiusApiError(
+            "Nebius operation failed", code=_status_code(error.stderr or b"")
+        ) from None
     except (OSError, subprocess.SubprocessError, ValueError):
         raise NebiusApiError("Nebius operation failed or timed out") from None
 
@@ -65,6 +110,32 @@ def list_instances(*, deadline_at=None):
         for item in data.get("items", [])
         if item.get("metadata", {}).get("labels", {}).get("flash-owner") == "flash-training"
     ]
+
+
+def preemptible_in_use(*, deadline_at=None) -> int:
+    """Count preemptible VMs the project quota currently charges, from any owner.
+
+    `compute.instance.preemptible.count` covers every preemptible VM in the project (stopped ones
+    included), not only Flash's, so do not filter by the flash-owner label.
+    """
+    data = call(
+        "compute",
+        "instance",
+        "list",
+        "--parent-id",
+        settings()["project_id"],
+        "--all",
+        deadline_at=deadline_at,
+    )
+    if not isinstance(data, dict) or not isinstance(data.get("items", []), list):
+        raise NebiusApiError("Nebius returned an invalid instance list")
+    return sum(
+        1
+        for item in data.get("items", [])
+        if isinstance(item, dict)
+        and (item.get("spec") or {}).get("preemptible") is not None
+        and str((item.get("status") or {}).get("state", "")).upper() != "DELETING"
+    )
 
 
 def get_instance(instance_id, *, deadline_at=None):
@@ -295,10 +366,16 @@ def create(*, name, payload, image_reference, gpu, gpu_count, capsule, disk_gb, 
     try:
         result = call("compute", "instance", "create", body=body, deadline_at=deadline_at)
         return result["metadata"]["id"]
-    except (NebiusApiError, KeyError):
+    except (NebiusApiError, KeyError) as error:
         existing = reconcile()
         if existing:
             return existing
+        if getattr(error, "code", "") in CAPACITY_CODES:
+            # Nebius refused the create for quota/capacity and no VM exists under this attempt's
+            # name, so nothing can materialize later: requeue instead of failing the run.
+            raise CapacityUnavailableError(
+                f"Nebius Spot {gpu} capacity unavailable ({error.code}); requeuing"
+            ) from None
         raise UnreconciledCreateError(
             "Nebius launch could not be reconciled; refusing duplicate allocation"
         ) from None
