@@ -100,13 +100,10 @@ def test_lora_engine_uses_configured_capacity(modal_app_module):
         if "startup_timeout" in call.kwargs
     ]
     assert len(cls_calls) == len(modal_app_module.ENGINE_BY_MODEL)
-    # asserted on the kwargs modal is actually CALLED with, not on the constant: the floor is only
-    # real if it reaches `app.cls`. `AutoscalerSettings.min_containers` is an `optional` proto field
-    # (has_presence), so omitting it and sending 0 are distinguishable on the wire -- an omitted
-    # field leaves the floor to whatever the server defaults to, which is not ours to assume.
+    # Modal rejects positive decorator floors on parameterized classes. Startup
+    # applies each model's minimum through the bound instance's autoscaler.
     assert all(
-        kwargs["min_containers"] == policy_for(model).min_capacity
-        and kwargs["max_containers"] == policy_for(model).max_capacity
+        kwargs["min_containers"] == 0 and kwargs["max_containers"] == policy_for(model).max_capacity
         for kwargs, model in zip(cls_calls, modal_app_module.ENGINE_BY_MODEL, strict=True)
     )
     assert all(
@@ -137,7 +134,7 @@ def test_gpu_engines_scale_from_demand_without_a_paid_spare(modal_app_module):
     assert all(kwargs["max_containers"] == 2 for kwargs in cls_calls)
     # An active, lightly loaded model must not reserve a second GPU.
     assert all(kwargs["buffer_containers"] == 0 for kwargs in cls_calls)
-    assert sorted(kwargs["min_containers"] for kwargs in cls_calls) == [0, 0, 0, 0, 1, 1]
+    assert sorted(kwargs["min_containers"] for kwargs in cls_calls) == [0, 0, 0, 0, 0, 0]
 
     # The cpu router is uncapped: it is the front door that triggers cold engines, and
     # capping it would throttle every model at once rather than bounding gpu spend per model. It

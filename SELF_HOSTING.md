@@ -107,7 +107,10 @@ The shipping settings are:
 
 Capacity counts model replicas, not GPU cards, and applies independently in each
 environment. A positive minimum starts the parameterized pool during router startup and keeps
-it warm; GPU availability and worker startup still apply. Lambda's CPU proxy owns one VM
+it warm; GPU availability and worker startup still apply. Modal requires a zero
+minimum in parameterized class decorators, so router startup applies the configured
+minimum and maximum with each bound instance's `update_autoscaler()` before readiness.
+It also writes zero minimums explicitly to clear previous warm settings. Lambda's CPU proxy owns one VM
 per replica. Its lease guard enforces the same maximum per model and source
 revision; rolling releases can temporarily overlap old and new replicas.
 
