@@ -5565,11 +5565,12 @@ def test_concurrently_finished_episodes_are_scored_in_one_env_call():
     assert sum(env.batch_sizes) == 8, "an episode was scored twice or not at all"
 
 
-def test_a_batched_score_reaches_the_env_under_the_same_lock_every_other_call_takes():
-    # scoring is batched to shorten how long the lock is held, NOT to drop it. `reward_thread_safe`
-    # licenses racing the scorer against ITSELF; it says nothing about racing it against a
-    # concurrent episode's `env_reply`, and no env contract permits that.
+def test_a_not_thread_safe_env_is_scored_under_the_same_lock_every_other_call_takes():
+    # an env that opts out with `reward_thread_safe = False` (a shared browser, a non-thread-safe
+    # client) must never have its scorer race a concurrent episode's `env_reply`.
     class _LockObservingEnv(_BridgeEnv):
+        reward_thread_safe = False
+
         def __init__(self):
             super().__init__()
             self.held_during_scoring: list[bool] = []
@@ -5591,7 +5592,7 @@ def test_a_batched_score_reaches_the_env_under_the_same_lock_every_other_call_ta
     assert env.held_during_scoring == [True], "the env was scored without the session lock held"
 
 
-def _parked_scorer_env(*, score_overlaps_steps):
+def _parked_scorer_env(*, reward_thread_safe):
     """an env whose scorer parks until released, to observe what a slow score blocks."""
     entered = threading.Event()
     release = threading.Event()
@@ -5605,7 +5606,7 @@ def _parked_scorer_env(*, score_overlaps_steps):
             return [RolloutReward(episode=1.0, turns=None) for _ in items]
 
     env = _SlowScoringEnv(done_after=2)
-    env.score_overlaps_steps = score_overlaps_steps
+    env.reward_thread_safe = reward_thread_safe
     return env, entered, release
 
 
@@ -5635,21 +5636,21 @@ def _step_while_scoring(env, entered, release):
     return finished_early, scored
 
 
-def test_an_env_that_opts_in_keeps_stepping_while_a_slow_score_runs():
+def test_a_thread_safe_env_keeps_stepping_while_a_slow_score_runs():
     # a remote grader can take minutes per episode. scored under the step lock, that one score
     # freezes every other in-flight episode's env_reply until verl's no-progress watchdog fires.
-    env, entered, release = _parked_scorer_env(score_overlaps_steps=True)
+    env, entered, release = _parked_scorer_env(reward_thread_safe=True)
     finished_early, scored = _step_while_scoring(env, entered, release)
     assert finished_early, "a step waited on an unrelated episode's score"
     assert scored == [1.0]
 
 
-def test_by_default_a_step_still_waits_for_a_score_in_progress():
-    # the opt-in is the only way scoring leaves the lock: an env that did not declare its scorer
-    # independent of env_reply state is never raced against it.
-    env, entered, release = _parked_scorer_env(score_overlaps_steps=False)
+def test_a_not_thread_safe_env_still_makes_a_step_wait_for_a_score_in_progress():
+    # `reward_thread_safe = False` keeps the old behavior: the scorer is never raced against
+    # env_reply state.
+    env, entered, release = _parked_scorer_env(reward_thread_safe=False)
     finished_early, scored = _step_while_scoring(env, entered, release)
-    assert not finished_early, "a step raced a score the env never allowed to overlap"
+    assert not finished_early, "a step raced the scorer of an env that is not thread-safe"
     assert scored == [1.0]
 
 

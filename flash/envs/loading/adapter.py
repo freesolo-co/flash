@@ -571,16 +571,6 @@ class FreesoloEnvironment(BaseEnvironment):
         """Whether reward() may be called concurrently; delegates to the underlying env."""
         return bool(getattr(self._env, "reward_thread_safe", True))
 
-    @property
-    def score_overlaps_steps(self) -> bool:
-        """Whether multi-turn GRPO may score finished episodes while other episodes are stepping.
-
-        Off by default: the bridge then scores under the same lock as ``env_reply``. An env whose
-        scoring does not touch state its turns mutate (e.g. it only calls a remote grader) sets
-        ``score_overlaps_steps = True`` so a slow score no longer stalls every in-flight episode.
-        """
-        return bool(getattr(self._env, "score_overlaps_steps", False))
-
     def grade(self, completion: str, example: dict, state: dict | None = None) -> bool:
         return bool(self._score_one(completion, example, state).resolved_success())
 

@@ -600,21 +600,6 @@ def test_single_turn_reward_many_batches_by_example_value_identical(monkeypatch)
     assert sorted(sdk_env.batch_sizes) == [1, 2]  # ex_a's two completions scored in ONE call
 
 
-def test_score_overlaps_steps_defaults_off_and_follows_the_env(monkeypatch):
-    """Multi-turn GRPO scores outside the step lock only for an env that declares it safe."""
-    _install_fake_freesolo(monkeypatch)
-
-    from flash.envs.loading.adapter import FreesoloEnvironment
-
-    class _OverlappingEnv(_FakeSingleTurnEnv):
-        score_overlaps_steps = True
-
-    default = FreesoloEnvironment(_FakeSingleTurnEnv(), "owner/env", source=None, contract_text="")
-    opted_in = FreesoloEnvironment(_OverlappingEnv(), "owner/env", source=None, contract_text="")
-    assert default.score_overlaps_steps is False
-    assert opted_in.score_overlaps_steps is True
-
-
 def test_single_turn_reward_many_serial_when_not_thread_safe(monkeypatch):
     """An env that opts out with reward_thread_safe = False must NOT have a group's
     completions batched into one env-concurrent score_responses call (a scorer with mutable/thread-
