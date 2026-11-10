@@ -35,7 +35,11 @@ def controller(ready=0, modal_runners=0, running=0):
     state = SimpleNamespace(
         get=AsyncMock(
             side_effect=lambda key: (
-                REVISION if key == "active_revision" else {"modal_slots": max(0, 4 - ready)}
+                None
+                if key.startswith("demand:")
+                else REVISION
+                if key == "active_revision"
+                else {"modal_slots": max(0, 4 - ready)}
             )
         ),
         put=AsyncMock(),
@@ -138,3 +142,38 @@ async def test_unconfirmed_lambda_allocations_reserve_budget_until_cleanup():
     assert fallback.update_autoscaler.aio.await_args.kwargs["max_containers"] == 1
     with pytest.raises(NoCapacityError):
         await control.before_launch(MODEL, REVISION, allocated=4)
+
+
+@pytest.mark.anyio
+async def test_short_requests_boot_lambda_for_zero_floor_models_then_return_to_zero():
+    model = "Qwen/Qwen3.5-4B"
+    control, primary, fallback = controller()
+    now = [1000]
+    state = {"active_revision": REVISION, model: {"modal_slots": 2}}
+
+    async def get(key):
+        return state.get(key)
+
+    async def put(key, value):
+        state[key] = value
+
+    control.state = SimpleNamespace(get=get, put=put)
+    control.clock = lambda: now[0]
+    await control.reconcile_model(model)
+    assert primary.update_autoscaler.aio.await_args.kwargs["min_containers"] == 0
+    assert await control.choose(model) == "modal"
+    # The request finishes before the next sample; remembered demand still
+    # starts Lambda, instead of leaving all short requests on Modal forever.
+    now[0] += 60
+    await control.reconcile_model(model)
+    assert primary.update_autoscaler.aio.await_args.kwargs["min_containers"] == 1
+    control.fleet.ready_count.return_value = 1
+    control.fleet.allocated_count.return_value = 1
+    assert await control.choose(model) == "lambda"
+    now[0] += 121
+    await control.reconcile_model(model)
+    assert primary.update_autoscaler.aio.await_args.kwargs["min_containers"] == 0
+    assert fallback.update_autoscaler.aio.await_args.kwargs["min_containers"] == 0
+
+    with pytest.raises(NoCapacityError, match="idle"):
+        await control.before_launch(model, REVISION, allocated=1)

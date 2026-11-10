@@ -6,7 +6,6 @@ import asyncio
 import hashlib
 from typing import Any
 
-from flash.serving.app.inference_provider import capacity_for, policy_for
 from flash.serving.app.timeouts import ROUTER_TIMEOUT_SECONDS
 
 
@@ -57,15 +56,3 @@ async def warm_active_models(
             tasks.create_task(
                 _warm_model(model, engine, (legacy or {}).get(model), model in (keep_warm or set()))
             )
-
-
-async def warm_configured_models(engines: dict[str, Any], *, fallback: bool = False) -> None:
-    """Start configured warm pools and gate already-active pools during rollout."""
-    keep_warm = set()
-    for model in engines:
-        provider = "modal" if fallback or policy_for(model).provider == "modal" else "lambda"
-        minimum, maximum = capacity_for(model, provider)
-        await engines[model].update_autoscaler.aio(min_containers=minimum, max_containers=maximum)
-        if minimum > 0:
-            keep_warm.add(model)
-    await warm_active_models(engines, keep_warm=keep_warm)

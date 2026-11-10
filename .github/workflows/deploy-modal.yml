@@ -347,25 +347,19 @@ jobs:
           done
 
       # This independent app keeps orphan VM cleanup running across serving releases.
-      - name: Validate inference provider
-        id: provider
+      - name: Validate Lambda credentials
         if: steps.gate.outputs.deploy == 'true'
         run: |
           python3 - <<'PYCODE'
           import os
-          import runpy
-          policy = runpy.run_path("flash/serving/app/inference_provider.py")
-          enabled = policy["lambda_enabled"]()
-          if enabled and not os.environ.get("LAMBDA_API_KEY"):
-              raise SystemExit("LAMBDA_API_KEY is required for lambda/all inference")
-          with open(os.environ["GITHUB_OUTPUT"], "a") as output:
-              output.write(f"lambda_enabled={str(enabled).lower()}\n")
+          if not os.environ.get("LAMBDA_API_KEY"):
+              raise SystemExit("LAMBDA_API_KEY is required for hosted inference")
           PYCODE
 
       - name: Deploy Lambda fleet control
         env:
           FREESOLO_DEPLOYMENT_SHA: ${{ github.sha }}
-        if: steps.gate.outputs.deploy == 'true' && steps.provider.outputs.lambda_enabled == 'true'
+        if: steps.gate.outputs.deploy == 'true'
         run: modal deploy --strategy rolling --env main -m flash.serving.lambda_cloud.control_app
 
       - name: Deploy serving

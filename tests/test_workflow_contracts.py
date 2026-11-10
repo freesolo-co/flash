@@ -843,38 +843,20 @@ def test_promotion_failure_has_no_automatic_redeployment_path():
 
 
 @pytest.mark.parametrize("workflow", ["deploy-modal.yml", "deploy-modal-dev.yml"])
-@pytest.mark.parametrize(
-    ("mode", "key", "success", "enabled"),
-    [
-        ("modal", "", True, "false"),
-        ("lambda", "", False, None),
-        ("lambda", "test-key", True, "true"),
-        ("all", "test-key", True, "true"),
-        ("bad-mode", "test-key", False, None),
-    ],
-)
-def test_provider_deployment_requires_lambda_only_when_enabled(
-    workflow, mode, key, success, enabled, tmp_path
-):
+@pytest.mark.parametrize(("key", "success"), [("", False), ("test-key", True)])
+def test_hosted_deployment_always_requires_lambda(workflow, key, success, tmp_path):
     job = _load(WORKFLOW_DIR / workflow)["jobs"]["deploy"]
-    step = next(s for s in _steps(job) if s.get("name") == "Validate inference provider")
-    target = tmp_path / "flash/serving/app/inference_provider.py"
-    target.parent.mkdir(parents=True)
-    source = (REPO_ROOT / "flash/serving/app/inference_provider.py").read_text()
-    target.write_text(source + f'\nMODEL_POLICIES = {{"test-model": ModelPolicy({mode!r})}}\n')
-    output = tmp_path / "outputs"
+    step = next(s for s in _steps(job) if s.get("name") == "Validate Lambda credentials")
     result = subprocess.run(
         ["bash", "-e", "-c", step["run"]],
         cwd=tmp_path,
-        env={**os.environ, "LAMBDA_API_KEY": key, "GITHUB_OUTPUT": str(output)},
+        env={**os.environ, "LAMBDA_API_KEY": key},
         capture_output=True,
         text=True,
     )
     assert (result.returncode == 0) is success
-    if success:
-        assert output.read_text() == f"lambda_enabled={enabled}\n"
     control = next(s for s in _steps(job) if s.get("name") == "Deploy Lambda fleet control")
-    assert "steps.provider.outputs.lambda_enabled == 'true'" in control["if"]
+    assert control["if"] == "steps.gate.outputs.deploy == 'true'"
 
 
 @pytest.mark.parametrize("filename", ["deploy-modal.yml", "deploy-modal-dev.yml"])

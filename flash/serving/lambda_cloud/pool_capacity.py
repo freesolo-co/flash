@@ -2,8 +2,9 @@
 
 import logging
 import math
+import time
 
-from flash.serving.app.inference_provider import MODEL_POLICIES, policy_for
+from flash.serving.app.inference_provider import lambda_models, policy_for
 from flash.serving.app.rollout import model_engine_name
 from flash.serving.src.engine.model_config import engine_overrides_for
 
@@ -22,8 +23,9 @@ def sequence_capacity(model):
 
 
 class SharedCapacity:
-    def __init__(self, fleet, pools, state, revision):
+    def __init__(self, fleet, pools, state, revision, *, clock=time.time):
         self.fleet, self.pools, self.state, self.revision = fleet, pools, state, revision
+        self.clock = clock
 
     async def activate(self, revision):
         if not revision or revision != self.revision:
@@ -38,15 +40,14 @@ class SharedCapacity:
         if not await self.active():
             return
         errors = []
-        for model, policy in MODEL_POLICIES.items():
-            if policy.provider != "modal":
-                try:
-                    await self.reconcile_model(model)
-                except Exception as exc:
-                    errors.append(exc)
-                    logger.warning(
-                        "Capacity reconciliation failed for %s; retrying in one minute", model
-                    )
+        for model in lambda_models():
+            try:
+                await self.reconcile_model(model)
+            except Exception as exc:
+                errors.append(exc)
+                logger.warning(
+                    "Capacity reconciliation failed for %s; retrying in one minute", model
+                )
         if strict and errors:
             raise ExceptionGroup("Cannot configure shared serving capacity", errors)
 
@@ -57,9 +58,17 @@ class SharedCapacity:
         primary_stats = await primary.health.get_current_stats.aio()
         fallback_stats = await fallback.health.get_current_stats.aio()
         inputs = sum(s.num_running_inputs + s.backlog for s in (primary_stats, fallback_stats))
+        # Remember short requests that finish between minute samples, so a
+        # zero-floor model still moves to Lambda while requests keep arriving.
+        last_request = await self.state.get("demand:" + model)
+        recent_demand = last_request is not None and self.clock() - last_request < 120
         desired = min(
             policy.max_capacity,
-            max(policy.min_capacity, math.ceil(inputs / sequence_capacity(model))),
+            max(
+                policy.min_capacity,
+                int(recent_demand),
+                math.ceil(inputs / sequence_capacity(model)),
+            ),
         )
         # With no ready Lambda worker, Modal can use the entire budget. Once
         # replacements are healthy, reduce its ceiling and drain idle GPUs.
@@ -77,12 +86,14 @@ class SharedCapacity:
         await primary.update_autoscaler.aio(
             min_containers=desired, max_containers=policy.max_capacity, buffer_containers=0
         )
-        return ready, primary_stats, fallback_stats
+        return ready, primary_stats, fallback_stats, desired
 
     async def before_launch(self, model, revision, allocated):
         if revision != self.revision or not await self.active():
             raise NoCapacityError("Lambda pool is not active for this deployment")
-        ready, _, fallback_stats = await self.reconcile_model(model)
+        ready, _, fallback_stats, desired = await self.reconcile_model(model)
+        if desired == 0:
+            raise NoCapacityError("Model is idle; waiting for new demand before allocating Lambda")
         maximum = policy_for(model).max_capacity
         # Reserve room for requests that can still scale Modal up to its ceiling,
         # as well as old containers that have not finished draining yet.
@@ -96,6 +107,7 @@ class SharedCapacity:
             raise NoCapacityError("A Lambda replacement is already starting")
 
     async def choose(self, model):
+        await self.state.put("demand:" + model, self.clock())
         ready = await self.fleet.ready_count(model)
         routing = await self.state.get(model)
         if routing is None:

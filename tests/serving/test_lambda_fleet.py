@@ -167,7 +167,7 @@ async def test_uncertain_leases_count_toward_per_release_replica_limit():
 async def test_all_mode_can_fill_the_entire_shared_budget_with_lambda(monkeypatch):
     from flash.serving.app.inference_provider import MODEL_POLICIES, ModelPolicy
 
-    monkeypatch.setitem(MODEL_POLICIES, MODEL, ModelPolicy("all"))
+    monkeypatch.setitem(MODEL_POLICIES, MODEL, ModelPolicy())
     api, ledger = API(), Ledger()
     fleet = Fleet(api, ledger, "dev", clock=lambda: 100)
     await fleet.launch(OWNER, MODEL, "bootstrap", "b" * 40)
@@ -181,7 +181,9 @@ async def test_all_mode_can_fill_the_entire_shared_budget_with_lambda(monkeypatc
 async def test_custom_model_maximum_is_enforced_independently(monkeypatch):
     from flash.serving.app.inference_provider import MODEL_POLICIES, ModelPolicy
 
-    monkeypatch.setitem(MODEL_POLICIES, MODEL, ModelPolicy("lambda", 1, 3, ("A10",)))
+    monkeypatch.setitem(
+        MODEL_POLICIES, MODEL, ModelPolicy(min_capacity=1, max_capacity=3, lambda_gpus=("A10",))
+    )
     api, ledger = API(), Ledger()
     fleet = Fleet(api, ledger, "dev", clock=lambda: 100)
     for owner in ("a" * 32, "b" * 32, "c" * 32):
@@ -189,9 +191,11 @@ async def test_custom_model_maximum_is_enforced_independently(monkeypatch):
     with pytest.raises(RuntimeError, match="replica limit"):
         await fleet.launch("d" * 32, MODEL, "bootstrap", "e" * 40)
     assert api.launches == 3
+    for owner in ("f" * 32, "1" * 32):
+        await fleet.launch(owner, "Qwen/Qwen3.5-4B", "bootstrap", "e" * 40)
     with pytest.raises(RuntimeError, match="replica limit"):
-        await fleet.launch("f" * 32, "Qwen/Qwen3.5-4B", "bootstrap", "e" * 40)
-    assert api.launches == 3
+        await fleet.launch("2" * 32, "Qwen/Qwen3.5-4B", "bootstrap", "e" * 40)
+    assert api.launches == 5
 
 
 @pytest.mark.anyio

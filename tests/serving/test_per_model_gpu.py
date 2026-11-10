@@ -30,8 +30,8 @@ def _passthrough_decorator(*_a: Any, **_k: Any):
     return deco
 
 
-@pytest.fixture(scope="module", params=["modal", "lambda"])
-def modal_app_module(load_modal_app_under_stub, request):
+@pytest.fixture(scope="module")
+def modal_app_module(load_modal_app_under_stub):
     modal_stub = MagicMock(name="modal")
     modal_stub.concurrent.side_effect = _passthrough_decorator
     modal_stub.method.side_effect = _passthrough_decorator
@@ -51,7 +51,7 @@ def modal_app_module(load_modal_app_under_stub, request):
             patch.setitem(
                 inference_provider.MODEL_POLICIES,
                 model,
-                inference_provider.ModelPolicy(request.param),
+                inference_provider.ModelPolicy(),
             )
         return load_modal_app_under_stub(modal_stub)
 

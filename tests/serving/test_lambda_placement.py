@@ -25,7 +25,7 @@ def offer(gpu, price=300, count=1, regions=("us-west-1",), architecture="x86_64"
 def test_select_cheapest_available_approved_gpu_without_guessing_instance_ids(monkeypatch):
     from flash.serving.app.inference_provider import MODEL_POLICIES, ModelPolicy
 
-    monkeypatch.setitem(MODEL_POLICIES, SMALL, ModelPolicy("lambda"))
+    monkeypatch.setitem(MODEL_POLICIES, SMALL, ModelPolicy())
     catalog = {
         "provider-a100": offer("A100 (80 GB SXM4)", 250),
         "provider-h100": offer("H100 (80 GB SXM5)", 400),

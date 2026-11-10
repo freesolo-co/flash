@@ -1,4 +1,4 @@
-"""Provider selection is explicit and never retries a dispatched generation."""
+"""Every Qwen model prefers Lambda without a provider mode setting."""
 
 import asyncio
 from types import SimpleNamespace
@@ -20,10 +20,9 @@ def passthrough(*args, **kwargs):
     return lambda cls: cls
 
 
-@pytest.mark.parametrize("mode", ["modal", "lambda", "all"])
-def test_registered_pools_and_combined_limit(mode, monkeypatch, load_modal_app_under_stub):
+def test_registered_pools_and_combined_limit(monkeypatch, load_modal_app_under_stub):
     for model in base_models():
-        monkeypatch.setitem(policy.MODEL_POLICIES, model, policy.ModelPolicy(mode))
+        monkeypatch.setitem(policy.MODEL_POLICIES, model, policy.ModelPolicy())
     modal = MagicMock()
     for name in ("concurrent", "method", "enter", "exit", "asgi_app"):
         getattr(modal, name).side_effect = passthrough
@@ -36,25 +35,29 @@ def test_registered_pools_and_combined_limit(mode, monkeypatch, load_modal_app_u
     cpu_calls = [call for call in app.cls.call_args_list if "gpu" not in call.kwargs]
     n = len(base_models())
     assert len(gpu_calls) == n
-    assert len(cpu_calls) == (n if mode in {"lambda", "all"} else 0)
+    assert len(cpu_calls) == n
     # Modal rejects non-preemptible GPU workloads; Lambda proxies are CPU-only.
     assert all(not call.kwargs.get("nonpreemptible", False) for call in gpu_calls)
     assert all(call.kwargs["nonpreemptible"] for call in cpu_calls)
-    assert sum(call.kwargs["max_containers"] for call in app.cls.call_args_list) == (
-        2 * n if mode == "modal" else 4 * n
-    )
-    for model, cls in mod.ENGINE_BY_MODEL.items():
-        if mode == "modal":
-            assert issubclass(cls, mod.HostedModalEngine)
-            assert cls.pinned_gpu == policy.modal_gpus_for(model)
-        else:
-            assert issubclass(cls, mod.LambdaEngineProxy)
-    assert bool(mod.MODAL_FALLBACK_BY_MODEL) == (mode != "modal")
+    assert sum(call.kwargs["max_containers"] for call in app.cls.call_args_list) == 4 * n
+    assert all(issubclass(cls, mod.LambdaEngineProxy) for cls in mod.ENGINE_BY_MODEL.values())
+    assert set(mod.MODAL_FALLBACK_BY_MODEL) == set(base_models())
     assert not any("DeepSeek" in model for model in mod.ENGINE_BY_MODEL)
+    monkeypatch.setenv("FREESOLO_DEPLOYMENT_SHA", "a" * 40)
+    pool = mod._ModalEnginePool()
+    activation = AsyncMock()
+    pool._fleet = SimpleNamespace(activate=SimpleNamespace(remote=SimpleNamespace(aio=activation)))
+
+    async def startup():
+        await pool.start()
+        await pool.aclose()
+
+    asyncio.run(startup())
+    activation.assert_awaited_once_with("a" * 40)
 
 
 @pytest.mark.anyio
-async def test_all_selects_by_capacity_and_caches_concurrent_lookups():
+async def test_selects_by_capacity_and_caches_concurrent_lookups():
     now = 100
     capacity = AsyncMock(return_value="lambda")
     selection = ProviderSelection(capacity, clock=lambda: now)
@@ -73,9 +76,16 @@ async def test_provider_api_failure_is_not_treated_as_missing_capacity():
         await ProviderSelection(capacity).choose("model")
 
 
-def test_unknown_mode_and_deepseek_are_not_reinterpreted():
-    with pytest.raises(ValueError, match="provider must"):
-        policy.ModelPolicy("automatic")
+@pytest.mark.parametrize("removed_mode", ["modal", "lambda", "all"])
+def test_provider_setting_is_removed(removed_mode):
+    with pytest.raises(TypeError):
+        policy.ModelPolicy(provider=removed_mode)
+    with pytest.raises(TypeError):
+        policy.ModelPolicy(removed_mode)
+    assert not hasattr(policy.ModelPolicy(), "provider")
+
+
+def test_deepseek_is_not_reinterpreted_as_a_qwen_worker():
     with pytest.raises(ValueError, match="only defined for hosted Qwen"):
         policy.modal_gpus_for("deepseek-ai/DeepSeek-V4.1-Flash-1017")
 
@@ -177,7 +187,6 @@ async def test_modal_load_selects_actual_profile_and_isolates_compiled_cache(mon
         {"max_capacity": 0},
         {"max_capacity": None},
         {"max_capacity": 1.5},
-        {"provider": "all", "max_capacity": 1},
         {"dev_max_capacity": 0},
         {"lambda_gpus": ("T4",)},
     ],
@@ -192,27 +201,30 @@ def test_shipping_policy_covers_catalog_and_requested_placement():
     from flash.serving.lambda_cloud.config import placements
 
     assert set(policy.MODEL_POLICIES) == set(base_models()) | {MODEL_ID}
+    assert set(policy.lambda_models()) == set(base_models())
     selected = {
         "Qwen/Qwen3.5-0.8B": ("A10",),
         "Qwen/Qwen3.5-9B-Base": ("A100-40GB", "A100-80GB", "H100"),
     }
     for model, config in policy.MODEL_POLICIES.items():
         if model in selected:
-            assert config.provider == "lambda"
             assert policy.capacity_for(model, "lambda") == (
                 (2, 4) if "9B-Base" in model else (1, 2)
             )
             assert placements(model) == selected[model]
         else:
-            assert config.provider == "modal"
             assert config.min_capacity == 0
     with pytest.raises(ValueError, match="No serving"):
         policy.policy_for("typo")
 
 
 def test_mixed_model_decorators_use_independent_capacity(monkeypatch, load_modal_app_under_stub):
-    monkeypatch.setitem(policy.MODEL_POLICIES, "Qwen/Qwen3.5-4B", policy.ModelPolicy("modal", 2, 5))
-    monkeypatch.setitem(policy.MODEL_POLICIES, "Qwen/Qwen3.5-9B", policy.ModelPolicy("all", 4, 7))
+    monkeypatch.setitem(
+        policy.MODEL_POLICIES, "Qwen/Qwen3.5-4B", policy.ModelPolicy(min_capacity=2, max_capacity=5)
+    )
+    monkeypatch.setitem(
+        policy.MODEL_POLICIES, "Qwen/Qwen3.5-9B", policy.ModelPolicy(min_capacity=4, max_capacity=7)
+    )
     modal = MagicMock()
     for name in ("concurrent", "method", "enter", "exit", "asgi_app"):
         getattr(modal, name).side_effect = passthrough
@@ -221,22 +233,19 @@ def test_mixed_model_decorators_use_independent_capacity(monkeypatch, load_modal
     for name in ("cls", "function", "local_entrypoint"):
         getattr(app, name).side_effect = passthrough
     mod = load_modal_app_under_stub(modal)
-    expected = [(0, 2), (0, 5), (0, 7), (0, 4), (0, 2), (0, 2), (0, 2), (0, 7), (0, 4)]
+    expected = [(0, 2), (0, 5), (0, 7), (0, 4), (0, 2), (0, 2)] * 2
     assert [
         (c.kwargs["min_containers"], c.kwargs["max_containers"]) for c in app.cls.call_args_list
     ] == expected
-    assert set(mod.MODAL_FALLBACK_BY_MODEL) == {
-        "Qwen/Qwen3.5-0.8B",
-        "Qwen/Qwen3.5-9B",
-        "Qwen/Qwen3.5-9B-Base",
-    }
-    # A fallback on another model must never redirect a Lambda-only or Modal-only model.
-    for model in mod.ENGINE_BY_MODEL:
-        monkeypatch.setitem(mod.ENGINE_BY_MODEL, model, MagicMock())
-    monkeypatch.setitem(mod.MODAL_FALLBACK_BY_MODEL, "Qwen/Qwen3.5-9B", MagicMock())
-    pool = mod._ModalEnginePool()
-    pool._provider_selection = SimpleNamespace(choose=AsyncMock(return_value="modal"))
-    asyncio.run(pool._engine_for("Qwen/Qwen3.5-4B"))
-    pool._provider_selection.choose.assert_not_awaited()
-    asyncio.run(pool._engine_for("Qwen/Qwen3.5-9B"))
-    pool._provider_selection.choose.assert_awaited_once_with("Qwen/Qwen3.5-9B")
+    assert set(mod.MODAL_FALLBACK_BY_MODEL) == set(base_models())
+    for model in base_models():
+        primary, fallback = MagicMock(), MagicMock()
+        monkeypatch.setitem(mod.ENGINE_BY_MODEL, model, primary)
+        monkeypatch.setitem(mod.MODAL_FALLBACK_BY_MODEL, model, fallback)
+        pool = mod._ModalEnginePool()
+        choose = AsyncMock(return_value="modal")
+        pool._provider_selection = SimpleNamespace(choose=choose)
+        assert asyncio.run(pool._engine_for(model)) is fallback.return_value
+        primary.assert_not_called()
+        choose.return_value = "lambda"
+        assert asyncio.run(pool._engine_for(model)) is primary.return_value

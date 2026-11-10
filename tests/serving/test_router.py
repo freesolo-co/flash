@@ -206,12 +206,7 @@ def test_unregister_safe_records_exact_gpu_cleanup_failure(capsys):
     )
 
 
-@pytest.mark.parametrize("provider", ["modal", "lambda", "all"])
-def test_healthz_reports_one_gpu_per_base_model(app_setup, monkeypatch, provider):
-    from flash.serving.app.inference_provider import MODEL_POLICIES, ModelPolicy
-
-    for model in (QWEN, QWEN_35B):
-        monkeypatch.setitem(MODEL_POLICIES, model, ModelPolicy(provider))
+def test_healthz_reports_one_gpu_per_base_model(app_setup):
     client, _, _ = app_setup
     body = client.get("/healthz").json()
     assert body["ok"] is True
@@ -221,11 +216,9 @@ def test_healthz_reports_one_gpu_per_base_model(app_setup, monkeypatch, provider
     ]
     assert body["base_models"] == [QWEN, QWEN_35B]  # sorted by model id
     assert body["gpus"] == 2  # two configured supported base-model engines
-    expected = {
-        "modal": {QWEN: "L40S | A100-80GB", QWEN_35B: "H200"},
-        "lambda": {QWEN: "A100-40GB | A100-80GB | H100", QWEN_35B: "H200 | B200"},
-        "all": {QWEN: "A100-40GB | A100-80GB | H100 | L40S", QWEN_35B: "H200 | B200"},
-    }[provider]
+    expected = {QWEN: "A100-40GB | A100-80GB | H100 | L40S", QWEN_35B: "H200 | B200"}
+    assert body["inference_provider"] == "lambda"
+    assert body["fallback_provider_by_model"] == {QWEN: "modal", QWEN_35B: "modal"}
     assert body["gpu_by_model"] == expected
     assert body["gpu_tiers"] == sorted(
         {gpu for options in expected.values() for gpu in options.split(" | ")}

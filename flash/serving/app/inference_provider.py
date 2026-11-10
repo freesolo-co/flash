@@ -3,9 +3,8 @@
 from dataclasses import dataclass
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, kw_only=True)
 class ModelPolicy:
-    provider: str = "modal"
     min_capacity: int = 0
     max_capacity: int = 2
     lambda_gpus: tuple[str, ...] | list[str] = ()
@@ -13,8 +12,6 @@ class ModelPolicy:
     dev_max_capacity: int | None = None
 
     def __post_init__(self):
-        if self.provider not in {"modal", "lambda", "all"}:
-            raise ValueError("provider must be modal, lambda, or all")
         if type(self.min_capacity) is not int or type(self.max_capacity) is not int:
             raise ValueError("capacity must use integers")
         for maximum in (self.max_capacity, self.dev_max_capacity):
@@ -24,11 +21,10 @@ class ModelPolicy:
                 type(self.min_capacity) is not int
                 or type(maximum) is not int
                 or not 0 <= self.min_capacity <= maximum
-                or maximum < (2 if self.provider == "all" else 1)
+                or maximum < 1
             ):
                 raise ValueError(
-                    "capacity requires integer 0 <= min_capacity <= max_capacity; "
-                    "max_capacity >= 1 (>= 2 for all)"
+                    "capacity requires integer 0 <= min_capacity <= max_capacity; max_capacity >= 1"
                 )
         if not isinstance(self.lambda_gpus, (tuple, list)) or any(
             gpu not in {"A10", "A100-40GB", "A100-80GB", "H100", "H200", "B200"}
@@ -43,21 +39,17 @@ class ModelPolicy:
 # allow one temporary extra GPU, then drain the replaced Modal replica before
 # starting another. lambda_gpus is an allowlist: use the cheapest available offer.
 MODEL_POLICIES = {
-    "Qwen/Qwen3.5-0.8B": ModelPolicy(
-        "lambda", min_capacity=1, max_capacity=2, lambda_gpus=("A10",)
-    ),
-    "Qwen/Qwen3.5-4B": ModelPolicy("modal", min_capacity=0, max_capacity=2),
-    "Qwen/Qwen3.5-9B": ModelPolicy("modal", min_capacity=0, max_capacity=2),
+    "Qwen/Qwen3.5-0.8B": ModelPolicy(min_capacity=1, max_capacity=2, lambda_gpus=("A10",)),
+    "Qwen/Qwen3.5-4B": ModelPolicy(min_capacity=0, max_capacity=2),
+    "Qwen/Qwen3.5-9B": ModelPolicy(min_capacity=0, max_capacity=2),
     "Qwen/Qwen3.5-9B-Base": ModelPolicy(
-        "lambda",
         min_capacity=2,
         max_capacity=4,
         lambda_gpus=["A100-40GB", "A100-80GB", "H100"],
     ),
-    "Qwen/Qwen3.8-27B": ModelPolicy("modal", min_capacity=0, max_capacity=2),
-    "Qwen/Qwen3.6-35B-A3B": ModelPolicy("modal", min_capacity=0, max_capacity=2),
+    "Qwen/Qwen3.8-27B": ModelPolicy(min_capacity=0, max_capacity=2),
+    "Qwen/Qwen3.6-35B-A3B": ModelPolicy(min_capacity=0, max_capacity=2),
     "deepseek-ai/DeepSeek-V4.1-Flash-1017": ModelPolicy(
-        "modal",
         min_capacity=0,
         max_capacity=4,
         dev_max_capacity=1,
@@ -69,13 +61,11 @@ def policy_for(model):
     try:
         return MODEL_POLICIES[model]
     except KeyError:
-        raise ValueError(f"No serving provider/capacity policy for {model}") from None
+        raise ValueError(f"No serving capacity policy for {model}") from None
 
 
 def capacity_for(model, provider):
     policy = policy_for(model)
-    if policy.provider == "modal":
-        return (policy.min_capacity, policy.max_capacity) if provider == "modal" else (0, 0)
     if provider == "lambda":
         return policy.min_capacity, policy.max_capacity
     if provider == "modal":
@@ -83,8 +73,11 @@ def capacity_for(model, provider):
     return 0, 0
 
 
-def lambda_enabled():
-    return any(p.provider in {"lambda", "all"} for p in MODEL_POLICIES.values())
+def lambda_models():
+    """Models supported by the Lambda worker runtime, all with Modal fallback."""
+    from flash.serving.src.engine.model_config import base_models
+
+    return base_models()
 
 
 def modal_gpus_for(model):

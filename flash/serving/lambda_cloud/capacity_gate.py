@@ -5,7 +5,7 @@ import logging
 import os
 import time
 
-from flash.serving.app.inference_provider import MODEL_POLICIES
+from flash.serving.app.inference_provider import lambda_models
 from flash.serving.app.timeouts import CAPACITY_POLL_SECONDS
 
 from .api import LambdaAPI
@@ -49,10 +49,7 @@ async def wait_for_capacity(api, models, *, clock=time.monotonic, sleep=asyncio.
 
 
 async def main():
-    models = [model for model, policy in MODEL_POLICIES.items() if policy.provider != "modal"]
-    if not models:
-        logger.warning("No Lambda models configured; skipping capacity wait")
-        return
+    models = lambda_models()
     key = os.environ.get("LAMBDA_API_KEY", "").strip()
     if not key:
         raise RuntimeError("LAMBDA_API_KEY is required for Lambda deployment")
