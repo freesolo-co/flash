@@ -75,6 +75,20 @@ jobs:
         with:
           fetch-depth: 0
 
+      # Run after the capacity wait and after acquiring the deployment lock.
+      # A newer run may have deployed while this revision waited for GPUs.
+      - name: Reject superseded deployment revision
+        env:
+          CURRENT_SHA: ${{ github.sha }}
+          TARGET_BRANCH: dev
+        run: |
+          set -euo pipefail
+          latest_sha="$(git ls-remote --exit-code origin "refs/heads/$TARGET_BRANCH" | cut -f1)"
+          if [ "$latest_sha" != "$CURRENT_SHA" ]; then
+            echo "::error::Deployment revision is superseded by the current $TARGET_BRANCH tip; refusing to overwrite a newer release."
+            exit 1
+          fi
+
       - name: Decide whether to deploy development serving
         id: gate
         working-directory: .
