@@ -55,6 +55,13 @@ def test_qwen_rollout_waits_for_active_pool_startup(filename):
     assert job["timeout-minutes"] * 60 >= budget + 15 * 60
 
 
+def test_deepinfer_redeploys_when_shared_model_capacity_changes():
+    workflow = _load(WORKFLOW_DIR / "deploy-deepinfer.yml")
+    push = _triggers(workflow)["push"]
+    assert set(push["branches"]) == {"main", "dev"}
+    assert "flash/serving/app/inference_provider.py" in push["paths"]
+
+
 def test_deepinfer_warm_rollout_is_opt_in_and_verifies_the_replacement():
     workflow = yaml.safe_load((WORKFLOW_DIR / "deploy-deepinfer.yml").read_text())
     assert workflow["concurrency"]["cancel-in-progress"] is False
