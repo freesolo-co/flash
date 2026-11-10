@@ -526,13 +526,9 @@ class _ModalEnginePool:
         self._deepinfer = HostedDeepInfer()
         self._provider_selection = None
         if MODAL_FALLBACK_BY_MODEL:
-            from flash.serving.app.provider_selection import ProviderSelection
-            from flash.serving.lambda_cloud.config import APP_NAME as fleet_app
+            from flash.serving.app.provider_selection import bind_lambda_control
 
-            fleet = modal.Cls.from_name(fleet_app, "LambdaFleet")()
-            self._fleet = fleet
-            chooser = modal.Function.from_name(fleet_app, "choose_provider")
-            self._provider_selection = ProviderSelection(chooser.remote.aio)
+            self._fleet, self._provider_selection = bind_lambda_control()
 
     async def _engine_for(self, model):
         if (
