@@ -129,9 +129,12 @@ def health_body(
         for m in supported_models
     }
     providers = {m: "lambda" if m.startswith("Qwen/") else "modal" for m in supported_models}
+    primary_providers = set(providers.values())
     body = {
         "ok": True,
-        "inference_provider": "lambda" if set(providers.values()) == {"lambda"} else "mixed",
+        "inference_provider": next(iter(primary_providers))
+        if len(primary_providers) == 1
+        else "mixed",
         "provider_by_model": providers,
         "fallback_provider_by_model": {
             m: "modal" for m in supported_models if m.startswith("Qwen/")
