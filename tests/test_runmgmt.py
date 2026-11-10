@@ -877,6 +877,100 @@ def test_supervised_attempt_identities_start_at_zero_and_increment_without_expan
     assert status.cleanup_confirmed_remote["attempt"] == 1
 
 
+def test_spot_capacity_refusal_requeues_until_capacity_frees(monkeypatch, tmp_path):
+    # Reproduces the failure: Nebius refused a third concurrent Spot H100 create (quota), Flash
+    # reported "provider create could not be reconciled" and ended the run ("not retrying").
+    # A definitive capacity refusal must instead wait and requeue on the same shape.
+    import io
+    from dataclasses import replace
+
+    import flash.providers.core.allocator as allocator
+    import flash.runner.supervise.execution as execution
+    from flash.core.spec import GpuSpec, JobSpec, TrainSpec
+    from flash.providers.core import registry as providers
+    from flash.providers.core.base import (
+        Allocation,
+        Candidate,
+        CapacityUnavailableError,
+        PollResult,
+    )
+    from flash.runner.supervise import lifecycle
+    from tests._helpers.profile import attach_sft_profile, stub_revision_geometry
+
+    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
+    stub_revision_geometry(monkeypatch)
+    spec = attach_sft_profile(
+        JobSpec(
+            run_id="spot-capacity-requeue",
+            model="Qwen/Qwen3.5-9B",
+            algorithm="sft",
+            train=TrainSpec(max_examples=1),
+            gpu=GpuSpec(type="", max_retries=0),
+        )
+    )
+    spec = replace(spec, gpu=replace(spec.gpu, spot=True))
+    runner_state._save_status(
+        runner_state.RunStatus(run_id=spec.run_id, state="running", spec=spec.to_dict()),
+        _next_attempt=0,
+    )
+    h100 = Candidate("spot", "H100", 1.0, 80)
+    monkeypatch.setattr(
+        allocator,
+        "allocate",
+        lambda *args, **kwargs: Allocation(
+            provider="spot", gpu="H100", hourly_usd=1.0, min_vram_gb=80, candidates=(h100,)
+        ),
+    )
+    pauses = []
+    monkeypatch.setattr(execution, "pause", pauses.append)
+    monkeypatch.setattr(lifecycle.time, "sleep", lambda *_args: None)
+
+    class SpotProvider:
+        supports_weight_cache = False
+
+        def __init__(self):
+            self.attempts = []
+
+        def submit_attempt(self, _spec, *, on_handle, attempt, **_kwargs):
+            self.attempts.append(attempt)
+            if attempt < 2:
+                raise CapacityUnavailableError("Nebius Spot H100 capacity unavailable")
+            from flash.providers.core.base import JobHandle
+            from flash.providers.nebius.handles import SpotJobHandle
+
+            handle = SpotJobHandle(
+                instance_id=f"computeinstance-{attempt}",
+                gpu="H100",
+                hourly_usd=1,
+                attempt=attempt,
+                started_ts=float(attempt + 1),
+                name=f"{spec.run_id}-a{attempt}",
+                run_id=spec.run_id,
+                hf_repo="org/artifacts",
+                phase="sft",
+                scope="test",
+            )
+            on_handle(JobHandle.from_dict(handle.to_dict()))
+            return PollResult(True, metrics={"wall_seconds": 1.0})
+
+        def cancel(self, _handle):
+            return None
+
+        def destroy(self, _handle):
+            return None
+
+    provider = SpotProvider()
+    monkeypatch.setattr(providers, "get_provider", lambda _name: provider)
+
+    metrics = lifecycle._run_attempts_supervised(
+        spec, io.StringIO(), source_snapshot=_SOURCE_SNAPSHOT
+    )
+
+    assert metrics["wall_seconds"] == 1.0
+    assert provider.attempts == [0, 1, 2]
+    assert pauses == [execution.SPOT_CAPACITY_REQUEUE_SECONDS] * 2
+
+
 def test_attempt_is_consumed_when_provider_fails_before_handle_persistence(monkeypatch, tmp_path):
     import io
 
