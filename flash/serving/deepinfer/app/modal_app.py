@@ -99,7 +99,7 @@ def _watch_server(process):
     # this temporary floor after the idle window; ordinary starts remain at zero.
     min_containers=(max(1, MAIN_MIN_CONTAINERS) if deployment_id else MAIN_MIN_CONTAINERS)
     if main_environment
-    else MAIN_MIN_CONTAINERS,
+    else 0,
     max_containers=(MAIN_ROLLOUT_MAX_CONTAINERS if deployment_id else MAIN_MAX_CONTAINERS)
     if main_environment
     else MAX_CONTAINERS,

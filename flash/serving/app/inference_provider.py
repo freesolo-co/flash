@@ -34,6 +34,7 @@ class ModelPolicy:
         object.__setattr__(self, "lambda_gpus", tuple(self.lambda_gpus))
 
 
+# Minimums apply to main only; dev always scales to zero when idle.
 # Lambda is preferred; Modal is a scale-to-zero fallback sharing max_capacity.
 # The fleet controller transfers slots as Lambda workers become ready. Handoffs
 # allow one temporary extra GPU, then drain the replaced Modal replica before
@@ -62,6 +63,14 @@ def policy_for(model):
         return MODEL_POLICIES[model]
     except KeyError:
         raise ValueError(f"No serving capacity policy for {model}") from None
+
+
+def minimum_for(model, environment):
+    """Idle GPU floor; development never reserves idle capacity."""
+    if environment not in {"main", "dev"}:
+        raise ValueError("Serving capacity requires the main or dev environment")
+    policy = policy_for(model)
+    return 0 if environment == "dev" else policy.min_capacity
 
 
 def capacity_for(model, provider):
