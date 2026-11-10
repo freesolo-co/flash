@@ -1383,6 +1383,30 @@ def test_required_upload_caps_retry_sleep_and_starts_no_late_retry(
     assert "provider-body-private" in output
 
 
+def test_required_upload_survives_transient_storage_stalls(worker_context, monkeypatch):
+    """A final adapter survives four write timeouts, backing off 10/20/40/80 s."""
+    import flash.engine.worker.io.artifacts as worker
+
+    calls = []
+    sleeps = []
+    monkeypatch.setattr(
+        worker_context, "config", replace(worker_context.config, hf_repo="owner/repo")
+    )
+    monkeypatch.setattr(worker_context, "remaining_wall_seconds", lambda: None)
+    monkeypatch.setattr(worker.time, "sleep", sleeps.append)
+
+    def flaky():
+        calls.append("upload")
+        if len(calls) < worker.REQUIRED_UPLOAD_ATTEMPTS:
+            raise TimeoutError("The write operation timed out")
+
+    assert worker._artifact_upload(
+        flaky, "adapter", required=True, label="adapter", context=worker_context
+    )
+    assert len(calls) == worker.REQUIRED_UPLOAD_ATTEMPTS == 5
+    assert sleeps == [10.0, 20.0, 40.0, 80.0]
+
+
 def test_optional_upload_without_deadline_preserves_single_attempt(worker_context, monkeypatch):
     import flash.engine.worker.io.artifacts as worker
 

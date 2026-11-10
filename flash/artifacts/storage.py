@@ -32,6 +32,14 @@ else:
         validate_revision,
     )
 
+# Large artifact objects (adapters, checkpoint shards) stream from GPU workers in blocks. Azure's
+# requests transport applies ``connection_timeout`` as the socket timeout while a block is being
+# written, so the client's 10 s default fails whole uploads ("The write operation timed out") on
+# a slow cross-cloud link. Uploads get a longer write timeout and more SDK retries per block;
+# reads and control-plane calls keep the shared client's fast-fail settings.
+UPLOAD_WRITE_TIMEOUT_S = 120
+UPLOAD_RETRY_TOTAL = 5
+
 
 class BlobArtifacts:
     def __init__(self, container):
@@ -104,6 +112,8 @@ class BlobArtifacts:
                     overwrite=False,
                     max_concurrency=4,
                     metadata={"sha256": digest},
+                    connection_timeout=UPLOAD_WRITE_TIMEOUT_S,
+                    retry_total=UPLOAD_RETRY_TOTAL,
                 )
             except ResourceExistsError:
                 props = self.container.get_blob_client(name).get_blob_properties()
