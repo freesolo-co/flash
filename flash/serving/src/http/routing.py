@@ -143,6 +143,7 @@ def health_body(
             m: {
                 "min": policy_for(m).min_capacity,
                 "max": policy_for(m).max_capacity,
+                "dev_min": 0,
                 "dev_max": policy_for(m).dev_max_capacity,
             }
             for m in supported_models
