@@ -1755,6 +1755,8 @@ def test_run_verl_training_without_a_tail_is_unchanged():
     [
         "cudaErrorDevicesUnavailable",
         "CUDA-capable device(s) is/are busy or unavailable",
+        "an illegal memory access was encountered",
+        "uncorrectable ECC error encountered",
     ],
 )
 def test_run_verl_training_retries_nested_cuda_device_unavailable_after_tail_eviction(

@@ -9,7 +9,10 @@ from flash.core.spec import JobSpec
 
 INFRA_RETRY_FLOOR = 5
 INFRA_RETRY_FAILURES = frozenset({"stalled", "no_capacity", "poll_error"})
-CANDIDATE_RETRY_FAILURES = INFRA_RETRY_FAILURES | {"oom", "job_preempted"}
+# The worker itself reported a transient infrastructure fault (RetriableInfraError: a GPU fault, an
+# artifact-store stall). Distinct from preemption, whose non-Spot handling stays terminal.
+WORKER_RETRIABLE_FAILURE = "worker_retriable"
+CANDIDATE_RETRY_FAILURES = INFRA_RETRY_FAILURES | {"oom", "job_preempted", WORKER_RETRIABLE_FAILURE}
 CACHE_FALLBACK_FAILURES = frozenset({"no_capacity", "poll_error"})
 _STATE_KEYS = frozenset(
     {
@@ -302,6 +305,25 @@ def _spot_preemption_plan(state: RetryState, chosen) -> tuple[RetryState, RetryP
     )
 
 
+def _worker_retriable_plan(state: RetryState, chosen) -> tuple[RetryState, RetryPlan]:
+    """Retry a worker-flagged transient fault on the same shape, within the infrastructure budget.
+
+    A GPU fault or a storage stall says nothing about memory needs, so the usable-VRAM floor is not
+    raised (unlike stalls and OOMs); the budget bounds a fault that turns out to be deterministic.
+    """
+    if chosen is None:
+        return state, RetryPlan(False, "not retrying")
+    if state.infra_used >= state.infra_retries:
+        return state, RetryPlan(False, "not retrying: infrastructure retry budget exhausted")
+    ordinal = state.infra_used + 1
+    return replace(state, infra_used=ordinal, cache_retry_shape=None), RetryPlan(
+        True,
+        f"retrying on {chosen.gpu} @ {chosen.provider} after a retriable worker fault "
+        "(resume from last checkpoint)",
+        ordinal,
+    )
+
+
 def transition_failure(
     state: RetryState,
     observation: FailureObservation,
@@ -314,6 +336,9 @@ def transition_failure(
     candidates = observation.candidates
     if failure == "job_preempted":
         state, plan = _spot_preemption_plan(state, chosen)
+        return _finish(state, plan, observation, attempt)
+    if failure == WORKER_RETRIABLE_FAILURE:
+        state, plan = _worker_retriable_plan(state, chosen)
         return _finish(state, plan, observation, attempt)
     if failure not in CANDIDATE_RETRY_FAILURES:
         return _finish(state, RetryPlan(False, "not retrying"), observation, attempt)

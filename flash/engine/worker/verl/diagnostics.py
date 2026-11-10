@@ -33,6 +33,10 @@ STALL_TAIL_LINES = 15
 _RETRIABLE_VERL_CHILD_SIGNATURES = (
     "cudaErrorDevicesUnavailable",
     "CUDA-capable device(s) is/are busy or unavailable",
+    # transient GPU faults: a healthy replacement worker resumes from the last checkpoint. a fault
+    # that is actually deterministic is bounded by the infrastructure retry budget.
+    "an illegal memory access was encountered",
+    "uncorrectable ECC error encountered",
 )
 
 
