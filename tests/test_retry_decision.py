@@ -320,3 +320,50 @@ def test_spot_worker_failure_is_not_treated_as_preemption():
         attempt=0,
     )
     assert not plan.retry
+
+
+@pytest.mark.parametrize("provider", ["modal", "spot"])
+def test_worker_retriable_fault_retries_same_shape_within_infra_budget(provider):
+    """A worker-flagged GPU fault or storage stall retries on the same shape, unlike preemption."""
+    chosen = _candidate(provider, "H100", 80, 2)
+    current = replace(RetryState(2, 2, 1), usable_vram_floor=40)
+    for attempt in range(2):
+        current, plan = transition_failure(
+            current, _observe("worker_retriable", chosen, (chosen,)), attempt=attempt
+        )
+        assert plan.retry
+        assert plan.infra_retry_ordinal == attempt + 1
+        assert current.infra_used == attempt + 1
+        assert current.usable_vram_floor == 40
+        assert current.select_candidate((chosen,))[1] == chosen
+    current, plan = transition_failure(
+        current, _observe("worker_retriable", chosen, (chosen,)), attempt=2
+    )
+    assert not plan.retry
+    assert "budget exhausted" in plan.action
+
+
+def test_worker_retriable_authorization_survives_restore():
+    spec = _spec(max_retries=2)
+    chosen = _candidate("modal", "H100", 80, 2)
+    current, plan = transition_failure(
+        RetryState.initial_for_spec(spec),
+        _observe("worker_retriable", chosen, (chosen,)),
+        attempt=0,
+    )
+    assert plan.retry
+    restored = RetryState.from_snapshot(spec, current.to_snapshot())
+    assert restored.persisted_plan(0) == plan
+
+
+def test_non_spot_preemption_stays_terminal_while_worker_faults_retry():
+    chosen = _candidate("modal", "H100", 80)
+    state0 = RetryState(2, 2, 1)
+    _, preempted = transition_failure(
+        state0, _observe("job_preempted", chosen, (chosen,)), attempt=0
+    )
+    _, flagged = transition_failure(
+        state0, _observe("worker_retriable", chosen, (chosen,)), attempt=0
+    )
+    assert not preempted.retry
+    assert flagged.retry

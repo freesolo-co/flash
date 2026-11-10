@@ -216,4 +216,4 @@ def test_explicit_retriable_worker_evidence_overrides_process_exit(monkeypatch, 
             }
         ),
     )
-    assert jobs.poll(handle, spec, deadline_at=10000).failure == "job_preempted"
+    assert jobs.poll(handle, spec, deadline_at=10000).failure == "worker_retriable"
