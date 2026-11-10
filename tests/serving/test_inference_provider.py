@@ -214,7 +214,7 @@ def test_mixed_model_decorators_use_independent_capacity(monkeypatch, load_modal
     for name in ("cls", "function", "local_entrypoint"):
         getattr(app, name).side_effect = passthrough
     mod = load_modal_app_under_stub(modal)
-    expected = [(1, 2), (2, 5), (4, 4), (1, 2), (0, 2), (0, 2), (0, 3)]
+    expected = [(0, 2), (0, 5), (0, 4), (0, 2), (0, 2), (0, 2), (0, 3)]
     assert [
         (c.kwargs["min_containers"], c.kwargs["max_containers"]) for c in app.cls.call_args_list
     ] == expected

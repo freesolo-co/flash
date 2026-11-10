@@ -64,6 +64,8 @@ async def warm_configured_models(engines: dict[str, Any], *, fallback: bool = Fa
     keep_warm = set()
     for model in engines:
         provider = "modal" if fallback or policy_for(model).provider == "modal" else "lambda"
-        if capacity_for(model, provider)[0] > 0:
+        minimum, maximum = capacity_for(model, provider)
+        await engines[model].update_autoscaler.aio(min_containers=minimum, max_containers=maximum)
+        if minimum > 0:
             keep_warm.add(model)
     await warm_active_models(engines, keep_warm=keep_warm)

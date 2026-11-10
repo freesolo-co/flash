@@ -13,6 +13,7 @@ from flash.serving.src.http.router import _lifespan_for
 
 def _engine(model="base", *, runners=0, running=0, backlog=0):
     return SimpleNamespace(
+        update_autoscaler=SimpleNamespace(aio=AsyncMock()),
         health=SimpleNamespace(
             get_current_stats=SimpleNamespace(
                 aio=AsyncMock(
@@ -22,7 +23,7 @@ def _engine(model="base", *, runners=0, running=0, backlog=0):
                 )
             ),
             remote=SimpleNamespace(aio=AsyncMock(return_value={"ok": True, "base_model": model})),
-        )
+        ),
     )
 
 
@@ -148,7 +149,34 @@ def test_configured_warm_models_start_and_modal_models_remain_idle():
     models = {model: _engine(model) for model in base_models()}
     asyncio.run(rollout.warm_configured_models(models))
     for model, engine in models.items():
+        minimum, maximum = rollout.capacity_for(model, rollout.policy_for(model).provider)
+        engine.update_autoscaler.aio.assert_awaited_once_with(
+            min_containers=minimum, max_containers=maximum
+        )
         if model in {"Qwen/Qwen3.5-0.8B", "Qwen/Qwen3.5-9B-Base"}:
             engine.health.remote.aio.assert_awaited_once()
         else:
             engine.health.remote.aio.assert_not_awaited()
+
+
+def test_capacity_update_failure_blocks_startup():
+    model = "Qwen/Qwen3.5-0.8B"
+    engine = _engine(model)
+    engine.update_autoscaler.aio.side_effect = RuntimeError("autoscaler unavailable")
+    with pytest.raises(RuntimeError, match="autoscaler unavailable"):
+        asyncio.run(rollout.warm_configured_models({model: engine}))
+    engine.health.remote.aio.assert_not_awaited()
+
+
+def test_dual_provider_capacity_is_applied_to_each_bound_pool(monkeypatch):
+    from flash.serving.app.inference_provider import MODEL_POLICIES, ModelPolicy
+
+    model = "Qwen/Qwen3.5-9B"
+    monkeypatch.setitem(MODEL_POLICIES, model, ModelPolicy("all", 4, 7))
+    primary, fallback = _engine(model), _engine(model)
+    asyncio.run(rollout.warm_configured_models({model: primary}))
+    asyncio.run(rollout.warm_configured_models({model: fallback}, fallback=True))
+    primary.update_autoscaler.aio.assert_awaited_once_with(min_containers=4, max_containers=4)
+    fallback.update_autoscaler.aio.assert_awaited_once_with(min_containers=0, max_containers=3)
+    primary.health.remote.aio.assert_awaited_once()
+    fallback.health.remote.aio.assert_not_awaited()
