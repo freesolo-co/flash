@@ -875,3 +875,74 @@ def test_provider_deployment_requires_lambda_only_when_enabled(
         assert output.read_text() == f"lambda_enabled={enabled}\n"
     control = next(s for s in _steps(job) if s.get("name") == "Deploy Lambda fleet control")
     assert "steps.provider.outputs.lambda_enabled == 'true'" in control["if"]
+
+
+@pytest.mark.parametrize("filename", ["deploy-modal.yml", "deploy-modal-dev.yml"])
+def test_lambda_capacity_wait_precedes_deployment_with_its_own_five_hour_budget(filename):
+    from flash.serving.lambda_cloud.capacity_gate import DEPLOY_CAPACITY_WAIT_SECONDS
+
+    jobs = _load(WORKFLOW_DIR / filename)["jobs"]
+    capacity = jobs["lambda-capacity"]
+    assert jobs["deploy"]["needs"] == "lambda-capacity"
+    assert capacity["if"] == jobs["deploy"]["if"]
+    assert capacity["timeout-minutes"] * 60 >= DEPLOY_CAPACITY_WAIT_SECONDS + 10 * 60
+    assert any(
+        "flash.serving.lambda_cloud.capacity_gate" in step.get("run", "")
+        for step in capacity["steps"]
+    )
+
+
+@pytest.mark.parametrize(
+    ("filename", "branch"), [("deploy-modal.yml", "main"), ("deploy-modal-dev.yml", "dev")]
+)
+@pytest.mark.parametrize("scenario", ["current", "superseded", "deleted", "unreachable"])
+def test_waiting_deploy_cannot_overwrite_a_newer_branch_tip(filename, branch, scenario, tmp_path):
+    job = _load(WORKFLOW_DIR / filename)["jobs"]["deploy"]
+    steps = _steps(job)
+    guard_index = next(
+        i
+        for i, step in enumerate(steps)
+        if step.get("name") == "Reject superseded deployment revision"
+    )
+    guard = steps[guard_index]
+    # The remote-tip check must happen inside the deployment lock, after the long
+    # capacity wait and before the deploy decision or any provider mutation.
+    assert job["needs"] == "lambda-capacity"
+    assert job["concurrency"]["cancel-in-progress"] is False
+    assert "if" not in guard
+    assert guard_index < next(i for i, step in enumerate(steps) if step.get("id") == "gate")
+    assert guard["env"] == {"CURRENT_SHA": "${{ github.sha }}", "TARGET_BRANCH": branch}
+
+    def git(*args):
+        return subprocess.run(
+            ["git", *args], cwd=tmp_path, check=True, capture_output=True, text=True
+        ).stdout.strip()
+
+    git("init", "--bare", "--initial-branch=unused", "remote.git")
+    git("init")
+    git("config", "user.name", "Workflow test")
+    git("config", "user.email", "workflow@example.invalid")
+    git("remote", "add", "origin", str(tmp_path / "remote.git"))
+    git("commit", "--allow-empty", "-m", "older release waiting for capacity")
+    older = git("rev-parse", "HEAD")
+    git("commit", "--allow-empty", "-m", "newer release without unavailable GPU")
+    current = git("rev-parse", "HEAD")
+    git("push", "origin", f"HEAD:refs/heads/{branch}")
+    if scenario == "deleted":
+        git("push", "origin", f":refs/heads/{branch}")
+    elif scenario == "unreachable":
+        git("remote", "set-url", "origin", str(tmp_path / "missing.git"))
+    result = subprocess.run(
+        ["bash", "-c", guard["run"]],
+        cwd=tmp_path,
+        env={
+            **os.environ,
+            "CURRENT_SHA": older if scenario == "superseded" else current,
+            "TARGET_BRANCH": branch,
+        },
+        capture_output=True,
+        text=True,
+    )
+    assert (result.returncode == 0) is (scenario == "current")
+    if scenario == "superseded":
+        assert "refusing to overwrite a newer release" in result.stdout

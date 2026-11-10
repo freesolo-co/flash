@@ -7,7 +7,29 @@ on:
   workflow_dispatch:
 
 jobs:
+  lambda-capacity:
+    name: Wait for Lambda GPU capacity
+    if: github.ref == 'refs/heads/dev'
+    runs-on: ubuntu-latest
+    # Keep the five-hour provider wait separate from deployment/readiness budgets.
+    timeout-minutes: 310
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        with:
+          version: "0.12.5"
+          python-version: "3.12"
+      - name: Install capacity checker dependencies
+        run: uv sync --extra serving --locked --no-dev
+      - name: Check every five minutes for up to five hours
+        env:
+          LAMBDA_API_KEY: ${{ secrets.LAMBDA_API_KEY }}
+        run: uv run --no-sync python -m flash.serving.lambda_cloud.capacity_gate
+
   deploy:
+    needs: lambda-capacity
     name: Deploy development serving Modal app
     if: github.ref == 'refs/heads/dev'
     runs-on: ubuntu-latest
@@ -52,6 +74,20 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
+
+      # Run after the capacity wait and after acquiring the deployment lock.
+      # A newer run may have deployed while this revision waited for GPUs.
+      - name: Reject superseded deployment revision
+        env:
+          CURRENT_SHA: ${{ github.sha }}
+          TARGET_BRANCH: dev
+        run: |
+          set -euo pipefail
+          latest_sha="$(git ls-remote --exit-code origin "refs/heads/$TARGET_BRANCH" | cut -f1)"
+          if [ "$latest_sha" != "$CURRENT_SHA" ]; then
+            echo "::error::Deployment revision is superseded by the current $TARGET_BRANCH tip; refusing to overwrite a newer release."
+            exit 1
+          fi
 
       - name: Decide whether to deploy development serving
         id: gate

@@ -371,7 +371,6 @@ def _build_engine(
     max_inputs: int,
     target_inputs: int,
     provider: str = "lambda",
-    min_capacity: int = 0,
     max_capacity: int = 2,
 ) -> Any:
     """Register a Modal GPU engine or Lambda CPU proxy under a stable model name.
@@ -480,7 +479,9 @@ def _build_engine(
         region="us",
         scaledown_window=scaledown_window_for(gpu[0] if isinstance(gpu, list) else gpu),
         timeout=REQUEST_TIMEOUT_SECONDS,
-        min_containers=min_capacity,
+        # Parameterized classes require a zero decorator floor. Apply the model
+        # floor to its bound instance during router startup.
+        min_containers=0,
         max_containers=max_capacity,
         buffer_containers=ENGINE_BUFFER_CONTAINERS,
     )(modal.concurrent(max_inputs=max_inputs, target_inputs=target_inputs)(_Engine))
@@ -489,13 +490,12 @@ def _build_engine(
 
 
 def _configured_engine(model, provider, suffix=""):
-    minimum, maximum = capacity_for(model, provider)
+    _, maximum = capacity_for(model, provider)
     return _build_engine(
         modal_gpus_for(model) if provider == "modal" else gpu_for(model),
         model_engine_name(model) + suffix,
         *_engine_concurrency(model),
         provider=provider,
-        min_capacity=minimum,
         max_capacity=maximum,
     )
 
