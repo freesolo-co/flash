@@ -360,6 +360,18 @@ def record_heartbeat(run_id: str, heartbeat: dict) -> None:
             and "session_started_at" in prev
         ):
             hb.setdefault("session_started_at", prev["session_started_at"])
+        if same_attempt and status.spec.get("algorithm") == "custom" and "session_seconds" in prev:
+            # Checkpoint heartbeats omit session_seconds; keep the attempt's latest measurement so
+            # a later replacement attempt can bill it.
+            hb.setdefault("session_seconds", prev["session_seconds"])
+        if prev is not None and status.spec.get("algorithm") == "custom":
+            # A replacement (Spot) attempt starts a new session clock; keep earlier attempts'
+            # measured session time so billing covers the whole run, not only the last VM.
+            prior = _session_seconds(prev.get("session_seconds_prior"))
+            if not same_attempt:
+                prior += _session_seconds(prev.get("session_seconds"))
+            if prior:
+                hb.setdefault("session_seconds_prior", prior)
         # Checkpoint-stage heartbeats (checkpoint_uploading/deployable/uploaded) omit metrics_last; carry
         # the existing per-step backlog forward so `flash runs log -f` doesn't drop it mid-save until the next
         # metrics-bearing heartbeat lands.
@@ -549,3 +561,12 @@ def _update(run_id: str, new_state: str, *, allow_from_terminal: bool = False, *
     if report_status is not None:
         reporting._report_status(report_status)
     return True
+
+
+def _session_seconds(value):
+    """A finite, non-negative session-seconds value from a persisted heartbeat, else 0."""
+    import math
+
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+        return 0.0
+    return max(0.0, float(value))

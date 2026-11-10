@@ -138,6 +138,36 @@ def pricing_policy(gpu, *, deadline_at):
         raise
 
 
+# A custom session's controller connects straight to the VM (TLS, pinned per attempt).
+CUSTOM_SESSION_PORT = 8000
+
+
+def _is_custom(payload):
+    raw = payload.get("job_spec_json")
+    return bool(raw) and json.loads(raw).get("algorithm") == "custom"
+
+
+def public_ip(instance_id, *, deadline_at=None):
+    """The VM's global IPv4 address, or None while it is not assigned yet."""
+    import ipaddress
+
+    for item in list_instances(deadline_at=deadline_at):
+        if item["metadata"]["id"] != instance_id:
+            continue
+        for interface in item.get("status", {}).get("network_interfaces") or []:
+            raw = ((interface or {}).get("public_ip_address") or {}).get("address")
+            if not isinstance(raw, str) or not raw:
+                continue
+            try:
+                address = ipaddress.ip_address(raw.split("/", 1)[0])
+            except ValueError:
+                continue
+            if address.is_global:
+                return str(address)
+        return None
+    return None
+
+
 def cloud_init(payload, capsule_ref, image, *, deadline_at):
     """Use a configured GPU host image with Docker + NVIDIA container toolkit installed."""
     from flash.providers.nebius.bootstrap import DOWNLOAD
@@ -176,6 +206,7 @@ def cloud_init(payload, capsule_ref, image, *, deadline_at):
         "--ipc=host",
         "--env-file",
         "/opt/flash/payload.env",
+        *(["-p", f"{CUSTOM_SESSION_PORT}:8000"] if _is_custom(payload) else []),
         "-v",
         "/opt/flash/capsule.pyz:/opt/flash/capsule.pyz:ro",
         "--workdir",

@@ -309,16 +309,22 @@ def _run_cost_key(
 
 
 def custom_gpu_shape(model_id, provider, gpu_types, count):
-    """Bound custom layer sharding to validated one/two-GPU Modal shapes."""
+    """Bound custom layer sharding to validated one/two-GPU Modal shapes or one Spot GPU.
+
+    Spot presets are 1 or 8 GPUs and custom sharding stops at two, so a Spot custom
+    session is exactly one card, reached directly over TLS instead of a provider tunnel.
+    """
     from flash.core.catalog import validate_model_for_algorithm
 
     validate_model_for_algorithm(model_id, "custom")
-    if provider not in {"", "modal"} or (
-        count is not None and (type(count) is not int or count not in (1, 2))
-    ):
-        raise ValueError("custom training supports one or two managed Modal GPUs")
+    valid_count = count is None or type(count) is int
+    if provider == "spot":
+        if not valid_count or (count or 1) != 1:
+            raise ValueError("custom training on Spot supports exactly one GPU")
+    elif provider not in {"", "modal"} or not valid_count or (count or 1) not in (1, 2):
+        raise ValueError("custom training supports one or two managed Modal GPUs or one Spot GPU")
     allowed = tuple(gpu_types)
-    return "modal", allowed[0] if allowed else "", allowed[1:], count or 1
+    return provider or "modal", allowed[0] if allowed else "", allowed[1:], count or 1
 
 
 def authored_gpu_ceiling(gpu_type: str, gpu_count: int | None) -> int | None:

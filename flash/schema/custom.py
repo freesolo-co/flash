@@ -1,5 +1,6 @@
 """Custom-only fields and constraints; common sections use the normal JobSpec parser."""
 
+from flash.core.checkpoint_policy import is_spot_spec
 from flash.custom.types import integer
 from flash.schema.fields import ConfigError, _train_int
 
@@ -73,7 +74,9 @@ def validate_custom_spec(spec):
             "max_context_tokens",
             minimum=2,
         )
-        integer(spec.train.save_every, "train.save_every", 1, 1_000_000)
+        if not is_spot_spec(spec):
+            # Spot normalizes save_every away: its recovery saves are automatic and time-based.
+            integer(spec.train.save_every, "train.save_every", 1, 1_000_000)
     except ValueError as exc:
         raise ConfigError(str(exc)) from exc
     if spec.train.init_from_adapter and spec.custom.get("resume_from"):

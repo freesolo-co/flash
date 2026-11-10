@@ -103,6 +103,17 @@ def _sleep_with_artifact_deadline(delay: float, *, context: WorkerContext) -> bo
     return remaining is None or remaining > 0
 
 
+# Required artifacts (final adapters, DONE markers) end hours of paid training; a transient
+# storage stall must not discard them. Back off exponentially between attempts; every sleep and
+# retry stays bounded by the run's wall-clock deadline (_sleep_with_artifact_deadline).
+REQUIRED_UPLOAD_ATTEMPTS = 5
+
+
+def _required_retry_delay(attempt: int) -> float:
+    """Seconds to wait after failed attempt ``attempt`` (0-based): 10, 20, 40, 80 s."""
+    return min(160.0, 10.0 * 2**attempt)
+
+
 def _artifact_upload(
     do_upload, repo_subpath: str, required: bool, label: str, *, context: WorkerContext
 ) -> bool:
@@ -112,7 +123,7 @@ def _artifact_upload(
     """
     if not context.config.hf_repo:
         return True
-    attempts = 3 if required else 1
+    attempts = REQUIRED_UPLOAD_ATTEMPTS if required else 1
     last_err: Exception | None = None
     for attempt in range(attempts):
         try:
@@ -125,7 +136,9 @@ def _artifact_upload(
             if required and attempt + 1 < attempts:
                 print(f"{label} retry {attempt + 1}/{attempts}: {detail}")
                 try:
-                    if not _sleep_with_artifact_deadline(5 * (attempt + 1), context=context):
+                    if not _sleep_with_artifact_deadline(
+                        _required_retry_delay(attempt), context=context
+                    ):
                         break
                 except Exception:
                     break

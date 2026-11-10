@@ -10,8 +10,23 @@ from flash.client.http import ApiClient, ApiError
 from flash.custom.types import MAX_BODY_BYTES, Datum
 
 
+def pinned_context(certificate):
+    """Trust exactly one self-signed session certificate (no public CA, no hostname).
+
+    The worker's address is not known when its per-attempt identity is minted, so the
+    certificate names no IP; pinning it as the only trust anchor authenticates the server.
+    """
+    import ssl
+
+    # cadata replaces the system store: public CAs are never trusted for a session.
+    context = ssl.create_default_context(cadata=certificate)
+    context.check_hostname = False
+    context.verify_mode = ssl.CERT_REQUIRED
+    return context
+
+
 class TrainingClient:
-    def __init__(self, url, *, api_key, timeout=300):
+    def __init__(self, url, *, api_key, timeout=300, tls_cert=None):
         parsed = urlsplit(url)
         if parsed.scheme != "https" and not (
             parsed.scheme == "http" and parsed.hostname in {"localhost", "127.0.0.1", "::1"}
@@ -19,7 +34,12 @@ class TrainingClient:
             raise ValueError("custom training requires HTTPS, except on localhost")
         if not api_key:
             raise ValueError("a dedicated custom-session API key is required")
-        self._http = ApiClient(url, api_key, timeout=timeout)
+        self._http = ApiClient(
+            url,
+            api_key,
+            timeout=timeout,
+            ssl_context=pinned_context(tls_cert) if tls_cert else None,
+        )
         self._lock = threading.RLock()
         self._pending = None
         self._state = self.status()

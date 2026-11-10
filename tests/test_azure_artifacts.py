@@ -338,3 +338,34 @@ def test_finalized_checkpoint_upload_does_not_stage_another_copy(
     )
     assert Path(downloaded).read_bytes() == source.read_bytes()
     assert len(transferred) == 1
+
+
+def test_object_uploads_use_long_write_timeout_and_more_retries(azure, tmp_path, monkeypatch):
+    """Large objects stream in blocks; a 10 s write timeout must not fail adapter uploads."""
+    from flash.artifacts import storage
+
+    container, client, _ = azure
+    seen = []
+    original = container.get_blob_client
+
+    def get_blob(name):
+        blob = original(name)
+        upload_blob = blob.upload_blob
+
+        def record(data, **kwargs):
+            if "/objects/" in name:
+                seen.append(kwargs)
+            return upload_blob(data, **kwargs)
+
+        blob.upload_blob = record
+        return blob
+
+    monkeypatch.setattr(container, "get_blob_client", get_blob)
+    source = tmp_path / "adapter_model.safetensors"
+    source.write_bytes(b"weights")
+    client.upload_file(
+        repo_id=REPO, path_in_repo="adapter/adapter_model.safetensors", path_or_fileobj=source
+    )
+    assert seen
+    assert seen[0]["connection_timeout"] == storage.UPLOAD_WRITE_TIMEOUT_S == 120
+    assert seen[0]["retry_total"] == storage.UPLOAD_RETRY_TOTAL == 5
