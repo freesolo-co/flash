@@ -30,8 +30,8 @@ def _passthrough_decorator(*_a: Any, **_k: Any):
     return deco
 
 
-@pytest.fixture(scope="module", params=["modal", "lambda"])
-def modal_app_module(load_modal_app_under_stub, request):
+@pytest.fixture(scope="module")
+def modal_app_module(load_modal_app_under_stub):
     modal_stub = MagicMock(name="modal")
     modal_stub.concurrent.side_effect = _passthrough_decorator
     modal_stub.method.side_effect = _passthrough_decorator
@@ -51,7 +51,7 @@ def modal_app_module(load_modal_app_under_stub, request):
             patch.setitem(
                 inference_provider.MODEL_POLICIES,
                 model,
-                inference_provider.ModelPolicy(request.param),
+                inference_provider.ModelPolicy(),
             )
         return load_modal_app_under_stub(modal_stub)
 
@@ -448,8 +448,13 @@ def test_deployed_timeouts_use_the_shared_serving_budget(modal_app_module):
 
 def test_only_model_scoped_engines_are_registered(modal_app_module):
     registered = {name for name in vars(modal_app_module) if name.startswith("LoraEngine_")}
-    assert registered == {modal_app_module.model_engine_name(model) for model in base_models()}
-    assert modal_app_module.app.cls.call_count == len(base_models())
+    assert registered == {modal_app_module.model_engine_name(model) for model in base_models()} | {
+        modal_app_module.model_engine_name(model) + "_ModalGPU"
+        for model in modal_app_module.MODAL_FALLBACK_BY_MODEL
+    }
+    assert modal_app_module.app.cls.call_count == len(base_models()) + len(
+        modal_app_module.MODAL_FALLBACK_BY_MODEL
+    )
 
 
 def test_engine_concurrency_rejects_malformed_catalog_values(modal_app_module, monkeypatch):
@@ -704,6 +709,9 @@ def test_scale_to_zero_pool_dispatches_inference_and_registration(modal_app_modu
 
     monkeypatch.setattr(mod, "_engine_cls_for", lambda _base_model: _bind)
     pool = mod._ModalEnginePool()
+    from unittest.mock import AsyncMock
+
+    pool._provider_selection = types.SimpleNamespace(choose=AsyncMock(return_value="lambda"))
     generation_id = "fsgen-00000000000000000000000000000001"
     payload = _Dump(
         {"messages": [{"role": "user", "content": "hello"}]},
@@ -1000,8 +1008,12 @@ def test_modal_stream_entrypoint_uses_regular_call(modal_app_module, monkeypatch
     run.assert_awaited_once_with(engine, *args)
 
 
-def test_hosted_qwen_registers_only_the_selected_provider(modal_app_module):
+def test_hosted_qwen_registers_primary_and_scale_to_zero_fallback(modal_app_module):
     mod = modal_app_module
-    for call, cls in zip(mod.app.cls.call_args_list, mod.ENGINE_BY_MODEL.values(), strict=True):
+    for call, cls in zip(
+        mod.app.cls.call_args_list,
+        [*mod.ENGINE_BY_MODEL.values(), *mod.MODAL_FALLBACK_BY_MODEL.values()],
+        strict=True,
+    ):
         assert ("gpu" in call.kwargs) == issubclass(cls, mod.HostedModalEngine)
         assert issubclass(cls, mod.LambdaEngineProxy) != issubclass(cls, mod._LoraEngineImpl)

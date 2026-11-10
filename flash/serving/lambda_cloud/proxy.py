@@ -57,17 +57,18 @@ class LambdaEngineProxy:
                     ):
                         raise RuntimeError("Lambda worker readiness identity mismatch")
                     self._health_cache = health
+                    await self._fleet.heartbeat.remote.aio(self._owner, health)
                     return
             await asyncio.sleep(15)
 
     async def _heartbeat(self):
         while True:
             try:
-                await self._fleet.heartbeat.remote.aio(self._owner)
                 if self._transport is not None:
                     async with asyncio.timeout(10):
                         health = await self._transport.call("/health")
                     self._health_cache = health
+                await self._fleet.heartbeat.remote.aio(self._owner, self._health_cache)
             except Exception:
                 self._health_cache = {"ok": False, "base_model": self.base_model}
             await asyncio.sleep(HEARTBEAT_SECONDS)

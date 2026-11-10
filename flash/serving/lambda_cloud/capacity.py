@@ -4,7 +4,7 @@ import asyncio
 import logging
 import time
 
-from flash.serving.app.timeouts import CAPACITY_POLL_SECONDS, CAPACITY_WAIT_SECONDS
+from flash.serving.app.timeouts import CAPACITY_WAIT_SECONDS, LAMBDA_SCALE_POLL_SECONDS
 
 from .config import NoCapacityError
 
@@ -22,7 +22,7 @@ async def launch_with_capacity_wait(launch, *args, clock=time.monotonic, sleep=a
                 remaining = deadline - clock()
                 if remaining <= 0:
                     raise TimeoutError("Lambda capacity unavailable after one hour") from None
-                logger.info("Lambda capacity unavailable; checking again in five minutes")
-                await sleep(min(CAPACITY_POLL_SECONDS, remaining))
+                logger.warning("Lambda scale-up capacity unavailable; checking again in one minute")
+                await sleep(min(LAMBDA_SCALE_POLL_SECONDS, remaining))
                 if clock() >= deadline:
                     raise TimeoutError("Lambda capacity unavailable after one hour") from None

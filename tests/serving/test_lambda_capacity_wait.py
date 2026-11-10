@@ -30,7 +30,7 @@ def test_capacity_returning_after_two_polls_launches_once():
         capacity.launch_with_capacity_wait(launch, "owner", clock=clock, sleep=clock.sleep)
     )
     assert result == {"id": "vm"}
-    assert clock.waits == [300, 300]
+    assert clock.waits == [60, 60]
     assert all(call.args == ("owner",) for call in launch.call_args_list)
 
 
@@ -44,7 +44,7 @@ def test_no_capacity_stops_at_one_hour_without_a_late_launch():
 
     with pytest.raises(TimeoutError, match="one hour"):
         asyncio.run(capacity.launch_with_capacity_wait(launch, clock=clock, sleep=clock.sleep))
-    assert attempts == list(range(0, 3600, 300))
+    assert attempts == list(range(0, 3600, 60))
     assert clock.now == 3600
 
 

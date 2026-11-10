@@ -53,10 +53,10 @@ async def test_authentication_errors_fail_without_waiting():
 
 
 @pytest.mark.anyio
-async def test_modal_only_deployment_does_not_require_lambda_credentials(monkeypatch):
-    monkeypatch.setattr(gate, "MODEL_POLICIES", {})
+async def test_all_hosted_deployments_require_lambda_credentials(monkeypatch):
     monkeypatch.delenv("LAMBDA_API_KEY", raising=False)
-    await gate.main()
+    with pytest.raises(RuntimeError, match="LAMBDA_API_KEY"):
+        await gate.main()
 
 
 @pytest.mark.anyio
