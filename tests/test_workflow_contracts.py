@@ -875,3 +875,18 @@ def test_provider_deployment_requires_lambda_only_when_enabled(
         assert output.read_text() == f"lambda_enabled={enabled}\n"
     control = next(s for s in _steps(job) if s.get("name") == "Deploy Lambda fleet control")
     assert "steps.provider.outputs.lambda_enabled == 'true'" in control["if"]
+
+
+@pytest.mark.parametrize("filename", ["deploy-modal.yml", "deploy-modal-dev.yml"])
+def test_lambda_capacity_wait_precedes_deployment_with_its_own_five_hour_budget(filename):
+    from flash.serving.lambda_cloud.capacity_gate import DEPLOY_CAPACITY_WAIT_SECONDS
+
+    jobs = _load(WORKFLOW_DIR / filename)["jobs"]
+    capacity = jobs["lambda-capacity"]
+    assert jobs["deploy"]["needs"] == "lambda-capacity"
+    assert capacity["if"] == jobs["deploy"]["if"]
+    assert capacity["timeout-minutes"] * 60 >= DEPLOY_CAPACITY_WAIT_SECONDS + 10 * 60
+    assert any(
+        "flash.serving.lambda_cloud.capacity_gate" in step.get("run", "")
+        for step in capacity["steps"]
+    )

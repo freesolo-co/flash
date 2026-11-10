@@ -134,3 +134,16 @@ and deploy the fleet controller before serving. `/healthz` exposes
 `provider_by_model`, `capacity_by_model` (including the optional dev override), and
 `gpu_by_model` so the deployed configuration can be inspected. These settings
 control hosted inference; training and customer-owned deployments are separate.
+
+Before either dev or production serving deployment, a separate job checks Lambda's
+live catalog for every model configured to use Lambda. It waits up to **five hours**,
+checking every **five minutes** and logging the missing models, elapsed time, and
+remaining time. No VMs are rented during this preflight; the existing serving app
+stays unchanged while capacity is unavailable. A timeout fails the deployment
+instead of changing the requested GPU or provider. Authentication/API errors fail
+immediately rather than being mistaken for unavailable hardware.
+
+The capacity job has its own 310-minute budget, leaving the subsequent deployment,
+startup, and inference verification their existing full budgets. Advertised
+capacity is not a reservation: a worker still uses the existing one-hour capacity
+retry if availability disappears between preflight and allocation.

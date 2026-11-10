@@ -31,7 +31,29 @@ on:
   workflow_dispatch:
 
 jobs:
+  lambda-capacity:
+    name: Wait for Lambda GPU capacity
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    # Keep the five-hour provider wait separate from deployment/readiness budgets.
+    timeout-minutes: 310
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        with:
+          version: "0.12.5"
+          python-version: "3.12"
+      - name: Install capacity checker dependencies
+        run: uv sync --extra serving --locked --no-dev
+      - name: Check every five minutes for up to five hours
+        env:
+          LAMBDA_API_KEY: ${{ secrets.LAMBDA_API_KEY }}
+        run: uv run --no-sync python -m flash.serving.lambda_cloud.capacity_gate
+
   deploy:
+    needs: lambda-capacity
     name: Deploy serving Modal app
     # prod safety: `modal deploy` always targets the fixed freesolo-lora-serving production app, and
     # workflow_dispatch can be launched from any branch via the "run workflow" dropdown. restrict the
