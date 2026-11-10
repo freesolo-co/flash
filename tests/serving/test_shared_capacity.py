@@ -177,3 +177,28 @@ async def test_short_requests_boot_lambda_for_zero_floor_models_then_return_to_z
 
     with pytest.raises(NoCapacityError, match="idle"):
         await control.before_launch(model, REVISION, allocated=1)
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(("allocated", "expected"), [(4, "modal"), (5, "lambda")])
+async def test_health_loss_refreshes_zero_slots_without_exceeding_handoff_budget(
+    allocated, expected
+):
+    control, _, fallback = controller()
+    control.fleet.allocated_count.return_value = allocated
+    state = {MODEL: {"modal_slots": 0}}
+
+    async def get(key):
+        return state.get(key)
+
+    async def put(key, value):
+        state[key] = value
+
+    control.state = SimpleNamespace(get=get, put=put)
+    # Mimic the independent routing function asking the serialized controller
+    # to refresh, without accessing provider credentials on the request path.
+    control.refresh = AsyncMock(side_effect=control.reconcile_model)
+    assert await control.choose(MODEL) == expected
+    control.refresh.assert_awaited_once_with(MODEL)
+    assert state[MODEL]["modal_slots"] == 5 - allocated
+    assert fallback.update_autoscaler.aio.await_args.kwargs["min_containers"] == 0

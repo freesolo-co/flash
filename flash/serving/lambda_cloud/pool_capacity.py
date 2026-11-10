@@ -23,9 +23,10 @@ def sequence_capacity(model):
 
 
 class SharedCapacity:
-    def __init__(self, fleet, pools, state, revision, *, clock=time.time):
+    def __init__(self, fleet, pools, state, revision, *, clock=time.time, refresh=None):
         self.fleet, self.pools, self.state, self.revision = fleet, pools, state, revision
         self.clock = clock
+        self.refresh = refresh
 
     async def activate(self, revision):
         if not revision or revision != self.revision:
@@ -112,6 +113,16 @@ class SharedCapacity:
         routing = await self.state.get(model)
         if routing is None:
             raise RuntimeError("Serving capacity has not been configured")
+        if routing["modal_slots"] == 0 and ready < policy_for(model).max_capacity:
+            # A healthy pool may have filled every slot at the last minute tick.
+            # Recheck the allocation budget before routing to a now-unhealthy
+            # primary; the handoff surge may already be occupied, so do not
+            # blindly start a fallback GPU.
+            if self.refresh is None:
+                await self.reconcile_model(model)
+            else:
+                await self.refresh(model)
+            routing = await self.state.get(model)
         if routing["modal_slots"] == 0:
             return "lambda"
         if not ready:

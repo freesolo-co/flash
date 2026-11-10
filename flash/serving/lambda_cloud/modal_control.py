@@ -77,6 +77,12 @@ def register_control(app, secret, image, module_name):
             return await self.capacity.activate(revision)
 
         @modal.method()
+        async def refresh_capacity(self, model):
+            if not await self.capacity.active():
+                raise RuntimeError("Cannot refresh a superseded capacity controller")
+            await self.capacity.reconcile_model(model)
+
+        @modal.method()
         async def choose(self, model):
             return await self.capacity.choose(model)
 
@@ -101,7 +107,11 @@ def register_control(app, secret, image, module_name):
         environment = os.environ["FLASH_LAMBDA_ENVIRONMENT"]
         fleet = Fleet(None, Ledger(), environment)
         capacity = SharedCapacity(
-            fleet, modal_pools(environment), Ledger(LEDGER_NAME + "-pools"), ""
+            fleet,
+            modal_pools(environment),
+            Ledger(LEDGER_NAME + "-pools"),
+            "",
+            refresh=control().refresh_capacity.remote.aio,
         )
         return await capacity.choose(model)
 
