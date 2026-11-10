@@ -5591,6 +5591,68 @@ def test_a_batched_score_reaches_the_env_under_the_same_lock_every_other_call_ta
     assert env.held_during_scoring == [True], "the env was scored without the session lock held"
 
 
+def _parked_scorer_env(*, score_overlaps_steps):
+    """an env whose scorer parks until released, to observe what a slow score blocks."""
+    entered = threading.Event()
+    release = threading.Event()
+
+    class _SlowScoringEnv(_BridgeEnv):
+        def rollout_rewards_many(self, items):
+            from flash.envs.loading.base import RolloutReward
+
+            entered.set()
+            release.wait(timeout=30)
+            return [RolloutReward(episode=1.0, turns=None) for _ in items]
+
+    env = _SlowScoringEnv(done_after=2)
+    env.score_overlaps_steps = score_overlaps_steps
+    return env, entered, release
+
+
+def _step_while_scoring(env, entered, release):
+    """park session a's score in the env, then step session b. returns (step finished early, score)."""
+    bridge = _bridge(env, examples=[{"index": 0}, {"index": 1}])
+    bridge.start({"index": 0, "session_id": "a"})
+    bridge.start({"index": 1, "session_id": "b"})
+    bridge.step({"session_id": "a", "completion_text": "answer"})
+    scored: list[float] = []
+    scorer = threading.Thread(
+        target=lambda: scored.append(bridge.score({"session_id": "a", "turn_count": 1})["score"])
+    )
+    scorer.start()
+    assert entered.wait(timeout=30), "the scorer never reached the env"
+    stepper = threading.Thread(
+        target=lambda: bridge.step({"session_id": "b", "completion_text": "search"})
+    )
+    stepper.start()
+    stepper.join(timeout=1.0)
+    finished_early = not stepper.is_alive()
+    release.set()
+    stepper.join(timeout=30)
+    scorer.join(timeout=30)
+    assert not stepper.is_alive(), "the step never completed"
+    assert not scorer.is_alive(), "the score never completed"
+    return finished_early, scored
+
+
+def test_an_env_that_opts_in_keeps_stepping_while_a_slow_score_runs():
+    # a remote grader can take minutes per episode. scored under the step lock, that one score
+    # freezes every other in-flight episode's env_reply until verl's no-progress watchdog fires.
+    env, entered, release = _parked_scorer_env(score_overlaps_steps=True)
+    finished_early, scored = _step_while_scoring(env, entered, release)
+    assert finished_early, "a step waited on an unrelated episode's score"
+    assert scored == [1.0]
+
+
+def test_by_default_a_step_still_waits_for_a_score_in_progress():
+    # the opt-in is the only way scoring leaves the lock: an env that did not declare its scorer
+    # independent of env_reply state is never raced against it.
+    env, entered, release = _parked_scorer_env(score_overlaps_steps=False)
+    finished_early, scored = _step_while_scoring(env, entered, release)
+    assert not finished_early, "a step raced a score the env never allowed to overlap"
+    assert scored == [1.0]
+
+
 def test_a_failing_batch_fails_every_episode_in_it_rather_than_hanging_them():
     # a scoring raise must complete every waiter or the other episodes block until VERL-100 fires.
     # park the scorer until several episodes queue so the test exercises one real shared batch.

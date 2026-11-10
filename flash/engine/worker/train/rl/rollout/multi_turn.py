@@ -254,6 +254,9 @@ class MultiTurnBridge:
         # the flash env is not required to be thread-safe, and verl runs many rollouts at once.
         # every stateful episode touch below happens under this lock.
         self._lock = threading.Lock()
+        # an env that opts in (`score_overlaps_steps = True`) is scored outside that lock, so a slow
+        # scorer (a remote grader, a test sandbox) no longer blocks every in-flight episode's turns.
+        self._score_overlaps_steps = bool(getattr(env, "score_overlaps_steps", False))
         self._warned_missing_turn_rewards = False
         # per-run turn totals, published through `turn_accounting`. guarded by the same lock as
         # every other mutable bridge state.
@@ -269,7 +272,7 @@ class MultiTurnBridge:
         self._session_lease_s = float(session_lease_s)
         # score many episodes under one lock-held env call so judge work can use the env's own
         # max_score_concurrency. keep the lock: reward_thread_safe permits scorer/scorer concurrency,
-        # not racing scoring against env_reply.
+        # not racing scoring against env_reply (unless the env opts in with score_overlaps_steps).
         # the defaults are what this path wants: env scoring errors propagate as raised (the reward
         # routes already translate them for the child), and a batch assembled during the flush window
         # is still scored, so the last requests of a run answer instead of failing on shutdown.
@@ -568,7 +571,12 @@ class MultiTurnBridge:
 
         takes the same lock every other env touch takes, so scoring never overlaps a concurrent
         episode's ``env_reply``. the win is that one lock acquisition now covers a whole batch.
+        an env with ``score_overlaps_steps`` is scored without that lock: its scoring runs while
+        other episodes keep stepping, instead of holding all of them for the slowest score.
         """
+        if self._score_overlaps_steps:
+            with self._parent_work.busy():
+                return score_rollouts(self._env, requests)
         with self._lock, self._parent_work.busy():
             return score_rollouts(self._env, requests)
 
