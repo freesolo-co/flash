@@ -25,10 +25,6 @@ def engine_profile(model, gpu):
                 "ignore": ["re:.*visual.*", "re:.*lm_head$", f"re:.*in_proj_{gate}$"]
             },
         )
-    if model == "Qwen/Qwen3.6-35B-A3B":
-        overrides.update(
-            serve_model_id=model + "-FP8",
-            model_revision="c653bba46dfa06e9658dcc0b0dc87fe4685f14a2",
-            quantization="fp8",
-        )
+    # In particular, retain 35B's qualified BF16 checkpoint and LoRA/graph
+    # settings. FP8 fused-MoE LoRA fails on both H200 and B200.
     return overrides

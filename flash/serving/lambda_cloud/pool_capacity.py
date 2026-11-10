@@ -28,17 +28,35 @@ class SharedCapacity:
         self.clock = clock
         self.refresh = refresh
 
+    async def serving_release(self):
+        release = await self.state.get("serving_release")
+        if release is not None:
+            return release
+        # Upgrade controllers without requiring an already-serving router to
+        # redeploy. Older controllers stored only the active SHA.
+        return {"revision": await self.state.get("active_revision"), "retired": []}
+
     async def activate(self, revision):
-        if not revision or revision != self.revision:
+        release = await self.serving_release()
+        if revision and revision == release["revision"]:
+            return  # A new controller must still admit the existing router.
+        if not revision or revision != self.revision or revision in release["retired"]:
             raise RuntimeError("Cannot activate a superseded Lambda capacity controller")
-        await self.state.put("active_revision", revision)
-        await self.reconcile(strict=True)
+        # Do not retire the serving release if configuring its replacement fails.
+        await self.reconcile(strict=True, activating=True)
+        retired = release["retired"] + ([release["revision"]] if release["revision"] else [])
+        # Publish activation and retirement together: an old router cannot
+        # reactivate itself after the replacement has taken over.
+        await self.state.put("serving_release", {"revision": revision, "retired": retired})
 
     async def active(self):
-        return bool(self.revision) and await self.state.get("active_revision") == self.revision
+        release = await self.serving_release()
+        return (
+            bool(self.revision and release["revision"]) and self.revision not in release["retired"]
+        )
 
-    async def reconcile(self, *, strict=False):
-        if not await self.active():
+    async def reconcile(self, *, strict=False, activating=False):
+        if not activating and not await self.active():
             return
         errors = []
         for model in lambda_models():
@@ -90,7 +108,13 @@ class SharedCapacity:
         return ready, primary_stats, fallback_stats, desired
 
     async def before_launch(self, model, revision, allocated):
-        if revision != self.revision or not await self.active():
+        release = await self.serving_release()
+        if not release["revision"] and revision != self.revision:
+            # The first shared-pool controller may replace a legacy controller
+            # whose serving release never called activate(). Its existing CPU
+            # pools still enforce their bounds; Fleet also checks the leases.
+            return
+        if revision != release["revision"] or not await self.active():
             raise NoCapacityError("Lambda pool is not active for this deployment")
         ready, _, fallback_stats, desired = await self.reconcile_model(model)
         if desired == 0:

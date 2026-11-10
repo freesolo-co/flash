@@ -36,7 +36,7 @@ def controller(ready=0, modal_runners=0, running=0):
         get=AsyncMock(
             side_effect=lambda key: (
                 None
-                if key.startswith("demand:")
+                if key.startswith("demand:") or key == "serving_release"
                 else REVISION
                 if key == "active_revision"
                 else {"modal_slots": max(0, 4 - ready)}
@@ -109,15 +109,16 @@ async def test_busy_partial_lambda_pool_uses_modal_but_full_pool_does_not_overfl
 @pytest.mark.anyio
 async def test_old_controller_cannot_reconfigure_new_deployment():
     control, primary, fallback = controller()
-    control.state.get.side_effect = None
-    control.state.get.return_value = "b" * 40
+    control.state.get.side_effect = lambda key: (
+        {"revision": "b" * 40, "retired": [REVISION]} if key == "serving_release" else None
+    )
     await control.reconcile()
     primary.update_autoscaler.aio.assert_not_awaited()
     fallback.update_autoscaler.aio.assert_not_awaited()
     with pytest.raises(NoCapacityError):
         await control.before_launch(MODEL, REVISION, 0)
     with pytest.raises(RuntimeError):
-        await control.activate("b" * 40)
+        await control.activate(REVISION)
 
 
 @pytest.mark.anyio
@@ -202,3 +203,70 @@ async def test_health_loss_refreshes_zero_slots_without_exceeding_handoff_budget
     control.refresh.assert_awaited_once_with(MODEL)
     assert state[MODEL]["modal_slots"] == 5 - allocated
     assert fallback.update_autoscaler.aio.await_args.kwargs["min_containers"] == 0
+
+
+class ReleaseState:
+    def __init__(self, revision):
+        self.data = {"active_revision": revision}
+
+    async def get(self, key):
+        return self.data.get(key)
+
+    async def put(self, key, value):
+        self.data[key] = value
+
+
+@pytest.mark.anyio
+async def test_controller_upgrade_preserves_serving_until_replacement_activation():
+    control, primary, _ = controller()
+    state = ReleaseState(REVISION)
+    control.state = state
+    control.revision = "b" * 40  # New controller is deployed before serving.
+    await control.activate(REVISION)  # Existing serving router cold start.
+    await control.before_launch(MODEL, REVISION, allocated=0)  # Existing pool replenishment.
+    assert (await control.serving_release())["revision"] == REVISION
+    assert await control.active()
+    primary.update_autoscaler.aio.reset_mock()
+    await control.reconcile()  # Minute autoscaling still works after a failed serving deploy.
+    assert primary.update_autoscaler.aio.await_count > 0
+
+    await control.activate(control.revision)
+    assert (await control.serving_release())["revision"] == control.revision
+    with pytest.raises(RuntimeError):
+        await control.activate(REVISION)
+    with pytest.raises(NoCapacityError):
+        await control.before_launch(MODEL, REVISION, allocated=0)
+    await control.before_launch(MODEL, control.revision, allocated=0)
+    old = SharedCapacity(control.fleet, control.pools, state, REVISION)
+    assert not await old.active()
+    with pytest.raises(RuntimeError):
+        await old.activate(REVISION)
+
+
+@pytest.mark.anyio
+async def test_failed_activation_keeps_old_serving_revision_usable():
+    control, primary, _ = controller()
+    control.state = ReleaseState(REVISION)
+    control.revision = "b" * 40
+    primary.update_autoscaler.aio.side_effect = RuntimeError("pool update failed")
+    with pytest.raises(ExceptionGroup):
+        await control.activate(control.revision)
+    assert (await control.serving_release()) == {"revision": REVISION, "retired": []}
+    await control.activate(REVISION)  # Admission does not depend on retrying the failed update.
+    primary.update_autoscaler.aio.side_effect = None
+    await control.before_launch(MODEL, REVISION, allocated=0)
+
+
+@pytest.mark.anyio
+async def test_first_controller_upgrade_keeps_legacy_lambda_pools_usable():
+    control, primary, fallback = controller()
+    control.state = ReleaseState(None)
+    await control.before_launch(MODEL, "b" * 40, allocated=0)
+    # Legacy serving has no fallback class: do not look it up before activation.
+    primary.update_autoscaler.aio.assert_not_awaited()
+    fallback.update_autoscaler.aio.assert_not_awaited()
+    with pytest.raises(NoCapacityError):
+        await control.before_launch(MODEL, REVISION, allocated=0)
+    await control.activate(REVISION)
+    with pytest.raises(NoCapacityError):
+        await control.before_launch(MODEL, "b" * 40, allocated=0)

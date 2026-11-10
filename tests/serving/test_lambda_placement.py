@@ -90,11 +90,15 @@ def test_ampere_profile_uses_passing_fp8_path_without_changing_admission(model):
     assert engine_overrides_for(model) == before
 
 
-def test_moe_fp8_pin_and_unapproved_profile():
-    result = engine_profile(MOE, "H200")
-    assert result["serve_model_id"] == MOE + "-FP8"
-    assert result["model_revision"] == "c653bba46dfa06e9658dcc0b0dc87fe4685f14a2"
-    assert result["quantization"] == "fp8"
+@pytest.mark.parametrize("gpu", ["H200", "B200"])
+def test_moe_preserves_qualified_bf16_lora_profile(gpu):
+    result = engine_profile(MOE, gpu)
+    assert result == engine_overrides_for(MOE)
+    assert result["serve_model_id"] == MOE
+    assert result["quantization"] is None
+    assert result["enforce_eager"] is False
+    assert result["max_loras"] == 6
+    assert result["max_lora_rank"] == 64
     with pytest.raises(ValueError, match="Unapproved"):
         engine_profile(MOE, "A100-80GB")
 
