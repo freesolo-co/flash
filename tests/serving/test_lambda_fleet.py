@@ -164,16 +164,17 @@ async def test_uncertain_leases_count_toward_per_release_replica_limit():
 
 
 @pytest.mark.anyio
-async def test_all_mode_reserves_only_one_lambda_slot(monkeypatch):
+async def test_all_mode_can_fill_the_entire_shared_budget_with_lambda(monkeypatch):
     from flash.serving.app.inference_provider import MODEL_POLICIES, ModelPolicy
 
     monkeypatch.setitem(MODEL_POLICIES, MODEL, ModelPolicy("all"))
     api, ledger = API(), Ledger()
     fleet = Fleet(api, ledger, "dev", clock=lambda: 100)
     await fleet.launch(OWNER, MODEL, "bootstrap", "b" * 40)
+    await fleet.launch("c" * 32, MODEL, "bootstrap", "b" * 40)
     with pytest.raises(RuntimeError, match="replica limit"):
-        await fleet.launch("c" * 32, MODEL, "bootstrap", "b" * 40)
-    assert api.launches == 1
+        await fleet.launch("d" * 32, MODEL, "bootstrap", "b" * 40)
+    assert api.launches == 2
 
 
 @pytest.mark.anyio
@@ -191,3 +192,48 @@ async def test_custom_model_maximum_is_enforced_independently(monkeypatch):
     with pytest.raises(RuntimeError, match="replica limit"):
         await fleet.launch("f" * 32, "Qwen/Qwen3.5-4B", "bootstrap", "e" * 40)
     assert api.launches == 3
+
+
+@pytest.mark.anyio
+async def test_explicit_capacity_rejection_retries_without_ambiguous_lease():
+    from flash.serving.lambda_cloud.api import LambdaAPIError
+    from flash.serving.lambda_cloud.config import NoCapacityError
+
+    api, ledger = API(), Ledger()
+    original = api.call
+    attempts = []
+    now = [100]
+
+    async def reject(method, path, body=None):
+        if path == "instance-operations/launch":
+            attempts.append(body["region_name"])
+            raise LambdaAPIError(400, "instance-operations/launch/insufficient-capacity")
+        return await original(method, path, body)
+
+    api.call = reject
+    fleet = Fleet(api, ledger, "dev", clock=lambda: now[0])
+    for instant in (100, 160, 220):
+        now[0] = instant
+        with pytest.raises(NoCapacityError):
+            await fleet.launch(OWNER, MODEL, "bootstrap", "b" * 40)
+        assert not ledger.data
+    assert len(attempts) == 2  # Rejected offers cool down while other shapes remain eligible.
+
+
+@pytest.mark.anyio
+async def test_only_fresh_validated_health_counts_as_ready():
+    ledger = Ledger()
+    now = [100]
+    fleet = Fleet(API(), ledger, "dev", clock=lambda: now[0])
+    await fleet.launch(OWNER, MODEL, "bootstrap", "b" * 40)
+    assert await fleet.ready_count(MODEL) == 0
+    health = {"ok": True, "base_model": MODEL, "deployment_sha": "b" * 40, "configured_gpu": "A10"}
+    await fleet.heartbeat(OWNER, health)
+    assert await fleet.ready_count(MODEL) == 1
+    now[0] += 91
+    assert await fleet.ready_count(MODEL) == 0
+    await fleet.heartbeat(OWNER, dict(health, deployment_sha="c" * 40))
+    assert await fleet.ready_count(MODEL) == 0
+    await fleet.heartbeat(OWNER, health)
+    await fleet.release(OWNER)
+    assert await fleet.ready_count(MODEL) == 0

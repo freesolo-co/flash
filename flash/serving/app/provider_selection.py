@@ -15,8 +15,11 @@ class ProviderSelection:
         async with self._lock:
             choice, expires = self._choices.get(model, (None, 0))
             if self.clock() >= expires:
-                choice = "lambda" if await self.capacity(model) else "modal"
-                self._choices[model] = choice, self.clock() + 30
+                async with asyncio.timeout(5):
+                    choice = await self.capacity(model)
+                if choice not in {"lambda", "modal"}:
+                    raise RuntimeError("Invalid serving provider choice")
+                self._choices[model] = choice, self.clock() + 1
             return choice
 
 

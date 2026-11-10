@@ -8,7 +8,7 @@ class ModelPolicy:
     provider: str = "modal"
     min_capacity: int = 0
     max_capacity: int = 2
-    lambda_gpus: tuple[str, ...] = ()
+    lambda_gpus: tuple[str, ...] | list[str] = ()
     # DeepSeek retains its smaller development pool; None uses max_capacity everywhere.
     dev_max_capacity: int | None = None
 
@@ -30,14 +30,18 @@ class ModelPolicy:
                     "capacity requires integer 0 <= min_capacity <= max_capacity; "
                     "max_capacity >= 1 (>= 2 for all)"
                 )
-        if not isinstance(self.lambda_gpus, tuple) or any(
-            gpu not in {"A10", "A100-80GB", "H100", "H200", "B200"} for gpu in self.lambda_gpus
+        if not isinstance(self.lambda_gpus, (tuple, list)) or any(
+            gpu not in {"A10", "A100-40GB", "A100-80GB", "H100", "H200", "B200"}
+            for gpu in self.lambda_gpus
         ):
-            raise ValueError("lambda_gpus must be a tuple of approved GPU names")
+            raise ValueError("lambda_gpus must be a list or tuple of approved GPU names")
+        object.__setattr__(self, "lambda_gpus", tuple(self.lambda_gpus))
 
 
-# Capacity counts replicas, not cards. In `all` mode max is the combined limit;
-# Lambda receives the odd slot and the warm floor first, Modal receives the rest.
+# Lambda is preferred; Modal is a scale-to-zero fallback sharing max_capacity.
+# The fleet controller transfers slots as Lambda workers become ready. Handoffs
+# allow one temporary extra GPU, then drain the replaced Modal replica before
+# starting another. lambda_gpus is an allowlist: use the cheapest available offer.
 MODEL_POLICIES = {
     "Qwen/Qwen3.5-0.8B": ModelPolicy(
         "lambda", min_capacity=1, max_capacity=2, lambda_gpus=("A10",)
@@ -45,7 +49,10 @@ MODEL_POLICIES = {
     "Qwen/Qwen3.5-4B": ModelPolicy("modal", min_capacity=0, max_capacity=2),
     "Qwen/Qwen3.5-9B": ModelPolicy("modal", min_capacity=0, max_capacity=2),
     "Qwen/Qwen3.5-9B-Base": ModelPolicy(
-        "lambda", min_capacity=1, max_capacity=2, lambda_gpus=("H100",)
+        "lambda",
+        min_capacity=2,
+        max_capacity=4,
+        lambda_gpus=["A100-40GB", "A100-80GB", "H100"],
     ),
     "Qwen/Qwen3.8-27B": ModelPolicy("modal", min_capacity=0, max_capacity=2),
     "Qwen/Qwen3.6-35B-A3B": ModelPolicy("modal", min_capacity=0, max_capacity=2),
@@ -67,14 +74,12 @@ def policy_for(model):
 
 def capacity_for(model, provider):
     policy = policy_for(model)
-    if policy.provider == provider:
+    if policy.provider == "modal":
+        return (policy.min_capacity, policy.max_capacity) if provider == "modal" else (0, 0)
+    if provider == "lambda":
         return policy.min_capacity, policy.max_capacity
-    if policy.provider == "all" and provider in {"lambda", "modal"}:
-        lambda_max = (policy.max_capacity + 1) // 2
-        lambda_min = min(policy.min_capacity, lambda_max)
-        if provider == "lambda":
-            return lambda_min, lambda_max
-        return policy.min_capacity - lambda_min, policy.max_capacity - lambda_max
+    if provider == "modal":
+        return 0, policy.max_capacity
     return 0, 0
 
 

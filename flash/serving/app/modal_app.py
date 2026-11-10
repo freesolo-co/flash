@@ -507,7 +507,7 @@ ENGINE_BY_MODEL: dict[str, Any] = {
 MODAL_FALLBACK_BY_MODEL: dict[str, Any] = {
     bm: _configured_engine(bm, "modal", "_ModalGPU")
     for bm in base_models()
-    if policy_for(bm).provider == "all"
+    if policy_for(bm).provider != "modal"
 }
 
 
@@ -530,7 +530,9 @@ class _ModalEnginePool:
             from flash.serving.lambda_cloud.config import APP_NAME as fleet_app
 
             fleet = modal.Cls.from_name(fleet_app, "LambdaFleet")()
-            self._provider_selection = ProviderSelection(fleet.has_capacity.remote.aio)
+            self._fleet = fleet
+            chooser = modal.Function.from_name(fleet_app, "choose_provider")
+            self._provider_selection = ProviderSelection(chooser.remote.aio)
 
     async def _engine_for(self, model):
         if (
@@ -541,14 +543,17 @@ class _ModalEnginePool:
         return _engine_cls_for(model)(base_model=model)
 
     async def start(self):
-        await warm_configured_models(
-            {bm: cls(base_model=bm) for bm, cls in ENGINE_BY_MODEL.items()}
-        )
         if MODAL_FALLBACK_BY_MODEL:
-            await warm_configured_models(
-                {bm: cls(base_model=bm) for bm, cls in MODAL_FALLBACK_BY_MODEL.items()},
-                fallback=True,
-            )
+            await self._fleet.activate.remote.aio(os.environ["FREESOLO_DEPLOYMENT_SHA"])
+        await warm_configured_models(
+            {
+                bm: cls(base_model=bm)
+                for bm, cls in ENGINE_BY_MODEL.items()
+                if policy_for(bm).provider == "modal"
+            }
+        )
+        # Lambda startup must never block the router: requests use the fallback
+        # until a worker publishes a healthy, hardware-validated heartbeat.
 
     async def aclose(self):
         await self._deepinfer.aclose()

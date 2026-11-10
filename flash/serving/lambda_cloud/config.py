@@ -21,8 +21,15 @@ RUNTIME_IMAGE = (
 
 
 # Labels describe qualified shapes, not guessed provider instance-type IDs.
-GPU_MEMORY_GIB = {"A10": 22, "A100-80GB": 75, "H100": 75, "H200": 130, "B200": 170}
-CATALOG_MEMORY_GB = {"A10": 24, "A100-80GB": 80, "H100": 80, "H200": 141, "B200": 180}
+GPU_MEMORY_GIB = {"A10": 22, "A100-40GB": 35, "A100-80GB": 75, "H100": 75, "H200": 130, "B200": 170}
+CATALOG_MEMORY_GB = {
+    "A10": 24,
+    "A100-40GB": 40,
+    "A100-80GB": 80,
+    "H100": 80,
+    "H200": 141,
+    "B200": 180,
+}
 
 
 def qualified_placements(model):
@@ -32,6 +39,8 @@ def qualified_placements(model):
         return ("H200", "B200")
     if model in {"Qwen/Qwen3.5-0.8B", "Qwen/Qwen3.5-4B"}:
         return ("A10", "A100-80GB", "H100")
+    if model in {"Qwen/Qwen3.5-9B", "Qwen/Qwen3.5-9B-Base"}:
+        return ("A100-40GB", "A100-80GB", "H100")
     return ("A100-80GB", "H100")
 
 
@@ -49,17 +58,17 @@ def gpu_matches(gpu, description):
 
 
 def validate_gpu(model, name, memory_bytes, count):
-    for gpu in placements(model):
+    for gpu in sorted(placements(model), key=GPU_MEMORY_GIB.get, reverse=True):
         if count == 1 and gpu_matches(gpu, name) and memory_bytes >= GPU_MEMORY_GIB[gpu] * 2**30:
             return gpu
     raise RuntimeError(f"Lambda worker received an unapproved GPU shape for {model}: {name}")
 
 
 class NoCapacityError(RuntimeError):
-    """No approved shape advertises capacity; no VM launch was attempted."""
+    """No approved capacity is available; no VM was created."""
 
 
-def select_region(catalog, model):
+def select_region(catalog, model, *, excluded=()):
     allowed = placements(model)
     candidates = []
     for instance_type, offer in catalog.items():
@@ -79,7 +88,7 @@ def select_region(catalog, model):
         candidates.extend(
             (price, instance_type, region["name"])
             for region in offer.get("regions_with_capacity_available", [])
-            if region["name"].startswith("us-")
+            if region["name"].startswith("us-") and (instance_type, region["name"]) not in excluded
         )
     if not candidates:
         raise NoCapacityError(

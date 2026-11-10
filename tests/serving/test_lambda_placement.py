@@ -114,11 +114,14 @@ def test_a10_is_cheapest_small_model_option():
         assert validate_gpu(model, "NVIDIA A10", 22.06 * 2**30, 1) == "A10"
 
 
-def test_nine_base_stays_on_h100_even_when_a100_is_cheaper():
+@pytest.mark.parametrize("a100", ["A100 (40 GB SXM4)", "A100 (80 GB SXM4)"])
+def test_nine_base_uses_available_a100_or_h100(a100):
     model = "Qwen/Qwen3.5-9B-Base"
-    catalog = {"a100": offer("A100 (80 GB SXM4)", 200), "h100": offer("H100 (80 GB SXM5)", 400)}
+    catalog = {"a100": offer(a100, 200), "h100": offer("H100 (80 GB SXM5)", 400)}
+    assert select_region(catalog, model) == ("a100", "us-west-1")
+    catalog["a100"]["regions_with_capacity_available"] = []
     assert select_region(catalog, model) == ("h100", "us-west-1")
-    del catalog["h100"]
+    catalog["h100"]["regions_with_capacity_available"] = []
     with pytest.raises(RuntimeError, match="no US capacity"):
         select_region(catalog, model)
 
@@ -126,3 +129,9 @@ def test_nine_base_stays_on_h100_even_when_a100_is_cheaper():
 def test_small_model_does_not_fall_back_to_more_expensive_hardware():
     with pytest.raises(RuntimeError, match="no US capacity"):
         select_region({"h100": offer("H100 (80 GB SXM5)", 400)}, SMALL)
+
+
+def test_rejected_offer_does_not_prevent_trying_other_available_shapes():
+    model = "Qwen/Qwen3.5-9B-Base"
+    catalog = {"a100": offer("A100 (40 GB SXM4)", 200), "h100": offer("H100 (80 GB SXM5)", 400)}
+    assert select_region(catalog, model, excluded={("a100", "us-west-1")}) == ("h100", "us-west-1")

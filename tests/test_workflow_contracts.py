@@ -878,12 +878,12 @@ def test_provider_deployment_requires_lambda_only_when_enabled(
 
 
 @pytest.mark.parametrize("filename", ["deploy-modal.yml", "deploy-modal-dev.yml"])
-def test_lambda_capacity_wait_precedes_deployment_with_its_own_five_hour_budget(filename):
+def test_lambda_capacity_watch_runs_alongside_fallback_deployment_for_five_hours(filename):
     from flash.serving.lambda_cloud.capacity_gate import DEPLOY_CAPACITY_WAIT_SECONDS
 
     jobs = _load(WORKFLOW_DIR / filename)["jobs"]
     capacity = jobs["lambda-capacity"]
-    assert jobs["deploy"]["needs"] == "lambda-capacity"
+    assert "needs" not in jobs["deploy"]
     assert capacity["if"] == jobs["deploy"]["if"]
     assert capacity["timeout-minutes"] * 60 >= DEPLOY_CAPACITY_WAIT_SECONDS + 10 * 60
     assert any(
@@ -907,7 +907,7 @@ def test_waiting_deploy_cannot_overwrite_a_newer_branch_tip(filename, branch, sc
     guard = steps[guard_index]
     # The remote-tip check must happen inside the deployment lock, after the long
     # capacity wait and before the deploy decision or any provider mutation.
-    assert job["needs"] == "lambda-capacity"
+    assert "needs" not in job
     assert job["concurrency"]["cancel-in-progress"] is False
     assert "if" not in guard
     assert guard_index < next(i for i, step in enumerate(steps) if step.get("id") == "gate")

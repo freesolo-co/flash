@@ -11,7 +11,7 @@ def engine_profile(model, gpu):
         raise ValueError(f"Unapproved serving GPU {gpu} for {model}")
     overrides = engine_overrides_for(model)
     small = model in {"Qwen/Qwen3.5-0.8B", "Qwen/Qwen3.5-4B"}
-    online_nine = gpu in {"A10", "A100-80GB"} and model in {
+    online_nine = gpu in {"A10", "A100-40GB", "A100-80GB"} and model in {
         "Qwen/Qwen3.5-9B",
         "Qwen/Qwen3.5-9B-Base",
     }

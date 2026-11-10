@@ -35,32 +35,34 @@ def test_registered_pools_and_combined_limit(mode, monkeypatch, load_modal_app_u
     gpu_calls = [call for call in app.cls.call_args_list if "gpu" in call.kwargs]
     cpu_calls = [call for call in app.cls.call_args_list if "gpu" not in call.kwargs]
     n = len(base_models())
-    assert len(gpu_calls) == (n if mode in {"modal", "all"} else 0)
+    assert len(gpu_calls) == n
     assert len(cpu_calls) == (n if mode in {"lambda", "all"} else 0)
     # Modal rejects non-preemptible GPU workloads; Lambda proxies are CPU-only.
     assert all(not call.kwargs.get("nonpreemptible", False) for call in gpu_calls)
     assert all(call.kwargs["nonpreemptible"] for call in cpu_calls)
-    assert sum(call.kwargs["max_containers"] for call in app.cls.call_args_list) == 2 * n
+    assert sum(call.kwargs["max_containers"] for call in app.cls.call_args_list) == (
+        2 * n if mode == "modal" else 4 * n
+    )
     for model, cls in mod.ENGINE_BY_MODEL.items():
         if mode == "modal":
             assert issubclass(cls, mod.HostedModalEngine)
             assert cls.pinned_gpu == policy.modal_gpus_for(model)
         else:
             assert issubclass(cls, mod.LambdaEngineProxy)
-    assert bool(mod.MODAL_FALLBACK_BY_MODEL) == (mode == "all")
+    assert bool(mod.MODAL_FALLBACK_BY_MODEL) == (mode != "modal")
     assert not any("DeepSeek" in model for model in mod.ENGINE_BY_MODEL)
 
 
 @pytest.mark.anyio
 async def test_all_selects_by_capacity_and_caches_concurrent_lookups():
     now = 100
-    capacity = AsyncMock(return_value=True)
+    capacity = AsyncMock(return_value="lambda")
     selection = ProviderSelection(capacity, clock=lambda: now)
     assert await asyncio.gather(*(selection.choose("model") for _ in range(10))) == ["lambda"] * 10
     capacity.assert_awaited_once_with("model")
-    capacity.return_value = False
+    capacity.return_value = "modal"
     assert await selection.choose("model") == "lambda"
-    now += 31
+    now += 2
     assert await selection.choose("model") == "modal"
 
 
@@ -190,12 +192,17 @@ def test_shipping_policy_covers_catalog_and_requested_placement():
     from flash.serving.lambda_cloud.config import placements
 
     assert set(policy.MODEL_POLICIES) == set(base_models()) | {MODEL_ID}
-    selected = {"Qwen/Qwen3.5-0.8B": "A10", "Qwen/Qwen3.5-9B-Base": "H100"}
+    selected = {
+        "Qwen/Qwen3.5-0.8B": ("A10",),
+        "Qwen/Qwen3.5-9B-Base": ("A100-40GB", "A100-80GB", "H100"),
+    }
     for model, config in policy.MODEL_POLICIES.items():
         if model in selected:
             assert config.provider == "lambda"
-            assert policy.capacity_for(model, "lambda") == (1, 2)
-            assert placements(model) == (selected[model],)
+            assert policy.capacity_for(model, "lambda") == (
+                (2, 4) if "9B-Base" in model else (1, 2)
+            )
+            assert placements(model) == selected[model]
         else:
             assert config.provider == "modal"
             assert config.min_capacity == 0
@@ -214,18 +221,21 @@ def test_mixed_model_decorators_use_independent_capacity(monkeypatch, load_modal
     for name in ("cls", "function", "local_entrypoint"):
         getattr(app, name).side_effect = passthrough
     mod = load_modal_app_under_stub(modal)
-    expected = [(0, 2), (0, 5), (0, 4), (0, 2), (0, 2), (0, 2), (0, 3)]
+    expected = [(0, 2), (0, 5), (0, 7), (0, 4), (0, 2), (0, 2), (0, 2), (0, 7), (0, 4)]
     assert [
         (c.kwargs["min_containers"], c.kwargs["max_containers"]) for c in app.cls.call_args_list
     ] == expected
-    assert set(mod.MODAL_FALLBACK_BY_MODEL) == {"Qwen/Qwen3.5-9B"}
+    assert set(mod.MODAL_FALLBACK_BY_MODEL) == {
+        "Qwen/Qwen3.5-0.8B",
+        "Qwen/Qwen3.5-9B",
+        "Qwen/Qwen3.5-9B-Base",
+    }
     # A fallback on another model must never redirect a Lambda-only or Modal-only model.
     for model in mod.ENGINE_BY_MODEL:
         monkeypatch.setitem(mod.ENGINE_BY_MODEL, model, MagicMock())
     monkeypatch.setitem(mod.MODAL_FALLBACK_BY_MODEL, "Qwen/Qwen3.5-9B", MagicMock())
     pool = mod._ModalEnginePool()
     pool._provider_selection = SimpleNamespace(choose=AsyncMock(return_value="modal"))
-    asyncio.run(pool._engine_for("Qwen/Qwen3.5-0.8B"))
     asyncio.run(pool._engine_for("Qwen/Qwen3.5-4B"))
     pool._provider_selection.choose.assert_not_awaited()
     asyncio.run(pool._engine_for("Qwen/Qwen3.5-9B"))

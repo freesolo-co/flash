@@ -99,16 +99,29 @@ def test_lora_engine_uses_configured_capacity(modal_app_module):
         for call in modal_app_module.app.cls.call_args_list
         if "startup_timeout" in call.kwargs
     ]
-    assert len(cls_calls) == len(modal_app_module.ENGINE_BY_MODEL)
+    assert len(cls_calls) == len(modal_app_module.ENGINE_BY_MODEL) + len(
+        modal_app_module.MODAL_FALLBACK_BY_MODEL
+    )
     # Modal rejects positive decorator floors on parameterized classes. Startup
     # applies each model's minimum through the bound instance's autoscaler.
     assert all(
         kwargs["min_containers"] == 0 and kwargs["max_containers"] == policy_for(model).max_capacity
-        for kwargs, model in zip(cls_calls, modal_app_module.ENGINE_BY_MODEL, strict=True)
+        for kwargs, model in zip(
+            cls_calls,
+            [*modal_app_module.ENGINE_BY_MODEL, *modal_app_module.MODAL_FALLBACK_BY_MODEL],
+            strict=True,
+        )
     )
     assert all(
         ("gpu" in kwargs) == issubclass(cls, modal_app_module.HostedModalEngine)
-        for kwargs, cls in zip(cls_calls, modal_app_module.ENGINE_BY_MODEL.values(), strict=True)
+        for kwargs, cls in zip(
+            cls_calls,
+            [
+                *modal_app_module.ENGINE_BY_MODEL.values(),
+                *modal_app_module.MODAL_FALLBACK_BY_MODEL.values(),
+            ],
+            strict=True,
+        )
     )
     assert all(
         kwargs["scaledown_window"]
@@ -130,11 +143,13 @@ def test_gpu_engines_scale_from_demand_without_a_paid_spare(modal_app_module):
         for call in modal_app_module.app.cls.call_args_list
         if "startup_timeout" in call.kwargs
     ]
-    assert len(cls_calls) == len(modal_app_module.ENGINE_BY_MODEL)
-    assert all(kwargs["max_containers"] == 2 for kwargs in cls_calls)
+    assert len(cls_calls) == len(modal_app_module.ENGINE_BY_MODEL) + len(
+        modal_app_module.MODAL_FALLBACK_BY_MODEL
+    )
+    assert all(kwargs["max_containers"] in {2, 4} for kwargs in cls_calls)
     # An active, lightly loaded model must not reserve a second GPU.
     assert all(kwargs["buffer_containers"] == 0 for kwargs in cls_calls)
-    assert sorted(kwargs["min_containers"] for kwargs in cls_calls) == [0, 0, 0, 0, 0, 0]
+    assert sorted(kwargs["min_containers"] for kwargs in cls_calls) == [0] * len(cls_calls)
 
     # The cpu router is uncapped: it is the front door that triggers cold engines, and
     # capping it would throttle every model at once rather than bounding gpu spend per model. It
@@ -170,7 +185,10 @@ def test_modal_concurrency_is_per_engine_key(modal_app_module):
     assert modal_app_module.TARGET_INPUTS == 48
     # One @modal.concurrent per distinct engine key plus one on the router.
     calls = [call.kwargs for call in modal_app_module.modal.concurrent.call_args_list]
-    assert len(calls) == len(modal_app_module.ENGINE_BY_MODEL) + 1
+    assert (
+        len(calls)
+        == len(modal_app_module.ENGINE_BY_MODEL) + len(modal_app_module.MODAL_FALLBACK_BY_MODEL) + 1
+    )
     seen = {(c["max_inputs"], c["target_inputs"]) for c in calls}
     # Check the actual decorators: changing only _engine_concurrency must not leave
     # a second target calculation deploying the old 75% threshold.

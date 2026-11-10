@@ -20,6 +20,7 @@ secret = modal.Secret.from_dict(
     {
         "LAMBDA_API_KEY": os.environ.get("LAMBDA_API_KEY", ""),
         "FLASH_LAMBDA_ENVIRONMENT": environment,
+        "FREESOLO_DEPLOYMENT_SHA": os.environ.get("FREESOLO_DEPLOYMENT_SHA", ""),
     }
 )
 LambdaFleet, reap_lambda_workers = register_control(app, secret, image, __name__)

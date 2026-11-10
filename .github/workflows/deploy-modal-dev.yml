@@ -29,7 +29,6 @@ jobs:
         run: uv run --no-sync python -m flash.serving.lambda_cloud.capacity_gate
 
   deploy:
-    needs: lambda-capacity
     name: Deploy development serving Modal app
     if: github.ref == 'refs/heads/dev'
     runs-on: ubuntu-latest
@@ -75,7 +74,7 @@ jobs:
         with:
           fetch-depth: 0
 
-      # Run after the capacity wait and after acquiring the deployment lock.
+      # Run after acquiring the deployment lock. The capacity watch runs independently.
       # A newer run may have deployed while this revision waited for GPUs.
       - name: Reject superseded deployment revision
         env:
@@ -284,6 +283,8 @@ jobs:
           PYCODE
 
       - name: Deploy Lambda fleet control
+        env:
+          FREESOLO_DEPLOYMENT_SHA: ${{ github.sha }}
         if: steps.gate.outputs.deploy == 'true' && steps.provider.outputs.lambda_enabled == 'true'
         run: modal deploy --strategy rolling --env dev -m flash.serving.lambda_cloud.control_app
 
