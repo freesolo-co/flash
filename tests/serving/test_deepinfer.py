@@ -294,9 +294,11 @@ def test_native_image_patch_rejects_unknown_source():
     ("environment", "warm_replicas"), [("main", 1), ("dev", 0), ("test", 0), (None, 0)]
 )
 @pytest.mark.parametrize("rollout_id", ["", "test-rollout"])
+@pytest.mark.parametrize("production_min", [0, 2])
 def test_modal_private_four_gpu_autoscaling_contract(
-    monkeypatch, environment, warm_replicas, rollout_id
+    monkeypatch, environment, warm_replicas, rollout_id, production_min
 ):
+    monkeypatch.setattr(config, "MAIN_MIN_CONTAINERS", production_min)
     monkeypatch.setenv("DEEPINFER_ROLLOUT_ID", rollout_id)
     captured = {}
 
@@ -357,7 +359,9 @@ def test_modal_private_four_gpu_autoscaling_contract(
         sys.modules.pop(name, None)
     assert captured["server"]["gpu"] == "B200:4"
     assert captured["server"]["memory"] == 524288
-    assert captured["server"]["min_containers"] == (warm_replicas if rollout_id else 0)
+    assert captured["server"]["min_containers"] == (
+        max(production_min, warm_replicas if rollout_id else 0) if environment == "main" else 0
+    )
     assert captured["server"]["max_containers"] == (
         (8 if rollout_id else 4) if environment == "main" else 1
     )

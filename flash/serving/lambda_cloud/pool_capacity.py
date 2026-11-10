@@ -4,7 +4,7 @@ import logging
 import math
 import time
 
-from flash.serving.app.inference_provider import lambda_models, policy_for
+from flash.serving.app.inference_provider import lambda_models, minimum_for, policy_for
 from flash.serving.app.rollout import model_engine_name
 from flash.serving.src.engine.model_config import engine_overrides_for
 
@@ -91,7 +91,7 @@ class SharedCapacity:
         desired = min(
             policy.max_capacity,
             max(
-                policy.min_capacity,
+                minimum_for(model, self.fleet.environment),
                 int(recent_demand),
                 math.ceil(inputs / sequence_capacity(model)),
             ),

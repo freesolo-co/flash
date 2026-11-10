@@ -5,6 +5,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
+from flash.serving.app.inference_provider import lambda_models, policy_for
 from flash.serving.lambda_cloud.config import NoCapacityError
 from flash.serving.lambda_cloud.pool_capacity import SharedCapacity, sequence_capacity
 
@@ -30,7 +31,9 @@ def pool(runners=0, running=0, backlog=0):
 def controller(ready=0, modal_runners=0, running=0):
     primary, fallback = pool(), pool(modal_runners, running)
     fleet = SimpleNamespace(
-        ready_count=AsyncMock(return_value=ready), allocated_count=AsyncMock(return_value=ready)
+        environment="main",
+        ready_count=AsyncMock(return_value=ready),
+        allocated_count=AsyncMock(return_value=ready),
     )
     fleet.allocated_count.side_effect = lambda model, exclude_revision=None: (
         0 if exclude_revision is not None else fleet.allocated_count.return_value
@@ -313,3 +316,32 @@ async def test_rolling_activation_routes_by_new_revision_but_budgets_all_workers
     ledger.data["2"]["ready_at"] = 0  # An unhealthy old worker still consumes budget.
     await control.before_launch(MODEL, new, allocated=3)
     assert await fleet.allocated_count(MODEL) == 3
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("model", lambda_models())
+async def test_dev_cold_start_demand_and_return_to_zero(model):
+    control, primary, fallback = controller()
+    control.fleet.environment = "dev"
+    control.clock = lambda: 1000
+    await control.activate(REVISION)
+    await control.reconcile_model(model)
+    assert primary.update_autoscaler.aio.await_args.kwargs["min_containers"] == 0
+    with pytest.raises(NoCapacityError, match="idle"):
+        await control.before_launch(model, REVISION, allocated=0)
+
+    assert await control.choose(model) == "modal"
+    await control.before_launch(model, REVISION, allocated=0)
+    assert primary.update_autoscaler.aio.await_args.kwargs["min_containers"] == 1
+    maximum = policy_for(model).max_capacity
+    fallback.health.get_current_stats.aio.return_value.backlog = maximum * sequence_capacity(model)
+    control.clock = lambda: 1201
+    await control.reconcile_model(model)
+    assert primary.update_autoscaler.aio.await_args.kwargs["min_containers"] == maximum
+    # Capacity retries continue while demand exists, even after the recent-request window.
+    await control.reconcile_model(model)
+    assert primary.update_autoscaler.aio.await_args.kwargs["min_containers"] == maximum
+    fallback.health.get_current_stats.aio.return_value.backlog = 0
+    await control.reconcile_model(model)
+    assert primary.update_autoscaler.aio.await_args.kwargs["min_containers"] == 0
+    assert fallback.update_autoscaler.aio.await_args.kwargs["min_containers"] == 0
