@@ -826,7 +826,8 @@ def allocate(
         provider, gpu_type, gpu_type_fallbacks, max_gpu_count = allocation_shape(
             model_id, provider, providers, gpu_type, gpu_type_fallbacks, max_gpu_count
         )
-        providers = ()  # only Modal has a validated custom worker transport today.
+        # Modal (provider tunnel) and Spot (direct, pinned TLS) carry the custom session.
+        providers = ()
     sized_train = _overridden_train(train, overrides)
     # bound before the pinned-class checks below, which need it too: every question about a card
     # count in this function is asked through this one rule. see `_executed_width`.

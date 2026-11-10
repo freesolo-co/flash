@@ -318,11 +318,13 @@ class ApiClient:
         api_key: str | None = None,
         timeout: float = 60.0,
         key_source: str | None = None,
+        ssl_context=None,
     ):
         self.api_url = api_url.rstrip("/")
         self.api_key = api_key
         self.timeout = timeout
         self.key_source = key_source
+        self.ssl_context = ssl_context
 
     def _auth_headers(self) -> dict[str, str]:
         if self.api_key:
@@ -462,7 +464,10 @@ class ApiClient:
         with (
             self._translate_http_errors(deadline=deadline),
             _urlopen_no_redirect(
-                req, timeout=_capped_timeout(timeout or self.timeout, deadline), deadline=deadline
+                req,
+                timeout=_capped_timeout(timeout or self.timeout, deadline),
+                deadline=deadline,
+                ssl_context=self.ssl_context,
             ) as resp,
         ):
             raw = _read_response_body(
@@ -488,7 +493,9 @@ class ApiClient:
         )
         with (
             self._translate_http_errors(),
-            _urlopen_no_redirect(req, timeout=timeout or self.timeout) as resp,
+            _urlopen_no_redirect(
+                req, timeout=timeout or self.timeout, ssl_context=self.ssl_context
+            ) as resp,
         ):
             if max_bytes is not None:
                 return _read_capped_response(resp, max_bytes)

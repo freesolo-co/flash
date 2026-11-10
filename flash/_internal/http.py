@@ -77,6 +77,7 @@ def _urlopen_no_redirect(
     timeout: float,
     urlopen: _UrlOpen | None = None,
     deadline: float | None = None,
+    ssl_context=None,
 ):
     """open one authenticated request through a transport that refuses redirects.
 
@@ -103,5 +104,8 @@ def _urlopen_no_redirect(
     if deadline is not None:
         from flash._internal.http_deadline import deadline_handlers
 
-        handlers.extend(deadline_handlers(deadline))
+        handlers.extend(deadline_handlers(deadline, context=ssl_context))
+    elif ssl_context is not None:
+        # A pinned trust anchor (e.g. a custom session's per-attempt certificate).
+        handlers.append(urllib.request.HTTPSHandler(context=ssl_context))
     return urllib.request.build_opener(*handlers).open(request, timeout=timeout)

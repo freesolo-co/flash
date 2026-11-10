@@ -84,8 +84,11 @@ def connect(api, run_id, *, timeout=1200, sleep=time.sleep, clock=time.monotonic
         try:
             connection = api._request("GET", f"/v1/runs/{run_id}/custom")
             try:
+                # A Spot worker is reached directly and pins its per-attempt certificate; a Modal
+                # tunnel terminates public TLS, so its connection carries none.
+                pinned = {"tls_cert": connection["tls_cert"]} if connection.get("tls_cert") else {}
                 client = TrainingClient(
-                    connection["url"], api_key=connection["api_key"], timeout=10
+                    connection["url"], api_key=connection["api_key"], timeout=10, **pinned
                 )
                 client._http.timeout = 300
                 client.run_id = run_id
@@ -110,6 +113,45 @@ def connect(api, run_id, *, timeout=1200, sleep=time.sleep, clock=time.monotonic
                     )
         sleep(max(0.0, min(delay, deadline - clock())))
     raise TimeoutError(f"custom run {run_id} did not become ready ({last})")
+
+
+# Spot attempts are replaced after preemption; each replacement is a new worker session.
+MAX_SPOT_RECONNECTS = 50
+
+
+def first_connect_timeout(spec):
+    """How long to wait for the first session before cancelling the run.
+
+    Modal provisions promptly, so a stuck launch is cut off after 20 minutes. A Spot run can
+    legitimately wait longer: it queues while prices exceed the cap and may be preempted and
+    replaced before its first session starts, all within the run's own wall-clock deadline.
+    """
+    wall = spec.custom["max_wall_seconds"]
+    return wall if spec.gpu.spot else min(1200, wall)
+
+
+def replacement_session(api, run_id, previous, *, timeout, connect=connect):
+    """A newer attempt's session after the current one failed, or None if it is still the same.
+
+    The same session answering means the worker is healthy and the failure came from the
+    algorithm itself, which must not be retried. A different session id means Flash replaced
+    the attempt (Spot preemption) and restored the run's newest durable checkpoint.
+    """
+    try:
+        client = connect(api, run_id, timeout=timeout)
+    except ClientError:
+        return None  # the run ended (409) or never came back within its remaining time
+    if client.session_id == previous.session_id:
+        return None
+    return client
+
+
+def _run_entry(entry, client):
+    if inspect.iscoroutinefunction(entry):
+        asyncio.run(_run_async(entry, client))
+    else:
+        entry(client)
+        client.close()
 
 
 def run_custom(args, spec, authored_train_keys):
@@ -166,13 +208,35 @@ def run_custom(args, spec, authored_train_keys):
             file=sys.stderr,
         )
         try:
-            client = connect(api, run_id, timeout=min(1200, spec.custom["max_wall_seconds"]))
+            client = connect(api, run_id, timeout=first_connect_timeout(spec))
             client.config = spec.to_dict()
-            if inspect.iscoroutinefunction(entry):
-                asyncio.run(_run_async(entry, client))
-            else:
-                entry(client)
-                client.close()
+            started = time.monotonic()
+            reconnects = 0
+            while True:
+                try:
+                    _run_entry(entry, client)
+                    break
+                except Exception as error:
+                    remaining = spec.custom["max_wall_seconds"] - (time.monotonic() - started)
+                    if not spec.gpu.spot or reconnects >= MAX_SPOT_RECONNECTS or remaining <= 0:
+                        raise
+                    print(
+                        f"custom session lost ({error}); waiting for a replacement Spot attempt",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                    replacement = replacement_session(api, run_id, client, timeout=remaining)
+                    if replacement is None:
+                        raise
+                    reconnects += 1
+                    replacement.config = spec.to_dict()
+                    print(
+                        f"reconnected to {run_id} at step {replacement.step}; "
+                        "running main(client) again from its restored state",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                    client = replacement
         except BaseException:
             # a local exception is a cancelled run, never a falsely successful worker close.
             api.cancel_run(run_id)
