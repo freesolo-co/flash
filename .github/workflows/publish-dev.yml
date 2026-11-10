@@ -51,7 +51,7 @@ jobs:
 
       # tomllib is stdlib only since 3.11; pin the interpreter before the metadata step below.
       - name: Set up Python
-        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: "3.11"
 
@@ -120,7 +120,7 @@ jobs:
 
       - name: Install uv
         if: steps.decide.outputs.publish == 'true'
-        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
         with:
           # pin the installed binary as well as the action implementation.
           version: "0.12.5"
