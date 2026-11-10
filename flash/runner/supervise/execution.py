@@ -20,6 +20,9 @@ from flash.runner.supervise.retry_decision import (
     _managed_cache_mounted,
 )
 
+# Seconds between Spot requeues after a provider capacity refusal (the price queue polls at 60 s).
+SPOT_CAPACITY_REQUEUE_SECONDS = 60.0
+
 
 @dataclass
 class _SubmitContext:
@@ -385,6 +388,7 @@ def _submit_provider(ctx: _SubmitContext, prepared, candidate_plan):
     claim, _, attempt_runtime_secrets, _ = prepared
     _, chosen, _, run_spec = candidate_plan
     from flash.providers.core.base import (
+        CapacityUnavailableError,
         PollResult,
         UnreconciledCreateError,
     )
@@ -410,6 +414,18 @@ def _submit_provider(ctx: _SubmitContext, prepared, candidate_plan):
         return provider.submit_attempt(run_spec, **submit_kwargs), False
     except _TerminalHandleRace:
         raise
+    except CapacityUnavailableError as exc:
+        # The provider definitively refused the create (quota/capacity) and nothing was provisioned:
+        # an allocation-shaped outcome, not an ambiguous launch. The retry plan decides whether to
+        # requeue (Spot) or move on.
+        return (
+            PollResult(
+                False,
+                failure="no_capacity",
+                detail=f"provider refused the create for capacity ({type(exc).__name__})",
+            ),
+            True,
+        )
     except Exception as exc:
         if isinstance(exc, UnreconciledCreateError):
             return (
@@ -542,6 +558,10 @@ def _handle_failure(ctx: _SubmitContext, prepared, outcome):
     retry_delay = (
         _retry_delay(ctx, plan.infra_retry_ordinal) if plan.retry and candidate_not_started else 0.0
     )
+    if plan.retry and result.failure == "no_capacity" and getattr(chosen, "provider", "") == "spot":
+        # Wait like the Spot price queue instead of hammering a provider that just said no.
+        remaining = _load_run_deadline_at(ctx.spec.run_id) - time.time()
+        retry_delay = max(retry_delay, min(SPOT_CAPACITY_REQUEUE_SECONDS, max(0.0, remaining)))
     print(
         f"attempt={claim.attempt} failed ({result.failure}); {plan.action}"
         f"\n--- failure detail ---\n{(result.detail or '')[:2000]}\n---",

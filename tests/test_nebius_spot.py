@@ -315,6 +315,147 @@ def test_allocation_price_wait_does_not_consume_attempts(monkeypatch):
     assert len(checks) >= 60
 
 
+@pytest.mark.parametrize(
+    ("stderr", "code"),
+    [
+        (b"Error: rpc error: code = ResourceExhausted desc = quota exceeded", "ResourceExhausted"),
+        (b'{"code": "RESOURCE_EXHAUSTED", "message": "no capacity"}', "ResourceExhausted"),
+        (b"operation failed: not enough resources in zone", "ResourceExhausted"),
+        (b"Quota limit for gpu-h100 reached", "ResourceExhausted"),
+        (b"rpc error: code = InvalidArgument desc = bad preset", "InvalidArgument"),
+        (b"connection reset by peer", ""),
+        (b"", ""),
+    ],
+)
+def test_cli_errors_keep_only_a_definitive_status_name(monkeypatch, stderr, code):
+    import subprocess
+
+    def run(command, **kwargs):
+        raise subprocess.CalledProcessError(1, command, output=b"", stderr=stderr + b" key=SECRET")
+
+    monkeypatch.setattr(api.subprocess, "run", run)
+    with pytest.raises(api.NebiusApiError) as raised:
+        api.call("compute", "instance", "create", body={"secret": "SECRET"})
+    assert raised.value.code == code
+    assert "SECRET" not in str(raised.value)
+
+
+def test_timeouts_stay_ambiguous(monkeypatch):
+    import subprocess
+
+    def run(command, **kwargs):
+        raise subprocess.TimeoutExpired(command, 60, stderr=b"code = ResourceExhausted")
+
+    monkeypatch.setattr(api.subprocess, "run", run)
+    with pytest.raises(api.NebiusApiError) as raised:
+        api.call("compute", "instance", "list")
+    assert raised.value.code == ""
+
+
+def _create(monkeypatch, failure, instances=()):
+    monkeypatch.setattr(
+        api, "settings", lambda: {"project_id": "p", "subnet_id": "s", "image_id": "image"}
+    )
+    monkeypatch.setattr(api, "list_instances", lambda **kwargs: list(instances))
+    monkeypatch.setattr(api, "pricing_policy", lambda *args, **kwargs: "policy")
+    from flash.providers.nebius import bootstrap
+
+    monkeypatch.setattr(
+        bootstrap,
+        "publish_capsule",
+        lambda *a, **kw: {"url": "https://example.com/capsule", "sha256": "digest"},
+    )
+    calls = []
+
+    def fail(*args, **kwargs):
+        calls.append(args)
+        raise failure
+
+    monkeypatch.setattr(api, "call", fail)
+    payload = {"run_id": "flash-test", "attempt": 0, "job_spec_json": "{}", "source_snapshot": {}}
+    result = api.create(
+        name="flash-test-a0",
+        payload=payload,
+        image_reference="worker",
+        gpu="H100",
+        gpu_count=1,
+        capsule=b"capsule",
+        disk_gb=100,
+        deadline_at=time.time() + 100,
+    )
+    return result, calls
+
+
+def test_capacity_refused_create_requeues_instead_of_failing_the_run(monkeypatch):
+    # Reproduces the failure: a third concurrent Spot H100 create refused by Nebius quota used to
+    # raise UnreconciledCreateError and end the run ("not retrying").
+    from flash.providers.core.base import CapacityUnavailableError, UnreconciledCreateError
+
+    with pytest.raises(CapacityUnavailableError) as raised:
+        _create(monkeypatch, api.NebiusApiError("failed", code="ResourceExhausted"))
+    assert not isinstance(raised.value, UnreconciledCreateError)
+    assert "H100" in str(raised.value)
+
+
+def test_refused_create_still_returns_a_vm_that_exists(monkeypatch):
+    labels = {
+        "flash-owner": "flash-training",
+        "flash-run": "flash-test",
+        "flash-attempt": "0",
+        "flash-spec": __import__("hashlib").sha256(b"{}").hexdigest(),
+        "flash-source": __import__("hashlib").sha256(b"{}").hexdigest(),
+    }
+    vm = {"metadata": {"name": "flash-test-a0", "labels": labels, "id": "computeinstance-x"}}
+    calls = []
+
+    def list_instances(**kwargs):
+        calls.append(1)
+        # nothing before the create; the VM is visible when reconciling after the refusal
+        return [vm] if len(calls) > 1 else []
+
+    monkeypatch.setattr(api, "list_instances", list_instances)
+    from flash.providers.core.base import UnreconciledCreateError  # noqa: F401
+
+    monkeypatch.setattr(
+        api, "settings", lambda: {"project_id": "p", "subnet_id": "s", "image_id": "image"}
+    )
+    monkeypatch.setattr(api, "pricing_policy", lambda *args, **kwargs: "policy")
+    from flash.providers.nebius import bootstrap
+
+    monkeypatch.setattr(
+        bootstrap,
+        "publish_capsule",
+        lambda *a, **kw: {"url": "https://example.com/capsule", "sha256": "digest"},
+    )
+
+    def refuse(*args, **kwargs):
+        raise api.NebiusApiError("failed", code="ResourceExhausted")
+
+    monkeypatch.setattr(api, "call", refuse)
+    payload = {"run_id": "flash-test", "attempt": 0, "job_spec_json": "{}", "source_snapshot": {}}
+    assert (
+        api.create(
+            name="flash-test-a0",
+            payload=payload,
+            image_reference="worker",
+            gpu="H100",
+            gpu_count=1,
+            capsule=b"capsule",
+            disk_gb=100,
+            deadline_at=time.time() + 100,
+        )
+        == "computeinstance-x"
+    )
+
+
+@pytest.mark.parametrize("code", ["", "InvalidArgument", "PermissionDenied"])
+def test_non_capacity_failures_remain_unreconciled(monkeypatch, code):
+    from flash.providers.core.base import UnreconciledCreateError
+
+    with pytest.raises(UnreconciledCreateError):
+        _create(monkeypatch, api.NebiusApiError("failed", code=code))
+
+
 def test_ambiguous_create_is_not_blindly_retried(monkeypatch):
     from flash.providers.core.base import UnreconciledCreateError
 

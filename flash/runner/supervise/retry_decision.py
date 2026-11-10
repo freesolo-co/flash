@@ -315,6 +315,16 @@ def transition_failure(
     if failure == "job_preempted":
         state, plan = _spot_preemption_plan(state, chosen)
         return _finish(state, plan, observation, attempt)
+    if failure == "no_capacity" and chosen is not None and chosen.provider == "spot":
+        # Spot refused the create for quota/capacity before provisioning anything. Like an
+        # eviction, wait for the same shape: cancellation and the run deadline bound it, not the
+        # failure budget, and a larger (pricier) GPU is never substituted.
+        return _finish(
+            replace(state, cache_retry_shape=None),
+            RetryPlan(True, "requeuing spot capacity (provider refused the create)"),
+            observation,
+            attempt,
+        )
     if failure not in CANDIDATE_RETRY_FAILURES:
         return _finish(state, RetryPlan(False, "not retrying"), observation, attempt)
     if chosen is None:

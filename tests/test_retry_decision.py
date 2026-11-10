@@ -269,6 +269,38 @@ def test_spot_preemption_reuses_shape_without_spending_infrastructure_budget(bud
         assert current.select_candidate((chosen,))[1] == chosen
 
 
+@pytest.mark.parametrize("cache", [False, True])
+@pytest.mark.parametrize("budget", [0, 2, 5])
+def test_spot_capacity_refusal_requeues_same_shape_without_spending_budget(budget, cache):
+    # Nebius refusing a Spot create for quota/capacity used to end the run (UnreconciledCreateError).
+    chosen = _candidate("spot", "H100", 80)
+    larger = _candidate("spot", "H200", 141)
+    current = replace(RetryState(budget, 2, 1), usable_vram_floor=24)
+    for attempt in range(budget + 3):
+        current, plan = transition_failure(
+            current, _observe("no_capacity", chosen, (chosen, larger), cache=cache), attempt=attempt
+        )
+        assert plan.retry
+        assert plan.infra_retry_ordinal is None
+        assert "requeuing spot capacity" in plan.action
+        assert current.infra_used == 0
+        assert not current.drop_weight_cache
+        assert current.usable_vram_floor == 24
+        assert current.select_candidate((chosen, larger))[1] == chosen
+
+
+def test_modal_no_capacity_keeps_existing_policy():
+    chosen = _candidate("modal", "H100", 80)
+    larger = _candidate("modal", "H200", 141)
+    current, plan = transition_failure(
+        RetryState(2, 2, 1), _observe("no_capacity", chosen, (chosen, larger)), attempt=0
+    )
+    assert plan.retry
+    assert plan.infra_retry_ordinal == 1
+    assert current.infra_used == 1
+    assert "strictly larger" in plan.action
+
+
 def test_spot_preemption_persists_authorization_for_replacement(monkeypatch, tmp_path):
     from flash.runner.supervise.retry_decision import require_retry_authorization_from_raw
 
