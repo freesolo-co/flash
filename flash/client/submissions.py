@@ -57,11 +57,29 @@ def submit_run(
     path = f"/v1/run-submissions/{submission_id}"
     give_up = clock() + deadline_seconds
     transport_failures = 0
+    may_have_submitted = False
+    uncertain_detail = (
+        f"submission {submission_id} was not confirmed. It may still create a "
+        "run: check `flash runs list` before submitting again"
+    )
     while True:
+        remaining = give_up - clock()
+        if remaining <= 0:
+            raise RequestTimeoutError(uncertain_detail)
         try:
-            return client._request("PUT", path, body=body, require={"run_id": str})
+            return client._request(
+                "PUT",
+                path,
+                body=body,
+                require={"run_id": str},
+                timeout=min(client.timeout, remaining),
+                body_deadline=remaining,
+            )
         except ApiError as exc:
             if _route_missing(exc):
+                # A rollback can remove the route while an earlier PUT still creates its run.
+                if may_have_submitted:
+                    raise RequestTimeoutError(uncertain_detail) from exc
                 return None
             if _in_progress(exc):
                 transport_failures, wait = 0, IN_PROGRESS_WAIT_SECONDS
@@ -73,9 +91,7 @@ def submit_run(
         except (RequestTimeoutError, ServiceUnreachableError) as exc:
             # the request may still be running server-side; re-sending the same ID attaches to it.
             transport_failures, wait, last = transport_failures + 1, TRANSPORT_WAIT_SECONDS, exc
-        if transport_failures > MAX_CONSECUTIVE_TRANSPORT_FAILURES or clock() + wait > give_up:
-            raise RequestTimeoutError(
-                f"submission {submission_id} was not confirmed ({last}). It may still create a "
-                "run: check `flash runs list` before submitting again"
-            ) from last
+        may_have_submitted = True
+        if transport_failures > MAX_CONSECUTIVE_TRANSPORT_FAILURES or clock() + wait >= give_up:
+            raise RequestTimeoutError(uncertain_detail) from last
         sleep(wait)

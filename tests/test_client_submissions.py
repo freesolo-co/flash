@@ -20,11 +20,14 @@ class _Plane:
     """Scripted control plane: each _request call pops the next outcome."""
 
     def __init__(self, *outcomes):
+        self.timeout = 60.0
+        self.request_options: list[dict] = []
         self.outcomes = list(outcomes)
         self.calls: list[tuple[str, str, dict | None]] = []
 
     def _request(self, method, path, body=None, **_kwargs):
         self.calls.append((method, path, body))
+        self.request_options.append(_kwargs)
         outcome = self.outcomes.pop(0)
         if isinstance(outcome, Exception):
             raise outcome
@@ -127,3 +130,69 @@ def test_dry_runs_stay_on_post(monkeypatch):
     assert plane.calls == [
         ("POST", "/v1/runs", {"spec": {"model": "m", "project": _PROJECT_ID}, "dry_run": True})
     ]
+
+
+@pytest.mark.parametrize(
+    "first",
+    [
+        RequestTimeoutError("timed out"),
+        ServiceUnreachableError("connection dropped"),
+        ApiError(502, "gateway"),
+        ApiError(503, "unavailable"),
+        ApiError(504, "gateway timeout"),
+        _in_progress(),
+    ],
+)
+@pytest.mark.parametrize(("status", "detail"), [(404, "Not Found"), (405, "Method Not Allowed")])
+def test_ambiguous_submission_never_falls_back_to_post(monkeypatch, first, status, detail):
+    from flash.client import submissions
+
+    client = ApiClient("http://plane.invalid", "fslo-user-test")
+    plane = _Plane(first, ApiError(status, detail, detail=detail), _CREATED)
+    monkeypatch.setattr(client, "_request", plane._request)
+    monkeypatch.setattr(
+        submissions,
+        "submit_run",
+        lambda client, body: submit_run(client, body, sleep=lambda _s: None),
+    )
+    with pytest.raises(RequestTimeoutError, match="may still create a run") as error:
+        client.create_run({"model": "m", "project": _PROJECT_ID})
+    assert [method for method, _, _ in plane.calls] == ["PUT", "PUT"]
+    assert plane.calls[0][1] == plane.calls[1][1]
+    assert plane.calls[0][1].rsplit("/", 1)[1] in str(error.value)
+
+
+def test_requests_use_remaining_deadline_and_configured_timeout():
+    now = [0.0]
+    plane = _Plane(_in_progress(), _CREATED)
+    plane.timeout = 25 * 60.0
+
+    def sleep(seconds):
+        now[0] += seconds
+
+    assert submit_run(plane, {}, deadline_seconds=12, sleep=sleep, clock=lambda: now[0]) == _CREATED
+    assert [(o["timeout"], o["body_deadline"]) for o in plane.request_options] == [(12, 12), (2, 2)]
+    short = _Plane(_CREATED)
+    short.timeout = 1
+    submit_run(short, {}, deadline_seconds=12, clock=lambda: 0)
+    assert short.request_options[0]["timeout"] == 1
+    assert short.request_options[0]["body_deadline"] == 12
+
+
+def test_no_request_starts_after_deadline_even_if_sleep_overshoots():
+    now = [0.0]
+    plane = _Plane(_in_progress(), _CREATED)
+
+    def sleep(_seconds):
+        now[0] = 20
+
+    with pytest.raises(RequestTimeoutError, match="may still create a run"):
+        submit_run(plane, {}, deadline_seconds=15, sleep=sleep, clock=lambda: now[0])
+    assert len(plane.calls) == 1
+
+
+def test_expired_deadline_does_not_send_a_request():
+    plane = _Plane(_CREATED)
+    with pytest.raises(RequestTimeoutError):
+        submit_run(plane, {}, deadline_seconds=0)
+    assert plane.calls == []
