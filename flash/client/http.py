@@ -617,6 +617,14 @@ class ApiClient:
             body["dry_run"] = True
         if client_train_schema is not None:
             body["client_train_schema"] = client_train_schema
+        if not dry_run:
+            # paid runs go through the idempotent submission route, so a submit that outlives
+            # one request (dataset profiling can take minutes) is retried without a second run.
+            from flash.client.submissions import submit_run
+
+            created = submit_run(self, body)
+            if created is not None:
+                return created
         return self._request("POST", "/v1/runs", body=body, require={"run_id": str})
 
     def list_runs(self) -> list[dict]:

@@ -346,6 +346,27 @@ def test_registered_token_id_rejects_ambiguous_hf_tokenizers(tokenizer):
         _registered_token_id(tokenizer, IMAGE_PAD_TOKEN)
 
 
+def test_registered_token_id_reads_the_vocabulary_once_per_tokenizer(monkeypatch):
+    # profiling asks once per image row; copying a ~250k-entry vocabulary each time made a
+    # 4k-row image dataset's submit take minutes in the shared control plane.
+    tokenizer = _minimal_hf_tokenizer(with_image_token=True)
+    calls = []
+    real = tokenizer.get_vocab
+    monkeypatch.setattr(tokenizer, "get_vocab", lambda: calls.append(1) or real())
+    assert [_registered_token_id(tokenizer, IMAGE_PAD_TOKEN) for _ in range(50)] == [1] * 50
+    assert len(calls) == 1
+    # a different tokenizer object is checked on its own.
+    assert _registered_token_id(_minimal_hf_tokenizer(with_image_token=True), IMAGE_PAD_TOKEN) == 1
+
+
+def test_registered_token_id_never_caches_a_rejection():
+    tokenizer = _minimal_hf_tokenizer(with_image_token=True, tokenizer_type=_InvalidIdTokenizer)
+    tokenizer.invalid_id = -1
+    for _ in range(2):
+        with pytest.raises(ValueError, match=r"exact token"):
+            _registered_token_id(tokenizer, IMAGE_PAD_TOKEN)
+
+
 @pytest.mark.parametrize("invalid_id", [True, "1", -1])
 def test_registered_token_id_rejects_invalid_id_shapes(invalid_id):
     tokenizer = _minimal_hf_tokenizer(
