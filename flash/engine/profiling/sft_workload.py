@@ -21,6 +21,13 @@ from flash.engine.profiling.sft_image_rows import (
     estimate_sft_image_row,
     process_sft_image_row,
 )
+from flash.engine.profiling.sft_reasoning import (
+    _encoded_length,
+    _require_reasoning_when_thinking,
+    _require_rendered_reasoning,
+    _row_reasoning,
+    _RowReasoning,
+)
 from flash.engine.profiling.sft_rows import (
     _pretokenize_completion_only,
     _reject_image_completion,
@@ -30,16 +37,10 @@ from flash.engine.profiling.sft_rows import (
 from flash.engine.profiling.workload_profile import (
     SftWorkloadProfile,
     horizon_row_count,
-    marked_reasoning_end,
-    reasoned_assistant_turns,
-    reasoning_marker_prefix,
-    reasoning_markers,
     reasoning_warning_rows,
     rendered_reasoning_loss_warning,
     sft_sample_policy,
-    strip_reasoning_markers,
     unpacked_batch_warning,
-    with_marked_reasoning,
 )
 from flash.engine.worker.model.packing import (
     gdn_packing_contract_available,
@@ -337,103 +338,6 @@ def _sft_completion_with_provenance(env, example: dict) -> tuple[list[dict], boo
     return env.sft_completion(example), False
 
 
-def _require_reasoning_when_thinking(prompt_rows) -> None:
-    """Reject a thinking SFT whose rows open their answer without authored reasoning.
-
-    With thinking on, serving pre-opens ``<think>\\n`` and the model generates from there. A target
-    with no reasoning renders an empty ``<think>\\n\\n</think>`` block, and encoding the row merges
-    that seam into one ``\\n\\n`` token, so training never sees the served ``<think>`` ``\\n`` context
-    and the adapter drifts at the start of every answer (answers written inside the think block, or
-    empty answers after ``</think>``). It also teaches the model to skip thinking, which defeats the
-    setting. Targets with reasoning tokenize cleanly at the same seam, so the row's first assistant
-    turn must author some.
-    """
-    missing = 0
-    for _example, _prompt, completion, _coerced in prompt_rows:
-        first = next((m for m in completion if m.get("role") == "assistant"), None)
-        if first is not None and not reasoned_assistant_turns([first]):
-            missing += 1
-    if missing:
-        raise ValueError(
-            f"thinking = true, but {missing} of {len(prompt_rows)} selected SFT rows have no "
-            "reasoning in their first assistant turn. Thinking SFT needs reasoning in the targets "
-            "(reasoning_content, or a <think>...</think> span before the answer); otherwise set "
-            "thinking = false."
-        )
-
-
-def _encoded_length(tokenizer, text: str) -> int:
-    """Token count of ``text``, for either the batched or unbatched ``input_ids`` shape.
-
-    A tokenizer handed a single string may answer with one id list or with a batch holding one
-    row. Reading ``len()`` off the batch would count ROWS -- always 1 -- and silently declare every
-    span to be within the cap.
-    """
-    ids = tokenizer(text)["input_ids"]
-    if ids and isinstance(ids[0], list):
-        ids = ids[0]
-    return len(ids)
-
-
-@dataclass(frozen=True)
-class _RowReasoning:
-    """One row's reasoning accounting, with the two causes of loss kept apart.
-
-    They have opposite remedies: reasoning the TEMPLATE dropped is fixed by splitting a K-turn
-    transcript into K single-turn rows, while reasoning the CAP cut is fixed by raising
-    ``max_context_tokens``. Folding both into one survivor count makes the warning prescribe
-    restructuring for a dataset whose only problem is that the row is too long.
-    """
-
-    authored_turns: int
-    rendered_spans: int
-    truncated_spans: int
-
-
-def _row_reasoning(
-    prompt_messages: list[dict],
-    completion_messages: list[dict],
-    *,
-    render: Callable[[list[dict]], str],
-    tokenizer,
-    max_length: int,
-) -> _RowReasoning:
-    """One row's authored reasoning, and how much of it reaches the loss.
-
-    The row is rendered once with each reasoning-authoring turn's reasoning marked. A turn survives
-    exactly when its marker reaches the render: a marker rides only inside text the template chose
-    to keep as THIS turn's reasoning, so a ``<think>`` an answer merely quotes carries none and a
-    span in a system or user message -- never supervised, since the split is assistant-only -- cannot
-    be credited either. Counting rendered tags instead gets both wrong, and scores the total-loss
-    case as one survivor because the template injects an empty block on trailing assistant turns.
-
-    A survivor also has to fit inside ``max_length``: the cap slices the token row, so a block past
-    it never reaches the loss. Truncation is judged per turn rather than per row, because the cap
-    usually cuts the answer tail while leaving an earlier reasoning block whole.
-
-    Markers are stripped before measuring, so the length charged against the cap is the real render's
-    rather than one inflated by the measurement's own bytes.
-    """
-    authored = reasoned_assistant_turns(completion_messages)
-    if not authored:
-        # nothing authored means nothing to lose, and the marked render would equal the full one.
-        # skipped rather than rendered so a dataset with no reasoning pays nothing for this check.
-        return _RowReasoning(0, 0, 0)
-    prefix = reasoning_marker_prefix(render([*prompt_messages, *completion_messages]))
-    marked = render([*prompt_messages, *with_marked_reasoning(completion_messages, prefix)])
-    rendered = 0
-    truncated = 0
-    for marker in reasoning_markers(completion_messages, prefix):
-        end = marked_reasoning_end(marked, marker)
-        if end is None:
-            continue
-        rendered += 1
-        through = strip_reasoning_markers(marked[:end], prefix)
-        if _encoded_length(tokenizer, through) > max_length:
-            truncated += 1
-    return _RowReasoning(authored, rendered, truncated)
-
-
 def _text_sft_row_spec(
     spec,
     prompt_messages: list[dict],
@@ -595,6 +499,8 @@ def _tokenize_prompt_rows(
             sampled_texts.append(text)
             reasoning_by_index[row_index] = reasoning
             text_specs.append(text_spec)
+        if spec.thinking:
+            _require_rendered_reasoning(reasoning_by_index[row_index], row_index=row_index)
 
     dropped = 0
     if text_specs:

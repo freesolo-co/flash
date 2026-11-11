@@ -627,9 +627,13 @@ class ThinkingEnvironment(FakeEnvironment):
 
 
 def _thinking_prepared_env(
-    env, *, max_context_tokens=512, max_steps=None, model=None, processor_loader=None
+    env, *, max_context_tokens=512, max_steps=None, model=None, processor_loader=None, thinking=True
 ):
-    """Profile ``env`` through the thinking tokenizer, for a test supplying its own transcript."""
+    """Profile a transcript through the thinking-layout tokenizer.
+
+    Accounting tests pass thinking=False to inspect lossy renders without opting into the strict
+    thinking-SFT contract. The fake intentionally renders the same layout in either mode.
+    """
     train = replace(_spec().train, max_context_tokens=max_context_tokens, max_examples=0)
     if max_steps is not None:
         train = replace(train, max_steps=max_steps)
@@ -638,7 +642,7 @@ def _thinking_prepared_env(
         spec = replace(spec, model=model)
     spec = replace(
         spec,
-        thinking=True,
+        thinking=thinking,
         workload_profile_input_digest=sft_profile_input_digest(
             spec,
             tokenizer_revision=spec.model_revision,
@@ -656,9 +660,11 @@ def _thinking_prepared_env(
     )
 
 
-def _thinking_prepared(completion, prompt="board", *, max_context_tokens=512):
+def _thinking_prepared(completion, prompt="board", *, max_context_tokens=512, thinking=True):
     return _thinking_prepared_env(
-        ThinkingEnvironment(completion, prompt=prompt), max_context_tokens=max_context_tokens
+        ThinkingEnvironment(completion, prompt=prompt),
+        max_context_tokens=max_context_tokens,
+        thinking=thinking,
     )
 
 
@@ -671,13 +677,13 @@ _MULTITURN_TARGET = [
 ]
 
 
-def test_a_multiturn_thinking_target_warns_that_the_template_ate_its_reasoning(capsys) -> None:
+def test_reasoning_loss_still_warns_when_thinking_is_disabled(capsys) -> None:
     """The defect: 3 authored reasoning blocks, 1 trained on, and nothing said so. A green ``flash
     env test`` and a correct-looking dataset both survive it, because the stored messages are never
     wrong -- only the render is. The warning names how much was lost, since "some reasoning was
     dropped" cannot be acted on.
     """
-    prepared = _thinking_prepared(_MULTITURN_TARGET)
+    prepared = _thinking_prepared(_MULTITURN_TARGET, thinking=False)
 
     assert prepared.authored_reasoning_turns == 3
     assert prepared.rendered_reasoning_spans == 1
@@ -699,6 +705,58 @@ def test_a_final_position_thinking_target_keeps_its_reasoning_and_stays_quiet(ca
     assert "authored reasoning blocks" not in capsys.readouterr().err
 
 
+def test_thinking_rejects_partial_template_reasoning_loss() -> None:
+    with pytest.raises(ValueError, match="chat template dropped 2 of 3") as error:
+        _thinking_prepared(_MULTITURN_TARGET)
+    assert "K single-turn rows" in str(error.value)
+    assert "prompt_messages" in str(error.value)
+
+
+@pytest.mark.parametrize("middle_role", ["user", "tool"])
+def test_thinking_rejects_a_reasoning_free_continuation(middle_role) -> None:
+    completion = [
+        {"role": "assistant", "reasoning_content": "first", "content": "a1"},
+        {"role": middle_role, "content": "next"},
+        {"role": "assistant", "content": "a2"},
+    ]
+    with pytest.raises(ValueError, match="completion message 3 has no reasoning"):
+        _thinking_prepared(completion)
+
+
+def test_thinking_keeps_reasoned_tool_continuations() -> None:
+    prepared = _thinking_prepared(
+        [
+            {"role": "assistant", "reasoning_content": "look it up", "content": "call"},
+            {"role": "tool", "content": "result"},
+            {"role": "assistant", "reasoning_content": "use the result", "content": "answer"},
+        ]
+    )
+    assert prepared.rendered_reasoning_spans == 2
+
+
+def test_thinking_accepts_split_transcripts_with_reasoning_in_each_target() -> None:
+    class SplitEnvironment(ThinkingEnvironment):
+        def dataset(self):
+            return [
+                {
+                    "prompt_messages": [
+                        {"role": "user", "content": "board"},
+                        *_MULTITURN_TARGET[:index],
+                    ],
+                    "completion": [message],
+                }
+                for index, message in enumerate(_MULTITURN_TARGET)
+                if message["role"] == "assistant"
+            ]
+
+        def sft_completion(self, row):
+            return row["completion"]
+
+    prepared = _thinking_prepared_env(SplitEnvironment([]))
+    assert len(prepared.rows) == 3
+    assert prepared.rendered_reasoning_spans == prepared.authored_reasoning_turns == 3
+
+
 def test_reasoning_stripped_to_nothing_is_not_read_as_one_surviving_block(capsys) -> None:
     """The trap that makes naive ``count("<think>")`` wrong, and it fires on the WORST input:
     reasoning on every turn but the last renders one EMPTY block, so counting raw opening tags
@@ -709,7 +767,8 @@ def test_reasoning_stripped_to_nothing_is_not_read_as_one_surviving_block(capsys
             {"role": "assistant", "content": "<think>first</think>a1"},
             {"role": "user", "content": "next"},
             {"role": "assistant", "content": "a2"},
-        ]
+        ],
+        thinking=False,
     )
 
     assert prepared.authored_reasoning_turns == 1
@@ -725,7 +784,7 @@ def test_a_thinking_sft_without_authored_reasoning_is_rejected() -> None:
     as ``\\n\\n`` while serving continues from ``<think>`` ``\\n``, so the adapter is trained off the
     served context. It must fail before any GPU work with a fix the author can apply.
     """
-    with pytest.raises(ValueError, match="no reasoning in their first assistant turn") as error:
+    with pytest.raises(ValueError, match="no reasoning in its assistant turn") as error:
         _thinking_prepared([{"role": "assistant", "content": "plain answer"}])
     assert "thinking = false" in str(error.value)
 
@@ -740,7 +799,8 @@ def test_reasoning_carried_in_reasoning_content_counts_as_authored(capsys) -> No
             {"role": "assistant", "content": "a1", "reasoning_content": "first"},
             {"role": "user", "content": "next"},
             {"role": "assistant", "content": "a2", "reasoning_content": "second"},
-        ]
+        ],
+        thinking=False,
     )
 
     assert prepared.authored_reasoning_turns == 2
@@ -759,7 +819,8 @@ def test_adjacent_empty_think_blocks_do_not_merge_into_one_survivor(capsys) -> N
             {"role": "user", "content": "next"},
             {"role": "assistant", "content": "a2"},
             {"role": "assistant", "content": "a3"},
-        ]
+        ],
+        thinking=False,
     )
 
     assert prepared.authored_reasoning_turns == 1
@@ -804,7 +865,8 @@ def test_a_think_span_in_the_prompt_does_not_offset_reasoning_lost_from_the_targ
                 {"role": "user", "content": "next"},
                 {"role": "assistant", "content": "a2"},
             ]
-        )
+        ),
+        thinking=False,
     )
 
     assert prepared.authored_reasoning_turns == 1
@@ -837,7 +899,7 @@ def test_reasoning_in_a_dropped_row_is_not_reported_against_the_retained_rows(ca
     # long row loses its completion to the cap while the short row keeps its block intact. a cap
     # under 87 would truncate the RETAINED row's reasoning too, and the warning it raised would
     # look like the dropped row leaking into the count while proving nothing about it.
-    prepared = _thinking_prepared_env(MixedEnvironment(), max_context_tokens=100)
+    prepared = _thinking_prepared_env(MixedEnvironment(), max_context_tokens=100, thinking=False)
 
     # the long row lost its whole completion to the cap and was dropped
     assert prepared.profile.dropped_examples == 1
@@ -858,7 +920,8 @@ def test_block_form_assistant_content_counts_as_authored_reasoning(capsys) -> No
             {"role": "assistant", "content": [{"type": "text", "text": "<think>first</think>a1"}]},
             {"role": "user", "content": "next"},
             {"role": "assistant", "content": [{"type": "text", "text": "<think>second</think>a2"}]},
-        ]
+        ],
+        thinking=False,
     )
 
     assert prepared.authored_reasoning_turns == 2
@@ -900,7 +963,8 @@ def test_an_answer_quoting_think_is_not_credited_when_reasoning_content_is_strip
                 "content": "answer shows <think>example</think> format",
                 "reasoning_content": "real reasoning",
             },
-        ]
+        ],
+        thinking=False,
     )
 
     assert prepared.authored_reasoning_turns == 2
@@ -926,7 +990,8 @@ def test_an_answer_quoting_think_tags_cannot_mask_turns_the_template_dropped(cap
                 "content": "quotes <think>x</think> and <think>y</think> here",
                 "reasoning_content": "real reasoning",
             },
-        ]
+        ],
+        thinking=False,
     )
 
     assert prepared.authored_reasoning_turns == 3
@@ -945,7 +1010,9 @@ def test_a_truncated_row_does_not_claim_reasoning_the_cap_removed(capsys) -> Non
         {"role": "user", "content": "next"},
         {"role": "assistant", "content": long_reasoning},
     ]
-    prepared = _thinking_prepared_env(ThinkingEnvironment(completion), max_context_tokens=64)
+    prepared = _thinking_prepared_env(
+        ThinkingEnvironment(completion), max_context_tokens=64, thinking=False
+    )
 
     # the row IS retained and IS truncated: it is trained on, with its reasoning cut away
     assert prepared.profile.retained_examples == 1
@@ -1089,7 +1156,7 @@ def test_an_empty_reasoning_field_is_authoritative_over_a_tag_the_answer_quotes(
             "content": "use <think>like this</think> in prompts",
         }
     ]
-    with pytest.raises(ValueError, match="no reasoning in their first assistant turn"):
+    with pytest.raises(ValueError, match="no reasoning in its assistant turn"):
         _thinking_prepared(completion)
 
 
@@ -1125,7 +1192,7 @@ def test_a_real_loss_is_reported_beside_a_surviving_turn(capsys) -> None:
                 {"role": "assistant", "reasoning_content": "late", "content": "a2"},
             ]
 
-    prepared = _thinking_prepared_env(KnownLossEnvironment([], prompt="board"))
+    prepared = _thinking_prepared_env(KnownLossEnvironment([], prompt="board"), thinking=False)
 
     assert prepared.authored_reasoning_turns == 2
     assert prepared.rendered_reasoning_spans == 1
@@ -1176,7 +1243,7 @@ def test_a_turn_index_is_terminated_so_turn_one_is_not_read_inside_turn_ten(caps
                     turns.append({"role": "user", "content": "next"})
             return turns
 
-    prepared = _thinking_prepared_env(ManyTurnEnvironment([], prompt="board"))
+    prepared = _thinking_prepared_env(ManyTurnEnvironment([], prompt="board"), thinking=False)
 
     # only the final turn sits after the last user message, so exactly one survives
     assert prepared.authored_reasoning_turns == 6
@@ -1217,7 +1284,7 @@ def test_reasoning_loss_is_measured_over_the_rows_the_horizon_reaches(capsys) ->
         spec = _rebuild_digest(
             replace(
                 base,
-                thinking=True,
+                thinking=False,
                 train=replace(
                     base.train, max_context_tokens=512, max_examples=0, max_steps=max_steps
                 ),
@@ -1304,7 +1371,7 @@ def test_reasoning_sampled_without_an_opening_tag_still_counts_as_authored(capsy
         {"role": "user", "content": "next"},
         {"role": "assistant", "content": "<think>late</think>a2"},
     ]
-    prepared = _thinking_prepared(completion)
+    prepared = _thinking_prepared(completion, thinking=False)
 
     # both turns authored reasoning, and the opener-less one is the turn the template strips
     assert prepared.authored_reasoning_turns == 2
@@ -1319,7 +1386,7 @@ def test_the_templates_own_empty_think_block_is_not_counted_as_authored() -> Non
     thinking row carrying only that block is rejected as reasoning-free.
     """
     completion = [{"role": "assistant", "content": "<think>\n\n</think>just an answer"}]
-    with pytest.raises(ValueError, match="no reasoning in their first assistant turn"):
+    with pytest.raises(ValueError, match="no reasoning in its assistant turn"):
         _thinking_prepared(completion)
 
 
@@ -1366,7 +1433,7 @@ def test_a_quoting_answer_on_a_dropped_turn_is_not_credited_as_a_survivor(capsys
         {"role": "user", "content": "next"},
         {"role": "assistant", "content": "<think>late</think>a2"},
     ]
-    prepared = _thinking_prepared_env(ThinkingEnvironment(completion))
+    prepared = _thinking_prepared_env(ThinkingEnvironment(completion), thinking=False)
 
     assert prepared.authored_reasoning_turns == 2
     # only the final turn's reasoning reaches the loss; the quoted tags are answer text
