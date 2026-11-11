@@ -2284,10 +2284,14 @@ def test_env_setup_scaffolds_grpo_and_sft_configs(monkeypatch, tmp_path, capsys)
     assert "## Common Flash issues and mitigations" in training_text
     assert "GPU selection is not what you expected" in training_text
     assert "response_text.thinking" in training_text
-    assert "Qwen3.5 thinking multi-turn SFT" in training_text
+    assert "Thinking SFT requires reasoning in every assistant target" in training_text
+    assert "assistant replies after tool results" in training_text
+    assert "conversation into K rows" in training_text
     assert "`grades_episodes = True`" in training_text
     assert "`score(case, response, state)`" in training_text
-    assert "longest shared token prefix" in training_text
+    assert (
+        "Flash rejects missing reasoning and reasoning removed during formatting" in training_text
+    )
     assert "flash env pull your-org/your-project/my-env" in training_text
     assert "private environment-scoped repo" in training_text
     assert 'project = "11111111-1111-4111-8111-111111111111"' in training_text

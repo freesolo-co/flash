@@ -59,6 +59,80 @@ def _render(tokenizer, messages):
     )
 
 
+@pytest.mark.parametrize("first_content_type", ["field", "input_text"])
+@pytest.mark.parametrize(
+    ("middle_role", "final_reasoning", "error"),
+    [
+        ("user", None, "no reasoning"),
+        ("tool", None, "no reasoning"),
+        ("user", "second", "chat template dropped 1 of 2"),
+        ("tool", "second", None),
+    ],
+)
+def test_thinking_sft_validates_real_rendered_targets(
+    tokenizer, middle_role, final_reasoning, error, first_content_type
+):
+    from dataclasses import replace
+
+    from flash.core.spec import EnvironmentSpec, JobSpec, TrainSpec
+    from flash.engine.profiling.sft_workload import prepare_sft_workload
+    from flash.engine.profiling.workload_profile import sft_profile_input_digest
+
+    class Environment:
+        package_root = None
+
+        def dataset(self):
+            return [{}]
+
+        def prompt_messages(self, row):
+            return [{"role": "user", "content": "question"}]
+
+        def sft_completion(self, row):
+            first = {"role": "assistant", "reasoning_content": "first", "content": "a1"}
+            if first_content_type == "input_text":
+                first = {
+                    "role": "assistant",
+                    "content": [{"type": "input_text", "text": "<think>first</think>a1"}],
+                }
+            return [
+                first,
+                {"role": middle_role, "content": "next"},
+                {"role": "assistant", "reasoning_content": final_reasoning, "content": "a2"},
+            ]
+
+    spec = JobSpec(
+        model=MODEL,
+        model_revision=REVISION,
+        algorithm="sft",
+        thinking=True,
+        environment=EnvironmentSpec(id="test/thinking", resolved_sha="a" * 40),
+        train=TrainSpec(batch_size=1, max_context_tokens=512),
+    )
+    spec = replace(
+        spec,
+        workload_profile_producer_version="1.4.29",
+        workload_profile_input_digest=sft_profile_input_digest(
+            spec, tokenizer_revision=REVISION, producer_version="1.4.29"
+        ),
+    )
+
+    def prepare():
+        return prepare_sft_workload(
+            spec,
+            Environment(),
+            tokenizer_loader=lambda *_: tokenizer,
+            producer_version="1.4.29",
+            allow_packing=False,
+        )
+
+    if error:
+        with pytest.raises(ValueError, match=error):
+            prepare()
+    else:
+        prepared = prepare()
+        assert prepared.rendered_reasoning_spans == prepared.authored_reasoning_turns == 2
+
+
 def _survivors(tokenizer, messages):
     """Which turns' reasoning the REAL template keeps, by the profiler's own marker procedure."""
     prefix = reasoning_marker_prefix(_render(tokenizer, messages))
