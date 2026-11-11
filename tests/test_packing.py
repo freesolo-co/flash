@@ -206,6 +206,73 @@ def test_pretokenize_completion_only_drops_empty_and_keeps_lockstep():
     assert all(len(r["completion_mask"]) == len(r["input_ids"]) for r in pretok)
 
 
+class _MergingTok(_FakeTok):
+    """Char-code ids, except a "\\n\\n" pair encodes as one token (id 1000), like Qwen's BPE."""
+
+    def __call__(self, rows, truncation=False, max_length=None, add_special_tokens=True):
+        out = []
+        for row in rows:
+            ids, i = ([1] if add_special_tokens else []), 0
+            while i < len(row):
+                if row.startswith("\n\n", i):
+                    ids.append(1000)
+                    i += 2
+                else:
+                    ids.append(ord(row[i]))
+                    i += 1
+            out.append(ids[:max_length] if truncation else ids)
+        return {"input_ids": out}
+
+
+def test_thinking_row_trains_on_the_served_prompt_tokens():
+    # A thinking template pre-opens "<think>\n"; an empty-reasoning target renders "<think>\n\n</think>".
+    # One whole-row encode merges the seam into "\n\n", so the row never contains the served prompt's
+    # trailing "\n" token and the model is never trained to continue from it.
+    from flash.engine.profiling.sft_rows import _pretokenize_completion_only
+
+    tok = _MergingTok(eos="!")
+    prompt, text = "P<\n", "P<\n\n>A"  # "<" ~ <think>, ">" ~ </think>
+    whole = tok([text + "!"])["input_ids"][0]
+    served = tok([prompt])["input_ids"][0]
+    assert whole[: len(served)] != served  # the defect: the served prompt is not a token prefix
+
+    rows, lengths = packing.tokenize_at_prompt_boundary([text], [prompt], tok, max_length=100)
+    assert rows[0] == [*served, ord("\n"), ord(">"), ord("A"), ord("!")]
+    assert lengths == [len(rows[0])]
+
+    _kept, pretok, dropped = _pretokenize_completion_only(
+        [
+            {
+                "text": text,
+                "prompt_text": prompt,
+                "target_messages": [],
+                "source_messages": [],
+                "template_kwargs": {},
+            }
+        ],
+        tok,
+        max_length=100,
+    )
+    assert dropped == 0
+    ids, mask = pretok[0]["input_ids"], pretok[0]["completion_mask"]
+    assert ids[: len(served)] == served
+    # exactly the served prompt is masked; everything the model must generate after it is supervised.
+    assert mask == [0] * len(served) + [1] * (len(ids) - len(served))
+
+
+def test_prompt_boundary_tokenization_caps_and_falls_back():
+    tok = _MergingTok(eos="!")
+    rows, lengths = packing.tokenize_at_prompt_boundary(
+        ["P<\n\n>A", "XY"], ["P<\n", "Z"], tok, max_length=4
+    )
+    # row 0 splits at its prompt and is capped; untruncated length is the uncapped split encode.
+    assert rows[0] == [1, ord("P"), ord("<"), ord("\n")]
+    assert lengths[0] == 8
+    # row 1 does not start with its prompt text -> the whole-row encode, unchanged.
+    assert rows[1] == tok(["XY!"])["input_ids"][0]
+    assert lengths[1] == 4
+
+
 def test_pretokenize_drops_content_free_completion():
     # A completion whose only masked token is special (an empty assistant turn -> just EOS/turn-closer)
     # has no REAL target and must be dropped — not train the model to emit EOS immediately. "Special" is
