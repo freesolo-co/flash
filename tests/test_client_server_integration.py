@@ -79,14 +79,14 @@ class _FakeUrlResponse:
     """Mimics the ``urllib`` response object ``ApiClient._request`` consumes."""
 
     def __init__(self, body: bytes, status: int, headers=None) -> None:
-        self._body = body
+        self._body = io.BytesIO(body)
         self.status = status
         self.code = status
         # `_request` reads Content-Type to say what answered when a 2xx body is not JSON.
         self.headers = headers if headers is not None else {}
 
-    def read(self) -> bytes:
-        return self._body
+    def read(self, size: int = -1) -> bytes:
+        return self._body.read(size)
 
     def __enter__(self) -> _FakeUrlResponse:
         return self
