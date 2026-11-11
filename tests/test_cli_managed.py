@@ -40,6 +40,12 @@ def stub_server():
             else:
                 self._send(404, {"detail": f"unknown path {self.path}"})
 
+        def do_PUT(self):
+            # paid submits use the idempotent route; answer it exactly like POST /v1/runs.
+            if self.path.startswith("/v1/run-submissions/"):
+                self.path = "/v1/runs"
+            self.do_POST()
+
         def do_GET(self):
             if self.path == "/api/auth/verify":
                 # Login is handled by the freesolo backend: it verifies the bearer key.

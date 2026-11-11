@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import io
+import threading
+import weakref
 from pathlib import Path
 from typing import Any, cast
 
@@ -53,8 +55,35 @@ def _normalize_token_ids(value) -> list[int]:
     return [int(item) for item in value]
 
 
+# successful _registered_token_id verdicts, per live tokenizer object and token.
+_REGISTERED_TOKEN_IDS: weakref.WeakKeyDictionary[Any, dict[str, int]] = weakref.WeakKeyDictionary()
+_REGISTERED_TOKEN_IDS_LOCK = threading.Lock()
+
+
 def _registered_token_id(tokenizer, token: str) -> int:
-    """return one exact, canonical registered token id without aliases or unknown fallback."""
+    """return one exact, canonical registered token id without aliases or unknown fallback.
+
+    the check copies and scans the whole vocabulary (~250k entries for qwen), and submission
+    profiling asks it once per image row: recomputing it cost ~58 ms a row, most of a 4k-row
+    dataset's quote, held under the gil in the shared control plane. a successful verdict is
+    therefore memoized per tokenizer object (loaded tokenizers are not given new tokens while
+    profiling; even len() is ~14 ms, so the vocabulary size cannot cheaply be part of the key).
+    failures are never cached and always re-raise from a fresh check.
+    """
+    try:
+        with _REGISTERED_TOKEN_IDS_LOCK:
+            cached = _REGISTERED_TOKEN_IDS.get(tokenizer, {}).get(token)
+    except TypeError:  # not hashable or not weak-referenceable: check every time
+        return _check_registered_token_id(tokenizer, token)
+    if cached is not None:
+        return cached
+    token_id = _check_registered_token_id(tokenizer, token)
+    with _REGISTERED_TOKEN_IDS_LOCK:
+        _REGISTERED_TOKEN_IDS.setdefault(tokenizer, {})[token] = token_id
+    return token_id
+
+
+def _check_registered_token_id(tokenizer, token: str) -> int:
     convert = getattr(tokenizer, "convert_tokens_to_ids", None)
     token_id = convert(token) if callable(convert) else None
     unk_token_id = getattr(tokenizer, "unk_token_id", None)

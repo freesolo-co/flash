@@ -104,6 +104,13 @@ def stub():
                 return
             self._send(200, {"run_id": "r1", "state": "queued"})
 
+        def do_PUT(self):
+            # paid submits use the idempotent route; answer it exactly like POST /v1/runs.
+            assert self.path.startswith("/v1/run-submissions/")
+            seen["submission_path"] = self.path
+            self.path = "/v1/runs"
+            self.do_POST()
+
         def do_DELETE(self):
             seen["auth"] = self.headers.get("Authorization")
             seen["project_id"] = self.headers.get("X-Freesolo-Project-Id")
