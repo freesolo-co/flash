@@ -121,8 +121,11 @@ def submit_attempt(
         source_snapshot=source_snapshot,
         deadline_at=deadline_at,
     )
-    from flash.providers.nebius.queue import wait_for_price
+    from flash.providers.nebius.queue import wait_for_price, wait_for_slot
 
+    # Hold a place until the project's preemptible-VM quota has room, then recheck the price
+    # immediately before creating (a slot wait can outlast a fresh price).
+    wait_for_slot(spec.run_id, deadline_at=deadline_at, log=log)
     wait_for_price(gpu, spec.run_id, deadline_at=deadline_at, log=log)
     name = instance_label(spec.run_id, attempt)
     started = time.time()
