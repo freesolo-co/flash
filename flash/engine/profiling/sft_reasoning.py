@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import dataclass
 
+from flash.content.thinking import messages_for_chat_template
 from flash.engine.profiling.reasoning_render import (
     marked_reasoning_end,
     reasoned_assistant_turns,
@@ -22,7 +23,7 @@ def _require_reasoning_when_thinking(prompt_rows) -> None:
     preserve those blocks; authored reasoning alone does not establish the training contract.
     """
     for row_index, (_example, _prompt, completion, _coerced) in enumerate(prompt_rows):
-        for turn_index, message in enumerate(completion):
+        for turn_index, message in enumerate(messages_for_chat_template(completion)):
             if message.get("role") == "assistant" and not reasoned_assistant_turns([message]):
                 raise ValueError(
                     f"thinking = true, but selected SFT row {row_index + 1}, completion message "
@@ -85,6 +86,10 @@ def _row_reasoning(
     Markers are stripped before measuring, so the length charged against the cap is the real render's
     rather than one inflated by the measurement's own bytes.
     """
+    # Use the same canonical fields as the actual render. In particular, input_text blocks
+    # can carry a leading think span that the template receives as reasoning_content.
+    prompt_messages = messages_for_chat_template(prompt_messages)
+    completion_messages = messages_for_chat_template(completion_messages)
     authored = reasoned_assistant_turns(completion_messages)
     if not authored:
         # nothing authored means nothing to lose, and the marked render would equal the full one.

@@ -59,6 +59,7 @@ def _render(tokenizer, messages):
     )
 
 
+@pytest.mark.parametrize("first_content_type", ["field", "input_text"])
 @pytest.mark.parametrize(
     ("middle_role", "final_reasoning", "error"),
     [
@@ -69,7 +70,7 @@ def _render(tokenizer, messages):
     ],
 )
 def test_thinking_sft_validates_real_rendered_targets(
-    tokenizer, middle_role, final_reasoning, error
+    tokenizer, middle_role, final_reasoning, error, first_content_type
 ):
     from dataclasses import replace
 
@@ -87,8 +88,14 @@ def test_thinking_sft_validates_real_rendered_targets(
             return [{"role": "user", "content": "question"}]
 
         def sft_completion(self, row):
+            first = {"role": "assistant", "reasoning_content": "first", "content": "a1"}
+            if first_content_type == "input_text":
+                first = {
+                    "role": "assistant",
+                    "content": [{"type": "input_text", "text": "<think>first</think>a1"}],
+                }
             return [
-                {"role": "assistant", "reasoning_content": "first", "content": "a1"},
+                first,
                 {"role": middle_role, "content": "next"},
                 {"role": "assistant", "reasoning_content": final_reasoning, "content": "a2"},
             ]

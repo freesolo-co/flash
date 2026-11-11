@@ -712,6 +712,28 @@ def test_thinking_rejects_partial_template_reasoning_loss() -> None:
     assert "prompt_messages" in str(error.value)
 
 
+@pytest.mark.parametrize("block_type", ["text", "input_text"])
+@pytest.mark.parametrize("split", [False, True])
+def test_thinking_normalizes_reasoning_blocks_before_validation(block_type, split) -> None:
+    content = (
+        [{"type": block_type, "text": "<think>why"}, {"type": "text", "text": "</think>answer"}]
+        if split
+        else [{"type": block_type, "text": "<think>why</think>answer"}]
+    )
+    prepared = _thinking_prepared([{"role": "assistant", "content": content}])
+    assert prepared.authored_reasoning_turns == prepared.rendered_reasoning_spans == 1
+
+
+def test_thinking_rejects_template_loss_after_normalizing_input_text() -> None:
+    completion = [
+        {"role": "assistant", "content": [{"type": "input_text", "text": "<think>why</think>a"}]},
+        {"role": "user", "content": "next"},
+        {"role": "assistant", "reasoning_content": "second", "content": "b"},
+    ]
+    with pytest.raises(ValueError, match="chat template dropped 1 of 2"):
+        _thinking_prepared(completion)
+
+
 @pytest.mark.parametrize("middle_role", ["user", "tool"])
 def test_thinking_rejects_a_reasoning_free_continuation(middle_role) -> None:
     completion = [
