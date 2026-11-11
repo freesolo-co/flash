@@ -720,15 +720,14 @@ def test_reasoning_stripped_to_nothing_is_not_read_as_one_surviving_block(capsys
     assert "0%" in warning
 
 
-def test_a_dataset_with_no_authored_reasoning_stays_quiet(capsys) -> None:
-    """The other control. Every thinking render carries one empty ``<think>`` block, so a rule keyed
-    on tags rather than content warns about dropped reasoning for a dataset that authored none.
+def test_a_thinking_sft_without_authored_reasoning_is_rejected() -> None:
+    """Thinking SFT on reasoning-free targets trains an empty ``<think>`` block whose seam tokenizes
+    as ``\\n\\n`` while serving continues from ``<think>`` ``\\n``, so the adapter is trained off the
+    served context. It must fail before any GPU work with a fix the author can apply.
     """
-    prepared = _thinking_prepared([{"role": "assistant", "content": "plain answer"}])
-
-    assert prepared.authored_reasoning_turns == 0
-    assert prepared.rendered_reasoning_spans == 0
-    assert "authored reasoning blocks" not in capsys.readouterr().err
+    with pytest.raises(ValueError, match="no reasoning in their first assistant turn") as error:
+        _thinking_prepared([{"role": "assistant", "content": "plain answer"}])
+    assert "thinking = false" in str(error.value)
 
 
 def test_reasoning_carried_in_reasoning_content_counts_as_authored(capsys) -> None:
@@ -1077,11 +1076,11 @@ def test_a_closing_tag_quoted_inside_reasoning_does_not_end_the_block_early(
     assert "max_context_tokens cut 1 rendered reasoning" in capsys.readouterr().err
 
 
-def test_an_empty_reasoning_field_is_authoritative_over_a_tag_the_answer_quotes(capsys) -> None:
+def test_an_empty_reasoning_field_is_authoritative_over_a_tag_the_answer_quotes() -> None:
     """The template renders a STRING ``reasoning_content`` and leaves ``content`` whole, so an empty
     field means the turn authored nothing however the answer is written. Falling back to inline
-    detection reads a quoted ``<think>`` as this turn's reasoning; the marker then lands outside the
-    empty block the template owns and the turn reports as dropped.
+    detection would read a quoted ``<think>`` as this turn's reasoning and let a reasoning-free
+    thinking row through; it is rejected like any other.
     """
     completion = [
         {
@@ -1090,11 +1089,8 @@ def test_an_empty_reasoning_field_is_authoritative_over_a_tag_the_answer_quotes(
             "content": "use <think>like this</think> in prompts",
         }
     ]
-    prepared = _thinking_prepared(completion)
-
-    assert prepared.authored_reasoning_turns == 0
-    assert prepared.rendered_reasoning_spans == 0
-    assert "reasoning" not in capsys.readouterr().err
+    with pytest.raises(ValueError, match="no reasoning in their first assistant turn"):
+        _thinking_prepared(completion)
 
 
 @pytest.mark.parametrize(
@@ -1207,7 +1203,8 @@ def test_reasoning_loss_is_measured_over_the_rows_the_horizon_reaches(capsys) ->
 
         def sft_completion(self, row):
             if row["prompt"] in consumed:
-                return [{"role": "assistant", "content": "plain answer"}]
+                # final-turn reasoning survives the render, so these rows lose nothing
+                return [{"role": "assistant", "content": "<think>kept</think>plain answer"}]
             # never reached at max_steps=1: the template strips the first turn's reasoning
             return [
                 {"role": "assistant", "content": "<think>lost</think>a1"},
@@ -1316,18 +1313,14 @@ def test_reasoning_sampled_without_an_opening_tag_still_counts_as_authored(capsy
     assert "the chat template dropped 1 of 2 authored reasoning blocks" in capsys.readouterr().err
 
 
-def test_the_templates_own_empty_think_block_is_not_counted_as_authored(capsys) -> None:
+def test_the_templates_own_empty_think_block_is_not_counted_as_authored() -> None:
     """The template stamps ``<think>\n\n</think>`` onto qualifying trailing assistant turns, so it
-    comes back in any transcript captured from a previous render. Counting it as authored marks a
-    block the real render does not have, and the row reports having lost ALL of its reasoning.
+    comes back in any transcript captured from a previous render. It is not authored reasoning, so a
+    thinking row carrying only that block is rejected as reasoning-free.
     """
     completion = [{"role": "assistant", "content": "<think>\n\n</think>just an answer"}]
-    prepared = _thinking_prepared(completion)
-
-    assert prepared.authored_reasoning_turns == 0
-    assert prepared.rendered_reasoning_spans == 0
-    assert prepared.truncated_reasoning_spans == 0
-    assert "reasoning" not in capsys.readouterr().err
+    with pytest.raises(ValueError, match="no reasoning in their first assistant turn"):
+        _thinking_prepared(completion)
 
 
 @pytest.mark.parametrize(

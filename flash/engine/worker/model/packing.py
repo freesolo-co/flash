@@ -207,57 +207,6 @@ def untruncated_lengths_for_packing(texts: list[str], tokenizer) -> list[int]:
     return [len(ids) for ids in enc["input_ids"]]
 
 
-def tokenize_at_prompt_boundary(
-    texts: list[str], prompt_texts: list[str], tokenizer, max_length: int
-) -> tuple[list[list[int]], list[int]]:
-    """Tokenize SFT rows so each row's prefix is exactly the served prompt's tokens.
-
-    Returns ``(capped_rows, untruncated_lengths)`` under the same EOS rule as ``tokenize_for_packing``.
-
-    Encoding the whole transcript in one call lets BPE merge across the prompt/target seam. With a
-    thinking template the generation prompt ends ``<think>\\n`` while an empty-reasoning target renders
-    ``<think>\\n\\n</think>``: one call encodes ``<think>`` ``\\n\\n`` ``</think>``, but serving encodes
-    the prompt alone and the model continues from ``<think>`` ``\\n`` -- a context it never trained
-    on. Encoding the prompt and the rest separately trains on the served prompt tokens and supervises
-    exactly what the model must generate after them (``\\n`` ``</think>`` ...). A row whose render does
-    not start with its prompt text keeps the single-call encoding.
-    """
-    terminated = _eos_terminated(texts, tokenizer)
-    split = [
-        bool(prompt) and text.startswith(prompt)
-        for text, prompt in zip(terminated, prompt_texts, strict=True)
-    ]
-
-    def encode(rows: list[str]) -> list[list[int]]:
-        return [list(ids) for ids in tokenizer(rows)["input_ids"]] if rows else []
-
-    prompts = iter(encode([p for p, s in zip(prompt_texts, split, strict=True) if s]))
-    # the suffix continues the row, so it must not repeat the leading specials (e.g. BOS) the default
-    # encode adds; they are read off an empty encode rather than requested away by keyword.
-    specials = encode([""])[0] if any(split) else []
-
-    def without_leading_specials(ids: list[int]) -> list[int]:
-        n = 0
-        while n < len(specials) and n < len(ids) and ids[n] == specials[n]:
-            n += 1
-        return ids[n:]
-
-    suffixes = iter(
-        without_leading_specials(ids)
-        for ids in encode(
-            [t[len(p) :] for t, p, s in zip(terminated, prompt_texts, split, strict=True) if s]
-        )
-    )
-    wholes = iter(encode([t for t, s in zip(terminated, split, strict=True) if not s]))
-    rows: list[list[int]] = []
-    lengths: list[int] = []
-    for at_boundary in split:
-        ids = next(prompts) + next(suffixes) if at_boundary else next(wholes)
-        lengths.append(len(ids))
-        rows.append(ids[:max_length])
-    return rows, lengths
-
-
 def completion_mask_from_ids(prompt_ids: list[int], full_ids: list[int]) -> list[int]:
     """Return per-token mask: 0 over the shared prompt prefix, 1 over the completion.
 

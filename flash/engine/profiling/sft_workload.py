@@ -337,6 +337,31 @@ def _sft_completion_with_provenance(env, example: dict) -> tuple[list[dict], boo
     return env.sft_completion(example), False
 
 
+def _require_reasoning_when_thinking(prompt_rows) -> None:
+    """Reject a thinking SFT whose rows open their answer without authored reasoning.
+
+    With thinking on, serving pre-opens ``<think>\\n`` and the model generates from there. A target
+    with no reasoning renders an empty ``<think>\\n\\n</think>`` block, and encoding the row merges
+    that seam into one ``\\n\\n`` token, so training never sees the served ``<think>`` ``\\n`` context
+    and the adapter drifts at the start of every answer (answers written inside the think block, or
+    empty answers after ``</think>``). It also teaches the model to skip thinking, which defeats the
+    setting. Targets with reasoning tokenize cleanly at the same seam, so the row's first assistant
+    turn must author some.
+    """
+    missing = 0
+    for _example, _prompt, completion, _coerced in prompt_rows:
+        first = next((m for m in completion if m.get("role") == "assistant"), None)
+        if first is not None and not reasoned_assistant_turns([first]):
+            missing += 1
+    if missing:
+        raise ValueError(
+            f"thinking = true, but {missing} of {len(prompt_rows)} selected SFT rows have no "
+            "reasoning in their first assistant turn. Thinking SFT needs reasoning in the targets "
+            "(reasoning_content, or a <think>...</think> span before the answer); otherwise set "
+            "thinking = false."
+        )
+
+
 def _encoded_length(tokenizer, text: str) -> int:
     """Token count of ``text``, for either the batched or unbatched ``input_ids`` shape.
 
@@ -922,6 +947,8 @@ def prepare_sft_workload(
             example, image_bearing=record_has_images(example, prompt_messages)
         )
         prompt_rows.append((example, prompt_messages, completion_messages, coerced_scalar_output))
+    if spec.thinking:
+        _require_reasoning_when_thinking(prompt_rows)
     package_root = getattr(env, "package_root", None)
     multimodal = any(
         record_has_images(example, prompt_messages)

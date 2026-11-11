@@ -12,7 +12,8 @@ from flash.engine.worker.model.chatml_mask import assistant_only_mask
 from flash.engine.worker.model.packing import (
     completion_mask_from_ids,
     packing_appends_eos,
-    tokenize_at_prompt_boundary,
+    tokenize_for_packing,
+    untruncated_lengths_for_packing,
 )
 
 
@@ -38,12 +39,9 @@ def _pretokenize_completion_only(texts, tokenizer, max_length):
     max_length, so it cannot say whether the cap actually bound; this can. It also carries
     ``assistant_mask_applied``: whether the render was readable enough to mask non-assistant turns.
     """
-    # the prompt and the target are encoded separately, so a row trains on the served prompt tokens
-    # rather than on a cross-seam BPE merge serving never produces (thinking templates: <think>\n\n).
-    # untruncated is the same encode without the cap, so a truncated row reports its real size.
-    full_ids, untruncated = tokenize_at_prompt_boundary(
-        [t["text"] for t in texts], [t["prompt_text"] for t in texts], tokenizer, max_length
-    )
+    full_ids = tokenize_for_packing([t["text"] for t in texts], tokenizer, max_length)
+    # the same encode without the cap, so a truncated row reports its real size rather than the cap.
+    untruncated = untruncated_lengths_for_packing([t["text"] for t in texts], tokenizer)
     prompt_ids = tokenizer(
         [t["prompt_text"] for t in texts], truncation=True, max_length=max_length
     )["input_ids"]
