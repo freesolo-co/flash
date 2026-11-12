@@ -22,7 +22,7 @@ _STOPPED = frozenset(
 
 def _ownership(bid):
     config = settings()
-    if bid.get("project") != config["project_id"] or bid.get("region") != config["region"]:
+    if bid.get("project") != config["project_id"] or not bid.get("region"):
         return None
     script = (bid.get("launch_specification") or {}).get("startup_script") or ""
     lines = script.splitlines()
@@ -76,7 +76,7 @@ def _bid(bid_id, *, deadline_at=None):
             return None
         raise
     if not isinstance(bid, dict) or not _ownership(bid) or bid.get("fid") != bid_id:
-        raise MithrilApiError("Mithril bid does not belong to this project and region")
+        raise MithrilApiError("Mithril bid does not belong to this project")
     return bid
 
 
@@ -158,6 +158,8 @@ def create(*, name, offer, payload, image_reference, gpu, gpu_count, capsule, di
     config = settings()
     if offer.gpu != gpu or offer.count != gpu_count or offer.disk_gb < disk_gb:
         raise ValueError("Mithril offer does not fit the requested GPU and disk shape")
+    if not offer.region:
+        raise ValueError("Mithril offer has no region")
     labels = {
         "flash-owner": "flash-training",
         "flash-run": payload["run_id"],
@@ -216,7 +218,8 @@ def create(*, name, offer, payload, image_reference, gpu, gpu_count, capsule, di
         launch["image_version"] = config["image_version"]
     body = {
         "project": config["project_id"],
-        "region": config["region"],
+        # Bid where the admitted (cheapest qualifying) offer is.
+        "region": offer.region,
         "instance_type": offer.instance_type,
         "limit_price": f"${cap:.2f}",
         "instance_quantity": 1,

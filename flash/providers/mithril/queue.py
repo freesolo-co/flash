@@ -5,7 +5,6 @@ import time
 from flash.providers.core.base import CapacityLookupError
 from flash.providers.mithril.capacity import quota_available
 from flash.providers.mithril.client import MithrilApiError
-from flash.providers.mithril.config import settings
 from flash.providers.mithril.prices import affordable_offers
 
 
@@ -19,7 +18,7 @@ def wait_for_price(gpu, run_id, *, gpu_count=1, disk_gb=0, deadline_at, log=None
         try:
             offers = [
                 offer
-                for offer in affordable_offers(settings()["region"], deadline_at=deadline_at)
+                for offer in affordable_offers(deadline_at=deadline_at)
                 if offer.gpu == gpu and offer.count == gpu_count and offer.disk_gb >= disk_gb
             ]
             offers = [
@@ -29,7 +28,11 @@ def wait_for_price(gpu, run_id, *, gpu_count=1, disk_gb=0, deadline_at, log=None
             ]
             if offers:
                 _update(run_id, "provisioning")
-                return min(offers, key=lambda offer: (offer.hourly_usd, offer.instance_type))
+                # Cheapest qualifying shape across every admitted region.
+                return min(
+                    offers,
+                    key=lambda offer: (offer.hourly_usd, offer.region, offer.instance_type),
+                )
         except (CapacityLookupError, MithrilApiError):
             pass
         _update(run_id, "queued")
