@@ -87,11 +87,8 @@ def test_warm_start_downloads_verified_source_before_loading_backend(monkeypatch
 
     with pytest.raises(RuntimeError, match="stop after model load"):
         worker.run(context=context)
-    from flash.core.catalog import supports_image_training
-
-    # image-training models check the source against custom's text-only surface.
-    multimodal = supports_image_training("Qwen/Qwen3.5-0.8B")
-    assert calls == [("Qwen/Qwen3.5-0.8B", 32, 64, multimodal)]
+    # no modality is imposed: an image-trained source (SFT on screenshots) is a valid start.
+    assert calls == [("Qwen/Qwen3.5-0.8B", 32, 64, False)]
     assert load.call_args.kwargs["init_adapter"] == "/tmp/evdl/source/adapter"
     assert load.call_args.kwargs["lora_rank"] == 32
 
