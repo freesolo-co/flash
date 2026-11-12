@@ -100,6 +100,13 @@ class InstancePollAdapter:
     load_timeout_detail: Callable[[str, float], str]  # (status, elapsed_s) -> str
     first_liveness_detail: Callable[[float, float], str]  # (elapsed_s, first_liveness_s) -> str
     load_timeout_failure: str = "stalled"
+    # Spot: a host shutdown signal (the provider stopping a preemptible VM) is a preemption, so it
+    # gets the budget-free requeue rather than spending the infrastructure retry budget.
+    signal_interruption_is_preemption: bool = False
+
+
+# Written by bootstrap.WorkerInterrupted when a host shutdown signal stops the worker.
+SIGNAL_INTERRUPTION = "worker interrupted by signal"
 
 
 class _TerminalArtifacts:
@@ -167,6 +174,16 @@ class _TerminalArtifacts:
     def _fail_from_marker(self, marker: dict) -> PollResult:
         # a real worker error fails fast unless flagged retriable in the marker or the worker heartbeat.
         # gate the heartbeat flag to this attempt so a stale prior-attempt flag cannot trigger a retry.
+        if (
+            self._adapter.signal_interruption_is_preemption
+            and marker["retriable"]
+            and SIGNAL_INTERRUPTION in str(marker.get("error") or "")
+        ):
+            # A gracefully stopped Spot VM delivers SIGTERM before it disappears; that worker
+            # still writes a retriable marker. Treat it like the silent case: preemption.
+            return PollResult(
+                False, failure="job_preempted", detail=self._adapter.failure_detail(marker)
+            )
         retriable = marker["retriable"] or worker_flagged_retriable(
             self._heartbeat_reader,
             launch_ts=self._launch_ts,
