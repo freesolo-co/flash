@@ -80,3 +80,19 @@ async def test_shared_reconciler_skips_reserved_model(monkeypatch):
     control.reconcile_model = AsyncMock()
     await control.reconcile()
     control.reconcile_model.assert_not_awaited()
+
+
+@pytest.mark.anyio
+async def test_development_keeps_lambda_only_capacity_without_modal_fallback():
+    from types import SimpleNamespace
+
+    async def empty_items():
+        if False:
+            yield None
+
+    api = SimpleNamespace(call=AsyncMock(return_value=[]))
+    ledger = SimpleNamespace(items=empty_items)
+    fleet = Fleet(api, ledger, "dev")
+    fleet.shared_capacity = AsyncMock()
+    await fleet._check_capacity(reserved.MODEL, "a" * 40)
+    fleet.shared_capacity.before_launch.assert_not_awaited()

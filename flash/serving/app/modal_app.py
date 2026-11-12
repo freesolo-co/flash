@@ -514,7 +514,9 @@ def _configured_engine(model, provider, suffix=""):
 
 
 ENGINE_BY_MODEL: dict[str, Any] = {
-    bm: _configured_engine(bm, "lambda") for bm in base_models() if bm != reserved.MODEL
+    bm: _configured_engine(bm, "lambda")
+    for bm in base_models()
+    if not reserved.enabled(bm, MODAL_ENVIRONMENT)
 }
 RESERVED_ENGINES = (
     tuple(
