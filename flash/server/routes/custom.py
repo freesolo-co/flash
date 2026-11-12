@@ -26,11 +26,15 @@ def _modal_connection(run_id, remote):
 def _spot_connection(run_id, remote):
     """A Spot VM is reached directly: its public IP, the attempt's token and pinned certificate."""
     from flash.providers.mithril import api
+    from flash.providers.mithril.client import MithrilApiError
     from flash.providers.mithril.handles import SpotJobHandle, require_scope
 
     try:
         handle = SpotJobHandle.from_dict(remote)
         require_scope(handle)
+    except MithrilApiError:
+        # ownership could not be checked right now (timeout, 429, 5xx): the controller retries
+        raise HTTPException(503, "could not verify the custom Spot attempt; retry") from None
     except (ValueError, RuntimeError):
         # e.g. a handle from the retired Nebius Spot provider, or other provider credentials:
         # this plane cannot reach that session, so stop the controller instead of a retried 500.

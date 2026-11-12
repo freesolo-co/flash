@@ -744,3 +744,25 @@ def test_attempts_from_region_pinned_releases_stay_recognized(monkeypatch):
     with pytest.raises(RuntimeError, match="differ"):
         handles.require_scope(handle)
     handles.require_scope(SimpleNamespace(scope=config.scope_fingerprint(), instance_id="bid_x"))
+
+
+def test_a_failed_scope_lookup_is_retryable_not_a_mismatch(monkeypatch):
+    from flash.providers.mithril import handles
+
+    legacy = config.region_scope_fingerprint("proj_test", "us-central2-b")
+    handle = SimpleNamespace(scope=legacy, instance_id="bid_test")
+    for status in (0, 429, 503):
+
+        def fail(m, p, status=status, **kw):
+            raise client.MithrilApiError(status=status)
+
+        monkeypatch.setattr(client, "call", fail)
+        with pytest.raises(client.MithrilApiError):
+            handles.require_scope(handle)
+
+    def gone(m, p, **kw):
+        raise client.MithrilApiError(status=404)
+
+    monkeypatch.setattr(client, "call", gone)
+    with pytest.raises(RuntimeError, match="differ"):
+        handles.require_scope(handle)

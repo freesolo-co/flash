@@ -189,6 +189,19 @@ def test_spot_connection_rejects_a_retired_provider_handle_without_a_500(monkeyp
     assert "retired provider" in response.json()["detail"]
 
 
+def test_spot_connection_is_retryable_when_ownership_cannot_be_checked(monkeypatch):
+    from flash.providers.mithril import handles
+    from flash.providers.mithril.client import MithrilApiError
+
+    client = _route_client(monkeypatch, _spot_remote())
+
+    def unreachable(handle):
+        raise MithrilApiError(status=503)
+
+    monkeypatch.setattr(handles, "require_scope", unreachable)
+    assert client.get("/v1/runs/spot-run/custom").status_code == 503
+
+
 # --- worker saves ---------------------------------------------------------------------------
 
 

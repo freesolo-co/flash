@@ -47,6 +47,9 @@ class SpotJobHandle(InstanceJobHandle):
         return fields
 
 
+_NO_SUCH_BID = frozenset({400, 403, 404, 422})
+
+
 def require_scope(handle):
     from flash.providers.mithril.config import (
         region_scope_fingerprint,
@@ -63,7 +66,9 @@ def require_scope(handle):
     project = settings()["project_id"]
     try:
         bid = call("GET", f"/spot/bids/{handle.instance_id}")
-    except MithrilApiError:
+    except MithrilApiError as exc:
+        if exc.status not in _NO_SUCH_BID:
+            raise  # timeout, 429 or 5xx: ownership is unverified, not disproven; callers retry
         bid = None
     if (
         isinstance(bid, dict)
