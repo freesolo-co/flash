@@ -18,10 +18,13 @@ from flash.providers.nebius.pricing import SPOT_GPUS, accepts_price, hourly_rate
     ("gpu", "value", "accepted"),
     [
         ("H100", "0.79", True),
-        ("H100", "1.00", False),
-        ("H200", "1.001", False),
-        ("B200", "3.999", True),
-        ("B200", "4", False),
+        ("H100", "1.00", True),
+        ("H100", "1.01", False),
+        ("H200", "1.00", True),
+        ("H200", "1.011", False),
+        ("B200", "4", True),
+        ("B200", "4.009", True),
+        ("B200", "4.01", False),
         ("H100", "NaN", False),
         ("H100", "Infinity", False),
         ("H100", "-1", False),
@@ -34,8 +37,14 @@ def test_price_caps(gpu, value, accepted):
 
 def test_fixed_rates_and_supported_shapes():
     assert set(SPOT_GPUS) == {"H100", "H200", "B200"}
+    # Billing rates stay round even though admission thresholds sit $0.01 higher.
     assert hourly_rate("H100") == hourly_rate("H200") == 1
     assert hourly_rate("B200") == 4
+    assert [str(SPOT_GPUS[g].entry_below_usd) for g in ("H100", "H200", "B200")] == [
+        "1.01",
+        "1.01",
+        "4.01",
+    ]
     assert SPOT_GPUS["H200"].preset(8) == "8gpu-128vcpu-1600gb"
     with pytest.raises(ValueError, match="count"):
         SPOT_GPUS["H200"].preset(2)
@@ -647,7 +656,7 @@ def test_spot_rejects_manual_interval_but_modal_keeps_it():
     assert JobSpec(gpu=GpuSpec(provider="modal"), train=train).train.save_every == 100
 
 
-@pytest.mark.parametrize(("gpu", "hold"), [("H100", "1.50"), ("H200", "2.00"), ("B200", "5.00")])
+@pytest.mark.parametrize(("gpu", "hold"), [("H100", "1.51"), ("H200", "2.01"), ("B200", "5.01")])
 def test_native_policy_uses_hold_threshold_not_entry_threshold(monkeypatch, gpu, hold):
     monkeypatch.setattr(api, "settings", lambda: {"project_id": "p"})
     calls = []

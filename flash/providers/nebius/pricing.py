@@ -1,5 +1,9 @@
-"""Fixed Spot entry estimates and separate hold caps, in USD per GPU-hour.
+"""Fixed Spot rates, entry thresholds and separate hold caps, in USD per GPU-hour.
 
+``hourly_usd`` is the fixed rate Flash estimates and charges. ``entry_below_usd`` admits a
+rental when the live price is strictly below it, and ``keep_running_usd`` is the Nebius
+maximum-price policy a running VM keeps. Each threshold sits $0.01 above its round figure so a
+price of exactly $1.00 (or $2.00, $4.00, $5.00) still admits or keeps running.
 These are user-selected thresholds, not current market prices or capacity guarantees.
 GPU priority follows insertion order: H100, H200, B200.
 """
@@ -14,6 +18,7 @@ from flash.providers.core.base import canonical_gpu
 class SpotGpu:
     platform: str
     hourly_usd: Decimal
+    entry_below_usd: Decimal
     keep_running_usd: Decimal
     cpu: int
     memory_gib: int
@@ -26,9 +31,9 @@ class SpotGpu:
 
 
 SPOT_GPUS = {
-    "H100": SpotGpu("gpu-h100-sxm", Decimal("1.00"), Decimal("1.50"), 16, 200),
-    "H200": SpotGpu("gpu-h200-sxm", Decimal("1.00"), Decimal("2.00"), 16, 200),
-    "B200": SpotGpu("gpu-b200-sxm", Decimal("4.00"), Decimal("5.00"), 20, 224),
+    "H100": SpotGpu("gpu-h100-sxm", Decimal("1.00"), Decimal("1.01"), Decimal("1.51"), 16, 200),
+    "H200": SpotGpu("gpu-h200-sxm", Decimal("1.00"), Decimal("1.01"), Decimal("2.01"), 16, 200),
+    "B200": SpotGpu("gpu-b200-sxm", Decimal("4.00"), Decimal("4.01"), Decimal("5.01"), 20, 224),
 }
 
 
@@ -41,7 +46,7 @@ def accepts_price(gpu: str, value, *, currency: str, unit: str) -> bool:
         return False
     try:
         price = Decimal(str(value))
-        return price.is_finite() and 0 < price < SPOT_GPUS[canonical_gpu(gpu)].hourly_usd
+        return price.is_finite() and 0 < price < SPOT_GPUS[canonical_gpu(gpu)].entry_below_usd
     except (ValueError, ArithmeticError):
         return False
 

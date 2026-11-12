@@ -4,15 +4,17 @@ Set `[gpu] spot = true` to opt into Nebius preemptible VMs. Modal remains
 the default; Spot never falls back to Modal or Nebius on-demand instances. Only
 H100, H200 and B200 are offered. RTX Pro 6000 and L40S are excluded.
 
-| GPU | Start below / fixed estimate | Keep running through |
-| --- | ---: | ---: |
-| H100 | $1.00 | $1.50 |
-| H200 | $1.00 | $2.00 |
-| B200 | $4.00 | $5.00 |
+| GPU | Fixed rate (estimates, charges) | Start below | Keep running through |
+| --- | ---: | ---: | ---: |
+| H100 | $1.00 | $1.01 | $1.51 |
+| H200 | $1.00 | $1.01 | $2.01 |
+| B200 | $4.00 | $4.01 | $5.01 |
 
 The table lives in `flash/providers/nebius/pricing.py`. Live regional prices
 admit fitting rentals in H100, H200, B200 priority order, even when H200 is cheaper.
-The entry thresholds price Flash's estimates; running prices can be higher. Estimates exclude disk, network and taxes and are not Nebius invoices.
+Each threshold sits $0.01 above its round figure, so a price of exactly $1.00 (or $2.00,
+$4.00, $5.00) still starts or keeps running. The fixed rate prices Flash's estimates and
+charges; running prices can be higher. Estimates exclude disk, network and taxes and are not Nebius invoices.
 Nebius presets are 1 or 8 GPUs. All rented cards contribute to the price.
 
 Customer charges use the accepted Spot-priced quote: $1 per GPU-hour for H100/H200
