@@ -73,3 +73,19 @@ def test_interruption_race_always_resumes_with_additional_steps(smoke, monkeypat
     assert resumed_steps == [4]
     assert deleted == ["sft/flash-spot-sft-smoke-test/DONE"]
     assert updates[-1][0][1] == "done"
+
+
+def test_paid_override_changes_admission_without_changing_billing_or_hold(smoke, monkeypatch):
+    from flash.providers.mithril import pricing
+
+    monkeypatch.setattr(pricing, "SPOT_GPUS", dict(pricing.SPOT_GPUS))
+
+    def stop_before_storage():
+        assert pricing.SPOT_GPUS["H200"].entry_below_usd == Decimal("2.00")
+        assert pricing.hourly_rate("H200") == 1
+        assert pricing.running_limit("H200") == 2.51
+        raise RuntimeError("stop before paid resources")
+
+    monkeypatch.setattr(smoke, "ArtifactStore", stop_before_storage)
+    with pytest.raises(RuntimeError, match="stop before paid resources"):
+        smoke.run("unused", gpu="H200", entry_price_cap=Decimal("2.00"))

@@ -70,7 +70,7 @@ def run(repo, gpu="H100", model="Qwen/Qwen3.5-9B", entry_price_cap=None):
         if not cap.is_finite() or not 0 < cap <= SPOT_GPUS[gpu].keep_running_usd:
             raise ValueError("Test entry cap must be positive and no greater than the hold cap")
         # Explicit paid-test-only admission override; never alter the provider's hold cap.
-        SPOT_GPUS[gpu] = replace(SPOT_GPUS[gpu], hourly_usd=cap)
+        SPOT_GPUS[gpu] = replace(SPOT_GPUS[gpu], entry_below_usd=cap)
     hub = ArtifactStore()
     hub.create_repo(repo, exist_ok=True, private=True)
     if not hub.repo_info(repo, repo_type="dataset").private:

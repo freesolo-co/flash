@@ -81,6 +81,7 @@ def poll(handle, spec, *, log=None, deadline_at=None):
         first_liveness_detail=lambda elapsed, limit: (
             f"Mithril Spot worker produced no liveness for {int(elapsed)}s (limit {int(limit)}s)"
         ),
+        signal_interruption_is_preemption=True,
     )
     return poll_instance_job(
         adapter,

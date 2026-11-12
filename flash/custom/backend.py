@@ -15,11 +15,15 @@ from flash.custom.validation import validate_operation
 
 
 class TorchBackend:
-    def __init__(self, model, tokenizer, *, checkpoint_dir, max_tokens=2048, max_batch=16):
+    def __init__(
+        self, model, tokenizer, *, checkpoint_dir, max_tokens=2048, max_batch=16, processor=None
+    ):
         import torch
 
         self.model = model
         self.tokenizer = tokenizer
+        # an image-capable model's processor; None keeps the session text-only.
+        self.processor = processor
         # eval disables dropout while retaining autograd: two-pass custom losses must see the same function.
         self.model.eval()
         self.checkpointing = _enable_checkpointing(model)
@@ -44,6 +48,7 @@ class TorchBackend:
             "max_context_tokens": self.max_tokens,
             "max_batch": self.max_batch,
             "pending_backward": self.pending_backward,
+            "images": self.processor is not None,
         }
 
     def validate(self, operation, arguments):
@@ -60,12 +65,73 @@ class TorchBackend:
             [tokens], device=self.model.get_input_embeddings().weight.device, dtype=torch.long
         )
 
-    def _logprobs(self, tokens, target_tokens=None):
+    def decode_images(self, images):
+        """Decode data URIs under the training image limits; validation calls this."""
+        if self.processor is None:
+            raise ValueError("this custom session's model does not accept images")
+        from flash.content.image_descriptors import descriptor
+        from flash.content.multimodal import MAX_IMAGE_DESCRIPTOR_BYTES, decode_image_descriptors
+
+        descriptors = [
+            descriptor("data_uri", uri, max_descriptor_bytes=MAX_IMAGE_DESCRIPTOR_BYTES)
+            for uri in images
+        ]
+        return decode_image_descriptors(descriptors, None)
+
+    def vision_inputs(self, tokens, images):
+        """Processor image inputs for tokens, checked against their placeholder runs.
+
+        Runs during validation, before any GPU work: the image-pad tokens in tokens[:-1] (the
+        positions the model reads) must be exactly the runs the processor sizes these images
+        to, or the model would silently misplace image features.
+        """
+        decoded = self.decode_images(images)
+        try:
+            out = self.processor.image_processor(images=decoded, return_tensors="pt")
+        finally:
+            for image in decoded:
+                image.close()
+        grid = out["image_grid_thw"]
+        merge = int(getattr(self.processor.image_processor, "merge_size", 2))
+        expected = int((grid.prod(-1) // (merge * merge)).sum())
+        pad = self._image_pad_id()
+        found = sum(1 for token in tokens[:-1] if token == pad)
+        if found != expected or tokens[-1] == pad:
+            raise ValueError(
+                f"tokens hold {found} image placeholder tokens but these {len(images)} images "
+                f"need {expected}; build image rows with encode(text, images=...)"
+            )
+        return {"pixel_values": out["pixel_values"], "image_grid_thw": grid}
+
+    def _image_pad_id(self):
+        from flash.content.multimodal import IMAGE_PAD_TOKEN
+
+        return self.tokenizer.convert_tokens_to_ids(IMAGE_PAD_TOKEN)
+
+    def _vision_kwargs(self, ids, vision):
+        """Model keyword inputs for one row's images; ids are the tokens the model reads."""
+        if vision is None:
+            return {}
+        device = ids.device
+        dtype = self.model.get_input_embeddings().weight.dtype
+        return {
+            "pixel_values": vision["pixel_values"].to(device=device, dtype=dtype),
+            "image_grid_thw": vision["image_grid_thw"].to(device),
+            # multimodal rope needs the image positions: 1 on image tokens, 0 on text.
+            "mm_token_type_ids": (ids == self._image_pad_id()).int(),
+        }
+
+    def _logprobs(self, tokens, target_tokens=None, vision=None):
         """Logprobs of the targets: the next token ([T]) or a [T, K] target matrix."""
         import torch
 
         ids = self._tensor(tokens)
-        logits = self.model(input_ids=ids[:, :-1], use_cache=False).logits[0].float()
+        inputs = ids[:, :-1]
+        logits = (
+            self.model(input_ids=inputs, use_cache=False, **self._vision_kwargs(inputs, vision))
+            .logits[0]
+            .float()
+        )
         if target_tokens is None:
             targets = ids[0, 1:, None].to(logits.device)
         else:
@@ -80,7 +146,7 @@ class TorchBackend:
         outputs = []
         with torch.no_grad():
             for row in data:
-                logprobs, logits = self._logprobs(row.tokens, row.target_tokens)
+                logprobs, logits = self._logprobs(row.tokens, row.target_tokens, row.vision)
                 output = {"logprobs": logprobs.cpu().tolist()}
                 if top_k:
                     values, indices = logits.topk(top_k, dim=-1)
@@ -102,7 +168,7 @@ class TorchBackend:
         self.model.train(self.checkpointing)
         try:
             for row in data:
-                logprobs, _ = self._logprobs(row.tokens, row.target_tokens)
+                logprobs, _ = self._logprobs(row.tokens, row.target_tokens, row.vision)
                 weights = torch.tensor(row.weights, device=logprobs.device, dtype=logprobs.dtype)
                 loss = -(weights * logprobs).sum()
                 if not torch.isfinite(loss):
@@ -142,7 +208,7 @@ class TorchBackend:
         self.pending_backward = 0
         return {}
 
-    def sample(self, prompt, max_tokens, temperature, num_samples):
+    def sample(self, prompt, max_tokens, temperature, num_samples, vision=None):
         import torch
         from transformers import GenerationConfig
 
@@ -160,14 +226,16 @@ class TorchBackend:
                     return_dict_in_generate=True,
                     output_scores=True,
                 )
+                prompt_ids = self._tensor(prompt)
                 generated = self.model.generate(
-                    input_ids=self._tensor(prompt),
+                    input_ids=prompt_ids,
                     generation_config=config,
-                    attention_mask=torch.ones_like(self._tensor(prompt)),
+                    attention_mask=torch.ones_like(prompt_ids),
+                    **self._vision_kwargs(prompt_ids, vision),
                 )
                 tokens = generated.sequences[0].tolist()
                 completion = tokens[len(prompt) :]
-                policy, _ = self._logprobs(tokens)
+                policy, _ = self._logprobs(tokens, vision=vision)
                 behavior = [
                     torch.log_softmax(scores[0].float(), dim=-1)[token].item()
                     if temperature
@@ -187,8 +255,17 @@ class TorchBackend:
                 )
         return {"sequences": sequences}
 
-    def encode(self, text):
-        return {"tokens": self.tokenizer.encode(text, add_special_tokens=False)}
+    def encode(self, text, images=None):
+        if images is None:
+            return {"tokens": self.tokenizer.encode(text, add_special_tokens=False)}
+        # the processor expands each <|image_pad|> into the run these images need.
+        try:
+            out = self.processor(text=[text], images=images, add_special_tokens=False)
+        finally:
+            for image in images:
+                image.close()
+        ids = out["input_ids"][0]
+        return {"tokens": [int(t) for t in (ids.tolist() if hasattr(ids, "tolist") else ids)]}
 
     def decode(self, tokens):
         return {"text": self.tokenizer.decode(tokens, skip_special_tokens=False)}
@@ -360,14 +437,20 @@ def load_backend(
 
     model_class = AutoModelForCausalLM
     targeting = {}
+    processor = None
     # Image-trained checkpoints keep the multimodal module layout their adapters target;
     # custom training adapts only the cataloged language modules of that layout.
     if supports_image_training(model_id):
-        from transformers import AutoModelForImageTextToText
+        from transformers import AutoModelForImageTextToText, AutoProcessor
 
         from flash.adapters.targets import resolve_lora_targeting
 
         model_class = AutoModelForImageTextToText
+        # the vision tower stays frozen (language-module adapters only), but image rows run
+        # through it, so the session can accept images; same pinned revision as the weights.
+        processor = AutoProcessor.from_pretrained(
+            model_id, revision=revision, trust_remote_code=False
+        )
         surface = resolve_lora_targeting(model_id, algorithm="custom", multimodal=False)
         targeting = {
             "exclude_modules": surface.exclude_modules,
@@ -409,7 +492,13 @@ def load_backend(
         )
     validate_placement(model, gpu_count)
     model.config._commit_hash = revision
-    return TorchBackend(model, tokenizer, checkpoint_dir=checkpoint_dir, max_tokens=max_tokens)
+    return TorchBackend(
+        model,
+        tokenizer,
+        checkpoint_dir=checkpoint_dir,
+        max_tokens=max_tokens,
+        processor=processor,
+    )
 
 
 def _uses_language_model_layout(adapter_dir):

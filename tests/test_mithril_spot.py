@@ -95,7 +95,7 @@ def test_spot_estimate_is_offline_and_uses_fixed_cap(monkeypatch):
     config = {"model_id": "Qwen/Qwen3.5-9B", "method": "sft", "steps": 100, "gpu_type": "H100"}
     spot = estimate_cost(RunConfig(**config, provider="spot"))
     modal = estimate_cost(RunConfig(**config, provider="modal"))
-    assert spot.gpu_hourly_usd == 1.01
+    assert spot.gpu_hourly_usd == 1
     assert spot.total_usd < modal.total_usd / 3
     assert spot.provider == "spot"
 
@@ -292,6 +292,7 @@ def test_stopped_spot_worker_requeues_until_price_recovers(monkeypatch):
 
     states = []
     prices_to_check = iter([[], [], [prices.Offer("H100", 1, "it_test", 0.9, 1500)]])
+    monkeypatch.setattr(queue, "quota_available", lambda *a, **kw: True)
     monkeypatch.setattr(queue, "settings", lambda: {"region": "test"})
     monkeypatch.setattr(queue, "affordable_offers", lambda region, **kw: next(prices_to_check))
     monkeypatch.setattr(status, "get_status", lambda run: SimpleNamespace(state="queued"))
@@ -300,3 +301,94 @@ def test_stopped_spot_worker_requeues_until_price_recovers(monkeypatch):
     queue.wait_for_price("H100", spec.run_id, deadline_at=500, log=io.StringIO())
     assert now[0] == queued_at + 120
     assert states == ["queued", "queued", "provisioning"]
+
+
+@pytest.mark.parametrize(
+    ("spot", "error", "failure"),
+    [
+        # a gracefully stopped Spot VM: SIGTERM reaches the worker before the host disappears
+        (True, "WorkerInterrupted: worker interrupted by signal 15", "job_preempted"),
+        # other transient worker faults keep the bounded infrastructure retry
+        (True, "RetriableBootstrapError: train phase exited non-zero", "worker_retriable"),
+        # Modal (no flag) keeps its existing classification
+        (False, "WorkerInterrupted: worker interrupted by signal 15", "worker_retriable"),
+    ],
+)
+def test_spot_signal_interruption_is_preemption(spot, error, failure):
+    from flash.providers._lifecycle.instances.poll_instance import _TerminalArtifacts
+
+    adapter = SimpleNamespace(
+        signal_interruption_is_preemption=spot,
+        current_attempt=2,
+        failure_detail=lambda marker: (marker or {}).get("error") or "",
+    )
+    artifacts = _TerminalArtifacts(
+        adapter, say=print, heartbeat_reader=None, launch_ts=0.0, absolute_deadline=None
+    )
+    result = artifacts._fail_from_marker({"retriable": True, "error": error})
+    assert result.failure == failure
+    assert result.detail == error
+
+
+@pytest.mark.parametrize("algorithm", ["sft", "grpo", "custom"])
+def test_mithril_signal_preemption_requeues_without_retry_budget(monkeypatch, algorithm):
+    from flash.core.spec import GpuSpec, JobSpec, TrainSpec
+    from flash.providers._lifecycle.instances.poll_instance import _TerminalArtifacts
+    from flash.providers.core.base import Candidate
+    from flash.providers.mithril import jobs
+    from flash.providers.mithril.handles import SpotJobHandle
+    from flash.runner.supervise.retry_decision import (
+        FailureObservation,
+        RetryState,
+        transition_failure,
+    )
+
+    spec = JobSpec(
+        algorithm=algorithm,
+        run_id="run",
+        gpu=GpuSpec(provider="spot", max_retries=0),
+        train=TrainSpec(hf_repo="org/repo"),
+    )
+    handle = SpotJobHandle(
+        instance_id="bid_test",
+        gpu="H100",
+        hourly_usd=1,
+        attempt=0,
+        started_ts=100,
+        name="test",
+        run_id="run",
+        hf_repo="org/repo",
+        phase=spec.phase,
+        scope="test",
+    )
+    monkeypatch.setattr(jobs, "require_scope", lambda _: None)
+    monkeypatch.setattr(jobs, "make_artifact_text_reader", lambda *a, **kw: lambda **kw: None)
+    monkeypatch.setattr(jobs, "heartbeat_reader_for", lambda *a, **kw: None)
+
+    def interrupted(adapter, **kwargs):
+        artifacts = _TerminalArtifacts(
+            adapter, say=print, heartbeat_reader=None, launch_ts=100, absolute_deadline=None
+        )
+        return artifacts._fail_from_marker(
+            {"retriable": True, "error": "WorkerInterrupted: worker interrupted by signal 15"}
+        )
+
+    monkeypatch.setattr(jobs, "poll_instance_job", interrupted)
+    result = jobs.poll(handle, spec)
+    assert result.failure == "job_preempted"
+    chosen = Candidate("spot", "H100", 1, 80, 1)
+    state, plan = transition_failure(
+        RetryState.initial_for_spec(spec),
+        FailureObservation(result.failure, chosen, (chosen,)),
+        attempt=0,
+    )
+    assert plan.retry
+    assert state.infra_used == 0
+
+
+def test_entry_and_running_caps_do_not_change_fixed_customer_rates():
+    from flash.providers.mithril.pricing import SPOT_GPUS, hourly_rate
+
+    assert [hourly_rate(gpu) for gpu in SPOT_GPUS] == [1, 1, 4]
+    assert [str(shape.entry_below_usd) for shape in SPOT_GPUS.values()] == ["1.01", "1.01", "4.01"]
+    assert [str(shape.keep_running_usd) for shape in SPOT_GPUS.values()] == ["2.01", "2.51", "5.01"]

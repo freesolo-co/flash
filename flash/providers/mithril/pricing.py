@@ -1,4 +1,4 @@
-"""Fixed Spot entry estimates and separate hold caps, in USD per GPU-hour.
+"""Fixed Spot rates, entry thresholds and separate hold caps, in USD per GPU-hour.
 
 These are user-selected thresholds, not current market prices or capacity guarantees.
 Each threshold includes a $0.01/GPU-hour offset above the selected base cap.
@@ -15,14 +15,15 @@ from flash.providers.core.base import canonical_gpu
 @dataclass(frozen=True)
 class SpotGpu:
     hourly_usd: Decimal
+    entry_below_usd: Decimal
     keep_running_usd: Decimal
     counts: tuple[int, ...] = (1, 8)
 
 
 SPOT_GPUS = {
-    "H100": SpotGpu(Decimal("1.01"), Decimal("2.01")),
-    "H200": SpotGpu(Decimal("1.01"), Decimal("2.51")),
-    "B200": SpotGpu(Decimal("4.01"), Decimal("5.01")),
+    "H100": SpotGpu(Decimal("1.00"), Decimal("1.01"), Decimal("2.01")),
+    "H200": SpotGpu(Decimal("1.00"), Decimal("1.01"), Decimal("2.51")),
+    "B200": SpotGpu(Decimal("4.00"), Decimal("4.01"), Decimal("5.01")),
 }
 
 
@@ -35,7 +36,7 @@ def accepts_price(gpu: str, value, *, currency: str, unit: str) -> bool:
         return False
     try:
         price = Decimal(str(value))
-        return price.is_finite() and 0 < price < SPOT_GPUS[canonical_gpu(gpu)].hourly_usd
+        return price.is_finite() and 0 < price < SPOT_GPUS[canonical_gpu(gpu)].entry_below_usd
     except (ValueError, ArithmeticError):
         return False
 

@@ -5,6 +5,7 @@ The public router and the separate DeepSeek deployment remain on Modal.
 """
 
 import asyncio
+import itertools
 import os
 import time
 import uuid
@@ -14,6 +15,7 @@ from typing import TYPE_CHECKING, Any
 import modal
 
 from flash.schema import parse_checkpoint_ref
+from flash.serving.app.authorization_response import _authorize_response as _authorize_response
 from flash.serving.app.rollout import model_engine_name
 from flash.serving.app.timeouts import (
     LAMBDA_STARTUP_TIMEOUT_SECONDS,
@@ -43,7 +45,9 @@ _validate_deploy_wiring = modal.is_local() and os.environ.get("MODAL_IS_REMOTE")
 _ALLOWED_SERVING_DEPLOYMENT_MODES = frozenset({"production", "development"})
 _requested_deployment_mode = os.environ.get("SERVING_DEPLOYMENT_MODE", "").strip()
 SERVING_DEPLOYMENT_MODE = _requested_deployment_mode or "production"
-MODAL_ENVIRONMENT = str(modal.config.config.get("environment") or "").strip()
+# Modal uses main when no environment is explicitly configured. Resolve the same
+# default before selecting reserved classes and their request routes.
+MODAL_ENVIRONMENT = str(modal.config.config.get("environment") or "main").strip()
 if _validate_deploy_wiring:
     if SERVING_DEPLOYMENT_MODE not in _ALLOWED_SERVING_DEPLOYMENT_MODES:
         raise ValueError(
@@ -319,6 +323,7 @@ from flash.serving.app.inference_provider import (  # noqa: E402
     modal_gpus_for,
 )
 from flash.serving.app.modal_engine import HostedModalEngine  # noqa: E402
+from flash.serving.lambda_cloud import reserved  # noqa: E402
 from flash.serving.lambda_cloud.proxy import LambdaEngineProxy  # noqa: E402
 from flash.serving.src.engine.lora_engine import _LoraEngineImpl  # noqa: E402, F401
 
@@ -371,12 +376,19 @@ def _build_engine(
     target_inputs: int,
     provider: str = "lambda",
     max_capacity: int = 2,
+    reserved_slot: int = 0,
 ) -> Any:
     """Register a Modal GPU engine or Lambda CPU proxy under a stable model name.
 
     Set the class identity before decorators so Modal can re-import it remotely.
     """
-    implementation = HostedModalEngine if provider == "modal" else LambdaEngineProxy
+    implementation = (
+        reserved.ReservedLambdaEngineProxy
+        if provider == "reserved"
+        else HostedModalEngine
+        if provider == "modal"
+        else LambdaEngineProxy
+    )
 
     class _Engine(implementation):
         base_model: str = modal.parameter()
@@ -451,6 +463,7 @@ def _build_engine(
 
     # Lambda reports actual hardware remotely; Modal is pinned by its decorator.
     _Engine.pinned_gpu = gpu if provider == "modal" else None
+    _Engine.reserved_slot = reserved_slot
     # Modal must see the final module-level identity before decoration.
     _Engine.__name__ = class_name
     _Engine.__qualname__ = class_name
@@ -470,7 +483,11 @@ def _build_engine(
             "cpu": 1,
             "memory": 2048,
             "nonpreemptible": True,  # Modal supports this only for CPU workloads.
-            "secrets": lambda_proxy_secrets,
+            "secrets": (
+                [modal.Secret.from_name(reserved.SECRET_NAME)]
+                if provider == "reserved"
+                else lambda_proxy_secrets
+            ),
         }
     )
     engine = app.cls(
@@ -499,9 +516,28 @@ def _configured_engine(model, provider, suffix=""):
     )
 
 
-ENGINE_BY_MODEL: dict[str, Any] = {bm: _configured_engine(bm, "lambda") for bm in base_models()}
+ENGINE_BY_MODEL: dict[str, Any] = {
+    bm: _configured_engine(bm, "lambda")
+    for bm in base_models()
+    if not reserved.enabled(bm, MODAL_ENVIRONMENT)
+}
+RESERVED_ENGINES = (
+    tuple(
+        _build_engine(
+            "H100",
+            model_engine_name(reserved.MODEL) + f"_ReservedH100{slot}",
+            *_engine_concurrency(reserved.MODEL),
+            provider="reserved",
+            max_capacity=1,
+            reserved_slot=slot,
+        )
+        for slot in range(1, 5)
+    )
+    if reserved.enabled(reserved.MODEL, MODAL_ENVIRONMENT)
+    else ()
+)
 MODAL_FALLBACK_BY_MODEL: dict[str, Any] = {
-    bm: _configured_engine(bm, "modal", "_ModalGPU") for bm in base_models()
+    bm: _configured_engine(bm, "modal", "_ModalGPU") for bm in base_models() if bm != reserved.MODEL
 }
 
 
@@ -521,8 +557,11 @@ class _ModalEnginePool:
         from flash.serving.app.provider_selection import bind_lambda_control
 
         self._fleet, self._provider_selection = bind_lambda_control()
+        self._reserved_cycle = itertools.cycle(RESERVED_ENGINES)
 
     async def _engine_for(self, model):
+        if RESERVED_ENGINES and model == reserved.MODEL:
+            return next(self._reserved_cycle)(base_model=model)
         if (
             model in MODAL_FALLBACK_BY_MODEL
             and await self._provider_selection.choose(model) == "modal"
@@ -617,6 +656,16 @@ class _ModalEnginePool:
                 await close()
 
     async def register(self, base_model: str, record: Any) -> None:
+        if RESERVED_ENGINES and base_model == reserved.MODEL:
+            await asyncio.gather(
+                *(
+                    cls(base_model=base_model).register.remote.aio(
+                        self._record_payload(record), getattr(record, "deployment_generation", None)
+                    )
+                    for cls in RESERVED_ENGINES
+                )
+            )
+            return
         engine = await self._engine_for(base_model)
         await engine.register.remote.aio(
             self._record_payload(record),
@@ -630,17 +679,22 @@ class _ModalEnginePool:
         model_id: str,
         expected_generation: str | None = None,
     ) -> None:
-        if base_model in MODAL_FALLBACK_BY_MODEL:
-            from flash.serving.app.provider_selection import unregister_active
+        if RESERVED_ENGINES and base_model == reserved.MODEL:
+            await asyncio.gather(
+                *(
+                    cls(base_model=base_model).unregister.remote.aio(
+                        org_id, model_id, expected_generation
+                    )
+                    for cls in RESERVED_ENGINES
+                )
+            )
+            return
+        from flash.serving.app.provider_selection import unregister_active
 
-            engines = [
-                ENGINE_BY_MODEL[base_model](base_model=base_model),
-                MODAL_FALLBACK_BY_MODEL[base_model](base_model=base_model),
-            ]
-            await unregister_active(engines, org_id, model_id, expected_generation)
-        else:
-            engine = await self._engine_for(base_model)
-            await engine.unregister.remote.aio(org_id, model_id, expected_generation)
+        engines = [ENGINE_BY_MODEL[base_model](base_model=base_model)]
+        if base_model in MODAL_FALLBACK_BY_MODEL:
+            engines.append(MODAL_FALLBACK_BY_MODEL[base_model](base_model=base_model))
+        await unregister_active(engines, org_id, model_id, expected_generation)
 
 
 def _build_usage_outbox(settings: Any) -> Any:
@@ -665,71 +719,6 @@ def _build_usage_outbox(settings: Any) -> Any:
 _AUTH_CACHE_TTL_SECONDS = 60.0
 _AUTH_CACHE_REFRESH_SECONDS = 10.0
 _AUTH_CACHE_MAX_ENTRIES = 4096
-
-
-def _authorize_response(
-    resp: Any, model_id: str, *, require_api_key_id: bool = False
-) -> "AuthorizedTraffic":
-    """Return the approved billing org and checkpoint generation, or fail closed."""
-    from fastapi import HTTPException, status
-
-    from flash.serving.src.accounting.usage import AuthorizedTraffic, principal_for_external_org
-
-    if resp.status_code == 200:
-        # Bind billing and checkpoint dispatch to the same backend authorization.
-        try:
-            body = resp.json()
-            org_id = body.get("orgId")
-            if not isinstance(org_id, str) or not org_id.strip():
-                raise ValueError("missing billing organization")
-            api_key_id = body.get("apiKeyId")
-            if require_api_key_id or api_key_id is not None:
-                from uuid import UUID
-
-                api_key_id = str(UUID(api_key_id))
-            generation = body.get("deploymentGeneration")
-            if parse_checkpoint_ref(model_id) is not None and (
-                not isinstance(generation, str) or not generation.strip()
-            ):
-                raise ValueError("missing verified checkpoint generation")
-        except Exception as exc:
-            raise HTTPException(
-                status.HTTP_503_SERVICE_UNAVAILABLE,
-                "serving auth backend returned malformed response",
-            ) from exc
-        return AuthorizedTraffic(principal_for_external_org(org_id), generation, api_key_id)
-    if resp.status_code == 401:
-        # The backend returns 401 for BOTH an invalid *user* key (our authorize route, body
-        # code "invalid_api_key") AND a rejected serving *machine* bearer (require_internal_token,
-        # decided before the user key is even read). Only the former is the caller's fault; the
-        # latter is a serving misconfiguration we must not report as the user's bad key.
-        code = ""
-        try:
-            detail = resp.json().get("detail")
-            if isinstance(detail, dict):
-                code = detail.get("code") or ""
-        except Exception:  # a non-JSON 401 is an internal-auth failure (below)
-            code = ""
-        if code == "invalid_api_key":
-            raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Invalid Freesolo API key")
-        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "serving auth is misconfigured")
-    # Org has no budget to serve (zero balance and no card+auto-topup). The backend gates this
-    # before generation so a broke org can't serve for free; surface it as a clean 402 rather
-    # than letting it fall through to the retryable 503 below.
-    if resp.status_code == 402:
-        raise HTTPException(
-            status.HTTP_402_PAYMENT_REQUIRED,
-            "insufficient balance: top up or enable auto-topup to serve this model",
-        )
-    # Unknown adapter (404) and org mismatch (403) both collapse to 403 so we don't leak
-    # which adapters exist to an unauthorized caller.
-    if resp.status_code in (403, 404):
-        raise HTTPException(status.HTTP_403_FORBIDDEN, "API key is not authorized for this adapter")
-    # Any backend 5xx (500/502/503/504) or other unexpected status is a transient auth-lookup
-    # infra failure (Supabase down, backend overloaded). Surface it as a RETRYABLE 503, never a
-    # 502: a client/load-balancer must be free to retry rather than treat it as a permanent
-    # upstream error. The cache+single-flight above is what makes this failure rare under load.
-    raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "serving auth backend unavailable")
 
 
 def _build_chat_authorizer(settings: Any) -> Any:
@@ -965,9 +954,15 @@ def start_all(base_model: str | None = None) -> None:
     failures: list[str] = []
     models = [base_model] if base_model else list(base_models())
     for bm in models:
-        engine = modal.Cls.from_name(APP_NAME, model_engine_name(bm))
-        instance = engine(base_model=bm)
-        started[bm] = instance.health.spawn()
+        names = (
+            [model_engine_name(bm) + f"_ReservedH100{slot}" for slot in range(1, 5)]
+            if reserved.enabled(bm, MODAL_ENVIRONMENT)
+            else [model_engine_name(bm)]
+        )
+        for name in names:
+            engine = modal.Cls.from_name(APP_NAME, name)
+            instance = engine(base_model=bm)
+            started[name] = instance.health.spawn()
     for bm, handle in started.items():
         try:
             print(f"started {bm}: {handle.get(timeout=1800)}", flush=True)

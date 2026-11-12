@@ -240,6 +240,16 @@ def create(*, name, offer, payload, image_reference, gpu, gpu_count, capsule, di
             return existing
         if isinstance(error, MithrilApiError) and error.status == 429:
             raise CapacityUnavailableError("Mithril request throttled; requeuing") from None
+        if isinstance(error, MithrilApiError) and error.status in {400, 403, 409, 422}:
+            from flash.providers.mithril.capacity import quota_available
+
+            # A definitive refusal plus exhausted quota is safe to requeue only
+            # after reconciliation found no bid. Never retry unknown POST outcomes.
+            with contextlib.suppress(MithrilApiError):
+                if not quota_available(offer.instance_type, deadline_at=deadline_at):
+                    raise CapacityUnavailableError(
+                        "Mithril Spot quota exhausted; requeuing"
+                    ) from None
         raise UnreconciledCreateError(
             "Mithril launch could not be reconciled; refusing duplicate allocation"
         ) from None

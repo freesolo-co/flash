@@ -197,6 +197,7 @@ def test_invalid_prices_fail_closed(monkeypatch, price):
 
 
 def test_queue_waits_for_exact_count_and_disk_without_provisioning(monkeypatch):
+    monkeypatch.setattr(queue, "quota_available", lambda *a, **kw: True)
     from flash.runner.lifecycle import status
 
     now = [100.0]
@@ -219,7 +220,7 @@ def test_queue_waits_for_exact_count_and_disk_without_provisioning(monkeypatch):
     assert states == ["queued", "queued", "provisioning"]
 
 
-def launch(monkeypatch, *, count=1):
+def launch(monkeypatch, *, count=1, gpu="H200"):
     monkeypatch.setattr(
         bootstrap,
         "startup_script",
@@ -227,10 +228,10 @@ def launch(monkeypatch, *, count=1):
     )
     return api.create(
         name="flash-test-a0",
-        offer=Offer("H200", count, "it_test", 0.8, 1500),
+        offer=Offer(gpu, count, "it_test", 0.8, 1500),
         payload=payload(),
         image_reference="worker",
-        gpu="H200",
+        gpu=gpu,
         gpu_count=count,
         capsule=b"capsule",
         disk_gb=500,
@@ -239,7 +240,8 @@ def launch(monkeypatch, *, count=1):
 
 
 @pytest.mark.parametrize("count", [1, 8])
-def test_create_bids_for_one_instance_at_per_instance_hold_cap(monkeypatch, count):
+@pytest.mark.parametrize(("gpu", "cap"), [("H100", 2.01), ("H200", 2.51), ("B200", 5.01)])
+def test_create_bids_for_one_instance_at_per_instance_hold_cap(monkeypatch, count, gpu, cap):
     monkeypatch.setattr(api, "pages", lambda *a, **kw: [])
     captured = []
 
@@ -248,10 +250,10 @@ def test_create_bids_for_one_instance_at_per_instance_hold_cap(monkeypatch, coun
         return {"fid": "bid_test"}
 
     monkeypatch.setattr(api, "call", call)
-    assert launch(monkeypatch, count=count) == "bid_test"
+    assert launch(monkeypatch, count=count, gpu=gpu) == "bid_test"
     body = captured[0]
     assert body["instance_quantity"] == 1
-    assert body["limit_price"] == f"${2.51 * count:.2f}"
+    assert body["limit_price"] == f"${cap * count:.2f}"
     assert body["launch_specification"]["volumes"] == []
     assert "api_key" not in json.dumps(body)
     assert api._ownership(body)["flash-run"] == "test"
@@ -608,3 +610,34 @@ def test_orphan_sweep_reaps_terminated_bid_with_stopping_instance(monkeypatch):
         "bid_test"
     ]
     assert terminated == ["bid_test"]
+
+
+@pytest.mark.parametrize("status", [400, 403, 409, 422, 429, 0, 500])
+def test_capacity_refusal_requeues_but_unknown_create_outcomes_do_not(monkeypatch, status):
+    from flash.providers.core.base import CapacityUnavailableError
+    from flash.providers.mithril import capacity
+
+    monkeypatch.setattr(api, "pages", lambda *a, **kw: [])
+    monkeypatch.setattr(capacity, "quota_available", lambda *a, **kw: False)
+
+    def refuse(*args, **kwargs):
+        raise client.MithrilApiError(status=status)
+
+    monkeypatch.setattr(api, "call", refuse)
+    error = UnreconciledCreateError if status in {0, 500} else CapacityUnavailableError
+    with pytest.raises(error):
+        launch(monkeypatch)
+
+
+def test_refused_create_reconciles_existing_bid_before_capacity_retry(monkeypatch):
+    from flash.providers.mithril import capacity
+
+    listings = iter([[], [owned_bid()]])
+    monkeypatch.setattr(api, "pages", lambda *a, **kw: next(listings))
+    monkeypatch.setattr(capacity, "quota_available", lambda *a, **kw: pytest.fail("existing bid"))
+
+    def refuse(*args, **kwargs):
+        raise client.MithrilApiError(status=429)
+
+    monkeypatch.setattr(api, "call", refuse)
+    assert launch(monkeypatch) == "bid_test"

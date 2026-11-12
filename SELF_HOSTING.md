@@ -27,11 +27,11 @@ release does not migrate or delete existing legacy VMs.
 
 ## Admission, prices and recovery
 
-| GPU | Start below / fixed estimate per GPU-hour | Bid cap per GPU-hour |
-| --- | ---: | ---: |
-| H100 | $1.01 | $2.01 |
-| H200 | $1.01 | $2.51 |
-| B200 | $4.01 | $5.01 |
+| GPU | Fixed estimate / charge rate | Start below | Bid cap per GPU-hour |
+| --- | ---: | ---: | ---: |
+| H100 | $1.00 | $1.01 | $2.01 |
+| H200 | $1.00 | $1.01 | $2.51 |
+| B200 | $4.00 | $4.01 | $5.01 |
 
 The policy lives in `flash/providers/mithril/pricing.py`. Flash joins the authenticated
 instance-type catalog to live regional auctions, admitting only advertised SXM
@@ -49,6 +49,11 @@ while $8.08 does not. Current market prices may leave all jobs queued.
 Malformed or unavailable prices fail closed. Jobs recheck every 60 seconds without
 creating bids or consuming training retries; waiting respects cancellation and the
 run deadline. The selected GPU count and disk requirement are rechecked before launch.
+Project Spot quotas are checked for the exact instance type, including usage by
+other jobs. Exhausted or unreadable quotas keep the job queued. Missing shape
+quota rows defer to server enforcement. Definitively refused creates with confirmed
+quota exhaustion requeue only after reconciliation finds no bid; unknown POST
+outcomes remain fail-closed. Organization-level limits remain server-enforced.
 
 Customer charges retain the accepted Spot quote ($1 per GPU-hour for H100/H200 or
 $4 for B200), with the existing completed-work/session-time settlement rules.
@@ -60,7 +65,8 @@ cancellation also stops unallocated bids and automatic reallocation. Cleanup con
 both bid termination and stopped instances. An ambiguous create is reconciled by
 attempt name and ownership; it is never blindly retried. Preemption or relocation
 ends the attempt, cancels the bid, and lets Flash resume a fresh attempt from its
-latest fully uploaded trainer checkpoint. Workers atomically claim their attempt
+latest fully uploaded trainer checkpoint. SIGTERM interruption is treated as Spot
+preemption, not a budgeted worker fault, including custom jobs with zero retries. Workers atomically claim their attempt
 in private Azure storage, preventing a duplicate or replacement host from running
 the same attempt twice. Flash does not install a service to restart training after
 Mithril reboots a preserved boot disk.

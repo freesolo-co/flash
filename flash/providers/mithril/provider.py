@@ -1,6 +1,7 @@
 """Mithril-only Spot training provider."""
 
-from flash.providers.core.base import GPU_INFO, Candidate
+from flash.providers.core import base
+from flash.providers.core.base import Candidate
 from flash.providers.mithril.config import configured
 from flash.providers.mithril.handles import SpotJobHandle, require_scope
 from flash.providers.mithril.pricing import SPOT_GPUS, hourly_rate
@@ -27,7 +28,7 @@ class SpotProvider:
         return problems
 
     def gpu_classes(self):
-        return [GPU_INFO[name] for name in SPOT_GPUS]
+        return [base.GPU_INFO[name] for name in SPOT_GPUS]
 
     def hourly_rate(self, gpu):
         return hourly_rate(gpu)
@@ -38,10 +39,14 @@ class SpotProvider:
 
         return [
             Candidate(
-                self.name, offer.gpu, offer.hourly_usd, GPU_INFO[offer.gpu].vram_gb, offer.count
+                self.name,
+                offer.gpu,
+                offer.hourly_usd,
+                base.GPU_INFO[offer.gpu].vram_gb,
+                offer.count,
             )
             for offer in affordable_offers(settings()["region"])
-            if GPU_INFO[offer.gpu].vram_gb >= need_vram_gb
+            if base.GPU_INFO[offer.gpu].vram_gb >= need_vram_gb
             and offer.count <= constraints.max_gpu_count
             and offer.disk_gb >= constraints.disk_gb
         ]
