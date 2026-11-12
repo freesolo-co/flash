@@ -86,6 +86,74 @@ def test_stop_before_training_never_meters():
     assert "billable_train_s" not in timings.snapshot()
 
 
+def test_sft_runner_meters_from_first_update_to_child_exit(worker_context, monkeypatch):
+    """The real SFT runner path: child stdout drives the meter, child exit freezes it."""
+    from types import SimpleNamespace
+
+    from flash.engine.worker.train.entry import sft_train, sft_train_runner
+
+    now = [100.0]
+    monkeypatch.setattr(phases.time, "monotonic", lambda: now[0])
+
+    def fake_child(child, callbacks, on_line, *, context):
+        now[0] = 700.0  # trainer/model init inside the child: not billed
+        line = phases.PREFIX + json.dumps(_event("first_update", "started"))
+        context.phase_timings.observe_line(line)
+        now[0] = 4300.0  # one hour of optimizer updates
+        return 0
+
+    class _Sampler:
+        def start(self):
+            return self
+
+        def stop_gb(self):
+            now[0] = 9000.0  # post-loop work (sampler stop, publication): not billed
+            return 1.0
+
+    monkeypatch.setattr(sft_train_runner, "_invoke_sft_child", fake_child)
+    monkeypatch.setattr(sft_train, "_NvidiaSmiPeakSampler", _Sampler)
+    monkeypatch.setattr(
+        sft_train_runner, "liveness_heartbeat", lambda *a, **k: __import__("contextlib").nullcontext()
+    )
+    watcher = SimpleNamespace(start=lambda: None, stop=lambda require_complete: None)
+    child = SimpleNamespace(resume_step=0, watcher=watcher)
+    progress = SimpleNamespace(values={"step": 0}, expected_components=(), runtime_verified=True)
+    sft_train_runner._run_sft_child(child, 10, progress, lambda line: None, context=worker_context)
+    assert worker_context.phase_timings.billable_train_seconds() == pytest.approx(3600.0)
+    now[0] = 99999.0
+    assert worker_context.phase_timings.snapshot()["billable_train_s"] == pytest.approx(3600.0)
+
+
+def test_heartbeat_and_terminal_metrics_carry_the_meter(worker_context, monkeypatch):
+    from types import SimpleNamespace
+
+    from flash.engine.worker.io import artifacts as hf
+    from flash.engine.worker.io import heartbeat
+    from flash.engine.worker.train.core.lifecycle import finalize
+
+    now = [0.0]
+    monkeypatch.setattr(phases.time, "monotonic", lambda: now[0])
+    payloads = []
+    monkeypatch.setattr(hf, "upload_artifact_file", lambda *a, **k: True)
+    monkeypatch.setattr(
+        heartbeat,
+        "_console_heartbeat_snapshot",
+        lambda payload, *args, **kw: payloads.append(payload) or "{}",
+    )
+    worker_context.phase_timings.observe(_event("first_update", "started"))
+    now[0] = 120.0
+    heartbeat.heartbeat("rl_step", step=1, context=worker_context)
+    assert payloads[-1]["training_timing"]["billable_train_s"] == 120.0
+    worker_context.phase_timings.stop_billing()
+    now[0] = 500.0
+    metrics = []
+    monkeypatch.setattr(finalize, "_publish_training_completion", lambda m, **kw: metrics.append(m))
+    monkeypatch.setattr(worker_context, "require_active_env", lambda: SimpleNamespace(id="test"))
+    monkeypatch.setattr(finalize, "gpu_diagnostics", dict)
+    finalize.write_train_meta("rl", "/tmp/adapter", "model", 130, 21, 0, 0, {}, context=worker_context)
+    assert metrics[0].notes["training_timing"]["billable_train_s"] == 120.0
+
+
 # ---------------------------------------------------------------------------- charge
 
 
