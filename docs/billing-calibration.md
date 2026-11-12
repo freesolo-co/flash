@@ -75,13 +75,15 @@ What the quote still cannot know:
 - **Per-architecture efficiency.** Qwen3.5-4B runs ~0.8–0.9× its estimate, which suggests it is
   less efficient per FLOP than 0.8B or 9B.
 
-- **PCIe-class cards.** Live SFT measured these effective training throughputs: A100 SXM ~162
-  TFLOPS (catalog 264; estimate/actual 0.69) and L40S ~61 TFLOPS (catalog 362 is the sparse figure;
-  estimate/actual 0.59). H100, H200 and RTX Pro 6000 match their catalog values (0.94–1.01).
-  These caps are deliberately **not** applied yet. `effective_train_tflops` also drives
-  dollars-per-step GPU ranking, and capping A100 moves 9B GRPO onto RTX Pro 6000, where the one
-  measured GRPO run took ~3× its estimate (bandwidth-bound decode). Applying per-card caps needs
-  both SFT and GRPO measurements per card, so it is left as a follow-up.
+- **A100 SXM** measured ~0.68× its spec-peak estimate for both SFT (0.69) and GRPO (0.67). Its
+  training throughput is capped at the measured **162 TFLOPS** (catalog 264), which brings A100 SFT to
+  1.00 and A100 GRPO to 0.76. A per-card GRPO step-floor offset waits until the codebase's 3-arm
+  minimum is met. The cap also changes dollars-per-step placement: unconstrained 9B GRPO now lands
+  on **RTX Pro 6000**, which live runs confirm is cheaper per job ($0.214 vs $0.324 on A100 for the
+  same run; RTX Pro measured 0.94 for SFT and 1.21 for GRPO).
+- **L40S** is **not** capped. It measured slow for SFT (0.59; its catalog 362 TFLOPS is the sparse
+  figure) but fast for GRPO (1.47, faster than H100), which a single throughput number cannot
+  represent.
 
 The charge is metered, so these limits affect only the estimate, never the amount billed.
 

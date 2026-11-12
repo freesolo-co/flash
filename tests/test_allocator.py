@@ -36,7 +36,9 @@ def test_provider_allocation_lands_on_full_validated_cards():
 
     a9 = allocator.allocate("Qwen/Qwen3.5-9B", "grpo")
     assert a9.provider == "modal"
-    assert a9.gpu == "A100 SXM"  # cheapest validated Modal dollars per step
+    # cheapest validated Modal dollars per step at measured training throughput: live 9B grpo cost
+    # $0.214 on RTX Pro 6000 vs $0.324 on A100 SXM for the same job (docs/billing-calibration.md).
+    assert a9.gpu == "RTX Pro 6000"
     a27_sft = allocator.allocate("Qwen/Qwen3.8-27B", "sft")
     assert a27_sft.provider == "modal"
     assert a27_sft.gpu == "H100"
@@ -119,10 +121,18 @@ def test_offline_allocates_static_cheapest():
     from flash.providers.core import allocator
     from flash.providers.core.base import cheapest_gpu
 
-    # Modal static rates: allocation matches cheapest_gpu.
+    # Modal static rates: allocation ranks by dollars per STEP, so it is never costlier per step than
+    # the cheapest-per-hour class cheapest_gpu names (at measured throughput it is RTX Pro 6000).
+    from flash.cost.analytical import step_cost_key
+    from flash.cost.types import RunConfig
+    from flash.providers.core.registry import get_provider
+
     a = allocator.allocate("Qwen/Qwen3.5-9B", "grpo")
     assert a.provider == "modal"
-    assert a.gpu == cheapest_gpu(a.min_vram_gb)
+    key = step_cost_key(RunConfig("Qwen/Qwen3.5-9B", "grpo", 1))
+    rate = get_provider("modal").hourly_rate
+    cheapest_hourly = cheapest_gpu(a.min_vram_gb)
+    assert key(a.gpu, rate(a.gpu)) <= key(cheapest_hourly, rate(cheapest_hourly))
 
 
 def test_nothing_fits_names_constraint(monkeypatch):
