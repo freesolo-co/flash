@@ -34,7 +34,7 @@ def accepts_price(gpu: str, value, *, currency: str, unit: str) -> bool:
         return False
     shape = SPOT_GPUS.get(canonical_gpu(gpu))
     if shape is None:
-        return False  # not a Spot class (e.g. B200)
+        return False  # not a Spot class
     try:
         price = Decimal(str(value))
         return price.is_finite() and 0 < price < shape.keep_running_usd

@@ -19,7 +19,7 @@ from flash.providers.mithril.pricing import accepts_price
         ("H100", "2.01", False),
         ("H200", "2.50", True),
         ("H200", "2.51", False),
-        ("B200", "1.00", False),
+        ("L40S", "1.00", False),
         ("H100", "NaN", False),
         ("H100", "Infinity", False),
         ("H100", "-1", False),
@@ -386,7 +386,7 @@ def test_mithril_signal_preemption_requeues_without_retry_budget(monkeypatch, al
 def test_entry_and_running_caps_do_not_change_fixed_customer_rates():
     from flash.providers.mithril.pricing import SPOT_GPUS, hourly_rate
 
-    assert list(SPOT_GPUS) == ["H100", "H200"]  # B200 is not offered on Spot
+    assert list(SPOT_GPUS) == ["H100", "H200"]  # Mithril offers only these
     assert [hourly_rate(gpu) for gpu in SPOT_GPUS] == [1, 1]
     assert [str(shape.keep_running_usd) for shape in SPOT_GPUS.values()] == ["2.01", "2.51"]
     assert not any(hasattr(shape, "entry_below_usd") for shape in SPOT_GPUS.values())

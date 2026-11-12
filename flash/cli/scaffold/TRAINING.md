@@ -414,9 +414,10 @@ Select Spot directly in your editable training TOML:
 spot = false # set true for Mithril Spot; false uses regular training
 ```
 
-Spot only uses Mithril and prefers fitting H100s, then H200s, then B200s.
-It queues until the price is below $1.01, $1.01, or $4.01 per GPU-hour respectively.
-Once running, the corresponding maximum prices are $2.01, $2.51, and $5.01.
+Spot only uses Mithril, which offers H100 and H200. Each has one cap per GPU-hour, $2.01
+for H100 and $2.51 for H200: a run starts below it and keeps running through it. A queued run
+waits for every class that fits its plan (an H100 run also takes an H200) and launches on
+whichever comes up first.
 
 GPU allocation and Azure artifacts are **managed by default**: leave `[gpu] type` unset to
 let the allocator pick the cheapest fitting validated class, while `train.hf_repo` remains
