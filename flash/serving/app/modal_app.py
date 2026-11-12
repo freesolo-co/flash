@@ -45,7 +45,9 @@ _validate_deploy_wiring = modal.is_local() and os.environ.get("MODAL_IS_REMOTE")
 _ALLOWED_SERVING_DEPLOYMENT_MODES = frozenset({"production", "development"})
 _requested_deployment_mode = os.environ.get("SERVING_DEPLOYMENT_MODE", "").strip()
 SERVING_DEPLOYMENT_MODE = _requested_deployment_mode or "production"
-MODAL_ENVIRONMENT = str(modal.config.config.get("environment") or "").strip()
+# Modal uses main when no environment is explicitly configured. Resolve the same
+# default before selecting reserved classes and their request routes.
+MODAL_ENVIRONMENT = str(modal.config.config.get("environment") or "main").strip()
 if _validate_deploy_wiring:
     if SERVING_DEPLOYMENT_MODE not in _ALLOWED_SERVING_DEPLOYMENT_MODES:
         raise ValueError(
