@@ -40,7 +40,7 @@ MFU_DECODE = 0.25  # batched vLLM rollout (decode is memory-bandwidth-bound)
 SFT_ATTENTION_COEF = 2.0
 # one-time work inside the billed window: the first optimizer update (graph capture, allocator
 # warm-up, first rollout for grpo). measured, not modeled.
-SFT_FIRST_UPDATE_S = 250.0
+SFT_FIRST_UPDATE_S = 300.0
 GRPO_FIRST_UPDATE_S = 95.0
 
 STEP_FLOOR_BASE_SECONDS = 3.5
@@ -94,7 +94,7 @@ STEP_FLOOR_SHARDED_FRACTION = 0.799
 # per-step publish/sync work. customer policy excludes the one-time framework setup from the quote,
 # while the recurring per-step work remains billable training. setup_seconds reports cold start and
 # model initialization separately for observability and never contributes to total_usd.
-SFT_STEP_FLOOR_SECONDS = 0.26
+SFT_STEP_FLOOR_SECONDS = 0.10
 
 
 def first_update_seconds(config: RunConfig) -> float:

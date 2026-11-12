@@ -45,8 +45,8 @@ runs decide, because historical "actual" values include unobservable queue time.
 |---|---|---|
 | SFT effective MFU (vs `effective_train_tflops`) | 0.25 | 0.85 |
 | SFT attention term (× mean example tokens / 32768) | — | 2.0 |
-| SFT per-step floor | 0.8 s | 0.26 s |
-| SFT first update (one-time) | — | 250 s |
+| SFT per-step floor | 0.8 s | 0.10 s |
+| SFT first update (one-time) | — | 300 s |
 | MoE SFT MFU (total params) | 0.10 | 0.45 |
 | GRPO step floor | 62.7 s + 0.805 s/completion | 3.5 s + 0.466 s/completion |
 | GRPO decode / update MFU | 0.12 / 0.35 | 0.25 / 0.72 |
@@ -66,8 +66,8 @@ Live runs cover Qwen3.5-0.8B, 4B, 9B, 9B-Base and Qwen3.6-35B-A3B on 1× H100, 1
 
 | | n | median | mean abs error | within ±20% |
 |---|---|---|---|---|
-| SFT | 11 | 0.96 | 10% | 82% |
-| GRPO | 7 | 1.02 | 12% | 86% |
+| SFT | 13 | 0.97 | 7% | 85% |
+| GRPO | 8 | 1.03 | 12% | 88% |
 
 What the quote still cannot know:
 - **GRPO realized completion length.** The quote prices with `max_completion_tokens`. A 2,048-token
