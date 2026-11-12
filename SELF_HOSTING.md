@@ -29,8 +29,8 @@ release does not migrate or delete existing legacy VMs.
 
 | GPU | Start below / fixed estimate per GPU-hour | Bid cap per GPU-hour |
 | --- | ---: | ---: |
-| H100 | $1.01 | $1.51 |
-| H200 | $1.01 | $2.01 |
+| H100 | $1.01 | $2.01 |
+| H200 | $1.01 | $2.51 |
 | B200 | $4.01 | $5.01 |
 
 The policy lives in `flash/providers/mithril/pricing.py`. Flash joins the authenticated

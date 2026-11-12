@@ -61,7 +61,7 @@ def owned_bid(**changes):
         "instances": ["inst_test"],
         "instance_type": "it_test",
         "instance_quantity": 1,
-        "limit_price": "$2.01",
+        "limit_price": "$2.51",
         "launch_specification": {"startup_script": "#!/bin/bash\n" + owner + "\n"},
         **changes,
     }
@@ -251,7 +251,7 @@ def test_create_bids_for_one_instance_at_per_instance_hold_cap(monkeypatch, coun
     assert launch(monkeypatch, count=count) == "bid_test"
     body = captured[0]
     assert body["instance_quantity"] == 1
-    assert body["limit_price"] == f"${2.01 * count:.2f}"
+    assert body["limit_price"] == f"${2.51 * count:.2f}"
     assert body["launch_specification"]["volumes"] == []
     assert "api_key" not in json.dumps(body)
     assert api._ownership(body)["flash-run"] == "test"
