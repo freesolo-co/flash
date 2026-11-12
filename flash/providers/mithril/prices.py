@@ -15,6 +15,7 @@ class Offer:
     instance_type: str
     hourly_usd: float  # per GPU, like Candidate.hourly_usd
     disk_gb: int
+    region: str = ""
 
 
 def dollars(raw):
@@ -26,7 +27,8 @@ def dollars(raw):
     return value
 
 
-def affordable_offers(region: str, *, deadline_at=None) -> list[Offer]:
+def affordable_offers(region: str | None = None, *, deadline_at=None) -> list[Offer]:
+    """Qualifying offers in ``region``, or in every region when it is empty/None."""
     try:
         types = call("GET", "/instance-types", deadline_at=deadline_at)
         auctions = call("GET", "/spot/availability", deadline_at=deadline_at)
@@ -35,7 +37,7 @@ def affordable_offers(region: str, *, deadline_at=None) -> list[Offer]:
         catalog = {row["fid"]: row for row in types}
         offers = []
         for auction in auctions:
-            if auction["region"] != region:
+            if region and auction["region"] != region:
                 continue
             shape = catalog[auction["instance_type"]]
             gpu = shape["gpu_type"]
@@ -53,7 +55,14 @@ def affordable_offers(region: str, *, deadline_at=None) -> list[Offer]:
             price = dollars(auction["last_instance_price"]) / count
             if accepts_price(gpu, price, currency="usd", unit="GPU hour"):
                 offers.append(
-                    Offer(gpu, count, shape["fid"], float(price), shape["local_storage_gb"])
+                    Offer(
+                        gpu,
+                        count,
+                        shape["fid"],
+                        float(price),
+                        shape["local_storage_gb"],
+                        auction["region"],
+                    )
                 )
         return offers
     except (MithrilApiError, ValueError, ArithmeticError, KeyError, TypeError, AttributeError):

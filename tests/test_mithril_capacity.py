@@ -61,7 +61,7 @@ def test_exhausted_or_unknown_quota_waits_then_rechecks_price(monkeypatch, first
     monkeypatch.setattr(queue, "settings", lambda: {"region": "test"})
     monkeypatch.setattr(status, "get_status", lambda _: SimpleNamespace(state="queued"))
     monkeypatch.setattr(status, "_update", lambda _, state: states.append(state))
-    offer = Offer("H200", 8, "it_8gpu", 1, 1500)
+    offer = Offer("H200", 8, "it_8gpu", 1, 1500, "us-central2-b")
     monkeypatch.setattr(
         queue, "affordable_offers", lambda *a, **kw: checks.append(now[0]) or [offer]
     )

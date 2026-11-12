@@ -159,13 +159,15 @@ def catalog(
 @pytest.mark.parametrize("count", [1, 8])
 def test_exact_dollar_per_gpu_auction_is_admitted(monkeypatch, count):
     catalog(monkeypatch, price=f"${count:.2f}", count=count)
-    assert prices.affordable_offers("us-central2-b") == [Offer("H200", count, "it_test", 1.0, 1500)]
+    assert prices.affordable_offers("us-central2-b") == [
+        Offer("H200", count, "it_test", 1.0, 1500, "us-central2-b")
+    ]
 
 
 def test_live_candidates_use_only_advertised_shapes_and_per_gpu_prices(monkeypatch):
     catalog(monkeypatch)
     offers = prices.affordable_offers("us-central2-b")
-    assert offers == [Offer("H200", 8, "it_test", 0.8, 1500)]
+    assert offers == [Offer("H200", 8, "it_test", 0.8, 1500, "us-central2-b")]
     candidates = get_provider("spot").live_candidates(80, AllocationConstraints(max_gpu_count=8))
     assert [(c.gpu, c.gpu_count, c.hourly_usd) for c in candidates] == [("H200", 8, 0.8)]
     assert get_provider("spot").live_candidates(80, AllocationConstraints(max_gpu_count=1)) == []
@@ -208,9 +210,9 @@ def test_queue_waits_for_exact_count_and_disk_without_provisioning(monkeypatch):
     monkeypatch.setattr(status, "_update", lambda _, state: states.append(state))
     answers = iter(
         [
-            [Offer("H200", 8, "it_8", 0.8, 1500)],
-            [Offer("H200", 1, "it_1", 0.9, 100)],
-            [Offer("H200", 1, "it_1", 0.9, 1500)],
+            [Offer("H200", 8, "it_8", 0.8, 1500, "us-central2-b")],
+            [Offer("H200", 1, "it_1", 0.9, 100, "us-central2-b")],
+            [Offer("H200", 1, "it_1", 0.9, 1500, "us-central2-b")],
         ]
     )
     monkeypatch.setattr(queue, "affordable_offers", lambda *a, **kw: next(answers))
@@ -228,7 +230,7 @@ def launch(monkeypatch, *, count=1, gpu="H200"):
     )
     return api.create(
         name="flash-test-a0",
-        offer=Offer(gpu, count, "it_test", 0.8, 1500),
+        offer=Offer(gpu, count, "it_test", 0.8, 1500, "us-central2-b"),
         payload=payload(),
         image_reference="worker",
         gpu=gpu,
@@ -641,3 +643,120 @@ def test_refused_create_reconciles_existing_bid_before_capacity_retry(monkeypatc
 
     monkeypatch.setattr(api, "call", refuse)
     assert launch(monkeypatch) == "bid_test"
+
+
+# --- any region (FLASH_MITHRIL_REGION unset) -------------------------------------------------
+
+
+def test_region_is_optional_and_scopes_ownership_to_the_project(monkeypatch):
+    pinned = config.scope_fingerprint()
+    assert pinned == config.region_scope_fingerprint("proj_test", "us-central2-b")
+    monkeypatch.delenv("FLASH_MITHRIL_REGION")
+    assert config.configured()
+    assert config.scope_fingerprint() != pinned
+    assert config.region_allowed("af-south1-a")
+    assert not config.region_allowed("")
+    monkeypatch.setenv("FLASH_MITHRIL_REGION", "us-central2-b")
+    assert not config.region_allowed("af-south1-a")
+
+
+def test_unpinned_offers_cover_every_region_and_keep_each_region(monkeypatch):
+    shapes = [
+        {
+            "fid": "it_test",
+            "gpu_type": "H200",
+            "num_gpus": 1,
+            "gpu_memory_gb": 141,
+            "gpu_socket": "SXM5",
+            "local_storage_gb": 1500,
+        }
+    ]
+    auctions = [
+        {"instance_type": "it_test", "region": r, "capacity": 3, "last_instance_price": p}
+        for r, p in (("us-central2-b", "$3.50"), ("af-south1-a", "$0.90"), ("eu-x", "$1.00"))
+    ]
+    monkeypatch.setattr(
+        prices, "call", lambda method, path, **kw: shapes if path == "/instance-types" else auctions
+    )
+    assert {o.region for o in prices.affordable_offers(None)} == {"af-south1-a", "eu-x"}
+    assert prices.affordable_offers("us-central2-b") == []  # pinned: original behavior
+
+
+def test_queue_picks_the_cheapest_region(monkeypatch):
+    monkeypatch.setattr(queue, "settings", lambda: {"region": ""})
+    monkeypatch.setattr(queue, "quota_available", lambda *a, **kw: True)
+    monkeypatch.setattr(
+        queue,
+        "affordable_offers",
+        lambda region, **kw: (
+            [
+                Offer("H200", 1, "it_a", 1.0, 1500, "eu-x"),
+                Offer("H200", 1, "it_b", 0.9, 1500, "af-south1-a"),
+            ]
+            if region is None
+            else pytest.fail("unpinned plane must not filter by region")
+        ),
+    )
+    from flash.runner.lifecycle import status
+
+    monkeypatch.setattr(status, "get_status", lambda run: SimpleNamespace(state="queued"))
+    monkeypatch.setattr(status, "_update", lambda run, state: None)
+    offer = queue.wait_for_price("H200", "test", deadline_at=time.time() + 60, log=io.StringIO())
+    assert offer.region == "af-south1-a"
+
+
+def test_unpinned_bid_uses_the_offer_region_and_pinned_rejects_others(monkeypatch):
+    monkeypatch.setattr(api, "pages", lambda *a, **kw: [])
+    captured = []
+    monkeypatch.setattr(
+        api, "call", lambda m, p, **kw: captured.append(kw["body"]) or {"fid": "bid_x"}
+    )
+    monkeypatch.setattr(
+        bootstrap,
+        "startup_script",
+        lambda *a, owner_line, **kw: "#!/bin/bash\n" + owner_line + "\n",
+    )
+
+    def create(region):
+        return api.create(
+            name="flash-test-a0",
+            offer=Offer("H200", 1, "it_test", 0.9, 1500, region),
+            payload=payload(),
+            image_reference="worker",
+            gpu="H200",
+            gpu_count=1,
+            capsule=b"capsule",
+            disk_gb=500,
+            deadline_at=time.time() + 100,
+        )
+
+    with pytest.raises(ValueError, match="region is not admitted"):
+        create("af-south1-a")  # still pinned to us-central2-b
+    monkeypatch.delenv("FLASH_MITHRIL_REGION")
+    assert create("af-south1-a") == "bid_x"
+    assert captured[-1]["region"] == "af-south1-a"
+
+
+def test_unpinned_ownership_accepts_any_region_and_pinned_does_not(monkeypatch):
+    assert api._ownership(owned_bid(region="af-south1-a")) is None
+    monkeypatch.delenv("FLASH_MITHRIL_REGION")
+    assert api._ownership(owned_bid(region="af-south1-a")) is not None
+    assert api._ownership(owned_bid(project="other")) is None
+
+
+def test_unpinning_keeps_in_flight_region_scoped_attempts(monkeypatch):
+    from flash.providers.mithril import handles
+
+    legacy = config.region_scope_fingerprint("proj_test", "us-central2-b")
+    monkeypatch.delenv("FLASH_MITHRIL_REGION")
+    handle = SimpleNamespace(scope=legacy, instance_id="bid_test")
+    monkeypatch.setattr(
+        client, "call", lambda m, p, **kw: {"project": "proj_test", "region": "us-central2-b"}
+    )
+    handles.require_scope(handle)  # verified against its own bid's region
+    monkeypatch.setattr(
+        client, "call", lambda m, p, **kw: {"project": "proj_test", "region": "eu-x"}
+    )
+    with pytest.raises(RuntimeError, match="differ"):
+        handles.require_scope(handle)
+    handles.require_scope(SimpleNamespace(scope=config.scope_fingerprint(), instance_id="bid_x"))

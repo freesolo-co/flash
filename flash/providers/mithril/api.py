@@ -10,7 +10,7 @@ import time
 
 from flash.providers.core.base import CapacityUnavailableError, UnreconciledCreateError
 from flash.providers.mithril.client import MithrilApiError, call, pages
-from flash.providers.mithril.config import settings
+from flash.providers.mithril.config import region_allowed, settings
 from flash.providers.mithril.pricing import SPOT_GPUS
 
 CUSTOM_SESSION_PORT = 8000
@@ -22,7 +22,7 @@ _STOPPED = frozenset(
 
 def _ownership(bid):
     config = settings()
-    if bid.get("project") != config["project_id"] or bid.get("region") != config["region"]:
+    if bid.get("project") != config["project_id"] or not region_allowed(bid.get("region") or ""):
         return None
     script = (bid.get("launch_specification") or {}).get("startup_script") or ""
     lines = script.splitlines()
@@ -158,6 +158,8 @@ def create(*, name, offer, payload, image_reference, gpu, gpu_count, capsule, di
     config = settings()
     if offer.gpu != gpu or offer.count != gpu_count or offer.disk_gb < disk_gb:
         raise ValueError("Mithril offer does not fit the requested GPU and disk shape")
+    if not region_allowed(offer.region):
+        raise ValueError("Mithril offer region is not admitted by this control plane")
     labels = {
         "flash-owner": "flash-training",
         "flash-run": payload["run_id"],
@@ -216,7 +218,8 @@ def create(*, name, offer, payload, image_reference, gpu, gpu_count, capsule, di
         launch["image_version"] = config["image_version"]
     body = {
         "project": config["project_id"],
-        "region": config["region"],
+        # The admitted offer's region: the configured one, or any region when none is set.
+        "region": offer.region,
         "instance_type": offer.instance_type,
         "limit_price": f"${cap:.2f}",
         "instance_quantity": 1,

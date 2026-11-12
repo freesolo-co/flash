@@ -45,7 +45,7 @@ class SpotProvider:
                 base.GPU_INFO[offer.gpu].vram_gb,
                 offer.count,
             )
-            for offer in affordable_offers(settings()["region"])
+            for offer in affordable_offers(settings()["region"] or None)
             if base.GPU_INFO[offer.gpu].vram_gb >= need_vram_gb
             and offer.count <= constraints.max_gpu_count
             and offer.disk_gb >= constraints.disk_gb
