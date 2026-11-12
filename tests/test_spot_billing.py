@@ -181,3 +181,20 @@ def test_spot_handle_keeps_the_quoted_class_and_reads_older_handles():
     legacy = SpotJobHandle(**fields).to_dict()
     assert "quoted_gpu" not in legacy
     assert SpotJobHandle.from_dict(legacy).quoted_gpu == ""
+
+
+@pytest.mark.parametrize(
+    ("chosen", "remote", "expected"),
+    [
+        (("spot", "H100"), {"gpu": "H200"}, ("H200", 141)),  # substituted: record what ran
+        (("spot", "H100"), {"gpu": "H100"}, ("H100", 80)),
+        (("spot", "H100"), {}, ("H100", 80)),
+        (("modal", "H100"), {"gpu": "H200"}, ("H100", 80)),  # only Spot substitutes
+    ],
+)
+def test_supervisor_records_the_class_actually_rented(chosen, remote, expected):
+    from flash.providers.core.base import Candidate
+    from flash.runner.supervise.execution import _rented_candidate
+
+    rented = _rented_candidate(Candidate(chosen[0], chosen[1], 2.5, 80, 1), remote)
+    assert (rented.gpu, rented.vram_gb) == expected

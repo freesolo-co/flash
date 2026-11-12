@@ -304,6 +304,28 @@ def _retry_delay(ctx: _SubmitContext, infra_retry_ordinal: int | None) -> float:
     return min(10 * infra_retry_ordinal, remaining) if remaining > 0 else 0
 
 
+def _rented_candidate(chosen, remote):
+    """``chosen`` restated as the class a Spot provider actually rented (from its handle's gpu).
+
+    A Spot run may launch on an interchangeable class with more VRAM than allocation chose, so
+    the persisted allocation, result metrics and OOM retry decisions must name the rented card.
+    """
+    if getattr(chosen, "provider", "") != "spot" or not isinstance(remote, dict):
+        return chosen
+    from dataclasses import replace
+
+    from flash.providers.core.base import GPU_INFO, canonical_gpu
+
+    try:
+        gpu = canonical_gpu(remote.get("gpu") or "")
+    except Exception:
+        return chosen
+    info = GPU_INFO.get(gpu)
+    if info is None or gpu == chosen.gpu:
+        return chosen
+    return replace(chosen, gpu=gpu, vram_gb=info.vram_gb)
+
+
 def _handle_callback(ctx: _SubmitContext, prepared, candidate_plan):
     """Bind provider handle persistence to one immutable reservation and candidate."""
     claim = prepared[0]
@@ -326,12 +348,13 @@ def _handle_callback(ctx: _SubmitContext, prepared, candidate_plan):
             raise RuntimeError("provider handle attempt does not match the reserved attempt")
         if remote.get("instance_id"):
             ctx.seen_sandboxes[remote["instance_id"]] = dict(remote)
+        rented = _rented_candidate(chosen, remote)
         persisted = {
             **remote,
             "launch_claim_token": claim.token,
-            "allocated_gpu": chosen.gpu,
-            "allocated_gpu_count": int(getattr(chosen, "gpu_count", 1) or 1),
-            "allocated_usable_vram_gb": _candidate_usable_vram_gb(chosen),
+            "allocated_gpu": rented.gpu,
+            "allocated_gpu_count": int(getattr(rented, "gpu_count", 1) or 1),
+            "allocated_usable_vram_gb": _candidate_usable_vram_gb(rented),
         }
         try:
             claimed = persist_claimed_remote(ctx.spec.run_id, claim, persisted)
@@ -508,6 +531,7 @@ def _return_success_metrics(ctx: _SubmitContext, outcome) -> dict:
     ctx.raise_if_cancelled()
     _settle_terminal_remote(ctx)
     result, chosen, _, _ = outcome
+    chosen = _rented_candidate(chosen, ctx.last_handle)
     metrics = result.metrics
     if chosen is not None and isinstance(metrics, dict):
         metrics.setdefault("allocated_gpu", chosen.gpu)
@@ -535,6 +559,8 @@ def _handle_failure(ctx: _SubmitContext, prepared, outcome):
         return ctx.return_completed_worker_metrics(completed_metrics), False, 0.0, False
 
     ctx.last_detail = f"{result.failure}: {result.detail}"
+    # an OOM on a substituted (larger) Spot card must not authorize "larger" than what ran.
+    chosen = _rented_candidate(chosen, ctx.last_handle)
     from flash.runner.lifecycle.attempts import decide_attempt_failure
 
     plan = decide_attempt_failure(

@@ -89,3 +89,19 @@ def test_paid_override_changes_admission_without_changing_billing_or_hold(smoke,
     monkeypatch.setattr(smoke, "ArtifactStore", stop_before_storage)
     with pytest.raises(RuntimeError, match="stop before paid resources"):
         smoke.run("unused", gpu="H200", entry_price_cap=Decimal("2.00"))
+
+
+def test_paid_cap_bounds_every_class_the_run_could_take(smoke, monkeypatch):
+    from flash.providers.mithril import pricing
+
+    monkeypatch.setattr(pricing, "SPOT_GPUS", dict(pricing.SPOT_GPUS))
+
+    def stop_before_storage():
+        # an H100 smoke run may launch on an H200, so the $0.10 test cap must bound both.
+        assert pricing.SPOT_GPUS["H100"].keep_running_usd == Decimal("0.10")
+        assert pricing.SPOT_GPUS["H200"].keep_running_usd == Decimal("0.10")
+        raise RuntimeError("stop before paid resources")
+
+    monkeypatch.setattr(smoke, "ArtifactStore", stop_before_storage)
+    with pytest.raises(RuntimeError, match="stop before paid resources"):
+        smoke.run("unused", gpu="H100", entry_price_cap=Decimal("0.10"))

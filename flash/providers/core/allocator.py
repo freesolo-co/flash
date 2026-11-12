@@ -973,8 +973,7 @@ def _cheapest_allocation(
     # Spot prioritizes GPU class, then current price; fixed entry rates price estimates.
     from flash.providers.mithril.pricing import quote_rate as spot_quote_rate
 
-    # A Spot run may launch on any class with at least its VRAM, so quote the costliest of them;
-    # billing scales the charge down to the class actually rented.
+    # Spot quotes the costliest class the run may take; billing scales to the class rented.
     ranked = [
         replace(c, hourly_usd=spot_quote_rate(c.gpu, c.gpu_count)) if c.provider == "spot" else c
         for c in ranked

@@ -69,8 +69,14 @@ def run(repo, gpu="H100", model="Qwen/Qwen3.5-9B", entry_price_cap=None):
         cap = Decimal(str(entry_price_cap))
         if not cap.is_finite() or not 0 < cap <= SPOT_GPUS[gpu].keep_running_usd:
             raise ValueError("Test cap must be positive and no greater than the hold cap")
-        # Explicit paid-test-only override that can only lower the class's single cap.
-        SPOT_GPUS[gpu] = replace(SPOT_GPUS[gpu], keep_running_usd=cap)
+        # Explicit paid-test-only override that can only lower caps. A queued run may launch on
+        # any interchangeable class, so the test cap bounds every one of them, not just ``gpu``.
+        from flash.providers.mithril.pricing import interchangeable
+
+        for name in interchangeable(gpu, 1) or (gpu,):
+            SPOT_GPUS[name] = replace(
+                SPOT_GPUS[name], keep_running_usd=min(cap, SPOT_GPUS[name].keep_running_usd)
+            )
     hub = ArtifactStore()
     hub.create_repo(repo, exist_ok=True, private=True)
     if not hub.repo_info(repo, repo_type="dataset").private:
