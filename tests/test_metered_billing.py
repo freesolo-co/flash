@@ -1,0 +1,214 @@
+"""Metered billing: charge = measured training seconds x rented card $/hr x rented cards.
+
+Setup (model download, data loading, trainer/model/vLLM init) and final publication never bill.
+"""
+
+import json
+import os
+
+import pytest
+
+from flash.engine.worker.runtime import phases
+from flash.runner.accounting import costs
+from flash.runner.lifecycle import state as runner_state
+from flash.runner.lifecycle import status as status_ops
+from flash.runner.lifecycle.state import RunStatus
+from tests.test_charge_pricing import _spec
+from tests.test_spot_billing import spot_spec
+
+H100_MODAL = 4.42512
+
+
+def _event(name, state, span="a" * 32, **kw):
+    return dict(phase=name, state=state, span=span, **kw)
+
+
+def _metrics(tmp_path, monkeypatch, spec, **fields):
+    monkeypatch.setattr(runner_state, "RESULTS_DIR", str(tmp_path))
+    dest = runner_state.artifacts_dir(spec)
+    os.makedirs(dest, exist_ok=True)
+    with open(os.path.join(dest, "metrics.json"), "w") as handle:
+        json.dump(fields, handle)
+
+
+def _status(spec, *, heartbeat=None, quote=50.0, state="done"):
+    return RunStatus(
+        run_id=spec.run_id,
+        state=state,
+        spec=spec.to_dict(),
+        estimated_cost_usd=quote,
+        last_heartbeat=heartbeat,
+    )
+
+
+# ---------------------------------------------------------------------------- worker meter
+
+
+def test_meter_starts_at_first_update_and_stops_at_loop_exit(monkeypatch):
+    now = [0.0]
+    monkeypatch.setattr(phases.time, "monotonic", lambda: now[0])
+    timings = phases.PhaseTimings(started=0)
+    # model download + init happen before the first update: never metered.
+    timings.observe(_event("model_download", "started", span="d" * 32))
+    now[0] = 600
+    timings.observe(_event("model_download", "completed", span="d" * 32, seconds=600))
+    assert "billable_train_s" not in timings.snapshot()
+    assert timings.billable_train_seconds() is None
+    now[0] = 900
+    timings.observe(_event("first_update", "started"))
+    now[0] = 1000
+    timings.observe(_event("first_update", "completed", seconds=100))
+    timings.observe(_event("steady_update", "started", span="b" * 32))
+    now[0] = 4500
+    assert timings.snapshot()["billable_train_s"] == 3600
+    timings.stop_billing()
+    now[0] = 9000  # final publication: not metered
+    assert timings.snapshot()["billable_train_s"] == 3600
+    timings.stop_billing()  # idempotent
+    assert timings.billable_train_seconds() == 3600
+
+
+def test_meter_ignores_a_second_first_update_in_the_same_attempt(monkeypatch):
+    now = [10.0]
+    monkeypatch.setattr(phases.time, "monotonic", lambda: now[0])
+    timings = phases.PhaseTimings(started=0)
+    timings.observe(_event("first_update", "started"))
+    now[0] = 20
+    timings.observe(_event("first_update", "started", span="c" * 32))  # another rank
+    now[0] = 70
+    assert timings.billable_train_seconds() == 60
+
+
+def test_stop_before_training_never_meters():
+    timings = phases.PhaseTimings()
+    timings.stop_billing()
+    assert timings.billable_train_seconds() is None
+    assert "billable_train_s" not in timings.snapshot()
+
+
+# ---------------------------------------------------------------------------- charge
+
+
+def test_completed_run_bills_metered_seconds_not_the_quote(tmp_path, monkeypatch):
+    spec = _spec()
+    _metrics(
+        tmp_path,
+        monkeypatch,
+        spec,
+        step=20,
+        allocated_provider="modal",
+        allocated_gpu="H100",
+        allocated_gpu_count=1,
+        notes={"training_timing": {"billable_train_s": 7200.0}},
+    )
+    charge = costs._status_estimated_charge(_status(spec, quote=105.6), spec, fallback=999.0)
+    assert charge == pytest.approx(2 * H100_MODAL)
+
+
+def test_metered_charge_uses_rented_card_count(tmp_path, monkeypatch):
+    spec = _spec()
+    _metrics(
+        tmp_path,
+        monkeypatch,
+        spec,
+        step=5,
+        allocated_provider="modal",
+        allocated_gpu="H100",
+        allocated_gpu_count=4,
+        notes={"training_timing": {"billable_train_s": 3600.0}},
+    )
+    charge = costs._status_estimated_charge(_status(spec), spec, fallback=999.0)
+    assert charge == pytest.approx(4 * H100_MODAL)
+
+
+def test_metered_charge_sums_prior_attempts(tmp_path, monkeypatch):
+    spec = _spec()
+    _metrics(
+        tmp_path,
+        monkeypatch,
+        spec,
+        step=20,
+        allocated_provider="modal",
+        allocated_gpu="H100",
+        allocated_gpu_count=1,
+        notes={"training_timing": {"billable_train_s": 1800.0}},
+    )
+    hb = {"attempt": 2, "billable_train_s_prior": 1800.0, "training_timing": {}}
+    charge = costs._status_estimated_charge(_status(spec, heartbeat=hb), spec, fallback=999.0)
+    assert charge == pytest.approx(H100_MODAL)
+
+
+def test_spot_run_bills_spot_rate(tmp_path, monkeypatch):
+    spec = spot_spec("H100")
+    _metrics(
+        tmp_path,
+        monkeypatch,
+        spec,
+        step=20,
+        allocated_provider="modal",  # stale/legacy stamp: the authored Spot choice wins
+        allocated_gpu="H100",
+        allocated_gpu_count=1,
+        notes={"training_timing": {"billable_train_s": 36000.0}},
+    )
+    charge = costs._status_estimated_charge(_status(spec), spec, fallback=999.0)
+    assert charge == pytest.approx(10 * 1.0)
+
+
+def test_cancel_bills_heartbeat_meter_with_pre_teardown_handle(tmp_path, monkeypatch):
+    spec = _spec()
+    monkeypatch.setattr(runner_state, "RESULTS_DIR", str(tmp_path))  # no metrics yet
+    hb = {"attempt": 0, "stage": "sft_step", "step": 3, "training_timing": {"billable_train_s": 900}}
+    remote = {"provider": "modal", "allocated_gpu": "H100", "allocated_gpu_count": 2}
+    charge = costs.cancelled_charge_usd(
+        _status(spec, heartbeat=hb, state="cancelled"), spec, steps=3, rented_remote=remote
+    )
+    assert charge == pytest.approx(0.25 * H100_MODAL * 2)
+
+
+def test_cancel_mid_first_update_bills_measured_time(tmp_path, monkeypatch):
+    spec = _spec()
+    monkeypatch.setattr(runner_state, "RESULTS_DIR", str(tmp_path))
+    hb = {"attempt": 0, "stage": "sft_step", "training_timing": {"billable_train_s": 36}}
+    remote = {"provider": "modal", "allocated_gpu": "H100", "allocated_gpu_count": 1}
+    charge = costs.cancelled_charge_usd(
+        _status(spec, heartbeat=hb, state="cancelled"), spec, steps=0, rented_remote=remote
+    )
+    assert charge == pytest.approx(0.01 * H100_MODAL)
+
+
+def test_legacy_worker_without_meter_keeps_quote_pricing(tmp_path, monkeypatch):
+    spec = _spec()
+    _metrics(tmp_path, monkeypatch, spec, step=20, wall_seconds=1.0)
+    assert costs.metered_training_seconds(_status(spec), spec) is None
+    charge = costs._status_estimated_charge(_status(spec, quote=12.34), spec, fallback=999.0)
+    assert charge == pytest.approx(12.34)
+
+
+# ---------------------------------------------------------------------------- attempt carry
+
+
+def test_status_carries_prior_attempt_meter_across_retries(tmp_path, monkeypatch):
+    spec = _spec()
+    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path), raising=False)
+    status = _status(spec, state="running", heartbeat=None)
+    saved = {}
+    monkeypatch.setattr(status_ops, "get_status", lambda run_id: status)
+    monkeypatch.setattr(runner_state, "_save_status_unlocked", lambda s: saved.update(s=s))
+    monkeypatch.setattr(status_ops.os.path, "exists", lambda path: True)
+    monkeypatch.setattr(status_ops.reporting, "_report_status", lambda s: None, raising=False)
+
+    def beat(attempt, billable):
+        hb = {"attempt": attempt, "stage": "sft_step", "training_timing": {}}
+        if billable is not None:
+            hb["training_timing"]["billable_train_s"] = billable
+        status_ops.record_heartbeat(spec.run_id, hb)
+        status.last_heartbeat = saved["s"].last_heartbeat
+
+    beat(0, 100.0)
+    beat(0, 400.0)
+    beat(1, None)  # replacement attempt still initializing
+    assert status.last_heartbeat["billable_train_s_prior"] == 400.0
+    beat(1, 50.0)
+    beat(2, 10.0)
+    assert status.last_heartbeat["billable_train_s_prior"] == 450.0
+    assert costs.metered_training_seconds(status, spec) == pytest.approx(460.0)

@@ -397,6 +397,8 @@ def run_rl_train(*, context: WorkerContext):
             reward_runtime=reward_runtime,
         )
     finally:
+        # the training loop is over; final adapter export/publication is not billed training time.
+        context.phase_timings.stop_billing()
         device_peak_gpu_gb = _shutdown_rl_runtime(resume_uploader, gpu_sampler, reward_runtime)
 
     adapter_dir, steps_run, train_wall = _publish_rl_result(

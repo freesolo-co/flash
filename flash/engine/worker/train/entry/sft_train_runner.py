@@ -910,6 +910,8 @@ def _run_sft_child(
                 # A failed child cannot prove save completeness; preserve its failure.
                 child.watcher.stop(require_complete=training_completed)
     finally:
+        # the training loop is over; final adapter publication is not billed training time.
+        context.phase_timings.stop_billing()
         device_peak_gpu_gb = gpu_sampler.stop_gb()
     train_wall = time.time() - train_started_at
     if return_code != 0:

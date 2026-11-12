@@ -251,6 +251,10 @@ def cancelled_charge_usd(
         from flash.custom.billing import session_charge
 
         return session_charge(status, spec)
+    # a metered worker reports its exact training GPU time; bill that, not the quote's estimate.
+    metered = metered_charge_usd(status, spec, rented_remote=rented_remote)
+    if metered is not None:
+        return metered
     n = max(0, int(steps))
     if n == 0:
         # cancelled before any training step: nothing rented, nothing owed.
@@ -313,6 +317,81 @@ def cancelled_charge_usd(
     return min(repriced, quote)
 
 
+def _finite_seconds(value) -> float | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    value = float(value)
+    return value if math.isfinite(value) and value >= 0 else None
+
+
+def _persisted_metrics(spec) -> dict:
+    try:
+        with open(os.path.join(state.artifacts_dir(spec), "metrics.json")) as handle:
+            metrics = json.load(handle)
+    except Exception:
+        # unreadable or not-yet-written metrics: the heartbeat meter (or the legacy quote) prices.
+        return {}
+    return metrics if isinstance(metrics, dict) else {}
+
+
+def metered_training_seconds(status: RunStatus, spec) -> float | None:
+    """Measured GPU training seconds across every attempt, or ``None`` when nothing was metered.
+
+    each worker attempt meters from the start of its first optimizer update to the exit of its
+    training loop (``training_timing.billable_train_s``), so model download, data loading, trainer
+    / model / vLLM initialization and final adapter publication are never included. the current
+    attempt's value comes from the terminal metrics when they exist (frozen at loop exit), else
+    from the latest heartbeat; earlier attempts' metered time is carried on the heartbeat as
+    ``billable_train_s_prior``. ``None`` means a legacy worker that reports no meter.
+    """
+    from flash.runner.lifecycle.status import _heartbeat_billable_seconds
+
+    hb = status.last_heartbeat if isinstance(status.last_heartbeat, dict) else {}
+    notes = _persisted_metrics(spec).get("notes")
+    timing = notes.get("training_timing") if isinstance(notes, dict) else None
+    current = _finite_seconds(timing.get("billable_train_s")) if isinstance(timing, dict) else None
+    if current is None:
+        current = _finite_seconds(_heartbeat_billable_seconds(hb))
+    prior = _finite_seconds(hb.get("billable_train_s_prior"))
+    if current is None and prior is None:
+        return None
+    return (current or 0.0) + (prior or 0.0)
+
+
+def metered_charge_usd(status: RunStatus, spec, *, rented_remote: dict | None = None):
+    """Exact charge: metered training seconds x the rented card's $/hr x rented cards.
+
+    returns ``None`` when the run carries no meter (legacy workers), so callers fall back to the
+    quote-based estimate. the rate is the same per-card rate card the quote prices with, applied
+    to the provider/card/count the run actually rented rather than the quote's assumptions.
+    """
+    seconds = metered_training_seconds(status, spec)
+    if seconds is None:
+        return None
+    metrics = _persisted_metrics(spec)
+    merged = {
+        "provider": metrics.get("allocated_provider"),
+        "allocated_gpu": metrics.get("allocated_gpu"),
+        "allocated_gpu_count": metrics.get("allocated_gpu_count"),
+    }
+    remote = rented_remote if isinstance(rented_remote, dict) else getattr(status, "remote", None)
+    if isinstance(remote, dict):
+        merged.update({key: value for key, value in remote.items() if value is not None})
+    provider, gpu_type, gpu_count = _rented_basis(merged)
+    try:
+        from flash.core.checkpoint_policy import is_spot_spec
+
+        if is_spot_spec(spec):
+            provider = "spot"
+    except Exception:
+        pass
+    gpu_spec = getattr(spec, "gpu", None)
+    gpu_type = gpu_type or str(getattr(gpu_spec, "type", "") or "")
+    gpu_count = gpu_count or max(1, int(getattr(gpu_spec, "count", 1) or 1))
+    rate = _gpu_rate(gpu_type, provider)
+    return seconds / 3600.0 * rate * gpu_count
+
+
 def _persisted_completed_work(spec) -> tuple[int | None, dict | None]:
     """Authoritative completed steps and rented basis from terminal metrics."""
     try:
@@ -349,6 +428,9 @@ def _status_estimated_charge(status: RunStatus, spec, *, fallback: float = 0.0) 
         from flash.custom.billing import session_charge
 
         return session_charge(status, spec)
+    metered = metered_charge_usd(status, spec)
+    if metered is not None:
+        return metered
     completed_steps, persisted_basis = _persisted_completed_work(spec)
     if completed_steps is not None:
         # reuse cancellation's estimated-work fraction: one-time compile and reached saves stay

@@ -372,6 +372,14 @@ def record_heartbeat(run_id: str, heartbeat: dict) -> None:
                 prior += _session_seconds(prev.get("session_seconds"))
             if prior:
                 hb.setdefault("session_seconds_prior", prior)
+        if prev is not None and status.spec.get("algorithm") != "custom":
+            # each attempt meters its own training seconds from its first optimizer update; keep
+            # the earlier attempts' metered time so a retried or Spot-resumed run bills all of it.
+            prior = _session_seconds(prev.get("billable_train_s_prior"))
+            if not same_attempt:
+                prior += _session_seconds(_heartbeat_billable_seconds(prev))
+            if prior:
+                hb.setdefault("billable_train_s_prior", prior)
         # Checkpoint-stage heartbeats (checkpoint_uploading/deployable/uploaded) omit metrics_last; carry
         # the existing per-step backlog forward so `flash runs log -f` doesn't drop it mid-save until the next
         # metrics-bearing heartbeat lands.
@@ -561,6 +569,12 @@ def _update(run_id: str, new_state: str, *, allow_from_terminal: bool = False, *
     if report_status is not None:
         reporting._report_status(report_status)
     return True
+
+
+def _heartbeat_billable_seconds(heartbeat):
+    """The attempt's metered training seconds carried by one heartbeat, else ``None``."""
+    timing = heartbeat.get("training_timing") if isinstance(heartbeat, dict) else None
+    return timing.get("billable_train_s") if isinstance(timing, dict) else None
 
 
 def _session_seconds(value):
