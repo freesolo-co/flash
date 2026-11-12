@@ -5,7 +5,6 @@ import time
 from flash.providers.core.base import CapacityLookupError
 from flash.providers.mithril.capacity import quota_available
 from flash.providers.mithril.client import MithrilApiError
-from flash.providers.mithril.config import settings
 from flash.providers.mithril.prices import affordable_offers
 
 
@@ -19,9 +18,7 @@ def wait_for_price(gpu, run_id, *, gpu_count=1, disk_gb=0, deadline_at, log=None
         try:
             offers = [
                 offer
-                for offer in affordable_offers(
-                    settings()["region"] or None, deadline_at=deadline_at
-                )
+                for offer in affordable_offers(deadline_at=deadline_at)
                 if offer.gpu == gpu and offer.count == gpu_count and offer.disk_gb >= disk_gb
             ]
             offers = [

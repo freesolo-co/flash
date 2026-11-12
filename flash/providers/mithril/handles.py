@@ -56,8 +56,8 @@ def require_scope(handle):
 
     if handle.scope == scope_fingerprint():
         return
-    # An attempt launched while a region was pinned carries the project+region scope. Verify it
-    # against its own bid's region so unpinning the region does not orphan in-flight runs.
+    # Attempts launched by region-pinned releases carry the retired project+region scope. Verify
+    # them against their own bid's region so removing the setting does not orphan in-flight runs.
     from flash.providers.mithril.client import MithrilApiError, call
 
     project = settings()["project_id"]

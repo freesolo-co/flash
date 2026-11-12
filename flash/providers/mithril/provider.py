@@ -20,9 +20,7 @@ class SpotProvider:
 
         problems = []
         if not self.is_configured():
-            problems.append(
-                "Configure FLASH_MITHRIL_API_KEY, FLASH_MITHRIL_PROJECT_ID and FLASH_MITHRIL_REGION"
-            )
+            problems.append("Configure FLASH_MITHRIL_API_KEY and FLASH_MITHRIL_PROJECT_ID")
         if require_hf and not artifacts_configured():
             problems.append("Configure private Azure artifact storage")
         return problems
@@ -34,7 +32,6 @@ class SpotProvider:
         return hourly_rate(gpu)
 
     def live_candidates(self, need_vram_gb, constraints):
-        from flash.providers.mithril.config import settings
         from flash.providers.mithril.prices import affordable_offers
 
         return [
@@ -45,7 +42,7 @@ class SpotProvider:
                 base.GPU_INFO[offer.gpu].vram_gb,
                 offer.count,
             )
-            for offer in affordable_offers(settings()["region"] or None)
+            for offer in affordable_offers()
             if base.GPU_INFO[offer.gpu].vram_gb >= need_vram_gb
             and offer.count <= constraints.max_gpu_count
             and offer.disk_gb >= constraints.disk_gb

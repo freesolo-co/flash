@@ -15,7 +15,7 @@ class Offer:
     instance_type: str
     hourly_usd: float  # per GPU, like Candidate.hourly_usd
     disk_gb: int
-    region: str = ""
+    region: str
 
 
 def dollars(raw):
@@ -27,8 +27,8 @@ def dollars(raw):
     return value
 
 
-def affordable_offers(region: str | None = None, *, deadline_at=None) -> list[Offer]:
-    """Qualifying offers in ``region``, or in every region when it is empty/None."""
+def affordable_offers(*, deadline_at=None) -> list[Offer]:
+    """Qualifying offers across every region's auctions."""
     try:
         types = call("GET", "/instance-types", deadline_at=deadline_at)
         auctions = call("GET", "/spot/availability", deadline_at=deadline_at)
@@ -37,7 +37,7 @@ def affordable_offers(region: str | None = None, *, deadline_at=None) -> list[Of
         catalog = {row["fid"]: row for row in types}
         offers = []
         for auction in auctions:
-            if region and auction["region"] != region:
+            if not isinstance(auction.get("region"), str) or not auction["region"]:
                 continue
             shape = catalog[auction["instance_type"]]
             gpu = shape["gpu_type"]

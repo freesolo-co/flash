@@ -9,10 +9,10 @@ Set these secrets/configuration on the control plane:
 
 - `FLASH_MITHRIL_API_KEY`: Mithril API key with access to the intended project.
 - `FLASH_MITHRIL_PROJECT_ID`: project FID from `GET /v2/projects`.
-- Optional `FLASH_MITHRIL_REGION`: pin one auction region from `GET /v2/spot/availability`.
-  Leave it unset to admit offers from every region: Flash bids in the region of the cheapest
-  qualifying offer, and each bid keeps its own region. Ownership is then the project; attempts
-  launched while a region was pinned stay recognized after unpinning (checked against their bid).
+- There is no region setting. Flash admits offers from every region's auctions, bids in the
+  region of the cheapest qualifying offer, and each bid keeps its own region. Ownership is the
+  project. Attempts launched by earlier region-pinned releases stay recognized (checked against
+  their bid's region). `FLASH_MITHRIL_REGION` is no longer read.
 - Optional `FLASH_MITHRIL_IMAGE_VERSION`: GPU host image version FID. Otherwise,
   Mithril selects the region's default image. Use an image with Docker, a compatible
   NVIDIA driver, NVIDIA container toolkit, Python 3 and outbound registry/Azure access.
@@ -37,7 +37,7 @@ release does not migrate or delete existing legacy VMs.
 | B200 | $4.00 | $4.01 | $5.01 |
 
 The policy lives in `flash/providers/mithril/pricing.py`. Flash joins the authenticated
-instance-type catalog to live auctions (every region, or only `FLASH_MITHRIL_REGION` when set), admitting only advertised SXM
+instance-type catalog to live auctions in every region, admitting only advertised SXM
 shapes with sufficient VRAM, capacity and local scratch. Supported counts are 1 and 8;
 a listed eight-GPU auction never implies single-GPU availability. B200 remains an
 eligible policy class but cannot be selected unless Mithril actually offers it.
