@@ -32,22 +32,22 @@ GRPO_UPDATE_FLOPS_PER_TOKEN_PER_PARAM = 8.0  # policy fwd+bwd (6) + frozen-ref f
 # a 20% holdout. See docs/billing-calibration.md for the data, the fit and the per-model error.
 # The previous constants were fitted to elapsed wall including in-train initialization and
 # over-predicted billed training time ~2.3x for SFT and ~3.8x for GRPO.
-MFU_TRAIN = 0.52  # GRPO policy/reference update
+MFU_TRAIN = 0.72  # GRPO policy/reference update
 MFU_SFT_TRAIN = 0.85  # SFT fwd/bwd, realized against effective_train_tflops
-MFU_DECODE = 0.18  # batched vLLM rollout (decode is memory-bandwidth-bound)
+MFU_DECODE = 0.25  # batched vLLM rollout (decode is memory-bandwidth-bound)
 # sft attention: seconds per (6*P*tokens/peak) scaled by mean example length / 32768. long
 # examples cost super-linearly; without it long-context runs under-quote and short ones over-quote.
-SFT_ATTENTION_COEF = 0.47
+SFT_ATTENTION_COEF = 2.0
 # one-time work inside the billed window: the first optimizer update (graph capture, allocator
 # warm-up, first rollout for grpo). measured, not modeled.
-SFT_FIRST_UPDATE_S = 205.0
-GRPO_FIRST_UPDATE_S = 135.0
+SFT_FIRST_UPDATE_S = 250.0
+GRPO_FIRST_UPDATE_S = 95.0
 
-STEP_FLOOR_BASE_SECONDS = 14.2
-STEP_FLOOR_SECONDS_PER_COMPLETION = 0.048
+STEP_FLOOR_BASE_SECONDS = 3.5
+STEP_FLOOR_SECONDS_PER_COMPLETION = 0.466
 # the per-card offsets below were fitted against the previous 62.7 s floor; they are rescaled by
 # the same factor as the floor so each card keeps its measured relative speed.
-_STEP_FLOOR_RESCALE = 14.2 / 62.7
+_STEP_FLOOR_RESCALE = 3.5 / 62.7
 
 # --- per-card offset ---------------------------------------------------------------------------
 # empirically fitted intercept offsets capture measured card-level variance; the slope stays shared.

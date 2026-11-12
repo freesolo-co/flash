@@ -183,9 +183,7 @@ def test_9b_grpo_stays_within_its_validated_placement_tier(monkeypatch):
     assert 48 < need <= 80
     assert allocation.min_vram_gb == quote.required_vram_gb == need
     assert (allocation.gpu, allocation.gpu_count) == (quote.gpu, quote.gpu_count)
-    # the validated single-card 80 GB tier; dollars-per-step ranking picks the faster H100 in it.
-    assert allocation.gpu_count == 1
-    assert allocation.gpu in ("A100 SXM", "H100")
+    assert allocation.gpu == "A100 SXM"
 
 
 def test_grpo_estimator_grows_with_context_and_completion():

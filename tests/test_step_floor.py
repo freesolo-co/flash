@@ -156,9 +156,9 @@ def test_the_floor_has_both_a_fixed_and_a_per_completion_part():
     grew = step_floor_seconds("L40S", 100) - step_floor_seconds("L40S", 0)
     assert grew == pytest.approx(100 * STEP_FLOOR_SECONDS_PER_COMPLETION)
     # re-measured against metered production training time (docs/billing-calibration.md): the
-    # per-completion floor is ~0.05 s once rollout FLOPs are priced at realized MFU. it must stay
+    # per-completion floor is ~0.47 s (wide 256-completion arms on 0.8B and 9B). it must stay
     # strictly positive so wide-rollout steps still grow with their completion count.
-    assert grew == pytest.approx(4.8, rel=0.25)
+    assert grew == pytest.approx(46.6, rel=0.25)
     assert STEP_FLOOR_SECONDS_PER_COMPLETION > 0
 
 
