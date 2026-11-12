@@ -125,7 +125,7 @@ def _step_floor_seconds_for(config: RunConfig, gpu: str) -> float:
 # measured MoE wall time scales with total params because routing and grouped GEMMs dominate at
 # small batch. price MoE on total params with reduced MFU, per-step overhead, and one-time compile;
 # dense models retain the active-param path.
-MFU_SFT_TRAIN_MOE = 0.10  # MoE SFT fwd/bwd priced on total params
+MFU_SFT_TRAIN_MOE = 0.45  # MoE SFT fwd/bwd priced on total params (live 35B-A3B H200 run)
 MFU_TRAIN_MOE = 0.09  # MoE GRPO policy update priced on total params
 MOE_STEP_OVERHEAD_S = 2.0  # routing/dispatch/kernel-launch overhead an MoE pays every step
 # One-time kernel/graph compile amortized into the first training step (fused Triton kernels;
