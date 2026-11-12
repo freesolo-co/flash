@@ -687,17 +687,12 @@ class _ModalEnginePool:
                 )
             )
             return
-        if base_model in MODAL_FALLBACK_BY_MODEL:
-            from flash.serving.app.provider_selection import unregister_active
+        from flash.serving.app.provider_selection import unregister_active
 
-            engines = [
-                ENGINE_BY_MODEL[base_model](base_model=base_model),
-                MODAL_FALLBACK_BY_MODEL[base_model](base_model=base_model),
-            ]
-            await unregister_active(engines, org_id, model_id, expected_generation)
-        else:
-            engine = await self._engine_for(base_model)
-            await engine.unregister.remote.aio(org_id, model_id, expected_generation)
+        engines = [ENGINE_BY_MODEL[base_model](base_model=base_model)]
+        if base_model in MODAL_FALLBACK_BY_MODEL:
+            engines.append(MODAL_FALLBACK_BY_MODEL[base_model](base_model=base_model))
+        await unregister_active(engines, org_id, model_id, expected_generation)
 
 
 def _build_usage_outbox(settings: Any) -> Any:
@@ -957,9 +952,15 @@ def start_all(base_model: str | None = None) -> None:
     failures: list[str] = []
     models = [base_model] if base_model else list(base_models())
     for bm in models:
-        engine = modal.Cls.from_name(APP_NAME, model_engine_name(bm))
-        instance = engine(base_model=bm)
-        started[bm] = instance.health.spawn()
+        names = (
+            [model_engine_name(bm) + f"_ReservedH100{slot}" for slot in range(1, 5)]
+            if reserved.enabled(bm, MODAL_ENVIRONMENT)
+            else [model_engine_name(bm)]
+        )
+        for name in names:
+            engine = modal.Cls.from_name(APP_NAME, name)
+            instance = engine(base_model=bm)
+            started[name] = instance.health.spawn()
     for bm, handle in started.items():
         try:
             print(f"started {bm}: {handle.get(timeout=1800)}", flush=True)

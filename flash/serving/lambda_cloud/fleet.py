@@ -135,7 +135,16 @@ class Fleet:
                 allocated += 1
                 if record["revision"] == revision:
                     occupied += 1
-        if self.shared_capacity is not None and model != RESERVED_MODEL:
+        if model == RESERVED_MODEL:
+            from .pool_capacity import HANDOFF_SURGE
+
+            # Dev has no Modal fallback, but draining releases and uncertain
+            # launches still consume the shared Lambda handoff budget.
+            if allocated >= capacity_for(model, "lambda")[1] + HANDOFF_SURGE:
+                raise NoCapacityError(
+                    "Lambda model aggregate replica limit reached; pending cleanup"
+                )
+        elif self.shared_capacity is not None:
             await self.shared_capacity.before_launch(model, revision, allocated)
         if occupied >= capacity_for(model, "lambda")[1]:
             raise NoCapacityError("Lambda model/release replica limit reached; pending cleanup")

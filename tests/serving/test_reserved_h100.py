@@ -96,3 +96,61 @@ async def test_development_keeps_lambda_only_capacity_without_modal_fallback():
     fleet.shared_capacity = AsyncMock()
     await fleet._check_capacity(reserved.MODEL, "a" * 40)
     fleet.shared_capacity.before_launch.assert_not_awaited()
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("old_count", "current_count", "allowed"), [(4, 0, True), (4, 1, False), (0, 4, False)]
+)
+@pytest.mark.parametrize("ownership", ["leased", "draining", "uncertain"])
+async def test_dev_lambda_only_budget_counts_all_revisions(
+    old_count, current_count, allowed, ownership
+):
+    from types import SimpleNamespace
+
+    now = 10000
+    records = []
+    instances = []
+    for i in range(old_count + current_count):
+        owner = f"{i:032x}"
+        records.append(
+            (
+                owner,
+                {
+                    "model": reserved.MODEL,
+                    "revision": "old" if i < old_count else "new",
+                    "instance_id": None if ownership == "uncertain" else str(i),
+                    "released": ownership == "draining",
+                    "heartbeat": now,
+                },
+            )
+        )
+        if ownership == "draining":
+            instances.append(
+                {
+                    "name": f"flash-dev-{owner}",
+                    "status": "terminating",
+                    "tags": [
+                        {"key": "flash-owner", "value": owner},
+                        {"key": "flash-environment", "value": "dev"},
+                    ],
+                }
+            )
+
+    async def items():
+        for item in records:
+            yield item
+
+    fleet = Fleet(
+        SimpleNamespace(call=AsyncMock(return_value=instances)),
+        SimpleNamespace(items=items),
+        "dev",
+        clock=lambda: now,
+    )
+    fleet.shared_capacity = AsyncMock()
+    if allowed:
+        await fleet._check_capacity(reserved.MODEL, "new")
+    else:
+        with pytest.raises(NoCapacityError, match="replica limit"):
+            await fleet._check_capacity(reserved.MODEL, "new")
+    fleet.shared_capacity.before_launch.assert_not_awaited()
