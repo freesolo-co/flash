@@ -16,17 +16,6 @@ from flash.engine.worker.io.heartbeat import heartbeat, liveness_heartbeat
 from flash.engine.worker.train.core.child.checkpoint_schedule import CheckpointClock
 
 
-def _custom_targeting(model_id):
-    """Custom runs adapt only text modules; a warm-start source must have the same modality."""
-    from flash.core.catalog import supports_image_training
-
-    if not supports_image_training(model_id):
-        return None
-    from flash.adapters.targets import resolve_lora_targeting
-
-    return resolve_lora_targeting(model_id, algorithm="custom", multimodal=False)
-
-
 def checkpoint_due(train, clock, step, max_steps):
     """Whether an optimizer step publishes a checkpoint.
 
@@ -83,13 +72,16 @@ def run(*, context):
         elif spec.train.init_from_adapter:
             from flash.engine.worker.train.entry.sft_train import _warmstart_adapter_path
 
-            # downloads the prepared source and checks its rank, alpha, modules and base model.
+            # downloads the prepared source and checks its rank, alpha and base model. No
+            # modality is imposed: custom sessions accept image rows, and the backend continues
+            # the source's exact LoRA modules (text-only, or language + vision from image SFT),
+            # failing if any source tensor does not land on a trainable parameter.
             init_adapter = _warmstart_adapter_path(
                 spec.model,
                 spec.model_revision,
                 spec.train.lora_rank,
                 spec.train.lora_alpha,
-                _custom_targeting(spec.model),
+                None,
                 context=context,
             )
         backend = load_backend(
