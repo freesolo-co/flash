@@ -919,3 +919,38 @@ def test_stopped_spot_worker_requeues_until_price_recovers(monkeypatch):
     queue.wait_for_price("H100", spec.run_id, deadline_at=500, log=io.StringIO())
     assert now[0] == queued_at + 120
     assert states == ["queued", "queued", "provisioning"]
+
+
+@pytest.mark.parametrize(
+    ("spot", "error", "failure"),
+    [
+        # a gracefully stopped Spot VM: SIGTERM reaches the worker before the host disappears
+        (True, "WorkerInterrupted: worker interrupted by signal 15", "job_preempted"),
+        # other transient worker faults keep the bounded infrastructure retry
+        (True, "RetriableBootstrapError: train phase exited non-zero", "worker_retriable"),
+        # Modal (no flag) keeps its existing classification
+        (False, "WorkerInterrupted: worker interrupted by signal 15", "worker_retriable"),
+    ],
+)
+def test_spot_signal_interruption_is_preemption(spot, error, failure):
+    from flash.providers._lifecycle.instances.poll_instance import _TerminalArtifacts
+
+    adapter = SimpleNamespace(
+        signal_interruption_is_preemption=spot,
+        current_attempt=2,
+        failure_detail=lambda marker: (marker or {}).get("error") or "",
+    )
+    artifacts = _TerminalArtifacts(
+        adapter, say=print, heartbeat_reader=None, launch_ts=0.0, absolute_deadline=None
+    )
+    result = artifacts._fail_from_marker({"retriable": True, "error": error})
+    assert result.failure == failure
+    assert result.detail == error
+
+
+def test_nebius_poll_treats_signal_interruption_as_preemption():
+    import inspect
+
+    from flash.providers.nebius import jobs
+
+    assert "signal_interruption_is_preemption=True" in inspect.getsource(jobs.poll)
