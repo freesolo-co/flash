@@ -43,6 +43,11 @@ SFT_ATTENTION_COEF = 2.0
 SFT_FIRST_UPDATE_S = 300.0
 GRPO_FIRST_UPDATE_S = 95.0
 
+# measured whole-step grpo slowdown per card, for cards whose rollout runs uniformly slower than
+# their throughput predicts across completion counts. A100 SXM: three live 9B arms at 16/64/128
+# completions ran 0.76/0.75/0.83 of estimate (an additive offset cannot fit that).
+GRPO_CARD_STEP_SCALE = {"A100 SXM": 1.28, "A100 SXM 40GB": 1.28}
+
 STEP_FLOOR_BASE_SECONDS = 3.5
 STEP_FLOOR_SECONDS_PER_COMPLETION = 0.466
 # the per-card offsets below were fitted against the previous 62.7 s floor; they are rescaled by
@@ -332,7 +337,8 @@ def step_seconds_split(config: RunConfig, gpu: str) -> tuple[float, float]:
     # fitted floor. reward latency is not. only STEP_FLOOR_SHARDED_FRACTION shards; callers must
     # use sharded_step_seconds().
     floor_s = step_floor_seconds(gpu, completions)
-    return gen_s + update_s + floor_s, overhead
+    scale = GRPO_CARD_STEP_SCALE.get(gpu, 1.0)
+    return (gen_s + update_s + floor_s) * scale, overhead
 
 
 def seconds_per_step(config: RunConfig, gpu: str) -> float:

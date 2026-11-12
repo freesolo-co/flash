@@ -66,8 +66,8 @@ Live runs cover Qwen3.5-0.8B, 4B, 9B, 9B-Base and Qwen3.6-35B-A3B on 1× H100, 1
 
 | | n | median | mean abs error | within ±20% |
 |---|---|---|---|---|
-| SFT | 13 | 0.97 | 7% | 85% |
-| GRPO | 8 | 1.03 | 12% | 88% |
+| SFT | 18 | 0.98 | 10% | 78% |
+| GRPO | 16 | 1.02 | 14% | 81% |
 
 What the quote still cannot know:
 - **GRPO realized completion length.** The quote prices with `max_completion_tokens`. A 2,048-token
@@ -77,8 +77,9 @@ What the quote still cannot know:
 
 - **A100 SXM** measured ~0.68× its spec-peak estimate for both SFT (0.69) and GRPO (0.67). Its
   training throughput is capped at the measured **162 TFLOPS** (catalog 264), which brings A100 SFT to
-  1.00 and A100 GRPO to 0.76. A per-card GRPO step-floor offset waits until the codebase's 3-arm
-  minimum is met. The cap also changes dollars-per-step placement: unconstrained 9B GRPO now lands
+  1.00. Three live A100 GRPO arms (16, 64 and 128 completions) ran a uniform ~0.78 of estimate, so
+  A100 also carries a measured whole-step GRPO scale of **1.28** (`GRPO_CARD_STEP_SCALE`). That
+  brings them to 0.90 / 0.93 / 1.03. The cap also changes dollars-per-step placement: unconstrained 9B GRPO now lands
   on **RTX Pro 6000**, which live runs confirm is cheaper per job ($0.214 vs $0.324 on A100 for the
   same run; RTX Pro measured 0.94 for SFT and 1.21 for GRPO).
 - **L40S** is **not** capped. It measured slow for SFT (0.59; its catalog 362 TFLOPS is the sparse
