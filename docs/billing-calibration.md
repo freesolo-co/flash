@@ -36,31 +36,59 @@ their real training cost.
 
 ## Estimator calibration
 
-The time model (`flash/cost/analytical.py`) was refit to the metered window by relative least
-squares, with a 20% holdout:
+The time model (`flash/cost/analytical.py`) is fit to the metered window. Constants come from
+two sources: historical production runs (relative least squares, 20% holdout) and live
+calibration runs with exact first-update → loop-exit timing. Wherever the two disagree, the live
+runs decide, because historical "actual" values include unobservable queue time.
 
 | term | before | after |
 |---|---|---|
 | SFT effective MFU (vs `effective_train_tflops`) | 0.25 | 0.85 |
-| SFT attention term (× mean example tokens / 32768) | — | 0.47 |
+| SFT attention term (× mean example tokens / 32768) | — | 2.0 |
 | SFT per-step floor | 0.8 s | 0.26 s |
-| SFT first update (one-time) | — | 205 s |
-| GRPO step floor | 62.7 s + 0.805 s/completion | 14.2 s + 0.048 s/completion |
-| GRPO decode / update MFU | 0.12 / 0.35 | 0.18 / 0.52 |
-| GRPO first update (one-time) | — | 135 s |
+| SFT first update (one-time) | — | 250 s |
+| MoE SFT MFU (total params) | 0.10 | 0.45 |
+| GRPO step floor | 62.7 s + 0.805 s/completion | 3.5 s + 0.466 s/completion |
+| GRPO decode / update MFU | 0.12 / 0.35 | 0.25 / 0.72 |
+| GRPO first update (one-time) | — | 95 s |
 
-Estimate ÷ actual on historical runs:
+### Historical runs (1,469 completed, on-demand, single attempt)
 
-| | median | mean abs error | within ±20% |
+| estimate ÷ actual | median | mean abs error | within ±20% |
 |---|---|---|---|
 | before | 2.28 | 124% | 12% |
-| after | 0.92 | 22% | 59% |
+| after | ~1.0 | 22% | 58% |
 
-**Known gaps:**
-- A100 runs are under-predicted (median 0.63, n=17).
-- Historical "actual" values include provisioning queue time for runs submitted in large parallel
-  campaigns, which biases them upward.
-- Live calibration rounds with exact log timing are tracked in the PR that introduced this file.
+### Live calibration runs (exact timing)
+
+Live runs cover Qwen3.5-0.8B, 4B, 9B, 9B-Base and Qwen3.6-35B-A3B on 1× H100, 1× H200 and
+2× H100. They include 16-, 64- and 256-completion GRPO rollouts and 300–800-step SFT.
+
+| | n | median | mean abs error | within ±20% |
+|---|---|---|---|---|
+| SFT | 11 | 0.96 | 10% | 82% |
+| GRPO | 7 | 1.02 | 12% | 86% |
+
+What the quote still cannot know:
+- **GRPO realized completion length.** The quote prices with `max_completion_tokens`. A 2,048-token
+  cap trained faster than a 512-token cap when the model stopped early.
+- **Per-architecture efficiency.** Qwen3.5-4B runs ~0.8–0.9× its estimate, which suggests it is
+  less efficient per FLOP than 0.8B or 9B.
+
+The charge is metered, so these limits affect only the estimate, never the amount billed.
+
+### What metering changes in practice
+
+Per-run charged vs. actual training cost before this change (live runs):
+
+| run | charged (quote) | actual training | ratio |
+|---|---|---|---|
+| SFT 9B 800 steps | $5.40 | $2.03 | 2.66× |
+| SFT 35B-A3B (MoE) | $11.17 | $3.28 | 3.41× |
+| GRPO 0.8B | $0.81 | $0.24 | 3.41× |
+| SFT 0.8B | $0.30 | $0.42 | 0.72× (under) |
+| GRPO 9B on 2× H100 | $3.34 | $3.97 | 0.84× (under) |
+| SFT 9B cancelled at step 150/1500 | $1.02 | $0.66 | 1.55× |
 
 ## Re-running the calibration
 
