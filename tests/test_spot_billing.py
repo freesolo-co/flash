@@ -17,7 +17,7 @@ def spot_spec(gpu="H100", *, legacy_preference=False):
     return replace(_spec(), gpu=GpuSpec(type=gpu, count=1, **choice))
 
 
-@pytest.mark.parametrize(("gpu", "hourly"), [("H100", 1.0), ("H200", 1.0), ("B200", 4.0)])
+@pytest.mark.parametrize(("gpu", "hourly"), [("H100", 1.0), ("H200", 1.0)])
 @pytest.mark.parametrize("provider_hint", ["", "spot", "modal"])
 @pytest.mark.parametrize("legacy_preference", [False, True])
 def test_spot_charge_uses_spot_tariff_even_with_missing_or_stale_provider(
@@ -35,7 +35,7 @@ def test_spot_charge_uses_spot_tariff_even_with_missing_or_stale_provider(
     assert charge < costs.charge_usd_for_spec(regular)
 
 
-@pytest.mark.parametrize("gpu", ["H100", "H200", "B200"])
+@pytest.mark.parametrize("gpu", ["H100", "H200"])
 @pytest.mark.parametrize("completed_steps", [0, 10, 20])
 def test_cancelled_spot_charge_prorates_the_accepted_spot_quote(gpu, completed_steps):
     spec = spot_spec(gpu)
@@ -52,7 +52,7 @@ def test_cancelled_spot_charge_prorates_the_accepted_spot_quote(gpu, completed_s
     assert 0 <= actual <= quote
 
 
-@pytest.mark.parametrize("gpu", ["H100", "H200", "B200"])
+@pytest.mark.parametrize("gpu", ["H100", "H200"])
 def test_completed_spot_recovery_charges_quote_not_expensive_worker_wall(
     tmp_path, monkeypatch, gpu
 ):

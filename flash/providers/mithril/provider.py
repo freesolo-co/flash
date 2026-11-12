@@ -34,7 +34,7 @@ class SpotProvider:
     def live_candidates(self, need_vram_gb, constraints):
         from flash.providers.mithril.prices import affordable_offers
 
-        return [
+        live = [
             Candidate(
                 self.name,
                 offer.gpu,
@@ -46,6 +46,18 @@ class SpotProvider:
             if base.GPU_INFO[offer.gpu].vram_gb >= need_vram_gb
             and offer.count <= constraints.max_gpu_count
             and offer.disk_gb >= constraints.disk_gb
+        ]
+        if live:
+            return live
+        # Nothing is below its cap right now. Spot quotes use fixed rates, so admit the run on the
+        # catalog shapes that fit; the queue then waits for whichever class comes up first.
+        return [
+            Candidate(self.name, name, hourly_rate(name), base.GPU_INFO[name].vram_gb, count)
+            for name, shape in SPOT_GPUS.items()
+            if base.GPU_INFO[name].vram_gb >= need_vram_gb
+            and (not constraints.gpu_type or constraints.gpu_type == name)
+            for count in shape.counts
+            if count <= constraints.max_gpu_count
         ]
 
     def submit_attempt(

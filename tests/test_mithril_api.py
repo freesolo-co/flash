@@ -174,14 +174,20 @@ def test_live_candidates_use_only_advertised_shapes_and_per_gpu_prices(monkeypat
     assert offers == [Offer("H200", 8, "it_test", 0.8, 1500, "us-central2-b")]
     candidates = get_provider("spot").live_candidates(80, AllocationConstraints(max_gpu_count=8))
     assert [(c.gpu, c.gpu_count, c.hourly_usd) for c in candidates] == [("H200", 8, 0.8)]
-    assert get_provider("spot").live_candidates(80, AllocationConstraints(max_gpu_count=1)) == []
+    # No live single-GPU offer: admit on the fitting catalog shapes at the fixed rate, so the run
+    # queues for whichever class comes up first instead of being rejected.
+    fallback = get_provider("spot").live_candidates(80, AllocationConstraints(max_gpu_count=1))
+    assert [(c.gpu, c.gpu_count, c.hourly_usd) for c in fallback] == [
+        ("H100", 1, 1.0),
+        ("H200", 1, 1.0),
+    ]
 
 
 @pytest.mark.parametrize(
     "change",
     [
-        {"price": "$8.08"},
-        {"price": "$9.00"},
+        {"price": "$20.08"},
+        {"price": "$21.00"},
         {"capacity": 0},
         {"region": ""},
         {"socket": "PCIe"},
@@ -246,7 +252,7 @@ def launch(monkeypatch, *, count=1, gpu="H200"):
 
 
 @pytest.mark.parametrize("count", [1, 8])
-@pytest.mark.parametrize(("gpu", "cap"), [("H100", 2.01), ("H200", 2.51), ("B200", 5.01)])
+@pytest.mark.parametrize(("gpu", "cap"), [("H100", 2.01), ("H200", 2.51)])
 def test_create_bids_for_one_instance_at_per_instance_hold_cap(monkeypatch, count, gpu, cap):
     monkeypatch.setattr(api, "pages", lambda *a, **kw: [])
     captured = []
@@ -415,7 +421,11 @@ def test_missing_bid_does_not_hide_a_still_stopping_instance(monkeypatch):
 def test_candidates_exclude_insufficient_scratch(monkeypatch):
     catalog(monkeypatch)
     constraints = AllocationConstraints(max_gpu_count=8, disk_gb=2000)
-    assert get_provider("spot").live_candidates(80, constraints) == []
+    candidates = get_provider("spot").live_candidates(80, constraints)
+    # the 1.5 TB live offer is excluded; only fixed-rate catalog shapes remain (the queue rechecks
+    # disk before bidding).
+    assert candidates
+    assert all(c.hourly_usd == 1.0 for c in candidates)
 
 
 @pytest.mark.parametrize("valid", [True, False])

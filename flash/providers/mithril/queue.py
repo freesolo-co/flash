@@ -9,7 +9,15 @@ from flash.providers.mithril.prices import affordable_offers
 
 
 def wait_for_price(gpu, run_id, *, gpu_count=1, disk_gb=0, deadline_at, log=None):
+    """Wait for any acceptable class to be below its cap with free quota; never spend meanwhile.
+
+    ``gpu`` is one class or a tuple of interchangeable classes (``pricing.interchangeable``). The
+    run takes whichever comes up first; when several qualify at once, priority order then price.
+    """
+    from flash.providers.mithril.pricing import priority
     from flash.runner.lifecycle.status import _update, get_status
+
+    gpus = (gpu,) if isinstance(gpu, str) else tuple(gpu)
     from flash.runner.supervise.errors import _RunCancelled
 
     while time.time() < deadline_at:
@@ -19,7 +27,7 @@ def wait_for_price(gpu, run_id, *, gpu_count=1, disk_gb=0, deadline_at, log=None
             offers = [
                 offer
                 for offer in affordable_offers(deadline_at=deadline_at)
-                if offer.gpu == gpu and offer.count == gpu_count and offer.disk_gb >= disk_gb
+                if offer.gpu in gpus and offer.count == gpu_count and offer.disk_gb >= disk_gb
             ]
             offers = [
                 offer
@@ -28,16 +36,21 @@ def wait_for_price(gpu, run_id, *, gpu_count=1, disk_gb=0, deadline_at, log=None
             ]
             if offers:
                 _update(run_id, "provisioning")
-                # Cheapest qualifying shape across every admitted region.
+                # First class to come up wins; ties: class priority, price, region.
                 return min(
                     offers,
-                    key=lambda offer: (offer.hourly_usd, offer.region, offer.instance_type),
+                    key=lambda offer: (
+                        priority(offer.gpu),
+                        offer.hourly_usd,
+                        offer.region,
+                        offer.instance_type,
+                    ),
                 )
         except (CapacityLookupError, MithrilApiError):
             pass
         _update(run_id, "queued")
         print(
-            "Spot queued: waiting for a Mithril shape below the cap with free quota",
+            f"Spot queued: waiting for {' or '.join(gpus)} below its cap with free quota",
             file=log,
             flush=True,
         )

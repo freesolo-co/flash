@@ -15,13 +15,11 @@ from flash.providers.mithril.pricing import accepts_price
     ("gpu", "value", "accepted"),
     [
         ("H100", "0.79", True),
-        ("H100", "1.00", True),
-        ("H100", "1.01", False),
-        ("H200", "1.001", True),
-        ("H200", "1.01", False),
-        ("B200", "3.999", True),
-        ("B200", "4", True),
-        ("B200", "4.01", False),
+        ("H100", "2.00", True),
+        ("H100", "2.01", False),
+        ("H200", "2.50", True),
+        ("H200", "2.51", False),
+        ("B200", "1.00", False),
         ("H100", "NaN", False),
         ("H100", "Infinity", False),
         ("H100", "-1", False),
@@ -388,6 +386,68 @@ def test_mithril_signal_preemption_requeues_without_retry_budget(monkeypatch, al
 def test_entry_and_running_caps_do_not_change_fixed_customer_rates():
     from flash.providers.mithril.pricing import SPOT_GPUS, hourly_rate
 
-    assert [hourly_rate(gpu) for gpu in SPOT_GPUS] == [1, 1, 4]
-    assert [str(shape.entry_below_usd) for shape in SPOT_GPUS.values()] == ["1.01", "1.01", "4.01"]
-    assert [str(shape.keep_running_usd) for shape in SPOT_GPUS.values()] == ["2.01", "2.51", "5.01"]
+    assert list(SPOT_GPUS) == ["H100", "H200"]  # B200 is not offered on Spot
+    assert [hourly_rate(gpu) for gpu in SPOT_GPUS] == [1, 1]
+    assert [str(shape.keep_running_usd) for shape in SPOT_GPUS.values()] == ["2.01", "2.51"]
+    assert not any(hasattr(shape, "entry_below_usd") for shape in SPOT_GPUS.values())
+
+
+def test_runs_on_h100_may_take_h200_but_not_the_reverse():
+    from flash.providers.mithril.pricing import interchangeable
+
+    assert interchangeable("H100", 1) == ("H100", "H200")
+    assert interchangeable("H100", 8) == ("H100", "H200")
+    assert interchangeable("H200", 1) == ("H200",)  # an 80 GB card cannot host a 141 GB plan
+
+
+@pytest.mark.parametrize(
+    ("live", "expected"),
+    [
+        (["H200"], "H200"),  # whichever comes up first
+        (["H100"], "H100"),
+        (["H200", "H100"], "H100"),  # both at once: class priority
+    ],
+)
+def test_queue_takes_whichever_acceptable_class_comes_up_first(monkeypatch, live, expected):
+    from flash.runner.lifecycle import status
+
+    offers = [prices.Offer(gpu, 1, f"it_{gpu}", 1.5, 1500, "r") for gpu in live]
+    answers = iter([[], offers])
+    now = [0.0]
+    monkeypatch.setattr(queue.time, "time", lambda: now[0])
+    monkeypatch.setattr(queue.time, "sleep", lambda s: now.__setitem__(0, now[0] + s))
+    monkeypatch.setattr(queue, "quota_available", lambda *a, **kw: True)
+    monkeypatch.setattr(queue, "affordable_offers", lambda **kw: next(answers))
+    monkeypatch.setattr(status, "get_status", lambda run: SimpleNamespace(state="queued"))
+    monkeypatch.setattr(status, "_update", lambda run, state: None)
+    log = io.StringIO()
+    offer = queue.wait_for_price(("H100", "H200"), "test", deadline_at=500, log=log)
+    assert offer.gpu == expected
+    assert "H100 or H200" in log.getvalue()
+
+
+def test_attempt_spec_names_the_class_that_came_up(monkeypatch):
+    from flash.core.spec import GpuSpec, JobSpec
+    from flash.providers.mithril import jobs
+    from flash.providers.mithril import queue as spot_queue
+
+    spec = JobSpec(
+        run_id="r", model="Qwen/Qwen3.5-9B-Base", gpu=GpuSpec(type="H100", provider="spot")
+    )
+    seen = {}
+    monkeypatch.setattr(jobs, "scope_fingerprint", lambda: "scope")
+
+    def wait(gpus, run_id, **kw):
+        seen["waited_for"] = gpus
+        return prices.Offer("H200", 1, "it_h200", 1.5, 1500, "r")
+
+    monkeypatch.setattr(spot_queue, "wait_for_price", wait)
+
+    def build_payload(spec, attempt, **kw):
+        seen["gpu"] = spec.gpu.type
+        raise RuntimeError("stop before launch")
+
+    monkeypatch.setattr(jobs, "build_payload", build_payload)
+    with pytest.raises(RuntimeError, match="stop before launch"):
+        jobs.submit_attempt(spec, deadline_at=time.time() + 600, log=io.StringIO())
+    assert seen == {"waited_for": ("H100", "H200"), "gpu": "H200"}
