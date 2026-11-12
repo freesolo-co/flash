@@ -38,6 +38,8 @@ MFU_DECODE = 0.25  # batched vLLM rollout (decode is memory-bandwidth-bound)
 # sft attention: seconds per (6*P*tokens/peak) scaled by mean example length / 32768. long
 # examples cost super-linearly; without it long-context runs under-quote and short ones over-quote.
 SFT_ATTENTION_COEF = 2.0
+# image sft (exact-unpacked rows): vision encoding per example, fitted on 46 multimodal runs.
+SFT_IMAGE_S_PER_EXAMPLE = 0.41
 # one-time work inside the billed window: the first optimizer update (graph capture, allocator
 # warm-up, first rollout for grpo). measured, not modeled.
 SFT_FIRST_UPDATE_S = 300.0
@@ -108,6 +110,18 @@ def first_update_seconds(config: RunConfig) -> float:
     if config.has_rollout:
         return GRPO_FIRST_UPDATE_S
     return 0.0
+
+
+def sft_image_seconds(config: RunConfig) -> float:
+    """Vision-encoder seconds for image SFT rows, which the text-token flops term does not see.
+
+    Image rows are trained exact-unpacked (one example per optimizer update), so that packing mode
+    marks them. Fitted per example on 46 completed multimodal production runs (median 1.00).
+    """
+    if config.sft_packing_mode != "exact-unpacked":
+        return 0.0
+    examples = max(1, int(config.steps)) * max(1, int(config.batch_size or 1))
+    return SFT_IMAGE_S_PER_EXAMPLE * examples
 
 
 def sft_step_floor_seconds(steps: int) -> float:
@@ -811,6 +825,7 @@ def estimate_cost(
         raw_train = (
             compile_s
             + sft_seconds_for_tokens(config, gpu, config.train_tokens) / speedup
+            + sft_image_seconds(config) / speedup
             + required_save_s
             + sft_floor_s
         )

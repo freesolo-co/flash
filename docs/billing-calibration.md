@@ -48,6 +48,7 @@ runs decide, because historical "actual" values include unobservable queue time.
 | SFT per-step floor | 0.8 s | 0.10 s |
 | SFT first update (one-time) | — | 300 s |
 | MoE SFT MFU (total params) | 0.10 | 0.45 |
+| Image SFT (exact-unpacked) vision encoding | — | 0.41 s/example |
 | GRPO step floor | 62.7 s + 0.805 s/completion | 3.5 s + 0.466 s/completion |
 | GRPO decode / update MFU | 0.12 / 0.35 | 0.25 / 0.72 |
 | GRPO first update (one-time) | — | 95 s |
@@ -91,9 +92,11 @@ What the quote still cannot know:
   intentional and left in place.
 - **Covered with no extra term needed:** thinking-mode SFT (1.00), 12k context (0.97–1.05), 9B-Base
   vs instruct (within 5% of each other for both SFT and GRPO), 2× H100 for SFT and GRPO, and H200.
-- **LoRA rank** is still open. One live rank-128 run took 1.64× its rank-16 twin, but the
-  historical sample shows little rank effect (rank 16 and rank 64 both at 0.93). A confirmation pair
-  is running before any rank term is added.
+- **LoRA rank** has no measurable effect on this workload. One live rank-128 run took 1.64× its
+  rank-16 twin, but its repeat (0.97) and a rank-64 run (1.00) matched rank 16. The slow run was a
+  one-off outlier, so no rank term was added.
+- **Image SFT** (MiniWoB screenshots, exact-unpacked) was under-estimated at 0.63 (n=46). A
+  per-example vision-encoding term (0.41 s/example) brings it to ~1.00.
 - **Run-to-run noise.** Identical repeats differed by 9% (GRPO 0.8B and 9B, SFT 9B) and 23% (short
   SFT 0.8B). No estimate can beat that.
 

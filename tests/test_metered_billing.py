@@ -280,3 +280,24 @@ def test_status_carries_prior_attempt_meter_across_retries(tmp_path, monkeypatch
     beat(2, 10.0)
     assert status.last_heartbeat["billable_train_s_prior"] == 450.0
     assert costs.metered_training_seconds(status, spec) == pytest.approx(460.0)
+
+
+# ---------------------------------------------------------------------------- estimator
+
+
+def test_image_sft_quotes_vision_encoding_per_example():
+    from dataclasses import replace
+
+    from flash.cost.analytical import SFT_IMAGE_S_PER_EXAMPLE, estimate_cost, sft_image_seconds
+    from flash.cost.types import RunConfig
+
+    text = RunConfig(
+        "Qwen/Qwen3.5-9B", "sft", 1000, seq_len=8192, batch_size=1, gpu_type="H100",
+        train_tokens=4_000_000, supervised_train_tokens=100_000, sft_packing_mode="packed",
+        sft_packed_blocks=1000, sft_retained_examples=1000, max_wall_seconds=10**7,
+    )
+    image = replace(text, sft_packing_mode="exact-unpacked")
+    assert sft_image_seconds(text) == 0.0
+    assert sft_image_seconds(image) == pytest.approx(1000 * SFT_IMAGE_S_PER_EXAMPLE)
+    gap = estimate_cost(image).train_seconds - estimate_cost(text).train_seconds
+    assert gap == pytest.approx(1000 * SFT_IMAGE_S_PER_EXAMPLE)
