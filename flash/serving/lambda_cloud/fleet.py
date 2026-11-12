@@ -111,6 +111,10 @@ class Fleet:
         return {"id": ids[0], "status": "booting"}
 
     async def _check_capacity(self, model, revision):
+        from .reserved import MODEL as RESERVED_MODEL
+
+        if model == RESERVED_MODEL and self.environment == "main":
+            raise NoCapacityError("9B Base is reserved; automatic GPU allocation is disabled")
         # Modal normally enforces this. Include uncertain/orphan launches so a
         # replacement CPU replica cannot silently exceed its GPU budget.
         instances = await self.api.call("GET", "instances")
@@ -131,7 +135,16 @@ class Fleet:
                 allocated += 1
                 if record["revision"] == revision:
                     occupied += 1
-        if self.shared_capacity is not None:
+        if model == RESERVED_MODEL:
+            from .pool_capacity import HANDOFF_SURGE
+
+            # Dev has no Modal fallback, but draining releases and uncertain
+            # launches still consume the shared Lambda handoff budget.
+            if allocated >= capacity_for(model, "lambda")[1] + HANDOFF_SURGE:
+                raise NoCapacityError(
+                    "Lambda model aggregate replica limit reached; pending cleanup"
+                )
+        elif self.shared_capacity is not None:
             await self.shared_capacity.before_launch(model, revision, allocated)
         if occupied >= capacity_for(model, "lambda")[1]:
             raise NoCapacityError("Lambda model/release replica limit reached; pending cleanup")
