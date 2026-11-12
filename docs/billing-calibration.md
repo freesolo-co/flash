@@ -86,6 +86,17 @@ What the quote still cannot know:
   figure) but fast for GRPO (1.47, faster than H100), which a single throughput number cannot
   represent.
 
+- **B200** measured 1.12–1.24, faster than estimated. The existing policy deliberately caps B200 at
+  H200-class training throughput ("never cheaper or faster than H200"), so this over-estimate is
+  intentional and left in place.
+- **Covered with no extra term needed:** thinking-mode SFT (1.00), 12k context (0.97–1.05), 9B-Base
+  vs instruct (within 5% of each other for both SFT and GRPO), 2× H100 for SFT and GRPO, and H200.
+- **LoRA rank** is still open. One live rank-128 run took 1.64× its rank-16 twin, but the
+  historical sample shows little rank effect (rank 16 and rank 64 both at 0.93). A confirmation pair
+  is running before any rank term is added.
+- **Run-to-run noise.** Identical repeats differed by 9% (GRPO 0.8B and 9B, SFT 9B) and 23% (short
+  SFT 0.8B). No estimate can beat that.
+
 The charge is metered, so these limits affect only the estimate, never the amount billed.
 
 ### What metering changes in practice
