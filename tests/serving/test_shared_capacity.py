@@ -13,6 +13,15 @@ MODEL = "Qwen/Qwen3.5-9B-Base"
 REVISION = "a" * 40
 
 
+@pytest.fixture(autouse=True)
+def exercise_dynamic_policy(monkeypatch):
+    # These tests exercise the general four-slot handoff algorithm. The production
+    # reserved-model exclusion is covered separately in test_reserved_h100.py.
+    monkeypatch.setattr(
+        "flash.serving.lambda_cloud.pool_capacity.RESERVED_MODEL", "reserved-test-only"
+    )
+
+
 @pytest.fixture
 def anyio_backend():
     return "asyncio"
