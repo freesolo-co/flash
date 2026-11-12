@@ -908,16 +908,16 @@ Pick SFT when you already have good answers and want the model to imitate them.
   including text content, reasoning, and tool-call serialization. They are indistinguishable from
   structural turn delimiters after tokenization. The run logs role-aware masked rows and any
   completion-only fallback rows separately.
-- **For Qwen3.5 thinking multi-turn SFT, put reasoning only in the final assistant
-  turn.** Qwen3.5's chat template strips literal `<think>` blocks from prior assistant
-  history and pre-opens `<think>\n` in the next generation prompt. If every assistant
-  turn in a gold multi-turn transcript includes `<think>...</think>`, training sees a
-  different tag layout than inference and can learn doubled or misplaced thinking
-  tags. Keep intermediate assistant turns as the actual code/tool/action text only;
-  put `<think>...</think>` plus the final answer in the final assistant target. Flash's
-  completion-only SFT masking uses the longest shared token prefix, so the template's
-  pre-opened `<think>\n` is treated as prompt text instead of training the model to
-  emit another opener.
+- **Thinking SFT requires reasoning in every assistant target, preserved by the
+  chat template.** With `thinking = true`, provide nonempty `reasoning_content` or a
+  leading `<think>...</think>` span, including in assistant replies after tool results.
+  Flash rejects missing reasoning and reasoning removed during formatting before training.
+  Qwen3.5 strips reasoning before the last ordinary user message: split a K-turn
+  conversation into K rows, each with earlier messages in `prompt_messages` and one
+  assistant target in `output`. Tool continuations may remain together when every
+  assistant target has reasoning and the template preserves all of it. For answer-only
+  targets, set `thinking = false`. Truncation is reported separately; increase
+  `max_context_tokens` when the reasoning or answer does not fit.
 - **SFT is a great warm start for GRPO.** SFT first to teach the format and a competent
   baseline, then GRPO to optimize past it. Across that lineage keep the **same base
   model**. Warm-start CONTINUES one adapter in place — the next run keeps training the
