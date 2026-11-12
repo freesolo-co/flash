@@ -93,7 +93,7 @@ def test_spot_estimate_is_offline_and_uses_fixed_cap(monkeypatch):
     config = {"model_id": "Qwen/Qwen3.5-9B", "method": "sft", "steps": 100, "gpu_type": "H100"}
     spot = estimate_cost(RunConfig(**config, provider="spot"))
     modal = estimate_cost(RunConfig(**config, provider="modal"))
-    assert spot.gpu_hourly_usd == 2.0  # the class's own fixed Spot rate
+    assert spot.gpu_hourly_usd == 2.5  # quoted at the costliest class an H100 run may take
     assert spot.total_usd < modal.total_usd
     assert spot.provider == "spot"
 

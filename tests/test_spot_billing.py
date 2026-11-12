@@ -26,11 +26,13 @@ def test_spot_charge_uses_spot_tariff_even_with_missing_or_stale_provider(
     spec = spot_spec(gpu, legacy_preference=legacy_preference)
     quote = estimate_for_spec(spec)
     assert quote.provider == "spot"
-    assert quote.gpu_hourly_usd == hourly
+    # the quote covers the costliest class the run may take (an H100 run may launch on an H200)
+    assert quote.gpu_hourly_usd == 2.5
     charge = costs.charge_usd_for_spec(
         spec, provider=provider_hint, gpu_type=gpu, gpu_count=1, fallback=float("nan")
     )
-    assert charge == pytest.approx(quote.total_usd)
+    # repriced on the rented class's own rate: exactly the quote scaled to that class
+    assert charge == pytest.approx(quote.total_usd * hourly / 2.5)
     regular = replace(spec, gpu=GpuSpec(type=gpu, count=1, provider="modal"))
     assert charge < costs.charge_usd_for_spec(regular)
 
@@ -198,3 +200,31 @@ def test_supervisor_records_the_class_actually_rented(chosen, remote, expected):
 
     rented = _rented_candidate(Candidate(chosen[0], chosen[1], 2.5, 80, 1), remote)
     assert (rented.gpu, rented.vram_gb) == expected
+
+
+@pytest.mark.parametrize(("rented", "hourly"), [("H100", 2.0), ("H200", 2.5)])
+def test_submitted_quote_covers_substitution_and_bills_the_rented_rate(
+    tmp_path, monkeypatch, rented, hourly
+):
+    """The persisted (offline) quote is priced at $2.50, so the settled charge equals the class
+    actually rented at its own rate: no extra discount on H100, no undercharge on an H200."""
+    from flash.runner.lifecycle import state
+
+    monkeypatch.setattr(state, "artifacts_dir", lambda spec: str(tmp_path))  # no metrics.json
+    spec = spot_spec("H100")
+    quote = estimate_for_spec(spec).total_usd  # what prepare_job persists as estimated_cost_usd
+    at_class_rate = costs.charge_usd_for_spec(
+        spec, gpu_type="H100", gpu_count=1, fallback=float("nan")
+    )
+    status = RunStatus(
+        run_id="r",
+        state="done",
+        spec=spec.to_dict(),
+        estimated_cost_usd=quote,
+        remote=_remote(rented),
+    )
+    charged = costs._status_estimated_charge(status, spec)
+    assert charged == pytest.approx(quote * hourly / 2.5)
+    if rented == "H100":
+        assert charged == pytest.approx(at_class_rate)  # exactly $2.00/GPU-hour, not less
+    assert charged <= quote
