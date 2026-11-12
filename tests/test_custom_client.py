@@ -83,8 +83,9 @@ def test_oversized_batch_can_be_split_without_losing_session(monkeypatch):
     monkeypatch.setattr("flash.custom.client.ApiClient", lambda *args, **kwargs: http)
     client = TrainingClient("https://gpu.example", api_key="session-token")
     row = Datum([1] * 32768, [0.123456789] * 32767)
+    # ~0.46 MB per row; 80 rows pass the 32 MiB body cap before any request is sent.
     with pytest.raises(ValueError, match="split the batch"):
-        client.forward_backward([row] * 16)
+        client.forward_backward([row] * 80)
     assert client.pending_request is None
     assert http.envelopes == []
     client.forward_backward([row])

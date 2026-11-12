@@ -10,7 +10,7 @@ from fastapi.testclient import TestClient
 
 from flash.custom.server import create_app
 from flash.custom.session import SessionConflict, TrainingSession
-from flash.custom.types import Datum, parse_batch
+from flash.custom.types import MAX_BODY_BYTES, Datum, parse_batch
 
 
 class CounterBackend:
@@ -228,7 +228,7 @@ def test_http_auth_validation_logs_and_retry(tmp_path):
         == "optim_step"
     )
     oversized = client.post(
-        "/v1/custom/operation", headers=headers, content="x" * (4 * 1024 * 1024 + 1)
+        "/v1/custom/operation", headers=headers, content="x" * (MAX_BODY_BYTES + 1)
     )
     assert oversized.status_code == 413
     assert oversized.json()["detail"]["code"] == "custom_rejected"

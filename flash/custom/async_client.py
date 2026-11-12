@@ -45,8 +45,8 @@ class AsyncTrainingClient:
         # retains ambiguous receipts, so subsequent queued calls fail closed until reconciled.
         return await asyncio.shield(asyncio.wrap_future(future))
 
-    async def encode(self, text):
-        return await self._call("encode", text)
+    async def encode(self, text, **kwargs):
+        return await self._call("encode", text, **kwargs)
 
     async def decode(self, tokens):
         return await self._call("decode", tokens)

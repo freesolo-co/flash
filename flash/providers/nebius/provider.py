@@ -1,6 +1,7 @@
 """Nebius-only Spot training provider."""
 
-from flash.providers.core.base import GPU_INFO, Candidate
+from flash.providers.core import base
+from flash.providers.core.base import Candidate
 from flash.providers.nebius.config import configured
 from flash.providers.nebius.handles import SpotJobHandle, require_scope
 from flash.providers.nebius.pricing import SPOT_GPUS, hourly_rate
@@ -27,7 +28,7 @@ class SpotProvider:
         return problems
 
     def gpu_classes(self):
-        return [GPU_INFO[name] for name in SPOT_GPUS]
+        return [base.GPU_INFO[name] for name in SPOT_GPUS]
 
     def hourly_rate(self, gpu):
         return hourly_rate(gpu)
@@ -38,9 +39,9 @@ class SpotProvider:
 
         prices = affordable_gpus(settings()["region"])
         return [
-            Candidate(self.name, name, prices[name], GPU_INFO[name].vram_gb, count)
+            Candidate(self.name, name, prices[name], base.GPU_INFO[name].vram_gb, count)
             for name, shape in SPOT_GPUS.items()
-            if name in prices and GPU_INFO[name].vram_gb >= need_vram_gb
+            if name in prices and base.GPU_INFO[name].vram_gb >= need_vram_gb
             for count in shape.counts
             if count <= constraints.max_gpu_count
         ]

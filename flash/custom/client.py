@@ -7,7 +7,7 @@ import threading
 from urllib.parse import urlsplit
 
 from flash.client.http import ApiClient, ApiError
-from flash.custom.types import MAX_BODY_BYTES, Datum
+from flash.custom.types import MAX_BODY_BYTES, MAX_BODY_MIB, Datum
 
 
 def pinned_context(certificate):
@@ -84,7 +84,9 @@ class TrainingClient:
             # detach from mutable user lists; retries must send byte-equivalent intent.
             serialized = json.dumps(envelope, allow_nan=False)
             if len(serialized.encode()) > MAX_BODY_BYTES:
-                raise ValueError("custom operation exceeds 4 MiB; split the batch and try again")
+                raise ValueError(
+                    f"custom operation exceeds {MAX_BODY_MIB} MiB; split the batch and try again"
+                )
             self._pending = json.loads(serialized)
             return self.retry_pending()
 
@@ -110,19 +112,24 @@ class TrainingClient:
             self._pending = None
             return result
 
-    def encode(self, text):
-        return self._call("encode", text=text)["tokens"]
+    def encode(self, text, *, images=None):
+        """Token ids for text; with images (data URIs), each <|image_pad|> in text becomes the
+        exact placeholder run its image needs, ready for Datum(tokens, images=images)."""
+        extra = {"images": list(images)} if images is not None else {}
+        return self._call("encode", text=text, **extra)["tokens"]
 
     def decode(self, tokens):
         return self._call("decode", tokens=tokens)["text"]
 
-    def sample(self, prompt, *, max_tokens=64, temperature=1.0, num_samples=1):
+    def sample(self, prompt, *, max_tokens=64, temperature=1.0, num_samples=1, images=None):
+        extra = {"images": list(images)} if images is not None else {}
         return self._call(
             "sample",
             prompt=prompt,
             max_tokens=max_tokens,
             temperature=temperature,
             num_samples=num_samples,
+            **extra,
         )
 
     def forward(self, data, *, top_k=0):
@@ -153,6 +160,7 @@ class TrainingClient:
                     target_tokens=[list(ids) for ids in row.target_tokens]
                     if row.target_tokens is not None
                     else None,
+                    images=list(row.images) if row.images is not None else None,
                 )
                 for row in data
             ]
@@ -176,7 +184,7 @@ class TrainingClient:
                     if not torch.isfinite(gradient).all():
                         raise ValueError("custom loss produced non-finite token gradients")
                     weight = (-gradient).tolist()
-                weights.append(Datum(row.tokens, weight, row.target_tokens))
+                weights.append(Datum(row.tokens, weight, row.target_tokens, row.images))
             return self.forward_backward(weights, metrics={**metrics, "custom_loss": loss.item()})
 
     def optim_step(self, *, learning_rate, max_grad_norm=1.0, algorithm_state=None):
