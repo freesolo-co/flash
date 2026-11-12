@@ -451,3 +451,37 @@ def test_attempt_spec_names_the_class_that_came_up(monkeypatch):
     with pytest.raises(RuntimeError, match="stop before launch"):
         jobs.submit_attempt(spec, deadline_at=time.time() + 600, log=io.StringIO())
     assert seen == {"waited_for": ("H100", "H200"), "gpu": "H200"}
+
+
+def test_mithril_boot_window_and_failure(monkeypatch):
+    """A filled bid gets 30 minutes to boot; a VM that never boots is a boot_timeout, not a stall."""
+    from flash.providers.mithril import jobs as mithril_jobs
+
+    captured = {}
+
+    def fake_poll(adapter, **kwargs):
+        captured.update(kwargs, failure=adapter.load_timeout_failure)
+        return "polled"
+
+    monkeypatch.setattr(mithril_jobs, "poll_instance_job", fake_poll)
+    monkeypatch.setattr(mithril_jobs, "require_scope", lambda _: None)
+    handle = SimpleNamespace(
+        to_dict=lambda: {
+            "provider": "spot",
+            "instance_id": "bid_test",
+            "name": "run-a0",
+            "run_id": "run",
+            "phase": "custom",
+            "hf_repo": "org/repo",
+            "attempt": 0,
+            "gpu": "H200",
+            "gpu_count": 1,
+            "hourly_usd": 2.5,
+            "scope": "x",
+            "started_ts": 1.0,
+        }
+    )
+    spec = SimpleNamespace(run_id="run", phase="custom", train=SimpleNamespace(hf_repo="org/repo"))
+    assert mithril_jobs.poll(handle, spec, deadline_at=10_000) == "polled"
+    assert captured["load_timeout_s"] == mithril_jobs.BOOT_TIMEOUT_S == 1800
+    assert captured["failure"] == "boot_timeout"
