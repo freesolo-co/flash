@@ -291,10 +291,9 @@ def test_stopped_spot_worker_requeues_until_price_recovers(monkeypatch):
     assert plan.retry
 
     states = []
-    prices_to_check = iter([[], [], [prices.Offer("H100", 1, "it_test", 0.9, 1500)]])
+    prices_to_check = iter([[], [], [prices.Offer("H100", 1, "it_test", 0.9, 1500, "test")]])
     monkeypatch.setattr(queue, "quota_available", lambda *a, **kw: True)
-    monkeypatch.setattr(queue, "settings", lambda: {"region": "test"})
-    monkeypatch.setattr(queue, "affordable_offers", lambda region, **kw: next(prices_to_check))
+    monkeypatch.setattr(queue, "affordable_offers", lambda **kw: next(prices_to_check))
     monkeypatch.setattr(status, "get_status", lambda run: SimpleNamespace(state="queued"))
     monkeypatch.setattr(status, "_update", lambda run, state: states.append(state))
     queued_at = now[0]
