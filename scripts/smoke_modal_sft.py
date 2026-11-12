@@ -81,7 +81,9 @@ def stage_environment(hub, repo, root):
     return environment, rows
 
 
-def prepare(hub, repo, run_id, volume, root, gpu, model="Qwen/Qwen3.5-9B", *, provider="modal"):
+def prepare(
+    hub, repo, run_id, volume, root, gpu, model="Qwen/Qwen3.5-9B", *, provider="modal", steps=2
+):
     from importlib.metadata import version
 
     environment, rows = stage_environment(hub, repo, root)
@@ -97,15 +99,15 @@ def prepare(hub, repo, run_id, volume, root, gpu, model="Qwen/Qwen3.5-9B", *, pr
         model_revision=revision,
         model_revision_auto=True,
         algorithm="sft",
-        thinking="off",
+        thinking=False,
         environment=environment,
         train=TrainSpec(
             hf_repo=repo,
-            max_steps=2,
+            max_steps=steps,
             max_examples=4,
             batch_size=1,
             max_context_tokens=256,
-            save_at_steps=(1, 2),
+            save_at_steps=(1, steps),
             lora_rank=8,
         ),
         gpu=GpuSpec(

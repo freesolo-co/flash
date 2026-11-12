@@ -104,10 +104,17 @@ Azure artifact repository and run:
 python scripts/smoke_mithril_sft.py --run-paid-test --repo owner/private-test-dataset
 ```
 
-This rents one H100 at a time, cancels its bid after checkpoint 1 is durable, and
-verifies that a new bid resumes and completes step 2. Each attempt is limited to
+This rents one H100 at a time and requests cancellation after checkpoint 1 is durable.
+The small first run may finish step 2 before cancellation takes effect. A new bid
+restores the latest checkpoint with the target extended to step 4, proving that
+recovery executes additional optimizer steps in either case. Each attempt is limited to
 45 minutes. The harness cancels its bids; test artifacts remain in private storage.
 It will stay queued if the regional H100 price is not below the unchanged entry cap.
+
+For an explicitly paid qualification when current prices exceed the normal entry
+threshold, select `--gpu H200 --entry-price-cap 2`. This changes admission only in
+the smoke-test process and refuses caps above that GPU's existing hold cap. It does
+not change production pricing. `--model` selects the model to qualify.
 
 # Hosted model capacity and providers
 
