@@ -12,7 +12,15 @@ INFRA_RETRY_FAILURES = frozenset({"stalled", "no_capacity", "poll_error"})
 # The worker itself reported a transient infrastructure fault (RetriableInfraError: a GPU fault, an
 # artifact-store stall). Distinct from preemption, whose non-Spot handling stays terminal.
 WORKER_RETRIABLE_FAILURE = "worker_retriable"
-CANDIDATE_RETRY_FAILURES = INFRA_RETRY_FAILURES | {"oom", "job_preempted", WORKER_RETRIABLE_FAILURE}
+# A Spot VM was rented but never booted within its window: a provider fault on that machine, not
+# a memory signal, so retry the same shape within the infrastructure budget.
+BOOT_TIMEOUT_FAILURE = "boot_timeout"
+CANDIDATE_RETRY_FAILURES = INFRA_RETRY_FAILURES | {
+    "oom",
+    "job_preempted",
+    WORKER_RETRIABLE_FAILURE,
+    BOOT_TIMEOUT_FAILURE,
+}
 CACHE_FALLBACK_FAILURES = frozenset({"no_capacity", "poll_error"})
 _STATE_KEYS = frozenset(
     {
@@ -305,7 +313,9 @@ def _spot_preemption_plan(state: RetryState, chosen) -> tuple[RetryState, RetryP
     )
 
 
-def _worker_retriable_plan(state: RetryState, chosen) -> tuple[RetryState, RetryPlan]:
+def _worker_retriable_plan(
+    state: RetryState, chosen, reason: str = "a retriable worker fault"
+) -> tuple[RetryState, RetryPlan]:
     """Retry a worker-flagged transient fault on the same shape, within the infrastructure budget.
 
     A GPU fault or a storage stall says nothing about memory needs, so the usable-VRAM floor is not
@@ -318,7 +328,7 @@ def _worker_retriable_plan(state: RetryState, chosen) -> tuple[RetryState, Retry
     ordinal = state.infra_used + 1
     return replace(state, infra_used=ordinal, cache_retry_shape=None), RetryPlan(
         True,
-        f"retrying on {chosen.gpu} @ {chosen.provider} after a retriable worker fault "
+        f"retrying on {chosen.gpu} @ {chosen.provider} after {reason} "
         "(resume from last checkpoint)",
         ordinal,
     )
@@ -339,6 +349,9 @@ def transition_failure(
         return _finish(state, plan, observation, attempt)
     if failure == WORKER_RETRIABLE_FAILURE:
         state, plan = _worker_retriable_plan(state, chosen)
+        return _finish(state, plan, observation, attempt)
+    if failure == BOOT_TIMEOUT_FAILURE:
+        state, plan = _worker_retriable_plan(state, chosen, "a VM that never booted")
         return _finish(state, plan, observation, attempt)
     if failure == "no_capacity" and chosen is not None and chosen.provider == "spot":
         # Spot refused the create for quota/capacity before provisioning anything. Like an
