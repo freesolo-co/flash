@@ -109,11 +109,32 @@ def submit_attempt(
     from flash.runtime_capsule import build_capsule
 
     deadline_at = require_deadline_at(deadline_at)
-    gpu = spec.gpu.type
+    allocated = spec.gpu.type
     count = gpu_count_of(spec)
-    if count > get_gpu_info(gpu).max_count:
-        raise ValueError(f"Mithril Spot does not support {count} GPUs of class {gpu}")
+    if count > get_gpu_info(allocated).max_count:
+        raise ValueError(f"Mithril Spot does not support {count} GPUs of class {allocated}")
     owner_scope = scope_fingerprint()
+    from flash.providers.mithril.pricing import interchangeable
+    from flash.providers.mithril.queue import wait_for_price
+
+    # Wait for every Spot class that can host this plan and take whichever comes up first.
+    offer = wait_for_price(
+        interchangeable(allocated, count) or (allocated,),
+        spec.run_id,
+        gpu_count=count,
+        disk_gb=spec.gpu.disk_gb,
+        deadline_at=deadline_at,
+        log=log,
+    )
+    gpu = offer.gpu
+    if gpu != allocated:
+        # The worker verifies its live card against spec.gpu.type, so the attempt's spec names the
+        # class actually rented (it has at least the allocated class's VRAM).
+        from dataclasses import replace
+
+        spec = replace(spec, gpu=replace(spec.gpu, type=gpu, type_fallbacks=()))
+        if log is not None:
+            print(f"Spot: {gpu} came up first (allocated {allocated})", file=log, flush=True)
     payload = build_payload(
         spec,
         attempt,
@@ -121,16 +142,6 @@ def submit_attempt(
         runtime_secrets=runtime_secrets,
         source_snapshot=source_snapshot,
         deadline_at=deadline_at,
-    )
-    from flash.providers.mithril.queue import wait_for_price
-
-    offer = wait_for_price(
-        gpu,
-        spec.run_id,
-        gpu_count=count,
-        disk_gb=spec.gpu.disk_gb,
-        deadline_at=deadline_at,
-        log=log,
     )
     name = instance_label(spec.run_id, attempt)
     started = time.time()
