@@ -67,8 +67,8 @@ Live runs cover Qwen3.5-0.8B, 4B, 9B, 9B-Base and Qwen3.6-35B-A3B on 1× H100, 1
 
 | | n | median | mean abs error | within ±20% |
 |---|---|---|---|---|
-| SFT | 18 | 0.98 | 10% | 78% |
-| GRPO | 16 | 1.02 | 14% | 81% |
+| SFT | 26 | 0.99 | 11% | 73% |
+| GRPO | 18 | 1.03 | 13% | 83% |
 
 What the quote still cannot know:
 - **GRPO realized completion length.** The quote prices with `max_completion_tokens`. A 2,048-token
@@ -96,7 +96,9 @@ What the quote still cannot know:
   rank-16 twin, but its repeat (0.97) and a rank-64 run (1.00) matched rank 16. The slow run was a
   one-off outlier, so no rank term was added.
 - **Image SFT** (MiniWoB screenshots, exact-unpacked) was under-estimated at 0.63 (n=46). A
-  per-example vision-encoding term (0.41 s/example) brings it to ~1.00.
+  per-example vision-encoding term (0.41 s/example) brings it to ~1.00. Three live 600-step MiniWoB
+  image runs measured 0.97 / 1.20 / 1.14. Identical repeats spread 816–1,006 s. Each spent
+  900–1,100 s in setup (image loading and model download), which the meter excludes.
 - **Run-to-run noise.** Identical repeats differed by 9% (GRPO 0.8B and 9B, SFT 9B) and 23% (short
   SFT 0.8B). No estimate can beat that.
 
