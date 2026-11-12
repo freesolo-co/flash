@@ -375,6 +375,26 @@ def test_worker_retriable_fault_retries_same_shape_within_infra_budget(provider)
     assert "budget exhausted" in plan.action
 
 
+def test_spot_vm_that_never_booted_retries_same_shape_within_infra_budget():
+    """An H200 (the largest Spot class) that never boots is rebid, not escalated past every GPU."""
+    chosen = _candidate("spot", "H200", 141)
+    current = RetryState(2, 2, 1)
+    for attempt in range(2):
+        current, plan = transition_failure(
+            current, _observe("boot_timeout", chosen, (chosen,)), attempt=attempt
+        )
+        assert plan.retry
+        assert "never booted" in plan.action
+        assert current.infra_used == attempt + 1
+        assert current.usable_vram_floor == 0
+        assert current.select_candidate((chosen,))[1] == chosen
+    current, plan = transition_failure(
+        current, _observe("boot_timeout", chosen, (chosen,)), attempt=2
+    )
+    assert not plan.retry
+    assert "budget exhausted" in plan.action
+
+
 def test_worker_retriable_authorization_survives_restore():
     spec = _spec(max_retries=2)
     chosen = _candidate("modal", "H100", 80, 2)
