@@ -14,6 +14,9 @@ class SpotJobHandle(InstanceJobHandle):
     phase: str
     scope: str
     gpu_count: int = 1
+    # The allocated class the run's quote was priced on (``pricing.quote_rate``). Empty for
+    # handles written before quotes covered interchangeable classes.
+    quoted_gpu: str = ""
     provider = "spot"
 
     @staticmethod
@@ -30,6 +33,7 @@ class SpotJobHandle(InstanceJobHandle):
             "phase": self.phase,
             "gpu_count": self.gpu_count,
             "scope": self.scope,
+            **({"quoted_gpu": self.quoted_gpu} if self.quoted_gpu else {}),
         }
 
     @staticmethod
@@ -44,6 +48,10 @@ class SpotJobHandle(InstanceJobHandle):
         if type(count) is not int or count not in (1, 8):
             raise ValueError("invalid Mithril Spot gpu_count")
         fields["gpu_count"] = count
+        quoted = data.get("quoted_gpu", "")
+        if not isinstance(quoted, str) or quoted != quoted.strip():
+            raise ValueError("invalid Mithril Spot quoted_gpu")
+        fields["quoted_gpu"] = quoted
         return fields
 
 

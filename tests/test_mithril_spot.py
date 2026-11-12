@@ -93,8 +93,8 @@ def test_spot_estimate_is_offline_and_uses_fixed_cap(monkeypatch):
     config = {"model_id": "Qwen/Qwen3.5-9B", "method": "sft", "steps": 100, "gpu_type": "H100"}
     spot = estimate_cost(RunConfig(**config, provider="spot"))
     modal = estimate_cost(RunConfig(**config, provider="modal"))
-    assert spot.gpu_hourly_usd == 1
-    assert spot.total_usd < modal.total_usd / 3
+    assert spot.gpu_hourly_usd == 2.0  # the class's own fixed Spot rate
+    assert spot.total_usd < modal.total_usd
     assert spot.provider == "spot"
 
 
@@ -387,7 +387,7 @@ def test_entry_and_running_caps_do_not_change_fixed_customer_rates():
     from flash.providers.mithril.pricing import SPOT_GPUS, hourly_rate
 
     assert list(SPOT_GPUS) == ["H100", "H200"]  # Mithril offers only these
-    assert [hourly_rate(gpu) for gpu in SPOT_GPUS] == [1, 1]
+    assert [hourly_rate(gpu) for gpu in SPOT_GPUS] == [2.0, 2.5]
     assert [str(shape.keep_running_usd) for shape in SPOT_GPUS.values()] == ["2.01", "2.51"]
     assert not any(hasattr(shape, "entry_below_usd") for shape in SPOT_GPUS.values())
 

@@ -417,7 +417,8 @@ spot = false # set true for Mithril Spot; false uses regular training
 Spot only uses Mithril, which offers H100 and H200. Each has one cap per GPU-hour, $2.01
 for H100 and $2.51 for H200: a run starts below it and keeps running through it. A queued run
 waits for every class that fits its plan (an H100 run also takes an H200) and launches on
-whichever comes up first.
+whichever comes up first. Spot is charged at a fixed $2.00 (H100) or $2.50 (H200) per
+GPU-hour.
 
 GPU allocation and Azure artifacts are **managed by default**: leave `[gpu] type` unset to
 let the allocator pick the cheapest fitting validated class, while `train.hf_repo` remains

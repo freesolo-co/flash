@@ -178,8 +178,8 @@ def test_live_candidates_use_only_advertised_shapes_and_per_gpu_prices(monkeypat
     # queues for whichever class comes up first instead of being rejected.
     fallback = get_provider("spot").live_candidates(80, AllocationConstraints(max_gpu_count=1))
     assert [(c.gpu, c.gpu_count, c.hourly_usd) for c in fallback] == [
-        ("H100", 1, 1.0),
-        ("H200", 1, 1.0),
+        ("H100", 1, 2.0),
+        ("H200", 1, 2.5),
     ]
 
 
@@ -425,7 +425,7 @@ def test_candidates_exclude_insufficient_scratch(monkeypatch):
     # the 1.5 TB live offer is excluded; only fixed-rate catalog shapes remain (the queue rechecks
     # disk before bidding).
     assert candidates
-    assert all(c.hourly_usd == 1.0 for c in candidates)
+    assert all(c.hourly_usd in (2.0, 2.5) for c in candidates)
 
 
 @pytest.mark.parametrize("valid", [True, False])

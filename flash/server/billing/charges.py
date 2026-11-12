@@ -257,6 +257,9 @@ def _charge_run(
     remote = status.remote or status.billing_remote
     remote = remote if isinstance(remote, dict) else {}
     allocated_gpu = remote.get("allocated_gpu")
+    if remote.get("provider") == "spot" and isinstance(remote.get("gpu"), str) and remote["gpu"]:
+        # A Spot run may launch on a different (interchangeable) class than it was allocated.
+        allocated_gpu = remote["gpu"]
     gpu = (
         allocated_gpu
         if isinstance(allocated_gpu, str) and allocated_gpu

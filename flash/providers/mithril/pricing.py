@@ -20,8 +20,8 @@ class SpotGpu:
 
 
 SPOT_GPUS = {
-    "H100": SpotGpu(Decimal("1.00"), Decimal("2.01")),
-    "H200": SpotGpu(Decimal("1.00"), Decimal("2.51")),
+    "H100": SpotGpu(Decimal("2.00"), Decimal("2.01")),
+    "H200": SpotGpu(Decimal("2.50"), Decimal("2.51")),
 }
 
 
@@ -48,6 +48,35 @@ def priority(gpu: str) -> int:
 
 def running_limit(gpu: str) -> float:
     return float(SPOT_GPUS[canonical_gpu(gpu)].keep_running_usd)
+
+
+def quote_rate(gpu: str, count: int) -> float:
+    """Per-GPU rate a Spot quote is priced at: the costliest class the run may land on.
+
+    A run allocated on ``gpu`` may launch on any ``interchangeable`` class, so its quote is an
+    upper bound; billing scales it to the class actually rented (``billed_rate_factor``).
+    """
+    return max(hourly_rate(name) for name in interchangeable(gpu, count) or (gpu,))
+
+
+def billed_rate_factor(remote) -> float:
+    """Charge share of a Spot quote for the class actually rented: rented rate / quoted rate.
+
+    Only handles that record ``quoted_gpu`` (quotes priced by ``quote_rate``) are scaled; older
+    handles were quoted at their own class rate and keep a factor of 1.
+    """
+    if not isinstance(remote, dict) or remote.get("provider") != "spot":
+        return 1.0
+    quoted, rented, count = remote.get("quoted_gpu"), remote.get("gpu"), remote.get("gpu_count", 1)
+    try:
+        quoted, rented = canonical_gpu(quoted), canonical_gpu(rented)
+        if quoted not in SPOT_GPUS or rented not in SPOT_GPUS:
+            return 1.0
+        if type(count) is not int or count < 1:
+            count = 1
+        return min(1.0, hourly_rate(rented) / quote_rate(quoted, count))
+    except Exception:
+        return 1.0
 
 
 def interchangeable(gpu: str, count: int) -> tuple[str, ...]:

@@ -32,8 +32,8 @@ release does not migrate or delete existing legacy VMs.
 
 | GPU | Fixed estimate / charge rate | Cap per GPU-hour (start below, keep running through) |
 | --- | ---: | ---: |
-| H100 | $1.00 | $2.01 |
-| H200 | $1.00 | $2.51 |
+| H100 | $2.00 | $2.01 |
+| H200 | $2.50 | $2.51 |
 
 The policy lives in `flash/providers/mithril/pricing.py`. Flash joins the authenticated
 instance-type catalog to live auctions in every region, admitting only advertised SXM
@@ -60,7 +60,13 @@ quota rows defer to server enforcement. Definitively refused creates with confir
 quota exhaustion requeue only after reconciliation finds no bid; unknown POST
 outcomes remain fail-closed. Organization-level limits remain server-enforced.
 
-Customer charges retain the accepted Spot quote ($1 per GPU-hour for H100/H200),
+A Spot quote is priced at the costliest class the run may land on (an H100-allocated run may
+take an H200, so it is quoted at $2.50 per GPU-hour). The charge is then scaled to the class
+actually rented: the accepted quote x the completed-work share x (rented rate / quoted rate),
+so an H100 run that ran on an H100 pays $2.00 per GPU-hour and never more than the quote.
+Runs launched before this rule are billed on their accepted quote unchanged.
+Customer charges otherwise retain the accepted Spot quote ($2.00 per GPU-hour for H100, $2.50 for
+H200),
 with the existing completed-work/session-time settlement rules.
 These estimates are not Mithril invoices and exclude network, taxes and other charges.
 The same cap bounds both admission and subsequent compute pricing.
