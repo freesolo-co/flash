@@ -21,7 +21,7 @@ logger = get_logger(__name__)
 
 _PROVIDER_SETUP = (
     ("modal", "MODAL_TOKEN_ID + MODAL_TOKEN_SECRET", "Modal workspace credentials"),
-    ("spot", "FLASH_NEBIUS_PROJECT_ID/REGION/SUBNET_ID/IMAGE_ID", "Nebius CLI and GPU host image"),
+    ("spot", "FLASH_MITHRIL_API_KEY/PROJECT_ID/REGION", "Mithril Compute API credentials"),
 )
 
 

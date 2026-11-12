@@ -411,10 +411,10 @@ Select Spot directly in your editable training TOML:
 
 ```toml
 [gpu]
-spot = false # set true for Nebius Spot; false uses regular training
+spot = false # set true for Mithril Spot; false uses regular training
 ```
 
-Spot only uses Nebius and prefers fitting H100s, then H200s, then B200s.
+Spot only uses Mithril and prefers fitting H100s, then H200s, then B200s.
 It queues until the price is below $1, $1, or $4 per GPU-hour respectively.
 Once running, the corresponding maximum prices are $1.50, $2, and $5.
 
@@ -1658,12 +1658,12 @@ rejected as unknown settings; no legacy optimizer or loss shim is installed.
 
 ### Spot recovery checkpoints
 
-With `[gpu] spot = true`, Flash uses Nebius and manages recovery checkpoints automatically.
+With `[gpu] spot = true`, Flash uses Mithril and manages recovery checkpoints automatically.
 A greedy scheduler uses the latest step duration, targeting at most 10 minutes of
 unsaved training: 5-minute steps save every 2 steps; 1-minute steps every 10.
 The first and final completed steps also save. Steps lasting 10 minutes or longer save after every step. Slow steps or uploads can exceed
 the recovery target. Omit `train.save_every`. Set `spot = false` for regular training.
 An optional `train.save_at_steps` schedule adds model exports to those automatic
-saves; it cannot disable them. After preemption, the replacement Nebius Spot VM
+saves; it cannot disable them. After preemption, the replacement Mithril Spot VM
 resumes the latest fully uploaded trainer checkpoint. An interrupted upload is
 not a valid resume point.

@@ -25,8 +25,8 @@ def _modal_connection(run_id, remote):
 
 def _spot_connection(run_id, remote):
     """A Spot VM is reached directly: its public IP, the attempt's token and pinned certificate."""
-    from flash.providers.nebius import api
-    from flash.providers.nebius.handles import SpotJobHandle, require_scope
+    from flash.providers.mithril import api
+    from flash.providers.mithril.handles import SpotJobHandle, require_scope
 
     handle = SpotJobHandle.from_dict(remote)
     require_scope(handle)

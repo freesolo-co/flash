@@ -1,9 +1,9 @@
-"""Nebius-only Spot training provider."""
+"""Mithril-only Spot training provider."""
 
 from flash.providers.core.base import GPU_INFO, Candidate
-from flash.providers.nebius.config import configured
-from flash.providers.nebius.handles import SpotJobHandle, require_scope
-from flash.providers.nebius.pricing import SPOT_GPUS, hourly_rate
+from flash.providers.mithril.config import configured
+from flash.providers.mithril.handles import SpotJobHandle, require_scope
+from flash.providers.mithril.pricing import SPOT_GPUS, hourly_rate
 
 
 class SpotProvider:
@@ -20,7 +20,7 @@ class SpotProvider:
         problems = []
         if not self.is_configured():
             problems.append(
-                "Configure the Nebius CLI and FLASH_NEBIUS_PROJECT_ID/REGION/SUBNET_ID/IMAGE_ID"
+                "Configure FLASH_MITHRIL_API_KEY, FLASH_MITHRIL_PROJECT_ID and FLASH_MITHRIL_REGION"
             )
         if require_hf and not artifacts_configured():
             problems.append("Configure private Azure artifact storage")
@@ -33,16 +33,17 @@ class SpotProvider:
         return hourly_rate(gpu)
 
     def live_candidates(self, need_vram_gb, constraints):
-        from flash.providers.nebius.config import settings
-        from flash.providers.nebius.prices import affordable_gpus
+        from flash.providers.mithril.config import settings
+        from flash.providers.mithril.prices import affordable_offers
 
-        prices = affordable_gpus(settings()["region"])
         return [
-            Candidate(self.name, name, prices[name], GPU_INFO[name].vram_gb, count)
-            for name, shape in SPOT_GPUS.items()
-            if name in prices and GPU_INFO[name].vram_gb >= need_vram_gb
-            for count in shape.counts
-            if count <= constraints.max_gpu_count
+            Candidate(
+                self.name, offer.gpu, offer.hourly_usd, GPU_INFO[offer.gpu].vram_gb, offer.count
+            )
+            for offer in affordable_offers(settings()["region"])
+            if GPU_INFO[offer.gpu].vram_gb >= need_vram_gb
+            and offer.count <= constraints.max_gpu_count
+            and offer.disk_gb >= constraints.disk_gb
         ]
 
     def submit_attempt(
@@ -57,7 +58,7 @@ class SpotProvider:
         source_snapshot=None,
         _deadline_at=None,
     ):
-        from flash.providers.nebius.jobs import submit_attempt
+        from flash.providers.mithril.jobs import submit_attempt
 
         return submit_attempt(
             spec,
@@ -70,12 +71,12 @@ class SpotProvider:
         )
 
     def poll_attempt(self, handle, spec, *, log=None, _deadline_at=None):
-        from flash.providers.nebius.jobs import poll
+        from flash.providers.mithril.jobs import poll
 
         return poll(handle, spec, log=log, deadline_at=_deadline_at)
 
     def destroy(self, handle):
-        from flash.providers.nebius.api import terminate
+        from flash.providers.mithril.api import terminate
 
         h = SpotJobHandle.from_dict(handle.to_dict())
         require_scope(h)
@@ -88,14 +89,14 @@ class SpotProvider:
         self.terminate_run(spec.run_id)
 
     def terminate_run(self, run_id):
-        from flash.providers.nebius import api
+        from flash.providers.mithril import api
 
         for instance in api.list_instances():
             if instance["metadata"]["labels"].get("flash-run") == run_id:
                 api.terminate(instance["metadata"]["id"])
 
     def run_instances_remaining(self, run_id):
-        from flash.providers.nebius import api
+        from flash.providers.mithril import api
 
         return [
             item["metadata"]["id"]
@@ -104,7 +105,7 @@ class SpotProvider:
         ]
 
     def sweep_orphans(self, active_labels=None, known_labels=None):
-        from flash.providers.nebius import api
+        from flash.providers.mithril import api
 
         instances = api.list_instances()
         active = active_labels() if callable(active_labels) else active_labels

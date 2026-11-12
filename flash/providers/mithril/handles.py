@@ -1,4 +1,4 @@
-"""Strict, durable identity for a Nebius Spot training attempt."""
+"""Strict, durable identity for a Mithril Spot training attempt."""
 
 import re
 from dataclasses import dataclass
@@ -18,8 +18,8 @@ class SpotJobHandle(InstanceJobHandle):
 
     @staticmethod
     def _coerce_instance_id(raw):
-        if not isinstance(raw, str) or not re.fullmatch(r"computeinstance-[A-Za-z0-9_-]+", raw):
-            raise ValueError("invalid Nebius Spot sandbox id")
+        if not isinstance(raw, str) or not re.fullmatch(r"bid_[A-Za-z0-9]+", raw):
+            raise ValueError("invalid Mithril Spot sandbox id")
         return raw
 
     def _extra_to_dict(self):
@@ -38,19 +38,19 @@ class SpotJobHandle(InstanceJobHandle):
         for key in ("name", "run_id", "hf_repo", "phase", "scope"):
             value = data.get(key)
             if not isinstance(value, str) or not value or value != value.strip():
-                raise ValueError(f"invalid Nebius Spot {key}")
+                raise ValueError(f"invalid Mithril Spot {key}")
             fields[key] = value
         count = data.get("gpu_count")
         if type(count) is not int or count not in (1, 8):
-            raise ValueError("invalid Nebius Spot gpu_count")
+            raise ValueError("invalid Mithril Spot gpu_count")
         fields["gpu_count"] = count
         return fields
 
 
 def require_scope(handle):
-    from flash.providers.nebius.config import scope_fingerprint
+    from flash.providers.mithril.config import scope_fingerprint
 
     if handle.scope != scope_fingerprint():
         raise RuntimeError(
-            "Nebius Spot credentials or environment differ from this attempt's owner"
+            "Mithril Spot credentials or environment differ from this attempt's owner"
         )

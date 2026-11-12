@@ -555,7 +555,7 @@ def _offline_gpu_shape(config: RunConfig) -> tuple[str, int, int, str, float]:
         info = GPU_INFO[gpu]
         counts = rentable_gpu_counts(min(safe_gpu_count, info.max_count))
         if provider == "spot":
-            from flash.providers.nebius.pricing import SPOT_GPUS
+            from flash.providers.mithril.pricing import SPOT_GPUS
 
             counts = tuple(n for n in counts if n in SPOT_GPUS[gpu].counts)
         for count in counts:
@@ -572,7 +572,7 @@ def _offline_gpu_shape(config: RunConfig) -> tuple[str, int, int, str, float]:
             step_seconds = sharded_step_seconds(
                 config, gpu, count, "" if provider == "auto" else provider
             )
-            from flash.providers.nebius.pricing import priority as spot_priority
+            from flash.providers.mithril.pricing import priority as spot_priority
 
             ranked.append(
                 (

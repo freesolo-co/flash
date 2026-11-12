@@ -12,23 +12,15 @@ from flash.providers.core.base import canonical_gpu
 
 @dataclass(frozen=True)
 class SpotGpu:
-    platform: str
     hourly_usd: Decimal
     keep_running_usd: Decimal
-    cpu: int
-    memory_gib: int
     counts: tuple[int, ...] = (1, 8)
-
-    def preset(self, count: int) -> str:
-        if type(count) is not int or count not in self.counts:
-            raise ValueError("unsupported Nebius GPU count")
-        return f"{count}gpu-{self.cpu * count}vcpu-{self.memory_gib * count}gb"
 
 
 SPOT_GPUS = {
-    "H100": SpotGpu("gpu-h100-sxm", Decimal("1.00"), Decimal("1.50"), 16, 200),
-    "H200": SpotGpu("gpu-h200-sxm", Decimal("1.00"), Decimal("2.00"), 16, 200),
-    "B200": SpotGpu("gpu-b200-sxm", Decimal("4.00"), Decimal("5.00"), 20, 224),
+    "H100": SpotGpu(Decimal("1.00"), Decimal("1.50")),
+    "H200": SpotGpu(Decimal("1.00"), Decimal("2.00")),
+    "B200": SpotGpu(Decimal("4.00"), Decimal("5.00")),
 }
 
 

@@ -1,0 +1,60 @@
+"""Join live auctions to actual GPU shapes; prices are USD per whole instance-hour."""
+
+from dataclasses import dataclass
+from decimal import Decimal
+
+from flash.providers.core.base import GPU_INFO, CapacityLookupError
+from flash.providers.mithril.client import MithrilApiError, call
+from flash.providers.mithril.pricing import SPOT_GPUS, accepts_price
+
+
+@dataclass(frozen=True)
+class Offer:
+    gpu: str
+    count: int
+    instance_type: str
+    hourly_usd: float  # per GPU, like Candidate.hourly_usd
+    disk_gb: int
+
+
+def dollars(raw):
+    if not isinstance(raw, str) or not raw.startswith("$"):
+        raise ValueError("expected USD price")
+    value = Decimal(raw[1:])
+    if not value.is_finite() or value <= 0:
+        raise ValueError("invalid USD price")
+    return value
+
+
+def affordable_offers(region: str, *, deadline_at=None) -> list[Offer]:
+    try:
+        types = call("GET", "/instance-types", deadline_at=deadline_at)
+        auctions = call("GET", "/spot/availability", deadline_at=deadline_at)
+        if not isinstance(types, list) or not isinstance(auctions, list):
+            raise ValueError("invalid catalog")
+        catalog = {row["fid"]: row for row in types}
+        offers = []
+        for auction in auctions:
+            if auction["region"] != region:
+                continue
+            shape = catalog[auction["instance_type"]]
+            gpu = shape["gpu_type"]
+            count = shape["num_gpus"]
+            if (
+                gpu not in SPOT_GPUS
+                or type(count) is not int
+                or count not in SPOT_GPUS[gpu].counts
+                or not shape["gpu_socket"].upper().startswith("SXM")
+                or shape["gpu_memory_gb"] < GPU_INFO[gpu].vram_gb
+                or type(auction["capacity"]) is not int
+                or auction["capacity"] <= 0
+            ):
+                continue
+            price = dollars(auction["last_instance_price"]) / count
+            if accepts_price(gpu, price, currency="usd", unit="GPU hour"):
+                offers.append(
+                    Offer(gpu, count, shape["fid"], float(price), shape["local_storage_gb"])
+                )
+        return offers
+    except (MithrilApiError, ValueError, ArithmeticError, KeyError, TypeError, AttributeError):
+        raise CapacityLookupError("Mithril spot prices unavailable; keeping job queued") from None

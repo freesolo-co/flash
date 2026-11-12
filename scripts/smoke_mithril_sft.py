@@ -1,10 +1,10 @@
-"""Paid Nebius Spot SFT and durable checkpoint resume qualification.
+"""Paid Mithril Spot SFT and durable checkpoint resume qualification.
 
-Set FLASH_NEBIUS_* and authenticate Nebius and Azure artifact storage, then run:
-    python scripts/smoke_nebius_sft.py --run-paid-test --repo owner/private-test-dataset
+Set FLASH_MITHRIL_* and authenticate Mithril and Azure artifact storage, then run:
+    python scripts/smoke_mithril_sft.py --run-paid-test --repo owner/private-test-dataset
 The first VM is terminated after checkpoint 1 becomes durable. A replacement
 resumes and finishes step 2. Each attempt is limited to 45 minutes; only this
-run's VMs are deleted.
+run's bids are cancelled.
 """
 
 import argparse
@@ -21,8 +21,8 @@ from smoke_modal_sft import prepare
 
 from flash.artifacts.api import ArtifactStore
 from flash.providers._lifecycle.net.worker import publish_source_snapshot
-from flash.providers.nebius import api, jobs
-from flash.providers.nebius.config import configured
+from flash.providers.mithril import api, jobs
+from flash.providers.mithril.config import configured
 from flash.runner.lifecycle.state import RunStatus, _save_status
 from flash.runner.lifecycle.status import _update
 
@@ -61,7 +61,7 @@ def resume_attempt(spec, snapshot, on_handle):
 
 def run(repo):
     if not configured():
-        raise ValueError("Authenticate Nebius and configure FLASH_NEBIUS_* first")
+        raise ValueError("Authenticate Mithril and configure FLASH_MITHRIL_* first")
     hub = ArtifactStore()
     if not hub.repo_info(repo, repo_type="dataset").private:
         raise ValueError("Use a disposable private dataset repository")

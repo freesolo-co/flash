@@ -206,7 +206,7 @@ def _allocate_attempt(ctx: _SubmitContext, prepared):
             return allocation, failure
         _update(ctx.spec.run_id, "queued")
         print(
-            "Spot queued: waiting for Nebius capacity below the GPU price cap",
+            "Spot queued: waiting for Mithril capacity below the GPU price cap",
             file=ctx.log,
             flush=True,
         )

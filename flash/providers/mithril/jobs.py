@@ -1,4 +1,4 @@
-"""Nebius Spot training launch and artifact-backed supervision."""
+"""Mithril Spot training launch and artifact-backed supervision."""
 
 from __future__ import annotations
 
@@ -23,17 +23,17 @@ from flash.providers.artifacts.channel import (
     make_artifact_text_reader,
 )
 from flash.providers.core.base import JobHandle, get_gpu_info
-from flash.providers.nebius import api
-from flash.providers.nebius.config import scope_fingerprint
-from flash.providers.nebius.handles import SpotJobHandle, require_scope
-from flash.providers.nebius.pricing import hourly_rate
+from flash.providers.mithril import api
+from flash.providers.mithril.config import scope_fingerprint
+from flash.providers.mithril.handles import SpotJobHandle, require_scope
+from flash.providers.mithril.pricing import hourly_rate
 
 
 def poll(handle, spec, *, log=None, deadline_at=None):
     h = SpotJobHandle.from_dict(handle.to_dict())
     require_scope(h)
     if (h.run_id, h.phase, h.hf_repo) != (spec.run_id, spec.phase, spec.train.hf_repo):
-        raise ValueError("Nebius Spot attempt does not belong to this run")
+        raise ValueError("Mithril Spot attempt does not belong to this run")
     prefix = f"{spec.phase}/{spec.run_id}"
 
     def reader(filename, **kwargs):
@@ -50,7 +50,7 @@ def poll(handle, spec, *, log=None, deadline_at=None):
         notes.update(
             provider="spot",
             spot_entry_estimate_usd_hr=h.hourly_usd,
-            nebius_instance_id=h.instance_id,
+            mithril_bid_id=h.instance_id,
             cost_basis="spot_entry_estimate",
         )
 
@@ -63,23 +63,23 @@ def poll(handle, spec, *, log=None, deadline_at=None):
         marker_reader=reader(f"spot_attempt{h.attempt}.json"),
         metrics_reader=reader("metrics.json"),
         fetch_instance=lambda: api.get_instance(h.instance_id, deadline_at=deadline_at),
-        poll_error_exceptions=(api.NebiusApiError,),
+        poll_error_exceptions=(api.MithrilApiError,),
         status_field="status",
         running_status="running",
-        dead_states=frozenset({"stopped", "error"}),
+        dead_states=frozenset({"stopped", "error", "preempting"}),
         missing_dead_threshold=3,
         early_liveness_alive=lambda: console(force=True) is not None,
         read_current_error=lambda: error(force=True),
         stamp_cost_and_notes=stamp,
         failure_detail=lambda marker: (
             (marker or {}).get("error")
-            or "Nebius Spot worker stopped without a successful terminal marker"
+            or "Mithril Spot worker stopped without a successful terminal marker"
         ),
         load_timeout_detail=lambda status, elapsed: (
-            f"Nebius Spot sandbox remained {status} for {int(elapsed)}s"
+            f"Mithril Spot sandbox remained {status} for {int(elapsed)}s"
         ),
         first_liveness_detail=lambda elapsed, limit: (
-            f"Nebius Spot worker produced no liveness for {int(elapsed)}s (limit {int(limit)}s)"
+            f"Mithril Spot worker produced no liveness for {int(elapsed)}s (limit {int(limit)}s)"
         ),
     )
     return poll_instance_job(
@@ -111,7 +111,7 @@ def submit_attempt(
     gpu = spec.gpu.type
     count = gpu_count_of(spec)
     if count > get_gpu_info(gpu).max_count:
-        raise ValueError(f"Nebius Spot does not support {count} GPUs of class {gpu}")
+        raise ValueError(f"Mithril Spot does not support {count} GPUs of class {gpu}")
     owner_scope = scope_fingerprint()
     payload = build_payload(
         spec,
@@ -121,17 +121,22 @@ def submit_attempt(
         source_snapshot=source_snapshot,
         deadline_at=deadline_at,
     )
-    from flash.providers.nebius.queue import wait_for_price, wait_for_slot
+    from flash.providers.mithril.queue import wait_for_price
 
-    # Hold a place until the project's preemptible-VM quota has room, then recheck the price
-    # immediately before creating (a slot wait can outlast a fresh price).
-    wait_for_slot(spec.run_id, deadline_at=deadline_at, log=log)
-    wait_for_price(gpu, spec.run_id, deadline_at=deadline_at, log=log)
+    offer = wait_for_price(
+        gpu,
+        spec.run_id,
+        gpu_count=count,
+        disk_gb=spec.gpu.disk_gb,
+        deadline_at=deadline_at,
+        log=log,
+    )
     name = instance_label(spec.run_id, attempt)
     started = time.time()
     capsule, _ = build_capsule("instance-bootstrap")
     sandbox_id = api.create(
         name=name,
+        offer=offer,
         payload=payload,
         image_reference=worker_image_for_gpu(gpu),
         gpu=gpu,

@@ -447,7 +447,7 @@ class GpuSpec:
         if self.spot:
             if self.provider not in ("", "spot") or providers not in ((), ("spot",)):
                 raise ValueError(
-                    "gpu.spot=true requires Nebius Spot; remove other provider choices"
+                    "gpu.spot=true requires Mithril Spot; remove other provider choices"
                 )
             if not providers:
                 object.__setattr__(self, "provider", "spot")

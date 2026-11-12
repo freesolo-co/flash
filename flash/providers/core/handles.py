@@ -3,7 +3,7 @@
 
 def parse_handle(data):
     if data.get("provider") == "spot":
-        from flash.providers.nebius.handles import SpotJobHandle
+        from flash.providers.mithril.handles import SpotJobHandle
 
         return SpotJobHandle.from_dict(data)
     from flash.providers.modal.handles import ModalJobHandle
