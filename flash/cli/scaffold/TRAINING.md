@@ -415,8 +415,8 @@ spot = false # set true for Mithril Spot; false uses regular training
 ```
 
 Spot only uses Mithril and prefers fitting H100s, then H200s, then B200s.
-It queues until the price is below $1, $1, or $4 per GPU-hour respectively.
-Once running, the corresponding maximum prices are $1.50, $2, and $5.
+It queues until the price is below $1.01, $1.01, or $4.01 per GPU-hour respectively.
+Once running, the corresponding maximum prices are $1.51, $2.01, and $5.01.
 
 GPU allocation and Azure artifacts are **managed by default**: leave `[gpu] type` unset to
 let the allocator pick the cheapest fitting validated class, while `train.hf_repo` remains

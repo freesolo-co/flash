@@ -15,23 +15,23 @@ Set these secrets/configuration on the control plane:
   NVIDIA driver, NVIDIA container toolkit, Python 3 and outbound registry/Azure access.
 - Optional `FLASH_MITHRIL_SSH_KEY_IDS`: comma-separated existing SSH key FIDs for diagnostics.
 
-No provider CLI, service-account profile, subnet or Nebius image ID is needed.
+Host images are selected through the Mithril API; no provider CLI is needed.
 Keep the existing worker image, Azure artifact and runtime-secret configuration.
 The Mithril API key stays on the control plane; workers receive only their runtime
 credentials. Use a dedicated project for Flash training.
 
-**Migration:** finish or cancel all existing Nebius Spot runs using the previous
-release before deploying this change. Persisted Nebius resource IDs and ownership
+**Migration:** finish or cancel all existing legacy Spot runs using the previous
+release before deploying this change. Persisted legacy resource IDs and ownership
 fingerprints are deliberately rejected by the Mithril provider. Installing this
-release does not migrate or delete existing Nebius VMs.
+release does not migrate or delete existing legacy VMs.
 
 ## Admission, prices and recovery
 
 | GPU | Start below / fixed estimate per GPU-hour | Bid cap per GPU-hour |
 | --- | ---: | ---: |
-| H100 | $1.00 | $1.50 |
-| H200 | $1.00 | $2.00 |
-| B200 | $4.00 | $5.00 |
+| H100 | $1.01 | $1.51 |
+| H200 | $1.01 | $2.01 |
+| B200 | $4.01 | $5.01 |
 
 The policy lives in `flash/providers/mithril/pricing.py`. Flash joins the authenticated
 instance-type catalog to live regional auctions, admitting only advertised SXM
@@ -43,8 +43,9 @@ Fitting rentals retain H100, H200, B200 priority order.
 Mithril reports prices and accepts bids **per instance-hour**. Flash divides the
 auction price by the actual GPU count for admission and multiplies the hold cap by
 that count for the bid. It requests one instance, not one instance per GPU.
-Admission uses strict `<` thresholds, so an eight-H200 price of $8.00 does not pass
-the $1.00/GPU-hour entry threshold. Current market prices may leave all jobs queued.
+Each cap includes a one-cent per-GPU-hour offset. Admission uses strict `<`
+thresholds: an eight-H200 price of $8.00 passes the $1.01/GPU-hour entry threshold,
+while $8.08 does not. Current market prices may leave all jobs queued.
 Malformed or unavailable prices fail closed. Jobs recheck every 60 seconds without
 creating bids or consuming training retries; waiting respects cancellation and the
 run deadline. The selected GPU count and disk requirement are rechecked before launch.

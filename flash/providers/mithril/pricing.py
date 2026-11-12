@@ -1,6 +1,8 @@
 """Fixed Spot entry estimates and separate hold caps, in USD per GPU-hour.
 
 These are user-selected thresholds, not current market prices or capacity guarantees.
+Each threshold includes a $0.01/GPU-hour offset above the selected base cap.
+This admits exact-dollar prices despite the strict entry comparison.
 GPU priority follows insertion order: H100, H200, B200.
 """
 
@@ -18,9 +20,9 @@ class SpotGpu:
 
 
 SPOT_GPUS = {
-    "H100": SpotGpu(Decimal("1.00"), Decimal("1.50")),
-    "H200": SpotGpu(Decimal("1.00"), Decimal("2.00")),
-    "B200": SpotGpu(Decimal("4.00"), Decimal("5.00")),
+    "H100": SpotGpu(Decimal("1.01"), Decimal("1.51")),
+    "H200": SpotGpu(Decimal("1.01"), Decimal("2.01")),
+    "B200": SpotGpu(Decimal("4.01"), Decimal("5.01")),
 }
 
 

@@ -61,7 +61,7 @@ def owned_bid(**changes):
         "instances": ["inst_test"],
         "instance_type": "it_test",
         "instance_quantity": 1,
-        "limit_price": "$2.00",
+        "limit_price": "$2.01",
         "launch_specification": {"startup_script": "#!/bin/bash\n" + owner + "\n"},
         **changes,
     }
@@ -156,6 +156,12 @@ def catalog(
     )
 
 
+@pytest.mark.parametrize("count", [1, 8])
+def test_exact_dollar_per_gpu_auction_is_admitted(monkeypatch, count):
+    catalog(monkeypatch, price=f"${count:.2f}", count=count)
+    assert prices.affordable_offers("us-central2-b") == [Offer("H200", count, "it_test", 1.0, 1500)]
+
+
 def test_live_candidates_use_only_advertised_shapes_and_per_gpu_prices(monkeypatch):
     catalog(monkeypatch)
     offers = prices.affordable_offers("us-central2-b")
@@ -168,7 +174,7 @@ def test_live_candidates_use_only_advertised_shapes_and_per_gpu_prices(monkeypat
 @pytest.mark.parametrize(
     "change",
     [
-        {"price": "$8.00"},
+        {"price": "$8.08"},
         {"price": "$9.00"},
         {"capacity": 0},
         {"region": "other"},
@@ -245,7 +251,7 @@ def test_create_bids_for_one_instance_at_per_instance_hold_cap(monkeypatch, coun
     assert launch(monkeypatch, count=count) == "bid_test"
     body = captured[0]
     assert body["instance_quantity"] == 1
-    assert body["limit_price"] == f"${2 * count:.2f}"
+    assert body["limit_price"] == f"${2.01 * count:.2f}"
     assert body["launch_specification"]["volumes"] == []
     assert "api_key" not in json.dumps(body)
     assert api._ownership(body)["flash-run"] == "test"
@@ -359,7 +365,7 @@ def test_public_address_comes_from_running_owned_instance(monkeypatch, destinati
     assert api.public_ip("bid_test") == expected
 
 
-def test_handle_rejects_legacy_nebius_identity():
+def test_handle_rejects_legacy_provider_identity():
     from flash.providers.mithril.handles import SpotJobHandle
 
     with pytest.raises(ValueError, match="invalid Mithril Spot"):

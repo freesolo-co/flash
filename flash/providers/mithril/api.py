@@ -68,7 +68,7 @@ def list_instances(*, deadline_at=None):
 
 def _bid(bid_id, *, deadline_at=None):
     if not isinstance(bid_id, str) or not re.fullmatch(r"bid_[A-Za-z0-9]+", bid_id):
-        raise ValueError("invalid Mithril bid id; drain legacy Nebius runs before migration")
+        raise ValueError("invalid Mithril bid id; drain legacy Spot runs before migration")
     try:
         bid = call("GET", f"/spot/bids/{bid_id}", deadline_at=deadline_at)
     except MithrilApiError as error:

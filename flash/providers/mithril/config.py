@@ -20,5 +20,5 @@ def scope_fingerprint() -> str:
     config = settings()
     if not configured():
         raise RuntimeError("Configure FLASH_MITHRIL_API_KEY, PROJECT_ID and REGION")
-    # Namespaced so a persisted Nebius identity can never be adopted by Mithril.
+    # Namespaced so a persisted legacy provider identity can never be adopted by Mithril.
     return hashlib.sha256(f"mithril:{config['project_id']}:{config['region']}".encode()).hexdigest()

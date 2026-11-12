@@ -15,10 +15,13 @@ from flash.providers.mithril.pricing import accepts_price
     ("gpu", "value", "accepted"),
     [
         ("H100", "0.79", True),
-        ("H100", "1.00", False),
-        ("H200", "1.001", False),
+        ("H100", "1.00", True),
+        ("H100", "1.01", False),
+        ("H200", "1.001", True),
+        ("H200", "1.01", False),
         ("B200", "3.999", True),
-        ("B200", "4", False),
+        ("B200", "4", True),
+        ("B200", "4.01", False),
         ("H100", "NaN", False),
         ("H100", "Infinity", False),
         ("H100", "-1", False),
@@ -92,7 +95,7 @@ def test_spot_estimate_is_offline_and_uses_fixed_cap(monkeypatch):
     config = {"model_id": "Qwen/Qwen3.5-9B", "method": "sft", "steps": 100, "gpu_type": "H100"}
     spot = estimate_cost(RunConfig(**config, provider="spot"))
     modal = estimate_cost(RunConfig(**config, provider="modal"))
-    assert spot.gpu_hourly_usd == 1
+    assert spot.gpu_hourly_usd == 1.01
     assert spot.total_usd < modal.total_usd / 3
     assert spot.provider == "spot"
 
