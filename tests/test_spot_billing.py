@@ -85,27 +85,30 @@ def test_missing_provider_preserves_eight_gpu_spot_billing_shape():
     assert charge == pytest.approx(expected.total_usd)
 
 
-# --- quote the costliest interchangeable class, bill the class actually rented -----------------
+# --- quote at the top Spot rate, bill each stretch at the class it actually ran on -------------
 
 
-def _remote(rented, *, quoted="H100", count=1):
-    remote = {"provider": "spot", "gpu": rented, "gpu_count": count}
-    if quoted:
-        remote["quoted_gpu"] = quoted
-    return remote
+def _status(spec, remote_gpu, **fields):
+    remote = {"provider": "spot", "gpu": remote_gpu} if remote_gpu else None
+    return RunStatus(run_id="r", state="running", spec=spec.to_dict(), remote=remote, **fields)
 
 
-def test_quote_rate_covers_every_class_the_run_may_land_on():
-    from flash.providers.mithril.pricing import quote_rate
+def _beat(status, hb):
+    """Feed one heartbeat through the usage ledger the way record_heartbeat does."""
+    from flash.runner.accounting.spot_usage import record
 
-    assert quote_rate("H100", 1) == 2.5  # an H100 run may launch on an H200
-    assert quote_rate("H200", 1) == 2.5
+    prev = status.last_heartbeat
+    same = isinstance(prev, dict) and prev.get("attempt") == hb.get("attempt")
+    record(status, prev, hb, same_attempt=same)
+    status.last_heartbeat = hb
 
 
-def test_allocator_quotes_spot_at_the_quote_rate():
+def test_every_spot_quote_uses_the_top_spot_rate():
     from flash.providers.core.allocator import _cheapest_allocation
     from flash.providers.core.base import Candidate
+    from flash.providers.mithril.pricing import quote_rate
 
+    assert quote_rate() == 2.5
     allocation = _cheapest_allocation(
         [Candidate("spot", "H100", 1.4, 80, 1)], need=47, cost_per_step=None, provider_rank={}
     )
@@ -113,76 +116,89 @@ def test_allocator_quotes_spot_at_the_quote_rate():
 
 
 @pytest.mark.parametrize(
-    ("remote", "factor"),
+    ("usage", "factor"),
     [
-        (_remote("H100"), 0.8),  # quoted at $2.50, ran on an H100 at $2.00
-        (_remote("H200"), 1.0),  # quoted at $2.50, ran on an H200 at $2.50
-        (_remote("H200", quoted="H200"), 1.0),
-        (_remote("H100", quoted=""), 1.0),  # handle from before: quoted at its own class rate
-        ({"provider": "modal", "gpu": "H100", "quoted_gpu": "H100"}, 1.0),
+        ({"H100": 10}, 0.8),  # all on H100: $2.00 of the $2.50 quote rate
+        ({"H200": 10}, 1.0),
+        ({"H100": 5, "H200": 5}, 0.9),  # half and half
+        (None, 1.0),  # no ledger (runs launched before this accounting): the quote
     ],
 )
-def test_billed_rate_factor_is_rented_rate_over_quoted_rate(remote, factor):
-    from flash.providers.mithril.pricing import billed_rate_factor
+def test_rate_factor_weights_usage_by_class(usage, factor):
+    from types import SimpleNamespace
 
-    assert costs._billed_rate_factor(remote, None) == pytest.approx(factor)
-    if remote.get("quoted_gpu"):
-        assert billed_rate_factor(remote) == pytest.approx(factor)
+    from flash.runner.accounting.spot_usage import rate_factor
 
-
-@pytest.mark.parametrize(("rented", "expected"), [("H100", 8.0), ("H200", 10.0), (None, 10.0)])
-def test_completed_spot_run_is_charged_for_the_class_it_rented(
-    tmp_path, monkeypatch, rented, expected
-):
-    from flash.runner.lifecycle import state
-
-    monkeypatch.setattr(state, "artifacts_dir", lambda spec: str(tmp_path))  # no metrics.json
-    remote = _remote(rented) if rented else None
-    status = RunStatus(
-        run_id="r", state="done", spec=spot_spec().to_dict(), estimated_cost_usd=10.0, remote=remote
-    )
-    assert costs._status_estimated_charge(status, spot_spec()) == pytest.approx(expected)
+    hb = {"spot_usage_by_gpu": usage} if usage is not None else {}
+    assert rate_factor(SimpleNamespace(last_heartbeat=hb)) == pytest.approx(factor)
 
 
-def test_custom_spot_session_is_charged_for_the_class_it_rented(tmp_path, monkeypatch):
+def test_steps_are_credited_to_the_class_that_reached_them_once():
+    spec = spot_spec()
+    status = _status(spec, "H100")
+    for step in (1, 2, 3, 4):
+        _beat(status, {"attempt": 0, "stage": "sft_step", "step": step})
+    status.remote = {"provider": "spot", "gpu": "H200"}  # preempted; replacement is an H200
+    for step in (3, 4, 5, 6):  # resumed from step 2: steps 3-4 repeat and are not billed twice
+        _beat(status, {"attempt": 1, "stage": "sft_step", "step": step})
+    _beat(status, {"attempt": 1, "stage": "checkpoint_deployable"})  # no step: totals carry
+    assert status.last_heartbeat["spot_usage_by_gpu"] == {"H100": 4.0, "H200": 2.0}
+
+
+def test_custom_session_mixing_classes_is_billed_per_attempt(tmp_path, monkeypatch):
+    """Review case: a 1 h $2.50 quote, 900 s on H100 then 900 s on H200 charges $1.125."""
     import json
     from types import SimpleNamespace
 
     from flash.custom.billing import session_charge
     from flash.runner.lifecycle import state
 
+    custom = replace(spot_spec(), algorithm="custom")
+    status = _status(custom, "H100")
+    _beat(status, {"attempt": 0, "stage": "custom_step", "session_seconds": 900.0})
+    status.remote = {"provider": "spot", "gpu": "H200"}
+    _beat(status, {"attempt": 1, "stage": "custom_step", "session_seconds": 900.0})
+    assert status.last_heartbeat["spot_usage_by_gpu"] == {"H100": 900.0, "H200": 900.0}
+
     monkeypatch.setattr(state, "artifacts_dir", lambda spec: str(tmp_path))
-    (tmp_path / "metrics.json").write_text(json.dumps({"session_seconds": 1800.0}))
-    spec = SimpleNamespace(custom={"max_wall_seconds": 3600})
-    status = SimpleNamespace(
-        last_heartbeat={}, estimated_cost_usd=20.0, remote=_remote("H100"), billing_remote=None
+    (tmp_path / "metrics.json").write_text(json.dumps({"session_seconds": 900.0}))
+    status.last_heartbeat["session_seconds_prior"] = 900.0
+    status.estimated_cost_usd = 2.5
+    charged = session_charge(status, SimpleNamespace(custom={"max_wall_seconds": 3600}))
+    # 1,800 s of a 3,600 s cap, priced (900 x $2.00 + 900 x $2.50) / (1,800 x $2.50) = 0.9
+    assert charged == pytest.approx(2.5 * 0.5 * 0.9)  # $1.125
+
+
+@pytest.mark.parametrize(
+    ("usage", "hourly"), [({"H100": 20}, 2.0), ({"H200": 20}, 2.5), (None, 2.5)]
+)
+def test_completed_spot_run_is_charged_for_the_classes_it_rented(
+    tmp_path, monkeypatch, usage, hourly
+):
+    from flash.runner.lifecycle import state
+
+    monkeypatch.setattr(state, "artifacts_dir", lambda spec: str(tmp_path))  # no metrics.json
+    spec = spot_spec("H100")
+    quote = estimate_for_spec(spec).total_usd  # what prepare_job persists
+    hb = {"spot_usage_by_gpu": usage} if usage else {}
+    status = _status(spec, "H100", estimated_cost_usd=quote, last_heartbeat=hb)
+    charged = costs._status_estimated_charge(status, spec)
+    assert charged == pytest.approx(quote * hourly / 2.5)
+    assert charged <= quote
+
+
+def test_allocation_admits_a_pinned_class_even_when_only_another_is_cheap(monkeypatch):
+    """Review case: allocation never reads live prices, so an H100-pinned run is admitted and
+    the queue can then take an H200 that is below its cap."""
+    from flash.providers.core.base import AllocationConstraints
+    from flash.providers.core.registry import get_provider
+    from flash.providers.mithril import prices
+
+    monkeypatch.setattr(prices, "affordable_offers", lambda **kw: pytest.fail("no live prices"))
+    candidates = get_provider("spot").live_candidates(
+        47, AllocationConstraints(max_gpu_count=1, gpu_type="H100")
     )
-    assert session_charge(status, spec) == pytest.approx(20.0 * 0.5 * 0.8)
-    status.remote = _remote("H200")
-    assert session_charge(status, spec) == pytest.approx(20.0 * 0.5)
-
-
-def test_spot_handle_keeps_the_quoted_class_and_reads_older_handles():
-    from flash.providers.mithril.handles import SpotJobHandle
-
-    fields = {
-        "instance_id": "bid_x",
-        "gpu": "H200",
-        "hourly_usd": 2.5,
-        "attempt": 0,
-        "started_ts": 1.0,
-        "name": "n",
-        "run_id": "r",
-        "hf_repo": "o/r",
-        "phase": "sft",
-        "scope": "s",
-        "gpu_count": 1,
-    }
-    handle = SpotJobHandle(**fields, quoted_gpu="H100")
-    assert SpotJobHandle.from_dict(handle.to_dict()).quoted_gpu == "H100"
-    legacy = SpotJobHandle(**fields).to_dict()
-    assert "quoted_gpu" not in legacy
-    assert SpotJobHandle.from_dict(legacy).quoted_gpu == ""
+    assert [(c.gpu, c.gpu_count, c.hourly_usd) for c in candidates] == [("H100", 1, 2.5)]
 
 
 @pytest.mark.parametrize(
@@ -200,31 +216,3 @@ def test_supervisor_records_the_class_actually_rented(chosen, remote, expected):
 
     rented = _rented_candidate(Candidate(chosen[0], chosen[1], 2.5, 80, 1), remote)
     assert (rented.gpu, rented.vram_gb) == expected
-
-
-@pytest.mark.parametrize(("rented", "hourly"), [("H100", 2.0), ("H200", 2.5)])
-def test_submitted_quote_covers_substitution_and_bills_the_rented_rate(
-    tmp_path, monkeypatch, rented, hourly
-):
-    """The persisted (offline) quote is priced at $2.50, so the settled charge equals the class
-    actually rented at its own rate: no extra discount on H100, no undercharge on an H200."""
-    from flash.runner.lifecycle import state
-
-    monkeypatch.setattr(state, "artifacts_dir", lambda spec: str(tmp_path))  # no metrics.json
-    spec = spot_spec("H100")
-    quote = estimate_for_spec(spec).total_usd  # what prepare_job persists as estimated_cost_usd
-    at_class_rate = costs.charge_usd_for_spec(
-        spec, gpu_type="H100", gpu_count=1, fallback=float("nan")
-    )
-    status = RunStatus(
-        run_id="r",
-        state="done",
-        spec=spec.to_dict(),
-        estimated_cost_usd=quote,
-        remote=_remote(rented),
-    )
-    charged = costs._status_estimated_charge(status, spec)
-    assert charged == pytest.approx(quote * hourly / 2.5)
-    if rented == "H100":
-        assert charged == pytest.approx(at_class_rate)  # exactly $2.00/GPU-hour, not less
-    assert charged <= quote

@@ -170,7 +170,6 @@ def submit_attempt(
             phase=spec.phase,
             gpu_count=count,
             scope=owner_scope,
-            quoted_gpu=allocated,
         )
         handle = JobHandle.from_dict(h.to_dict())
         if on_handle is not None:

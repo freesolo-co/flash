@@ -373,17 +373,10 @@ def _status_estimated_charge(status: RunStatus, spec, *, fallback: float = 0.0) 
 
 
 def _billed_rate_factor(rented_remote, status) -> float:
-    """Share of a Spot quote owed for the class actually rented (1.0 for every other run)."""
-    from flash.providers.mithril.pricing import billed_rate_factor
+    """Share of a Spot quote owed for the classes actually rented (1.0 for every other run)."""
+    from flash.runner.accounting.spot_usage import rate_factor
 
-    for remote in (
-        rented_remote,
-        getattr(status, "remote", None),
-        getattr(status, "billing_remote", None),
-    ):
-        if isinstance(remote, dict) and remote.get("quoted_gpu"):
-            return billed_rate_factor(remote)
-    return 1.0
+    return rate_factor(status)
 
 
 def actual_steps_run(status: RunStatus) -> int:

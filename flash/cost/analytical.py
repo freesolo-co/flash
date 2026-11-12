@@ -572,7 +572,7 @@ def _offline_gpu_shape(config: RunConfig) -> tuple[str, int, int, str, float]:
                 # quote the costliest class this run may take; billing scales to the rented one.
                 from flash.providers.mithril.pricing import quote_rate
 
-                hourly = quote_rate(gpu, count)
+                hourly = quote_rate()
             else:
                 hourly = get_provider("modal" if provider == "auto" else provider).hourly_rate(gpu)
             step_seconds = sharded_step_seconds(

@@ -975,8 +975,7 @@ def _cheapest_allocation(
 
     # Spot quotes the costliest class the run may take; billing scales to the class rented.
     ranked = [
-        replace(c, hourly_usd=spot_quote_rate(c.gpu, c.gpu_count)) if c.provider == "spot" else c
-        for c in ranked
+        replace(c, hourly_usd=spot_quote_rate()) if c.provider == "spot" else c for c in ranked
     ]
     best = ranked[0]
     return Allocation(

@@ -168,19 +168,23 @@ def test_exact_dollar_per_gpu_auction_is_admitted(monkeypatch, count):
     ]
 
 
-def test_live_candidates_use_only_advertised_shapes_and_per_gpu_prices(monkeypatch):
+def test_offers_use_only_advertised_shapes_and_per_gpu_prices(monkeypatch):
     catalog(monkeypatch)
-    offers = prices.affordable_offers()
-    assert offers == [Offer("H200", 8, "it_test", 0.8, 1500, "us-central2-b")]
+    assert prices.affordable_offers() == [Offer("H200", 8, "it_test", 0.8, 1500, "us-central2-b")]
+
+
+def test_allocation_offers_fitting_catalog_shapes_at_the_quote_rate(monkeypatch):
+    # live prices are the queue's concern; allocation never reads them.
+    monkeypatch.setattr(prices, "affordable_offers", lambda **kw: pytest.fail("no live prices"))
     candidates = get_provider("spot").live_candidates(80, AllocationConstraints(max_gpu_count=8))
-    assert [(c.gpu, c.gpu_count, c.hourly_usd) for c in candidates] == [("H200", 8, 0.8)]
-    # No live single-GPU offer: admit on the fitting catalog shapes at the fixed rate, so the run
-    # queues for whichever class comes up first instead of being rejected.
-    fallback = get_provider("spot").live_candidates(80, AllocationConstraints(max_gpu_count=1))
-    assert [(c.gpu, c.gpu_count, c.hourly_usd) for c in fallback] == [
-        ("H100", 1, 2.0),
+    assert [(c.gpu, c.gpu_count, c.hourly_usd) for c in candidates] == [
+        ("H100", 1, 2.5),
+        ("H100", 8, 2.5),
         ("H200", 1, 2.5),
+        ("H200", 8, 2.5),
     ]
+    one = get_provider("spot").live_candidates(100, AllocationConstraints(max_gpu_count=1))
+    assert [(c.gpu, c.gpu_count) for c in one] == [("H200", 1)]  # 100 GB only fits an H200
 
 
 @pytest.mark.parametrize(
@@ -416,16 +420,6 @@ def test_missing_bid_does_not_hide_a_still_stopping_instance(monkeypatch):
     monkeypatch.setattr(api, "_bid", lambda *a, **kw: None)
     monkeypatch.setattr(api, "_instances", lambda *a, **kw: [{"status": "STATUS_STOPPING"}])
     assert api.get_instance("bid_test")["status"] == "stopping"
-
-
-def test_candidates_exclude_insufficient_scratch(monkeypatch):
-    catalog(monkeypatch)
-    constraints = AllocationConstraints(max_gpu_count=8, disk_gb=2000)
-    candidates = get_provider("spot").live_candidates(80, constraints)
-    # the 1.5 TB live offer is excluded; only fixed-rate catalog shapes remain (the queue rechecks
-    # disk before bidding).
-    assert candidates
-    assert all(c.hourly_usd in (2.0, 2.5) for c in candidates)
 
 
 @pytest.mark.parametrize("valid", [True, False])

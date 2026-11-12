@@ -42,8 +42,9 @@ a listed eight-GPU auction never implies single-GPU availability. Spot offers H1
 H200 only. A queued run waits for every class with at least its allocated class's VRAM
 (for 9B and 0.8B models, H100 or H200) and takes whichever comes up first; when both
 qualify at once, H100 then H200, then price. The attempt's spec names the class rented.
-When nothing is below its cap, a run is still admitted on the fitting catalog shapes
-at the fixed rate and waits in the queue.
+Allocation never reads live prices: it picks the highest-priority fitting catalog
+shape, so a run is always admitted and waits in the queue until a fitting class is
+below its cap.
 
 Mithril reports prices and accepts bids **per instance-hour**. Flash divides the
 auction price by the actual GPU count for admission and multiplies the hold cap by
@@ -60,14 +61,14 @@ quota rows defer to server enforcement. Definitively refused creates with confir
 quota exhaustion requeue only after reconciliation finds no bid; unknown POST
 outcomes remain fail-closed. Organization-level limits remain server-enforced.
 
-A Spot quote is priced at the costliest class the run may land on (an H100-allocated run may
-take an H200, so it is quoted at $2.50 per GPU-hour). The charge is then scaled to the class
-actually rented: the accepted quote x the completed-work share x (rented rate / quoted rate),
-so an H100 run that ran on an H100 pays $2.00 per GPU-hour and never more than the quote.
-Runs launched before this rule are billed on their accepted quote unchanged.
-Customer charges otherwise retain the accepted Spot quote ($2.00 per GPU-hour for H100, $2.50 for
-H200),
-with the existing completed-work/session-time settlement rules.
+Every Spot quote is priced at the top Spot rate ($2.50 per GPU-hour), because any run may
+end up on an H200. Each stretch is then billed at the class it actually ran on ($2.00 for
+H100, $2.50 for H200), including runs that resume on a different class after a preemption.
+Heartbeats credit usage to the class the run is on at the time (newly reached training
+steps, or custom-session seconds), and settlement charges the accepted quote x the
+completed-work share x (usage-weighted rate / $2.50), never more than the quote. Runs
+launched before this accounting are billed on their accepted quote unchanged. The existing
+completed-work/session-time settlement rules otherwise apply.
 These estimates are not Mithril invoices and exclude network, taxes and other charges.
 The same cap bounds both admission and subsequent compute pricing.
 
