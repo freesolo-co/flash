@@ -166,3 +166,36 @@ def test_engine_exit_hook_awaits_shutdown(monkeypatch) -> None:
     asyncio.run(engine.shutdown())
     engine._shutdown.assert_awaited_once_with()
     assert app.modal.exit.called
+
+
+def test_main_9b_base_has_four_reserved_cpu_proxies_and_no_gpu_fallback(monkeypatch):
+    _clear_deployment_environment(monkeypatch)
+    module = _import_modal_app(monkeypatch, is_local=False, environment="main")
+    model = "Qwen/Qwen3.5-9B-Base"
+    assert len(module.RESERVED_ENGINES) == 4
+    assert {cls.reserved_slot for cls in module.RESERVED_ENGINES} == {1, 2, 3, 4}
+    assert all(cls.pinned_gpu is None for cls in module.RESERVED_ENGINES)
+    assert model not in module.ENGINE_BY_MODEL
+    assert model not in module.MODAL_FALLBACK_BY_MODEL
+
+
+def test_reserved_requests_rotate_without_calling_capacity_service(monkeypatch):
+    import asyncio
+    import itertools
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+
+    _clear_deployment_environment(monkeypatch)
+    module = _import_modal_app(monkeypatch, is_local=False, environment="main")
+    pool = module._ModalEnginePool.__new__(module._ModalEnginePool)
+    pool._provider_selection = SimpleNamespace(choose=AsyncMock())
+    pool._reserved_cycle = itertools.cycle(
+        [lambda *, base_model, slot=i: (slot, base_model) for i in range(4)]
+    )
+
+    async def check():
+        return [await pool._engine_for("Qwen/Qwen3.5-9B-Base") for _ in range(8)]
+
+    results = asyncio.run(check())
+    assert [slot for slot, _ in results] == [0, 1, 2, 3, 0, 1, 2, 3]
+    pool._provider_selection.choose.assert_not_awaited()

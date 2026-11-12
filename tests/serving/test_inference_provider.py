@@ -34,14 +34,14 @@ def test_registered_pools_and_combined_limit(monkeypatch, load_modal_app_under_s
     gpu_calls = [call for call in app.cls.call_args_list if "gpu" in call.kwargs]
     cpu_calls = [call for call in app.cls.call_args_list if "gpu" not in call.kwargs]
     n = len(base_models())
-    assert len(gpu_calls) == n
+    assert len(gpu_calls) == n - 1
     assert len(cpu_calls) == n
     # Modal rejects non-preemptible GPU workloads; Lambda proxies are CPU-only.
     assert all(not call.kwargs.get("nonpreemptible", False) for call in gpu_calls)
     assert all(call.kwargs["nonpreemptible"] for call in cpu_calls)
-    assert sum(call.kwargs["max_containers"] for call in app.cls.call_args_list) == 4 * n
+    assert sum(call.kwargs["max_containers"] for call in app.cls.call_args_list) == 4 * n - 2
     assert all(issubclass(cls, mod.LambdaEngineProxy) for cls in mod.ENGINE_BY_MODEL.values())
-    assert set(mod.MODAL_FALLBACK_BY_MODEL) == set(base_models())
+    assert set(mod.MODAL_FALLBACK_BY_MODEL) == set(base_models()) - {"Qwen/Qwen3.5-9B-Base"}
     assert not any("DeepSeek" in model for model in mod.ENGINE_BY_MODEL)
     monkeypatch.setenv("FREESOLO_DEPLOYMENT_SHA", "a" * 40)
     pool = mod._ModalEnginePool()
@@ -233,12 +233,24 @@ def test_mixed_model_decorators_use_independent_capacity(monkeypatch, load_modal
     for name in ("cls", "function", "local_entrypoint"):
         getattr(app, name).side_effect = passthrough
     mod = load_modal_app_under_stub(modal)
-    expected = [(0, 2), (0, 5), (0, 7), (0, 4), (0, 2), (0, 2)] * 2
+    expected = [
+        (0, 2),
+        (0, 5),
+        (0, 7),
+        (0, 4),
+        (0, 2),
+        (0, 2),
+        (0, 2),
+        (0, 5),
+        (0, 7),
+        (0, 2),
+        (0, 2),
+    ]
     assert [
         (c.kwargs["min_containers"], c.kwargs["max_containers"]) for c in app.cls.call_args_list
     ] == expected
-    assert set(mod.MODAL_FALLBACK_BY_MODEL) == set(base_models())
-    for model in base_models():
+    assert set(mod.MODAL_FALLBACK_BY_MODEL) == set(base_models()) - {"Qwen/Qwen3.5-9B-Base"}
+    for model in set(base_models()) - {"Qwen/Qwen3.5-9B-Base"}:
         primary, fallback = MagicMock(), MagicMock()
         monkeypatch.setitem(mod.ENGINE_BY_MODEL, model, primary)
         monkeypatch.setitem(mod.MODAL_FALLBACK_BY_MODEL, model, fallback)

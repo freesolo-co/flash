@@ -9,6 +9,7 @@ from flash.serving.app.rollout import model_engine_name
 from flash.serving.src.engine.model_config import engine_overrides_for
 
 from .config import NoCapacityError
+from .reserved import MODEL as RESERVED_MODEL
 
 logger = logging.getLogger(__name__)
 
@@ -60,6 +61,8 @@ class SharedCapacity:
             return
         errors = []
         for model in lambda_models():
+            if model == RESERVED_MODEL:
+                continue  # The reserved fleet is managed independently, with no Modal GPU fallback.
             try:
                 await self.reconcile_model(model, revision=self.revision if activating else None)
             except Exception as exc:
@@ -77,6 +80,8 @@ class SharedCapacity:
         return await self.fleet.ready_count(model, revision=revision)
 
     async def reconcile_model(self, model, *, revision=None):
+        if model == RESERVED_MODEL:
+            raise NoCapacityError("9B Base uses the separately managed reserved fleet")
         revision = revision or (await self.serving_release())["revision"]
         policy = policy_for(model)
         primary, fallback = self.pools(model)

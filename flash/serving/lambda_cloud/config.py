@@ -16,7 +16,7 @@ HEARTBEAT_SECONDS = 30
 LEASE_SECONDS = 45 * 60 + 15 * 60 + 300
 RUNTIME_IMAGE = (
     "ghcr.io/freesolo-co/freesolo-flash-serve@"
-    "sha256:8fde9eec7ca01a2f0173be467beb753c7c107ced644f44a5f38fb61524c8060c"
+    "sha256:50881d9f170356d24e379a6fca5e8f06f0ab323138e65a65771e9adeb8a83e8f"
 )
 
 

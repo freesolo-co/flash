@@ -5,6 +5,7 @@ The public router and the separate DeepSeek deployment remain on Modal.
 """
 
 import asyncio
+import itertools
 import os
 import time
 import uuid
@@ -319,6 +320,7 @@ from flash.serving.app.inference_provider import (  # noqa: E402
     modal_gpus_for,
 )
 from flash.serving.app.modal_engine import HostedModalEngine  # noqa: E402
+from flash.serving.lambda_cloud import reserved  # noqa: E402
 from flash.serving.lambda_cloud.proxy import LambdaEngineProxy  # noqa: E402
 from flash.serving.src.engine.lora_engine import _LoraEngineImpl  # noqa: E402, F401
 
@@ -371,12 +373,19 @@ def _build_engine(
     target_inputs: int,
     provider: str = "lambda",
     max_capacity: int = 2,
+    reserved_slot: int = 0,
 ) -> Any:
     """Register a Modal GPU engine or Lambda CPU proxy under a stable model name.
 
     Set the class identity before decorators so Modal can re-import it remotely.
     """
-    implementation = HostedModalEngine if provider == "modal" else LambdaEngineProxy
+    implementation = (
+        reserved.ReservedLambdaEngineProxy
+        if provider == "reserved"
+        else HostedModalEngine
+        if provider == "modal"
+        else LambdaEngineProxy
+    )
 
     class _Engine(implementation):
         base_model: str = modal.parameter()
@@ -451,6 +460,7 @@ def _build_engine(
 
     # Lambda reports actual hardware remotely; Modal is pinned by its decorator.
     _Engine.pinned_gpu = gpu if provider == "modal" else None
+    _Engine.reserved_slot = reserved_slot
     # Modal must see the final module-level identity before decoration.
     _Engine.__name__ = class_name
     _Engine.__qualname__ = class_name
@@ -470,7 +480,11 @@ def _build_engine(
             "cpu": 1,
             "memory": 2048,
             "nonpreemptible": True,  # Modal supports this only for CPU workloads.
-            "secrets": lambda_proxy_secrets,
+            "secrets": (
+                [modal.Secret.from_name(reserved.SECRET_NAME)]
+                if provider == "reserved"
+                else lambda_proxy_secrets
+            ),
         }
     )
     engine = app.cls(
@@ -499,9 +513,26 @@ def _configured_engine(model, provider, suffix=""):
     )
 
 
-ENGINE_BY_MODEL: dict[str, Any] = {bm: _configured_engine(bm, "lambda") for bm in base_models()}
+ENGINE_BY_MODEL: dict[str, Any] = {
+    bm: _configured_engine(bm, "lambda") for bm in base_models() if bm != reserved.MODEL
+}
+RESERVED_ENGINES = (
+    tuple(
+        _build_engine(
+            "H100",
+            model_engine_name(reserved.MODEL) + f"_ReservedH100{slot}",
+            *_engine_concurrency(reserved.MODEL),
+            provider="reserved",
+            max_capacity=1,
+            reserved_slot=slot,
+        )
+        for slot in range(1, 5)
+    )
+    if reserved.enabled(reserved.MODEL, MODAL_ENVIRONMENT)
+    else ()
+)
 MODAL_FALLBACK_BY_MODEL: dict[str, Any] = {
-    bm: _configured_engine(bm, "modal", "_ModalGPU") for bm in base_models()
+    bm: _configured_engine(bm, "modal", "_ModalGPU") for bm in base_models() if bm != reserved.MODEL
 }
 
 
@@ -521,8 +552,11 @@ class _ModalEnginePool:
         from flash.serving.app.provider_selection import bind_lambda_control
 
         self._fleet, self._provider_selection = bind_lambda_control()
+        self._reserved_cycle = itertools.cycle(RESERVED_ENGINES)
 
     async def _engine_for(self, model):
+        if RESERVED_ENGINES and model == reserved.MODEL:
+            return next(self._reserved_cycle)(base_model=model)
         if (
             model in MODAL_FALLBACK_BY_MODEL
             and await self._provider_selection.choose(model) == "modal"
@@ -617,6 +651,16 @@ class _ModalEnginePool:
                 await close()
 
     async def register(self, base_model: str, record: Any) -> None:
+        if RESERVED_ENGINES and base_model == reserved.MODEL:
+            await asyncio.gather(
+                *(
+                    cls(base_model=base_model).register.remote.aio(
+                        self._record_payload(record), getattr(record, "deployment_generation", None)
+                    )
+                    for cls in RESERVED_ENGINES
+                )
+            )
+            return
         engine = await self._engine_for(base_model)
         await engine.register.remote.aio(
             self._record_payload(record),
@@ -630,6 +674,16 @@ class _ModalEnginePool:
         model_id: str,
         expected_generation: str | None = None,
     ) -> None:
+        if RESERVED_ENGINES and base_model == reserved.MODEL:
+            await asyncio.gather(
+                *(
+                    cls(base_model=base_model).unregister.remote.aio(
+                        org_id, model_id, expected_generation
+                    )
+                    for cls in RESERVED_ENGINES
+                )
+            )
+            return
         if base_model in MODAL_FALLBACK_BY_MODEL:
             from flash.serving.app.provider_selection import unregister_active
 
