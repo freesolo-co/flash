@@ -369,7 +369,7 @@ jobs:
         env:
           FREESOLO_DEPLOYMENT_SHA: ${{ github.sha }}
           FREESOLO_DEPLOYMENT_ID: ${{ github.run_id }}-${{ github.run_attempt }}
-        run: modal deploy --strategy rolling flash/serving/app/modal_app.py
+        run: modal deploy --strategy rolling --env main flash/serving/app/modal_app.py
 
       - name: Install promotion gate dependencies
         if: steps.gate.outputs.deploy == 'true'

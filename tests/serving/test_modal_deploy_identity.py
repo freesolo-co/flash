@@ -168,9 +168,10 @@ def test_engine_exit_hook_awaits_shutdown(monkeypatch) -> None:
     assert app.modal.exit.called
 
 
-def test_main_9b_base_has_four_reserved_cpu_proxies_and_no_gpu_fallback(monkeypatch):
+@pytest.mark.parametrize("environment", ["main", "", None])
+def test_main_9b_base_has_four_reserved_cpu_proxies_and_no_gpu_fallback(monkeypatch, environment):
     _clear_deployment_environment(monkeypatch)
-    module = _import_modal_app(monkeypatch, is_local=False, environment="main")
+    module = _import_modal_app(monkeypatch, is_local=False, environment=environment)
     model = "Qwen/Qwen3.5-9B-Base"
     assert len(module.RESERVED_ENGINES) == 4
     assert {cls.reserved_slot for cls in module.RESERVED_ENGINES} == {1, 2, 3, 4}
