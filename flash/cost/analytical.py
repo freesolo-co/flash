@@ -42,8 +42,11 @@ SFT_ATTENTION_COEF = 2.0
 SFT_IMAGE_S_PER_EXAMPLE = 0.41
 # one-time work inside the billed window: the first optimizer update (graph capture, allocator
 # warm-up, first rollout for grpo). measured, not modeled.
-SFT_FIRST_UPDATE_S = 300.0
-GRPO_FIRST_UPDATE_S = 95.0
+# grows with model size (graph capture, allocator warm-up, first rollout): base + per-B active params.
+SFT_FIRST_UPDATE_S = 250.0
+SFT_FIRST_UPDATE_S_PER_B = 5.0
+GRPO_FIRST_UPDATE_S = 60.0
+GRPO_FIRST_UPDATE_S_PER_B = 6.0
 
 # measured whole-step grpo slowdown per card, for cards whose rollout runs uniformly slower than
 # their throughput predicts across completion counts. A100 SXM: three live 9B arms at 16/64/128
@@ -105,10 +108,11 @@ SFT_STEP_FLOOR_SECONDS = 0.10
 
 def first_update_seconds(config: RunConfig) -> float:
     """Measured one-time seconds of the first optimizer update, which the meter bills."""
+    size_b = active_params_b(config.model_id, config.model_revision)
     if config.method == "sft":
-        return SFT_FIRST_UPDATE_S
+        return SFT_FIRST_UPDATE_S + SFT_FIRST_UPDATE_S_PER_B * size_b
     if config.has_rollout:
-        return GRPO_FIRST_UPDATE_S
+        return GRPO_FIRST_UPDATE_S + GRPO_FIRST_UPDATE_S_PER_B * size_b
     return 0.0
 
 
