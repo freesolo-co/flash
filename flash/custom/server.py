@@ -8,7 +8,7 @@ import time
 
 from flash._internal.diagnostics import sanitize_diagnostic
 from flash.custom.session import SessionConflict
-from flash.custom.types import MAX_BODY_BYTES
+from flash.custom.types import MAX_BODY_BYTES, MAX_BODY_MIB
 
 
 def create_app(session, token):
@@ -57,7 +57,7 @@ def create_app(session, token):
                             413,
                             {
                                 "code": "custom_rejected",
-                                "message": "custom operation body exceeds 4 MiB",
+                                "message": f"custom operation body exceeds {MAX_BODY_MIB} MiB",
                             },
                         )
             payload = json.loads(raw)

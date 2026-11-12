@@ -1,6 +1,19 @@
 """Validate all custom-session arguments before touching model or optimizer state."""
 
-from flash.custom.types import checkpoint_name, integer, number, parse_batch
+from dataclasses import replace
+
+from flash.custom.types import checkpoint_name, integer, number, parse_batch, parse_images
+
+
+def _with_vision(backend, tokens, images):
+    """Decode images and check their placeholder runs now: a failure during execution
+    would fail the whole session, while a rejection here leaves it usable."""
+    if images is None:
+        return None
+    prepare = getattr(backend, "vision_inputs", None)
+    if prepare is None:
+        raise ValueError("this custom session's model does not accept images")
+    return prepare(tokens, images)
 
 
 def validate_operation(backend, operation, arguments):
@@ -9,8 +22,8 @@ def validate_operation(backend, operation, arguments):
         "forward_backward": {"data", "metrics"},
         "optim_step": {"learning_rate", "max_grad_norm", "algorithm_state"},
         "zero_grad": set(),
-        "sample": {"prompt", "max_tokens", "temperature", "num_samples"},
-        "encode": {"text"},
+        "sample": {"prompt", "max_tokens", "temperature", "num_samples", "images"},
+        "encode": {"text", "images"},
         "decode": {"tokens"},
         "save_checkpoint": {"name", "algorithm_state"},
         "load_checkpoint": {"name"},
@@ -29,6 +42,12 @@ def validate_operation(backend, operation, arguments):
             max_batch=backend.max_batch,
             weighted=operation == "forward_backward",
         )
+        args["data"] = [
+            replace(row, vision=_with_vision(backend, row.tokens, row.images))
+            if row.images is not None
+            else row
+            for row in args["data"]
+        ]
         if operation == "forward":
             args["top_k"] = integer(args.get("top_k", 0), "top_k", 0, min(20, backend.vocab_size))
             if sum(len(row.tokens) - 1 for row in args["data"]) * args["top_k"] > 100_000:
@@ -61,10 +80,26 @@ def validate_operation(backend, operation, arguments):
         args["num_samples"] = integer(
             args.get("num_samples", 1), "num_samples", 1, backend.max_batch
         )
+        images = parse_images(args.pop("images", None))
+        if images is not None:
+            args["vision"] = _with_vision(backend, args["prompt"], images)
     elif operation == "encode":
         text = args.get("text")
         if not isinstance(text, str) or len(text) > 100_000:
             raise ValueError("text must be a string of at most 100000 characters")
+        images = parse_images(args.pop("images", None))
+        if images is not None:
+            decode = getattr(backend, "decode_images", None)
+            if decode is None:
+                raise ValueError("this custom session's model does not accept images")
+            from flash.content.multimodal import IMAGE_PAD_TOKEN
+
+            if text.count(IMAGE_PAD_TOKEN) != len(images):
+                raise ValueError(
+                    f"text must contain one {IMAGE_PAD_TOKEN} placeholder per image "
+                    f"({text.count(IMAGE_PAD_TOKEN)} for {len(images)} images)"
+                )
+            args["images"] = decode(images)
     elif operation == "decode":
         tokens = args.get("tokens")
         if not isinstance(tokens, list) or len(tokens) > backend.max_tokens:

@@ -1,6 +1,7 @@
 """Modal-only GPU training provider."""
 
-from flash.providers.core.base import GPU_INFO, Candidate, rentable_gpu_counts
+from flash.providers.core import base
+from flash.providers.core.base import Candidate, rentable_gpu_counts
 from flash.providers.modal.auth import credentials
 from flash.providers.modal.handles import ModalJobHandle, require_scope
 from flash.providers.modal.pricing import hourly_rate
@@ -24,7 +25,9 @@ class ModalProvider:
         return problems
 
     def gpu_classes(self):
-        return list(GPU_INFO.values())
+        # read the catalog at call time: a name bound at import would freeze whatever catalog
+        # was live when this module first loaded (in tests, a monkeypatched subset).
+        return list(base.GPU_INFO.values())
 
     def hourly_rate(self, gpu):
         return hourly_rate(gpu)
@@ -35,7 +38,7 @@ class ModalProvider:
         # Modal queues GPU reservations; there is no public live inventory API.
         return [
             Candidate(self.name, g.name, hourly_rate(g.name), g.vram_gb, count)
-            for g in GPU_INFO.values()
+            for g in base.GPU_INFO.values()
             if g.validated and g.vram_gb >= need_vram_gb
             for count in rentable_gpu_counts(min(g.max_count, constraints.max_gpu_count))
         ]
