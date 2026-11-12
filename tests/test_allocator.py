@@ -36,7 +36,7 @@ def test_provider_allocation_lands_on_full_validated_cards():
 
     a9 = allocator.allocate("Qwen/Qwen3.5-9B", "grpo")
     assert a9.provider == "modal"
-    assert a9.gpu == "A100 SXM"  # cheapest validated Modal dollars per step
+    assert a9.gpu == "H100"  # cheapest validated Modal dollars per step at realized throughput
     a27_sft = allocator.allocate("Qwen/Qwen3.8-27B", "sft")
     assert a27_sft.provider == "modal"
     assert a27_sft.gpu == "H100"
@@ -119,10 +119,19 @@ def test_offline_allocates_static_cheapest():
     from flash.providers.core import allocator
     from flash.providers.core.base import cheapest_gpu
 
-    # Modal static rates: allocation matches cheapest_gpu.
+    # Modal static rates: allocation is the cheapest per STEP, which at realized throughput is the
+    # faster H100 rather than the cheapest-per-hour A100 that cheapest_gpu names.
+    from flash.cost.analytical import step_cost_key
+    from flash.cost.types import RunConfig
+
     a = allocator.allocate("Qwen/Qwen3.5-9B", "grpo")
     assert a.provider == "modal"
-    assert a.gpu == cheapest_gpu(a.min_vram_gb)
+    key = step_cost_key(RunConfig("Qwen/Qwen3.5-9B", "grpo", 1))
+    from flash.providers.core.registry import get_provider
+
+    rate = get_provider("modal").hourly_rate
+    cheapest_hourly = cheapest_gpu(a.min_vram_gb)
+    assert key(a.gpu, rate(a.gpu)) <= key(cheapest_hourly, rate(cheapest_hourly))
 
 
 def test_nothing_fits_names_constraint(monkeypatch):

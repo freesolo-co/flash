@@ -180,22 +180,33 @@ def test_quoting_an_unbounded_on_policy_run_still_refuses_to_guess():
         assert math.isnan(runner_costs.charge_usd_for_spec(spec, fallback=float("nan")))
 
 
+def _work_share(spec, steps):
+    """Estimated share of the planned work done by ``steps``; the one-time first update is whole."""
+    partial = runner_costs.charge_usd_for_spec(spec, steps=steps, fallback=float("nan"))
+    return partial / runner_costs.charge_usd_for_spec(spec, fallback=float("nan"))
+
+
 def test_cancelled_charge_usd_prorates_against_the_whole_cent_quote():
     spec = _spec()
     st = runner_state.RunStatus(run_id="r", state="cancelled", spec={}, estimated_cost_usd=1.01)
 
-    assert runner_costs.cancelled_charge_usd(st, spec, steps=10) == 0.505
+    half = runner_costs.cancelled_charge_usd(st, spec, steps=10)
+    assert half == pytest.approx(1.01 * _work_share(spec, 10))
+    # the first update's one-time work lands whole with the first step, so half the steps is more
+    # than half the work.
+    assert 0.505 < half < 1.01
     assert runner_costs.cancelled_charge_usd(st, spec, steps=20) == 1.01
 
 
 def test_cancelled_charge_usd_prorates_and_clamps_to_the_quote():
     # the persisted quote carries the accepted live rate, so a cancel bills the completed share of
-    # it and can never exceed it. this plan is uniform (no saves, dense model, no wall cap), so the
-    # work share reduces to the bare step fraction.
+    # it and can never exceed it.
     spec = _spec()  # 20 planned steps
     st = runner_state.RunStatus(run_id="r", state="cancelled", spec={}, estimated_cost_usd=8.0)
     assert runner_costs.cancelled_charge_usd(st, spec, steps=0) == 0.0
-    assert runner_costs.cancelled_charge_usd(st, spec, steps=10) == 4.0
+    assert runner_costs.cancelled_charge_usd(st, spec, steps=10) == pytest.approx(
+        8.0 * _work_share(spec, 10)
+    )
     assert runner_costs.cancelled_charge_usd(st, spec, steps=20) == 8.0
     # a step count beyond the plan still caps at the full quote.
     assert runner_costs.cancelled_charge_usd(st, spec, steps=25) == 8.0
@@ -485,8 +496,8 @@ def test_cancel_run_prorates_the_persisted_quote(monkeypatch, tmp_path):
 
     st = runner_status.get_status("run-1")
     assert st.state == "cancelled"
-    # half the steps -> half the accepted quote.
-    assert st.cost_usd == 4.0
+    # half the steps -> the accepted quote's estimated share of the work done by then.
+    assert st.cost_usd == pytest.approx(8.0 * _work_share(spec, 10))
 
 
 def test_cancel_run_with_malformed_quote_still_settles_as_a_billing_failure(monkeypatch, tmp_path):

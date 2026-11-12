@@ -26,12 +26,28 @@ SFT_FLOPS_PER_TOKEN_PER_PARAM = 6.0  # forward (2) + backward (4)
 GRPO_GEN_FLOPS_PER_TOKEN_PER_PARAM = 2.0  # autoregressive rollout forward
 GRPO_UPDATE_FLOPS_PER_TOKEN_PER_PARAM = 8.0  # policy fwd+bwd (6) + frozen-ref fwd (2)
 
-MFU_TRAIN = 0.35  # GRPO policy/reference update
-MFU_SFT_TRAIN = 0.25  # SFT fwd/bwd (smaller effective batch, long sequences)
-MFU_DECODE = 0.12  # batched vLLM rollout (decode is memory-bandwidth-bound)
+# --- calibration ---------------------------------------------------------------------------------
+# Fitted to MEASURED billable training time (first optimizer update -> training-loop exit, the
+# window the worker meter bills) across completed production runs, by relative least squares with
+# a 20% holdout. See docs/billing-calibration.md for the data, the fit and the per-model error.
+# The previous constants were fitted to elapsed wall including in-train initialization and
+# over-predicted billed training time ~2.3x for SFT and ~3.8x for GRPO.
+MFU_TRAIN = 0.52  # GRPO policy/reference update
+MFU_SFT_TRAIN = 0.85  # SFT fwd/bwd, realized against effective_train_tflops
+MFU_DECODE = 0.18  # batched vLLM rollout (decode is memory-bandwidth-bound)
+# sft attention: seconds per (6*P*tokens/peak) scaled by mean example length / 32768. long
+# examples cost super-linearly; without it long-context runs under-quote and short ones over-quote.
+SFT_ATTENTION_COEF = 0.47
+# one-time work inside the billed window: the first optimizer update (graph capture, allocator
+# warm-up, first rollout for grpo). measured, not modeled.
+SFT_FIRST_UPDATE_S = 205.0
+GRPO_FIRST_UPDATE_S = 135.0
 
-STEP_FLOOR_BASE_SECONDS = 62.7
-STEP_FLOOR_SECONDS_PER_COMPLETION = 0.805
+STEP_FLOOR_BASE_SECONDS = 14.2
+STEP_FLOOR_SECONDS_PER_COMPLETION = 0.048
+# the per-card offsets below were fitted against the previous 62.7 s floor; they are rescaled by
+# the same factor as the floor so each card keeps its measured relative speed.
+_STEP_FLOOR_RESCALE = 14.2 / 62.7
 
 # --- per-card offset ---------------------------------------------------------------------------
 # empirically fitted intercept offsets capture measured card-level variance; the slope stays shared.
@@ -39,12 +55,15 @@ STEP_FLOOR_SECONDS_PER_COMPLETION = 0.805
 # unmeasured cards use the pooled floor rather than a hardware guess.
 STEP_FLOOR_MIN_ARMS_FOR_OFFSET = 3
 STEP_FLOOR_CARD_OFFSET_SECONDS = {
-    "A100 PCIe": -12.6,  # n=6, completion counts 32/256
-    "B200": 42.5,  # n=4, 32/256 -- tied to H200, see below
-    "H100": -10.4,  # n=24, 16/32/256
-    "H200": 42.5,  # n=4, 32/256
-    "RTX 4090": 14.8,  # n=10, 16/32/64/96
-    "RTX 5090": -30.0,  # n=4, 32/96
+    card: round(offset * _STEP_FLOOR_RESCALE, 2)
+    for card, offset in {
+        "A100 PCIe": -12.6,  # n=6, completion counts 32/256
+        "B200": 42.5,  # n=4, 32/256 -- tied to H200, see below
+        "H100": -10.4,  # n=24, 16/32/256
+        "H200": 42.5,  # n=4, 32/256
+        "RTX 4090": 14.8,  # n=10, 16/32/64/96
+        "RTX 5090": -30.0,  # n=4, 32/96
+    }.items()
 }
 # B200 and H200 share the slower offset as a conservative never-cheaper policy, despite matched A/B
 # evidence that B200 is faster. untying changes the contract asserted by
@@ -75,7 +94,16 @@ STEP_FLOOR_SHARDED_FRACTION = 0.799
 # per-step publish/sync work. customer policy excludes the one-time framework setup from the quote,
 # while the recurring per-step work remains billable training. setup_seconds reports cold start and
 # model initialization separately for observability and never contributes to total_usd.
-SFT_STEP_FLOOR_SECONDS = 0.8
+SFT_STEP_FLOOR_SECONDS = 0.26
+
+
+def first_update_seconds(config: RunConfig) -> float:
+    """Measured one-time seconds of the first optimizer update, which the meter bills."""
+    if config.method == "sft":
+        return SFT_FIRST_UPDATE_S
+    if config.has_rollout:
+        return GRPO_FIRST_UPDATE_S
+    return 0.0
 
 
 def sft_step_floor_seconds(steps: int) -> float:
@@ -353,7 +381,10 @@ def sft_seconds_for_tokens(config: RunConfig, gpu: str, train_tokens: float) -> 
     mfu = MFU_SFT_TRAIN_MOE if moe else MFU_SFT_TRAIN
     peak = effective_train_tflops(gpu) * 1e12
     flops = SFT_FLOPS_PER_TOKEN_PER_PARAM * params * train_tokens
-    return flops / (peak * mfu)
+    examples = max(1, int(n.steps)) * max(1, int(n.batch_size or 1))
+    mean_example_tokens = float(train_tokens) / examples
+    attention = SFT_ATTENTION_COEF * (flops / peak) * (mean_example_tokens / 32768.0)
+    return flops / (peak * mfu) + attention
 
 
 def _wider_shape_remedy(config: RunConfig, need: float, names: tuple[str, ...]) -> str:
@@ -769,6 +800,7 @@ def estimate_cost(
     # block is excluded here too; grpo retains its aggregate recurring-work floor because its
     # calibration cannot safely split synchronization, checkpointing, and any in-train init.
     sft_floor_s = sft_step_floor_seconds(config.steps) if config.method == "sft" else 0.0
+    compile_s += first_update_seconds(config)
     raw_train = compile_s + config.steps * sps + required_save_s + sft_floor_s
     if not config.is_grpo and config.train_tokens is not None:
         raw_train = (

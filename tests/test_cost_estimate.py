@@ -153,12 +153,14 @@ def test_provisional_estimate_preserves_auto_provider():
 
 
 def test_estimate_honors_exact_gpu_instead_of_cheaper_fit():
+    # unconstrained ranks by dollars per step: at realized throughput an H100's speed outweighs
+    # its higher hourly rate. an exact A100 pin must still be honored even though it costs more.
     unconstrained = estimate_cost(RunConfig("Qwen/Qwen3.5-9B", "grpo", 10))
-    exact = estimate_cost(RunConfig("Qwen/Qwen3.5-9B", "grpo", 10, gpu_type="H100"))
+    exact = estimate_cost(RunConfig("Qwen/Qwen3.5-9B", "grpo", 10, gpu_type="A100 SXM"))
 
-    assert unconstrained.gpu == "A100 SXM"
-    assert exact.gpu == "H100"
-    assert exact.gpu_hourly_usd > unconstrained.gpu_hourly_usd
+    assert unconstrained.gpu == "H100"
+    assert exact.gpu == "A100 SXM"
+    assert exact.total_usd > unconstrained.total_usd
 
 
 def test_runconfig_from_spec_preserves_gpu_constraints():
