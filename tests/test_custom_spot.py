@@ -1,4 +1,4 @@
-"""Custom training on Nebius Spot: direct pinned-TLS sessions, automatic saves, preemption recovery."""
+"""Custom training on Mithril Spot: direct pinned-TLS sessions, automatic saves, preemption recovery."""
 
 import itertools
 import json
@@ -119,50 +119,17 @@ def test_training_client_pins_the_attempt_certificate(tls_status_server):
         TrainingClient(url, api_key="token", timeout=10)
 
 
-# --- Nebius launch and connection -----------------------------------------------------------
+# --- Mithril launch and connection -----------------------------------------------------------
 
 
 def _payload(algorithm):
     return {"job_spec_json": json.dumps({"algorithm": algorithm}), "run_id": "r", "attempt": 0}
 
 
-def test_cloud_init_publishes_the_session_port_only_for_custom():
-    from flash.providers.nebius import api
-
-    deadline = time.time() + 3600
-    custom = api.cloud_init(_payload("custom"), {"url": "x"}, "img", deadline_at=deadline)
-    sft = api.cloud_init(_payload("sft"), {"url": "x"}, "img", deadline_at=deadline)
-    assert '"-p", "8000:8000"' in custom
-    assert '"-p"' not in sft
-
-
-def test_public_ip_reads_only_a_global_address(monkeypatch):
-    from flash.providers.nebius import api
-
-    def instances(address):
-        return [
-            {
-                "metadata": {"id": "computeinstance-a"},
-                "status": {
-                    "state": "RUNNING",
-                    "network_interfaces": [{"public_ip_address": {"address": address}}],
-                },
-            }
-        ]
-
-    monkeypatch.setattr(api, "list_instances", lambda **_: instances("8.8.4.4/32"))
-    assert api.public_ip("computeinstance-a") == "8.8.4.4"
-    assert api.public_ip("computeinstance-other") is None
-    monkeypatch.setattr(api, "list_instances", lambda **_: instances("10.0.0.5/32"))
-    assert api.public_ip("computeinstance-a") is None
-    monkeypatch.setattr(api, "list_instances", lambda **_: instances(""))
-    assert api.public_ip("computeinstance-a") is None
-
-
 def _spot_remote(run_id="spot-run", attempt=2):
     return {
         "provider": "spot",
-        "instance_id": "computeinstance-a",
+        "instance_id": "bid_test",
         "name": "flash-spot-run-2",
         "run_id": run_id,
         "hf_repo": "owner/repo",
@@ -180,7 +147,7 @@ def _route_client(monkeypatch, remote, *, address="8.8.4.4"):
     from fastapi import FastAPI
     from fastapi.testclient import TestClient
 
-    from flash.providers.nebius import api, handles
+    from flash.providers.mithril import api, handles
     from flash.server.platform.deps import require_key
     from flash.server.routes import custom
 

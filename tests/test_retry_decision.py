@@ -272,7 +272,7 @@ def test_spot_preemption_reuses_shape_without_spending_infrastructure_budget(bud
 @pytest.mark.parametrize("cache", [False, True])
 @pytest.mark.parametrize("budget", [0, 2, 5])
 def test_spot_capacity_refusal_requeues_same_shape_without_spending_budget(budget, cache):
-    # Nebius refusing a Spot create for quota/capacity used to end the run (UnreconciledCreateError).
+    # Mithril refusing a Spot create for quota/capacity used to end the run (UnreconciledCreateError).
     chosen = _candidate("spot", "H100", 80)
     larger = _candidate("spot", "H200", 141)
     current = replace(RetryState(budget, 2, 1), usable_vram_floor=24)

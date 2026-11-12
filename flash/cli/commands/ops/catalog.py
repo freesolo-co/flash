@@ -19,8 +19,8 @@ def cmd_models(args) -> int:
 def cmd_gpus(args) -> int:
     """List validated managed GPU classes, VRAM, and estimated $/hr."""
     from flash.providers.core.base import GPU_INFO
+    from flash.providers.mithril.pricing import SPOT_GPUS
     from flash.providers.modal.pricing import static_rates as modal_static_rates
-    from flash.providers.nebius.pricing import SPOT_GPUS
 
     modal_rates = modal_static_rates()
     infos = sorted(
@@ -30,7 +30,7 @@ def cmd_gpus(args) -> int:
         "Tip: GPU allocation is automatic by default.\n"
         "The allocator picks the cheapest validated class that fits. Pin a specific class by "
         'adding type = "<CLASS>" to the [gpu] section.\n'
-        "Set spot = true for Nebius only. Spot rates are entry estimates; jobs start strictly below them.\n"
+        "Set spot = true for Mithril only. Spot rates are entry estimates; jobs start strictly below them.\n"
         "Spot priority: H100, H200, B200. Keep-running caps: $1.50, $2.00, $5.00 per GPU-hour."
     )
     if render.styled():

@@ -1,117 +1,127 @@
-# Nebius Spot training
+# Mithril Spot training
 
-Set `[gpu] spot = true` to opt into Nebius preemptible VMs. Modal remains
-the default; Spot never falls back to Modal or Nebius on-demand instances. Only
-H100, H200 and B200 are offered. RTX Pro 6000 and L40S are excluded.
+Set `[gpu] spot = true` to use Mithril's Compute API. Modal remains the default;
+Spot never falls back to Modal or on-demand reservations.
 
-| GPU | Fixed rate (estimates, charges) | Start below | Keep running through |
+## Operator setup
+
+Set these secrets/configuration on the control plane:
+
+- `FLASH_MITHRIL_API_KEY`: Mithril API key with access to the intended project.
+- `FLASH_MITHRIL_PROJECT_ID`: project FID from `GET /v2/projects`.
+- `FLASH_MITHRIL_REGION`: auction region from `GET /v2/spot/availability`.
+- Optional `FLASH_MITHRIL_IMAGE_VERSION`: GPU host image version FID. Otherwise,
+  Mithril selects the region's default image. Use an image with Docker, a compatible
+  NVIDIA driver, NVIDIA container toolkit, Python 3 and outbound registry/Azure access.
+- Optional `FLASH_MITHRIL_SSH_KEY_IDS`: comma-separated existing SSH key FIDs for diagnostics.
+
+Host images are selected through the Mithril API; no provider CLI is needed.
+Keep the existing worker image, Azure artifact and runtime-secret configuration.
+The Mithril API key stays on the control plane; workers receive only their runtime
+credentials. Use a dedicated project for Flash training.
+
+**Migration:** finish or cancel all existing legacy Spot runs using the previous
+release before deploying this change. Persisted legacy resource IDs and ownership
+fingerprints are deliberately rejected by the Mithril provider. Installing this
+release does not migrate or delete existing legacy VMs.
+
+## Admission, prices and recovery
+
+| GPU | Fixed estimate / charge rate | Start below | Bid cap per GPU-hour |
 | --- | ---: | ---: | ---: |
-| H100 | $1.00 | $1.01 | $1.51 |
-| H200 | $1.00 | $1.01 | $2.01 |
+| H100 | $1.00 | $1.01 | $2.01 |
+| H200 | $1.00 | $1.01 | $2.51 |
 | B200 | $4.00 | $4.01 | $5.01 |
 
-The table lives in `flash/providers/nebius/pricing.py`. Live regional prices
-admit fitting rentals in H100, H200, B200 priority order, even when H200 is cheaper.
-Each threshold sits $0.01 above its round figure, so a price of exactly $1.00 (or $2.00,
-$4.00, $5.00) still starts or keeps running. The fixed rate prices Flash's estimates and
-charges; running prices can be higher. Estimates exclude disk, network and taxes and are not Nebius invoices.
-Nebius presets are 1 or 8 GPUs. All rented cards contribute to the price.
+The policy lives in `flash/providers/mithril/pricing.py`. Flash joins the authenticated
+instance-type catalog to live regional auctions, admitting only advertised SXM
+shapes with sufficient VRAM, capacity and local scratch. Supported counts are 1 and 8;
+a listed eight-GPU auction never implies single-GPU availability. B200 remains an
+eligible policy class but cannot be selected unless Mithril actually offers it.
+Fitting rentals retain H100, H200, B200 priority order.
 
-Customer charges use the accepted Spot-priced quote: $1 per GPU-hour for H100/H200
-or $4 for B200 in the work estimate. Completion charges that quote; early completion
-or cancellation charges its completed-work fraction, capped at the accepted quote.
-Recovery preserves Spot pricing even when a saved resource record lacks its provider.
-These are fixed Flash Spot rates, not a pass-through of fluctuating Nebius invoices.
+Mithril reports prices and accepts bids **per instance-hour**. Flash divides the
+auction price by the actual GPU count for admission and multiplies the hold cap by
+that count for the bid. It requests one instance, not one instance per GPU.
+Each cap includes a one-cent per-GPU-hour offset. Admission uses strict `<`
+thresholds: an eight-H200 price of $8.00 passes the $1.01/GPU-hour entry threshold,
+while $8.08 does not. Current market prices may leave all jobs queued.
+Malformed or unavailable prices fail closed. Jobs recheck every 60 seconds without
+creating bids or consuming training retries; waiting respects cancellation and the
+run deadline. The selected GPU count and disk requirement are rechecked before launch.
+Project Spot quotas are checked for the exact instance type, including usage by
+other jobs. Exhausted or unreadable quotas keep the job queued. Missing shape
+quota rows defer to server enforcement. Definitively refused creates with confirmed
+quota exhaustion requeue only after reconciliation finds no bid; unknown POST
+outcomes remain fail-closed. Organization-level limits remain server-enforced.
 
-Flash reads Nebius's public spot-price API and queues jobs if prices are over the
-cap, absent, stale, or unavailable. It checks again every 60 seconds, without
-consuming training retries or creating a VM. Queueing respects cancellation and
-the run's wall-clock deadline. Admission is rechecked before launch, and every VM
-also carries a Nebius maximum-price policy so a later price rise cannot silently
-switch to uncapped pricing. On preemption, Flash provisions another eligible Spot
-VM and resumes the latest durable trainer checkpoint using its existing retry
-budget. Spot uses a greedy scheduler based on the latest completed step duration and checkpoints before another similar
-step would exceed **10 minutes** of unsaved training (for example, every 2 five-minute
-steps or 10 one-minute steps). It also saves the first and final completed step.
-Steps lasting 10 minutes or longer checkpoint after every step. This is a recovery target: indivisible steps and asynchronous uploads can exceed it.
-Do not set `train.save_every` for Spot. Optional `train.save_at_steps` exports
-cannot suppress automatic recovery saves.
-Work since the latest fully uploaded checkpoint may be repeated, including any
-checkpoint whose upload was still in progress. Portal is not used.
+Customer charges retain the accepted Spot quote ($1 per GPU-hour for H100/H200 or
+$4 for B200), with the existing completed-work/session-time settlement rules.
+These estimates are not Mithril invoices and exclude network, taxes and other charges.
+The bid cap is higher than the entry threshold and bounds subsequent compute pricing.
 
-## Custom algorithms on Spot
+Each attempt owns one bid. Its durable resource handle stores the **bid FID**, so
+cancellation also stops unallocated bids and automatic reallocation. Cleanup confirms
+both bid termination and stopped instances. An ambiguous create is reconciled by
+attempt name and ownership; it is never blindly retried. Preemption or relocation
+ends the attempt, cancels the bid, and lets Flash resume a fresh attempt from its
+latest fully uploaded trainer checkpoint. SIGTERM interruption is treated as Spot
+preemption, not a budgeted worker fault, including custom jobs with zero retries. Workers atomically claim their attempt
+in private Azure storage, preventing a duplicate or replacement host from running
+the same attempt twice. Flash does not install a service to restart training after
+Mithril reboots a preserved boot disk.
 
-`algorithm = "custom"` runs accept `[gpu] spot = true` on exactly one GPU (custom layer
-sharding stops at two cards and Spot presets are 1 or 8). Without a provider tunnel, the local
-controller connects straight to the VM:
+Spot saves the first and final completed step, explicit `train.save_at_steps`, and
+before another step of similar duration would exceed ten minutes of unsaved work.
+Steps lasting ten minutes or longer save after every step. This is a recovery target;
+indivisible steps and asynchronous uploads may exceed it. Do not set `train.save_every`
+for Spot. Work since the latest complete upload may be repeated after preemption.
 
-- The worker serves its session over HTTPS on port 8000, published from the container. Allow
-  inbound TCP 8000 to Flash's Spot VMs from wherever controllers run (Nebius's default security
-  group allows all ingress).
-- Each attempt has its own Ed25519 TLS identity and session token, both derived from
-  `FREESOLO_INTERNAL_KEY`, so nothing new is stored. `GET /v1/runs/{id}/custom` returns the VM's
-  public address, the token and the certificate; the controller trusts only that certificate.
-- Recovery saves are automatic and time-based, as for other Spot jobs: the first step, every
-  `save_at_steps` entry, the final step, and before another typical step would exceed 10 minutes
-  of unsaved work. `train.save_every` must be omitted.
-- After preemption, the replacement attempt restores the run's newest complete custom
-  checkpoint (adapter, optimizer state and `algorithm_state`). The controller notices its
-  session failed, waits for the new attempt's session, and calls `main(client)` again; write
-  `main` to continue from `client.step` and `client.restored_state`. A failure while the same
-  session is still alive is the algorithm's own error and cancels the run as before.
-- Billing is session time across all attempts, as a fraction of the accepted quote.
+## Worker startup and custom algorithms
 
-On the control-plane host:
+The startup script downloads checksum-verified launch data and the Flash capsule
+from private Azure storage. Large payloads stay outside Mithril's 10,000-character
+startup-script limit. Runtime files are root-only; restrict access to bid metadata,
+startup scripts and the artifact container because they contain scoped credentials.
+Docker image layers and training scratch use the host's ephemeral `/mnt/local`
+storage. Flash creates no persistent Mithril volumes. Uploaded Azure checkpoints
+remain the durable recovery source.
 
-1. Install and authenticate the current Nebius CLI with access to the intended
-   USD-billed project, compute resources and billing pricing policies. Freesolo's
-   published control-plane images already contain a pinned CLI (`INSTALL_NEBIUS=true`;
-   a plain `docker build .` omits it). Flash calls it non-interactively with
-   `--no-browser`, so give the container a service-account profile, not a browser
-   login: for example, mount a root-only directory holding `config.yaml` and the
-   authorized-key PEM at `/root/.nebius`.
-2. Set `FLASH_NEBIUS_PROJECT_ID`, `FLASH_NEBIUS_REGION`,
-   `FLASH_NEBIUS_SUBNET_ID`, and `FLASH_NEBIUS_IMAGE_ID`. The region must match
-   the project and subnet. The configured GPU host image must have Docker,
-   a suitable NVIDIA driver and NVIDIA container toolkit installed, plus outbound
-   access to the worker container registry and Azure Blob Storage. B200 requires the
-   driver/CUDA support of Flash's configured Blackwell worker image.
-   Optionally set `FLASH_NEBIUS_PREEMPTIBLE_VM_LIMIT` to the project's
-   `compute.instance.preemptible.count` quota (Nebius console: Administration → Limits).
-   Spot jobs then wait in the queue, without provisioning, while that many preemptible VMs
-   exist in the project, and the next waiting job claims the slot when a VM is deleted. Without
-   it, a create Nebius refuses for quota or capacity is requeued after 60 seconds instead.
-3. Retain the existing worker image, artifact and runtime-secret configuration.
-   The VM launches the same Flash worker capsule and training container as Modal.
-4. Start the control plane and submit with `spot = true`. `flash gpus`
-   lists the fixed Spot estimates alongside Modal rates. Set `spot = false` for regular
-   Modal training. Legacy `provider = "spot"` is also accepted.
+Workers stop at their absolute deadline and shut down the host on exit. The control
+plane must remain available to cancel the bid and confirm resource cleanup; host
+shutdown alone does not cancel a Mithril bid. Normal completion, cancellation and
+orphan reconciliation all cancel the owned bid.
 
-Supported platform IDs are `gpu-h100-sxm`, `gpu-h200-sxm`, and `gpu-b200-sxm`;
-only platforms offered in the configured region can be admitted. Managed boot
-disks use fast ephemeral Network SSD Non-replicated storage, rounded to 93-GiB
-allocation units with a 279-GiB minimum for the image, model and checkpoints.
-They are deleted with the VM; fully uploaded Azure Blob Storage checkpoints are the
-durable recovery source. Runtime secrets are in root-only cloud-init files;
-restrict access to VM metadata and the image accordingly. Use a dedicated project
-for Flash training resources. The worker has a deadline shutdown, and normal
-cancellation, completion and orphan reconciliation delete the VM and its disk.
+`algorithm = "custom"` supports exactly one Spot GPU. The worker publishes port 8000
+through Mithril's `foundrypf` utility and serves the existing per-attempt pinned TLS
+session. The controller receives the running instance's public IPv4 address, session
+token and certificate from `GET /v1/runs/{id}/custom`. After preemption, it reconnects
+to a new attempt and invokes `main(client)` again; continue from `client.step` and
+`client.restored_state`. Custom billing still accumulates session time across attempts.
 
-References: [Nebius spot prices](https://docs.nebius.com/signup-billing/spot-prices),
-[maximum-price policies](https://docs.nebius.com/signup-billing/manage-pricing-policy),
-and [preemptible VM lifecycle](https://docs.nebius.com/compute/virtual-machines/preemptible).
+References: [Compute API](https://docs.mithril.ai/compute-api/compute-api-reference/spot),
+[Spot lifecycle](https://docs.mithril.ai/compute-and-storage/spot-bids),
+[startup scripts](https://docs.mithril.ai/compute-and-storage/startup-scripts), and
+[port forwarding](https://docs.mithril.ai/compute-and-storage/managing-open-ports).
 
-To qualify a configured Nebius account, create a disposable private Azure artifact repository, configure Azure artifact storage locally, and run:
+To qualify a configured account with paid resources, prepare a disposable private
+Azure artifact repository and run:
 
 ```sh
-python scripts/smoke_nebius_sft.py --run-paid-test --repo owner/private-test-dataset
+python scripts/smoke_mithril_sft.py --run-paid-test --repo owner/private-test-dataset
 ```
 
-This rents one H100 at a time, interrupts a two-step SFT job after checkpoint 1
-is fully uploaded, then verifies that a replacement VM resumes and finishes step 2. Each attempt is limited to 45 minutes to allow cold image downloads and full-state checkpoint transfers.
-The harness deletes its VMs and managed disks; test artifacts remain in the private
-repository. GPU quota and active billing are required. Price thresholds, GPU
-priority, cancellation and adaptive checkpoint timing are covered by offline tests.
+This rents one H100 at a time and requests cancellation after checkpoint 1 is durable.
+The small first run may finish step 2 before cancellation takes effect. A new bid
+restores the latest checkpoint with the target extended to step 4, proving that
+recovery executes additional optimizer steps in either case. Each attempt is limited to
+45 minutes. The harness cancels its bids; test artifacts remain in private storage.
+It will stay queued if the regional H100 price is not below the unchanged entry cap.
+
+For an explicitly paid qualification when current prices exceed the normal entry
+threshold, select `--gpu H200 --entry-price-cap 2`. This changes admission only in
+the smoke-test process and refuses caps above that GPU's existing hold cap. It does
+not change production pricing. `--model` selects the model to qualify.
 
 # Hosted model capacity and providers
 

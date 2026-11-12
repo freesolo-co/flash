@@ -303,7 +303,7 @@ def _structurally_fits(available, need: int, cap: int, executed_width, acceptabl
                 continue
             counts = rentable_gpu_counts(min(cap, gpu_class.max_count))
             if name == "spot":
-                from flash.providers.nebius.pricing import SPOT_GPUS
+                from flash.providers.mithril.pricing import SPOT_GPUS
 
                 counts = tuple(n for n in counts if n in SPOT_GPUS[gpu_class.name].counts)
             for count in counts:
@@ -954,7 +954,7 @@ def _cheapest_allocation(
     matches. A run the cost model cannot price (``cost_per_step`` is ``None``) falls back to total
     $/hr.
     """
-    from flash.providers.nebius.pricing import priority as spot_priority
+    from flash.providers.mithril.pricing import priority as spot_priority
 
     primary = cost_per_step if cost_per_step is not None else (lambda c: c.total_hourly_usd)
     unnamed_rank = len(provider_rank)
@@ -971,7 +971,7 @@ def _cheapest_allocation(
         ),
     )
     # Spot prioritizes GPU class, then current price; fixed entry rates price estimates.
-    from flash.providers.nebius.pricing import hourly_rate as spot_hourly_rate
+    from flash.providers.mithril.pricing import hourly_rate as spot_hourly_rate
 
     ranked = [
         replace(c, hourly_usd=spot_hourly_rate(c.gpu)) if c.provider == "spot" else c

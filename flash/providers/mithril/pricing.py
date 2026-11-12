@@ -1,10 +1,8 @@
 """Fixed Spot rates, entry thresholds and separate hold caps, in USD per GPU-hour.
 
-``hourly_usd`` is the fixed rate Flash estimates and charges. ``entry_below_usd`` admits a
-rental when the live price is strictly below it, and ``keep_running_usd`` is the Nebius
-maximum-price policy a running VM keeps. Each threshold sits $0.01 above its round figure so a
-price of exactly $1.00 (or $2.00, $4.00, $5.00) still admits or keeps running.
 These are user-selected thresholds, not current market prices or capacity guarantees.
+Each threshold includes a $0.01/GPU-hour offset above the selected base cap.
+This admits exact-dollar prices despite the strict entry comparison.
 GPU priority follows insertion order: H100, H200, B200.
 """
 
@@ -16,24 +14,16 @@ from flash.providers.core.base import canonical_gpu
 
 @dataclass(frozen=True)
 class SpotGpu:
-    platform: str
     hourly_usd: Decimal
     entry_below_usd: Decimal
     keep_running_usd: Decimal
-    cpu: int
-    memory_gib: int
     counts: tuple[int, ...] = (1, 8)
-
-    def preset(self, count: int) -> str:
-        if type(count) is not int or count not in self.counts:
-            raise ValueError("unsupported Nebius GPU count")
-        return f"{count}gpu-{self.cpu * count}vcpu-{self.memory_gib * count}gb"
 
 
 SPOT_GPUS = {
-    "H100": SpotGpu("gpu-h100-sxm", Decimal("1.00"), Decimal("1.01"), Decimal("1.51"), 16, 200),
-    "H200": SpotGpu("gpu-h200-sxm", Decimal("1.00"), Decimal("1.01"), Decimal("2.01"), 16, 200),
-    "B200": SpotGpu("gpu-b200-sxm", Decimal("4.00"), Decimal("4.01"), Decimal("5.01"), 20, 224),
+    "H100": SpotGpu(Decimal("1.00"), Decimal("1.01"), Decimal("2.01")),
+    "H200": SpotGpu(Decimal("1.00"), Decimal("1.01"), Decimal("2.51")),
+    "B200": SpotGpu(Decimal("4.00"), Decimal("4.01"), Decimal("5.01")),
 }
 
 

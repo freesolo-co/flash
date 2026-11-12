@@ -50,7 +50,7 @@ def _get_provider(key: str) -> Provider:
 
         return PROVIDER
     if key == "spot":
-        from flash.providers.nebius.provider import PROVIDER
+        from flash.providers.mithril.provider import PROVIDER
 
         return PROVIDER
     raise KeyError(f"unknown provider {key!r}")

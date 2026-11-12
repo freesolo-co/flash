@@ -79,8 +79,8 @@ def _worker_provably_gone(run_id: str, handle) -> bool:
     try:
         h = _canonical_provider_handle(handle)
         if h.provider == "spot":
-            from flash.providers.nebius import api
-            from flash.providers.nebius.handles import require_scope
+            from flash.providers.mithril import api
+            from flash.providers.mithril.handles import require_scope
         else:
             from flash.providers.modal.handles import require_scope
         from flash.providers.core.handles import parse_handle

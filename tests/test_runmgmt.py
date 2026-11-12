@@ -878,7 +878,7 @@ def test_supervised_attempt_identities_start_at_zero_and_increment_without_expan
 
 
 def test_spot_capacity_refusal_requeues_until_capacity_frees(monkeypatch, tmp_path):
-    # Reproduces the failure: Nebius refused a third concurrent Spot H100 create (quota), Flash
+    # Reproduces the failure: Mithril refused a third concurrent Spot H100 create (quota), Flash
     # reported "provider create could not be reconciled" and ended the run ("not retrying").
     # A definitive capacity refusal must instead wait and requeue on the same shape.
     import io
@@ -934,12 +934,12 @@ def test_spot_capacity_refusal_requeues_until_capacity_frees(monkeypatch, tmp_pa
         def submit_attempt(self, _spec, *, on_handle, attempt, **_kwargs):
             self.attempts.append(attempt)
             if attempt < 2:
-                raise CapacityUnavailableError("Nebius Spot H100 capacity unavailable")
+                raise CapacityUnavailableError("Mithril Spot H100 capacity unavailable")
             from flash.providers.core.base import JobHandle
-            from flash.providers.nebius.handles import SpotJobHandle
+            from flash.providers.mithril.handles import SpotJobHandle
 
             handle = SpotJobHandle(
-                instance_id=f"computeinstance-{attempt}",
+                instance_id=f"bid_{attempt}",
                 gpu="H100",
                 hourly_usd=1,
                 attempt=attempt,
