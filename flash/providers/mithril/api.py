@@ -54,8 +54,15 @@ def list_instances(*, deadline_at=None):
         "/spot/bids", params={"project": settings()["project_id"]}, deadline_at=deadline_at
     ):
         labels = _ownership(bid)
-        if labels and bid["status"] != "Terminated":
-            result.append({"metadata": {"id": bid["fid"], "name": bid["name"], "labels": labels}})
+        if not labels:
+            continue
+        # Bid cancellation precedes VM shutdown. Handle-less recovery must still see
+        # these resources until the same instance-state check as terminate() passes.
+        if bid["status"] == "Terminated" and all(
+            row["status"] in _STOPPED for row in _instances(bid["fid"], deadline_at=deadline_at)
+        ):
+            continue
+        result.append({"metadata": {"id": bid["fid"], "name": bid["name"], "labels": labels}})
     return result
 
 

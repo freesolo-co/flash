@@ -514,3 +514,91 @@ def test_worker_launches_capsule_on_ephemeral_docker_storage(monkeypatch, tmp_pa
     assert ("-p" in command) == (algorithm == "custom")
     assert bool(forwarded) == (algorithm == "custom")
     assert commands[-1] == ["shutdown", "-h", "now"]
+
+
+@pytest.mark.parametrize(
+    ("states", "remaining"),
+    [
+        (["STATUS_RUNNING"], True),
+        (["STATUS_STOPPING"], True),
+        (["STATUS_TERMINATED", "STATUS_STOPPING"], True),
+        (["STATUS_UNKNOWN"], True),
+        (["STATUS_TERMINATED"], False),
+        (["STATUS_PREEMPTED", "STATUS_PAUSED", "STATUS_REPLACED", "STATUS_ERROR"], False),
+        ([], False),
+    ],
+)
+def test_terminated_bids_remain_discoverable_until_every_vm_stops(monkeypatch, states, remaining):
+    deadline = time.time() + 30
+
+    def pages(path, *, params, deadline_at):
+        assert deadline_at == deadline
+        assert params["project"] == "proj_test"
+        if path == "/spot/bids":
+            return [owned_bid(status="Terminated")]
+        assert path == "/instances"
+        assert params["bid_fid_in"] == "bid_test"
+        return [{"bid": "bid_test", "project": "proj_test", "status": state} for state in states]
+
+    monkeypatch.setattr(api, "pages", pages)
+    found = api.list_instances(deadline_at=deadline)
+    assert [item["metadata"]["id"] for item in found] == (["bid_test"] if remaining else [])
+
+
+def test_instance_shutdown_checks_ignore_unowned_bids(monkeypatch):
+    monkeypatch.setattr(
+        api, "pages", lambda *a, **kw: [owned_bid(status="Terminated", project="foreign")]
+    )
+    monkeypatch.setattr(
+        api, "_instances", lambda *a, **kw: pytest.fail("must not inspect foreign resources")
+    )
+    assert api.list_instances() == []
+
+
+def test_handleless_recovery_blocks_until_terminated_bid_instances_stop(monkeypatch):
+    from flash.providers.core import registry
+    from flash.providers.modal import auth
+    from flash.server.platform import runtime
+
+    provider = get_provider("spot")
+    monkeypatch.setattr(registry, "configured_providers", lambda: [provider])
+    monkeypatch.setattr(
+        runtime, "get_status", lambda _: SimpleNamespace(submitted_instance_providers=["spot"])
+    )
+    monkeypatch.setattr(auth, "require_recorded_scope", lambda _: None)
+    monkeypatch.setattr(api, "pages", lambda *a, **kw: [owned_bid(status="Terminated")])
+    current = ["STATUS_STOPPING"]
+
+    def instances(*args, **kwargs):
+        if current[0] == "unavailable":
+            raise api.MithrilApiError("instance lookup failed")
+        return [{"status": current[0]}]
+
+    monkeypatch.setattr(api, "_instances", instances)
+    cancelled = []
+
+    def terminate(bid_id):
+        cancelled.append(bid_id)
+        raise api.MithrilApiError("shutdown not confirmed")
+
+    monkeypatch.setattr(api, "terminate", terminate)
+    spec = SimpleNamespace(run_id="test")
+    assert provider.run_instances_remaining(spec.run_id) == ["bid_test"]
+    assert runtime._confirm_run_clear(spec) is False
+    assert cancelled == ["bid_test"]
+    current[0] = "unavailable"
+    assert runtime._confirm_run_clear(spec) is False
+    current[0] = "STATUS_TERMINATED"
+    assert runtime._confirm_run_clear(spec) is True
+    assert provider.run_instances_remaining(spec.run_id) == []
+
+
+def test_orphan_sweep_reaps_terminated_bid_with_stopping_instance(monkeypatch):
+    monkeypatch.setattr(api, "pages", lambda *a, **kw: [owned_bid(status="Terminated")])
+    monkeypatch.setattr(api, "_instances", lambda *a, **kw: [{"status": "STATUS_STOPPING"}])
+    terminated = []
+    monkeypatch.setattr(api, "terminate", terminated.append)
+    assert get_provider("spot").sweep_orphans(active_labels=set(), known_labels={"test"}) == [
+        "bid_test"
+    ]
+    assert terminated == ["bid_test"]
