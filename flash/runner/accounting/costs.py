@@ -302,7 +302,7 @@ def cancelled_charge_usd(
         gpu_count=gpu_count,
     )
     if math.isfinite(partial) and math.isfinite(full) and full > 0:
-        return quote * min(1.0, partial / full)
+        return quote * min(1.0, partial / full) * _billed_rate_factor(rented_remote, status)
     # the work fraction is unpriceable: reprice the spec but never bill a cancel above the quote.
     # a non-finite reprice is a pricing failure and must propagate so the caller records it.
     repriced = charge_usd_for_spec(
@@ -310,7 +310,7 @@ def cancelled_charge_usd(
     )
     if not math.isfinite(repriced):
         return repriced
-    return min(repriced, quote)
+    return min(repriced, quote * _billed_rate_factor(rented_remote, status))
 
 
 def _persisted_completed_work(spec) -> tuple[int | None, dict | None]:
@@ -368,8 +368,15 @@ def _status_estimated_charge(status: RunStatus, spec, *, fallback: float = 0.0) 
         )
     quote = getattr(status, "estimated_cost_usd", None)
     if quote is not None:
-        return float(quote)
+        return float(quote) * _billed_rate_factor(None, status)
     return charge_usd_for_spec(spec, fallback=fallback)
+
+
+def _billed_rate_factor(rented_remote, status) -> float:
+    """Share of a Spot quote owed for the classes actually rented (1.0 for every other run)."""
+    from flash.runner.accounting.spot_usage import rate_factor
+
+    return rate_factor(status)
 
 
 def actual_steps_run(status: RunStatus) -> int:

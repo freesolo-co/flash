@@ -30,25 +30,28 @@ release does not migrate or delete existing legacy VMs.
 
 ## Admission, prices and recovery
 
-| GPU | Fixed estimate / charge rate | Start below | Bid cap per GPU-hour |
-| --- | ---: | ---: | ---: |
-| H100 | $1.00 | $1.01 | $2.01 |
-| H200 | $1.00 | $1.01 | $2.51 |
-| B200 | $4.00 | $4.01 | $5.01 |
+| GPU | Fixed estimate / charge rate | Cap per GPU-hour (start below, keep running through) |
+| --- | ---: | ---: |
+| H100 | $2.00 | $2.01 |
+| H200 | $2.50 | $2.51 |
 
 The policy lives in `flash/providers/mithril/pricing.py`. Flash joins the authenticated
 instance-type catalog to live auctions in every region, admitting only advertised SXM
 shapes with sufficient VRAM, capacity and local scratch. Supported counts are 1 and 8;
-a listed eight-GPU auction never implies single-GPU availability. B200 remains an
-eligible policy class but cannot be selected unless Mithril actually offers it.
-Fitting rentals retain H100, H200, B200 priority order.
+a listed eight-GPU auction never implies single-GPU availability. Spot offers H100 and
+H200 only. A queued run waits for every class with at least its allocated class's VRAM
+(for 9B and 0.8B models, H100 or H200) and takes whichever comes up first; when both
+qualify at once, H100 then H200, then price. The attempt's spec names the class rented.
+Allocation never reads live prices: it picks the highest-priority fitting catalog
+shape, so a run is always admitted and waits in the queue until a fitting class is
+below its cap.
 
 Mithril reports prices and accepts bids **per instance-hour**. Flash divides the
 auction price by the actual GPU count for admission and multiplies the hold cap by
 that count for the bid. It requests one instance, not one instance per GPU.
-Each cap includes a one-cent per-GPU-hour offset. Admission uses strict `<`
-thresholds: an eight-H200 price of $8.00 passes the $1.01/GPU-hour entry threshold,
-while $8.08 does not. Current market prices may leave all jobs queued.
+Each cap includes a one-cent per-GPU-hour offset. Admission uses a strict `<` against
+the same cap the bid uses: an eight-H200 price of $20.00 passes the $2.51/GPU-hour cap,
+while $20.08 does not. Current market prices may leave all jobs queued.
 Malformed or unavailable prices fail closed. Jobs recheck every 60 seconds without
 creating bids or consuming training retries; waiting respects cancellation and the
 run deadline. The selected GPU count and disk requirement are rechecked before launch.
@@ -58,10 +61,16 @@ quota rows defer to server enforcement. Definitively refused creates with confir
 quota exhaustion requeue only after reconciliation finds no bid; unknown POST
 outcomes remain fail-closed. Organization-level limits remain server-enforced.
 
-Customer charges retain the accepted Spot quote ($1 per GPU-hour for H100/H200 or
-$4 for B200), with the existing completed-work/session-time settlement rules.
+Every Spot quote is priced at the top Spot rate ($2.50 per GPU-hour), because any run may
+end up on an H200. Each stretch is then billed at the class it actually ran on ($2.00 for
+H100, $2.50 for H200), including runs that resume on a different class after a preemption.
+Heartbeats credit usage to the class the run is on at the time (newly reached training
+steps, or custom-session seconds), and settlement charges the accepted quote x the
+completed-work share x (usage-weighted rate / $2.50), never more than the quote. Runs
+launched before this accounting are billed on their accepted quote unchanged. The existing
+completed-work/session-time settlement rules otherwise apply.
 These estimates are not Mithril invoices and exclude network, taxes and other charges.
-The bid cap is higher than the entry threshold and bounds subsequent compute pricing.
+The same cap bounds both admission and subsequent compute pricing.
 
 Each attempt owns one bid. Its durable resource handle stores the **bid FID**, so
 cancellation also stops unallocated bids and automatic reallocation. Cleanup confirms

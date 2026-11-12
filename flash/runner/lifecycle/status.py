@@ -372,6 +372,9 @@ def record_heartbeat(run_id: str, heartbeat: dict) -> None:
                 prior += _session_seconds(prev.get("session_seconds"))
             if prior:
                 hb.setdefault("session_seconds_prior", prior)
+        from flash.runner.accounting.spot_usage import record as record_spot_usage
+
+        record_spot_usage(status, prev, hb, same_attempt=same_attempt)
         # Checkpoint-stage heartbeats (checkpoint_uploading/deployable/uploaded) omit metrics_last; carry
         # the existing per-step backlog forward so `flash runs log -f` doesn't drop it mid-save until the next
         # metrics-bearing heartbeat lands.

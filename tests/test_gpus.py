@@ -26,7 +26,7 @@ def test_providers_for():
     from flash.providers.core.base import GPU_CLASSES, providers_for
 
     for gpu in GPU_CLASSES:
-        expected = ("modal", "spot") if gpu.name in {"H100", "H200", "B200"} else ("modal",)
+        expected = ("modal", "spot") if gpu.name in {"H100", "H200"} else ("modal",)
         assert providers_for(gpu.name) == expected
 
 

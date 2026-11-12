@@ -30,8 +30,10 @@ def cmd_gpus(args) -> int:
         "Tip: GPU allocation is automatic by default.\n"
         "The allocator picks the cheapest validated class that fits. Pin a specific class by "
         'adding type = "<CLASS>" to the [gpu] section.\n'
-        "Set spot = true for Mithril only. Spot rates are entry estimates; jobs start strictly below them.\n"
-        "Spot priority: H100, H200, B200. Keep-running caps: $1.50, $2.00, $5.00 per GPU-hour."
+        "Set spot = true for Mithril only. Spot rates are fixed estimates and charges.\n"
+        "Spot classes: H100, H200 (priority order). One cap each, $2.01 and $2.51 per GPU-hour: "
+        "jobs start below it and keep running through it. A spot run takes whichever fitting "
+        "class comes up first."
     )
     if render.styled():
         rows = [(info.name, info.vram_gb, modal_rates.get(info.name)) for info in infos]
