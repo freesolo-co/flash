@@ -219,7 +219,30 @@ def test_spot_run_bills_spot_rate(tmp_path, monkeypatch):
         notes={"training_timing": {"billable_train_s": 36000.0}},
     )
     charge = costs._status_estimated_charge(_status(spec), spec, fallback=999.0)
-    assert charge == pytest.approx(10 * 1.0)
+    assert charge == pytest.approx(10 * 2.00)  # fixed Spot H100 rate
+
+
+def test_spot_run_resumed_on_another_class_bills_usage_weighted_rates(tmp_path, monkeypatch):
+    spec = spot_spec("H100")
+    _metrics(
+        tmp_path,
+        monkeypatch,
+        spec,
+        step=20,
+        allocated_provider="spot",
+        allocated_gpu="H100",
+        allocated_gpu_count=1,
+        notes={"training_timing": {"billable_train_s": 1800.0}},
+    )
+    # half the steps ran on H100 ($2.00), half on H200 ($2.50) after a preemption.
+    hb = {
+        "attempt": 1,
+        "billable_train_s_prior": 1800.0,
+        "spot_usage_by_gpu": {"H100": 10, "H200": 10},
+        "training_timing": {},
+    }
+    charge = costs._status_estimated_charge(_status(spec, heartbeat=hb), spec, fallback=999.0)
+    assert charge == pytest.approx(1.0 * 2.25)
 
 
 def test_cancel_bills_heartbeat_meter_with_pre_teardown_handle(tmp_path, monkeypatch):

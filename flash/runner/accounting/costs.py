@@ -377,19 +377,49 @@ def metered_charge_usd(status: RunStatus, spec, *, rented_remote: dict | None = 
     remote = rented_remote if isinstance(rented_remote, dict) else getattr(status, "remote", None)
     if isinstance(remote, dict):
         merged.update({key: value for key, value in remote.items() if value is not None})
-    provider, gpu_type, gpu_count = _rented_basis(merged)
+    spot = False
     try:
         from flash.core.checkpoint_policy import is_spot_spec
 
-        if is_spot_spec(spec):
-            provider = "spot"
+        spot = bool(is_spot_spec(spec))
     except Exception:
         pass
+    if spot and isinstance(merged.get("gpu"), str) and merged["gpu"]:
+        # a Spot run may launch on a different (interchangeable) class than it was allocated.
+        merged["allocated_gpu"] = merged["gpu"]
+    provider, gpu_type, gpu_count = _rented_basis(merged)
     gpu_spec = getattr(spec, "gpu", None)
     gpu_type = gpu_type or str(getattr(gpu_spec, "type", "") or "")
     gpu_count = gpu_count or max(1, int(getattr(gpu_spec, "count", 1) or 1))
-    rate = _gpu_rate(gpu_type, provider)
+    if spot:
+        rate = _spot_metered_rate(status, gpu_type)
+    else:
+        rate = _gpu_rate(gpu_type, provider)
     return seconds / 3600.0 * rate * gpu_count
+
+
+def _spot_metered_rate(status: RunStatus, gpu_type: str) -> float:
+    """Per-GPU Spot rate for metered time: the fixed class rates, weighted by usage per class.
+
+    A Spot run can resume on a different class after a preemption; ``spot_usage`` credits each
+    stretch to the class it ran on, so the metered seconds are priced at that usage-weighted rate.
+    Without recorded usage, the rented class's fixed rate applies; with no class at all, the quote
+    rate (the costliest class) is the upper bound.
+    """
+    from flash.providers.mithril.pricing import SPOT_GPUS, hourly_rate, quote_rate
+    from flash.runner.accounting.spot_usage import USAGE_KEY, _amount
+
+    hb = status.last_heartbeat if isinstance(status.last_heartbeat, dict) else {}
+    usage = hb.get(USAGE_KEY)
+    if isinstance(usage, dict):
+        usage = {gpu: _amount(amount) for gpu, amount in usage.items() if gpu in SPOT_GPUS}
+        total = sum(usage.values())
+        if total > 0:
+            return sum(amount * hourly_rate(gpu) for gpu, amount in usage.items()) / total
+    try:
+        return hourly_rate(gpu_type)
+    except Exception:
+        return quote_rate()
 
 
 def _persisted_completed_work(spec) -> tuple[int | None, dict | None]:
