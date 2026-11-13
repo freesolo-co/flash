@@ -89,7 +89,7 @@ def poll(handle, spec, *, log=None, deadline_at=None):
         load_timeout_failure=BOOT_TIMEOUT_FAILURE,
         signal_interruption_is_preemption=True,
     )
-    result = poll_instance_job(
+    return poll_instance_job(
         adapter,
         log=log,
         heartbeat_reader=heartbeat_reader_for(spec, deadline_at=deadline_at),
@@ -99,28 +99,6 @@ def poll(handle, spec, *, log=None, deadline_at=None):
         load_timeout_s=BOOT_TIMEOUT_S,
         deadline_at=deadline_at,
     )
-    if result.failure == BOOT_TIMEOUT_FAILURE:
-        _cool_down_region(h.instance_id, log=log)
-    return result
-
-
-def _cool_down_region(bid_id, *, log=None):
-    """Keep every run off this bid's region for a while; its VM never booted."""
-    from flash.providers.mithril.region_health import COOLDOWN_S, mark_unbootable
-
-    try:
-        bid = api._bid(bid_id)
-        region = bid.get("region") if isinstance(bid, dict) else None
-        # Only an allocated VM that never booted indicts the region; an unfilled bid does not.
-        if region and bid.get("instances"):
-            mark_unbootable(region)
-            print(
-                f"Spot: skipping {region} for {COOLDOWN_S / 3600:g}h (its VM never booted)",
-                file=log,
-                flush=True,
-            )
-    except Exception:  # best effort: the retry still proceeds without the cooldown
-        pass
 
 
 def submit_attempt(

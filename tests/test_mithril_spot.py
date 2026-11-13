@@ -489,7 +489,7 @@ def test_mithril_boot_window_and_failure(monkeypatch):
     assert captured["failure"] == "boot_timeout"
 
 
-def test_a_vm_that_never_booted_cools_its_region_for_every_run(monkeypatch):
+def test_a_vm_that_never_booted_does_not_bench_its_region(monkeypatch):
     from flash.providers.core.base import PollResult
     from flash.providers.mithril import api as mithril_api
     from flash.providers.mithril import jobs as mithril_jobs
@@ -517,18 +517,13 @@ def test_a_vm_that_never_booted_cools_its_region_for_every_run(monkeypatch):
         }
     )
     spec = SimpleNamespace(run_id="run", phase="custom", train=SimpleNamespace(hf_repo="org/repo"))
-    # a bid that never filled says nothing about the region
-    assert mithril_jobs.poll(handle, spec, deadline_at=10_000) is timed_out
-    assert not region_health.cooling_down("af-south1-a")
-    # an allocated VM that never booted does
+    # One VM that never booted (filled or not) must not keep every run off a healthy region: the
+    # boot timeout only rebids, and no cooldown entry is written.
     bid["instances"] = ["inst_x"]
     log = io.StringIO()
     assert mithril_jobs.poll(handle, spec, log=log, deadline_at=10_000) is timed_out
-    assert "skipping af-south1-a" in log.getvalue()
-    assert region_health.cooling_down("af-south1-a")
-    assert not region_health.cooling_down("us-central2-b")
-    later = time.time() + region_health.COOLDOWN_S + 1
-    assert not region_health.cooling_down("af-south1-a", now=later)
+    assert "skipping" not in log.getvalue()
+    assert region_health._load(region_health._path()) == {}
 
 
 def test_region_cooldown_is_not_a_run_record_and_keeps_every_mark(monkeypatch, tmp_path):
@@ -539,10 +534,10 @@ def test_region_cooldown_is_not_a_run_record_and_keeps_every_mark(monkeypatch, t
     monkeypatch.setattr(
         region_health, "_path", lambda: tmp_path / ".spot-region-health" / "cooldown.json"
     )
-    region_health.mark_unbootable("af-south1-a")
-    region_health.mark_unbootable("eu-x")
-    assert region_health.cooling_down("af-south1-a")
-    assert region_health.cooling_down("eu-x")
+    region_health.mark_refused("us-central2-b", "it_a")
+    region_health.mark_refused("eu-x", "it_b")
+    assert region_health.refused("us-central2-b", "it_a")
+    assert region_health.refused("eu-x", "it_b")
     assert not list(tmp_path.glob("*.json"))  # run scanners read top-level *.json as run records
 
 
