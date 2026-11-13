@@ -447,6 +447,10 @@ flash train configs/sft.toml --background  # submit and return immediately
 >
 > - Never wrap `flash train` in `timeout`, and use `--background` when you do not want to
 >   watch.
+> - A submit that ended unconfirmed (a timeout or dropped connection before any run id was
+>   printed) is the exception: re-running the identical command within 24 h attaches to
+>   that same submission instead of creating a second run. Once a run id was printed, a
+>   rerun is a new run.
 > - After any interrupted submit, reconcile with `flash runs list` **before** re-running.
 >   The list shows only run id, state, algorithm, cost, GPU and model — not `max_examples`
 >   or `[wandb] run_name` — so identify the live duplicate by running `flash runs status`

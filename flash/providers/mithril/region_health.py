@@ -24,9 +24,10 @@ except ImportError:  # pragma: no cover - non-POSIX dev machines skip cross-proc
     fcntl = None
 
 COOLDOWN_S = 6 * 3600.0
-# A definitive bid refusal (Mithril org/region limits that /quotas does not list) cools down only
-# that auction shape, and briefly: the limit frees as soon as other bids on the shape end.
-REFUSED_COOLDOWN_S = 15 * 60.0
+# A bid Mithril definitively refused (and that reconciliation proved was never created) cools down
+# only that region's instance type, and for less time: the refusal says nothing about other shapes
+# there, and a quota or catalog change can clear it.
+REFUSED_COOLDOWN_S = 3600.0
 
 
 def _path() -> Path:
@@ -62,14 +63,35 @@ def _locked(path: Path):
                 fcntl.flock(lock, fcntl.LOCK_UN)
 
 
-def mark_unbootable(region: str, *, now: float | None = None, seconds: float = COOLDOWN_S) -> None:
+def _refused_key(region: str, instance_type: str) -> str:
+    # "/" never appears in a Mithril region name, so these keys cannot collide with a region entry.
+    return f"{region}/{instance_type}"
+
+
+def mark_unbootable(region: str, *, now: float | None = None) -> None:
     if not isinstance(region, str) or not region:
         return
+    _mark(region, COOLDOWN_S, now=now)
+
+
+def mark_refused(region: str, instance_type: str, *, now: float | None = None) -> None:
+    """Skip one region's instance type for a while after Mithril refused a bid on it."""
+    if not all(isinstance(value, str) and value for value in (region, instance_type)):
+        return
+    _mark(_refused_key(region, instance_type), REFUSED_COOLDOWN_S, now=now)
+
+
+def refused(region: str, instance_type: str, *, now: float | None = None) -> bool:
+    now = time.time() if now is None else now
+    return _load(_path()).get(_refused_key(region, instance_type), 0.0) > now
+
+
+def _mark(key: str, seconds: float, *, now: float | None = None) -> None:
     now = time.time() if now is None else now
     path = _path()
     with _locked(path):
         entries = {r: u for r, u in _load(path).items() if u > now}
-        entries[region] = max(entries.get(region, 0.0), now + seconds)
+        entries[key] = now + seconds
         fd, temporary = tempfile.mkstemp(dir=path.parent, prefix=".cooldown.")
         try:
             with os.fdopen(fd, "w") as stream:
@@ -83,14 +105,3 @@ def mark_unbootable(region: str, *, now: float | None = None, seconds: float = C
 def cooling_down(region: str, *, now: float | None = None) -> bool:
     now = time.time() if now is None else now
     return _load(_path()).get(region, 0.0) > now
-
-
-def refused_key(region: str, instance_type: str) -> str:
-    """Cooldown key for one auction shape (never a bare region, so region cooldowns are unaffected)."""
-    return f"{region}/{instance_type}"
-
-
-def mark_refused(region: str, instance_type: str, *, now: float | None = None) -> None:
-    if not region or not instance_type:
-        return
-    mark_unbootable(refused_key(region, instance_type), now=now, seconds=REFUSED_COOLDOWN_S)

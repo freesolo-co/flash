@@ -295,6 +295,15 @@ def _private_plane_lease(monkeypatch, tmp_path):
 
 
 @pytest.fixture(autouse=True)
+def _private_pending_submissions(monkeypatch, tmp_path):
+    """Each test records pending submission IDs in its own dir, never the developer's ~/.flash."""
+    from flash.client import pending_submissions
+
+    path = tmp_path / ".pending-submissions" / "pending.json"
+    monkeypatch.setattr(pending_submissions, "_path", lambda: path)
+
+
+@pytest.fixture(autouse=True)
 def _private_spot_region_cooldown(monkeypatch, tmp_path):
     """Each test sees its own (empty) Spot region cooldown, never the developer's ~/.flash."""
     from flash.providers.mithril import region_health
