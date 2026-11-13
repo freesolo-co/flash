@@ -13,6 +13,7 @@ import pytest
 from flash.providers.core.base import (
     AllocationConstraints,
     CapacityLookupError,
+    CapacityUnavailableError,
     UnreconciledCreateError,
 )
 from flash.providers.core.registry import get_provider
@@ -237,16 +238,16 @@ def test_queue_waits_for_exact_count_and_disk_without_provisioning(monkeypatch):
     assert states == ["queued", "queued", "provisioning"]
 
 
-def launch(monkeypatch, *, count=1, gpu="H200"):
+def launch(monkeypatch, *, count=1, gpu="H200", attempt=0):
     monkeypatch.setattr(
         bootstrap,
         "startup_script",
         lambda *a, owner_line, **kw: "#!/bin/bash\n" + owner_line + "\n",
     )
     return api.create(
-        name="flash-test-a0",
+        name=f"flash-test-a{attempt}",
         offer=Offer(gpu, count, "it_test", 0.8, 1500, "us-central2-b"),
-        payload=payload(),
+        payload={**payload(), "attempt": attempt},
         image_reference="worker",
         gpu=gpu,
         gpu_count=count,
@@ -290,7 +291,7 @@ def test_ambiguous_create_is_reconciled_without_a_second_post(monkeypatch, recon
     if reconcile:
         assert launch(monkeypatch) == "bid_test"
     else:
-        with pytest.raises(UnreconciledCreateError):
+        with pytest.raises(CapacityUnavailableError):
             launch(monkeypatch)
     assert posted == [1]
 
@@ -659,10 +660,10 @@ def test_reconciled_4xx_refusal_requeues_with_its_status(monkeypatch, status, qu
         (KeyError("fid"), "invalid create response"),
     ],
 )
-def test_ambiguous_create_rechecks_once_then_fails_with_its_cause(monkeypatch, error, cause):
+def test_ambiguous_create_rechecks_once_then_requeues_with_its_cause(monkeypatch, error, cause):
     # A 5xx, transport failure or unreadable response may have created the bid after the first
-    # listing. Recheck once after a bounded pause; never requeue, since the next attempt's new name
-    # would leave a late bid from this attempt running beside it until the run ends.
+    # listing. Recheck once after a bounded pause; with still no bid, requeue (seen 2026-11-13:
+    # Mithril answered 503 and placed nothing). The next attempt cancels any late bid first.
     monkeypatch.setattr(api, "CREATE_RECHECK_SECONDS", 7)
     listed, slept = [], []
     monkeypatch.setattr(api, "pages", lambda *a, **kw: listed.append(1) or [])
@@ -672,12 +673,94 @@ def test_ambiguous_create_rechecks_once_then_fails_with_its_cause(monkeypatch, e
         raise error
 
     monkeypatch.setattr(api, "call", fail)
-    with pytest.raises(UnreconciledCreateError) as raised:
+    with pytest.raises(CapacityUnavailableError) as raised:
         launch(monkeypatch)
     assert raised.value.cause == cause
+    assert "requeuing" in str(raised.value)
     assert listed == [1, 1, 1]
     assert len(slept) == 1
     assert 0 < slept[0] <= 7
+
+
+def test_late_bid_from_an_earlier_attempt_is_cancelled_before_the_next_post(monkeypatch):
+    # Attempt 0 got a 503 and requeued; Mithril placed its bid late. Attempt 1 must cancel it
+    # before bidding, or two VMs would bill for one run until the run ends.
+    late = owned_bid(fid="bid_late")
+    foreign_run = owned_bid(fid="bid_other")
+    other_labels = {**api._ownership(foreign_run), "flash-run": "other"}
+    foreign_run["launch_specification"]["startup_script"] = (
+        "#!/bin/bash\n"
+        + api._OWNER_PREFIX
+        + base64.b64encode(json.dumps(other_labels).encode()).decode()
+        + "\n"
+    )
+    events = []
+
+    def pages(path, params, **kw):
+        if "name" in params:
+            return []
+        events.append("list")
+        return [late, foreign_run]
+
+    monkeypatch.setattr(api, "pages", pages)
+    monkeypatch.setattr(api, "terminate", lambda bid_id: events.append(f"cancel {bid_id}"))
+
+    def call(method, path, **kw):
+        events.append(method)
+        return {"fid": "bid_new"}
+
+    monkeypatch.setattr(api, "call", call)
+    assert launch(monkeypatch, attempt=1) == "bid_new"
+    assert events == ["list", "cancel bid_late", "POST"]
+
+
+def test_earlier_attempt_lookup_failure_prevents_a_new_bid(monkeypatch):
+    def pages(path, params, **kw):
+        if "name" in params:
+            return []
+        raise client.MithrilApiError(status=503)
+
+    monkeypatch.setattr(api, "pages", pages)
+    monkeypatch.setattr(api, "call", lambda *a, **kw: pytest.fail("must not bid"))
+    with pytest.raises(CapacityUnavailableError) as error:
+        launch(monkeypatch, attempt=1)
+    assert error.value.cause == "earlier attempt cleanup unavailable"
+
+
+def test_unconfirmed_earlier_attempt_cancellation_prevents_a_new_bid(monkeypatch):
+    def pages(path, params, **kw):
+        return [] if "name" in params else [owned_bid(fid="bid_late")]
+
+    def stuck(bid_id):
+        raise client.MithrilApiError("Mithril bid cancellation is not confirmed")
+
+    monkeypatch.setattr(api, "pages", pages)
+    monkeypatch.setattr(api, "terminate", stuck)
+    monkeypatch.setattr(api, "call", lambda *a, **kw: pytest.fail("must not bid"))
+    with pytest.raises(CapacityUnavailableError, match="requeuing"):
+        launch(monkeypatch, attempt=1)
+
+
+def test_stopped_or_current_attempt_bids_are_not_cancelled(monkeypatch):
+    stopped = owned_bid(fid="bid_stopped", status="Terminated")
+    current = owned_bid(fid="bid_current")
+    labels = {**api._ownership(current), "flash-attempt": "1"}
+    current["launch_specification"]["startup_script"] = (
+        "#!/bin/bash\n"
+        + api._OWNER_PREFIX
+        + base64.b64encode(json.dumps(labels).encode()).decode()
+        + "\n"
+    )
+
+    def pages(path, params, **kw):
+        if path == "/instances":
+            return [{"bid": "bid_stopped", "project": "proj_test", "status": "STATUS_TERMINATED"}]
+        return [] if "name" in params else [stopped, current]
+
+    monkeypatch.setattr(api, "pages", pages)
+    monkeypatch.setattr(api, "terminate", lambda bid_id: pytest.fail(f"cancelled {bid_id}"))
+    monkeypatch.setattr(api, "call", lambda *a, **kw: {"fid": "bid_new"})
+    assert launch(monkeypatch, attempt=1) == "bid_new"
 
 
 def test_ambiguous_create_adopts_a_bid_that_appears_on_recheck(monkeypatch):
@@ -853,25 +936,137 @@ def test_a_failed_scope_lookup_is_retryable_not_a_mismatch(monkeypatch):
         handles.require_scope(handle)
 
 
-def test_offers_skip_a_region_cooling_down_after_a_boot_timeout(monkeypatch):
-    from flash.providers.mithril import region_health
+def test_a_refusal_keeps_mithrils_short_reason_in_its_cause(monkeypatch, tmp_path):
+    from flash.providers.core.base import CapacityUnavailableError
+    from flash.runner.lifecycle import state
 
+    monkeypatch.setattr(state, "RUNS_DIR", str(tmp_path))
+    monkeypatch.setattr(api, "pages", lambda *a, **kw: [])
+
+    def refuse(*args, **kwargs):
+        raise client.MithrilApiError(status=400, reason="Spot quota exceeded for instance type")
+
+    monkeypatch.setattr(api, "call", refuse)
+    with pytest.raises(CapacityUnavailableError) as error:
+        launch(monkeypatch)
+    assert error.value.cause == "http 400: Spot quota exceeded for instance type"
+
+
+class _Response:
+    def __init__(self, data):
+        self._data = data
+
+    def json(self):
+        if isinstance(self._data, Exception):
+            raise self._data
+        return self._data
+
+
+def test_error_reasons_are_short_and_never_echo_the_request():
+    body = {"launch_specification": {"startup_script": "#!/bin/bash\nexport TOKEN=hunter2-secret"}}
+    reason = client._safe_reason
+    assert reason(_Response({"detail": "Limit price is below the minimum"}), body=body) == (
+        "Limit price is below the minimum"
+    )
+    validation = {"detail": [{"loc": ["body", "region"], "msg": "field required"}]}
+    assert reason(_Response(validation)) == "field required"
+    # anything echoing a request value or the API key is dropped, as are raw or odd bodies
+    echoed = {"detail": "bad script #!/bin/bash\nexport TOKEN=hunter2-secret"}
+    assert reason(_Response(echoed), body=body) == ""
+    partial = {"detail": "invalid line: export TOKEN=hunter2-secret"}
+    assert reason(_Response(partial), body=body) == ""
+    # a bare secret echoed without its script syntax, e.g. a base64 payload
+    assert reason(_Response({"detail": "Invalid token: hunter2-secret"}), body=body) == ""
+    wrapped = {"startup_script": "REF=json.loads(base64.b64decode('eyJrZXkiOiAic2VjcmV0In0='))"}
+    echo = {"detail": "bad payload eyJrZXkiOiAic2VjcmV0In0="}
+    assert reason(_Response(echo), body=wrapped) == ""
+    for tail in (".", ")", '"', ","):  # punctuation glued to the echo
+        glued = {"detail": "Invalid payload eyJrZXkiOiAic2VjcmV0In0=" + tail}
+        assert reason(_Response(glued), body=wrapped) == ""
+    # plain words that also appear in the request (field names) do not drop a reason
+    words = {"detail": "Spot quota exceeded for this instance type"}
+    assert reason(_Response(words), body={"instance_type": "it_x"}) == words["detail"]
+    assert reason(_Response({"message": "key test-secret rejected"})) == ""
+    assert reason(_Response(ValueError("not json"))) == ""
+    assert reason(_Response(["unexpected"])) == ""
+    assert len(reason(_Response({"detail": "x" * 1000}))) == 200
+    # a secret crossing the length limit is caught on the whole message, not a truncated prefix
+    assert reason(_Response({"detail": "x" * 190 + "test-secret"})) == ""
+    assert reason(_Response({"detail": "x" * 190 + " TOKEN=hunter2-secret"}), body=body) == ""
+
+
+@pytest.mark.parametrize("status", [400, 403, 409, 422])
+def test_a_definitive_refusal_with_quota_left_requeues_and_cools_that_shape(
+    monkeypatch, status, tmp_path
+):
+    """A refused bid that reconciliation proved was never created must not fail the run.
+
+    Seen 2026-11-13: when an interchangeable H200 came up first for an H100 allocation, Mithril
+    refused every H200 bid (no bid existed afterwards) while quota remained, and each run failed
+    with UnreconciledCreateError instead of waiting for an offer it could take.
+    """
+    from flash.providers.core.base import CapacityUnavailableError
+    from flash.providers.mithril import capacity, region_health
+    from flash.runner.lifecycle import state
+
+    monkeypatch.setattr(state, "RUNS_DIR", str(tmp_path))
+    monkeypatch.setattr(api, "pages", lambda *a, **kw: [])
+    monkeypatch.setattr(capacity, "quota_available", lambda *a, **kw: True)
+
+    def refuse(*args, **kwargs):
+        raise client.MithrilApiError(status=status)
+
+    monkeypatch.setattr(api, "call", refuse)
+    with pytest.raises(CapacityUnavailableError) as error:
+        launch(monkeypatch)
+    assert "requeuing" in str(error.value)
+    assert region_health.refused("us-central2-b", "it_test")
+    # the refusal cools only that shape, never the whole region.
+    assert not region_health.refused("us-central2-b", "it_other")
+
+
+@pytest.mark.parametrize("status", [0, 500, 503])
+def test_unknown_create_outcomes_requeue_without_cooling_the_shape(monkeypatch, status, tmp_path):
+    from flash.providers.mithril import capacity, region_health
+    from flash.runner.lifecycle import state
+
+    monkeypatch.setattr(state, "RUNS_DIR", str(tmp_path))
+    monkeypatch.setattr(api, "pages", lambda *a, **kw: [])
+    monkeypatch.setattr(capacity, "quota_available", lambda *a, **kw: True)
+
+    def refuse(*args, **kwargs):
+        raise client.MithrilApiError(status=status)
+
+    monkeypatch.setattr(api, "call", refuse)
+    with pytest.raises(CapacityUnavailableError) as error:
+        launch(monkeypatch)
+    assert error.value.cause == (f"http {status}" if status else "transport error or timeout")
+    assert not region_health.refused("us-central2-b", "it_test")
+
+
+def test_offers_skip_a_refused_shape_but_keep_the_region(monkeypatch, tmp_path):
+    from flash.providers.mithril import region_health
+    from flash.runner.lifecycle import state
+
+    monkeypatch.setattr(state, "RUNS_DIR", str(tmp_path))
     shapes = [
         {
-            "fid": "it_test",
-            "gpu_type": "H200",
+            "fid": fid,
+            "gpu_type": gpu,
             "num_gpus": 1,
-            "gpu_memory_gb": 141,
+            "gpu_memory_gb": memory,
             "gpu_socket": "SXM5",
             "local_storage_gb": 1500,
         }
+        for fid, gpu, memory in (("it_h200", "H200", 141), ("it_h100", "H100", 80))
     ]
     auctions = [
-        {"instance_type": "it_test", "region": r, "capacity": 3, "last_instance_price": "$2.00"}
-        for r in ("af-south1-a", "us-central2-b")
+        {"instance_type": fid, "region": "us-central2-b", "capacity": 3, "last_instance_price": p}
+        for fid, p in (("it_h200", "$2.20"), ("it_h100", "$1.90"))
     ]
     monkeypatch.setattr(
         prices, "call", lambda method, path, **kw: shapes if path == "/instance-types" else auctions
     )
-    region_health.mark_unbootable("af-south1-a")
-    assert {o.region for o in prices.affordable_offers()} == {"us-central2-b"}
+    assert {o.gpu for o in prices.affordable_offers()} == {"H100", "H200"}
+    region_health.mark_refused("us-central2-b", "it_h200")
+    assert {o.gpu for o in prices.affordable_offers()} == {"H100"}

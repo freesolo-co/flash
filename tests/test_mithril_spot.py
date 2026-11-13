@@ -489,7 +489,7 @@ def test_mithril_boot_window_and_failure(monkeypatch):
     assert captured["failure"] == "boot_timeout"
 
 
-def test_a_vm_that_never_booted_cools_its_region_for_every_run(monkeypatch):
+def test_a_vm_that_never_booted_does_not_bench_its_region(monkeypatch):
     from flash.providers.core.base import PollResult
     from flash.providers.mithril import api as mithril_api
     from flash.providers.mithril import jobs as mithril_jobs
@@ -517,18 +517,13 @@ def test_a_vm_that_never_booted_cools_its_region_for_every_run(monkeypatch):
         }
     )
     spec = SimpleNamespace(run_id="run", phase="custom", train=SimpleNamespace(hf_repo="org/repo"))
-    # a bid that never filled says nothing about the region
-    assert mithril_jobs.poll(handle, spec, deadline_at=10_000) is timed_out
-    assert not region_health.cooling_down("af-south1-a")
-    # an allocated VM that never booted does
+    # One VM that never booted (filled or not) must not keep every run off a healthy region: the
+    # boot timeout only rebids, and no cooldown entry is written.
     bid["instances"] = ["inst_x"]
     log = io.StringIO()
     assert mithril_jobs.poll(handle, spec, log=log, deadline_at=10_000) is timed_out
-    assert "skipping af-south1-a" in log.getvalue()
-    assert region_health.cooling_down("af-south1-a")
-    assert not region_health.cooling_down("us-central2-b")
-    later = time.time() + region_health.COOLDOWN_S + 1
-    assert not region_health.cooling_down("af-south1-a", now=later)
+    assert "skipping" not in log.getvalue()
+    assert region_health._load(region_health._path()) == {}
 
 
 def test_region_cooldown_is_not_a_run_record_and_keeps_every_mark(monkeypatch, tmp_path):
@@ -539,11 +534,106 @@ def test_region_cooldown_is_not_a_run_record_and_keeps_every_mark(monkeypatch, t
     monkeypatch.setattr(
         region_health, "_path", lambda: tmp_path / ".spot-region-health" / "cooldown.json"
     )
-    region_health.mark_unbootable("af-south1-a")
-    region_health.mark_unbootable("eu-x")
-    assert region_health.cooling_down("af-south1-a")
-    assert region_health.cooling_down("eu-x")
+    region_health.mark_refused("us-central2-b", "it_a")
+    region_health.mark_refused("eu-x", "it_b")
+    assert region_health.refused("us-central2-b", "it_a")
+    assert region_health.refused("eu-x", "it_b")
     assert not list(tmp_path.glob("*.json"))  # run scanners read top-level *.json as run records
+
+
+def test_spot_allocation_prefers_cheaper_1x_h200_over_8x_h100():
+    """Regression: a >80 GB plan took 8x H100 ($16/hr, never under cap) over a fitting 1x H200."""
+    from flash.providers.core.allocator import _cheapest_allocation
+    from flash.providers.core.base import Candidate
+
+    allocation = _cheapest_allocation(
+        [Candidate("spot", "H100", 2.0, 80, 8), Candidate("spot", "H200", 2.5, 141, 1)],
+        need=85,
+        cost_per_step=None,
+        provider_rank={},
+    )
+    assert (allocation.gpu, allocation.gpu_count) == ("H200", 1)
+
+
+def test_spot_allocation_prefers_cheaper_1x_h100_over_1x_h200():
+    from flash.providers.core.allocator import _cheapest_allocation
+    from flash.providers.core.base import Candidate
+
+    allocation = _cheapest_allocation(
+        [Candidate("spot", "H200", 2.5, 141, 1), Candidate("spot", "H100", 2.0, 80, 1)],
+        need=40,
+        cost_per_step=None,
+        provider_rank={},
+    )
+    assert (allocation.gpu, allocation.gpu_count) == ("H100", 1)
+
+
+def test_spot_quote_prefers_one_h200_over_eight_h100s(monkeypatch):
+    from flash.cost import RunConfig, analytical
+
+    monkeypatch.setattr(analytical, "required_vram_gb", lambda *a, **k: 85)
+    gpu, _need, count, provider, _hourly = analytical._offline_gpu_shape(
+        RunConfig("Qwen/Qwen3.5-9B", "grpo", 10, provider="spot")
+    )
+    assert (provider, gpu, count) == ("spot", "H200", 1)
+
+
+def test_spot_quote_names_spot_as_unsupported_when_no_shape_fits(monkeypatch):
+    from flash.cost import RunConfig, analytical
+
+    monkeypatch.setattr(analytical, "required_vram_gb", lambda *a, **k: 5000)
+    with pytest.raises(
+        ValueError, match=r"Spot is not supported for Qwen/Qwen3.5-9B with algorithm 'grpo'"
+    ):
+        analytical._offline_gpu_shape(RunConfig("Qwen/Qwen3.5-9B", "grpo", 10, provider="spot"))
+
+
+def test_spot_shape_price_is_class_rate_times_cards():
+    from decimal import Decimal
+
+    from flash.providers.mithril.pricing import shape_price
+
+    assert shape_price("H100", 1) == Decimal("2.00")
+    assert shape_price("H200", 1) == Decimal("2.50")
+    assert shape_price("H100", 8) == Decimal("16.00")
+    assert shape_price("H200", 8) == Decimal("20.00")
+
+
+def test_spot_quote_keeps_ceiling_error_when_a_wider_spot_shape_fits(monkeypatch):
+    """Review: a 1-card ceiling on a run 8 cards could hold is a ceiling problem, not unsupported."""
+    from flash.cost import RunConfig, analytical
+
+    monkeypatch.setattr(analytical, "required_vram_gb", lambda *a, **k: 200)
+    with pytest.raises(ValueError, match=r"Raise the card ceiling") as error:
+        analytical._offline_gpu_shape(
+            RunConfig("Qwen/Qwen3.5-9B", "grpo", 10, provider="spot", gpu_count=1)
+        )
+    assert "Spot is not supported" not in str(error.value)
+
+
+def _spot_only_allocate(monkeypatch, need, **kwargs):
+    from flash.providers.core import allocator
+
+    monkeypatch.setattr(allocator, "required_vram_gb", lambda *a, **k: need)
+    monkeypatch.setattr(allocator, "available_providers", lambda: ("spot",))
+    return allocator.allocate("Qwen/Qwen3.5-9B", "grpo", provider="spot", **kwargs)
+
+
+def test_spot_allocate_names_spot_as_unsupported_when_no_shape_fits(monkeypatch):
+    """Review: the public allocate() path must reach the Spot diagnostic, not the generic one."""
+    from flash.providers.core.base import UnsupportedGpuError
+
+    with pytest.raises(
+        UnsupportedGpuError,
+        match=r"Spot is not supported for Qwen/Qwen3.5-9B with algorithm 'grpo'.*5000 GB.*8x H200",
+    ):
+        _spot_only_allocate(monkeypatch, 5000)
+
+
+def test_spot_allocate_keeps_ceiling_error_when_a_wider_spot_shape_fits(monkeypatch):
+    with pytest.raises(ValueError, match=r"Raise the card ceiling") as error:
+        _spot_only_allocate(monkeypatch, 200, max_gpu_count=1)
+    assert "Spot is not supported" not in str(error.value)
 
 
 def _launch_with_poll(monkeypatch, poll, on_handle):

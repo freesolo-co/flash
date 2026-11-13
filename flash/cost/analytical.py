@@ -633,10 +633,13 @@ def _offline_gpu_shape(config: RunConfig) -> tuple[str, int, int, str, float]:
                 config, gpu, count, "" if provider == "auto" else provider
             )
             from flash.providers.mithril.pricing import priority as spot_priority
+            from flash.providers.mithril.pricing import shape_price as spot_shape_price
 
             ranked.append(
                 (
                     (
+                        # same order as the allocator: Spot takes the cheapest rental, then class.
+                        spot_shape_price(gpu, count) if provider == "spot" else 0,
                         spot_priority(gpu) if provider == "spot" else 0,
                         hourly * count * step_seconds,
                     ),
@@ -661,6 +664,19 @@ def _offline_gpu_shape(config: RunConfig) -> tuple[str, int, int, str, float]:
     return gpu, need, count, provider, hourly
 
 
+def _spot_can_hold(config: RunConfig, need: float) -> bool:
+    """Whether any Spot shape, at any card count it rents, holds the run on its launched ranks."""
+    from flash.providers.core.base import GPU_INFO
+    from flash.providers.core.sharding import combined_vram_gb
+    from flash.providers.mithril.pricing import SPOT_GPUS
+
+    return any(
+        combined_vram_gb(GPU_INFO[gpu].vram_gb, executed_gpu_count(config, count)) >= need
+        for gpu, shape in SPOT_GPUS.items()
+        for count in shape.counts
+    )
+
+
 def _raise_no_fitting_shape(
     config: RunConfig,
     need: float,
@@ -680,6 +696,11 @@ def _raise_no_fitting_shape(
     # use. `_wider_shape_remedy` searches only `names`, already narrowed to the pin, so the
     # `--gpus N` clause it appends can never name a shape the pin forbids. an unpinned run
     # falls through to the pool-wide message, which reports the count that would fit.
+    if provider == "spot" and not config.gpu_type and not _spot_can_hold(config, need):
+        # a restrictive card ceiling keeps the ceiling-aware message below instead.
+        from flash.providers.mithril.pricing import spot_unsupported_message
+
+        raise ValueError(spot_unsupported_message(config.model_id, config.method, need))
     remedy = _wider_shape_remedy(config, need, names)
     if config.gpu_type:
         # name every acceptable class, not just the head: with fallbacks authored, reporting the
