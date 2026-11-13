@@ -16,9 +16,11 @@ from flash.providers.mithril.pricing import accepts_price
     [
         ("H100", "0.79", True),
         ("H100", "2.00", True),
-        ("H100", "2.01", False),
+        ("H100", "2.10", True),
+        ("H100", "2.11", False),
         ("H200", "2.50", True),
-        ("H200", "2.51", False),
+        ("H200", "2.60", True),
+        ("H200", "2.61", False),
         ("L40S", "1.00", False),
         ("H100", "NaN", False),
         ("H100", "Infinity", False),
@@ -388,7 +390,7 @@ def test_entry_and_running_caps_do_not_change_fixed_customer_rates():
 
     assert list(SPOT_GPUS) == ["H100", "H200"]  # Mithril offers only these
     assert [hourly_rate(gpu) for gpu in SPOT_GPUS] == [2.0, 2.5]
-    assert [str(shape.keep_running_usd) for shape in SPOT_GPUS.values()] == ["2.01", "2.51"]
+    assert [str(shape.keep_running_usd) for shape in SPOT_GPUS.values()] == ["2.11", "2.61"]
     assert not any(hasattr(shape, "entry_below_usd") for shape in SPOT_GPUS.values())
 
 

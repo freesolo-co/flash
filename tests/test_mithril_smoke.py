@@ -20,7 +20,7 @@ def smoke(monkeypatch):
     return module
 
 
-@pytest.mark.parametrize("cap", ["2.52", "NaN", "Infinity", "0", "-1"])
+@pytest.mark.parametrize("cap", ["2.62", "NaN", "Infinity", "0", "-1"])
 def test_paid_entry_override_cannot_raise_hold_cap_or_touch_storage(smoke, monkeypatch, cap):
     monkeypatch.setattr(smoke, "ArtifactStore", lambda: pytest.fail("must validate before storage"))
     with pytest.raises(ValueError, match="hold cap"):

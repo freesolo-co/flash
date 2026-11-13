@@ -63,7 +63,7 @@ def owned_bid(**changes):
         "instances": ["inst_test"],
         "instance_type": "it_test",
         "instance_quantity": 1,
-        "limit_price": "$2.51",
+        "limit_price": "$2.61",
         "launch_specification": {"startup_script": "#!/bin/bash\n" + owner + "\n"},
         **changes,
     }
@@ -192,7 +192,7 @@ def test_allocation_offers_fitting_catalog_shapes_at_the_quote_rate(monkeypatch)
 @pytest.mark.parametrize(
     "change",
     [
-        {"price": "$20.08"},
+        {"price": "$20.88"},
         {"price": "$21.00"},
         {"capacity": 0},
         {"region": ""},
@@ -258,7 +258,7 @@ def launch(monkeypatch, *, count=1, gpu="H200", attempt=0):
 
 
 @pytest.mark.parametrize("count", [1, 8])
-@pytest.mark.parametrize(("gpu", "cap"), [("H100", 2.01), ("H200", 2.51)])
+@pytest.mark.parametrize(("gpu", "cap"), [("H100", 2.11), ("H200", 2.61)])
 def test_create_bids_for_one_instance_at_per_instance_hold_cap(monkeypatch, count, gpu, cap):
     monkeypatch.setattr(api, "pages", lambda *a, **kw: [])
     captured = []
