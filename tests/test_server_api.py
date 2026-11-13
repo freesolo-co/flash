@@ -1947,6 +1947,34 @@ def test_logs_offset_paging(api):
     assert page2["logs"] == "line two\n"
 
 
+def test_logs_include_the_rotated_log(api):
+    # Host logrotate copy-truncates run logs: earlier lines move to .log.1 and .log restarts empty.
+    key = _new_user_token()
+    run_id = api.post(
+        "/v1/runs", json={"spec": SPEC, "dry_run": True}, headers=_bearer(key)
+    ).json()["run_id"]
+    log_path = os.path.join(runner_state.RUNS_DIR, f"{run_id}.log")
+    page = api.get(f"/v1/runs/{run_id}/logs", headers=_bearer(key)).json()
+    assert "rotated_logs" not in page  # nothing rotated yet
+    with open(log_path + ".1", "w") as f:
+        f.write("retry\n")
+    with open(log_path, "w") as f:
+        f.write("retry\nfailure\n")  # new output may repeat rotated lines; none is dropped
+    page = api.get(f"/v1/runs/{run_id}/logs", headers=_bearer(key)).json()
+    assert page["rotated_logs"] == "retry\n"
+    assert page["logs"] == "retry\nfailure\n"
+    assert page["offset"] == len("retry\nfailure\n")  # offsets address only the current log
+    with open(log_path, "a") as f:
+        f.write("done\n")
+    page2 = api.get(f"/v1/runs/{run_id}/logs?offset={page['offset']}", headers=_bearer(key)).json()
+    assert page2["logs"] == "done\n"
+    assert "rotated_logs" not in page2  # followers page the current log only
+    os.remove(log_path)  # rotated, current log not yet recreated
+    page3 = api.get(f"/v1/runs/{run_id}/logs", headers=_bearer(key)).json()
+    assert page3["logs"] == ""
+    assert page3["rotated_logs"] == "retry\n"
+
+
 def test_worker_output_route(api, monkeypatch):
     # /worker surfaces the train-subprocess stdout/traceback from the run's artifact namespace (operator
     # token, server-side). Best-effort: no artifacts -> empty dict; present -> passed through.
