@@ -63,7 +63,7 @@ def owned_bid(**changes):
         "instances": ["inst_test"],
         "instance_type": "it_test",
         "instance_quantity": 1,
-        "limit_price": "$2.61",
+        "limit_price": "$2.60",
         "launch_specification": {"startup_script": "#!/bin/bash\n" + owner + "\n"},
         **changes,
     }
@@ -180,10 +180,10 @@ def test_allocation_offers_fitting_catalog_shapes_at_the_quote_rate(monkeypatch)
     monkeypatch.setattr(prices, "affordable_offers", lambda **kw: pytest.fail("no live prices"))
     candidates = get_provider("spot").live_candidates(80, AllocationConstraints(max_gpu_count=8))
     assert [(c.gpu, c.gpu_count, c.hourly_usd) for c in candidates] == [
-        ("H100", 1, 2.5),
-        ("H100", 8, 2.5),
-        ("H200", 1, 2.5),
-        ("H200", 8, 2.5),
+        ("H100", 1, 2.6),
+        ("H100", 8, 2.6),
+        ("H200", 1, 2.6),
+        ("H200", 8, 2.6),
     ]
     one = get_provider("spot").live_candidates(100, AllocationConstraints(max_gpu_count=1))
     assert [(c.gpu, c.gpu_count) for c in one] == [("H200", 1)]  # 100 GB only fits an H200
@@ -258,7 +258,7 @@ def launch(monkeypatch, *, count=1, gpu="H200", attempt=0):
 
 
 @pytest.mark.parametrize("count", [1, 8])
-@pytest.mark.parametrize(("gpu", "cap"), [("H100", 2.11), ("H200", 2.61)])
+@pytest.mark.parametrize(("gpu", "cap"), [("H100", 2.10), ("H200", 2.60)])
 def test_create_bids_for_one_instance_at_per_instance_hold_cap(monkeypatch, count, gpu, cap):
     monkeypatch.setattr(api, "pages", lambda *a, **kw: [])
     captured = []

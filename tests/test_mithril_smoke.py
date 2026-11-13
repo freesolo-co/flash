@@ -20,7 +20,7 @@ def smoke(monkeypatch):
     return module
 
 
-@pytest.mark.parametrize("cap", ["2.62", "NaN", "Infinity", "0", "-1"])
+@pytest.mark.parametrize("cap", ["2.61", "NaN", "Infinity", "0", "-1"])
 def test_paid_entry_override_cannot_raise_hold_cap_or_touch_storage(smoke, monkeypatch, cap):
     monkeypatch.setattr(smoke, "ArtifactStore", lambda: pytest.fail("must validate before storage"))
     with pytest.raises(ValueError, match="hold cap"):
@@ -82,7 +82,7 @@ def test_paid_override_changes_admission_without_changing_billing_or_hold(smoke,
 
     def stop_before_storage():
         assert pricing.SPOT_GPUS["H200"].keep_running_usd == Decimal("2.00")
-        assert pricing.hourly_rate("H200") == 2.5
+        assert pricing.hourly_rate("H200") == 2.6
         assert pricing.running_limit("H200") == 2.00
         raise RuntimeError("stop before paid resources")
 

@@ -1,9 +1,9 @@
-"""Fixed Spot rates and one price cap per GPU class, in USD per GPU-hour.
+"""One fixed Spot rate per GPU class, in USD per GPU-hour, which is also the price cap.
 
 These are user-selected thresholds, not current market prices or capacity guarantees.
-Each class has a single cap: a rental starts only while the live price is below it, and the
-Mithril bid's limit price keeps a running VM up to the same cap. ``hourly_usd`` is the fixed
-rate Flash estimates and charges. GPU priority follows insertion order: H100, H200.
+``hourly_usd`` is what Flash estimates and charges, and the cap: a rental starts only while the
+live price is at or below it, and the Mithril bid's limit price keeps a running VM up to it.
+GPU priority follows insertion order: H100, H200.
 """
 
 from dataclasses import dataclass
@@ -14,14 +14,21 @@ from flash.providers.core.base import canonical_gpu
 
 @dataclass(frozen=True)
 class SpotGpu:
+    # the charged rate, and by default the one cap: start at or below it, keep running up to it
     hourly_usd: Decimal
-    keep_running_usd: Decimal  # the one cap: start below it, keep running through it
     counts: tuple[int, ...] = (1, 8)
+    # only a paid smoke test lowers this below the rate (scripts/smoke_mithril_sft.py); production
+    # classes leave it unset, so the cap is the rate
+    keep_running_usd: Decimal | None = None
+
+    def __post_init__(self) -> None:
+        if self.keep_running_usd is None:
+            object.__setattr__(self, "keep_running_usd", self.hourly_usd)
 
 
 SPOT_GPUS = {
-    "H100": SpotGpu(Decimal("2.00"), Decimal("2.11")),
-    "H200": SpotGpu(Decimal("2.50"), Decimal("2.61")),
+    "H100": SpotGpu(Decimal("2.10")),
+    "H200": SpotGpu(Decimal("2.60")),
 }
 
 
@@ -37,7 +44,7 @@ def accepts_price(gpu: str, value, *, currency: str, unit: str) -> bool:
         return False  # not a Spot class
     try:
         price = Decimal(str(value))
-        return price.is_finite() and 0 < price < shape.keep_running_usd
+        return price.is_finite() and 0 < price <= shape.keep_running_usd
     except (ValueError, ArithmeticError):
         return False
 

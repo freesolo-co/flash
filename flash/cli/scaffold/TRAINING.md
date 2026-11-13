@@ -414,11 +414,10 @@ Select Spot directly in your editable training TOML:
 spot = false # set true for Mithril Spot; false uses regular training
 ```
 
-Spot only uses Mithril, which offers H100 and H200. Each has one cap per GPU-hour, $2.11
-for H100 and $2.61 for H200: a run starts below it and keeps running through it. A queued run
-waits for every class that fits its plan (an H100 run also takes an H200) and launches on
-whichever comes up first. Spot is charged at a fixed $2.00 (H100) or $2.50 (H200) per
-GPU-hour.
+Spot only uses Mithril, which offers H100 and H200. Each has one rate per GPU-hour, $2.10
+for H100 and $2.60 for H200, which is both what Spot charges and the cap: a run starts while
+the live price is at or below it and keeps running up to it. A queued run waits for every class
+that fits its plan (an H100 run also takes an H200) and launches on whichever comes up first.
 
 GPU allocation and Azure artifacts are **managed**: the allocator picks the cheapest fitting
 shape (class, card count, and provider), and `train.hf_repo` remains platform-managed. GPU
