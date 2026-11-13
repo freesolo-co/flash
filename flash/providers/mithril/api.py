@@ -273,6 +273,8 @@ def create(*, name, offer, payload, image_reference, gpu, gpu_count, capsule, di
         status = error.status if isinstance(error, MithrilApiError) else 0
         if status:
             cause = f"http {status}"
+            if getattr(error, "reason", ""):
+                cause += f": {error.reason}"
         elif isinstance(error, MithrilApiError):
             cause = "transport error or timeout"
         else:
