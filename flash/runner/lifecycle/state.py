@@ -146,6 +146,10 @@ class RunStatus:
     submitted_instance_providers: list[str] | None = None
     submitted_modal_scope: str | None = None
     submitted_spot_scope: str | None = None
+    # Spot per-class rates (USD per GPU-hour) in force when this run was quoted. Settlement reprices
+    # the accepted quote with these, never with rates that changed after submission. None for
+    # non-Spot runs and for runs submitted before this was recorded (they settle on the legacy table).
+    submitted_spot_rates: dict[str, float] | None = None
     # Stamped ONCE on first terminal transition; survives later updated_at bumps from deployment updates.
     finished_at: float | None = None
     billing_context: dict | None = None

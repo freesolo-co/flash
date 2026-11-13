@@ -247,6 +247,16 @@ def _persist_effective_worker_spec(worker_spec: JobSpec) -> bool:
     )
 
 
+def _spot_tariff(spec: JobSpec) -> dict[str, float] | None:
+    """Spot rates this run is quoted under, recorded so settlement never uses later rates."""
+    gpu = getattr(spec, "gpu", None)
+    if not getattr(gpu, "spot", False):
+        return None
+    from flash.providers.mithril.pricing import tariff
+
+    return tariff()
+
+
 def submit_job(
     spec: JobSpec,
     dry_run: bool = False,
@@ -353,6 +363,7 @@ def _submit_prepared_job(
             spot_scope_fingerprint() if "spot" in available_providers() else None
         ),
         submitted_instance_providers=[n for n in available_providers() if n in INSTANCE_PROVIDERS],
+        submitted_spot_rates=_spot_tariff(public_spec),
     )
     save_kwargs = {
         "_run_deadline_at": status.created_at + float(public_spec.gpu.max_wall_seconds),
