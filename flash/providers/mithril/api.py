@@ -245,14 +245,23 @@ def create(*, name, offer, payload, image_reference, gpu, gpu_count, capsule, di
             raise CapacityUnavailableError("Mithril request throttled; requeuing") from None
         if isinstance(error, MithrilApiError) and error.status in {400, 403, 409, 422}:
             from flash.providers.mithril.capacity import quota_available
+            from flash.providers.mithril.region_health import mark_refused
 
-            # A definitive refusal plus exhausted quota is safe to requeue only
-            # after reconciliation found no bid. Never retry unknown POST outcomes.
+            # A definitive refusal is a known outcome once reconciliation found no bid: nothing
+            # was created, so requeueing cannot duplicate an allocation. Cool down this exact
+            # region/instance type so the requeue waits for an offer Mithril will accept (often
+            # another interchangeable class) instead of rebidding the refused one. Unknown POST
+            # outcomes (5xx, transport errors, malformed responses) still fail closed below.
             with contextlib.suppress(MithrilApiError):
                 if not quota_available(offer.instance_type, deadline_at=deadline_at):
                     raise CapacityUnavailableError(
                         "Mithril Spot quota exhausted; requeuing"
                     ) from None
+            mark_refused(offer.region, offer.instance_type)
+            raise CapacityUnavailableError(
+                f"Mithril refused the {gpu} bid in {offer.region} ({error}); "
+                "skipping that shape there for an hour and requeuing"
+            ) from None
         raise UnreconciledCreateError(
-            "Mithril launch could not be reconciled; refusing duplicate allocation"
+            f"Mithril launch could not be reconciled ({error}); refusing duplicate allocation"
         ) from None
