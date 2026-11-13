@@ -110,7 +110,8 @@ def _cool_down_region(bid_id, *, log=None):
     try:
         bid = api._bid(bid_id)
         region = bid.get("region") if isinstance(bid, dict) else None
-        if region:
+        # Only an allocated VM that never booted indicts the region; an unfilled bid does not.
+        if region and bid.get("instances"):
             mark_unbootable(region)
             print(
                 f"Spot: skipping {region} for {COOLDOWN_S / 3600:g}h (its VM never booted)",

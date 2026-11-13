@@ -498,9 +498,8 @@ def test_a_vm_that_never_booted_cools_its_region_for_every_run(monkeypatch):
     timed_out = PollResult(False, failure="boot_timeout", detail="remained starting")
     monkeypatch.setattr(mithril_jobs, "poll_instance_job", lambda adapter, **kw: timed_out)
     monkeypatch.setattr(mithril_jobs, "require_scope", lambda _: None)
-    monkeypatch.setattr(
-        mithril_api, "_bid", lambda bid_id: {"fid": bid_id, "region": "af-south1-a"}
-    )
+    bid = {"fid": "bid_test", "region": "af-south1-a", "instances": []}
+    monkeypatch.setattr(mithril_api, "_bid", lambda bid_id: bid)
     handle = SimpleNamespace(
         to_dict=lambda: {
             "provider": "spot",
@@ -518,6 +517,11 @@ def test_a_vm_that_never_booted_cools_its_region_for_every_run(monkeypatch):
         }
     )
     spec = SimpleNamespace(run_id="run", phase="custom", train=SimpleNamespace(hf_repo="org/repo"))
+    # a bid that never filled says nothing about the region
+    assert mithril_jobs.poll(handle, spec, deadline_at=10_000) is timed_out
+    assert not region_health.cooling_down("af-south1-a")
+    # an allocated VM that never booted does
+    bid["instances"] = ["inst_x"]
     log = io.StringIO()
     assert mithril_jobs.poll(handle, spec, log=log, deadline_at=10_000) is timed_out
     assert "skipping af-south1-a" in log.getvalue()
@@ -525,3 +529,18 @@ def test_a_vm_that_never_booted_cools_its_region_for_every_run(monkeypatch):
     assert not region_health.cooling_down("us-central2-b")
     later = time.time() + region_health.COOLDOWN_S + 1
     assert not region_health.cooling_down("af-south1-a", now=later)
+
+
+def test_region_cooldown_is_not_a_run_record_and_keeps_every_mark(monkeypatch, tmp_path):
+    from flash.providers.mithril import region_health
+    from flash.runner.lifecycle import state
+
+    monkeypatch.setattr(state, "RUNS_DIR", str(tmp_path))
+    monkeypatch.setattr(
+        region_health, "_path", lambda: tmp_path / ".spot-region-health" / "cooldown.json"
+    )
+    region_health.mark_unbootable("af-south1-a")
+    region_health.mark_unbootable("eu-x")
+    assert region_health.cooling_down("af-south1-a")
+    assert region_health.cooling_down("eu-x")
+    assert not list(tmp_path.glob("*.json"))  # run scanners read top-level *.json as run records

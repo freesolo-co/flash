@@ -299,7 +299,7 @@ def _private_spot_region_cooldown(monkeypatch, tmp_path):
     """Each test sees its own (empty) Spot region cooldown, never the developer's ~/.flash."""
     from flash.providers.mithril import region_health
 
-    path = tmp_path / ".spot-region-cooldown.json"
+    path = tmp_path / ".spot-region-health" / "cooldown.json"
     monkeypatch.setattr(region_health, "_path", lambda: path)
 
 
