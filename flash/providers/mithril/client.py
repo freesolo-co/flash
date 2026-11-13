@@ -1,7 +1,5 @@
 """Bounded Compute API requests; never log response bodies or worker credentials."""
 
-import json
-import re
 import time
 
 from flash.providers.mithril.config import settings
@@ -19,16 +17,27 @@ class MithrilApiError(RuntimeError):
 
 _REASON_KEYS = ("detail", "message", "error", "title")
 _REASON_LIMIT = 200
-# Tokens that could be (part of) a credential: 8+ characters with a digit or symbol.
-_TOKEN = re.compile(r"[\w+/=.-]{8,}")
+# Any space-free run this long that also occurs in a request value counts as an echo.
+_ECHO_WINDOW = 10
+
+
+def _values(value):
+    if isinstance(value, str):
+        yield value
+    elif isinstance(value, dict):
+        for item in value.values():
+            yield from _values(item)
+    elif isinstance(value, (list, tuple)):
+        for item in value:
+            yield from _values(item)
 
 
 def _safe_reason(response, *, body=None, params=None) -> str:
     """Mithril's short error message, or "" when it might echo request data.
 
     Only a top-level message field (or a validation list's ``msg`` entries) is read, never the raw
-    body. It is dropped if it contains the API key or any non-alphabetic 8+ character token that also
-    appears anywhere in the request (startup scripts carry worker credentials), then bounded.
+    body. It is dropped if any space-free 10-character run of it occurs in the API key or a request
+    value (startup scripts carry worker credentials), whatever punctuation surrounds it; then bounded.
     """
     try:
         data = response.json()
@@ -50,13 +59,14 @@ def _safe_reason(response, *, body=None, params=None) -> str:
             )
             break
     reason = " ".join(reason.split())
-    request = json.dumps([body, params], default=str)
-    key = settings()["api_key"]
-    if not reason or (key and key in reason):
+    if not reason:
         return ""
+    request = "\n".join([settings()["api_key"], *_values([body, params])])
     # Checked on the whole message before bounding it, so a secret crossing the limit is caught.
-    if any(not t.isalpha() and t in request for t in _TOKEN.findall(reason)):
-        return ""
+    for start in range(len(reason) - _ECHO_WINDOW + 1):
+        window = reason[start : start + _ECHO_WINDOW]
+        if " " not in window and window in request:
+            return ""
     return reason[:_REASON_LIMIT]
 
 

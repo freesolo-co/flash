@@ -980,6 +980,9 @@ def test_error_reasons_are_short_and_never_echo_the_request():
     wrapped = {"startup_script": "REF=json.loads(base64.b64decode('eyJrZXkiOiAic2VjcmV0In0='))"}
     echo = {"detail": "bad payload eyJrZXkiOiAic2VjcmV0In0="}
     assert reason(_Response(echo), body=wrapped) == ""
+    for tail in (".", ")", '"', ","):  # punctuation glued to the echo
+        glued = {"detail": "Invalid payload eyJrZXkiOiAic2VjcmV0In0=" + tail}
+        assert reason(_Response(glued), body=wrapped) == ""
     # plain words that also appear in the request (field names) do not drop a reason
     words = {"detail": "Spot quota exceeded for this instance type"}
     assert reason(_Response(words), body={"instance_type": "it_x"}) == words["detail"]
