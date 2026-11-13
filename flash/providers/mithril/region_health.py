@@ -1,9 +1,7 @@
-"""Regions whose allocated Spot VMs never booted are skipped for a while, across runs and restarts.
+"""Region instance types Mithril just refused are skipped for a while, across runs and restarts.
 
-Mithril can list capacity and accept bids in a region whose instances then stay ``STATUS_NEW``
-(af-south1-a, 2026-11-12: every VM there sat unbooted while us-central2 booted in minutes). Each such
-bid holds a project quota slot for the whole boot window, so one boot timeout cools the region down
-for every run rather than letting each run rediscover it.
+A region whose VMs never boot is excluded outright (``prices.EXCLUDED_REGIONS``); a single boot
+timeout does not bench a region, since one bad VM in a healthy region would stall every run.
 
 State lives in its own directory under ``RUNS_DIR`` (never a top-level ``*.json``, which the run
 scanners would read as a run record), guarded by an exclusive lock for read-modify-write.
@@ -23,7 +21,6 @@ try:
 except ImportError:  # pragma: no cover - non-POSIX dev machines skip cross-process locking
     fcntl = None
 
-COOLDOWN_S = 6 * 3600.0
 # A bid Mithril definitively refused (and that reconciliation proved was never created) cools down
 # only that region's instance type, and for less time: the refusal says nothing about other shapes
 # there, and a quota or catalog change can clear it.
@@ -68,12 +65,6 @@ def _refused_key(region: str, instance_type: str) -> str:
     return f"{region}/{instance_type}"
 
 
-def mark_unbootable(region: str, *, now: float | None = None) -> None:
-    if not isinstance(region, str) or not region:
-        return
-    _mark(region, COOLDOWN_S, now=now)
-
-
 def mark_refused(region: str, instance_type: str, *, now: float | None = None) -> None:
     """Skip one region's instance type for a while after Mithril refused a bid on it."""
     if not all(isinstance(value, str) and value for value in (region, instance_type)):
@@ -100,8 +91,3 @@ def _mark(key: str, seconds: float, *, now: float | None = None) -> None:
         except BaseException:
             Path(temporary).unlink(missing_ok=True)
             raise
-
-
-def cooling_down(region: str, *, now: float | None = None) -> bool:
-    now = time.time() if now is None else now
-    return _load(_path()).get(region, 0.0) > now
