@@ -16,7 +16,7 @@ BASE = (
     'algorithm = "grpo"\n'
     '[environment]\nid = "github:freesolo-co/envs@main:gsm8k/environment.py"\n'
     "[train]\nepochs = 1\nmax_examples = 100\n"
-    '[gpu]\ntype = "B200"\nprovider = "modal"\n'
+    '[gpu]\nprovider = "modal"\n'
 )
 
 BIG_GRPO = (
@@ -153,11 +153,8 @@ def test_gpus_is_accepted_on_every_provider(tmp_path, provider):
     provider ignored the count and would have landed 4 ranks on one rented card while billing for four;
     both now rent the allocated shape (Lambda names the count in the instance type, provider filters
     offers by num_gpus), so rejecting the ask is no longer correct for any provider.
-
-    H100 rather than the shared BASE's B200: it is the one managed class all three stock, so the
-    spec is not rejected on catalog grounds before the count is ever considered.
     """
-    config = BASE.replace('type = "B200"', 'type = "H100"').replace('"modal"', f'"{provider}"')
+    config = BASE.replace('"modal"', f'"{provider}"')
     assert _spec(tmp_path, "--gpus", "4", config=config).gpu.count == 4
 
 
@@ -312,7 +309,7 @@ def test_the_public_run_record_never_reports_the_allocated_count():
     )
 
 
-def test_a_pinned_class_below_the_whole_run_floor_is_only_rejected_on_one_card(tmp_path):
+def test_the_whole_run_floor_is_only_rejected_on_one_card(tmp_path):
     """The offline VRAM gate compares a WHOLE-RUN floor to ONE card, so it must respect gpu.count.
 
     required_vram_gb is the memory the run needs in total. Comparing it to a single card's VRAM is
@@ -327,14 +324,14 @@ def test_a_pinned_class_below_the_whole_run_floor_is_only_rejected_on_one_card(t
     """
     from flash.schema import ConfigError
 
-    # 35B MoE GRPO needs more than one 141 GB card holds, so the floor is above the pinned class.
+    # 35B MoE GRPO needs more than one card holds.
     big = (
         'model = "Qwen/Qwen3.6-35B-A3B"\n'
         'project = "11111111-1111-4111-8111-111111111111"\n'
         'algorithm = "grpo"\n'
         '[environment]\nid = "github:freesolo-co/envs@main:gsm8k/environment.py"\n'
         "[train]\nepochs = 1\nmax_examples = 100\n"
-        '[gpu]\ntype = "H200"\nprovider = "modal"\n'
+        '[gpu]\nprovider = "modal"\n'
     )
 
     # one card genuinely cannot hold it, so the gate must still fire. the 35B GRPO floor now exceeds
@@ -342,7 +339,7 @@ def test_a_pinned_class_below_the_whole_run_floor_is_only_rejected_on_one_card(t
     # per-pin shortfall; either way --gpus 1 must not be admitted.
     with pytest.raises(
         ConfigError,
-        match=r"(but this run requires at least|no validated GPU class has)",
+        match=r"(gpu\.count=1 provides at most|no validated GPU class has)",
     ):
         _spec(tmp_path, "--gpus", "1", config=big)
 

@@ -469,10 +469,7 @@ def test_warmstart_placeholder_rank_does_not_reject_a_source_rank_that_fits_b200
     base = _raw(
         model="Qwen/Qwen3.6-35B-A3B",
         algorithm="grpo",
-        **{
-            "gpu.type": "B200",
-            **{f"train.{key}": value for key, value in train.items()},
-        },
+        **{f"train.{key}": value for key, value in train.items()},
     )
     base["train"].pop("lora_rank")
 
@@ -493,46 +490,6 @@ def test_warmstart_placeholder_rank_does_not_reject_a_source_rank_that_fits_b200
         required_vram_gb(warm.model, warm.algorithm, train={**base["train"], "lora_rank": 32})
         == 199
     )
-    with pytest.raises(ConfigError, match=r"requires at least 199 GB"):
-        spec_from_dict({**base, "train": {**base["train"], "lora_rank": 32}})
-
-
-def test_warmstart_still_rejects_a_shape_impossible_at_the_minimum_rank() -> None:
-    raw = _raw(
-        model="Qwen/Qwen3.6-35B-A3B",
-        **{
-            "gpu.type": "B200",
-            "train.init_from_adapter": "source-run/final",
-            "train.max_context_tokens": 32768,
-            "train.max_completion_tokens": 512,
-            "train.prompts_per_step": 8,
-            "train.group_size": 4,
-        },
-    )
-    raw["train"].pop("lora_rank")
-
-    # the pinned class is named, because the exact-card gate reaches this shape before the pool-wide
-    # search does. the requirement is the same 216 GB either way.
-    with pytest.raises(ConfigError, match=r"gpu\.type 'B200' .* at least 216 GB"):
-        spec_from_dict(raw)
-
-
-def test_warmstart_still_validates_the_authored_card_at_the_minimum_rank() -> None:
-    """Relaxing the rank must not switch the exact-card gate off.
-
-    That gate is the only parse-time check of an authored `gpu.type`; skipping it let a pin that
-    cannot hold the run at ANY rank parse, because the fallback search ranks the whole pool rather
-    than the pinned class. rank 1 is a true vram lower bound, so a card rejected against it cannot fit
-    whatever rank the source turns out to have.
-    """
-    raw = _raw(
-        model="Qwen/Qwen3.6-35B-A3B",
-        **{"gpu.type": "A100 SXM", "train.init_from_adapter": "source-run/final"},
-    )
-    raw["train"].pop("lora_rank")
-
-    with pytest.raises(ConfigError, match=r"gpu\.type 'A100 SXM' has 80 GB VRAM"):
-        spec_from_dict(raw)
 
 
 def test_public_warmstart_serialization_omits_resolved_internal_fields() -> None:
@@ -1134,65 +1091,22 @@ def test_gpu_public_fields_survive_payload_and_server_reparse() -> None:
 
     defaults = GpuSpec()
     spec = spec_from_dict(
-        _raw(**{"gpu.provider": " Modal ", "gpu.type": "A100 SXM"}),
+        _raw(**{"gpu.provider": " Modal "}),
         run_id="gpu-rt",
     )
     payload = spec_payload(spec)
     # the public payload carries the user-authorable gpu knobs and omits managed lifecycle policy.
     assert payload["gpu"]["provider"] == "modal"
-    assert payload["gpu"]["type"] == "A100 SXM"
+    assert payload["gpu"]["type"] == ""
     assert "max_retries" not in payload["gpu"]
     assert "max_wall_seconds" not in payload["gpu"]
 
     reparsed = spec_from_dict(payload, run_id="server-reparse")
     assert reparsed.gpu.provider == "modal"
-    assert reparsed.gpu.type == "A100 SXM"
-    assert reparsed.gpu.type == spec.gpu.type
+    assert reparsed.gpu.type == ""
     # managed lifecycle fields reconstitute to their defaults on the server reparse.
     assert reparsed.gpu.max_retries == defaults.max_retries
     assert reparsed.gpu.max_wall_seconds == defaults.max_wall_seconds
-
-
-def test_cost_quote_prices_the_cheapest_acceptable_gpu_class() -> None:
-    """An ordered `[gpu] type` list must be quoted over the whole acceptable set.
-
-    ``allocate()`` cost-ranks every class ``acceptable_types`` returns, so pricing only the head
-    quotes a shape the run may never be given: a ["B200", "H100"] run is quoted ~3x the H100 the
-    allocator would really rent, and the submit-time affordability precheck can refuse a run the
-    organization can afford.
-    """
-    from flash.cost.analytical import estimate_cost
-    from flash.cost.spec import run_config_from_spec
-
-    listed = spec_from_dict(_raw(**{"gpu.type": ["B200", "H100"]}))
-    assert listed.gpu.acceptable_types == ("B200", "H100")
-
-    config = run_config_from_spec(listed)
-    assert config.gpu_type == "B200"
-    assert config.gpu_type_fallbacks == ("H100",)
-
-    head_only = estimate_cost(run_config_from_spec(spec_from_dict(_raw(**{"gpu.type": "B200"}))))
-    fallback_only = estimate_cost(
-        run_config_from_spec(spec_from_dict(_raw(**{"gpu.type": "H100"})))
-    )
-    quoted = estimate_cost(config)
-
-    # the acceptable fallback is genuinely cheaper here, so the head-only quote is an overquote.
-    assert fallback_only.total_usd < head_only.total_usd
-    assert quoted.gpu == "H100"
-    assert quoted.total_usd == pytest.approx(fallback_only.total_usd)
-
-    # authoring order does not change the answer: allocation ranks on cost, not position.
-    reversed_order = estimate_cost(
-        run_config_from_spec(spec_from_dict(_raw(**{"gpu.type": ["H100", "B200"]})))
-    )
-    assert reversed_order.gpu == "H100"
-
-    # a bare pin stays a hard pin -- carrying fallbacks must not widen a single authored class.
-    assert (
-        estimate_cost(run_config_from_spec(spec_from_dict(_raw(**{"gpu.type": "B200"})))).gpu
-        == "B200"
-    )
 
 
 def test_cost_quote_no_fit_error_names_every_acceptable_class() -> None:
@@ -1220,56 +1134,16 @@ def test_cost_quote_no_fit_error_names_every_acceptable_class() -> None:
     assert "L40S" in str(exc.value)
 
 
-def test_gpu_type_pins_and_unset_stays_auto(capsys) -> None:
+def test_gpu_type_is_allocator_owned(capsys) -> None:
     automatic_raw = _raw()
     automatic_raw["gpu"].pop("type", None)
 
-    automatic = spec_from_dict(automatic_raw)
-    pinned = spec_from_dict(_raw(**{"gpu.type": "B200"}))
-
-    assert automatic.gpu.type == ""
-    assert pinned.gpu.type == "B200"
+    assert spec_from_dict(automatic_raw).gpu.type == ""
+    assert spec_from_dict(_raw(**{"gpu.type": ""})).gpu.type == ""
+    for pin in ("B200", ["H100", "H200"]):
+        with pytest.raises(ConfigError, match="type is no longer supported"):
+            spec_from_dict(_raw(**{"gpu.type": pin}))
     assert capsys.readouterr().err == ""
-
-
-def test_gpu_type_accepts_an_ordered_list_of_acceptable_classes() -> None:
-    """An ordered list preserves every acceptable class behind one concrete head."""
-    spec = spec_from_dict(_raw(**{"gpu.type": ["H100", "A100 SXM"]}))
-
-    assert spec.gpu.type == "H100"
-    assert spec.gpu.type_fallbacks == ("A100 SXM",)
-    assert spec.gpu.acceptable_types == ("H100", "A100 SXM")
-
-    # aliases canonicalize per entry, exactly as the scalar form does.
-    assert spec_from_dict(_raw(**{"gpu.type": [" a100-80gb ", "h100"]})).gpu.acceptable_types == (
-        "A100 SXM",
-        "H100",
-    )
-    # a one-element list is exactly a scalar pin, fallbacks included (there are none).
-    lone = spec_from_dict(_raw(**{"gpu.type": ["B200"]}))
-    assert (lone.gpu.type, lone.gpu.type_fallbacks) == ("B200", ())
-    assert (
-        lone.gpu.acceptable_types
-        == spec_from_dict(_raw(**{"gpu.type": "B200"})).gpu.acceptable_types
-    )
-    # a repeat asks for nothing the first mention did not, and the first position is preference.
-    assert spec_from_dict(
-        _raw(**{"gpu.type": ["H100", "A100 SXM", "H100"]})
-    ).gpu.acceptable_types == ("H100", "A100 SXM")
-
-
-def test_gpu_type_list_round_trips_through_the_public_payload() -> None:
-    """Public serialization restores the authored list spelling."""
-    from flash.client.specs import spec_payload
-
-    spec = spec_from_dict(_raw(**{"gpu.type": ["H100", "A100 SXM"]}), run_id="gpu-list")
-    payload = spec_payload(spec)
-
-    assert payload["gpu"]["type"] == ["H100", "A100 SXM"]
-    assert "type_fallbacks" not in payload["gpu"]
-
-    reparsed = spec_from_dict(payload, run_id="server-reparse")
-    assert reparsed.gpu.acceptable_types == spec.gpu.acceptable_types
 
 
 def test_authoring_gpu_type_fallbacks_directly_is_rejected() -> None:
@@ -2071,12 +1945,6 @@ def test_authored_gpu_count_parses_and_roundtrips() -> None:
 
 def test_explicit_gpu_count_one_is_not_auto() -> None:
     parsed = spec_from_dict(_raw(**{"gpu.count": 1}))
-    assert parsed.gpu.count == 1
-    assert parsed.gpu_count_auto is False
-
-
-def test_gpu_type_without_count_keeps_the_single_card_pin() -> None:
-    parsed = spec_from_dict(_raw(**{"gpu.type": "B200"}))
     assert parsed.gpu.count == 1
     assert parsed.gpu_count_auto is False
 

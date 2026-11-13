@@ -27,7 +27,7 @@ def custom_raw(**gpu):
         "project": "11111111-1111-4111-8111-111111111111",
         "custom": {"file": "algorithm.py"},
         "train": {"max_steps": 6},
-        "gpu": {"type": "H100", **gpu},
+        "gpu": gpu,
     }
 
 

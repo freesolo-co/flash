@@ -55,9 +55,9 @@ def test_custom_allocation_uses_shared_capacity_lookup_and_memory_fit(monkeypatc
 
 def test_custom_config_uses_common_gpu_syntax_and_lora_validation():
     raw = custom_raw()
-    raw["gpu"] = {"type": ["H100"], "provider": " MODAL "}
+    raw["gpu"] = {"provider": " MODAL "}
     spec = spec_from_dict(raw)
-    assert spec.gpu.type == "H100"
+    assert spec.gpu.type == ""
     assert spec.gpu.provider == "modal"
     raw["train"]["lora_rank"] = 0
     with pytest.raises(ConfigError, match="lora_rank"):

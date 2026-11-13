@@ -42,7 +42,7 @@ def _add_train_commands(sub: argparse._SubParsersAction) -> None:
         type=_gpu_count_override,
         metavar="N",
         help=(
-            "optional card ceiling; sets [gpu] count (1-8). omit it with an unpinned gpu type to "
+            "optional card ceiling; sets [gpu] count (1-8). omit it to "
             "auto-size the smallest fitting geometry; an authored value pins the ceiling, and only "
             "(1, 2, 4, 8) are ever provisioned"
         ),

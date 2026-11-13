@@ -1466,7 +1466,6 @@ def test_spec_payload_sends_an_omitted_gpu_count_as_omitted() -> None:
     for authored, expected_count in (
         ({"count": 1}, 1),
         ({"count": 4}, 4),
-        ({"type": "B200"}, 1),
     ):
         pinned = spec_from_dict({**base, "gpu": authored})
         reparsed = spec_from_dict(spec_payload(pinned))

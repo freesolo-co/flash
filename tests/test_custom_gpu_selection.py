@@ -59,10 +59,14 @@ def test_moe_rank_64_routes_to_b200_and_accounts_for_every_expert(modal_capacity
         assert provisional_gpu(MOE, "custom", train=spec.train) == expected
 
 
-@pytest.mark.parametrize("gpu", ["RTX Pro 6000", "H200", ["B200", "H200"]])
-def test_rank_64_rejects_undersized_pins_and_fallbacks_before_allocation(gpu):
-    with pytest.raises(ConfigError, match="requires at least"):
+@pytest.mark.parametrize("gpu", ["RTX Pro 6000", "B200", ["B200", "H200"], []])
+def test_authored_gpu_type_is_rejected(gpu):
+    with pytest.raises(ConfigError, match="type is no longer supported"):
         custom_spec(gpu={"type": gpu})
+
+
+def test_empty_gpu_type_from_the_public_payload_is_accepted():
+    assert custom_spec(gpu={"type": ""}).gpu.type == ""
 
 
 def test_direct_allocation_cannot_rent_an_undersized_pin(modal_capacity):
@@ -148,16 +152,11 @@ def test_catalog_custom_runs_choose_cheapest_fitting_single_card(model, rank, co
         )
     for gpu in GPU_INFO.values():
         if gpu.vram_gb < need:
-            with pytest.raises(ConfigError, match="requires at least"):
-                custom_spec(model, rank=rank, context=context, gpu={"type": gpu.name})
             with pytest.raises(UnsupportedGpuError):
                 allocator.allocate(model, "custom", train=spec.train, gpu_type=gpu.name)
         else:
-            pinned = custom_spec(model, rank=rank, context=context, gpu={"type": gpu.name})
             assert (
-                allocator.allocate(
-                    model, "custom", train=pinned.train, gpu_type=pinned.gpu.type
-                ).gpu
+                allocator.allocate(model, "custom", train=spec.train, gpu_type=gpu.name).gpu
                 == gpu.name
             )
 

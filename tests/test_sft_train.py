@@ -2773,7 +2773,7 @@ def test_sft_retries_preserve_the_preparation_digest(worker_context, monkeypatch
         "project": "11111111-1111-4111-8111-111111111111",
         "environment": {"id": "owner/project/env"},
         "train": {"epochs": 1, "learning_rate": 1e-5},
-        "gpu": {"type": "H100", "count": 1},
+        "gpu": {"count": 1},
     }
     spec = spec_from_dict(raw)
     spec = replace(spec, run_id="retry-sft", model_revision="a" * 40, model_revision_auto=True)

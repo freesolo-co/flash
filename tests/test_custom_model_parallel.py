@@ -30,10 +30,10 @@ def spec(gpu):
     )
 
 
-def test_two_gpu_shape_parses_but_single_card_and_small_pairs_do_not():
-    assert spec({"type": "H200", "count": 2}).gpu.count == 2
+def test_two_gpu_shape_parses_but_single_card_does_not():
+    assert spec({"count": 2}).gpu.count == 2
     assert provisional_gpu(MODEL, "custom", train=TRAIN, gpu_count=2) == "H200"
-    for shape in ({}, {"type": "H200"}, {"type": "A100 SXM", "count": 2}):
+    for shape in ({}, {"count": 1}):
         with pytest.raises(ConfigError):
             spec(shape)
 
@@ -88,7 +88,7 @@ def test_loader_reserves_only_requested_cuda_devices(monkeypatch):
 def test_worker_passes_allocated_gpu_count_to_loader(monkeypatch):
     from flash.custom import worker
 
-    context = SimpleNamespace(config=SimpleNamespace(spec=spec({"type": "H200", "count": 2})))
+    context = SimpleNamespace(config=SimpleNamespace(spec=spec({"count": 2})))
     load = Mock(side_effect=RuntimeError("stop before GPU loading"))
     monkeypatch.setattr(worker, "RunCheckpoints", Mock())
     monkeypatch.setattr(worker, "heartbeat", Mock())

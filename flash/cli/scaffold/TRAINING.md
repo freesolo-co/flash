@@ -420,15 +420,15 @@ waits for every class that fits its plan (an H100 run also takes an H200) and la
 whichever comes up first. Spot is charged at a fixed $2.00 (H100) or $2.50 (H200) per
 GPU-hour.
 
-GPU allocation and Azure artifacts are **managed by default**: leave `[gpu] type` unset to
-let the allocator pick the cheapest fitting validated class, while `train.hf_repo` remains
-platform-managed. `[gpu] providers` takes an ordered list of provider names and prefers them in
-that order: the preference ranks ahead of cost, so a preferred provider wins even when a cheaper
-one is offered, but providers you did not name stay eligible behind them, so a preference never
-costs you failover. `[gpu] provider` instead hard-pins allocation to one provider, which does
-remove that failover, and cannot be combined with `providers`. An unknown name is rejected at parse
-time and the error lists the names your plane accepts. `[gpu] type` pins one exact active
-validated GPU class. Run artifacts are stored in a
+GPU allocation and Azure artifacts are **managed**: the allocator picks the cheapest fitting
+validated class, and `train.hf_repo` remains platform-managed. GPU classes are not
+user-selectable; a `[gpu] type` key is rejected at parse time. `[gpu] providers` takes an ordered
+list of provider names and prefers them in that order: the preference ranks ahead of cost, so a
+preferred provider wins even when a cheaper one is offered, but providers you did not name stay
+eligible behind them, so a preference never costs you failover. `[gpu] provider` instead hard-pins
+allocation to one provider, which does remove that failover, and cannot be combined with
+`providers`. An unknown name is rejected at parse time and the error lists the names your plane
+accepts. Run artifacts are stored in a
 private environment-scoped repo with content-addressed Flash code snapshots. Set `seed` only at the
 top level: a run has exactly one seed, and if a host fails Flash executes another attempt of that
 same run rather than a new one, so every attempt trains on the seed you set here.
@@ -731,8 +731,8 @@ spending another GPU run:
 | Environment id is blank or stale                             | A blank id fails config validation. A stale published id can pass `flash train --dry-run` because dry-run does not import or run `environment.py`; the worker then uses old reward/data. | Run `flash env push --project <project-uuid> --name my-env .` after every environment/data edit and paste the returned id into every config you submit. **Self-hosted:** `env push` targets the managed hub, so instead commit the edit and re-point `[environment] id` at the new ref -- see "Publish the environment" above.                                                                                                  |
 | Local-only env path in config                                | Config validation says there is no local path mode                                                                                                                                       | Publish first, then use the returned slug in `[environment] id`. `flash train` only runs published env ids, not local paths.                                                                                                                                                                                                                                                                                                    |
 | Config knobs are in the wrong table                          | Validation rejects `[grpo]`, `[sft]`, or unknown `[train]` keys                                                                                                                          | Put `epochs`, `group_size`, `max_completion_tokens`, `temperature`, `max_context_tokens`, LoRA, and other training knobs under `[train]`.                                                                                                                                                                                                                                                                                       |
-| GPU selection is not what you expected                       | Leaving `[gpu] type` unset may select a different fitting class as prices or capacity change                                                                                             | Set `[gpu] type` to an active validated class to hard-pin it, to a list (`["H100", "A100 SXM"]`) to allow several, or leave it unset for managed cheapest-fit allocation. `train.hf_repo` remains platform-managed.                                                                                                                                                                                                        |
-| A run stops after an infrastructure or OOM failure           | No candidate with strictly more usable VRAM remains, even if another provider offers the same-size GPU                                                                                   | Widen `[gpu] type` or the card-count ceiling to include a strictly larger fitting shape, or reduce the workload footprint. Flash preserves allocator order among larger candidates and never retries an equal-size shape. A managed shared-cache `no_capacity` or `poll_error` gets one cacheless same-shape retry before this rule applies.                                                                                    |
+| GPU selection is not what you expected                       | The allocator may select a different fitting class as prices or capacity change | Expected: GPU classes are managed cheapest-fit and not user-selectable. Read the `allocated ...` line in `flash runs log` to see what was chosen. `train.hf_repo` remains platform-managed. |
+| A run stops after an infrastructure or OOM failure           | No candidate with strictly more usable VRAM remains, even if another provider offers the same-size GPU                                                                                   | Raise the `[gpu] count` ceiling to include a strictly larger fitting shape, or reduce the workload footprint. Flash preserves allocator order among larger candidates and never retries an equal-size shape. A managed shared-cache `no_capacity` or `poll_error` gets one cacheless same-shape retry before this rule applies.                                                                                    |
 | Secrets are not available on the worker                      | Reward code works locally but remote logs show missing API keys or auth failures                                                                                                         | List secret names under `[environment] secrets = [...]`, export those env vars locally before submit, or put them in local `.env` / `.env.local`. Never hard-code secret values in the config.                                                                                                                                                                                                                                  |
 | Scorer dependency is missing on the worker                   | Reward code works locally but every reward is `0.0` remotely; the import your scorer needs is installed in your venv, not the worker's                                                   | List the packages your scorer imports under `[environment] pip = ["pymongo>=4.6"]`. They are installed alongside Flash's own worker requirement. `flash env test` names the failing import locally before you spend a GPU on it. Entries name packages only: pip options and URLs with inline credentials are rejected, because the spec is stored and uploaded in plaintext (put the credential in `[environment] secrets`).   |
 | Wrong model / thinking setting                               | Config validation fails, or chat behavior does not match the run                                                                                                                         | Config validation is authoritative for model and thinking compatibility. Thinking is a run-level choice, and `flash models chat` does not expose an override flag.                                                                                                                                                                                                                                                              |
@@ -1547,16 +1547,14 @@ kind because the run itself looks fine.
 
 ## Multi-GPU training and `gpu.count` pins
 
-When both `gpu.type` and `gpu.count` are omitted, Flash auto-sizes to the smallest geometry-safe card
-ceiling that can hold the run. Fitting shapes within that ceiling still compete on dollars per
-optimizer step, so no extra multi-GPU setting is required. A pinned `gpu.type` without a count keeps
-the historical single-card constraint; set `gpu.count` too when that exact class should shard.
+When `gpu.count` is omitted, Flash auto-sizes to the smallest geometry-safe card ceiling that can
+hold the run. Fitting shapes within that ceiling still compete on dollars per optimizer step, so no
+extra multi-GPU setting is required.
 
 Set a count only when you want to pin the maximum:
 
 ```toml
 [gpu]
-type = "B200"
 count = 4
 ```
 
@@ -1577,8 +1575,7 @@ The fit test is per algorithm. GRPO can need a wider combination than SFT becaus
 memory raises the whole-run floor. Raising `--gpus` still cannot rescue a pin the algorithm does not
 fit on even as an 8-card combination.
 
-**There is no exact-count mechanism.** Pinning a small `[gpu] type` raises the floor above one card
-but still does not pin n — it only moves which combination is smallest. To see what a submit
+**There is no exact-count mechanism.** To see what a submit
 actually chose, read the `allocated 2x <class> on <provider> at $N/hr` line at the top of `flash runs
 log`: the runner writes it when it places the run, so it is there before a worker exists and stays
 there for the life of the run. A single card is spelled without the `Nx` prefix.

@@ -12,7 +12,7 @@ BASE = (
     'algorithm = "grpo"\n'
     '[environment]\nid = "github:freesolo-co/envs@main:gsm8k/environment.py"\n'
     "[train]\nepochs = 1\nmax_examples = 100\n"
-    '[gpu]\ntype = "B200"\n'
+    "[gpu]\n"
 )
 
 
@@ -33,14 +33,11 @@ def test_set_overrides_scalar_and_list():
             run_id="x",
             overrides=[
                 "train.epochs=3",
-                "gpu.type=H100",
                 "train.stop_sequences=[STOP1,STOP2]",
             ],
         )[0]
         assert spec.train.epochs == 3
         assert spec.train.stop_sequences == ("STOP1", "STOP2")
-        # gpu.type overrides hard-pin the requested active validated class.
-        assert spec.gpu.type == "H100"
 
 
 def test_composed_config_deep_merge():
@@ -51,15 +48,14 @@ def test_composed_config_deep_merge():
         override = _write(
             tmp,
             "prod.toml",
-            '[train]\nmax_examples = 250\n[gpu]\ntype = "H100"\n',
+            "[train]\nmax_examples = 250\n[gpu]\ncount = 2\n",
         )
         spec = spec_and_train_keys_from_file(base, run_id="x", extra_configs=[override])[0]
         assert spec.train.max_examples == 250  # deep-merged override of a scalar
         assert (
             spec.environment.id == "github:freesolo-co/envs@main:gsm8k/environment.py"
         )  # untouched key preserved
-        # the merged gpu.type remains the authoritative hard pin.
-        assert spec.gpu.type == "H100"
+        assert spec.gpu.count == 2  # deep-merged [gpu] table
 
 
 def test_authored_train_keys_follow_composed_config() -> None:
