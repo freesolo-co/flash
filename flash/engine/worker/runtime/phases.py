@@ -80,13 +80,16 @@ class PhaseTimings:
                 self.billing_stopped = time.monotonic()
 
     def billable_train_seconds(self):
-        """GPU seconds this attempt has spent training, or ``None`` before its first update."""
+        """GPU seconds this attempt has spent training (0.0 before its first optimizer update)."""
         with self.lock:
             return self._billable_unlocked(time.monotonic())
 
     def _billable_unlocked(self, now):
+        # an explicit zero before the first optimizer update, never "absent": a metered worker
+        # cancelled during trainer/model init must bill zero, not look like a legacy worker that
+        # falls back to quote pricing.
         if self.billing_started is None:
-            return None
+            return 0.0
         end = self.billing_stopped if self.billing_stopped is not None else now
         return max(0.0, end - self.billing_started)
 
@@ -108,7 +111,7 @@ class PhaseTimings:
                 elapsed[name] = round(max(elapsed.get(name, 0), now - started), 3)
             billable = self._billable_unlocked(now)
             return {
-                **({"billable_train_s": round(billable, 3)} if billable is not None else {}),
+                "billable_train_s": round(billable, 3),
                 "active_phase_elapsed_s": elapsed,
                 "longest_phase_s": {name: round(value, 3) for name, value in self.longest.items()},
                 **(

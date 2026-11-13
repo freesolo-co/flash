@@ -334,28 +334,40 @@ def _persisted_metrics(spec) -> dict:
     return metrics if isinstance(metrics, dict) else {}
 
 
-def metered_training_seconds(status: RunStatus, spec) -> float | None:
-    """Measured GPU training seconds across every attempt, or ``None`` when nothing was metered.
+def _attempt_meters(status: RunStatus, spec) -> dict[str, dict] | None:
+    """Per-attempt metered seconds and rented shape, or ``None`` when nothing was metered.
 
     each worker attempt meters from the start of its first optimizer update to the exit of its
     training loop (``training_timing.billable_train_s``), so model download, data loading, trainer
-    / model / vLLM initialization and final adapter publication are never included. the current
-    attempt's value comes from the terminal metrics when they exist (frozen at loop exit), else
-    from the latest heartbeat; earlier attempts' metered time is carried on the heartbeat as
-    ``billable_train_s_prior``. ``None`` means a legacy worker that reports no meter.
+    / model / vLLM initialization and final adapter publication are never included. the status
+    record ``billable_by_attempt`` keeps every attempt's highest observed meter and the shape it
+    rented; the final attempt is raised to its frozen terminal meter when metrics exist. ``None``
+    means a legacy worker that reports no meter.
     """
-    from flash.runner.lifecycle.status import _heartbeat_billable_seconds
+    from flash.runner.lifecycle.status import BILLABLE_ATTEMPTS_KEY, _heartbeat_billable_seconds
 
     hb = status.last_heartbeat if isinstance(status.last_heartbeat, dict) else {}
+    attempts: dict[str, dict] = {}
+    raw = hb.get(BILLABLE_ATTEMPTS_KEY)
+    for key, entry in raw.items() if isinstance(raw, dict) else ():
+        seconds = _finite_seconds(entry.get("s")) if isinstance(entry, dict) else None
+        if isinstance(key, str) and seconds is not None:
+            shape = entry.get("shape")
+            attempts[key] = {"s": seconds, "shape": shape if isinstance(shape, str) else None}
     notes = _persisted_metrics(spec).get("notes")
     timing = notes.get("training_timing") if isinstance(notes, dict) else None
-    current = _finite_seconds(timing.get("billable_train_s")) if isinstance(timing, dict) else None
-    if current is None:
-        current = _finite_seconds(_heartbeat_billable_seconds(hb))
-    prior = _finite_seconds(hb.get("billable_train_s_prior"))
-    if current is None and prior is None:
-        return None
-    return (current or 0.0) + (prior or 0.0)
+    frozen = _finite_seconds(timing.get("billable_train_s")) if isinstance(timing, dict) else None
+    current = frozen if frozen is not None else _finite_seconds(_heartbeat_billable_seconds(hb))
+    if current is not None:
+        entry = attempts.setdefault(str(hb.get("attempt")), {"s": 0.0, "shape": None})
+        entry["s"] = max(entry["s"], current)
+    return attempts or None
+
+
+def metered_training_seconds(status: RunStatus, spec) -> float | None:
+    """Measured GPU training seconds across every attempt, or ``None`` for a legacy worker."""
+    attempts = _attempt_meters(status, spec)
+    return None if attempts is None else sum(entry["s"] for entry in attempts.values())
 
 
 def metered_charge_usd(status: RunStatus, spec, *, rented_remote: dict | None = None):
@@ -365,8 +377,8 @@ def metered_charge_usd(status: RunStatus, spec, *, rented_remote: dict | None = 
     quote-based estimate. the rate is the same per-card rate card the quote prices with, applied
     to the provider/card/count the run actually rented rather than the quote's assumptions.
     """
-    seconds = metered_training_seconds(status, spec)
-    if seconds is None:
+    attempts = _attempt_meters(status, spec)
+    if attempts is None:
         return None
     metrics = _persisted_metrics(spec)
     merged = {
@@ -392,21 +404,15 @@ def metered_charge_usd(status: RunStatus, spec, *, rented_remote: dict | None = 
     gpu_type = gpu_type or str(getattr(gpu_spec, "type", "") or "")
     gpu_count = gpu_count or max(1, int(getattr(gpu_spec, "count", 1) or 1))
     final_hourly = _per_card_rate("spot" if spot else provider, gpu_type) * gpu_count
-    ledger = _shape_ledger(status, spot=spot)
-    ledger_seconds = sum(ledger.values())
-    if ledger_seconds <= 0:
-        return seconds / 3600.0 * final_hourly
-    # each attempt's seconds at the shape it actually rented (an OOM retry moves to a larger card
-    # or count; a Spot resume can land on another class), never repriced at the final rental.
-    priced = sum(
-        shape_seconds / 3600.0 * _per_card_rate(shape_provider, shape_gpu) * shape_count
-        for (shape_provider, shape_gpu, shape_count), shape_seconds in ledger.items()
-    )
-    if seconds <= ledger_seconds:
-        return priced * (seconds / ledger_seconds)
-    # metered seconds the heartbeats had not reported yet (the final, frozen meter in terminal
-    # metrics) ran on the final rental.
-    return priced + (seconds - ledger_seconds) / 3600.0 * final_hourly
+    # each attempt bills at the shape it actually rented (an OOM retry moves to a larger card or
+    # count; a Spot resume can land on another class), never repriced at the final rental. an
+    # attempt whose shape was never observed bills at the final rental.
+    total = 0.0
+    for entry in attempts.values():
+        shape = _parse_shape(entry["shape"], spot=spot)
+        hourly = final_hourly if shape is None else _per_card_rate(shape[0], shape[1]) * shape[2]
+        total += entry["s"] / 3600.0 * hourly
+    return total
 
 
 def _per_card_rate(provider: str, gpu_type: str) -> float:
@@ -422,25 +428,13 @@ def _per_card_rate(provider: str, gpu_type: str) -> float:
     return _gpu_rate(gpu_type, provider)
 
 
-def _shape_ledger(status: RunStatus, *, spot: bool) -> dict[tuple[str, str, int], float]:
-    """Metered seconds per rented ``(provider, gpu, cards)`` from the status ledger."""
-    from flash.runner.lifecycle.status import BILLABLE_SHAPE_KEY
-
-    hb = status.last_heartbeat if isinstance(status.last_heartbeat, dict) else {}
-    raw = hb.get(BILLABLE_SHAPE_KEY)
-    ledger: dict[tuple[str, str, int], float] = {}
-    if not isinstance(raw, dict):
-        return ledger
-    for key, value in raw.items():
-        seconds = _finite_seconds(value)
-        parts = key.split("|") if isinstance(key, str) else []
-        if seconds is None or seconds <= 0 or len(parts) != 3 or not parts[2].isdigit():
-            continue
-        # the authored Spot choice is authoritative, as for the final rental.
-        provider = "spot" if spot else parts[0]
-        shape = (provider, parts[1], max(1, int(parts[2])))
-        ledger[shape] = ledger.get(shape, 0.0) + seconds
-    return ledger
+def _parse_shape(shape, *, spot: bool) -> tuple[str, str, int] | None:
+    """``provider|gpu|cards`` -> ``(provider, gpu, cards)``; ``None`` when unusable."""
+    parts = shape.split("|") if isinstance(shape, str) else []
+    if len(parts) != 3 or not parts[1] or not parts[2].isdigit():
+        return None
+    # the authored Spot choice is authoritative, as for the final rental.
+    return ("spot" if spot else parts[0], parts[1], max(1, int(parts[2])))
 
 
 def _persisted_completed_work(spec) -> tuple[int | None, dict | None]:

@@ -52,8 +52,9 @@ def test_meter_starts_at_first_update_and_stops_at_loop_exit(monkeypatch):
     timings.observe(_event("model_download", "started", span="d" * 32))
     now[0] = 600
     timings.observe(_event("model_download", "completed", span="d" * 32, seconds=600))
-    assert "billable_train_s" not in timings.snapshot()
-    assert timings.billable_train_seconds() is None
+    # an explicit zero before the first update, never absent (absent = legacy worker).
+    assert timings.snapshot()["billable_train_s"] == 0.0
+    assert timings.billable_train_seconds() == 0.0
     now[0] = 900
     timings.observe(_event("first_update", "started"))
     now[0] = 1000
@@ -79,11 +80,33 @@ def test_meter_ignores_a_second_first_update_in_the_same_attempt(monkeypatch):
     assert timings.billable_train_seconds() == 60
 
 
-def test_stop_before_training_never_meters():
+def test_stop_before_training_meters_zero():
     timings = phases.PhaseTimings()
     timings.stop_billing()
-    assert timings.billable_train_seconds() is None
-    assert "billable_train_s" not in timings.snapshot()
+    assert timings.billable_train_seconds() == 0.0
+    assert timings.snapshot()["billable_train_s"] == 0.0
+
+
+def test_cancel_during_init_bills_zero_not_the_quote(tmp_path, monkeypatch):
+    """A liveness heartbeat during trainer/model init must not fall back to quote pricing.
+
+    The runners emit sft_step/rl_step liveness heartbeats with step=0 before the first update,
+    and actual_steps_run floors those stages to one step. With the meter absent the cancel looked
+    like a legacy worker and billed estimated training that never happened.
+    """
+    spec = _spec()
+    monkeypatch.setattr(runner_state, "RESULTS_DIR", str(tmp_path))  # no metrics yet
+    hb = {
+        "attempt": 0,
+        "stage": "rl_step",
+        "step": 0,
+        "liveness": True,
+        "training_timing": phases.PhaseTimings().snapshot(),
+    }
+    status = _status(spec, heartbeat=hb, state="cancelled", quote=9.60)
+    remote = {"provider": "modal", "allocated_gpu": "H100", "allocated_gpu_count": 1}
+    charge = costs.cancelled_charge_usd(status, spec, steps=1, rented_remote=remote)
+    assert charge == 0.0
 
 
 def test_sft_runner_meters_from_first_update_to_child_exit(worker_context, monkeypatch):
@@ -209,7 +232,11 @@ def test_metered_charge_sums_prior_attempts(tmp_path, monkeypatch):
         allocated_gpu_count=1,
         notes={"training_timing": {"billable_train_s": 1800.0}},
     )
-    hb = {"attempt": 2, "billable_train_s_prior": 1800.0, "training_timing": {}}
+    hb = {
+        "attempt": 2,
+        "billable_by_attempt": {"0": {"s": 1800.0, "shape": "modal|H100|1"}},
+        "training_timing": {},
+    }
     charge = costs._status_estimated_charge(_status(spec, heartbeat=hb), spec, fallback=999.0)
     assert charge == pytest.approx(H100_MODAL)
 
@@ -230,7 +257,7 @@ def test_spot_run_bills_spot_rate(tmp_path, monkeypatch):
     assert charge == pytest.approx(10 * 2.00)  # fixed Spot H100 rate
 
 
-def test_spot_run_without_a_seconds_ledger_bills_the_rented_class_rate(tmp_path, monkeypatch):
+def test_spot_attempts_without_an_observed_shape_bill_the_rented_class_rate(tmp_path, monkeypatch):
     spec = spot_spec("H100")
     _metrics(
         tmp_path,
@@ -242,10 +269,10 @@ def test_spot_run_without_a_seconds_ledger_bills_the_rented_class_rate(tmp_path,
         allocated_gpu_count=1,
         notes={"training_timing": {"billable_train_s": 1800.0}},
     )
-    # a step-only usage record (no seconds ledger) never weights the rate: steps are not time.
+    # a step-only usage record (no observed shape) never weights the rate: steps are not time.
     hb = {
         "attempt": 1,
-        "billable_train_s_prior": 1800.0,
+        "billable_by_attempt": {"0": {"s": 1800.0}},
         "spot_usage_by_gpu": {"H100": 10, "H200": 10},
         "training_timing": {},
     }
@@ -286,36 +313,6 @@ def test_legacy_worker_without_meter_keeps_quote_pricing(tmp_path, monkeypatch):
     assert costs.metered_training_seconds(_status(spec), spec) is None
     charge = costs._status_estimated_charge(_status(spec, quote=12.34), spec, fallback=999.0)
     assert charge == pytest.approx(12.34)
-
-
-# ---------------------------------------------------------------------------- attempt carry
-
-
-def test_status_carries_prior_attempt_meter_across_retries(tmp_path, monkeypatch):
-    spec = _spec()
-    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path), raising=False)
-    status = _status(spec, state="running", heartbeat=None)
-    saved = {}
-    monkeypatch.setattr(status_ops, "get_status", lambda run_id: status)
-    monkeypatch.setattr(runner_state, "_save_status_unlocked", lambda s: saved.update(s=s))
-    monkeypatch.setattr(status_ops.os.path, "exists", lambda path: True)
-    monkeypatch.setattr(status_ops.reporting, "_report_status", lambda s: None, raising=False)
-
-    def beat(attempt, billable):
-        hb = {"attempt": attempt, "stage": "sft_step", "training_timing": {}}
-        if billable is not None:
-            hb["training_timing"]["billable_train_s"] = billable
-        status_ops.record_heartbeat(spec.run_id, hb)
-        status.last_heartbeat = saved["s"].last_heartbeat
-
-    beat(0, 100.0)
-    beat(0, 400.0)
-    beat(1, None)  # replacement attempt still initializing
-    assert status.last_heartbeat["billable_train_s_prior"] == 400.0
-    beat(1, 50.0)
-    beat(2, 10.0)
-    assert status.last_heartbeat["billable_train_s_prior"] == 450.0
-    assert costs.metered_training_seconds(status, spec) == pytest.approx(460.0)
 
 
 # ---------------------------------------------------------------------------- estimator
@@ -362,150 +359,148 @@ def test_grpo_freezes_the_meter_before_draining_required_save_publication():
     assert src.index("rc = _execute_rl_child(") < src.index("context.phase_timings.stop_billing()")
 
 
-# ---------------------------------------------------------------------------- per-shape seconds ledger
+# ---------------------------------------------------------------------------- per-attempt meter
 
 
-def _spot_status(spec, gpu, heartbeat=None):
-    status = _status(spec, state="running", heartbeat=heartbeat)
-    status.remote = {"provider": "spot", "gpu": gpu, "attempt": 0}
-    return status
-
-
-def test_ledger_credits_metered_seconds_to_the_shape_running_them():
-    spec = spot_spec("H100")
-    status = _spot_status(spec, "H100")
-    prev = {"attempt": 0, "training_timing": {"billable_train_s": 100.0}}
-    hb = {"attempt": 0, "training_timing": {"billable_train_s": 400.0}}
-    status_ops._credit_billable_seconds(status, prev, hb, same_attempt=True)
-    assert hb[status_ops.BILLABLE_SHAPE_KEY] == {"spot|H100|1": 300.0}
-    # a replacement attempt on another class starts its own meter at zero.
-    status.remote = {"provider": "spot", "gpu": "H200", "attempt": 1}
-    nxt = {"attempt": 1, "training_timing": {"billable_train_s": 50.0}}
-    status_ops._credit_billable_seconds(status, hb, nxt, same_attempt=False)
-    assert nxt[status_ops.BILLABLE_SHAPE_KEY] == {"spot|H100|1": 300.0, "spot|H200|1": 50.0}
-
-
-def test_ledger_keys_on_demand_shapes_by_class_and_card_count():
-    spec = _spec()
-    status = _status(spec, state="running")
-    status.remote = {"provider": "modal", "allocated_gpu": "H100", "allocated_gpu_count": 2}
-    prev = {"attempt": 1, "training_timing": {"billable_train_s": 0.0}}
-    hb = {"attempt": 1, "training_timing": {"billable_train_s": 60.0}}
-    status_ops._credit_billable_seconds(status, prev, hb, same_attempt=True)
-    assert hb[status_ops.BILLABLE_SHAPE_KEY] == {"modal|H100|2": 60.0}
-
-
-def test_an_oom_retry_on_a_larger_shape_bills_each_attempt_at_its_own_shape(tmp_path, monkeypatch):
-    """1 h on 1x H100, then 1 h on 2x H100 after an OOM retry = 3 card-hours, not 4."""
-    spec = _spec()
-    _metrics(
-        tmp_path,
-        monkeypatch,
-        spec,
-        step=20,
-        allocated_provider="modal",
-        allocated_gpu="H100",
-        allocated_gpu_count=2,
-        notes={"training_timing": {"billable_train_s": 3600.0}},
-    )
-    hb = {
-        "attempt": 1,
-        "billable_train_s_prior": 3600.0,
-        status_ops.BILLABLE_SHAPE_KEY: {"modal|H100|1": 3600.0, "modal|H100|2": 3600.0},
-        "training_timing": {},
-    }
-    charge = costs._status_estimated_charge(_status(spec, heartbeat=hb), spec, fallback=999.0)
-    assert charge == pytest.approx(3 * H100_MODAL)
-
-
-def test_metered_seconds_not_yet_in_the_ledger_bill_at_the_final_shape(tmp_path, monkeypatch):
-    spec = _spec()
-    _metrics(
-        tmp_path,
-        monkeypatch,
-        spec,
-        step=20,
-        allocated_provider="modal",
-        allocated_gpu="H100",
-        allocated_gpu_count=2,
-        notes={"training_timing": {"billable_train_s": 3600.0}},
-    )
-    # the last heartbeat saw only 1,800 s of the final attempt; its frozen meter says 3,600 s.
-    hb = {
-        "attempt": 1,
-        "billable_train_s_prior": 3600.0,
-        status_ops.BILLABLE_SHAPE_KEY: {"modal|H100|1": 3600.0, "modal|H100|2": 1800.0},
-        "training_timing": {},
-    }
-    charge = costs._status_estimated_charge(_status(spec, heartbeat=hb), spec, fallback=999.0)
-    assert charge == pytest.approx((1 + 2 * 0.5 + 2 * 0.5) * H100_MODAL)
-
-
-def test_spot_charge_weights_class_rates_by_seconds_not_steps(tmp_path, monkeypatch):
-    """10 steps in 5,400 s on H100 ($2.00) + 10 steps in 1,800 s on H200 ($2.50) = $4.25."""
-    spec = spot_spec("H100")
-    _metrics(
-        tmp_path,
-        monkeypatch,
-        spec,
-        step=20,
-        allocated_provider="spot",
-        allocated_gpu="H100",
-        allocated_gpu_count=1,
-        notes={"training_timing": {"billable_train_s": 1800.0}},
-    )
-    hb = {
-        "attempt": 1,
-        "billable_train_s_prior": 5400.0,
-        "spot_usage_by_gpu": {"H100": 10, "H200": 10},  # steps: would price $4.50
-        status_ops.BILLABLE_SHAPE_KEY: {"spot|H100|1": 5400.0, "spot|H200|1": 1800.0},
-        "training_timing": {},
-    }
-    charge = costs._status_estimated_charge(_status(spec, heartbeat=hb), spec, fallback=999.0)
-    assert charge == pytest.approx(4.25)
-
-
-def test_the_first_observed_heartbeat_credits_its_shape(tmp_path, monkeypatch):
-    """The poller can first see a run mid-training; those seconds belong to the shape rented then.
-
-    Samples of 1,800 s then 3,600 s on 1x H100, then a retry for 3,600 s on 2x H100, must bill
-    3 card-hours ($13.28), not price the first 1,800 s at the final 2-card rental ($15.49).
-    """
-    spec = _spec()
-    # the terminal metrics (final frozen meter: 3,600 s on 2x H100), written before os.path.exists
-    # is patched below for record_heartbeat.
-    _metrics(
-        tmp_path,
-        monkeypatch,
-        spec,
-        step=20,
-        allocated_provider="modal",
-        allocated_gpu="H100",
-        allocated_gpu_count=2,
-        notes={"training_timing": {"billable_train_s": 3600.0}},
-    )
+def _recorder(tmp_path, monkeypatch, spec, status):
+    """Drive the real record_heartbeat path; returns beat(attempt, meter, *, handle=..., cards=...)."""
     monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path), raising=False)
-    status = _status(spec, state="running", heartbeat=None)
     saved = {}
     monkeypatch.setattr(status_ops, "get_status", lambda run_id: status)
     monkeypatch.setattr(runner_state, "_save_status_unlocked", lambda s: saved.update(s=s))
     monkeypatch.setattr(status_ops.os.path, "exists", lambda path: True)
     monkeypatch.setattr(status_ops.reporting, "_report_status", lambda s: None, raising=False)
 
-    def beat(attempt, billable, cards):
-        status.remote = {"provider": "modal", "allocated_gpu": "H100", "allocated_gpu_count": cards}
+    def beat(attempt, meter, *, handle=None, cards=1, gpu="H100", provider="modal"):
+        # handle: the attempt whose provider handle is live when this sample is observed.
+        live = attempt if handle is None else handle
+        status.remote = {
+            "provider": provider,
+            "allocated_gpu": gpu,
+            "allocated_gpu_count": cards,
+            "attempt": live,
+        }
+        if provider == "spot":
+            status.remote["gpu"] = gpu
         hb = {"attempt": attempt, "stage": "sft_step", "training_timing": {}}
-        hb["training_timing"]["billable_train_s"] = billable
+        if meter is not None:
+            hb["training_timing"]["billable_train_s"] = meter
         status_ops.record_heartbeat(spec.run_id, hb)
         status.last_heartbeat = saved["s"].last_heartbeat
 
-    beat(0, 1800.0, 1)  # first observation, prev is None
-    beat(0, 3600.0, 1)
-    beat(1, 3600.0, 2)  # OOM retry on 2x H100
-    assert status.last_heartbeat[status_ops.BILLABLE_SHAPE_KEY] == {
-        "modal|H100|1": 3600.0,
-        "modal|H100|2": 3600.0,
+    return beat
+
+
+def _metered_status(
+    tmp_path, monkeypatch, spec, *, final_meter, cards, provider="modal", gpu="H100"
+):
+    # terminal metrics first: the recorder patches os.path.exists afterwards.
+    _metrics(
+        tmp_path,
+        monkeypatch,
+        spec,
+        step=20,
+        allocated_provider=provider,
+        allocated_gpu=gpu,
+        allocated_gpu_count=cards,
+        notes={"training_timing": {"billable_train_s": final_meter}},
+    )
+    return _status(spec, state="running", heartbeat=None)
+
+
+def test_attempt_record_carries_meters_across_retries(tmp_path, monkeypatch):
+    spec = _spec()
+    status = _status(spec, state="running", heartbeat=None)
+    beat = _recorder(tmp_path, monkeypatch, spec, status)
+    beat(0, 100.0)
+    beat(0, 400.0)
+    beat(1, None)  # replacement attempt still initializing
+    beat(1, 50.0)
+    beat(2, 10.0)
+    record = status.last_heartbeat[status_ops.BILLABLE_ATTEMPTS_KEY]
+    assert {k: v["s"] for k, v in record.items()} == {"0": 400.0, "1": 50.0, "2": 10.0}
+    assert costs.metered_training_seconds(status, spec) == pytest.approx(460.0)
+
+
+def test_the_first_observed_heartbeat_is_metered_at_its_shape(tmp_path, monkeypatch):
+    """1,800 then 3,600 s on 1x H100, then a retry for 3,600 s on 2x H100 = $13.28, not $15.49."""
+    spec = _spec()
+    status = _metered_status(tmp_path, monkeypatch, spec, final_meter=3600.0, cards=2)
+    beat = _recorder(tmp_path, monkeypatch, spec, status)
+    beat(0, 1800.0, cards=1)  # first observation: there is no previous heartbeat
+    beat(0, 3600.0, cards=1)
+    beat(1, 3600.0, cards=2)  # OOM retry on 2x H100
+    status.state = "done"
+    assert costs._status_estimated_charge(status, spec, fallback=999.0) == pytest.approx(
+        3 * H100_MODAL
+    )
+
+
+def test_an_out_of_order_stale_sample_never_lowers_the_meter(tmp_path, monkeypatch):
+    """3,600 s, then a stale 1,800 s from the same attempt, then a retry for 3,600 s = 7,200 s."""
+    spec = _spec()
+    status = _metered_status(tmp_path, monkeypatch, spec, final_meter=3600.0, cards=1)
+    beat = _recorder(tmp_path, monkeypatch, spec, status)
+    beat(0, 3600.0)
+    beat(0, 1800.0)  # published out of order (snapshotted before the upload lock)
+    beat(1, 3600.0)
+    status.state = "done"
+    assert costs.metered_training_seconds(status, spec) == pytest.approx(7200.0)
+    assert costs._status_estimated_charge(status, spec, fallback=999.0) == pytest.approx(
+        2 * H100_MODAL
+    )
+
+
+def test_a_late_sample_from_a_replaced_attempt_keeps_its_own_shape(tmp_path, monkeypatch):
+    """The old attempt's 3,600 s sample, observed after the 2x H100 handle, stays 1x: 3 card-h."""
+    spec = _spec()
+    status = _metered_status(tmp_path, monkeypatch, spec, final_meter=3600.0, cards=2)
+    beat = _recorder(tmp_path, monkeypatch, spec, status)
+    beat(0, 1800.0, cards=1)
+    beat(0, 3600.0, handle=1, cards=2)  # late sample from attempt 0; attempt 1's handle is live
+    beat(1, 3600.0, cards=2)
+    record = status.last_heartbeat[status_ops.BILLABLE_ATTEMPTS_KEY]
+    assert record["0"] == {"s": 3600.0, "shape": "modal|H100|1"}
+    assert record["1"] == {"s": 3600.0, "shape": "modal|H100|2"}
+    status.state = "done"
+    assert costs._status_estimated_charge(status, spec, fallback=999.0) == pytest.approx(
+        3 * H100_MODAL
+    )
+
+
+def test_an_oom_retry_on_a_larger_shape_bills_each_attempt_at_its_own_shape(tmp_path, monkeypatch):
+    """1 h on 1x H100, then 1 h on 2x H100 after an OOM retry = 3 card-hours, not 4."""
+    spec = _spec()
+    status = _metered_status(tmp_path, monkeypatch, spec, final_meter=3600.0, cards=2)
+    status.last_heartbeat = {
+        "attempt": 1,
+        status_ops.BILLABLE_ATTEMPTS_KEY: {
+            "0": {"s": 3600.0, "shape": "modal|H100|1"},
+            "1": {"s": 1800.0, "shape": "modal|H100|2"},
+        },
+        "training_timing": {},
     }
     status.state = "done"
-    charge = costs._status_estimated_charge(status, spec, fallback=999.0)
-    assert charge == pytest.approx(3 * H100_MODAL)
+    # the final attempt's frozen terminal meter (3,600 s) wins over its last sample (1,800 s).
+    assert costs._status_estimated_charge(status, spec, fallback=999.0) == pytest.approx(
+        3 * H100_MODAL
+    )
+
+
+def test_spot_attempts_bill_each_class_by_its_own_seconds(tmp_path, monkeypatch):
+    """5,400 s on H100 ($2.00) + 1,800 s on H200 ($2.50) = $4.25, never step-weighted ($4.50)."""
+    spec = spot_spec("H100")
+    status = _metered_status(
+        tmp_path, monkeypatch, spec, final_meter=1800.0, cards=1, provider="spot", gpu="H200"
+    )
+    status.last_heartbeat = {
+        "attempt": 1,
+        "spot_usage_by_gpu": {"H100": 10, "H200": 10},
+        status_ops.BILLABLE_ATTEMPTS_KEY: {
+            "0": {"s": 5400.0, "shape": "spot|H100|1"},
+            "1": {"s": 1800.0, "shape": "spot|H200|1"},
+        },
+        "training_timing": {},
+    }
+    status.state = "done"
+    assert costs._status_estimated_charge(status, spec, fallback=999.0) == pytest.approx(4.25)

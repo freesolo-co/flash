@@ -372,18 +372,10 @@ def record_heartbeat(run_id: str, heartbeat: dict) -> None:
                 prior += _session_seconds(prev.get("session_seconds"))
             if prior:
                 hb.setdefault("session_seconds_prior", prior)
-        if prev is not None and status.spec.get("algorithm") != "custom":
-            # each attempt meters its own training seconds from its first optimizer update; keep
-            # the earlier attempts' metered time so a retried or Spot-resumed run bills all of it.
-            prior = _session_seconds(prev.get("billable_train_s_prior"))
-            if not same_attempt:
-                prior += _session_seconds(_heartbeat_billable_seconds(prev))
-            if prior:
-                hb.setdefault("billable_train_s_prior", prior)
         if status.spec.get("algorithm") != "custom":
-            # outside the prev guard: the first heartbeat the poller sees can already carry minutes
-            # of metered training, and those seconds belong to the shape rented right now.
-            _credit_billable_seconds(status, prev, hb, same_attempt=same_attempt)
+            # every heartbeat, including the first one observed: it can already carry minutes of
+            # metered training (see _record_attempt_meter).
+            _record_attempt_meter(status, prev, hb)
         from flash.runner.accounting.spot_usage import record as record_spot_usage
 
         record_spot_usage(status, prev, hb, same_attempt=same_attempt)
@@ -578,7 +570,7 @@ def _update(run_id: str, new_state: str, *, allow_from_terminal: bool = False, *
     return True
 
 
-BILLABLE_SHAPE_KEY = "billable_s_by_shape"
+BILLABLE_ATTEMPTS_KEY = "billable_by_attempt"
 
 
 def rented_shape_key(remote) -> str | None:
@@ -609,26 +601,36 @@ def rented_shape_key(remote) -> str | None:
     return f"{provider}|{gpu}|{count}"
 
 
-def _credit_billable_seconds(status, prev, hb, *, same_attempt):
-    """Credit this heartbeat's newly metered seconds to the shape the run is renting right now.
+def _record_attempt_meter(status, prev, hb) -> None:
+    """Carry each attempt's metered training seconds, and the shape it rented, forward.
 
-    Attempts can rent different shapes: an OOM retry moves to a strictly larger card or count,
-    and a Spot resume can land on another class. Each shape's seconds are priced at its own rate
-    and card count, never at the final attempt's.
+    ``billable_by_attempt`` maps an attempt to ``{"s": seconds, "shape": "provider|gpu|cards"}``:
+    - ``s`` is the attempt's HIGHEST observed meter. Heartbeats can publish out of order (the
+      worker snapshots the meter before its upload lock), so a stale smaller sample never lowers it.
+    - ``shape`` is stamped only while the live handle belongs to that same attempt. A late sample
+      from a replaced attempt keeps the shape it ran on and never borrows the replacement's.
+    Attempts can rent different shapes (an OOM retry moves to a larger card or count; a Spot
+    resume can land on another class), and each attempt's seconds bill at its own shape.
     """
-    ledger = prev.get(BILLABLE_SHAPE_KEY) if isinstance(prev, dict) else None
-    ledger = {
-        shape: _session_seconds(seconds)
-        for shape, seconds in (ledger.items() if isinstance(ledger, dict) else ())
-        if isinstance(shape, str)
-    }
-    current = _session_seconds(_heartbeat_billable_seconds(hb))
-    before = _session_seconds(_heartbeat_billable_seconds(prev)) if same_attempt else 0.0
-    shape = rented_shape_key(status.remote)
-    if shape and current > before:
-        ledger[shape] = ledger.get(shape, 0.0) + (current - before)
-    if ledger:
-        hb[BILLABLE_SHAPE_KEY] = ledger
+    carried = prev.get(BILLABLE_ATTEMPTS_KEY) if isinstance(prev, dict) else None
+    attempts: dict[str, dict] = {}
+    for key, entry in carried.items() if isinstance(carried, dict) else ():
+        if isinstance(key, str) and isinstance(entry, dict):
+            attempts[key] = {"s": _session_seconds(entry.get("s"))}
+            if isinstance(entry.get("shape"), str):
+                attempts[key]["shape"] = entry["shape"]
+    meter = _heartbeat_billable_seconds(hb)
+    if meter is not None:
+        key = str(hb.get("attempt"))
+        entry = attempts.setdefault(key, {"s": 0.0})
+        entry["s"] = max(entry["s"], _session_seconds(meter))
+        remote = status.remote if isinstance(status.remote, dict) else None
+        if remote is not None and str(remote.get("attempt")) == key:
+            shape = rented_shape_key(remote)
+            if shape:
+                entry["shape"] = shape
+    if attempts:
+        hb[BILLABLE_ATTEMPTS_KEY] = attempts
 
 
 def _heartbeat_billable_seconds(heartbeat):

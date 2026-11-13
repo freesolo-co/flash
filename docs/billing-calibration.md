@@ -16,16 +16,23 @@ charge = billable_train_seconds / 3600 × rate-card $/hr for the rented card × 
   capability checks, trainer/model/vLLM initialization, and final adapter export/publication.
 - **Billed:** every optimizer update, including the first one (graph capture and warm-up happen
   inside it), plus checkpoint saves taken during training.
-- **Retries and Spot resumes:** each attempt meters its own window. `record_heartbeat` carries the
-  earlier attempts' metered seconds as `billable_train_s_prior`, so the charge covers every attempt.
-- **Cancellation:** the latest heartbeat's meter (`training_timing.billable_train_s`), plus earlier
-  attempts.
+- **Before the first update:** the worker reports an explicit `billable_train_s = 0`, so a run
+  cancelled during trainer/model initialization bills $0 rather than looking like a legacy worker.
+- **Retries and Spot resumes:** `record_heartbeat` keeps one record per attempt,
+  `billable_by_attempt = {attempt: {"s": seconds, "shape": "provider|gpu|cards"}}`:
+  - `s` is the attempt's **highest** observed meter. Heartbeats can publish out of order, so a stale
+    smaller sample never lowers it.
+  - `shape` is stamped only while the live provider handle belongs to that same attempt, so a late
+    sample from a replaced attempt never borrows the replacement's shape.
+  - The final attempt is raised to its frozen terminal meter. Every heartbeat counts, including the
+    first one observed.
+- **Attempts on different shapes:** each attempt bills its seconds at its own shape's rate and card
+  count. An OOM retry on a larger card or count, or a Spot resume on another class, never reprices
+  earlier attempts at the final rental. An attempt whose shape was never observed bills at the
+  final rental.
+- **Cancellation:** the same per-attempt record, with the latest heartbeat's meter for the live
+  attempt.
 - **Spot:** dev's fixed class rates (H100 $2.00/hr, H200 $2.50/hr).
-- **Attempts on different shapes:** `record_heartbeat` keeps metered seconds per rented shape
-  (`billable_s_by_shape`, keyed `provider|gpu|cards`). Each shape's seconds bill at its own rate and
-  card count: an OOM retry on a larger card or count, or a Spot resume on another class, never
-  reprices earlier attempts at the final rental. Seconds not yet in the ledger (the final frozen
-  meter) bill at the final rental.
 - **Legacy workers** that report no meter keep the previous quote-based pricing.
 - **Custom runs** are unchanged. They were already metered on session time, which starts after
   the backend loads the model and ends at session close or cancel. Session time includes time the
