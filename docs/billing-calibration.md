@@ -32,7 +32,7 @@ charge = billable_train_seconds / 3600 × rate-card $/hr for the rented card × 
   final rental.
 - **Cancellation:** the same per-attempt record, with the latest heartbeat's meter for the live
   attempt.
-- **Spot:** dev's fixed class rates (H100 $2.00/hr, H200 $2.50/hr).
+- **Spot:** the Spot tariff recorded on the run at submission (`submitted_spot_rates`; currently H100 $2.10/hr, H200 $2.60/hr; older runs use the legacy $2.00/$2.50 table), so a rate change never reprices a run.
 - **Legacy workers** that report no meter keep the previous quote-based pricing.
 - **Custom runs** are unchanged. They were already metered on session time, which starts after
   the backend loads the model and ends at session close or cancel. Session time includes time the

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
 import math
 import os
@@ -195,28 +196,35 @@ def metered_charge_usd(
             str(getattr(gpu_spec, "type", "") or ""),
             max(1, int(getattr(gpu_spec, "count", 1) or 1)),
         )
-    final_hourly = _per_card_rate(final[0], final[1]) * final[2]
+    final_hourly = _per_card_rate(final[0], final[1], status) * final[2]
     # each attempt bills at the shape it actually rented (an OOM retry moves to a larger card or
     # count; a Spot resume can land on another class), never repriced at the final rental. an
     # attempt whose shape was never observed bills at the final rental.
     total = 0.0
     for entry in attempts.values():
         shape = _parse_shape(entry["shape"], spot=spot)
-        hourly = final_hourly if shape is None else _per_card_rate(shape[0], shape[1]) * shape[2]
+        hourly = (
+            final_hourly if shape is None else _per_card_rate(shape[0], shape[1], status) * shape[2]
+        )
         total += entry["s"] / 3600.0 * hourly
     return total
 
 
-def _per_card_rate(provider: str, gpu_type: str) -> float:
-    """$/hr for one card: Spot bills dev's fixed class rate, everything else the rate card."""
-    if provider == "spot":
-        from flash.providers.mithril.pricing import hourly_rate, quote_rate
+def _per_card_rate(provider: str, gpu_type: str, status: RunStatus) -> float:
+    """$/hr for one card: Spot bills the tariff the run was quoted under, else the rate card.
 
-        try:
-            return hourly_rate(gpu_type)
-        except Exception:
-            # an unknown class prices at the costliest Spot class, the quote's upper bound.
-            return quote_rate()
+    a Spot run's tariff is recorded at submission (``submitted_spot_rates``; older runs use the
+    legacy table), so a later rate change never reprices a run. an unknown class prices at that
+    tariff's costliest class, the quote's upper bound.
+    """
+    if provider == "spot":
+        from flash.providers.core.base import canonical_gpu
+        from flash.runner.accounting.spot_usage import submitted_rates
+
+        rates = submitted_rates(status)
+        with contextlib.suppress(Exception):
+            gpu_type = canonical_gpu(gpu_type)
+        return rates.get(gpu_type, max(rates.values()))
     return _gpu_rate(gpu_type, provider)
 
 

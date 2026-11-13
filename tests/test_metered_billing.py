@@ -546,3 +546,23 @@ def test_completion_prices_the_attempt_that_produced_the_terminal_metrics():
     src = " ".join(inspect.getsource(cleanup).split())
     call = src[src.index("costs._status_estimated_charge(") :]
     assert "completed_attempt=verified_attempt if verified_attempt is not None else" in call[:400]
+
+
+def test_spot_meters_at_the_tariff_recorded_when_the_run_was_submitted(tmp_path, monkeypatch):
+    """A rate change after submission never reprices a run: each class uses its recorded tariff."""
+    spec = spot_spec("H100")
+    status = _metered_status(
+        tmp_path, monkeypatch, spec, final_meter=1800.0, cards=1, provider="spot", gpu="H200"
+    )
+    status.submitted_spot_rates = {"H100": 2.10, "H200": 2.60}
+    status.last_heartbeat = {
+        "attempt": 1,
+        status_ops.BILLABLE_ATTEMPTS_KEY: {
+            "0": {"s": 3600.0, "shape": "spot|H100|1"},
+            "1": {"s": 1800.0, "shape": "spot|H200|1"},
+        },
+        "training_timing": {},
+    }
+    status.state = "done"
+    charge = costs._status_estimated_charge(status, spec, fallback=999.0)
+    assert charge == pytest.approx(1.0 * 2.10 + 0.5 * 2.60)
