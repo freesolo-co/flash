@@ -544,3 +544,67 @@ def test_region_cooldown_is_not_a_run_record_and_keeps_every_mark(monkeypatch, t
     assert region_health.cooling_down("af-south1-a")
     assert region_health.cooling_down("eu-x")
     assert not list(tmp_path.glob("*.json"))  # run scanners read top-level *.json as run records
+
+
+def test_spot_allocation_prefers_one_fitting_card_over_eight_h100s():
+    """Regression: a >80 GB plan took 8x H100 ($20/hr, never under cap) over a fitting 1x H200."""
+    from flash.providers.core.allocator import _cheapest_allocation
+    from flash.providers.core.base import Candidate
+
+    allocation = _cheapest_allocation(
+        [Candidate("spot", "H100", 2.0, 80, 8), Candidate("spot", "H200", 2.5, 141, 1)],
+        need=85,
+        cost_per_step=None,
+        provider_rank={},
+    )
+    assert (allocation.gpu, allocation.gpu_count) == ("H200", 1)
+
+
+def test_spot_allocation_still_prefers_h100_at_equal_card_count():
+    from flash.providers.core.allocator import _cheapest_allocation
+    from flash.providers.core.base import Candidate
+
+    allocation = _cheapest_allocation(
+        [Candidate("spot", "H200", 2.5, 141, 1), Candidate("spot", "H100", 2.0, 80, 1)],
+        need=40,
+        cost_per_step=None,
+        provider_rank={},
+    )
+    assert (allocation.gpu, allocation.gpu_count) == ("H100", 1)
+
+
+def test_spot_quote_prefers_one_h200_over_eight_h100s(monkeypatch):
+    from flash.cost import RunConfig, analytical
+
+    monkeypatch.setattr(analytical, "required_vram_gb", lambda *a, **k: 85)
+    gpu, _need, count, provider, _hourly = analytical._offline_gpu_shape(
+        RunConfig("Qwen/Qwen3.5-9B", "grpo", 10, provider="spot")
+    )
+    assert (provider, gpu, count) == ("spot", "H200", 1)
+
+
+def test_spot_quote_names_spot_as_unsupported_when_no_shape_fits(monkeypatch):
+    from flash.cost import RunConfig, analytical
+
+    monkeypatch.setattr(analytical, "required_vram_gb", lambda *a, **k: 5000)
+    with pytest.raises(ValueError, match=r"Spot is not supported for Qwen/Qwen3.5-9B with algorithm 'grpo'"):
+        analytical._offline_gpu_shape(RunConfig("Qwen/Qwen3.5-9B", "grpo", 10, provider="spot"))
+
+
+def test_spot_allocator_names_spot_as_unsupported_when_no_shape_fits():
+    from flash.providers.core.allocator import _raise_no_candidate_error
+    from flash.providers.core.base import UnsupportedGpuError
+
+    with pytest.raises(UnsupportedGpuError, match=r"Spot is not supported .* 5000 GB.*8x H200"):
+        _raise_no_candidate_error(
+            model_id="Qwen/Qwen3.5-9B",
+            algorithm="custom",
+            need=5000,
+            cap=8,
+            exact="",
+            acceptable=(),
+            supported_available=("spot",),
+            structurally_unsupported={},
+            lookup_failed=False,
+            executed_width=lambda n: n,
+        )

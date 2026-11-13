@@ -583,6 +583,8 @@ def _offline_gpu_shape(config: RunConfig) -> tuple[str, int, int, str, float]:
             ranked.append(
                 (
                     (
+                        # same order as the allocator: Spot takes the fewest cards, then class.
+                        count if provider == "spot" else 0,
                         spot_priority(gpu) if provider == "spot" else 0,
                         hourly * count * step_seconds,
                     ),
@@ -626,6 +628,10 @@ def _raise_no_fitting_shape(
     # use. `_wider_shape_remedy` searches only `names`, already narrowed to the pin, so the
     # `--gpus N` clause it appends can never name a shape the pin forbids. an unpinned run
     # falls through to the pool-wide message, which reports the count that would fit.
+    if provider == "spot" and not config.gpu_type:
+        from flash.providers.mithril.pricing import spot_unsupported_message
+
+        raise ValueError(spot_unsupported_message(config.model_id, config.method, need))
     remedy = _wider_shape_remedy(config, need, names)
     if config.gpu_type:
         # name every acceptable class, not just the head: with fallbacks authored, reporting the
