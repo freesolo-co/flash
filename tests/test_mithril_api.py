@@ -936,6 +936,65 @@ def test_a_failed_scope_lookup_is_retryable_not_a_mismatch(monkeypatch):
         handles.require_scope(handle)
 
 
+def test_a_refusal_keeps_mithrils_short_reason_in_its_cause(monkeypatch, tmp_path):
+    from flash.providers.core.base import CapacityUnavailableError
+    from flash.runner.lifecycle import state
+
+    monkeypatch.setattr(state, "RUNS_DIR", str(tmp_path))
+    monkeypatch.setattr(api, "pages", lambda *a, **kw: [])
+
+    def refuse(*args, **kwargs):
+        raise client.MithrilApiError(status=400, reason="Spot quota exceeded for instance type")
+
+    monkeypatch.setattr(api, "call", refuse)
+    with pytest.raises(CapacityUnavailableError) as error:
+        launch(monkeypatch)
+    assert error.value.cause == "http 400: Spot quota exceeded for instance type"
+
+
+class _Response:
+    def __init__(self, data):
+        self._data = data
+
+    def json(self):
+        if isinstance(self._data, Exception):
+            raise self._data
+        return self._data
+
+
+def test_error_reasons_are_short_and_never_echo_the_request():
+    body = {"launch_specification": {"startup_script": "#!/bin/bash\nexport TOKEN=hunter2-secret"}}
+    reason = client._safe_reason
+    assert reason(_Response({"detail": "Limit price is below the minimum"}), body=body) == (
+        "Limit price is below the minimum"
+    )
+    validation = {"detail": [{"loc": ["body", "region"], "msg": "field required"}]}
+    assert reason(_Response(validation)) == "field required"
+    # anything echoing a request value or the API key is dropped, as are raw or odd bodies
+    echoed = {"detail": "bad script #!/bin/bash\nexport TOKEN=hunter2-secret"}
+    assert reason(_Response(echoed), body=body) == ""
+    partial = {"detail": "invalid line: export TOKEN=hunter2-secret"}
+    assert reason(_Response(partial), body=body) == ""
+    # a bare secret echoed without its script syntax, e.g. a base64 payload
+    assert reason(_Response({"detail": "Invalid token: hunter2-secret"}), body=body) == ""
+    wrapped = {"startup_script": "REF=json.loads(base64.b64decode('eyJrZXkiOiAic2VjcmV0In0='))"}
+    echo = {"detail": "bad payload eyJrZXkiOiAic2VjcmV0In0="}
+    assert reason(_Response(echo), body=wrapped) == ""
+    for tail in (".", ")", '"', ","):  # punctuation glued to the echo
+        glued = {"detail": "Invalid payload eyJrZXkiOiAic2VjcmV0In0=" + tail}
+        assert reason(_Response(glued), body=wrapped) == ""
+    # plain words that also appear in the request (field names) do not drop a reason
+    words = {"detail": "Spot quota exceeded for this instance type"}
+    assert reason(_Response(words), body={"instance_type": "it_x"}) == words["detail"]
+    assert reason(_Response({"message": "key test-secret rejected"})) == ""
+    assert reason(_Response(ValueError("not json"))) == ""
+    assert reason(_Response(["unexpected"])) == ""
+    assert len(reason(_Response({"detail": "x" * 1000}))) == 200
+    # a secret crossing the length limit is caught on the whole message, not a truncated prefix
+    assert reason(_Response({"detail": "x" * 190 + "test-secret"})) == ""
+    assert reason(_Response({"detail": "x" * 190 + " TOKEN=hunter2-secret"}), body=body) == ""
+
+
 @pytest.mark.parametrize("status", [400, 403, 409, 422])
 def test_a_definitive_refusal_with_quota_left_requeues_and_cools_that_shape(
     monkeypatch, status, tmp_path
