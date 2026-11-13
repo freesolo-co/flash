@@ -111,6 +111,7 @@ def test_cancel_during_init_bills_zero_not_the_quote(tmp_path, monkeypatch):
 
 def test_sft_runner_meters_from_first_update_to_child_exit(worker_context, monkeypatch):
     """The real SFT runner path: child stdout drives the meter, child exit freezes it."""
+    import contextlib
     from types import SimpleNamespace
 
     from flash.engine.worker.train.entry import sft_train, sft_train_runner
@@ -135,11 +136,13 @@ def test_sft_runner_meters_from_first_update_to_child_exit(worker_context, monke
 
     monkeypatch.setattr(sft_train_runner, "_invoke_sft_child", fake_child)
     monkeypatch.setattr(sft_train, "_NvidiaSmiPeakSampler", _Sampler)
-    monkeypatch.setattr(
-        sft_train_runner,
-        "liveness_heartbeat",
-        lambda *a, **k: __import__("contextlib").nullcontext(),
-    )
+
+    @contextlib.contextmanager
+    def liveness(*args, **kwargs):
+        yield
+        now[0] += 30.0  # context exit joins an in-flight heartbeat upload: not billed
+
+    monkeypatch.setattr(sft_train_runner, "liveness_heartbeat", liveness)
 
     def drain(require_complete):
         now[0] += 1800.0  # pending adapter publication + uploads drained after the child exits
@@ -356,8 +359,13 @@ def test_grpo_freezes_the_meter_before_draining_required_save_publication():
     from flash.engine.worker.train.entry import rl_train
 
     src = " ".join(inspect.getsource(rl_train.run_rl_train).split())
-    assert src.index("context.phase_timings.stop_billing()") < src.index("_validate_rl_child(")
-    assert src.index("rc = _execute_rl_child(") < src.index("context.phase_timings.stop_billing()")
+    liveness = src.index('with liveness_heartbeat( "rl_step"')
+    child = src.index("rc = _execute_rl_child(")
+    freeze = src.index("context.phase_timings.stop_billing()", child)
+    # frozen in a finally around the child, inside the rl_step liveness context (whose exit can
+    # wait on a heartbeat upload) and before _validate_rl_child drains publication.
+    assert liveness < child < freeze < src.index("_validate_rl_child(")
+    assert "finally: # freeze the meter the moment the verl child exits" in src
 
 
 # ---------------------------------------------------------------------------- per-attempt meter

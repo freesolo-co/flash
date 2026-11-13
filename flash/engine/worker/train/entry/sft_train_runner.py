@@ -877,13 +877,15 @@ def _run_sft_child(
                     progress_step=True,
                     context=context,
                 ):
-                    return_code = _invoke_sft_child(child, callbacks, on_line, context=context)
+                    try:
+                        return_code = _invoke_sft_child(child, callbacks, on_line, context=context)
+                    finally:
+                        # freeze the meter the moment the child exits: inside the liveness context,
+                        # whose exit can wait on an in-flight heartbeat upload, and before the
+                        # watcher drains pending adapter publication. neither is training time.
+                        context.phase_timings.stop_billing()
                     training_completed = return_code == 0
             finally:
-                # freeze the meter the moment the child exits, BEFORE the watcher drains its
-                # pending adapter publication and storage uploads: post-training publication is
-                # not billed training time.
-                context.phase_timings.stop_billing()
                 # A failed child cannot prove save completeness; preserve its failure.
                 child.watcher.stop(require_complete=training_completed)
     finally:

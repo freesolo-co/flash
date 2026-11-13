@@ -376,20 +376,23 @@ def run_rl_train(*, context: WorkerContext):
             sample_off_thread=True,
             context=context,
         ):
-            rc = _execute_rl_child(
-                python_bin=python_bin,
-                overrides=configured["overrides"],
-                env_for_verl=env_for_verl,
-                inp=inp,
-                state=state,
-                reward_runtime=reward_runtime,
-                _reward_observability=_reward_observability,
-                files=files,
-                context=context,
-            )
-        # freeze the meter the moment the verl child exits, BEFORE _validate_rl_child drains
-        # required-save publication: post-training publication is not billed training time.
-        context.phase_timings.stop_billing()
+            try:
+                rc = _execute_rl_child(
+                    python_bin=python_bin,
+                    overrides=configured["overrides"],
+                    env_for_verl=env_for_verl,
+                    inp=inp,
+                    state=state,
+                    reward_runtime=reward_runtime,
+                    _reward_observability=_reward_observability,
+                    files=files,
+                    context=context,
+                )
+            finally:
+                # freeze the meter the moment the verl child exits: inside the liveness context,
+                # whose exit can wait on an in-flight heartbeat upload, and before
+                # _validate_rl_child drains required-save publication. neither is training time.
+                context.phase_timings.stop_billing()
         _validate_rl_child(
             rc,
             state,
