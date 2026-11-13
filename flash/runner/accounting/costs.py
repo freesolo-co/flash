@@ -2,12 +2,10 @@
 
 from __future__ import annotations
 
-import contextlib
 import json
 import math
 import os
 import time
-from dataclasses import replace
 
 from flash.runner.lifecycle import reporting, state
 from flash.runner.lifecycle.state import RunStatus
@@ -45,182 +43,6 @@ def _gpu_rate(gpu_type: str, provider: str = "") -> float:
     return 0.80
 
 
-def _pinned_offline_allocation(provider: str, gpu_type: str, gpu_count: int):
-    """An offline-rate allocation pinning a rented shape, or ``None`` when there is nothing to pin.
-
-    the offline shape search treats the spec's card count as a ceiling and re-optimizes under it,
-    so a live allocator's 2/4/8-card rental would be repriced on whatever smaller shape the static
-    rate table prefers. an explicit allocation is the same mechanism the accepted quote was built
-    on (see seed submission), so an estimate that consumes it reproduces the quote's exact
-    geometry. the pin fixes geometry, not price: rates stay offline, mirroring the shape search's
-    own rate choice, and cancel out of any partial/full ratio. never raises -- an unpriceable pin
-    returns ``None`` so the caller degrades to the spec-derived shape instead of failing a charge.
-    """
-    if not gpu_type or gpu_count < 1:
-        return None
-    try:
-        from flash.providers.core.base import Allocation, canonical_gpu
-
-        gpu = canonical_gpu(gpu_type)
-        from flash.providers.core.registry import get_provider
-
-        hourly = get_provider(provider or "modal").hourly_rate(gpu)
-        return Allocation(
-            provider=provider,
-            gpu=gpu,
-            hourly_usd=float(hourly),
-            min_vram_gb=0,
-            candidates=(),
-            gpu_count=int(gpu_count),
-        )
-    except Exception:
-        return None
-
-
-def _spec_pinned_to_horizon(spec, steps: int):
-    """``spec`` with its update horizon stated as ``steps``, for pricing a run that already ran.
-
-    ``max_steps`` is the one field that states a grpo horizon outright, so pinning it is what
-    lets a completed step count stand in for the prompt-pool size the estimator would otherwise
-    have to derive one from. floored at 1 because ``RunConfig`` rejects a zero horizon; the callers
-    all return $0 for a zero-step cancel before the estimate is reached, so the floor never prices
-    anything. only reached when that derivation failed, which by construction means no save
-    schedule to rewrite: ``save_at_steps`` requires a positive ``max_steps`` (core/spec.py), and a
-    positive ``max_steps`` is itself a stated horizon that never needed a pool size.
-    """
-    from dataclasses import replace as _replace
-
-    return _replace(spec, train=_replace(spec.train, max_steps=max(1, int(steps))))
-
-
-def charge_usd_for_spec(
-    spec,
-    *,
-    steps: int | None = None,
-    fallback: float = 0.0,
-    provider: str = "",
-    gpu_type: str = "",
-    gpu_count: int = 0,
-) -> float:
-    """Return the estimated customer charge, prorated by completed steps when requested.
-
-    ``provider`` overrides the pricing substrate for a training estimate. the persisted worker spec
-    of an auto-allocated run carries no provider; the cancel path passes the provider the run
-    actually rented so the estimate reproduces the accepted quote's work model. ``gpu_type``
-    and ``gpu_count`` together pin the rented card shape the same way: the spec's count is only the
-    ceiling the allocator searched under, so without the pin a 4-card rental could be repriced on
-    the 1-card offline optimum.
-    """
-    try:
-        from flash.core.checkpoint_policy import is_spot_spec
-        from flash.cost.analytical import estimate_cost
-        from flash.cost.spec import UnknownPromptPoolSize, run_config_from_spec
-
-        try:
-            cfg = run_config_from_spec(spec)
-        except UnknownPromptPoolSize:
-            # a cancel prices work that already happened, so it must not need a PREDICTED horizon.
-            # grpo derive theirs from a stated prompt-pool size and refuse to guess without one,
-            # which would make an unbounded run unpriceable at exactly the moment its cost is known
-            # exactly. the completed count answers that question with the measurement instead --
-            # spec_steps reads max_steps first, so the pool size is never consulted. only the
-            # prorating callers may do this: with no steps to state, there is still no horizon.
-            if steps is None:
-                raise
-            cfg = run_config_from_spec(_spec_pinned_to_horizon(spec, int(steps)))
-        if is_spot_spec(spec):
-            # The authored Spot choice remains authoritative after teardown or retry,
-            # even if a legacy/incomplete rented handle omits or misstates its provider.
-            provider = "spot"
-            cfg = replace(cfg, provider=provider, providers=())
-        elif provider:
-            # suppressed ValueError: the registry no longer maps this provider to the spec's
-            # class. the combination was rentable when the run launched, so degrade to the spec's
-            # own pricing substrate rather than turning a chargeable cancel into a pricing failure.
-            with contextlib.suppress(ValueError):
-                cfg = replace(cfg, provider=provider)
-        pricing_provider = provider or (cfg.provider if cfg.provider != "auto" else "")
-        allocation = _pinned_offline_allocation(pricing_provider, gpu_type, gpu_count)
-        if steps is None:
-            return float(estimate_cost(cfg, allocation=allocation).total_usd)
-        n = max(0, int(steps))
-        if n == 0:
-            return 0.0
-        planned = int(cfg.steps or 0)
-        if planned > 0:
-            n = min(n, planned)
-        # a partial (cancelled) reprice only counts required saves that could already have landed by
-        # the completed step. keeping a save beyond the reduced horizon would also trip the run
-        # config's save_at_steps <= steps guard and drop the whole estimate to the fallback.
-        reached_saves = tuple(s for s in cfg.save_at_steps if s <= n)
-        if not cfg.is_grpo and cfg.train_tokens and planned > 0:
-            scaled_tokens = max(1, int(cfg.train_tokens * n / planned))
-            # both token totals describe the same completed horizon. leaving supervised tokens
-            # at the full-run value can violate supervised <= compute and make cancellation fail.
-            supervised = cfg.supervised_train_tokens
-            scaled_supervised = (
-                max(1, supervised * n // planned) if supervised is not None else None
-            )
-            cfg = replace(
-                cfg,
-                steps=n,
-                train_tokens=scaled_tokens,
-                supervised_train_tokens=scaled_supervised,
-                save_at_steps=reached_saves,
-            )
-        else:
-            cfg = replace(cfg, steps=n, save_at_steps=reached_saves)
-        return float(estimate_cost(cfg, allocation=allocation).total_usd)
-    except Exception:
-        return float(fallback)
-
-
-def _rented_basis(remote) -> tuple[str, str, int]:
-    """The substrate a run actually rented: (provider, gpu type, card count) from its handle.
-
-    the provider handle is the only durable record of the rented shape -- seed submission persists
-    ``allocated_gpu``/``allocated_gpu_count`` beside the provider precisely because the spec's own
-    count is just the ceiling the allocator searched under. a successful cancel tears the handle
-    down before billing runs, so the cancel path captures it pre-teardown and passes it here.
-    every field is validated and degrades to ""/0 rather than raising: an unrecognized value would
-    make the offline estimate unpriceable and turn a chargeable cancel into a billing failure, so
-    it falls back to the spec's own pricing substrate and shape instead. the shape pair is
-    all-or-nothing -- a card name without its count (or vice versa) cannot name a geometry.
-    """
-    if not isinstance(remote, dict):
-        return "", "", 0
-    provider = remote.get("provider")
-    provider = provider.strip().lower() if isinstance(provider, str) else ""
-    if provider:
-        try:
-            from flash.providers.core.registry import PROVIDER_NAMES
-
-            if provider not in PROVIDER_NAMES:
-                provider = ""
-        except Exception:
-            provider = ""
-    gpu_type = ""
-    raw_gpu = remote.get("allocated_gpu")
-    if isinstance(raw_gpu, str) and raw_gpu.strip():
-        try:
-            from flash.providers.core.base import GPU_INFO, canonical_gpu
-
-            name = canonical_gpu(raw_gpu)
-            info = GPU_INFO.get(name)
-            if info is not None and info.validated:
-                gpu_type = name
-        except Exception:
-            gpu_type = ""
-    raw_count = remote.get("allocated_gpu_count")
-    gpu_count = raw_count if isinstance(raw_count, int) and not isinstance(raw_count, bool) else 0
-    # mirror the spec layer's 1..8 bound so a corrupt stamp cannot reach the estimator.
-    if not 1 <= gpu_count <= 8:
-        gpu_count = 0
-    if not gpu_type or not gpu_count:
-        gpu_type, gpu_count = "", 0
-    return provider, gpu_type, gpu_count
-
-
 def cancelled_charge_usd(
     status: RunStatus,
     spec,
@@ -229,92 +51,46 @@ def cancelled_charge_usd(
     fallback: float = 0.0,
     rented_remote: dict | None = None,
 ) -> float:
-    """Price a mid-training cancellation from the accepted quote, scaled by the completed work.
+    """Price a cancellation: the training time it metered, at the shapes it rented.
 
-    the persisted quote (``estimated_cost_usd``) is the whole-cent submit-time amount shown by
-    ``flash train --cost``. provider selection and allocation never refresh it. instead the quote is
-    scaled by the completed share of estimated billed work: partial and full spec estimates use the
-    rented topology when available, so their ratio isolates the work fraction without replacing the
-    accepted quote. the fraction, not a bare ``steps / planned`` ratio, keeps the charge honest:
-    the one-time compile and each reached save land whole in the partial estimate, unreached saves
-    stay out of it, and a wall-capped plan caps both sides so the fraction is measured against the
-    capped horizon the quote actually paid for rather than the uncapped step count. the fraction is
-    capped at 1 so the charge never exceeds the quote. a run with no persisted quote has nothing to
-    clamp to, so it falls back to the spec reprice.
-
-    ``rented_remote`` is the provider handle captured before teardown cleared it: a successful
-    cancel destroys ``status.remote`` before billing runs, and the handle is the only durable
-    record of the rented basis. absent (legacy callers, never-allocated runs), the status's own
-    handle is consulted, which still covers failed or unconfirmed teardowns.
+    ``rented_remote`` is the provider handle captured before teardown cleared it; it names the
+    shape and attempt of the live rental. a worker that predates the meter falls back to the
+    quote's share of completed steps (``_legacy_quote_share``).
     """
     if getattr(spec, "algorithm", None) == "custom":
         from flash.custom.billing import session_charge
 
         return session_charge(status, spec)
-    # a metered worker reports its exact training GPU time; bill that, not the quote's estimate.
     metered = metered_charge_usd(status, spec, rented_remote=rented_remote)
     if metered is not None:
         return metered
+    return _legacy_quote_share(status, spec, steps=steps, fallback=fallback)
+
+
+def _legacy_quote_share(status: RunStatus, spec, *, steps: int, fallback: float) -> float:
+    """A cancelled run whose worker predates the meter: the quote x its completed-step share.
+
+    only runs in flight across the deploy that introduced metering reach this. an invalid persisted
+    quote returns ``fallback`` so the caller records the pricing failure.
+    """
     n = max(0, int(steps))
     if n == 0:
-        # cancelled before any training step: nothing rented, nothing owed.
         return 0.0
-    # the persisted worker spec of an auto-allocated run names no provider and carries the card
-    # count only as the ceiling the allocator searched under, so pricing it bare can re-optimize
-    # a 4-card rental onto the 1-card offline optimum. that changes the per-step term, so it does not
-    # cancel out of partial / full whenever the estimate also carries fixed work (moe compile,
-    # required saves) or a wall cap: both estimates are computed on the substrate and card shape
-    # the run actually rented.
-    provider, gpu_type, gpu_count = _rented_basis(
-        rented_remote if rented_remote is not None else getattr(status, "remote", None)
-    )
     quote = getattr(status, "estimated_cost_usd", None)
-    if quote is None:
-        return charge_usd_for_spec(
-            spec,
-            steps=n,
-            fallback=fallback,
-            provider=provider,
-            gpu_type=gpu_type,
-            gpu_count=gpu_count,
-        )
-    if isinstance(quote, bool) or not isinstance(quote, (int, float)):
-        # a malformed persisted quote is a pricing failure, not a license to reprice: the accepted
-        # rate is unknowable, so the caller's fallback must propagate and settle the run.
+    if (
+        isinstance(quote, bool)
+        or not isinstance(quote, (int, float))
+        or not math.isfinite(quote)
+        or quote < 0
+    ):
         return float(fallback)
-    quote = float(quote)
-    if not math.isfinite(quote) or quote < 0:
-        # negative and non-finite quotes cannot represent an accepted whole-cent amount, so the
-        # fallback propagates and the caller records the pricing failure.
-        return float(fallback)
-    if quote == 0:
-        # a valid quote may round to zero cents and remains authoritative for any completed work.
-        return 0.0
-    partial = charge_usd_for_spec(
-        spec,
-        steps=n,
-        fallback=float("nan"),
-        provider=provider,
-        gpu_type=gpu_type,
-        gpu_count=gpu_count,
-    )
-    full = charge_usd_for_spec(
-        spec,
-        fallback=float("nan"),
-        provider=provider,
-        gpu_type=gpu_type,
-        gpu_count=gpu_count,
-    )
-    if math.isfinite(partial) and math.isfinite(full) and full > 0:
-        return quote * min(1.0, partial / full) * _billed_rate_factor(rented_remote, status)
-    # the work fraction is unpriceable: reprice the spec but never bill a cancel above the quote.
-    # a non-finite reprice is a pricing failure and must propagate so the caller records it.
-    repriced = charge_usd_for_spec(
-        spec, steps=n, fallback=fallback, provider=provider, gpu_type=gpu_type, gpu_count=gpu_count
-    )
-    if not math.isfinite(repriced):
-        return repriced
-    return min(repriced, quote * _billed_rate_factor(rented_remote, status))
+    try:
+        from flash.cost.spec import spec_steps
+
+        planned = int(spec_steps(spec))
+    except Exception:
+        planned = 0
+    return float(quote) * (min(1.0, n / planned) if planned > 0 else 1.0)
 
 
 def _finite_seconds(value) -> float | None:
@@ -383,8 +159,7 @@ def metered_charge_usd(
 ):
     """Exact charge: metered training seconds x the rented card's $/hr x rented cards.
 
-    returns ``None`` when the run carries no meter (legacy workers), so callers fall back to the
-    quote-based estimate. the rate is the same per-card rate card the quote prices with, applied
+    returns ``None`` when the run carries no meter (legacy workers), so callers fall back. the rate is the same per-card rate card the quote prices with, applied
     to the provider/card/count the run actually rented rather than the quote's assumptions.
     """
     if completed_attempt is None and isinstance(rented_remote, dict):
@@ -409,14 +184,18 @@ def metered_charge_usd(
         spot = bool(is_spot_spec(spec))
     except Exception:
         pass
-    if spot and isinstance(merged.get("gpu"), str) and merged["gpu"]:
-        # a Spot run may launch on a different (interchangeable) class than it was allocated.
-        merged["allocated_gpu"] = merged["gpu"]
-    provider, gpu_type, gpu_count = _rented_basis(merged)
-    gpu_spec = getattr(spec, "gpu", None)
-    gpu_type = gpu_type or str(getattr(gpu_spec, "type", "") or "")
-    gpu_count = gpu_count or max(1, int(getattr(gpu_spec, "count", 1) or 1))
-    final_hourly = _per_card_rate("spot" if spot else provider, gpu_type) * gpu_count
+    from flash.runner.lifecycle.status import rented_shape_key
+
+    final = _parse_shape(rented_shape_key(merged), spot=spot)
+    if final is None:
+        # no usable rented handle: the spec's own class and card count.
+        gpu_spec = getattr(spec, "gpu", None)
+        final = (
+            "spot" if spot else str(merged.get("provider") or ""),
+            str(getattr(gpu_spec, "type", "") or ""),
+            max(1, int(getattr(gpu_spec, "count", 1) or 1)),
+        )
+    final_hourly = _per_card_rate(final[0], final[1]) * final[2]
     # each attempt bills at the shape it actually rented (an OOM retry moves to a larger card or
     # count; a Spot resume can land on another class), never repriced at the final rental. an
     # attempt whose shape was never observed bills at the final rental.
@@ -450,75 +229,21 @@ def _parse_shape(shape, *, spot: bool) -> tuple[str, str, int] | None:
     return ("spot" if spot else parts[0], parts[1], max(1, int(parts[2])))
 
 
-def _persisted_completed_work(spec) -> tuple[int | None, dict | None]:
-    """Authoritative completed steps and rented basis from terminal metrics."""
-    try:
-        with open(os.path.join(state.artifacts_dir(spec), "metrics.json")) as handle:
-            metrics = json.load(handle)
-    except (OSError, TypeError, ValueError):
-        return None, None
-    if not isinstance(metrics, dict):
-        return None, None
-    step = metrics.get("step")
-    valid_step = (
-        isinstance(step, (int, float))
-        and not isinstance(step, bool)
-        and (not isinstance(step, float) or (math.isfinite(step) and step.is_integer()))
-        and step >= 0
-    )
-    completed_steps = int(step) if valid_step else None
-    provider = metrics.get("allocated_provider")
-    gpu = metrics.get("allocated_gpu")
-    gpu_count = metrics.get("allocated_gpu_count")
-    rented_remote = {
-        "provider": provider,
-        "allocated_gpu": gpu,
-        "allocated_gpu_count": gpu_count,
-    }
-    if not any(value is not None for value in rented_remote.values()):
-        rented_remote = None
-    return completed_steps, rented_remote
-
-
 def _status_estimated_charge(
     status: RunStatus, spec, *, fallback: float = 0.0, completed_attempt=None
 ) -> float:
-    """Charge the quote exactly for full work, or its estimated share for an early finish."""
+    """Charge a completed run: the training time it metered, at the shapes it rented.
+
+    ``completed_attempt`` is the attempt whose terminal metrics completed the run. a worker that
+    predates the meter is charged ``fallback``, the measured wall-clock cost the caller computed
+    from its terminal metrics.
+    """
     if getattr(spec, "algorithm", None) == "custom":
         from flash.custom.billing import session_charge
 
         return session_charge(status, spec)
     metered = metered_charge_usd(status, spec, completed_attempt=completed_attempt)
-    if metered is not None:
-        return metered
-    completed_steps, persisted_basis = _persisted_completed_work(spec)
-    if completed_steps is not None:
-        # reuse cancellation's estimated-work fraction: one-time compile and reached saves stay
-        # whole, unreached saves stay out, and a wall-capped plan reaches 100% at its priced cap.
-        # a complete horizon produces a fraction of exactly 1 and therefore the accepted quote.
-        status_remote = status.remote if isinstance(status.remote, dict) else {}
-        rented_remote = {
-            key: value for key, value in (persisted_basis or {}).items() if value is not None
-        }
-        rented_remote.update(status_remote)
-        return cancelled_charge_usd(
-            status,
-            spec,
-            steps=completed_steps,
-            fallback=fallback,
-            rented_remote=rented_remote or None,
-        )
-    quote = getattr(status, "estimated_cost_usd", None)
-    if quote is not None:
-        return float(quote) * _billed_rate_factor(None, status)
-    return charge_usd_for_spec(spec, fallback=fallback)
-
-
-def _billed_rate_factor(rented_remote, status) -> float:
-    """Share of a Spot quote owed for the classes actually rented (1.0 for every other run)."""
-    from flash.runner.accounting.spot_usage import rate_factor
-
-    return rate_factor(status)
+    return float(fallback) if metered is None else metered
 
 
 def actual_steps_run(status: RunStatus) -> int:

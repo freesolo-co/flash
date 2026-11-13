@@ -307,12 +307,13 @@ def test_cancel_mid_first_update_bills_measured_time(tmp_path, monkeypatch):
     assert charge == pytest.approx(0.01 * H100_MODAL)
 
 
-def test_legacy_worker_without_meter_keeps_quote_pricing(tmp_path, monkeypatch):
+def test_a_legacy_worker_without_a_meter_pays_its_measured_fallback(tmp_path, monkeypatch):
     spec = _spec()
     _metrics(tmp_path, monkeypatch, spec, step=20, wall_seconds=1.0)
     assert costs.metered_training_seconds(_status(spec), spec) is None
-    charge = costs._status_estimated_charge(_status(spec, quote=12.34), spec, fallback=999.0)
-    assert charge == pytest.approx(12.34)
+    # a completion without a meter pays the measured wall cost the caller computed, not the quote.
+    charge = costs._status_estimated_charge(_status(spec, quote=12.34), spec, fallback=0.5)
+    assert charge == pytest.approx(0.5)
 
 
 # ---------------------------------------------------------------------------- estimator

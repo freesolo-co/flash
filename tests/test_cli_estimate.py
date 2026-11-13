@@ -155,24 +155,6 @@ def test_required_save_overhead_uses_contractual_commit_counts():
         assert required_save_overhead_seconds(config) == pytest.approx(expected)
 
 
-def test_partial_reprice_counts_reached_saves_and_drops_future_saves():
-    from flash.runner.accounting.costs import charge_usd_for_spec
-
-    def partial_charge(save_at_steps):
-        raw = copy.deepcopy(GRPO_RAW)
-        raw["train"].update({"max_steps": 100, "save_at_steps": save_at_steps})
-        return charge_usd_for_spec(spec_from_dict(raw), steps=10, fallback=-1.0)
-
-    # cancel at step 10: step 5 landed and remains priced, while steps 50/100 are dropped before the
-    # reduced run config is built so neither estimate falls back.
-    reached_save_charge = partial_charge([5, 50, 100])
-    future_only_charge = partial_charge([50, 100])
-
-    assert reached_save_charge != -1.0
-    assert future_only_charge != -1.0
-    assert reached_save_charge > future_only_charge > 0.0
-
-
 def test_sft_cost_requires_the_measured_workload_rather_than_deriving_one():
     """sft has no analytical step count left: without a profile the quote refuses to exist.
 

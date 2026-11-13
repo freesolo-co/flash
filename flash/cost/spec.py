@@ -118,10 +118,8 @@ def _rollout_batch_for_quote(spec) -> int:
     one leaves the batch unknowable in the same both-ways sense: an environment that honours it
     trains ``len(prompts)`` per step, so the requested batch overcharges 64x, and one that ignores
     it trains the full batch, so the env value undercharges 64x. Refusing looks right and is not:
-    ``charge_usd_for_spec`` prices a CANCELLED run through here by pinning ``max_steps`` onto the
-    spec, and its outer ``except Exception`` turns any refusal into the $0 fallback -- billing
-    nothing for a run that really executed. A quote that is too high can at least be seen and
-    disputed; a silent zero cannot. So the requested batch stands, and the guard against pricing an
+    it would reject a run whose horizon is fully stated, and the quote is only an estimate (the
+    charge is metered training time). So the requested batch stands, and the guard against pricing an
     unenforced number lives where it costs nothing: ``_on_policy_example_count`` refuses to derive a
     HORIZON from it, which is the path a submit-time quote takes.
     """
