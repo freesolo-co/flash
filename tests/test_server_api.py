@@ -1954,37 +1954,25 @@ def test_logs_include_the_rotated_log(api):
         "/v1/runs", json={"spec": SPEC, "dry_run": True}, headers=_bearer(key)
     ).json()["run_id"]
     log_path = os.path.join(runner_state.RUNS_DIR, f"{run_id}.log")
-    with open(log_path + ".1", "w") as f:
-        f.write("attempt=0 failed (boot_timeout)\n")
-    with open(log_path, "w") as f:
-        f.write("attempt 1 running\n")
     page = api.get(f"/v1/runs/{run_id}/logs", headers=_bearer(key)).json()
-    assert page["logs"] == "attempt=0 failed (boot_timeout)\nattempt 1 running\n"
+    assert "rotated_logs" not in page  # nothing rotated yet
+    with open(log_path + ".1", "w") as f:
+        f.write("retry\n")
+    with open(log_path, "w") as f:
+        f.write("retry\nfailure\n")  # new output may repeat rotated lines; none is dropped
+    page = api.get(f"/v1/runs/{run_id}/logs", headers=_bearer(key)).json()
+    assert page["rotated_logs"] == "retry\n"
+    assert page["logs"] == "retry\nfailure\n"
+    assert page["offset"] == len("retry\nfailure\n")  # offsets address only the current log
     with open(log_path, "a") as f:
         f.write("done\n")
     page2 = api.get(f"/v1/runs/{run_id}/logs?offset={page['offset']}", headers=_bearer(key)).json()
     assert page2["logs"] == "done\n"
-    # A poll between copytruncate's copy and its truncate sees the same bytes in both files: they
-    # are served once, and output written after the truncate is not skipped.
-    with open(log_path) as f:
-        current = f.read()
-    with open(log_path + ".1", "w") as f:
-        f.write(current)
-    whole = api.get(f"/v1/runs/{run_id}/logs", headers=_bearer(key)).json()
-    assert whole["logs"] == current
-    mid = api.get(f"/v1/runs/{run_id}/logs?offset={whole['offset']}", headers=_bearer(key)).json()
-    assert mid["logs"] == ""
-    assert mid["offset"] == whole["offset"]
-    with open(log_path, "w") as f:
-        f.write("new error\n")
-    after = api.get(f"/v1/runs/{run_id}/logs?offset={mid['offset']}", headers=_bearer(key)).json()
-    assert after["logs"] == "new error\n"
-    with open(log_path + ".1", "w") as f:
-        f.write("attempt=0 failed (boot_timeout)\n")
+    assert "rotated_logs" not in page2  # followers page the current log only
     os.remove(log_path)  # rotated, current log not yet recreated
-    assert api.get(f"/v1/runs/{run_id}/logs", headers=_bearer(key)).json()["logs"] == (
-        "attempt=0 failed (boot_timeout)\n"
-    )
+    page3 = api.get(f"/v1/runs/{run_id}/logs", headers=_bearer(key)).json()
+    assert page3["logs"] == ""
+    assert page3["rotated_logs"] == "retry\n"
 
 
 def test_worker_output_route(api, monkeypatch):
