@@ -766,3 +766,27 @@ def test_a_failed_scope_lookup_is_retryable_not_a_mismatch(monkeypatch):
     monkeypatch.setattr(client, "call", gone)
     with pytest.raises(RuntimeError, match="differ"):
         handles.require_scope(handle)
+
+
+def test_offers_skip_a_region_cooling_down_after_a_boot_timeout(monkeypatch):
+    from flash.providers.mithril import region_health
+
+    shapes = [
+        {
+            "fid": "it_test",
+            "gpu_type": "H200",
+            "num_gpus": 1,
+            "gpu_memory_gb": 141,
+            "gpu_socket": "SXM5",
+            "local_storage_gb": 1500,
+        }
+    ]
+    auctions = [
+        {"instance_type": "it_test", "region": r, "capacity": 3, "last_instance_price": "$2.00"}
+        for r in ("af-south1-a", "us-central2-b")
+    ]
+    monkeypatch.setattr(
+        prices, "call", lambda method, path, **kw: shapes if path == "/instance-types" else auctions
+    )
+    region_health.mark_unbootable("af-south1-a")
+    assert {o.region for o in prices.affordable_offers()} == {"us-central2-b"}
