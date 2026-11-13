@@ -154,6 +154,29 @@ def terminate(bid_id):
     raise MithrilApiError("Mithril bid cancellation and instance termination are not confirmed")
 
 
+def _cancel_earlier_attempts(run_id, attempt, *, deadline_at):
+    """Cancel this run's live bids from earlier attempts before bidding for a new one.
+
+    An ambiguous create (5xx, transport failure) requeues under a new attempt name, and Mithril can
+    still place the old attempt's bid afterwards. The orphan sweep skips active runs, so remove any
+    such bid here rather than let it bill beside the new attempt. Only one attempt of a run is ever
+    live, so an earlier attempt's bid is never one Flash is still supervising.
+    """
+    for bid in pages(
+        "/spot/bids", params={"project": settings()["project_id"]}, deadline_at=deadline_at
+    ):
+        labels = _ownership(bid)
+        if not labels or labels["flash-run"] != run_id:
+            continue
+        if not labels["flash-attempt"].isdigit() or int(labels["flash-attempt"]) >= attempt:
+            continue
+        if bid["status"] == "Terminated" and all(
+            row["status"] in _STOPPED for row in _instances(bid["fid"], deadline_at=deadline_at)
+        ):
+            continue
+        terminate(bid["fid"])
+
+
 def create(*, name, offer, payload, image_reference, gpu, gpu_count, capsule, disk_gb, deadline_at):
     from flash.providers.mithril.bootstrap import startup_script
 
@@ -205,6 +228,18 @@ def create(*, name, offer, payload, image_reference, gpu, gpu_count, capsule, di
     existing = reconcile()
     if existing:
         return existing
+    if int(payload["attempt"]) > 0:
+        try:
+            _cancel_earlier_attempts(
+                payload["run_id"], int(payload["attempt"]), deadline_at=deadline_at
+            )
+        except (MithrilApiError, TimeoutError, KeyError, TypeError, ValueError):
+            # Without confirming earlier attempts hold no live bid, a new bid could run beside a
+            # late one. Requeue instead; the next attempt retries the cleanup first.
+            raise CapacityUnavailableError(
+                "Could not confirm earlier Mithril attempts are cancelled; requeuing",
+                cause="earlier attempt cleanup unavailable",
+            ) from None
     owner_line = (
         _OWNER_PREFIX + base64.b64encode(json.dumps(labels, sort_keys=True).encode()).decode()
     )
@@ -268,13 +303,15 @@ def create(*, name, offer, payload, image_reference, gpu, gpu_count, capsule, di
                 f"Mithril refused the Spot bid ({cause}); requeuing", cause=cause
             ) from None
         # A 5xx, transport failure, timeout or unreadable 2xx may still have created the bid after
-        # the listing above. Look once more after a bounded pause and adopt a late bid, but never
-        # retry an unknown POST outcome: the next attempt's new name would leave a late bid from
-        # this one running beside it until the run ends.
+        # the listing above. Look once more after a bounded pause and adopt a late bid. If none
+        # appeared, requeue: in practice Mithril's 5xx is a transient refusal, and the next
+        # attempt cancels any bid this one places late before it bids (_cancel_earlier_attempts).
+        # Do not cool the shape down; a 5xx says nothing about that region or instance type.
         time.sleep(max(0, min(CREATE_RECHECK_SECONDS, deadline_at - time.time())))
         existing = reconciled()
         if existing:
             return existing
-        raise UnreconciledCreateError(
-            "Mithril launch could not be reconciled; refusing duplicate allocation", cause=cause
+        raise CapacityUnavailableError(
+            f"Mithril Spot bid outcome unknown ({cause}) and no bid appeared; requeuing",
+            cause=cause,
         ) from None
