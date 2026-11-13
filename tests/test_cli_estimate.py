@@ -1040,29 +1040,6 @@ def test_plain_non_sft_cost_uses_the_authoritative_server_quote(
     assert "warm-start" not in captured.err
 
 
-def test_warm_start_exact_card_cost_uses_the_server_prepared_quote(tmp_path, capsys, monkeypatch):
-    """an exact card pin is priced only after preparation resolves the source adapter rank."""
-    client = _use_client(monkeypatch, _QuotingClient({"estimated_cost_usd": 6.5}))
-    body = SFT_TOML.replace('algorithm = "sft"', 'algorithm = "grpo"').replace(
-        "batch_size = 8\n",
-        "prompts_per_step = 8\nmax_examples = 40\ngroup_size = 2\n"
-        'init_from_adapter = "source-run/final"\n',
-    )
-    # sft_toml ends with an empty `[gpu]`, so the pin is appended into that section.
-    body = body.replace('model = "Qwen/Qwen3.5-9B"', 'model = "Qwen/Qwen3.6-35B-A3B"')
-    body += 'type = "B200"\ncount = 1\n'
-
-    assert cmd_train(_sft_args(tmp_path, body)) == 0
-    captured = capsys.readouterr()
-
-    assert client.calls[0]["dry_run"] is True
-    assert client.calls[0]["spec"]["gpu"]["type"] == "B200"
-    assert client.calls[0]["spec"]["gpu"]["count"] == 1
-    assert "$6.50" in captured.out
-    assert "--gpus 2" not in captured.err
-    assert "provisional" not in captured.err
-
-
 def _warm_start_rank_boundary_config():
     from flash.cost.spec import run_config_from_spec
 

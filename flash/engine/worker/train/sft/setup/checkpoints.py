@@ -227,16 +227,49 @@ class _VerlCheckpointWatcher:
                 checkpoint_dir, os.path.join(self.staging_root, f"global_step_{step}")
             )
 
+    def _rotated_away(self, step: int, checkpoint_dir: str) -> bool:
+        """Whether verl already deleted this OPTIONAL checkpoint because a newer one completed.
+
+        The child keeps ``max_ckpt_to_keep=1`` and only waits for publication of REQUIRED steps
+        (``save_at_steps``) before rotating. A periodic step can therefore vanish while this
+        watcher still waits for persistence capacity to pin it, which is common on fast cards,
+        where the next save lands sooner. Its weights are superseded by the newer checkpoint
+        that rotated it out, which the next sweep publishes. Required steps never qualify: the
+        retention gate protects them, so their disappearance stays a hard failure.
+        """
+        if step in self.required_steps or os.path.isdir(checkpoint_dir):
+            return False
+        return self._completed_step() > step
+
+    def _stage_or_skip_rotated(self, step: int, checkpoint_dir: str) -> str | None:
+        """Pin ``checkpoint_dir``; ``None`` when it was rotated away (see ``_rotated_away``)."""
+        try:
+            return self._staged_source(step, checkpoint_dir)
+        except FileNotFoundError:
+            if not self._rotated_away(step, checkpoint_dir):
+                raise
+        self.lifecycle.mark_discovered(step)
+        print(
+            f"[ckpt] skipping periodic checkpoint step {step}: the trainer rotated it out after "
+            f"saving step {self._completed_step()} before it could be pinned; the newer "
+            "checkpoint supersedes it",
+            flush=True,
+        )
+        return None
+
     def _publish(self, step: int, checkpoint_dir: str) -> None:
         if not self._should_publish(step):
             from flash.core.checkpoint_policy import is_spot_spec
 
             self.lifecycle.mark_discovered(step)
             if is_spot_spec(self.context.config.spec):
-                staged_dir = self._staged_source(step, checkpoint_dir)
-                self._persist_resume(step, staged_dir, job_label="sft")
+                staged_dir = self._stage_or_skip_rotated(step, checkpoint_dir)
+                if staged_dir is not None:
+                    self._persist_resume(step, staged_dir, job_label="sft")
             return
-        staged_dir = self._staged_source(step, checkpoint_dir)
+        staged_dir = self._stage_or_skip_rotated(step, checkpoint_dir)
+        if staged_dir is None:
+            return
         try:
             with checkpoint_phase(step, "adapter_publication"):
                 self._publish_from(step, staged_dir)

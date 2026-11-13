@@ -143,7 +143,15 @@ class CapacityLookupError(RuntimeError):
 
 
 class CapacityUnavailableError(CapacityLookupError):
-    """A live provider answered successfully but currently offers no fitting capacity."""
+    """A live provider answered successfully but currently offers no fitting capacity.
+
+    ``cause`` optionally names the provider response behind the refusal (e.g. ``http 422``), never
+    its body, so a persisted requeue detail can tell a throttle from a quota or validation refusal.
+    """
+
+    def __init__(self, message: str = "", *, cause: str = "") -> None:
+        super().__init__(message)
+        self.cause = cause
 
 
 class UnreconciledCreateError(RuntimeError):
@@ -324,7 +332,12 @@ def custom_gpu_shape(model_id, provider, gpu_types, count):
     elif provider not in {"", "modal"} or not valid_count or (count or 1) not in (1, 2):
         raise ValueError("custom training supports one or two managed Modal GPUs or one Spot GPU")
     allowed = tuple(gpu_types)
-    return provider or "modal", allowed[0] if allowed else "", allowed[1:], count or 1
+    if count is None:
+        # auto-size: Spot custom sessions are one card; Modal may layer-shard across two.
+        from flash.custom.placement import MAX_GPUS
+
+        count = 1 if provider == "spot" else MAX_GPUS
+    return provider or "modal", allowed[0] if allowed else "", allowed[1:], count
 
 
 def authored_gpu_ceiling(gpu_type: str, gpu_count: int | None) -> int | None:

@@ -445,7 +445,11 @@ def _submit_provider(ctx: _SubmitContext, prepared, candidate_plan):
             PollResult(
                 False,
                 failure="no_capacity",
-                detail=f"provider refused the create for capacity ({type(exc).__name__})",
+                detail=(
+                    f"provider refused the create for capacity ({type(exc).__name__}"
+                    + (f" after {exc.cause}" if getattr(exc, "cause", "") else "")
+                    + ")"
+                ),
             ),
             True,
         )

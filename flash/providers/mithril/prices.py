@@ -8,6 +8,10 @@ from flash.providers.mithril.client import MithrilApiError, call
 from flash.providers.mithril.pricing import SPOT_GPUS, accepts_price
 from flash.providers.mithril.region_health import cooling_down
 
+# Regions never bid in. af-south1-a lists capacity and accepts bids, but none of 112 Flash VMs
+# allocated there booted (93 boot timeouts) while us-central2-a booted 35 of 39 (2026-11-11..13).
+EXCLUDED_REGIONS = frozenset({"af-south1-a"})
+
 
 @dataclass(frozen=True)
 class Offer:
@@ -39,6 +43,8 @@ def affordable_offers(*, deadline_at=None) -> list[Offer]:
         offers = []
         for auction in auctions:
             if not isinstance(auction.get("region"), str) or not auction["region"]:
+                continue
+            if auction["region"] in EXCLUDED_REGIONS:
                 continue
             if cooling_down(auction["region"]):
                 continue  # its last filled bid never booted
