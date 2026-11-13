@@ -89,7 +89,11 @@ def test_missing_provider_preserves_eight_gpu_spot_billing_shape():
 
 
 def _status(spec, remote_gpu, **fields):
+    """A run submitted under the current tariff, the way submit records it."""
+    from flash.providers.mithril.pricing import tariff
+
     remote = {"provider": "spot", "gpu": remote_gpu} if remote_gpu else None
+    fields.setdefault("submitted_spot_rates", tariff())
     return RunStatus(run_id="r", state="running", spec=spec.to_dict(), remote=remote, **fields)
 
 
@@ -127,10 +131,53 @@ def test_every_spot_quote_uses_the_top_spot_rate():
 def test_rate_factor_weights_usage_by_class(usage, factor):
     from types import SimpleNamespace
 
+    from flash.providers.mithril.pricing import tariff
     from flash.runner.accounting.spot_usage import rate_factor
 
     hb = {"spot_usage_by_gpu": usage} if usage is not None else {}
-    assert rate_factor(SimpleNamespace(last_heartbeat=hb)) == pytest.approx(factor)
+    status = SimpleNamespace(last_heartbeat=hb, submitted_spot_rates=tariff())
+    assert rate_factor(status) == pytest.approx(factor)
+
+
+@pytest.mark.parametrize(
+    ("usage", "factor"),
+    [
+        ({"H100": 10}, 0.8),  # $2.00 of the $2.50 quote rate the run accepted
+        ({"H200": 10}, 1.0),
+        ({"H100": 5, "H200": 5}, 0.9),
+    ],
+)
+def test_runs_quoted_before_rates_were_recorded_settle_on_the_legacy_tariff(usage, factor):
+    """A run submitted under the old $2.00/$2.50 tariff is never repriced by a later rate change:
+    an H100-only run with an accepted $2.50 quote still settles at $2.00, not $2.50 x 2.10/2.60."""
+    from types import SimpleNamespace
+
+    from flash.runner.accounting.spot_usage import rate_factor
+
+    legacy = SimpleNamespace(last_heartbeat={"spot_usage_by_gpu": usage})  # no recorded rates
+    assert rate_factor(legacy) == pytest.approx(factor)
+    assert 2.5 * rate_factor(
+        SimpleNamespace(last_heartbeat={"spot_usage_by_gpu": {"H100": 1}})
+    ) == (pytest.approx(2.0))
+
+
+def test_recorded_submit_rates_survive_a_later_rate_change(monkeypatch):
+    from decimal import Decimal
+    from types import SimpleNamespace
+
+    from flash.providers.mithril import pricing
+    from flash.runner.accounting.spot_usage import rate_factor
+
+    status = SimpleNamespace(
+        last_heartbeat={"spot_usage_by_gpu": {"H100": 10}},
+        submitted_spot_rates={"H100": 2.1, "H200": 2.6},
+    )
+    monkeypatch.setattr(
+        pricing,
+        "SPOT_GPUS",
+        {"H100": pricing.SpotGpu(Decimal("3.00")), "H200": pricing.SpotGpu(Decimal("4.00"))},
+    )
+    assert rate_factor(status) == pytest.approx(2.1 / 2.6)
 
 
 def test_steps_are_credited_to_the_class_that_reached_them_once():
@@ -216,3 +263,12 @@ def test_supervisor_records_the_class_actually_rented(chosen, remote, expected):
 
     rented = _rented_candidate(Candidate(chosen[0], chosen[1], 2.5, 80, 1), remote)
     assert (rented.gpu, rented.vram_gb) == expected
+
+
+def test_submit_records_the_spot_tariff_only_for_spot_runs():
+    from flash.providers.mithril.pricing import tariff
+    from flash.runner.lifecycle.submit import _spot_tariff
+
+    assert _spot_tariff(spot_spec("H100")) == tariff() == {"H100": 2.1, "H200": 2.6}
+    regular = replace(spot_spec(), gpu=GpuSpec(type="H100", count=1, provider="modal"))
+    assert _spot_tariff(regular) is None

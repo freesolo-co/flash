@@ -32,6 +32,17 @@ SPOT_GPUS = {
 }
 
 
+# The tariff every Spot run accepted before rates rose to the current table. Runs submitted before
+# submit-time rates were recorded (``RunStatus.submitted_spot_rates`` absent) settle on these, so a
+# rate change never reprices a quote that was already accepted.
+LEGACY_SPOT_RATES = {"H100": Decimal("2.00"), "H200": Decimal("2.50")}
+
+
+def tariff() -> dict[str, float]:
+    """Current per-GPU-hour rate of every Spot class, as recorded on a run at submission."""
+    return {gpu: float(shape.hourly_usd) for gpu, shape in SPOT_GPUS.items()}
+
+
 def hourly_rate(gpu: str) -> float:
     return float(SPOT_GPUS[canonical_gpu(gpu)].hourly_usd)
 
