@@ -4972,3 +4972,63 @@ def test_sft_reports_worker_dataset_counts_separately_from_quote(worker_context,
     assert captured["meta"]["notes"]["training_dataset"] == realized_counts
     ready = [fields for stage, fields in captured["heartbeats"] if stage == "sft_dataset_ready"]
     assert ready == [{"training_dataset": realized_counts}]
+
+
+def _rotation_watcher(worker_context, tmp_path, *, required_steps):
+    from flash.engine.worker.train.entry import sft_train
+
+    local_dir = tmp_path / "ckpts"
+    (local_dir / "global_step_300" / "huggingface").mkdir(parents=True)
+    # verl (max_ckpt_to_keep=1) already rotated step 250 out after completing step 300.
+    (local_dir / "latest_checkpointed_iteration.txt").write_text("300")
+    watcher = sft_train._VerlCheckpointWatcher(
+        local_dir=str(local_dir),
+        export_root=str(tmp_path / "exports"),
+        python_bin="/verl/python",
+        model_id="org/model",
+        model_revision="commit",
+        required_steps=required_steps,
+        context=worker_context,
+    )
+    return watcher, str(local_dir / "global_step_250")
+
+
+def test_a_periodic_checkpoint_rotated_out_before_pinning_is_skipped_not_fatal(
+    worker_context, monkeypatch, tmp_path
+):
+    """fast cards save the next checkpoint before the watcher pins the last one.
+
+    the trainer keeps one checkpoint and only waits for REQUIRED steps, so a periodic step can be
+    deleted while the watcher waits for persistence capacity. that used to raise FileNotFoundError,
+    kill the watcher and fail a run whose training had completed. the newer checkpoint supersedes it.
+    """
+    watcher, rotated = _rotation_watcher(worker_context, tmp_path, required_steps=())
+    published = []
+    monkeypatch.setattr(watcher, "_publish_from", lambda step, staged: published.append(step))
+
+    watcher._publish(250, rotated)
+
+    assert published == []
+    assert watcher.lifecycle.facts(250).discovered
+    assert not watcher.lifecycle.facts(250).deployable_published
+    assert not os.path.exists(os.path.join(watcher.staging_root, "global_step_250"))
+    # the superseding step still publishes normally.
+    watcher._publish(300, str(tmp_path / "ckpts" / "global_step_300"))
+    assert published == [300]
+
+
+def test_a_rotated_required_checkpoint_still_fails_closed(worker_context, tmp_path):
+    """required saves are protected by the retention gate; losing one is a real failure."""
+    watcher, rotated = _rotation_watcher(worker_context, tmp_path, required_steps=(250,))
+
+    with pytest.raises(FileNotFoundError):
+        watcher._publish(250, rotated)
+
+
+def test_a_missing_checkpoint_that_nothing_superseded_still_fails(worker_context, tmp_path):
+    """without a newer completed checkpoint, a vanished directory is not rotation."""
+    watcher, _ = _rotation_watcher(worker_context, tmp_path, required_steps=())
+    missing = str(tmp_path / "ckpts" / "global_step_400")
+
+    with pytest.raises(FileNotFoundError):
+        watcher._publish(400, missing)
