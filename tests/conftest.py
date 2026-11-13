@@ -295,6 +295,15 @@ def _private_plane_lease(monkeypatch, tmp_path):
 
 
 @pytest.fixture(autouse=True)
+def _private_spot_region_cooldown(monkeypatch, tmp_path):
+    """Each test sees its own (empty) Spot region cooldown, never the developer's ~/.flash."""
+    from flash.providers.mithril import region_health
+
+    path = tmp_path / ".spot-region-cooldown.json"
+    monkeypatch.setattr(region_health, "_path", lambda: path)
+
+
+@pytest.fixture(autouse=True)
 def _reset_status_reporter_before_test():
     from flash.runner.lifecycle import reporting
 
