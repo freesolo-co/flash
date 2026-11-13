@@ -380,6 +380,9 @@ def record_heartbeat(run_id: str, heartbeat: dict) -> None:
                 prior += _session_seconds(_heartbeat_billable_seconds(prev))
             if prior:
                 hb.setdefault("billable_train_s_prior", prior)
+        if status.spec.get("algorithm") != "custom":
+            # outside the prev guard: the first heartbeat the poller sees can already carry minutes
+            # of metered training, and those seconds belong to the shape rented right now.
             _credit_billable_seconds(status, prev, hb, same_attempt=same_attempt)
         from flash.runner.accounting.spot_usage import record as record_spot_usage
 

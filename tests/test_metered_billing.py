@@ -463,3 +463,49 @@ def test_spot_charge_weights_class_rates_by_seconds_not_steps(tmp_path, monkeypa
     }
     charge = costs._status_estimated_charge(_status(spec, heartbeat=hb), spec, fallback=999.0)
     assert charge == pytest.approx(4.25)
+
+
+def test_the_first_observed_heartbeat_credits_its_shape(tmp_path, monkeypatch):
+    """The poller can first see a run mid-training; those seconds belong to the shape rented then.
+
+    Samples of 1,800 s then 3,600 s on 1x H100, then a retry for 3,600 s on 2x H100, must bill
+    3 card-hours ($13.28), not price the first 1,800 s at the final 2-card rental ($15.49).
+    """
+    spec = _spec()
+    # the terminal metrics (final frozen meter: 3,600 s on 2x H100), written before os.path.exists
+    # is patched below for record_heartbeat.
+    _metrics(
+        tmp_path,
+        monkeypatch,
+        spec,
+        step=20,
+        allocated_provider="modal",
+        allocated_gpu="H100",
+        allocated_gpu_count=2,
+        notes={"training_timing": {"billable_train_s": 3600.0}},
+    )
+    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path), raising=False)
+    status = _status(spec, state="running", heartbeat=None)
+    saved = {}
+    monkeypatch.setattr(status_ops, "get_status", lambda run_id: status)
+    monkeypatch.setattr(runner_state, "_save_status_unlocked", lambda s: saved.update(s=s))
+    monkeypatch.setattr(status_ops.os.path, "exists", lambda path: True)
+    monkeypatch.setattr(status_ops.reporting, "_report_status", lambda s: None, raising=False)
+
+    def beat(attempt, billable, cards):
+        status.remote = {"provider": "modal", "allocated_gpu": "H100", "allocated_gpu_count": cards}
+        hb = {"attempt": attempt, "stage": "sft_step", "training_timing": {}}
+        hb["training_timing"]["billable_train_s"] = billable
+        status_ops.record_heartbeat(spec.run_id, hb)
+        status.last_heartbeat = saved["s"].last_heartbeat
+
+    beat(0, 1800.0, 1)  # first observation, prev is None
+    beat(0, 3600.0, 1)
+    beat(1, 3600.0, 2)  # OOM retry on 2x H100
+    assert status.last_heartbeat[status_ops.BILLABLE_SHAPE_KEY] == {
+        "modal|H100|1": 3600.0,
+        "modal|H100|2": 3600.0,
+    }
+    status.state = "done"
+    charge = costs._status_estimated_charge(status, spec, fallback=999.0)
+    assert charge == pytest.approx(3 * H100_MODAL)
