@@ -10,7 +10,8 @@ charge = billable_train_seconds / 3600 × rate-card $/hr for the rented card × 
 
 - **Meter start:** the start of the attempt's first optimizer update (`FLASH_TRAINING_PHASE
   first_update started`, observed by the worker parent).
-- **Meter stop:** the training loop exits (SFT child exit; GRPO verl exit).
+- **Meter stop:** the moment the trainer child exits (SFT child; GRPO verl), before the checkpoint
+  watcher or required-save validation drains any pending adapter publication or upload.
 - **Never billed:** queueing and provisioning, container boot, model download, data loading,
   capability checks, trainer/model/vLLM initialization, and final adapter export/publication.
 - **Billed:** every optimizer update, including the first one (graph capture and warm-up happen
@@ -19,6 +20,9 @@ charge = billable_train_seconds / 3600 × rate-card $/hr for the rented card × 
   earlier attempts' metered seconds as `billable_train_s_prior`, so the charge covers every attempt.
 - **Cancellation:** the latest heartbeat's meter (`training_timing.billable_train_s`), plus earlier
   attempts.
+- **Spot:** dev's fixed class rates (H100 $2.00/hr, H200 $2.50/hr). A run that resumes on a
+  different class is priced by metered **seconds** per class (`spot_billable_s_by_gpu`), never by
+  steps, because classes differ in seconds per step and a resumed attempt can repeat steps.
 - **Legacy workers** that report no meter keep the previous quote-based pricing.
 - **Custom runs** are unchanged. They were already metered on session time, which starts after
   the backend loads the model and ends at session close or cancel. Session time includes time the
@@ -48,7 +52,7 @@ runs decide, because historical "actual" values include unobservable queue time.
 | SFT per-step floor | 0.8 s | 0.10 s |
 | SFT first update (one-time) | — | 250 s + 5 s × active params (B) |
 | MoE SFT MFU (total params) | 0.10 | 0.45 |
-| Image SFT (exact-unpacked) vision encoding | — | 0.41 s/example |
+| Image SFT vision encoding (multimodal profiles only) | — | 0.41 s/example |
 | GRPO step floor | 62.7 s + 0.805 s/completion | 3.5 s + 0.466 s/completion |
 | GRPO decode / update MFU | 0.12 / 0.35 | 0.25 / 0.72 |
 | GRPO first update (one-time) | — | 60 s + 6 s × active params (B) |
@@ -95,7 +99,9 @@ What the quote still cannot know:
 - **LoRA rank** has no measurable effect on this workload. One live rank-128 run took 1.64× its
   rank-16 twin, but its repeat (0.97) and a rank-64 run (1.00) matched rank 16. The slow run was a
   one-off outlier, so no rank term was added.
-- **Image SFT** (MiniWoB screenshots, exact-unpacked) was under-estimated at 0.63 (n=46). A
+- **Image SFT** (MiniWoB screenshots; gated on the profile's `architecture_mode == "multimodal"`,
+  not on exact-unpacked packing, which text-only models that cannot pack also use) was
+  under-estimated at 0.63 (n=46). A
   per-example vision-encoding term (0.41 s/example) brings it to ~1.00. Three live 600-step MiniWoB
   image runs measured 0.97 / 1.20 / 1.14. Identical repeats spread 816–1,006 s. Each spent
   900–1,100 s in setup (image loading and model download), which the meter excludes.
