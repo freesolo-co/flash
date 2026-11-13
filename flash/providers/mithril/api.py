@@ -258,6 +258,12 @@ def create(*, name, offer, payload, image_reference, gpu, gpu_count, capsule, di
         if 400 <= status < 500:
             # A 4xx is a definitive refusal, and reconciliation found no bid under this attempt's
             # name, so nothing was created: requeue (a new attempt name) instead of failing.
+            # Cool down this exact region/instance type so the requeue waits for an offer Mithril
+            # accepts (often another interchangeable class) instead of rebidding the refused one.
+            if status != 429:
+                from flash.providers.mithril.region_health import mark_refused
+
+                mark_refused(offer.region, offer.instance_type)
             raise CapacityUnavailableError(
                 f"Mithril refused the Spot bid ({cause}); requeuing", cause=cause
             ) from None

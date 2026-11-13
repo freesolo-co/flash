@@ -29,7 +29,11 @@ def call(method, path, *, body=None, params=None, deadline_at=None):
                 json=body,
             )
             if not 200 <= response.status_code < 300:
-                raise MithrilApiError(status=response.status_code)
+                # status only: Mithril can echo request data (including secrets) in error bodies.
+                raise MithrilApiError(
+                    f"Mithril {method} {path} returned {response.status_code}",
+                    status=response.status_code,
+                )
             return None if response.status_code == 204 else response.json()
     except (httpx.HTTPError, ValueError):
         raise MithrilApiError("Mithril operation failed or timed out") from None
