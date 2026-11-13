@@ -24,10 +24,9 @@ def require_recorded_scope(status) -> None:
     """A lost launch must be reconciled in the same workspace and environment."""
     spot_scope = getattr(status, "submitted_spot_scope", None)
     if spot_scope is not None:
-        from flash.providers.mithril.config import scope_fingerprint as spot_scope_fingerprint
+        from flash.providers.mithril.handles import require_run_scope
 
-        if spot_scope != spot_scope_fingerprint():
-            raise RuntimeError("Mithril project or region differs from this run's owner")
+        require_run_scope(spot_scope)
     recorded = getattr(status, "submitted_modal_scope", None)
     if recorded is not None and recorded != scope_fingerprint():
         raise RuntimeError("Modal credentials or environment differ from this run's owner")

@@ -746,6 +746,32 @@ def test_attempts_from_region_pinned_releases_stay_recognized(monkeypatch):
     handles.require_scope(SimpleNamespace(scope=config.scope_fingerprint(), instance_id="bid_x"))
 
 
+def test_runs_from_region_pinned_releases_stay_recoverable(monkeypatch):
+    from flash.providers.modal import auth
+
+    monkeypatch.setattr(auth, "scope_fingerprint", lambda: "modal_scope")
+    regions = [{"region": "eu-x"}, {"region": "us-central2-b"}]
+    monkeypatch.setattr(client, "call", lambda m, p, **kw: regions)
+    run = SimpleNamespace(
+        submitted_spot_scope=config.region_scope_fingerprint("proj_test", "us-central2-b"),
+        submitted_modal_scope="modal_scope",
+    )
+    auth.require_recorded_scope(run)  # a handle-less run matched against every listed region
+    run.submitted_spot_scope = config.region_scope_fingerprint("proj_other", "us-central2-b")
+    with pytest.raises(RuntimeError, match="differs"):
+        auth.require_recorded_scope(run)
+
+    def fail(m, p, **kw):
+        raise client.MithrilApiError(status=503)
+
+    monkeypatch.setattr(client, "call", fail)
+    run.submitted_spot_scope = config.region_scope_fingerprint("proj_test", "us-central2-b")
+    with pytest.raises(client.MithrilApiError):  # unverified, so recovery retries
+        auth.require_recorded_scope(run)
+    run.submitted_spot_scope = config.scope_fingerprint()
+    auth.require_recorded_scope(run)  # the current scope needs no lookup
+
+
 def test_a_failed_scope_lookup_is_retryable_not_a_mismatch(monkeypatch):
     from flash.providers.mithril import handles
 

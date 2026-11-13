@@ -50,6 +50,39 @@ class SpotJobHandle(InstanceJobHandle):
 _NO_SUCH_BID = frozenset({400, 403, 404, 422})
 
 
+def require_run_scope(scope):
+    """Accept a run's recorded Spot scope when it belongs to this Mithril project.
+
+    Runs submitted by region-pinned releases record the retired project+region scope and, before
+    their first bid, have no bid to read the region from. Match that scope against every region
+    Mithril lists so removing the setting does not leave those runs unrecoverable.
+    """
+    from flash.providers.mithril.config import (
+        region_scope_fingerprint,
+        scope_fingerprint,
+        settings,
+    )
+
+    if scope == scope_fingerprint():
+        return
+    from flash.providers.mithril.client import call
+
+    # A failed lookup leaves ownership unverified, not disproven; callers retry.
+    auctions = call("GET", "/spot/availability")
+    project = settings()["project_id"]
+    regions = {
+        auction.get("region")
+        for auction in (auctions if isinstance(auctions, list) else [])
+        if isinstance(auction, dict)
+    }
+    if any(
+        isinstance(region, str) and region and scope == region_scope_fingerprint(project, region)
+        for region in regions
+    ):
+        return
+    raise RuntimeError("Mithril project differs from this run's owner")
+
+
 def require_scope(handle):
     from flash.providers.mithril.config import (
         region_scope_fingerprint,
