@@ -1964,6 +1964,23 @@ def test_logs_include_the_rotated_log(api):
         f.write("done\n")
     page2 = api.get(f"/v1/runs/{run_id}/logs?offset={page['offset']}", headers=_bearer(key)).json()
     assert page2["logs"] == "done\n"
+    # A poll between copytruncate's copy and its truncate sees the same bytes in both files: they
+    # are served once, and output written after the truncate is not skipped.
+    with open(log_path) as f:
+        current = f.read()
+    with open(log_path + ".1", "w") as f:
+        f.write(current)
+    whole = api.get(f"/v1/runs/{run_id}/logs", headers=_bearer(key)).json()
+    assert whole["logs"] == current
+    mid = api.get(f"/v1/runs/{run_id}/logs?offset={whole['offset']}", headers=_bearer(key)).json()
+    assert mid["logs"] == ""
+    assert mid["offset"] == whole["offset"]
+    with open(log_path, "w") as f:
+        f.write("new error\n")
+    after = api.get(f"/v1/runs/{run_id}/logs?offset={mid['offset']}", headers=_bearer(key)).json()
+    assert after["logs"] == "new error\n"
+    with open(log_path + ".1", "w") as f:
+        f.write("attempt=0 failed (boot_timeout)\n")
     os.remove(log_path)  # rotated, current log not yet recreated
     assert api.get(f"/v1/runs/{run_id}/logs", headers=_bearer(key)).json()["logs"] == (
         "attempt=0 failed (boot_timeout)\n"

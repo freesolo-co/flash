@@ -512,6 +512,20 @@ def run_status(run_id: str, key: Annotated[dict, Depends(require_key)]):
     return status.to_dict()
 
 
+def _starts_with_file(path: str, prefix_path: str, prefix_size: int) -> bool:
+    """Whether ``path`` begins with all ``prefix_size`` bytes of ``prefix_path`` (chunked compare)."""
+    if prefix_size <= 0 or not os.path.isfile(path) or os.path.getsize(path) < prefix_size:
+        return False
+    with open(path, "rb") as current, open(prefix_path, "rb") as copied:
+        remaining = prefix_size
+        while remaining:
+            size = min(remaining, 1 << 16)
+            if current.read(size) != copied.read(size):
+                return False
+            remaining -= size
+    return True
+
+
 @router.get("/v1/runs/{run_id}/logs")
 def run_logs(
     run_id: str,
@@ -527,15 +541,18 @@ def run_logs(
     rotated_size = os.path.getsize(rotated_path) if os.path.isfile(rotated_path) else 0
     data, end = b"", max(0, offset)
     try:
+        # Mid copytruncate, ``.log`` still begins with the bytes just copied to ``.log.1``; those
+        # are already served from ``.log.1``, so only what follows them is new.
+        skip = rotated_size if _starts_with_file(log_path, rotated_path, rotated_size) else 0
         if end < rotated_size:
             with open(rotated_path, "rb") as f:
                 f.seek(end)
                 data = f.read(rotated_size - end)
         if os.path.exists(log_path):
             with open(log_path, "rb") as f:
-                f.seek(max(0, end - rotated_size))
+                f.seek(skip + max(0, end - rotated_size))
                 data += f.read()
-                end = rotated_size + f.tell()
+                end = rotated_size + max(0, f.tell() - skip)
         else:
             end = max(end, rotated_size)
     except (ValueError, OSError, OverflowError) as exc:
