@@ -758,7 +758,13 @@ def _raise_no_candidate_error(
     # advertised somewhere, so "come back later" is a coherent thing to say. Evaluated once -- three
     # copies of this question is what let the sft width clamp reach one branch and not the others.
     could_fit = _structurally_fits(supported_available, need, cap, executed_width, acceptable)
-    if supported_available == ("spot",) and not could_fit:
+    from flash.providers.mithril.pricing import MAX_SPOT_CARDS
+
+    # only when no Spot shape holds the run at ANY card count: a restrictive authored ceiling
+    # keeps its own ceiling-aware error below, which tells the user to raise the ceiling.
+    if supported_available == ("spot",) and not _structurally_fits(
+        ("spot",), need, MAX_SPOT_CARDS, executed_width, acceptable
+    ):
         from flash.providers.mithril.pricing import spot_unsupported_message
 
         raise UnsupportedGpuError(spot_unsupported_message(model_id, algorithm, need))
@@ -951,7 +957,7 @@ def _cheapest_allocation(
 ) -> Allocation:
     """The cheapest-JOB shape from a non-empty fitting set, plus the full ranking behind it.
 
-    Spot candidates rank by card count, then class priority, before any cost key (see below).
+    Spot candidates rank by rental price, then class priority, before any cost key (see below).
 
     Cheapest job, not cheapest rental: rank on the dollars one step costs on each candidate (rate x
     how long that hardware takes), so a faster card wins whenever it finishes enough sooner to pay
@@ -963,6 +969,7 @@ def _cheapest_allocation(
     $/hr.
     """
     from flash.providers.mithril.pricing import priority as spot_priority
+    from flash.providers.mithril.pricing import shape_price as spot_shape_price
 
     primary = cost_per_step if cost_per_step is not None else (lambda c: c.total_hourly_usd)
     unnamed_rank = len(provider_rank)
@@ -970,11 +977,10 @@ def _cheapest_allocation(
         candidates,
         key=lambda c: (
             provider_rank.get(c.provider, unnamed_rank),
-            # Spot: fewest cards first, then class priority. The queue only waits for shapes with
-            # the allocated card count, and multi-card Spot shapes price far above the per-GPU cap,
-            # so ranking class ahead of count chose 8x H100 ($20/hr, never under cap) over a 1x H200
-            # that fits and is rentable now.
-            c.gpu_count if c.provider == "spot" else 0,
+            # Spot: cheapest rental first (fixed class rate x cards), then class priority. Ranking
+            # class ahead of price chose 8x H100 ($16/hr, never under its cap) over a fitting
+            # 1x H200 ($2.50/hr) that was rentable now.
+            spot_shape_price(c.gpu, c.gpu_count) if c.provider == "spot" else 0,
             spot_priority(c.gpu) if c.provider == "spot" else 0,
             primary(c),
             c.total_hourly_usd,

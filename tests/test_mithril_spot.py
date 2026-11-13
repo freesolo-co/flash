@@ -546,8 +546,8 @@ def test_region_cooldown_is_not_a_run_record_and_keeps_every_mark(monkeypatch, t
     assert not list(tmp_path.glob("*.json"))  # run scanners read top-level *.json as run records
 
 
-def test_spot_allocation_prefers_one_fitting_card_over_eight_h100s():
-    """Regression: a >80 GB plan took 8x H100 ($20/hr, never under cap) over a fitting 1x H200."""
+def test_spot_allocation_prefers_cheaper_1x_h200_over_8x_h100():
+    """Regression: a >80 GB plan took 8x H100 ($16/hr, never under cap) over a fitting 1x H200."""
     from flash.providers.core.allocator import _cheapest_allocation
     from flash.providers.core.base import Candidate
 
@@ -560,7 +560,7 @@ def test_spot_allocation_prefers_one_fitting_card_over_eight_h100s():
     assert (allocation.gpu, allocation.gpu_count) == ("H200", 1)
 
 
-def test_spot_allocation_still_prefers_h100_at_equal_card_count():
+def test_spot_allocation_prefers_cheaper_1x_h100_over_1x_h200():
     from flash.providers.core.allocator import _cheapest_allocation
     from flash.providers.core.base import Candidate
 
@@ -608,3 +608,45 @@ def test_spot_allocator_names_spot_as_unsupported_when_no_shape_fits():
             lookup_failed=False,
             executed_width=lambda n: n,
         )
+
+
+def test_spot_shape_price_is_class_rate_times_cards():
+    from decimal import Decimal
+
+    from flash.providers.mithril.pricing import shape_price
+
+    assert shape_price("H100", 1) == Decimal("2.00")
+    assert shape_price("H200", 1) == Decimal("2.50")
+    assert shape_price("H100", 8) == Decimal("16.00")
+    assert shape_price("H200", 8) == Decimal("20.00")
+
+
+def test_spot_quote_keeps_ceiling_error_when_a_wider_spot_shape_fits(monkeypatch):
+    """Review: a 1-card ceiling on a run 8 cards could hold is a ceiling problem, not unsupported."""
+    from flash.cost import RunConfig, analytical
+
+    monkeypatch.setattr(analytical, "required_vram_gb", lambda *a, **k: 200)
+    with pytest.raises(ValueError) as error:
+        analytical._offline_gpu_shape(
+            RunConfig("Qwen/Qwen3.5-9B", "grpo", 10, provider="spot", gpu_count=1)
+        )
+    assert "Spot is not supported" not in str(error.value)
+
+
+def test_spot_allocator_keeps_ceiling_error_when_a_wider_spot_shape_fits():
+    from flash.providers.core.allocator import _raise_no_candidate_error
+
+    with pytest.raises(ValueError) as error:
+        _raise_no_candidate_error(
+            model_id="Qwen/Qwen3.5-9B",
+            algorithm="grpo",
+            need=200,
+            cap=1,
+            exact="",
+            acceptable=(),
+            supported_available=("spot",),
+            structurally_unsupported={},
+            lookup_failed=False,
+            executed_width=lambda n: n,
+        )
+    assert "Spot is not supported" not in str(error.value)

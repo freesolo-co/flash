@@ -42,6 +42,14 @@ def accepts_price(gpu: str, value, *, currency: str, unit: str) -> bool:
         return False
 
 
+MAX_SPOT_CARDS = max(count for shape in SPOT_GPUS.values() for count in shape.counts)
+
+
+def shape_price(gpu: str, count: int) -> Decimal:
+    """Fixed rental price of ``count`` cards of ``gpu`` per hour: what Spot allocation ranks on."""
+    return SPOT_GPUS[canonical_gpu(gpu)].hourly_usd * count
+
+
 def priority(gpu: str) -> int:
     return tuple(SPOT_GPUS).index(canonical_gpu(gpu))
 
