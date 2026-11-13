@@ -380,6 +380,7 @@ def record_heartbeat(run_id: str, heartbeat: dict) -> None:
                 prior += _session_seconds(_heartbeat_billable_seconds(prev))
             if prior:
                 hb.setdefault("billable_train_s_prior", prior)
+            _credit_spot_billable_seconds(status, prev, hb, same_attempt=same_attempt)
         from flash.runner.accounting.spot_usage import record as record_spot_usage
 
         record_spot_usage(status, prev, hb, same_attempt=same_attempt)
@@ -572,6 +573,34 @@ def _update(run_id: str, new_state: str, *, allow_from_terminal: bool = False, *
     if report_status is not None:
         reporting._report_status(report_status)
     return True
+
+
+SPOT_BILLABLE_KEY = "spot_billable_s_by_gpu"
+
+
+def _credit_spot_billable_seconds(status, prev, hb, *, same_attempt):
+    """Credit this heartbeat's newly metered seconds to the Spot class the run is on right now.
+
+    A Spot run can resume on a different class after a preemption, and classes run at different
+    seconds per step, so pricing must weight each class by the seconds it trained, not its steps.
+    """
+    from flash.runner.accounting.spot_usage import _is_spot, _rented_gpu
+
+    if not _is_spot(status):
+        return
+    ledger = prev.get(SPOT_BILLABLE_KEY) if isinstance(prev, dict) else None
+    ledger = {
+        gpu: _session_seconds(seconds)
+        for gpu, seconds in (ledger.items() if isinstance(ledger, dict) else ())
+        if isinstance(gpu, str)
+    }
+    current = _session_seconds(_heartbeat_billable_seconds(hb))
+    before = _session_seconds(_heartbeat_billable_seconds(prev)) if same_attempt else 0.0
+    gpu = _rented_gpu(status)
+    if gpu and current > before:
+        ledger[gpu] = ledger.get(gpu, 0.0) + (current - before)
+    if ledger:
+        hb[SPOT_BILLABLE_KEY] = ledger
 
 
 def _heartbeat_billable_seconds(heartbeat):

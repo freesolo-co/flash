@@ -880,10 +880,14 @@ def _run_sft_child(
                     return_code = _invoke_sft_child(child, callbacks, on_line, context=context)
                     training_completed = return_code == 0
             finally:
+                # freeze the meter the moment the child exits, BEFORE the watcher drains its
+                # pending adapter publication and storage uploads: post-training publication is
+                # not billed training time.
+                context.phase_timings.stop_billing()
                 # A failed child cannot prove save completeness; preserve its failure.
                 child.watcher.stop(require_complete=training_completed)
     finally:
-        # the training loop is over; final adapter publication is not billed training time.
+        # also covers the resume-at-horizon path, which launches no child (idempotent).
         context.phase_timings.stop_billing()
         device_peak_gpu_gb = gpu_sampler.stop_gb()
     train_wall = time.time() - train_started_at

@@ -119,10 +119,11 @@ def first_update_seconds(config: RunConfig) -> float:
 def sft_image_seconds(config: RunConfig) -> float:
     """Vision-encoder seconds for image SFT rows, which the text-token flops term does not see.
 
-    Image rows are trained exact-unpacked (one example per optimizer update), so that packing mode
-    marks them. Fitted per example on 46 completed multimodal production runs (median 1.00).
+    Gated on the profile's explicit multimodal architecture, not on exact-unpacked packing: text-only
+    models that cannot pack are unpacked too and encode no images. Fitted per example on 46
+    completed multimodal production runs (median 1.00).
     """
-    if config.sft_packing_mode != "exact-unpacked":
+    if not config.sft_multimodal:
         return 0.0
     examples = max(1, int(config.steps)) * max(1, int(config.batch_size or 1))
     return SFT_IMAGE_S_PER_EXAMPLE * examples

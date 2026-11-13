@@ -396,23 +396,26 @@ def metered_charge_usd(status: RunStatus, spec, *, rented_remote: dict | None = 
 
 
 def _spot_metered_rate(status: RunStatus, gpu_type: str) -> float:
-    """Per-GPU Spot rate for metered time: the fixed class rates, weighted by usage per class.
+    """Per-GPU Spot rate for metered time: each class's fixed rate, weighted by its seconds.
 
-    A Spot run can resume on a different class after a preemption; ``spot_usage`` credits each
-    stretch to the class it ran on, so the metered seconds are priced at that usage-weighted rate.
-    Without recorded usage, the rented class's fixed rate applies; with no class at all, the quote
-    rate (the costliest class) is the upper bound.
+    A Spot run can resume on a different class after a preemption. The status ledger
+    ``spot_billable_s_by_gpu`` credits every metered second to the class it ran on, so the
+    seconds-weighted rate times total metered seconds equals the sum of each class's seconds at
+    its own rate. Steps are not a substitute: classes differ in seconds per step, and a resumed
+    attempt can repeat steps. Without a ledger, the rented class's fixed rate applies; with no
+    class at all, the quote rate (the costliest class) is the upper bound.
     """
     from flash.providers.mithril.pricing import SPOT_GPUS, hourly_rate, quote_rate
-    from flash.runner.accounting.spot_usage import USAGE_KEY, _amount
+    from flash.runner.accounting.spot_usage import _amount
+    from flash.runner.lifecycle.status import SPOT_BILLABLE_KEY
 
     hb = status.last_heartbeat if isinstance(status.last_heartbeat, dict) else {}
-    usage = hb.get(USAGE_KEY)
-    if isinstance(usage, dict):
-        usage = {gpu: _amount(amount) for gpu, amount in usage.items() if gpu in SPOT_GPUS}
-        total = sum(usage.values())
+    seconds = hb.get(SPOT_BILLABLE_KEY)
+    if isinstance(seconds, dict):
+        seconds = {gpu: _amount(value) for gpu, value in seconds.items() if gpu in SPOT_GPUS}
+        total = sum(seconds.values())
         if total > 0:
-            return sum(amount * hourly_rate(gpu) for gpu, amount in usage.items()) / total
+            return sum(value * hourly_rate(gpu) for gpu, value in seconds.items()) / total
     try:
         return hourly_rate(gpu_type)
     except Exception:

@@ -117,7 +117,11 @@ def test_sft_runner_meters_from_first_update_to_child_exit(worker_context, monke
         "liveness_heartbeat",
         lambda *a, **k: __import__("contextlib").nullcontext(),
     )
-    watcher = SimpleNamespace(start=lambda: None, stop=lambda require_complete: None)
+
+    def drain(require_complete):
+        now[0] += 1800.0  # pending adapter publication + uploads drained after the child exits
+
+    watcher = SimpleNamespace(start=lambda: None, stop=drain)
     child = SimpleNamespace(resume_step=0, watcher=watcher)
     progress = SimpleNamespace(values={"step": 0}, expected_components=(), runtime_verified=True)
     sft_train_runner._run_sft_child(child, 10, progress, lambda line: None, context=worker_context)
@@ -226,7 +230,7 @@ def test_spot_run_bills_spot_rate(tmp_path, monkeypatch):
     assert charge == pytest.approx(10 * 2.00)  # fixed Spot H100 rate
 
 
-def test_spot_run_resumed_on_another_class_bills_usage_weighted_rates(tmp_path, monkeypatch):
+def test_spot_run_without_a_seconds_ledger_bills_the_rented_class_rate(tmp_path, monkeypatch):
     spec = spot_spec("H100")
     _metrics(
         tmp_path,
@@ -238,7 +242,7 @@ def test_spot_run_resumed_on_another_class_bills_usage_weighted_rates(tmp_path, 
         allocated_gpu_count=1,
         notes={"training_timing": {"billable_train_s": 1800.0}},
     )
-    # half the steps ran on H100 ($2.00), half on H200 ($2.50) after a preemption.
+    # a step-only usage record (no seconds ledger) never weights the rate: steps are not time.
     hb = {
         "attempt": 1,
         "billable_train_s_prior": 1800.0,
@@ -246,7 +250,7 @@ def test_spot_run_resumed_on_another_class_bills_usage_weighted_rates(tmp_path, 
         "training_timing": {},
     }
     charge = costs._status_estimated_charge(_status(spec, heartbeat=hb), spec, fallback=999.0)
-    assert charge == pytest.approx(1.0 * 2.25)
+    assert charge == pytest.approx(1.0 * 2.00)  # one metered hour at the rented H100 rate
 
 
 def test_cancel_bills_heartbeat_meter_with_pre_teardown_handle(tmp_path, monkeypatch):
@@ -337,8 +341,69 @@ def test_image_sft_quotes_vision_encoding_per_example():
         sft_retained_examples=1000,
         max_wall_seconds=10**7,
     )
-    image = replace(text, sft_packing_mode="exact-unpacked")
+    image = replace(text, sft_packing_mode="exact-unpacked", sft_multimodal=True)
+    # text-only models that cannot pack are also trained exact-unpacked; they encode no images.
+    unpacked_text = replace(text, sft_packing_mode="exact-unpacked")
+    assert sft_image_seconds(unpacked_text) == 0.0
     assert sft_image_seconds(text) == 0.0
     assert sft_image_seconds(image) == pytest.approx(1000 * SFT_IMAGE_S_PER_EXAMPLE)
     gap = estimate_cost(image).train_seconds - estimate_cost(text).train_seconds
     assert gap == pytest.approx(1000 * SFT_IMAGE_S_PER_EXAMPLE)
+
+
+def test_grpo_freezes_the_meter_before_draining_required_save_publication():
+    """_validate_rl_child can drain required-save publication; that is not billed training time."""
+    import inspect
+
+    from flash.engine.worker.train.entry import rl_train
+
+    src = " ".join(inspect.getsource(rl_train.run_rl_train).split())
+    assert src.index("context.phase_timings.stop_billing()") < src.index("_validate_rl_child(")
+    assert src.index("rc = _execute_rl_child(") < src.index("context.phase_timings.stop_billing()")
+
+
+# ---------------------------------------------------------------------------- spot seconds ledger
+
+
+def _spot_status(spec, gpu, heartbeat=None):
+    status = _status(spec, state="running", heartbeat=heartbeat)
+    status.remote = {"provider": "spot", "gpu": gpu, "attempt": 0}
+    return status
+
+
+def test_spot_ledger_credits_metered_seconds_to_the_class_running_them():
+    spec = spot_spec("H100")
+    status = _spot_status(spec, "H100")
+    prev = {"attempt": 0, "training_timing": {"billable_train_s": 100.0}}
+    hb = {"attempt": 0, "training_timing": {"billable_train_s": 400.0}}
+    status_ops._credit_spot_billable_seconds(status, prev, hb, same_attempt=True)
+    assert hb[status_ops.SPOT_BILLABLE_KEY] == {"H100": 300.0}
+    # a replacement attempt on another class starts its own meter at zero.
+    status.remote = {"provider": "spot", "gpu": "H200", "attempt": 1}
+    nxt = {"attempt": 1, "training_timing": {"billable_train_s": 50.0}}
+    status_ops._credit_spot_billable_seconds(status, hb, nxt, same_attempt=False)
+    assert nxt[status_ops.SPOT_BILLABLE_KEY] == {"H100": 300.0, "H200": 50.0}
+
+
+def test_spot_charge_weights_class_rates_by_seconds_not_steps(tmp_path, monkeypatch):
+    """10 steps in 5,400 s on H100 ($2.00) + 10 steps in 1,800 s on H200 ($2.50) = $4.25."""
+    spec = spot_spec("H100")
+    _metrics(
+        tmp_path,
+        monkeypatch,
+        spec,
+        step=20,
+        allocated_provider="spot",
+        allocated_gpu="H100",
+        allocated_gpu_count=1,
+        notes={"training_timing": {"billable_train_s": 1800.0}},
+    )
+    hb = {
+        "attempt": 1,
+        "billable_train_s_prior": 5400.0,
+        "spot_usage_by_gpu": {"H100": 10, "H200": 10},  # steps: would price $4.50
+        status_ops.SPOT_BILLABLE_KEY: {"H100": 5400.0, "H200": 1800.0},
+        "training_timing": {},
+    }
+    charge = costs._status_estimated_charge(_status(spec, heartbeat=hb), spec, fallback=999.0)
+    assert charge == pytest.approx(4.25)

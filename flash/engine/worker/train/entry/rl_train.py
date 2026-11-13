@@ -387,6 +387,9 @@ def run_rl_train(*, context: WorkerContext):
                 files=files,
                 context=context,
             )
+        # freeze the meter the moment the verl child exits, BEFORE _validate_rl_child drains
+        # required-save publication: post-training publication is not billed training time.
+        context.phase_timings.stop_billing()
         _validate_rl_child(
             rc,
             state,
@@ -397,7 +400,7 @@ def run_rl_train(*, context: WorkerContext):
             reward_runtime=reward_runtime,
         )
     finally:
-        # the training loop is over; final adapter export/publication is not billed training time.
+        # also covers a child that raised before returning (idempotent).
         context.phase_timings.stop_billing()
         device_peak_gpu_gb = _shutdown_rl_runtime(resume_uploader, gpu_sampler, reward_runtime)
 
