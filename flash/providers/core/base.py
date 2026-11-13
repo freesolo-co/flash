@@ -143,7 +143,15 @@ class CapacityLookupError(RuntimeError):
 
 
 class CapacityUnavailableError(CapacityLookupError):
-    """A live provider answered successfully but currently offers no fitting capacity."""
+    """A live provider answered successfully but currently offers no fitting capacity.
+
+    ``cause`` optionally names the provider response behind the refusal (e.g. ``http 422``), never
+    its body, so a persisted requeue detail can tell a throttle from a quota or validation refusal.
+    """
+
+    def __init__(self, message: str = "", *, cause: str = "") -> None:
+        super().__init__(message)
+        self.cause = cause
 
 
 class UnreconciledCreateError(RuntimeError):
