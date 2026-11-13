@@ -936,6 +936,56 @@ def test_a_failed_scope_lookup_is_retryable_not_a_mismatch(monkeypatch):
         handles.require_scope(handle)
 
 
+def test_a_refusal_keeps_mithrils_short_reason_in_its_cause(monkeypatch, tmp_path):
+    from flash.providers.core.base import CapacityUnavailableError
+    from flash.runner.lifecycle import state
+
+    monkeypatch.setattr(state, "RUNS_DIR", str(tmp_path))
+    monkeypatch.setattr(api, "pages", lambda *a, **kw: [])
+
+    def refuse(*args, **kwargs):
+        raise client.MithrilApiError(status=400, reason="Spot quota exceeded for instance type")
+
+    monkeypatch.setattr(api, "call", refuse)
+    with pytest.raises(CapacityUnavailableError) as error:
+        launch(monkeypatch)
+    assert error.value.cause == "http 400: Spot quota exceeded for instance type"
+
+
+class _Response:
+    def __init__(self, data):
+        self._data = data
+
+    def json(self):
+        if isinstance(self._data, Exception):
+            raise self._data
+        return self._data
+
+
+def test_error_reasons_are_short_and_never_echo_the_request():
+    body = {"launch_specification": {"startup_script": "#!/bin/bash\nexport TOKEN=hunter2-secret"}}
+    reason = client._safe_reason
+    assert reason(_Response({"detail": "Limit price is below the minimum"}), body=body) == (
+        "Limit price is below the minimum"
+    )
+    validation = {"detail": [{"loc": ["body", "region"], "msg": "field required"}]}
+    assert reason(_Response(validation)) == "field required"
+    # anything echoing a request value or the API key is dropped, as are raw or odd bodies
+    echoed = {"detail": "bad script #!/bin/bash\nexport TOKEN=hunter2-secret"}
+    assert reason(_Response(echoed), body=body) == ""
+    partial = {"detail": "invalid line: export TOKEN=hunter2-secret"}
+    assert reason(_Response(partial), body=body) == ""
+    # short, non-secret request values such as the region may appear in a kept reason
+    regional = {"detail": "no Spot capacity in us-central2-b"}
+    assert reason(_Response(regional), body={**body, "region": "us-central2-b"}) == (
+        "no Spot capacity in us-central2-b"
+    )
+    assert reason(_Response({"message": "key test-secret rejected"})) == ""
+    assert reason(_Response(ValueError("not json"))) == ""
+    assert reason(_Response(["unexpected"])) == ""
+    assert len(reason(_Response({"detail": "x" * 1000}))) == 200
+
+
 @pytest.mark.parametrize("status", [400, 403, 409, 422])
 def test_a_definitive_refusal_with_quota_left_requeues_and_cools_that_shape(
     monkeypatch, status, tmp_path
