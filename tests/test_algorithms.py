@@ -65,14 +65,13 @@ def test_grpo_capability_still_enforced():
 
 
 def test_qwen35_9b_now_supports_grpo():
-    # Qwen3.5-9B is GRPO-capable now (normal bf16 LoRA; auto-routed to an 80 GB A100).
+    # Qwen3.5-9B is GRPO-capable now (normal bf16 LoRA).
     spec = spec_from_dict(
         {
             "model": "Qwen/Qwen3.5-9B",
             "algorithm": "grpo",
             "environment": {"id": "github:owner/repo@main:env/environment.py"},
             "train": {"epochs": 1, "max_examples": 1},
-            "gpu": {"type": "A100 SXM"},
         },
         run_id="x",
     )

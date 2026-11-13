@@ -14,6 +14,8 @@ from flash.providers.mithril.config import settings
 from flash.providers.mithril.pricing import SPOT_GPUS
 
 CUSTOM_SESSION_PORT = 8000
+# After an ambiguous create failure, how long to wait before listing the attempt's bids again.
+CREATE_RECHECK_SECONDS = 10
 _OWNER_PREFIX = "# flash-mithril-owner: "
 _STOPPED = frozenset(
     {"STATUS_TERMINATED", "STATUS_PREEMPTED", "STATUS_REPLACED", "STATUS_PAUSED", "STATUS_ERROR"}
@@ -233,30 +235,46 @@ def create(*, name, offer, payload, image_reference, gpu, gpu_count, capsule, di
             raise ValueError("invalid bid identity")
         return bid_id
     except (MithrilApiError, KeyError, TypeError, ValueError) as error:
-        try:
-            existing = reconcile()
-        except (MithrilApiError, TimeoutError):
-            raise UnreconciledCreateError(
-                "Mithril launch reconciliation unavailable; refusing duplicate allocation"
-            ) from None
+        status = error.status if isinstance(error, MithrilApiError) else 0
+        if status:
+            cause = f"http {status}"
+        elif isinstance(error, MithrilApiError):
+            cause = "transport error or timeout"
+        else:
+            cause = "invalid create response"
+
+        def reconciled():
+            try:
+                return reconcile()
+            except (MithrilApiError, TimeoutError):
+                raise UnreconciledCreateError(
+                    "Mithril launch reconciliation unavailable; refusing duplicate allocation",
+                    cause=cause,
+                ) from None
+
+        existing = reconciled()
         if existing:
             return existing
-        status = error.status if isinstance(error, MithrilApiError) else 0
-        if status == 429:
-            raise CapacityUnavailableError("Mithril request throttled; requeuing") from None
-        if status in {400, 403, 409, 422}:
+        if 400 <= status < 500:
+            # A 4xx is a definitive refusal, and reconciliation found no bid under this attempt's
+            # name, so nothing was created: requeue (a new attempt name) instead of failing. Mithril
+            # also enforces limits /quotas does not list, so cool this auction shape down briefly
+            # and let the queue take another offer rather than re-bidding into the same refusal.
             from flash.providers.mithril.region_health import mark_refused
 
-            # A definitive refusal, and reconciliation just proved no bid exists, so requeueing
-            # cannot double-provision. Mithril enforces org/region limits /quotas does not list (a
-            # shape with no quota row was refused while 8 other bids held it), so do not gate this
-            # on quota_available: cool the shape down and let the queue take another offer.
             with contextlib.suppress(Exception):
                 mark_refused(offer.region, offer.instance_type)
             raise CapacityUnavailableError(
-                f"Mithril refused the bid (HTTP {status}); requeuing"
+                f"Mithril refused the Spot bid ({cause}); requeuing", cause=cause
             ) from None
+        # A 5xx, transport failure, timeout or unreadable 2xx may still have created the bid after
+        # the listing above. Look once more after a bounded pause and adopt a late bid, but never
+        # retry an unknown POST outcome: the next attempt's new name would leave a late bid from
+        # this one running beside it until the run ends.
+        time.sleep(max(0, min(CREATE_RECHECK_SECONDS, deadline_at - time.time())))
+        existing = reconciled()
+        if existing:
+            return existing
         raise UnreconciledCreateError(
-            "Mithril launch could not be reconciled; refusing duplicate allocation",
-            cause=f"HTTP {status}" if status else type(error).__name__,
+            "Mithril launch could not be reconciled; refusing duplicate allocation", cause=cause
         ) from None

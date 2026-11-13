@@ -421,62 +421,6 @@ def test_catalog_model_algorithm_gpu_matrix_routes_to_fitting_cards(monkeypatch)
     assert {algo for _, algo in checked} == set(ALGORITHMS)
 
 
-def test_catalog_model_algorithm_config_gpu_matrix_enforces_pins(monkeypatch):
-    """Every active validated GPU pin is preserved when it fits and rejected when it does not."""
-    from flash.core.catalog import ALGORITHMS, MODELS
-    from flash.providers.core import allocator
-    from flash.providers.core.base import GPU_INFO, get_gpu_info, providers_for
-    from flash.schema import ConfigError, spec_from_dict
-
-    monkeypatch.setattr(allocator, "available_providers", lambda: ("modal",))
-    configured_gpu_types = tuple(name for name, gpu_info in GPU_INFO.items() if gpu_info.validated)
-    expected = {
-        (model_id, algo, configured_gpu)
-        for model_id, info in MODELS.items()
-        for algo in ALGORITHMS
-        if algo in info.algos
-        for configured_gpu in configured_gpu_types
-    }
-    checked = set()
-    rejected = set()
-
-    for model_id, info in MODELS.items():
-        for algo in ALGORITHMS:
-            if algo not in info.algos:
-                continue
-            train = {"epochs": 1, "max_examples": 8}
-            need = allocator.required_vram_gb(model_id, algo, train=train)
-
-            for configured_gpu in configured_gpu_types:
-                raw = {
-                    "model": model_id,
-                    "algorithm": algo,
-                    "environment": {"id": "github:freesolo-co/envs@main:gsm8k/environment.py"},
-                    "train": train,
-                    "gpu": {"type": configured_gpu},
-                }
-                key = (model_id, algo, configured_gpu)
-                if get_gpu_info(configured_gpu).vram_gb < need:
-                    # a type pin with no authored count keeps the historical one-card constraint, so
-                    # its own shortfall is always the actionable error even when every class is small.
-                    with pytest.raises(ConfigError, match="requires at least"):
-                        spec_from_dict(raw, run_id="matrix")
-                    rejected.add(key)
-                    continue
-
-                spec = spec_from_dict(raw, run_id="matrix")
-                assert spec.gpu.type == configured_gpu
-                resolved_info = get_gpu_info(spec.gpu.type)
-                assert resolved_info.validated
-                assert providers_for(spec.gpu.type)
-                assert resolved_info.vram_gb >= need
-                checked.add(key)
-
-    assert checked | rejected == expected
-    assert checked
-    assert rejected
-
-
 def test_sft_big_vocab_logits_term_present_and_bounded():
     """plain nll reserves dense logits while chunked nll reserves one bounded projection chunk."""
     from flash.engine.plan import vram

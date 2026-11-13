@@ -370,16 +370,17 @@ def test_sft_idle_card_warning_names_a_remedy_that_can_actually_work():
     text = unpacked.getvalue()
     assert "[sft][warn] training on 1 of 2 allocated cards" in text, text
     assert "batch_size" not in text, "raising the batch cannot move an unpacked run off one card"
-    assert "allocate 1 card(s)" in text, text
+    assert "report this allocation" in text, text
 
-    # batch 6 on 4 cards resolves to 3 ranks, but 3 is not rentable -- recommend 2.
+    # batch 6 on 4 cards resolves to 3 ranks; the card count is allocator-owned, so the remedy names
+    # the training inputs rather than a card count.
     odd = io.StringIO()
     with contextlib.redirect_stdout(odd):
         assert _resolve_sft_world_size(4, 6, 12) == 3
     text = odd.getvalue()
     assert "training on 3 of 4 allocated cards" in text, text
-    assert "allocate 2 card(s)" in text, text
-    assert "allocate 3 card(s)" not in text
+    assert "batch_size to a multiple of 4" in text, text
+    assert "allocate" not in text.split("allocated cards", 1)[1]
 
 
 def test_sft_quote_credits_only_the_ranks_that_will_execute():
@@ -2773,7 +2774,7 @@ def test_sft_retries_preserve_the_preparation_digest(worker_context, monkeypatch
         "project": "11111111-1111-4111-8111-111111111111",
         "environment": {"id": "owner/project/env"},
         "train": {"epochs": 1, "learning_rate": 1e-5},
-        "gpu": {"type": "H100", "count": 1},
+        "gpu": {"count": 1},
     }
     spec = spec_from_dict(raw)
     spec = replace(spec, run_id="retry-sft", model_revision="a" * 40, model_revision_auto=True)
@@ -3906,7 +3907,6 @@ def test_sft_idle_card_warning_only_recommends_widths_that_actually_work():
 
     from flash.engine.plan.steps import sft_data_parallel_cards
     from flash.engine.worker.train.entry.sft_train_runner import _resolve_sft_world_size
-    from flash.providers.core.base import rentable_gpu_counts
 
     def warn(cards, batch, rows):
         buf = io.StringIO()
@@ -3918,8 +3918,8 @@ def test_sft_idle_card_warning_only_recommends_widths_that_actually_work():
     width, text = warn(4, 8, 10)
     assert width == 2
     assert "a dataset of 10 rows" in text, text
-    assert "batch_size" not in text, "rows bind here, so raising the batch cannot help"
-    assert "allocate 2 card(s)" in text, text
+    assert "batch_size" not in text.split("row count", 1)[0], "rows bind, raising batch cannot help"
+    assert "divisible by 4" in text, text
 
     # the batch binds AND fixing it is sufficient (12 rows already divide 4), so the batch remedy
     # is legitimate and must still be offered.
@@ -3931,7 +3931,9 @@ def test_sft_idle_card_warning_only_recommends_widths_that_actually_work():
     # split 4 ways, so name the dataset and the lower card count instead.
     _, text = warn(4, 6, 10)
     assert "a dataset of 10 rows" in text, text
-    assert "batch_size" not in text, "rows block full width too, so the batch remedy is a dead end"
+    assert "raise [train] batch_size" not in text, (
+        "rows block full width, batch remedy is a dead end"
+    )
 
     # an unpacked run pins the batch to 1, which binds on its own -- but it is not the ROWS that
     # bind, and saying so is a false statement about the dataset. 12 divides 4 exactly here, so
@@ -3941,14 +3943,13 @@ def test_sft_idle_card_warning_only_recommends_widths_that_actually_work():
     assert "single example per update" in text, text
     assert "12 rows" not in text, "12 divides 4 cleanly; the rows are not what bind at batch 1"
     assert "batch_size" not in text, "packing mode fixes the batch at 1, so it cannot be raised"
-    assert "allocate 1 card(s)" in text, text
 
     # a batch remedy is only ever printed when acting on it actually restores the full allocation.
     for cards in range(1, 9):
         for batch in range(1, 17):
             for rows in range(32):
                 _, text = warn(cards, batch, rows)
-                if "batch_size" not in text:
+                if "raise [train] batch_size" not in text:
                     continue
                 raised = cards * (batch // cards + 1)
                 assert sft_data_parallel_cards(cards, raised, rows) == cards, (
@@ -3956,9 +3957,7 @@ def test_sft_idle_card_warning_only_recommends_widths_that_actually_work():
                     "does not use every card"
                 )
 
-    # every width this warning recommends must be BOTH rentable and usable. neither implies the
-    # other: the rentable count need not divide the batch (4 cards, batch 3 -> 2, and 3 % 2 != 0),
-    # and a divisor need not be rentable (7 cards, batch 6, rows 6 -> 3, which nobody sells).
+    # the warning stays quiet when every card is used and never prescribes a card count.
     for cards in range(1, 9):
         for batch in range(1, 17):
             for rows in range(1, 32):
@@ -3966,105 +3965,7 @@ def test_sft_idle_card_warning_only_recommends_widths_that_actually_work():
                 if width >= cards:
                     assert text == "", "must stay quiet when every allocated card is used"
                     continue
-                found = re.search(r"allocate (\d+) card", text)
-                assert found, text
-                advised = int(found.group(1))
-                assert advised in rentable_gpu_counts(cards), (
-                    f"advised {advised} cards at {cards}/{batch}/{rows}: not a shape providers rent"
-                )
-                assert batch % advised == 0, (cards, batch, rows, advised)
-                assert rows % advised == 0, (cards, batch, rows, advised)
-                assert advised == sft_data_parallel_cards(advised, batch, rows)
-                assert advised <= width, "advising more cards than the run can use is the same bug"
-
-
-def test_sft_idle_card_advice_does_not_shrink_the_memory_the_run_is_running_on():
-    """Advising FEWER cards than the run launched can take away memory it needs to exist.
-
-    The idle-card warning fires on a rented shape the fit gate already accepted, and the ranks that
-    joined are what hold the model. Dropping to the next rentable divisor is a VRAM change, not just
-    a billing one: Qwen3.8-27B sft at 32k is sized at 159 GB, a 4x H100 rental launching 3 ranks
-    provides 191.6 GB and runs, but batch 6 over 6 rows advised "allocate 2 card(s)" -- 130.4 GB,
-    which the fit gate rejects. Acting on that remedy turns a working run into an unplaceable one.
-
-    The worker cannot check the fit itself: it runs after allocation, on hardware already rented,
-    and has no VRAM need in scope. So the advice is QUALIFIED rather than computed -- it stays a
-    billing observation and never claims the smaller shape still holds the model. A width at or
-    above the launched one needs no qualifier, because it takes no memory away.
-    """
-    import contextlib
-    import io
-    import re
-
-    from flash.engine.worker.train.entry.sft_train_runner import _resolve_sft_world_size
-
-    def warn(cards, batch, rows):
-        buf = io.StringIO()
-        with contextlib.redirect_stdout(buf):
-            width = _resolve_sft_world_size(cards, batch, rows)
-        return width, buf.getvalue()
-
-    # the reported case: 3 ranks hold the run, the advised 2 cards would not.
-    width, text = warn(4, 6, 6)
-    assert width == 3, "batch 6 over 6 rows launches 3 of the 4 rented cards"
-    assert "allocate 2 card(s)" in text, text
-    assert "fits" in text, (
-        "advice that drops below the launched width must be qualified as a fit question, "
-        f"not presented as the remedy: {text!r}"
-    )
-
-    # whenever the advised width is BELOW the ranks actually running, the line must not present
-    # the smaller shape as a straight remedy -- that shape may not hold the model at all.
-    for cards in range(1, 9):
-        for batch in range(1, 17):
-            for rows in range(1, 32):
-                width, text = warn(cards, batch, rows)
-                if not text:
-                    continue
-                found = re.search(r"allocate (\d+) card", text)
-                assert found, text
-                advised = int(found.group(1))
-                if advised < width:
-                    assert "fits" in text, (
-                        f"at {cards}/{batch}/{rows} advised {advised} cards below the {width} "
-                        f"ranks running, unqualified: {text!r}"
-                    )
-
-
-def test_sft_quote_credits_the_width_the_rows_allow_not_just_the_batch():
-    """Pricing must clamp on the rows too, or it re-opens the gap the batch clamp closed.
-
-    A packed profile can leave a row count that narrows the width below what the batch alone
-    permits: batch 8 with 10 retained rows on 4 cards launches 2 ranks, not 4. Crediting 4 there
-    understates wall time and cost exactly as the authored-batch bug did.
-
-    The row count must be carried explicitly rather than derived from `sft_packed_blocks`, which is
-    `ceil(rows / examples_per_update)` and reconstructs those 10 rows as 16 -- an OVER-credit, i.e.
-    the very failure this clamp exists to prevent.
-    """
-    from flash.cost import analytical
-    from flash.cost.types import RunConfig
-    from flash.engine.plan.steps import sft_data_parallel_cards
-
-    def speedup(rows):
-        config = RunConfig(
-            model_id="Qwen/Qwen3.5-9B",
-            method="sft",
-            steps=10,
-            batch_size=8,
-            sft_retained_examples=rows,
-        )
-        return analytical.method_card_speedup(config, 4, "H100", "modal")
-
-    # the worker would launch 2 ranks on 10 rows and 4 on 16; the quote must agree with both.
-    assert sft_data_parallel_cards(4, 8, 10) == 2
-    assert sft_data_parallel_cards(4, 8, 16) == 4
-    assert speedup(10) < speedup(16)
-    assert speedup(10) == speedup(2 * 5)
-
-    # an unknown row count must not constrain: the quote is built before the dataset exists on some
-    # paths, and inventing a bound there would misprice every one of them.
-    assert speedup(None) == speedup(16)
+                assert not re.search(r"allocate \d+ card", text), text
 
 
 def test_sft_resume_guard_checks_the_launched_width_not_the_allocation():
@@ -5071,3 +4972,63 @@ def test_sft_reports_worker_dataset_counts_separately_from_quote(worker_context,
     assert captured["meta"]["notes"]["training_dataset"] == realized_counts
     ready = [fields for stage, fields in captured["heartbeats"] if stage == "sft_dataset_ready"]
     assert ready == [{"training_dataset": realized_counts}]
+
+
+def _rotation_watcher(worker_context, tmp_path, *, required_steps):
+    from flash.engine.worker.train.entry import sft_train
+
+    local_dir = tmp_path / "ckpts"
+    (local_dir / "global_step_300" / "huggingface").mkdir(parents=True)
+    # verl (max_ckpt_to_keep=1) already rotated step 250 out after completing step 300.
+    (local_dir / "latest_checkpointed_iteration.txt").write_text("300")
+    watcher = sft_train._VerlCheckpointWatcher(
+        local_dir=str(local_dir),
+        export_root=str(tmp_path / "exports"),
+        python_bin="/verl/python",
+        model_id="org/model",
+        model_revision="commit",
+        required_steps=required_steps,
+        context=worker_context,
+    )
+    return watcher, str(local_dir / "global_step_250")
+
+
+def test_a_periodic_checkpoint_rotated_out_before_pinning_is_skipped_not_fatal(
+    worker_context, monkeypatch, tmp_path
+):
+    """fast cards save the next checkpoint before the watcher pins the last one.
+
+    the trainer keeps one checkpoint and only waits for REQUIRED steps, so a periodic step can be
+    deleted while the watcher waits for persistence capacity. that used to raise FileNotFoundError,
+    kill the watcher and fail a run whose training had completed. the newer checkpoint supersedes it.
+    """
+    watcher, rotated = _rotation_watcher(worker_context, tmp_path, required_steps=())
+    published = []
+    monkeypatch.setattr(watcher, "_publish_from", lambda step, staged: published.append(step))
+
+    watcher._publish(250, rotated)
+
+    assert published == []
+    assert watcher.lifecycle.facts(250).discovered
+    assert not watcher.lifecycle.facts(250).deployable_published
+    assert not os.path.exists(os.path.join(watcher.staging_root, "global_step_250"))
+    # the superseding step still publishes normally.
+    watcher._publish(300, str(tmp_path / "ckpts" / "global_step_300"))
+    assert published == [300]
+
+
+def test_a_rotated_required_checkpoint_still_fails_closed(worker_context, tmp_path):
+    """required saves are protected by the retention gate; losing one is a real failure."""
+    watcher, rotated = _rotation_watcher(worker_context, tmp_path, required_steps=(250,))
+
+    with pytest.raises(FileNotFoundError):
+        watcher._publish(250, rotated)
+
+
+def test_a_missing_checkpoint_that_nothing_superseded_still_fails(worker_context, tmp_path):
+    """without a newer completed checkpoint, a vanished directory is not rotation."""
+    watcher, _ = _rotation_watcher(worker_context, tmp_path, required_steps=())
+    missing = str(tmp_path / "ckpts" / "global_step_400")
+
+    with pytest.raises(FileNotFoundError):
+        watcher._publish(400, missing)

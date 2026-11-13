@@ -32,8 +32,6 @@ from flash.core.spec import (
 )
 from flash.providers.core.base import (
     UnsupportedGpuError,
-    authored_gpu_ceiling,
-    get_gpu_info,
     providers_for,
     provisional_gpu,
     provisional_gpu_count,
@@ -45,7 +43,6 @@ from flash.schema.fields import (
     _environment_pip,
     _environment_secrets,
     _require_environment_ref,
-    _section_int,
     _train_credit_assignment,
     _train_float,
     _train_int,
@@ -245,14 +242,31 @@ _TOP_LEVEL_KEYS = (
 # runner-assigned [gpu] fields (MANAGED_GPU_KEYS, single-sourced in flash.core.spec) are excluded from the
 # user-facing surface. GpuSpec still carries them so the internal JobSpec.from_dict round trip
 # preserves the runner's disk sizing, weight-cache volume, and platform retry/wall-clock policy.
-# `type_fallbacks` is derived, not authored: an ordered pin is written as a list, and
-# the parser splits it into the head plus these. accepting both spellings would let a config name a
-# head that contradicts its own fallback list, so only the list form is public.
+# GPU class, card count, and provider are allocator-owned: the allocator picks the cheapest fitting
+# shape and the runner records it in the worker spec. `spot` is the only authorable [gpu] key.
+_RETIRED_GPU_KEYS = frozenset({"type", "type_fallbacks", "count", "provider", "providers"})
 _GPU_KEYS = (
     frozenset(item.name for item in dataclass_fields(GpuSpec))
     - MANAGED_GPU_KEYS
-    - {"type_fallbacks"}
+    - _RETIRED_GPU_KEYS
 )
+
+
+def _is_derived_gpu_value(key: str, value: Any, *, spot: bool) -> bool:
+    """True for the empty/derived values ``JobSpec.to_dict()`` itself emits for allocator-owned keys.
+
+    Every stored public spec carries ``count = 1`` (the digest-stable placeholder), so resubmitting a
+    spec copied from ``flash runs status`` must still parse; the value never reaches allocation.
+    """
+    if key == "count":
+        return type(value) is int and value == 1
+    if key == "type":
+        return isinstance(value, str) and not value.strip()
+    if key == "provider":
+        return isinstance(value, str) and value.strip().lower() in (("", "spot") if spot else ("",))
+    return False
+
+
 # [environment] user-authorable keys, derived from environmentspec (mirrors _gpu_keys) so a new field
 # is accepted automatically; resolved_sha and package are controller-managed by staging and named once
 # in the managed environment registry rather than restated here.
@@ -421,58 +435,6 @@ def _validate_train_section(raw: dict[str, Any], algorithm: str) -> dict[str, An
     return train_raw
 
 
-def _authored_gpu_type_entries(raw: Any) -> tuple[str, ...]:
-    """Validate the public scalar-or-list shape before ``GpuSpec`` canonicalizes it."""
-    if isinstance(raw, str):
-        entries = (raw,) if raw.strip() else ()
-    elif isinstance(raw, (list, tuple)):
-        entries = tuple(raw)
-        if not entries:
-            raise ConfigError(
-                "[gpu] type must not be an empty list; omit the key for managed allocation, "
-                'or name the classes to allow, e.g. type = ["H100", "A100 SXM"]'
-            )
-    else:
-        raise ConfigError("gpu.type must be a string or a list of strings")
-    if any(not isinstance(entry, str) for entry in entries):
-        raise ConfigError("gpu.type entries must be strings")
-    if any(not entry.strip() for entry in entries):
-        raise ConfigError("gpu.type entries must not be empty")
-    return entries
-
-
-def _parse_time_wider_shape_remedy(
-    candidate: str,
-    required_vram: int,
-    model: str,
-    algorithm: str,
-    *,
-    train: dict[str, Any],
-    thinking: bool,
-    provider: str,
-) -> str:
-    """The ``--gpus N`` clause for a class this run outgrows on ONE card, or ``""``."""
-    try:
-        from flash.providers.core.allocator import _executed_width, geometry_safe_gpu_cap
-        from flash.providers.core.base import wider_shape_remedy
-        from flash.providers.core.fit_errors import widenable_gpu_names
-        from flash.providers.core.sharding import MAX_COMBINATION_CARDS
-
-        if not widenable_gpu_names((candidate,), (provider,) if provider else None):
-            return ""
-        return wider_shape_remedy(
-            (get_gpu_info(candidate).vram_gb,),
-            required_vram,
-            # the same ceiling and executed-width rule the allocator searches with, so a count
-            # suggested here is one the submit-time gate would also accept.
-            ceiling=geometry_safe_gpu_cap(model, MAX_COMBINATION_CARDS),
-            above=1,
-            executed_width=_executed_width(algorithm, train, None),
-        )
-    except Exception:
-        return ""
-
-
 def _validate_gpu_section(
     raw: dict[str, Any],
     *,
@@ -489,64 +451,38 @@ def _validate_gpu_section(
         gpu_raw = {}
     if not isinstance(gpu_raw, dict):
         raise ConfigError("[gpu] must be a table")
-    unknown_gpu = sorted(set(gpu_raw) - _GPU_KEYS)
+    unknown_gpu = sorted(set(gpu_raw) - _GPU_KEYS - _RETIRED_GPU_KEYS)
     if unknown_gpu:
         raise ConfigError(
             f"[gpu] unknown key(s): {', '.join(unknown_gpu)} "
             f"(allowed: {', '.join(sorted(_GPU_KEYS))})"
         )
-    # cards a single training worker occupies (1..8); count > 1 provisions a multi-gpu pod.
-    gpu_count = _section_int(gpu_raw, "gpu", "count", minimum=1, maximum=8)
-
-    provider_raw = gpu_raw.get("provider", "")
-    if not isinstance(provider_raw, str):
-        raise ConfigError("gpu.provider must be a string")
-    gpu_provider = provider_raw.strip().lower()
-    if gpu_provider and gpu_provider not in PROVIDER_NAMES:
-        raise ConfigError(
-            f"gpu.provider must be one of {', '.join(PROVIDER_NAMES)}; got {provider_raw!r}"
-        )
     spot = gpu_raw.get("spot", False)
     if type(spot) is not bool:
         raise ConfigError("gpu.spot must be a boolean")
-    if (
-        "spot" in gpu_raw
-        and not spot
-        and (gpu_provider == "spot" or gpu_raw.get("providers") == ["spot"])
-    ):
-        raise ConfigError("gpu.spot=false conflicts with the Spot provider")
-    if spot:
-        if gpu_provider not in ("", "spot"):
-            raise ConfigError("gpu.spot=true cannot use another provider")
-        if not gpu_raw.get("providers"):
-            gpu_provider = "spot"
-    gpu_entries = _authored_gpu_type_entries(gpu_raw.get("type", ""))
-    try:
-        gpu_spec = GpuSpec(
-            type=gpu_entries[0] if gpu_entries else "",
-            provider=gpu_provider,
-            providers=gpu_raw.get("providers", ()),
-            spot=spot,
-            count=gpu_count if gpu_count is not None else 1,
-            type_fallbacks=gpu_entries[1:],
+    # GPU class, card count, and provider are allocator-owned. a stored public spec still carries
+    # `type = ""`, `count = 1`, and `provider = ""` (or the "spot" provider a Spot spec derives) for
+    # digest stability, so only values a user could have meant as a choice are rejected.
+    retired = sorted(
+        key
+        for key in _RETIRED_GPU_KEYS & set(gpu_raw)
+        if not _is_derived_gpu_value(key, gpu_raw[key], spot=spot)
+    )
+    if retired:
+        raise ConfigError(
+            f"[gpu] {', '.join(retired)} is no longer supported: Flash picks the GPU class, card "
+            "count, and provider automatically. Delete the line; `spot = true` is the only [gpu] "
+            "setting."
         )
-    except (TypeError, ValueError) as exc:
-        raise ConfigError(str(exc)) from exc
+    gpu_spec = GpuSpec(provider="spot" if spot else "", spot=spot)
 
+    # never authored: every run auto-sizes to the smallest fitting geometry-safe shape. custom runs
+    # are bounded by their placement shapes (one Spot card, or up to two Modal cards).
+    requested_gpu_count = None
     if algorithm == "custom":
         from flash.schema.custom import validate_custom_gpu_count
 
-        gpu_count = validate_custom_gpu_count(model, gpu_spec, gpu_count)
-
-    gpu_types = gpu_spec.acceptable_types
-    for candidate in gpu_types:
-        if gpu_provider and gpu_provider not in providers_for(candidate):
-            raise ConfigError(
-                f"gpu.provider {gpu_provider!r} cannot provision gpu.type {candidate!r}"
-            )
-        # provider preferences are soft; configured unnamed providers remain eligible.
-
-    requested_gpu_count = authored_gpu_ceiling(gpu_spec.type, gpu_count)
+        requested_gpu_count = validate_custom_gpu_count(model, gpu_spec)
     unresolved_warmstart_rank = bool(init_from_adapter) and "lora_rank" not in train_raw
     # the client cannot resolve a run id to the source adapter metadata, so rank 32 is only a
     # serialization placeholder here. keep geometry checks and reject shapes that cannot fit even at
@@ -564,46 +500,6 @@ def _validate_gpu_section(
             geometry_model_revision=model_revision,
             gpu_count=requested_gpu_count,
         )
-        if gpu_types and (preflight_gpu_count <= 1 or algorithm == "custom") and not model_revision:
-            from flash.providers.core.allocator import required_vram_gb
-
-            # sized from `preflight_train`, so an unresolved warm start is measured at rank 1 rather
-            # than at the placeholder. that is a true vram lower bound: no source adapter can need
-            # less. a card rejected here therefore cannot fit at any rank the source could turn out to
-            # have, which keeps an impossible pin (an 80 GB A100 for a run needing 180 GB at rank 1)
-            # rejected at parse time. relaxing the rank is not the same as dropping the check --
-            # dropping it would let the authored `gpu.type` go unvalidated entirely.
-            required_vram = required_vram_gb(
-                model,
-                algorithm,
-                train=preflight_train,
-                thinking=thinking,
-            )
-            # every authored class is checked, not just the head: a fallback too small to hold the
-            # run is one allocation would never rent, so accepting it here would advertise failover
-            # the run does not actually have and surface the shortfall only after the head ran out
-            # of capacity.
-            if algorithm == "custom":
-                from flash.custom.placement import per_device_vram_gb
-
-                required_vram = per_device_vram_gb(
-                    model, preflight_train, preflight_gpu_count, total_need=required_vram
-                )
-            for candidate in gpu_types:
-                if get_gpu_info(candidate).vram_gb < required_vram:
-                    raise ConfigError(
-                        f"gpu.type {candidate!r} has {get_gpu_info(candidate).vram_gb} GB VRAM, "
-                        f"but this run requires at least {required_vram} GB"
-                        + _parse_time_wider_shape_remedy(
-                            candidate,
-                            required_vram,
-                            model,
-                            algorithm,
-                            train=preflight_train,
-                            thinking=thinking,
-                            provider=gpu_spec.provider,
-                        )
-                    )
         # called for its rejection, not its return: it raises when no validated class can hold the
         # run, which is the parse-time "this is unplaceable" gate. every count reaches this boundary
         # after the geometry cap, so an unsafe eight-card width cannot leak into sizing.
@@ -620,7 +516,7 @@ def _validate_gpu_section(
         raise ConfigError("training dimensions exceed the supported numeric range") from exc
     except (UnsupportedGpuError, ValueError) as exc:
         raise ConfigError(str(exc)) from exc
-    return gpu_spec, requested_gpu_count is None
+    return gpu_spec, True
 
 
 def _validate_algorithm_model_consistency(

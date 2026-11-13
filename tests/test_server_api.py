@@ -4839,7 +4839,7 @@ def test_deploy_rechecks_run_state_before_alias_activation(api, monkeypatch):
     assert cleaned == [(f"{run_id}/final", run_serving_org_id(status))]
 
 
-def test_create_rejects_retired_gpu_class(api):
+def test_create_rejects_an_authored_gpu_class(api):
     key = _new_user_token()
     retired_spec = {**SPEC, "gpu": {"type": "RTX A6000"}}
 
@@ -4848,7 +4848,7 @@ def test_create_rejects_retired_gpu_class(api):
     )
 
     assert response.status_code == 400
-    assert "unsupported gpu" in response.json()["detail"]
+    assert "type is no longer supported" in response.json()["detail"]
 
 
 def test_deploy_forwards_structured_outputs_to_serving(api, monkeypatch):

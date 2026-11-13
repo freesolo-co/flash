@@ -739,7 +739,6 @@ def _gather_candidates(
 def _raise_no_candidate_error(
     *,
     model_id: str,
-    algorithm: str = "",
     need: float,
     cap: int,
     exact: str,
@@ -764,16 +763,6 @@ def _raise_no_candidate_error(
     # advertised somewhere, so "come back later" is a coherent thing to say. Evaluated once -- three
     # copies of this question is what let the sft width clamp reach one branch and not the others.
     could_fit = _structurally_fits(supported_available, need, cap, executed_width, acceptable)
-    from flash.providers.mithril.pricing import MAX_SPOT_CARDS
-
-    # only when no Spot shape holds the run at ANY card count: a restrictive authored ceiling
-    # keeps its own ceiling-aware error below, which tells the user to raise the ceiling.
-    if supported_available == ("spot",) and not _structurally_fits(
-        ("spot",), need, MAX_SPOT_CARDS, executed_width, acceptable
-    ):
-        from flash.providers.mithril.pricing import spot_unsupported_message
-
-        raise UnsupportedGpuError(spot_unsupported_message(model_id, algorithm, need))
     if lookup_failed and could_fit:
         raise CapacityLookupError(
             f"no allocatable GPU (>= {need} GB VRAM for {model_id}): a provider's live capacity lookup "
@@ -881,6 +870,13 @@ def allocate(
             raise UnsupportedGpuError(f"requested provider {provider!r} is not configured")
         unpinned = available
         available = (provider,)
+    if available == ("spot",):
+        # before any ceiling or pin check, whose generic VRAM errors would otherwise hide that
+        # no Spot shape at any card count can hold this model/algorithm.
+        from flash.providers.mithril.pricing import MAX_SPOT_CARDS, spot_unsupported_message
+
+        if not _structurally_fits(("spot",), need, MAX_SPOT_CARDS, executed_width):
+            raise UnsupportedGpuError(spot_unsupported_message(model_id, algorithm, need))
 
     # allocate() is reachable directly, bypassing the parse gate entirely, so it resolves the
     # author's ceiling from the same shared predicate rather than trusting a caller to have applied
@@ -936,7 +932,6 @@ def allocate(
     if not candidates:
         _raise_no_candidate_error(
             model_id=model_id,
-            algorithm=algorithm,
             need=need,
             cap=cap,
             exact=exact,

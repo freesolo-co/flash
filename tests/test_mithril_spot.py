@@ -593,25 +593,6 @@ def test_spot_quote_names_spot_as_unsupported_when_no_shape_fits(monkeypatch):
         analytical._offline_gpu_shape(RunConfig("Qwen/Qwen3.5-9B", "grpo", 10, provider="spot"))
 
 
-def test_spot_allocator_names_spot_as_unsupported_when_no_shape_fits():
-    from flash.providers.core.allocator import _raise_no_candidate_error
-    from flash.providers.core.base import UnsupportedGpuError
-
-    with pytest.raises(UnsupportedGpuError, match=r"Spot is not supported .* 5000 GB.*8x H200"):
-        _raise_no_candidate_error(
-            model_id="Qwen/Qwen3.5-9B",
-            algorithm="custom",
-            need=5000,
-            cap=8,
-            exact="",
-            acceptable=(),
-            supported_available=("spot",),
-            structurally_unsupported={},
-            lookup_failed=False,
-            executed_width=lambda n: n,
-        )
-
-
 def test_spot_shape_price_is_class_rate_times_cards():
     from decimal import Decimal
 
@@ -635,20 +616,84 @@ def test_spot_quote_keeps_ceiling_error_when_a_wider_spot_shape_fits(monkeypatch
     assert "Spot is not supported" not in str(error.value)
 
 
-def test_spot_allocator_keeps_ceiling_error_when_a_wider_spot_shape_fits():
-    from flash.providers.core.allocator import _raise_no_candidate_error
+def _spot_only_allocate(monkeypatch, need, **kwargs):
+    from flash.providers.core import allocator
 
-    with pytest.raises(ValueError, match=r"no allocatable GPU") as error:
-        _raise_no_candidate_error(
-            model_id="Qwen/Qwen3.5-9B",
-            algorithm="grpo",
-            need=200,
-            cap=1,
-            exact="",
-            acceptable=(),
-            supported_available=("spot",),
-            structurally_unsupported={},
-            lookup_failed=False,
-            executed_width=lambda n: n,
-        )
+    monkeypatch.setattr(allocator, "required_vram_gb", lambda *a, **k: need)
+    monkeypatch.setattr(allocator, "available_providers", lambda: ("spot",))
+    return allocator.allocate("Qwen/Qwen3.5-9B", "grpo", provider="spot", **kwargs)
+
+
+def test_spot_allocate_names_spot_as_unsupported_when_no_shape_fits(monkeypatch):
+    """Review: the public allocate() path must reach the Spot diagnostic, not the generic one."""
+    from flash.providers.core.base import UnsupportedGpuError
+
+    with pytest.raises(
+        UnsupportedGpuError,
+        match=r"Spot is not supported for Qwen/Qwen3.5-9B with algorithm 'grpo'.*5000 GB.*8x H200",
+    ):
+        _spot_only_allocate(monkeypatch, 5000)
+
+
+def test_spot_allocate_keeps_ceiling_error_when_a_wider_spot_shape_fits(monkeypatch):
+    with pytest.raises(ValueError, match=r"Raise the card ceiling") as error:
+        _spot_only_allocate(monkeypatch, 200, max_gpu_count=1)
     assert "Spot is not supported" not in str(error.value)
+
+
+def _launch_with_poll(monkeypatch, poll, on_handle):
+    """Launch one bid offline whose supervision raises; return what it raised and terminated."""
+    import flash.runtime_capsule
+    from flash.core.spec import GpuSpec, JobSpec
+    from flash.providers.mithril import jobs
+    from flash.providers.mithril import queue as spot_queue
+
+    spec = JobSpec(
+        run_id="r", model="Qwen/Qwen3.5-9B-Base", gpu=GpuSpec(type="H100", provider="spot")
+    )
+    offer = prices.Offer("H100", 1, "it_h100", 1.5, 1500, "r")
+    monkeypatch.setattr(jobs, "scope_fingerprint", lambda: "scope")
+    monkeypatch.setattr(spot_queue, "wait_for_price", lambda *a, **k: offer)
+    monkeypatch.setattr(jobs, "build_payload", lambda *a, **k: {"env": {}})
+    monkeypatch.setattr(flash.runtime_capsule, "build_capsule", lambda *a: ("capsule", None))
+    monkeypatch.setattr(jobs, "worker_image_for_gpu", lambda gpu: "image")
+    monkeypatch.setattr(api, "create", lambda **kw: "bid_live")
+    terminated = []
+    monkeypatch.setattr(api, "terminate", terminated.append)
+    monkeypatch.setattr(jobs, "poll", poll)
+    try:
+        jobs.submit_attempt(
+            spec, on_handle=on_handle, deadline_at=time.time() + 600, log=io.StringIO()
+        )
+    except BaseException as exc:  # TaskStopped is a BaseException
+        return type(exc), terminated
+    raise AssertionError("supervision was expected to raise")
+
+
+@pytest.mark.parametrize("persistence", ["recorded", "missing", "interrupted"])
+def test_shutdown_keeps_only_a_durably_recorded_bid(monkeypatch, persistence):
+    """A redeploy stops supervision; the next plane re-attaches to the recorded live bid."""
+    from flash._internal.background import TaskStopped
+
+    def stop(*args, **kwargs):
+        raise TaskStopped
+
+    persisted = []
+    callback = {"recorded": persisted.append, "missing": None, "interrupted": stop}[persistence]
+    raised, terminated = _launch_with_poll(monkeypatch, stop, callback)
+    assert raised is TaskStopped
+    if persistence == "recorded":
+        assert len(persisted) == 1
+        assert terminated == []
+    else:
+        assert terminated == ["bid_live"]
+
+
+def test_failed_supervision_still_terminates_the_bid(monkeypatch):
+    def fail(*args, **kwargs):
+        raise RuntimeError("poll failed")
+
+    assert _launch_with_poll(monkeypatch, fail, lambda handle: None) == (
+        RuntimeError,
+        ["bid_live"],
+    )
