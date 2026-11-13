@@ -334,15 +334,18 @@ def _persisted_metrics(spec) -> dict:
     return metrics if isinstance(metrics, dict) else {}
 
 
-def _attempt_meters(status: RunStatus, spec) -> dict[str, dict] | None:
+def _attempt_meters(status: RunStatus, spec, *, completed_attempt=None) -> dict[str, dict] | None:
     """Per-attempt metered seconds and rented shape, or ``None`` when nothing was metered.
 
     each worker attempt meters from the start of its first optimizer update to the exit of its
     training loop (``training_timing.billable_train_s``), so model download, data loading, trainer
     / model / vLLM initialization and final adapter publication are never included. the status
     record ``billable_by_attempt`` keeps every attempt's highest observed meter and the shape it
-    rented; the final attempt is raised to its frozen terminal meter when metrics exist. ``None``
-    means a legacy worker that reports no meter.
+    rented. the frozen terminal meter belongs to ``completed_attempt``, the authoritative identity
+    of the attempt whose artifacts completed the run, never ``last_heartbeat.attempt``: the final
+    heartbeat read is best effort, so the last persisted heartbeat can still belong to an earlier
+    attempt, and merging the two would drop one attempt's time. ``None`` means a legacy worker that
+    reports no meter.
     """
     from flash.runner.lifecycle.status import BILLABLE_ATTEMPTS_KEY, _heartbeat_billable_seconds
 
@@ -357,10 +360,15 @@ def _attempt_meters(status: RunStatus, spec) -> dict[str, dict] | None:
     notes = _persisted_metrics(spec).get("notes")
     timing = notes.get("training_timing") if isinstance(notes, dict) else None
     frozen = _finite_seconds(timing.get("billable_train_s")) if isinstance(timing, dict) else None
-    current = frozen if frozen is not None else _finite_seconds(_heartbeat_billable_seconds(hb))
-    if current is not None:
+    live = _finite_seconds(_heartbeat_billable_seconds(hb))
+    if live is not None:
         entry = attempts.setdefault(str(hb.get("attempt")), {"s": 0.0, "shape": None})
-        entry["s"] = max(entry["s"], current)
+        entry["s"] = max(entry["s"], live)
+    if frozen is not None:
+        owner = completed_attempt if completed_attempt is not None else hb.get("attempt")
+        # an attempt first seen here ran on the final rental, which the caller prices it at.
+        entry = attempts.setdefault(str(owner), {"s": 0.0, "shape": None})
+        entry["s"] = max(entry["s"], frozen)
     return attempts or None
 
 
@@ -370,14 +378,19 @@ def metered_training_seconds(status: RunStatus, spec) -> float | None:
     return None if attempts is None else sum(entry["s"] for entry in attempts.values())
 
 
-def metered_charge_usd(status: RunStatus, spec, *, rented_remote: dict | None = None):
+def metered_charge_usd(
+    status: RunStatus, spec, *, rented_remote: dict | None = None, completed_attempt=None
+):
     """Exact charge: metered training seconds x the rented card's $/hr x rented cards.
 
     returns ``None`` when the run carries no meter (legacy workers), so callers fall back to the
     quote-based estimate. the rate is the same per-card rate card the quote prices with, applied
     to the provider/card/count the run actually rented rather than the quote's assumptions.
     """
-    attempts = _attempt_meters(status, spec)
+    if completed_attempt is None and isinstance(rented_remote, dict):
+        # a cancel prices the attempt whose handle was captured before teardown.
+        completed_attempt = rented_remote.get("attempt")
+    attempts = _attempt_meters(status, spec, completed_attempt=completed_attempt)
     if attempts is None:
         return None
     metrics = _persisted_metrics(spec)
@@ -467,13 +480,15 @@ def _persisted_completed_work(spec) -> tuple[int | None, dict | None]:
     return completed_steps, rented_remote
 
 
-def _status_estimated_charge(status: RunStatus, spec, *, fallback: float = 0.0) -> float:
+def _status_estimated_charge(
+    status: RunStatus, spec, *, fallback: float = 0.0, completed_attempt=None
+) -> float:
     """Charge the quote exactly for full work, or its estimated share for an early finish."""
     if getattr(spec, "algorithm", None) == "custom":
         from flash.custom.billing import session_charge
 
         return session_charge(status, spec)
-    metered = metered_charge_usd(status, spec)
+    metered = metered_charge_usd(status, spec, completed_attempt=completed_attempt)
     if metered is not None:
         return metered
     completed_steps, persisted_basis = _persisted_completed_work(spec)

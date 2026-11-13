@@ -504,3 +504,36 @@ def test_spot_attempts_bill_each_class_by_its_own_seconds(tmp_path, monkeypatch)
     }
     status.state = "done"
     assert costs._status_estimated_charge(status, spec, fallback=999.0) == pytest.approx(4.25)
+
+
+def test_the_frozen_meter_belongs_to_the_completed_attempt_not_the_last_heartbeat(
+    tmp_path, monkeypatch
+):
+    """The final heartbeat read is best effort: the last persisted one can be an earlier attempt's.
+
+    Attempt 0 trained 1,800 s on 1x H100; attempt 1 completed with a frozen 3,600 s on 2x H100
+    while last_heartbeat still belonged to attempt 0. Merging the frozen meter into attempt 0 with
+    max() billed $4.43; binding it to the completed attempt bills (0.5 x 1 + 1 x 2) card-h = $11.06.
+    """
+    spec = _spec()
+    status = _metered_status(tmp_path, monkeypatch, spec, final_meter=3600.0, cards=2)
+    status.last_heartbeat = {
+        "attempt": 0,
+        status_ops.BILLABLE_ATTEMPTS_KEY: {"0": {"s": 1800.0, "shape": "modal|H100|1"}},
+        "training_timing": {"billable_train_s": 1800.0},
+    }
+    status.state = "done"
+    charge = costs._status_estimated_charge(status, spec, fallback=999.0, completed_attempt=1)
+    assert charge == pytest.approx(2.5 * H100_MODAL)
+    meters = costs._attempt_meters(status, spec, completed_attempt=1)
+    assert {k: v["s"] for k, v in meters.items()} == {"0": 1800.0, "1": 3600.0}
+
+
+def test_completion_prices_the_attempt_that_produced_the_terminal_metrics():
+    import inspect
+
+    from flash.runner.lifecycle import cleanup
+
+    src = " ".join(inspect.getsource(cleanup).split())
+    call = src[src.index("costs._status_estimated_charge(") :]
+    assert "completed_attempt=verified_attempt if verified_attempt is not None else" in call[:400]
