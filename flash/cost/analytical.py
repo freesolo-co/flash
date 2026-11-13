@@ -74,7 +74,7 @@ STEP_FLOOR_CARD_OFFSET_SECONDS = {
         "RTX 4090": 14.8,  # n=10, 16/32/64/96
         "RTX 5090": -30.0,  # n=4, 32/96
     }.items()
-}# B200 and H200 share the slower offset as a conservative never-cheaper policy, despite matched A/B
+}  # B200 and H200 share the slower offset as a conservative never-cheaper policy, despite matched A/B
 # evidence that B200 is faster. untying changes the contract asserted by
 # test_b200_not_cheaper_or_faster_than_h200_for_grpo, not just this fit. evidence:
 # /home/azureuser/benchmark/b200-vs-h200-20260806/.

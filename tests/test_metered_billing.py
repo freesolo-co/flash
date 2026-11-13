@@ -113,7 +113,9 @@ def test_sft_runner_meters_from_first_update_to_child_exit(worker_context, monke
     monkeypatch.setattr(sft_train_runner, "_invoke_sft_child", fake_child)
     monkeypatch.setattr(sft_train, "_NvidiaSmiPeakSampler", _Sampler)
     monkeypatch.setattr(
-        sft_train_runner, "liveness_heartbeat", lambda *a, **k: __import__("contextlib").nullcontext()
+        sft_train_runner,
+        "liveness_heartbeat",
+        lambda *a, **k: __import__("contextlib").nullcontext(),
     )
     watcher = SimpleNamespace(start=lambda: None, stop=lambda require_complete: None)
     child = SimpleNamespace(resume_step=0, watcher=watcher)
@@ -150,7 +152,9 @@ def test_heartbeat_and_terminal_metrics_carry_the_meter(worker_context, monkeypa
     monkeypatch.setattr(finalize, "_publish_training_completion", lambda m, **kw: metrics.append(m))
     monkeypatch.setattr(worker_context, "require_active_env", lambda: SimpleNamespace(id="test"))
     monkeypatch.setattr(finalize, "gpu_diagnostics", dict)
-    finalize.write_train_meta("rl", "/tmp/adapter", "model", 130, 21, 0, 0, {}, context=worker_context)
+    finalize.write_train_meta(
+        "rl", "/tmp/adapter", "model", 130, 21, 0, 0, {}, context=worker_context
+    )
     assert metrics[0].notes["training_timing"]["billable_train_s"] == 120.0
 
 
@@ -248,7 +252,12 @@ def test_spot_run_resumed_on_another_class_bills_usage_weighted_rates(tmp_path, 
 def test_cancel_bills_heartbeat_meter_with_pre_teardown_handle(tmp_path, monkeypatch):
     spec = _spec()
     monkeypatch.setattr(runner_state, "RESULTS_DIR", str(tmp_path))  # no metrics yet
-    hb = {"attempt": 0, "stage": "sft_step", "step": 3, "training_timing": {"billable_train_s": 900}}
+    hb = {
+        "attempt": 0,
+        "stage": "sft_step",
+        "step": 3,
+        "training_timing": {"billable_train_s": 900},
+    }
     remote = {"provider": "modal", "allocated_gpu": "H100", "allocated_gpu_count": 2}
     charge = costs.cancelled_charge_usd(
         _status(spec, heartbeat=hb, state="cancelled"), spec, steps=3, rented_remote=remote
@@ -315,9 +324,18 @@ def test_image_sft_quotes_vision_encoding_per_example():
     from flash.cost.types import RunConfig
 
     text = RunConfig(
-        "Qwen/Qwen3.5-9B", "sft", 1000, seq_len=8192, batch_size=1, gpu_type="H100",
-        train_tokens=4_000_000, supervised_train_tokens=100_000, sft_packing_mode="packed",
-        sft_packed_blocks=1000, sft_retained_examples=1000, max_wall_seconds=10**7,
+        "Qwen/Qwen3.5-9B",
+        "sft",
+        1000,
+        seq_len=8192,
+        batch_size=1,
+        gpu_type="H100",
+        train_tokens=4_000_000,
+        supervised_train_tokens=100_000,
+        sft_packing_mode="packed",
+        sft_packed_blocks=1000,
+        sft_retained_examples=1000,
+        max_wall_seconds=10**7,
     )
     image = replace(text, sft_packing_mode="exact-unpacked")
     assert sft_image_seconds(text) == 0.0

@@ -118,13 +118,12 @@ def test_cheapest_gpu_picks_cheapest_validated_provider_class():
 
 
 def test_offline_allocates_static_cheapest():
-    from flash.providers.core import allocator
-    from flash.providers.core.base import cheapest_gpu
-
     # Modal static rates: allocation ranks by dollars per STEP, so it is never costlier per step than
     # the cheapest-per-hour class cheapest_gpu names (at measured throughput it is RTX Pro 6000).
     from flash.cost.analytical import step_cost_key
     from flash.cost.types import RunConfig
+    from flash.providers.core import allocator
+    from flash.providers.core.base import cheapest_gpu
     from flash.providers.core.registry import get_provider
 
     a = allocator.allocate("Qwen/Qwen3.5-9B", "grpo")

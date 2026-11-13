@@ -391,10 +391,7 @@ def metered_charge_usd(status: RunStatus, spec, *, rented_remote: dict | None = 
     gpu_spec = getattr(spec, "gpu", None)
     gpu_type = gpu_type or str(getattr(gpu_spec, "type", "") or "")
     gpu_count = gpu_count or max(1, int(getattr(gpu_spec, "count", 1) or 1))
-    if spot:
-        rate = _spot_metered_rate(status, gpu_type)
-    else:
-        rate = _gpu_rate(gpu_type, provider)
+    rate = _spot_metered_rate(status, gpu_type) if spot else _gpu_rate(gpu_type, provider)
     return seconds / 3600.0 * rate * gpu_count
 
 
