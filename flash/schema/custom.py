@@ -86,12 +86,11 @@ def validate_custom_spec(spec):
         )
 
 
-def validate_custom_gpu_count(model, gpu_spec, gpu_count):
-    """Validate custom GPU placement and apply its single-device default."""
+def validate_custom_gpu_count(model, gpu_spec):
+    """Validate custom placement and return its auto-sized card ceiling."""
     from flash.providers.core.base import custom_gpu_shape
 
     try:
-        custom_gpu_shape(model, gpu_spec.provider, gpu_spec.acceptable_types, gpu_count)
+        return custom_gpu_shape(model, gpu_spec.provider, gpu_spec.acceptable_types, None)[3]
     except ValueError as exc:
         raise ConfigError(str(exc)) from exc
-    return gpu_count or 1

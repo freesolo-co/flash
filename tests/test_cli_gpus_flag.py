@@ -16,7 +16,7 @@ BASE = (
     'algorithm = "grpo"\n'
     '[environment]\nid = "github:freesolo-co/envs@main:gsm8k/environment.py"\n'
     "[train]\nepochs = 1\nmax_examples = 100\n"
-    '[gpu]\nprovider = "modal"\n'
+    "[gpu]\n"
 )
 
 BIG_GRPO = (
@@ -48,13 +48,6 @@ def _spec(tmp_path, *argv: str, config: str = BASE):
     )[0]
 
 
-def test_the_parser_turns_gpus_into_the_override_it_is_sugar_for():
-    # the ask is a first-class CLI item, not something the user spells as --set. it parses as its
-    # own flag, and the conversion to gpu.count happens at parse time so nothing downstream needs
-    # to know the flag exists.
-    assert _overrides("--gpus", "4") == ["gpu.count=4"]
-
-
 def test_no_gpus_flag_contributes_no_override():
     # an absent flag must be indistinguishable from no flag. emitting `gpu.count=1` here would
     # turn auto-sizing into an explicit one-card pin.
@@ -67,115 +60,26 @@ def test_no_gpus_flag_marks_the_count_for_auto_sizing(tmp_path):
     assert spec.gpu_count_auto is True
 
 
-def test_gpus_reaches_the_spec(tmp_path):
-    assert _spec(tmp_path, "--gpus", "4").gpu.count == 4
-
-
 def test_unset_count_accepts_a_grpo_run_that_needs_two_cards(tmp_path):
     spec = _spec(tmp_path, config=BIG_GRPO)
     assert spec.gpu_count_auto is True
     assert spec.gpu.count == 1
 
 
-def test_explicit_one_card_pin_rejects_with_a_fitting_count(tmp_path):
-    from flash.schema import ConfigError
-
-    with pytest.raises(ConfigError) as exc:
-        _spec(tmp_path, "--gpus", "1", config=BIG_GRPO)
-    message = str(exc.value)
-    assert "grpo needs >= 235 GB VRAM" in message
-    assert "gpu.count=1 provides at most 180 GB (B200)" in message
-    assert "--gpus 2" in message
-    assert "max_context_tokens" in message
-    assert "max_completion_tokens" in message
-    assert "lora_rank" in message
-    assert "batch_size" not in message
-
-
-def test_no_gpus_flag_leaves_the_configs_count_alone(tmp_path):
-    # the flag is opt-in. a config that already asks for 2 cards must still get 2.
-    assert _spec(tmp_path, config=BASE + "count = 2\n").gpu.count == 2
-
-
-def test_gpus_beats_the_config_file(tmp_path):
-    assert _spec(tmp_path, "--gpus", "4", config=BASE + "count = 2\n").gpu.count == 4
-
-
-def test_gpus_and_set_of_the_same_key_resolve_left_to_right(tmp_path):
-    # both spellings target gpu.count and land in ONE list, so they resolve by argv order exactly
-    # as two --set of the same key already do. no spelling gets a hidden priority: what the user
-    # typed last is what they meant.
-    assert _spec(tmp_path, "--gpus", "4", "--set", "gpu.count=8").gpu.count == 8
-    assert _spec(tmp_path, "--set", "gpu.count=8", "--gpus", "4").gpu.count == 4
-
-
-def test_gpus_does_not_disturb_other_overrides(tmp_path):
-    # sharing the dest must APPEND, not replace: an unrelated --set alongside --gpus has to survive.
-    spec = _spec(tmp_path, "--set", "train.epochs=3", "--gpus", "2")
-    assert spec.gpu.count == 2
-    assert spec.train.epochs == 3
-
-
-def test_repeatable_flags_keep_argv_order():
-    # the shared dest must preserve interleaving, not group by flag. asserting the list itself
-    # (rather than only the resolved spec) pins the ordering the precedence rule depends on.
-    assert _overrides("--gpus", "2", "--set", "train.epochs=3", "--gpus", "4") == [
-        "gpu.count=2",
-        "train.epochs=3",
-        "gpu.count=4",
-    ]
-
-
-@pytest.mark.parametrize("bad", ["0", "-1", "9", "100"])
-def test_gpus_is_validated_by_the_same_bound_as_the_config_key(tmp_path, bad):
-    # the flag routes through gpu.count, so JobSpec's 1..8 bound is the ONLY validator. a second
-    # bound in the CLI could drift from it; assert the shared one actually fires on the flag.
-    with pytest.raises(ValueError, match=r"gpu\.count must be between 1 and 8"):
-        _spec(tmp_path, "--gpus", bad)
-
-
-@pytest.mark.parametrize("bad", ["abc", "2.5", ""])
-def test_a_non_integer_gpus_is_refused_at_parse_time(bad, capsys):
-    # `--gpus 2.5` must not reach the config as the literal string "gpu.count=2.5" and get
-    # diagnosed as a TOML problem. argparse rejects it where the user typed it.
+def test_the_gpus_flag_is_gone(capsys):
     from flash.cli.parsing.main import _build_parser
 
     with pytest.raises(SystemExit):
-        _build_parser().parse_args(["train", "run.toml", "--gpus", bad])
+        _build_parser().parse_args(["train", "run.toml", "--gpus", "4"])
     assert "--gpus" in capsys.readouterr().err
 
 
-@pytest.mark.parametrize("provider", ["modal"])
-def test_gpus_is_accepted_on_every_provider(tmp_path, provider):
-    """The flag carries no provider special-casing: 4 cards is a legal ask on all three.
+@pytest.mark.parametrize("override", ["gpu.count=4", "gpu.provider=modal", "gpu.type=H100"])
+def test_gpu_shape_overrides_are_rejected(tmp_path, override):
+    from flash.schema import ConfigError
 
-    This replaces a test of the old provider-only submit gate. That gate existed because Lambda and
-    provider ignored the count and would have landed 4 ranks on one rented card while billing for four;
-    both now rent the allocated shape (Lambda names the count in the instance type, provider filters
-    offers by num_gpus), so rejecting the ask is no longer correct for any provider.
-    """
-    config = BASE.replace('"modal"', f'"{provider}"')
-    assert _spec(tmp_path, "--gpus", "4", config=config).gpu.count == 4
-
-
-def test_the_help_explains_auto_sizing_and_authored_ceilings():
-    """The flag must distinguish an omitted auto-size from an authored hard ceiling."""
-    from flash.cli.parsing.main import _build_parser
-
-    # render the train subparser's help, which is the text `flash train --help` prints.
-    sub = _build_parser()._subparsers._group_actions[0].choices["train"]  # type: ignore[union-attr]
-    rendered = sub.format_help()
-
-    # rindex, not index: "--gpus N" appears first in the usage line, whose text is just the metavar.
-    # collapse argparse's wrapping first, or a phrase split across two lines reads as absent.
-    start = rendered.rindex("--gpus")
-    window = " ".join(rendered[start : start + 400].split()).lower()
-    assert "auto-size" in window, "help must say omission auto-sizes"
-    assert "pins the ceiling" in window, "help must say an authored value pins the ceiling"
-    assert "1, 2, 4, 8" in window, "help must name the public maximum as a rentable shape"
-    assert not window.startswith("--gpus n cards to run the job on"), (
-        "that phrasing promises exact-count semantics the allocator does not provide"
-    )
+    with pytest.raises(ConfigError, match="no longer supported"):
+        _spec(tmp_path, "--set", override)
 
 
 def test_a_pinned_small_class_still_does_not_pin_the_card_count():
@@ -307,41 +211,3 @@ def test_the_public_run_record_never_reports_the_allocated_count():
     assert public["spec"]["gpu"]["count"] == submitted_ceiling, (
         "spec.gpu.count no longer echoes the submitted ceiling; the doc's warning is now wrong"
     )
-
-
-def test_the_whole_run_floor_is_only_rejected_on_one_card(tmp_path):
-    """The offline VRAM gate compares a WHOLE-RUN floor to ONE card, so it must respect gpu.count.
-
-    required_vram_gb is the memory the run needs in total. Comparing it to a single card's VRAM is
-    correct only when the run is confined to a single card; above that the allocator shards the run
-    and applies its own multi-card fit test (allocator.py:181), which guards the identical
-    comparison with `and max_gpu_count <= 1`.
-
-    Without that guard the gate rejects a pin the allocator would have accepted, and it does so
-    client-side before any allocation runs -- which makes --gpus useless for its main purpose,
-    since the reason to ask for more cards is precisely that one card is too small. Found on a 35B
-    GRPO run: a 141 GB class at count=2 holds 282 GB against a 180 GB floor and was still refused.
-    """
-    from flash.schema import ConfigError
-
-    # 35B MoE GRPO needs more than one card holds.
-    big = (
-        'model = "Qwen/Qwen3.6-35B-A3B"\n'
-        'project = "11111111-1111-4111-8111-111111111111"\n'
-        'algorithm = "grpo"\n'
-        '[environment]\nid = "github:freesolo-co/envs@main:gsm8k/environment.py"\n'
-        "[train]\nepochs = 1\nmax_examples = 100\n"
-        '[gpu]\nprovider = "modal"\n'
-    )
-
-    # one card genuinely cannot hold it, so the gate must still fire. the 35B GRPO floor now exceeds
-    # every validated class (the routed experts train), so the refusal names that rather than the
-    # per-pin shortfall; either way --gpus 1 must not be admitted.
-    with pytest.raises(
-        ConfigError,
-        match=r"(gpu\.count=1 provides at most|no validated GPU class has)",
-    ):
-        _spec(tmp_path, "--gpus", "1", config=big)
-
-    # two cards clear the floor, so the gate must stand aside and let the allocator decide.
-    assert _spec(tmp_path, "--gpus", "2", config=big).gpu.count == 2

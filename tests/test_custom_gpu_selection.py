@@ -150,15 +150,14 @@ def test_catalog_custom_runs_choose_cheapest_fitting_single_card(model, rank, co
             provisional_gpu(model, "custom", train=spec.train, model_revision=revision)
             == expected.name
         )
+    # a runner-selected class confined to one card must still respect the per-card budget.
     for gpu in GPU_INFO.values():
+        one_card = {"gpu_type": gpu.name, "max_gpu_count": 1}
         if gpu.vram_gb < need:
             with pytest.raises(UnsupportedGpuError):
-                allocator.allocate(model, "custom", train=spec.train, gpu_type=gpu.name)
+                allocator.allocate(model, "custom", train=spec.train, **one_card)
         else:
-            assert (
-                allocator.allocate(model, "custom", train=spec.train, gpu_type=gpu.name).gpu
-                == gpu.name
-            )
+            assert allocator.allocate(model, "custom", train=spec.train, **one_card).gpu == gpu.name
 
 
 def test_custom_sizing_defaults_match_parsed_worker_defaults():

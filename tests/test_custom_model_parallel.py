@@ -2,6 +2,7 @@
 
 import sys
 from contextlib import nullcontext
+from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -30,12 +31,12 @@ def spec(gpu):
     )
 
 
-def test_two_gpu_shape_parses_but_single_card_does_not():
-    assert spec({"count": 2}).gpu.count == 2
+def test_custom_runs_auto_size_to_the_two_gpu_shape():
+    parsed = spec({})
+    assert parsed.gpu_count_auto is True
     assert provisional_gpu(MODEL, "custom", train=TRAIN, gpu_count=2) == "H200"
-    for shape in ({}, {"count": 1}):
-        with pytest.raises(ConfigError):
-            spec(shape)
+    with pytest.raises(ConfigError, match="count is no longer supported"):
+        spec({"count": 2})
 
 
 def test_per_device_floor_does_not_divide_logits_by_gpu_count():
@@ -55,7 +56,7 @@ def test_allocator_filters_pooled_fit_that_fails_per_device_floor(monkeypatch):
         "get_provider",
         lambda _: SimpleNamespace(live_candidates=lambda *args: candidates),
     )
-    run = spec({"count": 2})
+    run = spec({})
     chosen = allocator.allocate(MODEL, "custom", train=run.train, max_gpu_count=2)
     assert chosen.gpu_count == 2
     quote = estimate(run, allocation=chosen)
@@ -88,7 +89,10 @@ def test_loader_reserves_only_requested_cuda_devices(monkeypatch):
 def test_worker_passes_allocated_gpu_count_to_loader(monkeypatch):
     from flash.custom import worker
 
-    context = SimpleNamespace(config=SimpleNamespace(spec=spec({"count": 2})))
+    # the runner writes the allocated card count into the worker spec.
+    allocated = spec({})
+    allocated = replace(allocated, gpu=replace(allocated.gpu, count=2))
+    context = SimpleNamespace(config=SimpleNamespace(spec=allocated))
     load = Mock(side_effect=RuntimeError("stop before GPU loading"))
     monkeypatch.setattr(worker, "RunCheckpoints", Mock())
     monkeypatch.setattr(worker, "heartbeat", Mock())

@@ -134,10 +134,10 @@ def test_checkpoint_ref_round_trip_requires_explicit_checkpoint():
         ({"train.rollout_request_max_attempts": 2}, "unknown key"),
         ({"train.rollout_stall_timeout_seconds": 60}, "unknown key"),
         # gpu.count: cards per job, validated to 1..8; bools/non-ints/out-of-range are rejected.
-        ({"gpu.count": 0}, "gpu.count must be between 1 and 8"),
-        ({"gpu.count": 9}, "gpu.count must be between 1 and 8"),
-        ({"gpu.count": True}, "gpu.count must be an integer"),
-        ({"gpu.count": "two"}, "gpu.count must be an integer"),
+        ({"gpu.count": 0}, "count is no longer supported"),
+        ({"gpu.count": 9}, "count is no longer supported"),
+        ({"gpu.count": True}, "count is no longer supported"),
+        ({"gpu.count": "two"}, "count is no longer supported"),
         # `project` is the required canonical freesolo project id and must be a plain string.
         ({"project": ["p"]}, "project must be a string"),
         ({"project": 5}, "project must be a string"),
@@ -1091,18 +1091,18 @@ def test_gpu_public_fields_survive_payload_and_server_reparse() -> None:
 
     defaults = GpuSpec()
     spec = spec_from_dict(
-        _raw(**{"gpu.provider": " Modal "}),
+        _raw(),
         run_id="gpu-rt",
     )
     payload = spec_payload(spec)
     # the public payload carries the user-authorable gpu knobs and omits managed lifecycle policy.
-    assert payload["gpu"]["provider"] == "modal"
+    assert payload["gpu"]["provider"] == ""
     assert payload["gpu"]["type"] == ""
     assert "max_retries" not in payload["gpu"]
     assert "max_wall_seconds" not in payload["gpu"]
 
     reparsed = spec_from_dict(payload, run_id="server-reparse")
-    assert reparsed.gpu.provider == "modal"
+    assert reparsed.gpu.provider == ""
     assert reparsed.gpu.type == ""
     # managed lifecycle fields reconstitute to their defaults on the server reparse.
     assert reparsed.gpu.max_retries == defaults.max_retries
@@ -1151,7 +1151,7 @@ def test_authoring_gpu_type_fallbacks_directly_is_rejected() -> None:
     raw = _raw()
     raw["gpu"]["type_fallbacks"] = ["A100 SXM"]
 
-    with pytest.raises(ConfigError, match=r"\[gpu\] unknown key"):
+    with pytest.raises(ConfigError, match=r"type_fallbacks is no longer supported"):
         spec_from_dict(raw)
 
 
@@ -1934,19 +1934,16 @@ def test_unset_gpu_count_keeps_the_digest_stable_integer_placeholder() -> None:
         spec_from_dict(_raw(gpu_count_auto=True))
 
 
-def test_authored_gpu_count_parses_and_roundtrips() -> None:
-    parsed = spec_from_dict(_raw(**{"gpu.count": 4}))
-    assert parsed.gpu.count == 4
-    assert parsed.gpu_count_auto is False
-    # count survives both serialization hops (asdict-based to_dict / to_json).
-    assert _job_from_dict(parsed.to_dict()).gpu.count == 4
-    assert JobSpec.from_json(parsed.to_json()).gpu.count == 4
+def test_authored_gpu_count_is_rejected() -> None:
+    with pytest.raises(ConfigError, match="count is no longer supported"):
+        spec_from_dict(_raw(**{"gpu.count": 4}))
 
 
-def test_explicit_gpu_count_one_is_not_auto() -> None:
+def test_placeholder_gpu_count_one_from_a_stored_spec_stays_auto() -> None:
+    # every stored public spec carries count = 1; resubmitting one must not become a one-card pin.
     parsed = spec_from_dict(_raw(**{"gpu.count": 1}))
     assert parsed.gpu.count == 1
-    assert parsed.gpu_count_auto is False
+    assert parsed.gpu_count_auto is True
 
 
 @pytest.mark.parametrize("good", [1, 8])

@@ -32,7 +32,6 @@ from flash.core.spec import (
 )
 from flash.providers.core.base import (
     UnsupportedGpuError,
-    authored_gpu_ceiling,
     providers_for,
     provisional_gpu,
     provisional_gpu_count,
@@ -44,7 +43,6 @@ from flash.schema.fields import (
     _environment_pip,
     _environment_secrets,
     _require_environment_ref,
-    _section_int,
     _train_credit_assignment,
     _train_float,
     _train_int,
@@ -244,13 +242,31 @@ _TOP_LEVEL_KEYS = (
 # runner-assigned [gpu] fields (MANAGED_GPU_KEYS, single-sourced in flash.core.spec) are excluded from the
 # user-facing surface. GpuSpec still carries them so the internal JobSpec.from_dict round trip
 # preserves the runner's disk sizing, weight-cache volume, and platform retry/wall-clock policy.
-# `type` and `type_fallbacks` are allocator-owned: the allocator picks the cheapest fitting class
-# and the runner records it in the worker spec. users never pin a GPU class.
+# GPU class, card count, and provider are allocator-owned: the allocator picks the cheapest fitting
+# shape and the runner records it in the worker spec. `spot` is the only authorable [gpu] key.
+_RETIRED_GPU_KEYS = frozenset({"type", "type_fallbacks", "count", "provider", "providers"})
 _GPU_KEYS = (
     frozenset(item.name for item in dataclass_fields(GpuSpec))
     - MANAGED_GPU_KEYS
-    - {"type", "type_fallbacks"}
+    - _RETIRED_GPU_KEYS
 )
+
+
+def _is_derived_gpu_value(key: str, value: Any, *, spot: bool) -> bool:
+    """True for the empty/derived values ``JobSpec.to_dict()`` itself emits for allocator-owned keys.
+
+    Every stored public spec carries ``count = 1`` (the digest-stable placeholder), so resubmitting a
+    spec copied from ``flash runs status`` must still parse; the value never reaches allocation.
+    """
+    if key == "count":
+        return type(value) is int and value == 1
+    if key == "type":
+        return isinstance(value, str) and not value.strip()
+    if key == "provider":
+        return isinstance(value, str) and value.strip().lower() in (("", "spot") if spot else ("",))
+    return False
+
+
 # [environment] user-authorable keys, derived from environmentspec (mirrors _gpu_keys) so a new field
 # is accepted automatically; resolved_sha and package are controller-managed by staging and named once
 # in the managed environment registry rather than restated here.
@@ -435,61 +451,38 @@ def _validate_gpu_section(
         gpu_raw = {}
     if not isinstance(gpu_raw, dict):
         raise ConfigError("[gpu] must be a table")
-    # the public payload always carries `type` (empty) for digest stability, so only a real pin is
-    # rejected. the allocator owns class selection.
-    authored_type = gpu_raw.get("type", "")
-    if not (isinstance(authored_type, str) and not authored_type.strip()):
-        raise ConfigError(
-            "[gpu] type is no longer supported: Flash picks the cheapest GPU that fits the run. "
-            "Delete the `type` line; use `count` to cap cards or `spot = true` for Mithril Spot."
-        )
-    unknown_gpu = sorted(set(gpu_raw) - _GPU_KEYS - {"type"})
+    unknown_gpu = sorted(set(gpu_raw) - _GPU_KEYS - _RETIRED_GPU_KEYS)
     if unknown_gpu:
         raise ConfigError(
             f"[gpu] unknown key(s): {', '.join(unknown_gpu)} "
             f"(allowed: {', '.join(sorted(_GPU_KEYS))})"
         )
-    # cards a single training worker occupies (1..8); count > 1 provisions a multi-gpu pod.
-    gpu_count = _section_int(gpu_raw, "gpu", "count", minimum=1, maximum=8)
-
-    provider_raw = gpu_raw.get("provider", "")
-    if not isinstance(provider_raw, str):
-        raise ConfigError("gpu.provider must be a string")
-    gpu_provider = provider_raw.strip().lower()
-    if gpu_provider and gpu_provider not in PROVIDER_NAMES:
-        raise ConfigError(
-            f"gpu.provider must be one of {', '.join(PROVIDER_NAMES)}; got {provider_raw!r}"
-        )
     spot = gpu_raw.get("spot", False)
     if type(spot) is not bool:
         raise ConfigError("gpu.spot must be a boolean")
-    if (
-        "spot" in gpu_raw
-        and not spot
-        and (gpu_provider == "spot" or gpu_raw.get("providers") == ["spot"])
-    ):
-        raise ConfigError("gpu.spot=false conflicts with the Spot provider")
-    if spot:
-        if gpu_provider not in ("", "spot"):
-            raise ConfigError("gpu.spot=true cannot use another provider")
-        if not gpu_raw.get("providers"):
-            gpu_provider = "spot"
-    try:
-        gpu_spec = GpuSpec(
-            provider=gpu_provider,
-            providers=gpu_raw.get("providers", ()),
-            spot=spot,
-            count=gpu_count if gpu_count is not None else 1,
+    # GPU class, card count, and provider are allocator-owned. a stored public spec still carries
+    # `type = ""`, `count = 1`, and `provider = ""` (or the "spot" provider a Spot spec derives) for
+    # digest stability, so only values a user could have meant as a choice are rejected.
+    retired = sorted(
+        key
+        for key in _RETIRED_GPU_KEYS & set(gpu_raw)
+        if not _is_derived_gpu_value(key, gpu_raw[key], spot=spot)
+    )
+    if retired:
+        raise ConfigError(
+            f"[gpu] {', '.join(retired)} is no longer supported: Flash picks the GPU class, card "
+            "count, and provider automatically. Delete the line; `spot = true` is the only [gpu] "
+            "setting."
         )
-    except (TypeError, ValueError) as exc:
-        raise ConfigError(str(exc)) from exc
+    gpu_spec = GpuSpec(provider="spot" if spot else "", spot=spot)
 
+    # never authored: every run auto-sizes to the smallest fitting geometry-safe shape. custom runs
+    # are bounded by their placement shapes (one Spot card, or up to two Modal cards).
+    requested_gpu_count = None
     if algorithm == "custom":
         from flash.schema.custom import validate_custom_gpu_count
 
-        gpu_count = validate_custom_gpu_count(model, gpu_spec, gpu_count)
-
-    requested_gpu_count = authored_gpu_ceiling("", gpu_count)
+        requested_gpu_count = validate_custom_gpu_count(model, gpu_spec)
     unresolved_warmstart_rank = bool(init_from_adapter) and "lora_rank" not in train_raw
     # the client cannot resolve a run id to the source adapter metadata, so rank 32 is only a
     # serialization placeholder here. keep geometry checks and reject shapes that cannot fit even at
@@ -523,7 +516,7 @@ def _validate_gpu_section(
         raise ConfigError("training dimensions exceed the supported numeric range") from exc
     except (UnsupportedGpuError, ValueError) as exc:
         raise ConfigError(str(exc)) from exc
-    return gpu_spec, requested_gpu_count is None
+    return gpu_spec, True
 
 
 def _validate_algorithm_model_consistency(

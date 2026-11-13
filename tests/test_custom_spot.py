@@ -45,7 +45,7 @@ def test_custom_spot_rejects_manual_interval_and_two_gpus():
     raw["train"]["save_every"] = 3
     with pytest.raises((ConfigError, ValueError), match="time-based and automatic"):
         spec_from_dict(raw)
-    with pytest.raises(ConfigError, match="exactly one GPU"):
+    with pytest.raises(ConfigError, match="count is no longer supported"):
         spec_from_dict(custom_raw(spot=True, count=2))
 
 

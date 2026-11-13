@@ -135,8 +135,9 @@ def test_public_spec_round_trips_through_user_parser():
     # Because to_dict() omits every managed field, that round trip must pass without a rejection -
     # the run_id travels as the separate server-assigned parameter, not in the config body.
     public = _fully_managed_internal_spec().to_dict()
-    # a non-empty gpu.type exists only on runner-selected specs; an authored payload carries "".
+    # class and provider exist only on runner-selected specs; an authored payload carries neither.
     public["gpu"]["type"] = ""
+    public["gpu"].pop("providers")
     reparsed = spec_from_dict(public, run_id="flash-managed-run")
     assert reparsed.model == "Qwen/Qwen3.5-9B"
     assert reparsed.run_id == "flash-managed-run"  # from the parameter, not the config body
@@ -164,6 +165,7 @@ def test_authored_surface_is_exactly_what_the_public_payload_carries():
     # empty custom settings stay absent to preserve historical preparation digests.
     assert set(public) == _TOP_LEVEL_KEYS - {"custom"}
     assert set(public["environment"]) == _ENVIRONMENT_KEYS
-    # The false Spot default stays absent to preserve pre-Spot preparation digests. `type` is not
-    # authorable but stays in the payload (always empty for authored specs) for digest stability.
-    assert set(public["gpu"]) == (_GPU_KEYS | {"type"}) - {"spot"}
+    # The false Spot default stays absent to preserve pre-Spot preparation digests. The
+    # allocator-owned keys are not authorable but stay in the payload for digest stability (empty,
+    # or the count placeholder, for authored specs; this fixture is runner-selected).
+    assert set(public["gpu"]) == (_GPU_KEYS | {"type", "count", "provider", "providers"}) - {"spot"}

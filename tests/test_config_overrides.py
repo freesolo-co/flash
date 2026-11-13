@@ -48,14 +48,14 @@ def test_composed_config_deep_merge():
         override = _write(
             tmp,
             "prod.toml",
-            "[train]\nmax_examples = 250\n[gpu]\ncount = 2\n",
+            "[train]\nmax_examples = 250\n[gpu]\nspot = true\n",
         )
         spec = spec_and_train_keys_from_file(base, run_id="x", extra_configs=[override])[0]
         assert spec.train.max_examples == 250  # deep-merged override of a scalar
         assert (
             spec.environment.id == "github:freesolo-co/envs@main:gsm8k/environment.py"
         )  # untouched key preserved
-        assert spec.gpu.count == 2  # deep-merged [gpu] table
+        assert spec.gpu.spot is True  # deep-merged [gpu] table
 
 
 def test_authored_train_keys_follow_composed_config() -> None:
