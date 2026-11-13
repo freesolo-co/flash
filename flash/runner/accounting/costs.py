@@ -391,35 +391,56 @@ def metered_charge_usd(status: RunStatus, spec, *, rented_remote: dict | None = 
     gpu_spec = getattr(spec, "gpu", None)
     gpu_type = gpu_type or str(getattr(gpu_spec, "type", "") or "")
     gpu_count = gpu_count or max(1, int(getattr(gpu_spec, "count", 1) or 1))
-    rate = _spot_metered_rate(status, gpu_type) if spot else _gpu_rate(gpu_type, provider)
-    return seconds / 3600.0 * rate * gpu_count
+    final_hourly = _per_card_rate("spot" if spot else provider, gpu_type) * gpu_count
+    ledger = _shape_ledger(status, spot=spot)
+    ledger_seconds = sum(ledger.values())
+    if ledger_seconds <= 0:
+        return seconds / 3600.0 * final_hourly
+    # each attempt's seconds at the shape it actually rented (an OOM retry moves to a larger card
+    # or count; a Spot resume can land on another class), never repriced at the final rental.
+    priced = sum(
+        shape_seconds / 3600.0 * _per_card_rate(shape_provider, shape_gpu) * shape_count
+        for (shape_provider, shape_gpu, shape_count), shape_seconds in ledger.items()
+    )
+    if seconds <= ledger_seconds:
+        return priced * (seconds / ledger_seconds)
+    # metered seconds the heartbeats had not reported yet (the final, frozen meter in terminal
+    # metrics) ran on the final rental.
+    return priced + (seconds - ledger_seconds) / 3600.0 * final_hourly
 
 
-def _spot_metered_rate(status: RunStatus, gpu_type: str) -> float:
-    """Per-GPU Spot rate for metered time: each class's fixed rate, weighted by its seconds.
+def _per_card_rate(provider: str, gpu_type: str) -> float:
+    """$/hr for one card: Spot bills dev's fixed class rate, everything else the rate card."""
+    if provider == "spot":
+        from flash.providers.mithril.pricing import hourly_rate, quote_rate
 
-    A Spot run can resume on a different class after a preemption. The status ledger
-    ``spot_billable_s_by_gpu`` credits every metered second to the class it ran on, so the
-    seconds-weighted rate times total metered seconds equals the sum of each class's seconds at
-    its own rate. Steps are not a substitute: classes differ in seconds per step, and a resumed
-    attempt can repeat steps. Without a ledger, the rented class's fixed rate applies; with no
-    class at all, the quote rate (the costliest class) is the upper bound.
-    """
-    from flash.providers.mithril.pricing import SPOT_GPUS, hourly_rate, quote_rate
-    from flash.runner.accounting.spot_usage import _amount
-    from flash.runner.lifecycle.status import SPOT_BILLABLE_KEY
+        try:
+            return hourly_rate(gpu_type)
+        except Exception:
+            # an unknown class prices at the costliest Spot class, the quote's upper bound.
+            return quote_rate()
+    return _gpu_rate(gpu_type, provider)
+
+
+def _shape_ledger(status: RunStatus, *, spot: bool) -> dict[tuple[str, str, int], float]:
+    """Metered seconds per rented ``(provider, gpu, cards)`` from the status ledger."""
+    from flash.runner.lifecycle.status import BILLABLE_SHAPE_KEY
 
     hb = status.last_heartbeat if isinstance(status.last_heartbeat, dict) else {}
-    seconds = hb.get(SPOT_BILLABLE_KEY)
-    if isinstance(seconds, dict):
-        seconds = {gpu: _amount(value) for gpu, value in seconds.items() if gpu in SPOT_GPUS}
-        total = sum(seconds.values())
-        if total > 0:
-            return sum(value * hourly_rate(gpu) for gpu, value in seconds.items()) / total
-    try:
-        return hourly_rate(gpu_type)
-    except Exception:
-        return quote_rate()
+    raw = hb.get(BILLABLE_SHAPE_KEY)
+    ledger: dict[tuple[str, str, int], float] = {}
+    if not isinstance(raw, dict):
+        return ledger
+    for key, value in raw.items():
+        seconds = _finite_seconds(value)
+        parts = key.split("|") if isinstance(key, str) else []
+        if seconds is None or seconds <= 0 or len(parts) != 3 or not parts[2].isdigit():
+            continue
+        # the authored Spot choice is authoritative, as for the final rental.
+        provider = "spot" if spot else parts[0]
+        shape = (provider, parts[1], max(1, int(parts[2])))
+        ledger[shape] = ledger.get(shape, 0.0) + seconds
+    return ledger
 
 
 def _persisted_completed_work(spec) -> tuple[int | None, dict | None]:

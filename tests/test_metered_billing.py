@@ -362,7 +362,7 @@ def test_grpo_freezes_the_meter_before_draining_required_save_publication():
     assert src.index("rc = _execute_rl_child(") < src.index("context.phase_timings.stop_billing()")
 
 
-# ---------------------------------------------------------------------------- spot seconds ledger
+# ---------------------------------------------------------------------------- per-shape seconds ledger
 
 
 def _spot_status(spec, gpu, heartbeat=None):
@@ -371,18 +371,74 @@ def _spot_status(spec, gpu, heartbeat=None):
     return status
 
 
-def test_spot_ledger_credits_metered_seconds_to_the_class_running_them():
+def test_ledger_credits_metered_seconds_to_the_shape_running_them():
     spec = spot_spec("H100")
     status = _spot_status(spec, "H100")
     prev = {"attempt": 0, "training_timing": {"billable_train_s": 100.0}}
     hb = {"attempt": 0, "training_timing": {"billable_train_s": 400.0}}
-    status_ops._credit_spot_billable_seconds(status, prev, hb, same_attempt=True)
-    assert hb[status_ops.SPOT_BILLABLE_KEY] == {"H100": 300.0}
+    status_ops._credit_billable_seconds(status, prev, hb, same_attempt=True)
+    assert hb[status_ops.BILLABLE_SHAPE_KEY] == {"spot|H100|1": 300.0}
     # a replacement attempt on another class starts its own meter at zero.
     status.remote = {"provider": "spot", "gpu": "H200", "attempt": 1}
     nxt = {"attempt": 1, "training_timing": {"billable_train_s": 50.0}}
-    status_ops._credit_spot_billable_seconds(status, hb, nxt, same_attempt=False)
-    assert nxt[status_ops.SPOT_BILLABLE_KEY] == {"H100": 300.0, "H200": 50.0}
+    status_ops._credit_billable_seconds(status, hb, nxt, same_attempt=False)
+    assert nxt[status_ops.BILLABLE_SHAPE_KEY] == {"spot|H100|1": 300.0, "spot|H200|1": 50.0}
+
+
+def test_ledger_keys_on_demand_shapes_by_class_and_card_count():
+    spec = _spec()
+    status = _status(spec, state="running")
+    status.remote = {"provider": "modal", "allocated_gpu": "H100", "allocated_gpu_count": 2}
+    prev = {"attempt": 1, "training_timing": {"billable_train_s": 0.0}}
+    hb = {"attempt": 1, "training_timing": {"billable_train_s": 60.0}}
+    status_ops._credit_billable_seconds(status, prev, hb, same_attempt=True)
+    assert hb[status_ops.BILLABLE_SHAPE_KEY] == {"modal|H100|2": 60.0}
+
+
+def test_an_oom_retry_on_a_larger_shape_bills_each_attempt_at_its_own_shape(tmp_path, monkeypatch):
+    """1 h on 1x H100, then 1 h on 2x H100 after an OOM retry = 3 card-hours, not 4."""
+    spec = _spec()
+    _metrics(
+        tmp_path,
+        monkeypatch,
+        spec,
+        step=20,
+        allocated_provider="modal",
+        allocated_gpu="H100",
+        allocated_gpu_count=2,
+        notes={"training_timing": {"billable_train_s": 3600.0}},
+    )
+    hb = {
+        "attempt": 1,
+        "billable_train_s_prior": 3600.0,
+        status_ops.BILLABLE_SHAPE_KEY: {"modal|H100|1": 3600.0, "modal|H100|2": 3600.0},
+        "training_timing": {},
+    }
+    charge = costs._status_estimated_charge(_status(spec, heartbeat=hb), spec, fallback=999.0)
+    assert charge == pytest.approx(3 * H100_MODAL)
+
+
+def test_metered_seconds_not_yet_in_the_ledger_bill_at_the_final_shape(tmp_path, monkeypatch):
+    spec = _spec()
+    _metrics(
+        tmp_path,
+        monkeypatch,
+        spec,
+        step=20,
+        allocated_provider="modal",
+        allocated_gpu="H100",
+        allocated_gpu_count=2,
+        notes={"training_timing": {"billable_train_s": 3600.0}},
+    )
+    # the last heartbeat saw only 1,800 s of the final attempt; its frozen meter says 3,600 s.
+    hb = {
+        "attempt": 1,
+        "billable_train_s_prior": 3600.0,
+        status_ops.BILLABLE_SHAPE_KEY: {"modal|H100|1": 3600.0, "modal|H100|2": 1800.0},
+        "training_timing": {},
+    }
+    charge = costs._status_estimated_charge(_status(spec, heartbeat=hb), spec, fallback=999.0)
+    assert charge == pytest.approx((1 + 2 * 0.5 + 2 * 0.5) * H100_MODAL)
 
 
 def test_spot_charge_weights_class_rates_by_seconds_not_steps(tmp_path, monkeypatch):
@@ -402,7 +458,7 @@ def test_spot_charge_weights_class_rates_by_seconds_not_steps(tmp_path, monkeypa
         "attempt": 1,
         "billable_train_s_prior": 5400.0,
         "spot_usage_by_gpu": {"H100": 10, "H200": 10},  # steps: would price $4.50
-        status_ops.SPOT_BILLABLE_KEY: {"H100": 5400.0, "H200": 1800.0},
+        status_ops.BILLABLE_SHAPE_KEY: {"spot|H100|1": 5400.0, "spot|H200|1": 1800.0},
         "training_timing": {},
     }
     charge = costs._status_estimated_charge(_status(spec, heartbeat=hb), spec, fallback=999.0)

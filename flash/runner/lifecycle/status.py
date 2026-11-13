@@ -380,7 +380,7 @@ def record_heartbeat(run_id: str, heartbeat: dict) -> None:
                 prior += _session_seconds(_heartbeat_billable_seconds(prev))
             if prior:
                 hb.setdefault("billable_train_s_prior", prior)
-            _credit_spot_billable_seconds(status, prev, hb, same_attempt=same_attempt)
+            _credit_billable_seconds(status, prev, hb, same_attempt=same_attempt)
         from flash.runner.accounting.spot_usage import record as record_spot_usage
 
         record_spot_usage(status, prev, hb, same_attempt=same_attempt)
@@ -575,32 +575,57 @@ def _update(run_id: str, new_state: str, *, allow_from_terminal: bool = False, *
     return True
 
 
-SPOT_BILLABLE_KEY = "spot_billable_s_by_gpu"
+BILLABLE_SHAPE_KEY = "billable_s_by_shape"
 
 
-def _credit_spot_billable_seconds(status, prev, hb, *, same_attempt):
-    """Credit this heartbeat's newly metered seconds to the Spot class the run is on right now.
+def rented_shape_key(remote) -> str | None:
+    """``provider|gpu|cards`` for the shape a provider handle rented, else ``None``.
 
-    A Spot run can resume on a different class after a preemption, and classes run at different
-    seconds per step, so pricing must weight each class by the seconds it trained, not its steps.
+    A Spot run may launch on a different (interchangeable) class than it was allocated, so its
+    actual class (``gpu``) wins over ``allocated_gpu``. Card count defaults to 1.
     """
-    from flash.runner.accounting.spot_usage import _is_spot, _rented_gpu
+    if not isinstance(remote, dict):
+        return None
+    provider = remote.get("provider")
+    if not isinstance(provider, str) or not provider.strip():
+        return None
+    provider = provider.strip().lower()
+    gpu = remote.get("gpu") if provider == "spot" else None
+    gpu = gpu if isinstance(gpu, str) and gpu else remote.get("allocated_gpu")
+    if not isinstance(gpu, str) or not gpu:
+        return None
+    try:
+        from flash.providers.core.base import canonical_gpu
 
-    if not _is_spot(status):
-        return
-    ledger = prev.get(SPOT_BILLABLE_KEY) if isinstance(prev, dict) else None
+        gpu = canonical_gpu(gpu)
+    except Exception:
+        return None
+    count = remote.get("allocated_gpu_count") or remote.get("gpu_count") or 1
+    if isinstance(count, bool) or not isinstance(count, int) or not 1 <= count <= 8:
+        count = 1
+    return f"{provider}|{gpu}|{count}"
+
+
+def _credit_billable_seconds(status, prev, hb, *, same_attempt):
+    """Credit this heartbeat's newly metered seconds to the shape the run is renting right now.
+
+    Attempts can rent different shapes: an OOM retry moves to a strictly larger card or count,
+    and a Spot resume can land on another class. Each shape's seconds are priced at its own rate
+    and card count, never at the final attempt's.
+    """
+    ledger = prev.get(BILLABLE_SHAPE_KEY) if isinstance(prev, dict) else None
     ledger = {
-        gpu: _session_seconds(seconds)
-        for gpu, seconds in (ledger.items() if isinstance(ledger, dict) else ())
-        if isinstance(gpu, str)
+        shape: _session_seconds(seconds)
+        for shape, seconds in (ledger.items() if isinstance(ledger, dict) else ())
+        if isinstance(shape, str)
     }
     current = _session_seconds(_heartbeat_billable_seconds(hb))
     before = _session_seconds(_heartbeat_billable_seconds(prev)) if same_attempt else 0.0
-    gpu = _rented_gpu(status)
-    if gpu and current > before:
-        ledger[gpu] = ledger.get(gpu, 0.0) + (current - before)
+    shape = rented_shape_key(status.remote)
+    if shape and current > before:
+        ledger[shape] = ledger.get(shape, 0.0) + (current - before)
     if ledger:
-        hb[SPOT_BILLABLE_KEY] = ledger
+        hb[BILLABLE_SHAPE_KEY] = ledger
 
 
 def _heartbeat_billable_seconds(heartbeat):

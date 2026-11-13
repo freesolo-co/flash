@@ -20,9 +20,12 @@ charge = billable_train_seconds / 3600 × rate-card $/hr for the rented card × 
   earlier attempts' metered seconds as `billable_train_s_prior`, so the charge covers every attempt.
 - **Cancellation:** the latest heartbeat's meter (`training_timing.billable_train_s`), plus earlier
   attempts.
-- **Spot:** dev's fixed class rates (H100 $2.00/hr, H200 $2.50/hr). A run that resumes on a
-  different class is priced by metered **seconds** per class (`spot_billable_s_by_gpu`), never by
-  steps, because classes differ in seconds per step and a resumed attempt can repeat steps.
+- **Spot:** dev's fixed class rates (H100 $2.00/hr, H200 $2.50/hr).
+- **Attempts on different shapes:** `record_heartbeat` keeps metered seconds per rented shape
+  (`billable_s_by_shape`, keyed `provider|gpu|cards`). Each shape's seconds bill at its own rate and
+  card count: an OOM retry on a larger card or count, or a Spot resume on another class, never
+  reprices earlier attempts at the final rental. Seconds not yet in the ledger (the final frozen
+  meter) bill at the final rental.
 - **Legacy workers** that report no meter keep the previous quote-based pricing.
 - **Custom runs** are unchanged. They were already metered on session time, which starts after
   the backend loads the model and ends at session close or cancel. Session time includes time the
