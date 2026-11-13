@@ -1,5 +1,7 @@
 """Bounded Compute API requests; never log response bodies or worker credentials."""
 
+import json
+import re
 import time
 
 from flash.providers.mithril.config import settings
@@ -17,26 +19,16 @@ class MithrilApiError(RuntimeError):
 
 _REASON_KEYS = ("detail", "message", "error", "title")
 _REASON_LIMIT = 200
-_LONG_REQUEST_STRING = 32
-
-
-def _strings(value):
-    if isinstance(value, str):
-        yield value
-    elif isinstance(value, dict):
-        for item in value.values():
-            yield from _strings(item)
-    elif isinstance(value, (list, tuple)):
-        for item in value:
-            yield from _strings(item)
+# Tokens that could be (part of) a credential: 8+ characters with a digit or symbol.
+_TOKEN = re.compile(r"[\w+/=.-]{8,}")
 
 
 def _safe_reason(response, *, body=None, params=None) -> str:
     """Mithril's short error message, or "" when it might echo request data.
 
-    Only a top-level message field (or the ``msg`` entries of a validation error list) is read,
-    never the raw body. It is dropped entirely if it contains any request string of 8+ characters
-    (startup scripts carry worker credentials) or the API key, and it is bounded in length.
+    Only a top-level message field (or a validation list's ``msg`` entries) is read, never the raw
+    body. It is dropped if it contains the API key or any non-alphabetic 8+ character token that also
+    appears anywhere in the request (startup scripts carry worker credentials), then bounded.
     """
     try:
         data = response.json()
@@ -58,19 +50,12 @@ def _safe_reason(response, *, body=None, params=None) -> str:
             )
             break
     reason = " ".join(reason.split())
-    if not reason:
+    request = json.dumps([body, params], default=str)
+    key = settings()["api_key"]
+    if not reason or (key and key in reason):
         return ""
-    # Secrets ride in long request strings (startup scripts) and the API key. Compare them after
-    # the same whitespace collapsing, and word by word so a partial echo (one script line) also
-    # drops the reason. Short values (region, instance type, price) are not secret.
-    sensitive = {settings()["api_key"]}
-    for value in (*_strings(body), *_strings(params)):
-        if len(value) >= _LONG_REQUEST_STRING:
-            sensitive.add(" ".join(value.split()))
-            sensitive.update(word for word in value.split() if len(word) >= 8)
-    # Check the whole message before bounding it: truncation could cut a secret that crosses the
-    # limit, leaving a prefix the substring checks no longer match.
-    if any(value and value in reason for value in sensitive):
+    # Checked on the whole message before bounding it, so a secret crossing the limit is caught.
+    if any(not t.isalpha() and t in request for t in _TOKEN.findall(reason)):
         return ""
     return reason[:_REASON_LIMIT]
 

@@ -975,11 +975,14 @@ def test_error_reasons_are_short_and_never_echo_the_request():
     assert reason(_Response(echoed), body=body) == ""
     partial = {"detail": "invalid line: export TOKEN=hunter2-secret"}
     assert reason(_Response(partial), body=body) == ""
-    # short, non-secret request values such as the region may appear in a kept reason
-    regional = {"detail": "no Spot capacity in us-central2-b"}
-    assert reason(_Response(regional), body={**body, "region": "us-central2-b"}) == (
-        "no Spot capacity in us-central2-b"
-    )
+    # a bare secret echoed without its script syntax, e.g. a base64 payload
+    assert reason(_Response({"detail": "Invalid token: hunter2-secret"}), body=body) == ""
+    wrapped = {"startup_script": "REF=json.loads(base64.b64decode('eyJrZXkiOiAic2VjcmV0In0='))"}
+    echo = {"detail": "bad payload eyJrZXkiOiAic2VjcmV0In0="}
+    assert reason(_Response(echo), body=wrapped) == ""
+    # plain words that also appear in the request (field names) do not drop a reason
+    words = {"detail": "Spot quota exceeded for this instance type"}
+    assert reason(_Response(words), body={"instance_type": "it_x"}) == words["detail"]
     assert reason(_Response({"message": "key test-secret rejected"})) == ""
     assert reason(_Response(ValueError("not json"))) == ""
     assert reason(_Response(["unexpected"])) == ""
