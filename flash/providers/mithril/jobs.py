@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import time
 
+from flash._internal.background import TaskStopped
 from flash.providers._lifecycle.instances.instance import build_payload, instance_label
 from flash.providers._lifecycle.instances.poll import (
     FIRST_LIVENESS_S,
@@ -184,6 +185,7 @@ def submit_attempt(
         disk_gb=spec.gpu.disk_gb,
         deadline_at=deadline_at,
     )
+    persisted = detached = False
     try:
         h = SpotJobHandle(
             instance_id=sandbox_id,
@@ -201,7 +203,14 @@ def submit_attempt(
         handle = JobHandle.from_dict(h.to_dict())
         if on_handle is not None:
             on_handle(handle)
+            persisted = True
         return poll(handle, spec, log=log, deadline_at=deadline_at)
+    except TaskStopped:
+        # Control-plane shutdown (e.g. a redeploy) detaches supervision only. A durably recorded
+        # handle lets the next plane re-attach to the live bid, so leave it running.
+        detached = persisted
+        raise
     finally:
-        # cleanup errors stay visible; a failed delete must not be mistaken for a stopped worker.
-        api.terminate(sandbox_id)
+        if not detached:
+            # cleanup errors stay visible; a failed delete must not be mistaken for a stopped worker.
+            api.terminate(sandbox_id)

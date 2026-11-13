@@ -42,6 +42,14 @@ def accepts_price(gpu: str, value, *, currency: str, unit: str) -> bool:
         return False
 
 
+MAX_SPOT_CARDS = max(count for shape in SPOT_GPUS.values() for count in shape.counts)
+
+
+def shape_price(gpu: str, count: int) -> Decimal:
+    """Fixed rental price of ``count`` cards of ``gpu`` per hour: what Spot allocation ranks on."""
+    return SPOT_GPUS[canonical_gpu(gpu)].hourly_usd * count
+
+
 def priority(gpu: str) -> int:
     return tuple(SPOT_GPUS).index(canonical_gpu(gpu))
 
@@ -73,4 +81,20 @@ def interchangeable(gpu: str, count: int) -> tuple[str, ...]:
         name
         for name, shape in SPOT_GPUS.items()
         if count in shape.counts and get_gpu_info(name).vram_gb >= floor
+    )
+
+
+def spot_unsupported_message(model_id: str, algorithm: str, need: float) -> str:
+    """Why a run no Spot shape can hold is refused: Spot rents only these classes and counts."""
+    from flash.providers.core.base import get_gpu_info
+
+    shapes = ", ".join(
+        f"{count}x {name} ({count * get_gpu_info(name).vram_gb} GB)"
+        for name, shape in SPOT_GPUS.items()
+        for count in shape.counts
+    )
+    return (
+        f"Spot is not supported for {model_id} with algorithm {algorithm!r}: it needs at least "
+        f"{need} GB of GPU memory, which no Spot shape can hold (Spot rents only {shapes}). "
+        "Lower max_context_tokens / max_completion_tokens / batch size, or pick a smaller model"
     )

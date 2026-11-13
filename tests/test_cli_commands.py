@@ -1230,14 +1230,13 @@ def test_models_table(fake_client, capsys) -> None:
     assert "thinking=" not in out
 
 
-def test_gpus_tip_explains_automatic_default_and_type_pin(fake_client, capsys) -> None:
+def test_gpus_tip_explains_automatic_allocation(fake_client, capsys) -> None:
     assert _run(["gpus"]) == 0
     out = capsys.readouterr().out
-    assert "GPU allocation is automatic by default" in out
+    assert "GPU allocation is automatic" in out
     assert "cheapest validated class" in out
-    assert 'type = "<CLASS>"' in out
-    assert "don't pin" not in out
-    assert "cannot pin" not in out
+    assert "not user-selectable" in out
+    assert 'type = "<CLASS>"' not in out
     assert "runpod" not in out.lower()
 
 

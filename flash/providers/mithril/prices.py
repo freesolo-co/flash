@@ -6,7 +6,11 @@ from decimal import Decimal
 from flash.providers.core.base import GPU_INFO, CapacityLookupError
 from flash.providers.mithril.client import MithrilApiError, call
 from flash.providers.mithril.pricing import SPOT_GPUS, accepts_price
-from flash.providers.mithril.region_health import cooling_down
+from flash.providers.mithril.region_health import cooling_down, refused
+
+# Regions never bid in. af-south1-a lists capacity and accepts bids, but none of 112 Flash VMs
+# allocated there booted (93 boot timeouts) while us-central2-a booted 35 of 39 (2026-11-11..13).
+EXCLUDED_REGIONS = frozenset({"af-south1-a"})
 
 
 @dataclass(frozen=True)
@@ -40,8 +44,12 @@ def affordable_offers(*, deadline_at=None) -> list[Offer]:
         for auction in auctions:
             if not isinstance(auction.get("region"), str) or not auction["region"]:
                 continue
+            if auction["region"] in EXCLUDED_REGIONS:
+                continue
             if cooling_down(auction["region"]):
                 continue  # its last filled bid never booted
+            if refused(auction["region"], auction["instance_type"]):
+                continue  # Mithril refused our last bid on this shape here
             shape = catalog[auction["instance_type"]]
             gpu = shape["gpu_type"]
             count = shape["num_gpus"]

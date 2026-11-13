@@ -45,7 +45,7 @@ def test_custom_allocation_uses_shared_capacity_lookup_and_memory_fit(monkeypatc
     result = allocator.allocate(spec.model, spec.algorithm, train=spec.train)
     assert result.gpu == "A100 SXM"
     assert result.hourly_usd == 1.0
-    assert seen[0][1].max_gpu_count == 1
+    assert seen[0][1].max_gpu_count == 2  # custom auto-sizes across one or two Modal cards
     assert seen[0][1].gpu_type == ""  # no synthetic pin from a per-model GPU list
     assert estimate_for_spec(spec, allocation=result).total_usd == 1.0
     provider.live_candidates = lambda *a: []
@@ -55,10 +55,13 @@ def test_custom_allocation_uses_shared_capacity_lookup_and_memory_fit(monkeypatc
 
 def test_custom_config_uses_common_gpu_syntax_and_lora_validation():
     raw = custom_raw()
-    raw["gpu"] = {"type": ["H100"], "provider": " MODAL "}
     spec = spec_from_dict(raw)
-    assert spec.gpu.type == "H100"
-    assert spec.gpu.provider == "modal"
+    assert spec.gpu.type == ""
+    assert spec.gpu.provider == ""
+    raw["gpu"] = {"provider": "modal"}
+    with pytest.raises(ConfigError, match="provider is no longer supported"):
+        spec_from_dict(raw)
+    raw["gpu"] = {}
     raw["train"]["lora_rank"] = 0
     with pytest.raises(ConfigError, match="lora_rank"):
         spec_from_dict(raw)

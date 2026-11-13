@@ -194,7 +194,7 @@ def test_parse_and_allocator_agree_on_batch_bound_sft(sequence, accepted):
             assert "batch and retained rows bound the rank count" in str(error)
 
 
-def test_config_gpu_type_is_empty_for_auto_and_preserves_pins():
+def test_config_gpu_type_is_empty_for_auto_and_rejects_pins():
     from flash.schema import ConfigError, spec_from_dict
 
     raw = {
@@ -206,13 +206,10 @@ def test_config_gpu_type_is_empty_for_auto_and_preserves_pins():
     }
     assert spec_from_dict(raw, run_id="x").gpu.type == ""
 
-    for klass in ("A100 SXM", "A100 SXM", "H100"):
+    for klass in ("A100 SXM", "H100", "cheapest", ["H100"]):
         raw["gpu"] = {"type": klass}
-        assert spec_from_dict(raw, run_id="x").gpu.type == klass
-
-    raw["gpu"] = {"type": "cheapest"}
-    with pytest.raises(ConfigError, match="unsupported gpu"):
-        spec_from_dict(raw, run_id="x")
+        with pytest.raises(ConfigError, match="type is no longer supported"):
+            spec_from_dict(raw, run_id="x")
 
 
 def test_gpu_short():

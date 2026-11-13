@@ -27,6 +27,7 @@ def mithril_env(monkeypatch):
     monkeypatch.delenv("FLASH_MITHRIL_REGION", raising=False)
     monkeypatch.delenv("FLASH_MITHRIL_IMAGE_VERSION", raising=False)
     monkeypatch.delenv("FLASH_MITHRIL_SSH_KEY_IDS", raising=False)
+    monkeypatch.setattr(api, "CREATE_RECHECK_SECONDS", 0)
 
 
 def payload():
@@ -277,7 +278,7 @@ def test_create_bids_for_one_instance_at_per_instance_hold_cap(monkeypatch, coun
 
 @pytest.mark.parametrize("reconcile", [True, False])
 def test_ambiguous_create_is_reconciled_without_a_second_post(monkeypatch, reconcile):
-    listings = iter([[], [owned_bid()] if reconcile else []])
+    listings = iter([[], [owned_bid()] if reconcile else [], []])
     monkeypatch.setattr(api, "pages", lambda *a, **kw: next(listings))
     posted = []
 
@@ -622,21 +623,95 @@ def test_orphan_sweep_reaps_terminated_bid_with_stopping_instance(monkeypatch):
     assert terminated == ["bid_test"]
 
 
-@pytest.mark.parametrize("status", [400, 403, 409, 422, 429, 0, 500])
-def test_capacity_refusal_requeues_but_unknown_create_outcomes_do_not(monkeypatch, status):
+@pytest.mark.parametrize("status", [400, 403, 404, 409, 422, 429])
+@pytest.mark.parametrize("quota", [True, False])
+def test_reconciled_4xx_refusal_requeues_with_its_status(monkeypatch, status, quota):
+    # A 4xx is a definitive refusal. Once reconciliation confirms no bid exists under this
+    # attempt's name, nothing was created, so requeue whether or not quota looks exhausted (the
+    # refusal can be a capacity, validation or conflict response the quota listing does not see).
     from flash.providers.core.base import CapacityUnavailableError
     from flash.providers.mithril import capacity
 
-    monkeypatch.setattr(api, "pages", lambda *a, **kw: [])
-    monkeypatch.setattr(capacity, "quota_available", lambda *a, **kw: False)
+    listed = []
+    monkeypatch.setattr(api, "pages", lambda *a, **kw: listed.append(1) or [])
+    monkeypatch.setattr(capacity, "quota_available", lambda *a, **kw: quota)
+    monkeypatch.setattr(api.time, "sleep", lambda s: pytest.fail("a 4xx needs no recheck"))
 
     def refuse(*args, **kwargs):
         raise client.MithrilApiError(status=status)
 
     monkeypatch.setattr(api, "call", refuse)
-    error = UnreconciledCreateError if status in {0, 500} else CapacityUnavailableError
-    with pytest.raises(error):
+    with pytest.raises(CapacityUnavailableError, match=f"http {status}") as error:
         launch(monkeypatch)
+    assert error.value.cause == f"http {status}"
+    assert listed == [1, 1]
+
+
+@pytest.mark.parametrize(
+    ("error", "cause"),
+    [
+        (client.MithrilApiError(status=500), "http 500"),
+        (client.MithrilApiError(status=503), "http 503"),
+        (
+            client.MithrilApiError("Mithril operation failed or timed out"),
+            "transport error or timeout",
+        ),
+        (KeyError("fid"), "invalid create response"),
+    ],
+)
+def test_ambiguous_create_rechecks_once_then_fails_with_its_cause(monkeypatch, error, cause):
+    # A 5xx, transport failure or unreadable response may have created the bid after the first
+    # listing. Recheck once after a bounded pause; never requeue, since the next attempt's new name
+    # would leave a late bid from this attempt running beside it until the run ends.
+    monkeypatch.setattr(api, "CREATE_RECHECK_SECONDS", 7)
+    listed, slept = [], []
+    monkeypatch.setattr(api, "pages", lambda *a, **kw: listed.append(1) or [])
+    monkeypatch.setattr(api.time, "sleep", slept.append)
+
+    def fail(*args, **kwargs):
+        raise error
+
+    monkeypatch.setattr(api, "call", fail)
+    with pytest.raises(UnreconciledCreateError) as raised:
+        launch(monkeypatch)
+    assert raised.value.cause == cause
+    assert listed == [1, 1, 1]
+    assert len(slept) == 1
+    assert 0 < slept[0] <= 7
+
+
+def test_ambiguous_create_adopts_a_bid_that_appears_on_recheck(monkeypatch):
+    listings = iter([[], [], [owned_bid()]])
+    monkeypatch.setattr(api, "pages", lambda *a, **kw: next(listings))
+    posted = []
+
+    def fail(*args, **kwargs):
+        posted.append(1)
+        raise client.MithrilApiError(status=502)
+
+    monkeypatch.setattr(api, "call", fail)
+    assert launch(monkeypatch) == "bid_test"
+    assert posted == [1]
+
+
+@pytest.mark.parametrize("status", [422, 503, 0])
+def test_refused_create_without_reconciliation_never_requeues(monkeypatch, status):
+    listings = iter([[]])
+
+    def pages(*args, **kwargs):
+        for page in listings:
+            return page
+        raise client.MithrilApiError(status=503)
+
+    monkeypatch.setattr(api, "pages", pages)
+
+    def refuse(*args, **kwargs):
+        raise client.MithrilApiError(status=status)
+
+    monkeypatch.setattr(api, "call", refuse)
+    with pytest.raises(UnreconciledCreateError, match="reconciliation unavailable") as error:
+        launch(monkeypatch)
+    assert error.value.cause == (f"http {status}" if status else "transport error or timeout")
 
 
 def test_refused_create_reconciles_existing_bid_before_capacity_retry(monkeypatch):
@@ -669,12 +744,22 @@ def test_offers_cover_every_region_and_keep_each_region(monkeypatch):
     ]
     auctions = [
         {"instance_type": "it_test", "region": r, "capacity": 3, "last_instance_price": p}
-        for r, p in (("us-central2-b", "$3.50"), ("af-south1-a", "$0.90"), ("eu-x", "$1.00"))
+        for r, p in (("us-central2-b", "$3.50"), ("ap-x", "$0.90"), ("eu-x", "$1.00"))
     ]
     monkeypatch.setattr(
         prices, "call", lambda method, path, **kw: shapes if path == "/instance-types" else auctions
     )
-    assert {o.region for o in prices.affordable_offers()} == {"af-south1-a", "eu-x"}
+    assert {o.region for o in prices.affordable_offers()} == {"ap-x", "eu-x"}
+    # An excluded region is never offered, however cheap.
+    auctions.append(
+        {
+            "instance_type": "it_test",
+            "region": "af-south1-a",
+            "capacity": 3,
+            "last_instance_price": "$0.50",
+        }
+    )
+    assert {o.region for o in prices.affordable_offers()} == {"ap-x", "eu-x"}
 
 
 def test_queue_picks_the_cheapest_region(monkeypatch):
@@ -790,3 +875,79 @@ def test_offers_skip_a_region_cooling_down_after_a_boot_timeout(monkeypatch):
     )
     region_health.mark_unbootable("af-south1-a")
     assert {o.region for o in prices.affordable_offers()} == {"us-central2-b"}
+
+
+@pytest.mark.parametrize("status", [400, 403, 409, 422])
+def test_a_definitive_refusal_with_quota_left_requeues_and_cools_that_shape(
+    monkeypatch, status, tmp_path
+):
+    """A refused bid that reconciliation proved was never created must not fail the run.
+
+    Seen 2026-11-13: when an interchangeable H200 came up first for an H100 allocation, Mithril
+    refused every H200 bid (no bid existed afterwards) while quota remained, and each run failed
+    with UnreconciledCreateError instead of waiting for an offer it could take.
+    """
+    from flash.providers.core.base import CapacityUnavailableError
+    from flash.providers.mithril import capacity, region_health
+    from flash.runner.lifecycle import state
+
+    monkeypatch.setattr(state, "RUNS_DIR", str(tmp_path))
+    monkeypatch.setattr(api, "pages", lambda *a, **kw: [])
+    monkeypatch.setattr(capacity, "quota_available", lambda *a, **kw: True)
+
+    def refuse(*args, **kwargs):
+        raise client.MithrilApiError(status=status)
+
+    monkeypatch.setattr(api, "call", refuse)
+    with pytest.raises(CapacityUnavailableError) as error:
+        launch(monkeypatch)
+    assert "requeuing" in str(error.value)
+    assert region_health.refused("us-central2-b", "it_test")
+    # the refusal cools only that shape, never the whole region.
+    assert not region_health.cooling_down("us-central2-b")
+
+
+@pytest.mark.parametrize("status", [0, 500])
+def test_unknown_create_outcomes_still_fail_closed_with_quota_left(monkeypatch, status, tmp_path):
+    from flash.providers.mithril import capacity, region_health
+    from flash.runner.lifecycle import state
+
+    monkeypatch.setattr(state, "RUNS_DIR", str(tmp_path))
+    monkeypatch.setattr(api, "pages", lambda *a, **kw: [])
+    monkeypatch.setattr(capacity, "quota_available", lambda *a, **kw: True)
+
+    def refuse(*args, **kwargs):
+        raise client.MithrilApiError(status=status)
+
+    monkeypatch.setattr(api, "call", refuse)
+    with pytest.raises(UnreconciledCreateError):
+        launch(monkeypatch)
+    assert not region_health.refused("us-central2-b", "it_test")
+
+
+def test_offers_skip_a_refused_shape_but_keep_the_region(monkeypatch, tmp_path):
+    from flash.providers.mithril import region_health
+    from flash.runner.lifecycle import state
+
+    monkeypatch.setattr(state, "RUNS_DIR", str(tmp_path))
+    shapes = [
+        {
+            "fid": fid,
+            "gpu_type": gpu,
+            "num_gpus": 1,
+            "gpu_memory_gb": memory,
+            "gpu_socket": "SXM5",
+            "local_storage_gb": 1500,
+        }
+        for fid, gpu, memory in (("it_h200", "H200", 141), ("it_h100", "H100", 80))
+    ]
+    auctions = [
+        {"instance_type": fid, "region": "us-central2-b", "capacity": 3, "last_instance_price": p}
+        for fid, p in (("it_h200", "$2.20"), ("it_h100", "$1.90"))
+    ]
+    monkeypatch.setattr(
+        prices, "call", lambda method, path, **kw: shapes if path == "/instance-types" else auctions
+    )
+    assert {o.gpu for o in prices.affordable_offers()} == {"H100", "H200"}
+    region_health.mark_refused("us-central2-b", "it_h200")
+    assert {o.gpu for o in prices.affordable_offers()} == {"H100"}
