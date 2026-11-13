@@ -177,7 +177,16 @@ def _compare_and_complete_remote(
         if not expected_still_owned:
             return False
         measured = float(status.cost_usd or 0.0) + recovered_cost
-        charge_usd = costs._status_estimated_charge(status, spec, fallback=measured)
+        # the frozen meter in these metrics belongs to the attempt that produced them, which the
+        # last persisted heartbeat (a best-effort read) may not be.
+        charge_usd = costs._status_estimated_charge(
+            status,
+            spec,
+            fallback=measured,
+            completed_attempt=verified_attempt
+            if verified_attempt is not None
+            else expected_attempt,
+        )
         status.state = "done"
         status.cost_usd = charge_usd
         status.artifacts_dir = state.artifacts_dir(spec)

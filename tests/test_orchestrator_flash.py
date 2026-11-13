@@ -86,8 +86,10 @@ def test_run_job_persists_flash_metrics(monkeypatch):
         assert status.state == "done", status.error
         from flash.providers.modal.pricing import hourly_rate
 
-        # the full run charges the persisted accepted quote; measured cost lands in metrics.json.
-        assert status.cost_usd == status.estimated_cost_usd, status.cost_usd
+        # this fake worker reports no training meter, so the run is charged its measured wall cost
+        # (1 h on the L4, also in metrics.json), never the submit quote.
+        assert status.cost_usd == pytest.approx(hourly_rate("L4")), status.cost_usd
+        assert status.cost_usd != status.estimated_cost_usd
         assert publication_events == ["published"]
         assert captured["gpu"] == ""
         assert captured["seed"] == 123

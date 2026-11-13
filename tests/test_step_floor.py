@@ -155,7 +155,11 @@ def test_the_floor_has_both_a_fixed_and_a_per_completion_part():
     assert STEP_FLOOR_BASE_SECONDS > 1.0
     grew = step_floor_seconds("L40S", 100) - step_floor_seconds("L40S", 0)
     assert grew == pytest.approx(100 * STEP_FLOOR_SECONDS_PER_COMPLETION)
-    assert grew == pytest.approx(80.5, rel=0.15)
+    # re-measured against metered production training time (docs/billing-calibration.md): the
+    # per-completion floor is ~0.47 s (wide 256-completion arms on 0.8B and 9B). it must stay
+    # strictly positive so wide-rollout steps still grow with their completion count.
+    assert grew == pytest.approx(46.6, rel=0.25)
+    assert STEP_FLOOR_SECONDS_PER_COMPLETION > 0
 
 
 @pytest.mark.parametrize("gpu", [*CARDS, "L40S"])

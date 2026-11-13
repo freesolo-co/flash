@@ -26,12 +26,38 @@ SFT_FLOPS_PER_TOKEN_PER_PARAM = 6.0  # forward (2) + backward (4)
 GRPO_GEN_FLOPS_PER_TOKEN_PER_PARAM = 2.0  # autoregressive rollout forward
 GRPO_UPDATE_FLOPS_PER_TOKEN_PER_PARAM = 8.0  # policy fwd+bwd (6) + frozen-ref fwd (2)
 
-MFU_TRAIN = 0.35  # GRPO policy/reference update
-MFU_SFT_TRAIN = 0.25  # SFT fwd/bwd (smaller effective batch, long sequences)
-MFU_DECODE = 0.12  # batched vLLM rollout (decode is memory-bandwidth-bound)
+# --- calibration ---------------------------------------------------------------------------------
+# Fitted to MEASURED billable training time (first optimizer update -> training-loop exit, the
+# window the worker meter bills) across completed production runs, by relative least squares with
+# a 20% holdout. See docs/billing-calibration.md for the data, the fit and the per-model error.
+# The previous constants were fitted to elapsed wall including in-train initialization and
+# over-predicted billed training time ~2.3x for SFT and ~3.8x for GRPO.
+MFU_TRAIN = 0.72  # GRPO policy/reference update
+MFU_SFT_TRAIN = 0.85  # SFT fwd/bwd, realized against effective_train_tflops
+MFU_DECODE = 0.25  # batched vLLM rollout (decode is memory-bandwidth-bound)
+# sft attention: seconds per (6*P*tokens/peak) scaled by mean example length / 32768. long
+# examples cost super-linearly; without it long-context runs under-quote and short ones over-quote.
+SFT_ATTENTION_COEF = 2.0
+# image sft (exact-unpacked rows): vision encoding per example, fitted on 46 multimodal runs.
+SFT_IMAGE_S_PER_EXAMPLE = 0.41
+# one-time work inside the billed window: the first optimizer update (graph capture, allocator
+# warm-up, first rollout for grpo). measured, not modeled.
+# grows with model size (graph capture, allocator warm-up, first rollout): base + per-B active params.
+SFT_FIRST_UPDATE_S = 250.0
+SFT_FIRST_UPDATE_S_PER_B = 5.0
+GRPO_FIRST_UPDATE_S = 60.0
+GRPO_FIRST_UPDATE_S_PER_B = 6.0
 
-STEP_FLOOR_BASE_SECONDS = 62.7
-STEP_FLOOR_SECONDS_PER_COMPLETION = 0.805
+# measured whole-step grpo slowdown per card, for cards whose rollout runs uniformly slower than
+# their throughput predicts across completion counts. A100 SXM: three live 9B arms at 16/64/128
+# completions ran 0.76/0.75/0.83 of estimate (an additive offset cannot fit that).
+GRPO_CARD_STEP_SCALE = {"A100 SXM": 1.28, "A100 SXM 40GB": 1.28}
+
+STEP_FLOOR_BASE_SECONDS = 3.5
+STEP_FLOOR_SECONDS_PER_COMPLETION = 0.466
+# the per-card offsets below were fitted against the previous 62.7 s floor; they are rescaled by
+# the same factor as the floor so each card keeps its measured relative speed.
+_STEP_FLOOR_RESCALE = 3.5 / 62.7
 
 # --- per-card offset ---------------------------------------------------------------------------
 # empirically fitted intercept offsets capture measured card-level variance; the slope stays shared.
@@ -39,14 +65,16 @@ STEP_FLOOR_SECONDS_PER_COMPLETION = 0.805
 # unmeasured cards use the pooled floor rather than a hardware guess.
 STEP_FLOOR_MIN_ARMS_FOR_OFFSET = 3
 STEP_FLOOR_CARD_OFFSET_SECONDS = {
-    "A100 PCIe": -12.6,  # n=6, completion counts 32/256
-    "B200": 42.5,  # n=4, 32/256 -- tied to H200, see below
-    "H100": -10.4,  # n=24, 16/32/256
-    "H200": 42.5,  # n=4, 32/256
-    "RTX 4090": 14.8,  # n=10, 16/32/64/96
-    "RTX 5090": -30.0,  # n=4, 32/96
-}
-# B200 and H200 share the slower offset as a conservative never-cheaper policy, despite matched A/B
+    card: round(offset * _STEP_FLOOR_RESCALE, 2)
+    for card, offset in {
+        "A100 PCIe": -12.6,  # n=6, completion counts 32/256
+        "B200": 42.5,  # n=4, 32/256 -- tied to H200, see below
+        "H100": -10.4,  # n=24, 16/32/256
+        "H200": 42.5,  # n=4, 32/256
+        "RTX 4090": 14.8,  # n=10, 16/32/64/96
+        "RTX 5090": -30.0,  # n=4, 32/96
+    }.items()
+}  # B200 and H200 share the slower offset as a conservative never-cheaper policy, despite matched A/B
 # evidence that B200 is faster. untying changes the contract asserted by
 # test_b200_not_cheaper_or_faster_than_h200_for_grpo, not just this fit. evidence:
 # /home/azureuser/benchmark/b200-vs-h200-20260806/.
@@ -75,7 +103,30 @@ STEP_FLOOR_SHARDED_FRACTION = 0.799
 # per-step publish/sync work. customer policy excludes the one-time framework setup from the quote,
 # while the recurring per-step work remains billable training. setup_seconds reports cold start and
 # model initialization separately for observability and never contributes to total_usd.
-SFT_STEP_FLOOR_SECONDS = 0.8
+SFT_STEP_FLOOR_SECONDS = 0.10
+
+
+def first_update_seconds(config: RunConfig) -> float:
+    """Measured one-time seconds of the first optimizer update, which the meter bills."""
+    size_b = active_params_b(config.model_id, config.model_revision)
+    if config.method == "sft":
+        return SFT_FIRST_UPDATE_S + SFT_FIRST_UPDATE_S_PER_B * size_b
+    if config.has_rollout:
+        return GRPO_FIRST_UPDATE_S + GRPO_FIRST_UPDATE_S_PER_B * size_b
+    return 0.0
+
+
+def sft_image_seconds(config: RunConfig) -> float:
+    """Vision-encoder seconds for image SFT rows, which the text-token flops term does not see.
+
+    Gated on the profile's explicit multimodal architecture, not on exact-unpacked packing: text-only
+    models that cannot pack are unpacked too and encode no images. Fitted per example on 46
+    completed multimodal production runs (median 1.00).
+    """
+    if not config.sft_multimodal:
+        return 0.0
+    examples = max(1, int(config.steps)) * max(1, int(config.batch_size or 1))
+    return SFT_IMAGE_S_PER_EXAMPLE * examples
 
 
 def sft_step_floor_seconds(steps: int) -> float:
@@ -97,7 +148,7 @@ def _step_floor_seconds_for(config: RunConfig, gpu: str) -> float:
 # measured MoE wall time scales with total params because routing and grouped GEMMs dominate at
 # small batch. price MoE on total params with reduced MFU, per-step overhead, and one-time compile;
 # dense models retain the active-param path.
-MFU_SFT_TRAIN_MOE = 0.10  # MoE SFT fwd/bwd priced on total params
+MFU_SFT_TRAIN_MOE = 0.45  # MoE SFT fwd/bwd priced on total params (live 35B-A3B H200 run)
 MFU_TRAIN_MOE = 0.09  # MoE GRPO policy update priced on total params
 MOE_STEP_OVERHEAD_S = 2.0  # routing/dispatch/kernel-launch overhead an MoE pays every step
 # One-time kernel/graph compile amortized into the first training step (fused Triton kernels;
@@ -305,7 +356,8 @@ def step_seconds_split(config: RunConfig, gpu: str) -> tuple[float, float]:
     # fitted floor. reward latency is not. only STEP_FLOOR_SHARDED_FRACTION shards; callers must
     # use sharded_step_seconds().
     floor_s = step_floor_seconds(gpu, completions)
-    return gen_s + update_s + floor_s, overhead
+    scale = GRPO_CARD_STEP_SCALE.get(gpu, 1.0)
+    return (gen_s + update_s + floor_s) * scale, overhead
 
 
 def seconds_per_step(config: RunConfig, gpu: str) -> float:
@@ -353,7 +405,10 @@ def sft_seconds_for_tokens(config: RunConfig, gpu: str, train_tokens: float) -> 
     mfu = MFU_SFT_TRAIN_MOE if moe else MFU_SFT_TRAIN
     peak = effective_train_tflops(gpu) * 1e12
     flops = SFT_FLOPS_PER_TOKEN_PER_PARAM * params * train_tokens
-    return flops / (peak * mfu)
+    examples = max(1, int(n.steps)) * max(1, int(n.batch_size or 1))
+    mean_example_tokens = float(train_tokens) / examples
+    attention = SFT_ATTENTION_COEF * (flops / peak) * (mean_example_tokens / 32768.0)
+    return flops / (peak * mfu) + attention
 
 
 def _wider_shape_remedy(config: RunConfig, need: float, names: tuple[str, ...]) -> str:
@@ -796,11 +851,13 @@ def estimate_cost(
     # block is excluded here too; grpo retains its aggregate recurring-work floor because its
     # calibration cannot safely split synchronization, checkpointing, and any in-train init.
     sft_floor_s = sft_step_floor_seconds(config.steps) if config.method == "sft" else 0.0
+    compile_s += first_update_seconds(config)
     raw_train = compile_s + config.steps * sps + required_save_s + sft_floor_s
     if not config.is_grpo and config.train_tokens is not None:
         raw_train = (
             compile_s
             + sft_seconds_for_tokens(config, gpu, config.train_tokens) / speedup
+            + sft_image_seconds(config) / speedup
             + required_save_s
             + sft_floor_s
         )

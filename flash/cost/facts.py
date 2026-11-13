@@ -56,6 +56,12 @@ _TRAIN_TFLOPS_CAP: dict[str, float] = {
     # h200-class realized training throughput, not the 2250 dense-bf16 peak. tracks the H200 entry,
     # which is itself now anchored to a measured H100 PCIe rate rather than a vendor spec.
     "B200": 550.0,
+    # measured realized training throughput from live metered calibration runs: A100 SXM ran
+    # ~0.68x its spec-peak estimate for BOTH sft (0.69) and grpo (0.67) on the same workloads
+    # (docs/billing-calibration.md). L40S is deliberately not capped: it measured slow for sft but
+    # fast for grpo, which one throughput number cannot represent.
+    "A100 SXM": 162.0,
+    "A100 SXM 40GB": 162.0,
 }
 
 

@@ -77,7 +77,7 @@ def session_charge(status, spec):
         or quote < 0
     ):
         raise ValueError("custom run has no valid accepted session cap")
-    from flash.runner.accounting.costs import _billed_rate_factor
+    from flash.runner.accounting.spot_usage import rate_factor
 
     share = min(1.0, max(0.0, seconds) / spec.custom["max_wall_seconds"])
-    return quote * share * _billed_rate_factor(None, status)
+    return quote * share * rate_factor(status)

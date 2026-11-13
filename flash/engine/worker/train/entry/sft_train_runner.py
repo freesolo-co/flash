@@ -877,12 +877,20 @@ def _run_sft_child(
                     progress_step=True,
                     context=context,
                 ):
-                    return_code = _invoke_sft_child(child, callbacks, on_line, context=context)
+                    try:
+                        return_code = _invoke_sft_child(child, callbacks, on_line, context=context)
+                    finally:
+                        # freeze the meter the moment the child exits: inside the liveness context,
+                        # whose exit can wait on an in-flight heartbeat upload, and before the
+                        # watcher drains pending adapter publication. neither is training time.
+                        context.phase_timings.stop_billing()
                     training_completed = return_code == 0
             finally:
                 # A failed child cannot prove save completeness; preserve its failure.
                 child.watcher.stop(require_complete=training_completed)
     finally:
+        # also covers the resume-at-horizon path, which launches no child (idempotent).
+        context.phase_timings.stop_billing()
         device_peak_gpu_gb = gpu_sampler.stop_gb()
     train_wall = time.time() - train_started_at
     if return_code != 0:

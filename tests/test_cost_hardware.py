@@ -49,10 +49,12 @@ def test_effective_train_tflops_caps_b200_at_h200_class():
 def test_effective_train_tflops_is_peak_for_uncapped_classes():
     from flash.cost.facts import effective_train_tflops
 
-    for name in ("H100", "H200", "A100 SXM", "L4", "B200"):
-        # only b200 is capped; every other class keeps its peak.
+    for name in ("H100", "H200", "L4", "B200"):
+        # b200 is capped at h200 class; every other uncapped class keeps its peak.
         expected = effective_train_tflops("H200") if name == "B200" else gpu_tflops(name)
         assert effective_train_tflops(name) == expected
+    # a100 is capped at its MEASURED training throughput (live sft and grpo both ran ~0.68x peak).
+    assert effective_train_tflops("A100 SXM") == 162.0 < gpu_tflops("A100 SXM")
 
 
 def test_nvlink_classification_is_by_form_factor():

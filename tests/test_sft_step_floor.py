@@ -8,6 +8,7 @@ from flash.cost.analytical import (
     SFT_STEP_FLOOR_SECONDS,
     compile_seconds,
     estimate_cost,
+    first_update_seconds,
     required_save_overhead_seconds,
     sft_step_floor_seconds,
     sharded_step_seconds,
@@ -46,6 +47,7 @@ def test_sft_quote_is_exactly_training_work_without_framework_setup():
     quote = estimate_cost(config)
     expected = (
         compile_seconds(config, quote.gpu)
+        + first_update_seconds(config)
         + config.steps * sharded_step_seconds(config, quote.gpu, quote.gpu_count, quote.provider)
         + required_save_overhead_seconds(config)
         + sft_step_floor_seconds(config.steps)
