@@ -669,12 +669,22 @@ def test_offers_cover_every_region_and_keep_each_region(monkeypatch):
     ]
     auctions = [
         {"instance_type": "it_test", "region": r, "capacity": 3, "last_instance_price": p}
-        for r, p in (("us-central2-b", "$3.50"), ("af-south1-a", "$0.90"), ("eu-x", "$1.00"))
+        for r, p in (("us-central2-b", "$3.50"), ("ap-x", "$0.90"), ("eu-x", "$1.00"))
     ]
     monkeypatch.setattr(
         prices, "call", lambda method, path, **kw: shapes if path == "/instance-types" else auctions
     )
-    assert {o.region for o in prices.affordable_offers()} == {"af-south1-a", "eu-x"}
+    assert {o.region for o in prices.affordable_offers()} == {"ap-x", "eu-x"}
+    # An excluded region is never offered, however cheap.
+    auctions.append(
+        {
+            "instance_type": "it_test",
+            "region": "af-south1-a",
+            "capacity": 3,
+            "last_instance_price": "$0.50",
+        }
+    )
+    assert {o.region for o in prices.affordable_offers()} == {"ap-x", "eu-x"}
 
 
 def test_queue_picks_the_cheapest_region(monkeypatch):
