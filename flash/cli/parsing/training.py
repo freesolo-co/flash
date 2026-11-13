@@ -8,14 +8,6 @@ from flash.cli.commands.ops.runs import cmd_cancel, cmd_checkpoints, cmd_log, cm
 from flash.cli.commands.ops.train import cmd_train
 
 
-def _gpu_count_override(value: str) -> str:
-    """Convert a GPU count to the canonical config override."""
-    try:
-        return f"gpu.count={int(value)}"
-    except ValueError:
-        raise argparse.ArgumentTypeError(f"expected a number of gpus, got {value!r}") from None
-
-
 def _add_train_commands(sub: argparse._SubParsersAction) -> None:
     """`train`: config composition, overrides, cost preflight."""
     train = sub.add_parser("train", help="submit a managed training run from a TOML config")
@@ -34,18 +26,6 @@ def _add_train_commands(sub: argparse._SubParsersAction) -> None:
         default=[],
         metavar="key=value",
         help="override a config value; repeatable",
-    )
-    train.add_argument(
-        "--gpus",
-        dest="overrides",
-        action="append",
-        type=_gpu_count_override,
-        metavar="N",
-        help=(
-            "optional card ceiling; sets [gpu] count (1-8). omit it with an unpinned gpu type to "
-            "auto-size the smallest fitting geometry; an authored value pins the ceiling, and only "
-            "(1, 2, 4, 8) are ever provisioned"
-        ),
     )
     train.add_argument("--dry-run", action="store_true")
     train.add_argument(
