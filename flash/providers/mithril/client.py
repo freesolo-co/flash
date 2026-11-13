@@ -57,7 +57,7 @@ def _safe_reason(response, *, body=None, params=None) -> str:
                 if isinstance(item, dict) and isinstance(item.get("msg"), str)
             )
             break
-    reason = " ".join(reason.split())[:_REASON_LIMIT]
+    reason = " ".join(reason.split())
     if not reason:
         return ""
     # Secrets ride in long request strings (startup scripts) and the API key. Compare them after
@@ -68,9 +68,11 @@ def _safe_reason(response, *, body=None, params=None) -> str:
         if len(value) >= _LONG_REQUEST_STRING:
             sensitive.add(" ".join(value.split()))
             sensitive.update(word for word in value.split() if len(word) >= 8)
+    # Check the whole message before bounding it: truncation could cut a secret that crosses the
+    # limit, leaving a prefix the substring checks no longer match.
     if any(value and value in reason for value in sensitive):
         return ""
-    return reason
+    return reason[:_REASON_LIMIT]
 
 
 def call(method, path, *, body=None, params=None, deadline_at=None):

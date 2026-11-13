@@ -984,6 +984,9 @@ def test_error_reasons_are_short_and_never_echo_the_request():
     assert reason(_Response(ValueError("not json"))) == ""
     assert reason(_Response(["unexpected"])) == ""
     assert len(reason(_Response({"detail": "x" * 1000}))) == 200
+    # a secret crossing the length limit is caught on the whole message, not a truncated prefix
+    assert reason(_Response({"detail": "x" * 190 + "test-secret"})) == ""
+    assert reason(_Response({"detail": "x" * 190 + " TOKEN=hunter2-secret"}), body=body) == ""
 
 
 @pytest.mark.parametrize("status", [400, 403, 409, 422])
