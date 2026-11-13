@@ -544,3 +544,61 @@ def test_region_cooldown_is_not_a_run_record_and_keeps_every_mark(monkeypatch, t
     assert region_health.cooling_down("af-south1-a")
     assert region_health.cooling_down("eu-x")
     assert not list(tmp_path.glob("*.json"))  # run scanners read top-level *.json as run records
+
+
+def _launch_with_poll(monkeypatch, poll, on_handle):
+    """Launch one bid offline whose supervision raises; return what it raised and terminated."""
+    import flash.runtime_capsule
+    from flash.core.spec import GpuSpec, JobSpec
+    from flash.providers.mithril import jobs
+    from flash.providers.mithril import queue as spot_queue
+
+    spec = JobSpec(
+        run_id="r", model="Qwen/Qwen3.5-9B-Base", gpu=GpuSpec(type="H100", provider="spot")
+    )
+    offer = prices.Offer("H100", 1, "it_h100", 1.5, 1500, "r")
+    monkeypatch.setattr(jobs, "scope_fingerprint", lambda: "scope")
+    monkeypatch.setattr(spot_queue, "wait_for_price", lambda *a, **k: offer)
+    monkeypatch.setattr(jobs, "build_payload", lambda *a, **k: {"env": {}})
+    monkeypatch.setattr(flash.runtime_capsule, "build_capsule", lambda *a: ("capsule", None))
+    monkeypatch.setattr(jobs, "worker_image_for_gpu", lambda gpu: "image")
+    monkeypatch.setattr(api, "create", lambda **kw: "bid_live")
+    terminated = []
+    monkeypatch.setattr(api, "terminate", terminated.append)
+    monkeypatch.setattr(jobs, "poll", poll)
+    try:
+        jobs.submit_attempt(
+            spec, on_handle=on_handle, deadline_at=time.time() + 600, log=io.StringIO()
+        )
+    except BaseException as exc:  # TaskStopped is a BaseException
+        return type(exc), terminated
+    raise AssertionError("supervision was expected to raise")
+
+
+@pytest.mark.parametrize("persistence", ["recorded", "missing", "interrupted"])
+def test_shutdown_keeps_only_a_durably_recorded_bid(monkeypatch, persistence):
+    """A redeploy stops supervision; the next plane re-attaches to the recorded live bid."""
+    from flash._internal.background import TaskStopped
+
+    def stop(*args, **kwargs):
+        raise TaskStopped
+
+    persisted = []
+    callback = {"recorded": persisted.append, "missing": None, "interrupted": stop}[persistence]
+    raised, terminated = _launch_with_poll(monkeypatch, stop, callback)
+    assert raised is TaskStopped
+    if persistence == "recorded":
+        assert len(persisted) == 1
+        assert terminated == []
+    else:
+        assert terminated == ["bid_live"]
+
+
+def test_failed_supervision_still_terminates_the_bid(monkeypatch):
+    def fail(*args, **kwargs):
+        raise RuntimeError("poll failed")
+
+    assert _launch_with_poll(monkeypatch, fail, lambda handle: None) == (
+        RuntimeError,
+        ["bid_live"],
+    )

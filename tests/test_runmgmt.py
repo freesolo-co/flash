@@ -934,7 +934,9 @@ def test_spot_capacity_refusal_requeues_until_capacity_frees(monkeypatch, tmp_pa
         def submit_attempt(self, _spec, *, on_handle, attempt, **_kwargs):
             self.attempts.append(attempt)
             if attempt < 2:
-                raise CapacityUnavailableError("Mithril Spot H100 capacity unavailable")
+                raise CapacityUnavailableError(
+                    "Mithril Spot H100 capacity unavailable", cause="http 422"
+                )
             from flash.providers.core.base import JobHandle
             from flash.providers.mithril.handles import SpotJobHandle
 
@@ -962,12 +964,13 @@ def test_spot_capacity_refusal_requeues_until_capacity_frees(monkeypatch, tmp_pa
     provider = SpotProvider()
     monkeypatch.setattr(providers, "get_provider", lambda _name: provider)
 
-    metrics = lifecycle._run_attempts_supervised(
-        spec, io.StringIO(), source_snapshot=_SOURCE_SNAPSHOT
-    )
+    log = io.StringIO()
+    metrics = lifecycle._run_attempts_supervised(spec, log, source_snapshot=_SOURCE_SNAPSHOT)
 
     assert metrics["wall_seconds"] == 1.0
     assert provider.attempts == [0, 1, 2]
+    # the provider's HTTP status survives into the persisted failure detail.
+    assert "(CapacityUnavailableError after http 422)" in log.getvalue()
     assert pauses == [execution.SPOT_CAPACITY_REQUEUE_SECONDS] * 2
 
 

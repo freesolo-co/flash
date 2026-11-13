@@ -533,7 +533,7 @@ def run_logs(
                 ) from exc
             end = f.tell()
     public_status = status.to_dict()
-    return {
+    page = {
         "run_id": run_id,
         "logs": chunk,
         "offset": end,
@@ -541,6 +541,16 @@ def run_logs(
         "last_heartbeat": public_status.get("last_heartbeat"),
         "gpu_status": status.gpu_status,
     }
+    if offset == 0:
+        # Host logrotate copy-truncates run logs into ``.log.1``, after which ``.log`` restarts
+        # empty. A full read also returns that earlier output, separately: ``logs``/``offset``
+        # keep addressing only ``.log``, so followers never skip or repeat output across a
+        # rotation (mid-rotation, the two fields may briefly hold the same lines).
+        rotated_path = runs_file_path(run_id, ".log.1")
+        if os.path.isfile(rotated_path):
+            with open(rotated_path, "rb") as f:
+                page["rotated_logs"] = f.read().decode("utf-8", errors="replace")
+    return page
 
 
 @router.get("/v1/runs/{run_id}/worker")
