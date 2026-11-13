@@ -622,21 +622,30 @@ def test_orphan_sweep_reaps_terminated_bid_with_stopping_instance(monkeypatch):
     assert terminated == ["bid_test"]
 
 
+@pytest.mark.parametrize("quota_free", [True, False])
 @pytest.mark.parametrize("status", [400, 403, 409, 422, 429, 0, 500])
-def test_capacity_refusal_requeues_but_unknown_create_outcomes_do_not(monkeypatch, status):
+def test_capacity_refusal_requeues_but_unknown_create_outcomes_do_not(
+    monkeypatch, status, quota_free
+):
+    """A definitive refusal requeues even when /quotas lists no limit (2026-11-13: H200 1x in
+    us-central2-b had no quota row and every bid was refused, failing runs terminally)."""
     from flash.providers.core.base import CapacityUnavailableError
     from flash.providers.mithril import capacity
 
     monkeypatch.setattr(api, "pages", lambda *a, **kw: [])
-    monkeypatch.setattr(capacity, "quota_available", lambda *a, **kw: False)
+    monkeypatch.setattr(capacity, "quota_available", lambda *a, **kw: quota_free)
 
     def refuse(*args, **kwargs):
         raise client.MithrilApiError(status=status)
 
     monkeypatch.setattr(api, "call", refuse)
-    error = UnreconciledCreateError if status in {0, 500} else CapacityUnavailableError
-    with pytest.raises(error):
-        launch(monkeypatch)
+    if status in {0, 500}:
+        with pytest.raises(UnreconciledCreateError) as error:
+            launch(monkeypatch)
+        assert error.value.cause == (f"HTTP {status}" if status else "MithrilApiError")
+    else:
+        with pytest.raises(CapacityUnavailableError):
+            launch(monkeypatch)
 
 
 def test_refused_create_reconciles_existing_bid_before_capacity_retry(monkeypatch):
@@ -790,3 +799,52 @@ def test_offers_skip_a_region_cooling_down_after_a_boot_timeout(monkeypatch):
     )
     region_health.mark_unbootable("af-south1-a")
     assert {o.region for o in prices.affordable_offers()} == {"us-central2-b"}
+
+
+def test_refused_shape_cools_down_only_that_auction(monkeypatch):
+    from flash.providers.mithril import region_health
+
+    shapes = [
+        {
+            "fid": fid,
+            "gpu_type": "H200",
+            "num_gpus": 1,
+            "gpu_memory_gb": 141,
+            "gpu_socket": "SXM5",
+            "local_storage_gb": 1500,
+        }
+        for fid in ("it_a", "it_b")
+    ]
+    auctions = [
+        {
+            "instance_type": fid,
+            "region": "us-central2-b",
+            "capacity": 3,
+            "last_instance_price": "$2.00",
+        }
+        for fid in ("it_a", "it_b")
+    ]
+    monkeypatch.setattr(
+        prices, "call", lambda method, path, **kw: shapes if path == "/instance-types" else auctions
+    )
+    now = time.time()
+    region_health.mark_refused("us-central2-b", "it_a", now=now)
+    assert {o.instance_type for o in prices.affordable_offers()} == {"it_b"}
+    assert not region_health.cooling_down("us-central2-b")  # the region itself stays usable
+    monkeypatch.setattr(time, "time", lambda: now + region_health.REFUSED_COOLDOWN_S + 1)
+    assert {o.instance_type for o in prices.affordable_offers()} == {"it_a", "it_b"}
+
+
+def test_refused_create_cools_down_the_refused_shape(monkeypatch):
+    from flash.providers.core.base import CapacityUnavailableError
+    from flash.providers.mithril import region_health
+
+    monkeypatch.setattr(api, "pages", lambda *a, **kw: [])
+
+    def refuse(*args, **kwargs):
+        raise client.MithrilApiError(status=403)
+
+    monkeypatch.setattr(api, "call", refuse)
+    with pytest.raises(CapacityUnavailableError, match="HTTP 403"):
+        launch(monkeypatch)
+    assert any("/" in key for key in region_health._load(region_health._path()))

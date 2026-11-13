@@ -587,7 +587,9 @@ def test_spot_quote_names_spot_as_unsupported_when_no_shape_fits(monkeypatch):
     from flash.cost import RunConfig, analytical
 
     monkeypatch.setattr(analytical, "required_vram_gb", lambda *a, **k: 5000)
-    with pytest.raises(ValueError, match=r"Spot is not supported for Qwen/Qwen3.5-9B with algorithm 'grpo'"):
+    with pytest.raises(
+        ValueError, match=r"Spot is not supported for Qwen/Qwen3.5-9B with algorithm 'grpo'"
+    ):
         analytical._offline_gpu_shape(RunConfig("Qwen/Qwen3.5-9B", "grpo", 10, provider="spot"))
 
 
@@ -626,7 +628,7 @@ def test_spot_quote_keeps_ceiling_error_when_a_wider_spot_shape_fits(monkeypatch
     from flash.cost import RunConfig, analytical
 
     monkeypatch.setattr(analytical, "required_vram_gb", lambda *a, **k: 200)
-    with pytest.raises(ValueError) as error:
+    with pytest.raises(ValueError, match=r"Raise the card ceiling") as error:
         analytical._offline_gpu_shape(
             RunConfig("Qwen/Qwen3.5-9B", "grpo", 10, provider="spot", gpu_count=1)
         )
@@ -636,7 +638,7 @@ def test_spot_quote_keeps_ceiling_error_when_a_wider_spot_shape_fits(monkeypatch
 def test_spot_allocator_keeps_ceiling_error_when_a_wider_spot_shape_fits():
     from flash.providers.core.allocator import _raise_no_candidate_error
 
-    with pytest.raises(ValueError) as error:
+    with pytest.raises(ValueError, match=r"no allocatable GPU") as error:
         _raise_no_candidate_error(
             model_id="Qwen/Qwen3.5-9B",
             algorithm="grpo",

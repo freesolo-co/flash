@@ -241,18 +241,22 @@ def create(*, name, offer, payload, image_reference, gpu, gpu_count, capsule, di
             ) from None
         if existing:
             return existing
-        if isinstance(error, MithrilApiError) and error.status == 429:
+        status = error.status if isinstance(error, MithrilApiError) else 0
+        if status == 429:
             raise CapacityUnavailableError("Mithril request throttled; requeuing") from None
-        if isinstance(error, MithrilApiError) and error.status in {400, 403, 409, 422}:
-            from flash.providers.mithril.capacity import quota_available
+        if status in {400, 403, 409, 422}:
+            from flash.providers.mithril.region_health import mark_refused
 
-            # A definitive refusal plus exhausted quota is safe to requeue only
-            # after reconciliation found no bid. Never retry unknown POST outcomes.
-            with contextlib.suppress(MithrilApiError):
-                if not quota_available(offer.instance_type, deadline_at=deadline_at):
-                    raise CapacityUnavailableError(
-                        "Mithril Spot quota exhausted; requeuing"
-                    ) from None
+            # A definitive refusal, and reconciliation just proved no bid exists, so requeueing
+            # cannot double-provision. Mithril enforces org/region limits /quotas does not list (a
+            # shape with no quota row was refused while 8 other bids held it), so do not gate this
+            # on quota_available: cool the shape down and let the queue take another offer.
+            with contextlib.suppress(Exception):
+                mark_refused(offer.region, offer.instance_type)
+            raise CapacityUnavailableError(
+                f"Mithril refused the bid (HTTP {status}); requeuing"
+            ) from None
         raise UnreconciledCreateError(
-            "Mithril launch could not be reconciled; refusing duplicate allocation"
+            "Mithril launch could not be reconciled; refusing duplicate allocation",
+            cause=f"HTTP {status}" if status else type(error).__name__,
         ) from None
