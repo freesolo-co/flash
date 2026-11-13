@@ -242,12 +242,11 @@ def test_persisted_legacy_shapes_price_finite_nonzero(prompts_per_step, group_si
         )
     )
 
-    full = runner_costs.charge_usd_for_spec(spec, fallback=float("nan"))
-    partial = runner_costs.charge_usd_for_spec(spec, steps=5, fallback=float("nan"))
-    assert math.isfinite(full)
-    assert full > 0
-    assert math.isfinite(partial)
-    assert 0 < partial < full
+    from flash.cost.spec import estimate_for_spec
+
+    quote = estimate_for_spec(spec).total_usd
+    assert math.isfinite(quote)
+    assert quote > 0
 
 
 def test_cancellation_billing_does_not_zero_a_completed_legacy_run():

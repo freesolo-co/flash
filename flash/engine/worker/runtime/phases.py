@@ -35,6 +35,11 @@ class PhaseTimings:
     active: dict[str, tuple[str, float]] = field(default_factory=dict)
     longest: dict[str, float] = field(default_factory=dict)
     first_update_ready_s: float | None = None
+    # customer billing meter. it starts when this attempt's first optimizer update starts, so model
+    # download, data loading and trainer/model/vLLM initialization never bill, and stops when the
+    # training loop exits, so final adapter publication never bills. monotonic and attempt-local.
+    billing_started: float | None = None
+    billing_stopped: float | None = None
     lock: object = field(default_factory=threading.Lock)
 
     def observe(self, event):
@@ -49,8 +54,11 @@ class PhaseTimings:
             return
         with self.lock:
             if state == "started":
+                now = time.monotonic()
+                if name == "first_update" and self.billing_started is None:
+                    self.billing_started = now
                 if len(self.active) < 128:
-                    self.active.setdefault(span, (name, time.monotonic()))
+                    self.active.setdefault(span, (name, now))
             elif state == "completed" or state == "failed":
                 self.active.pop(span, None)
                 seconds = event.get("seconds")
@@ -64,6 +72,26 @@ class PhaseTimings:
                 self.longest[name] = max(self.longest.get(name, 0.0), seconds)
                 if name == "first_update" and self.first_update_ready_s is None:
                     self.first_update_ready_s = time.monotonic() - self.started
+
+    def stop_billing(self):
+        """Freeze the billable training meter when the training loop exits. Idempotent."""
+        with self.lock:
+            if self.billing_started is not None and self.billing_stopped is None:
+                self.billing_stopped = time.monotonic()
+
+    def billable_train_seconds(self):
+        """GPU seconds this attempt has spent training (0.0 before its first optimizer update)."""
+        with self.lock:
+            return self._billable_unlocked(time.monotonic())
+
+    def _billable_unlocked(self, now):
+        # an explicit zero before the first optimizer update, never "absent": a metered worker
+        # cancelled during trainer/model init must bill zero, not look like a legacy worker that
+        # falls back to quote pricing.
+        if self.billing_started is None:
+            return 0.0
+        end = self.billing_stopped if self.billing_stopped is not None else now
+        return max(0.0, end - self.billing_started)
 
     def observe_line(self, line):
         # Ray prefixes stdout with actor identity; retain only our bounded JSON record.
@@ -81,7 +109,9 @@ class PhaseTimings:
             now = time.monotonic()
             for name, started in self.active.values():
                 elapsed[name] = round(max(elapsed.get(name, 0), now - started), 3)
+            billable = self._billable_unlocked(now)
             return {
+                "billable_train_s": round(billable, 3),
                 "active_phase_elapsed_s": elapsed,
                 "longest_phase_s": {name: round(value, 3) for name, value in self.longest.items()},
                 **(

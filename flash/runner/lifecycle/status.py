@@ -372,6 +372,10 @@ def record_heartbeat(run_id: str, heartbeat: dict) -> None:
                 prior += _session_seconds(prev.get("session_seconds"))
             if prior:
                 hb.setdefault("session_seconds_prior", prior)
+        if status.spec.get("algorithm") != "custom":
+            # every heartbeat, including the first one observed: it can already carry minutes of
+            # metered training (see _record_attempt_meter).
+            _record_attempt_meter(status, prev, hb)
         from flash.runner.accounting.spot_usage import record as record_spot_usage
 
         record_spot_usage(status, prev, hb, same_attempt=same_attempt)
@@ -564,6 +568,75 @@ def _update(run_id: str, new_state: str, *, allow_from_terminal: bool = False, *
     if report_status is not None:
         reporting._report_status(report_status)
     return True
+
+
+BILLABLE_ATTEMPTS_KEY = "billable_by_attempt"
+
+
+def rented_shape_key(remote) -> str | None:
+    """``provider|gpu|cards`` for the shape a provider handle rented, else ``None``.
+
+    A Spot run may launch on a different (interchangeable) class than it was allocated, so its
+    actual class (``gpu``) wins over ``allocated_gpu``. Card count defaults to 1.
+    """
+    if not isinstance(remote, dict):
+        return None
+    provider = remote.get("provider")
+    if not isinstance(provider, str) or not provider.strip():
+        return None
+    provider = provider.strip().lower()
+    gpu = remote.get("gpu") if provider == "spot" else None
+    gpu = gpu if isinstance(gpu, str) and gpu else remote.get("allocated_gpu")
+    if not isinstance(gpu, str) or not gpu:
+        return None
+    try:
+        from flash.providers.core.base import canonical_gpu
+
+        gpu = canonical_gpu(gpu)
+    except Exception:
+        return None
+    count = remote.get("allocated_gpu_count") or remote.get("gpu_count") or 1
+    if isinstance(count, bool) or not isinstance(count, int) or not 1 <= count <= 8:
+        count = 1
+    return f"{provider}|{gpu}|{count}"
+
+
+def _record_attempt_meter(status, prev, hb) -> None:
+    """Carry each attempt's metered training seconds, and the shape it rented, forward.
+
+    ``billable_by_attempt`` maps an attempt to ``{"s": seconds, "shape": "provider|gpu|cards"}``:
+    - ``s`` is the attempt's HIGHEST observed meter. Heartbeats can publish out of order (the
+      worker snapshots the meter before its upload lock), so a stale smaller sample never lowers it.
+    - ``shape`` is stamped only while the live handle belongs to that same attempt. A late sample
+      from a replaced attempt keeps the shape it ran on and never borrows the replacement's.
+    Attempts can rent different shapes (an OOM retry moves to a larger card or count; a Spot
+    resume can land on another class), and each attempt's seconds bill at its own shape.
+    """
+    carried = prev.get(BILLABLE_ATTEMPTS_KEY) if isinstance(prev, dict) else None
+    attempts: dict[str, dict] = {}
+    for key, entry in carried.items() if isinstance(carried, dict) else ():
+        if isinstance(key, str) and isinstance(entry, dict):
+            attempts[key] = {"s": _session_seconds(entry.get("s"))}
+            if isinstance(entry.get("shape"), str):
+                attempts[key]["shape"] = entry["shape"]
+    meter = _heartbeat_billable_seconds(hb)
+    if meter is not None:
+        key = str(hb.get("attempt"))
+        entry = attempts.setdefault(key, {"s": 0.0})
+        entry["s"] = max(entry["s"], _session_seconds(meter))
+        remote = status.remote if isinstance(status.remote, dict) else None
+        if remote is not None and str(remote.get("attempt")) == key:
+            shape = rented_shape_key(remote)
+            if shape:
+                entry["shape"] = shape
+    if attempts:
+        hb[BILLABLE_ATTEMPTS_KEY] = attempts
+
+
+def _heartbeat_billable_seconds(heartbeat):
+    """The attempt's metered training seconds carried by one heartbeat, else ``None``."""
+    timing = heartbeat.get("training_timing") if isinstance(heartbeat, dict) else None
+    return timing.get("billable_train_s") if isinstance(timing, dict) else None
 
 
 def _session_seconds(value):

@@ -156,7 +156,8 @@ def test_estimate_honors_exact_gpu_instead_of_cheaper_fit():
     unconstrained = estimate_cost(RunConfig("Qwen/Qwen3.5-9B", "grpo", 10))
     exact = estimate_cost(RunConfig("Qwen/Qwen3.5-9B", "grpo", 10, gpu_type="H100"))
 
-    assert unconstrained.gpu == "A100 SXM"
+    # measured dollars-per-step ranking (docs/billing-calibration.md) lands 9B grpo on RTX Pro 6000.
+    assert unconstrained.gpu == "RTX Pro 6000"
     assert exact.gpu == "H100"
     assert exact.gpu_hourly_usd > unconstrained.gpu_hourly_usd
 

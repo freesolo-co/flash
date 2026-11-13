@@ -376,17 +376,23 @@ def run_rl_train(*, context: WorkerContext):
             sample_off_thread=True,
             context=context,
         ):
-            rc = _execute_rl_child(
-                python_bin=python_bin,
-                overrides=configured["overrides"],
-                env_for_verl=env_for_verl,
-                inp=inp,
-                state=state,
-                reward_runtime=reward_runtime,
-                _reward_observability=_reward_observability,
-                files=files,
-                context=context,
-            )
+            try:
+                rc = _execute_rl_child(
+                    python_bin=python_bin,
+                    overrides=configured["overrides"],
+                    env_for_verl=env_for_verl,
+                    inp=inp,
+                    state=state,
+                    reward_runtime=reward_runtime,
+                    _reward_observability=_reward_observability,
+                    files=files,
+                    context=context,
+                )
+            finally:
+                # freeze the meter the moment the verl child exits: inside the liveness context,
+                # whose exit can wait on an in-flight heartbeat upload, and before
+                # _validate_rl_child drains required-save publication. neither is training time.
+                context.phase_timings.stop_billing()
         _validate_rl_child(
             rc,
             state,
@@ -397,6 +403,8 @@ def run_rl_train(*, context: WorkerContext):
             reward_runtime=reward_runtime,
         )
     finally:
+        # also covers a child that raised before returning (idempotent).
+        context.phase_timings.stop_billing()
         device_peak_gpu_gb = _shutdown_rl_runtime(resume_uploader, gpu_sampler, reward_runtime)
 
     adapter_dir, steps_run, train_wall = _publish_rl_result(

@@ -175,7 +175,7 @@ def test_get_status_tolerates_stale_unknown_keys(monkeypatch):
         assert "old" in {r.run_id for r in runner_status.list_runs()}
 
 
-def test_submit_job_persists_quote_and_completion_charges_it(monkeypatch, tmp_path):
+def test_submit_job_persists_the_quote_without_billing_it(monkeypatch, tmp_path):
     from flash.core.spec import GpuSpec, JobSpec, TrainSpec
     from flash.cost.currency import usd_amount
     from flash.cost.spec import estimate_for_spec
@@ -213,7 +213,9 @@ def test_submit_job_persists_quote_and_completion_charges_it(monkeypatch, tmp_pa
 
     assert seen["estimate"] == pytest.approx(seen["expected"])
     assert status.estimated_cost_usd == pytest.approx(seen["expected"])
-    assert status.cost_usd == pytest.approx(seen["expected"])
+    # the quote is an estimate; completion charges metered training time (here no meter was
+    # reported, so the measured fallback), never the quote.
+    assert status.cost_usd == pytest.approx(0.01)
     raw = runner_status._load_status_json(status.run_id)
     assert raw[runner_state._RUN_DEADLINE_AT_KEY] == pytest.approx(
         status.created_at + JobSpec.from_dict(status.spec).gpu.max_wall_seconds
@@ -742,7 +744,7 @@ def test_persist_metrics_bills_training_wall_not_setup(monkeypatch):
         assert on_disk["setup_seconds"] == pytest.approx(590.0)
 
 
-def test_run_training_charges_persisted_submit_estimate(monkeypatch, tmp_path):
+def test_run_training_charges_metered_training_time_not_the_quote(monkeypatch, tmp_path):
     import io
 
     from flash.core.spec import GpuSpec, JobSpec, TrainSpec
@@ -768,12 +770,14 @@ def test_run_training_charges_persisted_submit_estimate(monkeypatch, tmp_path):
     monkeypatch.setattr(
         runner_lifecycle,
         "_run_attempts_supervised",
-        lambda *a, **k: {"wall_seconds": 1.0, "cost_usd": 0.01},
-    )
-    monkeypatch.setattr(
-        runner_costs,
-        "charge_usd_for_spec",
-        lambda *a, **k: (_ for _ in ()).throw(AssertionError("must use submit quote")),
+        lambda *a, **k: {
+            "wall_seconds": 1.0,
+            "cost_usd": 0.01,
+            "allocated_provider": "modal",
+            "allocated_gpu": "H100",
+            "allocated_gpu_count": 1,
+            "notes": {"training_timing": {"billable_train_s": 1800.0}},
+        },
     )
 
     monkeypatch.setattr(
@@ -785,7 +789,8 @@ def test_run_training_charges_persisted_submit_estimate(monkeypatch, tmp_path):
 
     st = runner_status.get_status(spec.run_id)
     assert st.state == "done"
-    assert st.cost_usd == pytest.approx(7.77)
+    # half an hour of metered training on 1x H100, not the $7.77 submit quote.
+    assert st.cost_usd == pytest.approx(0.5 * runner_costs._gpu_rate("H100", "modal"))
 
 
 def test_supervised_attempt_identities_start_at_zero_and_increment_without_expanding_budget(

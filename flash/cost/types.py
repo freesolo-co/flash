@@ -67,6 +67,10 @@ class RunConfig:
     # rent the cheaper H100, and the affordability precheck runs on that inflated estimate.
     # appended for the same positional-constructor reason as the two fields above.
     gpu_type_fallbacks: tuple[str, ...] = ()
+    # sft only: the workload profile's architecture mode is "multimodal" (image rows). gates the
+    # vision-encoding term; "exact-unpacked" alone does not imply images, since text-only models
+    # that cannot pack are also trained unpacked. appended for the positional-constructor reason.
+    sft_multimodal: bool = False
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "method", normalize_algorithm(self.method))
