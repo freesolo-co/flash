@@ -431,7 +431,35 @@ def _reconcile_handleless_run(spec) -> Retry | None:
             return None
     except Exception:
         pass
+    _log_ownership_mismatch_once(spec.run_id)
     return Retry(min(_DEFERRED_RECOVERY_RETRY_S, max(0.0, deadline_at - time.time())))
+
+
+_OWNERSHIP_MISMATCH_LOGGED: set[tuple[str, str]] = set()
+
+
+def _log_ownership_mismatch_once(run_id: str) -> None:
+    """Say in the run log, once per reason, why a deferred recovery cannot proceed.
+
+    Without this a run whose recorded provider scope no longer matches this control plane waits
+    silently in queued/provisioning until its wall deadline. Lookup failures stay quiet: they only
+    leave ownership unverified and are retried.
+    """
+    from flash.providers.modal.auth import OwnershipMismatch, require_recorded_scope
+
+    try:
+        require_recorded_scope(get_status(run_id))
+    except OwnershipMismatch as exc:
+        key = (run_id, str(exc))
+        if key not in _OWNERSHIP_MISMATCH_LOGGED:
+            _OWNERSHIP_MISMATCH_LOGGED.add(key)
+            with contextlib.suppress(Exception):
+                _append_run_log(
+                    run_id,
+                    f"control plane recovery deferred: {exc}; retrying until the run wall deadline",
+                )
+    except Exception:
+        return
 
 
 def _schedule_resubmit(spec) -> None:

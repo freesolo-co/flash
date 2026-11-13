@@ -32,3 +32,28 @@ def scope_fingerprint() -> str:
         raise RuntimeError("Configure FLASH_MITHRIL_API_KEY and PROJECT_ID")
     # Ownership is the project; each bid records its own region.
     return hashlib.sha256(f"mithril:{config['project_id']}:*".encode()).hexdigest()
+
+
+def recorded_scope_is_ours(fingerprint: str) -> bool:
+    """Whether a run-level recorded Spot scope belongs to this control plane's project.
+
+    Runs submitted by region-pinned releases recorded the retired project+region scope. Without a
+    handle there is no bid whose region could be checked, so accept that scope for any region
+    Mithril lists; the fingerprint embeds the project, so a match still proves the owner. A failed
+    region listing raises (ownership unverified, not disproven), so recovery fails closed and retries.
+    """
+    current = scope_fingerprint()
+    if fingerprint == current:
+        return True
+    from flash.providers.mithril.client import call
+
+    project = settings()["project_id"]
+    auctions = call("GET", "/spot/availability")
+    if not isinstance(auctions, list):
+        return False
+    regions = {
+        auction["region"]
+        for auction in auctions
+        if isinstance(auction, dict) and isinstance(auction.get("region"), str)
+    }
+    return any(fingerprint == region_scope_fingerprint(project, region) for region in regions)

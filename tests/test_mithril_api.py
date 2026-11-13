@@ -746,6 +746,55 @@ def test_attempts_from_region_pinned_releases_stay_recognized(monkeypatch):
     handles.require_scope(SimpleNamespace(scope=config.scope_fingerprint(), instance_id="bid_x"))
 
 
+def test_handleless_runs_from_region_pinned_releases_stay_recognized(monkeypatch):
+    """A run that recorded the retired project+region scope and never got a handle is still ours.
+
+    Regression: such a run, submitted before the region setting was removed, sat in provisioning
+    after a restart because recovery compared the recorded scope for exact equality only.
+    """
+    from flash.providers.modal.auth import OwnershipMismatch, require_recorded_scope
+
+    legacy = config.region_scope_fingerprint("proj_test", "us-central2-b")
+    calls = []
+
+    def availability(method, path, **kw):
+        calls.append(path)
+        return [{"region": "us-central2-b"}, {"region": "eu-x"}, {"no_region": True}]
+
+    monkeypatch.setattr(client, "call", availability)
+    assert config.recorded_scope_is_ours(legacy)
+    require_recorded_scope(SimpleNamespace(submitted_spot_scope=legacy, submitted_modal_scope=None))
+    assert calls == ["/spot/availability", "/spot/availability"]
+
+    foreign = config.region_scope_fingerprint("proj_other", "us-central2-b")
+    assert not config.recorded_scope_is_ours(foreign)
+    with pytest.raises(OwnershipMismatch, match="differs"):
+        require_recorded_scope(
+            SimpleNamespace(submitted_spot_scope=foreign, submitted_modal_scope=None)
+        )
+
+    monkeypatch.setattr(
+        client, "call", lambda *a, **kw: pytest.fail("current scope needs no lookup")
+    )
+    assert config.recorded_scope_is_ours(config.scope_fingerprint())
+
+
+def test_a_failed_run_scope_lookup_is_unverified_not_a_mismatch(monkeypatch):
+    from flash.providers.modal.auth import OwnershipMismatch, require_recorded_scope
+
+    legacy = config.region_scope_fingerprint("proj_test", "us-central2-b")
+
+    def fail(method, path, **kw):
+        raise client.MithrilApiError(status=503)
+
+    monkeypatch.setattr(client, "call", fail)
+    with pytest.raises(client.MithrilApiError) as raised:
+        require_recorded_scope(
+            SimpleNamespace(submitted_spot_scope=legacy, submitted_modal_scope=None)
+        )
+    assert not isinstance(raised.value, OwnershipMismatch)
+
+
 def test_a_failed_scope_lookup_is_retryable_not_a_mismatch(monkeypatch):
     from flash.providers.mithril import handles
 

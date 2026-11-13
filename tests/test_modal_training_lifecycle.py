@@ -183,6 +183,31 @@ def test_handleless_recovery_cannot_prove_absence_in_a_different_scope(monkeypat
     assert runtime._confirm_run_clear(spec()) is False
 
 
+def test_deferred_recovery_logs_an_ownership_mismatch_once(monkeypatch):
+    from types import SimpleNamespace
+
+    import flash.server.platform.runtime as runtime
+    from flash.providers.modal.auth import scope_fingerprint
+
+    status = SimpleNamespace(submitted_spot_scope=None, submitted_modal_scope=scope_fingerprint())
+    monkeypatch.setattr(runtime, "get_status", lambda _: status)
+    logged = []
+    monkeypatch.setattr(
+        runtime, "_append_run_log", lambda run_id, msg: logged.append((run_id, msg))
+    )
+    monkeypatch.setattr(runtime, "_OWNERSHIP_MISMATCH_LOGGED", set())
+
+    runtime._log_ownership_mismatch_once("run-owned")  # matching scope: nothing to report
+    assert logged == []
+
+    monkeypatch.setenv("MODAL_ENVIRONMENT", "another-owner")
+    runtime._log_ownership_mismatch_once("run-owned")
+    runtime._log_ownership_mismatch_once("run-owned")  # same reason: not repeated every retry
+    assert len(logged) == 1
+    assert logged[0][0] == "run-owned"
+    assert "Modal credentials or environment differ" in logged[0][1]
+
+
 def test_launch_keeps_original_owner_if_environment_changes_after_create(monkeypatch, launch_state):
     from flash.providers.modal.auth import scope_fingerprint
 

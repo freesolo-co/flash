@@ -20,14 +20,23 @@ def scope_fingerprint() -> str:
     return hashlib.sha256(f"{auth[0]}:{environment()}".encode()).hexdigest()
 
 
+class OwnershipMismatch(RuntimeError):
+    """The run was submitted under different provider credentials than this control plane's.
+
+    Distinct from lookup failures (for example a Mithril API error, also a RuntimeError), which
+    leave ownership unverified rather than disproven.
+    """
+
+
 def require_recorded_scope(status) -> None:
     """A lost launch must be reconciled in the same workspace and environment."""
     spot_scope = getattr(status, "submitted_spot_scope", None)
     if spot_scope is not None:
-        from flash.providers.mithril.config import scope_fingerprint as spot_scope_fingerprint
+        from flash.providers.mithril.config import recorded_scope_is_ours
 
-        if spot_scope != spot_scope_fingerprint():
-            raise RuntimeError("Mithril project or region differs from this run's owner")
+        # Accepts the retired project+region scope of runs submitted by region-pinned releases.
+        if not recorded_scope_is_ours(spot_scope):
+            raise OwnershipMismatch("Mithril project or region differs from this run's owner")
     recorded = getattr(status, "submitted_modal_scope", None)
     if recorded is not None and recorded != scope_fingerprint():
-        raise RuntimeError("Modal credentials or environment differ from this run's owner")
+        raise OwnershipMismatch("Modal credentials or environment differ from this run's owner")
