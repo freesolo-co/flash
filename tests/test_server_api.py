@@ -1947,6 +1947,29 @@ def test_logs_offset_paging(api):
     assert page2["logs"] == "line two\n"
 
 
+def test_logs_include_the_rotated_log(api):
+    # Host logrotate copy-truncates run logs: earlier lines move to .log.1 and .log restarts empty.
+    key = _new_user_token()
+    run_id = api.post(
+        "/v1/runs", json={"spec": SPEC, "dry_run": True}, headers=_bearer(key)
+    ).json()["run_id"]
+    log_path = os.path.join(runner_state.RUNS_DIR, f"{run_id}.log")
+    with open(log_path + ".1", "w") as f:
+        f.write("attempt=0 failed (boot_timeout)\n")
+    with open(log_path, "w") as f:
+        f.write("attempt 1 running\n")
+    page = api.get(f"/v1/runs/{run_id}/logs", headers=_bearer(key)).json()
+    assert page["logs"] == "attempt=0 failed (boot_timeout)\nattempt 1 running\n"
+    with open(log_path, "a") as f:
+        f.write("done\n")
+    page2 = api.get(f"/v1/runs/{run_id}/logs?offset={page['offset']}", headers=_bearer(key)).json()
+    assert page2["logs"] == "done\n"
+    os.remove(log_path)  # rotated, current log not yet recreated
+    assert api.get(f"/v1/runs/{run_id}/logs", headers=_bearer(key)).json()["logs"] == (
+        "attempt=0 failed (boot_timeout)\n"
+    )
+
+
 def test_worker_output_route(api, monkeypatch):
     # /worker surfaces the train-subprocess stdout/traceback from the run's artifact namespace (operator
     # token, server-side). Best-effort: no artifacts -> empty dict; present -> passed through.

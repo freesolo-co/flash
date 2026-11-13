@@ -520,18 +520,27 @@ def run_logs(
     x_freesolo_org_id: Annotated[str | None, Header()] = None,
 ):
     status = require_readable_run(run_id, key, x_freesolo_org_id)
+    # Host logrotate copy-truncates run logs into ``.log.1``; serve it ahead of ``.log`` as one
+    # stream so a rotation does not hide earlier attempts' failure details.
+    rotated_path = runs_file_path(run_id, ".log.1")
     log_path = runs_file_path(run_id, ".log")
-    chunk, end = "", max(0, offset)
-    if os.path.exists(log_path):
-        with open(log_path, "rb") as f:
-            try:
+    rotated_size = os.path.getsize(rotated_path) if os.path.isfile(rotated_path) else 0
+    data, end = b"", max(0, offset)
+    try:
+        if end < rotated_size:
+            with open(rotated_path, "rb") as f:
                 f.seek(end)
-                chunk = f.read().decode("utf-8", errors="replace")
-            except (ValueError, OSError, OverflowError) as exc:
-                raise HTTPException(
-                    status_code=400, detail=f"invalid log offset {offset}: {exc}"
-                ) from exc
-            end = f.tell()
+                data = f.read(rotated_size - end)
+        if os.path.exists(log_path):
+            with open(log_path, "rb") as f:
+                f.seek(max(0, end - rotated_size))
+                data += f.read()
+                end = rotated_size + f.tell()
+        else:
+            end = max(end, rotated_size)
+    except (ValueError, OSError, OverflowError) as exc:
+        raise HTTPException(status_code=400, detail=f"invalid log offset {offset}: {exc}") from exc
+    chunk = data.decode("utf-8", errors="replace")
     public_status = status.to_dict()
     return {
         "run_id": run_id,
