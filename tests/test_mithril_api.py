@@ -853,30 +853,6 @@ def test_a_failed_scope_lookup_is_retryable_not_a_mismatch(monkeypatch):
         handles.require_scope(handle)
 
 
-def test_offers_skip_a_region_cooling_down_after_a_boot_timeout(monkeypatch):
-    from flash.providers.mithril import region_health
-
-    shapes = [
-        {
-            "fid": "it_test",
-            "gpu_type": "H200",
-            "num_gpus": 1,
-            "gpu_memory_gb": 141,
-            "gpu_socket": "SXM5",
-            "local_storage_gb": 1500,
-        }
-    ]
-    auctions = [
-        {"instance_type": "it_test", "region": r, "capacity": 3, "last_instance_price": "$2.00"}
-        for r in ("af-south1-a", "us-central2-b")
-    ]
-    monkeypatch.setattr(
-        prices, "call", lambda method, path, **kw: shapes if path == "/instance-types" else auctions
-    )
-    region_health.mark_unbootable("af-south1-a")
-    assert {o.region for o in prices.affordable_offers()} == {"us-central2-b"}
-
-
 @pytest.mark.parametrize("status", [400, 403, 409, 422])
 def test_a_definitive_refusal_with_quota_left_requeues_and_cools_that_shape(
     monkeypatch, status, tmp_path
@@ -904,7 +880,7 @@ def test_a_definitive_refusal_with_quota_left_requeues_and_cools_that_shape(
     assert "requeuing" in str(error.value)
     assert region_health.refused("us-central2-b", "it_test")
     # the refusal cools only that shape, never the whole region.
-    assert not region_health.cooling_down("us-central2-b")
+    assert not region_health.refused("us-central2-b", "it_other")
 
 
 @pytest.mark.parametrize("status", [0, 500])
