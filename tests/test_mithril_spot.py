@@ -15,13 +15,11 @@ from flash.providers.mithril.pricing import accepts_price
     ("gpu", "value", "accepted"),
     [
         ("H100", "0.79", True),
-        ("H100", "1.00", True),
-        ("H100", "1.01", False),
-        ("H200", "1.001", True),
-        ("H200", "1.01", False),
-        ("B200", "3.999", True),
-        ("B200", "4", True),
-        ("B200", "4.01", False),
+        ("H100", "2.00", True),
+        ("H100", "2.01", False),
+        ("H200", "2.50", True),
+        ("H200", "2.51", False),
+        ("L40S", "1.00", False),
         ("H100", "NaN", False),
         ("H100", "Infinity", False),
         ("H100", "-1", False),
@@ -95,8 +93,8 @@ def test_spot_estimate_is_offline_and_uses_fixed_cap(monkeypatch):
     config = {"model_id": "Qwen/Qwen3.5-9B", "method": "sft", "steps": 100, "gpu_type": "H100"}
     spot = estimate_cost(RunConfig(**config, provider="spot"))
     modal = estimate_cost(RunConfig(**config, provider="modal"))
-    assert spot.gpu_hourly_usd == 1
-    assert spot.total_usd < modal.total_usd / 3
+    assert spot.gpu_hourly_usd == 2.5  # quoted at the costliest class an H100 run may take
+    assert spot.total_usd < modal.total_usd
     assert spot.provider == "spot"
 
 
@@ -388,6 +386,161 @@ def test_mithril_signal_preemption_requeues_without_retry_budget(monkeypatch, al
 def test_entry_and_running_caps_do_not_change_fixed_customer_rates():
     from flash.providers.mithril.pricing import SPOT_GPUS, hourly_rate
 
-    assert [hourly_rate(gpu) for gpu in SPOT_GPUS] == [1, 1, 4]
-    assert [str(shape.entry_below_usd) for shape in SPOT_GPUS.values()] == ["1.01", "1.01", "4.01"]
-    assert [str(shape.keep_running_usd) for shape in SPOT_GPUS.values()] == ["2.01", "2.51", "5.01"]
+    assert list(SPOT_GPUS) == ["H100", "H200"]  # Mithril offers only these
+    assert [hourly_rate(gpu) for gpu in SPOT_GPUS] == [2.0, 2.5]
+    assert [str(shape.keep_running_usd) for shape in SPOT_GPUS.values()] == ["2.01", "2.51"]
+    assert not any(hasattr(shape, "entry_below_usd") for shape in SPOT_GPUS.values())
+
+
+def test_runs_on_h100_may_take_h200_but_not_the_reverse():
+    from flash.providers.mithril.pricing import interchangeable
+
+    assert interchangeable("H100", 1) == ("H100", "H200")
+    assert interchangeable("H100", 8) == ("H100", "H200")
+    assert interchangeable("H200", 1) == ("H200",)  # an 80 GB card cannot host a 141 GB plan
+
+
+@pytest.mark.parametrize(
+    ("live", "expected"),
+    [
+        (["H200"], "H200"),  # whichever comes up first
+        (["H100"], "H100"),
+        (["H200", "H100"], "H100"),  # both at once: class priority
+    ],
+)
+def test_queue_takes_whichever_acceptable_class_comes_up_first(monkeypatch, live, expected):
+    from flash.runner.lifecycle import status
+
+    offers = [prices.Offer(gpu, 1, f"it_{gpu}", 1.5, 1500, "r") for gpu in live]
+    answers = iter([[], offers])
+    now = [0.0]
+    monkeypatch.setattr(queue.time, "time", lambda: now[0])
+    monkeypatch.setattr(queue.time, "sleep", lambda s: now.__setitem__(0, now[0] + s))
+    monkeypatch.setattr(queue, "quota_available", lambda *a, **kw: True)
+    monkeypatch.setattr(queue, "affordable_offers", lambda **kw: next(answers))
+    monkeypatch.setattr(status, "get_status", lambda run: SimpleNamespace(state="queued"))
+    monkeypatch.setattr(status, "_update", lambda run, state: None)
+    log = io.StringIO()
+    offer = queue.wait_for_price(("H100", "H200"), "test", deadline_at=500, log=log)
+    assert offer.gpu == expected
+    assert "H100 or H200" in log.getvalue()
+
+
+def test_attempt_spec_names_the_class_that_came_up(monkeypatch):
+    from flash.core.spec import GpuSpec, JobSpec
+    from flash.providers.mithril import jobs
+    from flash.providers.mithril import queue as spot_queue
+
+    spec = JobSpec(
+        run_id="r", model="Qwen/Qwen3.5-9B-Base", gpu=GpuSpec(type="H100", provider="spot")
+    )
+    seen = {}
+    monkeypatch.setattr(jobs, "scope_fingerprint", lambda: "scope")
+
+    def wait(gpus, run_id, **kw):
+        seen["waited_for"] = gpus
+        return prices.Offer("H200", 1, "it_h200", 1.5, 1500, "r")
+
+    monkeypatch.setattr(spot_queue, "wait_for_price", wait)
+
+    def build_payload(spec, attempt, **kw):
+        seen["gpu"] = spec.gpu.type
+        raise RuntimeError("stop before launch")
+
+    monkeypatch.setattr(jobs, "build_payload", build_payload)
+    with pytest.raises(RuntimeError, match="stop before launch"):
+        jobs.submit_attempt(spec, deadline_at=time.time() + 600, log=io.StringIO())
+    assert seen == {"waited_for": ("H100", "H200"), "gpu": "H200"}
+
+
+def test_mithril_boot_window_and_failure(monkeypatch):
+    """A filled bid gets 30 minutes to boot; a VM that never boots is a boot_timeout, not a stall."""
+    from flash.providers.core.base import PollResult
+    from flash.providers.mithril import jobs as mithril_jobs
+
+    captured = {}
+    polled = PollResult(True)
+
+    def fake_poll(adapter, **kwargs):
+        captured.update(kwargs, failure=adapter.load_timeout_failure)
+        return polled
+
+    monkeypatch.setattr(mithril_jobs, "poll_instance_job", fake_poll)
+    monkeypatch.setattr(mithril_jobs, "require_scope", lambda _: None)
+    handle = SimpleNamespace(
+        to_dict=lambda: {
+            "provider": "spot",
+            "instance_id": "bid_test",
+            "name": "run-a0",
+            "run_id": "run",
+            "phase": "custom",
+            "hf_repo": "org/repo",
+            "attempt": 0,
+            "gpu": "H200",
+            "gpu_count": 1,
+            "hourly_usd": 2.5,
+            "scope": "x",
+            "started_ts": 1.0,
+        }
+    )
+    spec = SimpleNamespace(run_id="run", phase="custom", train=SimpleNamespace(hf_repo="org/repo"))
+    assert mithril_jobs.poll(handle, spec, deadline_at=10_000) is polled
+    assert captured["load_timeout_s"] == mithril_jobs.BOOT_TIMEOUT_S == 1800
+    assert captured["failure"] == "boot_timeout"
+
+
+def test_a_vm_that_never_booted_cools_its_region_for_every_run(monkeypatch):
+    from flash.providers.core.base import PollResult
+    from flash.providers.mithril import api as mithril_api
+    from flash.providers.mithril import jobs as mithril_jobs
+    from flash.providers.mithril import region_health
+
+    timed_out = PollResult(False, failure="boot_timeout", detail="remained starting")
+    monkeypatch.setattr(mithril_jobs, "poll_instance_job", lambda adapter, **kw: timed_out)
+    monkeypatch.setattr(mithril_jobs, "require_scope", lambda _: None)
+    bid = {"fid": "bid_test", "region": "af-south1-a", "instances": []}
+    monkeypatch.setattr(mithril_api, "_bid", lambda bid_id: bid)
+    handle = SimpleNamespace(
+        to_dict=lambda: {
+            "provider": "spot",
+            "instance_id": "bid_test",
+            "name": "run-a0",
+            "run_id": "run",
+            "phase": "custom",
+            "hf_repo": "org/repo",
+            "attempt": 0,
+            "gpu": "H200",
+            "gpu_count": 1,
+            "hourly_usd": 2.5,
+            "scope": "x",
+            "started_ts": 1.0,
+        }
+    )
+    spec = SimpleNamespace(run_id="run", phase="custom", train=SimpleNamespace(hf_repo="org/repo"))
+    # a bid that never filled says nothing about the region
+    assert mithril_jobs.poll(handle, spec, deadline_at=10_000) is timed_out
+    assert not region_health.cooling_down("af-south1-a")
+    # an allocated VM that never booted does
+    bid["instances"] = ["inst_x"]
+    log = io.StringIO()
+    assert mithril_jobs.poll(handle, spec, log=log, deadline_at=10_000) is timed_out
+    assert "skipping af-south1-a" in log.getvalue()
+    assert region_health.cooling_down("af-south1-a")
+    assert not region_health.cooling_down("us-central2-b")
+    later = time.time() + region_health.COOLDOWN_S + 1
+    assert not region_health.cooling_down("af-south1-a", now=later)
+
+
+def test_region_cooldown_is_not_a_run_record_and_keeps_every_mark(monkeypatch, tmp_path):
+    from flash.providers.mithril import region_health
+    from flash.runner.lifecycle import state
+
+    monkeypatch.setattr(state, "RUNS_DIR", str(tmp_path))
+    monkeypatch.setattr(
+        region_health, "_path", lambda: tmp_path / ".spot-region-health" / "cooldown.json"
+    )
+    region_health.mark_unbootable("af-south1-a")
+    region_health.mark_unbootable("eu-x")
+    assert region_health.cooling_down("af-south1-a")
+    assert region_health.cooling_down("eu-x")
+    assert not list(tmp_path.glob("*.json"))  # run scanners read top-level *.json as run records

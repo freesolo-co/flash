@@ -168,20 +168,30 @@ def test_exact_dollar_per_gpu_auction_is_admitted(monkeypatch, count):
     ]
 
 
-def test_live_candidates_use_only_advertised_shapes_and_per_gpu_prices(monkeypatch):
+def test_offers_use_only_advertised_shapes_and_per_gpu_prices(monkeypatch):
     catalog(monkeypatch)
-    offers = prices.affordable_offers()
-    assert offers == [Offer("H200", 8, "it_test", 0.8, 1500, "us-central2-b")]
+    assert prices.affordable_offers() == [Offer("H200", 8, "it_test", 0.8, 1500, "us-central2-b")]
+
+
+def test_allocation_offers_fitting_catalog_shapes_at_the_quote_rate(monkeypatch):
+    # live prices are the queue's concern; allocation never reads them.
+    monkeypatch.setattr(prices, "affordable_offers", lambda **kw: pytest.fail("no live prices"))
     candidates = get_provider("spot").live_candidates(80, AllocationConstraints(max_gpu_count=8))
-    assert [(c.gpu, c.gpu_count, c.hourly_usd) for c in candidates] == [("H200", 8, 0.8)]
-    assert get_provider("spot").live_candidates(80, AllocationConstraints(max_gpu_count=1)) == []
+    assert [(c.gpu, c.gpu_count, c.hourly_usd) for c in candidates] == [
+        ("H100", 1, 2.5),
+        ("H100", 8, 2.5),
+        ("H200", 1, 2.5),
+        ("H200", 8, 2.5),
+    ]
+    one = get_provider("spot").live_candidates(100, AllocationConstraints(max_gpu_count=1))
+    assert [(c.gpu, c.gpu_count) for c in one] == [("H200", 1)]  # 100 GB only fits an H200
 
 
 @pytest.mark.parametrize(
     "change",
     [
-        {"price": "$8.08"},
-        {"price": "$9.00"},
+        {"price": "$20.08"},
+        {"price": "$21.00"},
         {"capacity": 0},
         {"region": ""},
         {"socket": "PCIe"},
@@ -246,7 +256,7 @@ def launch(monkeypatch, *, count=1, gpu="H200"):
 
 
 @pytest.mark.parametrize("count", [1, 8])
-@pytest.mark.parametrize(("gpu", "cap"), [("H100", 2.01), ("H200", 2.51), ("B200", 5.01)])
+@pytest.mark.parametrize(("gpu", "cap"), [("H100", 2.01), ("H200", 2.51)])
 def test_create_bids_for_one_instance_at_per_instance_hold_cap(monkeypatch, count, gpu, cap):
     monkeypatch.setattr(api, "pages", lambda *a, **kw: [])
     captured = []
@@ -410,12 +420,6 @@ def test_missing_bid_does_not_hide_a_still_stopping_instance(monkeypatch):
     monkeypatch.setattr(api, "_bid", lambda *a, **kw: None)
     monkeypatch.setattr(api, "_instances", lambda *a, **kw: [{"status": "STATUS_STOPPING"}])
     assert api.get_instance("bid_test")["status"] == "stopping"
-
-
-def test_candidates_exclude_insufficient_scratch(monkeypatch):
-    catalog(monkeypatch)
-    constraints = AllocationConstraints(max_gpu_count=8, disk_gb=2000)
-    assert get_provider("spot").live_candidates(80, constraints) == []
 
 
 @pytest.mark.parametrize("valid", [True, False])
@@ -740,3 +744,49 @@ def test_attempts_from_region_pinned_releases_stay_recognized(monkeypatch):
     with pytest.raises(RuntimeError, match="differ"):
         handles.require_scope(handle)
     handles.require_scope(SimpleNamespace(scope=config.scope_fingerprint(), instance_id="bid_x"))
+
+
+def test_a_failed_scope_lookup_is_retryable_not_a_mismatch(monkeypatch):
+    from flash.providers.mithril import handles
+
+    legacy = config.region_scope_fingerprint("proj_test", "us-central2-b")
+    handle = SimpleNamespace(scope=legacy, instance_id="bid_test")
+    for status in (0, 429, 503):
+
+        def fail(m, p, status=status, **kw):
+            raise client.MithrilApiError(status=status)
+
+        monkeypatch.setattr(client, "call", fail)
+        with pytest.raises(client.MithrilApiError):
+            handles.require_scope(handle)
+
+    def gone(m, p, **kw):
+        raise client.MithrilApiError(status=404)
+
+    monkeypatch.setattr(client, "call", gone)
+    with pytest.raises(RuntimeError, match="differ"):
+        handles.require_scope(handle)
+
+
+def test_offers_skip_a_region_cooling_down_after_a_boot_timeout(monkeypatch):
+    from flash.providers.mithril import region_health
+
+    shapes = [
+        {
+            "fid": "it_test",
+            "gpu_type": "H200",
+            "num_gpus": 1,
+            "gpu_memory_gb": 141,
+            "gpu_socket": "SXM5",
+            "local_storage_gb": 1500,
+        }
+    ]
+    auctions = [
+        {"instance_type": "it_test", "region": r, "capacity": 3, "last_instance_price": "$2.00"}
+        for r in ("af-south1-a", "us-central2-b")
+    ]
+    monkeypatch.setattr(
+        prices, "call", lambda method, path, **kw: shapes if path == "/instance-types" else auctions
+    )
+    region_health.mark_unbootable("af-south1-a")
+    assert {o.region for o in prices.affordable_offers()} == {"us-central2-b"}

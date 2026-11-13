@@ -7,7 +7,6 @@ import time
 from flash.providers._lifecycle.instances.instance import build_payload, instance_label
 from flash.providers._lifecycle.instances.poll import (
     FIRST_LIVENESS_S,
-    LOAD_TIMEOUT_S,
     SETUP_GRACE_S,
     STALL_AFTER_S,
 )
@@ -27,6 +26,11 @@ from flash.providers.mithril import api
 from flash.providers.mithril.config import scope_fingerprint
 from flash.providers.mithril.handles import SpotJobHandle, require_scope
 from flash.providers.mithril.pricing import hourly_rate
+from flash.runner.supervise.retry_decision import BOOT_TIMEOUT_FAILURE
+
+# A filled Mithril bid allocates, images and boots a VM before it reports running; that has
+# taken over 15 minutes, so allow 30 before treating the machine as faulty and rebidding.
+BOOT_TIMEOUT_S = 1800.0
 
 
 def poll(handle, spec, *, log=None, deadline_at=None):
@@ -81,18 +85,41 @@ def poll(handle, spec, *, log=None, deadline_at=None):
         first_liveness_detail=lambda elapsed, limit: (
             f"Mithril Spot worker produced no liveness for {int(elapsed)}s (limit {int(limit)}s)"
         ),
+        load_timeout_failure=BOOT_TIMEOUT_FAILURE,
         signal_interruption_is_preemption=True,
     )
-    return poll_instance_job(
+    result = poll_instance_job(
         adapter,
         log=log,
         heartbeat_reader=heartbeat_reader_for(spec, deadline_at=deadline_at),
         setup_grace_s=SETUP_GRACE_S,
         stall_after_s=STALL_AFTER_S,
         first_liveness_s=FIRST_LIVENESS_S,
-        load_timeout_s=LOAD_TIMEOUT_S,
+        load_timeout_s=BOOT_TIMEOUT_S,
         deadline_at=deadline_at,
     )
+    if result.failure == BOOT_TIMEOUT_FAILURE:
+        _cool_down_region(h.instance_id, log=log)
+    return result
+
+
+def _cool_down_region(bid_id, *, log=None):
+    """Keep every run off this bid's region for a while; its VM never booted."""
+    from flash.providers.mithril.region_health import COOLDOWN_S, mark_unbootable
+
+    try:
+        bid = api._bid(bid_id)
+        region = bid.get("region") if isinstance(bid, dict) else None
+        # Only an allocated VM that never booted indicts the region; an unfilled bid does not.
+        if region and bid.get("instances"):
+            mark_unbootable(region)
+            print(
+                f"Spot: skipping {region} for {COOLDOWN_S / 3600:g}h (its VM never booted)",
+                file=log,
+                flush=True,
+            )
+    except Exception:  # best effort: the retry still proceeds without the cooldown
+        pass
 
 
 def submit_attempt(
@@ -109,11 +136,32 @@ def submit_attempt(
     from flash.runtime_capsule import build_capsule
 
     deadline_at = require_deadline_at(deadline_at)
-    gpu = spec.gpu.type
+    allocated = spec.gpu.type
     count = gpu_count_of(spec)
-    if count > get_gpu_info(gpu).max_count:
-        raise ValueError(f"Mithril Spot does not support {count} GPUs of class {gpu}")
+    if count > get_gpu_info(allocated).max_count:
+        raise ValueError(f"Mithril Spot does not support {count} GPUs of class {allocated}")
     owner_scope = scope_fingerprint()
+    from flash.providers.mithril.pricing import interchangeable
+    from flash.providers.mithril.queue import wait_for_price
+
+    # Wait for every Spot class that can host this plan and take whichever comes up first.
+    offer = wait_for_price(
+        interchangeable(allocated, count) or (allocated,),
+        spec.run_id,
+        gpu_count=count,
+        disk_gb=spec.gpu.disk_gb,
+        deadline_at=deadline_at,
+        log=log,
+    )
+    gpu = offer.gpu
+    if gpu != allocated:
+        # The worker verifies its live card against spec.gpu.type, so the attempt's spec names the
+        # class actually rented (it has at least the allocated class's VRAM).
+        from dataclasses import replace
+
+        spec = replace(spec, gpu=replace(spec.gpu, type=gpu, type_fallbacks=()))
+        if log is not None:
+            print(f"Spot: {gpu} came up first (allocated {allocated})", file=log, flush=True)
     payload = build_payload(
         spec,
         attempt,
@@ -121,16 +169,6 @@ def submit_attempt(
         runtime_secrets=runtime_secrets,
         source_snapshot=source_snapshot,
         deadline_at=deadline_at,
-    )
-    from flash.providers.mithril.queue import wait_for_price
-
-    offer = wait_for_price(
-        gpu,
-        spec.run_id,
-        gpu_count=count,
-        disk_gb=spec.gpu.disk_gb,
-        deadline_at=deadline_at,
-        log=log,
     )
     name = instance_label(spec.run_id, attempt)
     started = time.time()

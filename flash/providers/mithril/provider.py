@@ -4,7 +4,7 @@ from flash.providers.core import base
 from flash.providers.core.base import Candidate
 from flash.providers.mithril.config import configured
 from flash.providers.mithril.handles import SpotJobHandle, require_scope
-from flash.providers.mithril.pricing import SPOT_GPUS, hourly_rate
+from flash.providers.mithril.pricing import SPOT_GPUS, hourly_rate, quote_rate
 
 
 class SpotProvider:
@@ -32,20 +32,15 @@ class SpotProvider:
         return hourly_rate(gpu)
 
     def live_candidates(self, need_vram_gb, constraints):
-        from flash.providers.mithril.prices import affordable_offers
-
+        # Spot admission is the queue's job (it waits for any fitting class below its cap), so
+        # allocation offers every fitting catalog shape at the fixed quote rate.
         return [
-            Candidate(
-                self.name,
-                offer.gpu,
-                offer.hourly_usd,
-                base.GPU_INFO[offer.gpu].vram_gb,
-                offer.count,
-            )
-            for offer in affordable_offers()
-            if base.GPU_INFO[offer.gpu].vram_gb >= need_vram_gb
-            and offer.count <= constraints.max_gpu_count
-            and offer.disk_gb >= constraints.disk_gb
+            Candidate(self.name, name, quote_rate(), base.GPU_INFO[name].vram_gb, count)
+            for name, shape in SPOT_GPUS.items()
+            if base.GPU_INFO[name].vram_gb >= need_vram_gb
+            and (not constraints.gpu_type or constraints.gpu_type == name)
+            for count in shape.counts
+            if count <= constraints.max_gpu_count
         ]
 
     def submit_attempt(

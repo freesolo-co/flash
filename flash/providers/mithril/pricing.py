@@ -1,9 +1,9 @@
-"""Fixed Spot rates, entry thresholds and separate hold caps, in USD per GPU-hour.
+"""Fixed Spot rates and one price cap per GPU class, in USD per GPU-hour.
 
 These are user-selected thresholds, not current market prices or capacity guarantees.
-Each threshold includes a $0.01/GPU-hour offset above the selected base cap.
-This admits exact-dollar prices despite the strict entry comparison.
-GPU priority follows insertion order: H100, H200, B200.
+Each class has a single cap: a rental starts only while the live price is below it, and the
+Mithril bid's limit price keeps a running VM up to the same cap. ``hourly_usd`` is the fixed
+rate Flash estimates and charges. GPU priority follows insertion order: H100, H200.
 """
 
 from dataclasses import dataclass
@@ -15,15 +15,13 @@ from flash.providers.core.base import canonical_gpu
 @dataclass(frozen=True)
 class SpotGpu:
     hourly_usd: Decimal
-    entry_below_usd: Decimal
-    keep_running_usd: Decimal
+    keep_running_usd: Decimal  # the one cap: start below it, keep running through it
     counts: tuple[int, ...] = (1, 8)
 
 
 SPOT_GPUS = {
-    "H100": SpotGpu(Decimal("1.00"), Decimal("1.01"), Decimal("2.01")),
-    "H200": SpotGpu(Decimal("1.00"), Decimal("1.01"), Decimal("2.51")),
-    "B200": SpotGpu(Decimal("4.00"), Decimal("4.01"), Decimal("5.01")),
+    "H100": SpotGpu(Decimal("2.00"), Decimal("2.01")),
+    "H200": SpotGpu(Decimal("2.50"), Decimal("2.51")),
 }
 
 
@@ -34,9 +32,12 @@ def hourly_rate(gpu: str) -> float:
 def accepts_price(gpu: str, value, *, currency: str, unit: str) -> bool:
     if currency.lower() != "usd" or unit.lower() != "gpu hour" or isinstance(value, bool):
         return False
+    shape = SPOT_GPUS.get(canonical_gpu(gpu))
+    if shape is None:
+        return False  # not a Spot class
     try:
         price = Decimal(str(value))
-        return price.is_finite() and 0 < price < SPOT_GPUS[canonical_gpu(gpu)].entry_below_usd
+        return price.is_finite() and 0 < price < shape.keep_running_usd
     except (ValueError, ArithmeticError):
         return False
 
@@ -47,3 +48,29 @@ def priority(gpu: str) -> int:
 
 def running_limit(gpu: str) -> float:
     return float(SPOT_GPUS[canonical_gpu(gpu)].keep_running_usd)
+
+
+def quote_rate() -> float:
+    """Per-GPU rate every Spot quote is priced at: the costliest Spot class.
+
+    Any Spot run may end up on the costliest class (an H100 run may take an H200 that comes up
+    first), so quotes are an upper bound; settlement bills each stretch at the class it actually
+    ran on (``flash.runner.accounting.spot_usage``).
+    """
+    return max(float(shape.hourly_usd) for shape in SPOT_GPUS.values())
+
+
+def interchangeable(gpu: str, count: int) -> tuple[str, ...]:
+    """Spot classes a run allocated on ``gpu`` x ``count`` may take instead, in priority order.
+
+    Every catalog class offering ``count`` cards with at least the allocated class's VRAM can host
+    the same plan, so a queued run waits for all of them and takes whichever comes up first.
+    """
+    from flash.providers.core.base import get_gpu_info
+
+    floor = get_gpu_info(gpu).vram_gb
+    return tuple(
+        name
+        for name, shape in SPOT_GPUS.items()
+        if count in shape.counts and get_gpu_info(name).vram_gb >= floor
+    )
