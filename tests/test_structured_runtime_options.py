@@ -153,3 +153,91 @@ def test_nested_runtime_configuration_becomes_plain_json():
     assert vllm_structured_kwargs({"choice": UserList(["red", "blue"])}) == {
         "choice": ["red", "blue"]
     }
+
+
+# xgrammar (<= 0.2.9) prints a length-limited string's repetition unit without an escape branch.
+_LIMITED_GRAMMAR = (
+    'root ::= (("{" [ \\n\\t]* "\\"c\\"" [ \\n\\t]* ":" [ \\n\\t]* root_prop_0 [ \\n\\t]* "}"))\n'
+    'root_prop_0 ::= (("\\"" root_prop_0_characters{1, -1} "\\""))\n'
+    'root_prop_0_characters ::= (([^\\"\\\\\\r\\n]))\n'
+)
+
+
+def _limited(prop=None):
+    prop = prop or {"type": "string", "minLength": 1}
+    return {"type": "object", "properties": {"c": prop}, "required": ["c"]}
+
+
+@pytest.fixture
+def fake_xgrammar(monkeypatch, backend_feature_check):
+    from flash.content.structured_options import _escape_safe_json_grammar
+
+    calls = []
+
+    def compile_schema(schema, **options):
+        calls.append((json.loads(schema), options))
+        return _LIMITED_GRAMMAR
+
+    monkeypatch.setitem(
+        sys.modules,
+        "xgrammar",
+        SimpleNamespace(Grammar=SimpleNamespace(from_json_schema=compile_schema)),
+    )
+    _escape_safe_json_grammar.cache_clear()
+    yield calls
+    _escape_safe_json_grammar.cache_clear()
+
+
+def test_length_limited_strings_keep_json_escapes(fake_xgrammar):
+    """minLength/maxLength strings must still decode escapes (e.g. code inside a JSON answer)."""
+    spec = {"json": _limited()}
+    original = copy.deepcopy(spec)
+    lowered = vllm_structured_kwargs(spec)
+    grammar = lowered["grammar"]
+    assert set(lowered) == {"grammar"}
+    assert 'root_prop_0_characters ::= (([^\\"\\\\\\r\\n]) | ("\\\\" flash_json_escape))' in grammar
+    assert grammar.rstrip().endswith(
+        'flash_json_escape ::= (([\\"\\\\/bfnrt]) | '
+        '("u" [A-Fa-f0-9] [A-Fa-f0-9] [A-Fa-f0-9] [A-Fa-f0-9]))'
+    )
+    # vLLM's default JSON compilation (any whitespace) is kept; only the character unit changes.
+    assert fake_xgrammar == [(spec["json"], {"any_whitespace": True})]
+    assert vllm_structured_kwargs(spec) == lowered  # cached
+    assert len(fake_xgrammar) == 1
+    assert spec == original
+
+
+@pytest.mark.parametrize(
+    "prop",
+    [
+        {"type": "string", "maxLength": 64},
+        {"type": ["string", "null"], "minLength": 1},
+    ],
+)
+def test_any_length_limited_string_type_is_lowered(fake_xgrammar, prop):
+    assert "flash_json_escape" in vllm_structured_kwargs({"json": _limited(prop)})["grammar"]
+
+
+def test_unlimited_strings_stay_plain_json(fake_xgrammar):
+    schema = _limited({"type": "string"})
+    assert vllm_structured_kwargs({"json": schema}) == {"json": schema}
+    assert fake_xgrammar == []
+
+
+def test_length_limited_schema_xgrammar_cannot_compile_is_left_to_vllm(
+    fake_xgrammar, backend_feature_check
+):
+    backend_feature_check.return_value = True
+    schema = _limited()
+    assert vllm_structured_kwargs({"json": schema}) == {"json": schema}
+    assert fake_xgrammar == []
+
+
+def test_compact_length_limited_strings_also_keep_escapes(fake_xgrammar):
+    lowered = vllm_structured_kwargs({"json": _limited(), "disable_any_whitespace": True})
+    assert "flash_json_escape" in lowered["grammar"]
+    assert fake_xgrammar[0][1] == {
+        "any_whitespace": False,
+        "indent": None,
+        "separators": (",", ":"),
+    }

@@ -96,29 +96,91 @@ def vllm_structured_kwargs(spec: dict[str, Any]) -> dict[str, Any]:
     kwargs.pop("whitespace_pattern", None)
     compact = bool(spec.get("disable_any_whitespace"))
     closed = bool(spec.get("disable_additional_properties"))
-    if not (compact or closed):
+    limited = "json" in spec and _has_length_limited_string(_loaded(spec["json"]))
+    if not (compact or closed or limited):
         return kwargs
     schema = copy.deepcopy(spec.get("json", {"type": "object", "additionalProperties": True}))
     if isinstance(schema, str):
         schema = json.loads(schema)
     if closed:
         _close_objects(schema)
+    canonical = json.dumps(schema, sort_keys=True, separators=(",", ":"))
     if compact:
-        canonical = json.dumps(schema, sort_keys=True, separators=(",", ":"))
         return {"grammar": _compact_json_grammar(canonical)}
+    if limited:
+        grammar = _escape_safe_json_grammar(canonical)
+        if grammar is not None:
+            return {"grammar": grammar}
     return {"json": schema}
 
 
-@lru_cache(maxsize=32)
-def _compact_json_grammar(schema: str) -> str:
+# xgrammar (through 0.2.9) compiles a string with minLength/maxLength as a repetition of this
+# character class, which has no escape alternative: \" \\ \n \r \t \uXXXX become undecodable, so a
+# model that must quote or break a line inside such a field silently drops the quote or ends the
+# string. Each rewritten repetition unit accepts one escape as one character, so the length bounds
+# keep their JSON meaning (decoded characters).
+_BARE_STRING_CHARACTER = r"(([^\"\\\r\n]))"
+_ESCAPED_STRING_CHARACTER = r'(([^\"\\\r\n]) | ("\\" flash_json_escape))'
+_JSON_ESCAPE_RULE = r'flash_json_escape ::= (([\"\\/bfnrt]) | ("u" [A-Fa-f0-9] [A-Fa-f0-9] [A-Fa-f0-9] [A-Fa-f0-9]))'
+
+
+def _allow_escapes_in_limited_strings(grammar: str) -> str:
+    lines = grammar.splitlines()
+    patched = False
+    for index, line in enumerate(lines):
+        name, separator, body = line.partition(" ::= ")
+        if separator and body == _BARE_STRING_CHARACTER:
+            lines[index] = f"{name}{separator}{_ESCAPED_STRING_CHARACTER}"
+            patched = True
+    if not patched:
+        return grammar
+    return "\n".join([*lines, _JSON_ESCAPE_RULE]) + "\n"
+
+
+def _loaded(schema: Any) -> Any:
+    return json.loads(schema) if isinstance(schema, str) else schema
+
+
+def _has_length_limited_string(schema: Any) -> bool:
+    for node in _schema_nodes(schema):
+        kind = node.get("type")
+        is_string = kind == "string" or (isinstance(kind, list) and "string" in kind)
+        if is_string and ("minLength" in node or "maxLength" in node):
+            return True
+    return False
+
+
+def _xgrammar_unsupported(schema: Any) -> bool:
     from vllm.v1.structured_output.backend_xgrammar import (
         has_xgrammar_unsupported_json_features,
     )
 
-    if any(
+    return any(
         has_xgrammar_unsupported_json_features(_node_features(node))
-        for node in _schema_nodes(json.loads(schema))
-    ):
+        for node in _schema_nodes(schema)
+    )
+
+
+@lru_cache(maxsize=32)
+def _escape_safe_json_grammar(schema: str) -> str | None:
+    """vLLM's default JSON compilation (any whitespace), with escapes allowed in limited strings.
+
+    None leaves the schema to vLLM's own backend selection (features xgrammar cannot compile).
+    """
+    if _xgrammar_unsupported(json.loads(schema)):
+        return None
+    import xgrammar
+
+    try:
+        grammar = str(xgrammar.Grammar.from_json_schema(schema, any_whitespace=True))
+    except RuntimeError:
+        return None
+    return _allow_escapes_in_limited_strings(grammar)
+
+
+@lru_cache(maxsize=32)
+def _compact_json_grammar(schema: str) -> str:
+    if _xgrammar_unsupported(json.loads(schema)):
         raise ValueError(
             "disable_any_whitespace requires an xgrammar-compatible JSON schema; "
             "omit disable_any_whitespace to allow backend selection"
@@ -126,13 +188,14 @@ def _compact_json_grammar(schema: str) -> str:
     import xgrammar
 
     try:
-        return str(
+        grammar = str(
             xgrammar.Grammar.from_json_schema(
                 schema, any_whitespace=False, indent=None, separators=(",", ":")
             )
         )
     except RuntimeError as exc:
         raise ValueError(f"invalid compact JSON constraint: {exc}") from exc
+    return _allow_escapes_in_limited_strings(grammar)
 
 
 def _close_objects(schema: Any) -> None:
