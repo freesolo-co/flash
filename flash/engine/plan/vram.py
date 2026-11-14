@@ -192,6 +192,15 @@ def _declares_linear_attention(model_info, model_id: str = "") -> bool:
     return int(getattr(catalog_info, "num_linear_attention_layers", 0) or 0) > 0
 
 
+def _rollout_sleep_unsupported(model_id: str) -> bool:
+    """Whether the worker keeps this model's rollout engine resident (same rule it applies)."""
+    if not model_id:
+        return False
+    from flash.core.catalog import MODELS
+
+    return bool(getattr(MODELS.get(model_id), "sleep_unsupported", False))
+
+
 def _rollout_kv_floor_gb(
     params_b: float,
     vllm_max_len: int,
@@ -203,6 +212,11 @@ def _rollout_kv_floor_gb(
     lora_rank: int = 0,
     rollout_cache_min_gb: float = 0.0,
 ) -> int:
+    from flash.engine.plan.kv_sizing import vision_engine_reserve_gb
+
+    # the worker charges the same vision reserve and lifts the same cap (kv_sizing), so a card this
+    # floor admits is a card the engine actually fits on.
+    vision_reserve = vision_engine_reserve_gb(model_id or str(getattr(model_info, "id", "") or ""))
     floor = grpo_kv_floor_gb(
         params_b,
         vllm_max_len,
@@ -211,6 +225,8 @@ def _rollout_kv_floor_gb(
         model_info=model_info,
         rollout_cache_min_gb=rollout_cache_min_gb,
         lora_rank=lora_rank,
+        vision_reserve_gb=vision_reserve,
+        sleep_mode=not _rollout_sleep_unsupported(model_id),
     )
     from flash.providers.core.base import max_non_fp8_kv_vram_gb
 
@@ -232,6 +248,8 @@ def _rollout_kv_floor_gb(
         model_info=model_info,
         rollout_cache_min_gb=rollout_cache_min_gb,
         lora_rank=lora_rank,
+        vision_reserve_gb=vision_reserve,
+        sleep_mode=not _rollout_sleep_unsupported(model_id),
     )
     return max(fp8_floor, ceiling + 1)
 

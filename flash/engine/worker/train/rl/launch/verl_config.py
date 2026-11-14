@@ -526,6 +526,7 @@ def resolve_gpu_mem_util(
         return _DEFAULT_GPU_MEM_UTIL
     try:
         from flash.core.catalog import MODELS
+        from flash.engine.plan.kv_sizing import vision_engine_reserve_gb
         from flash.engine.plan.vram import colocate_kv_util, resolve_params_b
         from flash.providers.core.base import get_gpu_info
 
@@ -568,6 +569,7 @@ def resolve_gpu_mem_util(
             rollout_cache_min_gb=getattr(catalog_info, "rollout_cache_min_gb", 0.0),
             tensor_parallel=n_gpus,
             lora_rank=int(inp["lora_rank"]),
+            vision_reserve_gb=vision_engine_reserve_gb(model_id),
         )
         # multi-rank sizing is strictly one-directional against the previous worker contract: it may
         # free memory but can never claim more than the flat reservation a working run already used.
