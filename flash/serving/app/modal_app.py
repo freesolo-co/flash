@@ -5,7 +5,6 @@ The public router and the separate DeepSeek deployment remain on Modal.
 """
 
 import asyncio
-import itertools
 import os
 import time
 import uuid
@@ -323,7 +322,7 @@ from flash.serving.app.inference_provider import (  # noqa: E402
     modal_gpus_for,
 )
 from flash.serving.app.modal_engine import HostedModalEngine  # noqa: E402
-from flash.serving.lambda_cloud import reserved  # noqa: E402
+from flash.serving.lambda_cloud import reserved, reserved_watchdog  # noqa: E402
 from flash.serving.lambda_cloud.proxy import LambdaEngineProxy  # noqa: E402
 from flash.serving.src.engine.lora_engine import _LoraEngineImpl  # noqa: E402, F401
 
@@ -536,6 +535,9 @@ RESERVED_ENGINES = (
     if reserved.enabled(reserved.MODEL, MODAL_ENVIRONMENT)
     else ()
 )
+if RESERVED_ENGINES:
+    reserved_watchdog.register_watchdog(app, lambda_controller_image, __name__)
+
 MODAL_FALLBACK_BY_MODEL: dict[str, Any] = {
     bm: _configured_engine(bm, "modal", "_ModalGPU") for bm in base_models() if bm != reserved.MODEL
 }
@@ -557,11 +559,17 @@ class _ModalEnginePool:
         from flash.serving.app.provider_selection import bind_lambda_control
 
         self._fleet, self._provider_selection = bind_lambda_control()
-        self._reserved_cycle = itertools.cycle(RESERVED_ENGINES)
+        # Watchdog-quarantined reserved workers are skipped for routing and registration.
+        self._reserved_health = reserved_watchdog.HealthView.for_engines(RESERVED_ENGINES)
+
+    async def _each_reserved(self, label, call):
+        slots = await self._reserved_health.usable()
+        await reserved_watchdog.each_slot(RESERVED_ENGINES, reserved.MODEL, slots, label, call)
 
     async def _engine_for(self, model):
         if RESERVED_ENGINES and model == reserved.MODEL:
-            return next(self._reserved_cycle)(base_model=model)
+            slot = await self._reserved_health.next_slot()
+            return RESERVED_ENGINES[slot - 1](base_model=model)
         if (
             model in MODAL_FALLBACK_BY_MODEL
             and await self._provider_selection.choose(model) == "modal"
@@ -657,13 +665,10 @@ class _ModalEnginePool:
 
     async def register(self, base_model: str, record: Any) -> None:
         if RESERVED_ENGINES and base_model == reserved.MODEL:
-            await asyncio.gather(
-                *(
-                    cls(base_model=base_model).register.remote.aio(
-                        self._record_payload(record), getattr(record, "deployment_generation", None)
-                    )
-                    for cls in RESERVED_ENGINES
-                )
+            payload = self._record_payload(record)
+            generation = getattr(record, "deployment_generation", None)
+            await self._each_reserved(
+                "register", lambda engine: engine.register.remote.aio(payload, generation)
             )
             return
         engine = await self._engine_for(base_model)
@@ -680,13 +685,11 @@ class _ModalEnginePool:
         expected_generation: str | None = None,
     ) -> None:
         if RESERVED_ENGINES and base_model == reserved.MODEL:
-            await asyncio.gather(
-                *(
-                    cls(base_model=base_model).unregister.remote.aio(
-                        org_id, model_id, expected_generation
-                    )
-                    for cls in RESERVED_ENGINES
-                )
+            # Quarantined slots are skipped: the router stops addressing the removed
+            # checkpoint, so a recovering worker cannot be asked to serve it again.
+            await self._each_reserved(
+                "unregister",
+                lambda engine: engine.unregister.remote.aio(org_id, model_id, expected_generation),
             )
             return
         from flash.serving.app.provider_selection import unregister_active
