@@ -23,6 +23,26 @@ _KV_FRAGMENTATION_MARGIN = 1.25
 # once the kv pool is carved out, so a budget that prices under it is not a smaller engine but a
 # broken one. the parameter-based estimate and multi-rank shard path both bottom out here.
 _MIN_ENGINE_UTIL = 0.10
+# vision-language rollout engines (catalog image-training models, e.g. Qwen3.5) need runtime memory
+# beyond their bf16 weights before any kv page: vllm profiles the vision encoder on a maximum-size
+# dummy image, reserves the encoder cache, and captures cuda graphs. measured lower bound: on an
+# 80 GB H100, Qwen3.5-9B-Base GRPO at gpu_memory_utilization=0.3939 (31.5 GB budget, 19.3 GB weights)
+# died with "No available memory for the cache blocks", so that non-kv runtime is >= 12.2 GB. 14 GB
+# holds it with margin; it is charged to the engine before the kv pool in both the planner and the
+# worker, so they size the same engine.
+_VLM_ENGINE_RESERVE_GB = 14.0
+# ceiling for a single-gpu sleep-mode vision engine whose reserve does not fit under the 0.45 cap.
+# the trainer's resident bf16 copy (same size as the engine's weights) plus 10 GB of trainer headroom
+# must still fit beside the lifted engine, so the lift can only take memory the card actually has.
+_VLM_SINGLE_GPU_UTIL_CAP = 0.62
+_TRAINER_HEADROOM_GB = 10.0
+
+
+def vision_engine_reserve_gb(model_id: str) -> float:
+    """Non-kv runtime reserve for a vision-language rollout engine; 0 for text-only models."""
+    from flash.core.catalog import supports_image_training
+
+    return _VLM_ENGINE_RESERVE_GB if supports_image_training(model_id) else 0.0
 
 
 def _round_up(value: int, multiple: int) -> int:
@@ -128,12 +148,38 @@ def _colocate_util_cap(weights_gb: float, total_vram_gb: float) -> float:
     return 0.55 if (big_weight_copy and leaves_room_for_trainer_copy) else 0.45
 
 
+def _engine_util_cap(
+    weights_gb: float,
+    fixed_gb: float,
+    total_vram_gb: float,
+    *,
+    vision_reserve_gb: float = 0.0,
+    single_rank_sleep: bool = False,
+) -> float:
+    """The colocated engine's utilization ceiling, shared by the planner and the worker.
+
+    ``fixed_gb`` is everything the engine holds before kv: weights, adapter, and the vision reserve.
+    The standard cap applies unless a single-gpu sleep-mode vision engine cannot fit its fixed cost
+    plus the minimum kv pool under it; only then is the cap lifted, never beyond what leaves the
+    trainer's resident copy and its headroom free.
+    """
+    cap = _colocate_util_cap(weights_gb, total_vram_gb)
+    card_gb = max(1.0, total_vram_gb)
+    if not (vision_reserve_gb > 0 and single_rank_sleep):
+        return cap
+    if cap * card_gb >= fixed_gb + _KV_CAP:
+        return cap
+    room = (card_gb - weights_gb - _TRAINER_HEADROOM_GB) / card_gb
+    return max(cap, min(_VLM_SINGLE_GPU_UTIL_CAP, room))
+
+
 def _capped_engine_util(
     weights_gb: float,
     adapter_gb: float,
     requested_kv_gb: float,
     total_vram_gb: float,
     util_cap: float,
+    reserve_gb: float = 0.0,
 ) -> float:
     """Fit weights, adapter, then KV into vllm's capped share of one card."""
     card_gb = max(1.0, total_vram_gb)
@@ -143,8 +189,10 @@ def _capped_engine_util(
     # fitted_kv_gb makes that loss visible instead of incidentally subtracting adapter bytes from a
     # weights-plus-kv fraction. if weights plus adapter alone exceed the cap, kv reaches zero and the
     # returned cap truthfully exposes that this engine shape has no viable cache budget.
-    fitted_kv_gb = max(0.0, min(requested_kv_gb, max_engine_gb - weights_gb - adapter_gb))
-    fitted_engine_gb = weights_gb + adapter_gb + fitted_kv_gb
+    fitted_kv_gb = max(
+        0.0, min(requested_kv_gb, max_engine_gb - weights_gb - adapter_gb - reserve_gb)
+    )
+    fitted_engine_gb = weights_gb + adapter_gb + reserve_gb + fitted_kv_gb
     return min(util_cap, fitted_engine_gb / card_gb)
 
 
@@ -158,8 +206,10 @@ def grpo_kv_floor_gb(
     lora_rank: int = 0,
     tensor_parallel: int = 1,
     rollout_cache_min_gb: float = 0.0,
+    vision_reserve_gb: float = 0.0,
+    sleep_mode: bool = True,
 ) -> int:
-    """Smallest card whose cap holds rank-local weights, adapter, and half the KV pool."""
+    """Smallest card whose cap holds rank-local weights, adapter, vision reserve, and half the KV."""
     from flash.engine.plan.vram import _lora_weight_memory_gb
 
     kv_params_b = float(active_params_b) if active_params_b else float(params_b)
@@ -174,11 +224,20 @@ def grpo_kv_floor_gb(
         model_info=model_info,
         rollout_cache_min_gb=rollout_cache_min_gb,
     )
-    need = weights_gb + adapter_gb + 0.5 * kv_gb
-    lower = math.ceil(need / 0.55)
+    fixed_gb = weights_gb + adapter_gb + vision_reserve_gb
+    need = fixed_gb + 0.5 * kv_gb
+    single_rank_sleep = tp_size == 1 and sleep_mode
+    lower = math.ceil(need / max(0.55, _VLM_SINGLE_GPU_UTIL_CAP))
     upper = math.ceil(need / 0.45)
     for total_vram_gb in range(lower, upper + 1):
-        if _colocate_util_cap(weights_gb, total_vram_gb) * total_vram_gb >= need:
+        cap = _engine_util_cap(
+            weights_gb,
+            fixed_gb,
+            total_vram_gb,
+            vision_reserve_gb=vision_reserve_gb,
+            single_rank_sleep=single_rank_sleep,
+        )
+        if cap * total_vram_gb >= need:
             return total_vram_gb
     return upper
 
@@ -195,6 +254,7 @@ def colocate_kv_util(
     tensor_parallel: int = 1,
     lora_rank: int = 0,
     rollout_cache_min_gb: float = 0.0,
+    vision_reserve_gb: float = 0.0,
 ) -> float:
     """vllm_gpu_memory_utilization for one colocated rollout tensor-parallel rank.
 
@@ -216,7 +276,13 @@ def colocate_kv_util(
     # 0.45 starves KV for >=60 GB colocated weight copies on cards with residual headroom.
     # lift to 0.55 only when `0.45 * total_vram_gb - weight_copy_gb >= 10`; this admits B200
     # but not H200. `_NvidiaSmiPeakSampler` verifies runtime headroom.
-    util_cap = _colocate_util_cap(weights_gb, total_vram_gb)
+    util_cap = _engine_util_cap(
+        weights_gb,
+        weights_gb + adapter_gb + vision_reserve_gb,
+        total_vram_gb,
+        vision_reserve_gb=vision_reserve_gb,
+        single_rank_sleep=tp_size == 1 and sleep_mode,
+    )
     kv_gb = _resident_kv_gb(
         kv_params_b,
         vllm_max_len,
@@ -228,7 +294,9 @@ def colocate_kv_util(
     # Sleep mode keeps a larger pool (1.5x margin): the engine is offloaded during the backward, so a
     # bigger rollout-phase KV does not compete with the training peak.
     kv_pool_gb = max(_KV_CAP, kv_gb * (1.5 if sleep_mode else 1.0))
-    sized = _capped_engine_util(weights_gb, adapter_gb, kv_pool_gb, total_vram_gb, util_cap)
+    sized = _capped_engine_util(
+        weights_gb, adapter_gb, kv_pool_gb, total_vram_gb, util_cap, vision_reserve_gb
+    )
     # Resident engines always retain a minimum allocation. Sleeping engines need it only when
     # tensor parallelism shrinks each rank's weight budget below the engine's runtime overhead.
     return max(_MIN_ENGINE_UTIL, sized) if not sleep_mode or tp_size > 1 else sized

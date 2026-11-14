@@ -39,6 +39,15 @@ _RETRIABLE_VERL_CHILD_SIGNATURES = (
     "uncorrectable ECC error encountered",
 )
 
+# the rollout engine never started: vllm could not size its kv pool, or its engine core failed to
+# initialize. verl's driver does not exit on these, so the worker would otherwise keep heartbeating
+# at step 0 while billing (an 80 GB H100 GRPO run sat 20 minutes this way); they end the run at once.
+# deliberately startup-only: EngineDeadError also appears during an ordinary end-of-run teardown.
+_FATAL_ROLLOUT_ENGINE_SIGNATURES = (
+    "No available memory for the cache blocks",
+    "Engine core initialization failed",
+)
+
 
 def _backend_common():
     """The parent module, imported lazily because it imports this one.
@@ -68,8 +77,13 @@ class ChildOutputTail:
         self._cuda_oom_evidence: str | None = None
         self._cuda_oom_allocation_detail: str | None = None
         self._host_ram_kill_evidence: str | None = None
+        self._fatal_engine_signature: str | None = None
 
     def record(self, line: str) -> None:
+        if self._fatal_engine_signature is None:
+            self._fatal_engine_signature = next(
+                (sig for sig in _FATAL_ROLLOUT_ENGINE_SIGNATURES if sig in line), None
+            )
         if self._retriable_infra_signature is None:
             self._retriable_infra_signature = next(
                 (signature for signature in _RETRIABLE_VERL_CHILD_SIGNATURES if signature in line),
@@ -106,6 +120,11 @@ class ChildOutputTail:
     def retriable_infra_signature(self) -> str | None:
         """the first stable retriable-infrastructure signature observed in child output."""
         return self._retriable_infra_signature
+
+    @property
+    def fatal_engine_signature(self) -> str | None:
+        """the first rollout-engine death signature observed in child output."""
+        return self._fatal_engine_signature
 
     @property
     def cuda_oom_evidence(self) -> str | None:
@@ -385,7 +404,14 @@ class VerlChildSilenceWatchdog:
         with self._lock:
             alive = self._child_alive is not None and self._child_alive()
             expired = time.monotonic() - self._last_activity >= VERL_CHILD_SILENCE_SECONDS
-            if self._armed and alive and expired and self._failure is None:
+            engine_dead = self._tail.fatal_engine_signature
+            if engine_dead is not None and alive and self._failure is None:
+                # armed or not: an engine that died before the first step is the case that hung.
+                self._failure = f"rollout_engine_failed: {engine_dead}"
+                if not self._tore_down:
+                    self._tore_down = True
+                    teardown = self._teardown
+            elif self._armed and alive and expired and self._failure is None:
                 self._failure = (
                     "verl_child_silence: no distinct child output or parent work completed for "
                     f"{VERL_CHILD_SILENCE_SECONDS:.0f}s while training"

@@ -1189,6 +1189,7 @@ def test_gpu_mem_util_is_the_sized_budget_not_a_constant():
     constant look intended, and it would have to be hand-edited (i.e. re-decided) on any retune.
     """
     from flash.core.catalog import MODELS
+    from flash.engine.plan.kv_sizing import vision_engine_reserve_gb
     from flash.engine.plan.vram import colocate_kv_util
     from flash.providers.core.base import get_gpu_info
 
@@ -1203,6 +1204,7 @@ def test_gpu_mem_util_is_the_sized_budget_not_a_constant():
         fp8_kv=False,
         model_info=info,
         lora_rank=32,
+        vision_reserve_gb=vision_engine_reserve_gb(info.id),
     )
     got = rl_verl.resolve_gpu_mem_util(
         _mem_util_inp(), gpu_type="H100", n_gpus=1, fp8_kv=False, sleep_unsupported=False
@@ -1218,14 +1220,15 @@ def test_gpu_mem_util_is_the_sized_budget_not_a_constant():
         model_info=info,
         tensor_parallel=1,
         lora_rank=32,
+        vision_reserve_gb=vision_engine_reserve_gb(info.id),
     )
     assert got == want == explicit_tp_one
-    # the current 9b geometry, kv reserve, and rank-32 adapter fit inside vllm's 80 gb share.
-    assert got * 80 == pytest.approx(31.605060096)
-    assert got.hex() == "0x1.948b75ff05902p-2"
+    # the 9b weights, the 14 GB vision-language runtime reserve, a rank-32 adapter and the 12 GB
+    # sleep-mode kv pool fit inside vllm's share of an 80 GB card (the reserve lifts the 0.45 cap).
+    assert got * 80 == pytest.approx(45.605060096)
+    assert got * 80 - info.params_b * 2.0 - 14.0 >= 8.0
     # and it is genuinely NOT the old constant, so the test cannot pass on an unwired build.
     assert got != rl_verl._DEFAULT_GPU_MEM_UTIL
-    assert got < rl_verl._DEFAULT_GPU_MEM_UTIL
 
 
 def test_gpu_mem_util_sizing_reaches_the_launch_config():
@@ -1295,10 +1298,12 @@ def test_multigpu_gpu_mem_util_shards_only_weights_and_frees_the_observed_shortf
 
 def test_multigpu_gpu_mem_util_reserves_rank_local_lora_inside_vllm_without_reducing_kv():
     from flash.core.catalog import MODELS
+    from flash.engine.plan.kv_sizing import vision_engine_reserve_gb
     from flash.engine.plan.vram import _lora_weight_memory_gb, colocate_kv_util
     from flash.providers.core.base import get_gpu_info
 
     info = MODELS["Qwen/Qwen3.6-35B-A3B"]
+    reserve_gb = vision_engine_reserve_gb(info.id)
     card_gb = float(get_gpu_info("B200").vram_gb)
     adapter_gb = _lora_weight_memory_gb(64, info, tensor_parallel=2)
     assert adapter_gb == pytest.approx(6.591276032)
@@ -1312,6 +1317,7 @@ def test_multigpu_gpu_mem_util_reserves_rank_local_lora_inside_vllm_without_redu
         active_params_b=float(info.active_params_b),
         model_info=info,
         tensor_parallel=2,
+        vision_reserve_gb=reserve_gb,
     )
     got = rl_verl.resolve_gpu_mem_util(
         _mem_util_inp(
@@ -1325,11 +1331,12 @@ def test_multigpu_gpu_mem_util_reserves_rank_local_lora_inside_vllm_without_redu
         sleep_unsupported=True,
     )
 
-    # tp2 gives each rank 35 gb of weights. the resident short-context pool is the 8 gb floor, and
-    # the default tp lora layout adds 6.591276032 gb on that same rank.
-    assert got * card_gb == pytest.approx(49.591276032)
+    # tp2 gives each rank 35 gb of weights. the resident short-context pool is the 8 gb floor, the
+    # default tp lora layout adds 6.591276032 gb, and the vision-language runtime reserve 14 gb, all
+    # on that same rank and still under the 0.5 multi-rank ceiling.
+    assert got * card_gb == pytest.approx(63.591276032)
     assert got == pytest.approx(without_adapter + adapter_gb / card_gb)
-    assert got * card_gb - 35.0 - adapter_gb == pytest.approx(8.0)
+    assert got * card_gb - 35.0 - adapter_gb - reserve_gb == pytest.approx(8.0)
 
 
 def test_gpu_mem_util_preserves_current_budget_without_catalog_lora_shapes(monkeypatch):
