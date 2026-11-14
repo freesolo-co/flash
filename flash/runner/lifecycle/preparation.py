@@ -487,7 +487,14 @@ def _validate_effective_spec(public_spec: JobSpec, worker_spec: JobSpec) -> None
     # the attention-head geometry cap, so a marker cannot buy a shape those would refuse.
     from flash.providers.core.sharding import MAX_COMBINATION_CARDS
 
-    ceiling = public_count if worker_spec.authored_gpu_count is not None else MAX_COMBINATION_CARDS
+    # an authored `max_count` ceiling bounds the auto-sized shape the same way; the public count is
+    # still the placeholder 1 there, so compare against the ceiling itself.
+    if worker_spec.authored_gpu_count is not None:
+        ceiling = public_count
+    elif worker_spec.gpu.max_count:
+        ceiling = worker_spec.gpu.max_count
+    else:
+        ceiling = MAX_COMBINATION_CARDS
     if 1 <= effective_count <= ceiling:
         effective_gpu["count"] = public_gpu.get("count")
     # disk sizing, the weight-cache volume, and retry/wall-clock lifecycle policy are platform-managed

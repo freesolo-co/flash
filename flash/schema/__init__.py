@@ -474,15 +474,30 @@ def _validate_gpu_section(
             "count, and provider automatically. Delete the line; `spot = true` is the only [gpu] "
             "setting."
         )
-    gpu_spec = GpuSpec(provider="spot" if spot else "", spot=spot)
+    max_count = gpu_raw.get("max_count", 0)
+    if type(max_count) is not int or not 1 <= max_count <= 8:
+        if "max_count" in gpu_raw:
+            raise ConfigError("gpu.max_count must be an integer from 1 to 8")
+        max_count = 0
+    gpu_spec = GpuSpec(provider="spot" if spot else "", spot=spot, max_count=max_count)
 
-    # never authored: every run auto-sizes to the smallest fitting geometry-safe shape. custom runs
-    # are bounded by their placement shapes (one Spot card, or up to two Modal cards).
-    requested_gpu_count = None
+    # the card count is never authored: every run auto-sizes to the smallest fitting geometry-safe
+    # shape, at most `max_count` cards when set. custom runs are bounded by their placement shapes
+    # (one Spot card, or up to two Modal cards).
+    requested_gpu_count = max_count or None
     if algorithm == "custom":
         from flash.schema.custom import validate_custom_gpu_count
 
-        requested_gpu_count = validate_custom_gpu_count(model, gpu_spec)
+        custom_count = validate_custom_gpu_count(model, gpu_spec)
+        requested_gpu_count = (
+            custom_count
+            if requested_gpu_count is None or custom_count is None
+            else min(custom_count, requested_gpu_count)
+        )
+        if max_count and requested_gpu_count is not None:
+            # store the ceiling clipped to the custom placement shape (one Spot card, two Modal
+            # cards) so allocation's custom shape check never sees an unsupported exact width.
+            gpu_spec = replace(gpu_spec, max_count=requested_gpu_count)
     unresolved_warmstart_rank = bool(init_from_adapter) and "lora_rank" not in train_raw
     # the client cannot resolve a run id to the source adapter metadata, so rank 32 is only a
     # serialization placeholder here. keep geometry checks and reject shapes that cannot fit even at

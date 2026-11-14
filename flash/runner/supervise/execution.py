@@ -245,7 +245,7 @@ def _allocate_attempt_once(ctx: _SubmitContext, prepared):
             gpu_type=getattr(attempt_spec.gpu, "type", ""),
             gpu_type_fallbacks=getattr(attempt_spec.gpu, "type_fallbacks", ()),
             model_revision=attempt_spec.model_revision,
-            max_gpu_count=attempt_spec.authored_gpu_count,
+            max_gpu_count=attempt_spec.gpu_count_ceiling,
         )
     except UnsupportedGpuError:
         raise  # config-shaped: no gpu anywhere can run this job
