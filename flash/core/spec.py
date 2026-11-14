@@ -635,7 +635,17 @@ class JobSpec:
         `count == 1`, another `count == 1 and not type`, two checked neither. Rejoin them here so a
         consumer cannot invent a fifth spelling.
         """
-        authored = None if self.gpu_count_auto else gpu_count_of(self)
+        return None if self.gpu_count_auto else gpu_count_of(self)
+
+    @property
+    def gpu_count_ceiling(self) -> int | None:
+        """The widest card count allocation may rent: ``None`` when unbounded (auto-sized).
+
+        Combines an authored count (an exact pin, see `authored_gpu_count`) with the optional
+        ``gpu.max_count`` ceiling. Only allocation-width consumers read this; the authored count
+        keeps its own meaning for provenance, wire serialization and the preparation check.
+        """
+        authored = self.authored_gpu_count
         ceiling = self.gpu.max_count
         if ceiling:
             return ceiling if authored is None else min(authored, ceiling)

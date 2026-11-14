@@ -208,7 +208,13 @@ def run_config_from_spec(spec) -> RunConfig:
         # allocated run still reports no authored ceiling -- quoting that as auto would re-size a
         # run whose geometry is already rented and bill a different one. auto-size only while the
         # shape is still unresolved (no class chosen and the count still the placeholder).
-        gpu_count=(None if spec.gpu_count_auto and g.count == 1 and not g.type else g.count),
+        # an authored `max_count` ceiling bounds the unresolved quote exactly as it bounds
+        # allocation, so a preview never prices a shape the allocator may not rent.
+        gpu_count=(
+            (g.max_count or None)
+            if spec.gpu_count_auto and g.count == 1 and not g.type
+            else g.count
+        ),
         max_wall_seconds=g.max_wall_seconds,
         environment=spec.environment.id or None,
         save_at_steps=t.save_at_steps,

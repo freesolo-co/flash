@@ -494,6 +494,10 @@ def _validate_gpu_section(
             if requested_gpu_count is None or custom_count is None
             else min(custom_count, requested_gpu_count)
         )
+        if max_count and requested_gpu_count is not None:
+            # store the ceiling clipped to the custom placement shape (one Spot card, two Modal
+            # cards) so allocation's custom shape check never sees an unsupported exact width.
+            gpu_spec = replace(gpu_spec, max_count=requested_gpu_count)
     unresolved_warmstart_rank = bool(init_from_adapter) and "lora_rank" not in train_raw
     # the client cannot resolve a run id to the source adapter metadata, so rank 32 is only a
     # serialization placeholder here. keep geometry checks and reject shapes that cannot fit even at
