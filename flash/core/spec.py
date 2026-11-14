@@ -432,6 +432,9 @@ class GpuSpec:
     count: int = 1
     # authored alternatives after the concrete head class.
     type_fallbacks: tuple[str, ...] = ()
+    # optional authored card ceiling (1..8); 0 = none, Flash auto-sizes the card count. A job that
+    # cannot fit within the ceiling is rejected at submit, and allocation never rents wider.
+    max_count: int = 0
 
     def __post_init__(self) -> None:
         # coerce/validate here so every path (from_dict and direct construction) is guarded.
@@ -465,6 +468,8 @@ class GpuSpec:
         object.__setattr__(self, "type_fallbacks", fallbacks)
         object.__setattr__(self, "providers", providers)
         object.__setattr__(self, "count", _gpu_count(self.count))
+        if type(self.max_count) is not int or not 0 <= self.max_count <= 8:
+            raise ValueError("gpu.max_count must be an integer from 1 to 8")
 
     @property
     def acceptable_types(self) -> tuple[str, ...]:
@@ -630,7 +635,11 @@ class JobSpec:
         `count == 1`, another `count == 1 and not type`, two checked neither. Rejoin them here so a
         consumer cannot invent a fifth spelling.
         """
-        return None if self.gpu_count_auto else gpu_count_of(self)
+        authored = None if self.gpu_count_auto else gpu_count_of(self)
+        ceiling = self.gpu.max_count
+        if ceiling:
+            return ceiling if authored is None else min(authored, ceiling)
+        return authored
 
     def to_dict(self) -> dict[str, Any]:
         """return the public user-authorable job specification.
@@ -718,6 +727,9 @@ class JobSpec:
         # omit an empty field to preserve existing preparation digests.
         if not data["gpu"].get("type_fallbacks"):
             data["gpu"].pop("type_fallbacks", None)
+        # an unset card ceiling is omitted for the same reason.
+        if not data["gpu"].get("max_count"):
+            data["gpu"].pop("max_count", None)
         # omit an unstaged package so historical worker payloads and preparation digests stay stable.
         if not data["environment"].get("package"):
             data["environment"].pop("package", None)
@@ -848,6 +860,7 @@ class JobSpec:
                 network_volume_gb=volume_gb(gpu.get("network_volume_gb")),
                 count=gpu.get("count", 1),
                 type_fallbacks=gpu_type_fallbacks,
+                max_count=gpu.get("max_count", 0),
             ),
             run_id=data.get("run_id", "local"),
             thinking=coerce_bool(data.get("thinking", False)),
