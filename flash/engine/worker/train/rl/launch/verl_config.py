@@ -535,8 +535,11 @@ def resolve_gpu_mem_util(
         model_id = str(inp["model_id"])
         revision = str(inp.get("model_revision") or "")
         catalog_info = MODELS.get(model_id)
-        # Pinned revisions cannot use unverified catalog layer geometry. Runtime floors still apply.
-        info = None if revision else catalog_info
+        # Pinned revisions cannot use unverified catalog layer geometry, except the catalog's own
+        # managed revision, which that geometry describes. Runtime floors still apply.
+        from flash.engine.plan.vram import catalog_geometry_trusted
+
+        info = catalog_info if catalog_geometry_trusted(catalog_info, revision) else None
         # the ONE way the worker, the preflight and the cost estimator agree on a model's size:
         # curated catalog params_b, else the pinned commit's real HF count. the catalog answers
         # FIRST and locally, so the common path adds no network call to launch; the HF lookup is
