@@ -535,6 +535,21 @@ def _model_vram_need(
     return math.ceil(est * headroom)
 
 
+def catalog_geometry_trusted(info, model_revision: str) -> bool:
+    """Whether catalog layer geometry describes the weights a run loads.
+
+    Unpinned runs load the catalog model itself. A pin equal to the catalog's own
+    ``managed_revision`` is the exact commit the catalog row was written for (and the pin Flash
+    applies automatically), so its geometry holds too. Any other pinned revision is unverified.
+    """
+    if info is None:
+        return False
+    if not model_revision:
+        return True
+    managed = str(getattr(info, "managed_revision", "") or "")
+    return bool(managed) and model_revision == managed
+
+
 def _catalog_model_required_vram_gb(
     model_id: str,
     algorithm: str,
@@ -557,10 +572,14 @@ def _catalog_model_required_vram_gb(
     if model_revision:
         params_b, model_vocab = _validated_revision_geometry(model_id, model_revision, info)
     quant = getattr(info, "quant", "bf16") or "bf16"
-    # Recipe sizing drops unverified layer geometry for pinned revisions. Custom training
-    # uses the catalog adapter targets even for its validated immutable worker revision.
-    # Dropping them would lose the full MoE expert-state allowance at higher ranks.
-    sizing_info = info if not model_revision or algorithm == "custom" else None
+    # Recipe sizing drops unverified layer geometry for pinned revisions. The catalog's own
+    # managed revision is the commit its geometry describes, so it keeps that geometry (a
+    # GDN-hybrid such as Qwen3.5 otherwise sizes its rollout KV as all-attention, ~4.5x too
+    # large). Custom training uses the catalog adapter targets even for its validated immutable
+    # worker revision. Dropping them would lose the full MoE expert-state allowance at higher ranks.
+    sizing_info = (
+        info if catalog_geometry_trusted(info, model_revision) or algorithm == "custom" else None
+    )
     rollout_cache_min_gb = getattr(info, "rollout_cache_min_gb", 0.0)
     active_b = float(getattr(sizing_info, "active_params_b", 0.0) or 0.0)
     need = _model_vram_need(
