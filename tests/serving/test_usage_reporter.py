@@ -195,8 +195,24 @@ def test_modal_concurrency_is_per_engine_key(modal_app_module):
     expected = {
         modal_app_module._engine_concurrency(model) for model in modal_app_module.ENGINE_BY_MODEL
     }
-    expected.add((modal_app_module.MAX_INPUTS, modal_app_module.TARGET_INPUTS))
+    expected.add((modal_app_module.ROUTER_MAX_INPUTS, modal_app_module.ROUTER_TARGET_INPUTS))
     assert seen == expected
+
+
+def test_router_and_proxies_reserve_measured_cpu(modal_app_module):
+    # Modal bills reservations; production routers used ~0.24 cores while reserving 2 each.
+    router_kwargs = modal_app_module.app.function.call_args.kwargs
+    assert router_kwargs["cpu"] == 0.5
+    assert router_kwargs["memory"] == 1024
+    assert modal_app_module.ROUTER_MAX_INPUTS == 128
+    assert modal_app_module.ROUTER_TARGET_INPUTS == 96
+    proxies = [
+        call.kwargs
+        for call in modal_app_module.app.cls.call_args_list
+        if "startup_timeout" in call.kwargs and "gpu" not in call.kwargs
+    ]
+    assert proxies
+    assert all(kwargs["cpu"] == 0.5 and kwargs["memory"] == 2048 for kwargs in proxies)
 
 
 def test_lora_engine_replica_identifier_is_stable_per_instance(modal_app_module):

@@ -5,7 +5,6 @@ The public router and the separate DeepSeek deployment remain on Modal.
 """
 
 import asyncio
-import itertools
 import os
 import time
 import uuid
@@ -163,6 +162,15 @@ ROUTER_BUFFER_CONTAINERS = 1
 # Qwen engines use their own qualified max_num_seqs, not this router capacity.
 MAX_INPUTS = 64
 TARGET_INPUTS = max(1, MAX_INPUTS * 3 // 4)
+# The router is async I/O: production peaks used ~0.24 cores across ~10 routers while each
+# reserved 2. Admit more streams per router so load does not fan out into idle reservations.
+ROUTER_MAX_INPUTS = 128
+ROUTER_TARGET_INPUTS = max(1, ROUTER_MAX_INPUTS * 3 // 4)
+# Modal bills the larger of request and use; requests below are soft, so bursts still run.
+ROUTER_CPU = 0.5
+ROUTER_MEMORY_MIB = 1024
+# A Lambda/reserved proxy only forwards to its GPU VM; measured peak use is ~0.4 cores.
+PROXY_CPU = 0.5
 
 # engines enable trust_remote_code, so their secret uses an allowlist: future credentials
 # default to staying router-only. engines hydrate adapter state per request from the router-forwarded
@@ -323,7 +331,7 @@ from flash.serving.app.inference_provider import (  # noqa: E402
     modal_gpus_for,
 )
 from flash.serving.app.modal_engine import HostedModalEngine  # noqa: E402
-from flash.serving.lambda_cloud import reserved  # noqa: E402
+from flash.serving.lambda_cloud import reserved, reserved_watchdog  # noqa: E402
 from flash.serving.lambda_cloud.proxy import LambdaEngineProxy  # noqa: E402
 from flash.serving.src.engine.lora_engine import _LoraEngineImpl  # noqa: E402, F401
 
@@ -480,7 +488,7 @@ def _build_engine(
         else {
             "image": lambda_controller_image,
             "startup_timeout": LAMBDA_STARTUP_TIMEOUT_SECONDS,
-            "cpu": 1,
+            "cpu": PROXY_CPU,
             "memory": 2048,
             "nonpreemptible": True,  # Modal supports this only for CPU workloads.
             "secrets": (
@@ -536,6 +544,9 @@ RESERVED_ENGINES = (
     if reserved.enabled(reserved.MODEL, MODAL_ENVIRONMENT)
     else ()
 )
+if RESERVED_ENGINES:
+    reserved_watchdog.register_watchdog(app, lambda_controller_image, __name__)
+
 MODAL_FALLBACK_BY_MODEL: dict[str, Any] = {
     bm: _configured_engine(bm, "modal", "_ModalGPU") for bm in base_models() if bm != reserved.MODEL
 }
@@ -557,11 +568,17 @@ class _ModalEnginePool:
         from flash.serving.app.provider_selection import bind_lambda_control
 
         self._fleet, self._provider_selection = bind_lambda_control()
-        self._reserved_cycle = itertools.cycle(RESERVED_ENGINES)
+        # Watchdog-quarantined reserved workers are skipped for routing and registration.
+        self._reserved_health = reserved_watchdog.HealthView.for_engines(RESERVED_ENGINES)
+
+    async def _each_reserved(self, label, call):
+        slots = await self._reserved_health.usable()
+        await reserved_watchdog.each_slot(RESERVED_ENGINES, reserved.MODEL, slots, label, call)
 
     async def _engine_for(self, model):
         if RESERVED_ENGINES and model == reserved.MODEL:
-            return next(self._reserved_cycle)(base_model=model)
+            slot = await self._reserved_health.next_slot()
+            return RESERVED_ENGINES[slot - 1](base_model=model)
         if (
             model in MODAL_FALLBACK_BY_MODEL
             and await self._provider_selection.choose(model) == "modal"
@@ -657,13 +674,10 @@ class _ModalEnginePool:
 
     async def register(self, base_model: str, record: Any) -> None:
         if RESERVED_ENGINES and base_model == reserved.MODEL:
-            await asyncio.gather(
-                *(
-                    cls(base_model=base_model).register.remote.aio(
-                        self._record_payload(record), getattr(record, "deployment_generation", None)
-                    )
-                    for cls in RESERVED_ENGINES
-                )
+            payload = self._record_payload(record)
+            generation = getattr(record, "deployment_generation", None)
+            await self._each_reserved(
+                "register", lambda engine: engine.register.remote.aio(payload, generation)
             )
             return
         engine = await self._engine_for(base_model)
@@ -680,13 +694,11 @@ class _ModalEnginePool:
         expected_generation: str | None = None,
     ) -> None:
         if RESERVED_ENGINES and base_model == reserved.MODEL:
-            await asyncio.gather(
-                *(
-                    cls(base_model=base_model).unregister.remote.aio(
-                        org_id, model_id, expected_generation
-                    )
-                    for cls in RESERVED_ENGINES
-                )
+            # Quarantined slots are skipped: the router stops addressing the removed
+            # checkpoint, so a recovering worker cannot be asked to serve it again.
+            await self._each_reserved(
+                "unregister",
+                lambda engine: engine.unregister.remote.aio(org_id, model_id, expected_generation),
             )
             return
         from flash.serving.app.provider_selection import unregister_active
@@ -893,15 +905,15 @@ def _base_model_records() -> list:
 @app.function(
     secrets=runtime_secrets,
     region="us-east",  # keep admission, private HTTP dispatch, and serving ingress nearby
-    cpu=2,  # HTTP parsing and stream framing; the engine handles tokenization
-    memory=4096,  # reservation, not a hard cap: near-limit request bursts need additional memory
+    cpu=ROUTER_CPU,  # HTTP parsing and stream framing; the engine handles tokenization
+    memory=ROUTER_MEMORY_MIB,  # reservation, not a hard cap: request bursts can use more
     nonpreemptible=True,  # a CPU-host interruption cannot resume an open token stream
     min_containers=1,  # one warm CPU front door (hardcoded; no deploy-time knob)
     buffer_containers=ROUTER_BUFFER_CONTAINERS,
     startup_timeout=ROUTER_TIMEOUT_SECONDS + 60,  # warm active pools before accepting traffic
     timeout=ROUTER_TIMEOUT_SECONDS,  # must cover engine cold start (see ROUTER_TIMEOUT_SECONDS)
 )
-@modal.concurrent(max_inputs=MAX_INPUTS, target_inputs=TARGET_INPUTS)
+@modal.concurrent(max_inputs=ROUTER_MAX_INPUTS, target_inputs=ROUTER_TARGET_INPUTS)
 @modal.asgi_app(
     label=APP_NAME,
     # Claim the branded domain only when one is configured for this workspace; empty => omit it so the

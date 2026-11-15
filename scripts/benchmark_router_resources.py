@@ -21,10 +21,17 @@ from pathlib import Path
 
 import modal
 
-from flash.serving.app.modal_app import MAX_INPUTS, TARGET_INPUTS
+from flash.serving.app.modal_app import (
+    MAX_INPUTS,
+    ROUTER_CPU,
+    ROUTER_MAX_INPUTS,
+    ROUTER_MEMORY_MIB,
+    ROUTER_TARGET_INPUTS,
+    TARGET_INPUTS,
+)
 from flash.serving.app.modal_app import image as serving_image
 
-CANDIDATE_MEMORY_MIB = int(os.environ.get("ROUTER_BENCH_MEMORY_MIB", "4096"))
+CANDIDATE_MEMORY_MIB = int(os.environ.get("ROUTER_BENCH_MEMORY_MIB", str(ROUTER_MEMORY_MIB)))
 CANDIDATE_MEMORY_LIMIT_MIB = int(os.environ.get("ROUTER_BENCH_MEMORY_LIMIT_MIB", "0"))
 MEMORY_BURST = CANDIDATE_MEMORY_LIMIT_MIB == 0
 app = modal.App("flash-router-resource-qualification" + ("-burst" if MEMORY_BURST else ""))
@@ -194,7 +201,7 @@ def baseline():
     image=image,
     secrets=[test_secret],
     region="us-east",
-    cpu=(2, 2),
+    cpu=(ROUTER_CPU, ROUTER_CPU),
     memory=(
         CANDIDATE_MEMORY_MIB if MEMORY_BURST else (CANDIDATE_MEMORY_MIB, CANDIDATE_MEMORY_LIMIT_MIB)
     ),
@@ -203,7 +210,7 @@ def baseline():
     scaledown_window=600,
     timeout=600,
 )
-@modal.concurrent(max_inputs=MAX_INPUTS, target_inputs=TARGET_INPUTS)
+@modal.concurrent(max_inputs=ROUTER_MAX_INPUTS, target_inputs=ROUTER_TARGET_INPUTS)
 @modal.asgi_app()
 def candidate():
     return build_benchmark_router()

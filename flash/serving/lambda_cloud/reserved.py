@@ -10,6 +10,11 @@ from .transport import WorkerTransport
 MODEL = "Qwen/Qwen3.5-9B-Base"
 SECRET_NAME = "flash-reserved-h100-workers-20261112"
 SLOT_COUNT = 4
+# Holds LAMBDA_API_KEY for the reservation's own lifecycle; the watchdog uses it only to
+# reboot an existing reserved instance, never to launch or terminate one.
+RESERVATION_SECRET_NAME = "flash-h100-reservation-20261112"
+# Bounded per-worker registration: a hung worker must not hold every adapter promotion.
+REGISTER_TIMEOUT_SECONDS = 10 * 60
 
 
 def enabled(model, environment):
