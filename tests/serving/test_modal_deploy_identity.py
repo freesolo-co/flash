@@ -178,6 +178,57 @@ def test_main_9b_base_has_four_reserved_cpu_proxies_and_no_gpu_fallback(monkeypa
     assert all(cls.pinned_gpu is None for cls in module.RESERVED_ENGINES)
     assert model not in module.ENGINE_BY_MODEL
     assert model not in module.MODAL_FALLBACK_BY_MODEL
+    small = "Qwen/Qwen3.5-0.8B-Base"
+    assert list(module.EXTRA_RESERVED_ENGINES) == [small]
+    (engine,) = module.EXTRA_RESERVED_ENGINES[small]
+    assert engine.__name__ == module.model_engine_name(small) + "_ReservedH2001"
+    assert engine.reserved_slot == 1
+    assert engine.pinned_gpu is None
+    assert small not in module.ENGINE_BY_MODEL
+    assert small not in module.MODAL_FALLBACK_BY_MODEL
+
+
+def test_dev_has_no_reserved_proxies_and_no_reserved_gpu_fallback(monkeypatch):
+    _clear_deployment_environment(monkeypatch)
+    module = _import_modal_app(monkeypatch, is_local=False, environment="dev")
+    assert module.RESERVED_ENGINES == ()
+    assert module.EXTRA_RESERVED_ENGINES == {}
+    for model in ("Qwen/Qwen3.5-9B-Base", "Qwen/Qwen3.5-0.8B-Base"):
+        assert model in module.ENGINE_BY_MODEL
+        assert model not in module.MODAL_FALLBACK_BY_MODEL
+
+
+def test_extra_reserved_model_rotates_and_broadcasts_registration(monkeypatch):
+    import asyncio
+    import itertools
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock, MagicMock
+
+    _clear_deployment_environment(monkeypatch)
+    module = _import_modal_app(monkeypatch, is_local=False, environment="main")
+    small = "Qwen/Qwen3.5-0.8B-Base"
+    engines = [MagicMock() for _ in range(2)]
+    for engine in engines:
+        engine.register.remote.aio = AsyncMock()
+        engine.unregister.remote.aio = AsyncMock()
+    classes = tuple(lambda *, base_model, e=e: e for e in engines)
+    monkeypatch.setitem(module.EXTRA_RESERVED_ENGINES, small, classes)
+    pool = module._ModalEnginePool.__new__(module._ModalEnginePool)
+    pool._provider_selection = SimpleNamespace(choose=AsyncMock())
+    pool._extra_reserved_cycles = {small: itertools.cycle(classes)}
+    monkeypatch.setattr(pool, "_record_payload", lambda record: {"id": "adapter"})
+
+    async def check():
+        picked = [await pool._engine_for(small) for _ in range(4)]
+        await pool.register(small, SimpleNamespace(deployment_generation="g"))
+        await pool.unregister(small, "org", "adapter", "g")
+        return picked
+
+    assert asyncio.run(check()) == [engines[0], engines[1], engines[0], engines[1]]
+    pool._provider_selection.choose.assert_not_awaited()
+    for engine in engines:
+        engine.register.remote.aio.assert_awaited_once_with({"id": "adapter"}, "g")
+        engine.unregister.remote.aio.assert_awaited_once_with("org", "adapter", "g")
 
 
 def test_reserved_requests_rotate_without_calling_capacity_service(monkeypatch):

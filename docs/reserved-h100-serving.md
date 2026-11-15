@@ -11,3 +11,9 @@ Worker addresses, instance identities, source revisions, certificate pins and be
 The separate `flash-h100-reservation-20261112` operation owns the four instances' week-long retention. Its authoritative state and `hold_until` are in the same-named Modal Dict. Explicitly transfer lifecycle responsibility before stopping that scheduler. The reservation inventory is separate from ephemeral `flash-main-*` workers and their idle reaper.
 
 Qualify all four workers before cutover: pinned-runtime lock verification, GPU/model identity, buffered and streamed generation, cancellation, and an authenticated public-endpoint canary. Drain prior 9B Base requests before terminating old dynamic workers. Reverting the routing code restores the prior dynamic paths; review capacity and live instances before rollback.
+
+## Reserved 0.8B Base serving
+
+Production `Qwen/Qwen3.5-0.8B-Base` uses one reserved Lambda H200 worker, routed through the same reserved-proxy path. `flash/serving/lambda_cloud/reserved.py` lists each reserved model's GPU, slot count, Modal Secret and worker environment variable. The 0.8B Base worker inventory lives in the main-environment Modal Secret `flash-reserved-h200-workers-20261114` as `FLASH_RESERVED_H200_WORKERS` (one slot), and its proxy class is `..._ReservedH2001`. The proxy requires the worker to report this model, the pinned worker revision and `H200`.
+
+Like 9B Base, it has no Modal GPU fallback in main or dev, main forbids automatic Lambda allocation, and development keeps a scale-to-zero Lambda-only path on smaller qualified GPUs. Provision, qualify and create the secret before deploying this routing to main; until then production requests for this model fail closed.

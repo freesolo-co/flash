@@ -111,10 +111,10 @@ class Fleet:
         return {"id": ids[0], "status": "booting"}
 
     async def _check_capacity(self, model, revision):
-        from .reserved import MODEL as RESERVED_MODEL
+        from .reserved import MODELS as RESERVED_MODELS
 
-        if model == RESERVED_MODEL and self.environment == "main":
-            raise NoCapacityError("9B Base is reserved; automatic GPU allocation is disabled")
+        if model in RESERVED_MODELS and self.environment == "main":
+            raise NoCapacityError(f"{model} is reserved; automatic GPU allocation is disabled")
         # Modal normally enforces this. Include uncertain/orphan launches so a
         # replacement CPU replica cannot silently exceed its GPU budget.
         instances = await self.api.call("GET", "instances")
@@ -135,7 +135,7 @@ class Fleet:
                 allocated += 1
                 if record["revision"] == revision:
                     occupied += 1
-        if model == RESERVED_MODEL:
+        if model in RESERVED_MODELS:
             from .pool_capacity import HANDOFF_SURGE
 
             # Dev has no Modal fallback, but draining releases and uncertain

@@ -130,6 +130,7 @@ def test_public_rows_prune_unset_serving_capacity_fields():
 def test_serving_repos_cover_public_catalog_and_hosted_activation() -> None:
     assert SERVING_MODEL_REPOS == {
         "Qwen/Qwen3.5-0.8B": "Qwen/Qwen3.5-0.8B",
+        "Qwen/Qwen3.5-0.8B-Base": "Qwen/Qwen3.5-0.8B-Base",
         "Qwen/Qwen3.5-4B": "Qwen/Qwen3.5-4B",
         "Qwen/Qwen3.5-9B": "Freesolo-Co/Qwen3.5-9B-FP8",
         "Qwen/Qwen3.5-9B-Base": "Qwen/Qwen3.5-9B-Base",

@@ -5,6 +5,7 @@ The public router and the separate DeepSeek deployment remain on Modal.
 """
 
 import asyncio
+import itertools
 import os
 import time
 import uuid
@@ -120,38 +121,11 @@ HOSTING_CACHE_MOUNT = "/vol/hosting-cache"
 # doesn't; there is nothing to tune at deploy time. Every value is the proven default. (The wiring
 # below — HF/internal key, backend + Supabase URLs — stays env-configured because it is per-deploy
 # credentials, not tuning.)
-# Hosted models use their qualified GPU tier from the catalog. The slowest measured
-# cold boot is 1821s (27b); retain
-# its 2100s idle window so warm replicas survive normal gaps between requests.
-SCALEDOWN_WINDOW_SECONDS_BY_GPU: dict[str, int] = {
-    "L4": 2100,
-    "L40S": 2100,
-    "H100": 2100,
-    "H200": 2100,
-    "A10G": 2100,
-    "A100-80GB": 2100,
-}
-# The tiers this app is allowed to run an engine on. `gpu` in the serving catalog is a plain string,
-# so a typo ("b200", "B2OO") or an unvalidated new card used to fall through `dict.get` to a default
-# window and deploy anyway, at that card's real hourly rate. Membership here is the one gate.
-SUPPORTED_GPUS: frozenset[str] = frozenset(SCALEDOWN_WINDOW_SECONDS_BY_GPU)
-
-
-def scaledown_window_for(gpu: str) -> int:
-    """Idle seconds before ``gpu``'s engine containers scale down (see the table above).
-
-    Raises ``ValueError`` for a tier this app has no window for, rather than silently applying a
-    default to an unrecognized card.
-    """
-    try:
-        return SCALEDOWN_WINDOW_SECONDS_BY_GPU[gpu]
-    except KeyError:
-        supported = ", ".join(sorted(SUPPORTED_GPUS))
-        raise ValueError(
-            f"Unsupported serving GPU tier {gpu!r}; supported tiers: {supported}. "
-            "Add the tier to SCALEDOWN_WINDOW_SECONDS_BY_GPU with its measured cold-boot window."
-        ) from None
-
+from flash.serving.app.scaledown import (  # noqa: E402, F401
+    SCALEDOWN_WINDOW_SECONDS_BY_GPU,
+    SUPPORTED_GPUS,
+    scaledown_window_for,
+)
 
 # A spare GPU per active model doubles the allocation for lightly loaded pools, then
 # remains billable through the 35-minute idle window. Scale GPUs from actual demand;
@@ -385,6 +359,7 @@ def _build_engine(
     provider: str = "lambda",
     max_capacity: int = 2,
     reserved_slot: int = 0,
+    reserved_secret: str = reserved.SECRET_NAME,
 ) -> Any:
     """Register a Modal GPU engine or Lambda CPU proxy under a stable model name.
 
@@ -492,7 +467,7 @@ def _build_engine(
             "memory": 2048,
             "nonpreemptible": True,  # Modal supports this only for CPU workloads.
             "secrets": (
-                [modal.Secret.from_name(reserved.SECRET_NAME)]
+                [modal.Secret.from_name(reserved_secret)]
                 if provider == "reserved"
                 else lambda_proxy_secrets
             ),
@@ -529,26 +504,43 @@ ENGINE_BY_MODEL: dict[str, Any] = {
     for bm in base_models()
     if not reserved.enabled(bm, MODAL_ENVIRONMENT)
 }
-RESERVED_ENGINES = (
-    tuple(
+
+
+def _reserved_engines(bm):
+    """One single-container CPU proxy class per reserved worker slot."""
+    fleet = reserved.fleet_for(bm)
+    return tuple(
         _build_engine(
-            "H100",
-            model_engine_name(reserved.MODEL) + f"_ReservedH100{slot}",
-            *_engine_concurrency(reserved.MODEL),
+            fleet.gpu,
+            model_engine_name(bm) + reserved.engine_name_suffix(bm, slot),
+            *_engine_concurrency(bm),
             provider="reserved",
             max_capacity=1,
             reserved_slot=slot,
+            reserved_secret=fleet.secret_name,
         )
-        for slot in range(1, 5)
+        for slot in range(1, fleet.slots + 1)
     )
-    if reserved.enabled(reserved.MODEL, MODAL_ENVIRONMENT)
-    else ()
+
+
+RESERVED_ENGINES = (
+    _reserved_engines(reserved.MODEL) if reserved.enabled(reserved.MODEL, MODAL_ENVIRONMENT) else ()
 )
 if RESERVED_ENGINES:
     reserved_watchdog.register_watchdog(app, lambda_controller_image, __name__)
+# Other reserved fleets route round-robin without the 9B Base watchdog, which owns
+# that fleet's health store and reboot key.
+EXTRA_RESERVED_ENGINES: dict[str, tuple[Any, ...]] = {
+    bm: _reserved_engines(bm)
+    for bm in base_models()
+    if bm != reserved.MODEL and reserved.enabled(bm, MODAL_ENVIRONMENT)
+}
 
+# Reserved models have no Modal GPU fallback in any environment.
 MODAL_FALLBACK_BY_MODEL: dict[str, Any] = {
-    bm: _configured_engine(bm, "modal", "_ModalGPU") for bm in base_models() if bm != reserved.MODEL
+    bm: _configured_engine(bm, "modal", "_ModalGPU")
+    for bm in base_models()
+    if bm not in reserved.MODELS
 }
 
 
@@ -570,15 +562,28 @@ class _ModalEnginePool:
         self._fleet, self._provider_selection = bind_lambda_control()
         # Watchdog-quarantined reserved workers are skipped for routing and registration.
         self._reserved_health = reserved_watchdog.HealthView.for_engines(RESERVED_ENGINES)
+        self._extra_reserved_cycles = {
+            model: itertools.cycle(engines) for model, engines in EXTRA_RESERVED_ENGINES.items()
+        }
 
-    async def _each_reserved(self, label, call):
-        slots = await self._reserved_health.usable()
-        await reserved_watchdog.each_slot(RESERVED_ENGINES, reserved.MODEL, slots, label, call)
+    @staticmethod
+    def _is_reserved(model):
+        return bool(RESERVED_ENGINES and model == reserved.MODEL) or model in EXTRA_RESERVED_ENGINES
+
+    async def _each_reserved(self, model, label, call):
+        if model in EXTRA_RESERVED_ENGINES:
+            engines = EXTRA_RESERVED_ENGINES[model]
+            slots = range(1, len(engines) + 1)
+        else:
+            engines, slots = RESERVED_ENGINES, await self._reserved_health.usable()
+        await reserved_watchdog.each_slot(engines, model, slots, label, call)
 
     async def _engine_for(self, model):
         if RESERVED_ENGINES and model == reserved.MODEL:
             slot = await self._reserved_health.next_slot()
             return RESERVED_ENGINES[slot - 1](base_model=model)
+        if model in EXTRA_RESERVED_ENGINES:
+            return next(self._extra_reserved_cycles[model])(base_model=model)
         if (
             model in MODAL_FALLBACK_BY_MODEL
             and await self._provider_selection.choose(model) == "modal"
@@ -673,11 +678,13 @@ class _ModalEnginePool:
                 await close()
 
     async def register(self, base_model: str, record: Any) -> None:
-        if RESERVED_ENGINES and base_model == reserved.MODEL:
+        if self._is_reserved(base_model):
             payload = self._record_payload(record)
             generation = getattr(record, "deployment_generation", None)
             await self._each_reserved(
-                "register", lambda engine: engine.register.remote.aio(payload, generation)
+                base_model,
+                "register",
+                lambda engine: engine.register.remote.aio(payload, generation),
             )
             return
         engine = await self._engine_for(base_model)
@@ -693,10 +700,11 @@ class _ModalEnginePool:
         model_id: str,
         expected_generation: str | None = None,
     ) -> None:
-        if RESERVED_ENGINES and base_model == reserved.MODEL:
-            # Quarantined slots are skipped: the router stops addressing the removed
+        if self._is_reserved(base_model):
+            # Quarantined 9B Base slots are skipped: the router stops addressing the removed
             # checkpoint, so a recovering worker cannot be asked to serve it again.
             await self._each_reserved(
+                base_model,
                 "unregister",
                 lambda engine: engine.unregister.remote.aio(org_id, model_id, expected_generation),
             )
@@ -967,7 +975,10 @@ def start_all(base_model: str | None = None) -> None:
     models = [base_model] if base_model else list(base_models())
     for bm in models:
         names = (
-            [model_engine_name(bm) + f"_ReservedH100{slot}" for slot in range(1, 5)]
+            [
+                model_engine_name(bm) + reserved.engine_name_suffix(bm, slot)
+                for slot in range(1, reserved.fleet_for(bm).slots + 1)
+            ]
             if reserved.enabled(bm, MODAL_ENVIRONMENT)
             else [model_engine_name(bm)]
         )

@@ -3,7 +3,7 @@
 import re
 
 from flash.serving.app.inference_provider import policy_for
-from flash.serving.src.engine.model_config import base_models
+from flash.serving.src.engine.model_config import SMALL_QWEN_MODELS, base_models
 
 API_URL = "https://cloud.lambda.com/api/v1"
 APP_NAME = "freesolo-lambda-serving-control"
@@ -37,7 +37,10 @@ def qualified_placements(model):
         raise ValueError("Lambda placement is only defined for the hosted Qwen catalog")
     if model == "Qwen/Qwen3.6-35B-A3B":
         return ("H200", "B200")
-    if model in {"Qwen/Qwen3.5-0.8B", "Qwen/Qwen3.5-4B"}:
+    if model == "Qwen/Qwen3.5-0.8B-Base":
+        # Production serves this model from its reserved H200; development may use smaller GPUs.
+        return ("A10", "A100-80GB", "H100", "H200")
+    if model in SMALL_QWEN_MODELS:
         return ("A10", "A100-80GB", "H100")
     if model in {"Qwen/Qwen3.5-9B", "Qwen/Qwen3.5-9B-Base"}:
         return ("A100-40GB", "A100-80GB", "H100")

@@ -34,5 +34,11 @@
     "source": "https://huggingface.co/Qwen/Qwen3.5-9B-Base/resolve/68c46c4b3498877f3ef123c856ecfde50c39f404/tokenizer_config.json",
     "sha256": "a4aee8afcf2e0711942cf848899be66016f8d14a889ff9ede07bca099c28f715",
     "file": "Qwen3.5-9B-Base.jinja"
+  },
+  "Qwen/Qwen3.5-0.8B-Base": {
+    "revision": "dc7cdfe2ee4154fa7e30f5b51ca41bfa40174e68",
+    "source": "https://huggingface.co/Qwen/Qwen3.5-0.8B-Base/resolve/dc7cdfe2ee4154fa7e30f5b51ca41bfa40174e68/tokenizer_config.json",
+    "sha256": "273d8e0e683b885071fb17e08d71e5f2a5ddfb5309756181681de4f5a1822d80",
+    "file": "Qwen3.5-0.8B-Base.jinja"
   }
 }

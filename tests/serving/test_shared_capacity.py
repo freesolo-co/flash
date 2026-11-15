@@ -18,7 +18,7 @@ def exercise_dynamic_policy(monkeypatch):
     # These tests exercise the general four-slot handoff algorithm. The production
     # reserved-model exclusion is covered separately in test_reserved_h100.py.
     monkeypatch.setattr(
-        "flash.serving.lambda_cloud.pool_capacity.RESERVED_MODEL", "reserved-test-only"
+        "flash.serving.lambda_cloud.pool_capacity.RESERVED_MODELS", ("reserved-test-only",)
     )
 
 

@@ -23,6 +23,7 @@ from flash.serving.src.engine.model_config import (
 def test_catalog_has_only_canary_qualified_active_models() -> None:
     assert set(base_models()) == {
         "Qwen/Qwen3.5-0.8B",
+        "Qwen/Qwen3.5-0.8B-Base",
         "Qwen/Qwen3.5-4B",
         "Qwen/Qwen3.5-9B",
         "Qwen/Qwen3.5-9B-Base",
