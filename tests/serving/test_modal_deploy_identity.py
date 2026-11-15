@@ -182,7 +182,6 @@ def test_main_9b_base_has_four_reserved_cpu_proxies_and_no_gpu_fallback(monkeypa
 
 def test_reserved_requests_rotate_without_calling_capacity_service(monkeypatch):
     import asyncio
-    import itertools
     from types import SimpleNamespace
     from unittest.mock import AsyncMock
 
@@ -190,8 +189,13 @@ def test_reserved_requests_rotate_without_calling_capacity_service(monkeypatch):
     module = _import_modal_app(monkeypatch, is_local=False, environment="main")
     pool = module._ModalEnginePool.__new__(module._ModalEnginePool)
     pool._provider_selection = SimpleNamespace(choose=AsyncMock())
-    pool._reserved_cycle = itertools.cycle(
-        [lambda *, base_model, slot=i: (slot, base_model) for i in range(4)]
+    monkeypatch.setattr(
+        module,
+        "RESERVED_ENGINES",
+        tuple(lambda *, base_model, slot=i: (slot, base_model) for i in range(4)),
+    )
+    pool._reserved_health = module.reserved_watchdog.HealthView(
+        SimpleNamespace(get=AsyncMock(return_value=None)), range(1, 5)
     )
 
     async def check():
@@ -200,6 +204,25 @@ def test_reserved_requests_rotate_without_calling_capacity_service(monkeypatch):
     results = asyncio.run(check())
     assert [slot for slot, _ in results] == [0, 1, 2, 3, 0, 1, 2, 3]
     pool._provider_selection.choose.assert_not_awaited()
+
+
+@pytest.mark.parametrize("environment", ["main", "dev"])
+def test_reserved_watchdog_is_scheduled_only_with_reserved_workers(monkeypatch, environment):
+    _clear_deployment_environment(monkeypatch)
+    module = _import_modal_app(monkeypatch, is_local=False, environment=environment)
+    secret_names = [c.args[0] for c in module.modal.Secret.from_name.call_args_list]
+    watchdog = [
+        call
+        for call in module.app.function.call_args_list
+        if call.kwargs.get("schedule") is not None and call.kwargs.get("cpu") == 0.25
+    ]
+    reserved_main = environment == "main"
+    assert hasattr(module, "reserved_h100_watchdog") is reserved_main
+    assert (module.reserved.RESERVATION_SECRET_NAME in secret_names) is reserved_main
+    assert len(watchdog) == (1 if reserved_main else 0)
+    if reserved_main:
+        assert watchdog[0].kwargs["max_containers"] == 1
+        assert watchdog[0].kwargs["nonpreemptible"] is True
 
 
 @pytest.mark.parametrize("environment", ["main", "dev"])
