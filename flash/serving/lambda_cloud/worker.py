@@ -38,10 +38,28 @@ class LambdaWorker(_LoraEngineImpl):
             os._exit(1)
 
 
+def _is_canary(body):
+    """A liveness canary: an explicit flag on a one-token base-model generation.
+
+    Only the router and the watchdog hold the worker token, and the router never sets this
+    top-level flag, so it cannot be used to jump the request queue.
+    """
+    if body.get("canary") is not True:
+        return False
+    payload, record = body.get("payload") or {}, body.get("record") or {}
+    if payload.get("max_tokens") != 1 or record.get("serve_base_model") is not True:
+        raise ValueError("a canary must be a one-token base-model generation")
+    return True
+
+
 def create_app(engine, token):
     if not token:
         raise ValueError("worker bearer token is required")
-    slots = asyncio.Semaphore(int(engine_overrides_for(engine.base_model).get("max_num_seqs", 64)))
+    max_num_seqs = int(engine_overrides_for(engine.base_model).get("max_num_seqs", 64))
+    # Hold one engine sequence back for the liveness canary so a worker saturated by long,
+    # healthy generations still answers it promptly; only a hung engine fails the probe.
+    slots = asyncio.Semaphore(max(1, max_num_seqs - 1))
+    canary_slots = asyncio.Semaphore(1)
     active = set()
     leases = GenerationLeases(
         2 * int(engine_overrides_for(engine.base_model).get("max_num_seqs", 64))
@@ -107,7 +125,7 @@ def create_app(engine, token):
         generation_id = body.get("generation_id")
         if not isinstance(generation_id, str) or not generation_id:
             raise ValueError("generation id is required")
-        async with slots:
+        async with canary_slots if _is_canary(body) else slots:
             if generation_id in active:
                 raise ValueError("generation id is already running")
             await leases.check(generation_id)

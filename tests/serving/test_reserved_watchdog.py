@@ -81,6 +81,7 @@ def test_canary_matches_worker_schemas():
     assert record.model_id == reserved.MODEL
     assert payload.max_tokens == 1
     assert payload.generation_id == body["generation_id"]
+    assert body["canary"] is True
 
 
 @pytest.mark.anyio
@@ -138,6 +139,78 @@ async def test_health_view_caches_and_keeps_last_view_on_store_error():
     store.get = AsyncMock(side_effect=RuntimeError("dict unavailable"))
     now[0] += wd.ROUTER_CACHE_SECONDS
     assert await view.usable() == [1, 2, 3]
+
+
+def _hung_factory(hung_suffixes):
+    def factory(ip, tls):
+        hung = ip.endswith(tuple(hung_suffixes))
+
+        async def call(path, body=None):
+            if path == "/health":
+                return {"ok": True, "engine_dead": False}
+            if hung:
+                await asyncio.sleep(10)
+            return {"request_id": body["generation_id"]}
+
+        return MagicMock(call=call, aclose=AsyncMock())
+
+    return factory
+
+
+async def _run_until_reboot_due(factory, store, api):
+    now = [0.0]
+    reports = []
+    for _ in range(int(wd.RESTART_AFTER_UNHEALTHY_SECONDS / wd.WATCHDOG_PERIOD_SECONDS) + 2):
+        reports.append(
+            await wd.run_once(
+                workers(),
+                store,
+                api,
+                reserved.MODEL,
+                transport_factory=factory,
+                clock=lambda: now[0],
+            )
+        )
+        now[0] += wd.WATCHDOG_PERIOD_SECONDS
+    return reports
+
+
+@pytest.mark.anyio
+async def test_no_reboot_when_every_worker_fails_the_probe(monkeypatch):
+    # Fleet-wide saturation or a watchdog network fault: never reboot the whole fleet.
+    monkeypatch.setattr(wd, "CANARY_TIMEOUT_SECONDS", 0.05)
+    store, api = MemoryStore(), AsyncMock()
+    reports = await _run_until_reboot_due(_hung_factory([".1", ".2", ".3", ".4"]), store, api)
+    api.call.assert_not_awaited()
+    assert all(not r["restart"] for report in reports for r in report.values())
+    assert all(wd.SlotState.load(store.data[s]).restarted_at is None for s in range(1, 5))
+
+
+@pytest.mark.anyio
+async def test_at_most_one_reboot_per_cycle(monkeypatch):
+    monkeypatch.setattr(wd, "CANARY_TIMEOUT_SECONDS", 0.05)
+    store, api = MemoryStore(), AsyncMock()
+    reports = await _run_until_reboot_due(_hung_factory([".3", ".4"]), store, api)
+    assert all(sum(r["restart"] for r in report.values()) <= 1 for report in reports)
+    # The deferred worker is rebooted on the following cycle, not dropped.
+    rebooted = [c.args[2]["instance_ids"] for c in api.call.await_args_list]
+    assert rebooted == [["inst-3"], ["inst-4"]]
+
+
+@pytest.mark.anyio
+async def test_health_view_does_not_block_routing_on_a_slow_store(monkeypatch):
+    monkeypatch.setattr(wd, "ROUTER_REFRESH_TIMEOUT_SECONDS", 0.05)
+    store = MemoryStore({4: wd.SlotState(healthy=False).dump()})
+    now = [0.0]
+    view = wd.HealthView(store, range(1, 5), clock=lambda: now[0])
+    assert await view.usable() == [1, 2, 3]
+
+    async def stalled(slot):
+        await asyncio.sleep(10)
+
+    store.get = stalled
+    now[0] += wd.ROUTER_CACHE_SECONDS
+    assert await asyncio.wait_for(view.usable(), 1) == [1, 2, 3]
 
 
 def _pool(mod, engines, usable):

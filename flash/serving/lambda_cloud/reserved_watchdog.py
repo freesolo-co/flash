@@ -28,6 +28,8 @@ RESTART_AFTER_UNHEALTHY_SECONDS = 10 * 60
 # until a restarted worker has had time to come back.
 RESTART_COOLDOWN_SECONDS = 30 * 60
 ROUTER_CACHE_SECONDS = 15
+# Upper bound on how long a routed request can wait for a health-state refresh.
+ROUTER_REFRESH_TIMEOUT_SECONDS = 1.0
 
 
 @dataclass
@@ -102,6 +104,9 @@ def canary_request(model):
         },
         "expected_checkpoint": None,
         "generation_id": generation_id,
+        # Admitted through the worker's reserved canary lane, not the request queue, so a
+        # worker busy with long healthy generations is not mistaken for a hung one.
+        "canary": True,
     }
 
 
@@ -132,11 +137,22 @@ async def run_once(workers, store, lambda_api, model, *, transport_factory, cloc
             await transport.aclose()
 
     results = await asyncio.gather(*(check(w) for w in workers))
+    # Reboot only a worker whose failure is its own: another worker must have passed this
+    # cycle (so the probe path itself works), and at most one reboot per cycle, so a shared
+    # cause such as fleet-wide saturation or a watchdog network fault never reboots them all.
+    any_passed = any(ok for _, (ok, _) in results)
+    rebooted = False
     report = {}
     for worker, (ok, error) in results:
         slot = worker["slot"]
-        state, restart = advance(SlotState.load(await store.get(slot)), ok, clock(), error)
+        previous = SlotState.load(await store.get(slot))
+        state, restart = advance(previous, ok, clock(), error)
+        if restart and (rebooted or not any_passed):
+            restart = False
+            state.restarted_at = previous.restarted_at  # still due next cycle
+            state.last_error = f"reboot deferred: {state.last_error}"[:200]
         if restart:
+            rebooted = True
             try:
                 await lambda_api.call(
                     "POST",
@@ -267,8 +283,12 @@ class HealthView:
         if self._clock() >= self._expires:
             self._expires = self._clock() + ROUTER_CACHE_SECONDS
             try:
-                states = {s: await self._store.get(s) for s in self._slots}
-                self._usable = routable_slots(states, self._slots)
+                # Inference waits on this refresh, so bound it; a slow store keeps the last view.
+                async with asyncio.timeout(ROUTER_REFRESH_TIMEOUT_SECONDS):
+                    values = await asyncio.gather(*(self._store.get(s) for s in self._slots))
+                self._usable = routable_slots(
+                    dict(zip(self._slots, values, strict=True)), self._slots
+                )
             except Exception as exc:  # keep the last known view
                 print(f"reserved H100 health read failed: {exc!r}", flush=True)
         return self._usable
