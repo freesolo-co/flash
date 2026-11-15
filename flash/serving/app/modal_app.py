@@ -163,6 +163,15 @@ ROUTER_BUFFER_CONTAINERS = 1
 # Qwen engines use their own qualified max_num_seqs, not this router capacity.
 MAX_INPUTS = 64
 TARGET_INPUTS = max(1, MAX_INPUTS * 3 // 4)
+# The router is async I/O: production peaks used ~0.24 cores across ~10 routers while each
+# reserved 2. Admit more streams per router so load does not fan out into idle reservations.
+ROUTER_MAX_INPUTS = 128
+ROUTER_TARGET_INPUTS = max(1, ROUTER_MAX_INPUTS * 3 // 4)
+# Modal bills the larger of request and use; requests below are soft, so bursts still run.
+ROUTER_CPU = 0.5
+ROUTER_MEMORY_MIB = 1024
+# A Lambda/reserved proxy only forwards to its GPU VM; measured peak use is ~0.4 cores.
+PROXY_CPU = 0.5
 
 # engines enable trust_remote_code, so their secret uses an allowlist: future credentials
 # default to staying router-only. engines hydrate adapter state per request from the router-forwarded
@@ -480,7 +489,7 @@ def _build_engine(
         else {
             "image": lambda_controller_image,
             "startup_timeout": LAMBDA_STARTUP_TIMEOUT_SECONDS,
-            "cpu": 1,
+            "cpu": PROXY_CPU,
             "memory": 2048,
             "nonpreemptible": True,  # Modal supports this only for CPU workloads.
             "secrets": (
@@ -893,15 +902,15 @@ def _base_model_records() -> list:
 @app.function(
     secrets=runtime_secrets,
     region="us-east",  # keep admission, private HTTP dispatch, and serving ingress nearby
-    cpu=2,  # HTTP parsing and stream framing; the engine handles tokenization
-    memory=4096,  # reservation, not a hard cap: near-limit request bursts need additional memory
+    cpu=ROUTER_CPU,  # HTTP parsing and stream framing; the engine handles tokenization
+    memory=ROUTER_MEMORY_MIB,  # reservation, not a hard cap: request bursts can use more
     nonpreemptible=True,  # a CPU-host interruption cannot resume an open token stream
     min_containers=1,  # one warm CPU front door (hardcoded; no deploy-time knob)
     buffer_containers=ROUTER_BUFFER_CONTAINERS,
     startup_timeout=ROUTER_TIMEOUT_SECONDS + 60,  # warm active pools before accepting traffic
     timeout=ROUTER_TIMEOUT_SECONDS,  # must cover engine cold start (see ROUTER_TIMEOUT_SECONDS)
 )
-@modal.concurrent(max_inputs=MAX_INPUTS, target_inputs=TARGET_INPUTS)
+@modal.concurrent(max_inputs=ROUTER_MAX_INPUTS, target_inputs=ROUTER_TARGET_INPUTS)
 @modal.asgi_app(
     label=APP_NAME,
     # Claim the branded domain only when one is configured for this workspace; empty => omit it so the
