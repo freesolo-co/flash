@@ -143,4 +143,9 @@ def openai_generate_fields(request: NormalizedChatRequest, model_id: str) -> dic
         "tools": None if request.tools is None else [tool.wire() for tool in request.tools],
         "tool_choice": request.tool_choice,
         "parallel_tool_calls": request.parallel_tool_calls,
+        **(
+            {"logprob_token_ids": list(request.logprob_token_ids)}
+            if request.logprob_token_ids is not None
+            else {}
+        ),
     }

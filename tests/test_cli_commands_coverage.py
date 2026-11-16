@@ -303,6 +303,25 @@ def test_chat_logprobs_prints_full_json(monkeypatch, capsys, flags, expected_k) 
     assert captured.err == ""
 
 
+def test_chat_logprob_token_ids_forward_to_the_client(monkeypatch, capsys) -> None:
+    seen: dict = {}
+
+    class ChatClient:
+        def chat(self, target, **kwargs):
+            seen.update(kwargs)
+            return {"choices": []}
+
+    monkeypatch.setattr(deploy_commands, "client_from_config", ChatClient)
+    args = cli._build_parser().parse_args(
+        ["models", "chat", "flash-1/final", "-m", "hi", "--logprob-token-ids", "32,33"]
+    )
+    assert args.func(args) == 0
+    assert seen["logprobs"] is True
+    assert seen["top_logprobs"] == 0
+    assert seen["logprob_token_ids"] == [32, 33]
+    assert json.loads(capsys.readouterr().out) == {"choices": []}
+
+
 @pytest.mark.parametrize("value", ["-1", "21", "1.5"])
 def test_chat_parser_rejects_invalid_top_logprobs(value) -> None:
     with pytest.raises(SystemExit):

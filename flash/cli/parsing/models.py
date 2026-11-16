@@ -32,6 +32,21 @@ def _wait_seconds(value: str) -> float:
     return seconds
 
 
+def _token_id_list(value: str) -> list[int]:
+    """Parse comma-separated candidate token ids, validated like the serving request field."""
+    from flash.serve.runtime.sampling import validate_logprob_token_ids
+
+    try:
+        token_ids = [int(part) for part in value.split(",")]
+        validated = validate_logprob_token_ids(token_ids)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(
+            f"expected comma-separated token ids such as 32,33,34, got {value!r}: {exc}"
+        ) from None
+    assert validated is not None
+    return list(validated)
+
+
 def _add_model_commands(sub: argparse._SubParsersAction) -> argparse._SubParsersAction:
     """`models list` and `gpus`, returning the `models` subparser action.
 
@@ -147,5 +162,13 @@ def _add_deployment_commands(models_sub: argparse._SubParsersAction) -> None:
         metavar="K",
         default=None,
         help="return top K token alternatives (0-20); implies --logprobs and JSON output",
+    )
+    chat.add_argument(
+        "--logprob-token-ids",
+        type=_token_id_list,
+        metavar="IDS",
+        default=None,
+        help="comma-separated token ids (1-128) whose exact log probabilities are returned at "
+        "each generated position; implies --logprobs and JSON output",
     )
     chat.set_defaults(func=cmd_chat)

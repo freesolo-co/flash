@@ -578,7 +578,15 @@ def cmd_chat(args) -> int:
     if system:
         messages.insert(0, {"role": "system", "content": system})
     top_logprobs = getattr(args, "top_logprobs", None)
-    if getattr(args, "logprobs", False) or top_logprobs is not None:
+    logprob_token_ids = getattr(args, "logprob_token_ids", None)
+    if (
+        getattr(args, "logprobs", False)
+        or top_logprobs is not None
+        or logprob_token_ids is not None
+    ):
+        candidate_kwargs = (
+            {} if logprob_token_ids is None else {"logprob_token_ids": logprob_token_ids}
+        )
         response = client.chat(
             chat_target,
             messages=messages,
@@ -586,6 +594,7 @@ def cmd_chat(args) -> int:
             max_tokens=args.max_tokens,
             logprobs=True,
             top_logprobs=top_logprobs if top_logprobs is not None else 0,
+            **candidate_kwargs,
         )
         print(json.dumps(response, indent=2))
         return 0

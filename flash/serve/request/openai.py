@@ -25,6 +25,7 @@ from flash.serve.request.validation import (
 )
 from flash.serve.runtime.sampling import (
     validate_choice_count,
+    validate_logprob_token_ids,
     validate_logprobs,
     validate_penalty,
     validate_sampling_relationships,
@@ -38,6 +39,7 @@ _ALLOWED_REQUEST_KEYS = frozenset(
         "checkpoint_id",
         "chat_template_kwargs",
         "frequency_penalty",
+        "logprob_token_ids",
         "logprobs",
         "max_tokens",
         "messages",
@@ -106,6 +108,7 @@ class NormalizedChatRequest:
     parallel_tool_calls: bool | None
     stream: bool
     stream_options: dict[str, bool] | None
+    logprob_token_ids: tuple[int, ...] | None = None
 
     @property
     def include_usage(self) -> bool:
@@ -148,11 +151,13 @@ def parse_chat_request(
         )
         logprobs = validate_logprobs(payload.get("logprobs", False))
         top_logprobs = validate_top_logprobs(payload.get("top_logprobs", 0))
+        logprob_token_ids = validate_logprob_token_ids(payload.get("logprob_token_ids"))
         validate_sampling_relationships(
             n=n,
             temperature=temperature,
             logprobs=logprobs,
             top_logprobs=top_logprobs,
+            logprob_token_ids=logprob_token_ids,
         )
     except ValueError as exc:
         raise OpenAIRequestError(str(exc)) from exc
@@ -198,6 +203,7 @@ def parse_chat_request(
         parallel_tool_calls=parallel_tool_calls,
         stream=stream,
         stream_options=_stream_options(payload.get("stream_options"), stream),
+        logprob_token_ids=logprob_token_ids,
     )
 
 

@@ -28,6 +28,7 @@ from flash.serve.request.validation import (
 from .errors import RuntimeConfigurationError
 from .sampling import (
     validate_choice_count,
+    validate_logprob_token_ids,
     validate_logprobs,
     validate_penalty,
     validate_sampling_relationships,
@@ -416,6 +417,8 @@ class GenerationRequest:
     tool_choice: str | None = None
     parallel_tool_calls: bool | None = None
     stop: Any = None
+    # exact candidate ids (normalized to a tuple) returned at each position instead of top-k.
+    logprob_token_ids: tuple[int, ...] | None = None
 
     def __post_init__(self) -> None:
         if self.adapter_id is not None:
@@ -481,11 +484,15 @@ class GenerationRequest:
         )
         object.__setattr__(self, "logprobs", validate_logprobs(self.logprobs))
         object.__setattr__(self, "top_logprobs", validate_top_logprobs(self.top_logprobs))
+        object.__setattr__(
+            self, "logprob_token_ids", validate_logprob_token_ids(self.logprob_token_ids)
+        )
         validate_sampling_relationships(
             n=self.n,
             temperature=self.temperature,
             logprobs=self.logprobs,
             top_logprobs=self.top_logprobs,
+            logprob_token_ids=self.logprob_token_ids,
         )
         object.__setattr__(
             self,

@@ -1373,3 +1373,38 @@ def test_thinking_tools_use_answer_only_and_preserve_reasoning(
     assert len(result.choices[0].tool_calls) == 1
     assert result.choices[0].tool_calls[0].arguments == '{"city":"Paris"}'
     asyncio.run(runtime.close())
+
+
+def test_packaged_engine_threads_logprob_token_ids_through_buffered_and_streaming() -> None:
+    runtime = VllmLoraRuntime(EngineConfig(model="model"))
+    asyncio.run(runtime.start())
+    engine = _Engine.latest
+    assert engine is not None
+    option_ids = list(range(100, 136))
+    candidates = {1: _Logprob(-0.05, "x")}
+    candidates.update(
+        {token_id: _Logprob(-1.0 - i, f"o{i}") for i, token_id in enumerate(option_ids)}
+    )
+    engine.responses.append([_output("x", [1], logprobs=[candidates])])
+    request = GenerationRequest(prompt="hello", logprobs=True, logprob_token_ids=option_ids)
+
+    result = asyncio.run(runtime.generate(request))
+    sampling = engine.generate_calls[0]["sampling"].kwargs
+    # top-k stays unset: vllm sizes candidate output from the id list, past max_logprobs=20.
+    assert sampling["logprobs"] is None
+    assert sampling["logprob_token_ids"] == option_ids
+    assert result.choices[0].logprobs is not None
+    top = result.choices[0].logprobs[0]["top_logprobs"]
+    assert [record["token"] for record in top] == ["x", *[f"o{i}" for i in range(36)]]
+
+    engine.responses.append([_output("x", [1], logprobs=[candidates])])
+
+    async def collect():
+        return [event async for event in runtime.stream(request)]
+
+    events = asyncio.run(collect())
+    assert engine.generate_calls[1]["sampling"].kwargs["logprob_token_ids"] == option_ids
+    delta = next(event for event in events if isinstance(event, StreamDelta))
+    assert delta.logprobs is not None
+    assert len(delta.logprobs[0]["top_logprobs"]) == 37
+    asyncio.run(runtime.close())
