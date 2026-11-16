@@ -8,7 +8,12 @@ from flash.providers.core.base import Allocation
 
 
 def _cheapest_allocation(
-    candidates, *, need: float, cost_per_step, provider_rank: dict[str, int]
+    candidates,
+    *,
+    need: float,
+    cost_per_step,
+    provider_rank: dict[str, int],
+    preferred_width: int | None = None,
 ) -> Allocation:
     """The cheapest-JOB shape from a non-empty fitting set, plus the full ranking behind it.
 
@@ -22,6 +27,9 @@ def _cheapest_allocation(
     name. Sorting is stable, so provider and provider-local order apply only when every explicit key
     matches. A run the cost model cannot price (``cost_per_step`` is ``None``) falls back to total
     $/hr.
+
+    ``preferred_width`` (an auto-sized Lambda run) ranks Lambda shapes wider than it after every
+    shape within it, so a wider rental is chosen only when no narrower one is rentable now.
     """
     from flash.providers.mithril.pricing import priority as spot_priority
     from flash.providers.mithril.pricing import shape_price as spot_shape_price
@@ -32,6 +40,9 @@ def _cheapest_allocation(
         candidates,
         key=lambda c: (
             provider_rank.get(c.provider, unnamed_rank),
+            preferred_width is not None
+            and c.provider == "lambda"
+            and c.gpu_count > preferred_width,
             # Spot: cheapest rental first (fixed class rate x cards), then class priority. Ranking
             # class ahead of price chose 8x H100 ($16/hr, never under its cap) over a fitting
             # 1x H200 ($2.50/hr) that was rentable now.

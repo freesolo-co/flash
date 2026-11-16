@@ -169,7 +169,7 @@ def test_authored_surface_is_exactly_what_the_public_payload_carries():
     # allocator-owned keys are not authorable but stay in the payload for digest stability (empty,
     # or the count placeholder, for authored specs; this fixture is runner-selected). An unset
     # `max_count` card ceiling is likewise absent, so existing digests are unchanged.
-    assert set(public["gpu"]) == (_GPU_KEYS | {"type", "count", "provider", "providers"}) - {
+    assert set(public["gpu"]) == (_GPU_KEYS | {"type", "count", "providers"}) - {
         "spot",
         "max_count",
     }

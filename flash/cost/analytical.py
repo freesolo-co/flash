@@ -548,7 +548,11 @@ def _offline_preferred_gpu_shape(config: RunConfig) -> tuple[str, int, int, str,
     configured = available_providers()
     # an unconfigured plane (no credentials anywhere) has nothing to filter against; fall back to the
     # registered set so the quote keeps its historical structural answer instead of going empty.
-    eligible = tuple(name for name in (configured or PROVIDER_NAMES) if name != "spot")
+    from flash.providers.core.registry import PINNED_ONLY_PROVIDERS
+
+    eligible = tuple(
+        name for name in (configured or PROVIDER_NAMES) if name not in PINNED_ONLY_PROVIDERS
+    )
     for provider in config.providers:
         if provider not in eligible:
             continue
@@ -583,10 +587,10 @@ def _offline_gpu_shape(config: RunConfig) -> tuple[str, int, int, str, float]:
     Preparation must not consume live-capacity failures before run creation. Rank rentable shapes
     offline, then replace the quote with the selected live candidate before provisioning.
     """
-    if config.providers == ("spot",):
+    if config.providers in (("spot",), ("lambda",)):
         from dataclasses import replace
 
-        return _offline_gpu_shape(replace(config, provider="spot", providers=()))
+        return _offline_gpu_shape(replace(config, provider=config.providers[0], providers=()))
     if config.providers:
         return _offline_preferred_gpu_shape(config)
     # Fail closed on a model that cannot be sized at all. Curated entries answer from the catalog
@@ -642,6 +646,10 @@ def _offline_gpu_shape(config: RunConfig) -> tuple[str, int, int, str, float]:
             from flash.providers.mithril.pricing import SPOT_GPUS
 
             counts = tuple(n for n in counts if n in SPOT_GPUS[gpu].counts)
+        elif provider == "lambda":
+            from flash.providers.lambda_.pricing import LAMBDA_GPUS
+
+            counts = tuple(n for n in counts if n in LAMBDA_GPUS[gpu].counts)
         for count in counts:
             # credit only the cards that JOIN the run, matching the allocator's `_fits`. quoting the
             # billed count here made the two disagree: a 27B at 128k over 10 rows was quoted 4x H200
@@ -657,6 +665,11 @@ def _offline_gpu_shape(config: RunConfig) -> tuple[str, int, int, str, float]:
                 from flash.providers.mithril.pricing import quote_rate
 
                 hourly = quote_rate()
+            elif provider == "lambda":
+                # offline: Lambda's static list price, never a live catalog read.
+                from flash.providers.lambda_.pricing import static_hourly_rate
+
+                hourly = static_hourly_rate(gpu)
             else:
                 hourly = get_provider("modal" if provider == "auto" else provider).hourly_rate(gpu)
             step_seconds = sharded_step_seconds(
@@ -707,6 +720,19 @@ def _spot_can_hold(config: RunConfig, need: float) -> bool:
     )
 
 
+def _lambda_can_hold(config: RunConfig, need: float) -> bool:
+    """Whether any Lambda shape, at any card count it rents, holds the run on its launched ranks."""
+    from flash.providers.core.base import GPU_INFO
+    from flash.providers.core.sharding import combined_vram_gb
+    from flash.providers.lambda_.pricing import LAMBDA_GPUS
+
+    return any(
+        combined_vram_gb(GPU_INFO[gpu].vram_gb, executed_gpu_count(config, count)) >= need
+        for gpu, shape in LAMBDA_GPUS.items()
+        for count in shape.counts
+    )
+
+
 def _raise_no_fitting_shape(
     config: RunConfig,
     need: float,
@@ -731,6 +757,10 @@ def _raise_no_fitting_shape(
         from flash.providers.mithril.pricing import spot_unsupported_message
 
         raise ValueError(spot_unsupported_message(config.model_id, config.method, need))
+    if provider == "lambda" and not config.gpu_type and not _lambda_can_hold(config, need):
+        from flash.providers.lambda_.pricing import lambda_unsupported_message
+
+        raise ValueError(lambda_unsupported_message(config.model_id, config.method, need))
     remedy = _wider_shape_remedy(config, need, names)
     if config.gpu_type:
         # name every acceptable class, not just the head: with fallbacks authored, reporting the

@@ -41,6 +41,7 @@ from flash.providers.core.fit_errors import (
     widenable_gpu_names,
 )
 from flash.providers.core.registry import (
+    PINNED_ONLY_PROVIDERS,
     PROVIDER_NAMES,
     available_providers,
     get_provider,
@@ -312,6 +313,10 @@ def _structurally_fits(available, need: int, cap: int, executed_width, acceptabl
                 from flash.providers.mithril.pricing import SPOT_GPUS
 
                 counts = tuple(n for n in counts if n in SPOT_GPUS[gpu_class.name].counts)
+            elif name == "lambda":
+                from flash.providers.lambda_.pricing import LAMBDA_GPUS
+
+                counts = tuple(n for n in counts if n in LAMBDA_GPUS[gpu_class.name].counts)
             for count in counts:
                 if combined_vram_gb(gpu_class.vram_gb, executed_width(count)) >= need:
                     return True
@@ -677,6 +682,30 @@ def _resolved_gpu_count(
     )
 
 
+def _lambda_auto_width(
+    available: tuple[str, ...],
+    authored_ceiling: int | None,
+    cap: int,
+    *,
+    model_id: str,
+    model_revision: str,
+) -> tuple[int, int | None]:
+    """``(ceiling, preferred width)`` for the live catalog query.
+
+    An auto-sized Lambda run (no authored count or class) may rent any structurally safe width,
+    because Lambda's live catalog decides what is rentable now: a run that fits one B200 must not
+    queue while that type is sold out and a fitting multi-card H100 is free. The smallest fitting
+    width (``cap``) stays the preferred one, so a wider rental is only a fallback (see
+    ``_cheapest_allocation``). Every other case keeps ``cap`` and no preference.
+    """
+    if available != ("lambda",) or authored_ceiling is not None:
+        return cap, None
+    widest = geometry_safe_gpu_cap(
+        model_id, MAX_COMBINATION_CARDS, model_revision=model_revision, certify=True
+    )
+    return max(cap, widest), cap
+
+
 def _gather_candidates(
     available: tuple[str, ...],
     *,
@@ -801,6 +830,24 @@ def _raise_no_candidate_error(
     )
 
 
+def _reject_pinned_misfit(available, need, executed_width, model_id, algorithm) -> None:
+    """Name a pinned provider's own limits before any ceiling or pin check.
+
+    The generic VRAM errors later in ``allocate`` would otherwise hide that no Spot shape (or no
+    Lambda shape -- it sells no H200) at any card count can hold this model/algorithm.
+    """
+    if available == ("spot",):
+        from flash.providers.mithril.pricing import MAX_SPOT_CARDS, spot_unsupported_message
+
+        if not _structurally_fits(("spot",), need, MAX_SPOT_CARDS, executed_width):
+            raise UnsupportedGpuError(spot_unsupported_message(model_id, algorithm, need))
+    if available == ("lambda",):
+        from flash.providers.lambda_.pricing import MAX_LAMBDA_CARDS, lambda_unsupported_message
+
+        if not _structurally_fits(("lambda",), need, MAX_LAMBDA_CARDS, executed_width):
+            raise UnsupportedGpuError(lambda_unsupported_message(model_id, algorithm, need))
+
+
 def allocate(
     model_id: str,
     algorithm: str,
@@ -859,10 +906,12 @@ def allocate(
     if provider and providers:
         raise UnsupportedGpuError("provider and providers cannot both be set")
     available = available_providers()
-    if providers == ("spot",):
-        provider = "spot"
-    if provider != "spot":
-        available = tuple(name for name in available if name != "spot")
+    if providers in (("spot",), ("lambda",)):
+        provider = providers[0]
+    # Spot and Lambda are opt-in: only a run that pins one ever allocates on it.
+    available = tuple(
+        name for name in available if name not in PINNED_ONLY_PROVIDERS or name == provider
+    )
     # kept across the narrowing below so a rejection can ask what dropping the pin would restore.
     unpinned = None
     if provider:
@@ -870,13 +919,7 @@ def allocate(
             raise UnsupportedGpuError(f"requested provider {provider!r} is not configured")
         unpinned = available
         available = (provider,)
-    if available == ("spot",):
-        # before any ceiling or pin check, whose generic VRAM errors would otherwise hide that
-        # no Spot shape at any card count can hold this model/algorithm.
-        from flash.providers.mithril.pricing import MAX_SPOT_CARDS, spot_unsupported_message
-
-        if not _structurally_fits(("spot",), need, MAX_SPOT_CARDS, executed_width):
-            raise UnsupportedGpuError(spot_unsupported_message(model_id, algorithm, need))
+    _reject_pinned_misfit(available, need, executed_width, model_id, algorithm)
 
     # allocate() is reachable directly, bypassing the parse gate entirely, so it resolves the
     # author's ceiling from the same shared predicate rather than trusting a caller to have applied
@@ -912,6 +955,9 @@ def allocate(
         executed_width=executed_width,
     )
 
+    cap, preferred_width = _lambda_auto_width(
+        available, max_gpu_count, cap, model_id=model_id, model_revision=model_revision
+    )
     constraints = AllocationConstraints(
         disk_gb=disk_gb,
         max_wall_seconds=max_wall_seconds,
@@ -950,4 +996,5 @@ def allocate(
         need=need,
         cost_per_step=None if provider == "spot" else cost_per_step,
         provider_rank=provider_rank,
+        preferred_width=preferred_width,
     )
