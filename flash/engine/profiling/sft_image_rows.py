@@ -364,16 +364,15 @@ def fit_observation_conversation(
             if completion_messages[count - 1].get("role") == "assistant"
         ]
         best: FittedObservationRow | None = None
-        low, high = 0, len(cuts) - 1
-        # rendered length grows with the prefix, so the longest fitting cut is a binary search; each
-        # candidate is still checked, so a template that drops earlier reasoning cannot overshoot.
-        while low <= high:
-            middle = (low + high) // 2
-            candidate = run(cuts[middle])
+        # rendered length is NOT monotonic in the prefix: a template that drops earlier assistant
+        # reasoning once a later observation becomes the last query (Qwen3.6 with
+        # preserve_thinking=False) can render a longer prefix shorter than a shorter one. so no
+        # oversized cut rules out a longer one; scan longest first and keep the first that fits.
+        for count in reversed(cuts):
+            candidate = run(count)
             if candidate.untruncated_length <= max_length:
-                best, low = candidate, middle + 1
-            else:
-                high = middle - 1
+                best = candidate
+                break
         if best is None and cuts:
             best = run(cuts[0])
         fitted = best or fitted

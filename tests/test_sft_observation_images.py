@@ -419,3 +419,40 @@ def test_the_decoded_memory_limit_bounds_the_whole_conversation(monkeypatch):
 
     with pytest.raises(ValueError, match="decoded"):
         _prepare()
+
+
+def test_the_longest_fitting_prefix_wins_even_when_lengths_are_not_monotonic():
+    from flash.engine.profiling.sft_image_rows import fit_observation_conversation
+
+    # a template that drops earlier reasoning can render a longer prefix SHORTER than a shorter one
+    lengths = {1: 30, 3: 1060, 5: 110, 7: 2000}
+    # the fitter sees normalized messages, whose images are {"type": "image"} blocks
+    seen_image = {"role": "user", "content": [{"type": "text", "text": "obs"}, {"type": "image"}]}
+    completion = [
+        {"role": "assistant", "content": "ACT1"},
+        seen_image,
+        {"role": "assistant", "content": "ACT2"},
+        seen_image,
+        {"role": "assistant", "content": "ACT3"},
+        seen_image,
+        {"role": "assistant", "content": "ACT4"},
+    ]
+    seen = []
+
+    def tokenize(prompt, part, used, *, package_root):
+        seen.append(len(part))
+        return [0], [1], b"", lengths[len(part)], True
+
+    fitted = fit_observation_conversation(
+        tokenize,
+        [{"role": "user", "content": "go"}],
+        completion,
+        ["a", "b", "c"],
+        package_root=None,
+        max_length=300,
+    )
+    assert len(fitted.completion_messages) == 5
+    assert fitted.descriptors == ["a", "b"]
+    assert fitted.untruncated_length == 2000
+    # the oversized middle prefix never pruned the longer one that fits
+    assert seen == [7, 5]
