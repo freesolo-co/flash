@@ -248,6 +248,20 @@ def _persist_effective_worker_spec(worker_spec: JobSpec) -> bool:
     )
 
 
+def _lambda_submission_scope(spec: JobSpec) -> str | None:
+    """The Lambda account that may own this run's launches, recorded before any provisioning.
+
+    Lambda is pinned-only, so only a run that names it can own a Lambda launch; recording it for
+    every run would let a key rotation block unrelated Modal and Spot runs.
+    """
+    from flash.providers.core.registry import available_providers
+
+    pinned = (spec.gpu.provider.strip().lower(), *spec.gpu.providers)
+    if "lambda" not in pinned or "lambda" not in available_providers():
+        return None
+    return lambda_scope_fingerprint()
+
+
 def _spot_tariff(spec: JobSpec) -> dict[str, float] | None:
     """Spot rates this run is quoted under, recorded so settlement never uses later rates."""
     gpu = getattr(spec, "gpu", None)
@@ -363,13 +377,7 @@ def _submit_prepared_job(
         submitted_spot_scope=(
             spot_scope_fingerprint() if "spot" in available_providers() else None
         ),
-        # Lambda is pinned-only, so only a run that names it can own a Lambda launch.
-        submitted_lambda_scope=(
-            lambda_scope_fingerprint()
-            if "lambda" in (public_spec.gpu.provider.strip().lower(), *public_spec.gpu.providers)
-            and "lambda" in available_providers()
-            else None
-        ),
+        submitted_lambda_scope=_lambda_submission_scope(public_spec),
         submitted_instance_providers=[n for n in available_providers() if n in INSTANCE_PROVIDERS],
         submitted_spot_rates=_spot_tariff(public_spec),
     )

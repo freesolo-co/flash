@@ -1106,6 +1106,31 @@ def test_recorded_lambda_scope_blocks_recovery_from_another_account(monkeypatch)
         require_recorded_scope(status)
 
 
+@pytest.mark.parametrize(
+    ("gpu", "recorded"),
+    [
+        ({"provider": "lambda"}, True),
+        ({"provider": " Lambda "}, True),
+        ({"providers": ("lambda",)}, True),
+        ({"provider": "modal"}, False),
+        ({}, False),
+    ],
+)
+def test_submit_records_the_lambda_account_only_for_lambda_pinned_runs(monkeypatch, gpu, recorded):
+    from flash.core.spec import GpuSpec, JobSpec
+    from flash.runner.lifecycle import submit
+
+    monkeypatch.setattr(
+        "flash.providers.core.registry.available_providers", lambda: ("modal", "lambda")
+    )
+    spec = JobSpec(run_id="flash-test", model="Qwen/Qwen3.5-9B-Base", gpu=GpuSpec(**gpu))
+    expected = config.scope_fingerprint() if recorded else None
+    assert submit._lambda_submission_scope(spec) == expected
+    # a plane without Lambda configured records nothing (it cannot launch there)
+    monkeypatch.setattr("flash.providers.core.registry.available_providers", lambda: ("modal",))
+    assert submit._lambda_submission_scope(spec) is None
+
+
 def test_metering_bills_the_rented_lambda_instance_price(monkeypatch):
     from flash.runner.accounting import costs
     from flash.runner.lifecycle.status import rented_shape_key
