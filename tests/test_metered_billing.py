@@ -322,10 +322,9 @@ def test_a_legacy_worker_without_a_meter_pays_its_measured_fallback(tmp_path, mo
 # ---------------------------------------------------------------------------- estimator
 
 
-def test_image_sft_quotes_vision_encoding_per_example():
+def _image_run_config(**overrides):
     from dataclasses import replace
 
-    from flash.cost.analytical import SFT_IMAGE_S_PER_EXAMPLE, estimate_cost, sft_image_seconds
     from flash.cost.types import RunConfig
 
     text = RunConfig(
@@ -342,14 +341,77 @@ def test_image_sft_quotes_vision_encoding_per_example():
         sft_retained_examples=1000,
         max_wall_seconds=10**7,
     )
+    return replace(text, **overrides)
+
+
+def test_image_sft_quotes_the_image_term_per_example_at_batch_one():
+    """Every calibration run was batch 1, where a micro-batch is one example: the fit is unchanged."""
+    from dataclasses import replace
+
+    from flash.cost.analytical import (
+        SFT_IMAGE_S_PER_MICRO_BATCH,
+        estimate_cost,
+        sft_image_seconds,
+    )
+
+    text = _image_run_config()
     image = replace(text, sft_packing_mode="exact-unpacked", sft_multimodal=True)
     # text-only models that cannot pack are also trained exact-unpacked; they encode no images.
     unpacked_text = replace(text, sft_packing_mode="exact-unpacked")
     assert sft_image_seconds(unpacked_text) == 0.0
     assert sft_image_seconds(text) == 0.0
-    assert sft_image_seconds(image) == pytest.approx(1000 * SFT_IMAGE_S_PER_EXAMPLE)
+    assert sft_image_seconds(image) == pytest.approx(1000 * SFT_IMAGE_S_PER_MICRO_BATCH)
     gap = estimate_cost(image).train_seconds - estimate_cost(text).train_seconds
-    assert gap == pytest.approx(1000 * SFT_IMAGE_S_PER_EXAMPLE)
+    assert gap == pytest.approx(1000 * SFT_IMAGE_S_PER_MICRO_BATCH)
+
+
+@pytest.mark.parametrize(
+    ("batch", "steps", "micro_batches"),
+    [(1, 1000, 1000), (2, 500, 500), (4, 250, 250), (8, 125, 250), (32, 32, 256)],
+)
+def test_packed_image_sft_pays_the_image_term_once_per_micro_batch(batch, steps, micro_batches):
+    """The worker's micro-batch is at most 4, so batch 8 runs two image micro-batches per update."""
+    from flash.cost.analytical import (
+        SFT_IMAGE_S_PER_MICRO_BATCH,
+        sft_image_seconds,
+        sft_micro_batches,
+    )
+
+    image = _image_run_config(
+        steps=steps, batch_size=batch, sft_packed_blocks=steps, sft_multimodal=True
+    )
+    assert sft_micro_batches(image) == micro_batches
+    assert sft_image_seconds(image) == pytest.approx(micro_batches * SFT_IMAGE_S_PER_MICRO_BATCH)
+
+
+def test_batched_image_sft_quotes_less_training_time_for_the_same_tokens():
+    """Same rows and tokens, fewer updates and image micro-batches: a cheaper, never costlier quote."""
+    from flash.cost.analytical import estimate_cost
+
+    one = _image_run_config(sft_multimodal=True)
+    batched = _image_run_config(steps=125, batch_size=8, sft_packed_blocks=125, sft_multimodal=True)
+    saved = estimate_cost(one).train_seconds - estimate_cost(batched).train_seconds
+    # 750 fewer image micro-batches and 875 fewer per-step floors; the token flops are unchanged.
+    assert saved == pytest.approx(750 * 0.41 + 875 * 0.10)
+
+
+def test_batched_image_sft_sizes_vram_for_the_executed_micro_batch():
+    """Sizing reads the profile's examples_per_update, so a packed image batch reserves its tokens.
+
+    The worker runs at most 4 rows per micro-batch, so batch 8 and batch 32 need the same card as
+    batch 4, and a 9B image run at the 8k context still fits one 80 GB card under max_count = 1.
+    """
+    from flash.core.spec import TrainSpec
+    from flash.providers.core.allocator import _overridden_train, required_vram_gb
+
+    authored = TrainSpec(batch_size=32, max_context_tokens=32768)
+
+    def need(examples_per_update: int) -> int:
+        train = _overridden_train(authored, {"batch_size": examples_per_update, "seq_len": 8192})
+        assert (train.batch_size, train.max_context_tokens) == (examples_per_update, 8192)
+        return required_vram_gb("Qwen/Qwen3.5-9B-Base", "sft", train=train)
+
+    assert need(1) < need(2) < need(4) == need(8) == need(32) <= 80
 
 
 def test_grpo_freezes_the_meter_before_draining_required_save_publication():

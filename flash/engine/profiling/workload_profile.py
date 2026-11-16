@@ -37,8 +37,10 @@ WORKLOAD_PROFILE_SCHEMA_VERSION = 7
 # 2 lets a gdn hybrid pack when the installed stack proves it can reset example boundaries, where 1
 # always answered exact-unpacked. the same config therefore resolves to a different packing_mode and
 # examples_per_update, so a profile cached under 1 quotes a step count this policy would not: it has
-# to be a different identity rather than a cache hit.
-SFT_PACKING_POLICY_VERSION = 2
+# to be a different identity rather than a cache hit. 3 lets image rows pack under that same
+# contract, where 2 always answered exact-unpacked for a multimodal workload: same reason a profile
+# cached under 2 quotes a step count (and an examples_per_update) this policy would not.
+SFT_PACKING_POLICY_VERSION = 3
 # which rows the profile measured. sft is never sampled: it either measures every source row or the
 # deterministic max_examples prefix training will consume, so both policies are exact.
 SFT_SAMPLE_POLICY_FULL = "exact-full"
@@ -58,7 +60,10 @@ def sft_sample_policy(max_examples: object) -> str:
 # froze alongside the mode (`sft_workload._packing_mode`). that label is the only part of the
 # decision that survives into the profile, so it is the only place the reason can come from.
 _UNPACKED_REASONS = {
-    "multimodal": "this run is multimodal, and image rows are never packed",
+    "multimodal": (
+        "this run is multimodal, and the model's architecture has no boundary-safe packing path in "
+        "the installed stack, so image rows cannot share an update without bleeding state"
+    ),
     "gdn-hybrid": (
         "this model is a gated-delta-net hybrid and the installed stack cannot reset the "
         "linear-attention recurrence at example boundaries, so packed examples would bleed state"

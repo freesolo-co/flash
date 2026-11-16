@@ -1990,7 +1990,12 @@ def test_grpo_do_not_launch_into_the_unrunnable_padded_fallback():
     # `gdn_hybrid` from it alone lets a transient failure turn the gate above into dead code on a
     # profile that is already packed -- resets skipped, shim not installed, state bleeding across
     # packed neighbours, and nothing raised. the profile's label was frozen by a raising probe.
-    assert 'profile.architecture_mode == "gdn-hybrid"' in sft_src, (
+    # the decision lives in `_profile_is_gdn_hybrid`, which run_sft_train must call; a packed
+    # image profile (labelled multimodal) re-asks the RAISING probe there for the same reason.
+    gate_src = _inspect.getsource(sft_train._profile_is_gdn_hybrid)
+    assert "_profile_is_gdn_hybrid(data.profile" in sft_src
+    assert "return probe_is_gdn_hybrid(" in gate_src
+    assert 'profile.architecture_mode == "gdn-hybrid"' in gate_src, (
         "the sft gdn decision no longer consults the frozen profile.architecture_mode. it must, "
         "because model_is_gdn_hybrid returns False on a transient config-read failure: that would "
         "silently skip the packed-boundary reset requirement instead of failing closed."
