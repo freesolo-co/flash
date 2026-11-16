@@ -806,6 +806,24 @@ def _raise_no_candidate_error(
     )
 
 
+def _reject_pinned_misfit(available, need, executed_width, model_id, algorithm) -> None:
+    """Name a pinned provider's own limits before any ceiling or pin check.
+
+    The generic VRAM errors later in ``allocate`` would otherwise hide that no Spot shape (or no
+    Lambda shape -- it sells no H200) at any card count can hold this model/algorithm.
+    """
+    if available == ("spot",):
+        from flash.providers.mithril.pricing import MAX_SPOT_CARDS, spot_unsupported_message
+
+        if not _structurally_fits(("spot",), need, MAX_SPOT_CARDS, executed_width):
+            raise UnsupportedGpuError(spot_unsupported_message(model_id, algorithm, need))
+    if available == ("lambda",):
+        from flash.providers.lambda_.pricing import MAX_LAMBDA_CARDS, lambda_unsupported_message
+
+        if not _structurally_fits(("lambda",), need, MAX_LAMBDA_CARDS, executed_width):
+            raise UnsupportedGpuError(lambda_unsupported_message(model_id, algorithm, need))
+
+
 def allocate(
     model_id: str,
     algorithm: str,
@@ -877,19 +895,7 @@ def allocate(
             raise UnsupportedGpuError(f"requested provider {provider!r} is not configured")
         unpinned = available
         available = (provider,)
-    if available == ("spot",):
-        # before any ceiling or pin check, whose generic VRAM errors would otherwise hide that
-        # no Spot shape at any card count can hold this model/algorithm.
-        from flash.providers.mithril.pricing import MAX_SPOT_CARDS, spot_unsupported_message
-
-        if not _structurally_fits(("spot",), need, MAX_SPOT_CARDS, executed_width):
-            raise UnsupportedGpuError(spot_unsupported_message(model_id, algorithm, need))
-    if available == ("lambda",):
-        # same as Spot: name Lambda's own limits (it sells no H200) before the generic VRAM errors.
-        from flash.providers.lambda_.pricing import MAX_LAMBDA_CARDS, lambda_unsupported_message
-
-        if not _structurally_fits(("lambda",), need, MAX_LAMBDA_CARDS, executed_width):
-            raise UnsupportedGpuError(lambda_unsupported_message(model_id, algorithm, need))
+    _reject_pinned_misfit(available, need, executed_width, model_id, algorithm)
 
     # allocate() is reachable directly, bypassing the parse gate entirely, so it resolves the
     # author's ceiling from the same shared predicate rather than trusting a caller to have applied
