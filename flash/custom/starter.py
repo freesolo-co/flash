@@ -4,6 +4,8 @@ Run: flash train run.toml
 Install local loss dependencies: pip install 'freesolo-flash[custom]'
 Async is the default. For blocking calls, use def main(client), remove await, and
 replace asyncio.to_thread(file_operation, ...) with file_operation(...).
+To score only an answer position, give Datum target_positions (and target_tokens for option
+ids); flash.custom.losses.option_ce_brier_loss_fn(targets) is a ready option CE+Brier loss_fn.
 """
 
 import asyncio

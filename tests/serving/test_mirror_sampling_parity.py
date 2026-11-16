@@ -421,6 +421,61 @@ def test_hosted_buffered_sampling_params_and_choices_are_json_safe(choice_count:
     json.dumps(result, allow_nan=False)
 
 
+class _CandidateLogprobEngine:
+    """vllm double that answers `logprob_token_ids` like vllm 0.23: sampled token + every id."""
+
+    def __init__(self) -> None:
+        self.sampling_params: Any = None
+
+    async def generate(self, _prompt: Any, sampling: Any, _request_id: str, **_kwargs: Any):
+        self.sampling_params = sampling
+        candidates = {7: _Logprob(-0.01, "The")}
+        for offset, token_id in enumerate(sampling.logprob_token_ids):
+            candidates[token_id] = _Logprob(-1.0 - offset, f"opt-{offset}")
+        yield SimpleNamespace(
+            outputs=[
+                SimpleNamespace(
+                    index=0,
+                    text="The",
+                    finish_reason="length",
+                    token_ids=[7],
+                    logprobs=[candidates],
+                )
+            ],
+            prompt_token_ids=[1, 2],
+            num_cached_tokens=0,
+        )
+
+
+@pytest.mark.parametrize("streaming", [False, True], ids=["buffered", "streaming"])
+def test_hosted_logprob_token_ids_reach_vllm_and_return_every_candidate(streaming: bool) -> None:
+    option_ids = list(range(200, 236))
+    vllm_engine = _CandidateLogprobEngine()
+    engine = _engine(vllm_engine)
+    payload = {
+        "model_id": "adapter",
+        "messages": [{"role": "user", "content": "pick"}],
+        "max_tokens": 1,
+        "logprobs": True,
+        "logprob_token_ids": option_ids,
+    }
+    record = _forwarded_base_record(engine)
+
+    async def exercise() -> list[dict[str, Any]]:
+        if streaming:
+            events = [event async for event in engine._stream_generate(payload, record)]
+            return next(event for event in events if event.get("logprobs"))["logprobs"]
+        result = await engine._generate(payload, record)
+        return result["choices"][0]["logprobs"]
+
+    logprobs = asyncio.run(exercise())
+
+    assert vllm_engine.sampling_params.logprobs is None
+    assert vllm_engine.sampling_params.logprob_token_ids == option_ids
+    tokens = [record["token"] for record in logprobs[0]["top_logprobs"]]
+    assert tokens == ["The", *[f"opt-{offset}" for offset in range(36)]]
+
+
 def test_hosted_tool_stream_keeps_interleaved_choice_parsers_isolated() -> None:
     engine = _engine(_InterleavedToolChoiceEngine())
 

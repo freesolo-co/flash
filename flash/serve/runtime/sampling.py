@@ -10,6 +10,8 @@ from .errors import RuntimeConfigurationError, RuntimeNotReadyError
 
 MIN_SEED = -(2**63)
 MAX_SEED = 2**63 - 1
+# vllm's SamplingParams MAX_LOGPROB_TOKEN_IDS; its sampler allocates rows of this width.
+MAX_LOGPROB_TOKEN_IDS = 128
 
 
 def validate_choice_count(value: Any) -> int:
@@ -54,13 +56,70 @@ def validate_top_logprobs(value: Any) -> int:
     return value
 
 
+def validate_logprob_token_ids(value: Any) -> tuple[int, ...] | None:
+    """exact candidate token ids whose logprobs are returned at every generated position."""
+
+    if value is None:
+        return None
+    message = (
+        "logprob_token_ids must be a list of 1 through "
+        f"{MAX_LOGPROB_TOKEN_IDS} unique non-negative integer token ids"
+    )
+    if isinstance(value, str | bytes) or not isinstance(value, Sequence):
+        raise RuntimeConfigurationError(message)
+    token_ids = tuple(value)
+    if not 1 <= len(token_ids) <= MAX_LOGPROB_TOKEN_IDS:
+        raise RuntimeConfigurationError(message)
+    if any(type(token_id) is not int or token_id < 0 for token_id in token_ids):
+        raise RuntimeConfigurationError(message)
+    if len(set(token_ids)) != len(token_ids):
+        raise RuntimeConfigurationError(message)
+    return token_ids
+
+
 def validate_sampling_relationships(
-    *, n: int, temperature: float, logprobs: bool, top_logprobs: int
+    *,
+    n: int,
+    temperature: float,
+    logprobs: bool,
+    top_logprobs: int,
+    logprob_token_ids: tuple[int, ...] | None = None,
 ) -> None:
     if n > 1 and temperature == 0:
         raise RuntimeConfigurationError("n greater than 1 requires temperature greater than zero")
     if top_logprobs > 0 and not logprobs:
         raise RuntimeConfigurationError("positive top_logprobs requires logprobs=true")
+    if logprob_token_ids is not None:
+        if not logprobs:
+            raise RuntimeConfigurationError("logprob_token_ids requires logprobs=true")
+        if top_logprobs > 0:
+            raise RuntimeConfigurationError(
+                "logprob_token_ids cannot be combined with positive top_logprobs"
+            )
+
+
+def vllm_logprob_kwargs(
+    *, logprobs: bool, top_logprobs: int, logprob_token_ids: tuple[int, ...] | None
+) -> dict[str, Any]:
+    """map validated request logprob fields onto vllm SamplingParams keywords.
+
+    candidate ids leave ``logprobs`` unset: vllm then sizes the output from the id list, and the
+    engine's ``max_logprobs`` (default 20) bounds only top-k counts, not explicit candidate ids.
+    """
+
+    if not logprobs:
+        return {"logprobs": None}
+    if logprob_token_ids is not None:
+        return {"logprobs": None, "logprob_token_ids": list(logprob_token_ids)}
+    return {"logprobs": top_logprobs}
+
+
+def response_logprob_width(top_logprobs: int, logprob_token_ids: tuple[int, ...] | None) -> int:
+    """alternatives kept per position: every candidate id plus the sampled token."""
+
+    if logprob_token_ids is not None:
+        return len(logprob_token_ids) + 1
+    return top_logprobs
 
 
 def choice_index(output: Any, *, n: int) -> int:

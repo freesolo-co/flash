@@ -185,6 +185,12 @@ def _tool_forward_fields(request: Any) -> dict[str, Any]:
     }
 
 
+def _logprob_forward_fields(request: Any) -> dict[str, Any]:
+    if request.logprob_token_ids is None:
+        return {}
+    return {"logprob_token_ids": list(request.logprob_token_ids)}
+
+
 def _forward_stream(
     *,
     run_id: str,
@@ -215,6 +221,7 @@ def _forward_stream(
         structured_outputs=request.structured_outputs,
         stream_options=request.stream_options,
         **_tool_forward_fields(request),
+        **_logprob_forward_fields(request),
     )
     try:
         content_type = upstream.headers.get("content-type", "")
@@ -303,6 +310,7 @@ def managed_chat(
             chat_template_kwargs=chat_template_kwargs,
             structured_outputs=request.structured_outputs,
             **_tool_forward_fields(request),
+            **_logprob_forward_fields(request),
         )
         if not isinstance(response, dict):
             raise ValueError("serving backend returned a non-object chat response")

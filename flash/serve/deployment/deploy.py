@@ -620,6 +620,7 @@ def chat_sse(
     tools: list[dict[str, Any]] | None = None,
     tool_choice: str | None = None,
     parallel_tool_calls: bool | None = None,
+    logprob_token_ids: list[int] | tuple[int, ...] | None = None,
 ) -> transport.OpenAIStreamResponse:
     """open a raw openai stream while preserving status, headers, and sse bytes."""
 
@@ -649,6 +650,7 @@ def chat_sse(
         parallel_tool_calls=parallel_tool_calls,
         stream_options=stream_options,
         frame_bytes=streaming_support._complete_sse_frames,
+        logprob_token_ids=logprob_token_ids,
     )
 
 
@@ -735,6 +737,7 @@ def chat(
     tools: list[dict[str, Any]] | None = None,
     tool_choice: str | None = None,
     parallel_tool_calls: bool | None = None,
+    logprob_token_ids: list[int] | tuple[int, ...] | None = None,
 ) -> dict:
     """Send an OpenAI-style chat request for the run's adapter to freesolo serving.
 
@@ -797,4 +800,5 @@ def chat(
             payload, thinking=enabled
         ),
         expected_checkpoint=expected_checkpoint,
+        logprob_token_ids=logprob_token_ids,
     )

@@ -5,6 +5,9 @@ import re
 
 def internal_generation_payload(payload):
     result = payload.model_dump()
+    # an unset candidate list stays off the wire, so engines that predate the field accept it.
+    if result.get("logprob_token_ids", 0) is None:
+        del result["logprob_token_ids"]
     namespace = getattr(payload, "_cache_namespace", None)
     if namespace is not None:
         result["_cache_namespace"] = namespace

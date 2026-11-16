@@ -6,7 +6,7 @@ import atexit
 import math
 import os
 import threading
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Sequence
 from contextlib import AbstractContextManager
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Protocol
@@ -250,6 +250,7 @@ def chat_request_body(
     tool_choice: str | None = None,
     parallel_tool_calls: bool | None = None,
     stream_options: dict[str, bool] | None = None,
+    logprob_token_ids: Sequence[int] | None = None,
 ) -> dict[str, Any]:
     """serialize the supported serving request fields exactly once."""
 
@@ -270,6 +271,9 @@ def chat_request_body(
         if chat_template_kwargs is not None
         else {"enable_thinking": bool(thinking)},
     }
+    # omitted when unset so existing request bodies stay byte-identical.
+    if logprob_token_ids is not None:
+        body["logprob_token_ids"] = [int(token_id) for token_id in logprob_token_ids]
     if stream:
         body["stream"] = True
     if stop:
@@ -398,6 +402,7 @@ def request_chat_sse(
     parallel_tool_calls: bool | None,
     stream_options: dict[str, bool] | None,
     frame_bytes: Callable[[Iterator[bytes]], Iterator[bytes]],
+    logprob_token_ids: Sequence[int] | None = None,
 ) -> OpenAIStreamResponse:
     body = chat_request_body(
         run_id,
@@ -420,6 +425,7 @@ def request_chat_sse(
         tool_choice=tool_choice,
         parallel_tool_calls=parallel_tool_calls,
         stream_options=stream_options,
+        logprob_token_ids=logprob_token_ids,
     )
     return open_chat_stream(
         client,
@@ -514,6 +520,7 @@ def request_chat_json(
     before_raise: Callable[[httpx.Response], None] | None,
     balance_payload: Callable[[Any, bool], None],
     expected_checkpoint: str | None,
+    logprob_token_ids: Sequence[int] | None = None,
 ) -> Any:
     body = chat_request_body(
         run_id,
@@ -535,6 +542,7 @@ def request_chat_json(
         tools=tools,
         tool_choice=tool_choice,
         parallel_tool_calls=parallel_tool_calls,
+        logprob_token_ids=logprob_token_ids,
     )
     response = post_chat_json(
         client_context,

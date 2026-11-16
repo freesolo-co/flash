@@ -69,6 +69,7 @@ def parse_chat_request(
         presence_penalty=request.presence_penalty,
         logprobs=request.logprobs,
         top_logprobs=request.top_logprobs,
+        logprob_token_ids=request.logprob_token_ids,
         thinking=resolved.adapter.thinking_default,
         stop=request.stop,
         chat_template_kwargs=request.chat_template_kwargs,
