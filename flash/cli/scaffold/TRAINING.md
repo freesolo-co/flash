@@ -906,6 +906,15 @@ Pick SFT when you already have good answers and want the model to imitate them.
   including text content, reasoning, and tool-call serialization. They are indistinguishable from
   structural turn delimiters after tokenization. The run logs role-aware masked rows and any
   completion-only fallback rows separately.
+- **Image observations can stay in a multi-turn target.** A browser or GUI trajectory can be one
+  row: the first turns in `prompt_messages` and `output = {"messages": [assistant, user(text +
+  screenshot), assistant, ...]}`. Images in the target's **user** messages are model input: they
+  are tokenized in conversation order exactly like prompt images and masked out of the loss, so
+  only the assistant turns are supervised. Images in assistant (or tool) messages are rejected.
+  The image limits (32 images, total source and decoded bytes) apply to the whole conversation.
+  When the row exceeds `max_context_tokens`, it is trimmed to the longest prefix that ends on a
+  whole assistant turn instead of being cut mid-screenshot; raise `max_context_tokens` to keep
+  later turns.
 - **Thinking SFT requires reasoning in every assistant target, preserved by the
   chat template.** With `thinking = true`, provide nonempty `reasoning_content` or a
   leading `<think>...</think>` span, including in assistant replies after tool results.
