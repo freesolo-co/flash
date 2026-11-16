@@ -1163,7 +1163,8 @@ def test_authored_sft_prompt_messages_quote_images_without_executing_environment
     (entrypoint.parent / "dataset/train.jsonl").write_text(json.dumps(row) + "\n")
     entrypoint.write_text("raise AssertionError('profiling executed environment code')\n")
     profile = _image_profile(entrypoint)
-    assert profile.packing_mode == "exact-unpacked"
+    # image rows pack under the gdn boundary-reset contract; one row still makes a batch of one.
+    assert profile.packing_mode == "packed"
     assert profile.architecture_mode == "multimodal"
     assert profile.examples_per_update == 1
     assert profile.real_tokens_per_epoch > 300
@@ -1264,9 +1265,43 @@ def test_control_plane_profiles_image_rows_without_loading_a_processor(
     assert profile.retained_examples == 1
     # a 640x480 image expands to 300 pad tokens, so the row cannot be near-empty text.
     assert profile.real_tokens_per_epoch > 300
-    # image rows are never packed, and the profile has to say so rather than quoting a packed run.
-    assert profile.packing_mode == "exact-unpacked"
+    # image rows pack like text rows; the label still says multimodal so the vision term applies.
+    assert profile.packing_mode == "packed"
     assert profile.architecture_mode == "multimodal"
+
+
+def test_image_rows_batch_by_the_authored_batch_size(tmp_path, published_geometry) -> None:
+    """Image sft no longer pins the optimizer batch to 1 when the architecture can pack.
+
+    Five image rows at batch 2 over 2 epochs is ceil(5 / 2) * 2 = 6 updates, the same horizon a
+    text run of the same shape quotes. An architecture that cannot reset boundaries still trains
+    one image row per update.
+    """
+    entrypoint = _image_package(tmp_path)
+    row = '{"input":"describe","output":"red","image":"dataset/red.png"}\n'
+    (entrypoint.parent / "dataset/train.jsonl").write_text(row * 5)
+
+    profile = _image_profile(entrypoint, max_context_tokens=1024)
+
+    assert (profile.packing_mode, profile.architecture_mode) == ("packed", "multimodal")
+    assert profile.examples_per_update == 2
+    assert profile.packed_blocks == 3
+    assert profile.derived_steps == profile.authoritative_steps == 6
+
+    spec = replace(
+        _spec(environment_id=str(entrypoint), model="Qwen/Qwen3.5-9B"),
+        train=TrainSpec(epochs=2, batch_size=2, max_context_tokens=1024),
+    )
+    unpacked = profile_packaged_sft_dataset(
+        spec,
+        producer_version="1.2.3",
+        tokenizer_loader=lambda _model, _revision: FakeMultimodalTokenizer(),
+        packing_support=lambda _model, _revision: ("gdn-hybrid", False),
+    )
+    assert (unpacked.packing_mode, unpacked.architecture_mode) == ("exact-unpacked", "multimodal")
+    assert unpacked.examples_per_update == 1
+    assert unpacked.derived_steps == 10
+    assert unpacked.real_tokens_per_epoch == profile.real_tokens_per_epoch
 
 
 def test_the_quote_grows_with_the_image_the_user_packaged(tmp_path, published_geometry) -> None:

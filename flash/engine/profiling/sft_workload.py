@@ -207,8 +207,23 @@ def _packing_mode(
     allow_packing: bool,
     packing_support: Callable[[str, str], tuple[str, bool]] | None,
 ) -> tuple[str, str]:
-    if multimodal:
-        return "exact-unpacked", "multimodal"
+    architecture_mode, supported = _architecture_packing_support(
+        model_id, revision, packing_support
+    )
+    mode = "packed" if allow_packing and supported else "exact-unpacked"
+    # image rows pack under the SAME boundary contract as text: verl concatenates each row's
+    # pixel_values/image_grid_thw in micro-batch order and keeps the 4-row mrope positions per row,
+    # and the gdn hook resets at the text-position boundaries (row 0 of those positions), which is
+    # the layout grpo already trains vision rows on. the label stays "multimodal" because the cost
+    # model keys the vision term on it and the worker resolves the gdn gate strictly for it.
+    return mode, ("multimodal" if multimodal else architecture_mode)
+
+
+def _architecture_packing_support(
+    model_id: str,
+    revision: str,
+    packing_support: Callable[[str, str], tuple[str, bool]] | None,
+) -> tuple[str, bool]:
     if packing_support is not None:
         architecture_mode, supported = packing_support(model_id, revision)
     else:
@@ -236,7 +251,7 @@ def _packing_mode(
                 f"architecture probe for {model_id!r} could not resolve the model config, so the "
                 "packing mode cannot be frozen into a workload profile"
             ) from e
-    return ("packed" if allow_packing and supported else "exact-unpacked"), architecture_mode
+    return architecture_mode, supported
 
 
 def sft_tokens_for_updates(
@@ -635,8 +650,9 @@ def _resolve_sft_step_horizon(
     """Compute optimizer updates and exact tokens consumed by the resolved horizon."""
     # batch size follows the packing mode: `exact-unpacked` keeps one example per update, which is
     # what makes an unpacked gdn run boundary-safe (no packed neighbours to contaminate). a `packed`
-    # gdn run has earned that mode through the boundary-reset contract above. this CPU-side choice
-    # sets quoted and executed steps. the child probe controls verl layout, not batch size.
+    # gdn run -- text or image -- has earned that mode through the boundary-reset contract above.
+    # this CPU-side choice sets quoted and executed steps. the child probe controls verl layout,
+    # not batch size.
     examples_per_update = min(effective_batch, len(rows)) if packing_mode == "packed" else 1
     # packed_blocks is already the optimizer batches verl runs per epoch, so the horizon is one
     # update per block per epoch. do not divide by examples_per_update again.

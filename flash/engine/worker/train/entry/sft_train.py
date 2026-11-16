@@ -376,7 +376,10 @@ from flash.engine.profiling.sft_workload import (  # noqa: E402,F401
     sft_tokens_for_updates,
 )
 from flash.engine.worker.io.heartbeat import liveness_heartbeat  # noqa: E402
-from flash.engine.worker.model.packing import model_is_gdn_hybrid  # noqa: E402
+from flash.engine.worker.model.packing import (  # noqa: E402
+    model_is_gdn_hybrid,
+    probe_is_gdn_hybrid,
+)
 from flash.engine.worker.runtime.rng import seed_training_rngs  # noqa: E402,F401
 from flash.engine.worker.train.entry.backend_common import (  # noqa: E402,F401
     fused_ce_backend,
@@ -552,6 +555,22 @@ def _publish_sft_result(
     )
 
 
+def _profile_is_gdn_hybrid(profile, model_id: str, model_revision: str) -> bool:
+    """Whether this run trains a gdn hybrid, failing closed wherever the answer gates packing.
+
+    A text profile names the architecture its raising probe found. An image profile is labelled
+    ``multimodal`` instead (the cost model keys the vision term on that label), so when it packs
+    neighbours the probe is re-asked here in its RAISING form: the swallowing one answers False on
+    a transient config read, which would skip the boundary-reset gate on a packed image batch.
+    """
+    if profile.architecture_mode == "gdn-hybrid":
+        return True
+    packed_neighbours = profile.packing_mode == "packed" and profile.examples_per_update > 1
+    if profile.architecture_mode == "multimodal" and packed_neighbours:
+        return probe_is_gdn_hybrid(model_id, model_revision)
+    return model_is_gdn_hybrid(model_id, model_revision)
+
+
 def run_sft_train(spec=None, *, context: WorkerContext) -> None:
     """run flash sft through verl's out-of-process fsdp trainer."""
     options = _resolve_sft_options(spec, context=context)
@@ -575,9 +594,7 @@ def run_sft_train(spec=None, *, context: WorkerContext) -> None:
         # answers False. trusting the swallow alone would let a transient failure skip the
         # boundary-reset requirement below on an already-packed profile -- the one combination that
         # trains across example boundaries unprotected.
-        gdn_hybrid = data.profile.architecture_mode == "gdn-hybrid" or model_is_gdn_hybrid(
-            options.model_id, options.model_revision
-        )
+        gdn_hybrid = _profile_is_gdn_hybrid(data.profile, options.model_id, options.model_revision)
         # and the MODULE has to fail closed for the same reason one layer down: `gdn_model_type`
         # swallows a failed config read and defaults to "qwen3_5". on a packed `qwen3_5_moe` model
         # (Qwen/Qwen3.6-35B-A3B is in the catalog) that default names the DENSE module, so the child

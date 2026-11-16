@@ -559,3 +559,38 @@ def test_flash_worker_decodes_positions_before_upstream_execution(monkeypatch, m
     assert (
         getattr(FlashTrainingWorker.__new__(FlashTrainingWorker), method)(data) == "native result"
     )
+
+
+def test_batched_image_sft_rows_collate_through_the_native_no_padding_path(tmp_path, monkeypatch):
+    """A packed image micro-batch keeps each row's pixels, grids and mrope positions aligned.
+
+    Real upstream collation and micro-batch selection, on real child-dataset items with different
+    image counts and sizes, reversed the way dynamic batching may reorder a batch.
+    """
+    import torch
+    from tensordict import TensorDict
+    from verl.utils.dataset.dataset_utils import DatasetPadMode, SFTTensorCollator
+    from verl.utils.model import extract_multi_modal_inputs
+    from verl.utils.tensordict_utils import index_select_tensor_dict
+
+    from tests.test_sft_image_batching import items as items_fixture
+
+    items = items_fixture.__wrapped__(tmp_path, monkeypatch)
+    batch = TensorDict(SFTTensorCollator(DatasetPadMode.NO_PADDING)(items), batch_size=len(items))
+    order = list(reversed(range(len(items))))
+    selected = index_select_tensor_dict(batch, order)
+
+    ids = selected["input_ids"]
+    positions = selected["position_ids"].values().unsqueeze(1)
+    assert positions.shape == (4, 1, ids.values().numel())
+    for row, index in zip(selected["position_ids"].unbind(), order, strict=True):
+        torch.testing.assert_close(row, items[index]["position_ids"])
+    inputs = extract_multi_modal_inputs(selected["multi_modal_inputs"])
+    torch.testing.assert_close(
+        inputs["pixel_values"],
+        torch.cat([items[i]["multi_modal_inputs"]["pixel_values"] for i in order]),
+    )
+    torch.testing.assert_close(
+        inputs["image_grid_thw"],
+        torch.cat([items[i]["multi_modal_inputs"]["image_grid_thw"] for i in order]),
+    )

@@ -62,7 +62,7 @@ runs decide, because historical "actual" values include unobservable queue time.
 | SFT per-step floor | 0.8 s | 0.10 s |
 | SFT first update (one-time) | — | 250 s + 5 s × active params (B) |
 | MoE SFT MFU (total params) | 0.10 | 0.45 |
-| Image SFT vision encoding (multimodal profiles only) | — | 0.41 s/example |
+| Image SFT fixed image-batch work (multimodal profiles only) | — | 0.41 s/micro-batch |
 | GRPO step floor | 62.7 s + 0.805 s/completion | 3.5 s + 0.466 s/completion |
 | GRPO decode / update MFU | 0.12 / 0.35 | 0.25 / 0.72 |
 | GRPO first update (one-time) | — | 60 s + 6 s × active params (B) |
@@ -115,6 +115,12 @@ What the quote still cannot know:
   per-example vision-encoding term (0.41 s/example) brings it to ~1.00. Three live 600-step MiniWoB
   image runs measured 0.97 / 1.20 / 1.14. Identical repeats spread 816–1,006 s. Each spent
   900–1,100 s in setup (image loading and model download), which the meter excludes.
+  Every one of those runs trained one example per update. Image rows now pack like text rows
+  (same gdn boundary-reset contract), so the term is charged per executed micro-batch
+  (`ceil(batch / micro_batch)` per update, micro-batch at most 4) instead of per example: it is
+  not vision-encoder FLOPs (a MiniWoB screenshot is ~3 ms of tower compute on an H100) but the
+  fixed cost of one image forward/backward. A batch-1 quote is unchanged. **Not yet measured on
+  a packed image run** — refit this term once live batched image SFT runs complete.
 - **Run-to-run noise.** Identical repeats differed by 9% (GRPO 0.8B and 9B, SFT 9B) and 23% (short
   SFT 0.8B). No estimate can beat that.
 
