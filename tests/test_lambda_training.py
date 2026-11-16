@@ -99,70 +99,90 @@ def _raw(gpu):
     }
 
 
-@pytest.mark.parametrize("enabled", [True, False])
-def test_toml_lambda_pin_parses_and_round_trips(enabled):
-    import tomllib
-
+@pytest.mark.parametrize(
+    ("gpu", "provider"),
+    [
+        ({"provider": "lambda"}, "lambda"),
+        ({"provider": " Lambda "}, "lambda"),
+        ({"provider": "modal"}, "modal"),
+        ({"provider": "spot"}, "spot"),
+        ({"spot": True}, "spot"),
+        ({"spot": True, "provider": "spot"}, "spot"),
+        ({"provider": ""}, ""),
+        ({}, ""),
+    ],
+)
+def test_toml_provider_pin_parses_and_round_trips(gpu, provider):
     from flash.core.spec import JobSpec
     from flash.schema import spec_from_dict
 
-    raw = _raw(tomllib.loads(f"lambda = {str(enabled).lower()}\nmax_count = 2"))
-    spec = spec_from_dict(raw, project_required=False)
-    assert spec.gpu.provider == ("lambda" if enabled else "")
-    assert spec.gpu.spot is False
+    spec = spec_from_dict(_raw({**gpu, "max_count": 2}), project_required=False)
+    assert spec.gpu.provider == provider
+    assert spec.gpu.spot is (provider == "spot")
     assert spec.gpu.max_count == 2
-    internal = JobSpec.from_json(spec.to_json())
-    assert internal == spec
+    assert JobSpec.from_json(spec.to_json()) == spec
     public = spec.to_dict()
-    assert ("lambda" in public["gpu"]) is enabled
-    assert JobSpec.from_dict(public).gpu.provider == spec.gpu.provider
-    # a public spec copied back into a config still parses to the same pin.
-    assert spec_from_dict(public, project_required=False).gpu.provider == spec.gpu.provider
+    assert public["gpu"]["provider"] == provider
+    assert JobSpec.from_dict(public).gpu == spec.gpu
+    # a public spec copied back into a config (e.g. from `flash runs status`) keeps its pin.
+    reparsed = spec_from_dict(public, project_required=False)
+    assert reparsed.gpu.provider == provider
+    assert reparsed.gpu.spot is spec.gpu.spot
 
 
-def test_lambda_pin_leaves_unpinned_digests_alone():
+def test_provider_spot_is_the_same_spec_as_spot_true():
+    from flash.schema import spec_from_dict
+
+    legacy = spec_from_dict(_raw({"spot": True}), project_required=False)
+    pinned = spec_from_dict(_raw({"provider": "spot"}), project_required=False)
+    assert legacy == pinned
+    assert legacy.to_json() == pinned.to_json()
+
+
+def test_provider_pin_leaves_spec_digests_alone():
     from flash.core.spec import GpuSpec, JobSpec
 
-    assert "lambda" not in JobSpec(gpu=GpuSpec()).to_internal_dict()["gpu"]
-    assert "lambda" not in JobSpec(gpu=GpuSpec(provider="spot")).to_internal_dict()["gpu"]
-    pinned = JobSpec(gpu=GpuSpec(provider="lambda")).to_internal_dict()["gpu"]
-    assert pinned["lambda"] is True
-    assert pinned["provider"] == "lambda"
+    for gpu in (GpuSpec(), GpuSpec(provider="spot"), GpuSpec(provider="lambda")):
+        internal = JobSpec(gpu=gpu).to_internal_dict()["gpu"]
+        assert "lambda" not in internal
+        assert internal["provider"] == gpu.provider
+    # an unpinned spec serializes exactly as before the provider key became authorable
+    assert JobSpec(gpu=GpuSpec()).to_internal_dict()["gpu"] == {
+        "type": "",
+        "disk_gb": 60,
+        "max_wall_seconds": 86400,
+        "max_retries": 5,
+        "network_volume": None,
+        "network_volume_gb": 100,
+        "provider": "",
+        "count": 1,
+    }
 
 
 @pytest.mark.parametrize(
-    "gpu",
+    ("gpu", "match"),
     [
-        {"spot": True, "lambda": True},
-        {"lambda": "true"},
-        {"lambda": 1},
-        {"lambda": False, "provider": "lambda"},
-        {"lambda": True, "provider": "modal"},
+        ({"provider": "runpod"}, r"not a provider; use one of modal, spot, lambda"),
+        ({"provider": 1}, r"gpu\.provider must be a string"),
+        ({"provider": True}, r"gpu\.provider must be a string"),
+        ({"spot": True, "provider": "lambda"}, r"conflicts with gpu\.provider = 'lambda'"),
+        ({"spot": True, "provider": "modal"}, r"conflicts with gpu\.provider = 'modal'"),
+        ({"spot": False, "provider": "spot"}, r"spot = false conflicts"),
+        ({"lambda": True}, r"unknown key"),
+        ({"providers": ["lambda"]}, r"providers is no longer supported"),
     ],
 )
-def test_lambda_toml_rejects_conflicts_and_non_booleans(gpu):
+def test_toml_provider_rejects_invalid_and_conflicting_values(gpu, match):
     from flash.schema import ConfigError, spec_from_dict
 
-    with pytest.raises(ConfigError):
+    with pytest.raises(ConfigError, match=match):
         spec_from_dict(_raw(gpu), project_required=False)
-
-
-def test_persisted_lambda_flag_must_match_its_provider():
-    from flash.core.spec import GpuSpec, JobSpec
-
-    data = JobSpec(gpu=GpuSpec(provider="modal")).to_internal_dict()
-    data["gpu"]["lambda"] = True
-    with pytest.raises(ValueError, match=r"gpu\.lambda"):
-        JobSpec.from_dict(data)
-    data["gpu"]["lambda"] = "yes"
-    with pytest.raises(TypeError):
-        JobSpec.from_dict(data)
 
 
 def test_lambda_custom_training_is_refused_at_parse():
     from flash.schema import ConfigError, spec_from_dict
 
-    raw = _raw({"lambda": True})
+    raw = _raw({"provider": "lambda"})
     raw["algorithm"] = "custom"
     with pytest.raises(ConfigError):
         spec_from_dict(raw, project_required=False)
@@ -979,3 +999,79 @@ def test_poll_stamps_lambda_on_demand_cost(monkeypatch):
     assert metrics["cost_usd"] == pytest.approx(3.79)
     assert metrics["notes"]["provider"] == "lambda"
     assert metrics["notes"]["cost_basis"] == "lambda_on_demand"
+
+
+# --- serving VMs on the same account -------------------------------------------------------------
+
+SERVING_NAMES = [
+    *(f"flash-h100-reservation-20261112-{n}" for n in range(1, 5)),
+    "flash-main-38d6f47f0b3846d6a278ae558ebffd7f",
+    "flash-dev-a1234567890123456789012345678901",  # fleet pattern whose hex starts with "a"
+    "flash-main-a3f00000000000000000000000000000",
+]
+TRAINING_RUN = "flash-1794787586-d76d4618"
+TRAINING_NAME = "flash-1794787586-d76d4618-a0"
+
+
+def _mixed_account(monkeypatch):
+    rows = [
+        row(name=name, instance_id=f"{index:032x}", status="active")
+        for index, name in enumerate(SERVING_NAMES, start=1)
+    ]
+    rows.append(row(name=TRAINING_NAME, instance_id="f" * 32, status="active"))
+    by_id = {item["id"]: item for item in rows}
+    posts = []
+
+    def call(method, path, *, body=None, deadline_at=None, retries=None):
+        if (method, path) == ("GET", "/instances"):
+            return rows
+        if method == "GET" and path.startswith("/instances/"):
+            return by_id[path.rsplit("/", 1)[1]]
+        posts.append(body["instance_ids"][0])
+        raise client.LambdaApiError("refused", status=400)
+
+    monkeypatch.setattr(api, "call", call)
+    monkeypatch.setattr(api, "TERMINATE_CONFIRM_SECONDS", 0.0)
+    return rows, posts
+
+
+def test_serving_vms_are_never_owned_listed_swept_or_terminated(monkeypatch):
+    rows, _posts = _mixed_account(monkeypatch)
+    serving_ids = {item["id"] for item in rows if item["name"] in SERVING_NAMES}
+    for name in SERVING_NAMES:
+        assert not api.owned({"name": name})
+        for run_id in ("main", "dev", "h100-reservation-20261112", "flash-main"):
+            assert api.attempt_of(name, run_id) is None
+    assert api.owned({"name": TRAINING_NAME})
+    assert api.attempt_of(TRAINING_NAME, TRAINING_RUN) == 0
+    assert [item["name"] for item in api.list_instances()] == [TRAINING_NAME]
+
+    reaped = []
+    monkeypatch.setattr(api, "terminate_confirmed", lambda iid, name=None: reaped.append(iid))
+    provider = get_provider("lambda")
+    # no known set: nothing is reaped at all
+    assert provider.sweep_orphans(active_labels=set(), known_labels=None) == []
+    # a known set naming every serving prefix as a "run" still reaps only the training VM
+    known = {"main", "dev", "flash-main", "h100-reservation-20261112", TRAINING_RUN}
+    assert provider.sweep_orphans(active_labels=set(), known_labels=known) == ["f" * 32]
+    for run_id in ("main", "dev", "flash-main", "h100-reservation-20261112"):
+        provider.terminate_run(run_id)
+        assert provider.run_instances_remaining(run_id) == []
+    provider.terminate_run(TRAINING_RUN)
+    assert not serving_ids & set(reaped)
+    assert reaped == ["f" * 32, "f" * 32]
+
+
+def test_terminate_confirmed_refuses_a_serving_vm_by_id(monkeypatch):
+    rows, posts = _mixed_account(monkeypatch)
+    for item in rows:
+        if item["name"] in SERVING_NAMES:
+            with pytest.raises(client.LambdaApiError, match="not a Flash training VM"):
+                api.terminate_confirmed(item["id"])
+            with pytest.raises(client.LambdaApiError, match="does not belong"):
+                api.terminate_confirmed(item["id"], name=TRAINING_NAME)
+    assert posts == []
+    # the training VM is still terminable (the fake refuses, so it is reported unconfirmed)
+    with pytest.raises(client.LambdaApiError, match="not confirmed"):
+        api.terminate_confirmed("f" * 32, name=TRAINING_NAME)
+    assert posts == ["f" * 32]

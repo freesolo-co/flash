@@ -19,7 +19,6 @@ from flash.core.catalog import (
 from flash.core.grpo import resolve_grpo_rollout_shape
 from flash.core.spec import (
     FIXED_SEED,
-    LAMBDA_GPU_KEY,
     MANAGED_ENVIRONMENT_KEYS,
     MANAGED_GPU_KEYS,
     MANAGED_TOP_LEVEL_KEYS,
@@ -243,17 +242,18 @@ _TOP_LEVEL_KEYS = (
 # runner-assigned [gpu] fields (MANAGED_GPU_KEYS, single-sourced in flash.core.spec) are excluded from the
 # user-facing surface. GpuSpec still carries them so the internal JobSpec.from_dict round trip
 # preserves the runner's disk sizing, weight-cache volume, and platform retry/wall-clock policy.
-# GPU class, card count, and provider are allocator-owned: the allocator picks the cheapest fitting
-# shape and the runner records it in the worker spec. `spot` and `lambda` pin a provider.
-_RETIRED_GPU_KEYS = frozenset({"type", "type_fallbacks", "count", "provider", "providers"})
+# GPU class and card count are allocator-owned: the allocator picks the cheapest fitting shape and
+# the runner records it in the worker spec. `provider` optionally pins one provider ("" = automatic;
+# "spot" and "lambda" are only ever used when pinned); `spot = true` is the legacy Spot pin.
+_RETIRED_GPU_KEYS = frozenset({"type", "type_fallbacks", "count", "providers"})
 _GPU_KEYS = (
     frozenset(item.name for item in dataclass_fields(GpuSpec))
     - MANAGED_GPU_KEYS
     - _RETIRED_GPU_KEYS
-) | {LAMBDA_GPU_KEY}
+)
 
 
-def _is_derived_gpu_value(key: str, value: Any, *, spot: bool, lambda_: bool = False) -> bool:
+def _is_derived_gpu_value(key: str, value: Any) -> bool:
     """True for the empty/derived values ``JobSpec.to_dict()`` itself emits for allocator-owned keys.
 
     Every stored public spec carries ``count = 1`` (the digest-stable placeholder), so resubmitting a
@@ -263,9 +263,6 @@ def _is_derived_gpu_value(key: str, value: Any, *, spot: bool, lambda_: bool = F
         return type(value) is int and value == 1
     if key == "type":
         return isinstance(value, str) and not value.strip()
-    if key == "provider":
-        derived = ("", "spot") if spot else ("", "lambda") if lambda_ else ("",)
-        return isinstance(value, str) and value.strip().lower() in derived
     return False
 
 
@@ -437,6 +434,32 @@ def _validate_train_section(raw: dict[str, Any], algorithm: str) -> dict[str, An
     return train_raw
 
 
+def _authored_gpu_provider(gpu_raw: dict[str, Any], *, spot: bool) -> str:
+    """The provider a `[gpu]` table pins, or "" for automatic allocation.
+
+    `provider = "spot"` and the legacy `spot = true` are the same pin; `spot = true` with any other
+    provider, or `spot = false` with `provider = "spot"`, is a contradiction. Spot and Lambda are
+    only ever used when pinned here.
+    """
+    raw = gpu_raw.get("provider", "")
+    if not isinstance(raw, str):
+        raise ConfigError("gpu.provider must be a string")
+    provider = raw.strip().lower()
+    if provider and provider not in PROVIDER_NAMES:
+        raise ConfigError(
+            f"gpu.provider {raw!r} is not a provider; use one of {', '.join(PROVIDER_NAMES)} "
+            "(or omit it for automatic allocation)"
+        )
+    if spot and provider not in ("", "spot"):
+        raise ConfigError(
+            f"gpu.spot = true pins Mithril Spot and conflicts with gpu.provider = {provider!r}; "
+            "keep only one"
+        )
+    if provider == "spot" and "spot" in gpu_raw and not spot:
+        raise ConfigError("gpu.spot = false conflicts with gpu.provider = 'spot'; keep only one")
+    return "spot" if spot else provider
+
+
 def _validate_gpu_section(
     raw: dict[str, Any],
     *,
@@ -462,31 +485,27 @@ def _validate_gpu_section(
     spot = gpu_raw.get("spot", False)
     if type(spot) is not bool:
         raise ConfigError("gpu.spot must be a boolean")
-    lambda_ = gpu_raw.get(LAMBDA_GPU_KEY, False)
-    if type(lambda_) is not bool:
-        raise ConfigError("gpu.lambda must be a boolean")
-    if spot and lambda_:
-        raise ConfigError("gpu.spot and gpu.lambda cannot both be true; pick one provider")
-    # GPU class, card count, and provider are allocator-owned. a stored public spec still carries
-    # `type = ""`, `count = 1`, and `provider = ""` (or the "spot" provider a Spot spec derives) for
-    # digest stability, so only values a user could have meant as a choice are rejected.
+    provider = _authored_gpu_provider(gpu_raw, spot=spot)
+    spot = provider == "spot"
+    # GPU class and card count are allocator-owned. a stored public spec still carries `type = ""`
+    # and `count = 1` for digest stability, so only values a user could have meant as a choice are
+    # rejected.
     retired = sorted(
         key
         for key in _RETIRED_GPU_KEYS & set(gpu_raw)
-        if not _is_derived_gpu_value(key, gpu_raw[key], spot=spot, lambda_=lambda_)
+        if not _is_derived_gpu_value(key, gpu_raw[key])
     )
     if retired:
         raise ConfigError(
-            f"[gpu] {', '.join(retired)} is no longer supported: Flash picks the GPU class, card "
-            "count, and provider automatically. Delete the line; `spot = true` (Mithril Spot) or "
-            "`lambda = true` (Lambda Cloud) pins a provider."
+            f"[gpu] {', '.join(retired)} is no longer supported: Flash picks the GPU class and card "
+            'count automatically. Delete the line; `provider = "<name>"` '
+            f"({', '.join(PROVIDER_NAMES)}) is the only way to choose where a run trains."
         )
     max_count = gpu_raw.get("max_count", 0)
     if type(max_count) is not int or not 1 <= max_count <= 8:
         if "max_count" in gpu_raw:
             raise ConfigError("gpu.max_count must be an integer from 1 to 8")
         max_count = 0
-    provider = "spot" if spot else "lambda" if lambda_ else ""
     gpu_spec = GpuSpec(provider=provider, spot=spot, max_count=max_count)
 
     # the card count is never authored: every run auto-sizes to the smallest fitting geometry-safe

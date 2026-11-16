@@ -10,7 +10,7 @@ from flash.providers.core.base import Provider
 # ties through Python's stable sort.
 PROVIDER_NAMES: tuple[str, ...] = ("modal", "spot", "lambda")
 
-# Providers a run reaches only by pinning them (``[gpu] spot = true`` / ``[gpu] lambda = true``).
+# Providers a run reaches only by pinning them (``[gpu] provider = "spot"`` / ``"lambda"``).
 # Unpinned allocation never selects them, and a pin on one cannot fall back to another provider.
 PINNED_ONLY_PROVIDERS: tuple[str, ...] = ("spot", "lambda")
 

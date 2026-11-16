@@ -118,28 +118,27 @@ class LambdaProvider:
         return [item["id"] for item in api.run_instances(run_id)]
 
     def sweep_orphans(self, active_labels=None, known_labels=None):
-        """Terminate Flash VMs of runs this plane knows and no longer runs.
+        """Terminate Flash training VMs of runs this plane knows and no longer runs.
 
         Instances are listed first and protection sets read afterwards, so a launch racing the
-        sweep is protected. A VM is attributed to a run by its label prefix; a VM of a run this
-        plane never recorded (another plane on the same account) is left alone.
+        sweep is protected. A VM is reaped only when its name is exactly a known run's
+        ``instance_label`` (``flash-<run>-a<N>``). Without a known set nothing is reaped: the account
+        also holds serving VMs and other planes' runs, which a name pattern alone cannot rule out.
         """
-        from flash.providers._lifecycle.instances.instance import (
-            label_matches_run,
-            run_label_prefix,
-        )
         from flash.providers.lambda_ import api
 
         instances = api.list_instances()
         active = active_labels() if callable(active_labels) else active_labels
         known = known_labels() if callable(known_labels) else known_labels
+        if not known:
+            return []
 
         def matches(name, run_ids):
-            return any(label_matches_run(name, run_label_prefix(run_id)) for run_id in run_ids)
+            return any(api.attempt_of(name, run_id) is not None for run_id in run_ids)
 
         deleted = []
         for item in instances:
-            if known is not None and not matches(item["name"], known):
+            if not matches(item["name"], known):
                 continue
             if active and matches(item["name"], active):
                 continue

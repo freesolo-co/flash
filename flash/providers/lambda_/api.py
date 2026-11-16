@@ -12,7 +12,7 @@ import re
 import time
 from dataclasses import dataclass
 
-from flash.providers._lifecycle.instances.instance import label_matches_run, run_label_prefix
+from flash.providers._lifecycle.instances.instance import run_label_prefix
 from flash.providers.core.base import (
     CapacityLookupError,
     CapacityUnavailableError,
@@ -132,8 +132,26 @@ def _instance_view(row) -> dict | None:
 
 
 def owned(instance: dict) -> bool:
-    """Whether an instance carries a Flash training attempt name (``flash-<run>-a<N>``)."""
+    """Whether an instance carries a Flash training attempt name (``flash-<run>-a<N>``).
+
+    The same Lambda account runs serving VMs (``flash-<env>-<32 hex>``,
+    ``flash-h100-reservation-<date>-<n>``). None of them ends in ``-a<digits>``, so none is ever
+    listed, swept or terminated by training.
+    """
     return bool(_OWNED_NAME.fullmatch(instance.get("name") or ""))
+
+
+def attempt_of(name: str, run_id: str) -> int | None:
+    """The attempt number when ``name`` is exactly ``instance_label(run_id, attempt)``, else None.
+
+    Exact: the run's label prefix, then ``-a``, then only digits. A bare prefix match is not enough
+    (a serving VM ``flash-main-a3f...`` starts with ``flash-main-a`` for a run named ``main``).
+    """
+    if not _OWNED_NAME.fullmatch(name or ""):
+        return None
+    head = run_label_prefix(run_id) + "-a"
+    suffix = name[len(head) :] if name.startswith(head) else ""
+    return int(suffix) if suffix.isdigit() and len(suffix) <= 10 else None
 
 
 def list_instances(*, deadline_at=None) -> list[dict]:
@@ -152,11 +170,10 @@ def list_instances(*, deadline_at=None) -> list[dict]:
 
 
 def run_instances(run_id: str, *, deadline_at=None) -> list[dict]:
-    prefix = run_label_prefix(run_id)
     return [
         item
         for item in list_instances(deadline_at=deadline_at)
-        if label_matches_run(item["name"], prefix)
+        if attempt_of(item["name"], run_id) is not None
     ]
 
 
@@ -190,6 +207,9 @@ def terminate_confirmed(instance_id: str, *, name: str | None = None) -> None:
     Per id: Lambda's batch terminate rejects the whole request when one id is bad, which would leak
     every other VM in it. No run-deadline dependency, so a VM that outlived its run is still
     removable. Raises unless disappearance (or the ``terminated`` state) is observed.
+
+    Refuses (before any terminate request) an instance that is not a Flash training VM, whatever
+    id a caller passes: serving VMs on the same account are never terminated here.
     """
     deadline = time.time() + TERMINATE_CONFIRM_SECONDS
 
@@ -203,8 +223,11 @@ def terminate_confirmed(instance_id: str, *, name: str | None = None) -> None:
                 deadline_at=deadline,
             )
 
-    if get_instance(instance_id, name=name, deadline_at=deadline) is None:
+    current = get_instance(instance_id, name=name, deadline_at=deadline)
+    if current is None:
         return
+    if not owned(current):
+        raise LambdaApiError("Lambda instance is not a Flash training VM; refusing to terminate")
     request()
     while time.time() < deadline:
         instance = get_instance(instance_id, name=name, deadline_at=deadline)
@@ -223,14 +246,10 @@ def _terminate_earlier_attempts(run_id: str, attempt: int, *, deadline_at) -> No
     attempt's VM afterwards. Only one attempt of a run is ever live, so an earlier attempt's VM is
     never one Flash is still supervising.
     """
-    prefix = run_label_prefix(run_id)
     for item in list_instances(deadline_at=deadline_at):
-        name = item["name"]
-        if not label_matches_run(name, prefix):
-            continue
-        suffix = name[len(prefix) + len("-a") :]
-        if suffix.isdigit() and int(suffix) < attempt:
-            terminate_confirmed(item["id"], name=name)
+        earlier = attempt_of(item["name"], run_id)
+        if earlier is not None and earlier < attempt:
+            terminate_confirmed(item["id"], name=item["name"])
 
 
 def launch(*, name, run_id, attempt, offer: Offer, region, user_data, deadline_at) -> str:
