@@ -5,13 +5,19 @@ from __future__ import annotations
 import io
 import threading
 import weakref
+from collections.abc import Callable
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, cast
 
 from flash.content.multimodal import (
     IMAGE_PAD_TOKEN,
+    NormalizedImages,
+    content_has_images,
     decode_image_descriptors,
+    image_block_count,
     messages_with_decoded_images,
+    text_only_prompt_messages,
 )
 from flash.content.thinking import messages_for_chat_template
 from flash.engine.profiling.image_tokens import (
@@ -152,7 +158,9 @@ def estimate_sft_image_row(
         validation_state,
     )
 
-    def token_ids(messages: list[dict], *, add_generation_prompt: bool) -> list[int]:
+    def token_ids(
+        messages: list[dict], *, add_generation_prompt: bool, pad_counts: list[int] = pad_counts
+    ) -> list[int]:
         rendered = dict(
             tokenizer.apply_chat_template(
                 messages,
@@ -168,7 +176,13 @@ def estimate_sft_image_row(
     untruncated_ids = token_ids(full_messages, add_generation_prompt=False)
     untruncated_length = len(untruncated_ids)
     input_ids = untruncated_ids[:max_length]
-    prompt_ids = token_ids(normalized_prompt, add_generation_prompt=True)[:max_length]
+    # observation images in the completion follow the prompt's, so the prompt render holds exactly
+    # the leading pad runs.
+    prompt_ids = token_ids(
+        normalized_prompt,
+        add_generation_prompt=True,
+        pad_counts=pad_counts[: image_block_count(normalized_prompt)],
+    )[:max_length]
     # the same narrowing the processor path applies. the quote has to agree with what training will
     # actually supervise: leaving the contiguous mask here would count the environment's replies as
     # supervised tokens the worker then masks away, and report a step budget for a different run.
@@ -200,10 +214,11 @@ def process_sft_image_row(
     """tokenize one image row through the real processor and serialize its tensors."""
     images = cast("list[Any]", decode_image_descriptors(descriptors, package_root))
     try:
-        prepared_prompt = messages_for_chat_template(
-            messages_with_decoded_images(prompt_messages, images)
-        )
-        normalized_completion = messages_for_chat_template(completion_messages)
+        # images bind in conversation order: the prompt's first, then any user observation images
+        # between the completion's assistant turns, which are input context like a prompt image.
+        prepared = messages_with_decoded_images([*prompt_messages, *completion_messages], images)
+        prepared_prompt = messages_for_chat_template(prepared[: len(prompt_messages)])
+        normalized_completion = messages_for_chat_template(prepared[len(prompt_messages) :])
         full_messages = [*prepared_prompt, *normalized_completion]
         rendered_probe = reject_rendered_message_token(
             processor,
@@ -266,3 +281,113 @@ def process_sft_image_row(
     finally:
         for image in images:
             image.close()
+
+
+def normalize_observation_conversation(
+    normalize: Callable[[dict, list[dict], str | Path | None], NormalizedImages],
+    record: dict,
+    prompt_messages: list[dict],
+    completion_messages: list[dict],
+    package_root: str | Path | None,
+) -> tuple[list[dict], list[dict], list[str]]:
+    """normalize a row whose completion carries user observation images.
+
+    the prompt and every image-bearing completion message are normalized as ONE conversation, so the
+    descriptors come out in rendered order and the per-row image limits (count, source and decoded
+    bytes) bound the whole conversation, not each half. completion messages without images keep the
+    text-only form the prompt-image path gives every target.
+    """
+    observed = [
+        index
+        for index, message in enumerate(completion_messages)
+        if content_has_images(message.get("content"))
+    ]
+    normalized = normalize(
+        record,
+        [*prompt_messages, *(completion_messages[index] for index in observed)],
+        package_root,
+    )
+    prompt_count = len(prompt_messages)
+    by_index = dict(zip(observed, normalized.messages[prompt_count:], strict=True))
+    text_only = text_only_prompt_messages(completion_messages)
+    completion = [by_index.get(index, text_only[index]) for index in range(len(text_only))]
+    return normalized.messages[:prompt_count], completion, list(normalized.descriptors)
+
+
+@dataclass(frozen=True)
+class FittedObservationRow:
+    """one image-observation row tokenized at a whole-turn prefix that fits the context cap."""
+
+    result: tuple[list[int], list[int], bytes, int, bool]
+    completion_messages: list[dict]
+    descriptors: list[str]
+    # the WHOLE conversation's length, so truncation reporting still sees the row the cap bound.
+    untruncated_length: int
+
+
+def fit_observation_conversation(
+    tokenize: Callable[..., tuple[list[int], list[int], bytes, int, bool]],
+    prompt_messages: list[dict],
+    completion_messages: list[dict],
+    descriptors: list[str],
+    *,
+    package_root: str | Path | None,
+    max_length: int,
+) -> FittedObservationRow:
+    """tokenize an observation-image row, trimming it to whole turns when the cap binds.
+
+    slicing the token row would cut a screenshot's pad run (its image grid would no longer match the
+    placeholders) or an observation's closing delimiter (the assistant-only mask then cannot read
+    the transcript and would supervise the environment's replies). an overlong row is therefore
+    trimmed to the longest completion prefix that ends on an assistant turn and fits ``max_length``;
+    only that prefix's images are kept. a row whose first assistant turn alone overflows keeps the
+    ordinary right truncation when that prefix shows no completion image, and is refused otherwise.
+    a row without completion images is tokenized once, exactly as before.
+    """
+    prompt_images = image_block_count(prompt_messages)
+
+    def run(count: int) -> FittedObservationRow:
+        part = completion_messages[:count]
+        used = descriptors[: prompt_images + image_block_count(part)]
+        result = tokenize(prompt_messages, part, used, package_root=package_root)
+        return FittedObservationRow(result, part, used, result[3])
+
+    fitted = run(len(completion_messages))
+    whole_length = fitted.untruncated_length
+    if not image_block_count(completion_messages):
+        # a prompt-image row keeps the ordinary right truncation: no observation image can be cut.
+        return fitted
+    if whole_length > max_length:
+        cuts = [
+            count
+            for count in range(1, len(completion_messages))
+            if completion_messages[count - 1].get("role") == "assistant"
+        ]
+        best: FittedObservationRow | None = None
+        low, high = 0, len(cuts) - 1
+        # rendered length grows with the prefix, so the longest fitting cut is a binary search; each
+        # candidate is still checked, so a template that drops earlier reasoning cannot overshoot.
+        while low <= high:
+            middle = (low + high) // 2
+            candidate = run(cuts[middle])
+            if candidate.untruncated_length <= max_length:
+                best, low = candidate, middle + 1
+            else:
+                high = middle - 1
+        if best is None and cuts:
+            best = run(cuts[0])
+        fitted = best or fitted
+        if fitted.untruncated_length > max_length and image_block_count(fitted.completion_messages):
+            raise ValueError(
+                f"an sft row needs {whole_length} tokens but max_context_tokens is {max_length}, "
+                "and its first whole turn would cut an observation image; raise "
+                "max_context_tokens or shorten the trajectory"
+            )
+    if image_block_count(fitted.completion_messages) and not fitted.result[4]:
+        raise ValueError(
+            "an sft completion with observation images needs a ChatML chat template whose "
+            "assistant turns can be located, so the observations stay out of the loss"
+        )
+    return FittedObservationRow(
+        fitted.result, fitted.completion_messages, fitted.descriptors, whole_length
+    )

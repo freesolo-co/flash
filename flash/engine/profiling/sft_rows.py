@@ -158,6 +158,11 @@ def _reject_image_completion(
 ) -> None:
     """reject image targets always, and reserved pad tokens only on image-bearing rows.
 
+    a completion may carry images only in user observation messages: a multi-turn trajectory shows
+    the model a fresh screenshot between its actions, and those images are model INPUT, masked out
+    of the loss exactly like a prompt image. an image in an assistant message would be a target the
+    model cannot emit, so it is always refused, as is any output-image spelling.
+
     the estimator tokenizes an image-bearing prompt and completion as one stream, so a literal
     image-pad token in any field emitted by the chat template is indistinguishable from a real image
     block. the rendered field probe covers content and nested tool-call fields without rejecting
@@ -166,12 +171,22 @@ def _reject_image_completion(
     """
     from flash.content.multimodal import (
         IMAGE_PAD_TOKEN,
-        completion_has_images,
+        completion_image_roles,
         message_content_text,
     )
 
-    if completion_has_images(completion):
-        raise ValueError("image-bearing SFT completions are not supported")
+    for index, role, output_image in completion_image_roles(completion):
+        if role == "assistant" or output_image:
+            raise ValueError(
+                "image-bearing SFT completions are not supported in assistant messages "
+                f"(completion message {index}): the model cannot emit images. Put observation "
+                "images in user messages between the assistant turns."
+            )
+        if role != "user":
+            raise ValueError(
+                f"sft completion message {index} has role {role!r}: completion images are "
+                "supported only in user observation messages"
+            )
     if not image_bearing:
         return
     for message in completion or []:

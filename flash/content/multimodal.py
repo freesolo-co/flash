@@ -273,6 +273,42 @@ def completion_has_images(messages: object) -> bool:
     )
 
 
+def completion_image_roles(messages: object) -> list[tuple[int, str, bool]]:
+    """``(index, role, has_output_image)`` for each completion message carrying an image block.
+
+    every sdk input or output image spelling counts, so a caller can refuse output images and
+    images in roles that are not model input without restating the block-type tables.
+    """
+    if not isinstance(messages, list):
+        return []
+    found: list[tuple[int, str, bool]] = []
+    for index, message in enumerate(messages):
+        content = message.get("content") if isinstance(message, dict) else None
+        if not isinstance(content, list):
+            continue
+        types = [block.get("type") for block in content if isinstance(block, dict)]
+        if any(block_type in _IMAGE_TARGET_BLOCK_TYPES for block_type in types):
+            role = _canonical_role_name(message.get("role"))
+            found.append((index, role, "output_image" in types))
+    return found
+
+
+def image_block_count(messages: list[dict]) -> int:
+    """How many normalized ``{"type": "image"}`` blocks a message list carries, in order."""
+    return sum(
+        1
+        for message in messages
+        if isinstance(message.get("content"), list)
+        for block in message["content"]
+        if isinstance(block, dict) and block.get("type") == "image"
+    )
+
+
+def _canonical_role_name(role: object) -> str:
+    text = str(role).strip().lower()
+    return "system" if text == "developer" else text
+
+
 def text_only_prompt_messages(messages: list[dict]) -> list[dict]:
     """Drop image content blocks while preserving message order and text."""
     stripped: list[dict] = []
