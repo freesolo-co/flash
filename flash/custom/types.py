@@ -63,8 +63,10 @@ class Datum:
     indices i in [0, len(tokens)-2], each naming the position that predicts tokens[i+1].
     Weights, target_tokens and the returned logprobs then have one row per listed position
     instead of len(tokens)-1, so scoring K option tokens at one answer position costs K target
-    entries. For example, target_positions=[len(prompt)-1] with target_tokens=[option_ids]
-    reads the option logprobs right after the prompt.
+    entries. The model reads tokens[:-1], so to score the position right after a prompt,
+    append one placeholder token (any id; it is never read as input):
+    tokens=prompt + [placeholder], target_positions=[len(prompt)-1],
+    target_tokens=[option_ids] reads the option logprobs given the full prompt.
     """
 
     tokens: list[int]

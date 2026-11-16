@@ -1,9 +1,11 @@
 """Optional local losses for forward_backward_custom; they run on the client, never the GPU.
 
 Option scoring reads, for each datum, the logprobs of K option tokens (for example the letters
-A-D) at the position right after the prompt:
+A-D) at the position right after the prompt. The model reads tokens[:-1], so append one
+placeholder token (any id, for example option_ids[0]; it is never read as input):
 
-    Datum(prompt, target_tokens=[option_ids], target_positions=[len(prompt) - 1])
+    Datum(prompt + [option_ids[0]], target_tokens=[option_ids],
+          target_positions=[len(prompt) - 1])
 
 Each datum then scores K target entries, and forward_backward_custom hands loss_fn one [1, K]
 row per datum. The loss renormalizes those rows over the options (softmax over the options

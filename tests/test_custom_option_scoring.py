@@ -76,6 +76,28 @@ def test_rows_follow_target_positions(row, message) -> None:
         _parse({"tokens": [1, 2, 3, 4], "target_positions": [2], **row}, weighted=True)
 
 
+def test_documented_answer_position_example_is_accepted() -> None:
+    prompt, option_ids = [5, 6, 7], [10, 11, 12, 13]
+    # As documented: append a placeholder so the last prompt position predicts the answer.
+    [row] = _parse(
+        {
+            "tokens": [*prompt, option_ids[0]],
+            "target_tokens": [option_ids],
+            "target_positions": [len(prompt) - 1],
+        }
+    )
+    assert row.target_positions == [len(prompt) - 1]
+    # Without the placeholder the answer position is out of range.
+    with pytest.raises(ValueError, match="target_positions"):
+        _parse(
+            {
+                "tokens": prompt,
+                "target_tokens": [option_ids],
+                "target_positions": [len(prompt) - 1],
+            }
+        )
+
+
 def test_answer_position_datum_costs_k_entries_not_every_position() -> None:
     tokens = [1] * 1601
     columns = [list(range(64))]
