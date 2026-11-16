@@ -28,6 +28,12 @@ def require_recorded_scope(status) -> None:
 
         if spot_scope != spot_scope_fingerprint():
             raise RuntimeError("Mithril project or region differs from this run's owner")
+    lambda_scope = getattr(status, "submitted_lambda_scope", None)
+    if lambda_scope is not None:
+        from flash.providers.lambda_.config import scope_fingerprint as lambda_scope_fingerprint
+
+        if lambda_scope != lambda_scope_fingerprint():
+            raise RuntimeError("Lambda account differs from this run's owner")
     recorded = getattr(status, "submitted_modal_scope", None)
     if recorded is not None and recorded != scope_fingerprint():
         raise RuntimeError("Modal credentials or environment differ from this run's owner")

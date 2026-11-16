@@ -22,6 +22,7 @@ from flash.core import catalog
 from flash.core.spec import TRAINER_BACKEND, JobSpec
 from flash.core.spec_persistence import PREPARATION_ENVELOPE_VERSION
 from flash.providers._lifecycle.net import worker as provider_worker
+from flash.providers.lambda_.config import scope_fingerprint as lambda_scope_fingerprint
 from flash.providers.mithril.config import scope_fingerprint as spot_scope_fingerprint
 from flash.providers.modal.auth import scope_fingerprint
 from flash.runner.accounting import artifacts, weight_cache
@@ -361,6 +362,13 @@ def _submit_prepared_job(
         submitted_modal_scope=(scope_fingerprint() if "modal" in available_providers() else None),
         submitted_spot_scope=(
             spot_scope_fingerprint() if "spot" in available_providers() else None
+        ),
+        # Lambda is pinned-only, so only a run that names it can own a Lambda launch.
+        submitted_lambda_scope=(
+            lambda_scope_fingerprint()
+            if "lambda" in (public_spec.gpu.provider.strip().lower(), *public_spec.gpu.providers)
+            and "lambda" in available_providers()
+            else None
         ),
         submitted_instance_providers=[n for n in available_providers() if n in INSTANCE_PROVIDERS],
         submitted_spot_rates=_spot_tariff(public_spec),

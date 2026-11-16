@@ -682,6 +682,30 @@ def _resolved_gpu_count(
     )
 
 
+def _lambda_auto_width(
+    available: tuple[str, ...],
+    authored_ceiling: int | None,
+    cap: int,
+    *,
+    model_id: str,
+    model_revision: str,
+) -> tuple[int, int | None]:
+    """``(ceiling, preferred width)`` for the live catalog query.
+
+    An auto-sized Lambda run (no authored count or class) may rent any structurally safe width,
+    because Lambda's live catalog decides what is rentable now: a run that fits one B200 must not
+    queue while that type is sold out and a fitting multi-card H100 is free. The smallest fitting
+    width (``cap``) stays the preferred one, so a wider rental is only a fallback (see
+    ``_cheapest_allocation``). Every other case keeps ``cap`` and no preference.
+    """
+    if available != ("lambda",) or authored_ceiling is not None:
+        return cap, None
+    widest = geometry_safe_gpu_cap(
+        model_id, MAX_COMBINATION_CARDS, model_revision=model_revision, certify=True
+    )
+    return max(cap, widest), cap
+
+
 def _gather_candidates(
     available: tuple[str, ...],
     *,
@@ -931,6 +955,9 @@ def allocate(
         executed_width=executed_width,
     )
 
+    cap, preferred_width = _lambda_auto_width(
+        available, max_gpu_count, cap, model_id=model_id, model_revision=model_revision
+    )
     constraints = AllocationConstraints(
         disk_gb=disk_gb,
         max_wall_seconds=max_wall_seconds,
@@ -969,4 +996,5 @@ def allocate(
         need=need,
         cost_per_step=None if provider == "spot" else cost_per_step,
         provider_rank=provider_rank,
+        preferred_width=preferred_width,
     )

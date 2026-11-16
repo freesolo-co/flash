@@ -1075,3 +1075,92 @@ def test_terminate_confirmed_refuses_a_serving_vm_by_id(monkeypatch):
     with pytest.raises(client.LambdaApiError, match="not confirmed"):
         api.terminate_confirmed("f" * 32, name=TRAINING_NAME)
     assert posts == ["f" * 32]
+
+
+# --- review follow-ups: recorded ownership, instance-priced metering, auto-sized width -----------
+
+
+def test_recorded_lambda_scope_blocks_recovery_from_another_account(monkeypatch):
+    from flash.providers.modal.auth import require_recorded_scope
+    from flash.server.platform import runtime
+
+    status = SimpleNamespace(
+        submitted_lambda_scope=config.scope_fingerprint(),
+        submitted_instance_providers=["lambda"],
+    )
+    require_recorded_scope(status)
+    provider = get_provider("lambda")
+    monkeypatch.setattr(runtime, "get_status", lambda run_id: status)
+    monkeypatch.setattr("flash.providers.core.registry.configured_providers", lambda: [provider])
+    monkeypatch.setattr(provider, "gc", lambda spec: None)
+    monkeypatch.setattr(provider, "run_instances_remaining", lambda run_id: [])
+    spec = SimpleNamespace(run_id="flash-test")
+    assert runtime._confirm_run_clear(spec)
+    # a rotated key lists another account, whose empty listing proves nothing about the launch
+    monkeypatch.setenv("FLASH_LAMBDA_API_KEY", "another-account")
+    with pytest.raises(RuntimeError, match="Lambda account"):
+        require_recorded_scope(status)
+    assert not runtime._confirm_run_clear(spec)
+    monkeypatch.delenv("FLASH_LAMBDA_API_KEY")
+    with pytest.raises(RuntimeError):
+        require_recorded_scope(status)
+
+
+def test_metering_bills_the_rented_lambda_instance_price(monkeypatch):
+    from flash.runner.accounting import costs
+    from flash.runner.lifecycle.status import rented_shape_key
+
+    wide = handle(instance_type="gpu_8x_h100_sxm5", gpu_count=8, hourly_usd=23.92).to_dict()
+    wide |= {"allocated_gpu": "H100", "allocated_gpu_count": 8}
+    assert rented_shape_key(wide) == "lambda|H100|8|23.92"
+    monkeypatch.setattr(costs, "_persisted_metrics", lambda spec: {})
+    monkeypatch.setattr(
+        costs,
+        "_attempt_meters",
+        lambda status, spec, completed_attempt=None: {"0": {"s": 3600.0, "shape": None}},
+    )
+    monkeypatch.setattr(costs, "_gpu_rate", lambda gpu, provider="": 3.79)
+    status = SimpleNamespace(remote=wide)
+    spec = SimpleNamespace(gpu=SimpleNamespace(type="H100", count=1, spot=False))
+    # one metered hour on 8x SXM5 is its $23.92 list price, not 8 x the cheapest card's $3.79
+    assert costs.metered_charge_usd(status, spec) == pytest.approx(23.92)
+    # each attempt's recorded shape carries its own instance price; legacy keys use the rate card
+    monkeypatch.setattr(
+        costs,
+        "_attempt_meters",
+        lambda status, spec, completed_attempt=None: {
+            "0": {"s": 3600.0, "shape": "lambda|H100|1|4.89"},
+            "1": {"s": 3600.0, "shape": "lambda|H100|1"},
+        },
+    )
+    assert costs.metered_charge_usd(status, spec) == pytest.approx(4.89 + 3.79)
+    # other providers' keys are unchanged
+    modal = {"provider": "modal", "allocated_gpu": "H100", "hourly_usd": 9.0}
+    assert rented_shape_key(modal) == "modal|H100|1"
+
+
+def _wide_allocate(monkeypatch, rows, **kwargs):
+    from flash.providers.core import allocator
+
+    monkeypatch.setattr(allocator, "geometry_safe_gpu_cap", lambda model_id, cap, **k: min(cap, 8))
+    monkeypatch.setattr(api, "_catalog", {"at": 0.0, "data": None})
+    return _allocate(monkeypatch, 60, rows=rows, provider="lambda", **kwargs)
+
+
+def test_auto_sized_lambda_falls_back_to_a_wider_rentable_shape(monkeypatch):
+    keep = ("gpu_8x_h100_sxm5", "gpu_2x_b200_sxm6")
+    sold_out = {name: [] for name in catalog() if name not in keep}
+    allocation = _wide_allocate(monkeypatch, catalog(**sold_out))
+    assert allocation.provider == "lambda"
+    assert allocation.gpu_count > 1
+    # a single card stays first whenever one is rentable
+    allocation = _wide_allocate(monkeypatch, catalog())
+    assert allocation.gpu_count == 1
+    assert max(c.gpu_count for c in allocation.candidates) > 1
+    assert all(
+        c.gpu_count == 1
+        for c in allocation.candidates[: sum(c.gpu_count == 1 for c in allocation.candidates)]
+    )
+    # an authored ceiling is never widened
+    with pytest.raises(CapacityUnavailableError):
+        _wide_allocate(monkeypatch, catalog(**sold_out), max_gpu_count=1)
