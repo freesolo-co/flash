@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import contextlib
 import json
+import math
 import os
 import time
 
@@ -500,7 +501,7 @@ def _persist_metrics(spec: JobSpec, metrics: dict) -> float:
         cost = float(raw_cost) if raw_cost is not None else None
     except (TypeError, ValueError):
         cost = None
-    provider_stamped = provider in ("modal", "spot") and cost is not None
+    provider_stamped = provider in ("modal", "spot", "lambda") and cost is not None
     if cost or provider_stamped:
         metrics = {**metrics, "cost_usd": cost}
     else:
@@ -573,11 +574,17 @@ def _update(run_id: str, new_state: str, *, allow_from_terminal: bool = False, *
 BILLABLE_ATTEMPTS_KEY = "billable_by_attempt"
 
 
+# providers that price a whole rented instance, so its handle's ``hourly_usd`` is the exact rate.
+_INSTANCE_PRICED_PROVIDERS = frozenset({"lambda"})
+
+
 def rented_shape_key(remote) -> str | None:
-    """``provider|gpu|cards`` for the shape a provider handle rented, else ``None``.
+    """``provider|gpu|cards[|instance_usd_hr]`` for the shape a handle rented, else ``None``.
 
     A Spot run may launch on a different (interchangeable) class than it was allocated, so its
-    actual class (``gpu``) wins over ``allocated_gpu``. Card count defaults to 1.
+    actual class (``gpu``) wins over ``allocated_gpu``. Card count defaults to 1. A provider that
+    prices whole instances (Lambda: an 8x SXM5 or a disk-constrained SXM5 is not N x the cheapest
+    card) appends the rented instance's own $/hr, which metering bills instead of the rate card.
     """
     if not isinstance(remote, dict):
         return None
@@ -598,7 +605,17 @@ def rented_shape_key(remote) -> str | None:
     count = remote.get("allocated_gpu_count") or remote.get("gpu_count") or 1
     if isinstance(count, bool) or not isinstance(count, int) or not 1 <= count <= 8:
         count = 1
-    return f"{provider}|{gpu}|{count}"
+    key = f"{provider}|{gpu}|{count}"
+    rate = remote.get("hourly_usd")
+    if (
+        provider in _INSTANCE_PRICED_PROVIDERS
+        and isinstance(rate, (int, float))
+        and not isinstance(rate, bool)
+        and math.isfinite(rate)
+        and rate > 0
+    ):
+        key += f"|{float(rate)!r}"
+    return key
 
 
 def _record_attempt_meter(status, prev, hb) -> None:

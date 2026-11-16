@@ -404,6 +404,40 @@ def test_chat_sends_logprob_options(stub, top_logprobs):
     assert seen["body"]["logprobs"] is True
     assert seen["body"]["top_logprobs"] == top_logprobs
     assert "stream" not in seen["body"]
+    assert "logprob_token_ids" not in seen["body"]
+
+
+def test_chat_sends_logprob_token_ids(stub):
+    url, seen = stub
+    client = ApiClient(url, "fslo-user-test")
+    client.chat(
+        "json-chat/final",
+        [{"role": "user", "content": "hi"}],
+        logprobs=True,
+        logprob_token_ids=list(range(32, 68)),
+    )
+    assert seen["body"]["logprobs"] is True
+    assert seen["body"]["top_logprobs"] == 0
+    assert seen["body"]["logprob_token_ids"] == list(range(32, 68))
+
+
+@pytest.mark.parametrize(
+    ("options", "message"),
+    [
+        ({"logprob_token_ids": [1]}, "logprob_token_ids requires logprobs=true"),
+        ({"logprobs": True, "logprob_token_ids": [1, 1]}, "logprob_token_ids must be"),
+        (
+            {"logprobs": True, "top_logprobs": 2, "logprob_token_ids": [1]},
+            "cannot be combined with positive top_logprobs",
+        ),
+    ],
+)
+def test_chat_rejects_invalid_logprob_token_ids_before_request(stub, options, message):
+    url, seen = stub
+    client = ApiClient(url, "fslo-user-test")
+    with pytest.raises(ClientError, match=message):
+        client.chat("json-chat/final", [{"role": "user", "content": "hi"}], **options)
+    assert "body" not in seen
 
 
 @pytest.mark.parametrize(

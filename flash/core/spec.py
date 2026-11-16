@@ -358,7 +358,8 @@ class TrainSpec:
     # None -> worker's tuned recipe default.
     learning_rate: float | None = field(default=None, metadata={"introduced_in": "0.2.0"})
     # sft only. the packaged-dataset estimate resolves this against the selected row count into
-    # examples_per_update (packed) or pins the optimizer batch to 1 (unpacked). grpo has no
+    # examples_per_update (packed, text or image rows) or pins the optimizer batch to 1 (unpacked:
+    # an architecture with no boundary-safe packing path in the installed stack). grpo has no
     # profile, so they take prompts_per_step instead and reject this key: the two are not the same
     # quantity, and accepting one name for both let the standard sft memory workaround
     # (batch_size = 1) silently mean one prompt per optimizer update on rl.

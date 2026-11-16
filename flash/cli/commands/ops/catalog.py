@@ -30,11 +30,14 @@ def cmd_gpus(args) -> int:
         "Tip: GPU allocation is automatic.\n"
         "The allocator picks the cheapest validated class that fits; GPU classes are not "
         "user-selectable.\n"
-        "Set spot = true for Mithril only. Spot rates are fixed estimates and charges.\n"
+        'Set provider = "spot" (or spot = true) for Mithril only. Spot rates are fixed '
+        "estimates and charges.\n"
         "Spot classes: H100, H200 (priority order). One rate each, $2.10 and $2.60 per GPU-hour, "
         "which is also the cap: jobs start at or below it and keep running up to it. A spot run "
         "takes whichever fitting "
-        "class comes up first."
+        "class comes up first.\n"
+        'Set provider = "lambda" for Lambda Cloud on-demand (A10, A100 SXM 40GB, H100, B200; no H200) '
+        "at Lambda's live list price."
     )
     if render.styled():
         rows = [(info.name, info.vram_gb, modal_rates.get(info.name)) for info in infos]

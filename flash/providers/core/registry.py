@@ -8,7 +8,11 @@ from flash.providers.core.base import Provider
 
 # registry order is not a primary selection preference. it affects only exact full-key allocation
 # ties through Python's stable sort.
-PROVIDER_NAMES: tuple[str, ...] = ("modal", "spot")
+PROVIDER_NAMES: tuple[str, ...] = ("modal", "spot", "lambda")
+
+# Providers a run reaches only by pinning them (``[gpu] provider = "spot"`` / ``"lambda"``).
+# Unpinned allocation never selects them, and a pin on one cannot fall back to another provider.
+PINNED_ONLY_PROVIDERS: tuple[str, ...] = ("spot", "lambda")
 
 
 def validated_provider_preferences(value, *, allow_empty: bool = False) -> tuple[str, ...]:
@@ -30,12 +34,16 @@ def validated_provider_preferences(value, *, allow_empty: bool = False) -> tuple
         if name not in seen:
             result.append(name)
             seen.add(name)
-    if "spot" in result and len(result) != 1:
-        raise ValueError("Spot cannot fall back to another provider; use gpu.provider = 'spot'")
+    for name in PINNED_ONLY_PROVIDERS:
+        if name in result and len(result) != 1:
+            label = "Spot" if name == "spot" else "Lambda"
+            raise ValueError(
+                f"{label} cannot fall back to another provider; use gpu.provider = '{name}'"
+            )
     return tuple(result)
 
 
-INSTANCE_PROVIDERS: tuple[str, ...] = ("modal", "spot")
+INSTANCE_PROVIDERS: tuple[str, ...] = ("modal", "spot", "lambda")
 
 
 def get_provider(name: str) -> Provider:
@@ -51,6 +59,10 @@ def _get_provider(key: str) -> Provider:
         return PROVIDER
     if key == "spot":
         from flash.providers.mithril.provider import PROVIDER
+
+        return PROVIDER
+    if key == "lambda":
+        from flash.providers.lambda_.provider import PROVIDER
 
         return PROVIDER
     raise KeyError(f"unknown provider {key!r}")

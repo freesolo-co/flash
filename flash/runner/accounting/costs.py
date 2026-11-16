@@ -195,17 +195,16 @@ def metered_charge_usd(
             "spot" if spot else str(merged.get("provider") or ""),
             str(getattr(gpu_spec, "type", "") or ""),
             max(1, int(getattr(gpu_spec, "count", 1) or 1)),
+            None,
         )
-    final_hourly = _per_card_rate(final[0], final[1], status) * final[2]
+    final_hourly = _shape_hourly(final, status)
     # each attempt bills at the shape it actually rented (an OOM retry moves to a larger card or
     # count; a Spot resume can land on another class), never repriced at the final rental. an
     # attempt whose shape was never observed bills at the final rental.
     total = 0.0
     for entry in attempts.values():
         shape = _parse_shape(entry["shape"], spot=spot)
-        hourly = (
-            final_hourly if shape is None else _per_card_rate(shape[0], shape[1], status) * shape[2]
-        )
+        hourly = final_hourly if shape is None else _shape_hourly(shape, status)
         total += entry["s"] / 3600.0 * hourly
     return total
 
@@ -228,13 +227,30 @@ def _per_card_rate(provider: str, gpu_type: str, status: RunStatus) -> float:
     return _gpu_rate(gpu_type, provider)
 
 
-def _parse_shape(shape, *, spot: bool) -> tuple[str, str, int] | None:
-    """``provider|gpu|cards`` -> ``(provider, gpu, cards)``; ``None`` when unusable."""
+def _shape_hourly(shape: tuple[str, str, int, float | None], status: RunStatus) -> float:
+    """Whole-rental $/hr: the rented instance's own price when known, else per-card x cards."""
+    if shape[3] is not None:
+        return shape[3]
+    return _per_card_rate(shape[0], shape[1], status) * shape[2]
+
+
+def _parse_shape(shape, *, spot: bool) -> tuple[str, str, int, float | None] | None:
+    """``provider|gpu|cards[|instance_usd_hr]`` -> ``(provider, gpu, cards, instance_usd_hr)``.
+
+    ``None`` when unusable. The optional instance rate is the whole rental's listed price (see
+    ``rented_shape_key``); an unparseable one falls back to the rate card.
+    """
     parts = shape.split("|") if isinstance(shape, str) else []
-    if len(parts) != 3 or not parts[1] or not parts[2].isdigit():
+    if len(parts) not in (3, 4) or not parts[1] or not parts[2].isdigit():
         return None
+    instance_rate = None
+    if len(parts) == 4 and not spot:
+        with contextlib.suppress(ValueError):
+            rate = float(parts[3])
+            if math.isfinite(rate) and rate > 0:
+                instance_rate = rate
     # the authored Spot choice is authoritative, as for the final rental.
-    return ("spot" if spot else parts[0], parts[1], max(1, int(parts[2])))
+    return ("spot" if spot else parts[0], parts[1], max(1, int(parts[2])), instance_rate)
 
 
 def _status_estimated_charge(

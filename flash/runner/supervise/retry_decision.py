@@ -353,13 +353,13 @@ def transition_failure(
     if failure == BOOT_TIMEOUT_FAILURE:
         state, plan = _worker_retriable_plan(state, chosen, "a VM that never booted")
         return _finish(state, plan, observation, attempt)
-    if failure == "no_capacity" and chosen is not None and chosen.provider == "spot":
-        # Spot refused the create for quota/capacity before provisioning anything. Like an
-        # eviction, wait for the same shape: cancellation and the run deadline bound it, not the
+    if failure == "no_capacity" and chosen is not None and chosen.provider in ("spot", "lambda"):
+        # Spot or Lambda refused the create for quota/capacity before provisioning anything. Like
+        # an eviction, wait for the same shape: cancellation and the run deadline bound it, not the
         # failure budget, and a larger (pricier) GPU is never substituted.
         return _finish(
             replace(state, cache_retry_shape=None),
-            RetryPlan(True, "requeuing spot capacity (provider refused the create)"),
+            RetryPlan(True, f"requeuing {chosen.provider} capacity (provider refused the create)"),
             observation,
             attempt,
         )

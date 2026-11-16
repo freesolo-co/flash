@@ -38,8 +38,15 @@ MFU_DECODE = 0.25  # batched vLLM rollout (decode is memory-bandwidth-bound)
 # sft attention: seconds per (6*P*tokens/peak) scaled by mean example length / 32768. long
 # examples cost super-linearly; without it long-context runs under-quote and short ones over-quote.
 SFT_ATTENTION_COEF = 2.0
-# image sft (exact-unpacked rows): vision encoding per example, fitted on 46 multimodal runs.
-SFT_IMAGE_S_PER_EXAMPLE = 0.41
+# image sft: fixed work per image-bearing MICRO-BATCH, fitted on 46 multimodal runs. every one of
+# them trained one example per update (micro-batch 1), so the fit is exactly 0.41 s/example there.
+# it is charged per micro-batch rather than per example because it cannot be vision-encoder flops:
+# a 498x321 MiniWoB screenshot is ~620 patches through a ~0.4B tower, ~1.5e12 flops or ~3 ms on an
+# H100. what remains is the per-forward/backward fixed cost of an image batch (vision tower and
+# gdn kernel launches at short length, checkpoint recompute, mrope assembly), which a packed
+# micro-batch pays once for all of its rows. UNVERIFIED for packed image runs: refit on live
+# batched image runs (see docs/billing-calibration.md).
+SFT_IMAGE_S_PER_MICRO_BATCH = 0.41
 # one-time work inside the billed window: the first optimizer update (graph capture, allocator
 # warm-up, first rollout for grpo). measured, not modeled.
 # grows with model size (graph capture, allocator warm-up, first rollout): base + per-B active params.
@@ -117,16 +124,38 @@ def first_update_seconds(config: RunConfig) -> float:
 
 
 def sft_image_seconds(config: RunConfig) -> float:
-    """Vision-encoder seconds for image SFT rows, which the text-token flops term does not see.
+    """Fixed image-batch seconds for image SFT, which the text-token flops term does not see.
 
-    Gated on the profile's explicit multimodal architecture, not on exact-unpacked packing: text-only
-    models that cannot pack are unpacked too and encode no images. Fitted per example on 46
-    completed multimodal production runs (median 1.00).
+    Gated on the profile's explicit multimodal architecture, not on the packing mode: text-only
+    models that cannot pack are unpacked too and encode no images. Fitted on 46 completed
+    multimodal production runs at one example per update (median 1.00), and charged per executed
+    micro-batch -- see ``SFT_IMAGE_S_PER_MICRO_BATCH``. A batch-1 run is priced exactly as before.
     """
     if not config.sft_multimodal:
         return 0.0
-    examples = max(1, int(config.steps)) * max(1, int(config.batch_size or 1))
-    return SFT_IMAGE_S_PER_EXAMPLE * examples
+    return SFT_IMAGE_S_PER_MICRO_BATCH * sft_micro_batches(config)
+
+
+def sft_micro_batches(config: RunConfig) -> int:
+    """Micro-batches the sft horizon runs: ``ceil(batch / micro_batch)`` per update.
+
+    The micro-batch is the worker's own rule (``sft_per_device``: at most 4, vocab-capped when the
+    fused loss is off), sized at the profile's ``max_length``. The worker sizes it at the realized
+    length, which is never longer, and its token-budgeted micro-batches pack at least this many
+    rows each, so this is an upper bound on the count the run executes.
+    """
+    from flash.core.catalog import vocab_size_for
+    from flash.engine.plan.vram import sft_chunked_nll_enabled, sft_per_device
+
+    batch = max(1, int(config.batch_size or 1))
+    micro = sft_per_device(
+        batch,
+        seq_len=int(config.seq_len or 0),
+        vocab=vocab_size_for(config.model_id),
+        fused=sft_chunked_nll_enabled(config.model_id),
+    )
+    per_update = -(-batch // max(1, min(micro, batch)))
+    return max(1, int(config.steps)) * per_update
 
 
 def sft_step_floor_seconds(steps: int) -> float:
@@ -519,7 +548,11 @@ def _offline_preferred_gpu_shape(config: RunConfig) -> tuple[str, int, int, str,
     configured = available_providers()
     # an unconfigured plane (no credentials anywhere) has nothing to filter against; fall back to the
     # registered set so the quote keeps its historical structural answer instead of going empty.
-    eligible = tuple(name for name in (configured or PROVIDER_NAMES) if name != "spot")
+    from flash.providers.core.registry import PINNED_ONLY_PROVIDERS
+
+    eligible = tuple(
+        name for name in (configured or PROVIDER_NAMES) if name not in PINNED_ONLY_PROVIDERS
+    )
     for provider in config.providers:
         if provider not in eligible:
             continue
@@ -554,10 +587,10 @@ def _offline_gpu_shape(config: RunConfig) -> tuple[str, int, int, str, float]:
     Preparation must not consume live-capacity failures before run creation. Rank rentable shapes
     offline, then replace the quote with the selected live candidate before provisioning.
     """
-    if config.providers == ("spot",):
+    if config.providers in (("spot",), ("lambda",)):
         from dataclasses import replace
 
-        return _offline_gpu_shape(replace(config, provider="spot", providers=()))
+        return _offline_gpu_shape(replace(config, provider=config.providers[0], providers=()))
     if config.providers:
         return _offline_preferred_gpu_shape(config)
     # Fail closed on a model that cannot be sized at all. Curated entries answer from the catalog
@@ -613,6 +646,10 @@ def _offline_gpu_shape(config: RunConfig) -> tuple[str, int, int, str, float]:
             from flash.providers.mithril.pricing import SPOT_GPUS
 
             counts = tuple(n for n in counts if n in SPOT_GPUS[gpu].counts)
+        elif provider == "lambda":
+            from flash.providers.lambda_.pricing import LAMBDA_GPUS
+
+            counts = tuple(n for n in counts if n in LAMBDA_GPUS[gpu].counts)
         for count in counts:
             # credit only the cards that JOIN the run, matching the allocator's `_fits`. quoting the
             # billed count here made the two disagree: a 27B at 128k over 10 rows was quoted 4x H200
@@ -628,6 +665,11 @@ def _offline_gpu_shape(config: RunConfig) -> tuple[str, int, int, str, float]:
                 from flash.providers.mithril.pricing import quote_rate
 
                 hourly = quote_rate()
+            elif provider == "lambda":
+                # offline: Lambda's static list price, never a live catalog read.
+                from flash.providers.lambda_.pricing import static_hourly_rate
+
+                hourly = static_hourly_rate(gpu)
             else:
                 hourly = get_provider("modal" if provider == "auto" else provider).hourly_rate(gpu)
             step_seconds = sharded_step_seconds(
@@ -678,6 +720,19 @@ def _spot_can_hold(config: RunConfig, need: float) -> bool:
     )
 
 
+def _lambda_can_hold(config: RunConfig, need: float) -> bool:
+    """Whether any Lambda shape, at any card count it rents, holds the run on its launched ranks."""
+    from flash.providers.core.base import GPU_INFO
+    from flash.providers.core.sharding import combined_vram_gb
+    from flash.providers.lambda_.pricing import LAMBDA_GPUS
+
+    return any(
+        combined_vram_gb(GPU_INFO[gpu].vram_gb, executed_gpu_count(config, count)) >= need
+        for gpu, shape in LAMBDA_GPUS.items()
+        for count in shape.counts
+    )
+
+
 def _raise_no_fitting_shape(
     config: RunConfig,
     need: float,
@@ -702,6 +757,10 @@ def _raise_no_fitting_shape(
         from flash.providers.mithril.pricing import spot_unsupported_message
 
         raise ValueError(spot_unsupported_message(config.model_id, config.method, need))
+    if provider == "lambda" and not config.gpu_type and not _lambda_can_hold(config, need):
+        from flash.providers.lambda_.pricing import lambda_unsupported_message
+
+        raise ValueError(lambda_unsupported_message(config.model_id, config.method, need))
     remedy = _wider_shape_remedy(config, need, names)
     if config.gpu_type:
         # name every acceptable class, not just the head: with fallbacks authored, reporting the

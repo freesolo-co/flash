@@ -222,6 +222,31 @@ def test_managed_chat_forwards_normalized_tools_without_parsing_output(api, monk
     assert response.json()["choices"][0]["finish_reason"] == "tool_calls"
 
 
+def test_managed_chat_forwards_logprob_token_ids(api, monkeypatch):
+    key, run_id = _deployed_chat_run(api)
+    seen = {}
+
+    def fake_chat(**kwargs):
+        seen.update(kwargs)
+        return _managed_chat_result(kwargs["run_id"])
+
+    monkeypatch.setattr(serving_deploy, "chat", fake_chat)
+    response = api.post(
+        f"/v1/runs/{run_id}/chat",
+        json={
+            "checkpoint_id": f"{run_id}/final",
+            "messages": [{"role": "user", "content": "pick"}],
+            "logprobs": True,
+            "logprob_token_ids": [32, 33, 34],
+        },
+        headers=_bearer(key),
+    )
+    assert response.status_code == 200, response.text
+    assert seen["logprobs"] is True
+    assert seen["top_logprobs"] == 0
+    assert seen["logprob_token_ids"] == [32, 33, 34]
+
+
 def test_managed_chat_rejects_unverified_checkpoint() -> None:
     with pytest.raises(HTTPException, match="has not passed"):
         _authorized_chat_checkpoint(

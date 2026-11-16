@@ -74,12 +74,20 @@ def test_the_gpus_flag_is_gone(capsys):
     assert "--gpus" in capsys.readouterr().err
 
 
-@pytest.mark.parametrize("override", ["gpu.count=4", "gpu.provider=modal", "gpu.type=H100"])
+@pytest.mark.parametrize("override", ["gpu.count=4", "gpu.type=H100"])
 def test_gpu_shape_overrides_are_rejected(tmp_path, override):
     from flash.schema import ConfigError
 
     with pytest.raises(ConfigError, match="no longer supported"):
         _spec(tmp_path, "--set", override)
+
+
+@pytest.mark.parametrize("provider", ["modal", "spot", "lambda"])
+def test_provider_override_pins_the_provider(tmp_path, provider):
+    """`[gpu] provider` is authorable again; class and card count stay allocator-owned."""
+    spec = _spec(tmp_path, "--set", f"gpu.provider={provider}")
+    assert spec.gpu.provider == provider
+    assert spec.gpu.spot is (provider == "spot")
 
 
 def test_a_pinned_small_class_still_does_not_pin_the_card_count():

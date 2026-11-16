@@ -59,7 +59,9 @@ def test_custom_config_uses_common_gpu_syntax_and_lora_validation():
     assert spec.gpu.type == ""
     assert spec.gpu.provider == ""
     raw["gpu"] = {"provider": "modal"}
-    with pytest.raises(ConfigError, match="provider is no longer supported"):
+    assert spec_from_dict(raw).gpu.provider == "modal"
+    raw["gpu"] = {"provider": "lambda"}
+    with pytest.raises(ConfigError, match="custom training supports"):
         spec_from_dict(raw)
     raw["gpu"] = {}
     raw["train"]["lora_rank"] = 0

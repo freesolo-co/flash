@@ -503,9 +503,13 @@ def test_remove_padding_is_unconditional():
         (("gdn-hybrid", False), "exact-unpacked"),
         (("unsupported", False), "exact-unpacked"),
         (("pure-attention", True), "packed"),
+        (("gdn-hybrid", True), "packed"),
     ],
 )
-def test_batch_is_the_isolation_lever_that_replaces_the_removed_flag(support, expected_mode):
+@pytest.mark.parametrize("multimodal", [False, True])
+def test_batch_is_the_isolation_lever_that_replaces_the_removed_flag(
+    support, expected_mode, multimodal
+):
     """Deleting the gate is only safe because no unsupported architecture ever packs.
 
     `use_remove_padding` used to be the (broken) isolation lever. The real one is the batch size,
@@ -524,14 +528,67 @@ def test_batch_is_the_isolation_lever_that_replaces_the_removed_flag(support, ex
     packing_mode, architecture_mode = _packing_mode(
         "Qwen/Qwen3.5-9B",
         "rev",
-        multimodal=False,
+        multimodal=multimodal,
         allow_packing=True,
         packing_support=lambda _m, _r: support,
     )
 
-    assert (packing_mode, architecture_mode) == (expected_mode, support[0])
+    # image rows ride the same architecture decision; only the label differs, so the cost model
+    # can still price their vision work.
+    label = "multimodal" if multimodal else support[0]
+    assert (packing_mode, architecture_mode) == (expected_mode, label)
     # an architecture that cannot pack must not be able to reach a batch > 1
     assert (expected_mode == "packed") is support[1]
+
+
+@pytest.mark.parametrize(
+    ("architecture", "packing", "per_update", "strict_calls", "soft_calls"),
+    [
+        ("gdn-hybrid", "packed", 4, 0, 0),
+        ("multimodal", "packed", 4, 1, 0),
+        ("multimodal", "packed", 1, 0, 1),
+        ("multimodal", "exact-unpacked", 1, 0, 1),
+        ("pure-attention", "packed", 4, 0, 1),
+    ],
+)
+def test_packed_image_profiles_resolve_the_gdn_gate_with_the_raising_probe(
+    monkeypatch, architecture, packing, per_update, strict_calls, soft_calls
+):
+    """A packed image batch must not lose its boundary resets to a swallowed config read.
+
+    An image profile is labelled ``multimodal``, not ``gdn-hybrid``, so the worker cannot read the
+    architecture off it. When the batch has neighbours it re-asks with the probe that RAISES.
+    """
+    from types import SimpleNamespace
+
+    from flash.engine.worker.train.entry import sft_train
+
+    calls = {"strict": 0, "soft": 0}
+
+    def strict(*_args):
+        calls["strict"] += 1
+        return True
+
+    def soft(*_args):
+        calls["soft"] += 1
+        return True
+
+    monkeypatch.setattr(sft_train, "probe_is_gdn_hybrid", strict)
+    monkeypatch.setattr(sft_train, "model_is_gdn_hybrid", soft)
+    profile = SimpleNamespace(
+        architecture_mode=architecture, packing_mode=packing, examples_per_update=per_update
+    )
+
+    assert sft_train._profile_is_gdn_hybrid(profile, "Qwen/Qwen3.5-9B", "rev") is True
+    assert calls == {"strict": strict_calls, "soft": soft_calls}
+
+    def unreadable(*_args):
+        raise OSError("config read timed out")
+
+    monkeypatch.setattr(sft_train, "probe_is_gdn_hybrid", unreadable)
+    if strict_calls:
+        with pytest.raises(OSError, match="timed out"):
+            sft_train._profile_is_gdn_hybrid(profile, "Qwen/Qwen3.5-9B", "rev")
 
 
 def test_small_lr_renders_fixed_point_not_scientific():

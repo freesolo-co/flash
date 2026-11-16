@@ -23,6 +23,7 @@ def chat_body(payload):
         "presence_penalty": 0.0,
         "logprobs": False,
         "top_logprobs": 0,
+        "logprob_token_ids": None,
         "tools": None,
         "tool_choice": None,
         "parallel_tool_calls": None,

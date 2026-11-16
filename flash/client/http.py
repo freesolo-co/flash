@@ -35,6 +35,7 @@ from flash.core.spec import require_project_id
 from flash.serve.contract.urls import is_freesolo_hosted_url
 from flash.serve.request.tool_calls import validate_tool_control_presence
 from flash.serve.runtime.sampling import (
+    validate_logprob_token_ids,
     validate_logprobs,
     validate_sampling_relationships,
     validate_top_logprobs,
@@ -837,17 +838,25 @@ class ApiClient:
         tools: list[dict[str, Any]] | None = None,
         tool_choice: str | None = None,
         parallel_tool_calls: bool | None = None,
+        logprob_token_ids: list[int] | None = None,
     ) -> dict:
         """Return a complete chat response, optionally including per-token log probabilities.
 
         Set ``logprobs=True`` and ``top_logprobs=K`` (0-20) to include the top K
-        alternatives per generated token in ``choices[].logprobs.content``.
+        alternatives per generated token in ``choices[].logprobs.content``. Or set
+        ``logprobs=True`` and ``logprob_token_ids`` (1-128 unique token ids) to get exactly those
+        tokens' logprobs, plus the sampled token, at every generated position.
         """
         try:
             logprobs = validate_logprobs(logprobs)
             top_logprobs = validate_top_logprobs(top_logprobs)
+            candidate_ids = validate_logprob_token_ids(logprob_token_ids)
             validate_sampling_relationships(
-                n=1, temperature=temperature, logprobs=logprobs, top_logprobs=top_logprobs
+                n=1,
+                temperature=temperature,
+                logprobs=logprobs,
+                top_logprobs=top_logprobs,
+                logprob_token_ids=candidate_ids,
             )
         except ValueError as exc:
             raise ClientError(str(exc)) from exc
@@ -862,6 +871,8 @@ class ApiClient:
         )
         if logprobs:
             body.update(logprobs=True, top_logprobs=top_logprobs)
+        if candidate_ids is not None:
+            body["logprob_token_ids"] = list(candidate_ids)
         return self._request(
             "POST",
             f"/v1/runs/{base_run_id}/chat",

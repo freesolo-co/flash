@@ -421,8 +421,10 @@ that fits its plan (an H100 run also takes an H200) and launches on whichever co
 
 GPU allocation and Azure artifacts are **managed**: the allocator picks the cheapest fitting
 shape (class, card count, and provider), and `train.hf_repo` remains platform-managed. GPU
-selection is not user-configurable: `spot` is the only `[gpu]` key, and `type`, `count`,
-`provider`, and `providers` are rejected at parse time. Run artifacts are stored in a
+class and card count are not user-configurable: `type`, `count`, and `providers` are rejected
+at parse time. `[gpu] provider = "<name>"` optionally pins where a run trains (`modal`, `spot`,
+or `lambda`); omit it for automatic allocation, which never picks Spot or Lambda.
+`spot = true` is the legacy spelling of `provider = "spot"`. `max_count` caps the card count. Run artifacts are stored in a
 private environment-scoped repo with content-addressed Flash code snapshots. Set `seed` only at the
 top level: a run has exactly one seed, and if a host fails Flash executes another attempt of that
 same run rather than a new one, so every attempt trains on the seed you set here.
@@ -906,6 +908,15 @@ Pick SFT when you already have good answers and want the model to imitate them.
   including text content, reasoning, and tool-call serialization. They are indistinguishable from
   structural turn delimiters after tokenization. The run logs role-aware masked rows and any
   completion-only fallback rows separately.
+- **Image observations can stay in a multi-turn target.** A browser or GUI trajectory can be one
+  row: the first turns in `prompt_messages` and `output = {"messages": [assistant, user(text +
+  screenshot), assistant, ...]}`. Images in the target's **user** messages are model input: they
+  are tokenized in conversation order exactly like prompt images and masked out of the loss, so
+  only the assistant turns are supervised. Images in assistant (or tool) messages are rejected.
+  The image limits (32 images, total source and decoded bytes) apply to the whole conversation.
+  When the row exceeds `max_context_tokens`, it is trimmed to the longest prefix that ends on a
+  whole assistant turn instead of being cut mid-screenshot; raise `max_context_tokens` to keep
+  later turns.
 - **Thinking SFT requires reasoning in every assistant target, preserved by the
   chat template.** With `thinking = true`, provide nonempty `reasoning_content` or a
   leading `<think>...</think>` span, including in assistant replies after tool results.
@@ -1619,7 +1630,7 @@ rejected as unknown settings; no legacy optimizer or loss shim is installed.
 
 ### Spot recovery checkpoints
 
-With `[gpu] spot = true`, Flash uses Mithril and manages recovery checkpoints automatically.
+With `[gpu] provider = "spot"` (or `spot = true`), Flash uses Mithril and manages recovery checkpoints automatically.
 A greedy scheduler uses the latest step duration, targeting at most 10 minutes of
 unsaved training: 5-minute steps save every 2 steps; 1-minute steps every 10.
 The first and final completed steps also save. Steps lasting 10 minutes or longer save after every step. Slow steps or uploads can exceed
@@ -1628,3 +1639,11 @@ An optional `train.save_at_steps` schedule adds model exports to those automatic
 saves; it cannot disable them. After preemption, the replacement Mithril Spot VM
 resumes the latest fully uploaded trainer checkpoint. An interrupted upload is
 not a valid resume point.
+
+### Lambda Cloud on-demand
+
+With `[gpu] provider = "lambda"`, Flash rents a Lambda Cloud on-demand VM (A10, A100 SXM 40GB,
+H100 or B200; Lambda sells no H200) at Lambda's live list price, picking the cheapest instance
+type that fits and currently has capacity. It cannot be combined with `spot = true`, and
+unpinned runs never use Lambda. When Lambda has no capacity the run stays
+queued until it does or the run deadline passes. `max_count` still bounds the card count.

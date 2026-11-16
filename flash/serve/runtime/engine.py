@@ -31,7 +31,13 @@ from .prompt import (
     resolve_thinking,
 )
 from .reasoning_tools import ReasoningToolStreamParser, parse_tool_output
-from .sampling import complete_indexed_outputs, indexed_outputs, normalize_token_logprobs
+from .sampling import (
+    complete_indexed_outputs,
+    indexed_outputs,
+    normalize_token_logprobs,
+    response_logprob_width,
+    vllm_logprob_kwargs,
+)
 from .tool_calls import ParsedToolCall
 from .types import (
     AdapterSpec,
@@ -369,7 +375,9 @@ class VllmLoraRuntime:
             _generation_choice(
                 index,
                 output,
-                top_logprobs=request.top_logprobs,
+                top_logprobs=response_logprob_width(
+                    request.top_logprobs, request.logprob_token_ids
+                ),
                 tools=request.tools if tools_active(request.tools, request.tool_choice) else None,
                 thinking=bool(thinking),
             )
@@ -422,7 +430,7 @@ class VllmLoraRuntime:
                 )
                 state = _StreamState.create(
                     request.n,
-                    request.top_logprobs,
+                    response_logprob_width(request.top_logprobs, request.logprob_token_ids),
                     request.tools if tools_active(request.tools, request.tool_choice) else None,
                     thinking=bool(thinking),
                 )
@@ -658,7 +666,11 @@ class VllmLoraRuntime:
             seed=request.seed,
             frequency_penalty=request.frequency_penalty,
             presence_penalty=request.presence_penalty,
-            logprobs=request.top_logprobs if request.logprobs else None,
+            **vllm_logprob_kwargs(
+                logprobs=request.logprobs,
+                top_logprobs=request.top_logprobs,
+                logprob_token_ids=request.logprob_token_ids,
+            ),
             output_kind=output_kind,
             structured_outputs=structured.params,
             # pass none rather than an empty list so vllm keeps its own default.

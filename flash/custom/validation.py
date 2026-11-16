@@ -50,7 +50,7 @@ def validate_operation(backend, operation, arguments):
         ]
         if operation == "forward":
             args["top_k"] = integer(args.get("top_k", 0), "top_k", 0, min(20, backend.vocab_size))
-            if sum(len(row.tokens) - 1 for row in args["data"]) * args["top_k"] > 100_000:
+            if sum(row.scored_rows for row in args["data"]) * args["top_k"] > 100_000:
                 raise ValueError("top-k output exceeds 100000 entries; split the scoring batch")
         else:
             metrics = args.get("metrics", {})

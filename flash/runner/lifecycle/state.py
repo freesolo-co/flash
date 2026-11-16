@@ -146,6 +146,9 @@ class RunStatus:
     submitted_instance_providers: list[str] | None = None
     submitted_modal_scope: str | None = None
     submitted_spot_scope: str | None = None
+    # Lambda account fingerprint at submit, so a handle-less recovery never enumerates another
+    # account and mistakes an empty listing for a gone VM.
+    submitted_lambda_scope: str | None = None
     # Spot per-class rates (USD per GPU-hour) in force when this run was quoted. Settlement reprices
     # the accepted quote with these, never with rates that changed after submission. None for
     # non-Spot runs and for runs submitted before this was recorded (they settle on the legacy table).

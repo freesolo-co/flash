@@ -148,7 +148,9 @@ class TrainingClient:
         or pickle is sent to the GPU. Both passes use the same model version and dropout-free
         model. Cross-sequence objectives (DPO, PPO, ranking, etc.) are supported. Rows with a
         [T, K] target_tokens matrix receive [T, K] logprobs, so soft-target losses such as KL
-        to a teacher's top-k read them directly.
+        to a teacher's top-k read them directly. With target_positions, T is the number of
+        listed positions; flash.custom.losses.option_ce_brier_loss is one such loss over
+        option-token logprobs at an answer position.
         """
         import torch
 
@@ -161,6 +163,9 @@ class TrainingClient:
                     if row.target_tokens is not None
                     else None,
                     images=list(row.images) if row.images is not None else None,
+                    target_positions=list(row.target_positions)
+                    if row.target_positions is not None
+                    else None,
                 )
                 for row in data
             ]
@@ -184,7 +189,9 @@ class TrainingClient:
                     if not torch.isfinite(gradient).all():
                         raise ValueError("custom loss produced non-finite token gradients")
                     weight = (-gradient).tolist()
-                weights.append(Datum(row.tokens, weight, row.target_tokens, row.images))
+                weights.append(
+                    Datum(row.tokens, weight, row.target_tokens, row.images, row.target_positions)
+                )
             return self.forward_backward(weights, metrics={**metrics, "custom_loss": loss.item()})
 
     def optim_step(self, *, learning_rate, max_grad_norm=1.0, algorithm_state=None):

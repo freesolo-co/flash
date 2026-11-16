@@ -17,6 +17,7 @@ from flash.serve.request.tool_calls import (
 from flash.serve.request.validation import MAX_SOURCE_CHARS, has_image_blocks, normalize_messages
 from flash.serve.runtime.sampling import (
     validate_choice_count,
+    validate_logprob_token_ids,
     validate_logprobs,
     validate_penalty,
     validate_sampling_relationships,
@@ -35,6 +36,7 @@ class OpenAIGenerateRequest(GenerateRequest):
     presence_penalty: float = 0.0
     logprobs: bool = False
     top_logprobs: int = 0
+    logprob_token_ids: list[int] | None = None
     tools: list[dict[str, Any]] | None = None
     tool_choice: str | None = None
     parallel_tool_calls: bool | None = None
@@ -64,6 +66,16 @@ class OpenAIGenerateRequest(GenerateRequest):
     def validate_top_logprobs_value(cls, value: Any) -> int:
         return validate_top_logprobs(value)
 
+    @field_validator("logprob_token_ids", mode="before")
+    @classmethod
+    def validate_logprob_token_ids_value(cls, value: Any) -> list[int] | None:
+        token_ids = validate_logprob_token_ids(value)
+        return None if token_ids is None else list(token_ids)
+
+    @property
+    def logprob_token_id_tuple(self) -> tuple[int, ...] | None:
+        return None if self.logprob_token_ids is None else tuple(self.logprob_token_ids)
+
     @model_validator(mode="before")
     @classmethod
     def validate_tools(cls, value: Any) -> Any:
@@ -85,6 +97,7 @@ class OpenAIGenerateRequest(GenerateRequest):
             temperature=self.temperature,
             logprobs=self.logprobs,
             top_logprobs=self.top_logprobs,
+            logprob_token_ids=self.logprob_token_id_tuple,
         )
         validate_tool_control_presence(
             self.tools,

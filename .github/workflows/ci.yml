@@ -130,7 +130,7 @@ jobs:
         env:
           HF_HUB_OFFLINE: "1"
           TRANSFORMERS_OFFLINE: "1"
-        run: .venv/bin/pytest -q tests/test_custom_gradients.py tests/test_custom_session.py tests/test_custom_client.py tests/test_custom_managed.py
+        run: .venv/bin/pytest -q tests/test_custom_gradients.py tests/test_custom_option_scoring.py tests/test_custom_session.py tests/test_custom_client.py tests/test_custom_managed.py
 
   typecheck:
     name: mypy (advisory)

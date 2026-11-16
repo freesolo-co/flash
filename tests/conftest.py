@@ -371,6 +371,19 @@ def _offline(monkeypatch):
 
     monkeypatch.setattr(modal_api, "call", no_live_calls)
 
+    # Lambda Cloud: never configured from the operator shell, never called for real, and no catalog
+    # cached across tests. A test opts in by setting the env and stubbing the client.
+    from flash.providers.lambda_ import api as lambda_api
+    from flash.providers.lambda_ import client as lambda_client
+
+    def no_lambda_calls(*args, **kwargs):
+        raise AssertionError("offline tests must stub the Lambda API")
+
+    monkeypatch.setattr(lambda_client, "_once", no_lambda_calls)
+    monkeypatch.setattr(lambda_api, "_catalog", {"at": 0.0, "data": None})
+    for _key in ("FLASH_LAMBDA_API_KEY", "FLASH_LAMBDA_SSH_KEY_NAME"):
+        monkeypatch.delenv(_key, raising=False)
+
     # scrub automatically forwarded secrets from the production key set so operator credentials
     # never enter fixtures. FREESOLO_API_KEY changes org
     # identity, and FLASH_STANDALONE/FLASH_HF_NAMESPACE change global mode. tests opt in after this

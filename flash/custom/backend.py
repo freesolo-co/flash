@@ -121,8 +121,11 @@ class TorchBackend:
             "mm_token_type_ids": (ids == self._image_pad_id()).int(),
         }
 
-    def _logprobs(self, tokens, target_tokens=None, vision=None):
-        """Logprobs of the targets: the next token ([T]) or a [T, K] target matrix."""
+    def _logprobs(self, tokens, target_tokens=None, vision=None, target_positions=None):
+        """Logprobs of the targets: the next token ([T]) or a [T, K] target matrix.
+
+        target_positions keeps only those positions' rows (T becomes len(target_positions)).
+        """
         import torch
 
         ids = self._tensor(tokens)
@@ -132,8 +135,12 @@ class TorchBackend:
             .logits[0]
             .float()
         )
+        next_tokens = ids[0, 1:, None].to(logits.device)
+        if target_positions is not None:
+            rows = torch.tensor(target_positions, device=logits.device, dtype=torch.long)
+            logits, next_tokens = logits[rows], next_tokens[rows]
         if target_tokens is None:
-            targets = ids[0, 1:, None].to(logits.device)
+            targets = next_tokens
         else:
             targets = torch.tensor(target_tokens, device=logits.device, dtype=torch.long)
         # gather targets and one normalizer per position; never copy a vocabulary row each.
@@ -146,7 +153,9 @@ class TorchBackend:
         outputs = []
         with torch.no_grad():
             for row in data:
-                logprobs, logits = self._logprobs(row.tokens, row.target_tokens, row.vision)
+                logprobs, logits = self._logprobs(
+                    row.tokens, row.target_tokens, row.vision, row.target_positions
+                )
                 output = {"logprobs": logprobs.cpu().tolist()}
                 if top_k:
                     values, indices = logits.topk(top_k, dim=-1)
@@ -168,7 +177,9 @@ class TorchBackend:
         self.model.train(self.checkpointing)
         try:
             for row in data:
-                logprobs, _ = self._logprobs(row.tokens, row.target_tokens, row.vision)
+                logprobs, _ = self._logprobs(
+                    row.tokens, row.target_tokens, row.vision, row.target_positions
+                )
                 weights = torch.tensor(row.weights, device=logprobs.device, dtype=logprobs.dtype)
                 loss = -(weights * logprobs).sum()
                 if not torch.isfinite(loss):

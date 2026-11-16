@@ -20,6 +20,8 @@ from flash.serve.runtime.sampling import (
     complete_indexed_outputs,
     indexed_outputs,
     normalize_token_logprobs,
+    response_logprob_width,
+    vllm_logprob_kwargs,
 )
 from flash.serve.runtime.tool_calls import (
     ParsedToolCall,
@@ -51,6 +53,7 @@ _OPENAI_FIELDS = frozenset(
         "presence_penalty",
         "logprobs",
         "top_logprobs",
+        "logprob_token_ids",
         "tools",
         "tool_choice",
         "parallel_tool_calls",
@@ -83,7 +86,11 @@ def _sampling_params(
         seed=payload.seed,
         frequency_penalty=payload.frequency_penalty,
         presence_penalty=payload.presence_penalty,
-        logprobs=payload.top_logprobs if payload.logprobs else None,
+        **vllm_logprob_kwargs(
+            logprobs=payload.logprobs,
+            top_logprobs=payload.top_logprobs,
+            logprob_token_ids=payload.logprob_token_id_tuple,
+        ),
         output_kind=output_kind,
         structured_outputs=structured,
         stop=payload.stop,
@@ -270,7 +277,9 @@ async def generate(
         _choice(
             index,
             output,
-            top_logprobs=payload.top_logprobs,
+            top_logprobs=response_logprob_width(
+                payload.top_logprobs, payload.logprob_token_id_tuple
+            ),
             tools=active_tools,
         )
         for index, output in sorted(complete_indexed_outputs(final_output, n=payload.n).items())
@@ -342,7 +351,9 @@ def _consume_stream_output(
         logprobs = normalize_token_logprobs(
             token_ids,
             getattr(output, "logprobs", None),
-            top_logprobs=payload.top_logprobs,
+            top_logprobs=response_logprob_width(
+                payload.top_logprobs, payload.logprob_token_id_tuple
+            ),
         )
         text = str(getattr(output, "text", "") or "")
         visible = tool_parsers[index].feed(text) if index in tool_parsers else text

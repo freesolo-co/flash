@@ -11,14 +11,17 @@ from functools import partial
 from pathlib import Path
 from typing import Any, Protocol, TypedDict, cast
 
-from flash.content.multimodal import NormalizedImages
+from flash.content.multimodal import NormalizedImages, completion_has_images
 from flash.content.processor import inherit_tokenizer_chat_template
 from flash.content.thinking import messages_for_chat_template
 from flash.engine.plan.recipe import RECIPE
 from flash.engine.plan.steps import resolve_update_horizon, sft_update_steps
 from flash.engine.profiling import sft_tools
 from flash.engine.profiling.sft_image_rows import (
+    FittedObservationRow,
     estimate_sft_image_row,
+    fit_observation_conversation,
+    normalize_observation_conversation,
     process_sft_image_row,
 )
 from flash.engine.profiling.sft_reasoning import (
@@ -207,8 +210,23 @@ def _packing_mode(
     allow_packing: bool,
     packing_support: Callable[[str, str], tuple[str, bool]] | None,
 ) -> tuple[str, str]:
-    if multimodal:
-        return "exact-unpacked", "multimodal"
+    architecture_mode, supported = _architecture_packing_support(
+        model_id, revision, packing_support
+    )
+    mode = "packed" if allow_packing and supported else "exact-unpacked"
+    # image rows pack under the SAME boundary contract as text: verl concatenates each row's
+    # pixel_values/image_grid_thw in micro-batch order and keeps the 4-row mrope positions per row,
+    # and the gdn hook resets at the text-position boundaries (row 0 of those positions), which is
+    # the layout grpo already trains vision rows on. the label stays "multimodal" because the cost
+    # model keys the vision term on it and the worker resolves the gdn gate strictly for it.
+    return mode, ("multimodal" if multimodal else architecture_mode)
+
+
+def _architecture_packing_support(
+    model_id: str,
+    revision: str,
+    packing_support: Callable[[str, str], tuple[str, bool]] | None,
+) -> tuple[str, bool]:
     if packing_support is not None:
         architecture_mode, supported = packing_support(model_id, revision)
     else:
@@ -236,7 +254,7 @@ def _packing_mode(
                 f"architecture probe for {model_id!r} could not resolve the model config, so the "
                 "packing mode cannot be frozen into a workload profile"
             ) from e
-    return ("packed" if allow_packing and supported else "exact-unpacked"), architecture_mode
+    return architecture_mode, supported
 
 
 def sft_tokens_for_updates(
@@ -386,6 +404,36 @@ def _text_sft_row_spec(
     )
 
 
+def _fit_image_row(
+    image: _SftImagePipeline,
+    example: dict,
+    prompt_messages: list[dict],
+    completion_messages: list[dict],
+    *,
+    package_root,
+    max_length: int,
+    text_only_prompt_messages: Callable,
+) -> tuple[list[dict], FittedObservationRow]:
+    """normalize and tokenize one image row; observation images ride in their completion turns."""
+    if completion_has_images(completion_messages):
+        prompt_view, completion_messages, descriptors = normalize_observation_conversation(
+            image.normalize, example, prompt_messages, completion_messages, package_root
+        )
+    else:
+        normalized = image.normalize(example, prompt_messages, package_root)
+        prompt_view, descriptors = normalized.messages, list(normalized.descriptors)
+        completion_messages = text_only_prompt_messages(completion_messages)
+    fitted = fit_observation_conversation(
+        image.tokenize,
+        prompt_view,
+        completion_messages,
+        descriptors,
+        package_root=package_root,
+        max_length=max_length,
+    )
+    return prompt_view, fitted
+
+
 def _tokenize_prompt_rows(
     spec,
     prompt_rows: list[tuple[Any, list[dict], list[dict], bool]],
@@ -428,7 +476,9 @@ def _tokenize_prompt_rows(
         completion_messages,
         coerced_scalar_output,
     ) in enumerate(prompt_rows):
-        has_images = record_has_images(example, prompt_messages)
+        # user observation images in the completion make the row image-bearing as much as a prompt
+        # image does; images anywhere else in the completion are refused here.
+        has_images = record_has_images(example, [*prompt_messages, *completion_messages])
         _reject_image_completion(completion_messages, image_bearing=has_images)
         tools = sft_tools.sft_row_tools(example)
         # read before the image branch rewrites `completion_messages` to its text-only form.
@@ -444,41 +494,39 @@ def _tokenize_prompt_rows(
         if has_images:
             if image is None:
                 raise RuntimeError("multimodal sft row has no image pipeline")
-            normalized = image.normalize(example, prompt_messages, package_root)
-            completion_messages = text_only_prompt_messages(completion_messages)
-            (
-                input_ids,
-                loss_mask,
-                multimodal_inputs,
-                untruncated_length,
-                assistant_mask_applied,
-            ) = image.tokenize(
-                normalized.messages,
+            prompt_view, fitted = _fit_image_row(
+                image,
+                example,
+                prompt_messages,
                 completion_messages,
-                normalized.descriptors,
                 package_root=package_root,
+                max_length=max_length,
+                text_only_prompt_messages=text_only_prompt_messages,
             )
-            untruncated_by_index[row_index] = untruncated_length
+            completion_messages = fitted.completion_messages
+            input_ids, loss_mask, multimodal_inputs, fitted_length, mask_applied = fitted.result
+            untruncated_by_index[row_index] = fitted.untruncated_length
             if multiturn:
-                multiturn_mask_applied[row_index] = assistant_mask_applied
+                multiturn_mask_applied[row_index] = mask_applied
             row_by_index[row_index] = {
                 "input_ids": input_ids,
                 "loss_mask": loss_mask,
                 "images": _materialize_verl_images(
-                    normalized.descriptors,
+                    fitted.descriptors,
                     package_root,
                     image_dir,
                     row_index,
                 ),
                 "multimodal_inputs": multimodal_inputs,
             }
-            text = render_transcript([*normalized.messages, *completion_messages])
+            text = render_transcript([*prompt_view, *completion_messages])
             sampled_texts.append(text)
-            # every image is in the prompt, so visual expansion shifts every completion position by
-            # the same amount; charge that inflation before measuring reasoning against the cap.
-            visual_inflation = max(0, untruncated_length - _encoded_length(tokenizer, text))
+            # charge the whole visual expansion before measuring reasoning against the cap. it shifts
+            # every completion position by the same amount when the images are in the prompt; an
+            # observation-image row was fitted whole, so no reasoning span of it can be cut anyway.
+            visual_inflation = max(0, fitted_length - _encoded_length(tokenizer, text))
             reasoning_by_index[row_index] = _row_reasoning(
-                normalized.messages,
+                prompt_view,
                 completion_messages,
                 render=render_transcript,
                 tokenizer=tokenizer,
@@ -635,8 +683,9 @@ def _resolve_sft_step_horizon(
     """Compute optimizer updates and exact tokens consumed by the resolved horizon."""
     # batch size follows the packing mode: `exact-unpacked` keeps one example per update, which is
     # what makes an unpacked gdn run boundary-safe (no packed neighbours to contaminate). a `packed`
-    # gdn run has earned that mode through the boundary-reset contract above. this CPU-side choice
-    # sets quoted and executed steps. the child probe controls verl layout, not batch size.
+    # gdn run -- text or image -- has earned that mode through the boundary-reset contract above.
+    # this CPU-side choice sets quoted and executed steps. the child probe controls verl layout,
+    # not batch size.
     examples_per_update = min(effective_batch, len(rows)) if packing_mode == "packed" else 1
     # packed_blocks is already the optimizer batches verl runs per epoch, so the horizon is one
     # update per block per epoch. do not divide by examples_per_update again.
@@ -850,15 +899,17 @@ def prepare_sft_workload(
             prompt_messages = env.prompt_messages(example)
         completion_messages, coerced_scalar_output = _sft_completion_with_provenance(env, example)
         sft_tools.reject_image_row_tools(
-            example, image_bearing=record_has_images(example, prompt_messages)
+            example,
+            image_bearing=record_has_images(example, prompt_messages)
+            or completion_has_images(completion_messages),
         )
         prompt_rows.append((example, prompt_messages, completion_messages, coerced_scalar_output))
     if spec.thinking:
         _require_reasoning_when_thinking(prompt_rows)
     package_root = getattr(env, "package_root", None)
     multimodal = any(
-        record_has_images(example, prompt_messages)
-        for example, prompt_messages, _completion, _used_fallback in prompt_rows
+        record_has_images(example, prompt_messages) or completion_has_images(completion)
+        for example, prompt_messages, completion, _used_fallback in prompt_rows
     )
     tokenization = _resolve_sft_tokenization(
         spec,

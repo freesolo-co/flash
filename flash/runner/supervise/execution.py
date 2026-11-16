@@ -184,32 +184,42 @@ def _prepare_attempt(ctx: _SubmitContext):
     return (claim, attempt_spec, attempt_runtime_secrets, retry_state), None
 
 
+def _queued_provider(spec) -> str | None:
+    """The pinned live-capacity provider whose sold-out answer means "wait", not "fail"."""
+    for name in ("spot", "lambda"):
+        if spec.gpu.provider == name or spec.gpu.providers == (name,):
+            return name
+    return None
+
+
 def _allocate_attempt(ctx: _SubmitContext, prepared):
     """Price/capacity waiting is queue time, not a failed training attempt."""
     from flash.runner.lifecycle.deadlines import _load_run_deadline_at
     from flash.runner.lifecycle.status import _update
 
     spec = prepared[1]
-    if spec.gpu.provider != "spot" and spec.gpu.providers != ("spot",):
+    queued = _queued_provider(spec)
+    if queued is None:
         return _allocate_attempt_once(ctx, prepared)
     from flash.providers.core.base import PollResult
 
+    label, waiting = (
+        ("Spot", "Mithril capacity below the GPU price cap")
+        if queued == "spot"
+        else ("Lambda", "Lambda Cloud capacity for a fitting instance type")
+    )
     while True:
         ctx.raise_if_cancelled()
         remaining = _load_run_deadline_at(ctx.spec.run_id) - time.time()
         if remaining <= 0:
             return None, PollResult(
-                False, failure="stalled", detail="Spot queue reached run deadline"
+                False, failure="stalled", detail=f"{label} queue reached run deadline"
             )
         allocation, failure = _allocate_attempt_once(ctx, prepared)
         if failure is None or failure.failure not in {"no_capacity", "poll_error"}:
             return allocation, failure
         _update(ctx.spec.run_id, "queued")
-        print(
-            "Spot queued: waiting for Mithril capacity below the GPU price cap",
-            file=ctx.log,
-            flush=True,
-        )
+        print(f"{label} queued: waiting for {waiting}", file=ctx.log, flush=True)
         until = min(time.time() + 60, _load_run_deadline_at(ctx.spec.run_id))
         while time.time() < until:
             ctx.raise_if_cancelled()
@@ -588,7 +598,11 @@ def _handle_failure(ctx: _SubmitContext, prepared, outcome):
     retry_delay = (
         _retry_delay(ctx, plan.infra_retry_ordinal) if plan.retry and candidate_not_started else 0.0
     )
-    if plan.retry and result.failure == "no_capacity" and getattr(chosen, "provider", "") == "spot":
+    if (
+        plan.retry
+        and result.failure == "no_capacity"
+        and getattr(chosen, "provider", "") in ("spot", "lambda")
+    ):
         # Wait like the Spot price queue instead of hammering a provider that just said no.
         remaining = _load_run_deadline_at(ctx.spec.run_id) - time.time()
         retry_delay = max(retry_delay, min(SPOT_CAPACITY_REQUEUE_SECONDS, max(0.0, remaining)))

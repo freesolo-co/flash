@@ -81,12 +81,20 @@ def _worker_provably_gone(run_id: str, handle) -> bool:
         if h.provider == "spot":
             from flash.providers.mithril import api
             from flash.providers.mithril.handles import require_scope
+        elif h.provider == "lambda":
+            from flash.providers.lambda_ import api
+            from flash.providers.lambda_.handles import require_scope
         else:
             from flash.providers.modal.handles import require_scope
         from flash.providers.core.handles import parse_handle
 
-        require_scope(parse_handle(h.to_dict()))
-        instance = api.get_instance(h.to_dict()["instance_id"])
+        parsed = parse_handle(h.to_dict())
+        require_scope(parsed)
+        if h.provider == "lambda":
+            # bound to the attempt's name: a reused id under another name is never "ours, gone".
+            instance = api.get_instance(parsed.instance_id, name=parsed.name)
+        else:
+            instance = api.get_instance(h.to_dict()["instance_id"])
         return instance is None or instance.get("status") in {"terminated", "stopped", "error"}
     except Exception:
         return False
@@ -112,7 +120,7 @@ def _completed_attempt_metrics(
     log=None,
 ) -> dict | None:
     """Read a strict successful instance marker plus its run-scoped metrics."""
-    if provider not in ("modal", "spot") or not spec.train.hf_repo:
+    if provider not in ("modal", "spot", "lambda") or not spec.train.hf_repo:
         return None
     from flash.providers._lifecycle.instances.poll import make_say
     from flash.providers._lifecycle.instances.poll_instance import (
@@ -331,7 +339,7 @@ def _gc_run_sandboxes(spec: JobSpec) -> None:
             resource_deleted = _destroy_and_confirm_worker(status.remote, spec.run_id)
             if resource_deleted:
                 _compare_and_confirm_remote_teardown(spec.run_id, status.remote)
-            elif status.remote.get("provider") in ("modal", "spot"):
+            elif status.remote.get("provider") in ("modal", "spot", "lambda"):
                 from flash.runner.lifecycle.cleanup import _record_cleanup_remote
 
                 _record_cleanup_remote(spec.run_id, status.remote)
