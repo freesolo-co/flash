@@ -152,8 +152,8 @@ def build_payload(
         from flash.custom.managed import session_token
 
         env["FLASH_CUSTOM_SESSION_TOKEN"] = session_token(spec.run_id, attempt_id)
-        if arm == "spot":
-            # Spot VMs are reached directly (no provider tunnel): serve the session over TLS with
+        if arm in ("spot", "lambda"):
+            # Instance VMs are reached directly (no provider tunnel): serve the session over TLS with
             # a per-attempt identity the control plane can recompute for the controller to pin.
             from flash.custom.managed import session_tls
 

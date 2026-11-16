@@ -34,7 +34,7 @@ def remote(**changes):
 
 
 def test_registry_has_modal_and_opt_in_spot():
-    assert PROVIDER_NAMES == ("modal", "spot")
+    assert PROVIDER_NAMES == ("modal", "spot", "lambda")
     assert available_providers() == ("modal",)
     assert get_provider("modal").name == "modal"
     with pytest.raises(KeyError):

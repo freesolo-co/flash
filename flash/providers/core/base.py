@@ -183,10 +183,16 @@ def get_gpu_info(name: str) -> GpuClass:
 
 def providers_for(name: str) -> tuple[str, ...]:
     """The training substrate supporting this validated GPU class."""
+    from flash.providers.lambda_.pricing import LAMBDA_GPUS
     from flash.providers.mithril.pricing import SPOT_GPUS
 
     gpu = get_gpu_info(name)
-    return ("modal", "spot") if gpu.name in SPOT_GPUS else ("modal",)
+    carriers = ["modal"]
+    if gpu.name in SPOT_GPUS:
+        carriers.append("spot")
+    if gpu.name in LAMBDA_GPUS:
+        carriers.append("lambda")
+    return tuple(carriers)
 
 
 def gpu_short(name: str) -> str:

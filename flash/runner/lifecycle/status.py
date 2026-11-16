@@ -500,7 +500,7 @@ def _persist_metrics(spec: JobSpec, metrics: dict) -> float:
         cost = float(raw_cost) if raw_cost is not None else None
     except (TypeError, ValueError):
         cost = None
-    provider_stamped = provider in ("modal", "spot") and cost is not None
+    provider_stamped = provider in ("modal", "spot", "lambda") and cost is not None
     if cost or provider_stamped:
         metrics = {**metrics, "cost_usd": cost}
     else:

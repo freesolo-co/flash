@@ -25,9 +25,16 @@ def test_unknown_gpu_rejected():
 def test_providers_for():
     from flash.providers.core.base import GPU_CLASSES, providers_for
 
+    lambda_classes = {"A10", "A100 SXM 40GB", "H100", "B200"}
     for gpu in GPU_CLASSES:
-        expected = ("modal", "spot") if gpu.name in {"H100", "H200"} else ("modal",)
+        expected = ("modal",)
+        if gpu.name in {"H100", "H200"}:
+            expected += ("spot",)
+        if gpu.name in lambda_classes:
+            expected += ("lambda",)
         assert providers_for(gpu.name) == expected
+    # Lambda sells no H200.
+    assert "lambda" not in providers_for("H200")
 
 
 def test_removed_gpu_class_is_unmanaged():

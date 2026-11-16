@@ -22,6 +22,7 @@ logger = get_logger(__name__)
 _PROVIDER_SETUP = (
     ("modal", "MODAL_TOKEN_ID + MODAL_TOKEN_SECRET", "Modal workspace credentials"),
     ("spot", "FLASH_MITHRIL_API_KEY/PROJECT_ID/REGION", "Mithril Compute API credentials"),
+    ("lambda", "FLASH_LAMBDA_API_KEY + FLASH_LAMBDA_SSH_KEY_NAME", "Lambda Cloud API credentials"),
 )
 
 

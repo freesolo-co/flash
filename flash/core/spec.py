@@ -482,6 +482,11 @@ class GpuSpec:
 # serializer (JobSpec.to_dict), the user-facing parser (flash.schema), and the runner's effective-spec
 # validator strip, reject, and exclude exactly the same set. divergence would leak a managed field
 # into the public surface or fail the submit round trip.
+# `[gpu] lambda = true` pins Lambda Cloud. `lambda` is a Python keyword, so it is not a GpuSpec
+# field: the pin is `provider = "lambda"`, and serialized specs carry this flag beside it so a
+# public spec copied back into a config still parses.
+LAMBDA_GPU_KEY = "lambda"
+
 MANAGED_GPU_KEYS = frozenset(
     {"disk_gb", "network_volume", "network_volume_gb", "max_retries", "max_wall_seconds"}
 )
@@ -725,6 +730,9 @@ class JobSpec:
         # Keep pre-Spot preparation digests stable while binding opt-in Spot to integrity checks.
         if not self.gpu.spot:
             data["gpu"].pop("spot", None)
+        # only Lambda-pinned specs carry the flag, so every other digest is unchanged.
+        if self.gpu.provider == "lambda":
+            data["gpu"][LAMBDA_GPU_KEY] = True
         if not data["custom"]:
             data.pop("custom")
         # Preserve public and worker preparation digests for all existing runs.
@@ -789,9 +797,16 @@ class JobSpec:
             if "credit_assignment" in train
             else DEFAULT_CREDIT_ASSIGNMENT
         )
-        gpu = validated_section(data, "gpu", {item.name for item in fields(GpuSpec)})
+        gpu = validated_section(
+            data, "gpu", {item.name for item in fields(GpuSpec)} | {LAMBDA_GPU_KEY}
+        )
         gpu_type, gpu_type_fallbacks = _parse_persisted_gpu_types(gpu)
         provider, providers = validated_persisted_providers(gpu, gpu_type, gpu_type_fallbacks)
+        lambda_pin = gpu.get(LAMBDA_GPU_KEY, False)
+        if type(lambda_pin) is not bool:
+            raise TypeError("gpu.lambda must be a boolean")
+        if lambda_pin and provider != "lambda":
+            raise ValueError("gpu.lambda = true requires gpu.provider = 'lambda'")
         project_raw = data.get("project", "")
         if not isinstance(project_raw, str):
             raise TypeError("project must be a string")

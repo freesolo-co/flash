@@ -168,8 +168,10 @@ def test_authored_surface_is_exactly_what_the_public_payload_carries():
     # The false Spot default stays absent to preserve pre-Spot preparation digests. The
     # allocator-owned keys are not authorable but stay in the payload for digest stability (empty,
     # or the count placeholder, for authored specs; this fixture is runner-selected). An unset
-    # `max_count` card ceiling is likewise absent, so existing digests are unchanged.
+    # `max_count` card ceiling is likewise absent, so existing digests are unchanged, and so is the
+    # `lambda` pin flag, which only Lambda-pinned specs carry.
     assert set(public["gpu"]) == (_GPU_KEYS | {"type", "count", "provider", "providers"}) - {
         "spot",
         "max_count",
+        "lambda",
     }

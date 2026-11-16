@@ -1628,3 +1628,11 @@ An optional `train.save_at_steps` schedule adds model exports to those automatic
 saves; it cannot disable them. After preemption, the replacement Mithril Spot VM
 resumes the latest fully uploaded trainer checkpoint. An interrupted upload is
 not a valid resume point.
+
+### Lambda Cloud on-demand
+
+With `[gpu] lambda = true`, Flash rents a Lambda Cloud on-demand VM (A10, A100 SXM 40GB,
+H100 or B200; Lambda sells no H200) at Lambda's live list price, picking the cheapest instance
+type that fits and currently has capacity. `lambda = true` cannot be combined with
+`spot = true`, and unpinned runs never use Lambda. When Lambda has no capacity the run stays
+queued until it does or the run deadline passes. `max_count` still bounds the card count.
