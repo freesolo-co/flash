@@ -19,9 +19,9 @@ from flash.providers.mithril.pricing import accepts_price
         ("H100", "1.20", True),  # the cap is inclusive
         ("H100", "1.21", False),
         ("H100", "2.10", False),  # the former cap no longer admits
-        ("H200", "2.20", True),
-        ("H200", "2.21", True),
-        ("H200", "2.22", False),
+        ("H200", "2.39", True),
+        ("H200", "2.40", True),
+        ("H200", "2.41", False),
         ("H200", "2.60", False),
         ("L40S", "1.00", False),
         ("H100", "NaN", False),
@@ -97,7 +97,7 @@ def test_spot_estimate_is_offline_and_uses_fixed_cap(monkeypatch):
     config = {"model_id": "Qwen/Qwen3.5-9B", "method": "sft", "steps": 100, "gpu_type": "H100"}
     spot = estimate_cost(RunConfig(**config, provider="spot"))
     modal = estimate_cost(RunConfig(**config, provider="modal"))
-    assert spot.gpu_hourly_usd == 2.21  # quoted at the costliest class an H100 run may take
+    assert spot.gpu_hourly_usd == 2.40  # quoted at the costliest class an H100 run may take
     assert spot.total_usd < modal.total_usd
     assert spot.provider == "spot"
 
@@ -391,9 +391,9 @@ def test_entry_and_running_caps_do_not_change_fixed_customer_rates():
     from flash.providers.mithril.pricing import SPOT_GPUS, hourly_rate
 
     assert list(SPOT_GPUS) == ["H100", "H200"]  # Mithril offers only these
-    assert [hourly_rate(gpu) for gpu in SPOT_GPUS] == [1.2, 2.21]
+    assert [hourly_rate(gpu) for gpu in SPOT_GPUS] == [1.2, 2.4]
     # one number per class: the charged rate is also the cap
-    assert [str(shape.keep_running_usd) for shape in SPOT_GPUS.values()] == ["1.20", "2.21"]
+    assert [str(shape.keep_running_usd) for shape in SPOT_GPUS.values()] == ["1.20", "2.40"]
     assert not any(hasattr(shape, "entry_below_usd") for shape in SPOT_GPUS.values())
 
 
@@ -599,9 +599,9 @@ def test_spot_shape_price_is_class_rate_times_cards():
     from flash.providers.mithril.pricing import shape_price
 
     assert shape_price("H100", 1) == Decimal("1.20")
-    assert shape_price("H200", 1) == Decimal("2.21")
+    assert shape_price("H200", 1) == Decimal("2.40")
     assert shape_price("H100", 8) == Decimal("9.60")
-    assert shape_price("H200", 8) == Decimal("17.68")
+    assert shape_price("H200", 8) == Decimal("19.20")
 
 
 def test_spot_quote_keeps_ceiling_error_when_a_wider_spot_shape_fits(monkeypatch):

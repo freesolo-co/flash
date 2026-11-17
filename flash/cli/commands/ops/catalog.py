@@ -32,7 +32,7 @@ def cmd_gpus(args) -> int:
         "user-selectable.\n"
         'Set provider = "spot" (or spot = true) for Mithril only. Spot rates are fixed '
         "estimates and charges.\n"
-        "Spot classes: H100, H200 (priority order). One rate each, $1.20 and $2.21 per GPU-hour, "
+        "Spot classes: H100, H200 (priority order). One rate each, $1.20 and $2.40 per GPU-hour, "
         "which is also the cap: jobs start at or below it and keep running up to it. A spot run "
         "takes whichever fitting "
         "class comes up first.\n"
