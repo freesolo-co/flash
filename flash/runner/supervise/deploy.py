@@ -74,6 +74,23 @@ def _deployment_state_and_requires_cleanup(
     return state, state not in _INACTIVE_DEPLOYMENT_STATES
 
 
+def _user_cancel_reason() -> str:
+    return f"cancelled by user request at {time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime())}"
+
+
+def _log_user_cancel(run_id: str, reason: str, *, has_instance: bool) -> None:
+    """Say in the run log, before teardown starts, that the user stopped this run.
+
+    The supervising poll sees the instance stop a few seconds later. Without this line first, that
+    teardown reads as a spot preemption to anyone following the log.
+    """
+    from flash.runner.lifecycle.state import runs_file_path
+
+    action = "tearing down instance" if has_instance else "no instance is running yet"
+    with contextlib.suppress(Exception), open(runs_file_path(run_id, ".log"), "a") as log:
+        print(f"[{time.strftime('%H:%M:%S')}] {reason}; {action}", file=log, flush=True)
+
+
 class _CancellationFence:
     """Persist the ``cancelled`` state once, deferring any failure to the caller's error list.
 
@@ -88,10 +105,12 @@ class _CancellationFence:
         deferred_errors: list[Exception],
         *,
         entered_deployed: bool,
+        reason: str | None = None,
     ):
         self.run_id = run_id
         self.deferred_errors = deferred_errors
         self.entered_deployed = entered_deployed
+        self.reason = reason
         self.attempted = False
 
     def persist(self) -> None:
@@ -103,7 +122,10 @@ class _CancellationFence:
         self.attempted = True
         try:
             fence_applied = _update(
-                self.run_id, "cancelled", allow_from_terminal=self.entered_deployed
+                self.run_id,
+                "cancelled",
+                allow_from_terminal=self.entered_deployed,
+                cancel_reason=self.reason,
             )
         except Exception as exc:
             self.deferred_errors.append(exc)
@@ -402,7 +424,12 @@ def cancel_run(run_id: str) -> RunStatus:
         and not entered_deployed
     )
 
-    fence = _CancellationFence(run_id, deferred_fencing_errors, entered_deployed=entered_deployed)
+    reason = _user_cancel_reason()
+    if not entered_deployed:
+        _log_user_cancel(run_id, reason, has_instance=bool(initial_status.remote))
+    fence = _CancellationFence(
+        run_id, deferred_fencing_errors, entered_deployed=entered_deployed, reason=reason
+    )
     _persist_cancellation_fence = fence.persist
 
     deploy_lock = _deploy_lock(run_id)
@@ -457,6 +484,7 @@ def cancel_run(run_id: str) -> RunStatus:
         )
         cancel_updates = {} if cancel_charge_usd is None else {"cost_usd": cancel_charge_usd}
         cancel_updates.update(billing_diagnostic)
+        cancel_updates["cancel_reason"] = reason
         preserve_retry_state = (
             persistence_error is not None and persistence_error[1] == "not_required"
         )

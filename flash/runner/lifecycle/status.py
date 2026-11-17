@@ -40,6 +40,7 @@ _TRANSITION_FIELDS = frozenset(
         "lifecycle_progressed_attempt",
         "billing_state",
         "billing_error",
+        "cancel_reason",
     }
 )
 

@@ -15,6 +15,7 @@ def wait_for_price(gpu, run_id, *, gpu_count=1, disk_gb=0, deadline_at, log=None
     run takes whichever comes up first; when several qualify at once, priority order then price.
     """
     from flash.providers.mithril.pricing import priority
+    from flash.runner.lifecycle.startup import record_startup_stage
     from flash.runner.lifecycle.status import _update, get_status
 
     gpus = (gpu,) if isinstance(gpu, str) else tuple(gpu)
@@ -49,6 +50,7 @@ def wait_for_price(gpu, run_id, *, gpu_count=1, disk_gb=0, deadline_at, log=None
         except (CapacityLookupError, MithrilApiError):
             pass
         _update(run_id, "queued")
+        record_startup_stage(run_id, "waiting_for_gpu", extra="Spot")
         print(
             f"Spot queued: waiting for {' or '.join(gpus)} below its cap with free quota",
             file=log,

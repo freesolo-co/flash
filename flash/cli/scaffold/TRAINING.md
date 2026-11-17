@@ -515,6 +515,14 @@ Two consequences worth knowing before you read a quiet log as a broken run:
 For progress _while_ a run is live, use the `status` panel's heartbeat age and W&B. Use
 `runs log` for the most recent console tail and a terminating traceback.
 
+**Before the first heartbeat there is a cold start.** From submission to the worker's first
+heartbeat typically takes 10-12 minutes (GPU allocation, instance boot, worker image pull, model
+load). Until the first training heartbeat, `status` shows a `startup` row (`startup` in the JSON /
+API) naming the stage Flash last observed, and the run log prints `starting: ...` lines with the
+time since launch. That is normal progress, not a stall. When you cancel a run, the log says
+`cancelled by user request at <time>` and `status` carries `cancel_reason`; the instance teardown
+that follows is the cancel, not a spot preemption.
+
 **Exception — startup is exempt from all of the above.** While the run is warming up
 (`status` shows a `warmup` row: initializing the model, vLLM, and training kernels) a long
 quiet stretch at 0% GPU is the normal case, not a stall. `status` itself calls this out and
