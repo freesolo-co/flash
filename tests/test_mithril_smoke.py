@@ -79,10 +79,12 @@ def test_paid_override_changes_admission_without_changing_billing_or_hold(smoke,
     from flash.providers.mithril import pricing
 
     monkeypatch.setattr(pricing, "SPOT_GPUS", dict(pricing.SPOT_GPUS))
+    rate = pricing.SPOT_GPUS["H200"].hourly_usd
+    assert Decimal("2.00") < rate  # the override must lower the hold below the charged rate
 
     def stop_before_storage():
         assert pricing.SPOT_GPUS["H200"].keep_running_usd == Decimal("2.00")
-        assert pricing.hourly_rate("H200") == 2.6
+        assert pricing.hourly_rate("H200") == float(rate)
         assert pricing.running_limit("H200") == 2.00
         raise RuntimeError("stop before paid resources")
 

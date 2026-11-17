@@ -19,6 +19,7 @@ from flash.providers.core.base import (
 from flash.providers.core.registry import get_provider
 from flash.providers.mithril import api, bootstrap, client, config, prices, queue
 from flash.providers.mithril.prices import Offer
+from flash.providers.mithril.pricing import SPOT_GPUS, quote_rate
 
 
 @pytest.fixture(autouse=True)
@@ -63,7 +64,7 @@ def owned_bid(**changes):
         "instances": ["inst_test"],
         "instance_type": "it_test",
         "instance_quantity": 1,
-        "limit_price": "$2.60",
+        "limit_price": f"${SPOT_GPUS['H200'].keep_running_usd:.2f}",  # one-card H200 hold cap
         "launch_specification": {"startup_script": "#!/bin/bash\n" + owner + "\n"},
         **changes,
     }
@@ -179,11 +180,12 @@ def test_allocation_offers_fitting_catalog_shapes_at_the_quote_rate(monkeypatch)
     # live prices are the queue's concern; allocation never reads them.
     monkeypatch.setattr(prices, "affordable_offers", lambda **kw: pytest.fail("no live prices"))
     candidates = get_provider("spot").live_candidates(80, AllocationConstraints(max_gpu_count=8))
+    rate = quote_rate()
     assert [(c.gpu, c.gpu_count, c.hourly_usd) for c in candidates] == [
-        ("H100", 1, 2.6),
-        ("H100", 8, 2.6),
-        ("H200", 1, 2.6),
-        ("H200", 8, 2.6),
+        ("H100", 1, rate),
+        ("H100", 8, rate),
+        ("H200", 1, rate),
+        ("H200", 8, rate),
     ]
     one = get_provider("spot").live_candidates(100, AllocationConstraints(max_gpu_count=1))
     assert [(c.gpu, c.gpu_count) for c in one] == [("H200", 1)]  # 100 GB only fits an H200
@@ -192,8 +194,8 @@ def test_allocation_offers_fitting_catalog_shapes_at_the_quote_rate(monkeypatch)
 @pytest.mark.parametrize(
     "change",
     [
-        {"price": "$20.88"},
-        {"price": "$21.00"},
+        {"price": "$17.76"},  # 8 x $2.22, a cent over the H200 cap
+        {"price": "$18.00"},
         {"capacity": 0},
         {"region": ""},
         {"socket": "PCIe"},
@@ -258,7 +260,7 @@ def launch(monkeypatch, *, count=1, gpu="H200", attempt=0):
 
 
 @pytest.mark.parametrize("count", [1, 8])
-@pytest.mark.parametrize(("gpu", "cap"), [("H100", 2.10), ("H200", 2.60)])
+@pytest.mark.parametrize(("gpu", "cap"), [("H100", 1.20), ("H200", 2.21)])
 def test_create_bids_for_one_instance_at_per_instance_hold_cap(monkeypatch, count, gpu, cap):
     monkeypatch.setattr(api, "pages", lambda *a, **kw: [])
     captured = []
@@ -1062,7 +1064,7 @@ def test_offers_skip_a_refused_shape_but_keep_the_region(monkeypatch, tmp_path):
     ]
     auctions = [
         {"instance_type": fid, "region": "us-central2-b", "capacity": 3, "last_instance_price": p}
-        for fid, p in (("it_h200", "$2.20"), ("it_h100", "$1.90"))
+        for fid, p in (("it_h200", "$2.20"), ("it_h100", "$1.10"))
     ]
     monkeypatch.setattr(
         prices, "call", lambda method, path, **kw: shapes if path == "/instance-types" else auctions

@@ -27,8 +27,8 @@ class SpotGpu:
 
 
 SPOT_GPUS = {
-    "H100": SpotGpu(Decimal("2.10")),
-    "H200": SpotGpu(Decimal("2.60")),
+    "H100": SpotGpu(Decimal("1.20")),
+    "H200": SpotGpu(Decimal("2.21")),
 }
 
 
