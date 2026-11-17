@@ -25,6 +25,7 @@ from flash.providers._lifecycle.instances.poll import (
     make_say,
     surface_heartbeat,
 )
+from flash.providers._lifecycle.instances.startup import StartupTracker, run_cancel_requested
 from flash.providers._lifecycle.instances.terminal_artifacts import (
     INVALID_MARKER_DETAIL,
     AttemptIdentity,
@@ -477,6 +478,21 @@ def _classify_poll_error(
     )
 
 
+def _classify_cancelled(ctx: _PollContext) -> PollResult | None:
+    """end supervision on a user cancel before its teardown can read as host loss or preemption."""
+    # the cancel persists `cancelled` before it tears the instance down, so a status read that
+    # already shows the box stopping is always seen after this flag. without the check the poll would
+    # log the teardown as the instance going away (`preempting`, `instance gone`) and the run would
+    # look preempted when the user stopped it.
+    if not run_cancel_requested(ctx.adapter.run_id):
+        return None
+    ctx.say(
+        f"run cancelled by user request; instance {ctx.adapter.instance_id} is being torn down by "
+        "the cancel (this is not a spot preemption); supervision stops here"
+    )
+    return PollResult(False, failure="job_failed", detail="cancelled by user request")
+
+
 def _update_instance_state(
     ctx: _PollContext,
     state: _PollState,
@@ -709,6 +725,13 @@ def poll_instance_job(
     )
     poll_errors = PollErrorTracker(ctx.say, interval_s)
     state = _initial_poll_state(ctx)
+    startup = StartupTracker(
+        run_id=adapter.run_id,
+        instance_id=adapter.instance_id,
+        attempt=adapter.current_attempt,
+        launch_ts=adapter.launch_ts,
+        say=ctx.say,
+    )
 
     while True:
         checkpoint()
@@ -726,7 +749,15 @@ def poll_instance_job(
         result = _classify_deadline(ctx, state)
         if result is not None:
             return result
+        result = _classify_cancelled(ctx)
+        if result is not None:
+            return result
         status = _update_instance_state(ctx, state, inst)
+        startup.observe_instance(
+            status,
+            running=status == adapter.running_status,
+            dead=status in adapter.dead_states or status == "missing",
+        )
         result = _classify_terminal_artifacts(ctx, state)
         if result is not None:
             return result
@@ -734,10 +765,12 @@ def poll_instance_job(
         if result is not None:
             return result
         _process_heartbeat(ctx, state)
+        startup.observe_heartbeat(ctx.artifacts.last_hb_key)
         result = _classify_load_timeout(ctx, state, status)
         if result is not None:
             return result
         result = _classify_running_stall(ctx, state, status)
         if result is not None:
             return result
+        startup.tick()
         _sleep_until_next_poll(ctx)

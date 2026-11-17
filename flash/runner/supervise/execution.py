@@ -195,9 +195,12 @@ def _queued_provider(spec) -> str | None:
 def _allocate_attempt(ctx: _SubmitContext, prepared):
     """Price/capacity waiting is queue time, not a failed training attempt."""
     from flash.runner.lifecycle.deadlines import _load_run_deadline_at
+    from flash.runner.lifecycle.startup import record_startup_stage
     from flash.runner.lifecycle.status import _update
 
     spec = prepared[1]
+    attempt = getattr(prepared[0], "attempt", None)
+    record_startup_stage(ctx.spec.run_id, "allocating_gpu", attempt=attempt)
     queued = _queued_provider(spec)
     if queued is None:
         return _allocate_attempt_once(ctx, prepared)
@@ -219,6 +222,7 @@ def _allocate_attempt(ctx: _SubmitContext, prepared):
         if failure is None or failure.failure not in {"no_capacity", "poll_error"}:
             return allocation, failure
         _update(ctx.spec.run_id, "queued")
+        record_startup_stage(ctx.spec.run_id, "waiting_for_gpu", attempt=attempt, extra=label)
         print(f"{label} queued: waiting for {waiting}", file=ctx.log, flush=True)
         until = min(time.time() + 60, _load_run_deadline_at(ctx.spec.run_id))
         while time.time() < until:
