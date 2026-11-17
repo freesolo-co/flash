@@ -44,6 +44,10 @@ def _log_follow_progress(status: dict | None, fallback_state: str) -> tuple[str,
     # `remote` is absent rather than cleared at teardown) and is shared with the worker-artifact
     # labelling below, so the spinner and the appended sections name the same current attempt.
     attempt = heartbeat_ui.live_attempt(status)
+    startup = status.get("startup") if isinstance(status, dict) else None
+    if isinstance(startup, dict) and isinstance(startup.get("detail"), str):
+        # set only between submission and the first training heartbeat (status.startup).
+        parts.append(startup["detail"])
     if isinstance(heartbeat, dict):
         heartbeat_age_seconds = heartbeat_ui._heartbeat_age_seconds(heartbeat.get("ts"))
         # stage and step come from the heartbeat, attempt from `remote` below. during the relaunch

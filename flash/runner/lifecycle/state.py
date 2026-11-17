@@ -162,6 +162,12 @@ class RunStatus:
     platform_context: dict | None = None
     last_heartbeat: dict | None = None
     gpu_status: dict | None = None
+    # the live attempt's cold-start stage (flash.runner.lifecycle.startup); cleared by the first
+    # training heartbeat and hidden from readers once the run leaves queued/provisioning/running.
+    startup: dict | None = None
+    # why a cancelled run stopped, e.g. "cancelled by user request at <utc time>". a cancel tears the
+    # instance down, which a reader must never mistake for a spot preemption.
+    cancel_reason: str | None = None
     workload_profile_input_digest: str | None = None
     workload_profile: dict | None = None
     # submit-time derived grpo prompt budget from flash.engine.plan.prompt_budget. workers drop
@@ -192,6 +198,9 @@ class RunStatus:
         heartbeat = data.get("last_heartbeat")
         if isinstance(heartbeat, dict):
             heartbeat.pop("source_provenance", None)
+        from flash.runner.lifecycle.startup import public_startup
+
+        data["startup"] = public_startup(data.get("state"), data.get("startup"))
         source_snapshot = data.pop("source_snapshot", None)
         data.pop("source_verified_attempt", None)
         if source_snapshot is not None:

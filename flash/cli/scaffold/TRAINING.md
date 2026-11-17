@@ -414,8 +414,8 @@ Select Spot directly in your editable training TOML:
 spot = false # set true for Mithril Spot; false uses regular training
 ```
 
-Spot only uses Mithril, which offers H100 and H200. Each has one rate per GPU-hour, $2.10
-for H100 and $2.60 for H200, which is both what Spot charges and the cap: a run starts while
+Spot only uses Mithril, which offers H100 and H200. Each has one rate per GPU-hour, $1.20
+for H100 and $2.21 for H200, which is both what Spot charges and the cap: a run starts while
 the live price is at or below it and keeps running up to it. A queued run waits for every class
 that fits its plan (an H100 run also takes an H200) and launches on whichever comes up first.
 
@@ -514,6 +514,14 @@ Two consequences worth knowing before you read a quiet log as a broken run:
 
 For progress _while_ a run is live, use the `status` panel's heartbeat age and W&B. Use
 `runs log` for the most recent console tail and a terminating traceback.
+
+**Before the first heartbeat there is a cold start.** From submission to the worker's first
+heartbeat typically takes 10-12 minutes (GPU allocation, instance boot, worker image pull, model
+load). Until the first training heartbeat, `status` shows a `startup` row (`startup` in the JSON /
+API) naming the stage Flash last observed, and the run log prints `starting: ...` lines with the
+time since launch. That is normal progress, not a stall. When you cancel a run, the log says
+`cancelled by user request at <time>` and `status` carries `cancel_reason`; the instance teardown
+that follows is the cancel, not a spot preemption.
 
 **Exception — startup is exempt from all of the above.** While the run is warming up
 (`status` shows a `warmup` row: initializing the model, vLLM, and training kernels) a long
