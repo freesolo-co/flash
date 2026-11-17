@@ -5,8 +5,11 @@ from dataclasses import replace
 import pytest
 
 from flash.core.spec import GpuSpec
+from flash.providers.mithril.pricing import quote_rate, tariff
 from flash.runner.lifecycle.state import RunStatus
 from tests.test_charge_pricing import _spec
+
+H100_RATE, H200_RATE = tariff()["H100"], tariff()["H200"]  # the current per-class rates
 
 
 def spot_spec(gpu="H100", *, legacy_preference=False):
@@ -19,8 +22,6 @@ def spot_spec(gpu="H100", *, legacy_preference=False):
 
 def _status(spec, remote_gpu, **fields):
     """A run submitted under the current tariff, the way submit records it."""
-    from flash.providers.mithril.pricing import tariff
-
     remote = {"provider": "spot", "gpu": remote_gpu} if remote_gpu else None
     fields.setdefault("submitted_spot_rates", tariff())
     return RunStatus(run_id="r", state="running", spec=spec.to_dict(), remote=remote, **fields)
@@ -39,28 +40,26 @@ def _beat(status, hb):
 def test_every_spot_quote_uses_the_top_spot_rate():
     from flash.providers.core.allocator import _cheapest_allocation
     from flash.providers.core.base import Candidate
-    from flash.providers.mithril.pricing import quote_rate
 
-    assert quote_rate() == 2.6
+    assert quote_rate() == 2.21  # the H200 rate, the costliest class
     allocation = _cheapest_allocation(
         [Candidate("spot", "H100", 1.4, 80, 1)], need=47, cost_per_step=None, provider_rank={}
     )
-    assert (allocation.gpu, allocation.hourly_usd) == ("H100", 2.6)
+    assert (allocation.gpu, allocation.hourly_usd) == ("H100", 2.21)
 
 
 @pytest.mark.parametrize(
     ("usage", "factor"),
     [
-        ({"H100": 10}, 2.1 / 2.6),  # all on H100: $2.10 of the $2.60 quote rate
+        ({"H100": 10}, H100_RATE / H200_RATE),  # all on H100: its rate of the H200 quote rate
         ({"H200": 10}, 1.0),
-        ({"H100": 5, "H200": 5}, (2.1 + 2.6) / (2 * 2.6)),  # half and half
+        ({"H100": 5, "H200": 5}, (H100_RATE + H200_RATE) / (2 * H200_RATE)),  # half and half
         (None, 1.0),  # no ledger (runs launched before this accounting): the quote
     ],
 )
 def test_rate_factor_weights_usage_by_class(usage, factor):
     from types import SimpleNamespace
 
-    from flash.providers.mithril.pricing import tariff
     from flash.runner.accounting.spot_usage import rate_factor
 
     hb = {"spot_usage_by_gpu": usage} if usage is not None else {}
@@ -78,7 +77,8 @@ def test_rate_factor_weights_usage_by_class(usage, factor):
 )
 def test_runs_quoted_before_rates_were_recorded_settle_on_the_legacy_tariff(usage, factor):
     """A run submitted under the old $2.00/$2.50 tariff is never repriced by a later rate change:
-    an H100-only run with an accepted $2.50 quote still settles at $2.00, not $2.50 x 2.10/2.60."""
+    an H100-only run with an accepted $2.50 quote still settles at $2.00, not at the current
+    table's H100/H200 ratio."""
     from types import SimpleNamespace
 
     from flash.runner.accounting.spot_usage import rate_factor
@@ -122,7 +122,8 @@ def test_steps_are_credited_to_the_class_that_reached_them_once():
 
 
 def test_custom_session_mixing_classes_is_billed_per_attempt(tmp_path, monkeypatch):
-    """Review case: a 1 h $2.60 quote, 900 s on H100 then 900 s on H200 charges $1.175."""
+    """Review case: a 1 h quote at the top rate, 900 s on H100 then 900 s on H200 is charged
+    half the quote, each half at the class it ran on."""
     import json
     from types import SimpleNamespace
 
@@ -139,10 +140,13 @@ def test_custom_session_mixing_classes_is_billed_per_attempt(tmp_path, monkeypat
     monkeypatch.setattr(state, "artifacts_dir", lambda spec: str(tmp_path))
     (tmp_path / "metrics.json").write_text(json.dumps({"session_seconds": 900.0}))
     status.last_heartbeat["session_seconds_prior"] = 900.0
-    status.estimated_cost_usd = 2.6
+    status.estimated_cost_usd = quote_rate()
     charged = session_charge(status, SimpleNamespace(custom={"max_wall_seconds": 3600}))
-    # 1,800 s of a 3,600 s cap, priced (900 x $2.10 + 900 x $2.60) / (1,800 x $2.60)
-    assert charged == pytest.approx(2.6 * 0.5 * (2.1 + 2.6) / (2 * 2.6))  # $1.175
+    # 1,800 s of a 3,600 s cap, priced (900 x H100 + 900 x H200) / (1,800 x quote rate)
+    assert charged == pytest.approx(
+        quote_rate() * 0.5 * (H100_RATE + H200_RATE) / (2 * quote_rate())
+    )
+    assert charged == pytest.approx(0.5 * (1.20 + 2.21) / 2)  # $0.8525 at the current table
 
 
 def test_allocation_admits_a_pinned_class_even_when_only_another_is_cheap(monkeypatch):
@@ -156,7 +160,7 @@ def test_allocation_admits_a_pinned_class_even_when_only_another_is_cheap(monkey
     candidates = get_provider("spot").live_candidates(
         47, AllocationConstraints(max_gpu_count=1, gpu_type="H100")
     )
-    assert [(c.gpu, c.gpu_count, c.hourly_usd) for c in candidates] == [("H100", 1, 2.6)]
+    assert [(c.gpu, c.gpu_count, c.hourly_usd) for c in candidates] == [("H100", 1, quote_rate())]
 
 
 @pytest.mark.parametrize(
@@ -177,9 +181,8 @@ def test_supervisor_records_the_class_actually_rented(chosen, remote, expected):
 
 
 def test_submit_records_the_spot_tariff_only_for_spot_runs():
-    from flash.providers.mithril.pricing import tariff
     from flash.runner.lifecycle.submit import _spot_tariff
 
-    assert _spot_tariff(spot_spec("H100")) == tariff() == {"H100": 2.1, "H200": 2.6}
+    assert _spot_tariff(spot_spec("H100")) == tariff() == {"H100": 1.2, "H200": 2.21}
     regular = replace(spot_spec(), gpu=GpuSpec(type="H100", count=1, provider="modal"))
     assert _spot_tariff(regular) is None
