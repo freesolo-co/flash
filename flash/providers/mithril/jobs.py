@@ -23,7 +23,7 @@ from flash.providers.artifacts.channel import (
     make_artifact_text_reader,
 )
 from flash.providers.core.base import JobHandle, get_gpu_info
-from flash.providers.mithril import api
+from flash.providers.mithril import api, queue_board
 from flash.providers.mithril.config import scope_fingerprint
 from flash.providers.mithril.handles import SpotJobHandle, require_scope
 from flash.providers.mithril.pricing import hourly_rate
@@ -101,6 +101,19 @@ def poll(handle, spec, *, log=None, deadline_at=None):
     )
 
 
+def _raise_if_cancelled(run_id):
+    from flash.runner.lifecycle.status import get_status
+    from flash.runner.supervise.errors import _RunCancelled
+
+    try:
+        cancelled = get_status(run_id).state == "cancelled"
+    except FileNotFoundError:
+        return
+    if cancelled:
+        queue_board.leave(run_id, allocated=False)
+        raise _RunCancelled(f"run {run_id} was cancelled before its Spot bid was placed")
+
+
 def submit_attempt(
     spec,
     *,
@@ -152,6 +165,8 @@ def submit_attempt(
     name = instance_label(spec.run_id, attempt)
     started = time.time()
     capsule, _ = build_capsule("instance-bootstrap")
+    # building the payload and capsule takes time; a cancel recorded meanwhile must stop the bid.
+    _raise_if_cancelled(spec.run_id)
     sandbox_id = api.create(
         name=name,
         offer=offer,
@@ -165,6 +180,16 @@ def submit_attempt(
     )
     persisted = detached = False
     try:
+        # a cancel that landed while the create was in flight: the finally below cancels the bid.
+        _raise_if_cancelled(spec.run_id)
+        queue_board.leave(spec.run_id, allocated=True)
+        if log is not None:
+            print(
+                f"Spot: Mithril accepted the bid for {count}x {gpu} in {offer.region} "
+                f"({sandbox_id}); left the queue, instance booting",
+                file=log,
+                flush=True,
+            )
         h = SpotJobHandle(
             instance_id=sandbox_id,
             gpu=gpu,

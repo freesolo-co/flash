@@ -49,14 +49,19 @@ def _ownership(bid):
         return None
 
 
-def list_instances(*, deadline_at=None):
-    """Expose owned bids to Flash's existing resource reconciliation interface."""
+def list_instances(*, run_id=None, deadline_at=None):
+    """Expose owned bids to Flash's existing resource reconciliation interface.
+
+    ``run_id`` keeps only that run's bids. Filter before the per-bid instance lookup: the project
+    holds every bid Flash ever placed, and checking each terminated one's instances made a single
+    run's cleanup (and with it a user's cancel) take minutes.
+    """
     result = []
     for bid in pages(
         "/spot/bids", params={"project": settings()["project_id"]}, deadline_at=deadline_at
     ):
         labels = _ownership(bid)
-        if not labels:
+        if not labels or (run_id is not None and labels.get("flash-run") != run_id):
             continue
         # Bid cancellation precedes VM shutdown. Handle-less recovery must still see
         # these resources until the same instance-state check as terminate() passes.
@@ -301,6 +306,11 @@ def create(*, name, offer, payload, image_reference, gpu, gpu_count, capsule, di
                 from flash.providers.mithril.region_health import mark_refused
 
                 mark_refused(offer.region, offer.instance_type)
+            from flash.providers.mithril import queue_board
+
+            if queue_board.is_quota_refusal(getattr(error, "reason", "")):
+                # Mithril's account quota is invisible before a refusal; the queue reports it.
+                queue_board.record_quota_refusal(gpu)
             raise CapacityUnavailableError(
                 f"Mithril refused the Spot bid ({cause}); requeuing", cause=cause
             ) from None
