@@ -15,6 +15,15 @@ TRAIN_KEYS = {
 }
 TRAIN_DEFAULTS = {"max_steps": 1000, "max_context_tokens": 2048, "lora_rank": 16, "save_every": 10}
 CUSTOM_KEYS = {"file", "resume_from", "idle_seconds", "max_wall_seconds", "controller_id"}
+# Queue allowance a custom run's deadline adds to its session cap: the same 24 hours of
+# run-global wall time an SFT or GRPO run gets by default, so waiting for a Spot GPU never
+# consumes the session's own time.
+CUSTOM_QUEUE_SECONDS = 24 * 3600
+
+
+def custom_run_wall_seconds(custom):
+    """The run-global deadline (gpu.max_wall_seconds) of a custom run."""
+    return int(custom["max_wall_seconds"]) + CUSTOM_QUEUE_SECONDS
 
 
 def parse_custom_section(value, algorithm):

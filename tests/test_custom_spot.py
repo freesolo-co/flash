@@ -315,4 +315,60 @@ def test_spot_first_connection_waits_for_the_run_deadline_not_twenty_minutes():
     modal = spec_from_dict({**custom_raw(), "custom": custom})
     spot = spec_from_dict({**custom_raw(spot=True), "custom": custom})
     assert first_connect_timeout(modal) == 1200
-    assert first_connect_timeout(spot) == 7200
+    # the run deadline covers queue time plus the session cap
+    assert first_connect_timeout(spot) == 7200 + 24 * 3600
+
+
+def test_custom_session_cap_is_not_consumed_by_queue_time():
+    from flash.schema.custom import CUSTOM_QUEUE_SECONDS
+
+    spec = spec_from_dict(
+        {**custom_raw(spot=True), "custom": {"file": "a.py", "max_wall_seconds": 1800}}
+    )
+    assert spec.custom["max_wall_seconds"] == 1800
+    assert spec.gpu.max_wall_seconds == 1800 + CUSTOM_QUEUE_SECONDS
+    assert spec.gpu.max_retries == 0
+
+
+def test_replacement_attempt_cap_subtracts_earlier_session_time(monkeypatch):
+    from flash.custom.billing import PRIOR_SESSION_SECONDS_ENV, prior_session_seconds
+    from flash.custom.worker import session_cap_seconds
+
+    spec = spec_from_dict(
+        {**custom_raw(spot=True), "custom": {"file": "a.py", "max_wall_seconds": 3600}}
+    )
+    context = SimpleNamespace(remaining_wall_seconds=lambda: 50_000.0)
+    assert session_cap_seconds(spec, context) == 3600
+    status = SimpleNamespace(
+        last_heartbeat={"session_seconds_prior": 600.0, "session_seconds": 900.0}
+    )
+    monkeypatch.setenv(PRIOR_SESSION_SECONDS_ENV, str(prior_session_seconds(status)))
+    assert session_cap_seconds(spec, context) == 2100
+    # the run deadline (queue plus session) is still the hard ceiling
+    assert session_cap_seconds(spec, SimpleNamespace(remaining_wall_seconds=lambda: 60.0)) == 60
+    monkeypatch.setenv(PRIOR_SESSION_SECONDS_ENV, "nan")
+    assert session_cap_seconds(spec, context) == 3600
+
+
+def test_unattached_attempt_bills_only_earlier_attempts(monkeypatch, tmp_path):
+    import flash.runner.lifecycle.state as runner_state
+    from flash.custom.billing import session_charge
+
+    monkeypatch.setattr(runner_state, "artifacts_dir", lambda _: str(tmp_path))
+    spec = spec_from_dict(custom_raw(spot=True))
+    wall = spec.custom["max_wall_seconds"]
+    status = SimpleNamespace(
+        last_heartbeat={
+            "stage": "custom_waiting",
+            "session_seconds": 0,
+            "controller_attached": False,
+        },
+        estimated_cost_usd=10.0,
+        updated_at=time.time(),
+        finished_at=time.time(),
+        rate_factor=1.0,
+    )
+    monkeypatch.setattr("flash.runner.accounting.spot_usage.rate_factor", lambda status: 1.0)
+    assert session_charge(status, spec) == 0
+    status.last_heartbeat["session_seconds_prior"] = wall / 2
+    assert session_charge(status, spec) == pytest.approx(5.0)

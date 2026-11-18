@@ -65,6 +65,8 @@ class FailureObservation:
     chosen: object | None = None
     candidates: tuple | None = None
     managed_cache_mounted: bool = False
+    # the provider create failed before anything was provisioned (no GPU was ever assigned).
+    not_started: bool = False
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "failure", self.failure or "unknown")
@@ -360,6 +362,21 @@ def transition_failure(
         return _finish(
             replace(state, cache_retry_shape=None),
             RetryPlan(True, f"requeuing {chosen.provider} capacity (provider refused the create)"),
+            observation,
+            attempt,
+        )
+    if (
+        failure == "poll_error"
+        and observation.not_started
+        and chosen is not None
+        and chosen.provider in ("spot", "lambda")
+    ):
+        # A submit that timed out or errored before any GPU was assigned is queue time, not a
+        # failed training attempt: requeue like a refused create, bounded by cancellation and the
+        # run deadline rather than the failure budget (custom runs have none).
+        return _finish(
+            replace(state, cache_retry_shape=None),
+            RetryPlan(True, f"requeuing {chosen.provider} capacity (submit failed before a GPU)"),
             observation,
             attempt,
         )

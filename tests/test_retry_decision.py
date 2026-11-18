@@ -419,3 +419,34 @@ def test_non_spot_preemption_stays_terminal_while_worker_faults_retry():
     )
     assert not preempted.retry
     assert flagged.retry
+
+
+@pytest.mark.parametrize("provider", ["spot", "lambda"])
+@pytest.mark.parametrize("budget", [0, 2])
+def test_pre_gpu_submit_failure_requeues_without_spending_budget(provider, budget):
+    chosen = _candidate(provider, "H100", 80)
+    observation = FailureObservation("poll_error", chosen, (chosen,), not_started=True)
+    retry_state, plan = transition_failure(RetryState(budget, budget, 0), observation, attempt=3)
+
+    assert plan.retry
+    assert "submit failed before a GPU" in plan.action
+    assert plan.infra_retry_ordinal is None
+    assert retry_state.infra_used == 0
+    assert retry_state.usable_vram_floor == 0
+    restored = RetryState.from_snapshot(_spec(max_retries=budget), retry_state.to_snapshot())
+    assert restored.persisted_plan(3) == plan
+
+
+def test_poll_error_after_a_gpu_started_keeps_the_retry_budget():
+    chosen = _candidate("spot", "H100", 80)
+    _, plan = transition_failure(
+        RetryState(0, 0, 0), FailureObservation("poll_error", chosen, (chosen,)), attempt=0
+    )
+    assert not plan.retry
+    modal = _candidate("modal", "H100", 80)
+    _, plan = transition_failure(
+        RetryState(0, 0, 0),
+        FailureObservation("poll_error", modal, (modal,), not_started=True),
+        attempt=0,
+    )
+    assert not plan.retry

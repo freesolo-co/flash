@@ -641,7 +641,13 @@ def spec_from_dict(
         thinking=thinking,
     )
     if custom:
-        gpu_spec = replace(gpu_spec, max_retries=0, max_wall_seconds=custom["max_wall_seconds"])
+        from flash.schema.custom import custom_run_wall_seconds
+
+        # custom.max_wall_seconds caps GPU session time (enforced by the worker from when it
+        # serves); the run deadline also covers queue time, like any other algorithm's run.
+        gpu_spec = replace(
+            gpu_spec, max_retries=0, max_wall_seconds=custom_run_wall_seconds(custom)
+        )
     init_from_adapter, lora_rank, lora_alpha = _validate_algorithm_model_consistency(
         model,
         algorithm,
