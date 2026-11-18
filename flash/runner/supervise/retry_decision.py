@@ -5,6 +5,7 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass, replace
 
+from flash.core.checkpoint_policy import is_spot_spec
 from flash.core.spec import JobSpec
 
 INFRA_RETRY_FLOOR = 5
@@ -15,11 +16,15 @@ WORKER_RETRIABLE_FAILURE = "worker_retriable"
 # A Spot VM was rented but never booted within its window: a provider fault on that machine, not
 # a memory signal, so retry the same shape within the infrastructure budget.
 BOOT_TIMEOUT_FAILURE = "boot_timeout"
+# A VM reached running but its worker never showed liveness (e.g. a stuck image pull): also a fault
+# of that machine, so retry the same shape rather than raising the usable-VRAM floor.
+BOOT_STALL_FAILURE = "boot_stalled"
 CANDIDATE_RETRY_FAILURES = INFRA_RETRY_FAILURES | {
     "oom",
     "job_preempted",
     WORKER_RETRIABLE_FAILURE,
     BOOT_TIMEOUT_FAILURE,
+    BOOT_STALL_FAILURE,
 }
 CACHE_FALLBACK_FAILURES = frozenset({"no_capacity", "poll_error"})
 _STATE_KEYS = frozenset(
@@ -65,6 +70,8 @@ class FailureObservation:
     chosen: object | None = None
     candidates: tuple | None = None
     managed_cache_mounted: bool = False
+    # the provider create failed before anything was provisioned (no GPU was ever assigned).
+    not_started: bool = False
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "failure", self.failure or "unknown")
@@ -87,6 +94,11 @@ class RetryState:
     @classmethod
     def initial_for_spec(cls, spec: JobSpec) -> RetryState:
         retries = int(spec.gpu.max_retries)
+        if spec.algorithm == "custom":
+            # Custom pins max_retries = 0 (no OOM/cache retries). On Spot an infrastructure retry
+            # resumes from the run's newest checkpoint and the controller reconnects exactly as
+            # after a preemption; other providers restore neither, so they keep no retries.
+            return cls(INFRA_RETRY_FLOOR if is_spot_spec(spec) else 0, 0, 0)
         return cls(max(retries, INFRA_RETRY_FLOOR) if retries else 0, retries, int(retries > 0))
 
     @classmethod
@@ -353,6 +365,9 @@ def transition_failure(
     if failure == BOOT_TIMEOUT_FAILURE:
         state, plan = _worker_retriable_plan(state, chosen, "a VM that never booted")
         return _finish(state, plan, observation, attempt)
+    if failure == BOOT_STALL_FAILURE:
+        state, plan = _worker_retriable_plan(state, chosen, "a worker that never became live")
+        return _finish(state, plan, observation, attempt)
     if failure == "no_capacity" and chosen is not None and chosen.provider in ("spot", "lambda"):
         # Spot or Lambda refused the create for quota/capacity before provisioning anything. Like
         # an eviction, wait for the same shape: cancellation and the run deadline bound it, not the
@@ -360,6 +375,21 @@ def transition_failure(
         return _finish(
             replace(state, cache_retry_shape=None),
             RetryPlan(True, f"requeuing {chosen.provider} capacity (provider refused the create)"),
+            observation,
+            attempt,
+        )
+    if (
+        failure == "poll_error"
+        and observation.not_started
+        and chosen is not None
+        and chosen.provider in ("spot", "lambda")
+    ):
+        # A submit that timed out or errored before any GPU was assigned is queue time, not a
+        # failed training attempt: requeue like a refused create, bounded by cancellation and the
+        # run deadline rather than the failure budget (custom runs have none).
+        return _finish(
+            replace(state, cache_retry_shape=None),
+            RetryPlan(True, f"requeuing {chosen.provider} capacity (submit failed before a GPU)"),
             observation,
             attempt,
         )

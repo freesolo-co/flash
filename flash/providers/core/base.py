@@ -643,7 +643,7 @@ class PollResult:
     ok: bool
     metrics: dict | None = None
     # failure: job_failed, oom, job_preempted, no_capacity, stalled, poll_error, boot_timeout
-    # (a rented Spot VM never booted), or
+    # (a rented Spot VM never booted), boot_stalled (a running VM's worker never became live), or
     # checkpoint_upload_failed (training finished; the final CPU checkpoint upload failed after
     # its own retries, and the committed handoff is preserved).
     failure: str | None = None

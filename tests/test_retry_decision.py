@@ -375,24 +375,47 @@ def test_worker_retriable_fault_retries_same_shape_within_infra_budget(provider)
     assert "budget exhausted" in plan.action
 
 
-def test_spot_vm_that_never_booted_retries_same_shape_within_infra_budget():
+@pytest.mark.parametrize(
+    ("failure", "reason"),
+    [("boot_timeout", "never booted"), ("boot_stalled", "never became live")],
+)
+def test_spot_vm_that_never_booted_retries_same_shape_within_infra_budget(failure, reason):
     """An H200 (the largest Spot class) that never boots is rebid, not escalated past every GPU."""
     chosen = _candidate("spot", "H200", 141)
     current = RetryState(2, 2, 1)
     for attempt in range(2):
         current, plan = transition_failure(
-            current, _observe("boot_timeout", chosen, (chosen,)), attempt=attempt
+            current, _observe(failure, chosen, (chosen,)), attempt=attempt
         )
         assert plan.retry
-        assert "never booted" in plan.action
+        assert reason in plan.action
         assert current.infra_used == attempt + 1
         assert current.usable_vram_floor == 0
         assert current.select_candidate((chosen,))[1] == chosen
-    current, plan = transition_failure(
-        current, _observe("boot_timeout", chosen, (chosen,)), attempt=2
-    )
+    current, plan = transition_failure(current, _observe(failure, chosen, (chosen,)), attempt=2)
     assert not plan.retry
     assert "budget exhausted" in plan.action
+
+
+def test_custom_spot_runs_get_infrastructure_retries_but_no_oom_or_cache_retries():
+    spec = replace(
+        _spec(max_retries=0), algorithm="custom", gpu=GpuSpec(provider="spot", max_retries=0)
+    )
+    initial = RetryState.initial_for_spec(spec)
+    assert (initial.infra_retries, initial.oom_retries, initial.cache_retries) == (5, 0, 0)
+    # without Spot's checkpoint restore and controller reconnect, a retry would lose progress.
+    modal = replace(spec, gpu=GpuSpec(provider="modal", max_retries=0))
+    assert RetryState.initial_for_spec(modal).infra_retries == 0
+    chosen = _candidate("spot", "H100", 80)
+    current, plan = transition_failure(
+        initial, _observe("boot_stalled", chosen, (chosen,)), attempt=0
+    )
+    assert plan.retry
+    assert RetryState.from_snapshot(spec, current.to_snapshot()).persisted_plan(0) == plan
+    _, plan = transition_failure(
+        initial, _observe("oom", chosen, (chosen, _candidate("spot", "H200", 141))), attempt=0
+    )
+    assert not plan.retry
 
 
 def test_worker_retriable_authorization_survives_restore():
@@ -419,3 +442,44 @@ def test_non_spot_preemption_stays_terminal_while_worker_faults_retry():
     )
     assert not preempted.retry
     assert flagged.retry
+
+
+@pytest.mark.parametrize("provider", ["spot", "lambda"])
+@pytest.mark.parametrize("budget", [0, 2])
+def test_pre_gpu_submit_failure_requeues_without_spending_budget(provider, budget):
+    chosen = _candidate(provider, "H100", 80)
+    observation = FailureObservation("poll_error", chosen, (chosen,), not_started=True)
+    retry_state, plan = transition_failure(RetryState(budget, budget, 0), observation, attempt=3)
+
+    assert plan.retry
+    assert "submit failed before a GPU" in plan.action
+    assert plan.infra_retry_ordinal is None
+    assert retry_state.infra_used == 0
+    assert retry_state.usable_vram_floor == 0
+    restored = RetryState.from_snapshot(_spec(max_retries=budget), retry_state.to_snapshot())
+    assert restored.persisted_plan(3) == plan
+
+
+def test_poll_error_after_a_gpu_started_keeps_the_retry_budget():
+    chosen = _candidate("spot", "H100", 80)
+    _, plan = transition_failure(
+        RetryState(0, 0, 0), FailureObservation("poll_error", chosen, (chosen,)), attempt=0
+    )
+    assert not plan.retry
+    modal = _candidate("modal", "H100", 80)
+    _, plan = transition_failure(
+        RetryState(0, 0, 0),
+        FailureObservation("poll_error", modal, (modal,), not_started=True),
+        attempt=0,
+    )
+    assert not plan.retry
+
+
+def test_pre_gpu_requeue_requires_that_this_attempt_recorded_no_handle():
+    from flash.runner.supervise.execution import _gpu_never_assigned
+
+    assert _gpu_never_assigned(True, {}, 3)
+    assert _gpu_never_assigned(True, {"attempt": 2}, 3)  # an earlier attempt's handle
+    # a GPU was provisioned for this attempt, then polling or teardown raised: not pre-GPU.
+    assert not _gpu_never_assigned(True, {"attempt": 3}, 3)
+    assert not _gpu_never_assigned(False, {}, 3)

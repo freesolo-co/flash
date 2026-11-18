@@ -15,6 +15,10 @@ TRAIN_KEYS = {
 }
 TRAIN_DEFAULTS = {"max_steps": 1000, "max_context_tokens": 2048, "lora_rank": 16, "save_every": 10}
 CUSTOM_KEYS = {"file", "resume_from", "idle_seconds", "max_wall_seconds", "controller_id"}
+# A custom run's run-global deadline (gpu.max_wall_seconds). Queue time is not limited:
+# custom.max_wall_seconds caps GPU session time from when the worker serves, and the run waits for
+# a GPU until it gets one or is cancelled. This is only a backstop for a run nobody cancels.
+CUSTOM_RUN_BACKSTOP_SECONDS = 7 * 24 * 3600
 
 
 def parse_custom_section(value, algorithm):

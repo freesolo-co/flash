@@ -52,6 +52,11 @@ class SessionConflict(ValueError):
     """The caller must inspect/reconcile session state before doing more work."""
 
 
+# A session that no controller has reached yet ends after at most this long: nothing is waiting
+# to use the GPU, so holding it for the full idle allowance only wastes it.
+UNATTACHED_IDLE_SECONDS = 300
+
+
 class TrainingSession:
     def __init__(self, backend, *, max_steps=1000, idle_seconds=900):
         self.backend = backend
@@ -70,6 +75,19 @@ class TrainingSession:
         self.event_cursor = 0
         self.on_commit = None
         self.restored_state = {}
+        # monotonic time of the first authenticated controller request, or None.
+        self.attached_at = None
+        self.on_attach = None
+
+    def attach(self):
+        """Record that a controller reached the session; billing and the idle clock start here."""
+        # called from the server's event loop: never block on the operation lock here.
+        if self.attached_at is not None:
+            return
+        self.attached_at = time.monotonic()
+        self.last_activity = max(self.last_activity, self.attached_at)
+        if self.on_attach is not None:
+            self.on_attach(self)
 
     def status(self):
         return {
@@ -194,10 +212,9 @@ class TrainingSession:
         if not self.lock.acquire(blocking=False):
             return False
         try:
-            return (
-                self.closed
-                or self.failed
-                or (time.monotonic() - self.last_activity > self.idle_seconds)
-            )
+            idle = self.idle_seconds
+            if self.attached_at is None:
+                idle = min(idle, UNATTACHED_IDLE_SECONDS)
+            return self.closed or self.failed or (time.monotonic() - self.last_activity > idle)
         finally:
             self.lock.release()
