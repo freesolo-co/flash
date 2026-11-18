@@ -1995,6 +1995,45 @@ def test_logs_of_a_run_rotated_to_an_empty_log(api):
     assert runner_status.get_logs(run_id) == "step 1\nstep 2\n"
 
 
+def test_logs_archives_can_be_skipped_by_a_follower(api):
+    # A follower still at offset 0 (empty `.log`) must not receive the archives on every poll.
+    key = _new_user_token()
+    run_id = api.post(
+        "/v1/runs", json={"spec": SPEC, "dry_run": True}, headers=_bearer(key)
+    ).json()["run_id"]
+    log_path = os.path.join(runner_state.RUNS_DIR, f"{run_id}.log")
+    with open(log_path + ".1", "w") as f:
+        f.write("archived\n")
+    open(log_path, "w").close()
+    url = f"/v1/runs/{run_id}/logs"
+    assert api.get(url, headers=_bearer(key)).json()["logs"] == "archived\n"
+    follow = api.get(url + "?offset=0&archives=false", headers=_bearer(key)).json()
+    assert (follow["logs"], follow["offset"]) == ("", 0)
+    with open(log_path, "a") as f:
+        f.write("new\n")
+    follow = api.get(url + "?offset=0&archives=false", headers=_bearer(key)).json()
+    assert (follow["logs"], follow["offset"]) == ("new\n", 4)
+
+
+def test_logs_skip_an_archive_with_corrupt_deflate_data(api):
+    # A valid gzip header over a corrupt DEFLATE stream raises zlib.error, not OSError.
+    key = _new_user_token()
+    run_id = api.post(
+        "/v1/runs", json={"spec": SPEC, "dry_run": True}, headers=_bearer(key)
+    ).json()["run_id"]
+    log_path = os.path.join(runner_state.RUNS_DIR, f"{run_id}.log")
+    with open(log_path + ".2.gz", "wb") as f:
+        f.write(b"\x1f\x8b\x08\x00\x00\x00\x00\x00\x00\xff" + b"\xff" * 32)
+    with open(log_path + ".1", "w") as f:
+        f.write("intact\n")
+    with open(log_path, "w") as f:
+        f.write("current\n")
+    response = api.get(f"/v1/runs/{run_id}/logs", headers=_bearer(key))
+    assert response.status_code == 200
+    assert response.json()["logs"] == "intact\ncurrent\n"
+    assert runner_status.get_logs(run_id) == "intact\ncurrent\n"
+
+
 def test_plane_startup_leaves_run_logs_in_place(api, monkeypatch):
     # A redeploy starts a new plane on the shared state volume; it must never rotate run logs.
     import flash.server.asgi.app as app_mod

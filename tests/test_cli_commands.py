@@ -99,7 +99,7 @@ class _FakeClient:
             "spec": {"model": "Qwen/Qwen3.5-9B"},
         }
 
-    def get_logs(self, run_id: str, offset: int = 0) -> dict:
+    def get_logs(self, run_id: str, offset: int = 0, archives: bool = True) -> dict:
         logs = self.log_text[max(0, int(offset)) :]
         return {
             "run_id": run_id,
@@ -1720,7 +1720,7 @@ def test_log_snapshot_reads_one_offset_page_without_status(fake_client, capsys) 
         13: {"run_id": "flash-1", "logs": "", "offset": 13, "state": "done"},
     }
 
-    def get_logs(run_id: str, offset: int = 0) -> dict:
+    def get_logs(run_id: str, offset: int = 0, archives: bool = True) -> dict:
         calls.append(offset)
         return pages[offset]
 
@@ -1834,7 +1834,7 @@ def test_follow_logs_shows_tty_spinner_while_waiting(monkeypatch, capsys) -> Non
                 ]
             )
 
-        def get_logs(self, run_id: str, offset: int = 0) -> dict:
+        def get_logs(self, run_id: str, offset: int = 0, archives: bool = True) -> dict:
             return next(self.pages)
 
         def get_run(self, run_id: str) -> dict:
@@ -1857,7 +1857,7 @@ def test_follow_logs_shows_tty_spinner_while_waiting(monkeypatch, capsys) -> Non
 
 def test_poll_logs_returns_the_live_attempt_from_the_terminal_status(capsys) -> None:
     class _AttemptClient(_FakeClient):
-        def get_logs(self, run_id: str, offset: int = 0) -> dict:
+        def get_logs(self, run_id: str, offset: int = 0, archives: bool = True) -> dict:
             return {"run_id": run_id, "logs": "", "offset": 0, "state": "done"}
 
         def get_run(self, run_id: str) -> dict:
@@ -1868,6 +1868,39 @@ def test_poll_logs_returns_the_live_attempt_from_the_terminal_status(capsys) -> 
     assert result == run_commands._LogPollResult("done", False, 1)
     assert result.live_attempt == 1
     assert capsys.readouterr().out == ""
+
+
+def test_poll_logs_prints_rotated_archives_once(monkeypatch, capsys) -> None:
+    # A rotated run: `.log` is empty and its earlier output is archived. The server returns the
+    # archives with any offset-0 page unless the follower says it already has them.
+    class _RotatedClient(_FakeClient):
+        def __init__(self) -> None:
+            super().__init__()
+            self.current = ""
+            self.calls: list[tuple[int, bool]] = []
+            self.statuses = iter(["running", "running", "running", "done"])
+
+        def get_logs(self, run_id: str, offset: int = 0, archives: bool = True) -> dict:
+            self.calls.append((offset, archives))
+            chunk = self.current[offset:]
+            if offset == 0 and archives:
+                chunk = "archived 1\narchived 2\n" + chunk
+            return {"run_id": run_id, "logs": chunk, "offset": len(self.current)}
+
+        def get_run(self, run_id: str) -> dict:
+            state = next(self.statuses)
+            if len(self.calls) == 3:
+                self.current = "new line\n"  # the run writes again after two empty polls
+            return {"run_id": run_id, "state": state}
+
+    monkeypatch.setattr(run_commands.time, "sleep", lambda _seconds: None)
+    client = _RotatedClient()
+
+    state, printed_any, _ = run_commands._poll_logs(client, "flash-rotated", interval=0)
+
+    assert (state, printed_any) == ("done", True)
+    assert capsys.readouterr().out == "archived 1\narchived 2\nnew line\n"
+    assert client.calls == [(0, True), (0, False), (0, False), (0, False)]
 
 
 def test_follow_logs_uses_status_progress_when_log_tail_lags(monkeypatch, capsys) -> None:
@@ -1895,7 +1928,7 @@ def test_follow_logs_uses_status_progress_when_log_tail_lags(monkeypatch, capsys
                 ]
             )
 
-        def get_logs(self, run_id: str, offset: int = 0) -> dict:
+        def get_logs(self, run_id: str, offset: int = 0, archives: bool = True) -> dict:
             # Stale/lossy log stream: no bytes and a non-terminal page state forever.
             return {"run_id": run_id, "logs": "", "offset": 0, "state": "running"}
 
@@ -1971,7 +2004,7 @@ def test_follow_logs_prints_heartbeat_metrics_once_per_step(monkeypatch, capsys)
                 ]
             )
 
-        def get_logs(self, run_id: str, offset: int = 0) -> dict:
+        def get_logs(self, run_id: str, offset: int = 0, archives: bool = True) -> dict:
             return {"run_id": run_id, "logs": "", "offset": 0, "state": "running"}
 
         def get_run(self, run_id: str) -> dict:
@@ -4975,7 +5008,7 @@ def test_follow_survives_a_transient_502_instead_of_reporting_a_failed_submit(
             super().__init__()
             self.log_calls = 0
 
-        def get_logs(self, run_id: str, offset: int = 0) -> dict:
+        def get_logs(self, run_id: str, offset: int = 0, archives: bool = True) -> dict:
             self.log_calls += 1
             if self.log_calls == 1:
                 raise deploy_commands.ApiError(502, "HTTP Error 502: Bad Gateway")
@@ -5009,7 +5042,7 @@ def test_follow_does_not_reprint_the_log_page_it_retried(monkeypatch, capsys) ->
             self.offsets: list[int] = []
             self.run_calls = 0
 
-        def get_logs(self, run_id: str, offset: int = 0) -> dict:
+        def get_logs(self, run_id: str, offset: int = 0, archives: bool = True) -> dict:
             self.offsets.append(offset)
             if offset == 0:
                 return {"run_id": run_id, "logs": "step 1\n", "offset": 7, "state": "running"}
@@ -5036,7 +5069,7 @@ def test_follow_gives_up_after_the_retry_window_and_names_the_run(monkeypatch, c
     """A genuinely dead plane must still end -- naming the run, never as a failed submit."""
 
     class _DeadClient(_FakeClient):
-        def get_logs(self, run_id: str, offset: int = 0) -> dict:
+        def get_logs(self, run_id: str, offset: int = 0, archives: bool = True) -> dict:
             raise deploy_commands.ApiError(502, "HTTP Error 502: Bad Gateway")
 
         def get_run(self, run_id: str) -> dict:
@@ -5066,7 +5099,7 @@ def test_follow_surfaces_a_client_error_immediately_without_retrying(monkeypatch
             super().__init__()
             self.log_calls = 0
 
-        def get_logs(self, run_id: str, offset: int = 0) -> dict:
+        def get_logs(self, run_id: str, offset: int = 0, archives: bool = True) -> dict:
             self.log_calls += 1
             raise deploy_commands.ApiError(401, "invalid or missing API key")
 
@@ -5113,7 +5146,7 @@ def test_follow_reports_a_finished_run_even_if_the_final_status_fetch_blips(
             super().__init__()
             self.run_calls = 0
 
-        def get_logs(self, run_id: str, offset: int = 0) -> dict:
+        def get_logs(self, run_id: str, offset: int = 0, archives: bool = True) -> dict:
             return {"run_id": run_id, "logs": "", "offset": 0, "state": "done"}
 
         def get_run(self, run_id: str) -> dict:
@@ -5139,7 +5172,7 @@ def test_follow_warns_once_per_outage_not_once_per_attempt(monkeypatch, capsys) 
             super().__init__()
             self.log_calls = 0
 
-        def get_logs(self, run_id: str, offset: int = 0) -> dict:
+        def get_logs(self, run_id: str, offset: int = 0, archives: bool = True) -> dict:
             self.log_calls += 1
             if self.log_calls <= 3:
                 raise deploy_commands.ApiError(502, "HTTP Error 502: Bad Gateway")
@@ -5169,7 +5202,7 @@ def test_follow_surfaces_a_wrong_api_url_instead_of_retrying_it(monkeypatch, cap
             super().__init__()
             self.log_calls = 0
 
-        def get_logs(self, run_id: str, offset: int = 0) -> dict:
+        def get_logs(self, run_id: str, offset: int = 0, archives: bool = True) -> dict:
             self.log_calls += 1
             raise _unexpected_response(
                 "https://proxy.example", f"/v1/runs/{run_id}/logs", "returned a non-JSON body"
@@ -5198,7 +5231,7 @@ def test_follow_retries_a_genuinely_unreachable_service(monkeypatch, capsys) -> 
             super().__init__()
             self.log_calls = 0
 
-        def get_logs(self, run_id: str, offset: int = 0) -> dict:
+        def get_logs(self, run_id: str, offset: int = 0, archives: bool = True) -> dict:
             self.log_calls += 1
             if self.log_calls == 1:
                 raise ServiceUnreachableError(

@@ -634,10 +634,13 @@ class ApiClient:
     def get_run(self, run_id: str) -> dict:
         return self._request("GET", f"/v1/runs/{run_id}")
 
-    def get_logs(self, run_id: str, offset: int = 0) -> dict:
+    def get_logs(self, run_id: str, offset: int = 0, archives: bool = True) -> dict:
+        """One page of run logs; at offset 0, rotated archives precede `.log` unless `archives`
+        is False (a follower that already received them)."""
+        query = f"offset={int(offset)}" + ("" if archives else "&archives=false")
         return self._request(
             "GET",
-            f"/v1/runs/{run_id}/logs?offset={int(offset)}",
+            f"/v1/runs/{run_id}/logs?{query}",
             require={"logs": str, "offset": int},
         )
 

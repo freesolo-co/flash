@@ -18,6 +18,7 @@ import json
 import math
 import os
 import time
+import zlib
 
 from flash.core.catalog import validate_model_for_algorithm
 from flash.core.spec import JobSpec
@@ -319,8 +320,10 @@ def _read_log_archive(log_path: str, number: int) -> str | None:
             return f.read().decode("utf-8", errors="replace")
     except FileNotFoundError:
         return None
-    except (OSError, EOFError):
-        return ""  # mid-compression or damaged: keep probing the older archives
+    except (OSError, EOFError, zlib.error):
+        # mid-compression or damaged (bad header, truncated, or corrupt DEFLATE data): skip it and
+        # keep probing the older archives, so one bad archive never hides the intact logs.
+        return ""
 
 
 def get_rotated_logs(run_id: str) -> str:

@@ -517,6 +517,7 @@ def run_logs(
     run_id: str,
     key: Annotated[dict, Depends(require_key)],
     offset: int = 0,
+    archives: bool = True,
     x_freesolo_org_id: Annotated[str | None, Header()] = None,
 ):
     status = require_readable_run(run_id, key, x_freesolo_org_id)
@@ -541,11 +542,12 @@ def run_logs(
         "last_heartbeat": public_status.get("last_heartbeat"),
         "gpu_status": status.gpu_status,
     }
-    if offset == 0:
+    if offset == 0 and archives:
         # A host logrotate copy-truncates run logs into `.log.1` (older archives `.log.N[.gz]`),
         # after which `.log` restarts empty. A full read returns that earlier output first, so a
-        # rotated run still shows its whole log; `offset` keeps addressing only `.log`, so
-        # followers never skip or repeat output across a rotation.
+        # rotated run still shows its whole log; `offset` keeps addressing only `.log`. A follower
+        # still at offset 0 after its first page (empty `.log`) passes `archives=false` so it does
+        # not receive the archives again on every poll.
         page["logs"] = runner_status.get_rotated_logs(run_id) + chunk
     return page
 
