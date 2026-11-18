@@ -5,7 +5,7 @@ from __future__ import annotations
 import contextlib
 import time
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from flash.adapters.artifacts import MAX_ATTEMPT_ID
 from flash.core.spec import JobSpec
@@ -193,6 +193,7 @@ def _reserve_attempt_launch(
     from flash.runner.supervise.retry_decision import (
         FailureObservation,
         RetryState,
+        custom_session_started,
         require_retry_authorization_from_raw,
         transition_failure,
     )
@@ -246,7 +247,10 @@ def _reserve_attempt_launch(
                     if plan is None:
                         retry_state, plan = transition_failure(
                             retry_state,
-                            FailureObservation("poll_error"),
+                            FailureObservation(
+                                "poll_error",
+                                session_started=custom_session_started(raw, current - 1),
+                            ),
                             attempt=current - 1,
                         )
                         snapshot = retry_state.to_snapshot()
@@ -411,6 +415,7 @@ def decide_attempt_failure(
     """Atomically persist one immutable failure decision for the exact attempt owner."""
     from flash.runner.supervise.retry_decision import (
         FailureObservation,
+        custom_session_started,
         require_retry_authorization_from_raw,
         transition_failure,
     )
@@ -444,6 +449,10 @@ def decide_attempt_failure(
             retry_state = require_retry_authorization_from_raw(spec, raw, attempt)
             plan = retry_state.persisted_plan(attempt)
             if plan is None:
+                if retry_state.pre_session_retries_only:
+                    observation = replace(
+                        observation, session_started=custom_session_started(raw, attempt)
+                    )
                 retry_state, plan = transition_failure(retry_state, observation, attempt=attempt)
                 state._save_status_unlocked(
                     status,

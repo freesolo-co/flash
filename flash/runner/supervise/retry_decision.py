@@ -15,12 +15,23 @@ WORKER_RETRIABLE_FAILURE = "worker_retriable"
 # A Spot VM was rented but never booted within its window: a provider fault on that machine, not
 # a memory signal, so retry the same shape within the infrastructure budget.
 BOOT_TIMEOUT_FAILURE = "boot_timeout"
+# A VM reached running but its worker never produced a heartbeat or bootstrap output within the
+# first-liveness window (a stuck image pull or bootstrap on that machine). Like a boot timeout it
+# says nothing about memory, so retry the same shape instead of raising the usable-VRAM floor.
+BOOT_STALL_FAILURE = "boot_stalled"
 CANDIDATE_RETRY_FAILURES = INFRA_RETRY_FAILURES | {
     "oom",
     "job_preempted",
     WORKER_RETRIABLE_FAILURE,
     BOOT_TIMEOUT_FAILURE,
+    BOOT_STALL_FAILURE,
 }
+# Custom runs pin max_retries = 0: once a session has started, the local controller owns recovery
+# (it reconnects to Spot replacement sessions itself). Before that nothing of the author's algorithm
+# has run, so these infrastructure faults retry the same shape within INFRA_RETRY_FLOOR.
+CUSTOM_PRE_SESSION_RETRY_FAILURES = frozenset(
+    {BOOT_TIMEOUT_FAILURE, BOOT_STALL_FAILURE, WORKER_RETRIABLE_FAILURE}
+)
 CACHE_FALLBACK_FAILURES = frozenset({"no_capacity", "poll_error"})
 _STATE_KEYS = frozenset(
     {
@@ -65,6 +76,8 @@ class FailureObservation:
     chosen: object | None = None
     candidates: tuple | None = None
     managed_cache_mounted: bool = False
+    # custom runs only: the failed attempt had already started a session (custom_session_started)
+    session_started: bool = False
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "failure", self.failure or "unknown")
@@ -83,10 +96,14 @@ class RetryState:
     drop_weight_cache: bool = False
     cache_retry_shape: tuple[str, str, int] | None = None
     last_decision: PersistedRetryDecision | None = None
+    # derived from the spec, never persisted: a custom run retries only pre-session faults.
+    pre_session_retries_only: bool = False
 
     @classmethod
     def initial_for_spec(cls, spec: JobSpec) -> RetryState:
         retries = int(spec.gpu.max_retries)
+        if spec.algorithm == "custom" and not retries:
+            return cls(INFRA_RETRY_FLOOR, 0, 0, pre_session_retries_only=True)
         return cls(max(retries, INFRA_RETRY_FLOOR) if retries else 0, retries, int(retries > 0))
 
     @classmethod
@@ -127,6 +144,7 @@ class RetryState:
             drop_weight_cache=drop,
             cache_retry_shape=shape,
             last_decision=decision,
+            pre_session_retries_only=maxima.pre_session_retries_only,
         )
 
     def to_snapshot(self) -> dict:
@@ -156,6 +174,37 @@ class RetryState:
             ),
             None,
         )
+
+
+def custom_session_started(raw: dict, attempt: int) -> bool:
+    """Whether the persisted run status shows that ``attempt`` already started a custom session.
+
+    The worker reports ``session_started_at`` once it serves the session (record_heartbeat carries
+    it forward on later heartbeats of the same attempt); a committed step marks it progressed.
+    """
+    if raw.get("lifecycle_progressed_attempt") == attempt:
+        return True
+    heartbeat = raw.get("last_heartbeat")
+    return (
+        isinstance(heartbeat, dict)
+        and heartbeat.get("attempt") == attempt
+        and (
+            "session_started_at" in heartbeat
+            or heartbeat.get("stage") in {"custom_waiting", "custom_step", "done"}
+        )
+    )
+
+
+def _custom_retry_refused(state: RetryState, observation: FailureObservation) -> bool:
+    if not state.pre_session_retries_only:
+        return False
+    if observation.session_started:
+        return True
+    failure = observation.failure
+    return not (
+        failure in CUSTOM_PRE_SESSION_RETRY_FAILURES
+        or (failure == "poll_error" and observation.chosen is None)
+    )
 
 
 def _bounded_count(value: object, label: str, maximum: int) -> int:
@@ -347,12 +396,6 @@ def transition_failure(
     if failure == "job_preempted":
         state, plan = _spot_preemption_plan(state, chosen)
         return _finish(state, plan, observation, attempt)
-    if failure == WORKER_RETRIABLE_FAILURE:
-        state, plan = _worker_retriable_plan(state, chosen)
-        return _finish(state, plan, observation, attempt)
-    if failure == BOOT_TIMEOUT_FAILURE:
-        state, plan = _worker_retriable_plan(state, chosen, "a VM that never booted")
-        return _finish(state, plan, observation, attempt)
     if failure == "no_capacity" and chosen is not None and chosen.provider in ("spot", "lambda"):
         # Spot or Lambda refused the create for quota/capacity before provisioning anything. Like
         # an eviction, wait for the same shape: cancellation and the run deadline bound it, not the
@@ -363,6 +406,18 @@ def transition_failure(
             observation,
             attempt,
         )
+    if _custom_retry_refused(state, observation):
+        reason = "custom session already started" if observation.session_started else "custom run"
+        return _finish(state, RetryPlan(False, f"not retrying: {reason}"), observation, attempt)
+    if failure == WORKER_RETRIABLE_FAILURE:
+        state, plan = _worker_retriable_plan(state, chosen)
+        return _finish(state, plan, observation, attempt)
+    if failure == BOOT_TIMEOUT_FAILURE:
+        state, plan = _worker_retriable_plan(state, chosen, "a VM that never booted")
+        return _finish(state, plan, observation, attempt)
+    if failure == BOOT_STALL_FAILURE:
+        state, plan = _worker_retriable_plan(state, chosen, "a worker that never became live")
+        return _finish(state, plan, observation, attempt)
     if failure not in CANDIDATE_RETRY_FAILURES:
         return _finish(state, RetryPlan(False, "not retrying"), observation, attempt)
     if chosen is None:

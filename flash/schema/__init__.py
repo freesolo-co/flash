@@ -617,7 +617,7 @@ def spec_from_dict(
     raw: dict[str, Any], run_id: str | None = None, *, project_required: bool = False
 ) -> JobSpec:
     model, model_revision, project, algorithm, thinking = _validate_top_level(raw, project_required)
-    from flash.schema.custom import parse_custom_section
+    from flash.schema.custom import custom_run_wall_seconds, parse_custom_section
 
     custom = parse_custom_section(raw.get("custom"), algorithm)
     env_raw, environment_pip, environment_secrets = _validate_environment_section(raw, algorithm)
@@ -641,7 +641,11 @@ def spec_from_dict(
         thinking=thinking,
     )
     if custom:
-        gpu_spec = replace(gpu_spec, max_retries=0, max_wall_seconds=custom["max_wall_seconds"])
+        # the session cap (custom.max_wall_seconds) runs from session start; the run deadline also
+        # covers queueing and boot. see CUSTOM_QUEUE_ALLOWANCE_SECONDS.
+        gpu_spec = replace(
+            gpu_spec, max_retries=0, max_wall_seconds=custom_run_wall_seconds(custom)
+        )
     init_from_adapter, lora_rank, lora_alpha = _validate_algorithm_model_consistency(
         model,
         algorithm,

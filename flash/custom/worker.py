@@ -28,6 +28,16 @@ def checkpoint_due(train, clock, step, max_steps):
     return step % train.save_every == 0 or step in train.save_at_steps or step == max_steps
 
 
+def session_wall_seconds(spec, remaining):
+    """The session's own cap: the full custom.max_wall_seconds from session start.
+
+    The run deadline (``remaining``) also covers queueing and boot, so it only bounds the session
+    when that allowance is nearly spent.
+    """
+    cap = spec.custom["max_wall_seconds"]
+    return min(cap, remaining) if remaining else cap
+
+
 def _latest_checkpoint_or_retry(lookup, spec):
     """Checkpoint discovery whose transient storage failures reschedule the attempt.
 
@@ -170,7 +180,7 @@ def run(*, context):
     serve_session(
         session,
         os.environ["FLASH_CUSTOM_SESSION_TOKEN"],
-        context.remaining_wall_seconds() or spec.gpu.max_wall_seconds,
+        session_wall_seconds(spec, context.remaining_wall_seconds()),
         tick=tick,
         tls=tls,
     )

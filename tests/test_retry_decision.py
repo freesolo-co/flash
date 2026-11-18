@@ -419,3 +419,175 @@ def test_non_spot_preemption_stays_terminal_while_worker_faults_retry():
     )
     assert not preempted.retry
     assert flagged.retry
+
+
+def _custom_spec(run_id: str = "custom-retry", *, spot: bool = True) -> JobSpec:
+    return JobSpec(
+        run_id=run_id,
+        model="Qwen/Qwen3.5-9B",
+        algorithm="custom",
+        gpu=GpuSpec(provider="spot" if spot else "modal", spot=spot, max_retries=0),
+        custom={"file": "algorithm.py", "max_wall_seconds": 2700, "idle_seconds": 900},
+    )
+
+
+def test_first_liveness_stall_retries_same_shape_instead_of_raising_the_vram_floor():
+    """A Spot H200 whose worker never became live is rebid, not escalated past every GPU."""
+    from flash.runner.supervise.retry_decision import BOOT_STALL_FAILURE
+
+    chosen = _candidate("spot", "H200", 141)
+    current = RetryState(2, 2, 1)
+    for attempt in range(2):
+        current, plan = transition_failure(
+            current, _observe(BOOT_STALL_FAILURE, chosen, (chosen,)), attempt=attempt
+        )
+        assert plan.retry
+        assert "never became live" in plan.action
+        assert current.usable_vram_floor == 0
+        assert current.select_candidate((chosen,))[1] == chosen
+    current, plan = transition_failure(
+        current, _observe(BOOT_STALL_FAILURE, chosen, (chosen,)), attempt=2
+    )
+    assert not plan.retry
+    assert "budget exhausted" in plan.action
+
+
+@pytest.mark.parametrize("failure", ["boot_stalled", "boot_timeout", "worker_retriable"])
+def test_custom_run_retries_pre_session_faults_within_the_infra_floor(failure):
+    from flash.runner.supervise.retry_decision import INFRA_RETRY_FLOOR
+
+    spec = _custom_spec()
+    chosen = _candidate("spot", "H200", 141)
+    current = RetryState.initial_for_spec(spec)
+    assert (current.infra_retries, current.oom_retries, current.cache_retries) == (
+        INFRA_RETRY_FLOOR,
+        0,
+        0,
+    )
+    for attempt in range(INFRA_RETRY_FLOOR):
+        current, plan = transition_failure(
+            current, _observe(failure, chosen, (chosen,)), attempt=attempt
+        )
+        assert plan.retry
+        assert plan.infra_retry_ordinal == attempt + 1
+        current = RetryState.from_snapshot(spec, current.to_snapshot())
+        assert current.pre_session_retries_only
+        assert current.persisted_plan(attempt) == plan
+        assert current.select_candidate((chosen,))[1] == chosen
+    current, plan = transition_failure(
+        current, _observe(failure, chosen, (chosen,)), attempt=INFRA_RETRY_FLOOR
+    )
+    assert not plan.retry
+    assert "budget exhausted" in plan.action
+
+
+def test_custom_run_retries_lost_allocation_before_a_session():
+    current, plan = transition_failure(
+        RetryState.initial_for_spec(_custom_spec()), _observe("poll_error"), attempt=0
+    )
+    assert plan.retry
+    assert current.infra_used == 1
+
+
+@pytest.mark.parametrize("failure", ["boot_stalled", "worker_retriable", "poll_error"])
+def test_custom_run_does_not_retry_after_its_session_started(failure):
+    chosen = None if failure == "poll_error" else _candidate("spot", "H200", 141)
+    observation = replace(
+        _observe(failure, chosen, (chosen,) if chosen else ()), session_started=True
+    )
+    current, plan = transition_failure(
+        RetryState.initial_for_spec(_custom_spec()), observation, attempt=0
+    )
+    assert not plan.retry
+    assert "session already started" in plan.action
+    assert current.infra_used == 0
+
+
+@pytest.mark.parametrize("failure", ["stalled", "oom", "job_failed", "no_capacity", "poll_error"])
+def test_custom_run_keeps_max_retries_zero_for_other_failures(failure):
+    chosen = _candidate("modal", "H100", 80)
+    larger = _candidate("modal", "H200", 141)
+    current, plan = transition_failure(
+        RetryState.initial_for_spec(_custom_spec(spot=False)),
+        _observe(failure, chosen, (chosen, larger)),
+        attempt=0,
+    )
+    assert not plan.retry
+    assert current.infra_used == 0
+    assert current.usable_vram_floor == 0
+
+
+def test_custom_spot_preemption_and_capacity_still_requeue_after_a_session():
+    chosen = _candidate("spot", "H200", 141)
+    state0 = RetryState.initial_for_spec(_custom_spec())
+    for failure in ("job_preempted", "no_capacity"):
+        _, plan = transition_failure(
+            state0,
+            replace(_observe(failure, chosen, (chosen,)), session_started=True),
+            attempt=0,
+        )
+        assert plan.retry
+        assert plan.infra_retry_ordinal is None
+
+
+def test_custom_snapshot_bounds_follow_the_pre_session_floor():
+    from flash.runner.supervise.retry_decision import INFRA_RETRY_FLOOR
+
+    spec = _custom_spec()
+    snapshot = replace(
+        RetryState.initial_for_spec(spec),
+        infra_used=INFRA_RETRY_FLOOR,
+        last_decision=PersistedRetryDecision(
+            4, "boot_stalled", RetryPlan(True, "retrying", INFRA_RETRY_FLOOR)
+        ),
+    ).to_snapshot()
+    assert RetryState.from_snapshot(spec, snapshot).infra_used == INFRA_RETRY_FLOOR
+    snapshot["infra_used"] = INFRA_RETRY_FLOOR + 1
+    with pytest.raises(ValueError, match="infra retry count"):
+        RetryState.from_snapshot(spec, snapshot)
+    # a non-custom max_retries = 0 run still has no infrastructure budget.
+    snapshot["infra_used"] = 1
+    with pytest.raises(ValueError, match="infra retry count"):
+        RetryState.from_snapshot(_spec(max_retries=0), snapshot)
+
+
+@pytest.mark.parametrize(
+    ("raw", "attempt", "started"),
+    [
+        ({}, 0, False),
+        ({"last_heartbeat": {"attempt": 0, "stage": "custom_model_load"}}, 0, False),
+        ({"last_heartbeat": {"attempt": 0, "stage": "x", "session_started_at": 1.0}}, 0, True),
+        ({"last_heartbeat": {"attempt": 0, "stage": "custom_waiting"}}, 0, True),
+        # an earlier attempt's session says nothing about this replacement attempt.
+        ({"last_heartbeat": {"attempt": 0, "stage": "custom_step"}}, 1, False),
+        ({"lifecycle_progressed_attempt": 1}, 1, True),
+    ],
+)
+def test_custom_session_started_reads_only_the_failed_attempt(raw, attempt, started):
+    from flash.runner.supervise.retry_decision import custom_session_started
+
+    assert custom_session_started(raw, attempt) is started
+
+
+@pytest.mark.parametrize("session_started", [False, True])
+def test_custom_failure_decision_reads_the_persisted_session_state(
+    monkeypatch, tmp_path, session_started
+):
+    monkeypatch.setattr(state, "RUNS_DIR", str(tmp_path / "runs"))
+    spec = _custom_spec(f"custom-decision-{int(session_started)}")
+    run = state.RunStatus(spec.run_id, "running", spec.to_dict())
+    # max_retries is platform-managed: the lifecycle reads it from the internal worker spec.
+    run.effective_preparation = {"worker_spec": spec.to_internal_dict()}
+    state._save_status(run)
+    claim = attempts.reserve_verified_attempt_launch(spec.run_id)
+    stage = "custom_waiting" if session_started else "custom_model_load"
+    status.record_heartbeat(spec.run_id, {"stage": stage, "attempt": 0})
+    chosen = _candidate("spot", "H200", 141)
+    plan = decide_attempt_failure(
+        spec.run_id,
+        claim_token=claim.token,
+        expected_remote=None,
+        observation=_observe("boot_stalled", chosen, (chosen,)),
+        attempt=0,
+    )
+    assert plan.retry is not session_started

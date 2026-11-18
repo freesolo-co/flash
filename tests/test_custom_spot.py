@@ -308,11 +308,35 @@ def test_custom_session_time_accumulates_across_spot_attempts(monkeypatch, tmp_p
     assert session_charge(status, spec) == pytest.approx(36.0 * min(1.0, 1800.0 / wall))
 
 
-def test_spot_first_connection_waits_for_the_run_deadline_not_twenty_minutes():
+def test_custom_run_deadline_adds_the_queue_allowance_and_reloads_canonically(
+    monkeypatch, tmp_path
+):
+    """The persisted run deadline covers queueing + boot + the session cap, and still validates."""
+    from flash.runner.lifecycle import deadlines
+    from flash.runner.lifecycle import state as runner_state
+    from flash.schema.custom import CUSTOM_QUEUE_ALLOWANCE_SECONDS
+
+    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
+    custom = {"file": "a.py", "max_wall_seconds": 2700}
+    spec = spec_from_dict({**custom_raw(spot=True), "custom": custom}, run_id="custom-deadline")
+    created = 1_794_972_604.0
+    run = runner_state.RunStatus(spec.run_id, "running", spec.to_dict(), created_at=created)
+    run.effective_preparation = {"worker_spec": spec.to_internal_dict()}
+    runner_state._save_status(run, _run_deadline_at=created + float(spec.gpu.max_wall_seconds))
+    deadline = deadlines._load_run_deadline_at(spec.run_id)
+    assert deadline == created + 2700 + CUSTOM_QUEUE_ALLOWANCE_SECONDS
+    # an hour of Spot capacity queueing no longer exhausts a 45-minute session cap.
+    remaining = deadlines._remaining_run_wall_seconds(spec.run_id, now=created + 3600)
+    assert remaining > 2700
+
+
+def test_spot_first_connection_waits_for_the_queue_allowance_not_twenty_minutes():
     from flash.custom.controller import first_connect_timeout
+    from flash.schema.custom import CUSTOM_QUEUE_ALLOWANCE_SECONDS
 
     custom = {"file": "a.py", "max_wall_seconds": 7200}
     modal = spec_from_dict({**custom_raw(), "custom": custom})
     spot = spec_from_dict({**custom_raw(spot=True), "custom": custom})
     assert first_connect_timeout(modal) == 1200
-    assert first_connect_timeout(spot) == 7200
+    # Spot price/capacity queueing and boot are bounded by the queue allowance, not the session cap.
+    assert first_connect_timeout(spot) == CUSTOM_QUEUE_ALLOWANCE_SECONDS > 7200

@@ -15,6 +15,16 @@ TRAIN_KEYS = {
 }
 TRAIN_DEFAULTS = {"max_steps": 1000, "max_context_tokens": 2048, "lora_rank": 16, "save_every": 10}
 CUSTOM_KEYS = {"file", "resume_from", "idle_seconds", "max_wall_seconds", "controller_id"}
+# custom.max_wall_seconds caps the GPU session from when it starts (the worker's serve_session and
+# the billing share both measure it there). The run-global deadline (gpu.max_wall_seconds, charged
+# from submission) adds this allowance so Spot price/capacity queueing and VM boot cannot eat the
+# session: a session that starts within it still gets its full cap.
+CUSTOM_QUEUE_ALLOWANCE_SECONDS = 24 * 3600
+
+
+def custom_run_wall_seconds(custom):
+    """The run-global submission-to-terminal budget for a parsed [custom] section."""
+    return custom["max_wall_seconds"] + CUSTOM_QUEUE_ALLOWANCE_SECONDS
 
 
 def parse_custom_section(value, algorithm):

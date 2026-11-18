@@ -123,11 +123,14 @@ def first_connect_timeout(spec):
     """How long to wait for the first session before cancelling the run.
 
     Modal provisions promptly, so a stuck launch is cut off after 20 minutes. A Spot run can
-    legitimately wait longer: it queues while prices exceed the cap and may be preempted and
-    replaced before its first session starts, all within the run's own wall-clock deadline.
+    legitimately wait longer: it queues while prices exceed the cap or capacity is short, and may
+    be preempted and replaced before its first session starts. It waits for the run's own queue
+    allowance; the session cap only starts counting once the session does.
     """
+    from flash.schema.custom import CUSTOM_QUEUE_ALLOWANCE_SECONDS
+
     wall = spec.custom["max_wall_seconds"]
-    return wall if spec.gpu.spot else min(1200, wall)
+    return CUSTOM_QUEUE_ALLOWANCE_SECONDS if spec.gpu.spot else min(1200, wall)
 
 
 def replacement_session(api, run_id, previous, *, timeout, connect=connect):

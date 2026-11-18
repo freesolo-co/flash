@@ -55,6 +55,36 @@ def test_slow_restore_does_not_consume_controller_idle_allowance(tmp_path, monke
     server.assert_called_once()
 
 
+def test_session_cap_runs_from_session_start_not_from_submission():
+    """Queue and boot time spent before the session must not shorten custom.max_wall_seconds."""
+    from flash.cost.spec import estimate_for_spec
+    from flash.custom.worker import session_wall_seconds
+    from flash.providers.core.base import Allocation
+    from flash.schema import spec_from_dict
+    from flash.schema.custom import CUSTOM_QUEUE_ALLOWANCE_SECONDS
+
+    spec = spec_from_dict(
+        {
+            "model": "Qwen/Qwen3.5-9B",
+            "algorithm": "custom",
+            "custom": {"file": "algorithm.py", "max_wall_seconds": 2700},
+        }
+    )
+    # the run-global deadline covers queueing and boot on top of the session cap.
+    assert spec.gpu.max_wall_seconds == 2700 + CUSTOM_QUEUE_ALLOWANCE_SECONDS
+    assert spec.custom["max_wall_seconds"] == 2700
+    # an hour of queueing leaves plenty of run deadline: the session still gets its full cap.
+    assert session_wall_seconds(spec, spec.gpu.max_wall_seconds - 3600) == 2700
+    # only a nearly spent queue allowance shortens it, never past the run deadline.
+    assert session_wall_seconds(spec, 1000.0) == 1000.0
+    assert session_wall_seconds(spec, None) == 2700
+    # the quote still prices exactly the session cap, not the queue allowance.
+    rented = Allocation("spot", "H200", 3.2, 141, ())
+    quote = estimate_for_spec(spec, allocation=rented)
+    assert quote.wall_clock_seconds == 2700
+    assert abs(quote.total_usd - 2700 * 3.2 / 3600) < 1e-9
+
+
 def test_warm_start_downloads_verified_source_before_loading_backend(monkeypatch):
     from flash.custom import worker
     from flash.engine.worker.train.entry import sft_train
