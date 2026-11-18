@@ -13,6 +13,7 @@ Split out of `flash.runner` to keep that module under the file-size limit.
 from __future__ import annotations
 
 import contextlib
+import gzip
 import json
 import math
 import os
@@ -301,12 +302,51 @@ def list_run_ids() -> list[str]:
     ]
 
 
-def get_logs(run_id: str) -> str:
+# Contiguous logrotate archives are probed by number; this only bounds a pathological history.
+_MAX_LOG_ARCHIVES = 64
+
+
+def _read_log_archive(log_path: str, number: int) -> str | None:
+    """One rotated archive (`.log.N`, or `.log.N.gz` once delaycompress has run), else None."""
+    plain = f"{log_path}.{number}"
+    try:
+        with open(plain, "rb") as f:
+            return f.read().decode("utf-8", errors="replace")
+    except FileNotFoundError:
+        pass
+    try:
+        with gzip.open(plain + ".gz", "rb") as f:
+            return f.read().decode("utf-8", errors="replace")
+    except FileNotFoundError:
+        return None
+    except (OSError, EOFError):
+        return ""  # mid-compression or damaged: keep probing the older archives
+
+
+def get_rotated_logs(run_id: str) -> str:
+    """Run output a host logrotate moved out of `<run_id>.log`, oldest archive first.
+
+    Copytruncate rotation restarts `.log` empty and keeps earlier output in `.log.1`, `.log.2.gz`,
+    ...; readers combine these with `.log` so a rotated run never appears to have no logs.
+    """
     log_path = state.runs_file_path(run_id, ".log")
-    if not os.path.exists(log_path):
-        return ""
-    with open(log_path) as f:
-        return f.read()
+    archives: list[str] = []
+    for number in range(1, _MAX_LOG_ARCHIVES + 1):
+        text = _read_log_archive(log_path, number)
+        if text is None:
+            break
+        archives.append(text)
+    return "".join(reversed(archives))
+
+
+def get_logs(run_id: str) -> str:
+    """The run's whole log: rotated archives followed by the current `.log`."""
+    log_path = state.runs_file_path(run_id, ".log")
+    current = ""
+    if os.path.exists(log_path):
+        with open(log_path, "rb") as f:
+            current = f.read().decode("utf-8", errors="replace")
+    return get_rotated_logs(run_id) + current
 
 
 _STATUS_LIST_LIMIT = 16

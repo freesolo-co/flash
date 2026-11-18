@@ -7,6 +7,7 @@ keys, so each distinct token resolves to its own run-ownership identity via ``db
 
 from __future__ import annotations
 
+import gzip
 import importlib
 import itertools
 import json
@@ -1948,31 +1949,71 @@ def test_logs_offset_paging(api):
 
 
 def test_logs_include_the_rotated_log(api):
-    # Host logrotate copy-truncates run logs: earlier lines move to .log.1 and .log restarts empty.
+    # Host logrotate copy-truncates run logs: earlier lines move to .log.1 (older archives to
+    # .log.N.gz) and .log restarts empty. A full read returns the archives, oldest first, then .log.
     key = _new_user_token()
     run_id = api.post(
         "/v1/runs", json={"spec": SPEC, "dry_run": True}, headers=_bearer(key)
     ).json()["run_id"]
     log_path = os.path.join(runner_state.RUNS_DIR, f"{run_id}.log")
     page = api.get(f"/v1/runs/{run_id}/logs", headers=_bearer(key)).json()
-    assert "rotated_logs" not in page  # nothing rotated yet
+    assert page["logs"] == ""  # nothing logged or rotated yet
+    assert "rotated_logs" not in page
+    with gzip.open(log_path + ".2.gz", "wt") as f:
+        f.write("start\n")
     with open(log_path + ".1", "w") as f:
         f.write("retry\n")
     with open(log_path, "w") as f:
-        f.write("retry\nfailure\n")  # new output may repeat rotated lines; none is dropped
+        f.write("failure\n")
     page = api.get(f"/v1/runs/{run_id}/logs", headers=_bearer(key)).json()
-    assert page["rotated_logs"] == "retry\n"
-    assert page["logs"] == "retry\nfailure\n"
-    assert page["offset"] == len("retry\nfailure\n")  # offsets address only the current log
+    assert page["logs"] == "start\nretry\nfailure\n"
+    assert "rotated_logs" not in page
+    assert page["offset"] == len("failure\n")  # offsets address only the current log
     with open(log_path, "a") as f:
         f.write("done\n")
     page2 = api.get(f"/v1/runs/{run_id}/logs?offset={page['offset']}", headers=_bearer(key)).json()
-    assert page2["logs"] == "done\n"
-    assert "rotated_logs" not in page2  # followers page the current log only
+    assert page2["logs"] == "done\n"  # followers page the current log only
     os.remove(log_path)  # rotated, current log not yet recreated
     page3 = api.get(f"/v1/runs/{run_id}/logs", headers=_bearer(key)).json()
-    assert page3["logs"] == ""
-    assert page3["rotated_logs"] == "retry\n"
+    assert page3["logs"] == "start\nretry\n"
+    assert page3["offset"] == 0
+
+
+def test_logs_of_a_run_rotated_to_an_empty_log(api):
+    # The production symptom: rotation left `.log` empty and all output in `.log.1`.
+    key = _new_user_token()
+    run_id = api.post(
+        "/v1/runs", json={"spec": SPEC, "dry_run": True}, headers=_bearer(key)
+    ).json()["run_id"]
+    log_path = os.path.join(runner_state.RUNS_DIR, f"{run_id}.log")
+    with open(log_path + ".1", "w") as f:
+        f.write("step 1\nstep 2\n")
+    open(log_path, "w").close()
+    page = api.get(f"/v1/runs/{run_id}/logs", headers=_bearer(key)).json()
+    assert page["logs"] == "step 1\nstep 2\n"
+    assert page["offset"] == 0
+    assert runner_status.get_logs(run_id) == "step 1\nstep 2\n"
+
+
+def test_plane_startup_leaves_run_logs_in_place(api, monkeypatch):
+    # A redeploy starts a new plane on the shared state volume; it must never rotate run logs.
+    import flash.server.asgi.app as app_mod
+
+    key = _new_user_token()
+    run_id = api.post(
+        "/v1/runs", json={"spec": SPEC, "dry_run": True}, headers=_bearer(key)
+    ).json()["run_id"]
+    log_path = os.path.join(runner_state.RUNS_DIR, f"{run_id}.log")
+    with open(log_path, "w") as f:
+        f.write("before redeploy\n")
+    monkeypatch.setenv("GITHUB_TOKEN", "ghp-test")  # startup preflight only
+    with TestClient(app_mod.create_app()) as redeployed:
+        monkeypatch.delenv("GITHUB_TOKEN")
+        page = redeployed.get(f"/v1/runs/{run_id}/logs", headers=_bearer(key)).json()
+    assert page["logs"] == "before redeploy\n"
+    with open(log_path) as f:
+        assert f.read() == "before redeploy\n"
+    assert not [name for name in os.listdir(runner_state.RUNS_DIR) if ".log." in name]
 
 
 def test_worker_output_route(api, monkeypatch):

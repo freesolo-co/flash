@@ -542,14 +542,11 @@ def run_logs(
         "gpu_status": status.gpu_status,
     }
     if offset == 0:
-        # Host logrotate copy-truncates run logs into ``.log.1``, after which ``.log`` restarts
-        # empty. A full read also returns that earlier output, separately: ``logs``/``offset``
-        # keep addressing only ``.log``, so followers never skip or repeat output across a
-        # rotation (mid-rotation, the two fields may briefly hold the same lines).
-        rotated_path = runs_file_path(run_id, ".log.1")
-        if os.path.isfile(rotated_path):
-            with open(rotated_path, "rb") as f:
-                page["rotated_logs"] = f.read().decode("utf-8", errors="replace")
+        # A host logrotate copy-truncates run logs into `.log.1` (older archives `.log.N[.gz]`),
+        # after which `.log` restarts empty. A full read returns that earlier output first, so a
+        # rotated run still shows its whole log; `offset` keeps addressing only `.log`, so
+        # followers never skip or repeat output across a rotation.
+        page["logs"] = runner_status.get_rotated_logs(run_id) + chunk
     return page
 
 
