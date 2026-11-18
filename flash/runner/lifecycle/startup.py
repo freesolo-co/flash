@@ -38,6 +38,10 @@ STARTUP_STAGES = {
     "initializing_training": "preparing data and initializing training",
 }
 
+# Stages before a GPU is assigned. A cold-start expectation is only true once one is: while queued,
+# "10-12 minutes" would read as the wait, which is unbounded and set by the queue instead.
+PRE_GPU_STAGES = frozenset({"waiting_for_gpu", "allocating_gpu"})
+
 # The run states in which a startup phase is meaningful; any other state hides a stale record.
 _STARTING_STATES = frozenset({"queued", "provisioning", "running"})
 
@@ -54,16 +58,27 @@ def record_startup_stage(
     *,
     attempt: int | None = None,
     extra: str | None = None,
+    queue: dict | None = None,
 ) -> None:
-    """Persist the live attempt's startup stage; ``None`` clears it. Diagnostic only, never raises."""
+    """Persist the live attempt's startup stage; ``None`` clears it. Diagnostic only, never raises.
+
+    ``queue`` is the Spot queue's view while ``waiting_for_gpu`` (reason, position, rough ETA).
+    """
     if stage is not None and stage not in STARTUP_STAGES:
         raise ValueError(f"unknown startup stage: {stage!r}")
     # status persistence is diagnostic here; a failed write must not disturb supervision.
     with contextlib.suppress(Exception):
-        _record(run_id, stage, attempt=attempt, extra=extra)
+        _record(run_id, stage, attempt=attempt, extra=extra, queue=queue)
 
 
-def _record(run_id: str, stage: str | None, *, attempt: int | None, extra: str | None) -> None:
+def _record(
+    run_id: str,
+    stage: str | None,
+    *,
+    attempt: int | None,
+    extra: str | None,
+    queue: dict | None = None,
+) -> None:
     from flash.runner.lifecycle import state
     from flash.runner.lifecycle.status import get_status
 
@@ -84,13 +99,18 @@ def _record(run_id: str, stage: str | None, *, attempt: int | None, extra: str |
                 attempt = previous.get("attempt")
             now = time.time()
             same_stage = previous.get("stage") == stage and previous.get("attempt") == attempt
-            status.startup = {
+            record = {
                 "stage": stage,
                 "detail": startup_detail(stage, extra),
                 "since": previous.get("since", now) if same_stage else now,
                 "attempt": attempt,
-                "typical_cold_start": TYPICAL_COLD_START,
             }
+            if stage in PRE_GPU_STAGES:
+                if stage == "waiting_for_gpu" and isinstance(queue, dict):
+                    record["queue"] = queue
+            else:
+                record["typical_cold_start"] = TYPICAL_COLD_START
+            status.startup = record
         status.updated_at = time.time()
         state._save_status_unlocked(status)
 

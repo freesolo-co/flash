@@ -431,6 +431,12 @@ def cancel_run(run_id: str) -> RunStatus:
         run_id, deferred_fencing_errors, entered_deployed=entered_deployed, reason=reason
     )
     _persist_cancellation_fence = fence.persist
+    if not entered_deployed and not initial_active:
+        # A training run with no serving to fence becomes `cancelled` before any provider call or
+        # lock wait. The queue, the bid path and handle persistence all check this state, so
+        # nothing is bid for afterwards, and the caller sees `cancelled` at once instead of after
+        # a provider sweep that took minutes.
+        _persist_cancellation_fence()
 
     deploy_lock = _deploy_lock(run_id)
     lock_acquired = deploy_lock.acquire(blocking=False)

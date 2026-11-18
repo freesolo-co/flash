@@ -521,6 +521,11 @@ def run_status(obj: dict) -> str:
         typical = startup.get("typical_cold_start")
         note = f"  (cold start typically takes {typical}; this is normal)" if typical else ""
         pairs.append(("startup", f"{startup['detail']}{_dim(note) if note else ''}"))
+        queue = startup.get("queue")
+        if isinstance(queue, dict) and queue.get("eta"):
+            pairs.append(
+                ("queue", f"{queue.get('reason_detail') or ''}; {queue['eta']}".lstrip("; "))
+            )
     pairs += heartbeat._heartbeat_pairs(obj, format_hint=_dim)
     if obj.get("state") == "cancelled" and obj.get("cancel_reason"):
         pairs.append(("cancelled", str(obj["cancel_reason"])))

@@ -149,9 +149,13 @@ class CapacityUnavailableError(CapacityLookupError):
     its body, so a persisted requeue detail can tell a throttle from a quota or validation refusal.
     """
 
-    def __init__(self, message: str = "", *, cause: str = "") -> None:
+    def __init__(self, message: str = "", *, cause: str = "", definitive: bool = True) -> None:
         super().__init__(message)
         self.cause = cause
+        # False when the create's outcome is unknown (timeout, 5xx, unreadable answer) and bounded
+        # reconciliation found nothing yet: a late resource may still appear, so nothing may be
+        # claimed about provisioning or billing.
+        self.definitive = definitive
 
 
 class UnreconciledCreateError(RuntimeError):
@@ -164,9 +168,13 @@ class UnreconciledCreateError(RuntimeError):
     quote a request body), so a capacity timeout can be told apart from an image or schema failure.
     """
 
-    def __init__(self, message: str = "", *, cause: str = "") -> None:
+    def __init__(self, message: str = "", *, cause: str = "", definitive: bool = True) -> None:
         super().__init__(message)
         self.cause = cause
+        # False when the create's outcome is unknown (timeout, 5xx, unreadable answer) and bounded
+        # reconciliation found nothing yet: a late resource may still appear, so nothing may be
+        # claimed about provisioning or billing.
+        self.definitive = definitive
 
 
 def canonical_gpu(name: str) -> str:

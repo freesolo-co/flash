@@ -41,11 +41,11 @@ def test_every_spot_quote_uses_the_top_spot_rate():
     from flash.providers.core.allocator import _cheapest_allocation
     from flash.providers.core.base import Candidate
 
-    assert quote_rate() == 2.21  # the H200 rate, the costliest class
+    assert quote_rate() == 2.40  # the H200 rate, the costliest class
     allocation = _cheapest_allocation(
         [Candidate("spot", "H100", 1.4, 80, 1)], need=47, cost_per_step=None, provider_rank={}
     )
-    assert (allocation.gpu, allocation.hourly_usd) == ("H100", 2.21)
+    assert (allocation.gpu, allocation.hourly_usd) == ("H100", 2.40)
 
 
 @pytest.mark.parametrize(
@@ -146,7 +146,7 @@ def test_custom_session_mixing_classes_is_billed_per_attempt(tmp_path, monkeypat
     assert charged == pytest.approx(
         quote_rate() * 0.5 * (H100_RATE + H200_RATE) / (2 * quote_rate())
     )
-    assert charged == pytest.approx(0.5 * (1.20 + 2.21) / 2)  # $0.8525 at the current table
+    assert charged == pytest.approx(0.5 * (1.20 + 2.40) / 2)  # $0.90 at the current table
 
 
 def test_allocation_admits_a_pinned_class_even_when_only_another_is_cheap(monkeypatch):
@@ -183,6 +183,6 @@ def test_supervisor_records_the_class_actually_rented(chosen, remote, expected):
 def test_submit_records_the_spot_tariff_only_for_spot_runs():
     from flash.runner.lifecycle.submit import _spot_tariff
 
-    assert _spot_tariff(spot_spec("H100")) == tariff() == {"H100": 1.2, "H200": 2.21}
+    assert _spot_tariff(spot_spec("H100")) == tariff() == {"H100": 1.2, "H200": 2.4}
     regular = replace(spot_spec(), gpu=GpuSpec(type="H100", count=1, provider="modal"))
     assert _spot_tariff(regular) is None

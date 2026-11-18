@@ -347,4 +347,5 @@ def launch(*, name, run_id, attempt, offer: Offer, region, user_data, deadline_a
         raise CapacityUnavailableError(
             f"Lambda launch outcome unknown ({cause}) and no instance appeared; requeuing",
             cause=cause,
+            definitive=False,
         ) from None
