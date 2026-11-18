@@ -375,24 +375,42 @@ def test_worker_retriable_fault_retries_same_shape_within_infra_budget(provider)
     assert "budget exhausted" in plan.action
 
 
-def test_spot_vm_that_never_booted_retries_same_shape_within_infra_budget():
+@pytest.mark.parametrize(
+    ("failure", "reason"),
+    [("boot_timeout", "never booted"), ("boot_stalled", "never became live")],
+)
+def test_spot_vm_that_never_booted_retries_same_shape_within_infra_budget(failure, reason):
     """An H200 (the largest Spot class) that never boots is rebid, not escalated past every GPU."""
     chosen = _candidate("spot", "H200", 141)
     current = RetryState(2, 2, 1)
     for attempt in range(2):
         current, plan = transition_failure(
-            current, _observe("boot_timeout", chosen, (chosen,)), attempt=attempt
+            current, _observe(failure, chosen, (chosen,)), attempt=attempt
         )
         assert plan.retry
-        assert "never booted" in plan.action
+        assert reason in plan.action
         assert current.infra_used == attempt + 1
         assert current.usable_vram_floor == 0
         assert current.select_candidate((chosen,))[1] == chosen
-    current, plan = transition_failure(
-        current, _observe("boot_timeout", chosen, (chosen,)), attempt=2
-    )
+    current, plan = transition_failure(current, _observe(failure, chosen, (chosen,)), attempt=2)
     assert not plan.retry
     assert "budget exhausted" in plan.action
+
+
+def test_custom_runs_get_infrastructure_retries_but_no_oom_or_cache_retries():
+    spec = replace(_spec(max_retries=0), algorithm="custom")
+    initial = RetryState.initial_for_spec(spec)
+    assert (initial.infra_retries, initial.oom_retries, initial.cache_retries) == (5, 0, 0)
+    chosen = _candidate("spot", "H100", 80)
+    current, plan = transition_failure(
+        initial, _observe("boot_stalled", chosen, (chosen,)), attempt=0
+    )
+    assert plan.retry
+    assert RetryState.from_snapshot(spec, current.to_snapshot()).persisted_plan(0) == plan
+    _, plan = transition_failure(
+        initial, _observe("oom", chosen, (chosen, _candidate("spot", "H200", 141))), attempt=0
+    )
+    assert not plan.retry
 
 
 def test_worker_retriable_authorization_survives_restore():

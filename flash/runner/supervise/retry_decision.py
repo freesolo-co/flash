@@ -15,11 +15,15 @@ WORKER_RETRIABLE_FAILURE = "worker_retriable"
 # A Spot VM was rented but never booted within its window: a provider fault on that machine, not
 # a memory signal, so retry the same shape within the infrastructure budget.
 BOOT_TIMEOUT_FAILURE = "boot_timeout"
+# A VM reached running but its worker never showed liveness (e.g. a stuck image pull): also a fault
+# of that machine, so retry the same shape rather than raising the usable-VRAM floor.
+BOOT_STALL_FAILURE = "boot_stalled"
 CANDIDATE_RETRY_FAILURES = INFRA_RETRY_FAILURES | {
     "oom",
     "job_preempted",
     WORKER_RETRIABLE_FAILURE,
     BOOT_TIMEOUT_FAILURE,
+    BOOT_STALL_FAILURE,
 }
 CACHE_FALLBACK_FAILURES = frozenset({"no_capacity", "poll_error"})
 _STATE_KEYS = frozenset(
@@ -89,6 +93,11 @@ class RetryState:
     @classmethod
     def initial_for_spec(cls, spec: JobSpec) -> RetryState:
         retries = int(spec.gpu.max_retries)
+        if spec.algorithm == "custom":
+            # Custom pins max_retries = 0 (no OOM/cache retries), but an infrastructure retry
+            # resumes from the newest checkpoint and the controller reconnects to the new
+            # session exactly as after a Spot preemption.
+            return cls(INFRA_RETRY_FLOOR, 0, 0)
         return cls(max(retries, INFRA_RETRY_FLOOR) if retries else 0, retries, int(retries > 0))
 
     @classmethod
@@ -354,6 +363,9 @@ def transition_failure(
         return _finish(state, plan, observation, attempt)
     if failure == BOOT_TIMEOUT_FAILURE:
         state, plan = _worker_retriable_plan(state, chosen, "a VM that never booted")
+        return _finish(state, plan, observation, attempt)
+    if failure == BOOT_STALL_FAILURE:
+        state, plan = _worker_retriable_plan(state, chosen, "a worker that never became live")
         return _finish(state, plan, observation, attempt)
     if failure == "no_capacity" and chosen is not None and chosen.provider in ("spot", "lambda"):
         # Spot or Lambda refused the create for quota/capacity before provisioning anything. Like

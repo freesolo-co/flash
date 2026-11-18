@@ -223,3 +223,28 @@ def test_cli_surfaces_startup_stage_and_cancel_reason():
         "cancel_reason": "cancelled by user request at 2026-11-16 12:00:00 UTC",
     }
     assert "cancelled by user request at 2026-11-16 12:00:00 UTC" in run_status(cancelled)
+
+
+@pytest.mark.parametrize("failure", ["stalled", "boot_stalled"])
+def test_first_liveness_stall_reports_the_adapters_failure(clock, monkeypatch, failure):
+    """A running VM whose worker never showed liveness fails with the provider's classification."""
+    from dataclasses import replace
+
+    _save_run()
+    monkeypatch.setattr(time, "sleep", lambda seconds: clock.__setitem__(0, clock[0] + seconds))
+    adapter = replace(_adapter(lambda: {"status": "running"}), early_liveness_alive=lambda: False)
+    if failure != "stalled":
+        adapter = replace(adapter, first_liveness_failure=failure)
+    result = poll_instance_job(
+        adapter,
+        log=io.StringIO(),
+        interval_s=15.0,
+        heartbeat_reader=lambda: None,
+        setup_grace_s=10_000,
+        stall_after_s=10_000,
+        first_liveness_s=300,
+        load_timeout_s=10_000,
+    )
+    assert not result.ok
+    assert result.failure == failure
+    assert "> 300" in result.detail

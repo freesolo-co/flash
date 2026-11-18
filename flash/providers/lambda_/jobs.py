@@ -26,7 +26,7 @@ from flash.providers.core.base import CapacityUnavailableError, JobHandle, get_g
 from flash.providers.lambda_ import api
 from flash.providers.lambda_.config import scope_fingerprint
 from flash.providers.lambda_.handles import LambdaJobHandle, require_scope
-from flash.runner.supervise.retry_decision import BOOT_TIMEOUT_FAILURE
+from flash.runner.supervise.retry_decision import BOOT_STALL_FAILURE, BOOT_TIMEOUT_FAILURE
 
 # Lambda VMs usually reach "active" in a few minutes, but large multi-GPU types can take far longer.
 BOOT_TIMEOUT_S = 1800.0
@@ -91,6 +91,7 @@ def poll(handle, spec, *, log=None, deadline_at=None):
             f"Lambda worker produced no liveness for {int(elapsed)}s (limit {int(limit)}s)"
         ),
         load_timeout_failure=BOOT_TIMEOUT_FAILURE,
+        first_liveness_failure=BOOT_STALL_FAILURE,
     )
     return poll_instance_job(
         adapter,
