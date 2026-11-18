@@ -148,6 +148,7 @@ jobs:
         run: |
           python3 - <<'PY'
           import os
+          import time
           import urllib.error
           import urllib.request
 
@@ -155,16 +156,31 @@ jobs:
           version = os.environ["PACKAGE_VERSION"]
           url = f"https://pypi.org/pypi/{name}/{version}/json"
 
-          try:
-              with urllib.request.urlopen(url, timeout=30) as response:
-                  if response.status == 200:
-                      raise SystemExit(
-                          f"{name} {version} is already on PyPI. "
-                          "Bump pyproject.toml before publishing."
-                      )
-          except urllib.error.HTTPError as error:
-              if error.code != 404:
-                  raise
+          # A slow or failing PyPI read is not proof the version is free: retry transient errors
+          # (timeouts, connection errors, 5xx) with backoff, and fail if PyPI never answers.
+          attempts = 6
+          for attempt in range(1, attempts + 1):
+              try:
+                  with urllib.request.urlopen(url, timeout=30) as response:
+                      if response.status == 200:
+                          raise SystemExit(
+                              f"{name} {version} is already on PyPI. "
+                              "Bump pyproject.toml before publishing."
+                          )
+                  break
+              except urllib.error.HTTPError as error:
+                  if error.code == 404:
+                      break
+                  if error.code < 500 or attempt == attempts:
+                      raise
+                  reason = f"HTTP {error.code}"
+              except (TimeoutError, urllib.error.URLError, ConnectionError) as error:
+                  if attempt == attempts:
+                      raise
+                  reason = repr(error)
+              delay = min(60, 5 * 2 ** (attempt - 1))
+              print(f"PyPI check attempt {attempt} failed ({reason}); retrying in {delay}s")
+              time.sleep(delay)
           PY
 
       # Checked BEFORE the upload, because publishing is irreversible and tagging is not. If the tag
