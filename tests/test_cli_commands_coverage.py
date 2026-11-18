@@ -603,7 +603,7 @@ def test_follow_also_tags_a_teardown_it_ends_inside(capsys) -> None:
     }
 
     class _Client:
-        def get_logs(self, _run_id, offset=0):
+        def get_logs(self, _run_id, offset=0, archives=True):
             return {"logs": "", "offset": 0, "state": "failed"}
 
         def get_run(self, _run_id):

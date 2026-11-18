@@ -123,6 +123,7 @@ class _LogPollResult(NamedTuple):
 def _poll_logs(client: ApiClient, run_id: str, interval: float) -> _LogPollResult:
     """Stream logs until terminal and return the final state, output, and attempt snapshot."""
     offset = 0
+    archives = True  # rotated archives arrive with the first page only
     printed_any = False
     attempt: int | None = None
     last_progress: str | None = None
@@ -135,7 +136,7 @@ def _poll_logs(client: ApiClient, run_id: str, interval: float) -> _LogPollResul
             # billing regardless. Retry both under one budget and keep the loop's place, so a 502
             # storm costs the stream a pause rather than the whole follow.
             try:
-                page = client.get_logs(run_id, offset=offset)
+                page = client.get_logs(run_id, offset=offset, archives=archives)
                 # The log file can lag worker heartbeat/status updates, so lifecycle/progress must
                 # come from the run status endpoint. The log page's embedded state is only a
                 # fallback for older servers or test doubles.
@@ -148,6 +149,7 @@ def _poll_logs(client: ApiClient, run_id: str, interval: float) -> _LogPollResul
                 _sleep_with_spinner(delay, spinner, "reconnecting")
                 continue
             retry.reset()
+            archives = False
             if page["logs"]:
                 spinner.clear()
                 print(page["logs"], end="", flush=True)
