@@ -22,9 +22,11 @@ except ImportError:  # pragma: no cover - non-POSIX dev machines skip cross-proc
     fcntl = None
 
 # A bid Mithril definitively refused (and that reconciliation proved was never created) cools down
-# only that region's instance type, and for less time: the refusal says nothing about other shapes
-# there, and a quota or catalog change can clear it.
-REFUSED_COOLDOWN_S = 3600.0
+# only that region's instance type, and only briefly: the refusal says nothing about other shapes
+# there, and the usual cause, an organization quota or open-bid cap that Flash cannot read, clears
+# as soon as other bids end. An hour-long cooldown left freed quota idle (2026-11-18: 13 H100s free
+# while 50 queued runs waited), so queued runs rebid the shape every couple of minutes instead.
+REFUSED_COOLDOWN_S = 120.0
 
 
 def _path() -> Path:
