@@ -4,6 +4,10 @@ import json
 import math
 from pathlib import Path
 
+# Session time already used by earlier attempts of this run (Spot replacements), set by the
+# control plane when it launches an attempt; custom.max_wall_seconds covers the whole run.
+PRIOR_SESSION_SECONDS_ENV = "FLASH_CUSTOM_SESSION_SECONDS_PRIOR"
+
 
 def estimate(spec, *, allocation=None):
     from flash.cost.types import CostEstimate
@@ -81,3 +85,18 @@ def session_charge(status, spec):
 
     share = min(1.0, max(0.0, seconds) / spec.custom["max_wall_seconds"])
     return quote * share * rate_factor(status)
+
+
+def prior_session_seconds(status):
+    """Session seconds of a run's earlier attempts, from its latest worker heartbeat.
+
+    The latest heartbeat belongs to the previous attempt when a replacement is launched, so its
+    own session_seconds is added to what earlier attempts already carried forward.
+    """
+    heartbeat = (status.last_heartbeat or {}) if status is not None else {}
+    total = 0.0
+    for key in ("session_seconds_prior", "session_seconds"):
+        value = heartbeat.get(key, 0)
+        if not isinstance(value, bool) and isinstance(value, (int, float)) and math.isfinite(value):
+            total += max(0.0, value)
+    return total

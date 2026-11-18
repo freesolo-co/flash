@@ -101,6 +101,8 @@ class InstancePollAdapter:
     load_timeout_detail: Callable[[str, float], str]  # (status, elapsed_s) -> str
     first_liveness_detail: Callable[[float, float], str]  # (elapsed_s, first_liveness_s) -> str
     load_timeout_failure: str = "stalled"
+    # A running VM whose worker never showed liveness; VM providers retry it like a boot timeout.
+    first_liveness_failure: str = "stalled"
     # Spot: a host shutdown signal (the provider stopping a preemptible VM) is a preemption, so it
     # gets the budget-free requeue rather than spending the infrastructure retry budget.
     signal_interruption_is_preemption: bool = False
@@ -314,7 +316,7 @@ class _TerminalArtifacts:
             return self.deferred_deadline_failure
         return PollResult(False, failure="stalled", detail="client-side deadline exceeded")
 
-    def stalled_unless_terminal(self, detail: str) -> PollResult:
+    def stalled_unless_terminal(self, detail: str, failure: str = "stalled") -> PollResult:
         # A stall exit still checks for terminal artifacts — the worker may have finished right at the
         # boundary. Use the BOUNDED read (like the deadline / dead-host / poll-error paths) so a fresh
         # DONE/marker not yet published or readable isn't missed and mis-classified stalled
@@ -325,7 +327,7 @@ class _TerminalArtifacts:
         )
         if terminal is not None:
             return terminal
-        return PollResult(False, failure="stalled", detail=detail)
+        return PollResult(False, failure=failure, detail=detail)
 
 
 @dataclass(frozen=True)
@@ -342,7 +344,7 @@ class _PollContext:
     artifacts: _TerminalArtifacts
     terminal_artifact_result: Callable[..., PollResult | None]
     deadline_unless_terminal: Callable[[], PollResult]
-    stalled_unless_terminal: Callable[[str], PollResult]
+    stalled_unless_terminal: Callable[..., PollResult]
     surface_final_heartbeat: Callable[[], None]
     reread_before_giving_up: Callable[[str], PollResult | None]
 
@@ -668,7 +670,8 @@ def _classify_running_stall(
                     ctx.adapter.first_liveness_detail(
                         time.time() - state.running_since,
                         ctx.first_liveness_s,
-                    )
+                    ),
+                    ctx.adapter.first_liveness_failure,
                 )
         else:
             # Bootstrap is producing output -> healthy slow cold start; setup/stall below backstop.

@@ -467,7 +467,11 @@ def test_mithril_boot_window_and_failure(monkeypatch):
     polled = PollResult(True)
 
     def fake_poll(adapter, **kwargs):
-        captured.update(kwargs, failure=adapter.load_timeout_failure)
+        captured.update(
+            kwargs,
+            failure=adapter.load_timeout_failure,
+            first_liveness_failure=adapter.first_liveness_failure,
+        )
         return polled
 
     monkeypatch.setattr(mithril_jobs, "poll_instance_job", fake_poll)
@@ -492,6 +496,8 @@ def test_mithril_boot_window_and_failure(monkeypatch):
     assert mithril_jobs.poll(handle, spec, deadline_at=10_000) is polled
     assert captured["load_timeout_s"] == mithril_jobs.BOOT_TIMEOUT_S == 1800
     assert captured["failure"] == "boot_timeout"
+    # a running VM whose worker never became live is a same-shape retry, not a memory stall.
+    assert captured["first_liveness_failure"] == "boot_stalled"
 
 
 def test_a_vm_that_never_booted_does_not_bench_its_region(monkeypatch):

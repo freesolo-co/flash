@@ -24,6 +24,7 @@ from flash.runner.supervise.retry_decision import (
 SPOT_CAPACITY_REQUEUE_SECONDS = 60.0
 # The detail prefix of a create whose outcome is unknown (see CapacityUnavailableError.definitive).
 UNKNOWN_CREATE_DETAIL = "provider create outcome unknown and no resource appeared"
+SUBMIT_FAILED_DETAIL = "provider submit failed"
 
 
 @dataclass
@@ -504,7 +505,7 @@ def _submit_provider(ctx: _SubmitContext, prepared, candidate_plan):
             PollResult(
                 False,
                 failure="poll_error",
-                detail=f"provider submit failed ({type(exc).__name__})",
+                detail=f"{SUBMIT_FAILED_DETAIL} ({type(exc).__name__})",
             ),
             True,
         )
@@ -579,6 +580,15 @@ def _return_success_metrics(ctx: _SubmitContext, outcome) -> dict:
     return metrics
 
 
+def _gpu_never_assigned(candidate_not_started: bool, last_handle: dict, attempt: int) -> bool:
+    """Whether a failed submit provisioned nothing for ``attempt``.
+
+    submit_attempt also polls and tears down after on_handle persisted a GPU, so a generic
+    exception only proves nothing was provisioned while this attempt recorded no handle.
+    """
+    return bool(candidate_not_started) and last_handle.get("attempt") != attempt
+
+
 def _handle_failure(ctx: _SubmitContext, prepared, outcome):
     claim, attempt_spec, _, _ = prepared
     result, chosen, candidates, candidate_not_started = outcome
@@ -598,6 +608,7 @@ def _handle_failure(ctx: _SubmitContext, prepared, outcome):
     chosen = _rented_candidate(chosen, ctx.last_handle)
     from flash.runner.lifecycle.attempts import decide_attempt_failure
 
+    gpu_never_assigned = _gpu_never_assigned(candidate_not_started, ctx.last_handle, claim.attempt)
     plan = decide_attempt_failure(
         ctx.spec.run_id,
         claim_token=claim.token,
@@ -610,6 +621,7 @@ def _handle_failure(ctx: _SubmitContext, prepared, outcome):
                 attempt_spec,
                 chosen,
             ),
+            not_started=gpu_never_assigned,
         ),
         attempt=claim.attempt,
     )
@@ -619,18 +631,17 @@ def _handle_failure(ctx: _SubmitContext, prepared, outcome):
     retry_delay = (
         _retry_delay(ctx, plan.infra_retry_ordinal) if plan.retry and candidate_not_started else 0.0
     )
-    if (
-        plan.retry
-        and result.failure == "no_capacity"
-        and getattr(chosen, "provider", "") in ("spot", "lambda")
-    ):
+    requeued = result.failure == "no_capacity" or (
+        result.failure == "poll_error" and gpu_never_assigned
+    )
+    if plan.retry and requeued and getattr(chosen, "provider", "") in ("spot", "lambda"):
         # Wait like the Spot price queue instead of hammering a provider that just said no.
         remaining = _load_run_deadline_at(ctx.spec.run_id) - time.time()
         retry_delay = max(retry_delay, min(SPOT_CAPACITY_REQUEUE_SECONDS, max(0.0, remaining)))
     ctx.last_requeue_refused = bool(
         plan.retry
         and candidate_not_started
-        and result.failure == "no_capacity"
+        and requeued
         and getattr(chosen, "provider", "") == "spot"
     )
     if ctx.last_requeue_refused:
@@ -656,7 +667,9 @@ def _spot_requeue_line(run_id: str, attempt: int, detail: str | None) -> str:
         if view is not None
         else "back in the queue"
     )
-    if (detail or "").startswith(UNKNOWN_CREATE_DETAIL):
+    if (detail or "").startswith(SUBMIT_FAILED_DETAIL):
+        head = f"Spot bid {attempt}: submit failed before a GPU was assigned; {where}"
+    elif (detail or "").startswith(UNKNOWN_CREATE_DETAIL):
         # a timeout or 5xx: a bid may still appear late, so promise nothing about billing.
         head = (
             f"Spot bid {attempt}: create outcome unknown and no bid has appeared; {where}; any "

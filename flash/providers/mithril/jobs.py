@@ -29,7 +29,7 @@ from flash.providers.mithril.config import scope_fingerprint
 from flash.providers.mithril.handles import SpotJobHandle, require_scope
 from flash.providers.mithril.pricing import hourly_rate
 from flash.runner.supervise.errors import _RunCancelled
-from flash.runner.supervise.retry_decision import BOOT_TIMEOUT_FAILURE
+from flash.runner.supervise.retry_decision import BOOT_STALL_FAILURE, BOOT_TIMEOUT_FAILURE
 
 # A filled Mithril bid allocates, images and boots a VM before it reports running; that has
 # taken over 15 minutes, so allow 30 before treating the machine as faulty and rebidding.
@@ -89,6 +89,7 @@ def poll(handle, spec, *, log=None, deadline_at=None):
             f"Mithril Spot worker produced no liveness for {int(elapsed)}s (limit {int(limit)}s)"
         ),
         load_timeout_failure=BOOT_TIMEOUT_FAILURE,
+        first_liveness_failure=BOOT_STALL_FAILURE,
         signal_interruption_is_preemption=True,
     )
     return poll_instance_job(

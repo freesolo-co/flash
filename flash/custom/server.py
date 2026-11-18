@@ -27,6 +27,7 @@ def create_app(session, token):
         supplied = request.headers.get("authorization", "").encode()
         if not hmac.compare_digest(supplied, expected):
             return JSONResponse({"detail": "invalid session token"}, status_code=401)
+        session.attach()
         return await call_next(request)
 
     @app.get("/v1/custom/status")
@@ -95,7 +96,11 @@ def create_app(session, token):
 
 
 def serve_session(session, token, max_wall_seconds, *, tick=None, tls=None):
-    """Serve the session on :8000; ``tls`` ({cert, key} PEM) when no provider tunnel terminates it."""
+    """Serve the session on :8000; ``tls`` ({cert, key} PEM) when no provider tunnel terminates it.
+
+    Returns why serving stopped: ``"ended"`` (closed, failed or idle) or ``"wall"`` when
+    ``max_wall_seconds`` ran out first, so the caller can still save the reached step.
+    """
     import tempfile
 
     import uvicorn
@@ -124,6 +129,8 @@ def serve_session(session, token, max_wall_seconds, *, tick=None, tls=None):
         )
     )
 
+    reason = ["ended"]
+
     async def serve():
         started = time.monotonic()
 
@@ -132,7 +139,10 @@ def serve_session(session, token, max_wall_seconds, *, tick=None, tls=None):
                 await asyncio.sleep(5)
                 if tick is not None:
                     await asyncio.to_thread(tick)
-                if session.expired() or time.monotonic() - started >= max_wall_seconds:
+                if session.expired():
+                    server.should_exit = True
+                elif time.monotonic() - started >= max_wall_seconds:
+                    reason[0] = "wall"
                     server.should_exit = True
 
         task = asyncio.create_task(watchdog())
@@ -142,3 +152,4 @@ def serve_session(session, token, max_wall_seconds, *, tick=None, tls=None):
             task.cancel()
 
     asyncio.run(serve())
+    return reason[0]

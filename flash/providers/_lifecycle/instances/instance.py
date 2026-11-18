@@ -127,6 +127,17 @@ class InstanceJobHandle:
         )
 
 
+def _prior_custom_session_seconds(run_id: str) -> float:
+    """Earlier attempts' custom session time; 0 when the run record cannot be read."""
+    from flash.custom.billing import prior_session_seconds
+    from flash.runner.lifecycle.status import get_status
+
+    try:
+        return prior_session_seconds(get_status(run_id))
+    except (OSError, ValueError, TypeError):
+        return 0.0
+
+
 def build_payload(
     spec,
     attempt: int,
@@ -149,9 +160,12 @@ def build_payload(
     if attempt_id is None:
         raise ValueError("instance attempt identity is invalid")
     if spec.algorithm == "custom":
+        from flash.custom.billing import PRIOR_SESSION_SECONDS_ENV
         from flash.custom.managed import session_token
 
         env["FLASH_CUSTOM_SESSION_TOKEN"] = session_token(spec.run_id, attempt_id)
+        if attempt_id > 0:
+            env[PRIOR_SESSION_SECONDS_ENV] = str(_prior_custom_session_seconds(spec.run_id))
         if arm in ("spot", "lambda"):
             # Instance VMs are reached directly (no provider tunnel): serve the session over TLS with
             # a per-attempt identity the control plane can recompute for the controller to pin.

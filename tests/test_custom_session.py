@@ -254,3 +254,39 @@ def test_gpu_failure_detail_reaches_client_before_worker_teardown(tmp_path):
         "message": "RuntimeError: partial GPU mutation",
         "session_id": session.id,
     }
+
+
+def test_unattached_session_expires_early_and_attach_starts_the_idle_clock(monkeypatch):
+    from flash.custom import session as session_module
+    from flash.custom.session import UNATTACHED_IDLE_SECONDS, TrainingSession
+
+    clock = [1000.0]
+    monkeypatch.setattr(session_module.time, "monotonic", lambda: clock[0])
+    session = TrainingSession(object(), idle_seconds=900)
+    attached = []
+    session.on_attach = attached.append
+    clock[0] += UNATTACHED_IDLE_SECONDS - 1
+    assert not session.expired()
+    clock[0] += 2
+    assert session.expired()  # nobody attached: do not hold the GPU for the full 900 seconds
+
+    session = TrainingSession(object(), idle_seconds=900)
+    session.on_attach = attached.append
+    clock[0] += 200
+    session.attach()
+    session.attach()
+    assert attached == [session]
+    clock[0] += 899
+    assert not session.expired()
+    clock[0] += 2
+    assert session.expired()
+
+
+def test_authenticated_request_attaches_but_rejected_token_does_not(tmp_path):
+    session = TrainingSession(CounterBackend(tmp_path))
+    client = TestClient(create_app(session, "t" * 32))
+    assert client.get("/v1/custom/status").status_code == 401
+    assert session.attached_at is None
+    response = client.get("/v1/custom/status", headers={"authorization": "Bearer " + "t" * 32})
+    assert response.status_code == 200
+    assert session.attached_at is not None
