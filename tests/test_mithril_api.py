@@ -194,8 +194,8 @@ def test_allocation_offers_fitting_catalog_shapes_at_the_quote_rate(monkeypatch)
 @pytest.mark.parametrize(
     "change",
     [
-        {"price": "$17.76"},  # 8 x $2.22, a cent over the H200 cap
-        {"price": "$18.00"},
+        {"price": "$19.28"},  # 8 x $2.41, a cent over the H200 cap
+        {"price": "$19.60"},  # 8 x $2.45
         {"capacity": 0},
         {"region": ""},
         {"socket": "PCIe"},
@@ -260,7 +260,7 @@ def launch(monkeypatch, *, count=1, gpu="H200", attempt=0):
 
 
 @pytest.mark.parametrize("count", [1, 8])
-@pytest.mark.parametrize(("gpu", "cap"), [("H100", 1.20), ("H200", 2.21)])
+@pytest.mark.parametrize(("gpu", "cap"), [("H100", 1.20), ("H200", 2.40)])
 def test_create_bids_for_one_instance_at_per_instance_hold_cap(monkeypatch, count, gpu, cap):
     monkeypatch.setattr(api, "pages", lambda *a, **kw: [])
     captured = []
@@ -829,12 +829,18 @@ def test_offers_cover_every_region_and_keep_each_region(monkeypatch):
     ]
     auctions = [
         {"instance_type": "it_test", "region": r, "capacity": 3, "last_instance_price": p}
-        for r, p in (("us-central2-b", "$3.50"), ("ap-x", "$0.90"), ("eu-x", "$1.00"))
+        for r, p in (
+            ("us-central2-b", "$3.50"),
+            ("us-east-1", "$0.90"),
+            ("us-west-1", "$1.00"),
+            ("ap-x", "$0.80"),  # non-US regions are never bid in, however cheap
+            ("eu-x", "$0.80"),
+        )
     ]
     monkeypatch.setattr(
         prices, "call", lambda method, path, **kw: shapes if path == "/instance-types" else auctions
     )
-    assert {o.region for o in prices.affordable_offers()} == {"ap-x", "eu-x"}
+    assert {o.region for o in prices.affordable_offers()} == {"us-east-1", "us-west-1"}
     # An excluded region is never offered, however cheap.
     auctions.append(
         {
@@ -844,7 +850,7 @@ def test_offers_cover_every_region_and_keep_each_region(monkeypatch):
             "last_instance_price": "$0.50",
         }
     )
-    assert {o.region for o in prices.affordable_offers()} == {"ap-x", "eu-x"}
+    assert {o.region for o in prices.affordable_offers()} == {"us-east-1", "us-west-1"}
 
 
 def test_queue_picks_the_cheapest_region(monkeypatch):
