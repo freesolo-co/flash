@@ -268,3 +268,30 @@ def test_disconnected_controller_saves_progress_but_failed_session_does_not(tmp_
     with pytest.raises(RuntimeError, match="disconnected or timed out; resume"):
         worker.run(context=context)
     backend.save_checkpoint.assert_not_called()
+
+
+def test_attach_is_reported_promptly_and_a_lost_session_persists_its_time(tmp_path, monkeypatch):
+    import pytest
+
+    worker, context, _, beats = _managed_worker(tmp_path, monkeypatch)
+    clock = [100.0]
+    monkeypatch.setattr(worker.time, "monotonic", lambda: clock[0])
+
+    def serve(session, *args, tick, **kwargs):
+        session.attach()
+        clock[0] += 5
+        tick()  # the first watchdog tick after attach, well before the 60 s cadence
+        attached = beats.call_args_list[-1].kwargs
+        assert attached["controller_attached"] is True
+        assert "session_started_at" in attached
+        tick()
+        assert beats.call_args_list[-1].kwargs is attached  # no duplicate beat
+        clock[0] += 20
+        return "ended"  # preempted or disconnected before the first optimizer step
+
+    monkeypatch.setattr(worker, "serve_session", serve)
+    with pytest.raises(RuntimeError, match="disconnected or timed out"):
+        worker.run(context=context)
+    final = beats.call_args_list[-1]
+    assert final.args[0] == "custom_waiting"
+    assert final.kwargs["session_seconds"] == 25

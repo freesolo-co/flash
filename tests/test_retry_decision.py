@@ -397,10 +397,15 @@ def test_spot_vm_that_never_booted_retries_same_shape_within_infra_budget(failur
     assert "budget exhausted" in plan.action
 
 
-def test_custom_runs_get_infrastructure_retries_but_no_oom_or_cache_retries():
-    spec = replace(_spec(max_retries=0), algorithm="custom")
+def test_custom_spot_runs_get_infrastructure_retries_but_no_oom_or_cache_retries():
+    spec = replace(
+        _spec(max_retries=0), algorithm="custom", gpu=GpuSpec(provider="spot", max_retries=0)
+    )
     initial = RetryState.initial_for_spec(spec)
     assert (initial.infra_retries, initial.oom_retries, initial.cache_retries) == (5, 0, 0)
+    # without Spot's checkpoint restore and controller reconnect, a retry would lose progress.
+    modal = replace(spec, gpu=GpuSpec(provider="modal", max_retries=0))
+    assert RetryState.initial_for_spec(modal).infra_retries == 0
     chosen = _candidate("spot", "H100", 80)
     current, plan = transition_failure(
         initial, _observe("boot_stalled", chosen, (chosen,)), attempt=0
@@ -468,3 +473,13 @@ def test_poll_error_after_a_gpu_started_keeps_the_retry_budget():
         attempt=0,
     )
     assert not plan.retry
+
+
+def test_pre_gpu_requeue_requires_that_this_attempt_recorded_no_handle():
+    from flash.runner.supervise.execution import _gpu_never_assigned
+
+    assert _gpu_never_assigned(True, {}, 3)
+    assert _gpu_never_assigned(True, {"attempt": 2}, 3)  # an earlier attempt's handle
+    # a GPU was provisioned for this attempt, then polling or teardown raised: not pre-GPU.
+    assert not _gpu_never_assigned(True, {"attempt": 3}, 3)
+    assert not _gpu_never_assigned(False, {}, 3)

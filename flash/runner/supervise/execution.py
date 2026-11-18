@@ -580,6 +580,15 @@ def _return_success_metrics(ctx: _SubmitContext, outcome) -> dict:
     return metrics
 
 
+def _gpu_never_assigned(candidate_not_started: bool, last_handle: dict, attempt: int) -> bool:
+    """Whether a failed submit provisioned nothing for ``attempt``.
+
+    submit_attempt also polls and tears down after on_handle persisted a GPU, so a generic
+    exception only proves nothing was provisioned while this attempt recorded no handle.
+    """
+    return bool(candidate_not_started) and last_handle.get("attempt") != attempt
+
+
 def _handle_failure(ctx: _SubmitContext, prepared, outcome):
     claim, attempt_spec, _, _ = prepared
     result, chosen, candidates, candidate_not_started = outcome
@@ -599,6 +608,7 @@ def _handle_failure(ctx: _SubmitContext, prepared, outcome):
     chosen = _rented_candidate(chosen, ctx.last_handle)
     from flash.runner.lifecycle.attempts import decide_attempt_failure
 
+    gpu_never_assigned = _gpu_never_assigned(candidate_not_started, ctx.last_handle, claim.attempt)
     plan = decide_attempt_failure(
         ctx.spec.run_id,
         claim_token=claim.token,
@@ -611,7 +621,7 @@ def _handle_failure(ctx: _SubmitContext, prepared, outcome):
                 attempt_spec,
                 chosen,
             ),
-            not_started=bool(candidate_not_started),
+            not_started=gpu_never_assigned,
         ),
         attempt=claim.attempt,
     )
@@ -622,7 +632,7 @@ def _handle_failure(ctx: _SubmitContext, prepared, outcome):
         _retry_delay(ctx, plan.infra_retry_ordinal) if plan.retry and candidate_not_started else 0.0
     )
     requeued = result.failure == "no_capacity" or (
-        result.failure == "poll_error" and candidate_not_started
+        result.failure == "poll_error" and gpu_never_assigned
     )
     if plan.retry and requeued and getattr(chosen, "provider", "") in ("spot", "lambda"):
         # Wait like the Spot price queue instead of hammering a provider that just said no.

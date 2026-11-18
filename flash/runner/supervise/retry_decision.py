@@ -5,6 +5,7 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass, replace
 
+from flash.core.checkpoint_policy import is_spot_spec
 from flash.core.spec import JobSpec
 
 INFRA_RETRY_FLOOR = 5
@@ -94,10 +95,10 @@ class RetryState:
     def initial_for_spec(cls, spec: JobSpec) -> RetryState:
         retries = int(spec.gpu.max_retries)
         if spec.algorithm == "custom":
-            # Custom pins max_retries = 0 (no OOM/cache retries), but an infrastructure retry
-            # resumes from the newest checkpoint and the controller reconnects to the new
-            # session exactly as after a Spot preemption.
-            return cls(INFRA_RETRY_FLOOR, 0, 0)
+            # Custom pins max_retries = 0 (no OOM/cache retries). On Spot an infrastructure retry
+            # resumes from the run's newest checkpoint and the controller reconnects exactly as
+            # after a preemption; other providers restore neither, so they keep no retries.
+            return cls(INFRA_RETRY_FLOOR if is_spot_spec(spec) else 0, 0, 0)
         return cls(max(retries, INFRA_RETRY_FLOOR) if retries else 0, retries, int(retries > 0))
 
     @classmethod

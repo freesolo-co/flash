@@ -238,11 +238,17 @@ def run(*, context):
     session.on_commit = committed
     last_tick = time.monotonic()
 
+    attach_reported = False
+
     def tick():
-        nonlocal last_tick
-        if time.monotonic() - last_tick >= 60:
+        nonlocal last_tick, attach_reported
+        # report the attach on the next watchdog tick: billing and replacement attempts read the
+        # session start from the latest heartbeat, and the session may end before a minute passes.
+        newly_attached = meter.started_at is not None and not attach_reported
+        if newly_attached or time.monotonic() - last_tick >= 60:
             heartbeat("custom_waiting", step=session.step, **session_fields(), context=context)
             last_tick = time.monotonic()
+            attach_reported = attach_reported or newly_attached
 
     heartbeat("custom_waiting", step=session.step, **session_fields(), context=context)
     tls = None
@@ -261,9 +267,10 @@ def run(*, context):
         tls=tls,
     )
     if session.failed or not session.closed:
-        raise unfinished_session_error(
-            session, reason, save_unfinished_session(session, save, initial_step)
-        )
+        saved = save_unfinished_session(session, save, initial_step)
+        # persist the final session time; an unfinished session writes no metrics.json.
+        heartbeat("custom_waiting", step=session.step, **session_fields(), context=context)
+        raise unfinished_session_error(session, reason, saved)
     seconds = meter.seconds()
     metrics = {"steps": session.step, "session_seconds": seconds, "train_seconds": seconds}
     path = Path("/tmp/metrics.json")
