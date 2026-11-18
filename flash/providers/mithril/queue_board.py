@@ -78,7 +78,15 @@ def _load(path: Path) -> dict:
         }
     allocations = raw.get("allocations")
     if isinstance(allocations, list):
-        board["allocations"] = [float(ts) for ts in allocations if _number(ts)]
+        # each sample is [accepted_at, gpu class]; samples without a class cannot be scoped.
+        board["allocations"] = [
+            [float(item[0]), item[1]]
+            for item in allocations
+            if isinstance(item, list)
+            and len(item) == 2
+            and _number(item[0])
+            and isinstance(item[1], str)
+        ]
     refusals = raw.get("quota_refusals")
     if isinstance(refusals, dict):
         board["quota_refusals"] = {
@@ -123,7 +131,7 @@ def _prune(board: dict, now: float) -> None:
         if now - entry["seen_at"] <= STALE_AFTER_S
     }
     board["allocations"] = sorted(
-        ts for ts in board["allocations"] if now - ts <= ALLOCATION_WINDOW_S
+        sample for sample in board["allocations"] if now - sample[0] <= ALLOCATION_WINDOW_S
     )[-500:]
     board["quota_refusals"] = {
         gpu: ts for gpu, ts in board["quota_refusals"].items() if now - ts <= QUOTA_REFUSAL_WINDOW_S
@@ -203,7 +211,10 @@ def _view(board: dict, run_id: str, gpus: tuple[str, ...], now: float) -> QueueV
         if now - other["seen_at"] <= STALE_AFTER_S and _overlaps(other, gpus)
     ]
     ahead = sum(1 for key in rivals if key < (entry["entered_at"], run_id))
-    recent = sorted(ts for ts in board["allocations"] if now - ts <= ALLOCATION_WINDOW_S)
+    # only GPUs this run could have taken say anything about how fast its turn comes.
+    recent = sorted(
+        at for at, gpu in board["allocations"] if gpu in gpus and now - at <= ALLOCATION_WINDOW_S
+    )
     refusals = [
         ts
         for gpu, ts in board["quota_refusals"].items()
@@ -247,12 +258,15 @@ def view(run_id: str) -> QueueView | None:
     return None
 
 
-def leave(run_id: str, *, allocated: bool) -> None:
-    """``run_id`` stopped waiting; ``allocated`` means Mithril accepted its bid (an ETA sample)."""
+def leave(run_id: str, *, allocated: bool, gpu: str | None = None) -> None:
+    """``run_id`` stopped waiting; ``allocated`` means Mithril accepted its bid on ``gpu``.
+
+    An accepted bid is an ETA sample for runs that can use that GPU class.
+    """
     with contextlib.suppress(Exception), _locked_board() as board:
         was_waiting = board["waiting"].pop(run_id, None) is not None
-        if allocated and was_waiting:
-            board["allocations"].append(time.time())
+        if allocated and was_waiting and isinstance(gpu, str) and gpu:
+            board["allocations"].append([time.time(), gpu])
 
 
 def record_quota_refusal(gpu: str) -> None:

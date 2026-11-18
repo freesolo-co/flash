@@ -351,9 +351,9 @@ def test_eta_comes_from_recent_allocations_and_stays_coarse(monkeypatch):
         now[0] = joined_at
         queue_board.join(run_id, ("H100",))
     now[0] = 100.0
-    queue_board.leave("a", allocated=True)
+    queue_board.leave("a", allocated=True, gpu="H100")
     now[0] = 1800.0
-    queue_board.leave("b", allocated=True)
+    queue_board.leave("b", allocated=True, gpu="H100")
     queue_board.leave("later", allocated=False)  # a cancel is not an allocation
     now[0] = 3700.0
     view = queue_board.join("me", ("H100",))
@@ -431,7 +431,7 @@ def test_accepted_bid_leaves_the_queue_and_counts_as_an_allocation(monkeypatch):
         jobs.submit_attempt(_spec(), log=log, on_handle=on_handle, deadline_at=time.time() + 3600)
     assert "Spot: Mithril accepted the bid for 1x H100 in us-central2-b (bid_ok)" in log.getvalue()
     assert queue_board.view(RUN_ID) is None
-    assert queue_board._load(queue_board._path())["allocations"]
+    assert [gpu for _, gpu in queue_board._load(queue_board._path())["allocations"]] == ["H100"]
 
 
 def test_quota_refusal_is_recorded_and_logged_as_a_requeue(monkeypatch):
@@ -521,3 +521,34 @@ def test_definitive_refusal_keeps_the_nothing_billed_assurance():
     )
     assert line.startswith("Spot bid 1: provider refused (capacity); back in the queue")
     assert "nothing was provisioned or billed" in line.splitlines()[0]
+
+
+def _eta_for(monkeypatch, allocated_gpus, waiter_gpus):
+    now = [0.0]
+    monkeypatch.setattr(queue_board.time, "time", lambda: now[0])
+    for index, gpu in enumerate(allocated_gpus):
+        now[0] = float(index)
+        queue_board.join(f"done-{index}", (gpu,))
+        now[0] = 600.0 * (index + 1)
+        queue_board.leave(f"done-{index}", allocated=True, gpu=gpu)
+    now[0] = 3600.0
+    return queue_board.join("waiter", waiter_gpus)
+
+
+def test_h100_allocations_say_nothing_about_an_h200_only_wait(monkeypatch):
+    view = _eta_for(monkeypatch, ["H100", "H100", "H100"], ("H200",))
+    assert view.recent_allocations == 0
+    assert view.eta_seconds() is None
+    assert view.eta_short() == "ETA unknown"
+
+
+def test_h200_allocations_estimate_an_h200_wait(monkeypatch):
+    view = _eta_for(monkeypatch, ["H200", "H100", "H200"], ("H200",))
+    assert view.recent_allocations == 2
+    assert view.eta_seconds() is not None
+
+
+def test_a_wait_for_h100_or_h200_uses_both_classes(monkeypatch):
+    view = _eta_for(monkeypatch, ["H100", "H200", "A100"], ("H100", "H200"))
+    assert view.recent_allocations == 2
+    assert view.eta_seconds() is not None

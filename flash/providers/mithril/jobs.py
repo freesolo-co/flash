@@ -215,7 +215,7 @@ def submit_attempt(
             persisted = True
         else:
             _raise_if_cancelled_keeping_cleanup(spec.run_id, handle)
-        queue_board.leave(spec.run_id, allocated=True)
+        queue_board.leave(spec.run_id, allocated=True, gpu=gpu)
         if log is not None:
             print(
                 f"Spot: Mithril accepted the bid for {count}x {gpu} in {offer.region} "
