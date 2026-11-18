@@ -546,6 +546,18 @@ def test_region_cooldown_is_not_a_run_record_and_keeps_every_mark(monkeypatch, t
     assert not list(tmp_path.glob("*.json"))  # run scanners read top-level *.json as run records
 
 
+def test_refused_shape_is_retried_after_two_minutes(monkeypatch, tmp_path):
+    """A quota refusal (often an org cap that clears as bids end) must not idle freed GPUs."""
+    from flash.providers.mithril import region_health
+
+    monkeypatch.setattr(
+        region_health, "_path", lambda: tmp_path / ".spot-region-health" / "cooldown.json"
+    )
+    region_health.mark_refused("us-central2-a", "it_h100", now=1000.0)
+    assert region_health.refused("us-central2-a", "it_h100", now=1000.0 + 119)
+    assert not region_health.refused("us-central2-a", "it_h100", now=1000.0 + 120)
+
+
 def test_spot_allocation_prefers_cheaper_1x_h200_over_8x_h100():
     """Regression: a >80 GB plan took 8x H100 ($16/hr, never under cap) over a fitting 1x H200."""
     from flash.providers.core.allocator import _cheapest_allocation
