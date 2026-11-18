@@ -10,7 +10,7 @@ import pytest
 import flash.runner.lifecycle.state as runner_state
 import flash.runner.lifecycle.status as runner_status
 import flash.runner.supervise.deploy as runner_deploy
-from flash.core.spec import GpuSpec, JobSpec
+from flash.core.spec import GpuSpec, JobSpec, TrainSpec
 from flash.providers.mithril import api, client, jobs, queue, queue_board
 from flash.providers.mithril.prices import Offer
 from flash.runner.lifecycle.startup import record_startup_stage
@@ -37,6 +37,7 @@ def _spec(run_id: str = RUN_ID) -> JobSpec:
         model="Qwen/Qwen3.5-9B",
         algorithm="sft",
         gpu=GpuSpec(type="H100", provider="spot"),
+        train=TrainSpec(hf_repo="org/artifacts"),
     )
 
 
@@ -131,30 +132,6 @@ def test_run_cleanup_inspects_only_that_runs_bids(monkeypatch):
 # --- fix 2: no bid once a run is cancelled -----------------------------------------------------
 
 
-def _submit(monkeypatch, *, create):
-    from flash import runtime_capsule
-
-    offer = Offer("H100", 1, "it_h100", 1.0, 1500, "us-central2-b")
-    monkeypatch.setattr(queue, "wait_for_price", lambda *a, **kw: offer)
-    monkeypatch.setattr(jobs, "scope_fingerprint", lambda: "scope")
-    monkeypatch.setattr(jobs, "build_payload", lambda *a, **kw: {"payload": True})
-    monkeypatch.setattr(jobs, "worker_image_for_gpu", lambda gpu: "worker")
-    monkeypatch.setattr(runtime_capsule, "build_capsule", lambda *_a: (b"capsule", None))
-    monkeypatch.setattr(api, "create", create)
-    terminated = []
-    monkeypatch.setattr(api, "terminate", terminated.append)
-    handles = []
-    log = io.StringIO()
-    with pytest.raises(_RunCancelled):
-        jobs.submit_attempt(
-            _spec(),
-            log=log,
-            on_handle=handles.append,
-            deadline_at=time.time() + 3600,
-        )
-    return terminated, handles, log.getvalue()
-
-
 def test_cancel_during_payload_build_places_no_bid(monkeypatch):
     """Regression: flash-1794908910-4696240d logged its cancel, then still bid and booted."""
     _save_run("provisioning")
@@ -178,17 +155,75 @@ def test_cancel_during_payload_build_places_no_bid(monkeypatch):
         jobs.submit_attempt(_spec(), log=io.StringIO(), deadline_at=time.time() + 3600)
 
 
-def test_bid_created_while_cancel_lands_is_terminated_and_never_persisted(monkeypatch):
+def _supervisor_callback(monkeypatch):
+    """The real handle callback the supervisor passes to ``submit_attempt``."""
+    from flash.providers.core.base import Candidate
+    from flash.providers.mithril import handles, provider
+    from flash.runner.lifecycle import attempts
+    from flash.runner.supervise import execution
+
+    monkeypatch.setattr(handles, "require_scope", lambda _h: None)
+    monkeypatch.setattr(provider, "require_scope", lambda _h: None)
+    claim = attempts.reserve_verified_attempt_launch(RUN_ID)
+    assert claim is not None
+    ctx = execution._SubmitContext(
+        spec=_spec(), log=io.StringIO(), runtime_secrets=None, source_snapshot={}
+    )
+    chosen = Candidate("spot", "H100", 1.2, 80, 1)
+    return execution._handle_callback(ctx, (claim, None, None, None), (None, chosen, None, None))
+
+
+def _late_bid_after_cancel(monkeypatch, *, terminate):
+    from flash import runtime_capsule
+    from flash.runner.supervise.errors import _TerminalHandleRace
+
     _save_run("provisioning")
+    on_handle = _supervisor_callback(monkeypatch)
+    offer = Offer("H100", 1, "it_h100", 1.0, 1500, "us-central2-b")
+    monkeypatch.setattr(queue, "wait_for_price", lambda *a, **kw: offer)
+    monkeypatch.setattr(jobs, "scope_fingerprint", lambda: "scope")
+    monkeypatch.setattr(jobs, "build_payload", lambda *a, **kw: {"payload": True})
+    monkeypatch.setattr(jobs, "worker_image_for_gpu", lambda gpu: "worker")
+    monkeypatch.setattr(runtime_capsule, "build_capsule", lambda *_a: (b"capsule", None))
 
     def create(**_kw):
         _cancel_on_disk()  # the cancel lands while the create request is in flight
         return "bid_late"
 
-    terminated, handles, _ = _submit(monkeypatch, create=create)
-    assert terminated == ["bid_late"]
-    assert handles == []
-    assert runner_status.get_status(RUN_ID).state == "cancelled"
+    monkeypatch.setattr(api, "create", create)
+    monkeypatch.setattr(api, "terminate", terminate)
+    monkeypatch.setattr(api, "get_instance", lambda *_a, **_kw: None)
+    with pytest.raises((_TerminalHandleRace, client.MithrilApiError)):
+        jobs.submit_attempt(
+            _spec(), log=io.StringIO(), on_handle=on_handle, deadline_at=time.time() + 3600
+        )
+    status = runner_status.get_status(RUN_ID)
+    assert status.state == "cancelled"
+    return status
+
+
+def test_bid_created_while_cancel_lands_is_terminated(monkeypatch):
+    from flash.runner.lifecycle.cleanup import _snapshot_cleanup_remotes
+
+    terminated = []
+    status = _late_bid_after_cancel(monkeypatch, terminate=terminated.append)
+    assert "bid_late" in terminated
+    assert status.remote is None  # confirmed gone: nothing left to clean up
+    assert _snapshot_cleanup_remotes(RUN_ID) == []
+
+
+def test_late_bid_whose_teardown_fails_stays_a_durable_cleanup_target(monkeypatch):
+    from flash.runner.lifecycle.cleanup import _snapshot_cleanup_remotes
+
+    def terminate(_bid):
+        raise client.MithrilApiError("Mithril bid cancellation is not confirmed")
+
+    status = _late_bid_after_cancel(monkeypatch, terminate=terminate)
+    # the unconfirmed bid stays named twice over: as a cleanup obligation and as the remote a
+    # re-issued cancel tears down.
+    targets = _snapshot_cleanup_remotes(RUN_ID)
+    assert [target.get("instance_id") for target in targets] == ["bid_late"]
+    assert status.remote["instance_id"] == "bid_late"
 
 
 def test_queue_never_returns_an_offer_once_cancelled(monkeypatch):
@@ -233,7 +268,13 @@ def _wait_once(monkeypatch, *, offers=(), quota=True, run_id=RUN_ID):
 
     monkeypatch.setattr(queue.time, "sleep", sleep)
     monkeypatch.setattr(queue, "affordable_offers", lambda **kw: list(offers))
-    monkeypatch.setattr(queue, "quota_available", lambda *a, **kw: quota)
+
+    def quota_available(*_a, **_kw):
+        if quota is None:  # the quota API is down
+            raise client.MithrilApiError("Mithril GET /quotas returned 503", status=503)
+        return quota
+
+    monkeypatch.setattr(queue, "quota_available", quota_available)
     seen = {}
 
     real_record = record_startup_stage
@@ -292,6 +333,15 @@ def test_affordable_offer_without_project_quota_is_reported_as_quota(monkeypatch
     text, startup = _wait_once(monkeypatch, offers=[offer], quota=False)
     assert "Spot queued (GPU quota full: project Spot quota" in text
     assert startup["queue"]["reason"] == "gpu_quota_full"
+
+
+def test_quota_lookup_failure_is_not_reported_as_quota_full(monkeypatch):
+    _save_run("queued")
+    offer = Offer("H100", 1, "it_h100", 1.0, 1500, "us-central2-b")
+    text, startup = _wait_once(monkeypatch, offers=[offer], quota=None)
+    assert "Spot queued (Spot market temporarily unreadable:" in text
+    assert "GPU quota full" not in text
+    assert startup["queue"]["reason"] == "capacity_lookup_failed"
 
 
 def test_eta_comes_from_recent_allocations_and_stays_coarse(monkeypatch):
@@ -369,9 +419,13 @@ def test_accepted_bid_leaves_the_queue_and_counts_as_an_allocation(monkeypatch):
     class _Stop(Exception):
         pass
 
-    def on_handle(_handle):
+    def poll(*_a, **_kw):
         raise _Stop
 
+    def on_handle(_handle):
+        return None
+
+    monkeypatch.setattr(jobs, "poll", poll)
     log = io.StringIO()
     with pytest.raises(_Stop):
         jobs.submit_attempt(_spec(), log=log, on_handle=on_handle, deadline_at=time.time() + 3600)
@@ -407,3 +461,63 @@ def test_quota_refusal_is_recorded_and_logged_as_a_requeue(monkeypatch):
         "nothing was provisioned or billed"
     )
     assert "failed" not in line.splitlines()[0]
+
+
+def test_unknown_create_outcome_never_claims_nothing_was_billed(monkeypatch):
+    from flash.providers.core.base import CapacityUnavailableError
+    from flash.runner.supervise import execution
+
+    monkeypatch.setattr(api, "pages", lambda *a, **kw: [])
+
+    def timeout(*args, **kwargs):
+        raise client.MithrilApiError("Mithril operation failed or timed out")
+
+    monkeypatch.setattr(api, "call", timeout)
+    with pytest.raises(CapacityUnavailableError) as error:
+        launch(monkeypatch)
+    assert error.value.definitive is False
+
+    class _Provider:
+        def submit_attempt(self, *_a, **_kw):
+            raise error.value
+
+    from flash.providers.core import registry
+    from flash.providers.core.base import Candidate
+
+    monkeypatch.setattr(registry, "get_provider", lambda _name: _Provider())
+    ctx = execution._SubmitContext(
+        spec=_spec(), log=io.StringIO(), runtime_secrets=None, source_snapshot={}
+    )
+    monkeypatch.setattr(execution, "_handle_callback", lambda *a: None)
+    from flash.runner.lifecycle import deadlines
+
+    monkeypatch.setattr(deadlines, "_worker_deadline_at", lambda *a: time.time() + 3600)
+    claim = type("Claim", (), {"attempt": 2})()
+    chosen = Candidate("spot", "H100", 1.2, 80, 1)
+    result, not_started = execution._submit_provider(
+        ctx, (claim, None, {}, None), (None, chosen, None, _spec())
+    )
+    assert result.failure == "no_capacity"
+    assert not_started
+    assert result.detail.startswith(execution.UNKNOWN_CREATE_DETAIL)
+    line = execution._spot_requeue_line(RUN_ID, 2, result.detail)
+    head = line.splitlines()[0]
+    assert head.startswith("Spot bid 2: create outcome unknown and no bid has appeared; ")
+    assert "any late bid will be cancelled before the next attempt bids" in head
+    assert "nothing was provisioned" not in line
+    assert "billed" not in head
+
+
+def test_definitive_refusal_keeps_the_nothing_billed_assurance():
+    from flash.providers.core.base import CapacityUnavailableError
+    from flash.runner.supervise import execution
+
+    refusal = CapacityUnavailableError("Mithril refused the Spot bid (http 400); requeuing")
+    assert refusal.definitive is True
+    line = execution._spot_requeue_line(
+        RUN_ID,
+        1,
+        "provider refused the create for capacity (CapacityUnavailableError after http 400)",
+    )
+    assert line.startswith("Spot bid 1: provider refused (capacity); back in the queue")
+    assert "nothing was provisioned or billed" in line.splitlines()[0]

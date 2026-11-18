@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import time
 
 from flash._internal.background import TaskStopped
@@ -27,6 +28,7 @@ from flash.providers.mithril import api, queue_board
 from flash.providers.mithril.config import scope_fingerprint
 from flash.providers.mithril.handles import SpotJobHandle, require_scope
 from flash.providers.mithril.pricing import hourly_rate
+from flash.runner.supervise.errors import _RunCancelled
 from flash.runner.supervise.retry_decision import BOOT_TIMEOUT_FAILURE
 
 # A filled Mithril bid allocates, images and boots a VM before it reports running; that has
@@ -103,7 +105,6 @@ def poll(handle, spec, *, log=None, deadline_at=None):
 
 def _raise_if_cancelled(run_id):
     from flash.runner.lifecycle.status import get_status
-    from flash.runner.supervise.errors import _RunCancelled
 
     try:
         cancelled = get_status(run_id).state == "cancelled"
@@ -112,6 +113,18 @@ def _raise_if_cancelled(run_id):
     if cancelled:
         queue_board.leave(run_id, allocated=False)
         raise _RunCancelled(f"run {run_id} was cancelled before its Spot bid was placed")
+
+
+def _raise_if_cancelled_keeping_cleanup(run_id, handle):
+    """Without a supervisor callback, keep a cancelled run's late bid as a cleanup target."""
+    try:
+        _raise_if_cancelled(run_id)
+    except Exception:
+        from flash.runner.lifecycle.cleanup import _preserve_cleanup_remote
+
+        with contextlib.suppress(Exception):
+            _preserve_cleanup_remote(run_id, handle.to_dict())
+        raise
 
 
 def submit_attempt(
@@ -180,16 +193,6 @@ def submit_attempt(
     )
     persisted = detached = False
     try:
-        # a cancel that landed while the create was in flight: the finally below cancels the bid.
-        _raise_if_cancelled(spec.run_id)
-        queue_board.leave(spec.run_id, allocated=True)
-        if log is not None:
-            print(
-                f"Spot: Mithril accepted the bid for {count}x {gpu} in {offer.region} "
-                f"({sandbox_id}); left the queue, instance booting",
-                file=log,
-                flush=True,
-            )
         h = SpotJobHandle(
             instance_id=sandbox_id,
             gpu=gpu,
@@ -204,10 +207,26 @@ def submit_attempt(
             scope=owner_scope,
         )
         handle = JobHandle.from_dict(h.to_dict())
+        # A cancel that landed while the create was in flight is caught when the handle is
+        # persisted: the supervisor's callback refuses a terminal run, tears the bid down and, if
+        # that cannot be confirmed, records the bid as a durable cleanup target before raising.
         if on_handle is not None:
             on_handle(handle)
             persisted = True
+        else:
+            _raise_if_cancelled_keeping_cleanup(spec.run_id, handle)
+        queue_board.leave(spec.run_id, allocated=True)
+        if log is not None:
+            print(
+                f"Spot: Mithril accepted the bid for {count}x {gpu} in {offer.region} "
+                f"({sandbox_id}); left the queue, instance booting",
+                file=log,
+                flush=True,
+            )
         return poll(handle, spec, log=log, deadline_at=deadline_at)
+    except _RunCancelled:
+        queue_board.leave(spec.run_id, allocated=False)
+        raise
     except TaskStopped:
         # Control-plane shutdown (e.g. a redeploy) detaches supervision only. A durably recorded
         # handle lets the next plane re-attach to the live bid, so leave it running.

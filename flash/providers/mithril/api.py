@@ -326,4 +326,5 @@ def create(*, name, offer, payload, image_reference, gpu, gpu_count, capsule, di
         raise CapacityUnavailableError(
             f"Mithril Spot bid outcome unknown ({cause}) and no bid appeared; requeuing",
             cause=cause,
+            definitive=False,
         ) from None

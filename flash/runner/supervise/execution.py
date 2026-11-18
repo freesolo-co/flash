@@ -22,6 +22,8 @@ from flash.runner.supervise.retry_decision import (
 
 # Seconds between Spot requeues after a provider capacity refusal (the price queue polls at 60 s).
 SPOT_CAPACITY_REQUEUE_SECONDS = 60.0
+# The detail prefix of a create whose outcome is unknown (see CapacityUnavailableError.definitive).
+UNKNOWN_CREATE_DETAIL = "provider create outcome unknown and no resource appeared"
 
 
 @dataclass
@@ -144,8 +146,8 @@ def _mark_attempt_boundary(ctx: _SubmitContext, attempt: int) -> None:
     if ctx.last_requeue_refused:
         # a refused bid never ran anything; say so, so the counter is not read as a failure count.
         line = (
-            f"---- attempt {attempt}: a new Spot bid after the provider refused the last one "
-            "(queue requeue, not a training failure) ----"
+            f"---- attempt {attempt}: a new Spot bid after the last one was refused or never "
+            "appeared (queue requeue, not a training failure) ----"
         )
     with contextlib.suppress(Exception):
         print(line, file=ctx.log, flush=True)
@@ -461,15 +463,21 @@ def _submit_provider(ctx: _SubmitContext, prepared, candidate_plan):
     except _TerminalHandleRace:
         raise
     except CapacityUnavailableError as exc:
-        # The provider definitively refused the create (quota/capacity) and nothing was provisioned:
-        # an allocation-shaped outcome, not an ambiguous launch. The retry plan decides whether to
-        # requeue (Spot) or move on.
+        # Either the provider definitively refused the create (quota/capacity) and nothing was
+        # provisioned, or the outcome is unknown and bounded reconciliation found nothing yet (the
+        # next attempt cancels any late resource before it creates). Both requeue; only the first
+        # may be described as "nothing provisioned". The retry plan decides whether to requeue.
+        lead = (
+            UNKNOWN_CREATE_DETAIL
+            if getattr(exc, "definitive", True) is False
+            else "provider refused the create for capacity"
+        )
         return (
             PollResult(
                 False,
                 failure="no_capacity",
                 detail=(
-                    f"provider refused the create for capacity ({type(exc).__name__}"
+                    f"{lead} ({type(exc).__name__}"
                     + (f" after {exc.cause}" if getattr(exc, "cause", "") else "")
                     + ")"
                 ),
@@ -642,17 +650,25 @@ def _spot_requeue_line(run_id: str, attempt: int, detail: str | None) -> str:
     """A refused Spot bid is a step back into the queue, not a failed training attempt."""
     from flash.providers.mithril import queue_board
 
-    cause = "quota full" if queue_board.is_quota_refusal(detail) else "capacity"
     view = queue_board.view(run_id)
     where = (
         f"back in the queue at position {view.position} of {view.waiting}"
         if view is not None
         else "back in the queue"
     )
-    return (
-        f"Spot bid {attempt}: provider refused ({cause}); {where}; nothing was provisioned or "
-        f"billed\n--- provider detail ---\n{(detail or '')[:2000]}\n---"
-    )
+    if (detail or "").startswith(UNKNOWN_CREATE_DETAIL):
+        # a timeout or 5xx: a bid may still appear late, so promise nothing about billing.
+        head = (
+            f"Spot bid {attempt}: create outcome unknown and no bid has appeared; {where}; any "
+            "late bid will be cancelled before the next attempt bids"
+        )
+    else:
+        cause = "quota full" if queue_board.is_quota_refusal(detail) else "capacity"
+        head = (
+            f"Spot bid {attempt}: provider refused ({cause}); {where}; nothing was provisioned "
+            "or billed"
+        )
+    return f"{head}\n--- provider detail ---\n{(detail or '')[:2000]}\n---"
 
 
 def run_attempts_supervised(

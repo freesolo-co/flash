@@ -20,8 +20,8 @@ def _raise_if_cancelled(run_id):
 
 def _queue_reason(lookup_failed, shaped_offers, view):
     """Why the run is still waiting, as ``(reason, detail)``; quota evidence wins over price."""
-    if shaped_offers:
-        # an offer below the cap exists, but the project quota for every such shape is used up.
+    if shaped_offers and not lookup_failed:
+        # an offer below the cap exists, and every such shape's quota lookup answered "used up".
         return queue_board.REASON_QUOTA, "project Spot quota for every affordable shape is in use"
     if view is not None and view.quota_refused_at is not None:
         minutes = max(0, int((view.at - view.quota_refused_at) // 60))
@@ -31,7 +31,9 @@ def _queue_reason(lookup_failed, shaped_offers, view):
         )
     if lookup_failed:
         return queue_board.REASON_LOOKUP, "Mithril prices or quotas could not be read; retrying"
-    return queue_board.REASON_PRICE, "no matching Spot offer is at or below the GPU price cap"
+    return queue_board.REASON_PRICE, (
+        "no matching Spot offer in a US region is at or below the GPU price cap"
+    )
 
 
 def wait_for_price(gpu, run_id, *, gpu_count=1, disk_gb=0, deadline_at, log=None):
