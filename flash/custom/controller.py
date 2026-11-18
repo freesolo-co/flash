@@ -124,8 +124,8 @@ def first_connect_timeout(spec):
 
     Modal provisions promptly, so a stuck launch is cut off after 20 minutes. A Spot run can
     legitimately wait longer: it queues while prices exceed the cap and may be preempted and
-    replaced before its first session starts, all within the run's own wall-clock deadline
-    (gpu.max_wall_seconds: queue time plus the session cap).
+    replaced before its first session starts; queue time is unlimited, so it waits for the
+    run's backstop deadline (gpu.max_wall_seconds).
     """
     if spec.gpu.spot:
         return spec.gpu.max_wall_seconds

@@ -315,18 +315,18 @@ def test_spot_first_connection_waits_for_the_run_deadline_not_twenty_minutes():
     modal = spec_from_dict({**custom_raw(), "custom": custom})
     spot = spec_from_dict({**custom_raw(spot=True), "custom": custom})
     assert first_connect_timeout(modal) == 1200
-    # the run deadline covers queue time plus the session cap
-    assert first_connect_timeout(spot) == 7200 + 24 * 3600
+    # queue time is unlimited: a Spot controller waits for the run's backstop deadline
+    assert first_connect_timeout(spot) == 7 * 24 * 3600
 
 
 def test_custom_session_cap_is_not_consumed_by_queue_time():
-    from flash.schema.custom import CUSTOM_QUEUE_SECONDS
+    from flash.schema.custom import CUSTOM_RUN_BACKSTOP_SECONDS
 
     spec = spec_from_dict(
         {**custom_raw(spot=True), "custom": {"file": "a.py", "max_wall_seconds": 1800}}
     )
     assert spec.custom["max_wall_seconds"] == 1800
-    assert spec.gpu.max_wall_seconds == 1800 + CUSTOM_QUEUE_SECONDS
+    assert spec.gpu.max_wall_seconds == CUSTOM_RUN_BACKSTOP_SECONDS
     assert spec.gpu.max_retries == 0
 
 
