@@ -313,6 +313,15 @@ def _private_spot_region_cooldown(monkeypatch, tmp_path):
 
 
 @pytest.fixture(autouse=True)
+def _private_spot_queue_board(monkeypatch, tmp_path):
+    """Each test sees its own (empty) Spot queue board, never the developer's ~/.flash."""
+    from flash.providers.mithril import queue_board
+
+    path = tmp_path / ".spot-queue" / "board.json"
+    monkeypatch.setattr(queue_board, "_path", lambda: path)
+
+
+@pytest.fixture(autouse=True)
 def _reset_status_reporter_before_test():
     from flash.runner.lifecycle import reporting
 

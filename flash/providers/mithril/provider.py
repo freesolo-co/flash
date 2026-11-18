@@ -88,7 +88,7 @@ class SpotProvider:
     def terminate_run(self, run_id):
         from flash.providers.mithril import api
 
-        for instance in api.list_instances():
+        for instance in api.list_instances(run_id=run_id):
             if instance["metadata"]["labels"].get("flash-run") == run_id:
                 api.terminate(instance["metadata"]["id"])
 
@@ -97,7 +97,7 @@ class SpotProvider:
 
         return [
             item["metadata"]["id"]
-            for item in api.list_instances()
+            for item in api.list_instances(run_id=run_id)
             if item["metadata"]["labels"].get("flash-run") == run_id
         ]
 

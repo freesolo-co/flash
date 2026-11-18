@@ -246,7 +246,10 @@ def _run_training(
     # it and this transition. _update is a compare-and-set: it returns False when the run is already
     # terminal and leaves the state untouched. Gate the PAID supervised submit on that result so a
     # run cancelled in this last instant is never resumed onto a GPU.
-    if not _update(spec.run_id, "running"):
+    # a Spot run holds no GPU until the queue's bid is accepted, which persists `running` itself;
+    # saying `running` here would read as a GPU that then "falls back" to `queued`.
+    spot = spec.gpu.provider == "spot" or tuple(spec.gpu.providers or ()) == ("spot",)
+    if not _update(spec.run_id, "queued" if spot else "running"):
         raise _RunCancelled(f"run {spec.run_id} went terminal before submit; not submitting")
     print(
         f"starting phase={spec.phase} model={spec.model} gpu={spec.gpu.type}",
