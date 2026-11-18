@@ -194,8 +194,8 @@ def test_allocation_offers_fitting_catalog_shapes_at_the_quote_rate(monkeypatch)
 @pytest.mark.parametrize(
     "change",
     [
-        {"price": "$19.28"},  # 8 x $2.41, a cent over the H200 cap
-        {"price": "$19.60"},  # 8 x $2.45
+        {"price": "$25.68"},  # 8 x $3.21, a cent over the H200 cap
+        {"price": "$26.00"},  # 8 x $3.25
         {"capacity": 0},
         {"region": ""},
         {"socket": "PCIe"},
@@ -260,7 +260,7 @@ def launch(monkeypatch, *, count=1, gpu="H200", attempt=0):
 
 
 @pytest.mark.parametrize("count", [1, 8])
-@pytest.mark.parametrize(("gpu", "cap"), [("H100", 1.20), ("H200", 2.40)])
+@pytest.mark.parametrize(("gpu", "cap"), [("H100", 1.20), ("H200", 3.20)])
 def test_create_bids_for_one_instance_at_per_instance_hold_cap(monkeypatch, count, gpu, cap):
     monkeypatch.setattr(api, "pages", lambda *a, **kw: [])
     captured = []
