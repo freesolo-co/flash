@@ -11,6 +11,9 @@ from flash.providers.mithril.region_health import refused
 # Regions never bid in. af-south1-a lists capacity and accepts bids, but none of 112 Flash VMs
 # allocated there booted (93 boot timeouts) while us-central2-a booted 35 of 39 (2026-11-11..13).
 EXCLUDED_REGIONS = frozenset({"af-south1-a"})
+# Spot bids only in US regions (operator policy, 2026-11-17): any non-US region, including ones
+# Mithril adds later, is never bid in. EXCLUDED_REGIONS still applies within the US.
+ALLOWED_REGION_PREFIX = "us-"
 
 
 @dataclass(frozen=True)
@@ -44,7 +47,10 @@ def affordable_offers(*, deadline_at=None) -> list[Offer]:
         for auction in auctions:
             if not isinstance(auction.get("region"), str) or not auction["region"]:
                 continue
-            if auction["region"] in EXCLUDED_REGIONS:
+            if (
+                not auction["region"].startswith(ALLOWED_REGION_PREFIX)
+                or auction["region"] in EXCLUDED_REGIONS
+            ):
                 continue
             if refused(auction["region"], auction["instance_type"]):
                 continue  # Mithril refused our last bid on this shape here
