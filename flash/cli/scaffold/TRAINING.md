@@ -177,8 +177,9 @@ class RetailEnv(EnvironmentMultiTurn):
         return EnvironmentStepResult(done=not replies, messages=tuple(replies))
 ```
 
-- Declarations are validated exactly as a serving chat request's `tools` are (closed object schemas
-  with `"additionalProperties": false`, no `strict`); a malformed one fails at load.
+- Declarations are validated exactly as a serving chat request's `tools` are (closed object schemas:
+  an omitted `additionalProperties` is closed, any value but `false` is refused; no `strict`); a
+  malformed one fails at load.
 - Flash renders them with the chat template's own `tools=` into the first prompt, every
   generation prefix, and the glue for every environment reply, so the policy trains on exactly the
   prompt serving renders for the same conversation (and that SFT renders for a row's `tools`).
