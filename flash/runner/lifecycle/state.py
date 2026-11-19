@@ -126,6 +126,10 @@ class RunStatus:
     # customer is charged exactly what was estimated before paid work started.
     estimated_cost_usd: float | None = None
     error: str | None = None
+    # why a failed run failed: "infra" (provider, machine, or a service the run depends on, after
+    # the infrastructure retry budget) or "job" (the run's own code, config, or memory needs).
+    # stamped by the terminal retry decision; None for runs that did not end through one.
+    failure_class: str | None = None
     artifacts_dir: str | None = None
     adapter_ref: str | None = None
     deployments: dict[str, dict] = field(default_factory=dict)
@@ -189,6 +193,8 @@ class RunStatus:
         data["spec"] = _public_status_spec(data.get("spec"))
         data.pop("requires_runtime_secrets", None)
         data.pop("report_sequence", None)
+        if data.get("state") != "failed":
+            data["failure_class"] = None
         data.pop("lifecycle_started_attempt", None)
         data.pop("lifecycle_progressed_attempt", None)
         data.pop("cleanup_confirmed_remote", None)

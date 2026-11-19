@@ -262,6 +262,7 @@ def _reserve_attempt_launch(
                         )
                         snapshot = retry_state.to_snapshot()
                     if not plan.retry:
+                        status.failure_class = "infra"  # a lost poll, never the run's own fault
                         state._save_status_unlocked(status, _retry_state=snapshot)
                         if recover_handleless:
                             return LaunchReservationResult(None, retry_plan=plan)
@@ -425,6 +426,7 @@ def decide_attempt_failure(
     """Atomically persist one immutable failure decision for the exact attempt owner."""
     from flash.runner.supervise.retry_decision import (
         FailureObservation,
+        failure_class,
         require_retry_authorization_from_raw,
         transition_failure,
     )
@@ -459,6 +461,8 @@ def decide_attempt_failure(
             plan = retry_state.persisted_plan(attempt)
             if plan is None:
                 retry_state, plan = transition_failure(retry_state, observation, attempt=attempt)
+                # only a terminal decision classifies the run; a retried one clears a stale class.
+                status.failure_class = None if plan.retry else failure_class(observation.failure)
                 state._save_status_unlocked(
                     status,
                     _retry_state=retry_state.to_snapshot(),

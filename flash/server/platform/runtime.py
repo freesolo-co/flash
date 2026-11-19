@@ -641,11 +641,42 @@ def _schedule_cleanup(run_id: str) -> None:
         _log.debug("cleanup remains pending for %s", run_id, exc_info=True)
 
 
-def _schedule_attach(run_id: str) -> None:
+class _RunLogStream:
+    """An append-per-write view of one run's log file, safe to hand to background tasks.
+
+    Attach passes its stream on to reconciliation tasks that outlive the attach call, so an open
+    file handle closed at the end of it would make their writes raise. Opening per write never
+    holds a descriptor between lines.
+    """
+
+    def __init__(self, run_id: str) -> None:
+        self._path = runs_file_path(run_id, ".log")
+
+    def write(self, text: str) -> int:
+        with open(self._path, "a") as f:
+            return f.write(text)
+
+    def flush(self) -> None:
+        return None
+
+
+def _attach_with_run_log(run_id: str):
+    """Reattach with the run's own log as the stream, not the server's stderr.
+
+    A run adopted after a control-plane restart keeps being polled, retried, and failed here, and
+    every line of that went to stderr: the run log simply stopped at the restart, hiding the
+    failure detail from `flash runs log` exactly when the run ended.
+    """
     from flash.runner.supervise.attach import attach_run
 
+    return attach_run(run_id, log_stream=_RunLogStream(run_id))
+
+
+def _schedule_attach(run_id: str) -> None:
     try:
-        current_supervisor().submit(("run", run_id), "training", partial(attach_run, run_id))
+        current_supervisor().submit(
+            ("run", run_id), "training", partial(_attach_with_run_log, run_id)
+        )
     except TaskAdmissionError:
         _log.info("training capacity full; attachment for %s remains pending", run_id)
 
