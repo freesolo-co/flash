@@ -36,6 +36,9 @@ ROUTER_REFRESH_TIMEOUT_SECONDS = 1.0
 HOLD_RENEW_BELOW_SECONDS = 7 * 86400
 HOLD_EXTENSION_SECONDS = 30 * 86400
 HOLD_ALERT_WITHIN_SECONDS = 86400
+# The scheduler's tick runs at most 180 s and never expires its own lock. A lock older than
+# this was left by a killed tick; it would block renewal (and the scheduler) forever.
+TICK_LOCK_STALE_SECONDS = 15 * 60
 
 
 @dataclass
@@ -208,7 +211,21 @@ async def renew_reservation(ledger, *, clock=time.time):
     overwritten by a concurrent tick; a busy lock just defers renewal to the next cycle.
     """
     token = uuid.uuid4().hex
-    if not await ledger.put_if_absent("tick_lock", {"token": token, "at": clock()}):
+    lock = {"token": token, "at": clock()}
+    acquired = await ledger.put_if_absent("tick_lock", lock)
+    if not acquired:
+        held = await ledger.get("tick_lock")
+        held_at = (held or {}).get("at")
+        if held is None or (
+            isinstance(held_at, (int, float)) and clock() - held_at > TICK_LOCK_STALE_SECONDS
+        ):
+            print(
+                f"reserved H100 alert: replacing stale reservation tick_lock {held!r}", flush=True
+            )
+            await ledger.put("tick_lock", lock)
+            # Another watchdog or tick may have raced the takeover; only the winner proceeds.
+            acquired = ((await ledger.get("tick_lock")) or {}).get("token") == token
+    if not acquired:
         state = await ledger.get("state")
         hold_until = (state or {}).get("hold_until")
         if (

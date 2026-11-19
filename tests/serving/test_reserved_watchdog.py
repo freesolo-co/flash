@@ -331,3 +331,15 @@ def test_renew_reservation_defers_while_scheduler_ticks(capsys):
     ledger.data["state"]["hold_until"] = 1000 + 20 * DAY
     asyncio.run(wd.renew_reservation(ledger, clock=lambda: 1000))
     assert "alert" not in capsys.readouterr().out
+
+
+def test_renew_reservation_replaces_a_stale_tick_lock(capsys):
+    stale = {"token": "dead-tick", "at": 0}
+    ledger = LedgerStore({"state": reservation("serving", 1000 + DAY), "tick_lock": stale})
+    now = wd.TICK_LOCK_STALE_SECONDS + 1
+    event = asyncio.run(wd.renew_reservation(ledger, clock=lambda: now))
+    assert event.startswith("renewed")
+    assert ledger.data["state"]["hold_until"] == now + wd.HOLD_EXTENSION_SECONDS
+    # The stale lock is released too, which also unblocks the scheduler.
+    assert "tick_lock" not in ledger.data
+    assert "stale reservation tick_lock" in capsys.readouterr().out
