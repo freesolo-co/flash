@@ -7,7 +7,7 @@ import threading
 from urllib.parse import urlsplit
 
 from flash.client.http import ApiClient, ApiError
-from flash.custom.types import MAX_BODY_BYTES, MAX_BODY_MIB, Datum
+from flash.custom.types import MAX_BODY_BYTES, MAX_BODY_MIB, MAX_ENCODE_CHARACTERS, Datum
 
 
 def pinned_context(certificate):
@@ -26,6 +26,32 @@ def pinned_context(certificate):
 
 
 class TrainingClient:
+    """Synchronous client for one managed custom-training GPU session.
+
+    Every operation returns the operation's own fields merged with the session status
+    (session_id, step, sequence, model_version, max_steps, vocab_size, max_context_tokens,
+    max_batch, ...). Operation-specific results:
+
+    * ``encode(text) -> list[int]``: plain tokenization, no chat template and no added special
+      tokens; special-token strings in ``text`` (``<|im_start|>``...) become their ids.
+      ``text`` holds at most 100,000 characters per call.
+    * ``decode(tokens) -> str``, special tokens kept.
+    * ``sample(prompt_ids, ...) -> {"sequences": [{"tokens", "text", "logprobs",
+      "sampling_logprobs", "finish_reason"}, ...]}``: completion-only tokens and logprobs;
+      ``finish_reason`` is "stop" or "length". Sampling is plain (no top-k/top-p; temperature
+      0 is greedy) and stops at the tokenizer's EOS (<|endoftext|> for Qwen3.5), so text often
+      ends "<|im_end|>\\n<|endoftext|>". No chat template, system prompt or structured-output
+      constraint is applied: render the prompt exactly as serving does before ``encode``.
+    * ``forward(data, top_k=0) -> {"outputs": [{"logprobs": [...], "top_logprobs": ...}]}``:
+      one output per Datum; ``logprobs[i]`` scores ``tokens[i+1]``.
+    * ``forward_backward(data) -> {"outputs": [...], "metrics": {"surrogate_loss": ...}}``.
+    * ``optim_step(...) -> {"metrics": {"grad_norm", "learning_rate", ...}}``.
+
+    Limits: at most ``max_batch`` rows (or ``num_samples``) per call, 2..max_context_tokens
+    tokens per datum and 32 MiB per request. A rejected call raises ApiError with code
+    ``custom_rejected`` and leaves the session usable.
+    """
+
     def __init__(self, url, *, api_key, timeout=300, tls_cert=None):
         parsed = urlsplit(url)
         if parsed.scheme != "https" and not (
@@ -113,8 +139,14 @@ class TrainingClient:
             return result
 
     def encode(self, text, *, images=None):
-        """Token ids for text; with images (data URIs), each <|image_pad|> in text becomes the
+        """Token ids (list[int]) for at most 100,000 characters of text, with no template or
+        added special tokens; with images (data URIs), each <|image_pad|> in text becomes the
         exact placeholder run its image needs, ready for Datum(tokens, images=images)."""
+        if isinstance(text, str) and len(text) > MAX_ENCODE_CHARACTERS:
+            raise ValueError(
+                f"encode accepts at most {MAX_ENCODE_CHARACTERS:,} characters per call "
+                f"(got {len(text):,}); split the text and concatenate the token ids"
+            )
         extra = {"images": list(images)} if images is not None else {}
         return self._call("encode", text=text, **extra)["tokens"]
 
@@ -122,6 +154,15 @@ class TrainingClient:
         return self._call("decode", tokens=tokens)["text"]
 
     def sample(self, prompt, *, max_tokens=64, temperature=1.0, num_samples=1, images=None):
+        """Sample completions of a token-id prompt; returns {"sequences": [...]} (see class).
+
+        prompt is a list of token ids, e.g. client.encode(rendered_prompt_text), never a string.
+        """
+        if isinstance(prompt, str):
+            raise TypeError(
+                "sample takes prompt token ids, not text: pass client.encode(prompt_text), "
+                "with the prompt rendered exactly as serving's chat template renders it"
+            )
         extra = {"images": list(images)} if images is not None else {}
         return self._call(
             "sample",
@@ -133,6 +174,9 @@ class TrainingClient:
         )
 
     def forward(self, data, *, top_k=0):
+        """Score Datum rows without gradients: {"outputs": [{"logprobs": [...]}, ...]}, one
+        output per row (index result["outputs"][row], not result[row]); top_k > 0 adds
+        "top_logprobs" per scored position."""
         return self._call("forward", data=[row.to_dict() for row in data], top_k=top_k)
 
     def forward_backward(self, data, *, metrics=None):
