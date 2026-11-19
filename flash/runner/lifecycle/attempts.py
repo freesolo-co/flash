@@ -193,6 +193,7 @@ def _reserve_attempt_launch(
     from flash.runner.supervise.retry_decision import (
         FailureObservation,
         RetryState,
+        failure_class,
         require_retry_authorization_from_raw,
         transition_failure,
     )
@@ -262,7 +263,9 @@ def _reserve_attempt_launch(
                         )
                         snapshot = retry_state.to_snapshot()
                     if not plan.retry:
-                        status.failure_class = "infra"  # a lost poll, never the run's own fault
+                        # classify by the decision itself: a lost poll is infra, but a terminal
+                        # decision persisted before a restart keeps its own (e.g. job) class.
+                        status.failure_class = failure_class(retry_state.last_decision.failure)
                         state._save_status_unlocked(status, _retry_state=snapshot)
                         if recover_handleless:
                             return LaunchReservationResult(None, retry_plan=plan)

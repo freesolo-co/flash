@@ -275,6 +275,19 @@ def test_terminal_job_failure_is_classified_job(monkeypatch, tmp_path):
     assert status.to_dict()["failure_class"] == "job"
 
 
+def test_recovery_over_a_persisted_terminal_decision_keeps_its_class(monkeypatch, tmp_path):
+    """A restart after a terminal `job_failed` decision must not relabel the run as infra."""
+    from flash.runner.lifecycle import status as runner_status
+
+    plan, status = _decide(monkeypatch, tmp_path, "job_failed")
+    assert not plan.retry
+    assert status.failure_class == "job"
+    # attach recovery resumes the captured remote whose teardown it just confirmed.
+    with pytest.raises(RuntimeError, match="attempt 0 ended"):
+        runner_attempts._reserve_attempt_launch(status.run_id, expected_remote=status.remote)
+    assert runner_status.get_status(status.run_id).failure_class == "job"
+
+
 def test_retried_infra_failure_leaves_the_class_unset(monkeypatch, tmp_path):
     plan, status = _decide(monkeypatch, tmp_path, "worker_retriable", max_retries=2)
     assert plan.retry
