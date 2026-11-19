@@ -40,6 +40,7 @@ pytest.importorskip("fastapi")
 from fastapi.testclient import TestClient
 
 from flash.client.http import ApiClient, ApiError
+from tests._helpers import wait_until_leading
 from tests._helpers.source_snapshot import valid_source_snapshot
 
 # A representative managed-run spec -- the shape the freesolo bridge / SDK
@@ -156,6 +157,7 @@ def make_client(tmp_path, monkeypatch):
     auth_mod._verify_cache.clear()
     monkeypatch.setattr(auth_mod, "_freesolo_verify", _identity_for_token)
     with TestClient(app_mod.create_app()) as test_client:
+        wait_until_leading(test_client)
 
         def fake_urlopen(req: urllib.request.Request, timeout: float | None = None):
             parsed = urllib.parse.urlsplit(req.full_url)

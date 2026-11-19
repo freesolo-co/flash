@@ -557,7 +557,10 @@ def test_worker_launches_capsule_on_ephemeral_docker_storage(monkeypatch, tmp_pa
         ([], False),
     ],
 )
-def test_terminated_bids_remain_discoverable_until_every_vm_stops(monkeypatch, states, remaining):
+@pytest.mark.parametrize("run_id", [None, "test"])
+def test_terminated_bids_remain_discoverable_until_every_vm_stops(
+    monkeypatch, states, remaining, run_id
+):
     deadline = time.time() + 30
 
     def pages(path, *, params, deadline_at):
@@ -566,12 +569,54 @@ def test_terminated_bids_remain_discoverable_until_every_vm_stops(monkeypatch, s
         if path == "/spot/bids":
             return [owned_bid(status="Terminated")]
         assert path == "/instances"
-        assert params["bid_fid_in"] == "bid_test"
-        return [{"bid": "bid_test", "project": "proj_test", "status": state} for state in states]
+        # a run-scoped lookup asks for its bid; an unscoped sweep lists the project once.
+        assert params.get("bid_fid_in") == ("bid_test" if run_id else None)
+        rows = [{"bid": "bid_test", "project": "proj_test", "status": state} for state in states]
+        return (
+            rows
+            + [{"bid": "bid_other", "project": "proj_test", "status": "STATUS_RUNNING"}][
+                : 0 if run_id else 1
+            ]
+        )
 
     monkeypatch.setattr(api, "pages", pages)
-    found = api.list_instances(deadline_at=deadline)
+    found = api.list_instances(run_id=run_id, deadline_at=deadline)
     assert [item["metadata"]["id"] for item in found] == (["bid_test"] if remaining else [])
+
+
+def test_unscoped_sweep_lists_instances_once_however_many_bids_terminated(monkeypatch):
+    """Production: one /instances call per historical bid kept startup recovery >10 minutes."""
+    bids = [owned_bid(fid=f"bid_{i}", status="Terminated") for i in range(500)]
+    bids.append(owned_bid(fid="bid_live", status="Allocated"))
+    calls = []
+
+    def pages(path, *, params, deadline_at=None):
+        calls.append(path)
+        if path == "/spot/bids":
+            return bids
+        return [
+            {"bid": "bid_7", "project": "proj_test", "status": "STATUS_STOPPING"},
+            *(
+                {"bid": f"bid_{i}", "project": "proj_test", "status": "STATUS_TERMINATED"}
+                for i in range(500)
+            ),
+        ]
+
+    monkeypatch.setattr(api, "pages", pages)
+    found = api.list_instances()
+    assert sorted(item["metadata"]["id"] for item in found) == ["bid_7", "bid_live"]
+    assert calls == ["/spot/bids", "/instances"]
+
+
+def test_unscoped_sweep_rejects_instances_from_another_project(monkeypatch):
+    def pages(path, *, params, deadline_at=None):
+        if path == "/spot/bids":
+            return [owned_bid(status="Terminated")]
+        return [{"bid": "bid_test", "project": "proj_foreign", "status": "STATUS_TERMINATED"}]
+
+    monkeypatch.setattr(api, "pages", pages)
+    with pytest.raises(api.MithrilApiError):
+        api.list_instances()
 
 
 def test_instance_shutdown_checks_ignore_unowned_bids(monkeypatch):
@@ -623,8 +668,12 @@ def test_handleless_recovery_blocks_until_terminated_bid_instances_stop(monkeypa
 
 
 def test_orphan_sweep_reaps_terminated_bid_with_stopping_instance(monkeypatch):
-    monkeypatch.setattr(api, "pages", lambda *a, **kw: [owned_bid(status="Terminated")])
-    monkeypatch.setattr(api, "_instances", lambda *a, **kw: [{"status": "STATUS_STOPPING"}])
+    def pages(path, *args, **kwargs):
+        if path == "/spot/bids":
+            return [owned_bid(status="Terminated")]
+        return [{"bid": "bid_test", "project": "proj_test", "status": "STATUS_STOPPING"}]
+
+    monkeypatch.setattr(api, "pages", pages)
     terminated = []
     monkeypatch.setattr(api, "terminate", terminated.append)
     assert get_provider("spot").sweep_orphans(active_labels=set(), known_labels={"test"}) == [

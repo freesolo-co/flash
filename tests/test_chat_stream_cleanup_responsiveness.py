@@ -10,6 +10,8 @@ from fastapi.responses import StreamingResponse
 from flash.server.routes.meta import health
 from flash.server.routes.serving_chat import _UpstreamStreamingResponse
 
+_REQUEST = SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace()))
+
 
 @pytest.mark.parametrize("disconnected", [False, True])
 def test_health_responds_while_upstream_close_waits(monkeypatch, disconnected):
@@ -33,7 +35,7 @@ def test_health_responds_while_upstream_close_waits(monkeypatch, disconnected):
         task = asyncio.create_task(response({}, None, None))
         try:
             assert await asyncio.wait_for(asyncio.to_thread(entered.wait, 1), 2)
-            assert (await asyncio.wait_for(health(), 0.2))["ok"]
+            assert (await asyncio.wait_for(health(_REQUEST), 0.2))["ok"]
             assert len(close_threads) == 1
             assert close_threads[0] != threading.get_ident()
         finally:

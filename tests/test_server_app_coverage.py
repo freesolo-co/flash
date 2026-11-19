@@ -218,12 +218,26 @@ def test_run_server_explains_missing_uvicorn(monkeypatch) -> None:
         app_mod.run_server()
 
 
+def _fake_uvicorn(calls: list) -> types.ModuleType:
+    fake_uvicorn = types.ModuleType("uvicorn")
+    fake_uvicorn.Config = lambda application, **kwargs: (application, kwargs)
+
+    class Server:
+        def __init__(self, config):
+            self.config, self.started = config, False
+
+        def run(self):
+            calls.append(self.config)
+            self.started = True
+
+    fake_uvicorn.Server = Server
+    return fake_uvicorn
+
+
 def test_run_server_builds_the_app_and_delegates_to_uvicorn(monkeypatch) -> None:
     """The server entrypoint must pass its constructed app and explicit bind address to Uvicorn."""
     calls = []
-    fake_uvicorn = types.ModuleType("uvicorn")
-    fake_uvicorn.run = lambda application, **kwargs: calls.append((application, kwargs))
-    monkeypatch.setitem(sys.modules, "uvicorn", fake_uvicorn)
+    monkeypatch.setitem(sys.modules, "uvicorn", _fake_uvicorn(calls))
     application = object()
     monkeypatch.setattr(app_mod, "create_app", lambda: application)
     # run_server preflights the operator's configuration before starting uvicorn; this test runs
@@ -268,9 +282,7 @@ def test_run_server_does_not_repeat_the_advisory_preflight_logging(monkeypatch) 
     the lines SELF_HOSTING.md tells an operator to read, and any alert keyed on them.
     """
     seen: list[str] = []
-    fake_uvicorn = types.ModuleType("uvicorn")
-    fake_uvicorn.run = lambda *_args, **_kwargs: None
-    monkeypatch.setitem(sys.modules, "uvicorn", fake_uvicorn)
+    monkeypatch.setitem(sys.modules, "uvicorn", _fake_uvicorn([]))
     monkeypatch.setattr(app_mod, "create_app", lambda: object())
     monkeypatch.setattr(
         "flash.providers.core.preflight.require_operator_config",

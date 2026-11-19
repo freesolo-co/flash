@@ -4,17 +4,21 @@ A zero-downtime deploy starts the new plane while the old one drains in-flight r
 few minutes two planes share one state directory. Recovery and the background loops assume they
 are alone: a second plane's recovery scan would reap instances the first is still launching. Only
 the holder of this lease runs them. A plane without it still serves HTTP and leaves new runs queued
-for the holder's recovery scan. The kernel drops the flock when the holder exits, even on SIGKILL.
+for the holder's recovery scan. The holder releases the lease once its shutdown begins and its work
+has stopped (see flash.server.asgi.app._step_down); the kernel drops the flock when the holder
+exits, even on SIGKILL.
 """
 
 from __future__ import annotations
 
 import asyncio
 import fcntl
+import logging
 import os
 
 from flash._internal.paths import data_dir
 
+_log = logging.getLogger("flash.server")
 _fd: int | None = None
 
 
@@ -43,8 +47,17 @@ def try_acquire() -> bool:
 
 
 async def acquire(poll_seconds: float = 1.0) -> None:
-    """Wait until this process holds the lease."""
-    while not try_acquire():  # noqa: ASYNC110 -- the holder is another process; flock has no event.
+    """Wait until this process holds the lease.
+
+    A failed attempt (say, no file descriptor free under load) is retried, never raised: a waiter
+    that died would leave this plane serving without ever leading once the holder exits.
+    """
+    while True:
+        try:
+            if try_acquire():
+                return
+        except OSError:
+            _log.warning("could not try the control-plane lease; retrying", exc_info=True)
         await asyncio.sleep(poll_seconds)
 
 

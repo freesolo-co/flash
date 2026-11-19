@@ -11,6 +11,8 @@ import flash.runner.lifecycle.state as runner_state
 pytest.importorskip("fastapi")
 from fastapi.testclient import TestClient
 
+from tests._helpers import wait_until_leading
+
 _USER_TOKEN = "fslo-user-env-download"
 
 
@@ -55,6 +57,7 @@ def api(tmp_path, monkeypatch):
     auth_mod._verify_cache.clear()
     monkeypatch.setattr(auth_mod, "_freesolo_verify", _identity_for_token)
     with TestClient(app_mod.create_app()) as client:
+        wait_until_leading(client)
         yield client
 
 

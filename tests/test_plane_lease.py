@@ -67,19 +67,57 @@ def _stub_lifespan(monkeypatch, recovered: list) -> None:
     monkeypatch.setattr(app_mod, "_instance_providers_configured", lambda: False)
 
 
-def test_lone_plane_recovers_before_serving(monkeypatch):
+def test_lone_plane_leads_and_releases_the_lease_at_shutdown(monkeypatch):
     import flash.server.asgi.app as app_mod
 
     recovered = []
     _stub_lifespan(monkeypatch, recovered)
 
     with TestClient(app_mod.create_app()) as client:
+        _wait_for(lambda: client.app.state.plane_standby is False)
         assert recovered == ["runs", "deployments"]
-        assert not getattr(client.app.state, "plane_standby", False)
         assert plane_lease.held()
+        assert client.get("/v1/health").json()["control_plane"] == "leader"
 
     # shutdown hands the lease to whichever plane starts next.
     assert not plane_lease.held()
+
+
+def test_lone_plane_serves_before_its_recovery_finishes(monkeypatch):
+    """2026-11-19: a new plane that took the free lease recovered before serving, for >10 minutes
+    of per-bid Mithril calls, so it failed the deploy health check while holding the lease."""
+    import flash.server.asgi.app as app_mod
+    import flash.server.platform.runtime as server_runtime
+
+    recovered = []
+    _stub_lifespan(monkeypatch, recovered)
+    started, proceed = threading.Event(), threading.Event()
+
+    def slow_recovery():
+        started.set()
+        assert proceed.wait(10)
+        recovered.append("runs")
+
+    monkeypatch.setattr(server_runtime, "recover_runs", slow_recovery)
+    client = TestClient(app_mod.create_app())
+    entered = threading.Thread(target=client.__enter__)
+    entered.start()
+    entered.join(5)
+    try:
+        assert not entered.is_alive(), "startup blocked on recovery"
+        assert started.wait(10)
+        health = client.get("/v1/health")
+        assert health.status_code == 200
+        assert health.json()["control_plane"] == "recovering"
+        assert plane_lease.held()
+        # leading, but still recovering: submissions stay queued for the scanner.
+        assert client.app.state.plane_standby is True
+    finally:
+        proceed.set()
+    _wait_for(lambda: client.app.state.plane_standby is False)
+    assert recovered == ["runs", "deployments"]
+    assert client.get("/v1/health").json()["control_plane"] == "leader"
+    client.__exit__(None, None, None)
 
 
 def test_plane_beside_a_draining_one_serves_and_takes_over_when_it_exits(monkeypatch):
@@ -90,7 +128,9 @@ def test_plane_beside_a_draining_one_serves_and_takes_over_when_it_exits(monkeyp
     old_plane = _hold_elsewhere()
 
     with TestClient(app_mod.create_app()) as client:
-        assert client.get("/v1/health").status_code == 200
+        health = client.get("/v1/health")
+        assert health.status_code == 200
+        assert health.json()["control_plane"] == "standby"
         assert client.app.state.plane_standby is True
         assert recovered == []
 
@@ -246,6 +286,115 @@ def test_shutdown_waits_for_takeover_recovery_before_releasing_the_lease(monkeyp
     assert not shutdown.is_alive()
     assert "runs" in recovered
     assert not plane_lease.held()
+
+
+def test_standby_keeps_waiting_when_trying_the_lease_fails(monkeypatch):
+    """A waiter that died on one failed attempt left a plane serving without ever leading."""
+    import flash.server.asgi.app as app_mod
+
+    recovered = []
+    _stub_lifespan(monkeypatch, recovered)
+    old_plane = _hold_elsewhere()
+    real_try_acquire = plane_lease.try_acquire
+    failures = []
+
+    def flaky_try_acquire():
+        if not failures:
+            failures.append("EMFILE")
+            raise OSError(24, "Too many open files")
+        return real_try_acquire()
+
+    with TestClient(app_mod.create_app()) as client:
+        monkeypatch.setattr(plane_lease, "try_acquire", flaky_try_acquire)
+        _wait_for(lambda: failures)
+        _release_elsewhere(old_plane)
+        _wait_for(lambda: client.app.state.plane_standby is False)
+        assert recovered == ["runs", "deployments"]
+        assert plane_lease.held()
+
+
+def test_shutdown_signal_releases_the_lease_while_requests_still_drain(monkeypatch):
+    """2026-11-19: a retired plane kept the lease for its whole 600 s HTTP drain."""
+    import flash.server.asgi.app as app_mod
+
+    recovered = []
+    _stub_lifespan(monkeypatch, recovered)
+
+    with TestClient(app_mod.create_app()) as client:
+        _wait_for(lambda: client.app.state.plane_standby is False)
+        client.app.state.begin_drain()
+        _wait_for(lambda: not plane_lease.held())
+        # still serving its in-flight requests, now as a non-leader that queues submissions.
+        assert client.get("/v1/health").json()["control_plane"] == "draining"
+        assert client.app.state.plane_standby is True
+        # the next plane can take over at once.
+        _release_elsewhere(_hold_elsewhere())
+
+
+def test_shutdown_signal_keeps_the_lease_while_deployment_jobs_hold_run_locks(monkeypatch):
+    import flash.server.asgi.app as app_mod
+
+    recovered = []
+    _stub_lifespan(monkeypatch, recovered)
+    monkeypatch.setattr(deployment_jobs, "_wait_for_deployment_jobs", lambda _timeout: False)
+
+    with TestClient(app_mod.create_app()) as client:
+        _wait_for(lambda: client.app.state.plane_standby is False)
+        client.app.state.begin_drain()
+        _wait_for(lambda: client.get("/v1/health").json()["control_plane"] == "draining")
+        time.sleep(0.2)
+        assert plane_lease.held()
+
+    assert plane_lease.held()
+
+
+def test_shutdown_signal_waits_for_recovery_before_releasing_the_lease(monkeypatch):
+    import flash.server.asgi.app as app_mod
+    import flash.server.platform.runtime as server_runtime
+
+    recovered = []
+    _stub_lifespan(monkeypatch, recovered)
+    started, proceed = threading.Event(), threading.Event()
+
+    def slow_recovery():
+        started.set()
+        assert proceed.wait(10)
+        recovered.append("runs")
+
+    monkeypatch.setattr(server_runtime, "recover_runs", slow_recovery)
+    with TestClient(app_mod.create_app()) as client:
+        assert started.wait(10)
+        client.app.state.begin_drain()
+        time.sleep(0.3)
+        assert plane_lease.held()
+        proceed.set()
+        _wait_for(lambda: not plane_lease.held())
+        # recovery finished, but a draining plane never starts the leader loops.
+        assert client.app.state.plane_standby is True
+
+
+def test_server_signal_handler_begins_the_lease_handover(monkeypatch):
+    import signal
+
+    import uvicorn
+
+    import flash.server.asgi.app as app_mod
+    from flash.providers.core import preflight
+
+    drains = []
+    app = type("App", (), {})()
+    app.state = type("State", (), {"begin_drain": lambda self: drains.append("drain")})()
+    monkeypatch.setattr(preflight, "require_operator_config", lambda: None)
+    monkeypatch.setattr(app_mod, "create_app", lambda: app)
+
+    def run(self):
+        self.handle_exit(signal.SIGTERM, None)
+        assert self.should_exit
+        self.started = True
+
+    monkeypatch.setattr(uvicorn.Server, "run", run)
+    app_mod.run_server()
+    assert drains == ["drain"]
 
 
 def test_queue_only_submission_persists_without_dispatch(monkeypatch):
