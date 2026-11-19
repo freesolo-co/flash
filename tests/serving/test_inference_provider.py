@@ -203,8 +203,8 @@ def test_shipping_policy_covers_catalog_and_requested_placement():
     assert set(policy.MODEL_POLICIES) == set(base_models()) | {MODEL_ID}
     assert set(policy.lambda_models()) == set(base_models())
     selected = {
-        "Qwen/Qwen3.5-0.8B": ("A10",),
-        "Qwen/Qwen3.5-9B-Base": ("A100-40GB", "A100-80GB", "H100"),
+        "Qwen/Qwen3.5-0.8B": ("H100",),
+        "Qwen/Qwen3.5-9B-Base": ("H100",),
     }
     for model, config in policy.MODEL_POLICIES.items():
         if model in selected:
