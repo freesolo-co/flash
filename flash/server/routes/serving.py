@@ -9,7 +9,6 @@ import contextlib
 import time
 from typing import Annotated, NoReturn
 
-import anyio
 from fastapi import APIRouter, Depends, Header, HTTPException, Request
 
 import flash.runner.lifecycle.status as run_status
@@ -607,20 +606,13 @@ async def chat(
     x_freesolo_org_id: Annotated[str | None, Header()] = None,
     x_freesolo_project_id: Annotated[str | None, Header()] = None,
 ):
-    # Model responses can take minutes. They must not hold the default AnyIO
-    # worker budget also used by authentication, status, and deployment routes.
-    # Keep inference forwarding bounded independently, including disconnects:
-    # run_sync's default cancellation shielding retains the token until it exits.
-    limiter = getattr(request.app.state, "chat_forwarding_limiter", None)
-    if limiter is None:
-        limiter = anyio.CapacityLimiter(128)
-        request.app.state.chat_forwarding_limiter = limiter
-    return await anyio.to_thread.run_sync(
-        serving_chat.managed_chat,
+    # Model responses can take minutes, so forwarding runs on its own bounded worker
+    # budget with admission control instead of the default AnyIO pool used by auth/status.
+    return await serving_chat.admitted_managed_chat(
+        request,
         run_id,
         payload,
         key,
         x_freesolo_org_id,
         x_freesolo_project_id,
-        limiter=limiter,
     )
