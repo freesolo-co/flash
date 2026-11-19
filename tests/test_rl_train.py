@@ -153,6 +153,59 @@ def test_grpo_unclassified_nonzero_exit_still_tears_down_the_group(monkeypatch):
     )
 
 
+def test_grpo_unclassified_exit_reports_the_child_traceback_cause(monkeypatch):
+    """ "exited 1; see the flash log" pointed at a log that never held the traceback.
+
+    Shape of miniwob-astra flash-1795010812-6678f473 (2026-11-18): the environment's browser service
+    returned 503 for one rollout, and verl's own final raise names only the replayed prompt.
+    """
+    monkeypatch.setattr(rl_runner, "kill_process_group", lambda proc, *, process_group_id: None)
+    worker = "[verl] \x1b[36m(AgentLoopWorkerTQ pid=5151)\x1b[0m "
+    lines = [
+        (
+            "[verl] (pid=4819) UserWarning: torchtitan engine is not available: "
+            "ModuleNotFoundError(\"No module named 'torchtitan'\")\n"
+        ),
+        f"{worker}Traceback (most recent call last):\n",
+        f"{worker}urllib.error.HTTPError: HTTP Error 503: Service Unavailable\n",
+        (
+            f"{worker}RuntimeError: flash multi-turn bridge could not serve /multiturn/step "
+            "(HTTP 503): RuntimeError: MiniWoB browser service failed (503)\n"
+        ),
+        "[verl] Traceback (most recent call last):\n",
+        "[verl] RuntimeError: GRPO replay observed failed prompt 'b8984836' at global_steps=8\n",
+        'HEARTBEAT {"stage": "error_rl"}\n',
+    ]
+    proc = _FakeGrpoProcess(lines, wait_code=1, stale_return_code=0)
+    stream = rl_runner._GrpoSubprocessStream(proc)
+    list(stream)
+
+    with pytest.raises(RuntimeError) as exc_info:
+        stream.wait_and_classify()
+
+    message = str(exc_info.value)
+    assert message.startswith(
+        "verl.trainer.main_ppo exited 1: RuntimeError: GRPO replay observed failed prompt "
+        "'b8984836' at global_steps=8 (first failed rollout: RuntimeError: flash multi-turn bridge "
+        "could not serve /multiturn/step (HTTP 503): RuntimeError: MiniWoB browser service failed"
+    )
+    assert "see the flash log" not in message
+
+
+def test_grpo_unclassified_exit_reports_a_single_trainer_exception():
+    tail = backend_common.ChildOutputTail()
+    for line in (
+        "[verl] Traceback (most recent call last):\n",
+        "[verl]     raise RuntimeError(\n",
+        "[verl] RuntimeError: no trainable response tokens remain: every rollout was truncated\n",
+    ):
+        tail.record(line)
+
+    assert tail.failure_summary == (
+        "RuntimeError: no trainable response tokens remain: every rollout was truncated"
+    )
+
+
 def test_grpo_wait_is_bounded_so_a_pipe_holding_grandchild_cannot_park_the_attempt(monkeypatch):
     """The stream ends on stdout EOF, which is not the direct child's exit.
 

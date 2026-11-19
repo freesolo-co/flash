@@ -241,7 +241,18 @@ def _reserve_attempt_launch(
                     return LaunchReservationResult(None, active=True)
                 retry_state = RetryState.from_snapshot(spec, snapshot)
                 snapshot = retry_state.to_snapshot()
-                if recover_handleless and current:
+                # a replacement over a settled previous attempt (handleless recovery, or attach
+                # reconciliation resuming a captured remote whose teardown it just confirmed) may
+                # find that attempt never reached a decision: the control plane lost it mid-poll.
+                # record that loss as a poll error, bounded by the infrastructure budget, instead
+                # of refusing the authorization and failing a run that can resume from checkpoint.
+                if current and (
+                    recover_handleless
+                    or (
+                        expected_remote is not None
+                        and expected_remote.get("attempt") == current - 1
+                    )
+                ):
                     plan = retry_state.persisted_plan(current - 1)
                     if plan is None:
                         retry_state, plan = transition_failure(
@@ -252,7 +263,10 @@ def _reserve_attempt_launch(
                         snapshot = retry_state.to_snapshot()
                     if not plan.retry:
                         state._save_status_unlocked(status, _retry_state=snapshot)
-                        return LaunchReservationResult(None, retry_plan=plan)
+                        if recover_handleless:
+                            return LaunchReservationResult(None, retry_plan=plan)
+                        # attach callers fail the run on a raise; a quiet None would strand it.
+                        raise RuntimeError(f"attempt {current - 1} ended: {plan.action}")
                 reservation_raw = {**raw, state._RETRY_STATE_KEY: snapshot}
                 require_retry_authorization_from_raw(spec, reservation_raw, current)
                 if current >= MAX_ATTEMPT_ID:

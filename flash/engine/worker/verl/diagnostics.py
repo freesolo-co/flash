@@ -48,6 +48,14 @@ _FATAL_ROLLOUT_ENGINE_SIGNATURES = (
     "Engine core initialization failed",
 )
 
+# the final line of a python traceback (`RuntimeError: ...`, `urllib.error.HTTPError: ...`). an
+# unclassified exit otherwise reports only "exited 1" while the cause sits in console_rl.txt.
+_EXCEPTION_LINE = re.compile(r"(?<![\w.])(?:[A-Za-z_]\w*\.)*[A-Z]\w*(?:Error|Exception): \S")
+# the rollout that actually failed: verl's final raise only names the replayed prompt, while the
+# environment's own error (a 503 from its service, a reward KeyError) rides the bridge failure.
+_ROLLOUT_FAILURE_MARKER = "multi-turn bridge could not serve"
+_FAILURE_SUMMARY_CHARS = 300
+
 
 def _backend_common():
     """The parent module, imported lazily because it imports this one.
@@ -78,6 +86,17 @@ class ChildOutputTail:
         self._cuda_oom_allocation_detail: str | None = None
         self._host_ram_kill_evidence: str | None = None
         self._fatal_engine_signature: str | None = None
+        self._first_rollout_failure: str | None = None
+        self._last_exception: str | None = None
+
+    def _note_exception(self, line: str) -> None:
+        match = _EXCEPTION_LINE.search(line)
+        if match is None:
+            return
+        text = sanitize_diagnostic(line[match.start() :].strip(), limit=_FAILURE_SUMMARY_CHARS)
+        self._last_exception = text
+        if self._first_rollout_failure is None and _ROLLOUT_FAILURE_MARKER in text:
+            self._first_rollout_failure = text
 
     def record(self, line: str) -> None:
         if self._fatal_engine_signature is None:
@@ -104,6 +123,7 @@ class ChildOutputTail:
             from flash.engine.worker.perf.lifecycle import host_ram_kill_evidence
 
             self._host_ram_kill_evidence = host_ram_kill_evidence(line)
+        self._note_exception(line)
         text = line.rstrip("\n")
         if text:
             # sanitize before the per-line cap, not after: truncating first could split a credential
@@ -120,6 +140,14 @@ class ChildOutputTail:
     def retriable_infra_signature(self) -> str | None:
         """the first stable retriable-infrastructure signature observed in child output."""
         return self._retriable_infra_signature
+
+    @property
+    def failure_summary(self) -> str | None:
+        """the child's last exception line, plus the first failed rollout when it differs."""
+        last, rollout = self._last_exception, self._first_rollout_failure
+        if rollout is not None and rollout != last:
+            return f"{last} (first failed rollout: {rollout})" if last else rollout
+        return last
 
     @property
     def fatal_engine_signature(self) -> str | None:
