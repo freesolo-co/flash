@@ -16,6 +16,7 @@ import json
 import multiprocessing
 import time
 
+import httpx
 import regex as safe_regex
 from jsonschema import SchemaError, ValidationError
 from jsonschema.validators import validator_for
@@ -447,6 +448,24 @@ def _smoke_request_settings(spec: JobSpec) -> tuple[dict | None, int, list[str] 
     return constraint, max_tokens, stop_sequences or None
 
 
+# the serving edge answers 502/504 when an engine call fails or times out in transit (2026-11-18:
+# serve.freesolo.co returned `504 Gateway Timeout` to fixed-prompt smokes ~20 s in, failing the
+# deployment, and a redeploy of the same checkpoint then passed). the smoke is a deterministic,
+# side-effect-free request, so it is retried a bounded number of times inside its deadline; a
+# deployment whose every attempt hits the gateway error still fails, naming that error.
+_SMOKE_GATEWAY_RETRY_STATUSES = frozenset({502, 504})
+_SMOKE_GATEWAY_RETRIES = 3
+_SMOKE_GATEWAY_RETRY_DELAY_SECONDS = 5.0
+
+
+def _gateway_failure(exc: BaseException) -> bool:
+    return (
+        isinstance(exc, httpx.HTTPStatusError)
+        and exc.response is not None
+        and exc.response.status_code in _SMOKE_GATEWAY_RETRY_STATUSES
+    )
+
+
 def _bounded_smoke_chat(
     *,
     serving_model: str,
@@ -461,6 +480,7 @@ def _bounded_smoke_chat(
     budget_s: float,
     error_context: str | None = None,
 ) -> dict:
+    gateway_retries = 0
     while True:
         remaining = deadline - time.monotonic()
         if remaining <= 0:
@@ -497,6 +517,12 @@ def _bounded_smoke_chat(
         except ServingError:
             raise
         except Exception as exc:
+            if _gateway_failure(exc) and gateway_retries < _SMOKE_GATEWAY_RETRIES:
+                gateway_retries += 1
+                delay = _SMOKE_GATEWAY_RETRY_DELAY_SECONDS * gateway_retries
+                if deadline - time.monotonic() > delay:
+                    time.sleep(delay)
+                    continue
             if error_context is None:
                 raise
             raise ServingError(f"{error_context}: {exc}") from exc
