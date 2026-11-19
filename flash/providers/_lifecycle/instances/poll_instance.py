@@ -18,6 +18,10 @@ from dataclasses import dataclass
 from flash._internal.background import checkpoint, pause
 from flash.providers._lifecycle.instances.poll import (
     BOOT_LOG_ABSENT_POLLS,
+    BOOT_PROGRESS_BYTES_STEP,
+    BOOT_PROGRESS_FRESH_S,
+    BOOT_PROGRESS_MAX_S,
+    BOOT_PROGRESS_READ_S,
     FIRST_LIVENESS_OBSERVED_FLOOR_S,
     PollErrorTracker,
     heartbeat_progress_ts,
@@ -106,6 +110,10 @@ class InstancePollAdapter:
     # Spot: a host shutdown signal (the provider stopping a preemptible VM) is a preemption, so it
     # gets the budget-free requeue rather than spending the infrastructure retry budget.
     signal_interruption_is_preemption: bool = False
+    # Host-side boot progress before the worker exists ({"stage", "disk_used", "reason"}), or None
+    # when the provider's launcher reports none. A moving image pull extends the first-liveness window
+    # (up to BOOT_PROGRESS_MAX_S); a reported launcher failure ends the attempt at once.
+    boot_progress: Callable[[], dict | None] | None = None
 
 
 # Written by bootstrap.WorkerInterrupted when a host shutdown signal stops the worker.
@@ -361,6 +369,11 @@ class _PollState:
     liveness_seen: bool
     liveness_absent_polls: int
     missing_streak: int
+    boot_progress_key: tuple | None = None
+    boot_progress_changed_at: float | None = None
+    boot_progress_read_at: float | None = None
+    boot_progress_record: dict | None = None
+    boot_extension_announced: bool = False
 
 
 def _build_poll_context(
@@ -644,6 +657,71 @@ def _classify_load_timeout(
     return None
 
 
+def _boot_progress_key(record: dict) -> tuple:
+    used = record.get("disk_used")
+    bucket = (
+        int(used) // BOOT_PROGRESS_BYTES_STEP
+        if type(used) in (int, float) and math.isfinite(used) and used >= 0
+        else None
+    )
+    return (record.get("stage"), bucket)
+
+
+def _observe_boot_progress(ctx: _PollContext, state: _PollState) -> dict | None:
+    """Read the host launcher's progress (rate-limited) and date its last change by OUR clock.
+
+    The host's own timestamp is not trusted (VM clocks drift); a change is credited when this poller
+    first sees it, so a stale record cannot keep buying time.
+    """
+    reader = ctx.adapter.boot_progress
+    if reader is None:
+        return None
+    now = time.time()
+    if state.boot_progress_read_at is not None and (
+        now - state.boot_progress_read_at < BOOT_PROGRESS_READ_S
+    ):
+        return state.boot_progress_record
+    state.boot_progress_read_at = now
+    try:
+        record = reader()
+    except Exception:
+        record = None
+    if not isinstance(record, dict) or not isinstance(record.get("stage"), str):
+        return state.boot_progress_record
+    key = _boot_progress_key(record)
+    if key != state.boot_progress_key:
+        state.boot_progress_key = key
+        state.boot_progress_changed_at = now
+    state.boot_progress_record = record
+    return record
+
+
+def _boot_still_progressing(ctx: _PollContext, state: _PollState) -> bool:
+    """A VM whose launcher is still visibly moving (e.g. pulling the image) inside the hard cap."""
+    if state.boot_progress_changed_at is None:
+        return False
+    now = time.time()
+    if now - state.running_since > BOOT_PROGRESS_MAX_S:
+        return False
+    if now - state.boot_progress_changed_at > BOOT_PROGRESS_FRESH_S:
+        return False
+    record = state.boot_progress_record or {}
+    if not state.boot_extension_announced:
+        state.boot_extension_announced = True
+        used = record.get("disk_used")
+        size = (
+            f"; {used / 2**30:.1f} GiB on the image disk"
+            if type(used) in (int, float) and math.isfinite(used) and used >= 0
+            else ""
+        )
+        ctx.say(
+            f"VM still booting the worker (launcher stage {record.get('stage')}{size}); keeping it "
+            f"past the {int(ctx.first_liveness_s)}s first-liveness window while it makes progress "
+            f"(up to {int(BOOT_PROGRESS_MAX_S)}s after running)"
+        )
+    return True
+
+
 def _classify_running_stall(
     ctx: _PollContext,
     state: _PollState,
@@ -652,6 +730,17 @@ def _classify_running_stall(
     """decide whether a running worker lacks bootstrap or staged progress evidence."""
     if not state.became_running:
         return None
+    if not state.seen_fresh_hb and not state.liveness_seen:
+        record = _observe_boot_progress(ctx, state)
+        if isinstance(record, dict) and record.get("stage") == "failed":
+            # The launcher said it cannot start the worker (e.g. the image pull failed): waiting out
+            # the first-liveness window would only burn the boot slot.
+            reason = record.get("reason")
+            detail = reason if isinstance(reason, str) and reason else "host launcher failed"
+            return ctx.stalled_unless_terminal(
+                f"VM launcher reported failure before the worker started: {detail[:200]}",
+                ctx.adapter.first_liveness_failure,
+            )
     # after running without a heartbeat, consult early-liveness before declaring a stall: slow
     # installs and fetches can be healthy. latch positive bootstrap evidence; require silence for
     # BOOT_LOG_ABSENT_POLLS and respect the observed-running floor on reattach.
@@ -663,16 +752,24 @@ def _classify_running_stall(
         and time.time() - state.observed_running_since > FIRST_LIVENESS_OBSERVED_FLOOR_S
     ):
         if not ctx.adapter.early_liveness_alive():
-            # A lone absent read can be a transient log-API error -> require BOOT_LOG_ABSENT_POLLS.
-            state.liveness_absent_polls += 1
+            if _boot_still_progressing(ctx, state):
+                # The VM is slow, not dead (e.g. a congested image pull): killing it restarts the
+                # pull from zero on a new VM after another queue wait and boot.
+                state.liveness_absent_polls = 0
+            else:
+                # A lone absent read can be a transient log-API error -> require BOOT_LOG_ABSENT_POLLS.
+                state.liveness_absent_polls += 1
             if state.liveness_absent_polls >= BOOT_LOG_ABSENT_POLLS:
-                return ctx.stalled_unless_terminal(
-                    ctx.adapter.first_liveness_detail(
-                        time.time() - state.running_since,
-                        ctx.first_liveness_s,
-                    ),
-                    ctx.adapter.first_liveness_failure,
+                detail = ctx.adapter.first_liveness_detail(
+                    time.time() - state.running_since,
+                    ctx.first_liveness_s,
                 )
+                if state.boot_progress_record is not None and state.boot_progress_changed_at:
+                    detail += (
+                        f"; VM launcher last at stage {state.boot_progress_record.get('stage')}, "
+                        f"no progress for {int(time.time() - state.boot_progress_changed_at)}s"
+                    )
+                return ctx.stalled_unless_terminal(detail, ctx.adapter.first_liveness_failure)
         else:
             # Bootstrap is producing output -> healthy slow cold start; setup/stall below backstop.
             state.liveness_seen = True

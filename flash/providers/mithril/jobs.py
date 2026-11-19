@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+import json
 import time
 
 from flash._internal.background import TaskStopped
@@ -30,6 +31,34 @@ from flash.providers.mithril.handles import SpotJobHandle, require_scope
 from flash.providers.mithril.pricing import hourly_rate
 from flash.runner.supervise.errors import _RunCancelled
 from flash.runner.supervise.retry_decision import BOOT_STALL_FAILURE, BOOT_TIMEOUT_FAILURE
+
+
+def boot_progress_reader(spec, attempt, *, deadline_at=None):
+    """Read the host launcher's per-attempt progress blob (see ``bootstrap.WORKER``); None if absent.
+
+    Bids launched before the launcher reported progress have no blob and keep the plain
+    first-liveness window.
+    """
+    from flash.artifacts.config import open_container
+    from flash.artifacts.storage import BlobArtifacts
+    from flash.providers.mithril.bootstrap import boot_progress_blob
+
+    name = boot_progress_blob(spec.train.hf_repo, spec.phase, spec.run_id, attempt)
+
+    def read():
+        if deadline_at is not None and time.time() >= deadline_at:
+            return None
+        try:
+            with open_container() as container:
+                raw, _ = BlobArtifacts(container).read(name, 4096)
+            record = json.loads(raw)
+        except Exception:
+            # absent (not reported yet), unreadable or malformed: no evidence either way.
+            return None
+        return record if isinstance(record, dict) else None
+
+    return read
+
 
 # A filled Mithril bid allocates, images and boots a VM before it reports running; that has
 # taken over 15 minutes, so allow 30 before treating the machine as faulty and rebidding.
@@ -91,6 +120,7 @@ def poll(handle, spec, *, log=None, deadline_at=None):
         load_timeout_failure=BOOT_TIMEOUT_FAILURE,
         first_liveness_failure=BOOT_STALL_FAILURE,
         signal_interruption_is_preemption=True,
+        boot_progress=boot_progress_reader(spec, h.attempt, deadline_at=deadline_at),
     )
     return poll_instance_job(
         adapter,

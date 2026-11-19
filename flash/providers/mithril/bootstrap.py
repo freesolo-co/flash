@@ -38,6 +38,11 @@ def publish_capsule(payload, capsule, *, deadline_at):
     return _publish(payload, capsule, "pyz", deadline_at=deadline_at)
 
 
+def boot_progress_blob(hf_repo, phase, run_id, attempt):
+    """Where the host launcher reports its pre-worker progress (image pull) for one attempt."""
+    return f"{repo_prefix(hf_repo)}/{phase}/{run_id}/mithril_boot_{attempt}.json"
+
+
 def startup_script(payload, capsule, image, *, owner_line, deadline_at):
     capsule_ref = publish_capsule(payload, capsule, deadline_at=deadline_at)
     bundle = {
@@ -46,6 +51,9 @@ def startup_script(payload, capsule, image, *, owner_line, deadline_at):
         "image": image,
         "deadline_at": deadline_at,
         "claim_blob": f"{repo_prefix(payload['hf_repo'])}/{payload['phase']}/{payload['run_id']}/mithril_claim_{payload['attempt']}",
+        "boot_blob": boot_progress_blob(
+            payload["hf_repo"], payload["phase"], payload["run_id"], payload["attempt"]
+        ),
     }
     # Large source descriptors and runtime secrets stay in private storage, not the API's script.
     source = "BUNDLE = " + repr(bundle) + "\n" + WORKER
@@ -85,13 +93,56 @@ except Exception:
 subprocess.run(['python3',str(path)],check=True)
 """
 
-WORKER = """import hashlib,json,os,pathlib,subprocess,time,urllib.request,urllib.parse
+# The worker image is ~16 GiB compressed and every Spot VM pulls it cold. Until the worker starts,
+# the control plane sees nothing from the box, so the launcher reports its own progress to a small
+# per-attempt blob: the stage, and the bytes on the image disk while the pull runs. The poller keeps
+# a VM whose pull is still moving and fails fast on a reported launcher failure. Reasons are fixed
+# strings, never exception text (URLs carry SAS credentials).
+WORKER = """import hashlib,json,os,pathlib,shutil,subprocess,threading,time,urllib.request,urllib.parse
 os.umask(0o077)
 root=pathlib.Path('/opt/flash')
 payload=BUNDLE['payload']
 sas=urllib.parse.urlsplit(payload['env']['FLASH_ARTIFACT_BLOB_SAS_URL'])
 def blob_url(blob):
     return urllib.parse.urlunsplit((sas.scheme,sas.netloc,sas.path+'/'+urllib.parse.quote(blob,safe='/'),sas.query,''))
+boot={'stage':'unclaimed','reason':''}
+def report():
+    if not BUNDLE.get('boot_blob'):
+        return
+    try:
+        used=shutil.disk_usage('/mnt/local').used
+    except OSError:
+        used=None
+    body=json.dumps({'stage':boot['stage'],'reason':boot['reason'],'disk_used':used,'ts':time.time()}).encode()
+    try:
+        put=urllib.request.Request(blob_url(BUNDLE['boot_blob']),data=body,method='PUT',
+            headers={'x-ms-blob-type':'BlockBlob','x-ms-version':'2023-11-03'})
+        with urllib.request.urlopen(put,timeout=30):
+            pass
+    except Exception:
+        pass
+def stage(name,reason=''):
+    boot['stage'],boot['reason']=name,reason
+    report()
+def pull(image):
+    # Report the image disk while the pull runs; retry a failed pull (registry blips) a few times.
+    done=threading.Event()
+    def beat():
+        while not done.wait(60):
+            report()
+    threading.Thread(target=beat,daemon=True).start()
+    try:
+        for tries in range(3):
+            if time.time() >= BUNDLE['deadline_at']:
+                break
+            if subprocess.run(['docker','pull','--quiet',image],stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,check=False).returncode==0:
+                return
+            time.sleep(15*(tries+1))
+    finally:
+        done.set()
+    stage('failed','worker image pull failed')
+    raise RuntimeError('worker image pull failed')
 def run():
     if time.time() >= BUNDLE['deadline_at']:
         raise RuntimeError('deadline reached')
@@ -100,6 +151,7 @@ def run():
         headers={'x-ms-blob-type':'BlockBlob','If-None-Match':'*','x-ms-version':'2023-11-03'})
     with urllib.request.urlopen(claim,timeout=60):
         pass
+    stage('claimed')
     with urllib.request.urlopen(blob_url(BUNDLE['capsule']['blob']),timeout=60) as response:
         data=response.read(8*1024*1024)
     if hashlib.sha256(data).hexdigest()!=BUNDLE['capsule']['sha256']:
@@ -116,6 +168,9 @@ def run():
     daemon.parent.mkdir(parents=True,exist_ok=True)
     daemon.write_text(json.dumps(config))
     subprocess.run(['systemctl','restart','docker'],check=True,timeout=60)
+    stage('pulling_image')
+    pull(BUNDLE['image'])
+    stage('starting_worker')
     custom=json.loads(payload['job_spec_json']).get('algorithm')=='custom'
     if custom:
         subprocess.Popen(['foundrypf','8000'],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
@@ -138,6 +193,9 @@ try:
 except Exception:
     # URLs can contain SAS credentials: never print a host traceback.
     print('Flash worker bootstrap failed',flush=True)
+    # Only the VM that owns the claim reports; once the worker runs, its own markers speak.
+    if boot['stage'] in ('claimed','pulling_image'):
+        stage('failed','host launcher failed at '+boot['stage'])
 finally:
     subprocess.run(['shutdown','-h','now'],check=False)
 """
