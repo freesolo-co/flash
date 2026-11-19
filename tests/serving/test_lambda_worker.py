@@ -324,3 +324,31 @@ def test_worker_failure_names_status_and_fixed_kind_only(response, status, detai
         check_response(response)
     assert str(excinfo.value) == f"Lambda worker request failed {detail}"
     assert excinfo.value.status_code == status
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("code", "body", "status", "detail"),
+    [
+        (401, {"error": "unauthorized"}, 502, "(HTTP 401, kind=unauthorized)"),
+        (504, {"kind": "timeout"}, 504, "(HTTP 504, kind=timeout)"),
+    ],
+)
+async def test_stream_failure_reads_error_body_before_naming_kind(tls, code, body, status, detail):
+    async def chunks():
+        yield json.dumps(body).encode()
+
+    async def handler(request):
+        if request.url.path == "/lease":
+            return httpx.Response(200, json={"ok": True})
+        # A truly streamed body stays unread under send(stream=True), like a real socket.
+        return httpx.Response(code, content=chunks())
+
+    transport = WorkerTransport("8.8.8.8", tls, transport=httpx.MockTransport(handler))
+    try:
+        with pytest.raises(WorkerError) as excinfo:
+            _ = [event async for event in transport.stream({"generation_id": "test"})]
+    finally:
+        await transport.aclose()
+    assert str(excinfo.value) == f"Lambda worker request failed {detail}"
+    assert excinfo.value.status_code == status

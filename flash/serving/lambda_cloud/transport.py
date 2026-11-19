@@ -111,6 +111,8 @@ class WorkerTransport:
         lease_task = asyncio.create_task(self._renew_lease(body["generation_id"]))
         try:
             response = await self.client.send(self.request("POST", "/stream", body), stream=True)
+            if response.status_code != 200:
+                await response.aread()  # check_response parses the error body
             check_response(response)
             async for line in response.aiter_lines():
                 if not line:
