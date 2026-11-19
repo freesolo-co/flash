@@ -46,9 +46,9 @@ class API:
     async def call(self, method, path, body=None):
         if path == "instance-types":
             return {
-                "gpu_1x_a10": {
+                "gpu_1x_h100_pcie": {
                     "instance_type": {
-                        "gpu_description": "A10 (24 GB PCIe)",
+                        "gpu_description": "H100 (80 GB PCIe)",
                         "architecture": "x86_64",
                         "specs": {"gpus": 1},
                         "price_cents_per_hour": 400,
@@ -60,7 +60,7 @@ class API:
             return [] if method == "GET" else {"id": "resource"}
         if path == "instance-operations/launch":
             self.launches += 1
-            assert body["instance_type_name"] == "gpu_1x_a10"
+            assert body["instance_type_name"] == "gpu_1x_h100_pcie"
             assert body["file_system_mounts"][0]["mount_point"] == "/data/hosting-cache"
             assert body["firewall_rulesets"]
             self.instances.append(
@@ -132,7 +132,7 @@ async def test_release_finds_vm_after_launch_response_loss():
 
 
 def test_hardware_choices_and_capacity_fail_closed():
-    assert placements(MODEL) == ("A10",)
+    assert placements(MODEL) == ("H100",)
     assert placements("Qwen/Qwen3.6-35B-A3B") == ("H200", "B200")
     with pytest.raises(ValueError, match="only defined"):
         placements("deepseek-ai/DeepSeek-V4.1-Flash-1017")
@@ -182,7 +182,7 @@ async def test_custom_model_maximum_is_enforced_independently(monkeypatch):
     from flash.serving.app.inference_provider import MODEL_POLICIES, ModelPolicy
 
     monkeypatch.setitem(
-        MODEL_POLICIES, MODEL, ModelPolicy(min_capacity=1, max_capacity=3, lambda_gpus=("A10",))
+        MODEL_POLICIES, MODEL, ModelPolicy(min_capacity=1, max_capacity=3, lambda_gpus=("H100",))
     )
     api, ledger = API(), Ledger()
     fleet = Fleet(api, ledger, "dev", clock=lambda: 100)
@@ -231,7 +231,7 @@ async def test_only_fresh_validated_health_counts_as_ready():
     fleet = Fleet(API(), ledger, "dev", clock=lambda: now[0])
     await fleet.launch(OWNER, MODEL, "bootstrap", "b" * 40)
     assert await fleet.ready_count(MODEL) == 0
-    health = {"ok": True, "base_model": MODEL, "deployment_sha": "b" * 40, "configured_gpu": "A10"}
+    health = {"ok": True, "base_model": MODEL, "deployment_sha": "b" * 40, "configured_gpu": "H100"}
     await fleet.heartbeat(OWNER, health)
     assert await fleet.ready_count(MODEL) == 1
     now[0] += 91

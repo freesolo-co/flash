@@ -1169,7 +1169,12 @@ def test_generation_request_revalidates_tools_and_rejects_tool_images() -> None:
                 FunctionTool(
                     "weather",
                     None,
-                    {"type": "object", "properties": {}, "required": []},
+                    {
+                        "type": "object",
+                        "properties": {},
+                        "required": [],
+                        "additionalProperties": True,
+                    },
                 ),
             ),
             tool_choice="auto",
