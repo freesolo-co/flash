@@ -272,3 +272,94 @@ async def test_routing_skips_quarantined_worker(monkeypatch, mod):
     assert engines[3].call_count == 0
     assert all(e.call_count == 3 for e in engines[:3])
     assert len(picks) == 9
+
+
+DAY = 86400
+
+
+class LedgerStore(MemoryStore):
+    async def put_if_absent(self, key, value):
+        if key in self.data:
+            return False
+        self.data[key] = value
+        return True
+
+    async def pop(self, key):
+        return self.data.pop(key, None)
+
+
+def reservation(mode, hold_until):
+    return {"campaign": "c", "mode": mode, "hold_until": hold_until, "slots": []}
+
+
+def test_serving_hold_renews_before_it_can_lapse():
+    state, event = wd.renew_hold(reservation("serving", 1000 + 2 * DAY), 1000)
+    assert state["hold_until"] == 1000 + wd.HOLD_EXTENSION_SECONDS
+    assert state["hold_renewed_at"] == 1000
+    assert event.startswith("renewed")
+    # Far enough ahead: untouched, no log noise.
+    far = reservation("serving", 1000 + 20 * DAY)
+    assert wd.renew_hold(far, 1000) == (far, None)
+
+
+def test_non_serving_hold_alerts_within_a_day_and_closed_is_ignored():
+    state = reservation("reserve_only", 1000 + 3600)
+    renewed, event = wd.renew_hold(state, 1000)
+    assert renewed is state
+    assert event.startswith("alert")
+    assert "1.0h" in event
+    assert wd.renew_hold(reservation("closed", 0), 1000) == (reservation("closed", 0), None)
+    assert wd.renew_hold(None, 1000) == (None, None)
+
+
+def test_renew_reservation_takes_the_scheduler_tick_lock():
+    ledger = LedgerStore({"state": reservation("serving", 1000 + DAY)})
+    event = asyncio.run(wd.renew_reservation(ledger, clock=lambda: 1000))
+    assert event.startswith("renewed")
+    assert ledger.data["state"]["hold_until"] == 1000 + wd.HOLD_EXTENSION_SECONDS
+    assert "tick_lock" not in ledger.data
+
+
+def test_renew_reservation_defers_while_scheduler_ticks(capsys):
+    held = {"token": "scheduler", "at": 999}
+    ledger = LedgerStore({"state": reservation("serving", 1000 + 3600), "tick_lock": held})
+    assert asyncio.run(wd.renew_reservation(ledger, clock=lambda: 1000)) is None
+    assert ledger.data["state"]["hold_until"] == 1000 + 3600
+    assert ledger.data["tick_lock"] == held
+    # Inside the alert window the deferred renewal still alerts.
+    assert "alert: hold expires in 1.0h" in capsys.readouterr().out
+    ledger.data["state"]["hold_until"] = 1000 + 20 * DAY
+    asyncio.run(wd.renew_reservation(ledger, clock=lambda: 1000))
+    assert "alert" not in capsys.readouterr().out
+
+
+def test_renew_reservation_replaces_a_stale_tick_lock(capsys):
+    stale = {"token": "dead-tick", "at": 0}
+    ledger = LedgerStore({"state": reservation("serving", 1000 + DAY), "tick_lock": stale})
+    now = wd.TICK_LOCK_STALE_SECONDS + 1
+    event = asyncio.run(wd.renew_reservation(ledger, clock=lambda: now))
+    assert event.startswith("renewed")
+    assert ledger.data["state"]["hold_until"] == now + wd.HOLD_EXTENSION_SECONDS
+    # The stale lock is released too, which also unblocks the scheduler.
+    assert "tick_lock" not in ledger.data
+    assert "stale reservation tick_lock" in capsys.readouterr().out
+
+
+class VanishingLockLedger(LedgerStore):
+    """put_if_absent fails, then the first read finds no lock: the scheduler released it and
+    a new tick took it again before the watchdog could act."""
+
+    async def get(self, key):
+        if key == "tick_lock" and not getattr(self, "raced", False):
+            self.raced = True
+            return None
+        return await super().get(key)
+
+
+def test_renew_reservation_retries_atomically_when_the_lock_vanishes():
+    live = {"token": "scheduler", "at": 1000}
+    ledger = VanishingLockLedger({"state": reservation("serving", 1000 + DAY), "tick_lock": live})
+    assert asyncio.run(wd.renew_reservation(ledger, clock=lambda: 1000)) is None
+    # The live scheduler lock is never overwritten, and the state is left to the scheduler.
+    assert ledger.data["tick_lock"] == live
+    assert ledger.data["state"]["hold_until"] == 1000 + DAY
