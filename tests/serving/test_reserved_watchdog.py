@@ -343,3 +343,23 @@ def test_renew_reservation_replaces_a_stale_tick_lock(capsys):
     # The stale lock is released too, which also unblocks the scheduler.
     assert "tick_lock" not in ledger.data
     assert "stale reservation tick_lock" in capsys.readouterr().out
+
+
+class VanishingLockLedger(LedgerStore):
+    """put_if_absent fails, then the first read finds no lock: the scheduler released it and
+    a new tick took it again before the watchdog could act."""
+
+    async def get(self, key):
+        if key == "tick_lock" and not getattr(self, "raced", False):
+            self.raced = True
+            return None
+        return await super().get(key)
+
+
+def test_renew_reservation_retries_atomically_when_the_lock_vanishes():
+    live = {"token": "scheduler", "at": 1000}
+    ledger = VanishingLockLedger({"state": reservation("serving", 1000 + DAY), "tick_lock": live})
+    assert asyncio.run(wd.renew_reservation(ledger, clock=lambda: 1000)) is None
+    # The live scheduler lock is never overwritten, and the state is left to the scheduler.
+    assert ledger.data["tick_lock"] == live
+    assert ledger.data["state"]["hold_until"] == 1000 + DAY

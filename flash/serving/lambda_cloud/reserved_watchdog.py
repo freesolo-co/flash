@@ -216,15 +216,14 @@ async def renew_reservation(ledger, *, clock=time.time):
     if not acquired:
         held = await ledger.get("tick_lock")
         held_at = (held or {}).get("at")
-        if held is None or (
-            isinstance(held_at, (int, float)) and clock() - held_at > TICK_LOCK_STALE_SECONDS
-        ):
-            print(
-                f"reserved H100 alert: replacing stale reservation tick_lock {held!r}", flush=True
-            )
-            await ledger.put("tick_lock", lock)
-            # Another watchdog or tick may have raced the takeover; only the winner proceeds.
-            acquired = ((await ledger.get("tick_lock")) or {}).get("token") == token
+        stale = isinstance(held_at, (int, float)) and clock() - held_at > TICK_LOCK_STALE_SECONDS
+        # Modal Dicts have no compare-and-swap: drop only the stale lock we saw (re-read first),
+        # then contend with put_if_absent like everyone else, so a lock taken meanwhile wins.
+        if stale and ((await ledger.get("tick_lock")) or {}).get("token") == held.get("token"):
+            print(f"reserved H100 alert: dropping stale reservation tick_lock {held!r}", flush=True)
+            await ledger.pop("tick_lock")
+        if held is None or stale:
+            acquired = await ledger.put_if_absent("tick_lock", lock)
     if not acquired:
         state = await ledger.get("state")
         hold_until = (state or {}).get("hold_until")
