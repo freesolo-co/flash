@@ -177,6 +177,7 @@ def test_train_key_registry_is_derived_from_trainspec_metadata() -> None:
     assert TRAIN_KEY_MIN_VERSIONS["prompts_per_step"] == "1.1.43"
     assert TRAIN_KEY_MIN_VERSIONS["batch_size"] == "0.2.0"
     assert TRAIN_KEY_MIN_VERSIONS["mask_truncated_completions"] == "1.3.33"
+    assert TRAIN_KEY_MIN_VERSIONS["zero_signal_abort_steps"] == "1.4.56"
     assert {
         value
         for key, value in TRAIN_KEY_MIN_VERSIONS.items()
@@ -190,6 +191,7 @@ def test_train_key_registry_is_derived_from_trainspec_metadata() -> None:
             "lora_alpha",
             "prompts_per_step",
             "mask_truncated_completions",
+            "zero_signal_abort_steps",
         }
     } == {"0.2.0"}
 

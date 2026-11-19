@@ -34,6 +34,7 @@ from flash.engine.worker.train.entry.backend_common import (
 )
 from flash.engine.worker.train.entry.rl_train_runner import (
     _announce_training,
+    _arm_signal_guard,
     _build_rl_child_env,
     _execute_rl_child,
     _export_final_adapter,
@@ -353,6 +354,8 @@ def run_rl_train(*, context: WorkerContext):
             final_step=expected_steps,
             context=context,
         )
+        # after the uploader: restoring a resume checkpoint installs its prior positive evidence.
+        _arm_signal_guard(state, inp, files, reward_runtime)
         env_for_verl = _build_rl_child_env(
             inp, files, loggers, reward_runtime.reward_url, context=context
         )

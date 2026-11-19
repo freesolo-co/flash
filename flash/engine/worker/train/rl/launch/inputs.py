@@ -49,6 +49,7 @@ from flash.engine.worker.train.entry.backend_common import (
     clamp_engine_len,
     model_max_position_embeddings,
 )
+from flash.engine.worker.train.rl.launch.signal_guard import resolve_zero_signal_abort_steps
 from flash.engine.worker.train.rl.launch.verl_config import (
     _processor_expanded_prompt,
     _verl_epochs_for_horizon,
@@ -497,6 +498,7 @@ def _assemble_grpo_inputs(
             int(schedule["prompts_per_step"]) * int(options["group_size"]),
         ),
         "mask_truncated_completions": options["mask_truncated_completions"],
+        "zero_signal_abort_steps": options["zero_signal_abort_steps"],
         "temperature": options["temperature"],
         "top_p": float(RECIPE.rl.sampling_top_p),
         "think_penalty": options["think_penalty"],
@@ -548,6 +550,7 @@ def _resolve_grpo_inputs(*, context: WorkerContext):
 
     mask_truncated_completions = _worker_config.grpo_mask_truncated_completions(_t)
     options["mask_truncated_completions"] = mask_truncated_completions
+    options["zero_signal_abort_steps"] = resolve_zero_signal_abort_steps(_t)
     warmstart_adapter = ""
     if _t and getattr(_t, "init_from_adapter", ""):
         from flash.engine.worker.model.adapter import _download_adapter
