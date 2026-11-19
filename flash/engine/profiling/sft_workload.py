@@ -50,6 +50,7 @@ from flash.engine.worker.model.packing import (
     probe_is_gdn_hybrid,
     probe_is_pure_attention,
 )
+from flash.envs.loading.sft_targets import decode_tool_call_arguments
 
 
 @dataclass
@@ -898,6 +899,10 @@ def prepare_sft_workload(
         else:
             prompt_messages = env.prompt_messages(example)
         completion_messages, coerced_scalar_output = _sft_completion_with_provenance(env, example)
+        prompt_messages = decode_tool_call_arguments(prompt_messages, row_id=example.get("id"))
+        completion_messages = decode_tool_call_arguments(
+            completion_messages, row_id=example.get("id")
+        )
         sft_tools.reject_image_row_tools(
             example,
             image_bearing=record_has_images(example, prompt_messages)

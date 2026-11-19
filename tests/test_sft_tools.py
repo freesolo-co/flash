@@ -262,3 +262,58 @@ def test_qwen35_training_text_is_the_served_prompt_plus_the_target() -> None:
     assert "# Tools" not in supervised
     assert "policy" not in supervised
     assert "my email is" not in supervised
+
+
+class ItemsTemplateTokenizer(RecordingToolTokenizer):
+    """Iterates tool-call arguments with jinja's ``items`` filter, as the Qwen3.5 template does."""
+
+    def apply_chat_template(self, messages, **kwargs):
+        import jinja2
+
+        template = jinja2.Environment().from_string(
+            "{% for m in messages %}{% for c in m.tool_calls or [] %}"
+            "<{{ c.function.name }}{% for k, v in c.function.arguments|items %} {{ k }}={{ v }}"
+            "{% endfor %}>{% endfor %}{% endfor %}"
+        )
+        return template.render(messages=messages) + super().apply_chat_template(messages, **kwargs)
+
+
+def _tool_call_row(arguments):
+    call = {"id": "c1", "type": "function"}
+    call["function"] = {"name": "find_user_id_by_email", "arguments": arguments}
+    history = {"role": "assistant", "content": "", "tool_calls": [call]}
+    return {
+        **_row(tools=TOOLS),
+        "prompt_messages": [*_row()["prompt_messages"], history, {"role": "tool", "content": "u1"}],
+        "output": {"messages": [{"role": "assistant", "content": "", "tool_calls": [call]}]},
+    }
+
+
+class OutputEnvironment(ToolRowEnvironment):
+    def sft_completion(self, row):
+        return row["output"]["messages"]
+
+
+def _prepare_output(rows):
+    return prepare_sft_workload(
+        _spec(),
+        OutputEnvironment(rows),
+        tokenizer_loader=lambda *_: ItemsTemplateTokenizer(),
+        producer_version="1.2.3",
+        packing_support=lambda *_: ("pure-attention", True),
+    )
+
+
+def test_json_string_tool_call_arguments_render_as_the_mapping_the_template_iterates() -> None:
+    # OpenAI-format data stores arguments as a JSON string; the template iterates `arguments|items`
+    as_string = _prepare_output([_tool_call_row('{"email": "a@b.c"}')])
+    as_mapping = _prepare_output([_tool_call_row({"email": "a@b.c"})])
+
+    assert as_string.sampled_texts == as_mapping.sampled_texts
+    assert as_string.sampled_texts[0].count("<find_user_id_by_email email=a@b.c>") == 2
+
+
+@pytest.mark.parametrize("arguments", ["not json", '["a@b.c"]', '"a@b.c"'])
+def test_tool_call_arguments_that_are_not_a_json_object_fail_the_profile(arguments) -> None:
+    with pytest.raises(ValueError, match=r"arguments must be a JSON object"):
+        _prepare_output([_tool_call_row(arguments)])
