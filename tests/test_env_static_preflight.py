@@ -176,6 +176,72 @@ def test_dataset_as_a_property_passes(tmp_path):
     check_environment_package(_package(tmp_path, as_property))
 
 
+_ALTERNATIVE = textwrap.dedent(
+    """
+    class Legacy(EnvironmentSingleTurn):
+        image_observations = True
+
+    def load_environment(use_legacy=False, **kwargs):
+        if use_legacy:
+            return Legacy()
+        return Env(**kwargs)
+"""
+)
+
+
+def test_an_unselected_factory_branch_is_not_judged(tmp_path):
+    # Legacy is incomplete and multimodal, but only a branch that may not run builds it.
+    source = _GOOD.replace("def load_environment(**kwargs):\n    return Env(**kwargs)\n", "")
+    facts = check_environment_package(_package(tmp_path, source + _ALTERNATIVE))
+
+    assert facts == StaticEnvironmentFacts()
+
+
+def test_the_unconditionally_built_class_is_still_judged(tmp_path):
+    source = _GOOD.replace("def score_response(", "def _unused(").replace(
+        "def load_environment(**kwargs):\n    return Env(**kwargs)\n",
+        "def load_environment(**kwargs):\n    env = Env(**kwargs)\n    return env\n",
+    )
+
+    with pytest.raises(EnvironmentPreflightError, match=r"abstract class Env .*'score_response'"):
+        check_environment_package(_package(tmp_path, source))
+
+
+_INHERITED_DATASET = """
+    from freesolo.environments import EnvironmentSingleTurn, RewardResult
+
+    class Base(EnvironmentSingleTurn):
+        def dataset(self):
+            return []
+
+        def build_prompt_messages(self, example, prompt_text):
+            return []
+
+        def score_response(self, example, response_text):
+            return RewardResult(score=0.0)
+
+    class Env(Base):
+        OVERRIDE
+
+    def load_environment(**kwargs):
+        return Env()
+"""
+
+
+def test_a_subclass_property_overriding_a_base_dataset_method_passes(tmp_path):
+    source = _INHERITED_DATASET.replace(
+        "OVERRIDE", "@property\n        def dataset(self):\n            return [1]"
+    )
+    check_environment_package(_package(tmp_path, source))
+
+
+def test_an_inherited_dataset_method_is_still_rejected(tmp_path):
+    source = _INHERITED_DATASET.replace("OVERRIDE", "pass")
+
+    with pytest.raises(EnvironmentPreflightError, match=r"Base\.dataset is a method"):
+        check_environment_package(_package(tmp_path, source))
+
+
 def test_image_observations_is_reported_for_the_built_class(tmp_path):
     source = _GOOD.replace(
         "class Env(EnvironmentSingleTurn):\n",

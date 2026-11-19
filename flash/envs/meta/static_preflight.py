@@ -195,20 +195,55 @@ def _class_level_names(node: ast.ClassDef) -> set[str] | None:
     return names
 
 
-def _built_classes(tree: ast.Module, resolver: _ClassResolver) -> list[str]:
-    """local classes that ``load_environment()`` instantiates directly."""
-    for node in tree.body:
-        if isinstance(node, ast.FunctionDef) and node.name == "load_environment":
-            return sorted(
-                {
-                    call.func.id
-                    for call in ast.walk(node)
-                    if isinstance(call, ast.Call)
-                    and isinstance(call.func, ast.Name)
-                    and call.func.id in resolver.classes
-                }
-            )
-    return []
+def _may_return(stmt: ast.stmt) -> bool:
+    """whether ``stmt`` contains a ``return`` of the enclosing function (nested defs excluded)."""
+    pending: list[ast.AST] = [stmt]
+    while pending:
+        node = pending.pop()
+        if isinstance(node, ast.Return):
+            return True
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)):
+            pending.extend(ast.iter_child_nodes(node))
+    return False
+
+
+def _local_call(expr: ast.expr | None, resolver: _ClassResolver) -> str | None:
+    if (
+        isinstance(expr, ast.Call)
+        and isinstance(expr.func, ast.Name)
+        and expr.func.id in resolver.classes
+    ):
+        return expr.func.id
+    return None
+
+
+def _built_class(tree: ast.Module, resolver: _ClassResolver) -> str | None:
+    """the local class ``load_environment()`` provably constructs and returns, else None.
+
+    Only straight-line code counts: the first top-level ``return Cls(...)`` (or ``env =
+    Cls(...)`` then ``return env``) with no earlier statement that could return instead.
+    Anything conditional or unresolved abstains, since an unselected branch never runs.
+    """
+    func = next(
+        (n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "load_environment"),
+        None,
+    )
+    bound: dict[str, str] = {}
+    for stmt in func.body if func is not None else []:
+        if isinstance(stmt, ast.Return):
+            if isinstance(stmt.value, ast.Name):
+                return bound.get(stmt.value.id)
+            return _local_call(stmt.value, resolver)
+        if _may_return(stmt):
+            return None
+        if isinstance(stmt, ast.Assign):
+            built = _local_call(stmt.value, resolver)
+            for target in stmt.targets:
+                if isinstance(target, ast.Name):
+                    bound.pop(target.id, None)
+                    if built is not None and len(stmt.targets) == 1:
+                        bound[target.id] = built
+    return None
 
 
 def _assigns_dataset_attribute(tree: ast.Module) -> bool:
@@ -234,8 +269,58 @@ def _declares_image_observations(local: list[ast.ClassDef]) -> bool:
     return False
 
 
+def _dataset_binding(node: ast.ClassDef) -> ast.stmt | None:
+    """the last statement in a class body that binds ``dataset`` (the one Python keeps)."""
+    found = None
+    for stmt in node.body:
+        if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            names = [stmt.name]
+        elif isinstance(stmt, ast.Assign):
+            names = [t.id for t in stmt.targets if isinstance(t, ast.Name)]
+        elif isinstance(stmt, ast.AnnAssign) and isinstance(stmt.target, ast.Name):
+            names = [stmt.target.id]
+        else:
+            continue
+        if "dataset" in names:
+            found = stmt
+    return found
+
+
+def _dataset_method_findings(node: ast.ClassDef, resolver: _ClassResolver) -> list[str]:
+    """follow the built class's inheritance to the ``dataset`` binding Python resolves.
+
+    Only a single local inheritance line is followed (the SDK bases define no ``dataset``);
+    multiple local bases or a conditionally bound class body abstain.
+    """
+    while _class_level_names(node) is not None:
+        stmt = _dataset_binding(node)
+        if stmt is not None:
+            if (
+                isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef))
+                and not stmt.decorator_list
+            ):
+                message = (
+                    f"environment.py line {stmt.lineno}: {node.name}.dataset is a method, but "
+                    "Flash reads `dataset` as the row sequence itself (iterating it raises "
+                    "TypeError: 'method' object is not iterable). Assign the rows instead, e.g. "
+                    "`self.dataset = load_task_examples(path)`, or decorate it with @property"
+                )
+                return [message]
+            return []
+        bases = [b.id for b in node.bases if isinstance(b, ast.Name) and b.id in resolver.classes]
+        if len(bases) != 1:
+            return []
+        node = resolver.classes[bases[0]]
+    return []
+
+
 def _class_findings(
-    name: str, local: list[ast.ClassDef], sdk: list[type], *, dataset_assigned: bool
+    name: str,
+    local: list[ast.ClassDef],
+    sdk: list[type],
+    resolver: _ClassResolver,
+    *,
+    dataset_assigned: bool,
 ) -> list[str]:
     from freesolo.environments import EnvironmentMultiTurn, EnvironmentSingleTurn
 
@@ -258,17 +343,7 @@ def _class_findings(
                 f"{sdk[0].__name__})"
             )
     if not dataset_assigned:
-        findings.extend(
-            f"environment.py line {stmt.lineno}: {node.name}.dataset is a method, but Flash "
-            "reads `dataset` as the row sequence itself (iterating it raises TypeError: 'method' "
-            "object is not iterable). Assign the rows instead, e.g. "
-            "`self.dataset = load_task_examples(path)`, or decorate it with @property"
-            for node in local
-            for stmt in node.body
-            if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef))
-            and stmt.name == "dataset"
-            and not stmt.decorator_list
-        )
+        findings.extend(_dataset_method_findings(local[0], resolver))
     return findings
 
 
@@ -284,15 +359,16 @@ def check_environment_package(
     check_classes = check_sdk_imports and not findings
     resolver = _ClassResolver(tree)
     dataset_assigned = _assigns_dataset_attribute(tree)
-    for name in _built_classes(tree, resolver):
-        resolved = resolver.chain(name)
-        if resolved is None or not resolved[1]:
-            continue
+    name = _built_class(tree, resolver)
+    resolved = resolver.chain(name) if name is not None else None
+    if resolved is not None and resolved[1]:
         local, sdk = resolved
         if _declares_image_observations(local):
             facts = StaticEnvironmentFacts(image_observations=True)
         if check_classes:
-            findings.extend(_class_findings(name, local, sdk, dataset_assigned=dataset_assigned))
+            findings.extend(
+                _class_findings(name, local, sdk, resolver, dataset_assigned=dataset_assigned)
+            )
     if findings:
         shown = findings[:_MAX_FINDINGS]
         more = len(findings) - len(shown)
