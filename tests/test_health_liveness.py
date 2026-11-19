@@ -46,4 +46,5 @@ def test_health_returns_ok():
         "service": "flash",
         "version": __version__,
         "capabilities": ["custom_training_v1"],
+        "control_plane": "standby",
     }

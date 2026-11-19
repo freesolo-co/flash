@@ -11,7 +11,6 @@ import contextlib
 import logging
 import signal
 import threading
-import time
 
 import flash.runner.lifecycle.status as run_status
 import flash.server.platform.deployment_jobs as deployment_jobs
@@ -189,14 +188,18 @@ def _stop_plane() -> None:
 
 
 async def _lead_when_free(work: _LeaderWork) -> None:
-    """Wait for the previous plane to exit, then take over recovery and the loops."""
-    await plane_lease.acquire()
-    _log.info("control-plane lease acquired; starting recovery and background work")
-    # Submissions stay queued until recovery and its orphan sweep finish: a launch racing the sweep
-    # has no persisted handle yet, so the sweep would reap its instance. The recovery scanner that
-    # recover() dispatches launches the runs queued meanwhile.
-    work.recovery = asyncio.ensure_future(asyncio.to_thread(work.recover))
+    """Take the lease once it is free (at once for a lone plane), then recover and start the loops.
+
+    The plane serves HTTP meanwhile. Recovery can take minutes against provider APIs, and a plane
+    that recovered before serving failed its deploy health check while holding the lease.
+    """
     try:
+        await plane_lease.acquire()
+        _log.info("control-plane lease acquired; starting recovery and background work")
+        # Submissions stay queued until recovery and its orphan sweep finish: a launch racing the
+        # sweep has no persisted handle yet, so the sweep would reap its instance. The recovery
+        # scanner that recover() dispatches launches the runs queued meanwhile.
+        work.recovery = asyncio.ensure_future(asyncio.to_thread(work.recover))
         await asyncio.shield(work.recovery)
         # Starting the loops can fail too, e.g. the deployment-job pool is full of jobs the plane
         # accepted in standby. Leave standby only once the holder's work is actually running.
@@ -204,12 +207,48 @@ async def _lead_when_free(work: _LeaderWork) -> None:
     except asyncio.CancelledError:
         raise
     except Exception:
-        # A lone plane fails startup when recovery or its loops fail; a takeover must not keep
-        # serving as if it led. Stop, and let the restart recover from a clean start.
+        # A plane that can neither lead nor wait to lead must not keep serving as if it would.
+        # Stop, and let the restart recover from a clean start.
         _log.critical("control-plane takeover failed; stopping", exc_info=True)
         _stop_plane()
         return
     work.app.state.plane_standby = False
+
+
+async def _step_down(app, work: _LeaderWork, waiter: asyncio.Task) -> None:
+    """Stop leading and release the lease as soon as no work it guards is still running.
+
+    Runs when shutdown begins, not after the HTTP drain: a retired plane may drain requests for
+    minutes, and the next plane cannot lead until the lease is released.
+    """
+    app.state.plane_draining = True
+    # Submissions still arriving here persist as queued for the next holder's recovery scan.
+    app.state.plane_standby = True
+    waiter.cancel()
+    with contextlib.suppress(asyncio.CancelledError, Exception):
+        await waiter
+    if work.recovery is not None:
+        # Never hand the lease over mid-recovery.
+        with contextlib.suppress(Exception):
+            await work.recovery
+    work.signal_stop()
+    owner = app.state.training_jobs
+    owner.close()
+    await work.cancel()
+    deployments_drained = False
+    with contextlib.suppress(Exception):
+        deployments_drained = await asyncio.to_thread(
+            deployment_jobs._wait_for_deployment_jobs, 10.0
+        )
+    if not deployments_drained:
+        _log.warning("deployment jobs still running at shutdown deadline")
+    # A deployment still holding its run lock would be skipped by a successor's one-time
+    # deployment recovery and then stranded in `deploying`, so the lease stays with this plane.
+    app.state.deployments_drained = deployments_drained
+    tasks_stopped = await asyncio.to_thread(owner.close, 5.0)
+    if tasks_stopped and deployments_drained:
+        plane_lease.release()
+        _log.info("control-plane lease released for the next plane")
 
 
 def create_app():
@@ -239,50 +278,37 @@ def create_app():
         deployment_jobs._open_deployment_jobs()
         _open_status_reporter()
         work = _LeaderWork(app)
-        waiter = None
-        if plane_lease.try_acquire():
-            # The usual case: no other plane on this state directory. Recover before serving.
-            work.recover()
-            work.start()
-        else:
-            # A deploy started this plane while the previous one drains. Serve HTTP now; new runs
-            # stay queued for the holder's recovery scan until its exit hands the lease over.
+        # Serve at once, leader or not; submissions stay queued until this plane has recovered.
+        app.state.plane_standby = True
+        app.state.plane_draining = False
+        if not plane_lease.try_acquire():
+            # A deploy started this plane while the previous one drains. New runs stay queued for
+            # the holder's recovery scan until its step-down hands the lease over.
             _log.warning(
                 "another control plane holds %s; serving without recovery until it exits",
                 plane_lease.lease_path(),
             )
-            app.state.plane_standby = True
-            waiter = asyncio.create_task(_lead_when_free(work))
+        waiter = asyncio.create_task(_lead_when_free(work))
+        loop = asyncio.get_running_loop()
+        step_down: asyncio.Task | None = None
+
+        def begin_step_down() -> None:
+            nonlocal step_down
+            if step_down is None:
+                step_down = asyncio.ensure_future(_step_down(app, work, waiter))
+
+        # Called from the server's signal handler when shutdown begins (see run_server).
+        app.state.begin_drain = lambda: loop.call_soon_threadsafe(begin_step_down)
         try:
             yield
         finally:
-            if waiter is not None:
-                waiter.cancel()
-                with contextlib.suppress(asyncio.CancelledError, Exception):
-                    await waiter
-            if work.recovery is not None:
-                # The lease is released after shutdown; never hand it over mid-recovery.
-                with contextlib.suppress(Exception):
-                    await work.recovery
-            work.signal_stop()
-            app.state.training_jobs.close()
-            await work.cancel()
-            shutdown_deadline = time.monotonic() + 15.0
-            deployments_drained = False
+            begin_step_down()
             with contextlib.suppress(Exception):
-                deployments_drained = await asyncio.to_thread(
-                    deployment_jobs._wait_for_deployment_jobs, 10.0
-                )
-            if not deployments_drained:
-                _log.warning("deployment jobs still running at shutdown deadline")
-            # A deployment still holding its run lock would be skipped by a successor's one-time
-            # deployment recovery and then stranded in `deploying`; lifespan keeps the lease.
-            app.state.deployments_drained = deployments_drained
+                await step_down
             with contextlib.suppress(Exception):
                 from flash.runner.lifecycle.reporting import _shutdown_status_reporter
 
-                remaining = max(0.0, shutdown_deadline - time.monotonic())
-                await asyncio.to_thread(_shutdown_status_reporter, remaining, close=True)
+                await asyncio.to_thread(_shutdown_status_reporter, 15.0, close=True)
 
     @asynccontextmanager
     async def lifespan(app):
@@ -332,4 +358,18 @@ def run_server(host: str = "127.0.0.1", port: int = 8080) -> None:
     # The refusing half only: this is the call that repeats, and the lifespan is where the advisory
     # summary belongs, so a booted plane logs it once.
     require_operator_config()
-    uvicorn.run(create_app(), host=host, port=port)
+    app = create_app()
+
+    class _Server(uvicorn.Server):
+        def handle_exit(self, sig, frame) -> None:
+            super().handle_exit(sig, frame)
+            # Shutdown has begun: hand the lease over now rather than after the HTTP drain.
+            begin_drain = getattr(app.state, "begin_drain", None)
+            if begin_drain is not None:
+                with contextlib.suppress(RuntimeError):  # the loop already closed
+                    begin_drain()
+
+    server = _Server(uvicorn.Config(app, host=host, port=port))
+    server.run()
+    if not server.started:
+        raise SystemExit(3)  # uvicorn.run's exit code for a failed startup

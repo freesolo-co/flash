@@ -57,6 +57,7 @@ def list_instances(*, run_id=None, deadline_at=None):
     run's cleanup (and with it a user's cancel) take minutes.
     """
     result = []
+    project_states = None
     for bid in pages(
         "/spot/bids", params={"project": settings()["project_id"]}, deadline_at=deadline_at
     ):
@@ -65,12 +66,30 @@ def list_instances(*, run_id=None, deadline_at=None):
             continue
         # Bid cancellation precedes VM shutdown. Handle-less recovery must still see
         # these resources until the same instance-state check as terminate() passes.
-        if bid["status"] == "Terminated" and all(
-            row["status"] in _STOPPED for row in _instances(bid["fid"], deadline_at=deadline_at)
-        ):
-            continue
+        if bid["status"] == "Terminated":
+            if run_id is not None:
+                states = [row["status"] for row in _instances(bid["fid"], deadline_at=deadline_at)]
+            else:
+                # An unscoped sweep sees every bid Flash ever placed, nearly all terminated. One
+                # lookup per bid made the startup orphan sweep take over ten minutes; list the
+                # project's instances once instead.
+                if project_states is None:
+                    project_states = _instance_states_by_bid(deadline_at=deadline_at)
+                states = project_states.get(bid["fid"], [])
+            if all(state in _STOPPED for state in states):
+                continue
         result.append({"metadata": {"id": bid["fid"], "name": bid["name"], "labels": labels}})
     return result
+
+
+def _instance_states_by_bid(*, deadline_at=None):
+    project = settings()["project_id"]
+    states = {}
+    for row in pages("/instances", params={"project": project}, deadline_at=deadline_at):
+        if row.get("project") != project:
+            raise MithrilApiError("Mithril returned an instance outside the project")
+        states.setdefault(row.get("bid"), []).append(row.get("status"))
+    return states
 
 
 def _bid(bid_id, *, deadline_at=None):
