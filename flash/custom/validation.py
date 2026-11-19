@@ -2,7 +2,14 @@
 
 from dataclasses import replace
 
-from flash.custom.types import checkpoint_name, integer, number, parse_batch, parse_images
+from flash.custom.types import (
+    MAX_ENCODE_CHARACTERS,
+    checkpoint_name,
+    integer,
+    number,
+    parse_batch,
+    parse_images,
+)
 
 
 def _with_vision(backend, tokens, images):
@@ -85,8 +92,8 @@ def validate_operation(backend, operation, arguments):
             args["vision"] = _with_vision(backend, args["prompt"], images)
     elif operation == "encode":
         text = args.get("text")
-        if not isinstance(text, str) or len(text) > 100_000:
-            raise ValueError("text must be a string of at most 100000 characters")
+        if not isinstance(text, str) or len(text) > MAX_ENCODE_CHARACTERS:
+            raise ValueError(f"text must be a string of at most {MAX_ENCODE_CHARACTERS} characters")
         images = parse_images(args.pop("images", None))
         if images is not None:
             decode = getattr(backend, "decode_images", None)
