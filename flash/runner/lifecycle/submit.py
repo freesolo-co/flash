@@ -154,6 +154,7 @@ def prepare_job(
     # these read-only gates belong to preparation: every submit path passes here exactly once, and
     # callers receive the pinned worker spec before quoting, affordability, persistence, or allocation.
     worker_spec, _ = artifacts.preflight_validate_environment_ref(worker_spec)
+    preparation._preflight_environment_source(worker_spec)
     from flash.cost.currency import usd_amount
     from flash.cost.spec import estimate_for_spec
 

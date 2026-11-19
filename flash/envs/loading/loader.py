@@ -681,14 +681,13 @@ def _load_resolved_freesolo_environment(
     selection = select_dataset_source(params, base_dir, source, _resolve_path_arg)
     source = selection.source
 
-    contract_path = _resolve_path_arg(params.get("contract_path"), base_dir)
-    if isinstance(contract_path, str):
-        params["contract_path"] = contract_path
-    else:
-        params.setdefault("contract_path", str(base_dir / "TRAINING_CONTRACT.md"))
-    contract_text = str(
-        params.pop("contract_text", "") or _load_contract_text(params["contract_path"])
-    )
+    # contract_text/contract_path are Flash's own keys: Flash renders the contract, so neither is
+    # forwarded to load_environment(). forwarding the injected default broke every documented
+    # `load_environment(**kwargs): return MyEnv(**kwargs)` whose __init__ does not take it.
+    contract_path = _resolve_path_arg(params.pop("contract_path", None), base_dir)
+    if not isinstance(contract_path, str):
+        contract_path = str(base_dir / "TRAINING_CONTRACT.md")
+    contract_text = str(params.pop("contract_text", "") or _load_contract_text(contract_path))
 
     sdk_env = tools["load_environment"](reference, **params)
     # an env that generates or owns every row in load_environment needs no packaged file, and a
