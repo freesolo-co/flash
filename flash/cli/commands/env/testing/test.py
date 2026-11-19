@@ -109,9 +109,8 @@ def _gold_lacks_replayable_text(completion: list[dict], reference_turns: list[st
     `""`, which is absence, not a payload elsewhere.
 
     Keyed on a non-`content` payload rather than on null content alone: `content: null` with
-    nothing beside it is an empty turn, not a tool call. Image-only content never reaches here --
-    `freesolo.datasets.target_messages` rejects a non-string, non-null content before this runs --
-    so it is deliberately not claimed as a case.
+    nothing beside it is an empty turn, not a tool call. Image-only assistant content is a list, not
+    null, so it is deliberately not claimed as a case (SFT preparation refuses assistant images).
     """
     if not completion or "".join(reference_turns).strip():
         return False

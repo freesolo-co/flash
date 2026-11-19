@@ -1122,7 +1122,7 @@ def test_profile_rejects_mixed_message_lists(tmp_path) -> None:
         },
     )
 
-    with pytest.raises(ValueError, match="non-object message entries"):
+    with pytest.raises(ValueError, match=r"non-object output entries at indexes \[1\]"):
         _profile(entrypoint)
 
 
