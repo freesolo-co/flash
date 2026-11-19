@@ -515,7 +515,12 @@ def test_worker_launches_capsule_on_ephemeral_docker_storage(monkeypatch, tmp_pa
     forwarded = []
     monkeypatch.setattr(urllib.request, "urlopen", download)
     monkeypatch.setattr(pathlib.Path, "is_mount", lambda _: True)
-    monkeypatch.setattr(subprocess, "run", lambda command, **kw: commands.append(command))
+
+    def run(command, **kw):
+        commands.append(command)
+        return subprocess.CompletedProcess(command, 0)
+
+    monkeypatch.setattr(subprocess, "run", run)
     monkeypatch.setattr(subprocess, "Popen", lambda command, **kw: forwarded.append(command))
     monkeypatch.setattr("os.umask", lambda _: None)
     code = bootstrap.WORKER.replace("'/opt/flash'", repr(str(root))).replace(
@@ -526,7 +531,9 @@ def test_worker_launches_capsule_on_ephemeral_docker_storage(monkeypatch, tmp_pa
         "default-runtime": "nvidia",
         "data-root": "/mnt/local/docker",
     }
-    command = commands[1]
+    # the image is pulled explicitly (so its progress is reportable) before the worker starts.
+    assert commands[1] == ["docker", "pull", "--quiet", "worker@sha256:digest"]
+    command = commands[2]
     assert command[:3] == ["timeout", "--signal=TERM", "--kill-after=30"]
     assert 0 < int(command[3]) <= 3600
     assert "worker@sha256:digest" in command
@@ -1078,3 +1085,119 @@ def test_offers_skip_a_refused_shape_but_keep_the_region(monkeypatch, tmp_path):
     assert {o.gpu for o in prices.affordable_offers()} == {"H100", "H200"}
     region_health.mark_refused("us-central2-b", "it_h200")
     assert {o.gpu for o in prices.affordable_offers()} == {"H100"}
+
+
+def _launcher_bundle(capsule):
+    raw = payload()
+    return {
+        "payload": raw,
+        "deadline_at": time.time() + 3600,
+        "claim_blob": "repo/run/claim",
+        "boot_blob": "repo/run/boot.json",
+        "capsule": {"blob": "repo/capsule", "sha256": hashlib.sha256(capsule).hexdigest()},
+        "image": "worker@sha256:digest",
+    }
+
+
+def _exec_launcher(monkeypatch, tmp_path, bundle, capsule, pull_rc):
+    """Run the host launcher with fake storage/docker; return (boot reports, commands)."""
+    import pathlib
+    import subprocess
+    import urllib.request
+
+    root = tmp_path / "flash"
+    root.mkdir()
+    daemon = tmp_path / "daemon.json"
+    reports, commands = [], []
+    pull_timeouts = bundle.setdefault("_pull_timeouts", [])
+
+    def urlopen(request, timeout):
+        if isinstance(request, urllib.request.Request):
+            if "boot.json" in request.full_url:
+                reports.append(json.loads(request.data))
+            return io.BytesIO(b"")
+        return io.BytesIO(capsule)
+
+    def run(command, **kw):
+        commands.append(command)
+        if command[:2] == ["docker", "pull"]:
+            pull_timeouts.append(kw.get("timeout"))
+            if pull_rc == "hang":
+                # A pull that outlives its bound; an unbounded one would block forever.
+                if kw.get("timeout") is None:
+                    raise AssertionError("image pull ran without a deadline bound")
+                raise subprocess.TimeoutExpired(command, kw["timeout"])
+        rc = pull_rc if command[:2] == ["docker", "pull"] else 0
+        return subprocess.CompletedProcess(command, rc)
+
+    monkeypatch.setattr(urllib.request, "urlopen", urlopen)
+    monkeypatch.setattr(pathlib.Path, "is_mount", lambda _: True)
+    monkeypatch.setattr(subprocess, "run", run)
+    monkeypatch.setattr(subprocess, "Popen", lambda command, **kw: None)
+    monkeypatch.setattr(time, "sleep", lambda _s: None)
+    monkeypatch.setattr("os.umask", lambda _: None)
+    code = bootstrap.WORKER.replace("'/opt/flash'", repr(str(root))).replace(
+        "'/etc/docker/daemon.json'", repr(str(daemon))
+    )
+    exec(code, {"BUNDLE": bundle})
+    return reports, commands
+
+
+def test_launcher_reports_boot_progress_through_the_image_pull(monkeypatch, tmp_path, capsys):
+    capsule = b"capsule"
+    reports, commands = _exec_launcher(
+        monkeypatch, tmp_path, _launcher_bundle(capsule), capsule, pull_rc=0
+    )
+    assert [r["stage"] for r in reports] == ["claimed", "pulling_image", "starting_worker"]
+    assert all(set(r) == {"stage", "reason", "disk_used"} for r in reports)
+    pull = commands.index(["docker", "pull", "--quiet", "worker@sha256:digest"])
+    assert commands[pull + 1][0] == "timeout"
+    assert "secret" not in json.dumps(reports) + capsys.readouterr().out
+
+
+def test_launcher_reports_a_failed_image_pull_instead_of_going_silent(
+    monkeypatch, tmp_path, capsys
+):
+    capsule = b"capsule"
+    reports, commands = _exec_launcher(
+        monkeypatch, tmp_path, _launcher_bundle(capsule), capsule, pull_rc=1
+    )
+    # a registry blip is retried; a pull that keeps failing is reported, the worker never starts.
+    assert sum(c[:2] == ["docker", "pull"] for c in commands) == 3
+    assert not any(c[0] == "timeout" for c in commands)
+    assert reports[-1]["stage"] == "failed"
+    assert reports[-1]["reason"] == "worker image pull failed"
+    assert commands[-1] == ["shutdown", "-h", "now"]
+    assert "secret" not in json.dumps(reports) + capsys.readouterr().out
+
+
+def test_launcher_bounds_the_image_pull_by_the_run_deadline(monkeypatch, tmp_path, capsys):
+    # Without control-plane supervision, a hung pull must not keep the VM past its deadline:
+    # the pull gets the remaining deadline as its timeout and a timed-out pull ends the boot.
+    capsule = b"capsule"
+    bundle = _launcher_bundle(capsule)
+    reports, commands = _exec_launcher(monkeypatch, tmp_path, bundle, capsule, pull_rc="hang")
+    (bound,) = bundle["_pull_timeouts"]
+    assert 0 < bound <= 3600
+    assert not any(c[0] == "timeout" for c in commands)
+    assert reports[-1]["stage"] == "failed"
+    assert reports[-1]["reason"] == "worker image pull failed"
+    assert commands[-1] == ["shutdown", "-h", "now"]
+    assert "secret" not in json.dumps(reports) + capsys.readouterr().out
+
+
+def test_launcher_bundle_names_the_attempt_boot_progress_blob(monkeypatch):
+    published = []
+
+    def publish(payload, data, suffix, **kw):
+        published.append(data)
+        return {"blob": "private/" + suffix, "sha256": hashlib.sha256(data).hexdigest()}
+
+    monkeypatch.setattr(bootstrap, "_publish", publish)
+    bootstrap.startup_script(
+        payload(), b"capsule", "worker", owner_line="# owner", deadline_at=time.time() + 100
+    )
+    source = published[1].decode()
+    expected = bootstrap.boot_progress_blob("owner/repo", "sft", "test", 0)
+    assert expected.endswith("/sft/test/mithril_boot_0.json")
+    assert repr(expected) in source
