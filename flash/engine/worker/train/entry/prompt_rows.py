@@ -4,7 +4,8 @@ from __future__ import annotations
 
 from typing import Any
 
-_ALLOWED_MESSAGE_KEYS = frozenset({"role", "content", "reasoning_content"})
+from flash.content.prompt_turns import PROMPT_MESSAGE_KEYS as _ALLOWED_MESSAGE_KEYS
+
 _TEXT_BLOCK_TYPES = frozenset({"text", "input_text"})
 
 

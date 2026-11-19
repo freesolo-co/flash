@@ -13,6 +13,7 @@ from __future__ import annotations
 import contextlib
 import hashlib
 import json
+import logging
 import os
 import re
 from collections.abc import Mapping
@@ -21,6 +22,8 @@ from dataclasses import replace
 from flash.core.spec import MANAGED_GPU_KEYS, JobSpec
 from flash.core.spec_persistence import PREPARATION_ENVELOPE_VERSION
 from flash.runner.lifecycle import status as status_ops
+
+_LOG = logging.getLogger(__name__)
 
 
 class WarmStartPreparationError(ValueError):
@@ -650,3 +653,61 @@ def _require_sft_workload_profile(spec: JobSpec) -> JobSpec:
     except dataset_profile.PackagedDatasetUnavailable as exc:
         raise WorkloadProfileUnavailable(str(exc)) from exc
     return replace(profiled_spec, workload_profile=profile.to_dict())
+
+
+_SDK_REQUIREMENT = re.compile(r"\s*freesolo\s*(?:$|[\[<>=!~;@ ])", re.IGNORECASE)
+
+
+def _preflight_environment_source(spec: JobSpec) -> None:
+    """reject load failures provable from the pinned package source, before quote or GPU.
+
+    reads the package without importing it (flash/envs/meta/static_preflight.py). a package the
+    plane cannot resolve here is left to the worker, exactly as before this check existed.
+    """
+    environment = spec.environment
+    if spec.algorithm not in {"sft", "grpo"} or not environment.id or not environment.resolved_sha:
+        return
+    from pathlib import Path
+
+    from flash.envs.loading.loader import _resolve_environment_reference
+    from flash.envs.meta.static_preflight import (
+        EnvironmentPreflightError,
+        check_environment_package,
+    )
+
+    # a package that pins its own SDK runs against that one, not the SDK installed here.
+    own_sdk = any(_SDK_REQUIREMENT.match(str(req)) for req in environment.pip or ())
+    try:
+        entrypoint = Path(_resolve_environment_reference(environment.id, environment.resolved_sha))
+        if not entrypoint.is_file():
+            return
+        facts = check_environment_package(entrypoint, check_sdk_imports=not own_sdk)
+        text_only_source = (
+            spec.algorithm == "grpo"
+            and bool(spec.train.init_from_adapter)
+            and facts.image_observations
+            and _source_adapter_is_text_only(spec)
+        )
+    except EnvironmentPreflightError:
+        raise
+    except Exception:
+        # only a proven failure may block a submit; anything else is the worker's to report.
+        _LOG.warning("environment preflight skipped for %s", environment.id, exc_info=True)
+        return
+    if text_only_source:
+        # the worker's modality check (engine/worker/model/adapter.py), decided at submit time.
+        raise ValueError(
+            "warm-start modality mismatch: the environment class declares "
+            "image_observations = True, so this GRPO run trains multimodal, but the "
+            "train.init_from_adapter source is a text-only adapter; start a fresh run or warm-start "
+            "from an adapter trained with images"
+        )
+
+
+def _source_adapter_is_text_only(spec: JobSpec) -> bool:
+    from flash.adapters.lora_rank import load_artifact_adapter_config
+
+    config = load_artifact_adapter_config(
+        spec.train.init_from_adapter, None, spec.train.init_from_adapter_revision or None
+    )
+    return config.get("exclude_modules") is not None

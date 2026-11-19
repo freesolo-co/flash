@@ -23,6 +23,7 @@ import flash.engine.worker.perf as _worker_perf
 import flash.engine.worker.train.rl.launch.config as _worker_config
 from flash.adapters.targets import LoraTargeting, resolve_lora_targeting
 from flash.content.processor import inherit_tokenizer_chat_template
+from flash.content.prompt_turns import require_plain_prompt_turns
 from flash.content.stop_tokens import chat_stop_token_ids
 from flash.content.structured_outputs import (
     describe_structured_outputs,
@@ -248,7 +249,12 @@ def _load_training_records(env, train_spec, *, context: WorkerContext):
         train = train[: int(max_examples)]
     rng = random.Random(context.config.seed)
     rng.shuffle(train)
-    return train, [env.prompt_messages(ex) for ex in train]
+    message_prompts = [env.prompt_messages(ex) for ex in train]
+    for ex, messages in zip(train, message_prompts, strict=True):
+        require_plain_prompt_turns(
+            messages, example_id=ex.get("id") if isinstance(ex, dict) else None
+        )
+    return train, message_prompts
 
 
 def _grpo_is_multimodal(env, train, message_prompts):
