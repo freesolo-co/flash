@@ -629,6 +629,7 @@ def _load_contract_text(path: str | None) -> str:
 
 def _import_freesolo_environment_tools():
     try:
+        import freesolo.environments as sdk_environments
         from freesolo.datasets.records import load_task_examples, task_example_from_record
         from freesolo.environments import (
             EnvironmentEpisode,
@@ -638,6 +639,9 @@ def _import_freesolo_environment_tools():
         )
 
         return {
+            # the sdk base class, so the adapter can tell its default sft_completion from an
+            # authored override. looked up softly: a stand-in sdk without it has no default hook.
+            "Environment": getattr(sdk_environments, "Environment", None),
             "EnvironmentEpisode": EnvironmentEpisode,
             "EnvironmentMultiTurn": EnvironmentMultiTurn,
             "EnvironmentTurn": EnvironmentTurn,
