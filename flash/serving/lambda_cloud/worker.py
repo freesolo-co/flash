@@ -93,7 +93,12 @@ def create_app(engine, token):
 
     @app.get("/health")
     async def health():
-        return {**engine._health(), "deployment_sha": os.environ.get("FREESOLO_DEPLOYMENT_SHA", "")}
+        return {
+            **engine._health(),
+            "deployment_sha": os.environ.get("FREESOLO_DEPLOYMENT_SHA", ""),
+            # The watchdog judges a canary timeout as a hang only on workers with this lane.
+            "canary_lane": True,
+        }
 
     @app.post("/register")
     async def register(request: Request):

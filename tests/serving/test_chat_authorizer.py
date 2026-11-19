@@ -156,6 +156,35 @@ def test_403_and_404_collapse_to_403(modal_app_module, monkeypatch, code):
     assert exc.value.status_code == 403
 
 
+@pytest.mark.parametrize("code", [403, 404])
+def test_denied_unserved_base_model_names_served_models(modal_app_module, monkeypatch, code):
+    # A base-model chat for a catalog id serving does not host (live: Qwen/Qwen3.5-27B) was
+    # reported as "not authorized for this adapter". Unknown and foreign adapter ids still get
+    # one identical message, and checkpoint ids keep the adapter wording.
+    import asyncio
+
+    from fastapi import HTTPException
+
+    from flash.serving.src.engine import model_config
+
+    monkeypatch.setattr(model_config, "hosted_base_models", lambda: ["Qwen/Qwen3.5-9B-Base"])
+    authorize = _authorizer(modal_app_module, monkeypatch, _FakeResp(code, {}))
+    details = {}
+    for model_id in ("Qwen/Qwen3.5-27B", "Qwen/Qwen3.5-9B-Base", "flash-1795095101-3ae26310/final"):
+        with pytest.raises(HTTPException) as exc:
+            asyncio.run(authorize("fs-user-key", model_id))
+        assert exc.value.status_code == 403
+        details[model_id] = exc.value.detail
+    assert details["Qwen/Qwen3.5-27B"] == (
+        "'Qwen/Qwen3.5-27B' is not a served base model or an adapter this API key may use; "
+        "served base models: Qwen/Qwen3.5-9B-Base"
+    )
+    assert details["Qwen/Qwen3.5-9B-Base"] == "API key is not authorized for this model"
+    assert (
+        details["flash-1795095101-3ae26310/final"] == "API key is not authorized for this adapter"
+    )
+
+
 def test_backend_503_stays_503(modal_app_module, monkeypatch):
     # The core fix: a retryable backend 503 must NOT be masked as a 502.
     from fastapi import HTTPException

@@ -10,6 +10,15 @@ routing and registering to quarantined workers. A worker that stays unhealthy is
 rebooted through the Lambda API (same instance, IP, certificate and token; Docker
 restarts the worker), then readmitted after it passes a probe again. At least one
 worker is always kept routable: if every worker is quarantined the router fails open.
+
+Only workers that admit the canary through a dedicated lane (``/health`` reports
+``canary_lane``) can be judged by a canary timeout alone. On older workers the canary
+queues behind generations, so a timeout while ``/health`` is fine means *busy*: it neither
+quarantines nor reboots the worker until no canary has completed for
+``BUSY_HUNG_AFTER_SECONDS``, which still catches a worker whose generations never finish.
+
+The watchdog also publishes the slots configured in the workers secret; the router never
+routes to a declared slot the secret does not configure.
 """
 
 import asyncio
@@ -22,6 +31,11 @@ HEALTH_DICT_NAME = "flash-reserved-h100-health-20261112"
 WATCHDOG_PERIOD_SECONDS = 120
 HEALTH_TIMEOUT_SECONDS = 15
 CANARY_TIMEOUT_SECONDS = 90
+# A healthy worker frees an admission slot whenever any generation finishes, so a laneless
+# canary that has not completed for this long means generations are not finishing.
+BUSY_HUNG_AFTER_SECONDS = 20 * 60
+# Health-Dict key holding the sorted slots the workers secret configures.
+CONFIGURED_KEY = "configured_slots"
 QUARANTINE_AFTER_FAILURES = 2
 RESTART_AFTER_UNHEALTHY_SECONDS = 10 * 60
 # Booting the VM and reloading the model takes several minutes; do not reboot it again
@@ -30,7 +44,7 @@ RESTART_COOLDOWN_SECONDS = 30 * 60
 ROUTER_CACHE_SECONDS = 15
 # Upper bound on how long a routed request can wait for a health-state refresh.
 ROUTER_REFRESH_TIMEOUT_SECONDS = 1.0
-# The reservation scheduler terminates all four VMs once ``hold_until`` passes (observed
+# The reservation scheduler terminates its VMs once ``hold_until`` passes (observed
 # 2026-11-19: the week-long hold lapsed and production 9B Base lost every worker). While the
 # fleet is serving, the watchdog keeps the hold rolling well ahead of now.
 HOLD_RENEW_BELOW_SECONDS = 7 * 86400
@@ -49,6 +63,8 @@ class SlotState:
     restarted_at: float | None = None
     last_error: str = ""
     checked_at: float | None = None
+    # First consecutive busy probe (laneless canary timeout while /health is fine).
+    busy_since: float | None = None
 
     @classmethod
     def load(cls, raw):
@@ -61,12 +77,25 @@ class SlotState:
         return asdict(self)
 
 
-def advance(state, ok, now, error=""):
-    """Return (new_state, restart) after one probe. Pure: no I/O."""
+def advance(state, ok, now, error="", *, busy=False):
+    """Return (new_state, restart) after one probe. Pure: no I/O.
+
+    ``busy`` marks a failed probe whose only symptom is a laneless canary timeout: it is
+    not counted against the worker until it has persisted for ``BUSY_HUNG_AFTER_SECONDS``.
+    """
     state = SlotState(**state.dump())
     state.checked_at = now
     if ok:
         return SlotState(restarted_at=state.restarted_at, checked_at=now), False
+    if busy:
+        if state.busy_since is None:
+            state.busy_since = now
+        if now - state.busy_since < BUSY_HUNG_AFTER_SECONDS:
+            state.last_error = f"busy: {error}"[:200]
+            return state, False
+        error = f"no canary completed for {now - state.busy_since:.0f}s: {error}"
+    else:
+        state.busy_since = None
     state.failures += 1
     state.last_error = error[:200]
     if state.unhealthy_since is None:
@@ -83,10 +112,20 @@ def advance(state, ok, now, error=""):
     return state, restart
 
 
-def routable_slots(states, slots):
-    """Slots the router may use; never empty (fail open when every slot is quarantined)."""
+def routable_slots(states, slots, configured=None):
+    """Slots the router may use; never empty (fail open when every slot is quarantined).
+
+    ``configured`` is the watchdog's published slot list. Without it (before the first
+    watchdog cycle), only slots the watchdog has already probed are configured, unless none
+    has been, in which case every declared slot is.
+    """
+    slots = list(slots)
+    if isinstance(configured, list) and configured:
+        slots = [s for s in slots if s in configured] or slots
+    else:
+        slots = [s for s in slots if states.get(s) is not None] or slots
     usable = [s for s in slots if SlotState.load(states.get(s)).healthy]
-    return usable or list(slots)
+    return usable or slots
 
 
 def canary_request(model):
@@ -119,20 +158,38 @@ def canary_request(model):
     }
 
 
-async def probe(transport, model):
-    """(ok, error). Talks to the worker directly, bypassing its possibly saturated proxy."""
+OK, BUSY, FAILED = "ok", "busy", "failed"
+
+
+async def probe_status(transport, model):
+    """(OK | BUSY | FAILED, error), talking to the worker directly, bypassing its proxy.
+
+    BUSY: ``/health`` is fine but the canary timed out on a worker without a canary lane,
+    where the canary waits behind every admitted generation.
+    """
     try:
         async with asyncio.timeout(HEALTH_TIMEOUT_SECONDS):
             health = await transport.call("/health")
         if health.get("ok") is not True or health.get("engine_dead"):
-            return False, "health not ok"
+            return FAILED, "health not ok"
+    except TimeoutError:
+        return FAILED, "health timeout"
+    except Exception as exc:  # any failure counts against liveness
+        return FAILED, f"{type(exc).__name__}: {exc}"[:200]
+    try:
         async with asyncio.timeout(CANARY_TIMEOUT_SECONDS):
             await transport.call("/generate", canary_request(model))
-        return True, ""
+        return OK, ""
     except TimeoutError:
-        return False, "timeout"
-    except Exception as exc:  # any failure counts against liveness
-        return False, f"{type(exc).__name__}: {exc}"[:200]
+        return (FAILED if health.get("canary_lane") is True else BUSY), "canary timeout"
+    except Exception as exc:
+        return FAILED, f"{type(exc).__name__}: {exc}"[:200]
+
+
+async def probe(transport, model):
+    """(ok, error): a strict pass/fail view of ``probe_status``."""
+    status, error = await probe_status(transport, model)
+    return status == OK, error
 
 
 async def run_once(workers, store, lambda_api, model, *, transport_factory, clock=time.time):
@@ -141,7 +198,7 @@ async def run_once(workers, store, lambda_api, model, *, transport_factory, cloc
     async def check(worker):
         transport = transport_factory(worker["ip"], worker["tls"])
         try:
-            return worker, await probe(transport, model)
+            return worker, await probe_status(transport, model)
         finally:
             await transport.aclose()
 
@@ -149,14 +206,16 @@ async def run_once(workers, store, lambda_api, model, *, transport_factory, cloc
     # Reboot only a worker whose failure is its own: another worker must have passed this
     # cycle (so the probe path itself works), and at most one reboot per cycle, so a shared
     # cause such as fleet-wide saturation or a watchdog network fault never reboots them all.
-    any_passed = any(ok for _, (ok, _) in results)
+    any_passed = any(status == OK for _, (status, _) in results)
     rebooted = False
     report = {}
-    for worker, (ok, error) in results:
+    for worker, (status, error) in results:
         slot = worker["slot"]
+        ok = status == OK
         previous = SlotState.load(await store.get(slot))
-        state, restart = advance(previous, ok, clock(), error)
-        if restart and (rebooted or not any_passed):
+        state, restart = advance(previous, ok, clock(), error, busy=status == BUSY)
+        # A lone worker has no peer to rule out a shared cause; its own failure is the signal.
+        if restart and (rebooted or (not any_passed and len(results) > 1)):
             restart = False
             state.restarted_at = previous.restarted_at  # still due next cycle
             state.last_error = f"reboot deferred: {state.last_error}"[:200]
@@ -173,7 +232,9 @@ async def run_once(workers, store, lambda_api, model, *, transport_factory, cloc
                 state.last_error = f"reboot failed: {type(exc).__name__}"[:200]
         await store.put(slot, state.dump())
         report[slot] = {"healthy": state.healthy, "restart": restart, "error": state.last_error}
-        print(f"reserved H100 slot {slot}: ok={ok} {report[slot]}", flush=True)
+        print(f"reserved H100 slot {slot}: {status} {report[slot]}", flush=True)
+    # Published after the probes, so a newly configured slot is routed only once probed.
+    await store.put(CONFIGURED_KEY, sorted(w["slot"] for w in workers))
     return report
 
 
@@ -181,7 +242,7 @@ def renew_hold(state, now):
     """Return (state, event) for the reservation ledger. Pure: no I/O.
 
     Only a reservation in ``serving`` mode is renewed: that is the explicit hand-over of the
-    four VMs to production serving. ``closed``/``adopted`` reservations never terminate
+    reserved VMs to production serving. ``closed``/``adopted`` reservations never terminate
     anything, so they need neither renewal nor an alert.
     """
     if not isinstance(state, dict) or state.get("mode") in {None, "closed", "adopted"}:
@@ -199,7 +260,7 @@ def renew_hold(state, now):
     if remaining <= HOLD_ALERT_WITHIN_SECONDS:
         return state, (
             f"alert: reserved H100 hold expires in {remaining / 3600:.1f}h "
-            f"(mode={state['mode']}); the reservation will terminate all four workers"
+            f"(mode={state['mode']}); the reservation will terminate its workers"
         )
     return state, None
 
@@ -282,13 +343,12 @@ def register_watchdog(app, image, module_name):
 
     async def reserved_h100_watchdog():
         """Quarantine hung reserved workers and reboot ones that stay dead."""
-        import json
         import os
 
         from .api import LambdaAPI
         from .transport import WorkerTransport
 
-        workers = json.loads(os.environ["FLASH_RESERVED_H100_WORKERS"])
+        workers = reserved.parse_workers(os.environ["FLASH_RESERVED_H100_WORKERS"])
         api = LambdaAPI(os.environ["LAMBDA_API_KEY"])
         try:
             report = await run_once(
@@ -349,6 +409,22 @@ class ModalDictStore:
         return await self._dict.pop.aio(key, None)
 
 
+def configured_slots() -> list[int]:
+    """Slots the watchdog last saw in the workers secret; every declared slot if unknown."""
+    import modal
+
+    from . import reserved
+
+    declared = list(range(1, reserved.SLOT_COUNT + 1))
+    try:
+        configured = modal.Dict.from_name(HEALTH_DICT_NAME).get(CONFIGURED_KEY)
+    except Exception:  # a diagnostic must still warm what it can
+        return declared
+    if isinstance(configured, list) and configured and set(configured) <= set(declared):
+        return sorted(configured)
+    return declared
+
+
 class HealthView:
     """Router-side cached read of slot states; never blocks routing on the store."""
 
@@ -359,6 +435,8 @@ class HealthView:
         self._expires = 0.0
         self._usable = list(self._slots)
         self._cycle = itertools.cycle(self._slots)
+        self._loaded = False
+        self._refresh = None
 
     @classmethod
     def for_engines(cls, engines):
@@ -376,13 +454,25 @@ class HealthView:
     async def usable(self):
         if self._clock() >= self._expires:
             self._expires = self._clock() + ROUTER_CACHE_SECONDS
-            try:
-                # Inference waits on this refresh, so bound it; a slow store keeps the last view.
-                async with asyncio.timeout(ROUTER_REFRESH_TIMEOUT_SECONDS):
-                    values = await asyncio.gather(*(self._store.get(s) for s in self._slots))
-                self._usable = routable_slots(
-                    dict(zip(self._slots, values, strict=True)), self._slots
-                )
-            except Exception as exc:  # keep the last known view
-                print(f"reserved H100 health read failed: {exc!r}", flush=True)
+            self._refresh = asyncio.ensure_future(self._reload())
+            await asyncio.shield(self._refresh)
+        elif not self._loaded and self._refresh is not None and not self._refresh.done():
+            # Before the first view, concurrent callers share the in-flight read rather than
+            # routing to every declared slot, some of which may not be configured.
+            await asyncio.shield(self._refresh)
         return self._usable
+
+    async def _reload(self):
+        try:
+            # Inference waits on this refresh, so bound it; a slow store keeps the last view.
+            async with asyncio.timeout(ROUTER_REFRESH_TIMEOUT_SECONDS):
+                configured, *values = await asyncio.gather(
+                    self._store.get(CONFIGURED_KEY),
+                    *(self._store.get(s) for s in self._slots),
+                )
+            self._usable = routable_slots(
+                dict(zip(self._slots, values, strict=True)), self._slots, configured
+            )
+            self._loaded = True
+        except Exception as exc:  # keep the last known view
+            print(f"reserved H100 health read failed: {exc!r}", flush=True)

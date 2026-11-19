@@ -2,6 +2,7 @@
 
 import asyncio
 import base64
+import contextlib
 import json
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -58,7 +59,9 @@ def test_worker_auth_lifecycle_and_exact_payload_forwarding():
     with TestClient(create_app(engine, "private")) as client:
         assert client.get("/health").status_code == 401
         headers = {"Authorization": "Bearer private"}
-        assert client.get("/health", headers=headers).json()["base_model"] == MODEL
+        health = client.get("/health", headers=headers).json()
+        assert health["base_model"] == MODEL
+        assert health["canary_lane"] is True
         client.post("/lease", json={"generation_id": "g1"}, headers=headers)
         assert client.post("/generate", json=body, headers=headers).json() == {"text": "ok"}
         engine._generate.assert_awaited_once_with(
@@ -306,3 +309,111 @@ def test_canary_flag_requires_a_one_token_base_model_generation():
         response = client.post("/generate", json=body, headers=headers)
     assert response.status_code == 400
     engine._generate.assert_not_awaited()
+
+
+@pytest.mark.parametrize(
+    ("response", "status", "detail"),
+    [
+        (httpx.Response(500, text="Internal Server Error"), 502, "(HTTP 500)"),
+        (httpx.Response(504, json={"kind": "timeout"}), 504, "(HTTP 504, kind=timeout)"),
+        (httpx.Response(401, json={"error": "unauthorized"}), 502, "(HTTP 401, kind=unauthorized)"),
+        (httpx.Response(503, json={"kind": "token=secret"}), 502, "(HTTP 503)"),
+    ],
+)
+def test_worker_failure_names_status_and_fixed_kind_only(response, status, detail):
+    from flash.serving.lambda_cloud.transport import check_response
+
+    with pytest.raises(WorkerError) as excinfo:
+        check_response(response)
+    assert str(excinfo.value) == f"Lambda worker request failed {detail}"
+    assert excinfo.value.status_code == status
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("code", "body", "status", "detail"),
+    [
+        (401, {"error": "unauthorized"}, 502, "(HTTP 401, kind=unauthorized)"),
+        (504, {"kind": "timeout"}, 504, "(HTTP 504, kind=timeout)"),
+    ],
+)
+async def test_stream_failure_reads_error_body_before_naming_kind(tls, code, body, status, detail):
+    async def chunks():
+        yield json.dumps(body).encode()
+
+    async def handler(request):
+        if request.url.path == "/lease":
+            return httpx.Response(200, json={"ok": True})
+        # A truly streamed body stays unread under send(stream=True), like a real socket.
+        return httpx.Response(code, content=chunks())
+
+    transport = WorkerTransport("8.8.8.8", tls, transport=httpx.MockTransport(handler))
+    try:
+        with pytest.raises(WorkerError) as excinfo:
+            _ = [event async for event in transport.stream({"generation_id": "test"})]
+    finally:
+        await transport.aclose()
+    assert str(excinfo.value) == f"Lambda worker request failed {detail}"
+    assert excinfo.value.status_code == status
+
+
+@pytest.mark.anyio
+async def test_slow_lease_renewal_still_renews_on_its_own_pool(tls):
+    """A renewal slower than one heartbeat (but inside the lease) must not be abandoned."""
+    renewed = []
+
+    async def handler(request):
+        body = json.loads(request.content)
+        if request.url.path == "/lease":
+            await asyncio.sleep(1.2 if renewed else 0)
+            renewed.append(body["generation_id"])
+            return httpx.Response(200, json={"ok": True})
+        await asyncio.sleep(4.0)
+        return httpx.Response(200, json={"request_id": body["generation_id"]})
+
+    transport = WorkerTransport("8.8.8.8", tls, transport=httpx.MockTransport(handler))
+    try:
+        assert transport._client_for("/lease") is transport.lease_client
+        assert transport._client_for("/generate") is transport.client
+        assert transport.lease_client is not transport.client
+        result = await transport.call("/generate", {"generation_id": "g-slow"})
+        assert result["request_id"] == "g-slow"
+        # the initial lease plus at least one slow (1.2 s) renewal that completed
+        assert len(renewed) >= 2
+    finally:
+        await transport.aclose()
+    assert transport.lease_client.is_closed
+    assert transport.client.is_closed
+
+
+@pytest.mark.anyio
+async def test_stalled_lease_renewal_is_retried_before_the_lease_lapses(tls):
+    """One stalled renewal must leave time for a retry inside LEASE_SECONDS."""
+    from flash.serving.src.stream_channel.protocol import LEASE_SECONDS
+
+    loop = asyncio.get_running_loop()
+    leases = []
+    retried = asyncio.Event()
+
+    async def handler(request):
+        body = json.loads(request.content)
+        if request.url.path == "/lease":
+            leases.append(loop.time())
+            if len(leases) == 2:
+                await asyncio.sleep(60)  # first renewal stalls before reaching the worker
+            if len(leases) == 3:
+                retried.set()
+            return httpx.Response(200, json={"ok": True})
+        with contextlib.suppress(TimeoutError):
+            async with asyncio.timeout(LEASE_SECONDS + 2):
+                await retried.wait()
+        return httpx.Response(200, json={"request_id": body["generation_id"]})
+
+    transport = WorkerTransport("8.8.8.8", tls, transport=httpx.MockTransport(handler))
+    try:
+        await transport.call("/generate", {"generation_id": "g-stall"})
+    finally:
+        await transport.aclose()
+    assert len(leases) >= 3
+    # the retry reached the worker while the lease from the initial renewal was still live
+    assert leases[2] - leases[0] < LEASE_SECONDS

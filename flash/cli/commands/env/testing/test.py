@@ -21,6 +21,7 @@ from flash.cli.commands.env.testing.warnings import (
     _warn_on_uniformly_zero_rewards,
 )
 from flash.cli.ui import render
+from flash.content.prompt_turns import require_plain_prompt_turns
 
 _ALLOWED_ROLES = frozenset({"system", "user", "assistant", "tool"})
 _ECHO_RESPONSE = "test"
@@ -757,6 +758,8 @@ def cmd_env_test(args) -> int:
         return _load_failure("dataset is empty")
 
     episode_count = min(_DEFAULT_EPISODES, len(dataset))
+    # default to grpo so omitting the algorithm cannot disable the blocking check.
+    algorithm = getattr(args, "algorithm", None) or _REWARD_DRIVEN_ALGORITHM
     passed = 0
     tally = _Tally()
     for index, example in enumerate(dataset[:episode_count], start=1):
@@ -767,6 +770,9 @@ def cmd_env_test(args) -> int:
                 _drive_multi_turn(env, example, record)
             else:
                 _drive_single_turn(env, example, record)
+            if algorithm == _REWARD_DRIVEN_ALGORITHM:
+                # the grpo worker's own prompt-row gate, so it fails here and not on a rented GPU.
+                require_plain_prompt_turns(record["prompt"], example_id=example.get("id"))
             reward = record["reward"]
             if reward is None or not math.isfinite(reward):
                 raise ValueError(f"reward is not finite: {reward}")
@@ -806,8 +812,6 @@ def cmd_env_test(args) -> int:
     print(f"{passed}/{episode_count} episodes passed contract checks")
     if passed != episode_count:
         return _report_command_error("overall: FAIL")
-    # default to grpo so omitting the algorithm cannot disable the blocking check.
-    algorithm = getattr(args, "algorithm", None) or _REWARD_DRIVEN_ALGORITHM
     grader_recognizes_gold = _check_grader(env, algorithm, tally)
     # run the evaluation checks even when the grader gate already failed, so one `flash env test`
     # reports every broken surface at once instead of hiding the sidecar's errors behind the

@@ -65,9 +65,32 @@ def _authorize_response(
     # Unknown adapter (404) and org mismatch (403) both collapse to 403 so we don't leak
     # which adapters exist to an unauthorized caller.
     if resp.status_code in (403, 404):
-        raise HTTPException(status.HTTP_403_FORBIDDEN, "API key is not authorized for this adapter")
+        raise HTTPException(status.HTTP_403_FORBIDDEN, _denied_detail(model_id))
     # Any backend 5xx (500/502/503/504) or other unexpected status is a transient auth-lookup
     # infra failure (Supabase down, backend overloaded). Surface it as a RETRYABLE 503, never a
     # 502: a client/load-balancer must be free to retry rather than treat it as a permanent
     # upstream error. The cache+single-flight above is what makes this failure rare under load.
     raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "serving auth backend unavailable")
+
+
+def _denied_detail(model_id: str) -> str:
+    """Name the served base models when a denied id is neither one of them nor a checkpoint.
+
+    A request for an unserved base model (e.g. a catalog id that serving does not host) is denied
+    by the backend like an unknown adapter. The served base models are public (``/healthz``) and
+    the text is the same whether or not an adapter with that id exists, so nothing leaks.
+    """
+    if parse_checkpoint_ref(model_id) is not None:
+        return "API key is not authorized for this adapter"
+    try:
+        from flash.serving.src.engine.model_config import hosted_base_models
+
+        served = hosted_base_models()
+    except Exception:
+        return "API key is not authorized for this adapter"
+    if model_id in served:
+        return "API key is not authorized for this model"
+    return (
+        f"{model_id!r} is not a served base model or an adapter this API key may use; "
+        f"served base models: {', '.join(served)}"
+    )
