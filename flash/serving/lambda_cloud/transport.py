@@ -9,9 +9,13 @@ import ssl
 import httpx
 
 from flash.serving.app.timeouts import REQUEST_TIMEOUT_SECONDS
-from flash.serving.src.stream_channel.protocol import HEARTBEAT_INTERVAL_SECONDS
+from flash.serving.src.stream_channel.protocol import HEARTBEAT_INTERVAL_SECONDS, LEASE_SECONDS
 
 from .config import PORT, SERVER_NAME
+
+# The next renewal starts one heartbeat after the last success; splitting the rest of the lease
+# in two leaves a full retry before it lapses when that first attempt stalls.
+LEASE_RENEW_TIMEOUT_SECONDS = (LEASE_SECONDS - HEARTBEAT_INTERVAL_SECONDS) / 2
 
 
 class WorkerError(RuntimeError):
@@ -57,17 +61,25 @@ class WorkerTransport:
         if not address.is_global:
             raise ValueError("Lambda worker must have a public IP")
         context = ssl.create_default_context(cadata=tls["cert"])
-        self.client = httpx.AsyncClient(
-            base_url=f"https://{address}:{PORT}",
-            verify=context,
-            headers={"Authorization": f"Bearer {tls['token']}"},
-            follow_redirects=False,
-            timeout=httpx.Timeout(REQUEST_TIMEOUT_SECONDS, connect=10),
-            transport=transport,
-        )
+
+        def client(timeout):
+            return httpx.AsyncClient(
+                base_url=f"https://{address}:{PORT}",
+                verify=context,
+                headers={"Authorization": f"Bearer {tls['token']}"},
+                follow_redirects=False,
+                timeout=timeout,
+                transport=transport,
+            )
+
+        self.client = client(httpx.Timeout(REQUEST_TIMEOUT_SECONDS, connect=10))
+        # Lease renewals get their own connection pool: a proxy saturated with long-lived
+        # generations must never make a renewal wait for a connection until its lease lapses,
+        # which makes the worker abort a healthy generation.
+        self.lease_client = client(httpx.Timeout(LEASE_RENEW_TIMEOUT_SECONDS))
 
     def request(self, method, path, body=None):
-        return self.client.build_request(
+        return self._client_for(path).build_request(
             method,
             path,
             json=body,
@@ -80,7 +92,7 @@ class WorkerTransport:
             await self.call("/lease", {"generation_id": body["generation_id"]})
             lease_task = asyncio.create_task(self._renew_lease(body["generation_id"]))
         try:
-            response = await self.client.send(
+            response = await self._client_for(path).send(
                 self.request("GET" if body is None else "POST", path, body)
             )
             check_response(response)
@@ -97,11 +109,18 @@ class WorkerTransport:
                 lease_task.cancel()
                 await asyncio.gather(lease_task, return_exceptions=True)
 
+    def _client_for(self, path):
+        return self.lease_client if path == "/lease" else self.client
+
     async def _renew_lease(self, generation_id):
+        loop = asyncio.get_running_loop()
+        started = loop.time()
         while True:
-            await asyncio.sleep(HEARTBEAT_INTERVAL_SECONDS)
+            # Attempts start a heartbeat apart, or at once when the previous one overran.
+            await asyncio.sleep(max(0.0, started + HEARTBEAT_INTERVAL_SECONDS - loop.time()))
+            started = loop.time()
             with contextlib.suppress(WorkerError, TimeoutError):
-                async with asyncio.timeout(HEARTBEAT_INTERVAL_SECONDS):
+                async with asyncio.timeout(LEASE_RENEW_TIMEOUT_SECONDS):
                     await self.call("/lease", {"generation_id": generation_id})
 
     async def stream(self, body):
@@ -144,3 +163,4 @@ class WorkerTransport:
 
     async def aclose(self):
         await self.client.aclose()
+        await self.lease_client.aclose()
