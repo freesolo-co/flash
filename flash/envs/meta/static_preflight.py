@@ -90,6 +90,39 @@ def _sdk_version() -> str:
         return "unknown"
 
 
+def _may_bind(tree: ast.Module, name: str) -> bool:
+    """whether a package ``__init__`` could bind ``name`` itself (conservatively yes)."""
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Name) and (
+            node.id in {"globals", "setattr", "__getattr__"}
+            or (node.id == name and isinstance(node.ctx, ast.Store))
+        ):
+            return True
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            if node.name in {name, "__getattr__"}:
+                return True
+        elif isinstance(node, (ast.Import, ast.ImportFrom)):
+            for alias in node.names:
+                bound = alias.asname or alias.name.split(".", 1)[0]
+                if alias.name == "*" or bound == name:
+                    return True
+    return False
+
+
+def _imported_submodules(init: Path, names: list[str], base_dir: Path) -> list[Path]:
+    """submodules ``from pkg import name`` provably imports.
+
+    Python imports ``pkg/name.py`` only when ``pkg/__init__.py`` has not already bound ``name``,
+    so a submodule the package could shadow is never checked.
+    """
+    subs = [init.parent / f"{name}.py" for name in names]
+    subs = [sub for sub in subs if sub.is_file()]
+    if not subs:
+        return []
+    tree = _parse(init, base_dir)
+    return [sub for sub in subs if not _may_bind(tree, sub.stem)]
+
+
 def _import_findings(
     entrypoint: Path, base_dir: Path, *, check_sdk: bool
 ) -> tuple[list[str], dict[Path, ast.Module]]:
@@ -106,11 +139,8 @@ def _import_findings(
             local = _local_module_path(base_dir, module)
             if local is not None:
                 pending.append(local)
-                for name in names:
-                    if isinstance(node, ast.ImportFrom) and local.name == "__init__.py":
-                        sub = local.parent / f"{name}.py"
-                        if sub.is_file():
-                            pending.append(sub)
+                if isinstance(node, ast.ImportFrom) and local.name == "__init__.py":
+                    pending.extend(_imported_submodules(local, names, base_dir))
                 continue
             if not check_sdk or module.split(".", 1)[0] != _SDK_ROOT:
                 continue
@@ -255,63 +285,65 @@ def _assigns_dataset_attribute(tree: ast.Module) -> bool:
     )
 
 
-def _declares_image_observations(local: list[ast.ClassDef]) -> bool:
-    for node in local:
-        for stmt in node.body:
-            if isinstance(stmt, ast.Assign):
-                targets = stmt.targets
-            elif isinstance(stmt, ast.AnnAssign) and stmt.value is not None:
-                targets = [stmt.target]
-            else:
-                continue
-            if any(isinstance(t, ast.Name) and t.id == "image_observations" for t in targets):
-                return isinstance(stmt.value, ast.Constant) and stmt.value.value is True
-    return False
-
-
-def _dataset_binding(node: ast.ClassDef) -> ast.stmt | None:
-    """the last statement in a class body that binds ``dataset`` (the one Python keeps)."""
+def _attribute_binding(node: ast.ClassDef, attr: str) -> ast.stmt | None:
+    """the last statement in a class body that binds ``attr`` (the one Python keeps)."""
     found = None
     for stmt in node.body:
         if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)):
             names = [stmt.name]
         elif isinstance(stmt, ast.Assign):
             names = [t.id for t in stmt.targets if isinstance(t, ast.Name)]
-        elif isinstance(stmt, ast.AnnAssign) and isinstance(stmt.target, ast.Name):
-            names = [stmt.target.id]
+        elif isinstance(stmt, ast.AnnAssign) and stmt.value is not None:
+            names = [stmt.target.id] if isinstance(stmt.target, ast.Name) else []
         else:
             continue
-        if "dataset" in names:
+        if attr in names:
             found = stmt
     return found
 
 
-def _dataset_method_findings(node: ast.ClassDef, resolver: _ClassResolver) -> list[str]:
-    """follow the built class's inheritance to the ``dataset`` binding Python resolves.
+def _effective_binding(
+    node: ast.ClassDef, resolver: _ClassResolver, attr: str
+) -> tuple[ast.ClassDef, ast.stmt] | None:
+    """the class-level binding of ``attr`` that Python's MRO resolves for ``node``, or None.
 
-    Only a single local inheritance line is followed (the SDK bases define no ``dataset``);
-    multiple local bases or a conditionally bound class body abstain.
+    Only a single local inheritance line is followed (the SDK bases bind neither ``dataset``
+    nor ``image_observations``); multiple local bases or a conditionally bound class body
+    abstain with None, as does an attribute no local class binds.
     """
     while _class_level_names(node) is not None:
-        stmt = _dataset_binding(node)
+        stmt = _attribute_binding(node, attr)
         if stmt is not None:
-            if (
-                isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef))
-                and not stmt.decorator_list
-            ):
-                message = (
-                    f"environment.py line {stmt.lineno}: {node.name}.dataset is a method, but "
-                    "Flash reads `dataset` as the row sequence itself (iterating it raises "
-                    "TypeError: 'method' object is not iterable). Assign the rows instead, e.g. "
-                    "`self.dataset = load_task_examples(path)`, or decorate it with @property"
-                )
-                return [message]
-            return []
+            return node, stmt
         bases = [b.id for b in node.bases if isinstance(b, ast.Name) and b.id in resolver.classes]
         if len(bases) != 1:
-            return []
+            return None
         node = resolver.classes[bases[0]]
-    return []
+    return None
+
+
+def _declares_image_observations(node: ast.ClassDef, resolver: _ClassResolver) -> bool:
+    binding = _effective_binding(node, resolver, "image_observations")
+    if binding is None or not isinstance(binding[1], (ast.Assign, ast.AnnAssign)):
+        return False
+    value = binding[1].value
+    return isinstance(value, ast.Constant) and value.value is True
+
+
+def _dataset_method_findings(node: ast.ClassDef, resolver: _ClassResolver) -> list[str]:
+    binding = _effective_binding(node, resolver, "dataset")
+    if binding is None:
+        return []
+    owner, stmt = binding
+    if not isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)) or stmt.decorator_list:
+        return []
+    message = (
+        f"environment.py line {stmt.lineno}: {owner.name}.dataset is a method, but Flash reads "
+        "`dataset` as the row sequence itself (iterating it raises TypeError: 'method' object "
+        "is not iterable). Assign the rows instead, e.g. "
+        "`self.dataset = load_task_examples(path)`, or decorate it with @property"
+    )
+    return [message]
 
 
 def _class_findings(
@@ -320,7 +352,7 @@ def _class_findings(
     sdk: list[type],
     resolver: _ClassResolver,
     *,
-    dataset_assigned: bool,
+    skip_dataset_check: bool,
 ) -> list[str]:
     from freesolo.environments import EnvironmentMultiTurn, EnvironmentSingleTurn
 
@@ -342,15 +374,19 @@ def _class_findings(
                 f"for abstract method(s) {', '.join(repr(m) for m in missing)} (required by "
                 f"{sdk[0].__name__})"
             )
-    if not dataset_assigned:
+    if not skip_dataset_check:
         findings.extend(_dataset_method_findings(local[0], resolver))
     return findings
 
 
 def check_environment_package(
-    entrypoint: Path, *, check_sdk_imports: bool = True
+    entrypoint: Path, *, check_sdk_imports: bool = True, reads_env_dataset: bool = True
 ) -> StaticEnvironmentFacts:
-    """raise EnvironmentPreflightError for load failures provable from the package source."""
+    """raise EnvironmentPreflightError for load failures provable from the package source.
+
+    ``reads_env_dataset`` is False when the run's explicit records or non-default dataset_path
+    take precedence, so the worker never iterates the environment's own ``dataset``.
+    """
     base_dir = entrypoint.parent
     findings, trees = _import_findings(entrypoint, base_dir, check_sdk=check_sdk_imports)
     tree = trees[entrypoint]
@@ -358,16 +394,16 @@ def check_environment_package(
     # an import failure stops the module before any class exists, so report only that.
     check_classes = check_sdk_imports and not findings
     resolver = _ClassResolver(tree)
-    dataset_assigned = _assigns_dataset_attribute(tree)
+    skip_dataset_check = not reads_env_dataset or _assigns_dataset_attribute(tree)
     name = _built_class(tree, resolver)
     resolved = resolver.chain(name) if name is not None else None
     if resolved is not None and resolved[1]:
         local, sdk = resolved
-        if _declares_image_observations(local):
+        if _declares_image_observations(local[0], resolver):
             facts = StaticEnvironmentFacts(image_observations=True)
         if check_classes:
             findings.extend(
-                _class_findings(name, local, sdk, resolver, dataset_assigned=dataset_assigned)
+                _class_findings(name, local, sdk, resolver, skip_dataset_check=skip_dataset_check)
             )
     if findings:
         shown = findings[:_MAX_FINDINGS]
