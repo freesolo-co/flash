@@ -30,6 +30,12 @@ RESTART_COOLDOWN_SECONDS = 30 * 60
 ROUTER_CACHE_SECONDS = 15
 # Upper bound on how long a routed request can wait for a health-state refresh.
 ROUTER_REFRESH_TIMEOUT_SECONDS = 1.0
+# The reservation scheduler terminates all four VMs once ``hold_until`` passes (observed
+# 2026-11-19: the week-long hold lapsed and production 9B Base lost every worker). While the
+# fleet is serving, the watchdog keeps the hold rolling well ahead of now.
+HOLD_RENEW_BELOW_SECONDS = 7 * 86400
+HOLD_EXTENSION_SECONDS = 30 * 86400
+HOLD_ALERT_WITHIN_SECONDS = 86400
 
 
 @dataclass
@@ -168,6 +174,67 @@ async def run_once(workers, store, lambda_api, model, *, transport_factory, cloc
     return report
 
 
+def renew_hold(state, now):
+    """Return (state, event) for the reservation ledger. Pure: no I/O.
+
+    Only a reservation in ``serving`` mode is renewed: that is the explicit hand-over of the
+    four VMs to production serving. ``closed``/``adopted`` reservations never terminate
+    anything, so they need neither renewal nor an alert.
+    """
+    if not isinstance(state, dict) or state.get("mode") in {None, "closed", "adopted"}:
+        return state, None
+    hold_until = state.get("hold_until")
+    if not isinstance(hold_until, (int, float)):
+        return state, "alert: reserved H100 reservation has no hold_until"
+    remaining = hold_until - now
+    if state["mode"] == "serving" and remaining < HOLD_RENEW_BELOW_SECONDS:
+        state = {**state, "hold_until": now + HOLD_EXTENSION_SECONDS, "hold_renewed_at": now}
+        return state, (
+            f"renewed reserved H100 hold: {remaining / 3600:.1f}h left -> "
+            f"{HOLD_EXTENSION_SECONDS / 86400:.0f}d"
+        )
+    if remaining <= HOLD_ALERT_WITHIN_SECONDS:
+        return state, (
+            f"alert: reserved H100 hold expires in {remaining / 3600:.1f}h "
+            f"(mode={state['mode']}); the reservation will terminate all four workers"
+        )
+    return state, None
+
+
+async def renew_reservation(ledger, *, clock=time.time):
+    """Extend the reservation's ``hold_until`` under the reservation scheduler's own tick lock.
+
+    The scheduler rewrites its whole state each tick, so the lock keeps a renewal from being
+    overwritten by a concurrent tick; a busy lock just defers renewal to the next cycle.
+    """
+    token = uuid.uuid4().hex
+    if not await ledger.put_if_absent("tick_lock", {"token": token, "at": clock()}):
+        state = await ledger.get("state")
+        hold_until = (state or {}).get("hold_until")
+        if (
+            (state or {}).get("mode") not in {None, "closed", "adopted"}
+            and isinstance(hold_until, (int, float))
+            and hold_until - clock() <= HOLD_ALERT_WITHIN_SECONDS
+        ):
+            print(
+                f"reserved H100 alert: hold expires in {(hold_until - clock()) / 3600:.1f}h "
+                "and renewal is waiting on the reservation tick lock",
+                flush=True,
+            )
+        return None
+    try:
+        state = await ledger.get("state")
+        renewed, event = renew_hold(state, clock())
+        if renewed is not state:
+            await ledger.put("state", renewed)
+        if event:
+            print(f"reserved H100 {event}", flush=True)
+        return event
+    finally:
+        if ((await ledger.get("tick_lock")) or {}).get("token") == token:
+            await ledger.pop("tick_lock")
+
+
 async def each_slot(engines, model, slots, label, call):
     """Run ``call(engine)`` on each slot with a bound; succeed if any slot succeeds.
 
@@ -208,7 +275,7 @@ def register_watchdog(app, image, module_name):
         workers = json.loads(os.environ["FLASH_RESERVED_H100_WORKERS"])
         api = LambdaAPI(os.environ["LAMBDA_API_KEY"])
         try:
-            return await run_once(
+            report = await run_once(
                 workers,
                 ModalDictStore(),
                 api,
@@ -217,6 +284,11 @@ def register_watchdog(app, image, module_name):
             )
         finally:
             await api.aclose()
+        try:
+            await renew_reservation(ModalDictStore(reserved.RESERVATION_SECRET_NAME))
+        except Exception as exc:  # never let renewal break probing; retried next cycle
+            print(f"reserved H100 alert: hold renewal failed: {exc!r}", flush=True)
+        return report
 
     # Modal resolves scheduled functions by their module-level identity.
     module = sys.modules[module_name]
@@ -253,6 +325,12 @@ class ModalDictStore:
 
     async def put(self, slot, value):
         await self._dict.put.aio(slot, value)
+
+    async def put_if_absent(self, key, value):
+        return await self._dict.put.aio(key, value, skip_if_exists=True)
+
+    async def pop(self, key):
+        return await self._dict.pop.aio(key, None)
 
 
 class HealthView:
