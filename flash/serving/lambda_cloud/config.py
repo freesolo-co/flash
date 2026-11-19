@@ -14,9 +14,13 @@ PORT = 8443
 HEARTBEAT_SECONDS = 30
 # An orphan cannot be reaped before the full startup + request budget expires.
 LEASE_SECONDS = 45 * 60 + 15 * 60 + 300
+# Published by publish-serving-image.yml from main d1397691; its /app/uv.lock is byte-identical
+# to the repository lock since #1766 (uv lock revision 3, dnspython 2.9.2, opentelemetry 1.45.2).
+# Workers verify that lock against their source revision at boot, so re-pin whenever uv.lock
+# changes: take the digest the workflow reports for a commit with the new lock.
 RUNTIME_IMAGE = (
     "ghcr.io/freesolo-co/freesolo-flash-serve@"
-    "sha256:50881d9f170356d24e379a6fca5e8f06f0ab323138e65a65771e9adeb8a83e8f"
+    "sha256:1b4bd9229621eaa0aeef8415608a2683c6eed5cf6703050973e65239fea2bc4c"
 )
 
 
