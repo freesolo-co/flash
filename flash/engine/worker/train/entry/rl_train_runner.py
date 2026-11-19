@@ -155,6 +155,10 @@ class _GrpoSubprocessStream:
             # is the failing path that reached no teardown. the direct child is gone but its group
             # need not be, and a surviving EngineCore strands the gpu for the next attempt.
             self.terminate()
+            # the traceback lives only in console_rl.txt; carry its last line into the run error.
+            summary = self._tail.failure_summary
+            if summary:
+                raise RuntimeError(f"verl.trainer.main_ppo exited {return_code}: {summary}")
         if self._orphaned_pipe and return_code == 0:
             # the trainer exited 0 but a descendant held the pipe open past the grace, so the group
             # was killed to release it. the trainer's status says nothing about that descendant, and
