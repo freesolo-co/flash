@@ -23,6 +23,16 @@ FIRST_LIVENESS_OBSERVED_FLOOR_S = 120.0
 # Require absence to persist this many polls before declaring sick — one None could be a Hub blip.
 BOOT_LOG_ABSENT_POLLS = 3
 
+# Host-reported boot progress (a VM still pulling the worker image before its worker can say
+# anything). The launcher reports about once a minute; a pull whose stage or image-disk bytes have not
+# moved for BOOT_PROGRESS_FRESH_S is stalled. Progress extends the first-liveness window only up to
+# BOOT_PROGRESS_MAX_S after the VM reached running, so a crawling pull cannot hold a GPU forever.
+BOOT_PROGRESS_READ_S = 60.0
+BOOT_PROGRESS_FRESH_S = 300.0
+BOOT_PROGRESS_MAX_S = 2700.0
+# Bytes on the image disk are bucketed so filesystem noise is not mistaken for a moving pull.
+BOOT_PROGRESS_BYTES_STEP = 256 * 1024 * 1024
+
 LOAD_TIMEOUT_S = 900.0
 SETUP_GRACE_S = 3000.0
 STALL_AFTER_S = 1500.0
