@@ -12,8 +12,9 @@ from flash.serving.src.stream_channel.protocol import HEARTBEAT_INTERVAL_SECONDS
 
 from .config import PORT, SERVER_NAME
 
-# A renewal may take until the lease would lapse, one heartbeat after the last renewal was sent.
-LEASE_RENEW_TIMEOUT_SECONDS = LEASE_SECONDS - HEARTBEAT_INTERVAL_SECONDS
+# The next renewal starts one heartbeat after the last success; splitting the rest of the lease
+# in two leaves a full retry before it lapses when that first attempt stalls.
+LEASE_RENEW_TIMEOUT_SECONDS = (LEASE_SECONDS - HEARTBEAT_INTERVAL_SECONDS) / 2
 
 
 class WorkerError(RuntimeError):
@@ -93,8 +94,12 @@ class WorkerTransport:
         return self.lease_client if path == "/lease" else self.client
 
     async def _renew_lease(self, generation_id):
+        loop = asyncio.get_running_loop()
+        started = loop.time()
         while True:
-            await asyncio.sleep(HEARTBEAT_INTERVAL_SECONDS)
+            # Attempts start a heartbeat apart, or at once when the previous one overran.
+            await asyncio.sleep(max(0.0, started + HEARTBEAT_INTERVAL_SECONDS - loop.time()))
+            started = loop.time()
             with contextlib.suppress(WorkerError, TimeoutError):
                 async with asyncio.timeout(LEASE_RENEW_TIMEOUT_SECONDS):
                     await self.call("/lease", {"generation_id": generation_id})
