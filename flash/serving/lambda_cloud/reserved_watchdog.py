@@ -264,6 +264,7 @@ class HealthView:
         self._clock = clock
         self._expires = 0.0
         self._usable = list(self._slots)
+        self._fleet_down = False
         self._cycle = itertools.cycle(self._slots)
 
     @classmethod
@@ -286,9 +287,18 @@ class HealthView:
                 # Inference waits on this refresh, so bound it; a slow store keeps the last view.
                 async with asyncio.timeout(ROUTER_REFRESH_TIMEOUT_SECONDS):
                     values = await asyncio.gather(*(self._store.get(s) for s in self._slots))
-                self._usable = routable_slots(
-                    dict(zip(self._slots, values, strict=True)), self._slots
-                )
+                states = dict(zip(self._slots, values, strict=True))
+                self._usable = routable_slots(states, self._slots)
+                self._fleet_down = not any(SlotState.load(states[s]).healthy for s in self._slots)
             except Exception as exc:  # keep the last known view
                 print(f"reserved H100 health read failed: {exc!r}", flush=True)
         return self._usable
+
+    async def fleet_down(self):
+        """True when the watchdog has quarantined every worker (e.g. the reservation ended).
+
+        The router then sends 9B Base to its Modal GPU fallback instead of failing open into
+        workers that cannot answer; it returns to the reserved fleet once any probe passes.
+        """
+        await self.usable()
+        return self._fleet_down

@@ -550,6 +550,10 @@ if RESERVED_ENGINES:
 MODAL_FALLBACK_BY_MODEL: dict[str, Any] = {
     bm: _configured_engine(bm, "modal", "_ModalGPU") for bm in base_models() if bm != reserved.MODEL
 }
+# 9B Base GPU fallback while every reserved worker is quarantined (HealthView.fleet_down).
+RESERVED_FALLBACK = (
+    _configured_engine(reserved.MODEL, "modal", "_ModalGPU") if RESERVED_ENGINES else None
+)
 
 
 def _engine_cls_for(base_model: str) -> Any:
@@ -577,6 +581,8 @@ class _ModalEnginePool:
 
     async def _engine_for(self, model):
         if RESERVED_ENGINES and model == reserved.MODEL:
+            if await self._reserved_health.fleet_down():
+                return RESERVED_FALLBACK(base_model=model)
             slot = await self._reserved_health.next_slot()
             return RESERVED_ENGINES[slot - 1](base_model=model)
         if (
@@ -673,7 +679,8 @@ class _ModalEnginePool:
                 await close()
 
     async def register(self, base_model: str, record: Any) -> None:
-        if RESERVED_ENGINES and base_model == reserved.MODEL:
+        reserved_model = RESERVED_ENGINES and base_model == reserved.MODEL
+        if reserved_model and not await self._reserved_health.fleet_down():
             payload = self._record_payload(record)
             generation = getattr(record, "deployment_generation", None)
             await self._each_reserved(
@@ -693,7 +700,13 @@ class _ModalEnginePool:
         model_id: str,
         expected_generation: str | None = None,
     ) -> None:
+        from flash.serving.app.provider_selection import unregister_active
+
         if RESERVED_ENGINES and base_model == reserved.MODEL:
+            fallback = RESERVED_FALLBACK(base_model=base_model)
+            await unregister_active([fallback], org_id, model_id, expected_generation)
+            if await self._reserved_health.fleet_down():
+                return
             # Quarantined slots are skipped: the router stops addressing the removed
             # checkpoint, so a recovering worker cannot be asked to serve it again.
             await self._each_reserved(
@@ -701,8 +714,6 @@ class _ModalEnginePool:
                 lambda engine: engine.unregister.remote.aio(org_id, model_id, expected_generation),
             )
             return
-        from flash.serving.app.provider_selection import unregister_active
-
         engines = [ENGINE_BY_MODEL[base_model](base_model=base_model)]
         if base_model in MODAL_FALLBACK_BY_MODEL:
             engines.append(MODAL_FALLBACK_BY_MODEL[base_model](base_model=base_model))

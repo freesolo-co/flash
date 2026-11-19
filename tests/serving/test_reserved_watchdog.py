@@ -272,3 +272,84 @@ async def test_routing_skips_quarantined_worker(monkeypatch, mod):
     assert engines[3].call_count == 0
     assert all(e.call_count == 3 for e in engines[:3])
     assert len(picks) == 9
+
+
+@pytest.mark.anyio
+async def test_health_view_reports_fleet_down_only_when_every_worker_is_quarantined():
+    quarantined = wd.SlotState(healthy=False).dump()
+    store = MemoryStore(dict.fromkeys((1, 2, 3), quarantined))
+    now = [0.0]
+    view = wd.HealthView(store, range(1, 5), clock=lambda: now[0])
+    assert not await view.fleet_down()
+    store.data[4] = quarantined
+    now[0] += wd.ROUTER_CACHE_SECONDS
+    assert await view.fleet_down()
+    assert await view.usable() == [1, 2, 3, 4]  # slot routing alone still fails open
+    store.data[2] = wd.SlotState().dump()  # one worker passes a probe again
+    now[0] += wd.ROUTER_CACHE_SECONDS
+    assert not await view.fleet_down()
+
+
+@pytest.mark.anyio
+async def test_dead_reserved_fleet_routes_9b_base_to_modal_fallback(monkeypatch, mod):
+    # 2026-11-19: the H100 reservation expired and all four workers vanished; failing open
+    # into them queued every request until Modal refused inputs, so no Base call or adapter
+    # deploy could succeed. With every slot quarantined the router must use the GPU fallback.
+    engines = tuple(MagicMock() for _ in range(4))
+    fallback_instance = MagicMock()
+    fallback = MagicMock(return_value=fallback_instance)
+    monkeypatch.setattr(mod, "RESERVED_ENGINES", engines)
+    monkeypatch.setattr(mod, "RESERVED_FALLBACK", fallback)
+    pool = _pool(mod, engines, [])
+    assert await pool._engine_for(reserved.MODEL) is fallback_instance
+    assert all(e.call_count == 0 for e in engines)
+
+
+@pytest.mark.anyio
+async def test_dead_reserved_fleet_registers_adapters_on_modal_fallback(monkeypatch, mod):
+    dead = AsyncMock(side_effect=RuntimeError("pending input queue limit"))
+    engines = tuple(_engine(dead) for _ in range(4))
+    fallback_register = AsyncMock(return_value={"ok": True})
+    fallback = _engine(fallback_register)
+    monkeypatch.setattr(mod, "RESERVED_ENGINES", engines)
+    monkeypatch.setattr(mod, "RESERVED_FALLBACK", fallback)
+    pool = _pool(mod, engines, [])
+    monkeypatch.setattr(pool, "_record_payload", lambda record: {"model_id": "m"})
+    await pool.register(reserved.MODEL, MagicMock(deployment_generation="g"))
+    fallback_register.assert_awaited_once_with({"model_id": "m"}, "g")
+    dead.assert_not_awaited()
+
+
+@pytest.mark.anyio
+async def test_healthy_reserved_fleet_never_uses_modal_fallback(monkeypatch, mod):
+    ok = AsyncMock(return_value={"ok": True})
+    engines = tuple(_engine(ok) for _ in range(4))
+    fallback = MagicMock()
+    monkeypatch.setattr(mod, "RESERVED_ENGINES", engines)
+    monkeypatch.setattr(mod, "RESERVED_FALLBACK", fallback)
+    pool = _pool(mod, engines, [1, 2, 3, 4])
+    monkeypatch.setattr(pool, "_record_payload", lambda record: {"model_id": "m"})
+    await pool.register(reserved.MODEL, MagicMock(deployment_generation="g"))
+    await pool._engine_for(reserved.MODEL)
+    assert ok.await_count == 4
+    fallback.assert_not_called()
+
+
+@pytest.mark.anyio
+async def test_unregister_evicts_from_live_fallback_even_when_fleet_is_down(monkeypatch, mod):
+    import flash.serving.app.provider_selection as selection
+
+    evicted = []
+
+    async def fake_unregister_active(engines, *args):
+        evicted.append((engines, args))
+
+    monkeypatch.setattr(selection, "unregister_active", fake_unregister_active)
+    dead = AsyncMock(side_effect=RuntimeError("unreachable"))
+    engines = tuple(_engine(dead) for _ in range(4))
+    fallback = MagicMock()
+    monkeypatch.setattr(mod, "RESERVED_ENGINES", engines)
+    monkeypatch.setattr(mod, "RESERVED_FALLBACK", fallback)
+    pool = _pool(mod, engines, [])
+    await pool.unregister(reserved.MODEL, "org", "flash-x/step-1", "g")
+    assert evicted == [([fallback.return_value], ("org", "flash-x/step-1", "g"))]
