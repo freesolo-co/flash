@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from typing import Any
 
 import anyio
@@ -34,6 +35,7 @@ from flash.server.routes.serving_revisions import (
     _managed_chat_messages,
 )
 
+logger = logging.getLogger(__name__)
 _UPSTREAM_RESPONSE_HEADER_EXCLUSIONS = frozenset(
     {
         "connection",
@@ -320,4 +322,8 @@ def managed_chat(
     except httpx.HTTPStatusError as exc:
         raise upstream_chat_error(exc, checkpoint_id=authorized_checkpoint) from exc
     except Exception as exc:
+        # Exception text can carry upstream detail; the type is enough to classify the failure.
+        logger.warning(
+            "serving_failure checkpoint=%s error=%s", authorized_checkpoint, type(exc).__name__
+        )
         raise HTTPException(status_code=502, detail=f"inference failure: {exc}") from exc

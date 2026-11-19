@@ -3,6 +3,7 @@
 import asyncio
 import contextlib
 import json
+import re
 import ssl
 
 import httpx
@@ -19,14 +20,32 @@ class WorkerError(RuntimeError):
         super().__init__(message)
 
 
+_SAFE_KIND = re.compile(r"[a-z][a-z0-9_]{0,63}")
+
+
+def _failure_kind(response):
+    """The worker's fixed error kind (e.g. ``timeout``), never free-form body text."""
+    try:
+        body = response.json()
+    except ValueError:
+        return None
+    if not isinstance(body, dict):
+        return None
+    kind = body.get("kind", body.get("error"))
+    return kind if isinstance(kind, str) and _SAFE_KIND.fullmatch(kind) else None
+
+
 def check_response(response):
     if response.status_code == 400:
         body = response.json()
         if body.get("kind") == "value_error":
             raise ValueError(body["message"])
     if response.status_code != 200:
+        kind = _failure_kind(response)
+        detail = f"HTTP {response.status_code}" + (f", kind={kind}" if kind else "")
         raise WorkerError(
-            "Lambda worker request failed", 504 if response.status_code == 504 else 502
+            f"Lambda worker request failed ({detail})",
+            504 if response.status_code == 504 else 502,
         )
 
 

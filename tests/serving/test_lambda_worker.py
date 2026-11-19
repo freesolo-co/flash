@@ -306,3 +306,21 @@ def test_canary_flag_requires_a_one_token_base_model_generation():
         response = client.post("/generate", json=body, headers=headers)
     assert response.status_code == 400
     engine._generate.assert_not_awaited()
+
+
+@pytest.mark.parametrize(
+    ("response", "status", "detail"),
+    [
+        (httpx.Response(500, text="Internal Server Error"), 502, "(HTTP 500)"),
+        (httpx.Response(504, json={"kind": "timeout"}), 504, "(HTTP 504, kind=timeout)"),
+        (httpx.Response(401, json={"error": "unauthorized"}), 502, "(HTTP 401, kind=unauthorized)"),
+        (httpx.Response(503, json={"kind": "token=secret"}), 502, "(HTTP 503)"),
+    ],
+)
+def test_worker_failure_names_status_and_fixed_kind_only(response, status, detail):
+    from flash.serving.lambda_cloud.transport import check_response
+
+    with pytest.raises(WorkerError) as excinfo:
+        check_response(response)
+    assert str(excinfo.value) == f"Lambda worker request failed {detail}"
+    assert excinfo.value.status_code == status
