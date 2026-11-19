@@ -9,7 +9,9 @@ from .transport import WorkerTransport
 
 MODEL = "Qwen/Qwen3.5-9B-Base"
 SECRET_NAME = "flash-reserved-h100-workers-20261112"
-SLOT_COUNT = 4
+# Serving declares one CPU proxy per slot up to this ceiling; the workers secret configures any
+# non-empty subset of them. Unconfigured slots are never routed (see reserved_watchdog).
+SLOT_COUNT = 8
 # Holds LAMBDA_API_KEY for the reservation's own lifecycle; the watchdog uses it only to
 # reboot an existing reserved instance, never to launch or terminate one.
 RESERVATION_SECRET_NAME = "flash-h100-reservation-20261112"
@@ -21,13 +23,26 @@ def enabled(model, environment):
     return model == MODEL and environment == "main"
 
 
-def worker_config(slot, raw):
+def parse_workers(raw):
+    """Validated worker entries from the secret: unique slots within 1..SLOT_COUNT."""
     workers = json.loads(raw)
-    if len(workers) != SLOT_COUNT or {w["slot"] for w in workers} != set(range(1, 5)):
-        raise ValueError("Reserved fleet must contain four unique slots")
-    if len({w["instance_id"] for w in workers}) != SLOT_COUNT:
+    if not isinstance(workers, list) or not workers:
+        raise ValueError("Reserved fleet must configure at least one slot")
+    slots = [w.get("slot") for w in workers]
+    if any(type(s) is not int or not 1 <= s <= SLOT_COUNT for s in slots):
+        raise ValueError(f"Reserved fleet slots must be integers 1..{SLOT_COUNT}")
+    if len(set(slots)) != len(slots):
+        raise ValueError("Reserved fleet slots must be unique")
+    if len({w["instance_id"] for w in workers}) != len(workers):
         raise ValueError("Reserved fleet instance IDs must be distinct")
-    return next(w for w in workers if w["slot"] == slot)
+    return sorted(workers, key=lambda w: w["slot"])
+
+
+def worker_config(slot, raw):
+    worker = next((w for w in parse_workers(raw) if w["slot"] == slot), None)
+    if worker is None:
+        raise ValueError(f"Reserved slot {slot} is not configured")
+    return worker
 
 
 class ReservedLambdaEngineProxy(LambdaEngineProxy):

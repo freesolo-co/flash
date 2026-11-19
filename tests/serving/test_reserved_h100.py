@@ -20,6 +20,33 @@ def workers():
     ]
 
 
+def test_worker_config_accepts_any_subset_of_declared_slots():
+    data = [dict(w, slot=w["slot"] + 4, instance_id=f"x{w['slot']}") for w in workers()]
+    raw = json.dumps(workers() + data)
+    assert reserved.SLOT_COUNT == 8
+    assert [w["slot"] for w in reserved.parse_workers(raw)] == list(range(1, 9))
+    assert reserved.worker_config(8, raw)["instance_id"] == "x4"
+    # Four configured slots: the declared slots beyond them are not configured.
+    with pytest.raises(ValueError, match="not configured"):
+        reserved.worker_config(5, json.dumps(workers()))
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda d: d.__setitem__(1, dict(d[1], slot=1)),
+        lambda d: d.__setitem__(0, dict(d[0], slot=9)),
+        lambda d: d.__setitem__(0, dict(d[0], slot=0)),
+        lambda d: d.clear(),
+    ],
+)
+def test_reject_invalid_reserved_slots(mutate):
+    data = workers()
+    mutate(data)
+    with pytest.raises(ValueError, match="slot"):
+        reserved.parse_workers(json.dumps(data))
+
+
 def test_reject_duplicate_reserved_instance():
     data = workers()
     data[1]["instance_id"] = data[0]["instance_id"]

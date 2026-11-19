@@ -539,7 +539,7 @@ RESERVED_ENGINES = (
             max_capacity=1,
             reserved_slot=slot,
         )
-        for slot in range(1, 5)
+        for slot in range(1, reserved.SLOT_COUNT + 1)
     )
     if reserved.enabled(reserved.MODEL, MODAL_ENVIRONMENT)
     else ()
@@ -967,7 +967,10 @@ def start_all(base_model: str | None = None) -> None:
     models = [base_model] if base_model else list(base_models())
     for bm in models:
         names = (
-            [model_engine_name(bm) + f"_ReservedH100{slot}" for slot in range(1, 5)]
+            [
+                model_engine_name(bm) + f"_ReservedH100{slot}"
+                for slot in reserved_watchdog.configured_slots()
+            ]
             if reserved.enabled(bm, MODAL_ENVIRONMENT)
             else [model_engine_name(bm)]
         )

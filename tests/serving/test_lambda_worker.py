@@ -59,7 +59,9 @@ def test_worker_auth_lifecycle_and_exact_payload_forwarding():
     with TestClient(create_app(engine, "private")) as client:
         assert client.get("/health").status_code == 401
         headers = {"Authorization": "Bearer private"}
-        assert client.get("/health", headers=headers).json()["base_model"] == MODEL
+        health = client.get("/health", headers=headers).json()
+        assert health["base_model"] == MODEL
+        assert health["canary_lane"] is True
         client.post("/lease", json={"generation_id": "g1"}, headers=headers)
         assert client.post("/generate", json=body, headers=headers).json() == {"text": "ok"}
         engine._generate.assert_awaited_once_with(
