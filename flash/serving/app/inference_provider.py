@@ -27,9 +27,9 @@ class ModelPolicy:
                     "capacity requires integer 0 <= min_capacity <= max_capacity; max_capacity >= 1"
                 )
         if not isinstance(self.lambda_gpus, (tuple, list)) or any(
-            gpu not in {"A10", "A100-40GB", "A100-80GB", "H100", "H200", "B200"}
-            for gpu in self.lambda_gpus
+            gpu not in {"H100", "H200", "B200"} for gpu in self.lambda_gpus
         ):
+            # Lambda serving never rents A10 or A100; those stay Modal-only.
             raise ValueError("lambda_gpus must be a list or tuple of approved GPU names")
         object.__setattr__(self, "lambda_gpus", tuple(self.lambda_gpus))
 
@@ -40,13 +40,13 @@ class ModelPolicy:
 # allow one temporary extra GPU, then drain the replaced Modal replica before
 # starting another. lambda_gpus is an allowlist: use the cheapest available offer.
 MODEL_POLICIES = {
-    "Qwen/Qwen3.5-0.8B": ModelPolicy(min_capacity=1, max_capacity=2, lambda_gpus=("A10",)),
+    "Qwen/Qwen3.5-0.8B": ModelPolicy(min_capacity=1, max_capacity=2),
     "Qwen/Qwen3.5-4B": ModelPolicy(min_capacity=0, max_capacity=2),
     "Qwen/Qwen3.5-9B": ModelPolicy(min_capacity=0, max_capacity=2),
     "Qwen/Qwen3.5-9B-Base": ModelPolicy(
         min_capacity=2,
         max_capacity=4,
-        lambda_gpus=["A100-40GB", "A100-80GB", "H100"],
+        lambda_gpus=["H100"],
     ),
     "Qwen/Qwen3.8-27B": ModelPolicy(min_capacity=0, max_capacity=2),
     "Qwen/Qwen3.6-35B-A3B": ModelPolicy(min_capacity=0, max_capacity=2),

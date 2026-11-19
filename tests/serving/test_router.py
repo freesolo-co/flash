@@ -216,7 +216,7 @@ def test_healthz_reports_one_gpu_per_base_model(app_setup):
     ]
     assert body["base_models"] == [QWEN, QWEN_35B]  # sorted by model id
     assert body["gpus"] == 2  # two configured supported base-model engines
-    expected = {QWEN: "A100-40GB | A100-80GB | H100 | L40S", QWEN_35B: "H200 | B200"}
+    expected = {QWEN: "H100 | L40S | A100-80GB", QWEN_35B: "H200 | B200"}
     assert body["inference_provider"] == "lambda"
     assert body["fallback_provider_by_model"] == {QWEN: "modal", QWEN_35B: "modal"}
     assert body["gpu_by_model"] == expected

@@ -44,12 +44,18 @@ def qualified_placements(model):
     return ("A100-80GB", "H100")
 
 
+# Lambda serving rents only H100-class GPUs. A10 and A100 stay qualified for
+# the engine (Modal still serves on A10G/A100-80GB) but are never launched on
+# Lambda Cloud: they cycled as on-demand fleet workers for 0.8B and 9B.
+LAMBDA_SERVING_GPUS = ("H100", "H200", "B200")
+
+
 def placements(model):
     qualified = qualified_placements(model)
     requested = policy_for(model).lambda_gpus
     if any(gpu not in qualified for gpu in requested):
         raise ValueError(f"Unqualified Lambda GPU for {model}: {requested}")
-    return requested or qualified
+    return tuple(gpu for gpu in requested or qualified if gpu in LAMBDA_SERVING_GPUS)
 
 
 def gpu_matches(gpu, description):
