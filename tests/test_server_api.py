@@ -49,6 +49,7 @@ pytest.importorskip("fastapi")
 from fastapi.testclient import TestClient
 
 import flash.server.routes.serving_completion as serving_completion
+from tests._helpers import wait_until_leading
 
 
 def _env_package_b64() -> str:
@@ -220,6 +221,7 @@ def api(tmp_path, monkeypatch):
         lambda **_kwargs: True,
     )
     with TestClient(app_mod.create_app()) as client:
+        wait_until_leading(client)
         # the fake token exists only to satisfy startup preflight. leaving it live for requests makes
         # submit-time environment pinning call the real GitHub API with `ghp-test`; tokenless planes
         # deliberately defer that work to the worker. tests that exercise a token set their own.
