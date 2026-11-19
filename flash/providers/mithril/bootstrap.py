@@ -126,6 +126,8 @@ def stage(name,reason=''):
     report()
 def pull(image):
     # Report the image disk while the pull runs; retry a failed pull (registry blips) a few times.
+    # Each pull is bounded by the run deadline so a hung pull cannot keep the VM past its budget
+    # when the control plane is not supervising it.
     done=threading.Event()
     def beat():
         while not done.wait(60):
@@ -133,12 +135,17 @@ def pull(image):
     threading.Thread(target=beat,daemon=True).start()
     try:
         for tries in range(3):
-            if time.time() >= BUNDLE['deadline_at']:
+            remaining=BUNDLE['deadline_at']-time.time()
+            if remaining<=0:
                 break
-            if subprocess.run(['docker','pull','--quiet',image],stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,check=False).returncode==0:
+            try:
+                code=subprocess.run(['docker','pull','--quiet',image],stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,check=False,timeout=remaining).returncode
+            except subprocess.TimeoutExpired:
+                break
+            if code==0:
                 return
-            time.sleep(15*(tries+1))
+            time.sleep(max(0,min(15*(tries+1),BUNDLE['deadline_at']-time.time())))
     finally:
         done.set()
     stage('failed','worker image pull failed')

@@ -1109,6 +1109,7 @@ def _exec_launcher(monkeypatch, tmp_path, bundle, capsule, pull_rc):
     root.mkdir()
     daemon = tmp_path / "daemon.json"
     reports, commands = [], []
+    pull_timeouts = bundle.setdefault("_pull_timeouts", [])
 
     def urlopen(request, timeout):
         if isinstance(request, urllib.request.Request):
@@ -1119,6 +1120,13 @@ def _exec_launcher(monkeypatch, tmp_path, bundle, capsule, pull_rc):
 
     def run(command, **kw):
         commands.append(command)
+        if command[:2] == ["docker", "pull"]:
+            pull_timeouts.append(kw.get("timeout"))
+            if pull_rc == "hang":
+                # A pull that outlives its bound; an unbounded one would block forever.
+                if kw.get("timeout") is None:
+                    raise AssertionError("image pull ran without a deadline bound")
+                raise subprocess.TimeoutExpired(command, kw["timeout"])
         rc = pull_rc if command[:2] == ["docker", "pull"] else 0
         return subprocess.CompletedProcess(command, rc)
 
@@ -1156,6 +1164,21 @@ def test_launcher_reports_a_failed_image_pull_instead_of_going_silent(
     )
     # a registry blip is retried; a pull that keeps failing is reported, the worker never starts.
     assert sum(c[:2] == ["docker", "pull"] for c in commands) == 3
+    assert not any(c[0] == "timeout" for c in commands)
+    assert reports[-1]["stage"] == "failed"
+    assert reports[-1]["reason"] == "worker image pull failed"
+    assert commands[-1] == ["shutdown", "-h", "now"]
+    assert "secret" not in json.dumps(reports) + capsys.readouterr().out
+
+
+def test_launcher_bounds_the_image_pull_by_the_run_deadline(monkeypatch, tmp_path, capsys):
+    # Without control-plane supervision, a hung pull must not keep the VM past its deadline:
+    # the pull gets the remaining deadline as its timeout and a timed-out pull ends the boot.
+    capsule = b"capsule"
+    bundle = _launcher_bundle(capsule)
+    reports, commands = _exec_launcher(monkeypatch, tmp_path, bundle, capsule, pull_rc="hang")
+    (bound,) = bundle["_pull_timeouts"]
+    assert 0 < bound <= 3600
     assert not any(c[0] == "timeout" for c in commands)
     assert reports[-1]["stage"] == "failed"
     assert reports[-1]["reason"] == "worker image pull failed"
