@@ -132,10 +132,14 @@ async def admitted_managed_chat(
     if stats.borrowed_tokens >= limiter.total_tokens and stats.tasks_waiting >= queue_limit:
         raise _chat_overloaded(429, "queue_full", limiter)
     slot = object()
-    with anyio.move_on_after(_env_number(_CHAT_QUEUE_WAIT_ENV, 30.0, minimum=0.0)) as wait:
-        await limiter.acquire_on_behalf_of(slot)
-    if wait.cancelled_caught:
-        raise _chat_overloaded(503, "queue_timeout", limiter)
+    try:
+        # Take an idle slot without a checkpoint, so a zero queue wait still admits.
+        limiter.acquire_on_behalf_of_nowait(slot)
+    except anyio.WouldBlock:
+        with anyio.move_on_after(_env_number(_CHAT_QUEUE_WAIT_ENV, 30.0, minimum=0.0)) as wait:
+            await limiter.acquire_on_behalf_of(slot)
+        if wait.cancelled_caught:
+            raise _chat_overloaded(503, "queue_timeout", limiter) from None
     try:
         if await request.is_disconnected():
             # The caller gave up while queued; do not spend a generation on nobody.

@@ -178,3 +178,20 @@ def test_queued_chat_gives_up_with_503_after_bounded_wait(monkeypatch):
             assert app.state.chat_forwarding_limiter.statistics().borrowed_tokens == 0
 
     asyncio.run(exercise())
+
+
+def test_zero_queue_wait_still_admits_into_an_idle_slot(monkeypatch):
+    # A zero wait means "do not queue", not "refuse every chat": idle slots must admit.
+    monkeypatch.setenv("FLASH_CHAT_QUEUE_WAIT_SECONDS", "0")
+    app, calls = _slow_chat_app(monkeypatch, threading.Event(), threading.Event(), target=1)
+
+    async def exercise():
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app), base_url="http://test"
+        ) as client:
+            response = await client.post("/v1/runs/run/chat", json={})
+        assert response.status_code == 200, response.text
+        assert len(calls) == 1
+        assert app.state.chat_forwarding_limiter.statistics().borrowed_tokens == 0
+
+    asyncio.run(exercise())
