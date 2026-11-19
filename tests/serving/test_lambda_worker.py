@@ -306,3 +306,32 @@ def test_canary_flag_requires_a_one_token_base_model_generation():
         response = client.post("/generate", json=body, headers=headers)
     assert response.status_code == 400
     engine._generate.assert_not_awaited()
+
+
+@pytest.mark.anyio
+async def test_slow_lease_renewal_still_renews_on_its_own_pool(tls):
+    """A renewal slower than one heartbeat (but inside the lease) must not be abandoned."""
+    renewed = []
+
+    async def handler(request):
+        body = json.loads(request.content)
+        if request.url.path == "/lease":
+            await asyncio.sleep(1.5 if renewed else 0)
+            renewed.append(body["generation_id"])
+            return httpx.Response(200, json={"ok": True})
+        await asyncio.sleep(4.0)
+        return httpx.Response(200, json={"request_id": body["generation_id"]})
+
+    transport = WorkerTransport("8.8.8.8", tls, transport=httpx.MockTransport(handler))
+    try:
+        assert transport._client_for("/lease") is transport.lease_client
+        assert transport._client_for("/generate") is transport.client
+        assert transport.lease_client is not transport.client
+        result = await transport.call("/generate", {"generation_id": "g-slow"})
+        assert result["request_id"] == "g-slow"
+        # the initial lease plus at least one slow (1.5 s) renewal that completed
+        assert len(renewed) >= 2
+    finally:
+        await transport.aclose()
+    assert transport.lease_client.is_closed
+    assert transport.client.is_closed
