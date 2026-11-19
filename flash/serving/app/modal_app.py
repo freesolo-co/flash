@@ -952,20 +952,6 @@ def router():
     )
 
 
-def _configured_reserved_slots() -> list[int]:
-    """Slots the watchdog last saw in the workers secret; every declared slot if unknown."""
-    declared = list(range(1, reserved.SLOT_COUNT + 1))
-    try:
-        configured = modal.Dict.from_name(reserved_watchdog.HEALTH_DICT_NAME).get(
-            reserved_watchdog.CONFIGURED_KEY
-        )
-    except Exception:  # a diagnostic must still warm what it can
-        return declared
-    if isinstance(configured, list) and configured and set(configured) <= set(declared):
-        return sorted(configured)
-    return declared
-
-
 @app.local_entrypoint()
 def start_all(base_model: str | None = None) -> None:
     """Explicitly boot deployed gpu engines and wait for them to report healthy.
@@ -983,7 +969,7 @@ def start_all(base_model: str | None = None) -> None:
         names = (
             [
                 model_engine_name(bm) + f"_ReservedH100{slot}"
-                for slot in _configured_reserved_slots()
+                for slot in reserved_watchdog.configured_slots()
             ]
             if reserved.enabled(bm, MODAL_ENVIRONMENT)
             else [model_engine_name(bm)]

@@ -408,6 +408,22 @@ class ModalDictStore:
         return await self._dict.pop.aio(key, None)
 
 
+def configured_slots() -> list[int]:
+    """Slots the watchdog last saw in the workers secret; every declared slot if unknown."""
+    import modal
+
+    from . import reserved
+
+    declared = list(range(1, reserved.SLOT_COUNT + 1))
+    try:
+        configured = modal.Dict.from_name(HEALTH_DICT_NAME).get(CONFIGURED_KEY)
+    except Exception:  # a diagnostic must still warm what it can
+        return declared
+    if isinstance(configured, list) and configured and set(configured) <= set(declared):
+        return sorted(configured)
+    return declared
+
+
 class HealthView:
     """Router-side cached read of slot states; never blocks routing on the store."""
 
