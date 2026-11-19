@@ -681,7 +681,11 @@ def _preflight_environment_source(spec: JobSpec) -> None:
         entrypoint = Path(_resolve_environment_reference(environment.id, environment.resolved_sha))
         if not entrypoint.is_file():
             return
-        facts = check_environment_package(entrypoint, check_sdk_imports=not own_sdk)
+        facts = check_environment_package(
+            entrypoint,
+            check_sdk_imports=not own_sdk,
+            reads_env_dataset=_worker_reads_env_dataset(environment.params, entrypoint.parent),
+        )
         text_only_source = (
             spec.algorithm == "grpo"
             and bool(spec.train.init_from_adapter)
@@ -702,6 +706,20 @@ def _preflight_environment_source(spec: JobSpec) -> None:
             "train.init_from_adapter source is a text-only adapter; start a fresh run or warm-start "
             "from an adapter trained with images"
         )
+
+
+def _worker_reads_env_dataset(params: dict | None, base_dir) -> bool:
+    """whether the worker trains on the env's own ``dataset`` (flash/envs/loading/adapter.py).
+
+    explicit records or a non-default dataset_path win over it, so it is never iterated.
+    """
+    from flash.envs.loading.loader import _resolve_path_arg
+    from flash.envs.meta.dataset_selection import select_dataset_source
+
+    params = dict(params or {})
+    records = params.pop("records", None)
+    selection = select_dataset_source(params, base_dir, records, _resolve_path_arg)
+    return selection.source is None or selection.source_is_dataset_file
 
 
 def _source_adapter_is_text_only(spec: JobSpec) -> bool:

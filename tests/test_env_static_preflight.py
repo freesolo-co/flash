@@ -95,6 +95,21 @@ def test_a_sibling_module_import_is_checked_too(tmp_path):
         check_environment_package(entrypoint)
 
 
+@pytest.mark.parametrize(("init", "rejected"), [("rows = []\n", False), ("", True)])
+def test_a_package_submodule_is_checked_only_when_python_imports_it(tmp_path, init, rejected):
+    # `from helpers import rows` imports helpers/rows.py only if helpers/__init__ lacks `rows`.
+    entrypoint = _package(tmp_path, "from helpers import rows\n" + _GOOD)
+    (entrypoint.parent / "helpers").mkdir()
+    (entrypoint.parent / "helpers" / "__init__.py").write_text(init)
+    (entrypoint.parent / "helpers" / "rows.py").write_text("from freesolo.missing import x\n")
+
+    if rejected:
+        with pytest.raises(EnvironmentPreflightError, match=r"rows\.py line 1"):
+            check_environment_package(entrypoint)
+    else:
+        check_environment_package(entrypoint)
+
+
 def test_guarded_and_non_sdk_imports_are_not_judged(tmp_path):
     source = """
         try:
@@ -251,6 +266,18 @@ def test_image_observations_is_reported_for_the_built_class(tmp_path):
     assert check_environment_package(_package(tmp_path, source)).image_observations is True
 
 
+def test_image_observations_follows_python_attribute_resolution(tmp_path):
+    # Env(TextEnv, ImageMixin): Python resolves TextEnv's False, as the worker's getattr does.
+    source = _GOOD.replace(
+        "class Env(EnvironmentSingleTurn):\n",
+        "class TextEnv(EnvironmentSingleTurn):\n    image_observations = False\n\n\n"
+        "class ImageMixin:\n    image_observations = True\n\n\n"
+        "class Env(TextEnv, ImageMixin):\n",
+    )
+
+    assert check_environment_package(_package(tmp_path, source)).image_observations is False
+
+
 def test_the_loader_no_longer_forwards_the_contract_path(tmp_path):
     # tau-kimi / html-glm: load_environment(**kwargs) -> Env(**kwargs) with no contract_path.
     entrypoint = _package(tmp_path, _GOOD)
@@ -296,6 +323,38 @@ def test_submit_preparation_rejects_a_broken_package(monkeypatch, tmp_path):
     spec = _grpo_spec()
     spec = replace(spec, environment=replace(spec.environment, pip=["freesolo==9.9.9"]))
     preparation._preflight_environment_source(spec)
+
+
+_DATASET_METHOD = _GOOD.replace("self.dataset = ", "self._rows = ").replace(
+    "    def build_prompt_messages",
+    "    def dataset(self):\n        return list(self._rows)\n\n    def build_prompt_messages",
+)
+
+
+@pytest.mark.parametrize(
+    ("params", "rejected"),
+    [
+        ({}, True),
+        ({"dataset_path": "dataset/train.jsonl"}, True),
+        ({"records": [{"input": "q", "output": "a"}]}, False),
+        ({"dataset_path": "dataset/other.jsonl"}, False),
+    ],
+)
+def test_explicit_dataset_sources_skip_the_dataset_method_check(
+    monkeypatch, tmp_path, params, rejected
+):
+    # explicit records / a non-default dataset_path win, so the worker never iterates `dataset`.
+    entrypoint = _package(tmp_path, _DATASET_METHOD)
+    (entrypoint.parent / "dataset" / "other.jsonl").write_text(_DATASET)
+    _resolve_to(monkeypatch, entrypoint)
+    spec = _grpo_spec()
+    spec = replace(spec, environment=replace(spec.environment, params=params))
+
+    if rejected:
+        with pytest.raises(EnvironmentPreflightError, match="'method' object is not iterable"):
+            preparation._preflight_environment_source(spec)
+    else:
+        preparation._preflight_environment_source(spec)
 
 
 def test_submit_preparation_skips_an_unresolvable_package(monkeypatch):
