@@ -48,6 +48,7 @@ def _finalize_single_turn_reward(
     prompt_opened_thinking: bool,
     think_penalty: float,
     raise_on_error: bool = False,
+    on_fault=None,
 ) -> float:
     if think_penalty > 0 and thinking:
         reward -= think_penalty * _worker_decoding.think_token_count(
@@ -59,6 +60,8 @@ def _finalize_single_turn_reward(
     if not math.isfinite(reward):
         if raise_on_error:
             raise ValueError(f"env scoring returned a non-finite reward: {reward}")
+        if on_fault is not None:
+            on_fault(ValueError(f"env scoring returned a non-finite reward: {reward}"))
         print(f"[rl-verl] env scored {reward}; unscorable, scoring 0.0", flush=True)
         return 0.0
     return reward
@@ -76,6 +79,7 @@ def score_single_turn(
     raise_on_error: bool = False,
     breakdowns: list[dict[str, float] | None] | None = None,
     context: WorkerContext,
+    on_fault=None,
 ) -> float:
     """score one single-turn text completion against flash's live env.
 
@@ -84,6 +88,9 @@ def score_single_turn(
 
     append named breakdowns only when provided. grading failures append none so reported component
     means count them as zero without inventing metrics for scalar-only envs.
+
+    ``on_fault`` receives every failure that is scored 0.0 instead of raised, so a reward function
+    that fails on every call stays visible to the run's zero-signal guard.
     """
     # optimistic until the probe answers: a probe that RAISES is itself a failed grading, and the
     # except branch has to be able to record it -- omitting it instead would drop this completion
@@ -116,6 +123,8 @@ def score_single_turn(
             raise
         if collect_breakdown:
             breakdowns.append(None)
+        if on_fault is not None:
+            on_fault(exc)
         print(
             f"[rl-verl] env scoring raised ({type(exc).__name__}: {exc}); scoring 0.0", flush=True
         )
@@ -128,6 +137,7 @@ def score_single_turn(
         prompt_opened_thinking=prompt_opened_thinking,
         think_penalty=think_penalty,
         raise_on_error=raise_on_error,
+        on_fault=on_fault,
     )
 
 
@@ -140,6 +150,7 @@ def score_single_turn_batch(
     prompt_opened_thinking: bool,
     think_penalty: float,
     context: WorkerContext,
+    on_fault=None,
 ) -> list[tuple[float, list[dict[str, float] | None]]]:
     """score a batch of single-turn completions while preserving scalar failure semantics."""
     if not requests:
@@ -159,6 +170,7 @@ def score_single_turn_batch(
             think_penalty=think_penalty,
             breakdowns=breakdowns,
             context=context,
+            on_fault=on_fault,
         )
         return score, breakdowns
 
@@ -231,6 +243,7 @@ def score_single_turn_batch(
                 thinking=thinking,
                 prompt_opened_thinking=prompt_opened_thinking,
                 think_penalty=think_penalty,
+                on_fault=on_fault,
             ),
             breakdowns,
         )
