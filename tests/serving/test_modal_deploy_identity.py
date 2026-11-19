@@ -169,12 +169,12 @@ def test_engine_exit_hook_awaits_shutdown(monkeypatch) -> None:
 
 
 @pytest.mark.parametrize("environment", ["main", "", None])
-def test_main_9b_base_has_four_reserved_cpu_proxies_and_no_gpu_fallback(monkeypatch, environment):
+def test_main_9b_base_has_eight_reserved_cpu_proxies_and_no_gpu_fallback(monkeypatch, environment):
     _clear_deployment_environment(monkeypatch)
     module = _import_modal_app(monkeypatch, is_local=False, environment=environment)
     model = "Qwen/Qwen3.5-9B-Base"
-    assert len(module.RESERVED_ENGINES) == 4
-    assert {cls.reserved_slot for cls in module.RESERVED_ENGINES} == {1, 2, 3, 4}
+    assert len(module.RESERVED_ENGINES) == 8
+    assert {cls.reserved_slot for cls in module.RESERVED_ENGINES} == set(range(1, 9))
     assert all(cls.pinned_gpu is None for cls in module.RESERVED_ENGINES)
     assert model not in module.ENGINE_BY_MODEL
     assert model not in module.MODAL_FALLBACK_BY_MODEL
@@ -238,7 +238,7 @@ def test_start_all_resolves_reserved_workers_only_in_main(monkeypatch, environme
     module.start_all(None if all_models else model)
     names = [c.args[1] for c in module.modal.Cls.from_name.call_args_list]
     expected = (
-        [module.model_engine_name(model) + f"_ReservedH100{i}" for i in range(1, 5)]
+        [module.model_engine_name(model) + f"_ReservedH100{i}" for i in range(1, 9)]
         if environment == "main"
         else [module.model_engine_name(model)]
     )
