@@ -33,7 +33,7 @@ from flash.runner.supervise.errors import _RunCancelled
 from flash.runner.supervise.retry_decision import BOOT_STALL_FAILURE, BOOT_TIMEOUT_FAILURE
 
 
-def boot_progress_reader(spec, attempt, *, deadline_at=None):
+def boot_progress_reader(spec, attempt):
     """Read the host launcher's per-attempt progress blob (see ``bootstrap.WORKER``); None if absent.
 
     Bids launched before the launcher reported progress have no blob and keep the plain
@@ -46,16 +46,13 @@ def boot_progress_reader(spec, attempt, *, deadline_at=None):
     name = boot_progress_blob(spec.train.hf_repo, spec.phase, spec.run_id, attempt)
 
     def read():
-        if deadline_at is not None and time.time() >= deadline_at:
-            return None
         try:
             with open_container() as container:
                 raw, _ = BlobArtifacts(container).read(name, 4096)
-            record = json.loads(raw)
+            return json.loads(raw)
         except Exception:
             # absent (not reported yet), unreadable or malformed: no evidence either way.
             return None
-        return record if isinstance(record, dict) else None
 
     return read
 
@@ -120,7 +117,7 @@ def poll(handle, spec, *, log=None, deadline_at=None):
         load_timeout_failure=BOOT_TIMEOUT_FAILURE,
         first_liveness_failure=BOOT_STALL_FAILURE,
         signal_interruption_is_preemption=True,
-        boot_progress=boot_progress_reader(spec, h.attempt, deadline_at=deadline_at),
+        boot_progress=boot_progress_reader(spec, h.attempt),
     )
     return poll_instance_job(
         adapter,

@@ -657,14 +657,9 @@ def _classify_load_timeout(
     return None
 
 
-def _boot_progress_key(record: dict) -> tuple:
+def _disk_used(record: dict) -> float | None:
     used = record.get("disk_used")
-    bucket = (
-        int(used) // BOOT_PROGRESS_BYTES_STEP
-        if type(used) in (int, float) and math.isfinite(used) and used >= 0
-        else None
-    )
-    return (record.get("stage"), bucket)
+    return used if type(used) in (int, float) and math.isfinite(used) and used >= 0 else None
 
 
 def _observe_boot_progress(ctx: _PollContext, state: _PollState) -> dict | None:
@@ -682,13 +677,11 @@ def _observe_boot_progress(ctx: _PollContext, state: _PollState) -> dict | None:
     ):
         return state.boot_progress_record
     state.boot_progress_read_at = now
-    try:
-        record = reader()
-    except Exception:
-        record = None
+    record = reader()
     if not isinstance(record, dict) or not isinstance(record.get("stage"), str):
         return state.boot_progress_record
-    key = _boot_progress_key(record)
+    used = _disk_used(record)
+    key = (record["stage"], None if used is None else int(used) // BOOT_PROGRESS_BYTES_STEP)
     if key != state.boot_progress_key:
         state.boot_progress_key = key
         state.boot_progress_changed_at = now
@@ -705,17 +698,13 @@ def _boot_still_progressing(ctx: _PollContext, state: _PollState) -> bool:
         return False
     if now - state.boot_progress_changed_at > BOOT_PROGRESS_FRESH_S:
         return False
-    record = state.boot_progress_record or {}
     if not state.boot_extension_announced:
         state.boot_extension_announced = True
-        used = record.get("disk_used")
-        size = (
-            f"; {used / 2**30:.1f} GiB on the image disk"
-            if type(used) in (int, float) and math.isfinite(used) and used >= 0
-            else ""
-        )
+        record = state.boot_progress_record
+        used = _disk_used(record)
+        size = "" if used is None else f"; {used / 2**30:.1f} GiB on the image disk"
         ctx.say(
-            f"VM still booting the worker (launcher stage {record.get('stage')}{size}); keeping it "
+            f"VM still booting the worker (launcher stage {record['stage']}{size}); keeping it "
             f"past the {int(ctx.first_liveness_s)}s first-liveness window while it makes progress "
             f"(up to {int(BOOT_PROGRESS_MAX_S)}s after running)"
         )
@@ -732,7 +721,7 @@ def _classify_running_stall(
         return None
     if not state.seen_fresh_hb and not state.liveness_seen:
         record = _observe_boot_progress(ctx, state)
-        if isinstance(record, dict) and record.get("stage") == "failed":
+        if record is not None and record["stage"] == "failed":
             # The launcher said it cannot start the worker (e.g. the image pull failed): waiting out
             # the first-liveness window would only burn the boot slot.
             reason = record.get("reason")
@@ -764,9 +753,9 @@ def _classify_running_stall(
                     time.time() - state.running_since,
                     ctx.first_liveness_s,
                 )
-                if state.boot_progress_record is not None and state.boot_progress_changed_at:
+                if state.boot_progress_changed_at is not None:
                     detail += (
-                        f"; VM launcher last at stage {state.boot_progress_record.get('stage')}, "
+                        f"; VM launcher last at stage {state.boot_progress_record['stage']}, "
                         f"no progress for {int(time.time() - state.boot_progress_changed_at)}s"
                     )
                 return ctx.stalled_unless_terminal(detail, ctx.adapter.first_liveness_failure)

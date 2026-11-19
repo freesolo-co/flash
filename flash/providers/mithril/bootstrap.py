@@ -107,13 +107,11 @@ def blob_url(blob):
     return urllib.parse.urlunsplit((sas.scheme,sas.netloc,sas.path+'/'+urllib.parse.quote(blob,safe='/'),sas.query,''))
 boot={'stage':'unclaimed','reason':''}
 def report():
-    if not BUNDLE.get('boot_blob'):
-        return
     try:
         used=shutil.disk_usage('/mnt/local').used
     except OSError:
         used=None
-    body=json.dumps({'stage':boot['stage'],'reason':boot['reason'],'disk_used':used,'ts':time.time()}).encode()
+    body=json.dumps({'stage':boot['stage'],'reason':boot['reason'],'disk_used':used}).encode()
     try:
         put=urllib.request.Request(blob_url(BUNDLE['boot_blob']),data=body,method='PUT',
             headers={'x-ms-blob-type':'BlockBlob','x-ms-version':'2023-11-03'})

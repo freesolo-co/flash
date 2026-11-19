@@ -1149,7 +1149,7 @@ def test_launcher_reports_boot_progress_through_the_image_pull(monkeypatch, tmp_
         monkeypatch, tmp_path, _launcher_bundle(capsule), capsule, pull_rc=0
     )
     assert [r["stage"] for r in reports] == ["claimed", "pulling_image", "starting_worker"]
-    assert all(set(r) == {"stage", "reason", "disk_used", "ts"} for r in reports)
+    assert all(set(r) == {"stage", "reason", "disk_used"} for r in reports)
     pull = commands.index(["docker", "pull", "--quiet", "worker@sha256:digest"])
     assert commands[pull + 1][0] == "timeout"
     assert "secret" not in json.dumps(reports) + capsys.readouterr().out
