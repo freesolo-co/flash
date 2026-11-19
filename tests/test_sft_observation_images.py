@@ -10,18 +10,23 @@ from __future__ import annotations
 
 import base64
 import io
+import json
 from dataclasses import replace
+from pathlib import Path
 from typing import ClassVar
 
 import numpy as np
 import pytest
+from freesolo.environments import EnvironmentSingleTurn, RewardResult
 from PIL import Image
 
 from flash.content import multimodal as mm
 from flash.core.spec import EnvironmentSpec, JobSpec, TrainSpec
 from flash.engine.profiling import image_tokens
+from flash.engine.profiling.dataset_profile import _RawRecordEnvironment
 from flash.engine.profiling.sft_workload import prepare_sft_workload
 from flash.engine.profiling.workload_profile import sft_profile_input_digest
+from flash.envs.loading.adapter import FreesoloEnvironment
 
 IM_START = 0x110000
 IM_END = 0x110001
@@ -456,3 +461,282 @@ def test_the_longest_fitting_prefix_wins_even_when_lengths_are_not_monotonic():
     assert fitted.untruncated_length == 2000
     # the oversized middle prefix never pruned the longer one that fits
     assert seen == [7, 5]
+
+
+# ---- preview/worker parity for an output authored as data, read by the sdk's default hook ----
+#
+# the cases above hand prepare_sft_workload a stand-in environment with its own sft_completion.
+# real environments that do not override the hook get the sdk default, whose target_messages
+# refused content-block lists: the control-plane quote (preview and submit) accepted these rows,
+# and the worker then failed on the gpu with "Expected output messages[1].content must be a
+# string or null". both paths must read the same row the same way.
+
+
+class _DefaultHookTrajectories(EnvironmentSingleTurn):
+    """the miniwob sft shape: trajectories in `output`, no sft_completion override."""
+
+    def build_prompt_messages(self, example, prompt_text):
+        return [{"role": "user", "content": example.input}]
+
+    def score_response(self, example, response_text):
+        return RewardResult(score=0.0, threshold=1.0)
+
+
+def _worker_env(rows):
+    return FreesoloEnvironment(_DefaultHookTrajectories(), "team/browser", source=rows)
+
+
+def _quote_env(rows):
+    return _RawRecordEnvironment(rows=[dict(row) for row in rows], package_root=Path.cwd())
+
+
+def _prepare_both(rows, monkeypatch):
+    """the worker (adapter + processor) and the control-plane quote (raw records + estimate)."""
+    monkeypatch.setattr(image_tokens, "load_image_geometry", lambda *_args: _GEOMETRY)
+    common = {
+        "tokenizer_loader": lambda _model, _revision: _ChatMlTokenizer(),
+        "producer_version": "1.2.3",
+        "packing_support": lambda _model, _revision: ("multimodal", False),
+    }
+    worker = prepare_sft_workload(
+        _spec(),
+        _worker_env(rows),
+        processor_loader=lambda _model, _revision: _ExpandingProcessor(),
+        **common,
+    )
+    quote = prepare_sft_workload(_spec(), _quote_env(rows), require_processor=False, **common)
+    return worker, quote
+
+
+@pytest.mark.parametrize(
+    "output",
+    [{"messages": COMPLETION}, COMPLETION],
+    ids=["messages-container", "bare-message-list"],
+)
+def test_default_hook_trains_the_observation_rows_the_quote_accepted(monkeypatch, output):
+    rows = [{"input": "click ok", "output": output}]
+
+    worker, quote = _prepare_both(rows, monkeypatch)
+
+    assert worker.rows[0]["input_ids"] == quote.rows[0]["input_ids"]
+    assert worker.rows[0]["loss_mask"] == quote.rows[0]["loss_mask"]
+    assert _pad_runs(worker.rows[0]["input_ids"]) == [_pads(64), _pads(48)]
+    assert _supervised_text(worker.rows[0]) == "ACT1<|im_end|>ACT2<|im_end|>ACT3<|im_end|>"
+    assert worker.profile.real_tokens_per_epoch == quote.profile.real_tokens_per_epoch
+
+
+@pytest.mark.parametrize(
+    ("completion", "match"),
+    [
+        (
+            [{"role": "assistant", "content": "ACT1"}, {"role": "user", "content": 5}],
+            r"messages\[1\]\.content must be a string, a content-block list, or null",
+        ),
+        (
+            [{"role": "assistant", "content": "ACT1"}, {"content": "page"}],
+            r"messages\[1\]\.role must be a non-empty string",
+        ),
+        (
+            [{"role": "assistant", "content": None}],
+            r"messages\[0\]\.content must be a string or a content-block list",
+        ),
+        (
+            [{"role": "assistant", "content": "ACT1"}, {"role": "user", "content": ["page"]}],
+            r"messages\[1\]\.content list must be a non-empty list of content-block objects",
+        ),
+        (
+            [
+                {"role": "assistant", "content": "ACT1"},
+                _observation("page", 32, "green"),
+                {
+                    "role": "assistant",
+                    "content": [{"type": "image_url", "image_url": {"url": _image_uri(32, "red")}}],
+                },
+            ],
+            "not supported in assistant messages",
+        ),
+    ],
+    ids=[
+        "scalar-content",
+        "missing-role",
+        "null-without-tool-calls",
+        "non-block-list",
+        "assistant-image",
+    ],
+)
+def test_quote_refuses_exactly_what_the_worker_refuses(monkeypatch, completion, match):
+    rows = [{"input": "click ok", "output": {"messages": completion}}]
+    monkeypatch.setattr(image_tokens, "load_image_geometry", lambda *_args: _GEOMETRY)
+    common = {
+        "tokenizer_loader": lambda _model, _revision: _ChatMlTokenizer(),
+        "producer_version": "1.2.3",
+        "packing_support": lambda _model, _revision: ("multimodal", False),
+    }
+
+    with pytest.raises(ValueError, match=match):
+        prepare_sft_workload(_spec(), _quote_env(rows), require_processor=False, **common)
+    with pytest.raises(ValueError, match=match):
+        prepare_sft_workload(
+            _spec(),
+            _worker_env(rows),
+            processor_loader=lambda _model, _revision: _ExpandingProcessor(),
+            **common,
+        )
+
+
+def test_an_authored_sft_completion_override_still_owns_the_target():
+    class _Override(_DefaultHookTrajectories):
+        def sft_completion(self, example):
+            return [{"role": "assistant", "content": "from the hook"}]
+
+    env = FreesoloEnvironment(
+        _Override(), "team/browser", source=[{"input": "q", "output": {"messages": COMPLETION}}]
+    )
+
+    assert env.sft_completion(env.dataset()[0]) == [
+        {"role": "assistant", "content": "from the hook"}
+    ]
+
+
+def test_scalar_outputs_still_use_the_sdk_default_hook():
+    env = _worker_env([{"input": "q", "output": {"answer": 1}}])
+
+    # the sdk serializes a structured scalar as json (not a python repr); its hook keeps that case
+    (message,) = env.sft_completion(env.dataset()[0])
+    assert message["role"] == "assistant"
+    assert json.loads(message["content"]) == {"answer": 1}
+
+
+# ---- reproduction: the miniwob-fable sft package (flash-1795014931/-14940/-15157, 2026-11-18) ----
+#
+# environment.py is the researcher's MiniwobSFT verbatim minus its later workaround override; the
+# row is the shape its build_sft.py wrote (system + first observation in prompt_messages, the rest
+# of the episode in output.messages). before the fix the real preview profiler quoted this package
+# and the real worker data path then failed on the gpu with
+# "ValueError: Expected output messages[1].content must be a string or null".
+
+_MINIWOB_ENVIRONMENT = '''"""MiniWoB browser-action SFT environment: rows are complete authored transcripts."""
+
+from __future__ import annotations
+
+import json
+from pathlib import Path
+
+from freesolo.datasets.types import TaskExample
+from freesolo.environments import EnvironmentSingleTurn, RewardResult
+
+DEFAULT_DATASET_PATH = Path(__file__).parent / "dataset" / "train.jsonl"
+
+
+def load_jsonl(path):
+    rows = []
+    with Path(path).open() as f:
+        for line in f:
+            line = line.strip()
+            if line:
+                rows.append(json.loads(line))
+    return rows
+
+
+class MiniwobSFT(EnvironmentSingleTurn):
+    dataset = load_jsonl(DEFAULT_DATASET_PATH)
+
+    def build_prompt_messages(self, example: TaskExample, prompt_text: str):
+        return [{"role": "user", "content": example.input}]
+
+    def score_response(self, example: TaskExample, response_text: str) -> RewardResult:
+        return RewardResult(score=0.0, threshold=1.0)
+
+
+def load_environment(dataset_path: str | None = None, **kwargs) -> MiniwobSFT:
+    env = MiniwobSFT()
+    if dataset_path:
+        env.dataset = load_jsonl(dataset_path)
+    return env
+'''
+
+
+def _miniwob_user(obs: str, size: int, color: str) -> dict:
+    return {
+        "role": "user",
+        "content": [
+            {"type": "text", "text": obs},
+            {"type": "image_url", "image_url": {"url": _image_uri(size, color), "detail": "high"}},
+        ],
+    }
+
+
+def _miniwob_row() -> dict:
+    return {
+        "input": "click-button-sequence-0",
+        "prompt_messages": [
+            {"role": "system", "content": "You control a browser. Reply with one action."},
+            _miniwob_user("Task: click ONE, then TWO.", 32, "red"),
+        ],
+        "output": {
+            "messages": [
+                {"role": "assistant", "content": 'click(ref="ONE")'},
+                _miniwob_user("Clicked ONE.", 64, "green"),
+                {"role": "assistant", "content": 'click(ref="TWO")'},
+            ]
+        },
+        "metadata": {"task": "click-button-sequence", "seed": 0, "source": "demo"},
+    }
+
+
+def _miniwob_package(tmp_path) -> Path:
+    package = tmp_path / "miniwob-sft"
+    (package / "dataset").mkdir(parents=True)
+    (package / "environment.py").write_text(_MINIWOB_ENVIRONMENT, encoding="utf-8")
+    (package / "dataset" / "train.jsonl").write_text(
+        json.dumps(_miniwob_row()) + "\n", encoding="utf-8"
+    )
+    return package / "environment.py"
+
+
+def test_miniwob_fable_package_previews_and_trains_identically(tmp_path, monkeypatch):
+    from flash.engine.profiling.dataset_profile import profile_packaged_sft_dataset
+    from flash.envs.loading.base import load_environment
+
+    monkeypatch.setattr(image_tokens, "load_image_geometry", lambda *_args: _GEOMETRY)
+    entrypoint = _miniwob_package(tmp_path)
+    spec = replace(
+        _spec(),
+        environment=EnvironmentSpec(id=str(entrypoint), resolved_sha="b" * 40),
+    )
+    spec = replace(
+        spec,
+        workload_profile_input_digest=sft_profile_input_digest(
+            spec, tokenizer_revision=spec.model_revision, producer_version="1.2.3"
+        ),
+    )
+    tokenizer_loader = lambda _model, _revision: _ChatMlTokenizer()  # noqa: E731
+    packing_support = lambda _model, _revision: ("multimodal", False)  # noqa: E731
+
+    # preview / submit: the control-plane quote (runner/lifecycle/preparation.py)
+    quoted = profile_packaged_sft_dataset(
+        spec,
+        producer_version="1.2.3",
+        tokenizer_loader=tokenizer_loader,
+        packing_support=packing_support,
+    )
+    assert quoted.retained_examples == 1
+    assert quoted.architecture_mode == "multimodal"
+
+    # gpu worker: the environment executed, then the same preparation the sft runner calls
+    env = load_environment(spec.environment.id, spec.environment.params, "b" * 40)
+    trained = prepare_sft_workload(
+        spec,
+        env,
+        tokenizer_loader=tokenizer_loader,
+        processor_loader=lambda _model, _revision: _ExpandingProcessor(),
+        producer_version="1.2.3",
+        image_dir=str(tmp_path / "images"),
+        packing_support=packing_support,
+    )
+
+    row = trained.rows[0]
+    assert _pad_runs(row["input_ids"]) == [_pads(32), _pads(64)]
+    assert _supervised_text(row) == 'click(ref="ONE")<|im_end|>click(ref="TWO")<|im_end|>'
+    assert trained.profile.real_tokens_per_epoch == quoted.real_tokens_per_epoch
+    assert trained.profile.supervised_tokens_per_epoch == quoted.supervised_tokens_per_epoch

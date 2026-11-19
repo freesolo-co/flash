@@ -27,6 +27,7 @@ from flash.envs.loading.loader import (
     _resolve_environment_reference,
     _resolve_path_arg,
 )
+from flash.envs.loading.sft_targets import is_message_target, parse_message_target
 from flash.envs.meta.dataset_selection import (
     _packaged_dataset_file,
     _validate_packaged_dataset_split,
@@ -68,32 +69,13 @@ class _RawRecordEnvironment:
         self, row: dict[str, Any]
     ) -> tuple[list[dict[str, Any]], bool]:
         value = row.get(_CANONICAL_OUTPUT_KEY)
-        if _is_message_list(value):
-            return _copied_messages(value, field="output"), False
-        if isinstance(value, dict) and "messages" in value:
-            sibling_keys = sorted(str(key) for key in value if key != "messages")
-            if sibling_keys:
-                raise ValueError(
-                    "sft output has 'messages' alongside sibling keys "
-                    f"{sibling_keys}; expected exactly {{'messages': [...]}}"
-                )
-            return _copied_messages(value["messages"], field="output"), False
+        # the worker's adapter parses a message-shaped output with this same function, so the
+        # quote accepts (or refuses, with the same message) exactly the rows the worker trains on.
+        if is_message_target(value):
+            return parse_message_target(value, row_id=row.get("id")), False
         # the adapter coerces a scalar output with str(), not serialize_value: unlike input, the
         # gold completion never passes through the sdk's record normalization.
         return [{"role": "assistant", "content": "" if value is None else str(value)}], True
-
-
-def _is_message_list(value: object) -> bool:
-    return isinstance(value, list) and any(isinstance(message, dict) for message in value)
-
-
-def _copied_messages(value: object, *, field: str) -> list[dict[str, Any]]:
-    if not isinstance(value, list):
-        raise ValueError(f"sft {field} messages must be a list of message objects")
-    invalid = [index for index, message in enumerate(value) if not isinstance(message, dict)]
-    if invalid:
-        raise ValueError(f"sft {field} contains non-object message entries at indexes {invalid}")
-    return [dict(message) for message in value]
 
 
 def _contract_text(base_dir: Path, params: dict[str, Any]) -> str:

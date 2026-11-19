@@ -61,6 +61,10 @@ from flash.engine.worker.train.entry.sft_train import (
     _build_verl_child_env,
     _NvidiaSmiPeakSampler,
 )
+from flash.engine.worker.train.rl.launch.signal_guard import (
+    RewardFaultTally,
+    ZeroLearningSignalGuard,
+)
 from flash.engine.worker.train.rl.rollout.identity import RolloutIdentityLedger
 from flash.engine.worker.train.rl.rollout.multi_turn import (
     MultiTurnBridge,
@@ -188,6 +192,8 @@ class _StepMetricState:
     )
     sent_first_metrics: bool = False
     sent_first_timing: bool = False
+    # fails the run once it has provably learned nothing; None leaves only the publish-time check.
+    signal_guard: ZeroLearningSignalGuard | None = None
 
     def set_prior_positive_step(self, step: int | None, *, checkpoint_step: int) -> None:
         """install the strict durable positive-gradient fact before uploader start."""
@@ -242,6 +248,7 @@ class _RewardRuntime:
     multi_turn_bridge: object
     server: object
     reward_url: str
+    faults: RewardFaultTally = field(default_factory=RewardFaultTally)
 
 
 def _prepare_rl_inputs(*, context: WorkerContext):
@@ -409,9 +416,12 @@ def _start_reward_runtime(
         int(inp["group_size"]),
     )
 
+    faults = RewardFaultTally()
+
     def _score_batch(requests: list[tuple[int, str]]) -> list[float]:
         # grade the whole batch before touching the observability lock. the env's scorer may block on
         # judge i/o, while record is intentionally a short per-result critical section.
+        faults.record_scored(len(requests))
         with observability.parent_work.busy():
             scored = score_single_turn_batch(
                 env,
@@ -421,6 +431,7 @@ def _start_reward_runtime(
                 prompt_opened_thinking=inp["prompt_opened_thinking"],
                 think_penalty=inp["think_penalty"],
                 context=context,
+                on_fault=faults.record_fault,
             )
         results = []
         for (index, solution_str), (score, breakdowns) in zip(requests, scored, strict=True):
@@ -481,6 +492,17 @@ def _start_reward_runtime(
         multi_turn_bridge=multi_turn_bridge,
         server=server,
         reward_url=reward_url,
+        faults=faults,
+    )
+
+
+def _arm_signal_guard(state: _StepMetricState, inp, files, reward_runtime: _RewardRuntime) -> None:
+    """install the zero-learning-signal early stop; call after resume evidence is restored."""
+    state.signal_guard = ZeroLearningSignalGuard(
+        inp["zero_signal_abort_steps"],
+        resume_step=int(files["resume_step"]),
+        prior_positive_step=state.prior_positive_grad_step,
+        faults=reward_runtime.faults,
     )
 
 
@@ -665,6 +687,15 @@ def _ingest_step_metrics(
             )
         ]
         state.record_grad_norm(step_number, grad_norm if isinstance(grad_norm, float) else None)
+        if state.signal_guard is not None and step_metrics is not None:
+            # raising here unwinds _execute_rl_child, which tears the verl process group down.
+            state.signal_guard.observe(
+                step_number,
+                grad_norm=grad_norm if isinstance(grad_norm, float) else None,
+                reward_mean=step_metrics.get("reward"),
+                advantage_min=step_metrics.get("advantage_min"),
+                advantage_max=step_metrics.get("advantage_max"),
+            )
 
 
 def _execute_rl_child(

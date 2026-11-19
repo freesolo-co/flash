@@ -381,6 +381,10 @@ class TrainSpec:
         default=None, metadata={"introduced_in": "1.3.33"}
     )
     kl_penalty_coef: float | None = field(default=None, metadata={"introduced_in": "0.2.0"})
+    # grpo: fail the run after this many optimizer steps with a zero actor gradient and no positive
+    # one yet (every group's rewards identical, usually a reward function that always fails).
+    # None -> the worker default; 0 disables the early stop, leaving only the publish refusal.
+    zero_signal_abort_steps: int | None = field(default=None, metadata={"introduced_in": "1.4.56"})
     thinking_length_penalty_coef: float | None = field(
         default=None, metadata={"introduced_in": "0.2.0"}
     )
@@ -397,6 +401,13 @@ class TrainSpec:
             self.mask_truncated_completions, bool
         ):
             raise TypeError("train.mask_truncated_completions must be a boolean or null")
+        if self.zero_signal_abort_steps is not None:
+            if isinstance(self.zero_signal_abort_steps, bool) or not isinstance(
+                self.zero_signal_abort_steps, int
+            ):
+                raise TypeError("train.zero_signal_abort_steps must be an integer or null")
+            if self.zero_signal_abort_steps < 0:
+                raise ValueError("train.zero_signal_abort_steps must be >= 0 (0 disables it)")
         if not self.lora_alpha:
             object.__setattr__(self, "lora_alpha", 2 * self.lora_rank)
         max_steps = parse_max_steps(self.max_steps)
@@ -731,6 +742,8 @@ class JobSpec:
         # Preserve public and worker preparation digests for all existing runs.
         if data["train"]["mask_truncated_completions"] is None:
             data["train"].pop("mask_truncated_completions")
+        if data["train"]["zero_signal_abort_steps"] is None:
+            data["train"].pop("zero_signal_abort_steps")
         # missing and unset are the same internal state. omitting the empty value preserves that state
         # without serializing it into an explicit empty preference, which every parser rejects.
         if not data["gpu"].get("providers"):
@@ -851,6 +864,7 @@ class JobSpec:
                 max_completion_tokens=opt_int(train.get("max_completion_tokens")),
                 mask_truncated_completions=train.get("mask_truncated_completions"),
                 kl_penalty_coef=opt_float(train.get("kl_penalty_coef")),
+                zero_signal_abort_steps=opt_int(train.get("zero_signal_abort_steps")),
                 thinking_length_penalty_coef=opt_float(train.get("thinking_length_penalty_coef")),
                 stop_sequences=str_tuple(train.get("stop_sequences")),
                 structured_outputs=str(train.get("structured_outputs") or ""),

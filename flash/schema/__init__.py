@@ -672,6 +672,7 @@ def spec_from_dict(
             max_completion_tokens=_train_int(train_raw, "max_completion_tokens", minimum=1),
             mask_truncated_completions=train_raw.get("mask_truncated_completions"),
             kl_penalty_coef=_train_float(train_raw, "kl_penalty_coef", minimum=0.0),
+            zero_signal_abort_steps=_train_int(train_raw, "zero_signal_abort_steps", minimum=0),
             thinking_length_penalty_coef=_train_float(
                 train_raw, "thinking_length_penalty_coef", minimum=0.0, maximum=1.0
             ),
@@ -740,6 +741,9 @@ _INAPPLICABLE_TRAIN_KNOBS: dict[str, dict[str, str]] = {
             "training rows with max_context_tokens instead"
         ),
         "kl_penalty_coef": ("only applies to grpo; SFT's objective has no KL term"),
+        "zero_signal_abort_steps": (
+            "only applies to grpo; it stops a run whose group rewards carry no advantage"
+        ),
         "thinking_length_penalty_coef": (
             "only applies to grpo; it penalizes generated reasoning length, and SFT never generates"
         ),

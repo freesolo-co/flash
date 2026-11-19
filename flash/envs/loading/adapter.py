@@ -33,6 +33,7 @@ from flash.envs.loading.loader import (
     load_freesolo_environment,
     managed_slug_to_github_ref,
 )
+from flash.envs.loading.sft_targets import is_message_target, parse_message_target
 from flash.envs.scoring.response import ScoredResponseText as _ScoredResponseText
 
 _MIN_EPISODE_TURNS = 8
@@ -53,22 +54,16 @@ def _json_safe(value: Any) -> Any:
         return str(value)
 
 
-def _copied_message_list(value: Any, *, row_id: Any, source: str) -> list[dict]:
-    """Copy `value` as a chat message list, naming the offending row and entries on a bad shape."""
-    if not isinstance(value, list):
-        raise ValueError(
-            f"sft output for row id {row_id!r} has a {source} value of type "
-            f"{type(value).__name__}; expected a list of message objects"
-        )
-    invalid_indexes = [
-        index for index, message in enumerate(value) if not isinstance(message, dict)
-    ]
-    if invalid_indexes:
-        raise ValueError(
-            f"sft output for row id {row_id!r} contains non-object {source} entries at "
-            f"indexes {invalid_indexes}; expected a list of message objects"
-        )
-    return [dict(message) for message in value]
+def _sdk_default_sft_completion(sdk_env: object, base: object) -> bool:
+    """Whether ``sdk_env.sft_completion`` is the SDK base class's own, not an authored override.
+
+    The SDK default delegates to ``freesolo.datasets.target_messages``, which predates content-block
+    lists and rejects them. Flash parses a message-shaped ``output`` itself for such environments
+    (see :mod:`flash.envs.loading.sft_targets`); an authored override is user code and always runs.
+    """
+    default = getattr(base, "sft_completion", None)
+    hook = getattr(sdk_env, "sft_completion", None)
+    return default is not None and getattr(hook, "__func__", None) is default
 
 
 def _declared_tool_schemas(sdk_env: object) -> tuple | None:
@@ -140,6 +135,9 @@ class FreesoloEnvironment(BaseEnvironment):
         self._load_task_examples = tools["load_task_examples"]
         self._EnvironmentEpisode = tools["EnvironmentEpisode"]
         self._EnvironmentTurn = tools["EnvironmentTurn"]
+        self._sdk_default_sft_completion = _sdk_default_sft_completion(
+            sdk_env, tools.get("Environment")
+        )
         self.multi_turn = isinstance(sdk_env, tools["EnvironmentMultiTurn"])
         # only an explicit class capability opts in. instance data and environment params cannot
         # turn dynamic image observations on accidentally.
@@ -320,25 +318,21 @@ class FreesoloEnvironment(BaseEnvironment):
         coerced, so a dataset that already encodes real trajectories never trips the collapse
         warning.
         """
+        row_id = example.get("id")
+        value = example.get(_CANONICAL_OUTPUT_KEY)
+        # a message-shaped output under the SDK's default hook is parsed here, exactly as the
+        # control-plane quote parses it (flash/engine/profiling/dataset_profile.py): the default
+        # hook's target_messages rejects content-block lists, so a trajectory whose user turns
+        # carry screenshot observations passed preview and then failed on the GPU.
+        if self._sdk_default_sft_completion and is_message_target(value):
+            return parse_message_target(value, row_id=row_id), False
         fn = getattr(self._env, "sft_completion", None)
         if callable(fn):
             msgs = fn(self._task_example(example))
             if msgs:
                 return [dict(m) for m in msgs], False
-        row_id = example.get("id")
-        value = example.get(_CANONICAL_OUTPUT_KEY)
-        if isinstance(value, list) and any(isinstance(message, dict) for message in value):
-            return _copied_message_list(value, row_id=row_id, source="output"), False
-        if isinstance(value, dict) and "messages" in value:
-            sibling_keys = sorted(str(key) for key in value if key != "messages")
-            if sibling_keys:
-                raise ValueError(
-                    f"sft output for row id {row_id!r} has 'messages' alongside sibling keys "
-                    f"{sibling_keys}; expected exactly {{'messages': [...]}}"
-                )
-            return _copied_message_list(
-                value["messages"], row_id=row_id, source="'messages'"
-            ), False
+        if is_message_target(value):
+            return parse_message_target(value, row_id=row_id), False
         return [{"role": "assistant", "content": "" if value is None else str(value)}], True
 
     def _single(self, results, method: str):
