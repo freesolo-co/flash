@@ -382,7 +382,7 @@ def _normalize_schema(
         required = raw.get("required", [])
         if type(properties) is not dict or type(required) is not list:
             raise error_type(f"{path}.properties must be an object and required must be an array")
-        if raw.get("additionalProperties") is not False:
+        if raw.get("additionalProperties", False) is not False:  # omitted = the closed wire form
             raise error_type(f"{path}.additionalProperties must be false")
         if any(type(name) is not str or not name for name in properties):
             raise error_type(f"{path}.properties keys must be nonempty strings")

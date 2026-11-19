@@ -689,7 +689,7 @@ def test_root_property_surrogate_preserves_identifier_error_precedence() -> None
 
 def test_surrogate_check_runs_after_structural_normalization() -> None:
     declaration = _unicode_declaration("function-description", "bad\ud800")
-    del declaration[0]["function"]["parameters"]["additionalProperties"]
+    declaration[0]["function"]["parameters"]["additionalProperties"] = True
 
     with pytest.raises(ValueError, match="additionalProperties must be false"):
         normalize_tools(declaration)
