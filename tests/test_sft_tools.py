@@ -313,6 +313,13 @@ def test_json_string_tool_call_arguments_render_as_the_mapping_the_template_iter
     assert as_string.sampled_texts[0].count("<find_user_id_by_email email=a@b.c>") == 2
 
 
+def test_json_string_tool_call_scalars_render_with_json_spellings_like_serving() -> None:
+    # the template sends scalars through `string`, which would spell these True/None
+    rendered = _prepare_output([_tool_call_row('{"email": "a@b.c", "notify": true, "cc": null}')])
+
+    assert rendered.sampled_texts[0].count("email=a@b.c notify=true cc=null>") == 2
+
+
 @pytest.mark.parametrize("arguments", ["not json", '["a@b.c"]', '"a@b.c"'])
 def test_tool_call_arguments_that_are_not_a_json_object_fail_the_profile(arguments) -> None:
     with pytest.raises(ValueError, match=r"arguments must be a JSON object"):

@@ -16,7 +16,6 @@ assistant or tool turns are refused there.
 
 from __future__ import annotations
 
-import json
 from typing import Any
 
 
@@ -86,8 +85,11 @@ def decode_tool_call_arguments(messages: list[dict], *, row_id: Any = None) -> l
     OpenAI-format data carries ``tool_calls[].function.arguments`` as a JSON string, while the
     Qwen3.5 template iterates ``arguments|items``. Every SFT render (preview quote and worker alike,
     through flash/engine/profiling/sft_workload.py) reads rows through this, so both accept the
-    string form and refuse one that does not encode a JSON object, naming the row.
+    string form and refuse one that does not encode a JSON object, naming the row. Decoding reuses
+    serving's normalization, so scalar ``true``/``null`` render as JSON, not python's ``True``/``None``.
     """
+    from flash.serve.request.tool_calls import _template_json_object
+
     decoded: list[dict] = []
     for index, message in enumerate(messages):
         calls = message.get("tool_calls")
@@ -98,14 +100,12 @@ def decode_tool_call_arguments(messages: list[dict], *, row_id: Any = None) -> l
                 if not isinstance(function, dict) or not isinstance(function.get("arguments"), str):
                     continue
                 try:
-                    arguments = json.loads(function["arguments"])
-                except json.JSONDecodeError:
-                    arguments = None
-                if not isinstance(arguments, dict):
+                    arguments = _template_json_object(function["arguments"])
+                except ValueError as exc:
                     raise ValueError(
                         f"sft row id {row_id!r} messages[{index}].tool_calls[{position}].function."
                         "arguments must be a JSON object or a string encoding one"
-                    )
+                    ) from exc
                 call["function"] = {**function, "arguments": arguments}
         decoded.append(message)
     return decoded
