@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import logging
+import math
+import os
+from collections.abc import Iterator
 from typing import Any
 
 import anyio
@@ -36,6 +39,14 @@ from flash.server.routes.serving_revisions import (
 )
 
 logger = logging.getLogger(__name__)
+# Forwarding budget for managed chat. A saturated budget sheds load with 429/503 + Retry-After
+# instead of queueing thousands of sockets behind minute-long generations.
+_CHAT_CONCURRENCY_ENV = "FLASH_CHAT_FORWARDING_CONCURRENCY"
+_CHAT_QUEUE_LIMIT_ENV = "FLASH_CHAT_QUEUE_LIMIT"
+_CHAT_QUEUE_WAIT_ENV = "FLASH_CHAT_QUEUE_WAIT_SECONDS"
+_CHAT_UPSTREAM_TIMEOUT_ENV = "FLASH_CHAT_UPSTREAM_TIMEOUT_SECONDS"
+_CHAT_RETRY_AFTER_SECONDS = "5"
+_STREAM_LIMITER: anyio.CapacityLimiter | None = None
 _UPSTREAM_RESPONSE_HEADER_EXCLUSIONS = frozenset(
     {
         "connection",
@@ -54,6 +65,110 @@ _UPSTREAM_RESPONSE_HEADER_EXCLUSIONS = frozenset(
         "x-freesolo-lora-request-adapter",
     }
 )
+
+
+def _env_number(name: str, default: float, *, minimum: float) -> float:
+    raw = (os.environ.get(name) or "").strip()
+    try:
+        value = float(raw) if raw else default
+    except ValueError:
+        value = default
+    if not math.isfinite(value) or value < minimum:
+        logger.warning("chat_admission_config_invalid name=%s value=%r", name, raw)
+        return default
+    return value
+
+
+def chat_forwarding_concurrency() -> int:
+    return int(_env_number(_CHAT_CONCURRENCY_ENV, 128, minimum=1))
+
+
+def chat_upstream_timeout_s() -> float:
+    """bound one forwarded generation; keep it below callers' own request timeouts."""
+
+    return _env_number(_CHAT_UPSTREAM_TIMEOUT_ENV, 600.0, minimum=1.0)
+
+
+def _state_limiter(state: Any, name: str) -> anyio.CapacityLimiter:
+    limiter = getattr(state, name, None)
+    if limiter is None:
+        limiter = anyio.CapacityLimiter(chat_forwarding_concurrency())
+        setattr(state, name, limiter)
+    return limiter
+
+
+def _chat_overloaded(
+    status_code: int, reason: str, limiter: anyio.CapacityLimiter
+) -> HTTPException:
+    stats = limiter.statistics()
+    logger.warning(
+        "chat_admission_rejected reason=%s in_flight=%d waiting=%d capacity=%s",
+        reason,
+        stats.borrowed_tokens,
+        stats.tasks_waiting,
+        limiter.total_tokens,
+    )
+    return HTTPException(
+        status_code=status_code,
+        detail=f"checkpoint chat is at capacity ({reason}); retry after backoff",
+        headers={"Retry-After": _CHAT_RETRY_AFTER_SECONDS},
+    )
+
+
+async def admitted_managed_chat(
+    request: Any,
+    run_id: str,
+    payload: dict[str, Any],
+    key: dict[str, Any],
+    x_freesolo_org_id: str | None,
+    x_freesolo_project_id: str | None,
+) -> Any:
+    """forward one managed chat inside a bounded slot, shedding load when saturated."""
+
+    state = request.app.state
+    limiter = _state_limiter(state, "chat_forwarding_limiter")
+    stats = limiter.statistics()
+    queue_limit = int(_env_number(_CHAT_QUEUE_LIMIT_ENV, 128, minimum=0))
+    if stats.borrowed_tokens >= limiter.total_tokens and stats.tasks_waiting >= queue_limit:
+        raise _chat_overloaded(429, "queue_full", limiter)
+    slot = object()
+    with anyio.move_on_after(_env_number(_CHAT_QUEUE_WAIT_ENV, 30.0, minimum=0.0)) as wait:
+        await limiter.acquire_on_behalf_of(slot)
+    if wait.cancelled_caught:
+        raise _chat_overloaded(503, "queue_timeout", limiter)
+    try:
+        if await request.is_disconnected():
+            # The caller gave up while queued; do not spend a generation on nobody.
+            raise HTTPException(status_code=499, detail="client disconnected before forwarding")
+        # The thread budget mirrors the admission budget, so it never queues itself and
+        # never borrows the default AnyIO workers used by authentication and status routes.
+        return await anyio.to_thread.run_sync(
+            managed_chat,
+            run_id,
+            payload,
+            key,
+            x_freesolo_org_id,
+            x_freesolo_project_id,
+            limiter=_state_limiter(state, "chat_thread_limiter"),
+        )
+    finally:
+        limiter.release_on_behalf_of(slot)
+
+
+def _stream_limiter() -> anyio.CapacityLimiter:
+    global _STREAM_LIMITER
+    if _STREAM_LIMITER is None:
+        _STREAM_LIMITER = anyio.CapacityLimiter(chat_forwarding_concurrency())
+    return _STREAM_LIMITER
+
+
+async def _iterate_on_chat_workers(chunks: Iterator[bytes]):
+    """read a blocking upstream stream without borrowing the default AnyIO workers."""
+
+    end = object()
+    limiter = _stream_limiter()
+    while (chunk := await anyio.to_thread.run_sync(next, chunks, end, limiter=limiter)) is not end:
+        yield chunk
 
 
 def _upstream_response_headers(headers: dict[str, str]) -> dict[str, str]:
@@ -80,7 +195,7 @@ class _UpstreamStreamingResponse(StreamingResponse):
             # Closing a synchronous HTTP stream can wait on transport locks or I/O.
             # Keep health checks responsive, and finish cleanup even on disconnect.
             with anyio.CancelScope(shield=True):
-                await anyio.to_thread.run_sync(self._upstream.close)
+                await anyio.to_thread.run_sync(self._upstream.close, limiter=_stream_limiter())
 
 
 def _resolve_chat_request(
@@ -242,7 +357,7 @@ def _forward_stream(
             validate_header_provenance(upstream.headers, provenance)
             headers.update(provenance.freesolo_headers())
         return _UpstreamStreamingResponse(
-            upstream.iter_bytes(),
+            _iterate_on_chat_workers(iter(upstream.iter_bytes())),
             status_code=upstream.status_code,
             headers=headers,
             upstream=upstream,
@@ -298,6 +413,7 @@ def managed_chat(
             run_id=authorized_checkpoint,
             messages=messages,
             org_id=org_id,
+            timeout_s=chat_upstream_timeout_s(),
             temperature=request.temperature,
             max_tokens=request.max_tokens,
             thinking=effective_spec.thinking,
