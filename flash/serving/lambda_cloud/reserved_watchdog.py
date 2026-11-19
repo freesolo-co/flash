@@ -214,7 +214,8 @@ async def run_once(workers, store, lambda_api, model, *, transport_factory, cloc
         ok = status == OK
         previous = SlotState.load(await store.get(slot))
         state, restart = advance(previous, ok, clock(), error, busy=status == BUSY)
-        if restart and (rebooted or not any_passed):
+        # A lone worker has no peer to rule out a shared cause; its own failure is the signal.
+        if restart and (rebooted or (not any_passed and len(results) > 1)):
             restart = False
             state.restarted_at = previous.restarted_at  # still due next cycle
             state.last_error = f"reboot deferred: {state.last_error}"[:200]
@@ -434,6 +435,8 @@ class HealthView:
         self._expires = 0.0
         self._usable = list(self._slots)
         self._cycle = itertools.cycle(self._slots)
+        self._loaded = False
+        self._refresh = None
 
     @classmethod
     def for_engines(cls, engines):
@@ -451,16 +454,25 @@ class HealthView:
     async def usable(self):
         if self._clock() >= self._expires:
             self._expires = self._clock() + ROUTER_CACHE_SECONDS
-            try:
-                # Inference waits on this refresh, so bound it; a slow store keeps the last view.
-                async with asyncio.timeout(ROUTER_REFRESH_TIMEOUT_SECONDS):
-                    configured, *values = await asyncio.gather(
-                        self._store.get(CONFIGURED_KEY),
-                        *(self._store.get(s) for s in self._slots),
-                    )
-                self._usable = routable_slots(
-                    dict(zip(self._slots, values, strict=True)), self._slots, configured
-                )
-            except Exception as exc:  # keep the last known view
-                print(f"reserved H100 health read failed: {exc!r}", flush=True)
+            self._refresh = asyncio.ensure_future(self._reload())
+            await asyncio.shield(self._refresh)
+        elif not self._loaded and self._refresh is not None and not self._refresh.done():
+            # Before the first view, concurrent callers share the in-flight read rather than
+            # routing to every declared slot, some of which may not be configured.
+            await asyncio.shield(self._refresh)
         return self._usable
+
+    async def _reload(self):
+        try:
+            # Inference waits on this refresh, so bound it; a slow store keeps the last view.
+            async with asyncio.timeout(ROUTER_REFRESH_TIMEOUT_SECONDS):
+                configured, *values = await asyncio.gather(
+                    self._store.get(CONFIGURED_KEY),
+                    *(self._store.get(s) for s in self._slots),
+                )
+            self._usable = routable_slots(
+                dict(zip(self._slots, values, strict=True)), self._slots, configured
+            )
+            self._loaded = True
+        except Exception as exc:  # keep the last known view
+            print(f"reserved H100 health read failed: {exc!r}", flush=True)

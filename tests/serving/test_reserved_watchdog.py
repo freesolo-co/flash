@@ -195,6 +195,17 @@ async def test_no_reboot_when_every_worker_fails_the_probe(monkeypatch):
 
 
 @pytest.mark.anyio
+async def test_lone_worker_that_stays_dead_is_rebooted(monkeypatch):
+    # A singleton fleet has no peer to rule out a shared cause; never deferring forever.
+    monkeypatch.setattr(wd, "CANARY_TIMEOUT_SECONDS", 0.05)
+    store, api = MemoryStore(), AsyncMock()
+    await _run_until_reboot_due(_hung_factory([".1"]), store, api, count=1)
+    api.call.assert_awaited_once_with(
+        "POST", "instance-operations/restart", {"instance_ids": ["inst-1"]}
+    )
+
+
+@pytest.mark.anyio
 async def test_at_most_one_reboot_per_cycle(monkeypatch):
     monkeypatch.setattr(wd, "CANARY_TIMEOUT_SECONDS", 0.05)
     store, api = MemoryStore(), AsyncMock()
@@ -452,6 +463,19 @@ async def test_health_view_routes_only_configured_slots():
     bad = wd.SlotState(healthy=False).dump()
     store = MemoryStore({wd.CONFIGURED_KEY: [1, 2], 1: bad, 2: bad})
     assert await wd.HealthView(store, range(1, 9)).usable() == [1, 2]
+
+
+@pytest.mark.anyio
+async def test_concurrent_first_requests_wait_for_the_configured_slots():
+    # Requests that arrive while the first refresh is in flight must not see all 8 slots.
+    class SlowStore(MemoryStore):
+        async def get(self, key):
+            await asyncio.sleep(0.01)
+            return await super().get(key)
+
+    view = wd.HealthView(SlowStore({wd.CONFIGURED_KEY: [1, 2, 3, 4]}), range(1, 9))
+    views = await asyncio.gather(*(view.usable() for _ in range(5)))
+    assert all(v == [1, 2, 3, 4] for v in views)
 
 
 @pytest.mark.anyio
