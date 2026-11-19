@@ -430,19 +430,40 @@ def test_recover_deployments_selects_busy_and_skips_missing(monkeypatch):
         ),
     )
 
+    import threading
+
     from flash.server.platform.locks import _RunLock
 
+    # A request on the serving plane (an export, an adapter download) holds r-held's lock while
+    # the scan runs. The scan must wait for it rather than strand the record in `deploying`.
     held_lock = _RunLock("r-held")
-    assert held_lock.acquire(blocking=False) is True
+    locked, release = threading.Event(), threading.Event()
+
+    def hold() -> None:
+        with held_lock:
+            locked.set()
+            release.wait(10)
+
+    holder = threading.Thread(target=hold)
+    holder.start()
+    assert locked.wait(10)
+
+    def get_status_then_release(run_id):
+        if run_id == "r-missing":
+            release.set()  # r-held was skipped by now; its holder finishes mid-scan.
+        return fake_get_status(run_id)
+
+    monkeypatch.setattr(run_status, "get_status", get_status_then_release)
     try:
-        # r-stale and r-fresh both recover: the lock is the ownership proof, so a busy record whose
-        # lock this pass can take has no live lifecycle whatever its timestamp says. r-held is the
-        # one that must survive -- its lock is genuinely held, so a live owner still has it.
-        assert serving_completion.recover_deployments() == 2
+        # The lock is the ownership proof, so a busy record whose lock the scan takes has no live
+        # lifecycle whatever its timestamp says.
+        assert serving_completion.recover_deployments() == 3
     finally:
-        held_lock.release()
+        release.set()
+        holder.join(10)
     assert sorted(recovered) == [
         ("r-fresh", "r-fresh/final"),
+        ("r-held", "r-held/final"),
         ("r-stale", "r-stale/final"),
     ]
 

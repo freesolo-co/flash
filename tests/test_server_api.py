@@ -3778,11 +3778,19 @@ def test_deploy_holds_lock_through_background_job_handoff(api, monkeypatch):
         worker = threading.Thread(target=run_target)
         worker.start()
         phases.append(observations.get(timeout=5))
-        recovered.append(serving_completion.recover_deployments())
+        # Recovery waits for the live job's lock instead of failing its deployment.
+        recovery = threading.Thread(
+            target=lambda: recovered.append(serving_completion.recover_deployments())
+        )
+        recovery.start()
+        recovery.join(timeout=0.5)
+        assert recovery.is_alive()
         observed_states.append(only_deployment(runner_status.get_status(run_id))["state"])
         allow_lifecycle.set()
         worker.join(timeout=5)
+        recovery.join(timeout=5)
         assert not worker.is_alive()
+        assert not recovery.is_alive()
         assert worker_errors == []
         return False
 
@@ -3793,10 +3801,12 @@ def test_deploy_holds_lock_through_background_job_handoff(api, monkeypatch):
     )
 
     assert response.status_code == 200, response.text
-    assert recovered == [0]
     assert observed_states == ["deploying"]
     assert phases == ["lifecycle-started"]
-    assert only_deployment(runner_status.get_status(run_id))["state"] == "deploying"
+    # The stubbed lifecycle returned without settling its record, so once the job released the
+    # lock nothing owned it and recovery failed it.
+    assert recovered == [1]
+    assert only_deployment(runner_status.get_status(run_id))["state"] == "failed"
 
 
 def test_deploy_start_failure_persists_terminal_failure(api, monkeypatch):
