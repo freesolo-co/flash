@@ -361,3 +361,21 @@ def test_a_healthy_boot_never_needs_the_extension(clock, monkeypatch):
     )
     assert result is None
     assert "keeping it past" not in text
+
+
+def test_a_launcher_failure_on_a_stopped_vm_is_a_boot_stall_not_preemption(clock, monkeypatch):
+    # The launcher shuts the VM down right after reporting, so the poller may only see it stopped.
+    from dataclasses import replace
+
+    _save_run()
+    monkeypatch.setattr(time, "sleep", lambda seconds: clock.__setitem__(0, clock[0] + seconds))
+    failed = {"stage": "failed", "reason": "worker image pull failed"}
+    for progress, failure in ((failed, "boot_stalled"), (None, "job_preempted")):
+        adapter = replace(
+            _adapter(lambda: {"status": "stopped"}),
+            first_liveness_failure="boot_stalled",
+            boot_progress=lambda progress=progress: progress,
+        )
+        result = _poll(adapter, io.StringIO())
+        assert result.failure == failure
+        assert ("worker image pull failed" in result.detail) == (progress is not None)

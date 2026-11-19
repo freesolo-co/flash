@@ -599,6 +599,12 @@ def _classify_dead_host(
         # that vanished without a word (preemption), whose policy depends on Spot.
         failure = "worker_retriable"
     else:
+        # The launcher shuts the VM down right after reporting a boot failure, so a stopped VM may
+        # carry one even if this poller never saw it running: that is a boot stall, not preemption.
+        reader = ctx.adapter.boot_progress
+        detail = _launcher_failure(reader() if reader else None)
+        if detail:
+            return PollResult(False, failure=ctx.adapter.first_liveness_failure, detail=detail)
         failure = "job_preempted"
     return PollResult(False, failure=failure, detail=ctx.adapter.failure_detail(None))
 
@@ -662,6 +668,15 @@ def _disk_used(record: dict) -> float | None:
     return used if type(used) in (int, float) and math.isfinite(used) and used >= 0 else None
 
 
+def _launcher_failure(record: dict | None) -> str | None:
+    """The detail of a boot failure the host launcher reported, or None."""
+    if not isinstance(record, dict) or record.get("stage") != "failed":
+        return None
+    reason = record.get("reason")
+    detail = reason if isinstance(reason, str) and reason else "host launcher failed"
+    return f"VM launcher reported failure before the worker started: {detail[:200]}"
+
+
 def _observe_boot_progress(ctx: _PollContext, state: _PollState) -> dict | None:
     """Read the host launcher's progress (rate-limited) and date its last change by OUR clock.
 
@@ -720,16 +735,11 @@ def _classify_running_stall(
     if not state.became_running:
         return None
     if not state.seen_fresh_hb and not state.liveness_seen:
-        record = _observe_boot_progress(ctx, state)
-        if record is not None and record["stage"] == "failed":
-            # The launcher said it cannot start the worker (e.g. the image pull failed): waiting out
-            # the first-liveness window would only burn the boot slot.
-            reason = record.get("reason")
-            detail = reason if isinstance(reason, str) and reason else "host launcher failed"
-            return ctx.stalled_unless_terminal(
-                f"VM launcher reported failure before the worker started: {detail[:200]}",
-                ctx.adapter.first_liveness_failure,
-            )
+        # The launcher said it cannot start the worker (e.g. the image pull failed): waiting out
+        # the first-liveness window would only burn the boot slot.
+        detail = _launcher_failure(_observe_boot_progress(ctx, state))
+        if detail:
+            return ctx.stalled_unless_terminal(detail, ctx.adapter.first_liveness_failure)
     # after running without a heartbeat, consult early-liveness before declaring a stall: slow
     # installs and fetches can be healthy. latch positive bootstrap evidence; require silence for
     # BOOT_LOG_ABSENT_POLLS and respect the observed-running floor on reattach.
