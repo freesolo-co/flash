@@ -1761,6 +1761,97 @@ def test_replacement_reservation_clears_the_consumed_teardown_marker(monkeypatch
     assert settled.billing_remote is not None
 
 
+def _undecided_torn_down_attempt(monkeypatch, tmp_path, run_id, *, observation=None):
+    """A live attempt whose teardown was confirmed before any failure decision was persisted.
+
+    This is the state 14 runs (9 GRPO, 5 SFT) were left in on 2026-11-19 03:34-03:41 UTC: the
+    control plane ran out of file descriptors mid-poll, attach reconciliation tore the healthy
+    workers down, and nothing recorded an outcome for the attempt being replaced.
+    """
+    from flash.core.spec import JobSpec
+    from flash.runner.lifecycle.cleanup import _compare_and_confirm_remote_teardown
+
+    monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
+    spec = JobSpec(run_id=run_id, model="Qwen/Qwen3.5-4B", algorithm="grpo")
+    runner_state._save_status(
+        runner_state.RunStatus(run_id=spec.run_id, state="provisioning", spec=spec.to_dict())
+    )
+    claim = runner_attempts.reserve_verified_attempt_launch(spec.run_id)
+    assert claim is not None
+    remote = _complete_modal_remote(
+        provider="modal",
+        instance_id="i-undecided",
+        attempt=claim.attempt,
+        started_ts=1.0,
+        gpu="B200",
+        hourly_usd=1.0,
+        instance_type="gpu_1x_b200",
+        region="us-west-1",
+        name="worker",
+    )
+    assert runner_attempts.persist_claimed_remote(spec.run_id, claim, remote)
+    persisted_remote = runner_status._load_status_json(spec.run_id)["remote"]
+    if observation is not None:
+        runner_attempts.decide_attempt_failure(
+            spec.run_id,
+            claim_token=claim.token,
+            expected_remote=persisted_remote,
+            observation=observation,
+            attempt=claim.attempt,
+        )
+    assert _compare_and_confirm_remote_teardown(spec.run_id, persisted_remote)
+    return spec, claim, runner_status.get_status(spec.run_id).cleanup_confirmed_remote
+
+
+def test_resume_over_an_undecided_torn_down_attempt_records_the_loss(monkeypatch, tmp_path):
+    """Attach resume must not fail the run because the replaced attempt never reached a decision."""
+    from flash.runner.supervise.retry_decision import RetryState
+
+    spec, claim, confirmed = _undecided_torn_down_attempt(monkeypatch, tmp_path, "undecided-resume")
+
+    replacement = runner_attempts.reserve_verified_attempt_launch(
+        spec.run_id,
+        expected_remote=confirmed,
+        expected_next_attempt=claim.attempt + 1,
+        transition_state="provisioning",
+    )
+
+    assert replacement is not None
+    assert replacement.attempt == claim.attempt + 1
+    raw = runner_status._load_status_json(spec.run_id)
+    retry_state = RetryState.from_snapshot(spec, raw[runner_state._RETRY_STATE_KEY])
+    decision = retry_state.last_decision
+    assert decision.attempt == claim.attempt
+    assert decision.failure == "poll_error"
+    assert decision.plan.retry is True
+    # the synthesized loss spends the bounded infrastructure budget, so it cannot loop forever.
+    assert retry_state.infra_used == 1
+    runner_attempts.release_launch_claim(spec.run_id, replacement)
+
+
+def test_resume_over_a_terminal_decision_raises_instead_of_stranding_the_run(monkeypatch, tmp_path):
+    """A persisted stop still blocks the resume, and loudly: attach callers fail the run on a raise,
+    while a quiet None would leave it nonterminal with no owner."""
+    from flash.runner.supervise.retry_decision import FailureObservation
+
+    spec, claim, confirmed = _undecided_torn_down_attempt(
+        monkeypatch,
+        tmp_path,
+        "terminal-decision-resume",
+        observation=FailureObservation(failure="no_capacity", candidates=()),
+    )
+
+    with pytest.raises(RuntimeError, match=f"attempt {claim.attempt} ended: not retrying"):
+        runner_attempts.reserve_verified_attempt_launch(
+            spec.run_id,
+            expected_remote=confirmed,
+            expected_next_attempt=claim.attempt + 1,
+            transition_state="provisioning",
+        )
+    raw = runner_status._load_status_json(spec.run_id)
+    assert runner_status.decode_next_attempt(raw) == claim.attempt + 1
+
+
 def test_setup_failure_releases_the_reserved_launch_claim(monkeypatch, tmp_path):
     """A raise during `_run_job` setup must still consume a claim handleless recovery reserved.
 
