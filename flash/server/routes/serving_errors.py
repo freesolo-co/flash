@@ -15,6 +15,8 @@ def upstream_chat_error(error: httpx.HTTPStatusError, *, checkpoint_id: str) -> 
     response = error.response
     status = response.status_code
     if status not in _FORWARDED_STATUSES:
+        # Upstream bodies may echo request content; log only the status and checkpoint.
+        logger.warning("serving_failure checkpoint=%s upstream_status=%d", checkpoint_id, status)
         return HTTPException(status_code=502, detail=f"inference failure: {error}")
     detail = f"Serving rejected the inference request (HTTP {status})."
     code = None

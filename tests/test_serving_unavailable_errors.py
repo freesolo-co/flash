@@ -76,3 +76,37 @@ def test_proxy_forwards_only_valid_pre_generation_authorization_marker(request_i
     error = httpx.HTTPStatusError("unavailable", request=response.request, response=response)
     result = upstream_chat_error(error, checkpoint_id="run/final")
     assert ((result.headers or {}).get("X-Freesolo-Inference-Started") == "false") == expected
+
+
+def test_unforwarded_upstream_status_is_logged_without_body(caplog):
+    response = httpx.Response(
+        500, text="prompt-text-not-for-logs", request=httpx.Request("POST", "https://example.test")
+    )
+    error = httpx.HTTPStatusError("boom", request=response.request, response=response)
+    with caplog.at_level("WARNING"):
+        result = upstream_chat_error(error, checkpoint_id="run/step-3")
+    assert result.status_code == 502
+    assert "serving_failure checkpoint=run/step-3 upstream_status=500" in caplog.text
+    assert "prompt-text-not-for-logs" not in caplog.text
+
+
+def test_checkpoint_proxy_logs_transport_failure_type(api, monkeypatch, caplog):
+    key, run_id = _deployed_chat_run(api)
+
+    def broken(**kwargs):
+        raise httpx.ReadTimeout("secret-detail")
+
+    monkeypatch.setattr(serving_deploy, "chat", broken)
+    with caplog.at_level("WARNING"):
+        response = api.post(
+            f"/v1/runs/{run_id}/chat",
+            json={
+                "checkpoint_id": f"{run_id}/final",
+                "messages": [{"role": "user", "content": "private-prompt-not-for-logs"}],
+            },
+            headers=_bearer(key),
+        )
+    assert response.status_code == 502
+    assert f"serving_failure checkpoint={run_id}/final error=ReadTimeout" in caplog.text
+    assert "secret-detail" not in caplog.text
+    assert "private-prompt-not-for-logs" not in caplog.text
