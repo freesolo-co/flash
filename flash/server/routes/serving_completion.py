@@ -31,13 +31,20 @@ _log = logging.getLogger(__name__)
 
 def recover_deployments() -> int:
     recovered = 0
-    for row in db.all_runs():
-        lock = deployment_locks._deploy_lock(row["run_id"])
-        if not lock.acquire(blocking=False):
+    run_ids = [row["run_id"] for row in db.all_runs()]
+    contended: set[str] = set()
+    for run_id in run_ids:
+        lock = deployment_locks._deploy_lock(run_id)
+        # The plane serves while it recovers, so a request (deploy, export, adapter download) may
+        # hold a run's lock during this scan. Revisit that run last and wait for the lock: once it
+        # is released, a record still busy has no live owner.
+        if not lock.acquire(blocking=run_id in contended):
+            contended.add(run_id)
+            run_ids.append(run_id)
             continue
         try:
             try:
-                status = run_status.get_status(row["run_id"])
+                status = run_status.get_status(run_id)
             except FileNotFoundError:
                 continue
             for checkpoint_id, deployment in status.deployments.items():

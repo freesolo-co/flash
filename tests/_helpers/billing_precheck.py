@@ -8,6 +8,7 @@ from contextlib import contextmanager
 from typing import Any
 
 import flash.runner.lifecycle.submit as run_submission
+from tests._helpers import wait_until_leading
 
 
 class PrecheckResponse:
@@ -121,5 +122,6 @@ def billing_api(
     monkeypatch.setattr(auth_mod, "_freesolo_verify", identity_for_token)
     monkeypatch.setattr(billing_mod, "precheck_training_run", lambda **k: {"ok": True})
     with TestClient(app_mod.create_app()) as client:
+        wait_until_leading(client)
         monkeypatch.delenv("GITHUB_TOKEN")
         yield client
