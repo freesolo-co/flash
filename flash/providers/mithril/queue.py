@@ -1,5 +1,6 @@
 """Recheck the exact shape immediately before bidding; never spend while waiting."""
 
+import contextlib
 import time
 
 from flash.providers.core.base import CapacityLookupError
@@ -18,8 +19,44 @@ def _raise_if_cancelled(run_id):
         raise _RunCancelled(f"run {run_id} was cancelled")
 
 
-def _queue_reason(lookup_failed, shaped_offers, view):
-    """Why the run is still waiting, as ``(reason, detail)``; quota evidence wins over price."""
+def set_account_error(run_id, text):
+    """Set (``text``) or clear (``None``) a run's account-refusal ``error``; diagnostic only.
+
+    Only an account-refusal error is ever replaced or cleared, and never on a terminal run.
+    """
+    from flash.runner.lifecycle import reporting, state
+    from flash.runner.lifecycle.status import get_status
+
+    with contextlib.suppress(Exception):
+        with state._status_guard(run_id):
+            status = get_status(run_id)
+            current = status.error
+            if status.state in state.TERMINAL_STATES or current == text:
+                return
+            if current and not queue_board.is_account_refusal(current):
+                return
+            status.error = text
+            state._save_status_unlocked(status)
+        reporting._report_status(status)
+
+
+def _account_error(run_id):
+    from flash.runner.lifecycle.status import get_status
+
+    with contextlib.suppress(Exception):
+        error = get_status(run_id).error
+        if queue_board.is_account_refusal(error):
+            return error
+    return None
+
+
+def _queue_reason(lookup_failed, shaped_offers, view, account_error=None):
+    """Why the run is still waiting, as ``(reason, detail)``; quota evidence wins over price.
+
+    An account or billing refusal wins over everything: no bid can succeed until it is fixed.
+    """
+    if account_error:
+        return queue_board.REASON_ACCOUNT, account_error
     if shaped_offers and not lookup_failed:
         # an offer below the cap exists, and every such shape's quota lookup answered "used up".
         return queue_board.REASON_QUOTA, "project Spot quota for every affordable shape is in use"
@@ -84,7 +121,7 @@ def wait_for_price(gpu, run_id, *, gpu_count=1, disk_gb=0, deadline_at, log=None
         except (CapacityLookupError, MithrilApiError):
             lookup_failed = True
         view = queue_board.join(run_id, gpus)
-        reason, detail = _queue_reason(lookup_failed, shaped, view)
+        reason, detail = _queue_reason(lookup_failed, shaped, view, _account_error(run_id))
         _update(run_id, "queued")
         record_startup_stage(
             run_id,

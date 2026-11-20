@@ -244,6 +244,10 @@ def submit_attempt(
         else:
             _raise_if_cancelled_keeping_cleanup(spec.run_id, handle)
         queue_board.leave(spec.run_id, allocated=True, gpu=gpu)
+        # an accepted bid proves any earlier account or billing refusal was fixed.
+        from flash.providers.mithril.queue import set_account_error
+
+        set_account_error(spec.run_id, None)
         if log is not None:
             print(
                 f"Spot: Mithril accepted the bid for {count}x {gpu} in {offer.region} "

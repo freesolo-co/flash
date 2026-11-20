@@ -327,7 +327,15 @@ def create(*, name, offer, payload, image_reference, gpu, gpu_count, capsule, di
                 mark_refused(offer.region, offer.instance_type)
             from flash.providers.mithril import queue_board
 
-            if queue_board.is_quota_refusal(getattr(error, "reason", "")):
+            account = queue_board.account_refusal(status, getattr(error, "reason", ""))
+            if account:
+                # Billing/account blocks refuse every bid until an operator fixes the account; name
+                # that instead of "capacity". Still a requeue, so runs recover once it is fixed.
+                cause = f"{queue_board.account_refusal_text(account)} ({cause})"
+                from flash.providers.mithril.queue import set_account_error
+
+                set_account_error(payload["run_id"], cause)
+            elif queue_board.is_quota_refusal(getattr(error, "reason", "")):
                 # Mithril's account quota is invisible before a refusal; the queue reports it.
                 queue_board.record_quota_refusal(gpu)
             raise CapacityUnavailableError(
