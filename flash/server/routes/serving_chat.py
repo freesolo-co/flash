@@ -45,6 +45,13 @@ _CHAT_CONCURRENCY_ENV = "FLASH_CHAT_FORWARDING_CONCURRENCY"
 _CHAT_QUEUE_LIMIT_ENV = "FLASH_CHAT_QUEUE_LIMIT"
 _CHAT_QUEUE_WAIT_ENV = "FLASH_CHAT_QUEUE_WAIT_SECONDS"
 _CHAT_UPSTREAM_TIMEOUT_ENV = "FLASH_CHAT_UPSTREAM_TIMEOUT_SECONDS"
+# Final evaluations (a verifier scoring a checkpoint) must not be shed behind research traffic on
+# the same control plane: one 429 on a 180-case evaluation used to fail the whole attempt. A request
+# that names this traffic class takes its own, smaller bounded lane with the same 429/503 shedding,
+# so it never competes with research chats and can never take more than its own slots.
+_TRAFFIC_CLASS_HEADER = "x-flash-traffic-class"
+_EVALUATION_TRAFFIC_CLASS = "evaluation"
+_CHAT_EVALUATION_CONCURRENCY_ENV = "FLASH_CHAT_EVALUATION_CONCURRENCY"
 _CHAT_RETRY_AFTER_SECONDS = "5"
 _STREAM_LIMITER: anyio.CapacityLimiter | None = None
 _UPSTREAM_RESPONSE_HEADER_EXCLUSIONS = frozenset(
@@ -89,12 +96,27 @@ def chat_upstream_timeout_s() -> float:
     return _env_number(_CHAT_UPSTREAM_TIMEOUT_ENV, 600.0, minimum=1.0)
 
 
-def _state_limiter(state: Any, name: str) -> anyio.CapacityLimiter:
+def chat_evaluation_concurrency() -> int:
+    return int(_env_number(_CHAT_EVALUATION_CONCURRENCY_ENV, 32, minimum=1))
+
+
+def _state_limiter(state: Any, name: str, capacity: int | None = None) -> anyio.CapacityLimiter:
     limiter = getattr(state, name, None)
     if limiter is None:
-        limiter = anyio.CapacityLimiter(chat_forwarding_concurrency())
+        limiter = anyio.CapacityLimiter(capacity or chat_forwarding_concurrency())
         setattr(state, name, limiter)
     return limiter
+
+
+def _chat_lane(request: Any) -> tuple[str, str, int | None]:
+    """(forwarding limiter, thread limiter, capacity) for this request's traffic class."""
+
+    traffic_class = (request.headers.get(_TRAFFIC_CLASS_HEADER) or "").strip().lower()
+    if traffic_class == _EVALUATION_TRAFFIC_CLASS:
+        capacity = chat_evaluation_concurrency()
+        return "chat_evaluation_limiter", "chat_evaluation_thread_limiter", capacity
+    # any other value (or none) is research traffic on the shared lane.
+    return "chat_forwarding_limiter", "chat_thread_limiter", None
 
 
 def _chat_overloaded(
@@ -126,11 +148,13 @@ async def admitted_managed_chat(
     """forward one managed chat inside a bounded slot, shedding load when saturated."""
 
     state = request.app.state
-    limiter = _state_limiter(state, "chat_forwarding_limiter")
+    limiter_name, thread_limiter_name, capacity = _chat_lane(request)
+    limiter = _state_limiter(state, limiter_name, capacity)
+    lane = "evaluation " if capacity is not None else ""
     stats = limiter.statistics()
     queue_limit = int(_env_number(_CHAT_QUEUE_LIMIT_ENV, 128, minimum=0))
     if stats.borrowed_tokens >= limiter.total_tokens and stats.tasks_waiting >= queue_limit:
-        raise _chat_overloaded(429, "queue_full", limiter)
+        raise _chat_overloaded(429, f"{lane}queue_full", limiter)
     slot = object()
     try:
         # Take an idle slot without a checkpoint, so a zero queue wait still admits.
@@ -139,7 +163,7 @@ async def admitted_managed_chat(
         with anyio.move_on_after(_env_number(_CHAT_QUEUE_WAIT_ENV, 30.0, minimum=0.0)) as wait:
             await limiter.acquire_on_behalf_of(slot)
         if wait.cancelled_caught:
-            raise _chat_overloaded(503, "queue_timeout", limiter) from None
+            raise _chat_overloaded(503, f"{lane}queue_timeout", limiter) from None
     try:
         if await request.is_disconnected():
             # The caller gave up while queued; do not spend a generation on nobody.
@@ -153,7 +177,7 @@ async def admitted_managed_chat(
             key,
             x_freesolo_org_id,
             x_freesolo_project_id,
-            limiter=_state_limiter(state, "chat_thread_limiter"),
+            limiter=_state_limiter(state, thread_limiter_name, capacity),
         )
     finally:
         limiter.release_on_behalf_of(slot)
