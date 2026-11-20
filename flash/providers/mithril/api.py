@@ -201,6 +201,36 @@ def _cancel_earlier_attempts(run_id, attempt, *, deadline_at):
         terminate(bid["fid"])
 
 
+def _raise_definitive_refusal(error, status, cause, offer, gpu, run_id):
+    """Requeue a 4xx bid refusal, naming account/billing blocks and recording quota refusals.
+
+    A 4xx is a definitive refusal, and reconciliation found no bid under this attempt's name, so
+    nothing was created: requeue (a new attempt name) instead of failing. Cool down this exact
+    region/instance type so the requeue waits for an offer Mithril accepts (often another
+    interchangeable class) instead of rebidding the refused one.
+    """
+    if status != 429:
+        from flash.providers.mithril.region_health import mark_refused
+
+        mark_refused(offer.region, offer.instance_type)
+    from flash.providers.mithril import queue_board
+
+    account = queue_board.account_refusal(status, getattr(error, "reason", ""))
+    if account:
+        # Billing/account blocks refuse every bid until an operator fixes the account; name that
+        # instead of "capacity". Still a requeue, so runs recover once it is fixed.
+        cause = f"{queue_board.account_refusal_text(account)} ({cause})"
+        from flash.providers.mithril.queue import set_account_error
+
+        set_account_error(run_id, cause)
+    elif queue_board.is_quota_refusal(getattr(error, "reason", "")):
+        # Mithril's account quota is invisible before a refusal; the queue reports it.
+        queue_board.record_quota_refusal(gpu)
+    raise CapacityUnavailableError(
+        f"Mithril refused the Spot bid ({cause}); requeuing", cause=cause
+    ) from None
+
+
 def create(*, name, offer, payload, image_reference, gpu, gpu_count, capsule, disk_gb, deadline_at):
     from flash.providers.mithril.bootstrap import startup_script
 
@@ -317,22 +347,7 @@ def create(*, name, offer, payload, image_reference, gpu, gpu_count, capsule, di
         if existing:
             return existing
         if 400 <= status < 500:
-            # A 4xx is a definitive refusal, and reconciliation found no bid under this attempt's
-            # name, so nothing was created: requeue (a new attempt name) instead of failing.
-            # Cool down this exact region/instance type so the requeue waits for an offer Mithril
-            # accepts (often another interchangeable class) instead of rebidding the refused one.
-            if status != 429:
-                from flash.providers.mithril.region_health import mark_refused
-
-                mark_refused(offer.region, offer.instance_type)
-            from flash.providers.mithril import queue_board
-
-            if queue_board.is_quota_refusal(getattr(error, "reason", "")):
-                # Mithril's account quota is invisible before a refusal; the queue reports it.
-                queue_board.record_quota_refusal(gpu)
-            raise CapacityUnavailableError(
-                f"Mithril refused the Spot bid ({cause}); requeuing", cause=cause
-            ) from None
+            _raise_definitive_refusal(error, status, cause, offer, gpu, payload["run_id"])
         # A 5xx, transport failure, timeout or unreadable 2xx may still have created the bid after
         # the listing above. Look once more after a bounded pause and adopt a late bid. If none
         # appeared, requeue: in practice Mithril's 5xx is a transient refusal, and the next
