@@ -17,6 +17,8 @@ CUSTOM_TRAINING_CAPABILITY = "custom_training_v1"
 # Target columns per position and target cells per request; a teacher top-20 fits both.
 MAX_TARGETS_PER_POSITION = 64
 MAX_TARGET_ENTRIES = 100_000
+# characters of text per encode call.
+MAX_ENCODE_CHARACTERS = 100_000
 
 
 def integer(value, name, minimum, maximum):

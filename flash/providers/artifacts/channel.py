@@ -196,18 +196,39 @@ def _heartbeat_matches_attempt(hb: dict, launch_ts: float | None, current_attemp
     )
 
 
+def current_worker_heartbeat(
+    heartbeat_reader, *, launch_ts: float | None = None, current_attempt: int | None = None
+) -> dict | None:
+    """The freshest heartbeat, only when its exact attempt provenance is current."""
+    if heartbeat_reader is None:
+        return None
+    hb = heartbeat_reader(force=True)
+    if isinstance(hb, dict) and _heartbeat_matches_attempt(hb, launch_ts, current_attempt):
+        return hb
+    return None
+
+
 def worker_flagged_retriable(
     heartbeat_reader, *, launch_ts: float | None = None, current_attempt: int | None = None
 ) -> bool:
     """Honor a retriable heartbeat only when its exact attempt provenance is current."""
-    if heartbeat_reader is None:
-        return False
-    hb = heartbeat_reader(force=True)
-    return (
-        isinstance(hb, dict)
-        and hb.get("retriable") is True
-        and _heartbeat_matches_attempt(hb, launch_ts, current_attempt)
+    hb = current_worker_heartbeat(
+        heartbeat_reader, launch_ts=launch_ts, current_attempt=current_attempt
     )
+    return hb is not None and hb.get("retriable") is True
+
+
+def with_worker_cause(detail: str, heartbeat: dict | None) -> str:
+    """Lead a terminal failure detail with the worker's own error, when it reported one.
+
+    The bootstrap marker only knows the train phase died ("produced no /tmp/metrics.json"); the
+    exception that killed it rides the worker's error heartbeat. Without this the run's `error`
+    names the symptom and the cause sits in `last_heartbeat.error`, where nobody reads it first.
+    """
+    error = heartbeat.get("error") if isinstance(heartbeat, dict) else None
+    if not isinstance(error, str) or not error.strip() or error.strip() in detail:
+        return detail
+    return f"{error.strip()} [worker exit: {detail}]" if detail else error.strip()
 
 
 T = TypeVar("T")

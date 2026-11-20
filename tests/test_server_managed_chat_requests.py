@@ -361,3 +361,23 @@ def test_managed_chat_preserves_serving_request_errors(
     assert response.status_code == expected_status
     assert expected_detail in response.json()["detail"]
     assert len(calls) == 1
+
+
+def test_managed_chat_bounds_the_upstream_generation_timeout(api, monkeypatch):
+    # Unbounded (30 min) forwards kept slots busy long after 270 s callers gave up.
+    key, run_id = _deployed_chat_run(api)
+    seen = {}
+
+    def fake_chat(**kwargs):
+        seen.update(kwargs)
+        return _managed_chat_result(kwargs["run_id"])
+
+    monkeypatch.setattr(serving_deploy, "chat", fake_chat)
+    monkeypatch.setenv("FLASH_CHAT_UPSTREAM_TIMEOUT_SECONDS", "240")
+    response = api.post(
+        f"/v1/runs/{run_id}/chat",
+        json={"checkpoint_id": f"{run_id}/final", "messages": [{"role": "user", "content": "x"}]},
+        headers=_bearer(key),
+    )
+    assert response.status_code == 200, response.text
+    assert seen["timeout_s"] == 240.0

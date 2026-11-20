@@ -27,6 +27,22 @@ CANDIDATE_RETRY_FAILURES = INFRA_RETRY_FAILURES | {
     BOOT_STALL_FAILURE,
 }
 CACHE_FALLBACK_FAILURES = frozenset({"no_capacity", "poll_error"})
+# failures the run did not cause: the provider, the machine, or a service the run depends on. a run
+# that ends on one of these (its infrastructure budget spent) reports `failure_class="infra"`, so a
+# client can tell "the platform failed this run" from "this run's code or config failed".
+INFRA_FAILURE_CLASS_FAILURES = INFRA_RETRY_FAILURES | {
+    "job_preempted",
+    WORKER_RETRIABLE_FAILURE,
+    BOOT_TIMEOUT_FAILURE,
+    BOOT_STALL_FAILURE,
+}
+
+
+def failure_class(failure: str | None) -> str:
+    """`infra` for a failure outside the run's control, `job` for everything else."""
+    return "infra" if failure in INFRA_FAILURE_CLASS_FAILURES else "job"
+
+
 _STATE_KEYS = frozenset(
     {
         "version",

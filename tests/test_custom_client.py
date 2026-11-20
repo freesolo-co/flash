@@ -153,3 +153,39 @@ def test_clients_have_no_user_owned_provisioning_api():
 
     assert not hasattr(TrainingClient, "create")
     assert not hasattr(AsyncTrainingClient, "create")
+
+
+def test_text_prompts_and_oversized_encodes_are_explained_before_sending(monkeypatch):
+    # researchers passed text to sample and >100k characters to encode; both used to fail
+    # only on the GPU worker with a terse rejection.
+    http = LostReplyHTTP()
+    http.drop = False
+    receipt = http._request
+
+    def encoded(method, path, body=None, **kwargs):
+        return {**receipt(method, path, body, **kwargs), "tokens": [1]}
+
+    http._request = encoded
+    monkeypatch.setattr("flash.custom.client.ApiClient", lambda *args, **kwargs: http)
+    client = TrainingClient("https://gpu.example", api_key="session-token")
+    with pytest.raises(TypeError, match=r"client\.encode\(prompt_text\)"):
+        client.sample("<|im_start|>user\nhi<|im_end|>\n")
+    with pytest.raises(ValueError, match="at most 100,000 characters"):
+        client.encode("x" * 100_001)
+    assert http.envelopes == []
+    assert client.pending_request is None
+    assert client.encode("x" * 100_000) == [1]
+    assert http.envelopes[0]["operation"] == "encode"
+
+
+def test_documented_limits_match_the_worker_validation():
+    from types import SimpleNamespace
+
+    from flash.custom.validation import validate_operation
+
+    backend = SimpleNamespace(vocab_size=10, max_tokens=8, max_batch=2, pending_backward=0)
+    validate_operation(backend, "encode", {"text": "x" * 100_000})
+    with pytest.raises(ValueError, match="100000 characters"):
+        validate_operation(backend, "encode", {"text": "x" * 100_001})
+    with pytest.raises(ValueError, match="nonempty token list"):
+        validate_operation(backend, "sample", {"prompt": "text"})

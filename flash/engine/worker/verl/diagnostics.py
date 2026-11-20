@@ -57,6 +57,12 @@ _ROLLOUT_FAILURE_MARKER = "multi-turn bridge could not serve"
 _FAILURE_SUMMARY_CHARS = 300
 
 
+def _is_env_service_outage(text: str) -> bool:
+    from flash.engine.worker.train.rl.rollout.service_outage import ENV_SERVICE_OUTAGE_EVIDENCE
+
+    return "bridge could not serve" in text and ENV_SERVICE_OUTAGE_EVIDENCE in text
+
+
 def _backend_common():
     """The parent module, imported lazily because it imports this one.
 
@@ -87,6 +93,7 @@ class ChildOutputTail:
         self._host_ram_kill_evidence: str | None = None
         self._fatal_engine_signature: str | None = None
         self._first_rollout_failure: str | None = None
+        self._env_service_outage: str | None = None
         self._last_exception: str | None = None
 
     def _note_exception(self, line: str) -> None:
@@ -97,6 +104,8 @@ class ChildOutputTail:
         self._last_exception = text
         if self._first_rollout_failure is None and _ROLLOUT_FAILURE_MARKER in text:
             self._first_rollout_failure = text
+        if self._env_service_outage is None and _is_env_service_outage(text):
+            self._env_service_outage = text
 
     def record(self, line: str) -> None:
         if self._fatal_engine_signature is None:
@@ -140,6 +149,11 @@ class ChildOutputTail:
     def retriable_infra_signature(self) -> str | None:
         """the first stable retriable-infrastructure signature observed in child output."""
         return self._retriable_infra_signature
+
+    @property
+    def env_service_outage(self) -> str | None:
+        """the first bridge failure caused by the environment's external service being down."""
+        return self._env_service_outage
 
     @property
     def failure_summary(self) -> str | None:
@@ -232,11 +246,20 @@ def raise_for_classified_verl_exit(return_code: int, tail: ChildOutputTail) -> N
             f"verl subprocess exited with status {return_code} after reporting "
             f"{oom_evidence}{detail}"
         )
+    from flash.engine.worker.perf.lifecycle import RetriableInfraError
+
+    outage = tail.env_service_outage
+    if outage is not None:
+        # the environment's own client retried its remote service and gave up. nothing about the
+        # run is wrong, so a replacement worker resumes from the last checkpoint, bounded by the
+        # infrastructure retry budget, instead of the run failing as an environment bug.
+        raise RetriableInfraError(
+            f"verl subprocess exited with status {return_code} after the environment's external "
+            f"service failed during rollouts: {outage}"
+        )
     signature = tail.retriable_infra_signature
     if signature is None:
         return
-    from flash.engine.worker.perf.lifecycle import RetriableInfraError
-
     raise RetriableInfraError(
         f"verl subprocess exited with status {return_code} after reporting {signature}"
     )
