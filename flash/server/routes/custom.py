@@ -43,7 +43,11 @@ def _spot_connection(run_id, remote):
         ) from None
     if handle.run_id != run_id:
         raise HTTPException(409, "custom Spot attempt does not belong to this run")
-    address = api.public_ip(handle.instance_id)
+    try:
+        address = api.public_ip(handle.instance_id)
+    except MithrilApiError:
+        # a Mithril API outage or rate limit is transient; a 500 here made controllers give up
+        raise HTTPException(503, "could not look up the custom Spot address; retry") from None
     if address is None:
         raise HTTPException(425, "custom Spot GPU has no public address yet")
     return {
