@@ -880,6 +880,10 @@ def test_ensure_adapter_local_redownloads_partial_volume_cache(
     partial_adapter_path = partial_path / "sft/run/seed0/adapter"
     partial_adapter_path.mkdir(parents=True)
     (partial_adapter_path / "adapter_config.json").write_text("{}", encoding="utf-8")
+    # A shared-cache peer's in-flight download must survive: the directory is completed, never
+    # deleted (deleting files a peer memory-maps kills its EngineCore with SIGBUS).
+    peer_partial = partial_adapter_path / ".artifact-peer"
+    peer_partial.write_bytes(b"in flight")
     calls: list[dict[str, Any]] = []
 
     def _snapshot_download(**kwargs: Any) -> str:
@@ -907,6 +911,7 @@ def test_ensure_adapter_local_redownloads_partial_volume_cache(
     assert len(calls) == 1
     assert (path / "adapter_model.safetensors").read_bytes() == b"weights"
     assert engine.registry.paths == {record.model_id: partial_adapter_path}
+    assert peer_partial.read_bytes() == b"in flight"
 
 
 def test_cached_lora_request_probes_on_int_id_collision(modal_app_module, monkeypatch, tmp_path):
