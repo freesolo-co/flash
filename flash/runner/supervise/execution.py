@@ -291,7 +291,12 @@ def _build_candidate_plan(ctx: _SubmitContext, prepared, allocation):
     candidates, chosen = retry_state.select_candidate(allocation.candidates)
     if chosen is None:
         floor = retry_state.usable_vram_floor
-        ctx.last_detail = f"no candidate has more than {floor:g} GB usable vram"
+        # Not a provider shortage: an earlier attempt's stall or OOM on this size raised the floor.
+        ctx.last_detail = (
+            f"no candidate has more than {floor:g} GB usable vram: an earlier attempt stalled "
+            f"or ran out of memory on a {floor:g} GB GPU, so a retry needs a strictly larger one "
+            "(see the attempt failures above; this is not a provider capacity shortage)"
+        )
         return None
 
     summary = allocation_summary(allocation)

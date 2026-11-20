@@ -787,10 +787,18 @@ def _classify_running_stall(
     limit = ctx.stall_after_s if state.seen_training_hb else ctx.setup_grace_s
     if time.time() - state.last_progress > limit:
         phase = "training" if state.seen_training_hb else "setup (pre-training)"
-        return ctx.stalled_unless_terminal(
+        detail = (
             f"no worker progress for {int(time.time() - state.last_progress)}s during "
             f"{phase} (instance status {status}, limit {int(limit)}s)"
         )
+        if not state.seen_fresh_hb:
+            # The worker never sent a heartbeat (e.g. a worker image pull that never finished):
+            # a fault of this machine like a first-liveness stall, not a memory signal, so it gets
+            # the provider's boot classification (same-shape retry), never a raised VRAM floor.
+            return ctx.stalled_unless_terminal(
+                f"{detail}; the worker never sent a heartbeat", ctx.adapter.first_liveness_failure
+            )
+        return ctx.stalled_unless_terminal(detail)
     return None
 
 
