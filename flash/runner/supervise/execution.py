@@ -14,6 +14,7 @@ from flash._internal.background import checkpoint, pause
 from flash.core.spec import JobSpec
 from flash.runner.lifecycle.attempts import AttemptLaunchClaim
 from flash.runner.supervise.retry_decision import (
+    UNRECONCILED_CREATE_FAILURE,
     FailureObservation,
     _candidate_usable_vram_gb,
     _drop_weight_cache,
@@ -490,7 +491,7 @@ def _submit_provider(ctx: _SubmitContext, prepared, candidate_plan):
             return (
                 PollResult(
                     False,
-                    failure="job_failed",
+                    failure=UNRECONCILED_CREATE_FAILURE,
                     detail=(
                         f"provider create could not be reconciled ({type(exc).__name__}"
                         + (f" after {exc.cause}" if getattr(exc, "cause", "") else "")
@@ -724,7 +725,9 @@ def run_attempts_supervised(
                 pause(retry_delay)
         _settle_terminal_remote(ctx)
         ctx.gc_seen_sandboxes()
-        raise RuntimeError(f"run {spec.run_id} failed after retries: {ctx.last_detail}")
+        from flash.runner.supervise.errors import RunAttemptsFailed
+
+        raise RunAttemptsFailed(spec.run_id, ctx.last_detail)
     finally:
         claim = reserved_claim if ctx is None else ctx.current_claim or ctx.reserved_claim
         if claim is not None:

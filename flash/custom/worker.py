@@ -84,7 +84,18 @@ class SessionMeter:
 
 
 def unfinished_session_error(session, reason, saved):
-    """The worker error for a session that ended without the controller closing it."""
+    """The worker error for a session that ended without the controller closing it.
+
+    A controller that attached and then stopped reaching the session for idle_seconds is
+    infrastructure, not the algorithm: a controller whose algorithm fails cancels its run, so
+    silence means its process, its network path or the control plane it attaches through was
+    lost (a control-plane restart silences every controller at once). Flag it retriable so a Spot
+    run resumes from its newest checkpoint and the controller reattaches to the replacement
+    session; the retry budget bounds a controller that is really gone (its replacement session
+    ends unattached, which is not retried or billed).
+    """
+    from flash.engine.worker.perf.lifecycle import RetriableInfraError
+
     kept = f"; saved checkpoint {saved}" if saved else ""
     if reason == "wall":
         return RuntimeError(
@@ -94,8 +105,15 @@ def unfinished_session_error(session, reason, saved):
         return RuntimeError(
             "no custom controller attached to the session; no session time was billed"
         )
-    return RuntimeError(
-        f"custom controller disconnected or timed out{kept}; resume from the last durable checkpoint"
+    if session.failed:
+        # the session's own operation raised; its error is in the session log. Not a lost link.
+        return RuntimeError(
+            "a custom session operation failed; its partial update was not saved; resume from "
+            "the last durable checkpoint"
+        )
+    return RetriableInfraError(
+        f"custom controller disconnected or timed out{kept} (no request reached the session for "
+        f"{session.idle_seconds}s); resume from the last durable checkpoint"
     )
 
 
