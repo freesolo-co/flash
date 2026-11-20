@@ -290,6 +290,18 @@ def test_native_image_patch_rejects_unknown_source():
         patch_indexer("unexpected upstream release")
 
 
+def test_runtime_image_build_patches_are_exact(tmp_path):
+    from flash.serving.deepinfer.native import runtime_image
+
+    platform = tmp_path / "platform.py"
+    platform.write_text("def f():\n    if x:\n" + runtime_image.PLATFORM_OLD)
+    runtime_image._replace_once(platform, runtime_image.PLATFORM_OLD, runtime_image.PLATFORM_NEW)
+    assert 'os.getenv("DEEPINFER_CROSS_COMPILE") == "1"' in platform.read_text()
+    with pytest.raises(RuntimeError, match="pinned build source"):
+        runtime_image._replace_once(platform, runtime_image.PLATFORM_OLD, runtime_image.PLATFORM_NEW)
+    assert runtime_image.VENV == str(config.RUNTIME_PYTHON).removesuffix("/bin/python")
+
+
 @pytest.mark.parametrize(
     ("environment", "warm_replicas"), [("main", 1), ("dev", 0), ("test", 0), (None, 0)]
 )
