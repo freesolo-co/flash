@@ -19,6 +19,9 @@ BOOT_TIMEOUT_FAILURE = "boot_timeout"
 # A VM reached running but its worker never showed liveness (e.g. a stuck image pull): also a fault
 # of that machine, so retry the same shape rather than raising the usable-VRAM floor.
 BOOT_STALL_FAILURE = "boot_stalled"
+# The provider may have accepted a create whose outcome cannot be reconciled. Never retried (a
+# second create could run beside an unseen first one), but the provider failed, not the run.
+UNRECONCILED_CREATE_FAILURE = "unreconciled_create"
 CANDIDATE_RETRY_FAILURES = INFRA_RETRY_FAILURES | {
     "oom",
     "job_preempted",
@@ -32,6 +35,7 @@ CACHE_FALLBACK_FAILURES = frozenset({"no_capacity", "poll_error"})
 # client can tell "the platform failed this run" from "this run's code or config failed".
 INFRA_FAILURE_CLASS_FAILURES = INFRA_RETRY_FAILURES | {
     "job_preempted",
+    UNRECONCILED_CREATE_FAILURE,
     WORKER_RETRIABLE_FAILURE,
     BOOT_TIMEOUT_FAILURE,
     BOOT_STALL_FAILURE,

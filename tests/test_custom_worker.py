@@ -265,7 +265,7 @@ def test_disconnected_controller_saves_progress_but_failed_session_does_not(tmp_
         return "ended"
 
     monkeypatch.setattr(worker, "serve_session", failed)
-    with pytest.raises(RuntimeError, match="disconnected or timed out; resume"):
+    with pytest.raises(RuntimeError, match="session operation failed; its partial update"):
         worker.run(context=context)
     backend.save_checkpoint.assert_not_called()
 

@@ -164,8 +164,15 @@ def _terminal_failure_detail(exc: BaseException) -> str:
     """Render a run's persisted `error` from the exception that ended it.
 
     `RunStatus.error` is shown to the submitter, so an arbitrary exception's text is NOT safe to
-    put there: it can carry internal storage paths, provider payloads, and upstream bodies. The
+    put there: it can carry internal storage paths, provider payloads, and upstream bodies, so
+    the default keeps only its type. A failed attempt that the retry plan did not retry carries
+    the attempt's own detail (the same text the run log prints and recovery persists): without
+    it the run said only `RuntimeError: run failed`.
     """
+    from flash.runner.supervise.errors import RunAttemptsFailed
+
+    if isinstance(exc, RunAttemptsFailed):
+        return exc.detail[:4000]
     return f"{type(exc).__name__}: run failed"
 
 
