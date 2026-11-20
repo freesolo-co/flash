@@ -463,6 +463,91 @@ def test_quota_refusal_is_recorded_and_logged_as_a_requeue(monkeypatch):
     assert "failed" not in line.splitlines()[0]
 
 
+BILLING_REASON = (
+    "Payment method validation failed. Please add a valid payment method. If the issue persists, "
+    "contact support."
+)
+
+
+def test_billing_refusal_is_a_distinct_visible_requeue_not_capacity(monkeypatch):
+    """2026-11-20: a billing 400 was reported as "capacity" and "no GPU below the price cap"."""
+    from flash.providers.core import registry
+    from flash.providers.core.base import Candidate, CapacityUnavailableError
+    from flash.runner.lifecycle import deadlines
+    from flash.runner.supervise import execution
+
+    run_id = "test"  # the run tests.test_mithril_api.launch bids for
+    _save_run("provisioning", run_id=run_id)
+    monkeypatch.setattr(api, "pages", lambda *a, **kw: [])
+
+    def refuse(*args, **kwargs):
+        raise client.MithrilApiError(status=400, reason=BILLING_REASON)
+
+    monkeypatch.setattr(api, "call", refuse)
+    with pytest.raises(CapacityUnavailableError) as error:
+        launch(monkeypatch)
+    expected = (
+        "provider refused: account billing problem (payment method validation failed); "
+        "an operator must fix the provider account"
+    )
+    assert error.value.cause.startswith(expected)
+    assert error.value.definitive is True
+    assert queue_board._load(queue_board._path())["quota_refusals"] == {}
+    assert runner_status.get_status(run_id).error.startswith(expected)
+
+    class _Provider:
+        def submit_attempt(self, *_a, **_kw):
+            raise error.value
+
+    monkeypatch.setattr(registry, "get_provider", lambda _name: _Provider())
+    monkeypatch.setattr(execution, "_handle_callback", lambda *a: None)
+    monkeypatch.setattr(deadlines, "_worker_deadline_at", lambda *a: time.time() + 3600)
+    ctx = execution._SubmitContext(
+        spec=_spec(run_id), log=io.StringIO(), runtime_secrets=None, source_snapshot={}
+    )
+    claim = type("Claim", (), {"attempt": 2})()
+    result, not_started = execution._submit_provider(
+        ctx, (claim, None, {}, None), (None, Candidate("spot", "H100", 1.2, 80, 1), None, _spec())
+    )
+    # still a requeued infra refusal: never a model failure, never charged
+    assert (result.failure, not_started) == ("no_capacity", True)
+    assert "for capacity" not in result.detail
+    loud = execution._spot_requeue_line(run_id, 2, result.detail)
+    assert loud.startswith(execution.ACCOUNT_REFUSAL_BANNER)
+    assert expected in loud.splitlines()[0]
+    assert "(capacity)" not in loud
+    quiet = execution._spot_requeue_line(run_id, 3, result.detail, loud=False)
+    assert "\n" not in quiet
+    assert expected in quiet
+
+    text, startup = _wait_once(monkeypatch, run_id=run_id)
+    assert "price cap" not in text
+    assert "Spot queued (provider account billing problem: provider refused: account" in text
+    assert startup["queue"]["reason"] == queue_board.REASON_ACCOUNT
+
+    # an accepted bid clears it; the run then shows no stale account error
+    _save_run("provisioning", run_id=run_id)
+    runner_status._update(run_id, "provisioning", error=error.value.cause)
+    from flash.providers.mithril.queue import set_account_error
+
+    set_account_error(run_id, None)
+    assert runner_status.get_status(run_id).error is None
+
+
+def test_capacity_and_quota_refusals_are_not_account_refusals():
+    assert queue_board.account_refusal(400, "No capacity for it_test in us-central2-b") is None
+    assert (
+        queue_board.account_refusal(
+            422, "Self-serve GPU quota exceeded in cluster us-central2-b: using 16 of 16"
+        )
+        is None
+    )
+    assert queue_board.account_refusal(400, BILLING_REASON) == "payment method validation failed"
+    assert queue_board.account_refusal(403, "Account is suspended") == (
+        "account suspended or disabled"
+    )
+
+
 def test_unknown_create_outcome_never_claims_nothing_was_billed(monkeypatch):
     from flash.providers.core.base import CapacityUnavailableError
     from flash.runner.supervise import execution

@@ -23,6 +23,7 @@ from flash.runner.supervise.retry_decision import (
 
 # Seconds between Spot requeues after a provider capacity refusal (the price queue polls at 60 s).
 SPOT_CAPACITY_REQUEUE_SECONDS = 60.0
+ACCOUNT_REFUSAL_BANNER = "!!! PROVIDER ACCOUNT PROBLEM !!!"
 # The detail prefix of a create whose outcome is unknown (see CapacityUnavailableError.definitive).
 UNKNOWN_CREATE_DETAIL = "provider create outcome unknown and no resource appeared"
 SUBMIT_FAILED_DETAIL = "provider submit failed"
@@ -42,6 +43,8 @@ class _SubmitContext:
     current_claim: AttemptLaunchClaim | None = None
     # the last attempt ended because Spot refused the bid, so the next one is a queue requeue.
     last_requeue_refused: bool = False
+    # an account or billing refusal was already logged loudly; later requeues stay one line.
+    account_refusal_logged: bool = False
 
     def gc_seen_sandboxes(self) -> None:
         if not self.seen_sandboxes:
@@ -474,11 +477,14 @@ def _submit_provider(ctx: _SubmitContext, prepared, candidate_plan):
         # provisioned, or the outcome is unknown and bounded reconciliation found nothing yet (the
         # next attempt cancels any late resource before it creates). Both requeue; only the first
         # may be described as "nothing provisioned". The retry plan decides whether to requeue.
-        lead = (
-            UNKNOWN_CREATE_DETAIL
-            if getattr(exc, "definitive", True) is False
-            else "provider refused the create for capacity"
-        )
+        from flash.providers.mithril import queue_board
+
+        if getattr(exc, "definitive", True) is False:
+            lead = UNKNOWN_CREATE_DETAIL
+        elif queue_board.is_account_refusal(getattr(exc, "cause", "")):
+            lead = "provider refused the create for an account problem"
+        else:
+            lead = "provider refused the create for capacity"
         return (
             PollResult(
                 False,
@@ -651,7 +657,10 @@ def _handle_failure(ctx: _SubmitContext, prepared, outcome):
         and getattr(chosen, "provider", "") == "spot"
     )
     if ctx.last_requeue_refused:
-        line = _spot_requeue_line(ctx.spec.run_id, claim.attempt, result.detail)
+        line = _spot_requeue_line(
+            ctx.spec.run_id, claim.attempt, result.detail, loud=not ctx.account_refusal_logged
+        )
+        ctx.account_refusal_logged |= line.startswith(ACCOUNT_REFUSAL_BANNER)
         print(line, file=ctx.log, flush=True)
         return None, plan.retry, retry_delay, False
     print(
@@ -663,8 +672,11 @@ def _handle_failure(ctx: _SubmitContext, prepared, outcome):
     return None, plan.retry, retry_delay, False
 
 
-def _spot_requeue_line(run_id: str, attempt: int, detail: str | None) -> str:
-    """A refused Spot bid is a step back into the queue, not a failed training attempt."""
+def _spot_requeue_line(run_id: str, attempt: int, detail: str | None, *, loud=True) -> str:
+    """A refused Spot bid is a step back into the queue, not a failed training attempt.
+
+    An account or billing refusal is logged loudly once (``loud``), then as one line per requeue.
+    """
     from flash.providers.mithril import queue_board
 
     view = queue_board.view(run_id)
@@ -681,6 +693,16 @@ def _spot_requeue_line(run_id: str, attempt: int, detail: str | None) -> str:
             f"Spot bid {attempt}: create outcome unknown and no bid has appeared; {where}; any "
             "late bid will be cancelled before the next attempt bids"
         )
+    elif queue_board.is_account_refusal(detail):
+        start = detail.index(queue_board.ACCOUNT_REFUSAL_PREFIX)
+        problem = detail[start:].split("; an operator", 1)[0]
+        head = (
+            f"Spot bid {attempt}: {problem}; an operator must fix the provider account; {where}; "
+            "nothing was provisioned or billed; retrying until the account is fixed"
+        )
+        if not loud:
+            return head
+        return f"{ACCOUNT_REFUSAL_BANNER} {head}\n--- provider detail ---\n{detail[:2000]}\n---"
     else:
         cause = "quota full" if queue_board.is_quota_refusal(detail) else "capacity"
         head = (

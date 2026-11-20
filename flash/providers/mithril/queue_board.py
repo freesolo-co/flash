@@ -17,6 +17,7 @@ import contextlib
 import json
 import math
 import os
+import re
 import tempfile
 import time
 from dataclasses import dataclass
@@ -40,7 +41,9 @@ QUOTA_REFUSAL_WINDOW_S = 3600.0
 REASON_QUOTA = "gpu_quota_full"
 REASON_PRICE = "no_gpu_below_price_cap"
 REASON_LOOKUP = "capacity_lookup_failed"
+REASON_ACCOUNT = "provider_account_problem"
 REASON_TEXT = {
+    REASON_ACCOUNT: "provider account billing problem",
     REASON_QUOTA: "GPU quota full",
     REASON_PRICE: "no GPU below the price cap",
     REASON_LOOKUP: "Spot market temporarily unreadable",
@@ -280,6 +283,40 @@ def record_quota_refusal(gpu: str) -> None:
 def is_quota_refusal(text: object) -> bool:
     """True when a provider refusal names a GPU quota (e.g. "Self-serve GPU quota exceeded")."""
     return isinstance(text, str) and "quota" in text.lower()
+
+
+# An account or billing refusal blocks every bid until an operator fixes the provider account; it
+# says nothing about capacity, so it must never read as "capacity" or "price cap".
+ACCOUNT_REFUSAL_PREFIX = "provider refused: account billing problem"
+_ACCOUNT_REFUSALS = (
+    (re.compile(r"payment method validation failed", re.I), "payment method validation failed"),
+    (re.compile(r"payment method|payment required|past due|unpaid", re.I), "payment problem"),
+    (re.compile(r"insufficient (funds|balance|credits?)", re.I), "insufficient funds or credit"),
+    (re.compile(r"billing", re.I), "billing problem"),
+    (
+        re.compile(
+            r"account\b.{0,40}\b(suspended|disabled|deactivated|blocked|frozen|locked)", re.I
+        ),
+        "account suspended or disabled",
+    ),
+)
+
+
+def account_refusal(status: int, text: object) -> str | None:
+    """A short label when a 4xx refusal is an account or billing block, else None."""
+    if isinstance(text, str):
+        for pattern, label in _ACCOUNT_REFUSALS:
+            if pattern.search(text):
+                return label
+    return "payment required" if status == 402 else None
+
+
+def account_refusal_text(label: str) -> str:
+    return f"{ACCOUNT_REFUSAL_PREFIX} ({label}); an operator must fix the provider account"
+
+
+def is_account_refusal(text: object) -> bool:
+    return isinstance(text, str) and ACCOUNT_REFUSAL_PREFIX in text
 
 
 def status_extra(view: QueueView | None, reason: str) -> str:
