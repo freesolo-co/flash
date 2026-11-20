@@ -41,6 +41,20 @@ UPLOAD_WRITE_TIMEOUT_S = 120
 UPLOAD_RETRY_TOTAL = 5
 
 
+def _is_entry(path, entry):
+    """Whether ``path`` is a regular file holding exactly the manifest entry's content."""
+    try:
+        if path.is_symlink() or not path.is_file() or path.stat().st_size != entry["size"]:
+            return False
+        digest = hashlib.sha256()
+        with path.open("rb") as stream:
+            for chunk in iter(lambda: stream.read(1 << 20), b""):
+                digest.update(chunk)
+    except OSError:
+        return False
+    return digest.hexdigest() == entry["sha256"]
+
+
 class BlobArtifacts:
     def __init__(self, container):
         self.container = container
@@ -162,6 +176,11 @@ class BlobArtifacts:
         if not target.resolve().is_relative_to(root):
             raise ValueError("artifact download escapes its destination")
         target.parent.mkdir(parents=True, exist_ok=True)
+        # Never replace an identical file. The destination can be a cache shared by several
+        # hosts, and replacing a file another host has memory-mapped makes that host's next page
+        # fault raise SIGBUS (vLLM EngineCores on reserved workers died this way, 2026-11-20).
+        if _is_entry(target, entry):
+            return str(target)
         fd, temporary = tempfile.mkstemp(prefix=".artifact-", dir=target.parent)
         try:
             digest = hashlib.sha256()
@@ -177,7 +196,8 @@ class BlobArtifacts:
                     stream.write(chunk)
             if size != entry["size"] or digest.hexdigest() != entry["sha256"]:
                 raise ValueError("artifact checksum mismatch")
-            os.replace(temporary, target)
+            if not _is_entry(target, entry):  # a peer may have published it meanwhile
+                os.replace(temporary, target)
         finally:
             if os.path.exists(temporary):
                 os.unlink(temporary)
