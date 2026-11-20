@@ -14,7 +14,7 @@ Qualify every worker before it is written into the secret: pinned-runtime lock v
 
 ## Slots outside the reservation
 
-The reservation scheduler is not part of this repository, and its instance inventory is its own state; Flash cannot extend it. The watchdog renews one `hold_until`, so renewal covers only the scheduler's own instances (`-1` through `-4`). Workers in other slots are deliberately left out: absorbing them would change who may terminate them, which needs an explicit operator decision. Until an operator transfers them, they have this lifecycle:
+The reservation scheduler's source is in [`deploy/reserved-h100/`](../deploy/reserved-h100/README.md), which also gives its safe deploy order. Its instance inventory is its own state, and Flash cannot extend it. The watchdog renews one `hold_until`, so renewal covers only the scheduler's own instances (`-1` through `-4`). Workers in other slots are deliberately left out: absorbing them would change who may terminate them, which needs an explicit operator decision. Until an operator transfers them, they have this lifecycle:
 
 - **Renewal.** None needed. No `hold_until` applies to them, so they never expire and keep billing until someone terminates them.
 - **Expiry.** When the reservation's `hold_until` passes, the scheduler terminates only `-1` through `-4`. Other slots keep serving. The router still routes only to configured slots, so if those slots remain in the workers secret, 9B Base keeps serving on them alone.
