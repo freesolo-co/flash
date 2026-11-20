@@ -29,7 +29,11 @@ from flash.providers._lifecycle.instances.poll import (
     make_say,
     surface_heartbeat,
 )
-from flash.providers._lifecycle.instances.startup import StartupTracker, run_cancel_requested
+from flash.providers._lifecycle.instances.startup import (
+    StartupTracker,
+    persisted_worker_start,
+    run_cancel_requested,
+)
 from flash.providers._lifecycle.instances.terminal_artifacts import (
     INVALID_MARKER_DETAIL,
     AttemptIdentity,
@@ -439,6 +443,12 @@ def _initial_poll_state(ctx: _PollContext) -> _PollState:
     start = ctx.adapter.launch_ts
     # Anchored to launch so a reattach already-running measures first-liveness from the original launch.
     running_since = start
+    # ...unless an earlier poll of this attempt saw the VM reach running. grep-astra flash-1795127872
+    # (2026-11-19): a Spot VM ran from 23:44 after a 29 min boot; the plane that reattached it after a
+    # rollover dated setup from the 23:14 launch and failed it at 00:05, 21 min into its start.
+    seen_running = persisted_worker_start(ctx.adapter.run_id, ctx.adapter.current_attempt)
+    if seen_running is not None and start <= seen_running <= time.time():
+        running_since = seen_running
     # Wall-clock THIS session first saw it running (set once) — "how long WE have watched it", so a
     # reattach doesn't fast-fail a box that just came up.
     observed_running_since = None
@@ -453,7 +463,7 @@ def _initial_poll_state(ctx: _PollContext) -> _PollState:
     liveness_absent_polls = 0
     return _PollState(
         last_status=None,
-        last_progress=start,
+        last_progress=running_since,
         became_running=False,
         running_since=running_since,
         observed_running_since=observed_running_since,
@@ -738,6 +748,27 @@ def _boot_still_progressing(ctx: _PollContext, state: _PollState) -> bool:
     return True
 
 
+def _stalled_pull(state: _PollState) -> str | None:
+    """The detail of a worker image pull that has stopped moving, or None.
+
+    A pull whose image-disk bytes have not moved for BOOT_PROGRESS_FRESH_S will not finish: fail it
+    then rather than at the first-liveness window, so the retry gets a fresh machine sooner.
+    """
+    record = state.boot_progress_record
+    changed_at = state.boot_progress_changed_at
+    if not isinstance(record, dict) or record.get("stage") != "pulling_image" or changed_at is None:
+        return None
+    still = time.time() - changed_at
+    if still <= BOOT_PROGRESS_FRESH_S:
+        return None
+    used = _disk_used(record)
+    size = "" if used is None else f", {used / 2**30:.1f} GiB on the image disk"
+    return (
+        f"worker image pull stalled: no progress for {int(still)}s{size}; "
+        "the start stalled on this machine (not a capacity shortage), retrying on a new one"
+    )
+
+
 def _classify_running_stall(
     ctx: _PollContext,
     state: _PollState,
@@ -749,7 +780,7 @@ def _classify_running_stall(
     if not state.seen_fresh_hb and not state.liveness_seen:
         # The launcher said it cannot start the worker (e.g. the image pull failed): waiting out
         # the first-liveness window would only burn the boot slot.
-        detail = _launcher_failure(_observe_boot_progress(ctx, state))
+        detail = _launcher_failure(_observe_boot_progress(ctx, state)) or _stalled_pull(state)
         if detail:
             return ctx.stalled_unless_terminal(detail, ctx.adapter.first_liveness_failure)
     # after running without a heartbeat, consult early-liveness before declaring a stall: slow
