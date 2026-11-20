@@ -6,9 +6,10 @@ MODEL_ID = "deepseek-ai/DeepSeek-V4.1-Flash-1017"
 APP_NAME = "freesolo-deepseek-serving"
 MODEL_REVISION = "1bae0e1088993b9b82de08f59de5be5a34e42170"
 RUNTIME_REVISION = "9bd9cf243fc53ef9afbf8f04d391d989117d6ab9"
-# Immutable CUDA 13.2 / Python 3.12 snapshot with B200 compiler artifacts from the
-# complete startup warmup. It contains no model weights, prompt KV, or credentials.
-RUNTIME_IMAGE_ID = "im-22oaWkg4YF8JC0J9nM5RjE"
+# Workspace-local (clado-ai) build of native/runtime_image.py: CUDA 13.2 / Python 3.12,
+# compiled for B200. It contains no model weights, prompt KV, credentials or compiler
+# kernel cache, so startup runs the exhaustive warmup. Rebuild per Modal workspace.
+RUNTIME_IMAGE_ID = "im-LkHGttRGuof00E1GXdRXlj"
 RUNTIME_PYTHON = "/opt/deepinfer-venv/bin/python"
 RUNTIME_ROOT = "/opt/DeepInfer"
 MODEL_CACHE = "/weights/hub"
