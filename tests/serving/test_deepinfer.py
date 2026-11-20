@@ -298,8 +298,10 @@ def test_runtime_image_build_patches_are_exact(tmp_path):
     runtime_image._replace_once(platform, runtime_image.PLATFORM_OLD, runtime_image.PLATFORM_NEW)
     assert 'os.getenv("DEEPINFER_CROSS_COMPILE") == "1"' in platform.read_text()
     with pytest.raises(RuntimeError, match="pinned build source"):
-        runtime_image._replace_once(platform, runtime_image.PLATFORM_OLD, runtime_image.PLATFORM_NEW)
-    assert runtime_image.VENV == str(config.RUNTIME_PYTHON).removesuffix("/bin/python")
+        runtime_image._replace_once(
+            platform, runtime_image.PLATFORM_OLD, runtime_image.PLATFORM_NEW
+        )
+    assert str(config.RUNTIME_PYTHON).removesuffix("/bin/python") == runtime_image.VENV
 
 
 @pytest.mark.parametrize(
