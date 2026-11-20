@@ -29,6 +29,11 @@ from flash.engine.worker.train.core.child.glue import (
 from flash.engine.worker.train.entry.backend_common import BoundedThreadingHTTPServer
 from flash.engine.worker.train.entry.score_batcher import ScoreBatcher
 from flash.engine.worker.train.rl.rollout.scoring import RolloutScoreRequest, score_rollouts
+from flash.engine.worker.train.rl.rollout.service_outage import (
+    ENV_SERVICE_OUTAGE_MARKER,
+    ENV_SERVICE_OUTAGE_STATUS,
+    is_environment_service_outage,
+)
 from flash.engine.worker.verl.parent_work import ParentWorkGauge
 from flash.envs.scoring.context import RolloutContext
 from flash.envs.scoring.response import ScoredResponseText
@@ -835,6 +840,12 @@ def start_reward_server(
                     # code that cannot produce one, so a resource fault reads as a 5xx here.
                     status = 503
                     detail = f"{type(exc).__name__}: {exc}"
+                    if is_environment_service_outage(exc):
+                        # the env's remote service was unreachable after its own retries. marked
+                        # so the trainer reports an infrastructure fault and the run resumes from
+                        # its last checkpoint, rather than failing it as an environment bug.
+                        status = ENV_SERVICE_OUTAGE_STATUS
+                        detail = f"{ENV_SERVICE_OUTAGE_MARKER}: {detail}"
                 else:
                     status = 200
             if status == 200:

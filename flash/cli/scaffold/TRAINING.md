@@ -524,6 +524,15 @@ time since launch. That is normal progress, not a stall. When you cancel a run, 
 `cancelled by user request at <time>` and `status` carries `cancel_reason`; the instance teardown
 that follows is the cancel, not a spot preemption.
 
+**A failed run says whose failure it was.** `status` carries `failure_class`: `infra` when the run
+ended on a provider, machine, or dependent-service fault after Flash's infrastructure retries, and
+`job` when the run's own code, config, or memory needs ended it. An environment whose external
+service (a browser farm, a sandbox, a remote grader) stays unreachable after the environment's own
+retries -- a connection error, timeout, or HTTP 408/429/5xx anywhere in the raised exception's
+chain, including a `raise RuntimeError(...)` inside the handler of that error -- is an `infra`
+fault: Flash resumes the run from its last checkpoint on a fresh worker. Any other exception your
+environment raises stays a `job` failure.
+
 **Exception — startup is exempt from all of the above.** While the run is warming up
 (`status` shows a `warmup` row: initializing the model, vLLM, and training kernels) a long
 quiet stretch at 0% GPU is the normal case, not a stall. `status` itself calls this out and

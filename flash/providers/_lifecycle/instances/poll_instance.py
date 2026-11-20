@@ -42,7 +42,11 @@ from flash.providers._lifecycle.net.deadline import (
     remaining_seconds,
     require_deadline_at,
 )
-from flash.providers.artifacts.channel import TextArtifactReader, worker_flagged_retriable
+from flash.providers.artifacts.channel import (
+    TextArtifactReader,
+    current_worker_heartbeat,
+    with_worker_cause,
+)
 from flash.providers.core.base import PollResult
 
 # a strict success marker and its metrics.json are separate artifacts; transient reads can fail.
@@ -195,17 +199,20 @@ class _TerminalArtifacts:
             return PollResult(
                 False, failure="job_preempted", detail=self._adapter.failure_detail(marker)
             )
-        retriable = marker["retriable"] or worker_flagged_retriable(
+        heartbeat = current_worker_heartbeat(
             self._heartbeat_reader,
             launch_ts=self._launch_ts,
             current_attempt=self._adapter.current_attempt,
+        )
+        retriable = marker["retriable"] or (
+            heartbeat is not None and heartbeat.get("retriable") is True
         )
         return PollResult(
             False,
             # A worker-flagged transient fault is retried on the same shape (see retry_decision);
             # a vanished instance is preemption and keeps its own policy below.
             failure="worker_retriable" if retriable else "job_failed",
-            detail=self._adapter.failure_detail(marker),
+            detail=with_worker_cause(self._adapter.failure_detail(marker), heartbeat),
         )
 
     def result(
@@ -587,11 +594,12 @@ def _classify_dead_host(
     err = ctx.adapter.read_current_error()
     # error files are attempt-scoped, so a present file already belongs to this exact handle.
     errored = bool(err and err.strip())
-    flagged = worker_flagged_retriable(
+    heartbeat = current_worker_heartbeat(
         ctx.heartbeat_reader,
         launch_ts=ctx.adapter.launch_ts,
         current_attempt=ctx.adapter.current_attempt,
     )
+    flagged = heartbeat is not None and heartbeat.get("retriable") is True
     if errored and not flagged:
         failure = "job_failed"
     elif errored or flagged:
@@ -606,7 +614,11 @@ def _classify_dead_host(
         if detail:
             return PollResult(False, failure=ctx.adapter.first_liveness_failure, detail=detail)
         failure = "job_preempted"
-    return PollResult(False, failure=failure, detail=ctx.adapter.failure_detail(None))
+    return PollResult(
+        False,
+        failure=failure,
+        detail=with_worker_cause(ctx.adapter.failure_detail(None), heartbeat),
+    )
 
 
 def _process_heartbeat(ctx: _PollContext, state: _PollState) -> None:
