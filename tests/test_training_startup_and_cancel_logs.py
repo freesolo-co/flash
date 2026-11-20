@@ -379,3 +379,59 @@ def test_a_launcher_failure_on_a_stopped_vm_is_a_boot_stall_not_preemption(clock
         result = _poll(adapter, io.StringIO())
         assert result.failure == failure
         assert ("worker image pull failed" in result.detail) == (progress is not None)
+
+
+def test_a_worker_silent_past_setup_grace_is_a_boot_stall_not_a_vram_signal(clock, monkeypatch):
+    """grep-astra flash-1795127872 (2026-11-19): a Spot H200 sat 38 min "pulling the worker image"
+    with live bootstrap logs and no heartbeat. The setup-grace stall reported plain ``stalled``,
+    which raised the usable-VRAM floor to 141 GB, and the next attempt failed with a misleading
+    ``no_capacity: no candidate has more than 141 GB usable vram``."""
+    from dataclasses import replace
+
+    _save_run()
+    monkeypatch.setattr(time, "sleep", lambda seconds: clock.__setitem__(0, clock[0] + seconds))
+    # A reattach that finds the VM already running: no started_ts, bootstrap log alive.
+    adapter = replace(
+        _adapter(lambda: {"status": "running"}),
+        early_liveness_alive=lambda: True,
+        first_liveness_failure="boot_stalled",
+    )
+    result = poll_instance_job(
+        adapter,
+        log=io.StringIO(),
+        interval_s=15.0,
+        heartbeat_reader=lambda: None,
+        setup_grace_s=3000,
+        stall_after_s=1500,
+        first_liveness_s=900,
+        load_timeout_s=1800,
+    )
+    assert not result.ok
+    assert result.failure == "boot_stalled"
+    assert "never sent a heartbeat" in result.detail
+
+
+def test_a_setup_stall_after_a_heartbeat_keeps_the_generic_stall(clock, monkeypatch):
+    from dataclasses import replace
+
+    _save_run()
+    monkeypatch.setattr(time, "sleep", lambda seconds: clock.__setitem__(0, clock[0] + seconds))
+
+    def heartbeat():
+        return {"stage": "sft_model_load", "attempt": 0, "ts": LAUNCH_TS + 60}
+
+    adapter = replace(
+        _adapter(lambda: {"status": "running"}), first_liveness_failure="boot_stalled"
+    )
+    result = poll_instance_job(
+        adapter,
+        log=io.StringIO(),
+        interval_s=15.0,
+        heartbeat_reader=heartbeat,
+        setup_grace_s=3000,
+        stall_after_s=1500,
+        first_liveness_s=900,
+        load_timeout_s=1800,
+    )
+    assert not result.ok
+    assert result.failure == "stalled"
