@@ -83,6 +83,24 @@ def _attempt_already_training(run_id: str, attempt: int) -> bool:
     return is_training_heartbeat(heartbeat.get("stage"), heartbeat.get("step"))
 
 
+def persisted_worker_start(run_id: str, attempt: int) -> float | None:
+    """When an earlier poll of this attempt first saw its VM running, from ``status.startup``.
+
+    Mithril reports no instance start time, so without this a reattached poll dates "running" from
+    the launch and charges the whole provider boot against the worker's setup windows.
+    """
+    try:
+        startup = _run_state(run_id).startup
+    except Exception:
+        return None
+    if not isinstance(startup, dict) or startup.get("attempt") != attempt:
+        return None
+    since = startup.get("since")
+    if startup.get("stage") != "starting_worker" or type(since) not in (int, float):
+        return None
+    return float(since)
+
+
 class StartupTracker:
     """Per-poll narrator of one attempt's startup; inert once training has begun."""
 
