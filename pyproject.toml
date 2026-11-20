@@ -282,7 +282,8 @@ warn_unused_configs = true
 [tool.ruff]
 line-length = 100
 target-version = "py311"
-extend-exclude = [".venv", "uv-cache"]
+# deploy/reserved-h100/reservation.py stays byte-identical to the deployed scheduler (sha256 5c278e5e).
+extend-exclude = [".venv", "uv-cache", "deploy/reserved-h100/reservation.py"]
 
 [tool.ruff.lint]
 # Shared strict ruleset. The select/ignore lists below are byte-identical in flash and in freesolo
