@@ -33,7 +33,6 @@ BOOT_PROGRESS_MAX_S = 2700.0
 # Bytes on the image disk are bucketed so filesystem noise is not mistaken for a moving pull.
 BOOT_PROGRESS_BYTES_STEP = 256 * 1024 * 1024
 
-LOAD_TIMEOUT_S = 900.0
 SETUP_GRACE_S = 3000.0
 STALL_AFTER_S = 1500.0
 
@@ -395,14 +394,6 @@ def _attempt_int(value: Any) -> int | None:
     if isinstance(value, bool) or not isinstance(value, int):
         return None
     return value if 0 <= value <= MAX_ATTEMPT_ID else None
-
-
-def heartbeat_oom_for_attempt(hb: Any, current_attempt: int | None) -> bool:
-    if not isinstance(hb, dict) or not hb.get("oom"):
-        return False
-    hb_attempt = _attempt_int(hb.get("attempt"))
-    expected_attempt = _attempt_int(current_attempt)
-    return expected_attempt is not None and hb_attempt == expected_attempt
 
 
 def heartbeat_progress_ts(

@@ -21,7 +21,6 @@ from flash.core.spec import (
     JobSpec,
     TrainSpec,
     attributed_gpu_type,
-    load_job_spec_from_env,
     persisted_gpu_head,
     persisted_gpu_types,
 )
@@ -1652,22 +1651,6 @@ def test_effective_spec_validation_accepts_the_asymmetric_auto_pin_shape() -> No
     assert worker.model_revision == "a" * 40
 
     _validate_effective_spec(reparsed_public, worker)  # raises if the exclusion is missing
-
-
-def test_load_job_spec_from_env_json_and_path(tmp_path, monkeypatch) -> None:
-    spec = spec_from_dict(_raw(), run_id="env-1")
-
-    monkeypatch.setenv("FLASH_JOB_SPEC_JSON", spec.to_json())
-    assert load_job_spec_from_env() == spec
-
-    monkeypatch.delenv("FLASH_JOB_SPEC_JSON")
-    path = tmp_path / "spec.json"
-    path.write_text(spec.to_json(), encoding="utf-8")
-    monkeypatch.setenv("FLASH_JOB_SPEC_PATH", str(path))
-    assert load_job_spec_from_env() == spec
-
-    monkeypatch.delenv("FLASH_JOB_SPEC_PATH")
-    assert load_job_spec_from_env() is None
 
 
 # ---------------------------------------------------------------------------

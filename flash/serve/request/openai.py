@@ -426,13 +426,6 @@ def _tool_controls(
     return tools, choice, True
 
 
-def parse_stream_options(value: object, stream: bool) -> bool:
-    """validate stream_options and return whether usage chunks were requested."""
-
-    options = _stream_options(value, stream)
-    return bool(options and options["include_usage"])
-
-
 def _stream_options(value: object, stream: bool) -> dict[str, bool] | None:
     if value is None:
         return None

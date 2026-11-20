@@ -7,9 +7,8 @@ import time
 from dataclasses import dataclass
 from typing import Any
 
-from flash.serve.request.openai import (  # noqa: F401
+from flash.serve.request.openai import (
     OpenAIRequestError,
-    parse_stream_options,
     reject_thinking_logprobs,
     reject_tool_capability,
 )

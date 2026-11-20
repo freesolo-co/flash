@@ -25,14 +25,6 @@ def run_label_prefix(run_id: str) -> str:
     return f"{base[: _PREFIX_BUDGET - 9]}-{h}"
 
 
-def label_matches_run(label: str, prefix: str) -> bool:
-    """True iff ``label`` belongs to the run whose prefix is ``prefix`` -- an EXACT match, or the
-    prefix followed by the ``-a`` attempt boundary. Boundary-anchored so ``flash-100`` never matches
-    ``flash-1000-...`` (or vice versa). The single label-ownership test every instance provider's
-    sweep and run-scoped teardown shares."""
-    return label == prefix or label.startswith(prefix + "-a")
-
-
 def instance_label(run_id: str, attempt: int) -> str:
     """Instance name: run plus the attempt executing on this host.
 

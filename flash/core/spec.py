@@ -20,7 +20,6 @@ detail. See their docstrings before changing either.
 from __future__ import annotations
 
 import json
-import os
 from dataclasses import asdict, dataclass, field, fields
 from typing import Any, Literal
 from uuid import UUID
@@ -906,15 +905,3 @@ class JobSpec:
     @classmethod
     def from_json(cls, raw: str) -> JobSpec:
         return cls.from_dict(json.loads(raw))
-
-
-def load_job_spec_from_env() -> JobSpec | None:
-    """Load FLASH_JOB_SPEC_JSON or FLASH_JOB_SPEC_PATH if present on a worker node."""
-    raw = os.environ.get("FLASH_JOB_SPEC_JSON")
-    if raw:
-        return JobSpec.from_json(raw)
-    path = os.environ.get("FLASH_JOB_SPEC_PATH")
-    if path and os.path.exists(path):
-        with open(path) as f:
-            return JobSpec.from_json(f.read())
-    return None
