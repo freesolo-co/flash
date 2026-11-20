@@ -22,16 +22,6 @@ def has_image_blocks(messages: Any) -> bool:
     return _shared.has_image_blocks(messages, sequence_types=(list, tuple))
 
 
-def validate_messages(messages: Any) -> None:
-    """raise unless every message satisfies the rules generation will later assume.
-
-    This deliberately discards the normalized result: normalization replaces image blocks with a
-    bare `{"type": "image"}` and carries payloads separately. Only the text branch may adopt that
-    result, past the image dispatch in `PromptPreparer`.
-    """
-    _normalize_messages(messages)
-
-
 def normalize_text_messages(messages: Any) -> list[dict[str, Any]]:
     """return template-ready messages for a request that carries no image blocks.
 

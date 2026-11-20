@@ -171,10 +171,6 @@ def _code_dir(payload: dict) -> str:
     )
 
 
-def _artifact_status_code(exc: BaseException) -> int | None:
-    return _source_snapshot.response_status_code(exc)
-
-
 def _artifact_retry_after(exc: BaseException) -> float | None:
     response = getattr(exc, "response", None)
     headers = getattr(response, "headers", None) or {}

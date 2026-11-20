@@ -268,7 +268,3 @@ def estimate_for_spec(spec, *, allocation=None) -> CostEstimate:
 
         return estimate(spec, allocation=allocation)
     return estimate_cost(run_config_from_spec(spec), allocation=allocation)
-
-
-# Backward-compatible public import.
-runconfig_from_spec = run_config_from_spec

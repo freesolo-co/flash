@@ -196,15 +196,16 @@ def test_source_descriptor_rejects_missing_and_malformed():
 
 
 # ---------------------------------------------------------------------------
-# _artifact_status_code
+# response_status_code
 # ---------------------------------------------------------------------------
 def test_artifact_status_code_parses_and_falls_back_to_none():
-    assert b._artifact_status_code(_err(status="503")) == 503  # numeric-string coerces to int
-    assert b._artifact_status_code(_err(status=429)) == 429
+    status_code = b._source_snapshot.response_status_code
+    assert status_code(_err(status="503")) == 503  # numeric-string coerces to int
+    assert status_code(_err(status=429)) == 429
     # No response attribute at all -> int(None) -> TypeError -> None.
-    assert b._artifact_status_code(_err()) is None
+    assert status_code(_err()) is None
     # Unparseable status -> ValueError -> None.
-    assert b._artifact_status_code(_err(status="not-a-number")) is None
+    assert status_code(_err(status="not-a-number")) is None
 
 
 # ---------------------------------------------------------------------------

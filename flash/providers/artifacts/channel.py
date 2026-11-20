@@ -126,54 +126,6 @@ def error_artifact_name(phase: str, attempt) -> str:
     return attempt_scoped_artifact_name("error", phase, attempt)
 
 
-def make_artifact_failure_detail_reader(
-    hf_repo: str,
-    prefix: str,
-    phase: str,
-    min_interval_s: float = 45.0,
-    attempt: int = 0,
-    *,
-    deadline_at: float | None = None,
-):
-    """Reader for worker-uploaded failure artifacts in Azure (error/console txt); force-read after terminal failure."""
-    # Attempt-scoped to match the worker's error_artifact_name(mode, attempt).
-    err_name = error_artifact_name(phase, attempt)
-    live_console_name = attempt_scoped_artifact_name("console", phase, attempt)
-    error_reader = make_artifact_text_reader(
-        hf_repo,
-        f"{prefix}/{err_name}",
-        min_interval_s,
-        deadline_at=deadline_at,
-    )
-    console_reader = make_artifact_text_reader(
-        hf_repo,
-        f"{prefix}/console_{phase}.txt",
-        min_interval_s,
-        deadline_at=deadline_at,
-    )
-    live_console_reader = make_artifact_text_reader(
-        hf_repo,
-        f"{prefix}/{live_console_name}",
-        min_interval_s,
-        deadline_at=deadline_at,
-    )
-
-    def read(force: bool = False) -> str | None:
-        parts: list[str] = []
-        error_text = error_reader(force=force)
-        if error_text:
-            parts.append(f"--- {err_name} ---\n{error_text}")
-        console_text = console_reader(force=force)
-        if console_text:
-            parts.append(f"--- console_{phase}.txt ---\n{console_text}")
-        live_console_text = live_console_reader(force=force)
-        if live_console_text:
-            parts.append(f"--- {live_console_name} ---\n{live_console_text}")
-        return "\n".join(parts) if parts else None
-
-    return read
-
-
 def _heartbeat_matches_attempt(hb: dict, launch_ts: float | None, current_attempt) -> bool:
     """Require exact attempt and timestamp provenance for one current worker heartbeat."""
     expected_attempt = _attempt_int(current_attempt)
@@ -206,16 +158,6 @@ def current_worker_heartbeat(
     if isinstance(hb, dict) and _heartbeat_matches_attempt(hb, launch_ts, current_attempt):
         return hb
     return None
-
-
-def worker_flagged_retriable(
-    heartbeat_reader, *, launch_ts: float | None = None, current_attempt: int | None = None
-) -> bool:
-    """Honor a retriable heartbeat only when its exact attempt provenance is current."""
-    hb = current_worker_heartbeat(
-        heartbeat_reader, launch_ts=launch_ts, current_attempt=current_attempt
-    )
-    return hb is not None and hb.get("retriable") is True
 
 
 def with_worker_cause(detail: str, heartbeat: dict | None) -> str:
