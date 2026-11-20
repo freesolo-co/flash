@@ -780,8 +780,16 @@ def _classify_running_stall(
     if not state.seen_fresh_hb and not state.liveness_seen:
         # The launcher said it cannot start the worker (e.g. the image pull failed): waiting out
         # the first-liveness window would only burn the boot slot.
-        detail = _launcher_failure(_observe_boot_progress(ctx, state)) or _stalled_pull(state)
+        detail = _launcher_failure(_observe_boot_progress(ctx, state))
         if detail:
+            return ctx.stalled_unless_terminal(detail, ctx.adapter.first_liveness_failure)
+        detail = _stalled_pull(state)
+        # A stale `pulling_image` record is only telemetry: the launcher stops reporting once the
+        # pull ends and drops failed uploads, so a finished pull can look stuck. Fail only while the
+        # worker's bootstrap shows no life either; latch it when it does.
+        if detail and ctx.adapter.early_liveness_alive():
+            state.liveness_seen = True
+        elif detail:
             return ctx.stalled_unless_terminal(detail, ctx.adapter.first_liveness_failure)
     # after running without a heartbeat, consult early-liveness before declaring a stall: slow
     # installs and fetches can be healthy. latch positive bootstrap evidence; require silence for

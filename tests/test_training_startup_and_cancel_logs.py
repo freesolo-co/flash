@@ -449,6 +449,46 @@ def test_a_setup_stall_after_a_heartbeat_keeps_the_generic_stall(clock, monkeypa
     assert result.failure == "stalled"
 
 
+def test_a_stale_pull_report_does_not_kill_a_live_worker(clock, monkeypatch):
+    """The pull finished but the launcher's `starting_worker` upload failed, so the last record
+    still says `pulling_image`; the worker's bootstrap console is up and it trains at 600 s."""
+    from dataclasses import replace
+
+    _save_run()
+    monkeypatch.setattr(time, "sleep", lambda seconds: clock.__setitem__(0, clock[0] + seconds))
+
+    def fetch():
+        if clock[0] - LAUNCH_TS > 900:
+            raise _StopPolling
+        return {"status": "running", "started_ts": LAUNCH_TS}
+
+    def heartbeat():
+        if clock[0] - LAUNCH_TS < 600:
+            return None
+        return {"stage": "sft_step", "step": 1, "attempt": 0, "ts": clock[0]}
+
+    stale = {"stage": "pulling_image", "disk_used": 20 * GIB, "reason": ""}
+    adapter = replace(
+        _adapter(fetch),
+        early_liveness_alive=lambda: clock[0] - LAUNCH_TS > 200,  # console uploaded once started
+        first_liveness_failure="boot_stalled",
+        boot_progress=lambda: stale,
+    )
+    log = io.StringIO()
+    with pytest.raises(_StopPolling):
+        poll_instance_job(
+            adapter,
+            log=log,
+            interval_s=15.0,
+            heartbeat_reader=heartbeat,
+            setup_grace_s=3000,
+            stall_after_s=1500,
+            first_liveness_s=900,
+            load_timeout_s=1800,
+        )
+    assert "started: first training heartbeat" in log.getvalue()
+
+
 def test_a_reattach_dates_setup_from_when_the_vm_was_seen_running(clock, monkeypatch):
     """grep-astra flash-1795127872 (2026-11-19): the Spot bid took 29 min to boot; after a rollover
     the reattaching plane dated setup from the launch and failed the VM 21 min after it ran."""
