@@ -219,13 +219,6 @@ def test_config_gpu_type_is_empty_for_auto_and_rejects_pins():
             spec_from_dict(raw, run_id="x")
 
 
-def test_gpu_short():
-    from flash.providers.core.base import gpu_short
-
-    assert gpu_short("L40S") == "l40s"
-    assert gpu_short("l4") == "l4"
-
-
 def test_config_defaults_gpu_to_auto():
     from flash.schema import spec_from_dict
 

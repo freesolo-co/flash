@@ -500,7 +500,7 @@ def test_heartbeat_keeps_slot_when_upload_reports_success(worker_context, monkey
 
 def test_critical_stages_wait_longer_for_upload_lock(worker_context, monkeypatch):
     """done/already_done/error_* are CRITICAL — no later heartbeat repairs a skipped terminal commit,
-    and error_* carries the `retriable` flag worker_flagged_retriable() reads. So they wait the LONGER
+    and error_* carries the `retriable` flag the poller reads. So they wait the LONGER
     _HB_CRITICAL_UPLOAD_LOCK_TIMEOUT_S for the upload lock before skipping, vs the short progress
     timeout. Proven by timing: with the lock held, a terminal stage blocks for the critical timeout
     while a progress stage gives up after the short one."""

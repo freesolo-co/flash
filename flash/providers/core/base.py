@@ -203,11 +203,6 @@ def providers_for(name: str) -> tuple[str, ...]:
     return tuple(carriers)
 
 
-def gpu_short(name: str) -> str:
-    """Short, endpoint-name-safe token for a GPU (e.g. '4090')."""
-    return get_gpu_info(name).short
-
-
 def min_cuda_modern(name: str) -> str:
     """Minimum host CUDA (driver) version for this GPU class on the modern stack."""
     return get_gpu_info(name).min_cuda_modern or "12.8"

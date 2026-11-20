@@ -70,9 +70,6 @@ def worker_image_for_gpu(friendly_gpu: str | None) -> str:
     return QUALIFIED_WORKER_IMAGES.get(sm, WORKER_IMAGE)
 
 
-DEFAULT_EXECUTION_TIMEOUT_MS = 6 * 3600 * 1000  # 6h cap
-
-
 # optimization toggles dropped in pr #175. filter declared runtime secrets so dead keys cannot
 # reach the worker, including allocator settings that crash grpo vllm sleep mode.
 _REMOVED_OPTIMIZATION_ENV = frozenset(
@@ -117,13 +114,6 @@ def weight_cache_env(mount: str = _WEIGHT_CACHE_MOUNT) -> dict[str, str]:
     caches are never redirected -- sharing compiled artifacts across tenants is unsafe.
     """
     return {"FLASH_WEIGHT_CACHE_DIR": f"{mount}/hf-cache/hub"}
-
-
-def strip_weight_cache_env(env: dict, mount: str = _WEIGHT_CACHE_MOUNT) -> dict:
-    """Clear cache redirects before applying this attempt's mount configuration (mutates)."""
-    for k in [k for k, v in env.items() if str(v).startswith(mount)]:
-        env.pop(k, None)
-    return env
 
 
 def build_worker_env(
