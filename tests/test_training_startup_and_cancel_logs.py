@@ -328,7 +328,19 @@ def test_a_pull_that_stops_moving_is_still_a_boot_stall(clock, monkeypatch):
     assert result.failure == "boot_stalled"
     # no progress since ~600 s: the 300 s freshness window, not the old 900 s rule, ends it.
     assert 900 <= elapsed <= 1000
-    assert "VM launcher last at stage pulling_image, no progress for" in result.detail
+    assert "worker image pull stalled: no progress for" in result.detail
+
+
+def test_a_stalled_pull_fails_before_the_first_liveness_window(clock, monkeypatch):
+    """A pull that stops moving 2 min in is a boot stall ~5 min later, not at the 900 s window."""
+    result, elapsed, _text = _boot_poll(
+        clock, monkeypatch, progress=_pulling(15 * 2**20, until=120)
+    )
+    assert result is not None
+    assert result.failure == "boot_stalled"
+    assert elapsed < 600
+    assert "worker image pull stalled" in result.detail
+    assert "not a capacity shortage" in result.detail
 
 
 def test_a_crawling_pull_is_capped(clock, monkeypatch):
@@ -435,3 +447,73 @@ def test_a_setup_stall_after_a_heartbeat_keeps_the_generic_stall(clock, monkeypa
     )
     assert not result.ok
     assert result.failure == "stalled"
+
+
+def test_a_stale_pull_report_does_not_kill_a_live_worker(clock, monkeypatch):
+    """The pull finished but the launcher's `starting_worker` upload failed, so the last record
+    still says `pulling_image`; the worker's bootstrap console is up and it trains at 600 s."""
+    from dataclasses import replace
+
+    _save_run()
+    monkeypatch.setattr(time, "sleep", lambda seconds: clock.__setitem__(0, clock[0] + seconds))
+
+    def fetch():
+        if clock[0] - LAUNCH_TS > 900:
+            raise _StopPolling
+        return {"status": "running", "started_ts": LAUNCH_TS}
+
+    def heartbeat():
+        if clock[0] - LAUNCH_TS < 600:
+            return None
+        return {"stage": "sft_step", "step": 1, "attempt": 0, "ts": clock[0]}
+
+    stale = {"stage": "pulling_image", "disk_used": 20 * GIB, "reason": ""}
+    adapter = replace(
+        _adapter(fetch),
+        early_liveness_alive=lambda: clock[0] - LAUNCH_TS > 200,  # console uploaded once started
+        first_liveness_failure="boot_stalled",
+        boot_progress=lambda: stale,
+    )
+    log = io.StringIO()
+    with pytest.raises(_StopPolling):
+        poll_instance_job(
+            adapter,
+            log=log,
+            interval_s=15.0,
+            heartbeat_reader=heartbeat,
+            setup_grace_s=3000,
+            stall_after_s=1500,
+            first_liveness_s=900,
+            load_timeout_s=1800,
+        )
+    assert "started: first training heartbeat" in log.getvalue()
+
+
+def test_a_reattach_dates_setup_from_when_the_vm_was_seen_running(clock, monkeypatch):
+    """grep-astra flash-1795127872 (2026-11-19): the Spot bid took 29 min to boot; after a rollover
+    the reattaching plane dated setup from the launch and failed the VM 21 min after it ran."""
+    from dataclasses import replace
+
+    _save_run()
+    seen_running = LAUNCH_TS + 1800
+    clock[0] = seen_running
+    record_startup_stage(RUN_ID, "starting_worker", attempt=0)
+    clock[0] = LAUNCH_TS + 2900  # the rollover: a new plane reattaches
+    monkeypatch.setattr(time, "sleep", lambda seconds: clock.__setitem__(0, clock[0] + seconds))
+
+    def fetch():
+        if clock[0] > seen_running + 2900:
+            raise _StopPolling
+        return {"status": "running"}  # Mithril reports no start time
+
+    with pytest.raises(_StopPolling):  # still inside the 3000 s setup grace from running
+        poll_instance_job(
+            replace(_adapter(fetch), first_liveness_failure="boot_stalled"),
+            log=io.StringIO(),
+            interval_s=15.0,
+            heartbeat_reader=lambda: None,
+            setup_grace_s=3000,
+            stall_after_s=1500,
+            first_liveness_s=900,
+            load_timeout_s=1800,
+        )
