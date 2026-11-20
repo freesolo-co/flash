@@ -128,6 +128,60 @@ def test_corrupt_download_never_replaces_valid_local_file(azure, tmp_path):
     assert not list(tmp_path.glob(".artifact-*"))
 
 
+def test_download_keeps_an_identical_file_in_place(azure, tmp_path):
+    # A shared cache peer may have this file memory-mapped; replacing it raises SIGBUS there.
+    container, client, _ = azure
+    upload(client, "adapter", b"weights")
+    target = tmp_path / "adapter"
+    target.write_bytes(b"weights")
+    inode = target.stat().st_ino
+    key = f"{repo_prefix(REPO)}/objects/{hashlib.sha256(b'weights').hexdigest()}"
+    del container.blobs[key]  # a cache hit must not even fetch the object
+    assert api.download_file(REPO, "adapter", local_dir=tmp_path) == str(target)
+    assert target.stat().st_ino == inode
+
+
+def test_download_keeps_a_file_a_peer_published_first(azure, tmp_path):
+    container, client, _ = azure
+    upload(client, "adapter", b"weights")
+    target = tmp_path / "adapter"
+    key = f"{repo_prefix(REPO)}/objects/{hashlib.sha256(b'weights').hexdigest()}"
+    raw, etag, _ = container.blobs[key]
+    inode = []
+
+    def peer_publishes_then_stream():
+        target.write_bytes(b"weights")
+        inode.append(target.stat().st_ino)
+        yield raw
+
+    blob = container.get_blob_client
+
+    def get_blob_client(name):
+        client_ = blob(name)
+        if name == key:
+            client_.download_blob = lambda: SimpleNamespace(
+                size=len(raw),
+                properties=SimpleNamespace(etag=etag),
+                chunks=peer_publishes_then_stream,
+            )
+        return client_
+
+    container.get_blob_client = get_blob_client
+    api.download_file(REPO, "adapter", local_dir=tmp_path)
+    assert target.stat().st_ino == inode[0]
+    assert target.read_bytes() == b"weights"
+    assert not list(tmp_path.glob(".artifact-*"))
+
+
+def test_download_replaces_a_stale_file(azure, tmp_path):
+    _, client, _ = azure
+    upload(client, "adapter", b"weights")
+    target = tmp_path / "adapter"
+    target.write_bytes(b"wrongly")  # same size, different content
+    api.download_file(REPO, "adapter", local_dir=tmp_path)
+    assert target.read_bytes() == b"weights"
+
+
 @pytest.mark.parametrize("path", ["../secret", "/secret", "a/../b", "a//b", "a\\b", "a/./b"])
 def test_rejects_unsafe_paths_before_network(azure, path):
     container, client, _ = azure

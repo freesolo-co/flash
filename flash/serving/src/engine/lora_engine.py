@@ -9,7 +9,6 @@ import asyncio
 import inspect
 import math
 import os
-import shutil
 import uuid
 from collections import OrderedDict
 from collections.abc import Awaitable, Callable
@@ -347,8 +346,10 @@ class _LoraEngineImpl(TextPromptTokenizer):
                 self._source_paths[source_ident] = cached_path
                 self.registry.set_local_path(record, cached_path)
                 return cached_path
-            if (cached_path / "adapter_config.json").exists():
-                shutil.rmtree(local_dir, ignore_errors=True)
+            # Never delete an incomplete source directory: the cache may be shared by several
+            # hosts, where a peer is still downloading it or already serves it from a memory map
+            # (deleting its file raises SIGBUS in that peer's EngineCore). The download below
+            # completes the directory, keeping files that are already correct.
 
             last_exc: Exception | None = None
             for attempt in range(3):

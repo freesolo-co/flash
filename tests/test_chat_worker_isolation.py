@@ -195,3 +195,72 @@ def test_zero_queue_wait_still_admits_into_an_idle_slot(monkeypatch):
         assert app.state.chat_forwarding_limiter.statistics().borrowed_tokens == 0
 
     asyncio.run(exercise())
+
+
+_EVALUATION = {"X-Flash-Traffic-Class": "evaluation"}
+
+
+def test_evaluation_chat_is_admitted_while_research_chat_is_shed(monkeypatch):
+    # html-astra's final evaluation failed three attempts on a single 429 from this queue while
+    # research scoring saturated it; verifier traffic takes its own bounded lane.
+    monkeypatch.setenv("FLASH_CHAT_FORWARDING_CONCURRENCY", "2")
+    monkeypatch.setenv("FLASH_CHAT_QUEUE_LIMIT", "0")
+    release, entered = threading.Event(), threading.Event()
+    app, calls = _slow_chat_app(monkeypatch, release, entered, target=2)
+
+    async def exercise():
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app), base_url="http://test"
+        ) as client:
+            pending = [
+                asyncio.create_task(client.post("/v1/runs/run/chat", json={"slow": True}))
+                for _ in range(2)
+            ]
+            try:
+                assert await asyncio.to_thread(entered.wait, 5)
+                async with asyncio.timeout(2):
+                    shed = await client.post("/v1/runs/run/chat", json={})
+                    evaluation = await client.post(
+                        "/v1/runs/run/chat", json={}, headers=_EVALUATION
+                    )
+                assert shed.status_code == 429
+                assert evaluation.status_code == 200, evaluation.text
+                assert len(calls) == 3
+            finally:
+                release.set()
+                responses = await asyncio.gather(*pending)
+            assert [r.status_code for r in responses] == [200, 200]
+            assert app.state.chat_evaluation_limiter.statistics().borrowed_tokens == 0
+
+    asyncio.run(exercise())
+
+
+def test_evaluation_lane_is_bounded_and_never_borrows_research_slots(monkeypatch):
+    monkeypatch.setenv("FLASH_CHAT_EVALUATION_CONCURRENCY", "1")
+    monkeypatch.setenv("FLASH_CHAT_QUEUE_LIMIT", "0")
+    release, entered = threading.Event(), threading.Event()
+    app, calls = _slow_chat_app(monkeypatch, release, entered, target=1)
+
+    async def exercise():
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app), base_url="http://test"
+        ) as client:
+            first = asyncio.create_task(
+                client.post("/v1/runs/run/chat", json={"slow": True}, headers=_EVALUATION)
+            )
+            try:
+                assert await asyncio.to_thread(entered.wait, 5)
+                async with asyncio.timeout(2):
+                    shed = await client.post("/v1/runs/run/chat", json={}, headers=_EVALUATION)
+                    research = await client.post("/v1/runs/run/chat", json={})
+                assert shed.status_code == 429
+                assert shed.headers["Retry-After"] == "5"
+                assert "evaluation queue_full" in shed.json()["detail"]
+                assert research.status_code == 200
+                assert app.state.chat_evaluation_limiter.total_tokens == 1
+            finally:
+                release.set()
+                assert (await first).status_code == 200
+            assert len(calls) == 2
+
+    asyncio.run(exercise())
