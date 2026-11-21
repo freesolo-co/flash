@@ -331,7 +331,7 @@ from flash.serving.app.inference_provider import (  # noqa: E402
     modal_gpus_for,
 )
 from flash.serving.app.modal_engine import HostedModalEngine  # noqa: E402
-from flash.serving.lambda_cloud import reserved, reserved_watchdog  # noqa: E402
+from flash.serving.lambda_cloud import reserved, reserved_expansion, reserved_watchdog  # noqa: E402
 from flash.serving.lambda_cloud.proxy import LambdaEngineProxy  # noqa: E402
 from flash.serving.src.engine.lora_engine import _LoraEngineImpl  # noqa: E402, F401
 
@@ -546,6 +546,9 @@ RESERVED_ENGINES = (
 )
 if RESERVED_ENGINES:
     reserved_watchdog.register_watchdog(app, lambda_controller_image, __name__)
+    reserved_expansion.register_expansion(
+        app, lambda_controller_image, lambda_proxy_secrets, __name__
+    )
 
 MODAL_FALLBACK_BY_MODEL: dict[str, Any] = {
     bm: _configured_engine(bm, "modal", "_ModalGPU") for bm in base_models() if bm != reserved.MODEL

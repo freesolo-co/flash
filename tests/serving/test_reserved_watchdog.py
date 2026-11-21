@@ -501,3 +501,17 @@ async def test_routing_rotates_over_eight_slots(monkeypatch, mod):
         await pool._engine_for(reserved.MODEL)
     assert engines[5].call_count == 0
     assert all(e.call_count == 2 for i, e in enumerate(engines) if i != 5)
+
+
+@pytest.mark.anyio
+async def test_unbuildable_worker_transport_fails_only_that_slot():
+    def factory(ip, tls):
+        if ip.endswith(".3"):
+            raise KeyError("cert")
+        return _hung_factory([])(ip, tls)
+
+    report = await wd.run_once(
+        workers(), MemoryStore(), AsyncMock(), reserved.MODEL, transport_factory=factory
+    )
+    assert "transport" in report[3]["error"]
+    assert [s for s in report if report[s]["error"]] == [3]
