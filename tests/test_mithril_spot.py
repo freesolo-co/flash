@@ -20,9 +20,10 @@ from flash.providers.mithril.pricing import accepts_price
         ("H100", "1.21", False),
         ("H100", "2.10", False),  # the former cap no longer admits
         ("H200", "2.39", True),
-        ("H200", "3.20", True),  # the cap is inclusive
-        ("H200", "3.21", False),
-        ("H200", "3.60", False),
+        ("H200", "3.20", True),  # the charged rate is admitted with headroom to win the auction
+        ("H200", "3.21", True),
+        ("H200", "3.51", True),  # the cap is inclusive
+        ("H200", "3.52", False),
         ("L40S", "1.00", False),
         ("H100", "NaN", False),
         ("H100", "Infinity", False),
@@ -392,8 +393,8 @@ def test_entry_and_running_caps_do_not_change_fixed_customer_rates():
 
     assert list(SPOT_GPUS) == ["H100", "H200"]  # Mithril offers only these
     assert [hourly_rate(gpu) for gpu in SPOT_GPUS] == [1.2, 3.2]
-    # one number per class: the charged rate is also the cap
-    assert [str(shape.keep_running_usd) for shape in SPOT_GPUS.values()] == ["1.20", "3.20"]
+    # H100's cap is its rate; H200's sits above its rate so bids win when the market clears there
+    assert [str(shape.keep_running_usd) for shape in SPOT_GPUS.values()] == ["1.20", "3.51"]
     assert not any(hasattr(shape, "entry_below_usd") for shape in SPOT_GPUS.values())
 
 
@@ -715,3 +716,104 @@ def test_failed_supervision_still_terminates_the_bid(monkeypatch):
         RuntimeError,
         ["bid_live"],
     )
+
+
+def _unfilled_handle():
+    return SimpleNamespace(
+        to_dict=lambda: {
+            "provider": "spot",
+            "instance_id": "bid_test",
+            "name": "run-a0",
+            "run_id": "run",
+            "phase": "custom",
+            "hf_repo": "org/repo",
+            "attempt": 2,
+            "gpu": "H200",
+            "gpu_count": 1,
+            "hourly_usd": 3.2,
+            "scope": "x",
+            "started_ts": 1.0,
+        }
+    )
+
+
+@pytest.mark.parametrize(
+    ("bid_status", "instances", "requeued"),
+    [
+        ("Open", [], True),  # never matched in the auction
+        ("Open", ["STATUS_NEW"], True),  # 2026-11-20: H200 bids at the clearing price
+        ("Allocated", ["STATUS_NEW"], False),  # a VM was assigned and never booted
+        ("Open", ["STATUS_STARTING"], False),
+    ],
+)
+def test_a_boot_timeout_on_a_bid_that_never_filled_requeues_as_capacity(
+    monkeypatch, bid_status, instances, requeued
+):
+    from flash.providers.core.base import PollResult
+    from flash.providers.mithril import api as mithril_api
+    from flash.providers.mithril import jobs as mithril_jobs
+
+    timed_out = PollResult(False, failure="boot_timeout", detail="remained starting")
+    monkeypatch.setattr(mithril_jobs, "poll_instance_job", lambda adapter, **kw: timed_out)
+    monkeypatch.setattr(mithril_jobs, "require_scope", lambda _: None)
+    bid = {
+        "fid": "bid_test",
+        "status": bid_status,
+        "region": "us-central2-b",
+        "instance_type": "it_h200",
+        "limit_price": "$3.20",
+    }
+    monkeypatch.setattr(mithril_api, "_bid", lambda bid_id, **kw: bid)
+    monkeypatch.setattr(
+        mithril_api, "_instances", lambda bid_id, **kw: [{"status": s} for s in instances]
+    )
+    spec = SimpleNamespace(run_id="run", phase="custom", train=SimpleNamespace(hf_repo="org/repo"))
+    log = io.StringIO()
+    result = mithril_jobs.poll(_unfilled_handle(), spec, log=log, deadline_at=10_000)
+    if requeued:
+        assert result.failure == "no_capacity"
+        assert "never filled Spot bid bid_test" in result.detail
+        assert "it_h200 in us-central2-b, limit $3.20" in result.detail
+        assert "never filled" in log.getvalue()
+    else:
+        assert result is timed_out
+
+
+def test_an_unreadable_bid_keeps_the_boot_timeout(monkeypatch):
+    from flash.providers.core.base import PollResult
+    from flash.providers.mithril import api as mithril_api
+    from flash.providers.mithril import jobs as mithril_jobs
+
+    timed_out = PollResult(False, failure="boot_timeout", detail="remained starting")
+    monkeypatch.setattr(mithril_jobs, "poll_instance_job", lambda adapter, **kw: timed_out)
+    monkeypatch.setattr(mithril_jobs, "require_scope", lambda _: None)
+
+    def down(*a, **kw):
+        raise mithril_api.MithrilApiError("down")
+
+    monkeypatch.setattr(mithril_api, "_bid", down)
+    spec = SimpleNamespace(run_id="run", phase="custom", train=SimpleNamespace(hf_repo="org/repo"))
+    assert mithril_jobs.poll(_unfilled_handle(), spec, deadline_at=10_000) is timed_out
+
+
+def test_an_unfilled_bid_requeues_without_spending_the_infra_budget():
+    """Five unfilled bids used to exhaust the budget and fail the run with boot_timeout."""
+    from flash.core.spec import GpuSpec, JobSpec
+    from flash.providers.core.allocator import Candidate
+    from flash.runner.supervise.retry_decision import (
+        FailureObservation,
+        RetryState,
+        transition_failure,
+    )
+
+    spec = JobSpec(
+        run_id="r", model="Qwen/Qwen3.5-9B-Base", gpu=GpuSpec(type="H200", provider="spot")
+    )
+    chosen = Candidate("spot", "H200", 1, 141, 1)
+    state = RetryState.initial_for_spec(spec)
+    for attempt in range(state.infra_retries + 3):
+        state, plan = transition_failure(
+            state, FailureObservation("no_capacity", chosen, (chosen,)), attempt=attempt
+        )
+        assert plan.retry
+    assert state.infra_used == 0
