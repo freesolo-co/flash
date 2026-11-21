@@ -23,7 +23,7 @@ def workers():
 def test_worker_config_accepts_any_subset_of_declared_slots():
     data = [dict(w, slot=w["slot"] + 4, instance_id=f"x{w['slot']}") for w in workers()]
     raw = json.dumps(workers() + data)
-    assert reserved.SLOT_COUNT == 8
+    assert reserved.SLOT_COUNT == 12
     assert [w["slot"] for w in reserved.parse_workers(raw)] == list(range(1, 9))
     assert reserved.worker_config(8, raw)["instance_id"] == "x4"
     # Four configured slots: the declared slots beyond them are not configured.
@@ -35,7 +35,7 @@ def test_worker_config_accepts_any_subset_of_declared_slots():
     "mutate",
     [
         lambda d: d.__setitem__(1, dict(d[1], slot=1)),
-        lambda d: d.__setitem__(0, dict(d[0], slot=9)),
+        lambda d: d.__setitem__(0, dict(d[0], slot=13)),
         lambda d: d.__setitem__(0, dict(d[0], slot=0)),
         lambda d: d.clear(),
     ],
@@ -181,3 +181,63 @@ async def test_dev_lambda_only_budget_counts_all_revisions(
         with pytest.raises(NoCapacityError, match="replica limit"):
             await fleet._check_capacity(reserved.MODEL, "new")
     fleet.shared_capacity.before_launch.assert_not_awaited()
+
+
+@pytest.mark.anyio
+async def test_expansion_proxy_follows_a_replaced_worker(monkeypatch):
+    from flash.serving.lambda_cloud import reserved_expansion
+
+    monkeypatch.setenv("FLASH_RESERVED_H100_WORKERS", json.dumps(workers()))
+    tls = {"cert": "C", "token": "T"}
+    published = [
+        {"slot": 9, "instance_id": "e9", "ip": "8.8.4.4", "revision": "a" * 40, "tls": tls}
+    ]
+    monkeypatch.setattr(reserved_expansion, "published_workers", AsyncMock(return_value=published))
+    health = {"ok": True, "base_model": reserved.MODEL, "deployment_sha": "a" * 40}
+    made = []
+
+    def factory(ip, tls):
+        made.append(AsyncMock(ip=ip))
+        made[-1].call.return_value = {**health, "configured_gpu": "H100"}
+        return made[-1]
+
+    monkeypatch.setattr(reserved, "WorkerTransport", factory)
+    clock = [0.0]
+    monkeypatch.setattr(reserved.time, "monotonic", lambda: clock[0])
+    proxy = reserved.ReservedLambdaEngineProxy()
+    proxy.base_model, proxy.reserved_slot = reserved.MODEL, 9
+    await proxy._load()
+
+    published[0] = dict(published[0], instance_id="e9b", ip="9.9.9.9")
+    clock[0] += reserved.REBIND_CHECK_SECONDS + 1
+    await proxy._generate({"x": 1})
+    assert (proxy._transport.ip, proxy._owner) == ("9.9.9.9", "e9b")
+    assert proxy.engine is proxy._transport
+    made[0].aclose.assert_awaited_once()
+
+
+@pytest.mark.anyio
+async def test_closing_reserved_stream_awaits_transport_cleanup(monkeypatch):
+    import asyncio
+
+    closed = asyncio.Event()
+
+    class Stream:
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            return {"event": "token"}
+
+        async def aclose(self):
+            await asyncio.sleep(0)
+            closed.set()
+
+    proxy = reserved.ReservedLambdaEngineProxy()
+    proxy._expansion = False
+    proxy._transport = AsyncMock()
+    proxy._transport.stream = lambda body: Stream()
+    stream = proxy._stream_generate({"x": 1})
+    assert await anext(stream) == {"event": "token"}
+    await stream.aclose()
+    assert closed.is_set()

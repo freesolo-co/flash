@@ -3,20 +3,22 @@
 import asyncio
 import json
 import os
+import time
 
 from .proxy import LambdaEngineProxy
 from .transport import WorkerTransport
 
 MODEL = "Qwen/Qwen3.5-9B-Base"
 SECRET_NAME = "flash-reserved-h100-workers-20261112"
-# Serving declares one CPU proxy per slot up to this ceiling; the workers secret configures any
-# non-empty subset of them. Unconfigured slots are never routed (see reserved_watchdog).
-SLOT_COUNT = 8
+# Serving declares one CPU proxy per slot up to this ceiling; the workers secret and
+# ``reserved_expansion`` configure a subset. Unconfigured slots are never routed.
+SLOT_COUNT = 12
 # Holds LAMBDA_API_KEY for the reservation's own lifecycle; the watchdog uses it only to
 # reboot an existing reserved instance, never to launch or terminate one.
 RESERVATION_SECRET_NAME = "flash-h100-reservation-20261112"
 # Bounded per-worker registration: a hung worker must not hold every adapter promotion.
 REGISTER_TIMEOUT_SECONDS = 10 * 60
+REBIND_CHECK_SECONDS = 15  # how often an expansion-slot proxy re-reads its worker
 
 
 def enabled(model, environment):
@@ -45,30 +47,86 @@ def worker_config(slot, raw):
     return worker
 
 
+def identity_ok(health, revision):
+    return (
+        health.get("ok") is True
+        and health.get("base_model") == MODEL
+        and health.get("deployment_sha") == revision
+        and health.get("configured_gpu") == "H100"
+    )
+
+
 class ReservedLambdaEngineProxy(LambdaEngineProxy):
     reserved_slot = 0
 
     async def _load(self):
         if self.base_model != MODEL:
             raise ValueError("Reserved H100s only serve the 9B Base model")
-        worker = worker_config(self.reserved_slot, os.environ["FLASH_RESERVED_H100_WORKERS"])
-        self._owner = worker["instance_id"]
-        self._transport = WorkerTransport(worker["ip"], worker["tls"])
+        self._transport = None
+        self._rebind_at = time.monotonic() + REBIND_CHECK_SECONDS
+        await self._bind(await self._configured())
+
+    async def _configured(self):
+        from .reserved_expansion import merge_workers, published_workers
+
+        workers = parse_workers(os.environ["FLASH_RESERVED_H100_WORKERS"])
+        # Secret slots never change under a running proxy; expansion slots can be replaced.
+        self._expansion = all(w["slot"] != self.reserved_slot for w in workers)
+        if self._expansion:
+            workers = merge_workers(workers, await published_workers())
+        return worker_config(self.reserved_slot, json.dumps(workers))
+
+    async def _bind(self, worker):
+        transport = WorkerTransport(worker["ip"], worker["tls"])
         try:
             async with asyncio.timeout(30):
-                health = await self._transport.call("/health")
-            if not (
-                health.get("ok") is True
-                and health.get("base_model") == MODEL
-                and health.get("deployment_sha") == worker["revision"]
-                and health.get("configured_gpu") == "H100"
-            ):
+                health = await transport.call("/health")
+            if not identity_ok(health, worker["revision"]):
                 raise RuntimeError("Reserved H100 model, revision, or hardware identity mismatch")
-            self._health_cache = health
-            self.engine = self._transport
         except BaseException:
-            await self._transport.aclose()
+            await transport.aclose()
             raise
+        previous, self._transport = self._transport, transport
+        self.engine, self._owner, self._health_cache = transport, worker["instance_id"], health
+        if previous is not None:
+            await previous.aclose()
+
+    async def _rebind(self):
+        """Follow an expansion slot's replaced worker; keep the binding if that fails."""
+        if not self._expansion or time.monotonic() < self._rebind_at:
+            return
+        self._rebind_at = time.monotonic() + REBIND_CHECK_SECONDS
+        try:
+            worker = await self._configured()
+            if worker["instance_id"] != self._owner:
+                await self._bind(worker)
+        except Exception as exc:
+            print(f"reserved H100 slot {self.reserved_slot} rebind failed: {exc!r}", flush=True)
+
+    async def _health(self):
+        await self._rebind()
+        return await super()._health()
+
+    async def _register(self, *args, **kwargs):
+        await self._rebind()
+        return await super()._register(*args, **kwargs)
+
+    async def _unregister(self, *args, **kwargs):
+        await self._rebind()
+        return await super()._unregister(*args, **kwargs)
+
+    async def _generate(self, *args, **kwargs):
+        await self._rebind()
+        return await super()._generate(*args, **kwargs)
+
+    async def _stream_generate(self, *args, **kwargs):
+        await self._rebind()
+        stream = super()._stream_generate(*args, **kwargs)
+        try:
+            async for event in stream:
+                yield event
+        finally:
+            await stream.aclose()  # keep the parent's bounded transport cleanup
 
     async def _shutdown(self):
         transport = getattr(self, "_transport", None)
