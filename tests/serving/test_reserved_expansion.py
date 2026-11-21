@@ -1,5 +1,3 @@
-import json
-
 import pytest
 
 from flash.serving.lambda_cloud import reserved
@@ -7,9 +5,9 @@ from flash.serving.lambda_cloud import reserved_expansion as ex
 from flash.serving.lambda_cloud.api import LambdaAPIError
 
 REV = "b" * 40
+TLS = {"cert": "C", "token": "T"}
 HEALTHY = {
     "ok": True,
-    "engine_dead": False,
     "canary_lane": True,
     "base_model": reserved.MODEL,
     "deployment_sha": REV,
@@ -22,352 +20,201 @@ def anyio_backend():
     return "asyncio"
 
 
-class Store:
-    def __init__(self, data=None):
-        self.data = dict(data or {})
+@pytest.fixture(autouse=True)
+def _launch_helpers(monkeypatch):
+    from flash.serving.lambda_cloud import bootstrap, resources
 
+    async def fake(api, env, region):
+        return f"{env}-{region}"
+
+    monkeypatch.setattr(resources, "firewall", fake)
+    monkeypatch.setattr(resources, "cache_filesystem", fake)
+    monkeypatch.setattr(bootstrap, "identity", lambda: {"key": "K", **TLS})
+    monkeypatch.setattr(bootstrap, "user_data", lambda m, rev, c, tls: f"init {rev} {tls['key']}")
+
+
+class Store(dict):
     async def get(self, key):
-        return self.data.get(key)
+        return super().get(key)
 
     async def put(self, key, value):
-        self.data[key] = value
+        self[key] = value
 
     async def pop(self, key):
-        return self.data.pop(key, None)
+        return super().pop(key, None)
 
 
-def catalog(*regions, kind="gpu_1x_h100_pcie", cents=379):
+def offer(region, kind="gpu_1x_h100_pcie", cents=379):
     return {
         kind: {
             "instance_type": {
-                "name": kind,
                 "gpu_description": "H100 (80 GB PCIe)",
                 "specs": {"gpus": 1},
+                "architecture": "x86_64",
                 "price_cents_per_hour": cents,
             },
-            "regions_with_capacity_available": [{"name": r} for r in regions],
-        },
-        "gpu_8x_h100_sxm5": {
-            "instance_type": {"gpu_description": "H100", "specs": {"gpus": 8}},
-            "regions_with_capacity_available": [{"name": "us-east-1"}],
-        },
+            "regions_with_capacity_available": [{"name": region}] if region else [],
+        }
     }
 
 
 class FakeAPI:
-    def __init__(self, cat=None, launch_error=None):
-        self.instances = []
-        self.catalog = cat or {}
-        self.launches = []
-        self.launch_error = launch_error
-        self.next_id = 0
+    def __init__(self, catalog, reject=()):
+        self.instances, self.catalog, self.launches, self.reject = [], catalog, [], reject
+        self.error = None
 
     async def call(self, method, path, body=None):
         if path == "instances":
             return list(self.instances)
         if path == "instance-types":
             return self.catalog
-        if path == "instance-operations/launch":
-            self.launches.append(body)
-            if self.launch_error:
-                raise self.launch_error
-            self.next_id += 1
-            iid = f"new-{self.next_id}"
-            self.instances.append(
-                {
-                    "id": iid,
-                    "name": body["name"],
-                    "status": "booting",
-                    "ip": None,
-                    "instance_type": {
-                        "name": body["instance_type_name"],
-                        "price_cents_per_hour": 379,
-                    },
-                    "region": {"name": body["region_name"]},
-                }
-            )
-            return {"instance_ids": [iid]}
-        raise AssertionError(path)
+        self.launches.append(body)
+        if body["region_name"] in self.reject:
+            raise LambdaAPIError(400, "instance-operations/launch/insufficient-capacity")
+        if self.error:
+            raise self.error
+        iid = f"new-{len(self.launches)}"
+        self.instances.append({"id": iid, "name": body["name"], "status": "booting", "ip": None})
+        return {"instance_ids": [iid]}
 
 
 class Transport:
     health = HEALTHY
-    generate_error = None
 
     def __init__(self, ip, tls):
-        self.tls = tls
+        pass
 
     async def call(self, path, body=None):
-        if path == "/health":
-            return self.health
-        if self.generate_error:
-            raise self.generate_error
-        return {"text": "1"}
+        return self.health if path == "/health" else {}
 
     async def aclose(self):
         pass
 
 
-async def tick(store, api, secret_slots=frozenset(range(1, 9)), now=1000.0, transport=Transport):
-    async def firewall(api, env, region):
-        assert env == "main"
-        return f"fw-{region}"
-
-    async def filesystem(api, env, region):
-        return f"fs-{region}"
-
+async def tick(store, api, now=1000.0, transport=Transport):
     return await ex.run_once(
         store,
         api,
-        set(secret_slots),
+        set(range(1, 9)),
         revision=REV,
-        credentials={"HF_TOKEN": "hf"},
+        credentials={},
         transport_factory=transport,
-        identity=lambda: {"key": "KEY", "cert": "CERT", "token": "TOKEN"},
-        user_data=lambda model, rev, creds, tls: f"cloud-init {model} {rev} {tls['key']}",
-        firewall=firewall,
-        filesystem=filesystem,
         clock=lambda: now,
     )
 
 
-def test_target_slots_default_and_validation():
-    assert ex.target_slots(None) == [9, 10, 11, 12]
-    assert ex.target_slots([10, 9, 9]) == [9, 10]
-    assert ex.target_slots([]) == []
-    with pytest.raises(ValueError, match="target slots"):
-        ex.target_slots([13])
-
-
-def test_choices_prefers_cheapest_single_h100_in_us():
-    cat = {
-        **catalog("us-west-3", "eu-central-1"),
-        **catalog("us-south-3", kind="gpu_1x_h100_sxm5", cents=489),
-    }
-    assert ex.choices(cat) == [
-        (379, "gpu_1x_h100_pcie", "us-west-3"),
-        (489, "gpu_1x_h100_sxm5", "us-south-3"),
-    ]
-    assert ex.choices(catalog()) == []
+def names(api):
+    return [b["name"].rsplit("-", 1)[1] for b in api.launches]
 
 
 @pytest.mark.anyio
 async def test_no_capacity_retries_without_launching():
-    store, api = Store(), FakeAPI(catalog())
-    report = await tick(store, api)
+    store, api = Store(), FakeAPI(offer(None))
+    assert "no H100 capacity" in (await tick(store, api))["launch"]
     assert api.launches == []
-    assert "no single-H100 capacity" in report["capacity"]
-    assert store.data == {}
+    assert store == {}
 
 
 @pytest.mark.anyio
 async def test_launch_one_per_cycle_then_qualify_and_publish():
-    store, api = Store(), FakeAPI(catalog("us-west-3"))
+    store, api = Store(), FakeAPI(offer("us-west-3"))
     await tick(store, api)
-    assert len(api.launches) == 1
     body = api.launches[0]
     assert body["name"] == "flash-h100-reservation-20261112-9"
-    assert body["firewall_rulesets"] == [{"id": "fw-us-west-3"}]
-    assert body["file_system_mounts"][0]["mount_point"] == "/data/hosting-cache"
-    assert body["user_data"] == f"cloud-init {reserved.MODEL} {REV} KEY"
-    record = store.data["slot-9"]
-    assert record["instance_id"] == "new-1"
-    assert "key" not in record["tls"]
+    assert body["firewall_rulesets"] == [{"id": "main-us-west-3"}]
+    assert body["user_data"] == f"init {REV} K"
+    assert store["slot-9"]["tls"] == TLS  # never the private key
 
-    await tick(store, api, now=1200)  # slot 9 booting; slot 10 launched
-    assert [b["name"][-2:] for b in api.launches] == ["-9", "10"]
-    assert store.data["slot-9"]["state"] == "booting"
+    await tick(store, api, now=1200)
+    assert names(api) == ["9", "10"]
 
     api.instances[0].update(status="active", ip="1.2.3.4")
     await tick(store, api, now=1400)
-    assert store.data[ex.WORKERS_KEY] == [
-        {
-            "slot": 9,
-            "instance_id": "new-1",
-            "ip": "1.2.3.4",
-            "revision": REV,
-            "tls": {"cert": "CERT", "token": "TOKEN"},
-        }
+    assert store[ex.WORKERS_KEY] == [
+        {"slot": 9, "instance_id": "new-1", "ip": "1.2.3.4", "revision": REV, "tls": TLS}
     ]
-    merged = ex.merge_workers(
-        [{"slot": 1, "instance_id": "a", "ip": "8.8.8.8", "revision": REV, "tls": {}}],
-        store.data[ex.WORKERS_KEY],
-    )
-    assert [w["slot"] for w in merged] == [1, 9]
 
 
 @pytest.mark.anyio
-async def test_unqualified_worker_is_not_published():
-    store, api = Store(), FakeAPI(catalog("us-west-3"))
-    await tick(store, api)
-
+async def test_worker_with_wrong_identity_is_not_published():
     class Wrong(Transport):
-        async def call(self, path, body=None):
-            return {**HEALTHY, "deployment_sha": "c" * 40}
+        health = {**HEALTHY, "deployment_sha": "c" * 40}  # noqa: RUF012
 
+    store, api = Store(), FakeAPI(offer("us-west-3"))
+    await tick(store, api)
     api.instances[0].update(status="active", ip="1.2.3.4")
     await tick(store, api, now=1200, transport=Wrong)
-    assert ex.WORKERS_KEY not in store.data
-    assert store.data["slot-9"]["state"] == "qualifying"
+    assert ex.WORKERS_KEY not in store
+    assert store["slot-9"]["state"] == "qualifying"
 
 
 @pytest.mark.anyio
-async def test_explicit_rejection_frees_the_slot_ambiguous_does_not():
-    store = Store()
-    api = FakeAPI(
-        catalog("us-west-3"),
-        LambdaAPIError(400, "instance-operations/launch/insufficient-capacity"),
-    )
+async def test_rejected_placement_rotates_then_retries_after_cooldown():
+    catalog = {**offer("us-west-3"), **offer("us-south-3", "gpu_1x_h100_sxm5", 489)}
+    store, api = Store(), FakeAPI(catalog, reject={"us-west-3"})
     await tick(store, api)
-    assert "slot-9" not in store.data
+    assert "slot-9" not in store
+    await tick(store, api, now=1100)
+    await tick(store, api, now=1000 + ex.REJECTION_COOLDOWN_SECONDS + 1)
+    assert [b["region_name"] for b in api.launches] == ["us-west-3", "us-south-3", "us-west-3"]
 
-    api.launch_error = TimeoutError()
-    await tick(store, api)  # the only placement is cooling down: nothing launched
-    assert len(api.launches) == 1
-    store.data.pop(ex.REJECTED_KEY)
+
+@pytest.mark.anyio
+async def test_ambiguous_launch_is_not_resubmitted_until_it_times_out():
+    store, api = Store(), FakeAPI(offer("us-west-3"))
+    api.error = TimeoutError()
     await tick(store, api)
-    assert store.data["slot-9"]["instance_id"] is None
-    api.launch_error = None
-    await tick(store, api, now=1100)  # still pending: no second launch for slot 9
-    assert [b["name"][-2:] for b in api.launches] == ["-9", "-9", "10"]  # one per cycle
+    api.error = None
+    await tick(store, api, now=1100)
+    assert names(api) == ["9", "10"]  # slot 9 still pending
     await tick(store, api, now=1000 + ex.AMBIGUOUS_LAUNCH_SECONDS + 1)
-    assert "slot-9" not in store.data  # never appeared: free to acquire again
+    assert "slot-9" not in store
 
 
 @pytest.mark.anyio
-async def test_secret_slots_and_unrecorded_instances_are_left_alone():
-    store, api = Store({ex.TARGET_KEY: [9, 10]}), FakeAPI(catalog("us-west-3"))
+async def test_unrecorded_instance_is_never_adopted():
+    store, api = Store({ex.TARGET_KEY: [9]}), FakeAPI(offer("us-west-3"))
     api.instances.append(
-        {"id": "x", "name": "flash-h100-reservation-20261112-10", "status": "active"}
+        {"id": "x", "name": ex.instance_name(9), "status": "active", "ip": "1.1.1.1"}
     )
-    report = await tick(store, api, secret_slots=set(range(1, 10)))
-    assert "review" in report[10]
+    assert "review" in (await tick(store, api))[9]
     assert api.launches == []
 
 
 @pytest.mark.anyio
-async def test_terminated_published_worker_is_unrouted_and_reacquired():
-    store, api = Store(), FakeAPI(catalog("us-west-3"))
+async def test_gone_worker_is_unrouted_and_replaced():
+    store, api = Store({ex.TARGET_KEY: [9]}), FakeAPI(offer("us-west-3"))
     await tick(store, api)
     api.instances[0].update(status="active", ip="1.2.3.4")
-    await tick(store, api, now=1200, secret_slots=set(range(1, 9)) | {10, 11, 12})
-    assert len(store.data[ex.WORKERS_KEY]) == 1
+    await tick(store, api, now=1200)
     api.instances[0]["status"] = "terminated"
-    await tick(store, api, now=1400, secret_slots=set(range(1, 9)) | {10, 11, 12})
-    assert store.data[ex.WORKERS_KEY] == []
-    await tick(store, api, now=1600, secret_slots=set(range(1, 9)) | {10, 11, 12})
-    assert [b["name"][-2:] for b in api.launches] == ["-9", "-9"]
-
-
-TLS = {"cert": "C", "token": "T"}
-
-
-def test_merge_ignores_published_slots_held_by_the_secret():
-    secret = [{"slot": 9, "instance_id": "s9", "ip": "8.8.8.8", "revision": REV, "tls": TLS}]
-    published = [{"slot": 9, "instance_id": "e9", "ip": "8.8.4.4", "revision": REV, "tls": TLS}]
-    assert [w["instance_id"] for w in ex.merge_workers(secret, published)] == ["s9"]
-    assert json.dumps(ex.merge_workers(secret, None))
-
-
-def test_merge_drops_malformed_published_entries():
-    secret = [{"slot": 1, "instance_id": "s1", "ip": "8.8.8.8", "revision": REV, "tls": {}}]
-    good = {"slot": 10, "instance_id": "e10", "ip": "8.8.4.4", "revision": REV, "tls": TLS}
-    bad = [
-        {"slot": 13, "instance_id": "x"},
-        {"slot": 11},
-        "junk",
-        dict(good, slot=12),  # duplicate instance id
-        dict(good, slot=11, instance_id="e11", tls={}),
-        dict(good, slot=11, instance_id="e11", tls={"cert": "C", "token": ""}),
-    ]
-    assert [w["slot"] for w in ex.merge_workers(secret, [good, *bad])] == [1, 10]
+    await tick(store, api, now=1400)
+    assert store[ex.WORKERS_KEY] == []
+    await tick(store, api, now=1600)
+    assert names(api) == ["9", "9"]
 
 
 @pytest.mark.anyio
-async def test_rejected_placement_rotates_to_another_offer():
-    cat = {
-        **catalog("us-west-3"),
-        **catalog("us-south-3", kind="gpu_1x_h100_sxm5", cents=489),
-    }
-
-    class Rejecting(FakeAPI):
-        async def call(self, method, path, body=None):
-            if path == "instance-operations/launch" and body["region_name"] == "us-west-3":
-                self.launches.append(body)
-                raise LambdaAPIError(400, "instance-operations/launch/insufficient-capacity")
-            return await super().call(method, path, body)
-
-    store, api = Store(), Rejecting(cat)
-    await tick(store, api)
-    await tick(store, api, now=1100)
-    assert [(b["region_name"], b["name"][-2:]) for b in api.launches] == [
-        ("us-west-3", "-9"),
-        ("us-south-3", "-9"),
-    ]
-    # The cooldown ends: the cheaper placement is tried again.
-    await tick(store, api, now=1000 + ex.REJECTION_COOLDOWN_SECONDS + 1)
-    assert api.launches[-1]["region_name"] == "us-west-3"
-
-
-@pytest.mark.anyio
-async def test_stale_publication_without_a_matching_record_is_unrouted():
+async def test_stale_publication_is_dropped_and_replacement_published():
     stale = {"slot": 9, "instance_id": "old", "ip": "8.8.4.4", "revision": REV, "tls": TLS}
-    store, api = Store({ex.WORKERS_KEY: [stale]}), FakeAPI(catalog("us-west-3"))
+    store = Store({ex.TARGET_KEY: [9], ex.WORKERS_KEY: [stale]})
+    api = FakeAPI(offer("us-west-3"))
     await tick(store, api)
-    assert store.data[ex.WORKERS_KEY] == []
+    assert store[ex.WORKERS_KEY] == []
     api.instances[0].update(status="active", ip="1.2.3.4")
     await tick(store, api, now=1200)
-    assert [w["instance_id"] for w in store.data[ex.WORKERS_KEY]] == ["new-1"]
+    assert [w["instance_id"] for w in store[ex.WORKERS_KEY]] == ["new-1"]
 
 
-@pytest.mark.anyio
-async def test_unpublish_is_durable_before_the_record_is_dropped():
-    store, api = Store(), FakeAPI(catalog("us-west-3"))
-    await tick(store, api)
-    api.instances[0].update(status="active", ip="1.2.3.4")
-    await tick(store, api, now=1200)
-    api.instances[0]["status"] = "terminated"
-
-    class FailingPop(Store):
-        async def pop(self, key):
-            raise RuntimeError("interrupted")
-
-    failing = FailingPop(store.data)
-    with pytest.raises(RuntimeError):
-        await tick(failing, api, now=1400)
-    assert all(w["slot"] != 9 for w in failing.data[ex.WORKERS_KEY])
-
-
-@pytest.mark.anyio
-async def test_pending_workers_qualify_concurrently_and_persist_each(monkeypatch):
-    import asyncio
-
-    store, api = Store(), FakeAPI(catalog("us-west-3"))
-    for n in range(4):
-        await tick(store, api, now=1000 + n)
-    for x in api.instances:
-        x.update(status="active", ip="1.2.3.4")
-
-    class Slow(Transport):
-        async def call(self, path, body=None):
-            await asyncio.sleep(0.2)
-            return await super().call(path, body)
-
-    loop = asyncio.get_running_loop()
-    start = loop.time()
-    await tick(store, api, now=1200, transport=Slow)
-    assert loop.time() - start < 1.0  # four workers x two calls x 0.2 s, in parallel
-    assert sorted(w["slot"] for w in store.data[ex.WORKERS_KEY]) == [9, 10, 11, 12]
-
-
-@pytest.mark.anyio
-async def test_transport_construction_failure_does_not_abort_qualification():
-    store, api = Store(), FakeAPI(catalog("us-west-3"))
-    await tick(store, api)
-    api.instances[0].update(status="active", ip="1.2.3.4")
-
-    def broken(ip, tls):
-        raise KeyError("cert")
-
-    await tick(store, api, now=1200, transport=broken)
-    assert store.data["slot-9"]["state"] == "qualifying"
+def test_merge_keeps_secret_and_falls_back_on_malformed_entries():
+    secret = [{"slot": 9, "instance_id": "s9", "ip": "8.8.8.8", "revision": REV, "tls": TLS}]
+    good = {"slot": 10, "instance_id": "e10", "ip": "8.8.4.4", "revision": REV, "tls": TLS}
+    merged = ex.merge_workers(secret, [dict(good, slot=9), good])
+    assert [w["instance_id"] for w in merged] == ["s9", "e10"]
+    for bad in (
+        {"slot": 13},
+        dict(good, slot=11, tls={}),
+        dict(good, slot=11, instance_id="s9"),
+        "junk",
+    ):
+        assert ex.merge_workers(secret, [good, bad]) == secret

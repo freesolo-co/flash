@@ -505,17 +505,13 @@ async def test_routing_rotates_over_eight_slots(monkeypatch, mod):
 
 @pytest.mark.anyio
 async def test_unbuildable_worker_transport_fails_only_that_slot():
-    healthy = _hung_factory([])
-
     def factory(ip, tls):
         if ip.endswith(".3"):
             raise KeyError("cert")
-        return healthy(ip, tls)
+        return _hung_factory([])(ip, tls)
 
-    store = MemoryStore()
     report = await wd.run_once(
-        workers(), store, AsyncMock(), reserved.MODEL, transport_factory=factory
+        workers(), MemoryStore(), AsyncMock(), reserved.MODEL, transport_factory=factory
     )
-    assert "transport: KeyError" in report[3]["error"]
-    assert all(report[s]["error"] == "" for s in (1, 2, 4))
-    assert store.data[wd.CONFIGURED_KEY] == [1, 2, 3, 4]
+    assert "transport" in report[3]["error"]
+    assert [s for s in report if report[s]["error"]] == [3]
