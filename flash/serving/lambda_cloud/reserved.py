@@ -121,8 +121,12 @@ class ReservedLambdaEngineProxy(LambdaEngineProxy):
 
     async def _stream_generate(self, *args, **kwargs):
         await self._rebind()
-        async for event in super()._stream_generate(*args, **kwargs):
-            yield event
+        stream = super()._stream_generate(*args, **kwargs)
+        try:
+            async for event in stream:
+                yield event
+        finally:
+            await stream.aclose()  # keep the parent's bounded transport cleanup
 
     async def _shutdown(self):
         transport = getattr(self, "_transport", None)

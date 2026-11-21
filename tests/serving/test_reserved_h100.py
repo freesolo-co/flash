@@ -214,3 +214,30 @@ async def test_expansion_proxy_follows_a_replaced_worker(monkeypatch):
     assert (proxy._transport.ip, proxy._owner) == ("9.9.9.9", "e9b")
     assert proxy.engine is proxy._transport
     made[0].aclose.assert_awaited_once()
+
+
+@pytest.mark.anyio
+async def test_closing_reserved_stream_awaits_transport_cleanup(monkeypatch):
+    import asyncio
+
+    closed = asyncio.Event()
+
+    class Stream:
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            return {"event": "token"}
+
+        async def aclose(self):
+            await asyncio.sleep(0)
+            closed.set()
+
+    proxy = reserved.ReservedLambdaEngineProxy()
+    proxy._expansion = False
+    proxy._transport = AsyncMock()
+    proxy._transport.stream = lambda body: Stream()
+    stream = proxy._stream_generate({"x": 1})
+    assert await anext(stream) == {"event": "token"}
+    await stream.aclose()
+    assert closed.is_set()
