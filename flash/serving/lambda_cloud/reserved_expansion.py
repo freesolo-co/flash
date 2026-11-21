@@ -119,6 +119,77 @@ async def identity_ok(transport, revision):
     )
 
 
+async def _launch(
+    store, api, slot, *, revision, credentials, identity, user_data, firewall, filesystem, now
+):
+    """Launch one worker for ``slot`` if capacity exists; at-most-once by durable record."""
+    from .api import LambdaAPIError
+
+    report = {}
+    catalog = await api.call("GET", "instance-types")
+    available = choices(catalog)
+    if not available:
+        report["capacity"] = "no single-H100 capacity; retrying next cycle"
+    else:
+        price, kind, region = available[0]
+        firewall_id = await firewall(api, "main", region)
+        filesystem_id = await filesystem(api, "main", region)
+        tls = await asyncio.to_thread(identity)
+        bootstrap = user_data(reserved.MODEL, revision, credentials, tls)
+        record = {
+            "state": "submitted",
+            "submitted_at": now,
+            "instance_id": None,
+            "instance_type": kind,
+            "region": region,
+            "quoted_hourly_usd": price / 100,
+            "revision": revision,
+            # The private key goes only into cloud-init; routing needs the pin and token.
+            "tls": {"cert": tls["cert"], "token": tls["token"]},
+        }
+        await store.put(slot_key(slot), record)  # durable before the launch request
+        try:
+            result = await api.call(
+                "POST",
+                "instance-operations/launch",
+                {
+                    "region_name": region,
+                    "instance_type_name": kind,
+                    "quantity": 1,
+                    "ssh_key_names": ["freesolo-serving"],
+                    "firewall_rulesets": [{"id": firewall_id}],
+                    "file_system_mounts": [
+                        {"file_system_id": filesystem_id, "mount_point": "/data/hosting-cache"}
+                    ],
+                    "name": instance_name(slot),
+                    "image": {"family": "gpu-base-24-04"},
+                    "user_data": bootstrap,
+                    "tags": [dict(t) for t in TAGS],
+                },
+            )
+        except LambdaAPIError as exc:
+            if 400 <= exc.status < 500 and exc.status != 408:
+                await store.pop(slot_key(slot))  # explicit rejection: nothing was created
+                report["capacity"] = f"launch rejected ({exc.code}); retrying next cycle"
+            else:
+                record["last_error"] = str(exc)[:120]
+                await store.put(slot_key(slot), record)
+                report["capacity"] = "launch outcome unknown; reconciling by name"
+            return report
+        except Exception as exc:
+            record["last_error"] = type(exc).__name__
+            await store.put(slot_key(slot), record)
+            report["capacity"] = "launch outcome unknown; reconciling by name"
+            return report
+        ids = result.get("instance_ids", [])
+        if len(ids) == 1:
+            record.update(instance_id=ids[0], state="booting", accepted_at=now)
+            await store.put(slot_key(slot), record)
+        report["launched"] = {"slot": slot, "type": kind, "region": region, "usd": price / 100}
+        print(f"reserved H100 expansion launched slot {slot}: {kind} {region}", flush=True)
+    return report
+
+
 async def run_once(
     store,
     api,
@@ -134,7 +205,6 @@ async def run_once(
     clock=time.time,
 ):
     """One acquisition/qualification cycle. Returns a printable report."""
-    from .api import LambdaAPIError
     from .reserved_watchdog import OK, probe_status
 
     now = clock()
@@ -230,68 +300,20 @@ async def run_once(
 
     # At most one launch per cycle, lowest empty slot first.
     if launchable:
-        slot = launchable[0]
-        catalog = await api.call("GET", "instance-types")
-        available = choices(catalog)
-        if not available:
-            report["capacity"] = "no single-H100 capacity; retrying next cycle"
-        else:
-            price, kind, region = available[0]
-            firewall_id = await firewall(api, "main", region)
-            filesystem_id = await filesystem(api, "main", region)
-            tls = await asyncio.to_thread(identity)
-            bootstrap = user_data(reserved.MODEL, revision, credentials, tls)
-            record = {
-                "state": "submitted",
-                "submitted_at": now,
-                "instance_id": None,
-                "instance_type": kind,
-                "region": region,
-                "quoted_hourly_usd": price / 100,
-                "revision": revision,
-                # The private key goes only into cloud-init; routing needs the pin and token.
-                "tls": {"cert": tls["cert"], "token": tls["token"]},
-            }
-            await store.put(slot_key(slot), record)  # durable before the launch request
-            try:
-                result = await api.call(
-                    "POST",
-                    "instance-operations/launch",
-                    {
-                        "region_name": region,
-                        "instance_type_name": kind,
-                        "quantity": 1,
-                        "ssh_key_names": ["freesolo-serving"],
-                        "firewall_rulesets": [{"id": firewall_id}],
-                        "file_system_mounts": [
-                            {"file_system_id": filesystem_id, "mount_point": "/data/hosting-cache"}
-                        ],
-                        "name": instance_name(slot),
-                        "image": {"family": "gpu-base-24-04"},
-                        "user_data": bootstrap,
-                        "tags": [dict(t) for t in TAGS],
-                    },
-                )
-            except LambdaAPIError as exc:
-                if 400 <= exc.status < 500 and exc.status != 408:
-                    await store.pop(slot_key(slot))  # explicit rejection: nothing was created
-                    report["capacity"] = f"launch rejected ({exc.code}); retrying next cycle"
-                else:
-                    record["last_error"] = str(exc)[:120]
-                    await store.put(slot_key(slot), record)
-                    report["capacity"] = "launch outcome unknown; reconciling by name"
-                return report
-            except Exception as exc:
-                record["last_error"] = type(exc).__name__
-                await store.put(slot_key(slot), record)
-                report["capacity"] = "launch outcome unknown; reconciling by name"
-                return report
-            ids = result.get("instance_ids", [])
-            if len(ids) == 1:
-                record.update(instance_id=ids[0], state="booting", accepted_at=now)
-                await store.put(slot_key(slot), record)
-            report["launched"] = {"slot": slot, "type": kind, "region": region, "usd": price / 100}
-            print(f"reserved H100 expansion launched slot {slot}: {kind} {region}", flush=True)
+        report.update(
+            await _launch(
+                store,
+                api,
+                launchable[0],
+                revision=revision,
+                credentials=credentials,
+                identity=identity,
+                user_data=user_data,
+                firewall=firewall,
+                filesystem=filesystem,
+                now=now,
+            )
+        )
     return report
 
 
