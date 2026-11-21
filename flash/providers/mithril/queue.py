@@ -8,6 +8,7 @@ from flash.providers.mithril import queue_board
 from flash.providers.mithril.capacity import quota_available
 from flash.providers.mithril.client import MithrilApiError
 from flash.providers.mithril.prices import affordable_offers
+from flash.providers.mithril.region_health import boot_failures
 
 
 def _raise_if_cancelled(run_id):
@@ -108,11 +109,21 @@ def wait_for_price(gpu, run_id, *, gpu_count=1, disk_gb=0, deadline_at, log=None
                 if _update(run_id, "provisioning") is False:
                     queue_board.leave(run_id, allocated=False)
                     raise _RunCancelled(f"run {run_id} went terminal while queued")
-                # First class to come up wins; ties: class priority, price, region.
+                # First class to come up wins; ties: class priority, then the pool (region and
+                # instance type) with the fewest recent boot timeouts, then price and region. The
+                # class order is unchanged; within a class, a pool whose VMs keep failing to boot
+                # is only bid on when no healthier pool has an offer.
+                failures = {
+                    (offer.region, offer.instance_type): boot_failures(
+                        offer.region, offer.instance_type
+                    )
+                    for offer in offers
+                }
                 return min(
                     offers,
                     key=lambda offer: (
                         priority(offer.gpu),
+                        failures[(offer.region, offer.instance_type)],
                         offer.hourly_usd,
                         offer.region,
                         offer.instance_type,

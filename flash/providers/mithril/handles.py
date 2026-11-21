@@ -14,6 +14,9 @@ class SpotJobHandle(InstanceJobHandle):
     phase: str
     scope: str
     gpu_count: int = 1
+    # the pool the bid was placed in; empty on attempts launched before it was recorded.
+    region: str = ""
+    instance_type: str = ""
     provider = "spot"
 
     @staticmethod
@@ -30,6 +33,8 @@ class SpotJobHandle(InstanceJobHandle):
             "phase": self.phase,
             "gpu_count": self.gpu_count,
             "scope": self.scope,
+            **({"region": self.region} if self.region else {}),
+            **({"instance_type": self.instance_type} if self.instance_type else {}),
         }
 
     @staticmethod
@@ -44,6 +49,10 @@ class SpotJobHandle(InstanceJobHandle):
         if type(count) is not int or count not in (1, 8):
             raise ValueError("invalid Mithril Spot gpu_count")
         fields["gpu_count"] = count
+        for key in ("region", "instance_type"):
+            value = data.get(key, "")
+            if isinstance(value, str) and value == value.strip():
+                fields[key] = value
         return fields
 
 

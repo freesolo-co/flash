@@ -500,41 +500,186 @@ def test_mithril_boot_window_and_failure(monkeypatch):
     assert captured["first_liveness_failure"] == "boot_stalled"
 
 
-def test_a_vm_that_never_booted_does_not_bench_its_region(monkeypatch):
+def _spot_handle(**extra):
+    data = {
+        "provider": "spot",
+        "instance_id": "bid_test",
+        "name": "run-a0",
+        "run_id": "run",
+        "phase": "custom",
+        "hf_repo": "org/repo",
+        "attempt": 0,
+        "gpu": "H200",
+        "gpu_count": 1,
+        "hourly_usd": 2.5,
+        "scope": "x",
+        "started_ts": 1.0,
+        **extra,
+    }
+    return SimpleNamespace(to_dict=lambda: dict(data))
+
+
+def _isolate_region_health(monkeypatch, tmp_path):
+    from flash.providers.mithril import region_health
+
+    monkeypatch.setattr(
+        region_health, "_path", lambda: tmp_path / ".spot-region-health" / "cooldown.json"
+    )
+    return region_health
+
+
+def test_a_vm_that_never_booted_demotes_its_pool_but_does_not_bench_its_region(
+    monkeypatch, tmp_path
+):
     from flash.providers.core.base import PollResult
     from flash.providers.mithril import api as mithril_api
     from flash.providers.mithril import jobs as mithril_jobs
-    from flash.providers.mithril import region_health
 
+    region_health = _isolate_region_health(monkeypatch, tmp_path)
     timed_out = PollResult(False, failure="boot_timeout", detail="remained starting")
     monkeypatch.setattr(mithril_jobs, "poll_instance_job", lambda adapter, **kw: timed_out)
     monkeypatch.setattr(mithril_jobs, "require_scope", lambda _: None)
-    bid = {"fid": "bid_test", "region": "af-south1-a", "instances": []}
-    monkeypatch.setattr(mithril_api, "_bid", lambda bid_id: bid)
-    handle = SimpleNamespace(
-        to_dict=lambda: {
-            "provider": "spot",
-            "instance_id": "bid_test",
-            "name": "run-a0",
-            "run_id": "run",
-            "phase": "custom",
-            "hf_repo": "org/repo",
-            "attempt": 0,
-            "gpu": "H200",
-            "gpu_count": 1,
-            "hourly_usd": 2.5,
-            "scope": "x",
-            "started_ts": 1.0,
-        }
-    )
+    # an attempt launched before handles recorded their pool reads it from the bid.
+    bid = {"fid": "bid_test", "region": "us-x1-a", "instance_type": "it_h200", "instances": []}
+    monkeypatch.setattr(mithril_api, "_bid", lambda bid_id, **kw: bid)
     spec = SimpleNamespace(run_id="run", phase="custom", train=SimpleNamespace(hf_repo="org/repo"))
-    # One VM that never booted (filled or not) must not keep every run off a healthy region: the
-    # boot timeout only rebids, and no cooldown entry is written.
-    bid["instances"] = ["inst_x"]
     log = io.StringIO()
-    assert mithril_jobs.poll(handle, spec, log=log, deadline_at=10_000) is timed_out
-    assert "skipping" not in log.getvalue()
+    assert mithril_jobs.poll(_spot_handle(), spec, log=log, deadline_at=10_000) is timed_out
+    assert "it_h200 in us-x1-a never booted (1 recent boot timeout(s) there)" in log.getvalue()
+    assert region_health.boot_failures("us-x1-a", "it_h200") == 1
+    # no region or shape is excluded: the refusal cooldown is untouched.
     assert region_health._load(region_health._path()) == {}
+    assert not region_health.refused("us-x1-a", "it_h200")
+
+
+def test_the_pool_recorded_on_the_handle_needs_no_bid_lookup(monkeypatch, tmp_path):
+    from flash.providers.core.base import PollResult
+    from flash.providers.mithril import api as mithril_api
+    from flash.providers.mithril import jobs as mithril_jobs
+
+    region_health = _isolate_region_health(monkeypatch, tmp_path)
+    timed_out = PollResult(False, failure="boot_timeout", detail="remained starting")
+    monkeypatch.setattr(mithril_jobs, "poll_instance_job", lambda adapter, **kw: timed_out)
+    monkeypatch.setattr(mithril_jobs, "require_scope", lambda _: None)
+
+    def no_lookup(*a, **kw):
+        raise AssertionError("the handle already names the pool")
+
+    monkeypatch.setattr(mithril_api, "_bid", no_lookup)
+    spec = SimpleNamespace(run_id="run", phase="custom", train=SimpleNamespace(hf_repo="org/repo"))
+    handle = _spot_handle(region="us-x1-a", instance_type="it_h200")
+    mithril_jobs.poll(handle, spec, deadline_at=10_000)
+    assert region_health.boot_failures("us-x1-a", "it_h200") == 1
+
+
+def test_a_running_vm_clears_its_pools_boot_timeouts(monkeypatch, tmp_path):
+    from flash.providers.core.base import PollResult
+    from flash.providers.mithril import api as mithril_api
+    from flash.providers.mithril import jobs as mithril_jobs
+
+    region_health = _isolate_region_health(monkeypatch, tmp_path)
+    region_health.mark_boot_failure("us-x1-a", "it_h200")
+    region_health.mark_boot_failure("us-x1-a", "it_h200")
+    monkeypatch.setattr(mithril_jobs, "require_scope", lambda _: None)
+    monkeypatch.setattr(
+        mithril_api, "get_instance", lambda bid_id, **kw: {"id": bid_id, "status": "running"}
+    )
+
+    def fake_poll(adapter, **kwargs):
+        adapter.fetch_instance()
+        adapter.fetch_instance()  # marking is once per attempt
+        return PollResult(True)
+
+    monkeypatch.setattr(mithril_jobs, "poll_instance_job", fake_poll)
+    spec = SimpleNamespace(run_id="run", phase="custom", train=SimpleNamespace(hf_repo="org/repo"))
+    handle = _spot_handle(region="us-x1-a", instance_type="it_h200")
+    assert mithril_jobs.poll(handle, spec, deadline_at=10_000).ok
+    assert region_health.boot_failures("us-x1-a", "it_h200") == 0
+
+
+def test_a_failed_pool_lookup_never_changes_the_poll_result(monkeypatch, tmp_path):
+    from flash.providers.core.base import PollResult
+    from flash.providers.mithril import api as mithril_api
+    from flash.providers.mithril import jobs as mithril_jobs
+
+    region_health = _isolate_region_health(monkeypatch, tmp_path)
+    timed_out = PollResult(False, failure="boot_timeout", detail="remained starting")
+    monkeypatch.setattr(mithril_jobs, "poll_instance_job", lambda adapter, **kw: timed_out)
+    monkeypatch.setattr(mithril_jobs, "require_scope", lambda _: None)
+
+    def broken(*a, **kw):
+        raise mithril_api.MithrilApiError("down")
+
+    monkeypatch.setattr(mithril_api, "_bid", broken)
+    spec = SimpleNamespace(run_id="run", phase="custom", train=SimpleNamespace(hf_repo="org/repo"))
+    assert mithril_jobs.poll(_spot_handle(), spec, deadline_at=10_000) is timed_out
+    assert not (tmp_path / ".spot-region-health" / "boot_failures.json").exists()
+
+
+def test_pool_boot_timeouts_expire_and_stay_out_of_run_records(monkeypatch, tmp_path):
+    region_health = _isolate_region_health(monkeypatch, tmp_path)
+    window = region_health.BOOT_FAILURE_WINDOW_S
+    region_health.mark_boot_failure("us-x1-a", "it_h200", now=1000.0)
+    region_health.mark_boot_failure("us-x1-a", "it_h200", now=2000.0)
+    region_health.mark_boot_failure("us-x2-a", "it_h200", now=2000.0)
+    assert region_health.boot_failures("us-x1-a", "it_h200", now=2000.0) == 2
+    assert region_health.boot_failures("us-x1-a", "it_h200", now=1000.0 + window) == 1
+    assert region_health.boot_failures("us-x1-a", "it_h200", now=2000.0 + window) == 0
+    region_health.mark_booted("us-x2-a", "it_h200", now=2001.0)
+    assert region_health.boot_failures("us-x2-a", "it_h200", now=2001.0) == 0
+    assert region_health.boot_failures("us-x1-a", "it_h200", now=2001.0) == 2
+    assert not list(tmp_path.glob("*.json"))
+    # releases without boot health read only cooldown.json, which this never writes.
+    assert region_health._load(region_health._path()) == {}
+
+
+def _queue_offers(monkeypatch, offers):
+    from flash.runner.lifecycle import status
+
+    monkeypatch.setattr(queue, "quota_available", lambda *a, **kw: True)
+    monkeypatch.setattr(queue, "affordable_offers", lambda **kw: offers)
+    monkeypatch.setattr(status, "get_status", lambda run: SimpleNamespace(state="queued"))
+    monkeypatch.setattr(status, "_update", lambda run, state: None)
+
+
+def test_queue_bids_a_healthier_pool_of_the_same_class_first(monkeypatch, tmp_path):
+    region_health = _isolate_region_health(monkeypatch, tmp_path)
+    # the failing pool is cheapest and sorts first by region: before, every rebid went back to it.
+    bad = prices.Offer("H200", 1, "it_h200", 2.0, 1500, "us-a1-a")
+    good = prices.Offer("H200", 1, "it_h200", 2.5, 1500, "us-b1-a")
+    region_health.mark_boot_failure("us-a1-a", "it_h200")
+    _queue_offers(monkeypatch, [bad, good])
+    assert queue.wait_for_price(("H200",), "test", deadline_at=time.time() + 60) == good
+
+
+def test_a_demoted_pool_is_still_bid_on_when_it_is_the_only_offer(monkeypatch, tmp_path):
+    region_health = _isolate_region_health(monkeypatch, tmp_path)
+    only = prices.Offer("H200", 1, "it_h200", 2.0, 1500, "us-a1-a")
+    region_health.mark_boot_failure("us-a1-a", "it_h200")
+    _queue_offers(monkeypatch, [only])
+    assert queue.wait_for_price(("H200",), "test", deadline_at=time.time() + 60) == only
+
+
+def test_pool_health_never_changes_the_class_order(monkeypatch, tmp_path):
+    region_health = _isolate_region_health(monkeypatch, tmp_path)
+    h100 = prices.Offer("H100", 1, "it_h100", 1.0, 1500, "us-a1-a")
+    h200 = prices.Offer("H200", 1, "it_h200", 2.0, 1500, "us-b1-a")
+    region_health.mark_boot_failure("us-a1-a", "it_h100")
+    _queue_offers(monkeypatch, [h100, h200])
+    # GPU class selection is unchanged: an H100 plan still takes H100 first.
+    assert queue.wait_for_price(("H100", "H200"), "test", deadline_at=time.time() + 60) == h100
+
+
+def test_spot_handle_round_trips_its_pool_and_reads_older_handles():
+    from flash.providers.mithril.handles import SpotJobHandle
+
+    old = _spot_handle().to_dict()
+    parsed = SpotJobHandle.from_dict(old)
+    assert (parsed.region, parsed.instance_type) == ("", "")
+    assert "region" not in parsed.to_dict()
+    new = SpotJobHandle.from_dict({**old, "region": "us-x1-a", "instance_type": "it_h200"})
+    assert SpotJobHandle.from_dict(new.to_dict()) == new
+    assert new.to_dict()["instance_type"] == "it_h200"
 
 
 def test_region_cooldown_is_not_a_run_record_and_keeps_every_mark(monkeypatch, tmp_path):

@@ -62,6 +62,64 @@ def boot_progress_reader(spec, attempt):
 BOOT_TIMEOUT_S = 1800.0
 
 
+class _BidPool:
+    """The region and instance type an attempt's bid was placed in, for pool boot health.
+
+    Attempts launched before the handle recorded its pool read it from the bid once. Every health
+    write is best effort: a failed lookup or write never changes how the attempt is supervised.
+    """
+
+    def __init__(self, handle, *, deadline_at=None):
+        self._handle = handle
+        self._deadline_at = deadline_at
+        self._pool = None
+        self._booted = False
+
+    def _resolve(self):
+        if self._pool is None:
+            region, instance_type = self._handle.region, self._handle.instance_type
+            if not (region and instance_type):
+                try:
+                    bid = api._bid(self._handle.instance_id, deadline_at=self._deadline_at)
+                except Exception:
+                    return "", ""  # not cached: a later call may succeed
+                if isinstance(bid, dict):
+                    region = region or bid.get("region") or ""
+                    instance_type = instance_type or bid.get("instance_type") or ""
+            self._pool = (
+                region if isinstance(region, str) else "",
+                instance_type if isinstance(instance_type, str) else "",
+            )
+        return self._pool
+
+    def booted(self):
+        if self._booted:
+            return
+        self._booted = True
+        from flash.providers.mithril.region_health import mark_booted
+
+        with contextlib.suppress(Exception):
+            mark_booted(*self._resolve())
+
+    def never_booted(self, log):
+        from flash.providers.mithril.region_health import boot_failures, mark_boot_failure
+
+        with contextlib.suppress(Exception):
+            region, instance_type = self._resolve()
+            if not (region and instance_type):
+                return
+            mark_boot_failure(region, instance_type)
+            if log is not None:
+                count = boot_failures(region, instance_type)
+                print(
+                    f"Spot: {instance_type} in {region} never booted ({count} recent boot "
+                    "timeout(s) there); the next attempt bids on a healthier pool of the same "
+                    "class first",
+                    file=log,
+                    flush=True,
+                )
+
+
 def poll(handle, spec, *, log=None, deadline_at=None):
     h = SpotJobHandle.from_dict(handle.to_dict())
     require_scope(h)
@@ -73,6 +131,14 @@ def poll(handle, spec, *, log=None, deadline_at=None):
         return make_artifact_text_reader(
             spec.train.hf_repo, f"{prefix}/{filename}", deadline_at=deadline_at, **kwargs
         )
+
+    pool = _BidPool(h, deadline_at=deadline_at)
+
+    def fetch_instance():
+        instance = api.get_instance(h.instance_id, deadline_at=deadline_at)
+        if isinstance(instance, dict) and instance.get("status") == "running":
+            pool.booted()
+        return instance
 
     console = reader(f"console_{spec.phase}_attempt{h.attempt}.txt")
     error = reader(error_artifact_name(spec.phase, h.attempt))
@@ -95,7 +161,7 @@ def poll(handle, spec, *, log=None, deadline_at=None):
         done_reader=reader("DONE"),
         marker_reader=reader(f"spot_attempt{h.attempt}.json"),
         metrics_reader=reader("metrics.json"),
-        fetch_instance=lambda: api.get_instance(h.instance_id, deadline_at=deadline_at),
+        fetch_instance=fetch_instance,
         poll_error_exceptions=(api.MithrilApiError,),
         status_field="status",
         running_status="running",
@@ -119,7 +185,7 @@ def poll(handle, spec, *, log=None, deadline_at=None):
         signal_interruption_is_preemption=True,
         boot_progress=boot_progress_reader(spec, h.attempt),
     )
-    return poll_instance_job(
+    result = poll_instance_job(
         adapter,
         log=log,
         heartbeat_reader=heartbeat_reader_for(spec, deadline_at=deadline_at),
@@ -129,6 +195,9 @@ def poll(handle, spec, *, log=None, deadline_at=None):
         load_timeout_s=BOOT_TIMEOUT_S,
         deadline_at=deadline_at,
     )
+    if getattr(result, "failure", None) == BOOT_TIMEOUT_FAILURE:
+        pool.never_booted(log)
+    return result
 
 
 def _raise_if_cancelled(run_id):
@@ -233,6 +302,8 @@ def submit_attempt(
             phase=spec.phase,
             gpu_count=count,
             scope=owner_scope,
+            region=offer.region,
+            instance_type=offer.instance_type,
         )
         handle = JobHandle.from_dict(h.to_dict())
         # A cancel that landed while the create was in flight is caught when the handle is
