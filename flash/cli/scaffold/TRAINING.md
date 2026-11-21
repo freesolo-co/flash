@@ -418,7 +418,7 @@ spot = false # set true for Mithril Spot; false uses regular training
 Spot only uses Mithril, which offers H100 and H200. Each has one rate per GPU-hour, $1.20
 for H100 and $3.20 for H200, which is what Spot charges. Each also has a price cap: a run starts
 while the live price is at or below it and keeps running up to it. The H100 cap is its rate,
-$1.20. The H200 cap is $4.00, so H200 bids still win when the market clears at the rate.
+$1.20. The H200 cap is $3.51, so H200 bids still win when the market clears at the rate.
 A queued run waits for every class
 that fits its plan (an H100 run also takes an H200) and launches on whichever comes up first.
 

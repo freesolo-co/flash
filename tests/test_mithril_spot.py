@@ -22,8 +22,8 @@ from flash.providers.mithril.pricing import accepts_price
         ("H200", "2.39", True),
         ("H200", "3.20", True),  # the charged rate is admitted with headroom to win the auction
         ("H200", "3.21", True),
-        ("H200", "4.00", True),  # the cap is inclusive
-        ("H200", "4.01", False),
+        ("H200", "3.51", True),  # the cap is inclusive
+        ("H200", "3.52", False),
         ("L40S", "1.00", False),
         ("H100", "NaN", False),
         ("H100", "Infinity", False),
@@ -394,7 +394,7 @@ def test_entry_and_running_caps_do_not_change_fixed_customer_rates():
     assert list(SPOT_GPUS) == ["H100", "H200"]  # Mithril offers only these
     assert [hourly_rate(gpu) for gpu in SPOT_GPUS] == [1.2, 3.2]
     # H100's cap is its rate; H200's sits above its rate so bids win when the market clears there
-    assert [str(shape.keep_running_usd) for shape in SPOT_GPUS.values()] == ["1.20", "4.00"]
+    assert [str(shape.keep_running_usd) for shape in SPOT_GPUS.values()] == ["1.20", "3.51"]
     assert not any(hasattr(shape, "entry_below_usd") for shape in SPOT_GPUS.values())
 
 

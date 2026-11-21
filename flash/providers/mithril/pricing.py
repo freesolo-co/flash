@@ -34,7 +34,7 @@ SPOT_GPUS = {
     # limit sat Open (instances STATUS_NEW) for the whole boot window, attempt after attempt. The
     # cap leaves headroom over that market; Mithril bills the clearing price, not the limit. The
     # charged rate is unchanged.
-    "H200": SpotGpu(Decimal("3.20"), keep_running_usd=Decimal("4.00")),
+    "H200": SpotGpu(Decimal("3.20"), keep_running_usd=Decimal("3.51")),
 }
 
 

@@ -194,8 +194,8 @@ def test_allocation_offers_fitting_catalog_shapes_at_the_quote_rate(monkeypatch)
 @pytest.mark.parametrize(
     "change",
     [
-        {"price": "$32.08"},  # 8 x $4.01, a cent over the H200 cap
-        {"price": "$33.00"},  # 8 x $4.125
+        {"price": "$28.16"},  # 8 x $3.52, a cent over the H200 cap
+        {"price": "$29.00"},  # 8 x $3.625
         {"capacity": 0},
         {"region": ""},
         {"socket": "PCIe"},
@@ -260,7 +260,7 @@ def launch(monkeypatch, *, count=1, gpu="H200", attempt=0):
 
 
 @pytest.mark.parametrize("count", [1, 8])
-@pytest.mark.parametrize(("gpu", "cap"), [("H100", 1.20), ("H200", 4.00)])
+@pytest.mark.parametrize(("gpu", "cap"), [("H100", 1.20), ("H200", 3.51)])
 def test_create_bids_for_one_instance_at_per_instance_hold_cap(monkeypatch, count, gpu, cap):
     monkeypatch.setattr(api, "pages", lambda *a, **kw: [])
     captured = []
@@ -302,7 +302,7 @@ def test_ambiguous_create_is_reconciled_without_a_second_post(monkeypatch, recon
     "change",
     [
         {"project": "foreign"},
-        {"limit_price": "$4.01"},  # above the cap: not a limit Flash ever bid
+        {"limit_price": "$3.52"},  # above the cap: not a limit Flash ever bid
         {"status": "Terminated"},
         {"instance_quantity": 2},
     ],
