@@ -44,6 +44,9 @@ AMBIGUOUS_LAUNCH_SECONDS = 30 * 60
 # Booting, pulling the runtime image and loading the model normally takes well under this.
 BOOT_ALERT_SECONDS = 90 * 60
 HEALTH_TIMEOUT_SECONDS = 20
+# Placements whose launch Lambda explicitly rejected, skipped until their cooldown ends.
+REJECTED_KEY = "rejected_placements"
+REJECTION_COOLDOWN_SECONDS = 10 * 60
 
 
 def slot_key(slot):
@@ -52,6 +55,10 @@ def slot_key(slot):
 
 def instance_name(slot):
     return f"{NAME_PREFIX}{slot}"
+
+
+def placement(kind, region):
+    return f"{kind}/{region}"
 
 
 def target_slots(raw):
@@ -99,6 +106,7 @@ def merge_workers(secret_workers, published):
             and w["instance_id"] not in ids
             and all(isinstance(w.get(k), str) for k in ("ip", "revision"))
             and isinstance(w.get("tls"), dict)
+            and all(isinstance(w["tls"].get(k), str) and w["tls"][k] for k in ("cert", "token"))
         ):
             continue
         taken.add(w["slot"])
@@ -127,7 +135,10 @@ async def _launch(
 
     report = {}
     catalog = await api.call("GET", "instance-types")
-    available = choices(catalog)
+    rejected = {
+        k: until for k, until in (await store.get(REJECTED_KEY) or {}).items() if until > now
+    }
+    available = [c for c in choices(catalog) if placement(c[1], c[2]) not in rejected]
     if not available:
         report["capacity"] = "no single-H100 capacity; retrying next cycle"
     else:
@@ -170,6 +181,9 @@ async def _launch(
         except LambdaAPIError as exc:
             if 400 <= exc.status < 500 and exc.status != 408:
                 await store.pop(slot_key(slot))  # explicit rejection: nothing was created
+                # Try the other advertised placements first on the next cycles.
+                rejected[placement(kind, region)] = now + REJECTION_COOLDOWN_SECONDS
+                await store.put(REJECTED_KEY, rejected)
                 report["capacity"] = f"launch rejected ({exc.code}); retrying next cycle"
             else:
                 record["last_error"] = str(exc)[:120]
@@ -190,6 +204,70 @@ async def _launch(
     return report
 
 
+class _Publication:
+    """The durable published-worker list; every change is written before it is relied on."""
+
+    def __init__(self, store, published):
+        self._store = store
+        self.workers = list(published)
+        self._lock = asyncio.Lock()
+
+    def instance(self, slot):
+        return next((w["instance_id"] for w in self.workers if w["slot"] == slot), None)
+
+    async def drop(self, slots):
+        async with self._lock:
+            kept = [w for w in self.workers if w["slot"] not in slots]
+            if len(kept) != len(self.workers):
+                await self._store.put(WORKERS_KEY, kept)
+                self.workers = kept
+
+    async def add(self, worker):
+        async with self._lock:
+            workers = [*(w for w in self.workers if w["slot"] != worker["slot"]), worker]
+            await self._store.put(WORKERS_KEY, workers)
+            self.workers = workers
+
+
+async def _qualify(slot, record, inst, publication, transport_factory, now):
+    """Probe one active worker; publish it (durably, at once) when it qualifies."""
+    from .reserved_watchdog import OK, probe_status
+
+    try:
+        transport = transport_factory(inst["ip"], record["tls"])
+    except Exception as exc:
+        record.update(state="qualifying", last_error=f"transport: {type(exc).__name__}")
+        return
+    try:
+        if await identity_ok(transport, record["revision"]):
+            status, error = await probe_status(transport, reserved.MODEL)
+        else:
+            status, error = "failed", "identity not ready"
+    except Exception as exc:  # booting workers refuse connections
+        status, error = "failed", f"{type(exc).__name__}"[:120]
+    finally:
+        await transport.aclose()
+    if status == OK:
+        await publication.add(
+            {
+                "slot": slot,
+                "instance_id": inst["id"],
+                "ip": inst["ip"],
+                "revision": record["revision"],
+                "tls": record["tls"],
+            }
+        )
+        record.update(state="serving", qualified_at=now, last_error="")
+        return
+    record.update(state="qualifying", last_error=error)
+    if now - record["submitted_at"] > BOOT_ALERT_SECONDS:
+        print(
+            f"reserved H100 alert: expansion slot {slot} not qualified after "
+            f"{(now - record['submitted_at']) / 60:.0f} min: {error}",
+            flush=True,
+        )
+
+
 async def run_once(
     store,
     api,
@@ -205,23 +283,28 @@ async def run_once(
     clock=time.time,
 ):
     """One acquisition/qualification cycle. Returns a printable report."""
-    from .reserved_watchdog import OK, probe_status
-
     now = clock()
     targets = [s for s in target_slots(await store.get(TARGET_KEY)) if s not in secret_slots]
-    published = list(await store.get(WORKERS_KEY) or [])
-    published_slots = {w["slot"] for w in published}
-    instances = await api.call("GET", "instances")
+    records = {slot: await store.get(slot_key(slot)) for slot in targets}
+    publication = _Publication(store, await store.get(WORKERS_KEY) or [])
+    # A target slot's publication must match its record; anything else is stale (e.g. a record
+    # deleted after an interrupted cycle) and is unrouted before anything else happens.
+    await publication.drop(
+        {
+            w["slot"]
+            for w in publication.workers
+            if w["slot"] in records
+            and (records[w["slot"]] or {}).get("instance_id") != w["instance_id"]
+        }
+    )
     live = {}
-    for x in instances:
+    for x in await api.call("GET", "instances"):
         if x.get("status") not in {"terminated", "terminating"}:
             live.setdefault(x.get("name"), []).append(x)
-    report, launchable, changed = {}, [], False
+    report, launchable, qualifying = {}, [], []
 
     for slot in targets:
-        name = instance_name(slot)
-        record = await store.get(slot_key(slot))
-        matches = live.get(name, [])
+        record, matches = records[slot], live.get(instance_name(slot), [])
         if len(matches) > 1:
             report[slot] = "duplicate instances with this name; review"
             continue
@@ -239,12 +322,9 @@ async def run_once(
             ):
                 report[slot] = "launch outcome pending"
                 continue
-            # Never created, or gone: forget it (and stop routing it) and acquire again.
+            # Never created, or gone: unroute it durably first, then forget it and reacquire.
+            await publication.drop({slot})
             await store.pop(slot_key(slot))
-            if slot in published_slots:
-                published = [w for w in published if w["slot"] != slot]
-                published_slots.discard(slot)
-                changed = True
             report[slot] = "instance gone; will reacquire"
             continue
         spec = inst.get("instance_type") or {}
@@ -256,47 +336,22 @@ async def run_once(
             region=(inst.get("region") or {}).get("name"),
             hourly_usd=spec.get("price_cents_per_hour", 0) / 100,
         )
-        if slot in published_slots:
+        if publication.instance(slot) == inst["id"]:
             record["state"] = "serving"
         elif inst.get("status") == "active" and inst.get("ip"):
-            transport = transport_factory(inst["ip"], record["tls"])
-            try:
-                if await identity_ok(transport, record["revision"]):
-                    status, error = await probe_status(transport, reserved.MODEL)
-                else:
-                    status, error = "failed", "identity not ready"
-            except Exception as exc:  # booting workers refuse connections
-                status, error = "failed", f"{type(exc).__name__}"[:120]
-            finally:
-                await transport.aclose()
-            if status == OK:
-                published.append(
-                    {
-                        "slot": slot,
-                        "instance_id": inst["id"],
-                        "ip": inst["ip"],
-                        "revision": record["revision"],
-                        "tls": record["tls"],
-                    }
-                )
-                published_slots.add(slot)
-                changed = True
-                record.update(state="serving", qualified_at=now, last_error="")
-            else:
-                record.update(state="qualifying", last_error=error)
-                if now - record["submitted_at"] > BOOT_ALERT_SECONDS:
-                    print(
-                        f"reserved H100 alert: expansion slot {slot} not qualified after "
-                        f"{(now - record['submitted_at']) / 60:.0f} min: {error}",
-                        flush=True,
-                    )
+            qualifying.append((slot, record, inst))
         else:
             record["state"] = "booting"
-        await store.put(slot_key(slot), record)
-        report[slot] = record["state"]
 
-    if changed:
-        await store.put(WORKERS_KEY, published)
+    # Concurrent, so every pending worker fits one cycle (health + canary < the timeout).
+    await asyncio.gather(
+        *(_qualify(s, r, i, publication, transport_factory, now) for s, r, i in qualifying)
+    )
+    for slot in targets:
+        record = records[slot]
+        if record is not None and slot not in report:
+            await store.put(slot_key(slot), record)
+            report[slot] = record["state"]
 
     # At most one launch per cycle, lowest empty slot first.
     if launchable:

@@ -196,7 +196,10 @@ async def run_once(workers, store, lambda_api, model, *, transport_factory, cloc
     """Probe every worker, persist slot states and reboot persistently dead workers."""
 
     async def check(worker):
-        transport = transport_factory(worker["ip"], worker["tls"])
+        try:
+            transport = transport_factory(worker["ip"], worker["tls"])
+        except Exception as exc:  # a malformed entry must not abort the whole cycle
+            return worker, (FAILED, f"transport: {type(exc).__name__}"[:200])
         try:
             return worker, await probe_status(transport, model)
         finally:

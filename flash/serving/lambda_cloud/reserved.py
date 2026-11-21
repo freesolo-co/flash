@@ -3,6 +3,7 @@
 import asyncio
 import json
 import os
+import time
 
 from .proxy import LambdaEngineProxy
 from .transport import WorkerTransport
@@ -18,6 +19,8 @@ SLOT_COUNT = 12
 RESERVATION_SECRET_NAME = "flash-h100-reservation-20261112"
 # Bounded per-worker registration: a hung worker must not hold every adapter promotion.
 REGISTER_TIMEOUT_SECONDS = 10 * 60
+# How often a proxy for an expansion slot re-reads its published worker.
+REBIND_CHECK_SECONDS = 15
 
 
 def enabled(model, environment):
@@ -63,12 +66,20 @@ class ReservedLambdaEngineProxy(LambdaEngineProxy):
     async def _load(self):
         if self.base_model != MODEL:
             raise ValueError("Reserved H100s only serve the 9B Base model")
-        worker = await configured_worker(self.reserved_slot)
-        self._owner = worker["instance_id"]
-        self._transport = WorkerTransport(worker["ip"], worker["tls"])
+        raw = os.environ["FLASH_RESERVED_H100_WORKERS"]
+        # Secret slots never change under a running proxy; expansion slots can be replaced.
+        self._expansion = not any(w["slot"] == self.reserved_slot for w in parse_workers(raw))
+        self._rebind_at = time.monotonic() + REBIND_CHECK_SECONDS
+        self._rebind_lock = asyncio.Lock()
+        self._transport = None
+        await self._bind(await configured_worker(self.reserved_slot))
+
+    async def _bind(self, worker):
+        """Switch to ``worker`` once it proves its identity; keep the old binding otherwise."""
+        transport = WorkerTransport(worker["ip"], worker["tls"])
         try:
             async with asyncio.timeout(30):
-                health = await self._transport.call("/health")
+                health = await transport.call("/health")
             if not (
                 health.get("ok") is True
                 and health.get("base_model") == MODEL
@@ -76,11 +87,71 @@ class ReservedLambdaEngineProxy(LambdaEngineProxy):
                 and health.get("configured_gpu") == "H100"
             ):
                 raise RuntimeError("Reserved H100 model, revision, or hardware identity mismatch")
-            self._health_cache = health
-            self.engine = self._transport
         except BaseException:
-            await self._transport.aclose()
+            await transport.aclose()
             raise
+        previous = self._transport
+        self._owner = worker["instance_id"]
+        self._worker = worker
+        self._health_cache = health
+        self._transport = self.engine = transport
+        if previous is not None:
+            await previous.aclose()
+
+    async def _refresh_binding(self):
+        """Follow a replaced expansion worker (new instance under the same slot)."""
+        if not getattr(self, "_expansion", False) or time.monotonic() < self._rebind_at:
+            return
+        async with self._rebind_lock:
+            if time.monotonic() < self._rebind_at:
+                return
+            self._rebind_at = time.monotonic() + REBIND_CHECK_SECONDS
+            try:
+                worker = await configured_worker(self.reserved_slot)
+                if (worker["instance_id"], worker["ip"]) != (
+                    self._worker["instance_id"],
+                    self._worker["ip"],
+                ):
+                    await self._bind(worker)
+            except Exception as exc:  # unpublished or not ready: the router stops routing here
+                print(
+                    f"reserved H100 slot {self.reserved_slot} rebind skipped: {exc!r}", flush=True
+                )
+
+    async def _health(self):
+        await self._refresh_binding()
+        return await super()._health()
+
+    async def _register(self, record, deployment_generation=None):
+        await self._refresh_binding()
+        return await super()._register(record, deployment_generation)
+
+    async def _unregister(self, org_id, model_id, expected_generation=None):
+        await self._refresh_binding()
+        return await super()._unregister(org_id, model_id, expected_generation)
+
+    async def _generate(self, payload, record=None, expected_checkpoint=None, generation_id=None):
+        await self._refresh_binding()
+        return await super()._generate(payload, record, expected_checkpoint, generation_id)
+
+    async def _stream_generate(
+        self,
+        payload,
+        record=None,
+        expected_checkpoint=None,
+        generation_id=None,
+        *,
+        pre_generate_check=None,
+    ):
+        await self._refresh_binding()
+        async for event in super()._stream_generate(
+            payload,
+            record,
+            expected_checkpoint,
+            generation_id,
+            pre_generate_check=pre_generate_check,
+        ):
+            yield event
 
     async def _shutdown(self):
         transport = getattr(self, "_transport", None)

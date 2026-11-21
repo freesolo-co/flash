@@ -181,3 +181,79 @@ async def test_dev_lambda_only_budget_counts_all_revisions(
         with pytest.raises(NoCapacityError, match="replica limit"):
             await fleet._check_capacity(reserved.MODEL, "new")
     fleet.shared_capacity.before_launch.assert_not_awaited()
+
+
+def _healthy(revision="a" * 40):
+    return {
+        "ok": True,
+        "base_model": reserved.MODEL,
+        "deployment_sha": revision,
+        "configured_gpu": "H100",
+    }
+
+
+@pytest.mark.anyio
+async def test_expansion_proxy_follows_a_replaced_worker(monkeypatch):
+    monkeypatch.setenv("FLASH_RESERVED_H100_WORKERS", json.dumps(workers()))
+    published = [
+        {
+            "slot": 9,
+            "instance_id": "e9",
+            "ip": "8.8.4.4",
+            "revision": "a" * 40,
+            "tls": {"cert": "C", "token": "T"},
+        }
+    ]
+
+    async def fake_published():
+        return published
+
+    from flash.serving.lambda_cloud import reserved_expansion
+
+    monkeypatch.setattr(reserved_expansion, "published_workers", fake_published)
+    made = []
+
+    def factory(ip, tls):
+        t = AsyncMock()
+        t.ip = ip
+        t.call.return_value = _healthy()
+        made.append(t)
+        return t
+
+    monkeypatch.setattr(reserved, "WorkerTransport", factory)
+    clock = [0.0]
+    monkeypatch.setattr(reserved.time, "monotonic", lambda: clock[0])
+    proxy = reserved.ReservedLambdaEngineProxy()
+    proxy.base_model = reserved.MODEL
+    proxy.reserved_slot = 9
+    await proxy._load()
+    assert proxy._transport.ip == "8.8.4.4"
+
+    published[0] = dict(published[0], instance_id="e9b", ip="9.9.9.9")
+    await proxy._generate({"x": 1})  # within the check interval: still the old binding
+    assert proxy._transport.ip == "8.8.4.4"
+    clock[0] += reserved.REBIND_CHECK_SECONDS + 1
+    await proxy._generate({"x": 1})
+    assert proxy._transport.ip == "9.9.9.9"
+    assert proxy.engine is proxy._transport
+    assert proxy._owner == "e9b"
+    made[0].aclose.assert_awaited_once()
+
+
+@pytest.mark.anyio
+async def test_secret_slot_proxy_never_rereads_published_workers(monkeypatch):
+    monkeypatch.setenv("FLASH_RESERVED_H100_WORKERS", json.dumps(workers()))
+    transport = AsyncMock()
+    transport.call.return_value = _healthy()
+    monkeypatch.setattr(reserved, "WorkerTransport", lambda *a: transport)
+    proxy = reserved.ReservedLambdaEngineProxy()
+    proxy.base_model = reserved.MODEL
+    proxy.reserved_slot = 1
+    await proxy._load()
+    from flash.serving.lambda_cloud import reserved_expansion
+
+    monkeypatch.setattr(
+        reserved_expansion, "published_workers", AsyncMock(side_effect=AssertionError)
+    )
+    monkeypatch.setattr(reserved.time, "monotonic", lambda: 1e12)
+    await proxy._generate({"x": 1})
