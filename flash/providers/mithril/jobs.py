@@ -119,7 +119,7 @@ def poll(handle, spec, *, log=None, deadline_at=None):
         signal_interruption_is_preemption=True,
         boot_progress=boot_progress_reader(spec, h.attempt),
     )
-    return poll_instance_job(
+    result = poll_instance_job(
         adapter,
         log=log,
         heartbeat_reader=heartbeat_reader_for(spec, deadline_at=deadline_at),
@@ -129,6 +129,29 @@ def poll(handle, spec, *, log=None, deadline_at=None):
         load_timeout_s=BOOT_TIMEOUT_S,
         deadline_at=deadline_at,
     )
+    return _classify_unfilled_bid(result, h, log=log, deadline_at=deadline_at)
+
+
+def _classify_unfilled_bid(result, h, *, log=None, deadline_at=None):
+    """A boot timeout whose bid never got a VM is waiting for capacity, not a broken machine.
+
+    It requeues as ``no_capacity``, like a refused create: the run deadline and cancellation bound
+    it, not the infrastructure retry budget, which five unfilled bids used to exhaust and fail
+    the run. If the bid cannot be read, the boot timeout stands.
+    """
+    if getattr(result, "failure", None) != BOOT_TIMEOUT_FAILURE:
+        return result
+    try:
+        detail = api.unfilled_bid_detail(h.instance_id, deadline_at=deadline_at)
+    except Exception:
+        return result
+    if not detail:
+        return result
+    if log is not None:
+        print(f"Spot: {detail}", file=log, flush=True)
+    from flash.providers.core.base import PollResult
+
+    return PollResult(False, failure="no_capacity", detail=detail)
 
 
 def _raise_if_cancelled(run_id):

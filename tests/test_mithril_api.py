@@ -194,8 +194,8 @@ def test_allocation_offers_fitting_catalog_shapes_at_the_quote_rate(monkeypatch)
 @pytest.mark.parametrize(
     "change",
     [
-        {"price": "$25.68"},  # 8 x $3.21, a cent over the H200 cap
-        {"price": "$26.00"},  # 8 x $3.25
+        {"price": "$32.08"},  # 8 x $4.01, a cent over the H200 cap
+        {"price": "$33.00"},  # 8 x $4.125
         {"capacity": 0},
         {"region": ""},
         {"socket": "PCIe"},
@@ -260,7 +260,7 @@ def launch(monkeypatch, *, count=1, gpu="H200", attempt=0):
 
 
 @pytest.mark.parametrize("count", [1, 8])
-@pytest.mark.parametrize(("gpu", "cap"), [("H100", 1.20), ("H200", 3.20)])
+@pytest.mark.parametrize(("gpu", "cap"), [("H100", 1.20), ("H200", 4.00)])
 def test_create_bids_for_one_instance_at_per_instance_hold_cap(monkeypatch, count, gpu, cap):
     monkeypatch.setattr(api, "pages", lambda *a, **kw: [])
     captured = []
@@ -302,7 +302,7 @@ def test_ambiguous_create_is_reconciled_without_a_second_post(monkeypatch, recon
     "change",
     [
         {"project": "foreign"},
-        {"limit_price": "$3.00"},
+        {"limit_price": "$4.01"},  # above the cap: not a limit Flash ever bid
         {"status": "Terminated"},
         {"instance_quantity": 2},
     ],
@@ -886,7 +886,7 @@ def test_offers_cover_every_region_and_keep_each_region(monkeypatch):
     auctions = [
         {"instance_type": "it_test", "region": r, "capacity": 3, "last_instance_price": p}
         for r, p in (
-            ("us-central2-b", "$3.50"),
+            ("us-central2-b", "$4.50"),
             ("us-east-1", "$0.90"),
             ("us-west-1", "$1.00"),
             ("ap-x", "$0.80"),  # non-US regions are never bid in, however cheap
@@ -1250,3 +1250,9 @@ def test_launcher_bundle_names_the_attempt_boot_progress_blob(monkeypatch):
     expected = bootstrap.boot_progress_blob("owner/repo", "sft", "test", 0)
     assert expected.endswith("/sft/test/mithril_boot_0.json")
     assert repr(expected) in source
+
+
+def test_a_bid_placed_at_the_previous_lower_cap_is_still_reconciled(monkeypatch):
+    """A rollover that raised the cap must not strand an attempt whose bid used the old limit."""
+    monkeypatch.setattr(api, "pages", lambda *a, **kw: [owned_bid(limit_price="$3.20")])
+    assert launch(monkeypatch) == "bid_test"

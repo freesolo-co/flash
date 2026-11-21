@@ -143,6 +143,28 @@ def get_instance(bid_id, *, deadline_at=None):
     return {"id": bid_id, "status": state}
 
 
+def unfilled_bid_detail(bid_id, *, deadline_at=None):
+    """Why a bid never produced a VM, or None if Mithril allocated one (or the bid is gone).
+
+    An ``Open`` bid whose instances are all still ``STATUS_NEW`` (or that has none) lost or never
+    entered the auction: no machine was ever assigned, so there was nothing to boot.
+    """
+    bid = _bid(bid_id, deadline_at=deadline_at)
+    if bid is None or bid.get("status") != "Open":
+        return None
+    states = {row.get("status") for row in _instances(bid_id, deadline_at=deadline_at)}
+    if not states <= {"STATUS_NEW"}:
+        return None
+    limit = bid.get("limit_price")
+    where = " ".join(
+        str(part) for part in (bid.get("instance_type"), "in", bid.get("region")) if part
+    )
+    return (
+        f"Mithril never filled Spot bid {bid_id} ({where}, limit {limit}): it stayed Open with no "
+        "allocated VM, so it was outbid or capacity never freed; requeuing"
+    )
+
+
 def public_ip(bid_id, *, deadline_at=None):
     if _bid(bid_id, deadline_at=deadline_at) is None:
         return None
@@ -271,7 +293,8 @@ def create(*, name, offer, payload, image_reference, gpu, gpu_count, capsule, di
             _ownership(bid) != labels
             or bid["instance_type"] != offer.instance_type
             or bid["instance_quantity"] != 1
-            or dollars(bid["limit_price"]) != cap
+            # a bid placed before the cap last rose keeps its lower limit; it is still this attempt's
+            or not 0 < dollars(bid["limit_price"]) <= cap
             or bid["status"] == "Terminated"
         ):
             raise UnreconciledCreateError(

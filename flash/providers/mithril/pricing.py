@@ -1,8 +1,9 @@
-"""One fixed Spot rate per GPU class, in USD per GPU-hour, which is also the price cap.
+"""One fixed Spot rate per GPU class, in USD per GPU-hour, and the price cap Flash bids at.
 
 These are user-selected thresholds, not current market prices or capacity guarantees.
-``hourly_usd`` is what Flash estimates and charges, and the cap: a rental starts only while the
-live price is at or below it, and the Mithril bid's limit price keeps a running VM up to it.
+``hourly_usd`` is what Flash estimates and charges. ``keep_running_usd`` is the cap: a rental
+starts only while the live price is at or below it, and it is the Mithril bid's limit price, which
+keeps a running VM up to it. The cap equals the rate unless a class sets it apart (H200).
 GPU priority follows insertion order: H100, H200.
 """
 
@@ -17,8 +18,9 @@ class SpotGpu:
     # the charged rate, and by default the one cap: start at or below it, keep running up to it
     hourly_usd: Decimal
     counts: tuple[int, ...] = (1, 8)
-    # only a paid smoke test lowers this below the rate (scripts/smoke_mithril_sft.py); production
-    # classes leave it unset, so the cap is the rate
+    # the cap and bid limit price. Unset, it is the rate. A class whose auction clears at the rate
+    # raises it above the rate so its bids win (H200); only a paid smoke test lowers it below the
+    # rate (scripts/smoke_mithril_sft.py).
     keep_running_usd: Decimal | None = None
 
     def __post_init__(self) -> None:
@@ -28,7 +30,11 @@ class SpotGpu:
 
 SPOT_GPUS = {
     "H100": SpotGpu(Decimal("1.20")),
-    "H200": SpotGpu(Decimal("3.20")),
+    # 2026-11-20: us-central2-b, the one US H200 x1 pool, cleared at exactly $3.20. Bids with a $3.20
+    # limit sat Open (instances STATUS_NEW) for the whole boot window, attempt after attempt. The
+    # cap leaves headroom over that market; Mithril bills the clearing price, not the limit. The
+    # charged rate is unchanged.
+    "H200": SpotGpu(Decimal("3.20"), keep_running_usd=Decimal("4.00")),
 }
 
 
