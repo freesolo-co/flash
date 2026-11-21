@@ -10,8 +10,9 @@ from .transport import WorkerTransport
 MODEL = "Qwen/Qwen3.5-9B-Base"
 SECRET_NAME = "flash-reserved-h100-workers-20261112"
 # Serving declares one CPU proxy per slot up to this ceiling; the workers secret configures any
-# non-empty subset of them. Unconfigured slots are never routed (see reserved_watchdog).
-SLOT_COUNT = 8
+# non-empty subset of them, and ``reserved_expansion`` publishes qualified workers for target
+# slots the secret does not hold. Unconfigured slots are never routed (see reserved_watchdog).
+SLOT_COUNT = 12
 # Holds LAMBDA_API_KEY for the reservation's own lifecycle; the watchdog uses it only to
 # reboot an existing reserved instance, never to launch or terminate one.
 RESERVATION_SECRET_NAME = "flash-h100-reservation-20261112"
@@ -45,13 +46,24 @@ def worker_config(slot, raw):
     return worker
 
 
+async def configured_worker(slot):
+    """The slot's worker from the secret, else from the published expansion workers."""
+    from .reserved_expansion import merge_workers, published_workers
+
+    raw = os.environ["FLASH_RESERVED_H100_WORKERS"]
+    if any(w["slot"] == slot for w in parse_workers(raw)):
+        return worker_config(slot, raw)
+    workers = merge_workers(parse_workers(raw), await published_workers())
+    return worker_config(slot, json.dumps(workers))
+
+
 class ReservedLambdaEngineProxy(LambdaEngineProxy):
     reserved_slot = 0
 
     async def _load(self):
         if self.base_model != MODEL:
             raise ValueError("Reserved H100s only serve the 9B Base model")
-        worker = worker_config(self.reserved_slot, os.environ["FLASH_RESERVED_H100_WORKERS"])
+        worker = await configured_worker(self.reserved_slot)
         self._owner = worker["instance_id"]
         self._transport = WorkerTransport(worker["ip"], worker["tls"])
         try:

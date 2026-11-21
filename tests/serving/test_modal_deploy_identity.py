@@ -169,12 +169,12 @@ def test_engine_exit_hook_awaits_shutdown(monkeypatch) -> None:
 
 
 @pytest.mark.parametrize("environment", ["main", "", None])
-def test_main_9b_base_has_eight_reserved_cpu_proxies_and_no_gpu_fallback(monkeypatch, environment):
+def test_main_9b_base_has_twelve_reserved_cpu_proxies_and_no_gpu_fallback(monkeypatch, environment):
     _clear_deployment_environment(monkeypatch)
     module = _import_modal_app(monkeypatch, is_local=False, environment=environment)
     model = "Qwen/Qwen3.5-9B-Base"
-    assert len(module.RESERVED_ENGINES) == 8
-    assert {cls.reserved_slot for cls in module.RESERVED_ENGINES} == set(range(1, 9))
+    assert len(module.RESERVED_ENGINES) == 12
+    assert {cls.reserved_slot for cls in module.RESERVED_ENGINES} == set(range(1, 13))
     assert all(cls.pinned_gpu is None for cls in module.RESERVED_ENGINES)
     assert model not in module.ENGINE_BY_MODEL
     assert model not in module.MODAL_FALLBACK_BY_MODEL
@@ -211,15 +211,19 @@ def test_reserved_watchdog_is_scheduled_only_with_reserved_workers(monkeypatch, 
     _clear_deployment_environment(monkeypatch)
     module = _import_modal_app(monkeypatch, is_local=False, environment=environment)
     secret_names = [c.args[0] for c in module.modal.Secret.from_name.call_args_list]
-    watchdog = [
+    scheduled = [
         call
         for call in module.app.function.call_args_list
         if call.kwargs.get("schedule") is not None and call.kwargs.get("cpu") == 0.25
     ]
     reserved_main = environment == "main"
     assert hasattr(module, "reserved_h100_watchdog") is reserved_main
+    assert hasattr(module, "reserved_h100_expansion") is reserved_main
+    # The watchdog and the expansion loop, each a single non-preemptible container.
+    watchdog = scheduled[:1]
+    assert len(scheduled) == (2 if reserved_main else 0)
+    assert all(c.kwargs["max_containers"] == 1 for c in scheduled)
     assert (module.reserved.RESERVATION_SECRET_NAME in secret_names) is reserved_main
-    assert len(watchdog) == (1 if reserved_main else 0)
     if reserved_main:
         assert watchdog[0].kwargs["max_containers"] == 1
         assert watchdog[0].kwargs["nonpreemptible"] is True
@@ -238,7 +242,7 @@ def test_start_all_resolves_reserved_workers_only_in_main(monkeypatch, environme
     module.start_all(None if all_models else model)
     names = [c.args[1] for c in module.modal.Cls.from_name.call_args_list]
     expected = (
-        [module.model_engine_name(model) + f"_ReservedH100{i}" for i in range(1, 9)]
+        [module.model_engine_name(model) + f"_ReservedH100{i}" for i in range(1, 13)]
         if environment == "main"
         else [module.model_engine_name(model)]
     )

@@ -17,8 +17,8 @@ queues behind generations, so a timeout while ``/health`` is fine means *busy*: 
 quarantines nor reboots the worker until no canary has completed for
 ``BUSY_HUNG_AFTER_SECONDS``, which still catches a worker whose generations never finish.
 
-The watchdog also publishes the slots configured in the workers secret; the router never
-routes to a declared slot the secret does not configure.
+The watchdog also publishes the configured slots (the workers secret plus qualified
+``reserved_expansion`` workers); the router never routes to a declared slot outside them.
 """
 
 import asyncio
@@ -346,9 +346,14 @@ def register_watchdog(app, image, module_name):
         import os
 
         from .api import LambdaAPI
+        from .reserved_expansion import merge_workers, published_workers
         from .transport import WorkerTransport
 
-        workers = reserved.parse_workers(os.environ["FLASH_RESERVED_H100_WORKERS"])
+        # Expansion workers are published only after qualification; re-read every cycle.
+        workers = merge_workers(
+            reserved.parse_workers(os.environ["FLASH_RESERVED_H100_WORKERS"]),
+            await published_workers(),
+        )
         api = LambdaAPI(os.environ["LAMBDA_API_KEY"])
         try:
             report = await run_once(
