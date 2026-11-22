@@ -16,7 +16,7 @@ EXPANSION_DICT_NAME = "flash-reserved-h100-expansion-20261121"
 TARGET_KEY = "target_slots"  # set to [] to stop acquiring
 WORKERS_KEY = "workers"  # same entry shape as the workers secret
 REJECTED_KEY = "rejected_placements"
-DEFAULT_TARGET_SLOTS = (9, 10, 11, 12)
+DEFAULT_TARGET_SLOTS = (9, 10, 11, 12, 13, 14, 15)
 PERIOD_SECONDS = 120
 TAGS = [
     {"key": "reservation-campaign", "value": "flash-h100-reservation-20261112"},
