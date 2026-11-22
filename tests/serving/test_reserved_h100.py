@@ -23,7 +23,7 @@ def workers():
 def test_worker_config_accepts_any_subset_of_declared_slots():
     data = [dict(w, slot=w["slot"] + 4, instance_id=f"x{w['slot']}") for w in workers()]
     raw = json.dumps(workers() + data)
-    assert reserved.SLOT_COUNT == 12
+    assert reserved.SLOT_COUNT == 15
     assert [w["slot"] for w in reserved.parse_workers(raw)] == list(range(1, 9))
     assert reserved.worker_config(8, raw)["instance_id"] == "x4"
     # Four configured slots: the declared slots beyond them are not configured.
