@@ -35,7 +35,7 @@ def test_worker_config_accepts_any_subset_of_declared_slots():
     "mutate",
     [
         lambda d: d.__setitem__(1, dict(d[1], slot=1)),
-        lambda d: d.__setitem__(0, dict(d[0], slot=13)),
+        lambda d: d.__setitem__(0, dict(d[0], slot=reserved.SLOT_COUNT + 1)),
         lambda d: d.__setitem__(0, dict(d[0], slot=0)),
         lambda d: d.clear(),
     ],
