@@ -194,6 +194,78 @@ def test_9b_base_uses_the_lease_pool_with_modal_fallback_and_no_dedicated_fleet(
     assert all(c.kwargs["max_containers"] == 1 for c in scheduled)
 
 
+def _reserved_secret_refs(module):
+    return {
+        c.args[0]
+        for c in module.modal.Secret.from_name.call_args_list
+        if c.args and "h100" in c.args[0]
+    }
+
+
+def _watchdog_schedules(module):
+    return [
+        call
+        for call in module.app.function.call_args_list
+        if call.kwargs.get("schedule") is not None and call.kwargs.get("cpu") == 0.25
+    ]
+
+
+def _assert_on_demand(module):
+    assert module.RESERVED_ENGINES == ()
+    assert _reserved_secret_refs(module) == set()
+    assert _watchdog_schedules(module) == []
+    for model in ("Qwen/Qwen3.8-27B", "Qwen/Qwen3.5-0.8B-Base", "Qwen/Qwen3.5-9B-Base"):
+        assert issubclass(module.ENGINE_BY_MODEL[model], module.LambdaEngineProxy)
+        assert model in module.MODAL_FALLBACK_BY_MODEL
+    assert module._reserved_env == {"FLASH_RESERVED_H100_ACTIVE": "0"}
+
+
+@pytest.mark.parametrize("environment", ["main", ""])
+def test_main_without_the_reserved_secret_deploys_without_referencing_it(monkeypatch, environment):
+    """Deploy run 45330840461 failed: the new reserved secret did not exist in main yet."""
+    _clear_deployment_environment(monkeypatch)
+    monkeypatch.setenv("FLASH_RESERVED_H100_ACTIVE", "0")
+    _assert_on_demand(_import_modal_app(monkeypatch, is_local=False, environment=environment))
+
+
+@pytest.mark.parametrize("exists", [True, False])
+def test_deploy_decides_from_the_secret_lookup_and_bakes_the_decision(monkeypatch, exists):
+    from flash.serving.lambda_cloud import reserved
+
+    _clear_deployment_environment(monkeypatch)
+    monkeypatch.delenv("FLASH_RESERVED_H100_ACTIVE")
+    looked_up = []
+    monkeypatch.setattr(reserved, "secret_exists", lambda env: looked_up.append(env) or exists)
+    module = _import_modal_app(monkeypatch, is_local=False, environment="main")
+    assert looked_up == ["main"]
+    if not exists:
+        _assert_on_demand(module)
+        return
+    assert module._reserved_env == {"FLASH_RESERVED_H100_ACTIVE": "1"}
+    assert len(module.RESERVED_ENGINES) == 8
+    assert _reserved_secret_refs(module) == {reserved.SECRET_NAME}
+    assert len(_watchdog_schedules(module)) == 1
+
+
+def test_control_app_bakes_the_same_reserved_decision(monkeypatch):
+    from flash.serving.lambda_cloud import reserved
+
+    monkeypatch.setenv("FLASH_RESERVED_H100_ACTIVE", "0")
+    modal_stub = MagicMock(name="modal")
+    modal_stub.config.config.get.return_value = "main"
+    monkeypatch.setitem(sys.modules, "modal", modal_stub)
+    monkeypatch.delitem(sys.modules, "flash.serving.lambda_cloud.control_app", raising=False)
+    monkeypatch.setattr(
+        "flash.serving.lambda_cloud.modal_control.register_control", lambda *a: (None, None)
+    )
+    importlib.import_module("flash.serving.lambda_cloud.control_app")
+    secret = modal_stub.Secret.from_dict.call_args.args[0]
+    assert secret[reserved.ACTIVE_ENV] == "0"
+    # The shared image carries it too, so the secret-less reaper never looks the secret up.
+    image_env = modal_stub.Image.debian_slim.return_value.pip_install.return_value.env
+    image_env.assert_called_once_with({reserved.ACTIVE_ENV: "0"})
+
+
 @pytest.mark.parametrize("environment", ["main", "", "dev"])
 def test_main_serves_27b_and_08b_base_only_from_eight_reserved_slots(monkeypatch, environment):
     _clear_deployment_environment(monkeypatch)

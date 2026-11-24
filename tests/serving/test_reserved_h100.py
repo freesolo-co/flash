@@ -250,3 +250,110 @@ def test_shared_capacity_skips_reserved_models_in_main_only(monkeypatch):
                 SimpleNamespace(environment="main"), None, None, REV
             ).reconcile_model(DRAFTER)
         )
+
+
+class _NotFound(Exception):
+    pass
+
+
+def _modal_with_secret(monkeypatch, exists):
+    import modal
+
+    lookups = []
+
+    def from_name(name, environment_name=None):
+        lookups.append((name, environment_name))
+
+        def hydrate():
+            if not exists:
+                raise _NotFound(name)
+
+        return SimpleNamespace(hydrate=hydrate)
+
+    monkeypatch.setattr(modal.Secret, "from_name", from_name)
+    monkeypatch.setattr(modal.exception, "NotFoundError", _NotFound)
+    return lookups
+
+
+@pytest.mark.parametrize("exists", [True, False])
+def test_active_follows_the_workers_secret_in_main_and_is_decided_once(monkeypatch, capsys, exists):
+    monkeypatch.delenv(reserved.ACTIVE_ENV)
+    lookups = _modal_with_secret(monkeypatch, exists)
+    assert reserved.active("main") is exists
+    assert reserved.active("") is exists  # Modal's unset environment is main
+    assert lookups == [(reserved.SECRET_NAME, "main")]
+    assert reserved.baked_env("main") == {reserved.ACTIVE_ENV: "1" if exists else "0"}
+    assert reserved.enabled(LARGE, "main") is exists
+    assert reserved.enabled(DRAFTER, "main") is exists
+    out = capsys.readouterr().out
+    assert f"reserved H100 serving {'ON' if exists else 'OFF'} in main" in out
+
+
+def test_dev_is_never_reserved_and_never_looks_the_secret_up(monkeypatch):
+    monkeypatch.delenv(reserved.ACTIVE_ENV)
+    lookups = _modal_with_secret(monkeypatch, True)
+    assert reserved.active("dev") is False
+    assert reserved.baked_env("dev") == {reserved.ACTIVE_ENV: "0"}
+    assert lookups == []
+
+
+def test_baked_decision_wins_in_remote_containers(monkeypatch):
+    lookups = _modal_with_secret(monkeypatch, True)
+    monkeypatch.setenv(reserved.ACTIVE_ENV, "0")
+    assert reserved.active("main") is False
+    monkeypatch.setenv(reserved.ACTIVE_ENV, "1")
+    assert reserved.active("main") is True
+    assert lookups == []
+
+
+def test_secret_lookup_errors_other_than_not_found_fail_the_deploy(monkeypatch):
+    import modal
+
+    def from_name(name, environment_name=None):
+        def hydrate():
+            raise ConnectionError("modal unreachable")
+
+        return SimpleNamespace(hydrate=hydrate)
+
+    monkeypatch.setattr(modal.Secret, "from_name", from_name)
+    with pytest.raises(ConnectionError, match="unreachable"):
+        reserved.secret_exists("main")
+
+
+def test_secret_absent_main_uses_the_on_demand_pool_for_both_models(monkeypatch):
+    from flash.serving.lambda_cloud import pool_capacity
+
+    monkeypatch.setenv(reserved.ACTIVE_ENV, "0")
+    for model in (LARGE, DRAFTER):
+        assert not reserved.enabled(model, "main")
+    monkeypatch.setattr(pool_capacity, "lambda_models", lambda: [LARGE, DRAFTER])
+    capacity = pool_capacity.SharedCapacity(SimpleNamespace(environment="main"), None, None, REV)
+    reconciled = []
+
+    async def reconcile_model(model, *, revision=None):
+        reconciled.append(model)
+
+    capacity.reconcile_model = reconcile_model
+    asyncio.run(capacity.reconcile(activating=True))
+    assert reconciled == [LARGE, DRAFTER]
+    assert wd.warm_names(LARGE, "main", "Engine27B") == ["Engine27B"]
+
+
+@pytest.mark.parametrize("on", [True, False])
+def test_health_body_reports_reserved_models_only_while_reserved_is_on(monkeypatch, on):
+    from flash.serving.src.http.routing import health_body
+
+    monkeypatch.setenv(reserved.ACTIVE_ENV, "1" if on else "0")
+    monkeypatch.delenv("SERVING_DEPLOYMENT_MODE", raising=False)
+    router = SimpleNamespace(
+        base_models=lambda: [LARGE, DRAFTER, "Qwen/Qwen3.5-9B-Base"], ready_adapters=list
+    )
+    body = health_body(router, deployment_sha="s", deployment_id="d", capabilities=[])
+    fallback = set(body["fallback_provider_by_model"])
+    assert (LARGE in fallback) is (not on)
+    assert (DRAFTER in fallback) is (not on)
+    assert "Qwen/Qwen3.5-9B-Base" in fallback
+    assert body["capacity_by_model"][LARGE]["min"] == (5 if on else 0)
+    assert body["capacity_by_model"][DRAFTER]["min"] == (3 if on else 0)
+    assert body["capacity_by_model"]["Qwen/Qwen3.5-9B-Base"]["min"] == 2
+    assert (body["gpu_by_model"][LARGE] == "H100") is on
