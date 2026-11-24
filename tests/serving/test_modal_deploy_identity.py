@@ -261,6 +261,9 @@ def test_control_app_bakes_the_same_reserved_decision(monkeypatch):
     importlib.import_module("flash.serving.lambda_cloud.control_app")
     secret = modal_stub.Secret.from_dict.call_args.args[0]
     assert secret[reserved.ACTIVE_ENV] == "0"
+    # The shared image carries it too, so the secret-less reaper never looks the secret up.
+    image_env = modal_stub.Image.debian_slim.return_value.pip_install.return_value.env
+    image_env.assert_called_once_with({reserved.ACTIVE_ENV: "0"})
 
 
 @pytest.mark.parametrize("environment", ["main", "", "dev"])
