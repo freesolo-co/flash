@@ -303,6 +303,19 @@ def configured_slots() -> list[int]:
     return declared
 
 
+def warm_names(model, environment, engine_name):
+    """Engine classes ``start_all`` warms for ``model``: its configured reserved slots, if any."""
+    from . import reserved
+
+    if not reserved.enabled(model, environment):
+        return [engine_name]
+    return [
+        engine_name + f"_ReservedH100{slot}"
+        for slot in configured_slots()
+        if reserved.model_for(slot) == model
+    ]
+
+
 class HealthView:
     """Router-side cached read of slot states; never blocks routing on the store."""
 

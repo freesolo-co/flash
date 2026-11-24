@@ -134,7 +134,7 @@ def health_body(
     reserved_models = (
         set()
         if os.environ.get("SERVING_DEPLOYMENT_MODE") == "development"
-        else set(reserved.MODELS) & set(gpu_by_model)
+        else {m for m in reserved.MODELS if reserved.enabled(m, None)} & set(gpu_by_model)
     )
     for m in reserved_models:
         gpu_by_model[m] = "H100"

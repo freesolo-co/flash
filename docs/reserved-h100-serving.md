@@ -10,7 +10,17 @@ Serving code never launches or terminates reserved instances. This page is the *
 | 6–8 | `Qwen/Qwen3.5-0.8B-Base` @ `dc7cdfe2ee4154fa7e30f5b51ca41bfa40174e68` | BF16, spec-decoding drafter |
 
 - **`Qwen/Qwen3.5-9B-Base` has no reserved slots.** It runs on the on-demand Lambda pool with its Modal GPU fallback, keeping an idle floor of 2 in main.
-- **In main, the two reserved models are served only by their slots.** They get no lease-pool workers and no Modal fallback. Dev serves every model from the normal pools.
+- **Reserved serving is switched on by the workers secret.** `reserved.active(env)` is the single switch. It is on only in main, and only when the Secret `flash-reserved-h100-workers-20261123` exists there.
+  - Each `modal deploy` looks the secret up once and logs `reserved H100 serving ON|OFF in main …`.
+  - The decision is baked into the serving, Lambda-controller and fleet-control images as `FLASH_RESERVED_H100_ACTIVE`, so remote containers follow it.
+  - The lookup is rerun only by the next deploy, so creating or deleting the secret has no effect until you redeploy both the control app and serving.
+- **ON:** the two reserved models are served only by their slots, with no lease-pool workers and no Modal fallback.
+- **OFF** (secret not created yet, or dev):
+  - the two models use the ordinary on-demand Lambda pool and Modal GPU fallback (27B at 0..2, 0.8B Base at 0..2);
+  - no reserved proxy or watchdog is registered;
+  - the deploy references no reserved secret.
+
+  This is how main deploys before step 5 below; deploy run 45330840461 failed when the code still required the secret.
 - **Source of truth:** `flash/serving/lambda_cloud/reserved.py` (`SLOT_MODELS`) and `reserved_watchdog.py`.
 
 | Kind | Name | Holds |
@@ -62,8 +72,9 @@ These steps go from the 15 9B Base boxes to 8 boxes serving 27B and 0.8B Base.
    3. **Edit `/opt/flash/setup.sh`:** use revision `R` and `R`'s `flash.serving.lambda_cloud.config.RUNTIME_IMAGE`.
    4. **Restart:** `sudo docker rm -f flash-worker && sudo rm -rf /opt/flash-source/* && sudo bash /opt/flash/setup.sh`.
    5. **Verify:** `/health` (port 8443, bearer token) reports `ok`, the slot model, `deployment_sha == R`, `configured_gpu == "H100"` and `canary_lane: true`. A 27B cold boot takes up to ~30 minutes.
-5. **Create the Secret `flash-reserved-h100-workers-20261123`** with the 8 entries and `LAMBDA_API_KEY`. Nothing needs pre-writing to the new health Dict.
-6. **Deploy serving to main at `R`.**
+5. **Create the Secret `flash-reserved-h100-workers-20261123`** in main, with the 8 entries and `LAMBDA_API_KEY`. Nothing needs pre-writing to the new health Dict. Until this step, main deploys with reserved serving OFF.
+6. **Redeploy to main at `R`** to switch the reserved slots on: re-run the "Deploy serving Modal app" workflow, which deploys the control app and then serving.
+   - Check the deploy log for `reserved H100 serving ON in main`.
    - Check the logs for `reserved H100 slot <n>: ok` for all 8.
    - Smoke-test one 27B and one 0.8B Base chat.
    - Until this deploy, the 27B is still served by its on-demand pool, so it has no downtime.
@@ -76,7 +87,7 @@ These steps go from the 15 9B Base boxes to 8 boxes serving 27B and 0.8B Base.
 8. **Optional cleanup:** the old Dicts `flash-reserved-h100-health-20261112` and `flash-reserved-h100-expansion-20261121`, and the old Secrets `flash-reserved-h100-workers-20261112` and `flash-h100-reservation-20261112`. Keep the Dict `flash-h100-reservation-20261112` while you still want its record of old slots 1–4.
 
 ## Retiring the fleet entirely
-1. Remove the slots from `SLOT_MODELS` (or the reserved code) and deploy. The two models then return to the on-demand pool and fallback.
+1. Delete the Secret `flash-reserved-h100-workers-20261123` in main and redeploy (control app and serving). The deploy logs `reserved H100 serving OFF`, and the two models return to the on-demand pool and fallback with no code change.
 2. Wait out the 2 h router drain.
 3. Terminate the 8 instances with the Lambda API steps in step 7 above.
-4. Delete `flash-reserved-h100-workers-20261123` and `flash-reserved-h100-health-20261123`.
+4. Delete the health Dict `flash-reserved-h100-health-20261123`.
