@@ -126,12 +126,8 @@ SERVING_MODELS: list[dict[str, Any]] = [
             "processor_revision": "68c46c4b3498877f3ef123c856ecfde50c39f404",
             "quantization": None,
             "gpu_memory_utilization": 0.90,
-            # GPU-resident LoRA slots are pre-allocated VRAM, so they stay at the qualified 16.
-            # The host-RAM LRU behind them holds 64: production workers serve more than 28
-            # distinct adapters at once, and a 16-entry CPU pool reloaded them from disk on
-            # nearly every miss. 64 rank-128 adapters fit easily in the H100 VMs' >=200 GiB RAM.
             "max_loras": 16,
-            "max_cpu_loras": 64,
+            "max_cpu_loras": 16,
             "max_lora_rank": 128,
             "max_model_len": 262144,
             # Keep Modal admission aligned with this per-container scheduler capacity.

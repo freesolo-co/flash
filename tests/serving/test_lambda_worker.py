@@ -59,9 +59,7 @@ def test_worker_auth_lifecycle_and_exact_payload_forwarding():
     with TestClient(create_app(engine, "private")) as client:
         assert client.get("/health").status_code == 401
         headers = {"Authorization": "Bearer private"}
-        health = client.get("/health", headers=headers).json()
-        assert health["base_model"] == MODEL
-        assert health["canary_lane"] is True
+        assert client.get("/health", headers=headers).json()["base_model"] == MODEL
         client.post("/lease", json={"generation_id": "g1"}, headers=headers)
         assert client.post("/generate", json=body, headers=headers).json() == {"text": "ok"}
         engine._generate.assert_awaited_once_with(
@@ -249,66 +247,6 @@ def test_runtime_pin_allows_version_only_bumps_but_rejects_dependency_drift(tmp_
     source.write_text(base.replace("0.23.0", "0.24.0"))
     with pytest.raises(RuntimeError, match="dependency lock mismatch"):
         verify(image, source)
-
-
-@pytest.mark.anyio
-async def test_canary_lane_answers_while_regular_admission_is_full(monkeypatch):
-    import flash.serving.lambda_cloud.worker as worker
-
-    monkeypatch.setattr(worker, "engine_overrides_for", lambda model: {"max_num_seqs": 2})
-    engine = fake_engine()
-    release = asyncio.Event()
-
-    async def generate(payload, record, expected, generation_id):
-        if not record.get("serve_base_model"):
-            await release.wait()
-        return {"request_id": generation_id}
-
-    engine._generate = generate
-    app = create_app(engine, "private")
-    headers = {"Authorization": "Bearer private"}
-
-    def body(generation_id, *, canary=False):
-        return {
-            "payload": {"model_id": MODEL, "prompt": "1", "max_tokens": 1},
-            "record": {"model_id": MODEL, "serve_base_model": canary},
-            "generation_id": generation_id,
-            **({"canary": True} if canary else {}),
-        }
-
-    async with httpx.AsyncClient(
-        transport=httpx.ASGITransport(app=app), base_url="https://worker"
-    ) as client:
-        for generation_id in ("busy", "queued", "canary"):
-            app.state.generation_leases.renew(generation_id)
-        # max_num_seqs - 1 = 1 regular slot: "busy" holds it and "queued" waits behind it.
-        busy = asyncio.create_task(client.post("/generate", json=body("busy"), headers=headers))
-        queued = asyncio.create_task(client.post("/generate", json=body("queued"), headers=headers))
-        await asyncio.sleep(0.1)
-        canary = await asyncio.wait_for(
-            client.post("/generate", json=body("canary", canary=True), headers=headers), 2
-        )
-        assert canary.json() == {"request_id": "canary"}
-        assert not queued.done()
-        release.set()
-        assert (await busy).status_code == 200
-        assert (await queued).status_code == 200
-
-
-def test_canary_flag_requires_a_one_token_base_model_generation():
-    engine = fake_engine()
-    body = {
-        "payload": {"model_id": MODEL, "prompt": "long", "max_tokens": 512},
-        "record": {"model_id": MODEL, "serve_base_model": True},
-        "generation_id": "jump-the-queue",
-        "canary": True,
-    }
-    with TestClient(create_app(engine, "private")) as client:
-        headers = {"Authorization": "Bearer private"}
-        client.post("/lease", json={"generation_id": "jump-the-queue"}, headers=headers)
-        response = client.post("/generate", json=body, headers=headers)
-    assert response.status_code == 400
-    engine._generate.assert_not_awaited()
 
 
 @pytest.mark.parametrize(

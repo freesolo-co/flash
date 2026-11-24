@@ -223,11 +223,3 @@ def test_hosted_gpu_matches_public_catalog(entry):
     from flash.core.catalog import get_model
 
     assert gpu_for(entry["base_model"]) == get_model(entry["base_model"]).serving.gpu
-
-
-def test_9b_base_keeps_16_hot_loras_with_a_64_adapter_host_pool():
-    # Production workers serve more than 28 distinct adapters at once; a 16-entry CPU pool
-    # reloaded them from disk on nearly every miss. GPU-resident slots stay at the qualified 16.
-    ov = engine_overrides_for("Qwen/Qwen3.5-9B-Base")
-    assert ov["max_loras"] == 16
-    assert ov["max_cpu_loras"] == 64
