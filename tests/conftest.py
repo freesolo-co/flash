@@ -13,6 +13,11 @@ import pytest
 
 PLACEHOLDER_HF_REVISION = "0" * 40
 
+# Collection imports modal_app, which bakes the reserved-H100 decision at import time. Pin it
+# before any test module loads so collection never looks up the Modal secret (CI has no Modal
+# token). The per-test fixture below still controls the mode inside each test.
+os.environ.setdefault("FLASH_RESERVED_H100_ACTIVE", "1")
+
 
 def _positive_finite_seconds(raw: str) -> float:
     try:
