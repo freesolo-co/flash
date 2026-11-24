@@ -161,20 +161,25 @@ def test_a_worker_serving_another_model_fails_its_probe_without_a_canary():
     transport.call.assert_awaited_once_with("/health")
 
 
-def test_canary_timeout_is_busy_until_generations_stop_finishing():
+@pytest.mark.parametrize(("lane", "status"), [(True, wd.FAILED), (False, wd.BUSY)])
+def test_canary_timeout_is_a_hang_only_on_workers_with_a_canary_lane(monkeypatch, lane, status):
+    sent = []
+
     async def call(path, body=None):
         if path == "/health":
-            return health(LARGE)
+            return health(LARGE, **({"canary_lane": True} if lane else {}))
+        sent.append(body)
         await asyncio.sleep(1)
         return None
 
-    transport = MagicMock(call=call)
-    old = wd.CANARY_TIMEOUT_SECONDS
-    try:
-        wd.CANARY_TIMEOUT_SECONDS = 0.01
-        assert asyncio.run(wd.probe_status(transport, LARGE)) == (wd.BUSY, "canary timeout")
-    finally:
-        wd.CANARY_TIMEOUT_SECONDS = old
+    monkeypatch.setattr(wd, "CANARY_TIMEOUT_SECONDS", 0.01)
+    assert asyncio.run(wd.probe_status(MagicMock(call=call), LARGE)) == (status, "canary timeout")
+    assert sent[0]["canary"] is True
+    assert sent[0]["payload"]["max_tokens"] == 1
+    assert sent[0]["record"]["serve_base_model"] is True
+
+
+def test_laneless_canary_timeout_is_busy_until_generations_stop_finishing():
     state, restart = wd.advance(wd.SlotState(), False, 0, "canary timeout", busy=True)
     assert state.healthy
     assert state.failures == 0

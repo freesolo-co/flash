@@ -11,6 +11,9 @@ on-demand Lambda allocation and no Modal GPU fallback. Development keeps ordinar
 
 The workers secret lists exactly the configured workers. Every entry names its model, which
 must be its slot's model, so a worker can never be routed requests for another model.
+
+Nothing here launches, renews or terminates the instances: the required operator procedure
+(bring-up, replacing a worker, retiring the fleet) is docs/reserved-h100-serving.md.
 """
 
 import asyncio

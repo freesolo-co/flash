@@ -2,8 +2,11 @@
 
 A worker can answer ``/health`` while its admitted generations never finish (observed
 2026-11-14), so health also requires a one-token base-model generation of the worker's own
-slot model. Workers have no dedicated canary lane: a canary timeout while ``/health`` is fine
-means *busy* until no canary has completed for ``BUSY_HUNG_AFTER_SECONDS``.
+slot model. Workers admit that canary through a dedicated lane (``/health`` reports
+``canary_lane``), so a worker saturated by long, healthy generations still answers it and a
+canary timeout means the engine is hung. On a worker without the lane the canary queues
+behind generations, so a timeout while ``/health`` is fine only means *busy* until no canary
+has completed for ``BUSY_HUNG_AFTER_SECONDS``.
 
 The watchdog quarantines a worker after consecutive failed probes; the router stops routing
 and registering to quarantined workers. A worker that stays unhealthy is rebooted through
@@ -123,6 +126,8 @@ def canary_request(model):
         },
         "expected_checkpoint": None,
         "generation_id": generation_id,
+        # Admitted through the worker's canary lane, not the request queue.
+        "canary": True,
     }
 
 
@@ -147,7 +152,7 @@ async def probe_status(transport, model):
             await transport.call("/generate", canary_request(model))
         return OK, ""
     except TimeoutError:
-        return BUSY, "canary timeout"
+        return (FAILED if health.get("canary_lane") is True else BUSY), "canary timeout"
     except Exception as exc:
         return FAILED, f"{type(exc).__name__}: {exc}"[:200]
 
