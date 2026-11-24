@@ -44,9 +44,7 @@ _validate_deploy_wiring = modal.is_local() and os.environ.get("MODAL_IS_REMOTE")
 _ALLOWED_SERVING_DEPLOYMENT_MODES = frozenset({"production", "development"})
 _requested_deployment_mode = os.environ.get("SERVING_DEPLOYMENT_MODE", "").strip()
 SERVING_DEPLOYMENT_MODE = _requested_deployment_mode or "production"
-# Modal uses main when no environment is explicitly configured. Resolve the same
-# default before selecting reserved classes and their request routes.
-MODAL_ENVIRONMENT = str(modal.config.config.get("environment") or "main").strip()
+MODAL_ENVIRONMENT = str(modal.config.config.get("environment") or "").strip()
 if _validate_deploy_wiring:
     if SERVING_DEPLOYMENT_MODE not in _ALLOWED_SERVING_DEPLOYMENT_MODES:
         raise ValueError(
@@ -169,7 +167,7 @@ ROUTER_TARGET_INPUTS = max(1, ROUTER_MAX_INPUTS * 3 // 4)
 # Modal bills the larger of request and use; requests below are soft, so bursts still run.
 ROUTER_CPU = 0.5
 ROUTER_MEMORY_MIB = 1024
-# A Lambda/reserved proxy only forwards to its GPU VM; measured peak use is ~0.4 cores.
+# A Lambda proxy only forwards to its GPU VM; measured peak use is ~0.4 cores.
 PROXY_CPU = 0.5
 
 # engines enable trust_remote_code, so their secret uses an allowlist: future credentials
@@ -331,7 +329,7 @@ from flash.serving.app.inference_provider import (  # noqa: E402
     modal_gpus_for,
 )
 from flash.serving.app.modal_engine import HostedModalEngine  # noqa: E402
-from flash.serving.lambda_cloud import reserved, reserved_expansion, reserved_watchdog  # noqa: E402
+from flash.serving.lambda_cloud import reserved, reserved_watchdog  # noqa: E402
 from flash.serving.lambda_cloud.proxy import LambdaEngineProxy  # noqa: E402
 from flash.serving.src.engine.lora_engine import _LoraEngineImpl  # noqa: E402, F401
 
@@ -390,13 +388,10 @@ def _build_engine(
 
     Set the class identity before decorators so Modal can re-import it remotely.
     """
-    implementation = (
-        reserved.ReservedLambdaEngineProxy
-        if provider == "reserved"
-        else HostedModalEngine
-        if provider == "modal"
-        else LambdaEngineProxy
-    )
+    implementation = {
+        "modal": HostedModalEngine,
+        "reserved": reserved.ReservedLambdaEngineProxy,
+    }.get(provider, LambdaEngineProxy)
 
     class _Engine(implementation):
         base_model: str = modal.parameter()
@@ -524,35 +519,39 @@ def _configured_engine(model, provider, suffix=""):
     )
 
 
+# In main the reserved models (27B, 0.8B Base) are served only by reserved H100 slots.
 ENGINE_BY_MODEL: dict[str, Any] = {
     bm: _configured_engine(bm, "lambda")
     for bm in base_models()
     if not reserved.enabled(bm, MODAL_ENVIRONMENT)
 }
+MODAL_FALLBACK_BY_MODEL: dict[str, Any] = {
+    bm: _configured_engine(bm, "modal", "_ModalGPU")
+    for bm in base_models()
+    if not reserved.enabled(bm, MODAL_ENVIRONMENT)
+}
+# Indexed by slot - 1; each slot's proxy carries its own model's name and concurrency.
 RESERVED_ENGINES = (
     tuple(
         _build_engine(
             "H100",
-            model_engine_name(reserved.MODEL) + f"_ReservedH100{slot}",
-            *_engine_concurrency(reserved.MODEL),
+            model_engine_name(model) + f"_ReservedH100{slot}",
+            *_engine_concurrency(model),
             provider="reserved",
             max_capacity=1,
             reserved_slot=slot,
         )
-        for slot in range(1, reserved.SLOT_COUNT + 1)
+        for slot, model in reserved.SLOT_MODELS.items()
     )
-    if reserved.enabled(reserved.MODEL, MODAL_ENVIRONMENT)
+    if reserved.enabled(reserved.LARGE_MODEL, MODAL_ENVIRONMENT)
     else ()
 )
 if RESERVED_ENGINES:
     reserved_watchdog.register_watchdog(app, lambda_controller_image, __name__)
-    reserved_expansion.register_expansion(
-        app, lambda_controller_image, lambda_proxy_secrets, __name__
-    )
 
-MODAL_FALLBACK_BY_MODEL: dict[str, Any] = {
-    bm: _configured_engine(bm, "modal", "_ModalGPU") for bm in base_models() if bm != reserved.MODEL
-}
+
+def _reserved(model: str) -> bool:
+    return bool(RESERVED_ENGINES) and reserved.enabled(model, MODAL_ENVIRONMENT)
 
 
 def _engine_cls_for(base_model: str) -> Any:
@@ -574,13 +573,13 @@ class _ModalEnginePool:
         # Watchdog-quarantined reserved workers are skipped for routing and registration.
         self._reserved_health = reserved_watchdog.HealthView.for_engines(RESERVED_ENGINES)
 
-    async def _each_reserved(self, label, call):
-        slots = await self._reserved_health.usable()
-        await reserved_watchdog.each_slot(RESERVED_ENGINES, reserved.MODEL, slots, label, call)
+    async def _each_reserved(self, model, label, call):
+        slots = await self._reserved_health.usable(model)
+        await reserved_watchdog.each_slot(RESERVED_ENGINES, model, slots, label, call)
 
     async def _engine_for(self, model):
-        if RESERVED_ENGINES and model == reserved.MODEL:
-            slot = await self._reserved_health.next_slot()
+        if _reserved(model):
+            slot = await self._reserved_health.next_slot(model)
             return RESERVED_ENGINES[slot - 1](base_model=model)
         if (
             model in MODAL_FALLBACK_BY_MODEL
@@ -676,11 +675,13 @@ class _ModalEnginePool:
                 await close()
 
     async def register(self, base_model: str, record: Any) -> None:
-        if RESERVED_ENGINES and base_model == reserved.MODEL:
+        if _reserved(base_model):
             payload = self._record_payload(record)
             generation = getattr(record, "deployment_generation", None)
             await self._each_reserved(
-                "register", lambda engine: engine.register.remote.aio(payload, generation)
+                base_model,
+                "register",
+                lambda engine: engine.register.remote.aio(payload, generation),
             )
             return
         engine = await self._engine_for(base_model)
@@ -696,20 +697,24 @@ class _ModalEnginePool:
         model_id: str,
         expected_generation: str | None = None,
     ) -> None:
-        if RESERVED_ENGINES and base_model == reserved.MODEL:
-            # Quarantined slots are skipped: the router stops addressing the removed
-            # checkpoint, so a recovering worker cannot be asked to serve it again.
+        if _reserved(base_model):
             await self._each_reserved(
+                base_model,
                 "unregister",
                 lambda engine: engine.unregister.remote.aio(org_id, model_id, expected_generation),
             )
             return
-        from flash.serving.app.provider_selection import unregister_active
-
-        engines = [ENGINE_BY_MODEL[base_model](base_model=base_model)]
         if base_model in MODAL_FALLBACK_BY_MODEL:
-            engines.append(MODAL_FALLBACK_BY_MODEL[base_model](base_model=base_model))
-        await unregister_active(engines, org_id, model_id, expected_generation)
+            from flash.serving.app.provider_selection import unregister_active
+
+            engines = [
+                ENGINE_BY_MODEL[base_model](base_model=base_model),
+                MODAL_FALLBACK_BY_MODEL[base_model](base_model=base_model),
+            ]
+            await unregister_active(engines, org_id, model_id, expected_generation)
+        else:
+            engine = await self._engine_for(base_model)
+            await engine.unregister.remote.aio(org_id, model_id, expected_generation)
 
 
 def _build_usage_outbox(settings: Any) -> Any:
@@ -973,13 +978,13 @@ def start_all(base_model: str | None = None) -> None:
             [
                 model_engine_name(bm) + f"_ReservedH100{slot}"
                 for slot in reserved_watchdog.configured_slots()
+                if reserved.model_for(slot) == bm
             ]
             if reserved.enabled(bm, MODAL_ENVIRONMENT)
             else [model_engine_name(bm)]
         )
         for name in names:
-            engine = modal.Cls.from_name(APP_NAME, name)
-            instance = engine(base_model=bm)
+            instance = modal.Cls.from_name(APP_NAME, name)(base_model=bm)
             started[name] = instance.health.spawn()
     for bm, handle in started.items():
         try:

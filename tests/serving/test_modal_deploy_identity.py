@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
+import asyncio
 import importlib
 import sys
 from typing import Any
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -168,24 +169,56 @@ def test_engine_exit_hook_awaits_shutdown(monkeypatch) -> None:
     assert app.modal.exit.called
 
 
-@pytest.mark.parametrize("environment", ["main", "", None])
-def test_main_9b_base_has_fifteen_reserved_cpu_proxies_and_no_gpu_fallback(
+@pytest.mark.parametrize("environment", ["main", "dev", ""])
+def test_9b_base_uses_the_lease_pool_with_modal_fallback_and_no_dedicated_fleet(
     monkeypatch, environment
 ):
     _clear_deployment_environment(monkeypatch)
     module = _import_modal_app(monkeypatch, is_local=False, environment=environment)
     model = "Qwen/Qwen3.5-9B-Base"
-    assert len(module.RESERVED_ENGINES) == 15
-    assert {cls.reserved_slot for cls in module.RESERVED_ENGINES} == set(range(1, 16))
-    assert all(cls.pinned_gpu is None for cls in module.RESERVED_ENGINES)
-    assert model not in module.ENGINE_BY_MODEL
-    assert model not in module.MODAL_FALLBACK_BY_MODEL
+    assert issubclass(module.ENGINE_BY_MODEL[model], module.LambdaEngineProxy)
+    assert model in module.MODAL_FALLBACK_BY_MODEL
+    assert model not in module.reserved.MODELS
+    # Only main declares the reserved 27B / 0.8B Base fleet: its secret and its watchdog.
+    main = environment != "dev"
+    secret_names = {c.args[0] for c in module.modal.Secret.from_name.call_args_list if c.args}
+    assert {n for n in secret_names if "h100" in n} == (
+        {module.reserved.SECRET_NAME} if main else set()
+    )
+    scheduled = [
+        call
+        for call in module.app.function.call_args_list
+        if call.kwargs.get("schedule") is not None and call.kwargs.get("cpu") == 0.25
+    ]
+    assert len(scheduled) == int(main)
+    assert all(c.kwargs["max_containers"] == 1 for c in scheduled)
 
 
-def test_reserved_requests_rotate_without_calling_capacity_service(monkeypatch):
-    import asyncio
+@pytest.mark.parametrize("environment", ["main", "", "dev"])
+def test_main_serves_27b_and_08b_base_only_from_eight_reserved_slots(monkeypatch, environment):
+    _clear_deployment_environment(monkeypatch)
+    module = _import_modal_app(monkeypatch, is_local=False, environment=environment)
+    large, drafter = "Qwen/Qwen3.8-27B", "Qwen/Qwen3.5-0.8B-Base"
+    if environment == "dev":
+        assert module.RESERVED_ENGINES == ()
+        assert {large, drafter} <= set(module.ENGINE_BY_MODEL)
+        assert {large, drafter} <= set(module.MODAL_FALLBACK_BY_MODEL)
+        return
+    engines = module.RESERVED_ENGINES
+    assert [cls.reserved_slot for cls in engines] == list(range(1, 9))
+    assert [cls.__name__ for cls in engines] == [
+        module.model_engine_name(large if slot <= 5 else drafter) + f"_ReservedH100{slot}"
+        for slot in range(1, 9)
+    ]
+    assert all(issubclass(cls, module.reserved.ReservedLambdaEngineProxy) for cls in engines)
+    assert all(cls.pinned_gpu is None for cls in engines)
+    for model in (large, drafter):
+        assert model not in module.ENGINE_BY_MODEL
+        assert model not in module.MODAL_FALLBACK_BY_MODEL
+
+
+def test_reserved_requests_rotate_within_their_models_slots(monkeypatch):
     from types import SimpleNamespace
-    from unittest.mock import AsyncMock
 
     _clear_deployment_environment(monkeypatch)
     module = _import_modal_app(monkeypatch, is_local=False, environment="main")
@@ -194,88 +227,15 @@ def test_reserved_requests_rotate_without_calling_capacity_service(monkeypatch):
     monkeypatch.setattr(
         module,
         "RESERVED_ENGINES",
-        tuple(lambda *, base_model, slot=i: (slot, base_model) for i in range(4)),
+        tuple(lambda *, base_model, slot=i + 1: (slot, base_model) for i in range(8)),
     )
     pool._reserved_health = module.reserved_watchdog.HealthView(
-        SimpleNamespace(get=AsyncMock(return_value=None)), range(1, 5)
+        SimpleNamespace(get=AsyncMock(return_value=None)), module.reserved.SLOT_MODELS
     )
 
-    async def check():
-        return [await pool._engine_for("Qwen/Qwen3.5-9B-Base") for _ in range(8)]
+    async def picks(model, n):
+        return [(await pool._engine_for(model))[0] for _ in range(n)]
 
-    results = asyncio.run(check())
-    assert [slot for slot, _ in results] == [0, 1, 2, 3, 0, 1, 2, 3]
+    assert asyncio.run(picks("Qwen/Qwen3.8-27B", 6)) == [1, 2, 3, 4, 5, 1]
+    assert asyncio.run(picks("Qwen/Qwen3.5-0.8B-Base", 4)) == [6, 7, 8, 6]
     pool._provider_selection.choose.assert_not_awaited()
-
-
-@pytest.mark.parametrize("environment", ["main", "dev"])
-def test_reserved_watchdog_is_scheduled_only_with_reserved_workers(monkeypatch, environment):
-    _clear_deployment_environment(monkeypatch)
-    module = _import_modal_app(monkeypatch, is_local=False, environment=environment)
-    secret_names = [c.args[0] for c in module.modal.Secret.from_name.call_args_list]
-    scheduled = [
-        call
-        for call in module.app.function.call_args_list
-        if call.kwargs.get("schedule") is not None and call.kwargs.get("cpu") == 0.25
-    ]
-    reserved_main = environment == "main"
-    assert hasattr(module, "reserved_h100_watchdog") is reserved_main
-    assert hasattr(module, "reserved_h100_expansion") is reserved_main
-    # The watchdog and the expansion loop, each a single non-preemptible container.
-    watchdog = scheduled[:1]
-    assert len(scheduled) == (2 if reserved_main else 0)
-    assert all(c.kwargs["max_containers"] == 1 for c in scheduled)
-    assert (module.reserved.RESERVATION_SECRET_NAME in secret_names) is reserved_main
-    if reserved_main:
-        assert watchdog[0].kwargs["max_containers"] == 1
-        assert watchdog[0].kwargs["nonpreemptible"] is True
-
-
-@pytest.mark.parametrize("environment", ["main", "dev"])
-@pytest.mark.parametrize("all_models", [False, True])
-def test_start_all_resolves_reserved_workers_only_in_main(monkeypatch, environment, all_models):
-    _clear_deployment_environment(monkeypatch)
-    module = _import_modal_app(monkeypatch, is_local=False, environment=environment)
-    model = module.reserved.MODEL
-    ordinary = "Qwen/Qwen3.5-4B"
-    monkeypatch.setattr(
-        "flash.serving.src.engine.model_config.base_models", lambda: [ordinary, model]
-    )
-    module.start_all(None if all_models else model)
-    names = [c.args[1] for c in module.modal.Cls.from_name.call_args_list]
-    expected = (
-        [module.model_engine_name(model) + f"_ReservedH100{i}" for i in range(1, 16)]
-        if environment == "main"
-        else [module.model_engine_name(model)]
-    )
-    assert names == ([module.model_engine_name(ordinary)] if all_models else []) + expected
-    instance = module.modal.Cls.from_name.return_value.return_value
-    assert instance.health.spawn.call_count == len(expected) + int(all_models)
-    assert instance.health.spawn.return_value.get.call_count == len(expected) + int(all_models)
-
-
-@pytest.mark.parametrize(
-    ("runners", "inputs", "backlog"), [(0, 0, 0), (1, 0, 0), (0, 1, 0), (0, 0, 1)]
-)
-def test_dev_lambda_only_unregister_does_not_wake_idle_pool(monkeypatch, runners, inputs, backlog):
-    import asyncio
-    from types import SimpleNamespace
-    from unittest.mock import AsyncMock
-
-    _clear_deployment_environment(monkeypatch)
-    module = _import_modal_app(monkeypatch, is_local=False, environment="dev")
-    model = module.reserved.MODEL
-    engine = MagicMock()
-    engine.health.get_current_stats.aio = AsyncMock(
-        return_value=SimpleNamespace(
-            num_total_runners=runners, num_running_inputs=inputs, backlog=backlog
-        )
-    )
-    engine.unregister.remote.aio = AsyncMock()
-    module.ENGINE_BY_MODEL[model] = MagicMock(return_value=engine)
-    pool = module._ModalEnginePool.__new__(module._ModalEnginePool)
-    asyncio.run(pool.unregister(model, "org", "adapter", "generation"))
-    if runners or inputs or backlog:
-        engine.unregister.remote.aio.assert_awaited_once_with("org", "adapter", "generation")
-    else:
-        engine.unregister.remote.aio.assert_not_awaited()

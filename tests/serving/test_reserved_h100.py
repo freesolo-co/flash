@@ -1,243 +1,252 @@
+"""Reserved H100 fleet: 5 x Qwen3.8-27B + 3 x Qwen3.5-0.8B-Base, one model per slot."""
+
+import asyncio
 import json
-from unittest.mock import AsyncMock
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
 from flash.serving.lambda_cloud import reserved
-from flash.serving.lambda_cloud.config import NoCapacityError
-from flash.serving.lambda_cloud.fleet import Fleet
+from flash.serving.lambda_cloud import reserved_watchdog as wd
+from flash.serving.lambda_cloud.config import NoCapacityError, placements
+
+REV = "a" * 40
+TLS = {"cert": "C", "token": "T"}
+LARGE, DRAFTER = "Qwen/Qwen3.8-27B", "Qwen/Qwen3.5-0.8B-Base"
 
 
-@pytest.fixture
-def anyio_backend():
-    return "asyncio"
+def worker(slot, **extra):
+    return {
+        "slot": slot,
+        "model": reserved.model_for(slot),
+        "instance_id": f"i{slot}",
+        "ip": f"10.0.0.{slot}",
+        "revision": REV,
+        "tls": TLS,
+        **extra,
+    }
 
 
-def workers():
-    return [
-        {"slot": i, "instance_id": str(i), "ip": f"8.8.8.{i}", "revision": "a" * 40, "tls": {}}
-        for i in range(1, 5)
-    ]
+def health(model, **extra):
+    return {
+        "ok": True,
+        "base_model": model,
+        "deployment_sha": REV,
+        "configured_gpu": "H100",
+        **extra,
+    }
 
 
-def test_worker_config_accepts_any_subset_of_declared_slots():
-    data = [dict(w, slot=w["slot"] + 4, instance_id=f"x{w['slot']}") for w in workers()]
-    raw = json.dumps(workers() + data)
-    assert reserved.SLOT_COUNT == 15
+class MemoryStore(dict):
+    async def get(self, key):
+        return super().get(key)
+
+    async def put(self, key, value):
+        self[key] = value
+
+
+def test_slot_layout_is_five_27b_then_three_08b_base_and_no_9b_base():
+    assert reserved.SLOT_COUNT == 8
+    assert reserved.slots_for(LARGE) == (1, 2, 3, 4, 5)
+    assert reserved.slots_for(DRAFTER) == (6, 7, 8)
+    assert reserved.slots_for("Qwen/Qwen3.5-9B-Base") == ()
+    assert reserved.MODELS == (LARGE, DRAFTER)
+    with pytest.raises(ValueError, match="not declared"):
+        reserved.model_for(9)
+
+
+@pytest.mark.parametrize("environment", ["main", "", None])
+def test_reserved_models_are_reserved_only_in_main(environment):
+    assert reserved.enabled(LARGE, environment)
+    assert reserved.enabled(DRAFTER, environment)
+    assert not reserved.enabled("Qwen/Qwen3.5-9B-Base", environment)
+    assert not reserved.enabled(LARGE, "dev")
+
+
+def test_both_reserved_models_place_on_a_single_h100_on_lambda():
+    assert placements(LARGE) == ("H100",)
+    assert placements(DRAFTER) == ("H100",)
+
+
+def test_parse_workers_requires_each_entry_to_name_its_slot_model():
+    raw = json.dumps([worker(s) for s in range(1, 9)])
     assert [w["slot"] for w in reserved.parse_workers(raw)] == list(range(1, 9))
-    assert reserved.worker_config(8, raw)["instance_id"] == "x4"
-    # Four configured slots: the declared slots beyond them are not configured.
-    with pytest.raises(ValueError, match="not configured"):
-        reserved.worker_config(5, json.dumps(workers()))
+    for bad in (
+        [worker(1, model=DRAFTER)],  # a drafter entry in a 27B slot
+        [{k: v for k, v in worker(6).items() if k != "model"}],  # model omitted
+        [{**worker(1), "slot": 9}],  # undeclared slot
+        [worker(1), {**worker(2), "instance_id": "i1"}],  # duplicate instance
+        [worker(1), worker(1)],  # duplicate slot
+        [],
+    ):
+        with pytest.raises(ValueError, match=r"Reserved fleet|Every reserved worker"):
+            reserved.parse_workers(json.dumps(bad))
+
+
+def proxy_for(slot, base_model, reported, monkeypatch):
+    from flash.serving.lambda_cloud import reserved as module
+
+    transport = MagicMock(call=AsyncMock(return_value=reported), aclose=AsyncMock())
+    monkeypatch.setattr(module, "WorkerTransport", lambda ip, tls: transport)
+    monkeypatch.setenv(reserved.WORKERS_ENV, json.dumps([worker(s) for s in range(1, 9)]))
+    proxy = reserved.ReservedLambdaEngineProxy()
+    proxy.base_model, proxy.reserved_slot = base_model, slot
+    return proxy, transport
+
+
+def test_proxy_binds_its_slot_worker_after_identity_check(monkeypatch):
+    proxy, transport = proxy_for(7, DRAFTER, health(DRAFTER), monkeypatch)
+    asyncio.run(proxy._load())
+    assert proxy.engine is transport
+    assert proxy._owner == "i7"
 
 
 @pytest.mark.parametrize(
-    "mutate",
+    ("slot", "base_model", "reported", "error"),
     [
-        lambda d: d.__setitem__(1, dict(d[1], slot=1)),
-        lambda d: d.__setitem__(0, dict(d[0], slot=reserved.SLOT_COUNT + 1)),
-        lambda d: d.__setitem__(0, dict(d[0], slot=0)),
-        lambda d: d.clear(),
+        (2, DRAFTER, health(DRAFTER), "serves Qwen/Qwen3.8-27B"),  # wrong model for the slot
+        (2, LARGE, health("Qwen/Qwen3.5-9B-Base"), "identity mismatch"),  # leftover 9B worker
+        (6, DRAFTER, health(DRAFTER, deployment_sha="b" * 40), "identity mismatch"),
+        (6, DRAFTER, health(DRAFTER, configured_gpu="A100-80GB"), "identity mismatch"),
     ],
 )
-def test_reject_invalid_reserved_slots(mutate):
-    data = workers()
-    mutate(data)
-    with pytest.raises(ValueError, match="slot"):
-        reserved.parse_workers(json.dumps(data))
-
-
-def test_reject_duplicate_reserved_instance():
-    data = workers()
-    data[1]["instance_id"] = data[0]["instance_id"]
-    with pytest.raises(ValueError, match="distinct"):
-        reserved.worker_config(1, json.dumps(data))
-
-
-@pytest.mark.anyio
-async def test_reserved_shutdown_does_not_release_gpu():
-    proxy = reserved.ReservedLambdaEngineProxy()
-    proxy._transport = AsyncMock()
-    proxy._fleet = AsyncMock()
-    await proxy._shutdown()
-    proxy._transport.aclose.assert_awaited_once()
-    proxy._fleet.release.remote.aio.assert_not_awaited()
-
-
-@pytest.mark.anyio
-async def test_wrong_worker_identity_fails_closed(monkeypatch):
-    monkeypatch.setenv("FLASH_RESERVED_H100_WORKERS", json.dumps(workers()))
-    transport = AsyncMock()
-    transport.call.return_value = {
-        "ok": True,
-        "base_model": reserved.MODEL,
-        "deployment_sha": "b" * 40,
-        "configured_gpu": "H100",
-    }
-    monkeypatch.setattr(reserved, "WorkerTransport", lambda *a: transport)
-    proxy = reserved.ReservedLambdaEngineProxy()
-    proxy.base_model = reserved.MODEL
-    proxy.reserved_slot = 1
-    with pytest.raises(RuntimeError, match="identity"):
-        await proxy._load()
-    transport.aclose.assert_awaited_once()
-
-
-@pytest.mark.anyio
-async def test_dynamic_fleet_cannot_allocate_more_9b_base_gpus():
-    api = AsyncMock()
-    ledger = AsyncMock()
-    fleet = Fleet(api, ledger, "main")
-    with pytest.raises(NoCapacityError, match="reserved"):
-        await fleet._check_capacity(reserved.MODEL, "a" * 40)
-    api.call.assert_not_awaited()
-
-
-@pytest.mark.anyio
-async def test_shared_reconciler_skips_reserved_model(monkeypatch):
-    from types import SimpleNamespace
-
-    from flash.serving.lambda_cloud.pool_capacity import SharedCapacity
-
-    monkeypatch.setattr(
-        "flash.serving.lambda_cloud.pool_capacity.lambda_models", lambda: [reserved.MODEL]
-    )
-    state = SimpleNamespace(get=AsyncMock(return_value={"revision": "a" * 40, "retired": []}))
-    control = SharedCapacity(AsyncMock(), AsyncMock(), state, "a" * 40)
-    control.reconcile_model = AsyncMock()
-    await control.reconcile()
-    control.reconcile_model.assert_not_awaited()
-
-
-@pytest.mark.anyio
-async def test_development_keeps_lambda_only_capacity_without_modal_fallback():
-    from types import SimpleNamespace
-
-    async def empty_items():
-        if False:
-            yield None
-
-    api = SimpleNamespace(call=AsyncMock(return_value=[]))
-    ledger = SimpleNamespace(items=empty_items)
-    fleet = Fleet(api, ledger, "dev")
-    fleet.shared_capacity = AsyncMock()
-    await fleet._check_capacity(reserved.MODEL, "a" * 40)
-    fleet.shared_capacity.before_launch.assert_not_awaited()
-
-
-@pytest.mark.anyio
-@pytest.mark.parametrize(
-    ("old_count", "current_count", "allowed"), [(4, 0, True), (4, 1, False), (0, 4, False)]
-)
-@pytest.mark.parametrize("ownership", ["leased", "draining", "uncertain"])
-async def test_dev_lambda_only_budget_counts_all_revisions(
-    old_count, current_count, allowed, ownership
+def test_proxy_refuses_a_worker_with_the_wrong_identity(
+    monkeypatch, slot, base_model, reported, error
 ):
-    from types import SimpleNamespace
-
-    now = 10000
-    records = []
-    instances = []
-    for i in range(old_count + current_count):
-        owner = f"{i:032x}"
-        records.append(
-            (
-                owner,
-                {
-                    "model": reserved.MODEL,
-                    "revision": "old" if i < old_count else "new",
-                    "instance_id": None if ownership == "uncertain" else str(i),
-                    "released": ownership == "draining",
-                    "heartbeat": now,
-                },
-            )
-        )
-        if ownership == "draining":
-            instances.append(
-                {
-                    "name": f"flash-dev-{owner}",
-                    "status": "terminating",
-                    "tags": [
-                        {"key": "flash-owner", "value": owner},
-                        {"key": "flash-environment", "value": "dev"},
-                    ],
-                }
-            )
-
-    async def items():
-        for item in records:
-            yield item
-
-    fleet = Fleet(
-        SimpleNamespace(call=AsyncMock(return_value=instances)),
-        SimpleNamespace(items=items),
-        "dev",
-        clock=lambda: now,
-    )
-    fleet.shared_capacity = AsyncMock()
-    if allowed:
-        await fleet._check_capacity(reserved.MODEL, "new")
-    else:
-        with pytest.raises(NoCapacityError, match="replica limit"):
-            await fleet._check_capacity(reserved.MODEL, "new")
-    fleet.shared_capacity.before_launch.assert_not_awaited()
+    proxy, transport = proxy_for(slot, base_model, reported, monkeypatch)
+    with pytest.raises((RuntimeError, ValueError), match=error):
+        asyncio.run(proxy._load())
+    if error == "identity mismatch":
+        transport.aclose.assert_awaited_once()
 
 
-@pytest.mark.anyio
-async def test_expansion_proxy_follows_a_replaced_worker(monkeypatch):
-    from flash.serving.lambda_cloud import reserved_expansion
+def test_watchdog_probes_each_worker_with_its_slot_model():
+    seen = {}
 
-    monkeypatch.setenv("FLASH_RESERVED_H100_WORKERS", json.dumps(workers()))
-    tls = {"cert": "C", "token": "T"}
-    published = [
-        {"slot": 9, "instance_id": "e9", "ip": "8.8.4.4", "revision": "a" * 40, "tls": tls}
-    ]
-    monkeypatch.setattr(reserved_expansion, "published_workers", AsyncMock(return_value=published))
-    health = {"ok": True, "base_model": reserved.MODEL, "deployment_sha": "a" * 40}
-    made = []
+    class Transport:
+        def __init__(self, ip, tls):
+            self.slot = int(ip.rsplit(".", 1)[1])
 
-    def factory(ip, tls):
-        made.append(AsyncMock(ip=ip))
-        made[-1].call.return_value = {**health, "configured_gpu": "H100"}
-        return made[-1]
-
-    monkeypatch.setattr(reserved, "WorkerTransport", factory)
-    clock = [0.0]
-    monkeypatch.setattr(reserved.time, "monotonic", lambda: clock[0])
-    proxy = reserved.ReservedLambdaEngineProxy()
-    proxy.base_model, proxy.reserved_slot = reserved.MODEL, 9
-    await proxy._load()
-
-    published[0] = dict(published[0], instance_id="e9b", ip="9.9.9.9")
-    clock[0] += reserved.REBIND_CHECK_SECONDS + 1
-    await proxy._generate({"x": 1})
-    assert (proxy._transport.ip, proxy._owner) == ("9.9.9.9", "e9b")
-    assert proxy.engine is proxy._transport
-    made[0].aclose.assert_awaited_once()
-
-
-@pytest.mark.anyio
-async def test_closing_reserved_stream_awaits_transport_cleanup(monkeypatch):
-    import asyncio
-
-    closed = asyncio.Event()
-
-    class Stream:
-        def __aiter__(self):
-            return self
-
-        async def __anext__(self):
-            return {"event": "token"}
+        async def call(self, path, body=None):
+            model = reserved.model_for(self.slot)
+            if path == "/health":
+                return health(model)
+            seen[self.slot] = (body["payload"]["model_id"], body["record"]["base_model"])
+            return {}
 
         async def aclose(self):
-            await asyncio.sleep(0)
-            closed.set()
+            pass
 
-    proxy = reserved.ReservedLambdaEngineProxy()
-    proxy._expansion = False
-    proxy._transport = AsyncMock()
-    proxy._transport.stream = lambda body: Stream()
-    stream = proxy._stream_generate({"x": 1})
-    assert await anext(stream) == {"event": "token"}
-    await stream.aclose()
-    assert closed.is_set()
+    store = MemoryStore()
+    report = asyncio.run(
+        wd.run_once(
+            [worker(s) for s in range(1, 9)],
+            store,
+            AsyncMock(),
+            reserved.model_for,
+            transport_factory=Transport,
+        )
+    )
+    assert all(r["healthy"] for r in report.values())
+    assert seen == {s: (reserved.model_for(s),) * 2 for s in range(1, 9)}
+    assert store[wd.CONFIGURED_KEY] == list(range(1, 9))
+
+
+def test_a_worker_serving_another_model_fails_its_probe_without_a_canary():
+    transport = MagicMock(call=AsyncMock(return_value=health("Qwen/Qwen3.5-9B-Base")))
+    status, error = asyncio.run(wd.probe_status(transport, LARGE))
+    assert status == wd.FAILED
+    assert "slot serves Qwen/Qwen3.8-27B" in error
+    transport.call.assert_awaited_once_with("/health")
+
+
+@pytest.mark.parametrize(("lane", "status"), [(True, wd.FAILED), (False, wd.BUSY)])
+def test_canary_timeout_is_a_hang_only_on_workers_with_a_canary_lane(monkeypatch, lane, status):
+    sent = []
+
+    async def call(path, body=None):
+        if path == "/health":
+            return health(LARGE, **({"canary_lane": True} if lane else {}))
+        sent.append(body)
+        await asyncio.sleep(1)
+        return None
+
+    monkeypatch.setattr(wd, "CANARY_TIMEOUT_SECONDS", 0.01)
+    assert asyncio.run(wd.probe_status(MagicMock(call=call), LARGE)) == (status, "canary timeout")
+    assert sent[0]["canary"] is True
+    assert sent[0]["payload"]["max_tokens"] == 1
+    assert sent[0]["record"]["serve_base_model"] is True
+
+
+def test_laneless_canary_timeout_is_busy_until_generations_stop_finishing():
+    state, restart = wd.advance(wd.SlotState(), False, 0, "canary timeout", busy=True)
+    assert state.healthy
+    assert state.failures == 0
+    assert not restart
+    state, _ = wd.advance(state, False, wd.BUSY_HUNG_AFTER_SECONDS, "canary timeout", busy=True)
+    assert state.failures == 1
+
+
+def test_routing_uses_only_healthy_configured_slots_of_the_requested_model():
+    states = {2: wd.SlotState(healthy=False).dump(), 7: wd.SlotState(healthy=False).dump()}
+    store = MemoryStore({wd.CONFIGURED_KEY: [1, 2, 3, 6, 7], **states})
+    view = wd.HealthView(store, reserved.SLOT_MODELS)
+
+    async def check():
+        large = [await view.next_slot(LARGE) for _ in range(4)]
+        drafter = [await view.next_slot(DRAFTER) for _ in range(2)]
+        return large, drafter, await view.usable(LARGE), await view.usable(DRAFTER)
+
+    large, drafter, usable_large, usable_drafter = asyncio.run(check())
+    assert usable_large == [1, 3]
+    assert large == [1, 3, 1, 3]
+    assert usable_drafter == [6]
+    assert drafter == [6, 6]
+    with pytest.raises(ValueError, match="No reserved slot"):
+        asyncio.run(view.usable("Qwen/Qwen3.5-9B-Base"))
+
+
+def test_routing_fails_open_within_a_model_when_all_its_slots_are_quarantined():
+    down = wd.SlotState(healthy=False).dump()
+    store = MemoryStore({wd.CONFIGURED_KEY: list(range(1, 9)), 6: down, 7: down, 8: down})
+    view = wd.HealthView(store, reserved.SLOT_MODELS)
+    assert asyncio.run(view.usable(DRAFTER)) == [6, 7, 8]
+    assert asyncio.run(view.usable(LARGE)) == [1, 2, 3, 4, 5]
+
+
+def fleet(environment):
+    from flash.serving.lambda_cloud.fleet import Fleet
+
+    return Fleet(MagicMock(), MagicMock(), environment)
+
+
+@pytest.mark.parametrize("model", [LARGE, DRAFTER])
+def test_main_never_allocates_on_demand_gpus_for_reserved_models(model):
+    with pytest.raises(NoCapacityError, match="reserved H100s"):
+        asyncio.run(fleet("main")._check_capacity(model, REV))
+
+
+def test_shared_capacity_skips_reserved_models_in_main_only(monkeypatch):
+    from flash.serving.lambda_cloud import pool_capacity
+
+    monkeypatch.setattr(pool_capacity, "lambda_models", lambda: [LARGE, "Qwen/Qwen3.5-9B-Base"])
+    for environment in ("main", "dev"):
+        capacity = pool_capacity.SharedCapacity(
+            SimpleNamespace(environment=environment), None, None, REV
+        )
+        reconciled = []
+
+        async def reconcile_model(model, *, revision=None, seen=reconciled):
+            seen.append(model)
+
+        capacity.reconcile_model = reconcile_model
+        asyncio.run(capacity.reconcile(activating=True))
+        assert (LARGE in reconciled) is (environment == "dev")
+        assert "Qwen/Qwen3.5-9B-Base" in reconciled
+    with pytest.raises(NoCapacityError):
+        asyncio.run(
+            pool_capacity.SharedCapacity(
+                SimpleNamespace(environment="main"), None, None, REV
+            ).reconcile_model(DRAFTER)
+        )
