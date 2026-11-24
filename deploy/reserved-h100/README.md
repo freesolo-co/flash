@@ -10,7 +10,9 @@ so it stays identical to what ran.
 `tick()` runs every minute under the `tick_lock` in the Modal Dict of the same name. In mode
 `serving` with four active instances it only records state. Once `hold_until` passes it
 **terminates all four instances**. The serving watchdog (`reserved_watchdog.py`) renews
-`hold_until`.
+`hold_until` while reserved serving is on. With reserved serving off (`reserved.ENABLED = False`),
+`reserved_retire.py` instead sets `hold_until` to now once routing has drained, so the next tick
+terminates the four instances and the reservation closes (see `docs/reserved-h100-serving.md`).
 
 ## Deploying (workspace moves included)
 

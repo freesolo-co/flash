@@ -11,6 +11,7 @@ from typing import Any, Protocol
 
 from flash.schema import parse_checkpoint_ref
 from flash.serving.app.inference_provider import modal_gpus_for, policy_for
+from flash.serving.lambda_cloud import reserved
 from flash.serving.lambda_cloud.config import placements
 from flash.serving.lambda_cloud.reserved import MODEL as RESERVED_MODEL
 from flash.serving.src.engine.model_config import (
@@ -130,11 +131,10 @@ def health_body(
         else gpu_for(m)
         for m in supported_models
     }
+    reserved_fleet = reserved.ENABLED and os.environ.get("SERVING_DEPLOYMENT_MODE") != "development"
     if RESERVED_MODEL in gpu_by_model:
         gpu_by_model[RESERVED_MODEL] = (
-            " | ".join(placements(RESERVED_MODEL))
-            if os.environ.get("SERVING_DEPLOYMENT_MODE") == "development"
-            else "H100"
+            "H100" if reserved_fleet else " | ".join(placements(RESERVED_MODEL))
         )
     providers = {m: "lambda" if m.startswith("Qwen/") else "modal" for m in supported_models}
     primary_providers = set(providers.values())
@@ -149,7 +149,7 @@ def health_body(
         },
         "capacity_by_model": {
             m: {
-                "min": 4 if m == RESERVED_MODEL else policy_for(m).min_capacity,
+                "min": 4 if reserved_fleet and m == RESERVED_MODEL else policy_for(m).min_capacity,
                 "max": policy_for(m).max_capacity,
                 "dev_min": 0,
                 "dev_max": policy_for(m).dev_max_capacity,

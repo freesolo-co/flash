@@ -9,6 +9,10 @@ from .proxy import LambdaEngineProxy
 from .transport import WorkerTransport
 
 MODEL = "Qwen/Qwen3.5-9B-Base"
+# Off: production 9B Base serves from the scale-to-zero Lambda lease pool (as in dev), and
+# ``reserved_retire`` releases the previous reserved fleet. Set True and redeploy to route
+# production 9B Base to reserved slots again (see docs/reserved-h100-serving.md).
+ENABLED = False
 SECRET_NAME = "flash-reserved-h100-workers-20261112"
 # Serving declares one CPU proxy per slot up to this ceiling; the workers secret and
 # ``reserved_expansion`` configure a subset. Unconfigured slots are never routed.
@@ -22,7 +26,7 @@ REBIND_CHECK_SECONDS = 15  # how often an expansion-slot proxy re-reads its work
 
 
 def enabled(model, environment):
-    return model == MODEL and environment == "main"
+    return ENABLED and model == MODEL and environment == "main"
 
 
 def parse_workers(raw):

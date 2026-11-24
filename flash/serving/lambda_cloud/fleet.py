@@ -112,8 +112,9 @@ class Fleet:
 
     async def _check_capacity(self, model, revision):
         from .reserved import MODEL as RESERVED_MODEL
+        from .reserved import enabled as reserved_enabled
 
-        if model == RESERVED_MODEL and self.environment == "main":
+        if reserved_enabled(model, self.environment):
             raise NoCapacityError("9B Base is reserved; automatic GPU allocation is disabled")
         # Modal normally enforces this. Include uncertain/orphan launches so a
         # replacement CPU replica cannot silently exceed its GPU budget.
@@ -138,7 +139,7 @@ class Fleet:
         if model == RESERVED_MODEL:
             from .pool_capacity import HANDOFF_SURGE
 
-            # Dev has no Modal fallback, but draining releases and uncertain
+            # 9B Base has no Modal fallback, but draining releases and uncertain
             # launches still consume the shared Lambda handoff budget.
             if allocated >= capacity_for(model, "lambda")[1] + HANDOFF_SURGE:
                 raise NoCapacityError(

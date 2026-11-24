@@ -43,8 +43,9 @@ MODEL_POLICIES = {
     "Qwen/Qwen3.5-0.8B": ModelPolicy(min_capacity=1, max_capacity=2),
     "Qwen/Qwen3.5-4B": ModelPolicy(min_capacity=0, max_capacity=2),
     "Qwen/Qwen3.5-9B": ModelPolicy(min_capacity=0, max_capacity=2),
+    # Lambda H100 only, no Modal fallback; scales to zero unless reserved serving is on.
     "Qwen/Qwen3.5-9B-Base": ModelPolicy(
-        min_capacity=2,
+        min_capacity=0,
         max_capacity=4,
         lambda_gpus=["H100"],
     ),

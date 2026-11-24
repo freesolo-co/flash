@@ -83,8 +83,15 @@ async def test_wrong_worker_identity_fails_closed(monkeypatch):
     transport.aclose.assert_awaited_once()
 
 
+def test_reserved_serving_is_off_by_default():
+    assert reserved.ENABLED is False
+    assert not reserved.enabled(reserved.MODEL, "main")
+    assert not reserved.enabled(reserved.MODEL, "dev")
+
+
 @pytest.mark.anyio
-async def test_dynamic_fleet_cannot_allocate_more_9b_base_gpus():
+async def test_dynamic_fleet_cannot_allocate_more_9b_base_gpus_while_reserved(monkeypatch):
+    monkeypatch.setattr(reserved, "ENABLED", True)
     api = AsyncMock()
     ledger = AsyncMock()
     fleet = Fleet(api, ledger, "main")
@@ -110,7 +117,8 @@ async def test_shared_reconciler_skips_reserved_model(monkeypatch):
 
 
 @pytest.mark.anyio
-async def test_development_keeps_lambda_only_capacity_without_modal_fallback():
+@pytest.mark.parametrize("environment", ["main", "dev"])
+async def test_9b_base_allocates_lambda_only_on_demand_without_reserved_fleet(environment):
     from types import SimpleNamespace
 
     async def empty_items():
@@ -119,9 +127,10 @@ async def test_development_keeps_lambda_only_capacity_without_modal_fallback():
 
     api = SimpleNamespace(call=AsyncMock(return_value=[]))
     ledger = SimpleNamespace(items=empty_items)
-    fleet = Fleet(api, ledger, "dev")
+    fleet = Fleet(api, ledger, environment)
     fleet.shared_capacity = AsyncMock()
     await fleet._check_capacity(reserved.MODEL, "a" * 40)
+    # No shared Modal GPU pool: 9B Base has no Modal fallback in either environment.
     fleet.shared_capacity.before_launch.assert_not_awaited()
 
 

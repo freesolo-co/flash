@@ -268,11 +268,11 @@ def renew_hold(state, now):
     return state, None
 
 
-async def renew_reservation(ledger, *, clock=time.time):
-    """Extend the reservation's ``hold_until`` under the reservation scheduler's own tick lock.
+async def acquire_tick_lock(ledger, *, clock=time.time):
+    """The reservation scheduler's own ``tick_lock`` token, or None while another holder has it.
 
-    The scheduler rewrites its whole state each tick, so the lock keeps a renewal from being
-    overwritten by a concurrent tick; a busy lock just defers renewal to the next cycle.
+    The scheduler rewrites its whole state each tick, so holding the lock keeps a write to that
+    state from being overwritten by a concurrent tick. Release with ``release_tick_lock``.
     """
     token = uuid.uuid4().hex
     lock = {"token": token, "at": clock()}
@@ -288,7 +288,21 @@ async def renew_reservation(ledger, *, clock=time.time):
             await ledger.pop("tick_lock")
         if held is None or stale:
             acquired = await ledger.put_if_absent("tick_lock", lock)
-    if not acquired:
+    return token if acquired else None
+
+
+async def release_tick_lock(ledger, token):
+    if ((await ledger.get("tick_lock")) or {}).get("token") == token:
+        await ledger.pop("tick_lock")
+
+
+async def renew_reservation(ledger, *, clock=time.time):
+    """Extend the reservation's ``hold_until`` under the reservation scheduler's own tick lock.
+
+    A busy lock just defers renewal to the next cycle.
+    """
+    token = await acquire_tick_lock(ledger, clock=clock)
+    if token is None:
         state = await ledger.get("state")
         hold_until = (state or {}).get("hold_until")
         if (
@@ -311,8 +325,7 @@ async def renew_reservation(ledger, *, clock=time.time):
             print(f"reserved H100 {event}", flush=True)
         return event
     finally:
-        if ((await ledger.get("tick_lock")) or {}).get("token") == token:
-            await ledger.pop("tick_lock")
+        await release_tick_lock(ledger, token)
 
 
 async def each_slot(engines, model, slots, label, call):

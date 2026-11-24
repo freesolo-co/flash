@@ -62,7 +62,7 @@ class SharedCapacity:
         errors = []
         for model in lambda_models():
             if model == RESERVED_MODEL:
-                continue  # The reserved fleet is managed independently, with no Modal GPU fallback.
+                continue  # 9B Base is Lambda-only (reserved or lease pool): no Modal GPU fallback.
             try:
                 await self.reconcile_model(model, revision=self.revision if activating else None)
             except Exception as exc:
@@ -81,7 +81,7 @@ class SharedCapacity:
 
     async def reconcile_model(self, model, *, revision=None):
         if model == RESERVED_MODEL:
-            raise NoCapacityError("9B Base uses the separately managed reserved fleet")
+            raise NoCapacityError("9B Base is Lambda-only and has no shared Modal pool")
         revision = revision or (await self.serving_release())["revision"]
         policy = policy_for(model)
         primary, fallback = self.pools(model)

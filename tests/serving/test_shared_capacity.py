@@ -5,7 +5,12 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from flash.serving.app.inference_provider import lambda_models, policy_for
+from flash.serving.app.inference_provider import (
+    MODEL_POLICIES,
+    ModelPolicy,
+    lambda_models,
+    policy_for,
+)
 from flash.serving.lambda_cloud.config import NoCapacityError
 from flash.serving.lambda_cloud.pool_capacity import SharedCapacity, sequence_capacity
 
@@ -15,10 +20,13 @@ REVISION = "a" * 40
 
 @pytest.fixture(autouse=True)
 def exercise_dynamic_policy(monkeypatch):
-    # These tests exercise the general four-slot handoff algorithm. The production
-    # reserved-model exclusion is covered separately in test_reserved_h100.py.
+    # These tests exercise the general four-slot handoff algorithm with a two-GPU floor. The
+    # 9B Base Lambda-only exclusion is covered separately in test_reserved_h100.py.
     monkeypatch.setattr(
         "flash.serving.lambda_cloud.pool_capacity.RESERVED_MODEL", "reserved-test-only"
+    )
+    monkeypatch.setitem(
+        MODEL_POLICIES, MODEL, ModelPolicy(min_capacity=2, max_capacity=4, lambda_gpus=["H100"])
     )
 
 

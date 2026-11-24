@@ -168,9 +168,34 @@ def test_engine_exit_hook_awaits_shutdown(monkeypatch) -> None:
     assert app.modal.exit.called
 
 
+@pytest.fixture
+def reserved_on(monkeypatch):
+    """Reserved serving switched back on, as for a research sweep."""
+    from flash.serving.lambda_cloud import reserved
+
+    monkeypatch.setattr(reserved, "ENABLED", True)
+
+
+@pytest.mark.parametrize("environment", ["main", "", None])
+def test_main_9b_base_scales_to_zero_on_lambda_without_reserved_proxies(monkeypatch, environment):
+    _clear_deployment_environment(monkeypatch)
+    module = _import_modal_app(monkeypatch, is_local=False, environment=environment)
+    model = "Qwen/Qwen3.5-9B-Base"
+    assert module.RESERVED_ENGINES == ()
+    assert model in module.ENGINE_BY_MODEL
+    assert model not in module.MODAL_FALLBACK_BY_MODEL
+    proxies = [
+        c
+        for c in module.app.cls.call_args_list
+        if c.kwargs.get("max_containers") == 4 and c.kwargs.get("cpu") is not None
+    ]
+    assert proxies
+    assert all(c.kwargs["min_containers"] == 0 for c in proxies)
+
+
 @pytest.mark.parametrize("environment", ["main", "", None])
 def test_main_9b_base_has_fifteen_reserved_cpu_proxies_and_no_gpu_fallback(
-    monkeypatch, environment
+    monkeypatch, environment, reserved_on
 ):
     _clear_deployment_environment(monkeypatch)
     module = _import_modal_app(monkeypatch, is_local=False, environment=environment)
@@ -209,7 +234,9 @@ def test_reserved_requests_rotate_without_calling_capacity_service(monkeypatch):
 
 
 @pytest.mark.parametrize("environment", ["main", "dev"])
-def test_reserved_watchdog_is_scheduled_only_with_reserved_workers(monkeypatch, environment):
+def test_reserved_watchdog_is_scheduled_only_with_reserved_workers(
+    monkeypatch, environment, reserved_on
+):
     _clear_deployment_environment(monkeypatch)
     module = _import_modal_app(monkeypatch, is_local=False, environment=environment)
     secret_names = [c.args[0] for c in module.modal.Secret.from_name.call_args_list]
@@ -221,6 +248,7 @@ def test_reserved_watchdog_is_scheduled_only_with_reserved_workers(monkeypatch, 
     reserved_main = environment == "main"
     assert hasattr(module, "reserved_h100_watchdog") is reserved_main
     assert hasattr(module, "reserved_h100_expansion") is reserved_main
+    assert not hasattr(module, "reserved_h100_retire")
     # The watchdog and the expansion loop, each a single non-preemptible container.
     watchdog = scheduled[:1]
     assert len(scheduled) == (2 if reserved_main else 0)
@@ -232,8 +260,42 @@ def test_reserved_watchdog_is_scheduled_only_with_reserved_workers(monkeypatch, 
 
 
 @pytest.mark.parametrize("environment", ["main", "dev"])
+def test_retire_is_scheduled_only_in_main_while_reserved_serving_is_off(monkeypatch, environment):
+    _clear_deployment_environment(monkeypatch)
+    module = _import_modal_app(monkeypatch, is_local=False, environment=environment)
+    scheduled = [
+        call
+        for call in module.app.function.call_args_list
+        if call.kwargs.get("schedule") is not None and call.kwargs.get("cpu") == 0.25
+    ]
+    main = environment == "main"
+    assert not hasattr(module, "reserved_h100_watchdog")
+    assert not hasattr(module, "reserved_h100_expansion")
+    assert hasattr(module, "reserved_h100_retire") is main
+    assert len(scheduled) == int(main)
+    if main:
+        assert scheduled[0].kwargs["max_containers"] == 1
+        assert scheduled[0].kwargs["nonpreemptible"] is True
+        secret_names = [c.args[0] for c in module.modal.Secret.from_name.call_args_list]
+        assert module.reserved.SECRET_NAME in secret_names
+        assert module.reserved.RESERVATION_SECRET_NAME in secret_names
+
+
+@pytest.mark.parametrize("environment", ["main", "dev"])
+def test_start_all_warms_the_lease_pool_proxy_without_reserved_serving(monkeypatch, environment):
+    _clear_deployment_environment(monkeypatch)
+    module = _import_modal_app(monkeypatch, is_local=False, environment=environment)
+    model = module.reserved.MODEL
+    module.start_all(model)
+    names = [c.args[1] for c in module.modal.Cls.from_name.call_args_list]
+    assert names == [module.model_engine_name(model)]
+
+
+@pytest.mark.parametrize("environment", ["main", "dev"])
 @pytest.mark.parametrize("all_models", [False, True])
-def test_start_all_resolves_reserved_workers_only_in_main(monkeypatch, environment, all_models):
+def test_start_all_resolves_reserved_workers_only_in_main(
+    monkeypatch, environment, all_models, reserved_on
+):
     _clear_deployment_environment(monkeypatch)
     module = _import_modal_app(monkeypatch, is_local=False, environment=environment)
     model = module.reserved.MODEL

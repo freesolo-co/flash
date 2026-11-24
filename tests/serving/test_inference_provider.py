@@ -208,8 +208,9 @@ def test_shipping_policy_covers_catalog_and_requested_placement():
     }
     for model, config in policy.MODEL_POLICIES.items():
         if model in selected:
+            # 9B Base scales to zero: no idle floor without the reserved fleet.
             assert policy.capacity_for(model, "lambda") == (
-                (2, 4) if "9B-Base" in model else (1, 2)
+                (0, 4) if "9B-Base" in model else (1, 2)
             )
             assert placements(model) == selected[model]
         else:
