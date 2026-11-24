@@ -281,6 +281,18 @@ def _close_status_reporter_after_suite():
 
 
 @pytest.fixture(autouse=True)
+def _reserved_h100_decision(monkeypatch):
+    """Tests never look up the reserved workers secret: default to the reserved fleet being on.
+
+    Tests of the secret-absent mode set ``FLASH_RESERVED_H100_ACTIVE`` to "0" or unset it.
+    """
+    from flash.serving.lambda_cloud import reserved
+
+    monkeypatch.setenv(reserved.ACTIVE_ENV, "1")
+    monkeypatch.setattr(reserved, "_decisions", {})
+
+
+@pytest.fixture(autouse=True)
 def _private_plane_lease(monkeypatch, tmp_path):
     """Give each test its own control-plane lease.
 

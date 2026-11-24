@@ -4,6 +4,7 @@ import os
 
 import modal
 
+from . import reserved
 from .config import APP_NAME
 from .modal_control import register_control
 
@@ -21,6 +22,9 @@ secret = modal.Secret.from_dict(
         "LAMBDA_API_KEY": os.environ.get("LAMBDA_API_KEY", ""),
         "FLASH_LAMBDA_ENVIRONMENT": environment,
         "FREESOLO_DEPLOYMENT_SHA": os.environ.get("FREESOLO_DEPLOYMENT_SHA", ""),
+        # Same decision as the serving deploy: refuse on-demand GPUs only while the reserved
+        # slots serve those models.
+        **reserved.baked_env(environment),
     }
 )
 LambdaFleet, reap_lambda_workers = register_control(app, secret, image, __name__)

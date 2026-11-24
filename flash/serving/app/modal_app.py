@@ -226,6 +226,11 @@ runtime_secrets = [runtime_secret] if runtime_secret is not None else []
 engine_secret = _engine_secret()
 engine_secrets = [engine_secret] if engine_secret is not None else []
 
+# Reserved serving is decided once here and baked into every image (see reserved.active).
+from flash.serving.lambda_cloud import reserved, reserved_watchdog  # noqa: E402
+
+_reserved_env = reserved.baked_env(MODAL_ENVIRONMENT)
+
 image = (
     # cuda 13, not 12.8: `serve-runtime` below pins vllm 0.23.0, which requires torch 2.11.0, whose
     # linux wheels depend on the -cu13 nvidia packages -- and vllm's own `_C` extension links
@@ -306,6 +311,8 @@ image = (
             # leaves moe_backend unset/auto and lets vLLM select a working FP8-MoE backend; this
             # MoE-only env keeps the image away from the DeepGEMM path that previously crash-looped.
             "VLLM_MOE_USE_DEEP_GEMM": "0",
+            # This deploy's reserved-serving decision, for the router's routing and health.
+            **_reserved_env,
         }
     )
     # Ship the package under its REAL import path. This used to be
@@ -329,7 +336,6 @@ from flash.serving.app.inference_provider import (  # noqa: E402
     modal_gpus_for,
 )
 from flash.serving.app.modal_engine import HostedModalEngine  # noqa: E402
-from flash.serving.lambda_cloud import reserved, reserved_watchdog  # noqa: E402
 from flash.serving.lambda_cloud.proxy import LambdaEngineProxy  # noqa: E402
 from flash.serving.src.engine.lora_engine import _LoraEngineImpl  # noqa: E402, F401
 
@@ -337,6 +343,7 @@ lambda_controller_image = (
     modal.Image.debian_slim(python_version="3.12")
     .apt_install("openssl")
     .pip_install("httpx>=0.27", "modal==1.6.2")
+    .env(_reserved_env)
     .add_local_python_source("flash")
 )
 lambda_proxy_secrets = [
@@ -974,16 +981,7 @@ def start_all(base_model: str | None = None) -> None:
     failures: list[str] = []
     models = [base_model] if base_model else list(base_models())
     for bm in models:
-        names = (
-            [
-                model_engine_name(bm) + f"_ReservedH100{slot}"
-                for slot in reserved_watchdog.configured_slots()
-                if reserved.model_for(slot) == bm
-            ]
-            if reserved.enabled(bm, MODAL_ENVIRONMENT)
-            else [model_engine_name(bm)]
-        )
-        for name in names:
+        for name in reserved_watchdog.warm_names(bm, MODAL_ENVIRONMENT, model_engine_name(bm)):
             instance = modal.Cls.from_name(APP_NAME, name)(base_model=bm)
             started[name] = instance.health.spawn()
     for bm, handle in started.items():
