@@ -111,6 +111,12 @@ class Fleet:
         return {"id": ids[0], "status": "booting"}
 
     async def _check_capacity(self, model, revision):
+        from .reserved import enabled as reserved_enabled
+
+        if reserved_enabled(model, self.environment):
+            raise NoCapacityError(
+                f"{model} is served by reserved H100s; automatic GPU allocation is disabled"
+            )
         # Modal normally enforces this. Include uncertain/orphan launches so a
         # replacement CPU replica cannot silently exceed its GPU budget.
         instances = await self.api.call("GET", "instances")

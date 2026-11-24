@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
+import asyncio
 import importlib
 import sys
 from typing import Any
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -177,12 +178,64 @@ def test_9b_base_uses_the_lease_pool_with_modal_fallback_and_no_dedicated_fleet(
     model = "Qwen/Qwen3.5-9B-Base"
     assert issubclass(module.ENGINE_BY_MODEL[model], module.LambdaEngineProxy)
     assert model in module.MODAL_FALLBACK_BY_MODEL
-    # Serving deploys reference no per-fleet Modal Secret and schedule no fleet maintenance.
+    assert model not in module.reserved.MODELS
+    # Only main declares the reserved 27B / 0.8B Base fleet: its secret and its watchdog.
+    main = environment != "dev"
     secret_names = {c.args[0] for c in module.modal.Secret.from_name.call_args_list if c.args}
-    assert not any("h100" in name for name in secret_names)
+    assert {n for n in secret_names if "h100" in n} == (
+        {module.reserved.SECRET_NAME} if main else set()
+    )
     scheduled = [
         call
         for call in module.app.function.call_args_list
         if call.kwargs.get("schedule") is not None and call.kwargs.get("cpu") == 0.25
     ]
-    assert scheduled == []
+    assert len(scheduled) == int(main)
+    assert all(c.kwargs["max_containers"] == 1 for c in scheduled)
+
+
+@pytest.mark.parametrize("environment", ["main", "", "dev"])
+def test_main_serves_27b_and_08b_base_only_from_eight_reserved_slots(monkeypatch, environment):
+    _clear_deployment_environment(monkeypatch)
+    module = _import_modal_app(monkeypatch, is_local=False, environment=environment)
+    large, drafter = "Qwen/Qwen3.8-27B", "Qwen/Qwen3.5-0.8B-Base"
+    if environment == "dev":
+        assert module.RESERVED_ENGINES == ()
+        assert {large, drafter} <= set(module.ENGINE_BY_MODEL)
+        assert {large, drafter} <= set(module.MODAL_FALLBACK_BY_MODEL)
+        return
+    engines = module.RESERVED_ENGINES
+    assert [cls.reserved_slot for cls in engines] == list(range(1, 9))
+    assert [cls.__name__ for cls in engines] == [
+        module.model_engine_name(large if slot <= 5 else drafter) + f"_ReservedH100{slot}"
+        for slot in range(1, 9)
+    ]
+    assert all(issubclass(cls, module.reserved.ReservedLambdaEngineProxy) for cls in engines)
+    assert all(cls.pinned_gpu is None for cls in engines)
+    for model in (large, drafter):
+        assert model not in module.ENGINE_BY_MODEL
+        assert model not in module.MODAL_FALLBACK_BY_MODEL
+
+
+def test_reserved_requests_rotate_within_their_models_slots(monkeypatch):
+    from types import SimpleNamespace
+
+    _clear_deployment_environment(monkeypatch)
+    module = _import_modal_app(monkeypatch, is_local=False, environment="main")
+    pool = module._ModalEnginePool.__new__(module._ModalEnginePool)
+    pool._provider_selection = SimpleNamespace(choose=AsyncMock())
+    monkeypatch.setattr(
+        module,
+        "RESERVED_ENGINES",
+        tuple(lambda *, base_model, slot=i + 1: (slot, base_model) for i in range(8)),
+    )
+    pool._reserved_health = module.reserved_watchdog.HealthView(
+        SimpleNamespace(get=AsyncMock(return_value=None)), module.reserved.SLOT_MODELS
+    )
+
+    async def picks(model, n):
+        return [(await pool._engine_for(model))[0] for _ in range(n)]
+
+    assert asyncio.run(picks("Qwen/Qwen3.8-27B", 6)) == [1, 2, 3, 4, 5, 1]
+    assert asyncio.run(picks("Qwen/Qwen3.5-0.8B-Base", 4)) == [6, 7, 8, 6]
+    pool._provider_selection.choose.assert_not_awaited()

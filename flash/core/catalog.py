@@ -28,6 +28,7 @@ _IMAGE_TRAINING_MODELS = frozenset(
 TOOL_CALLING_MODELS = frozenset(
     {
         "Qwen/Qwen3.5-0.8B",
+        "Qwen/Qwen3.5-0.8B-Base",
         "Qwen/Qwen3.5-4B",
         "Qwen/Qwen3.5-9B",
         "Qwen/Qwen3.5-9B-Base",
@@ -231,6 +232,7 @@ DEFAULT_MODEL = "Qwen/Qwen3.5-9B"
 # a separate allowlist in flash.serving.src.engine.model_config.
 SERVING_MODEL_REPOS: dict[str, str] = {
     "Qwen/Qwen3.5-0.8B": "Qwen/Qwen3.5-0.8B",
+    "Qwen/Qwen3.5-0.8B-Base": "Qwen/Qwen3.5-0.8B-Base",
     "Qwen/Qwen3.5-4B": "Qwen/Qwen3.5-4B",
     "Qwen/Qwen3.5-9B": "Freesolo-Co/Qwen3.5-9B-FP8",
     "Qwen/Qwen3.5-9B-Base": "Qwen/Qwen3.5-9B-Base",
@@ -572,6 +574,20 @@ MODELS["Qwen/Qwen3.5-9B-Base"] = replace(
     "tokenizer, not the post-trained 9B. Native chat/thinking formatting is available for "
     "fine-tuning; instruction following and reasoning are not post-trained. Hosted FP8 serving "
     "on H100; customer-owned BF16 serving on H100.",
+)
+
+
+# Same architecture and native chat template as the post-trained 0.8B, with distinct weights,
+# document-level EOS metadata and adapter identity.
+MODELS["Qwen/Qwen3.5-0.8B-Base"] = replace(
+    MODELS["Qwen/Qwen3.5-0.8B"],
+    id="Qwen/Qwen3.5-0.8B-Base",
+    display_name="Qwen3.5 0.8B Base (pretrained)",
+    managed_revision="dc7cdfe2ee4154fa7e30f5b51ca41bfa40174e68",
+    serving=replace(MODELS["Qwen/Qwen3.5-0.8B"].serving, serve_model_id="Qwen/Qwen3.5-0.8B-Base"),
+    notes="Pretrained-only Qwen3.5 0.8B; text-only BF16 LoRA SFT/GRPO. Uses its own weights "
+    "and tokenizer, not the post-trained 0.8B; instruction following is not post-trained. "
+    "Hosted serving uses L4; no thinking mode.",
 )
 
 

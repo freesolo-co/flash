@@ -193,6 +193,9 @@ _PROFILES: dict[str, ServingProfile] = {
     "Qwen/Qwen3.5-0.8B": _small_qwen_profile(
         "Qwen/Qwen3.5-0.8B", "2fc06364715b967f1860aea9cf38778875588b17", "L40S"
     ),
+    "Qwen/Qwen3.5-0.8B-Base": _small_qwen_profile(
+        "Qwen/Qwen3.5-0.8B-Base", "dc7cdfe2ee4154fa7e30f5b51ca41bfa40174e68", "L40S"
+    ),
     "Qwen/Qwen3.5-4B": _small_qwen_profile(
         "Qwen/Qwen3.5-4B", "851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a", "H100"
     ),

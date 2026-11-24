@@ -329,6 +329,7 @@ from flash.serving.app.inference_provider import (  # noqa: E402
     modal_gpus_for,
 )
 from flash.serving.app.modal_engine import HostedModalEngine  # noqa: E402
+from flash.serving.lambda_cloud import reserved, reserved_watchdog  # noqa: E402
 from flash.serving.lambda_cloud.proxy import LambdaEngineProxy  # noqa: E402
 from flash.serving.src.engine.lora_engine import _LoraEngineImpl  # noqa: E402, F401
 
@@ -381,12 +382,16 @@ def _build_engine(
     target_inputs: int,
     provider: str = "lambda",
     max_capacity: int = 2,
+    reserved_slot: int = 0,
 ) -> Any:
     """Register a Modal GPU engine or Lambda CPU proxy under a stable model name.
 
     Set the class identity before decorators so Modal can re-import it remotely.
     """
-    implementation = HostedModalEngine if provider == "modal" else LambdaEngineProxy
+    implementation = {
+        "modal": HostedModalEngine,
+        "reserved": reserved.ReservedLambdaEngineProxy,
+    }.get(provider, LambdaEngineProxy)
 
     class _Engine(implementation):
         base_model: str = modal.parameter()
@@ -461,6 +466,7 @@ def _build_engine(
 
     # Lambda reports actual hardware remotely; Modal is pinned by its decorator.
     _Engine.pinned_gpu = gpu if provider == "modal" else None
+    _Engine.reserved_slot = reserved_slot
     # Modal must see the final module-level identity before decoration.
     _Engine.__name__ = class_name
     _Engine.__qualname__ = class_name
@@ -480,7 +486,11 @@ def _build_engine(
             "cpu": PROXY_CPU,
             "memory": 2048,
             "nonpreemptible": True,  # Modal supports this only for CPU workloads.
-            "secrets": lambda_proxy_secrets,
+            "secrets": (
+                [modal.Secret.from_name(reserved.SECRET_NAME)]
+                if provider == "reserved"
+                else lambda_proxy_secrets
+            ),
         }
     )
     engine = app.cls(
@@ -509,10 +519,39 @@ def _configured_engine(model, provider, suffix=""):
     )
 
 
-ENGINE_BY_MODEL: dict[str, Any] = {bm: _configured_engine(bm, "lambda") for bm in base_models()}
-MODAL_FALLBACK_BY_MODEL: dict[str, Any] = {
-    bm: _configured_engine(bm, "modal", "_ModalGPU") for bm in base_models()
+# In main the reserved models (27B, 0.8B Base) are served only by reserved H100 slots.
+ENGINE_BY_MODEL: dict[str, Any] = {
+    bm: _configured_engine(bm, "lambda")
+    for bm in base_models()
+    if not reserved.enabled(bm, MODAL_ENVIRONMENT)
 }
+MODAL_FALLBACK_BY_MODEL: dict[str, Any] = {
+    bm: _configured_engine(bm, "modal", "_ModalGPU")
+    for bm in base_models()
+    if not reserved.enabled(bm, MODAL_ENVIRONMENT)
+}
+# Indexed by slot - 1; each slot's proxy carries its own model's name and concurrency.
+RESERVED_ENGINES = (
+    tuple(
+        _build_engine(
+            "H100",
+            model_engine_name(model) + f"_ReservedH100{slot}",
+            *_engine_concurrency(model),
+            provider="reserved",
+            max_capacity=1,
+            reserved_slot=slot,
+        )
+        for slot, model in reserved.SLOT_MODELS.items()
+    )
+    if reserved.enabled(reserved.LARGE_MODEL, MODAL_ENVIRONMENT)
+    else ()
+)
+if RESERVED_ENGINES:
+    reserved_watchdog.register_watchdog(app, lambda_controller_image, __name__)
+
+
+def _reserved(model: str) -> bool:
+    return bool(RESERVED_ENGINES) and reserved.enabled(model, MODAL_ENVIRONMENT)
 
 
 def _engine_cls_for(base_model: str) -> Any:
@@ -531,8 +570,17 @@ class _ModalEnginePool:
         from flash.serving.app.provider_selection import bind_lambda_control
 
         self._fleet, self._provider_selection = bind_lambda_control()
+        # Watchdog-quarantined reserved workers are skipped for routing and registration.
+        self._reserved_health = reserved_watchdog.HealthView.for_engines(RESERVED_ENGINES)
+
+    async def _each_reserved(self, model, label, call):
+        slots = await self._reserved_health.usable(model)
+        await reserved_watchdog.each_slot(RESERVED_ENGINES, model, slots, label, call)
 
     async def _engine_for(self, model):
+        if _reserved(model):
+            slot = await self._reserved_health.next_slot(model)
+            return RESERVED_ENGINES[slot - 1](base_model=model)
         if (
             model in MODAL_FALLBACK_BY_MODEL
             and await self._provider_selection.choose(model) == "modal"
@@ -627,6 +675,15 @@ class _ModalEnginePool:
                 await close()
 
     async def register(self, base_model: str, record: Any) -> None:
+        if _reserved(base_model):
+            payload = self._record_payload(record)
+            generation = getattr(record, "deployment_generation", None)
+            await self._each_reserved(
+                base_model,
+                "register",
+                lambda engine: engine.register.remote.aio(payload, generation),
+            )
+            return
         engine = await self._engine_for(base_model)
         await engine.register.remote.aio(
             self._record_payload(record),
@@ -640,6 +697,13 @@ class _ModalEnginePool:
         model_id: str,
         expected_generation: str | None = None,
     ) -> None:
+        if _reserved(base_model):
+            await self._each_reserved(
+                base_model,
+                "unregister",
+                lambda engine: engine.unregister.remote.aio(org_id, model_id, expected_generation),
+            )
+            return
         if base_model in MODAL_FALLBACK_BY_MODEL:
             from flash.serving.app.provider_selection import unregister_active
 
@@ -910,9 +974,18 @@ def start_all(base_model: str | None = None) -> None:
     failures: list[str] = []
     models = [base_model] if base_model else list(base_models())
     for bm in models:
-        engine = modal.Cls.from_name(APP_NAME, model_engine_name(bm))
-        instance = engine(base_model=bm)
-        started[bm] = instance.health.spawn()
+        names = (
+            [
+                model_engine_name(bm) + f"_ReservedH100{slot}"
+                for slot in reserved_watchdog.configured_slots()
+                if reserved.model_for(slot) == bm
+            ]
+            if reserved.enabled(bm, MODAL_ENVIRONMENT)
+            else [model_engine_name(bm)]
+        )
+        for name in names:
+            instance = modal.Cls.from_name(APP_NAME, name)(base_model=bm)
+            started[name] = instance.health.spawn()
     for bm, handle in started.items():
         try:
             print(f"started {bm}: {handle.get(timeout=1800)}", flush=True)

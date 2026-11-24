@@ -48,6 +48,9 @@ from flash.serving.src.engine.prequant_config import (
 # NOTE: every new tier/shape needs a one-time real-GPU cold-boot smoke test with the serving canary.
 # Training GPU validation is separate; this file is only the serving vLLM engine matrix.
 
+# Small dense checkpoints serve their own BF16 weights; online FP8 is applied per GPU.
+SMALL_QWEN_MODELS = frozenset({"Qwen/Qwen3.5-0.8B", "Qwen/Qwen3.5-0.8B-Base", "Qwen/Qwen3.5-4B"})
+
 SERVING_MODELS: list[dict[str, Any]] = [
     {
         "base_model": "Qwen/Qwen3.5-0.8B",
@@ -65,6 +68,26 @@ SERVING_MODELS: list[dict[str, Any]] = [
             "max_lora_rank": 64,
             "max_model_len": 262144,
             # L4 sweep: 64 sequences improve short/4k throughput ~3x/~1.6x over eight.
+            "max_num_seqs": 64,
+            "enforce_eager": False,
+            "reasoning_parser": "qwen3",
+        },
+    },
+    {
+        "base_model": "Qwen/Qwen3.5-0.8B-Base",
+        "image_input_limit": None,
+        "gpu": "L4",
+        "engine": {
+            "serve_model_id": "Qwen/Qwen3.5-0.8B-Base",
+            "model_revision": "dc7cdfe2ee4154fa7e30f5b51ca41bfa40174e68",
+            "tokenizer_revision": "dc7cdfe2ee4154fa7e30f5b51ca41bfa40174e68",
+            "processor_revision": "dc7cdfe2ee4154fa7e30f5b51ca41bfa40174e68",
+            "quantization": None,
+            "gpu_memory_utilization": 0.90,
+            "max_loras": 4,
+            "max_cpu_loras": 4,
+            "max_lora_rank": 64,
+            "max_model_len": 262144,
             "max_num_seqs": 64,
             "enforce_eager": False,
             "reasoning_parser": "qwen3",
@@ -260,7 +283,7 @@ def gpu_for(base_model: str) -> str:
 def serve_model_for(base_model: str) -> str:
     """return the pre-quantized checkpoint an active hosted engine loads."""
     _config_for(base_model)
-    if base_model in {"Qwen/Qwen3.5-0.8B", "Qwen/Qwen3.5-4B"}:
+    if base_model in SMALL_QWEN_MODELS:
         return base_model
     if base_model == DEEPSEEK_MODEL_ID:
         return DEEPSEEK_MODEL_ID

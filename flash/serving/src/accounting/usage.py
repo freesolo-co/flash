@@ -33,6 +33,8 @@ FREESOLO_PRICING_VERSION = "2026-08-27.1"
 _FREESOLO_USD_PER_MTOK: dict[str, tuple[str, str, str]] = {
     # Restore the prior final customer rates (the old catalog applied 1.2 markup).
     "Qwen/Qwen3.5-0.8B": ("0.012", "0.06", "0.0024"),
+    # Pretrained 0.8B uses the same customer token rates as post-trained 0.8B.
+    "Qwen/Qwen3.5-0.8B-Base": ("0.012", "0.06", "0.0024"),
     "Qwen/Qwen3.5-4B": ("0.036", "0.18", "0.0072"),
     "deepseek-ai/DeepSeek-V4.1-Flash-1017": ("0.15", "0.60", "0.003"),
     "Qwen/Qwen3.5-9B": ("0.095", "0.1425", "0.0276"),
