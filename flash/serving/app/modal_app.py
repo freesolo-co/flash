@@ -331,12 +331,7 @@ from flash.serving.app.inference_provider import (  # noqa: E402
     modal_gpus_for,
 )
 from flash.serving.app.modal_engine import HostedModalEngine  # noqa: E402
-from flash.serving.lambda_cloud import (  # noqa: E402
-    reserved,
-    reserved_expansion,
-    reserved_retire,
-    reserved_watchdog,
-)
+from flash.serving.lambda_cloud import reserved, reserved_expansion, reserved_watchdog  # noqa: E402
 from flash.serving.lambda_cloud.proxy import LambdaEngineProxy  # noqa: E402
 from flash.serving.src.engine.lora_engine import _LoraEngineImpl  # noqa: E402, F401
 
@@ -556,6 +551,8 @@ if RESERVED_ENGINES:
     )
 elif MODAL_ENVIRONMENT == "main":
     # Reserved serving is off: release the previous reserved fleet after routing has drained.
+    from flash.serving.lambda_cloud import reserved_retire
+
     reserved_retire.register_retire(app, lambda_controller_image, lambda_proxy_secrets, __name__)
 
 MODAL_FALLBACK_BY_MODEL: dict[str, Any] = {
