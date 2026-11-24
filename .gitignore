@@ -50,6 +50,3 @@ uv-cache/
 # hostname that scrub removes. Committing it would republish exactly what the scrub
 # exists to delete, so it must stay untracked.
 scripts/scrub_identities.env
-
-# reserved H100 scheduler: real config holds the operator notification target
-/deploy/reserved-h100/config.json

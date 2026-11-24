@@ -41,6 +41,8 @@ class ModelPolicy:
 # starting another. lambda_gpus is an allowlist: use the cheapest available offer.
 MODEL_POLICIES = {
     "Qwen/Qwen3.5-0.8B": ModelPolicy(min_capacity=1, max_capacity=2),
+    # Main serves 0.8B Base (and the 27B) from reserved H100 slots; this policy covers dev.
+    "Qwen/Qwen3.5-0.8B-Base": ModelPolicy(min_capacity=0, max_capacity=2),
     "Qwen/Qwen3.5-4B": ModelPolicy(min_capacity=0, max_capacity=2),
     "Qwen/Qwen3.5-9B": ModelPolicy(min_capacity=0, max_capacity=2),
     "Qwen/Qwen3.5-9B-Base": ModelPolicy(
@@ -96,7 +98,7 @@ def modal_gpus_for(model):
         raise ValueError("Provider policy is only defined for hosted Qwen")
     if model == "Qwen/Qwen3.6-35B-A3B":
         return ["H200"]
-    if model == "Qwen/Qwen3.5-0.8B":
+    if model in {"Qwen/Qwen3.5-0.8B", "Qwen/Qwen3.5-0.8B-Base"}:
         return ["A10G", "A100-80GB"]
     if model == "Qwen/Qwen3.5-4B":
         return ["A10G", "L40S", "A100-80GB"]

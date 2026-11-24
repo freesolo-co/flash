@@ -282,6 +282,7 @@ def test_geometry_cap_follows_each_models_own_head_count():
     }
     assert derived_wrong == {
         "Qwen/Qwen3.5-0.8B",
+        "Qwen/Qwen3.5-0.8B-Base",
         "Qwen/Qwen3.5-4B",
         "Qwen/Qwen3.8-27B",
         "Qwen/Qwen3.6-35B-A3B",

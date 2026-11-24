@@ -178,7 +178,7 @@ class BlobArtifacts:
         target.parent.mkdir(parents=True, exist_ok=True)
         # Never replace an identical file. The destination can be a cache shared by several
         # hosts, and replacing a file another host has memory-mapped makes that host's next page
-        # fault raise SIGBUS (vLLM EngineCores on reserved workers died this way, 2026-11-20).
+        # fault raise SIGBUS (vLLM EngineCores on Lambda workers died this way, 2026-11-20).
         if _is_entry(target, entry):
             return str(target)
         fd, temporary = tempfile.mkstemp(prefix=".artifact-", dir=target.parent)

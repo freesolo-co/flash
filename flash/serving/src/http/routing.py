@@ -11,8 +11,8 @@ from typing import Any, Protocol
 
 from flash.schema import parse_checkpoint_ref
 from flash.serving.app.inference_provider import modal_gpus_for, policy_for
+from flash.serving.lambda_cloud import reserved
 from flash.serving.lambda_cloud.config import placements
-from flash.serving.lambda_cloud.reserved import MODEL as RESERVED_MODEL
 from flash.serving.src.engine.model_config import (
     gpu_for,
     is_supported_base_model,
@@ -130,12 +130,14 @@ def health_body(
         else gpu_for(m)
         for m in supported_models
     }
-    if RESERVED_MODEL in gpu_by_model:
-        gpu_by_model[RESERVED_MODEL] = (
-            " | ".join(placements(RESERVED_MODEL))
-            if os.environ.get("SERVING_DEPLOYMENT_MODE") == "development"
-            else "H100"
-        )
+    # Production serves the reserved models only from their reserved H100 slots.
+    reserved_models = (
+        set()
+        if os.environ.get("SERVING_DEPLOYMENT_MODE") == "development"
+        else set(reserved.MODELS) & set(gpu_by_model)
+    )
+    for m in reserved_models:
+        gpu_by_model[m] = "H100"
     providers = {m: "lambda" if m.startswith("Qwen/") else "modal" for m in supported_models}
     primary_providers = set(providers.values())
     body = {
@@ -145,11 +147,15 @@ def health_body(
         else "mixed",
         "provider_by_model": providers,
         "fallback_provider_by_model": {
-            m: "modal" for m in supported_models if m.startswith("Qwen/") and m != RESERVED_MODEL
+            m: "modal"
+            for m in supported_models
+            if m.startswith("Qwen/") and m not in reserved_models
         },
         "capacity_by_model": {
             m: {
-                "min": 4 if m == RESERVED_MODEL else policy_for(m).min_capacity,
+                "min": len(reserved.slots_for(m))
+                if m in reserved_models
+                else policy_for(m).min_capacity,
                 "max": policy_for(m).max_capacity,
                 "dev_min": 0,
                 "dev_max": policy_for(m).dev_max_capacity,
