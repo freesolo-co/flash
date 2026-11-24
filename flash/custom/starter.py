@@ -2,6 +2,10 @@
 
 Run: flash train run.toml
 Install local loss dependencies: pip install 'freesolo-flash[custom]'
+No torch? Use forward_backward_custom(data, loss_fn, gradients=True): loss_fn gets plain
+float lists and returns (loss, metrics, dloss_dlogprobs), one list per row shaped like its
+logprobs. forward_backward(data) minimizes -sum(weights * logprobs), so weights =
+-dL/dlogprob train any loss built from token logprobs.
 Async is the default. For blocking calls, use def main(client), remove await, and
 replace asyncio.to_thread(file_operation, ...) with file_operation(...).
 To score only an answer position, give Datum target_positions (and target_tokens for option
