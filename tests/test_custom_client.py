@@ -121,6 +121,119 @@ def test_custom_api_imports_without_any_site_packages():
     assert result.returncode == 0, result.stderr
 
 
+class ScoringHTTP:
+    """Answers forward with fixed logprobs and records the forward_backward weights."""
+
+    def __init__(self, logprobs):
+        self.logprobs = logprobs
+        self.sent = []
+        self.sequence = 0
+
+    def _request(self, method, path, body=None, **kwargs):
+        state = {"session_id": "session", "sequence": self.sequence, "model_version": 0}
+        if method == "GET":
+            return state
+        self.sequence = state["sequence"] = body["sequence"]
+        self.sent.append(body)
+        if body["operation"] == "forward":
+            return {**state, "outputs": [{"logprobs": row} for row in self.logprobs]}
+        return {**state, "metrics": body["arguments"]["metrics"]}
+
+
+# a pairwise margin loss over completion logprobs, with dL/dlogprob written out by hand.
+_MANUAL_GRADIENT_SCRIPT = """
+import sys
+from flash.custom import Datum, TrainingClient
+import flash.custom.client as module
+
+class HTTP:
+    sequence = 0
+    sent = []
+    def _request(self, method, path, body=None, **kwargs):
+        state = {"session_id": "s", "sequence": self.sequence, "model_version": 0}
+        if method == "GET":
+            return state
+        self.sequence = state["sequence"] = body["sequence"]
+        self.sent.append(body)
+        if body["operation"] == "forward":
+            return {**state, "outputs": [{"logprobs": [-0.5, -1.0]}, {"logprobs": [-2.0, -0.25]}]}
+        return {**state, "metrics": body["arguments"]["metrics"]}
+
+http = HTTP()
+module.ApiClient = lambda *args, **kwargs: http
+client = TrainingClient("http://localhost", api_key="k")
+
+def loss_fn(data, logprobs):
+    margin = sum(logprobs[0]) - sum(logprobs[1])
+    return -margin, {"margin": margin}, [[-1.0] * 2, [1.0] * 2]
+
+result = client.forward_backward_custom(
+    [Datum([1, 2, 3]), Datum([1, 4, 5])], loss_fn, gradients=True
+)
+assert "torch" not in sys.modules, "torch was imported"
+weights = [row["weights"] for row in http.sent[-1]["arguments"]["data"]]
+assert weights == [[1.0, 1.0], [-1.0, -1.0]], weights
+assert result["metrics"]["custom_loss"] == -0.75, result
+"""
+
+
+def test_manual_gradients_train_without_torch_installed():
+    result = subprocess.run(
+        [sys.executable, "-S", "-c", _MANUAL_GRADIENT_SCRIPT],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+
+
+def test_manual_gradients_keep_target_matrix_shape_and_none_rows(monkeypatch):
+    http = ScoringHTTP([[[-0.1, -2.0], [-0.3, -1.5]], [-0.2, -0.4]])
+    monkeypatch.setattr("flash.custom.client.ApiClient", lambda *args, **kwargs: http)
+    client = TrainingClient("http://localhost", api_key="k")
+    data = [Datum([1, 2, 3], target_tokens=[[2, 4], [3, 5]]), Datum([1, 4, 5])]
+
+    def loss_fn(rows, logprobs):
+        logprobs[0][0][0] = 99.0  # mutating the copy never changes the shape reference.
+        return 0.5, {}, [[[0.25, -0.5], [0.0, 1.0]], None]
+
+    client.forward_backward_custom(data, loss_fn, gradients=True)
+    sent = http.sent[-1]["arguments"]["data"]
+    assert sent[0]["weights"] == [[-0.25, 0.5], [-0.0, -1.0]]
+    assert sent[1]["weights"] == [0.0, 0.0]
+    assert sent[0]["target_tokens"] == [[2, 4], [3, 5]]
+
+
+@pytest.mark.parametrize(
+    ("result", "message"),
+    [
+        ((0.5, {}), "must return"),
+        ((float("nan"), {}, [[0.0, 0.0]]), "finite number"),
+        ((0.5, [], [[0.0, 0.0]]), "JSON dictionary"),
+        ((0.5, {}, []), "one entry per datum"),
+        ((0.5, {}, [[0.0]]), "must have 2 entries"),
+        ((0.5, {}, [[0.0, float("inf")]]), "non-finite"),
+    ],
+)
+def test_bad_manual_gradients_never_reach_the_gpu(monkeypatch, result, message):
+    http = ScoringHTTP([[-0.1, -0.2]])
+    monkeypatch.setattr("flash.custom.client.ApiClient", lambda *args, **kwargs: http)
+    client = TrainingClient("http://localhost", api_key="k")
+    with pytest.raises(ValueError, match=message):
+        client.forward_backward_custom([Datum([1, 2, 3])], lambda *_: result, gradients=True)
+    assert [body["operation"] for body in http.sent] == ["forward"]
+
+
+def test_missing_torch_points_at_the_torch_free_mode(monkeypatch):
+    http = ScoringHTTP([[-0.1, -0.2]])
+    monkeypatch.setattr("flash.custom.client.ApiClient", lambda *args, **kwargs: http)
+    monkeypatch.setitem(sys.modules, "torch", None)
+    client = TrainingClient("http://localhost", api_key="k")
+    with pytest.raises(ImportError, match="gradients=True"):
+        client.forward_backward_custom([Datum([1, 2, 3])], lambda *_: None)
+    assert http.sent == []  # no GPU pass is spent before the missing dependency is reported.
+
+
 def test_scaffold_project_creates_normal_train_config_without_overwriting(tmp_path):
     from flash.cli.parsing.main import _build_parser
     from flash.schema import spec_and_train_keys_from_file
