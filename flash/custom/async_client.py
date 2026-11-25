@@ -60,8 +60,8 @@ class AsyncTrainingClient:
     async def forward_backward(self, data, **kwargs):
         return await self._call("forward_backward", data, **kwargs)
 
-    async def forward_backward_custom(self, data, loss_fn):
-        return await self._call("forward_backward_custom", data, loss_fn)
+    async def forward_backward_custom(self, data, loss_fn, **kwargs):
+        return await self._call("forward_backward_custom", data, loss_fn, **kwargs)
 
     async def optim_step(self, **kwargs):
         return await self._call("optim_step", **kwargs)

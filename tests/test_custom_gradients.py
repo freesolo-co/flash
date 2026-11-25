@@ -86,6 +86,28 @@ def test_two_pass_cross_sequence_loss_has_exact_direct_autograd_gradient(client_
     assert torch.count_nonzero(backend.model.projection.weight.grad[1]) == 0
 
 
+def test_manual_gradients_match_autograd_exactly(client_and_backend):
+    client, backend = client_and_backend
+    data = [Datum([1, 2, 3, 4]), Datum([1, 5, 6])]
+
+    def autograd_loss(rows, probs):
+        return (probs[0][1:].sum() - 2.0 * probs[1][-1]), {}
+
+    def manual_loss(rows, probs):
+        loss = sum(probs[0][1:]) - 2.0 * probs[1][-1]
+        return loss, {}, [[0.0, 1.0, 1.0], [0.0, -2.0]]
+
+    expected = client.forward_backward_custom(data, autograd_loss)
+    autograd_grad = backend.model.projection.weight.grad.clone()
+    client.zero_grad()
+    actual = client.forward_backward_custom(data, manual_loss, gradients=True)
+    # autograd sums in float32, the manual loss in float64.
+    assert actual["metrics"]["custom_loss"] == pytest.approx(
+        expected["metrics"]["custom_loss"], rel=1e-5
+    )
+    assert torch.allclose(backend.model.projection.weight.grad, autograd_grad, atol=1e-7)
+
+
 def _direct_log_softmax(model, tokens):
     return model(torch.tensor([tokens[:-1]])).logits[0].log_softmax(-1)
 

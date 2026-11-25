@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import math
+import numbers
 import threading
 from urllib.parse import urlsplit
 
@@ -45,6 +47,11 @@ class TrainingClient:
     * ``forward(data, top_k=0) -> {"outputs": [{"logprobs": [...], "top_logprobs": ...}]}``:
       one output per Datum; ``logprobs[i]`` scores ``tokens[i+1]``.
     * ``forward_backward(data) -> {"outputs": [...], "metrics": {"surrogate_loss": ...}}``.
+      It minimizes -sum(weights * logprobs), so weights = -dL/dlogprob trains any loss L
+      built from token logprobs (DPO, ranking, Brier, ...) without torch.
+    * ``forward_backward_custom(data, loss_fn, gradients=False)``: forward, then
+      forward_backward with loss_fn's -dL/dlogprob; torch autograd by default, or your
+      own dL/dlogprob lists with gradients=True (no torch needed).
     * ``optim_step(...) -> {"metrics": {"grad_norm", "learning_rate", ...}}``.
 
     Limits: at most ``max_batch`` rows (or ``num_samples``) per call, 2..max_context_tokens
@@ -180,24 +187,41 @@ class TrainingClient:
         return self._call("forward", data=[row.to_dict() for row in data], top_k=top_k)
 
     def forward_backward(self, data, *, metrics=None):
-        """Accumulate gradients of -sum(weights * logprobs), without stepping the optimizer."""
+        """Accumulate gradients of -sum(weights * logprobs), without stepping the optimizer.
+
+        Weights can be any -dL/dlogprob, so any loss built from token logprobs trains with no
+        torch: forward() to get logprobs, compute dL/dlogprob yourself, then call this with
+        weights = -dL/dlogprob (forward_backward_custom(..., gradients=True) does exactly
+        that). The gradient matches L's as long as the model version has not changed between
+        the two calls.
+        """
         return self._call(
             "forward_backward", data=[row.to_dict() for row in data], metrics=metrics or {}
         )
 
-    def forward_backward_custom(self, data, loss_fn):
+    def forward_backward_custom(self, data, loss_fn, *, gradients=False):
         """Evaluate loss_fn(data, logprobs) locally, then send its token derivatives.
 
-        loss_fn returns a scalar torch tensor and a JSON dictionary of metrics. No callable
-        or pickle is sent to the GPU. Both passes use the same model version and dropout-free
-        model. Cross-sequence objectives (DPO, PPO, ranking, etc.) are supported. Rows with a
-        [T, K] target_tokens matrix receive [T, K] logprobs, so soft-target losses such as KL
-        to a teacher's top-k read them directly. With target_positions, T is the number of
-        listed positions; flash.custom.losses.option_ce_brier_loss is one such loss over
-        option-token logprobs at an answer position.
-        """
-        import torch
+        Default (needs torch: pip install 'freesolo-flash[custom]'): logprobs is a list of
+        float32 tensors with requires_grad, and loss_fn returns (scalar loss tensor, metrics).
 
+        gradients=True (no torch needed): logprobs is a list of plain float lists, and loss_fn
+        returns (loss, metrics, dloss_dlogprobs). The loss is a finite number.
+        dloss_dlogprobs holds, per row, dL/dlogprob with that row's logprob shape (lists or
+        numpy arrays), or None for a row the loss ignores.
+
+        Either way the gradient pass is forward_backward with weights = -dL/dlogprob, because
+        forward_backward minimizes -sum(weights * logprobs). Calling forward then
+        forward_backward yourself with those weights is equivalent.
+
+        No callable or pickle is sent to the GPU. Both passes use the same model version and
+        dropout-free model. Cross-sequence objectives (DPO, PPO, ranking, etc.) are supported.
+        Rows with a [T, K] target_tokens matrix receive [T, K] logprobs, so soft-target losses
+        such as KL to a teacher's top-k read them directly. With target_positions, T is the
+        number of listed positions; flash.custom.losses.option_ce_brier_loss is one such loss
+        over option-token logprobs at an answer position.
+        """
+        torch = None if gradients else _require_torch()  # fail before spending a GPU pass.
         with self._lock:
             # Both passes must score identical targets even if loss_fn mutates the caller's data.
             snapshot = [
@@ -213,30 +237,16 @@ class TrainingClient:
                 )
                 for row in data
             ]
-            scored = self.forward(snapshot)
-            logprobs = [
-                torch.tensor(row["logprobs"], dtype=torch.float32, requires_grad=True)
-                for row in scored["outputs"]
+            scored = [row["logprobs"] for row in self.forward(snapshot)["outputs"]]
+            if gradients:
+                loss, metrics, weights = _manual_weights(loss_fn, data, scored)
+            else:
+                loss, metrics, weights = _autograd_weights(torch, loss_fn, data, scored)
+            weighted = [
+                Datum(row.tokens, weight, row.target_tokens, row.images, row.target_positions)
+                for row, weight in zip(snapshot, weights, strict=True)
             ]
-            loss, metrics = loss_fn(data, logprobs)
-            if not isinstance(loss, torch.Tensor) or loss.ndim != 0 or not torch.isfinite(loss):
-                raise ValueError("custom loss must return a finite scalar torch tensor")
-            if not isinstance(metrics, dict):
-                raise ValueError("custom loss metrics must be a JSON dictionary")
-            json.dumps(metrics, allow_nan=False)
-            gradients = torch.autograd.grad(loss, logprobs, allow_unused=True)
-            weights = []
-            for row, gradient, scores in zip(snapshot, gradients, logprobs, strict=True):
-                if gradient is None:
-                    weight = torch.zeros_like(scores).tolist()
-                else:
-                    if not torch.isfinite(gradient).all():
-                        raise ValueError("custom loss produced non-finite token gradients")
-                    weight = (-gradient).tolist()
-                weights.append(
-                    Datum(row.tokens, weight, row.target_tokens, row.images, row.target_positions)
-                )
-            return self.forward_backward(weights, metrics={**metrics, "custom_loss": loss.item()})
+            return self.forward_backward(weighted, metrics={**metrics, "custom_loss": loss})
 
     def optim_step(self, *, learning_rate, max_grad_norm=1.0, algorithm_state=None):
         extra = {"algorithm_state": algorithm_state} if algorithm_state is not None else {}
@@ -276,3 +286,92 @@ class TrainingClient:
                 warnings.warn(
                     f"custom session cleanup failed: {type(cleanup_error).__name__}", stacklevel=2
                 )
+
+
+def _check_metrics(metrics):
+    if not isinstance(metrics, dict):
+        raise ValueError("custom loss metrics must be a JSON dictionary")
+    json.dumps(metrics, allow_nan=False)
+
+
+def _require_torch():
+    try:
+        import torch
+    except ImportError as error:
+        raise ImportError(
+            "forward_backward_custom needs torch for autograd: pip install "
+            "'freesolo-flash[custom]', or pass gradients=True and return dL/dlogprob yourself"
+        ) from error
+    return torch
+
+
+def _autograd_weights(torch, loss_fn, data, scored):
+    logprobs = [torch.tensor(row, dtype=torch.float32, requires_grad=True) for row in scored]
+    loss, metrics = loss_fn(data, logprobs)
+    if not isinstance(loss, torch.Tensor) or loss.ndim != 0 or not torch.isfinite(loss):
+        raise ValueError("custom loss must return a finite scalar torch tensor")
+    _check_metrics(metrics)
+    derivatives = torch.autograd.grad(loss, logprobs, allow_unused=True)
+    weights = []
+    for derivative, scores in zip(derivatives, logprobs, strict=True):
+        if derivative is None:
+            weights.append(torch.zeros_like(scores).tolist())
+            continue
+        if not torch.isfinite(derivative).all():
+            raise ValueError("custom loss produced non-finite token gradients")
+        weights.append((-derivative).tolist())
+    return loss.item(), metrics, weights
+
+
+def _manual_weights(loss_fn, data, scored):
+    # loss_fn gets its own copy; shapes are checked against the server's untouched output.
+    result = loss_fn(data, json.loads(json.dumps(scored)))
+    if not isinstance(result, tuple) or len(result) != 3:
+        raise ValueError(
+            "with gradients=True, custom loss must return (loss, metrics, dloss_dlogprobs)"
+        )
+    loss, metrics, derivatives = result
+    if not _is_finite_number(loss):
+        raise ValueError("custom loss must return a finite number")
+    _check_metrics(metrics)
+    if hasattr(derivatives, "tolist") and not isinstance(derivatives, list | tuple):
+        derivatives = list(derivatives)
+    if not isinstance(derivatives, list | tuple) or len(derivatives) != len(scored):
+        raise ValueError("dloss_dlogprobs needs one entry per datum (None for an unused row)")
+    weights = [
+        _negate_like(derivative, scores, index)
+        for index, (derivative, scores) in enumerate(zip(derivatives, scored, strict=True))
+    ]
+    return float(loss), metrics, weights
+
+
+def _is_finite_number(value):
+    return isinstance(value, numbers.Real) and not isinstance(value, bool) and math.isfinite(value)
+
+
+def _negate_like(derivative, scores, index):
+    """-derivative as plain floats, required to match one row's logprob shape exactly."""
+    if derivative is None:
+        return [[0.0] * len(cell) if isinstance(cell, list) else 0.0 for cell in scores]
+    if hasattr(derivative, "tolist"):  # numpy arrays work; torch is never imported here.
+        derivative = derivative.tolist()
+    if not isinstance(derivative, list | tuple) or len(derivative) != len(scores):
+        raise ValueError(
+            f"dloss_dlogprobs[{index}] must have {len(scores)} entries, like its logprobs row"
+        )
+    weights = []
+    for cell, reference in zip(derivative, scores, strict=True):
+        if isinstance(reference, list):
+            if not isinstance(cell, list | tuple) or len(cell) != len(reference):
+                raise ValueError(
+                    f"dloss_dlogprobs[{index}] must have the [T, {len(reference)}] shape "
+                    "of its logprobs row"
+                )
+            if not all(_is_finite_number(value) for value in cell):
+                raise ValueError("custom loss produced non-finite token gradients")
+            weights.append([-float(value) for value in cell])
+        else:
+            if not _is_finite_number(cell):
+                raise ValueError("custom loss produced non-finite token gradients")
+            weights.append(-float(cell))
+    return weights
