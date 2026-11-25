@@ -137,9 +137,15 @@ def test_saturated_chat_sheds_excess_with_fast_429_while_status_answers(monkeypa
             try:
                 assert await asyncio.to_thread(entered.wait, 5)
                 async with asyncio.timeout(2):
-                    await anyio.wait_all_tasks_blocked()
-                    stats = app.state.chat_forwarding_limiter.statistics()
-                    assert (stats.borrowed_tokens, stats.tasks_waiting) == (4, 2)
+                    # the last queued request can still be in transport when the four slow
+                    # forwards block, so wait for the limiter itself to show the full queue.
+                    limiter = app.state.chat_forwarding_limiter
+                    while True:
+                        await anyio.wait_all_tasks_blocked()
+                        stats = limiter.statistics()
+                        if (stats.borrowed_tokens, stats.tasks_waiting) == (4, 2):
+                            break
+                        await asyncio.sleep(0.01)
                     shed = await client.post("/v1/runs/run/chat", json={"slow": True})
                     status = await client.get("/v1/me")
                 assert shed.status_code == 429
