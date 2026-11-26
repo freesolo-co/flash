@@ -207,13 +207,14 @@ def test_shipping_policy_covers_catalog_and_requested_placement():
         "Qwen/Qwen3.5-9B-Base": ("H100",),
     }
     for model, config in policy.MODEL_POLICIES.items():
+        # every model scales to zero when idle: no GPU floor in main or dev
+        assert config.min_capacity == 0
+        assert policy.minimum_for(model, "main") == 0
         if model in selected:
             assert policy.capacity_for(model, "lambda") == (
-                (2, 4) if "9B-Base" in model else (1, 2)
+                (0, 4) if "9B-Base" in model else (0, 2)
             )
             assert placements(model) == selected[model]
-        else:
-            assert config.min_capacity == 0
     with pytest.raises(ValueError, match="No serving"):
         policy.policy_for("typo")
 
