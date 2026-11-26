@@ -1,5 +1,7 @@
 # Reserved H100 serving
 
+> **Status (2026-11-25): retired.** The spec-decoding sweep that needed the 8-slot fleet is finished. The workers secret is deleted, main is redeployed with reserved serving OFF, and the 8 Lambda instances are terminated ("Retiring the fleet entirely" below). Every serving model now scales from 0 GPUs when idle, in main and dev. The reserved code path stays, switched off, so the fleet can be brought back with the runbook below.
+
 Serving code never launches or terminates reserved instances. This page is the **required operator procedure** for bringing the 8-slot fleet up, retiring the previous 15-slot 9B Base fleet, and owning the fleet afterwards.
 
 ## Fleet
@@ -9,7 +11,7 @@ Serving code never launches or terminates reserved instances. This page is the *
 | 1–5 | `Qwen/Qwen3.8-27B` | official FP8 checkpoint `Qwen/Qwen3.8-27B-FP8`, TP=1, one H100 80 GB each |
 | 6–8 | `Qwen/Qwen3.5-0.8B-Base` @ `dc7cdfe2ee4154fa7e30f5b51ca41bfa40174e68` | BF16, spec-decoding drafter |
 
-- **`Qwen/Qwen3.5-9B-Base` has no reserved slots.** It runs on the on-demand Lambda pool with its Modal GPU fallback, keeping an idle floor of 2 in main.
+- **`Qwen/Qwen3.5-9B-Base` has no reserved slots.** It runs on the on-demand Lambda pool with its Modal GPU fallback and scales from 0 when idle.
 - **Reserved serving is switched on by the workers secret.** `reserved.active(env)` is the single switch. It is on only in main, and only when the Secret `flash-reserved-h100-workers-20261123` exists there.
   - Each `modal deploy` looks the secret up once and logs `reserved H100 serving ON|OFF in main …`.
   - The decision is baked into the serving, Lambda-controller and fleet-control images as `FLASH_RESERVED_H100_ACTIVE`, so remote containers follow it.

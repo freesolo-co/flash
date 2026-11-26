@@ -355,5 +355,5 @@ def test_health_body_reports_reserved_models_only_while_reserved_is_on(monkeypat
     assert "Qwen/Qwen3.5-9B-Base" in fallback
     assert body["capacity_by_model"][LARGE]["min"] == (5 if on else 0)
     assert body["capacity_by_model"][DRAFTER]["min"] == (3 if on else 0)
-    assert body["capacity_by_model"]["Qwen/Qwen3.5-9B-Base"]["min"] == 2
+    assert body["capacity_by_model"]["Qwen/Qwen3.5-9B-Base"]["min"] == 0
     assert (body["gpu_by_model"][LARGE] == "H100") is on
