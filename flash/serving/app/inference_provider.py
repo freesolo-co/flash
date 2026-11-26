@@ -34,19 +34,20 @@ class ModelPolicy:
         object.__setattr__(self, "lambda_gpus", tuple(self.lambda_gpus))
 
 
+# Every model scales to zero when idle (2026-11-25): no idle GPU floor in main or dev.
 # Minimums apply to main only; dev always scales to zero when idle.
 # Lambda is preferred; Modal is a scale-to-zero fallback sharing max_capacity.
 # The fleet controller transfers slots as Lambda workers become ready. Handoffs
 # allow one temporary extra GPU, then drain the replaced Modal replica before
 # starting another. lambda_gpus is an allowlist: use the cheapest available offer.
 MODEL_POLICIES = {
-    "Qwen/Qwen3.5-0.8B": ModelPolicy(min_capacity=1, max_capacity=2),
-    # Main serves 0.8B Base (and the 27B) from reserved H100 slots; this policy covers dev.
+    "Qwen/Qwen3.5-0.8B": ModelPolicy(min_capacity=0, max_capacity=2),
+    # Used whenever reserved serving is off (dev, or main without the workers secret).
     "Qwen/Qwen3.5-0.8B-Base": ModelPolicy(min_capacity=0, max_capacity=2),
     "Qwen/Qwen3.5-4B": ModelPolicy(min_capacity=0, max_capacity=2),
     "Qwen/Qwen3.5-9B": ModelPolicy(min_capacity=0, max_capacity=2),
     "Qwen/Qwen3.5-9B-Base": ModelPolicy(
-        min_capacity=2,
+        min_capacity=0,
         max_capacity=4,
         lambda_gpus=["H100"],
     ),

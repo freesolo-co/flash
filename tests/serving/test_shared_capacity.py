@@ -18,6 +18,18 @@ def anyio_backend():
     return "asyncio"
 
 
+@pytest.fixture(autouse=True)
+def warm_floor(monkeypatch):
+    """Every production model scales from 0; pin a floor of 2 so the handoff paths stay covered."""
+    from flash.serving.app import inference_provider
+
+    monkeypatch.setitem(
+        inference_provider.MODEL_POLICIES,
+        MODEL,
+        inference_provider.ModelPolicy(min_capacity=2, max_capacity=4, lambda_gpus=["H100"]),
+    )
+
+
 def pool(runners=0, running=0, backlog=0):
     stats = SimpleNamespace(num_total_runners=runners, num_running_inputs=running, backlog=backlog)
     return SimpleNamespace(
