@@ -466,6 +466,18 @@ def test_a_cancel_that_races_the_claim_is_not_overwritten():
     assert score_batches.get_row(batch["batch_id"])["state"] == "cancelled"
 
 
+def test_a_batch_can_be_polled_and_cancelled_by_the_callers_own_batch_id():
+    # A caller whose submit reply was lost knows only its idempotency key.
+    batch = _submit(_body(batch_id="ptp-lost-reply"))
+    row = score_batches.owned_row("ptp-lost-reply", INTERNAL)
+    assert row["batch_id"] == batch["batch_id"]
+    cancelled = score_batches.cancel("ptp-lost-reply", INTERNAL)
+    assert cancelled["state"] == "cancelled"
+    assert cancelled["batch_id"] == batch["batch_id"]
+    with pytest.raises(HTTPException):
+        score_batches.owned_row("ptp-lost-reply", {"id": 999})
+
+
 def test_null_concurrency_is_a_bad_request_not_a_server_error():
     with pytest.raises(HTTPException) as exc:
         _submit(_body(concurrency=None))

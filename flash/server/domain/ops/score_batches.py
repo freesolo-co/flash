@@ -364,8 +364,14 @@ def get_row(batch_id: str) -> dict | None:
 
 
 def owned_row(batch_id: str, key: dict) -> dict:
+    """The caller's batch by Flash's id or by the caller's own batch_id (idempotency key).
+
+    The second form lets a caller whose submit reply was lost still poll or cancel the batch.
+    """
     row = get_row(batch_id)
     if row is None or row["key_id"] != key["id"]:
+        row = _row_for_client(key["id"], batch_id)
+    if row is None:
         raise HTTPException(status_code=404, detail=f"unknown score batch: {batch_id}")
     return row
 
@@ -424,7 +430,7 @@ def public(row: dict, *, include_results: bool) -> dict:
 
 
 def cancel(batch_id: str, key: dict) -> dict:
-    owned_row(batch_id, key)
+    batch_id = owned_row(batch_id, key)["batch_id"]
     conn = _conn()
     with conn:
         conn.execute(
