@@ -464,3 +464,66 @@ def test_a_cancel_that_races_the_claim_is_not_overwritten():
     score_batches.cancel(batch["batch_id"], INTERNAL)
     score_batches._Batch(runner, row).run()
     assert score_batches.get_row(batch["batch_id"])["state"] == "cancelled"
+
+
+def test_null_concurrency_is_a_bad_request_not_a_server_error():
+    with pytest.raises(HTTPException) as exc:
+        _submit(_body(concurrency=None))
+    assert exc.value.status_code == 400
+    assert "concurrency" in exc.value.detail
+    # An explicit null deadline still means "no deadline".
+    assert _submit(_body(deadline_seconds=None))["deadline_seconds"] is None
+
+
+def test_thinking_base_batches_reject_logprobs_before_anything_runs():
+    body = _body(thinking=True)
+    body["requests"][1]["logprobs"] = True
+    with pytest.raises(HTTPException) as exc:
+        _submit(body)
+    assert "request 2" in exc.value.detail
+    assert "thinking" in exc.value.detail
+    body["thinking"] = False
+    assert _submit(body)["state"] == "queued"
+
+
+def test_a_request_waiting_for_a_slot_does_not_start_after_cancel():
+    batch = _submit()
+    runner = score_batches.ScoreBatchRunner(send=lambda *a: pytest.fail("must not send"))
+    row = runner._claim(time.time())
+    work = score_batches._Batch(runner, row)
+    score_batches.cancel(batch["batch_id"], INTERNAL)
+    with pytest.raises(score_batches._Cancelled):
+        work.send({"messages": []})
+
+
+def test_a_plane_that_lost_the_batch_cannot_publish_or_replace_results():
+    batch = _submit()
+    batch_id = batch["batch_id"]
+    old = score_batches.ScoreBatchRunner(send=lambda row, key, request: _ok(request))
+    old_work = score_batches._Batch(old, old._claim(time.time()))
+    old.release()
+    new = score_batches.ScoreBatchRunner(send=lambda row, key, request: _ok(request))
+    _drain(new)
+    first = _result(batch_id)["results"]
+    with pytest.raises(score_batches._Cancelled):
+        old_work._record(0, "case-0", response={"late": True})
+    # Even a record that slipped in is ignored: the first record per request wins.
+    with (score_batches._batch_dir(batch_id) / "results.jsonl").open("a") as handle:
+        handle.write(json.dumps({"index": 0, "response": {"late": True}}) + "\n")
+    assert _result(batch_id)["results"] == first
+    assert "owner" not in first[0]
+
+
+def test_a_torn_final_line_is_trimmed_before_a_resumed_batch_appends():
+    batch = _submit()
+    batch_id = batch["batch_id"]
+    path = score_batches._batch_dir(batch_id) / "results.jsonl"
+    path.write_text(
+        json.dumps({"index": 0, "id": "case-0", "response": {"kept": True}}) + '\n{"index": 1, "res'
+    )
+    _drain(score_batches.ScoreBatchRunner(send=lambda row, key, request: _ok(request)))
+    done = _result(batch_id)
+    assert done["results"][0]["response"] == {"kept": True}
+    assert "response" in done["results"][1]
+    assert "response" in done["results"][2]
+    assert all(json.loads(line) for line in path.read_text().splitlines())

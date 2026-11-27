@@ -154,6 +154,8 @@ def _bad(detail: str) -> HTTPException:
 def _int_field(body: dict, name: str, default: int | None, low: int, high: int) -> int | None:
     value = body.get(name, default)
     if value is None:
+        if default is not None:
+            raise _bad(f"{name} must be an integer in [{low}, {high}]")
         return None
     if type(value) is not int or not low <= value <= high:
         raise _bad(f"{name} must be an integer in [{low}, {high}]")
@@ -211,12 +213,28 @@ def _validate_checkpoint_items(run_id, checkpoint, items, key, org, project) -> 
 
 
 def _validate_base_items(model, items, thinking) -> None:
-    from flash.serve.request.openai import OpenAIRequestError, parse_chat_request
+    from flash.serve.request.openai import (
+        OpenAIRequestError,
+        parse_chat_request,
+        reject_thinking_logprobs,
+        reject_tool_capability,
+    )
+    from flash.serve.request.tool_calls import qualified_tool_parser
 
+    enabled = bool(thinking)
     for number, (_, item) in enumerate(items, 1):
         try:
-            parse_chat_request(
+            parsed = parse_chat_request(
                 {**item, "model": model}, require_model=True, allow_managed_selectors=False
+            )
+            # The same thinking-dependent checks serving applies, so no request runs (and is
+            # charged) before a deterministic rejection of another one in the batch.
+            reject_thinking_logprobs(thinking=enabled, logprobs=parsed.logprobs)
+            reject_tool_capability(
+                tools=parsed.tools,
+                tool_choice=parsed.tool_choice,
+                thinking=enabled,
+                tool_parser=qualified_tool_parser(model),
             )
         except OpenAIRequestError as exc:
             raise _bad(f"request {number}: {exc}. No requests were sent.") from None
@@ -365,7 +383,9 @@ def _results(batch_id: str) -> dict[int, dict]:
         except ValueError:
             continue  # a torn final line from a crash mid-write; that request runs again
         if isinstance(record, dict) and isinstance(record.get("index"), int):
-            out[record["index"]] = record
+            # First record wins: a late answer from a plane that lost the batch cannot replace
+            # a result already recorded (and possibly already returned).
+            out.setdefault(record["index"], record)
     return out
 
 
@@ -397,6 +417,7 @@ def public(row: dict, *, include_results: bool) -> dict:
         for index in range(row["total"]):
             record = dict(results.get(index) or {"error": row["error"] or "not run"})
             record.pop("index", None)
+            record.pop("owner", None)
             records.append(record)
         body["results"] = records
     return body
@@ -472,7 +493,11 @@ class _Batch:
 
     def _record(self, index: int, identity: Any, **result: Any) -> None:
         record = {"index": index, **({"id": identity} if identity is not None else {}), **result}
-        line = json.dumps(record) + "\n"
+        line = json.dumps({**record, "owner": self.runner.owner}) + "\n"
+        row = get_row(self.batch_id)
+        if row is None or row["owner"] != self.runner.owner or row["state"] not in ACTIVE_STATES:
+            # Released, cancelled or claimed elsewhere while this request ran: do not publish.
+            raise _Cancelled("batch is no longer active here")
         with self.lock, (self.folder / "results.jsonl").open("a") as handle:
             handle.write(line)
             handle.flush()
@@ -492,6 +517,8 @@ class _Batch:
 
     def send(self, request: dict) -> dict:
         with self.runner.inflight:
+            # The slot may have been a long wait; never start a generation for a dead batch.
+            self._check_live()
             return self.runner.send(self.row, self._key(), request)
 
     # phases ----------------------------------------------------------------------------------
@@ -505,8 +532,23 @@ class _Batch:
             logger.exception("score_batch_failed batch=%s", self.batch_id)
             self._finish("failed", error=f"score batch failed: {_error_text(exc)}")
 
+    def _repair_tail(self) -> None:
+        """Drop a partly written final line so new records start on a record boundary."""
+        path = self.folder / "results.jsonl"
+        try:
+            data = path.read_bytes()
+        except FileNotFoundError:
+            path.touch()
+            return
+        if data and not data.endswith(b"\n"):
+            with path.open("r+b") as handle:
+                handle.truncate(data.rfind(b"\n") + 1)
+                handle.flush()
+                os.fsync(handle.fileno())
+
     def _run(self) -> None:
         requests = json.loads((self.folder / "requests.json").read_text())
+        self._repair_tail()
         done = _results(self.batch_id)
         pending = [i for i in range(len(requests)) if i not in done]
         if self.row["capacity_at"] is None:
