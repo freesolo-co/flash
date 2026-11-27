@@ -73,3 +73,9 @@ def parse_serving_health(payload: object) -> ServingHealth:
         requires_key=requires_key if isinstance(requires_key, bool) else None,
         ok=ok if isinstance(ok, bool) else None,
     )
+
+
+# A trusted internal caller pins one generation to the Lambda GPU pool with this header (score
+# batches wait for Lambda capacity instead of booting the Modal GPU fallback).
+SERVING_PROVIDER_HEADER = "X-Flash-Serving-Provider"
+LAMBDA_SERVING_PROVIDER = "lambda"

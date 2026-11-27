@@ -713,6 +713,82 @@ def chat_stream(
     )
 
 
+def _provider_header(serving_provider: str | None) -> dict[str, str]:
+    if serving_provider is None:
+        return {}
+    from flash.serve.contract.protocol import LAMBDA_SERVING_PROVIDER, SERVING_PROVIDER_HEADER
+
+    if serving_provider != LAMBDA_SERVING_PROVIDER:
+        raise ValueError(f"serving_provider must be {LAMBDA_SERVING_PROVIDER!r}")
+    return {SERVING_PROVIDER_HEADER: serving_provider}
+
+
+def base_chat(
+    model: str,
+    messages: list[dict],
+    *,
+    org_id: str,
+    timeout_s: float,
+    serving_provider: str | None = None,
+    temperature: float = 0.0,
+    max_tokens: int = 512,
+    thinking: bool = False,
+    stop: list[str] | None = None,
+    structured_outputs: dict | None = None,
+    top_p: float = 0.95,
+    chat_template_kwargs: dict | None = None,
+    n: int = 1,
+    seed: int | None = None,
+    frequency_penalty: float = 0.0,
+    presence_penalty: float = 0.0,
+    logprobs: bool = False,
+    top_logprobs: int = 0,
+    tools: list[dict[str, Any]] | None = None,
+    tool_choice: str | None = None,
+    parallel_tool_calls: bool | None = None,
+    logprob_token_ids: list[int] | tuple[int, ...] | None = None,
+) -> dict:
+    """Chat with an untrained catalog base model, attributed to ``org_id``.
+
+    Serving opens every catalog base model to trusted internal callers; ``org_id`` names the tenant
+    the generation is billed to.
+    """
+    if not org_id:
+        raise ValueError("base-model chat requires an organization to attribute usage to")
+    headers = transport._internal_key_header(org_id=org_id)
+    headers.update(_provider_header(serving_provider))
+    return transport.request_chat_json(
+        contextlib.nullcontext(transport._chat_http_client()),
+        url=f"{transport.serving_openai_base_url()}/chat/completions",
+        headers=headers,
+        run_id=model,
+        messages=messages,
+        temperature=temperature,
+        max_tokens=max_tokens,
+        thinking=thinking,
+        top_p=top_p,
+        n=n,
+        seed=seed,
+        frequency_penalty=frequency_penalty,
+        presence_penalty=presence_penalty,
+        logprobs=logprobs,
+        top_logprobs=top_logprobs,
+        stop=stop,
+        chat_template_kwargs=chat_template_kwargs,
+        structured_outputs=structured_outputs,
+        tools=tools,
+        tool_choice=tool_choice,
+        parallel_tool_calls=parallel_tool_calls,
+        timeout=max(0.0, float(timeout_s)),
+        before_raise=None,
+        balance_payload=lambda payload, enabled: thinking_support._balance_thinking_payload(
+            payload, thinking=enabled
+        ),
+        expected_checkpoint=None,
+        logprob_token_ids=logprob_token_ids,
+    )
+
+
 def chat(
     run_id: str,
     messages: list[dict],
@@ -738,6 +814,7 @@ def chat(
     tool_choice: str | None = None,
     parallel_tool_calls: bool | None = None,
     logprob_token_ids: list[int] | tuple[int, ...] | None = None,
+    serving_provider: str | None = None,
 ) -> dict:
     """Send an OpenAI-style chat request for the run's adapter to freesolo serving.
 
@@ -746,6 +823,7 @@ def chat(
     recognized unavailable-envelope classification so its caller can retry within one deadline.
     ``stop`` carries the run's own stop sequences so a model trained to terminate on a delimiter
     rather than EOS finishes on ``stop`` instead of running to ``max_tokens``.
+    ``serving_provider="lambda"`` pins the generation to the Lambda pool (no Modal GPU fallback).
     """
     # follow_redirects: modal 303-redirects slow cold-start requests across many poll cycles
     # before the result is ready, bounded by the transport redirect limit on the serving origin.
@@ -754,6 +832,7 @@ def chat(
     headers = transport._internal_key_header(org_id=org_id)
     if expected_checkpoint:
         headers["X-Freesolo-Expected-Checkpoint"] = expected_checkpoint
+    headers.update(_provider_header(serving_provider))
     timeout = 30 * 60.0 if timeout_s is None else max(0.0, float(timeout_s))
     client_context = (
         transport._new_serving_client()

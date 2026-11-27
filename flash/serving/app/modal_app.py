@@ -588,8 +588,13 @@ class _ModalEnginePool:
         if _reserved(model):
             slot = await self._reserved_health.next_slot(model)
             return RESERVED_ENGINES[slot - 1](base_model=model)
+        from flash.serving.src.http.provider_pin import lambda_pinned
+
+        # A Lambda-pinned request (score batches) queues on the Lambda pool, which boots a Lambda
+        # worker when none is up, and never starts a Modal GPU.
         if (
             model in MODAL_FALLBACK_BY_MODEL
+            and not lambda_pinned()
             and await self._provider_selection.choose(model) == "modal"
         ):
             return MODAL_FALLBACK_BY_MODEL[model](base_model=model)
