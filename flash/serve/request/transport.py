@@ -16,6 +16,7 @@ if TYPE_CHECKING:
 
 import flash.serve.contract.errors as serving_errors
 from flash.serve.contract.errors import ServingError
+from flash.serve.contract.protocol import TRAFFIC_SOURCE_HEADER
 from flash.serve.contract.responses import serving_status_error
 from flash.serve.contract.urls import (
     default_serving_url,
@@ -59,14 +60,22 @@ def _configured_serving_origin() -> tuple[str, str, int | None] | None:
     return _url_origin(url)
 
 
-def _internal_key_header(*, org_id: str | None = None) -> dict[str, str]:
-    """return serving credentials with an explicit tenant scope when required."""
+def _internal_key_header(
+    *, org_id: str | None = None, traffic_source: str | None = None
+) -> dict[str, str]:
+    """return serving credentials with an explicit tenant scope when required.
+
+    ``traffic_source`` names whose traffic this is for durable accounting (serving honors it only
+    from a trusted internal caller): the training agent's own chats settle at $0.
+    """
 
     key = (os.environ.get("FREESOLO_INTERNAL_KEY") or "").strip()
     headers = {_INTERNAL_KEY_HEADER_NAME: key} if key else {}
     normalized_org = (org_id or "").strip()
     if normalized_org:
         headers[_ORG_ID_HEADER_NAME] = normalized_org
+    if traffic_source:
+        headers[TRAFFIC_SOURCE_HEADER] = traffic_source
     return headers
 
 

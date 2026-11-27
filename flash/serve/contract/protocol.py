@@ -78,3 +78,9 @@ def parse_serving_health(payload: object) -> ServingHealth:
 # The external API key a trusted internal caller is acting for (score batches): serving applies
 # that key's own admission limits and records it in usage, as if the key had called directly.
 ACTING_API_KEY_HEADER = "X-Freesolo-Acting-Api-Key-Id"
+
+# Whose traffic a trusted internal call is, for durable accounting. The Flash control plane sends
+# TRAINING_AGENT_TRAFFIC_SOURCE for the training agent's own chats (internal key + a live training
+# job scope); the backend settles that traffic at $0. Serving honors it only from trusted callers.
+TRAFFIC_SOURCE_HEADER = "X-Freesolo-Traffic-Source"
+TRAINING_AGENT_TRAFFIC_SOURCE = "training_agent"
