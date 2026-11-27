@@ -144,8 +144,6 @@ def health_body(
         if len(primary_providers) == 1
         else "mixed",
         "provider_by_model": providers,
-        # Hosted Qwen GPUs are Lambda-only: no model has a Modal GPU fallback.
-        "fallback_provider_by_model": {},
         "capacity_by_model": {
             m: {
                 "min": len(reserved.slots_for(m))

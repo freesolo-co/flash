@@ -713,6 +713,76 @@ def chat_stream(
     )
 
 
+def base_chat(
+    model: str,
+    messages: list[dict],
+    *,
+    org_id: str,
+    timeout_s: float,
+    api_key_id: str | None = None,
+    temperature: float = 0.0,
+    max_tokens: int = 512,
+    thinking: bool = False,
+    stop: list[str] | None = None,
+    structured_outputs: dict | None = None,
+    top_p: float = 0.95,
+    chat_template_kwargs: dict | None = None,
+    n: int = 1,
+    seed: int | None = None,
+    frequency_penalty: float = 0.0,
+    presence_penalty: float = 0.0,
+    logprobs: bool = False,
+    top_logprobs: int = 0,
+    tools: list[dict[str, Any]] | None = None,
+    tool_choice: str | None = None,
+    parallel_tool_calls: bool | None = None,
+    logprob_token_ids: list[int] | tuple[int, ...] | None = None,
+) -> dict:
+    """Chat with an untrained catalog base model, attributed to ``org_id``.
+
+    Serving opens every catalog base model to trusted internal callers; ``org_id`` names the tenant
+    the generation is billed to and ``api_key_id`` the external key it is made for, whose per-key
+    admission limits serving still applies.
+    """
+    if not org_id:
+        raise ValueError("base-model chat requires an organization to attribute usage to")
+    headers = transport._internal_key_header(org_id=org_id)
+    if api_key_id:
+        from flash.serve.contract.protocol import ACTING_API_KEY_HEADER
+
+        headers[ACTING_API_KEY_HEADER] = api_key_id
+    return transport.request_chat_json(
+        contextlib.nullcontext(transport._chat_http_client()),
+        url=f"{transport.serving_openai_base_url()}/chat/completions",
+        headers=headers,
+        run_id=model,
+        messages=messages,
+        temperature=temperature,
+        max_tokens=max_tokens,
+        thinking=thinking,
+        top_p=top_p,
+        n=n,
+        seed=seed,
+        frequency_penalty=frequency_penalty,
+        presence_penalty=presence_penalty,
+        logprobs=logprobs,
+        top_logprobs=top_logprobs,
+        stop=stop,
+        chat_template_kwargs=chat_template_kwargs,
+        structured_outputs=structured_outputs,
+        tools=tools,
+        tool_choice=tool_choice,
+        parallel_tool_calls=parallel_tool_calls,
+        timeout=max(0.0, float(timeout_s)),
+        before_raise=None,
+        balance_payload=lambda payload, enabled: thinking_support._balance_thinking_payload(
+            payload, thinking=enabled
+        ),
+        expected_checkpoint=None,
+        logprob_token_ids=logprob_token_ids,
+    )
+
+
 def chat(
     run_id: str,
     messages: list[dict],

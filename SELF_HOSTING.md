@@ -163,10 +163,10 @@ production minimum. Requests still start workers and trigger demand-based scalin
 idle workers drain after the demand and scale-down windows expire. CPU routing and
 fleet control services remain available to handle cold requests.
 
-Qwen maximums cover Lambda and Modal together, with one temporary extra replica
-allowed during handoff. Modal fallback always has a zero idle minimum. The fleet
-controller reconciles demand every minute and moves traffic to Lambda once its
-workers are ready. Production retains the configured minimums.
+Hosted Qwen serves only on Lambda; there is no Modal GPU fallback. Requests queue on
+the model's Lambda pool until a worker is healthy. Qwen maximums allow one temporary
+extra replica during a release handoff. The fleet controller reconciles demand every
+minute. Production retains the configured minimums.
 
 `lambda_gpus` restricts the model's qualified hardware. An empty tuple permits the
 existing qualified alternatives, choosing the cheapest available US instance from

@@ -90,9 +90,10 @@ def register_control(app, secret, image, module_name):
         return await control().reap.remote.aio()
 
     async def choose_provider(model):
-        # Rolling-deploy shim: routers from before Lambda-only serving still ask
-        # which provider to use while the control app deploys ahead of them.
-        # Hosted Qwen GPUs are Lambda-only, so the answer is always Lambda.
+        # Rolling-deploy shim, the last remnant of the Modal GPU fallback: routers from
+        # before Lambda-only serving (flash #1887) still ask which provider to use while
+        # the control app deploys ahead of them, so the answer is always Lambda. Delete
+        # this once a release containing #1887 is live on main.
         return "lambda"
 
     module = sys.modules[module_name]

@@ -73,3 +73,8 @@ def parse_serving_health(payload: object) -> ServingHealth:
         requires_key=requires_key if isinstance(requires_key, bool) else None,
         ok=ok if isinstance(ok, bool) else None,
     )
+
+
+# The external API key a trusted internal caller is acting for (score batches): serving applies
+# that key's own admission limits and records it in usage, as if the key had called directly.
+ACTING_API_KEY_HEADER = "X-Freesolo-Acting-Api-Key-Id"

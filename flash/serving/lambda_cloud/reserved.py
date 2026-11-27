@@ -89,7 +89,7 @@ def active(environment=None):
             + (
                 f"{', '.join(MODELS)} served only by reserved slots"
                 if on
-                else f"{', '.join(MODELS)} use the on-demand pool and Modal fallback"
+                else f"{', '.join(MODELS)} use the on-demand Lambda pool"
             ),
             flush=True,
         )

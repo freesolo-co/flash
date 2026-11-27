@@ -117,6 +117,7 @@ class _LeaderWork:
         self.tasks: list[tuple[asyncio.Task, bool]] = []
         # A takeover's recovery thread; shutdown waits for it, since a thread cannot be cancelled.
         self.recovery: asyncio.Future | None = None
+        self.score_batches = None
 
     def recover(self) -> None:
         from flash.server.routes import serving_completion
@@ -155,6 +156,11 @@ class _LeaderWork:
             self._spawn(server_runtime._charge_retry_loop())
         if _instance_providers_configured():
             self._spawn(_sweep_orphan_instances_loop())
+        # Lambda-only score batches persist in the plane store; only the lease holder runs them.
+        from flash.server.domain.ops.score_batches import ScoreBatchRunner
+
+        self.score_batches = ScoreBatchRunner()
+        self.score_batches.start()
         # periodic artifact gc: delete aged (>7d), undeployed run prefixes inside the per-environment
         # Azure artifact namespaces (<artifact namespace>/flashrun-*) so old runs' checkpoints/adapters don't pile up
         # against the org's storage quota. only on a plane with an operator `hf_token` (it deletes
@@ -169,8 +175,15 @@ class _LeaderWork:
     def signal_stop(self) -> None:
         self.deployment_cleanup_stop.set()
         self.startup_report_stop.set()
+        if self.score_batches is not None:
+            self.score_batches.signal_stop()
 
     async def cancel(self) -> None:
+        if self.score_batches is not None:
+            # Hand this plane's batches to the next lease holder at once instead of after the
+            # stale-heartbeat window; requests already recorded are not sent again.
+            with contextlib.suppress(Exception):
+                await asyncio.to_thread(self.score_batches.release)
         for task, tolerate_errors in self.tasks:
             task.cancel()
             ignored = (
@@ -262,6 +275,7 @@ def create_app():
             envs,
             meta,
             runs,
+            score_batches,
             serving,
             submissions,
         )
@@ -339,6 +353,7 @@ def create_app():
     app.include_router(submissions.router)
     app.include_router(custom.router)
     app.include_router(serving.router)
+    app.include_router(score_batches.router)
     app.include_router(adapter_download.router)
     return app
 

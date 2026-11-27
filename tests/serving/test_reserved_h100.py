@@ -350,8 +350,8 @@ def test_health_body_reports_reserved_models_only_while_reserved_is_on(monkeypat
         base_models=lambda: [LARGE, DRAFTER, "Qwen/Qwen3.5-9B-Base"], ready_adapters=list
     )
     body = health_body(router, deployment_sha="s", deployment_id="d", capabilities=[])
-    # No model, reserved or on-demand, has a Modal GPU fallback.
-    assert body["fallback_provider_by_model"] == {}
+    # No model, reserved or on-demand, has a Modal GPU fallback to report.
+    assert "fallback_provider_by_model" not in body
     assert body["capacity_by_model"][LARGE]["min"] == (5 if on else 0)
     assert body["capacity_by_model"][DRAFTER]["min"] == (3 if on else 0)
     assert body["capacity_by_model"]["Qwen/Qwen3.5-9B-Base"]["min"] == 0
