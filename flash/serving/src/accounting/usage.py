@@ -12,6 +12,7 @@ from fastapi import Request
 
 from flash.serving.src.accounting.usage_facts import usage_facts
 from flash.serving.src.accounting.usage_outbox import (
+    FREESOLO_TRAFFIC_SOURCE,
     CapturedPrice,
     FreesoloOrgTrafficPrincipal,
     ImmutableTarget,
@@ -51,6 +52,8 @@ class AuthorizedTraffic:
     principal: ServingTrafficPrincipal
     deployment_generation: str | None = None
     api_key_id: str | None = None
+    # durable accounting's traffic source: the training agent's own traffic settles at $0.
+    traffic_source: str = FREESOLO_TRAFFIC_SOURCE
 
 
 @dataclass(frozen=True)
@@ -60,6 +63,7 @@ class TrustedInternalAuthorization:
     org_id: str | None = None
     # The external API key this trusted caller acts for; its per-key limits still apply.
     api_key_id: str | None = None
+    traffic_source: str = FREESOLO_TRAFFIC_SOURCE
 
 
 InferenceAuthorization = AuthorizedTraffic | TrustedInternalAuthorization
@@ -77,6 +81,7 @@ class UsageSession:
     serving_release: str | None
     attested_adapter: str | None
     api_key_id: str | None = None
+    traffic_source: str = FREESOLO_TRAFFIC_SOURCE
 
     def event(self, result: dict[str, Any]) -> UsageEvent:
         attested_adapter = result.get("lora_request_adapter") or self.attested_adapter
@@ -99,6 +104,7 @@ class UsageSession:
             tokenizer_version=_optional_text(result.get("tokenizer_version")),
             attestation_evidence=evidence,
             facts=usage_facts(result),
+            traffic_source=self.traffic_source,
         )
 
     async def capture(self, result: dict[str, Any]) -> None:
@@ -149,6 +155,7 @@ def build_usage_session(
     serving_release: str,
     captured_at: datetime,
     api_key_id: str | None = None,
+    traffic_source: str = FREESOLO_TRAFFIC_SOURCE,
 ) -> UsageSession:
     immutable_target = ImmutableTarget(
         public_model_id=requested.model_id,
@@ -168,6 +175,7 @@ def build_usage_session(
         serving_release=serving_release or None,
         attested_adapter=_optional_text(result.get("lora_request_adapter")),
         api_key_id=api_key_id,
+        traffic_source=traffic_source,
     )
 
 

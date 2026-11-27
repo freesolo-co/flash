@@ -15,6 +15,7 @@ def _authorize_response(
     from fastapi import HTTPException, status
 
     from flash.serving.src.accounting.usage import AuthorizedTraffic, principal_for_external_org
+    from flash.serving.src.accounting.usage_outbox import traffic_source_or_default
 
     if resp.status_code == 200:
         # Bind billing and checkpoint dispatch to the same backend authorization.
@@ -38,7 +39,14 @@ def _authorize_response(
                 status.HTTP_503_SERVICE_UNAVAILABLE,
                 "serving auth backend returned malformed response",
             ) from exc
-        return AuthorizedTraffic(principal_for_external_org(org_id), generation, api_key_id)
+        # the backend marks a live training job's own sampling so it settles at $0; any other
+        # (or unknown) value stays ordinary billable traffic.
+        return AuthorizedTraffic(
+            principal_for_external_org(org_id),
+            generation,
+            api_key_id,
+            traffic_source=traffic_source_or_default(body.get("trafficSource")),
+        )
     if resp.status_code == 401:
         # The backend returns 401 for BOTH an invalid *user* key (our authorize route, body
         # code "invalid_api_key") AND a rejected serving *machine* bearer (require_internal_token,
