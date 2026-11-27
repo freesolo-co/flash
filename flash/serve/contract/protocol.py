@@ -79,3 +79,6 @@ def parse_serving_health(payload: object) -> ServingHealth:
 # batches wait for Lambda capacity instead of booting the Modal GPU fallback).
 SERVING_PROVIDER_HEADER = "X-Flash-Serving-Provider"
 LAMBDA_SERVING_PROVIDER = "lambda"
+# The external API key a trusted internal caller is acting for (score batches): serving applies
+# that key's own admission limits and records it in usage, as if the key had called directly.
+ACTING_API_KEY_HEADER = "X-Freesolo-Acting-Api-Key-Id"

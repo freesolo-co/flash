@@ -312,9 +312,16 @@ def test_checkpoint_batches_validate_each_request_through_managed_chat(monkeypat
     seen = []
 
     def resolve(run_id, payload, key, org, project):
+        from types import SimpleNamespace
+
+        from flash.serve.request.openai import parse_chat_request
+
         seen.append((run_id, payload["checkpoint_id"]))
         if payload["messages"][0]["content"] == "q1":
             raise HTTPException(status_code=400, detail="tools need thinking off")
+        request = parse_chat_request(payload, require_model=False, allow_managed_selectors=True)
+        spec = SimpleNamespace(train=SimpleNamespace(stop_sequences=()))
+        return request, [], spec, payload["checkpoint_id"], "org"
 
     monkeypatch.setattr(serving_chat, "_resolve_chat_request", resolve)
     body = {k: v for k, v in _body().items() if k != "model"}
@@ -476,6 +483,71 @@ def test_a_batch_can_be_polled_and_cancelled_by_the_callers_own_batch_id():
     assert cancelled["batch_id"] == batch["batch_id"]
     with pytest.raises(HTTPException):
         score_batches.owned_row("ptp-lost-reply", {"id": 999})
+
+
+def test_a_request_whose_slot_opens_after_the_deadline_is_unfinished_not_sent():
+    batch = _submit()
+    runner = score_batches.ScoreBatchRunner(send=lambda *a: pytest.fail("must not send"))
+    work = score_batches._Batch(runner, runner._claim(time.time()))
+    work.stop_at = time.time() - 1
+    with pytest.raises(score_batches._DeadlineReached):
+        work.send({"messages": []})
+    assert score_batches.get_row(batch["batch_id"])["state"] == "queued"
+
+
+def test_checkpoint_batches_reject_trained_stops_that_break_tool_calls(monkeypatch):
+    from types import SimpleNamespace
+
+    from flash.serve.request.openai import parse_chat_request
+    from flash.server.routes import serving_chat
+
+    spec = SimpleNamespace(train=SimpleNamespace(stop_sequences=("<tool_call>",)))
+
+    def resolve(run_id, payload, key, org, project):
+        request = parse_chat_request(payload, require_model=False, allow_managed_selectors=True)
+        return request, [], spec, payload["checkpoint_id"], "org"
+
+    monkeypatch.setattr(serving_chat, "_resolve_chat_request", resolve)
+    tool = {"type": "function", "function": {"name": "lookup", "parameters": {"type": "object"}}}
+    body = {k: v for k, v in _body(2).items() if k != "model"}
+    body["requests"][1]["tools"] = [tool]
+    body["requests"][1]["tool_choice"] = "auto"
+    with pytest.raises(HTTPException) as exc:
+        _submit({**body, "checkpoint_id": "flash-1-abc/final"})
+    assert exc.value.status_code == 400
+    assert "request 2" in exc.value.detail
+
+
+def test_base_batches_keep_the_external_keys_identity_for_serving_admission(monkeypatch):
+    from flash.serve.request import transport
+
+    external = {"id": 3, "auth_kind": "freesolo_api_key", "org_id": "org-9", "api_key_id": "k-1"}
+    batch = score_batches.submit(_body(), external, None, None)
+    row = score_batches.get_row(batch["batch_id"])
+    assert row["api_key_id"] == "k-1"
+    assert score_batches.get_row(_submit()["batch_id"])["api_key_id"] is None
+    captured = {}
+    monkeypatch.setenv("FREESOLO_INTERNAL_KEY", "internal-secret")
+    monkeypatch.setattr(
+        transport, "request_chat_json", lambda _c, **kwargs: captured.update(kwargs) or {}
+    )
+    monkeypatch.setattr(transport, "serving_openai_base_url", lambda: "https://serving/v1")
+    score_batches._send_request(row, external, {"messages": [{"role": "user", "content": "x"}]})
+    assert captured["headers"]["X-Freesolo-Acting-Api-Key-Id"] == "k-1"
+
+
+def test_serving_applies_the_acting_keys_limits_to_trusted_internal_traffic():
+    from flash.serving.src.accounting.usage import TrustedInternalAuthorization
+    from flash.serving.src.http.context import require_attributed_traffic
+
+    target = type("Target", (), {"is_checkpoint": False, "org_id": None})()
+    traffic = require_attributed_traffic(
+        TrustedInternalAuthorization(org_id="org-9", api_key_id="k-1"), target
+    )
+    assert traffic.api_key_id == "k-1"
+    assert traffic.principal.orgId == "org-9"
+    plain = require_attributed_traffic(TrustedInternalAuthorization(org_id="org-9"), target)
+    assert plain.api_key_id is None
 
 
 def test_null_concurrency_is_a_bad_request_not_a_server_error():

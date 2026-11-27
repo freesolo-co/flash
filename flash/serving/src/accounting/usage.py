@@ -58,6 +58,8 @@ class TrustedInternalAuthorization:
     """A trusted server-to-server caller that has not yet been attributed to an organization."""
 
     org_id: str | None = None
+    # The external API key this trusted caller acts for; its per-key limits still apply.
+    api_key_id: str | None = None
 
 
 InferenceAuthorization = AuthorizedTraffic | TrustedInternalAuthorization

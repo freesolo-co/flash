@@ -70,6 +70,7 @@ CREATE TABLE IF NOT EXISTS score_batches (
   batch_id        TEXT PRIMARY KEY,
   key_id          INTEGER NOT NULL,
   auth_kind       TEXT,
+  api_key_id      TEXT,
   client_batch_id TEXT,
   org_id          TEXT,
   project_id      TEXT,
@@ -96,6 +97,10 @@ _SCHEMA_LOCK = threading.Lock()
 
 
 class _Cancelled(RuntimeError):
+    pass
+
+
+class _DeadlineReached(RuntimeError):
     pass
 
 
@@ -198,14 +203,36 @@ def _base_org(key: dict, org_header: str | None) -> str:
     return org
 
 
+def _acting_api_key_id(key: dict) -> str | None:
+    """The external key a base-model batch acts for, so serving keeps its per-key limits."""
+    if key.get("auth_kind") == "internal":
+        return None
+    value = str(key.get("api_key_id") or "").strip()
+    return value or None
+
+
 def _validate_checkpoint_items(run_id, checkpoint, items, key, org, project) -> None:
+    from flash.serve.request.openai import OpenAIRequestError, merge_stop_sequences
+    from flash.serve.request.tool_calls import validate_tool_stop_sequences
     from flash.server.routes import serving_chat
 
     for number, (_, item) in enumerate(items, 1):
         try:
-            serving_chat._resolve_chat_request(
+            request, _, spec, _, _ = serving_chat._resolve_chat_request(
                 run_id, {**item, "checkpoint_id": checkpoint}, key, org, project
             )
+            # The run's trained stops merge into every request at execution (managed_chat);
+            # check them against tool calls now so no request runs before that rejection.
+            mandatory = tuple(getattr(spec.train, "stop_sequences", ()) or ())
+            try:
+                validate_tool_stop_sequences(
+                    merge_stop_sequences(mandatory, request.stop) or (),
+                    tools=request.tools,
+                    tool_choice=request.tool_choice,
+                    error_type=OpenAIRequestError,
+                )
+            except OpenAIRequestError as exc:
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
         except HTTPException as exc:
             if exc.status_code == 400:
                 raise _bad(f"request {number}: {exc.detail}. No requests were sent.") from None
@@ -306,13 +333,14 @@ def submit(body: Any, key: dict, org: str | None, project: str | None) -> dict:
     try:
         with conn:
             conn.execute(
-                "INSERT INTO score_batches (batch_id, key_id, auth_kind, client_batch_id, org_id,"
-                " project_id, run_id, target, total, concurrency, deadline_s, thinking, state,"
-                " created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                "INSERT INTO score_batches (batch_id, key_id, auth_kind, api_key_id,"
+                " client_batch_id, org_id, project_id, run_id, target, total, concurrency,"
+                " deadline_s, thinking, state, created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (
                     batch_id,
                     key["id"],
                     key.get("auth_kind"),
+                    _acting_api_key_id(key),
                     client_batch_id,
                     scope_org,
                     project,
@@ -481,6 +509,7 @@ class _Batch:
         self.folder = _batch_dir(self.batch_id)
         self.lock = threading.Lock()
         self.stop = threading.Event()
+        self.stop_at: float | None = None
 
     # persistence -----------------------------------------------------------------------------
 
@@ -523,8 +552,11 @@ class _Batch:
 
     def send(self, request: dict) -> dict:
         with self.runner.inflight:
-            # The slot may have been a long wait; never start a generation for a dead batch.
+            # The slot may have been a long wait; never start a generation for a dead batch
+            # or one past its deadline.
             self._check_live()
+            if self.stop_at is not None and time.time() >= self.stop_at:
+                raise _DeadlineReached
             return self.runner.send(self.row, self._key(), request)
 
     # phases ----------------------------------------------------------------------------------
@@ -618,6 +650,7 @@ class _Batch:
             return
         deadline_s = self.row["deadline_s"]
         stop_at = None if deadline_s is None else self.row["capacity_at"] + deadline_s
+        self.stop_at = stop_at
         cursor = iter(pending)
         cursor_lock = threading.Lock()
 
@@ -628,15 +661,17 @@ class _Batch:
         def worker() -> None:
             while (index := next_index()) is not None:
                 entry = requests[index]
-                if stop_at is not None and time.time() >= stop_at:
+                try:
+                    if stop_at is not None and time.time() >= stop_at:
+                        raise _DeadlineReached
+                    self._run_item(index, entry)
+                except _DeadlineReached:
                     self._record(
                         index,
                         entry["id"],
                         error="unfinished: the batch deadline was reached before this request ran",
                         unfinished=True,
                     )
-                    continue
-                self._run_item(index, entry)
 
         workers = min(self.row["concurrency"], len(pending))
         with concurrent.futures.ThreadPoolExecutor(
@@ -652,7 +687,7 @@ class _Batch:
             self._check_live()
             try:
                 response = self.send(entry["request"])
-            except _Cancelled:
+            except (_Cancelled, _DeadlineReached):
                 raise
             except Exception as exc:
                 last = exc
@@ -715,6 +750,7 @@ def _send_request(row: dict, key: dict, request: dict) -> dict:
         org_id=row["org_id"],
         timeout_s=REQUEST_TIMEOUT_SECONDS,
         serving_provider=LAMBDA_SERVING_PROVIDER,
+        api_key_id=row.get("api_key_id"),
         temperature=parsed.temperature,
         max_tokens=parsed.max_tokens,
         thinking=thinking,

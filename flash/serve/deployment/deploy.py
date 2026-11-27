@@ -730,6 +730,7 @@ def base_chat(
     org_id: str,
     timeout_s: float,
     serving_provider: str | None = None,
+    api_key_id: str | None = None,
     temperature: float = 0.0,
     max_tokens: int = 512,
     thinking: bool = False,
@@ -751,12 +752,17 @@ def base_chat(
     """Chat with an untrained catalog base model, attributed to ``org_id``.
 
     Serving opens every catalog base model to trusted internal callers; ``org_id`` names the tenant
-    the generation is billed to.
+    the generation is billed to and ``api_key_id`` the external key it is made for, whose per-key
+    admission limits serving still applies.
     """
     if not org_id:
         raise ValueError("base-model chat requires an organization to attribute usage to")
     headers = transport._internal_key_header(org_id=org_id)
     headers.update(_provider_header(serving_provider))
+    if api_key_id:
+        from flash.serve.contract.protocol import ACTING_API_KEY_HEADER
+
+        headers[ACTING_API_KEY_HEADER] = api_key_id
     return transport.request_chat_json(
         contextlib.nullcontext(transport._chat_http_client()),
         url=f"{transport.serving_openai_base_url()}/chat/completions",
