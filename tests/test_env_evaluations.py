@@ -987,13 +987,10 @@ def test_env_eval_records_the_hub_environment_the_run_trains_on(
     the rest of the dashboard is keyed by, and a hub `github:` ref is canonicalized to the slug it
     denotes -- the same normalization the submit route applies when it records the run.
     """
-    from flash.envs.loading.loader import managed_slug_to_github_ref
-
     env_dir = _upload_env_dir(tmp_path, monkeypatch=monkeypatch)
     expected = "acme/example-project/starter"
-    # built by the library rather than hand-written, so the fixture cannot drift from the ref format
-    # the loader actually parses.
-    spec_environment = managed_slug_to_github_ref(expected) if as_github_ref else expected
+    hub_ref = f"github:freesolo-co/environment-hub@main:{expected}/environment.py"
+    spec_environment = hub_ref if as_github_ref else expected
 
     class Client(_EvalClient):
         def get_run(self, run_id):

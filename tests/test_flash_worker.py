@@ -620,7 +620,7 @@ def test_console_heartbeat_stays_flat_so_the_scanner_can_match_on_substrings(tmp
 
 
 def test_snapshot_weight_validation(tmp_path):
-    from flash.engine.worker.io.artifacts import _snapshot_has_weights
+    from flash.engine.support.model_snapshot import snapshot_has_weights as _snapshot_has_weights
 
     d = tmp_path / "snap"
     d.mkdir()

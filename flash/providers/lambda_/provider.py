@@ -72,7 +72,6 @@ class LambdaProvider:
         on_handle=None,
         attempt=0,
         runtime_secrets=None,
-        on_last_gpu=False,
         source_snapshot=None,
         _deadline_at=None,
     ):
@@ -148,8 +147,3 @@ class LambdaProvider:
 
 
 PROVIDER = LambdaProvider()
-
-
-def terminate_persisted_resources(spec, run_id):
-    """Reconcile a launch even when its public job spec can no longer be parsed."""
-    PROVIDER.terminate_run(run_id)

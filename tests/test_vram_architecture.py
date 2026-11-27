@@ -5,8 +5,8 @@ import math
 import pytest
 
 from flash.core.catalog import MODELS, serving_lora_rank_cap
+from flash.engine.plan.kv_sizing import _KV_BLOCK_TOKENS
 from flash.engine.plan.vram import (
-    _KV_BLOCK_TOKENS,
     _LORA_ADAMW_BYTES_PER_PARAM,
     _architecture_kv_raw_gb,
     _legacy_lora_floor_gb,

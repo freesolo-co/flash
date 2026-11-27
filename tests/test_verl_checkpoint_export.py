@@ -304,7 +304,6 @@ def test_low_space_preserves_non_disk_merger_launch_errors(monkeypatch, actor_di
         checkpoints.export_peft_adapter(
             str(actor_dir),
             str(tmp_path / "adapter"),
-            base_model_id="org/model",
             python_bin="/verl/python",
         )
     assert caught.value is error
@@ -327,7 +326,6 @@ def test_layout_error_after_success_is_not_reclassified(monkeypatch, actor_dir, 
         checkpoints.export_peft_adapter(
             str(actor_dir),
             str(tmp_path / "adapter"),
-            base_model_id="org/model",
             python_bin="/verl/python",
         )
     assert not isinstance(caught.value, checkpoints.MergeDiskExhaustedError)
@@ -352,7 +350,6 @@ def test_placement_error_after_success_is_not_reclassified(monkeypatch, actor_di
         checkpoints.export_peft_adapter(
             str(actor_dir),
             str(tmp_path / "adapter"),
-            base_model_id="org/model",
             python_bin="/verl/python",
         )
     assert caught.value is denied
@@ -381,7 +378,6 @@ def test_disk_classification_happens_before_merge_cleanup(monkeypatch, actor_dir
         checkpoints.export_peft_adapter(
             str(actor_dir),
             str(tmp_path / "adapter"),
-            base_model_id="org/model",
             python_bin="/verl/python",
         )
     assert sampled_with_evidence[-1] is True
@@ -414,7 +410,6 @@ def test_export_moves_adapter_files_and_cleans_merge_tree(monkeypatch, actor_dir
     checkpoints.export_peft_adapter(
         str(actor_dir),
         str(adapter),
-        base_model_id="org/model",
         python_bin="/verl/python",
     )
     assert (adapter / "adapter_model.safetensors").read_bytes() == b"weights"
@@ -463,7 +458,6 @@ def test_short_write_marker_survives_the_merger_subprocess_boundary(
         checkpoints.export_peft_adapter(
             str(actor_dir),
             str(tmp_path / "adapter"),
-            base_model_id="org/model",
             python_bin="/verl/python",
         )
     cause = caught.value.__cause__
@@ -489,7 +483,6 @@ def test_direct_disk_marker_replaces_an_earlier_short_write_marker(
         checkpoints.export_peft_adapter(
             str(actor_dir),
             str(tmp_path / "adapter"),
-            base_model_id="org/model",
             python_bin="/verl/python",
         )
     cause = caught.value.__cause__

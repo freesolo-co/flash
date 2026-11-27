@@ -64,13 +64,12 @@ class DirtyGpuError(RetriableInfraError):
     """
 
 
-def _nvml_memory_gb(device_index: int = 0) -> tuple[float, float] | None:
+def _nvml_memory_gb(device_index: int) -> tuple[float, float] | None:
     """``(free, total)`` for one device in GB from NVML, or None if NVML will not answer.
 
     NVML, not ``torch.cuda.mem_get_info``: the torch call needs a CUDA context and creates one if the
     process has none, so the act of measuring adds our own memory to the number being measured. NVML
-    queries the driver without initializing CUDA in this process. Device 0 remains the default for
-    the diagnostic helpers that expose its free and total memory.
+    queries the driver without initializing CUDA in this process.
     """
     try:
         import pynvml
@@ -87,18 +86,6 @@ def _nvml_memory_gb(device_index: int = 0) -> tuple[float, float] | None:
         return None
 
 
-def free_vram_gb() -> float | None:
-    """Free VRAM on device 0 in GB, or None if it cannot be determined.
-
-    Reads the DRIVER's number, not the torch allocator's. The allocator only knows about memory this
-    process reserved, and the memory at issue here belongs to somebody else -- a co-tenant sharing
-    the physical card from another container, which the allocator cannot see and would report as
-    entirely free.
-    """
-    reading = _nvml_memory_gb()
-    return None if reading is None else reading[0]
-
-
 def cuda_is_initialized() -> bool:
     """True once THIS process has a live CUDA context, so a driver reading includes our own memory.
 
@@ -113,16 +100,6 @@ def cuda_is_initialized() -> bool:
         return bool(torch is not None and torch.cuda.is_initialized())
     except Exception:
         return True  # cannot prove the card is untouched -> treat the reading as unusable
-
-
-def total_vram_gb() -> float | None:
-    """Total VRAM on device 0 in GB as the DRIVER reports it, or None if unavailable.
-
-    The driver's usable total, not the catalog's nominal tier: a "24 GB" RTX 4090 reports ~22.5 GB.
-    Comparing against the nominal number is what makes an exact-fit run unschedulable.
-    """
-    reading = _nvml_memory_gb()
-    return None if reading is None else reading[1]
 
 
 def preflight_gpu_occupancy(gpu_count: int, *, max_occupied_fraction: float = 0.05) -> None:

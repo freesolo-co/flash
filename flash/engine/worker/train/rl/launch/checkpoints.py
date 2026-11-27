@@ -380,9 +380,7 @@ class _VerlResumeUploader:
         adapter_dir = os.path.join(self.export_root, f"step-{step}")
         shutil.rmtree(adapter_dir, ignore_errors=True)
         os.makedirs(adapter_dir, exist_ok=True)
-        export_peft_adapter(
-            actor_dir, adapter_dir, base_model_id=self.model_id, python_bin=self.python_bin
-        )
+        export_peft_adapter(actor_dir, adapter_dir, python_bin=self.python_bin)
         self.preprocessor.save_pretrained(adapter_dir)
         stamp_adapter_dir_provenance(
             adapter_dir,

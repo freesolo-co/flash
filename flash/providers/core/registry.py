@@ -78,7 +78,7 @@ def configured_providers() -> list[Provider]:
     return [get_provider(n) for n in available_providers()]
 
 
-def terminate_persisted_resources(spec, run_id):
+def terminate_persisted_resources(run_id):
     """Clean owned training resources even when the persisted spec cannot be parsed."""
     for provider in configured_providers():
         provider.terminate_run(run_id)

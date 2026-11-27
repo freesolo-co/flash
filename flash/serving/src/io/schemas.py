@@ -16,11 +16,7 @@ from pydantic import (
 )
 
 from flash.schema import format_checkpoint_ref, parse_checkpoint_ref
-from flash.serve.contract.provenance import (
-    CheckpointKey,
-    immutable_binding_fingerprint,
-    record_key,
-)
+from flash.serve.contract.provenance import immutable_binding_fingerprint
 from flash.serve.runtime.types import (
     validate_generation_max_tokens,
     validate_generation_temperature,
@@ -140,10 +136,6 @@ class AdapterRecord(BaseModel):
     @property
     def is_checkpoint(self) -> bool:
         return not self.serve_base_model and parse_checkpoint_ref(self.model_id) is not None
-
-    @property
-    def storage_key(self) -> CheckpointKey:
-        return record_key(self)
 
     def immutable_fingerprint(self) -> str:
         return immutable_binding_fingerprint(self)

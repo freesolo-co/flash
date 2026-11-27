@@ -51,7 +51,6 @@ class SpotProvider:
         on_handle=None,
         attempt=0,
         runtime_secrets=None,
-        on_last_gpu=False,
         source_snapshot=None,
         _deadline_at=None,
     ):
@@ -118,8 +117,3 @@ class SpotProvider:
 
 
 PROVIDER = SpotProvider()
-
-
-def terminate_persisted_resources(spec, run_id):
-    """Reconcile a launch even when its public job spec can no longer be parsed."""
-    PROVIDER.terminate_run(run_id)

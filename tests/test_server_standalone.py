@@ -888,7 +888,7 @@ _MANAGED_HUB_FORMS: tuple[str, ...] = (
 def test_a_self_hosted_plane_refuses_an_id_naming_the_private_hub(monkeypatch, env_id: str) -> None:
     """A slug names the one repo a self-hosted plane provably cannot read.
 
-    ``managed_slug_to_github_ref`` maps every slug onto ``freesolo-co/environment-hub``, which is
+    Every slug names an environment in ``freesolo-co/environment-hub``, which is
     private and hardcoded with no override. Accepted, the id passes submit, survives the
     best-effort sha pin, and fails on a rented GPU as a bare GitHub 404 naming a repo the operator
     has no relationship with -- after the run has cost money. Refusing at submit makes that failure

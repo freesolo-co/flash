@@ -70,7 +70,7 @@ def _remaining_run_wall_seconds(run_id: str, *, now: float | None = None) -> flo
     return max(0.0, _load_run_deadline_at(run_id) - float(current))
 
 
-def _worker_deadline_at(run_id: str, spec: JobSpec, *, now: float | None = None) -> float:
+def _worker_deadline_at(run_id: str) -> float:
     """Return the absolute deadline the worker may enforce for this launch.
 
     Unarmed, the work budget from launch is the authority. So an unarmed profile also carries the

@@ -158,7 +158,6 @@ def _patch_prefetch_io(monkeypatch, ephemeral_hub):
 
     monkeypatch.setattr(huggingface_hub, "snapshot_download", _fake_snapshot)
     monkeypatch.setattr(huggingface_hub.constants, "HF_HUB_CACHE", str(ephemeral_hub))
-    monkeypatch.setattr(hf, "gpu_diagnostics", dict)
     monkeypatch.setattr(worker_heartbeat, "heartbeat", lambda *a, **k: None)
     return hf, calls
 

@@ -811,12 +811,7 @@ def _horizon_reasoning_fields(
     }
 
 
-def _print_workload_warnings(
-    profile: SftWorkloadProfile,
-    retained: _RetainedSftRows,
-    *,
-    batch_size: object,
-) -> None:
+def _print_workload_warnings(profile: SftWorkloadProfile, *, batch_size: object) -> None:
     """Emit the pre-allocation warnings a finished run's metrics would report too late.
 
     Both run for the control-plane estimate and again on the training worker, so they land in both
@@ -837,7 +832,7 @@ def _print_workload_warnings(
         print(f"warning: [train] {warning}", file=sys.stderr)
     # read straight off the profile, which already carries the horizon-bounded counts. this line is
     # rendered twice -- here, and again by the CLI off the serialized profile -- and recomputing it
-    # from `retained` would let the worker's stderr and the submitter's warning disagree about the
+    # from the retained rows would let the worker's stderr and the submitter's warning disagree about the
     # same run. one source, one answer.
     reasoning_warning = rendered_reasoning_loss_warning(
         authored_turns=profile.authored_reasoning_turns,
@@ -971,7 +966,7 @@ def prepare_sft_workload(
         measurements=measurements,
         horizon=horizon,
     )
-    _print_workload_warnings(profile, retained, batch_size=train_spec.batch_size)
+    _print_workload_warnings(profile, batch_size=train_spec.batch_size)
     return PreparedSftWorkload(
         rows=retained.rows,
         profile=profile,

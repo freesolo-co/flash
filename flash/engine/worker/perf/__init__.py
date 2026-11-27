@@ -1,8 +1,8 @@
 """Pure GPU/perf/optimizer probes for the fine-tuning worker.
 
-The fla/tilelang/cudart fixup group stays IN THIS MODULE on purpose: tests monkeypatch
-``perf._find_real_libcudart`` / ``perf._remove_fla_from_disk`` and the callers resolve them
-through the patched module globals. Do NOT move this group into a submodule.
+The fla/tilelang fixup group stays IN THIS MODULE on purpose: tests monkeypatch
+``perf._remove_fla_from_disk`` and the callers resolve it through the patched module globals.
+Do NOT move this group into a submodule.
 
 NOTE: ``tests/test_worker_stack.py`` reads THIS file as TEXT to assert the fla SHA /
 TILELANG_PIN stay in lockstep with Dockerfile.worker.
@@ -14,33 +14,14 @@ import contextlib
 import os
 import sys
 
-from flash.engine.worker.perf.diagnostics import (
-    _clean_diag,
-    _float_or_none,
-    _int_or_none,
-    _query_nvidia_gpu,
-    _query_nvidia_processes,
-    _round_gb_from_mib,
-    gpu_diagnostics,
-)
+from flash.engine.worker.perf.diagnostics import gpu_diagnostics
 from flash.engine.worker.perf.lifecycle import (
-    DirtyGpuError,
     RetriableInfraError,
-    free_vram_gb,
     is_cuda_oom,
     preflight_gpu_occupancy,
-    total_vram_gb,
     wait_for_gpu,
 )
-from flash.engine.worker.perf.memory import (
-    _prefer_gradient_checkpointing,
-    grad_checkpointing_on,
-    grpo_use_reentrant,
-)
-from flash.engine.worker.perf.model_size import (
-    _checkpointing_default_for_model,
-    _estimate_params,
-)
+from flash.engine.worker.perf.memory import grad_checkpointing_on, grpo_use_reentrant
 
 
 def _remove_fla_from_disk() -> tuple[list[str], bool]:
@@ -74,72 +55,6 @@ def _remove_fla_from_disk() -> tuple[list[str], bool]:
             break
     importlib.invalidate_caches()
     return removed, importlib.util.find_spec("fla") is not None
-
-
-def _find_real_libcudart() -> str | None:
-    """Find a real libcudart.so that exports cudaDeviceReset (tilelang's stub lacks it).
-
-    Probes nvidia wheel dirs (any CUDA major), the -devel image toolkit, and the system resolver.
-    """
-    import ctypes
-    import ctypes.util
-    import glob
-
-    def _verify(cand: str) -> str | None:
-        """Return resolved path if cand loads and exports cudaDeviceReset, else None."""
-        try:
-            lib = ctypes.CDLL(cand)
-        except OSError:
-            return None
-        if not hasattr(lib, "cudaDeviceReset"):
-            return None
-        if os.path.isabs(cand) and os.path.exists(cand):
-            return os.path.realpath(cand)
-        # bare soname: resolve via /proc/self/maps
-        base = os.path.basename(cand)
-        try:
-            with open("/proc/self/maps") as f:
-                for line in f:
-                    if base in line and "/" in line:
-                        p = line[line.index("/") :].rstrip()
-                        if os.path.basename(p).startswith(base) and os.path.exists(p):
-                            return os.path.realpath(p)
-        except OSError:
-            pass
-        return None
-
-    candidates: list[str] = []
-    # 1. nvidia cuda-runtime PyPI wheel (any CUDA major — cu12/cu13 layouts differ)
-    try:
-        import nvidia  # type: ignore[import-untyped]  # namespace pkg; subpkg import may fail, this won't
-
-        for base in sorted(map(str, getattr(nvidia, "__path__", []) or [])):
-            candidates += sorted(glob.glob(os.path.join(base, "*", "lib", "libcudart.so.*")))
-    except Exception:
-        pass
-    # 2. CUDA toolkit in a -devel base image
-    for pat in (
-        "/usr/local/cuda*/lib64/libcudart.so.*",
-        "/usr/local/cuda*/targets/*/lib/libcudart.so.*",
-        "/usr/lib/x86_64-linux-gnu/libcudart.so.*",
-    ):
-        candidates += sorted(glob.glob(pat))
-    # 3. system loader resolver
-    found = ctypes.util.find_library("cudart")
-    if found:
-        candidates.append(found)
-    for cand in candidates:
-        real = _verify(cand)
-        if real is not None:
-            return real
-    return None
-
-
-# NOTE: the stub repoint itself lives in `verl.child_io.render_tilelang_cudart_shim`, NOT here. The
-# stub only matters to the interpreter that builds a sleeping vLLM engine, and that is the verl child
-# (`FLASH_VERL_PYTHON`, `/opt/verl-venv`), which Dockerfile.worker gives its own tilelang install. A
-# parent-side repoint fixed the parent's copy and never reached the one the trainer loads. The probe
-# above stays because the child fragment ships ITS SOURCE via `inspect.getsource`.
 
 
 def _force_fla_triton_gdn_on_sm100() -> None:
@@ -383,28 +298,15 @@ def _ensure_fla_fastpath_on_hopper() -> None:
 
 
 __all__ = [
-    "DirtyGpuError",
     "RetriableInfraError",
-    "_checkpointing_default_for_model",
-    "_clean_diag",
     "_ensure_fla_fastpath_on_hopper",
-    "_estimate_params",
-    "_find_real_libcudart",
-    "_float_or_none",
     "_force_fla_triton_gdn_on_sm100",
-    "_int_or_none",
-    "_prefer_gradient_checkpointing",
-    "_query_nvidia_gpu",
-    "_query_nvidia_processes",
     "_remove_fla_from_disk",
     "_restrict_fla_gdn_autotune_on_blackwell",
-    "_round_gb_from_mib",
-    "free_vram_gb",
     "gpu_diagnostics",
     "grad_checkpointing_on",
     "grpo_use_reentrant",
     "is_cuda_oom",
     "preflight_gpu_occupancy",
-    "total_vram_gb",
     "wait_for_gpu",
 ]

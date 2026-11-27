@@ -926,9 +926,7 @@ def _export_final_adapter(
     if resume_uploader is not None and resume_uploader.reuse_final_adapter(steps_run, adapter_dir):
         print(f"[rl-verl] reused validated adapter export at step {steps_run}", flush=True)
         return
-    export_peft_adapter(
-        actor_dir, adapter_dir, base_model_id=inp["model_id"], python_bin=python_bin
-    )
+    export_peft_adapter(actor_dir, adapter_dir, python_bin=python_bin)
     targeting = resolve_lora_targeting(
         inp["model_id"], algorithm="grpo", multimodal=bool(inp.get("multimodal"))
     )

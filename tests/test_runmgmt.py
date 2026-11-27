@@ -785,7 +785,7 @@ def test_run_training_charges_metered_training_time_not_the_quote(monkeypatch, t
         "validate_terminal_source_metrics",
         lambda _status, metrics, expected_attempt=None: (metrics, expected_attempt),
     )
-    lifecycle._run_training(spec, io.StringIO(), prior_cost=0.0, source_snapshot=_SOURCE_SNAPSHOT)
+    lifecycle._run_training(spec, io.StringIO(), source_snapshot=_SOURCE_SNAPSHOT)
 
     st = runner_status.get_status(spec.run_id)
     assert st.state == "done"
@@ -2426,7 +2426,6 @@ def test_stale_attach_failure_cannot_fail_newer_launch_owner(monkeypatch, tmp_pa
             1,
             _SOURCE_SNAPSHOT,
             io.StringIO(),
-            failure="stalled",
         )
 
     current = runner_status.get_status(spec.run_id)
@@ -3592,8 +3591,8 @@ def test_recover_runs_rejects_handleless_removed_model_before_resubmit_or_gc(
     )
     terminated = []
 
-    def cleanup(raw_spec, run_id):
-        terminated.append((raw_spec["model"], run_id))
+    def cleanup(run_id):
+        terminated.append(run_id)
         if cleanup_fails:
             raise RuntimeError("temporary Modal outage")
 
@@ -3607,7 +3606,7 @@ def test_recover_runs_rejects_handleless_removed_model_before_resubmit_or_gc(
 
     runtime.recover_runs()
 
-    assert terminated == [(retired_model, spec.run_id)]
+    assert terminated == [spec.run_id]
     status = runner_status.get_status(spec.run_id)
     assert status.state == "failed"
     assert "unsupported model" in (status.error or "")
@@ -4265,7 +4264,7 @@ def test_run_training_bails_when_running_cas_rejects(monkeypatch):
     )
 
     with pytest.raises(runner_errors._RunCancelled):
-        lifecycle._run_training(spec, None, prior_cost=0.0, source_snapshot=_SOURCE_SNAPSHOT)
+        lifecycle._run_training(spec, None, source_snapshot=_SOURCE_SNAPSHOT)
     assert submitted == []  # never charged a GPU for an already-terminal run
 
 

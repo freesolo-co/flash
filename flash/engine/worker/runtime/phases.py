@@ -79,11 +79,6 @@ class PhaseTimings:
             if self.billing_started is not None and self.billing_stopped is None:
                 self.billing_stopped = time.monotonic()
 
-    def billable_train_seconds(self):
-        """GPU seconds this attempt has spent training (0.0 before its first optimizer update)."""
-        with self.lock:
-            return self._billable_unlocked(time.monotonic())
-
     def _billable_unlocked(self, now):
         # an explicit zero before the first optimizer update, never "absent": a metered worker
         # cancelled during trainer/model init must bill zero, not look like a legacy worker that

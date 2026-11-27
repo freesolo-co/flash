@@ -27,9 +27,6 @@ from flash.serving.src.stream_channel.protocol import (
     StreamChannelError,
 )
 
-# one process-wide retention set, shared with the engine side
-_BACKGROUND_TASKS = _tasks.BACKGROUND_TASKS
-
 
 async def _stop_task(
     task: asyncio.Task[Any],

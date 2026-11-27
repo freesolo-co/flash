@@ -211,7 +211,7 @@ def _safe_detail(
     return text[-bound:] if keep == "end" else text[:bound]
 
 
-def _read_console_tail(path: str, limit: int, secrets: dict | None = None) -> str:
+def _read_console_tail(path: str, limit: int) -> str:
     """Read the last ``limit`` bytes of a file, dropping a leading PARTIAL line.
 
     the byte boundary can land inside a one-line credential, and a partial value no longer matches

@@ -2633,14 +2633,13 @@ def test_read_console_tail_drops_a_single_unterminated_line(tmp_path, monkeypatc
     console = tmp_path / "console.txt"
     console.write_bytes(body)
 
-    # an unrelated configured credential must not buy the line a pass.
-    assert b._read_console_tail(str(console), limit, secrets={"K": "sk-live-abc123456789"}) == ""
-    assert b._read_console_tail(str(console), limit, secrets={}) == ""
+    # the split line is dropped whole: no known credential can size a safe cut.
+    assert b._read_console_tail(str(console), limit) == ""
 
     # a line the boundary did NOT split is still kept: that is the case worth keeping.
     terminated = tmp_path / "terminated.txt"
     terminated.write_bytes(b"x" * 70_000 + b"\nROOTCAUSE: cuda oom")
-    assert b._read_console_tail(str(terminated), limit, secrets={}) == "ROOTCAUSE: cuda oom"
+    assert b._read_console_tail(str(terminated), limit) == "ROOTCAUSE: cuda oom"
 
 
 def test_safe_detail_redacts_a_short_secret_whose_edges_are_not_word_characters():

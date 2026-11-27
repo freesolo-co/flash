@@ -33,6 +33,8 @@ import flash.engine.worker.train.entry.rl_train_runner as rl_train_runner
 from flash.engine.worker.perf.lifecycle import RetriableInfraError
 from flash.engine.worker.train.entry import backend_common as vc
 from flash.engine.worker.train.entry import rl_train
+from flash.engine.worker.verl import capabilities as verl_capabilities
+from flash.engine.worker.verl import diagnostics as verl_diagnostics
 
 # the stamp reads the run's modality off `exclude_modules`: the language-prefix regex for a
 # text-only run, None for a multimodal one. these artifacts are text-only.
@@ -280,7 +282,7 @@ def test_resolve_verl_loggers_treats_an_unanswerable_probe_as_no_wandb(monkeypat
     # a child that died answers nothing. asking verl for a logger it may not have dies at logger
     # init on a paid gpu, so an unanswered wandb question must degrade to console, never assume it.
     monkeypatch.setenv("WANDB_API_KEY", "k")
-    assert vc.resolve_verl_loggers(dict(vc._CAPABILITIES_UNAVAILABLE)) == ["console"]
+    assert vc.resolve_verl_loggers(dict(verl_capabilities._CAPABILITIES_UNAVAILABLE)) == ["console"]
 
 
 def test_stamp_adapter_dir_provenance_sets_base_and_revision(tmp_path):
@@ -601,7 +603,9 @@ def test_the_capability_probe_imports_nothing_from_flash():
     # the verl child cannot import Flash; doing so made the GDN probe fail closed permanently.
     # now one child answers every capability, so assert its parsed import graph contains no `flash`
     # import while allowing names such as flashinfer.
-    probe = vc._CAPABILITY_PROBE % {"gdn_module": "transformers.models.qwen3_5.modeling_qwen3_5"}
+    probe = verl_capabilities._CAPABILITY_PROBE % {
+        "gdn_module": "transformers.models.qwen3_5.modeling_qwen3_5"
+    }
     roots = set()
     for node in ast.walk(ast.parse(probe)):
         if isinstance(node, ast.Import):
@@ -632,7 +636,9 @@ def test_no_optional_package_is_imported_at_the_probes_top_level():
     Only stdlib imports may be top-level; optional imports must remain inside each question's
     try/except or one missing package fail-closes every capability.
     """
-    probe = vc._CAPABILITY_PROBE % {"gdn_module": "transformers.models.qwen3_5.modeling_qwen3_5"}
+    probe = verl_capabilities._CAPABILITY_PROBE % {
+        "gdn_module": "transformers.models.qwen3_5.modeling_qwen3_5"
+    }
     tree = ast.parse(probe)
     top_level = set()
     for node in tree.body:  # deliberately NOT ast.walk: only module-level statements
@@ -686,7 +692,7 @@ def _run_gdn_probe_branch(
     monkeypatch.setattr(import_utils, "is_flash_linear_attention_available", lambda: True)
     monkeypatch.setattr(import_utils, "is_causal_conv1d_available", lambda: True)
 
-    probe = vc._CAPABILITY_PROBE % {"gdn_module": module_name}
+    probe = verl_capabilities._CAPABILITY_PROBE % {"gdn_module": module_name}
     # keep only the gdn block: the rest of the probe imports verl/flashinfer/wandb, which this
     # process has no reason to have, and their absence would drown the line under test.
     start = probe.index(f"if {module_name!r}:")
@@ -790,7 +796,7 @@ def test_a_missing_package_still_names_which_package(monkeypatch):
 
     import io as _io
 
-    probe = vc._CAPABILITY_PROBE % {"gdn_module": "flash_test_absent_mod"}
+    probe = verl_capabilities._CAPABILITY_PROBE % {"gdn_module": "flash_test_absent_mod"}
     start = probe.index(f"if {'flash_test_absent_mod'!r}:")
     captured = _io.StringIO()
     with contextlib.redirect_stdout(captured):
@@ -805,10 +811,12 @@ def test_the_capability_probe_is_valid_python():
     # the probe is a template string, so a syntax error in it would surface as a silent
     # "every capability unavailable" on a paid gpu rather than at import time here. check BOTH
     # renderings: the gdn branch is interpolated in, and the skip case must parse too.
-    probe = vc._CAPABILITY_PROBE % {"gdn_module": "transformers.models.qwen3_6.modeling_qwen3_6"}
+    probe = verl_capabilities._CAPABILITY_PROBE % {
+        "gdn_module": "transformers.models.qwen3_6.modeling_qwen3_6"
+    }
     ast.parse(probe)
     assert "transformers.models.qwen3_6.modeling_qwen3_6" in probe
-    ast.parse(vc._CAPABILITY_PROBE % {"gdn_module": ""})
+    ast.parse(verl_capabilities._CAPABILITY_PROBE % {"gdn_module": ""})
 
 
 def test_every_capability_question_fails_independently(tmp_path):
@@ -822,7 +830,7 @@ def test_every_capability_question_fails_independently(tmp_path):
     venv.EnvBuilder(with_pip=False).create(environment)
     python = environment / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
     caps = vc.probe_verl_capabilities(str(python), "transformers.models.qwen3_5.modeling_qwen3_5")
-    assert set(caps) == set(vc._CAPABILITIES_UNAVAILABLE)
+    assert set(caps) == set(verl_capabilities._CAPABILITIES_UNAVAILABLE)
     # this interpreter has none of them, so every answer is the fail-closed one -- but each was
     # REACHED and answered rather than skipped by an earlier raise.
     assert caps["flashinfer"] is False
@@ -832,7 +840,7 @@ def test_every_capability_question_fails_independently(tmp_path):
 def test_the_probe_skips_the_gdn_question_for_a_non_hybrid():
     # the gdn smoke runs a live CUDA kernel and imports transformers; nothing consumes its answer
     # for a pure-attention model, so an empty module must skip it outright rather than pay for it.
-    probe = vc._CAPABILITY_PROBE % {"gdn_module": ""}
+    probe = verl_capabilities._CAPABILITY_PROBE % {"gdn_module": ""}
     assert "causal_conv1d_fn(" in probe  # the branch is present...
     caps = vc.probe_verl_capabilities(sys.executable, "")
     assert caps["gdn_boundary_resets"] is None  # ...but was never entered, so it stays unasked
@@ -891,7 +899,7 @@ def test_an_unconvincing_child_leaves_every_capability_fail_closed(monkeypatch, 
         lambda *a, **k: SimpleNamespace(returncode=returncode, stdout=stdout, stderr=""),
     )
     caps = vc.probe_verl_capabilities("/nonexistent/python", "m.o.d")
-    assert caps == vc._CAPABILITIES_UNAVAILABLE
+    assert caps == verl_capabilities._CAPABILITIES_UNAVAILABLE
     assert vc.gdn_reset_arch_from_caps(caps, "m.o.d") is None
     assert vc.verl_device_capability(caps) is None
 
@@ -931,20 +939,25 @@ def test_a_timed_out_child_that_answered_nothing_still_fails_every_capability_cl
         raise vc.subprocess.TimeoutExpired(cmd="python", timeout=1, output="", stderr="")
 
     monkeypatch.setattr(vc.subprocess, "run", _timeout)
-    assert vc.probe_verl_capabilities("/verl/bin/python", "m.o.d") == vc._CAPABILITIES_UNAVAILABLE
+    assert (
+        vc.probe_verl_capabilities("/verl/bin/python", "m.o.d")
+        == verl_capabilities._CAPABILITIES_UNAVAILABLE
+    )
 
 
 def test_the_probe_budget_covers_the_union_of_the_probes_it_replaced():
     # the batched child does serially what five children did in parallel processes, so its budget is
     # the SUM of theirs. the gdn smoke used to get a full 600s with no torch/verl import ahead of
     # it; a 600s shared bound would hand it strictly less wall-clock than before on a cold cache.
-    assert vc._CAPABILITY_PROBE_TIMEOUT_S == 300 + 600 + 120 + 120 + 120
+    assert verl_capabilities._CAPABILITY_PROBE_TIMEOUT_S == 300 + 600 + 120 + 120 + 120
 
 
 def test_the_gdn_answer_is_flushed_after_the_cheap_ones():
     # ordering is the contract that makes incremental flushing worth anything: if the expensive
     # question ran first, a timeout inside it would still take every cheap answer with it.
-    probe = vc._CAPABILITY_PROBE % {"gdn_module": "transformers.models.qwen3_5.modeling_qwen3_5"}
+    probe = verl_capabilities._CAPABILITY_PROBE % {
+        "gdn_module": "transformers.models.qwen3_5.modeling_qwen3_5"
+    }
     gdn_at = probe.index('emit("gdn_boundary_resets"')
     for key in ("capability", "flashinfer", "wandb"):
         assert probe.index(f'emit("{key}"') < gdn_at, (
@@ -964,7 +977,7 @@ def test_a_child_that_omits_a_key_leaves_it_fail_closed(monkeypatch):
         ),
     )
     caps = vc.probe_verl_capabilities("/verl/bin/python", "")
-    assert set(caps) == set(vc._CAPABILITIES_UNAVAILABLE)
+    assert set(caps) == set(verl_capabilities._CAPABILITIES_UNAVAILABLE)
     assert caps["flashinfer"] is True
     assert caps["capability"] is None
     assert caps["wandb"] is False
@@ -976,7 +989,7 @@ def test_an_unavailable_gdn_gate_says_why():
     The parent sees only a boolean, so missing packages and broken ABIs are otherwise identical.
     Assert both negative-path diagnostics in the rendered source; syntax is tested separately.
     """
-    probe = vc._CAPABILITY_PROBE
+    probe = verl_capabilities._CAPABILITY_PROBE
     # the clean negative: which of the checks failed is the difference between "install fla" and
     # "rebuild causal_conv1d for this arch".
     assert probe.count("gdn boundary resets unavailable in the child") == 2, (
@@ -1569,7 +1582,7 @@ def _caps_blob(**answers):
     one line per question, like the real probe: it flushes each answer as it is known so a kill
     partway through cannot retract the ones already sent.
     """
-    payload = dict(vc._CAPABILITIES_UNAVAILABLE)
+    payload = dict(verl_capabilities._CAPABILITIES_UNAVAILABLE)
     payload.update(answers)
     lines = "\n".join("FLASH_VERL_CAPS=" + json.dumps({k: v}) for k, v in payload.items())
     return "cat <<'EOF'\n" + lines + "\nEOF"
@@ -1682,7 +1695,7 @@ def test_child_output_tail_drops_blank_lines_and_caps_line_width():
     kept = tail.tail()
     assert "" not in kept, "a bare newline must not occupy a slot in the window"
     widest = max(len(line) for line in kept)
-    assert widest <= vc._CHILD_TAIL_LINE_CHARS, (
+    assert widest <= verl_diagnostics._CHILD_TAIL_LINE_CHARS, (
         f"retained a {widest}-char line; verl prints multi-KB config blocks and the tail "
         "has to ride inside an uploaded heartbeat payload"
     )
@@ -1746,7 +1759,7 @@ def test_run_verl_training_retries_nested_cuda_device_unavailable_after_tail_evi
 def test_child_output_tail_latches_signature_before_line_truncation():
     signature = "cudaErrorDevicesUnavailable"
     tail = vc.ChildOutputTail()
-    tail.record("x" * vc._CHILD_TAIL_LINE_CHARS + signature + "\n")
+    tail.record("x" * verl_diagnostics._CHILD_TAIL_LINE_CHARS + signature + "\n")
 
     assert signature not in tail.tail()[0]
     assert tail.retriable_infra_signature == signature
@@ -1795,7 +1808,9 @@ def test_run_verl_training_preserves_oom_over_device_unavailable_after_eviction(
 
     monkeypatch.setattr(lifecycle, "cuda_oom_count", lambda: 0)
     device_line = "cudaErrorDevicesUnavailable"
-    oom_line = "x" * vc._CHILD_TAIL_LINE_CHARS + "No available memory for the cache blocks"
+    oom_line = (
+        "x" * verl_diagnostics._CHILD_TAIL_LINE_CHARS + "No available memory for the cache blocks"
+    )
     first, second = (oom_line, device_line) if oom_first else (device_line, oom_line)
     command = [
         "bash",
@@ -1845,12 +1860,12 @@ def test_child_tail_redaction_precedes_the_per_line_cap(monkeypatch):
     monkeypatch.setenv("HF_TOKEN", secret)
     tail = vc.ChildOutputTail()
     # the token starts inside the retained window and ends past it.
-    tail.record("x" * (vc._CHILD_TAIL_LINE_CHARS - 10) + secret + "\n")
+    tail.record("x" * (verl_diagnostics._CHILD_TAIL_LINE_CHARS - 10) + secret + "\n")
 
     kept = tail.tail()[0]
 
     assert secret[:10] not in kept
-    assert len(kept) <= vc._CHILD_TAIL_LINE_CHARS
+    assert len(kept) <= verl_diagnostics._CHILD_TAIL_LINE_CHARS
 
 
 def test_child_tail_redacts_declared_secrets_with_arbitrary_names(monkeypatch):
@@ -3183,14 +3198,14 @@ def test_the_grpo_success_path_drains_stragglers_too():
 
 def _flashinfer_caps(*, flashinfer_ok=True):
     """the batched probe's answer for a child whose `import flashinfer` did or did not work."""
-    return dict(vc._CAPABILITIES_UNAVAILABLE, flashinfer=flashinfer_ok)
+    return dict(verl_capabilities._CAPABILITIES_UNAVAILABLE, flashinfer=flashinfer_ok)
 
 
 def _cc_probe(monkeypatch, cc):
     """stub the batched probe; `cc` is what torch reports, or None for no cuda."""
 
     def fake_run(cmd, **kwargs):
-        payload = dict(vc._CAPABILITIES_UNAVAILABLE, capability=cc)
+        payload = dict(verl_capabilities._CAPABILITIES_UNAVAILABLE, capability=cc)
         return SimpleNamespace(
             returncode=0, stdout="FLASH_VERL_CAPS=" + json.dumps(payload) + "\n", stderr=""
         )
@@ -3235,7 +3250,7 @@ def test_the_capability_probe_runs_against_the_verl_interpreter(monkeypatch):
 
     def fake_run(cmd, **kwargs):
         calls.append(cmd)
-        payload = dict(vc._CAPABILITIES_UNAVAILABLE, capability=[8, 9])
+        payload = dict(verl_capabilities._CAPABILITIES_UNAVAILABLE, capability=[8, 9])
         return SimpleNamespace(
             returncode=0, stdout="FLASH_VERL_CAPS=" + json.dumps(payload) + "\n", stderr=""
         )
@@ -3256,7 +3271,7 @@ def test_every_capability_question_costs_exactly_one_child(monkeypatch):
     def fake_run(cmd, **kwargs):
         calls.append(cmd)
         payload = dict(
-            vc._CAPABILITIES_UNAVAILABLE,
+            verl_capabilities._CAPABILITIES_UNAVAILABLE,
             capability=[12, 0],
             flashinfer=True,
             wandb=True,
@@ -3348,7 +3363,7 @@ def test_the_flashinfer_question_is_asked_of_the_verl_interpreter():
     # verl owns the rollout engine and pins its own vllm stack, so a flash-side `import flashinfer`
     # would answer for the wrong environment. the question now rides the batched child probe, so
     # assert it is IN that child's script rather than counting a subprocess of its own.
-    probe = vc._CAPABILITY_PROBE % {"gdn_module": ""}
+    probe = verl_capabilities._CAPABILITY_PROBE % {"gdn_module": ""}
     assert "import flashinfer" in probe
     assert '"flashinfer"' in probe
 
@@ -3464,7 +3479,7 @@ def test_ray_log_collection_cannot_mask_the_real_error_it_runs_after(tmp_path):
     # this runs on an ALREADY-failing path. if a missing/unreadable ray dir could raise here, the
     # collector would replace the run's real traceback with its own and make things strictly worse.
     assert vc.collect_ray_failure_logs(root=str(tmp_path / "nonexistent")) == ""
-    assert vc.latest_ray_session_dir(str(tmp_path / "nonexistent")) is None
+    assert verl_diagnostics.latest_ray_session_dir(str(tmp_path / "nonexistent")) is None
 
 
 def test_a_session_predating_this_run_is_rejected_not_reported_as_its_evidence(tmp_path):
@@ -3476,7 +3491,7 @@ def test_a_session_predating_this_run_is_rejected_not_reported_as_its_evidence(t
     _ray_session(root, "session_prev", files={"raylet.err": "PREVIOUS RUN"}, mtime=1_000_000)
     started = 1_500_000.0
 
-    assert vc.latest_ray_session_dir(str(root), started_after=started) is None
+    assert verl_diagnostics.latest_ray_session_dir(str(root), started_after=started) is None
     assert vc.collect_ray_failure_logs(root=str(root), started_after=started) == ""
     # and the same call without a start time still sees it, so the filter is what rejected it.
     assert "PREVIOUS RUN" in vc.collect_ray_failure_logs(root=str(root))

@@ -48,7 +48,6 @@ class _RunTarget:
     repo_id: str
     prefix: str  # "<phase>/<run_id>"
     run_id: str
-    age_ts: float | None  # newest-commit epoch of the prefix (fallback: run-id epoch)
 
 
 def _now() -> float:
@@ -259,9 +258,7 @@ def _collect_targets(api, live, whole, now: float, max_age_s: float) -> list[_Ru
                     continue  # recently active (in-flight or just finished)
                 if warm_src:
                     continue  # warm-start source for a recent child (referenced_by marker)
-                targets.append(
-                    _RunTarget(repo_id=repo, prefix=pfx, run_id=pfx.split("/", 1)[1], age_ts=ts)
-                )
+                targets.append(_RunTarget(repo_id=repo, prefix=pfx, run_id=pfx.split("/", 1)[1]))
     if unknown_tops:
         logger.info(
             "repo GC: skipped unrecognized non-artifact dirs (never deleted): %s",
