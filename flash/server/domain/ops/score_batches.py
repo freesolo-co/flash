@@ -72,6 +72,7 @@ CREATE TABLE IF NOT EXISTS score_batches (
   auth_kind       TEXT,
   api_key_id      TEXT,
   client_batch_id TEXT,
+  scope           TEXT NOT NULL DEFAULT '',
   org_id          TEXT,
   project_id      TEXT,
   run_id          TEXT,
@@ -89,7 +90,7 @@ CREATE TABLE IF NOT EXISTS score_batches (
   error           TEXT
 );
 CREATE UNIQUE INDEX IF NOT EXISTS score_batches_client_idx
-  ON score_batches(key_id, client_batch_id) WHERE client_batch_id IS NOT NULL;
+  ON score_batches(key_id, scope, client_batch_id) WHERE client_batch_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS score_batches_state_idx ON score_batches(state);
 """
 _SCHEMA_READY: set[str] = set()
@@ -203,6 +204,18 @@ def _base_org(key: dict, org_header: str | None) -> str:
     return org
 
 
+def _scope(key: dict, org: str | None, project: str | None) -> str:
+    """The tenant namespace of a caller's batches.
+
+    Every caller of a managed plane's shared internal key has the same key id, so for that key the
+    organization and project it names are part of the batch identity: one tenant can neither
+    collide with nor read or cancel another's batches. A user key is its own tenant.
+    """
+    if key.get("auth_kind") != "internal":
+        return ""
+    return f"internal:{(org or '').strip()}/{(project or '').strip()}"
+
+
 def _acting_api_key_id(key: dict) -> str | None:
     """The external key a base-model batch acts for, so serving keeps its per-key limits."""
     if key.get("auth_kind") == "internal":
@@ -221,6 +234,7 @@ def _validate_checkpoint_items(run_id, checkpoint, items, key, org, project) -> 
             request, _, spec, _, _ = serving_chat._resolve_chat_request(
                 run_id, {**item, "checkpoint_id": checkpoint}, key, org, project
             )
+            _validate_images(spec.model, item["messages"])
             # The run's trained stops merge into every request at execution (managed_chat);
             # check them against tool calls now so no request runs before that rejection.
             mandatory = tuple(getattr(spec.train, "stop_sequences", ()) or ())
@@ -254,6 +268,7 @@ def _validate_base_items(model, items, thinking) -> None:
             parsed = parse_chat_request(
                 {**item, "model": model}, require_model=True, allow_managed_selectors=False
             )
+            _validate_images(model, parsed.messages)
             # The same thinking-dependent checks serving applies, so no request runs (and is
             # charged) before a deterministic rejection of another one in the batch.
             reject_thinking_logprobs(thinking=enabled, logprobs=parsed.logprobs)
@@ -263,8 +278,24 @@ def _validate_base_items(model, items, thinking) -> None:
                 thinking=enabled,
                 tool_parser=qualified_tool_parser(model),
             )
-        except OpenAIRequestError as exc:
-            raise _bad(f"request {number}: {exc}. No requests were sent.") from None
+        except (OpenAIRequestError, HTTPException) as exc:
+            detail = exc.detail if isinstance(exc, HTTPException) else exc
+            raise _bad(f"request {number}: {detail}. No requests were sent.") from None
+
+
+def _validate_images(model: str, messages: Any) -> None:
+    """Serving's per-model image checks (support, count, size, decoding), applied at submit."""
+    from flash.serving.src.engine.model_config import image_limit_for, supports_image_input
+    from flash.serving.src.io.multimodal import MultimodalRequestError, normalize_chat_messages
+
+    try:
+        normalize_chat_messages(
+            messages,
+            supports_images=supports_image_input(model),
+            image_limit=image_limit_for(model),
+        )
+    except MultimodalRequestError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 def submit(body: Any, key: dict, org: str | None, project: str | None) -> dict:
@@ -292,8 +323,9 @@ def submit(body: Any, key: dict, org: str | None, project: str | None) -> dict:
         not isinstance(client_batch_id, str) or not 1 <= len(client_batch_id) <= 128
     ):
         raise _bad("batch_id must be a string of 1-128 characters")
+    scope = _scope(key, org, project)
     if client_batch_id is not None:
-        existing = _row_for_client(key["id"], client_batch_id)
+        existing = _row_for_client(key["id"], scope, client_batch_id)
         if existing is not None:
             return public(existing, include_results=False)
     concurrency = _int_field(body, "concurrency", DEFAULT_CONCURRENCY, 1, MAX_CONCURRENCY)
@@ -334,14 +366,16 @@ def submit(body: Any, key: dict, org: str | None, project: str | None) -> dict:
         with conn:
             conn.execute(
                 "INSERT INTO score_batches (batch_id, key_id, auth_kind, api_key_id,"
-                " client_batch_id, org_id, project_id, run_id, target, total, concurrency,"
-                " deadline_s, thinking, state, created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                " client_batch_id, scope, org_id, project_id, run_id, target, total, concurrency,"
+                " deadline_s, thinking, state, created_at)"
+                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (
                     batch_id,
                     key["id"],
                     key.get("auth_kind"),
                     _acting_api_key_id(key),
                     client_batch_id,
+                    scope,
                     scope_org,
                     project,
                     run_id,
@@ -357,7 +391,7 @@ def submit(body: Any, key: dict, org: str | None, project: str | None) -> dict:
     except sqlite3.IntegrityError:
         # A concurrent retry with the same batch_id won the insert; return that batch.
         shutil.rmtree(folder, ignore_errors=True)
-        existing = _row_for_client(key["id"], client_batch_id)
+        existing = _row_for_client(key["id"], scope, client_batch_id)
         if existing is None:
             raise
         return public(existing, include_results=False)
@@ -374,12 +408,12 @@ def _write_json(path: Path, value: Any) -> None:
 # reads
 
 
-def _row_for_client(key_id: int, client_batch_id: str) -> dict | None:
+def _row_for_client(key_id: int, scope: str, client_batch_id: str) -> dict | None:
     row = (
         _conn()
         .execute(
-            "SELECT * FROM score_batches WHERE key_id=? AND client_batch_id=?",
-            (key_id, client_batch_id),
+            "SELECT * FROM score_batches WHERE key_id=? AND scope=? AND client_batch_id=?",
+            (key_id, scope, client_batch_id),
         )
         .fetchone()
     )
@@ -391,14 +425,16 @@ def get_row(batch_id: str) -> dict | None:
     return dict(row) if row else None
 
 
-def owned_row(batch_id: str, key: dict) -> dict:
+def owned_row(batch_id: str, key: dict, org: str | None = None, project: str | None = None) -> dict:
     """The caller's batch by Flash's id or by the caller's own batch_id (idempotency key).
 
     The second form lets a caller whose submit reply was lost still poll or cancel the batch.
+    Either way the batch must belong to the caller's key and tenant scope.
     """
+    scope = _scope(key, org, project)
     row = get_row(batch_id)
-    if row is None or row["key_id"] != key["id"]:
-        row = _row_for_client(key["id"], batch_id)
+    if row is None or row["key_id"] != key["id"] or row["scope"] != scope:
+        row = _row_for_client(key["id"], scope, batch_id)
     if row is None:
         raise HTTPException(status_code=404, detail=f"unknown score batch: {batch_id}")
     return row
@@ -457,8 +493,8 @@ def public(row: dict, *, include_results: bool) -> dict:
     return body
 
 
-def cancel(batch_id: str, key: dict) -> dict:
-    batch_id = owned_row(batch_id, key)["batch_id"]
+def cancel(batch_id: str, key: dict, org: str | None = None, project: str | None = None) -> dict:
+    batch_id = owned_row(batch_id, key, org, project)["batch_id"]
     conn = _conn()
     with conn:
         conn.execute(

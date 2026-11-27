@@ -249,7 +249,7 @@ def test_cancel_stops_a_waiting_batch():
     runner = score_batches.ScoreBatchRunner(send=send)
     runner.tick()
     assert entered.wait(5)
-    cancelled = score_batches.cancel(batch["batch_id"], INTERNAL)
+    cancelled = score_batches.cancel(batch["batch_id"], INTERNAL, "org-test")
     assert cancelled["state"] == "cancelled"
     _drain(runner)
     assert _result(batch["batch_id"])["state"] == "cancelled"
@@ -320,7 +320,7 @@ def test_checkpoint_batches_validate_each_request_through_managed_chat(monkeypat
         if payload["messages"][0]["content"] == "q1":
             raise HTTPException(status_code=400, detail="tools need thinking off")
         request = parse_chat_request(payload, require_model=False, allow_managed_selectors=True)
-        spec = SimpleNamespace(train=SimpleNamespace(stop_sequences=()))
+        spec = SimpleNamespace(model=MODEL, train=SimpleNamespace(stop_sequences=()))
         return request, [], spec, payload["checkpoint_id"], "org"
 
     monkeypatch.setattr(serving_chat, "_resolve_chat_request", resolve)
@@ -443,13 +443,19 @@ def test_routes_submit_poll_and_cancel():
             )
             assert created.status_code == 202, created.text
             batch_id = created.json()["batch_id"]
-            polled = await client.get(f"/v1/score-batches/{batch_id}")
+            polled = await client.get(
+                f"/v1/score-batches/{batch_id}", headers={"X-Freesolo-Org-Id": "org-test"}
+            )
             assert polled.json()["state"] == "queued"
             assert "results" not in polled.json()
-            cancelled = await client.delete(f"/v1/score-batches/{batch_id}")
+            cancelled = await client.delete(
+                f"/v1/score-batches/{batch_id}", headers={"X-Freesolo-Org-Id": "org-test"}
+            )
             assert cancelled.json()["state"] == "cancelled"
             assert len(cancelled.json()["results"]) == 3
-            missing = await client.get("/v1/score-batches/sb-unknown")
+            missing = await client.get(
+                "/v1/score-batches/sb-unknown", headers={"X-Freesolo-Org-Id": "org-test"}
+            )
             assert missing.status_code == 404
 
     import asyncio
@@ -468,7 +474,7 @@ def test_a_cancel_that_races_the_claim_is_not_overwritten():
     batch = _submit()
     runner = score_batches.ScoreBatchRunner(send=lambda row, key, request: _ok(request))
     row = runner._claim(time.time())
-    score_batches.cancel(batch["batch_id"], INTERNAL)
+    score_batches.cancel(batch["batch_id"], INTERNAL, "org-test")
     score_batches._Batch(runner, row).run()
     assert score_batches.get_row(batch["batch_id"])["state"] == "cancelled"
 
@@ -476,9 +482,9 @@ def test_a_cancel_that_races_the_claim_is_not_overwritten():
 def test_a_batch_can_be_polled_and_cancelled_by_the_callers_own_batch_id():
     # A caller whose submit reply was lost knows only its idempotency key.
     batch = _submit(_body(batch_id="ptp-lost-reply"))
-    row = score_batches.owned_row("ptp-lost-reply", INTERNAL)
+    row = score_batches.owned_row("ptp-lost-reply", INTERNAL, "org-test")
     assert row["batch_id"] == batch["batch_id"]
-    cancelled = score_batches.cancel("ptp-lost-reply", INTERNAL)
+    cancelled = score_batches.cancel("ptp-lost-reply", INTERNAL, "org-test")
     assert cancelled["state"] == "cancelled"
     assert cancelled["batch_id"] == batch["batch_id"]
     with pytest.raises(HTTPException):
@@ -501,7 +507,7 @@ def test_checkpoint_batches_reject_trained_stops_that_break_tool_calls(monkeypat
     from flash.serve.request.openai import parse_chat_request
     from flash.server.routes import serving_chat
 
-    spec = SimpleNamespace(train=SimpleNamespace(stop_sequences=("<tool_call>",)))
+    spec = SimpleNamespace(model=MODEL, train=SimpleNamespace(stop_sequences=("<tool_call>",)))
 
     def resolve(run_id, payload, key, org, project):
         request = parse_chat_request(payload, require_model=False, allow_managed_selectors=True)
@@ -550,6 +556,45 @@ def test_serving_applies_the_acting_keys_limits_to_trusted_internal_traffic():
     assert plain.api_key_id is None
 
 
+def test_internal_callers_batches_are_scoped_to_the_tenant_they_name():
+    # Every caller of the shared internal key has one key id; org and project separate tenants.
+    first = score_batches.submit(_body(batch_id="round-1"), INTERNAL, "org-a", "proj-a")
+    second = score_batches.submit(_body(batch_id="round-1"), INTERNAL, "org-b", "proj-b")
+    assert first["batch_id"] != second["batch_id"]
+    again = score_batches.submit(_body(batch_id="round-1"), INTERNAL, "org-a", "proj-a")
+    assert again["batch_id"] == first["batch_id"]
+    assert (
+        score_batches.owned_row("round-1", INTERNAL, "org-b", "proj-b")["batch_id"]
+        == (second["batch_id"])
+    )
+    for ident in (first["batch_id"], "round-1"):
+        with pytest.raises(HTTPException) as exc:
+            score_batches.owned_row(ident, INTERNAL, "org-b", "proj-other")
+        assert exc.value.status_code == 404
+    with pytest.raises(HTTPException):
+        score_batches.cancel(first["batch_id"], INTERNAL, "org-b", "proj-b")
+    assert score_batches.get_row(first["batch_id"])["state"] == "queued"
+    assert score_batches.cancel(first["batch_id"], INTERNAL, "org-a", "proj-a")["state"] == (
+        "cancelled"
+    )
+
+
+def test_images_for_a_model_without_image_input_are_rejected_at_submit():
+    image = {"type": "image_url", "image_url": {"url": "data:image/png;base64,iVBORw0KGgo="}}
+    body = {
+        "model": "Qwen/Qwen3.5-0.8B",
+        "requests": [
+            {"messages": [{"role": "user", "content": "plain"}]},
+            {"messages": [{"role": "user", "content": [{"type": "text", "text": "x"}, image]}]},
+        ],
+    }
+    with pytest.raises(HTTPException) as exc:
+        _submit(body)
+    assert exc.value.status_code == 400
+    assert "request 2" in exc.value.detail
+    assert "image" in exc.value.detail
+
+
 def test_null_concurrency_is_a_bad_request_not_a_server_error():
     with pytest.raises(HTTPException) as exc:
         _submit(_body(concurrency=None))
@@ -575,7 +620,7 @@ def test_a_request_waiting_for_a_slot_does_not_start_after_cancel():
     runner = score_batches.ScoreBatchRunner(send=lambda *a: pytest.fail("must not send"))
     row = runner._claim(time.time())
     work = score_batches._Batch(runner, row)
-    score_batches.cancel(batch["batch_id"], INTERNAL)
+    score_batches.cancel(batch["batch_id"], INTERNAL, "org-test")
     with pytest.raises(score_batches._Cancelled):
         work.send({"messages": []})
 

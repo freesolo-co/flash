@@ -27,11 +27,22 @@ def submit_score_batch(
 
 
 @router.get("/v1/score-batches/{batch_id}")
-def score_batch(batch_id: str, key: Annotated[dict, Depends(require_key)]):
+def score_batch(
+    batch_id: str,
+    key: Annotated[dict, Depends(require_key)],
+    x_freesolo_org_id: Annotated[str | None, Header()] = None,
+    x_freesolo_project_id: Annotated[str | None, Header()] = None,
+):
     """Progress while active; every result, in request order, once the batch is terminal."""
-    return score_batches.public(score_batches.owned_row(batch_id, key), include_results=True)
+    row = score_batches.owned_row(batch_id, key, x_freesolo_org_id, x_freesolo_project_id)
+    return score_batches.public(row, include_results=True)
 
 
 @router.delete("/v1/score-batches/{batch_id}")
-def cancel_score_batch(batch_id: str, key: Annotated[dict, Depends(require_key)]):
-    return score_batches.cancel(batch_id, key)
+def cancel_score_batch(
+    batch_id: str,
+    key: Annotated[dict, Depends(require_key)],
+    x_freesolo_org_id: Annotated[str | None, Header()] = None,
+    x_freesolo_project_id: Annotated[str | None, Header()] = None,
+):
+    return score_batches.cancel(batch_id, key, x_freesolo_org_id, x_freesolo_project_id)
