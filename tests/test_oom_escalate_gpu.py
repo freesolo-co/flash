@@ -678,8 +678,9 @@ def test_free_vram_reads_nvml_and_never_starts_cuda(monkeypatch):
     )
     monkeypatch.setitem(sys.modules, "pynvml", pynvml)
 
-    assert lc.free_vram_gb() == pytest.approx(3.4, abs=0.05)
-    assert lc.total_vram_gb() == pytest.approx(22.5, abs=0.05)
+    free, total = lc._nvml_memory_gb(0)
+    assert free == pytest.approx(3.4, abs=0.05)
+    assert total == pytest.approx(22.5, abs=0.05)
 
 
 def test_cuda_oom_allocation_detail_recovers_the_numbers_the_token_drops():

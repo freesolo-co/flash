@@ -16,7 +16,7 @@ import os
 import pytest
 
 from flash.content.thinking import messages_for_chat_template
-from flash.engine.profiling.workload_profile import (
+from flash.engine.profiling.reasoning_render import (
     marked_reasoning_end,
     reasoned_assistant_turns,
     reasoning_marker_prefix,

@@ -103,17 +103,6 @@ def canonical_environment_id(value: str) -> str:
     return parsed.canonical()
 
 
-def managed_slug_to_github_ref(value: str) -> str:
-    parsed = _parse_managed_environment_slug(value)
-    if parsed is None:
-        raise ValueError(f"not a Freesolo environment slug: {value!r}")
-    namespace, project, name = parsed
-    return (
-        f"github:{_DEFAULT_MANAGED_ENV_REPO}@{_DEFAULT_GITHUB_REF}:"
-        f"{namespace}/{project}/{name}/{_DEFAULT_ENVIRONMENT_PATH}"
-    )
-
-
 def canonical_managed_environment_slug(value: str) -> str | None:
     if _parse_managed_environment_slug(value) is not None:
         return value

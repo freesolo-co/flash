@@ -8,13 +8,12 @@ import pytest
 def test_allocation_skips_cheaper_unvalidated_class(monkeypatch):
     """A cheaper fitting class stays excluded until it is validated."""
     from flash.providers.core import allocator
-    from flash.providers.core.base import GPU_INFO, VALIDATED, GpuClass
+    from flash.providers.core.base import GPU_INFO, GpuClass
 
     synthetic = GpuClass(
         "synthetic cheap gpu",
         "NVIDIA_SYNTHETIC_CHEAP",
         24,
-        "syntheticcheap",
         "sm80",
         0.01,
     )
@@ -27,7 +26,7 @@ def test_allocation_skips_cheaper_unvalidated_class(monkeypatch):
     assert synthetic.vram_gb >= allocation.min_vram_gb
     assert synthetic.hourly_usd < allocation.hourly_usd
     assert synthetic.name not in {candidate.gpu for candidate in allocation.candidates}
-    assert all(candidate.gpu in VALIDATED for candidate in allocation.candidates)
+    assert all(GPU_INFO[candidate.gpu].validated for candidate in allocation.candidates)
 
 
 def test_provider_allocation_lands_on_full_validated_cards():

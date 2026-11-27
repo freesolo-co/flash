@@ -48,7 +48,6 @@ class _RunTarget:
     repo_id: str
     prefix: str  # "<phase>/<run_id>"
     run_id: str
-    age_ts: float | None  # newest-commit epoch of the prefix (fallback: run-id epoch)
 
 
 def _now() -> float:
@@ -72,7 +71,7 @@ def _is_managed_env_repo(repo_id) -> bool:
     """True only for ``<artifact namespace>/flashrun-*`` dataset repos (the hard allowlist).
 
     Reads the namespace through ``artifact_namespace()`` so the allowlist always names the same
-    place ``managed_artifact_repo_for_environment`` creates repos in; a fixed constant here would stop
+    place ``managed_artifact_repo_for_run`` creates repos in; a fixed constant here would stop
     matching the moment an operator sets ``FLASH_ARTIFACT_NAMESPACE``, silently disabling the GC."""
     if not isinstance(repo_id, str):
         return False
@@ -259,9 +258,7 @@ def _collect_targets(api, live, whole, now: float, max_age_s: float) -> list[_Ru
                     continue  # recently active (in-flight or just finished)
                 if warm_src:
                     continue  # warm-start source for a recent child (referenced_by marker)
-                targets.append(
-                    _RunTarget(repo_id=repo, prefix=pfx, run_id=pfx.split("/", 1)[1], age_ts=ts)
-                )
+                targets.append(_RunTarget(repo_id=repo, prefix=pfx, run_id=pfx.split("/", 1)[1]))
     if unknown_tops:
         logger.info(
             "repo GC: skipped unrecognized non-artifact dirs (never deleted): %s",

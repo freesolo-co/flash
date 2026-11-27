@@ -553,7 +553,6 @@ def _decode_image_data_uris(image_data_uris: list[str]) -> list:
 
 def _processor_glue_ids(
     processor,
-    tokenizer,
     messages: list[dict],
     images: list,
     *,
@@ -633,7 +632,6 @@ def parent_environment_glue(
     try:
         token_ids = _processor_glue_ids(
             processor,
-            tokenizer,
             structured,
             images,
             apply_chat_template_kwargs={
@@ -697,7 +695,6 @@ class EnvGlueProcessor:
             mm_processor_kwargs = self.loop_self._get_mm_processor_kwargs(None)
             token_ids = _processor_glue_ids(
                 processor,
-                self.loop_self.tokenizer,
                 structured,
                 images,
                 apply_chat_template_kwargs=self.apply_chat_template_kwargs,

@@ -6,7 +6,7 @@ import time
 
 import httpx
 import pytest
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException
 
 from flash.server.domain.ops import score_batches
 from flash.server.platform import db
@@ -331,19 +331,13 @@ def test_checkpoint_batches_validate_each_request_through_managed_chat(monkeypat
     assert seen[0] == ("flash-1-abc", "flash-1-abc/final")
 
 
-def test_checkpoint_requests_forward_through_managed_chat_pinned_to_lambda(monkeypatch):
+def test_checkpoint_requests_forward_through_managed_chat(monkeypatch):
     from flash.server.routes import serving_chat
 
     captured = {}
 
-    def managed_chat(run_id, payload, key, org, project, *, timeout_s, serving_provider):
-        captured.update(
-            run_id=run_id,
-            payload=payload,
-            key=key,
-            timeout_s=timeout_s,
-            serving_provider=serving_provider,
-        )
+    def managed_chat(run_id, payload, key, org, project, *, timeout_s):
+        captured.update(run_id=run_id, payload=payload, key=key, timeout_s=timeout_s)
         return {"ok": True}
 
     monkeypatch.setattr(serving_chat, "managed_chat", managed_chat)
@@ -354,13 +348,11 @@ def test_checkpoint_requests_forward_through_managed_chat_pinned_to_lambda(monke
         "project_id": "proj",
     }
     assert score_batches._send_request(row, INTERNAL, {"messages": []}) == {"ok": True}
-    assert captured["serving_provider"] == "lambda"
     assert captured["payload"]["checkpoint_id"] == "flash-1-abc/step-4"
     assert captured["timeout_s"] == score_batches.REQUEST_TIMEOUT_SECONDS
 
 
-def test_base_requests_forward_to_serving_pinned_to_lambda(monkeypatch):
-    import flash.serve.deployment.deploy as serving_deploy
+def test_base_requests_forward_to_serving_billed_to_the_org(monkeypatch):
     from flash.serve.request import transport
 
     captured = {}
@@ -377,54 +369,11 @@ def test_base_requests_forward_to_serving_pinned_to_lambda(monkeypatch):
         row, INTERNAL, {"messages": [{"role": "user", "content": "hi"}], "max_tokens": 5}
     )
     assert result == {"ok": True}
-    assert captured["headers"]["X-Flash-Serving-Provider"] == "lambda"
     assert captured["headers"]["X-Freesolo-Org-Id"] == "org-test"
     assert captured["run_id"] == MODEL
     assert captured["chat_template_kwargs"]["enable_thinking"] is True
     assert captured["thinking"] is True
     assert captured["max_tokens"] == 5
-    assert serving_deploy._provider_header(None) == {}
-
-
-def test_checkpoint_chat_sends_the_provider_pin(monkeypatch):
-    import flash.serve.deployment.deploy as serving_deploy
-    from flash.serve.request import transport
-
-    captured = {}
-    monkeypatch.setattr(
-        transport, "request_chat_json", lambda _c, **kwargs: captured.update(kwargs) or {}
-    )
-    monkeypatch.setattr(transport, "serving_openai_base_url", lambda: "https://serving/v1")
-    serving_deploy.chat("flash-1-abc/final", [], org_id="org", serving_provider="lambda")
-    assert captured["headers"]["X-Flash-Serving-Provider"] == "lambda"
-    serving_deploy.chat("flash-1-abc/final", [], org_id="org")
-    assert "X-Flash-Serving-Provider" not in captured["headers"]
-
-
-def _request(headers):
-    raw = [(k.lower().encode(), v.encode()) for k, v in headers.items()]
-    return Request({"type": "http", "headers": raw})
-
-
-def test_only_trusted_internal_callers_can_pin_serving_to_lambda():
-    from flash.serving.src.http import provider_pin
-
-    provider_pin.pin_from_request(
-        _request({"X-Flash-Serving-Provider": "lambda"}), trusted_internal=True
-    )
-    assert provider_pin.lambda_pinned()
-    provider_pin.pin_from_request(_request({}), trusted_internal=True)
-    assert not provider_pin.lambda_pinned()
-    with pytest.raises(HTTPException) as exc:
-        provider_pin.pin_from_request(
-            _request({"X-Flash-Serving-Provider": "lambda"}), trusted_internal=False
-        )
-    assert exc.value.status_code == 403
-    with pytest.raises(HTTPException) as exc:
-        provider_pin.pin_from_request(
-            _request({"X-Flash-Serving-Provider": "modal"}), trusted_internal=True
-        )
-    assert exc.value.status_code == 400
 
 
 def test_routes_submit_poll_and_cancel():

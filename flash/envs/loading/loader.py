@@ -39,9 +39,6 @@ from flash.envs.meta.dataset_selection import (
     _packaged_dataset_file as _packaged_dataset_file,
 )
 from flash.envs.meta.dataset_selection import (
-    _plural_dataset_file as _plural_dataset_file,
-)
-from flash.envs.meta.dataset_selection import (
     _validate_packaged_dataset_split as _validate_packaged_dataset_split,
 )
 from flash.envs.meta.dataset_selection import (
@@ -53,15 +50,6 @@ from flash.envs.meta.dataset_selection import (
 # tests and sibling modules have always reached them through loader.
 from flash.envs.meta.identity import (
     _DEFAULT_ENVIRONMENT_PATH as _DEFAULT_ENVIRONMENT_PATH,
-)
-from flash.envs.meta.identity import (
-    _DEFAULT_GITHUB_REF as _DEFAULT_GITHUB_REF,
-)
-from flash.envs.meta.identity import (
-    _DEFAULT_MANAGED_ENV_REPO as _DEFAULT_MANAGED_ENV_REPO,
-)
-from flash.envs.meta.identity import (
-    _GITHUB_SAFE_PART_RE as _GITHUB_SAFE_PART_RE,
 )
 from flash.envs.meta.identity import (
     GitHubEnvironmentRef as GitHubEnvironmentRef,
@@ -79,12 +67,6 @@ from flash.envs.meta.identity import (
     GitHubUnavailableError as GitHubUnavailableError,
 )
 from flash.envs.meta.identity import (
-    _is_safe_github_path_parts as _is_safe_github_path_parts,
-)
-from flash.envs.meta.identity import (
-    _managed_environment_ref_error as _managed_environment_ref_error,
-)
-from flash.envs.meta.identity import (
     _normalize_env_path as _normalize_env_path,
 )
 from flash.envs.meta.identity import (
@@ -92,9 +74,6 @@ from flash.envs.meta.identity import (
 )
 from flash.envs.meta.identity import (
     _parse_managed_environment_slug as _parse_managed_environment_slug,
-)
-from flash.envs.meta.identity import (
-    _targets_managed_environment_repo as _targets_managed_environment_repo,
 )
 from flash.envs.meta.identity import (
     canonical_managed_environment_slug as canonical_managed_environment_slug,
@@ -110,9 +89,6 @@ from flash.envs.meta.identity import (
 )
 from flash.envs.meta.identity import (
     is_managed_environment_slug as is_managed_environment_slug,
-)
-from flash.envs.meta.identity import (
-    managed_slug_to_github_ref as managed_slug_to_github_ref,
 )
 from flash.envs.package.limits import (
     ARCHIVE_MEMBER_LIMIT,
@@ -166,7 +142,6 @@ _CACHE_MAX_BYTES = 4 * 1024 * 1024 * 1024
 _CACHE_MIN_AGE_SECONDS = 600
 _MAX_ARCHIVE_BYTES = 256 * 1024 * 1024
 _MAX_TARBALL_BYTES = 1024 * 1024 * 1024
-_MAX_CONTENTS_JSON_BYTES = 16 * 1024 * 1024
 _DOWNLOAD_CHUNK_BYTES = 1024 * 1024
 _MAX_ARCHIVE_MEMBERS = ARCHIVE_MEMBER_LIMIT
 _MAX_ARCHIVE_SCAN_MEMBERS = ARCHIVE_SCAN_MEMBER_LIMIT
@@ -718,8 +693,3 @@ def load_freesolo_environment(env_id: str, pinned_sha: str | None = None, /, **k
     # pinned_sha is positional-only so a user param named pinned_sha cannot shadow it.
     reference = _resolve_environment_reference(env_id, pinned_sha)
     return _load_resolved_freesolo_environment(env_id, reference, kwargs)
-
-
-from flash.envs.meta.namespace_listing import (  # noqa: E402
-    list_managed_namespace_slugs as list_managed_namespace_slugs,
-)

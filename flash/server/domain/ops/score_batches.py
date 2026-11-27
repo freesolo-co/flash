@@ -1,10 +1,9 @@
 """Score batches: run many chat requests against one model on Lambda and return them together.
 
 A caller submits every request at once (``POST /v1/score-batches``) and polls one batch id. The
-batch runs only on the Lambda GPU pool: each generation carries the serving provider pin, so it
-never boots the Modal GPU fallback. Lambda does not always have capacity, so the batch first sends
-one probe request and keeps resending it until Lambda serves it (the router itself waits up to an
-hour for a Lambda worker per attempt). Only then does it fan out the rest. Results are returned
+batch runs on Lambda, the only GPU pool hosted Qwen serves on. Lambda does not always have
+capacity, so the batch first sends one probe request and keeps resending it until Lambda serves it
+(the router itself waits up to an hour for a Lambda worker per attempt). Only then does it fan out the rest. Results are returned
 only when every request has finished, all at once.
 
 Batches are durable. The row lives in the control-plane SQLite store and the requests and results
@@ -33,7 +32,6 @@ import httpx
 from fastapi import HTTPException
 
 from flash._internal.paths import data_dir
-from flash.serve.contract.protocol import LAMBDA_SERVING_PROVIDER
 from flash.server.platform import db
 
 logger = logging.getLogger(__name__)
@@ -468,7 +466,7 @@ def public(row: dict, *, include_results: bool) -> dict:
         "batch_id": row["batch_id"],
         "client_batch_id": row["client_batch_id"],
         "state": row["state"],
-        "provider": LAMBDA_SERVING_PROVIDER,
+        "provider": "lambda",
         ("checkpoint_id" if row["run_id"] else "model"): row["target"],
         "total": row["total"],
         "completed": len(results),
@@ -752,7 +750,7 @@ class _Batch:
 
 
 def _send_request(row: dict, key: dict, request: dict) -> dict:
-    """Forward one request to serving, pinned to Lambda. Raises on failure."""
+    """Forward one request to serving (Lambda). Raises on failure."""
     if row["run_id"]:
         from flash.server.routes import serving_chat
 
@@ -763,7 +761,6 @@ def _send_request(row: dict, key: dict, request: dict) -> dict:
             row["org_id"],
             row["project_id"],
             timeout_s=REQUEST_TIMEOUT_SECONDS,
-            serving_provider=LAMBDA_SERVING_PROVIDER,
         )
     import flash.serve.deployment.deploy as serving_deploy
     from flash.serve.request.openai import parse_chat_request
@@ -785,7 +782,6 @@ def _send_request(row: dict, key: dict, request: dict) -> dict:
         parsed.messages,
         org_id=row["org_id"],
         timeout_s=REQUEST_TIMEOUT_SECONDS,
-        serving_provider=LAMBDA_SERVING_PROVIDER,
         api_key_id=row.get("api_key_id"),
         temperature=parsed.temperature,
         max_tokens=parsed.max_tokens,

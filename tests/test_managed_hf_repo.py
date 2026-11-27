@@ -78,18 +78,6 @@ def test_managed_hf_repo_finalizes_local_run_id(monkeypatch):
     )
 
 
-def test_managed_hf_repo_reuses_repo_for_same_environment():
-    env_id = "github:owner/repo@main:env/environment.py"
-    assert runner_artifacts.managed_artifact_repo_for_environment(
-        env_id
-    ) == runner_artifacts.managed_artifact_repo_for_environment(env_id)
-    assert runner_artifacts.managed_artifact_repo_for_environment(
-        env_id
-    ) != runner_artifacts.managed_artifact_repo_for_environment(
-        "github:owner/repo@main:env/other.py"
-    )
-
-
 def test_source_archive_path_is_content_addressed():
     from flash.snapshot.archive import canonical_archive_path
 
@@ -108,7 +96,6 @@ def test_concurrent_runs_do_not_share_the_repository_commit_quota():
     assert one != runner_artifacts.managed_artifact_repo_for_run(
         "another/environment", "flash-run-1"
     )
-    assert one != runner_artifacts.managed_artifact_repo_for_environment(env)
     validate_repo_id(one)
     validate_repo_id(runner_artifacts.managed_artifact_repo_for_run(env, "long/" * 100))
 
@@ -119,7 +106,7 @@ def test_existing_preparation_keeps_legacy_repository_during_recovery(monkeypatc
     spec = _spec()
     monkeypatch.setattr(runner_state, "RUNS_DIR", str(tmp_path / "runs"))
     satisfy_sft_profile(monkeypatch, spec)
-    legacy = runner_artifacts.managed_artifact_repo_for_environment(spec.environment.id)
+    legacy = f"{runner_artifacts.artifact_namespace()}/flashrun-legacy-environment-0123456789abcdef"
 
     def legacy_assignment(job):
         raw = job.to_internal_dict()

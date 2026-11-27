@@ -15,10 +15,9 @@ Two fingerprints, because "out of date" has two flavors with very different cost
     itself (it decides which kernels get compiled).
 
   * fp_base = hash of everything else baked into :cu128 that is NOT in the cache (FA2 wheel spec
-    AND their sha256 digests, causal-conv1d, the non-kernel pip stack, and the baked rp_handler =
-    endpoints.py + make_rp_handler.py). Changing one of these leaves the cache valid but means the
-    per-arch tag is sitting on an old base, so it just needs a cheap re-layer (no GPU). fp_base folds
-    fp_cache in, so it always moves when fp_cache does.
+    AND their sha256 digests, causal-conv1d, and the non-kernel pip stack). Changing one of these
+    leaves the cache valid but means the per-arch tag is sitting on an old base, so it just needs a
+    cheap re-layer (no GPU). fp_base folds fp_cache in, so it always moves when fp_cache does.
 
 A stale baked cache can cause cold-JIT when backend cache keys no longer match. The worker
 validates the GPU architecture; these fingerprints track changes to the image and warmup inputs.

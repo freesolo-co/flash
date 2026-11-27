@@ -399,14 +399,11 @@ from flash.engine.worker.train.entry.backend_common import (  # noqa: E402,F401
     verl_step_number,
 )
 from flash.engine.worker.train.sft.setup.checkpoints import (  # noqa: E402,F401
-    _copy_processing_sidecars,
     _export_checkpoint_adapter,
     _VerlCheckpointWatcher,
 )
 from flash.engine.worker.train.sft.setup.config import (  # noqa: E402,F401
-    _REQUIRED_OVERRIDE_KEYS,
     _hydra_val,
-    _sft_parquet_features,
     _write_sft_parquet,
     build_sft_overrides,
 )

@@ -3,7 +3,7 @@ from __future__ import annotations
 import pytest
 from pydantic import ValidationError
 
-from flash.serve.contract.provenance import immutable_binding_fingerprint
+from flash.serve.contract.provenance import immutable_binding_fingerprint, record_key
 from flash.serving.src.io.schemas import (
     AdapterRecord,
     ImmutableCheckpointRegistration,
@@ -45,7 +45,7 @@ def test_base_model_identity_is_not_a_checkpoint() -> None:
     assert record.model_id == "Qwen/Qwen3.5-9B"
     assert not record.is_checkpoint
     with pytest.raises(ValueError, match="base-model records"):
-        _ = record.storage_key
+        record_key(record)
     with pytest.raises(ValidationError, match="canonical checkpoint identity"):
         ImmutableCheckpointRegistration.model_validate(_payload(model_id=record.model_id))
 

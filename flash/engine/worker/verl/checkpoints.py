@@ -440,7 +440,6 @@ def export_peft_adapter(
     ckpt_actor_dir: str,
     out_adapter_dir: str,
     *,
-    base_model_id: str,
     python_bin: str,
 ) -> None:
     """turn verl's saved lora checkpoint into a flash-servable peft adapter dir.

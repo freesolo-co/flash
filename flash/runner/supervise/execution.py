@@ -465,7 +465,7 @@ def _submit_provider(ctx: _SubmitContext, prepared, candidate_plan):
             # persisted one still carries the queue allowance, and the bootstrap
             # enforces whatever absolute deadline it is handed regardless of
             # max_wall_seconds. see _worker_deadline_at.
-            "_deadline_at": _worker_deadline_at(ctx.spec.run_id, run_spec),
+            "_deadline_at": _worker_deadline_at(ctx.spec.run_id),
         }
         if attempt_runtime_secrets:
             submit_kwargs["runtime_secrets"] = attempt_runtime_secrets

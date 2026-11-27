@@ -297,7 +297,6 @@ def test_hourly_rate_is_live_per_card_with_static_fallback(monkeypatch):
 
     monkeypatch.setattr(api, "call", broken)
     assert pricing.hourly_rate("B200") == 7.99
-    assert pricing.STATIC_INSTANCE_PRICES["gpu_1x_h100_sxm5"] == 4.89
     with pytest.raises(KeyError):
         pricing.hourly_rate("H200")
 

@@ -26,7 +26,6 @@ from flash.serving.src.http.headers import (
     optional_internal_org_id,
     training_scope_headers,
 )
-from flash.serving.src.http.provider_pin import pin_from_request
 from flash.serving.src.http.rate_limit import RateLimiter
 from flash.serving.src.http.routing import AdapterRouter, EnginePool
 from flash.serving.src.io.schemas import AdapterRecord
@@ -120,9 +119,7 @@ class ServingContext:
         return internal_org_id(request)
 
     async def authorize_inference(self, request: Request, model_id: str) -> InferenceAuthorization:
-        trusted = is_trusted_internal(request, self.trusted_internal_keys)
-        pin_from_request(request, trusted_internal=trusted)
-        if trusted:
+        if is_trusted_internal(request, self.trusted_internal_keys):
             acting = (request.headers.get(ACTING_API_KEY_HEADER) or "").strip() or None
             return TrustedInternalAuthorization(
                 org_id=optional_internal_org_id(request), api_key_id=acting

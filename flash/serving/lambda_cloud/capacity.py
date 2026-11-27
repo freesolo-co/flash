@@ -22,7 +22,10 @@ async def launch_with_capacity_wait(launch, *args, clock=time.monotonic, sleep=a
                 remaining = deadline - clock()
                 if remaining <= 0:
                     raise TimeoutError("Lambda capacity unavailable after one hour") from None
-                logger.warning("Lambda scale-up capacity unavailable; checking again in one minute")
+                logger.warning(
+                    "Lambda scale-up capacity unavailable; checking again in %ss",
+                    LAMBDA_SCALE_POLL_SECONDS,
+                )
                 await sleep(min(LAMBDA_SCALE_POLL_SECONDS, remaining))
                 if clock() >= deadline:
                     raise TimeoutError("Lambda capacity unavailable after one hour") from None

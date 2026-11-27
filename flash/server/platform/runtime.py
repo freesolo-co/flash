@@ -790,7 +790,7 @@ def _classify_recoverable_runs(
                 from flash.providers.core.registry import terminate_persisted_resources
 
                 try:
-                    terminate_persisted_resources(status.spec, status.run_id)
+                    terminate_persisted_resources(status.run_id)
                 except Exception:
                     _log.warning(
                         "cleanup failed for run %s; orphan sweep will retry",

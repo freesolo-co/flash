@@ -23,11 +23,13 @@ def baked(monkeypatch, tmp_path):
         FLASHINFER_AOT_DIR=tmp_path / "builtin",
         FLASHINFER_JIT_DIR=tmp_path / "jit",
     )
-    source = env.FLASHINFER_JIT_DIR / cache.MODULE / f"{cache.MODULE}.so"
-    source.parent.mkdir(parents=True)
-    source.write_bytes(b"compiled-fixture")
-    cache.publish(env, torch)
-    return env, tmp_path / "cache" / "aot"
+    env.FLASHINFER_JIT_DIR.mkdir()
+    root = tmp_path / "cache" / "aot"
+    library = root / cache.MODULE / f"{cache.MODULE}.so"
+    library.parent.mkdir(parents=True)
+    library.write_bytes(b"compiled-fixture")
+    (root / "manifest.json").write_text(json.dumps(cache._identity(env, torch), sort_keys=True))
+    return env, root
 
 
 def test_portable_library_uses_aot_without_ninja_or_source_files(baked):

@@ -10,7 +10,7 @@ from collections.abc import AsyncIterator
 from typing import Any, Protocol
 
 from flash.schema import parse_checkpoint_ref
-from flash.serving.app.inference_provider import modal_gpus_for, policy_for
+from flash.serving.app.inference_provider import policy_for
 from flash.serving.lambda_cloud import reserved
 from flash.serving.lambda_cloud.config import placements
 from flash.serving.src.engine.model_config import (
@@ -125,9 +125,7 @@ def health_body(
     # not expose here. ``gpus`` is the supported base-model engine count and remains stable when
     # demand-driven containers scale to zero.
     gpu_by_model = {
-        m: " | ".join(dict.fromkeys([*placements(m), *modal_gpus_for(m)]))
-        if m.startswith("Qwen/")
-        else gpu_for(m)
+        m: " | ".join(placements(m)) if m.startswith("Qwen/") else gpu_for(m)
         for m in supported_models
     }
     # Production serves the reserved models only from their reserved H100 slots.
@@ -146,11 +144,6 @@ def health_body(
         if len(primary_providers) == 1
         else "mixed",
         "provider_by_model": providers,
-        "fallback_provider_by_model": {
-            m: "modal"
-            for m in supported_models
-            if m.startswith("Qwen/") and m not in reserved_models
-        },
         "capacity_by_model": {
             m: {
                 "min": len(reserved.slots_for(m))

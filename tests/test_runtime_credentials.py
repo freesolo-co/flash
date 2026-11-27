@@ -102,7 +102,7 @@ def test_recovered_training_forwards_original_credentials_to_the_provider(run, m
 
     monkeypatch.setattr(lifecycle, "_run_attempts_supervised", train)
     monkeypatch.setattr(recovery, "_adopt_completed_attempt", lambda *args, **kwargs: True)
-    lifecycle._run_training(spec, io.StringIO(), prior_cost=0, source_snapshot={})
+    lifecycle._run_training(spec, io.StringIO(), source_snapshot={})
     assert captured["runtime_secrets"] == credentials
 
 

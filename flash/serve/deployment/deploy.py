@@ -713,23 +713,12 @@ def chat_stream(
     )
 
 
-def _provider_header(serving_provider: str | None) -> dict[str, str]:
-    if serving_provider is None:
-        return {}
-    from flash.serve.contract.protocol import LAMBDA_SERVING_PROVIDER, SERVING_PROVIDER_HEADER
-
-    if serving_provider != LAMBDA_SERVING_PROVIDER:
-        raise ValueError(f"serving_provider must be {LAMBDA_SERVING_PROVIDER!r}")
-    return {SERVING_PROVIDER_HEADER: serving_provider}
-
-
 def base_chat(
     model: str,
     messages: list[dict],
     *,
     org_id: str,
     timeout_s: float,
-    serving_provider: str | None = None,
     api_key_id: str | None = None,
     temperature: float = 0.0,
     max_tokens: int = 512,
@@ -758,7 +747,6 @@ def base_chat(
     if not org_id:
         raise ValueError("base-model chat requires an organization to attribute usage to")
     headers = transport._internal_key_header(org_id=org_id)
-    headers.update(_provider_header(serving_provider))
     if api_key_id:
         from flash.serve.contract.protocol import ACTING_API_KEY_HEADER
 
@@ -820,7 +808,6 @@ def chat(
     tool_choice: str | None = None,
     parallel_tool_calls: bool | None = None,
     logprob_token_ids: list[int] | tuple[int, ...] | None = None,
-    serving_provider: str | None = None,
 ) -> dict:
     """Send an OpenAI-style chat request for the run's adapter to freesolo serving.
 
@@ -829,7 +816,6 @@ def chat(
     recognized unavailable-envelope classification so its caller can retry within one deadline.
     ``stop`` carries the run's own stop sequences so a model trained to terminate on a delimiter
     rather than EOS finishes on ``stop`` instead of running to ``max_tokens``.
-    ``serving_provider="lambda"`` pins the generation to the Lambda pool (no Modal GPU fallback).
     """
     # follow_redirects: modal 303-redirects slow cold-start requests across many poll cycles
     # before the result is ready, bounded by the transport redirect limit on the serving origin.
@@ -838,7 +824,6 @@ def chat(
     headers = transport._internal_key_header(org_id=org_id)
     if expected_checkpoint:
         headers["X-Freesolo-Expected-Checkpoint"] = expected_checkpoint
-    headers.update(_provider_header(serving_provider))
     timeout = 30 * 60.0 if timeout_s is None else max(0.0, float(timeout_s))
     client_context = (
         transport._new_serving_client()
