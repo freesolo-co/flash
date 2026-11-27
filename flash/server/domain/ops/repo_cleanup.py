@@ -72,7 +72,7 @@ def _is_managed_env_repo(repo_id) -> bool:
     """True only for ``<artifact namespace>/flashrun-*`` dataset repos (the hard allowlist).
 
     Reads the namespace through ``artifact_namespace()`` so the allowlist always names the same
-    place ``managed_artifact_repo_for_environment`` creates repos in; a fixed constant here would stop
+    place ``managed_artifact_repo_for_run`` creates repos in; a fixed constant here would stop
     matching the moment an operator sets ``FLASH_ARTIFACT_NAMESPACE``, silently disabling the GC."""
     if not isinstance(repo_id, str):
         return False

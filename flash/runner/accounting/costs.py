@@ -149,12 +149,6 @@ def _attempt_meters(status: RunStatus, spec, *, completed_attempt=None) -> dict[
     return attempts or None
 
 
-def metered_training_seconds(status: RunStatus, spec) -> float | None:
-    """Measured GPU training seconds across every attempt, or ``None`` for a legacy worker."""
-    attempts = _attempt_meters(status, spec)
-    return None if attempts is None else sum(entry["s"] for entry in attempts.values())
-
-
 def metered_charge_usd(
     status: RunStatus, spec, *, rented_remote: dict | None = None, completed_attempt=None
 ):

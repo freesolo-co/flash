@@ -267,13 +267,13 @@ def test_artifact_namespace_is_operator_configurable(monkeypatch) -> None:
 
     monkeypatch.delenv("FLASH_ARTIFACT_NAMESPACE", raising=False)
     assert runner_artifacts.artifact_namespace() == runner_artifacts._DEFAULT_ARTIFACT_NAMESPACE
-    assert runner_artifacts.managed_artifact_repo_for_environment("env-1").startswith(
+    assert runner_artifacts.managed_artifact_repo_for_run("env-1", "flash-run-1").startswith(
         f"{runner_artifacts._DEFAULT_ARTIFACT_NAMESPACE}/"
     )
 
     monkeypatch.setenv("FLASH_ARTIFACT_NAMESPACE", "self-hoster")
     assert runner_artifacts.artifact_namespace() == "self-hoster"
-    assert runner_artifacts.managed_artifact_repo_for_environment("env-1").startswith(
+    assert runner_artifacts.managed_artifact_repo_for_run("env-1", "flash-run-1").startswith(
         "self-hoster/"
     )
     # the GC allowlist must follow the same namespace, or it silently stops matching
@@ -521,7 +521,7 @@ def test_startup_rejects_an_artifact_namespace_that_cannot_form_a_repo_id(monkey
     """Presence was the whole check, so a malformed namespace boots and then fails every submit.
 
     `owner/repo` is the natural spelling for anyone used to HuggingFace ids, and
-    `managed_artifact_repo_for_environment` appends the repo name to it -- producing a three-segment id
+    `managed_artifact_repo_for_run` appends the repo name to it -- producing a three-segment id
     HuggingFace rejects while creating the artifact repo, long after preflight called the plane
     healthy.
     """
@@ -551,9 +551,11 @@ def test_startup_rejects_an_artifact_namespace_that_cannot_form_a_repo_id(monkey
     # and the value it accepts must actually build a valid id, which is the property that failed.
     from huggingface_hub.utils import validate_repo_id
 
-    from flash.runner.accounting.artifacts import managed_artifact_repo_for_environment
+    from flash.runner.accounting.artifacts import managed_artifact_repo_for_run
 
-    validate_repo_id(managed_artifact_repo_for_environment("github:owner/project/envs@main:gsm8k"))
+    validate_repo_id(
+        managed_artifact_repo_for_run("github:owner/project/envs@main:gsm8k", "flash-run-1")
+    )
 
 
 def test_the_env_template_does_not_preset_the_hosted_serving_url() -> None:

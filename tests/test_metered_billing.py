@@ -313,7 +313,6 @@ def test_cancel_mid_first_update_bills_measured_time(tmp_path, monkeypatch):
 def test_a_legacy_worker_without_a_meter_pays_its_measured_fallback(tmp_path, monkeypatch):
     spec = _spec()
     _metrics(tmp_path, monkeypatch, spec, step=20, wall_seconds=1.0)
-    assert costs.metered_training_seconds(_status(spec), spec) is None
     # a completion without a meter pays the measured wall cost the caller computed, not the quote.
     charge = costs._status_estimated_charge(_status(spec, quote=12.34), spec, fallback=0.5)
     assert charge == pytest.approx(0.5)
@@ -490,7 +489,6 @@ def test_attempt_record_carries_meters_across_retries(tmp_path, monkeypatch):
     beat(2, 10.0)
     record = status.last_heartbeat[status_ops.BILLABLE_ATTEMPTS_KEY]
     assert {k: v["s"] for k, v in record.items()} == {"0": 400.0, "1": 50.0, "2": 10.0}
-    assert costs.metered_training_seconds(status, spec) == pytest.approx(460.0)
 
 
 def test_the_first_observed_heartbeat_is_metered_at_its_shape(tmp_path, monkeypatch):
@@ -516,7 +514,6 @@ def test_an_out_of_order_stale_sample_never_lowers_the_meter(tmp_path, monkeypat
     beat(0, 1800.0)  # published out of order (snapshotted before the upload lock)
     beat(1, 3600.0)
     status.state = "done"
-    assert costs.metered_training_seconds(status, spec) == pytest.approx(7200.0)
     assert costs._status_estimated_charge(status, spec, fallback=999.0) == pytest.approx(
         2 * H100_MODAL
     )

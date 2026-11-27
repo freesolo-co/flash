@@ -718,8 +718,3 @@ def load_freesolo_environment(env_id: str, pinned_sha: str | None = None, /, **k
     # pinned_sha is positional-only so a user param named pinned_sha cannot shadow it.
     reference = _resolve_environment_reference(env_id, pinned_sha)
     return _load_resolved_freesolo_environment(env_id, reference, kwargs)
-
-
-from flash.envs.meta.namespace_listing import (  # noqa: E402
-    list_managed_namespace_slugs as list_managed_namespace_slugs,
-)

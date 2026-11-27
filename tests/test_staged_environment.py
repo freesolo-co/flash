@@ -945,11 +945,11 @@ def test_package_descriptor_contains_only_immutable_transport_values(tmp_path) -
 
 
 def test_artifact_repository_identity_keeps_raw_environment_spelling(monkeypatch) -> None:
-    from flash.runner.accounting.artifacts import managed_artifact_repo_for_environment
+    from flash.runner.accounting.artifacts import managed_artifact_repo_for_run
 
     monkeypatch.setenv("FLASH_ARTIFACT_NAMESPACE", "owner")
     managed = "org/project/env"
     url = "https://github.com/freesolo-co/environment-hub/blob/main/org/project/env/environment.py"
-    assert managed_artifact_repo_for_environment(managed) != managed_artifact_repo_for_environment(
-        url
+    assert managed_artifact_repo_for_run(managed, "flash-run-1") != managed_artifact_repo_for_run(
+        url, "flash-run-1"
     )

@@ -953,7 +953,6 @@ from flash.engine.worker.verl.capabilities import (  # noqa: E402,F401
     rollout_sleep_unsupported,
     strict_gdn_probe_module,
     trainer_dtype_overrides,
-    verl_declares_rollout_field,
     verl_device_capability,
 )
 from flash.engine.worker.verl.checkpoints import (  # noqa: E402,F401
@@ -985,13 +984,10 @@ from flash.engine.worker.verl.diagnostics import (  # noqa: E402,F401
     CHILD_TAIL_LINES,
     RAY_FAILURE_LOGS,
     RAY_LOG_TAIL_BYTES,
-    STALL_TAIL_LINES,
     ChildOutputTail,
-    ChildTailStaleness,
     VerlChildSilenceWatchdog,
     build_verl_line_handler,
     collect_ray_failure_logs,
     latest_ray_session_dir,
     raise_for_classified_verl_exit,
-    stall_tail_fields,
 )

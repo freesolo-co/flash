@@ -78,10 +78,6 @@ def priority(gpu: str) -> int:
     return tuple(SPOT_GPUS).index(canonical_gpu(gpu))
 
 
-def running_limit(gpu: str) -> float:
-    return float(SPOT_GPUS[canonical_gpu(gpu)].keep_running_usd)
-
-
 def quote_rate() -> float:
     """Per-GPU rate every Spot quote is priced at: the costliest Spot class.
 

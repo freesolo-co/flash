@@ -647,18 +647,32 @@ def test_catalog_model_ids_are_the_cache_fitting_catalog():
     assert "Qwen/Qwen3.6-35B-A3B" in ids
 
 
+def _catalog_peak_gb() -> float:
+    """Peak GB the volume must hold to warm the WHOLE catalog onto one shared volume.
+
+    That is strictly more than any single model's own peak: every other cached model is resident
+    while the largest one is still downloading.
+    """
+    from flash.core.catalog import MODELS
+    from flash.runner.accounting.weight_cache import _download_gb, _fits_weight_cache, _peak_gb
+
+    cached = [info for info in MODELS.values() if _fits_weight_cache(info)]
+    if not cached:
+        return 0.0
+    largest = max(cached, key=_download_gb)
+    resident_others = sum(_download_gb(info) for info in cached if info is not largest)
+    return resident_others + _peak_gb(largest)
+
+
 def test_volume_holds_whole_catalog_with_largest_model_in_transit():
     """The volume must fit every model resident PLUS the largest one's download scratch.
 
     Persistent volumes evict nothing, so download order cannot prevent the observed 200 GB
     "Disk quota exceeded" failure.
     """
-    from flash.runner.accounting.weight_cache import (
-        WEIGHT_CACHE_VOLUME_GB,
-        weight_cache_catalog_peak_gb,
-    )
+    from flash.runner.accounting.weight_cache import WEIGHT_CACHE_VOLUME_GB
 
-    needed = weight_cache_catalog_peak_gb()
+    needed = _catalog_peak_gb()
     assert needed <= WEIGHT_CACHE_VOLUME_GB, (
         f"catalog needs {needed:.1f} GB at peak but the volume is {WEIGHT_CACHE_VOLUME_GB} GB: "
         "the largest model will fail with Disk quota exceeded on every datacenter"
@@ -672,10 +686,7 @@ def test_catalog_peak_counts_others_resident_not_just_the_largest():
     the largest model's own peak and the plain resident total.
     """
     from flash.core.catalog import MODELS
-    from flash.runner.accounting.weight_cache import (
-        _fits_weight_cache,
-        weight_cache_catalog_peak_gb,
-    )
+    from flash.runner.accounting.weight_cache import _fits_weight_cache
 
     sizes = sorted(
         ((info.params_b or 0.0) * 2.0 for info in MODELS.values() if _fits_weight_cache(info)),
@@ -683,7 +694,7 @@ def test_catalog_peak_counts_others_resident_not_just_the_largest():
     )
     resident_total = sum(sizes)
     largest_alone_peak = 2.0 * sizes[0]
-    needed = weight_cache_catalog_peak_gb()
+    needed = _catalog_peak_gb()
 
     assert needed > largest_alone_peak, "peak ignores the models already on the volume"
     assert needed > resident_total, "peak ignores the largest model's in-transit scratch"
