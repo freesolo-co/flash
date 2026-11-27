@@ -93,6 +93,12 @@ def _internal_http_error(*, status: int, raw: bytes, project_id: str) -> HTTPExc
 
 
 def _require_internal_project_access(*, project_id: str, org_id: str) -> tuple[str, str]:
+    payload = _internal_project_payload(project_id=project_id, org_id=org_id)
+    return project_id, _payload_project_slug(payload)
+
+
+def _internal_project_payload(*, project_id: str, org_id: str) -> dict[str, Any]:
+    """Validate ``project_id`` within ``org_id`` with the internal key; return the body."""
     token = internal_key()
     if not token:
         raise HTTPException(
@@ -141,7 +147,41 @@ def _require_internal_project_access(*, project_id: str, org_id: str) -> tuple[s
             status_code=502,
             detail="Freesolo internal project validation returned a mismatched project association",
         )
-    return project_id, _payload_project_slug(payload)
+    return payload
+
+
+def require_internal_publish_scope(*, project_id: str, org_id: str | None) -> tuple[str, str, str]:
+    """Validate an internal-key publish and return ``(project_id, project_slug, org_slug)``.
+
+    The internal key is org-agnostic, so it has no namespace of its own (and never falls back
+    to one). A platform caller publishing on a customer's behalf names that customer with
+    ``X-Freesolo-Org-Id``; one backend validation checks the project inside that org and returns
+    both slugs, and the org's slug is the only namespace this publish may use.
+    """
+    expected_org = str(org_id or "").strip()
+    if not expected_org:
+        raise HTTPException(
+            status_code=400,
+            detail="X-Freesolo-Org-Id is required to publish with the internal key",
+        )
+    try:
+        project_id = require_project_id(project_id)
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    payload = _internal_project_payload(project_id=project_id, org_id=expected_org)
+    project_slug = _payload_project_slug(payload)
+    if not project_slug:
+        raise HTTPException(
+            status_code=502,
+            detail="Freesolo project validation did not return a canonical project slug",
+        )
+    org_slug = payload.get("orgSlug")
+    if not isinstance(org_slug, str) or not org_slug.strip():
+        raise HTTPException(
+            status_code=502,
+            detail="Freesolo project validation did not return the organization slug",
+        )
+    return project_id, project_slug, org_slug.strip()
 
 
 def require_project_access(
