@@ -11,8 +11,9 @@ from flash.serving.deepinfer.contract.config import (
     REQUEST_SECONDS as DEEPINFER_REQUEST_SECONDS,
 )
 
-CAPACITY_POLL_SECONDS = 5 * 60
-LAMBDA_SCALE_POLL_SECONDS = 60
+# With no Lambda capacity, recheck the catalog every 30 seconds (there is no other GPU provider).
+CAPACITY_POLL_SECONDS = 30
+LAMBDA_SCALE_POLL_SECONDS = 30
 LAMBDA_STARTUP_TIMEOUT_SECONDS = CAPACITY_WAIT_SECONDS + STARTUP_TIMEOUT_SECONDS
 
 # LoRA Functions can wait for cold startup. DeepInfer Servers reject requests

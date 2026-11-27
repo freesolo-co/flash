@@ -312,6 +312,18 @@ def _private_plane_lease(monkeypatch, tmp_path):
 
 
 @pytest.fixture(autouse=True)
+def _private_score_batches(monkeypatch, tmp_path):
+    """Score batch files live in the test's tmp dir, and lifespans never start the runner thread.
+
+    Tests that exercise the runner drive ``ScoreBatchRunner.tick`` directly.
+    """
+    from flash.server.domain.ops import score_batches
+
+    monkeypatch.setattr(score_batches, "batches_dir", lambda: tmp_path / "score_batches")
+    monkeypatch.setattr(score_batches.ScoreBatchRunner, "start", lambda self: None)
+
+
+@pytest.fixture(autouse=True)
 def _private_pending_submissions(monkeypatch, tmp_path):
     """Each test records pending submission IDs in its own dir, never the developer's ~/.flash."""
     from flash.client import pending_submissions

@@ -401,6 +401,8 @@ def managed_chat(
     key: dict[str, Any],
     x_freesolo_org_id: str | None,
     x_freesolo_project_id: str | None,
+    *,
+    timeout_s: float | None = None,
 ) -> Any:
     request, messages, effective_spec, authorized_checkpoint, org_id = _resolve_chat_request(
         run_id,
@@ -441,7 +443,7 @@ def managed_chat(
             run_id=authorized_checkpoint,
             messages=messages,
             org_id=org_id,
-            timeout_s=chat_upstream_timeout_s(),
+            timeout_s=chat_upstream_timeout_s() if timeout_s is None else timeout_s,
             temperature=request.temperature,
             max_tokens=request.max_tokens,
             thinking=effective_spec.thinking,

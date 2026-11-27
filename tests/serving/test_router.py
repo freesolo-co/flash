@@ -1,7 +1,7 @@
 """Multi-base-model adapter routing: each adapter request reaches its base model's
 engine (one GPU per base model), many adapters share a base model's engine, and
 registration lands on the right engine. Offline — a fake engine pool stands in for the
-per-base-model Modal GPU containers.
+per-base-model Lambda GPU workers.
 """
 
 from __future__ import annotations
@@ -216,9 +216,12 @@ def test_healthz_reports_one_gpu_per_base_model(app_setup):
     ]
     assert body["base_models"] == [QWEN, QWEN_35B]  # sorted by model id
     assert body["gpus"] == 2  # two configured supported base-model engines
-    expected = {QWEN: "H100 | L40S | A100-80GB", QWEN_35B: "H200 | B200"}
+    expected = {
+        QWEN: "A6000 | A100-40GB | A100-80GB | H100 | H200 | B200",
+        QWEN_35B: "H200 | B200",
+    }
     assert body["inference_provider"] == "lambda"
-    assert body["fallback_provider_by_model"] == {QWEN: "modal", QWEN_35B: "modal"}
+    assert "fallback_provider_by_model" not in body
     assert body["gpu_by_model"] == expected
     assert body["gpu_tiers"] == sorted(
         {gpu for options in expected.values() for gpu in options.split(" | ")}

@@ -7,6 +7,7 @@ from typing import Any
 
 from fastapi import HTTPException, Request, status
 
+from flash.serve.contract.protocol import ACTING_API_KEY_HEADER
 from flash.serving.src.accounting.usage import (
     AuthorizedTraffic,
     InferenceAuthorization,
@@ -60,7 +61,9 @@ def require_attributed_traffic(
             status.HTTP_503_SERVICE_UNAVAILABLE,
             "serving request lacks required organization attribution",
         )
-    return AuthorizedTraffic(principal=principal_for_trusted_internal(org_id))
+    return AuthorizedTraffic(
+        principal=principal_for_trusted_internal(org_id), api_key_id=authorization.api_key_id
+    )
 
 
 def bind_cache_namespace(payload: Any, traffic: AuthorizedTraffic) -> Any:
@@ -117,7 +120,10 @@ class ServingContext:
 
     async def authorize_inference(self, request: Request, model_id: str) -> InferenceAuthorization:
         if is_trusted_internal(request, self.trusted_internal_keys):
-            return TrustedInternalAuthorization(org_id=optional_internal_org_id(request))
+            acting = (request.headers.get(ACTING_API_KEY_HEADER) or "").strip() or None
+            return TrustedInternalAuthorization(
+                org_id=optional_internal_org_id(request), api_key_id=acting
+            )
         token = _bearer_token(request)
         if not token:
             raise HTTPException(

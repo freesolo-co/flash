@@ -11,14 +11,14 @@ Serving code never launches or terminates reserved instances. This page is the *
 | 1–5 | `Qwen/Qwen3.8-27B` | official FP8 checkpoint `Qwen/Qwen3.8-27B-FP8`, TP=1, one H100 80 GB each |
 | 6–8 | `Qwen/Qwen3.5-0.8B-Base` @ `dc7cdfe2ee4154fa7e30f5b51ca41bfa40174e68` | BF16, spec-decoding drafter |
 
-- **`Qwen/Qwen3.5-9B-Base` has no reserved slots.** It runs on the on-demand Lambda pool with its Modal GPU fallback and scales from 0 when idle.
+- **`Qwen/Qwen3.5-9B-Base` has no reserved slots.** It runs on the on-demand Lambda pool and scales from 0 when idle.
 - **Reserved serving is switched on by the workers secret.** `reserved.active(env)` is the single switch. It is on only in main, and only when the Secret `flash-reserved-h100-workers-20261123` exists there.
   - Each `modal deploy` looks the secret up once and logs `reserved H100 serving ON|OFF in main …`.
   - The decision is baked into the serving, Lambda-controller and fleet-control images as `FLASH_RESERVED_H100_ACTIVE`, so remote containers follow it.
   - The lookup is rerun only by the next deploy, so creating or deleting the secret has no effect until you redeploy both the control app and serving.
-- **ON:** the two reserved models are served only by their slots, with no lease-pool workers and no Modal fallback.
+- **ON:** the two reserved models are served only by their slots, with no lease-pool workers.
 - **OFF** (secret not created yet, or dev):
-  - the two models use the ordinary on-demand Lambda pool and Modal GPU fallback (27B at 0..2, 0.8B Base at 0..2);
+  - the two models use the ordinary on-demand Lambda pool (27B at 0..2, 0.8B Base at 0..2);
   - no reserved proxy or watchdog is registered;
   - the deploy references no reserved secret.
 

@@ -170,14 +170,14 @@ def test_engine_exit_hook_awaits_shutdown(monkeypatch) -> None:
 
 
 @pytest.mark.parametrize("environment", ["main", "dev", ""])
-def test_9b_base_uses_the_lease_pool_with_modal_fallback_and_no_dedicated_fleet(
+def test_9b_base_uses_the_lambda_lease_pool_without_modal_gpus_or_a_dedicated_fleet(
     monkeypatch, environment
 ):
     _clear_deployment_environment(monkeypatch)
     module = _import_modal_app(monkeypatch, is_local=False, environment=environment)
     model = "Qwen/Qwen3.5-9B-Base"
     assert issubclass(module.ENGINE_BY_MODEL[model], module.LambdaEngineProxy)
-    assert model in module.MODAL_FALLBACK_BY_MODEL
+    assert not hasattr(module, "MODAL_FALLBACK_BY_MODEL")
     assert model not in module.reserved.MODELS
     # Only main declares the reserved 27B / 0.8B Base fleet: its secret and its watchdog.
     main = environment != "dev"
@@ -216,7 +216,7 @@ def _assert_on_demand(module):
     assert _watchdog_schedules(module) == []
     for model in ("Qwen/Qwen3.8-27B", "Qwen/Qwen3.5-0.8B-Base", "Qwen/Qwen3.5-9B-Base"):
         assert issubclass(module.ENGINE_BY_MODEL[model], module.LambdaEngineProxy)
-        assert model in module.MODAL_FALLBACK_BY_MODEL
+    assert not hasattr(module, "MODAL_FALLBACK_BY_MODEL")
     assert module._reserved_env == {"FLASH_RESERVED_H100_ACTIVE": "0"}
 
 
@@ -274,7 +274,6 @@ def test_main_serves_27b_and_08b_base_only_from_eight_reserved_slots(monkeypatch
     if environment == "dev":
         assert module.RESERVED_ENGINES == ()
         assert {large, drafter} <= set(module.ENGINE_BY_MODEL)
-        assert {large, drafter} <= set(module.MODAL_FALLBACK_BY_MODEL)
         return
     engines = module.RESERVED_ENGINES
     assert [cls.reserved_slot for cls in engines] == list(range(1, 9))
@@ -286,7 +285,6 @@ def test_main_serves_27b_and_08b_base_only_from_eight_reserved_slots(monkeypatch
     assert all(cls.pinned_gpu is None for cls in engines)
     for model in (large, drafter):
         assert model not in module.ENGINE_BY_MODEL
-        assert model not in module.MODAL_FALLBACK_BY_MODEL
 
 
 def test_reserved_requests_rotate_within_their_models_slots(monkeypatch):
@@ -295,7 +293,6 @@ def test_reserved_requests_rotate_within_their_models_slots(monkeypatch):
     _clear_deployment_environment(monkeypatch)
     module = _import_modal_app(monkeypatch, is_local=False, environment="main")
     pool = module._ModalEnginePool.__new__(module._ModalEnginePool)
-    pool._provider_selection = SimpleNamespace(choose=AsyncMock())
     monkeypatch.setattr(
         module,
         "RESERVED_ENGINES",
@@ -310,4 +307,3 @@ def test_reserved_requests_rotate_within_their_models_slots(monkeypatch):
 
     assert asyncio.run(picks("Qwen/Qwen3.8-27B", 6)) == [1, 2, 3, 4, 5, 1]
     assert asyncio.run(picks("Qwen/Qwen3.5-0.8B-Base", 4)) == [6, 7, 8, 6]
-    pool._provider_selection.choose.assert_not_awaited()
