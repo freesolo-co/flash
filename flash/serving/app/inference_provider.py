@@ -2,6 +2,9 @@
 
 from dataclasses import dataclass
 
+# Every single-GPU shape the Lambda fleet knows how to match and validate.
+LAMBDA_GPU_NAMES = frozenset({"A10", "A6000", "A100-40GB", "A100-80GB", "H100", "H200", "B200"})
+
 
 @dataclass(frozen=True, kw_only=True)
 class ModelPolicy:
@@ -27,30 +30,25 @@ class ModelPolicy:
                     "capacity requires integer 0 <= min_capacity <= max_capacity; max_capacity >= 1"
                 )
         if not isinstance(self.lambda_gpus, (tuple, list)) or any(
-            gpu not in {"H100", "H200", "B200"} for gpu in self.lambda_gpus
+            gpu not in LAMBDA_GPU_NAMES for gpu in self.lambda_gpus
         ):
-            # Lambda serving never rents A10 or A100; those stay Modal-only.
             raise ValueError("lambda_gpus must be a list or tuple of approved GPU names")
         object.__setattr__(self, "lambda_gpus", tuple(self.lambda_gpus))
 
 
 # Every model scales to zero when idle (2026-11-25): no idle GPU floor in main or dev.
 # Minimums apply to main only; dev always scales to zero when idle.
-# Lambda is preferred; Modal is a scale-to-zero fallback sharing max_capacity.
-# The fleet controller transfers slots as Lambda workers become ready. Handoffs
-# allow one temporary extra GPU, then drain the replaced Modal replica before
-# starting another. lambda_gpus is an allowlist: use the cheapest available offer.
+# Hosted Qwen GPUs are Lambda-only (2026-11-26): there is no Modal GPU fallback.
+# Replicas scale from demand up to max_capacity; a release handoff may briefly
+# hold one extra GPU. lambda_gpus optionally narrows the qualified shapes; empty
+# means any qualified GPU, cheapest available offer first.
 MODEL_POLICIES = {
     "Qwen/Qwen3.5-0.8B": ModelPolicy(min_capacity=0, max_capacity=2),
     # Used whenever reserved serving is off (dev, or main without the workers secret).
     "Qwen/Qwen3.5-0.8B-Base": ModelPolicy(min_capacity=0, max_capacity=2),
     "Qwen/Qwen3.5-4B": ModelPolicy(min_capacity=0, max_capacity=2),
     "Qwen/Qwen3.5-9B": ModelPolicy(min_capacity=0, max_capacity=2),
-    "Qwen/Qwen3.5-9B-Base": ModelPolicy(
-        min_capacity=0,
-        max_capacity=4,
-        lambda_gpus=["H100"],
-    ),
+    "Qwen/Qwen3.5-9B-Base": ModelPolicy(min_capacity=0, max_capacity=4),
     "Qwen/Qwen3.8-27B": ModelPolicy(min_capacity=0, max_capacity=2),
     "Qwen/Qwen3.6-35B-A3B": ModelPolicy(min_capacity=0, max_capacity=2),
     "deepseek-ai/DeepSeek-V4.1-Flash-1017": ModelPolicy(
@@ -80,29 +78,11 @@ def capacity_for(model, provider):
     policy = policy_for(model)
     if provider == "lambda":
         return policy.min_capacity, policy.max_capacity
-    if provider == "modal":
-        return 0, policy.max_capacity
     return 0, 0
 
 
 def lambda_models():
-    """Models supported by the Lambda worker runtime, all with Modal fallback."""
+    """Models supported by the Lambda worker runtime."""
     from flash.serving.src.engine.model_config import base_models
 
     return base_models()
-
-
-def modal_gpus_for(model):
-    from flash.serving.src.engine.model_config import base_models
-
-    if model not in base_models():
-        raise ValueError("Provider policy is only defined for hosted Qwen")
-    if model == "Qwen/Qwen3.6-35B-A3B":
-        return ["H200"]
-    if model in {"Qwen/Qwen3.5-0.8B", "Qwen/Qwen3.5-0.8B-Base"}:
-        return ["A10G", "A100-80GB"]
-    if model == "Qwen/Qwen3.5-4B":
-        return ["A10G", "L40S", "A100-80GB"]
-    if model in {"Qwen/Qwen3.5-9B", "Qwen/Qwen3.5-9B-Base"}:
-        return ["L40S", "A100-80GB"]
-    return ["A100-80GB"]
