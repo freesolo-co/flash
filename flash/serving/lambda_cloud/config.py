@@ -25,18 +25,9 @@ RUNTIME_IMAGE = (
 
 
 # Labels describe qualified shapes, not guessed provider instance-type IDs.
-GPU_MEMORY_GIB = {
-    "A10": 22,
-    "A6000": 44,
-    "A100-40GB": 35,
-    "A100-80GB": 75,
-    "H100": 75,
-    "H200": 130,
-    "B200": 170,
-}
+GPU_MEMORY_GIB = {"A10": 22, "A100-40GB": 35, "A100-80GB": 75, "H100": 75, "H200": 130, "B200": 170}
 CATALOG_MEMORY_GB = {
     "A10": 24,
-    "A6000": 48,
     "A100-40GB": 40,
     "A100-80GB": 80,
     "H100": 80,
@@ -50,28 +41,25 @@ def qualified_placements(model):
         raise ValueError("Lambda placement is only defined for the hosted Qwen catalog")
     if model == "Qwen/Qwen3.6-35B-A3B":
         return ("H200", "B200")
-    # Every x86 single GPU that runs the model: Ampere (A10/A6000/A100) uses the
-    # weight-only FP8 Marlin profile, Hopper/Blackwell the native FP8 one. The fleet
-    # rents the cheapest shape with capacity. Turing (RTX 6000) has no FP8 kernels
-    # and GH200 is arm64, so neither is listed.
     if model in SMALL_QWEN_MODELS:
-        return ("A10", "A6000", "A100-40GB", "A100-80GB", "H100", "H200", "B200")
+        return ("A10", "A100-80GB", "H100")
     if model in {"Qwen/Qwen3.5-9B", "Qwen/Qwen3.5-9B-Base"}:
-        return ("A6000", "A100-40GB", "A100-80GB", "H100", "H200", "B200")
-    return ("A100-80GB", "H100", "H200", "B200")
+        return ("A100-40GB", "A100-80GB", "H100")
+    return ("A100-80GB", "H100")
+
+
+# Lambda serving rents only H100-class GPUs. A10 and A100 stay qualified for
+# the engine (Modal still serves on A10G/A100-80GB) but are never launched on
+# Lambda Cloud: they cycled as on-demand fleet workers for 0.8B and 9B.
+LAMBDA_SERVING_GPUS = ("H100", "H200", "B200")
 
 
 def placements(model):
-    """Lambda shapes for a model: every qualified GPU unless the policy narrows it.
-
-    Lambda is the only GPU provider for hosted Qwen, so any qualified shape with
-    capacity is rented (cheapest first) instead of waiting on one GPU type.
-    """
     qualified = qualified_placements(model)
     requested = policy_for(model).lambda_gpus
     if any(gpu not in qualified for gpu in requested):
         raise ValueError(f"Unqualified Lambda GPU for {model}: {requested}")
-    return requested or qualified
+    return tuple(gpu for gpu in requested or qualified if gpu in LAMBDA_SERVING_GPUS)
 
 
 def gpu_matches(gpu, description):

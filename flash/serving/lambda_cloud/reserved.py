@@ -5,7 +5,8 @@ Eight Lambda H100 workers, one model per slot (``SLOT_MODELS``):
 - slots 1-5 serve ``Qwen/Qwen3.8-27B`` (its official FP8 checkpoint, one H100 each);
 - slots 6-8 serve ``Qwen/Qwen3.5-0.8B-Base`` (the spec-decoding drafter).
 
-Qwen3.5-9B-Base has no reserved slots; it is served by the on-demand Lambda pool.
+Qwen3.5-9B-Base has no reserved slots; it is served by the on-demand Lambda pool with its
+Modal GPU fallback.
 
 ``active(environment)`` is the single switch. Reserved serving is on only in ``main`` and only
 when the workers secret exists there. The deploy process decides once by looking the secret
@@ -13,9 +14,9 @@ up, and bakes the decision into every image as ``FLASH_RESERVED_H100_ACTIVE`` so
 containers (router, proxies, watchdog, fleet controller) follow the same decision.
 
 - On: the reserved models are served only by their slots, with no on-demand Lambda
-  allocation.
-- Off (secret not created yet, or dev): they use the ordinary on-demand Lambda pool like every
-  other model, and the deploy references no reserved secret.
+  allocation and no Modal GPU fallback.
+- Off (secret not created yet, or dev): they use the ordinary on-demand Lambda pool and Modal
+  GPU fallback like every other model, and the deploy references no reserved secret.
 
 The workers secret lists exactly the configured workers. Every entry names its model, which
 must be its slot's model, so a worker can never be routed requests for another model.

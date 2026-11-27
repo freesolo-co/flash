@@ -1,8 +1,30 @@
-"""Router helpers for the Lambda-only hosted GPU pool."""
+"""Pick a backend before dispatch, never retry a generation on another provider."""
+
+import asyncio
+import time
+
+
+class ProviderSelection:
+    def __init__(self, capacity, *, clock=time.monotonic):
+        self.capacity = capacity
+        self.clock = clock
+        self._choices = {}
+        self._lock = asyncio.Lock()
+
+    async def choose(self, model):
+        async with self._lock:
+            choice, expires = self._choices.get(model, (None, 0))
+            if self.clock() >= expires:
+                async with asyncio.timeout(5):
+                    choice = await self.capacity(model)
+                if choice not in {"lambda", "modal"}:
+                    raise RuntimeError("Invalid serving provider choice")
+                self._choices[model] = choice, self.clock() + 1
+            return choice
 
 
 async def unregister_active(engines, org_id, model_id, expected_generation):
-    """Evict an adapter from live pools without booting an idle GPU."""
+    """Evict an adapter from both live pools without booting an idle GPU."""
     for engine in engines:
         stats = await engine.health.get_current_stats.aio()
         if any((stats.num_total_runners, stats.num_running_inputs, stats.backlog)):
@@ -15,4 +37,6 @@ def bind_lambda_control():
 
     from flash.serving.lambda_cloud.config import APP_NAME
 
-    return modal.Cls.from_name(APP_NAME, "LambdaFleet")()
+    fleet = modal.Cls.from_name(APP_NAME, "LambdaFleet")()
+    chooser = modal.Function.from_name(APP_NAME, "choose_provider")
+    return fleet, ProviderSelection(chooser.remote.aio)

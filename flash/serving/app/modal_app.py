@@ -20,6 +20,7 @@ from flash.serving.app.timeouts import (
     LAMBDA_STARTUP_TIMEOUT_SECONDS,
     REQUEST_TIMEOUT_SECONDS,
     ROUTER_TIMEOUT_SECONDS,
+    STARTUP_TIMEOUT_SECONDS,
 )
 
 if TYPE_CHECKING:
@@ -330,7 +331,11 @@ hf_cache_volume = modal.Volume.from_name(HF_CACHE_VOLUME_NAME, create_if_missing
 
 
 # Retain the GPU implementation, registering only the providers selected below.
-from flash.serving.app.inference_provider import capacity_for  # noqa: E402
+from flash.serving.app.inference_provider import (  # noqa: E402
+    capacity_for,
+    modal_gpus_for,
+)
+from flash.serving.app.modal_engine import HostedModalEngine  # noqa: E402
 from flash.serving.lambda_cloud.proxy import LambdaEngineProxy  # noqa: E402
 from flash.serving.src.engine.lora_engine import _LoraEngineImpl  # noqa: E402, F401
 
@@ -386,15 +391,14 @@ def _build_engine(
     max_capacity: int = 2,
     reserved_slot: int = 0,
 ) -> Any:
-    """Register a Lambda CPU proxy (the GPU runs on a Lambda VM) under a stable model name.
+    """Register a Modal GPU engine or Lambda CPU proxy under a stable model name.
 
     Set the class identity before decorators so Modal can re-import it remotely.
     """
-    if provider not in {"lambda", "reserved"}:
-        raise ValueError(f"Hosted serving has no {provider!r} GPU provider; Lambda only")
-    implementation = (
-        reserved.ReservedLambdaEngineProxy if provider == "reserved" else LambdaEngineProxy
-    )
+    implementation = {
+        "modal": HostedModalEngine,
+        "reserved": reserved.ReservedLambdaEngineProxy,
+    }.get(provider, LambdaEngineProxy)
 
     class _Engine(implementation):
         base_model: str = modal.parameter()
@@ -467,25 +471,35 @@ def _build_engine(
             result = self._health()
             return await result if hasattr(result, "__await__") else result
 
-    # Lambda reports the actual hardware remotely.
-    _Engine.pinned_gpu = None
+    # Lambda reports actual hardware remotely; Modal is pinned by its decorator.
+    _Engine.pinned_gpu = gpu if provider == "modal" else None
     _Engine.reserved_slot = reserved_slot
     # Modal must see the final module-level identity before decoration.
     _Engine.__name__ = class_name
     _Engine.__qualname__ = class_name
     globals()[class_name] = _Engine
-    resources = {
-        "image": lambda_controller_image,
-        "startup_timeout": LAMBDA_STARTUP_TIMEOUT_SECONDS,
-        "cpu": PROXY_CPU,
-        "memory": 2048,
-        "nonpreemptible": True,  # Modal supports this only for CPU workloads.
-        "secrets": (
-            [modal.Secret.from_name(reserved.SECRET_NAME)]
-            if provider == "reserved"
-            else lambda_proxy_secrets
-        ),
-    }
+    resources = (
+        {
+            "image": image,
+            "startup_timeout": STARTUP_TIMEOUT_SECONDS,
+            "gpu": gpu,
+            "secrets": engine_secrets,
+            "volumes": {HOSTING_CACHE_MOUNT: hf_cache_volume},
+        }
+        if provider == "modal"
+        else {
+            "image": lambda_controller_image,
+            "startup_timeout": LAMBDA_STARTUP_TIMEOUT_SECONDS,
+            "cpu": PROXY_CPU,
+            "memory": 2048,
+            "nonpreemptible": True,  # Modal supports this only for CPU workloads.
+            "secrets": (
+                [modal.Secret.from_name(reserved.SECRET_NAME)]
+                if provider == "reserved"
+                else lambda_proxy_secrets
+            ),
+        }
+    )
     engine = app.cls(
         **resources,
         region="us",
@@ -501,21 +515,25 @@ def _build_engine(
     return engine
 
 
-def _configured_engine(model):
-    _, maximum = capacity_for(model, "lambda")
+def _configured_engine(model, provider, suffix=""):
+    _, maximum = capacity_for(model, provider)
     return _build_engine(
-        gpu_for(model),
-        model_engine_name(model),
+        modal_gpus_for(model) if provider == "modal" else gpu_for(model),
+        model_engine_name(model) + suffix,
         *_engine_concurrency(model),
-        provider="lambda",
+        provider=provider,
         max_capacity=maximum,
     )
 
 
 # In main the reserved models (27B, 0.8B Base) are served only by reserved H100 slots.
-# Hosted Qwen GPUs are Lambda-only: there is no Modal GPU fallback class.
 ENGINE_BY_MODEL: dict[str, Any] = {
-    bm: _configured_engine(bm)
+    bm: _configured_engine(bm, "lambda")
+    for bm in base_models()
+    if not reserved.enabled(bm, MODAL_ENVIRONMENT)
+}
+MODAL_FALLBACK_BY_MODEL: dict[str, Any] = {
+    bm: _configured_engine(bm, "modal", "_ModalGPU")
     for bm in base_models()
     if not reserved.enabled(bm, MODAL_ENVIRONMENT)
 }
@@ -558,7 +576,7 @@ class _ModalEnginePool:
         self._deepinfer = HostedDeepInfer()
         from flash.serving.app.provider_selection import bind_lambda_control
 
-        self._fleet = bind_lambda_control()
+        self._fleet, self._provider_selection = bind_lambda_control()
         # Watchdog-quarantined reserved workers are skipped for routing and registration.
         self._reserved_health = reserved_watchdog.HealthView.for_engines(RESERVED_ENGINES)
 
@@ -570,12 +588,17 @@ class _ModalEnginePool:
         if _reserved(model):
             slot = await self._reserved_health.next_slot(model)
             return RESERVED_ENGINES[slot - 1](base_model=model)
+        if (
+            model in MODAL_FALLBACK_BY_MODEL
+            and await self._provider_selection.choose(model) == "modal"
+        ):
+            return MODAL_FALLBACK_BY_MODEL[model](base_model=model)
         return _engine_cls_for(model)(base_model=model)
 
     async def start(self):
         await self._fleet.activate.remote.aio(os.environ["FREESOLO_DEPLOYMENT_SHA"])
-        # Lambda startup must never block the router: requests queue on the CPU
-        # proxy until its worker publishes a healthy, hardware-validated heartbeat.
+        # Lambda startup must never block the router: requests use the fallback
+        # until a worker publishes a healthy, hardware-validated heartbeat.
 
     async def aclose(self):
         await self._deepinfer.aclose()
@@ -688,15 +711,17 @@ class _ModalEnginePool:
                 lambda engine: engine.unregister.remote.aio(org_id, model_id, expected_generation),
             )
             return
-        from flash.serving.app.provider_selection import unregister_active
+        if base_model in MODAL_FALLBACK_BY_MODEL:
+            from flash.serving.app.provider_selection import unregister_active
 
-        # Evict from live replicas only; never boot an idle Lambda GPU to unregister.
-        await unregister_active(
-            [ENGINE_BY_MODEL[base_model](base_model=base_model)],
-            org_id,
-            model_id,
-            expected_generation,
-        )
+            engines = [
+                ENGINE_BY_MODEL[base_model](base_model=base_model),
+                MODAL_FALLBACK_BY_MODEL[base_model](base_model=base_model),
+            ]
+            await unregister_active(engines, org_id, model_id, expected_generation)
+        else:
+            engine = await self._engine_for(base_model)
+            await engine.unregister.remote.aio(org_id, model_id, expected_generation)
 
 
 def _build_usage_outbox(settings: Any) -> Any:
