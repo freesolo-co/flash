@@ -265,8 +265,6 @@ def test_model_revision_threads_through_tokenizer_and_prefetch(worker_context, m
         lambda **kwargs: calls.append(("snapshot", kwargs["repo_id"], kwargs)),
     )
     monkeypatch.setattr(hf, "_shared_weight_cache_dir", lambda: None)
-    monkeypatch.setattr(hf, "_hf_cache_bytes", lambda *args, **kwargs: 0)
-    monkeypatch.setattr(hf, "gpu_diagnostics", dict)
     monkeypatch.setattr(worker_heartbeat, "heartbeat", lambda *args, context=None, **kwargs: None)
 
     assert hf.load_tokenizer("org/model", revision="refs/pr/123") is not None
@@ -594,6 +592,11 @@ def test_checkpointing_default_model_size_gate(monkeypatch):
     monkeypatch.setenv("RUN_MODE", "sft")
     monkeypatch.delenv("FLASH_JOB_SPEC_JSON", raising=False)
     import flash.engine.worker.perf as w
+    from flash.engine.worker.perf.memory import _prefer_gradient_checkpointing
+    from flash.engine.worker.perf.model_size import (
+        _checkpointing_default_for_model,
+        _estimate_params,
+    )
 
     # _estimate_params: ~1B vs ~4B configs
     small = types.SimpleNamespace(
@@ -602,8 +605,8 @@ def test_checkpointing_default_model_size_gate(monkeypatch):
     big = types.SimpleNamespace(
         hidden_size=2560, vocab_size=151936, num_hidden_layers=36, tie_word_embeddings=False
     )
-    assert w._estimate_params(small) < 3e9
-    assert w._estimate_params(big) >= 3e9
+    assert _estimate_params(small) < 3e9
+    assert _estimate_params(big) >= 3e9
 
     def fake_cfg(cfg):
         fake = types.SimpleNamespace(
@@ -612,17 +615,17 @@ def test_checkpointing_default_model_size_gate(monkeypatch):
         monkeypatch.setitem(sys.modules, "transformers", fake)
 
     fake_cfg(small)
-    assert w._checkpointing_default_for_model("meta-llama/Llama-3.2-1B") is False
+    assert _checkpointing_default_for_model("meta-llama/Llama-3.2-1B") is False
     # grad checkpointing follows the same small=speed(off) / large=memory(on) principle
     assert w.grad_checkpointing_on("meta-llama/Llama-3.2-1B") is False
     fake_cfg(big)
-    assert w._checkpointing_default_for_model("Qwen/Qwen3-4B") is True
+    assert _checkpointing_default_for_model("Qwen/Qwen3-4B") is True
     assert w.grad_checkpointing_on("Qwen/Qwen3-4B") is True
     # context-aware: a SMALL model at LONG context is memory-bound -> memory mode ON (PR #174:
     # 1B GRPO OOMs at 4096 in speed mode, fits in memory mode).
     fake_cfg(small)
-    assert w._prefer_gradient_checkpointing("meta-llama/Llama-3.2-1B", 512) is False
-    assert w._prefer_gradient_checkpointing("meta-llama/Llama-3.2-1B", 4096) is True
+    assert _prefer_gradient_checkpointing("meta-llama/Llama-3.2-1B", 512) is False
+    assert _prefer_gradient_checkpointing("meta-llama/Llama-3.2-1B", 4096) is True
     assert w.grad_checkpointing_on("meta-llama/Llama-3.2-1B", 4096) is True
 
 
@@ -1441,100 +1444,6 @@ def _fake_tilelang(tmp_path, stub_bytes=b"STUB"):
     return str(pkg), str(stub)
 
 
-def test_find_real_libcudart_safe_when_nothing_matches(monkeypatch):
-    """_find_real_libcudart returns None (never raises) when no candidate exposes the symbol."""
-    import builtins
-    import ctypes.util
-    import glob
-
-    import flash.engine.worker.perf as perf
-
-    monkeypatch.setattr(glob, "glob", lambda *_a, **_k: [])
-    monkeypatch.setattr(ctypes.util, "find_library", lambda _n: None)
-    real_import = builtins.__import__
-
-    def _no_nvidia(name, *a, **k):
-        if name.startswith("nvidia"):
-            raise ImportError(name)
-        return real_import(name, *a, **k)
-
-    monkeypatch.setattr(builtins, "__import__", _no_nvidia)
-    assert perf._find_real_libcudart() is None
-
-
-def _compile_so(c_path, so_path, src):
-    """Compile a tiny shared object; return True on success (skip the test if no toolchain)."""
-    import shutil
-    import subprocess
-
-    cc = shutil.which("cc") or shutil.which("gcc")
-    if not cc:
-        return False
-    with open(c_path, "w") as f:
-        f.write(src)
-    return subprocess.run([cc, "-shared", "-fPIC", "-o", so_path, c_path]).returncode == 0
-
-
-def test_find_real_libcudart_handles_bare_soname_without_crashing(monkeypatch):
-    """find_library('cudart') returns a bare soname (e.g. 'libcudart.so.12'), not a path. The
-    os.path.exists guard must not silently drop it; with no loadable cudart present it still resolves
-    to None safely (and never raises)."""
-    import builtins
-    import ctypes.util
-    import glob
-
-    import flash.engine.worker.perf as perf
-
-    monkeypatch.setattr(glob, "glob", lambda *_a, **_k: [])  # no absolute-path candidates
-    monkeypatch.setattr(ctypes.util, "find_library", lambda _n: "libcudart.so.12")  # bare soname
-    real_import = builtins.__import__
-
-    def _no_nvidia(name, *a, **k):
-        if name.startswith("nvidia"):
-            raise ImportError(name)
-        return real_import(name, *a, **k)
-
-    monkeypatch.setattr(builtins, "__import__", _no_nvidia)
-    # On a host without a real libcudart the bare soname won't load -> None (no exception, no skip).
-    assert perf._find_real_libcudart() is None
-
-
-def test_find_real_libcudart_finds_cu13_wheel_layout(tmp_path, monkeypatch):
-    """Regression: the resolver must be CUDA-major-agnostic. The cu13 nvidia wheel ships the runtime
-    at ``nvidia/cu13/lib/libcudart.so.13`` (NOT ``nvidia/cuda_runtime/lib/libcudart.so.12``, and it
-    has no ``nvidia.cuda_runtime`` module), so the original ``.so.12``-only probe returns None on a
-    cu13 stack -> the stub shadow stays in place. Build a real .so exporting cudaDeviceReset at the
-    cu13 wheel path and assert the resolver finds it (this FAILS against the .so.12-only version)."""
-    import ctypes.util
-    import glob
-    import os
-    import types
-
-    cu13lib = tmp_path / "nvidia" / "cu13" / "lib"
-    cu13lib.mkdir(parents=True)
-    real = str(cu13lib / "libcudart.so.13")
-    if not _compile_so(str(tmp_path / "real.c"), real, "void cudaDeviceReset(void){}"):
-        import pytest
-
-        pytest.skip("no C toolchain to build a real libcudart.so")
-
-    import flash.engine.worker.perf as perf
-
-    # Fake the `nvidia` namespace package so its __path__ is our tmp tree (the cu13 wheel layout).
-    fake_nvidia = types.ModuleType("nvidia")
-    fake_nvidia.__path__ = [str(tmp_path / "nvidia")]
-    monkeypatch.setitem(sys.modules, "nvidia", fake_nvidia)
-    # Neutralize the toolkit + ldconfig fallbacks so ONLY the wheel-layout path can match — keeps the
-    # assertion deterministic on any CI box, with or without a system CUDA install.
-    monkeypatch.setattr(ctypes.util, "find_library", lambda _n: None)
-    _real_glob = glob.glob
-    monkeypatch.setattr(
-        glob, "glob", lambda p, *a, **k: [] if p.startswith("/usr") else _real_glob(p, *a, **k)
-    )
-
-    assert perf._find_real_libcudart() == os.path.realpath(real)
-
-
 # ---------------------------------------------------------------------------
 # Blackwell fla GDN autotune restriction (fla #913 / #1000): on sm100/sm120 the
 # Blackwell fla GDN autotune restriction (fla #913 / #1000): on sm100/sm120 the unrestricted
@@ -2341,11 +2250,11 @@ def test_worker_image_rebuilds_when_the_cudart_extractor_changes():
     root = pathlib.Path(__file__).resolve().parent.parent
     workflow = (root / ".github" / "workflows" / "worker-image.yml").read_text()
 
-    for script in ("docker/extract_cudart_fix.py", "docker/make_rp_handler.py"):
-        assert f"- {script}" in workflow, (
-            f"worker-image.yml does not rebuild on {script}; a change to a build-time generator "
-            "would ship an image built from the old one."
-        )
+    script = "docker/extract_cudart_fix.py"
+    assert f"- {script}" in workflow, (
+        f"worker-image.yml does not rebuild on {script}; a change to a build-time generator "
+        "would ship an image built from the old one."
+    )
 
 
 def test_attempt_contexts_keep_identity_uploads_and_heartbeat_progress_independent(monkeypatch):

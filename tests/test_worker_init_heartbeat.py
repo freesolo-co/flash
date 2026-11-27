@@ -1113,7 +1113,7 @@ def test_progress_carry_does_not_mark_new_progress(worker_context, monkeypatch):
 def test_hf_cache_bytes_counts_blobs_and_reports_unmeasurable_as_none(tmp_path, monkeypatch):
     import huggingface_hub.constants as hconst
 
-    from flash.engine.worker.io import artifacts as hf
+    from flash.engine.worker.io import prefetch as hf
 
     monkeypatch.setattr(hconst, "HF_HUB_CACHE", str(tmp_path))
     assert hf._hf_cache_bytes("org/model") is None  # no repo dir yet -> unmeasurable

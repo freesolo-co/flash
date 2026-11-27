@@ -46,13 +46,6 @@ def emit(key, value):
 
 
 try:
-    from verl.workers.config.rollout import RolloutConfig
-
-    emit("rollout_fields", sorted(RolloutConfig.__dataclass_fields__))
-except Exception:
-    emit("rollout_fields", None)
-
-try:
     import torch
 
     emit(
@@ -203,11 +196,10 @@ if %(gdn_module)r:
 """
 
 # every answer's fail-closed default, used when the child dies, times out, or prints nothing
-# readable. `None` means "could not answer" for the two callers that must distinguish that from a
-# negative answer: rollout_fields (unknown verl -> do not claim a fork field is missing) and
-# capability (unknown card -> leave the library default alone rather than guessing a workaround).
+# readable. `None` means "could not answer" for the callers that must distinguish that from a
+# negative answer: capability (unknown card -> leave the library default alone rather than guessing
+# a workaround) and gdn_boundary_resets.
 _CAPABILITIES_UNAVAILABLE: dict = {
-    "rollout_fields": None,
     "capability": None,
     "flashinfer": False,
     "wandb": False,
@@ -238,8 +230,7 @@ def probe_verl_capabilities(python_bin: str, gdn_module: str = "") -> dict:
         stdout, stderr, returncode = done.stdout, done.stderr, done.returncode
     except subprocess.TimeoutExpired as e:
         # the killed child still flushed every answer it reached, and TimeoutExpired carries that
-        # output. a slow gdn smoke must not retract the cheap answers that already landed -- an
-        # empty rollout_fields aborts grpo, which is a worse outcome than training padded.
+        # output. a slow gdn smoke must not retract the cheap answers that already landed.
         timed_out = True
         stdout = (
             e.stdout.decode(errors="replace") if isinstance(e.stdout, bytes) else (e.stdout or "")
@@ -285,20 +276,6 @@ def probe_verl_capabilities(python_bin: str, gdn_module: str = "") -> dict:
     if stderr:
         print(f"[verl] capability probe stderr: {stderr.strip()[:800]}")
     return caps
-
-
-def verl_declares_rollout_field(caps: dict, field: str) -> bool:
-    """report whether the probed verl declares `field` on RolloutConfig.
-
-    the fork adds rollout fields stock verl does not have. hydra composes an unknown key happily and
-    only fails later in omega_conf_to_dataclass, so callers ask here before emitting a fork-only
-    override rather than letting the run abort at dataclass conversion. an unanswerable probe reads
-    as "not declared", which is what the subprocess version returned when the child could not be
-    reached: the caller raises with the cause instead of composing a key that would abort in
-    dataclass conversion on a paid gpu.
-    """
-    fields = caps.get("rollout_fields")
-    return bool(fields) and field in fields
 
 
 def gdn_probe_module(model_id: str, revision: str = "") -> str:

@@ -24,21 +24,6 @@ def artifact_namespace() -> str:
     return (os.environ.get("FLASH_ARTIFACT_NAMESPACE") or "").strip() or _DEFAULT_ARTIFACT_NAMESPACE
 
 
-def _environment_artifact_repo_name(env_id: str) -> str:
-    """Stable logical artifact namespace for all runs of one environment."""
-    raw = (env_id or "default-environment").strip() or "default-environment"
-    digest = hashlib.sha1(raw.encode("utf-8")).hexdigest()[:16]
-    slug = re.sub(r"[^A-Za-z0-9]+", "-", raw.lower()).strip("-") or "environment"
-    budget = _ARTIFACT_REPO_NAME_MAX - len(_ARTIFACT_REPO_PREFIX) - len(digest) - 1
-    slug = slug[:budget].rstrip("-") or "environment"
-    return f"{_ARTIFACT_REPO_PREFIX}{slug}-{digest}"
-
-
-def managed_artifact_repo_for_environment(env_id: str) -> str:
-    """Private Azure artifact namespace shared by runs that use the same environment id."""
-    return f"{artifact_namespace()}/{_environment_artifact_repo_name(env_id)}"
-
-
 def managed_artifact_repo_for_run(env_id: str, run_id: str) -> str:
     """isolate each new run's artifacts while keeping retries in one stable private namespace."""
     if not run_id or run_id == "local":

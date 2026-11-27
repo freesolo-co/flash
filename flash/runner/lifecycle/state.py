@@ -26,9 +26,6 @@ RUNS_DIR = os.path.join(_STATE_DIR, "runs")
 RESULTS_DIR = os.path.join(_STATE_DIR, "results")
 TERMINAL_STATES = frozenset({"done", "failed", "cancelled", "dry_run"})
 RUN_STATES = TERMINAL_STATES | {"queued", "provisioning", "running", "deployed"}
-# `done` IS deployable, so excluded; cancelled/failed/dry_run must never flip to `deployed`.
-_UNDEPLOYABLE_STATES = TERMINAL_STATES - {"done"}
-# serialize local writers before taking each run's interprocess lock.
 _RUN_DEADLINE_AT_KEY = "run_deadline_at"
 _NEXT_ATTEMPT_KEY = "next_attempt"
 _CLEANUP_REMOTES_KEY = "cleanup_remotes"

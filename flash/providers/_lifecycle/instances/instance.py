@@ -177,7 +177,7 @@ def build_payload(
         "env": env,
         # per-run env wheel; the bootstrap pip-installs extra_pip for every job. the author's
         # [environment] pip is appended to the worker requirement, never substituted for it.
-        "extra_pip": worker_pip_with_extras(spec.environment.id, spec.environment.pip),
+        "extra_pip": worker_pip_with_extras(spec.environment.pip),
         "hf_prefix": f"{spec.phase}/{spec.run_id}",
         "deadline_at": absolute_deadline,
         "run_created_at": absolute_deadline - max_wall_seconds,

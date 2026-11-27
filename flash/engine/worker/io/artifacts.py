@@ -16,14 +16,7 @@ from flash.engine.profiling.tokenizer import (  # noqa: F401
     load_tokenizer,
     model_revision_kwargs,
 )
-
-# `gpu_diagnostics` has no call site here since prefetch moved to `.prefetch`, but it is kept
-# imported on purpose: the prefetch tests patch `hf.gpu_diagnostics` and the prefetcher reads it
-# back through this module. removing it as unused would silently break them.
-from flash.engine.worker.perf import (  # noqa: F401
-    RetriableInfraError,
-    gpu_diagnostics,
-)
+from flash.engine.worker.perf import RetriableInfraError
 from flash.engine.worker.runtime.phases import timed_phase
 from flash.engine.worker.runtime.state import WorkerContext
 
@@ -595,20 +588,12 @@ def upload_resume_checkpoint(
             )
 
 
-# re-exported so the prefetch surface stays reachable as `hf.<name>`: the tests patch
-# `_shared_weight_cache_dir`, `resolve_cached_model_commit` and `_hf_cache_bytes` here, and the
-# worker entry points import `prefetch_model` from here.
+# re-exported so the prefetch surface stays reachable as `hf.<name>`: the prefetcher reads
+# `_shared_weight_cache_dir` and `resolve_cached_model_commit` back through this module (the tests
+# patch them here), and the worker entry points import `prefetch_model` from here.
 from flash.engine.worker.io.prefetch import (  # noqa: E402,F401
-    _hf_cache_bytes,
-    _prefetch_error_is_retriable,
     _shared_weight_cache_dir,
-    _snapshot_has_weights,
-    _SnapshotWeightsMissing,
     prefetch_model,
     resolve_cached_model_commit,
     write_base_model_provenance,
 )
-
-# the sha predicate lives in the client-safe `envs.loading.loader`; re-exported here because the
-# provenance tests patch and assert it as `hf.is_commit_sha`.
-from flash.envs.loading.loader import is_commit_sha  # noqa: E402,F401

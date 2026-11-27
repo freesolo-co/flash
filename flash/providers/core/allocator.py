@@ -191,7 +191,7 @@ def _executed_gpu_count(algorithm: str, train, overrides, gpu_count: int) -> int
     """
     algo = (algorithm or "").strip().lower()
     if algo in ("grpo", "rl"):
-        return _executed_rl_gpu_count(algo, train, gpu_count)
+        return _executed_rl_gpu_count(train, gpu_count)
     if algo == "custom":
         return gpu_count  # layer sharding uses every card even for a single sequence
     if algo != "sft":
@@ -212,7 +212,7 @@ def _executed_gpu_count(algorithm: str, train, overrides, gpu_count: int) -> int
     )
 
 
-def _executed_rl_gpu_count(algorithm: str, train, gpu_count: int) -> int:
+def _executed_rl_gpu_count(train, gpu_count: int) -> int:
     """Ranks grpo would launch: bounded by the SEQUENCES one step holds, not the prompt count.
 
     Both algorithms hand verl ``data.train_batch_size = prompts_per_step`` (grpo

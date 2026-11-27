@@ -175,31 +175,6 @@ def format_gpu_status(gpu: Any) -> str:
     return " gpu[" + " ".join(parts) + "]" if parts else ""
 
 
-def _format_child_tail(tail: object, silent_ticks: object = None) -> str:
-    """Render a stalled worker's retained child output, or "" when absent.
-
-    ``child_tail`` and ``silent_ticks`` must reach the streamed log to distinguish slow output from a
-    wedged child. Skip malformed non-string entries rather than breaking the heartbeat line.
-    """
-    if not isinstance(tail, list):
-        return ""
-    lines = [
-        f"    {neutralize_control_chars(line)}" for line in tail if isinstance(line, str) and line
-    ]
-    if not lines:
-        return ""
-    header = "\n  child output before the stall (most recent last)"
-    # bool is an int subclass, and a JSON payload can carry anything; a malformed counter drops the
-    # annotation rather than the tail it annotates.
-    if isinstance(silent_ticks, int) and not isinstance(silent_ticks, bool) and silent_ticks >= 0:
-        if silent_ticks == 0:
-            header += ", still producing output"
-        else:
-            plural = "" if silent_ticks == 1 else "s"
-            header += f", unchanged for {silent_ticks} tick{plural}"
-    return header + ":\n" + "\n".join(lines)
-
-
 def _format_heartbeat(hb: dict) -> str:
     msg = f"worker: stage={hb.get('stage')}"
     attempt = _attempt_int(hb.get("attempt"))
@@ -301,7 +276,6 @@ def _format_heartbeat(hb: dict) -> str:
             )
     if sample_lines:
         msg += "\n" + "\n".join(sample_lines)
-    msg += _format_child_tail(hb.get("child_tail"), hb.get("child_tail_silent_ticks"))
     return msg
 
 

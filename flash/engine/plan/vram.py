@@ -772,13 +772,8 @@ def resolve_params_b(model_id: str, revision: str = "") -> float | None:
 # constants too and `from flash.engine.plan.vram import colocate_kv_util` must keep working.
 # The import sits at the bottom because those estimators are defined before this point.
 from flash.engine.plan.kv_sizing import (  # noqa: E402,F401
-    _KV_BLOCK_TOKENS,
     _KV_CAP,
-    _KV_COEF,
-    _KV_FRAGMENTATION_MARGIN,
-    _KV_PROFILE_OVERHEAD_GB,
     _architecture_kv_raw_gb,
-    _colocate_util_cap,
     _resident_kv_gb,
     colocate_kv_util,
     grpo_kv_floor_gb,
@@ -791,9 +786,6 @@ from flash.engine.plan.kv_sizing import (  # noqa: E402,F401
 # swaps `vram._CONFIG_PROBE_MEMO` would leave the module actually reading the original --
 # a silently ineffective patch. Reach for it at its defining module.
 from flash.engine.plan.model_config_probe import (  # noqa: E402,F401
-    _certify_model_config,
-    _config_mismatches,
-    _memoized_config_probe,
     _validated_revision_geometry,
     certified_attention_heads,
 )

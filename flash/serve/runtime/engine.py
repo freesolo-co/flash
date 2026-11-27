@@ -72,7 +72,6 @@ class _ChoiceStreamState:
     text: str = ""
     finish_reason: str | None = None
     tool_calls: tuple[Any, ...] = ()
-    terminal_emitted: bool = False
 
 
 @dataclass(slots=True)
@@ -148,7 +147,6 @@ class _StreamState:
                     events.append((StreamDelta(index=index, text=parsed.content), None))
             choice.finish_reason = finish_reason
             choice.tool_calls = tool_calls
-            choice.terminal_emitted = True
             events.append(
                 (
                     None,

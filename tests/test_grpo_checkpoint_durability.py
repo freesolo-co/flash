@@ -1962,9 +1962,7 @@ def test_final_export_falls_back_after_optional_upload_failure(
         steps_run=4,
     )
 
-    assert exports == [
-        (("/actor", destination), {"base_model_id": "Qwen/Qwen3.5-9B", "python_bin": "python"})
-    ]
+    assert exports == [(("/actor", destination), {"python_bin": "python"})]
 
 
 def test_final_adapter_reuse_rejects_malformed_export(worker_context, tmp_path):

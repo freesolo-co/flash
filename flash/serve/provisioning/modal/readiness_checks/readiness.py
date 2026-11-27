@@ -16,7 +16,6 @@ from flash.serve.provisioning.common.records import (
     Clock,
     DeploymentBundle,
     LifecycleFailure,
-    ServingRuntimeSecrets,
     Sleeper,
     failed_deployment_result,
 )
@@ -40,7 +39,6 @@ __all__ = [
     "EndpointProbe",
     "ExpectedResources",
     "PhaseProof",
-    "ServingRuntimeSecrets",
     "TransientPhase",
     "failure_result",
     "from_sdk_failure",

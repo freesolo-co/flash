@@ -4625,7 +4625,7 @@ def test_bridge_start_mints_a_session_and_returns_the_turn_budget():
     env = _BridgeEnv()
     bridge = _bridge(env, max_turns=4)
     assert bridge.start({"index": 1, "session_id": "a"}) == {"max_turns": 4}
-    assert bridge.open_sessions() == 1
+    assert len(bridge._sessions) == 1
 
 
 def test_bridge_start_lets_a_per_example_budget_lower_the_cap_but_never_raise_it():
@@ -4789,7 +4789,7 @@ def test_bridge_authentication_joins_consecutive_text_blocks_like_the_chat_templ
             "image_digests": [],
         }
     )
-    assert bridge.open_sessions() == 1
+    assert len(bridge._sessions) == 1
 
 
 def test_bridge_authentication_rejects_changed_text_after_text_block_concatenation():
@@ -4820,7 +4820,7 @@ def test_bridge_authentication_rejects_changed_text_after_text_block_concatenati
                 "image_digests": [],
             }
         )
-    assert bridge.open_sessions() == 0
+    assert len(bridge._sessions) == 0
 
 
 def test_bridge_authentication_rejects_image_placement_and_media_digest_sabotage():
@@ -4927,7 +4927,7 @@ def test_bridge_authentication_rejects_image_placement_and_media_digest_sabotage
         for index, sabotage in enumerate(sabotages):
             with pytest.raises(_BadRequest):
                 bridge.start({"index": 0, "session_id": f"s{index}", **sabotage})
-        assert bridge.open_sessions() == 0
+        assert len(bridge._sessions) == 0
     finally:
         image.close()
 
@@ -5244,7 +5244,7 @@ def test_bridge_start_rejects_an_out_of_range_index_before_touching_the_env():
     for index in (-1, 1, 99):
         with pytest.raises(IndexError, match="outside"):
             bridge.start({"index": index, "session_id": "a"})
-    assert bridge.open_sessions() == 0
+    assert len(bridge._sessions) == 0
 
 
 def test_bridge_start_refuses_to_reuse_a_live_session_id():
@@ -5919,7 +5919,7 @@ def test_bridge_close_releases_the_session():
     bridge = _bridge(_BridgeEnv())
     bridge.start({"index": 0, "session_id": "a"})
     assert bridge.close({"session_id": "a"}) == {"closed": True}
-    assert bridge.open_sessions() == 0
+    assert len(bridge._sessions) == 0
     assert bridge.close({"session_id": "a"}) == {"closed": True}
 
 
@@ -5947,7 +5947,7 @@ def test_bridge_reaps_a_session_whose_actor_died_before_it_could_close(capsys):
 
     bridge.start({"index": 1, "session_id": "live"})
 
-    assert bridge.open_sessions() == 1, "the abandoned session outlived the actor that owned it"
+    assert len(bridge._sessions) == 1, "the abandoned session outlived the actor that owned it"
     assert "dead" not in bridge._sessions
     # the leak it prevents is silent, so the reap must not be: repeated reaps mean actors are dying
     # mid-episode, which is a rollout problem worth seeing in the log.
@@ -5969,7 +5969,7 @@ def test_bridge_never_reaps_a_session_that_is_still_being_driven():
     bridge.step({"session_id": "slow", "completion_text": "a turn that took a very long time"})
     bridge.start({"index": 1, "session_id": "other"})
 
-    assert bridge.open_sessions() == 2, "a live episode was reaped and its next turn will fail"
+    assert len(bridge._sessions) == 2, "a live episode was reaped and its next turn will fail"
     assert bridge.step({"session_id": "slow", "completion_text": "next"})["messages"]
 
 
@@ -5981,7 +5981,7 @@ def test_bridge_lease_can_be_disabled_and_then_nothing_is_ever_reaped():
     bridge.start({"index": 0, "session_id": "dead"})
     _age_session(bridge, "dead", 10_000_000.0)
     bridge.start({"index": 1, "session_id": "live"})
-    assert bridge.open_sessions() == 2
+    assert len(bridge._sessions) == 2
 
 
 def test_bridge_routes_are_served_alongside_single_turn_scoring():

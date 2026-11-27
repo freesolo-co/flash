@@ -539,7 +539,7 @@ def test_verl_rl_renders_the_same_metric_fields_the_cli_shows():
     # the payload schema belongs to the cli, not verl: a key the renderer does not know is dead
     # weight, so keep the mapping's flash-side names inside the rendered set.
     from flash.cli.commands.ops.log_follow import _FOLLOW_METRIC_FIELDS
-    from flash.engine.worker.train.entry.backend_common import _VERL_METRIC_FIELDS
+    from flash.engine.worker.verl.child_io import _VERL_METRIC_FIELDS
 
     rendered = {name for name, *_ in _FOLLOW_METRIC_FIELDS}
     emitted = {flash_key for _, flash_key in _VERL_METRIC_FIELDS}

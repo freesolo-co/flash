@@ -36,7 +36,6 @@ class ResolvedEnvironmentSource:
 
 @dataclass(frozen=True)
 class VerifiedStagedEnvironment:
-    manifest_file: Path
     archive_file: Path
     entrypoint: str
 
@@ -441,7 +440,7 @@ def verify_staged_environment(
     )
     if _archive_digest(archive_file) != package.archive_sha256:
         raise RuntimeError("staged environment archive digest does not match worker spec")
-    return VerifiedStagedEnvironment(manifest_file, archive_file, entrypoint)
+    return VerifiedStagedEnvironment(archive_file, entrypoint)
 
 
 def materialize_staged_environment(

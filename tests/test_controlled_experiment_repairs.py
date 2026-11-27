@@ -247,7 +247,7 @@ def test_prefetch_error_classification():
     )
     from requests.exceptions import ConnectionError, Timeout
 
-    from flash.engine.worker.io.artifacts import _prefetch_error_is_retriable
+    from flash.engine.worker.io.prefetch import _prefetch_error_is_retriable
 
     def hf_error(error_type, status):
         response = SimpleNamespace(

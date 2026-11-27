@@ -2296,7 +2296,7 @@ def test_a_resumed_sft_run_does_not_republish_the_step_it_resumed_from(
     """
     import flash.engine.worker.io.artifacts as worker
     from flash.engine.worker.train.entry import sft_train
-    from flash.engine.worker.train.entry.backend_common import stage_verl_resume
+    from flash.engine.worker.verl.checkpoints import stage_verl_resume
 
     local_dir = tmp_path / "checkpoints"
     local_dir.mkdir()

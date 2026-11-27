@@ -140,8 +140,8 @@ def _warn_if_environment_form_disagrees(
 
     if managed:
         # "cannot fetch", not "rejects": a slug passes validation and fails one layer later, at
-        # fetch -- `managed_slug_to_github_ref` maps every slug onto `freesolo-co/environment-hub`,
-        # which an external operator's GITHUB_TOKEN cannot read.
+        # fetch -- every slug names Freesolo's private managed environment registry, which an
+        # external operator's plane cannot read.
         warn(
             f"existing {_names(managed)} use managed hub [environment] ids, which this plane "
             "accepts but cannot fetch -- they resolve to Freesolo's internal environment-hub "

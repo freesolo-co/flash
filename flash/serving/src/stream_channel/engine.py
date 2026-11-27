@@ -54,10 +54,6 @@ class _UnsettledGuardedOperation(Exception):
         super().__init__(str(cause))
 
 
-# one process-wide retention set, shared with the router side
-_BACKGROUND_TASKS = _tasks.BACKGROUND_TASKS
-
-
 async def _join_task(task: asyncio.Task[Any]) -> None:
     await _tasks.join_task(task, CLEANUP_SECONDS)
 

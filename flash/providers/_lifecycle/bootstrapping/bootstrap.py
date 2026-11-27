@@ -270,7 +270,7 @@ def _upload_console_snapshot(
     """
     kind = "" if final else f"_attempt{payload.get('attempt', 0)}"
     tail_path = f"{console}{kind}.tail"
-    tail = _read_console_tail(console, 64_000, secrets=_payload_secrets(payload))
+    tail = _read_console_tail(console, 64_000)
     if extra:
         tail += extra
     with open(tail_path, "w", encoding="utf-8", errors="replace") as f:

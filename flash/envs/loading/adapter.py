@@ -20,10 +20,7 @@ from flash.envs.loading.base import (
     with_system_prompt,
 )
 from flash.envs.loading.loader import (
-    GitHubEnvironmentRef,
     GitHubRateLimitError,
-    GitHubTransientError,
-    GitHubUnavailableError,
     _import_freesolo_environment_tools,
     canonical_managed_environment_slug,
     env_dataset_rows,
@@ -31,7 +28,6 @@ from flash.envs.loading.loader import (
     is_github_environment_ref,
     is_managed_environment_slug,
     load_freesolo_environment,
-    managed_slug_to_github_ref,
 )
 from flash.envs.loading.sft_targets import is_message_target, parse_message_target
 from flash.envs.scoring.response import ScoredResponseText as _ScoredResponseText
@@ -755,14 +751,10 @@ class FreesoloEnvironment(BaseEnvironment):
 
 __all__ = [
     "FreesoloEnvironment",
-    "GitHubEnvironmentRef",
     "GitHubRateLimitError",
-    "GitHubTransientError",
-    "GitHubUnavailableError",
     "canonical_managed_environment_slug",
     "is_freesolo_environment_id",
     "is_github_environment_ref",
     "is_managed_environment_slug",
     "load_freesolo_environment",
-    "managed_slug_to_github_ref",
 ]

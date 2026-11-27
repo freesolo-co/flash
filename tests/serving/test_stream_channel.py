@@ -13,7 +13,7 @@ from typing import Any
 import modal
 import pytest
 
-from flash.serving.src.stream_channel import client
+from flash.serving.src.stream_channel import _tasks, client
 from flash.serving.src.stream_channel import engine as channel_engine
 from flash.serving.src.stream_channel.engine import stream_generate_call
 from flash.serving.src.stream_channel.protocol import (
@@ -948,13 +948,13 @@ def test_guarded_abort_timeout_retains_noncooperative_abort(
         with pytest.raises(StreamChannelError, match="stream cancelled"):
             await asyncio.wait_for(task, timeout=0.1)
         await abort_cancelled.wait()
-        retained = bool(channel_engine._BACKGROUND_TASKS)
+        retained = bool(_tasks.BACKGROUND_TASKS)
         release_abort.set()
-        for retained_task in tuple(channel_engine._BACKGROUND_TASKS):
+        for retained_task in tuple(_tasks.BACKGROUND_TASKS):
             await retained_task
         await asyncio.sleep(0)
         await watch.close()
-        return retained, not channel_engine._BACKGROUND_TASKS
+        return retained, not _tasks.BACKGROUND_TASKS
 
     assert asyncio.run(scenario()) == (True, True)
 
@@ -1017,7 +1017,7 @@ def test_unsettled_data_write_does_not_publish_a_competing_terminal_error(
         await data_put_cancelled.wait()
         returned_before_late_commit = queue._partitions[DATA_PARTITION].empty()
         release_data_put.set()
-        for retained_task in tuple(channel_engine._BACKGROUND_TASKS):
+        for retained_task in tuple(_tasks.BACKGROUND_TASKS):
             await retained_task
         values = list(queue._partitions[DATA_PARTITION]._queue)
         return values, returned_before_late_commit
@@ -1221,12 +1221,12 @@ def test_engine_cleanup_timeout_retains_noncooperative_task(
             timeout=0.1,
         )
         await cancellation_received.wait()
-        retained = bool(channel_engine._BACKGROUND_TASKS)
+        retained = bool(_tasks.BACKGROUND_TASKS)
         release.set()
-        for task in tuple(channel_engine._BACKGROUND_TASKS):
+        for task in tuple(_tasks.BACKGROUND_TASKS):
             await task
         await asyncio.sleep(0)
-        return retained, not channel_engine._BACKGROUND_TASKS
+        return retained, not _tasks.BACKGROUND_TASKS
 
     assert asyncio.run(scenario()) == (True, True)
 
@@ -1513,12 +1513,12 @@ def test_bounded_cancel_timeout_retains_noncooperative_rpc_until_completion(
         with pytest.raises(TimeoutError):
             await client._bounded_shield(noncooperative_rpc(), 0.01)
         await cancellation_received.wait()
-        retained = bool(client._BACKGROUND_TASKS)
+        retained = bool(_tasks.BACKGROUND_TASKS)
         release.set()
-        for task in tuple(client._BACKGROUND_TASKS):
+        for task in tuple(_tasks.BACKGROUND_TASKS):
             await task
         await asyncio.sleep(0)
-        return retained, not client._BACKGROUND_TASKS
+        return retained, not _tasks.BACKGROUND_TASKS
 
     assert asyncio.run(scenario()) == (True, True)
 
@@ -2211,7 +2211,7 @@ def test_iterator_close_cancels_exact_call_before_stalled_control_cleanup(
         await asyncio.wait_for(channel.aclose(), timeout=0.2)
         observed = stalled_cancel.is_set()
         release_cancel.set()
-        for task in tuple(client._BACKGROUND_TASKS):
+        for task in tuple(_tasks.BACKGROUND_TASKS):
             await task
         return call.cancel_count, observed
 
@@ -2256,12 +2256,12 @@ def test_router_cleanup_bounds_noncooperative_call_result(
         await anext(channel)
         await asyncio.wait_for(channel.aclose(), timeout=0.2)
         await cancellation_received.wait()
-        retained = bool(client._BACKGROUND_TASKS)
+        retained = bool(_tasks.BACKGROUND_TASKS)
         release.set()
-        for task in tuple(client._BACKGROUND_TASKS):
+        for task in tuple(_tasks.BACKGROUND_TASKS):
             await task
         await asyncio.sleep(0)
-        return retained, not client._BACKGROUND_TASKS
+        return retained, not _tasks.BACKGROUND_TASKS
 
     assert asyncio.run(scenario()) == (True, True)
 
@@ -2384,13 +2384,13 @@ def test_cancelled_channel_setup_closes_late_ephemeral_queue(
         await cancellation_received.wait()
         with pytest.raises(asyncio.CancelledError):
             await asyncio.wait_for(task, timeout=0.2)
-        retained = bool(client._BACKGROUND_TASKS)
+        retained = bool(_tasks.BACKGROUND_TASKS)
         release.set()
         await asyncio.wait_for(exited.wait(), timeout=0.2)
-        for retained_task in tuple(client._BACKGROUND_TASKS):
+        for retained_task in tuple(_tasks.BACKGROUND_TASKS):
             await retained_task
         await asyncio.sleep(0)
-        return retained, not client._BACKGROUND_TASKS
+        return retained, not _tasks.BACKGROUND_TASKS
 
     assert asyncio.run(scenario()) == (True, True)
 
@@ -2515,12 +2515,12 @@ def test_router_data_poll_cancellation_reaches_exact_call_teardown(
         await cancellation_received.wait()
         with pytest.raises(asyncio.CancelledError):
             await asyncio.wait_for(task, timeout=0.2)
-        retained = bool(client._BACKGROUND_TASKS)
+        retained = bool(_tasks.BACKGROUND_TASKS)
         release.set()
-        for retained_task in tuple(client._BACKGROUND_TASKS):
+        for retained_task in tuple(_tasks.BACKGROUND_TASKS):
             await retained_task
         await asyncio.sleep(0)
-        return call.cancel_count, retained, not client._BACKGROUND_TASKS
+        return call.cancel_count, retained, not _tasks.BACKGROUND_TASKS
 
     assert asyncio.run(scenario()) == (1, True, True)
 
@@ -2557,12 +2557,12 @@ def test_engine_control_read_stall_fails_closed_on_local_deadline(
         with pytest.raises(StreamChannelError) as exc_info:
             await asyncio.wait_for(watch._task, timeout=0.2)
         await cancellation_received.wait()
-        retained = bool(channel_engine._BACKGROUND_TASKS)
+        retained = bool(_tasks.BACKGROUND_TASKS)
         release.set()
-        for retained_task in tuple(channel_engine._BACKGROUND_TASKS):
+        for retained_task in tuple(_tasks.BACKGROUND_TASKS):
             await retained_task
         await asyncio.sleep(0)
-        return exc_info.value.code, retained, not channel_engine._BACKGROUND_TASKS
+        return exc_info.value.code, retained, not _tasks.BACKGROUND_TASKS
 
     assert asyncio.run(scenario()) == (ChannelErrorCode.CHANNEL_FAULT, True, True)
 
@@ -2612,12 +2612,12 @@ def test_router_context_exit_is_bounded_and_retained(
         )
         events = [event async for event in channel]
         await cancellation_received.wait()
-        retained = bool(client._BACKGROUND_TASKS)
+        retained = bool(_tasks.BACKGROUND_TASKS)
         release.set()
-        for retained_task in tuple(client._BACKGROUND_TASKS):
+        for retained_task in tuple(_tasks.BACKGROUND_TASKS):
             await retained_task
         await asyncio.sleep(0)
-        return events, retained, not client._BACKGROUND_TASKS
+        return events, retained, not _tasks.BACKGROUND_TASKS
 
     assert asyncio.run(scenario()) == ([{"type": "final", "ok": True}], True, True)
 
@@ -2645,12 +2645,12 @@ def test_router_partition_clear_retains_noncooperative_rpc(
             timeout=0.1,
         )
         await cancellation_received.wait()
-        retained = bool(client._BACKGROUND_TASKS)
+        retained = bool(_tasks.BACKGROUND_TASKS)
         release.set()
-        for task in tuple(client._BACKGROUND_TASKS):
+        for task in tuple(_tasks.BACKGROUND_TASKS):
             await task
         await asyncio.sleep(0)
-        return retained, not client._BACKGROUND_TASKS
+        return retained, not _tasks.BACKGROUND_TASKS
 
     assert asyncio.run(scenario()) == (True, True)
 

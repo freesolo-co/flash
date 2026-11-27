@@ -1899,7 +1899,6 @@ def test_github_environment_ref_parsing():
         is_freesolo_environment_id,
         is_github_environment_ref,
         is_managed_environment_slug,
-        managed_slug_to_github_ref,
     )
 
     assert is_github_environment_ref("github:owner/repo@dev:envs/e/environment.py")
@@ -1922,9 +1921,6 @@ def test_github_environment_ref_parsing():
     )
     assert is_managed_environment_slug("owner/project/env")
     assert is_freesolo_environment_id("owner/project/env")
-    assert managed_slug_to_github_ref("owner/project/env") == (
-        "github:freesolo-co/environment-hub@main:owner/project/env/environment.py"
-    )
     assert not is_managed_environment_slug("owner/project/env/extra")
     assert not is_freesolo_environment_id("gsm8k")
 
@@ -2122,8 +2118,7 @@ def test_safe_extract_archive_rejects_longname_decompression_bomb(tmp_path):
 def test_github_environment_requires_freesolo_worker_dependency():
     import flash.envs.loading.base as registry
 
-    env_id = "github:owner/repo@main:env/environment.py"
-    assert registry.worker_pip_for_env(env_id) == ["freesolo>=0.4.2"]
+    assert registry.worker_pip_for_env() == ["freesolo>=0.4.2"]
 
 
 # ============================================================================================

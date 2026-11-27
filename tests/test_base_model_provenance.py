@@ -6,12 +6,14 @@ from flash.engine.worker.io import artifacts as hf
 
 
 def test_is_commit_sha_accepts_only_full_hex():
-    assert hf.is_commit_sha("a" * 40)
-    assert hf.is_commit_sha("0123456789abcdef0123456789abcdef01234567")
-    assert not hf.is_commit_sha("a" * 39)  # too short
-    assert not hf.is_commit_sha("main")  # a ref, not a commit
-    assert not hf.is_commit_sha("g" * 40)  # non-hex
-    assert not hf.is_commit_sha("")
+    from flash.envs.loading.loader import is_commit_sha
+
+    assert is_commit_sha("a" * 40)
+    assert is_commit_sha("0123456789abcdef0123456789abcdef01234567")
+    assert not is_commit_sha("a" * 39)  # too short
+    assert not is_commit_sha("main")  # a ref, not a commit
+    assert not is_commit_sha("g" * 40)  # non-hex
+    assert not is_commit_sha("")
 
 
 def test_resolve_cached_model_commit_returns_snapshot_basename(monkeypatch):

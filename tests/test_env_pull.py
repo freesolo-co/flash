@@ -558,7 +558,7 @@ def test_download_github_tarball_uses_whole_repo_ceiling(monkeypatch):
     monkeypatch.setattr(adapter, "_urlopen", fake_urlopen)
     monkeypatch.setattr(adapter, "_github_token", lambda: None)
     ref = adapter._parse_github_environment_ref(
-        adapter.managed_slug_to_github_ref("david-freesolo-co/my-project/stuff")
+        "github:freesolo-co/environment-hub@main:david-freesolo-co/my-project/stuff/environment.py"
     )
 
     tarball = adapter._download_github_tarball(ref)

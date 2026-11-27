@@ -1,7 +1,7 @@
 """What the verl child said before it died, and where ray wrote the rest of it.
 
 A wedged or crashed child is diagnosed from two places: the tail of its own stdout, which
-`ChildOutputTail` retains in a bounded ring buffer and `ChildTailStaleness` times, and ray's
+`ChildOutputTail` retains in a bounded ring buffer, and ray's
 per-session log directory, which holds the raylet and worker output the child never printed. Both
 end up on a heartbeat payload, so both are size-capped and sanitized.
 
@@ -27,9 +27,6 @@ CHILD_TAIL_LINES = 60
 # per-line cap when rendering the retained tail. verl prints resolved-config blocks thousands of
 # characters wide; an unbounded tail would blow the heartbeat payload it has to travel inside.
 _CHILD_TAIL_LINE_CHARS = 300
-# how many retained lines ride along on a pre-first-step heartbeat. narrower than what is retained:
-# this payload is uploaded every tick, so it stays small enough not to bloat the snapshot.
-STALL_TAIL_LINES = 15
 _RETRIABLE_VERL_CHILD_SIGNATURES = (
     "cudaErrorDevicesUnavailable",
     "CUDA-capable device(s) is/are busy or unavailable",
@@ -263,62 +260,6 @@ def raise_for_classified_verl_exit(return_code: int, tail: ChildOutputTail) -> N
     raise RetriableInfraError(
         f"verl subprocess exited with status {return_code} after reporting {signature}"
     )
-
-
-class ChildTailStaleness:
-    """tracks how long a child has been silent, across the ticks that sample its tail.
-
-    the tail alone cannot answer the question a stall actually poses. a child still loading shards
-    and a child wedged forever both present a fully populated tail whose newest line is plausible,
-    so the only thing separating them is whether the tail CHANGED between two dumps -- and a
-    stateless report throws that comparison away, leaving it to be reconstructed by hand from
-    consecutive heartbeats after the money is already spent (ISSUES VERL-067). holding the previous
-    line count here turns that into a number the first dump already carries.
-    """
-
-    def __init__(self) -> None:
-        self._written = -1
-        self._since = 0
-
-    def observe(self, written: int) -> int:
-        """record this tick's line count; return consecutive ticks with no new output.
-
-        0 means the child spoke since the last observation. n>0 means it has been silent for n
-        ticks, which is the signal that separates a slow start from a wedge.
-        """
-        if written != self._written:
-            self._written = written
-            self._since = 0
-        else:
-            self._since += 1
-        return self._since
-
-
-def stall_tail_fields(
-    step: int,
-    tail: ChildOutputTail,
-    limit: int = STALL_TAIL_LINES,
-    staleness: ChildTailStaleness | None = None,
-) -> dict[str, object]:
-    """heartbeat fields carrying the child's last words, but only while it has made no progress.
-
-    before the first step, the tail is the only collected setup-stall evidence. with ``staleness``,
-    include silent ticks to distinguish a slow start from a wedge. return empty after progress or
-    before any child output.
-    """
-    if step > 0:
-        return {}
-    recent = tail.tail(limit=limit)
-    if not recent:
-        # observed even with nothing to report, so a child that starts talking later is measured
-        # from its first line rather than from whenever the payload happened to become non-empty.
-        if staleness is not None:
-            staleness.observe(tail.written)
-        return {}
-    fields: dict[str, object] = {"child_tail": recent}
-    if staleness is not None:
-        fields["child_tail_silent_ticks"] = staleness.observe(tail.written)
-    return fields
 
 
 def build_verl_line_handler(

@@ -514,23 +514,23 @@ def test_only_immutable_complete_pin_reads_are_memoized():
         # an incomplete read stays retryable rather than becoming a permanent rejection.
         monkey.setattr(model_config_probe, "_CONFIG_PROBE_MEMO", {})
         monkey.setattr(vram, "fetch_hf_model_geometry", _answer(None))
-        vram._memoized_config_probe("M", "a" * 40)
-        vram._memoized_config_probe("M", "a" * 40)
+        model_config_probe._memoized_config_probe("M", "a" * 40)
+        model_config_probe._memoized_config_probe("M", "a" * 40)
         assert model_config_probe._CONFIG_PROBE_MEMO == {}, "an incomplete read must not be cached"
         assert len(calls) == 2, "an incomplete read must stay retryable"
 
         # a moving ref is re-read every time, because it can point somewhere else tomorrow.
         calls.clear()
         monkey.setattr(vram, "fetch_hf_model_geometry", _answer(9.0))
-        vram._memoized_config_probe("M", "main")
-        vram._memoized_config_probe("M", "main")
+        model_config_probe._memoized_config_probe("M", "main")
+        model_config_probe._memoized_config_probe("M", "main")
         assert model_config_probe._CONFIG_PROBE_MEMO == {}, "a moving ref must not be cached"
         assert len(calls) == 2, "a moving ref must be re-read"
 
         # a complete sha read IS shared -- that is the whole point of the memo.
         calls.clear()
-        vram._memoized_config_probe("M", "b" * 40)
-        vram._memoized_config_probe("M", "b" * 40)
+        model_config_probe._memoized_config_probe("M", "b" * 40)
+        model_config_probe._memoized_config_probe("M", "b" * 40)
         assert len(calls) == 1, "a complete sha read must be shared, not repeated"
         assert list(model_config_probe._CONFIG_PROBE_MEMO) == [("M", "b" * 40)]
     finally:

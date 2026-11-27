@@ -120,8 +120,3 @@ class ModalProvider:
 
 
 PROVIDER = ModalProvider()
-
-
-def terminate_persisted_resources(spec, run_id):
-    """Reconcile a launch even when its public job spec can no longer be parsed."""
-    PROVIDER.terminate_run(run_id)
