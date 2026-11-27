@@ -227,7 +227,7 @@ engine_secret = _engine_secret()
 engine_secrets = [engine_secret] if engine_secret is not None else []
 
 # Reserved serving is decided once here and baked into every image (see reserved.active).
-from flash.serving.lambda_cloud import reserved, reserved_watchdog  # noqa: E402
+from flash.serving.lambda_cloud import reserved, reserved_acquire, reserved_watchdog  # noqa: E402
 
 _reserved_env = reserved.baked_env(MODAL_ENVIRONMENT)
 
@@ -526,7 +526,7 @@ def _configured_engine(model, provider, suffix=""):
     )
 
 
-# In main the reserved models (27B, 0.8B Base) are served only by reserved H100 slots.
+# In main, once its workers secret exists, 9B Base is served only by reserved H100 slots.
 ENGINE_BY_MODEL: dict[str, Any] = {
     bm: _configured_engine(bm, "lambda")
     for bm in base_models()
@@ -550,11 +550,13 @@ RESERVED_ENGINES = (
         )
         for slot, model in reserved.SLOT_MODELS.items()
     )
-    if reserved.enabled(reserved.LARGE_MODEL, MODAL_ENVIRONMENT)
+    if reserved.active(MODAL_ENVIRONMENT)
     else ()
 )
 if RESERVED_ENGINES:
     reserved_watchdog.register_watchdog(app, lambda_controller_image, __name__)
+_acq = (app, lambda_controller_image, lambda_proxy_secrets, MODAL_ENVIRONMENT, __name__)
+reserved_acquire.register_acquire(*_acq)
 
 
 def _reserved(model: str) -> bool:
