@@ -132,8 +132,7 @@ async def test_release_finds_vm_after_launch_response_loss():
 
 
 def test_hardware_choices_and_capacity_fail_closed():
-    # Any qualified single GPU may serve; the policy pins no type.
-    assert placements(MODEL) == ("A10", "A6000", "A100-40GB", "A100-80GB", "H100", "H200", "B200")
+    assert placements(MODEL) == ("H100",)
     assert placements("Qwen/Qwen3.6-35B-A3B") == ("H200", "B200")
     with pytest.raises(ValueError, match="only defined"):
         placements("deepseek-ai/DeepSeek-V4.1-Flash-1017")

@@ -448,9 +448,13 @@ def test_deployed_timeouts_use_the_shared_serving_budget(modal_app_module):
 
 def test_only_model_scoped_engines_are_registered(modal_app_module):
     registered = {name for name in vars(modal_app_module) if name.startswith("LoraEngine_")}
-    # One Lambda proxy per model and no Modal GPU (_ModalGPU) fallback class.
-    assert registered == {modal_app_module.model_engine_name(model) for model in base_models()}
-    assert modal_app_module.app.cls.call_count == len(base_models())
+    assert registered == {modal_app_module.model_engine_name(model) for model in base_models()} | {
+        modal_app_module.model_engine_name(model) + "_ModalGPU"
+        for model in modal_app_module.MODAL_FALLBACK_BY_MODEL
+    }
+    assert modal_app_module.app.cls.call_count == len(base_models()) + len(
+        modal_app_module.MODAL_FALLBACK_BY_MODEL
+    )
 
 
 def test_engine_concurrency_rejects_malformed_catalog_values(modal_app_module, monkeypatch):
@@ -486,9 +490,12 @@ def test_models_route_to_qualified_gpu(modal_app_module, model, gpu, sequences):
     assert cls is modal_app_module.ENGINE_BY_MODEL[model]
     assert cls.__name__ == modal_app_module.model_engine_name(model)
     assert modal_app_module._engine_concurrency(model) == (sequences, sequences)
-    # Lambda proxies report the actual rented GPU at runtime instead of pinning one.
-    assert issubclass(cls, modal_app_module.LambdaEngineProxy)
-    assert cls.pinned_gpu is None
+    expected = (
+        modal_app_module.modal_gpus_for(model)
+        if issubclass(cls, modal_app_module.HostedModalEngine)
+        else None
+    )
+    assert cls.pinned_gpu == expected
 
 
 def test_unknown_base_model_is_rejected_before_engine_dispatch(modal_app_module):
@@ -501,7 +508,12 @@ def test_tier_classes_inherit_the_shared_impl(modal_app_module):
     """Each tier class subclasses _LoraEngineImpl (so _load/_generate/etc resolve) and defines the
     public Modal entrypoints itself (so Modal collects them per class)."""
     tier = modal_app_module.ENGINE_BY_MODEL["Qwen/Qwen3.6-35B-A3B"]
-    assert issubclass(tier, modal_app_module.LambdaEngineProxy)
+    implementation = (
+        modal_app_module.HostedModalEngine
+        if issubclass(tier, modal_app_module.HostedModalEngine)
+        else modal_app_module.LambdaEngineProxy
+    )
+    assert issubclass(tier, implementation)
     for impl in ("_load", "_register", "_generate", "_stream_generate", "_unregister", "_health"):
         assert hasattr(tier, impl)
     for entry in ("load", "register", "generate", "stream_generate_call", "unregister", "health"):
@@ -1003,12 +1015,12 @@ def test_modal_stream_entrypoint_uses_regular_call(modal_app_module, monkeypatch
     run.assert_awaited_once_with(engine, *args)
 
 
-def test_hosted_qwen_registers_only_cpu_lambda_proxies(modal_app_module):
+def test_hosted_qwen_registers_primary_and_scale_to_zero_fallback(modal_app_module):
     mod = modal_app_module
-    for call, cls in zip(mod.app.cls.call_args_list, mod.ENGINE_BY_MODEL.values(), strict=True):
-        assert "gpu" not in call.kwargs  # No Modal GPU engine class is ever registered.
-        assert issubclass(cls, mod.LambdaEngineProxy)
-        assert not issubclass(cls, mod._LoraEngineImpl)
-    assert not hasattr(mod, "HostedModalEngine")
-    with pytest.raises(ValueError, match="Lambda only"):
-        mod._build_engine("A100-80GB", "LoraEngine_Rejected", 8, 8, provider="modal")
+    for call, cls in zip(
+        mod.app.cls.call_args_list,
+        [*mod.ENGINE_BY_MODEL.values(), *mod.MODAL_FALLBACK_BY_MODEL.values()],
+        strict=True,
+    ):
+        assert ("gpu" in call.kwargs) == issubclass(cls, mod.HostedModalEngine)
+        assert issubclass(cls, mod.LambdaEngineProxy) != issubclass(cls, mod._LoraEngineImpl)

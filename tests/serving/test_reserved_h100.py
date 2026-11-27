@@ -64,10 +64,9 @@ def test_reserved_models_are_reserved_only_in_main(environment):
     assert not reserved.enabled(LARGE, "dev")
 
 
-def test_both_reserved_models_can_place_on_a_single_h100_on_lambda():
-    # Reserved slots are explicitly provisioned H100s, so H100 must stay a qualified shape.
-    assert "H100" in placements(LARGE)
-    assert "H100" in placements(DRAFTER)
+def test_both_reserved_models_place_on_a_single_h100_on_lambda():
+    assert placements(LARGE) == ("H100",)
+    assert placements(DRAFTER) == ("H100",)
 
 
 def test_parse_workers_requires_each_entry_to_name_its_slot_model():
@@ -350,8 +349,10 @@ def test_health_body_reports_reserved_models_only_while_reserved_is_on(monkeypat
         base_models=lambda: [LARGE, DRAFTER, "Qwen/Qwen3.5-9B-Base"], ready_adapters=list
     )
     body = health_body(router, deployment_sha="s", deployment_id="d", capabilities=[])
-    # No model, reserved or on-demand, has a Modal GPU fallback to report.
-    assert "fallback_provider_by_model" not in body
+    fallback = set(body["fallback_provider_by_model"])
+    assert (LARGE in fallback) is (not on)
+    assert (DRAFTER in fallback) is (not on)
+    assert "Qwen/Qwen3.5-9B-Base" in fallback
     assert body["capacity_by_model"][LARGE]["min"] == (5 if on else 0)
     assert body["capacity_by_model"][DRAFTER]["min"] == (3 if on else 0)
     assert body["capacity_by_model"]["Qwen/Qwen3.5-9B-Base"]["min"] == 0
