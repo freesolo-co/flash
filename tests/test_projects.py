@@ -10,6 +10,7 @@ from fastapi import HTTPException
 
 from flash.client import ClientError, create_project, get_project, list_projects
 from flash.server.domain.registry.projects import (
+    require_internal_publish_scope,
     require_project_access,
     require_project_access_slug,
 )
@@ -651,3 +652,52 @@ def test_id_only_project_access_does_not_require_canonical_slug(monkeypatch) -> 
         == project_id
     )
     assert [request["method"] for request in requests] == ["GET"]
+
+
+def test_internal_publish_namespace_is_the_named_orgs_validated_slug(monkeypatch) -> None:
+    """The org-agnostic internal key publishes only under the slug of the org it names."""
+    project_id = "11111111-1111-4111-8111-111111111111"
+    requests = _install_project_validation_responses(
+        monkeypatch,
+        public_payloads=[],
+        internal_payloads=[
+            {
+                "ok": True,
+                "orgId": "org-one",
+                "projectId": project_id,
+                "projectSlug": "checkout-bot",
+                "orgSlug": "acme",
+            }
+        ],
+    )
+
+    assert require_internal_publish_scope(project_id=project_id, org_id="org-one") == (
+        project_id,
+        "checkout-bot",
+        "acme",
+    )
+    assert [request["body"] for request in requests] == [
+        {"orgId": "org-one", "projectId": project_id}
+    ]
+
+
+def test_internal_publish_namespace_requires_the_org_header() -> None:
+    with pytest.raises(HTTPException, match="X-Freesolo-Org-Id is required") as exc:
+        require_internal_publish_scope(
+            project_id="11111111-1111-4111-8111-111111111111", org_id=" "
+        )
+    assert exc.value.status_code == 400
+
+
+def test_internal_publish_namespace_fails_closed_without_an_org_slug(monkeypatch) -> None:
+    project_id = "11111111-1111-4111-8111-111111111111"
+    _install_project_validation_responses(
+        monkeypatch,
+        public_payloads=[],
+        internal_payloads=[
+            {"ok": True, "orgId": "org-one", "projectId": project_id, "projectSlug": "bot"}
+        ],
+    )
+    with pytest.raises(HTTPException, match="organization slug") as exc:
+        require_internal_publish_scope(project_id=project_id, org_id="org-one")
+    assert exc.value.status_code == 502
