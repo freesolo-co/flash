@@ -77,16 +77,6 @@ def register_control(app, secret, image, module_name):
             return await self.capacity.activate(revision)
 
         @modal.method()
-        async def refresh_capacity(self, model):
-            if not await self.capacity.active():
-                raise RuntimeError("Cannot refresh a superseded capacity controller")
-            await self.capacity.reconcile_model(model)
-
-        @modal.method()
-        async def choose(self, model):
-            return await self.capacity.choose(model)
-
-        @modal.method()
         async def release(self, owner):
             return await self.fleet.release(owner)
 
@@ -100,20 +90,10 @@ def register_control(app, secret, image, module_name):
         return await control().reap.remote.aio()
 
     async def choose_provider(model):
-        # Routing reads leases independently of the serialized VM mutation queue.
-        # A slow cloud launch must not hold incoming requests behind it.
-        from .pool_capacity import SharedCapacity, modal_pools
-
-        environment = os.environ["FLASH_LAMBDA_ENVIRONMENT"]
-        fleet = Fleet(None, Ledger(), environment)
-        capacity = SharedCapacity(
-            fleet,
-            modal_pools(environment),
-            Ledger(LEDGER_NAME + "-pools"),
-            "",
-            refresh=control().refresh_capacity.remote.aio,
-        )
-        return await capacity.choose(model)
+        # Rolling-deploy shim: routers from before Lambda-only serving still ask
+        # which provider to use while the control app deploys ahead of them.
+        # Hosted Qwen GPUs are Lambda-only, so the answer is always Lambda.
+        return "lambda"
 
     module = sys.modules[module_name]
     LambdaFleet.__module__ = module.__name__
@@ -143,9 +123,7 @@ def register_control(app, secret, image, module_name):
     module.choose_provider = choose_provider
     module.choose_provider = app.function(
         image=image,
-        secrets=[secret],
         timeout=30,
-        min_containers=1,
         max_containers=2,
     )(modal.concurrent(max_inputs=32)(choose_provider))
     return control, reaper

@@ -1,8 +1,8 @@
 """Watch configured Lambda hardware alongside a serving deployment.
 
-Every hosted model falls back to Modal when Lambda has no capacity, so the deployment does not wait
-on this watch. It reports which shapes Lambda offered during the window and warns (without failing
-the workflow) about any model that never had capacity.
+Hosted Qwen GPUs are Lambda-only: requests wait (rechecking every 30 seconds) until Lambda has
+capacity. The deployment does not wait on this watch. It reports which shapes Lambda offered during
+the window and warns (without failing the workflow) about any model that never had capacity.
 """
 
 import asyncio
@@ -21,7 +21,7 @@ logger = logging.getLogger(__name__)
 
 
 async def wait_for_capacity(api, models, *, clock=time.monotonic, sleep=asyncio.sleep):
-    """Poll every five minutes until each model has been seen with capacity; never rent a VM.
+    """Poll every 30 seconds until each model has been seen with capacity; never rent a VM.
 
     Returns the models Lambda never offered within the window (empty when all were seen). Shapes
     rarely free up together, so a model counts once any check found capacity for it.
@@ -53,11 +53,11 @@ async def wait_for_capacity(api, models, *, clock=time.monotonic, sleep=asyncio.
                     break
                 logger.warning(
                     "Lambda capacity check: not yet seen for %s; elapsed %.0f min, "
-                    "remaining %.0f min; checking again in %.0f min",
+                    "remaining %.0f min; checking again in %.0f s",
                     ", ".join(pending),
                     (clock() - started) / 60,
                     remaining / 60,
-                    min(CAPACITY_POLL_SECONDS, remaining) / 60,
+                    min(CAPACITY_POLL_SECONDS, remaining),
                 )
                 await sleep(min(CAPACITY_POLL_SECONDS, remaining))
     except TimeoutError:
@@ -69,7 +69,7 @@ async def wait_for_capacity(api, models, *, clock=time.monotonic, sleep=asyncio.
 def _report_unavailable(models):
     message = (
         "Lambda capacity was not available within five hours for "
-        f"{', '.join(models)}; these models serve on the Modal fallback"
+        f"{', '.join(models)}; their requests wait until Lambda has capacity"
     )
     logger.warning(message)
     if os.environ.get("GITHUB_ACTIONS") == "true":

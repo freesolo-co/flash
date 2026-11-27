@@ -19,13 +19,13 @@ def anyio_backend():
 
 
 @pytest.mark.anyio
-async def test_waits_for_all_shapes_and_reports_each_five_minute_check(caplog):
+async def test_waits_for_all_shapes_and_reports_each_30_second_check(caplog):
     clock = Clock()
     api = SimpleNamespace(call=AsyncMock(side_effect=[{}, {"a10": AVAILABLE["a10"]}, AVAILABLE]))
     assert await gate.wait_for_capacity(api, MODELS, clock=clock, sleep=clock.sleep) == []
-    assert clock.waits == [300, 300]
-    assert "elapsed 5 min, remaining 295 min" in caplog.text
-    assert "checking again in 5 min" in caplog.text
+    assert clock.waits == [30, 30]
+    assert "elapsed 0 min, remaining 300 min" in caplog.text
+    assert "checking again in 30 s" in caplog.text
     assert "seen for all configured models" in caplog.text
     assert all(call.args == ("GET", "instance-types") for call in api.call.call_args_list)
 
@@ -36,9 +36,9 @@ async def test_no_capacity_stops_after_five_hours_without_a_late_check(caplog):
     api = SimpleNamespace(call=AsyncMock(return_value={}))
     assert await gate.wait_for_capacity(api, MODELS, clock=clock, sleep=clock.sleep) == MODELS
     assert clock.now == 18000
-    assert clock.waits == [300] * 60
-    assert api.call.await_count == 60
-    assert len(caplog.records) == 60
+    assert clock.waits == [30] * 600
+    assert api.call.await_count == 600
+    assert len(caplog.records) == 600
 
 
 @pytest.mark.anyio
@@ -61,10 +61,10 @@ async def test_all_hosted_deployments_require_lambda_credentials(monkeypatch):
 @pytest.mark.anyio
 async def test_capacity_on_last_poll_still_allows_deployment():
     clock = Clock()
-    api = SimpleNamespace(call=AsyncMock(side_effect=[{}] * 59 + [AVAILABLE]))
+    api = SimpleNamespace(call=AsyncMock(side_effect=[{}] * 599 + [AVAILABLE]))
     assert await gate.wait_for_capacity(api, MODELS, clock=clock, sleep=clock.sleep) == []
-    assert clock.now == 17700
-    assert api.call.await_count == 60
+    assert clock.now == 17970
+    assert api.call.await_count == 600
 
 
 @pytest.mark.anyio
@@ -87,7 +87,7 @@ async def test_shapes_seen_at_different_checks_count_as_available():
         call=AsyncMock(side_effect=[{"a10": AVAILABLE["a10"]}, {}, {"h100": AVAILABLE["h100"]}])
     )
     assert await gate.wait_for_capacity(api, MODELS, clock=clock, sleep=clock.sleep) == []
-    assert clock.waits == [300, 300]
+    assert clock.waits == [30, 30]
 
 
 @pytest.mark.anyio
@@ -102,5 +102,6 @@ async def test_missing_capacity_warns_without_failing_the_workflow(monkeypatch, 
     out = capsys.readouterr().out
     assert out.startswith("::warning title=Lambda capacity unavailable::")
     assert MODELS[1] in out
-    assert "Modal fallback" in out
+    assert "wait until Lambda has capacity" in out
+    assert "Modal" not in out
     api.aclose.assert_awaited_once()
