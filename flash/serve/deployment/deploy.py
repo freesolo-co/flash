@@ -621,6 +621,7 @@ def chat_sse(
     tool_choice: str | None = None,
     parallel_tool_calls: bool | None = None,
     logprob_token_ids: list[int] | tuple[int, ...] | None = None,
+    traffic_source: str | None = None,
 ) -> transport.OpenAIStreamResponse:
     """open a raw openai stream while preserving status, headers, and sse bytes."""
 
@@ -629,7 +630,7 @@ def chat_sse(
     return transport.request_chat_sse(
         transport._chat_http_client(),
         url=f"{transport.serving_openai_base_url()}/chat/completions",
-        headers=transport._internal_key_header(org_id=org_id),
+        headers=transport._internal_key_header(org_id=org_id, traffic_source=traffic_source),
         run_id=run_id,
         messages=messages,
         temperature=temperature,
@@ -808,6 +809,7 @@ def chat(
     tool_choice: str | None = None,
     parallel_tool_calls: bool | None = None,
     logprob_token_ids: list[int] | tuple[int, ...] | None = None,
+    traffic_source: str | None = None,
 ) -> dict:
     """Send an OpenAI-style chat request for the run's adapter to freesolo serving.
 
@@ -821,7 +823,7 @@ def chat(
     # before the result is ready, bounded by the transport redirect limit on the serving origin.
     if parse_checkpoint_ref(run_id) is None:
         raise ValueError("chat target must be `<run_id>/final` or `<run_id>/step-N`")
-    headers = transport._internal_key_header(org_id=org_id)
+    headers = transport._internal_key_header(org_id=org_id, traffic_source=traffic_source)
     if expected_checkpoint:
         headers["X-Freesolo-Expected-Checkpoint"] = expected_checkpoint
     timeout = 30 * 60.0 if timeout_s is None else max(0.0, float(timeout_s))

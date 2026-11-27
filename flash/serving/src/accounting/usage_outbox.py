@@ -38,6 +38,17 @@ _RESPONSE_LOSS_SAFE_RPCS = frozenset(
         "acknowledge_serving_usage_delivered",
     }
 )
+# the outbox's traffic_source. ordinary Freesolo traffic bills the org; the training agent's own
+# research traffic (deploy checks, chats, scoring) is recorded but settles at $0 in the backend.
+FREESOLO_TRAFFIC_SOURCE = "freesolo"
+TRAINING_AGENT_TRAFFIC_SOURCE = "training_agent"
+_TRAFFIC_SOURCES = frozenset({FREESOLO_TRAFFIC_SOURCE, TRAINING_AGENT_TRAFFIC_SOURCE})
+
+
+def traffic_source_or_default(value: object) -> str:
+    """A known traffic source, else ordinary billable traffic (never trust an unknown value)."""
+    candidate = value.strip().lower() if isinstance(value, str) else ""
+    return candidate if candidate in _TRAFFIC_SOURCES else FREESOLO_TRAFFIC_SOURCE
 
 
 class FreesoloOrgTrafficPrincipal(BaseModel):
@@ -126,6 +137,7 @@ class UsageEvent:
     tokenizer_version: str | None
     attestation_evidence: Mapping[str, Any]
     facts: UsageFacts
+    traffic_source: str = FREESOLO_TRAFFIC_SOURCE
 
     def rpc_payload(self) -> dict[str, Any]:
         principal = self.principal
@@ -152,7 +164,7 @@ class UsageEvent:
             "request_id": self.identity.request_id,
             "correlation_id": self.identity.correlation_id,
             "traffic_principal_kind": principal.kind,
-            "traffic_source": "freesolo",
+            "traffic_source": self.traffic_source,
             "billing_attribution_explicit": principal.kind == "trusted_internal",
             "org_id": principal.orgId,
             "openai_completion_id": self.identity.openai_completion_id,

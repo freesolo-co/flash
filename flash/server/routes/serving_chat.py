@@ -15,6 +15,7 @@ from fastapi.responses import StreamingResponse
 
 import flash.serve.deployment.deploy as serving_deploy
 from flash.runner.lifecycle.status import effective_spec_from_status
+from flash.serve.contract.protocol import TRAINING_AGENT_TRAFFIC_SOURCE
 from flash.serve.contract.provenance import (
     CheckpointProvenance,
     validate_body_provenance,
@@ -108,6 +109,23 @@ def _state_limiter(state: Any, name: str, capacity: int | None = None) -> anyio.
     return limiter
 
 
+_TRAINING_JOB_HEADER = "x-freesolo-training-job-id"
+
+
+def _traffic_source(request: Any, key: dict[str, Any]) -> str | None:
+    """The training agent's own chat, for durable accounting to absorb, else None.
+
+    Only the platform internal key acting for a live training job (the agent sends its job scope
+    headers on every Flash call) counts. A customer's own key, or the platform web proxy acting for
+    a signed-in user (no job scope), stays ordinary billable traffic.
+    """
+    if key.get("auth_kind") != "internal":
+        return None
+    if not (request.headers.get(_TRAINING_JOB_HEADER) or "").strip():
+        return None
+    return TRAINING_AGENT_TRAFFIC_SOURCE
+
+
 def _chat_lane(request: Any) -> tuple[str, str, int | None]:
     """(forwarding limiter, thread limiter, capacity) for this request's traffic class."""
 
@@ -177,6 +195,7 @@ async def admitted_managed_chat(
             key,
             x_freesolo_org_id,
             x_freesolo_project_id,
+            _traffic_source(request, key),
             limiter=_state_limiter(state, thread_limiter_name, capacity),
         )
     finally:
@@ -346,11 +365,13 @@ def _forward_stream(
     chat_template_kwargs: dict[str, Any],
     provenance: CheckpointProvenance,
     org_id: str,
+    traffic_source: str | None = None,
 ) -> _UpstreamStreamingResponse:
     upstream: RawChatStream = serving_deploy.chat_sse(
         run_id=run_id,
         messages=messages,
         org_id=org_id,
+        traffic_source=traffic_source,
         temperature=request.temperature,
         max_tokens=request.max_tokens,
         thinking=thinking,
@@ -401,6 +422,7 @@ def managed_chat(
     key: dict[str, Any],
     x_freesolo_org_id: str | None,
     x_freesolo_project_id: str | None,
+    traffic_source: str | None = None,
     *,
     timeout_s: float | None = None,
 ) -> Any:
@@ -438,11 +460,13 @@ def managed_chat(
                 chat_template_kwargs=chat_template_kwargs,
                 provenance=provenance,
                 org_id=org_id,
+                traffic_source=traffic_source,
             )
         response = serving_deploy.chat(
             run_id=authorized_checkpoint,
             messages=messages,
             org_id=org_id,
+            traffic_source=traffic_source,
             timeout_s=chat_upstream_timeout_s() if timeout_s is None else timeout_s,
             temperature=request.temperature,
             max_tokens=request.max_tokens,

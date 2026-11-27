@@ -7,7 +7,7 @@ from typing import Any
 
 from fastapi import HTTPException, Request, status
 
-from flash.serve.contract.protocol import ACTING_API_KEY_HEADER
+from flash.serve.contract.protocol import ACTING_API_KEY_HEADER, TRAFFIC_SOURCE_HEADER
 from flash.serving.src.accounting.usage import (
     AuthorizedTraffic,
     InferenceAuthorization,
@@ -17,7 +17,11 @@ from flash.serving.src.accounting.usage import (
     principal_for_external_org,
     principal_for_trusted_internal,
 )
-from flash.serving.src.accounting.usage_outbox import RequestIdentity, UsageStore
+from flash.serving.src.accounting.usage_outbox import (
+    RequestIdentity,
+    UsageStore,
+    traffic_source_or_default,
+)
 from flash.serving.src.http.headers import (
     _bearer_token,
     assert_internal,
@@ -62,7 +66,9 @@ def require_attributed_traffic(
             "serving request lacks required organization attribution",
         )
     return AuthorizedTraffic(
-        principal=principal_for_trusted_internal(org_id), api_key_id=authorization.api_key_id
+        principal=principal_for_trusted_internal(org_id),
+        api_key_id=authorization.api_key_id,
+        traffic_source=authorization.traffic_source,
     )
 
 
@@ -121,8 +127,14 @@ class ServingContext:
     async def authorize_inference(self, request: Request, model_id: str) -> InferenceAuthorization:
         if is_trusted_internal(request, self.trusted_internal_keys):
             acting = (request.headers.get(ACTING_API_KEY_HEADER) or "").strip() or None
+            # only a trusted internal caller may say whose traffic this is (the Flash control
+            # plane marks the training agent's own chats); anything unknown bills as usual.
             return TrustedInternalAuthorization(
-                org_id=optional_internal_org_id(request), api_key_id=acting
+                org_id=optional_internal_org_id(request),
+                api_key_id=acting,
+                traffic_source=traffic_source_or_default(
+                    request.headers.get(TRAFFIC_SOURCE_HEADER)
+                ),
             )
         token = _bearer_token(request)
         if not token:
@@ -223,6 +235,7 @@ class ServingContext:
             serving_release=self.serving_release,
             captured_at=captured_at,
             api_key_id=traffic.api_key_id,
+            traffic_source=traffic.traffic_source,
         )
         finalization = asyncio.create_task(session.finalize(result))
         try:
@@ -252,6 +265,7 @@ class ServingContext:
             serving_release=self.serving_release,
             captured_at=captured_at,
             api_key_id=traffic.api_key_id,
+            traffic_source=traffic.traffic_source,
         )
 
     async def prepare_stream(
