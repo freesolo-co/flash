@@ -338,6 +338,7 @@ from flash.serving.app.inference_provider import (  # noqa: E402
 from flash.serving.app.modal_engine import HostedModalEngine  # noqa: E402
 from flash.serving.lambda_cloud.proxy import LambdaEngineProxy  # noqa: E402
 from flash.serving.src.engine.lora_engine import _LoraEngineImpl  # noqa: E402, F401
+from flash.serving.src.http.provider_pin import lambda_pinned  # noqa: E402
 
 lambda_controller_image = (
     modal.Image.debian_slim(python_version="3.12")
@@ -588,10 +589,7 @@ class _ModalEnginePool:
         if _reserved(model):
             slot = await self._reserved_health.next_slot(model)
             return RESERVED_ENGINES[slot - 1](base_model=model)
-        from flash.serving.src.http.provider_pin import lambda_pinned
-
-        # A Lambda-pinned request (score batches) queues on the Lambda pool, which boots a Lambda
-        # worker when none is up, and never starts a Modal GPU.
+        # A Lambda-pinned request (score batches) queues on Lambda and never boots a Modal GPU.
         if (
             model in MODAL_FALLBACK_BY_MODEL
             and not lambda_pinned()
