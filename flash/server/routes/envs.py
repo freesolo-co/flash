@@ -26,17 +26,29 @@ def publish_env(
     x_freesolo_org_id: Annotated[str | None, Header()] = None,
 ):
     from flash.server.domain.registry import envs
-    from flash.server.domain.registry.projects import require_project_access_slug
+    from flash.server.domain.registry.projects import (
+        require_internal_publish_scope,
+        require_project_access_slug,
+    )
+    from flash.server.platform.auth import standalone
 
     project_raw = payload.get("project_id")
     if not isinstance(project_raw, str):
         raise HTTPException(status_code=400, detail="project_id is required and must be a string")
-    project_id, project_slug = require_project_access_slug(
-        project_id=project_raw,
-        key=key,
-        authorization=authorization,
-        org_id=x_freesolo_org_id,
-    )
+    if key.get("auth_kind") == "internal" and not standalone():
+        # The org-agnostic internal key publishes only into the org it names, under that org's
+        # slug as the backend reports it for this project.
+        project_id, project_slug, org_slug = require_internal_publish_scope(
+            project_id=project_raw, org_id=x_freesolo_org_id
+        )
+        key = {**key, "org_slug": org_slug}
+    else:
+        project_id, project_slug = require_project_access_slug(
+            project_id=project_raw,
+            key=key,
+            authorization=authorization,
+            org_id=x_freesolo_org_id,
+        )
 
     # Use `if x is None` not `x or ""` so non-string falsy values reach publish_package's type checks.
     _pkg = payload.get("package_b64")

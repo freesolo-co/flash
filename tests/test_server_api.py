@@ -495,6 +495,57 @@ def test_canonical_slug_resolution_blocks_before_environment_publication(api, mo
     assert validation_calls == ["GET", "POST"]
 
 
+def test_internal_key_publishes_under_the_named_orgs_slug(api, monkeypatch) -> None:
+    """A platform worker publishes with the internal key for the org in X-Freesolo-Org-Id."""
+    import flash.server.domain.registry.environment_registry as registry_mod
+    import flash.server.domain.registry.envs as envs_mod
+    import flash.server.domain.registry.projects as projects_mod
+
+    importlib.reload(projects_mod)
+    monkeypatch.setenv("FREESOLO_BASE_URL", "https://freesolo.test")
+    project_id = "11111111-1111-4111-8111-111111111111"
+    published: list[str] = []
+
+    class _Response:
+        status = 200
+
+        def __init__(self, body: dict):
+            self._body = json.dumps(body).encode()
+
+        def read(self):
+            return self._body
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    def urlopen(request, timeout=None):
+        body = json.loads(request.data)
+        assert body == {"orgId": "org-acme", "projectId": project_id}
+        return _Response({"ok": True, "projectSlug": "people", "orgSlug": "acme", **body})
+
+    def publish_package(*, package_b64, name, key, project_slug):
+        slug = "/".join(envs_mod.publish_slug_for_name(name, key, project_slug))
+        published.append(slug)
+        return slug
+
+    monkeypatch.setattr(projects_mod.urllib.request, "urlopen", urlopen)
+    monkeypatch.setattr(envs_mod, "publish_package", publish_package)
+    monkeypatch.setattr(registry_mod, "record_published_environment", lambda **_kwargs: True)
+
+    response = api.post(
+        "/v1/envs",
+        headers={**_bearer("fslo-internal-test"), "X-Freesolo-Org-Id": "org-acme"},
+        json={"name": "env", "package_b64": ENV_PACKAGE_B64, "project_id": project_id},
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json() == {"id": "acme/people/env"}
+    assert published == ["acme/people/env"]
+
+
 def _install_real_internal_project_validation(monkeypatch):
     import flash.server.domain.registry.projects as projects_mod
 
@@ -527,7 +578,7 @@ def _install_real_internal_project_validation(monkeypatch):
                 "body": body,
             }
         )
-        return _Response({"ok": True, "projectSlug": "checkout-bot", **body})
+        return _Response({"ok": True, "projectSlug": "checkout-bot", "orgSlug": "org-test", **body})
 
     monkeypatch.setattr(projects_mod.urllib.request, "urlopen", urlopen)
     return requests
