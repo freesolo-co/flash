@@ -13,7 +13,6 @@ from __future__ import annotations
 import copy
 import json
 import math
-import os
 import threading
 import time
 from collections.abc import Callable
@@ -186,13 +185,6 @@ _BAD_REQUEST_ERRORS = (_BadRequest,)
 # socketserver's default of 5 resets overflowed clients, and bridge_post intentionally does not retry.
 # a fixed backlog only moves the cliff; linux may clamp this value to somaxconn.
 _REWARD_BRIDGE_MIN_REQUEST_BACKLOG = 128
-
-# the directory the child-side modules are copied FROM. anchored to `flash/engine/worker` rather
-# than to this file: the paths in MULTI_TURN_CHILD_MODULES are relative to the worker package, and
-# resolving them against this module's own directory would silently look under train/rl/.
-_WORKER_DIR = os.path.dirname(
-    os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-)
 
 
 class MultiTurnBridge:
@@ -714,10 +706,6 @@ class MultiTurnBridge:
         with self._lock:
             self._sessions.pop(request_session_id(payload), None)
         return {"closed": True}
-
-    def open_sessions(self) -> int:
-        with self._lock:
-            return len(self._sessions)
 
 
 def multi_turn_child_env(inp: dict, *, reward_url: str, thinking: bool) -> dict[str, str]:

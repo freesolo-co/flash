@@ -81,8 +81,8 @@ def run(algorithm, argv=None):
         from flash.engine.worker.train.rl.child.metrics import stream_metrics
 
         with stream_metrics(os.environ["VERL_FILE_LOGGER_PATH"]):
-            return run_rl(config, algorithm)
-    return run_rl(config, algorithm)
+            return run_rl(config)
+    return run_rl(config)
 
 
 def run_sft(config, options):
@@ -104,7 +104,7 @@ def run_sft(config, options):
         destroy_global_process_group()
 
 
-def run_rl(config, algorithm):
+def run_rl(config):
     import ray
     from verl.trainer.main_ppo import run_ppo
     from verl.trainer.ppo.utils import need_critic, need_reference_policy

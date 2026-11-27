@@ -21,7 +21,6 @@ class GpuClass:
     name: str
     modal_name: str
     vram_gb: int
-    short: str
     sm: str
     hourly_usd: float
     min_cuda_modern: str | None = None
@@ -32,30 +31,28 @@ class GpuClass:
 # GPU-only list prices from https://modal.com/pricing, retrieved 2026-10-18.
 # CPU/memory reservations are included by modal.pricing for allocation and billing estimates.
 GPU_CLASSES: tuple[GpuClass, ...] = (
-    GpuClass("L4", "L4", 24, "l4", "sm89", 0.7992, validated=True),
-    GpuClass("A10", "A10", 24, "a10", "sm86", 1.1016, max_count=4, validated=True),
-    GpuClass("L40S", "L40S", 48, "l40s", "sm89", 1.9512, validated=True),
-    GpuClass("A100 SXM 40GB", "A100-40GB", 40, "a100sxm40", "sm80", 2.0988, validated=True),
-    GpuClass("A100 SXM", "A100-80GB", 80, "a100sxm", "sm80", 2.4984, validated=True),
-    GpuClass("H100", "H100!", 80, "h100", "sm90", 3.9492, validated=True),
-    GpuClass("H200", "H200", 141, "h200", "sm90", 4.5396, validated=True),
+    GpuClass("L4", "L4", 24, "sm89", 0.7992, validated=True),
+    GpuClass("A10", "A10", 24, "sm86", 1.1016, max_count=4, validated=True),
+    GpuClass("L40S", "L40S", 48, "sm89", 1.9512, validated=True),
+    GpuClass("A100 SXM 40GB", "A100-40GB", 40, "sm80", 2.0988, validated=True),
+    GpuClass("A100 SXM", "A100-80GB", 80, "sm80", 2.4984, validated=True),
+    GpuClass("H100", "H100!", 80, "sm90", 3.9492, validated=True),
+    GpuClass("H200", "H200", 141, "sm90", 4.5396, validated=True),
     GpuClass(
         "RTX Pro 6000",
         "RTX-PRO-6000",
         96,
-        "pro6000",
         "sm120",
         3.0312,
         min_cuda_modern="13.0",
         max_count=1,
         validated=True,
     ),
-    GpuClass("B200", "B200", 180, "b200", "sm100", 6.2496, min_cuda_modern="13.0", validated=True),
+    GpuClass("B200", "B200", 180, "sm100", 6.2496, min_cuda_modern="13.0", validated=True),
 )
 
 GPU_INFO: dict[str, GpuClass] = {g.name: g for g in GPU_CLASSES}
 KNOWN = tuple(GPU_INFO)
-VALIDATED = tuple(g.name for g in GPU_CLASSES if g.validated)
 
 # fp8 KV cache is an Ada/Hopper/Blackwell feature; the training workers enable it exactly when the
 # device compute capability is >= (8, 9) (see engine/worker/rl_train.py_train.py). Sizing has

@@ -575,7 +575,6 @@ def _classify_free_string(state, value_start, values, name, probe):
             search_from = cursor
         if not content_viable:
             return count, witness_cursor, witness_values, None
-    return count, witness_cursor, witness_values, None
 
 
 def _materialize_span(text: str, span: _FreeStringSpan) -> str | None:

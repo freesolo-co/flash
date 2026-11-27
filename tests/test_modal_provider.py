@@ -140,7 +140,6 @@ class AsyncMethod:
 @pytest.mark.parametrize("failure", [None, "listing", "deletion", "termination"])
 def test_handleless_cleanup_discovers_volumes_and_requires_confirmed_removal(monkeypatch, failure):
     from flash.providers.modal import checkpoint_upload
-    from flash.providers.modal.provider import terminate_persisted_resources
 
     run_id = "lost-launch"
     own = [checkpoint_upload.volume_name(scope_fingerprint(), run_id, i) for i in (0, 3)]
@@ -190,7 +189,7 @@ def test_handleless_cleanup_discovers_volumes_and_requires_confirmed_removal(mon
     provider = get_provider("modal")
     if failure:
         with pytest.raises(api.ModalApiError, match=failure):
-            terminate_persisted_resources({}, run_id)
+            provider.terminate_run(run_id)
         assert not deleted
         if failure == "listing":
             with pytest.raises(api.ModalApiError, match="listing"):
@@ -202,11 +201,11 @@ def test_handleless_cleanup_discovers_volumes_and_requires_confirmed_removal(mon
     assert set(provider.run_instances_remaining(run_id)) == {"sb-gpu", "sb-upload", *own}
     # Recover even when creation failed before the GPU handle was persisted.
     instances[:] = [item for item in instances if item["id"] != "sb-gpu"]
-    terminate_persisted_resources({}, run_id)
+    provider.terminate_run(run_id)
     assert set(deleted) == set(own)
     assert volumes == set(foreign)
     assert provider.run_instances_remaining(run_id) == []
-    terminate_persisted_resources({}, run_id)
+    provider.terminate_run(run_id)
     assert len(deleted) == len(own)
 
 

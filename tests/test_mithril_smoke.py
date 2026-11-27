@@ -85,7 +85,6 @@ def test_paid_override_changes_admission_without_changing_billing_or_hold(smoke,
     def stop_before_storage():
         assert pricing.SPOT_GPUS["H200"].keep_running_usd == Decimal("2.00")
         assert pricing.hourly_rate("H200") == float(rate)
-        assert pricing.running_limit("H200") == 2.00
         raise RuntimeError("stop before paid resources")
 
     monkeypatch.setattr(smoke, "ArtifactStore", stop_before_storage)

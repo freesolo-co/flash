@@ -13,7 +13,6 @@ from .reserved import enabled as reserved_enabled
 
 logger = logging.getLogger(__name__)
 
-RECONCILE_SECONDS = 60
 # A replacement boots before the old GPU drains. Never start a second handoff
 # until the first has completed and the shared pool is back within its budget.
 HANDOFF_SURGE = 1

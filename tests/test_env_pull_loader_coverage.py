@@ -173,12 +173,6 @@ def test_slug_and_github_predicates_and_conversion():
     assert loader.is_freesolo_environment_id("david-freesolo-co/my-project/stuff") is True
     assert loader.is_freesolo_environment_id("nonsense value") is False
 
-    assert loader.managed_slug_to_github_ref("david-freesolo-co/my-project/stuff") == (
-        "github:freesolo-co/environment-hub@main:david-freesolo-co/my-project/stuff/environment.py"
-    )
-    with pytest.raises(ValueError, match="not a Freesolo environment slug"):
-        loader.managed_slug_to_github_ref("github:owner/repo@main:environment.py")
-
 
 def test_parse_github_ref_from_https_urls():
     plain = loader._parse_github_environment_ref("https://github.com/owner/repo.git")

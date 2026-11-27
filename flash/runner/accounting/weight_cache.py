@@ -28,30 +28,12 @@ def _peak_gb(info: ModelInfo) -> float:
 def _fits_weight_cache(info: ModelInfo) -> bool:
     """Whether the model's peak download footprint fits the shared weight-cache volume.
 
-    Sizes the model against an EMPTY volume. ``weight_cache_catalog_peak_gb`` answers that
-    cumulative question; keep both in agreement when adding a large model.
+    Sizes the model against an EMPTY volume; tests/test_weight_cache.py pins the cumulative
+    whole-catalog peak, so keep both in agreement when adding a large model.
     """
     if not info.params_b:
         return True
     return _peak_gb(info) <= WEIGHT_CACHE_VOLUME_GB
-
-
-def weight_cache_catalog_peak_gb() -> float:
-    """Peak GB the volume must hold to warm the WHOLE catalog onto one shared volume.
-
-    That is strictly more than any single model's own peak, which is why sizing the volume per-model
-    let the 35B fail with "Disk quota exceeded" on every datacenter at 200 GB. Derived from
-    ``params_b``, so it slightly understates a repo that also ships tokenizer/config/ index files;
-    the measured-bytes figure for today's catalog is ~5 GB higher.
-    """
-    from flash.core.catalog import MODELS
-
-    cached = [info for info in MODELS.values() if _fits_weight_cache(info)]
-    if not cached:
-        return 0.0
-    largest = max(cached, key=_download_gb)
-    resident_others = sum(_download_gb(info) for info in cached if info is not largest)
-    return resident_others + _peak_gb(largest)
 
 
 def _assign_weight_cache_volume(spec: JobSpec, info: ModelInfo | None = None) -> JobSpec:

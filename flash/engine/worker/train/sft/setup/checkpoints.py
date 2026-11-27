@@ -87,7 +87,6 @@ def _export_checkpoint_adapter(
     export_peft_adapter(
         actor_dir,
         adapter_dir,
-        base_model_id=model_id,
         python_bin=python_bin,
     )
     _copy_processing_sidecars(actor_dir, adapter_dir)

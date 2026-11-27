@@ -38,8 +38,6 @@ def _resume_after_confirmed_teardown(
     next_attempt: int,
     source_snapshot: dict | None,
     log,
-    *,
-    failure: str,
 ) -> RunStatus:
     """CAS-clear one captured remote, then resume its next attempt exactly once."""
     from flash.runner.accounting.artifacts import stage_environment_package
@@ -109,7 +107,6 @@ def _resume_after_confirmed_teardown(
         _run_training(
             worker_spec,
             log,
-            prior_cost=float(get_status(run_id).cost_usd or 0.0),
             source_snapshot=source_snapshot,
             reserved_claim=claim,
         )
@@ -360,7 +357,7 @@ def _reconcile_attached_remote(
         if not cleanup.replacement_safe:
             return Retry(min(_ATTACH_RECONCILE_INTERVAL_S, max(1.0, deadline_at - time.time())))
     return _resume_reconciled_remote(
-        run_id, expected_remote, worker_spec, next_attempt, source_snapshot, log, failure
+        run_id, expected_remote, worker_spec, next_attempt, source_snapshot, log
     )
 
 
@@ -371,7 +368,6 @@ def _resume_reconciled_remote(
     next_attempt: int,
     source_snapshot: dict | None,
     log,
-    failure: str,
 ) -> Retry | None:
     from flash.runner.lifecycle.cleanup import (
         _compare_and_fail_remote,
@@ -389,7 +385,6 @@ def _resume_reconciled_remote(
             next_attempt,
             source_snapshot,
             log,
-            failure=failure,
         )
     except StagedEnvironmentTransientError:
         return Retry(_ATTACH_RECONCILE_INTERVAL_S)
@@ -567,7 +562,7 @@ def _fail_unparseable_attach(run_id: str, status: RunStatus, exc: Exception, log
     if not confirmed_teardown:
         from flash.providers.core.registry import terminate_persisted_resources
 
-        terminate_persisted_resources(status.spec, run_id)
+        terminate_persisted_resources(run_id)
     print(f"attach: {run_id} {detail}", file=log)
     return get_status(run_id)
 
@@ -730,7 +725,6 @@ def _handle_failed_attach_poll(
             context.next_attempt,
             context.source_snapshot,
             log,
-            failure=failure,
         )
     if not plan.retry:
         print(
@@ -813,7 +807,6 @@ def _recover_confirmed_remote(
         context.next_attempt,
         source_snapshot,
         log,
-        failure="persisted cleanup confirmed the worker was torn down",
     )
 
 

@@ -934,9 +934,6 @@ def kill_process_group(proc: subprocess.Popen, *, process_group_id: int | None =
 # re-exported so the capability probe and the checkpoint exporter stay reachable as
 # `backend_common.<name>`: the trainers and the tests both import them from here.
 from flash.engine.worker.verl.capabilities import (  # noqa: E402,F401
-    _CAPABILITIES_UNAVAILABLE,
-    _CAPABILITY_PROBE,
-    _CAPABILITY_PROBE_TIMEOUT_S,
     actor_fsdp_strategy_overrides,
     gdn_probe_module,
     gdn_reset_arch_from_caps,
@@ -953,7 +950,6 @@ from flash.engine.worker.verl.capabilities import (  # noqa: E402,F401
     rollout_sleep_unsupported,
     strict_gdn_probe_module,
     trainer_dtype_overrides,
-    verl_declares_rollout_field,
     verl_device_capability,
 )
 from flash.engine.worker.verl.checkpoints import (  # noqa: E402,F401
@@ -961,18 +957,14 @@ from flash.engine.worker.verl.checkpoints import (  # noqa: E402,F401
     export_peft_adapter,
     latest_global_step_dir,
     resolve_checkpoint_actor_dir,
-    stage_verl_resume,
     stamp_adapter_dir_provenance,
     undiscovered_checkpoint_dirs,
 )
 from flash.engine.worker.verl.child_io import (  # noqa: E402,F401
-    _VERL_METRIC_FIELDS,
-    FLASH_WANDB_LINK_MARKER,
     append_step_metrics,
     parse_verl_metric,
     parse_verl_step_metrics,
     parse_wandb_link,
-    read_ready_components,
     readiness_file,
     verify_runtime_ready,
     verl_step_number,
@@ -981,17 +973,9 @@ from flash.engine.worker.verl.child_io import (  # noqa: E402,F401
 # re-exported so the child-tail and ray-log diagnostics stay reachable as
 # `backend_common.<name>`: the trainers and the tests both read them from here.
 from flash.engine.worker.verl.diagnostics import (  # noqa: E402,F401
-    _CHILD_TAIL_LINE_CHARS,
-    CHILD_TAIL_LINES,
-    RAY_FAILURE_LOGS,
-    RAY_LOG_TAIL_BYTES,
-    STALL_TAIL_LINES,
     ChildOutputTail,
-    ChildTailStaleness,
     VerlChildSilenceWatchdog,
     build_verl_line_handler,
     collect_ray_failure_logs,
-    latest_ray_session_dir,
     raise_for_classified_verl_exit,
-    stall_tail_fields,
 )

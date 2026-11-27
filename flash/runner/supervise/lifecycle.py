@@ -201,7 +201,6 @@ def _run_job_inner(
             _run_training(
                 spec,
                 log,
-                prior_cost=0.0,
                 runtime_secrets=runtime_secrets,
                 reserved_claim=reserved_claim,
             )
@@ -221,7 +220,6 @@ def _run_training(
     spec: JobSpec,
     log,
     *,
-    prior_cost: float,
     runtime_secrets: dict[str, str] | None = None,
     source_snapshot: dict | None = None,
     reserved_claim: AttemptLaunchClaim | None = None,

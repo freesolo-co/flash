@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import json
 import os
-import shutil
 import sys
 from pathlib import Path
 
@@ -48,23 +47,6 @@ def activate(env):
         return True
     except (OSError, ValueError, RuntimeError, AttributeError, ImportError):
         return False
-
-
-def publish(env, torch):
-    """Promote a successfully loaded bake artifact into FlashInfer's portable AOT layout."""
-    root = _root()
-    if root is None:
-        raise RuntimeError("FlashInfer cache root is not configured")
-    destination = root / MODULE / f"{MODULE}.so"
-    source = env.FLASHINFER_AOT_DIR / MODULE / f"{MODULE}.so"
-    if not source.is_file():
-        source = env.FLASHINFER_JIT_DIR / MODULE / f"{MODULE}.so"
-    if not source.is_file() or not source.stat().st_size:
-        raise RuntimeError("FlashInfer bake did not produce its GDN library")
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    if source.resolve() != destination.resolve():
-        shutil.copy2(source, destination)
-    (root / "manifest.json").write_text(json.dumps(_identity(env, torch), sort_keys=True))
 
 
 def activate_current():

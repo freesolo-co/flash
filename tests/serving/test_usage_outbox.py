@@ -35,13 +35,13 @@ from flash.serving.src.engine.model_config import base_models
 from flash.serving.src.http.inference_routes import _discard_prepared_stream
 from flash.serving.src.http.rate_limit import allow_offline_inference
 from flash.serving.src.http.router import AdapterRouter, build_serving_app
-from flash.serving.src.io.schemas import AdapterRecord
-from flash.serving.src.io.streaming import (
+from flash.serving.src.io.openai_stream import (
     _produce_openai_chat_stream,
     _sse,
     _StreamOutput,
     openai_chat_stream,
 )
+from flash.serving.src.io.schemas import AdapterRecord
 from flash.serving.src.store.settings import Settings
 from tests.serving.conftest import attest
 

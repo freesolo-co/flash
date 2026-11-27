@@ -54,7 +54,6 @@ def test_meter_starts_at_first_update_and_stops_at_loop_exit(monkeypatch):
     timings.observe(_event("model_download", "completed", span="d" * 32, seconds=600))
     # an explicit zero before the first update, never absent (absent = legacy worker).
     assert timings.snapshot()["billable_train_s"] == 0.0
-    assert timings.billable_train_seconds() == 0.0
     now[0] = 900
     timings.observe(_event("first_update", "started"))
     now[0] = 1000
@@ -66,7 +65,7 @@ def test_meter_starts_at_first_update_and_stops_at_loop_exit(monkeypatch):
     now[0] = 9000  # final publication: not metered
     assert timings.snapshot()["billable_train_s"] == 3600
     timings.stop_billing()  # idempotent
-    assert timings.billable_train_seconds() == 3600
+    assert timings.snapshot()["billable_train_s"] == 3600
 
 
 def test_meter_ignores_a_second_first_update_in_the_same_attempt(monkeypatch):
@@ -77,13 +76,12 @@ def test_meter_ignores_a_second_first_update_in_the_same_attempt(monkeypatch):
     now[0] = 20
     timings.observe(_event("first_update", "started", span="c" * 32))  # another rank
     now[0] = 70
-    assert timings.billable_train_seconds() == 60
+    assert timings.snapshot()["billable_train_s"] == 60
 
 
 def test_stop_before_training_meters_zero():
     timings = phases.PhaseTimings()
     timings.stop_billing()
-    assert timings.billable_train_seconds() == 0.0
     assert timings.snapshot()["billable_train_s"] == 0.0
 
 
@@ -151,7 +149,7 @@ def test_sft_runner_meters_from_first_update_to_child_exit(worker_context, monke
     child = SimpleNamespace(resume_step=0, watcher=watcher)
     progress = SimpleNamespace(values={"step": 0}, expected_components=(), runtime_verified=True)
     sft_train_runner._run_sft_child(child, 10, progress, lambda line: None, context=worker_context)
-    assert worker_context.phase_timings.billable_train_seconds() == pytest.approx(3600.0)
+    assert worker_context.phase_timings.snapshot()["billable_train_s"] == pytest.approx(3600.0)
     now[0] = 99999.0
     assert worker_context.phase_timings.snapshot()["billable_train_s"] == pytest.approx(3600.0)
 
@@ -313,7 +311,6 @@ def test_cancel_mid_first_update_bills_measured_time(tmp_path, monkeypatch):
 def test_a_legacy_worker_without_a_meter_pays_its_measured_fallback(tmp_path, monkeypatch):
     spec = _spec()
     _metrics(tmp_path, monkeypatch, spec, step=20, wall_seconds=1.0)
-    assert costs.metered_training_seconds(_status(spec), spec) is None
     # a completion without a meter pays the measured wall cost the caller computed, not the quote.
     charge = costs._status_estimated_charge(_status(spec, quote=12.34), spec, fallback=0.5)
     assert charge == pytest.approx(0.5)
@@ -490,7 +487,6 @@ def test_attempt_record_carries_meters_across_retries(tmp_path, monkeypatch):
     beat(2, 10.0)
     record = status.last_heartbeat[status_ops.BILLABLE_ATTEMPTS_KEY]
     assert {k: v["s"] for k, v in record.items()} == {"0": 400.0, "1": 50.0, "2": 10.0}
-    assert costs.metered_training_seconds(status, spec) == pytest.approx(460.0)
 
 
 def test_the_first_observed_heartbeat_is_metered_at_its_shape(tmp_path, monkeypatch):
@@ -516,7 +512,6 @@ def test_an_out_of_order_stale_sample_never_lowers_the_meter(tmp_path, monkeypat
     beat(0, 1800.0)  # published out of order (snapshotted before the upload lock)
     beat(1, 3600.0)
     status.state = "done"
-    assert costs.metered_training_seconds(status, spec) == pytest.approx(7200.0)
     assert costs._status_estimated_charge(status, spec, fallback=999.0) == pytest.approx(
         2 * H100_MODAL
     )

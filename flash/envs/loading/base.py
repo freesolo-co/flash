@@ -186,12 +186,12 @@ def with_system_prompt(messages: list[dict], contract_text: str) -> list[dict]:
 FREESOLO_WORKER_SPEC = "freesolo>=0.4.2"
 
 
-def worker_pip_for_env(env_id: str) -> list[str]:
+def worker_pip_for_env() -> list[str]:
     """Pip deps the GPU worker needs to run a Freesolo environment."""
     return [FREESOLO_WORKER_SPEC]
 
 
-def worker_pip_with_extras(env_id: str, extras: Iterable[str] | None) -> list[str]:
+def worker_pip_with_extras(extras: Iterable[str] | None) -> list[str]:
     """Worker requirements plus the author's ``[environment] pip``, in install order.
 
     The worker requirement stays first and is never displaced: a scorer's third-party dependency is
@@ -199,7 +199,7 @@ def worker_pip_with_extras(env_id: str, extras: Iterable[str] | None) -> list[st
     so restating the worker spec cannot install it twice; a conflicting version pin is left for pip
     to resolve and report, which it does with a clearer message than a guard here could.
     """
-    combined = list(worker_pip_for_env(env_id))
+    combined = list(worker_pip_for_env())
     for item in extras or ():
         requirement = str(item).strip()
         if requirement and requirement not in combined:

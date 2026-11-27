@@ -12,14 +12,8 @@ from typing import Any
 # but the profile's callers import these from here.
 from flash.engine.profiling.reasoning_render import (  # noqa: F401
     horizon_row_count,
-    marked_reasoning_end,
-    reasoned_assistant_turns,
-    reasoning_marker_prefix,
-    reasoning_markers,
     reasoning_warning_rows,
     rendered_reasoning_loss_warning,
-    strip_reasoning_markers,
-    with_marked_reasoning,
 )
 
 SFT_PROFILE_KIND = "sft"

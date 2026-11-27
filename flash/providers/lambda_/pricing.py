@@ -29,15 +29,6 @@ LAMBDA_GPUS: dict[str, LambdaGpu] = {
     "B200": LambdaGpu(7.99, (1, 2, 4, 8)),
 }
 
-# Whole-instance USD/hour of known types, snapshot 2026-11-15; live prices override these.
-STATIC_INSTANCE_PRICES: dict[str, float] = {
-    "gpu_1x_a10": 1.29,
-    "gpu_1x_a100_sxm4": 1.99,
-    "gpu_1x_h100_pcie": 3.79,
-    "gpu_1x_h100_sxm5": 4.89,
-    "gpu_1x_b200_sxm6": 7.99,
-}
-
 MAX_LAMBDA_CARDS = max(count for shape in LAMBDA_GPUS.values() for count in shape.counts)
 
 _TYPE_NAME = re.compile(r"gpu_(\d+)x_([a-z0-9]+(?:_[a-z0-9]+)*)")

@@ -7,15 +7,8 @@ from typing import Any
 from flash.serving.src.engine.errors import raise_if_engine_error
 from flash.serving.src.http.routing import AdapterRouter, EnginePool
 from flash.serving.src.io.openai_stream import (  # noqa: F401
-    _assistant_role_chunk,
-    _await_producer_shutdown,
     _close_async_iterator,
-    _close_stream_sources,
-    _next_event_or_disconnect,
-    _produce_openai_chat_stream,
     _replay_first_event,
-    _sse,
-    _StreamOutput,
     openai_chat_stream,
 )
 from flash.serving.src.io.provenance import (

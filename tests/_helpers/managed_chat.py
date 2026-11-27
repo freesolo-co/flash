@@ -3,23 +3,6 @@
 from tests.test_server_api import SPEC, _bearer, _new_user_token
 
 
-class _RawManagedChatResponse:
-    def __init__(self, chunks, *, status_code=200, headers=None):
-        self.status_code = status_code
-        self.headers = headers or {"content-type": "text/event-stream"}
-        self.chunks = chunks
-        self.closed = False
-
-    def iter_bytes(self):
-        try:
-            yield from self.chunks
-        finally:
-            self.closed = True
-
-    def close(self):
-        self.closed = True
-
-
 def _deployed_chat_run(api):
     """A deployed run ready to chat, returned as (key, run_id)."""
     import flash.runner.lifecycle.state as runner_state

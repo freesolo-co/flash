@@ -6,7 +6,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from flash.serve.contract.provenance import immutable_binding_fingerprint
+from flash.serve.contract.provenance import immutable_binding_fingerprint, record_key
 from flash.serving.src.engine.lora_engine import _LoraEngineImpl, _LoraEntry
 from flash.serving.src.engine.support import (
     _adapter_source_cache_dir,
@@ -75,7 +75,7 @@ def test_unregister_skips_cleanup_for_a_newer_deployment_generation() -> None:
     assert stale["skipped_stale_generation"] is True
     assert removed["removed"] == record.model_id
     assert engine.registry.get(record.org_id, record.model_id) is None
-    assert evicted == [record.storage_key]
+    assert evicted == [record_key(record)]
 
 
 def test_add_lora_exception_releases_new_entry_for_retry(tmp_path: Path) -> None:
@@ -96,10 +96,10 @@ def test_add_lora_exception_releases_new_entry_for_retry(tmp_path: Path) -> None
     with pytest.raises(RuntimeError, match="worker unavailable"):
         asyncio.run(engine._add_lora_locked(record, tmp_path))
 
-    assert record.storage_key not in engine._entries()
+    assert record_key(record) not in engine._entries()
     asyncio.run(engine._add_lora_locked(record, tmp_path))
     assert calls == 2
-    assert engine._entries()[record.storage_key].state == "loaded"
+    assert engine._entries()[record_key(record)].state == "loaded"
 
 
 def test_rejected_new_lora_releases_entry_and_reaches_engine_on_retry(tmp_path: Path) -> None:
@@ -119,10 +119,10 @@ def test_rejected_new_lora_releases_entry_and_reaches_engine_on_retry(tmp_path: 
     with pytest.raises(RuntimeError, match="vLLM rejected a new LoRA registration"):
         asyncio.run(engine._add_lora_locked(record, tmp_path))
 
-    assert record.storage_key not in engine._entries()
+    assert record_key(record) not in engine._entries()
     asyncio.run(engine._add_lora_locked(record, tmp_path))
     assert calls == 2
-    assert engine._entries()[record.storage_key].state == "loaded"
+    assert engine._entries()[record_key(record)].state == "loaded"
 
 
 @pytest.mark.parametrize(
@@ -139,7 +139,7 @@ def test_loaded_lora_failed_removal_retains_unconfirmed_entry(
     request = SimpleNamespace(lora_int_id=42)
     engine = _LoraEngineImpl()
     engine._lora_entries = {
-        record.storage_key: _LoraEntry(_adapter_source_ident(record), request, "loaded")
+        record_key(record): _LoraEntry(_adapter_source_ident(record), request, "loaded")
     }
 
     if outcome == "missing":
@@ -153,9 +153,9 @@ def test_loaded_lora_failed_removal_retains_unconfirmed_entry(
         engine.engine = _Engine()
 
     with pytest.raises(RuntimeError, match=message):
-        asyncio.run(engine._evict_loaded_lora(record.storage_key))
+        asyncio.run(engine._evict_loaded_lora(record_key(record)))
 
-    entry = engine._entries()[record.storage_key]
+    entry = engine._entries()[record_key(record)]
     assert entry.lora_request is request
     assert entry.state == "unconfirmed"
     with pytest.raises(RuntimeError, match="registration is unconfirmed"):
@@ -167,7 +167,7 @@ def test_reserved_lora_evict_releases_without_engine_removal() -> None:
     request = SimpleNamespace(lora_int_id=42)
     engine = _LoraEngineImpl()
     engine._lora_entries = {
-        record.storage_key: _LoraEntry(_adapter_source_ident(record), request, "reserved")
+        record_key(record): _LoraEntry(_adapter_source_ident(record), request, "reserved")
     }
     removed: list[int] = []
 
@@ -178,9 +178,9 @@ def test_reserved_lora_evict_releases_without_engine_removal() -> None:
 
     engine.engine = _Engine()
 
-    asyncio.run(engine._evict_loaded_lora(record.storage_key))
+    asyncio.run(engine._evict_loaded_lora(record_key(record)))
 
-    assert record.storage_key not in engine._entries()
+    assert record_key(record) not in engine._entries()
     assert removed == []
 
 
@@ -189,16 +189,16 @@ def test_cached_lora_request_enforces_state_and_source_identity(tmp_path: Path) 
     request = SimpleNamespace(lora_int_id=42)
     source_ident = _adapter_source_ident(record)
     engine = _LoraEngineImpl()
-    engine._lora_entries = {record.storage_key: _LoraEntry(source_ident, request, "loaded")}
+    engine._lora_entries = {record_key(record): _LoraEntry(source_ident, request, "loaded")}
 
     assert engine._cached_lora_request_locked(record, tmp_path) is request
 
-    engine._lora_entries[record.storage_key] = _LoraEntry(source_ident, request, "unconfirmed")
+    engine._lora_entries[record_key(record)] = _LoraEntry(source_ident, request, "unconfirmed")
     with pytest.raises(RuntimeError, match="registration is unconfirmed"):
         engine._cached_lora_request_locked(record, tmp_path)
 
     other_ident = ("other/repo", *source_ident[1:])
-    engine._lora_entries[record.storage_key] = _LoraEntry(other_ident, request, "loaded")
+    engine._lora_entries[record_key(record)] = _LoraEntry(other_ident, request, "loaded")
     with pytest.raises(RuntimeError, match="previous LoRA removal is unconfirmed"):
         engine._cached_lora_request_locked(record, tmp_path)
 
@@ -230,7 +230,7 @@ def test_cold_unregister_uses_durable_disable_time(monkeypatch) -> None:
     )
 
     async def authoritative(org_id, model_id):
-        assert (org_id, model_id) == stale_record.storage_key
+        assert (org_id, model_id) == record_key(stale_record)
         return disabled
 
     monkeypatch.setattr("flash.serving.src.store.undeploy.get_authoritative", authoritative)
@@ -240,7 +240,7 @@ def test_cold_unregister_uses_durable_disable_time(monkeypatch) -> None:
     )
 
     assert result["removed"] == stale_record.model_id
-    assert evicted == [stale_record.storage_key]
+    assert evicted == [record_key(stale_record)]
     engine.registry.upsert(stale_record)
     assert engine.registry.get(stale_record.org_id, stale_record.model_id) is None
     # even if the redeploy completed before this cleanup returned, its durable timestamp wins.
@@ -324,7 +324,7 @@ def test_cold_unregister_does_not_tombstone_new_deployment(monkeypatch, status):
     engine._adapter_locks_guard = asyncio.Lock()
 
     async def authoritative(org_id, model_id):
-        assert (org_id, model_id) == record.storage_key
+        assert (org_id, model_id) == record_key(record)
         return record
 
     monkeypatch.setattr("flash.serving.src.store.undeploy.get_authoritative", authoritative)
@@ -459,8 +459,6 @@ def test_loaded_adapter_requests_skip_the_volume_readiness_scan(tmp_path: Path) 
 
 
 def test_loaded_lora_fast_path_requires_loaded_current_source(tmp_path: Path) -> None:
-    from flash.serve.contract.provenance import record_key
-
     record = _revision("a" * 40)
     engine = _hot_path_engine(tmp_path, [])
     request = SimpleNamespace(lora_int_id=7)
@@ -533,17 +531,17 @@ def test_adapter_recovers_after_uncertain_removal(
         await engine._register(payload, "generation-old")
         old_request = additions[0]
         with pytest.raises(RuntimeError, match="worker unavailable"):
-            await engine._evict_loaded_lora(record.storage_key)
+            await engine._evict_loaded_lora(record_key(record))
         # A failed retry must keep the old ID reserved and must not load new weights.
         with pytest.raises(RuntimeError, match="worker unavailable"):
             await invoke()
-        assert engine._entries()[record.storage_key].state == "unconfirmed"
-        assert engine._entries()[record.storage_key].lora_request is old_request
+        assert engine._entries()[record_key(record)].state == "unconfirmed"
+        assert engine._entries()[record_key(record)].lora_request is old_request
         assert additions == [old_request]
 
         unavailable = False
         await invoke()
-        entry = engine._entries()[record.storage_key]
+        entry = engine._entries()[record_key(record)]
         assert entry.state == "loaded"
         assert entry.source_ident == _adapter_source_ident(record)
         assert entry.lora_request is additions[-1]
