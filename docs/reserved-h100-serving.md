@@ -1,6 +1,6 @@
 # Reserved H100 serving
 
-> **Status (2026-11-27): 8 x `Qwen/Qwen3.5-9B-Base`, being acquired (raised from 6).** The earlier 5 x 27B + 3 x 0.8B Base fleet is retired and its secret deleted. `reserved_h100_acquire` launches and qualifies the eight 9B Base H100s on Lambda. Reserved routing switches on only when an operator creates the workers secret ("Switching on" below), so 9B Base keeps the on-demand pool until then.
+> **Status (2026-11-27): live, 8 x `Qwen/Qwen3.5-9B-Base` (raised from 6).** The earlier 5 x 27B + 3 x 0.8B Base fleet is retired and its secret deleted. `reserved_h100_acquire` launches and qualifies the 9B Base H100s on Lambda; reserved routing is on in main because the workers secret exists ("Switching on" below).
 
 ## Fleet
 
