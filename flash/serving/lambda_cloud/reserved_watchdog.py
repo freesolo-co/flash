@@ -24,7 +24,7 @@ import time
 import uuid
 from dataclasses import asdict, dataclass
 
-HEALTH_DICT_NAME = "flash-reserved-h100-health-20261123"
+HEALTH_DICT_NAME = "flash-reserved-h100-health-20261127"
 WATCHDOG_PERIOD_SECONDS = 120
 HEALTH_TIMEOUT_SECONDS = 15
 CANARY_TIMEOUT_SECONDS = 90

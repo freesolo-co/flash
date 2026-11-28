@@ -19,6 +19,12 @@ def anyio_backend():
 
 
 @pytest.fixture(autouse=True)
+def reserved_off(monkeypatch):
+    """9B Base is a reserved model; these cover its on-demand pool, used while reserved is off."""
+    monkeypatch.setenv("FLASH_RESERVED_H100_ACTIVE", "0")
+
+
+@pytest.fixture(autouse=True)
 def warm_floor(monkeypatch):
     """Every production model scales from 0; pin a floor of 2 so the handoff paths stay covered."""
     from flash.serving.app import inference_provider
