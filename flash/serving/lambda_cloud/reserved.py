@@ -1,6 +1,6 @@
 """Explicitly provisioned H100s: CPU proxies never launch or release their VMs.
 
-Six Lambda H100 workers serve ``Qwen/Qwen3.5-9B-Base`` (``SLOT_MODELS``), one engine each.
+Eight Lambda H100 workers serve ``Qwen/Qwen3.5-9B-Base`` (``SLOT_MODELS``), one engine each.
 Every other hosted model, Qwen3.8-27B and Qwen3.5-0.8B-Base included, is served by the
 on-demand Lambda pool with its Modal GPU fallback.
 
@@ -31,7 +31,7 @@ from .proxy import LambdaEngineProxy
 from .transport import WorkerTransport
 
 MODEL = "Qwen/Qwen3.5-9B-Base"
-SLOT_COUNT = 6
+SLOT_COUNT = 8
 SLOT_MODELS = dict.fromkeys(range(1, SLOT_COUNT + 1), MODEL)
 MODELS = tuple(dict.fromkeys(SLOT_MODELS.values()))
 # Fresh names (2026-11-27): the earlier fleets' secrets and health Dicts hold entries for other
