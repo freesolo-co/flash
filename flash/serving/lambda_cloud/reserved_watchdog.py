@@ -32,6 +32,7 @@ import itertools
 import os
 import time
 import uuid
+from collections import OrderedDict
 from dataclasses import asdict, dataclass
 
 HEALTH_DICT_NAME = "flash-reserved-h100-health-20261127"
@@ -48,6 +49,8 @@ ROUTER_CACHE_SECONDS = 15
 ROUTER_REFRESH_TIMEOUT_SECONDS = 1.0
 # Home slots per checkpoint. 0 disables affinity (every request round-robins over all slots).
 AFFINITY_SLOTS = int(os.environ.get("FLASH_RESERVED_AFFINITY_SLOTS", "3"))
+# Checkpoints whose rotation position the router remembers (least recently used dropped first).
+ROTATION_KEYS = 4096
 
 
 def affinity_key(record):
@@ -368,7 +371,7 @@ class HealthView:
         self._states = {}
         self._configured = None
         self._cycles = {}
-        self._spread = itertools.count()
+        self._rotation = OrderedDict()  # affinity key -> next position among its home slots
         self._loaded = False
         self._refresh = None
 
@@ -398,7 +401,13 @@ class HealthView:
         key = affinity_key(record)
         if key is not None and AFFINITY_SLOTS > 0:
             home = home_slots(key, self.slots_for(model), usable)
-            return home[next(self._spread) % len(home)]
+            # Per-checkpoint position: a counter shared across checkpoints pins interleaved
+            # checkpoints (e.g. three in a repeating order) to one home slot each.
+            position = self._rotation.pop(key, 0)
+            self._rotation[key] = position + 1
+            if len(self._rotation) > ROTATION_KEYS:
+                self._rotation.popitem(last=False)
+            return home[position % len(home)]
         cycle = self._cycles.setdefault(model, itertools.cycle(self.slots_for(model)))
         while True:
             slot = next(cycle)

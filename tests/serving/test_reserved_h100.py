@@ -252,6 +252,34 @@ def test_next_slot_keeps_a_checkpoint_on_its_home_slots(monkeypatch):
     assert asyncio.run(view.home(BASE, ckpt)) == list(range(1, 9))
 
 
+def test_interleaved_checkpoints_each_rotate_over_all_their_homes(monkeypatch):
+    """Review repro: three checkpoints in a repeating order must not each stick to one home
+    slot, as a rotation counter shared across checkpoints made them do."""
+    store = MemoryStore({wd.CONFIGURED_KEY: list(range(1, 9))})
+    view = wd.HealthView(store, reserved.SLOT_MODELS)
+    records = [
+        SimpleNamespace(org_id="org", model_id=f"checkpoint-{i}", serve_base_model=False)
+        for i in range(3)
+    ]
+
+    async def rounds(n):
+        picks = {r.model_id: [] for r in records}
+        for _ in range(n):
+            for r in records:
+                picks[r.model_id].append(await view.next_slot(BASE, r))
+        return picks
+
+    picks = asyncio.run(rounds(6))
+    for r in records:
+        home = wd.home_slots(f"org/{r.model_id}", tuple(range(1, 9)), range(1, 9))
+        assert picks[r.model_id] == home * 2  # every home, in order, twice
+
+    # The remembered positions stay bounded on a long-lived router.
+    monkeypatch.setattr(wd, "ROTATION_KEYS", 2)
+    asyncio.run(rounds(1))
+    assert len(view._rotation) == 2
+
+
 def test_routing_fails_open_when_every_slot_is_quarantined():
     down = wd.SlotState(healthy=False).dump()
     store = MemoryStore({wd.CONFIGURED_KEY: [1, 2, 3], 1: down, 2: down, 3: down})
