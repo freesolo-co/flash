@@ -283,7 +283,7 @@ def test_an_authored_count_still_gets_raise_count_advice_on_a_pinned_class():
     authored count, raising it is a real remedy and `allocate()` says so -- the quote contradicting
     it would send the user to shrink a run that would fit on one more card.
     """
-    with pytest.raises(ValueError, match=r"--gpus \d"):
+    with pytest.raises(ValueError, match=r"max_count = \d"):
         estimate_cost(RunConfig("Qwen/Qwen3.6-35B-A3B", "sft", 10, gpu_type="H100", gpu_count=1))
 
 
@@ -296,7 +296,9 @@ def test_offline_estimate_supports_eight_card_only_runs(monkeypatch):
     assert estimate.gpu_count == 8
     # the pinned four-card ceiling is the reason this fails, so the message must name that ceiling
     # and the count that would fit -- not just report a generic no-fit.
-    with pytest.raises(ValueError, match=r"gpu\.count=4 provides at most .*`--gpus 8`"):
+    with pytest.raises(
+        ValueError, match=r"gpu\.max_count=4 provides at most .*`\[gpu\] max_count = 8`"
+    ):
         estimate_cost(RunConfig("Qwen/Qwen3.5-9B", "sft", 1, gpu_count=4))
 
 
@@ -439,7 +441,7 @@ def test_runconfig_rejects_bad_gpu_count(bad, exc):
 
 
 def test_offline_quote_fit_failure_names_the_card_count_that_fixes_it():
-    """`flash train --cost` must name the `--gpus` width when a wider shape would fit.
+    """`flash train --cost` must name the `[gpu] max_count` width when a wider shape would fit.
 
     A 35B-A3B GRPO run at the default single-card ceiling needs more VRAM than any one card has,
     but fits on two. Reporting only the shortfall reads as "this run is impossible" for the one
@@ -460,13 +462,13 @@ def test_offline_quote_fit_failure_names_the_card_count_that_fixes_it():
         "group_size": 4,
         "lora_rank": 16,
     }
-    with pytest.raises(ValueError, match=r"--gpus 2") as unpinned:
+    with pytest.raises(ValueError, match=r"max_count = 2") as unpinned:
         _offline_gpu_shape(RunConfig(gpu_count=1, **shared))
     # the unpinned message names the authored ceiling that fell short, which is strictly more than
     # "nothing fits" -- the shared contract is that the shortfall is stated and a width is offered.
-    assert "gpu.count=1 provides at most" in str(unpinned.value)
+    assert "gpu.max_count=1 provides at most" in str(unpinned.value)
 
-    with pytest.raises(ValueError, match=r"--gpus 2") as pinned:
+    with pytest.raises(ValueError, match=r"max_count = 2") as pinned:
         _offline_gpu_shape(RunConfig(gpu_count=1, gpu_type="H200", **shared))
     assert "cannot fit this run" in str(pinned.value)
 
@@ -488,7 +490,7 @@ def test_offline_quote_fit_failure_omits_the_remedy_when_nothing_fits(monkeypatc
     with pytest.raises(ValueError, match=r"more than any .*combination") as exc:
         _offline_gpu_shape(RunConfig("Qwen/Qwen3.5-9B", "sft", 1, gpu_count=1))
     # the load-bearing half: no width is suggested, because none would work.
-    assert "--gpus" not in str(exc.value)
+    assert "max_count" not in str(exc.value)
 
 
 def test_multi_card_quote_states_pooled_vram_not_per_card():

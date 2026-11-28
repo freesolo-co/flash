@@ -441,7 +441,7 @@ def sft_seconds_for_tokens(config: RunConfig, gpu: str, train_tokens: float) -> 
 
 
 def _wider_shape_remedy(config: RunConfig, need: float, names: tuple[str, ...]) -> str:
-    """The `--gpus N` clause this quote's fit failure carries; see ``base.wider_shape_remedy``.
+    """The `[gpu] max_count = N` clause this quote's fit failure carries; see ``base.wider_shape_remedy``.
 
     ``names`` is the pool the quote already ranked, so the remedy is searched over exactly the
     classes that were considered -- reusing the caller's provider filtering instead of
@@ -499,7 +499,7 @@ def _catalog_check_remedy(config: RunConfig, need: float, names: tuple[str, ...]
     pinned = names[0] if len(names) == 1 else "multi-card"
     return (
         f". Their catalog may list a {width}-card {pinned} instance -- raise the card ceiling "
-        f"with `--gpus {width}` to check it against their catalog"
+        f"with `[gpu] max_count = {width}` to check it against their catalog"
     )
 
 
@@ -508,7 +508,7 @@ def _quote_gpu_ceiling(
 ) -> int:
     """The widest count this quote ranks over: the authored ceiling, or the smallest that fits.
 
-    An authored ceiling is the user's own `[gpu] count`, narrowed only by the model's geometry cap.
+    An authored ceiling is the user's own `[gpu] max_count`, narrowed only by the model's geometry cap.
     Auto-sizing instead searches for the smallest fitting count, with the SAME executed-width rule
     the ranking loop applies -- without it the ceiling is chosen on rented cards and can land below
     the shape that actually fits, because sft's executed width is not monotonic in the rented count
@@ -750,7 +750,7 @@ def _raise_no_fitting_shape(
     # a pinned class is blocked by the class itself, so name it -- the pool-wide message would
     # report the widest validated shape, which is not hardware this quote was ever allowed to
     # use. `_wider_shape_remedy` searches only `names`, already narrowed to the pin, so the
-    # `--gpus N` clause it appends can never name a shape the pin forbids. an unpinned run
+    # `[gpu] max_count = N` clause it appends can never name a shape the pin forbids. an unpinned run
     # falls through to the pool-wide message, which reports the count that would fit.
     if provider == "spot" and not config.gpu_type and not _spot_can_hold(config, need):
         # a restrictive card ceiling keeps the ceiling-aware message below instead.

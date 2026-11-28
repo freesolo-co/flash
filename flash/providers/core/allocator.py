@@ -255,7 +255,7 @@ def _executed_width(algorithm: str, train, overrides):
 
     Bound ONCE per allocation and handed to every site that asks a question about a card count: the
     filter that removes shapes, the classification that says why none were left, the pinned-class
-    precheck, and each ``--gpus N`` remedy. One rule for all of them is the invariant -- each time a
+    precheck, and each ``[gpu] max_count = N`` remedy. One rule for all of them is the invariant -- each time a
     site was left crediting the RENTED count instead, it contradicted the filter: a width the filter
     deterministically rejects was reported as "structurally offered" (a terminal miss raised as
     retryable, re-polling a market that cannot widen a batch), and advice named a card count that
@@ -367,7 +367,7 @@ def geometry_safe_gpu_cap(
     A pin is not by itself unknown geometry. SFT reaches allocation with a revision ALWAYS resolved
     to a sha (``runner.submit.prepare_job`` -> ``_resolve_model_revision`` with ``required=True``),
     so treating "pinned" as "uncertifiable" capped every SFT run in the catalog at four cards and
-    made ``--gpus 8`` unreachable for the algorithm that always pins -- including for a run that
+    made ``[gpu] max_count = 8`` unreachable for the algorithm that always pins -- including for a run that
     only fits at eight. The pinned commit's own ``config.json`` is what settles it: read the head
     count from that commit (validated against the catalog row, fail-closed, so a drifted pin is
     rejected rather than widened) and cap on the real number. An unreadable pin certifies nothing:
@@ -450,7 +450,7 @@ def _resolve_exact_gpu(
     count, and suppressing the remedy entirely would hide a fix the user can actually apply.
 
     ``executed_width`` is ``_executed_width``'s rule. Both the combination precheck below and every
-    ``--gpus N`` remedy have to apply it, or a pinned sft run whose batch caps it at one rank is told
+    ``[gpu] max_count = N`` remedy have to apply it, or a pinned sft run whose batch caps it at one rank is told
     to buy cards that cannot hold it. ``algorithm`` only words the reason for that narrowing, so it
     defaults to sft's phrasing rather than being required of every caller.
     """
@@ -460,7 +460,7 @@ def _resolve_exact_gpu(
     if exact_info is None or not exact_info.validated:
         raise UnsupportedGpuError(f"exact GPU {exact!r} is not an active validated GPU class")
     # provider compatibility decides FIRST: a class the requested provider does not carry cannot be
-    # rented at any width, so reporting a fit failure (and a `--gpus N` remedy) for it would send
+    # rented at any width, so reporting a fit failure (and a `[gpu] max_count = N` remedy) for it would send
     # the user to widen a shape that will never exist. the real defect is the pin/provider pair.
     exact_providers = providers_for(exact)
     if provider and provider not in exact_providers:
@@ -531,7 +531,7 @@ def _resolve_exact_gpu(
     ):
         # the width the VRAM math above actually credited, which is what the message has to name.
         # naming `cap` instead points the operator at the card ceiling when the real limiter is the
-        # batch: they raise `--gpus` and hit the identical failure.
+        # batch: they raise `[gpu] max_count` and hit the identical failure.
         tried = launched(cap)
         raise UnsupportedGpuError(
             f"exact GPU {exact!r} cannot fit this run even as a {tried}-card combination"
@@ -628,7 +628,7 @@ def _resolved_gpu_count(
 
     ``executed_width`` (``_executed_width``) decides both the auto-sized ceiling and the
     authored-ceiling check on the width that will run. Without it an sft run the batch caps at one
-    rank is told to raise `[gpu] count` to a width that changes nothing.
+    rank is told to raise `[gpu] max_count` to a width that changes nothing.
 
     Certifies the pin (``certify=True``): this runs inside ``allocate()``, which already does
     network i/o and can retry, and the width decided here is the one the run is really rented at. A

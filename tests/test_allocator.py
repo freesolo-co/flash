@@ -694,7 +694,7 @@ def test_a_pinned_gpu_type_without_a_count_stays_one_card_in_allocate(monkeypatc
     # opt-in remedy the author must name -- never taken on their behalf.
     message = str(exc.value)
     assert "requires at least 80 GB" in message
-    assert "--gpus 8" in message
+    assert "max_count = 8" in message
 
 
 def test_every_boundary_reads_the_authored_ceiling_from_one_predicate():
@@ -752,7 +752,7 @@ def test_explicit_two_card_pin_never_escalates_to_four(monkeypatch):
     # the pin is rejected AT the authored width and the remedy names the width that fits. wording
     # comes from `wider_shape_remedy`, the one searched helper every fit rejection routes through.
     assert "2-card combination" in message
-    assert "--gpus 4" in message
+    assert "max_count = 4" in message
 
 
 def test_combo_two_cheap_cards_beat_one_expensive(monkeypatch):
@@ -878,13 +878,13 @@ def test_pinned_gpu_fit_failure_names_the_card_count_that_fixes_it():
     `[gpu] count` is a user-authored ceiling, so this rejection is one flag from success. Without
     the remedy the message states the shortfall and stops, and the user cannot tell an
     unsatisfiable run apart from one that fits on two cards -- the difference between abandoning
-    the run and passing `--gpus 2`.
+    the run and passing `[gpu] max_count = 2`.
     """
     from flash.providers.core.allocator import _resolve_exact_gpu
     from flash.providers.core.base import GPU_INFO, UnsupportedGpuError
 
     need = GPU_INFO["H200"].vram_gb + 40  # fits on 2 cards, never on 1
-    with pytest.raises(UnsupportedGpuError, match=r"--gpus 2") as single:
+    with pytest.raises(UnsupportedGpuError, match=r"max_count = 2") as single:
         _resolve_exact_gpu(
             "H200",
             need=need,
@@ -897,7 +897,7 @@ def test_pinned_gpu_fit_failure_names_the_card_count_that_fixes_it():
     assert "it fits on 2 cards" in str(single.value)
 
     # the multi-card rejection carries the same remedy, measured from ITS cap rather than 1.
-    with pytest.raises(UnsupportedGpuError, match=r"--gpus 4") as pair:
+    with pytest.raises(UnsupportedGpuError, match=r"max_count = 4") as pair:
         _resolve_exact_gpu(
             "H200",
             need=GPU_INFO["H200"].vram_gb * 3,
@@ -913,7 +913,7 @@ def test_pinned_gpu_fit_failure_names_the_card_count_that_fixes_it():
 def test_pinned_gpu_fit_failure_stays_a_dead_end_when_no_width_fits():
     """A genuinely unsatisfiable run must NOT be told to raise the ceiling.
 
-    The remedy is only useful if it is true. Suggesting `--gpus 8` for a run no shape can hold
+    The remedy is only useful if it is true. Suggesting `[gpu] max_count = 8` for a run no shape can hold
     would trade one dead end for a second, slower one -- so the suggestion is searched, not
     assumed, and absent when nothing fits.
     """
@@ -930,7 +930,7 @@ def test_pinned_gpu_fit_failure_stays_a_dead_end_when_no_width_fits():
             available=("modal",),
             widest_cap=8,
         )
-    assert "--gpus" not in str(exc.value)
+    assert "max_count" not in str(exc.value)
 
 
 def test_wider_shape_remedy_is_bounded_by_the_geometry_cap():
@@ -946,12 +946,12 @@ def test_wider_shape_remedy_is_bounded_by_the_geometry_cap():
 
     vram = GPU_INFO["H200"].vram_gb
     need = vram + 40
-    assert "--gpus 2" in wider_shape_remedy((vram,), need, ceiling=8, above=1)
+    assert "max_count = 2" in wider_shape_remedy((vram,), need, ceiling=8, above=1)
     # capped below the fitting width: report no remedy rather than an unrentable one.
     assert wider_shape_remedy((vram,), need, ceiling=1, above=1) == ""
     # `above` excludes widths already tried, so a remedy never restates the failing shape: at
     # above=2 the fitting width 2 is suppressed and the next one that fits is named instead.
-    assert "--gpus 4" in wider_shape_remedy((vram,), need, ceiling=8, above=2)
+    assert "max_count = 4" in wider_shape_remedy((vram,), need, ceiling=8, above=2)
     # ...and once no untried width fits, there is nothing to suggest.
     assert wider_shape_remedy((vram,), need, ceiling=8, above=8) == ""
 
@@ -964,15 +964,15 @@ def test_wider_shape_remedy_names_the_cheapest_fitting_width():
     from flash.providers.core.base import GPU_INFO, wider_shape_remedy
 
     vram = GPU_INFO["H200"].vram_gb
-    assert "--gpus 2" in wider_shape_remedy((vram,), vram + 40, ceiling=8, above=1)
+    assert "max_count = 2" in wider_shape_remedy((vram,), vram + 40, ceiling=8, above=1)
 
 
 def test_remedy_never_names_a_width_the_run_will_not_launch_on():
-    """Regression: `--gpus N` was searched with the RENTED count, not the ranks that join.
+    """Regression: `[gpu] max_count = N` was searched with the RENTED count, not the ranks that join.
 
     The fit gate credits only launched ranks, so an unpacked sft run (batch 1, one rank however many
     cards are rented) is rejected at every width. The remedy searched the same failure with the full
-    count and answered `--gpus 2`: the user pays for a second card that contributes no memory and
+    count and answered `[gpu] max_count = 2`: the user pays for a second card that contributes no memory and
     fails identically. Advice has to be proved with the rule that will judge the retry.
 
     Codex's shape exactly: a batch-1 4B at 32k needs 28 GB and does not fit a 24 GB card.
@@ -988,8 +988,8 @@ def test_remedy_never_names_a_width_the_run_will_not_launch_on():
     )
     # the default is unchanged for everything that DOES launch what it rents, so this cannot
     # silently suppress a real remedy on grpo.
-    assert "--gpus 2" in wider_shape_remedy((card,), need, ceiling=8, above=1)
-    assert "--gpus 2" in wider_shape_remedy(
+    assert "max_count = 2" in wider_shape_remedy((card,), need, ceiling=8, above=1)
+    assert "max_count = 2" in wider_shape_remedy(
         (card,), need, ceiling=8, above=1, executed_width=lambda n: n
     )
 
@@ -998,7 +998,7 @@ def test_pin_rejection_names_the_width_it_actually_credited():
     """Regression: the message claimed a `cap`-card combination the VRAM math never tried.
 
     Once the precheck credits `launched(cap)`, saying "cannot fit even as an 8-card combination" for
-    a run that launches one rank points the operator at the card ceiling -- they raise `--gpus` and
+    a run that launches one rank points the operator at the card ceiling -- they raise `[gpu] max_count` and
     hit the identical failure. The real limiter is the batch that bounds the rank count, so the
     message has to name the width it credited and why it is smaller than the one allowed.
     """
@@ -1043,7 +1043,7 @@ def test_width_search_credits_only_the_ranks_that_join():
     resubmission failed identically because `executed_width(2)` is still one.
 
     Fixing the shared helper rather than each caller is what makes the ceiling search, the pinned
-    precheck, and the `--gpus N` advice answer one question.
+    precheck, and the `[gpu] max_count = N` advice answer one question.
     """
     from flash.providers.core.base import GPU_INFO, smallest_fitting_gpu_count
 
@@ -1132,7 +1132,7 @@ def test_the_fit_message_states_capacity_the_run_will_actually_have():
     # unchanged for runs that launch what they rent, whether the rule is identity or absent.
     for control in (message(None), message(lambda count: count)):
         assert "provides at most 234.1 GB" in control
-        assert "`--gpus 2` (2x H200 = 234.1 GB)" in control
+        assert "`[gpu] max_count = 2` (2x H200 = 234.1 GB)" in control
 
 
 def test_a_shape_label_reconciles_with_the_capacity_printed_beside_it():
@@ -1141,7 +1141,7 @@ def test_a_shape_label_reconciles_with_the_capacity_printed_beside_it():
     Valuing capacity at the executed width fixed the arithmetic but left the labels reading as
     though the hardware were smaller: `2x H200` beside 141 GB says an H200 is a 70 GB card, and an
     `8-card combination` capped at 446.6 GB understates the class without saying why. A user who
-    cannot reconcile the two numbers reaches for `--gpus`, which is the one knob that cannot help
+    cannot reconcile the two numbers reaches for `[gpu] max_count`, which is the one knob that cannot help
     when the batch is the limiter -- so the label has to name the join count and the reason.
     """
     from flash.engine.plan.steps import sft_data_parallel_cards
