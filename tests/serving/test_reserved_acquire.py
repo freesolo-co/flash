@@ -1,4 +1,5 @@
-"""Unattended acquisition of the twelve reserved 9B Base H100s."""
+"""Unattended acquisition of the reserved H100s: ten 9B Base slots by default, the two 27B
+slots only once targeted."""
 
 import json
 
@@ -259,3 +260,87 @@ async def test_only_h100_shapes_are_launched():
     store, api = Store(), FakeAPI(catalog)
     await tick(store, api)
     assert api.launches == []
+
+
+LARGE_HEALTHY = {**HEALTHY, "base_model": reserved.LARGE_MODEL}
+
+
+@pytest.mark.anyio
+async def test_27b_slots_are_opt_in():
+    store, api = Store(), FakeAPI(offer("us-west-3"))
+    # Every 9B Base slot already in the secret: nothing left by default, 27B never bought.
+    report = await ex.run_once(
+        store,
+        api,
+        set(reserved.slots_for(reserved.MODEL)),
+        revision=REV,
+        credentials={},
+        transport_factory=Transport,
+        clock=lambda: 1000.0,
+    )
+    assert "launch" not in report
+    assert api.launches == []
+    assert tuple(range(1, 11)) == ex.DEFAULT_TARGETS
+
+
+@pytest.mark.anyio
+async def test_targeted_27b_slot_launches_qualifies_and_publishes_as_27b(monkeypatch):
+    from flash.serving.lambda_cloud import bootstrap
+
+    booted = []
+    monkeypatch.setattr(
+        bootstrap, "user_data", lambda m, rev, c, tls: booted.append(m) or f"init {m}"
+    )
+
+    class Large(Transport):
+        health = LARGE_HEALTHY
+
+    store, api = Store({ex.TARGET_KEY: [11]}), FakeAPI(offer("us-west-3"))
+    await tick(store, api)
+    body = api.launches[0]
+    assert body["name"] == "flash-27b-reservation-20261128-11"
+    assert {"key": "purpose", "value": "flash-27b-serving"} in body["tags"]
+    assert booted == [reserved.LARGE_MODEL]
+    assert store["slot-11"]["model"] == reserved.LARGE_MODEL
+
+    api.instances[0].update(status="active", ip="1.2.3.4")
+    await tick(store, api, now=1200, transport=Transport)  # a 9B worker: refused
+    assert ex.WORKERS_KEY not in store
+    await tick(store, api, now=1400, transport=Large)
+    [entry] = store[ex.WORKERS_KEY]
+    assert entry["slot"] == 11
+    assert entry["model"] == reserved.LARGE_MODEL
+    assert reserved.parse_workers(json.dumps(store[ex.WORKERS_KEY])) == [entry]
+
+
+@pytest.mark.anyio
+async def test_a_9b_record_or_entry_on_a_27b_slot_is_never_carried_over():
+    """Slots 11-12 served 9B Base before 27B: their old records and entries are dropped, and
+    the old instance name never matches the 27B slot."""
+    old_entry = {
+        "slot": 11,
+        "model": reserved.MODEL,
+        "instance_id": "old-9b",
+        "ip": "8.8.4.4",
+        "revision": REV,
+        "tls": TLS,
+    }
+    old_record = {"state": "serving", "submitted_at": 0, "instance_id": "old-9b", "revision": REV}
+    store = Store({ex.TARGET_KEY: [11], ex.WORKERS_KEY: [old_entry], "slot-11": old_record})
+    api = FakeAPI(offer("us-west-3"))
+    api.instances.append(
+        {"id": "old-9b", "name": "flash-h100-reservation-20261127-11", "status": "active"}
+    )
+    await tick(store, api)
+    assert store[ex.WORKERS_KEY] == []
+    assert store["slot-11"]["model"] == reserved.LARGE_MODEL  # relaunched as 27B
+    assert names(api) == ["11"]
+    assert api.launches[0]["name"].startswith(ex.LARGE_CAMPAIGN)
+
+
+@pytest.mark.anyio
+async def test_a_published_entry_for_another_model_is_dropped_even_off_target():
+    wrong = {"slot": 12, "model": reserved.MODEL, "instance_id": "x", "ip": "1.1.1.1"}
+    store = Store({ex.TARGET_KEY: [], ex.WORKERS_KEY: [wrong]})
+    await tick(store, FakeAPI(offer(None)))
+    assert store[ex.WORKERS_KEY] == []

@@ -1,4 +1,5 @@
-"""Reserved H100 fleet: 12 x Qwen3.5-9B-Base; every other model uses the on-demand pool."""
+"""Reserved H100 fleet: 10 x Qwen3.5-9B-Base (exclusive) and 2 x Qwen3.8-27B (preferred, with
+its on-demand pool as fallback); every other model uses the on-demand pool."""
 
 import asyncio
 import json
@@ -14,7 +15,8 @@ from flash.serving.lambda_cloud.config import NoCapacityError, placements
 REV = "a" * 40
 TLS = {"cert": "C", "token": "T"}
 BASE = "Qwen/Qwen3.5-9B-Base"
-LARGE, DRAFTER = "Qwen/Qwen3.8-27B", "Qwen/Qwen3.5-0.8B-Base"  # never reserved
+LARGE, DRAFTER = "Qwen/Qwen3.8-27B", "Qwen/Qwen3.5-0.8B-Base"  # preferred; never reserved
+ALL = range(1, 13)  # every declared slot
 
 
 def worker(slot, **extra):
@@ -47,11 +49,13 @@ class MemoryStore(dict):
         self[key] = value
 
 
-def test_slot_layout_is_twelve_9b_base_slots():
-    assert reserved.SLOT_COUNT == 12
-    assert reserved.slots_for(BASE) == (1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12)
-    assert reserved.slots_for(LARGE) == reserved.slots_for(DRAFTER) == ()
+def test_slot_layout_is_ten_9b_base_slots_then_two_27b_slots():
+    assert reserved.SLOT_COUNT == 10
+    assert reserved.slots_for(BASE) == (1, 2, 3, 4, 5, 6, 7, 8, 9, 10)
+    assert reserved.slots_for(LARGE) == reserved.LARGE_SLOTS == (11, 12)
+    assert reserved.slots_for(DRAFTER) == ()
     assert reserved.MODELS == (BASE,)
+    assert reserved.PREFERRED_MODELS == (LARGE,)
     with pytest.raises(ValueError, match="not declared"):
         reserved.model_for(13)
 
@@ -59,7 +63,11 @@ def test_slot_layout_is_twelve_9b_base_slots():
 @pytest.mark.parametrize("environment", ["main", "", None])
 def test_reserved_models_are_reserved_only_in_main(environment):
     assert reserved.enabled(BASE, environment)
+    # 27B is never exclusive: its on-demand pool and Modal fallback stay deployed.
     assert not reserved.enabled(LARGE, environment)
+    assert reserved.preferred(LARGE, environment)
+    assert not reserved.preferred(BASE, environment)
+    assert not reserved.preferred(LARGE, "dev")
     assert not reserved.enabled(DRAFTER, environment)
     assert not reserved.enabled(BASE, "dev")
 
@@ -69,7 +77,7 @@ def test_the_reserved_model_places_on_a_single_h100_on_lambda():
 
 
 def test_parse_workers_requires_each_entry_to_name_its_slot_model():
-    raw = json.dumps([worker(s) for s in range(1, 13)])
+    raw = json.dumps([worker(s) for s in ALL])
     assert [w["slot"] for w in reserved.parse_workers(raw)] == list(range(1, 13))
     for bad in (
         [worker(1, model=LARGE)],  # an entry for another model
@@ -88,7 +96,7 @@ def proxy_for(slot, base_model, reported, monkeypatch):
 
     transport = MagicMock(call=AsyncMock(return_value=reported), aclose=AsyncMock())
     monkeypatch.setattr(module, "WorkerTransport", lambda ip, tls: transport)
-    monkeypatch.setenv(reserved.WORKERS_ENV, json.dumps([worker(s) for s in range(1, 13)]))
+    monkeypatch.setenv(reserved.WORKERS_ENV, json.dumps([worker(s) for s in ALL]))
     proxy = reserved.ReservedLambdaEngineProxy()
     proxy.base_model, proxy.reserved_slot = base_model, slot
     return proxy, transport
@@ -140,7 +148,7 @@ def test_watchdog_probes_each_worker_with_its_slot_model():
     store = MemoryStore()
     report = asyncio.run(
         wd.run_once(
-            [worker(s) for s in range(1, 13)],
+            [worker(s) for s in ALL],
             store,
             AsyncMock(),
             reserved.model_for,
@@ -148,8 +156,12 @@ def test_watchdog_probes_each_worker_with_its_slot_model():
         )
     )
     assert all(r["healthy"] for r in report.values())
-    assert seen == dict.fromkeys(range(1, 13), (BASE, BASE))
-    assert store[wd.CONFIGURED_KEY] == list(range(1, 13))
+    assert seen == {
+        **dict.fromkeys(range(1, 11), (BASE, BASE)),
+        11: (LARGE, LARGE),
+        12: (LARGE, LARGE),
+    }
+    assert store[wd.CONFIGURED_KEY] == list(ALL)
 
 
 def test_a_worker_serving_another_model_fails_its_probe_without_a_canary():
@@ -199,7 +211,7 @@ def test_routing_uses_only_healthy_configured_slots():
     assert usable == [1, 3]
     assert picks == [1, 3, 1, 3]
     with pytest.raises(ValueError, match="No reserved slot"):
-        asyncio.run(view.usable(LARGE))
+        asyncio.run(view.usable(DRAFTER))
 
 
 def test_affinity_gives_each_checkpoint_three_stable_home_slots():
@@ -231,7 +243,7 @@ def test_affinity_moves_only_the_checkpoints_of_an_unhealthy_slot():
     assert wd.home_slots(k, slots, order[3:]) == order[3:6]
 
 
-FLEET = tuple(reserved.SLOT_MODELS)  # every declared reserved slot
+FLEET = reserved.slots_for(BASE)  # every 9B Base slot
 
 
 def test_next_slot_keeps_a_checkpoint_on_its_home_slots(monkeypatch):
@@ -281,6 +293,37 @@ def test_interleaved_checkpoints_each_rotate_over_all_their_homes(monkeypatch):
     monkeypatch.setattr(wd, "ROTATION_KEYS", 2)
     asyncio.run(rounds(1))
     assert len(view._rotation) == 2
+
+
+def test_27b_routes_to_its_slots_only_while_configured_and_passing():
+    ok, once = wd.SlotState().dump(), wd.SlotState(failures=1).dump()
+    down = wd.SlotState(healthy=False, failures=2).dump()
+    ckpt = SimpleNamespace(org_id="org", model_id="flash-27b/step-5", serve_base_model=False)
+
+    def view(store):
+        return wd.HealthView(MemoryStore(store), reserved.SLOT_MODELS)
+
+    async def route(v, record=None):
+        return await v.route(LARGE, record), await v.preferred_home(LARGE, record)
+
+    # Never fails open: no published list, unconfigured, unprobed, failing or quarantined
+    # slots all send 27B to its on-demand pool.
+    for store in (
+        {11: ok, 12: ok},
+        {wd.CONFIGURED_KEY: [1, 2], 11: ok, 12: ok},
+        {wd.CONFIGURED_KEY: [11, 12]},
+        {wd.CONFIGURED_KEY: [11, 12], 11: once, 12: down},
+    ):
+        assert asyncio.run(route(view(store))) == (None, [])
+    v = view({wd.CONFIGURED_KEY: [1, 11, 12], 1: ok, 11: ok, 12: down})
+    assert asyncio.run(route(v, ckpt)) == (11, [11])
+    v = view({wd.CONFIGURED_KEY: [11, 12], 11: ok, 12: ok})
+    assert {asyncio.run(v.route(LARGE)) for _ in range(4)} == {11, 12}
+    assert sorted(asyncio.run(v.preferred_home(LARGE, ckpt))) == [11, 12]  # both are home
+    # 9B Base never routes to a 27B slot, and other models are never reserved.
+    assert asyncio.run(v.route(DRAFTER)) is None
+    v = view({wd.CONFIGURED_KEY: [1, 11], 1: down, 11: ok})
+    assert asyncio.run(v.route(BASE)) == 1  # 9B still fails open within its own slots
 
 
 def test_routing_fails_open_when_every_slot_is_quarantined():
@@ -423,6 +466,6 @@ def test_health_body_reports_reserved_models_only_while_reserved_is_on(monkeypat
     fallback = set(body["fallback_provider_by_model"])
     assert (BASE in fallback) is (not on)
     assert {LARGE, DRAFTER} <= fallback
-    assert body["capacity_by_model"][BASE]["min"] == (12 if on else 0)
+    assert body["capacity_by_model"][BASE]["min"] == (10 if on else 0)
     assert body["capacity_by_model"][LARGE]["min"] == 0
     assert (body["gpu_by_model"][BASE] == "H100") is on
