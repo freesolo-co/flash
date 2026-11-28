@@ -14,6 +14,7 @@ _DEPLOYMENT_ENV_VARS = (
     "SERVING_DEPLOYMENT_MODE",
     "SERVING_CUSTOM_DOMAIN",
     "MODAL_IS_REMOTE",
+    "LAMBDA_API_KEY",
     "FREESOLO_INTERNAL_KEY",
     "HF_TOKEN",
     "FLASH_ARTIFACT_BLOB_SAS_URL",
@@ -170,16 +171,14 @@ def test_engine_exit_hook_awaits_shutdown(monkeypatch) -> None:
 
 
 @pytest.mark.parametrize("environment", ["main", "dev", ""])
-def test_9b_base_uses_the_lease_pool_with_modal_fallback_and_no_dedicated_fleet(
-    monkeypatch, environment
-):
+def test_27b_and_08b_base_use_the_lease_pool_with_modal_fallback(monkeypatch, environment):
     _clear_deployment_environment(monkeypatch)
     module = _import_modal_app(monkeypatch, is_local=False, environment=environment)
-    model = "Qwen/Qwen3.5-9B-Base"
-    assert issubclass(module.ENGINE_BY_MODEL[model], module.LambdaEngineProxy)
-    assert model in module.MODAL_FALLBACK_BY_MODEL
-    assert model not in module.reserved.MODELS
-    # Only main declares the reserved 27B / 0.8B Base fleet: its secret and its watchdog.
+    for model in ("Qwen/Qwen3.8-27B", "Qwen/Qwen3.5-0.8B-Base"):
+        assert issubclass(module.ENGINE_BY_MODEL[model], module.LambdaEngineProxy)
+        assert model in module.MODAL_FALLBACK_BY_MODEL
+        assert model not in module.reserved.MODELS
+    # Only main declares the reserved 9B Base fleet: its secret and its watchdog.
     main = environment != "dev"
     secret_names = {c.args[0] for c in module.modal.Secret.from_name.call_args_list if c.args}
     assert {n for n in secret_names if "h100" in n} == (
@@ -242,7 +241,7 @@ def test_deploy_decides_from_the_secret_lookup_and_bakes_the_decision(monkeypatc
         _assert_on_demand(module)
         return
     assert module._reserved_env == {"FLASH_RESERVED_H100_ACTIVE": "1"}
-    assert len(module.RESERVED_ENGINES) == 8
+    assert len(module.RESERVED_ENGINES) == 6
     assert _reserved_secret_refs(module) == {reserved.SECRET_NAME}
     assert len(_watchdog_schedules(module)) == 1
 
@@ -267,29 +266,39 @@ def test_control_app_bakes_the_same_reserved_decision(monkeypatch):
 
 
 @pytest.mark.parametrize("environment", ["main", "", "dev"])
-def test_main_serves_27b_and_08b_base_only_from_eight_reserved_slots(monkeypatch, environment):
+def test_main_serves_9b_base_only_from_six_reserved_slots(monkeypatch, environment):
     _clear_deployment_environment(monkeypatch)
     module = _import_modal_app(monkeypatch, is_local=False, environment=environment)
-    large, drafter = "Qwen/Qwen3.8-27B", "Qwen/Qwen3.5-0.8B-Base"
+    base = "Qwen/Qwen3.5-9B-Base"
     if environment == "dev":
         assert module.RESERVED_ENGINES == ()
-        assert {large, drafter} <= set(module.ENGINE_BY_MODEL)
-        assert {large, drafter} <= set(module.MODAL_FALLBACK_BY_MODEL)
+        assert base in module.ENGINE_BY_MODEL
+        assert base in module.MODAL_FALLBACK_BY_MODEL
         return
     engines = module.RESERVED_ENGINES
-    assert [cls.reserved_slot for cls in engines] == list(range(1, 9))
+    assert [cls.reserved_slot for cls in engines] == list(range(1, 7))
     assert [cls.__name__ for cls in engines] == [
-        module.model_engine_name(large if slot <= 5 else drafter) + f"_ReservedH100{slot}"
-        for slot in range(1, 9)
+        module.model_engine_name(base) + f"_ReservedH100{slot}" for slot in range(1, 7)
     ]
     assert all(issubclass(cls, module.reserved.ReservedLambdaEngineProxy) for cls in engines)
     assert all(cls.pinned_gpu is None for cls in engines)
-    for model in (large, drafter):
-        assert model not in module.ENGINE_BY_MODEL
-        assert model not in module.MODAL_FALLBACK_BY_MODEL
+    assert base not in module.ENGINE_BY_MODEL
+    assert base not in module.MODAL_FALLBACK_BY_MODEL
+    assert "Qwen/Qwen3.8-27B" in module.ENGINE_BY_MODEL
 
 
-def test_reserved_requests_rotate_within_their_models_slots(monkeypatch):
+@pytest.mark.parametrize(("environment", "scheduled"), [("main", True), ("", True), ("dev", False)])
+def test_acquisition_is_scheduled_only_in_main(monkeypatch, environment, scheduled):
+    _clear_deployment_environment(monkeypatch)
+    monkeypatch.setenv("FLASH_RESERVED_H100_ACTIVE", "0")
+    module = _import_modal_app(monkeypatch, is_local=False, environment=environment)
+    assert hasattr(module, "reserved_h100_acquire") is scheduled
+    # Reserved serving stays off: 9B Base keeps its on-demand pool while GPUs are acquired.
+    assert "Qwen/Qwen3.5-9B-Base" in module.ENGINE_BY_MODEL
+    assert _reserved_secret_refs(module) == set()
+
+
+def test_reserved_requests_rotate_over_the_9b_base_slots(monkeypatch):
     from types import SimpleNamespace
 
     _clear_deployment_environment(monkeypatch)
@@ -299,7 +308,7 @@ def test_reserved_requests_rotate_within_their_models_slots(monkeypatch):
     monkeypatch.setattr(
         module,
         "RESERVED_ENGINES",
-        tuple(lambda *, base_model, slot=i + 1: (slot, base_model) for i in range(8)),
+        tuple(lambda *, base_model, slot=i + 1: (slot, base_model) for i in range(6)),
     )
     pool._reserved_health = module.reserved_watchdog.HealthView(
         SimpleNamespace(get=AsyncMock(return_value=None)), module.reserved.SLOT_MODELS
@@ -308,6 +317,5 @@ def test_reserved_requests_rotate_within_their_models_slots(monkeypatch):
     async def picks(model, n):
         return [(await pool._engine_for(model))[0] for _ in range(n)]
 
-    assert asyncio.run(picks("Qwen/Qwen3.8-27B", 6)) == [1, 2, 3, 4, 5, 1]
-    assert asyncio.run(picks("Qwen/Qwen3.5-0.8B-Base", 4)) == [6, 7, 8, 6]
+    assert asyncio.run(picks("Qwen/Qwen3.5-9B-Base", 8)) == [1, 2, 3, 4, 5, 6, 1, 2]
     pool._provider_selection.choose.assert_not_awaited()
