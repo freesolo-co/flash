@@ -47,34 +47,10 @@ class SpotJobHandle(InstanceJobHandle):
         return fields
 
 
-_NO_SUCH_BID = frozenset({400, 403, 404, 422})
-
-
 def require_scope(handle):
-    from flash.providers.mithril.config import (
-        region_scope_fingerprint,
-        scope_fingerprint,
-        settings,
-    )
+    from flash.providers.mithril.config import scope_fingerprint
 
-    if handle.scope == scope_fingerprint():
-        return
-    # Attempts launched by region-pinned releases carry the retired project+region scope. Verify
-    # them against their own bid's region so removing the setting does not orphan in-flight runs.
-    from flash.providers.mithril.client import MithrilApiError, call
-
-    project = settings()["project_id"]
-    try:
-        bid = call("GET", f"/spot/bids/{handle.instance_id}")
-    except MithrilApiError as exc:
-        if exc.status not in _NO_SUCH_BID:
-            raise  # timeout, 429 or 5xx: ownership is unverified, not disproven; callers retry
-        bid = None
-    if (
-        isinstance(bid, dict)
-        and bid.get("project") == project
-        and isinstance(bid.get("region"), str)
-        and handle.scope == region_scope_fingerprint(project, bid["region"])
-    ):
-        return
-    raise RuntimeError("Mithril Spot credentials or environment differ from this attempt's owner")
+    if handle.scope != scope_fingerprint():
+        raise RuntimeError(
+            "Mithril Spot credentials or environment differ from this attempt's owner"
+        )

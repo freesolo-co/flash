@@ -19,20 +19,16 @@ def test_adapter_config_path_rejects_an_invalid_storage_reference(monkeypatch) -
         lora_rank.adapter_config_path_from_ref("invalid")
 
 
-def test_file_identity_accepts_attribute_style_lfs_metadata() -> None:
-    """Hugging Face attribute-style LFS metadata must produce a stable immutable identity."""
-    info = SimpleNamespace(
-        lfs=SimpleNamespace(sha256="sha256:weight", oid=None, size=321),
-        blob_id=None,
-        size=None,
-    )
+def test_file_identity_uses_the_blob_digest_and_size() -> None:
+    """An artifact listing's blob digest and size must produce a stable immutable identity."""
+    info = SimpleNamespace(blob_id="sha256:weight", size=321)
 
     assert lora_rank._file_identity(info) == "sha256:weight:321"
 
 
 def test_file_identity_rejects_metadata_without_immutable_content() -> None:
-    """Weight metadata without an LFS oid or blob id must never be treated as pinned."""
-    info = SimpleNamespace(lfs=None, blob_id=None, size=12)
+    """Weight metadata without a blob id must never be treated as pinned."""
+    info = SimpleNamespace(blob_id=None, size=12)
 
     with pytest.raises(ValueError, match="no immutable content identity"):
         lora_rank._file_identity(info)

@@ -117,18 +117,16 @@ def test_unsupported_requests_never_admit_gpu_work(change):
     assert runtime.calls == 0
 
 
-@pytest.mark.parametrize("sse", [False, True])
-def test_native_events_report_usage_and_close(sse):
+def test_native_events_report_usage_and_close():
     runtime = FakeRuntime()
     with TestClient(build_app(runtime, manage_lifecycle=False)) as client:
         response = client.post(
             "/internal/generate",
             json={"request_id": "test", "chat": body()},
-            headers={"Accept": "text/event-stream" if sse else "application/x-ndjson"},
+            headers={"Accept": "text/event-stream"},
         )
     assert response.status_code == 200
-    expected_type = "text/event-stream" if sse else "application/x-ndjson"
-    assert response.headers["content-type"].startswith(expected_type)
+    assert response.headers["content-type"].startswith("text/event-stream")
     events = [
         json.loads(line.removeprefix("data: ")) for line in response.text.splitlines() if line
     ]
@@ -141,14 +139,13 @@ def test_native_events_report_usage_and_close(sse):
     assert runtime.closed
 
 
-@pytest.mark.parametrize("sse", [False, True])
-def test_error_after_first_token_is_not_successful_completion(sse):
+def test_error_after_first_token_is_not_successful_completion():
     runtime = FakeRuntime([{"tokens": [2], "finish_reason": None}, RuntimeError("native failure")])
     with TestClient(build_app(runtime, manage_lifecycle=False)) as client:
         response = client.post(
             "/internal/generate",
             json={"request_id": "test", "chat": body()},
-            headers={"Accept": "text/event-stream" if sse else "application/x-ndjson"},
+            headers={"Accept": "text/event-stream"},
         )
     events = [
         json.loads(line.removeprefix("data: ")) for line in response.text.splitlines() if line

@@ -35,10 +35,9 @@ async def _monitor(runtime):
             return
 
 
-async def _native_stream(events, first, *, sse=False):
+async def _native_stream(events, first):
     def frame(event):
-        data = json.dumps(event)
-        return f"data: {data}\n\n" if sse else data + "\n"
+        return f"data: {json.dumps(event)}\n\n"
 
     try:
         yield frame(first)
@@ -58,13 +57,11 @@ async def _native_chat(runtime, body, request):
     try:
         events = await prepare(runtime, body)
         first = await await_until_disconnect(request, anext(events))
-        # Modal flushes SSE immediately; NDJSON can be buffered by its proxy.
-        # Negotiate so an older router can still consume this backend during rollout.
-        sse = "text/event-stream" in request.headers.get("accept", "")
+        # Modal flushes SSE immediately, where a line-delimited stream can be buffered by its proxy.
         response = ClosingStreamingResponse(
-            _native_stream(events, first, sse=sse),
+            _native_stream(events, first),
             on_unstarted=events.aclose,
-            media_type="text/event-stream" if sse else "application/x-ndjson",
+            media_type="text/event-stream",
             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
         )
         handed_off = True
@@ -116,13 +113,12 @@ class _GenerationCount:
 
 async def _bounded_request(app, scope, receive, send):
     """One deadline covers upload, preparation, generation, and stream delivery."""
-    started = completed = sse = False
+    started = completed = False
 
     async def track(message):
-        nonlocal started, completed, sse
+        nonlocal started, completed
         if message["type"] == "http.response.start":
             started = True
-            sse = b"text/event-stream" in dict(message.get("headers", [])).get(b"content-type", b"")
         await send(message)
         if message["type"] == "http.response.body" and not message.get("more_body", False):
             completed = True
@@ -145,7 +141,7 @@ async def _bounded_request(app, scope, receive, send):
                         {"detail": "DeepInfer request deadline exceeded"}, status_code=504
                     )(scope, receive, send)
                 elif not completed:
-                    error = b'data: {"type":"error"}\n\n' if sse else b'{"type":"error"}\n'
+                    error = b'data: {"type":"error"}\n\n'
                     await send({"type": "http.response.body", "body": error, "more_body": False})
 
 

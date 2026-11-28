@@ -11,8 +11,7 @@ Set these secrets/configuration on the control plane:
 - `FLASH_MITHRIL_PROJECT_ID`: project FID from `GET /v2/projects`.
 - There is no region setting. Flash admits offers from every region's auctions, bids in the
   region of the cheapest qualifying offer, and each bid keeps its own region. Ownership is the
-  project. Attempts launched by earlier region-pinned releases stay recognized (checked against
-  their bid's region). `FLASH_MITHRIL_REGION` is no longer read.
+  project.
 - Optional `FLASH_MITHRIL_IMAGE_VERSION`: GPU host image version FID. Otherwise,
   Mithril selects the region's default image. Use an image with Docker, a compatible
   NVIDIA driver, NVIDIA container toolkit, Python 3 and outbound registry/Azure access.
@@ -23,17 +22,12 @@ Keep the existing worker image, Azure artifact and runtime-secret configuration.
 The Mithril API key stays on the control plane; workers receive only their runtime
 credentials. Use a dedicated project for Flash training.
 
-**Migration:** finish or cancel all existing legacy Spot runs using the previous
-release before deploying this change. Persisted legacy resource IDs and ownership
-fingerprints are deliberately rejected by the Mithril provider. Installing this
-release does not migrate or delete existing legacy VMs.
-
 ## Admission, prices and recovery
 
 | GPU | Fixed estimate / charge rate | Cap per GPU-hour (start below, keep running through) |
 | --- | ---: | ---: |
-| H100 | $2.00 | $2.01 |
-| H200 | $2.50 | $2.51 |
+| H100 | $1.20 | $1.20 |
+| H200 | $3.20 | $3.51 |
 
 The policy lives in `flash/providers/mithril/pricing.py`. Flash joins the authenticated
 instance-type catalog to live auctions in every region, admitting only advertised SXM
@@ -49,9 +43,9 @@ below its cap.
 Mithril reports prices and accepts bids **per instance-hour**. Flash divides the
 auction price by the actual GPU count for admission and multiplies the hold cap by
 that count for the bid. It requests one instance, not one instance per GPU.
-Each cap includes a one-cent per-GPU-hour offset. Admission uses a strict `<` against
-the same cap the bid uses: an eight-H200 price of $20.00 passes the $2.51/GPU-hour cap,
-while $20.08 does not. Current market prices may leave all jobs queued.
+Admission accepts a price at or below the same cap the bid uses: an eight-H200 price of
+$28.08 passes the $3.51/GPU-hour cap, while $28.16 does not. Current market prices may
+leave all jobs queued.
 Malformed or unavailable prices fail closed. Jobs recheck every 60 seconds without
 creating bids or consuming training retries; waiting respects cancellation and the
 run deadline. The selected GPU count and disk requirement are rechecked before launch.
@@ -61,14 +55,14 @@ quota rows defer to server enforcement. Definitively refused creates with confir
 quota exhaustion requeue only after reconciliation finds no bid; unknown POST
 outcomes remain fail-closed. Organization-level limits remain server-enforced.
 
-Every Spot quote is priced at the top Spot rate ($2.50 per GPU-hour), because any run may
-end up on an H200. Each stretch is then billed at the class it actually ran on ($2.00 for
-H100, $2.50 for H200), including runs that resume on a different class after a preemption.
+Every Spot quote is priced at the top Spot rate ($3.20 per GPU-hour), because any run may
+end up on an H200. Each stretch is then billed at the class it actually ran on ($1.20 for
+H100, $3.20 for H200), including runs that resume on a different class after a preemption.
 Heartbeats credit usage to the class the run is on at the time (newly reached training
 steps, or custom-session seconds), and settlement charges the accepted quote x the
-completed-work share x (usage-weighted rate / $2.50), never more than the quote. Runs
-launched before this accounting are billed on their accepted quote unchanged. The existing
-completed-work/session-time settlement rules otherwise apply.
+completed-work share x (usage-weighted rate / quoted rate), never more than the quote.
+Rates are recorded on each run at submission, so a later rate change never reprices an
+accepted quote. The existing completed-work/session-time settlement rules otherwise apply.
 These estimates are not Mithril invoices and exclude network, taxes and other charges.
 The same cap bounds both admission and subsequent compute pricing.
 
@@ -140,11 +134,12 @@ not change production pricing. `--model` selects the model to qualify.
 Edit `MODEL_POLICIES` in `flash/serving/app/inference_provider.py`. Each model has
 `min_capacity`, `max_capacity`, and an optional `lambda_gpus` allowlist; redeploy after editing.
 All Qwen models prefer Lambda and use Modal when Lambda capacity is unavailable.
+`lambda_gpus` accepts only H100, H200 and B200; Lambda never rents A10 or A100 for serving.
 For example, to keep one production 9B Base replica warm and allow up to three:
 
 ```python
 "Qwen/Qwen3.5-9B-Base": ModelPolicy(
-    min_capacity=1, max_capacity=3, lambda_gpus=("A100-40GB", "H100"),
+    min_capacity=1, max_capacity=3, lambda_gpus=("H100",),
 ),
 ```
 
@@ -152,9 +147,8 @@ The shipping settings are:
 
 | Model | Preferred backend | Main minimum | Dev minimum | Maximum |
 | --- | --- | ---: | ---: | ---: |
-| Qwen3.5-0.8B | Lambda A10 | 1 | 0 | 2 |
-| Qwen3.5-9B-Base | Lambda A100-40GB / A100-80GB / H100 | 2 | 0 | 4 |
-| Other Qwen models | Lambda with per-model GPU options | 0 | 0 | 2 |
+| Qwen3.5-9B-Base | Lambda H100 (main: reserved H100 fleet, see `docs/reserved-h100-serving.md`) | 0 | 0 | 4 |
+| Other Qwen models | Lambda H100-class, Modal fallback | 0 | 0 | 2 |
 | DeepSeek | Modal four-B200 group | 0 | 0 | 4 main / 1 dev |
 
 Capacity counts model replicas, not GPU cards, and applies independently in each
@@ -163,9 +157,9 @@ production minimum. Requests still start workers and trigger demand-based scalin
 idle workers drain after the demand and scale-down windows expire. CPU routing and
 fleet control services remain available to handle cold requests.
 
-Hosted Qwen serves only on Lambda; there is no Modal GPU fallback. Requests queue on
-the model's Lambda pool until a worker is healthy. Qwen maximums allow one temporary
-extra replica during a release handoff. The fleet controller reconciles demand every
+When Lambda has no capacity, hosted Qwen falls back to a scale-to-zero Modal GPU pool
+that shares the model's maximum. Qwen maximums allow one temporary extra replica during
+a release handoff. The fleet controller reconciles demand every
 minute. Production retains the configured minimums.
 
 `lambda_gpus` restricts the model's qualified hardware. An empty tuple permits the

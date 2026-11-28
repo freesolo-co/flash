@@ -106,14 +106,9 @@ def _positive_int(value: Any, *, source: str, field: str) -> int:
 
 def _file_identity(file_info: Any) -> str:
     # Azure ArtifactFile entries carry path, size and the content digest in blob_id.
-    # lfs.sha256 remains accepted for saved source metadata from before the migration.
     # reject entries without file identity rather than hashing a folder or missing metadata.
-    lfs = getattr(file_info, "lfs", None)
-    oid = getattr(lfs, "sha256", None)
-    size = getattr(lfs, "size", None)
-    blob_id = getattr(file_info, "blob_id", None)
-    size = size if size is not None else getattr(file_info, "size", None)
-    immutable = oid or blob_id
+    immutable = getattr(file_info, "blob_id", None)
+    size = getattr(file_info, "size", None)
     if not immutable:
         raise ValueError("source adapter weight metadata has no immutable content identity")
     return f"{immutable}:{size if size is not None else 'unknown'}"

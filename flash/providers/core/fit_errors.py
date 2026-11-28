@@ -45,7 +45,7 @@ def batch_bound_width_note(*, algorithm: str = "", parenthetical: bool = False) 
     """Why this run launches on fewer ranks than it rents, worded for ``algorithm``.
 
     THE wording for that gap, shared by every message that shows one. The operator has to learn that
-    the card ceiling is not the limiter, or they raise `--gpus` and hit the identical failure.
+    the card ceiling is not the limiter, or they raise `[gpu] max_count` and hit the identical failure.
 
     For grpo it also states the DIRECTION, because the general knob advice appended after it
     says to lower those same knobs and here that is a dead end: a step bound by its sequence count
@@ -166,7 +166,7 @@ def catalog_check_hint(
         return ""
     return (
         f". Their catalog may list a {width}-card {exact} instance -- raise the card ceiling "
-        f"with `--gpus {width}` to check it against their catalog"
+        f"with `[gpu] max_count = {width}` to check it against their catalog"
     )
 
 
@@ -196,7 +196,7 @@ def _unbuyable_width_message(
         remedy = (
             (
                 "Drop the provider pin and raise the card ceiling with "
-                f"`--gpus {unpinned_width}` to let the allocator choose"
+                f"`[gpu] max_count = {unpinned_width}` to let the allocator choose"
             )
             if unpinned_width > requested_gpu_count
             else "Drop the provider pin to let the allocator choose"
@@ -210,7 +210,7 @@ def _unbuyable_width_message(
         )
         # the identical fit check guarding this block guarantees a catalog width is present.
         remedy = (
-            f"Raise the card ceiling with `--gpus {catalog_width}` to check it against their "
+            f"Raise the card ceiling with `[gpu] max_count = {catalog_width}` to check it against their "
             "catalog, or configure a provider that rents card counts directly (Modal)"
             if catalog_width > requested_gpu_count
             else "Configure a provider that rents card counts directly (Modal)"
@@ -276,15 +276,15 @@ def vram_fit_error_message(
         if provided is not None and fitting is not None:
             provided_gpu, provided_count, provided_vram = provided
             fitting_gpu, fitting_count, fitting_vram = fitting
-            # `--gpus {n}` is spelled exactly as `wider_shape_remedy` spells it, so the flag a user
-            # copies out of a fit failure is the same string on every path that can reject one.
+            # `[gpu] max_count = {n}` is spelled exactly as `wider_shape_remedy` spells it, so the
+            # setting a user copies out of a fit failure is the same on every path that rejects one.
             provided_join = _join_note(provided_count, executed_width)
             fitting_join = _join_note(fitting_count, executed_width)
             return (
-                f"{algorithm} needs >= {need:g} GB VRAM; gpu.count={requested_gpu_count} provides "
+                f"{algorithm} needs >= {need:g} GB VRAM; gpu.max_count={requested_gpu_count} provides "
                 f"at most {provided_vram:g} GB "
                 f"({_shape_label(provided_gpu, provided_count)}{provided_join}). "
-                f"Raise the card ceiling with `--gpus {fitting_count}` "
+                f"Raise the card ceiling with `[gpu] max_count = {fitting_count}` "
                 f"({_shape_label(fitting_gpu, fitting_count)} = {fitting_vram:g} GB"
                 f"{fitting_join})"
                 f"{_batch_bound_width_note(provided_join, fitting_join, algorithm=algorithm, parenthetical=True)}"

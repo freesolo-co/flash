@@ -385,7 +385,7 @@ def gpu_capacity_shape(
     """Return the largest shape, or the smallest shape clearing ``min_vram_gb``.
 
     The count in the returned shape is the RENTED count -- it labels what the user buys and what
-    `--gpus N` asks for. The capacity is valued at ``executed_width(count)``, the ranks that join.
+    `[gpu] max_count = N` asks for. The capacity is valued at ``executed_width(count)``, the ranks that join.
     For sft those differ, and a message that mixes them contradicts itself: a 2-card ceiling that
     launches one rank was reported as providing 234.1 GB against a 230 GB need (so the rejection
     read as a fit), then pointed at a 4-card shape credited 252.8 GB that really delivers 191.6.
@@ -445,7 +445,7 @@ def cheapest_gpu(
 ) -> str:
     """Return the cheapest fitting validated GPU class for the card ceiling.
 
-    Size against the rentable multi-card shape so ``--gpus`` is not rejected as single-card, but
+    Size against the rentable multi-card shape so ``[gpu] max_count`` is not rejected as single-card, but
     credit only ``executed_width`` when the run launches fewer ranks than it rents. A ``cost_key``
     ranks job cost; without one, rank hourly rate.
     """
@@ -673,10 +673,10 @@ def largest_rentable_count(max_gpu_count: int) -> int:
 def wider_shape_remedy(
     vram_options: Iterable[int], need: float, *, ceiling: int, above: int = 0, executed_width=None
 ) -> str:
-    """The ``--gpus N`` clause a fit failure carries, or ``""`` when no wider shape would fit.
+    """The ``[gpu] max_count = N`` clause a fit failure carries, or ``""`` when no wider shape would fit.
 
     A fit failure is only worth reporting as unsatisfiable when NO shape the user can ask for
-    would fix it. `[gpu] count` is a user-authored ceiling, so a run that fails at the authored
+    would fix it. `[gpu] max_count` is a user-authored ceiling, so a run that fails at the authored
     count but fits at a wider one is a one-flag fix, not a dead end -- and the error is the only
     place the user learns which flag.
 
@@ -690,7 +690,7 @@ def wider_shape_remedy(
     (see ``rents_arbitrary_card_counts``); passing none leaves the failure a bare dead end, which
     is the honest answer when no offline check can confirm the wider SKU exists.
 
-    ``executed_width`` (``allocator._executed_width``) has to bound the suggestion too: `--gpus 2`
+    ``executed_width`` (``allocator._executed_width``) has to bound the suggestion too: `[gpu] max_count = 2`
     on a run whose batch launches one rank buys a second card that contributes no memory, so the
     user pays twice to fail identically. Advice is searched with the rule that will judge the retry.
 
@@ -706,7 +706,7 @@ def wider_shape_remedy(
                 break
     if best == 0:
         return ""
-    return f"; it fits on {best} cards -- raise the card ceiling with `--gpus {best}`"
+    return f"; it fits on {best} cards -- raise the card ceiling with `[gpu] max_count = {best}`"
 
 
 @dataclass(frozen=True)

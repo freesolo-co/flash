@@ -2,12 +2,11 @@
 
 import os
 import sys
-import time
 
 import modal
 
 from .api import LambdaAPI
-from .config import LEDGER_NAME, NoCapacityError, select_region
+from .config import LEDGER_NAME
 from .fleet import Fleet
 
 
@@ -48,17 +47,6 @@ def register_control(app, secret, image, module_name):
         @modal.exit()
         async def close(self):
             await self.api.aclose()
-
-        @modal.method()
-        async def has_capacity(self, model):
-            if time.monotonic() >= getattr(self, "_catalog_expires", 0):
-                self._catalog = await self.api.call("GET", "instance-types")
-                self._catalog_expires = time.monotonic() + 30
-            try:
-                select_region(self._catalog, model)
-            except NoCapacityError:
-                return False
-            return True
 
         @modal.method()
         async def launch(self, owner, model, user_data, revision):

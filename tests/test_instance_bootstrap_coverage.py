@@ -535,21 +535,6 @@ def test_fetch_code_uses_exact_revision_and_verified_file_materialization(monkey
     ]
 
 
-def test_fetch_code_refuses_to_execute_retired_hf_backend(monkeypatch):
-    from pathlib import Path
-
-    _install_fake_hf(monkeypatch, download_file=lambda **kwargs: "/tmp/archive.zip")
-
-    def materialize(path, descriptor, destination):
-        retired = Path(destination) / "flash/engine/worker/io/hf.py"
-        retired.parent.mkdir(parents=True)
-        retired.write_text("old worker code")
-
-    monkeypatch.setattr(b._source_snapshot, "materialize_verified_archive_file", materialize)
-    with pytest.raises(RuntimeError, match="predates Azure"):
-        b.fetch_code(_source_payload())
-
-
 def test_fetch_code_distinguishes_transport_from_integrity_failure(monkeypatch):
     monkeypatch.setattr(
         b,

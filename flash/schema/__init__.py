@@ -32,11 +32,10 @@ from flash.core.spec import (
 )
 from flash.providers.core.base import (
     UnsupportedGpuError,
-    providers_for,
     provisional_gpu,
     provisional_gpu_count,
 )
-from flash.providers.core.registry import PROVIDER_NAMES, validated_provider_preferences
+from flash.providers.core.registry import PROVIDER_NAMES
 from flash.schema.fields import (
     ConfigError,
     _coerce_scalar,
@@ -822,19 +821,8 @@ _ALGO_VALIDATORS = {
 
 
 def _validate_spec(spec: JobSpec) -> None:
-    if spec.gpu.provider and spec.gpu.providers:
-        raise ConfigError("gpu.provider and gpu.providers cannot both be set")
-    try:
-        validated_provider_preferences(spec.gpu.providers, allow_empty=True)
-    except (TypeError, ValueError) as exc:
-        raise ConfigError(str(exc)) from exc
-    # the gpu spec owns class canonicalization and active-catalog validation. this layer only checks
-    # the provider relationship, which depends on the complete job spec rather than the field itself.
-    for gpu_type in spec.gpu.acceptable_types:
-        if spec.gpu.provider and spec.gpu.provider not in providers_for(gpu_type):
-            raise ConfigError(
-                f"gpu.provider {spec.gpu.provider!r} cannot provision gpu.type {gpu_type!r}"
-            )
+    # the parser builds gpu from provider/spot/max_count only (type and providers are retired
+    # keys), so the provider name is the one gpu relationship left to check here.
     if spec.gpu.provider and spec.gpu.provider not in PROVIDER_NAMES:
         raise ConfigError(f"unknown gpu.provider {spec.gpu.provider!r}")
     _reject_inapplicable_train_knobs(spec)

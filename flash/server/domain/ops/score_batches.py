@@ -53,8 +53,14 @@ ITEM_BACKOFF_SECONDS = 5
 ITEM_MAX_BACKOFF_SECONDS = 60
 # Generations in flight across every batch on this plane.
 MAX_INFLIGHT_ENV = "FLASH_SCORE_BATCH_MAX_INFLIGHT"
-DEFAULT_MAX_INFLIGHT = 256
-MAX_ACTIVE_BATCHES = 32
+# 8 reserved 9B-Base H100s x 48 sequences, under each engine's 64-sequence limit. Raise it with the
+# reserved fleet: at 256 the 8 workers already logged engine timeouts under 16k-token generations.
+DEFAULT_MAX_INFLIGHT = 384
+# Batches this plane runs at once; the rest wait queued. Every running batch still shares the
+# MAX_INFLIGHT generation budget above, so raising this lets small batches start without adding
+# GPU load. Each running batch holds up to its `concurrency` mostly idle threads.
+MAX_ACTIVE_ENV = "FLASH_SCORE_BATCH_MAX_ACTIVE"
+DEFAULT_MAX_ACTIVE_BATCHES = 96
 STALE_SECONDS = 120
 POLL_SECONDS = 5
 RETENTION_SECONDS = 7 * 24 * 60 * 60
@@ -123,22 +129,26 @@ def _batch_dir(batch_id: str) -> Path:
     return batches_dir() / batch_id
 
 
-def capacity_wait_seconds() -> float:
-    raw = (os.environ.get(CAPACITY_WAIT_ENV) or "").strip()
+def _positive_env(name: str, default: float, cast: type) -> Any:
+    """A positive number from ``name``, or ``default`` when it is unset, invalid or not positive."""
+    raw = (os.environ.get(name) or "").strip()
     try:
-        value = float(raw) if raw else DEFAULT_CAPACITY_WAIT_SECONDS
+        value = cast(raw) if raw else default
     except ValueError:
-        value = DEFAULT_CAPACITY_WAIT_SECONDS
-    return value if value > 0 else DEFAULT_CAPACITY_WAIT_SECONDS
+        value = default
+    return value if value > 0 else default
+
+
+def capacity_wait_seconds() -> float:
+    return _positive_env(CAPACITY_WAIT_ENV, DEFAULT_CAPACITY_WAIT_SECONDS, float)
 
 
 def _max_inflight() -> int:
-    raw = (os.environ.get(MAX_INFLIGHT_ENV) or "").strip()
-    try:
-        value = int(raw) if raw else DEFAULT_MAX_INFLIGHT
-    except ValueError:
-        value = DEFAULT_MAX_INFLIGHT
-    return value if value > 0 else DEFAULT_MAX_INFLIGHT
+    return _positive_env(MAX_INFLIGHT_ENV, DEFAULT_MAX_INFLIGHT, int)
+
+
+def _max_active() -> int:
+    return _positive_env(MAX_ACTIVE_ENV, DEFAULT_MAX_ACTIVE_BATCHES, int)
 
 
 # ---------------------------------------------------------------------------------------------
@@ -639,7 +649,7 @@ class _Batch:
         A retryable failure moves that request to the back, so one request that fails for its own
         reasons cannot hold the batch; capacity is confirmed by whichever request succeeds first.
         """
-        deadline = self.row["created_at"] + self.runner.capacity_wait()
+        deadline = self.row["created_at"] + self.runner.capacity_wait
         while pending:
             index = pending[0]
             entry = requests[index]
@@ -660,7 +670,7 @@ class _Batch:
                 if remaining <= 0:
                     message = (
                         "Lambda capacity was unavailable for "
-                        f"{self.runner.capacity_wait() / 3600:g} hours; no requests ran"
+                        f"{self.runner.capacity_wait / 3600:g} hours; no requests ran"
                     )
                     self._finish("failed", error=message)
                     return None
@@ -804,11 +814,16 @@ def _send_request(row: dict, key: dict, request: dict) -> dict:
 class ScoreBatchRunner:
     """Claims and runs score batches on the control-plane lease holder."""
 
-    def __init__(self, *, send=_send_request, clock=time.time, capacity_wait=capacity_wait_seconds):
+    def __init__(
+        self, *, send=_send_request, clock=time.time, capacity_wait: float | None = None
+    ) -> None:
         self.owner = f"{os.getpid()}-{uuid.uuid4().hex[:12]}"
         self.send = send
         self.clock = clock
-        self.capacity_wait = capacity_wait
+        # Environment settings are read once here: a process's environment cannot change while it
+        # runs, so changing any of them means restarting the control plane.
+        self.capacity_wait = capacity_wait_seconds() if capacity_wait is None else capacity_wait
+        self.max_active = _max_active()
         self.stopping = threading.Event()
         self.inflight = threading.BoundedSemaphore(_max_inflight())
         self.active: dict[str, tuple[_Batch, threading.Thread]] = {}
@@ -861,7 +876,7 @@ class ScoreBatchRunner:
             row = get_row(batch_id)
             if row is None or row["state"] == "cancelled" or row["owner"] != self.owner:
                 batch.stop.set()
-        while len(self.active) < MAX_ACTIVE_BATCHES:
+        while len(self.active) < self.max_active:
             row = self._claim(now)
             if row is None:
                 break

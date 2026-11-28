@@ -93,17 +93,11 @@ def _verify_adapter_artifact_tensors(
         # every listed name, because whether the shards form a loadable set is decided by the index
         # beside them -- and the index is not itself a weight file.
         listed_paths.append(path)
-        lfs = getattr(entry, "lfs", None)
         file_facts.append(
             {
                 "path": path,
                 "size": int(getattr(entry, "size", 0) or 0),
-                "oid": str(
-                    getattr(lfs, "sha256", None)
-                    or getattr(lfs, "oid", None)
-                    or getattr(entry, "blob_id", None)
-                    or ""
-                ),
+                "oid": str(getattr(entry, "blob_id", None) or ""),
             }
         )
         if not is_adapter_weight_filename(path):
