@@ -582,13 +582,13 @@ class _ModalEnginePool:
         # Watchdog-quarantined reserved workers are skipped for routing and registration.
         self._reserved_health = reserved_watchdog.HealthView.for_engines(RESERVED_ENGINES)
 
-    async def _each_reserved(self, model, label, call):
-        slots = await self._reserved_health.usable(model)
+    async def _each_reserved(self, model, label, call, *, record=None):
+        slots = await self._reserved_health.home(model, record)  # record: its home slots only
         await reserved_watchdog.each_slot(RESERVED_ENGINES, model, slots, label, call)
 
-    async def _engine_for(self, model):
+    async def _engine_for(self, model, record=None):
         if _reserved(model):
-            slot = await self._reserved_health.next_slot(model)
+            slot = await self._reserved_health.next_slot(model, record)
             return RESERVED_ENGINES[slot - 1](base_model=model)
         if (
             model in MODAL_FALLBACK_BY_MODEL
@@ -630,7 +630,7 @@ class _ModalEnginePool:
         generation_id = payload.generation_id
         if not generation_id:
             raise RuntimeError("generation id is required before modal dispatch")
-        engine = await self._engine_for(base_model)
+        engine = await self._engine_for(base_model, record)
         return await engine.generate.remote.aio(
             internal_generation_payload(payload),
             self._record_payload(record),
@@ -663,7 +663,7 @@ class _ModalEnginePool:
         generation_id = payload.generation_id
         if not generation_id:
             raise RuntimeError("generation id is required before modal dispatch")
-        engine = await self._engine_for(base_model)
+        engine = await self._engine_for(base_model, record)
         from flash.serving.src.stream_channel.client import CancellableStreamChannel
 
         remote_stream = CancellableStreamChannel(
@@ -691,6 +691,7 @@ class _ModalEnginePool:
                 base_model,
                 "register",
                 lambda engine: engine.register.remote.aio(payload, generation),
+                record=record,
             )
             return
         engine = await self._engine_for(base_model)

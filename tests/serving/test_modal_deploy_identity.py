@@ -334,3 +334,53 @@ def test_reserved_requests_rotate_over_the_9b_base_slots(monkeypatch):
         2,
     ]
     pool._provider_selection.choose.assert_not_awaited()
+
+
+def test_checkpoints_route_and_register_only_on_their_home_slots(monkeypatch):
+    """A checkpoint's requests and registration stay on its 3 home slots; base-model requests
+    spread over all 8; unregister still clears every slot."""
+    from types import SimpleNamespace
+
+    _clear_deployment_environment(monkeypatch)
+    module = _import_modal_app(monkeypatch, is_local=False, environment="main")
+    calls = []
+
+    class Engine:
+        def __init__(self, slot, base_model):
+            self.slot = slot
+            for name in ("register", "unregister"):
+                aio = AsyncMock(
+                    side_effect=lambda *a, name=name, slot=slot: calls.append((name, slot))
+                )
+                setattr(self, name, SimpleNamespace(remote=SimpleNamespace(aio=aio)))
+
+    monkeypatch.setattr(
+        module,
+        "RESERVED_ENGINES",
+        tuple(lambda *, base_model, slot=i + 1: Engine(slot, base_model) for i in range(8)),
+    )
+    pool = module._ModalEnginePool.__new__(module._ModalEnginePool)
+    pool._provider_selection = SimpleNamespace(choose=AsyncMock())
+    pool._record_payload = lambda record: {}
+    pool._reserved_health = module.reserved_watchdog.HealthView(
+        SimpleNamespace(get=AsyncMock(return_value=None)), module.reserved.SLOT_MODELS
+    )
+    base = "Qwen/Qwen3.5-9B-Base"
+    a = SimpleNamespace(org_id="org", model_id="flash-1/step-10", serve_base_model=False)
+    b = SimpleNamespace(org_id="org", model_id="flash-2/step-10", serve_base_model=False)
+    served = SimpleNamespace(org_id="org", model_id=base, serve_base_model=True)
+
+    async def picks(record, n):
+        return [(await pool._engine_for(base, record)).slot for _ in range(n)]
+
+    home_a = set(asyncio.run(picks(a, 30)))
+    home_b = set(asyncio.run(picks(b, 30)))
+    assert len(home_a) == len(home_b) == module.reserved_watchdog.AFFINITY_SLOTS == 3
+    assert home_a != home_b
+    assert set(asyncio.run(picks(served, 16))) == set(range(1, 9))
+    assert set(asyncio.run(picks(None, 16))) == set(range(1, 9))
+
+    asyncio.run(pool.register(base, a))
+    assert {slot for name, slot in calls if name == "register"} == home_a
+    asyncio.run(pool.unregister(base, "org", "flash-1/step-10"))
+    assert {slot for name, slot in calls if name == "unregister"} == set(range(1, 9))
