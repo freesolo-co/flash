@@ -20,12 +20,6 @@ def configured() -> bool:
     return all(config[key] for key in ("api_key", "project_id"))
 
 
-def region_scope_fingerprint(project_id: str, region: str) -> str:
-    """The retired project+region scope that attempts from region-pinned releases carry."""
-    # Namespaced so a persisted legacy provider identity can never be adopted by Mithril.
-    return hashlib.sha256(f"mithril:{project_id}:{region}".encode()).hexdigest()
-
-
 def scope_fingerprint() -> str:
     config = settings()
     if not configured():

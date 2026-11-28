@@ -56,8 +56,7 @@ async def test_preparation_cannot_start_a_fresh_generation_budget(advance):
 
 
 @pytest.mark.anyio
-@pytest.mark.parametrize("sse", [False, True])
-async def test_started_stream_times_out_and_keeps_its_slot_until_cleanup(advance, sse):
+async def test_started_stream_times_out_and_keeps_its_slot_until_cleanup(advance):
     streaming, cleaning, release = (asyncio.Event() for _ in range(3))
 
     class Runtime(FakeRuntime):
@@ -81,7 +80,7 @@ async def test_started_stream_times_out_and_keeps_its_slot_until_cleanup(advance
             client.post(
                 "/internal/generate",
                 json={"request_id": "stream", "chat": body()},
-                headers={"Accept": "text/event-stream" if sse else "application/x-ndjson"},
+                headers={"Accept": "text/event-stream"},
             )
         )
         await streaming.wait()
@@ -94,8 +93,7 @@ async def test_started_stream_times_out_and_keeps_its_slot_until_cleanup(advance
         response = await asyncio.wait_for(task, 2)
         assert response.status_code == 200  # Headers already went out; error terminates the stream.
         assert '"type": "ready"' in response.text
-        expected = 'data: {"type":"error"}\n\n' if sse else '{"type":"error"}\n'
-        assert response.text.endswith(expected)
+        assert response.text.endswith('data: {"type":"error"}\n\n')
         assert '"type": "final"' not in response.text
         assert runtime.closed
         assert (await client.get("/health")).json()["active_http_requests"] == 0

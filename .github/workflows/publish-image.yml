@@ -72,7 +72,7 @@ jobs:
             echo "EOF"
           } >> "$GITHUB_OUTPUT"
 
-      # The checked-in source always ships CHANNEL="prod" (scripts/_channel.py) -- the PyPI
+      # The checked-in source always ships CHANNEL="prod" (flash/_internal/channel.py) -- the PyPI
       # dev-channel package (publish-dev.yml) already flips it via the same script before its
       # own build. The Docker image build never did, so `:dev` shipped with CHANNEL="prod" and
       # every channel-derived default (serving URL, control-plane URL, CLI/dist names) resolved

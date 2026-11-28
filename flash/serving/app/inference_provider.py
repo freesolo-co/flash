@@ -42,7 +42,6 @@ class ModelPolicy:
 # starting another. lambda_gpus is an allowlist: use the cheapest available offer.
 MODEL_POLICIES = {
     "Qwen/Qwen3.5-0.8B": ModelPolicy(min_capacity=0, max_capacity=2),
-    # Used whenever reserved serving is off (dev, or main without the workers secret).
     "Qwen/Qwen3.5-0.8B-Base": ModelPolicy(min_capacity=0, max_capacity=2),
     "Qwen/Qwen3.5-4B": ModelPolicy(min_capacity=0, max_capacity=2),
     "Qwen/Qwen3.5-9B": ModelPolicy(min_capacity=0, max_capacity=2),

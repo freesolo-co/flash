@@ -340,14 +340,12 @@ def test_warmstart_identity_binds_every_shard(monkeypatch):
 
         def list_repo_tree(self, **_kwargs):
             return [
-                SimpleNamespace(path=f"sft/run/adapter/{name}", blob_id=None, size=8, lfs=None)
+                SimpleNamespace(path=f"sft/run/adapter/{name}", blob_id=None, size=8)
                 if name == _INDEX
                 else SimpleNamespace(
                     path=f"sft/run/adapter/{name}",
-                    blob_id=None,
+                    blob_id=oids[name],
                     size=123,
-                    # attribute-style `BlobLfsInfo`, the only shape `list_repo_tree` produces.
-                    lfs=SimpleNamespace(sha256=oids[name], size=123),
                 )
                 for name in (*_SHARDS, _INDEX)
             ]
