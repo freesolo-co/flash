@@ -241,7 +241,7 @@ def test_deploy_decides_from_the_secret_lookup_and_bakes_the_decision(monkeypatc
         _assert_on_demand(module)
         return
     assert module._reserved_env == {"FLASH_RESERVED_H100_ACTIVE": "1"}
-    assert len(module.RESERVED_ENGINES) == 8
+    assert len(module.RESERVED_ENGINES) == 12
     assert _reserved_secret_refs(module) == {reserved.SECRET_NAME}
     assert len(_watchdog_schedules(module)) == 1
 
@@ -266,7 +266,7 @@ def test_control_app_bakes_the_same_reserved_decision(monkeypatch):
 
 
 @pytest.mark.parametrize("environment", ["main", "", "dev"])
-def test_main_serves_9b_base_only_from_eight_reserved_slots(monkeypatch, environment):
+def test_main_serves_9b_base_only_from_twelve_reserved_slots(monkeypatch, environment):
     _clear_deployment_environment(monkeypatch)
     module = _import_modal_app(monkeypatch, is_local=False, environment=environment)
     base = "Qwen/Qwen3.5-9B-Base"
@@ -276,9 +276,9 @@ def test_main_serves_9b_base_only_from_eight_reserved_slots(monkeypatch, environ
         assert base in module.MODAL_FALLBACK_BY_MODEL
         return
     engines = module.RESERVED_ENGINES
-    assert [cls.reserved_slot for cls in engines] == list(range(1, 9))
+    assert [cls.reserved_slot for cls in engines] == list(range(1, 13))
     assert [cls.__name__ for cls in engines] == [
-        module.model_engine_name(base) + f"_ReservedH100{slot}" for slot in range(1, 9)
+        module.model_engine_name(base) + f"_ReservedH100{slot}" for slot in range(1, 13)
     ]
     assert all(issubclass(cls, module.reserved.ReservedLambdaEngineProxy) for cls in engines)
     assert all(cls.pinned_gpu is None for cls in engines)
@@ -308,7 +308,7 @@ def test_reserved_requests_rotate_over_the_9b_base_slots(monkeypatch):
     monkeypatch.setattr(
         module,
         "RESERVED_ENGINES",
-        tuple(lambda *, base_model, slot=i + 1: (slot, base_model) for i in range(8)),
+        tuple(lambda *, base_model, slot=i + 1: (slot, base_model) for i in range(12)),
     )
     pool._reserved_health = module.reserved_watchdog.HealthView(
         SimpleNamespace(get=AsyncMock(return_value=None)), module.reserved.SLOT_MODELS
@@ -317,5 +317,20 @@ def test_reserved_requests_rotate_over_the_9b_base_slots(monkeypatch):
     async def picks(model, n):
         return [(await pool._engine_for(model))[0] for _ in range(n)]
 
-    assert asyncio.run(picks("Qwen/Qwen3.5-9B-Base", 10)) == [1, 2, 3, 4, 5, 6, 7, 8, 1, 2]
+    assert asyncio.run(picks("Qwen/Qwen3.5-9B-Base", 14)) == [
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8,
+        9,
+        10,
+        11,
+        12,
+        1,
+        2,
+    ]
     pool._provider_selection.choose.assert_not_awaited()

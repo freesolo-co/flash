@@ -1,12 +1,12 @@
 # Reserved H100 serving
 
-> **Status (2026-11-27): live, 8 x `Qwen/Qwen3.5-9B-Base` (raised from 6).** The earlier 5 x 27B + 3 x 0.8B Base fleet is retired and its secret deleted. `reserved_h100_acquire` launches and qualifies the 9B Base H100s on Lambda; reserved routing is on in main because the workers secret exists ("Switching on" below).
+> **Status (2026-11-28): 12 x `Qwen/Qwen3.5-9B-Base`; slots 1–8 live, 9–12 being acquired (raised from 8).** The earlier 5 x 27B + 3 x 0.8B Base fleet is retired and its secret deleted. `reserved_h100_acquire` launches and qualifies the 9B Base H100s on Lambda; reserved routing is on in main because the workers secret exists ("Switching on" below).
 
 ## Fleet
 
 | Slots | Model | Engine |
 |---|---|---|
-| 1–8 | `Qwen/Qwen3.5-9B-Base` | BF16, one H100 80 GB each |
+| 1–12 | `Qwen/Qwen3.5-9B-Base` | BF16, one H100 80 GB each |
 
 - Every other hosted model, including `Qwen/Qwen3.8-27B` and `Qwen/Qwen3.5-0.8B-Base`, runs on the on-demand Lambda pool with Modal fallback.
 - **Reserved serving is switched on by the workers secret.** `reserved.active(env)` is the single switch. It is on only in main, and only when the Secret `flash-reserved-h100-workers-20261127` exists there.
@@ -22,7 +22,7 @@
 | Modal Secret (main) | `flash-reserved-h100-workers-20261127` | `FLASH_RESERVED_H100_WORKERS` (the worker list) and `LAMBDA_API_KEY` (reboots only) |
 | Modal Dict (main) | `flash-reserved-h100-acquire-20261127` | acquisition records per slot (`slot-<n>`), `workers` (qualified, secret-shaped entries), `target_slots` |
 | Modal Dict (main) | `flash-reserved-h100-health-20261127` | per-slot watchdog state and `configured_slots`, written by the watchdog |
-| Lambda instances | `flash-h100-reservation-20261127-<n>` | the eight workers; the training provider never sweeps this name prefix |
+| Lambda instances | `flash-h100-reservation-20261127-<n>` | the twelve workers; the training provider never sweeps this name prefix |
 
 **Workers secret entry**, one per slot (exactly what the acquire Dict publishes under `workers`):
 
@@ -33,18 +33,18 @@
 Every entry's `model` must be its slot's model. Otherwise the proxies and the watchdog reject the whole list, and the deploy serves nothing for 9B Base.
 
 ## Acquisition (`reserved_h100_acquire`)
-Scheduled every 120 s on the main serving app, whenever the deploy has `LAMBDA_API_KEY`. For each target slot (default all eight; set `target_slots` to `[]` in the acquire Dict to stop) that the workers secret does not hold:
+Scheduled every 120 s on the main serving app, whenever the deploy has `LAMBDA_API_KEY`. For each target slot (default all twelve; set `target_slots` to `[]` in the acquire Dict to stop) that the workers secret does not hold:
 - **Launch:** at most one per cycle, for the lowest empty slot, only on a single-H100 US Lambda shape with capacity. With no capacity it retries next cycle, indefinitely. Workers boot with the standard cloud-init from `bootstrap.user_data` at the deploy's `FREESOLO_DEPLOYMENT_SHA`, mounting the region's hosting-cache filesystem. The record (with the TLS pin and token, never the private key) is written before the launch request.
 - **Reconcile:** records are matched to instances by name. An ambiguous launch is not resubmitted for 30 minutes. An instance with no record is never adopted. A record whose instance disappeared is dropped and the slot reacquired.
 - **Qualify and publish:** an active worker must report `ok`, 9B Base, the record's revision and `configured_gpu == "H100"`, then answer a one-token canary. Its entry is then published under `workers`.
 - Publishing does not route anything. Nothing here terminates an instance or touches slots the secret holds.
 
 ## Switching on (operator)
-1. Wait until the deploy logs show `reserved H100 acquire: {... 'published': [1, 2, 3, 4, 5, 6, 7, 8]}`, or read `workers` from the acquire Dict and check it has eight entries.
+1. Wait until the deploy logs show `reserved H100 acquire: {... 'published': [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]}`, or read `workers` from the acquire Dict and check it has twelve entries.
 2. Create the Secret `flash-reserved-h100-workers-20261127` in main with `FLASH_RESERVED_H100_WORKERS` = that `workers` list as JSON, and `LAMBDA_API_KEY`.
 3. Re-run the "Deploy serving Modal app" workflow on main (control app, then serving).
    - Check the deploy log for `reserved H100 serving ON in main`.
-   - Check the logs for `reserved H100 slot <n>: ok` for all eight.
+   - Check the logs for `reserved H100 slot <n>: ok` for all twelve.
    - Smoke-test a 9B Base chat and a 9B Base LoRA chat.
 4. The on-demand 9B Base lease workers drain and are reaped by the fleet controller.
 
@@ -55,7 +55,7 @@ The watchdog, `reserved_h100_watchdog`, is scheduled every 120 s on the serving 
 - **Routing:** requests round-robin over the healthy, configured slots, and fail open if all are quarantined.
 
 ## Ownership (ongoing)
-- **Billing:** the instances are plain on-demand Lambda VMs. They run, and bill, until an operator terminates them, so treat them as a fixed monthly cost (8 x H100).
+- **Billing:** the instances are plain on-demand Lambda VMs. They run, and bill, until an operator terminates them, so treat them as a fixed monthly cost (12 x H100).
 - **Lost or replaced instance:** remove the slot's entry from the workers secret and redeploy (9B Base keeps serving on the other slots). Acquisition then reacquires the slot. Copy its newly published entry back into the secret and redeploy again.
 - **New release:** a proxy refuses a worker whose reported `deployment_sha` differs from its entry's `revision`. Before deploying a release that changes the worker protocol, re-bootstrap each worker: edit `/opt/flash/worker.env` (`FREESOLO_DEPLOYMENT_SHA`) and `/opt/flash/setup.sh` (revision and `RUNTIME_IMAGE`), then `sudo docker rm -f flash-worker && sudo rm -rf /opt/flash-source/* && sudo bash /opt/flash/setup.sh`. Then update each entry's `revision` in the secret. SSH as `ubuntu@<ip>` with key `freesolo-serving`.
 

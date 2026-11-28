@@ -1,4 +1,4 @@
-"""Reserved H100 fleet: 8 x Qwen3.5-9B-Base; every other model uses the on-demand pool."""
+"""Reserved H100 fleet: 12 x Qwen3.5-9B-Base; every other model uses the on-demand pool."""
 
 import asyncio
 import json
@@ -47,13 +47,13 @@ class MemoryStore(dict):
         self[key] = value
 
 
-def test_slot_layout_is_eight_9b_base_slots():
-    assert reserved.SLOT_COUNT == 8
-    assert reserved.slots_for(BASE) == (1, 2, 3, 4, 5, 6, 7, 8)
+def test_slot_layout_is_twelve_9b_base_slots():
+    assert reserved.SLOT_COUNT == 12
+    assert reserved.slots_for(BASE) == (1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12)
     assert reserved.slots_for(LARGE) == reserved.slots_for(DRAFTER) == ()
     assert reserved.MODELS == (BASE,)
     with pytest.raises(ValueError, match="not declared"):
-        reserved.model_for(9)
+        reserved.model_for(13)
 
 
 @pytest.mark.parametrize("environment", ["main", "", None])
@@ -69,12 +69,12 @@ def test_the_reserved_model_places_on_a_single_h100_on_lambda():
 
 
 def test_parse_workers_requires_each_entry_to_name_its_slot_model():
-    raw = json.dumps([worker(s) for s in range(1, 9)])
-    assert [w["slot"] for w in reserved.parse_workers(raw)] == list(range(1, 9))
+    raw = json.dumps([worker(s) for s in range(1, 13)])
+    assert [w["slot"] for w in reserved.parse_workers(raw)] == list(range(1, 13))
     for bad in (
         [worker(1, model=LARGE)],  # an entry for another model
         [{k: v for k, v in worker(6).items() if k != "model"}],  # model omitted
-        [{**worker(1), "slot": 9}],  # undeclared slot
+        [{**worker(1), "slot": 13}],  # undeclared slot
         [worker(1), {**worker(2), "instance_id": "i1"}],  # duplicate instance
         [worker(1), worker(1)],  # duplicate slot
         [],
@@ -88,7 +88,7 @@ def proxy_for(slot, base_model, reported, monkeypatch):
 
     transport = MagicMock(call=AsyncMock(return_value=reported), aclose=AsyncMock())
     monkeypatch.setattr(module, "WorkerTransport", lambda ip, tls: transport)
-    monkeypatch.setenv(reserved.WORKERS_ENV, json.dumps([worker(s) for s in range(1, 9)]))
+    monkeypatch.setenv(reserved.WORKERS_ENV, json.dumps([worker(s) for s in range(1, 13)]))
     proxy = reserved.ReservedLambdaEngineProxy()
     proxy.base_model, proxy.reserved_slot = base_model, slot
     return proxy, transport
@@ -140,7 +140,7 @@ def test_watchdog_probes_each_worker_with_its_slot_model():
     store = MemoryStore()
     report = asyncio.run(
         wd.run_once(
-            [worker(s) for s in range(1, 9)],
+            [worker(s) for s in range(1, 13)],
             store,
             AsyncMock(),
             reserved.model_for,
@@ -148,8 +148,8 @@ def test_watchdog_probes_each_worker_with_its_slot_model():
         )
     )
     assert all(r["healthy"] for r in report.values())
-    assert seen == dict.fromkeys(range(1, 9), (BASE, BASE))
-    assert store[wd.CONFIGURED_KEY] == list(range(1, 9))
+    assert seen == dict.fromkeys(range(1, 13), (BASE, BASE))
+    assert store[wd.CONFIGURED_KEY] == list(range(1, 13))
 
 
 def test_a_worker_serving_another_model_fails_its_probe_without_a_canary():
@@ -342,6 +342,6 @@ def test_health_body_reports_reserved_models_only_while_reserved_is_on(monkeypat
     fallback = set(body["fallback_provider_by_model"])
     assert (BASE in fallback) is (not on)
     assert {LARGE, DRAFTER} <= fallback
-    assert body["capacity_by_model"][BASE]["min"] == (8 if on else 0)
+    assert body["capacity_by_model"][BASE]["min"] == (12 if on else 0)
     assert body["capacity_by_model"][LARGE]["min"] == 0
     assert (body["gpu_by_model"][BASE] == "H100") is on

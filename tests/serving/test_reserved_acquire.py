@@ -1,4 +1,4 @@
-"""Unattended acquisition of the eight reserved 9B Base H100s."""
+"""Unattended acquisition of the twelve reserved 9B Base H100s."""
 
 import json
 
