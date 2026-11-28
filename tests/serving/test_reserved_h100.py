@@ -231,8 +231,11 @@ def test_affinity_moves_only_the_checkpoints_of_an_unhealthy_slot():
     assert wd.home_slots(k, slots, order[3:]) == order[3:6]
 
 
+FLEET = tuple(reserved.SLOT_MODELS)  # every declared reserved slot
+
+
 def test_next_slot_keeps_a_checkpoint_on_its_home_slots(monkeypatch):
-    store = MemoryStore({wd.CONFIGURED_KEY: list(range(1, 9))})
+    store = MemoryStore({wd.CONFIGURED_KEY: list(FLEET)})
     view = wd.HealthView(store, reserved.SLOT_MODELS)
 
     async def picks(record, n):
@@ -242,20 +245,20 @@ def test_next_slot_keeps_a_checkpoint_on_its_home_slots(monkeypatch):
     served_base = SimpleNamespace(org_id="org", model_id=BASE, serve_base_model=True)
     assert wd.affinity_key(ckpt) == "org/ckpt"
     assert wd.affinity_key(served_base) is wd.affinity_key(None) is None
-    home = set(wd.home_slots("org/ckpt", tuple(range(1, 9)), range(1, 9)))
+    home = set(wd.home_slots("org/ckpt", FLEET, FLEET))
     assert set(asyncio.run(picks(ckpt, 24))) == home
     assert set(asyncio.run(view.home(BASE, ckpt))) == home
-    assert set(asyncio.run(picks(served_base, 16))) == set(range(1, 9))
-    assert asyncio.run(view.home(BASE, None)) == list(range(1, 9))
+    assert set(asyncio.run(picks(served_base, 2 * len(FLEET)))) == set(FLEET)
+    assert asyncio.run(view.home(BASE, None)) == list(FLEET)
     monkeypatch.setattr(wd, "AFFINITY_SLOTS", 0)  # off: back to plain round-robin
-    assert set(asyncio.run(picks(ckpt, 16))) == set(range(1, 9))
-    assert asyncio.run(view.home(BASE, ckpt)) == list(range(1, 9))
+    assert set(asyncio.run(picks(ckpt, 2 * len(FLEET)))) == set(FLEET)
+    assert asyncio.run(view.home(BASE, ckpt)) == list(FLEET)
 
 
 def test_interleaved_checkpoints_each_rotate_over_all_their_homes(monkeypatch):
     """Review repro: three checkpoints in a repeating order must not each stick to one home
     slot, as a rotation counter shared across checkpoints made them do."""
-    store = MemoryStore({wd.CONFIGURED_KEY: list(range(1, 9))})
+    store = MemoryStore({wd.CONFIGURED_KEY: list(FLEET)})
     view = wd.HealthView(store, reserved.SLOT_MODELS)
     records = [
         SimpleNamespace(org_id="org", model_id=f"checkpoint-{i}", serve_base_model=False)
@@ -271,7 +274,7 @@ def test_interleaved_checkpoints_each_rotate_over_all_their_homes(monkeypatch):
 
     picks = asyncio.run(rounds(6))
     for r in records:
-        home = wd.home_slots(f"org/{r.model_id}", tuple(range(1, 9)), range(1, 9))
+        home = wd.home_slots(f"org/{r.model_id}", FLEET, FLEET)
         assert picks[r.model_id] == home * 2  # every home, in order, twice
 
     # The remembered positions stay bounded on a long-lived router.
