@@ -22,11 +22,15 @@ the next healthy slots in the same hash order serve it (they load the adapter on
 A quarantined slot only moves its own checkpoints. Base-model requests have no key and spread
 round-robin over every healthy slot.
 
+Preferred models (27B) never fail open: their requests and registrations go to a slot only
+while it is configured and its last probe passed, and otherwise to the model's on-demand pool.
+
 The watchdog also publishes the configured slots (the workers secret); the router never
 routes to a declared slot outside them.
 """
 
 import asyncio
+import contextlib
 import hashlib
 import itertools
 import os
@@ -267,6 +271,38 @@ async def each_slot(engines, model, slots, label, call):
         raise failures[0][1]
 
 
+async def register_preferred(view, engines, model, record, call):
+    """Register on a preferred model's healthy home slots; False sends it to the on-demand
+    pool (not a preferred model, no healthy slot, or every home slot failed)."""
+    from .reserved import PREFERRED_MODELS
+
+    if view is None or model not in PREFERRED_MODELS:
+        return False
+    slots = await view.preferred_home(model, record)
+    if not slots:
+        return False
+    try:
+        await each_slot(engines, model, slots, "register", call)
+    except Exception as exc:  # the on-demand pool still serves the adapter
+        print(f"reserved {model} register failed; using the on-demand pool: {exc!r}", flush=True)
+        return False
+    return True
+
+
+async def unregister_preferred(view, engines, model, call):
+    """Best-effort eviction from every configured slot of a preferred model; the on-demand
+    unregister that follows decides the outcome. A no-op for any other model."""
+    from .reserved import PREFERRED_MODELS
+
+    if view is None or model not in PREFERRED_MODELS:
+        return
+    slots = await view.configured(model)
+    if not slots:
+        return
+    with contextlib.suppress(Exception):  # each_slot already logged every slot's failure
+        await each_slot(engines, model, slots, "unregister", call)
+
+
 def register_watchdog(app, image, module_name):
     """Schedule the watchdog on the serving app (main only, alongside the reserved proxies)."""
     import sys
@@ -394,10 +430,23 @@ class HealthView:
             return usable
         return home_slots(key, self.slots_for(model), usable)
 
+    async def route(self, model, record=None):
+        """The reserved slot for a request; None sends it to the model's on-demand pool."""
+        from . import reserved
+
+        if model in reserved.MODELS:
+            return await self.next_slot(model, record)
+        if model in reserved.PREFERRED_MODELS:
+            return await self.preferred_slot(model, record)
+        return None
+
     async def next_slot(self, model, record=None):
         """Round-robin over the routable slots serving ``model``; for a checkpoint ``record``,
         round-robin over that checkpoint's healthy home slots only."""
-        usable = set(await self.usable(model))
+        return self._pick(model, record, await self.usable(model))
+
+    def _pick(self, model, record, usable):
+        usable = set(usable)
         key = affinity_key(record)
         if key is not None and AFFINITY_SLOTS > 0:
             home = home_slots(key, self.slots_for(model), usable)
@@ -413,6 +462,38 @@ class HealthView:
             slot = next(cycle)
             if slot in usable:
                 return slot
+
+    async def configured(self, model):
+        """``model``'s slots in the watchdog's published list; [] before it is known."""
+        await self.usable(model)  # refreshes the cached view
+        configured = self._configured if self._loaded else None
+        if not isinstance(configured, list):
+            return []
+        return [s for s in self.slots_for(model) if s in configured]
+
+    async def healthy(self, model):
+        """Configured slots whose last probe passed. Never fails open: [] means a preferred
+        model uses its on-demand pool."""
+        return [
+            s
+            for s in await self.configured(model)
+            if (state := self._states.get(s)) is not None
+            and SlotState.load(state).healthy
+            and SlotState.load(state).failures == 0
+        ]
+
+    async def preferred_slot(self, model, record=None):
+        """A healthy slot for a preferred model's request, or None for its on-demand pool."""
+        usable = await self.healthy(model)
+        return self._pick(model, record, usable) if usable else None
+
+    async def preferred_home(self, model, record=None):
+        """The healthy slots that should hold ``record``'s adapter; [] for the on-demand pool."""
+        usable = await self.healthy(model)
+        key = affinity_key(record)
+        if not usable or key is None or AFFINITY_SLOTS <= 0:
+            return usable
+        return home_slots(key, self.slots_for(model), usable)
 
     async def usable(self, model):
         slots = self.slots_for(model)

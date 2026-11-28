@@ -1,10 +1,11 @@
-"""Acquire and qualify reserved 9B Base H100s for the slots the workers secret lacks.
+"""Acquire and qualify reserved H100s for the slots the workers secret lacks.
 
 Scheduled on the main serving app. Every period, for each target slot that the workers secret
 does not hold:
 
 - reconcile its record with the Lambda instance named after the slot;
-- qualify an active instance (identity: model, deploy revision, H100, then a one-token canary)
+- qualify an active instance (identity: the slot's model, deploy revision, H100, then a one-token
+  canary)
   and publish its secret-shaped entry under ``WORKERS_KEY`` in ``DICT_NAME``;
 - launch at most one new worker per cycle, for the lowest empty slot, when Lambda reports
   single-H100 US capacity. Without capacity it simply retries next period, indefinitely.
@@ -14,7 +15,11 @@ secret and redeploys (docs/reserved-h100-serving.md), which is what switches res
 on, so 9B Base keeps its on-demand pool until every acquired worker has qualified.
 
 Nothing here terminates an instance or touches the secret's slots. Set ``TARGET_KEY`` to ``[]``
-in the Dict to stop acquiring.
+in the Dict to stop acquiring. Without ``TARGET_KEY`` only the 9B Base slots are acquired; the
+27B slots (``reserved.LARGE_SLOTS``) are bought only once an operator lists them there.
+
+Each model's instances carry their own name prefix and tags (``CAMPAIGNS``), and every record
+names its model, so a slot renumbered to another model never adopts the old model's instance.
 """
 
 import asyncio
@@ -28,10 +33,14 @@ WORKERS_KEY = "workers"  # qualified entries, same shape as the workers secret
 REJECTED_KEY = "rejected_placements"
 PERIOD_SECONDS = 120
 CAMPAIGN = "flash-h100-reservation-20261127"
-TAGS = [
-    {"key": "reservation-campaign", "value": CAMPAIGN},
-    {"key": "purpose", "value": "flash-9b-base-serving"},
-]
+LARGE_CAMPAIGN = "flash-27b-reservation-20261128"
+# model -> (instance name prefix, purpose tag)
+CAMPAIGNS = {
+    reserved.MODEL: (CAMPAIGN, "flash-9b-base-serving"),
+    reserved.LARGE_MODEL: (LARGE_CAMPAIGN, "flash-27b-serving"),
+}
+# Acquired when TARGET_KEY is absent: never the 27B slots, which are opt-in.
+DEFAULT_TARGETS = reserved.slots_for(reserved.MODEL)
 # An ambiguous launch is never resubmitted before this; its instance may still appear.
 AMBIGUOUS_LAUNCH_SECONDS = 30 * 60
 REJECTION_COOLDOWN_SECONDS = 10 * 60
@@ -44,20 +53,29 @@ def slot_key(slot):
 
 def instance_name(slot):
     """Never ends in ``-a<digits>``, so the training provider's sweep never matches it."""
-    return f"{CAMPAIGN}-{slot}"
+    return f"{CAMPAIGNS[reserved.model_for(slot)][0]}-{slot}"
+
+
+def tags(slot):
+    campaign, purpose = CAMPAIGNS[reserved.model_for(slot)]
+    return [
+        {"key": "reservation-campaign", "value": campaign},
+        {"key": "purpose", "value": purpose},
+    ]
 
 
 async def _qualify(slot, record, transport_factory, now):
     """The worker's secret entry if it passes identity and canary, else None."""
     from .reserved_watchdog import OK, probe_status
 
+    model = reserved.model_for(slot)
     try:
         transport = transport_factory(record["ip"], record["tls"])
         try:
             async with asyncio.timeout(20):
                 health = await transport.call("/health")
-            if reserved.identity_ok(health, record["revision"], reserved.MODEL):
-                status, error = await probe_status(transport, reserved.MODEL)
+            if reserved.identity_ok(health, record["revision"], model):
+                status, error = await probe_status(transport, model)
             else:
                 status, error = "failed", "identity not ready"
         finally:
@@ -68,7 +86,7 @@ async def _qualify(slot, record, transport_factory, now):
         record.update(state="serving", last_error="")
         return {
             "slot": slot,
-            "model": reserved.MODEL,
+            "model": model,
             **{k: record[k] for k in ("instance_id", "ip", "revision", "tls")},
         }
     record.update(state="qualifying", last_error=error)
@@ -83,11 +101,12 @@ async def _launch(store, api, slot, revision, credentials, now):
     from .config import SSH_KEY_NAME, NoCapacityError, select_region
     from .resources import cache_filesystem, firewall
 
+    model = reserved.model_for(slot)
     rejected = {k: t for k, t in (await store.get(REJECTED_KEY) or {}).items() if t > now}
     try:
         kind, region = select_region(
             await api.call("GET", "instance-types"),
-            reserved.MODEL,
+            model,
             excluded={tuple(k.split("/")) for k in rejected},
         )
     except NoCapacityError:
@@ -98,6 +117,7 @@ async def _launch(store, api, slot, revision, credentials, now):
     # The private key goes only into cloud-init; routing needs the pin and token.
     record = {
         "state": "submitted",
+        "model": model,
         "submitted_at": now,
         "instance_id": None,
         "revision": revision,
@@ -116,8 +136,8 @@ async def _launch(store, api, slot, revision, credentials, now):
         ],
         "name": instance_name(slot),
         "image": {"family": "gpu-base-24-04"},
-        "user_data": user_data(reserved.MODEL, revision, credentials, tls),
-        "tags": TAGS,
+        "user_data": user_data(model, revision, credentials, tls),
+        "tags": tags(slot),
     }
     await store.put(slot_key(slot), record)  # durable before the launch request
     try:
@@ -145,10 +165,15 @@ async def run_once(
     targets = await store.get(TARGET_KEY)
     targets = [
         s
-        for s in (list(reserved.SLOT_MODELS) if targets is None else targets)
+        for s in (DEFAULT_TARGETS if targets is None else targets)
         if s in reserved.SLOT_MODELS and s not in secret_slots
     ]
     records = {s: await store.get(slot_key(s)) for s in targets}
+    for s, record in records.items():
+        # A record from before its slot served this model (unnamed ones predate 27B: 9B Base).
+        if record is not None and record.get("model", reserved.MODEL) != reserved.model_for(s):
+            await store.pop(slot_key(s))
+            records[s] = None
     published = await store.get(WORKERS_KEY) or []
     serving = {w["slot"]: w["instance_id"] for w in published}
     live = {}
@@ -186,14 +211,18 @@ async def run_once(
         *(_qualify(s, records[s], transport_factory, now) for s in qualifying)
     )
     # A target slot stays published only while it matches its record. Unpublishing is written
-    # before any record is forgotten.
+    # before any record is forgotten. An entry naming another model than its slot's (a slot
+    # renumbered to another model) is dropped: the workers secret would reject it whole.
     workers = [
         w
         for w in published
-        if w["slot"] not in records
-        or (
-            w["slot"] not in gone
-            and (records[w["slot"]] or {}).get("instance_id") == w["instance_id"]
+        if reserved.SLOT_MODELS.get(w["slot"]) == w.get("model")
+        and (
+            w["slot"] not in records
+            or (
+                w["slot"] not in gone
+                and (records[w["slot"]] or {}).get("instance_id") == w["instance_id"]
+            )
         )
     ]
     workers += [w for w in qualified if w]

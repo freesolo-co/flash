@@ -526,7 +526,8 @@ def _configured_engine(model, provider, suffix=""):
     )
 
 
-# In main, once its workers secret exists, 9B Base is served only by reserved H100 slots.
+# In main, once its workers secret exists, 9B Base is served only by reserved H100 slots; 27B
+# prefers its slots and keeps these on-demand engines for whenever none is healthy.
 ENGINE_BY_MODEL: dict[str, Any] = {
     bm: _configured_engine(bm, "lambda")
     for bm in base_models()
@@ -586,9 +587,9 @@ class _ModalEnginePool:
         slots = await self._reserved_health.home(model, record)  # record: its home slots only
         await reserved_watchdog.each_slot(RESERVED_ENGINES, model, slots, label, call)
 
-    async def _engine_for(self, model, record=None):
-        if _reserved(model):
-            slot = await self._reserved_health.next_slot(model, record)
+    async def _engine_for(self, model, record=None, *, slots=True):
+        health = self._reserved_health if slots else None  # slots=False: the on-demand pool
+        if health and (slot := await health.route(model, record)):
             return RESERVED_ENGINES[slot - 1](base_model=model)
         if (
             model in MODAL_FALLBACK_BY_MODEL
@@ -684,21 +685,18 @@ class _ModalEnginePool:
                 await close()
 
     async def register(self, base_model: str, record: Any) -> None:
+        payload = self._record_payload(record)
+        generation = getattr(record, "deployment_generation", None)
+
+        def call(engine):
+            return engine.register.remote.aio(payload, generation)
+
         if _reserved(base_model):
-            payload = self._record_payload(record)
-            generation = getattr(record, "deployment_generation", None)
-            await self._each_reserved(
-                base_model,
-                "register",
-                lambda engine: engine.register.remote.aio(payload, generation),
-                record=record,
-            )
-            return
-        engine = await self._engine_for(base_model)
-        await engine.register.remote.aio(
-            self._record_payload(record),
-            getattr(record, "deployment_generation", None),
-        )
+            await self._each_reserved(base_model, "register", call, record=record)
+        elif not await reserved_watchdog.register_preferred(  # preferred: healthy home slots
+            self._reserved_health, RESERVED_ENGINES, base_model, record, call
+        ):
+            await call(await self._engine_for(base_model, slots=False))
 
     async def unregister(
         self,
@@ -707,13 +705,15 @@ class _ModalEnginePool:
         model_id: str,
         expected_generation: str | None = None,
     ) -> None:
+        def evict(engine):
+            return engine.unregister.remote.aio(org_id, model_id, expected_generation)
+
         if _reserved(base_model):
-            await self._each_reserved(
-                base_model,
-                "unregister",
-                lambda engine: engine.unregister.remote.aio(org_id, model_id, expected_generation),
-            )
+            await self._each_reserved(base_model, "unregister", evict)
             return
+        await reserved_watchdog.unregister_preferred(  # a preferred model's slot copies too
+            self._reserved_health, RESERVED_ENGINES, base_model, evict
+        )
         if base_model in MODAL_FALLBACK_BY_MODEL:
             from flash.serving.app.provider_selection import unregister_active
 
@@ -724,7 +724,7 @@ class _ModalEnginePool:
             await unregister_active(engines, org_id, model_id, expected_generation)
         else:
             engine = await self._engine_for(base_model)
-            await engine.unregister.remote.aio(org_id, model_id, expected_generation)
+            await evict(engine)
 
 
 def _build_usage_outbox(settings: Any) -> Any:
