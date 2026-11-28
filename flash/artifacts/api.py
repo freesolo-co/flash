@@ -32,7 +32,6 @@ class ArtifactFile:
     size: int
     blob_id: str
     modified: float
-    lfs: object = None
 
     @property
     def last_commit(self):

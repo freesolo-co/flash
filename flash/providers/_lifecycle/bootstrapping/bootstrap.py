@@ -613,10 +613,6 @@ def fetch_code(payload: dict) -> None:
         descriptor,
         _code_dir(payload),
     )
-    if os.path.exists(os.path.join(_code_dir(payload), "flash/engine/worker/io/hf.py")):
-        raise RuntimeError(
-            "source snapshot predates Azure artifact storage; start a new run from a migrated checkpoint"
-        )
 
 
 def _start_console_pump(proc, cf, payload):
