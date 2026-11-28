@@ -14,12 +14,22 @@ the Lambda API (same instance, IP, certificate and token; Docker restarts the wo
 readmitted after it passes a probe again. Routing picks among the healthy slots of the
 requested model and fails open within that model's slots if all are quarantined.
 
+Adapter affinity: each checkpoint has a stable set of AFFINITY_SLOTS home slots (rendezvous
+hashing of the checkpoint key against the slot numbers). Its registration and requests go only
+to the healthy home slots, so each engine keeps a small set of adapters loaded instead of
+swapping every deployed adapter through its 16 GPU/CPU LoRA slots. If no home slot is healthy,
+the next healthy slots in the same hash order serve it (they load the adapter on first use).
+A quarantined slot only moves its own checkpoints. Base-model requests have no key and spread
+round-robin over every healthy slot.
+
 The watchdog also publishes the configured slots (the workers secret); the router never
 routes to a declared slot outside them.
 """
 
 import asyncio
+import hashlib
 import itertools
+import os
 import time
 import uuid
 from dataclasses import asdict, dataclass
@@ -36,6 +46,36 @@ RESTART_AFTER_UNHEALTHY_SECONDS = 10 * 60
 RESTART_COOLDOWN_SECONDS = 30 * 60
 ROUTER_CACHE_SECONDS = 15
 ROUTER_REFRESH_TIMEOUT_SECONDS = 1.0
+# Home slots per checkpoint. 0 disables affinity (every request round-robins over all slots).
+AFFINITY_SLOTS = int(os.environ.get("FLASH_RESERVED_AFFINITY_SLOTS", "3"))
+
+
+def affinity_key(record):
+    """A checkpoint adapter's affinity key; None for base-model serving (no adapter)."""
+    if record is None or getattr(record, "serve_base_model", False):
+        return None
+    org_id, model_id = getattr(record, "org_id", None), getattr(record, "model_id", None)
+    return f"{org_id}/{model_id}" if org_id and model_id else None
+
+
+def affinity_order(key, slots):
+    """``slots`` in rendezvous-hash order for ``key``: stable per key, and removing one slot only
+    moves the keys that ranked it first."""
+    return sorted(
+        slots,
+        key=lambda slot: hashlib.sha256(f"{key}\0{slot}".encode()).digest(),
+        reverse=True,
+    )
+
+
+def home_slots(key, slots, usable, count=None):
+    """The healthy home slots for ``key``: the first ``count`` of its hash order that are usable,
+    else the next usable slots in that order. Never empty while ``usable`` is not."""
+    count = AFFINITY_SLOTS if count is None else count
+    order = affinity_order(key, slots)
+    usable = set(usable)
+    home = [slot for slot in order[:count] if slot in usable]
+    return home or [slot for slot in order if slot in usable][:count]
 
 
 @dataclass
@@ -328,6 +368,7 @@ class HealthView:
         self._states = {}
         self._configured = None
         self._cycles = {}
+        self._spread = itertools.count()
         self._loaded = False
         self._refresh = None
 
@@ -341,9 +382,23 @@ class HealthView:
     def slots_for(self, model):
         return tuple(s for s in self._slots if self._slot_models[s] == model)
 
-    async def next_slot(self, model):
-        """Round-robin over the routable slots serving ``model``."""
+    async def home(self, model, record=None):
+        """Slots that should hold ``record``'s checkpoint adapter; every usable slot for no
+        record, a base-model record, or with affinity off."""
+        usable = await self.usable(model)
+        key = affinity_key(record)
+        if key is None or AFFINITY_SLOTS <= 0:
+            return usable
+        return home_slots(key, self.slots_for(model), usable)
+
+    async def next_slot(self, model, record=None):
+        """Round-robin over the routable slots serving ``model``; for a checkpoint ``record``,
+        round-robin over that checkpoint's healthy home slots only."""
         usable = set(await self.usable(model))
+        key = affinity_key(record)
+        if key is not None and AFFINITY_SLOTS > 0:
+            home = home_slots(key, self.slots_for(model), usable)
+            return home[next(self._spread) % len(home)]
         cycle = self._cycles.setdefault(model, itertools.cycle(self.slots_for(model)))
         while True:
             slot = next(cycle)

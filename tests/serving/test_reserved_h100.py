@@ -202,6 +202,56 @@ def test_routing_uses_only_healthy_configured_slots():
         asyncio.run(view.usable(LARGE))
 
 
+def test_affinity_gives_each_checkpoint_three_stable_home_slots():
+    slots = tuple(range(1, 9))
+    keys = [f"org/flash-{i}/step-10" for i in range(400)]
+    homes = {k: wd.home_slots(k, slots, slots) for k in keys}
+    assert all(len(h) == 3 and set(h) <= set(slots) for h in homes.values())
+    assert homes == {k: wd.home_slots(k, slots, slots) for k in keys}  # deterministic
+    # spread: every slot is home to a fair share (3/8 of keys, within sampling noise)
+    load = {s: sum(s in h for h in homes.values()) for s in slots}
+    assert all(100 <= n <= 200 for n in load.values()), load
+
+
+def test_affinity_moves_only_the_checkpoints_of_an_unhealthy_slot():
+    slots = tuple(range(1, 9))
+    keys = [f"org/flash-{i}/step-10" for i in range(400)]
+    usable = [s for s in slots if s != 4]
+    for k in keys:
+        before = wd.home_slots(k, slots, slots)
+        after = wd.home_slots(k, slots, usable)
+        if 4 in before:
+            assert set(before) - {4} <= set(after)
+            assert 4 not in after
+        else:
+            assert after == before
+    # with every home slot down, the next healthy slots in hash order take over
+    k = keys[0]
+    order = wd.affinity_order(k, slots)
+    assert wd.home_slots(k, slots, order[3:]) == order[3:6]
+
+
+def test_next_slot_keeps_a_checkpoint_on_its_home_slots(monkeypatch):
+    store = MemoryStore({wd.CONFIGURED_KEY: list(range(1, 9))})
+    view = wd.HealthView(store, reserved.SLOT_MODELS)
+
+    async def picks(record, n):
+        return [await view.next_slot(BASE, record) for _ in range(n)]
+
+    ckpt = SimpleNamespace(org_id="org", model_id="ckpt", serve_base_model=False)
+    served_base = SimpleNamespace(org_id="org", model_id=BASE, serve_base_model=True)
+    assert wd.affinity_key(ckpt) == "org/ckpt"
+    assert wd.affinity_key(served_base) is wd.affinity_key(None) is None
+    home = set(wd.home_slots("org/ckpt", tuple(range(1, 9)), range(1, 9)))
+    assert set(asyncio.run(picks(ckpt, 24))) == home
+    assert set(asyncio.run(view.home(BASE, ckpt))) == home
+    assert set(asyncio.run(picks(served_base, 16))) == set(range(1, 9))
+    assert asyncio.run(view.home(BASE, None)) == list(range(1, 9))
+    monkeypatch.setattr(wd, "AFFINITY_SLOTS", 0)  # off: back to plain round-robin
+    assert set(asyncio.run(picks(ckpt, 16))) == set(range(1, 9))
+    assert asyncio.run(view.home(BASE, ckpt)) == list(range(1, 9))
+
+
 def test_routing_fails_open_when_every_slot_is_quarantined():
     down = wd.SlotState(healthy=False).dump()
     store = MemoryStore({wd.CONFIGURED_KEY: [1, 2, 3], 1: down, 2: down, 3: down})
