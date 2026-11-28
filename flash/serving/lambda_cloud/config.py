@@ -14,13 +14,14 @@ PORT = 8443
 HEARTBEAT_SECONDS = 30
 # An orphan cannot be reaped before the full startup + request budget expires.
 LEASE_SECONDS = 45 * 60 + 15 * 60 + 300
-# Published by publish-serving-image.yml from main d1397691; its /app/uv.lock is byte-identical
-# to the repository lock since #1766 (uv lock revision 3, dnspython 2.9.2, opentelemetry 1.45.2).
+# Published by publish-serving-image.yml from main 76636c4e; its /app/uv.lock matches the
+# repository lock since the 2026-11-24 python-deps update (1e102c04), which the previous pin
+# (from d1397691) predated, so every Lambda boot failed the lock check below.
 # Workers verify that lock against their source revision at boot, so re-pin whenever uv.lock
 # changes: take the digest the workflow reports for a commit with the new lock.
 RUNTIME_IMAGE = (
     "ghcr.io/freesolo-co/freesolo-flash-serve@"
-    "sha256:1b4bd9229621eaa0aeef8415608a2683c6eed5cf6703050973e65239fea2bc4c"
+    "sha256:a3031fdbf8acf7aef83e2ccce0d0e40c7266b79e452badc6761ac05ee953802c"
 )
 
 
