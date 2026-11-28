@@ -53,10 +53,11 @@ ITEM_BACKOFF_SECONDS = 5
 ITEM_MAX_BACKOFF_SECONDS = 60
 # Generations in flight across every batch on this plane.
 MAX_INFLIGHT_ENV = "FLASH_SCORE_BATCH_MAX_INFLIGHT"
-# 12 reserved 9B-Base H100s (reserved.SLOT_COUNT) x 48 sequences, under each engine's 64-sequence
+# 10 reserved 9B-Base H100s (reserved.SLOT_COUNT) x 48 sequences, under each engine's 64-sequence
 # limit; a test keeps it in step with the fleet. At 32 per worker the 8-H100 fleet already logged
-# engine timeouts under 16k-token generations, so do not raise the per-worker share.
-DEFAULT_MAX_INFLIGHT = 576
+# engine timeouts under 16k-token generations, so do not raise the per-worker share. The two 27B
+# slots (8 sequences each) are left out: 27B also has its on-demand pool behind them.
+DEFAULT_MAX_INFLIGHT = 480
 # Batches this plane runs at once; the rest wait queued. Every running batch still shares the
 # MAX_INFLIGHT generation budget above, so raising this lets small batches start without adding
 # GPU load. Each running batch holds up to its `concurrency` mostly idle threads.

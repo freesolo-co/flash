@@ -621,13 +621,13 @@ def test_active_batch_limit_defaults_to_96_and_reads_a_positive_override(
     assert score_batches._max_active() == expected
 
 
-def test_inflight_limit_defaults_to_576_and_reads_a_positive_override(monkeypatch):
+def test_inflight_limit_defaults_to_480_and_reads_a_positive_override(monkeypatch):
     monkeypatch.delenv(score_batches.MAX_INFLIGHT_ENV, raising=False)
-    assert score_batches._max_inflight() == 576
+    assert score_batches._max_inflight() == 480
     monkeypatch.setenv(score_batches.MAX_INFLIGHT_ENV, "512")
     assert score_batches._max_inflight() == 512
     monkeypatch.setenv(score_batches.MAX_INFLIGHT_ENV, "0")
-    assert score_batches._max_inflight() == 576
+    assert score_batches._max_inflight() == 480
 
 
 def test_runner_reads_its_environment_settings_once_at_start(monkeypatch):

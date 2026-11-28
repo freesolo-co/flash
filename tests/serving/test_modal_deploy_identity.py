@@ -177,8 +177,8 @@ def test_27b_and_08b_base_use_the_lease_pool_with_modal_fallback(monkeypatch, en
     for model in ("Qwen/Qwen3.8-27B", "Qwen/Qwen3.5-0.8B-Base"):
         assert issubclass(module.ENGINE_BY_MODEL[model], module.LambdaEngineProxy)
         assert model in module.MODAL_FALLBACK_BY_MODEL
-        assert model not in module.reserved.MODELS
-    # Only main declares the reserved 9B Base fleet: its secret and its watchdog.
+        assert model not in module.reserved.MODELS  # never exclusive: the pool stays deployed
+    # Only main declares the reserved fleet: its secret and its watchdog.
     main = environment != "dev"
     secret_names = {c.args[0] for c in module.modal.Secret.from_name.call_args_list if c.args}
     assert {n for n in secret_names if "h100" in n} == (
@@ -241,7 +241,7 @@ def test_deploy_decides_from_the_secret_lookup_and_bakes_the_decision(monkeypatc
         _assert_on_demand(module)
         return
     assert module._reserved_env == {"FLASH_RESERVED_H100_ACTIVE": "1"}
-    assert len(module.RESERVED_ENGINES) == 12
+    assert len(module.RESERVED_ENGINES) == 12  # 10 x 9B Base + 2 x 27B
     assert _reserved_secret_refs(module) == {reserved.SECRET_NAME}
     assert len(_watchdog_schedules(module)) == 1
 
@@ -266,7 +266,7 @@ def test_control_app_bakes_the_same_reserved_decision(monkeypatch):
 
 
 @pytest.mark.parametrize("environment", ["main", "", "dev"])
-def test_main_serves_9b_base_only_from_twelve_reserved_slots(monkeypatch, environment):
+def test_main_serves_9b_base_only_from_ten_reserved_slots(monkeypatch, environment):
     _clear_deployment_environment(monkeypatch)
     module = _import_modal_app(monkeypatch, is_local=False, environment=environment)
     base = "Qwen/Qwen3.5-9B-Base"
@@ -275,16 +275,19 @@ def test_main_serves_9b_base_only_from_twelve_reserved_slots(monkeypatch, enviro
         assert base in module.ENGINE_BY_MODEL
         assert base in module.MODAL_FALLBACK_BY_MODEL
         return
+    large = "Qwen/Qwen3.8-27B"
     engines = module.RESERVED_ENGINES
     assert [cls.reserved_slot for cls in engines] == list(range(1, 13))
     assert [cls.__name__ for cls in engines] == [
-        module.model_engine_name(base) + f"_ReservedH100{slot}" for slot in range(1, 13)
-    ]
+        module.model_engine_name(base) + f"_ReservedH100{slot}" for slot in range(1, 11)
+    ] + [module.model_engine_name(large) + f"_ReservedH100{slot}" for slot in (11, 12)]
     assert all(issubclass(cls, module.reserved.ReservedLambdaEngineProxy) for cls in engines)
     assert all(cls.pinned_gpu is None for cls in engines)
     assert base not in module.ENGINE_BY_MODEL
     assert base not in module.MODAL_FALLBACK_BY_MODEL
-    assert "Qwen/Qwen3.8-27B" in module.ENGINE_BY_MODEL
+    # 27B keeps its on-demand pool and Modal fallback behind its two slots.
+    assert large in module.ENGINE_BY_MODEL
+    assert large in module.MODAL_FALLBACK_BY_MODEL
 
 
 @pytest.mark.parametrize(("environment", "scheduled"), [("main", True), ("", True), ("dev", False)])
@@ -317,22 +320,7 @@ def test_reserved_requests_rotate_over_the_9b_base_slots(monkeypatch):
     async def picks(model, n):
         return [(await pool._engine_for(model))[0] for _ in range(n)]
 
-    assert asyncio.run(picks("Qwen/Qwen3.5-9B-Base", 14)) == [
-        1,
-        2,
-        3,
-        4,
-        5,
-        6,
-        7,
-        8,
-        9,
-        10,
-        11,
-        12,
-        1,
-        2,
-    ]
+    assert asyncio.run(picks("Qwen/Qwen3.5-9B-Base", 12)) == [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 1, 2]
     pool._provider_selection.choose.assert_not_awaited()
 
 
@@ -344,7 +332,7 @@ def test_checkpoints_route_and_register_only_on_their_home_slots(monkeypatch):
     _clear_deployment_environment(monkeypatch)
     module = _import_modal_app(monkeypatch, is_local=False, environment="main")
     calls = []
-    slots = set(module.reserved.SLOT_MODELS)
+    slots = set(module.reserved.slots_for("Qwen/Qwen3.5-9B-Base"))
 
     class Engine:
         def __init__(self, slot, base_model):
@@ -359,7 +347,8 @@ def test_checkpoints_route_and_register_only_on_their_home_slots(monkeypatch):
         module,
         "RESERVED_ENGINES",
         tuple(
-            lambda *, base_model, slot=i + 1: Engine(slot, base_model) for i in range(len(slots))
+            lambda *, base_model, slot=s: Engine(slot, base_model)
+            for s in module.reserved.SLOT_MODELS
         ),
     )
     pool = module._ModalEnginePool.__new__(module._ModalEnginePool)
@@ -387,3 +376,110 @@ def test_checkpoints_route_and_register_only_on_their_home_slots(monkeypatch):
     assert {slot for name, slot in calls if name == "register"} == home_a
     asyncio.run(pool.unregister(base, "org", "flash-1/step-10"))
     assert {slot for name, slot in calls if name == "unregister"} == slots
+
+
+def _preferred_pool(module, monkeypatch, store):
+    from types import SimpleNamespace
+
+    calls = []
+
+    class Engine:
+        def __init__(self, tag):
+            self.tag = tag
+            for name in ("register", "unregister"):
+
+                async def aio(*a, name=name):
+                    calls.append((name, tag))
+                    if tag in fail:
+                        raise RuntimeError("down")
+
+                setattr(self, name, SimpleNamespace(remote=SimpleNamespace(aio=aio)))
+            self.health = SimpleNamespace(
+                get_current_stats=SimpleNamespace(
+                    aio=AsyncMock(
+                        return_value=SimpleNamespace(
+                            num_total_runners=1, num_running_inputs=0, backlog=0
+                        )
+                    )
+                )
+            )
+
+    fail = set()
+    large = module.reserved.LARGE_MODEL
+    monkeypatch.setattr(
+        module,
+        "RESERVED_ENGINES",
+        tuple(lambda *, base_model, slot=s: Engine(slot) for s in module.reserved.SLOT_MODELS),
+    )
+    monkeypatch.setitem(module.ENGINE_BY_MODEL, large, lambda *, base_model: Engine("lambda"))
+    monkeypatch.setitem(
+        module.MODAL_FALLBACK_BY_MODEL, large, lambda *, base_model: Engine("modal")
+    )
+    pool = module._ModalEnginePool.__new__(module._ModalEnginePool)
+    pool._provider_selection = SimpleNamespace(choose=AsyncMock(return_value="lambda"))
+    pool._record_payload = lambda record: {}
+
+    async def get(key):
+        return store.get(key)
+
+    pool._reserved_health = module.reserved_watchdog.HealthView(
+        SimpleNamespace(get=get), module.reserved.SLOT_MODELS
+    )
+    return pool, calls, fail
+
+
+def test_27b_uses_its_healthy_slot_and_falls_back_to_the_on_demand_pool(monkeypatch):
+    from types import SimpleNamespace
+
+    _clear_deployment_environment(monkeypatch)
+    module = _import_modal_app(monkeypatch, is_local=False, environment="main")
+    large = module.reserved.LARGE_MODEL
+    ok, down = (module.reserved_watchdog.SlotState(healthy=h).dump() for h in (True, False))
+    store = {module.reserved_watchdog.CONFIGURED_KEY: [1, 11, 12], 11: ok, 12: down}
+    pool, calls, fail = _preferred_pool(module, monkeypatch, store)
+    ckpt = SimpleNamespace(org_id="org", model_id="flash-27b/step-5", serve_base_model=False)
+
+    async def tags(n=4):
+        return {(await pool._engine_for(large, ckpt)).tag for _ in range(n)}
+
+    assert asyncio.run(tags()) == {11}
+    pool._provider_selection.choose.assert_not_awaited()
+    asyncio.run(pool.register(large, ckpt))
+    assert calls == [("register", 11)]
+    fail.add(11)  # the slot fails the registration: the on-demand pool still gets it
+    asyncio.run(pool.register(large, ckpt))
+    assert calls[1:] == [("register", 11), ("register", "lambda")]
+    calls.clear()
+    # unregister clears every configured 27B slot, healthy or not, then both on-demand pools
+    asyncio.run(pool.unregister(large, "org", "flash-27b/step-5"))
+    assert sorted(map(str, calls)) == sorted(
+        map(str, [("unregister", t) for t in (11, 12, "lambda", "modal")])
+    )
+
+    store[11] = down  # quarantined: routing returns to the on-demand pool
+    pool._reserved_health._expires = 0
+    assert asyncio.run(tags()) == {"lambda"}
+    calls.clear()
+    asyncio.run(pool.register(large, ckpt))
+    assert calls == [("register", "lambda")]
+
+
+def test_27b_without_its_slots_in_the_secret_never_touches_a_reserved_engine(monkeypatch):
+    _clear_deployment_environment(monkeypatch)
+    module = _import_modal_app(monkeypatch, is_local=False, environment="main")
+    large = module.reserved.LARGE_MODEL
+    ok = module.reserved_watchdog.SlotState().dump()
+    # The secret holds only 9B Base workers, as it does before 27B is acquired.
+    store = {
+        module.reserved_watchdog.CONFIGURED_KEY: list(range(1, 11)),
+        **dict.fromkeys(range(1, 11), ok),
+    }
+    pool, calls, _ = _preferred_pool(module, monkeypatch, store)
+    assert asyncio.run(pool._engine_for(large)).tag == "lambda"
+    asyncio.run(pool.register(large, None))
+    asyncio.run(pool.unregister(large, "org", "m"))
+    assert all(tag in {"lambda", "modal"} for _, tag in calls)
+    # 9B Base keeps its own ten slots.
+    assert {asyncio.run(pool._engine_for(module.reserved.MODEL)).tag for _ in range(20)} == set(
+        range(1, 11)
+    )

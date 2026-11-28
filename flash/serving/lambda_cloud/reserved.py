@@ -1,17 +1,19 @@
 """Explicitly provisioned H100s: CPU proxies never launch or release their VMs.
 
-Twelve Lambda H100 workers serve ``Qwen/Qwen3.5-9B-Base`` (``SLOT_MODELS``), one engine each.
-Every other hosted model, Qwen3.8-27B and Qwen3.5-0.8B-Base included, is served by the
-on-demand Lambda pool with its Modal GPU fallback.
+Ten Lambda H100 workers serve ``Qwen/Qwen3.5-9B-Base`` and two serve ``Qwen/Qwen3.8-27B``
+(``SLOT_MODELS``), one engine each. Every other hosted model, Qwen3.5-0.8B-Base included, is
+served by the on-demand Lambda pool with its Modal GPU fallback.
 
 ``active(environment)`` is the single switch. Reserved serving is on only in ``main`` and only
 when the workers secret exists there. The deploy process decides once by looking the secret
 up, and bakes the decision into every image as ``FLASH_RESERVED_H100_ACTIVE`` so that remote
 containers (router, proxies, watchdog, fleet controller) follow the same decision.
 
-- On: the reserved model is served only by its slots, with no on-demand Lambda allocation
-  and no Modal GPU fallback.
-- Off (secret not created yet, or dev): it uses the ordinary on-demand Lambda pool and Modal
+- On: 9B Base (``MODELS``) is served only by its slots, with no on-demand Lambda allocation
+  and no Modal GPU fallback. 27B (``PREFERRED_MODELS``) goes to its slots while one is
+  configured and passed its last probe, and otherwise keeps its on-demand Lambda pool and Modal
+  fallback, which stay deployed (``preferred``).
+- Off (secret not created yet, or dev): both use the ordinary on-demand Lambda pool and Modal
   GPU fallback like every other model, and the deploy references no reserved secret.
 
 The workers secret lists exactly the configured workers. Every entry names its model, which
@@ -31,9 +33,17 @@ from .proxy import LambdaEngineProxy
 from .transport import WorkerTransport
 
 MODEL = "Qwen/Qwen3.5-9B-Base"
-SLOT_COUNT = 12
-SLOT_MODELS = dict.fromkeys(range(1, SLOT_COUNT + 1), MODEL)
-MODELS = tuple(dict.fromkeys(SLOT_MODELS.values()))
+SLOT_COUNT = 10  # 9B Base slots 1..10
+LARGE_MODEL = "Qwen/Qwen3.8-27B"
+LARGE_SLOTS = (11, 12)
+SLOT_MODELS = {
+    **dict.fromkeys(range(1, SLOT_COUNT + 1), MODEL),
+    **dict.fromkeys(LARGE_SLOTS, LARGE_MODEL),
+}
+# Served only by their slots while reserved serving is on.
+MODELS = (MODEL,)
+# Served by their slots while one is healthy, else by the on-demand pool and Modal fallback.
+PREFERRED_MODELS = (LARGE_MODEL,)
 # Fresh names (2026-11-27): the earlier fleets' secrets and health Dicts hold entries for other
 # slot layouts (15 x 9B Base, then 5 x 27B + 3 x 0.8B Base) and must never be read as this one.
 SECRET_NAME = "flash-reserved-h100-workers-20261127"
@@ -85,9 +95,10 @@ def active(environment=None):
             f"reserved H100 serving {'ON' if on else 'OFF'} in {environment}: secret "
             f"{SECRET_NAME} {'found' if on else 'not found'}; "
             + (
-                f"{', '.join(MODELS)} served only by reserved slots"
+                f"{', '.join(MODELS)} served only by reserved slots; "
+                f"{', '.join(PREFERRED_MODELS)} prefer theirs"
                 if on
-                else f"{', '.join(MODELS)} use the on-demand Lambda pool"
+                else f"{', '.join((*MODELS, *PREFERRED_MODELS))} use the on-demand Lambda pool"
             ),
             flush=True,
         )
@@ -104,6 +115,11 @@ def enabled(model, environment):
     return model in MODELS and active(environment)
 
 
+def preferred(model, environment):
+    """Whether ``model`` goes to its reserved slots while healthy, keeping its on-demand pool."""
+    return model in PREFERRED_MODELS and active(environment)
+
+
 def parse_workers(raw):
     """Validated secret entries: unique declared slots, each naming its slot's model."""
     workers = json.loads(raw)
@@ -111,7 +127,7 @@ def parse_workers(raw):
         raise ValueError("Reserved fleet must configure at least one slot")
     slots = [w.get("slot") for w in workers]
     if any(type(s) is not int or s not in SLOT_MODELS for s in slots):
-        raise ValueError(f"Reserved fleet slots must be integers 1..{SLOT_COUNT}")
+        raise ValueError(f"Reserved fleet slots must be integers 1..{len(SLOT_MODELS)}")
     if len(set(slots)) != len(slots):
         raise ValueError("Reserved fleet slots must be unique")
     if len({w["instance_id"] for w in workers}) != len(workers):
