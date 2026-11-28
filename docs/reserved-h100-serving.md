@@ -52,7 +52,8 @@ Scheduled every 120 s on the main serving app, whenever the deploy has `LAMBDA_A
 The watchdog, `reserved_h100_watchdog`, is scheduled every 120 s on the serving app while reserved serving is on.
 - **Probe:** each worker gets `/health`, which must report its slot model, plus a one-token canary admitted through the worker's dedicated canary lane. A saturated but healthy worker still answers the canary.
 - **Quarantine and reboot:** two failed probes quarantine a worker. After 10 minutes unhealthy it is rebooted through the Lambda API, at most one per cycle, only if another worker passed, and with a 30 minute cooldown.
-- **Routing:** requests round-robin over the healthy, configured slots, and fail open if all are quarantined.
+- **Routing:** base-model requests round-robin over the healthy, configured slots, and fail open if all are quarantined. LoRA requests are sticky per adapter among those slots (`lambda_cloud/affinity.py`): each adapter uses its rendezvous-ranked first slot, spills to its second only while the first has 63 requests in flight, and a worker scores at most 16 distinct adapters (its `max_loras`) at once.
+- **Batched prefill:** a worker whose `/health` reports `generate_batch: true` takes a list of generations in one `/generate_batch` call (score batches of one-token logprob reads use it). The proxy sends older workers the same generations one `/generate` call each, so this needs a re-bootstrap (below) only to take effect, not to stay correct.
 
 ## Ownership (ongoing)
 - **Billing:** the instances are plain on-demand Lambda VMs. They run, and bill, until an operator terminates them, so treat them as a fixed monthly cost (8 x H100).

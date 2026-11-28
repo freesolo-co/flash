@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import atexit
+import contextvars
+import json
 import math
 import os
 import threading
+import time
 from collections.abc import Callable, Iterator, Sequence
 from contextlib import AbstractContextManager
 from dataclasses import dataclass
@@ -16,7 +19,7 @@ if TYPE_CHECKING:
 
 import flash.serve.contract.errors as serving_errors
 from flash.serve.contract.errors import ServingError
-from flash.serve.contract.protocol import TRAFFIC_SOURCE_HEADER
+from flash.serve.contract.protocol import MAX_CHAT_REQUEST_BYTES, TRAFFIC_SOURCE_HEADER
 from flash.serve.contract.responses import serving_status_error
 from flash.serve.contract.urls import (
     default_serving_url,
@@ -316,18 +319,162 @@ def post_chat_json(
     timeout: float,
     before_raise: Callable[[httpx.Response], None] | None = None,
 ) -> BufferedChatResponse:
-    """post one buffered request and decode its json response."""
+    """post one buffered request and decode its json response.
 
-    with client_context as client:
-        response = client.post(url, json=body, headers=headers, timeout=timeout)
-        if before_raise is not None:
-            before_raise(response)
+    Inside ``ChatPostBatcher.run`` the exchange is shared with the batcher's other callers;
+    everything around it (the body, ``before_raise``, status and decoding) is unchanged.
+    """
+
+    batching = _CHAT_POST_BATCH.get()
+    response = None
+    if batching is not None and not batching[1].posted:
+        batching[1].posted = True
+        response = batching[0].exchange(client_context, url, body, headers, timeout)
+    if response is None:
+        with client_context as client:
+            response = client.post(url, json=body, headers=headers, timeout=timeout)
+    if before_raise is not None:
+        before_raise(response)
+    response.raise_for_status()
+    return BufferedChatResponse(
+        payload=response.json(),
+        headers=dict(getattr(response, "headers", {})),
+        status_code=int(getattr(response, "status_code", 200)),
+    )
+
+
+# Serving's batch route: the buffered chat requests in one body, answered in order with what
+# ``/chat/completions`` would have answered each (status, headers, body).
+CHAT_BATCH_PATH_SUFFIX = "/batch"
+# How long a serving origin without the batch route (an older release) is not asked again.
+CHAT_BATCH_UNSUPPORTED_SECONDS = 10 * 60
+_CHAT_BATCH_UNSUPPORTED: dict[str, float] = {}
+
+
+class _BatchMember:
+    __slots__ = ("posted",)
+
+    def __init__(self) -> None:
+        self.posted = False
+
+
+class _BatchPost:
+    __slots__ = ("body", "client_context", "done", "error", "headers", "response", "timeout", "url")
+
+    def __init__(self, client_context, url, body, headers, timeout) -> None:
+        self.client_context, self.url, self.body = client_context, url, body
+        self.headers, self.timeout = dict(headers), timeout
+        self.done = threading.Event()
+        self.response: httpx.Response | None = None
+        self.error: BaseException | None = None
+
+
+_CHAT_POST_BATCH: contextvars.ContextVar[tuple[ChatPostBatcher, _BatchMember] | None] = (
+    contextvars.ContextVar("flash_chat_post_batch", default=None)
+)
+
+
+class ChatPostBatcher:
+    """Coalesce the buffered chat posts of ``size`` concurrent calls into one serving request.
+
+    Each call runs in its own thread through ``run`` and builds its request exactly as it would
+    alone. Its post waits until every call has either posted or finished without posting; the
+    last one sends all posts as one batch request, and each call then handles its own item as
+    the response to its own post. When the posts cannot share one request (different
+    destinations or headers, too large) or serving has no batch route, every call posts on
+    its own, as it would have without the batcher.
+    """
+
+    def __init__(self, size: int) -> None:
+        self._size = size
+        self._lock = threading.Lock()
+        self._arrived = 0
+        self._posts: list[_BatchPost] = []
+
+    def run(self, fn: Callable[..., Any], *args: Any) -> Any:
+        member = _BatchMember()
+        token = _CHAT_POST_BATCH.set((self, member))
+        try:
+            return fn(*args)
+        finally:
+            _CHAT_POST_BATCH.reset(token)
+            if not member.posted:
+                self._arrive(None)
+
+    def exchange(self, client_context, url, body, headers, timeout) -> httpx.Response | None:
+        """This call's response from the shared request, or None to post on its own."""
+        post = _BatchPost(client_context, url, body, headers, timeout)
+        self._arrive(post)
+        post.done.wait()
+        if post.error is not None:
+            raise post.error
+        return post.response
+
+    def _arrive(self, post: _BatchPost | None) -> None:
+        with self._lock:
+            self._arrived += 1
+            if post is not None:
+                self._posts.append(post)
+            last = self._arrived == self._size
+        if last:
+            self._flush(self._posts)
+
+    def _flush(self, posts: list[_BatchPost]) -> None:
+        try:
+            responses = self._send(posts) if posts else None
+            for post, response in zip(posts, responses or [None] * len(posts), strict=True):
+                post.response = response
+        except BaseException as exc:
+            for post in posts:
+                post.error = exc
+        finally:
+            for post in posts:
+                post.done.set()
+
+    @staticmethod
+    def _send(posts: list[_BatchPost]) -> list[httpx.Response] | None:
+        import httpx
+
+        first = posts[0]
+        url = first.url + CHAT_BATCH_PATH_SUFFIX
+        if len(posts) < 2 or _CHAT_BATCH_UNSUPPORTED.get(url, 0.0) > time.monotonic():
+            return None
+        if any(
+            (p.url, p.headers, p.timeout) != (first.url, first.headers, first.timeout)
+            for p in posts
+        ):
+            return None
+        body = {"requests": [post.body for post in posts]}
+        if len(json.dumps(body, separators=(",", ":"))) > MAX_CHAT_REQUEST_BYTES:
+            return None
+        with first.client_context as client:
+            response = client.post(url, json=body, headers=first.headers, timeout=first.timeout)
+        if response.status_code in (404, 405):
+            _CHAT_BATCH_UNSUPPORTED[url] = time.monotonic() + CHAT_BATCH_UNSUPPORTED_SECONDS
+            return None
         response.raise_for_status()
-        return BufferedChatResponse(
-            payload=response.json(),
-            headers=dict(getattr(response, "headers", {})),
-            status_code=int(getattr(response, "status_code", 200)),
+        results = response.json().get("results")
+        if not isinstance(results, list) or len(results) != len(posts):
+            raise httpx.RemoteProtocolError("serving returned a malformed chat batch")
+        return [
+            _batch_item_response(item, post.url) for item, post in zip(results, posts, strict=True)
+        ]
+
+
+def _batch_item_response(item: Any, url: str) -> httpx.Response:
+    import httpx
+
+    if not isinstance(item, dict) or type(item.get("status_code")) is not int:
+        raise httpx.RemoteProtocolError("serving returned a malformed chat batch item")
+    headers = item.get("headers") if isinstance(item.get("headers"), dict) else {}
+    request = httpx.Request("POST", url)
+    if "body" in item:
+        return httpx.Response(
+            item["status_code"], headers=headers, json=item["body"], request=request
         )
+    return httpx.Response(
+        item["status_code"], headers=headers, text=str(item.get("text", "")), request=request
+    )
 
 
 class _OwnedByteIterator:

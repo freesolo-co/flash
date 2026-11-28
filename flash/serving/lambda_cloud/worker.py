@@ -98,6 +98,8 @@ def create_app(engine, token):
             "deployment_sha": os.environ.get("FREESOLO_DEPLOYMENT_SHA", ""),
             # The watchdog judges a canary timeout as a hang only on workers with this lane.
             "canary_lane": True,
+            # Proxies send a batch of generations as one /generate_batch call only when set.
+            "generate_batch": True,
         }
 
     @app.post("/register")
@@ -115,7 +117,13 @@ def create_app(engine, token):
     @app.post("/lease")
     async def renew_lease(request: Request):
         body = await request.json()
-        leases.renew(body.get("generation_id"))
+        ids = body.get("generation_ids")
+        if ids is None:
+            ids = [body.get("generation_id")]
+        if not isinstance(ids, list) or not ids:
+            raise ValueError("invalid generation id")
+        for generation_id in ids:
+            leases.renew(generation_id)
         return {"ok": True}
 
     @app.post("/abort")
@@ -168,6 +176,45 @@ def create_app(engine, token):
                     task.cancel()
                     with contextlib.suppress(asyncio.CancelledError):
                         await task
+
+    async def batch_item(body):
+        """One /generate_batch item, answered as /generate would have answered it alone."""
+        try:
+            if not isinstance(body, dict) or "canary" in body:
+                raise ValueError("a batch item must be a plain generation")
+            async with admission(body) as args:
+                return {"status": 200, "result": await engine._generate(*args)}
+        except ValueError as exc:
+            return {"status": 400, "kind": "value_error", "message": str(exc)}
+        except TimeoutError:
+            return {"status": 504, "kind": "timeout"}
+        except Exception:
+            return {"status": 500}
+
+    @app.post("/generate_batch")
+    async def generate_batch(request: Request):
+        """Many generations submitted to the engine together: one batched prefill for 1-token
+        reads. Each item has its own admission slot, lease and result."""
+        body = await request.json()
+        items = body.get("items")
+        if not isinstance(items, list) or not 1 <= len(items) <= leases.max_entries:
+            raise ValueError(f"items must be a list of 1-{leases.max_entries} generations")
+        tasks = [asyncio.create_task(batch_item(item)) for item in items]
+        try:
+            while not all(task.done() for task in tasks):
+                if await request.is_disconnected():
+                    raise asyncio.CancelledError
+                await asyncio.wait(tasks, timeout=0.25)
+            # A lease that lapsed cancels its own item, as it would end a lone /generate.
+            return {
+                "results": [
+                    {"status": 500} if task.cancelled() else task.result() for task in tasks
+                ]
+            }
+        finally:
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
 
     @app.post("/stream")
     async def stream(request: Request):

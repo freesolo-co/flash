@@ -8,6 +8,8 @@ key unless the caller presents the shared internal key.
 """
 
 import asyncio
+import json
+import logging
 import time
 import uuid
 from typing import Any
@@ -43,6 +45,7 @@ from flash.serving.src.http.stream_response import (
 from flash.serving.src.http.stream_response import (
     wait_for_disconnect as _wait_for_disconnect,
 )
+from flash.serving.src.io.generation_batch import MAX_BATCH_ITEMS, GenerationBatcher
 from flash.serving.src.io.multimodal import _prepare_generate_request
 from flash.serving.src.io.provenance import _checkpoint_provenance, _provenance_headers
 from flash.serving.src.io.requests import (
@@ -57,6 +60,8 @@ from flash.serving.src.io.responses import (
 )
 from flash.serving.src.io.schemas import GenerateRequest
 from flash.serving.src.io.streaming import _close_async_iterator
+
+logger = logging.getLogger(__name__)
 
 inference_router = APIRouter()
 
@@ -253,6 +258,88 @@ async def chat_completions(payload: dict[str, Any], request: Request) -> Any:
     if target.is_checkpoint:
         response_headers["X-Freesolo-LoRA-Request-Adapter"] = lora_request_adapter
     return JSONResponse(response, headers=response_headers)
+
+
+# Describe the encoded body, which the caller's HTTP client rebuilds from the item.
+_ITEM_DROPPED_HEADERS = frozenset({"content-length", "content-type", "content-encoding"})
+
+
+def _batch_item(response: Any) -> dict[str, Any]:
+    """One item's answer: what ``/v1/chat/completions`` would have sent for it."""
+    headers = {
+        name: value
+        for name, value in response.headers.items()
+        if name.lower() not in _ITEM_DROPPED_HEADERS
+    }
+    return {
+        "status_code": response.status_code,
+        "headers": headers,
+        "body": json.loads(response.body),
+    }
+
+
+def _batch_item_error(exc: HTTPException) -> dict[str, Any]:
+    return {
+        "status_code": exc.status_code,
+        "headers": dict(exc.headers or {}),
+        "body": {"detail": exc.detail},
+    }
+
+
+@inference_router.post("/v1/chat/completions/batch", tags=["openai"])
+async def chat_completions_batch(payload: dict[str, Any], request: Request) -> Any:
+    """Buffered chat requests answered together, for trusted internal callers (score batches).
+
+    Every item is handled by ``chat_completions`` exactly as if it had been posted alone
+    (authorization, admission, accounting, response shape); only the engine dispatch is shared,
+    so the items reaching the same engine run as one batched prefill. Results are in request
+    order, each with the status, headers and body the single request would have returned.
+    """
+    context = ServingContext.of(request)
+    context.assert_internal(request)
+    items = payload.get("requests")
+    if not isinstance(items, list) or not 1 <= len(items) <= MAX_BATCH_ITEMS:
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            f"requests must be a list of 1-{MAX_BATCH_ITEMS} chat requests",
+        )
+    batcher = GenerationBatcher(len(items))
+    # One reader of the connection; every item sees its disconnect through a shared view.
+    disconnected = asyncio.Event()
+
+    async def watch() -> None:
+        await _wait_for_disconnect(request)
+        disconnected.set()
+
+    async def receive() -> dict[str, Any]:
+        await disconnected.wait()
+        return {"type": "http.disconnect"}
+
+    item_request = Request(request.scope, receive)
+
+    async def handle(item: Any) -> dict[str, Any]:
+        if not isinstance(item, dict):
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, "each request must be an object")
+        if item.get("stream"):
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, "batched requests cannot stream")
+        return _batch_item(await chat_completions(item, item_request))
+
+    async def one(item: Any) -> dict[str, Any]:
+        try:
+            return await batcher.run(handle(item))
+        except HTTPException as exc:
+            return _batch_item_error(exc)
+        except Exception:
+            # The single request would have been an unhandled server error.
+            logger.exception("chat_batch_item_failed")
+            return {"status_code": 500, "headers": {}, "text": "Internal Server Error"}
+
+    watcher = asyncio.create_task(watch())
+    try:
+        return {"results": await asyncio.gather(*(one(item) for item in items))}
+    finally:
+        watcher.cancel()
+        await asyncio.gather(watcher, return_exceptions=True)
 
 
 async def _discard_prepared_stream(usage_session: Any, events: Any) -> None:

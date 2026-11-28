@@ -6,6 +6,7 @@ from typing import Any
 
 from flash.serving.src.engine.errors import raise_if_engine_error
 from flash.serving.src.http.routing import AdapterRouter, EnginePool
+from flash.serving.src.io.generation_batch import dispatch_generate
 from flash.serving.src.io.openai_stream import (  # noqa: F401
     _close_async_iterator,
     _replay_first_event,
@@ -107,7 +108,8 @@ async def generate_once(
         update={"model_id": target.model_id, "generation_id": generation_id}
     )
     try:
-        result = await pool.generate(
+        result = await dispatch_generate(
+            pool,
             target.base_model,
             engine_payload,
             target,

@@ -610,6 +610,30 @@ class _LoraEngineImpl(TextPromptTokenizer):
         finally:
             self._release_generation()
 
+    async def _generate_batch(
+        self,
+        payload_dicts: list[dict[str, Any]],
+        record_dict: dict[str, Any] | None = None,
+        expected_checkpoint: str | None = None,
+        generation_ids: list[str] | None = None,
+    ) -> list[dict[str, Any]]:
+        """``_generate`` for each payload, all submitted to vLLM at once; one envelope each.
+
+        Requests reaching the async engine together are scheduled into the same steps, so a
+        list of one-token requests runs as one batched prefill. Each is otherwise exactly the
+        single-request path, so its result is identical.
+        """
+        from flash.serving.src.io.generation_batch import envelope, gather_outcomes
+
+        ids = generation_ids or [None] * len(payload_dicts)
+        if len(ids) != len(payload_dicts):
+            raise ValueError("one generation id is required per batched payload")
+        outcomes = await gather_outcomes(
+            self._generate(payload, record_dict, expected_checkpoint, generation_id)
+            for payload, generation_id in zip(payload_dicts, ids, strict=True)
+        )
+        return [envelope(outcome) for outcome in outcomes]
+
     async def _stream_generate(
         self,
         payload_dict: dict[str, Any],

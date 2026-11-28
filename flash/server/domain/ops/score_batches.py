@@ -6,6 +6,12 @@ capacity, so the batch first sends one probe request and keeps resending it unti
 (the router itself waits up to an hour for a Lambda worker per attempt). Only then does it fan out the rest. Results are returned
 only when every request has finished, all at once.
 
+Generations in flight across the plane are capped (``FLASH_SCORE_BATCH_MAX_INFLIGHT``) and the cap
+is shared fairly between active batches (``FairShare``), so a huge batch cannot starve small ones.
+A batch whose every request is a one-token logprob read (``prefill_eligible``) is sent in chunks:
+each chunk is one serving call (``/v1/chat/completions/batch``) that one worker runs as one batched
+prefill, and each request still gets exactly the response it would have gotten alone.
+
 Batches are durable. The row lives in the control-plane SQLite store and the requests and results
 live under ``data_dir()/score_batches/<id>/``. Only the control-plane lease holder runs batches
 (``ScoreBatchRunner``, started from the leader work). A runner heartbeats the batches it owns; a
@@ -16,6 +22,7 @@ with only the requests that have no recorded result.
 from __future__ import annotations
 
 import concurrent.futures
+import contextlib
 import json
 import logging
 import os
@@ -51,9 +58,16 @@ PROBE_RETRY_SECONDS = 60
 ITEM_ATTEMPTS = 6
 ITEM_BACKOFF_SECONDS = 5
 ITEM_MAX_BACKOFF_SECONDS = 60
-# Generations in flight across every batch on this plane.
+# Generations in flight across every batch on this plane, shared fairly between batches.
 MAX_INFLIGHT_ENV = "FLASH_SCORE_BATCH_MAX_INFLIGHT"
 DEFAULT_MAX_INFLIGHT = 256
+# How often a request waiting for an in-flight slot rechecks whether its batch stopped.
+SLOT_POLL_SECONDS = 1.0
+# Prefill mode: a batch whose every request is a one-token logprob read is sent in chunks of
+# this many requests, each chunk one serving call that one worker runs as one batched prefill.
+# A chunk weighs its request count against the in-flight cap. 32 stays under a reserved
+# worker's 63 admission slots, so a chunk is admitted at once.
+PREFILL_CHUNK_ITEMS = 32
 MAX_ACTIVE_BATCHES = 32
 STALE_SECONDS = 120
 POLL_SECONDS = 5
@@ -97,6 +111,89 @@ _SCHEMA_LOCK = threading.Lock()
 
 class _Cancelled(RuntimeError):
     pass
+
+
+class _Waiter:
+    __slots__ = ("granted", "owner", "seq", "weight")
+
+    def __init__(self, owner: str, weight: int, seq: int) -> None:
+        self.owner, self.weight, self.seq = owner, weight, seq
+        self.granted = threading.Event()
+
+
+class FairShare:
+    """The plane-wide in-flight cap, shared max-min fairly between batches.
+
+    A free slot always goes to the waiting batch that holds the fewest slots (oldest request
+    first among equals), so with N batches waiting each converges to about ``capacity / N``,
+    however many requests one of them queues. It is work-conserving: a batch may hold more than
+    its share while no batch holding less is waiting, and gives the excess back as its requests
+    finish (there is no preemption). A request may weigh more than one slot (a prefill chunk
+    weighs its item count); grants follow the order strictly, so a heavy request at the head
+    is never overtaken indefinitely by lighter ones.
+    """
+
+    def __init__(self, capacity: int) -> None:
+        self.capacity = max(1, int(capacity))
+        self._lock = threading.Lock()
+        self._used = 0
+        self._held: dict[str, int] = {}
+        self._waiters: list[_Waiter] = []
+        self._seq = 0
+
+    def held(self, owner: str) -> int:
+        with self._lock:
+            return self._held.get(owner, 0)
+
+    def acquire(self, owner: str, weight: int = 1, *, abandon=lambda: False) -> int:
+        """Block until ``weight`` slots are granted to ``owner``; returns the weight held.
+
+        ``abandon`` is polled while waiting; when it returns true the wait raises ``_Cancelled``.
+        """
+        weight = max(1, min(int(weight), self.capacity))
+        with self._lock:
+            self._seq += 1
+            waiter = _Waiter(owner, weight, self._seq)
+            self._waiters.append(waiter)
+            self._dispatch()
+        while not waiter.granted.wait(SLOT_POLL_SECONDS):
+            if abandon():
+                with self._lock:
+                    if not waiter.granted.is_set():
+                        self._waiters.remove(waiter)
+                        self._dispatch()
+                        raise _Cancelled("batch stopped while waiting for an in-flight slot")
+                break  # granted at the same moment; the caller releases it as usual
+        return weight
+
+    def release(self, owner: str, weight: int) -> None:
+        with self._lock:
+            self._used -= weight
+            left = self._held.get(owner, 0) - weight
+            if left > 0:
+                self._held[owner] = left
+            else:
+                self._held.pop(owner, None)
+            self._dispatch()
+
+    @contextlib.contextmanager
+    def slot(self, owner: str, weight: int = 1, *, abandon=lambda: False):
+        held = self.acquire(owner, weight, abandon=abandon)
+        try:
+            yield held
+        finally:
+            self.release(owner, held)
+
+    def _dispatch(self) -> None:
+        # Caller holds the lock.
+        while self._waiters:
+            head = min(self._waiters, key=lambda w: (self._held.get(w.owner, 0), w.seq))
+            if self._used + head.weight > self.capacity:
+                return
+            self._waiters.remove(head)
+            self._used += head.weight
+            self._held[head.owner] = self._held.get(head.owner, 0) + head.weight
+            head.granted.set()
 
 
 class _DeadlineReached(RuntimeError):
@@ -584,13 +681,24 @@ class _Batch:
     def _key(self) -> dict:
         return {"id": self.row["key_id"], "auth_kind": self.row["auth_kind"]}
 
-    def send(self, request: dict) -> dict:
-        with self.runner.inflight:
-            # The slot may have been a long wait; never start a generation for a dead batch
-            # or one past its deadline.
+    def _stopping(self) -> bool:
+        return self.stop.is_set() or self.runner.stopping.is_set()
+
+    @contextlib.contextmanager
+    def _slot(self, weight: int = 1):
+        """Hold this batch's fair share of the plane-wide in-flight cap.
+
+        The slot may have been a long wait; never start a generation for a dead batch or one
+        past its deadline.
+        """
+        with self.runner.inflight.slot(self.batch_id, weight, abandon=self._stopping):
             self._check_live()
             if self.stop_at is not None and time.time() >= self.stop_at:
                 raise _DeadlineReached
+            yield
+
+    def send(self, request: dict) -> dict:
+        with self._slot():
             return self.runner.send(self.row, self._key(), request)
 
     # phases ----------------------------------------------------------------------------------
@@ -685,35 +793,108 @@ class _Batch:
         deadline_s = self.row["deadline_s"]
         stop_at = None if deadline_s is None else self.row["capacity_at"] + deadline_s
         self.stop_at = stop_at
-        cursor = iter(pending)
+        concurrency = self.row["concurrency"]
+        if all(prefill_eligible(entry["request"]) for entry in requests):
+            size = PREFILL_CHUNK_ITEMS
+            units = [pending[start : start + size] for start in range(0, len(pending), size)]
+            workers = min(len(units), max(1, concurrency // size))
+            run_unit = self._run_chunk
+        else:
+            units = [[index] for index in pending]
+            workers = min(concurrency, len(units))
+            run_unit = self._run_unit
+        cursor = iter(units)
         cursor_lock = threading.Lock()
 
-        def next_index() -> int | None:
+        def next_unit() -> list[int] | None:
             with cursor_lock:
                 return next(cursor, None)
 
         def worker() -> None:
-            while (index := next_index()) is not None:
-                entry = requests[index]
-                try:
-                    if stop_at is not None and time.time() >= stop_at:
-                        raise _DeadlineReached
-                    self._run_item(index, entry)
-                except _DeadlineReached:
-                    self._record(
-                        index,
-                        entry["id"],
-                        error="unfinished: the batch deadline was reached before this request ran",
-                        unfinished=True,
-                    )
+            while (unit := next_unit()) is not None:
+                if stop_at is not None and time.time() >= stop_at:
+                    for index in unit:
+                        self._unfinished(index, requests[index])
+                    continue
+                run_unit(requests, unit)
 
-        workers = min(self.row["concurrency"], len(pending))
         with concurrent.futures.ThreadPoolExecutor(
             max_workers=workers, thread_name_prefix=f"score-{self.batch_id[-6:]}"
         ) as pool:
             futures = [pool.submit(worker) for _ in range(workers)]
             for future in futures:
                 future.result()
+
+    def _unfinished(self, index: int, entry: dict) -> None:
+        self._record(
+            index,
+            entry["id"],
+            error="unfinished: the batch deadline was reached before this request ran",
+            unfinished=True,
+        )
+
+    def _run_unit(self, requests: list, unit: list[int]) -> None:
+        (index,) = unit
+        try:
+            self._run_item(index, requests[index])
+        except _DeadlineReached:
+            self._unfinished(index, requests[index])
+
+    def _run_chunk(self, requests: list, chunk: list[int]) -> None:
+        """Send a chunk of one-token logprob requests as one batched serving call.
+
+        Every request still gets its own result, with the per-request retry policy: requests
+        that failed retryably (or a whole chunk that failed, such as on a transport error) are
+        sent again together after the same backoff, up to ``ITEM_ATTEMPTS`` times.
+        """
+        pending = [(index, requests[index]) for index in chunk]
+        last: dict[int, BaseException] = {}
+        for attempt in range(ITEM_ATTEMPTS):
+            self._check_live()
+            try:
+                with self._slot(len(pending)):
+                    outcomes = self.runner.send_chunk(
+                        self.row, self._key(), [entry["request"] for _, entry in pending]
+                    )
+                if len(outcomes) != len(pending):
+                    raise RuntimeError("score chunk returned a result count that does not match")
+            except _DeadlineReached:
+                for index, entry in pending:
+                    self._unfinished(index, entry)
+                return
+            except _Cancelled:
+                raise
+            except Exception as exc:
+                logger.warning(
+                    "score_batch_chunk_failed batch=%s items=%s error=%s",
+                    self.batch_id,
+                    len(pending),
+                    _error_text(exc)[:200],
+                )
+                outcomes = [exc] * len(pending)
+            retry = []
+            for (index, entry), outcome in zip(pending, outcomes, strict=True):
+                if not isinstance(outcome, BaseException):
+                    self._record(index, entry["id"], response=outcome)
+                elif _retryable(outcome):
+                    last[index] = outcome
+                    retry.append((index, entry))
+                else:
+                    self._record(
+                        index,
+                        entry["id"],
+                        error=_error_text(outcome),
+                        status_code=_status_of(outcome),
+                    )
+            pending = retry
+            if not pending:
+                return
+            if attempt + 1 < ITEM_ATTEMPTS:
+                delay = min(ITEM_MAX_BACKOFF_SECONDS, ITEM_BACKOFF_SECONDS * 2**attempt)
+                self._sleep(delay * random.uniform(0.5, 1.0))
+        for index, entry in pending:
+            exc = last[index]
+            self._record(index, entry["id"], error=_error_text(exc), status_code=_status_of(exc))
 
     def _run_item(self, index: int, entry: dict) -> None:
         last: BaseException | None = None
@@ -747,6 +928,47 @@ class _Batch:
                 "WHERE batch_id=? AND owner=? AND state IN (?,?,?)",
                 (state, time.time(), error, self.batch_id, self.runner.owner, *ACTIVE_STATES),
             )
+
+
+def prefill_eligible(request: dict) -> bool:
+    """Whether a request only reads the logprobs of one generated token (prefill mode).
+
+    Such a request is one prefill forward pass, so many of them are sent to serving together.
+    The per-request path stays the reference: prefill mode sends each request exactly as it
+    would have been sent alone and returns its response unchanged.
+    """
+    max_tokens = request.get("max_tokens")
+    if type(max_tokens) is not int or max_tokens != 1 or request.get("stream"):
+        return False
+    if request.get("tools") or request.get("tool_choice") is not None:
+        return False
+    if request.get("n", 1) not in (None, 1):
+        return False
+    top_logprobs = request.get("top_logprobs")
+    token_ids = request.get("logprob_token_ids")
+    return (
+        request.get("logprobs") is True
+        or (type(top_logprobs) is int and top_logprobs > 0)
+        or (isinstance(token_ids, list) and bool(token_ids))
+    )
+
+
+def _send_chunk(send, row: dict, key: dict, requests: list[dict]) -> list[Any]:
+    """Send ``requests`` through ``send`` concurrently, coalesced into one serving call.
+
+    Each request runs the full per-request path (validation, payload, response handling); only
+    the HTTP exchange is shared. Returns one response or exception per request, in order. A
+    serving revision without the batch endpoint gets the requests one by one.
+    """
+    from flash.serve.request.transport import ChatPostBatcher
+
+    batcher = ChatPostBatcher(len(requests))
+    with concurrent.futures.ThreadPoolExecutor(
+        max_workers=len(requests), thread_name_prefix="score-chunk"
+    ) as pool:
+        futures = [pool.submit(batcher.run, send, row, key, request) for request in requests]
+        concurrent.futures.wait(futures)
+    return [future.exception() or future.result() for future in futures]
 
 
 def _send_request(row: dict, key: dict, request: dict) -> dict:
@@ -804,13 +1026,23 @@ def _send_request(row: dict, key: dict, request: dict) -> dict:
 class ScoreBatchRunner:
     """Claims and runs score batches on the control-plane lease holder."""
 
-    def __init__(self, *, send=_send_request, clock=time.time, capacity_wait=capacity_wait_seconds):
+    def __init__(
+        self,
+        *,
+        send=_send_request,
+        send_chunk=None,
+        clock=time.time,
+        capacity_wait=capacity_wait_seconds,
+    ):
         self.owner = f"{os.getpid()}-{uuid.uuid4().hex[:12]}"
         self.send = send
+        self.send_chunk = send_chunk or (
+            lambda row, key, requests: _send_chunk(self.send, row, key, requests)
+        )
         self.clock = clock
         self.capacity_wait = capacity_wait
         self.stopping = threading.Event()
-        self.inflight = threading.BoundedSemaphore(_max_inflight())
+        self.inflight = FairShare(_max_inflight())
         self.active: dict[str, tuple[_Batch, threading.Thread]] = {}
         self._thread: threading.Thread | None = None
         self._last_cleanup = 0.0

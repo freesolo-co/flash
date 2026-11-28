@@ -24,6 +24,10 @@ class WorkerError(RuntimeError):
         super().__init__(message)
 
 
+class BatchUnsupported(RuntimeError):
+    """The worker predates /generate_batch."""
+
+
 _SAFE_KIND = re.compile(r"[a-z][a-z0-9_]{0,63}")
 
 
@@ -39,6 +43,17 @@ def _failure_kind(response):
     return kind if isinstance(kind, str) and _SAFE_KIND.fullmatch(kind) else None
 
 
+def _failure(status_code, body):
+    if status_code == 400 and isinstance(body, dict) and body.get("kind") == "value_error":
+        return ValueError(body["message"])
+    kind = body.get("kind", body.get("error")) if isinstance(body, dict) else None
+    kind = kind if isinstance(kind, str) and _SAFE_KIND.fullmatch(kind) else None
+    detail = f"HTTP {status_code}" + (f", kind={kind}" if kind else "")
+    return WorkerError(
+        f"Lambda worker request failed ({detail})", 504 if status_code == 504 else 502
+    )
+
+
 def check_response(response):
     if response.status_code == 400:
         body = response.json()
@@ -51,6 +66,18 @@ def check_response(response):
             f"Lambda worker request failed ({detail})",
             504 if response.status_code == 504 else 502,
         )
+
+
+def batch_item_outcome(item, generation_id):
+    """A /generate_batch item as the result, or the exception, a lone /generate gives."""
+    if not isinstance(item, dict) or type(item.get("status")) is not int:
+        return WorkerError("Lambda returned a malformed batch item")
+    if item["status"] != 200:
+        return _failure(item["status"], item)
+    result = item.get("result")
+    if not isinstance(result, dict) or result.get("request_id") != generation_id:
+        return WorkerError("Lambda returned a mismatched generation id")
+    return result
 
 
 class WorkerTransport:
@@ -89,8 +116,9 @@ class WorkerTransport:
     async def call(self, path, body=None):
         lease_task = None
         if path == "/generate":
-            await self.call("/lease", {"generation_id": body["generation_id"]})
-            lease_task = asyncio.create_task(self._renew_lease(body["generation_id"]))
+            lease = {"generation_id": body["generation_id"]}
+            await self.call("/lease", lease)
+            lease_task = asyncio.create_task(self._renew_lease(lease))
         try:
             response = await self._client_for(path).send(
                 self.request("GET" if body is None else "POST", path, body)
@@ -109,10 +137,41 @@ class WorkerTransport:
                 lease_task.cancel()
                 await asyncio.gather(lease_task, return_exceptions=True)
 
+    async def call_batch(self, items):
+        """Run ``items`` (``/generate`` bodies) as one /generate_batch call.
+
+        Returns one result or exception per item, each what ``call("/generate", item)`` would
+        have returned or raised; raises ``BatchUnsupported`` on a worker without the route.
+        """
+        lease = {"generation_ids": [item["generation_id"] for item in items]}
+        await self.call("/lease", lease)
+        lease_task = asyncio.create_task(self._renew_lease(lease))
+        try:
+            response = await self.client.send(
+                self.request("POST", "/generate_batch", {"items": items})
+            )
+            if response.status_code in (404, 405):
+                raise BatchUnsupported("Lambda worker has no /generate_batch")
+            check_response(response)
+            results = response.json().get("results")
+            if not isinstance(results, list) or len(results) != len(items):
+                raise WorkerError("Lambda returned a malformed batch")
+            return [
+                batch_item_outcome(result, item["generation_id"])
+                for result, item in zip(results, items, strict=True)
+            ]
+        except httpx.TimeoutException as exc:
+            raise WorkerError("Lambda worker request timed out", 504) from exc
+        except httpx.HTTPError as exc:
+            raise WorkerError("Lambda worker connection failed") from exc
+        finally:
+            lease_task.cancel()
+            await asyncio.gather(lease_task, return_exceptions=True)
+
     def _client_for(self, path):
         return self.lease_client if path == "/lease" else self.client
 
-    async def _renew_lease(self, generation_id):
+    async def _renew_lease(self, lease):
         loop = asyncio.get_running_loop()
         started = loop.time()
         while True:
@@ -121,13 +180,14 @@ class WorkerTransport:
             started = loop.time()
             with contextlib.suppress(WorkerError, TimeoutError):
                 async with asyncio.timeout(LEASE_RENEW_TIMEOUT_SECONDS):
-                    await self.call("/lease", {"generation_id": generation_id})
+                    await self.call("/lease", lease)
 
     async def stream(self, body):
         response = None
         terminal = False
-        await self.call("/lease", {"generation_id": body["generation_id"]})
-        lease_task = asyncio.create_task(self._renew_lease(body["generation_id"]))
+        lease = {"generation_id": body["generation_id"]}
+        await self.call("/lease", lease)
+        lease_task = asyncio.create_task(self._renew_lease(lease))
         try:
             response = await self.client.send(self.request("POST", "/stream", body), stream=True)
             if response.status_code != 200:

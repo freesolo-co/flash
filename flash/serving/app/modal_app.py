@@ -5,6 +5,7 @@ The public router and the separate DeepSeek deployment remain on Modal.
 """
 
 import asyncio
+import contextlib
 import os
 import time
 import uuid
@@ -432,6 +433,18 @@ def _build_engine(
             )
 
         @modal.method()
+        async def generate_batch(
+            self,
+            payload_dicts: list[dict[str, Any]],
+            record_dict: dict[str, Any] | None = None,
+            expected_checkpoint: str | None = None,
+            generation_ids: list[str] | None = None,
+        ) -> list[dict[str, Any]]:
+            return await self._generate_batch(
+                payload_dicts, record_dict, expected_checkpoint, generation_ids
+            )
+
+        @modal.method()
         async def stream_generate_call(
             self,
             payload_dict: dict[str, Any],
@@ -563,6 +576,26 @@ def _reserved(model: str) -> bool:
     return bool(RESERVED_ENGINES) and reserved.enabled(model, MODAL_ENVIRONMENT)
 
 
+def _affinity_key(record: Any) -> str | None:
+    """The adapter a request scores, for sticky slot routing; None for a base-model serve."""
+    if record is None or getattr(record, "serve_base_model", False):
+        return None
+    return f"{getattr(record, 'org_id', None) or ''}\0{record.model_id}"
+
+
+def _new_affinity(model: str) -> Any:
+    from flash.serving.lambda_cloud.affinity import AdapterAffinity
+    from flash.serving.src.store.settings import MAX_LORAS
+
+    overrides = engine_overrides_for(model)
+    # The engine's GPU LoRA slots (boot.py reads max_loras the same way), and the worker's
+    # request admission (one sequence is held back for the liveness canary).
+    return AdapterAffinity(
+        int(overrides.get("max_loras", MAX_LORAS)),
+        max(1, int(overrides.get("max_num_seqs", 64)) - 1),
+    )
+
+
 def _engine_cls_for(base_model: str) -> Any:
     """Stable model identity, with independently qualified hardware and concurrency."""
     gpu_for(base_model)  # Reject unsupported models before dispatch.
@@ -581,10 +614,29 @@ class _ModalEnginePool:
         self._fleet, self._provider_selection = bind_lambda_control()
         # Watchdog-quarantined reserved workers are skipped for routing and registration.
         self._reserved_health = reserved_watchdog.HealthView.for_engines(RESERVED_ENGINES)
+        self._affinity: dict[str, Any] = {}
 
     async def _each_reserved(self, model, label, call):
         slots = await self._reserved_health.usable(model)
         await reserved_watchdog.each_slot(RESERVED_ENGINES, model, slots, label, call)
+
+    @contextlib.asynccontextmanager
+    async def _routed_engine(self, model, record, weight=1):
+        """The engine for one dispatch; reserved checkpoint traffic is sticky per adapter.
+
+        Health and quarantine still decide which slots are routable; affinity only picks
+        among them, so a quarantined slot's adapters move to their next-ranked slot.
+        """
+        key = _affinity_key(record)
+        if not _reserved(model) or key is None:
+            yield await self._engine_for(model)
+            return
+        slots = await self._reserved_health.usable(model)
+        affinity = self._affinity.get(model)
+        if affinity is None:
+            affinity = self._affinity[model] = _new_affinity(model)
+        async with affinity.route(key, slots, weight) as slot:
+            yield RESERVED_ENGINES[slot - 1](base_model=model)
 
     async def _engine_for(self, model):
         if _reserved(model):
@@ -630,13 +682,49 @@ class _ModalEnginePool:
         generation_id = payload.generation_id
         if not generation_id:
             raise RuntimeError("generation id is required before modal dispatch")
-        engine = await self._engine_for(base_model)
-        return await engine.generate.remote.aio(
-            internal_generation_payload(payload),
-            self._record_payload(record),
-            expected_checkpoint,
-            generation_id,
-        )
+        async with self._routed_engine(base_model, record) as engine:
+            return await engine.generate.remote.aio(
+                internal_generation_payload(payload),
+                self._record_payload(record),
+                expected_checkpoint,
+                generation_id,
+            )
+
+    async def generate_batch(
+        self,
+        base_model: str,
+        payloads: list[Any],
+        record: Any,
+        *,
+        expected_checkpoint: str | None = None,
+    ) -> list[Any]:
+        """Generations for one adapter on one engine replica, run as one batched prefill.
+
+        Returns each payload's result or the exception its lone ``generate`` would raise.
+        """
+        from flash.serving.deepinfer.contract.config import MODEL_ID as deepseek_model
+        from flash.serving.src.io.generation_batch import gather_outcomes, outcome_of
+
+        if base_model == deepseek_model:
+            return await gather_outcomes(
+                self.generate(base_model, payload, record, expected_checkpoint=expected_checkpoint)
+                for payload in payloads
+            )
+        from flash.serving.src.io.cache_namespace import internal_generation_payload
+
+        generation_ids = [payload.generation_id for payload in payloads]
+        if not all(generation_ids):
+            raise RuntimeError("generation id is required before modal dispatch")
+        async with self._routed_engine(base_model, record, len(payloads)) as engine:
+            envelopes = await engine.generate_batch.remote.aio(
+                [internal_generation_payload(payload) for payload in payloads],
+                self._record_payload(record),
+                expected_checkpoint,
+                generation_ids,
+            )
+        if not isinstance(envelopes, list) or len(envelopes) != len(payloads):
+            raise RuntimeError("serving engine returned a batch of the wrong size")
+        return [outcome_of(item) for item in envelopes]
 
     async def stream_generate(
         self,
@@ -663,25 +751,25 @@ class _ModalEnginePool:
         generation_id = payload.generation_id
         if not generation_id:
             raise RuntimeError("generation id is required before modal dispatch")
-        engine = await self._engine_for(base_model)
         from flash.serving.src.stream_channel.client import CancellableStreamChannel
 
-        remote_stream = CancellableStreamChannel(
-            spawn_method=engine.stream_generate_call,
-            payload_dict=internal_generation_payload(payload),
-            record_dict=self._record_payload(record),
-            expected_checkpoint=expected_checkpoint,
-            generation_id=generation_id,
-            dispatch_deadline_unix=time.time() + ROUTER_TIMEOUT_SECONDS,
-            invocation_nonce=uuid.uuid4().hex,
-        )
-        try:
-            async for event in remote_stream:
-                yield event
-        finally:
-            close = getattr(remote_stream, "aclose", None)
-            if close is not None:
-                await close()
+        async with self._routed_engine(base_model, record) as engine:
+            remote_stream = CancellableStreamChannel(
+                spawn_method=engine.stream_generate_call,
+                payload_dict=internal_generation_payload(payload),
+                record_dict=self._record_payload(record),
+                expected_checkpoint=expected_checkpoint,
+                generation_id=generation_id,
+                dispatch_deadline_unix=time.time() + ROUTER_TIMEOUT_SECONDS,
+                invocation_nonce=uuid.uuid4().hex,
+            )
+            try:
+                async for event in remote_stream:
+                    yield event
+            finally:
+                close = getattr(remote_stream, "aclose", None)
+                if close is not None:
+                    await close()
 
     async def register(self, base_model: str, record: Any) -> None:
         if _reserved(base_model):

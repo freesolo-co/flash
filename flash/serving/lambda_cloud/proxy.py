@@ -6,11 +6,12 @@ import os
 import uuid
 
 from flash.serving.app.timeouts import STARTUP_TIMEOUT_SECONDS
+from flash.serving.src.engine.model_config import engine_overrides_for
 
 from .bootstrap import identity, user_data
 from .capacity import launch_with_capacity_wait
 from .config import APP_NAME, HEARTBEAT_SECONDS
-from .transport import WorkerError, WorkerTransport
+from .transport import BatchUnsupported, WorkerError, WorkerTransport
 
 
 class LambdaEngineProxy:
@@ -120,6 +121,34 @@ class LambdaEngineProxy:
         return await self._transport.call(
             "/generate", self._body(payload, record, expected_checkpoint, generation_id)
         )
+
+    async def _generate_batch(
+        self, payloads, record=None, expected_checkpoint=None, generation_ids=None
+    ):
+        """One envelope per payload; a single /generate_batch call when the worker has it."""
+        from flash.serving.src.io.generation_batch import envelope, gather_outcomes
+
+        bodies = [
+            self._body(payload, record, expected_checkpoint, generation_id)
+            for payload, generation_id in zip(payloads, generation_ids, strict=True)
+        ]
+        outcomes = None
+        if self._health_cache.get("generate_batch") is True:
+            # Slices the worker admits at once (it holds one sequence back for its canary).
+            sequences = int(engine_overrides_for(self.base_model).get("max_num_seqs", 64))
+            size = max(1, sequences - 1)
+            slices = [bodies[start : start + size] for start in range(0, len(bodies), size)]
+            try:
+                answered = await asyncio.gather(*(self._transport.call_batch(s) for s in slices))
+                outcomes = [outcome for part in answered for outcome in part]
+            except BatchUnsupported:
+                self._health_cache = {**self._health_cache, "generate_batch": False}
+        if outcomes is None:
+            # An older worker: the same generations, one /generate call each.
+            outcomes = await gather_outcomes(
+                self._transport.call("/generate", body) for body in bodies
+            )
+        return [envelope(outcome) for outcome in outcomes]
 
     async def _stream_generate(
         self,
