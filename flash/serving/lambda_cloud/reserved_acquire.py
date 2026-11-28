@@ -5,8 +5,7 @@ does not hold:
 
 - reconcile its record with the Lambda instance named after the slot;
 - qualify an active instance (identity: the slot's model, deploy revision, H100, then a one-token
-  canary)
-  and publish its secret-shaped entry under ``WORKERS_KEY`` in ``DICT_NAME``;
+  canary) and publish its secret-shaped entry under ``WORKERS_KEY`` in ``DICT_NAME``;
 - launch at most one new worker per cycle, for the lowest empty slot, when Lambda reports
   single-H100 US capacity. Without capacity it simply retries next period, indefinitely.
 
@@ -172,6 +171,11 @@ async def run_once(
     for s, record in records.items():
         # A record from before its slot served this model (unnamed ones predate 27B: 9B Base).
         if record is not None and record.get("model", reserved.MODEL) != reserved.model_for(s):
+            print(
+                f"reserved H100 alert: slot {s} record for {record.get('model', reserved.MODEL)} "
+                f"dropped; its instance {record.get('instance_id')} is no longer managed",
+                flush=True,
+            )
             await store.pop(slot_key(s))
             records[s] = None
     published = await store.get(WORKERS_KEY) or []
