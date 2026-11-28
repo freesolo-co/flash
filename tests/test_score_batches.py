@@ -102,7 +102,7 @@ def test_batch_fails_every_request_when_capacity_never_arrives():
         raise httpx.ConnectError("no lambda worker")
 
     batch = _submit()
-    runner = score_batches.ScoreBatchRunner(send=send, capacity_wait=lambda: 0.001)
+    runner = score_batches.ScoreBatchRunner(send=send, capacity_wait=0.001)
     time.sleep(0.01)
     _drain(runner)
     done = _result(batch["batch_id"])
@@ -628,3 +628,17 @@ def test_inflight_limit_defaults_to_384_and_reads_a_positive_override(monkeypatc
     assert score_batches._max_inflight() == 512
     monkeypatch.setenv(score_batches.MAX_INFLIGHT_ENV, "0")
     assert score_batches._max_inflight() == 384
+
+
+def test_runner_reads_its_environment_settings_once_at_start(monkeypatch):
+    monkeypatch.setenv(score_batches.MAX_ACTIVE_ENV, "7")
+    monkeypatch.setenv(score_batches.MAX_INFLIGHT_ENV, "11")
+    monkeypatch.setenv(score_batches.CAPACITY_WAIT_ENV, "90")
+    runner = score_batches.ScoreBatchRunner(send=lambda row, key, request: _ok(request))
+    monkeypatch.setenv(score_batches.MAX_ACTIVE_ENV, "1")
+    monkeypatch.setenv(score_batches.CAPACITY_WAIT_ENV, "5")
+    assert runner.max_active == 7
+    assert runner.capacity_wait == 90.0
+    for _ in range(11):
+        assert runner.inflight.acquire(blocking=False)
+    assert not runner.inflight.acquire(blocking=False)
