@@ -338,12 +338,13 @@ def test_reserved_requests_rotate_over_the_9b_base_slots(monkeypatch):
 
 def test_checkpoints_route_and_register_only_on_their_home_slots(monkeypatch):
     """A checkpoint's requests and registration stay on its 3 home slots; base-model requests
-    spread over all 8; unregister still clears every slot."""
+    spread over every slot; unregister still clears every slot."""
     from types import SimpleNamespace
 
     _clear_deployment_environment(monkeypatch)
     module = _import_modal_app(monkeypatch, is_local=False, environment="main")
     calls = []
+    slots = set(module.reserved.SLOT_MODELS)
 
     class Engine:
         def __init__(self, slot, base_model):
@@ -357,7 +358,9 @@ def test_checkpoints_route_and_register_only_on_their_home_slots(monkeypatch):
     monkeypatch.setattr(
         module,
         "RESERVED_ENGINES",
-        tuple(lambda *, base_model, slot=i + 1: Engine(slot, base_model) for i in range(8)),
+        tuple(
+            lambda *, base_model, slot=i + 1: Engine(slot, base_model) for i in range(len(slots))
+        ),
     )
     pool = module._ModalEnginePool.__new__(module._ModalEnginePool)
     pool._provider_selection = SimpleNamespace(choose=AsyncMock())
@@ -377,10 +380,10 @@ def test_checkpoints_route_and_register_only_on_their_home_slots(monkeypatch):
     home_b = set(asyncio.run(picks(b, 30)))
     assert len(home_a) == len(home_b) == module.reserved_watchdog.AFFINITY_SLOTS == 3
     assert home_a != home_b
-    assert set(asyncio.run(picks(served, 16))) == set(range(1, 9))
-    assert set(asyncio.run(picks(None, 16))) == set(range(1, 9))
+    assert set(asyncio.run(picks(served, 2 * len(slots)))) == slots
+    assert set(asyncio.run(picks(None, 2 * len(slots)))) == slots
 
     asyncio.run(pool.register(base, a))
     assert {slot for name, slot in calls if name == "register"} == home_a
     asyncio.run(pool.unregister(base, "org", "flash-1/step-10"))
-    assert {slot for name, slot in calls if name == "unregister"} == set(range(1, 9))
+    assert {slot for name, slot in calls if name == "unregister"} == slots
