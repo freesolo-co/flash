@@ -605,3 +605,26 @@ def test_a_torn_final_line_is_trimmed_before_a_resumed_batch_appends():
     assert "response" in done["results"][1]
     assert "response" in done["results"][2]
     assert all(json.loads(line) for line in path.read_text().splitlines())
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [(None, 96), ("", 96), ("128", 128), ("0", 96), ("-4", 96), ("many", 96)],
+)
+def test_active_batch_limit_defaults_to_96_and_reads_a_positive_override(
+    monkeypatch, raw, expected
+):
+    if raw is None:
+        monkeypatch.delenv(score_batches.MAX_ACTIVE_ENV, raising=False)
+    else:
+        monkeypatch.setenv(score_batches.MAX_ACTIVE_ENV, raw)
+    assert score_batches._max_active() == expected
+
+
+def test_inflight_limit_defaults_to_384_and_reads_a_positive_override(monkeypatch):
+    monkeypatch.delenv(score_batches.MAX_INFLIGHT_ENV, raising=False)
+    assert score_batches._max_inflight() == 384
+    monkeypatch.setenv(score_batches.MAX_INFLIGHT_ENV, "512")
+    assert score_batches._max_inflight() == 512
+    monkeypatch.setenv(score_batches.MAX_INFLIGHT_ENV, "0")
+    assert score_batches._max_inflight() == 384

@@ -53,8 +53,14 @@ ITEM_BACKOFF_SECONDS = 5
 ITEM_MAX_BACKOFF_SECONDS = 60
 # Generations in flight across every batch on this plane.
 MAX_INFLIGHT_ENV = "FLASH_SCORE_BATCH_MAX_INFLIGHT"
-DEFAULT_MAX_INFLIGHT = 256
-MAX_ACTIVE_BATCHES = 32
+# 8 reserved 9B-Base H100s x 48 sequences, under each engine's 64-sequence limit. Raise it with the
+# reserved fleet: at 256 the 8 workers already logged engine timeouts under 16k-token generations.
+DEFAULT_MAX_INFLIGHT = 384
+# Batches this plane runs at once; the rest wait queued. Every running batch still shares the
+# MAX_INFLIGHT generation budget above, so raising this lets small batches start without adding
+# GPU load. Each running batch holds up to its `concurrency` mostly idle threads.
+MAX_ACTIVE_ENV = "FLASH_SCORE_BATCH_MAX_ACTIVE"
+DEFAULT_MAX_ACTIVE_BATCHES = 96
 STALE_SECONDS = 120
 POLL_SECONDS = 5
 RETENTION_SECONDS = 7 * 24 * 60 * 60
@@ -139,6 +145,15 @@ def _max_inflight() -> int:
     except ValueError:
         value = DEFAULT_MAX_INFLIGHT
     return value if value > 0 else DEFAULT_MAX_INFLIGHT
+
+
+def _max_active() -> int:
+    raw = (os.environ.get(MAX_ACTIVE_ENV) or "").strip()
+    try:
+        value = int(raw) if raw else DEFAULT_MAX_ACTIVE_BATCHES
+    except ValueError:
+        value = DEFAULT_MAX_ACTIVE_BATCHES
+    return value if value > 0 else DEFAULT_MAX_ACTIVE_BATCHES
 
 
 # ---------------------------------------------------------------------------------------------
@@ -861,7 +876,7 @@ class ScoreBatchRunner:
             row = get_row(batch_id)
             if row is None or row["state"] == "cancelled" or row["owner"] != self.owner:
                 batch.stop.set()
-        while len(self.active) < MAX_ACTIVE_BATCHES:
+        while len(self.active) < _max_active():
             row = self._claim(now)
             if row is None:
                 break
